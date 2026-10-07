@@ -13,18 +13,19 @@
 #                   space-separated word (- for none)
 name	expect	named-property	never	flags
 MC_gc_budget_selftest	inconclusive	WithinBudget	*	-
-MC_gc_core	pass	all	BaseRecord,GC,StartBase	-
-MC_gc_q46	pass	all	BaseRecord,StartBase	-
-MC_gc_grouped	pass	all	GC,Rewrite	-
-MC_gc_fix2	pass	all	Rewrite	-
-MC_gc_reroot	pass	all	BaseRecord,StartBase	-
-MC_gc_reroot_extended	pass	all	BaseRecord,StartBase	-
-MC_gc_fix2_deep	pass	all	Rewrite	-
-MC_gc_live	pass	all	BaseRecord,StartBase	-
+MC_gc_core	pass	all	BaseRecord,GC,ReuseSidecar,StartBase	-
+MC_gc_q46	pass	all	BaseRecord,ReuseSidecar,StartBase	-
+MC_gc_grouped	pass	all	GC,ReuseSidecar,Rewrite	-
+MC_gc_fix2	pass	all	ReuseSidecar,Rewrite	-
+MC_gc_reroot	pass	all	BaseRecord,ReuseSidecar,StartBase	-
+MC_gc_reroot_extended	pass	all	BaseRecord,ReuseSidecar,StartBase	-
+MC_gc_fix2_deep	pass	all	ReuseSidecar,Rewrite	-
+MC_gc_reuse	pass	all	Rewrite	-
+MC_gc_live	pass	all	BaseRecord,ReuseSidecar,StartBase	-
 MC_gc_reach_reroot_extended	reach	Witness_RerootExtended	*	-
 MC_gc_reach_second_reroot	reach	Witness_SecondReroot	*	-
 MC_gc_reach_based_chain	reach	Witness_BasedChainRestored	*	-
-MC_gc_base_missing_untyped	pass	all	Advance,Crash,GC,Rewrite	-
+MC_gc_base_missing_untyped	pass	all	Advance,Crash,GC,ReuseSidecar,Rewrite	-
 MC_gc_live_rewritten	fail	ChainRecovery	*	-
 MC_gc_neg_live_unfair	fail	ChainRecovery	*	-
 MC_gc_neg_chain_ignores_depth	fail	ChainDepthBounded	*	-
@@ -35,3 +36,4 @@ MC_gc_neg_skip_flatten_verify	fail	PrereqsSatisfiedByEarlierLinks	*	-
 MC_gc_neg_hit_ignores_chain	fail	BrokenLinkNeverReuseHit	*	-
 MC_gc_neg_hit_ignores_chain_restore	fail	RestoreOrRecapture	*	-
 MC_gc_neg_reroot_pre_mismatch	fail	PrereqsSatisfiedByEarlierLinks	*	-
+MC_gc_neg_reuse_after_record	fail	ReuseManifestBeforeRecord	*	-

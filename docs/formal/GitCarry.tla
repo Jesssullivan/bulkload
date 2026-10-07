@@ -22,7 +22,8 @@
 (*     (git_carry::decide on what prepare_base, retained_capture and       *)
 (*     chainable read; chain_offer and shared::write_capture act on it),   *)
 (*     then publish_bundle, the dependency sidecars ({bundle}.base,        *)
-(*     {bundle}.prior) and the {item}.capture record, each a separate      *)
+(*     {bundle}.prior), the reuse manifest ({bundle}.reuse, lane L7:       *)
+(*     ReuseManifest) and the {item}.capture record, each a separate       *)
 (*     durable step.                                                       *)
 (*   - Content names. A bundle's CORPUS name is its content               *)
 (*     ({identity}-{digest}.bundle, shared-{digest}.bundle), so a          *)
@@ -93,6 +94,13 @@
 (*     and prepare_base hard-link into CORPUS, so collecting an attempt   *)
 (*     under the lock cannot break custody. STATE GC is not modelled.     *)
 (*   - Sidecars are never damaged; only bundle files are.                 *)
+(*   - What a reuse manifest lists, and what a pass reuses from it. The    *)
+(*     manifest is a custody fact here only as a file that exists or not:  *)
+(*     no restore and no decision reads it (ApplyOutcome and DecideCore do *)
+(*     not mention it), so either publication order is safe for a restore. *)
+(*     That a manifest matches its bundle and that reuse reads no bundle   *)
+(*     byte are P70's and P69's (Rust). The model checks the order alone:  *)
+(*     a record never lacks its manifest.                                  *)
 (*                                                                         *)
 (* CODE MAP (A = crates/bulkload-agent/src)                                *)
 (*   StartBase, BaseRecord  A/estate.rs prepare_base, retained_base,      *)
@@ -109,6 +117,8 @@
 (*   Publish                A/estate.rs publish_bundle                    *)
 (*   Sidecars               A/estate.rs publish_prior, publish_sidecars,  *)
 (*                          capture_item's {bundle}.base write            *)
+(*   ReuseSidecar           A/estate.rs publish_reuse (lane L7); read by   *)
+(*                          retained_manifest, reuse_offer                 *)
 (*   Record                 A/estate.rs capture_item's {item}.capture     *)
 (*   GC                     Q46 STATE/CORPUS GC (lane L8, no code yet)    *)
 (*   ApplyOutcome           A/estate.rs apply_item, import_base,          *)
@@ -137,13 +147,14 @@ CONSTANTS
     BaseMissingTyped, \* apply refuses a missing plan base by name, as the
                       \* code does since lane L6b (stage_base, #181);
                       \* FALSE is the bare IO before it (README)
+    ReuseManifest,    \* L7: a pass publishes {bundle}.reuse before its record
     Mutation,         \* "none", or one deliberate rule break
     BudgetSeconds     \* wall-clock budget, checked by WithinBudget
 
 Mutations == {"none", "chain_ignores_depth", "gc_deletes_depended",
               "base_replaced_live", "sidecar_after_record",
               "skip_flatten_verify", "hit_ignores_chain",
-              "reroot_pre_mismatch"}
+              "reroot_pre_mismatch", "reuse_after_record"}
 
 (* The decision core's closed unions: catalogue/Types.dhall types them, and *)
 (* tla-check requires these sets to equal the catalogue's labels.          *)
@@ -159,6 +170,7 @@ ASSUME /\ IsFiniteSet(Items) /\ Items # {}
        /\ MaxCommits \in Nat /\ MaxRewrites \in Nat /\ MaxCrashes \in Nat
        /\ MaxDamage \in Nat /\ DamageBase \in BOOLEAN
        /\ DamageRewrites \in BOOLEAN /\ BaseMissingTyped \in BOOLEAN
+       /\ ReuseManifest \in BOOLEAN
        /\ Mutation \in Mutations /\ BudgetSeconds \in Nat
 
 \* Two or more items share one common repository, so one plan base.
@@ -179,13 +191,15 @@ VARIABLES
               \*   never published) | "ok" | "missing" | "replaced"
               \*   | "collected"
     sidecar,  \* bundle id -> its dependency sidecars, or NoSidecar
+    manifest, \* the bundle ids whose {bundle}.reuse manifest exists (L7)
     rec,      \* item -> the bundle its {item}.capture record names (0: none)
     baseRec,  \* the bundle shared-{group}.base names (0: none)
     cap,      \* the capture pass in flight (one at a time: estate.lock)
     crashes,  \* crashes so far
     damage    \* third-party damage so far
 
-vars == <<src, meta, corpus, sidecar, rec, baseRec, cap, crashes, damage>>
+vars == <<src, meta, corpus, sidecar, manifest, rec, baseRec, cap, crashes,
+          damage>>
 
 Ids == 1..Len(meta)
 
@@ -494,14 +508,14 @@ StartBase(i) ==
             /\ sidecar' = Append(sidecar, NoSidecar)
             /\ cap' = [Idle EXCEPT !.st = "baserec", !.item = i,
                                    !.b = Len(meta) + 1]
-    /\ UNCHANGED <<src, rec, baseRec, crashes, damage>>
+    /\ UNCHANGED <<src, manifest, rec, baseRec, crashes, damage>>
 
 \* prepare_base's write of shared-{group}.base; the pass goes on.
 BaseRecord ==
     /\ cap.st = "baserec"
     /\ baseRec' = cap.b
     /\ cap' = [cap EXCEPT !.st = "decide", !.b = 0]
-    /\ UNCHANGED <<src, meta, corpus, sidecar, rec, crashes, damage>>
+    /\ UNCHANGED <<src, meta, corpus, sidecar, manifest, rec, crashes, damage>>
 
 \* capture_item: decide, then export into a STATE attempt (or reuse the
 \* retained capture, or refuse by name). The export's name is its content:
@@ -525,7 +539,13 @@ Capture(i) ==
                                   b |-> Len(meta) + 1, plan |-> plan]
           ELSE /\ cap' = Idle
                /\ UNCHANGED <<meta, corpus, sidecar>>
-    /\ UNCHANGED <<src, rec, baseRec, crashes, damage>>
+    /\ UNCHANGED <<src, manifest, rec, baseRec, crashes, damage>>
+
+\* The step after a bundle's dependency sidecars: its reuse manifest (lane
+\* L7), then its record. reuse_after_record writes the record first.
+BeforeRecord ==
+    IF ReuseManifest /\ Mutation # "reuse_after_record" THEN "reuse"
+    ELSE "record"
 
 \* publish_bundle: hard link into CORPUS under the content name, sealed. A
 \* file already there at the same digest is reused; one rewritten in place
@@ -539,8 +559,8 @@ Publish ==
             /\ cap' = [cap EXCEPT !.st =
                          IF DeclaresPrereqs(cap.b)
                             /\ Mutation # "sidecar_after_record"
-                         THEN "sidecars" ELSE "record"]
-    /\ UNCHANGED <<src, meta, sidecar, rec, baseRec, crashes, damage>>
+                         THEN "sidecars" ELSE BeforeRecord]
+    /\ UNCHANGED <<src, meta, sidecar, manifest, rec, baseRec, crashes, damage>>
 
 \* {bundle}.base and publish_prior's {bundle}.prior, before the record. An
 \* intact chain already recorded for this name stands (identical bytes
@@ -555,16 +575,30 @@ Sidecars ==
                         IF keep THEN [@ EXCEPT !.base = cap.plan.base]
                         ELSE cap.plan]
     /\ cap' = IF Mutation = "sidecar_after_record" THEN Idle
+              ELSE [cap EXCEPT !.st = BeforeRecord]
+    /\ UNCHANGED <<src, meta, corpus, manifest, rec, baseRec, crashes, damage>>
+
+\* publish_reuse (lane L7): the bundle's {bundle}.reuse manifest, bound to
+\* it by digest, before the record. A re-export onto a name that has one
+\* writes the same list again.
+ReuseSidecar ==
+    /\ cap.st = "reuse"
+    /\ manifest' = manifest \cup {cap.b}
+    /\ cap' = IF Mutation = "reuse_after_record" THEN Idle
               ELSE [cap EXCEPT !.st = "record"]
-    /\ UNCHANGED <<src, meta, corpus, rec, baseRec, crashes, damage>>
+    /\ UNCHANGED <<src, meta, corpus, sidecar, rec, baseRec, crashes, damage>>
 
 \* The {item}.capture record names the new bundle.
 Record ==
     /\ cap.st = "record"
     /\ rec' = [rec EXCEPT ![cap.item] = cap.b]
     /\ cap' = IF Mutation = "sidecar_after_record" /\ DeclaresPrereqs(cap.b)
-              THEN [cap EXCEPT !.st = "sidecars"] ELSE Idle
-    /\ UNCHANGED <<src, meta, corpus, sidecar, baseRec, crashes, damage>>
+              THEN [cap EXCEPT !.st = "sidecars"]
+              ELSE IF Mutation = "reuse_after_record" /\ ReuseManifest
+              THEN [cap EXCEPT !.st = "reuse"]
+              ELSE Idle
+    /\ UNCHANGED <<src, meta, corpus, sidecar, manifest, baseRec, crashes,
+                   damage>>
 
 \* Q46 GC under estate.lock: remove a CORPUS bundle (and its sidecars) that
 \* no record and no base record depends on, one per step. gc_deletes_
@@ -582,6 +616,7 @@ GC ==
     /\ \E b \in Garbage :
           /\ corpus' = [corpus EXCEPT ![b] = "collected"]
           /\ sidecar' = [sidecar EXCEPT ![b] = NoSidecar]
+          /\ manifest' = manifest \ {b}
     /\ UNCHANGED <<src, meta, rec, baseRec, cap, crashes, damage>>
 
 (* Environment *)
@@ -590,13 +625,15 @@ GC ==
 Advance ==
     /\ src.ver < MaxCommits
     /\ src' = [src EXCEPT !.ver = @ + 1]
-    /\ UNCHANGED <<meta, corpus, sidecar, rec, baseRec, cap, crashes, damage>>
+    /\ UNCHANGED <<meta, corpus, sidecar, manifest, rec, baseRec, cap, crashes,
+                   damage>>
 
 \* The source history is rewritten and pruned: no retained tip is held.
 Rewrite ==
     /\ src.gen < MaxRewrites
     /\ src' = [src EXCEPT !.gen = @ + 1]
-    /\ UNCHANGED <<meta, corpus, sidecar, rec, baseRec, cap, crashes, damage>>
+    /\ UNCHANGED <<meta, corpus, sidecar, manifest, rec, baseRec, cap, crashes,
+                   damage>>
 
 \* A third party deletes a CORPUS bundle or rewrites it in place.
 Damage ==
@@ -610,7 +647,7 @@ Damage ==
                         ELSE {"missing"} :
                 corpus' = [corpus EXCEPT ![b] = how]
     /\ damage' = damage + 1
-    /\ UNCHANGED <<src, meta, sidecar, rec, baseRec, cap, crashes>>
+    /\ UNCHANGED <<src, meta, sidecar, manifest, rec, baseRec, cap, crashes>>
 
 \* The capture host crashes inside a pass: every durable step stands, the
 \* STATE attempt is left behind, the pass is lost.
@@ -618,13 +655,14 @@ Crash ==
     /\ crashes < MaxCrashes /\ cap.st # "idle"
     /\ cap' = Idle
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<src, meta, corpus, sidecar, rec, baseRec, damage>>
+    /\ UNCHANGED <<src, meta, corpus, sidecar, manifest, rec, baseRec, damage>>
 
 Init ==
     /\ src = [ver |-> 0, gen |-> 0]
     /\ meta = <<>>
     /\ corpus = <<>>
     /\ sidecar = <<>>
+    /\ manifest = {}
     /\ rec = [i \in Items |-> 0]
     /\ baseRec = 0
     /\ cap = Idle
@@ -635,7 +673,7 @@ Protocol ==
     \/ \E i \in Items : StartBase(i)
     \/ BaseRecord
     \/ \E i \in Items : Capture(i)
-    \/ Publish \/ Sidecars \/ Record \/ GC
+    \/ Publish \/ Sidecars \/ ReuseSidecar \/ Record \/ GC
 
 Environment == Advance \/ Rewrite \/ Damage \/ Crash
 
@@ -675,7 +713,9 @@ TypeOK ==
     /\ \A b, c \in Ids : meta[b] = meta[c] => b = c
     /\ rec \in [Items -> 0..Len(meta)]
     /\ baseRec \in 0..Len(meta)
-    /\ cap.st \in {"idle", "baserec", "decide", "publish", "sidecars", "record"}
+    /\ manifest \subseteq Ids
+    /\ cap.st \in {"idle", "baserec", "decide", "publish", "sidecars", "reuse",
+                  "record"}
     /\ cap.item \in Items /\ cap.b \in 0..Len(meta) /\ cap.plan \in SidecarRec
     /\ crashes \in 0..MaxCrashes /\ damage \in 0..MaxDamage
     /\ \A i \in Items :
@@ -717,6 +757,13 @@ SidecarsBeforeRecord ==
     \A i \in Items : rec[i] # 0 =>
         /\ corpus[rec[i]] # "staged"
         /\ DeclaresPrereqs(rec[i]) => HasSidecars(rec[i])
+
+\* Lane L7: a record names a bundle whose reuse manifest exists, so the pass
+\* after any crash reuses that capture's blobs from its manifest and never
+\* fetches the bundle to learn what it holds (P69). A restore never reads
+\* the manifest, so either order restores; this is the order's own claim.
+ReuseManifestBeforeRecord ==
+    ReuseManifest => \A i \in Items : rec[i] # 0 => rec[i] \in manifest
 
 \* Every record restores; or its item's next capture recaptures (exports a
 \* new record) or refuses by name, keeping the missing custody visible. An

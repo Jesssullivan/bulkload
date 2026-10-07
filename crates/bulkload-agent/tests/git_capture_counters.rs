@@ -165,8 +165,9 @@ fn a_capture_counts_its_pack_its_censuses_and_its_reuse_reads() {
     assert!(first["write_source_pack_bytes"] >= HISTORY as u64);
     // commit, root tree, two blobs, plus the capture's own refs' objects.
     assert!(first["write_source_pack_objects"] >= 4, "{first:?}");
-    // Nothing was retained, so nothing was fetched for reuse.
+    // Nothing was retained, so nothing was fetched or listed for reuse.
     assert_eq!(first["read_source_capture_reuse_bytes"], 0);
+    assert_eq!(first["read_reuse_manifest_bytes"], 0);
     // A changed item costs four metadata censuses today: the pre-pass key,
     // the export's own census before and after its byte pass, and the
     // post-pass key (architecture review finding 5; WP7 reduces it).
@@ -179,12 +180,25 @@ fn a_capture_counts_its_pack_its_censuses_and_its_reuse_reads() {
     assert_eq!(reused["write_source_pack_objects"], 0);
     assert_eq!(reused["read_source_pack_readback_bytes"], 0);
     assert_eq!(reused["read_source_file_bytes"], 0);
+    // A hit reads no manifest either: the manifest serves blob reuse only.
+    assert_eq!(reused["read_reuse_manifest_bytes"], 0);
 
     std::fs::write(estate.source.join("file"), b"changed").unwrap();
     run(git(&estate.source).args(["commit", "--quiet", "-am", "change"]));
     let changed = capture(&estate);
-    // The retained capture is fetched once for blob reuse, and counted.
-    assert_eq!(changed["read_source_capture_reuse_bytes"], size);
+    // Q42 lane L7 (P69 REUSE-COST): the rerun reuses the retained capture's
+    // blobs from its `{bundle}.reuse` manifest, looked up in the source
+    // object store. Nothing here is dirty, so there is no miss and no bundle
+    // byte is read. Before lane L7 this pin was `size`, the whole retained
+    // bundle: the pass fetched it to learn what it held.
+    assert_eq!(changed["read_source_capture_reuse_bytes"], 0);
+    assert_eq!(changed["reuse_dirty_misses"], 0);
+    let mut manifest = written[0].as_os_str().to_owned();
+    manifest.push(".reuse");
+    assert_eq!(
+        changed["read_reuse_manifest_bytes"],
+        std::fs::metadata(&manifest).unwrap().len()
+    );
     assert!(changed["write_source_pack_objects"] >= 1);
     // WP2 PR 2: the rerun declares the retained capture's source-held tips
     // as prerequisites, so it packs only the new commit, its tree and blob,
