@@ -87,14 +87,9 @@ mod tests {
     }
 
     proptest::proptest! {
-        // Fixed seed (OI-1003-Q7); fold into the shared
-        // `test_support::prop_config` once it lands on main.
-        #![proptest_config(proptest::test_runner::Config {
-            cases: 256,
-            rng_seed: proptest::test_runner::RngSeed::Fixed(0x7265_6675_7365_6174),
-            failure_persistence: None,
-            ..proptest::test_runner::Config::default()
-        })]
+        // The shared fixed-seed corpus (OI-1003-Q7). The seed moved from this
+        // block's own `0x7265_6675_7365_6174` to `test_support::CI_SEED`.
+        #![proptest_config(crate::test_support::prop_config(256))]
 
         /// Every OS error keeps its errno through `.refuse_at`, and a value
         /// passes through untouched.
