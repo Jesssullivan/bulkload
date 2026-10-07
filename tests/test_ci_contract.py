@@ -307,12 +307,77 @@ PINNED_JUST_RECIPES = {
     # The deep tier (OI-1003-Q78, OI-1003-Q81): on demand, never a gate.
     "props-deep": (
         "props-deep:",
-        ("cd {{ root }} && BULKLOAD_PROPTEST_DEEP=1 cargo test --workspace --locked",),
+        (
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "cd {{ root }}",
+            "export BULKLOAD_PROPTEST_DEEP=1",
+            "cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained",
+            'log=$(mktemp "${TMPDIR:-/tmp}/props-deep.XXXXXX")',
+            "trap 'rm -f \"$log\"' EXIT",
+            "row() {",
+            "    local name=$1 marker=$2 status=0",
+            "    shift 2",
+            '    cargo test -p bulkload-agent --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee "$log" || status=$?',
+            "    if [[ $status -ne 0 ]]; then",
+            '        echo "props-deep: $name failed with status $status" >&2',
+            '        exit "$status"',
+            "    fi",
+            "    if grep -q 'skipped: set ' \"$log\"; then",
+            '        echo "props-deep: $name skipped itself" >&2',
+            "        exit 1",
+            "    fi",
+            "    results=$(grep -c '^test result: ' \"$log\" || true)",
+            "    passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' \"$log\" || true)",
+            '    proved=$(grep -c "^test $name \\.\\.\\. ok$" "$log" || true)',
+            '    marked=$(grep -c "^$marker" "$log" || true)',
+            "    if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then",
+            "        echo \"props-deep: $name: expected exactly one '1 passed; 0 failed' result, the row's own\" >&2",
+            "        exit 1",
+            "    fi",
+            "    if [[ $marked -ne 1 ]]; then",
+            "        echo \"props-deep: $name printed $marked '$marker' lines, not 1: the row did not run\" >&2",
+            "        exit 1",
+            "    fi",
+            "}",
+            "row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib",
+            "row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct",
+            "row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct",
+            'echo "props-deep: the workspace and all 3 deep rows ran"',
+        ),
     ),
     "crash-sweep": (
         "crash-sweep:",
         (
-            "cd {{ root }} && BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness crash_sweep_every_point_and_nth -- --exact --nocapture",
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "cd {{ root }}",
+            'log=$(mktemp "${TMPDIR:-/tmp}/crash-sweep.XXXXXX")',
+            "trap 'rm -f \"$log\"' EXIT",
+            "status=0",
+            'BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness crash_sweep_every_point_and_nth -- --exact --nocapture 2>&1 | tee "$log" || status=$?',
+            "if [[ $status -ne 0 ]]; then",
+            '    echo "crash-sweep: cargo test failed with status $status" >&2',
+            '    exit "$status"',
+            "fi",
+            "if grep -q 'crash sweep skipped' \"$log\"; then",
+            '    echo "crash-sweep: the sweep skipped itself" >&2',
+            "    exit 1",
+            "fi",
+            "results=$(grep -c '^test result: ' \"$log\" || true)",
+            "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' \"$log\" || true)",
+            "proved=$(grep -c '^test crash_sweep_every_point_and_nth \\.\\.\\. ok$' \"$log\" || true)",
+            "if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then",
+            "    echo \"crash-sweep: expected exactly one '1 passed; 0 failed' result, the sweep's own\" >&2",
+            "    exit 1",
+            "fi",
+            "points=$(sed -n 's/^crash-sweep: \\([1-9][0-9]*\\) points, [1-9][0-9]* crashes, 0 failures, .*$/\\1/p' \"$log\")",
+            "swept=$(grep -c '^crash-sweep: [^ ]* hits=[1-9][0-9]* ' \"$log\" || true)",
+            "if [[ ! $points =~ ^[1-9][0-9]*$ || $swept -ne $points ]]; then",
+            "    echo \"crash-sweep: expected one '<n> points, <m> crashes, 0 failures' line and n 'hits=' lines; got '$points' and $swept\" >&2",
+            "    exit 1",
+            "fi",
+            'echo "crash-sweep: all $points points were swept"',
         ),
     ),
     "check": (
@@ -428,6 +493,66 @@ def validate_rust_test_groups(justfile: str) -> None:
         )
 
 
+# The deep tier (OI-1003-Q78, OI-1003-Q81) is the only run of the tests
+# that left the PR gate, and each of them passes when it skips itself: a
+# heavy row returns early unless BULKLOAD_PROPTEST_DEEP=1, the sweep unless
+# BULKLOAD_CRASH_SWEEP=1, and a name filter that matches nothing reports `0
+# passed`. Each line below is what makes its recipe fail unless the test
+# really ran (R-N122).
+DEEP_ROWS = (
+    "row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib",
+    "row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct",
+    "row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct",
+)
+PROPS_DEEP_REQUIRED = (
+    "export BULKLOAD_PROPTEST_DEEP=1",
+    "cargo test --workspace --locked -- "
+    "--skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed "
+    "--skip distinct_heavy_32768_refs_import_linearly_and_chain_thin "
+    "--skip distinct_heavy_110000_refs_chain_falls_back_self_contained",
+    '    cargo test -p bulkload-agent --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee "$log" || status=$?',
+    "    if [[ $status -ne 0 ]]; then",
+    "    if grep -q 'skipped: set ' \"$log\"; then",
+    "    results=$(grep -c '^test result: ' \"$log\" || true)",
+    "    passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' \"$log\" || true)",
+    '    proved=$(grep -c "^test $name \\.\\.\\. ok$" "$log" || true)',
+    '    marked=$(grep -c "^$marker" "$log" || true)',
+    "    if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then",
+    "    if [[ $marked -ne 1 ]]; then",
+    *DEEP_ROWS,
+)
+CRASH_SWEEP_REQUIRED = (
+    "BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked "
+    "--features fault-injection,io-trace --target-dir target/fault "
+    "--test fault_harness crash_sweep_every_point_and_nth "
+    '-- --exact --nocapture 2>&1 | tee "$log" || status=$?',
+    "if [[ $status -ne 0 ]]; then",
+    "if grep -q 'crash sweep skipped' \"$log\"; then",
+    "results=$(grep -c '^test result: ' \"$log\" || true)",
+    "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' \"$log\" || true)",
+    "proved=$(grep -c '^test crash_sweep_every_point_and_nth \\.\\.\\. ok$' \"$log\" || true)",
+    "if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then",
+    "points=$(sed -n 's/^crash-sweep: \\([1-9][0-9]*\\) points, [1-9][0-9]* crashes, 0 failures, .*$/\\1/p' \"$log\")",
+    "swept=$(grep -c '^crash-sweep: [^ ]* hits=[1-9][0-9]* ' \"$log\" || true)",
+    "if [[ ! $points =~ ^[1-9][0-9]*$ || $swept -ne $points ]]; then",
+)
+
+
+def validate_deep_recipes(justfile: str) -> None:
+    """`props-deep` and `crash-sweep` must fail unless the tests that left
+    the PR gate really ran."""
+    for name, required, runs in (
+        ("props-deep", PROPS_DEEP_REQUIRED, 2),
+        ("crash-sweep", CRASH_SWEEP_REQUIRED, 1),
+    ):
+        _, body = just_recipe(justfile, name)
+        for line in required:
+            if body.count(line) != 1:
+                raise ContractError(f"{name} must fail unless its tests ran: {line}")
+        if sum("cargo test -" in line for line in body) != runs:
+            raise ContractError(f"{name} must run cargo test only as pinned")
+
+
 # Top-level justfile lines that change how every recipe runs: settings,
 # exports, imports, modules, aliases and variables. A later `set
 # allow-duplicate-recipes`, a redirected `root :=` or an `export PATH := stub`
@@ -474,6 +599,7 @@ def validate_just_recipes(justfile: str, imported: str | None = None) -> None:
                 raise ContractError(f"imported justfile must not declare {name}")
     validate_p5_alone(justfile)
     validate_rust_test_groups(justfile)
+    validate_deep_recipes(justfile)
 
 
 def sha256(source: str) -> str:
@@ -3882,9 +4008,74 @@ class CiContractTest(unittest.TestCase):
                 "ci-source: check-source secrets-scan-history contract-test props-deep",
                 1,
             ),
+            # The deep recipes are the only run of the tests that left the PR
+            # gate, and each test passes when it skips itself. A recipe that
+            # loses its switch, its exact name, a row, or one of its "really
+            # ran" checks is green without running them (R-N122).
+            justfile.replace("    export BULKLOAD_PROPTEST_DEEP=1\n", "", 1),
+            justfile.replace("    " + DEEP_ROWS[0] + "\n", "", 1),
+            justfile.replace("    " + DEEP_ROWS[1] + "\n", "", 1),
+            justfile.replace("    " + DEEP_ROWS[2] + "\n", "", 1),
             justfile.replace(
-                "    cd {{ root }} && BULKLOAD_PROPTEST_DEEP=1 cargo test --workspace --locked\n",
-                "    cd {{ root }} && cargo test --workspace --locked\n",
+                "'REFS-SCALE-DISTINCT row=deep-32768 pass=2 '",
+                "'REFS-SCALE-DISTINCT row=deep-32768 '",
+                1,
+            ),
+            justfile.replace(
+                '"$@" "$name" -- --exact --nocapture', '"$@" "$name" -- --nocapture', 1
+            ),
+            justfile.replace(
+                '"$@" "$name" -- --exact --nocapture', '"$@" "$name" -- --exact', 1
+            ),
+            justfile.replace(
+                "        if grep -q 'skipped: set ' \"$log\"; then\n",
+                "        if false; then\n",
+                1,
+            ),
+            justfile.replace(
+                "        if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then\n",
+                "        if [[ $results -ne 1 ]]; then\n",
+                1,
+            ),
+            justfile.replace(
+                "        if [[ $marked -ne 1 ]]; then\n", "        if false; then\n", 1
+            ),
+            justfile.replace(
+                '2>&1 | tee "$log" || status=$?\n        if',
+                '2>&1 | tee "$log" || true\n        if',
+                1,
+            ),
+            justfile.replace(
+                "    BULKLOAD_CRASH_SWEEP=1 cargo test", "    cargo test", 1
+            ),
+            justfile.replace(
+                "crash_sweep_every_point_and_nth -- --exact --nocapture",
+                "crash_sweep_every_point_and_nth -- --nocapture",
+                1,
+            ),
+            justfile.replace(
+                "crash_sweep_every_point_and_nth -- --exact --nocapture",
+                "crash_sweep_every_point_and_nth -- --exact",
+                1,
+            ),
+            justfile.replace(
+                "    if grep -q 'crash sweep skipped' \"$log\"; then\n",
+                "    if false; then\n",
+                1,
+            ),
+            justfile.replace(
+                "    if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then\n",
+                "    if [[ $passed -lt 1 ]]; then\n",
+                1,
+            ),
+            justfile.replace(
+                "    if [[ ! $points =~ ^[1-9][0-9]*$ || $swept -ne $points ]]; then\n",
+                "    if false; then\n",
+                1,
+            ),
+            justfile.replace(
+                "[1-9][0-9]* crashes, 0 failures, ",
+                "[0-9]* crashes, [0-9]* failures, ",
                 1,
             ),
             justfile.replace("    " + harness_test + "\n", "", 1),

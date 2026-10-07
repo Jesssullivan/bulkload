@@ -54,8 +54,14 @@ use bulkload_agent::git_carry::{
     export_repository, export_repository_with_drift, shared, ExportOptions,
 };
 
-/// `test_support::DEEP`, mirrored: the switch for the deep tier.
-const DEEP: &str = "BULKLOAD_PROPTEST_DEEP";
+/// The library's `test_support`, compiled here from its source (the library
+/// module is `#[cfg(test)] pub(crate)`), so the deep switch is the helper's
+/// own and cannot drift from it. This file draws no property, so the rest of
+/// the helper is unused here.
+#[path = "../src/test_support.rs"]
+#[allow(dead_code)]
+mod test_support;
+
 /// The import's CPU budget per distinct object (a debug build). These rows
 /// measured 0.53 to 0.95 ms per distinct object on sting at load 3 to 22:
 /// 17.4 to 21.2 s self-contained and 24.8 to 31.2 s thin at 32,768
@@ -431,9 +437,12 @@ fn distinct_row(name: &str, refs: usize) -> bool {
 
 /// Whether this run is the deep tier; a skipped deep row says so.
 fn deep(row: &str) -> bool {
-    let deep = std::env::var_os(DEEP).is_some_and(|value| value == "1");
+    let deep = test_support::deep();
     if !deep {
-        eprintln!("REFS-SCALE-DISTINCT row={row} skipped: set {DEEP}=1");
+        eprintln!(
+            "REFS-SCALE-DISTINCT row={row} skipped: set {}=1",
+            test_support::DEEP
+        );
     }
     deep
 }

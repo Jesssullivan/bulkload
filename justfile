@@ -310,14 +310,59 @@ check-full: check-fast check-optional
 
 # Deep tier (OI-1003-Q7, OI-1003-Q78, OI-1003-Q81): on demand, never a PR
 # gate, and in neither tier above, because it runs for many minutes.
-# `props-deep` runs the workspace tests with BULKLOAD_PROPTEST_DEEP=1: every
-# property draws twenty times its PR-gate cases from the same fixed seed
-# (`test_support::prop_config`; the seed is fixed everywhere), and the heavy
-# fixed rows that skip themselves in the PR gate run (REFS-SCALE's 131,072
-# refs; the distinct-heavy 32,768 and 110,000 commits). A deep failure
+# `props-deep` runs the workspace tests with BULKLOAD_PROPTEST_DEEP=1. Every
+# property that runs through `test_support::prop_config` draws twenty times
+# its PR-gate cases from the same fixed seed, so a deep failure of one
 # reproduces with the same command; pin its shape as an explicit test row.
+# Two properties do not run through the helper yet (the EXEMPT entries of
+# `tests/prop_seed_guard.rs`): `git_carry_v2::random_dags_equal_upload_pack`
+# draws 12 cases from a random seed, here and in the PR gate, until Q42 L5
+# (#189) deletes its file; `refusal_taxonomy` keeps its own fixed seed and
+# its PR-gate case count. The heavy fixed rows that skip themselves in the
+# PR gate run here: REFS-SCALE's 131,072 refs, and the distinct-heavy 32,768
+# and 110,000 commits. A skipped row still reports `ok`, and the workspace
+# run captures its output, so each row is left out of that run and then run
+# alone. The recipe fails unless each one really ran: on a cargo failure, on
+# a `skipped: set` line, on anything but one `1 passed; 0 failed` result
+# with the row's own `ok` line, or without the row's measurement line, which
+# only its body prints (R-N122).
 props-deep:
-    cd {{ root }} && BULKLOAD_PROPTEST_DEEP=1 cargo test --workspace --locked
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    export BULKLOAD_PROPTEST_DEEP=1
+    cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained
+    log=$(mktemp "${TMPDIR:-/tmp}/props-deep.XXXXXX")
+    trap 'rm -f "$log"' EXIT
+    row() {
+        local name=$1 marker=$2 status=0
+        shift 2
+        cargo test -p bulkload-agent --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee "$log" || status=$?
+        if [[ $status -ne 0 ]]; then
+            echo "props-deep: $name failed with status $status" >&2
+            exit "$status"
+        fi
+        if grep -q 'skipped: set ' "$log"; then
+            echo "props-deep: $name skipped itself" >&2
+            exit 1
+        fi
+        results=$(grep -c '^test result: ' "$log" || true)
+        passed=$(grep -c '^test result: ok\. 1 passed; 0 failed;' "$log" || true)
+        proved=$(grep -c "^test $name \.\.\. ok$" "$log" || true)
+        marked=$(grep -c "^$marker" "$log" || true)
+        if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then
+            echo "props-deep: $name: expected exactly one '1 passed; 0 failed' result, the row's own" >&2
+            exit 1
+        fi
+        if [[ $marked -ne 1 ]]; then
+            echo "props-deep: $name printed $marked '$marker' lines, not 1: the row did not run" >&2
+            exit 1
+        fi
+    }
+    row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib
+    row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct
+    row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct
+    echo "props-deep: the workspace and all 3 deep rows ran"
 
 # Deep tier, on demand, never a PR gate: the W7 crash sweep. For every point
 # of the fault harness's `scenarios!` table it crashes one copy at every hit
@@ -326,8 +371,42 @@ props-deep:
 # prints one `crash-sweep: <point> hits=<n>` line per point. The PR gate
 # runs only the table's pinned (point, nth) rows. BULKLOAD_CRASH_SWEEP_JOBS
 # sets how many points run at a time (default: a quarter of the cores).
+# Without BULKLOAD_CRASH_SWEEP=1 the test passes after it prints `skipped`,
+# and a name filter that matches nothing reports `0 passed`, so this recipe
+# fails unless the sweep really ran: on a cargo failure, on a `skipped`
+# line, on anything but one `1 passed; 0 failed` result with the sweep's own
+# `ok` line, or without one `<n> points, <m> crashes, 0 failures` line and n
+# `hits=` lines with n and every hit count above 0 (R-N122).
 crash-sweep:
-    cd {{ root }} && BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness crash_sweep_every_point_and_nth -- --exact --nocapture
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    log=$(mktemp "${TMPDIR:-/tmp}/crash-sweep.XXXXXX")
+    trap 'rm -f "$log"' EXIT
+    status=0
+    BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness crash_sweep_every_point_and_nth -- --exact --nocapture 2>&1 | tee "$log" || status=$?
+    if [[ $status -ne 0 ]]; then
+        echo "crash-sweep: cargo test failed with status $status" >&2
+        exit "$status"
+    fi
+    if grep -q 'crash sweep skipped' "$log"; then
+        echo "crash-sweep: the sweep skipped itself" >&2
+        exit 1
+    fi
+    results=$(grep -c '^test result: ' "$log" || true)
+    passed=$(grep -c '^test result: ok\. 1 passed; 0 failed;' "$log" || true)
+    proved=$(grep -c '^test crash_sweep_every_point_and_nth \.\.\. ok$' "$log" || true)
+    if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then
+        echo "crash-sweep: expected exactly one '1 passed; 0 failed' result, the sweep's own" >&2
+        exit 1
+    fi
+    points=$(sed -n 's/^crash-sweep: \([1-9][0-9]*\) points, [1-9][0-9]* crashes, 0 failures, .*$/\1/p' "$log")
+    swept=$(grep -c '^crash-sweep: [^ ]* hits=[1-9][0-9]* ' "$log" || true)
+    if [[ ! $points =~ ^[1-9][0-9]*$ || $swept -ne $points ]]; then
+        echo "crash-sweep: expected one '<n> points, <m> crashes, 0 failures' line and n 'hits=' lines; got '$points' and $swept" >&2
+        exit 1
+    fi
+    echo "crash-sweep: all $points points were swept"
 
 # Normal attached gate: materialize the repo tools, then use the Flywheel
 # wrapper for the Bazel graph.

@@ -35,14 +35,17 @@ digest moved. No crate was added: `cargo nextest` is not in the dev shell
    feature alone.
 3. **Deep tier.** `just props-deep` and `just crash-sweep`, on demand, never
    a PR gate, in neither `check-optional` nor `check-full` (they take 30 and
-   20 minutes here).
+   20 minutes here). Both recipes fail unless their tests really ran (see
+   "Review fixes").
 4. **OI-1003-Q78.** `test_support::prop_config` keeps
    `RngSeed::Fixed(CI_SEED)` in the deep tier and only multiplies cases by
-   20. `prop_seed_guard::the_helper_fixes_the_seed_and_persists_nothing`
-   now asserts the seed in both tiers. Doc text that said the deep tier is
-   random is corrected in `git_estimate_dag.rs`, `s3_walk_resume.rs`,
-   `s3_transfer_resume.rs`, `decide_tests.rs` and the plan (the conventions,
-   D3, and the P18, P19, P21, P23, P66 and P67 rows).
+   20. The tier is a parameter (`prop_config_for(cases, deep)`), and
+   `prop_seed_guard` asks for both tiers in the PR gate (see "Review
+   fixes"). Doc text that said the deep tier is random is corrected in
+   `git_estimate_dag.rs`, `s3_walk_resume.rs`, `s3_transfer_resume.rs`,
+   `decide_tests.rs` and the plan (the conventions, D3, and the P18, P19,
+   P21, P23, P66 and P67 rows). Two properties are not on the helper; see
+   Open 8.
 5. **P30.** `fd_limit.rs` holds both rows; `fd_limit_directories.rs` is
    deleted. Both `#[test]` names are unchanged; a mutex in the file runs
    them one at a time, because both lower the process-wide limit.
@@ -106,35 +109,55 @@ the union (490 tests at `34e945e`, compared with `--list`).
 
 ## Measurements (sting, 32 cores, never quiet)
 
-`just check-source` and `just fault-harness`, each from a clean build of its
-own and then warm. "Before" on tmpfs and in the isolated fault rows is a
-`git archive` of main in `/srv/cache/jess/ci-slim-source-gate-base-src`;
-"after" is this worktree. The 1-minute load is given start → end.
+**Read these as rough local numbers, not as the gate saving.** The PR's own
+CI time is the acceptance number; no CI run of this branch existed when this
+was written. What limits them:
 
-| Gate | Run | Before | After |
-|---|---|---|---|
-| `check-source` | main `d9aa729`, TMPDIR on tmpfs, clean build | 594 s (117 → 40) | 319 s (45 → 49) |
-| `check-source` | same, warm | 304 s (40 → 55) | 135 s (61) |
-| `check-source` | main `34e945e`, TMPDIR on the scratch disk, clean build | 545 s (7 → 16) | no green run (below) |
-| `check-source` | same, warm | 408 s (41 → 29) | `rust-check` alone 188 s (18 → 27), all groups green; the lints and the secret scan add about 12 s |
-| `fault-harness` | main `d9aa729`, tmpfs, clean build | 290 s (28 → 47) | 264 s (32 → 41) |
-| `fault-harness` | same, warm | 36 s (30) | 52 s (46) |
-| `fault-harness` | main `34e945e`, disk, clean build | 280 s (33 → 38) | 265 s (71) |
-| `fault-harness` | same, warm | 57 s (31) | 85 s (53) |
+- They were taken at main `d9aa729` and `34e945e`, not at the pushed base
+  `3931471`.
+- "Before" ran from a `git archive` of main in
+  `/srv/cache/jess/ci-slim-source-gate-base-src`; "after" ran from this
+  worktree on `/srv/fast-local`. Different filesystems for the sources.
+- The host was loaded and the load differed between the two sides. The
+  1-minute load is given start → end.
+- Every green run of the new `check-source` had TMPDIR on tmpfs, where
+  fsync is free. **There is no green run of the new `check-source` on a
+  disk** (next section).
 
-- Source gate: about −45 % from a clean build, −55 % warm.
-- Fault gate: −5 to −9 % from a clean build; warm it is slower by a few
-  seconds, because it gained the `io::` lib tests and P5 and lost only four
-  short runs. The plan's estimate (−60–150 s) was too high.
+| Gate | Run | Before | After | Comparable? |
+|---|---|---|---|---|
+| `check-source` | main `d9aa729`, tmpfs, warm | 304 s (40 → 55) | 135 s (61) | yes: the one like-for-like pair, tmpfs only |
+| `check-source` | main `d9aa729`, tmpfs, clean build | 594 s (117 → 40) | 319 s (45 → 49) | no: "before" started at load 117, "after" at 45 |
+| `check-source` | main `34e945e`, scratch disk, clean build | 545 s (7 → 16) | no green run | no |
+| `check-source` | same, warm | 408 s (41 → 29) | `rust-check` alone 188 s (18 → 27), all groups green; the lints and the secret scan were not run with it (about 12 s elsewhere) | no: not the same recipe |
+| `fault-harness` | main `d9aa729`, tmpfs, clean build | 290 s (28 → 47) | 264 s (32 → 41) | roughly |
+| `fault-harness` | same, warm | 36 s (30) | 52 s (46) | roughly |
+| `fault-harness` | main `34e945e`, disk, clean build | 280 s (33 → 38) | 265 s (71) | no: load 33 against 71 |
+| `fault-harness` | same, warm | 57 s (31) | 85 s (53) | no: load 31 against 53 |
+
+- Source gate, warm, tmpfs: 304 s → 135 s (−55 %). That is the only
+  comparable pair, and it is tmpfs only.
+- Source gate, clean build: **not measured like for like.** The first
+  commit's message says "594 s to 319 s from a clean build"; that pair is
+  confounded by load and is tmpfs only, and the commit cannot be reworded
+  without a force-push. The low-load disk "before" was 545 s, so the clean
+  saving is at best about 545 s → 320 s, and only where fsync is free. On a
+  disk-backed runner the saving may be much smaller or absent: the groups
+  contend (below).
+- Fault gate: 15 to 26 s less from a clean build (−5 to −9 %), and 16 to
+  28 s more warm (36 → 52 s on tmpfs, 57 → 85 s on disk, +44 to +49 %),
+  because it gained the `io::` lib tests and P5 and lost only four short
+  runs. The plan's estimate (−60–150 s) was too high.
 - Per group, warm, tmpfs, after: unit 125 s; a to e 20 s; f to g 53 s; rest
   92 s. The unit group bounds the gate.
 - On the scratch disk the groups contend: beside the others `estimate_cli`
   took 115 to 152 s (55 s alone) and `fd_limit` 129 s (43 s alone).
-- Deep tier, once each, green: `props-deep` 1,795 s (lib 593 s,
-  `refs_scale_distinct` 308 s with all three rows run); `crash-sweep`
-  1,171 s: 19 points, 645 crashes, 0 failures, 8 points at a time. Hits per
-  point: 49 for the per-file points, 51 for `receive.after_decide`, 1 for
-  the five `directory.*` points and `serve.before_done`.
+- Deep tier, once each, green, before the review fixes: `props-deep`
+  1,795 s (lib 593 s, `refs_scale_distinct` 308 s with all three rows run);
+  `crash-sweep` 1,171 s: 19 points, 645 crashes, 0 failures, 8 points at a
+  time. Hits per point: 49 for the per-file points, 51 for
+  `receive.after_decide`, 1 for the five `directory.*` points and
+  `serve.before_done`.
 
 Disk runs of the new `check-source` that are **not** in the table: 310 s and
 355 to 394 s from a clean build, 151 to 177 s warm. In each,
@@ -155,14 +178,71 @@ used a private TMPDIR on tmpfs, `/dev/shm/ci-slim-source-gate-cf`, as lane
 `q42-l6b-grouped-chain` did the same evening. tmpfs makes fsync free, so
 those times are lower than a disk's for both columns.
 
+## Review fixes (second commit, 2026-10-07)
+
+The review of `0493713` had 12 findings, 5 medium and 7 low. The five medium
+ones are fixed in a second signed commit. The round was interrupted by a
+reboot of sting at about 01:03 EDT; the edits were on disk, were reviewed
+again line by line, and all nine files were checked whole (`cargo fmt
+--check`, `py_compile`, `just --list`, no NUL bytes).
+
+1. **Q78 is now held in the PR gate.** Before, the guard skipped the helper
+   file and asserted the seed only in the tier the process was in, and PR CI
+   never sets the deep switch; the pre-Q78 helper (random in the deep tier)
+   would have passed. Now:
+   - `test_support::prop_config_for(cases, deep)` takes the tier;
+     `prop_config(cases)` reads the switch through `test_support::deep()`
+     and calls it.
+   - `prop_seed_guard::the_helper_fixes_the_seed_in_both_tiers_and_persists_nothing`
+     asks for `deep = false` and `deep = true` and requires
+     `Fixed(CI_SEED)`, no persistence, and 7 and 140 cases.
+   - `the_helper_source_names_one_fixed_seed` reads the helper's source: one
+     config literal, one seed line (`rng_seed: RngSeed::Fixed(CI_SEED),`),
+     no `Random`, persistence off once.
+   - `the_guard_refuses_a_helper_that_is_not_fixed_everywhere` holds eight
+     helper mutants, the first being the pre-Q78 helper.
+   - The scan refuses a property that calls `prop_config_for` itself.
+2. **"Fixed everywhere" is reworded.** It was false of the pushed tree. The
+   justfile comment, AGENTS.md, the helper's module doc and the plan (§1
+   Conventions, §3, D3) now say "every property that runs through the
+   helper" and name the two that do not (Open 8).
+3. **The deep recipes fail closed (R-N122).** A skipped deep row, a skipped
+   sweep and a name filter that matches nothing all exit 0 in cargo.
+   - `props-deep` leaves the three heavy rows out of the workspace run
+     (`--skip`) and runs each alone with `--exact --nocapture`. It fails on
+     a cargo failure, on a `skipped: set` line, on anything but one
+     `1 passed; 0 failed` result with the row's own `ok` line, and unless
+     the row's measurement line appears once (`REFS-SCALE row=fixed refs=`,
+     `REFS-SCALE-DISTINCT row=deep-32768 pass=2`, `REFS-SCALE-DISTINCT
+     row=deep pass=2`). Only the row's body prints that line.
+   - `crash-sweep` fails on a cargo failure, on the `crash sweep skipped`
+     line, on anything but one `1 passed; 0 failed` result with the sweep's
+     own `ok` line, and unless there is one `<n> points, <m> crashes, 0
+     failures` line and n `hits=` lines, with n and every count above 0.
+   - `refs_scale_distinct.rs` no longer mirrors the switch's name: it
+     compiles `src/test_support.rs` and calls `test_support::deep()`, as
+     `refs_scale_tests.rs` now does too.
+   - Contract test: both bodies are re-pinned, `validate_deep_recipes`
+     requires each guard line exactly once and no extra `cargo test`, and
+     there are 18 new mutation rows (a lost switch, a lost row, a lost
+     `--exact` or `--nocapture`, each check turned off).
+4. **The timing claim is withdrawn as a headline** (Measurements, above).
+   Only the warm tmpfs pair is like for like. Nothing was re-measured: the
+   host ran at a 1-minute load of 100 to 127 during this round, so a new
+   pair would be no better. The PR's CI run is the evidence.
+
 ## Validation
 
-- `tests/test_ci_contract.py`: 24 tests, OK.
-- `cargo clippy` with default features, and with
-  `fault-injection,io-trace`: clean.
-- `just props-deep` and `just crash-sweep`: green (above), at `34e945e` plus
-  this lane.
-- `just check-fast`: see the receipt at the end of this note.
+- `tests/test_ci_contract.py`: 24 tests, OK (after the review fixes).
+- `prop_seed_guard`: 8 tests, OK.
+- A skipped deep row was run by hand with the recipe's flags and no switch:
+  it prints `REFS-SCALE-DISTINCT row=deep-32768 skipped: set
+  BULKLOAD_PROPTEST_DEEP=1` and then `1 passed`, which is the output the
+  recipe now refuses.
+- `just props-deep` and `just crash-sweep` were green at `34e945e` plus the
+  first commit, with the old one-line bodies. For the new bodies see the
+  receipts at the end of this note.
+- `just check-fast`: see the receipts at the end of this note.
 
 ## Open
 
@@ -191,6 +271,30 @@ those times are lower than a disk's for both columns.
 7. A measurement script of this lane removed its own `target/fault`
    directories through a variable path, not a literal one. The paths were
    this worktree's and the scratch copy's.
+8. **Two properties are not on the helper**, so the seed is not yet fixed
+   everywhere (OI-1003-Q78). Both are `EXEMPT` entries of the seed guard.
+   - `git_carry_v2::random_dags_equal_upload_pack` draws 12 cases from a
+     random seed in the PR gate and in the deep tier. Q42 L5 (#189) deletes
+     the file and lowers the guard's ceilings (`EXEMPT_CEILING` 2 to 1,
+     `FINDINGS_CEILING` 11 to 7). #189 was not on main when this was
+     written; when it is merged here, its side of those lines wins.
+   - `refusal_taxonomy` has its own fixed seed and does not multiply its
+     cases in the deep tier. It migrates after #189.
+9. **Low review findings, not fixed** (for the PR body):
+   - `rust-test` parses cargo's `Executable` lines; a forced colour setting
+     on the runner would make it count 0 and fail every run. Group output
+     is printed only after all groups end, so a stall shows nothing.
+   - `check-fast`, `check-optional` and `check-full` are not pinned, so
+     nothing stops a deep recipe from being added to them; `just_recipe()`
+     stops reading a body at a blank line.
+   - No green run of the new `check-source` on a disk exists (Open 4), so
+     peak scratch use of the parallel groups is unmeasured.
+   - The 16,384 PR row has less margin than the 32,768 row had: about 2.5
+     to 2.8 times against the quadratic fetch, where it was 6.6 times.
+   - No PR gate compiles `fault-injection` alone any more, and the fault
+     harness now runs with the `io-trace` recorder mutex compiled in.
+   - The warm fault gate is slower by 16 to 28 s; this note's text is
+     corrected, the first commit's message is not.
 
 ## Shas and receipts
 
@@ -212,4 +316,18 @@ those times are lower than a disk's for both columns.
   `rust-test: all 23 test executables ran, in 5 groups`; `fault_harness`
   53; `power_loss` 9; `io::` 62 passed and 2 ignored; P5 1; resume proofs
   3; the contract test OK.
+- First commit: `0493713`, signed, pushed.
+- Review fixes: a second signed commit on the same branch (its sha is in
+  the lane's result and in `git log`). `origin/main` was still `3931471`
+  when it was made, so there was nothing to merge and #189 had not landed.
+- `just check-fast` on the review-fix tree (the exact tree of the second
+  commit, apart from this receipt): **exit=0**, 2026-10-07 01:53:01 to
+  01:59:45 EDT (404 s, warm), 1-minute load 127 → 107, TMPDIR
+  `/dev/shm/ci-slim-tmp` (tmpfs, as the host note for this round directs),
+  `CARGO_TARGET_DIR=/srv/cache/jess/cargo-target/ci-slim-source-gate`. 31
+  `test result: ok` lines, no failure and no `error` line: lib 503 passed
+  and 5 ignored; `prop_seed_guard` 8; `rust-test: all 23 test executables
+  ran, in 5 groups`; `fault_harness` 53; `power_loss` 9; `io::` 62 passed
+  and 2 ignored; P5 1; resume proofs 3; the contract test OK. Both clippy
+  passes and the union clippy pass are clean.
 - Rulings cited: OI-1003-Q81, OI-1003-Q7, OI-1003-Q14, OI-1003-Q78, R-N13.

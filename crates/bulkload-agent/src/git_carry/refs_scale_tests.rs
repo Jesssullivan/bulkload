@@ -722,7 +722,7 @@ fn a_small_capture_carries_and_its_old_format_over_the_cap_is_refused_typed() {
 /// keeps the cap and the typed refusal.
 #[test]
 fn refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed() {
-    if std::env::var_os(crate::test_support::DEEP).is_none_or(|value| value != "1") {
+    if !crate::test_support::deep() {
         eprintln!(
             "REFS-SCALE row=fixed skipped: set {}=1",
             crate::test_support::DEEP

@@ -186,11 +186,17 @@ are mandatory and never move to the optional tier.
 Deep tier (OI-1003-Q78, OI-1003-Q81): `just props-deep` and
 `just crash-sweep` run on demand. They are never a PR gate and are in
 neither tier above. `props-deep` sets `BULKLOAD_PROPTEST_DEEP=1`: every
-property draws twenty times its cases from the same fixed seed (the seed is
-fixed everywhere; `test_support::prop_config`), and the heavy fixed rows
-that skip themselves in the PR gate run. `crash-sweep` crashes one copy at
-every hit of every point in the fault harness's `scenarios!` table. A test
-moves to the deep tier only by a ruling, and its PR names it.
+property that runs through `test_support::prop_config` draws twenty times
+its cases from the same fixed seed, and the heavy fixed rows that skip
+themselves in the PR gate run. Two properties do not run through the helper
+yet (the `EXEMPT` list in `tests/prop_seed_guard.rs`):
+`git_carry_v2::random_dags_equal_upload_pack` draws a random seed in both
+tiers until #189 deletes its file, and `refusal_taxonomy` keeps its own
+fixed seed and case count. `crash-sweep` crashes one copy at every hit of
+every point in the fault harness's `scenarios!` table. Both recipes fail
+unless the rows and the sweep really ran; a skipped one still reports `ok`
+to cargo (R-N122). A test moves to the deep tier only by a ruling, and its
+PR names it.
 
 `just check` runs the repository contract checks, `just rust-check`
 (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
