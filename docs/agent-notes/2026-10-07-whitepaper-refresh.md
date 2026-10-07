@@ -170,6 +170,35 @@ Specifying02 ISBN form differing between this note and the bibliography;
 "HTTP 200 in every case" against the [Unison04] handle. The rig-branch
 pointer that one low finding asked for was added as part of fix 1.
 
+## Recheck and ship (2026-10-07, same lane, same rulings)
+
+An adversarial recheck of `d7c74e7` against the three medium/high findings.
+Verdict: clean. No paper or bibliography text changed in this pass.
+
+- **S1 (high): fixed.** The off-`main` evidence file was read again with
+  `git show 640093d:docs/evidence/r23-2026-10-07-0652Z-no-a-control.md`.
+  Every figure section 5.3 quotes matches it: host and filesystem, corpus
+  size, rclone version, B `3e7b5bf`, the three load1 values, the three
+  native and rclone medians, the delta, resume and memory columns, the
+  status string and the printed verdict. The branch head is still
+  `83d08dc`, `gh pr list --head` returns no PR, and the three operator
+  choices match the branch's draft `docs/slo.md` amendment. No unscoped
+  "no gated sample" sentence remains (grep over the paper).
+- **S3 bound (medium): fixed.** `docs/slo.md` lines 41 and 110 say
+  wall-clock and the file has no Q35; the four ratio ranges in the new
+  table match the evidence file's verdict table.
+- **References (medium): fixed.** Both DOIs resolved again through Crossref
+  (`get_crossref_paper_by_doi`), and both OpenAlex abstracts were fetched
+  again from `api.openalex.org` (W1971991620, W2129360963). Each statement
+  the bibliography lists is in the abstract it names.
+- **No new defect found.** Relative links in both whitepaper files resolve;
+  every citation key in the paper has a bibliography entry and the reverse.
+  The same five gates exited 0 on the tree of `d7c74e7` and on this
+  commit's tree (24 contract tests, OK).
+- **Shipped on PR #164**, which already existed: title and body updated
+  with `gh pr edit`, no second PR, not merged.
+- The low findings listed above stay open, as before.
+
 ## Validation
 
 Docs-only diff, so `check-fast` was replaced, as dispatched, by
@@ -192,7 +221,9 @@ again.
 - `8b13fa8`: the refreshed whitepaper, the bibliography and this note
   (signed).
 - `1a3037b`: this note's shas and gate result.
-- The review-pass commit follows `1a3037b`; the PR body carries its sha.
+- `d7c74e7`: the review-pass commit.
+- The recheck commit (below) follows `d7c74e7`; the PR body carries the
+  final head.
 - The commit after `8b13fa8` records these shas in this note; the PR body
   carries the final head.
 
