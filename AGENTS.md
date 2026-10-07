@@ -177,9 +177,9 @@ no longer true (R-N55).
 Local first (OI-1001-Q2, 2026-10-01): run `just check-fast` (the mandatory
 tier: every ratified-contract guard, and what PR CI runs) inside
 `nix develop` before pushing; GloriousFlywheel CI is a contended backstop,
-not the first signal. `just check-optional` runs the optional tier (the W6 M1
-spike behind the `m1-spike` feature, bench-script stubs, the history secret
-scan, the flake and Bazel graph) on demand; `just check-full` runs both. The
+not the first signal. `just check-optional` runs the optional tier
+(bench-script stubs, the estate corpus self-test, the history secret scan,
+the flake and Bazel graph) on demand; `just check-full` runs both. The
 fault harness, the R-N88/R-N119 power-loss proofs and the R25 counter tests
 are mandatory and never move to the optional tier.
 
@@ -188,15 +188,13 @@ Deep tier (OI-1003-Q78, OI-1003-Q81): `just props-deep` and
 neither tier above. `props-deep` sets `BULKLOAD_PROPTEST_DEEP=1`: every
 property that runs through `test_support::prop_config` draws twenty times
 its cases from the same fixed seed, and the heavy fixed rows that skip
-themselves in the PR gate run. Two properties do not run through the helper
-yet (the `EXEMPT` list in `tests/prop_seed_guard.rs`):
-`git_carry_v2::random_dags_equal_upload_pack` draws a random seed in both
-tiers until #189 deletes its file, and `refusal_taxonomy` keeps its own
-fixed seed and case count. `crash-sweep` crashes one copy at every hit of
-every point in the fault harness's `scenarios!` table. Both recipes fail
-unless the rows and the sweep really ran; a skipped one still reports `ok`
-to cargo (R-N122). A test moves to the deep tier only by a ruling, and its
-PR names it.
+themselves in the PR gate run. One property does not run through the helper
+yet (the `EXEMPT` list in `tests/prop_seed_guard.rs`): `refusal_taxonomy`
+keeps its own fixed seed and case count. No property draws a random seed.
+`crash-sweep` crashes one copy at every hit of every point in the fault
+harness's `scenarios!` table. Both recipes fail unless the rows and the
+sweep really ran; a skipped one still reports `ok` to cargo (R-N122). A
+test moves to the deep tier only by a ruling, and its PR names it.
 
 `just check` runs the repository contract checks, `just rust-check`
 (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,

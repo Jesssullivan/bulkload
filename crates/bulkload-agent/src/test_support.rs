@@ -10,11 +10,10 @@
 //! same command. A shape worth keeping is pinned as an explicit test row
 //! rather than through a persistence file.
 //!
-//! Two properties do not run through this helper yet; they are the `EXEMPT`
-//! entries of `tests/prop_seed_guard.rs`. `random_dags_equal_upload_pack`
-//! (`tests/git_carry_v2.rs`) still draws a random seed in both tiers, until
-//! Q42 L5 (#189) deletes its file. `tests/refusal_taxonomy.rs` has its own
-//! fixed seed and does not multiply its cases in the deep tier.
+//! One property does not run through this helper yet; it is the `EXEMPT`
+//! entry of `tests/prop_seed_guard.rs`. `tests/refusal_taxonomy.rs` has its
+//! own fixed seed and does not multiply its cases in the deep tier. No
+//! property draws a random seed.
 
 use proptest::test_runner::{Config, RngSeed};
 

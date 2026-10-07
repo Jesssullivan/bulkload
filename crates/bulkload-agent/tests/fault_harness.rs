@@ -102,11 +102,6 @@ use bulkload_agent::transfer_store::Manifest;
 use bulkload_agent::walk::{walk, WalkOptions};
 use bulkload_proto::{BulkloadRefusal, RowSchema};
 
-// W6 M1 PR 2: git carry v2 ingest crash-resume scenarios, with their own
-// `git_scenarios!` table (counted by `every_fault_point_has_a_scenario`).
-#[path = "fault_harness/git_ingest.rs"]
-mod git_ingest;
-
 /// Maximal chunks in the large fixture file (the v4 pack's batch size).
 const LARGE_CHUNKS: usize = 256;
 /// `io::durable::GROUP_FILES`: the most outputs one destination group holds.
@@ -1268,12 +1263,7 @@ fn every_fault_point_has_a_scenario() {
     let start = source.find("\nscenarios! {\n").unwrap();
     let table = &source[start..];
     let table = &table[..table.find("\n}\n").unwrap()];
-    let git = include_str!("fault_harness/git_ingest.rs");
-    let git = &git[git.find("\ngit_scenarios! {\n").unwrap()..];
-    let git = &git[..git.find("\n}\n").unwrap()];
-    let covered = |point: &Point| {
-        table.contains(&format!("=> {point:?}:")) || git.contains(&format!("=> {point:?}:"))
-    };
+    let covered = |point: &Point| table.contains(&format!("=> {point:?}:"));
     let known = |point: &Point| {
         KNOWN_VIOLATIONS
             .iter()

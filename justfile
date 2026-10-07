@@ -277,9 +277,9 @@ check-source: repo-manifest-validate python-lint shell-lint workflow-lint secret
 #                   power-loss proofs, refusal taxonomy, R34 dependency wall,
 #                   R33 lint wall, CI contract). PR CI runs this tier through
 #                   its source and fault-harness gates (OI-1003-Q65).
-#   check-optional  optional tier: spike evidence, bench-script stubs, the
-#                   estate corpus self-test (OI-1003-Q19), the history secret
-#                   scan and the Nix/Bazel graph. On demand.
+#   check-optional  optional tier: bench-script stubs, the estate corpus
+#                   self-test (OI-1003-Q19), the history secret scan and the
+#                   Nix/Bazel graph. On demand.
 #   check-full      both tiers (the lab `test-presubmit` / xoxd.ai `ci` shape).
 
 # The repository and CI contract tests, run directly instead of through
@@ -294,8 +294,6 @@ check-fast: check-source fault-harness contract-test
 
 # Optional tier: on demand, never a PR gate (OI-1001-Q2).
 check-optional:
-    cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features m1-spike -- -D warnings
-    cd {{ root }} && cargo test -p bulkload-agent --locked --features m1-spike --test git_m1_spike
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_corpus.py
@@ -314,13 +312,11 @@ check-full: check-fast check-optional
 # property that runs through `test_support::prop_config` draws twenty times
 # its PR-gate cases from the same fixed seed, so a deep failure of one
 # reproduces with the same command; pin its shape as an explicit test row.
-# Two properties do not run through the helper yet (the EXEMPT entries of
-# `tests/prop_seed_guard.rs`): `git_carry_v2::random_dags_equal_upload_pack`
-# draws 12 cases from a random seed, here and in the PR gate, until Q42 L5
-# (#189) deletes its file; `refusal_taxonomy` keeps its own fixed seed and
-# its PR-gate case count. The heavy fixed rows that skip themselves in the
-# PR gate run here: REFS-SCALE's 131,072 refs, and the distinct-heavy 32,768
-# and 110,000 commits. A skipped row still reports `ok`, and the workspace
+# One property does not run through the helper yet (the EXEMPT entry of
+# `tests/prop_seed_guard.rs`): `refusal_taxonomy` keeps its own fixed seed
+# and its PR-gate case count. No property draws a random seed. The heavy
+# fixed rows that skip themselves in the PR gate run here: REFS-SCALE's
+# 131,072 refs, and the distinct-heavy 32,768 and 110,000 commits. A skipped row still reports `ok`, and the workspace
 # run captures its output, so each row is left out of that run and then run
 # alone. The recipe fails unless each one really ran: on a cargo failure, on
 # a `skipped: set` line, on anything but one `1 passed; 0 failed` result

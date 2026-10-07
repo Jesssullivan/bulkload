@@ -122,19 +122,6 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
-/// [`rename_exclusive_at`]; Darwin has no fallback.
-///
-/// # Errors
-/// Returns the rename failure; an occupied `to` is `EEXIST`.
-pub fn rename_noreplace_at(
-    from_dir: impl AsFd,
-    from: &CStr,
-    to_dir: impl AsFd,
-    to: &CStr,
-) -> io::Result<()> {
-    rename_exclusive_at(from_dir, from, to_dir, to)
-}
-
 /// [`rename_exclusive_at`] within one directory.
 ///
 /// # Errors
