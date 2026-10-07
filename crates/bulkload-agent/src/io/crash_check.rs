@@ -13,7 +13,8 @@
 //! # Persistence model
 //!
 //! The trace is a sequence of *operations*. A mutation is a write (class
-//! data), an `fchmod` (class meta), or a directory-entry change: create,
+//! data), an `fchmod` or the capture record's `fsetxattr` (class meta, #169),
+//! or a directory-entry change: create,
 //! mkdir, link, rename, unlink (class namespace; its objects are the one or
 //! two directories it changes). A sync operation names one object and a
 //! [`SyncKind`]. A crash after operation `c` keeps some subset `P` of the
@@ -166,6 +167,8 @@ enum Node {
     File {
         data: Vec<u8>,
         mode: u32,
+        /// The capture record (#169), an extended attribute.
+        record: Option<Vec<u8>>,
     },
     Dir {
         entries: BTreeMap<Vec<u8>, NodeId>,
@@ -174,6 +177,15 @@ enum Node {
     Symlink {
         target: Vec<u8>,
     },
+}
+
+/// A scanned file's capture record (#169); none where the file system has
+/// no extended attributes.
+fn scan_record(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match super::sys::get_capture_record(std::fs::File::open(path)?) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOTSUP) => Ok(None),
+        read => read,
+    }
 }
 
 /// A file-system image: the durable state before the trace, and each crash
@@ -218,6 +230,7 @@ impl Image {
             Node::File {
                 data: data.to_vec(),
                 mode: 0o644,
+                record: None,
             },
         );
         if let Some(Node::Dir { entries, .. }) = self.nodes.get_mut(&self.root) {
@@ -255,6 +268,7 @@ impl Image {
                     Node::File {
                         data: std::fs::read(entry.path())?,
                         mode: meta.mode() & 0o7777,
+                        record: scan_record(&entry.path())?,
                     },
                 );
             } else if meta.file_type().is_symlink() {
@@ -301,8 +315,12 @@ impl Image {
         for (name, child) in entries {
             let child_path = path.join(OsStr::from_bytes(name));
             match self.nodes.get(child) {
-                Some(Node::File { data, mode }) => {
+                Some(Node::File { data, mode, record }) => {
                     std::fs::write(&child_path, data)?;
+                    if let Some(record) = record {
+                        let file = std::fs::File::options().write(true).open(&child_path)?;
+                        super::sys::set_capture_record(&file, record)?;
+                    }
                     std::fs::set_permissions(&child_path, std::fs::Permissions::from_mode(*mode))?;
                 }
                 Some(Node::Dir { .. }) => {
@@ -358,6 +376,15 @@ impl Image {
                     return Err(other(format!("fchmod of unknown node {node:?}")))
                 }
             },
+            Change::Record {
+                node,
+                record: value,
+            } => match self.nodes.get_mut(node) {
+                Some(Node::File { record, .. }) => *record = Some(value.clone()),
+                Some(Node::Dir { .. } | Node::Symlink { .. }) | None => {
+                    return Err(other(format!("fsetxattr of unknown file {node:?}")))
+                }
+            },
             Change::Rename {
                 node,
                 from_dir,
@@ -401,6 +428,10 @@ enum Change {
     Mode {
         node: NodeId,
         mode: u32,
+    },
+    Record {
+        node: NodeId,
+        record: Vec<u8>,
     },
     Rename {
         node: NodeId,
@@ -587,6 +618,7 @@ fn describe(event: &Event) -> String {
         Event::Mkdir { name: n, .. } => format!("mkdir {}", name(n)),
         Event::Write { offset, data, .. } => format!("write {}@{offset}", data.len()),
         Event::SetMode { mode, .. } => format!("fchmod {mode:o}"),
+        Event::SetCaptureRecord { record, .. } => format!("fsetxattr {} bytes", record.len()),
         Event::Sync { kind, .. } => format!("sync {kind:?}"),
         Event::Link { name: n, .. } => format!("link {}", name(n)),
         Event::Rename { from, to, .. } => format!("rename {} -> {}", name(from), name(to)),
@@ -638,7 +670,9 @@ fn touches_only(event: &Event, known: &HashSet<NodeId>) -> bool {
         | Event::Link { dir, .. }
         | Event::Unlink { dir, .. }
         | Event::Symlink { dir, .. } => known(dir),
-        Event::Write { node, .. } | Event::SetMode { node, .. } => known(node),
+        Event::Write { node, .. }
+        | Event::SetMode { node, .. }
+        | Event::SetCaptureRecord { node, .. } => known(node),
         Event::Rename {
             from_dir, to_dir, ..
         } => known(from_dir) && known(to_dir),
@@ -702,6 +736,7 @@ fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result
                     Node::File {
                         data: Vec::new(),
                         mode: *mode,
+                        record: None,
                     },
                 ));
                 match (dir, name) {
@@ -787,6 +822,14 @@ fn build_ops(initial: &Image, events: &[Event], options: &Options) -> io::Result
                 Change::Mode {
                     node: *node,
                     mode: *mode,
+                },
+            ),
+            Event::SetCaptureRecord { node, record } => push(
+                Class::Meta,
+                vec![*node],
+                Change::Record {
+                    node: *node,
+                    record: record.clone(),
                 },
             ),
             Event::Sync { node, kind } => ops.push(Op {
@@ -1047,7 +1090,10 @@ impl Plan {
             };
             let moved = match change {
                 Change::Entry { node, .. } | Change::Rename { node, .. } => Some(*node),
-                Change::Write { .. } | Change::Mode { .. } | Change::Unlink { .. } => None,
+                Change::Write { .. }
+                | Change::Mode { .. }
+                | Change::Record { .. }
+                | Change::Unlink { .. } => None,
             };
             for dir in objects.iter().copied().chain(moved) {
                 if let Some(&mkdir) = made_by.get(&dir) {
@@ -1151,7 +1197,7 @@ pub struct View<'a> {
 impl<'a> View<'a> {
     fn entry(self, node: NodeId) -> Option<Entry<'a>> {
         match self.image.nodes.get(&node)? {
-            Node::File { data, mode } => Some(Entry::File { data, mode: *mode }),
+            Node::File { data, mode, .. } => Some(Entry::File { data, mode: *mode }),
             Node::Dir { mode, .. } => Some(Entry::Dir { mode: *mode }),
             Node::Symlink { target } => Some(Entry::Symlink { target }),
         }
@@ -1172,6 +1218,25 @@ impl<'a> View<'a> {
             node = *entries.get(part)?;
         }
         self.entry(node)
+    }
+
+    /// The capture record (#169) of the regular file at `rel`, if it has one.
+    #[must_use]
+    pub fn record(self, rel: &[u8]) -> Option<&'a [u8]> {
+        let mut node = self.image.root;
+        for part in rel
+            .split(|byte| *byte == b'/')
+            .filter(|part| !part.is_empty())
+        {
+            let Node::Dir { entries, .. } = self.image.nodes.get(&node)? else {
+                return None;
+            };
+            node = *entries.get(part)?;
+        }
+        match self.image.nodes.get(&node)? {
+            Node::File { record, .. } => record.as_deref(),
+            Node::Dir { .. } | Node::Symlink { .. } => None,
+        }
     }
 
     /// Every entry beneath the root, by relative path, parents first.

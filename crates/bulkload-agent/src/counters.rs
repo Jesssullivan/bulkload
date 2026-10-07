@@ -194,6 +194,14 @@ counters! {
     // deleted on its first open by this engine (#125): each costs one source
     // read of its seat.
     TransferLegacyRowsInvalidated => "transfer_legacy_rows_invalidated",
+    // R25's strict reading (#169): outputs a crash left durable with no row,
+    // adopted on resume from their capture record without a source read;
+    // existing outputs with no matching row that no record proved, each
+    // asked for by manifest (a source read) as before; and staged files whose
+    // capture record could not be written (no extended attributes).
+    TransferUnrowedAdopted => "transfer_unrowed_adopted",
+    TransferUnrowedUnproven => "transfer_unrowed_unproven",
+    TransferCaptureRecordsUnset => "transfer_capture_records_unset",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
     // Provider `SQLite` snapshots whose WAL-aware read left a wal-index

@@ -212,6 +212,29 @@ as properties.
     improvement in #169 and is not part of the SLO.
   - This narrows "the destination held durably" in OI-1002-Q33 to "a committed
     row proves it".
+  - Amendment 2026-10-06 (#169): the strict reading now holds in the model,
+    within stated limits. `R25_StrictNoDurableReread` passes in
+    `MC_r25_unrowed_bytes`, `MC_r25_strict_deep`, `MC_r25_strict_main` (two
+    seats) and, across a lost source authority, `MC_r25_strict_unsealed` and
+    `MC_r25_strict_authority` (`docs/formal/`), with the capture record's
+    adoption (`crates/bulkload-agent/src/transfer/unrowed.rs`). The limits:
+    - Only a non-racy capture gets a record. A racy capture's unrowed output
+      is read again, as before.
+    - The record is an extended attribute. A file system without them, or an
+      existing output adopted against a manifest whose mode gives its owner
+      no write permission, keeps no record, and its unrowed bytes are read
+      again. Both are counted (`transfer_capture_records_unset`,
+      `transfer_unrowed_unproven`).
+    - The model assumes the record can be written; it does not model its
+      loss.
+    - The Haskell explorer agrees with TLC on the model with the adoption
+      (`MC_nv_core_adopt`, `MC_nv_ledger_adopt`). `MC_nv_core`'s count of
+      record is still the transfer before #169; moving it needs a ruling.
+
+    On the code, the power-loss proof
+    `an_unrowed_output_is_adopted_without_source_reads`, P74 and
+    `an_output_adopted_against_a_manifest_carries_its_capture_record` check
+    it. `R25_NoDurableReread` stays the SLO's obligation (OI-1003-Q40).
 
 ## Amendment 2026-10-06: the empty `-wal` (OI-1003-Q72)
 
@@ -271,6 +294,51 @@ as properties.
   - its warm-resume reads are net of the 16-byte SQLite magic probes.
 - R-N81's load bound (load1 < 2.5) holds on both hosts in gated mode.
   `--dest-load-limit` can only tighten it.
+
+## Amendment 2026-10-06: S4 proof status (WP3 PR 3)
+
+- **S4 is provable on the estate ledger (OI-1003-Q1; a proof-status line, not a
+  new ruling).** Outcome records are a typed `Outcome` with
+  `Refusal{code, site, errno}`, persisted with postcard and decoded with no
+  bytes left over; legacy string records are mapped by a reader. Closure
+  matches the enum. The `gate` passes only when every planned item is
+  accounted and every typed refusal carries a disposition (accept, re-carry
+  or abandon, with reviewer and date) from the `closure-dispose` ledger. A
+  bare `IO` or `FRAME_CODEC` stays unaccounted: no disposition can name it
+  and no attestation can close it, whatever reason the item is unaccounted
+  for. Property P72 (codec round trip and legacy mapping) and P73 (green iff
+  every refusal is dispositioned and no untyped IO exists) carry the proof.
+  Transfer and SQLite provider outcomes join this ledger in WP3 PR 4; until
+  then S4 is proven for estate items only.
+- **What a disposition is bound to.** The ledger is bound to its plan (path
+  and a digest of the plan's bytes) and SOURCE label. An item disposition is
+  bound to the refusal instance it reviews (the item's current capture and
+  its outcome record) and is recorded only while the item holds that
+  refusal; a later refusal of the same code against another capture or with
+  another record is pending review again.
+- **Standing policies are open-ended (a design statement of WP3 PR 3, not
+  yet an operator ruling).** A standing-policy disposition covers every
+  refusal with its code under the bound plan and label, now or later. It is
+  bounded only by the plan digest and the label. Whether that is the
+  intended meaning of "operator-reviewed disposition" for S4 is an open
+  question for the operator.
+- **Codes that leave the taxonomy fail closed.** A recorded refusal whose
+  code has since been deleted is unaccounted (`refusal-code-retired`); no
+  disposition or attestation closes it, and a disposition row naming it
+  counts for nothing. Only a verb recording a current outcome closes the
+  item.
+
+## Amendment 2026-10-06 (later): S4 disposition rulings (OI-1003-Q74, Q75)
+
+- **Standing policies are open-ended in time (OI-1003-Q74, ruled as
+  built).** A standing-policy disposition stands until the plan's bytes
+  change: it covers every refusal with its code under the bound plan digest
+  and SOURCE label, now or later. This replaces the "design statement, not
+  yet an operator ruling" wording in the amendment above; the behaviour is
+  unchanged.
+- **A retired refusal code fails closed (OI-1003-Q75, ruled as built).** A
+  record naming a code that has left the taxonomy stays unaccounted
+  (`refusal-code-retired`); no disposition or attestation closes it.
 
 ## Priority (OI-1003-Q4)
 

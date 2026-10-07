@@ -60,9 +60,11 @@
 //! seat. Those properties state the residue, not the contract: when #186 is
 //! fixed they go red and are deleted, and the ignored ones lose `#[ignore]`.
 //!
-//! **Corpus.** Fixed seed and a small case count per property ([`prop_config`]);
-//! `BULKLOAD_PROPTEST_DEEP=1` runs twenty times the cases from the same
-//! fixed seed. No random seed, no failure-persistence file. The library's
+//! **Corpus.** CI runs a fixed seed and a small case count per property
+//! (`test_support::prop_config`, compiled here from the library's source
+//! file through `#[path]`; `tests/prop_seed_guard.rs` holds every property
+//! to it). `BULKLOAD_PROPTEST_DEEP=1` switches to random seeds and twenty
+//! times the cases. No failure-persistence file. The library's
 //! test-only clock and retention overrides are `#[cfg(test)]`, out of an
 //! integration test's reach, so captures are made non-racy for real with
 //! `settle_racy_window` (about 2 s per settle).
@@ -86,34 +88,15 @@ use bulkload_agent::hash::{chunk_boundaries, hash_bytes};
 use bulkload_agent::transfer::{copy, receive, serve, settle_racy_window, TransferStats};
 use bulkload_agent::{Control, Frame};
 use proptest::prelude::*;
-use proptest::test_runner::{Config, RngSeed};
 
 // ---------------------------------------------------------------------------
 // Corpus configuration
 // ---------------------------------------------------------------------------
 
-/// `test_support::CI_SEED`, mirrored: every run draws the same cases.
-const CI_SEED: u64 = 0x0B01_C0AD_2026_1003;
-
-/// `test_support::DEEP`, mirrored: the switch for the deep local tier.
-const DEEP: &str = "BULKLOAD_PROPTEST_DEEP";
-
-/// `test_support::prop_config`, mirrored for an integration test, with the
-/// seed fixed in both tiers: `cases` cases in CI, twenty times as many under
-/// `BULKLOAD_PROPTEST_DEEP=1`. Nothing persists between runs.
-fn prop_config(cases: u32) -> Config {
-    let deep = std::env::var_os(DEEP).is_some_and(|value| value == "1");
-    Config {
-        cases: if deep {
-            cases.saturating_mul(20)
-        } else {
-            cases
-        },
-        rng_seed: RngSeed::Fixed(CI_SEED),
-        failure_persistence: None,
-        ..Config::default()
-    }
-}
+/// The shared helper itself (OI-1003-Q7): the same source file as the
+/// library's `test_support`, so the seed and the deep switch cannot drift.
+#[path = "../src/test_support.rs"]
+mod test_support;
 
 /// The transfer's credit window (`transfer::CREDIT_WINDOW`, private).
 const CREDIT_WINDOW: usize = 16 * 1024 * 1024;
@@ -572,7 +555,7 @@ fn p23_case() -> impl Strategy<Value = (Vec<(usize, usize, u64)>, CutAt)> {
 }
 
 proptest! {
-    #![proptest_config(prop_config(8))]
+    #![proptest_config(test_support::prop_config(8))]
 
     /// P23: a resume after any cut reads exactly the unapplied files, once,
     /// converges, and a further rerun reads and receives nothing.
@@ -584,7 +567,7 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(prop_config(4))]
+    #![proptest_config(test_support::prop_config(4))]
 
     /// P23 with the fixture's refused seats: a refused `SQLite` seat is
     /// sniffed again on every run, so the further rerun reads
@@ -601,7 +584,7 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(prop_config(3))]
+    #![proptest_config(test_support::prop_config(3))]
 
     /// P23 with the fixture's refused seats, the clauses that hold on main:
     /// after any cut the refusal set is the fixture's on every run, the
@@ -1042,7 +1025,7 @@ fn shares_a_chunk(case: &DeltaCase) -> bool {
 }
 
 proptest! {
-    #![proptest_config(prop_config(6))]
+    #![proptest_config(test_support::prop_config(6))]
 
     /// P21 transfer leg, inequality 1: after in-place changes and added
     /// seats, the rerun reads at most the changed seats' bytes, and its walk
@@ -1064,7 +1047,7 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(prop_config(3))]
+    #![proptest_config(test_support::prop_config(3))]
 
     /// P21 transfer leg with refused `SQLite` seats, the clauses that hold
     /// on main: both inequalities (inequality 1 with exactly 16 bytes per
@@ -1081,7 +1064,7 @@ proptest! {
 }
 
 proptest! {
-    #![proptest_config(prop_config(4))]
+    #![proptest_config(test_support::prop_config(4))]
 
     /// P21 transfer leg, every clause, over in-place changes: a changed seat
     /// whose old output this store wrote is refused as divergent instead of
@@ -1306,7 +1289,7 @@ fn hint_case() -> impl Strategy<Value = HintCase> {
 }
 
 proptest! {
-    #![proptest_config(prop_config(6))]
+    #![proptest_config(test_support::prop_config(6))]
 
     /// P18 end to end: wire bytes are exactly the new file's size less the
     /// bytes its surviving holders still verify.
@@ -1467,7 +1450,7 @@ fn racy_case() -> impl Strategy<Value = RacyCase> {
 }
 
 proptest! {
-    #![proptest_config(prop_config(4))]
+    #![proptest_config(test_support::prop_config(4))]
 
     /// P19: a racy capture is sent but never recorded, so every later run
     /// reads it again until it is no longer racy.

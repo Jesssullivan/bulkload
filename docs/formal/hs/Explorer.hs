@@ -4,11 +4,15 @@ N-version explorer for docs/formal (OI-1003-Q32).
 An explicit-state breadth-first search of bulkload's wire v5 transfer,
 destination group commit and source ledger, across crashes and reruns. Its
 domain: any seats, runs, crashes, source edits and third-party writes (the
-bound flags), with no failed group commit, space refusal, relaxed source
-ledger or store, superseding publish, estate reads, unsealed state root or
-strict-held ghost. The presets are the N-version core, nv_core (TLC's
-MC_nv_core: one seat, three runs, two crashes, one source edit), and
-nv_ledger, which adds one third-party write or delete (MC_nv_ledger).
+bound flags), #169's capture record and its adoption (--adopt, TLC's
+AdoptUnrowed) and the strict-held ghost (--strict-held, TrackStrictHeld),
+with no failed group commit, space refusal, relaxed source ledger or store,
+superseding publish, estate reads or unsealed state root. The presets are
+the N-version core, nv_core (TLC's MC_nv_core: one seat, three runs, two
+crashes, one source edit), and nv_ledger, which adds one third-party write
+or delete (MC_nv_ledger), both the transfer before #169; and the same two
+bounds for the code since #169, nv_core_adopt and nv_ledger_adopt
+(MC_nv_core_adopt, MC_nv_ledger_adopt).
 
 TLA+ with TLC is the checker of record. This program is a second encoding
 of the spec: independent code, shared design. It is a separate program in
@@ -27,7 +31,7 @@ spec makes, because this encoding copies it (docs/formal/README.md,
 "Hybrid roles"). Comments cite code as A/... (crates/bulkload-agent/src)
 and P/... (crates/bulkload-proto/src).
 
-`just formal-nv` requires: both presets reach TLC's distinct-state counts;
+`just formal-nv` requires: every preset reaches TLC's distinct-state count;
 every MC_neg_ row of the catalogue inside this domain, at its own bound,
 violates the property its row names; and every such mutation, checked
 against every invariant, stops at the same invariant after the same number
@@ -35,9 +39,10 @@ of states as TLC with one worker.
 
 Out of the domain, and absent: the failed group commit (CommitFail), the
 space refusal, a relaxed source ledger or store, an unsealed state root,
-the strict-held ghost, WP0(d)'s superseding publish (CheckOwn,
-RenameReplace, Exchange, VerifyDisp, the displaced file) and estate
-capture's typed reads (GitRead, Backup*). The mutations that need them are
+WP0(d)'s superseding publish (CheckOwn, RenameReplace, Exchange,
+VerifyDisp, the displaced file) and estate capture's typed reads (GitRead,
+Backup*); so an adopted unrowed output's group never fails here
+(AnswerHeld's failed_space outcome). The mutations that need them are
 refused at the command line. In the domain, NoClobber and
 S2_BackupLockBounded hold by construction, here and in the spec: only
 absent actions set the state they read.
@@ -49,12 +54,15 @@ Base and containers only:
 
 Options:
 
-  --preset nv_core|nv_ledger   the base bound (default nv_core)
+  --preset nv_core|nv_ledger|nv_core_adopt|nv_ledger_adopt
+                               the base bound (default nv_core)
   --seats LETTERS              the seats, one lowercase letter each (a, ab)
   --runs N                     transfer sessions in one behaviour
   --crashes N                  crash budget: either host, or both
   --edits N                    source edits per seat
   --foreign N                  third-party writes or deletes
+  --adopt                      #169: capture records and their adoption
+  --strict-held                the strict-held ghost
   --mutation NAME              one deliberate rule break (default none)
   --check all|NAME[,NAME...]   the invariants to check (default all)
   --name NAME                  the row name reported (default from the above)
@@ -62,11 +70,15 @@ Options:
                                must exist)
 
 The bound flags override the preset's values (TLC's Seats, MaxRuns,
-MaxCrashes, MaxEdits and MaxForeign).
+MaxCrashes, MaxEdits and MaxForeign); --adopt and --strict-held turn on
+AdoptUnrowed and TrackStrictHeld.
 
-Output: one line of key=value pairs. With --check all, `violated` lists
-every invariant the failing state violates, in the spec's order, so its
-first name is the one TLC reports. Exit 0 when the search completed with no
+Output: one line of key=value pairs. `--check all` is every safety
+invariant, then R25_StrictNoDurableReread under --strict-held and
+AdoptOnlyUnrowed under --adopt (the catalogue's every-invariant configs
+check the same list). With it, `violated` lists every invariant the failing
+state violates, in the spec's order, so its first name is the one TLC
+reports. Exit 0 when the search completed with no
 violation, 1 when it stopped at a violated invariant or a deadlock, 2 on a
 usage error.
 -}
@@ -99,6 +111,10 @@ data Mutation
   | RecordRacy
   | SourceWrite
   | PauseWriter
+  | AdoptUnkeyed
+  | AdoptUnverified
+  | ReuseIgnoresRow
+  | AdoptUnrecorded
   deriving (Eq, Show, Enum, Bounded)
 
 mutationName :: Mutation -> String
@@ -117,6 +133,10 @@ mutationName m = case m of
   RecordRacy -> "record_racy"
   SourceWrite -> "source_write"
   PauseWriter -> "pause_writer"
+  AdoptUnkeyed -> "adopt_unkeyed"
+  AdoptUnverified -> "adopt_unverified"
+  ReuseIgnoresRow -> "reuse_ignores_row"
+  AdoptUnrecorded -> "adopt_unrecorded"
 
 data Config = Config
   { cPreset :: String
@@ -125,19 +145,29 @@ data Config = Config
   , cCrashes :: Int -- crash budget: either host, or both
   , cEdits :: Int -- source edits per seat
   , cForeign :: Int -- third-party writes or deletes at the destination
+  , cAdopt :: Bool -- #169: capture records and their adoption (AdoptUnrowed)
+  , cStrict :: Bool -- the strict-held ghost (TrackStrictHeld)
   , cMutation :: Maybe Mutation
   }
 
 preset :: String -> Maybe Config
-preset "nv_core" = Just (Config "nv_core" "a" 3 2 1 0 Nothing)
-preset "nv_ledger" = Just (Config "nv_ledger" "a" 3 2 1 1 Nothing)
+preset "nv_core" = Just (Config "nv_core" "a" 3 2 1 0 False False Nothing)
+preset "nv_ledger" = Just (Config "nv_ledger" "a" 3 2 1 1 False False Nothing)
+preset "nv_core_adopt" = Just (Config "nv_core_adopt" "a" 3 2 1 0 True False Nothing)
+preset "nv_ledger_adopt" = Just (Config "nv_ledger_adopt" "a" 3 2 1 1 True False Nothing)
 preset _ = Nothing
 
 -- The bound as seats,runs,crashes,edits,foreign (TLC's Seats, MaxRuns,
--- MaxCrashes, MaxEdits, MaxForeign).
+-- MaxCrashes, MaxEdits, MaxForeign), then the switches that are on.
 boundName :: Config -> String
 boundName cfg =
-  intercalate "," (cSeats cfg : map show [cRuns cfg, cCrashes cfg, cEdits cfg, cForeign cfg])
+  intercalate
+    ","
+    ( cSeats cfg
+        : map show [cRuns cfg, cCrashes cfg, cEdits cfg, cForeign cfg]
+        ++ ["adopt" | cAdopt cfg]
+        ++ ["strict-held" | cStrict cfg]
+    )
 
 mut :: Config -> Mutation -> Bool
 mut cfg m = cMutation cfg == Just m
@@ -159,7 +189,7 @@ data SEnt = SIdle | SUnwalked | SOffered | SManifested | SAwaitHeld | SDone
   deriving (Eq, Ord, Show)
 
 -- Destination entry phase (A/transfer.rs Inbound).
-data DEnt = DIdle | DNone | DStreaming | DAwaitManifest | DFilling | DQueued | DDone
+data DEnt = DIdle | DNone | DStreaming | DAwaitManifest | DFilling | DQueued | DAdoptQueued | DDone
   deriving (Eq, Ord, Show)
 
 data Plan = PlanNone | PlanWrite | PlanAdopt
@@ -203,9 +233,24 @@ data Msg = Msg {mT :: !MsgT, mV :: !Int, mB :: !Bool, mC :: !Code}
 data Outc = ONone | OPending | OApplied | OAppliedRacy | ORefused Refusal
   deriving (Eq, Ord, Show)
 
+-- A file's capture record (#169): the walked row its capture was made from
+-- (recordKey, never 0) and the bytes it names. Key 0 is no record.
+data CapRec = CapRec {crKey :: !Int, crData :: !Int}
+  deriving (Eq, Ord, Show)
+
 -- A file at a destination path: present, identity, content, data durable,
--- name durable.
-data File = File {fPres :: !Bool, fId :: !Int, fData :: !Int, fDD :: !Bool, fND :: !Bool}
+-- name durable; the strict-held ghost (bulkload published it from a non-racy
+-- capture, or verified it against one and sealed that adoption); and its
+-- capture record.
+data File = File
+  { fPres :: !Bool
+  , fId :: !Int
+  , fData :: !Int
+  , fDD :: !Bool
+  , fND :: !Bool
+  , fCl :: !Bool
+  , fRec :: !CapRec
+  }
   deriving (Eq, Ord, Show)
 
 data Tmp = Tmp {tSt :: !TmpSt, tData :: !Int}
@@ -236,6 +281,7 @@ data ReadRec = ReadRec
   , rdKey :: !Int
   , rdKind :: !ReadKind
   , rdHeld :: !Bool
+  , rdStrict :: !Bool
   , rdCommitted :: !Bool
   }
   deriving (Eq, Ord, Show)
@@ -297,8 +343,17 @@ data St = St
   }
   deriving (Eq, Ord, Show)
 
+noRecord :: CapRec
+noRecord = CapRec 0 0
+
 noFile :: File
-noFile = File False 0 0 True True
+noFile = File False 0 0 True True False noRecord
+
+-- A capture record's key for the entry of row key k (A/transfer/unrowed.rs
+-- record_key): the walked row alone, its stat version here, with no store
+-- authority. Never 0.
+recordKey :: Int -> Int
+recordKey k = k `mod` keyBase + 1
 
 noTmp :: Tmp
 noTmp = Tmp TmpNone 0
@@ -410,6 +465,15 @@ heldPhys st s v =
           (\r -> drSeat r == s && drKey r `mod` keyBase == v && drId r == fId o)
           (S.toList (dstRows st))
 
+-- The strict reading of "held durably": heldPhys, or bulkload's own output
+-- from a non-racy capture is durable at the path with the seat's current
+-- bytes, row or no row. Equal to heldPhys unless --strict-held.
+strictHeld :: St -> Seat -> Bool
+strictHeld st s =
+  let x = at st s
+      o = out x
+   in heldPhys st s (sRow x) || (fPres o && fCl o && fDD o && fND o && fData o == edits x)
+
 -- Nothing in either pipeline: a new session may open the publisher.
 quiescent :: St -> Bool
 quiescent st =
@@ -436,6 +500,7 @@ readSeat cfg st s kind st' =
           , rdKey = k
           , rdKind = kind
           , rdHeld = heldPhys st s (sRow (at st s))
+          , rdStrict = strictHeld st s
           , rdCommitted = not (null (ledgerRows st s k)) && destHolds st s k
           }
       x' = at st' s
@@ -544,36 +609,74 @@ walk _ st s
   where
     x = at st s
 
+-- What the destination decides for an offered entry.
+data Choice = ChReuse | ChAdopt | ChSend | ChManifest
+  deriving (Eq, Show)
+
 -- A/transfer.rs Inbound::entry: Reuse when the output's identity is the one
--- recorded under the key; otherwise WantManifest for an existing output, and
--- Send or WantManifest (salvage may fill chunks) for an absent one.
+-- recorded under the key. #169 (--adopt), otherwise: an existing output
+-- whose capture record names this entry's row, and whose own bytes are the
+-- record's, is adopted (Inbound::adopt_unrowed, A/transfer/unrowed.rs
+-- prove): answered Reuse and queued as an adopted publication. Otherwise
+-- WantManifest for an existing output, and Send or WantManifest (salvage
+-- may fill chunks) for an absent one.
 recvEntry :: Config -> St -> Seat -> [Step]
 recvEntry cfg st s
   | sess st == On && dEnt x == DNone && mT (msg x) == MEntry =
       let k = mV (msg x)
+          o = out x
+          never = mut cfg RereadDurable || mut cfg RereadIgnoreLedger
+          ledgered = not (mut cfg SrcLedgerCarriesR25) || mB (msg x)
           reuse =
             rowMatches st s k
-              && not (mut cfg RereadDurable || mut cfg RereadIgnoreLedger)
-              && (not (mut cfg SrcLedgerCarriesR25) || mB (msg x))
+              && not (never || mut cfg ReuseIgnoresRow)
+              && ledgered
+          adopt =
+            cAdopt cfg
+              && not never
+              && ledgered
+              && fPres o
+              && crKey (fRec o) /= 0
+              && (crKey (fRec o) == recordKey k || mut cfg AdoptUnkeyed)
+              && (fData o == crData (fRec o) || mut cfg AdoptUnverified)
           choices
-            | reuse = [Reuse]
-            | fPres (out x) = [WantManifest]
-            | otherwise = [Send, WantManifest]
+            | reuse = [ChReuse]
+            | adopt = [ChAdopt]
+            | fPres o = [ChManifest]
+            | otherwise = [ChSend, ChManifest]
+          wire d = case d of
+            ChSend -> Send
+            ChManifest -> WantManifest
+            _ -> Reuse
           phase d = case d of
-            Reuse -> DDone
-            Send -> DStreaming
-            WantManifest -> DAwaitManifest
+            ChReuse -> DDone
+            ChAdopt -> DAdoptQueued
+            ChSend -> DStreaming
+            ChManifest -> DAwaitManifest
+          queued d y
+            | d == ChAdopt =
+                y
+                  { dPub = PubAdoptWait
+                  , dRec = Rec k (if mut cfg AdoptUnverified then crData (fRec o) else fData o) False (fId o) KindAdopt
+                  }
+            | otherwise = y
           decided d =
             put
               s
-              x
-                { msg = Msg MDecide 0 False (CDecision d)
-                , dKey = k
-                , dEnt = phase d
-                , outc = if d == Reuse then OApplied else OPending
-                }
+              ( queued
+                  d
+                  x
+                    { msg = Msg MDecide 0 False (CDecision (wire d))
+                    , dKey = k
+                    , dEnt = phase d
+                    , outc = if d == ChReuse then OApplied else OPending
+                    }
+              )
               st
-       in [(label "RecvEntry" s (show d), decided d) | d <- choices]
+          shown d = case d of
+            ChAdopt -> "adopt_unrowed"
+            _ -> show (wire d)
+       in [(label "RecvEntry" s (shown d), decided d) | d <- choices]
   | otherwise = []
   where
     x = at st s
@@ -658,9 +761,11 @@ recvNeed cfg st s
     x = at st s
 
 -- A/transfer.rs Inbound::end: stage a written output for its group commit;
--- verify an adopted one byte for byte, or refuse it occupied.
+-- verify an adopted one byte for byte, or refuse it occupied. #169: a
+-- verified output of a non-racy capture gets that capture's record
+-- (Inbound::adopt, A/transfer/unrowed.rs refresh).
 recvEnd :: Config -> St -> Seat -> [Step]
-recvEnd _ st s
+recvEnd cfg st s
   | sess st == On && mT (msg x) == MEnd && dEnt x `elem` [DStreaming, DFilling] =
       let d = mV (msg x)
           racy = mB (msg x)
@@ -674,10 +779,13 @@ recvEnd _ st s
               ]
             PlanAdopt
               | fPres o && fData o == d ->
-                  [ ( label "RecvEnd" s "adopt"
-                    , put s x {dPub = PubAdoptWait, dRec = Rec (dKey x) d racy (fId o) KindAdopt, dEnt = DQueued, msg = noMsg} st
-                    )
-                  ]
+                  let recorded
+                        | cAdopt cfg && not racy && not (mut cfg AdoptUnrecorded) = o {fRec = CapRec (recordKey (dKey x)) d}
+                        | otherwise = o
+                   in [ ( label "RecvEnd" s "adopt"
+                        , put s x {dPub = PubAdoptWait, dRec = Rec (dKey x) d racy (fId o) KindAdopt, out = recorded, dEnt = DQueued, msg = noMsg} st
+                        )
+                      ]
             _ ->
               [ ( label "RecvEnd" s "occupied"
                 , put s x {msg = Msg MHeld 0 False CNone, dEnt = DDone, outc = ORefused GitOccupied} st
@@ -718,7 +826,11 @@ publish cfg st s
         then [(label "Publish" s "occupied", put s x {dPub = PubFailedOccupied, tmp = noTmp} st)]
         else
           let t = tmp x
-              placed = File True (run st) (tData t) (tSt t == TmpSealed) False
+              clean = not (rRacy (dRec x))
+              record
+                | cAdopt cfg && clean = CapRec (recordKey (rKey (dRec x))) (tData t)
+                | otherwise = noRecord
+              placed = File True (run st) (tData t) (tSt t == TmpSealed) False (cStrict cfg && clean) record
            in [ ( label "Publish" s ""
                 , put s x {out = placed, outPrev = out x, dRec = (dRec x) {rId = run st}, dPub = PubRenamed, tmp = noTmp} st
                 )
@@ -743,7 +855,10 @@ sealAdopted :: Config -> St -> Seat -> [Step]
 sealAdopted cfg st s
   | dPub x == PubAdoptWait =
       let o = out x
-          o' = if fPres o && fId o == rId (dRec x) && not (mut cfg AdoptWithoutSeal) then durable o else o
+          o'
+            | fPres o && fId o == rId (dRec x) && not (mut cfg AdoptWithoutSeal) =
+                (durable o) {fCl = fCl o || (cStrict cfg && not (rRacy (dRec x)))}
+            | otherwise = o
        in [(label "SealAdopted" s "", put s x {out = o', dPub = PubReady} st)]
   | otherwise = []
   where
@@ -778,9 +893,13 @@ commit cfg st =
             }
 
 -- A/transfer.rs Inbound::answer_held, settle_held: Held{true} only after
--- the group commit returned; Held{false} for an occupied path.
+-- the group commit returned; Held{false} for an occupied path. #169: an
+-- adopted unrowed output was answered Reuse, so no Held is sent; its
+-- group's outcome reaches the session report (finish_receive).
 answerHeld :: Config -> St -> Seat -> [Step]
 answerHeld cfg st s
+  | sess st == On && dEnt x == DAdoptQueued && msg x == noMsg =
+      [(label "AnswerHeld" s "adopted", put s x {outc = OApplied, dEnt = DDone} st) | dPub x == PubCommitted]
   | sess st == On && dEnt x == DQueued && msg x == noMsg =
       let held b o = put s x {msg = Msg MHeld 0 b CNone, outc = o, dEnt = DDone} st
        in [ (label "AnswerHeld" s "true", held True (if rRacy (dRec x) then OAppliedRacy else OApplied))
@@ -867,17 +986,20 @@ tick st
   | otherwise = []
 
 -- A third party writes the path (a copy of the source's bytes or other bytes)
--- under a new identity; its name is durable, its data not yet.
+-- under a new identity; its name is durable, its data not yet. Under --adopt
+-- it may instead rewrite an existing file in place, which keeps the file's
+-- capture record (an extended attribute) over other bytes.
 foreignWrite :: Config -> St -> Seat -> [Step]
 foreignWrite cfg st s
   | foreignN st < cForeign cfg =
-      [ ( label "ForeignWrite" s (show d)
+      [ ( label "ForeignWrite" s (show d ++ (if r == noRecord then "" else " in place"))
         , put
             s
-            x {out = File True (firstForeignId + foreignN st + 1) d False True, outPrev = noFile}
+            x {out = File True (firstForeignId + foreignN st + 1) d False True False r, outPrev = noFile}
             st {foreignN = foreignN st + 1, changedRun = S.insert s (changedRun st)}
         )
       | d <- S.toList (S.fromList [foreignBytes, edits x])
+      , r <- S.toList (S.fromList (noRecord : [fRec (out x) | cAdopt cfg && fPres (out x)]))
       ]
   | otherwise = []
   where
@@ -980,6 +1102,29 @@ terminated cfg st
 -- Invariants, under the model's frozen names
 
 type Invariant = (String, Config -> St -> Bool)
+
+-- #169's invariants, beside the safety ones and not frozen. Each is part of
+-- `--check all` only under its switch, as the catalogue's every-invariant
+-- configs are (Catalogue.dhall, `beside`).
+strictInvariant, adoptInvariant :: Invariant
+strictInvariant = ("R25_StrictNoDurableReread", \_ st -> not (any rdStrict (S.toList (readLog st))))
+adoptInvariant =
+  ( "AdoptOnlyUnrowed"
+  , \_ st ->
+      all
+        ( \(s, x) ->
+            not (dEnt x == DAdoptQueued && dPub x == PubAdoptWait)
+              || not (any (\r -> drSeat r == s && drKey r == rKey (dRec x) && drId r == rId (dRec x)) (S.toList (dstRows st)))
+        )
+        (M.toList (seats st))
+  )
+
+-- Every invariant a name may select, and the ones `--check all` means.
+knownInvariants :: [Invariant]
+knownInvariants = invariants ++ [strictInvariant, adoptInvariant]
+
+allInvariants :: Config -> [Invariant]
+allInvariants cfg = invariants ++ [strictInvariant | cStrict cfg] ++ [adoptInvariant | cAdopt cfg]
 
 invariants :: [Invariant]
 invariants =
@@ -1121,6 +1266,7 @@ dEntName e = case e of
   DAwaitManifest -> "await_manifest"
   DFilling -> "filling"
   DQueued -> "queued"
+  DAdoptQueued -> "adopt_queued"
   DDone -> "done"
 
 planName :: Plan -> String
@@ -1230,7 +1376,16 @@ stateJ st =
     lrowJ r = JO [("seat", JS [lSeat r]), ("key", JN (lKey r)), ("data", JN (lData r))]
     msgJ m = JO [("t", JS (msgTName (mT m))), ("v", JN (mV m)), ("b", JB (mB m)), ("c", JS (codeName (mC m)))]
     recJ r = JO [("key", JN (rKey r)), ("data", JN (rData r)), ("racy", JB (rRacy r)), ("id", JN (rId r)), ("kind", JS (kindName (rKind r)))]
-    fileJ f = JO [("pres", JB (fPres f)), ("id", JN (fId f)), ("data", JN (fData f)), ("dd", JB (fDD f)), ("nd", JB (fND f))]
+    fileJ f =
+      JO
+        [ ("pres", JB (fPres f))
+        , ("id", JN (fId f))
+        , ("data", JN (fData f))
+        , ("dd", JB (fDD f))
+        , ("nd", JB (fND f))
+        , ("cl", JB (fCl f))
+        , ("rec", JO [("key", JN (crKey (fRec f))), ("data", JN (crData (fRec f)))])
+        ]
     readJ r =
       JO
         [ ("run", JN (rdRun r))
@@ -1238,6 +1393,7 @@ stateJ st =
         , ("key", JN (rdKey r))
         , ("kind", JS (if rdKind r == Full then "full" else "chunks"))
         , ("held", JB (rdHeld r))
+        , ("strict", JB (rdStrict r))
         , ("committed", JB (rdCommitted r))
         ]
     tmpName t = case t of
@@ -1253,7 +1409,7 @@ stateJ st =
 counterexample :: Config -> String -> [String] -> Failure -> String
 counterexample cfg name checked f =
   let final = snd (last (failTrace f))
-      alsoFalse = [n | (n, ok) <- invariants, not (ok cfg final), n `notElem` failWhat f]
+      alsoFalse = [n | (n, ok) <- allInvariants cfg, not (ok cfg final), n `notElem` failWhat f]
       header =
         [ ("explorer", JS "docs/formal/hs/Explorer.hs")
         , ("row", JS name)
@@ -1282,6 +1438,8 @@ data Opts = Opts
   , oCrashes :: Maybe Int
   , oEdits :: Maybe Int
   , oForeign :: Maybe Int
+  , oAdopt :: Bool
+  , oStrict :: Bool
   , oMutation :: Maybe String
   , oCheck :: String
   , oName :: Maybe String
@@ -1289,7 +1447,7 @@ data Opts = Opts
   }
 
 parseOpts :: [String] -> Either String Opts
-parseOpts = go (Opts "nv_core" Nothing Nothing Nothing Nothing Nothing Nothing "all" Nothing Nothing)
+parseOpts = go (Opts "nv_core" Nothing Nothing Nothing Nothing Nothing False False Nothing "all" Nothing Nothing)
   where
     go o [] = Right o
     go o ("--preset" : v : rest) = go o {oPreset = v} rest
@@ -1300,6 +1458,8 @@ parseOpts = go (Opts "nv_core" Nothing Nothing Nothing Nothing Nothing Nothing "
     go o ("--crashes" : v : rest) = count v >>= \n -> go o {oCrashes = Just n} rest
     go o ("--edits" : v : rest) = count v >>= \n -> go o {oEdits = Just n} rest
     go o ("--foreign" : v : rest) = count v >>= \n -> go o {oForeign = Just n} rest
+    go o ("--adopt" : rest) = go o {oAdopt = True} rest
+    go o ("--strict-held" : rest) = go o {oStrict = True} rest
     go o ("--mutation" : v : rest) = go o {oMutation = if v == "none" then Nothing else Just v} rest
     go o ("--check" : v : rest) = go o {oCheck = v} rest
     go o ("--name" : v : rest) = go o {oName = Just v} rest
@@ -1318,7 +1478,7 @@ splitOn c s = case break (== c) s of
 usage :: String -> IO a
 usage err = do
   hPutStrLn stderr ("Explorer: " ++ err)
-  hPutStrLn stderr "usage: Explorer [--preset nv_core|nv_ledger] [--seats LETTERS] [--runs N] [--crashes N] [--edits N] [--foreign N] [--mutation NAME] [--check all|NAME,...] [--name NAME] [--json DIR]"
+  hPutStrLn stderr "usage: Explorer [--preset nv_core|nv_ledger|nv_core_adopt|nv_ledger_adopt] [--seats LETTERS] [--runs N] [--crashes N] [--edits N] [--foreign N] [--adopt] [--strict-held] [--mutation NAME] [--check all|NAME,...] [--name NAME] [--json DIR]"
   exitWith (ExitFailure 2)
 
 main :: IO ()
@@ -1337,10 +1497,12 @@ main = do
           , cCrashes = fromMaybe (cCrashes base) (oCrashes opts)
           , cEdits = fromMaybe (cEdits base) (oEdits opts)
           , cForeign = fromMaybe (cForeign base) (oForeign opts)
+          , cAdopt = cAdopt base || oAdopt opts
+          , cStrict = cStrict base || oStrict opts
           , cMutation = mutation
           }
-      known = map fst invariants
-      wanted = if oCheck opts == "all" then known else splitOn ',' (oCheck opts)
+      known = map fst knownInvariants
+      wanted = if oCheck opts == "all" then map fst (allInvariants cfg) else splitOn ',' (oCheck opts)
       name = case oName opts of
         Just n -> n
         Nothing -> case mutation of
@@ -1352,7 +1514,7 @@ main = do
     [] -> pure ()
     bad -> usage ("unknown invariant(s): " ++ unwords bad)
   if all (\c -> isAlphaNum c || c == '_') name then pure () else usage "a row name is letters, digits and _"
-  let checks = [inv | inv@(n, _) <- invariants, n `elem` wanted]
+  let checks = [inv | inv@(n, _) <- knownInvariants, n `elem` wanted]
       rep = explore cfg checks
       common =
         [ ("row", name)

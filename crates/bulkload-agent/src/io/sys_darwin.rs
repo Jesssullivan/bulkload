@@ -264,3 +264,69 @@ pub fn in_background() -> io::Result<bool> {
 pub const fn set_pipe_buffer(_fd: BorrowedFd<'_>, _bytes: libc::c_int) -> io::Result<bool> {
     Ok(false)
 }
+
+/// The extended attribute that carries a published output's capture record
+/// (#169), in reverse-DNS form as Darwin's own attributes are named.
+pub(super) const CAPTURE_RECORD: &CStr = c"dev.tinyland.bulkload.capture";
+
+/// `errno` for an attribute the file does not have.
+pub(super) const NO_ATTRIBUTE: libc::c_int = libc::ENOATTR;
+
+/// `fsetxattr(fd, name, value, 0, 0)`: create or replace the attribute.
+pub(super) fn set_xattr_raw(fd: BorrowedFd<'_>, name: &CStr, value: &[u8]) -> io::Result<()> {
+    loop {
+        // SAFETY: the descriptor is live for the call, `name` is
+        // NUL-terminated and outlives it, and `value` is a live slice whose
+        // length is passed with its pointer; the kernel only reads it.
+        // Position 0 and no options are what a regular file's attribute takes.
+        let ret = unsafe {
+            libc::fsetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+                0,
+            )
+        };
+        if ret != -1 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// `fgetxattr(fd, name, buffer, 0, 0)`: the attribute's length, read into
+/// `buffer`.
+pub(super) fn get_xattr_raw(
+    fd: BorrowedFd<'_>,
+    name: &CStr,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    loop {
+        // SAFETY: the descriptor is live for the call, `name` is
+        // NUL-terminated and outlives it, and `buffer` is a live, exclusively
+        // borrowed slice whose length is passed with its pointer, so the
+        // kernel writes at most that many bytes.
+        let got = unsafe {
+            libc::fgetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                0,
+                0,
+            )
+        };
+        if let Ok(length) = usize::try_from(got) {
+            return Ok(length);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}

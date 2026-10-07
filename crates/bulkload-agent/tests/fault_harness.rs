@@ -697,6 +697,26 @@ const fn leaves_temporary(point: Point) -> bool {
     )
 }
 
+/// #169 (R25 strict): the outputs a crash left published at their final
+/// path with the source's bytes and no row (their group's commit never ran).
+/// Each is adopted from its capture record, reading 0 source bytes. The
+/// fixture's captures are non-racy (`populate`), so each has a record.
+fn adoptable<'a>(
+    scratch: &Scratch,
+    files: &'a BTreeMap<Vec<u8>, u64>,
+    before: &CrashState,
+) -> Vec<&'a Vec<u8>> {
+    files
+        .keys()
+        .filter(|path| {
+            !before.outputs.contains_key(*path)
+                && !before.captures.contains_key(*path)
+                && fs::read(scratch.destination().join(relative(path))).ok()
+                    == fs::read(scratch.source().join(relative(path))).ok()
+        })
+        .collect()
+}
+
 fn crash_resume(point: Point, nth: u64, fixture: Fixture) {
     crash_resume_with(point, nth, fixture, &[], |_| {});
 }
@@ -721,10 +741,13 @@ fn crash_resume_with(
     let crash_temporaries = assert_i2(&label, &scratch);
 
     let files = source_files(&scratch);
+    let adoptable = adoptable(&scratch, &files, &before);
     let uncommitted: u64 = files
         .iter()
         .filter(|(path, _)| {
-            !before.outputs.contains_key(*path) && !before.captures.contains_key(*path)
+            !before.outputs.contains_key(*path)
+                && !before.captures.contains_key(*path)
+                && !adoptable.contains(path)
         })
         .map(|(_, size)| *size)
         .sum();
@@ -752,7 +775,8 @@ fn crash_resume_with(
         "{label}: resume refused {:?}",
         resumed.refusals
     );
-    // I3: committed files cost 0 source bytes; the rest are read exactly once.
+    // I3: committed and adopted files cost 0 source bytes; the rest are read
+    // exactly once.
     assert_eq!(
         resumed.source_bytes_read,
         uncommitted + refused_read,
@@ -763,6 +787,11 @@ fn crash_resume_with(
         resumed.reused,
         before.outputs.len() as u64,
         "{label} I3: every recorded output must be reused"
+    );
+    assert_eq!(
+        resumed.unrowed_adopted,
+        adoptable.len() as u64,
+        "{label} I3: every published unrowed output must be adopted (#169)"
     );
     assert_eq!(
         resumed.completed + resumed.reused,
@@ -796,12 +825,13 @@ fn crash_resume_with(
     );
     println!(
         "{label}: outputs_before={} captures_before={} temporaries_at_crash={crash_temporaries} \
-         resume_completed={} resume_reused={} resume_source_bytes={} resume_bytes_received={} \
-         temporaries_left={temporaries}{}",
+         resume_completed={} resume_reused={} resume_unrowed_adopted={} resume_source_bytes={} \
+         resume_bytes_received={} temporaries_left={temporaries}{}",
         before.outputs.len(),
         before.captures.len(),
         resumed.completed,
         resumed.reused,
+        resumed.unrowed_adopted,
         resumed.source_bytes_read,
         resumed.bytes_received,
         group
