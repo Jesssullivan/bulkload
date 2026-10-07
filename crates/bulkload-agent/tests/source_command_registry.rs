@@ -157,7 +157,11 @@ const BYPASSES: &[Bypass] = &[
              ssh.arg(\"-F\").arg(config);}ssh.arg(\"--\").arg(host).arg(remote);\
              ifbulkload_agent::durable::durability()==\
              bulkload_agent::durable::Durability::Strict{\
-             ssh.arg(\"--durability=strict\");}letmutchild=ssh.arg(\"serve\")\
+             ssh.arg(\"--durability=strict\");}\
+             ifbulkload_agent::durable::ledger_sync()==\
+             bulkload_agent::durable::LedgerSync::Full{\
+             ssh.arg(\"--source-ledger-sync=full\");}\
+             letmutchild=ssh.arg(\"serve\")\
              .stdin(Stdio::piped()).stdout(Stdio::piped())\
              .stderr(Stdio::inherit()).spawn()",
         ),
@@ -165,7 +169,9 @@ const BYPASSES: &[Bypass] = &[
         why: "Starts the remote `bulkload-agent serve`, which is the source \
               reader and enters background priority itself (OI-1003-Q25). The \
               remote word is `bulkload-agent` or a validated absolute path, \
-              and the ssh child touches no local source.",
+              and the ssh child touches no local source. The two mode flags it \
+              may pass (`--durability=strict`, and WP0(g)'s \
+              `--source-ledger-sync=full`, OI-1003-Q109) are fixed literals.",
     },
     Bypass {
         id: "agent::provider_sqlite::hydrate::hydrate_one(program)",
