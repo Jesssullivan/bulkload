@@ -90,6 +90,17 @@
 //! | `receive.after_chunks` | one file's chunks verified, covering it, and written to its temporary |
 //! | `receive.after_end` | an entry's `End` handled; its output may still be waiting on its group |
 //!
+//! Git estate capture publication, in `estate::capture_item` (Q42 lane L7,
+//! P70). The `{bundle}.reuse` manifest is published after the bundle and its
+//! dependency sidecars and before the `{item}.capture` record:
+//!
+//! | Name | Crash leaves (in the corpus) |
+//! |------|------------------------------|
+//! | `estate.after_bundle_publish` | the bundle under its content name; no sidecar of this pass, the record as it was |
+//! | `estate.before_reuse_sidecar` | the bundle and its `.base`, `.prior`, `.drift`, `.nested` and `.parts`; no manifest of this pass |
+//! | `estate.after_reuse_sidecar` | the bundle, its sidecars and its `.reuse` manifest; the record still names the capture before |
+//! | `estate.after_capture_record` | the record naming the bundle; no outcome record for the pass |
+//!
 //! # Group size
 //!
 //! Group commit closes a group by count, size or idle time, so how many
@@ -214,11 +225,19 @@ pub enum Point {
     ReceiveAfterChunks,
     /// `receive.after_end`
     ReceiveAfterEnd,
+    /// `estate.after_bundle_publish`
+    EstateAfterBundlePublish,
+    /// `estate.before_reuse_sidecar`
+    EstateBeforeReuseSidecar,
+    /// `estate.after_reuse_sidecar`
+    EstateAfterReuseSidecar,
+    /// `estate.after_capture_record`
+    EstateAfterCaptureRecord,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 23] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -238,6 +257,10 @@ impl Point {
         Self::ReceiveAfterDecide,
         Self::ReceiveAfterChunks,
         Self::ReceiveAfterEnd,
+        Self::EstateAfterBundlePublish,
+        Self::EstateBeforeReuseSidecar,
+        Self::EstateAfterReuseSidecar,
+        Self::EstateAfterCaptureRecord,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -263,6 +286,10 @@ impl Point {
             Self::ReceiveAfterDecide => "receive.after_decide",
             Self::ReceiveAfterChunks => "receive.after_chunks",
             Self::ReceiveAfterEnd => "receive.after_end",
+            Self::EstateAfterBundlePublish => "estate.after_bundle_publish",
+            Self::EstateBeforeReuseSidecar => "estate.before_reuse_sidecar",
+            Self::EstateAfterReuseSidecar => "estate.after_reuse_sidecar",
+            Self::EstateAfterCaptureRecord => "estate.after_capture_record",
         }
     }
 

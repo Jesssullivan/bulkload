@@ -880,11 +880,30 @@ fn crash_child_entry() {
 const WITH_REFUSAL: Fixture = Fixture { refused: true };
 const NO_REFUSAL: Fixture = Fixture { refused: false };
 
+/// What a row of the `scenarios!` table runs at its fault point: a `copy`
+/// crash-resume over a [`Fixture`], or an estate capture's publication
+/// ([`estate_sidecar::EstateSidecar`], P70).
+trait Scenario {
+    fn run(self, point: Point, nth: u64);
+}
+
+impl Scenario for Fixture {
+    fn run(self, point: Point, nth: u64) {
+        crash_resume(point, nth, self);
+    }
+}
+
+// The `estate.*` points (Q42 lane L7): the reuse manifest's publication
+// order around a Git capture's record.
+#[path = "fault_harness/estate_sidecar.rs"]
+mod estate_sidecar;
+use estate_sidecar::EstateSidecar;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {$(
         #[test]
         fn $name() {
-            crash_resume(Point::$point, $nth, $fixture);
+            Scenario::run($fixture, Point::$point, $nth);
         }
     )*};
 }
@@ -922,6 +941,15 @@ scenarios! {
     receive_after_decide_mid => ReceiveAfterDecide: 30, WITH_REFUSAL;
     receive_after_chunks_mid => ReceiveAfterChunks: 25, WITH_REFUSAL;
     receive_after_end_mid => ReceiveAfterEnd: 25, WITH_REFUSAL;
+    // P70 SIDECAR-ORDER: each point on a first capture and on a changed one.
+    estate_after_bundle_publish_first => EstateAfterBundlePublish: 1, EstateSidecar::First;
+    estate_after_bundle_publish_changed => EstateAfterBundlePublish: 1, EstateSidecar::Changed;
+    estate_before_reuse_sidecar_first => EstateBeforeReuseSidecar: 1, EstateSidecar::First;
+    estate_before_reuse_sidecar_changed => EstateBeforeReuseSidecar: 1, EstateSidecar::Changed;
+    estate_after_reuse_sidecar_first => EstateAfterReuseSidecar: 1, EstateSidecar::First;
+    estate_after_reuse_sidecar_changed => EstateAfterReuseSidecar: 1, EstateSidecar::Changed;
+    estate_after_capture_record_first => EstateAfterCaptureRecord: 1, EstateSidecar::First;
+    estate_after_capture_record_changed => EstateAfterCaptureRecord: 1, EstateSidecar::Changed;
 }
 
 #[test]

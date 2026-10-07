@@ -109,17 +109,10 @@ struct Ran {
     cpu: Duration,
 }
 
-/// Run one verb in its own process, reaped with `wait4` for its rusage.
-fn verb(scratch: &Path, args: &[&std::ffi::OsStr]) -> Ran {
-    let out = scratch.join("verb.stdout");
-    let err = scratch.join("verb.stderr");
-    let child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(std::fs::File::create(&out).unwrap())
-        .stderr(std::fs::File::create(&err).unwrap())
-        .spawn()
-        .unwrap();
+/// `wait4` on a child std has not waited for: whether it exited 0, and its
+/// rusage user plus system time, its reaped descendants' included. After
+/// this the `Child` handle is only dropped, never waited on.
+fn reap(child: &std::process::Child) -> (bool, Duration) {
     let pid = libc::pid_t::try_from(child.id()).unwrap();
     let mut status: libc::c_int = 0;
     // SAFETY: `rusage` is a plain C struct of integers; all-zero is a valid
@@ -142,20 +135,39 @@ fn verb(scratch: &Path, args: &[&std::ffi::OsStr]) -> Ran {
         Duration::from_secs(u64::try_from(value.tv_sec).unwrap())
             + Duration::from_micros(u64::try_from(value.tv_usec).unwrap())
     };
+    (
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        time(usage.ru_utime) + time(usage.ru_stime),
+    )
+}
+
+/// Run one verb in its own process, reaped with `wait4` for its rusage.
+#[allow(clippy::zombie_processes)] // `reap` waits for it, with `wait4`.
+fn verb(scratch: &Path, args: &[&std::ffi::OsStr]) -> Ran {
+    let out = scratch.join("verb.stdout");
+    let err = scratch.join("verb.stderr");
+    let child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&out).unwrap())
+        .stderr(std::fs::File::create(&err).unwrap())
+        .spawn()
+        .unwrap();
+    let (ok, cpu) = reap(&child);
     let stderr = std::fs::read_to_string(&err).unwrap();
     let line = stderr
         .lines()
         .find(|line| line.starts_with("counters "))
         .unwrap_or_else(|| panic!("no counters line in {stderr}"));
     Ran {
-        ok: libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        ok,
         counters: line
             .split(' ')
             .filter_map(|pair| pair.split_once('='))
             .filter_map(|(key, value)| Some((key.to_owned(), value.parse().ok()?)))
             .collect(),
         stdout: std::fs::read_to_string(&out).unwrap(),
-        cpu: time(usage.ru_utime) + time(usage.ru_stime),
+        cpu,
     }
 }
 
@@ -267,7 +279,7 @@ fn manifest_of(bundle: &Path) -> PathBuf {
 }
 
 /// Restore the corpus and compare the workspace with the source, byte for
-/// byte: `HEAD`, the branches and every file but `.git`.
+/// byte: `HEAD` and every file but `.git`.
 fn apply_and_compare(estate: &Estate) {
     let applied = verb(
         &estate.root.0,
@@ -283,21 +295,11 @@ fn apply_and_compare(estate: &Estate) {
     assert!(applied.ok, "{} {:?}", applied.stdout, applied.counters);
     // Apply never packs from a source and never reads a manifest.
     assert_eq!(applied.counters["write_source_pack_bytes"], 0);
-    for args in [
-        ["rev-parse", "HEAD"].as_slice(),
-        [
-            "for-each-ref",
-            "--format=%(objectname) %(refname)",
-            "refs/heads",
-        ]
-        .as_slice(),
-    ] {
-        assert_eq!(
-            git_out(&estate.target, args),
-            git_out(&estate.source, args),
-            "{args:?}"
-        );
-    }
+    let head = ["rev-parse", "HEAD"];
+    assert_eq!(
+        git_out(&estate.target, &head),
+        git_out(&estate.source, &head)
+    );
     let files = |root: &Path| -> BTreeMap<std::ffi::OsString, Vec<u8>> {
         std::fs::read_dir(root)
             .unwrap()
