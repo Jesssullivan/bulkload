@@ -110,9 +110,65 @@ Two wording points the pass settled:
 - The draft sentence that called Dhall "total" was removed: the fetched
   pages did not state it in those words. The paper now cites the formal
   README for what the catalogue's `merge` guarantees.
-- The texts of [NVersion85] and [KnightLeveson86] were not read. The paper
-  cites them for the term and for the independence assumption their titles
-  name, and each entry says so.
+- [NVersion85] and [KnightLeveson86]: in the first pass only the Crossref
+  metadata was checked, and the paper's sentences about them came from
+  memory. The review pass (below) read both abstracts and held the paper to
+  them.
+
+## Review pass (2026-10-07, same lane, same rulings)
+
+A review of `8b13fa8` raised one high and two medium findings. All three
+were judged valid and fixed in one signed commit on top of `1a3037b`.
+`origin/main` was still `a80c63b`, so there was nothing to merge.
+
+1. **S1 statements were only true of `main` (high).** Branch
+   `origin/feat/s1-hermetic-rig-20261007` (head `83d08dc`, no PR) holds, at
+   commit `640093d`, `docs/evidence/r23-2026-10-07-0652Z-no-a-control.md`:
+   a gated-mode gate (a) sample on mbp-13, B/B/B with no A control, printed
+   verdict "FAIL (NO A CONTROL)", 0 of 3. The paper now:
+   - scopes every "no gated sample" sentence to `main` (abstract, 4.6,
+     5.1, 5.2, 5.3, 7, 8);
+   - reports the draft as *pending, off `main`* in 4.4 and in a new
+     paragraph of 5.3, with the numbers as that file prints them, and says
+     its standing is the operator's decision;
+   - says beside the under-load numbers that the only gated-mode sample
+     points the other way;
+   - drops "No quiet gated window has been obtained";
+   - names this as the one exception to "every result cites a file on
+     `main`".
+   Read with `git show origin/feat/s1-hermetic-rig-20261007:<path>`; the
+   branch was not checked out and nothing was written to it.
+2. **S3's rerun bound (medium).** `docs/slo.md` words the unchanged-estate
+   bound on wall-clock (S3 row; WP0(c)). The S3 evidence applies
+   OI-1003-Q35 (CPU ratio admissible, wall informational), and
+   `grep Q35 docs/slo.md` finds nothing. Section 5.2 now gives both ratios
+   at both scales against both readings, 4.6 notes the disagreement, and
+   section 7's documentation-drift list carries the item.
+3. **[NVersion85] and [KnightLeveson86] (medium).** Both abstracts were
+   read on 2026-10-07 from the OpenAlex records for their DOIs
+   (`paper-search` `search_openalex` for W1971991620; `api.openalex.org`
+   for W2129360963), and both DOIs were resolved again through Crossref
+   (`get_crossref_paper_by_doi`; SE-12(1) pp. 96-109 and SE-11(12)
+   pp. 1491-1501). The full texts were not read. Changes:
+   - the definition of N-version programming and the result (27 versions,
+     coincident failures "substantially more than expected") are now cited
+     to the Knight and Leveson abstract, and the bibliography lists the
+     statements relied on;
+   - [NVersion85] is cited as a review of the approach, which is what its
+     abstract says it is. "Origin of the term" is gone. The earlier Chen
+     and Avizienis paper was not added: Crossref lists only a 1995 reprint
+     (10.1109/ftcsh.1995.532621) and its text was not read.
+
+No other bibliography entry was touched in this pass, so the 2026-10-07 log
+above stands for the rest.
+
+**Low findings, not fixed by instruction** (listed in the lane result):
+the [m0] citation for XFS in section 6; "three parts" naming two in 4.2;
+the bibliography header's "first checked on 2026-10-03" for the three new
+entries; the [Dhall] entry's README path; the Borg line range and
+Specifying02 ISBN form differing between this note and the bibliography;
+"HTTP 200 in every case" against the [Unison04] handle. The rig-branch
+pointer that one low finding asked for was added as part of fix 1.
 
 ## Validation
 
@@ -126,11 +182,17 @@ actionlint silent, and `tests/test_ci_contract.py` ran 24 tests, OK. No Rust
 was built or tested, because no Rust changed. Every relative link in both whitepaper files was
 checked to resolve.
 
+The same gate set was run again on the review-pass tree and exited 0 with
+the same output (24 contract tests, OK); the relative links were checked
+again.
+
 ## Shas
 
 - `316d304`: merge of `origin/main` `a80c63b`.
 - `8b13fa8`: the refreshed whitepaper, the bibliography and this note
   (signed).
+- `1a3037b`: this note's shas and gate result.
+- The review-pass commit follows `1a3037b`; the PR body carries its sha.
 - The commit after `8b13fa8` records these shas in this note; the PR body
   carries the final head.
 
@@ -141,12 +203,16 @@ checked to resolve.
 | Whitepaper refresh (this lane) | `docs/whitepaper-20261003`, #164 | refreshed and pushed | operator review and merge |
 | Q42 L6b grouped chaining, P68 | #199 | open | review |
 | S2 proof closure, P76 | #197 | open | review; closes #188 |
-| S1 hermetic rig | none on `main` | ruled (OI-1003-Q96, Q97), in progress | its `docs/slo.md` amendment |
+| S1 hermetic rig | `feat/s1-hermetic-rig-20261007` (`83d08dc`), no PR, not on `main` | ruled (OI-1003-Q96, Q97), in progress; one draft gated-mode sample, no A control, B FAIL 0 of 3 | the operator's ruling on the A control; its `docs/slo.md` amendment |
 | S2 gated budget run | #165 | never run | a quiet gated window |
 | Estate operations | n/a | **held** (R-N56) | the M2 gates |
 
 ## Open
 
+- **The draft rig sample needs an operator ruling**, and the paper's
+  section 5.3 should be rewritten when it is ruled on, rerun or merged.
+- **`docs/slo.md` has no OI-1003-Q35 text.** Its S3 bound is still worded
+  on wall-clock. Outside this lane's scope; the paper flags it.
 - **The paper will go stale again when the rig amendment lands.** Its S1
   text cites OI-1003-Q96 and Q97 from this lane's dispatch only. Once
   `docs/slo.md` carries them, section 4.4 should cite that text instead.

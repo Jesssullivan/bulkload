@@ -22,7 +22,11 @@ How the 2026-10-07 pass was made:
 - every URL was fetched again (HTTP 200 in every case) and searched for the
   phrase the entry relies on;
 - three entries were added for the formal method: [Dhall], [NVersion85] and
-  [KnightLeveson86].
+  [KnightLeveson86];
+- for [NVersion85] and [KnightLeveson86] the abstract was also read, from
+  the OpenAlex record for each DOI, because the paper relies on what those
+  two works say and not only on their existence. Each entry lists what was
+  read.
 
 The per-entry log is in
 [`docs/agent-notes/2026-10-07-whitepaper-refresh.md`](../agent-notes/2026-10-07-whitepaper-refresh.md).
@@ -110,9 +114,18 @@ evaluation of the assumption of independence in multiversion programming."
 [10.1109/TSE.1986.6312924](https://doi.org/10.1109/TSE.1986.6312924).
 - Verified via: Crossref, DOI 10.1109/TSE.1986.6312924 (authors, title,
   journal, volume SE-12, issue 1, pages, 1986). Added 2026-10-07.
-- The paper cites it only for its title's claim: that the independence of
-  separately written versions is an assumption to be tested. Its text was
-  not read here.
+- Abstract read on 2026-10-07 from the OpenAlex record for this DOI (work
+  W1971991620, `paper-search` `search_openalex`). The full text was not
+  read. The paper relies on these statements of the abstract and on nothing
+  else from the work:
+  - N versions of a program are prepared and executed in parallel, and a
+    voter examines their outputs;
+  - the method depends on the assumption that independently developed
+    programs fail independently;
+  - 27 versions were prepared independently from one specification at two
+    universities and subjected to one million tests;
+  - the number of tests in which more than one program failed was
+    "substantially more than expected".
 
 **[LBFS01]** Athicha Muthitacharoen, Benjie Chen and David Mazières. "A
 Low-bandwidth Network File System." *Proceedings of the Eighteenth ACM
@@ -128,8 +141,17 @@ SE-11(12), 1985, pp. 1491–1501. DOI
 - Verified via: Crossref, DOI 10.1109/TSE.1985.231893 (author "A.
   Avizienis", title, journal, volume SE-11, issue 12, pages, 1985). Added
   2026-10-07.
-- The paper cites it only as the origin of the term the formal model's
-  README uses ("N-version"). Its text was not read here.
+- Abstract read on 2026-10-07 from the OpenAlex record for this DOI (work
+  W2129360963, fetched from `api.openalex.org`). The full text was not
+  read. By its abstract the article reviews the evolution of the N-version
+  approach to tolerating design faults, summarises the requirements for
+  implementing N-version software, and describes the DEDIX testbed.
+- The paper cites it as a review of the approach whose name the formal
+  model's README uses ("N-version"), and for nothing else. It is not cited
+  as the origin of the term: the abstract calls itself a review of the
+  approach's evolution, and the earlier work it reviews was not looked up.
+  The definition the paper gives of N-version programming is taken from
+  the abstract of [KnightLeveson86].
 
 **[OptFS13]** Vijay Chidambaram, Thanumalayan Sankaranarayana Pillai,
 Andrea C. Arpaci-Dusseau and Remzi H. Arpaci-Dusseau. "Optimistic Crash

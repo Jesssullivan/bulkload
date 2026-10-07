@@ -22,6 +22,9 @@ Three rules keep the paper honest:
 
 - **Every statement about a result cites a file on `main`**: an evidence
   file, `docs/slo.md`, `docs/formal/`, a test file or a dated agent note.
+  There is one exception, named where it occurs: the draft S1 sample of
+  section 5.3 is on an unmerged branch, and is cited by branch, commit and
+  path.
 - **Every result carries one of three labels.**
   - *Gated*: enforced on every pull request by `just check-fast` and the two
     CI gates, or a benchmark sample taken under the R-N81 and R-N91 gate
@@ -69,11 +72,14 @@ state of the proof on `main` at `a80c63b`, in one paragraph each:
   small bounds. A Dhall catalogue renders their configurations, and a
   Haskell explorer reproduces TLC's state counts (section 4.2). No tier or
   CI gate runs them.
-- **Not met.** **S1 has no gated sample.** No benchmark of the wire v5
-  engine has been taken under the gate conditions. The only S1 numbers since
-  wire v5 are informational, taken under load on 2026-10-04 (section 5.2).
-  The S2 budget has never been measured. S4 does not yet cover transfer and
-  SQLite outcomes, and S5 still refuses HEAD and index movement.
+- **Not met.** **S1 has no gated sample on `main`.** No file on `main`
+  records a benchmark of the wire v5 engine taken under the gate conditions.
+  The only S1 numbers on `main` since wire v5 are informational, taken under
+  load on 2026-10-04, and they favour native (section 5.2). One draft
+  gated-mode sample exists off `main`, on an unmerged branch and without its
+  A control. It points the other way: B failed, with 0 of 3 reps passing
+  (section 5.3). The S2 budget has never been measured. S4 does not yet
+  cover transfer and SQLite outcomes, and S5 still refuses HEAD and index movement.
 
 ## 1. Problem
 
@@ -933,10 +939,15 @@ primary row, and every safety invariant except `TypeOK` to have at least one
 row that fails it. Each negative configuration breaks exactly one rule and
 must produce a counterexample on the one property it names.
 
-**What N-version checking does and does not show.** N-version programming
-runs independently written versions of one specification and compares their
-results [NVersion85]. Its known weakness is that independently written
-versions can still fail on the same inputs [KnightLeveson86]. The README is
+**What N-version checking does and does not show.** In N-version
+programming, several versions of a program are prepared independently and
+run in parallel, and their outputs are compared ([KnightLeveson86],
+abstract; [NVersion85] reviews the approach). The method rests on the
+assumption that independently developed versions fail independently.
+Knight and Leveson tested that assumption on 27 versions written from one
+specification and report that tests in which more than one version failed
+were substantially more frequent than independence predicts
+[KnightLeveson86]. The README is
 explicit that the explorers are "independent code, shared design": each was
 transliterated by hand from the TLA+ text. So parity shows that TLC
 evaluates the specification as its text reads. It cannot catch a misreading
@@ -1149,6 +1160,11 @@ never move to the optional tier (`AGENTS.md`, "Validation").
   no amendment for these rulings and no rig code or evidence is on `main`;
   this paper cites the rulings as this refresh's dispatch gave them. Until
   the amendment lands, the gate text in `docs/slo.md` is the one above.
+  - **Pending, off `main`.** Branch `feat/s1-hermetic-rig-20261007` (head
+    `83d08dc` on 2026-10-07, no pull request) carries a draft `docs/slo.md`
+    amendment for these rulings, the harness changes, and one draft
+    gated-mode gate (a) sample at commit `640093d`. The sample has no A
+    control and its B verdict is FAIL, 0 of 3. Section 5.3 reports it.
 - **The estate-shaped corpus** (#159, OI-1003-Q19): a deterministic, sealed
   generator of Git-heavy, many-small-file trees
   ([evidence](../evidence/estate-corpus-v1-2026-10-03.md)).
@@ -1177,15 +1193,15 @@ property tier and every benchmark are outside both.
 
 | SLO | Instrument | State |
 |---|---|---|
-| S1 gate (a) | R23 A/B harness under R-N81 | **Not met. No gated sample of the wire v5 engine exists.** Informational numbers only (section 5.2). |
+| S1 gate (a) | R23 A/B harness under R-N81 | **Not met. No gated sample of the wire v5 engine is on `main`.** Informational numbers only (section 5.2). Pending off `main`: one draft gated-mode sample with no A control, B FAIL 0 of 3 (section 5.3). |
 | S1 gate (b) | `gate_b.py` | Harness on `main`. Pending: no run, and the native multi-stream arm is not built. |
-| S1 gate of record | hermetic rig (OI-1003-Q96, Q97) | Ruled 2026-10-07; in progress; not on `main`. |
+| S1 gate of record | hermetic rig (OI-1003-Q96, Q97) | Ruled 2026-10-07; in progress; not on `main`. A draft amendment and one draft sample are on branch `feat/s1-hermetic-rig-20261007` (section 5.3). |
 | S2 properties | P-S2, P34, P75, the priority test; `MC_s2` | Gated for the file path, the Git object store and the SQLite exceptions. Open: #188, the Q16 lock counter, P34's traced form. |
 | S2 budget | `s2_budget.py` | Pending. Never measured (#165). |
 | S3 file path | P21, P23, P18, P19, fault-harness I3; the model's S3 invariants | Gated, with three properties ignored against #186 and #187. |
 | S3 Git path | P64, P65, P67, counters tests | Laws gated. One estate measurement, informational, taken before thin bases (section 5.2). |
 | S3 SQLite | none | Not met: `snapshot` re-reads every database on every pass. |
-| S3 rerun ratio | `s3_estate.py` | Informational, one run (section 5.2). No gated verdict. |
+| S3 rerun ratio | `s3_estate.py` | Informational, one run (section 5.2). No gated verdict. `docs/slo.md` words the bound on wall-clock; the evidence judged the CPU ratio (OI-1003-Q35), and the two readings disagree at small scale. |
 | R25 | P74, I3, the power-loss proofs; `R25_NoDurableReread` | Gated on the code; holds in the model within its bounds. Strict reading holds within stated limits (section 3.1). |
 | Durability order | fault harness I1–I4, R-N88 checker, resume proofs; four model invariants | Gated. #161 is fixed. The real-copy proof is bounded. |
 | S4 | closure gate, disposition ledger; P72, P73; `ClosureAccounted` | Gated **for Git estate items only**. Transfer and SQLite outcomes are not in the ledger. 57 bare `IO` sites remain. |
@@ -1193,8 +1209,10 @@ property tier and every benchmark are outside both.
 
 ## 5. Results
 
-This section reports only what files on `main` record, with dates. No
-number is rounded, extrapolated or combined from two files.
+This section reports only what files on `main` record, with dates. The one
+exception is the draft S1 sample in section 5.3, which is on an unmerged
+branch and is marked so. No number is rounded, extrapolated or combined
+from two files.
 
 ### 5.1 Gated
 
@@ -1222,15 +1240,19 @@ every pull request. These hold on `main` at `a80c63b`:
   proves the root refusal only (section 7).
 - **S4 for Git items**: P72 and P73 (`src/outcome.rs`, `src/closure.rs`).
 
-**No benchmark sample is gated.** No S1, S2-budget or S3-ratio sample has
-been taken under R-N81 and R-N91 on the wire v5 engine.
+**No benchmark sample on `main` is gated.** No file on `main` records an
+S1, S2-budget or S3-ratio sample of the wire v5 engine taken under R-N81
+and R-N91. Off `main`, one draft S1 sample was taken in gated mode without
+its A control (section 5.3).
 
 ### 5.2 Informational
 
 Each item below is on record but enforced by nothing.
 
-**S1. There is still no gated sample.** The only S1 numbers since wire v5
-are these.
+**S1. There is still no gated sample on `main`.** The only S1 numbers on
+`main` since wire v5 are these. **Read them beside section 5.3**: the
+under-load numbers below favour native, and the only gated-mode sample that
+exists, a draft off `main`, points the other way.
 
 - **2026-10-04, under load, on neo** (B = `cd4ffad`;
   [coordinator note](../agent-notes/2026-10-05-coordinator.md), "Measured";
@@ -1244,7 +1266,11 @@ are these.
   - it is one aborted sample on a host under memory pressure, so the ratio
     it suggests is not evidence of S1;
   - **no file under `docs/evidence/` records it.** The harness now writes
-    under-load evidence files, but the rerun has not happened.
+    under-load evidence files, but the rerun has not happened;
+  - **the only gated-mode sample points the other way.** In the draft
+    sample of 2026-10-07 on the hermetic rig, native lost the initial copy
+    and the delta in all three B reps (section 5.3). The two samples differ
+    in host, platform and load, so neither ratio transfers to the other.
 - **Before wire v5** (historical). The last completed gate sample,
   2026-09-18, **failed**: it lost the initial copy to rclone and won the
   1 % delta, and both are mandatory
@@ -1269,10 +1295,28 @@ estate scale (142,321 entries, 4.19 GB):
   issue #186.
 - **Unchanged reruns, SQLite half: fail.** `snapshot` re-read every
   database: 180,581,128 bytes per pass.
-- **CPU ratio** against the first pass: 6.9 % to 7.9 %, inside S3's bound
-  at estate scale. At small scale it was 15.2 % to 15.9 %, outside it; the
-  evidence attributes that to a small denominator. The wall-clock ratio was
-  0.6 % to 1.7 % and is informational by ruling (OI-1003-Q35).
+- **Rerun ratio against the first pass.** Two readings of S3's
+  unchanged-estate bound are in play, and they are not the same quantity:
+  - [`docs/slo.md`](../slo.md) words the bound on **wall-clock** (the S3
+    row, and WP0(c): "the unchanged-estate clause ... is unchanged"). It
+    carries no amendment for OI-1003-Q35.
+  - The evidence file applies **OI-1003-Q35**, which it states in its own
+    rulings header: the admissible quantity is the rusage CPU ratio, and
+    wall time is informational. That ruling is recorded in the evidence
+    files and agent notes only.
+
+  | Scale | CPU ratio (judged by the evidence, Q35) | Wall-clock ratio (the quantity `docs/slo.md` names) |
+  |---|---|---|
+  | estate | 6.9 % to 7.9 %: inside the bound | 0.6 % to 1.7 %: inside the bound |
+  | small | 15.2 % to 15.9 %: outside the bound | 3.7 % to 6.5 %: inside the bound |
+
+  So the estate scale is inside the bound on either reading. The small
+  scale fails on the CPU reading the evidence used and would pass on
+  `docs/slo.md`'s wording. The evidence attributes the small-scale CPU
+  failure to a small denominator. Which quantity binds is for `docs/slo.md`
+  to say; until it carries Q35, its wall-clock wording is the normative one
+  (section 7, "Documentation drift"). Either way the run is informational:
+  one run per scale, ungated, under load.
 - **Delta reruns.** File inequality 1 failed by the sniff bytes only. File
   inequality 2 passed after one change and was `n/a: blocked by WP0(d)`
   after ten, because changed seats were refused, not superseded (#187). Git
@@ -1325,7 +1369,8 @@ history on disk and so motivated incremental Git carry
 
 | Result owed | Blocker or state |
 |---|---|
-| A gated S1 gate (a) sample on wire v5 | No quiet gated window has been obtained; the hermetic rig (OI-1003-Q96, Q97) is in progress. |
+| A gated S1 gate (a) sample on wire v5 | None on `main`. One draft sample without its A control is on an unmerged branch (below). The hermetic rig (OI-1003-Q96, Q97) is in progress. |
+| A ruling on the draft rig sample | The operator's decision: accept B/B/B on the rig, pin a newer A that runs on Linux, or record a refused A rep without aborting (the branch's draft `docs/slo.md` amendment, "Open: the A control on the rig"). |
 | An S1 gate (b) sample | Waits on gate (a) (OI-1003-Q66). The multi-stream arm is not built. |
 | A re-run of the under-load sample with the fixed harness | Open in the [under-load note](../agent-notes/2026-10-04-r23-under-load.md). |
 | The S2 measured budget | Issue #165. Never run. |
@@ -1336,6 +1381,35 @@ history on disk and so motivated incremental Git carry
 | Transfer and SQLite outcomes in the disposition ledger | WP3 PR 4, not started on `main`. |
 | The daily-work verdict on the destination | Issue #40. |
 | The neo read-only estimate pass | Deferred ([probes](../evidence/2026-10-04-q42-probes.md), "Pending"). |
+
+**The draft gated-mode S1 sample (off `main`).** This is the one result in
+the paper that no file on `main` records. It is on branch
+`feat/s1-hermetic-rig-20261007` at commit `640093d` (2026-10-07; branch
+head `83d08dc`; no pull request), in
+`docs/evidence/r23-2026-10-07-0652Z-no-a-control.md` and its `.json`. As
+that file records it:
+
+- **What ran.** Gate (a) in the harness's `gated` mode on mbp-13 (Linux
+  x86_64, XFS), on the sealed R23 corpus v1 (23 files, 239,819,837 bytes),
+  with rclone v1.74.4. Every rep row reads `gated=True` on AC power, with
+  a 1-minute load before the B reps of 2.03, 1.87 and 1.82, and the
+  coordinator-quiet acknowledgement set (R-N91). B was `3e7b5bf`, a commit
+  of that branch.
+- **No A control.** The order was B/B/B, not the ratified B/A/B/A/B
+  (OI-1002-Q30), because the pinned A refused on that host. The file's
+  status is `complete-draft-no-a-control`.
+- **Verdict as printed: "R23 gate verdict for B: FAIL (NO A CONTROL)", 0 of
+  3 B reps.** Native's initial-copy medians were 872.965, 914.173 and
+  854.826 ms against rclone's 367.994, 361.784 and 358.996 ms. The delta
+  win was `False` in all three reps as well. Warm and interrupted resume
+  read zero in every rep, and peak memory stayed under its bound.
+- **Standing.** It is not a gate verdict of record. The file says that
+  whether it stands "is the operator's decision". It may be amended, rerun
+  with an A control, or withdrawn before it reaches `main`.
+
+What it changes for this paper: "no gated sample" is a statement about
+`main`, not about what has been attempted. A gated-mode measurement of wire
+v5 has been attempted once, and native lost it.
 
 ## 6. Prior art
 
@@ -1483,10 +1557,11 @@ the TLC model checker [TLC99] is the checker of record. Dhall [Dhall] is a
 typed configuration language. The catalogue merges a handler over each
 union type, and that is what turns a forgotten mutation verdict into a type
 error ([formal README](../formal/README.md), "The catalogue"). The Haskell
-explorers
-apply N-version programming [NVersion85] to the model, and the README's
-"independent code, shared design" caveat is the lesson of [KnightLeveson86]
-stated for this project (section 4.2).
+explorers apply the N-version approach [NVersion85] to the model. The
+README's "independent code, shared design" caveat matches what
+[KnightLeveson86] reports: versions written independently from one
+specification failed together more often than independence predicts
+(section 4.2).
 
 **Property testing.** QuickCheck [QuickCheck00] introduced random testing
 against stated properties. bulkload uses `proptest` [Proptest] and departs
@@ -1497,9 +1572,14 @@ tested corpus is bounded and identical on every run (section 4.1).
 
 **Performance is unproven.**
 
-- **No gated S1 sample exists for the wire v5 engine.** Every gated or
-  completed timing predates it, and the one sample since is informational,
-  aborted, and not in `docs/evidence/` (section 5.2).
+- **No gated S1 sample of the wire v5 engine is on `main`.** Every gated or
+  completed timing on `main` predates it, and the one sample on `main`
+  since is informational, aborted, and not in `docs/evidence/`
+  (section 5.2).
+- **The one gated-mode sample that exists is a draft, off `main`, and
+  native lost it.** B failed 0 of 3 on the hermetic rig, on the initial
+  copy and on the delta, with no A control (section 5.3). The under-load
+  numbers that favour native are therefore not the whole record.
 - The hermetic rig that is to be the gate of record is ruled and not built
   into `main` (OI-1003-Q96, Q97).
 - Gate (b)'s native multi-stream arm is not built, so gate (b) can only
@@ -1606,7 +1686,10 @@ hash check against the output's own bytes is what guards it.
 **Documentation drift on `main`.** `docs/design.md` still calls the salvage
 bounds unruled, and `docs/formal/README.md` still describes the state root
 as unsealed in two places, although `docs/slo.md` records both as settled.
-`docs/slo.md` has no text yet for OI-1003-Q96 and Q97.
+`docs/slo.md` has no text yet for OI-1003-Q96 and Q97. It also has none for
+OI-1003-Q35: it still words S3's unchanged-estate bound on wall-clock,
+while the S3 evidence judges the CPU ratio and treats wall time as
+informational (section 5.2).
 
 **CI is not uniformly green.** The CI run of `main` at `3931471`
 (2026-10-07) failed both gates, and issues #200 and #201 record flaky
@@ -1647,13 +1730,16 @@ to `a80c63b`. In order of weight:
 7. **S3 has evidence on the estate corpus**, informational and taken before
    four later fixes.
 8. **S1 is unchanged in the way that matters: there is still no gated
-   sample.** The gate (a) run this paper's earlier revision said had
-   "started" produced no verdict. New since then: an under-load mode and
-   one informational sample, a gate (b) harness, and rulings that make a
-   hermetic rig the gate of record.
+   sample on `main`.** The gate (a) run this paper's earlier revision said
+   had "started" produced no verdict. New since then: an under-load mode
+   and one informational sample, a gate (b) harness, and rulings that make
+   a hermetic rig the gate of record. Off `main`, the rig's branch holds
+   one draft gated-mode sample with no A control, in which B failed 0 of 3
+   (section 5.3).
 9. **CI went from four gates to two**, capped at 25 minutes (#190).
 10. **Rulings that were "not yet on `main`" now are**: OI-1003-Q24, Q25,
     Q26, Q34, Q36, Q37 and Q40 are all in `docs/slo.md`.
 11. **The bibliography was re-verified entry by entry on 2026-10-07**, and
     three references were added for the formal method: [Dhall],
-    [NVersion85] and [KnightLeveson86].
+    [NVersion85] and [KnightLeveson86]. The abstracts of the last two were
+    read, and the paper's wording is held to them.
