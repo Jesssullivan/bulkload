@@ -179,6 +179,12 @@ as properties.
   counted and recorded in S2 evidence. The main database and its `-wal` must
   stay byte-identical, and a property test asserts that no other source
   write occurs.
+- **2026-10-06, S2 wal-index counter (OI-1003-Q36, #157).** The counter is
+  `source_wal_index_touched`, on every counters line and in S2 evidence
+  (`s2_budget.py`). It adds 1 for each WAL-aware snapshot that leaves a
+  `-shm` beside its source, whether or not the file's bytes changed: such a
+  read always opens the wal-index read-write, maps it and locks it. P75
+  SQLITE-SHM-EXCEPTION is the property.
 
 ## Amendments 2026-10-04: WP0(g) adopted, and the R25 reading (OI-1003-Q37, Q40)
 
@@ -240,6 +246,49 @@ as properties.
   them. `git-carry-estimate` stays as a read-only verb (P66), and wire v5's
   reserved W6 frames stay until WP3's v6 cut. (a)'s "frozen behind a
   feature" text above is superseded by this line, not edited.
+
+## Amendment 2026-10-06: the empty `-wal` (OI-1003-Q72)
+
+- **2026-10-06, SQLite empty `-wal` (OI-1003-Q72, #157).** This extends
+  OI-1003-Q36 to the empty `-wal`. A read-only, WAL-aware snapshot of a
+  WAL-mode source that has no `-wal` may create an empty `-wal` beside it.
+  It is a counted S2 exception like the `-shm`:
+  - it is allowed only where no `-wal` existed, and the file is zero bytes;
+  - the main database file stays byte-identical;
+  - a `-wal` that existed before the read stays byte-identical;
+  - the counter is `source_wal_created`, on every counters line and in S2
+    evidence (`s2_budget.py`), beside `source_wal_index_touched`.
+
+  Every source read is the locked, WAL-aware backup-API read (OI-1003-Q16).
+  An unlocked `immutable=1` read of the source is not ratified and is not
+  used. P75 SQLITE-SHM-EXCEPTION asserts both exceptions.
+
+## Amendment 2026-10-06: no SQLite source read as root (OI-1003-Q76)
+
+- **2026-10-06, SQLite provider refuses root (OI-1003-Q76, #157).** The
+  SQLite provider refuses to snapshot as root, with the typed refusal
+  `SQLITE_SOURCE_AS_ROOT`, before it opens the source.
+  - **What is refused.** Every provider verb that opens a database to read
+    it, when the effective uid is 0: `snapshot`, `compose`, `compose-state`,
+    `hydrate-state` and `apply-state-candidate`. The refusal is by uid,
+    whatever the source's journal mode.
+  - **Why.** Run as root, SQLite re-applies the database's owner to the
+    `-wal` and `-shm` it opens (`fchown`), and skips that call as any other
+    user. Measured on sting: the same read-only, WAL-aware open plus backup
+    leaves an existing source `-wal`'s ctime unchanged as uid 1000 and moves
+    it as uid 0, while the `-wal`'s size, mtime and bytes stay the same. PR
+    CI runs as root and P75 failed there on exactly that. It is a source
+    metadata write outside OI-1003-Q16, Q36 and Q72, and neither S2 counter
+    sees it.
+  - **What it does not change.** The two counted exceptions (Q36, Q72) and
+    the Q16 lock stand as they are for every other uid. No SLO number
+    changes.
+  - **Proof.** P75 SQLITE-SHM-EXCEPTION as root asserts the refusal and
+    that the refused snapshot left the source directory byte- and
+    metadata-identical (no `-shm`, no `-wal`, no ctime moved), then runs the
+    whole property again in a child process that has dropped to an
+    unprivileged uid. Where that drop cannot be made, the run says so on
+    stderr and proves the refusal only.
 
 ## Amendment 2026-10-06: S1 gate (b) harness (OI-1003-Q66)
 

@@ -165,6 +165,55 @@ Source safety (S2, WP1):
   counters line and the bench header record the class.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
+- SQLite provider snapshots are S2's stated exceptions: one lock and two
+  writes. Every source is read through the backup API from a read-only,
+  WAL-aware connection; none is read `immutable=1`. All three are bounded.
+  The two writes are counted; the lock is not yet:
+  - **Lock (OI-1003-Q16).** The backup API's shared read lock on the source
+    database, held only for the bounded read. Q16 calls it "counted", but no
+    counter for it exists yet (neither a lock count nor a lock time). That
+    is an open gap; neither write counter covers it.
+  - **Write: the wal-index (OI-1003-Q36).** The source's `<db>-shm`:
+    SQLite's own coordination file, which holds no user data. A WAL-aware
+    read opens it read-write, maps it and takes `fcntl` locks on it. It
+    creates or rebuilds the file when no live connection holds it, and
+    beside a live writer it often leaves every byte as it was.
+    - `source_wal_index_touched` counts all of these: 1 for each snapshot
+      that leaves a `-shm` beside its source, whether or not the file
+      changed. So 0 means that no snapshot opened a source wal-index.
+  - **Write: the empty `-wal` (OI-1003-Q72, which extends Q36).** A
+    WAL-mode database with no `-wal` is one that was checkpointed and
+    closed, or one a writer has opened but not yet read. A WAL-aware open
+    of it creates a `-wal` of zero bytes. The exception is that file only:
+    allowed where no `-wal` existed, and empty.
+    - `source_wal_created` counts it: 1 for each snapshot that leaves a
+      `-wal` beside a source that had none. The file stays, so a second
+      snapshot of the same source adds 0.
+    - The read-only connection cannot append a frame, so the file it
+      creates is empty. A writer that arrives during the read and creates
+      the `-wal` itself is counted too: the counter is an upper bound and
+      never an undercount.
+  - Every counters line reports both counters, and S2 evidence
+    (`s2_budget.py`) records both.
+  - The main database file stays byte-identical with its timestamps
+    unchanged. A `-wal` that existed before the read stays byte-identical.
+    Nothing else beside the source is written (P75).
+  - **Refused as root (OI-1003-Q76).** With an effective uid of 0, every
+    provider verb that opens a database to read it refuses
+    `SQLITE_SOURCE_AS_ROOT` before it opens anything: `snapshot`, `compose`,
+    `compose-state`, `hydrate-state` and `apply-state-candidate`.
+    - Why: run as root, SQLite re-applies the database's owner to the
+      `-wal` and the `-shm` it opens (`fchown`; as any other user it skips
+      the call). Measured on 2026-10-06: the same read-only, WAL-aware open
+      plus backup leaves an existing `-wal`'s ctime unchanged as uid 1000
+      and moves it as uid 0, with the `-wal`'s size, mtime and bytes
+      unchanged. That is a source metadata write that Q16, Q36 and Q72 do
+      not admit, and neither counter sees it.
+    - The refusal is by uid, not by journal mode: a rollback-journal source
+      is refused as well, and no extra read of the source is made.
+    - A refused verb leaves the source directory as it was: no `-shm`, no
+      `-wal`, no timestamp moved, both counters 0 (P75's root leg).
+    - Run the verb as the database's owner.
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
