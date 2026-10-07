@@ -1812,7 +1812,8 @@ fn apply_item(
     // next capture
     // pass extends it clean. Key-only drift leaves a coherent snapshot, which
     // applies. R-N29 (apply proceeds on an occupied destination, recording
-    // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
+    // uncaptured seats) is deferred (bulkload#48); carry v2, the W6 engine it
+    // was deferred to, is deleted (OI-1003-Q44, OI-1003-Q56).
     let journal = journal_path(state, &identity, source, &captured.digest);
     if journal.try_exists().refuse_at("estate::apply_item")? {
         let done: String = read(&journal)?;
@@ -3239,7 +3240,8 @@ mod tests {
     // R-N72 (TIN-4540) finding 3: a drifted capture does not hold the drifted
     // seats' bytes, so apply refuses it, fail-closed, before touching the
     // destination. R-N29 (apply proceeds on an occupied destination, recording
-    // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
+    // uncaptured seats) is deferred (bulkload#48); carry v2, the W6 engine it
+    // was deferred to, is deleted (OI-1003-Q44, OI-1003-Q56).
     #[test]
     fn a_drifted_capture_refuses_to_apply_until_a_later_pass_extends_it() {
         let (root, source, target, plan, corpus) = drifting_plan("applies");

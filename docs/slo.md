@@ -236,6 +236,17 @@ as properties.
     `an_output_adopted_against_a_manifest_carries_its_capture_record` check
     it. `R25_NoDurableReread` stays the SLO's obligation (OI-1003-Q40).
 
+## Amendment 2026-10-05: carry_v2 deleted (OI-1003-Q44, Q54, Q56)
+
+- **WP0(a) closed: v1 is the Git carry engine.** OI-1003-Q15 and Q44 keep
+  v1. OI-1003-Q54 held the deletion of carry_v2 until v1 carried refs-heavy
+  repositories, and OI-1003-Q56 rules that precondition met by #182 and #184.
+  WP2 PR 3 deletes carry_v2, its ingest and journal, the `git_ingest` fault
+  points and the W6 M1 spike; tag `carry-v2-final` holds the last main with
+  them. `git-carry-estimate` stays as a read-only verb (P66), and wire v5's
+  reserved W6 frames stay until WP3's v6 cut. (a)'s "frozen behind a
+  feature" text above is superseded by this line, not edited.
+
 ## Amendment 2026-10-06: the empty `-wal` (OI-1003-Q72)
 
 - **2026-10-06, SQLite empty `-wal` (OI-1003-Q72, #157).** This extends
