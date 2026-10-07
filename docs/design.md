@@ -757,6 +757,19 @@ flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
 
+On Linux in group mode, a group of two or more outputs is sealed
+device-wide instead (S1, OI-1003-Q107; `io::durable::batched`). Each output
+starts write-back as it is queued (`sync_file_range(WRITE)`, not a
+durability step). The group then runs one `syncfs` per device its files live
+on, which makes every temporary's data durable under its temporary name;
+renames each into place; runs one `syncfs` per touched device again, which
+makes the new entries durable; and only then commits its records. No rename
+precedes the first `syncfs`, so no power loss can keep a name whose data it
+lost. `syncfs` is at least as strong as the per-file and per-directory
+flushes it replaces; it also flushes whatever else is dirty on that file
+system, which is why a single-file group keeps the per-file path. Darwin is
+unchanged.
+
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a
 store without the `root_sealed` setting is sealed again on open (#161, R25).

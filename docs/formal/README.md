@@ -950,8 +950,8 @@ Code at adb9c66, re-checked at `origin/main` 6268175. `A` is
 | `RecvNeed` | `A/transfer.rs` `Outbound::need_chunks`, `serve_chunks` |
 | `RecvEnd` | `A/transfer.rs` `Inbound::end`, `end_streaming`, `end_filling`, `Inbound::publish`, `Inbound::adopt`; `A/materialize.rs` `verify_existing`; `A/transfer/unrowed.rs` `write_record`, `refresh` |
 | `RecvRefused` | `A/transfer.rs` `Inbound::refused` |
-| `SealTemp`, `Publish` | `A/materialize.rs` `StagedFile::seal`, `StagedFile::publish`; `A/io/durable.rs` `seal_file`; `A/io/mod.rs` `publish_noreplace` |
-| `DirSeal`, `SealAdopted` | `A/materialize.rs` `TouchedDevices::seal`, `PublishSink::commit` (`Publication::Adopted`); `A/io/durable.rs` `seal_dir` |
+| `SealTemp`, `Publish` | `A/materialize.rs` `StagedFile::seal`, `seal_group_data` (a batched group), `StagedFile::publish`; `A/io/durable.rs` `seal_file`, `seal_device`; `A/io/mod.rs` `publish_noreplace` |
+| `DirSeal`, `SealAdopted` | `A/materialize.rs` `TouchedDevices::seal`, `seal_group_data`, `PublishSink::commit` (`Publication::Adopted`); `A/io/durable.rs` `seal_dir`, `seal_device` |
 | `Commit`, `CommitFail` | `A/transfer_store.rs` `StorePublisher::commit_outputs`; `A/materialize.rs` `PublishSink::commit`, `space_refusal`; `A/io/durable.rs` `configure_sqlite`, `Committer` |
 | `AnswerHeld` | `A/transfer.rs` `Inbound::answer_held`, `Inbound::settle_held` |
 | `RecvHeld`, `LedgerCommit` | `A/transfer.rs` `Outbound::handle` (`Event::Held`); `A/transfer_store.rs` `LedgerSink::publish`, `StorePublisher::commit_captures` |
@@ -978,6 +978,19 @@ What the abstractions are:
   ordering barrier, and the group's full flush is the real durability point.
   That difference only removes crash states that come before the commit,
   where no row exists yet.
+- **The batched group seal (Linux, S1, OI-1003-Q107) is a refinement, not a
+  new action.** It runs every `SealTemp` of a group, then every `Publish`,
+  then the group's `DirSeal`s: one interleaving the model already allows,
+  since each `Publish(s)` needs only `s`'s own seal. Its `syncfs` also makes
+  other pending state durable early (another output's rename, a third
+  party's write, a displaced file). In the model that is a crash taking the
+  `persist` choice, which `CrashChoice` always offers, so the batched
+  protocol's behaviours are a subset of the model's. What the refinement
+  needs from the code, that no rename precedes its own data's seal, is
+  checked on the real trace by
+  `a_batched_group_names_no_output_before_its_data_is_durable`
+  (`A/materialize/adoption_power_loss.rs`), which fails when both `syncfs`
+  calls follow the renames.
 - **Relaxed source store.** A power loss drops any subset of committed ledger
   rows, or, under `RelaxedAuthority` before its creation is synced, the
   whole store. Under `StoreRootSealed = FALSE` (the code today) a strict
