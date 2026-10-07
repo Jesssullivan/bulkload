@@ -2,7 +2,9 @@
 
 Lane `q42-l6b-grouped-chain`, branch `feat/q42-l6b-grouped-chain-20261007`,
 worktree `bulkload.worktrees/q42-l6b-grouped-chain-20261007`, from
-`origin/main` `34e945e`. Pushed, no PR opened (the coordinator opens it).
+`origin/main` `34e945e`, merged with `8083675` (#194) at the ship stage.
+Pushed; the ship stage opens the PR from the head named in "Recheck and
+ship" below.
 
 Rulings: OI-1003-Q42, OI-1003-Q46, OI-1003-Q62, OI-1003-Q63, R-N72, R-N13.
 Started under OI-1003-Q81 ("L6b starts now"); validation under OI-1003-Q85.
@@ -18,10 +20,13 @@ it was re-read against main.
 | `0ec447f` | The fix: `decide.rs`, `shared.rs`, `chain.rs`, `estate.rs`, and the tests |
 | `089e071` | `design.md`, the formal catalogue and its rendering, the property plan, this note |
 | `3a36f82` | Review round 1: `publish_prior` and `bound_base` in `estate.rs`, four custody tests, the P68 restore pin and the A → B → A row |
-| the commit after it | Review round 1 docs: `design.md`, the property plan, this note |
+| `98621bd` | Review round 1 docs: `design.md`, the property plan, this note |
+| `c9ea1ce` | Ship stage: the restore-cost pin cites #147, not #148 (docs and two test comments) |
+| `4dae1b8` | Ship stage: merge of `origin/main` `8083675` (#194, the seeded proptests and the no-fuzz guard) |
+| the commit after it | Ship stage: this note |
 
 All are signed. No force-push, no rebase; `origin/main` had not moved
-from `34e945e` at either push.
+from `34e945e` at the first two pushes and was `8083675` at the third.
 
 ## What changed
 
@@ -256,8 +261,8 @@ fifth is measured and pinned, and its design choice is an open ruling.
    `flatten` are unchanged: importing each base once per destination
    repository means the flat bundle is no longer self-contained, which
    changes the restore verbs' contract (R-N72 D2 says "restores from the
-   one flattened bundle") and the standalone-destination case. That is
-   #148 and needs a ruling (Open).
+   one flattened bundle") and the standalone-destination case. The
+   staging footprint is #147; the choice needs a ruling (Open).
 
 The low findings were not fixed, by instruction: the head-versus-root
 `.base` asymmetry in `chain_links` against `import_base`; the thin
@@ -299,6 +304,50 @@ capture.
   formal file, catalogue symbol or `decide` row changed. `origin/main`
   was still `34e945e`.
 
+## Recheck and ship (2026-10-07)
+
+The ship stage re-read the round's diff (`089e071..98621bd`) against each
+medium and high finding and ran its own checks. Verdict: clean.
+
+- **Cycle on a reproduced root (high): fixed.** A cycle needs the name to
+  be the link or in the link's chain; `publish_prior` now tests exactly
+  that. Scratch runs beyond the lane's tests: A → B → C → A (the root three
+  captures back) stands as the root; a capture that reproduces a root from
+  before a re-base (not in the link's chain, no `.prior`) is chained on the
+  link at the link's depth and restores, and seventeen further passes over
+  it (a second re-base among them) each keep an intact chain under both
+  bindings and restore.
+- **Stale `.prior` on a reproduced broken head (high): fixed.** Also with
+  the head two links deep and bound to both bases: after the old base is
+  lost the recapture has no stale link, hits on the next pass, extends on
+  the one after, and restores each time.
+- **Sidecar-less based bundle (medium and high): fixed.** `Lost`, so the
+  hit refuses and `chain_offer` drops it, as main refused.
+- **Restore cost (medium): deferred, soundly.** The per-item flatten is the
+  ratified restore contract (OI-1003-Q63 D2), so changing it is a ruling,
+  not this lane's choice. The cost is now a pinned number in P68 and a
+  line in `design.md`. The round cited #148 for it; that is the side-door
+  verbs issue. The apply-side flatten footprint is #147, which now carries
+  the numbers and the question; the citation is corrected in `c9ea1ce`.
+- **Mutants, re-run independently** in a scratch copy under
+  `/srv/cache/jess/q42-l6b-grouped-chain-mut` with its own target
+  directory (both since removed): `publish_prior` without the
+  chain-membership guard, without the stale-link removal, and `bound_base`
+  without the `Lost` arm each fail the test the table above names.
+- **Merge.** `origin/main` moved to `8083675` (#194). One conflict, in the
+  property plan's table: main's P66 row, this lane's P67 and P68 rows. This
+  lane has no proptest, so the new seed guard has nothing to check here.
+- **`just check-fast`** (CI toolchain, detached and polled, OI-1003-Q85)
+  over the merged tree `4dae1b8`, 03:10Z to 03:17Z: **exit 0**, 33 test
+  results, 789 passed, 0 failed, 13 ignored; `l6b_grouped_chain` 12,
+  `git_grouped_chain` 3, `prop_seed_guard` green. Test binaries ran with
+  `TMPDIR` on `/dev/shm`, as before (`/srv/scratch` is under the 25%
+  floor). Only this note changed after that run. A run over `98621bd`
+  plus the citation fix, before the merge, was also exit 0.
+
+Not done here: the low findings stay as listed above, and the two rulings
+under Open are for the operator.
+
 ## Open
 
 - **A ruling for item 2 above.** Should a based link whose bound base is
@@ -312,11 +361,15 @@ capture.
   mutation row; none was added.
 - **The re-base cost** (about 4.73 MB per item at `k = 9` here) stays until
   L8 (Q62).
-- **#148, a ruling.** Apply stages the base twice per chained item (the
-  numbers are in "Review round 1"). Either accept `N × base` on restore
-  until #148, or import each bound base once per destination repository
+- **Restore cost, a ruling (#147).** Apply stages the base twice per
+  chained item (the numbers are in "Review round 1"). Either accept
+  `N × base` on restore, or import each bound base once per destination
+  repository
   and flatten only the links, which amends the R-N72 restore contract
   (D2). P68's restore pin goes red on the day that changes, by design.
+  #148 is a different issue (the side-door verbs refuse a chained
+  capture); it matters more now that grouped captures chain, and is
+  untouched here.
 - **The space floor on sting.** `git_group_minimality`,
   `git_grouped_chain` and `git_capture_counters` refuse under the default
   floor wherever `TMPDIR` has under 25% free. Every lane's check-fast on
