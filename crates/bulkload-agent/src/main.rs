@@ -191,7 +191,10 @@ BOUNDARIES:
     start) and reuses every other blob (capture-extended-from-drift,
     source_bytes_read). A pass reusing nothing it was offered says why:
     reuse_unavailable=shallow|retained-unreadable|pass-start-unrecorded|
-    future-stamp.
+    future-stamp|manifest-mismatch. A changed capture reuses its retained
+    capture's blobs from that capture's {bundle}.reuse manifest and fetches
+    the bundle only for a seat whose blob the source object store does not
+    hold (counted: reuse_dirty_misses).
     A gc, repack or prune that rewrites the source's object store under a
     pass, so that a Git child reading through it fails, is drift custody too:
     outcome=deferred-with-drift with one ObjectStoreRewritten objects/pack

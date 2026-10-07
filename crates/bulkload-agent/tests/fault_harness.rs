@@ -1180,18 +1180,52 @@ const SUPERSEDING: Fixture = Fixture {
     superseding: true,
 };
 
+/// What a row of the `scenarios!` table runs at its fault point: a `copy`
+/// crash-resume over a [`Fixture`], or an estate capture's publication
+/// ([`estate_sidecar::EstateSidecar`], P70).
+trait Scenario {
+    fn run(self, point: Point, nth: u64);
+
+    /// The `copy` fixture the crash sweep runs this row against, if any.
+    fn copy_fixture(&self) -> Option<Fixture> {
+        None
+    }
+}
+
+impl Scenario for Fixture {
+    fn run(self, point: Point, nth: u64) {
+        crash_resume(point, nth, self);
+    }
+
+    fn copy_fixture(&self) -> Option<Fixture> {
+        Some(*self)
+    }
+}
+
+// The `estate.*` points (Q42 lane L7): the reuse manifest's publication
+// order around a Git capture's record.
+#[path = "fault_harness/estate_sidecar.rs"]
+mod estate_sidecar;
+use estate_sidecar::EstateSidecar;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
             #[test]
             fn $name() {
-                crash_resume(Point::$point, $nth, $fixture);
+                Scenario::run($fixture, Point::$point, $nth);
             }
         )*
 
         /// The table as data: what the crash sweep reads its points from.
-        const SCENARIOS: &[(Point, u64, Fixture)] =
-            &[$((Point::$point, $nth, $fixture)),*];
+        /// Only the `copy` rows: an estate row (P70) has no copy fixture to
+        /// sweep, so it is left to its pinned scenarios.
+        fn scenarios() -> Vec<(Point, u64, Fixture)> {
+            [$((Point::$point, $nth, Scenario::copy_fixture(&$fixture))),*]
+                .into_iter()
+                .filter_map(|(point, nth, fixture)| fixture.map(|fixture| (point, nth, fixture)))
+                .collect()
+        }
     };
 }
 
@@ -1240,6 +1274,15 @@ scenarios! {
     superseding_before_commit_mid => PublishDestinationBeforeCommit: 3, SUPERSEDING;
     superseding_after_commit_mid => PublishDestinationAfterCommit: 9, SUPERSEDING;
     superseding_receive_after_end_mid => ReceiveAfterEnd: 8, SUPERSEDING;
+    // P70 SIDECAR-ORDER: each point on a first capture and on a changed one.
+    estate_after_bundle_publish_first => EstateAfterBundlePublish: 1, EstateSidecar::First;
+    estate_after_bundle_publish_changed => EstateAfterBundlePublish: 1, EstateSidecar::Changed;
+    estate_before_reuse_sidecar_first => EstateBeforeReuseSidecar: 1, EstateSidecar::First;
+    estate_before_reuse_sidecar_changed => EstateBeforeReuseSidecar: 1, EstateSidecar::Changed;
+    estate_after_reuse_sidecar_first => EstateAfterReuseSidecar: 1, EstateSidecar::First;
+    estate_after_reuse_sidecar_changed => EstateAfterReuseSidecar: 1, EstateSidecar::Changed;
+    estate_after_capture_record_first => EstateAfterCaptureRecord: 1, EstateSidecar::First;
+    estate_after_capture_record_changed => EstateAfterCaptureRecord: 1, EstateSidecar::Changed;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.
@@ -1260,7 +1303,7 @@ const SWEEP_FAILURES_PER_POINT: usize = 3;
 /// swept as a row of its own.
 fn sweep_rows() -> Vec<(Point, Fixture, u64)> {
     let mut rows: Vec<(Point, Fixture, u64)> = Vec::new();
-    for (point, nth, fixture) in SCENARIOS {
+    for (point, nth, fixture) in &scenarios() {
         if let Some(row) = rows
             .iter_mut()
             .find(|row| row.0 == *point && row.1.superseding == fixture.superseding)

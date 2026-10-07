@@ -381,6 +381,47 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   with `index-pack --fix-thin`, reading every base from the source object
   store: `read_source_capture_reuse_bytes` counts those bases beside the
   bundle, and the fetch's storage reads join the readback counter.
+- Reuse reads a manifest, not the bundle (Q42 lane L7; OI-1003-Q42,
+  OI-1003-Q45, OI-1003-Q94, 2026-10-07). A changed capture used to fetch
+  its whole retained bundle to learn what it held: 179 MB and 13.8 s of CPU
+  for a 5-object change to the estate's history-heavy item. A capture now
+  publishes a `{bundle}.reuse` sidecar: its regular seats, each with its
+  census row and its blob, bound to the bundle by digest. The next pass
+  takes from that list the seats it may reuse (the same rule as before:
+  an unchanged stat identity, not racy), then asks which of their blobs it
+  can read with one `cat-file --batch-check` in its private repository,
+  which sees the source's object store through `alternates`. That child
+  comes from the hardened Git builder: it writes nothing to the source and
+  takes no lock (S2).
+  - **No miss:** every blob is there, and the pass reuses them without
+    opening the bundle. `read_source_capture_reuse_bytes` is 0 and
+    `read_reuse_manifest_bytes` is the manifest's length (P69).
+  - **A miss** is a reusable seat whose blob only the retained bundle
+    holds: dirty content (untracked, ignored or uncommitted) that has not
+    moved since. The pass counts the seats (`reuse_dirty_misses`) and
+    fetches the bundle, exactly as before. A seat that did move is read
+    again and is never a miss. A checkout that keeps one such file still
+    therefore fetches its retained bundle on every changed capture: for
+    it, lane L7 changed nothing. The seat is not read again instead,
+    because its identity has not moved (R25).
+  - **No manifest:** a capture from before lane L7, a shallow one, or one
+    whose list is over 256 MiB. Its bundle is fetched, as before; old STATE
+    and CORPUS need no migration.
+  - **A manifest that does not match its capture** (it does not decode, it
+    is bound to another digest, or it names an object that is not a blob)
+    is never reused. The pass says `reuse_unavailable=manifest-mismatch`,
+    reads every seat and still captures: a value, never a refusal.
+
+  The sidecar is advisory. The bundle stays complete and self-describing,
+  a restore and a whole-capture hit never read the manifest, and an engine
+  from before lane L7 ignores the file and fetches the bundle. The manifest
+  is durable before the `{item}.capture` record, like every other sidecar,
+  so a record this engine wrote never lacks one. A crash in between leaves
+  a manifest no record names, which nothing reads; the reverse order would
+  restore just as well, but would leave a record whose capture every later
+  pass fetches whole. P70 crashes a capture at each `estate.*` fault point
+  around that publication and checks the order, that every manifest lists
+  its bundle's blobs, and that the restore is exact.
 - Grouped items chain under their plan base (Q42 lane L6b, fix 2;
   OI-1003-Q42, OI-1003-Q46, OI-1003-Q62, OI-1003-Q63, 2026-10-07). A later
   capture of an item on a shared plan base declares the base's commits and
@@ -464,7 +505,8 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   rewritten at the same size without its identity moving, as in Git's racy
   index, so it is read again. A pass that reuses none of the blobs it was
   offered says why: `reuse_unavailable=shallow`, `retained-unreadable`,
-  `pass-start-unrecorded` or `future-stamp` (a seat stamped later than the
+  `pass-start-unrecorded`, `manifest-mismatch` (the retained capture's
+  `.reuse` sidecar does not describe it) or `future-stamp` (a seat stamped later than the
   pass's clock blocks every whole-capture reuse until the clock passes it). A retained capture that cannot be read degrades
   to a full read, and its transient refs never reach the new bundle.
 - A seat stamped later than the current pass's own clock reading is racy too
@@ -475,7 +517,7 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   start earlier than the window, and the guard cannot see it. Bulkload never
   writes into a source to read the filesystem's clock.
 - Known limit: capture records and their sidecars (`.capture`, `.parts`,
-  `.drift`, `.base`) are not authenticated. Anyone who can write the corpus
+  `.drift`, `.base`, `.reuse`) are not authenticated. Anyone who can write the corpus
   can forge a record into a whole-capture reuse. The in-band drift marker
   still makes every restore verb refuse a drifted bundle, and apply still
   checks the bundle digest, but corpus integrity rests on its 0700 custody.

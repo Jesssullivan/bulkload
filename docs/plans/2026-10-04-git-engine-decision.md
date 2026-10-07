@@ -250,6 +250,36 @@ target that can be measured without an unruled allowance:
    history ÷ 9 per changed capture: about 19.9 MB for history-heavy.
 4. **Reuse without fetching the whole retained bundle.** Target: a
    one-commit history delta costs about an unchanged rerun's CPU, not 13.8 s.
+   **Partly done 2026-10-07 (Q42 lane L7; OI-1003-Q42, OI-1003-Q45,
+   OI-1003-Q94): done for a checkout with no stationary dirty seat,
+   unchanged otherwise, and not yet measured on the estate.** A capture
+   publishes a `{bundle}.reuse` manifest, and the next pass reuses from it
+   and fetches the bundle only on a miss ([docs/design.md](../design.md),
+   "Reuse reads a manifest"; P69, P70).
+   - **The fetch is gone only when nothing misses.** A miss is a seat the
+     pass may reuse whose blob the source object store does not hold:
+     untracked, ignored or uncommitted content that has not moved since
+     the retained capture. All three are carried. One such file (a `.env`,
+     an editor file, a build output) is a miss on every changed capture,
+     and each one fetches the whole retained bundle as before. P69 pins
+     this: in its 36 MB fixture with one 4 KiB untracked file the pass
+     fetches all 36,369,739 B and costs 1,700 ms of CPU, against 320 ms
+     with no such file.
+   - **Not measured on the estate corpus.** Whether the history-heavy item
+     holds a stationary dirty seat is unknown, so the 13.8 s is not
+     recorded as removed for it. The measurement that closes this target
+     is that item's `reuse_dirty_misses` and CPU on a changed capture.
+   - **The CPU target is not met as written.** With no miss the capture
+     costs 320 ms against 297 ms for the same capture over a thin bundle
+     (before the lane, 2,273 ms against 476 ms): the retained bundle's
+     weight no longer shows. It is still about 6 times an unchanged rerun
+     (a hit: one census and no export, 53 ms there), by its four censuses
+     and its export. That remainder is WP7's.
+   - **Why a miss is not read from the worktree instead.** That would cost
+     the dirty bytes, not the bundle, and it reads a seat whose identity
+     has not moved, which S3 (R25) forbids. Removing the miss needs either
+     a ruling on that reading or the dirty blobs held somewhere cheaper
+     than the bundle. Neither exists yet.
 5. **Capture bare repositories.** v1 refused every bare mirror on every
    pass, and plan `rest` exited `CONTRACT_SELF_INCONSISTENT`. #151 may type
    the refusal differently at `dfb9604`. Target: plan `rest` captures all 4

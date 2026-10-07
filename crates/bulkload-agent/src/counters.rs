@@ -55,7 +55,11 @@
 //! pass's reuse fetch of such a capture completes it with `index-pack
 //! --fix-thin`, reading every base from the source object store:
 //! `read_source_capture_reuse_bytes` counts those bases (the written pack's
-//! growth) beside the bundle's length.
+//! growth) beside the bundle's length. Since Q42 lane L7 that fetch runs only
+//! for a retained capture with no `{bundle}.reuse` manifest, or on a miss
+//! (`reuse_dirty_misses`): otherwise the pass reads the manifest
+//! (`read_reuse_manifest_bytes`) and asks the source store which blobs it
+//! holds (`cat-file --batch-check`, a metadata read like the censuses).
 //!
 //! Every counter is incremented by production code; a declared counter
 //! nothing increments would read as a measured zero, so the
@@ -137,6 +141,9 @@ counters! {
     // (logical: the bundle's length per fetch, plus the delta bases a thin
     // bundle's fetch read from the source object store to complete it).
     SourceCaptureReuseRead => "read_source_capture_reuse_bytes",
+    // `{bundle}.reuse` manifests a Git capture read to reuse a retained
+    // capture's blobs without fetching its bundle (Q42 lane L7, P69).
+    ReuseManifestRead => "read_reuse_manifest_bytes",
     // Storage reads by the git children that pack a capture's objects or
     // complete a retained one for reuse (see the module notes: a lower
     // bound, page-cache hits are invisible).
@@ -231,6 +238,11 @@ counters! {
     ExchangeProbes => "exchange_probes",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
+    // Seats a Git capture could reuse by its retained capture's manifest
+    // whose blob the source object store does not hold (dirty content that
+    // has not moved since): each pass with one fetches the retained bundle,
+    // as every pass did before lane L7 (P69).
+    ReuseDirtyMiss => "reuse_dirty_misses",
     // Provider `SQLite` snapshots whose WAL-aware read left a wal-index
     // (`<db>-shm`) beside its source, changed or not: a stated S2 source
     // write (OI-1003-Q36).

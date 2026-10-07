@@ -273,6 +273,10 @@ let constantLines =
               , pad = ""
               , value = showBool c.BaseMissingTyped
               }
+            , { name = "ReuseManifest"
+              , pad = "   "
+              , value = showBool c.ReuseManifest
+              }
             , { name = "Mutation", pad = "        ", value = "\"${mutation}\"" }
             , { name = "BudgetSeconds"
               , pad = "   "
@@ -308,6 +312,15 @@ let defaults
              SEALED_OBJECT_MISSING (estate::stage_base, chain::flatten), so
              every config with a base sets True; configs without a base
              cannot reach it.
+          -}
+          False
+      , ReuseManifest =
+          {- Lane L7's manifest step (the code since L7: every capture
+             publishes {bundle}.reuse before its record). Off here: no
+             custody definition reads the manifest, so the step is checked
+             in its own rows (MC_gc_reuse and reuse_after_record's), and
+             every other row keeps its state count of record, which the
+             explorer's presets pin.
           -}
           False
       , Mutation = None M
@@ -369,6 +382,12 @@ let rerootExtended = q46 // { RootWindow = 5 }
 -}
 let fix2Deep = fix2 // { DepthLimit = 2 }
 
+{- Lane L7's manifest step on fix 2's bound (the code's policy with Q46's
+   GC): every pass publishes its bundle's reuse manifest before its record,
+   under crashes, and GC removes a collected bundle's manifest with it.
+-}
+let reuse = fix2 // { ReuseManifest = True }
+
 -- One item, one commit, no faults: the base of most mutation configs.
 let one =
           defaults
@@ -397,11 +416,15 @@ let verdict
           , skip_flatten_verify = P.PrereqsSatisfiedByEarlierLinks
           , hit_ignores_chain = P.BrokenLinkNeverReuseHit
           , reroot_pre_mismatch = P.PrereqsSatisfiedByEarlierLinks
+          , reuse_after_record = P.ReuseManifestBeforeRecord
           }
           m
 
 -- Coverage: the actions a pass row's report must show never enabled.
 let noBase = [ A.BaseRecord, A.StartBase ]
+
+-- Never enabled where ReuseManifest is off: lane L7's manifest step.
+let noManifest = [ A.ReuseSidecar ]
 
 -- Row constructors -----------------------------------------------------------
 
@@ -419,9 +442,13 @@ let row =
           }
         : T.GcRow
 
-let pass =
+-- A pass row with the manifest step on: `never` is its whole never column.
+let passWithManifest =
       \(never : List A) ->
         T.GcExpect.pass { invariants = safety, properties = [] : List P, never }
+
+-- A pass row at ReuseManifest = FALSE: ReuseSidecar is never enabled too.
+let pass = \(never : List A) -> passWithManifest (never # noManifest)
 
 let line = \(head : Text) -> { head, tail = [] : List Text }
 
@@ -539,12 +566,23 @@ let positives =
           , "MC_gc_reach_based_chain shows such a restore is reached."
           ]
           fix2Deep
+      , row
+          "MC_gc_reuse"
+          (passWithManifest [ A.Rewrite ])
+          [ "Lane L7's manifest step (the code since L7) on MC_gc_fix2's bound:"
+          , "every pass publishes its bundle's {bundle}.reuse manifest after the"
+          , "dependency sidecars and before the record, with crashes between any"
+          , "two steps, and GC removes a collected bundle's manifest with it. A"
+          , "record never lacks its manifest (ReuseManifestBeforeRecord), and"
+          , "every other invariant holds as in MC_gc_fix2: nothing reads it."
+          ]
+          reuse
       ,     row
               "MC_gc_live"
               ( T.GcExpect.pass
                   { invariants = [ P.TypeOK, P.RestoreOrRecapture ]
                   , properties = [ P.ChainRecovery ]
-                  , never = noBase
+                  , never = noBase # noManifest
                   }
               )
               [ "Liveness under WF_vars(Protocol): once the environment stops, every"
@@ -701,6 +739,18 @@ let primary =
             ]
           }
         }
+      , reuse_after_record =
+        { mutation = M.reuse_after_record
+        , constants = one // { ReuseManifest = True }
+        , comment =
+          { head =
+              "the {item}.capture record is written before the bundle's .reuse"
+          , tail =
+            [ "manifest (lane L7): a crash between the two leaves a record whose"
+            , "capture every later pass must fetch whole to reuse."
+            ]
+          }
+        }
       }
 
 let primaryOf
@@ -750,6 +800,7 @@ let negRows
               "as hit_ignores_chain, against RestoreOrRecapture's recapture half."
         }
       , primaryOf M.reroot_pre_mismatch
+      , primaryOf M.reuse_after_record
       ]
 
 let primaryPositions =
@@ -982,8 +1033,24 @@ let invariants
         , ruling = [ "OI-1003-Q15", "R-N86" ]
         , codeSymbol =
           [ "capture_item", "publish_bundle", "publish_prior", "publish_sidecars" ]
-        , pending = [ pending "the {name}.reuse sidecar" Lane.L7 ]
+        , pending = [] : List T.PendingSymbol
         , ptest = [ Id.P70 ]
+        }
+      , { tla = P.ReuseManifestBeforeRecord
+        , slo = [ S.Durability, S.S3 ]
+        , ruling = [ "OI-1003-Q42", "OI-1003-Q45", "OI-1003-Q94" ]
+        , codeSymbol =
+          [ "capture_item"
+          , "publish_reuse"
+          , "ReuseManifest"
+          , "reuse_sidecar"
+          , "retained_manifest"
+          , "reuse_offer"
+          , "manifest_blobs"
+          , "ManifestSeat"
+          ]
+        , pending = [] : List T.PendingSymbol
+        , ptest = [ Id.P70, Id.P69 ]
         }
       , { tla = P.RestoreOrRecapture
         , slo = [ S.S4, S.S5 ]
@@ -1071,6 +1138,8 @@ let explorerFlags =
           , flag c.DamageRewrites
           , "--base-missing-typed"
           , flag c.BaseMissingTyped
+          , "--reuse-manifest"
+          , flag c.ReuseManifest
           ]
 
 let nversion =
