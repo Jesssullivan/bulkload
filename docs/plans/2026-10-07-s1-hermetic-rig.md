@@ -100,6 +100,13 @@ nohup nice -n 10 nix develop .#default --command python3 crates/bulkload-bench/s
   complete (the verdict is PASS or FAIL), 2 refused before the sample, 3
   aborted during it, 4 build failure.
 
+If the pinned A cannot run on the host (on mbp-13 it refuses with `IO
+(errno 32)` on its own; see the slo.md amendment), add
+`--b-only-no-a-control --no-a-control-reason "<why>"`. The order becomes
+B/B/B, every other gated check stays, and the verdict is marked
+`(NO A CONTROL)`. It is reported, not a gate verdict of record, until the
+operator rules.
+
 One sample is one sample. A FAIL is a result: do not tune and do not rerun
 for a better one. A refused or aborted sample has no verdict; record why.
 
@@ -107,7 +114,8 @@ for a better one. A refused or aborted sample has no verdict; record why.
 
 - `~/git-bulkload/runs/r23-ab-<stamp>/r23-ab.json`: everything, including
   `host_identity` and each build's `preflight`.
-- `docs/evidence/r23-<stamp>.md` in the host's clone: the Markdown draft.
+- `docs/evidence/r23-<stamp>.md` in the host's clone: the Markdown draft
+  (`r23-<stamp>-no-a-control.md` for a B/B/B sample).
 - Copy both into the lane's `docs/evidence/` (`r23-<stamp>.md` and
   `r23-<stamp>.json`), commit them as drafts, and put the verdict and the
   medians on TIN-4543. The work root stays on the host as the raw record.

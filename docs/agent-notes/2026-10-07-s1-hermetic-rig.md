@@ -28,6 +28,17 @@ Branch `feat/s1-hermetic-rig-20261007`, from main `3931471`. No PR opened.
   a B without the sysfs probe is refused. The verdict rule is unchanged.
   The bench is one process that links the agent as a library, so "A's agent
   with B's bench" was not available.
+- A on Linux is broken beyond its preflight (found on mbp-13, 06:30Z, log
+  `~/git-bulkload/logs/diag.log`): native-only, informational, no shim.
+  A refused with `IO (errno 32)` in 3 of 3 runs on the dry-run synthetic
+  corpus (before the first sample) and in 1 of 3 runs on a copy of corpus
+  v1 (after two samples). v4 completed 6 of 6. A full A rep makes about
+  twice as many native copies, and a gated sample aborts on any refused
+  rep. So the harness gained `--b-only-no-a-control` (with
+  `--no-a-control-reason`): gated B/B/B, A not built, status
+  `complete-draft-no-a-control`, verdict `PASS|FAIL (NO A CONTROL)`,
+  evidence name must contain `no-a-control`. The default gated path and its
+  verdict rule are unchanged.
 - `docs/slo.md`: amendment 2026-10-07 (Q96, Q97). Runbook:
   `docs/plans/2026-10-07-s1-hermetic-rig.md`.
 - `gate_b.py` and the justfile are untouched. The justfile comment above
@@ -37,7 +48,7 @@ Branch `feat/s1-hermetic-rig-20261007`, from main `3931471`. No PR opened.
 ## Validation
 
 - `just check-fast` in `nix develop`, on sting: exit 0.
-- `python3 crates/bulkload-bench/scripts/test_r23_ab.py`: 51 tests pass
+- `python3 crates/bulkload-bench/scripts/test_r23_ab.py`: 55 tests pass
   (it is in `check-optional`, not `check-fast`).
 
 ## Rig probes (2026-10-07, about 06:00Z)
@@ -68,8 +79,10 @@ See the section added after the run.
 
 ## Open
 
-- Operator: ratify the pmset translator for the baselines, or move the
-  pinned A to a revision that has the Linux preflight.
+- Operator: the A control on the rig. Accept B/B/B, pin a newer A that
+  runs on Linux, or record a refused A rep without aborting.
+- Operator: ratify the pmset translator for baselines that only know pmset
+  (v4 runs behind it today).
 - Operator: mbp-13 has no Nix-profile rclone; the sample uses the
   flake-pinned one (v1.74.4). Say if a profile rclone is wanted instead.
 - `gate_b.py` still reads `unknown-no-supply-class` for a host with no

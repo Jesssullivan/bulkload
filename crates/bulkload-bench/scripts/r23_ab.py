@@ -128,6 +128,18 @@ native-vs-rclone initial and delta medians, not a pass count. The evidence
 goes to docs/evidence/r23-underload-<date>-<HHMM>Z.md; an --evidence name
 that does not contain `underload` is refused.
 
+--b-only-no-a-control (OI-1003-Q96, pending an operator ruling) is for a rig
+where the pinned A cannot run. It needs --no-a-control-reason. It keeps
+every gated check (platform, corpus v1, verify, seal, R-N81 before every rep
+and arm, R-N91) and changes one thing: the order is B/B/B, A is not built and
+no A rep runs. OI-1002-Q30 ratifies the order B/A/B/A/B, so this sample lacks
+its A control and says so everywhere: the status is
+`complete-draft-no-a-control`, the verdict is `PASS (NO A CONTROL)` or
+`FAIL (NO A CONTROL)` by the unchanged rule over the three B reps, and the
+evidence file name must contain `no-a-control`. Whether such a sample may
+stand as a gate verdict is the operator's decision, not this script's. The
+v4 dedup reference rep still runs.
+
 Exit: 0 complete (the gate verdict is in the evidence, pass or fail),
 2 refused before the sample, 3 aborted during the sample, 4 build failure.
 """
@@ -205,6 +217,8 @@ WALK_WAIT = re.compile(r"(walk.*(wait|slot|ahead))|((slot|ahead).*wait)")
 RECV_STALL = re.compile(r"(recv|receive).*(stall|seal|block).*_ns$")
 PAIR = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
 NOT_GATE = "DRY RUN - NOT A GATE SAMPLE"
+NO_A_CONTROL = "NO A CONTROL"
+B_ONLY_PATTERN = "B" * GATE_B_REPS
 UNDER_LOAD = "INFORMATIONAL UNDER LOAD - NOT A GATE SAMPLE"
 
 
@@ -983,6 +997,7 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
         verdict = "NOT A GATE SAMPLE"
     elif report["status"] not in (
         "complete-draft",
+        "complete-draft-no-a-control",
         "complete-under-load-informational",
     ):
         verdict = "NONE (sample aborted or refused)"
@@ -994,6 +1009,9 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
         verdict = "PASS"
     else:
         verdict = "FAIL"
+    no_a = report.get("a_control") is False
+    if no_a and verdict in ("PASS", "FAIL"):
+        verdict += f" ({NO_A_CONTROL})"
     return {
         "rule": (
             "under load there is no R23 verdict; B's bench statuses and the"
@@ -1002,7 +1020,17 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
             if under_load
             else "B passes R23 iff every B rep's bench verdict passes;"
             " A is informational (OI-1002-Q30)"
+            + (
+                f". This sample ran {B_ONLY_PATTERN[0]}"
+                + f"/{B_ONLY_PATTERN[0]}" * (GATE_B_REPS - 1)
+                + " with no A rep (--b-only-no-a-control): it lacks the A control"
+                " of the ratified B/A/B/A/B order, and whether it stands as a"
+                " gate verdict is the operator's decision"
+                if no_a
+                else ""
+            )
         ),
+        "a_control": not no_a,
         "b_reps": len(b_reps),
         "b_reps_pass": passed,
         "b_statuses": statuses,
@@ -1079,9 +1107,20 @@ def evidence(report: dict[str, object]) -> str:
         title += f" ({NOT_GATE})"
     elif report["mode"] == "under-load":
         title += f" ({UNDER_LOAD})"
+    elif report.get("a_control") is False:
+        title += f" (DRAFT, {NO_A_CONTROL})"
     else:
         title += " (DRAFT)"
     lines += [title, ""]
+    if report.get("a_control") is False:
+        lines += [
+            f"> **{NO_A_CONTROL}.** Run with `--b-only-no-a-control`: the order was"
+            " B/B/B and no A rep ran. Every other gated check applied. Reason"
+            f" given: {report.get('a_control_reason')}. OI-1002-Q30 ratifies"
+            " B/A/B/A/B, so this sample lacks its A control; whether it stands"
+            " as a gate verdict is the operator's decision.",
+            "",
+        ]
     if dry:
         lines += [
             f"> **{NOT_GATE}.** Synthetic corpus, `--informational`, no host gating.",
@@ -1376,6 +1415,17 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help=NOT_GATE)
     parser.add_argument(
+        "--b-only-no-a-control",
+        action="store_true",
+        help=f"{NO_A_CONTROL}: gated B/B/B with no A rep, for a rig where the"
+        " pinned A cannot run; the verdict is marked as lacking its A control"
+        " (needs --no-a-control-reason)",
+    )
+    parser.add_argument(
+        "--no-a-control-reason",
+        help="why A cannot run here; recorded in the report and the evidence",
+    )
+    parser.add_argument(
         "--under-load",
         action="store_true",
         help=f"{UNDER_LOAD}: sealed corpus, bench --informational, load recorded"
@@ -1399,6 +1449,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run and args.under_load:
         say("refused: --dry-run and --under-load are exclusive")
         return 2
+    no_a = args.b_only_no_a_control
+    if no_a:
+        if args.dry_run or args.under_load:
+            say("refused: --b-only-no-a-control is a gated mode only")
+            return 2
+        if not (args.no_a_control_reason or "").strip():
+            say("refused: --b-only-no-a-control needs --no-a-control-reason")
+            return 2
+        if args.pattern != DEFAULT_PATTERN:
+            say("refused: --b-only-no-a-control sets the order; do not pass --pattern")
+            return 2
+    elif args.no_a_control_reason:
+        say("refused: --no-a-control-reason needs --b-only-no-a-control")
+        return 2
+    pattern = B_ONLY_PATTERN if no_a else args.pattern
     system = platform.system()
     if not args.dry_run:
         if system not in ("Darwin", "Linux"):
@@ -1446,9 +1511,19 @@ def main(argv: list[str] | None = None) -> int:
             work / f"r23-dryrun-{stamp}.md"
             if args.dry_run
             else evidence_dir
-            / (f"r23-underload-{stamp}.md" if args.under_load else f"r23-{stamp}.md")
+            / (
+                f"r23-underload-{stamp}.md"
+                if args.under_load
+                else (f"r23-{stamp}-no-a-control.md" if no_a else f"r23-{stamp}.md")
+            )
         )
     )
+    if no_a and "no-a-control" not in evidence_path.name:
+        say(
+            "refused: evidence of a sample without its A control must be named"
+            f" *no-a-control*: {evidence_path.name}"
+        )
+        return 2
     if args.dry_run and evidence_path.is_relative_to(evidence_dir):
         say("refused: dry-run evidence never goes under docs/evidence")
         return 2
@@ -1482,10 +1557,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     build_root.mkdir(parents=True, exist_ok=True)
     scratch = work / "build-src"
-    builds = {
-        "B": build(repo, args.rev_b, build_root, scratch, args.build_jobs),
-        "A": build(repo, args.rev_a, build_root, scratch, args.build_jobs),
-    }
+    builds = {"B": build(repo, args.rev_b, build_root, scratch, args.build_jobs)}
+    if not no_a:
+        builds["A"] = build(repo, args.rev_a, build_root, scratch, args.build_jobs)
     if args.rev_v4:
         builds["V4"] = build(repo, args.rev_v4, build_root, scratch, args.build_jobs)
     if not args.dry_run and system == "Linux":
@@ -1528,7 +1602,9 @@ def main(argv: list[str] | None = None) -> int:
         "work_root": str(work),
         "rclone": str(rclone),
         "builds": builds,
-        "pattern": args.pattern,
+        "pattern": pattern,
+        "a_control": not no_a,
+        "a_control_reason": args.no_a_control_reason,
         "load_limit": LOAD_LIMIT,
         "load_gated": not args.under_load,
         "rulings": RULINGS_UNDER_LOAD if args.under_load else RULINGS,
@@ -1548,7 +1624,7 @@ def main(argv: list[str] | None = None) -> int:
                 finish(report, work, evidence_path)
                 return 2
             time.sleep(15)
-    order = [(label, False) for label in args.pattern]
+    order = [(label, False) for label in pattern]
     if args.rev_v4:
         order.append(("V4", True))
     state: dict[str, object] = {}
@@ -1586,7 +1662,9 @@ def main(argv: list[str] | None = None) -> int:
         "dry-run-complete-not-a-gate-sample"
         if args.dry_run
         else (
-            "complete-under-load-informational" if args.under_load else "complete-draft"
+            "complete-under-load-informational"
+            if args.under_load
+            else ("complete-draft-no-a-control" if no_a else "complete-draft")
         )
     )
     finish(report, work, evidence_path)

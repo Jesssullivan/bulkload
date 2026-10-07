@@ -490,6 +490,91 @@ class HarnessTests(unittest.TestCase):
         self.assertTrue(all(r["preflight"] == "native" for r in report["reps"]))
         self.assertNotIn("pmset-shim", (self.tmp / "ev.md").read_text())
 
+    def no_a(self, name: str = "r23-x-no-a-control.md") -> list[str]:
+        args = [
+            a for a in self.gated() if a not in ("--evidence", str(self.tmp / "ev.md"))
+        ]
+        return [
+            *args,
+            "--evidence",
+            str(self.tmp / name),
+            "--b-only-no-a-control",
+            "--no-a-control-reason",
+            "A fails on this rig",
+        ]
+
+    def test_b_only_runs_bbb_and_marks_the_verdict(self) -> None:
+        for verdict, expected in (("pass", "PASS"), ("fail", "FAIL")):
+            with self.subTest(verdict=verdict):
+                self.setUp()
+                revs: list[str] = []
+
+                def record(_repo: Path, rev: str, *_a: object) -> dict[str, str]:
+                    revs.append(rev)
+                    return self.info
+
+                build = mock.patch.object(ab, "build", side_effect=record)
+                with mock.patch.dict(os.environ, {"STUB_VERDICT": verdict}):
+                    self.assertEqual(self.main(self.no_a(), build=build), 0)
+                self.assertEqual(revs, [ab.DEFAULT_B, ab.DEFAULT_V4])
+                report = self.report()
+                # B and V4 are built; A never is.
+                self.assertEqual(sorted(report["builds"]), ["B", "V4"])
+                self.assertEqual(
+                    [r["label"] for r in report["reps"]], ["B", "B", "B", "V4"]
+                )
+                self.assertEqual(report["mode"], "gated")
+                self.assertEqual(report["status"], "complete-draft-no-a-control")
+                self.assertEqual(report["pattern"], "BBB")
+                self.assertFalse(report["a_control"])
+                self.assertEqual(report["a_control_reason"], "A fails on this rig")
+                gate = report["gate"]
+                self.assertEqual(gate["verdict"], f"{expected} (NO A CONTROL)")
+                self.assertFalse(gate["a_control"])
+                self.assertEqual(gate["b_reps"], 3)
+                self.assertIn("lacks the A control", gate["rule"])
+                self.assertIn("OI-1002-Q30", gate["rule"])
+                md = (self.tmp / "r23-x-no-a-control.md").read_text()
+                self.assertIn("(DRAFT, NO A CONTROL)", md.splitlines()[0])
+                self.assertIn(
+                    f"**R23 gate verdict for B: {expected} (NO A CONTROL)**", md
+                )
+                self.assertIn("A fails on this rig", md)
+                self.assertIn("operator's decision", md)
+
+    def test_b_only_keeps_every_gated_check(self) -> None:
+        busy = mock.patch.object(ab, "conditions", return_value=cond(False))
+        self.assertEqual(
+            self.main([*self.no_a(), "--settle-seconds", "0"], conditions=busy), 2
+        )
+        self.assertEqual(self.report()["gate"]["verdict"][:4], "NONE")
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_GATED": "false"}):
+            self.assertEqual(self.main(self.no_a()), 3)
+        self.setUp()
+        no_quiet = [a for a in self.no_a() if a != "--coordinator-quiet"]
+        self.assertEqual(self.main(no_quiet), 2)
+
+    def test_b_only_refusals(self) -> None:
+        self.assertEqual(self.main(self.no_a("r23-plain.md")), 2)
+        self.assertEqual(self.main(self.no_a()[:-2]), 2)
+        self.assertEqual(self.main([*self.no_a()[:-1], "  "]), 2)
+        self.assertEqual(self.main([*self.no_a(), "--pattern", "BBB"]), 2)
+        self.assertEqual(self.main([*self.no_a(), "--under-load"]), 2)
+        self.assertEqual(self.main([*self.no_a(), "--dry-run"]), 2)
+        self.assertEqual(self.main([*self.gated(), "--no-a-control-reason", "x"]), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_a_default_gated_sample_keeps_its_a_control(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated()), 0)
+        report = self.report()
+        self.assertTrue(report["a_control"])
+        self.assertTrue(report["gate"]["a_control"])
+        self.assertEqual(report["gate"]["verdict"], "PASS")
+        self.assertEqual(report["status"], "complete-draft")
+        self.assertNotIn("NO A CONTROL", (self.tmp / "ev.md").read_text())
+
     def test_gated_refuses_any_pattern_but_babab(self) -> None:
         for pattern in ("B", "BA", "BBBBB", "ABABA", "BABABA"):
             self.assertEqual(self.main([*self.gated(), "--pattern", pattern]), 2)

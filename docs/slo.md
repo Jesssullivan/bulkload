@@ -329,9 +329,18 @@ as properties.
   `41bf9a4`) only know `pmset`. They are built at their exact sha, unpatched,
   and run with a translator named `pmset` first on PATH that reports the
   Linux power state in pmset's words. B never runs behind it. A stays
-  informational and the verdict rule is unchanged. Whether to move the
-  pinned A to a revision with the Linux preflight is an open operator
-  question; until it is ruled, the translator stands.
+  informational and the verdict rule is unchanged.
+- **Open: the A control on the rig.** On mbp-13 the pinned A fails on its
+  own, before any power check matters: its copy refuses with `IO (errno
+  32)` every time on the dry-run corpus and in one of three native-only runs
+  on corpus v1 (2026-10-07, see the lane's agent note). A gated sample
+  aborts when any rep is refused, so B/A/B/A/B cannot be relied on to
+  complete there. Until the operator rules, `r23_ab.py
+  --b-only-no-a-control` runs B/B/B under every other gated check and marks
+  its verdict `(NO A CONTROL)`. Such a sample is reported; it is not a gate
+  verdict of record. The operator's choices: accept B/B/B on the rig, pin a
+  newer A that runs on Linux, or let a refused A rep be recorded without
+  aborting, as OI-1003-Q50 does under load.
 - **Every sample names its rig.** The report records the platform, kernel,
   machine, CPU model, core count, RAM and the filesystem type of the work
   root, so a sample from one rig is never read as another's.
