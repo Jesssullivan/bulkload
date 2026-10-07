@@ -330,4 +330,25 @@ again line by line, and all nine files were checked whole (`cargo fmt
   ran, in 5 groups`; `fault_harness` 53; `power_loss` 9; `io::` 62 passed
   and 2 ignored; P5 1; resume proofs 3; the contract test OK. Both clippy
   passes and the union clippy pass are clean.
+- Review fixes: `478ee06`, signed, pushed.
+- The new deep recipe bodies, run on `478ee06` after it was pushed
+  (2026-10-07 02:00 to 02:26 EDT, 1-minute load 110 → 63, TMPDIR on tmpfs):
+  - `just crash-sweep`: **exit 0**, the whole recipe. `19 points, 645
+    crashes, 0 failures, 8 at a time`, 19 `hits=` lines, `1 passed` in
+    764 s, then the recipe's own `crash-sweep: all 19 points were swept`.
+  - `props-deep`, **the three rows only**: the recipe's body was copied to a
+    scratch script without its workspace line and run; exit 0, `props-deep:
+    the workspace and all 3 deep rows ran`. 131,072 refs 94 s; 32,768
+    commits 135 s (import CPU 22.6 s and 32.7 s against 101.9 s); 110,000
+    commits 482 s (77.0 s and 84.9 s against 295 s, written
+    self-contained).
+  - **Not run:** the recipe's first line, the 20-times workspace run with
+    the three `--skip` filters (about 30 minutes on a quiet host). The
+    filters were checked with `--list` on `refs_scale_distinct`: only the
+    16,384 row is left. So `just props-deep` has not been run end to end
+    in its new form.
+  - The refusing paths (a skipped row, a missing line) were not run through
+    the recipes; they are held by the contract test's mutation rows, which
+    check the recipe text, and by the skipped-row output shown under
+    Validation.
 - Rulings cited: OI-1003-Q81, OI-1003-Q7, OI-1003-Q14, OI-1003-Q78, R-N13.
