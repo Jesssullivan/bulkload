@@ -233,3 +233,38 @@ no ratified number or rule was changed.
   `Mains` supply; it should take the same rule before gate (b) runs on the
   rig.
 - The justfile comment (other lane) and gate (b) on the rig (W5).
+
+## Recheck and ship (2026-10-07, third session, on sting; no ssh call made)
+
+Rulings: OI-1003-Q96, OI-1003-Q97, OI-1003-Q99, OI-1002-Q30, R-N81, R-N13.
+Read the diff `83d08dc..9ec1d63` against the review's seven medium
+findings. Verdict: clean; the PR is opened from this head plus this note.
+
+- Rig asserted: confirmed in code. `rig_role` gives `record` only for
+  mbp-13 with the pinned identity (the committed sample's JSON shows node
+  `mbp-13`, product `MacBookPro12,1`); `of_record` needs gated mode, a
+  `record` rig, the A control and `complete-draft`. Gated mode already
+  refuses any `--pattern` but B/A/B/A/B, so B-only cannot reach
+  `of_record=true` by another route. sting reads as `field`.
+- Cores and load: `cpu_physical_cores` reads 16 of 32 on sting, which is
+  right. The 2.5 bound is unchanged and the harness records, not refuses;
+  slo.md no longer says "not weakened" without the correction, and the
+  bound is an operator question.
+- Seal: `durable::file_seal` is `sys::full_flush` off Apple targets, and
+  `full_flush` in `sys_linux.rs` is `fsync`. The fix round's correction of
+  the finding (`fsync`, not `fdatasync`) is right.
+- B/B/B: one-token verdict confirmed; the old `(NO A CONTROL)` text remains
+  only in the title, the banner and the help. A's `IO (errno 32)` matches
+  the open issue #201 (`transfer::copy` returns a bare `Io(EPIPE)`), which
+  is in the s3-fixes lane's file, not this lane's.
+- Out-of-bounds writes: recorded in this note and closed in the runbook.
+  The directories on mbp-13 and PZM are still there; removal is the
+  operator's call.
+- Validation at `9ec1d63`: `test_r23_ab.py` 64 tests pass; `just
+  check-fast` in `nix develop` on sting, exit 0. Run again on this note's
+  commit before the push.
+- Left open, all low: the first amendment's unratified sentences (a field
+  fail "is filed as an issue", "quiet and close", the PZM free-space
+  reason), the justfile comment "Gated runs only on neo" (the justfile is
+  the ci-slim-source-gate lane's), the old evidence file's title, and
+  `linux_power`'s two fail-open readings and its hand-duplicated table.
