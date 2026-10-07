@@ -64,6 +64,33 @@
 //! `write_legacy_chunk`, `blake3_capture_file`, `blake3_store_read_verify`
 //! and `blake3_legacy_put` were removed for that reason).
 //!
+//! `source_wal_index_touched` counts the provider `SQLite` snapshots that
+//! touched their source's wal-index (`<db>-shm`): the first of S2's two stated
+//! source writes (OI-1003-Q36, which extends OI-1003-Q16). A backup-API read of a
+//! WAL-mode source is WAL-aware: it opens the wal-index read-write, maps it
+//! shared and takes `fcntl` locks on it. It creates the file when no live
+//! connection has, and rebuilds it when none holds it; beside a live writer
+//! it often leaves every byte as it was. "Touched" covers all of these. Each
+//! WAL-aware snapshot adds 1 when a `-shm` sits beside its source after the
+//! read, whether or not the file's bytes or metadata moved, so 0 means no
+//! snapshot opened a source wal-index. It is an upper bound in two corners,
+//! where `SQLite` never opens the `-shm` that is counted: a rollback-journal
+//! database with a stray `-shm` beside it, and a snapshot refused before its
+//! first read of the source.
+//!
+//! `source_wal_created` counts the provider `SQLite` snapshots that left a
+//! `-wal` beside a source that had none: S2's second stated source write
+//! (OI-1003-Q72, which extends OI-1003-Q36 to the empty `-wal`). A WAL-aware
+//! open of a WAL-mode database with no `-wal` (checkpointed and closed, or
+//! opened by a writer that has not read it yet) creates a zero-byte one.
+//! Each snapshot adds 1 when no `-wal` sat beside its source before the read
+//! and one does after it, so the same source adds 1 once and 0 on later
+//! snapshots while that file stays. The read-only connection cannot append a
+//! frame, so the file it creates is empty; a writer that arrives during the
+//! read and creates the `-wal` itself is counted too, which makes the counter
+//! an upper bound and never an undercount. The main database, and a `-wal`
+//! that existed before the read, are never written (P75).
+//!
 //! Not counted as flushes: syncs done by child processes. `git` children
 //! spawned by the Git carry verbs flush on their own, so the flush counters
 //! are a lower bound on the syncs a verb causes.
@@ -167,8 +194,23 @@ counters! {
     // deleted on its first open by this engine (#125): each costs one source
     // read of its seat.
     TransferLegacyRowsInvalidated => "transfer_legacy_rows_invalidated",
+    // R25's strict reading (#169): outputs a crash left durable with no row,
+    // adopted on resume from their capture record without a source read;
+    // existing outputs with no matching row that no record proved, each
+    // asked for by manifest (a source read) as before; and staged files whose
+    // capture record could not be written (no extended attributes).
+    TransferUnrowedAdopted => "transfer_unrowed_adopted",
+    TransferUnrowedUnproven => "transfer_unrowed_unproven",
+    TransferCaptureRecordsUnset => "transfer_capture_records_unset",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
+    // Provider `SQLite` snapshots whose WAL-aware read left a wal-index
+    // (`<db>-shm`) beside its source, changed or not: a stated S2 source
+    // write (OI-1003-Q36).
+    SourceWalIndexTouched => "source_wal_index_touched",
+    // Provider `SQLite` snapshots that left a `-wal` beside a source that had
+    // none: the empty `-wal` a WAL-aware open creates (OI-1003-Q72).
+    SourceWalCreated => "source_wal_created",
 }
 
 const COUNT: usize = Counter::ALL.len();

@@ -32,7 +32,9 @@ pub struct Hydrated {
 /// and symlinks are never replaced. Native decompressors validate their checksums.
 /// Errors leave already published complete files in place for an idempotent retry.
 /// # Errors
-/// Refuses invalid limits, changed inputs, decompressor errors and budget exhaustion.
+/// Refuses an effective uid of 0 (`SQLITE_SOURCE_AS_ROOT`, OI-1003-Q76: the
+/// snapshot is opened read-only and WAL-aware), invalid limits, changed
+/// inputs, decompressor errors and budget exhaustion.
 #[allow(clippy::too_many_arguments)] // Explicit native tools and receipt sink are caller-owned.
 pub fn hydrate_state(
     snapshot: &Path,
@@ -43,6 +45,7 @@ pub fn hydrate_state(
     zstd: &Path,
     receipt: &(impl Fn(&Hydrated) -> Result<()> + Sync),
 ) -> Result<Vec<Hydrated>> {
+    super::refuse_source_read_as_root()?;
     if max_bytes == 0 || jobs == 0 || jobs > 4 {
         return Err(BulkloadRefusal::BudgetExceeded);
     }

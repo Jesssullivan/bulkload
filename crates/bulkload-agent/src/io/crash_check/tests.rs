@@ -1199,3 +1199,40 @@ mod recorded {
         assert_eq!(strict.passed(), !cfg!(target_vendor = "apple"));
     }
 }
+
+/// #169: the capture record is metadata, like a mode. `fdatasync` leaves it
+/// volatile; `fsync` makes it durable; and a crash state shows it through
+/// [`View::record`].
+#[test]
+fn the_capture_record_follows_the_meta_class() {
+    let record = |kind| {
+        vec![
+            Event::SetCaptureRecord {
+                node: KEEP_NODE,
+                record: b"capture".to_vec(),
+            },
+            Event::Sync {
+                node: KEEP_NODE,
+                kind,
+            },
+        ]
+    };
+    for (kind, durable) in [(SyncKind::DataSync, false), (SyncKind::Fsync, true)] {
+        let events = record(kind);
+        let mut seen = std::collections::BTreeSet::new();
+        let report = check_view(&initial(), &events, &Options::default(), |view, info| {
+            if info.complete {
+                seen.insert(view.record(b"keep").map(<[u8]>::to_vec));
+            }
+            Ok(())
+        })
+        .unwrap();
+        assert!(report.passed(), "{}", report.summary(&events));
+        let kept = Some(b"capture".to_vec());
+        if durable {
+            assert_eq!(seen, [kept].into(), "{kind:?}");
+        } else {
+            assert_eq!(seen, [None, kept].into(), "{kind:?}");
+        }
+    }
+}
