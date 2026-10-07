@@ -422,17 +422,22 @@ impl<'a> Offer<'a> {
 /// (`decide::decide`, OI-1003-Q43), once this pass has read what only it can
 /// read: whether the source is shallow (the private repository carries its
 /// frontier), and, only when the decision rests on it, whether the source
-/// holds a tip of the link (`chain::source_held_tips`). Under v1's policy a
-/// plan base wins over a link, a shallow source is always self-contained
-/// and a source that holds none of the link's tips gets a self-contained
-/// bundle.
+/// holds a tip of the link (`chain::source_held_tips`). Under the code's
+/// policy ([`Policy::CODE`], L6b's fix 2) a shallow source is always
+/// self-contained, and a source that holds none of the link's tips gets the
+/// plan base's delta, or a self-contained bundle when no base is offered.
+///
+/// A plan base and a link together (`Basis::BaseAndChain`) write one thin
+/// bundle whose prerequisites are the base's commits and the link's
+/// source-held tips: it packs only what is new since the link, and a
+/// restore imports the base and then the chain (`chain::flatten`).
 ///
 /// Returns the pack cost and whether the bundle declares the link's tips as
 /// prerequisites. A self-contained bundle (a shallow envelope, nothing
 /// offered, no source-held tip, or a thin header over `cap`, see
 /// [`write_excluding_tip_trees`]) does not, and nor does a plan base's
-/// delta. A decision v1 cannot write (L6b's chain under a plan base) refuses
-/// `CONTRACT_SELF_INCONSISTENT`, as does a decision that is not an export.
+/// delta. A decision that is not an export refuses
+/// `CONTRACT_SELF_INCONSISTENT`.
 pub(super) fn write_capture(
     private: &Path,
     bundle: &Path,
@@ -445,7 +450,7 @@ pub(super) fn write_capture(
         offer.base.is_some(),
         offer.link,
         !boundary.is_empty(),
-        Policy::V1,
+        Policy::CODE,
         |link| {
             tips = super::chain::source_held_tips(link.source, link.prior)?;
             Ok(!tips.is_empty())
@@ -467,7 +472,21 @@ pub(super) fn write_capture(
             Ok((write_thin(private, bundle, &commits, cap)?.0, false))
         }
         Basis::Chain => write_excluding_tip_trees(private, bundle, &tips, cap),
-        Basis::BaseAndChain => Err(BulkloadRefusal::ContractSelfInconsistent),
+        Basis::BaseAndChain => {
+            let base = offer
+                .base
+                .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+            // The base's commits and the link's source-held tips, one
+            // prerequisite set: 54 B each on SHA-1, so on a refs-heavy
+            // source this header reaches the cap before a plan base's delta
+            // or a plain chain link does (REFS-SCALE), and `write_thin`
+            // then writes the capture self-contained.
+            let mut commits = prerequisite_commits(private, base)?;
+            for tip in &tips {
+                commits.insert(Oid::new(tip)?);
+            }
+            write_thin(private, bundle, &commits, cap)
+        }
     }
 }
 

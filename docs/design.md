@@ -346,8 +346,8 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   R-N29 (apply proceeds on an occupied destination, recording uncaptured
   seats) is deferred (bulkload#48); carry v2, the W6 engine it was deferred
   to, is deleted (OI-1003-Q44, OI-1003-Q56).
-- Auto-prerequisite chains (WP2, OI-1003-Q15, 2026-10-03). Without a shared
-  plan base, a capture that follows a retained capture of the same checkout
+- Auto-prerequisite chains (WP2, OI-1003-Q15, 2026-10-03). A capture that
+  follows a retained capture of the same checkout
   declares that capture's tips as its bundle prerequisites, so it packs only
   what is new since then instead of re-packing all history. Only tips whose
   commits the source object store holds qualify; the capture's own metadata
@@ -381,6 +381,76 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   with `index-pack --fix-thin`, reading every base from the source object
   store: `read_source_capture_reuse_bytes` counts those bases beside the
   bundle, and the fetch's storage reads join the readback counter.
+- Grouped items chain under their plan base (Q42 lane L6b, fix 2;
+  OI-1003-Q42, OI-1003-Q46, OI-1003-Q62, OI-1003-Q63, 2026-10-07). A later
+  capture of an item on a shared plan base declares the base's commits and
+  its own prior capture's source-held tips, so it too packs only what is
+  new since that capture, where before it re-packed everything committed
+  since the base. It carries both sidecars: `{bundle}.base` names the plan
+  base and `{bundle}.prior` the prior capture. This is the code's only
+  policy; there is no flag, and a build from before it refuses such a
+  corpus rather than restore it wrongly (it fails closed, D4). Retained
+  records need no migration: an ungrouped chain (`.prior`, no `.base`) is
+  still a reuse hit and extends as before, a grouped record from before
+  the change (a delta on the base alone) becomes the depth-0 root of the
+  next changed capture's chain, and a record bound to a lost base still
+  refuses `RECEIPT_BINDING_INVALID`. The depth bound is unchanged, so the
+  ninth changed capture re-bases: it is a delta on the plan base alone and
+  re-packs what the group committed since the base. P68 excludes that
+  capture from its flatness bound and pins its cost; only the re-root of
+  lane L8 removes it (OI-1003-Q62).
+- The restore contract for a chain under a plan base (an amendment to
+  R-N72, ratified as OI-1003-Q63 D2). Apply binds every base and every link
+  by corpus name and recorded digest, never by stat identity. It imports
+  every bound base before the oldest link, then each link in order, then
+  the head, and restores from the one flattened bundle. A base must be
+  self-contained. A base or a link the corpus does not hold refuses
+  `SEALED_OBJECT_MISSING`, never a bare IO error (#181); other bytes refuse
+  `DIGEST_MISMATCH`; a prerequisite no earlier bundle satisfies refuses
+  `GIT_INVENTORY_MISSING_PREREQUISITE`. On the capture side a chain is
+  intact only while every link and every bound base is retained at its
+  recorded identity, so a chain whose base is gone is neither a reuse hit
+  nor extended. One group has one base, so a chain binds one. It binds two
+  only when the group's base record went missing while a retained record
+  still bound the old base: the next pass exports a new base, as v1 did,
+  and the restore imports both (D5). The base record itself is written
+  no-replace: a record that appears concurrently stands, and the pass
+  refuses `RECEIPT_BINDING_INVALID`.
+- A capture record never names a chain nothing can restore (Q42 L6b review,
+  2026-10-07). Under a plan base an export can reproduce, byte for byte, a
+  bundle the corpus already holds: its link's held tips are then the base's
+  own commits. It has that bundle's name, and identical bytes declare
+  identical prerequisites, so three rules decide its `.prior`. A name that
+  is the link, or is already in the link's own chain, gets none: the root's
+  or the shallower link's recorded custody stands, and no cycle
+  (root → link → root) is ever written. A `.prior` already recorded for the
+  name stands while its chain is intact. When the export declared no link
+  (a base's delta, or self-contained) and the name still carries a `.prior`
+  whose chain is broken, that sidecar is removed, durably, before the
+  record names the bundle: a chain broken by a lost base recovers on the
+  next capture as the new base's delta even when that delta is the old
+  head's bytes. A based bundle (its header declares prerequisites, no
+  `.prior`) whose own `.base` sidecar is gone has lost its base: it refuses
+  `RECEIPT_BINDING_INVALID` while its key holds and is never a chain link,
+  matching apply, which refuses it `SEALED_OBJECT_MISSING`.
+- Restore cost under fix 2 is not flat in the group (#147, open). Capture
+  bytes are flat in the pass count; restore is not. Apply flattens every
+  chained item on its own: it copies the head, every link and the plan base
+  beside the corpus and writes one self-contained bundle holding them all,
+  so it stages the base twice per chained item, where a delta on the base
+  alone stages the base once per destination repository. The space
+  preflight charges each chained item its head, links and base against the
+  repository volume, and the staging peak against the corpus volume. P68
+  pins it: `copied + n × base ≤ write_bundle_stage_bytes ≤ 2 × copied` for
+  `n` chained items. Measured with a 1.33 MB base: 7.44 MB staged for two
+  chained items at depth 1 and 11.16 MB for three, where their heads,
+  links and the base once are 2.40 MB and 2.93 MB of corpus bytes.
+- A drift-marked bundle may be a chain link (OI-1003-Q63 D1, #149). The
+  pass after a drifted capture extends it clean, chained on the drifted
+  bundle. Only that bundle's source-held tip commits become prerequisites,
+  so the new capture packs again every seat the drifted pass withdrew, and
+  the flattened restore advertises exactly the head's refs: none of the
+  link's drift markers. The drifted bundle itself still never applies.
   Since Q42 L6a (OI-1003-Q43) these choices are one pure, total function,
   `git_carry::decide::decide`, which P67 pins to the Haskell reference's rows.
 - A whole capture is reused (`capture-reused-after-census`) only when its key
