@@ -77,13 +77,20 @@ fn file_name(path: &Path) -> String {
 }
 
 /// The corpus file a `.base` or `.prior` sidecar names: both records are a
-/// postcard struct whose first field is that name (a length byte, then the
-/// name; corpus names are under 128 bytes).
+/// postcard struct whose first field is that name (its length as a LEB128
+/// varint, then the name).
 fn named(record: &Path) -> String {
     let bytes = std::fs::read(record).unwrap();
-    let length = usize::from(bytes[0]);
-    assert!(length < 128, "{}", record.display());
-    String::from_utf8(bytes[1..=length].to_vec()).unwrap()
+    let (mut length, mut shift, mut start) = (0usize, 0u32, 0usize);
+    for byte in &bytes {
+        length |= usize::from(byte & 0x7f) << shift;
+        shift += 7;
+        start += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    String::from_utf8(bytes[start..start + length].to_vec()).unwrap()
 }
 
 /// The depth a `.prior` sidecar records for the link it names: its last
@@ -107,10 +114,11 @@ fn advertised(bundle: &Path) -> Vec<String> {
 
 /// The commits `tips` peel to that the source object store holds.
 fn source_commits(fixture: &Fixture, tips: &[String]) -> BTreeSet<String> {
-    let request: String = tips
-        .iter()
-        .map(|tip| format!("{tip}^{{commit}}\n"))
-        .collect();
+    let request = tips.iter().fold(String::new(), |mut lines, tip| {
+        lines.push_str(tip);
+        lines.push_str("^{commit}\n");
+        lines
+    });
     feed(
         git(&fixture.source).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
         request.as_bytes(),
@@ -172,7 +180,7 @@ fn commit_round(fixture: &Fixture, k: u32) {
     notes.extend_from_slice(format!("pass {k}\n").as_bytes());
     std::fs::write(main.join("notes.txt"), notes).unwrap();
     run(git(main).args(["commit", "-q", "-am", &format!("round {k}")]));
-    if k % 2 == 0 {
+    if k.is_multiple_of(2) {
         let wt = fixture.items[1].0.as_path();
         let mut notes = std::fs::read(wt.join("notes.txt")).unwrap();
         notes.extend_from_slice(format!("wt pass {k}\n").as_bytes());

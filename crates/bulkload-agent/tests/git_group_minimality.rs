@@ -42,6 +42,12 @@
 //! pack is then thin, and every row's apply restores it byte for byte through
 //! `index-pack --fix-thin` (an import's fetch, or `chain::flatten`).
 //!
+//! **Grouped items chain (Q42 lane L6b, fix 2).** A later capture of a
+//! grouped item declares its prior capture's source-held tips beside the
+//! plan base's commits, and carries both sidecars (`.prior`, `.base`); every
+//! row asserts it of the moved item. P68 (`tests/git_grouped_chain.rs`)
+//! holds the byte bound over twelve passes.
+//!
 //! **Thin reuse.** The `thin_reuse_third_pass` rows run a third pass whose
 //! retained capture is a thin bundle, so its blob-reuse fetch completes the
 //! pack from the source store. That pass reuses every unchanged seat (no
@@ -154,6 +160,10 @@ fn later_pass(
         assert_eq!(thin, deltas, "P65 {name}: a delta was not against the base");
     }
     assert!(moved.len() <= 1, "{name}: pass {pass}: {moved:?}");
+    // Re-pinned for L6b (fix 2): a grouped item's later capture chains too.
+    if let Some(bundle) = moved.first() {
+        assert_chained(fixture, bundle);
+    }
     moved.pop()
 }
 
@@ -279,6 +289,30 @@ fn row(layout: Layout, mutation: Mutation) {
     apply_and_compare(&fixture);
 }
 
+// A later capture's bundle names its prior capture (`.prior`), and in a
+// group the plan base too (`.base`). Re-pinned for Q42 lane L6b (fix 2,
+// OI-1003-Q63): a later capture of a grouped item is no longer a delta on
+// the plan base alone. Like a chained item's, it chains on its prior
+// capture, and it stays bound to the base.
+fn assert_chained(fixture: &Fixture, bundle: &Path) {
+    let sidecar = |extension: &str| {
+        let mut path = bundle.as_os_str().to_owned();
+        path.push(extension);
+        PathBuf::from(path)
+    };
+    assert!(
+        sidecar(".prior").exists(),
+        "{}: not chained",
+        bundle.display()
+    );
+    assert_eq!(
+        sidecar(".base").exists(),
+        fixture.items.len() > 1,
+        "{}: bound to a plan base exactly in a group",
+        bundle.display()
+    );
+}
+
 // The third pass of a thin-reuse row: its retained capture, `link`, is thin.
 fn thin_reuse(fixture: &Fixture, second: &Pass, link: &Path, expect: &mut Expect<'_>) {
     let name = expect.name;
@@ -321,15 +355,7 @@ fn thin_reuse(fixture: &Fixture, second: &Pass, link: &Path, expect: &mut Expect
             bundle.display()
         );
         assert!(!seen.prerequisites.is_empty(), "{}", bundle.display());
-        if fixture.items.len() == 1 {
-            let mut prior = bundle.as_os_str().to_owned();
-            prior.push(".prior");
-            assert!(
-                Path::new(&prior).exists(),
-                "{}: not chained",
-                bundle.display()
-            );
-        }
+        assert_chained(fixture, bundle);
     }
 }
 

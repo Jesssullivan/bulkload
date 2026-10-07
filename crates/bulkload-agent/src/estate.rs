@@ -79,8 +79,51 @@ enum LinkBinding {
     Digest,
 }
 
-/// The bundles a chained capture's bundle depends on, oldest first, each with
-/// its recorded digest. Empty for a bundle without a `.prior` sidecar.
+/// What a chained capture's bundle depends on (R-N72): every bundle a
+/// restore must hold beside the head, each with its recorded digest.
+#[derive(Debug, Default)]
+struct Chain {
+    /// The bundles it chains on, oldest first.
+    links: Vec<(PathBuf, [u8; 32])>,
+    /// The plan bases the head and its links are bound to (L6b's fix 2),
+    /// the oldest link's first, each once. A v1 chain binds none.
+    bases: Vec<(PathBuf, [u8; 32])>,
+}
+
+// The base `{bundle}.base` binds, if the capture published that sidecar.
+fn bound(corpus: &Path, bundle: &str) -> Result<Option<Base>> {
+    let sidecar = corpus.join(format!("{bundle}.base"));
+    if !sidecar.try_exists().refuse_at("estate::bound")? {
+        return Ok(None);
+    }
+    Ok(Some(read(&sidecar)?))
+}
+
+// One bound base of a chain, checked as `chain_links` checks a link: it
+// must be in the corpus and, under `Custody`, at its recorded identity.
+fn bind_base(
+    corpus: &Path,
+    base: &Base,
+    binding: LinkBinding,
+    bases: &mut Vec<(PathBuf, [u8; 32])>,
+) -> Result<()> {
+    let path = base_path(corpus, base)?;
+    if !path.try_exists().refuse_at("estate::bind_base")? {
+        return Err(BulkloadRefusal::SealedObjectMissing);
+    }
+    if binding == LinkBinding::Custody && !retained_base(corpus, base)? {
+        return Err(BulkloadRefusal::ReceiptBindingInvalid);
+    }
+    let entry = (path, base.digest);
+    if !bases.contains(&entry) {
+        bases.push(entry);
+    }
+    Ok(())
+}
+
+/// The bundles a chained capture's bundle depends on: its links, oldest
+/// first, and the plan bases they and the head are bound to, each with its
+/// recorded digest. Both are empty for a bundle without a `.prior` sidecar.
 ///
 /// Every link must be retained (and, under [`LinkBinding::Custody`], at its
 /// recorded identity), and depths must fall by exactly one per link to a
@@ -88,17 +131,25 @@ enum LinkBinding {
 /// therefore bounded. Digests and prerequisites are checked when the chain is
 /// flattened.
 ///
+/// **Bound bases (L6b's fix 2).** The head and every link that has a
+/// `.prior` is bound to the base its `.base` sidecar names, if it has one.
+/// The root is bound to its `.base` only when its header declares
+/// prerequisites: a root written self-contained (a shallow source, or a thin
+/// header over the cap) needs no base. Each bound base must be retained
+/// exactly as a link must, so under `Custody` a chain whose base is gone or
+/// replaced is not intact: it is neither a hit nor extended. One group has
+/// one base, so the set has one entry; it has more only when a base record
+/// went missing and a later capture was bound to a new base while its chain
+/// still binds the old one (OI-1003-Q63 D5).
+///
 /// # Errors
-/// `SEALED_OBJECT_MISSING` for a link the corpus no longer holds,
-/// `RECEIPT_BINDING_INVALID` for inconsistent depths or (under `Custody`) a
-/// replaced link, and `PATH_ESCAPES_ROOT` for a link name that is not a
-/// corpus file name.
-fn chain_links(
-    corpus: &Path,
-    bundle: &str,
-    binding: LinkBinding,
-) -> Result<Vec<(PathBuf, [u8; 32])>> {
+/// `SEALED_OBJECT_MISSING` for a link or a bound base the corpus no longer
+/// holds, `RECEIPT_BINDING_INVALID` for inconsistent depths or (under
+/// `Custody`) a replaced link or base, and `PATH_ESCAPES_ROOT` for a link or
+/// base name that is not a corpus file name.
+fn chain_links(corpus: &Path, bundle: &str, binding: LinkBinding) -> Result<Chain> {
     let mut links = Vec::new();
+    let mut bases = Vec::new();
     let mut current = bundle.to_owned();
     let mut expected: Option<u32> = None;
     loop {
@@ -108,9 +159,13 @@ fn chain_links(
             // chained bundle that lost its link breaks the chain. Only an
             // unchained head ends the walk here; a root ends it below.
             return match expected {
-                None => Ok(links),
+                None => Ok(Chain::default()),
                 Some(_) => Err(BulkloadRefusal::ReceiptBindingInvalid),
             };
+        }
+        // `current` is chained: the base it is bound to, if any.
+        if let Some(base) = bound(corpus, &current)? {
+            bind_base(corpus, &base, binding, &mut bases)?;
         }
         let prior: Prior = read(&sidecar)?;
         if prior.depth >= git_carry::chain::CHAIN_DEPTH_LIMIT
@@ -130,7 +185,6 @@ fn chain_links(
         {
             return Err(BulkloadRefusal::ReceiptBindingInvalid);
         }
-        links.push((path, prior.digest));
         if prior.depth == 0 {
             if prior_sidecar(corpus, &prior.bundle)
                 .try_exists()
@@ -138,9 +192,18 @@ fn chain_links(
             {
                 return Err(BulkloadRefusal::ReceiptBindingInvalid);
             }
+            // The root: bound to its base only when it is that base's delta.
+            if let Some(base) = bound(corpus, &prior.bundle)? {
+                if git_carry::shared::requires_base(&path)? {
+                    bind_base(corpus, &base, binding, &mut bases)?;
+                }
+            }
+            links.push((path, prior.digest));
             links.reverse();
-            return Ok(links);
+            bases.reverse();
+            return Ok(Chain { links, bases });
         }
+        links.push((path, prior.digest));
         expected = Some(prior.depth - 1);
         current = prior.bundle;
     }
@@ -149,9 +212,9 @@ fn chain_links(
 /// What the decision core needs to know to chain a new capture onto
 /// `previous` (`decide`): its shape (a chain link, a shared plan base's
 /// delta, or self-contained), whether its chain is intact under
-/// [`LinkBinding::Custody`], and its depth. Whether it chains is the
-/// decision's: never on a broken chain or a based bundle, and only below the
-/// depth limit (the capture at the limit re-bases).
+/// [`LinkBinding::Custody`] (every link and every bound base retained), and
+/// its depth. Whether it chains is the decision's: never on a broken chain,
+/// and only below the depth limit (the capture at the limit re-bases).
 fn chainable(
     corpus: &Path,
     previous: &Capture,
@@ -163,10 +226,11 @@ fn chainable(
     {
         return Ok(
             match chain_links(corpus, &previous.bundle, LinkBinding::Custody) {
-                Ok(links) => (
+                Ok(chain) => (
                     decide::Shape::Chained,
                     true,
-                    u32::try_from(links.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+                    u32::try_from(chain.links.len())
+                        .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
                 ),
                 // A broken chain is neither a hit nor extended.
                 Err(_) => (decide::Shape::Chained, false, 0),
@@ -419,6 +483,50 @@ fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         .refuse_at("estate::write")?
         .sync_dir_counted()
         .refuse_at("estate::write")?;
+    Ok(())
+}
+
+// [`write`] for a record that must never replace another: the temporary
+// file is linked to `path`, which fails if `path` exists, where `write`'s
+// rename would replace it. `RECEIPT_BINDING_INVALID` when `path` exists; it
+// is left as it is.
+fn write_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+    const SITE: &str = "estate::write_new";
+    let bytes = postcard::to_allocvec(value).map_err(|_| BulkloadRefusal::FrameCodec)?;
+    let mut generation = 0u64;
+    let (temporary, mut file) = loop {
+        let temporary = path.with_extension(format!("pending-{generation}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+        {
+            Ok(file) => break (temporary, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                generation = generation
+                    .checked_add(1)
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+            }
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        }
+    };
+    file.write_all(&bytes).refuse_at(SITE)?;
+    file.sync_file_counted().refuse_at(SITE)?;
+    let linked = fs::hard_link(&temporary, path);
+    // The temporary name is this call's own; the record is the link.
+    fs::remove_file(&temporary).refuse_at(SITE)?;
+    match linked {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(BulkloadRefusal::ReceiptBindingInvalid);
+        }
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    }
+    fs::File::open(path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
+        .refuse_at(SITE)?
+        .sync_dir_counted()
+        .refuse_at(SITE)?;
     Ok(())
 }
 
@@ -831,7 +939,7 @@ fn retained_base(corpus: &Path, base: &Base) -> Result<bool> {
 // only the base, so every item of the group refuses
 // `RECEIPT_BINDING_INVALID` (P67 draws every other input of that row).
 fn lost_base() -> BulkloadRefusal {
-    let inputs = decide::Inputs::new(true, decide::BaseState::Lost, decide::Policy::V1);
+    let inputs = decide::Inputs::new(true, decide::BaseState::Lost, decide::Policy::CODE);
     match decide::decide(&inputs) {
         decide::Decision::Refuse(refusal) => refusal.into(),
         decide::Decision::Hit | decide::Decision::Export(_) => {
@@ -888,7 +996,16 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
             &fs::symlink_metadata(published).refuse_at("estate::prepare_base")?,
         ),
     };
-    write(&record, &base)?;
+    #[cfg(test)]
+    git_carry::mid_pass::fire(
+        &fs::canonicalize(&item.source).refuse_at("estate::prepare_base")?,
+        git_carry::mid_pass::Stage::BasePublished,
+    );
+    // Never replace a base record (R-N72): every delta bound to the base it
+    // names depends on it. A record that appeared since the check above was
+    // written by another capture of this corpus; it stands, and this pass
+    // refuses rather than bind its items to a base the record does not name.
+    write_new(&record, &base)?;
     Ok(base)
 }
 
@@ -992,14 +1109,31 @@ fn retained_capture(
     ))
 }
 
-// The base a retained based bundle's `{bundle}.base` names: retained at its
-// recorded identity, or lost.
+// The bases a retained bundle is bound to: none, all retained at their
+// recorded identities, or one lost. A bundle with no `.prior` is bound to
+// the base its own `{bundle}.base` names; a bundle with no such sidecar is
+// bound to none (a v1 chain link, or a self-contained capture). A chained
+// bundle is bound to its own base and to every link's (`chain_links`), and
+// one lost base loses it.
 fn bound_base(corpus: &Path, bundle: &str) -> Result<decide::PrevBase> {
-    let bound: Base = read(&corpus.join(format!("{bundle}.base")))?;
-    Ok(if retained_base(corpus, &bound)? {
-        decide::PrevBase::Retained
-    } else {
-        decide::PrevBase::Lost
+    if prior_sidecar(corpus, bundle)
+        .try_exists()
+        .refuse_at("estate::bound_base")?
+    {
+        return match chain_links(corpus, bundle, LinkBinding::Custody) {
+            Ok(chain) if chain.bases.is_empty() => Ok(decide::PrevBase::None),
+            Ok(_) => Ok(decide::PrevBase::Retained),
+            // A base or a link that is gone or replaced: nothing restores it.
+            Err(BulkloadRefusal::ReceiptBindingInvalid | BulkloadRefusal::SealedObjectMissing) => {
+                Ok(decide::PrevBase::Lost)
+            }
+            Err(refusal) => Err(refusal),
+        };
+    }
+    Ok(match bound(corpus, bundle)? {
+        None => decide::PrevBase::None,
+        Some(base) if retained_base(corpus, &base)? => decide::PrevBase::Retained,
+        Some(_) => decide::PrevBase::Lost,
     })
 }
 
@@ -1168,6 +1302,7 @@ fn decide_capture(
     key: [u8; 32],
     authority: [u8; 32],
     base: Option<&Base>,
+    policy: decide::Policy,
 ) -> Result<(decide::Decision, decide::Inputs, Option<Retained>)> {
     let state = if base.is_some() {
         decide::BaseState::Retained
@@ -1180,7 +1315,7 @@ fn decide_capture(
         parts,
         key,
         authority,
-        decide::Inputs::new(base.is_some(), state, decide::Policy::V1),
+        decide::Inputs::new(base.is_some(), state, policy),
     )?;
     // A hit on a bundle bound to a base needs that base retained. The core
     // asks for it only then, which is only for a held record.
@@ -1199,7 +1334,7 @@ fn capture_item(
     state: &Path,
     corpus: &Path,
     base: Option<&Base>,
-    policy: git_carry::CapturePolicy,
+    (policy, decision): (git_carry::CapturePolicy, decide::Policy),
     owners: &Owners,
     refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
     space: &CorpusSpace<'_>,
@@ -1217,7 +1352,7 @@ fn capture_item(
     let key = parts.digest()?;
     let authority = parts.authority()?;
     let (decision, inputs, retained) =
-        decide_capture(&record, corpus, &parts, key, authority, base)?;
+        decide_capture(&record, corpus, &parts, key, authority, base, decision)?;
     let plan = match decision {
         decide::Decision::Hit => {
             return Ok(Completion::clean("capture-reused-after-census").naming(nested));
@@ -1227,8 +1362,9 @@ fn capture_item(
     };
     let extends = retained.as_ref().is_some_and(|held| held.extends);
     // WP2: pack only what is new since the retained capture, by declaring its
-    // source-held tips as prerequisites, when the plan chains on it.
-    let (link, chain) = chain_offer(corpus, plan, retained.as_ref(), inputs.depth)?;
+    // source-held tips as prerequisites, when the plan chains on it. Under a
+    // plan base too (L6b's fix 2): the writer then declares both.
+    let (link, chain) = chain_offer(corpus, plan, retained.as_ref(), &inputs)?;
     let retained_bundle = retained.as_ref().map(|held| held.bundle.as_path());
     // #101 (OI-1002-Q11): before this item's export writes a byte, charge its
     // estimated bundle to CORPUS. An item that does not fit refuses
@@ -1372,27 +1508,36 @@ fn link_path(corpus: &Path, link: &Prior) -> Result<PathBuf> {
 }
 
 // The link a capture chains onto and its corpus path, as the decision's plan
-// says (WP2): the retained bundle at its own `depth` for a chained basis,
-// none otherwise. A plan v1 cannot carry out refuses
-// CONTRACT_SELF_INCONSISTENT: a chain under a plan base (L6b's fix 2), a
-// re-root on the chain's root (Q46, L8), or a depth that is not one more
-// than the link's.
+// says (WP2): the retained bundle at its own depth for a chained basis,
+// under a plan base or not (L6b's fix 2), none otherwise. A plan the code
+// cannot carry out refuses CONTRACT_SELF_INCONSISTENT: a re-root on the
+// chain's root (Q46, L8), or a depth that is not one more than the link's.
+//
+// One link is never offered: a based bundle (no `.prior`) whose bound base
+// is gone or replaced. The decision does not read a based link's base on
+// this path, and nothing restores that bundle, so a capture chained on it
+// could not restore either. Without the link the writer writes what v1
+// wrote: the plan base's delta, or a self-contained bundle. A chained
+// link's bases are already part of its chain's custody (`chain_links`).
 fn chain_offer(
     corpus: &Path,
     plan: decide::Plan,
     retained: Option<&Retained>,
-    depth: u32,
+    inputs: &decide::Inputs,
 ) -> Result<(Option<Prior>, Option<PathBuf>)> {
+    let depth = inputs.depth;
     let link = match (plan.basis, plan.rebase) {
-        (decide::Basis::BaseAndChain, _) | (_, decide::Rebase::Reroot) => {
+        (_, decide::Rebase::Reroot) => {
             return Err(BulkloadRefusal::ContractSelfInconsistent);
         }
-        (decide::Basis::Chain, _) => {
+        (decide::Basis::Chain | decide::Basis::BaseAndChain, _) => {
             let held = retained.ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
             if depth.checked_add(1) != Some(plan.depth) {
                 return Err(BulkloadRefusal::ContractSelfInconsistent);
             }
-            Some(Prior {
+            let unrestorable = inputs.shape == decide::Shape::Based
+                && bound_base(corpus, &held.previous.bundle)? == decide::PrevBase::Lost;
+            (!unrestorable).then(|| Prior {
                 bundle: held.previous.bundle.clone(),
                 digest: held.previous.digest,
                 identity: held.previous.identity,
@@ -1413,15 +1558,22 @@ fn chain_offer(
 fn publish_prior(corpus: &Path, name: &str, link: Option<&Prior>, chained: bool) -> Result<()> {
     match (link, chained) {
         (Some(link), true) => {
+            // The export reproduced its link byte for byte, so it has the
+            // link's name: nothing the bundle carries moved since (another
+            // item's worktree changed the key), and the link's source-held
+            // tips add nothing to the prerequisites it already declares
+            // (under a plan base they are the base's own commits, L6b's fix
+            // 2). The bundle is the link, and the link's recorded custody
+            // stands: it is never made its own prior.
+            if link.bundle == name {
+                return Ok(());
+            }
             // Identical bundle bytes declare identical prerequisites, so an
             // intact chain already recorded for this name stands as it is.
             let sidecar = prior_sidecar(corpus, name);
             if !(sidecar.try_exists().refuse_at("estate::publish_prior")?
                 && chain_links(corpus, name, LinkBinding::Custody).is_ok())
             {
-                if link.bundle == name {
-                    return Err(BulkloadRefusal::ContractSelfInconsistent);
-                }
                 write(&sidecar, link)?;
             }
             Ok(())
@@ -1647,19 +1799,23 @@ pub fn capture_with_policy(
         state,
         corpus,
         jobs,
-        policy,
+        (policy, decide::Policy::CODE),
         &CorpusSpace::live(corpus),
         receipt,
     )
 }
 
-// [`capture_with_policy`] once both directories exist, against `space`.
+// [`capture_with_policy`] once both directories exist, against `space`,
+// deciding under `decision`. Every caller outside the tests passes the
+// code's one policy, `decide::Policy::CODE` (OI-1003-Q63 D4: no flag); the
+// back-compat tests pass `decide::Policy::V1` to write the corpus a pass
+// from before L6b left.
 fn capture_in(
     plan: &Path,
     state: &Path,
     corpus: &Path,
     jobs: usize,
-    policy: git_carry::CapturePolicy,
+    (policy, decision): (git_carry::CapturePolicy, decide::Policy),
     space: &CorpusSpace<'_>,
     receipt: &(impl Fn(&Receipt) -> Result<()> + Sync),
 ) -> Result<()> {
@@ -1678,7 +1834,7 @@ fn capture_in(
                 state,
                 corpus,
                 base.as_ref(),
-                policy,
+                (policy, decision),
                 &owners,
                 &refused,
                 space,
@@ -1712,6 +1868,30 @@ fn capture_in(
 
 type ImportedBases = Mutex<std::collections::BTreeSet<(PathBuf, [u8; 32])>>;
 
+// A missing corpus file is a typed refusal, never a bare IO errno (S4).
+fn sealed(refusal: BulkloadRefusal) -> BulkloadRefusal {
+    if refusal == BulkloadRefusal::Io(Some(libc::ENOENT)) {
+        BulkloadRefusal::SealedObjectMissing
+    } else {
+        refusal
+    }
+}
+
+// A plan base staged for an import (R-N72): bound by its corpus name and its
+// recorded digest, and self-contained. A base the corpus no longer holds
+// refuses `SEALED_OBJECT_MISSING` (#181), as a missing capture bundle does.
+fn stage_base(corpus: &Path, base: &Base) -> Result<git_carry::StagedBundle> {
+    let path = base_path(corpus, base)?;
+    if !path.try_exists().refuse_at("estate::stage_base")? {
+        return Err(BulkloadRefusal::SealedObjectMissing);
+    }
+    let staged = git_carry::stage_bundle(&path).map_err(sealed)?;
+    if staged.digest() != base.digest || git_carry::shared::requires_base(staged.path())? {
+        return Err(BulkloadRefusal::DigestMismatch);
+    }
+    Ok(staged)
+}
+
 // `bundle` is the staged copy of the capture this apply restores.
 fn import_base(
     item: &Item,
@@ -1724,8 +1904,8 @@ fn import_base(
     if !git_carry::shared::requires_base(bundle)? {
         return Ok(());
     }
-    let base: Base = read(&corpus.join(format!("{}.base", captured.bundle)))?;
-    let path = base_path(corpus, &base)?;
+    // A delta whose `.base` sidecar is gone names no base to import.
+    let base = bound(corpus, &captured.bundle)?.ok_or(BulkloadRefusal::SealedObjectMissing)?;
     // Existing shared repositories are the supported optimization. Creating a
     // standalone destination needs a separate private preseed implementation.
     if !item
@@ -1747,10 +1927,7 @@ fn import_base(
     {
         return Ok(());
     }
-    let staged = git_carry::stage_bundle(&path)?;
-    if staged.digest() != base.digest || git_carry::shared::requires_base(staged.path())? {
-        return Err(BulkloadRefusal::DigestMismatch);
-    }
+    let staged = stage_base(corpus, &base)?;
     git_carry::import_staged(&item.repository, &staged, source)?;
     imported
         .lock()
@@ -1810,13 +1987,7 @@ fn apply_item(
     if !published.try_exists().refuse_at("estate::apply_item")? {
         return Err(BulkloadRefusal::SealedObjectMissing);
     }
-    let staged = git_carry::stage_bundle(&published).map_err(|error| {
-        if error == BulkloadRefusal::Io(Some(libc::ENOENT)) {
-            BulkloadRefusal::SealedObjectMissing
-        } else {
-            error
-        }
-    })?;
+    let staged = git_carry::stage_bundle(&published).map_err(sealed)?;
     if staged.digest() != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
     }
@@ -1827,15 +1998,16 @@ fn apply_item(
         git_carry::refuse_bare_capture(&staged)?;
     }
     // WP2: a chained capture restores from its verified, flattened chain; a
-    // capture on a shared plan base imports that base first.
+    // capture on a shared plan base imports that base first. L6b's fix 2
+    // (R-N72): a chain under a plan base binds every base and every link by
+    // name and digest, and the flatten imports every bound base before the
+    // oldest link.
     let staged = if prior_sidecar(corpus, &captured.bundle)
         .try_exists()
         .refuse_at("estate::apply_item")?
     {
-        git_carry::chain::flatten(
-            staged,
-            &chain_links(corpus, &captured.bundle, LinkBinding::Digest)?,
-        )?
+        let chain = chain_links(corpus, &captured.bundle, LinkBinding::Digest)?;
+        git_carry::chain::flatten(staged, &chain.bases, &chain.links)?
     } else {
         import_base(item, &captured, staged.path(), corpus, source, imported)?;
         staged
@@ -2157,19 +2329,19 @@ fn item_space(item: &Item, corpus: &Path, state: &Path, source: &str) -> Result<
     {
         return Ok(None);
     }
-    // A chained capture lands its whole chain's objects (WP2).
-    let bundle = chain_links(corpus, &captured.bundle, LinkBinding::Digest)?
-        .iter()
-        .try_fold(
-            fs::metadata(corpus.join(&captured.bundle))
-                .refuse_at("estate::item_space")?
-                .len(),
-            |total, (link, _)| {
-                Ok::<_, BulkloadRefusal>(
-                    total.saturating_add(fs::metadata(link).refuse_at("estate::item_space")?.len()),
-                )
-            },
-        )?;
+    // A chained capture lands its whole chain's objects (WP2), and the
+    // objects of every plan base the chain is bound to (L6b's fix 2).
+    let chain = chain_links(corpus, &captured.bundle, LinkBinding::Digest)?;
+    let bundle = chain.links.iter().chain(&chain.bases).try_fold(
+        fs::metadata(corpus.join(&captured.bundle))
+            .refuse_at("estate::item_space")?
+            .len(),
+        |total, (link, _)| {
+            Ok::<_, BulkloadRefusal>(
+                total.saturating_add(fs::metadata(link).refuse_at("estate::item_space")?.len()),
+            )
+        },
+    )?;
     // Objects land in the repository; a checkout lands in the workspace.
     // For a linked worktree those are two places, possibly two filesystems.
     let mut writes = vec![(item.repository.clone(), bundle)];
@@ -5003,7 +5175,7 @@ mod closure_lane_20261002 {
             &state,
             &corpus,
             2,
-            git_carry::CapturePolicy::default(),
+            (git_carry::CapturePolicy::default(), decide::Policy::CODE),
             &space,
             &|row| {
                 rows.lock()
@@ -5439,9 +5611,12 @@ mod wp2_chain {
                 previous = (record.bundle, depth);
             }
             let head = fixture.corpus.join(&previous.0);
+            let chain = chain_links(&fixture.corpus, &previous.0, LinkBinding::Digest).unwrap();
+            assert!(chain.bases.is_empty(), "an ungrouped chain binds no base");
             let flat = git_carry::chain::flatten(
                 git_carry::stage_bundle(&head).unwrap(),
-                &chain_links(&fixture.corpus, &previous.0, LinkBinding::Digest).unwrap(),
+                &chain.bases,
+                &chain.links,
             )
             .unwrap();
             let standalone = git_carry::export_repository_with_policy(
@@ -5692,5 +5867,636 @@ mod wp2_chain {
             vec![Some(BulkloadRefusal::DigestMismatch.to_string())]
         );
         assert!(!fixture.target.exists(), "nothing is restored");
+    }
+}
+
+// Q42 lane L6b, fix 2 (OI-1003-Q62, OI-1003-Q63, R-N72): a grouped item's
+// capture chains on its prior capture under the group's plan base. P68
+// (`tests/git_grouped_chain.rs`) holds the byte bound through the verbs;
+// these tests hold the custody: the bound bases, the base record that is
+// never replaced, the typed refusals, and corpora written before L6b.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
+mod l6b_grouped_chain {
+    use super::*;
+    use std::process::Command;
+
+    fn git(path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "user.name=Bulkload test",
+                "-c",
+                "user.email=test@localhost",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn head_of(repo: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    // Whole-capture reuse needs seats older than one timestamp tick (R-N76).
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_nanos(
+            u64::try_from(git_carry::RACY_GRANULARITY_NS).unwrap() + 100_000_000,
+        ));
+    }
+
+    type Rows = Vec<(&'static str, Option<String>)>;
+
+    struct Fixture {
+        root: PathBuf,
+        /// The main checkout, on `main`.
+        source: PathBuf,
+        /// (source checkout, restore target), one per item: main, then in a
+        /// group the `wt` branch worktree.
+        items: Vec<(PathBuf, PathBuf)>,
+        plan: PathBuf,
+        state: PathBuf,
+        corpus: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    // A main checkout with an `extra` branch one commit off main, and, when
+    // `grouped`, a `wt` branch worktree: two items on one plan base.
+    fn fixture(name: &str, grouped: bool) -> Fixture {
+        let root =
+            std::env::temp_dir().join(format!("tcfs-estate-l6b-{name}-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template=", "-b", "main"]);
+        fs::write(source.join("file"), b"base\n").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        git(&source, &["checkout", "-q", "-b", "extra"]);
+        fs::write(source.join("extra"), b"only on extra\n").unwrap();
+        git(&source, &["add", "extra"]);
+        git(&source, &["commit", "-m", "extra"]);
+        git(&source, &["checkout", "-q", "main"]);
+        let plan = root.join("plan");
+        let mut items = Vec::new();
+        if grouped {
+            let wt = root.join("wt");
+            git(
+                &source,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    "wt",
+                    wt.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            let repository = root.join("repository");
+            fs::create_dir(&repository).unwrap();
+            git(&repository, &["init", "--template="]);
+            for (checkout, target) in [(&source, "target-main"), (&wt, "target-wt")] {
+                let target = root.join(target);
+                add(&plan, checkout, &repository, Some(&target)).unwrap();
+                items.push((checkout.clone(), target));
+            }
+        } else {
+            let target = root.join("target");
+            add(&plan, &source, &target, Some(&target)).unwrap();
+            items.push((source.clone(), target));
+        }
+        Fixture {
+            state: root.join("state"),
+            corpus: root.join("corpus"),
+            source,
+            items,
+            plan,
+            root,
+        }
+    }
+
+    impl Fixture {
+        // One capture pass deciding under `decision`: the code's policy, or
+        // v1's to write the corpus a pass from before L6b left.
+        fn pass(&self, decision: decide::Policy) -> (Result<()>, Rows) {
+            private_directory(&self.state).unwrap();
+            private_directory(&self.corpus).unwrap();
+            let rows = Mutex::new(Vec::new());
+            let result = capture_in(
+                &self.plan,
+                &self.state,
+                &self.corpus,
+                1,
+                (git_carry::CapturePolicy::default(), decision),
+                &CorpusSpace::live(&self.corpus),
+                &|row| {
+                    rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+                    Ok(())
+                },
+            );
+            (result, rows.into_inner().unwrap())
+        }
+
+        fn captured(&self, decision: decide::Policy) {
+            let (result, rows) = self.pass(decision);
+            result.unwrap();
+            assert!(
+                rows.iter().all(|(outcome, _)| *outcome == "captured"),
+                "{rows:?}"
+            );
+        }
+
+        // A commit on main. In a group the ref it moves is every item's, so
+        // every item's key changes.
+        fn commit(&self, round: u32) {
+            fs::write(self.source.join("file"), format!("round {round}\n")).unwrap();
+            git(
+                &self.source,
+                &["commit", "-q", "-am", &format!("round {round}")],
+            );
+        }
+
+        fn record(&self, index: usize) -> Capture {
+            let item = inspect(&self.plan).unwrap().remove(index);
+            read(&self.corpus.join(format!("{}.capture", id(&item).unwrap()))).unwrap()
+        }
+
+        fn prior(&self, bundle: &str) -> Option<Prior> {
+            let sidecar = prior_sidecar(&self.corpus, bundle);
+            sidecar.exists().then(|| read(&sidecar).unwrap())
+        }
+
+        fn apply(&self, state: &str) -> (Result<()>, Rows) {
+            let rows = Mutex::new(Vec::new());
+            let result = apply(
+                &self.plan,
+                &self.corpus,
+                &self.root.join(state),
+                "neo",
+                1,
+                &|row| {
+                    rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+                    Ok(())
+                },
+            );
+            (result, rows.into_inner().unwrap())
+        }
+
+        fn restored(&self, state: &str) {
+            let (result, rows) = self.apply(state);
+            assert!(result.is_ok(), "{result:?}: {rows:?}");
+            for (checkout, target) in &self.items {
+                assert_eq!(head_of(target), head_of(checkout), "{}", target.display());
+                assert_eq!(
+                    fs::read(target.join("file")).unwrap(),
+                    fs::read(checkout.join("file")).unwrap(),
+                    "{}",
+                    target.display()
+                );
+            }
+        }
+
+        // The group's one base record in the corpus.
+        fn base_record(&self) -> PathBuf {
+            let groups = capture_groups(&read::<Plan>(&self.plan).unwrap()).unwrap();
+            assert_eq!(groups.bases.len(), 1);
+            let group = groups.bases.keys().next().unwrap();
+            self.corpus.join(format!("shared-{group}.base"))
+        }
+    }
+
+    // Back-compat: a v1 grouped record is a delta on the plan base alone.
+    // The next changed capture chains on it under the base, at depth 1, and
+    // the restore imports the base, then the v1 bundle, then the head.
+    #[test]
+    fn a_v1_grouped_based_record_chains_under_its_base_on_the_next_changed_capture() {
+        let fixture = fixture("v1-based", true);
+        fixture.captured(decide::Policy::V1);
+        fixture.commit(1);
+        fixture.captured(decide::Policy::V1);
+        let v1: Vec<Capture> = (0..2).map(|index| fixture.record(index)).collect();
+        for record in &v1 {
+            // What v1 wrote: a based bundle with no chain link.
+            assert!(
+                git_carry::shared::requires_base(&fixture.corpus.join(&record.bundle)).unwrap()
+            );
+            assert!(fixture.prior(&record.bundle).is_none());
+            assert!(bound(&fixture.corpus, &record.bundle).unwrap().is_some());
+        }
+        fixture.commit(2);
+        fixture.captured(decide::Policy::CODE);
+        let base: Base = read(&fixture.base_record()).unwrap();
+        for (index, old) in v1.iter().enumerate() {
+            let record = fixture.record(index);
+            let prior = fixture
+                .prior(&record.bundle)
+                .expect("chained on the v1 bundle");
+            assert_eq!(
+                (&prior.bundle, prior.digest, prior.depth),
+                (&old.bundle, old.digest, 0)
+            );
+            let chain = chain_links(&fixture.corpus, &record.bundle, LinkBinding::Digest).unwrap();
+            assert_eq!(
+                chain.links,
+                vec![(fixture.corpus.join(&old.bundle), old.digest)]
+            );
+            assert_eq!(
+                chain.bases,
+                vec![(fixture.corpus.join(&base.bundle), base.digest)]
+            );
+            // The space preflight charges the head, its link and its base.
+            let item = inspect(&fixture.plan).unwrap().remove(index);
+            let (_, bytes) = item_space(&item, &fixture.corpus, &fixture.root.join("none"), "neo")
+                .unwrap()
+                .unwrap();
+            let size = |name: &str| fs::metadata(fixture.corpus.join(name)).unwrap().len();
+            assert_eq!(
+                bytes,
+                size(&record.bundle) + size(&old.bundle) + size(&base.bundle)
+            );
+        }
+        fixture.restored("applied");
+    }
+
+    // Back-compat: a v1 ungrouped chain (`.prior`, no `.base`) is still a
+    // reuse hit under the code's policy, which reads its bound bases and
+    // finds none, and it extends as a plain chain.
+    #[test]
+    fn a_v1_ungrouped_chain_keeps_hitting_and_extends_as_a_plain_chain() {
+        let fixture = fixture("v1-chain", false);
+        fixture.captured(decide::Policy::V1);
+        fixture.commit(1);
+        settle();
+        fixture.captured(decide::Policy::V1);
+        let v1 = fixture.record(0);
+        assert_eq!(fixture.prior(&v1.bundle).map(|prior| prior.depth), Some(0));
+        assert!(bound(&fixture.corpus, &v1.bundle).unwrap().is_none());
+        assert_eq!(
+            bound_base(&fixture.corpus, &v1.bundle).unwrap(),
+            decide::PrevBase::None
+        );
+        let (result, rows) = fixture.pass(decide::Policy::CODE);
+        result.unwrap();
+        assert_eq!(rows, vec![("capture-reused-after-census", None)]);
+        fixture.commit(2);
+        fixture.captured(decide::Policy::CODE);
+        let record = fixture.record(0);
+        let prior = fixture.prior(&record.bundle).expect("chained");
+        assert_eq!((&prior.bundle, prior.depth), (&v1.bundle, 1));
+        assert!(bound(&fixture.corpus, &record.bundle).unwrap().is_none());
+        let chain = chain_links(&fixture.corpus, &record.bundle, LinkBinding::Digest).unwrap();
+        assert_eq!((chain.links.len(), chain.bases.len()), (2, 0));
+        fixture.restored("applied");
+    }
+
+    // Back-compat: v1 records bound to a base that is lost, under a base
+    // record regenerated since, still refuse RECEIPT_BINDING_INVALID while
+    // their key holds, and the records stay (the missing custody is kept
+    // visible). Once the source moves, the next capture is the new base's
+    // delta alone: it never chains on a bundle nothing can restore.
+    #[test]
+    fn v1_records_bound_to_a_lost_base_refuse_and_are_never_chained_on() {
+        let fixture = fixture("v1-lost", true);
+        settle();
+        fixture.captured(decide::Policy::V1);
+        let v1: Vec<Capture> = (0..2).map(|index| fixture.record(index)).collect();
+        let lost = bound(&fixture.corpus, &v1[0].bundle).unwrap().unwrap();
+        fs::rename(fixture.corpus.join(&lost.bundle), fixture.root.join("lost")).unwrap();
+        fs::remove_file(fixture.base_record()).unwrap();
+        let (result, rows) = fixture.pass(decide::Policy::CODE);
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![("refused", Some("RECEIPT_BINDING_INVALID".to_owned())); 2]
+        );
+        for (index, old) in v1.iter().enumerate() {
+            assert_eq!(fixture.record(index).bundle, old.bundle);
+            assert_eq!(
+                bound_base(&fixture.corpus, &old.bundle).unwrap(),
+                decide::PrevBase::Lost
+            );
+        }
+        fixture.commit(1);
+        fixture.captured(decide::Policy::CODE);
+        let regenerated: Base = read(&fixture.base_record()).unwrap();
+        for index in 0..2 {
+            let record = fixture.record(index);
+            assert!(
+                fixture.prior(&record.bundle).is_none(),
+                "never chained on it"
+            );
+            let base = bound(&fixture.corpus, &record.bundle).unwrap().unwrap();
+            assert_eq!(base.bundle, regenerated.bundle);
+        }
+        fixture.restored("applied");
+    }
+
+    // R-N72: a base record is never replaced. A record that appears between
+    // `prepare_base`'s check and its write (another capture of this corpus)
+    // stands byte for byte, and the pass refuses RECEIPT_BINDING_INVALID
+    // rather than bind its items to a base the record does not name.
+    #[test]
+    fn prepare_base_never_replaces_a_record_that_appears_concurrently() {
+        let fixture = fixture("no-replace", true);
+        private_directory(&fixture.corpus).unwrap();
+        let record = fixture.base_record();
+        let other = postcard::to_allocvec(&Base {
+            bundle: "shared-another-capture.bundle".to_owned(),
+            digest: [7; 32],
+            identity: crate::freshness::StatIdentity::from_metadata(
+                &fs::symlink_metadata(&fixture.corpus).unwrap(),
+            ),
+        })
+        .unwrap();
+        // Whichever item prepares the group's base, the record appears just
+        // before its write.
+        for (checkout, _) in &fixture.items {
+            let (record, other) = (record.clone(), other.clone());
+            git_carry::mid_pass::arm_at(
+                checkout,
+                git_carry::mid_pass::Stage::BasePublished,
+                move || {
+                    if !record.exists() {
+                        fs::write(&record, &other).unwrap();
+                    }
+                },
+            );
+        }
+        let (result, rows) = fixture.pass(decide::Policy::CODE);
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![("refused", Some("RECEIPT_BINDING_INVALID".to_owned())); 2]
+        );
+        assert_eq!(fs::read(&record).unwrap(), other, "the record stands");
+        // No pending file is left beside it, and no item was captured.
+        let leftovers: Vec<String> = fs::read_dir(&fixture.corpus)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("pending") || name.ends_with(".capture"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        // The record write itself: a second write to the same path refuses
+        // and leaves the first.
+        let path = fixture.root.join("record");
+        write_new(&path, &1u32).unwrap();
+        assert_eq!(
+            write_new(&path, &2u32).err(),
+            Some(BulkloadRefusal::ReceiptBindingInvalid)
+        );
+        assert_eq!(read::<u32>(&path).unwrap(), 1);
+    }
+
+    // #181, R-N72: a plan base the corpus no longer holds refuses an apply
+    // SEALED_OBJECT_MISSING, never a bare IO errno: for a base's delta
+    // (`import_base`) and for a chain under the base (`chain_links`,
+    // `flatten`). Nothing reaches the destination.
+    #[test]
+    fn a_missing_plan_base_refuses_apply_by_name() {
+        for chained in [false, true] {
+            let fixture = fixture(
+                if chained {
+                    "base-gone-chain"
+                } else {
+                    "base-gone"
+                },
+                true,
+            );
+            fixture.captured(decide::Policy::CODE);
+            if chained {
+                fixture.commit(1);
+                fixture.captured(decide::Policy::CODE);
+            }
+            for index in 0..2 {
+                let record = fixture.record(index);
+                assert_eq!(fixture.prior(&record.bundle).is_some(), chained);
+            }
+            let base: Base = read(&fixture.base_record()).unwrap();
+            let held = fixture.root.join("held-base");
+            fs::rename(fixture.corpus.join(&base.bundle), &held).unwrap();
+            let (result, rows) = fixture.apply("applied");
+            assert!(result.is_err());
+            assert_eq!(
+                rows,
+                vec![("refused", Some("SEALED_OBJECT_MISSING".to_owned())); 2],
+                "chained={chained}"
+            );
+            for (_, target) in &fixture.items {
+                assert!(!target.exists(), "nothing is restored without the base");
+            }
+            // A flatten handed the missing base refuses the same way.
+            if chained {
+                let record = fixture.record(0);
+                let link = fixture.prior(&record.bundle).unwrap();
+                let refused = git_carry::chain::flatten(
+                    git_carry::stage_bundle(&fixture.corpus.join(&record.bundle)).unwrap(),
+                    &[(fixture.corpus.join(&base.bundle), base.digest)],
+                    &[(fixture.corpus.join(&link.bundle), link.digest)],
+                );
+                assert_eq!(refused.err(), Some(BulkloadRefusal::SealedObjectMissing));
+            }
+            fs::rename(&held, fixture.corpus.join(&base.bundle)).unwrap();
+            fixture.restored("applied");
+        }
+    }
+
+    // OI-1003-Q63 D5: the group's base record goes missing while a record
+    // still binds the old base. The next pass exports a new base, as v1
+    // did, and its captures chain on records bound to the old one, so a
+    // chain binds two bases and the restore imports both: the old base
+    // holds a commit the link declares and the new base lacks, and the new
+    // base holds a commit the head declares and the old base lacks.
+    //
+    // Cross-base custody: a flatten given only one of the two refuses, and
+    // once the old base is lost the chain is not intact, so the next
+    // capture is the new base's delta alone.
+    #[test]
+    fn a_chain_bound_to_two_bases_restores_from_both() {
+        let fixture = fixture("two-bases", true);
+        settle();
+        fixture.captured(decide::Policy::CODE);
+        let old: Base = read(&fixture.base_record()).unwrap();
+        let first: Vec<Capture> = (0..2).map(|index| fixture.record(index)).collect();
+        // `extra`'s commit is now only in the old base and the first
+        // captures' prerequisites; main's new commit is only in the new base.
+        git(&fixture.source, &["branch", "-q", "-D", "extra"]);
+        fixture.commit(1);
+        fs::remove_file(fixture.base_record()).unwrap();
+        settle();
+        fixture.captured(decide::Policy::CODE);
+        let new: Base = read(&fixture.base_record()).unwrap();
+        assert_ne!(new.bundle, old.bundle);
+        let bases = vec![
+            (fixture.corpus.join(&old.bundle), old.digest),
+            (fixture.corpus.join(&new.bundle), new.digest),
+        ];
+        for (index, link) in first.iter().enumerate() {
+            let record = fixture.record(index);
+            let prior = fixture
+                .prior(&record.bundle)
+                .expect("chained on the first capture");
+            assert_eq!(prior.bundle, link.bundle);
+            let chain = chain_links(&fixture.corpus, &record.bundle, LinkBinding::Custody).unwrap();
+            assert_eq!(chain.bases, bases, "the link's base, then the head's");
+            assert_eq!(
+                bound_base(&fixture.corpus, &record.bundle).unwrap(),
+                decide::PrevBase::Retained
+            );
+            // Both bases, the link's first: the chain flattens to one
+            // self-contained bundle.
+            let flat = git_carry::chain::flatten(
+                git_carry::stage_bundle(&fixture.corpus.join(&record.bundle)).unwrap(),
+                &chain.bases,
+                &chain.links,
+            )
+            .unwrap();
+            assert!(!git_carry::shared::requires_base(flat.path()).unwrap());
+            // Either base alone leaves a prerequisite unsatisfied.
+            for one in &bases {
+                let refused = git_carry::chain::flatten(
+                    git_carry::stage_bundle(&fixture.corpus.join(&record.bundle)).unwrap(),
+                    std::slice::from_ref(one),
+                    &chain.links,
+                );
+                assert_eq!(
+                    refused.err(),
+                    Some(BulkloadRefusal::GitInventoryMissingPrerequisite),
+                    "{}",
+                    one.0.display()
+                );
+            }
+        }
+        // The old base is lost: every chain that binds it is broken.
+        let held = fixture.root.join("held-old-base");
+        fs::rename(fixture.corpus.join(&old.bundle), &held).unwrap();
+        let chained: Vec<Capture> = (0..2).map(|index| fixture.record(index)).collect();
+        for record in &chained {
+            assert_eq!(
+                chain_links(&fixture.corpus, &record.bundle, LinkBinding::Custody).err(),
+                Some(BulkloadRefusal::SealedObjectMissing)
+            );
+            assert_eq!(
+                bound_base(&fixture.corpus, &record.bundle).unwrap(),
+                decide::PrevBase::Lost
+            );
+        }
+        let (result, rows) = fixture.apply("applied");
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![("refused", Some("SEALED_OBJECT_MISSING".to_owned())); 2]
+        );
+        // Not a hit and not extended: the unchanged source is recaptured as
+        // the new base's delta, which restores.
+        fixture.captured(decide::Policy::CODE);
+        for (index, broken) in chained.iter().enumerate() {
+            let record = fixture.record(index);
+            assert_ne!(record.bundle, broken.bundle);
+            assert!(fixture.prior(&record.bundle).is_none());
+            let base = bound(&fixture.corpus, &record.bundle).unwrap().unwrap();
+            assert_eq!(base.bundle, new.bundle);
+        }
+        fixture.restored("applied");
+    }
+
+    // OI-1003-Q63 D1 (#149): a drift-marked bundle may be a chain link. The
+    // pass after a drifted capture extends it clean, chained on the drifted
+    // bundle under the plan base: only that bundle's source-held tips become
+    // prerequisites, so the head re-packs every seat the drifted pass
+    // withdrew, and the flattened restore advertises exactly the head's
+    // refs, none of the link's drift markers.
+    #[test]
+    fn a_drift_marked_bundle_may_be_a_chain_link_under_the_plan_base() {
+        let fixture = fixture("drift-link", true);
+        let inside = fs::canonicalize(&fixture.source).unwrap();
+        git_carry::mid_pass::arm(&fixture.source, move || {
+            fs::write(inside.join("file"), b"rewritten mid-pass\n").unwrap();
+            fs::write(inside.join("appeared"), b"new seat\n").unwrap();
+        });
+        let outcomes = |rows: &Rows| rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        let (result, rows) = fixture.pass(decide::Policy::CODE);
+        result.unwrap();
+        assert!(outcomes(&rows).contains(&"captured-with-drift"), "{rows:?}");
+        let drifted = fixture.record(0);
+        assert!(fixture
+            .corpus
+            .join(format!("{}.drift", drifted.bundle))
+            .is_file());
+        let (result, rows) = fixture.pass(decide::Policy::CODE);
+        result.unwrap();
+        assert!(
+            outcomes(&rows).contains(&"capture-extended-from-drift"),
+            "{rows:?}"
+        );
+        let record = fixture.record(0);
+        let prior = fixture
+            .prior(&record.bundle)
+            .expect("chained on the drifted bundle");
+        assert_eq!((&prior.bundle, prior.depth), (&drifted.bundle, 0));
+        assert!(bound(&fixture.corpus, &record.bundle).unwrap().is_some());
+        assert!(fixture
+            .corpus
+            .join(format!("{}.drift", prior.bundle))
+            .is_file());
+        fixture.restored("applied");
+        let target = &fixture.items[0].1;
+        assert_eq!(
+            fs::read(target.join("file")).unwrap(),
+            b"rewritten mid-pass\n"
+        );
+        assert_eq!(fs::read(target.join("appeared")).unwrap(), b"new seat\n");
+    }
+
+    // #183 item 2: a corpus named by a relative path flattens. The scratch
+    // directory is made beside the canonical corpus, so the paths this
+    // process writes and the paths its git children read (from that
+    // directory) are the same files.
+    #[test]
+    fn a_chain_in_a_relative_corpus_path_flattens() {
+        let fixture = fixture("relative", false);
+        fixture.captured(decide::Policy::CODE);
+        fixture.commit(1);
+        fixture.captured(decide::Policy::CODE);
+        let record = fixture.record(0);
+        // The corpus relative to the working directory, without changing it.
+        let here = std::env::current_dir().unwrap();
+        let mut relative: PathBuf = here.components().skip(1).map(|_| "..").collect();
+        relative.extend(
+            fs::canonicalize(&fixture.corpus)
+                .unwrap()
+                .components()
+                .skip(1),
+        );
+        assert!(relative.is_relative());
+        let chain = chain_links(&relative, &record.bundle, LinkBinding::Digest).unwrap();
+        assert_eq!(chain.links.len(), 1);
+        assert!(chain.links[0].0.is_relative());
+        let flat = git_carry::chain::flatten(
+            git_carry::stage_bundle(&relative.join(&record.bundle)).unwrap(),
+            &chain.bases,
+            &chain.links,
+        )
+        .unwrap();
+        assert!(!git_carry::shared::requires_base(flat.path()).unwrap());
     }
 }
