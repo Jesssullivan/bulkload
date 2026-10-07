@@ -161,6 +161,14 @@ matched their expectation: 22 PASS, 8 REACHED, 38 FAIL, 1 SIMULATION,
 row's never-enabled actions equalled its `never` column. No row needed a
 second run. The rows' wall times sum to 1,155 s; peak RSS 2,127 MiB.**
 
+The whole recipe ran once more after the merge of main `8006085` (#202,
+which changed the justfile and nothing under `docs/formal`), 2026-10-07
+09:52 to 10:10 EDT for BulkloadTransfer's rows, at a load average near 17.
+All 70 rows matched again, with no row run twice, and every pass row's
+distinct and generated counts and diameter equalled the table's. Fail and
+reach rows stop at their first violation with 3 workers, so their counts
+differed a little, as they do between any two runs.
+
 What moved against the run before it (56 rows, 2026-10-06 23:38 to 23:54
 EDT, the #186/#187 revision, 881 s, peak RSS 1,976 MiB; superseded):
 
