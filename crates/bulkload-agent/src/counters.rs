@@ -35,16 +35,27 @@
 //! commit counters count successful commits only.
 //!
 //! Git children (`git bundle create`, `git pack-objects`) that pack a
-//! capture's objects from the source object store are measured from the
+//! capture's objects from the source object store, and the fetch that
+//! completes a retained capture for blob reuse, are measured from the
 //! child's own resource usage, collected by `wait4` when it exits:
 //! `read_source_pack_readback_bytes` is `ru_inblock` x 512. On Linux that is
 //! exactly the child's `/proc/<pid>/io` `read_bytes` (storage reads, 512-byte
 //! units). On Darwin `ru_inblock` counts block input operations, not sectors,
 //! so x 512 is a **lower bound**. On both, reads served from the page cache
 //! and mmap'd pack windows already resident are invisible: the counter is a
-//! lower bound on what the child read, never an over-count. The logical
-//! measure is `write_source_pack_bytes` and `write_source_pack_objects`: every
-//! object in a capture pack was read from an object store to be written.
+//! lower bound on what the child read, never an over-count.
+//!
+//! The logical measure is `write_source_pack_bytes` and
+//! `write_source_pack_objects`: every object in a capture pack was read from
+//! an object store to be written. That bounds a self-contained pack's reads,
+//! not a thin one's. A grouped item or a chained link (OI-1003-Q42) deltas
+//! against preferred bases its prerequisites hold: each base is read to
+//! delta against and never written, so for those captures
+//! `write_source_pack_bytes` counts the pack, not what packing read. The next
+//! pass's reuse fetch of such a capture completes it with `index-pack
+//! --fix-thin`, reading every base from the source object store:
+//! `read_source_capture_reuse_bytes` counts those bases (the written pack's
+//! growth) beside the bundle's length.
 //!
 //! Every counter is incremented by production code; a declared counter
 //! nothing increments would read as a measured zero, so the
@@ -52,6 +63,33 @@
 //! pack-store era's `read_other_chunk`, `write_dest_pack`,
 //! `write_legacy_chunk`, `blake3_capture_file`, `blake3_store_read_verify`
 //! and `blake3_legacy_put` were removed for that reason).
+//!
+//! `source_wal_index_touched` counts the provider `SQLite` snapshots that
+//! touched their source's wal-index (`<db>-shm`): the first of S2's two stated
+//! source writes (OI-1003-Q36, which extends OI-1003-Q16). A backup-API read of a
+//! WAL-mode source is WAL-aware: it opens the wal-index read-write, maps it
+//! shared and takes `fcntl` locks on it. It creates the file when no live
+//! connection has, and rebuilds it when none holds it; beside a live writer
+//! it often leaves every byte as it was. "Touched" covers all of these. Each
+//! WAL-aware snapshot adds 1 when a `-shm` sits beside its source after the
+//! read, whether or not the file's bytes or metadata moved, so 0 means no
+//! snapshot opened a source wal-index. It is an upper bound in two corners,
+//! where `SQLite` never opens the `-shm` that is counted: a rollback-journal
+//! database with a stray `-shm` beside it, and a snapshot refused before its
+//! first read of the source.
+//!
+//! `source_wal_created` counts the provider `SQLite` snapshots that left a
+//! `-wal` beside a source that had none: S2's second stated source write
+//! (OI-1003-Q72, which extends OI-1003-Q36 to the empty `-wal`). A WAL-aware
+//! open of a WAL-mode database with no `-wal` (checkpointed and closed, or
+//! opened by a writer that has not read it yet) creates a zero-byte one.
+//! Each snapshot adds 1 when no `-wal` sat beside its source before the read
+//! and one does after it, so the same source adds 1 once and 0 on later
+//! snapshots while that file stays. The read-only connection cannot append a
+//! frame, so the file it creates is empty; a writer that arrives during the
+//! read and creates the `-wal` itself is counted too, which makes the counter
+//! an upper bound and never an undercount. The main database, and a `-wal`
+//! that existed before the read, are never written (P75).
 //!
 //! Not counted as flushes: syncs done by child processes. `git` children
 //! spawned by the Git carry verbs flush on their own, so the flush counters
@@ -91,10 +129,12 @@ counters! {
     // Bytes read, by stage.
     SourceFileRead => "read_source_file_bytes",
     // Retained capture bundles a Git capture fetched to reuse their blobs
-    // (logical: the bundle's length per fetch).
+    // (logical: the bundle's length per fetch, plus the delta bases a thin
+    // bundle's fetch read from the source object store to complete it).
     SourceCaptureReuseRead => "read_source_capture_reuse_bytes",
-    // Storage reads by the git children that pack a capture's objects (see
-    // the module notes: a lower bound, page-cache hits are invisible).
+    // Storage reads by the git children that pack a capture's objects or
+    // complete a retained one for reuse (see the module notes: a lower
+    // bound, page-cache hits are invisible).
     SourcePackReadback => "read_source_pack_readback_bytes",
     DestLocalReuseRead => "read_dest_local_reuse_bytes",
     DestVerifyRead => "read_dest_verify_existing_bytes",
@@ -154,8 +194,23 @@ counters! {
     // deleted on its first open by this engine (#125): each costs one source
     // read of its seat.
     TransferLegacyRowsInvalidated => "transfer_legacy_rows_invalidated",
+    // R25's strict reading (#169): outputs a crash left durable with no row,
+    // adopted on resume from their capture record without a source read;
+    // existing outputs with no matching row that no record proved, each
+    // asked for by manifest (a source read) as before; and staged files whose
+    // capture record could not be written (no extended attributes).
+    TransferUnrowedAdopted => "transfer_unrowed_adopted",
+    TransferUnrowedUnproven => "transfer_unrowed_unproven",
+    TransferCaptureRecordsUnset => "transfer_capture_records_unset",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
+    // Provider `SQLite` snapshots whose WAL-aware read left a wal-index
+    // (`<db>-shm`) beside its source, changed or not: a stated S2 source
+    // write (OI-1003-Q36).
+    SourceWalIndexTouched => "source_wal_index_touched",
+    // Provider `SQLite` snapshots that left a `-wal` beside a source that had
+    // none: the empty `-wal` a WAL-aware open creates (OI-1003-Q72).
+    SourceWalCreated => "source_wal_created",
 }
 
 const COUNT: usize = Counter::ALL.len();

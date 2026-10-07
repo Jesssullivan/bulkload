@@ -20,6 +20,16 @@ const CUSTODY: &str = "refs/carry-export/shallow-custody-v1";
 /// the custody commit, so `bundle list-heads` shows the drift without the
 /// pack ever being fetched; `unpack` refuses any envelope carrying it.
 pub(super) const DRIFT_MARKER: &str = "refs/carry-export/shallow-drift-v1";
+/// Set on a shallow envelope whose capture is of a bare repository (S4,
+/// #162). It names the custody commit, so a staged bundle shows a bare
+/// capture without the pack ever being fetched, and every verb that lays down
+/// a workspace refuses it up front. `unpack` checks it against the inner
+/// inventory, which is the truth.
+pub(super) const BARE_MARKER: &str = "refs/carry-export/shallow-bare-v1";
+/// The most bytes an envelope's manifest (frontier, inner inventory, pack
+/// name) may hold. The writer measures it before it writes the envelope and
+/// the reader refuses a larger one, both `GIT_INVENTORY_OVER_CAP` (#178).
+const MANIFEST_CAP: u64 = 16 * 1024 * 1024;
 
 pub(super) fn frontier(repository: &Path) -> Result<Vec<u8>> {
     let path = text(git(repository).args([
@@ -55,6 +65,10 @@ pub(super) fn write_bundle(
     boundary: &[u8],
 ) -> Result<super::shared::PackStats> {
     validate_frontier(boundary)?;
+    // The inner inventory is read before the pack is written, so an envelope
+    // whose manifest could not fit refuses before any byte of it.
+    let inventory = refs(private)?;
+    over_manifest_cap(boundary.len().saturating_add(inventory.len()))?;
     let parent = bundle.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
     let pack = bundle.with_extension("objects.pack");
     let file = fs::OpenOptions::new()
@@ -94,9 +108,9 @@ pub(super) fn write_bundle(
             .args(["hash-object", "-w", "--no-filters", "--"])
             .arg(&pack),
     )?;
-    let inventory = refs(private)?;
     let manifest = postcard::to_allocvec(&(boundary, &inventory, &pack_oid))
         .map_err(|_| BulkloadRefusal::FrameCodec)?;
+    over_manifest_cap(manifest.len())?;
     // A metadata commit must actually reference the raw-pack blob so ordinary
     // bundle traversal carries it, without traversing the shallow source graph.
     let value = input(
@@ -113,7 +127,12 @@ pub(super) fn write_bundle(
     let tree = std::str::from_utf8(&tree)
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
         .trim();
-    let custody = super::commit_tree(&envelope, tree, "bulkload explicit shallow graph custody")?;
+    // The envelope borrows no store, so its own store is already private.
+    let custody = super::commit_object(
+        &mut git(&envelope),
+        tree,
+        "bulkload explicit shallow graph custody",
+    )?;
     super::set_ref(&envelope, CUSTODY, &custody)?;
     let mut create = git(&envelope);
     create.args(["bundle", "create"]).arg(bundle).arg(CUSTODY);
@@ -123,8 +142,21 @@ pub(super) fn write_bundle(
         super::set_ref(&envelope, DRIFT_MARKER, &custody)?;
         create.arg(DRIFT_MARKER);
     }
+    // So is the bare marker (S4, #162).
+    if super::bare_marked(&inventory) {
+        super::set_ref(&envelope, BARE_MARKER, &custody)?;
+        create.arg(BARE_MARKER);
+    }
     output(&mut create)?;
     Ok(stats)
+}
+
+// Refuse a manifest of `length` bytes that its reader would refuse.
+fn over_manifest_cap(length: usize) -> Result<()> {
+    if u64::try_from(length).map_or(true, |length| length > MANIFEST_CAP) {
+        return Err(BulkloadRefusal::GitInventoryOverCap);
+    }
+    Ok(())
 }
 
 fn custody_oid(heads: &str) -> Option<&str> {
@@ -153,7 +185,12 @@ fn custody_manifest(repository: &Path, value: &str) -> Result<(Vec<u8>, String, 
     let object = text(git(repository).args(["rev-parse", &format!("{value}:value")]))?;
     let mut reader = super::batch_objects::BatchObjects::new(repository)?;
     let mut bytes = Vec::new();
-    reader.copy_into(&object, &mut bytes, Some(16 * 1024 * 1024))?;
+    reader
+        .copy_into(&object, &mut bytes, Some(MANIFEST_CAP))
+        .map_err(|error| match error {
+            BulkloadRefusal::BudgetExceeded => BulkloadRefusal::GitInventoryOverCap,
+            other => other,
+        })?;
     reader.finish()?;
     postcard::from_bytes(&bytes).map_err(|_| BulkloadRefusal::FrameCodec)
 }
@@ -186,7 +223,10 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
     let Some(value) = custody_oid(heads) else {
         return Ok(None);
     };
-    if !oid(value) || heads.lines().count() != 1 {
+    // The custody ref, and at most the bare marker naming the same commit.
+    let bare = format!("{value} {BARE_MARKER}");
+    let lifted = heads.lines().any(|line| line == bare);
+    if !oid(value) || heads.lines().count() != 1 + usize::from(lifted) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     ensure_custody_objects(repository, bundle, value)?;
@@ -196,6 +236,10 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
     // it, still refuses here, before its pack is indexed (round-4 R1).
     if super::drift_marked(&inventory) {
         return Err(BulkloadRefusal::CaptureDrifted);
+    }
+    // The bare marker in the headers must be exactly the inner inventory's.
+    if lifted != super::bare_marked(&inventory) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     validate_frontier(&boundary)?;
     if boundary.is_empty() || !oid(&pack_oid) {
@@ -208,7 +252,9 @@ pub(super) fn unpack(repository: &Path, bundle: &Path, heads: &str) -> Result<Op
         let (object, name) = line
             .split_once(' ')
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        if !oid(object) || !name.starts_with("refs/carry-export/") {
+        // An exported name, or the ref table (OI-1003-Q54), which a reader
+        // before the table refuses here: the format's marker.
+        if !oid(object) || !super::ref_table::carried_name(name) {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         output(git(repository).args(["check-ref-format", name]))?;

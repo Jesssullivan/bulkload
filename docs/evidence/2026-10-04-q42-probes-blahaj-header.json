@@ -1,0 +1,67 @@
+{
+  "distinct_oids": 2382,
+  "distinct_tip_commits": 2378,
+  "headroom_bytes": -7662244,
+  "max_ref_line": 244,
+  "mean_ref_line": 198.704,
+  "measured_utc": "2026-10-05T04:38:26Z",
+  "min_ref_line": 70,
+  "modelled_header_bytes": 24439460,
+  "object_format": "sha1",
+  "over_cap": true,
+  "prerequisite_bytes_if_all_tip_commits": 128412,
+  "prerequisite_bytes_if_all_tips": 128628,
+  "ref_line_bytes": 24439443,
+  "refs": 122994,
+  "refs_at_cap_at_this_mean": 84432,
+  "repo": "/srv/fast-local/jess/git/blahaj",
+  "script": {
+    "blob": "90f21a96e61b450d87cf85b1276204bf5eee0d10",
+    "file": "q42_probes.py",
+    "head": "6511892be39cd23adadc7ca8849ded793186fd82",
+    "last_commit": "6511892be39cd23adadc7ca8849ded793186fd82",
+    "matches_head": true,
+    "selftest_sha256": "9c3f90c518cc04bd067bd3e9a596c71a007e5c815702927b4ad9e69dd20e9cd0",
+    "sha256": "0a907bc0f33514f06d36b0bee655e694df514620fe86bdfa831d73ea1b44954f"
+  },
+  "shape": {
+    "distinct_slugs": 4,
+    "other_mean_line": 113.074,
+    "other_refs": 3233,
+    "slugs": {
+      "neo": {
+        "refs": 7305,
+        "slug_bytes": 3
+      },
+      "neo-20260922-c1": {
+        "refs": 766,
+        "slug_bytes": 15
+      },
+      "neo-20260922-c2a": {
+        "refs": 110160,
+        "slug_bytes": 16
+      },
+      "neo-20260922-c3": {
+        "refs": 1530,
+        "slug_bytes": 15
+      }
+    },
+    "suffix_bytes": {
+      "max": 93.0,
+      "median": 53.0,
+      "min": 4.0,
+      "n": 119761
+    },
+    "suffix_bytes_mean": 50.828,
+    "target_types": {
+      "commit": 118568,
+      "tag": 4424,
+      "tree": 2
+    },
+    "union_formula_check": 0,
+    "union_line_bytes": 24073875,
+    "union_mapped_refs": 119761
+  },
+  "signature_and_blank_bytes": 17,
+  "union_mapped_refs": 119761
+}

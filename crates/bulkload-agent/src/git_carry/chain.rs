@@ -53,8 +53,9 @@ use crate::{BulkloadRefusal, Result};
 pub const CHAIN_DEPTH_LIMIT: u32 = 8;
 
 /// Refs a bundle advertises (`<oid> <refname>` header lines), in header order.
-/// Only the header is read: no pack byte is fetched.
-fn advertised(bundle: &Path) -> Result<Vec<(String, String)>> {
+/// Only the header is read: no pack byte is fetched. A header over
+/// [`shared::HEADER_CAP`] refuses `GIT_INVENTORY_OVER_CAP`.
+pub(super) fn advertised(bundle: &Path) -> Result<Vec<(String, String)>> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -76,7 +77,10 @@ fn advertised(bundle: &Path) -> Result<Vec<(String, String)>> {
         consumed = consumed
             .checked_add(count)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
-        if count == 0 || !line.ends_with(b"\n") || consumed > 16 * 1024 * 1024 {
+        if consumed > shared::HEADER_CAP {
+            return Err(BulkloadRefusal::GitInventoryOverCap);
+        }
+        if count == 0 || !line.ends_with(b"\n") {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         if line == b"\n" {
@@ -248,12 +252,15 @@ pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<Stag
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     let digest = head.digest();
+    // The flattened refs are exactly `head`'s, so is its bare marker.
+    let bare = head.bare;
     // The head's own stage is no longer read; remove it now.
     drop(head);
     Ok(StagedBundle {
         _directory: directory,
         bundle: flat,
         digest,
+        bare,
     })
 }
 

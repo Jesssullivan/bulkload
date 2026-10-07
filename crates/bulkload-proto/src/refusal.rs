@@ -2,7 +2,7 @@
 //!
 //! Each variant has a stable machine-readable code, and variants are grouped
 //! into families by prefix: `Snapshot*`, `Capture*`, `Digest*`, `Git*`,
-//! `Sqlite*`, `Path*`, `Journal*`, `Protocol*` and `Budget*`.
+//! `Sqlite*`, `Path*`, `Protocol*` and `Budget*`.
 //!
 //! Every variant has at least one constructor outside test code
 //! (`crates/bulkload-agent/tests/refusal_taxonomy.rs`, WP3): a code nothing
@@ -90,6 +90,26 @@ pub enum BulkloadRefusal {
     /// byte is laid down. Intent-to-add entries of a captured checkout are
     /// otherwise carried as index custody.
     GitInventoryIntentToAdd,
+    /// A non-bare repository has no index file (S4, #162): a `--no-checkout`
+    /// clone or worktree. Git reads the absent file as an unborn index, which
+    /// a plain `git checkout` populates as an initial checkout; an empty index
+    /// file does not, so no carried index can restore this state. Capture
+    /// refuses rather than lay down a checkout whose every HEAD path is a
+    /// staged deletion.
+    GitInventoryIndexAbsent,
+    /// A Git inventory is well formed but larger than a carry size bound
+    /// (OI-1003-Q54, #178): a v1 bundle header over its 16 MiB cap, a ref
+    /// table over its bound, or a shallow envelope's manifest over its cap.
+    /// Writers check before they write, so no capture is recorded that a
+    /// later reader refuses for size; a reader meeting one refuses here, not
+    /// `GIT_INVENTORY_MALFORMED`. The disposition is the inventory's size
+    /// (most often the distinct objects its refs name), not corruption.
+    GitInventoryOverCap,
+    /// A capture of a bare repository (ref custody only, with no worktree)
+    /// was asked to lay down a workspace: a restore, a linked worktree, an
+    /// attachment or an index repair (S4, #162). Refused before anything is
+    /// written; such an item imports its refs, planned without a workspace.
+    GitBareCaptureWorkspace,
     /// The git destination already exists or is non-empty.
     GitDestinationOccupied,
     /// Captured and destination Git ignore policies differ.
@@ -130,11 +150,6 @@ pub enum BulkloadRefusal {
     /// A destination's refs do not prove it holds their history: it is a
     /// partial clone, or shallow at a frontier other than the source's (R-N75).
     GitHavesUnprovable,
-    /// A Git destination's object store or common dir is on a filesystem
-    /// the ingest does not support: a network filesystem (NFS, SMB, `WebDAV`
-    /// and the like), where its `flock` locks cannot be trusted. Ingest
-    /// destinations must be local filesystems (operator ruling OI-1001-Q17).
-    GitDestinationFilesystemUnsupported,
     /// A Git source is a partial clone (a promisor remote, a partial-clone
     /// filter, `extensions.partialClone`, or a `.promisor` pack in its object
     /// store or an alternate). Reading it could fault in a lazy fetch, so v1
@@ -155,10 +170,12 @@ pub enum BulkloadRefusal {
     /// The `SQLite` online backup (open, step or finish) failed (WP3).
     /// Carries `SQLite`'s extended result code when `SQLite` reported one.
     SqliteBackupFailed(Option<i32>),
-
-    // ---- journal -----------------------------------------------------------
-    /// An existing journal belongs to a different transaction.
-    JournalOwnershipConflict,
+    /// A provider verb that reads a source database was run with effective
+    /// uid 0 (S2, OI-1003-Q76). Opened as root, `SQLite` re-applies the
+    /// database's ownership to its `-wal` (`fchown`), which moves the
+    /// `-wal`'s ctime: a source metadata write no ruling admits. The verb
+    /// refuses before it opens anything; run it as the database's owner.
+    SqliteSourceAsRoot,
 
     // ---- budgets / transport ------------------------------------------------
     /// A capture, row, or spill budget was exceeded.
@@ -225,6 +242,9 @@ impl BulkloadRefusal {
             Self::GitInventoryMalformed => "GIT_INVENTORY_MALFORMED",
             Self::GitInventoryMissingPrerequisite => "GIT_INVENTORY_MISSING_PREREQUISITE",
             Self::GitInventoryIntentToAdd => "GIT_INVENTORY_INTENT_TO_ADD",
+            Self::GitInventoryIndexAbsent => "GIT_INVENTORY_INDEX_ABSENT",
+            Self::GitInventoryOverCap => "GIT_INVENTORY_OVER_CAP",
+            Self::GitBareCaptureWorkspace => "GIT_BARE_CAPTURE_WORKSPACE",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
             Self::GitDestinationParentMissing => "GIT_DESTINATION_PARENT_MISSING",
@@ -236,14 +256,13 @@ impl BulkloadRefusal {
             Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
-            Self::GitDestinationFilesystemUnsupported => "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
             Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
             Self::GitChildFailed(_) => "GIT_CHILD_FAILED",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
             Self::SqliteBackupFailed(_) => "SQLITE_BACKUP_FAILED",
-            Self::JournalOwnershipConflict => "JOURNAL_OWNERSHIP_CONFLICT",
+            Self::SqliteSourceAsRoot => "SQLITE_SOURCE_AS_ROOT",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
@@ -283,6 +302,9 @@ impl BulkloadRefusal {
         "GIT_INVENTORY_MALFORMED",
         "GIT_INVENTORY_MISSING_PREREQUISITE",
         "GIT_INVENTORY_INTENT_TO_ADD",
+        "GIT_INVENTORY_INDEX_ABSENT",
+        "GIT_INVENTORY_OVER_CAP",
+        "GIT_BARE_CAPTURE_WORKSPACE",
         "GIT_DESTINATION_OCCUPIED",
         "GIT_IGNORE_POLICY_CONFLICT",
         "GIT_DESTINATION_PARENT_MISSING",
@@ -294,14 +316,13 @@ impl BulkloadRefusal {
         "GIT_NEST_CARRIER_REFUSED",
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
-        "GIT_DESTINATION_FILESYSTEM_UNSUPPORTED",
         "GIT_SOURCE_PARTIAL_CLONE",
         "GIT_CHILD_FAILED",
         "SQLITE_INTEGRITY_CHECK_FAILED",
         "SQLITE_UNSUPPORTED_VALUE",
         "SQLITE_STATE_CHANGED",
         "SQLITE_BACKUP_FAILED",
-        "JOURNAL_OWNERSHIP_CONFLICT",
+        "SQLITE_SOURCE_AS_ROOT",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
         "SALVAGE_BOUND_EXCEEDED",
@@ -486,6 +507,9 @@ mod tests {
             BulkloadRefusal::GitInventoryMalformed,
             BulkloadRefusal::GitInventoryMissingPrerequisite,
             BulkloadRefusal::GitInventoryIntentToAdd,
+            BulkloadRefusal::GitInventoryIndexAbsent,
+            BulkloadRefusal::GitInventoryOverCap,
+            BulkloadRefusal::GitBareCaptureWorkspace,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitIgnorePolicyConflict,
             BulkloadRefusal::GitDestinationParentMissing,
@@ -497,14 +521,13 @@ mod tests {
             BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
-            BulkloadRefusal::GitDestinationFilesystemUnsupported,
             BulkloadRefusal::GitSourcePartialClone,
             BulkloadRefusal::GitChildFailed(StderrClass::Other),
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,
             BulkloadRefusal::SqliteBackupFailed(None),
-            BulkloadRefusal::JournalOwnershipConflict,
+            BulkloadRefusal::SqliteSourceAsRoot,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::SalvageBoundExceeded,

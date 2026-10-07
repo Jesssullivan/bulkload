@@ -421,11 +421,6 @@ const IO_NONE_ALLOWLIST: &[(&str, usize)] = &[
     ("crates/bulkload-agent/src/freshness.rs", 2),
     ("crates/bulkload-agent/src/git_carry.rs", 1),
     ("crates/bulkload-agent/src/git_carry/batch_objects.rs", 3),
-    ("crates/bulkload-agent/src/git_carry/carry_v2.rs", 3),
-    ("crates/bulkload-agent/src/git_carry/carry_v2/ingest.rs", 5),
-    ("crates/bulkload-agent/src/git_carry/carry_v2/journal.rs", 2),
-    ("crates/bulkload-agent/src/git_carry/carry_v2/lists.rs", 1),
-    ("crates/bulkload-agent/src/git_carry/carry_v2/send.rs", 2),
     ("crates/bulkload-agent/src/git_carry/estimate.rs", 5),
     (
         "crates/bulkload-agent/src/git_carry/estimate/stderr_store.rs",

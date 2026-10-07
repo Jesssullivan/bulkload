@@ -1,42 +1,65 @@
 //! Closure report (OI-1001-Q2): bulkload's own completion gate for an
-//! estate apply.
+//! estate apply, and the S4 proof surface (OI-1003-Q1, WP3 PR 3).
 //!
-//! Every planned item must end in exactly one of three dispositions, read
-//! from the run's durable ledger (outcome records and apply journals, see
-//! [`crate::estate::ledger`]):
+//! Every planned item must end in exactly one of these dispositions, read
+//! from the run's durable ledger (typed outcome records and apply journals,
+//! see [`crate::estate::ledger`] and [`crate::outcome`]). Classification
+//! matches on the typed [`Outcome`], never on strings:
 //!
 //! - `applied`: the item plans a workspace, its outcome is
-//!   `workspace-restored` (or a re-apply's
-//!   `previous-workspace-restoration-not-revalidated`), and the exact
-//!   journal for its current capture and SOURCE says `workspace-restored`.
-//! - `refused`: the outcome is `refused` and its reason begins with a typed
-//!   refusal code. A bare `IO` or `FRAME_CODEC` names no cause, so it is
-//!   not typed enough to close an item.
+//!   `WorkspaceRestored` (or a re-apply's
+//!   `PreviousWorkspaceRestorationNotRevalidated`), and the exact journal for
+//!   its current capture and SOURCE says `workspace-restored`.
+//! - `refused-pending-review`: the outcome is a typed refusal (any taxonomy
+//!   code but `IO` and `FRAME_CODEC`) that no review disposes yet. The item
+//!   is accounted for natively, but the run is not complete (S4).
+//! - `refused`: such a refusal, disposed by a row of the disposition ledger
+//!   ([`crate::disposition`]): accept, re-carry or abandon. An item row
+//!   disposes only the refusal instance it was made against ([`instance`]);
+//!   a standing policy disposes every refusal with its code.
 //! - `referenced-only`: the item plans no workspace, its outcome is
-//!   `refs-imported` (or `previous-ref-custody-not-workspace-parity`, or
-//!   `index-repaired` from `git-repair-missing-index` with a state directory,
+//!   `RefsImported` (or `PreviousRefCustodyNotWorkspaceParity`, or
+//!   `IndexRepaired` from `git-repair-missing-index` with a state directory,
 //!   #95), and the exact current-capture journal says `refs-imported`. The
 //!   refs are held; no working bytes were laid down, and none were planned.
 //!
 //! Anything else is `unaccounted`: no outcome record, an unreadable record,
-//! a record naming another source, an untyped refusal, an outcome that does
-//! not match whether the item plans a workspace, a missing or mismatched
-//! current-capture journal (a stale journal from an earlier capture proves
-//! nothing), or an outcome that is not an apply outcome at all. The native
-//! `verdict` passes only when `unaccounted` is 0.
+//! a record naming another source, a bare `IO` or `FRAME_CODEC` refusal (it
+//! names no cause), a refusal whose code has left the taxonomy
+//! (`refusal-code-retired`), an outcome that does not match whether the item plans a
+//! workspace, a missing or mismatched current-capture journal (a stale
+//! journal from an earlier capture proves nothing), or an outcome that is not
+//! an apply outcome at all. The native `verdict` passes only when
+//! `unaccounted` is 0.
 //!
 //! An attestation ledger (`--attest`, #95, #133) may close natively
-//! unaccounted items in its own `attested` block. It never changes the
-//! native `verdict` or totals, and never overrides a native record; the
-//! separate top-level `gate` passes when every planned item is accounted for
-//! natively or by an accepted attestation row bound to the plan, the SOURCE
-//! label, the item's source and its current capture digest.
+//! unaccounted items in its own `attested` block, never one whose own record
+//! is an untyped or retired-code refusal. That is decided from the decoded
+//! record itself, whatever reason left the item unaccounted (a bare `IO`
+//! recorded under another source is still a bare `IO`). It never changes the
+//! native `verdict` or totals, and never overrides a native record.
+//!
+//! The top-level `gate` is S4: every planned item is accounted for natively
+//! or by an accepted attestation row bound to the plan, the SOURCE label, the
+//! item's source and its current capture digest, **and** every typed refusal
+//! (native or attested) carries a disposition. A bare `IO` never counts and
+//! can never be dispositioned or attested away. `gate` therefore differs
+//! from `verdict` whenever a typed refusal is pending review, with or
+//! without an attestation ledger.
+//!
+//! The report is `bulkload.closure.v2` (it was v1 before WP3 PR 3):
+//! `disposition` gained `refused-pending-review`, `totals.refused` counts
+//! reviewed refusals only, and each item row names its refusal `instance`.
+//! `refusal` is still printed for typed refusals only; a recorded refusal
+//! that is not one (a bare `IO`, a retired code, another source's record)
+//! is printed as `recorded_refusal`.
 
 use crate::refuse::RefuseAt as _;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use crate::estate::{JournalState, Ledger, LedgerEntry};
+use crate::outcome::Outcome;
 use crate::{BulkloadRefusal, Result};
 
 /// One planned item's closure disposition.
@@ -44,8 +67,10 @@ use crate::{BulkloadRefusal, Result};
 pub enum Disposition {
     /// Workspace restored, journal present.
     Applied,
-    /// Refused with this typed refusal code.
+    /// A typed refusal with this code that an operator review disposes (S4).
     Refused(String),
+    /// A typed refusal with this code that no review disposes yet (S4).
+    RefusedPendingReview(String),
     /// Ref custody imported, journal present; no working bytes.
     ReferencedOnly,
     /// Not provably closed, for this reason.
@@ -59,22 +84,74 @@ impl Disposition {
         match self {
             Self::Applied => "applied",
             Self::Refused(_) => "refused",
+            Self::RefusedPendingReview(_) => "refused-pending-review",
             Self::ReferencedOnly => "referenced-only",
             Self::Unaccounted(_) => "unaccounted",
         }
     }
+
+    /// The typed refusal code, reviewed or not.
+    #[must_use]
+    pub fn refusal(&self) -> Option<&str> {
+        match self {
+            Self::Refused(code) | Self::RefusedPendingReview(code) => Some(code),
+            _ => None,
+        }
+    }
 }
 
-/// Classify one ledger entry.
+/// The domain prefix of a refusal instance digest.
+const INSTANCE_DOMAIN: &[u8] = b"bulkload.refusal-instance.v1\0";
+
+/// The identity of the refusal instance an item currently holds.
+///
+/// A blake3 digest (lowercase hex) over the item's current capture (none,
+/// unreadable or its bundle digest) and its own outcome record (none,
+/// unreadable and why, or the record's canonical bytes: source, outcome,
+/// code, site, errno and reason).
+///
+/// An item review is bound to this value (S4): a review made against one
+/// capture and record does not dispose a later refusal recorded against
+/// another capture, at another site, with another errno or another reason.
+/// The record carries no time, so two refusals with the same capture and a
+/// byte-identical record are one instance.
+#[must_use]
+pub fn instance(entry: &LedgerEntry) -> String {
+    let (capture_tag, capture) = match CaptureId::of(entry) {
+        CaptureId::None => (0_u8, String::new()),
+        CaptureId::Unreadable => (1, String::new()),
+        CaptureId::Digest(digest) => (2, digest),
+    };
+    let (record_tag, record) = match &entry.record {
+        None => (0_u8, Vec::new()),
+        Some(Err(why)) => (1, why.reason().as_bytes().to_vec()),
+        // A decoded record always re-encodes (its path came from postcard).
+        Some(Ok(record)) => record
+            .encode()
+            .map_or_else(|_| (3, Vec::new()), |bytes| (2, bytes)),
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(INSTANCE_DOMAIN);
+    hasher.update(&[capture_tag]);
+    hasher.update(&(capture.len() as u64).to_le_bytes());
+    hasher.update(capture.as_bytes());
+    hasher.update(&[record_tag]);
+    hasher.update(&(record.len() as u64).to_le_bytes());
+    hasher.update(&record);
+    hasher.finalize().to_hex().to_string()
+}
+
+/// Classify one ledger entry natively. A typed refusal is
+/// [`Disposition::RefusedPendingReview`] here: only a disposition ledger
+/// ([`Report::dispose`]) makes it [`Disposition::Refused`].
 #[must_use]
 pub fn classify(entry: &LedgerEntry) -> Disposition {
-    if entry.record_unreadable {
-        return Disposition::Unaccounted("outcome-record-unreadable");
-    }
-    let Some((source, outcome, reason)) = &entry.record else {
-        return Disposition::Unaccounted("no-outcome-record");
+    let record = match &entry.record {
+        None => return Disposition::Unaccounted("no-outcome-record"),
+        Some(Err(why)) => return Disposition::Unaccounted(why.reason()),
+        Some(Ok(record)) => record,
     };
-    if *source != entry.source {
+    if record.source != entry.source {
         return Disposition::Unaccounted("record-source-mismatch");
     }
     // The exact current-capture journal must carry this body.
@@ -85,22 +162,17 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
         JournalState::NoCapture => Disposition::Unaccounted("capture-record-missing"),
         JournalState::CaptureUnreadable => Disposition::Unaccounted("capture-record-unreadable"),
     };
-    match outcome.as_str() {
-        "refused" => {
-            // A receipt reason is the refusal's Display: its code, then any
-            // escaped detail (`GIT_NEST_... path="..."`, `IO (errno 2)`).
-            match reason
-                .as_deref()
-                .and_then(|reason| reason.split_whitespace().next())
-                .filter(|code| BulkloadRefusal::is_code(code))
-            {
-                None => Disposition::Unaccounted("refusal-untyped"),
-                Some("IO") => Disposition::Unaccounted("refusal-untyped-io"),
-                Some("FRAME_CODEC") => Disposition::Unaccounted("refusal-untyped-frame-codec"),
-                Some(code) => Disposition::Refused(code.to_owned()),
-            }
-        }
-        "workspace-restored" | "previous-workspace-restoration-not-revalidated" => {
+    match &record.outcome {
+        // A bare IO or FRAME_CODEC names no cause (S4).
+        Outcome::Refused(refusal) => match refusal.code() {
+            "IO" => Disposition::Unaccounted("refusal-untyped-io"),
+            "FRAME_CODEC" => Disposition::Unaccounted("refusal-untyped-frame-codec"),
+            // The code left the taxonomy after the record was written: it
+            // names no cause the taxonomy holds, and no review can name it.
+            _ if refusal.is_retired() => Disposition::Unaccounted("refusal-code-retired"),
+            code => Disposition::RefusedPendingReview(code.to_owned()),
+        },
+        Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
             if entry.has_workspace {
                 journal("workspace-restored", Disposition::Applied)
             } else {
@@ -109,14 +181,14 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
         }
         // #95: git-repair-missing-index imported the same ref custody and
         // created the missing index into this state directory.
-        crate::estate::INDEX_REPAIRED => {
+        Outcome::IndexRepaired => {
             if entry.has_workspace {
                 Disposition::Unaccounted("index-repaired-for-workspace-item")
             } else {
                 journal("refs-imported", Disposition::ReferencedOnly)
             }
         }
-        "refs-imported" | "previous-ref-custody-not-workspace-parity" => {
+        Outcome::RefsImported | Outcome::PreviousRefCustodyNotWorkspaceParity => {
             if entry.has_workspace {
                 // A planned workspace that only got refs is not closed.
                 Disposition::Unaccounted("refs-only-for-workspace-item")
@@ -124,7 +196,11 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
                 journal("refs-imported", Disposition::ReferencedOnly)
             }
         }
-        _ => Disposition::Unaccounted("not-an-apply-outcome"),
+        Outcome::Captured
+        | Outcome::CapturedWithDrift
+        | Outcome::CaptureExtendedFromDrift
+        | Outcome::CaptureReusedAfterCensus
+        | Outcome::DeferredWithDrift => Disposition::Unaccounted("not-an-apply-outcome"),
     }
 }
 
@@ -154,10 +230,18 @@ impl CaptureId {
 pub struct Row {
     pub item: String,
     pub source: PathBuf,
-    pub outcome: Option<String>,
+    /// The typed outcome record's outcome, when one decoded.
+    pub outcome: Option<Outcome>,
+    /// Why the item's outcome record proves nothing, when one exists and
+    /// does not decode to an outcome.
+    pub unreadable: Option<crate::outcome::Unreadable>,
     pub disposition: Disposition,
     /// The item's current capture, which an attestation row must name.
     pub capture: CaptureId,
+    /// The refusal instance an item review must name ([`instance`]).
+    pub instance: String,
+    /// The review that disposes this row's typed refusal (S4).
+    pub review: Option<crate::disposition::Row>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -165,10 +249,13 @@ pub struct Row {
 pub struct Report {
     pub rows: Vec<Row>,
     pub applied: u64,
+    /// Typed refusals a review disposes.
     pub refused: u64,
+    /// Typed refusals no review disposes yet.
+    pub refused_pending_review: u64,
     pub referenced_only: u64,
     pub unaccounted: u64,
-    /// Typed refusal counts by code.
+    /// Typed refusal counts by code, reviewed or not.
     pub refusals: std::collections::BTreeMap<String, u64>,
     /// Outcome records for items the plan does not hold. Reported, not
     /// counted: they are not planned items.
@@ -178,6 +265,8 @@ pub struct Report {
     pub unmatched_journals: Vec<String>,
     /// The attestation block, when an attestation ledger was given (#95).
     pub attested: Option<Attested>,
+    /// The review block, when a disposition ledger was given (S4).
+    pub reviewed: Option<Reviewed>,
 }
 
 impl Report {
@@ -190,25 +279,145 @@ impl Report {
             ..Self::default()
         };
         for entry in &ledger.entries {
-            let disposition = classify(entry);
-            match &disposition {
-                Disposition::Applied => report.applied += 1,
-                Disposition::ReferencedOnly => report.referenced_only += 1,
-                Disposition::Unaccounted(_) => report.unaccounted += 1,
-                Disposition::Refused(code) => {
-                    report.refused += 1;
-                    *report.refusals.entry(code.clone()).or_default() += 1;
-                }
-            }
             report.rows.push(Row {
                 item: entry.item.clone(),
                 source: entry.source.clone(),
-                outcome: entry.record.as_ref().map(|(_, outcome, _)| outcome.clone()),
-                disposition,
+                outcome: entry
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.as_ref().ok())
+                    .map(|record| record.outcome.clone()),
+                unreadable: entry
+                    .record
+                    .as_ref()
+                    .and_then(|record| record.as_ref().err().copied()),
+                disposition: classify(entry),
                 capture: CaptureId::of(entry),
+                instance: instance(entry),
+                review: None,
             });
         }
+        report.recount();
         report
+    }
+
+    // Apply the reviews (when a disposition ledger was given) to every typed
+    // refusal, native and attested, and recount the totals.
+    fn recount(&mut self) {
+        let ledger = self.reviewed.as_ref().map(|reviewed| &reviewed.ledger);
+        let review = |item: &str, instance: &str, code: &str| {
+            ledger.and_then(|ledger| ledger.review(item, instance, code).cloned())
+        };
+        // Every typed refusal the report holds, as (item, instance, code).
+        let mut current = std::collections::BTreeSet::new();
+        let mut decisions = std::collections::BTreeMap::<&'static str, u64>::new();
+        (
+            self.applied,
+            self.refused,
+            self.refused_pending_review,
+            self.referenced_only,
+            self.unaccounted,
+        ) = (0, 0, 0, 0, 0);
+        self.refusals.clear();
+        for row in &mut self.rows {
+            if let Some(code) = row.disposition.refusal().map(str::to_owned) {
+                row.review = review(&row.item, &row.instance, &code);
+                current.insert((row.item.clone(), row.instance.clone(), code.clone()));
+                if let Some(found) = &row.review {
+                    *decisions.entry(found.decision().name()).or_default() += 1;
+                }
+                row.disposition = if row.review.is_some() {
+                    Disposition::Refused(code.clone())
+                } else {
+                    Disposition::RefusedPendingReview(code.clone())
+                };
+                *self.refusals.entry(code).or_default() += 1;
+            }
+            match &row.disposition {
+                Disposition::Applied => self.applied += 1,
+                Disposition::Refused(_) => self.refused += 1,
+                Disposition::RefusedPendingReview(_) => self.refused_pending_review += 1,
+                Disposition::ReferencedOnly => self.referenced_only += 1,
+                Disposition::Unaccounted(_) => self.unaccounted += 1,
+            }
+        }
+        if let Some(attested) = &mut self.attested {
+            attested.pending.clear();
+            attested.reviews.clear();
+            for row in &attested.items {
+                let Some(code) = row
+                    .refusal
+                    .as_deref()
+                    .filter(|_| row.disposition == "refused")
+                else {
+                    continue;
+                };
+                // An accepted row always names a planned item.
+                let Some(native) = self.rows.iter().find(|native| native.item == row.item) else {
+                    continue;
+                };
+                current.insert((row.item.clone(), native.instance.clone(), code.to_owned()));
+                match review(&row.item, &native.instance, code) {
+                    Some(found) => {
+                        *decisions.entry(found.decision().name()).or_default() += 1;
+                        attested.reviews.push((row.item.clone(), found));
+                    }
+                    None => attested.pending.push(row.item.clone()),
+                }
+            }
+        }
+        if let Some(reviewed) = &mut self.reviewed {
+            reviewed.decisions = decisions;
+            // Rows that dispose nothing in this report, and why. A row for
+            // an instance the report holds disposes it (or an earlier row
+            // for it is superseded by a later one): never listed.
+            reviewed.unmatched = reviewed
+                .ledger
+                .rows
+                .iter()
+                .filter_map(|row| {
+                    let item = row.item().map(str::to_owned);
+                    let code = row.code().to_owned();
+                    if row.is_retired() {
+                        return Some((item, code, "refusal-code-retired"));
+                    }
+                    let (item, instance) = (row.item()?, row.instance()?);
+                    let held = |exact: bool| {
+                        current.iter().any(|(held, at, refusal)| {
+                            held == item && *refusal == code && (!exact || at == instance)
+                        })
+                    };
+                    if held(true) {
+                        None
+                    } else if held(false) {
+                        Some((Some(item.to_owned()), code, "refusal-instance-stale"))
+                    } else {
+                        Some((Some(item.to_owned()), code, "no-such-refusal"))
+                    }
+                })
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+        }
+    }
+
+    /// The refusal instance an item review of `item`'s refusal with `code`
+    /// must name: `Some` only when the report holds exactly that typed
+    /// refusal now, natively or as an accepted attestation row. This is how
+    /// `closure-dispose` refuses a review written ahead of its refusal.
+    #[must_use]
+    pub fn reviewable(&self, item: &str, code: &str) -> Option<&str> {
+        let native = self.rows.iter().find(|row| row.item == item)?;
+        let attested = self.attested.as_ref().is_some_and(|attested| {
+            attested.items.iter().any(|row| {
+                row.item == item
+                    && row.disposition == "refused"
+                    && row.refusal.as_deref() == Some(code)
+            })
+        });
+        (crate::outcome::is_typed_code(code)
+            && (native.disposition.refusal() == Some(code) || attested))
+            .then_some(native.instance.as_str())
     }
 
     /// Planned items in the report.
@@ -218,19 +427,19 @@ impl Report {
     }
 
     /// The native verdict (`verdict`): every planned item is accounted for
-    /// by its own durable records. An attestation never changes it (#133).
+    /// by its own durable records (a typed refusal is, reviewed or not). An
+    /// attestation or a review never changes it (#133).
     #[must_use]
     pub const fn native_passes(&self) -> bool {
         self.unaccounted == 0
     }
 
-    /// The closure gate (`gate`, the exit status): every planned item is
-    /// accounted for natively, or, when an attestation ledger was given,
-    /// natively or by an accepted, bound attestation row. Without an
-    /// attestation ledger it is exactly the native verdict.
+    /// The closure gate (`gate`, the exit status), S4: every planned item is
+    /// accounted for natively or by an accepted, bound attestation row, and
+    /// every typed refusal, native or attested, carries a disposition.
     #[must_use]
-    pub const fn passes(&self) -> bool {
-        self.remaining_unaccounted() == 0
+    pub fn passes(&self) -> bool {
+        self.remaining_unaccounted() == 0 && self.pending_review() == 0
     }
 
     /// Items accounted for neither natively nor by an accepted attestation.
@@ -242,11 +451,24 @@ impl Report {
         }
     }
 
+    /// Typed refusals, native or attested, that no review disposes (S4).
+    #[must_use]
+    pub fn pending_review(&self) -> u64 {
+        self.refused_pending_review
+            + self
+                .attested
+                .as_ref()
+                .map_or(0, |attested| attested.pending.len() as u64)
+    }
+
     /// Join an attestation ledger (`bulkload.closure-ledger.v1`, #95) to this
     /// native report. A row closes a planned item only when the native ledger
-    /// leaves it unaccounted and the row names the item's source and current
-    /// capture digest (#133); a native record is never overridden. Rows are
-    /// reported in their own block, never in the native totals or verdict.
+    /// leaves it unaccounted, its own record is not an untyped or
+    /// retired-code refusal (whatever reason left it unaccounted), and the
+    /// row names the item's source and current capture digest (#133); a
+    /// native record is never overridden. Rows are reported in their own
+    /// block, never in the native totals or verdict. An accepted row claiming
+    /// `refused` is a typed refusal like any other: it needs a review (S4).
     ///
     /// # Errors
     /// `FIELD_DOMAIN_VIOLATION` for a ledger that lists an item twice. The
@@ -268,12 +490,14 @@ impl Report {
             if !matches!(native.disposition, Disposition::Unaccounted(_)) {
                 // Never overrides a native record; a disagreement is listed.
                 attested.superseded += 1;
-                if row.disposition != native.disposition.name() {
+                if row.disposition != native.disposition.name()
+                    && !(row.disposition == "refused" && native.disposition.refusal().is_some())
+                {
                     attested.disagreements.push(row.item.clone());
                 }
                 continue;
             }
-            match row.verdict(&native.source, &native.capture) {
+            match row.verdict(native) {
                 Ok(()) => {
                     *attested
                         .dispositions
@@ -285,15 +509,29 @@ impl Report {
             }
         }
         self.attested = Some(attested);
+        self.recount();
         Ok(())
     }
 
-    /// The gate as a value: `CLOSURE_UNACCOUNTED` when any item is.
+    /// Join a disposition ledger (S4): every typed refusal, native or
+    /// attested, that a review disposes becomes `refused` with that review;
+    /// the rest stay pending. A bare `IO` is never touched: it is
+    /// unaccounted, and no review can name it. The ledger's plan and SOURCE
+    /// label bind when it is read.
+    pub fn dispose(&mut self, ledger: &crate::disposition::Ledger) {
+        self.reviewed = Some(Reviewed {
+            ledger: ledger.clone(),
+            ..Reviewed::default()
+        });
+        self.recount();
+    }
+
+    /// The gate as a value: `CLOSURE_UNACCOUNTED` when any item is
+    /// unaccounted or any typed refusal is pending review.
     ///
     /// # Errors
-    /// `CLOSURE_UNACCOUNTED` when an item is accounted for neither natively
-    /// nor by an accepted attestation row.
-    pub const fn gate(&self) -> Result<()> {
+    /// `CLOSURE_UNACCOUNTED` when the gate fails.
+    pub fn gate(&self) -> Result<()> {
         if self.passes() {
             Ok(())
         } else {
@@ -301,20 +539,22 @@ impl Report {
         }
     }
 
-    /// The report as one JSON document (`bulkload.closure.v1`).
+    /// The report as one JSON document (`bulkload.closure.v2`).
     #[must_use]
     pub fn to_json(&self) -> String {
         let mut out = String::new();
         let _ = write!(
             out,
-            "{{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"applied\":{},\"refused\":{},\"referenced_only\":{},\"unaccounted\":{}}},\"refusals\":{{",
+            "{{\"schema\":\"bulkload.closure.v2\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"applied\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"unaccounted\":{},\"pending_review\":{}}},\"refusals\":{{",
             if self.native_passes() { "pass" } else { "fail" },
             if self.passes() { "pass" } else { "fail" },
             self.planned(),
             self.applied,
             self.refused,
+            self.refused_pending_review,
             self.referenced_only,
             self.unaccounted,
+            self.pending_review(),
         );
         for (index, (code, count)) in self.refusals.iter().enumerate() {
             let _ = write!(
@@ -331,26 +571,49 @@ impl Report {
             }
             let _ = write!(
                 out,
-                "{{\"item\":{},\"source\":{},\"capture\":{},\"outcome\":{},\"disposition\":\"{}\"",
+                "{{\"item\":{},\"source\":{},\"capture\":{},\"instance\":{},\"outcome\":{},\"disposition\":\"{}\"",
                 json_string(&row.item),
                 json_string(&row.source.to_string_lossy()),
                 match &row.capture {
                     CaptureId::Digest(digest) => json_string(digest),
                     CaptureId::None | CaptureId::Unreadable => "null".to_owned(),
                 },
-                row.outcome
-                    .as_deref()
-                    .map_or_else(|| "null".to_owned(), json_string),
+                json_string(&row.instance),
+                // A legacy `refused` record naming no code is still a
+                // recorded refusal: its outcome prints as before.
+                match (&row.outcome, row.unreadable) {
+                    (Some(outcome), _) => json_string(outcome.name()),
+                    (None, Some(crate::outcome::Unreadable::RefusalUntyped)) =>
+                        json_string(crate::outcome::REFUSED),
+                    (None, _) => "null".to_owned(),
+                },
                 row.disposition.name(),
             );
-            match &row.disposition {
-                Disposition::Refused(code) => {
-                    let _ = write!(out, ",\"refusal\":{}", json_string(code));
-                }
-                Disposition::Unaccounted(why) => {
-                    let _ = write!(out, ",\"unaccounted_reason\":{}", json_string(why));
-                }
-                Disposition::Applied | Disposition::ReferencedOnly => {}
+            if let Some(refusal) = row.outcome.as_ref().and_then(Outcome::refusal) {
+                // `refusal` names a typed refusal only, as it always did. A
+                // recorded refusal that is not one (a bare IO, a retired
+                // code, a record for another source) has its own key.
+                let _ = write!(
+                    out,
+                    ",\"{}\":{},\"site\":{},\"errno\":{}",
+                    if row.disposition.refusal().is_some() {
+                        "refusal"
+                    } else {
+                        "recorded_refusal"
+                    },
+                    json_string(refusal.code()),
+                    json_string(refusal.site()),
+                    refusal
+                        .errno()
+                        .map_or_else(|| "null".to_owned(), |errno| errno.to_string()),
+                );
+            }
+            if let Disposition::Unaccounted(why) = &row.disposition {
+                let _ = write!(out, ",\"unaccounted_reason\":{}", json_string(why));
+            }
+            if let Some(review) = &row.review {
+                out.push_str(",\"review\":");
+                write_review(&mut out, review);
             }
             out.push('}');
         }
@@ -372,8 +635,97 @@ impl Report {
         if let Some(attested) = &self.attested {
             attested.write_json(&mut out, self);
         }
+        if let Some(reviewed) = &self.reviewed {
+            reviewed.write_json(&mut out, self);
+        }
         out.push('}');
         out
+    }
+}
+
+// One review as JSON: its decision, reviewer, date and basis.
+fn write_review(out: &mut String, review: &crate::disposition::Row) {
+    let _ = write!(
+        out,
+        "{{\"decision\":\"{}\",\"reviewer\":{},\"date\":{},\"basis\":\"{}\"}}",
+        review.decision().name(),
+        json_string(review.reviewer()),
+        json_string(review.date()),
+        review.basis(),
+    );
+}
+
+/// The review block of a closure report (S4).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Reviewed {
+    /// The disposition ledger joined.
+    pub ledger: crate::disposition::Ledger,
+    /// Disposed refusals (native and attested) by decision.
+    pub decisions: std::collections::BTreeMap<&'static str, u64>,
+    /// Rows, as (item, code, reason), that dispose no refusal in this
+    /// report: `no-such-refusal` (the item holds no typed refusal with the
+    /// code), `refusal-instance-stale` (it holds one, but not the instance
+    /// the row reviewed), or `refusal-code-retired` (the code left the
+    /// taxonomy; the item is `None` for a policy row).
+    pub unmatched: Vec<(Option<String>, String, &'static str)>,
+}
+
+impl Reviewed {
+    fn write_json(&self, out: &mut String, report: &Report) {
+        let policies = self
+            .ledger
+            .rows
+            .iter()
+            .filter(|row| matches!(row.scope(), crate::disposition::Scope::Policy))
+            .count();
+        let _ = write!(
+            out,
+            ",\"reviewed\":{{\"schema\":\"{}\",\"ledger\":{},\"plan_digest\":{},\"totals\":{{\"rows\":{},\"policies\":{},\"disposed\":{},\"pending_review\":{}}},\"decisions\":{{",
+            crate::disposition::SCHEMA,
+            json_string(&self.ledger.path.to_string_lossy()),
+            json_string(&self.ledger.plan_digest),
+            self.ledger.rows.len(),
+            policies,
+            self.decisions.values().sum::<u64>(),
+            report.pending_review(),
+        );
+        for (index, (name, count)) in self.decisions.iter().enumerate() {
+            let _ = write!(
+                out,
+                "{}{}:{count}",
+                if index == 0 { "" } else { "," },
+                json_string(name)
+            );
+        }
+        out.push_str("},\"policies\":[");
+        let mut first = true;
+        for row in &self.ledger.rows {
+            if !matches!(row.scope(), crate::disposition::Scope::Policy) {
+                continue;
+            }
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            let _ = write!(out, "{{\"refusal\":{},\"review\":", json_string(row.code()));
+            write_review(out, row);
+            out.push('}');
+        }
+        out.push_str("],\"unmatched\":[");
+        for (index, (item, code, why)) in self.unmatched.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            let _ = write!(
+                out,
+                "{{\"item\":{},\"refusal\":{},\"reason\":{}}}",
+                item.as_deref()
+                    .map_or_else(|| "null".to_owned(), json_string),
+                json_string(code),
+                json_string(why)
+            );
+        }
+        out.push_str("]}");
     }
 }
 
@@ -415,13 +767,23 @@ pub struct AttestationRow {
 }
 
 impl AttestationRow {
-    // Whether this row may close a natively unaccounted item whose plan
-    // source is `source` and whose current capture is `capture`, and why not.
-    fn verdict(
-        &self,
-        source: &std::path::Path,
-        capture: &CaptureId,
-    ) -> std::result::Result<(), &'static str> {
+    // Whether this row may close the natively unaccounted item `native`
+    // (its plan source, its current capture, its own record), and why not.
+    fn verdict(&self, native: &Row) -> std::result::Result<(), &'static str> {
+        let (source, capture) = (native.source.as_path(), &native.capture);
+        // S4: a bare IO never counts. An item whose own record is an untyped
+        // refusal is closed only by a verb that records a typed outcome.
+        // Decided from the decoded record, not from the reason the item is
+        // unaccounted for: a bare IO recorded under another source is
+        // `record-source-mismatch` natively and still a bare IO.
+        match native.outcome.as_ref().and_then(Outcome::refusal) {
+            Some(refusal) if refusal.is_retired() => return Err("native-refusal-code-retired"),
+            Some(refusal) if !refusal.is_typed() => return Err("native-refusal-untyped"),
+            _ => {}
+        }
+        if native.unreadable == Some(crate::outcome::Unreadable::RefusalUntyped) {
+            return Err("native-refusal-untyped");
+        }
         if self.source.as_deref().map(std::path::Path::new) != Some(source) {
             return Err("source-mismatch");
         }
@@ -593,19 +955,24 @@ pub struct Attested {
     pub disagreements: Vec<String>,
     /// Rows naming items the plan does not hold.
     pub foreign: Vec<String>,
+    /// Accepted `refused` rows no review disposes (S4).
+    pub pending: Vec<String>,
+    /// Accepted `refused` rows and the review that disposes each (S4).
+    pub reviews: Vec<(String, crate::disposition::Row)>,
 }
 
 impl Attested {
     fn write_json(&self, out: &mut String, report: &Report) {
         let _ = write!(
             out,
-            ",\"attested\":{{\"schema\":\"bulkload.closure-ledger.v1\",\"ledger\":{},\"totals\":{{\"attested\":{},\"rejected\":{},\"superseded\":{},\"foreign\":{},\"unaccounted_after_attestation\":{}}},\"dispositions\":{{",
+            ",\"attested\":{{\"schema\":\"bulkload.closure-ledger.v1\",\"ledger\":{},\"totals\":{{\"attested\":{},\"rejected\":{},\"superseded\":{},\"foreign\":{},\"unaccounted_after_attestation\":{},\"pending_review\":{}}},\"dispositions\":{{",
             json_string(&self.ledger.to_string_lossy()),
             self.items.len(),
             self.rejected.len(),
             self.superseded,
             self.foreign.len(),
             report.remaining_unaccounted(),
+            self.pending.len(),
         );
         for (index, (name, count)) in self.dispositions.iter().enumerate() {
             let _ = write!(
@@ -639,6 +1006,10 @@ impl Attested {
             if let Some(code) = &row.refusal {
                 let _ = write!(out, ",\"refusal\":{}", json_string(code));
             }
+            if let Some((_, review)) = self.reviews.iter().find(|(item, _)| *item == row.item) {
+                out.push_str(",\"review\":");
+                write_review(out, review);
+            }
             if let Some(evidence) = &row.evidence {
                 out.push_str(",\"evidence\":");
                 evidence.write(out);
@@ -671,6 +1042,13 @@ impl Attested {
             }
             out.push_str(&json_string(item));
         }
+        out.push_str("],\"pending_review\":[");
+        for (index, item) in self.pending.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&json_string(item));
+        }
         out.push_str("]}");
     }
 }
@@ -678,6 +1056,14 @@ impl Attested {
 /// A JSON value: just enough to read an attestation ledger and write its
 /// evidence back verbatim. Hand-rolled, as the argument parser is: the agent
 /// carries no JSON crate (R34 dependency wall).
+///
+/// WP3 PR 3 (2026-10-06) considered `serde_json` here and kept this parser.
+/// The R34 wall is a closed list (`Cargo.toml`, `tests/dep_graph.rs`): adding
+/// a crate to the agent's normal graph is a design change taken back to the
+/// plan, not a bump, and the disposition ledger this PR adds is postcard, so
+/// nothing new needs JSON. The attestation ledger is the only JSON input and
+/// shrinks to the historical cohort rows under WP4, when this parser is
+/// deleted with it rather than replaced.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Json {
     Null,
@@ -1013,6 +1399,8 @@ pub fn json_string(value: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+    use crate::disposition::{Decision, Row as Review, Scope};
+    use crate::outcome::{OutcomeRecord, Unreadable};
 
     fn present(body: &str) -> JournalState {
         JournalState::Present(body.to_owned())
@@ -1029,15 +1417,38 @@ mod tests {
             JournalState::NoCapture | JournalState::CaptureUnreadable => None,
             JournalState::Absent | JournalState::Present(_) => Some(digest(item)),
         };
+        // The test records are written in the legacy string form and read
+        // through the legacy reader, as an old ledger is (WP3 PR 3).
         LedgerEntry {
             item: item.to_string().repeat(64),
             source: source.clone(),
             has_workspace,
-            record: record
-                .map(|(outcome, reason)| (source, outcome.to_owned(), reason.map(str::to_owned))),
-            record_unreadable: false,
+            record: record.map(|(outcome, reason)| {
+                OutcomeRecord::from_legacy(source, outcome, reason.map(str::to_owned))
+            }),
             journal,
             capture,
+        }
+    }
+
+    // An empty review ledger bound to the tests' plan and SOURCE label.
+    fn reviews() -> crate::disposition::Ledger {
+        crate::disposition::Ledger::bound(std::path::Path::new("/plan"), &"d".repeat(64), "neo")
+    }
+
+    // An item review scope for test item `item`, bound to the refusal
+    // instance the report holds for it now.
+    fn scope(report: &Report, item: char) -> Scope {
+        let item = item.to_string().repeat(64);
+        Scope::Item {
+            instance: report
+                .rows
+                .iter()
+                .find(|row| row.item == item)
+                .unwrap()
+                .instance
+                .clone(),
+            item,
         }
     }
 
@@ -1084,13 +1495,15 @@ mod tests {
         assert_eq!(classify(&restored), Disposition::Applied);
         assert_eq!(classify(&previous), Disposition::Applied);
         assert_eq!(classify(&refs), Disposition::ReferencedOnly);
+        // S4: natively a typed refusal is pending review; only a review
+        // makes it `refused`.
         assert_eq!(
             classify(&refused),
-            Disposition::Refused("GIT_INVENTORY_MALFORMED".into())
+            Disposition::RefusedPendingReview("GIT_INVENTORY_MALFORMED".into())
         );
         assert_eq!(
             classify(&nest),
-            Disposition::Refused("GIT_NEST_STASHED".into())
+            Disposition::RefusedPendingReview("GIT_NEST_STASHED".into())
         );
     }
 
@@ -1126,8 +1539,8 @@ mod tests {
             Some(("workspace-restored", None)),
             present("workspace-restored"),
         );
-        if let Some(record) = other_source.record.as_mut() {
-            record.0 = PathBuf::from("/src/elsewhere");
+        if let Some(Ok(record)) = other_source.record.as_mut() {
+            record.source = PathBuf::from("/src/elsewhere");
         }
         let cases = [
             (
@@ -1212,10 +1625,15 @@ mod tests {
                 ),
                 "not-an-apply-outcome",
             ),
+            // A legacy outcome string no writer produced (WP3 PR 3).
+            (
+                entry('m', true, Some(("finished", None)), JournalState::Absent),
+                "outcome-unknown",
+            ),
             (other_source, "record-source-mismatch"),
             (
                 LedgerEntry {
-                    record_unreadable: true,
+                    record: Some(Err(Unreadable::Codec)),
                     ..entry('l', true, None, JournalState::Absent)
                 },
                 "outcome-record-unreadable",
@@ -1258,7 +1676,7 @@ mod tests {
             (
                 report.planned(),
                 report.applied,
-                report.refused,
+                report.refused_pending_review,
                 report.referenced_only,
                 report.unaccounted
             ),
@@ -1268,19 +1686,25 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"applied\":1,\"refused\":1,\"referenced_only\":1,\"unaccounted\":1},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
-        ));
-        // Each native row names its current capture, so an attestation
-        // ledger can bind to it.
-        assert!(json.contains(&format!(
-            "\"source\":\"/src/a\",\"capture\":\"{}\",\"outcome\":\"workspace-restored\"",
-            digest('a')
-        )));
+            "{\"schema\":\"bulkload.closure.v2\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"applied\":1,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"unaccounted\":1,\"pending_review\":1},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
+        ), "{json}");
+        // A typed refusal row names its code, recording site and errno.
         assert!(json.contains(
-            "\"source\":\"/src/d\",\"capture\":\"{}\",\"outcome\":null"
-                .replace("{}", &digest('d'))
-                .as_str()
-        ));
+            "\"disposition\":\"refused-pending-review\",\"refusal\":\"CAPTURE_DRIFTED\",\"site\":\"outcome::legacy\",\"errno\":null}"
+        ), "{json}");
+        // Each native row names its current capture, so an attestation
+        // ledger can bind to it, and its refusal instance, which an item
+        // review is bound to.
+        assert!(json.contains(&format!(
+            "\"source\":\"/src/a\",\"capture\":\"{}\",\"instance\":\"{}\",\"outcome\":\"workspace-restored\"",
+            digest('a'),
+            instance(&ledger.entries[0])
+        )));
+        assert!(json.contains(&format!(
+            "\"source\":\"/src/d\",\"capture\":\"{}\",\"instance\":\"{}\",\"outcome\":null",
+            digest('d'),
+            instance(&ledger.entries[3])
+        )));
         assert!(json.contains(
             "\"disposition\":\"unaccounted\",\"unaccounted_reason\":\"no-outcome-record\""
         ));
@@ -1310,13 +1734,40 @@ mod tests {
             ],
             ..Ledger::default()
         };
-        let report = Report::from_ledger(&ledger);
+        // Every item is accounted natively, but S4 (WP3 PR 3): the typed
+        // refusal is pending review, so the gate fails until a review
+        // disposes it. This test passed natively before S4 was provable.
+        let mut report = Report::from_ledger(&ledger);
+        assert!(report.native_passes());
+        assert!(!report.passes());
+        assert_eq!(report.pending_review(), 1);
+        assert!(report
+            .to_json()
+            .contains("\"verdict\":\"pass\",\"gate\":\"fail\""));
+        let mut reviews = reviews();
+        reviews.rows.push(
+            Review::new(
+                scope(&report, 'b'),
+                "GIT_INVENTORY_MALFORMED",
+                Decision::Accept,
+                "jess",
+                "2026-10-06",
+            )
+            .unwrap(),
+        );
+        report.dispose(&reviews);
         assert!(report.passes());
         assert!(report.native_passes());
         assert_eq!(report.gate(), Ok(()));
-        assert!(report
-            .to_json()
-            .contains("\"verdict\":\"pass\",\"gate\":\"pass\""));
+        assert_eq!((report.refused, report.refused_pending_review), (1, 0));
+        let json = report.to_json();
+        assert!(json.contains("\"verdict\":\"pass\",\"gate\":\"pass\""));
+        assert!(json.contains(
+            "\"disposition\":\"refused\",\"refusal\":\"GIT_INVENTORY_MALFORMED\",\"site\":\"outcome::legacy\",\"errno\":null,\"review\":{\"decision\":\"accept\",\"reviewer\":\"jess\",\"date\":\"2026-10-06\",\"basis\":\"item\"}}"
+        ), "{json}");
+        assert!(json.contains(
+            "\"reviewed\":{\"schema\":\"bulkload.dispositions.v1\",\"ledger\":\"\",\"plan_digest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"totals\":{\"rows\":1,\"policies\":0,\"disposed\":1,\"pending_review\":0},\"decisions\":{\"accept\":1},\"policies\":[],\"unmatched\":[]}"
+        ), "{json}");
         // An empty plan is trivially closed.
         assert!(Report::from_ledger(&Ledger::default()).passes());
     }
@@ -1368,12 +1819,9 @@ mod tests {
                 entry('b', false, None, JournalState::NoCapture),
                 entry('c', true, None, JournalState::NoCapture),
                 entry('d', true, None, JournalState::NoCapture),
-                entry(
-                    'e',
-                    true,
-                    Some(("refused", Some("IO (errno 2)"))),
-                    JournalState::Absent,
-                ),
+                // No record (an untyped IO here would be rejected: see
+                // `attestation_cannot_close_an_untyped_refusal`).
+                entry('e', true, None, JournalState::Absent),
             ],
             ..Ledger::default()
         };
@@ -1422,11 +1870,16 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v1\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"referenced_only\":1,\"unaccounted\":4}"
-        ));
-        assert!(json.contains(
-            "\"totals\":{\"attested\":3,\"rejected\":1,\"superseded\":1,\"foreign\":1,\"unaccounted_after_attestation\":1},\"dispositions\":{\"referenced-only\":1,\"refused\":1,\"source-absent\":1}"
+            "{\"schema\":\"bulkload.closure.v2\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"unaccounted\":4,\"pending_review\":1}"
         ), "{json}");
+        // The attested refusal of c is a typed refusal: it needs a review.
+        assert!(json.contains(
+            "\"totals\":{\"attested\":3,\"rejected\":1,\"superseded\":1,\"foreign\":1,\"unaccounted_after_attestation\":1,\"pending_review\":1},\"dispositions\":{\"referenced-only\":1,\"refused\":1,\"source-absent\":1}"
+        ), "{json}");
+        assert!(
+            json.ends_with(&format!("\"pending_review\":[\"{}\"]}}}}", id('c'))),
+            "{json}"
+        );
         // The attested block carries each row's bound capture.
         assert!(json.contains(&format!(
             "\"source\":\"/src/e\",\"capture\":\"{}\",\"disposition\":\"source-absent\"",
@@ -1460,14 +1913,34 @@ mod tests {
                 &AttestationLedger::parse(&closing, std::path::Path::new("/plan"), "neo").unwrap(),
             )
             .unwrap();
+        // Every item is accounted, but the attested refusal of c is pending
+        // review (S4, WP3 PR 3); a standing policy for its code disposes it.
+        assert_eq!(report.remaining_unaccounted(), 0);
+        assert_eq!(report.pending_review(), 1);
+        assert!(!report.passes());
+        let mut reviews = reviews();
+        reviews.rows.push(
+            Review::new(
+                Scope::Policy,
+                "GIT_INVENTORY_INTENT_TO_ADD",
+                Decision::ReCarry,
+                "jess",
+                "2026-10-06",
+            )
+            .unwrap(),
+        );
+        report.dispose(&reviews);
         assert!(report.passes());
         assert!(!report.native_passes());
         assert_eq!(report.gate(), Ok(()));
         let json = report.to_json();
         assert!(
-            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"referenced_only\":1,\"unaccounted\":4}"),
+            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"unaccounted\":4,\"pending_review\":0}"),
             "{json}"
         );
+        assert!(json.contains(
+            "\"refusal\":\"GIT_INVENTORY_INTENT_TO_ADD\",\"review\":{\"decision\":\"re-carry\",\"reviewer\":\"jess\",\"date\":\"2026-10-06\",\"basis\":\"policy\"}"
+        ), "{json}");
     }
 
     // #133: an attestation never overrides a native applied, refused or
@@ -1527,13 +2000,13 @@ mod tests {
         assert_eq!(report.rows[0].disposition, Disposition::Applied);
         assert_eq!(
             report.rows[1].disposition,
-            Disposition::Refused("GIT_DESTINATION_OCCUPIED".into())
+            Disposition::RefusedPendingReview("GIT_DESTINATION_OCCUPIED".into())
         );
         assert_eq!(report.rows[2].disposition, Disposition::ReferencedOnly);
         assert_eq!(
             (
                 report.applied,
-                report.refused,
+                report.refused_pending_review,
                 report.referenced_only,
                 report.unaccounted
             ),
@@ -1696,7 +2169,7 @@ mod tests {
         let parse = |text: &str| AttestationLedger::parse(text, plan, "neo");
         assert_eq!(
             parse(
-                r#"{"schema":"bulkload.closure.v1","plan":"/plan","source_label":"neo","items":[]}"#
+                r#"{"schema":"bulkload.closure.v2","plan":"/plan","source_label":"neo","items":[]}"#
             ),
             Err(BulkloadRefusal::SchemaMismatch)
         );
@@ -1810,5 +2283,845 @@ mod tests {
     #[test]
     fn json_strings_cannot_break_out() {
         assert_eq!(json_string("a\"b\\c\nd\u{1}"), "\"a\\\"b\\\\c\\nd\\u0001\"");
+    }
+
+    // S4 (WP3 PR 3): an item whose own record is an untyped refusal is never
+    // closed by an attestation, however well bound the row is, and no review
+    // can name its code.
+    #[test]
+    fn attestation_cannot_close_an_untyped_refusal() {
+        let ledger = Ledger {
+            entries: vec![
+                entry(
+                    'e',
+                    true,
+                    Some(("refused", Some("IO (errno 2)"))),
+                    JournalState::Absent,
+                ),
+                entry(
+                    'f',
+                    true,
+                    Some(("refused", Some("FRAME_CODEC"))),
+                    JournalState::Absent,
+                ),
+                entry(
+                    'c',
+                    true,
+                    Some(("refused", Some("disk went away"))),
+                    JournalState::Absent,
+                ),
+            ],
+            ..Ledger::default()
+        };
+        let row = |c: char| {
+            format!(
+                r#"{{"item":"{}","source":"/src/{c}","capture":"{}","disposition":"source-absent","basis":"audit","evidence":"e"}}"#,
+                c.to_string().repeat(64),
+                digest(c)
+            )
+        };
+        let document = format!(
+            r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[{},{},{}]}}"#,
+            row('e'),
+            row('f'),
+            row('c')
+        );
+        let mut report = Report::from_ledger(&ledger);
+        report
+            .attest(
+                &AttestationLedger::parse(&document, std::path::Path::new("/plan"), "neo").unwrap(),
+            )
+            .unwrap();
+        let attested = report.attested.clone().unwrap();
+        assert!(attested.items.is_empty());
+        assert_eq!(
+            attested.rejected,
+            ['e', 'f', 'c']
+                .map(|c| (c.to_string().repeat(64), "native-refusal-untyped"))
+                .to_vec()
+        );
+        assert_eq!(report.remaining_unaccounted(), 3);
+        // Nor can a review: no row may name IO or FRAME_CODEC.
+        for code in ["IO", "FRAME_CODEC"] {
+            assert!(
+                Review::new(Scope::Policy, code, Decision::Accept, "jess", "2026-10-06").is_err()
+            );
+        }
+        assert!(!report.passes());
+        // The bare IO row still names its errno and the site that recorded
+        // it, under `recorded_refusal`: `refusal` is for typed refusals only.
+        let json = report.to_json();
+        assert!(json.contains(
+            "\"outcome\":\"refused\",\"disposition\":\"unaccounted\",\"recorded_refusal\":\"IO\",\"site\":\"outcome::legacy\",\"errno\":2,\"unaccounted_reason\":\"refusal-untyped-io\""
+        ), "{json}");
+        assert!(!json.contains("\"refusal\":"), "{json}");
+        // A legacy refusal naming no code is still a recorded refusal.
+        assert!(json.contains(
+            "\"outcome\":\"refused\",\"disposition\":\"unaccounted\",\"unaccounted_reason\":\"refusal-untyped\""
+        ), "{json}");
+    }
+
+    // S4: item rows dispose exactly their (item, code); a standing policy
+    // disposes its code for every item; rows that dispose nothing are listed.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reviews_dispose_typed_refusals_by_item_then_policy() {
+        let ledger = Ledger {
+            entries: vec![
+                entry(
+                    'a',
+                    true,
+                    Some(("refused", Some("CAPTURE_DRIFTED"))),
+                    JournalState::Absent,
+                ),
+                entry(
+                    'b',
+                    true,
+                    Some(("refused", Some("CAPTURE_DRIFTED"))),
+                    JournalState::Absent,
+                ),
+                entry(
+                    'c',
+                    true,
+                    Some(("refused", Some("GIT_NEST_STASHED"))),
+                    JournalState::Absent,
+                ),
+                entry(
+                    'd',
+                    true,
+                    Some(("refused", Some("IO"))),
+                    JournalState::Absent,
+                ),
+            ],
+            ..Ledger::default()
+        };
+        let mut reviews = reviews();
+        let review = |scope, code: &str, decision| {
+            Review::new(scope, code, decision, "jess", "2026-10-06").unwrap()
+        };
+        let mut report = Report::from_ledger(&ledger);
+        reviews.rows = vec![
+            review(scope(&report, 'a'), "CAPTURE_DRIFTED", Decision::Abandon),
+            // Names the right item with the wrong code: disposes nothing.
+            review(scope(&report, 'c'), "CAPTURE_DRIFTED", Decision::Accept),
+            review(scope(&report, 'd'), "CAPTURE_DRIFTED", Decision::Accept),
+            // Names b's refusal as it was against another capture or
+            // record: a review of an earlier instance disposes nothing now.
+            review(
+                Scope::Item {
+                    item: "b".repeat(64),
+                    instance: "0".repeat(64),
+                },
+                "CAPTURE_DRIFTED",
+                Decision::ReCarry,
+            ),
+        ];
+        report.dispose(&reviews);
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .map(|row| row.disposition.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Disposition::Refused("CAPTURE_DRIFTED".into()),
+                Disposition::RefusedPendingReview("CAPTURE_DRIFTED".into()),
+                Disposition::RefusedPendingReview("GIT_NEST_STASHED".into()),
+                Disposition::Unaccounted("refusal-untyped-io"),
+            ]
+        );
+        assert_eq!(
+            report.reviewed.as_ref().unwrap().unmatched,
+            vec![
+                (
+                    Some("b".repeat(64)),
+                    "CAPTURE_DRIFTED".to_owned(),
+                    "refusal-instance-stale"
+                ),
+                (
+                    Some("c".repeat(64)),
+                    "CAPTURE_DRIFTED".to_owned(),
+                    "no-such-refusal"
+                ),
+                (
+                    Some("d".repeat(64)),
+                    "CAPTURE_DRIFTED".to_owned(),
+                    "no-such-refusal"
+                ),
+            ]
+        );
+        assert_eq!(report.pending_review(), 2);
+        assert!(report.to_json().contains(&format!(
+            "\"unmatched\":[{{\"item\":\"{}\",\"refusal\":\"CAPTURE_DRIFTED\",\"reason\":\"refusal-instance-stale\"}}",
+            "b".repeat(64)
+        )));
+        // `closure-dispose` takes the instance from the report: only a
+        // typed refusal the item holds now is reviewable.
+        assert_eq!(
+            report.reviewable(&"a".repeat(64), "CAPTURE_DRIFTED"),
+            Some(report.rows[0].instance.as_str())
+        );
+        assert_eq!(report.reviewable(&"a".repeat(64), "GIT_NEST_STASHED"), None);
+        assert_eq!(report.reviewable(&"d".repeat(64), "IO"), None);
+        assert_eq!(report.reviewable(&"f".repeat(64), "CAPTURE_DRIFTED"), None);
+        reviews
+            .rows
+            .push(review(Scope::Policy, "CAPTURE_DRIFTED", Decision::ReCarry));
+        reviews
+            .rows
+            .push(review(Scope::Policy, "GIT_NEST_STASHED", Decision::Accept));
+        report.dispose(&reviews);
+        assert_eq!(report.pending_review(), 0);
+        // The item row still wins over the policy for its own item.
+        assert_eq!(
+            report.rows[0].review.as_ref().map(Review::decision),
+            Some(Decision::Abandon)
+        );
+        assert_eq!(
+            report.rows[1].review.as_ref().map(Review::basis),
+            Some("policy")
+        );
+        assert_eq!(report.refusals.get("CAPTURE_DRIFTED"), Some(&2));
+        // The bare IO is still unaccounted: the gate stays red.
+        assert_eq!((report.refused, report.unaccounted), (3, 1));
+        assert!(!report.passes());
+        assert!(report.native_passes() == (report.unaccounted == 0));
+        let json = report.to_json();
+        assert!(
+            json.contains("\"decisions\":{\"abandon\":1,\"accept\":1,\"re-carry\":1}"),
+            "{json}"
+        );
+    }
+
+    // S4: whether an attestation may close an item is decided from the
+    // item's decoded record, not from the reason it is unaccounted for. A
+    // bare IO recorded under another source is `record-source-mismatch`
+    // natively and is still a bare IO: no attestation closes it. Nor does
+    // one close a refusal whose code has left the taxonomy.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn attestation_cannot_close_an_untyped_refusal_under_any_reason() {
+        use crate::outcome::Refusal;
+        let with = |item: char, source: &str, refusal: Refusal| LedgerEntry {
+            record: Some(Ok(OutcomeRecord {
+                source: PathBuf::from(source),
+                outcome: Outcome::Refused(refusal),
+                reason: None,
+            })),
+            ..entry(item, true, None, JournalState::Absent)
+        };
+        let retired = "JOURNAL_RETIRED_FOR_THIS_TEST";
+        let ledger = Ledger {
+            entries: vec![
+                with(
+                    'a',
+                    "/elsewhere",
+                    Refusal::new("IO", "estate::apply", Some(5)).unwrap(),
+                ),
+                with(
+                    'b',
+                    "/elsewhere",
+                    Refusal::new("FRAME_CODEC", "estate::apply", None).unwrap(),
+                ),
+                with(
+                    'c',
+                    "/src/c",
+                    Refusal::decoded(retired, "estate::apply", None).unwrap(),
+                ),
+                with(
+                    'd',
+                    "/elsewhere",
+                    Refusal::decoded(retired, "estate::apply", None).unwrap(),
+                ),
+                // The control: a typed refusal under another source proves
+                // nothing about this item, and an attestation may close it.
+                with(
+                    'e',
+                    "/elsewhere",
+                    Refusal::new("GIT_NEST_STASHED", "estate::apply", None).unwrap(),
+                ),
+            ],
+            ..Ledger::default()
+        };
+        let mut report = Report::from_ledger(&ledger);
+        assert_eq!(
+            report
+                .rows
+                .iter()
+                .map(|row| row.disposition.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Disposition::Unaccounted("record-source-mismatch"),
+                Disposition::Unaccounted("record-source-mismatch"),
+                Disposition::Unaccounted("refusal-code-retired"),
+                Disposition::Unaccounted("record-source-mismatch"),
+                Disposition::Unaccounted("record-source-mismatch"),
+            ]
+        );
+        let row = |c: char| {
+            format!(
+                r#"{{"item":"{}","source":"/src/{c}","capture":"{}","disposition":"present","basis":"audit","evidence":"e"}}"#,
+                c.to_string().repeat(64),
+                digest(c)
+            )
+        };
+        let document = format!(
+            r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[{}]}}"#,
+            ['a', 'b', 'c', 'd', 'e'].map(row).join(",")
+        );
+        report
+            .attest(
+                &AttestationLedger::parse(&document, std::path::Path::new("/plan"), "neo").unwrap(),
+            )
+            .unwrap();
+        // A standing policy for every typed code changes nothing for them.
+        let mut reviews = reviews();
+        for code in BulkloadRefusal::CODES {
+            if crate::outcome::is_typed_code(code) {
+                reviews.rows.push(
+                    Review::new(Scope::Policy, code, Decision::Accept, "jess", "2026-10-06")
+                        .unwrap(),
+                );
+            }
+        }
+        report.dispose(&reviews);
+        let id = |c: char| c.to_string().repeat(64);
+        let attested = report.attested.clone().unwrap();
+        assert_eq!(
+            attested.rejected,
+            vec![
+                (id('a'), "native-refusal-untyped"),
+                (id('b'), "native-refusal-untyped"),
+                (id('c'), "native-refusal-code-retired"),
+                (id('d'), "native-refusal-code-retired"),
+            ]
+        );
+        assert_eq!(
+            attested
+                .items
+                .iter()
+                .map(|row| row.item.clone())
+                .collect::<Vec<_>>(),
+            vec![id('e')]
+        );
+        assert_eq!(report.remaining_unaccounted(), 4);
+        assert!(!report.passes());
+        assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
+        // No review reaches the retired code either, and none can be
+        // written for it.
+        assert_eq!(report.reviewable(&id('c'), retired), None);
+        let json = report.to_json();
+        assert!(json.contains(&format!(
+            "\"outcome\":\"refused\",\"disposition\":\"unaccounted\",\"recorded_refusal\":\"{retired}\",\"site\":\"estate::apply\",\"errno\":null,\"unaccounted_reason\":\"refusal-code-retired\""
+        )), "{json}");
+        assert!(json.contains(
+            "\"recorded_refusal\":\"IO\",\"site\":\"estate::apply\",\"errno\":5,\"unaccounted_reason\":\"record-source-mismatch\""
+        ), "{json}");
+        assert!(!json.contains("\"refusal\":\"IO\""), "{json}");
+    }
+
+    // S4: an item review is bound to the refusal instance it was made
+    // against. Run 1 refuses CAPTURE_DRIFTED and is reviewed; run 2 refuses
+    // the same code for the same item against a new capture, or with
+    // another record: the run-1 review does not dispose it.
+    #[test]
+    fn a_review_does_not_dispose_a_later_refusal_of_the_same_code() {
+        let run = |capture: char, reason: &str| {
+            let mut entry = entry(
+                'c',
+                true,
+                Some(("refused", Some(reason))),
+                JournalState::Absent,
+            );
+            entry.capture = Some(digest(capture));
+            Ledger {
+                entries: vec![entry],
+                ..Ledger::default()
+            }
+        };
+        let first = run('1', "CAPTURE_DRIFTED");
+        let mut report = Report::from_ledger(&first);
+        let mut reviews = reviews();
+        reviews.rows.push(
+            Review::new(
+                scope(&report, 'c'),
+                "CAPTURE_DRIFTED",
+                Decision::ReCarry,
+                "jess",
+                "2026-10-06",
+            )
+            .unwrap(),
+        );
+        report.dispose(&reviews);
+        assert!(report.passes());
+        // The same state read again is the same instance.
+        assert_eq!(
+            instance(&first.entries[0]),
+            instance(&run('1', "CAPTURE_DRIFTED").entries[0])
+        );
+
+        for later in [
+            // A new capture, the same record.
+            run('2', "CAPTURE_DRIFTED"),
+            // The same capture, another record (the reason differs).
+            run('1', "CAPTURE_DRIFTED again"),
+        ] {
+            assert_ne!(instance(&first.entries[0]), instance(&later.entries[0]));
+            let mut report = Report::from_ledger(&later);
+            report.dispose(&reviews);
+            assert_eq!(
+                report.rows[0].disposition,
+                Disposition::RefusedPendingReview("CAPTURE_DRIFTED".into())
+            );
+            assert_eq!(report.pending_review(), 1);
+            assert!(!report.passes());
+            assert_eq!(
+                report.reviewed.as_ref().unwrap().unmatched,
+                vec![(
+                    Some("c".repeat(64)),
+                    "CAPTURE_DRIFTED".to_owned(),
+                    "refusal-instance-stale"
+                )]
+            );
+            // A review of the new instance disposes it; the stale row is
+            // still listed.
+            let mut renewed = reviews.clone();
+            renewed.rows.push(
+                Review::new(
+                    scope(&report, 'c'),
+                    "CAPTURE_DRIFTED",
+                    Decision::Accept,
+                    "jess",
+                    "2026-10-07",
+                )
+                .unwrap(),
+            );
+            report.dispose(&renewed);
+            assert!(report.passes());
+            assert_eq!(report.reviewed.as_ref().unwrap().unmatched.len(), 1);
+        }
+    }
+
+    // A review row whose code has left the taxonomy disposes nothing and is
+    // listed; every other row of the ledger keeps working.
+    #[test]
+    fn a_retired_review_row_is_listed_and_the_rest_still_dispose() {
+        let ledger = Ledger {
+            entries: vec![entry(
+                'a',
+                true,
+                Some(("refused", Some("GIT_NEST_STASHED"))),
+                JournalState::Absent,
+            )],
+            ..Ledger::default()
+        };
+        let mut report = Report::from_ledger(&ledger);
+        let plan = std::path::Path::new("/plan");
+        let mut written = reviews();
+        written.rows.push(
+            Review::new(
+                scope(&report, 'a'),
+                "GIT_NEST_STASHED",
+                Decision::Accept,
+                "jess",
+                "2026-10-06",
+            )
+            .unwrap(),
+        );
+        // Two rows a binary that still held the code wrote: spliced into
+        // the encoded ledger, since no writer here can produce them.
+        let retired = "JOURNAL_RETIRED_FOR_THIS_TEST";
+        let current = "CAPTURE_DRIFTED";
+        written.rows.push(
+            Review::new(
+                Scope::Policy,
+                current,
+                Decision::Abandon,
+                "jess",
+                "2026-10-06",
+            )
+            .unwrap(),
+        );
+        written.rows.push(
+            Review::new(
+                scope(&report, 'a'),
+                current,
+                Decision::Abandon,
+                "jess",
+                "2026-10-06",
+            )
+            .unwrap(),
+        );
+        let bytes = written.encode().unwrap();
+        let spliced: Vec<u8> = {
+            // Postcard strings are length-prefixed: swap code and length.
+            let mut out = Vec::new();
+            let mut rest = bytes.as_slice();
+            let needle = [&[u8::try_from(current.len()).unwrap()], current.as_bytes()].concat();
+            while let Some(at) = rest.windows(needle.len()).position(|w| w == needle) {
+                out.extend_from_slice(&rest[..at]);
+                out.push(u8::try_from(retired.len()).unwrap());
+                out.extend_from_slice(retired.as_bytes());
+                rest = &rest[at + needle.len()..];
+            }
+            out.extend_from_slice(rest);
+            out
+        };
+        let read =
+            crate::disposition::Ledger::decode(&spliced, plan, &"d".repeat(64), "neo").unwrap();
+        assert_eq!(read.rows.len(), 3);
+        report.dispose(&read);
+        assert!(report.passes());
+        assert_eq!(
+            report.reviewed.as_ref().unwrap().unmatched,
+            vec![
+                (None, retired.to_owned(), "refusal-code-retired"),
+                (
+                    Some("a".repeat(64)),
+                    retired.to_owned(),
+                    "refusal-code-retired"
+                ),
+            ]
+        );
+        let json = report.to_json();
+        assert!(json.contains(&format!(
+            "\"unmatched\":[{{\"item\":null,\"refusal\":\"{retired}\",\"reason\":\"refusal-code-retired\"}}"
+        )), "{json}");
+    }
+
+    mod p73 {
+        //! P73 CLOSURE-DISPOSITION (WP3 PR 3, S4): closure is green iff every
+        //! typed refusal carries a review of its current instance (or a
+        //! standing policy) and no untyped or retired-code refusal exists.
+        //! Red on a generated ledger with one undispositioned refusal, one
+        //! refusal reviewed only as an earlier instance, or one bare IO
+        //! (under the item's own source or another), even when every typed
+        //! code has a standing policy and the bare IO is attested.
+
+        use super::*;
+        use crate::outcome::Refusal;
+        use crate::test_support::prop_config;
+        use proptest::prelude::*;
+
+        #[derive(Debug, Clone)]
+        enum Kind {
+            Applied,
+            Referenced,
+            /// A typed refusal (index into the typed codes) and how it is
+            /// reviewed: 0 none, 1 an item row for its instance, 2 a
+            /// standing policy, 3 an item row for another instance.
+            Typed(usize, u8),
+            BareIo(Option<i32>),
+            /// A bare IO whose record names another source: natively
+            /// `record-source-mismatch`, and still a bare IO.
+            BareIoElsewhere(Option<i32>),
+            FrameCodec,
+            Untyped,
+            /// A refusal whose code has left the taxonomy.
+            Retired,
+        }
+
+        const RETIRED: &str = "RETIRED_FOR_P73";
+
+        fn typed_codes() -> Vec<&'static str> {
+            BulkloadRefusal::CODES
+                .iter()
+                .copied()
+                .filter(|code| crate::outcome::is_typed_code(code))
+                .collect()
+        }
+
+        fn kind(untyped: bool) -> BoxedStrategy<Kind> {
+            let typed = (0..typed_codes().len(), 0..4_u8).prop_map(|(c, r)| Kind::Typed(c, r));
+            if untyped {
+                prop_oneof![
+                    3 => Just(Kind::Applied),
+                    3 => Just(Kind::Referenced),
+                    6 => typed,
+                    1 => proptest::option::of(any::<i32>()).prop_map(Kind::BareIo),
+                    1 => proptest::option::of(any::<i32>()).prop_map(Kind::BareIoElsewhere),
+                    1 => Just(Kind::FrameCodec),
+                    1 => Just(Kind::Untyped),
+                    1 => Just(Kind::Retired),
+                ]
+                .boxed()
+            } else {
+                prop_oneof![Just(Kind::Applied), Just(Kind::Referenced), typed].boxed()
+            }
+        }
+
+        fn item(index: usize) -> String {
+            format!("{index:064x}")
+        }
+
+        fn refused(refusal: Refusal) -> OutcomeRecord {
+            refused_under("", refusal)
+        }
+
+        fn refused_under(source: &str, refusal: Refusal) -> OutcomeRecord {
+            OutcomeRecord {
+                source: PathBuf::from(source),
+                outcome: Outcome::Refused(refusal),
+                reason: None,
+            }
+        }
+
+        // The ledger, the review ledger and the model's verdict.
+        #[allow(clippy::too_many_lines)]
+        fn build(kinds: &[Kind]) -> (Ledger, crate::disposition::Ledger, bool) {
+            let codes = typed_codes();
+            let mut reviews = reviews();
+            let mut entries: Vec<LedgerEntry> = Vec::new();
+            for (index, kind) in kinds.iter().enumerate() {
+                let (has_workspace, outcome, journal) = match kind {
+                    Kind::Applied => (
+                        true,
+                        Some(Ok(OutcomeRecord {
+                            source: PathBuf::new(),
+                            outcome: Outcome::WorkspaceRestored,
+                            reason: None,
+                        })),
+                        JournalState::Present("workspace-restored".into()),
+                    ),
+                    Kind::Referenced => (
+                        false,
+                        Some(Ok(OutcomeRecord {
+                            source: PathBuf::new(),
+                            outcome: Outcome::RefsImported,
+                            reason: None,
+                        })),
+                        JournalState::Present("refs-imported".into()),
+                    ),
+                    Kind::Typed(code, _) => (
+                        true,
+                        Some(Ok(refused(
+                            Refusal::new(codes[*code], "estate::apply", None).unwrap(),
+                        ))),
+                        JournalState::Absent,
+                    ),
+                    Kind::BareIo(errno) => {
+                        // No review can name it.
+                        assert!(Review::new(
+                            Scope::Item {
+                                item: item(index),
+                                instance: item(index),
+                            },
+                            "IO",
+                            Decision::Accept,
+                            "p73",
+                            "2026-10-06"
+                        )
+                        .is_err());
+                        (
+                            true,
+                            Some(Ok(refused(
+                                Refusal::new("IO", "estate::apply", *errno).unwrap(),
+                            ))),
+                            JournalState::Absent,
+                        )
+                    }
+                    Kind::BareIoElsewhere(errno) => (
+                        true,
+                        Some(Ok(refused_under(
+                            "/elsewhere",
+                            Refusal::new("IO", "estate::apply", *errno).unwrap(),
+                        ))),
+                        JournalState::Absent,
+                    ),
+                    Kind::FrameCodec => (
+                        true,
+                        Some(Ok(refused(
+                            Refusal::new("FRAME_CODEC", "estate::apply", None).unwrap(),
+                        ))),
+                        JournalState::Absent,
+                    ),
+                    Kind::Retired => (
+                        true,
+                        Some(Ok(refused(
+                            Refusal::decoded(RETIRED, "estate::apply", None).unwrap(),
+                        ))),
+                        JournalState::Absent,
+                    ),
+                    Kind::Untyped => (
+                        true,
+                        Some(Err(Unreadable::RefusalUntyped)),
+                        JournalState::Absent,
+                    ),
+                };
+                entries.push(LedgerEntry {
+                    item: item(index),
+                    source: PathBuf::new(),
+                    has_workspace,
+                    record: outcome,
+                    journal,
+                    capture: Some(item(index)),
+                });
+                let Kind::Typed(code, how) = kind else {
+                    continue;
+                };
+                // An item row names the refusal instance it reviews: the
+                // entry's own (1), or another one (3: a review made against
+                // an earlier capture or record).
+                let scope = match how {
+                    1 => Scope::Item {
+                        item: item(index),
+                        instance: entries.last().map(instance).unwrap(),
+                    },
+                    2 => Scope::Policy,
+                    3 => Scope::Item {
+                        item: item(index),
+                        instance: item(index),
+                    },
+                    _ => continue,
+                };
+                reviews.rows.push(
+                    Review::new(scope, codes[*code], Decision::Accept, "p73", "2026-10-06")
+                        .unwrap(),
+                );
+            }
+            // The model, from the kinds alone: every typed refusal is
+            // reviewed as its own instance or its code has a standing
+            // policy somewhere in the ledger, and nothing is untyped or
+            // retired.
+            let policy = |code: &usize| {
+                kinds
+                    .iter()
+                    .any(|kind| matches!(kind, Kind::Typed(other, 2) if other == code))
+            };
+            let green = kinds.iter().all(|kind| match kind {
+                Kind::Applied | Kind::Referenced => true,
+                Kind::Typed(code, how) => *how == 1 || policy(code),
+                Kind::BareIo(_)
+                | Kind::BareIoElsewhere(_)
+                | Kind::FrameCodec
+                | Kind::Untyped
+                | Kind::Retired => false,
+            });
+            (
+                Ledger {
+                    entries,
+                    ..Ledger::default()
+                },
+                reviews,
+                green,
+            )
+        }
+
+        // An attestation that tries to close every natively unaccounted item.
+        fn attest_everything(report: &mut Report) {
+            let rows: Vec<String> = report
+                .rows
+                .iter()
+                .filter(|row| matches!(row.disposition, Disposition::Unaccounted(_)))
+                .map(|row| {
+                    format!(
+                        r#"{{"item":"{}","source":"","capture":"{}","disposition":"present","basis":"audit","evidence":"p73"}}"#,
+                        row.item, row.item
+                    )
+                })
+                .collect();
+            let document = format!(
+                r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[{}]}}"#,
+                rows.join(",")
+            );
+            report
+                .attest(
+                    &AttestationLedger::parse(&document, std::path::Path::new("/plan"), "neo")
+                        .unwrap(),
+                )
+                .unwrap();
+        }
+
+        proptest! {
+            #![proptest_config(prop_config(256))]
+
+            /// Green iff every typed refusal is dispositioned and nothing is
+            /// untyped, whatever an attestation claims for the untyped ones.
+            #[test]
+            fn p73_closure_is_green_iff_every_refusal_is_dispositioned(
+                kinds in proptest::collection::vec(kind(true), 0..12),
+                attest in any::<bool>(),
+            ) {
+                let (ledger, reviews, green) = build(&kinds);
+                let mut report = Report::from_ledger(&ledger);
+                report.dispose(&reviews);
+                if attest {
+                    attest_everything(&mut report);
+                    let attested = report.attested.as_ref().unwrap();
+                    prop_assert!(attested.items.is_empty());
+                }
+                prop_assert_eq!(report.passes(), green, "{:?}", kinds);
+                prop_assert_eq!(report.gate().is_ok(), green);
+                // Typed refusals are never unaccounted and untyped ones never
+                // pending review: the two sets do not mix.
+                let typed = kinds.iter().filter(|kind| matches!(kind, Kind::Typed(..))).count() as u64;
+                prop_assert_eq!(report.refused + report.refused_pending_review, typed);
+                prop_assert_eq!(
+                    report.unaccounted,
+                    kinds.len() as u64 - typed
+                        - kinds.iter().filter(|kind| matches!(kind, Kind::Applied | Kind::Referenced)).count() as u64
+                );
+            }
+
+            /// A green ledger turns red with one more typed refusal that is
+            /// undispositioned or reviewed only as another instance, or one
+            /// more bare IO (under the item's source or another), even when
+            /// every typed code has a standing policy and the IO item is
+            /// attested.
+            #[test]
+            fn p73_one_undispositioned_refusal_or_bare_io_turns_it_red(
+                kinds in proptest::collection::vec(kind(false), 0..10),
+                code in 0..typed_codes().len(),
+                errno in proptest::option::of(any::<i32>()),
+                stale in any::<bool>(),
+                elsewhere in any::<bool>(),
+            ) {
+                let reviewed: Vec<Kind> = kinds
+                    .into_iter()
+                    .map(|kind| match kind {
+                        // Item rows only, so the new refusal's code has no
+                        // policy to fall back on.
+                        Kind::Typed(code, _) => Kind::Typed(code, 1),
+                        other => other,
+                    })
+                    .collect();
+                let (ledger, reviews, green) = build(&reviewed);
+                prop_assert!(green);
+                let mut report = Report::from_ledger(&ledger);
+                report.dispose(&reviews);
+                prop_assert!(report.passes());
+
+                let mut pending = reviewed.clone();
+                pending.push(Kind::Typed(code, if stale { 3 } else { 0 }));
+                let (ledger, reviews, green) = build(&pending);
+                prop_assert!(!green);
+                prop_assert!(reviews.rows.iter().all(|row| row.scope() != &Scope::Policy));
+                let mut report = Report::from_ledger(&ledger);
+                report.dispose(&reviews);
+                prop_assert!(!report.passes());
+                prop_assert_eq!(report.pending_review(), 1);
+
+                let mut bare = reviewed;
+                bare.push(if elsewhere {
+                    Kind::BareIoElsewhere(errno)
+                } else {
+                    Kind::BareIo(errno)
+                });
+                let (ledger, mut reviews, _) = build(&bare);
+                for typed in typed_codes() {
+                    reviews.rows.push(Review::new(Scope::Policy, typed, Decision::Accept, "p73", "2026-10-06").unwrap());
+                }
+                let mut report = Report::from_ledger(&ledger);
+                report.dispose(&reviews);
+                attest_everything(&mut report);
+                prop_assert!(!report.passes());
+                prop_assert_eq!(report.pending_review(), 0);
+                prop_assert_eq!(report.remaining_unaccounted(), 1);
+                prop_assert_eq!(
+                    &report.attested.as_ref().unwrap().rejected,
+                    &vec![(item(bare.len() - 1), "native-refusal-untyped")]
+                );
+            }
+        }
     }
 }

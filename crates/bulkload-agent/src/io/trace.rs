@@ -66,6 +66,8 @@ pub enum Event {
     },
     /// Permission bits set with `fchmod`.
     SetMode { node: NodeId, mode: u32 },
+    /// The capture record (#169) set with `fsetxattr`: metadata, like a mode.
+    SetCaptureRecord { node: NodeId, record: Vec<u8> },
     /// A sync call on `node`.
     Sync { node: NodeId, kind: SyncKind },
     /// A new symbolic link `name` in `dir` holding `target` literally.
@@ -119,6 +121,10 @@ pub enum CommitRecord {
     },
     /// A directory's final mode is durable and its record retired.
     DirectoryComplete { key: Vec<u8> },
+    /// The store's `root_sealed` setting (#161): `Store::open` sealed the
+    /// state root's entry and its database's entry before this commit, and
+    /// every later open trusts the marker without sealing again.
+    RootSealed,
 }
 
 #[cfg(feature = "io-trace")]

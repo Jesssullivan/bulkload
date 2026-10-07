@@ -19,13 +19,38 @@ use std::process::Command;
 use crate::{BulkloadRefusal, Result};
 
 mod batch_objects;
-pub mod carry_v2;
 pub mod chain;
+pub mod decide;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod decide_tests;
 pub mod estimate;
 mod raw_tree;
+mod ref_table;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod refs_scale_tests;
 pub mod registered;
 mod shallow;
 pub mod shared;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod source_inert_tests;
 
 /// The one Git hardening table (WP1 PR 1, S2; OI-1003-Q16). Every Git child
 /// the v1 carry and the estimate spawn is built from it by [`git`], and the
@@ -64,6 +89,12 @@ pub(crate) mod git_env {
 
     /// `-c` overrides every Git child runs with: no hooks, no fsmonitor, no
     /// automatic gc or maintenance, and bounded pack resources.
+    ///
+    /// `fastimport.unpackLimit=0` keeps every `fast-import` pack whole. Below
+    /// the limit (100 objects by default) fast-import explodes its pack into
+    /// loose objects through Git's object writer, which freshens (re-stamps)
+    /// any copy an alternate already holds: the source's, for a capture's raw
+    /// tree (S2, #162). Its own pack store never freshens.
     pub const CONFIG: &[&str] = &[
         "core.hooksPath=/dev/null",
         "core.fsmonitor=false",
@@ -71,7 +102,22 @@ pub(crate) mod git_env {
         "maintenance.auto=false",
         "pack.threads=2",
         "pack.windowMemory=64m",
+        "fastimport.unpackLimit=0",
     ];
+
+    /// The object store a capture's private repository writes into, a
+    /// sibling of its `objects` (S2, #162).
+    ///
+    /// Git freshens (re-stamps with `utime`) any existing copy of an object
+    /// it is asked to write, in its own store or in any alternate. The
+    /// private repository reads the source's store through
+    /// `objects/info/alternates`, so a writer that could see it would write
+    /// to the source. Every `hash-object -w`, `mktree` and `write-tree` of a
+    /// capture therefore runs with `GIT_OBJECT_DIRECTORY` here
+    /// ([`super::git_writer`]), and this store borrows nothing. The private
+    /// repository's own store lists it as its first alternate, so every
+    /// reader (bundle, pack, fetch, fast-import, update-ref) sees both.
+    pub const WRITE_STORE: &str = "objects-written";
 }
 
 /// A Git child for the repository at `repo`, hardened from [`git_env`]:
@@ -101,6 +147,22 @@ fn git(repo: &Path) -> Command {
         command.env("GIT_CEILING_DIRECTORIES", ceiling);
     }
     command
+}
+
+/// A Git child that writes objects into the capture's private repository at
+/// `private` (absolute, as [`prepare_private`] returns it) and sees no other
+/// store: [`git`], plus `GIT_OBJECT_DIRECTORY` at its
+/// [`git_env::WRITE_STORE`]. The source's object store is then strictly
+/// read-only to the capture (S2, #162).
+fn git_writer(private: &Path) -> Command {
+    let mut command = git(private);
+    writing_privately(&mut command, private);
+    command
+}
+
+// Point `command`'s object writes at `private`'s write store; see [`git_writer`].
+fn writing_privately<'a>(command: &'a mut Command, private: &Path) -> &'a mut Command {
+    command.env("GIT_OBJECT_DIRECTORY", private.join(git_env::WRITE_STORE))
 }
 
 /// Whether the repository at `repo` is a partial clone.
@@ -297,7 +359,8 @@ fn input(command: &mut Command, bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Run a git child that packs objects (`bundle create`, `pack-objects`,
-/// `rev-list`), feeding it `stdin`, and reap it with `wait4` so its own
+/// `rev-list`) or completes a thin pack it fetched (`fetch` of a retained
+/// capture), feeding it `stdin`, and reap it with `wait4` so its own
 /// resource usage is measured. Returns its storage reads in bytes
 /// (`ru_inblock` x 512; see the `counters` module notes for why this is a
 /// lower bound, and only a lower bound on Darwin). The caller sets stdout;
@@ -367,12 +430,15 @@ fn reap(child: &std::process::Child) -> Result<(bool, u64)> {
 }
 
 fn metadata(private: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    let value = input(git(private).args(["hash-object", "-w", "--stdin"]), bytes)?;
+    let value = input(
+        git_writer(private).args(["hash-object", "-w", "--stdin"]),
+        bytes,
+    )?;
     let value = std::str::from_utf8(&value)
         .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
         .trim();
     let tree = input(
-        git(private).args(["mktree", "-z"]),
+        git_writer(private).args(["mktree", "-z"]),
         format!("100644 blob {value}\tvalue\0").as_bytes(),
     )?;
     let tree = std::str::from_utf8(&tree)
@@ -411,17 +477,39 @@ fn snapshot_command(private: &Path, worktree: &Path, index: &Path) -> Command {
     command
 }
 
+/// Author and committer of every archival commit: the fixed identity and
+/// instant (2000-01-01T00:00:00Z) `commit-tree` was always run under.
+const ARCHIVAL_SIGNATURE: &str = "Bulkload archival capture <bulkload@localhost> 946684800 +0000";
+
+// A parentless archival commit of `tree` in the private repository's write
+// store (S2, #162).
 fn commit_tree(private: &Path, tree: &str, label: &str) -> Result<String> {
-    text(
-        git(private)
-            .env("GIT_AUTHOR_NAME", "Bulkload archival capture")
-            .env("GIT_AUTHOR_EMAIL", "bulkload@localhost")
-            .env("GIT_COMMITTER_NAME", "Bulkload archival capture")
-            .env("GIT_COMMITTER_EMAIL", "bulkload@localhost")
-            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
-            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
-            .args(["commit-tree", tree, "-m", label]),
-    )
+    commit_object(&mut git_writer(private), tree, label)
+}
+
+// A parentless commit of `tree` under [`ARCHIVAL_SIGNATURE`], written by
+// `writer` with `hash-object -t commit`: byte for byte what `git commit-tree
+// -m label` writes under that identity (pinned by a test), without requiring
+// `tree` in the writer's store. A capture's writer sees only its write store,
+// and a raw tree fast-import found in a source pack is not stored there.
+fn commit_object(writer: &mut Command, tree: &str, label: &str) -> Result<String> {
+    if !oid(tree) || label.contains('\n') {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let commit = format!(
+        "tree {tree}\nauthor {ARCHIVAL_SIGNATURE}\ncommitter {ARCHIVAL_SIGNATURE}\n\n{label}\n"
+    );
+    let value = input(
+        writer.args(["hash-object", "-t", "commit", "-w", "--stdin"]),
+        commit.as_bytes(),
+    )?;
+    let value = std::str::from_utf8(&value)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+        .trim_end();
+    if !oid(value) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    Ok(value.to_owned())
 }
 
 // Build a raw tree without running attributes/filters or starting Git per file.
@@ -438,7 +526,23 @@ fn capture_tree(private: &Path, repo: &Path, _index: &Path) -> Result<String> {
 
 // `stash` is the reflog read with the carried authority, never re-read here:
 // the bundle carries exactly the stash commits the snapshot saw.
+//
+// The carried map is written as the private repository's ref table and one
+// tip ref per distinct object (OI-1003-Q54, `ref_table`), not as one private
+// ref per carried ref: the bundle header then grows with the distinct
+// objects, and the private repository writes that many refs, not one per
+// carried ref (#178).
 fn capture_refs(private: &Path, inventory: &str, stash: &[u8]) -> Result<()> {
+    ref_table::write(private, &exported_refs(inventory, stash)?)
+}
+
+// Every ref a capture carries, by exported name: the inventory's refs under
+// `refs/carry-export/` (a canonical carry ref under `union/v1/`), then each
+// stash commit not already named.
+fn exported_refs(
+    inventory: &str,
+    stash: &[u8],
+) -> Result<std::collections::BTreeMap<String, String>> {
     let mut pending = std::collections::BTreeMap::new();
     for line in inventory.lines() {
         let (value, name) = line
@@ -468,23 +572,7 @@ fn capture_refs(private: &Path, inventory: &str, stash: &[u8]) -> Result<()> {
         let name = format!("refs/carry-export/stashes/{value}");
         pending.entry(name).or_insert_with(|| value.to_owned());
     }
-    // One create-only Git transaction instead of one process per ref. NUL
-    // framing preserves legal quote characters without command interpolation.
-    let mut commands = Vec::new();
-    for (name, value) in pending {
-        commands.extend_from_slice(b"create ");
-        commands.extend_from_slice(name.as_bytes());
-        commands.push(0);
-        commands.extend_from_slice(value.as_bytes());
-        commands.push(0);
-    }
-    if !commands.is_empty() {
-        input(
-            git(private).args(["update-ref", "--stdin", "-z"]),
-            &commands,
-        )?;
-    }
-    Ok(())
+    Ok(pending)
 }
 
 fn source_slug(source: &str) -> bool {
@@ -1016,6 +1104,7 @@ fn repair_missing_index_inner(
     const SITE: &str = "git_carry::repair_missing_index_inner";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     let staged = stage_bundle(bundle)?;
+    refuse_bare_capture(&staged)?;
     bind(&staged.digest())?;
     let bundle = staged.path();
     let repo = fs::canonicalize(repo).refuse_at(SITE)?;
@@ -1453,9 +1542,24 @@ fn export_pass(
     let census = capture_census_planned(repo, common, options.policy, options.planned)?;
     let seats = &census.rows;
     let private = carry_authority(repo, capture, &before_refs, &authority)?;
+    // S4 (#162): a bare capture says so in-band, so every verb that lays down
+    // a workspace refuses it up front ([`refuse_bare_capture`]).
+    if census.bare {
+        metadata(&private, BARE_METADATA, b"true\n")?;
+    }
     let index = capture.join("index");
-    fs::write(&index, &authority.index).refuse_at("git_carry::export_pass")?;
-    let staged = text(snapshot_command(&private, repo, &index).arg("write-tree"))?;
+    // A bare repository carries no index (S4, #162); Git reads the absent
+    // file as the empty index, so its staged tree is the empty tree.
+    if !authority.index.is_empty() {
+        fs::write(&index, &authority.index).refuse_at("git_carry::export_pass")?;
+    }
+    // Built in the write store, which cannot see the source's (S2, #162), so
+    // the index's blobs are not looked up (`--missing-ok`). Packing the bundle
+    // below reads both stores and still needs every blob it carries.
+    let staged = text(
+        writing_privately(&mut snapshot_command(&private, repo, &index), &private)
+            .args(["write-tree", "--missing-ok"]),
+    )?;
     set_ref(
         &private,
         "refs/carry-export/staged",
@@ -1485,6 +1589,7 @@ fn export_pass(
         || census.nested_worktrees != after.nested_worktrees
         || census.nested_repositories != after.nested_repositories
         || census.omitted != after.omitted
+        || census.bare != after.bare
     {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
@@ -1532,12 +1637,10 @@ fn export_pass(
     }
     mark_drift(&private, &drift)?;
     let bundle = capture.join("capture.bundle");
-    // A plan base wins; otherwise a retained capture's source-held tips are
-    // the prerequisites (WP2); otherwise the bundle is self-contained.
-    let (pack, chained) = match (options.prerequisite, options.chain) {
-        (None, Some(prior)) => shared::write_chained(&private, &bundle, repo, prior)?,
-        (base, _) => (shared::write_bundle(&private, &bundle, base)?, false),
-    };
+    // The decision core decides what the bundle depends on (OI-1003-Q43),
+    // from the offer (a plan base, a link to chain on) and this pass's source.
+    let offer = shared::Offer::of(options.prerequisite, options.chain, repo);
+    let (pack, chained) = shared::write_capture(&private, &bundle, offer, shared::HEADER_CAP)?;
     output(git(&private).args(["bundle", "verify"]).arg(&bundle))?;
     #[cfg(test)]
     mid_pass::fire(repo, mid_pass::Stage::AfterPass);
@@ -1659,6 +1762,31 @@ fn drift_marked(heads: &str) -> bool {
     })
 }
 
+// S4 (#162): whether `heads` (a bundle's headers, or a shallow envelope's
+// inner inventory) mark a capture of a bare repository.
+fn bare_marked(heads: &str) -> bool {
+    let plain = format!("refs/carry-export/{BARE_METADATA}");
+    heads.lines().any(|line| {
+        line.split_once(' ')
+            .is_some_and(|(_, name)| name == plain || name == shallow::BARE_MARKER)
+    })
+}
+
+/// S4 (#162): a bare capture is ref custody with no index or worktree. Every
+/// verb that lays down a workspace, an index or a payload attachment from a
+/// capture calls this first, so it refuses before anything is written; only
+/// an import (`refs-imported`) carries such a capture. Estate apply calls it
+/// too, before any plan base is imported for a workspace item.
+///
+/// # Errors
+/// `GIT_BARE_CAPTURE_WORKSPACE` for a capture of a bare repository.
+pub(crate) const fn refuse_bare_capture(staged: &StagedBundle) -> Result<()> {
+    if staged.bare {
+        return Err(BulkloadRefusal::GitBareCaptureWorkspace);
+    }
+    Ok(())
+}
+
 // A directory this process created exclusively (mode 0700, named by a
 // process-wide counter, never reused), removed when dropped. Created in the
 // first `near` directory that accepts it, else in TMPDIR.
@@ -1717,6 +1845,8 @@ pub struct StagedBundle {
     _directory: PrivateDir,
     bundle: PathBuf,
     digest: [u8; 32],
+    // Whether its headers mark a capture of a bare repository (S4, #162).
+    bare: bool,
 }
 
 impl StagedBundle {
@@ -1793,6 +1923,7 @@ pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
         _directory: directory,
         bundle: path,
         digest,
+        bare: bare_marked(&heads),
     })
 }
 
@@ -1875,24 +2006,43 @@ fn retained_blobs(
     seats: &[crate::RowSchema],
     now_ns: i128,
 ) -> Result<raw_tree::Reuse> {
+    use crate::counters::{add, Counter};
     use bulkload_proto::FileKind;
+    const SITE: &str = "git_carry::retained_blobs";
     let mut reuse = raw_tree::Reuse::new();
     // The fetch reads the whole retained bundle, whatever it then keeps.
-    crate::counters::add(
-        crate::counters::Counter::SourceCaptureReuseRead,
-        fs::symlink_metadata(retained.bundle)
-            .refuse_at("git_carry::retained_blobs")?
-            .len(),
+    add(
+        Counter::SourceCaptureReuseRead,
+        fs::symlink_metadata(retained.bundle).refuse_at(SITE)?.len(),
     );
-    output(
+    let packs = private.join("objects/pack");
+    let before = pack_files(&packs)?;
+    // Measured like the packing children (R25): a thin retained capture (a
+    // chained link or a grouped item, OI-1003-Q42) names delta bases it does
+    // not carry, and the fetch's `index-pack --fix-thin` reads each one from
+    // the source object store to complete the pack it writes here.
+    let storage_read = pack_child(
         git(private)
             .args(["fetch", "--no-tags", "--quiet"])
             .arg(retained.bundle)
             .args([
                 "+refs/carry-export/worktree:refs/carry-reuse/worktree",
                 "+refs/carry-export/filesystem-v1:refs/carry-reuse/filesystem-v1",
-            ]),
+            ])
+            .stdout(std::process::Stdio::null()),
+        None,
     )?;
+    add(Counter::SourcePackReadback, storage_read);
+    // Those bases are source reads beside the bundle: the written pack's
+    // growth over the bundle's own pack, exactly what fix-thin appended.
+    let written = pack_files(&packs)?
+        .into_iter()
+        .filter(|(name, _)| !before.contains_key(name))
+        .fold(0u64, |total, (_, length)| total.saturating_add(length));
+    add(
+        Counter::SourceCaptureReuseRead,
+        written.saturating_sub(shared::bundle_pack_len(retained.bundle)?),
+    );
     let held: Vec<crate::RowSchema> = postcard::from_bytes(&output(
         git(private).args(["show", "refs/carry-reuse/filesystem-v1:value"]),
     )?)
@@ -1940,6 +2090,23 @@ fn retained_blobs(
         }
     }
     Ok(reuse)
+}
+
+// The `.pack` files in a pack directory, by name, with their lengths.
+fn pack_files(packs: &Path) -> Result<std::collections::BTreeMap<std::ffi::OsString, u64>> {
+    const SITE: &str = "git_carry::pack_files";
+    let mut found = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(packs).refuse_at(SITE)? {
+        let entry = entry.refuse_at(SITE)?;
+        let name = entry.file_name();
+        if Path::new(&name)
+            .extension()
+            .is_some_and(|ext| ext == "pack")
+        {
+            found.insert(name, entry.metadata().refuse_at(SITE)?.len());
+        }
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -2109,8 +2276,11 @@ pub struct ExportOptions<'a> {
     pub planned: &'a [PathBuf],
     /// A retained capture bundle of this checkout whose source-held tips
     /// become this bundle's prerequisites, so only what is new since it is
-    /// packed (WP2, see [`chain`]). Ignored when `prerequisite` is set. The
-    /// caller owns the chain's custody and depth bound.
+    /// packed (WP2, see [`chain`]). Whether they do is the decision core's
+    /// ([`decide::decide`]): under v1's policy a plan base (`prerequisite`)
+    /// wins, and a shallow source, or one that holds none of its tips, gets
+    /// a self-contained bundle. The caller owns the chain's custody and
+    /// depth bound.
     pub chain: Option<&'a Path>,
 }
 
@@ -2229,6 +2399,10 @@ struct Census {
     /// census: a rebuildable root's contents are exactly what must not be able
     /// to invalidate a capture in flight.
     omitted: Vec<Vec<u8>>,
+    /// Whether the root is a bare repository at its own git dir (S4, #162):
+    /// ref custody only, recorded in the capture so no workspace is ever
+    /// laid down from it.
+    bare: bool,
 }
 
 /// Rebuildable roots a capture of `repo` would omit, with their measured sizes.
@@ -2316,7 +2490,44 @@ fn capture_census_planned(
     policy: CapturePolicy,
     planned: &[PathBuf],
 ) -> Result<Census> {
+    // S4 (#162): a bare repository's root is its own administration. It has
+    // no worktree, so no seat, nest or omission to census.
+    if bare_root(root)? {
+        return Ok(Census {
+            rows: Vec::new(),
+            nested_worktrees: Vec::new(),
+            nested_repositories: Vec::new(),
+            omitted: Vec::new(),
+            bare: true,
+        });
+    }
     filesystem_census(root, Some(common), policy, planned)
+}
+
+// S4 (#162): whether `root` is a bare repository at its own git dir, by Git's
+// own verdict, in one child. The census and the index read share this one
+// predicate. A non-bare `.git` directory given as a root is not bare. A bare
+// repository reached through any other path, such as a `.git` gitfile naming
+// a bare git dir (the bare-plus-worktrees layout), is not a repository root
+// and refuses GIT_REPOSITORY_NOT_AT_PATH, exactly as the estimate probe does:
+// carrying it would census the bare administration as worktree seats.
+fn bare_root(root: &Path) -> Result<bool> {
+    const SITE: &str = "git_carry::bare_root";
+    let answer = text(git(root).args(["rev-parse", "--is-bare-repository", "--absolute-git-dir"]))?;
+    let (bare, git_dir) = answer
+        .split_once('\n')
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    match bare {
+        "false" => Ok(false),
+        "true"
+            if fs::canonicalize(git_dir).refuse_at(SITE)?
+                == fs::canonicalize(root).refuse_at(SITE)? =>
+        {
+            Ok(true)
+        }
+        "true" => Err(BulkloadRefusal::GitRepositoryNotAtPath),
+        _ => Err(BulkloadRefusal::GitInventoryMalformed),
+    }
 }
 
 // A name on the fixed list is only rebuildable if Git tracks nothing beneath
@@ -2344,6 +2555,12 @@ const GITDIR_POINTER_LIMIT: u64 = 64 * 1024;
 
 /// Metadata ref naming the refs and seats that drifted under one capture pass.
 const CAPTURE_DRIFT_METADATA: &str = "capture-drift-v1";
+
+/// Metadata ref marking a capture of a bare repository (S4, #162): ref
+/// custody with no index or worktree. Written only for a bare source, so
+/// every other capture's bundle is unchanged. A shallow envelope lifts it
+/// into its headers ([`shallow::BARE_MARKER`]).
+const BARE_METADATA: &str = "bare-repository-v1";
 /// Largest drift list a single capture may report.
 ///
 /// Unbounded drift is indistinguishable from a rebuild of the checkout and must
@@ -3869,6 +4086,13 @@ fn filesystem_census(
                 return Err(BulkloadRefusal::GitInventoryMalformed);
             }
             let path = entry.path();
+            // The repository's own administration, reached through a `.git`
+            // gitfile and lying below the root (`git init
+            // --separate-git-dir`), is no more a seat than a root `.git`
+            // directory: its refs, objects and authority are the bundle's.
+            if common.is_some_and(|common| path == common) {
+                continue;
+            }
             let meta = fs::symlink_metadata(&path).refuse_at("git_carry::filesystem_census")?;
             let relative = path
                 .strip_prefix(root)
@@ -3930,6 +4154,7 @@ fn filesystem_census(
         nested_worktrees,
         nested_repositories,
         omitted,
+        bare: false,
     })
 }
 
@@ -4374,7 +4599,26 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
         "--git-path",
         "index",
     ]))?);
-    let before_index = fs::read(&index_path).refuse_at("git_carry::source_index")?;
+    let before_index = match fs::read(&index_path) {
+        Ok(bytes) => bytes,
+        // S4 (#162): a bare repository at its own git dir has no index and no
+        // worktree for one to describe. It carries none: its staged and
+        // worktree trees are empty, and its refs, HEAD and administration are
+        // its custody. A bare repository reached through any other path
+        // refuses GIT_REPOSITORY_NOT_AT_PATH ([`bare_root`]). A non-bare
+        // repository without an index (a `--no-checkout` clone or worktree)
+        // refuses GIT_INVENTORY_INDEX_ABSENT: Git reads the absent file as an
+        // unborn index that `git checkout` populates, which no carried index
+        // file can restore.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return if bare_root(repo)? {
+                Ok((index_path, Vec::new(), Vec::new()))
+            } else {
+                Err(BulkloadRefusal::GitInventoryIndexAbsent)
+            };
+        }
+        Err(error) => return Err(crate::refuse::io(&error, "git_carry::source_index")),
+    };
     #[cfg(test)]
     mid_pass::fire(
         &fs::canonicalize(repo).refuse_at("git_carry::source_index")?,
@@ -4511,6 +4755,7 @@ fn collapsed_gitlinks(repo: &Path, gitlinks: &mut Vec<NestedRepository>) -> Resu
 }
 
 fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
     let format = text(git(repo).args(["rev-parse", "--show-object-format"]))?;
     if !matches!(format.as_str(), "sha1" | "sha256") {
         return Err(BulkloadRefusal::GitInventoryMalformed);
@@ -4526,6 +4771,13 @@ fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
             ])
             .arg(&private),
     )?;
+    // S2 (#162): writers write only the write store, which borrows nothing;
+    // readers see it, then the source's store, through `alternates`. The
+    // write store's entry is relative to `objects`.
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(private.join(git_env::WRITE_STORE))
+        .refuse_at("git_carry::prepare_private")?;
     let objects = text(git(repo).args([
         "rev-parse",
         "--path-format=absolute",
@@ -4537,7 +4789,7 @@ fn prepare_private(repo: &Path, capture: &Path) -> Result<PathBuf> {
     }
     fs::write(
         private.join("objects/info/alternates"),
-        format!("{objects}\n"),
+        format!("../{}\n{objects}\n", git_env::WRITE_STORE),
     )
     .refuse_at("git_carry::prepare_private")?;
     let boundary = shallow::frontier(repo)?;
@@ -4576,9 +4828,16 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
     }
     let bundle = fs::canonicalize(bundle).refuse_at("git_carry::import_verified")?;
     verify_bundle(repo, &bundle)?;
-    let heads = text(git(repo).args(["bundle", "list-heads"]).arg(&bundle))?;
-    let unpacked = shallow::unpack(repo, &bundle, &heads)?;
-    let heads = unpacked.as_ref().unwrap_or(&heads);
+    let listed = text(git(repo).args(["bundle", "list-heads"]).arg(&bundle))?;
+    let unpacked = shallow::unpack(repo, &bundle, &listed)?;
+    let advertised = unpacked.as_ref().unwrap_or(&listed);
+    if unpacked.is_none() {
+        unbundle_objects(repo, &bundle, advertised)?;
+    }
+    // A ref table (OI-1003-Q54) expands to exactly the old format's lines,
+    // read from the objects just taken; an old-format header is used as is.
+    let expanded = ref_table::expand(repo, advertised)?;
+    let heads = expanded.as_ref().unwrap_or(advertised);
     let mut native: Vec<_> = heads
         .lines()
         .filter(|line| {
@@ -4614,22 +4873,7 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
         } else {
             format!("refs/carry/v1/{source}/{digest}/{suffix}")
         };
-        names.push((value.to_owned(), name.to_owned(), target));
-    }
-    // Fetch objects only. Compare-and-create below cannot clobber a native ref.
-    if unpacked.is_none() {
-        output(
-            git(repo)
-                .args([
-                    "fetch",
-                    "--no-write-fetch-head",
-                    "--no-auto-maintenance",
-                    "--no-tags",
-                    "--no-recurse-submodules",
-                ])
-                .arg(&bundle)
-                .args(names.iter().map(|(_, name, _)| name)),
-        )?;
+        names.push((value.to_owned(), target));
     }
     let inventory = text(git(repo).args([
         "for-each-ref",
@@ -4646,7 +4890,7 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
         }
     }
     let mut desired = std::collections::BTreeMap::new();
-    for (value, _, target) in &names {
+    for (value, target) in &names {
         if target.contains('\0')
             || desired
                 .insert(target.as_str(), value.as_str())
@@ -4673,6 +4917,109 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
         )?;
     }
     Ok(names.len())
+}
+
+/// The ref lines `bundle` carries, in the old format's terms: its header, or,
+/// beside a ref table (OI-1003-Q54), the lines the table expands to. A thin
+/// bundle's prerequisites come from `objects`, an object store added as an
+/// alternate. Test support: the bundle is read in a private scratch
+/// repository, never in a source.
+///
+/// # Errors
+/// Whatever `bundle list-heads`, [`unbundle_objects`] or [`ref_table::expand`]
+/// refuses.
+#[cfg(test)]
+pub(crate) fn carried_heads(bundle: &Path, objects: Option<&Path>) -> Result<String> {
+    let directory = PrivateDir::create(None)?;
+    let listed = text(
+        git(directory.path())
+            .args(["bundle", "list-heads"])
+            .arg(bundle),
+    )?;
+    let format = bundle_object_format(&listed)?;
+    let repository = directory.path().join("heads.git");
+    output(
+        git(directory.path())
+            .args([
+                "init",
+                "--bare",
+                "--quiet",
+                "--template=",
+                &format!("--object-format={format}"),
+            ])
+            .arg(&repository),
+    )?;
+    if let Some(objects) = objects {
+        let objects = fs::canonicalize(objects).refuse_at("git_carry::carried_heads")?;
+        fs::write(
+            repository.join("objects/info/alternates"),
+            format!("{}\n", objects.display()),
+        )
+        .refuse_at("git_carry::carried_heads")?;
+    }
+    unbundle_objects(&repository, bundle, &listed)?;
+    Ok(ref_table::expand(&repository, &listed)?.unwrap_or(listed))
+}
+
+// Take the objects of every ref `bundle` advertises into `repo`, and no ref:
+// the compare-and-create in `import_verified` cannot clobber a native ref.
+//
+// Linear in the bundle (#178 review): `git bundle unbundle` indexes its pack
+// (completing a thin one from the prerequisites `repo` holds) and writes no
+// ref, then one `rev-list --objects` walk proves every advertised object's
+// closure is present, which is the guarantee `fetch` gave by its
+// connectivity check. `fetch` with exact refspecs matched each one by a scan
+// of every advertised ref: O(distinct x advertised), quadratic in a
+// distinct-heavy capture (sting, git 2.52: 56 s, 232 s and 1,001 s of CPU at
+// 10k, 20k and 40k tips). Names are not matched here at all; the header's
+// names are read by `import_verified` and `ref_table::expand`.
+//
+// As `fetch` did, a `repo` that already holds every closure takes nothing:
+// re-importing a capture does not index its pack again. The walk stops at
+// `repo`'s refs and at the bundle's prerequisites, which `bundle verify` has
+// already found complete, so it reads only what the bundle brings.
+fn unbundle_objects(repo: &Path, bundle: &Path, advertised: &str) -> Result<()> {
+    let mut walk = String::new();
+    let mut objects = std::collections::BTreeSet::new();
+    for line in advertised.lines() {
+        let (value, name) = line
+            .split_once(' ')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        if !oid(value) || !ref_table::carried_name(name) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        if objects.insert(value) {
+            walk.push_str(value);
+            walk.push('\n');
+        }
+    }
+    if walk.is_empty() {
+        return Ok(());
+    }
+    for prerequisite in shared::prerequisites(bundle)? {
+        walk.push('^');
+        walk.push_str(&prerequisite);
+        walk.push('\n');
+    }
+    let connected = || {
+        input(
+            git(repo).args([
+                "rev-list",
+                "--objects",
+                "--quiet",
+                "--stdin",
+                "--not",
+                "--all",
+            ]),
+            walk.as_bytes(),
+        )
+    };
+    if connected().is_ok() {
+        return Ok(());
+    }
+    output(git(repo).args(["bundle", "unbundle"]).arg(bundle))?;
+    connected()?;
+    Ok(())
 }
 
 fn capture_revision(heads: &str, suffix: &str) -> Result<String> {
@@ -5141,6 +5488,7 @@ fn attach_payload(
     const SITE: &str = "git_carry::attach_payload";
     use std::os::unix::fs::MetadataExt;
     let staged = stage_bundle(bundle)?;
+    refuse_bare_capture(&staged)?;
     let bundle = staged.path();
     let destination = fs::canonicalize(destination).refuse_at(SITE)?;
     let repository = repository
@@ -5291,6 +5639,8 @@ fn write_git_pointer(receipt: &Path, admin: &Path) -> Result<PathBuf> {
 ///
 /// # Errors
 /// Refuses malformed paths/modes, missing capture metadata, or an occupied target.
+/// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
+/// anything is created (S4, #162).
 /// Partial new destinations are retained, never cleaned by recursive deletion.
 pub fn restore_bundle(bundle: &Path, destination: &Path, source: &str) -> Result<()> {
     restore_bundle_configured(bundle, destination, source, None)
@@ -5326,6 +5676,7 @@ pub fn restore_staged(
     mapping: Option<(&Path, &Path)>,
 ) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    refuse_bare_capture(staged)?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
     // never as a bare errno.
@@ -5408,6 +5759,8 @@ pub fn restore_staged(
 ///
 /// # Errors
 /// Refuses occupied destinations, differing common excludes, and invalid capture.
+/// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
+/// anything is imported or created (S4, #162).
 /// Partially created worktrees are retained on failure for explicit recovery.
 pub fn restore_linked(
     bundle: &Path,
@@ -5452,6 +5805,7 @@ pub fn restore_linked_staged(
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::PermissionsExt;
+    refuse_bare_capture(staged)?;
     let bundle = staged.path();
     if destination.symlink_metadata().is_ok() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
@@ -6223,11 +6577,9 @@ mod tests {
         let dest_head = fs::read(dest.join(".git/HEAD")).unwrap();
         let native = refs(&dest).unwrap();
         let bundle = export_repository(&source, &root.join("capture")).unwrap();
-        assert!(
-            text(git(&source).args(["bundle", "list-heads"]).arg(&bundle))
-                .unwrap()
-                .contains("refs/carry-export/refs/heads/quote\"branch")
-        );
+        assert!(carried_heads(&bundle, None)
+            .unwrap()
+            .contains("refs/carry-export/refs/heads/quote\"branch"));
         let count = import_bundle(&dest, &bundle, "neo").unwrap();
         assert!(count >= 6);
         assert_eq!(count, import_bundle(&dest, &bundle, "neo").unwrap());
@@ -8581,13 +8933,35 @@ mod tests {
             assert!(export.drift.is_empty());
             let private = capture.join("repository.git");
             assert!(!drift_ref_present(&private));
+            // The carried ref set, which a restore lays down, is the
+            // pre-change set exactly; the private repository holds it as a
+            // ref table and one tip per distinct object (OI-1003-Q54).
+            let mut heads: Vec<String> =
+                carried_heads(&export.bundle, Some(&source.join(".git/objects")))
+                    .unwrap()
+                    .lines()
+                    .map(|line| line.split_once(' ').unwrap().1.to_owned())
+                    .collect();
+            heads.sort();
+            assert_eq!(heads, expected);
+            let tip = text(git(&source).args(["rev-parse", &symbolic])).unwrap();
+            let mut private_names: Vec<String> = expected
+                .iter()
+                .filter(|name| !name.starts_with("refs/carry-export/refs/"))
+                .cloned()
+                .chain([
+                    ref_table::TABLE_REF.to_owned(),
+                    format!("{}{tip}", ref_table::TIP_PREFIX),
+                ])
+                .collect();
+            private_names.sort();
             let names: Vec<String> = refs(&private)
                 .unwrap()
                 .lines()
                 .map(|line| line.split_once(' ').unwrap().1.to_owned())
                 .collect();
-            assert_eq!(names, expected);
-            let heads: Vec<String> = text(
+            assert_eq!(names, private_names);
+            let listed: Vec<String> = text(
                 git(&source)
                     .args(["bundle", "list-heads"])
                     .arg(&export.bundle),
@@ -8596,7 +8970,7 @@ mod tests {
             .lines()
             .map(|line| line.split_once(' ').unwrap().1.to_owned())
             .collect();
-            assert_eq!(heads, expected);
+            assert_eq!(listed, private_names);
             shapes.push((
                 text(git(&private).args(["rev-parse", "refs/carry-export/worktree^{tree}"]))
                     .unwrap(),

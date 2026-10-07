@@ -15,6 +15,7 @@ use std::sync::Mutex;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::git_carry::decide;
 use crate::{git_carry, BulkloadRefusal, Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -145,32 +146,39 @@ fn chain_links(
     }
 }
 
-/// The link a new capture may chain onto `previous`, if any: `None` when
-/// `previous` depends on a shared plan base, its own chain is not intact, or
-/// it already sits at the depth limit (the next capture re-bases).
-fn chainable(corpus: &Path, previous: &Capture, bundle: &Path) -> Result<Option<Prior>> {
-    let depth = if prior_sidecar(corpus, &previous.bundle)
+/// What the decision core needs to know to chain a new capture onto
+/// `previous` (`decide`): its shape (a chain link, a shared plan base's
+/// delta, or self-contained), whether its chain is intact under
+/// [`LinkBinding::Custody`], and its depth. Whether it chains is the
+/// decision's: never on a broken chain or a based bundle, and only below the
+/// depth limit (the capture at the limit re-bases).
+fn chainable(
+    corpus: &Path,
+    previous: &Capture,
+    bundle: &Path,
+) -> Result<(decide::Shape, bool, u32)> {
+    if prior_sidecar(corpus, &previous.bundle)
         .try_exists()
         .refuse_at("estate::chainable")?
     {
-        match chain_links(corpus, &previous.bundle, LinkBinding::Custody) {
-            Ok(links) => u32::try_from(links.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
-            // A broken chain is never extended; the next bundle re-bases.
-            Err(_) => return Ok(None),
-        }
-    } else if git_carry::shared::requires_base(bundle)? {
-        return Ok(None);
+        return Ok(
+            match chain_links(corpus, &previous.bundle, LinkBinding::Custody) {
+                Ok(links) => (
+                    decide::Shape::Chained,
+                    true,
+                    u32::try_from(links.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+                ),
+                // A broken chain is neither a hit nor extended.
+                Err(_) => (decide::Shape::Chained, false, 0),
+            },
+        );
+    }
+    // No `.prior`: `chain_links` finds no link to break.
+    Ok(if git_carry::shared::requires_base(bundle)? {
+        (decide::Shape::Based, true, 0)
     } else {
-        0
-    };
-    Ok(
-        (depth < git_carry::chain::CHAIN_DEPTH_LIMIT).then(|| Prior {
-            bundle: previous.bundle.clone(),
-            digest: previous.digest,
-            identity: previous.identity,
-            depth,
-        }),
-    )
+        (decide::Shape::Unchained, true, 0)
+    })
 }
 
 #[derive(Debug)]
@@ -179,6 +187,9 @@ pub struct Receipt {
     pub source: PathBuf,
     pub outcome: &'static str,
     pub reason: Option<String>,
+    /// The refusal of a `refused` receipt (WP3 PR 3): its outcome record is
+    /// typed from this value, not from `reason`.
+    pub refusal: Option<BulkloadRefusal>,
     /// One line per ref or seat that drifted under the capture this receipt
     /// names. Empty is the ordinary case, and always empty on apply: apply
     /// refuses a drifted capture (`CAPTURE_DRIFTED`). The durable statement is
@@ -414,23 +425,34 @@ fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
+/// Create `path` (0700) or check the private directory already there, then
+/// seal its entry in the parent (#161): the records written inside it are
+/// sealed in it, and must not outlive the directory itself. Sealed whoever
+/// created it, since a creator may have died before its seal.
 fn private_directory(path: &Path) -> Result<()> {
     match fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             let metadata = fs::symlink_metadata(path).refuse_at("estate::private_directory")?;
             // SAFETY: geteuid has no preconditions or side effects.
-            if metadata.is_dir()
+            if !(metadata.is_dir()
                 && metadata.mode().trailing_zeros() >= 6
-                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.uid() == unsafe { libc::geteuid() })
             {
-                Ok(())
-            } else {
-                Err(BulkloadRefusal::PathEscapesRoot)
+                return Err(BulkloadRefusal::PathEscapesRoot);
             }
         }
-        Err(error) => Err(crate::refuse::io(&error, "estate::private_directory")),
+        Err(error) => return Err(crate::refuse::io(&error, "estate::private_directory")),
     }
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    fs::File::open(parent)
+        .refuse_at("estate::private_directory")?
+        .sync_dir_counted()
+        .refuse_at("estate::private_directory")?;
+    Ok(())
 }
 
 fn filename(value: &str) -> bool {
@@ -438,7 +460,7 @@ fn filename(value: &str) -> bool {
     matches!(parts.next(), Some(std::path::Component::Normal(_))) && parts.next().is_none()
 }
 
-fn id(item: &Item) -> Result<String> {
+pub(crate) fn id(item: &Item) -> Result<String> {
     let bytes = postcard::to_allocvec(item).map_err(|_| BulkloadRefusal::FrameCodec)?;
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
@@ -807,6 +829,20 @@ fn retained_base(corpus: &Path, base: &Base) -> Result<bool> {
             ))
 }
 
+// The decision on a group whose base record names a lost bundle. It comes
+// before any item's record is read: the decision core's first rule reads
+// only the base, so every item of the group refuses
+// `RECEIPT_BINDING_INVALID` (P67 draws every other input of that row).
+fn lost_base() -> BulkloadRefusal {
+    let inputs = decide::Inputs::new(true, decide::BaseState::Lost, decide::Policy::V1);
+    match decide::decide(&inputs) {
+        decide::Decision::Refuse(refusal) => refusal.into(),
+        decide::Decision::Hit | decide::Decision::Export(_) => {
+            BulkloadRefusal::ContractSelfInconsistent
+        }
+    }
+}
+
 fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result<Base> {
     let record = corpus.join(format!("shared-{group}.base"));
     if record.try_exists().refuse_at("estate::prepare_base")? {
@@ -816,7 +852,7 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
         }
         // Do not replace a missing or changed prerequisite while older deltas
         // still depend on it. Keep the missing custody visible.
-        return Err(BulkloadRefusal::ReceiptBindingInvalid);
+        return Err(lost_base());
     }
     let mut generation = 0u64;
     let attempt = loop {
@@ -859,37 +895,43 @@ fn prepare_base(item: &Item, group: &str, state: &Path, corpus: &Path) -> Result
     Ok(base)
 }
 
-/// What a retained capture record offers the next pass.
-enum Retained {
-    /// Same key, no drift, no racy seat: the retained bundle is the capture.
-    Hit,
-    /// A retained bundle of this checkout whose blobs this pass may reuse:
-    /// every seat at an unchanged, non-racy `StatIdentity` costs zero source
-    /// bytes (R25). `started_ns` is its recorded pass start, absent for a
-    /// capture from before that was recorded. `extends` says the retained
-    /// capture drifted and the difference is confined to the ref inventory and
+/// A retained capture of this checkout, at its recorded identity: what
+/// acting on the decision needs beside the decision's inputs.
+struct Retained {
+    /// Its record.
+    previous: Capture,
+    /// Its bundle in the corpus. Every seat at an unchanged, non-racy
+    /// `StatIdentity` may be reused from it at zero source bytes (R25).
+    bundle: PathBuf,
+    /// Its recorded pass start, absent for a capture from before that was
+    /// recorded.
+    started_ns: Option<i128>,
+    /// It drifted and the difference is confined to the ref inventory and
     /// the worktree census, so this pass completes it.
-    Extend {
-        bundle: PathBuf,
-        started_ns: Option<i128>,
-        extends: bool,
-        /// The link this pass may chain onto (WP2), if the retained bundle
-        /// is chainable.
-        chain: Option<Prior>,
-    },
-    /// Nothing retained.
-    None,
+    extends: bool,
 }
 
+/// The item's capture record as the decision core reads it: `inputs` with
+/// the record's state and, for a retained bundle, its key, drift, pass start
+/// and chain filled in; and the retained capture, if any. Nothing here
+/// decides. The retained bundle's bound base is read later, and only when
+/// the decision rests on it (`decide::reads_prev_base`).
 fn retained_capture(
     record: &Path,
     corpus: &Path,
     parts: &git_carry::KeyParts,
     key: [u8; 32],
     authority: [u8; 32],
-) -> Result<Retained> {
+    inputs: decide::Inputs,
+) -> Result<(decide::Inputs, Option<Retained>)> {
     if !record.try_exists().refuse_at("estate::retained_capture")? {
-        return Ok(Retained::None);
+        return Ok((
+            decide::Inputs {
+                retained: decide::RetainedState::NoRecord,
+                ..inputs
+            },
+            None,
+        ));
     }
     let previous: Capture = read(record)?;
     if !filename(&previous.bundle) {
@@ -902,7 +944,13 @@ fn retained_capture(
                 &fs::symlink_metadata(&bundle).refuse_at("estate::retained_capture")?,
             )
     {
-        return Ok(Retained::None);
+        return Ok((
+            decide::Inputs {
+                retained: decide::RetainedState::BundleGone,
+                ..inputs
+            },
+            None,
+        ));
     }
     let drift = retained_drift(corpus, &previous.bundle)?;
     let recorded = retained_parts(corpus, &previous.bundle)?;
@@ -915,33 +963,46 @@ fn retained_capture(
     let settled = recorded
         .as_ref()
         .is_some_and(|recorded| !parts.racy_since(recorded.started_ns, git_carry::pass_start_ns()));
-    let chained = prior_sidecar(corpus, &previous.bundle)
-        .try_exists()
-        .refuse_at("estate::retained_capture")?;
     // A chained bundle is a hit only while its whole chain is retained: a
     // broken chain recaptures (self-contained) instead of standing as custody
     // no restore can satisfy.
-    let restorable =
-        !chained || chain_links(corpus, &previous.bundle, LinkBinding::Custody).is_ok();
-    if previous.key == key && drift.is_empty() && settled && restorable {
-        if !chained && git_carry::shared::requires_base(&bundle)? {
-            let bound: Base = read(&corpus.join(format!("{}.base", previous.bundle)))?;
-            if !retained_base(corpus, &bound)? {
-                return Err(BulkloadRefusal::ReceiptBindingInvalid);
-            }
-        }
-        return Ok(Retained::Hit);
-    }
+    let (shape, chain_intact, depth) = chainable(corpus, &previous, &bundle)?;
     let extends = !drift.is_empty()
         && recorded
             .as_ref()
             .is_some_and(|recorded| recorded.authority == authority);
-    let chain = chainable(corpus, &previous, &bundle)?;
-    Ok(Retained::Extend {
-        bundle,
-        started_ns: recorded.map(|recorded| recorded.started_ns),
-        extends,
-        chain,
+    let inputs = decide::Inputs {
+        retained: decide::RetainedState::Held,
+        key_equal: previous.key == key,
+        drifted: !drift.is_empty(),
+        settled,
+        pass_start: recorded.is_some(),
+        shape,
+        chain_intact,
+        depth,
+        // v1 never re-roots, so a chain's root is as old as it is deep.
+        age: depth,
+        ..inputs
+    };
+    Ok((
+        inputs,
+        Some(Retained {
+            previous,
+            bundle,
+            started_ns: recorded.map(|recorded| recorded.started_ns),
+            extends,
+        }),
+    ))
+}
+
+// The base a retained based bundle's `{bundle}.base` names: retained at its
+// recorded identity, or lost.
+fn bound_base(corpus: &Path, bundle: &str) -> Result<decide::PrevBase> {
+    let bound: Base = read(&corpus.join(format!("{bundle}.base")))?;
+    Ok(if retained_base(corpus, &bound)? {
+        decide::PrevBase::Retained
+    } else {
+        decide::PrevBase::Lost
     })
 }
 
@@ -955,22 +1016,34 @@ fn poisoned(key: [u8; 32]) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 
-// Without a recorded pass start no retained seat can be proved non-racy.
-const fn reuse_offer(
-    retained: Option<&Path>,
-    started_ns: Option<i128>,
-) -> (
+// The blob-reuse offer the plan makes (R25): the retained capture with its
+// recorded pass start, or why none is made. Without a recorded pass start no
+// retained seat can be proved non-racy.
+fn reuse_offer(
+    plan: decide::Plan,
+    retained: Option<&Retained>,
+) -> Result<(
     Option<git_carry::RetainedCapture<'_>>,
     Option<git_carry::ReuseUnavailable>,
-) {
-    match (retained, started_ns) {
-        (Some(bundle), Some(started_ns)) => (
-            Some(git_carry::RetainedCapture { bundle, started_ns }),
-            None,
-        ),
-        (Some(_), None) => (None, Some(git_carry::ReuseUnavailable::PassStartUnrecorded)),
-        (None, _) => (None, None),
-    }
+)> {
+    Ok(match plan.reuse {
+        decide::ReuseEligibility::NoRetained => (None, None),
+        decide::ReuseEligibility::BlobReuse => {
+            let retained = retained.ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+            (
+                Some(git_carry::RetainedCapture {
+                    bundle: &retained.bundle,
+                    started_ns: retained
+                        .started_ns
+                        .ok_or(BulkloadRefusal::ContractSelfInconsistent)?,
+                }),
+                None,
+            )
+        }
+        decide::ReuseEligibility::PassStartUnrecorded => {
+            (None, Some(git_carry::ReuseUnavailable::PassStartUnrecorded))
+        }
+    })
 }
 
 // Failed private attempts are retained, never silently overwritten.
@@ -1085,6 +1158,44 @@ fn preflight(
     Ok(planned)
 }
 
+// The decision on one item (OI-1003-Q43), from the group's `base` and the
+// item's record: a reuse hit, a typed refusal, or an export and what it may
+// depend on. The writer decides again on what its pass observes
+// (`git_carry::shared::write_capture`). Returns the decision, the inputs it
+// read (among them the retained bundle's depth, which a chain link records)
+// and the retained capture.
+fn decide_capture(
+    record: &Path,
+    corpus: &Path,
+    parts: &git_carry::KeyParts,
+    key: [u8; 32],
+    authority: [u8; 32],
+    base: Option<&Base>,
+) -> Result<(decide::Decision, decide::Inputs, Option<Retained>)> {
+    let state = if base.is_some() {
+        decide::BaseState::Retained
+    } else {
+        decide::BaseState::NoGroup
+    };
+    let (recorded, retained) = retained_capture(
+        record,
+        corpus,
+        parts,
+        key,
+        authority,
+        decide::Inputs::new(base.is_some(), state, decide::Policy::V1),
+    )?;
+    // A hit on a bundle bound to a base needs that base retained. The core
+    // asks for it only then, which is only for a held record.
+    let (decision, inputs) = decide::decide_recorded(recorded, || {
+        let held = retained
+            .as_ref()
+            .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+        bound_base(corpus, &held.previous.bundle)
+    })?;
+    Ok((decision, inputs, retained))
+}
+
 #[allow(clippy::too_many_arguments)] // Pass-wide state is caller-owned.
 fn capture_item(
     item: &Item,
@@ -1108,32 +1219,32 @@ fn capture_item(
     let nested = nest_lines(item, owners, parts.nested_repositories());
     let key = parts.digest()?;
     let authority = parts.authority()?;
-    let (retained, started_ns, extends, link) =
-        match retained_capture(&record, corpus, &parts, key, authority)? {
-            Retained::Hit => {
-                return Ok(Completion::clean("capture-reused-after-census").naming(nested));
-            }
-            Retained::Extend {
-                bundle,
-                started_ns,
-                extends,
-                chain,
-            } => (Some(bundle), started_ns, extends, chain),
-            Retained::None => (None, None, false, None),
-        };
-    // WP2: without a plan base, pack only what is new since the retained
-    // capture, by declaring its source-held tips as prerequisites.
-    let (link, chain) = chain_offer(corpus, link, base.is_none())?;
+    let (decision, inputs, retained) =
+        decide_capture(&record, corpus, &parts, key, authority, base)?;
+    let plan = match decision {
+        decide::Decision::Hit => {
+            return Ok(Completion::clean("capture-reused-after-census").naming(nested));
+        }
+        decide::Decision::Refuse(refusal) => return Err(refusal.into()),
+        decide::Decision::Export(plan) => plan,
+    };
+    let extends = retained.as_ref().is_some_and(|held| held.extends);
+    // WP2: pack only what is new since the retained capture, by declaring its
+    // source-held tips as prerequisites, when the plan chains on it.
+    let (link, chain) = chain_offer(corpus, plan, retained.as_ref(), inputs.depth)?;
+    let retained_bundle = retained.as_ref().map(|held| held.bundle.as_path());
     // #101 (OI-1002-Q11): before this item's export writes a byte, charge its
     // estimated bundle to CORPUS. An item that does not fit refuses
     // DESTINATION_SPACE_INSUFFICIENT as its own receipt; the pass goes on.
-    let _reservation = space.reserve(estimated_bundle(&parts, retained.as_deref())?)?;
-    let (reuse, unrecorded) = reuse_offer(retained.as_deref(), started_ns);
+    let _reservation = space.reserve(estimated_bundle(&parts, retained_bundle)?)?;
+    let (reuse, unrecorded) = reuse_offer(plan, retained.as_ref())?;
     // A future-stamped seat blocked the whole-capture reuse above, and will on
     // every pass until the clock passes it: say so (round-3 N5).
     let future = (retained.is_some() && parts.stamped_after(git_carry::pass_start_ns()))
         .then_some(git_carry::ReuseUnavailable::FutureStamp);
     let attempt = attempt_directory(state, &identity, key)?;
+    // The plan base, when the plan's basis names it.
+    let base = base.filter(|_| plan.basis.based());
     let prerequisite = base.map(|base| base_path(corpus, base)).transpose()?;
     let export = match git_carry::export_repository_with_custody(
         &item.source,
@@ -1263,13 +1374,36 @@ fn link_path(corpus: &Path, link: &Prior) -> Result<PathBuf> {
     )
 }
 
-// The link a capture chains onto and its corpus path: none under a plan base.
+// The link a capture chains onto and its corpus path, as the decision's plan
+// says (WP2): the retained bundle at its own `depth` for a chained basis,
+// none otherwise. A plan v1 cannot carry out refuses
+// CONTRACT_SELF_INCONSISTENT: a chain under a plan base (L6b's fix 2), a
+// re-root on the chain's root (Q46, L8), or a depth that is not one more
+// than the link's.
 fn chain_offer(
     corpus: &Path,
-    link: Option<Prior>,
-    unbased: bool,
+    plan: decide::Plan,
+    retained: Option<&Retained>,
+    depth: u32,
 ) -> Result<(Option<Prior>, Option<PathBuf>)> {
-    let link = link.filter(|_| unbased);
+    let link = match (plan.basis, plan.rebase) {
+        (decide::Basis::BaseAndChain, _) | (_, decide::Rebase::Reroot) => {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        (decide::Basis::Chain, _) => {
+            let held = retained.ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+            if depth.checked_add(1) != Some(plan.depth) {
+                return Err(BulkloadRefusal::ContractSelfInconsistent);
+            }
+            Some(Prior {
+                bundle: held.previous.bundle.clone(),
+                digest: held.previous.digest,
+                identity: held.previous.identity,
+                depth,
+            })
+        }
+        (decide::Basis::SelfContained | decide::Basis::Base, _) => None,
+    };
     let path = link
         .as_ref()
         .map(|link| link_path(corpus, link))
@@ -1367,7 +1501,7 @@ fn execute(
     let refused = std::sync::atomic::AtomicBool::new(false);
     pool.install(|| {
         plan.items.par_iter().try_for_each(|item| {
-            let (done, reason) = match operation(item) {
+            let (done, reason, refusal) = match operation(item) {
                 Ok(done) => {
                     // The count rides in the layout-safe reason; the rows ride
                     // in the sidecar and the in-process receipt.
@@ -1380,11 +1514,15 @@ fn execute(
                     .flatten()
                     .collect();
                     let reason = (!counts.is_empty()).then(|| counts.join(" "));
-                    (done, reason)
+                    (done, reason, None)
                 }
                 Err(error) => {
                     refused.store(true, std::sync::atomic::Ordering::Relaxed);
-                    (Completion::clean("refused"), Some(error.to_string()))
+                    (
+                        Completion::clean("refused"),
+                        Some(error.to_string()),
+                        Some(error),
+                    )
                 }
             };
             receipt(&Receipt {
@@ -1392,6 +1530,7 @@ fn execute(
                 source: item.source.clone(),
                 outcome: done.outcome,
                 reason,
+                refusal,
                 drift: done.drift,
                 bytes_read: done.bytes_read,
                 reuse_unavailable: done.reuse_unavailable,
@@ -1406,10 +1545,24 @@ fn execute(
     }
 }
 
-fn emit(state: &Path, row: &Receipt, receipt: &impl Fn(&Receipt) -> Result<()>) -> Result<()> {
+// WP3 PR 3: the durable outcome is the typed record, its refusal recorded
+// at `site` (the verb).
+fn emit(
+    state: &Path,
+    site: &'static str,
+    row: &Receipt,
+    receipt: &impl Fn(&Receipt) -> Result<()>,
+) -> Result<()> {
+    let record = crate::outcome::OutcomeRecord::of_receipt(
+        row.source.clone(),
+        row.outcome,
+        row.refusal.as_ref(),
+        row.reason.clone(),
+        site,
+    )?;
     write(
         &state.join(format!("{}.outcome", row.item)),
-        &(&row.source, row.outcome, &row.reason),
+        &record.persisted(),
     )?;
     receipt(row)
 }
@@ -1572,7 +1725,9 @@ fn capture_in(
     }
     let mut outcome = Ok(());
     for level in levels.values().rev() {
-        if let Err(error) = execute(level, jobs, &operation, &|row| emit(state, row, receipt)) {
+        if let Err(error) = execute(level, jobs, &operation, &|row| {
+            emit(state, "estate::capture", row, receipt)
+        }) {
             outcome = Err(error);
         }
     }
@@ -1657,7 +1812,8 @@ fn apply_item(
     // next capture
     // pass extends it clean. Key-only drift leaves a coherent snapshot, which
     // applies. R-N29 (apply proceeds on an occupied destination, recording
-    // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
+    // uncaptured seats) is deferred (bulkload#48); carry v2, the W6 engine it
+    // was deferred to, is deleted (OI-1003-Q44, OI-1003-Q56).
     let journal = journal_path(state, &identity, source, &captured.digest);
     if journal.try_exists().refuse_at("estate::apply_item")? {
         let done: String = read(&journal)?;
@@ -1688,6 +1844,12 @@ fn apply_item(
     })?;
     if staged.digest() != captured.digest {
         return Err(BulkloadRefusal::DigestMismatch);
+    }
+    // S4 (#162): a workspace is never laid down from a bare capture. Refused
+    // here, before a chain is flattened or a plan base imported, so the
+    // typed cause is never masked and nothing reaches the destination.
+    if item.workspace.is_some() {
+        git_carry::refuse_bare_capture(&staged)?;
     }
     // WP2: a chained capture restores from its verified, flattened chain; a
     // capture on a shared plan base imports that base first.
@@ -1823,7 +1985,12 @@ pub fn repair_missing_index(
             {
                 write(&journal, &"refs-imported".to_owned())?;
             }
-            write(&outcome, &(&item.source, INDEX_REPAIRED, &None::<String>))?;
+            let record = crate::outcome::OutcomeRecord {
+                source: item.source,
+                outcome: crate::outcome::Outcome::IndexRepaired,
+                reason: None,
+            };
+            write(&outcome, &record.persisted())?;
             Ok(())
         }
         Err(refusal) => {
@@ -1831,10 +1998,15 @@ pub fn repair_missing_index(
                 .try_exists()
                 .refuse_at("estate::repair_missing_index")?
             {
-                write(
-                    &outcome,
-                    &(&item.source, "refused", &Some(refusal.to_string())),
-                )?;
+                let record = crate::outcome::OutcomeRecord {
+                    source: item.source,
+                    outcome: crate::outcome::Outcome::Refused(crate::outcome::Refusal::of(
+                        &refusal,
+                        "estate::repair_missing_index",
+                    )),
+                    reason: Some(refusal.to_string()),
+                };
+                write(&outcome, &record.persisted())?;
             }
             Err(refusal)
         }
@@ -1866,11 +2038,11 @@ pub struct LedgerEntry {
     pub source: PathBuf,
     /// The plan item restores a workspace (`workspace` is set).
     pub has_workspace: bool,
-    /// `(source, outcome, reason)` from the last state directory holding an
-    /// `{item}.outcome` record; `None` when none does.
-    pub record: Option<(PathBuf, String, Option<String>)>,
-    /// An `{item}.outcome` record exists but does not decode.
-    pub record_unreadable: bool,
+    /// The typed record from the last state directory holding an
+    /// `{item}.outcome` record (WP3 PR 3; a legacy record is mapped), or why
+    /// it proves nothing; `None` when no state directory holds one.
+    pub record:
+        Option<std::result::Result<crate::outcome::OutcomeRecord, crate::outcome::Unreadable>>,
     /// The apply journal for the item's current capture, at its exact path
     /// `{item}-{blake3(SOURCE)}-{capture digest}.done`.
     pub journal: JournalState,
@@ -1909,7 +2081,7 @@ fn is_identity(value: &str) -> bool {
 /// # Errors
 /// Refuses a malformed plan or an unreadable state directory.
 pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> Result<Ledger> {
-    type Record = Option<(PathBuf, String, Option<String>)>;
+    type Record = std::result::Result<crate::outcome::OutcomeRecord, crate::outcome::Unreadable>;
     let contents: Plan = read(plan)?;
     let mut records = std::collections::BTreeMap::<String, Record>::new();
     let mut journals = std::collections::BTreeSet::<String>::new();
@@ -1927,10 +2099,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
                 .strip_suffix(".outcome")
                 .filter(|item| is_identity(item))
             {
-                records.insert(
-                    item.to_owned(),
-                    read::<(PathBuf, String, Option<String>)>(&entry.path()).ok(),
-                );
+                records.insert(item.to_owned(), crate::outcome::read_record(&entry.path()));
             } else if name.strip_suffix(".done").is_some() {
                 journals.insert(name.to_owned());
             }
@@ -1973,8 +2142,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
-            record: record.cloned().flatten(),
-            record_unreadable: matches!(record, Some(None)),
+            record: record.cloned(),
             journal,
             capture,
             item: identity,
@@ -2181,7 +2349,9 @@ pub fn apply(
     }
     let mut outcome = Ok(());
     for level in levels.values() {
-        if let Err(error) = execute(level, jobs, &operation, &|row| emit(state, row, receipt)) {
+        if let Err(error) = execute(level, jobs, &operation, &|row| {
+            emit(state, "estate::apply", row, receipt)
+        }) {
             outcome = Err(error);
         }
     }
@@ -2287,6 +2457,123 @@ mod tests {
             fs::read(second_target.join("file")).unwrap(),
             b"second dirty"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // P67's v1 row `Held ... Based Lost -> Refuse`, through the code: the
+    // group's base record is retained, but a retained based bundle is bound
+    // (`{bundle}.base`) to a base that is lost. That happens when the group's
+    // base record was regenerated after its old base was lost. Every other
+    // condition of a reuse hit holds, so only the lazily read bound base
+    // (`decide::decide_recorded`, `bound_base`) keeps the record from being
+    // reused: each item refuses RECEIPT_BINDING_INVALID and its record stays.
+    #[test]
+    fn a_retained_based_bundle_bound_to_a_lost_base_is_never_a_reuse_hit() {
+        let root = std::env::temp_dir().join(format!("tcfs-estate-bound-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--template="]);
+        fs::write(source.join("file"), b"base").unwrap();
+        git(&source, &["add", "file"]);
+        git(&source, &["commit", "-m", "base"]);
+        let second = root.join("second");
+        git(
+            &source,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                second.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let plan = root.join("plan");
+        add(
+            &plan,
+            &source,
+            &repository,
+            Some(&root.join("first-target")),
+        )
+        .unwrap();
+        add(
+            &plan,
+            &second,
+            &repository,
+            Some(&root.join("second-target")),
+        )
+        .unwrap();
+        let state = root.join("state");
+        let corpus = root.join("corpus");
+        // Whole-capture reuse needs seats older than one timestamp tick (R-N76).
+        settle();
+        let outcomes = |corpus: &Path| {
+            let rows = Mutex::new(Vec::new());
+            let result = capture(&plan, &state, corpus, 2, &|row| {
+                rows.lock().unwrap().push((row.outcome, row.reason.clone()));
+                Ok(())
+            });
+            (result, rows.into_inner().unwrap())
+        };
+        capture(&plan, &state, &corpus, 2, &|_| Ok(())).unwrap();
+        // The records are reuse hits while their bound base is retained.
+        let (result, rows) = outcomes(&corpus);
+        result.unwrap();
+        assert_eq!(rows, vec![("capture-reused-after-census", None); 2]);
+        let items = inspect(&plan).unwrap();
+        let records: Vec<(PathBuf, Vec<u8>)> = items
+            .iter()
+            .map(|item| {
+                let path = corpus.join(format!("{}.capture", id(item).unwrap()));
+                let bytes = fs::read(&path).unwrap();
+                (path, bytes)
+            })
+            .collect();
+        let mut bound = Vec::new();
+        for (path, _) in &records {
+            let record: Capture = read(path).unwrap();
+            assert!(git_carry::shared::requires_base(&corpus.join(&record.bundle)).unwrap());
+            let base: Base = read(&corpus.join(format!("{}.base", record.bundle))).unwrap();
+            bound.push(base);
+        }
+        let named = |base: &Base| (base.bundle.clone(), base.digest, base.identity);
+        assert_eq!(bound.first().map(named), bound.last().map(named));
+        let lost = bound.first().unwrap();
+        // The old base is lost, and the group's base record regenerated: the
+        // next pass's `prepare_base` exports and records a retained base.
+        let groups: Vec<PathBuf> = fs::read_dir(&corpus)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                name.starts_with("shared-")
+                    && Path::new(name)
+                        .extension()
+                        .is_some_and(|extension| extension == "base")
+            })
+            .collect();
+        assert_eq!(groups.len(), 1);
+        fs::rename(corpus.join(&lost.bundle), root.join("lost-base")).unwrap();
+        fs::remove_file(groups.first().unwrap()).unwrap();
+        let (result, rows) = outcomes(&corpus);
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![("refused", Some("RECEIPT_BINDING_INVALID".to_owned())); 2]
+        );
+        // The group's base record is back and retained, and it is not the
+        // base the records are bound to.
+        let regenerated: Base = read(groups.first().unwrap()).unwrap();
+        assert!(retained_base(&corpus, &regenerated).unwrap());
+        assert_ne!(regenerated.identity, lost.identity);
+        assert!(!retained_base(&corpus, lost).unwrap());
+        // Neither record was replaced: the missing custody stays visible.
+        for (path, bytes) in &records {
+            assert_eq!(&fs::read(path).unwrap(), bytes);
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2634,6 +2921,212 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // S4 (#162): a bare repository item (a mirror) captures and applies as
+    // ref custody. Its key used to read the absent index and refuse with a
+    // bare IO (errno 2), which no closure report can account for.
+    #[test]
+    fn a_bare_repository_item_captures_and_applies_as_ref_custody() {
+        let (root, origin, _, _, corpus) = drifting_plan("bare");
+        let mirror = root.join("mirror.git");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                origin.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let plan = root.join("bare-plan");
+        add(&plan, &mirror, &repository, None).unwrap();
+        let state = root.join("state");
+        let rows = receipts(&plan, &state, &corpus).unwrap();
+        assert_eq!(rows.len(), 1);
+        let (outcome, reason, drift, bytes_read) = rows.first().unwrap();
+        assert_eq!(
+            (*outcome, reason.as_deref(), drift.len(), *bytes_read),
+            ("captured", None, 0, 0)
+        );
+        let applied = root.join("applied");
+        let outcomes = Mutex::new(Vec::new());
+        apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+            outcomes
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(
+            outcomes.into_inner().unwrap(),
+            vec![("refs-imported", None)]
+        );
+        let main = Command::new("git")
+            .arg("-C")
+            .arg(&mirror)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        let imported = Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["for-each-ref", "--format=%(objectname) %(refname)"])
+            .arg("refs/carry/v1/neo/")
+            .output()
+            .unwrap();
+        let main = String::from_utf8(main.stdout).unwrap();
+        let imported = String::from_utf8(imported.stdout).unwrap();
+        assert!(
+            imported
+                .lines()
+                .any(|line| line.starts_with(main.trim()) && line.ends_with("/head")),
+            "{imported}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // S4 (#162): a bare repository item planned with a workspace, standalone
+    // or linked, captures as ref custody, then refuses at apply as a typed
+    // GIT_BARE_CAPTURE_WORKSPACE before anything is laid down: no workspace
+    // directory, no imported ref, no journal. A bare capture has no index or
+    // worktree, so a checkout from it would stage every HEAD path as deleted.
+    #[test]
+    fn a_bare_repository_item_with_a_workspace_refuses_typed_at_apply() {
+        let (root, origin, _, _, corpus) = drifting_plan("bare-workspace");
+        let mirror = root.join("mirror.git");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                origin.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let standalone = root.join("standalone");
+        let linked = root.join("linked");
+        for (name, target, workspace) in [
+            ("standalone", &standalone, &standalone),
+            ("linked", &repository, &linked),
+        ] {
+            let plan = root.join(format!("{name}-plan"));
+            add(&plan, &mirror, target, Some(workspace)).unwrap();
+            let state = root.join(format!("{name}-state"));
+            let rows = receipts(&plan, &state, &corpus).unwrap();
+            assert_eq!(
+                rows.iter()
+                    .map(|row| (row.0, row.1.as_deref()))
+                    .collect::<Vec<_>>(),
+                vec![("captured", None)],
+                "{name}"
+            );
+            let applied = root.join(format!("{name}-applied"));
+            let outcomes = Mutex::new(Vec::new());
+            let result = apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+                outcomes
+                    .lock()
+                    .unwrap()
+                    .push((row.outcome, row.reason.clone()));
+                Ok(())
+            });
+            assert!(result.is_err(), "{name}");
+            assert_eq!(
+                outcomes.into_inner().unwrap(),
+                vec![("refused", Some("GIT_BARE_CAPTURE_WORKSPACE".to_owned()))],
+                "{name}"
+            );
+            assert!(!workspace.exists(), "{name}: nothing is laid down");
+        }
+        let refs = Command::new("git")
+            .arg("-C")
+            .arg(&repository)
+            .args(["for-each-ref"])
+            .output()
+            .unwrap();
+        assert!(refs.stdout.is_empty(), "nothing was imported");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // S4 (#162): a bare hub and its linked worktree share a common dir, so
+    // their items share a plan base. The bare item, planned with a
+    // standalone workspace, still refuses GIT_BARE_CAPTURE_WORKSPACE at
+    // apply: the check runs before the base import, which would otherwise
+    // mask it (`GIT_DESTINATION_OCCUPIED`).
+    #[test]
+    fn a_bare_item_on_a_plan_base_refuses_its_workspace_before_the_base() {
+        let (root, origin, _, _, corpus) = drifting_plan("bare-base");
+        let hub = root.join("hub.git");
+        git(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                origin.to_str().unwrap(),
+                hub.to_str().unwrap(),
+            ],
+        );
+        let linked = root.join("hub-worktree");
+        git(
+            &hub,
+            &["worktree", "add", "--quiet", linked.to_str().unwrap()],
+        );
+        let repository = root.join("repository");
+        fs::create_dir(&repository).unwrap();
+        git(&repository, &["init", "--template="]);
+        let standalone = root.join("standalone");
+        let plan = root.join("base-plan");
+        add(&plan, &hub, &standalone, Some(&standalone)).unwrap();
+        add(&plan, &linked, &repository, None).unwrap();
+        let state = root.join("state");
+        let rows = receipts(&plan, &state, &corpus).unwrap();
+        assert!(
+            rows.iter()
+                .all(|row| row.0 == "captured" && row.1.is_none()),
+            "{rows:?}"
+        );
+        let item = inspect(&plan)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.workspace.is_some())
+            .unwrap();
+        let record: Capture =
+            read(&corpus.join(format!("{}.capture", id(&item).unwrap()))).unwrap();
+        assert!(
+            git_carry::shared::requires_base(&corpus.join(&record.bundle)).unwrap(),
+            "the bare capture is on the plan base"
+        );
+        let applied = root.join("applied");
+        let outcomes = Mutex::new(Vec::new());
+        let result = apply(&plan, &corpus, &applied, "neo", 1, &|row| {
+            outcomes
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone()));
+            Ok(())
+        });
+        assert!(result.is_err());
+        let mut outcomes = outcomes.into_inner().unwrap();
+        outcomes.sort();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("refs-imported", None),
+                ("refused", Some("GIT_BARE_CAPTURE_WORKSPACE".to_owned())),
+            ]
+        );
+        assert!(!standalone.exists(), "nothing is laid down");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // WP1 PR 4 (S5, arch 8): a lane deletes a branch and prunes under the
     // pass. The private repository reads the source through `alternates`, so
     // its bundle child fails on the pruned commit; the pack listing moved, so
@@ -2729,13 +3222,13 @@ mod tests {
         );
         // The skipped seat cost nothing; everything else was read once.
         assert_eq!(*bytes_read, 65_536 + b"small untracked".len() as u64);
-        // The durable outcome still decodes as the existing tuple, unchanged.
+        // The durable outcome is the typed record (WP3 PR 3; it was the
+        // legacy string tuple, which the reader still maps).
         let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
-        let durable: (PathBuf, String, Option<String>) =
-            read(&state.join(format!("{item}.outcome"))).unwrap();
-        assert_eq!(durable.0, fs::canonicalize(&source).unwrap());
-        assert_eq!(durable.1, "captured-with-drift");
-        assert_eq!(durable.2.as_deref(), Some("drift=3"));
+        let durable = crate::outcome::read_record(&state.join(format!("{item}.outcome"))).unwrap();
+        assert_eq!(durable.source, fs::canonicalize(&source).unwrap());
+        assert_eq!(durable.outcome, crate::outcome::Outcome::CapturedWithDrift);
+        assert_eq!(durable.reason.as_deref(), Some("drift=3"));
         // The Capture record is the unchanged codec; the rows ride beside it.
         let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
         let sidecar: git_carry::CaptureDrift =
@@ -2747,7 +3240,8 @@ mod tests {
     // R-N72 (TIN-4540) finding 3: a drifted capture does not hold the drifted
     // seats' bytes, so apply refuses it, fail-closed, before touching the
     // destination. R-N29 (apply proceeds on an occupied destination, recording
-    // uncaptured seats) is deferred to W6 git carry v2 (bulkload#48).
+    // uncaptured seats) is deferred (bulkload#48); carry v2, the W6 engine it
+    // was deferred to, is deleted (OI-1003-Q44, OI-1003-Q56).
     #[test]
     fn a_drifted_capture_refuses_to_apply_until_a_later_pass_extends_it() {
         let (root, source, target, plan, corpus) = drifting_plan("applies");
@@ -2831,16 +3325,7 @@ mod tests {
         assert_eq!(*drift, vec!["RefRemoved \"refs/heads/side\"".to_owned()]);
         assert_eq!(second.first().unwrap().0, "capture-extended-from-drift");
         // The capture the second pass recorded holds the ref and its commit.
-        let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
-        let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
-        let heads = Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["bundle", "list-heads"])
-            .arg(corpus.join(&record.bundle))
-            .output()
-            .unwrap();
-        let heads = String::from_utf8(heads.stdout).unwrap();
+        let heads = recorded_heads(&plan, &corpus, &source);
         assert!(heads
             .lines()
             .any(|line| line.starts_with(&side) && line.ends_with("refs/heads/side")));
@@ -2942,17 +3427,29 @@ mod tests {
         corpus.join(format!("{}.drift", record.bundle))
     }
 
+    // The ref lines the item's recorded capture carries (its header, or its
+    // ref table's expansion, OI-1003-Q54); a chained bundle's prerequisites
+    // are read from the source's object store.
     fn recorded_heads(plan: &Path, corpus: &Path, source: &Path) -> String {
         let item = id(inspect(plan).unwrap().first().unwrap()).unwrap();
         let record: Capture = read(&corpus.join(format!("{item}.capture"))).unwrap();
-        let heads = Command::new("git")
+        let objects = Command::new("git")
             .arg("-C")
             .arg(source)
-            .args(["bundle", "list-heads"])
-            .arg(corpus.join(&record.bundle))
+            .args([
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "objects",
+            ])
             .output()
             .unwrap();
-        String::from_utf8(heads.stdout).unwrap()
+        let objects = String::from_utf8(objects.stdout).unwrap();
+        git_carry::carried_heads(
+            &corpus.join(&record.bundle),
+            Some(Path::new(objects.trim_end())),
+        )
+        .unwrap()
     }
 
     fn update_ref_at(repo: &Path, stage: git_carry::mid_pass::Stage, args: &[&str]) {
@@ -4567,7 +5064,7 @@ mod closure_lane_20261002 {
         // Every reservation was released.
         assert_eq!(*space.reserved.lock().unwrap(), 0);
         // The refused item's durable receipt carries the typed code, so the
-        // closure report counts it as refused.
+        // closure report counts it as a typed refusal pending review (S4).
         let read = ledger(&plan, &corpus, "neo", std::slice::from_ref(&state)).unwrap();
         let refused = read
             .entries
@@ -4576,7 +5073,7 @@ mod closure_lane_20261002 {
             .unwrap();
         assert_eq!(
             classify(refused),
-            Disposition::Refused("DESTINATION_SPACE_INSUFFICIENT".into())
+            Disposition::RefusedPendingReview("DESTINATION_SPACE_INSUFFICIENT".into())
         );
         // The next pass, with room, captures the refused item and reuses the
         // other.
@@ -4638,7 +5135,8 @@ mod closure_lane_20261002 {
             repaired
                 .record
                 .as_ref()
-                .map(|(_, outcome, _)| outcome.as_str()),
+                .and_then(|record| record.as_ref().ok())
+                .map(|record| record.outcome.name()),
             Some(INDEX_REPAIRED)
         );
         assert_eq!(
@@ -4679,7 +5177,7 @@ mod closure_lane_20261002 {
         );
         let refused = entry(std::slice::from_ref(&refused_state));
         assert!(
-            matches!(classify(&refused), Disposition::Refused(_)),
+            matches!(classify(&refused), Disposition::RefusedPendingReview(_)),
             "{refused:?}"
         );
         fs::remove_dir_all(root).unwrap();

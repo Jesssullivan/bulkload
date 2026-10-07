@@ -126,28 +126,6 @@ pub fn barrier_dir(directory: impl AsFd) -> io::Result<()> {
     full_flush(directory)
 }
 
-/// [`rename_exclusive_at`], then on `EINVAL`/`ENOSYS` `linkat` and `unlinkat`
-/// (no-clobber, two directory operations). For files only: `linkat` on a
-/// directory is `EPERM`.
-///
-/// # Errors
-/// Returns the rename, link or unlink failure; an occupied `to` is `EEXIST`.
-pub fn rename_noreplace_at(
-    from_dir: impl AsFd,
-    from: &CStr,
-    to_dir: impl AsFd,
-    to: &CStr,
-) -> io::Result<()> {
-    let (from_dir, to_dir) = (from_dir.as_fd(), to_dir.as_fd());
-    match rename_exclusive_at(from_dir, from, to_dir, to) {
-        Err(error) if matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) => {
-            linkat(from_dir, from, to_dir, to)?;
-            unlinkat(from_dir, from, false)
-        }
-        other => other,
-    }
-}
-
 /// [`rename_exclusive_at`] within one directory.
 ///
 /// # Errors
@@ -267,4 +245,57 @@ pub fn set_pipe_buffer(fd: BorrowedFd<'_>, bytes: libc::c_int) -> io::Result<boo
         return Err(io::Error::last_os_error());
     }
     Ok(true)
+}
+
+/// The extended attribute that carries a published output's capture record
+/// (#169): a `user.` attribute, which needs no privilege.
+pub(super) const CAPTURE_RECORD: &CStr = c"user.bulkload.capture";
+
+/// `errno` for an attribute the file does not have.
+pub(super) const NO_ATTRIBUTE: libc::c_int = libc::ENODATA;
+
+/// `fsetxattr(fd, name, value, 0)`: create or replace the attribute.
+pub(super) fn set_xattr_raw(fd: BorrowedFd<'_>, name: &CStr, value: &[u8]) -> io::Result<()> {
+    // SAFETY: the descriptor is live for every call of the closure, `name` is
+    // NUL-terminated and outlives it, and `value` is a live slice whose
+    // length is passed with its pointer; the kernel only reads it.
+    retry_eintr(|| unsafe {
+        libc::fsetxattr(
+            fd.as_raw_fd(),
+            name.as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    })
+}
+
+/// `fgetxattr(fd, name, buffer)`: the attribute's length, read into
+/// `buffer`.
+pub(super) fn get_xattr_raw(
+    fd: BorrowedFd<'_>,
+    name: &CStr,
+    buffer: &mut [u8],
+) -> io::Result<usize> {
+    loop {
+        // SAFETY: the descriptor is live for the call, `name` is
+        // NUL-terminated and outlives it, and `buffer` is a live, exclusively
+        // borrowed slice whose length is passed with its pointer, so the
+        // kernel writes at most that many bytes.
+        let got = unsafe {
+            libc::fgetxattr(
+                fd.as_raw_fd(),
+                name.as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+            )
+        };
+        if let Ok(length) = usize::try_from(got) {
+            return Ok(length);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
 }

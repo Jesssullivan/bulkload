@@ -1,5 +1,5 @@
 # TLC configs checked by `just tla-check`, in this order (README.md).
-# Rendered by gen_cfgs.py; edit its table, not this file.
+# Rendered from catalogue/Catalogue.dhall by `just tla-render`; edit the catalogue, not this file.
 # Tab-separated columns:
 #   name            the config, MC_<name>.cfg
 #   expect          pass | fail | reach | simulate | inconclusive
@@ -18,18 +18,25 @@ MC_main_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,Chec
 MC_dest_faults	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CrashBoth,CrashDst,CrashSrc,Edit,Exchange,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_nv_core	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
 MC_nv_ledger	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_nv_core_adopt	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
+MC_nv_ledger_adopt	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_wp0g	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_wp0g_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_wp0d_exchange	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,GitRead,RenameReplace	-
 MC_s2	pass	all	CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,RenameReplace,VerifyDisp	-
 MC_live	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,CrashBoth,CrashDst,CrashSrc,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_r25_unrowed_bytes	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_r25_strict_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_r25_strict_main	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
+MC_r25_strict_unsealed	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
+MC_r25_strict_authority	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_main_sim	simulate	all	*	-simulate num=3000 -depth 120 -seed 20261003
 MC_reach_ledger_manifest	reach	Witness_LedgerManifest	*	-
 MC_reach_ledger_chunks	reach	Witness_LedgerChunkRead	*	-
 MC_reach_wp0g_lost_row	reach	Witness_LostRowRead	*	-
 MC_wp0g_authority	fail	R25_NoDurableReread	*	-
 MC_store_root_unsealed	fail	R25_NoDurableReread	*	-
-MC_r25_unrowed_bytes	fail	R25_StrictNoDurableReread	*	-
+MC_r25_unrowed_no_adopt	fail	R25_StrictNoDurableReread	*	-
 MC_wp0d_check_rename	fail	NoClobber	*	-
 MC_neg_live_unfair	fail	RunsClose	*	-
 MC_neg_held_before_commit	fail	HeldAfterCommit	*	-
@@ -55,3 +62,7 @@ MC_neg_git_optional_locks	fail	S2_TypedSourceAccess	*	-
 MC_neg_unbounded_backup	fail	S2_BackupLockBounded	*	-
 MC_neg_supersede_unchecked	fail	NoClobber	*	-
 MC_neg_sweep_displaced	fail	NoClobber	*	-
+MC_neg_adopt_unkeyed	fail	ReuseSound	*	-
+MC_neg_adopt_unverified	fail	RecordImpliesBytes	*	-
+MC_neg_reuse_ignores_row	fail	AdoptOnlyUnrowed	*	-
+MC_neg_adopt_unrecorded	fail	R25_StrictNoDurableReread	*	-

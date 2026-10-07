@@ -32,6 +32,7 @@ py_test(
         ".github/actionlint.yaml",
         ".github/actions/bulkload-public-read-ci/action.yml",
         ".github/workflows/ci.yml",
+        "MODULE.bazel",
         "flake.lock",
         "flake.nix",
         "justfile",

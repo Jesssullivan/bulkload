@@ -23,9 +23,6 @@
 //!   repository. That containment check compares directory identities
 //!   (device and inode) along the state dir's ancestors, never path prefixes
 //!   (DF2).
-//!
-//! [`PrivateState`] and the private-file helpers are shared with git carry
-//! v2's list store (`git_carry::carry_v2`).
 
 use crate::refuse::RefuseAt as _;
 use std::ffi::CString;
@@ -50,7 +47,7 @@ pub const CLASSIFY_LIMIT: usize = 1 << 20;
 /// (DF2: a case alias, a firmlink or a bind mount names the same directory
 /// under another prefix). Opening it creates nothing (DF1).
 #[derive(Debug)]
-pub struct PrivateState {
+struct PrivateState {
     directory: File,
     root: PathBuf,
     chain: Vec<(u64, u64)>,
@@ -64,7 +61,7 @@ impl PrivateState {
     /// Refuses a state dir that is a symlink, is not owned by the effective
     /// uid, has group or other permission bits or carries an extended ACL,
     /// and any I/O failure.
-    pub fn open(state_dir: &Path) -> Result<Self> {
+    fn open(state_dir: &Path) -> Result<Self> {
         let absolute = if state_dir.is_absolute() {
             state_dir.to_path_buf()
         } else {
@@ -103,20 +100,20 @@ impl PrivateState {
     /// (followed) has the device and inode of the state dir or of one of its
     /// ancestors (DF2).
     #[must_use]
-    pub fn is_inside(&self, path: &Path) -> bool {
+    fn is_inside(&self, path: &Path) -> bool {
         std::fs::metadata(path)
             .is_ok_and(|metadata| self.chain.contains(&(metadata.dev(), metadata.ino())))
     }
 
     /// The state dir as its canonical parent and name spell it.
     #[must_use]
-    pub fn root(&self) -> &Path {
+    fn root(&self) -> &Path {
         &self.root
     }
 
     /// The open state dir.
     #[must_use]
-    pub const fn directory(&self) -> &File {
+    const fn directory(&self) -> &File {
         &self.directory
     }
 }
@@ -128,7 +125,7 @@ impl PrivateState {
 /// # Errors
 /// Refuses a symlink, a non-directory, a directory that is not private, and
 /// any I/O failure.
-pub fn private_subdirectory(parent: &File, name: &str, create: bool) -> Result<Option<File>> {
+fn private_subdirectory(parent: &File, name: &str, create: bool) -> Result<Option<File>> {
     if create {
         let leaf = cstring(name.as_bytes())?;
         // SAFETY: `parent` is an open directory and `leaf` is NUL-terminated.
@@ -223,6 +220,10 @@ impl StderrStore {
         if guard.is_none() {
             let directory = private_subdirectory(self.state.directory(), "stderr", true)?
                 .ok_or(BulkloadRefusal::Io(None))?;
+            // #161: `stderr/`'s own entry is durable before any capture in
+            // it is, whoever created it (a creator may have died unsealed).
+            crate::counters::sync_dir(self.state.directory())
+                .refuse_at("git_carry::estimate::stderr_store::with_opened")?;
             let key = key(&directory)?;
             *guard = Some(Opened { directory, key });
         }
@@ -346,7 +347,7 @@ impl Capture {
     }
 }
 
-pub fn cstring(bytes: &[u8]) -> Result<CString> {
+fn cstring(bytes: &[u8]) -> Result<CString> {
     CString::new(bytes).map_err(|_| BulkloadRefusal::PathNotPortable)
 }
 
@@ -372,7 +373,7 @@ fn open_dir(parent: Option<&File>, name: &Path) -> Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-pub fn create_private(directory: &File, name: &CString) -> Result<File> {
+fn create_private(directory: &File, name: &CString) -> Result<File> {
     // SAFETY: `directory` is open, `name` is NUL-terminated, and the mode
     // accompanies O_CREAT.
     let fd = unsafe {
@@ -409,7 +410,7 @@ pub fn create_private(directory: &File, name: &CString) -> Result<File> {
     Ok(file)
 }
 
-pub fn open_existing(directory: &File, name: &CString) -> Result<File> {
+fn open_existing(directory: &File, name: &CString) -> Result<File> {
     // SAFETY: `directory` is open and `name` NUL-terminated; O_NONBLOCK keeps
     // a FIFO planted at the name from blocking the open.
     let fd = unsafe {
@@ -483,7 +484,7 @@ fn private_directory(directory: &File) -> Result<()> {
     Ok(())
 }
 
-pub fn private_file(file: &File) -> Result<()> {
+fn private_file(file: &File) -> Result<()> {
     let metadata = file
         .metadata()
         .refuse_at("git_carry::estimate::stderr_store::private_file")?;
