@@ -137,7 +137,8 @@ bench-io-chunker:
     cd {{ root }} && cargo test --release -p bulkload-agent --lib --locked io::chunker::tests::chunker_micro_bench -- --ignored --nocapture --test-threads=1
 
 # bulkload-bench built at --rev-b (origin/main, the candidate) and --rev-a
-# (7c3ecc7, informational), each rep the full R23 bench with the rclone
+# (informational: the rig's pinned A on a rig of record, OI-1003-Q103; else
+# 7c3ecc7), each rep the full R23 bench with the flake-pinned rclone
 # baseline, plus one v4 (41bf9a4) native rep for dedup loss. B passes R23
 # iff every B rep's verdict passes. Gated runs only on neo, AC power, load1 < 2.5,
 # lanes quiet (R-N81, R-N91); --dry-run makes a synthetic corpus and is NOT a

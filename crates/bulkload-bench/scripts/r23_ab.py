@@ -3,8 +3,9 @@
 
 Runs `bulkload-bench` built at two revisions in the order B/A/B/A/B
 (OI-1002-Q30), one bench invocation per repetition. B (--rev-b, default
-origin/main) is the candidate; A (--rev-a, default 7c3ecc7) is the
-informational baseline. Each invocation is the full R23 bench as in
+origin/main) is the candidate; A (--rev-a) is the informational baseline:
+the rig's pinned commit on a rig of record (RIG_BASELINE_A, OI-1003-Q103),
+7c3ecc7 on every other host. Each invocation is the full R23 bench as in
 docs/evidence/r23-2026-09-18.md: native and rclone alternate N/R/N/R/N
 (`--reps 3`), then warm resume, interrupted resume and the 1 % delta, so the
 rclone baseline runs the same way, with the same flags, inside every
@@ -62,9 +63,33 @@ the default evidence file name; a gated --evidence name that lacks the rig
 name is refused. `of_record=true` needs all of: gated mode, a `record` rig,
 the A control (B/A/B/A/B) and a completed sample.
 
-Baselines on Linux (OI-1003-Q96): the pinned baselines A (7c3ecc7) and V4
-(41bf9a4) predate the sysfs preflight; their bench runs `pmset` from PATH
-and refuses when it is missing. The harness does not patch or rebuild them.
+The A control (OI-1003-Q103): A is a fixed commit run between the B reps.
+It shows drift of the rig itself, inside one sample and from one sample to
+the next: B changes with main, A does not, so a change in A's numbers is a
+change in the host. A never decides the gate (OI-1002-Q30). 7c3ecc7 cannot
+be that control on mbp-13, where its bench refuses with a bare `IO (errno
+32)`, so `RIG_BASELINE_A` pins a newer main commit for that rig, with its
+date and reason. A gated sample on a rig of record with its A control is
+refused when --rev-a resolves to any other commit; the pin changes with the
+SLO text, not on the command line. The report's `baseline_a` and the
+evidence name the commit and the pin.
+
+rclone (OI-1003-Q105): every sample uses the rclone build that the repo
+flake pins (`nix build --inputs-from <repo> nixpkgs#rclone`), on every
+host. `RCLONE_PIN` records that build's version and its store path per Nix
+system. A gated or under-load sample refuses a --rclone that is any other
+binary, unless --rclone-override-reason says why; an override is recorded,
+its verdict carries the token `RCLONE-OVERRIDE` and it is never of record.
+A gated sample is also refused when the flake resolves to a build other
+than the committed pin, so a version bump is a recorded edit and not a side
+effect of a lock update. Every report has `rclone_record` (store path,
+version, binary sha256, the flake's nixpkgs revision, the committed pin and
+whether they match), and a rep whose bench header names another rclone
+version aborts the sample. A dry run records the rclone and refuses nothing.
+
+Baselines on Linux (OI-1003-Q96): the baselines A (7c3ecc7, and the rig pin
+of OI-1003-Q103) and V4 (41bf9a4) predate the sysfs preflight; their bench
+runs `pmset` from PATH and refuses when it is missing. The harness does not patch or rebuild them.
 It builds each at its exact sha as usual, and runs a baseline that lacks
 the sysfs probe with <work>/pmset-shim first on PATH. That directory holds
 one script named `pmset`, which calls this file with --pmset-shim: it
@@ -149,8 +174,9 @@ native-vs-rclone initial and delta medians, not a pass count. The evidence
 goes to docs/evidence/r23-underload-<date>-<HHMM>Z.md; an --evidence name
 that does not contain `underload` is refused.
 
---b-only-no-a-control (OI-1003-Q96, pending an operator ruling) is for a rig
-where the pinned A cannot run. It needs --no-a-control-reason. It keeps
+--b-only-no-a-control (OI-1003-Q96) is for a rig where the pinned A cannot
+run. OI-1003-Q103 ruled on mbp-13's case: pin an A that runs and keep
+B/A/B/A/B, so this path is no longer how that rig samples. It needs --no-a-control-reason. It keeps
 every gated check (platform, corpus v1, verify, seal, R-N81 before every rep
 and arm, R-N91) and changes one thing: the order is B/B/B, A is not built and
 no A rep runs. OI-1002-Q30 ratifies the order B/A/B/A/B, so this sample lacks
@@ -203,8 +229,14 @@ DEFAULT_A = "7c3ecc7"
 DEFAULT_B = "origin/main"
 DEFAULT_V4 = "41bf9a4"
 RULINGS = (
-    "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, OI-1003-Q96, OI-1003-Q97, R23, R-N57,"
-    " R-N81, R-N91, R-N134, R-N13"
+    "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, OI-1003-Q96, OI-1003-Q97, OI-1003-Q103,"
+    " OI-1003-Q105, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
+)
+# What the A control is for (OI-1002-Q30, OI-1003-Q103). It never decides.
+A_PURPOSE = (
+    "A is a fixed commit run between the B reps. It shows drift of the rig"
+    " itself, inside a sample and from one sample to the next; it never"
+    " decides the gate"
 )
 POWER_SUPPLY_ROOT = Path("/sys/class/power_supply")
 PMSET_AC = "Now drawing from 'AC Power'"
@@ -252,6 +284,43 @@ NO_A_TOKEN = "NO-A-CONTROL"
 RIG_OF_RECORD: dict[str, dict[str, str]] = {
     "mbp-13": {"system": "Linux", "machine": "x86_64", "product": "MacBookPro12,1"},
 }
+# The A control of each rig of record (docs/slo.md, the 2026-10-07 Q103
+# amendment; OI-1003-Q103). DEFAULT_A (7c3ecc7) refuses on mbp-13 with a bare
+# `IO (errno 32)`; this pin replaces it there. A gated sample on a rig of
+# record with its A control runs exactly this commit or is refused. Change a
+# pin only with the SLO text. Every other host keeps DEFAULT_A.
+RIG_BASELINE_A: dict[str, dict[str, str]] = {
+    "mbp-13": {
+        "sha": "3931471738cc3995a0e564e73af3134d7a7f1ff2",
+        "pinned": "2026-10-07",
+        "reason": (
+            "main at the merge of #195, the last main commit before the rig work"
+            " of 2026-10-07. On mbp-13 it completed 24 of 24 native-only runs on"
+            " corpus v1 (12 informational, 12 R-N81 gated behind the pmset"
+            " translator) and 24 of 24 on the dry-run corpus. 7c3ecc7 refused"
+            " there with IO (errno 32) in 4 of 15 runs on corpus v1 and 15 of 15"
+            " on the dry-run corpus"
+        ),
+    },
+}
+# The rclone of every sample (OI-1003-Q105): the build the repo flake pins
+# (`nix build --inputs-from <repo> nixpkgs#rclone`), recorded here by version
+# and store path per Nix system. A gated sample is refused when the flake
+# resolves to anything else, so a version bump is this edit plus the SLO
+# text, never a side effect of a lock update. `aarch64-darwin` is the
+# evaluated output path; it was not built by the lane that recorded it.
+RCLONE_PIN: dict[str, object] = {
+    "version": "rclone v1.74.4",
+    "nixpkgs_rev": "241313f4e8e508cb9b13278c2b0fa25b9ca27163",
+    "recorded": "2026-10-07",
+    "store_paths": {
+        "x86_64-linux": "/nix/store/v5xbkynmfg8ml23d82m09s802nmj2r6f-rclone-1.74.4",
+        "aarch64-darwin": "/nix/store/5aw5dn7z12pnwjp1yghg9xar9bcl21fk-rclone-1.74.4",
+    },
+}
+RCLONE_OVERRIDE = "RCLONE OVERRIDE"
+# Verdict suffix of a sample that ran another rclone: one token, like NO_A_TOKEN.
+RCLONE_OVERRIDE_TOKEN = "RCLONE-OVERRIDE"
 # A gated sample is refused when any of these is missing from host_identity.
 IDENTITY_REQUIRED = (
     "node",
@@ -698,10 +767,9 @@ def build(
     }
 
 
-def resolve_rclone(repo: Path, given: str | None) -> Path:
-    if given:
-        return Path(given).resolve()
-    out = subprocess.run(
+def flake_rclone(repo: Path) -> Path:
+    """The rclone binary of the nixpkgs that the repo flake pins (OI-1003-Q105)."""
+    outputs = subprocess.run(
         [
             "nix",
             "build",
@@ -715,7 +783,131 @@ def resolve_rclone(repo: Path, given: str | None) -> Path:
         text=True,
         check=True,
     ).stdout.split()
-    return Path(out[-1]) / "bin" / "rclone"
+    # nixpkgs#rclone has more than one output (`-man`); take the one with the binary.
+    for output in outputs:
+        if (Path(output) / "bin" / "rclone").is_file():
+            return Path(output) / "bin" / "rclone"
+    raise FileNotFoundError(f"no bin/rclone in {outputs}")
+
+
+def flake_nixpkgs_rev(repo: Path) -> str | None:
+    """The nixpkgs revision in the repo's flake.lock, or None."""
+    try:
+        nodes = json.loads((repo / "flake.lock").read_text())["nodes"]
+        return nodes[nodes["root"]["inputs"]["nixpkgs"]]["locked"]["rev"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def system_key() -> str:
+    """This host's Nix system name, the key of RCLONE_PIN's store paths."""
+    machine = {"arm64": "aarch64", "amd64": "x86_64"}.get(
+        platform.machine(), platform.machine()
+    )
+    return f"{machine}-{platform.system().lower()}"
+
+
+def rclone_version(binary: Path) -> str | None:
+    """First line of `rclone version`, as the bench header prints it; or None."""
+    try:
+        result = subprocess.run(
+            [str(binary), "version"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    lines = result.stdout.splitlines()
+    return lines[0].strip() if result.returncode == 0 and lines else None
+
+
+def store_path(binary: Path) -> str:
+    """`/nix/store/<hash>-rclone-<v>` for `<that>/bin/rclone`; else the binary."""
+    return str(binary.parent.parent if binary.parent.name == "bin" else binary)
+
+
+def choose_rclone(
+    repo: Path, given: str | None, override_reason: str | None, mode: str
+) -> tuple[dict[str, object], str | None]:
+    """Which rclone this run uses, its record, and why it is refused (or None).
+
+    OI-1003-Q105: every sample uses the flake-pinned build. `mode` is
+    `gated`, `under-load` or `dry-run`.
+
+    - No --rclone: the flake-pinned build.
+    - --rclone naming that same store path: accepted, it is the same build.
+    - --rclone naming anything else: refused in a gated or under-load
+      sample unless --rclone-override-reason says why. The override and its
+      reason are recorded, the verdict carries RCLONE_OVERRIDE_TOKEN and the
+      sample is never of record.
+    - Gated only: the flake-pinned build must be the committed RCLONE_PIN
+      (version and this system's store path). If the lock moved it, the
+      sample is refused until the pin and the SLO text record the bump.
+    - A dry run records what it used and refuses nothing here.
+    """
+    reason = (override_reason or "").strip()
+    pinned: Path | None = None
+    resolve_error: str | None = None
+    if mode != "dry-run" or not given:
+        try:
+            pinned = flake_rclone(repo).resolve()
+        except (OSError, subprocess.CalledProcessError) as error:
+            resolve_error = f"{type(error).__name__}: {error}"
+    used = Path(given).resolve() if given else pinned
+    system = system_key()
+    committed = RCLONE_PIN["store_paths"].get(system)  # type: ignore[union-attr]
+    version = rclone_version(used) if used else None
+    is_pinned = used is not None and used == pinned
+    on_pin = (
+        is_pinned and store_path(used) == committed and version == RCLONE_PIN["version"]
+    )
+    record: dict[str, object] = {
+        "binary": str(used) if used else None,
+        "store_path": store_path(used) if used else None,
+        "version": version,
+        "sha256": sha256(used) if used and used.is_file() else None,
+        "flake_pinned_binary": str(pinned) if pinned else None,
+        "flake_pinned_store_path": store_path(pinned) if pinned else None,
+        "flake_nixpkgs_rev": flake_nixpkgs_rev(repo),
+        "is_flake_pinned": is_pinned,
+        "system": system,
+        "committed_pin": {
+            "version": RCLONE_PIN["version"],
+            "store_path": committed,
+            "nixpkgs_rev": RCLONE_PIN["nixpkgs_rev"],
+            "recorded": RCLONE_PIN["recorded"],
+        },
+        "matches_committed_pin": on_pin,
+        "override": {"reason": reason} if reason else None,
+        "ruling": "OI-1003-Q105",
+    }
+    if mode == "dry-run":
+        return record, None
+    if pinned is None:
+        return record, (
+            "cannot resolve the flake-pinned rclone, which every sample must"
+            f" record (OI-1003-Q105): {resolve_error}"
+        )
+    if reason and is_pinned:
+        return record, (
+            "--rclone-override-reason is only for a --rclone that is not the"
+            " flake-pinned build; this run would use the pinned one"
+        )
+    if not is_pinned and not reason:
+        return record, (
+            f"--rclone {used} is not the flake-pinned rclone {pinned}; every"
+            " sample uses the pinned build (OI-1003-Q105). A deliberate"
+            " exception needs --rclone-override-reason, and is recorded"
+        )
+    if version is None:
+        return record, f"cannot read `{used} version`"
+    if mode == "gated" and is_pinned and not on_pin:
+        return record, (
+            f"the repo flake resolves rclone to {store_path(used)} ({version}),"
+            f" but the committed pin for {system} is {committed}"
+            f" ({RCLONE_PIN['version']}). A version bump is a deliberate,"
+            " recorded change (OI-1003-Q105): update RCLONE_PIN with the SLO"
+            " text first"
+        )
+    return record, None
 
 
 def synthetic_corpus(root: Path) -> None:
@@ -1039,6 +1231,11 @@ def run_rep(
     if sealed is None or sealed != expected:
         problems.append(f"sealed_corpus_blake3 {sealed} != first rep's {expected}")
     problems += power
+    # OI-1003-Q105: the bench must have run the rclone the report records.
+    wanted = state.get("rclone_version")
+    ran = parsed["header"].get("rclone_version")
+    if wanted is not None and ran not in (wanted, "not-run"):
+        problems.append(f"bench header rclone_version {ran!r} != recorded {wanted!r}")
     # OI-1003-Q39: an under-load sample records load but does not gate on it,
     # and its rows are gated=false by design; power is checked above instead.
     if not args.dry_run and not args.under_load:
@@ -1118,15 +1315,19 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
     else:
         verdict = "FAIL"
     no_a = report.get("a_control") is False
+    rclone = report.get("rclone_record")
+    override = isinstance(rclone, dict) and bool(rclone.get("override"))
     of_record = (
         verdict in ("PASS", "FAIL")
         and not no_a
+        and not override
         and report["mode"] == "gated"
         and report["status"] == "complete-draft"
         and report.get("rig_role") == "record"
     )
-    if no_a and verdict in ("PASS", "FAIL"):
-        verdict += f"-{NO_A_TOKEN}"
+    if verdict in ("PASS", "FAIL"):
+        verdict += f"-{NO_A_TOKEN}" if no_a else ""
+        verdict += f"-{RCLONE_OVERRIDE_TOKEN}" if override else ""
     return {
         "rig": report.get("rig"),
         "rig_role": report.get("rig_role"),
@@ -1149,6 +1350,7 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
             )
         ),
         "a_control": not no_a,
+        "rclone_override": override,
         "b_reps": len(b_reps),
         "b_reps_pass": passed,
         "b_statuses": statuses,
@@ -1259,6 +1461,58 @@ def build_settle_lines(report: dict[str, object]) -> list[str]:
     ]
 
 
+def rclone_lines(report: dict[str, object]) -> list[str]:
+    """The rclone of the sample: store path, version and pin (OI-1003-Q105)."""
+    record = report.get("rclone_record")
+    if not isinstance(record, dict):
+        return [
+            f"- rclone: `{report['rclone']}` ({report.get('rclone_version', 'n/a')}),"
+            " the r23-2026-09-18 flags."
+        ]
+    pin = record.get("committed_pin") or {}
+    if record.get("override"):
+        standing = (
+            f"**not the flake-pinned build** (`{record.get('flake_pinned_store_path')}`);"
+            f" override reason: {record['override'].get('reason')}"
+        )
+    elif record.get("matches_committed_pin"):
+        standing = (
+            "the flake-pinned build, and the committed pin for"
+            f" `{record.get('system')}` (recorded {pin.get('recorded')})"
+        )
+    elif record.get("is_flake_pinned"):
+        standing = (
+            "the flake-pinned build; it is **not** the committed pin for"
+            f" `{record.get('system')}` (`{pin.get('store_path')}`,"
+            f" {pin.get('version')})"
+        )
+    else:
+        standing = "not compared with the flake-pinned build (dry run)"
+    return [
+        f"- rclone: store path `{record.get('store_path')}`, version"
+        f" `{record.get('version')}`, binary sha256"
+        f" `{str(record.get('sha256'))[:16]}`; {standing}; flake.lock nixpkgs"
+        f" `{record.get('flake_nixpkgs_rev')}` (OI-1003-Q105). The"
+        " r23-2026-09-18 flags."
+    ]
+
+
+def baseline_lines(report: dict[str, object]) -> list[str]:
+    """Which commit A is and what it is for (OI-1003-Q103)."""
+    baseline = report.get("baseline_a")
+    if not isinstance(baseline, dict):
+        return []
+    pin = baseline.get("pin")
+    if isinstance(pin, dict):
+        which = (
+            f"`{str(baseline.get('sha'))[:12]}`, this rig's pinned baseline"
+            f" (OI-1003-Q103, pinned {pin.get('pinned')}): {pin.get('reason')}"
+        )
+    else:
+        which = f"`{str(baseline.get('sha'))[:12]}` (`{baseline.get('rev')}`)"
+    return [f"- A control: {which}. {A_PURPOSE} (OI-1002-Q30)."]
+
+
 def evidence(report: dict[str, object]) -> str:
     dry = report["mode"] == "dry-run"
     aborted = report["status"] in ("aborted", "refused")
@@ -1273,11 +1527,25 @@ def evidence(report: dict[str, object]) -> str:
         title += f" ({NOT_GATE})"
     elif report["mode"] == "under-load":
         title += f" ({UNDER_LOAD})"
-    elif report.get("a_control") is False:
-        title += f" (DRAFT, {NO_A_CONTROL})"
     else:
-        title += " (DRAFT)"
+        marks = ["DRAFT"]
+        if report.get("a_control") is False:
+            marks.append(NO_A_CONTROL)
+        if gate.get("rclone_override"):
+            marks.append(RCLONE_OVERRIDE)
+        title += f" ({', '.join(marks)})"
     lines += [title, ""]
+    if gate.get("rclone_override"):
+        record = report["rclone_record"]
+        lines += [
+            f"> **{RCLONE_OVERRIDE}.** This sample ran `{record.get('binary')}`"
+            f" ({record.get('version')}), not the flake-pinned rclone"
+            f" `{record.get('flake_pinned_binary')}`. Reason given:"
+            f" {record['override'].get('reason')}. OI-1003-Q105 makes the"
+            " flake-pinned build the rclone of every sample, so this one is"
+            " not a verdict of record.",
+            "",
+        ]
     if report.get("a_control") is False:
         lines += [
             f"> **{NO_A_CONTROL}.** Run with `--b-only-no-a-control`: the order was"
@@ -1357,7 +1625,8 @@ def evidence(report: dict[str, object]) -> str:
         f"- Work root: `{report['work_root']}`.",
         *identity_lines(report.get("host_identity")),
         *build_settle_lines(report),
-        f"- rclone: `{report['rclone']}` ({report.get('rclone_version', 'n/a')}), the r23-2026-09-18 flags.",
+        *rclone_lines(report),
+        *baseline_lines(report),
         "- Page cache: never dropped. The bench reads the whole source (BLAKE3) before"
         " every arm, so every timed arm starts source-hot. Residency is logged for the"
         " working copy before each rep and for the rep's private fixture (what the timed"
@@ -1527,7 +1796,8 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
     if first:
         header = first["parsed"]["header"]
         report["sealed_identity"] = header.get("sealed_corpus_blake3")
-        report["rclone_version"] = header.get("rclone_version")
+        report["rclone_version_bench_header"] = header.get("rclone_version")
+        report.setdefault("rclone_version", header.get("rclone_version"))
     b_first = next(
         (r for r in reps if r["label"] == "B" and r["parsed"].get("header")), None
     )
@@ -1542,6 +1812,7 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
         f"status={report['status']} rig={report.get('rig')}"
         f" rig_role={report.get('rig_role')}"
         f" of_record={str(report['gate']['of_record']).lower()}"
+        f" rclone_pinned={str(not report['gate'].get('rclone_override')).lower()}"
         f" json={work / 'r23-ab.json'} evidence={evidence_path}"
         f" gate={report['gate']['verdict']}"
     )
@@ -1577,9 +1848,20 @@ def main(argv: list[str] | None = None) -> int:
         "--work-root", required=True, help="new directory on the volume under test"
     )
     parser.add_argument(
-        "--rclone", help="rclone binary (default: nixpkgs from the repo flake)"
+        "--rclone",
+        help="rclone binary. Default, and the only one a sample accepts without"
+        " --rclone-override-reason: the build the repo flake pins (OI-1003-Q105)",
     )
-    parser.add_argument("--rev-a", default=DEFAULT_A)
+    parser.add_argument(
+        "--rclone-override-reason",
+        help="why this sample runs a --rclone that is not the flake-pinned build;"
+        " recorded, and the sample is then never of record (OI-1003-Q105)",
+    )
+    parser.add_argument(
+        "--rev-a",
+        help=f"default: the rig's pinned A on a rig of record (RIG_BASELINE_A,"
+        f" OI-1003-Q103), else {DEFAULT_A}",
+    )
     parser.add_argument("--rev-b", default=DEFAULT_B)
     parser.add_argument(
         "--rev-v4", default=DEFAULT_V4, help="'' skips the dedup reference"
@@ -1658,9 +1940,15 @@ def main(argv: list[str] | None = None) -> int:
         say("refused: --no-a-control-reason needs --b-only-no-a-control")
         return 2
     pattern = B_ONLY_PATTERN if no_a else args.pattern
+    identity = host_identity(work.parent)
+    rig = rig_name(identity.get("node"))
+    role, role_problem = rig_role(identity)
+    # OI-1003-Q103: a rig of record has its own pinned A control.
+    rig_a = RIG_BASELINE_A.get(rig) if role == "record" else None
+    rev_a = args.rev_a or (rig_a["sha"] if rig_a else DEFAULT_A)
     revisions = [("B", args.rev_b)]
     if not no_a:
-        revisions.append(("A", args.rev_a))
+        revisions.append(("A", rev_a))
     if args.rev_v4:
         revisions.append(("V4", args.rev_v4))
     if args.build_only:
@@ -1696,9 +1984,6 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
     sealed = Path(args.corpus or DEFAULT_CORPUS).resolve()
-    identity = host_identity(work.parent)
-    rig = rig_name(identity.get("node"))
-    role, role_problem = rig_role(identity)
     if not args.dry_run and not args.under_load:
         # OI-1003-Q97: a gated sample must say exactly which rig it is from.
         missing = [k for k in IDENTITY_REQUIRED if identity.get(k) in (None, "")]
@@ -1774,6 +2059,26 @@ def main(argv: list[str] | None = None) -> int:
     if evidence_path.exists():
         say(f"refused: evidence file exists: {evidence_path}")
         return 2
+    mode = "dry-run" if args.dry_run else ("under-load" if args.under_load else "gated")
+    if mode == "gated" and rig_a and not no_a:
+        # OI-1003-Q103: on a rig of record the A control is the pinned commit.
+        try:
+            a_sha = git(repo, "rev-parse", "--verify", f"{rev_a}^{{commit}}")
+        except (OSError, subprocess.CalledProcessError):
+            a_sha = None
+        if a_sha != rig_a["sha"]:
+            say(
+                f"refused: on rig {rig} the A control is pinned to {rig_a['sha']}"
+                f" (OI-1003-Q103); --rev-a {rev_a} resolves to {a_sha}. Change"
+                " RIG_BASELINE_A with the SLO text, not the command line"
+            )
+            return 2
+    rclone_record, rclone_problem = choose_rclone(
+        repo, args.rclone, args.rclone_override_reason, mode
+    )
+    if rclone_problem:
+        say(f"refused: {rclone_problem}")
+        return 2
 
     work.mkdir(mode=0o700)
     (work / "logs").mkdir()
@@ -1819,13 +2124,11 @@ def main(argv: list[str] | None = None) -> int:
                 " the gate"
             )
             return 2
-    rclone = resolve_rclone(repo, args.rclone)
+    rclone = Path(str(rclone_record["binary"]))
     report: dict[str, object] = {
         "date": date,
         "stamp": stamp,
-        "mode": "dry-run"
-        if args.dry_run
-        else ("under-load" if args.under_load else "gated"),
+        "mode": mode,
         "host": platform.node(),
         "platform": platform.platform(),
         "host_identity": identity,
@@ -1847,6 +2150,17 @@ def main(argv: list[str] | None = None) -> int:
         "content_verified_before": verified_before,
         "work_root": str(work),
         "rclone": str(rclone),
+        "rclone_version": rclone_record["version"],
+        "rclone_store_path": rclone_record["store_path"],
+        "rclone_record": rclone_record,
+        "baseline_a": None
+        if no_a
+        else {
+            "rev": rev_a,
+            "sha": builds["A"]["sha"],
+            "pin": rig_a if rig_a and builds["A"]["sha"] == rig_a["sha"] else None,
+            "purpose": A_PURPOSE,
+        },
         "builds": builds,
         "pattern": pattern,
         "a_control": not no_a,
@@ -1879,6 +2193,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.rev_v4:
         order.append(("V4", True))
     state: dict[str, object] = {}
+    if not args.dry_run:
+        state["rclone_version"] = rclone_record["version"]
     try:
         for index, (label, native_only) in enumerate(order):
             try:

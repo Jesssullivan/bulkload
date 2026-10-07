@@ -496,6 +496,85 @@ a ratified number or rule; what needs the operator is listed at the end.
   3. The A control on the rig, as asked above. If B/B/B is accepted, should
      the B reps be spaced (a v4 or rclone-only rep between them)?
 
+## Amendment 2026-10-07 (third): the rig's A control and its rclone (OI-1003-Q103, Q105)
+
+The operator ruled on question 3 of the section above (OI-1003-Q103) and on
+the rig's rclone (OI-1003-Q105). The verdict rule does not change: B passes
+R23 if and only if every B rep's bench verdict passes, and A is
+informational (OI-1002-Q30). Questions 1 and 2 of that section are still
+open.
+
+- **The rig pins a newer A, and keeps B/A/B/A/B (OI-1003-Q103).** On mbp-13
+  the A control is `3931471738cc3995a0e564e73af3134d7a7f1ff2`: main at the
+  merge of #195, the last main commit before the rig work of 2026-10-07. It
+  is `RIG_BASELINE_A` in `r23_ab.py`, pinned 2026-10-07. Every other host
+  keeps `7c3ecc7`. B/B/B (`--b-only-no-a-control`) is no longer how the rig
+  samples.
+- **What A is for on the rig.** A is a fixed commit run between the B reps.
+  B changes with main and A does not, so a change in A's numbers, inside a
+  sample or between samples, is a change in the rig. A shows drift of the
+  rig. It is not a comparison of old code with new, and it never decides
+  the gate. When the pin changes, A's numbers on either side are different
+  series.
+- **Why `7c3ecc7` could not be that control, measured.** Native-only runs on
+  mbp-13, 2026-10-07, each a full native bench (initial copy, warm resume,
+  interrupted resume, delta). "Refused" means the bench ended with a bare
+  `IO (errno 32)`, which is EPIPE.
+
+  | Bench built at | Corpus v1: refused / runs | Dry-run corpus: refused / runs |
+  |---|---:|---:|
+  | `7c3ecc7`, the old A | 4 / 15 | 15 / 15 |
+  | `41bf9a4`, v4 | 0 / 15 | 0 / 15 |
+  | `3931471`, the new A | 0 / 24 | 0 / 24 |
+  | `5875610`, main on 2026-10-07 | 0 / 12 | 0 / 12 |
+
+  Twelve of the new A's runs on each corpus were R-N81 gated behind the
+  `pmset` translator, as an A rep runs; the rest, and every other row, were
+  `--informational`. The host was not quiet throughout: the runs were back
+  to back (load1 0.3 to 2.3), and another lane's build and measurements
+  overlapped some of them (load1 up to 4.6). So the zeroes were measured
+  under more pressure than a gated sample allows, not less.
+- **What that says about #201.** Issue #201 is `transfer::copy` returning a
+  bare EPIPE now and then on current main, seen on sting under a load of 80
+  to 113. It did not occur on mbp-13 on current main in 24 runs (12 on each
+  corpus). The old
+  A's failure is not that rare race: it is every run on the dry-run corpus.
+  It also reproduces off the rig, on sting, when the bench is held to two
+  CPUs, and the new A does not (0 of 40 there). So something between
+  `7c3ecc7` and `3931471` fixed it. It is the same symptom as #201 and may
+  share its cause; #201 stays open, and the rig has not shown it. If a B
+  rep ever refuses with `IO (errno 32)`, the sample aborts with no verdict
+  and the refusal goes on #201.
+- **A's power preflight.** No commit on main reads Linux power itself until
+  the rig lane (#204) merges, so the new A runs behind the `pmset`
+  translator of the first amendment, like v4. B never does.
+- **The rig's rclone is the flake-pinned build (OI-1003-Q105).** Every
+  sample on every host runs the rclone that the repo's `flake.lock` pins
+  (`nix build --inputs-from <repo> nixpkgs#rclone`). Today that is `rclone
+  v1.74.4`, nixpkgs `241313f4e8e508cb9b13278c2b0fa25b9ca27163`, store path
+  `/nix/store/v5xbkynmfg8ml23d82m09s802nmj2r6f-rclone-1.74.4` on
+  `x86_64-linux` and `/nix/store/5aw5dn7z12pnwjp1yghg9xar9bcl21fk-rclone-1.74.4`
+  on `aarch64-darwin` (evaluated, not yet built by a rig lane). `RCLONE_PIN`
+  in `r23_ab.py` records it.
+  - A gated or under-load sample refuses any other rclone binary. A
+    deliberate exception takes `--rclone-override-reason`; it is recorded,
+    its verdict is `PASS-RCLONE-OVERRIDE` or `FAIL-RCLONE-OVERRIDE`, and it
+    is never of record.
+  - A gated sample is refused when the flake resolves to a build other than
+    `RCLONE_PIN`. A version bump is therefore a deliberate, recorded change:
+    `flake.lock`, `RCLONE_PIN` and a dated line here, in one change. Samples
+    on either side of a bump are not one series.
+  - Every report records the rclone's store path, version, binary sha256
+    and the flake's nixpkgs revision, and says whether they match the pin.
+    A rep whose bench header names another version aborts the sample.
+  - This is the build the 06:52Z sample already used; no number changes.
+- **`of_record` now also needs the pinned rclone.** `of_record=true` needs
+  gated mode, a `record` rig, the A control, a completed sample and no
+  rclone override. On a rig of record the A control must be the pinned
+  commit, or the gated sample is refused.
+- Runbook: [plans/2026-10-07-s1-hermetic-rig.md](plans/2026-10-07-s1-hermetic-rig.md),
+  sections 3 and 5.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
