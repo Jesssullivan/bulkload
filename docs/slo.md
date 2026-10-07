@@ -179,6 +179,12 @@ as properties.
   counted and recorded in S2 evidence. The main database and its `-wal` must
   stay byte-identical, and a property test asserts that no other source
   write occurs.
+- **2026-10-06, S2 wal-index counter (OI-1003-Q36, #157).** The counter is
+  `source_wal_index_touched`, on every counters line and in S2 evidence
+  (`s2_budget.py`). It adds 1 for each WAL-aware snapshot that leaves a
+  `-shm` beside its source, whether or not the file's bytes changed: such a
+  read always opens the wal-index read-write, maps it and locks it. P75
+  SQLITE-SHM-EXCEPTION is the property.
 
 ## Amendments 2026-10-04: WP0(g) adopted, and the R25 reading (OI-1003-Q37, Q40)
 
@@ -206,6 +212,144 @@ as properties.
     improvement in #169 and is not part of the SLO.
   - This narrows "the destination held durably" in OI-1002-Q33 to "a committed
     row proves it".
+  - Amendment 2026-10-06 (#169): the strict reading now holds in the model,
+    within stated limits. `R25_StrictNoDurableReread` passes in
+    `MC_r25_unrowed_bytes`, `MC_r25_strict_deep`, `MC_r25_strict_main` (two
+    seats) and, across a lost source authority, `MC_r25_strict_unsealed` and
+    `MC_r25_strict_authority` (`docs/formal/`), with the capture record's
+    adoption (`crates/bulkload-agent/src/transfer/unrowed.rs`). The limits:
+    - Only a non-racy capture gets a record. A racy capture's unrowed output
+      is read again, as before.
+    - The record is an extended attribute. A file system without them, or an
+      existing output adopted against a manifest whose mode gives its owner
+      no write permission, keeps no record, and its unrowed bytes are read
+      again. Both are counted (`transfer_capture_records_unset`,
+      `transfer_unrowed_unproven`).
+    - The model assumes the record can be written; it does not model its
+      loss.
+    - The Haskell explorer agrees with TLC on the model with the adoption
+      (`MC_nv_core_adopt`, `MC_nv_ledger_adopt`). `MC_nv_core`'s count of
+      record is still the transfer before #169; moving it needs a ruling.
+
+    On the code, the power-loss proof
+    `an_unrowed_output_is_adopted_without_source_reads`, P74 and
+    `an_output_adopted_against_a_manifest_carries_its_capture_record` check
+    it. `R25_NoDurableReread` stays the SLO's obligation (OI-1003-Q40).
+
+## Amendment 2026-10-05: carry_v2 deleted (OI-1003-Q44, Q54, Q56)
+
+- **WP0(a) closed: v1 is the Git carry engine.** OI-1003-Q15 and Q44 keep
+  v1. OI-1003-Q54 held the deletion of carry_v2 until v1 carried refs-heavy
+  repositories, and OI-1003-Q56 rules that precondition met by #182 and #184.
+  WP2 PR 3 deletes carry_v2, its ingest and journal, the `git_ingest` fault
+  points and the W6 M1 spike; tag `carry-v2-final` holds the last main with
+  them. `git-carry-estimate` stays as a read-only verb (P66), and wire v5's
+  reserved W6 frames stay until WP3's v6 cut. (a)'s "frozen behind a
+  feature" text above is superseded by this line, not edited.
+
+## Amendment 2026-10-06: the empty `-wal` (OI-1003-Q72)
+
+- **2026-10-06, SQLite empty `-wal` (OI-1003-Q72, #157).** This extends
+  OI-1003-Q36 to the empty `-wal`. A read-only, WAL-aware snapshot of a
+  WAL-mode source that has no `-wal` may create an empty `-wal` beside it.
+  It is a counted S2 exception like the `-shm`:
+  - it is allowed only where no `-wal` existed, and the file is zero bytes;
+  - the main database file stays byte-identical;
+  - a `-wal` that existed before the read stays byte-identical;
+  - the counter is `source_wal_created`, on every counters line and in S2
+    evidence (`s2_budget.py`), beside `source_wal_index_touched`.
+
+  Every source read is the locked, WAL-aware backup-API read (OI-1003-Q16).
+  An unlocked `immutable=1` read of the source is not ratified and is not
+  used. P75 SQLITE-SHM-EXCEPTION asserts both exceptions.
+
+## Amendment 2026-10-06: no SQLite source read as root (OI-1003-Q76)
+
+- **2026-10-06, SQLite provider refuses root (OI-1003-Q76, #157).** The
+  SQLite provider refuses to snapshot as root, with the typed refusal
+  `SQLITE_SOURCE_AS_ROOT`, before it opens the source.
+  - **What is refused.** Every provider verb that opens a database to read
+    it, when the effective uid is 0: `snapshot`, `compose`, `compose-state`,
+    `hydrate-state` and `apply-state-candidate`. The refusal is by uid,
+    whatever the source's journal mode.
+  - **Why.** Run as root, SQLite re-applies the database's owner to the
+    `-wal` and `-shm` it opens (`fchown`), and skips that call as any other
+    user. Measured on sting: the same read-only, WAL-aware open plus backup
+    leaves an existing source `-wal`'s ctime unchanged as uid 1000 and moves
+    it as uid 0, while the `-wal`'s size, mtime and bytes stay the same. PR
+    CI runs as root and P75 failed there on exactly that. It is a source
+    metadata write outside OI-1003-Q16, Q36 and Q72, and neither S2 counter
+    sees it.
+  - **What it does not change.** The two counted exceptions (Q36, Q72) and
+    the Q16 lock stand as they are for every other uid. No SLO number
+    changes.
+  - **Proof.** P75 SQLITE-SHM-EXCEPTION as root asserts the refusal and
+    that the refused snapshot left the source directory byte- and
+    metadata-identical (no `-shm`, no `-wal`, no ctime moved), then runs the
+    whole property again in a child process that has dropped to an
+    unprivileged uid. Where that drop cannot be made, the run says so on
+    stderr and proves the refusal only.
+
+## Amendment 2026-10-06: S1 gate (b) harness (OI-1003-Q66)
+
+- The gate (b) harness is built (`gate_b.py`, `just bench-gate-b`) and its
+  protocol is [plans/2026-10-06-s1-gate-b-protocol.md](plans/2026-10-06-s1-gate-b-protocol.md).
+  It changes no SLO and no number above. Its choices are drafts until the
+  operator ratifies them: SQLite seats are left out of the comparable set, the
+  delta is a 1 % XOR, the arms run N/R/N/R/N, and gate (a)'s 2 GiB RSS cap
+  applies. No neo run happens until gate (a) passes.
+- Gate (b)'s rep rule is gate (a)'s rule with two unratified deviations. It
+  gates the warm resume (0 bytes received, 0 content bytes read), but:
+  - it runs no interrupted-resume phase, so `r25_interrupted_zero` is not
+    part of a gate (b) verdict (the harness never signals a process);
+  - its warm-resume reads are net of the 16-byte SQLite magic probes.
+- R-N81's load bound (load1 < 2.5) holds on both hosts in gated mode.
+  `--dest-load-limit` can only tighten it.
+
+## Amendment 2026-10-06: S4 proof status (WP3 PR 3)
+
+- **S4 is provable on the estate ledger (OI-1003-Q1; a proof-status line, not a
+  new ruling).** Outcome records are a typed `Outcome` with
+  `Refusal{code, site, errno}`, persisted with postcard and decoded with no
+  bytes left over; legacy string records are mapped by a reader. Closure
+  matches the enum. The `gate` passes only when every planned item is
+  accounted and every typed refusal carries a disposition (accept, re-carry
+  or abandon, with reviewer and date) from the `closure-dispose` ledger. A
+  bare `IO` or `FRAME_CODEC` stays unaccounted: no disposition can name it
+  and no attestation can close it, whatever reason the item is unaccounted
+  for. Property P72 (codec round trip and legacy mapping) and P73 (green iff
+  every refusal is dispositioned and no untyped IO exists) carry the proof.
+  Transfer and SQLite provider outcomes join this ledger in WP3 PR 4; until
+  then S4 is proven for estate items only.
+- **What a disposition is bound to.** The ledger is bound to its plan (path
+  and a digest of the plan's bytes) and SOURCE label. An item disposition is
+  bound to the refusal instance it reviews (the item's current capture and
+  its outcome record) and is recorded only while the item holds that
+  refusal; a later refusal of the same code against another capture or with
+  another record is pending review again.
+- **Standing policies are open-ended (a design statement of WP3 PR 3, not
+  yet an operator ruling).** A standing-policy disposition covers every
+  refusal with its code under the bound plan and label, now or later. It is
+  bounded only by the plan digest and the label. Whether that is the
+  intended meaning of "operator-reviewed disposition" for S4 is an open
+  question for the operator.
+- **Codes that leave the taxonomy fail closed.** A recorded refusal whose
+  code has since been deleted is unaccounted (`refusal-code-retired`); no
+  disposition or attestation closes it, and a disposition row naming it
+  counts for nothing. Only a verb recording a current outcome closes the
+  item.
+
+## Amendment 2026-10-06 (later): S4 disposition rulings (OI-1003-Q74, Q75)
+
+- **Standing policies are open-ended in time (OI-1003-Q74, ruled as
+  built).** A standing-policy disposition stands until the plan's bytes
+  change: it covers every refusal with its code under the bound plan digest
+  and SOURCE label, now or later. This replaces the "design statement, not
+  yet an operator ruling" wording in the amendment above; the behaviour is
+  unchanged.
+- **A retired refusal code fails closed (OI-1003-Q75, ruled as built).** A
+  record naming a code that has left the taxonomy stays unaccounted
+  (`refusal-code-retired`); no disposition or attestation closes it.
 
 ## Priority (OI-1003-Q4)
 

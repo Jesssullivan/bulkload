@@ -319,6 +319,50 @@ pub fn fchmod(fd: impl AsFd, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// The largest capture record [`get_capture_record`] reads back.
+pub const CAPTURE_RECORD_MAX: usize = 512;
+
+/// Set an open file's capture record (#169): the extended attribute that
+/// says which capture its bytes are. Class meta for the crash checker: the
+/// file's own `fsync` (the group seal) makes it durable with the data.
+///
+/// # Errors
+/// Returns the `fsetxattr` failure (`ENOTSUP` where the file system has no
+/// extended attributes).
+pub fn set_capture_record(fd: impl AsFd, record: &[u8]) -> io::Result<()> {
+    trace_serial!();
+    let fd = fd.as_fd();
+    if record.len() > CAPTURE_RECORD_MAX {
+        return Err(invalid_input());
+    }
+    super::sys::set_xattr_raw(fd, super::sys::CAPTURE_RECORD, record)?;
+    trace_event!(
+        "fsetxattr",
+        Ok(super::trace::Event::SetCaptureRecord {
+            node: fstat(fd)?.node,
+            record: record.to_vec(),
+        })
+    );
+    Ok(())
+}
+
+/// An open file's capture record, or `None` when it has none.
+///
+/// # Errors
+/// Returns the `fgetxattr` failure; a record longer than
+/// [`CAPTURE_RECORD_MAX`] is `ERANGE`.
+pub fn get_capture_record(fd: impl AsFd) -> io::Result<Option<Vec<u8>>> {
+    let mut buffer = vec![0_u8; CAPTURE_RECORD_MAX];
+    match super::sys::get_xattr_raw(fd.as_fd(), super::sys::CAPTURE_RECORD, &mut buffer) {
+        Ok(length) => {
+            buffer.truncate(length);
+            Ok(Some(buffer))
+        }
+        Err(error) if error.raw_os_error() == Some(super::sys::NO_ATTRIBUTE) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 /// `unlinkat`; `remove_dir` selects `AT_REMOVEDIR`.
 ///
 /// # Errors

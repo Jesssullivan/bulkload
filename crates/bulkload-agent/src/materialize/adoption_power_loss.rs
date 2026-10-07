@@ -15,6 +15,12 @@
 //!   adopts it through the bound-record arm; an output committed inside it
 //!   must not outlive the rename.
 //!
+//! - #169 (R25's strict reading, OI-1003-Q40, R-N58): a crash between an
+//!   output's publish and its row commit leaves its bytes durable at the
+//!   final path with no row. In every power-loss state of that crashed run,
+//!   a resume must adopt a surviving output from its capture record without
+//!   reading a source byte, and must complete a lost one.
+//!
 //! Each crashed run is replayed with the real calls the engine makes before
 //! its fault point. The resume then runs through `Destination::directory`, a
 //! staged write, a `PublishSink` group commit, `finish_directories` and
@@ -29,7 +35,7 @@
 )]
 
 use super::*;
-use crate::io::crash_check::{check_view, Entry, Image, Options};
+use crate::io::crash_check::{check, check_view, Entry, Image, Options};
 use crate::io::durable::GroupSink as _;
 use crate::io::trace::recorder::Recorder;
 use crate::io::trace::{CommitRecord, Event};
@@ -220,4 +226,128 @@ fn a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit() {
             .unwrap();
         crate::io::rename_exclusive(&root, &temporary, c"d").unwrap();
     });
+}
+
+/// #169 (R25 strict, OI-1003-Q40, R-N58): the crashed run is a publish up to
+/// its row commit: a staged file written, its capture record and mode set,
+/// sealed, renamed into place and its directory sealed, and no commit. The
+/// checker builds every power-loss state of that run, and each one is
+/// resumed by a real `copy` into its own materialized destination, from a
+/// source store of its own (a new authority and no ledger row: the crashed
+/// run never got `Held`, and the record's key holds no authority). A state
+/// whose output survived at the final path with its bytes must be adopted
+/// from its record with 0 source bytes read; any other state is completed by
+/// reading the seat once. Both kinds must occur.
+#[test]
+fn an_unrowed_output_is_adopted_without_source_reads() {
+    const SIZE: usize = 150_000;
+    let base = scratch("unrowed");
+    let (source, destination) = (base.join("source"), base.join("destination"));
+    let destination_state = base.join("state");
+    let payload: Vec<u8> = (0..SIZE)
+        .map(|at| u8::try_from((at * 7 + at / 251) % 256).unwrap())
+        .collect();
+    std::fs::write(source.join("f"), &payload).unwrap();
+    let row = rows(&source)
+        .into_iter()
+        .find(|row| row.rel_path == b"f")
+        .unwrap();
+    let record = crate::transfer::unrowed::CaptureRecord {
+        key: crate::transfer::unrowed::record_key(&row).unwrap(),
+        root: bulkload_proto::frame::manifest_root(&chunk_specs(&payload)),
+        size: SIZE as u64,
+    };
+
+    let image = Image::scan(&destination).unwrap();
+    let recorder = Recorder::new();
+    let _alone = ALONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let _attached = recorder.attach_process();
+        let store = Store::open(&destination_state).unwrap();
+        let target = Destination::open(&destination, &store).unwrap();
+        let staged = target.stage(&row).unwrap();
+        crate::io::sys::pwrite_all(&**staged.file(), &payload, 0).unwrap();
+        crate::transfer::unrowed::write_record(staged.file(), &record);
+        crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777).unwrap();
+        let (_, parent) = staged.publish().unwrap();
+        crate::io::durable::seal_dir(&parent).unwrap();
+        // The crash: the group's row commit never runs.
+    }
+    let events = recorder.take();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::SetCaptureRecord { .. })),
+        "the crashed run wrote no capture record: {events:?}"
+    );
+    let (mut adopted, mut completed, mut serial) = (0_u32, 0_u32, 0_u32);
+    let options = Options {
+        ignore_foreign: true,
+        accept_bounded: true,
+        ..Options::default()
+    };
+    let report = check(&image, &events, &options, |state, _| {
+        serial += 1;
+        let survived = std::fs::read(state.join("f")).ok().as_deref() == Some(payload.as_slice());
+        let stats = crate::transfer::copy(
+            &source,
+            state,
+            &base.join(format!("resume-source-state-{serial}")),
+            &base.join(format!("resume-state-{serial}")),
+        )
+        .map_err(|refusal| format!("resume refused: {refusal:?}"))?;
+        if !stats.refusals.is_empty() {
+            return Err(format!("resume refused {:?}", stats.refusals));
+        }
+        if std::fs::read(state.join("f")).ok().as_deref() != Some(payload.as_slice()) {
+            return Err("the resume did not complete f".to_owned());
+        }
+        if survived {
+            if (stats.source_bytes_read, stats.unrowed_adopted) != (0, 1) {
+                return Err(format!(
+                    "a durable unrowed output was read again: {} source bytes, {} adopted",
+                    stats.source_bytes_read, stats.unrowed_adopted
+                ));
+            }
+            adopted += 1;
+        } else {
+            if stats.source_bytes_read != SIZE as u64 {
+                return Err(format!(
+                    "a lost output was read {} bytes, not once",
+                    stats.source_bytes_read
+                ));
+            }
+            completed += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        report.passed(),
+        "a resume re-read a durable unrowed output:\n{}",
+        report.summary(&events)
+    );
+    assert!(
+        adopted > 0 && completed > 0,
+        "states adopted {adopted}, completed {completed}"
+    );
+}
+
+/// The chunks a capture of `data` sends: `FastCDC` with the engine's bounds,
+/// BLAKE3 per chunk.
+fn chunk_specs(data: &[u8]) -> Vec<bulkload_proto::frame::ChunkSpec> {
+    fastcdc::v2020::FastCDC::new(
+        data,
+        crate::hash::CDC_MIN_BYTES,
+        crate::hash::CDC_AVG_BYTES,
+        crate::hash::CDC_MAX_BYTES,
+    )
+    .map(|chunk| bulkload_proto::frame::ChunkSpec {
+        digest: blake3::hash(&data[chunk.offset..chunk.offset + chunk.length]).into(),
+        size: chunk.length as u64,
+    })
+    .collect()
 }

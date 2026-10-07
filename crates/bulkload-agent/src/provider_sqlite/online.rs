@@ -32,7 +32,9 @@ pub struct Applied {
 /// intents before live commits. Never remove it to retry: an absent attempted ID
 /// is a conflict, including ambiguous crashes and later operator deletions.
 /// # Errors
-/// Refuses schema drift, unknown triggers, absent files, busy writers and budgets.
+/// Refuses an effective uid of 0 (`SQLITE_SOURCE_AS_ROOT`, OI-1003-Q76: the
+/// retained inputs are opened read-only and WAL-aware), schema drift, unknown
+/// triggers, absent files, busy writers and budgets.
 pub fn apply_state_candidate(
     live: &Path,
     base: &Path,
@@ -40,6 +42,7 @@ pub fn apply_state_candidate(
     max_rows: usize,
     receipt: &impl Fn(&Applied) -> Result<()>,
 ) -> Result<()> {
+    super::refuse_source_read_as_root()?;
     if max_rows == 0 || live == base || live == candidate {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
@@ -382,6 +385,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)] // One shared lifecycle proves lock, retry and deletion semantics.
     fn busy_writer_refuses_readers_continue_and_live_fields_win() {
+        super::super::assume_unprivileged();
         let dir = std::env::temp_dir().join(format!("tcfs-online-test-{}", std::process::id()));
         std::fs::create_dir(&dir).expect("owned directory");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).expect("private");

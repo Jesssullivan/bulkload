@@ -8,10 +8,10 @@
 //!   `symlinkat`/`readlinkat`, directory listing through `fdopendir` and
 //!   `readdir`, `geteuid`, `flock`, `setsockopt`, `setpriority`/`getpriority`);
 //! - `sys_darwin.rs`: `F_BARRIERFSYNC`, `F_FULLFSYNC`,
-//!   `renameatx_np(RENAME_EXCL)`, and the background `IOPOL_THROTTLE` policy
-//!   and `QoS` class;
-//! - `sys_linux.rs`: `fdatasync`, `fsync`, `renameat2(RENAME_NOREPLACE)` and
-//!   the idle `ioprio_set` class;
+//!   `renameatx_np(RENAME_EXCL)`, `fsetxattr`/`fgetxattr` (Darwin's
+//!   signature), and the background `IOPOL_THROTTLE` policy and `QoS` class;
+//! - `sys_linux.rs`: `fdatasync`, `fsync`, `renameat2(RENAME_NOREPLACE)`,
+//!   `fsetxattr`/`fgetxattr` and the idle `ioprio_set` class;
 //! - `buf.rs`: the aligned slab allocation.
 //!
 //! The platform file is mounted as [`sys`]; `sys_posix` is re-exported through
@@ -28,8 +28,7 @@
 //! Group commit (W3, `durable.rs`) is built on these calls. With the
 //! `io-trace` feature each mutating call records its trace events (see
 //! `trace`), with the sync kind the crash checker models. That is one event
-//! per call, except the Linux `rename_noreplace_at` fallback, which records its
-//! `linkat` and its `unlinkat`:
+//! per call:
 //!
 //! | call | Darwin | Linux | trace |
 //! |---|---|---|---|
@@ -37,9 +36,9 @@
 //! | `sys::barrier_dir` | `F_BARRIERFSYNC` (falls back to `F_FULLFSYNC`) | `fsync` | `Sync(Barrier)` / `Sync(Fsync)` |
 //! | `sys::full_flush` | `F_FULLFSYNC` | `fsync` | `Sync(FullFlush)` / `Sync(Fsync)` |
 //! | `sys::rename_exclusive` | `renameatx_np(RENAME_EXCL)` | `renameat2(RENAME_NOREPLACE)`, no fallback | `Rename` |
-//! | `sys::rename_noreplace_at` | as `rename_exclusive_at` | `rename_exclusive`, then `linkat` + `unlinkat` on `EINVAL`/`ENOSYS` (files only) | `Rename`, or `Link` + `Unlink` |
 //! | `sys::create_excl_at`, `sys::mkdirat`, `sys::symlinkat` | | | `Create`, `Mkdir`, `Symlink` |
 //! | `sys::pwrite_all`, `sys::fchmod`, `sys::unlinkat`, `sys::linkat` | | | `Write`, `SetMode`, `Unlink`, `Link` |
+//! | `sys::set_capture_record` | `fsetxattr` | `fsetxattr` | `SetCaptureRecord` |
 //!
 //! The stores add an `Event::Commit` when a `SQLite` commit returns, naming
 //! the records it made durable.
@@ -52,12 +51,11 @@
 //! never calls `sys::barrier`.
 //!
 //! Directory creation and file publication use `sys::rename_exclusive`
-//! (through [`rename_exclusive`] and [`publish_noreplace`]), never the
-//! sys-internal Linux `linkat` fallback of `sys::rename_noreplace_at`: `linkat`
-//! on a directory fails with `EPERM` and would hide the R-N119 path taken.
-//! [`publish_noreplace`] has its own io-level `linkat` + `unlinkat` fallback,
-//! for files only, and counts it; a directory takes the `mkdirat` fallback
-//! with an intent record first (R-N119).
+//! (through [`rename_exclusive`] and [`publish_noreplace`]), which has no
+//! fallback inside `sys`: `linkat` on a directory fails with `EPERM` and would
+//! hide the R-N119 path taken. [`publish_noreplace`] has its own io-level
+//! `linkat` + `unlinkat` fallback, for files only, and counts it; a directory
+//! takes the `mkdirat` fallback with an intent record first (R-N119).
 
 // R-N54: every unsafe block names its obligations, one unsafe operation per
 // block, so each SAFETY comment covers exactly one call.
@@ -306,8 +304,7 @@ pub use sys_posix::force_rename_unsupported;
 /// `renameatx_np(RENAME_EXCL)` / `renameat2(RENAME_NOREPLACE)`. A file system
 /// without it reports an error [`rename_unsupported`] recognizes, so a
 /// directory can take the `mkdirat` fallback and a file the link fallback
-/// (R-N119). `sys::rename_noreplace_at`, which falls back to `linkat` inside
-/// `sys` on Linux, is for files only: `linkat` on a directory is `EPERM`.
+/// (R-N119).
 ///
 /// # Errors
 /// Returns the rename failure; see [`rename_unsupported`].

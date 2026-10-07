@@ -100,11 +100,13 @@ fault-harness:
     cd {{ root }} && cargo test -p bulkload-agent --locked --features io-trace --target-dir target/fault --test power_loss
     cd {{ root }} && {{ just_executable() }} resume-power-loss
 
-# Directory resume power-loss proofs (#74 review B1 and round 2 N1), lib tests
-# that need `io-trace`. A name filter that matches nothing still reports `0
-# passed`, so this recipe fails unless both proofs ran: on a cargo failure, on
-# anything but one `2 passed; 0 failed` result, or when either proof is not
-# among the passing tests (#74 round 2 N2, R-N122).
+# Resume power-loss proofs, lib tests that need `io-trace`: the directory
+# resume paths (#74 review B1 and round 2 N1) and the adoption of a durable
+# unrowed output from its capture record with 0 source bytes read (#169,
+# R-N58). A name filter that matches nothing still reports `0 passed`, so this
+# recipe fails unless all three proofs ran: on a cargo failure, on anything
+# but one `3 passed; 0 failed` result, or when a proof is not among the
+# passing tests (#74 round 2 N2, R-N122).
 resume-power-loss:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -117,12 +119,12 @@ resume-power-loss:
         exit "$status"
     fi
     results=$(grep -c '^test result: ' <<<"$output" || true)
-    passed=$(grep -c '^test result: ok\. 2 passed; 0 failed;' <<<"$output" || true)
+    passed=$(grep -c '^test result: ok\. 3 passed; 0 failed;' <<<"$output" || true)
     if [[ $results -ne 1 || $passed -ne 1 ]]; then
-        echo "resume-power-loss: expected exactly one '2 passed; 0 failed' result" >&2
+        echo "resume-power-loss: expected exactly one '3 passed; 0 failed' result" >&2
         exit 1
     fi
-    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit; do
+    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads; do
         if [[ $(grep -c "^test materialize::adoption_power_loss::$proof \.\.\. ok$" <<<"$output" || true) -ne 1 ]]; then
             echo "resume-power-loss: $proof was not among the passing tests" >&2
             exit 1
@@ -195,9 +197,9 @@ check-source: repo-manifest-validate python-lint shell-lint workflow-lint secret
 #                   power-loss proofs, refusal taxonomy, R34 dependency wall,
 #                   R33 lint wall, CI contract). PR CI runs this tier through
 #                   its source and fault-harness gates (OI-1003-Q65).
-#   check-optional  optional tier: spike evidence, bench-script stubs, the
-#                   estate corpus self-test (OI-1003-Q19), the history secret
-#                   scan and the Nix/Bazel graph. On demand.
+#   check-optional  optional tier: bench-script stubs, the estate corpus
+#                   self-test (OI-1003-Q19), the history secret scan and the
+#                   Nix/Bazel graph. On demand.
 #   check-full      both tiers (the lab `test-presubmit` / xoxd.ai `ci` shape).
 
 # The repository and CI contract tests, run directly instead of through
@@ -212,8 +214,6 @@ check-fast: check-source fault-harness contract-test
 
 # Optional tier: on demand, never a PR gate (OI-1001-Q2).
 check-optional:
-    cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features m1-spike -- -D warnings
-    cd {{ root }} && cargo test -p bulkload-agent --locked --features m1-spike --test git_m1_spike
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m0_gate_a.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_corpus.py
@@ -645,15 +645,20 @@ tla-check *configs:
 # mktemp directory under TMPDIR. Its rows:
 # - BulkloadTransfer: the presets nv_core and nv_ledger must reach TLC's
 #   distinct-state counts of record, MC_nv_core's 15,834 and MC_nv_ledger's
-#   142,450, with no invariant violated and no deadlock;
+#   142,450 (the transfer before #169), and nv_core_adopt and
+#   nv_ledger_adopt must reach MC_nv_core_adopt's 17,027 and
+#   MC_nv_ledger_adopt's 185,852 (the code since #169: the capture record
+#   and its adoption), with no invariant violated and no deadlock;
 # - every MC_neg_ row of the catalogue inside the explorer's domain (the
 #   evaluated catalogue's nversion list) runs at its own bound, passed as
-#   the explorer's bound flags, checking TypeOK and the row's named
-#   property, as its TLC config does; it must violate exactly that property;
+#   the explorer's bound flags and switches (--adopt, --strict-held),
+#   checking TypeOK and the row's named property, as its TLC config does;
+#   it must violate exactly that property;
 # - each primary row among them runs again with every safety invariant
-#   checked, on the explorer and on TLC with one worker (the catalogue's
-#   scratch config for it): both must stop at the same first violated
-#   invariant after the same number of states;
+#   checked (and #169's, where the row's constants set them), on the
+#   explorer and on TLC with one worker (the catalogue's scratch config for
+#   it): both must stop at the same first violated invariant after the same
+#   number of states;
 # - GitCarry: crates/bulkload-agent/tests/data/decide_rows.tsv must be
 #   GitCarryCore's rendering byte for byte (`rows --check`), and its
 #   closed unions (`schema`) must equal the catalogue's Basis and Decision
@@ -747,7 +752,7 @@ formal-nv:
         for ((i = 0; i < rows; i++)); do
             if [[ $rows_key == nversion ]]; then
                 IFS=$'\t' read -r name mutation named primary flags < <(
-                    "$jq" -r ".nversion[$i] | [.name, .mutation, .property, .primary, \"--seats \" + .seats + \" --runs \" + (.runs | tostring) + \" --crashes \" + (.crashes | tostring) + \" --edits \" + (.edits | tostring) + \" --foreign \" + (.foreign | tostring)] | @tsv" "$scratch/catalogue.json")
+                    "$jq" -r ".nversion[$i] | [.name, .mutation, .property, .primary, \"--seats \" + .seats + \" --runs \" + (.runs | tostring) + \" --crashes \" + (.crashes | tostring) + \" --edits \" + (.edits | tostring) + \" --foreign \" + (.foreign | tostring) + .switches] | @tsv" "$scratch/catalogue.json")
             else
                 IFS=$'\t' read -r name mutation named primary flags < <(
                     "$jq" -r ".$rows_key[$i] | [.name, .mutation, .property, .primary, .flags] | @tsv" "$scratch/catalogue.json")
@@ -796,7 +801,7 @@ formal-nv:
     }
     # BulkloadTransfer.tla: TLC's distinct-state counts of record (README.md,
     # "N-version core").
-    cross_check "$scratch/explorer" BulkloadTransfer.tla nversion nv_core=15834 nv_ledger=142450
+    cross_check "$scratch/explorer" BulkloadTransfer.tla nversion nv_core=15834 nv_ledger=142450 nv_core_adopt=17027 nv_ledger_adopt=185852
     # GitCarry.tla (OI-1003-Q43): the pinned rows, the closed unions, then
     # the custody explorer at TLC's counts of record (README.md, "GitCarry").
     rows_file={{ root }}/crates/bulkload-agent/tests/data/decide_rows.tsv
@@ -843,3 +848,17 @@ formal-nv:
 # S2 measured budget instrument (OI-1003-Q34)
 bench-s2-budget *args:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/s2_budget.py {{ args }}
+
+# `--work-root NEW --agent BIN --source-corpus DEST --source-work NEW
+# --source-repo CHECKOUT --remote-agent BIN [--ssh-config ABS]` pulls the sealed
+# estate corpus (#159) from the source over ssh: 3 B reps of N/R/N/R/N for the
+# initial copy and a 1 % delta, native `bulkload-agent pull` against `rclone
+# copy` over sftp, R-N81 on both hosts, warm resume gated, RSS cap 2 GiB, JSON
+# verdict and evidence draft; no wall-clock SLA. Refuses DEST_SPACE unless the
+# work root keeps the agent's 25 % free floor after 5 destination copies. Refuses
+# NATIVE_REMOTE_ARM_MISSING (#47) when the agent has no pull/serve pair or W5
+# streams are asked for. `--dry-run` is a one-host loopback smoke (NOT a gate
+# sample); `--under-load` is informational. No neo run until gate (a) passes.
+# S1 gate (b) neo->sting pull harness (OI-1003-Q3, OI-1003-Q66)
+bench-gate-b *args:
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/gate_b.py {{ args }}
