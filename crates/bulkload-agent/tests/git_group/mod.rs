@@ -403,6 +403,18 @@ pub fn receipts(stdout: &str) -> Vec<Receipt> {
         .collect()
 }
 
+/// The verb's process-scope counters, from its stderr `counters` line.
+pub fn counters(stderr: &str) -> BTreeMap<String, u64> {
+    stderr
+        .lines()
+        .find(|line| line.starts_with("counters "))
+        .unwrap_or_else(|| panic!("no counters line in {stderr}"))
+        .split(' ')
+        .filter_map(|pair| pair.split_once('='))
+        .filter_map(|(key, value)| Some((key.to_owned(), value.parse().ok()?)))
+        .collect()
+}
+
 pub fn capture(fixture: &Fixture) -> Pass {
     let (stdout, stderr) = verb(&[
         "estate-capture".as_ref(),
@@ -411,14 +423,7 @@ pub fn capture(fixture: &Fixture) -> Pass {
         fixture.corpus.as_os_str(),
         "1".as_ref(),
     ]);
-    let counters = stderr
-        .lines()
-        .find(|line| line.starts_with("counters "))
-        .unwrap_or_else(|| panic!("no counters line in {stderr}"))
-        .split(' ')
-        .filter_map(|pair| pair.split_once('='))
-        .filter_map(|(key, value)| Some((key.to_owned(), value.parse().ok()?)))
-        .collect();
+    let counters = counters(&stderr);
     let bundles = std::fs::read_dir(&fixture.corpus)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -696,9 +701,9 @@ pub fn apply_and_compare(fixture: &Fixture) {
 }
 
 /// `estate-apply` of the fixture's plan and corpus under the apply state
-/// directory `applied`.
-pub fn apply_into(fixture: &Fixture, applied: &Path) {
-    verb(&[
+/// directory `applied`. Returns the verb's counters.
+pub fn apply_into(fixture: &Fixture, applied: &Path) -> BTreeMap<String, u64> {
+    let (_, stderr) = verb(&[
         "estate-apply".as_ref(),
         fixture.plan.as_os_str(),
         fixture.corpus.as_os_str(),
@@ -706,6 +711,7 @@ pub fn apply_into(fixture: &Fixture, applied: &Path) {
         "neo".as_ref(),
         "1".as_ref(),
     ]);
+    counters(&stderr)
 }
 
 /// Every restored item equals its source checkout: HEAD, status and bytes.

@@ -1111,10 +1111,14 @@ fn retained_capture(
 
 // The bases a retained bundle is bound to: none, all retained at their
 // recorded identities, or one lost. A bundle with no `.prior` is bound to
-// the base its own `{bundle}.base` names; a bundle with no such sidecar is
-// bound to none (a v1 chain link, or a self-contained capture). A chained
-// bundle is bound to its own base and to every link's (`chain_links`), and
-// one lost base loses it.
+// the base its own `{bundle}.base` names. With no such sidecar it is bound
+// to none only when its header declares no prerequisites (a self-contained
+// capture). A bundle that declares prerequisites and has neither sidecar is
+// a based capture whose custody record is gone: its base is lost, exactly
+// as apply reads it (`import_base` refuses `SEALED_OBJECT_MISSING`), so it
+// is never a reuse hit and never a chain link. A chained bundle is bound to
+// its own base and to every link's (`chain_links`), and one lost base loses
+// it.
 fn bound_base(corpus: &Path, bundle: &str) -> Result<decide::PrevBase> {
     if prior_sidecar(corpus, bundle)
         .try_exists()
@@ -1131,6 +1135,7 @@ fn bound_base(corpus: &Path, bundle: &str) -> Result<decide::PrevBase> {
         };
     }
     Ok(match bound(corpus, bundle)? {
+        None if git_carry::shared::requires_base(&corpus.join(bundle))? => decide::PrevBase::Lost,
         None => decide::PrevBase::None,
         Some(base) if retained_base(corpus, &base)? => decide::PrevBase::Retained,
         Some(_) => decide::PrevBase::Lost,
@@ -1555,31 +1560,60 @@ fn chain_offer(
 
 // The chain link of a capture's bundle, durable before its record names it
 // (WP2), as `.base` is for a shared plan base.
+//
+// An export can reproduce, byte for byte, a bundle the corpus already holds
+// under the same content name. Identical bytes declare identical
+// prerequisites, so that bundle's recorded custody answers for it whenever
+// that custody is intact, and three rules keep the record from ever naming
+// a chain nothing can restore:
+//
+// 1. **Never a cycle.** A name that is the link, or is already in the
+//    link's own chain, gets no `.prior`: the bundle is that earlier capture
+//    (nothing it carries moved since; under a plan base the tips between
+//    are the base's own commits, L6b's fix 2), and its custody as a root or
+//    a shallower link stands. Writing the link there would close
+//    root -> link -> root.
+// 2. **An intact chain stands.** A `.prior` already recorded for the name
+//    whose chain is intact under `Custody` is left as it is.
+// 3. **A stale link never outlives its chain.** When the export declared
+//    no link's tips (a base's delta, or self-contained) and the name still
+//    carries a `.prior` whose chain is broken, that sidecar is removed and
+//    the removal made durable: the bytes were just written without the
+//    link, so the bundle restores from its base alone.
 fn publish_prior(corpus: &Path, name: &str, link: Option<&Prior>, chained: bool) -> Result<()> {
+    const SITE: &str = "estate::publish_prior";
+    let sidecar = prior_sidecar(corpus, name);
+    let recorded = sidecar.try_exists().refuse_at(SITE)?;
+    let intact = recorded && chain_links(corpus, name, LinkBinding::Custody).is_ok();
     match (link, chained) {
         (Some(link), true) => {
-            // The export reproduced its link byte for byte, so it has the
-            // link's name: nothing the bundle carries moved since (another
-            // item's worktree changed the key), and the link's source-held
-            // tips add nothing to the prerequisites it already declares
-            // (under a plan base they are the base's own commits, L6b's fix
-            // 2). The bundle is the link, and the link's recorded custody
-            // stands: it is never made its own prior.
             if link.bundle == name {
                 return Ok(());
             }
-            // Identical bundle bytes declare identical prerequisites, so an
-            // intact chain already recorded for this name stands as it is.
-            let sidecar = prior_sidecar(corpus, name);
-            if !(sidecar.try_exists().refuse_at("estate::publish_prior")?
-                && chain_links(corpus, name, LinkBinding::Custody).is_ok())
+            let published = corpus.join(name);
+            if chain_links(corpus, &link.bundle, LinkBinding::Custody)?
+                .links
+                .iter()
+                .any(|(path, _)| *path == published)
             {
+                return Ok(());
+            }
+            if !intact {
                 write(&sidecar, link)?;
             }
             Ok(())
         }
         (None, true) => Err(BulkloadRefusal::ContractSelfInconsistent),
-        (_, false) => Ok(()),
+        (_, false) => {
+            if recorded && !intact {
+                fs::remove_file(&sidecar).refuse_at(SITE)?;
+                fs::File::open(corpus)
+                    .refuse_at(SITE)?
+                    .sync_dir_counted()
+                    .refuse_at(SITE)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -6076,6 +6110,26 @@ mod l6b_grouped_chain {
             }
         }
 
+        // An empty destination: no restore target, and a fresh repository
+        // for a group's items to restore into.
+        fn reset(&self) {
+            for (_, target) in &self.items {
+                let _ = fs::remove_dir_all(target);
+            }
+            let repository = self.root.join("repository");
+            if repository.exists() {
+                fs::remove_dir_all(&repository).unwrap();
+                fs::create_dir(&repository).unwrap();
+                git(&repository, &["init", "--template="]);
+            }
+        }
+
+        // Apply into an empty destination under the fresh state `state`.
+        fn restored_afresh(&self, state: &str) {
+            self.reset();
+            self.restored(state);
+        }
+
         // The group's one base record in the corpus.
         fn base_record(&self) -> PathBuf {
             let groups = capture_groups(&read::<Plan>(&self.plan).unwrap()).unwrap();
@@ -6417,6 +6471,255 @@ mod l6b_grouped_chain {
             assert_eq!(base.bundle, new.bundle);
         }
         fixture.restored("applied");
+    }
+
+    // A capture that reproduces its chain's ROOT byte for byte (A -> B -> A:
+    // an untracked file added, then removed) is that root. Under a plan base
+    // the chained export of pass 3 declares the base's commits and the
+    // link's held tips, which are the base's own commits, so its bytes are
+    // the first capture's. The root's custody stands: it gets no `.prior`
+    // (the link's chain already holds it, so one would close a cycle
+    // root -> link -> root that `chain_links` refuses), and every pass
+    // restores.
+    #[test]
+    fn a_capture_that_reproduces_its_chain_root_stands_as_the_root() {
+        let fixture = fixture("root-again", true);
+        let seat = fixture.source.join("new");
+        let restored = |state: &str| {
+            fixture.restored_afresh(state);
+            assert_eq!(fixture.items[0].1.join("new").exists(), seat.exists());
+        };
+        let moved = |outcome: &'static str| {
+            settle();
+            let (result, rows) = fixture.pass(decide::Policy::CODE);
+            result.unwrap();
+            // Only main's worktree moved; `wt` is a hit.
+            assert_eq!(
+                rows,
+                vec![(outcome, None), ("capture-reused-after-census", None)]
+            );
+        };
+        settle();
+        fixture.captured(decide::Policy::CODE);
+        let root = fixture.record(0);
+        assert!(fixture.prior(&root.bundle).is_none());
+        restored("applied-1");
+        // A -> B.
+        fs::write(&seat, b"new\n").unwrap();
+        moved("captured");
+        let link = fixture.record(0);
+        let prior = fixture.prior(&link.bundle).expect("chained on the root");
+        assert_eq!((&prior.bundle, prior.depth), (&root.bundle, 0));
+        restored("applied-2");
+        // B -> A: the root again, three passes over.
+        fs::remove_file(&seat).unwrap();
+        for pass in 3..6 {
+            moved(if pass == 3 {
+                "captured"
+            } else {
+                "capture-reused-after-census"
+            });
+            let record = fixture.record(0);
+            assert_eq!((&record.bundle, record.digest), (&root.bundle, root.digest));
+            assert!(
+                fixture.prior(&record.bundle).is_none(),
+                "pass {pass}: the root is never chained on its own link"
+            );
+            let chain = chain_links(&fixture.corpus, &record.bundle, LinkBinding::Custody).unwrap();
+            assert!(chain.links.is_empty() && chain.bases.is_empty());
+            assert_eq!(
+                bound_base(&fixture.corpus, &record.bundle).unwrap(),
+                decide::PrevBase::Retained
+            );
+            restored(&format!("applied-{pass}"));
+        }
+        // The root is a root still: the next changed capture chains on it
+        // at depth 0, and restores.
+        fs::write(&seat, b"new again\n").unwrap();
+        moved("captured");
+        let again = fixture.record(0);
+        let prior = fixture.prior(&again.bundle).unwrap();
+        assert_eq!((&prior.bundle, prior.depth), (&root.bundle, 0));
+        restored("applied-6");
+    }
+
+    // The same reproduction deeper in a chain (A -> B -> C -> B): the
+    // capture is a link already in its own link's chain, so it keeps the
+    // `.prior` and the depth it was recorded with.
+    #[test]
+    fn a_capture_that_reproduces_a_link_of_its_own_chain_keeps_that_links_custody() {
+        let fixture = fixture("link-again", true);
+        let (one, two) = (fixture.source.join("one"), fixture.source.join("two"));
+        let pass = || {
+            settle();
+            let (result, rows) = fixture.pass(decide::Policy::CODE);
+            result.unwrap();
+            assert_eq!(
+                rows,
+                vec![("captured", None), ("capture-reused-after-census", None)]
+            );
+            fixture.record(0)
+        };
+        settle();
+        fixture.captured(decide::Policy::CODE);
+        let root = fixture.record(0);
+        fs::write(&one, b"one\n").unwrap();
+        let first = pass();
+        fs::write(&two, b"two\n").unwrap();
+        let second = pass();
+        let prior = fixture.prior(&second.bundle).unwrap();
+        assert_eq!((&prior.bundle, prior.depth), (&first.bundle, 1));
+        fs::remove_file(&two).unwrap();
+        let again = pass();
+        assert_eq!(again.bundle, first.bundle);
+        let prior = fixture.prior(&again.bundle).unwrap();
+        assert_eq!((&prior.bundle, prior.depth), (&root.bundle, 0));
+        let chain = chain_links(&fixture.corpus, &again.bundle, LinkBinding::Custody).unwrap();
+        assert_eq!(chain.links.len(), 1);
+        fixture.restored_afresh("applied");
+        assert!(fixture.items[0].1.join("one").exists());
+        assert!(!fixture.items[0].1.join("two").exists());
+    }
+
+    // Cross-base custody when the recapture reproduces the broken head. The
+    // head's link tips are all commits of the new base (no branch is
+    // deleted here), so once the old base is lost the unchanged source's
+    // recapture, the new base's delta, has the head's bytes and so its
+    // name. The stale `.prior` is removed before the record names the
+    // bundle again: the record never names a chain nothing can restore, and
+    // the capture restores from the new base alone.
+    #[test]
+    fn a_recapture_that_reproduces_a_broken_chains_head_drops_its_stale_link() {
+        let fixture = fixture("two-bases-same-head", true);
+        settle();
+        fixture.captured(decide::Policy::CODE);
+        let old: Base = read(&fixture.base_record()).unwrap();
+        fixture.commit(1);
+        fs::remove_file(fixture.base_record()).unwrap();
+        settle();
+        fixture.captured(decide::Policy::CODE);
+        let new: Base = read(&fixture.base_record()).unwrap();
+        assert_ne!(new.bundle, old.bundle);
+        let heads: Vec<Capture> = (0..2).map(|index| fixture.record(index)).collect();
+        for head in &heads {
+            assert!(fixture.prior(&head.bundle).is_some());
+            let chain = chain_links(&fixture.corpus, &head.bundle, LinkBinding::Custody).unwrap();
+            assert_eq!(chain.bases.len(), 2, "the old base and the new");
+        }
+        fixture.restored_afresh("applied-both");
+        // The old base is lost: the chains are broken and apply refuses.
+        fs::rename(
+            fixture.corpus.join(&old.bundle),
+            fixture.root.join("held-old-base"),
+        )
+        .unwrap();
+        fixture.reset();
+        let (result, rows) = fixture.apply("applied-lost");
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![("refused", Some("SEALED_OBJECT_MISSING".to_owned())); 2]
+        );
+        // The recapture reproduces each head; none keeps its stale link.
+        for pass in 0..2 {
+            settle();
+            let (result, rows) = fixture.pass(decide::Policy::CODE);
+            result.unwrap();
+            let outcome = if pass == 0 {
+                "captured"
+            } else {
+                "capture-reused-after-census"
+            };
+            assert_eq!(rows, vec![(outcome, None); 2]);
+            for (index, head) in heads.iter().enumerate() {
+                let record = fixture.record(index);
+                assert_eq!(
+                    (&record.bundle, record.digest),
+                    (&head.bundle, head.digest),
+                    "the new base's delta is the head, byte for byte"
+                );
+                assert!(fixture.prior(&record.bundle).is_none(), "pass {pass}");
+                let base = bound(&fixture.corpus, &record.bundle).unwrap().unwrap();
+                assert_eq!(base.bundle, new.bundle);
+                assert_eq!(
+                    bound_base(&fixture.corpus, &record.bundle).unwrap(),
+                    decide::PrevBase::Retained
+                );
+            }
+            fixture.restored_afresh(&format!("applied-recaptured-{pass}"));
+        }
+    }
+
+    // A based bundle (its header declares the plan base's commits, and it
+    // has no `.prior`) whose own `.base` sidecar is gone has lost its base:
+    // apply refuses it SEALED_OBJECT_MISSING, so the capture side never
+    // hides it behind a reuse hit. While its key holds it refuses
+    // RECEIPT_BINDING_INVALID, the record stays, and it is never a chain
+    // link; once the source moves the next capture is the base's delta
+    // alone and restores.
+    #[test]
+    fn a_based_bundle_whose_base_sidecar_is_gone_is_never_a_hit_or_a_link() {
+        let fixture = fixture("sidecar-gone", true);
+        settle();
+        fixture.captured(decide::Policy::CODE);
+        let first: Vec<Capture> = (0..2).map(|index| fixture.record(index)).collect();
+        let bundle = fixture.corpus.join(&first[0].bundle);
+        assert!(git_carry::shared::requires_base(&bundle).unwrap());
+        fs::remove_file(fixture.corpus.join(format!("{}.base", first[0].bundle))).unwrap();
+        assert_eq!(
+            bound_base(&fixture.corpus, &first[0].bundle).unwrap(),
+            decide::PrevBase::Lost
+        );
+        assert_eq!(
+            bound_base(&fixture.corpus, &first[1].bundle).unwrap(),
+            decide::PrevBase::Retained
+        );
+        settle();
+        let (result, rows) = fixture.pass(decide::Policy::CODE);
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![
+                ("refused", Some("RECEIPT_BINDING_INVALID".to_owned())),
+                ("capture-reused-after-census", None)
+            ]
+        );
+        assert_eq!(fixture.record(0).bundle, first[0].bundle);
+        // What the refusal stands for: apply cannot restore that item.
+        let (result, rows) = fixture.apply("applied-lost");
+        assert!(result.is_err());
+        assert_eq!(
+            rows,
+            vec![
+                ("refused", Some("SEALED_OBJECT_MISSING".to_owned())),
+                ("workspace-restored", None)
+            ]
+        );
+        // The source moves: item 0 is the base's delta alone, never chained
+        // on the bundle nothing restores; item 1 chains as usual.
+        fixture.commit(1);
+        fixture.captured(decide::Policy::CODE);
+        let record = fixture.record(0);
+        assert!(
+            fixture.prior(&record.bundle).is_none(),
+            "never chained on it"
+        );
+        assert!(bound(&fixture.corpus, &record.bundle).unwrap().is_some());
+        let other = fixture.record(1);
+        assert_eq!(
+            fixture.prior(&other.bundle).map(|prior| prior.bundle),
+            Some(first[1].bundle.clone())
+        );
+        fixture.restored_afresh("applied");
+        // A self-contained bundle with no sidecar is bound to no base.
+        let alone = self::fixture("sidecar-none", false);
+        alone.captured(decide::Policy::CODE);
+        let record = alone.record(0);
+        assert!(!git_carry::shared::requires_base(&alone.corpus.join(&record.bundle)).unwrap());
+        assert_eq!(
+            bound_base(&alone.corpus, &record.bundle).unwrap(),
+            decide::PrevBase::None
+        );
     }
 
     // OI-1003-Q63 D1 (#149): a drift-marked bundle may be a chain link. The

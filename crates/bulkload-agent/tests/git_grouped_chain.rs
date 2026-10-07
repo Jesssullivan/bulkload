@@ -36,6 +36,19 @@
 //! **Restores** at `k ∈ {1, 2, 9, 10, 12}`: the destination is wiped,
 //! `estate-apply` runs with a fresh state directory, and every item is
 //! compared byte for byte.
+//!
+//! **The restore side is not flat, and is pinned (#148).** Clause 4 bounds
+//! what a capture writes. A restore of a chained item flattens its chain:
+//! it copies the head, every link and the plan base beside the corpus and
+//! writes one self-contained bundle that holds them all, so an apply stages
+//! the base twice per chained item (`write_bundle_stage_bytes`), where a
+//! delta on the base alone stages it once for the repository. Each restore
+//! asserts `copied + n × base ≤ staged ≤ 2 × copied` for `n` chained items,
+//! `copied` being the corpus bytes the apply reads.
+//!
+//! **The A → B → A row.** A capture that reproduces its chain's root byte
+//! for byte stays that root and restores on every pass
+//! (`p68_a_capture_that_returns_to_its_root_restores`).
 
 #![allow(
     clippy::unwrap_used,
@@ -47,8 +60,8 @@
 mod git_group;
 
 use git_group::{
-    apply_into, capture, compare, feed, fixture, git, law, noise, of_item, run, Fixture, Layout,
-    Mutation,
+    apply_into, capture, compare, feed, fixture, git, law, noise, of_item, run, settle, Fixture,
+    Layout, Mutation,
 };
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -190,15 +203,62 @@ fn commit_round(fixture: &Fixture, k: u32) {
 }
 
 // Wipe the destination, apply the corpus under a fresh state directory and
-// compare every item byte for byte.
-fn restore(fixture: &Fixture, k: u32) {
+// compare every item byte for byte. Returns the bytes the apply wrote into
+// its private stages beside the corpus (`write_bundle_stage_bytes`).
+fn restore(fixture: &Fixture, k: u32) -> u64 {
     for directory in [&fixture.dest, &fixture.restored] {
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::create_dir(directory).unwrap();
     }
     run(git(&fixture.dest).args(["init", "-q", "--template="]));
-    apply_into(fixture, &fixture.root.join(format!("applied-{k}")));
+    let counters = apply_into(fixture, &fixture.root.join(format!("applied-{k}")));
     compare(fixture);
+    counters["write_bundle_stage_bytes"]
+}
+
+fn size(path: &Path) -> u64 {
+    std::fs::metadata(path).unwrap().len()
+}
+
+/// What a restore of the items' latest captures reads from the corpus.
+#[derive(Default)]
+struct Staging {
+    /// Items whose capture is chained (it has a `.prior`).
+    chained: u64,
+    /// Every byte the apply copies out of the corpus: each item's head; for
+    /// a chained item its links and the plan base, once per item; for the
+    /// unchained items the plan base once, for the one repository.
+    copied: u64,
+    /// The largest chain an item restores from: its head, its links and
+    /// the plan base.
+    chain_max: u64,
+}
+
+fn staging(fixture: &Fixture, held: &[Held]) -> Staging {
+    let base = size(&plan_base(fixture));
+    let mut staging = Staging::default();
+    let mut based = false;
+    for item in held {
+        let mut chain = size(&item.bundle);
+        let mut current = item.bundle.clone();
+        let chained = sidecar(&current, "prior").exists();
+        while sidecar(&current, "prior").exists() {
+            current = fixture.corpus.join(named(&sidecar(&current, "prior")));
+            chain += size(&current);
+        }
+        if chained {
+            staging.chained += 1;
+            staging.copied += chain + base;
+            staging.chain_max = staging.chain_max.max(chain + base);
+        } else {
+            based = true;
+            staging.copied += chain;
+        }
+    }
+    if based {
+        staging.copied += base;
+    }
+    staging
 }
 
 /// What one table row measured.
@@ -212,6 +272,9 @@ struct Measured {
     rebases: Vec<u64>,
     /// Chained captures checked.
     chained: usize,
+    /// Per restore: the pass, the bytes the apply staged beside the corpus
+    /// and how many of the items restored from a chain.
+    staged: Vec<(u32, u64, u64)>,
 }
 
 // Clauses 1 to 4 over `bundle`, pass `k`'s capture of the item `held`.
@@ -353,15 +416,39 @@ fn table(name: &str, layout: Layout) {
         }
         before = pass;
         if RESTORES.contains(&k) {
-            restore(&fixture, k);
+            let staged = restore(&fixture, k);
+            let read = staging(&fixture, &held);
+            let base = size(&plan_base(&fixture));
+            eprintln!(
+                "P68 {name} k={k} restore staged={staged} copied={} chained={} chain_max={} \
+                 base={base}",
+                read.copied, read.chained, read.chain_max
+            );
+            // The restore side is NOT flat in the group (#148). Every
+            // chained item's flatten copies the plan base and writes it
+            // again inside that item's flat bundle, so an apply stages the
+            // base twice per chained item, where a delta on the base alone
+            // stages it once for the whole repository. Pinned so the cost
+            // is a number: with no chained item the stage is exactly the
+            // corpus bytes copied; with `n` it is those bytes plus `n` flat
+            // bundles, each at least the base and at most its chain.
+            let floor = read.copied + read.chained * base;
+            if !(floor..=2 * read.copied).contains(&staged) {
+                measured.violations.push(format!(
+                    "P68 {name} k={k}: the restore staged {staged} bytes, outside [{floor}, {}]",
+                    2 * read.copied
+                ));
+            }
+            measured.staged.push((k, staged, read.chained));
         }
     }
     eprintln!(
-        "P68 {name} chained={} flat_max={} bound={} rebases={:?}",
+        "P68 {name} chained={} flat_max={} bound={} rebases={:?} restores={:?}",
         measured.chained,
         measured.flat_max,
         ROUND + SLACK,
-        measured.rebases
+        measured.rebases,
+        measured.staged
     );
     assert!(
         measured.violations.is_empty(),
@@ -383,6 +470,67 @@ fn table(name: &str, layout: Layout) {
             (9 * ROUND..=9 * (ROUND + SLACK)).contains(bytes),
             "P68 {name}: the re-base cost moved: {bytes}"
         );
+    }
+}
+
+/// The A -> B -> A row: a capture that reproduces its chain's root byte for
+/// byte. An untracked file appears in main (pass 2 chains on the first
+/// capture) and is removed (pass 3). Under the plan base the chained export
+/// of pass 3 declares the base's commits and the link's held tips, which
+/// are the base's own commits, so its bytes are the first capture's and it
+/// publishes nothing new. The first capture stays a root: no `.prior` is
+/// written onto it (its link's chain already holds it, so one would make
+/// the cycle root -> link -> root, which no apply can walk). Every pass is
+/// restored and compared, the untracked file included.
+#[test]
+fn p68_a_capture_that_returns_to_its_root_restores() {
+    let fixture = fixture("root-again", Layout::Pair, Mutation::FirstPass);
+    settle();
+    let first = capture(&fixture);
+    let main = first.receipt(&fixture.source).item.clone();
+    let root = first
+        .bundles
+        .iter()
+        .find(|bundle| of_item(bundle, &main))
+        .unwrap()
+        .clone();
+    assert!(sidecar(&root, "base").exists());
+    assert!(!sidecar(&root, "prior").exists());
+    restore(&fixture, 1);
+    // A -> B: only main's capture moves, and it chains on the root.
+    let seat = fixture.source.join("returning.txt");
+    std::fs::write(&seat, b"untracked for one pass\n").unwrap();
+    settle();
+    let second = capture(&fixture);
+    let fresh = second.fresh(&first);
+    assert_eq!(fresh.len(), 1, "{fresh:?}");
+    let link = fresh.first().unwrap();
+    assert!(of_item(link, &main));
+    let prior = sidecar(link, "prior");
+    assert_eq!(
+        (named(&prior), link_depth(&prior)),
+        (file_name(&root), 0),
+        "pass 2 chains on the root"
+    );
+    restore(&fixture, 2);
+    // B -> A: the root again, on the changed pass and on every hit after.
+    std::fs::remove_file(&seat).unwrap();
+    let mut before = second;
+    for k in 3..=5 {
+        settle();
+        let pass = capture(&fixture);
+        let fresh = pass.fresh(&before);
+        assert!(
+            fresh.is_empty(),
+            "pass {k} publishes no new bundle: {fresh:?}"
+        );
+        assert!(
+            !sidecar(&root, "prior").exists(),
+            "pass {k}: the root is never chained on its own link"
+        );
+        assert!(sidecar(&root, "base").exists());
+        restore(&fixture, k);
+        before = pass;
     }
 }
 
