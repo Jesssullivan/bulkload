@@ -256,6 +256,18 @@ as properties.
   counts for nothing. Only a verb recording a current outcome closes the
   item.
 
+## Amendment 2026-10-06 (later): S4 disposition rulings (OI-1003-Q74, Q75)
+
+- **Standing policies are open-ended in time (OI-1003-Q74, ruled as
+  built).** A standing-policy disposition stands until the plan's bytes
+  change: it covers every refusal with its code under the bound plan digest
+  and SOURCE label, now or later. This replaces the "design statement, not
+  yet an operator ruling" wording in the amendment above; the behaviour is
+  unchanged.
+- **A retired refusal code fails closed (OI-1003-Q75, ruled as built).** A
+  record naming a code that has left the taxonomy stays unaccounted
+  (`refusal-code-retired`); no disposition or attestation closes it.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

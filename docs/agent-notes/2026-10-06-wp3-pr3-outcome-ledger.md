@@ -1,8 +1,11 @@
 # 2026-10-06 WP3 PR 3: typed outcome ledger and dispositions (S4 backbone)
 
 Lane `wp3-pr3-outcome-ledger`, branch `feat/wp3-pr3-outcome-ledger-20261006`,
-cut from `origin/main` at `b6ecd50`. No PR opened (the coordinator opens it).
-Rulings: OI-1003-Q1 (S4), OI-1003-Q14, R33 (refusals are values), R-N13.
+cut from `origin/main` at `b6ecd50`. PR
+[#195](https://github.com/Jesssullivan/bulkload/pull/195), not merged by this
+lane.
+Rulings: OI-1003-Q1 (S4), OI-1003-Q14, R33 (refusals are values), R-N13, and
+the operator rulings OI-1003-Q73, Q74 and Q75 (see "Operator rulings" below).
 
 ## What was done
 
@@ -141,11 +144,7 @@ Unmutated: 31 of 31 in `outcome:: disposition:: closure::`, 6 of 6 in
   `GIT_DESTINATION_FILESYSTEM_UNSUPPORTED` and `JOURNAL_OWNERSHIP_CONFLICT`)
   reads as `refusal-code-retired`: unaccounted, not reviewable, not
   attestable, closed only by a verb recording a current outcome. A review
-  already written for it stops counting. The alternative (a closed list of
-  retired codes that stay reviewable) needs L5 to maintain the list and is
-  an operator decision.
-- A standing policy is open-ended in time (bounded by plan digest and
-  label). `docs/slo.md` says so and marks it as not yet a ruling.
+  already written for it stops counting. Ruled as built (OI-1003-Q75).
 - A disposition ledger is bound to the plan's bytes, so `estate-add` on a
   plan that already has reviews starts a new ledger.
 - The refusal instance has no time in it: the same capture and a
@@ -190,3 +189,54 @@ Still open, beyond the list above (all low, none fixed here):
 - A legacy `refused` reason whose first word happens to be an upper-case
   token (not a taxonomy code) reads as `refusal-code-retired`, not
   `refusal-untyped`. Both are unaccounted and neither can be attested.
+
+## Operator rulings (recorded 2026-10-06)
+
+- **OI-1003-Q73:** PR #195 merges under Q29.
+- **OI-1003-Q74:** standing-policy rows are open-ended in time, as built: a
+  policy stands until the plan's bytes change. `docs/slo.md` now states it as
+  ruled, in a new dated amendment ("2026-10-06 (later)"); the earlier
+  amendment's "design statement" wording is left as written and superseded
+  there.
+- **OI-1003-Q75:** a retired refusal code fails closed, as built.
+
+Neither ruling changes code.
+
+## Merge of main after #193 (2026-10-06)
+
+PR #195 conflicted with `origin/main` and update-branch was refused. Rulings
+as above.
+
+- State found: the branch head `b9a762f` already held the merge of `48bd697`
+  (#191 lane L6a, #192), with `estate.rs`, `design.md` and the property plan
+  merged without conflict. Only #193 (`34e945e`, S1 gate (b) harness) was
+  missing.
+- Signed merge commit `f57d3ae` (parents `b9a762f`, `34e945e`; no rebase).
+- Conflict list: `docs/slo.md` only. Both sides added a 2026-10-06 amendment
+  at the same place; both are kept, main's gate (b) amendment first, then
+  this lane's S4 amendment. `justfile`, `gate_b.py`, `test_gate_b.py` and the
+  gate (b) plan and note came in from main untouched.
+- `estate.rs` on the merged tree: L6a's decide core is as on main, with this
+  lane's hunks on top (`Receipt.refusal`, `emit` with a site and the typed
+  record, `repair_missing_index`, `LedgerEntry.record`, `id` `pub(crate)`).
+  `git diff origin/main -- crates/bulkload-agent/src/estate.rs` shows only
+  those hunks.
+- Receipts on the merged tree plus the Q74/Q75 `slo.md` amendment, sting,
+  inside `nix develop`:
+  - `cargo fmt --check` and `cargo clippy --workspace --all-targets -- -D
+    warnings`: clean.
+  - `cargo test -p bulkload-agent --lib -- outcome:: disposition:: closure::
+    closure_lane git_carry:: estate::`: 327 passed, 0 failed, 4 ignored
+    (includes the five P67 `git_carry::decide_tests` and the six
+    `estate::wp2_chain` P-CHAIN tests).
+  - `tests/space_closure_cli.rs`: 6 of 6. `tests/git_group_minimality.rs`
+    (P64/P65): 18 of 18.
+  - `just check-fast`: exit 0. The merge commit was made only after that.
+- Seed guard (#194) was not on `origin/main` (`34e945e`) at push time, so
+  `tests/prop_seed_guard.rs` does not exist here. The lane's two proptest
+  blocks (`outcome.rs` P72, `closure.rs` P73) already route through
+  `test_support::prop_config(256)`.
+
+Still open after this round: the list under "Open" above, less the two items
+ruled by Q74 and Q75. If #194 or #198 lands before #195, main is merged
+again and the seed guard is run.
