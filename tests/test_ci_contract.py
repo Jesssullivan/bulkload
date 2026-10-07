@@ -312,7 +312,7 @@ PINNED_JUST_RECIPES = {
             "set -euo pipefail",
             "cd {{ root }}",
             "export BULKLOAD_PROPTEST_DEEP=1",
-            "cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained",
+            "cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained --skip an_old_format_capture_of_65536_refs_imports_like_the_new_format",
             'log=$(mktemp "${TMPDIR:-/tmp}/props-deep.XXXXXX")',
             "trap 'rm -f \"$log\"' EXIT",
             "row() {",
@@ -341,9 +341,10 @@ PINNED_JUST_RECIPES = {
             "    fi",
             "}",
             "row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib",
+            "row git_carry::refs_scale_tests::an_old_format_capture_of_65536_refs_imports_like_the_new_format 'REFS-SCALE row=old-65536 refs=' --lib",
             "row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct",
             "row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct",
-            'echo "props-deep: the workspace and all 3 deep rows ran"',
+            'echo "props-deep: the workspace and all 4 deep rows ran"',
         ),
     ),
     "crash-sweep": (
@@ -501,6 +502,7 @@ def validate_rust_test_groups(justfile: str) -> None:
 # really ran (R-N122).
 DEEP_ROWS = (
     "row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib",
+    "row git_carry::refs_scale_tests::an_old_format_capture_of_65536_refs_imports_like_the_new_format 'REFS-SCALE row=old-65536 refs=' --lib",
     "row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct",
     "row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct",
 )
@@ -509,7 +511,8 @@ PROPS_DEEP_REQUIRED = (
     "cargo test --workspace --locked -- "
     "--skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed "
     "--skip distinct_heavy_32768_refs_import_linearly_and_chain_thin "
-    "--skip distinct_heavy_110000_refs_chain_falls_back_self_contained",
+    "--skip distinct_heavy_110000_refs_chain_falls_back_self_contained "
+    "--skip an_old_format_capture_of_65536_refs_imports_like_the_new_format",
     '    cargo test -p bulkload-agent --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee "$log" || status=$?',
     "    if [[ $status -ne 0 ]]; then",
     "    if grep -q 'skipped: set ' \"$log\"; then",
