@@ -176,12 +176,12 @@ fn namespace_calls_create_link_rename_and_remove() {
 
     // No-clobber rename: an occupied target is EEXIST and keeps its bytes.
     fs::write(dir.path().join("d/taken"), b"keep").unwrap();
-    let clobber = sys::rename_noreplace_at(&d, &c("one"), &d, &c("taken"));
+    let clobber = sys::rename_exclusive_at(&d, &c("one"), &d, &c("taken"));
     assert_eq!(clobber.unwrap_err().kind(), ErrorKind::AlreadyExists);
     assert_eq!(fs::read(dir.path().join("d/taken")).unwrap(), b"keep");
-    sys::rename_noreplace_at(&d, &c("one"), &d, &c("three")).unwrap();
+    sys::rename_exclusive_at(&d, &c("one"), &d, &c("three")).unwrap();
     assert_eq!(fs::read(dir.path().join("d/three")).unwrap(), b"one");
-    sys::rename_noreplace_at(&d, &c("three"), &root, &c("four")).unwrap();
+    sys::rename_exclusive_at(&d, &c("three"), &root, &c("four")).unwrap();
     assert_eq!(fs::read(dir.path().join("four")).unwrap(), b"one");
 
     sys::unlinkat(&root, &c("four"), false).unwrap();
@@ -209,28 +209,6 @@ fn an_unsupported_exclusive_rename_reports_einval_and_links_nothing() {
     assert!(!dir.path().join("b").exists(), "no link was made");
     sys::rename_exclusive(&root, &c("a"), &c("b")).unwrap();
     assert!(dir.path().join("b").exists(), "without the hook it renames");
-}
-
-/// PR #59 round 5, D2: `sys::rename_noreplace_at` is for files only. Under the
-/// hook, on a directory, its Linux `linkat` fallback fails with `EPERM`
-/// (which is why directories never take it); on Darwin it is the bare
-/// exclusive rename and reports `EINVAL`. The directory stays in place.
-#[test]
-fn rename_noreplace_on_a_directory_never_moves_it() {
-    let dir = tempfile::TempDir::new().unwrap();
-    fs::create_dir(dir.path().join("d")).unwrap();
-    let root = sys::open_root(dir.path()).unwrap();
-    crate::io::force_rename_unsupported(true);
-    let result = sys::rename_noreplace_at(&root, &c("d"), &root, &c("e"));
-    crate::io::force_rename_unsupported(false);
-    let expected = if cfg!(target_os = "linux") {
-        libc::EPERM
-    } else {
-        libc::EINVAL
-    };
-    assert_eq!(result.unwrap_err().raw_os_error(), Some(expected));
-    assert!(dir.path().join("d").is_dir());
-    assert!(!dir.path().join("e").exists());
 }
 
 #[test]
@@ -316,7 +294,7 @@ mod traced {
         sys::fchmod(&fd, 0o640).unwrap();
         sys::full_flush(&fd).unwrap();
         sys::mkdirat(&root, &c("d"), 0o700).unwrap();
-        sys::rename_noreplace_at(&root, &c("f"), &root, &c("g")).unwrap();
+        sys::rename_exclusive_at(&root, &c("f"), &root, &c("g")).unwrap();
         sys::linkat(&root, &c("g"), &root, &c("h")).unwrap();
         sys::unlinkat(&root, &c("h"), false).unwrap();
         let mut read = [0_u8; 4];

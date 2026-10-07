@@ -165,6 +165,55 @@ Source safety (S2, WP1):
   counters line and the bench header record the class.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
+- SQLite provider snapshots are S2's stated exceptions: one lock and two
+  writes. Every source is read through the backup API from a read-only,
+  WAL-aware connection; none is read `immutable=1`. All three are bounded.
+  The two writes are counted; the lock is not yet:
+  - **Lock (OI-1003-Q16).** The backup API's shared read lock on the source
+    database, held only for the bounded read. Q16 calls it "counted", but no
+    counter for it exists yet (neither a lock count nor a lock time). That
+    is an open gap; neither write counter covers it.
+  - **Write: the wal-index (OI-1003-Q36).** The source's `<db>-shm`:
+    SQLite's own coordination file, which holds no user data. A WAL-aware
+    read opens it read-write, maps it and takes `fcntl` locks on it. It
+    creates or rebuilds the file when no live connection holds it, and
+    beside a live writer it often leaves every byte as it was.
+    - `source_wal_index_touched` counts all of these: 1 for each snapshot
+      that leaves a `-shm` beside its source, whether or not the file
+      changed. So 0 means that no snapshot opened a source wal-index.
+  - **Write: the empty `-wal` (OI-1003-Q72, which extends Q36).** A
+    WAL-mode database with no `-wal` is one that was checkpointed and
+    closed, or one a writer has opened but not yet read. A WAL-aware open
+    of it creates a `-wal` of zero bytes. The exception is that file only:
+    allowed where no `-wal` existed, and empty.
+    - `source_wal_created` counts it: 1 for each snapshot that leaves a
+      `-wal` beside a source that had none. The file stays, so a second
+      snapshot of the same source adds 0.
+    - The read-only connection cannot append a frame, so the file it
+      creates is empty. A writer that arrives during the read and creates
+      the `-wal` itself is counted too: the counter is an upper bound and
+      never an undercount.
+  - Every counters line reports both counters, and S2 evidence
+    (`s2_budget.py`) records both.
+  - The main database file stays byte-identical with its timestamps
+    unchanged. A `-wal` that existed before the read stays byte-identical.
+    Nothing else beside the source is written (P75).
+  - **Refused as root (OI-1003-Q76).** With an effective uid of 0, every
+    provider verb that opens a database to read it refuses
+    `SQLITE_SOURCE_AS_ROOT` before it opens anything: `snapshot`, `compose`,
+    `compose-state`, `hydrate-state` and `apply-state-candidate`.
+    - Why: run as root, SQLite re-applies the database's owner to the
+      `-wal` and the `-shm` it opens (`fchown`; as any other user it skips
+      the call). Measured on 2026-10-06: the same read-only, WAL-aware open
+      plus backup leaves an existing `-wal`'s ctime unchanged as uid 1000
+      and moves it as uid 0, with the `-wal`'s size, mtime and bytes
+      unchanged. That is a source metadata write that Q16, Q36 and Q72 do
+      not admit, and neither counter sees it.
+    - The refusal is by uid, not by journal mode: a rollback-journal source
+      is refused as well, and no extra read of the source is made.
+    - A refused verb leaves the source directory as it was: no `-shm`, no
+      `-wal`, no timestamp moved, both counters 0 (P75's root leg).
+    - Run the verb as the database's owner.
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
@@ -295,7 +344,8 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   records. The sidecar is the receipt's statement of what moved, not the
   guard. The next capture pass extends it (`capture-extended-from-drift`).
   R-N29 (apply proceeds on an occupied destination, recording uncaptured
-  seats) is deferred to W6 git carry v2 (bulkload#48).
+  seats) is deferred (bulkload#48); carry v2, the W6 engine it was deferred
+  to, is deleted (OI-1003-Q44, OI-1003-Q56).
 - Auto-prerequisite chains (WP2, OI-1003-Q15, 2026-10-03). Without a shared
   plan base, a capture that follows a retained capture of the same checkout
   declares that capture's tips as its bundle prerequisites, so it packs only
@@ -414,7 +464,7 @@ updated.
 | W3 v3 engine wins | Destination BLAKE3 ≤ 1× payload. Full flushes ≤ groups + 1. The bench median improves. The < 1.5 s target moved to W4. | R-N77, R-N95 |
 | W4 single pass (wire v5) | Gate (a): the loopback native engine beats rclone as shipped, 3-rep medians. Median < 1.5 s on the TinylandState corpus. File I/O ≤ 2.05× payload and hash ≤ 2× payload. Warm resume reads 0 bytes. A refused live-writer capture leaves no source ledger row. | R-N57, R-N58, R-N86, R-N95, R-N118 |
 | W5 parallel and wire | Gate (b): a neo→sting pull beats rclone over sftp, 3 reps. Each result reports its percentage of the calibrated link ceiling. | R-N57, R-N64 |
-| W6 M1 git carry | Sent bytes ≤ 1.1× `missing_thin_pack_bytes`, and sent objects ≤ the estimate's object count (the estimate is an upper bound). M1 sends every destination-held tip as a have in its first round, ordered ancestors first. On every fixture, the sent object set equals what `upload-pack` sends for exactly that have set. The estimate and the sender both pin `pack.useSparse=false` and `pack.useBitmaps=false`, and add `--shallow` with `--objects-edge-aggressive` when the destination is shallow. A shallow source with a full destination is refused (`GIT_HAVES_UNPROVABLE`, `source_shallow_destination_full`) by both, before anything is sent; a shallow file is never written into a full destination. Extra haves beyond the held tips can make a shallow pack larger, so M1 sends exactly the held tips. A crash in segment k re-sends only segments ≥ k. Ingest destinations must be local filesystems: a destination whose `objects/` or common dir is on NFS, SMB, WebDAV or another network filesystem is refused (`GIT_DESTINATION_FILESYSTEM_UNSUPPORTED`) before anything is written, since the ingest's `flock` locks cannot be trusted there (OI-1001-Q17). | R-N60, R-N74, R-N75, R-N97, R-N113, R-N116, R-N131 |
+| W6 M1 git carry | **Retired 2026-10-05 (OI-1003-Q44, OI-1003-Q56).** carry_v2's sender and ingest are deleted; v1 is the Git engine, and tag `carry-v2-final` holds the deleted code and this row's earlier text. The estimate half stands: `git-carry-estimate`'s thin pack equals what `upload-pack` sends for exactly the destination's held tips, offered ancestors first (P66). It pins `pack.useSparse=false` and `pack.useBitmaps=false`, adds `--shallow` with `--objects-edge-aggressive` when the destination is shallow, and refuses a shallow source with a full destination (`GIT_HAVES_UNPROVABLE`, `source_shallow_destination_full`). The segment-resume rule and the network-filesystem ingest refusal went with the ingest. | R-N60, R-N74, R-N75, R-N97, R-N113, R-N116, R-N131, OI-1003-Q44, OI-1003-Q56 |
 | W6 M2 git carry | `census_walks == 1`. `bytes_read` equals the total size of the changed seats. The live-writer test passes. | R-N58 |
 | W7 proofs | I1 (a record implies its bytes), I2 (no partial leaves) and I3 (a committed file means 0 source reads on resume) hold at every process-crash fault point. Power-loss ordering is proven by a syscall-trace crash-state checker. Darwin barriers are modelled device-wide, with the per-fd model available as a strict option. | R-N86, R-N88, R-N103 |
 
@@ -562,7 +612,10 @@ file. Deduplication applies when the destination asks for a manifest.
 
 Control variants 12 to 19 and tag 3 are reserved for W6 git carry over the
 same session and are refused today. A sub-stream carries negotiated thin
-packs for one repository (R-N60):
+packs for one repository (R-N60). Since carry_v2's deletion (2026-10-05,
+OI-1003-Q44, OI-1003-Q56) no code builds or consumes them. They stay in wire
+v5 unchanged (`WIRE_SCHEMA` and `wire_id` do not move) and go with WP3's v6
+cut.
 
 | Frame | Direction | Meaning |
 |---|---|---|
@@ -576,29 +629,13 @@ packs for one repository (R-N60):
 | `GitCommitted{sub, transaction_digest}` | destination → source | The ref transaction committed. |
 | `GitResume{sub, durable_segments}` | destination → source | On a resumed sub-stream, the segments already durable, so only the others are re-sent (W6 M1: a crash in segment k re-sends only segments ≥ k). |
 
-**Caller retry contract (#89, OI-1001-Q17).** Every lock an ingest takes
-(the per-repository fence `<common>/bulkload-ingest.lock`, the quarantine
-claim, the journal lock) waits about 2 s and then refuses as a value, so a
-hung git child never stalls the repository. A finish on a large repository
-routinely holds the fence far longer, so the caller retries:
-
-- Retryable: `JOURNAL_OWNERSHIP_CONFLICT` with reason `repository_fenced`,
-  `quarantine_held` or `journal_held` (another live session holds the lock).
-  Nothing else is retried; a bare `JOURNAL_OWNERSHIP_CONFLICT` (a journal
-  holding another plan) or `journal_replaced` goes to the operator at once.
-- Each retry resumes the session from its journal (`Ingest::resume`), since
-  `finish` consumes it; a resume refused by a held lock is one more attempt.
-- Backoff: before retry n, `base * 2^(n-1)` capped at `ceiling`, jittered
-  uniformly into its upper half. The default (`FenceRetry::DEFAULT`) is 12
-  attempts, 500 ms base, 30 s ceiling: about three minutes of waiting.
-- When the attempts run out the caller surfaces `JOURNAL_OWNERSHIP_CONFLICT`
-  with reason `repository_fenced_retries_exhausted`,
-  `quarantine_held_retries_exhausted` or `journal_held_retries_exhausted`;
-  the journal and quarantine stay, so a later resume carries on.
-
-`Ingest::finish_retrying` implements the contract (`FenceRetry`). The
-W4/W5 wire driver's Git sub-stream receiver, when it lands, finishes
-through it rather than through `finish`.
+**Caller retry contract (#89, OI-1001-Q17): retired 2026-10-05.** It
+specified how a caller retries carry_v2's ingest locks
+(`Ingest::finish_retrying`, `FenceRetry`). Those were deleted with carry_v2
+(OI-1003-Q44, OI-1003-Q56), along with the `JOURNAL_OWNERSHIP_CONFLICT` and
+`GIT_DESTINATION_FILESYSTEM_UNSUPPORTED` refusals that only they raised. Tag
+`carry-v2-final` holds the code and the contract's text. A future receiver
+for these frames needs a contract of its own.
 
 ## Durability
 

@@ -1079,7 +1079,7 @@ that test the same claim on the real code. SLOs are
 | `DoneAfterLedger` | `SourceDone` follows the ledger's last commit. | Durability | wire v5 (design.md) | P4, P23 |
 | `ReuseSound` | Held under the seat's current identity means held with its current bytes (the racy rule). | S3, S5 | #86, R-N76 | P19 |
 | `LedgerSound` | A ledger manifest under the current key is the seat's current content. | S3, S5 | #86, R-N58 | P17, P19 |
-| `NoClobber` | Bulkload replaces or removes a destination file only when its identity is one this store recorded. | S4 | OI-1003-Q18 (WP0(d)), R-N119 | P7, P8, P26, P75 |
+| `NoClobber` | Bulkload replaces or removes a destination file only when its identity is one this store recorded. | S4 | OI-1003-Q18 (WP0(d)), R-N119 | P7, P8, P26, P76 |
 | `S2_TypedSourceAccess` | Every source access is a stat, a content read, an allowlisted git read or the SQLite backup. No write, lock, lease or signal. | S2 | OI-1003-Q5, OI-1003-Q16 (WP0(b)) | P34 |
 | `S2_BackupLockBounded` | The backup's lock is only ever shared, held only inside one step of a counted backup, and taken at most `max_steps` times. | S2 (its stated exception) | OI-1003-Q16 | P34; no dedicated test yet |
 | `ClosureAccounted` | A finished session leaves every seat applied or with a typed refusal. A bare `IO` closes nothing. | S4 | OI-1003-Q1, #100 | P61 |
@@ -1192,9 +1192,10 @@ The model proves the protocol, within its bounds. It does not prove:
 - **Git carry, in BulkloadTransfer.tla.** Only estate capture's typed reads
   (one git read, the SQLite backup) are modelled there. v1's chain and base
   custody is GitCarry.tla's ([what it does not
-  prove](#what-gitcarry-does-not-prove)); carry_v2 (frozen by WP0(a), deleted
-  by Q44), the ingest journal, the git sub-stream and estate apply's `.done`
-  journals are modelled nowhere.
+  prove](#what-gitcarry-does-not-prove)). carry_v2 and its ingest journal
+  are deleted (OI-1003-Q44, OI-1003-Q56; tag `carry-v2-final`), so there is
+  nothing of them to model. The reserved git sub-stream frames and estate
+  apply's `.done` journals are modelled nowhere.
 - **The tree.** Directories and their records (R-N102), symlinks, `Skip`,
   engine temporaries, walk caps and devices other than the store's.
 - **Storage below the store.** The Darwin barrier model belongs to

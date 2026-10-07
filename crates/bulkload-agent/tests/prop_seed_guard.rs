@@ -76,28 +76,22 @@ const SELF: &str = "crates/bulkload-agent/tests/prop_seed_guard.rs";
 /// Files that still escape the helper: (workspace path, exact finding count,
 /// why). An entry whose file no longer exists is tolerated so the lane that
 /// deletes it does not have to touch this guard; remove the entry then.
-const EXEMPT: &[(&str, usize, &str)] = &[
-    (
-        "crates/bulkload-agent/tests/git_carry_v2.rs",
-        4,
-        "unseeded `random_dags_equal_upload_pack` (random seed); the file \
-         disappears when L5 deletes carry_v2 (WP2 PR 3)",
-    ),
-    (
-        "crates/bulkload-agent/tests/refusal_taxonomy.rs",
-        7,
-        "its own fixed-seed `prop_config` (seed 0x5733_7265_6675_7365); \
+const EXEMPT: &[(&str, usize, &str)] = &[(
+    "crates/bulkload-agent/tests/refusal_taxonomy.rs",
+    7,
+    "its own fixed-seed `prop_config` (seed 0x5733_7265_6675_7365); \
          migrates onto the helper after L5 lands",
-    ),
-];
+)];
 
-/// Never raised once on main: the number of exempt files when the guard
-/// landed.
-const EXEMPT_CEILING: usize = 2;
+/// Never raised once on main: the number of exempt files. It was 2 when the
+/// guard landed and fell to 1 when L5 deleted `tests/git_carry_v2.rs`
+/// (WP2 PR 3).
+const EXEMPT_CEILING: usize = 1;
 
-/// Never raised once on main: the total exempt findings when the guard
-/// landed (4 + 7 under the rules above).
-const FINDINGS_CEILING: usize = 11;
+/// Never raised once on main: the total exempt findings. It was 11 when the
+/// guard landed (4 + 7 under the rules above) and fell to 7 with
+/// `tests/git_carry_v2.rs`.
+const FINDINGS_CEILING: usize = 7;
 
 /// One escape: 1-based line and what it is.
 type Finding = (usize, &'static str);

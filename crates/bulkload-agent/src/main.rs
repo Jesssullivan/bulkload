@@ -33,11 +33,12 @@ SUBCOMMANDS:
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
-                Read-only: report what git carry v2 would move from SOURCE_REPO
-                to DEST (a local path or HOST:PATH over ssh -T -oBatchMode=yes);
-                missing_thin_pack_bytes is the gate metric (R-N74). Refuses a
-                partial or differently-shallow DEST (R-N75); a refused pair
-                prints refused=CODE and the verb exits nonzero. A child's
+                Read-only: report what a negotiated thin-pack carry would move
+                from SOURCE_REPO to DEST (a local path or HOST:PATH over
+                ssh -T -oBatchMode=yes); missing_thin_pack_bytes is the gate
+                metric (R-N74). Refuses a partial or differently-shallow DEST
+                (R-N75); a refused pair prints refused=CODE and the verb exits
+                nonzero. A child's
                 stderr is never printed (R-N121): only stderr_class=, plus
                 stderr_keyed_blake3= and stderr_file= when --state-dir keeps
                 the raw bytes in DIR/stderr/<digest>.log (mode 0600). DIR
@@ -163,6 +164,10 @@ BOUNDARIES:
     File manifests allow 131072 chunks and frames at most 8 MiB; oversized files refuse.
     Git-native divergent union is not supplied by copy/pull.
     compose commands write offline candidates, never install live databases.
+    snapshot, compose, compose-state, hydrate-state and apply-state-candidate
+    refuse SQLITE_SOURCE_AS_ROOT when run as root (OI-1003-Q76): opened by
+    root, SQLite re-applies ownership to a database's -wal and -shm, a source
+    metadata write. Run them as the database's owner.
     Capture omits a fixed rebuildable set (target, node_modules, .venv, ...) at
     any depth when Git tracks nothing beneath it, records each omitted root and
     its size as custody, and carries every other untracked and ignored file.

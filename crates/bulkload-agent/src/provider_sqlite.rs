@@ -3,11 +3,11 @@
 //! This module never installs a snapshot over a live database.
 //! All tables, including unknown tables and recovery orphans, are preserved.
 
-use crate::counters::CountedSync as _;
+use crate::counters::{self, CountedSync as _, Counter};
 use crate::refuse::RefuseAt as _;
 use std::fs::{self, OpenOptions};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::backup::{Backup, StepResult};
@@ -46,15 +46,34 @@ fn mapped_rollout_path(path: &Path, mapping: &PathMapping<'_>) -> std::path::Pat
 /// by concurrent writers. Each step copies at most 128 pages; lock contention
 /// returns immediately. The caller may retry with a *new* output path.
 ///
-/// The source is opened read-only using normal WAL-aware `SQLite` access, never
-/// immutable mode. The output must not exist. On failure an incomplete private
-/// output may remain; only a successful return authorizes its use as a snapshot.
+/// The source is opened read-only using normal WAL-aware `SQLite` access,
+/// never immutable mode, under the backup API's bounded shared read lock
+/// (OI-1003-Q16). That read has two stated source writes, both counted (S2):
+///
+/// - the wal-index (`<db>-shm`), which the connection opens read-write, maps
+///   and locks. Every read that leaves a `-shm` beside the source adds 1 to
+///   `source_wal_index_touched`, whether or not the file's bytes moved
+///   (OI-1003-Q36);
+/// - an empty `-wal`, which `SQLite` creates when a WAL-mode source has none.
+///   Every read that leaves a `-wal` where none was adds 1 to
+///   `source_wal_created` (OI-1003-Q72, which extends OI-1003-Q36).
+///
+/// The main database file, and a `-wal` that already existed, are only read
+/// and stay byte-identical (P75).
+///
+/// Run as root it refuses `SQLITE_SOURCE_AS_ROOT` before it opens anything
+/// ([`refuse_source_read_as_root`], OI-1003-Q76).
+///
+/// The output must not exist. On failure an incomplete private output may
+/// remain; only a successful return authorizes its use as a snapshot.
 /// Neither failure nor success removes source data.
 ///
 /// # Errors
-/// Refuses non-private output directories, existing outputs, exhausted step
-/// budgets, `SQLite` errors, and failed database or foreign-key integrity checks.
+/// Refuses an effective uid of 0, non-private output directories, existing
+/// outputs, exhausted step budgets, `SQLite` errors, and failed database or
+/// foreign-key integrity checks.
 pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
+    refuse_source_read_as_root()?;
     if max_steps == 0 {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
@@ -63,6 +82,108 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
     if !metadata.is_dir() || metadata.permissions().mode() & 0o077 != 0 {
         return Err(BulkloadRefusal::Io(None));
     }
+    let footprint = Footprint::observe(source);
+    let copied = copy_source(source, output, max_steps);
+    // The source connection is closed: count what the read left beside it,
+    // whether or not the copy succeeded.
+    footprint.settle();
+    let (file, destination) = copied?;
+    // A WAL source must produce one portable database, without relying on
+    // destination sidecars. Changing the mode affects only the new snapshot.
+    let mode: String = destination
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .map_err(backup_refusal)?;
+    if mode != "delete" {
+        return Err(BulkloadRefusal::SqliteStateChanged);
+    }
+    let check: String = destination
+        .query_row("PRAGMA quick_check", [], |row| row.get(0))
+        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
+    if check != "ok" {
+        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+    }
+    let mut statement = destination
+        .prepare("PRAGMA foreign_key_check")
+        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
+    if statement
+        .query([])
+        .and_then(|mut rows| rows.next().map(|row| row.is_some()))
+        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?
+    {
+        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+    }
+    file.sync_file_counted()
+        .map_err(|_| BulkloadRefusal::Io(None))?;
+    Ok(())
+}
+
+/// Refuse a provider verb that reads a source database when the effective
+/// uid is 0 (S2, OI-1003-Q76).
+///
+/// Measured on 2026-10-06 (sting; the bundled `SQLite` 3.46.0, and 3.51 in
+/// a Python probe): a read-only, WAL-aware open plus backup of a WAL-mode
+/// database leaves an existing `-wal`'s ctime alone as an ordinary user and
+/// moves it as euid 0, with the `-wal`'s size, mtime and bytes unchanged;
+/// the `-shm`'s ctime moves the same way. `SQLite`'s unix VFS re-applies
+/// the database's owner to the `-wal` and the `-shm` it opens (`fchown`,
+/// its `robustFchown`) only when it runs as root. That is a source metadata
+/// write which OI-1003-Q16, Q36 and Q72 do not admit, and neither counter
+/// sees it. Every source is refused, whatever its journal mode: the ruling
+/// is by uid, and no extra read of the source is made to tell the modes
+/// apart.
+///
+/// [`snapshot`], the compose verbs, [`online::apply_state_candidate`] and
+/// [`hydrate::hydrate_state`] each call this before they open any file, so
+/// no input database is opened WAL-aware by root. Run the verb as the
+/// database's owner.
+///
+/// # Errors
+/// Refuses `SQLITE_SOURCE_AS_ROOT` when the effective uid is 0.
+pub(crate) fn refuse_source_read_as_root() -> Result<()> {
+    if reader_uid() == 0 {
+        return Err(BulkloadRefusal::SqliteSourceAsRoot);
+    }
+    Ok(())
+}
+
+#[cfg(not(test))]
+fn reader_uid() -> u32 {
+    crate::io::sys::effective_uid()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The uid this thread's provider calls take as the effective uid, in
+    /// place of the real one. Unit tests only: the seam is not compiled into
+    /// the library the binary and the integration tests link.
+    static ASSUMED_UID: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn reader_uid() -> u32 {
+    ASSUMED_UID
+        .get()
+        .unwrap_or_else(crate::io::sys::effective_uid)
+}
+
+/// Unit tests: this thread's provider calls see `uid` as the effective uid.
+#[cfg(test)]
+pub(crate) fn assume_uid(uid: u32) {
+    ASSUMED_UID.set(Some(uid));
+}
+
+/// Unit tests of what the provider does once it may read: run as an
+/// ordinary user whoever runs the tests (CI runs them as root). The refusal
+/// itself is `a_source_read_as_root_is_refused_before_any_open` here and the
+/// root leg of P75 (`tests/sqlite_wal_index.rs`), which uses the real uid.
+#[cfg(test)]
+pub(crate) fn assume_unprivileged() {
+    assume_uid(1000);
+}
+
+/// Run the online backup of `source` into a new private `output`. The source
+/// connection is closed when this returns, on success and on refusal alike.
+fn copy_source(source: &Path, output: &Path, max_steps: u32) -> Result<(fs::File, Connection)> {
     let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .map_err(backup_refusal)?;
     source
@@ -98,33 +219,84 @@ pub fn snapshot(source: &Path, output: &Path, max_steps: u32) -> Result<()> {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
     }
-    // A WAL source must produce one portable database, without relying on
-    // destination sidecars. Changing the mode affects only the new snapshot.
-    let mode: String = destination
-        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
-        .map_err(backup_refusal)?;
-    if mode != "delete" {
-        return Err(BulkloadRefusal::SqliteStateChanged);
+    Ok((file, destination))
+}
+
+/// What a snapshot's read leaves beside its source database (S2; OI-1003-Q16,
+/// OI-1003-Q36, OI-1003-Q72, P75).
+///
+/// Every source is read WAL-aware under the backup API's shared read lock. A
+/// read-only connection to a WAL-mode database writes nothing to the main
+/// file or to an existing `-wal`, but it does two things beside them, and
+/// [`Footprint::settle`] counts each:
+///
+/// - **The wal-index (OI-1003-Q36).** The connection opens `<db>-shm`
+///   read-write, maps it shared and takes `fcntl` locks on it. It creates the
+///   file when no live connection has, and rebuilds it from the `-wal` when
+///   none holds it; beside a live writer it often leaves every byte as it
+///   was. Each read that leaves a `-shm` beside the source adds 1 to
+///   `source_wal_index_touched`, changed or not. Comparing the file before
+///   and after would report 0 for most reads beside a live writer, which
+///   reads as "not touched" when the file was opened, mapped and locked.
+/// - **An empty `-wal` (OI-1003-Q72).** A WAL-mode database with no `-wal`
+///   (checkpointed and closed, or opened by a writer that has not read it
+///   yet) gets a zero-byte `-wal` from the open. Each read that leaves a
+///   `-wal` where [`Footprint::observe`] saw none adds 1 to
+///   `source_wal_created`. The read-only connection cannot append a frame,
+///   so the file it creates is empty; a `-wal` with frames can only be a
+///   writer's that arrived during the read, and is counted all the same (an
+///   upper bound, never an undercount).
+///
+/// The sidecars are only `lstat`ed, never opened: closing any descriptor of a
+/// file drops every POSIX lock the process holds on it, `SQLite`'s included.
+/// They sit beside the resolved path, as `SQLite` resolves symbolic links.
+struct Footprint {
+    wal: PathBuf,
+    shm: PathBuf,
+    /// No `-wal` sat beside the source before the read.
+    wal_absent: bool,
+}
+
+impl Footprint {
+    fn observe(source: &Path) -> Self {
+        let database = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        let wal = sidecar(&database, "-wal");
+        let shm = sidecar(&database, "-shm");
+        let wal_absent = absent(&wal);
+        Self {
+            wal,
+            shm,
+            wal_absent,
+        }
     }
-    let check: String = destination
-        .query_row("PRAGMA quick_check", [], |row| row.get(0))
-        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
-    if check != "ok" {
-        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+
+    /// Count what the read left beside its source. Call it once the source
+    /// connection is closed.
+    fn settle(self) {
+        // With a `-shm` beside the source, `SQLite` opened it read-write,
+        // mapped it and locked it, whatever its bytes are now. Without one
+        // there was no wal-index to touch (a rollback-journal database).
+        if !absent(&self.shm) {
+            counters::bump(Counter::SourceWalIndexTouched);
+        }
+        if self.wal_absent && !absent(&self.wal) {
+            counters::bump(Counter::SourceWalCreated);
+        }
     }
-    let mut statement = destination
-        .prepare("PRAGMA foreign_key_check")
-        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
-    if statement
-        .query([])
-        .and_then(|mut rows| rows.next().map(|row| row.is_some()))
-        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?
-    {
-        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
-    }
-    file.sync_file_counted()
-        .map_err(|_| BulkloadRefusal::Io(None))?;
-    Ok(())
+}
+
+/// `path` with `suffix` appended to its last component, as `SQLite` names
+/// its `-wal` and `-shm`.
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Nothing is at `path`, not even a dangling link. An `lstat` that fails for
+/// another reason is not proof of absence.
+fn absent(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Accounting for an offline candidate. Preserved rows require explicit
@@ -160,7 +332,8 @@ pub struct Composition {
 /// A returned candidate is never permission to replace a live database.
 ///
 /// # Errors
-/// Refuses invalid source IDs, `SQLite` errors, and invalid candidate integrity.
+/// Refuses an effective uid of 0 (`SQLITE_SOURCE_AS_ROOT`, OI-1003-Q76),
+/// invalid source IDs, `SQLite` errors, and invalid candidate integrity.
 /// Failure leaves an incomplete private candidate, with both inputs untouched.
 pub fn compose_snapshots(
     base: &Path,
@@ -211,6 +384,8 @@ fn compose(
     max_steps: u32,
     mapping: Option<&PathMapping<'_>>,
 ) -> Result<Composition> {
+    // Both inputs are opened WAL-aware: `base` by `snapshot`, `incoming` here.
+    refuse_source_read_as_root()?;
     if source_id.is_empty() {
         return Err(BulkloadRefusal::SqliteUnsupportedValue);
     }
@@ -698,6 +873,7 @@ mod tests {
     #[test]
     fn state_import_maps_existing_rollouts_and_keeps_missing_rows_private(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        assume_unprivileged();
         let dir = std::env::temp_dir().join(format!("tcfs-provider-state-{}", std::process::id()));
         fs::create_dir(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -828,6 +1004,7 @@ mod tests {
     #[test]
     fn offline_union_preserves_collisions_and_remaps_log_ids(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        assume_unprivileged();
         let dir = std::env::temp_dir().join(format!("tcfs-provider-union-{}", std::process::id()));
         fs::create_dir(&dir)?;
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
@@ -889,10 +1066,183 @@ mod tests {
         Ok(())
     }
 
+    /// A private directory holding `state.sqlite`, created by `setup` and
+    /// closed.
+    fn footprint_fixture(
+        setup: &str,
+    ) -> std::result::Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "bulkload-footprint-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+        let database = dir.join("state.sqlite");
+        let connection = Connection::open(&database)?;
+        connection.execute_batch(setup)?;
+        connection.close().map_err(|(_, error)| error)?;
+        Ok((dir, database))
+    }
+
+    #[test]
+    fn the_footprint_sees_a_wal_only_where_one_is(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        // Checkpointed and closed: no sidecar.
+        let (dir, database) =
+            footprint_fixture("PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY);")?;
+        assert!(Footprint::observe(&database).wal_absent);
+        // Through a symbolic link, the sidecars are the target's.
+        let link = dir.join("link.sqlite");
+        std::os::unix::fs::symlink(&database, &link)?;
+        let footprint = Footprint::observe(&link);
+        assert_eq!(
+            footprint.wal,
+            sidecar(&fs::canonicalize(&database)?, "-wal")
+        );
+        assert!(footprint.wal_absent);
+        // A `-wal` beside it, even an empty one or a dangling link.
+        fs::write(sidecar(&database, "-wal"), b"")?;
+        assert!(!Footprint::observe(&database).wal_absent);
+        fs::remove_file(sidecar(&database, "-wal"))?;
+        std::os::unix::fs::symlink(dir.join("nowhere"), sidecar(&database, "-wal"))?;
+        assert!(!Footprint::observe(&database).wal_absent);
+        fs::remove_dir_all(dir)?;
+        Ok(())
+    }
+
+    /// Every entry of `dir`: name, identity, mode, size, mtime, ctime, bytes.
+    type Listing = Vec<(std::ffi::OsString, [u64; 4], [i64; 4], Vec<u8>)>;
+
+    fn listing(dir: &Path) -> std::result::Result<Listing, Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            entries.push((
+                entry.file_name(),
+                [
+                    metadata.dev(),
+                    metadata.ino(),
+                    u64::from(metadata.mode()),
+                    metadata.size(),
+                ],
+                [
+                    metadata.mtime(),
+                    metadata.mtime_nsec(),
+                    metadata.ctime(),
+                    metadata.ctime_nsec(),
+                ],
+                if metadata.is_file() {
+                    fs::read(entry.path())?
+                } else {
+                    Vec::new()
+                },
+            ));
+        }
+        entries.sort();
+        Ok(entries)
+    }
+
+    /// OI-1003-Q76: with an effective uid of 0 every provider verb that reads
+    /// a database refuses `SQLITE_SOURCE_AS_ROOT` before it opens anything,
+    /// so the source directory keeps every entry, byte and timestamp, and
+    /// gets no `-shm` and no `-wal`. The uid is this thread's assumed one;
+    /// P75's root leg proves the same with the real uid.
+    #[test]
+    fn a_source_read_as_root_is_refused_before_any_open(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(
+            BulkloadRefusal::SqliteSourceAsRoot.code(),
+            "SQLITE_SOURCE_AS_ROOT"
+        );
+        // Two sources: checkpointed and closed (no sidecar), and one whose
+        // writer left frames in a `-wal`.
+        let (closed_dir, closed) =
+            footprint_fixture("PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY);")?;
+        let (wal_dir, with_wal) = footprint_fixture(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1);",
+        )?;
+        // A `-wal` as a crashed writer leaves it: copied while a writer holds it.
+        {
+            let writer = Connection::open(&with_wal)?;
+            writer.execute_batch("PRAGMA wal_autocheckpoint=0; INSERT INTO t VALUES (2);")?;
+            let kept = wal_dir.join("kept-wal");
+            fs::copy(sidecar(&with_wal, "-wal"), &kept)?;
+            writer.close().map_err(|(_, error)| error)?;
+            let _ = fs::remove_file(sidecar(&with_wal, "-shm"));
+            fs::rename(&kept, sidecar(&with_wal, "-wal"))?;
+        }
+        assert!(absent(&sidecar(&closed, "-wal")) && !absent(&sidecar(&with_wal, "-wal")));
+        let out = closed_dir.join("out");
+        fs::create_dir(&out)?;
+        fs::set_permissions(&out, fs::Permissions::from_mode(0o700))?;
+        let mapping = PathMapping {
+            source_home: Path::new("/Users/jess"),
+            destination_home: Path::new("/home/jess"),
+        };
+
+        assume_uid(0);
+        for (dir, source) in [(&closed_dir, &closed), (&wal_dir, &with_wal)] {
+            let before = listing(dir)?;
+            let output = out.join("snapshot.sqlite");
+            let candidate = out.join("candidate.sqlite");
+            assert_eq!(
+                snapshot(source, &output, 100),
+                Err(BulkloadRefusal::SqliteSourceAsRoot)
+            );
+            // The uid is refused before the arguments are looked at.
+            assert_eq!(
+                snapshot(source, &output, 0),
+                Err(BulkloadRefusal::SqliteSourceAsRoot)
+            );
+            assert_eq!(
+                compose_snapshots(source, source, &candidate, "id", 100),
+                Err(BulkloadRefusal::SqliteSourceAsRoot)
+            );
+            assert_eq!(
+                compose_state_snapshots(source, source, &candidate, "id", 100, &mapping),
+                Err(BulkloadRefusal::SqliteSourceAsRoot)
+            );
+            assert!(matches!(
+                online::apply_state_candidate(&output, source, source, 1, &|_| Ok(())),
+                Err(BulkloadRefusal::SqliteSourceAsRoot)
+            ));
+            assert!(matches!(
+                hydrate::hydrate_state(
+                    source,
+                    &mapping,
+                    1,
+                    1,
+                    Path::new("gzip"),
+                    Path::new("zstd"),
+                    &|_| Ok(())
+                ),
+                Err(BulkloadRefusal::SqliteSourceAsRoot)
+            ));
+            assert!(!output.exists() && !candidate.exists());
+            assert_eq!(fs::read_dir(&out)?.count(), 0, "nothing was written");
+            assert!(listing(dir)? == before, "a refused read changed its source");
+        }
+
+        // The same sources as an ordinary user: the read happens.
+        assume_unprivileged();
+        assert_eq!(snapshot(&closed, &out.join("closed.sqlite"), 100), Ok(()));
+        assert_eq!(snapshot(&with_wal, &out.join("wal.sqlite"), 100), Ok(()));
+        assert!(!absent(&sidecar(&closed, "-shm")) && !absent(&sidecar(&closed, "-wal")));
+        fs::remove_dir_all(closed_dir)?;
+        fs::remove_dir_all(wal_dir)?;
+        Ok(())
+    }
+
     #[test]
     fn captures_live_wal_and_orphans_without_overwriting(
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        assume_unprivileged();
         let dir = std::env::temp_dir().join(format!(
             "tcfs-provider-snapshot-{}-{}",
             std::process::id(),
