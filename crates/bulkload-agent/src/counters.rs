@@ -22,6 +22,9 @@
 //!   `F_FULLFSYNC` on Darwin).
 //! - `flush_dir_barrier`: a group-commit directory seal (`F_BARRIERFSYNC` on
 //!   Darwin, `fsync` elsewhere).
+//! - `flush_fs`: a batched group's device seal, `syncfs` (Linux; S1,
+//!   OI-1003-Q107). It replaces a group's per-file and per-directory seals,
+//!   so, like them, it is not counted in `full_flushes_total`.
 //!
 //! Every file-backed bulkload `SQLite` store runs in WAL mode with
 //! `synchronous=FULL` and `fullfsync=ON` (`io::durable::configure_sqlite`

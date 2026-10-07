@@ -103,7 +103,13 @@ fn w3_engine_properties() {
     assert_eq!(counted.get(Counter::HashVerifyExisting), 0);
     assert_eq!(counted.get(Counter::SourcePackReadback), 0);
     assert_eq!(counted.get(Counter::FilesMaterialized), 4);
-    assert!(counted.get(Counter::FlushBarrier) >= 4);
+    // Each file sealed: a barrier each, or a batched Linux group's two
+    // device seals, one before its renames and one after (S1, Q107).
+    assert!(
+        counted.get(Counter::FlushBarrier) >= 4 || counted.get(Counter::FlushFs) >= 2,
+        "{}",
+        counted.render()
+    );
     assert_eq!(counted.get(Counter::FlushFull), 0);
     // One commit per group, plus, per freshly created store, its schema
     // commit and the full flush that seals its state root (#161).
@@ -136,14 +142,15 @@ fn w3_engine_properties() {
     assert_eq!((adopted.source_bytes_read, adopted.bytes_received), (0, 0));
     assert_eq!(counted.get(Counter::DestVerifyRead), payload);
     assert_eq!(counted.get(Counter::FilesMaterialized), 0);
-    // Adopted outputs are sealed, and their directory too, before the record.
+    // Adopted outputs are sealed, and their directory too, before the record:
+    // file by file, or by a batched group's two device seals.
     assert!(
-        counted.get(Counter::FlushBarrier) >= 4,
+        counted.get(Counter::FlushBarrier) >= 4 || counted.get(Counter::FlushFs) >= 2,
         "{}",
         counted.render()
     );
     assert!(
-        counted.get(Counter::FlushDirBarrier) >= 1,
+        counted.get(Counter::FlushDirBarrier) >= 1 || counted.get(Counter::FlushFs) >= 2,
         "{}",
         counted.render()
     );
@@ -156,6 +163,7 @@ fn w3_engine_properties() {
     assert_eq!(strict.completed, 4);
     assert!(counted.get(Counter::FlushFull) >= 4);
     assert_eq!(counted.get(Counter::FlushBarrier), 0);
+    assert_eq!(counted.get(Counter::FlushFs), 0, "strict never batches");
 
     // A new file sharing a prefix with published outputs is built from their
     // chunks, re-read and re-verified through committed hints; only its new
