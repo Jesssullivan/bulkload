@@ -302,6 +302,12 @@ struct Sample {
     counters: Option<Counters>,
     preflight: Preflight,
     gated: bool,
+    /// The rclone arm only: one `syncfs` of the destination after the copy,
+    /// outside its timed window (S1, OI-1003-Q107). It makes rclone's copy as
+    /// durable as the native arm's, for the informational `rclone_synced`
+    /// medians, and leaves the next arm no dirty pages of rclone's to flush.
+    /// `None` off Linux and on the native arm.
+    sync_after_ms: Option<f64>,
 }
 
 struct SampleRun<'a> {
@@ -673,11 +679,39 @@ fn regular_bytes(rows: &[RowSchema]) -> u64 {
 }
 
 fn median(samples: &[Sample], arm: Arm, phase: &str) -> io::Result<f64> {
-    let mut values = samples
+    median_of(
+        samples
+            .iter()
+            .filter(|sample| sample.arm == arm && sample.phase == phase)
+            .map(|sample| sample.elapsed_ms)
+            .collect(),
+    )
+}
+
+/// The median of the rclone arm's `phase` samples with their untimed
+/// `syncfs` added, if every such sample has one.
+fn synced_rclone_median(samples: &[Sample], phase: &str) -> io::Result<Option<f64>> {
+    let synced = samples
         .iter()
-        .filter(|sample| sample.arm == arm && sample.phase == phase)
-        .map(|sample| sample.elapsed_ms)
-        .collect::<Vec<_>>();
+        .filter(|sample| sample.arm == Arm::Rclone && sample.phase == phase)
+        .map(|sample| sample.sync_after_ms.map(|sync| sample.elapsed_ms + sync))
+        .collect::<Option<Vec<_>>>();
+    synced.map(median_of).transpose()
+}
+
+/// S1 at equal durability (OI-1003-Q107), informational only: the verdict
+/// of record stays against rclone as shipped, which syncs nothing.
+fn print_rclone_synced(samples: &[Sample], phase: &str, native_ms: f64) -> io::Result<()> {
+    if let Some(synced) = synced_rclone_median(samples, phase)? {
+        println!(
+            "rclone_synced phase={phase} native_ms={native_ms:.3} rclone_synced_ms={synced:.3} native_wins={} informational=true",
+            native_ms < synced
+        );
+    }
+    Ok(())
+}
+
+fn median_of(mut values: Vec<f64>) -> io::Result<f64> {
     if values.is_empty() {
         return Err(io::Error::other("median has no samples"));
     }
@@ -726,6 +760,12 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
         sample.preflight.render(),
         sample.gated,
     );
+    if let Some(sync_ms) = sample.sync_after_ms {
+        println!(
+            "rclone_sync sequence={} phase={} sync_ms={sync_ms:.3} timed=false",
+            sample.sequence, sample.phase
+        );
+    }
     if let (Some(chunk), Some(transfer)) = (sample.chunk_timing, sample.transfer_timing) {
         println!(
             "native_timing sequence={} phase={} scope=cumulative-process-worker-sums walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} {}",
@@ -815,6 +855,10 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
     let chunk_timing = ChunkTiming::snapshot().since(chunk_before);
     let transfer_timing = TransferTiming::snapshot().since(transfer_before);
     let counters = Counters::snapshot().since(counters_before);
+    let sync_after_ms = match run.arm {
+        Arm::Rclone => sync_destination(&destination)?,
+        Arm::Native => None,
+    };
     if rows(run.source)? != run.expected || !same_payload(run.expected, &rows(&destination)?) {
         return Err(io::Error::other(
             "source mutation or destination content/mode mismatch",
@@ -835,9 +879,33 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
         counters: (run.arm == Arm::Native).then_some(counters),
         preflight,
         gated: blocker.is_none(),
+        sync_after_ms,
     };
     print_sample(&sample, run.expected.len());
     Ok(sample)
+}
+
+/// `syncfs` the file system holding `destination`, timed, in milliseconds:
+/// every file of it durable, data, metadata and entries (Linux only).
+///
+/// # Errors
+/// Returns a failed open or `syncfs`.
+#[cfg(target_os = "linux")]
+fn sync_destination(destination: &Path) -> io::Result<Option<f64>> {
+    use std::os::fd::AsRawFd as _;
+    let directory = std::fs::File::open(destination)?;
+    let started = Instant::now();
+    // SAFETY: the descriptor is live for the call; `syncfs` takes no pointers.
+    if unsafe { libc::syncfs(directory.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(Some(started.elapsed().as_secs_f64() * 1000.0))
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::unnecessary_wraps, reason = "the signature matches Linux's")]
+fn sync_destination(_destination: &Path) -> io::Result<Option<f64>> {
+    Ok(None)
 }
 
 fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
@@ -1084,6 +1152,8 @@ fn enforce_verdict(cli: &Cli, samples: &[Sample]) -> io::Result<()> {
     let initial_win = initial_native < initial_rclone;
     let delta_win = delta_native < delta_rclone;
     let passed = initial_win && delta_win && warm_zero && interrupted_zero && rss_ok;
+    print_rclone_synced(samples, "initial", initial_native)?;
+    print_rclone_synced(samples, "delta", delta_native)?;
     if ungated > 0 {
         println!(
             "median phase=initial native_ms={initial_native:.3} rclone_ms={initial_rclone:.3} gated=false"
