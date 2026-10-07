@@ -30,6 +30,14 @@ if [ "$1" = micro ]; then
   echo "micro name=residency source=x files=1 source_resident_fraction=1.0000"
   exit 0
 fi
+# A build with the Linux preflight answers `preflight`; an older one refuses.
+if [ "$1" = preflight ]; then
+  [ -f "$0.native" ] || exit 2
+  echo "preflight power=ac load1=0.10 power_probe=sysfs os=linux arch=x86_64"
+  exit 0
+fi
+# Which pmset a rep would run (the shim directory, or nothing).
+command -v pmset >> "$0.pmset" || echo none >> "$0.pmset"
 # Like the real bench: with --informational (dry run, under load) and the host
 # outside the R-N81 gate, rows say gated=false and the verdict is informational
 # with no wins; --only runs one arm and gives a diagnostic verdict.
@@ -97,6 +105,169 @@ class ParseTests(unittest.TestCase):
         self.assertAlmostEqual(summary["files_per_s_median"], 100.0)
         self.assertEqual(summary["bytes_received_median"], 900)
         self.assertTrue(summary["all_gated"])
+
+
+MAINS_ON = {"name": "ADP1", "type": "Mains", "online": "1"}
+MAINS_OFF = {"name": "ADP1", "type": "Mains", "online": "0"}
+FULL = {"name": "BAT0", "type": "Battery", "status": "Full"}
+DRAINING = {"name": "BAT0", "type": "Battery", "status": "Discharging"}
+MOUSE = {
+    "name": "hid-mouse",
+    "type": "Battery",
+    "status": "Discharging",
+    "scope": "Device",
+}
+USB_ON = {"name": "ucsi0", "type": "USB", "online": "1"}
+UPS = {"name": "ups0", "type": "UPS", "status": "Full"}
+NO_TYPE = {"name": "odd", "online": "1"}
+
+
+def fake_sysfs(root: Path, supplies: list[dict[str, str]]) -> Path:
+    root.mkdir()
+    for supply in supplies:
+        directory = root / supply["name"]
+        directory.mkdir()
+        for key, value in supply.items():
+            if key != "name":
+                (directory / key).write_text(value + "\n")
+    return root
+
+
+class LinuxPowerTests(unittest.TestCase):
+    """The R-N81 Linux power rule (OI-1003-Q96).
+
+    The same table as `linux_power_rule_over_fake_sysfs_trees` in the Rust bench.
+    """
+
+    CASES = (
+        ("laptop on its adapter", [MAINS_ON, FULL], "ac"),
+        ("laptop off its adapter", [MAINS_OFF, DRAINING], "battery"),
+        ("adapter online, battery draining", [MAINS_ON, DRAINING], "ac"),
+        ("battery only, not discharging", [FULL], "battery"),
+        ("usb supply never proves ac", [USB_ON, FULL], "battery"),
+        ("desktop: empty class", [], "ac"),
+        ("desktop: offline mains, no battery", [MAINS_OFF], "ac"),
+        ("desktop with a peripheral battery", [MOUSE], "ac"),
+        ("peripheral battery beside a real one", [MOUSE, DRAINING], "battery"),
+        ("ups without mains", [UPS], "battery"),
+        ("unreadable type, nothing else", [NO_TYPE], "unknown"),
+        ("unreadable type beside online mains", [NO_TYPE, MAINS_ON], "ac"),
+        ("unreadable type beside a battery", [NO_TYPE, FULL], "battery"),
+    )
+
+    def setUp(self) -> None:
+        raw = tempfile.TemporaryDirectory()
+        self.addCleanup(raw.cleanup)
+        self.tmp = Path(raw.name)
+
+    def test_rule_over_fake_sysfs_trees(self) -> None:
+        for index, (name, supplies, expected) in enumerate(self.CASES):
+            root = fake_sysfs(self.tmp / f"case{index}", supplies)
+            state, read = ab.linux_power(root)
+            self.assertEqual(state, expected, name)
+            self.assertEqual(
+                sorted(s["name"] for s in read), sorted(s["name"] for s in supplies)
+            )
+
+    def test_missing_class_directory_and_silent_mains(self) -> None:
+        self.assertEqual(ab.linux_power(self.tmp / "absent"), ("unknown", []))
+        silent = {"name": "ADP1", "type": "Mains"}
+        root = fake_sysfs(self.tmp / "silent", [silent, FULL])
+        self.assertEqual(ab.linux_power(root)[0], "battery")
+
+    def test_power_source_by_platform(self) -> None:
+        root = fake_sysfs(self.tmp / "sys", [MAINS_OFF, DRAINING])
+        with (
+            mock.patch.object(ab, "POWER_SUPPLY_ROOT", root),
+            mock.patch.object(ab.platform, "system", return_value="Linux"),
+        ):
+            self.assertEqual(ab.power_source(), "battery")
+            self.assertFalse(ab.conditions()["ok"])
+        with mock.patch.object(ab.platform, "system", return_value="FreeBSD"):
+            self.assertEqual(ab.power_source(), "unknown")
+
+    def shim(self, supplies: list[dict[str, str]], name: str) -> tuple[int, str]:
+        root = fake_sysfs(self.tmp / name, supplies)
+        out = io.StringIO()
+        with (
+            mock.patch.object(ab, "POWER_SUPPLY_ROOT", root),
+            mock.patch.object(ab.platform, "system", return_value="Linux"),
+            contextlib.redirect_stdout(out),
+        ):
+            return ab.main(["--pmset-shim"]), out.getvalue()
+
+    def test_pmset_shim_speaks_pmset_and_never_invents_ac(self) -> None:
+        self.assertEqual(
+            self.shim([MAINS_ON, FULL], "a"), (0, "Now drawing from 'AC Power'\n")
+        )
+        self.assertEqual(
+            self.shim([MAINS_OFF, DRAINING], "b"),
+            (0, "Now drawing from 'Battery Power'\n"),
+        )
+        self.assertEqual(self.shim([NO_TYPE], "c"), (1, ""))
+        out = io.StringIO()
+        with (
+            mock.patch.object(ab.platform, "system", return_value="Darwin"),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertEqual(ab.main(["--pmset-shim"]), 1)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_pmset_shim_script_runs_this_harness(self) -> None:
+        directory = ab.write_pmset_shim(self.tmp)
+        script = directory / "pmset"
+        self.assertTrue(os.access(script, os.X_OK))
+        self.assertIn("--pmset-shim", script.read_text())
+        result = ab.subprocess.run(
+            [str(script), "-g", "batt"], capture_output=True, text=True, check=False
+        )
+        expected = {
+            "ac": (0, ab.PMSET_AC + "\n"),
+            "battery": (0, ab.PMSET_BATTERY + "\n"),
+        }.get(ab.power_source() if ab.platform.system() == "Linux" else "", (1, ""))
+        self.assertEqual((result.returncode, result.stdout), expected)
+
+
+class HostIdentityTests(unittest.TestCase):
+    MOUNTINFO = (
+        "22 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/rl-root rw\n"
+        "90 22 253:2 / /home rw,relatime shared:40 - ext4 /dev/mapper/rl-home rw\n"
+        "95 90 0:40 / /home/a\\040b rw - tmpfs tmpfs rw\n"
+        "malformed line\n"
+    )
+    MOUNT = (
+        "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
+        "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)\n"
+        "/dev/disk5s1 on /Volumes/TinylandState (hfs, local, journaled)\n"
+    )
+
+    def test_fs_type_takes_the_longest_containing_mount(self) -> None:
+        fs = ab.fs_type_from_mountinfo
+        self.assertEqual(fs(self.MOUNTINFO, "/home/jess/git-bulkload"), "ext4")
+        self.assertEqual(fs(self.MOUNTINFO, "/home"), "ext4")
+        self.assertEqual(fs(self.MOUNTINFO, "/homestead"), "xfs")
+        self.assertEqual(fs(self.MOUNTINFO, "/home/a b/x"), "tmpfs")
+        self.assertIsNone(fs("", "/home"))
+        darwin = ab.fs_type_from_mount
+        self.assertEqual(darwin(self.MOUNT, "/Volumes/TinylandState/x"), "hfs")
+        self.assertEqual(darwin(self.MOUNT, "/Users/jess"), "apfs")
+        self.assertIsNone(darwin("", "/"))
+
+    def test_cpu_model(self) -> None:
+        text = "processor\t: 0\nmodel name\t: Intel(R) Core(TM) i7\nflags\t: fpu\n"
+        self.assertEqual(ab.cpu_model_from_cpuinfo(text), "Intel(R) Core(TM) i7")
+        self.assertIsNone(ab.cpu_model_from_cpuinfo("processor: 0\n"))
+
+    def test_identity_names_the_rig(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = ab.host_identity(Path(tmp))
+        self.assertEqual(identity["system"], ab.platform.system())
+        self.assertEqual(identity["cpu_count"], os.cpu_count())
+        self.assertGreater(identity["ram_bytes"], 0)
+        if identity["system"] == "Linux":
+            self.assertEqual(identity["power_probe"], "sysfs")
+            self.assertTrue(identity["cpu_model"])
+            self.assertTrue(identity["work_root_fs_type"])
 
 
 def cond(
@@ -210,14 +381,114 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse((self.tmp / "work").exists())
 
     def test_gated_refusals(self) -> None:
+        other = mock.patch.object(ab.platform, "system", return_value="FreeBSD")
+        self.assertEqual(self.main(self.gated(), system=other), 2)
         linux = mock.patch.object(ab.platform, "system", return_value="Linux")
-        self.assertEqual(self.main(self.gated(), system=linux), 2)
+        no_corpus = [a for a in self.gated() if a not in ("--corpus", str(self.corpus))]
+        self.assertEqual(self.main(no_corpus, system=linux), 2)
         no_quiet = [a for a in self.gated() if a != "--coordinator-quiet"]
         self.assertEqual(self.main(no_quiet), 2)
         self.assertEqual(self.main([*self.gated(), "--expect-files", "1"]), 2)
         bad = mock.patch.object(ab, "corpus_verify", return_value=1)
         self.assertEqual(self.main(self.gated(), corpus_verify=bad), 2)
         self.assertFalse((self.tmp / "work").exists())
+
+    def linux_builds(self, b_native: bool) -> mock._patch:
+        """Distinct stub binaries per label; B has the sysfs preflight or not."""
+        infos = {}
+        for label in ("B", "A", "V4"):
+            binary = stub(self.tmp / f"bench-{label}")
+            if label == "B" and b_native:
+                Path(f"{binary}.native").write_text("")
+            infos[label] = {
+                "rev": label,
+                "sha": {"B": "b", "A": "a", "V4": "4"}[label] * 40,
+                "binary": str(binary),
+                "sha256": "0" * 64,
+            }
+        self.infos = infos
+        order = iter(("B", "A", "V4"))
+        return mock.patch.object(
+            ab, "build", side_effect=lambda *_a, **_k: infos[next(order)]
+        )
+
+    def test_gated_linux_refuses_a_b_without_its_own_preflight(self) -> None:
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        code = self.main(
+            self.gated(), system=linux, build=self.linux_builds(b_native=False)
+        )
+        self.assertEqual(code, 2)
+        self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+        self.assertFalse((self.tmp / "ev.md").exists())
+        self.assertFalse(Path(self.infos["B"]["binary"] + ".pmset").exists())
+
+    def test_gated_linux_runs_b_native_and_baselines_behind_the_shim(self) -> None:
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(
+                self.gated(), system=linux, build=self.linux_builds(b_native=True)
+            )
+        self.assertEqual(code, 0)
+        report = self.report()
+        self.assertEqual(
+            {k: v["preflight"] for k, v in report["builds"].items()},
+            {"B": "native", "A": "pmset-shim", "V4": "pmset-shim"},
+        )
+        self.assertEqual(
+            [(r["label"], r["preflight"]) for r in report["reps"]],
+            [
+                ("B", "native"),
+                ("A", "pmset-shim"),
+                ("B", "native"),
+                ("A", "pmset-shim"),
+                ("B", "native"),
+                ("V4", "pmset-shim"),
+            ],
+        )
+        # The verdict rule is unchanged: every B rep passes, A decides nothing.
+        self.assertEqual(report["gate"]["verdict"], "PASS")
+        self.assertEqual(report["gate"]["b_reps"], 3)
+        self.assertIn("OI-1002-Q30", report["gate"]["rule"])
+        shim = str(self.tmp / "work" / "pmset-shim" / "pmset")
+        seen = {
+            label: Path(info["binary"] + ".pmset").read_text().split()
+            for label, info in self.infos.items()
+        }
+        self.assertEqual(seen["A"], [shim, shim])
+        self.assertEqual(seen["V4"], [shim])
+        self.assertEqual(len(seen["B"]), 3)
+        self.assertNotIn(shim, seen["B"])
+        identity = report["host_identity"]
+        for key in (
+            "node",
+            "system",
+            "kernel",
+            "machine",
+            "cpu_model",
+            "cpu_count",
+            "ram_bytes",
+            "work_root_fs_type",
+            "power_probe",
+        ):
+            self.assertIn(key, identity)
+        self.assertEqual(identity["system"], "Linux")
+        self.assertEqual(identity["power_probe"], "sysfs")
+        md = (self.tmp / "ev.md").read_text()
+        self.assertIn(
+            "| A | `A` | `aaaaaaaaaaaa` | `0000000000000000` | pmset-shim |", md
+        )
+        self.assertIn("B never runs behind it", md)
+        self.assertIn("- Rig: `", md)
+        self.assertIn("OI-1003-Q96", md)
+
+    def test_darwin_builds_are_never_shimmed(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated()), 0)
+        report = self.report()
+        self.assertFalse((self.tmp / "work" / "pmset-shim").exists())
+        self.assertTrue(all("preflight" not in b for b in report["builds"].values()))
+        self.assertTrue(all(r["preflight"] == "native" for r in report["reps"]))
+        self.assertNotIn("pmset-shim", (self.tmp / "ev.md").read_text())
 
     def test_gated_refuses_any_pattern_but_babab(self) -> None:
         for pattern in ("B", "BA", "BBBBB", "ABABA", "BABABA"):

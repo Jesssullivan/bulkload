@@ -27,8 +27,15 @@ Every key=value the bench prints is kept in the JSON, so a counter added
 later is captured without changing this script.
 
 Preconditions (gated mode, the default):
-  - Darwin only. The bench's own R-N81 preflight reads `pmset`; on Linux it
-    reports power=unknown and refuses every gated sample.
+  - Darwin or Linux (OI-1003-Q96). Power is read from `pmset -g batt` on
+    Darwin and from /sys/class/power_supply on Linux, by the rule on
+    `linux_power` below; the Rust bench applies the same rule. Any other
+    platform is refused.
+  - On Linux, --corpus is required: only Darwin has a default corpus path.
+  - On Linux, B must read sysfs itself (`bulkload-bench preflight` answers
+    `power_probe=sysfs`); a B without it is refused. An informational
+    baseline (A, V4) that only knows `pmset` runs unmodified behind a
+    translator: see "Baselines on Linux".
   - --coordinator-quiet: the operator or coordinator holds other lanes quiet
     (R-N91). It is recorded, not checked. --under-load does not require it.
   - The corpus is R23 corpus v1 (r23_corpus.py, OI-1002-Q28): 23 regular
@@ -36,7 +43,26 @@ Preconditions (gated mode, the default):
     committed manifest (content identity f4a7619f...). Gated mode refuses
     non-default --expect-files/--expect-bytes.
   - The work root does not exist yet. Its parent should be on the volume
-    under test (TinylandState for gate a).
+    under test (TinylandState on neo; ~/git-bulkload/ on the hermetic rig).
+
+Rig identity: the report's `host_identity` records the platform, kernel,
+machine, CPU model, core count, RAM and the filesystem type of the work
+root, so a sample from one rig is never read as another's (OI-1003-Q96,
+OI-1003-Q97). docs/slo.md says which rig is the gate of record.
+
+Baselines on Linux (OI-1003-Q96): the pinned baselines A (7c3ecc7) and V4
+(41bf9a4) predate the sysfs preflight; their bench runs `pmset` from PATH
+and refuses when it is missing. The harness does not patch or rebuild them.
+It builds each at its exact sha as usual, and runs a baseline that lacks
+the sysfs probe with <work>/pmset-shim first on PATH. That directory holds
+one script named `pmset`, which calls this file with --pmset-shim: it
+applies the `linux_power` rule and prints pmset's first line for AC or for
+battery, or prints nothing and exits 1 when the state is unknown. The
+baseline's own R-N81 check (AC and load1 < 2.5 before every arm) then runs
+unchanged on a true reading. Each build's `preflight` field says `native`
+or `pmset-shim`, and the evidence table shows it. B never runs behind the
+shim, so the arm that decides the gate always uses its own preflight. The
+verdict rule is unchanged (OI-1002-Q30).
 
 Corpus integrity: the sealed corpus is read-only (0444/0555). The harness
 copies it once into <work>/corpus with 0644/0755 modes, because the bench
@@ -85,7 +111,7 @@ write under docs/evidence.
 
 --under-load (operator rulings OI-1003-Q39 and OI-1003-Q50) is an
 informational R23 sample under the host's real pressure; it is never an R23
-gate verdict. It keeps the gated mode's Darwin, corpus v1, verify and seal
+gate verdict. It keeps the gated mode's platform, corpus v1, verify and seal
 checks, and passes --informational to the bench. It lifts only the load gate:
 load1 is recorded before and right after every rep, but it is not required
 to be below 2.5, and the post-rep load wait is skipped. AC power is
@@ -117,6 +143,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -140,8 +167,12 @@ DEFAULT_A = "7c3ecc7"
 DEFAULT_B = "origin/main"
 DEFAULT_V4 = "41bf9a4"
 RULINGS = (
-    "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
+    "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, OI-1003-Q96, OI-1003-Q97, R23, R-N57,"
+    " R-N81, R-N91, R-N134, R-N13"
 )
+POWER_SUPPLY_ROOT = Path("/sys/class/power_supply")
+PMSET_AC = "Now drawing from 'AC Power'"
+PMSET_BATTERY = "Now drawing from 'Battery Power'"
 # An under-load sample is not R-N81 load-gated and not R-N91 quiet-gated
 # (OI-1003-Q39), so it does not cite them as followed.
 RULINGS_UNDER_LOAD = (
@@ -230,8 +261,68 @@ def corpus_verify(corpus: Path) -> int:
     ).returncode
 
 
+def sysfs_word(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def linux_power(root: Path) -> tuple[str, list[dict[str, object]]]:
+    """R-N81 power state from a Linux power-supply class tree (OI-1003-Q96).
+
+    Returns the state (`ac`, `battery` or `unknown`) and every supply read.
+    The rule, in order; `linux_power` in the Rust bench is the same rule and
+    both are tested over the same fake trees:
+
+    1. The class directory cannot be listed: `unknown`.
+    2. A supply whose `scope` is `Device` powers a peripheral; it is ignored.
+    3. Any `Mains` supply with `online` = `1`: `ac`.
+    4. Otherwise, if a `Battery` or `UPS` supply exists: `battery`, whatever
+       its `status` says. With no mains supply online, the battery is the
+       only power the host can be on.
+    5. Otherwise, if any supply's `type` could not be read: `unknown`.
+    6. Otherwise no battery exists (a desktop or a server, with or without
+       an offline `Mains` entry): `ac`.
+
+    `USB`, `Wireless` and every other type never prove AC and never count as
+    a battery; a host charged only through such a supply reads `battery`.
+    """
+    try:
+        names = sorted(entry.name for entry in root.iterdir())
+    except OSError:
+        return "unknown", []
+    supplies: list[dict[str, object]] = []
+    mains_online = battery = unreadable = False
+    for name in names:
+        supply = {
+            "name": name,
+            **{
+                key: sysfs_word(root / name / key)
+                for key in ("type", "online", "status", "scope")
+            },
+        }
+        supplies.append(supply)
+        if supply["scope"] == "Device":
+            continue
+        if supply["type"] == "Mains":
+            mains_online = mains_online or supply["online"] == "1"
+        elif supply["type"] in ("Battery", "UPS"):
+            battery = True
+        elif supply["type"] is None:
+            unreadable = True
+    if mains_online:
+        return "ac", supplies
+    if battery:
+        return "battery", supplies
+    if unreadable:
+        return "unknown", supplies
+    return "ac", supplies
+
+
 def power_source() -> str:
-    if platform.system() == "Darwin":
+    system = platform.system()
+    if system == "Darwin":
         try:
             text = subprocess.run(
                 ["/usr/bin/pmset", "-g", "batt"],
@@ -247,20 +338,143 @@ def power_source() -> str:
         if "'Battery Power'" in first:
             return "battery"
         return "unknown"
-    supplies = Path("/sys/class/power_supply")
-    mains = (
-        [
-            p
-            for p in supplies.glob("*")
-            if (p / "type").is_file() and (p / "type").read_text().strip() == "Mains"
-        ]
-        if supplies.is_dir()
-        else []
+    if system == "Linux":
+        return linux_power(POWER_SUPPLY_ROOT)[0]
+    return "unknown"
+
+
+def pmset_shim_main() -> int:
+    """Stand in for `pmset -g batt` on Linux, for a baseline bench (see the docstring).
+
+    Prints pmset's first line for the `linux_power` state. An unknown state
+    prints nothing and exits 1, which the baseline bench reads as `unknown`
+    and refuses.
+    """
+    state = linux_power(POWER_SUPPLY_ROOT)[0] if platform.system() == "Linux" else ""
+    line = {"ac": PMSET_AC, "battery": PMSET_BATTERY}.get(state)
+    if line is None:
+        return 1
+    print(line)
+    return 0
+
+
+def write_pmset_shim(work: Path) -> Path:
+    """<work>/pmset-shim/pmset; returns the directory to put first on PATH."""
+    directory = work / "pmset-shim"
+    directory.mkdir(exist_ok=True)
+    script = directory / "pmset"
+    script.write_text(
+        "#!/bin/sh\n"
+        "# R-N81 power translator for a baseline bench that only knows pmset\n"
+        "# (OI-1003-Q96). See r23_ab.py, 'Baselines on Linux'.\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))}"
+        " --pmset-shim\n"
     )
-    if not mains:
-        return "unknown-no-supply-class"
-    online = any((p / "online").read_text().strip() == "1" for p in mains)
-    return "ac" if online else "battery"
+    script.chmod(0o755)
+    return directory
+
+
+def native_preflight(binary: Path) -> dict[str, object] | None:
+    """The build's own `preflight` answer, or None when it has no such probe."""
+    try:
+        result = subprocess.run(
+            [str(binary), "preflight"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("preflight "):
+            return pairs(line.partition(" ")[2])
+    return None
+
+
+def fs_type_from_mountinfo(text: str, path: str) -> str | None:
+    """Filesystem type of the longest mount point containing `path` (Linux)."""
+    best: tuple[int, str] | None = None
+    for line in text.splitlines():
+        left, sep, right = line.partition(" - ")
+        fields = left.split()
+        if not sep or len(fields) < 5 or not right.split():
+            continue
+        mount = fields[4].encode().decode("unicode_escape")
+        if path == mount or path.startswith(mount.rstrip("/") + "/"):
+            if best is None or len(mount) >= best[0]:
+                best = (len(mount), right.split()[0])
+    return best[1] if best else None
+
+
+def fs_type_from_mount(text: str, path: str) -> str | None:
+    """Filesystem type from Darwin `mount` output: `dev on /mnt (apfs, ...)`."""
+    best: tuple[int, str] | None = None
+    for line in text.splitlines():
+        found = re.match(r".* on (/.*) \(([^,)]+)", line)
+        if not found:
+            continue
+        mount = found.group(1)
+        if path == mount or path.startswith(mount.rstrip("/") + "/"):
+            if best is None or len(mount) >= best[0]:
+                best = (len(mount), found.group(2))
+    return best[1] if best else None
+
+
+def command_text(argv: list[str]) -> str:
+    try:
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False
+        ).stdout.strip()
+    except OSError:
+        return ""
+
+
+def cpu_model_from_cpuinfo(text: str) -> str | None:
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() in ("model name", "Model", "Hardware") and value.strip():
+            return value.strip()
+    return None
+
+
+def host_identity(work_parent: Path) -> dict[str, object]:
+    """What tells one rig's sample from another's (OI-1003-Q96, OI-1003-Q97)."""
+    system = platform.system()
+    path = str(work_parent)
+    cpu: str | None = None
+    fs: str | None = None
+    product: str | None = None
+    supplies: list[dict[str, object]] = []
+    if system == "Linux":
+        cpu = cpu_model_from_cpuinfo(sysfs_word(Path("/proc/cpuinfo")) or "")
+        fs = fs_type_from_mountinfo(
+            sysfs_word(Path("/proc/self/mountinfo")) or "", path
+        )
+        product = sysfs_word(Path("/sys/class/dmi/id/product_name"))
+        supplies = linux_power(POWER_SUPPLY_ROOT)[1]
+    elif system == "Darwin":
+        cpu = (
+            command_text(["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"]) or None
+        )
+        fs = fs_type_from_mount(command_text(["/sbin/mount"]), path)
+        product = command_text(["/usr/sbin/sysctl", "-n", "hw.model"]) or None
+    try:
+        ram: int | None = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError):
+        ram = None
+    return {
+        "node": platform.node(),
+        "system": system,
+        "kernel": platform.release(),
+        "machine": platform.machine(),
+        "product": product,
+        "cpu_model": cpu,
+        "cpu_count": os.cpu_count(),
+        "ram_bytes": ram,
+        "work_root_parent": path,
+        "work_root_fs_type": fs,
+        "power_probe": {"Linux": "sysfs", "Darwin": "pmset"}.get(system, "none"),
+        "power_supplies": supplies,
+    }
 
 
 def conditions() -> dict[str, object]:
@@ -634,8 +848,15 @@ def run_rep(
         f"rep={index} label={label} sha={info['sha'][:12]} load1={before['load1']} "
         f"power={before['power']} source_residency={source_cache}"
     )
+    env = None
+    if info.get("preflight") == "pmset-shim":
+        # A baseline that only knows pmset: see "Baselines on Linux".
+        env = dict(os.environ)
+        env["PATH"] = f"{write_pmset_shim(work)}{os.pathsep}{env.get('PATH', '')}"
     started = time.monotonic()
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False, env=env
+    )
     wall_s = time.monotonic() - started
     (logs / f"rep{index}-{label}.stdout").write_text(result.stdout)
     (logs / f"rep{index}-{label}.stderr").write_text(result.stderr)
@@ -679,6 +900,7 @@ def run_rep(
         "sha": info["sha"],
         "native_only": native_only,
         "command": command,
+        "preflight": info.get("preflight", "native"),
         "exit": result.returncode,
         "wall_s": round(wall_s, 3),
         "conditions_before": before,
@@ -830,6 +1052,21 @@ def fmt(value: object, digits: int = 3) -> str:
     return str(value)
 
 
+def identity_lines(identity: object) -> list[str]:
+    if not isinstance(identity, dict):
+        return []
+    ram = identity.get("ram_bytes")
+    return [
+        f"- Rig: `{identity.get('node')}`, {identity.get('system')}"
+        f" {identity.get('kernel')} {identity.get('machine')},"
+        f" product `{identity.get('product')}`, CPU `{identity.get('cpu_model')}`,"
+        f" {identity.get('cpu_count')} cores,"
+        f" RAM {fmt(ram / 2**30, 1) if isinstance(ram, int) else 'n/a'} GiB,"
+        f" work-root filesystem `{identity.get('work_root_fs_type')}`,"
+        f" power probe `{identity.get('power_probe')}`.",
+    ]
+
+
 def evidence(report: dict[str, object]) -> str:
     dry = report["mode"] == "dry-run"
     aborted = report["status"] in ("aborted", "refused")
@@ -910,6 +1147,7 @@ def evidence(report: dict[str, object]) -> str:
         f" copy, stat fields included; must match in every rep):"
         f" `{report.get('sealed_identity', 'n/a')}`.",
         f"- Work root: `{report['work_root']}`.",
+        *identity_lines(report.get("host_identity")),
         f"- rclone: `{report['rclone']}` ({report.get('rclone_version', 'n/a')}), the r23-2026-09-18 flags.",
         "- Page cache: never dropped. The bench reads the whole source (BLAKE3) before"
         " every arm, so every timed arm starts source-hot. Residency is logged for the"
@@ -917,13 +1155,22 @@ def evidence(report: dict[str, object]) -> str:
         " arms read) right after it.",
         "- Destinations: a new work root per repetition and a new destination per arm.",
         "",
-        "| label | rev | sha | binary sha256 |",
-        "|---|---|---|---|",
+        "| label | rev | sha | binary sha256 | R-N81 preflight |",
+        "|---|---|---|---|---|",
     ]
     for label, info in report["builds"].items():
         lines.append(
             f"| {label} | `{info['rev']}` | `{info['sha'][:12]}` | `{info['sha256'][:16]}` |"
+            f" {info.get('preflight', 'native')} |"
         )
+    if any(i.get("preflight") == "pmset-shim" for i in report["builds"].values()):
+        lines += [
+            "",
+            "`pmset-shim`: this baseline's bench only knows `pmset`. It is built at its"
+            " exact sha, unpatched, and run with a translator first on PATH that"
+            " reports the Linux power-supply state in pmset's words (OI-1003-Q96;"
+            ' `r23_ab.py`, "Baselines on Linux"). B never runs behind it.',
+        ]
     lines += [
         "",
         "## Per-rep bench verdicts",
@@ -1095,7 +1342,9 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[3]))
     parser.add_argument(
-        "--corpus", default=DEFAULT_CORPUS, help="sealed corpus root (gated mode)"
+        "--corpus",
+        help="sealed corpus root (gated mode). Darwin default:"
+        f" {DEFAULT_CORPUS}; required on Linux",
     )
     parser.add_argument(
         "--work-root", required=True, help="new directory on the volume under test"
@@ -1132,6 +1381,8 @@ def main(argv: list[str] | None = None) -> int:
         help=f"{UNDER_LOAD}: sealed corpus, bench --informational, load recorded"
         " but not gated, AC power still required (OI-1003-Q39, OI-1003-Q50)",
     )
+    if (sys.argv[1:] if argv is None else argv)[:1] == ["--pmset-shim"]:
+        return pmset_shim_main()
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
@@ -1148,13 +1399,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run and args.under_load:
         say("refused: --dry-run and --under-load are exclusive")
         return 2
-    sealed = Path(args.corpus).resolve()
+    system = platform.system()
     if not args.dry_run:
-        if platform.system() != "Darwin":
+        if system not in ("Darwin", "Linux"):
             say(
-                "refused: gated samples need Darwin (the bench R-N81 preflight reads pmset); run on neo"
+                f"refused: no R-N81 power probe for {system}; gated and under-load"
+                " samples run on Darwin (pmset) or Linux (sysfs)"
             )
             return 2
+        if args.corpus is None and system != "Darwin":
+            say(
+                "refused: --corpus is required on Linux (only Darwin has a default"
+                " corpus path)"
+            )
+            return 2
+    sealed = Path(args.corpus or DEFAULT_CORPUS).resolve()
+    if not args.dry_run:
         # OI-1003-Q39: an under-load sample runs with the lanes as they are.
         if not args.coordinator_quiet and not args.under_load:
             say("refused: --coordinator-quiet is required (R-N91)")
@@ -1228,6 +1488,21 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.rev_v4:
         builds["V4"] = build(repo, args.rev_v4, build_root, scratch, args.build_jobs)
+    if not args.dry_run and system == "Linux":
+        # OI-1003-Q96: which builds read sysfs themselves. B must; an
+        # informational baseline that does not runs behind the pmset shim.
+        for label, info in builds.items():
+            probe = native_preflight(Path(info["binary"]))
+            native = probe is not None and probe.get("power_probe") == "sysfs"
+            info["preflight"] = "native" if native else "pmset-shim"
+            say(f"preflight label={label} sha={info['sha'][:12]} {info['preflight']}")
+        if builds["B"]["preflight"] != "native":
+            say(
+                "refused: B has no Linux (sysfs) R-N81 preflight; the pmset shim is"
+                " only for informational baselines, never for the arm that decides"
+                " the gate"
+            )
+            return 2
     rclone = resolve_rclone(repo, args.rclone)
     report: dict[str, object] = {
         "date": date,
@@ -1237,6 +1512,7 @@ def main(argv: list[str] | None = None) -> int:
         else ("under-load" if args.under_load else "gated"),
         "host": platform.node(),
         "platform": platform.platform(),
+        "host_identity": host_identity(work.parent),
         "coordinator_quiet": args.coordinator_quiet,
         "coordinator_quiet_meaning": (
             "acknowledged only; an under-load sample is not R-N91 gated (OI-1003-Q39)"

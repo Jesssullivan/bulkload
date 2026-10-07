@@ -291,6 +291,70 @@ as properties.
   record naming a code that has left the taxonomy stays unaccounted
   (`refusal-code-retired`); no disposition or attestation closes it.
 
+## Amendment 2026-10-07: the hermetic rig is S1's gate of record (OI-1003-Q96, Q97)
+
+- **Why.** neo and sting are live, busy hosts. R-N81's gate (AC power, load1
+  below 2.5) almost never opens on them: from 2026-10-03 to 2026-10-07 every
+  gated gate (a) attempt on neo was refused or aborted, on load or on
+  battery power. A gate that
+  cannot be sampled proves nothing.
+- **The gate of record (OI-1003-Q97).** S1 gates (a) and (b) are decided on
+  the hermetic rig, on the sealed corpus. Nothing else in S1 changes: gate
+  (a) is still B/A/B/A/B with all three B reps passing (OI-1002-Q30), R-N81
+  holds before every rep and every arm, and gate (b) keeps the protocol
+  ratified in OI-1003-Q82 and Q89.
+- **Hosts and roles (OI-1003-Q96).**
+
+  | Host | Platform | Role |
+  |---|---|---|
+  | mbp-13 | Linux x86_64, 4 cores, 16 GB, XFS | Gate (a), local copy. Destination of both gate (b) runs. |
+  | yoga | Linux x86_64, 8 cores, 16 GB | Gate (b) source, Linux to Linux. |
+  | PZM | macOS arm64 | Gate (b) source, macOS to Linux, mirroring neo to sting. |
+
+  Every rig file lives under one bounded directory, `~/git-bulkload/`, on
+  each host: the clone, the builds, the sealed corpus and all run output.
+- **The sealed corpus.** Gate (a) runs on R23 corpus v1 (OI-1002-Q28):
+  23 regular files, 239,819,837 bytes, content identity
+  `f4a7619f7b88f2e0e1eeadb5995c79a809eafa8b4a8cf3f82d1ff6f29b5b07c7`,
+  generated on the host by `r23_corpus.py`, verified and sealed read-only.
+  The harness refuses any other corpus in gated mode. The estate-shaped
+  class of OI-1003-Q19 is unchanged and still owed.
+- **Power on Linux.** R-N81 is not weakened. On Linux the bench and the
+  harness read `/sys/class/power_supply`: `ac` only when a `Mains` supply is
+  online, or when the host has no battery at all; a battery with no mains
+  online is `battery`; an unreadable class is `unknown`. Only `ac` opens the
+  gate. The exact rule is on `linux_power` in `bulkload-bench` and
+  `r23_ab.py`.
+- **The baseline arm on Linux.** The pinned baselines (A `7c3ecc7`, v4
+  `41bf9a4`) only know `pmset`. They are built at their exact sha, unpatched,
+  and run with a translator named `pmset` first on PATH that reports the
+  Linux power state in pmset's words. B never runs behind it. A stays
+  informational and the verdict rule is unchanged. Whether to move the
+  pinned A to a revision with the Linux preflight is an open operator
+  question; until it is ruled, the translator stands.
+- **Every sample names its rig.** The report records the platform, kernel,
+  machine, CPU model, core count, RAM and the filesystem type of the work
+  root, so a sample from one rig is never read as another's.
+- **Field confirmation.** A neo to sting run (gate (a) on neo, gate (b) as a
+  neo to sting pull) is a field confirmation. It is run when the hosts
+  allow, on the same corpus and harness, and it is reported beside the rig
+  verdict. It never decides S1, in either direction: a field pass does not
+  rescue a rig fail, and a field fail does not revoke a rig pass. A field
+  fail is filed as an issue and explained.
+- **What the rig does not cover.**
+  - macOS code paths on gate (a). Gate (a) on the rig is Linux only until
+    PZM has room for the corpus and five destination copies (it has about
+    13 GB free). Until then, macOS local-copy performance is covered only by
+    a field confirmation on neo.
+  - APFS and the TinylandState volume. The rig's work root is XFS on
+    mbp-13's internal SSD.
+  - Tailscale link variance. The rig's hosts are quiet and close; the
+    neo to sting link's jitter and tailscaled CPU cost (see
+    `docs/evidence/m0-2026-09-23.md`) are seen only in a field confirmation.
+  - Estate scale and live-host pressure. `--under-load` samples stay
+    informational (OI-1003-Q39).
+- Runbook: [plans/2026-10-07-s1-hermetic-rig.md](plans/2026-10-07-s1-hermetic-rig.md).
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
