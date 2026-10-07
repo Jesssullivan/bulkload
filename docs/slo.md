@@ -207,6 +207,22 @@ as properties.
   - This narrows "the destination held durably" in OI-1002-Q33 to "a committed
     row proves it".
 
+## Amendment 2026-10-06: S1 gate (b) harness (OI-1003-Q66)
+
+- The gate (b) harness is built (`gate_b.py`, `just bench-gate-b`) and its
+  protocol is [plans/2026-10-06-s1-gate-b-protocol.md](plans/2026-10-06-s1-gate-b-protocol.md).
+  It changes no SLO and no number above. Its choices are drafts until the
+  operator ratifies them: SQLite seats are left out of the comparable set, the
+  delta is a 1 % XOR, the arms run N/R/N/R/N, and gate (a)'s 2 GiB RSS cap
+  applies. No neo run happens until gate (a) passes.
+- Gate (b)'s rep rule is gate (a)'s rule with two unratified deviations. It
+  gates the warm resume (0 bytes received, 0 content bytes read), but:
+  - it runs no interrupted-resume phase, so `r25_interrupted_zero` is not
+    part of a gate (b) verdict (the harness never signals a process);
+  - its warm-resume reads are net of the 16-byte SQLite magic probes.
+- R-N81's load bound (load1 < 2.5) holds on both hosts in gated mode.
+  `--dest-load-limit` can only tighten it.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
