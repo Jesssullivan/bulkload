@@ -30,6 +30,18 @@
 //! links before it (`GIT_INVENTORY_MISSING_PREREQUISITE` otherwise), and
 //! writes one self-contained bundle whose advertised refs must equal the head
 //! bundle's exactly. The restore and import verbs read only that bundle.
+//!
+//! **Under a plan base (Q42 lane L6b, fix 2; R-N72).** A grouped item's
+//! capture chains on its prior capture too, so its bundle declares the plan
+//! base's commits and the prior's source-held tips. Its restore binds every
+//! base and every link by name and digest: [`flatten`] stages each bound
+//! base, checks its digest, requires it to be self-contained and imports it
+//! before the oldest link, which may then declare prerequisites the bases
+//! satisfy. A base the corpus no longer holds refuses
+//! `SEALED_OBJECT_MISSING`. The chain re-bases at [`CHAIN_DEPTH_LIMIT`] as
+//! an ungrouped one does: that capture is the plan base's delta alone, and
+//! re-packs what the group committed since its base (OI-1003-Q62; lane L8's
+//! re-root removes it).
 
 use crate::refuse::RefuseAt as _;
 use std::collections::BTreeSet;
@@ -148,28 +160,63 @@ pub(super) fn source_held_tips(source: &Path, prior: &Path) -> Result<BTreeSet<S
     Ok(held)
 }
 
+// A bundle of the chain, copied privately while it is hashed. One the
+// corpus no longer holds is a typed refusal, never a bare IO errno (S4).
+fn stage(source: &Path, staged: &Path) -> Result<[u8; 32]> {
+    copy_hashing(source, staged).map_err(|refusal| {
+        if refusal == BulkloadRefusal::Io(Some(libc::ENOENT)) {
+            BulkloadRefusal::SealedObjectMissing
+        } else {
+            refusal
+        }
+    })
+}
+
 /// Turn a staged chained capture into one self-contained staged bundle.
 ///
-/// `links` are the bundles it chains on, oldest first, each with the digest
-/// its capture recorded. The oldest must be self-contained; each later one,
-/// and finally `head`, must have every prerequisite satisfied by the links
-/// before it. The result advertises exactly `head`'s refs, carries `head`'s
-/// digest (the capture it stands for), and lives in its own private directory
-/// beside the oldest link, removed when it drops.
+/// `links` are the bundles it chains on, oldest first, and `bases` the plan
+/// bases the head and its links are bound to (L6b's fix 2; none for a v1
+/// chain), each with the digest its capture recorded. Every base must be
+/// self-contained, and all are imported before the oldest link. Without a
+/// base the oldest link must be self-contained; with one it may declare
+/// prerequisites the bases satisfy. Each later link, and finally `head`,
+/// must have every prerequisite satisfied by the bases and the links before
+/// it. The result advertises exactly `head`'s refs, carries `head`'s digest
+/// (the capture it stands for), and lives in its own private directory
+/// beside the oldest link, removed when it drops. The oldest link's
+/// directory (the corpus) is canonicalized once, so a relative corpus path
+/// names the same scratch paths to this process and to every git child
+/// (#183).
 ///
 /// # Errors
-/// `DIGEST_MISMATCH` for a link whose bytes are not the recorded ones,
-/// `RECEIPT_BINDING_INVALID` for an oldest link that is not self-contained,
+/// `SEALED_OBJECT_MISSING` for a base or a link the corpus does not hold,
+/// `DIGEST_MISMATCH` for one whose bytes are not the recorded ones,
+/// `RECEIPT_BINDING_INVALID` for a base that is not self-contained, for an
+/// oldest link that is not self-contained when no base is bound, and for
+/// more links or bases than a chain can have,
 /// `GIT_INVENTORY_MISSING_PREREQUISITE` for a link the chain cannot satisfy,
 /// and `GIT_INVENTORY_MALFORMED` when the flattened refs are not `head`'s.
-pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<StagedBundle> {
+pub fn flatten(
+    head: StagedBundle,
+    bases: &[(PathBuf, [u8; 32])],
+    links: &[(PathBuf, [u8; 32])],
+) -> Result<StagedBundle> {
+    const SITE: &str = "git_carry::chain::flatten";
     let (oldest, _) = links
         .first()
         .ok_or(BulkloadRefusal::ReceiptBindingInvalid)?;
-    if links.len() > usize::try_from(CHAIN_DEPTH_LIMIT).unwrap_or(usize::MAX) {
+    // The head and each link bind at most one base each.
+    if links.len() > usize::try_from(CHAIN_DEPTH_LIMIT).unwrap_or(usize::MAX)
+        || bases.len() > links.len().saturating_add(1)
+    {
         return Err(BulkloadRefusal::ReceiptBindingInvalid);
     }
-    let directory = PrivateDir::create(oldest.parent())?;
+    let corpus = match oldest.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let corpus = fs::canonicalize(corpus).refuse_at(SITE)?;
+    let directory = PrivateDir::create(Some(&corpus))?;
     let heads = text(
         git(directory.path())
             .args(["bundle", "list-heads"])
@@ -188,12 +235,32 @@ pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<Stag
             ])
             .arg(&repository),
     )?;
-    for (index, (link, digest)) in links.iter().enumerate() {
-        let staged = directory.path().join(format!("link-{index}.bundle"));
-        if copy_hashing(link, &staged)? != *digest {
+    // Every bound base first: the oldest link, and any later capture bound
+    // to another base, may declare its commits.
+    for (index, (base, digest)) in bases.iter().enumerate() {
+        let staged = directory.path().join(format!("base-{index}.bundle"));
+        if stage(base, &staged)? != *digest {
             return Err(BulkloadRefusal::DigestMismatch);
         }
-        if index == 0 && !shared::prerequisites(&staged)?.is_empty() {
+        if !shared::prerequisites(&staged)?.is_empty() {
+            return Err(BulkloadRefusal::ReceiptBindingInvalid);
+        }
+        verify_bundle(&repository, &staged)?;
+        output(
+            git(&repository)
+                .args(["fetch", "--no-tags", "--quiet"])
+                .arg(&staged)
+                .arg(format!("+refs/*:refs/carry-chain/base-{index}/*")),
+        )?;
+    }
+    for (index, (link, digest)) in links.iter().enumerate() {
+        let staged = directory.path().join(format!("link-{index}.bundle"));
+        if stage(link, &staged)? != *digest {
+            return Err(BulkloadRefusal::DigestMismatch);
+        }
+        // Without a base nothing can satisfy the oldest link's
+        // prerequisites; with one, `verify_bundle` below decides.
+        if index == 0 && bases.is_empty() && !shared::prerequisites(&staged)?.is_empty() {
             return Err(BulkloadRefusal::ReceiptBindingInvalid);
         }
         verify_bundle(&repository, &staged)?;
@@ -211,7 +278,8 @@ pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<Stag
             .arg(head.path())
             .arg("+refs/*:refs/*"),
     )?;
-    // The links' refs only carried their objects here; none is restored.
+    // The bases' and links' refs only carried their objects here; none is
+    // restored.
     let transient = text(
         git(&repository)
             .args(["for-each-ref", "--format=%(refname)"])
@@ -238,9 +306,7 @@ pub fn flatten(head: StagedBundle, links: &[(PathBuf, [u8; 32])]) -> Result<Stag
     )?;
     crate::counters::add(
         crate::counters::Counter::BundleStageWrite,
-        fs::symlink_metadata(&flat)
-            .refuse_at("git_carry::chain::flatten")?
-            .len(),
+        fs::symlink_metadata(&flat).refuse_at(SITE)?.len(),
     );
     let sorted = |listing: &str| {
         let mut entries: Vec<String> = listing.lines().map(str::to_owned).collect();

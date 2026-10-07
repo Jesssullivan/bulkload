@@ -2,8 +2,7 @@
 
 Rulings: OI-1003-Q5, OI-1003-Q9, OI-1003-Q16, OI-1003-Q36, OI-1003-Q60,
 R-N13. Branch `feat/s2-proof-closure-20261006`, worktree
-`bulkload.worktrees/s2-proof-closure-20261006`. Main `a80c63b` is merged in
-(`fdc5fac`). PR #197 is open. Its CI failed as root on `b385f08`; the
+`bulkload.worktrees/s2-proof-closure-20261006`. Main `600c765` is merged in. PR #197 is open. Its CI failed as root on `b385f08`; the
 second fix round (below, 2026-10-07, adding OI-1003-Q72 and OI-1003-Q76)
 answers that.
 
@@ -130,6 +129,11 @@ section 5 of the evidence document.
   first two runs.
   It now repeats until one snapshot is seen (at most 40; each held to every
   limit); the live leg waits for a sampled lock too.
+- **Main moved during the round** to `600c765` (#199, #164), merged
+  again. #199 adds a fifth `fetch` (`chain::flatten`, each bound plan base
+  into the chain's scratch repository). P76 failed on it (`5 uses, ceiling
+  4`); the call site was read, the number raised to 5 with its argument in
+  the entry, and the fact recorded on #188. It is the only number raised.
 - **Mutants** (scratch copy, all red): S1 to S5 in the evidence document.
   S2 reproduces the CI failure under `unshare -r`. S5 passed before this
   round.
@@ -174,7 +178,10 @@ section 5 of the evidence document.
 - `b385f08`: the recheck stage's edits. CI failed on it as root (run
   37540759845).
 - `fdc5fac`: merge of main `a80c63b` (second fix round).
-- The commit that carries this line holds the second fix round's tests,
-  plan rows, evidence and this note. `just check-fast` ran on that tree
-  before the commit; its receipt is in the pull request, because a commit
-  cannot carry its own receipt.
+- `cd45b49`: the second fix round's tests, plan rows, evidence and this
+  note. `just check-fast` exited 0 on that tree (second run; the first
+  failed only on the known #200 `EAGAIN` flake).
+- The merge of main `600c765` carries this line, the `fetch` number and
+  its documentation. `just check-fast` ran on that tree before the commit;
+  its receipt is in the pull request, because a commit cannot carry its own
+  receipt.

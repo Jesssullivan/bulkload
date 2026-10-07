@@ -25,8 +25,9 @@ Measured on branch `feat/s2-proof-closure-20261006` on sting (Linux, xfs
 scratch), with main `2247ab8` merged in (`a7b7ccc`). The recheck stage then
 merged main `48bd697` (#191, #192) as `c8c1783` and reran both tests there;
 see sections 2 and 4. A second fix round on 2026-10-07 merged main `a80c63b`
-(#189, #194, #195, #196, #198) as `fdc5fac`, after PR CI failed as root; it
-is section 5, and sections 1, 3 and 4 are updated to match. The host was
+(#189, #194, #195, #196, #198) as `fdc5fac`, after PR CI failed as root, and
+then main `600c765` (#199, #164); it is section 5, and sections 1, 3 and 4
+are updated to match. The host was
 heavily shared. Tests ran inside `nix develop` with
 `cargo test -p bulkload-agent --test source_command_registry --test
 source_lock_trace -- --test-threads=1`.
@@ -89,8 +90,9 @@ carries `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`,
   injector (`git_carry::nest_status`).
 - Every Git subcommand in the `git_carry` tree is a registered read or one
   of 14 registered writers. Each writer is pinned to the exact number of
-  uses the tree holds (44 in all at main `a80c63b`): one more fails, and so
-  does one fewer, until the number is lowered (section 5). A literal that
+  uses the tree holds (45 in all at main `600c765`): one more fails, and so
+  does one fewer, until the number is changed with its argument (section
+  5). A literal that
   holds a shell line, such as the probe script, is read as shell, so a Git
   subcommand inside it is checked too.
 
@@ -285,7 +287,8 @@ Two library mutants ran both test files:
   lock lines are not sampled. The idle-writer leg accounts for the `-shm`.
 - **A typed source/private Git builder (#188).** Until it exists, "no
   writer is aimed at a source" is a census plus a dynamic check of three
-  verbs.
+  verbs. Until P76 is on main, a new writer use lands there without the
+  census seeing it (#199's `fetch`, section 5).
 - **Verbs with no P77 leg.** `estate::apply`, `git-carry-estimate` over
   ssh, `export_repository_with_policy` and the prerequisite and drift
   paths, `hydrate-state`, and a real `pull` over ssh. S2's lock property
@@ -345,7 +348,9 @@ Two library mutants ran both test files:
   `source_command_registry` 15 passed and `source_lock_trace` 12 passed,
   with no registry entry changed.
 - Second fix round, on `fdc5fac` (main `a80c63b` merged) plus the round's
-  test changes: `source_command_registry` 16 passed, `source_lock_trace` 13
+  test changes (committed as `cd45b49`, on which `just check-fast` exited 0
+  at its second run; the first failed only on the known #200 `EAGAIN`
+  flake), and again with main `600c765` merged: `source_command_registry` 16 passed, `source_lock_trace` 13
   passed as uid 1000 and 13 passed under `unshare -r`, `prop_seed_guard` 6
   passed with `scanned=83 exempt_present=1 escapes=0`. `cargo fmt --all
   --check` clean; `cargo clippy --workspace --all-targets --locked -- -D
@@ -438,7 +443,7 @@ under carry_v2". After the merge that meant:
 | `local_probe` callers | 3 carry_v2 calls registered and gone, tolerated by name | removed; the tolerance is deleted, the caller list is exact |
 | `BUILDERS` | 3 carry_v2 builders | removed; 8 builders, and a listed builder that is gone fails |
 | `EXTRA_CONFIG` | 4 carry_v2 assignments | removed; 3 entries, and an entry no literal spells fails |
-| `WRITERS` | `index-pack` 2 (holds 1), `update-ref` 10 (holds 9) | 1 and 9; 44 uses over 14 writers |
+| `WRITERS` | `index-pack` 2 (holds 1), `update-ref` 10 (holds 9) | 1 and 9; 44 uses over 14 writers at `a80c63b` |
 | `NOT_COMMANDS` | `commit` 6 (holds 4), `tag` 4 (holds 2), `refs` 1 (holds 0) | 4, 2, and `refs` removed; 18 literals |
 
 `stale_entries` now fails the test when any table holds more than the
@@ -451,4 +456,25 @@ files present (neither uses proptest).
 ```
 p76 static: 17 bypass ids, 8 builders, 44 writer uses over 14 writers, 18 non-command literals, 3 extra config, stale=0
 p76 dynamic: 345 Git children (77 git-export, 36 estimate, 232 estate-capture), 232 aimed at a protected root
+```
+
+### P76 against main `600c765` (#199 landed during the round)
+
+Main moved again before the push. #199 (grouped chains under a plan base)
+adds one writer use: `chain::flatten` now runs `git fetch --no-tags --quiet
+<staged base> +refs/*:refs/carry-chain/base-N/*` for each bound plan base.
+P76 failed on the merged tree, as it should: `"fetch": 5 uses, ceiling 4`.
+
+Read at the call site: the bundle is a digest-checked private copy inside
+the chain's own scratch directory, and the target is the scratch repository
+`flatten` creates there. Neither is a source repository, so it is the same
+class as the four existing `fetch` uses. The number is raised from 4 to 5
+with that argument in the entry, and it is recorded on #188. This is the
+one number this lane has raised. It is not a loosened rule: the pin is
+still exact, and it follows code that main already merged. It does show the
+cost stated in section 3: P76 is not on main yet, so a writer can land
+there unargued and is caught only when this branch merges it.
+
+```
+p76 static: 17 bypass ids, 8 builders, 45 writer uses over 14 writers, 18 non-command literals, 3 extra config, stale=0
 ```

@@ -436,7 +436,9 @@ const OPEN_FORMS: &[(&str, &str, &str)] = &[(
 /// runs, and a typed source/private builder split is asked for on
 /// bulkload#188. A number is a pin, not a ceiling: the tree holds exactly
 /// that many ([`stale_entries`]), so a removed writer cannot leave room for a
-/// new one. It is lowered with the code and never raised.
+/// new one. It moves only with the code on main: down when a use is
+/// removed, and up only for a use that its entry argues and bulkload#188
+/// records (one so far: `fetch`, 4 to 5, for #199).
 const WRITERS: &[(&str, usize, &str)] = &[
     (
         "add",
@@ -461,9 +463,11 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "fetch",
-        4,
+        5,
         "From a bundle file into the capture's private repository, a chain's \
-         scratch repository or a destination. Never from a source repository.",
+         scratch repository or a destination. Never from a source repository. \
+         Five since #199: chain::flatten also fetches each bound plan base, a \
+         digest-checked private copy, into the chain's scratch repository.",
     ),
     (
         "hash-object",

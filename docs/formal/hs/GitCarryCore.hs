@@ -52,8 +52,9 @@ crates/bulkload-agent/src:
     rootWindow > 0: a capture whose root would reach the window starts a
     new root; at the depth limit a capture chains on its chain's root
     (a re-root) instead of re-packing its whole history.
-  * Lane L6b's fix 2 (no code yet), under chainUnderBase: a based capture
-    still chains on its prior.
+  * Lane L6b's fix 2, under chainUnderBase: a based capture still chains
+    on its prior. It is the code's only policy since lane L6b
+    (decide::Policy::CODE, the L6b rows' policy).
 
 Base and containers only:
 
@@ -107,8 +108,9 @@ import System.IO (hPutStrLn, stderr)
 -- ---------------------------------------------------------------------------
 -- The decision core
 
--- | The policy a capture runs under. v1 at main: depth limit 8
+-- | The policy a capture runs under. v1: depth limit 8
 -- (chain::CHAIN_DEPTH_LIMIT), no re-root window, no chain under a base.
+-- The code since lane L6b: the same with a chain under a base.
 data Policy = Policy
   { depthLimit :: Int
   , rootWindow :: Int -- ^ Q46: captures per root; 0 never re-roots (v1)
@@ -263,8 +265,8 @@ extend tw i
 -- ---------------------------------------------------------------------------
 -- Pinned rows (P67)
 
--- | The lane whose code each row pins: main's behaviour (v1), L6b's fix 2,
--- and L8's re-root. The window 27 is a parameter of the rows, not a
+-- | The lane whose code each row pins: the code before L6b (v1), L6b's
+-- fix 2 (the code's policy, decide::Policy::CODE), and L8's re-root. The window 27 is a parameter of the rows, not a
 -- ruling: Q46 sets the policy, L8 its value.
 data Lane = V1 | L6b | L8
   deriving (Eq, Show, Enum, Bounded)
