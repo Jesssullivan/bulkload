@@ -513,6 +513,56 @@ fn crash_child(
     mid: bool,
     envs: &[(&str, &str)],
 ) -> Option<String> {
+    let child = run_crash_child(scratch, point, label, mid, envs);
+    assert_eq!(
+        child.status.code(),
+        Some(FAULT_EXIT_CODE),
+        "{label}: the child must stop at its fault point (status {:?}, stderr {})",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
+    assert_receipt(scratch, point)
+}
+
+/// What a crash child's own last line says when its copy returned.
+const NOT_REACHED: &str = "fault point not reached; copy returned";
+
+/// What a crash child of the sweep did.
+enum Swept {
+    /// It stopped at its fault point; the receipt's group, if it names one.
+    Crashed(Option<String>),
+    /// Its copy returned first: the point has fewer hits than `nth`.
+    OutOfHits,
+}
+
+/// [`crash_child`] for the crash sweep, where running out of hits is the
+/// end of a point's sweep and not a failure.
+fn crash_child_if_reached(scratch: &Scratch, point: Point, label: &str, mid: bool) -> Swept {
+    let child = run_crash_child(scratch, point, label, mid, &[]);
+    if child.status.code() == Some(0)
+        && String::from_utf8_lossy(&child.stderr).contains(NOT_REACHED)
+    {
+        return Swept::OutOfHits;
+    }
+    assert_eq!(
+        child.status.code(),
+        Some(FAULT_EXIT_CODE),
+        "{label}: the child must stop at its fault point or run out of hits (status {:?}, stderr {})",
+        child.status,
+        String::from_utf8_lossy(&child.stderr)
+    );
+    Swept::Crashed(assert_receipt(scratch, point))
+}
+
+/// Run one armed crash child to its end and return its output. A hung child
+/// fails here, by its watchdog's status or by the parent's deadline.
+fn run_crash_child(
+    scratch: &Scratch,
+    point: Point,
+    label: &str,
+    mid: bool,
+    envs: &[(&str, &str)],
+) -> std::process::Output {
     assert!(
         std::env::var_os(FAULT_ENV).is_none(),
         "the harness process itself must not be armed"
@@ -561,14 +611,7 @@ fn crash_child(
          (stderr {})",
         String::from_utf8_lossy(&child.stderr)
     );
-    assert_eq!(
-        child.status.code(),
-        Some(FAULT_EXIT_CODE),
-        "{label}: the child must stop at its fault point (status {:?}, stderr {})",
-        child.status,
-        String::from_utf8_lossy(&child.stderr)
-    );
-    assert_receipt(scratch, point)
+    child
 }
 
 /// The crash landed at `point`, and a publication point in the store it names.
@@ -957,14 +1000,39 @@ fn crash_resume_with(
     let scratch = Scratch::new(&point.name().replace('.', "-"));
     populate(&scratch.source(), fixture);
     let group = crash_child(&scratch, point, &label, nth > 1, envs);
+    resume_after_crash(point, &label, &scratch, fixture, group, check_before);
+}
 
-    let before = crash_state(&scratch);
+/// [`crash_resume`] for the crash sweep: `false`, with nothing asserted,
+/// when the copy has fewer than `nth` hits of `point`.
+fn crash_resume_if_reached(point: Point, nth: u64, fixture: Fixture) -> bool {
+    let label = format!("{}:{nth}", point.name());
+    let scratch = Scratch::new(&point.name().replace('.', "-"));
+    populate(&scratch.source(), fixture);
+    let Swept::Crashed(group) = crash_child_if_reached(&scratch, point, &label, nth > 1) else {
+        return false;
+    };
+    resume_after_crash(point, &label, &scratch, fixture, group, |_| {});
+    true
+}
+
+/// The parent half of a scenario, after the child crashed at `point`: check
+/// the crash state, resume in process, and assert I1 to I4 and convergence.
+fn resume_after_crash(
+    point: Point,
+    label: &str,
+    scratch: &Scratch,
+    fixture: Fixture,
+    group: Option<String>,
+    check_before: impl FnOnce(&CrashState),
+) {
+    let before = crash_state(scratch);
     check_before(&before);
-    assert_i1(&label, &scratch, &before);
-    let crash_temporaries = assert_i2(&label, &scratch);
+    assert_i1(label, scratch, &before);
+    let crash_temporaries = assert_i2(label, scratch);
 
-    let files = source_files(&scratch);
-    let adoptable = adoptable(&scratch, &files, &before);
+    let files = source_files(scratch);
+    let adoptable = adoptable(scratch, &files, &before);
     let uncommitted: u64 = files
         .iter()
         .filter(|(path, _)| {
@@ -1016,10 +1084,10 @@ fn crash_resume_with(
         "{label}: every carried file accounted for"
     );
 
-    let after = crash_state(&scratch);
-    assert_i1(&format!("{label} resumed"), &scratch, &after);
-    let temporaries = assert_i2(&format!("{label} resumed"), &scratch);
-    assert_complete(&label, &scratch, fixture, &files, &after);
+    let after = crash_state(scratch);
+    assert_i1(&format!("{label} resumed"), scratch, &after);
+    let temporaries = assert_i2(&format!("{label} resumed"), scratch);
+    assert_complete(label, scratch, fixture, &files, &after);
     // I4: the sweep leaves no temporary behind and removes only the crash's.
     if leaves_temporary(point) {
         assert!(
@@ -1113,12 +1181,18 @@ const SUPERSEDING: Fixture = Fixture {
 };
 
 macro_rules! scenarios {
-    ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {$(
-        #[test]
-        fn $name() {
-            crash_resume(Point::$point, $nth, $fixture);
-        }
-    )*};
+    ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
+        $(
+            #[test]
+            fn $name() {
+                crash_resume(Point::$point, $nth, $fixture);
+            }
+        )*
+
+        /// The table as data: what the crash sweep reads its points from.
+        const SCENARIOS: &[(Point, u64, Fixture)] =
+            &[$((Point::$point, $nth, $fixture)),*];
+    };
 }
 
 scenarios! {
@@ -1166,6 +1240,141 @@ scenarios! {
     superseding_before_commit_mid => PublishDestinationBeforeCommit: 3, SUPERSEDING;
     superseding_after_commit_mid => PublishDestinationAfterCommit: 9, SUPERSEDING;
     superseding_receive_after_end_mid => ReceiveAfterEnd: 8, SUPERSEDING;
+}
+
+/// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.
+const SWEEP_ENV: &str = "BULKLOAD_CRASH_SWEEP";
+/// How many points the sweep runs at a time (default: a quarter of the
+/// cores; each run writes and copies the 64 MiB fixture).
+const SWEEP_JOBS_ENV: &str = "BULKLOAD_CRASH_SWEEP_JOBS";
+/// No point of this fixture is hit this often; a sweep still crashing here
+/// has lost its end.
+const SWEEP_LIMIT: u64 = 4096;
+/// A point's sweep stops after this many failed hits, so a hang at every
+/// hit cannot hold the sweep for hours.
+const SWEEP_FAILURES_PER_POINT: usize = 3;
+
+/// One row per point of the `scenarios!` table: its fixture and the largest
+/// `nth` the table pins. A point always runs against one fixture.
+fn sweep_rows() -> Vec<(Point, Fixture, u64)> {
+    let mut rows: Vec<(Point, Fixture, u64)> = Vec::new();
+    for (point, nth, fixture) in SCENARIOS {
+        if let Some(row) = rows.iter_mut().find(|row| row.0 == *point) {
+            assert_eq!(
+                row.1.refused,
+                fixture.refused,
+                "{}: one fixture per point",
+                point.name()
+            );
+            row.2 = row.2.max(*nth);
+        } else {
+            rows.push((*point, *fixture, *nth));
+        }
+    }
+    rows
+}
+
+/// The crash sweep (deep tier, `just crash-sweep`; never a PR gate): for
+/// every point of the `scenarios!` table, a crash at every hit `nth = 1, 2,
+/// ...` of one copy of the fixture, each followed by the resume and the same
+/// I1 to I4 and convergence checks as the pinned scenarios. A point's sweep
+/// ends at the first `nth` the copy does not reach, which counts its hits;
+/// the count must cover every `nth` the table pins. As in the pinned
+/// scenarios, `nth > 1` runs with one file per commit group.
+///
+/// Without [`SWEEP_ENV`] this only checks the table's shape, so the PR gate
+/// keeps the sweep's rows well-formed without running it. The git ingest
+/// points have their own table and are not swept here.
+#[test]
+fn crash_sweep_every_point_and_nth() {
+    let rows = sweep_rows();
+    assert!(
+        !rows.is_empty() && rows.iter().all(|row| row.2 >= 1),
+        "the sweep reads one row per point of the scenarios table"
+    );
+    if std::env::var_os(SWEEP_ENV).is_none_or(|value| value != "1") {
+        eprintln!(
+            "crash sweep skipped ({} points): set {SWEEP_ENV}=1, or run just crash-sweep",
+            rows.len()
+        );
+        return;
+    }
+    let jobs = std::env::var(SWEEP_JOBS_ENV)
+        .ok()
+        .and_then(|jobs| jobs.parse::<usize>().ok())
+        .filter(|jobs| *jobs > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map_or(1, |cores| (cores.get() / 4).max(1))
+        });
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let failures = std::sync::Mutex::new(Vec::<String>::new());
+    let counts = std::sync::Mutex::new(Vec::<(Point, u64, u64)>::new());
+    std::thread::scope(|scope| {
+        for _ in 0..jobs.min(rows.len()) {
+            scope.spawn(|| {
+                while let Some((point, fixture, pinned)) =
+                    rows.get(next.fetch_add(1, Ordering::SeqCst)).copied()
+                {
+                    let mut failed = 0;
+                    let mut hits = 0;
+                    for nth in 1..=SWEEP_LIMIT {
+                        let run = std::panic::catch_unwind(|| {
+                            crash_resume_if_reached(point, nth, fixture)
+                        });
+                        match run {
+                            Ok(true) => hits = nth,
+                            Ok(false) => break,
+                            Err(panic) => {
+                                hits = nth;
+                                failed += 1;
+                                let message = panic
+                                    .downcast_ref::<String>()
+                                    .map(String::as_str)
+                                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                                    .unwrap_or("a panic without a message");
+                                failures
+                                    .lock()
+                                    .unwrap()
+                                    .push(format!("{}:{nth}: {message}", point.name()));
+                                if failed == SWEEP_FAILURES_PER_POINT {
+                                    failures.lock().unwrap().push(format!(
+                                        "{}: sweep stopped after {failed} failures",
+                                        point.name()
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    println!(
+                        "crash-sweep: {} hits={hits} pinned_max={pinned}",
+                        point.name()
+                    );
+                    counts.lock().unwrap().push((point, hits, pinned));
+                }
+            });
+        }
+    });
+    let counts = counts.into_inner().unwrap();
+    let failures = failures.into_inner().unwrap();
+    let runs: u64 = counts.iter().map(|(_, hits, _)| hits).sum();
+    println!(
+        "crash-sweep: {} points, {runs} crashes, {} failures, {jobs} at a time",
+        counts.len(),
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "crash sweep failures:\n{}",
+        failures.join("\n")
+    );
+    for (point, hits, pinned) in counts {
+        assert!(
+            hits >= pinned && hits < SWEEP_LIMIT,
+            "{}: the sweep counted {hits} hits; the table pins {pinned}",
+            point.name()
+        );
+    }
 }
 
 #[test]
@@ -1644,26 +1853,12 @@ fn assert_no_victim_ledger_row(mutation: Mutation) {
     assert_no_chunk_bytes(&format!("{label} source"), &scratch.source_state());
 }
 
-#[test]
-fn live_writer_in_place_overwrite_refuses() {
-    live_writer(Mutation::InPlaceOverwrite);
-}
-
-#[test]
-fn live_writer_truncate_refuses() {
-    live_writer(Mutation::Truncate);
-}
-
-#[test]
-fn live_writer_rename_replace_refuses() {
-    live_writer(Mutation::RenameReplace);
-}
-
-#[test]
-fn live_writer_same_size_mtime_restored_refuses() {
-    live_writer(Mutation::SameSizeMtimeRestored);
-}
-
+// One run per mutation. Each test below calls `live_writer(mutation)` first,
+// so it asserts the typed refusal, the clean destination and the empty chunk
+// stores before its own ledger checks. The four `live_writer_*_refuses`
+// tests ran exactly that call and nothing else; OI-1003-Q81 retired them as
+// duplicates (property-test plan, retire list A).
+//
 // R-N86, formerly four known violations: the source committer appended each
 // captured chunk to `chunks.pack` before the capture's final stat check, so a
 // refused capture left its bytes in the pack, unindexed. W4 PR 2 removes the
