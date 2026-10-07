@@ -3,7 +3,9 @@
 Rulings: OI-1003-Q96 (hermetic rig), OI-1003-Q97 (gate of record),
 OI-1003-Q99 (gated gate (a) on mbp-13), OI-1002-Q30, R-N81, R-N13. The
 rulings are recorded on TIN-4543 (comment of 2026-10-07 about 02:10 EDT).
-Branch `feat/s1-hermetic-rig-20261007`, from main `3931471`. No PR opened.
+Branch `feat/s1-hermetic-rig-20261007`, from main `3931471`, merged with
+main `95f43dc`. Commits `9d01b68`, `ef3fd75`, merge `3e7b5bf`, then the
+evidence commit. No PR opened.
 
 ## What changed
 
@@ -47,7 +49,8 @@ Branch `feat/s1-hermetic-rig-20261007`, from main `3931471`. No PR opened.
 
 ## Validation
 
-- `just check-fast` in `nix develop`, on sting: exit 0.
+- `just check-fast` in `nix develop`, on sting: exit 0 at `9d01b68`,
+  `ef3fd75`, the merge `3e7b5bf` and the evidence commit.
 - `python3 crates/bulkload-bench/scripts/test_r23_ab.py`: 55 tests pass
   (it is in `check-optional`, not `check-fast`).
 
@@ -73,11 +76,51 @@ default, the flake-pinned `nixpkgs#rclone`, resolved to v1.74.4 on mbp-13.
   A `7c3ecc714e38` sha256 `94ab3dd4304a0a6b...`, v4 `41bf9a4fa233` sha256
   `a5acdebb85ef9374...`.
 
-## The gated sample
+## The gated sample (one sample, 2026-10-07 06:52Z to 06:56Z)
 
-See the section added after the run.
+**Verdict as printed: `status=complete-draft-no-a-control gate=FAIL (NO A CONTROL)`.**
+It is a B/B/B sample without its A control, so it is reported, not a gate
+verdict of record (see Open). Nothing was tuned and nothing was rerun.
+
+- B = `3e7b5bf` (this branch after merging main `95f43dc`). `git diff
+  origin/main 3e7b5bf -- crates/bulkload-agent crates/bulkload-proto` is
+  empty; the tree ids match (`45e81a4d` and `29be8d7b`).
+- Host: mbp-13, Linux 6.19.5-11 x86_64, MacBookPro12,1, i7-5557U, 4 cores,
+  15.3 GiB, XFS, power probe sysfs (`ADP1` online, `BAT0` Full). Every row
+  `power=ac gated=true`; load1 before the reps 2.03, 1.87, 1.82, 1.78.
+- rclone: flake-pinned `/nix/store/v5xbkynmfg8ml23d82m09s802nmj2r6f-rclone-1.74.4/bin/rclone`, v1.74.4.
+- Bench priority `background`, durability `group`. The run was started
+  under `nice -n 10`, which both arms inherit.
+- Corpus v1 verified before and after, identity `f4a7619f...`.
+
+| B rep | verdict | initial native / rclone ms | delta native / rclone ms | warm zero | interrupted zero | native peak RSS |
+|---:|---|---:|---:|---|---|---:|
+| 0 | fail | 872.965 / 367.993 | 132.117 / 115.670 | true | true | 48.9 MiB |
+| 1 | fail | 914.173 / 361.784 | 135.596 / 105.634 | true | true | 50.0 MiB |
+| 2 | fail | 854.826 / 358.996 | 141.215 / 105.065 | true | true | 49.3 MiB |
+
+- Median of the rep medians: initial 872.965 ms native against 361.784 ms
+  rclone (2.41 times slower); delta 135.596 ms against 105.634 ms (1.28
+  times slower).
+- Warm resume and interrupted resume: 0 bytes received and 0 source bytes
+  read in every rep.
+- Seal time (the sum of `flush_*_ns`) is 64 % of the native initial wall time
+  (median share 0.639).
+- v4 reference (behind the pmset translator): 1,174.875 ms initial,
+  219,946,368 bytes received; B's duplicate share is 0.0829.
+- Evidence: `docs/evidence/r23-2026-10-07-0652Z-no-a-control.json` (sha256
+  `9f53da43...`, byte-identical to the host's `r23-ab.json`) and `.md`.
+  Raw record on mbp-13: `~/git-bulkload/runs/r23-ab-20261007-gate-a/` and
+  `~/git-bulkload/logs/r23-ab-20261007-gate-a.log`.
+- Also on mbp-13, not samples: `runs/dryrun-9d01b68` (a dry run, aborted
+  when A refused), `runs/diag-baselines` (the A and v4 check) and
+  `prep.sh`, `smoke.sh`, `diag.sh`, `gate-a.sh`. The smoke script stopped
+  at the dry run, so the A-behind-the-translator check never ran on a real
+  A binary; the translator did run for v4 in the sample.
 
 ## Open
+
+- Not posted to TIN-4543 by this lane; the coordinator owns that comment.
 
 - Operator: the A control on the rig. Accept B/B/B, pin a newer A that
   runs on Linux, or record a refused A rep without aborting.
