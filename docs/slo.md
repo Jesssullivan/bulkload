@@ -572,6 +572,17 @@ open.
   gated mode, a `record` rig, the A control, a completed sample and no
   rclone override. On a rig of record the A control must be the pinned
   commit, or the gated sample is refused.
+- **The first sample under this pin.** 2026-10-07 14:10Z, mbp-13, gated,
+  B/A/B/A/B, B `adfdf57` (agent and proto equal to main `8006085`), A
+  `3931471`, the pinned rclone. Printed verdict: `FAIL`, `of_record=true`,
+  0 of 3 B reps pass (every B rep: `r23_initial_win` and `r23_delta_win`
+  false, both R25 zero checks and RSS true). B's medians: initial 856.695 ms
+  native against 374.447 ms rclone, delta 140.475 ms against 107.739 ms.
+  A's two reps: native initial rep medians 866.452 and 907.211 ms. A's
+  series on this rig starts here.
+  [evidence/r23-2026-10-07-1410Z-mbp-13-record.md](evidence/r23-2026-10-07-1410Z-mbp-13-record.md).
+  Open question 2 of the second amendment (flushed native against unflushed
+  rclone) bears on how to read it.
 - Runbook: [plans/2026-10-07-s1-hermetic-rig.md](plans/2026-10-07-s1-hermetic-rig.md),
   sections 3 and 5.
 
