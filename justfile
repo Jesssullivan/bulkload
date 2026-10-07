@@ -217,7 +217,8 @@ bench-io-chunker:
     cd {{ root }} && cargo test --release -p bulkload-agent --lib --locked io::chunker::tests::chunker_micro_bench -- --ignored --nocapture --test-threads=1
 
 # bulkload-bench built at --rev-b (origin/main, the candidate) and --rev-a
-# (7c3ecc7, informational), each rep the full R23 bench with the rclone
+# (informational: the rig's pinned A on a rig of record, OI-1003-Q103; else
+# 7c3ecc7), each rep the full R23 bench with the flake-pinned rclone
 # baseline, plus one v4 (41bf9a4) native rep for dedup loss. B passes R23
 # iff every B rep's verdict passes. Gated runs only on neo, AC power, load1 < 2.5,
 # lanes quiet (R-N81, R-N91); --dry-run makes a synthetic corpus and is NOT a
@@ -327,7 +328,7 @@ props-deep:
     set -euo pipefail
     cd {{ root }}
     export BULKLOAD_PROPTEST_DEEP=1
-    cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained
+    cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained --skip an_old_format_capture_of_65536_refs_imports_like_the_new_format
     log=$(mktemp "${TMPDIR:-/tmp}/props-deep.XXXXXX")
     trap 'rm -f "$log"' EXIT
     row() {
@@ -356,9 +357,10 @@ props-deep:
         fi
     }
     row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib
+    row git_carry::refs_scale_tests::an_old_format_capture_of_65536_refs_imports_like_the_new_format 'REFS-SCALE row=old-65536 refs=' --lib
     row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct
     row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct
-    echo "props-deep: the workspace and all 3 deep rows ran"
+    echo "props-deep: the workspace and all 4 deep rows ran"
 
 # Deep tier, on demand, never a PR gate: the W7 crash sweep. For every point
 # of the fault harness's `scenarios!` table it crashes one copy at every hit

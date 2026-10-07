@@ -351,7 +351,242 @@ as properties.
   record naming a code that has left the taxonomy stays unaccounted
   (`refusal-code-retired`); no disposition or attestation closes it.
 
-## Amendment 2026-10-07: S3 inequalities 1 and 2 on the file transfer (#186, #187)
+## Amendment 2026-10-07: the hermetic rig is S1's gate of record (OI-1003-Q96, Q97)
+
+- **Why.** neo and sting are live, busy hosts. R-N81's gate (AC power, load1
+  below 2.5) almost never opens on them: from 2026-10-03 to 2026-10-07 every
+  gated gate (a) attempt on neo was refused or aborted, on load or on
+  battery power. A gate that
+  cannot be sampled proves nothing.
+- **The gate of record (OI-1003-Q97).** S1 gates (a) and (b) are decided on
+  the hermetic rig, on the sealed corpus. Nothing else in S1 changes: gate
+  (a) is still B/A/B/A/B with all three B reps passing (OI-1002-Q30), R-N81
+  holds before every rep and every arm, and gate (b) keeps the protocol
+  ratified in OI-1003-Q82 and Q89.
+- **Hosts and roles (OI-1003-Q96).**
+
+  | Host | Platform | Role |
+  |---|---|---|
+  | mbp-13 | Linux x86_64, 4 cores, 16 GB, XFS | Gate (a), local copy. Destination of both gate (b) runs. |
+  | yoga | Linux x86_64, 8 cores, 16 GB | Gate (b) source, Linux to Linux. |
+  | PZM | macOS arm64 | Gate (b) source, macOS to Linux, mirroring neo to sting. |
+
+  Every rig file lives under one bounded directory, `~/git-bulkload/`, on
+  each host: the clone, the builds, the sealed corpus and all run output.
+- **The sealed corpus.** Gate (a) runs on R23 corpus v1 (OI-1002-Q28):
+  23 regular files, 239,819,837 bytes, content identity
+  `f4a7619f7b88f2e0e1eeadb5995c79a809eafa8b4a8cf3f82d1ff6f29b5b07c7`,
+  generated on the host by `r23_corpus.py`, verified and sealed read-only.
+  The harness refuses any other corpus in gated mode. The estate-shaped
+  class of OI-1003-Q19 is unchanged and still owed.
+- **Power on Linux.** R-N81 is not weakened. On Linux the bench and the
+  harness read `/sys/class/power_supply`: `ac` only when a `Mains` supply is
+  online, or when the host has no battery at all; a battery with no mains
+  online is `battery`; an unreadable class is `unknown`. Only `ac` opens the
+  gate. The exact rule is on `linux_power` in `bulkload-bench` and
+  `r23_ab.py`.
+- **The baseline arm on Linux.** The pinned baselines (A `7c3ecc7`, v4
+  `41bf9a4`) only know `pmset`. They are built at their exact sha, unpatched,
+  and run with a translator named `pmset` first on PATH that reports the
+  Linux power state in pmset's words. B never runs behind it. A stays
+  informational and the verdict rule is unchanged.
+- **Open: the A control on the rig.** On mbp-13 the pinned A fails on its
+  own, before any power check matters: its copy refuses with `IO (errno
+  32)` every time on the dry-run corpus and in one of three native-only runs
+  on corpus v1 (2026-10-07, see the lane's agent note). A gated sample
+  aborts when any rep is refused, so B/A/B/A/B cannot be relied on to
+  complete there. Until the operator rules, `r23_ab.py
+  --b-only-no-a-control` runs B/B/B under every other gated check and marks
+  its verdict `(NO A CONTROL)`. Such a sample is reported; it is not a gate
+  verdict of record. The operator's choices: accept B/B/B on the rig, pin a
+  newer A that runs on Linux, or let a refused A rep be recorded without
+  aborting, as OI-1003-Q50 does under load.
+- **Every sample names its rig.** The report records the platform, kernel,
+  machine, CPU model, core count, RAM and the filesystem type of the work
+  root, so a sample from one rig is never read as another's.
+- **Field confirmation.** A neo to sting run (gate (a) on neo, gate (b) as a
+  neo to sting pull) is a field confirmation. It is run when the hosts
+  allow, on the same corpus and harness, and it is reported beside the rig
+  verdict. It never decides S1, in either direction: a field pass does not
+  rescue a rig fail, and a field fail does not revoke a rig pass. A field
+  fail is filed as an issue and explained.
+- **What the rig does not cover.**
+  - macOS code paths on gate (a). Gate (a) on the rig is Linux only until
+    PZM has room for the corpus and five destination copies (it has about
+    13 GB free). Until then, macOS local-copy performance is covered only by
+    a field confirmation on neo.
+  - APFS and the TinylandState volume. The rig's work root is XFS on
+    mbp-13's internal SSD.
+  - Tailscale link variance. The rig's hosts are quiet and close; the
+    neo to sting link's jitter and tailscaled CPU cost (see
+    `docs/evidence/m0-2026-09-23.md`) are seen only in a field confirmation.
+  - Estate scale and live-host pressure. `--under-load` samples stay
+    informational (OI-1003-Q39).
+- Runbook: [plans/2026-10-07-s1-hermetic-rig.md](plans/2026-10-07-s1-hermetic-rig.md).
+
+## Amendment 2026-10-07 (later): corrections to the hermetic rig amendment (OI-1003-Q96, Q97)
+
+These come from the review of the amendment above, which is left as
+written. Where the two differ, this section is right. Nothing here changes
+a ratified number or rule; what needs the operator is listed at the end.
+
+- **mbp-13 is 2 cores and 4 threads.** The i7-5557U has 2 physical cores
+  with 2 threads each. "4 cores" in the hosts table counted logical CPUs,
+  because the harness printed `os.cpu_count()` as cores. The report now
+  records `cpu_physical_cores` and `cpu_logical` separately. yoga's "8
+  cores" was counted the same way and has not been probed again.
+- **R-N81 is unchanged in text, but looser in effect on this rig.** The
+  load bound is an absolute load1 below 2.5. It is not scaled to a rig's
+  core count. On a 2-core host, 2.5 is more than every physical core busy,
+  so the same number admits more on mbp-13 than it does on neo. The one
+  sample so far shows it: the harness compiled B inside the sample for
+  2 m 54 s, rep 0 began seconds later at load1 2.03, and the three B reps
+  ran at 1.8 to 2.0 on a host that idles at 0.00 to 0.10. Both arms of each
+  rep shared that state, so the 2.4 times FAIL is unlikely to turn on it; a
+  close result would. Since then the harness records load1 right after the
+  builds, how long it waited and the reading that admitted rep 0, and
+  names every revision compiled inside the sample; `--build-only` prebuilds
+  so that none is, and the runbook requires it. The bound itself is not
+  changed here.
+- **The rig is asserted, not only recorded.** `RIG_OF_RECORD` in
+  `r23_ab.py` is the committed list of gate-of-record hosts for gate (a):
+  mbp-13, pinned to Linux, x86_64 and its product name. A sample from a
+  listed host has `rig_role=record`; from any other host, `rig_role=field`.
+  The status line, the evidence title, the verdict line and the default
+  evidence file name all carry the rig and its role. `of_record=true` needs
+  gated mode, a `record` rig, the A control and a completed sample. A gated
+  sample is refused when an identity field cannot be read, when a host has
+  a listed name but not the listed identity, or when its evidence file name
+  lacks the rig's name. A field sample therefore cannot be read as the S1
+  verdict, and a rig sample cannot be read as a field one.
+- **B/B/B is weaker than B/A/B/A/B, and says so in one word.** The
+  ratified order has never completed on the rig, and the A-behind-translator
+  path has never run against a real A binary there. In B/B/B the three B
+  reps run back to back (33 s in the one sample), so "all three B reps
+  pass" would be three readings of one host moment, with no baseline rep to
+  show the rig was behaving normally. Its verdict is now the single token
+  `PASS-NO-A-CONTROL` or `FAIL-NO-A-CONTROL`, with `of_record=false`. It
+  stays reported only. A's `IO (errno 32)` on Linux is not diagnosed, so it
+  is not shown to be absent from B.
+- **What the rig does not cover: additions.**
+  - *The seal is a different operation on each platform.* In group mode the
+    native arm seals each file with `fsync` on Linux
+    (`durable::seal_file`), which makes data and metadata durable and, on
+    XFS, flushes the device write cache. On macOS it uses `F_BARRIERFSYNC`,
+    which orders the writes without that flush. (The io layer's own
+    `sys::barrier` on Linux is `fdatasync`; the group seal does not use it,
+    so a later `fchmod` is durable with the data.) The rclone arm is run
+    with no sync flag on either platform. So gate (a) on the rig compares a
+    flushed native copy with an unflushed rclone copy, and the native arm
+    pays more for its seal there than on neo. In the one sample, seal time
+    is 64 % of the native initial wall time, and rclone's 362 ms for 240 MB
+    is a page-cache copy. The rig verdict is not the same test as gate (a)
+    on neo: a rig fail beside a field pass could be this difference alone.
+    The bench header now prints `seal_primitive`, and the evidence names
+    it.
+  - *The rig's hardware class.* Two physical cores carry rclone's four
+    transfers and the native workers. A result here is a result for a
+    2-core laptop of 2015.
+  - *A load bound scaled to the rig.* See the R-N81 bullet above.
+- **For the operator.** Each of these needs a ruling; none is assumed.
+  1. Does the rig need a tighter load bound than 2.5 (for example one
+     scaled to physical cores), or a required quiet period after a build?
+  2. Is gate (a) on Linux meant to compare a flushed native copy with an
+     unflushed rclone copy?
+  3. The A control on the rig, as asked above. If B/B/B is accepted, should
+     the B reps be spaced (a v4 or rclone-only rep between them)?
+
+## Amendment 2026-10-07 (third): the rig's A control and its rclone (OI-1003-Q103, Q105)
+
+The operator ruled on question 3 of the section above (OI-1003-Q103) and on
+the rig's rclone (OI-1003-Q105). The verdict rule does not change: B passes
+R23 if and only if every B rep's bench verdict passes, and A is
+informational (OI-1002-Q30). Questions 1 and 2 of that section are still
+open.
+
+- **The rig pins a newer A, and keeps B/A/B/A/B (OI-1003-Q103).** On mbp-13
+  the A control is `3931471738cc3995a0e564e73af3134d7a7f1ff2`: main at the
+  merge of #195, the last main commit before the rig work of 2026-10-07. It
+  is `RIG_BASELINE_A` in `r23_ab.py`, pinned 2026-10-07. Every other host
+  keeps `7c3ecc7`. B/B/B (`--b-only-no-a-control`) is no longer how the rig
+  samples.
+- **What A is for on the rig.** A is a fixed commit run between the B reps.
+  B changes with main and A does not, so a change in A's numbers, inside a
+  sample or between samples, is a change in the rig. A shows drift of the
+  rig. It is not a comparison of old code with new, and it never decides
+  the gate. When the pin changes, A's numbers on either side are different
+  series.
+- **Why `7c3ecc7` could not be that control, measured.** Native-only runs on
+  mbp-13, 2026-10-07, each a full native bench (initial copy, warm resume,
+  interrupted resume, delta). "Refused" means the bench ended with a bare
+  `IO (errno 32)`, which is EPIPE.
+
+  | Bench built at | Corpus v1: refused / runs | Dry-run corpus: refused / runs |
+  |---|---:|---:|
+  | `7c3ecc7`, the old A | 4 / 15 | 15 / 15 |
+  | `41bf9a4`, v4 | 0 / 15 | 0 / 15 |
+  | `3931471`, the new A | 0 / 24 | 0 / 24 |
+  | `5875610`, main on 2026-10-07 | 0 / 12 | 0 / 12 |
+
+  Twelve of the new A's runs on each corpus were R-N81 gated behind the
+  `pmset` translator, as an A rep runs; the rest, and every other row, were
+  `--informational`. The host was not quiet throughout: the runs were back
+  to back (load1 0.3 to 2.3), and another lane's build and measurements
+  overlapped some of them (load1 up to 4.6). So the zeroes were measured
+  under more pressure than a gated sample allows, not less.
+- **What that says about #201.** Issue #201 is `transfer::copy` returning a
+  bare EPIPE now and then on current main, seen on sting under a load of 80
+  to 113. It did not occur on mbp-13 on current main in 24 runs (12 on each
+  corpus). The old
+  A's failure is not that rare race: it is every run on the dry-run corpus.
+  It also reproduces off the rig, on sting, when the bench is held to two
+  CPUs, and the new A does not (0 of 40 there). So something between
+  `7c3ecc7` and `3931471` fixed it. It is the same symptom as #201 and may
+  share its cause; #201 stays open, and the rig has not shown it. If a B
+  rep ever refuses with `IO (errno 32)`, the sample aborts with no verdict
+  and the refusal goes on #201.
+- **A's power preflight.** No commit on main reads Linux power itself until
+  the rig lane (#204) merges, so the new A runs behind the `pmset`
+  translator of the first amendment, like v4. B never does.
+- **The rig's rclone is the flake-pinned build (OI-1003-Q105).** Every
+  sample on every host runs the rclone that the repo's `flake.lock` pins
+  (`nix build --inputs-from <repo> nixpkgs#rclone`). Today that is `rclone
+  v1.74.4`, nixpkgs `241313f4e8e508cb9b13278c2b0fa25b9ca27163`, store path
+  `/nix/store/v5xbkynmfg8ml23d82m09s802nmj2r6f-rclone-1.74.4` on
+  `x86_64-linux` and `/nix/store/5aw5dn7z12pnwjp1yghg9xar9bcl21fk-rclone-1.74.4`
+  on `aarch64-darwin` (evaluated, not yet built by a rig lane). `RCLONE_PIN`
+  in `r23_ab.py` records it.
+  - A gated or under-load sample refuses any other rclone binary. A
+    deliberate exception takes `--rclone-override-reason`; it is recorded,
+    its verdict is `PASS-RCLONE-OVERRIDE` or `FAIL-RCLONE-OVERRIDE`, and it
+    is never of record.
+  - A gated sample is refused when the flake resolves to a build other than
+    `RCLONE_PIN`. A version bump is therefore a deliberate, recorded change:
+    `flake.lock`, `RCLONE_PIN` and a dated line here, in one change. Samples
+    on either side of a bump are not one series.
+  - Every report records the rclone's store path, version, binary sha256
+    and the flake's nixpkgs revision, and says whether they match the pin.
+    A rep whose bench header names another version aborts the sample.
+  - This is the build the 06:52Z sample already used; no number changes.
+- **`of_record` now also needs the pinned rclone.** `of_record=true` needs
+  gated mode, a `record` rig, the A control, a completed sample and no
+  rclone override. On a rig of record the A control must be the pinned
+  commit, or the gated sample is refused.
+- **The first sample under this pin.** 2026-10-07 14:10Z, mbp-13, gated,
+  B/A/B/A/B, B `adfdf57` (agent and proto equal to main `8006085`), A
+  `3931471`, the pinned rclone. Printed verdict: `FAIL`, `of_record=true`,
+  0 of 3 B reps pass (every B rep: `r23_initial_win` and `r23_delta_win`
+  false, both R25 zero checks and RSS true). B's medians: initial 856.695 ms
+  native against 374.447 ms rclone, delta 140.475 ms against 107.739 ms.
+  A's two reps: native initial rep medians 866.452 and 907.211 ms. A's
+  series on this rig starts here.
+  [evidence/r23-2026-10-07-1410Z-mbp-13-record.md](evidence/r23-2026-10-07-1410Z-mbp-13-record.md).
+  Open question 2 of the second amendment (flushed native against unflushed
+  rclone) bears on how to read it.
+- Runbook: [plans/2026-10-07-s1-hermetic-rig.md](plans/2026-10-07-s1-hermetic-rig.md),
+  sections 3 and 5.
+
+## Amendment 2026-10-07 (fourth): S3 inequalities 1 and 2 on the file transfer (#186, #187)
 
 This records what the code now does under the rulings above (OI-1003-Q6,
 Q10, Q18). It changes no number and no ruling.
@@ -425,7 +660,7 @@ Q10, Q18). It changes no number and no ruling.
     (`docs/formal/README.md`, "What the #187 review added to the code and
     not to the model").
 
-## Amendment 2026-10-07 (later): the superseding publish is ruled and modelled (OI-1003-Q100, Q101, Q102)
+## Amendment 2026-10-07 (fifth): the superseding publish is ruled and modelled (OI-1003-Q100, Q101, Q102)
 
 Operator rulings of 2026-10-07 on #187 and its review. They supersede three
 statements of the amendment above: "Whether such destinations need a

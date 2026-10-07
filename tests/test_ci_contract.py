@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "2f3d115f5011c6be4c6181924ab8ebeb05ef8381f5b80d1d30ba10cc12f75c10"
+WORKFLOW_SHA256 = "7b8d63cc2b6075bfef24abcb99bf899e090e01a95e7d8f2c7bc79c1e4c63120f"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -58,14 +58,17 @@ EXPECTED_SHA_EXPRESSION = (
     "github.event_name == 'merge_group' && "
     "github.event.merge_group.head_sha || github.sha }}"
 )
-# The audited trigger inventory (R-N124): main pushes and release tags, pull
-# requests, and the main merge queue. Nothing else may start CI.
+# The audited trigger inventory (R-N124): release tags, pull requests, and
+# the main merge queue. Nothing else may start CI. OI-1003-Q111 (2026-10-07)
+# dropped main pushes: the ruleset's strict status-check policy merges a PR
+# only when it is up to date with main, so the merged tree is the tree its
+# own run tested, and a main run repeated it on the two shared runners.
 WORKFLOW_TRIGGERS = (
     "on:\n"
     "  push:\n"
-    "    branches: [main]\n"
     '    tags: ["v*"]\n'
     "  pull_request:\n"
+    "    types: [opened, synchronize, reopened, ready_for_review]\n"
     "  merge_group:\n"
     "    types: [checks_requested]\n"
     "\n"
@@ -82,9 +85,12 @@ HEAD_REPOSITORY_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name || github.repository }}"
 )
+# A draft pull request runs no gate (OI-1003-Q111); marking it ready for
+# review (ready_for_review) starts its run.
 SAME_REPOSITORY_GUARD = (
     "${{ github.event_name != 'pull_request' || "
-    "github.event.pull_request.head.repo.full_name == github.repository }}"
+    "github.event.pull_request.head.repo.full_name == github.repository "
+    "&& !github.event.pull_request.draft }}"
 )
 UPLOAD_EXPRESSION = (
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
@@ -312,7 +318,7 @@ PINNED_JUST_RECIPES = {
             "set -euo pipefail",
             "cd {{ root }}",
             "export BULKLOAD_PROPTEST_DEEP=1",
-            "cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained",
+            "cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained --skip an_old_format_capture_of_65536_refs_imports_like_the_new_format",
             'log=$(mktemp "${TMPDIR:-/tmp}/props-deep.XXXXXX")',
             "trap 'rm -f \"$log\"' EXIT",
             "row() {",
@@ -341,9 +347,10 @@ PINNED_JUST_RECIPES = {
             "    fi",
             "}",
             "row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib",
+            "row git_carry::refs_scale_tests::an_old_format_capture_of_65536_refs_imports_like_the_new_format 'REFS-SCALE row=old-65536 refs=' --lib",
             "row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct",
             "row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct",
-            'echo "props-deep: the workspace and all 3 deep rows ran"',
+            'echo "props-deep: the workspace and all 4 deep rows ran"',
         ),
     ),
     "crash-sweep": (
@@ -501,6 +508,7 @@ def validate_rust_test_groups(justfile: str) -> None:
 # really ran (R-N122).
 DEEP_ROWS = (
     "row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib",
+    "row git_carry::refs_scale_tests::an_old_format_capture_of_65536_refs_imports_like_the_new_format 'REFS-SCALE row=old-65536 refs=' --lib",
     "row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct",
     "row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct",
 )
@@ -509,7 +517,8 @@ PROPS_DEEP_REQUIRED = (
     "cargo test --workspace --locked -- "
     "--skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed "
     "--skip distinct_heavy_32768_refs_import_linearly_and_chain_thin "
-    "--skip distinct_heavy_110000_refs_chain_falls_back_self_contained",
+    "--skip distinct_heavy_110000_refs_chain_falls_back_self_contained "
+    "--skip an_old_format_capture_of_65536_refs_imports_like_the_new_format",
     '    cargo test -p bulkload-agent --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee "$log" || status=$?',
     "    if [[ $status -ne 0 ]]; then",
     "    if grep -q 'skipped: set ' \"$log\"; then",
@@ -2631,8 +2640,12 @@ class CiContractTest(unittest.TestCase):
             self.workflow.replace(queue, queue + "  workflow_dispatch:\n", 1),
             self.workflow.replace(queue, queue + "  pull_request_target:\n", 1),
             self.workflow.replace(
-                "    branches: [main]\n", "    branches: ['**']\n", 1
+                '    tags: ["v*"]\n', '    branches: [main]\n    tags: ["v*"]\n', 1
             ),
+            self.workflow.replace(
+                "    types: [opened, synchronize, reopened, ready_for_review]\n", "", 1
+            ),
+            self.workflow.replace(" && !github.event.pull_request.draft }}", " }}", 1),
             self.workflow.replace(
                 "github.event_name == 'merge_group' && "
                 "github.event.merge_group.head_sha || ",

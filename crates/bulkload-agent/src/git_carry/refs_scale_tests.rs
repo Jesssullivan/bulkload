@@ -801,8 +801,21 @@ fn a_sha256_repository_restores_exactly_in_either_format() {
 /// Old-format compatibility at a size the old import could not fetch: 65,536
 /// refs, whose refspecs no longer fit one argv. The old format's header is
 /// under the cap, and it imports to exactly the refs the new format does.
+/// A deep row (`BULKLOAD_PROPTEST_DEEP=1`, `just props-deep`): at 80 s it was
+/// the longest test of the PR gate's library run, which is the source gate's
+/// critical path, so OI-1003-Q110 moved it out. The PR gate keeps old-format
+/// import correctness in
+/// [`a_capture_written_by_the_old_binary_imports_exactly`]; what only this
+/// row covers is the argv-splitting of a refs-heavy old-format import.
 #[test]
 fn an_old_format_capture_of_65536_refs_imports_like_the_new_format() {
+    if !crate::test_support::deep() {
+        eprintln!(
+            "REFS-SCALE row=old-65536 skipped: set {}=1",
+            crate::test_support::DEEP
+        );
+        return;
+    }
     let shape = Shape {
         commits: 500,
         annotated: 40,
