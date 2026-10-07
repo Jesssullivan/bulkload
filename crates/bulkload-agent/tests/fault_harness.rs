@@ -1254,12 +1254,17 @@ const SWEEP_LIMIT: u64 = 4096;
 /// hit cannot hold the sweep for hours.
 const SWEEP_FAILURES_PER_POINT: usize = 3;
 
-/// One row per point of the `scenarios!` table: its fixture and the largest
-/// `nth` the table pins. A point always runs against one fixture.
+/// One row per point and kind of run of the `scenarios!` table: its fixture
+/// and the largest `nth` the table pins. A point runs against one fixture for
+/// a plain copy, and may also run in a superseding rerun (#187), which is
+/// swept as a row of its own.
 fn sweep_rows() -> Vec<(Point, Fixture, u64)> {
     let mut rows: Vec<(Point, Fixture, u64)> = Vec::new();
     for (point, nth, fixture) in SCENARIOS {
-        if let Some(row) = rows.iter_mut().find(|row| row.0 == *point) {
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|row| row.0 == *point && row.1.superseding == fixture.superseding)
+        {
             assert_eq!(
                 row.1.refused,
                 fixture.refused,
@@ -1347,8 +1352,13 @@ fn crash_sweep_every_point_and_nth() {
                         }
                     }
                     println!(
-                        "crash-sweep: {} hits={hits} pinned_max={pinned}",
-                        point.name()
+                        "crash-sweep: {}{} hits={hits} pinned_max={pinned}",
+                        point.name(),
+                        if fixture.superseding {
+                            "+superseding"
+                        } else {
+                            ""
+                        }
                     );
                     counts.lock().unwrap().push((point, hits, pinned));
                 }
