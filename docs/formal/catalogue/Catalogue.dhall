@@ -1473,7 +1473,7 @@ let invariants
         , ruling = [ "OI-1003-Q18", "R-N119" ]
         , codeSymbol =
           [ "publish_noreplace", "owned_output", "settle_supersedes" ]
-        , ptest = [ "P7", "P8", "P26", "P76" ]
+        , ptest = [ "P7", "P8", "P26", "P78" ]
         }
       , { tla = P.S2_TypedSourceAccess
         , slo = [ S.S2 ]
