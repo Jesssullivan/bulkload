@@ -354,16 +354,27 @@ again line by line, and all nine files were checked whole (`cargo fmt
     Validation.
 - Rulings cited: OI-1003-Q81, OI-1003-Q7, OI-1003-Q14, OI-1003-Q78, R-N13.
 
-## Recheck and ship (2026-10-07, 02:28 to 03:15 EDT)
+## Recheck and ship (2026-10-07, 02:28 to 03:25 EDT)
 
 The recheck stage read the diff `0493713..c0afc52` against the five medium
-findings and found each one fixed. It changed no code, recipe or pin.
+findings and found each one fixed. It changed no code, recipe or pin; it
+merged main twice and reworded comments and docs after #189 (below).
 
 - **Main moved.** `origin/main` went from `3931471` to `95f43dc` (#196: the S2
   wal-index counter, `tests/sqlite_wal_index.rs`) during the recheck. Merged
-  as signed merge commit `1e887a6`, no conflict. #189 was still open, so the
-  seed guard's ceilings and `tests/git_carry_v2.rs` are unchanged; Open 6
-  and Open 8 still stand.
+  as signed merge commit `1e887a6`, no conflict.
+- **Main moved again: #189 (Q42 L5) landed** (`a80c63b`). Merged as signed
+  merge commit `db6f1eb`. `prop_seed_guard.rs`, `fault_harness.rs` and the
+  justfile merged without conflict, and the guard's `EXEMPT` list and
+  ceilings are #189's (1 file, 7 findings). The plan conflicted in two
+  places; each line is the side that changed it, and P66, which both sides
+  changed, is #189's text with this lane's "240 cases from the same fixed
+  seed". The same commit rewords what this lane had written about the
+  random-seed property, now that its file is gone: AGENTS.md, the
+  `props-deep` comment, the helper's module doc and the plan say one
+  property is off the helper (`refusal_taxonomy`, its own fixed seed) and
+  that no property draws a random seed. **Open 6 is closed and Open 8 is
+  down to `refusal_taxonomy`**; the text of both above predates the merge.
 - **`just check-fast`** (TMPDIR `/dev/shm/ci-slim-tmp`, the lane's own
   `CARGO_TARGET_DIR`):
   - on `c0afc52`: exit=0, 02:28 to 02:31, load 42 → 39, 31 `test result: ok`
@@ -374,7 +385,11 @@ findings and found each one fixed. It changed no code, recipe or pin.
     flake on main under load; this lane does not touch `disposition`;
   - on `1e887a6`, second run: **exit=0**, 02:50 to 02:55, load 80 → 41, 32
     `test result: ok` lines, `rust-test: all 24 test executables ran, in 5
-    groups` (the new one is `sqlite_wal_index`), the contract test OK.
+    groups` (the new one is `sqlite_wal_index`), the contract test OK;
+  - on `db6f1eb` (the final code tree): **exit=0**, 03:14 to 03:22, load
+    30 → 28, 32 `test result: ok` lines, 736 passed and 13 ignored, `rust-test:
+    all 24 test executables ran, in 5 groups` (`git_carry_v2` left,
+    `git_estimate_shapes` came), the contract test's 24 tests OK.
 - **The refusing paths of both deep recipes were run**, which the fix round
   had not done. Each recipe body was copied to a scratch script
   (`/srv/cache/jess/ci-slim-mut/recheck`) with `cargo` replaced by a shell
@@ -398,8 +413,9 @@ findings and found each one fixed. It changed no code, recipe or pin.
     17 minutes. 27 results, all `ok`: lib 504 passed, 5 ignored, 1 filtered
     out; `refs_scale_distinct` 1 passed, 2 filtered out, so the three
     filters leave out exactly the three deep rows.
-  - The three rows were not run again after the merge; #196 does not touch
-    `git_carry`.
+  - Neither the three rows nor the deep workspace run was repeated on
+    `db6f1eb`. #196 does not touch `git_carry`; #189 deletes carry_v2 and
+    changes `git_carry/estimate.rs`, which the rows do not call.
 - **Still true:** `just props-deep` as one command has not been green from
   start to end in its new form. Every part of it has been, separately. On a
   loaded host it can fail on #201.
@@ -416,5 +432,6 @@ Open, added by the recheck:
     the test name before the row's output, so both deep recipes would refuse
     a run that really happened; they fail closed.
 
-Shas: `1e887a6` (merge of `95f43dc`), then this note's commit (`git log`).
+Shas: `1e887a6` (merge of `95f43dc`), `b7d1866` (this section's first form),
+`db6f1eb` (merge of `a80c63b`), then this note's last commit (`git log`).
 Rulings cited: OI-1003-Q81, OI-1003-Q7, OI-1003-Q14, OI-1003-Q78, R-N13.
