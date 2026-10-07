@@ -1,6 +1,6 @@
 //! P77 SOURCE-LOCK-TRACE (S2: never interrupt the source; OI-1003-Q5,
-//! OI-1003-Q9; the bounded `SQLite` exception OI-1003-Q16, OI-1003-Q36). A P34
-//! sibling.
+//! OI-1003-Q9; the bounded `SQLite` exception OI-1003-Q16, OI-1003-Q36,
+//! OI-1003-Q72; no `SQLite` source read as root, OI-1003-Q76). A P34 sibling.
 //!
 //! The `io-trace` recorder (R-N88) records only the agent's own mutating
 //! `io::sys` calls. It sees no `flock`, no `fcntl` lock, no open of any mode,
@@ -37,10 +37,26 @@
 //! own process (held), a v1 `export_repository` (held), an `estate::capture`
 //! of two repositories (held), a local `git-carry-estimate` of two
 //! repositories (held), and the `SQLite` backup against a writer process,
-//! idle and committing. Self-tests prove the lock table, the
+//! idle and committing, and against a closed WAL-mode database with no
+//! sidecar. Self-tests prove the lock table, the
 //! descriptor sample and the write watch each see what they claim on this
 //! kernel, and that the Git fixture's index is one an unhardened `git status`
 //! does rewrite.
+//!
+//! **The `SQLite` legs run one of two ways, and say which on stderr**
+//! ([`sqlite_leg`]). As an ordinary user they run the backup and hold it to
+//! the counted exception: the `-shm` (OI-1003-Q36,
+//! `source_wal_index_touched`) and an empty `-wal` only where none was
+//! (OI-1003-Q72, `source_wal_created`). As root (PR CI) the provider refuses
+//! to read a source at all (OI-1003-Q76): the bundled `SQLite` re-applies the
+//! database's owner to the `-wal` and `-shm` it opens when it runs as root,
+//! which moves their ctime, and this file's write watch reported exactly
+//! that as an `attrib` event on the `-wal` in CI. So as root each leg asserts
+//! the typed refusal `SQLITE_SOURCE_AS_ROOT` from all five provider verbs
+//! and that the refused calls left the source directory byte- and
+//! metadata-identical, with no write event and no lock
+//! ([`sqlite_source_read_is_refused_as_root`]). Neither run proves the
+//! other's half; no privilege is dropped or gained here.
 //!
 //! **Not covered here**, and so still open for S2's lock property:
 //! `estate::apply`, `git-carry-estimate` over ssh (the far host's probe),
@@ -74,7 +90,10 @@ use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
+use bulkload_agent::counters::{Counter, Counters};
+use bulkload_agent::provider_sqlite::{self, PathMapping};
 use bulkload_agent::transfer::{copy, receive, settle_racy_window};
+use bulkload_agent::BulkloadRefusal;
 
 /// One test at a time: the samplers read process-wide tables.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -82,13 +101,27 @@ static SERIAL: Mutex<()> = Mutex::new(());
 /// How long a verb may run before it counts as blocked on a holder.
 const DEADLINE: Duration = Duration::from_mins(2);
 
-/// Found by this file (2026-10-06, bulkload#157): the backup API's
-/// read-only connection holds the source's `-wal` open read-write
-/// (`O_RDWR`), which Q16/Q36 do not name. The bytes stay identical (asserted
-/// below), so it is counted and tracked rather than refused here. Set it to
-/// `false` once the provider opens the `-wal` read-only, and the test then
-/// refuses any write-mode open of it.
-const WAL_OPENED_READ_WRITE: bool = true;
+/// A named residual, not a ruling (found by this file, 2026-10-06,
+/// bulkload#157): the backup API's read-only connection holds a source
+/// `-wal` **that already existed** open read-write (`O_RDWR`).
+///
+/// Against the rulings as written: OI-1003-Q16 grants a bounded shared read
+/// lock; OI-1003-Q36 grants the `-shm`; OI-1003-Q72 grants an empty `-wal`
+/// "only where no `-wal` existed" and says "a `-wal` that existed before the
+/// read stays byte-identical". None of them names a write-mode descriptor on
+/// an existing `-wal`, and neither counter sees one. Q72's condition for that
+/// file is on its bytes, and it holds (asserted, with its `lstat` fields).
+/// So the open is neither granted nor a breach of the stated condition: it
+/// is the one thing these legs see and no ruling covers.
+///
+/// What this constant tolerates, exactly, for an existing `-wal`: this
+/// process's write-mode descriptor on it, and the one `close-write` event of
+/// that descriptor. It tolerates no `modify`, no `attrib` (the root finding,
+/// now refused by OI-1003-Q76), no create, delete or rename, and no lock.
+/// Each run prints the count as `wal-write-open=N (#157, residual)`. Set it
+/// to `false` once the provider opens an existing `-wal` read-only or a
+/// ruling refuses the open; the legs then fail on any write-mode open of it.
+const RESIDUAL_WAL_OPEN_READ_WRITE: bool = true;
 
 /// The environment variable that turns [`sqlite_writer_helper`] into the
 /// writer process.
@@ -106,6 +139,11 @@ const SQLITE_LOCK_BOUND: Duration = Duration::from_secs(30);
 
 /// The slowest commit the live writer may report while snapshots run.
 const COMMIT_BOUND: Duration = Duration::from_secs(10);
+
+/// How many snapshots the idle-writer leg takes before giving up on one the
+/// sampler sees holding its locks. Every one of them is held to every limit;
+/// only "the exception was seen" may take more than one.
+const OBSERVE_ATTEMPTS: usize = 40;
 
 /// How many snapshots the live leg tries before giving up on one that both
 /// succeeds and overlaps a commit.
@@ -504,6 +542,9 @@ impl Held {
 struct Sampler {
     stop: Arc<AtomicBool>,
     taken: Arc<AtomicU64>,
+    /// Samples so far that saw a granted lock of this process, the
+    /// holder's own apart.
+    own: Arc<AtomicU64>,
     thread: thread::JoinHandle<Observed>,
 }
 
@@ -515,6 +556,8 @@ impl Sampler {
         let stopping = Arc::clone(&stop);
         let taken = Arc::new(AtomicU64::new(0));
         let counting = Arc::clone(&taken);
+        let own = Arc::new(AtomicU64::new(0));
+        let owning = Arc::clone(&own);
         let ours = std::process::id().to_string();
         let thread = thread::spawn(move || {
             let mut observed = Observed::default();
@@ -527,6 +570,9 @@ impl Sampler {
                     .into_iter()
                     .filter(|line| keys.contains(&line.key) && !held.owns(line, &ours))
                     .collect();
+                if seen.iter().any(|line| line.pid == ours && !line.blocked) {
+                    owning.fetch_add(1, Ordering::Release);
+                }
                 runs.retain(|line, _| seen.contains(line));
                 for line in seen {
                     let since = *runs.entry(line.clone()).or_insert(now);
@@ -549,6 +595,7 @@ impl Sampler {
         Self {
             stop,
             taken,
+            own,
             thread,
         }
     }
@@ -559,6 +606,11 @@ impl Sampler {
         while self.taken.load(Ordering::Acquire) < target {
             thread::yield_now();
         }
+    }
+
+    /// How many samples so far saw a granted lock of this process.
+    fn own_lock_samples(&self) -> u64 {
+        self.own.load(Ordering::Acquire)
     }
 
     fn finish(self) -> Observed {
@@ -1640,8 +1692,9 @@ struct Accounting {
     shm_mark: u64,
     /// Samples that saw this process hold the `-shm` open for writing.
     shm_open: u64,
-    /// Samples that saw this process hold the `-wal` open for writing
-    /// ([`WAL_OPENED_READ_WRITE`], bulkload#157).
+    /// Samples that saw this process hold the `-wal` open for writing: the
+    /// empty `-wal` it creates (OI-1003-Q72), or an existing one
+    /// ([`RESIDUAL_WAL_OPEN_READ_WRITE`], bulkload#157).
     wal_open: u64,
     /// The longest this process was seen holding its database READ lock.
     db_hold: Duration,
@@ -1657,7 +1710,7 @@ const SHM_DMS: u64 = 128;
 
 /// Sort what the sampler saw of a snapshot into the exception and breaches.
 ///
-/// The exception, exactly (OI-1003-Q16, OI-1003-Q36): this process's granted
+/// The exception, exactly (OI-1003-Q16, OI-1003-Q36, OI-1003-Q72): this process's granted
 /// READ locks on the database; its granted READ locks on the `-shm`'s lock
 /// bytes; and its granted one-byte WRITE lock on a read-mark slot other than
 /// slot 0 (`SQLite` takes it for an instant to move a read mark; it excludes
@@ -1665,13 +1718,16 @@ const SHM_DMS: u64 = 128;
 /// WRITE lock on the `-shm`'s write, checkpoint or recovery byte or across
 /// several bytes; any lock on the `-wal`; any lock this process waits for;
 /// and any lock *another* process waits for on any of the three, which is
-/// the live writer being held up.
+/// the live writer being held up. Write-mode descriptors: the `-shm` (Q36);
+/// a `-wal` that did not exist before the read (Q72, `wal_existed` false);
+/// and, as a named residual only, one that did.
 fn account(
     observed: &Observed,
     keys: &DatabaseKeys,
     paths: &BTreeMap<String, PathBuf>,
     shm: &Path,
     wal: &Path,
+    wal_existed: bool,
 ) -> Accounting {
     let ours = std::process::id().to_string();
     let mut accounting = Accounting::default();
@@ -1715,7 +1771,9 @@ fn account(
     for (open, samples) in &observed.opens {
         if open.path == shm {
             accounting.shm_open += samples;
-        } else if open.path == wal && WAL_OPENED_READ_WRITE {
+        } else if open.path == wal && (!wal_existed || RESIDUAL_WAL_OPEN_READ_WRITE) {
+            // Where no `-wal` existed, creating the empty one is Q72's
+            // exception; on one that existed it is the named residual.
             accounting.wal_open += samples;
         } else {
             accounting
@@ -1754,31 +1812,340 @@ fn our_locks(keys: &BTreeMap<String, PathBuf>, held: &Held) -> Vec<LockLine> {
         .collect()
 }
 
-/// P77, `SQLite` leg (OI-1003-Q16, OI-1003-Q36): the backup API against a WAL
-/// database a separate writer holds open.
+/// Say on stderr which `SQLite` leg this run proves, and return whether it
+/// is the root one. One line per test, so a log shows which half ran.
+fn sqlite_leg(test: &str) -> bool {
+    let root = is_root();
+    if root {
+        eprintln!(
+            "p77 sqlite leg [{test}]: ROOT (euid 0). Proving the typed refusal \
+             SQLITE_SOURCE_AS_ROOT and an untouched source (OI-1003-Q76). The \
+             Q16/Q36/Q72 exception leg is NOT run as root."
+        );
+    } else {
+        eprintln!(
+            "p77 sqlite leg [{test}]: USER (euid {}). Running the backup under \
+             the Q16/Q36/Q72 exception. The root refusal (OI-1003-Q76) is NOT \
+             proved by this run.",
+            // SAFETY: `geteuid` takes no arguments and cannot fail.
+            unsafe { libc::geteuid() }
+        );
+    }
+    root
+}
+
+/// A WAL-mode database with `rows` rows that was checkpointed and closed:
+/// no `-wal` and no `-shm` sit beside it.
+fn closed_wal_database(db: &Path, rows: u64) {
+    let connection = rusqlite::Connection::open(db).unwrap();
+    let mode: String = connection
+        .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+    connection
+        .execute_batch("CREATE TABLE rows(id INTEGER PRIMARY KEY, body BLOB NOT NULL);")
+        .unwrap();
+    let transaction = connection.unchecked_transaction().unwrap();
+    for row in 0..rows {
+        transaction
+            .execute("INSERT INTO rows(body) VALUES (?1)", [noise(row, 1024)])
+            .unwrap();
+    }
+    transaction.commit().unwrap();
+    connection.close().map_err(|(_, error)| error).unwrap();
+    for suffix in ["-wal", "-shm"] {
+        assert!(
+            !sidecar(db, suffix).exists(),
+            "a closed database kept {suffix}"
+        );
+    }
+}
+
+/// `db` with `suffix` appended to its file name, as `SQLite` names sidecars.
+fn sidecar(db: &Path, suffix: &str) -> PathBuf {
+    let mut name = db.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// The bytes of every regular file directly in `directory`.
+fn file_bytes(directory: &Path) -> BTreeMap<std::ffi::OsString, Vec<u8>> {
+    listing(directory)
+        .into_iter()
+        .filter(|name| directory.join(name).is_file())
+        .map(|name| {
+            let bytes = fs::read(directory.join(&name)).unwrap();
+            (name, bytes)
+        })
+        .collect()
+}
+
+/// The source a root leg aims the provider at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootSource {
+    /// A writer process holds the database open with frames in its `-wal`
+    /// and commits nothing more: the directory is still.
+    IdleWriter,
+    /// A WAL-mode database, checkpointed and closed: no sidecar.
+    Closed,
+    /// A writer process commits a row every few milliseconds.
+    LiveWriter,
+}
+
+/// P77, the `SQLite` legs as root (OI-1003-Q76; S2).
+///
+/// Every provider verb that reads a database (`snapshot`, both compose
+/// verbs, `apply_state_candidate`, `hydrate_state`) is called on the source
+/// with the real effective uid of 0, under the same holder, write watch and
+/// sampler as the user legs. Asserted:
+///
+/// - each returns the typed refusal, code `SQLITE_SOURCE_AS_ROOT`, and the
+///   output directory stays empty;
+/// - **no write event**: the inotify queue (complete, every process) is
+///   empty for a still source; under the live writer it holds events on that
+///   writer's own `-wal` and `-shm` and nothing else;
+/// - **no lock**: this process has no lock line on any source inode in any
+///   sample or in a read made after the calls return, nothing waits, and no
+///   sample sees a write-mode descriptor on a source path;
+/// - **the directory is identical**: its listing, the `lstat` census of every
+///   node (the directory, the database, the `-wal` and `-shm` included; the
+///   live writer's two sidecars excepted) and every file's bytes. A closed
+///   database gets no `-wal` and no `-shm`.
+///
+/// The refused calls return in microseconds, so the sampler may see few
+/// samples; the complete channels here are the write watch, the census, the
+/// bytes and the lock read after return. This leg runs no backup: what a
+/// permitted read does to its source is the user legs', not proved as root.
+// One linear scenario: fixture, the five verbs, then the accounting.
+#[allow(clippy::too_many_lines)]
+fn sqlite_source_read_is_refused_as_root(shape: RootSource) {
+    assert!(is_root(), "the root leg runs with an effective uid of 0");
+    let scratch = Scratch::new(match shape {
+        RootSource::IdleWriter => "sqlite-root-idle",
+        RootSource::Closed => "sqlite-root-closed",
+        RootSource::LiveWriter => "sqlite-root-live",
+    });
+    let source = scratch.path("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("sibling"), noise(9, 8192)).unwrap();
+    let db = source.join("state.db");
+    let writer = match shape {
+        RootSource::IdleWriter => Some(Writer::start(&db, false)),
+        RootSource::LiveWriter => Some(Writer::start(&db, true)),
+        RootSource::Closed => {
+            closed_wal_database(&db, 200);
+            None
+        }
+    };
+    let (wal, shm) = (sidecar(&db, "-wal"), sidecar(&db, "-shm"));
+    let live = shape == RootSource::LiveWriter;
+    // The live writer rewrites its own two sidecars throughout.
+    let moving: &[&str] = if live {
+        &["state.db-shm", "state.db-wal"]
+    } else {
+        &[]
+    };
+    let still = |directory: &Path| {
+        let mut bytes = file_bytes(directory);
+        for name in moving {
+            bytes.remove(std::ffi::OsStr::new(name));
+        }
+        (listing(directory), census_without(directory, moving), bytes)
+    };
+    let before = still(&source);
+
+    let paths = lock_keys(&source);
+    let database: BTreeSet<&Path> = ["state.db", "state.db-wal", "state.db-shm"]
+        .into_iter()
+        .map(Path::new)
+        .collect();
+    // The writer holds its own locks on its database; a closed database has
+    // no writer, so the holder takes it too.
+    let skip: BTreeSet<PathBuf> = if writer.is_some() {
+        database.iter().map(|path| path.to_path_buf()).collect()
+    } else {
+        BTreeSet::new()
+    };
+    let holder = Holder::take(&source, &skip);
+    let watch = Watch::start(&[&source]);
+    let sampler = Sampler::start(
+        vec![source.clone()],
+        paths.keys().cloned().collect(),
+        holder.shape(),
+    );
+    sampler.wait_samples(1);
+
+    let output_dir = scratch.path("out");
+    fs::create_dir(&output_dir).unwrap();
+    fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    // The watch is drained before the holder is dropped: closing the
+    // holder's own write-mode descriptors is a write event too.
+    let ((refused, written, left), blocked) = {
+        let (output_dir, paths) = (output_dir.clone(), paths.clone());
+        let held = holder.shape();
+        within_deadline(vec![holder], move || {
+            let output = output_dir.join("snapshot.db");
+            let candidate = output_dir.join("candidate.db");
+            let mapping = PathMapping {
+                source_home: Path::new("/Users/p77"),
+                destination_home: Path::new("/home/p77"),
+            };
+            let refused: Vec<(&str, Option<BulkloadRefusal>)> = vec![
+                (
+                    "snapshot",
+                    provider_sqlite::snapshot(&db, &output, 10_000).err(),
+                ),
+                (
+                    "compose",
+                    provider_sqlite::compose_snapshots(&db, &db, &candidate, "p77", 100).err(),
+                ),
+                (
+                    "compose-state",
+                    provider_sqlite::compose_state_snapshots(
+                        &db, &db, &candidate, "p77", 100, &mapping,
+                    )
+                    .err(),
+                ),
+                (
+                    "apply-state-candidate",
+                    provider_sqlite::online::apply_state_candidate(&output, &db, &db, 1, &|_| {
+                        Ok(())
+                    })
+                    .err(),
+                ),
+                (
+                    "hydrate-state",
+                    provider_sqlite::hydrate::hydrate_state(
+                        &db,
+                        &mapping,
+                        1,
+                        1,
+                        Path::new("gzip"),
+                        Path::new("zstd"),
+                        &|_| Ok(()),
+                    )
+                    .err(),
+                ),
+            ];
+            (refused, watch.drain(), our_locks(&paths, &held))
+        })
+    };
+    sampler.wait_samples(1);
+    let observed = sampler.finish();
+    let after = still(&source);
+    let produced = listing(&output_dir);
+    let report = writer.map(Writer::finish);
+
+    assert!(!blocked, "a refused verb waited: {:?}", observed.locks);
+    for (verb, refusal) in &refused {
+        assert_eq!(
+            refusal.as_ref().map(BulkloadRefusal::code),
+            Some("SQLITE_SOURCE_AS_ROOT"),
+            "{verb} as root (OI-1003-Q76): {refusal:?}"
+        );
+    }
+    assert_eq!(refused.len(), 5);
+    assert_eq!(produced, Vec::<std::ffi::OsString>::new(), "an output");
+    // No write event. The live writer's own sidecar writes are not ours.
+    let outside: Vec<&WriteEvent> = written
+        .iter()
+        .filter(|event| !(live && (event.path == wal || event.path == shm)))
+        .collect();
+    assert_eq!(
+        outside,
+        Vec::<&WriteEvent>::new(),
+        "write events on the source of a refused read"
+    );
+    // No lock and no write-mode descriptor of ours, in any sample or after.
+    let ours = std::process::id().to_string();
+    let breaches: Vec<String> = observed
+        .locks
+        .keys()
+        .filter(|line| {
+            line.blocked
+                || line.pid == ours
+                || !paths
+                    .get(&line.key)
+                    .is_some_and(|path| database.contains(path.as_path()))
+        })
+        .map(|line| format!("{:?}: {line:?}", paths.get(&line.key)))
+        .collect();
+    assert_eq!(
+        breaches,
+        Vec::<String>::new(),
+        "locks during a refused read"
+    );
+    assert!(
+        observed.opens.is_empty(),
+        "write-mode opens during a refused read: {:?}",
+        observed.opens
+    );
+    assert_eq!(left, [], "locks left after the refused calls returned");
+    // Byte- and metadata-identical.
+    assert_eq!(after.0, before.0, "the source directory's listing changed");
+    assert_eq!(after.1, before.1, "a refused read moved source metadata");
+    assert!(after.2 == before.2, "a refused read changed source bytes");
+    if shape == RootSource::Closed {
+        assert!(
+            !wal.exists() && !shm.exists(),
+            "a refused read left a sidecar"
+        );
+    }
+    if let Some(report) = &report {
+        assert_eq!(report.busy, 0, "the writer found the database busy");
+        if !live {
+            assert_eq!(report.commits, 0, "{report:?}");
+        }
+    }
+    eprintln!(
+        "p77 sqlite root refusal ({shape:?}, OI-1003-Q76): 5 verbs refused \
+         SQLITE_SOURCE_AS_ROOT; write events {}; our locks 0; write-mode opens 0; \
+         {} nodes lstat-identical, {} files byte-identical; {} samples; writer {:?}",
+        outside.len(),
+        before.1.len(),
+        before.2.len(),
+        observed.samples,
+        report
+    );
+}
+
+/// P77, `SQLite` leg (OI-1003-Q16, OI-1003-Q36, OI-1003-Q72): the backup API
+/// against a WAL database a separate writer holds open. As root it is the
+/// refusal leg instead ([`sqlite_source_read_is_refused_as_root`],
+/// OI-1003-Q76).
 ///
 /// - This process's source locks fall only under the exception as
 ///   [`account`] states it, and the exception is observed, not assumed: the
-///   database READ lock and the `-shm` open are each seen at least once.
+///   database READ lock, the `-shm` READ locks and the `-shm` open are each
+///   seen in one snapshot. A 2 MiB backup can finish between two samples, so
+///   the leg takes up to [`OBSERVE_ATTEMPTS`] snapshots; every one of them
+///   is held to every limit here, seen or not.
 /// - Nobody waits: not the snapshot, and not the writer on anything the
 ///   snapshot holds.
 /// - The database READ lock is bounded: it is seen for at most
 ///   [`SQLITE_LOCK_BOUND`], and it is gone when `snapshot` returns.
-/// - No other source write occurs (Q36): the directory's listing and the
-///   `lstat` census of everything but the `-shm` are unchanged, the write
+/// - No other source write occurs (Q36, Q72): the directory's listing and
+///   the `lstat` census of everything but the `-shm` are unchanged (the
+///   `-wal`'s included: it existed, so Q72 grants nothing on it), the write
 ///   watch saw events on the `-shm` only, and the database, the `-wal` and
 ///   the sibling file are byte-identical.
+/// - The counters say the same: `source_wal_index_touched` moves by 1 and
+///   `source_wal_created` by 0.
 ///
-/// **Not met:** the acceptance criterion "no write-mode open but the
-/// `-shm`". The backup's read-only connection holds the `-wal` open
-/// `O_RDWR`, which no ruling grants. It is counted under
-/// [`WAL_OPENED_READ_WRITE`] and tracked on bulkload#157; this test does not
-/// pass that criterion, it records the breach.
+/// **Residual, not met:** the acceptance criterion "no write-mode open but
+/// the `-shm`". The backup's read-only connection holds the existing `-wal`
+/// open `O_RDWR`, which no ruling grants. It is counted under
+/// [`RESIDUAL_WAL_OPEN_READ_WRITE`] and tracked on bulkload#157; this test
+/// does not pass that criterion, it records the residual.
 #[test]
 // One linear scenario: writer, holder, snapshot, then the accounting.
 #[allow(clippy::too_many_lines)]
 fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    if sqlite_leg("idle writer") {
+        sqlite_source_read_is_refused_as_root(RootSource::IdleWriter);
+        return;
+    }
     let scratch = Scratch::new("sqlite");
     let source = scratch.path("source");
     fs::create_dir(&source).unwrap();
@@ -1808,42 +2175,134 @@ fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
         .into_iter()
         .map(PathBuf::from)
         .collect();
-    let holder = Holder::take(&source, &skip);
-    let watch = Watch::start(&[&source]);
-    let sampler = Sampler::start(
-        vec![source.clone()],
-        paths.keys().cloned().collect(),
-        holder.shape(),
-    );
-
     let output_dir = scratch.path("snapshot");
     fs::create_dir(&output_dir).unwrap();
     fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    let output = output_dir.join("state.db");
-    let ((result, written, left), blocked) = {
-        let (db, output, paths) = (db.clone(), output.clone(), paths.clone());
-        let held = holder.shape();
-        within_deadline(vec![holder], move || {
-            let result = bulkload_agent::provider_sqlite::snapshot(&db, &output, 10_000);
-            // Released on return: nothing of ours is left on the source.
-            let left = our_locks(&paths, &held);
-            (result, watch.drain(), left)
-        })
+    let wal_closed = WriteEvent {
+        path: wal.clone(),
+        what: "close-write".to_owned(),
     };
-    let observed = sampler.finish();
-    // Compared while the writer still holds the database open: its own
-    // close checkpoints the `-wal` into the database, which is the writer's
-    // write, not ours.
-    let db_unchanged = fs::read(&db).unwrap() == db_bytes;
-    let wal_unchanged = fs::read(&wal).unwrap() == wal_bytes;
-    let sibling_unchanged = fs::read(source.join("sibling")).unwrap() == sibling;
-    let names_after = listing(&source);
-    let census_after = census_without(&source, &["state.db-shm"]);
+    // A 2 MiB backup can finish between two samples of `/proc/locks`. Every
+    // snapshot is held to every limit below; the leg repeats until one of
+    // them is also *seen* under the exception, so it never passes by seeing
+    // nothing.
+    let mut seen = None;
+    let mut tried = Vec::new();
+    for attempt in 0..OBSERVE_ATTEMPTS {
+        let holder = Holder::take(&source, &skip);
+        let watch = Watch::start(&[&source]);
+        let sampler = Sampler::start(
+            vec![source.clone()],
+            paths.keys().cloned().collect(),
+            holder.shape(),
+        );
+        let output = output_dir.join(format!("state-{attempt}.db"));
+        let ((result, counted, written, left), blocked) = {
+            let (db, output, paths) = (db.clone(), output.clone(), paths.clone());
+            let held = holder.shape();
+            within_deadline(vec![holder], move || {
+                let counters = Counters::snapshot();
+                let result = provider_sqlite::snapshot(&db, &output, 10_000);
+                let counted = Counters::snapshot().since(counters);
+                // Released on return: nothing of ours is left on the source.
+                let left = our_locks(&paths, &held);
+                (result, counted, watch.drain(), left)
+            })
+        };
+        let observed = sampler.finish();
+        assert!(!blocked, "the snapshot waited: {:?}", observed.locks);
+        result.unwrap();
+        let accounting = account(&observed, &keys, &paths, &shm, &wal, true);
+        assert!(
+            accounting.breaches.is_empty(),
+            "source access outside the Q16/Q36/Q72 exception: {:#?}",
+            accounting.breaches
+        );
+        assert!(
+            accounting.db_hold + observed.period() * 2 <= SQLITE_LOCK_BOUND,
+            "the database READ lock was held for {:?}, over the bound {SQLITE_LOCK_BOUND:?}",
+            accounting.db_hold
+        );
+        assert_eq!(
+            left,
+            [],
+            "locks left on the source after the snapshot returned"
+        );
+        // The counters match what the directory shows: a `-shm` beside the
+        // source (Q36) and no `-wal` created, since one existed (Q72).
+        assert!(shm.exists(), "the -shm is beside the source");
+        assert_eq!(
+            (
+                counted.get(Counter::SourceWalIndexTouched),
+                counted.get(Counter::SourceWalCreated)
+            ),
+            (1, 0),
+            "source_wal_index_touched, source_wal_created"
+        );
+        // Q36, Q72: no other source write. The existing `-wal`'s one
+        // tolerated event is the close of the read-write descriptor (the
+        // named residual, bulkload#157); a write or a re-stamp of it is not
+        // tolerated.
+        let outside: Vec<&WriteEvent> = written
+            .iter()
+            .filter(|event| {
+                event.path != shm && !(RESIDUAL_WAL_OPEN_READ_WRITE && **event == wal_closed)
+            })
+            .collect();
+        assert_eq!(
+            outside,
+            Vec::<&WriteEvent>::new(),
+            "write events outside the -shm"
+        );
+        // Compared while the writer still holds the database open: its own
+        // close checkpoints the `-wal` into the database, which is the
+        // writer's write, not ours.
+        assert_eq!(
+            listing(&source),
+            names,
+            "the source directory's listing changed"
+        );
+        assert_eq!(
+            census_without(&source, &["state.db-shm"]),
+            census,
+            "the source changed outside the -shm"
+        );
+        assert!(
+            fs::read(&db).unwrap() == db_bytes,
+            "the snapshot changed the database"
+        );
+        assert!(
+            fs::read(&wal).unwrap() == wal_bytes,
+            "the snapshot changed the -wal"
+        );
+        assert!(
+            fs::read(source.join("sibling")).unwrap() == sibling,
+            "the snapshot changed a sibling file"
+        );
+        let snapshot = rusqlite::Connection::open(&output).unwrap();
+        let rows: i64 = snapshot
+            .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2000, "the snapshot holds the -wal's rows");
+        tried.push(format!(
+            "db-read-lock={} shm-read-lock={} shm-write-open={} over {} samples",
+            accounting.db_read, accounting.shm_read, accounting.shm_open, observed.samples
+        ));
+        // The exception was observed: the database READ lock, the `-shm`
+        // READ locks and the `-shm` write-mode open, all in this snapshot.
+        if accounting.db_read > 0 && accounting.shm_read > 0 && accounting.shm_open > 0 {
+            seen = Some((observed, accounting, counted, written));
+            break;
+        }
+    }
     let report = writer.finish();
-
-    assert!(!blocked, "the snapshot waited: {:?}", observed.locks);
-    result.unwrap();
-    let accounting = account(&observed, &keys, &paths, &shm, &wal);
+    assert_eq!((report.commits, report.busy), (0, 0), "{report:?}");
+    let (observed, accounting, counted, written) = seen.unwrap_or_else(|| {
+        panic!(
+            "no snapshot in {OBSERVE_ATTEMPTS} was seen holding the database READ lock \
+             and the -shm: {tried:#?}"
+        )
+    });
     eprintln!(
         "p77 sqlite lock lines: {:#?}",
         observed
@@ -1865,62 +2324,14 @@ fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
             ))
             .collect::<Vec<_>>()
     );
-    assert!(
-        accounting.breaches.is_empty(),
-        "source access outside the Q16/Q36 exception: {:#?}",
-        accounting.breaches
-    );
-    // The exception was observed, so the leg did not pass by seeing nothing.
-    assert!(
-        accounting.db_read > 0,
-        "the sampler never saw the database READ lock: {accounting:?}"
-    );
-    assert!(
-        accounting.shm_read > 0 && accounting.shm_open > 0,
-        "the sampler never saw the -shm exception: {accounting:?}"
-    );
-    assert!(
-        accounting.db_hold + observed.period() * 2 <= SQLITE_LOCK_BOUND,
-        "the database READ lock was held for {:?}, over the bound {SQLITE_LOCK_BOUND:?}",
-        accounting.db_hold
-    );
-    assert_eq!(
-        left,
-        [],
-        "locks left on the source after the snapshot returned"
-    );
-    // Q36: no other source write. The `-wal`'s one tolerated event is the
-    // close of the read-write descriptor (bulkload#157); a write to it is
-    // not tolerated.
-    let wal_closed = WriteEvent {
-        path: wal,
-        what: "close-write".to_owned(),
-    };
-    let outside: Vec<&WriteEvent> = written
-        .iter()
-        .filter(|event| event.path != shm && !(WAL_OPENED_READ_WRITE && **event == wal_closed))
-        .collect();
-    assert_eq!(
-        outside,
-        Vec::<&WriteEvent>::new(),
-        "write events outside the -shm"
-    );
-    assert_eq!(names_after, names, "the source directory's listing changed");
-    assert_eq!(census_after, census, "the source changed outside the -shm");
-    assert!(db_unchanged, "the snapshot changed the database");
-    assert!(wal_unchanged, "the snapshot changed the -wal");
-    assert!(sibling_unchanged, "the snapshot changed a sibling file");
-    assert_eq!((report.commits, report.busy), (0, 0), "{report:?}");
-    let snapshot = rusqlite::Connection::open(&output).unwrap();
-    let rows: i64 = snapshot
-        .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(rows, 2000, "the snapshot holds the -wal's rows");
     eprintln!(
-        "p77 sqlite exception (sample counts, Q16/Q36): {} samples, mean period {} us, \
+        "p77 sqlite exception (sample counts, Q16/Q36/Q72): snapshot {} of at most \
+         {OBSERVE_ATTEMPTS}, {} samples, mean period {} us, \
          db-read-lock={} shm-read-lock={} shm-read-mark-write={} shm-write-open={} \
-         wal-write-open={} (#157, criterion NOT met), db-read-lock held {:?} \
-         (bound {SQLITE_LOCK_BOUND:?}), write events {:?}",
+         wal-write-open={} (#157, residual), db-read-lock held {:?} \
+         (bound {SQLITE_LOCK_BOUND:?}), source_wal_index_touched=+{} \
+         source_wal_created=+{}, write events {:?}",
+        tried.len(),
         observed.samples,
         observed.period_us(),
         accounting.db_read,
@@ -1929,8 +2340,227 @@ fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
         accounting.shm_open,
         accounting.wal_open,
         accounting.db_hold,
+        counted.get(Counter::SourceWalIndexTouched),
+        counted.get(Counter::SourceWalCreated),
         written
             .iter()
+            .map(|event| event.what.as_str())
+            .collect::<BTreeSet<_>>()
+    );
+}
+
+/// P77, `SQLite` leg for the empty `-wal` (OI-1003-Q72, which extends
+/// OI-1003-Q36): the backup API against a WAL-mode database that was
+/// checkpointed and closed, so it has no `-wal` and no `-shm`. As root it is
+/// the refusal leg instead (OI-1003-Q76).
+///
+/// The first snapshot's whole write set is the two counted sidecars:
+///
+/// - `source_wal_created` moves by 1 and a zero-byte `-wal` sits where none
+///   was; `source_wal_index_touched` moves by 1 and a `-shm` sits there;
+/// - the write watch saw events on those two names only, and on the `-wal`
+///   only its creation and the close of the creating descriptor (no
+///   `modify`, no `attrib`);
+/// - the listing gained exactly those two names; the database and the
+///   sibling are byte- and `lstat`-identical (the directory's own times move
+///   with the two creations, and are left out);
+/// - whatever the sampler saw of this process falls under the exception,
+///   nothing waits, and no lock of ours is left when `snapshot` returns.
+///   The creation happens once, so this leg cannot repeat until the sampler
+///   sees the READ lock: seeing it is the idle-writer leg's.
+///
+/// A second snapshot finds the empty `-wal` in place: `source_wal_created`
+/// moves by 0, and that `-wal` is byte- and `lstat`-identical afterwards
+/// ("a `-wal` that existed before the read stays byte-identical").
+///
+/// Not seen here: lock lines on the two created sidecars, whose inodes do
+/// not exist when the sampler starts. The idle-writer leg accounts for the
+/// `-shm`'s locks.
+#[test]
+// One linear scenario: fixture, holder, two snapshots, then the accounting.
+#[allow(clippy::too_many_lines)]
+fn a_sqlite_snapshot_creates_only_an_empty_wal_where_none_existed() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    if sqlite_leg("closed database") {
+        sqlite_source_read_is_refused_as_root(RootSource::Closed);
+        return;
+    }
+    let scratch = Scratch::new("sqlite-closed");
+    let source = scratch.path("source");
+    fs::create_dir(&source).unwrap();
+    let sibling = noise(9, 8192);
+    fs::write(source.join("sibling"), &sibling).unwrap();
+    let db = source.join("state.db");
+    closed_wal_database(&db, 2000);
+    let (wal, shm) = (sidecar(&db, "-wal"), sidecar(&db, "-shm"));
+    let db_bytes = fs::read(&db).unwrap();
+    let names = listing(&source);
+    // Without the directory itself: creating the two sidecars moves its
+    // mtime and ctime, which is part of the same counted exception.
+    let apart = ["", "state.db-shm", "state.db-wal"];
+    let census = census_without(&source, &apart);
+
+    let paths = lock_keys(&source);
+    let keys = DatabaseKeys {
+        db: lock_key(&fs::symlink_metadata(&db).unwrap()),
+        // Neither sidecar has an inode yet, so no sampled line can match.
+        wal: String::new(),
+        shm: String::new(),
+    };
+    let skip: BTreeSet<PathBuf> = std::iter::once(PathBuf::from("state.db")).collect();
+    let holder = Holder::take(&source, &skip);
+    let watch = Watch::start(&[&source]);
+    let sampler = Sampler::start(
+        vec![source.clone()],
+        paths.keys().cloned().collect(),
+        holder.shape(),
+    );
+
+    let output_dir = scratch.path("snapshot");
+    fs::create_dir(&output_dir).unwrap();
+    fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let output = output_dir.join("state.db");
+    // The watch is drained before the holder is dropped: closing the
+    // holder's own write-mode descriptors is a write event too.
+    let ((result, counted, written, left), blocked) = {
+        let (db, paths) = (db.clone(), paths.clone());
+        let held = holder.shape();
+        within_deadline(vec![holder], move || {
+            let counters = Counters::snapshot();
+            let result = provider_sqlite::snapshot(&db, &output, 10_000);
+            let counted = Counters::snapshot().since(counters);
+            (result, counted, watch.drain(), our_locks(&paths, &held))
+        })
+    };
+    let observed = sampler.finish();
+
+    assert!(!blocked, "the snapshot waited: {:?}", observed.locks);
+    result.unwrap();
+    let accounting = account(&observed, &keys, &paths, &shm, &wal, false);
+    assert!(
+        accounting.breaches.is_empty(),
+        "source access outside the Q16/Q36/Q72 exception: {:#?}",
+        accounting.breaches
+    );
+    assert_eq!(left, [], "locks left on the source after the snapshot");
+    // Each exception matches its counter and its file.
+    assert_eq!(
+        (
+            counted.get(Counter::SourceWalIndexTouched),
+            counted.get(Counter::SourceWalCreated)
+        ),
+        (1, 1),
+        "source_wal_index_touched, source_wal_created"
+    );
+    assert!(shm.exists(), "the -shm the counter reports");
+    assert_eq!(
+        fs::symlink_metadata(&wal).unwrap().len(),
+        0,
+        "the created -wal is empty (OI-1003-Q72)"
+    );
+    // The write set, exactly: the `-shm`, and the `-wal`'s creation.
+    let outside: Vec<&WriteEvent> = written
+        .iter()
+        .filter(|event| event.path != shm && event.path != wal)
+        .collect();
+    assert_eq!(
+        outside,
+        Vec::<&WriteEvent>::new(),
+        "write events outside the two counted sidecars"
+    );
+    let on_wal: BTreeSet<&str> = written
+        .iter()
+        .filter(|event| event.path == wal)
+        .map(|event| event.what.as_str())
+        .collect();
+    assert_eq!(
+        on_wal,
+        BTreeSet::from(["close-write", "create"]),
+        "the empty -wal is created and closed, never written or re-stamped"
+    );
+    let mut expected = names;
+    expected.extend(["state.db-shm".into(), "state.db-wal".into()]);
+    expected.sort();
+    assert_eq!(listing(&source), expected, "the source directory's listing");
+    assert_eq!(
+        census_without(&source, &apart),
+        census,
+        "the source changed outside the two counted sidecars"
+    );
+    assert!(fs::read(&db).unwrap() == db_bytes, "the database changed");
+    assert!(
+        fs::read(source.join("sibling")).unwrap() == sibling,
+        "a sibling file changed"
+    );
+
+    // Again, with the empty `-wal` now in place: nothing is created, and
+    // the `-wal` that existed is left exactly as it was.
+    let wal_only = |directory: &Path| {
+        let mut census = lstat_census(directory);
+        census.retain(|path, _| path == Path::new("state.db-wal"));
+        census
+    };
+    let wal_before = wal_only(&source);
+    let census_second = census_without(&source, &["state.db-shm"]);
+    let watch = Watch::start(&[&source]);
+    let counters = Counters::snapshot();
+    provider_sqlite::snapshot(&db, &output_dir.join("again.db"), 10_000).unwrap();
+    let again = Counters::snapshot().since(counters);
+    let written_again = watch.drain();
+    assert_eq!(
+        (
+            again.get(Counter::SourceWalIndexTouched),
+            again.get(Counter::SourceWalCreated)
+        ),
+        (1, 0),
+        "a -wal that existed is not counted as created"
+    );
+    assert_eq!(wal_before.len(), 1);
+    assert_eq!(wal_only(&source), wal_before, "the existing -wal moved");
+    assert_eq!(fs::symlink_metadata(&wal).unwrap().len(), 0);
+    assert_eq!(
+        census_without(&source, &["state.db-shm"]),
+        census_second,
+        "the second snapshot changed the source outside the -shm"
+    );
+    let wal_closed = WriteEvent {
+        path: wal,
+        what: "close-write".to_owned(),
+    };
+    let outside: Vec<&WriteEvent> = written_again
+        .iter()
+        .filter(|event| {
+            event.path != shm && !(RESIDUAL_WAL_OPEN_READ_WRITE && **event == wal_closed)
+        })
+        .collect();
+    assert_eq!(
+        outside,
+        Vec::<&WriteEvent>::new(),
+        "write events outside the -shm on the second snapshot"
+    );
+    for name in ["state.db", "again.db"] {
+        let snapshot = rusqlite::Connection::open(output_dir.join(name)).unwrap();
+        let rows: i64 = snapshot
+            .query_row("SELECT count(*) FROM rows", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 2000, "{name}");
+    }
+    eprintln!(
+        "p77 sqlite empty -wal (Q72): first snapshot source_wal_index_touched=+{} \
+         source_wal_created=+{}, -wal events {on_wal:?}, -wal 0 bytes, db-read-lock={} \
+         shm-write-open={} wal-write-open={} over {} samples; second snapshot \
+         source_wal_created=+{}, existing -wal lstat-identical, its events {:?} \
+         (close-write is the #157 residual)",
+        counted.get(Counter::SourceWalIndexTouched),
+        counted.get(Counter::SourceWalCreated),
+        accounting.db_read,
+        accounting.shm_open,
+        accounting.wal_open,
+        observed.samples,
+        again.get(Counter::SourceWalCreated),
+        written_again
+            .iter()
+            .filter(|event| event.path == wal_closed.path)
             .map(|event| event.what.as_str())
             .collect::<BTreeSet<_>>()
     );
@@ -1951,11 +2581,18 @@ fn a_sqlite_snapshot_locks_only_under_the_q16_q36_exception() {
 ///
 /// A snapshot that loses a race with a commit refuses with a typed value and
 /// is retried on a new output path, as the provider's contract says.
+///
+/// As root it is the refusal leg instead (OI-1003-Q76): the five verbs are
+/// refused beside the committing writer, which is never found busy.
 #[test]
 // One linear scenario, as above.
 #[allow(clippy::too_many_lines)]
 fn a_sqlite_snapshot_does_not_hold_up_a_committing_writer() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    if sqlite_leg("live writer") {
+        sqlite_source_read_is_refused_as_root(RootSource::LiveWriter);
+        return;
+    }
     let scratch = Scratch::new("sqlite-live");
     let source = scratch.path("source");
     fs::create_dir(&source).unwrap();
@@ -1991,16 +2628,20 @@ fn a_sqlite_snapshot_does_not_hold_up_a_committing_writer() {
     let output_dir = scratch.path("snapshot");
     fs::create_dir(&output_dir).unwrap();
     fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    // Until one snapshot both succeeds and overlaps a commit.
+    // Until one snapshot succeeds, overlaps a commit and is seen by the
+    // sampler holding a lock (a short backup can fall between two samples).
     let mut attempts = Vec::new();
     let mut overlapped = None;
     for attempt in 0..LIVE_ATTEMPTS {
         let output = output_dir.join(format!("state-{attempt}.db"));
         let before = writer.commits();
-        let result = bulkload_agent::provider_sqlite::snapshot(&db, &output, 10_000);
+        let result = provider_sqlite::snapshot(&db, &output, 10_000);
         let during = writer.commits() - before;
-        attempts.push(format!("{result:?} during {during} commits"));
-        if result.is_ok() && during > 0 {
+        let locked = sampler.own_lock_samples();
+        attempts.push(format!(
+            "{result:?} during {during} commits, {locked} samples with our lock so far"
+        ));
+        if result.is_ok() && during > 0 && locked > 0 {
             overlapped = Some(output);
             break;
         }
@@ -2015,9 +2656,10 @@ fn a_sqlite_snapshot_does_not_hold_up_a_committing_writer() {
     let census_after = census_without(&source, &["state.db-shm", "state.db-wal"]);
     let report = writer.finish();
 
-    let output = overlapped
-        .unwrap_or_else(|| panic!("no snapshot overlapped a commit and succeeded: {attempts:#?}"));
-    let accounting = account(&observed, &keys, &paths, &shm, &wal);
+    let output = overlapped.unwrap_or_else(|| {
+        panic!("no snapshot overlapped a commit, succeeded and was sampled: {attempts:#?}")
+    });
+    let accounting = account(&observed, &keys, &paths, &shm, &wal, true);
     assert!(
         accounting.breaches.is_empty(),
         "source access outside the Q16/Q36 exception, or the writer held up: {:#?}",

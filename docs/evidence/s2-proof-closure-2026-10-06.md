@@ -3,7 +3,8 @@
 Rulings: OI-1003-Q5 and OI-1003-Q9 (S2: never interrupt the source; no
 locks, no writes, no signals), OI-1003-Q16 (WP0(b) typed source access and
 the bounded SQLite exception), OI-1003-Q36 (the `-shm` wal-index
-exception), OI-1003-Q60 (completion-bar audit), R-N13.
+exception), OI-1003-Q72 (the empty `-wal`), OI-1003-Q76 (no SQLite source
+read as root), OI-1003-Q60 (completion-bar audit), R-N13.
 
 **Scope.** This is lane 7 of the completion-bar audit. It adds two property
 tests, P76 and P77 in the
@@ -23,8 +24,10 @@ section 3.
 Measured on branch `feat/s2-proof-closure-20261006` on sting (Linux, xfs
 scratch), with main `2247ab8` merged in (`a7b7ccc`). The recheck stage then
 merged main `48bd697` (#191, #192) as `c8c1783` and reran both tests there;
-see sections 2 and 4. The host was heavily
-shared. Tests ran inside `nix develop` with
+see sections 2 and 4. A second fix round on 2026-10-07 merged main `a80c63b`
+(#189, #194, #195, #196, #198) as `fdc5fac`, after PR CI failed as root; it
+is section 5, and sections 1, 3 and 4 are updated to match. The host was
+heavily shared. Tests ran inside `nix develop` with
 `cargo test -p bulkload-agent --test source_command_registry --test
 source_lock_trace -- --test-threads=1`.
 
@@ -85,9 +88,11 @@ carries `GIT_OPTIONAL_LOCKS=0`, `GIT_NO_LAZY_FETCH=1`,
   are named only in `git_env`, the probe builder and one registered
   injector (`git_carry::nest_status`).
 - Every Git subcommand in the `git_carry` tree is a registered read or one
-  of 14 registered writers. Each writer has a ceiling, and the ceilings sum
-  to 46. A literal that holds a shell line, such as the probe script, is
-  read as shell, so a Git subcommand inside it is checked too.
+  of 14 registered writers. Each writer is pinned to the exact number of
+  uses the tree holds (44 in all at main `a80c63b`): one more fails, and so
+  does one fewer, until the number is lowered (section 5). A literal that
+  holds a shell line, such as the probe script, is read as shell, so a Git
+  subcommand inside it is checked too.
 
 **This is a census, not a proof.** A text scan cannot tell a source
 repository from a capture's private one. That every writer is aimed at a
@@ -145,32 +150,48 @@ means the children were hardened, not that the fixture was easy.
 not the lock table.** The lock table and the holder add only that no
 `flock` or `fcntl` lock is taken either.
 
-**The SQLite exception.** OI-1003-Q16 allows a shared read lock on the
+**The SQLite legs run one of two ways, and print which.** As an ordinary
+user they run the backup and hold it to the counted exception. As root they
+assert the refusal (OI-1003-Q76). Neither run proves the other's half.
+Section 5 has the root finding and both sets of numbers.
+
+**As a user: the exception.** OI-1003-Q16 allows a shared read lock on the
 database that is bounded and counted. OI-1003-Q36 allows the `-shm`
-wal-index. The leg requires:
+wal-index (`source_wal_index_touched`). OI-1003-Q72 allows an empty `-wal`
+only where none existed (`source_wal_created`). Three legs:
 
-- this process's locks are only READ on the database, READ on the `-shm`
-  lock bytes, and a one-byte read-mark WRITE on the `-shm`;
-- the exception is observed, not assumed: the counts are greater than zero;
-- the database read lock is released on return and is held under a 30 s
-  test bound;
-- no process waits on any lock;
-- no other source write occurs: the directory listing, an `lstat` census
-  without the `-shm`, and the write watch all agree.
+- **Idle writer** (a `-wal` with frames exists). This process's locks are
+  only READ on the database, READ on the `-shm` lock bytes, and a one-byte
+  read-mark WRITE on the `-shm`. The database read lock is released on
+  return and held under a 30 s test bound. No process waits. The listing,
+  the `lstat` census without the `-shm` (the `-wal`'s row included), the
+  bytes of the database, the `-wal` and a sibling, and the write watch all
+  agree that nothing but the `-shm` was written. The counters move by
+  `source_wal_index_touched=+1` and `source_wal_created=+0`. The exception
+  is observed, not assumed: the leg repeats the snapshot (at most 40 times,
+  every one held to every limit) until the sampler sees the database lock,
+  the `-shm` locks and the `-shm` open in one snapshot.
+- **Closed database** (no `-wal`, no `-shm`). The first snapshot's write
+  set is the two counted sidecars and nothing else: `+1` and `+1`, a
+  zero-byte `-wal`, events on the `-wal` of `create` and `close-write`
+  only, and the database and sibling byte- and `lstat`-identical. A second
+  snapshot finds the empty `-wal` in place: `source_wal_created=+0` and the
+  `-wal` `lstat`-identical.
+- **Committing writer.** The writer is never found busy and its slowest
+  commit is under the bound.
 
-One run gave `db-read-lock=68 shm-read-lock=102 shm-read-mark-write=0
-shm-write-open=67 wal-write-open=67` over 71 samples, with the database
-read lock seen held for 122 ms. Under a committing writer, two runs gave 51
-commits with the slowest at 998 ms, and 11 commits with the slowest at
-59 ms. Both had `busy=0`.
-
-**The `-wal` criterion is NOT met.** The backup's read-only connection
-holds the source `-wal` open `O_RDWR`. Q16 and Q36 do not name that. The
-bytes do not change, and the test tolerates it under
-`WAL_OPENED_READ_WRITE = true`. So the acceptance criterion "no write-mode
-open but the `-shm`" fails today, and the test records the failure rather
-than hiding it. It needs a provider fix or a Q36 amendment. Both belong to
-#157, which another lane owns.
+**The residual: an existing `-wal` is held open `O_RDWR`.** Q72 says an
+empty `-wal` is allowed "only where no `-wal` existed" and that "a `-wal`
+that existed before the read stays byte-identical". Q16, Q36 and Q72 do not
+name a write-mode descriptor on a `-wal` that already existed, and neither
+counter sees one. Q72's condition for that file is on its bytes, and it
+holds. So the open is neither granted nor a breach of a stated condition.
+The test names it `RESIDUAL_WAL_OPEN_READ_WRITE` and tolerates exactly two
+things for an existing `-wal`: this process's write-mode descriptor, and
+that descriptor's one `close-write` event. It tolerates no `modify`, no
+`attrib`, no create, delete or rename, and no lock. The criterion "no
+write-mode open but the `-shm`" is still not met; closing it needs a
+provider change or a ruling, on #157, which another lane owns.
 
 ## 2. Mutation evidence, leg by leg
 
@@ -249,7 +270,19 @@ Two library mutants ran both test files:
 
 - **#165, the S2 measured budget (OI-1003-Q34).** The proof-grade run on
   neo has not run. These property tests do not stand in for it.
-- **The `-wal` `O_RDWR` open (#157).** The criterion is not met. See above.
+- **The `-wal` `O_RDWR` open on an existing `-wal` (#157).** A named
+  residual: no ruling grants it and none refuses it. See section 1.
+- **A permitted SQLite read as root.** There is none to prove: the provider
+  refuses (OI-1003-Q76). The root legs prove the refusal and an untouched
+  source. They do not prove the Q16/Q36/Q72 exception, which only a non-root
+  run exercises. PR CI runs as root, so **CI proves the refusal half only**;
+  the exception half is proved by local runs as a user (section 5).
+- **Real root.** The local root runs used `unshare -r`, a user-namespace
+  root (euid 0, mapped to uid 1000). It reproduces the CI failure exactly
+  (section 5), but real root on the CI runner is proved only by CI itself.
+- **Lock lines on sidecars the snapshot creates.** In the closed-database
+  leg the `-shm` and `-wal` have no inode when the sampler starts, so their
+  lock lines are not sampled. The idle-writer leg accounts for the `-shm`.
 - **A typed source/private Git builder (#188).** Until it exists, "no
   writer is aimed at a source" is a census plus a dynamic check of three
   verbs.
@@ -311,6 +344,111 @@ Two library mutants ran both test files:
   `git_carry/decide.rs` and a changed `git_carry/shared.rs`):
   `source_command_registry` 15 passed and `source_lock_trace` 12 passed,
   with no registry entry changed.
+- Second fix round, on `fdc5fac` (main `a80c63b` merged) plus the round's
+  test changes: `source_command_registry` 16 passed, `source_lock_trace` 13
+  passed as uid 1000 and 13 passed under `unshare -r`, `prop_seed_guard` 6
+  passed with `scanned=83 exempt_present=1 escapes=0`. `cargo fmt --all
+  --check` clean; `cargo clippy --workspace --all-targets --locked -- -D
+  warnings` clean, and again for `-p bulkload-agent --features io-trace`.
 - `just check-fast` on the final head is reported in the pull request and
   the agent note's follow-up, not here: a commit cannot carry the receipt of
   its own check.
+
+## 5. Second fix round, 2026-10-07: root, the empty `-wal`, exact tables
+
+### The root finding
+
+PR CI run 37540759845 failed on `b385f08`:
+`a_sqlite_snapshot_locks_only_under_the_q16_q36_exception`, `write events
+outside the -shm: [WriteEvent { path: .../state.db-wal, what: "attrib" }]`.
+CI runs as root. Run as root, the bundled SQLite re-applies the database's
+owner to the `-wal` and `-shm` it opens, which moves their ctime; as any
+other user it skips that call. P77's write watch saw exactly that. It is a
+source metadata write that no ruling admits and no counter sees. The
+operator ruled OI-1003-Q76: the provider refuses to read a source as root
+(`SQLITE_SOURCE_AS_ROOT`, landed in #196).
+
+P77 now proves, per run, the half its uid allows.
+
+| Run | What is asserted | What is not |
+|---|---|---|
+| uid 0 (PR CI) | All five provider verbs return `SQLITE_SOURCE_AS_ROOT`; no write event; no lock or write-mode open of this process; the listing, every node's `lstat` row (directory, database, `-wal`, `-shm`) and every file's bytes are identical; a closed database gets no sidecar; the output directory stays empty. Three sources: idle writer, closed database, committing writer (its own two sidecars excepted). | The Q16/Q36/Q72 exception: no backup runs. |
+| any other uid | The exception as in section 1, with both counters. | The refusal. |
+
+No privilege is dropped or gained in the test. Main's P75 tried to drop to
+an unprivileged uid in a child and CI denied it, so P77 does not try.
+
+**Local root run** (`unshare -r <test binary> --nocapture --test-threads=1`,
+13 passed):
+
+```
+p77 sqlite leg [closed database]: ROOT (euid 0). Proving the typed refusal SQLITE_SOURCE_AS_ROOT and an untouched source (OI-1003-Q76). The Q16/Q36/Q72 exception leg is NOT run as root.
+p77 sqlite root refusal (Closed, OI-1003-Q76): 5 verbs refused SQLITE_SOURCE_AS_ROOT; write events 0; our locks 0; write-mode opens 0; 3 nodes lstat-identical, 2 files byte-identical; 6 samples; writer None
+p77 sqlite leg [live writer]: ROOT (euid 0). ...
+p77 sqlite root refusal (LiveWriter, OI-1003-Q76): 5 verbs refused SQLITE_SOURCE_AS_ROOT; write events 0; our locks 0; write-mode opens 0; 3 nodes lstat-identical, 2 files byte-identical; 6 samples; writer Some(WriterReport { commits: 12, busy: 0, slowest: 277µs })
+p77 sqlite leg [idle writer]: ROOT (euid 0). ...
+p77 sqlite root refusal (IdleWriter, OI-1003-Q76): 5 verbs refused SQLITE_SOURCE_AS_ROOT; write events 0; our locks 0; write-mode opens 0; 5 nodes lstat-identical, 4 files byte-identical; 5 samples; writer Some(WriterReport { commits: 0, busy: 0, slowest: 0ns })
+```
+
+The refused calls return in microseconds, so the sampler takes few samples.
+The complete channels for the refusal are the write watch (a queue), the
+census, the bytes and a lock-table read after the calls return.
+
+**Local user run** (uid 1000, same binary, 13 passed):
+
+```
+p77 sqlite empty -wal (Q72): first snapshot source_wal_index_touched=+1 source_wal_created=+1, -wal events {"close-write", "create"}, -wal 0 bytes, db-read-lock=0 shm-write-open=0 wal-write-open=0 over 7 samples; second snapshot source_wal_created=+0, existing -wal lstat-identical, its events {"close-write"} (close-write is the #157 residual)
+p77 sqlite live writer: 1 attempt(s) ["Ok(()) during 13 commits, 6 samples with our lock so far"]; writer commits=16 busy=0 slowest commit 1.597ms (bound 10s); db-read-lock=6 shm-read-lock=11 shm-read-mark-write=0 over 13 samples, mean period 2942 us
+p77 sqlite exception (sample counts, Q16/Q36/Q72): snapshot 2 of at most 40, 10 samples, mean period 2567 us, db-read-lock=4 shm-read-lock=7 shm-read-mark-write=0 shm-write-open=4 wal-write-open=4 (#157, residual), db-read-lock held 8.573565ms (bound 30s), source_wal_index_touched=+1 source_wal_created=+0, write events {"close-write"}
+```
+
+These ran with the scratch on tmpfs (`/dev/shm`), where a 2 MiB backup takes
+a few milliseconds and can fall between two samples of `/proc/locks`. The
+earlier numbers in this file (71 samples) were on xfs. That is why the
+idle-writer leg now repeats until the exception is seen, and why the live
+leg also waits for a sample that saw this process's lock. In this
+round, before the change, one of the first two runs on tmpfs failed "the
+sampler never saw the database READ lock".
+
+### Mutants for this round
+
+Applied to a copy under `/srv/cache/jess/s2-proof-closure-mut`; all red.
+
+| # | Mutant | Result |
+|---|---|---|
+| S1 | `refuse_source_read_as_root()?` removed from `snapshot` | Under `unshare -r`, all three root legs **red**: `snapshot as root (OI-1003-Q76)`, got `None` or `SQLITE_STATE_CHANGED`, wanted `SQLITE_SOURCE_AS_ROOT`. |
+| S2 | S1, and the test told to run the user leg whatever the uid | Under `unshare -r`, the idle-writer leg **red** with the CI failure itself: `write events outside the -shm: [WriteEvent { path: .../state.db-wal, what: "attrib" }]`. So the user-namespace root reproduces the finding. |
+| S3 | `Footprint::settle` no longer bumps `source_wal_created` | Closed-database leg **red** as a user: counters `(1, 0)`, wanted `(1, 1)`. |
+| S4 | A new `Command::new("git").arg("gc")` in `git_carry/shallow.rs` | P76 **red**: `agent::git_carry::shallow::sneak("git") ... not registered`, and `"gc" rewrites a repository's store`. |
+| S5 | A second `git(..).args(["index-pack", "--stdin"])` in `shallow.rs` | P76 **red**: `"index-pack": 2 uses, ceiling 1`. At `b385f08` plus main this mutant **passed**: the registered number was still 2. |
+
+### P76 against main `a80c63b`
+
+The frozen id list is unchanged and exact: 17 ids, 18 children with the gpg
+probe's two, plus the sanctioned builder. #196 and #198 added no child
+process; #189 removed none of the 17 (carry_v2's children were built
+through `git_carry::git` and the estimate's probe builder).
+
+What #189 did leave behind is slack, and the test passed with it. The
+tables were upper bounds, and one rule tolerated a missing caller "only
+under carry_v2". After the merge that meant:
+
+| Table | Stale at `b385f08` + main | Now |
+|---|---|---|
+| `local_probe` callers | 3 carry_v2 calls registered and gone, tolerated by name | removed; the tolerance is deleted, the caller list is exact |
+| `BUILDERS` | 3 carry_v2 builders | removed; 8 builders, and a listed builder that is gone fails |
+| `EXTRA_CONFIG` | 4 carry_v2 assignments | removed; 3 entries, and an entry no literal spells fails |
+| `WRITERS` | `index-pack` 2 (holds 1), `update-ref` 10 (holds 9) | 1 and 9; 44 uses over 14 writers |
+| `NOT_COMMANDS` | `commit` 6 (holds 4), `tag` 4 (holds 2), `refs` 1 (holds 0) | 4, 2, and `refs` removed; 18 literals |
+
+`stale_entries` now fails the test when any table holds more than the
+workspace bears out, and a self-test (`an_entry_that_outlives_its_code_is_refused`)
+removes a module and requires each table to report it. No rule was
+loosened: every change lowers a number, deletes an entry for deleted code,
+or adds a check. `tests/prop_seed_guard.rs` reports `escapes=0` with these
+files present (neither uses proptest).
+
+```
+p76 static: 17 bypass ids, 8 builders, 44 writer uses over 14 writers, 18 non-command literals, 3 extra config, stale=0
+p76 dynamic: 345 Git children (77 git-export, 36 estimate, 232 estate-capture), 232 aimed at a protected root
+```

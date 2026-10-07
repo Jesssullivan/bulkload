@@ -2,9 +2,10 @@
 
 Rulings: OI-1003-Q5, OI-1003-Q9, OI-1003-Q16, OI-1003-Q36, OI-1003-Q60,
 R-N13. Branch `feat/s2-proof-closure-20261006`, worktree
-`bulkload.worktrees/s2-proof-closure-20261006`. Main `48bd697` (#191, #192)
-is merged in. The recheck stage found no medium or high finding left and
-opens the pull request; see "Recheck stage" below.
+`bulkload.worktrees/s2-proof-closure-20261006`. Main `a80c63b` is merged in
+(`fdc5fac`). PR #197 is open. Its CI failed as root on `b385f08`; the
+second fix round (below, 2026-10-07, adding OI-1003-Q72 and OI-1003-Q76)
+answers that.
 
 **State: S2's lock and write properties are NOT closed.** Two property
 tests exist and are red on mutation leg by leg. What they do not prove is
@@ -99,10 +100,52 @@ lane.
   Take the path from cargo's `Executable` line, not from the target
   directory.
 
+## Second fix round, 2026-10-07 (root, the empty `-wal`, exact tables)
+
+Rulings: OI-1003-Q76, OI-1003-Q72, OI-1003-Q5, OI-1003-Q9, OI-1003-Q16,
+OI-1003-Q60, R-N13. No production code changed. Detail and receipts are in
+section 5 of the evidence document.
+
+- **Why.** PR CI failed on `b385f08` (run 37540759845): as root, SQLite
+  re-applies ownership to the `-wal` it opens, and P77's write watch
+  reported `attrib` on the source `-wal`. The operator ruled OI-1003-Q76
+  (the provider refuses a source read as root; #196). Main had also moved
+  to `a80c63b` (#189, #194, #195, #196, #198).
+- **Merge.** `fdc5fac` merges main `a80c63b`. One conflict, the property
+  plan; both sides' rows kept in order (P74, P75, P76, P77).
+- **P77.** The SQLite legs print which half they run. As root: the five
+  provider verbs refuse `SQLITE_SOURCE_AS_ROOT` on an idle-writer, a closed
+  and a live-writer source, with no write event, no lock, and the directory
+  byte- and metadata-identical. As a user: the Q16/Q36/Q72 exception, now
+  with both counters, and a new closed-database leg for the empty `-wal`.
+  `WAL_OPENED_READ_WRITE` became `RESIDUAL_WAL_OPEN_READ_WRITE`, documented
+  against Q72's wording.
+- **P76.** The id list was already exact and is unchanged (17). The other
+  tables were upper bounds and passed with carry_v2's leftovers: three
+  callers, three builders, four `-c` entries and five slack numbers. All
+  removed or lowered; `stale_entries` now fails on any of them.
+- **A flake found and fixed.** With the scratch on tmpfs the 2 MiB backup
+  can fall between two `/proc/locks` samples, and the idle-writer leg
+  failed "the sampler never saw the database READ lock" in one of the
+  first two runs.
+  It now repeats until one snapshot is seen (at most 40; each held to every
+  limit); the live leg waits for a sampled lock too.
+- **Mutants** (scratch copy, all red): S1 to S5 in the evidence document.
+  S2 reproduces the CI failure under `unshare -r`. S5 passed before this
+  round.
+- **Root run recorded:** `unshare -r <source_lock_trace binary> --nocapture
+  --test-threads=1`, 13 passed; the lines are in the evidence document.
+
 ## Open
 
-- **The `-wal` `O_RDWR` open (#157).** The criterion "no write-mode open
-  but the `-shm`" is not met. It needs a provider fix or a Q36 amendment.
+- **The `O_RDWR` open of an existing `-wal` (#157).** A named residual
+  (`RESIDUAL_WAL_OPEN_READ_WRITE`): Q16, Q36 and Q72 neither grant nor
+  refuse it. The criterion "no write-mode open but the `-shm`" is not met.
+  It needs a provider change or a ruling.
+- **CI proves the refusal half only.** PR CI runs as root, so P77's SQLite
+  legs assert `SQLITE_SOURCE_AS_ROOT` there and never run a backup. The
+  Q16/Q36/Q72 exception is proved by local runs as a user. The local root
+  run is `unshare -r`, a user-namespace root, not real root.
 - **A typed source/private Git builder (#188).** The writer table is a
   census until it exists.
 - **Two unhardened Git children in `bulkload-handoff` (#188).**
@@ -112,8 +155,10 @@ lane.
 - **Cross-lane friction.** The registry pins text and counts in files other
   lanes own. A lane that adds a writer subcommand or a `-c` in the
   `git_carry` tree, or changes `main::pull_command`'s ssh arguments or a
-  handoff Git probe, fails P76 until the registry is updated. Deleting
-  `carry_v2` is tolerated: ceilings only shrink.
+  handoff Git probe, fails P76 until the registry is updated. Since the
+  second fix round the tables are exact, so *removing* a writer use, a
+  builder, a registered caller or an extra `-c` also fails P76 until its
+  entry is lowered or deleted.
 - #165 (the S2 budget run on neo), the load1-lag estimator ruling, FADV and
   the no-signals scan are untouched.
 
@@ -126,6 +171,10 @@ lane.
 - `ad80d52`: the evidence doc, the plan rows and this note after the fix
   round. `just check-fast` exited 0 on that head; the receipt is on #188.
 - `c8c1783`: merge of main `48bd697`.
-- The commit that carries this section holds the recheck stage's edits.
-  `just check-fast` ran on that tree before the commit; its receipt is in
-  the pull request, because a commit cannot carry its own receipt.
+- `b385f08`: the recheck stage's edits. CI failed on it as root (run
+  37540759845).
+- `fdc5fac`: merge of main `a80c63b` (second fix round).
+- The commit that carries this line holds the second fix round's tests,
+  plan rows, evidence and this note. `just check-fast` ran on that tree
+  before the commit; its receipt is in the pull request, because a commit
+  cannot carry its own receipt.

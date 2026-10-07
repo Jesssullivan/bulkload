@@ -120,18 +120,6 @@ const BYPASSES: &[Bypass] = &[
                 "agent::git_carry::estimate::estimate_with",
                 "run_probe(&mutlocal_probe(path),store)",
             ),
-            (
-                "agent::git_carry::carry_v2::probe",
-                "run_probe(&mutlocal_probe(path),store)",
-            ),
-            (
-                "agent::git_carry::carry_v2::probe",
-                "run_probe(&mutlocal_probe(path),store)",
-            ),
-            (
-                "agent::git_carry::carry_v2::ingest::probe",
-                "run_probe(&mutlocal_probe(path),store)",
-            ),
         ],
         why: "Runs PROBE_SCRIPT on the local source: `bash -s -- REPOSITORY` \
               with the script on stdin (run_probe writes nothing else). Every \
@@ -446,7 +434,9 @@ const OPEN_FORMS: &[(&str, &str, &str)] = &[(
 /// one must run on a capture's private repository or a destination, never a
 /// source. The scan cannot prove which: the dynamic leg does for the verbs it
 /// runs, and a typed source/private builder split is asked for on
-/// bulkload#188. A ceiling only shrinks.
+/// bulkload#188. A number is a pin, not a ceiling: the tree holds exactly
+/// that many ([`stale_entries`]), so a removed writer cannot leave room for a
+/// new one. It is lowered with the code and never raised.
 const WRITERS: &[(&str, usize, &str)] = &[
     (
         "add",
@@ -480,11 +470,7 @@ const WRITERS: &[(&str, usize, &str)] = &[
         4,
         "The capture's private write store and a bundle's envelope repository.",
     ),
-    (
-        "index-pack",
-        2,
-        "shallow::unpack and carry_v2 ingest: the destination's store.",
-    ),
+    ("index-pack", 1, "shallow::unpack: the destination's store."),
     (
         "init",
         5,
@@ -509,7 +495,7 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "update-ref",
-        10,
+        9,
         "The capture's private repository, a chain's scratch repository, a \
          bundle's envelope, and the destination of an import or restore.",
     ),
@@ -529,7 +515,8 @@ const WRITERS: &[(&str, usize, &str)] = &[
 
 /// Literals that spell a Git command but are not one where they stand (an
 /// object type, a configuration field, a file or directory name): none is an
-/// argument of a Git child. Each with the most the `git_carry` tree may hold.
+/// argument of a Git child. Each with how many the `git_carry` tree holds,
+/// exactly ([`stale_entries`]).
 const NOT_COMMANDS: &[(&str, usize, &str)] = &[
     (
         "clean",
@@ -538,18 +525,17 @@ const NOT_COMMANDS: &[(&str, usize, &str)] = &[
     ),
     (
         "commit",
-        6,
+        4,
         "An object type, as cat-file and for-each-ref print it.",
     ),
     ("config", 2, "The repository's `config` file name."),
     ("fetch", 1, "The remote.origin.fetch configuration field."),
     ("merge", 1, "The branch.NAME.merge configuration field."),
     ("rebase", 1, "The branch.NAME.rebase configuration field."),
-    ("refs", 1, "The `refs` directory name."),
     ("remote", 1, "The branch.NAME.remote configuration field."),
     (
         "tag",
-        4,
+        2,
         "An object type, as cat-file and for-each-ref print it.",
     ),
     ("worktree", 4, "The name of a capture's worktree revision."),
@@ -688,7 +674,8 @@ const GIT_COMMANDS: &[&str] = &[
 ];
 
 /// `-c` assignments a caller adds after the sanctioned builder's own, each
-/// argued. None may name a key of `git_env::CONFIG` (the last `-c` wins).
+/// argued. None may name a key of `git_env::CONFIG` (the last `-c` wins), and
+/// every entry is one a literal still spells ([`stale_entries`]).
 const EXTRA_CONFIG: &[(&str, &str)] = &[
     (
         "core.bare=false",
@@ -697,27 +684,11 @@ const EXTRA_CONFIG: &[(&str, &str)] = &[
     ),
     (
         "pack.useSparse=false",
-        "The estimate's and carry_v2's pack-objects: a plain reachability walk.",
+        "The estimate's pack-objects: a plain reachability walk.",
     ),
     (
         "pack.useBitmaps=false",
-        "The estimate's and carry_v2's pack-objects: no bitmap is read or written.",
-    ),
-    (
-        "pack.useSparse=false pack.useBitmaps=false pack.threads=2 pack.windowMemory=64m",
-        "carry_v2's recorded pack settings (a wire string, not an argument).",
-    ),
-    (
-        "core.fsync=committed,derived-metadata",
-        "carry_v2 ingest: durability of the destination's own store.",
-    ),
-    (
-        "core.fsyncMethod=fsync",
-        "carry_v2 ingest: durability of the destination's own store.",
-    ),
-    (
-        "core.commitGraph=false",
-        "carry_v2 ingest: the destination reads no commit-graph.",
+        "The estimate's pack-objects: no bitmap is read or written.",
     ),
 ];
 
@@ -751,11 +722,9 @@ const INJECTING_ENV: &[&str] = &[
 
 /// Non-test agent functions that return a `Command`. None is `pub` or
 /// `pub(crate)`, so no code outside the `git_carry` tree can take a Git
-/// builder and add to it.
+/// builder and add to it. The list is exact: an entry whose function is
+/// gone fails, as an unlisted builder does.
 const BUILDERS: &[&str] = &[
-    "agent::git_carry::carry_v2::ingest::git",
-    "agent::git_carry::carry_v2::ingest::quarantined",
-    "agent::git_carry::carry_v2::pinned",
     "agent::git_carry::estimate::hardened",
     "agent::git_carry::estimate::local_probe",
     "agent::git_carry::estimate::ssh_command",
@@ -1620,8 +1589,9 @@ fn caller_breaches(sources: &[Source], bypasses: &[Bypass]) -> Vec<String> {
             .map(|(caller, call)| ((*caller).to_owned(), (*call).to_owned()))
             .collect();
         registered.sort();
-        // Every call is a registered one. A registered call may be gone
-        // only under carry_v2, which is frozen and being removed.
+        // Every call is a registered one, and every registered call is
+        // made: the lists are equal (carry_v2 is gone, #189, and with it the
+        // tolerance for its calls).
         let mut unmatched = registered;
         let mut unregistered = Vec::new();
         for call in &calls {
@@ -1632,7 +1602,6 @@ fn caller_breaches(sources: &[Source], bypasses: &[Bypass]) -> Vec<String> {
                 None => unregistered.push(call),
             }
         }
-        unmatched.retain(|(caller, _)| !caller.contains("::carry_v2::"));
         if !unregistered.is_empty() || !unmatched.is_empty() {
             found.push(format!(
                 "{}: its callers changed.\n  not registered: {unregistered:#?}\n  \
@@ -1969,9 +1938,92 @@ fn position(file: &Scanned, literal: &Range<usize>) -> Position {
 
 /// Every way non-test agent code could undo the sanctioned builder's
 /// contract or aim a writer at a repository without registering it.
-#[allow(clippy::too_many_lines)]
 fn contract_breaches(sources: &[Source], tables: &Tables) -> Vec<String> {
+    contract_scan(sources, tables).found
+}
+
+/// What one pass over the agent's literals found: the breaches, and which
+/// entries of the argued tables the pass used.
+#[derive(Default)]
+struct ContractScan {
+    found: Vec<String>,
+    /// Uses of each [`WRITERS`] (`true`) and [`NOT_COMMANDS`] (`false`) entry.
+    counted: BTreeMap<(bool, &'static str), Vec<String>>,
+    /// The [`EXTRA_CONFIG`] entries a literal spelled.
+    extra_config: BTreeSet<&'static str>,
+    /// The [`OPEN_FORMS`] entries (function, subcommand) a literal met.
+    open_forms: BTreeSet<(&'static str, &'static str)>,
+    /// The [`CONFIG_INJECTORS`] functions that named an injecting variable.
+    injectors: BTreeSet<&'static str>,
+}
+
+/// Entries of the argued tables that the workspace no longer bears out, so a
+/// table cannot keep room, or a reason, for code that is gone (found after
+/// #189 deleted `carry_v2`: its three probe calls, three builders, four
+/// configuration entries and one `index-pack` use all still passed).
+///
+/// - a [`WRITERS`] or [`NOT_COMMANDS`] number above the uses the scan counts;
+/// - an [`EXTRA_CONFIG`] assignment no literal spells;
+/// - an [`OPEN_FORMS`] entry or a [`CONFIG_INJECTORS`] function the scan never
+///   met;
+/// - a [`BUILDERS`] entry that is not a function returning a `Command`.
+///
+/// It reads the real workspace only: a synthetic source adds uses, so the
+/// self-tests go through [`contract_breaches`].
+fn stale_entries(sources: &[Source], tables: &Tables) -> Vec<String> {
+    let scan = contract_scan(sources, tables);
+    let mut stale = Vec::new();
+    for (writer, (name, pinned, _)) in WRITERS
+        .iter()
+        .map(|entry| (true, entry))
+        .chain(NOT_COMMANDS.iter().map(|entry| (false, entry)))
+    {
+        let uses = scan.counted.get(&(writer, *name)).map_or(0, Vec::len);
+        if uses < *pinned || *pinned == 0 {
+            stale.push(format!(
+                "{} {name:?}: registered as {pinned}, the tree holds {uses}; lower the number",
+                if writer { "WRITERS" } else { "NOT_COMMANDS" }
+            ));
+        }
+    }
+    for (extra, _) in EXTRA_CONFIG {
+        if !scan.extra_config.contains(extra) {
+            stale.push(format!("EXTRA_CONFIG {extra:?}: no literal assigns it"));
+        }
+    }
+    for (function, sub, _) in OPEN_FORMS {
+        if !scan.open_forms.contains(&(*function, *sub)) {
+            stale.push(format!(
+                "OPEN_FORMS {function} {sub:?}: no such open form in the tree"
+            ));
+        }
+    }
+    for (function, _) in CONFIG_INJECTORS {
+        if !scan.injectors.contains(function) {
+            stale.push(format!(
+                "CONFIG_INJECTORS {function}: it names no injecting variable"
+            ));
+        }
+    }
+    let built: BTreeSet<String> = builders(sources).into_iter().map(|(id, _)| id).collect();
+    for builder in BUILDERS {
+        if !built.contains(*builder) {
+            stale.push(format!(
+                "BUILDERS {builder}: no such function returns a Command"
+            ));
+        }
+    }
+    stale
+}
+
+/// One pass over every literal of `sources`: the breaches
+/// ([`contract_breaches`]) and the table entries the pass used.
+#[allow(clippy::too_many_lines)]
+fn contract_scan(sources: &[Source], tables: &Tables) -> ContractScan {
     let mut found = Vec::new();
+    let mut extra_config = BTreeSet::new();
+    let mut open_forms = BTreeSet::new();
+    let mut injectors = BTreeSet::new();
     let config = tables.config_pairs();
     let guarded_env: Vec<(&str, &str)> = tables
         .set
@@ -1980,7 +2032,7 @@ fn contract_breaches(sources: &[Source], tables: &Tables) -> Vec<String> {
         .map(|(key, value)| (key.as_str(), value.as_str()))
         .collect();
     // Uses of each WRITERS and each NOT_COMMANDS entry, keyed by the list.
-    let mut counted: BTreeMap<(bool, &str), Vec<String>> = BTreeMap::new();
+    let mut counted: BTreeMap<(bool, &'static str), Vec<String>> = BTreeMap::new();
     for (extra, _) in EXTRA_CONFIG {
         let key = assignment_key(extra).unwrap_or_default();
         if config.iter().any(|(guarded, _)| *guarded == key) {
@@ -2010,7 +2062,9 @@ fn contract_breaches(sources: &[Source], tables: &Tables) -> Vec<String> {
             // Configuration: a whole assignment must be registered, and an
             // embedded one must repeat the table.
             if assignment_key(literal).is_some() {
-                if !EXTRA_CONFIG.iter().any(|(extra, _)| *extra == literal) {
+                if let Some((extra, _)) = EXTRA_CONFIG.iter().find(|(extra, _)| *extra == literal) {
+                    extra_config.insert(*extra);
+                } else {
                     found.push(format!(
                         "{at}: {literal:?} assigns Git configuration outside git_env \
                          (the last -c wins); register it in EXTRA_CONFIG"
@@ -2033,9 +2087,16 @@ fn contract_breaches(sources: &[Source], tables: &Tables) -> Vec<String> {
                 || literal.starts_with("GIT_CONFIG_VALUE_");
             let guarded = guarded_env.iter().any(|(key, _)| *key == literal);
             let function = file.path_at(&source.module, span.start);
-            let injector = literal.starts_with("GIT_CONFIG_")
-                && literal != "GIT_CONFIG_PARAMETERS"
-                && CONFIG_INJECTORS.iter().any(|(id, _)| *id == function);
+            let injecting = CONFIG_INJECTORS
+                .iter()
+                .find(|(id, _)| *id == function)
+                .filter(|_| {
+                    literal.starts_with("GIT_CONFIG_") && literal != "GIT_CONFIG_PARAMETERS"
+                });
+            if let Some((id, _)) = injecting {
+                injectors.insert(*id);
+            }
+            let injector = injecting.is_some();
             if (injects || guarded)
                 && !injector
                 && function != "agent::git_carry::estimate::local_probe"
@@ -2098,9 +2159,13 @@ fn contract_breaches(sources: &[Source], tables: &Tables) -> Vec<String> {
                             })
                             .collect();
                         let open = rest.is_empty() || rest.contains(&Arg::Many);
-                        let registered = OPEN_FORMS
+                        let form = OPEN_FORMS
                             .iter()
-                            .any(|(id, sub, _)| *id == function && *sub == literal);
+                            .find(|(id, sub, _)| *id == function && *sub == literal);
+                        if let Some((id, sub, _)) = form {
+                            open_forms.insert((*id, *sub));
+                        }
+                        let registered = form.is_some();
                         if !MULTI_FORM.contains(&literal) || read_form(literal, &spelled).is_ok() {
                             if rest.contains(&Arg::Many)
                                 && MULTI_FORM.contains(&literal)
@@ -2188,7 +2253,13 @@ fn contract_breaches(sources: &[Source], tables: &Tables) -> Vec<String> {
             ));
         }
     }
-    found
+    ContractScan {
+        found,
+        counted,
+        extra_config,
+        open_forms,
+        injectors,
+    }
 }
 
 /// Every non-test agent function that returns a `Command`, with whether it
@@ -2726,11 +2797,36 @@ fn the_source_safe_builder_holds_the_s2_contract() {
 fn no_caller_undoes_the_contract_or_runs_an_unregistered_writer() {
     let sources = agent_sources();
     let tables = Tables::read(&sources);
-    let found = contract_breaches(&sources, &tables);
+    let scan = contract_scan(&sources, &tables);
     assert!(
-        found.is_empty(),
+        scan.found.is_empty(),
         "S2 contract breaches:\n{}",
-        found.join("\n")
+        scan.found.join("\n")
+    );
+    // The tables are exact, not upper bounds (see `stale_entries`).
+    let stale = stale_entries(&sources, &tables);
+    assert!(
+        stale.is_empty(),
+        "registry entries the workspace no longer bears out; shrink the \
+         table, never the rule:\n{}",
+        stale.join("\n")
+    );
+    let uses = |writer: bool| -> usize {
+        scan.counted
+            .iter()
+            .filter(|((is_writer, _), _)| *is_writer == writer)
+            .map(|(_, places)| places.len())
+            .sum()
+    };
+    eprintln!(
+        "p76 static: {} bypass ids, {} builders, {} writer uses over {} writers, \
+         {} non-command literals, {} extra config, stale=0",
+        BYPASSES.len(),
+        BUILDERS.len(),
+        uses(true),
+        WRITERS.len(),
+        uses(false),
+        EXTRA_CONFIG.len()
     );
     let known: BTreeSet<&str> = GIT_COMMANDS.iter().copied().collect();
     for name in READS.iter().chain(MAINTENANCE).chain(MULTI_FORM) {
@@ -2862,6 +2958,82 @@ fn each_way_of_undoing_the_contract_is_refused() {
     assert_eq!(
         shell_git_subcommands("g() { git --no-optional-locks -c a.b=c \"$@\"; }\nif head=$(g --git-dir=\"$x\" rev-parse -q HEAD); then :; fi\nversion=$(git version) || exit 5"),
         ["$@", "rev-parse", "version"]
+    );
+}
+
+/// The tables are exact: with a module taken away, every entry that module
+/// bore out is reported, table by table, and the registered callers of a
+/// bypass builder are reported gone. On the whole workspace nothing is.
+#[test]
+fn an_entry_that_outlives_its_code_is_refused() {
+    const GONE: &[Bypass] = &[Bypass {
+        id: "agent::git_carry::estimate::local_probe(\"bash\")",
+        shape: None,
+        callers: &[(
+            "agent::git_carry::carry_v2::probe",
+            "run_probe(&mutlocal_probe(path),store)",
+        )],
+        why: "self-test",
+    }];
+    let sources = agent_sources();
+    let tables = Tables::read(&sources);
+    assert_eq!(stale_entries(&sources, &tables), Vec::<String>::new());
+    let without = |module: &str| -> Vec<Source> {
+        let kept: Vec<Source> = agent_sources()
+            .into_iter()
+            .filter(|source| source.module != module)
+            .collect();
+        assert_eq!(kept.len() + 1, sources.len(), "{module} is one source");
+        kept
+    };
+    for (module, expected) in [
+        (
+            "agent::git_carry::shallow",
+            &["WRITERS \"index-pack\": registered as 1, the tree holds 0"][..],
+        ),
+        (
+            "agent::git_carry::estimate",
+            &[
+                "EXTRA_CONFIG \"pack.useSparse=false\"",
+                "EXTRA_CONFIG \"pack.useBitmaps=false\"",
+                "BUILDERS agent::git_carry::estimate::hardened",
+                "BUILDERS agent::git_carry::estimate::local_probe",
+                "BUILDERS agent::git_carry::estimate::ssh_command",
+            ][..],
+        ),
+        (
+            "agent::git_carry",
+            &[
+                "EXTRA_CONFIG \"core.bare=false\"",
+                "OPEN_FORMS agent::git_carry::partial_clone \"config\"",
+                "CONFIG_INJECTORS agent::git_carry::nest_status",
+                "BUILDERS agent::git_carry::git:",
+                "WRITERS \"write-tree\": registered as 1, the tree holds 0",
+            ][..],
+        ),
+    ] {
+        let stale = stale_entries(&without(module), &tables);
+        for entry in expected {
+            assert!(
+                stale.iter().any(|line| line.contains(entry)),
+                "without {module}, {entry:?} was not reported stale: {stale:#?}"
+            );
+        }
+    }
+    // A registered caller that is gone is a breach, with no exception.
+    let found = caller_breaches(&without("agent::git_carry::estimate"), BYPASSES);
+    assert!(
+        found
+            .iter()
+            .any(|breach| breach.contains("local_probe") && breach.contains("registered and gone")),
+        "{found:#?}"
+    );
+    let found = caller_breaches(&sources, GONE);
+    assert!(
+        found
+            .iter()
+            .any(|breach| breach.contains("registered and gone") && breach.contains("carry_v2")),
+        "{found:#?}"
     );
 }
 
