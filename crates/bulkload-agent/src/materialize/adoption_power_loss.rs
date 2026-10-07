@@ -21,6 +21,10 @@
 //!   a resume must adopt a surviving output from its capture record without
 //!   reading a source byte, and must complete a lost one.
 //!
+//! - S1 (OI-1003-Q107): a group of several outputs is sealed device-wide,
+//!   one `syncfs` before its renames and one after. No power-loss state may
+//!   name an output whose bytes are not there.
+//!
 //! Each crashed run is replayed with the real calls the engine makes before
 //! its fault point. The resume then runs through `Destination::directory`, a
 //! staged write, a `PublishSink` group commit, `finish_directories` and
@@ -38,7 +42,7 @@ use super::*;
 use crate::io::crash_check::{check, check_view, Entry, Image, Options};
 use crate::io::durable::GroupSink as _;
 use crate::io::trace::recorder::Recorder;
-use crate::io::trace::{CommitRecord, Event};
+use crate::io::trace::{CommitRecord, Event, SyncKind};
 use crate::transfer_store::PublisherSide;
 
 fn scratch(tag: &str) -> PathBuf {
@@ -350,4 +354,127 @@ fn chunk_specs(data: &[u8]) -> Vec<bulkload_proto::frame::ChunkSpec> {
         size: chunk.length as u64,
     })
     .collect()
+}
+
+/// The outputs of the batched group proof.
+const GROUP: [(&str, &[u8]); 3] = [
+    ("a", b"alpha-bytes"),
+    ("b", b"bravo"),
+    ("c", b"charlie-bytes!"),
+];
+
+/// S1 (OI-1003-Q107): commit three outputs in one group, which Linux group
+/// mode seals device-wide. In every power-loss state of that commit, each
+/// final name is absent or holds exactly its output's bytes, and every
+/// committed output is present.
+#[test]
+fn a_batched_group_names_no_output_before_its_data_is_durable() {
+    if !crate::io::durable::batched(GROUP.len()) {
+        return;
+    }
+    let base = scratch("batched");
+    let (source, destination, state) = (
+        base.join("source"),
+        base.join("destination"),
+        base.join("state"),
+    );
+    for (name, data) in GROUP {
+        std::fs::write(source.join(name), data).unwrap();
+    }
+    let all = rows(&source);
+    let store = Store::open(&state).unwrap();
+    let image = Image::scan(&destination).unwrap();
+    let recorder = Recorder::new();
+    let _alone = ALONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    {
+        let _attached = recorder.attach_process();
+        let target = Destination::open(&destination, &store).unwrap();
+        let mut publications = Vec::new();
+        for (name, data) in GROUP {
+            let row = all
+                .iter()
+                .find(|row| row.rel_path == name.as_bytes())
+                .unwrap();
+            let staged = target.stage(row).unwrap();
+            crate::io::sys::pwrite_all(&**staged.file(), data, 0).unwrap();
+            crate::io::durable::start_writeback(staged.file());
+            publications.push(Publication::Staged {
+                staged,
+                record: PendingOutput {
+                    key: name.as_bytes().to_vec(),
+                    rel_path: name.as_bytes().to_vec(),
+                    size: row.size,
+                    racy: false,
+                    hints: Vec::new(),
+                },
+            });
+        }
+        let mut sink = PublishSink::new(
+            Store::open(&state)
+                .unwrap()
+                .into_publisher(PublisherSide::Destination)
+                .unwrap(),
+        )
+        .unwrap();
+        sink.commit(publications);
+        let report = sink.finish();
+        assert!(
+            report.iter().all(|(_, outcome)| outcome.is_ok()),
+            "{report:?}"
+        );
+    }
+    let events = recorder.take();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                Event::Sync {
+                    kind: SyncKind::FsSync,
+                    ..
+                }
+            ))
+            .count(),
+        2,
+        "one syncfs before the renames and one after"
+    );
+    let options = Options {
+        ignore_foreign: true,
+        accept_bounded: true,
+        ..Options::default()
+    };
+    let report = check_view(&image, &events, &options, |view, info| {
+        for (name, data) in GROUP {
+            match view.get(name.as_bytes()) {
+                None => {}
+                Some(Entry::File { data: held, .. }) if held == data => {}
+                other => return Err(format!("output {name} is {other:?}")),
+            }
+        }
+        for commit in &info.commits {
+            let Event::Commit { records, .. } = &events[*commit] else {
+                continue;
+            };
+            for record in records {
+                if let CommitRecord::Output { rel_path } = record {
+                    if view.get(rel_path).is_none() {
+                        return Err(format!(
+                            "committed output {} is not named",
+                            String::from_utf8_lossy(rel_path)
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(
+        report.passed(),
+        "a batched group named an output its bytes did not reach:\n{}",
+        report.summary(&events)
+    );
 }

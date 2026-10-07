@@ -145,6 +145,82 @@ fn correct_publish_passes_under_every_durable_sync_pair() {
     }
 }
 
+/// create tmp, write, [`FsSync` on `first`], rename tmp -> data, `FsSync`
+/// on `second`: the batched group seal (S1, OI-1003-Q107), whose syncs name
+/// whichever node of the drive the group holds, not the files they cover.
+fn fs_sync_trace(first: Option<NodeId>, second: NodeId) -> Vec<Event> {
+    let mut events = vec![
+        Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"tmp".to_vec()),
+            node: TMP,
+            mode: 0o600,
+        },
+        write(TMP, NEW),
+    ];
+    if let Some(node) = first {
+        events.push(Event::Sync {
+            node,
+            kind: SyncKind::FsSync,
+        });
+    }
+    events.push(Event::Rename {
+        node: TMP,
+        from_dir: ROOT,
+        from: b"tmp".to_vec(),
+        to_dir: ROOT,
+        to: b"data".to_vec(),
+    });
+    events.push(Event::Sync {
+        node: second,
+        kind: SyncKind::FsSync,
+    });
+    events
+}
+
+#[test]
+fn a_file_system_sync_on_any_node_of_the_drive_seals_every_object() {
+    for scope in [BarrierScope::Object, BarrierScope::Device] {
+        let options = Options {
+            barrier_scope: scope,
+            ..Options::default()
+        };
+        let report = run(&fs_sync_trace(Some(LEDGER), KEEP_NODE), &options);
+        assert!(
+            report.passed(),
+            "syncfs before and after the rename must pass"
+        );
+        assert!(report.bounded.is_empty());
+    }
+}
+
+#[test]
+fn a_file_system_sync_only_after_the_rename_fails() {
+    let report = run(&fs_sync_trace(None, KEEP_NODE), &Options::default());
+    assert!(
+        !report.passed(),
+        "the rename can persist ahead of the data it names"
+    );
+    assert!(report
+        .violations
+        .iter()
+        .any(|violation| violation.message.contains("wrong bytes")));
+}
+
+#[test]
+fn a_file_system_sync_of_another_drive_makes_nothing_durable() {
+    const ELSEWHERE: NodeId = NodeId { dev: 2, ino: 9 };
+    let report = run(
+        &fs_sync_trace(Some(ELSEWHERE), ELSEWHERE),
+        &Options::default(),
+    );
+    assert!(!report.passed());
+    assert!(report
+        .violations
+        .iter()
+        .any(|violation| violation.message.contains("not durable")));
+}
+
 #[test]
 fn publish_without_the_file_sync_fails() {
     for dir in [SyncKind::Fsync, SyncKind::FullFlush] {

@@ -2740,6 +2740,7 @@ impl<W: Write> Inbound<'_, W> {
             return Err(refusal);
         }
         fault_point!(MaterializeAfterTempWrite);
+        crate::io::durable::start_writeback(staged.file());
         self.session.insert(Arc::clone(staged.file()), &hints);
         self.committer.submit(Publication::Staged {
             staged,

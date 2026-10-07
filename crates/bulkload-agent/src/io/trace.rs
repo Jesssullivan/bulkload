@@ -38,6 +38,10 @@ pub enum SyncKind {
     /// durable, and the device cache is drained, so every operation already
     /// sent to the device by an earlier sync of any object is durable too.
     FullFlush,
+    /// Linux `syncfs`: every pending operation on every object of the file
+    /// system holding the object is durable, data, metadata and entries, and
+    /// the device cache is flushed (S1, OI-1003-Q107).
+    FsSync,
 }
 
 /// One mutating syscall.

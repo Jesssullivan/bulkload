@@ -179,6 +179,9 @@ counters! {
     FlushDirNs => "flush_dir_ns",
     FlushDirBarrier => "flush_dir_barrier_count",
     FlushDirBarrierNs => "flush_dir_barrier_ns",
+    // A batched group seal: one `syncfs` per touched device (S1, Q107).
+    FlushFs => "flush_fs_count",
+    FlushFsNs => "flush_fs_ns",
     // Group commit (io::durable) and transport tuning.
     DurableGroups => "durable_groups",
     TransportTuned => "transport_buffers_raised",

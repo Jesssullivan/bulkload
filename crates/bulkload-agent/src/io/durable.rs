@@ -13,6 +13,16 @@
 //!    drains the store's device, which is the only device-cache flush a
 //!    group needs when its files share that device.
 //!
+//! On Linux in group mode a group of [`BATCH_MIN_FILES`] or more outputs is
+//! sealed in two device-wide steps instead (S1, OI-1003-Q107): each output's
+//! write-back starts as it is queued ([`start_writeback`]); the group then
+//! runs one `syncfs` per device its outputs live on ([`seal_device`]), which
+//! makes every temporary's data durable under its temporary name; renames
+//! every output into place; and runs one `syncfs` per touched device again,
+//! which makes the new entries durable, before the records commit. The
+//! renames never precede the first seal: a name must not survive a power
+//! loss that its data did not.
+//!
 //! The load-bearing order is data before record: a record never commits
 //! before the bytes it describes are sealed and, on another device, flushed.
 //! A sink that fails stops the committer's callers at their next
@@ -86,6 +96,51 @@ pub fn durability() -> Durability {
         Durability::Group
     } else {
         Durability::Strict
+    }
+}
+
+/// The smallest group sealed with [`seal_device`] rather than file by file:
+/// for one file a `syncfs` costs no less than its own flush, and it also
+/// flushes whatever else is dirty on that file system.
+pub const BATCH_MIN_FILES: usize = 2;
+
+/// Whether a group of `files` outputs is sealed device-wide (Linux, group
+/// mode, at least [`BATCH_MIN_FILES`]).
+#[must_use]
+pub fn batched(files: usize) -> bool {
+    cfg!(target_os = "linux") && durability() == Durability::Group && files >= BATCH_MIN_FILES
+}
+
+/// Start write-back of a fully written output as it is queued for its group.
+///
+/// Linux, group mode only, so the group's [`seal_device`] finds less to
+/// write. Not a durability step: a failure is ignored, and the group seal
+/// still makes the data durable.
+pub fn start_writeback(file: &File) {
+    #[cfg(target_os = "linux")]
+    if durability() == Durability::Group {
+        let _ = super::sys::start_writeback(file);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+}
+
+/// Seal every file of the file system holding `handle`: its data, metadata
+/// and directory entries (Linux `syncfs`). Only a [`batched`] group calls it.
+///
+/// # Errors
+/// Returns the flush failure; `Unsupported` off Linux.
+pub fn seal_device(handle: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        counters::timed(Counter::FlushFs, Counter::FlushFsNs, || {
+            super::sys::sync_fs(handle)
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = handle;
+        Err(std::io::ErrorKind::Unsupported.into())
     }
 }
 

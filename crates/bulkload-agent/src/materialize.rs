@@ -1060,7 +1060,17 @@ impl TouchedDevices {
     /// Seal every touched directory once, then, in group mode, fully flush
     /// each touched device other than `store_device`: the store commit that
     /// follows drains only its own device. Returns the devices flushed.
-    fn seal(&self, store_device: u64) -> Result<usize> {
+    ///
+    /// A `batched` group instead seals each touched device once
+    /// ([`crate::io::durable::seal_device`]), which makes every entry it
+    /// renamed durable, the store's device included.
+    fn seal(&self, store_device: u64, batched: bool) -> Result<usize> {
+        if batched {
+            for handle in self.devices.values() {
+                crate::io::durable::seal_device(handle).refuse_at("materialize::seal")?;
+            }
+            return Ok(self.devices.len());
+        }
         for directory in &self.directories {
             crate::io::durable::seal_dir(directory).refuse_at("materialize::seal")?;
         }
@@ -1104,6 +1114,27 @@ impl crate::io::durable::GroupSink for PublishSink {
                 .sum();
             crate::fault::note_group(&ids, chunks)
         };
+        let batched = crate::io::durable::batched(items.len());
+        let mut items = items;
+        if batched {
+            if let Err(refusal) = seal_group_data(&mut items) {
+                // Nothing was renamed: each temporary is removed and each
+                // output of the group carries the seal's refusal.
+                let refusal = space_refusal(refusal);
+                for item in items {
+                    let rel_path = match item {
+                        Publication::Staged { staged, record } => {
+                            let _ = staged.discard();
+                            record.rel_path
+                        }
+                        Publication::Adopted { record, .. } => record.rel_path,
+                    };
+                    self.outcomes.push((rel_path, Err(refusal.clone())));
+                }
+                self.notify_group(reported);
+                return;
+            }
+        }
         let mut records = Vec::with_capacity(items.len());
         let mut touched = TouchedDevices::default();
         for item in items {
@@ -1127,7 +1158,11 @@ impl crate::io::durable::GroupSink for PublishSink {
                     record,
                     file,
                     parent,
-                } => match crate::io::durable::seal_file(&file) {
+                } => match if batched {
+                    Ok(())
+                } else {
+                    crate::io::durable::seal_file(&file)
+                } {
                     Ok(()) => {
                         touched.directory(parent);
                         records.push(record);
@@ -1142,7 +1177,7 @@ impl crate::io::durable::GroupSink for PublishSink {
                 },
             }
         }
-        let committed = touched.seal(self.store_device).and_then(|_| {
+        let committed = touched.seal(self.store_device, batched).and_then(|_| {
             fault_point_in!(
                 PublishDestinationAfterDirSeal,
                 self.publisher.store().root()
@@ -1155,6 +1190,22 @@ impl crate::io::durable::GroupSink for PublishSink {
         for record in records {
             self.outcomes.push((record.rel_path, committed.clone()));
         }
+        self.notify_group(reported);
+    }
+
+    fn failure(&self) -> Option<BulkloadRefusal> {
+        None
+    }
+
+    fn finish(self) -> Self::Report {
+        self.outcomes
+    }
+}
+
+impl PublishSink {
+    /// Tell the receiving side the outcomes of the group whose first outcome
+    /// is at `reported`.
+    fn notify_group(&self, reported: usize) {
         if let Some(notify) = &self.notify {
             let group = self
                 .outcomes
@@ -1168,14 +1219,33 @@ impl crate::io::durable::GroupSink for PublishSink {
             let _ = notify.send(group);
         }
     }
+}
 
-    fn failure(&self) -> Option<BulkloadRefusal> {
-        None
+/// The first step of a [`crate::io::durable::batched`] group: one
+/// [`crate::io::durable::seal_device`] per device the group's files live on,
+/// which makes every temporary's data durable under its temporary name (and
+/// every adopted output's), before any rename. Each temporary is then marked
+/// sealed, so publication renames it without a flush of its own.
+fn seal_group_data(items: &mut [Publication]) -> Result<()> {
+    let mut devices: std::collections::HashMap<u64, &File> = std::collections::HashMap::new();
+    for item in items.iter() {
+        let file: &File = match item {
+            Publication::Staged { staged, .. } => &staged.file,
+            Publication::Adopted { file, .. } => file,
+        };
+        let device = file.metadata().refuse_at("materialize::seal")?.dev();
+        devices.entry(device).or_insert(file);
     }
-
-    fn finish(self) -> Self::Report {
-        self.outcomes
+    for handle in devices.values() {
+        crate::io::durable::seal_device(handle).refuse_at("materialize::seal")?;
     }
+    for item in items.iter_mut() {
+        if let Publication::Staged { staged, .. } = item {
+            staged.sealed = true;
+            fault_point!(MaterializeAfterTempSeal);
+        }
+    }
+    Ok(())
 }
 
 /// `ENOSPC` (or `SQLite`'s full-disk code, which the store reports as it)
@@ -1511,9 +1581,13 @@ mod tests {
         touched.directory(directory);
         assert_eq!(touched.directories.len(), 1, "one seal per directory");
         // Same device as the store: its commit drains the device.
-        assert_eq!(touched.seal(device)?, 0);
+        assert_eq!(touched.seal(device, false)?, 0);
         // Store elsewhere (PR #59 review): one full flush on this device.
-        assert_eq!(touched.seal(device.wrapping_add(1))?, 1);
+        assert_eq!(touched.seal(device.wrapping_add(1), false)?, 1);
+        // A batched group seals every touched device, the store's included.
+        if cfg!(target_os = "linux") {
+            assert_eq!(touched.seal(device, true)?, 1);
+        }
         Ok(())
     }
 

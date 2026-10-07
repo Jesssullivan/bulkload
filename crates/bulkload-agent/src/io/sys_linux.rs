@@ -8,7 +8,7 @@
 //! is neither durable nor ordered (it is never used alone; plan D3 "Linux");
 //! `fdatasync` makes a file's data durable, cache flush included;
 //! `fsync` also makes its metadata durable, and on a directory makes its
-//! entries durable.
+//! entries durable; `syncfs` makes every file of the file system durable.
 
 use std::ffi::CStr;
 use std::io;
@@ -113,6 +113,54 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
         Ok(super::trace::Event::Sync {
             node: fstat(fd)?.node,
             kind: super::trace::SyncKind::Fsync,
+        })
+    );
+    Ok(())
+}
+
+/// `syncfs`: every file of the file system holding `file` is durable, its
+/// data, metadata and directory entries, and the device cache is flushed.
+/// The group seal of the batched protocol (S1, OI-1003-Q107): one call per
+/// device in place of a flush per file and per directory. Linux 5.8 and
+/// later report a write-back error of any file of the file system here.
+///
+/// # Errors
+/// Returns the flush failure.
+pub fn sync_fs(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
+    let fd = file.as_fd();
+    // SAFETY: the descriptor is live for every call of the closure; `syncfs`
+    // takes no pointers.
+    retry_eintr(|| unsafe { libc::syncfs(fd.as_raw_fd()) })?;
+    trace_event!(
+        "syncfs",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::FsSync,
+        })
+    );
+    Ok(())
+}
+
+/// `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the whole file: start
+/// write-back of its dirty pages now, so a later [`sync_fs`] finds less to
+/// write. Neither durable nor ordered; traced as a kick.
+///
+/// # Errors
+/// Returns the failed call.
+pub fn start_writeback(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
+    let fd = file.as_fd();
+    // SAFETY: the descriptor is live for every call of the closure;
+    // `sync_file_range` takes no pointers.
+    retry_eintr(|| unsafe {
+        libc::sync_file_range(fd.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE)
+    })?;
+    trace_event!(
+        "sync_file_range",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::Kick,
         })
     );
     Ok(())
