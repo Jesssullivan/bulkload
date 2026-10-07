@@ -361,6 +361,106 @@ fn retained_nested(corpus: &Path, bundle: &str) -> Result<Vec<git_carry::NestedR
     }
 }
 
+/// A capture's `{bundle}.reuse` sidecar (Q42 lane L7, OI-1003-Q42): the
+/// regular seats its bundle holds, each with its blob, bound to the bundle
+/// by digest. A later pass reuses those blobs from this list, looked up in
+/// the source object store, and fetches the bundle only on a miss (P69).
+///
+/// **Advisory.** The bundle stays complete and self-describing: its own
+/// `filesystem-v1` rows and worktree tree say the same, and a restore never
+/// reads this file. A reader that does not know the sidecar (any engine
+/// before lane L7) ignores it and fetches the bundle, as it always did.
+///
+/// **Order (P70).** It is durable before the `{item}.capture` record that
+/// names its bundle, like every other sidecar, so a record written by this
+/// engine never lacks its manifest. A crash in between leaves a manifest
+/// whose bundle no record names: harmless, because a manifest is only ever
+/// looked up under the name the record gives, and is used only when its
+/// digest is the record's.
+#[derive(Serialize, Deserialize)]
+struct ReuseManifest {
+    // blake3 of the bundle the seats were listed from: the record's digest.
+    digest: [u8; 32],
+    seats: Vec<git_carry::ManifestSeat>,
+}
+
+/// The largest manifest written or read. A capture whose list is larger
+/// publishes none, and its next pass fetches the bundle, as before lane L7.
+const REUSE_MANIFEST_CAP: usize = 256 * 1024 * 1024;
+
+fn reuse_sidecar(corpus: &Path, bundle: &str) -> PathBuf {
+    corpus.join(format!("{bundle}.reuse"))
+}
+
+/// What a retained capture's `.reuse` sidecar offers the next pass.
+enum Listing {
+    /// No sidecar: a capture from before lane L7 (or one over the cap). Its
+    /// bundle is fetched for reuse, as it always was.
+    Absent,
+    /// The seats of a manifest bound to the record's bundle.
+    Bound(Vec<git_carry::ManifestSeat>),
+    /// A sidecar that cannot be read, does not decode or names another
+    /// bundle. Nothing is reused from it (`reuse_unavailable=
+    /// manifest-mismatch`); it is never a refusal of the capture.
+    Mismatch,
+}
+
+// The manifest of the capture `previous` records, read in full and counted
+// (`read_reuse_manifest_bytes`). Never an error: the manifest is advisory.
+fn retained_manifest(corpus: &Path, previous: &Capture) -> Listing {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(reuse_sidecar(corpus, &previous.bundle))
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Listing::Absent,
+        Err(_) => return Listing::Mismatch,
+    };
+    let mut bytes = Vec::new();
+    let limit = u64::try_from(REUSE_MANIFEST_CAP).map_or(u64::MAX, |cap| cap.saturating_add(1));
+    let read = file.take(limit).read_to_end(&mut bytes);
+    crate::counters::add_len(crate::counters::Counter::ReuseManifestRead, bytes.len());
+    if read.is_err() || bytes.len() > REUSE_MANIFEST_CAP {
+        return Listing::Mismatch;
+    }
+    match postcard::from_bytes::<ReuseManifest>(&bytes) {
+        Ok(manifest) if manifest.digest == previous.digest => Listing::Bound(manifest.seats),
+        Ok(_) | Err(_) => Listing::Mismatch,
+    }
+}
+
+// The manifest a plan that reuses the retained capture's blobs reads; no
+// other plan reads one.
+fn offered_manifest(corpus: &Path, plan: decide::Plan, retained: Option<&Retained>) -> Listing {
+    match (plan.reuse, retained) {
+        (decide::ReuseEligibility::BlobReuse, Some(held)) => {
+            retained_manifest(corpus, &held.previous)
+        }
+        _ => Listing::Absent,
+    }
+}
+
+// The reuse manifest of the bundle published as `name` with `digest`, durable
+// before the record names that bundle (P70). A shallow capture has none, and
+// a list over the cap is not published.
+fn publish_reuse(
+    corpus: &Path,
+    name: &str,
+    digest: [u8; 32],
+    seats: Option<Vec<git_carry::ManifestSeat>>,
+) -> Result<()> {
+    let Some(seats) = seats else {
+        return Ok(());
+    };
+    let bytes = postcard::to_allocvec(&ReuseManifest { digest, seats })
+        .map_err(|_| BulkloadRefusal::FrameCodec)?;
+    if bytes.len() > REUSE_MANIFEST_CAP {
+        return Ok(());
+    }
+    write_bytes(&reuse_sidecar(corpus, name), &bytes)
+}
+
 /// Plan items by canonical source: which item carries a checkout (R-N114).
 type Owners = std::collections::BTreeMap<PathBuf, String>;
 
@@ -458,7 +558,14 @@ fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
 }
 
 fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let bytes = postcard::to_allocvec(value).map_err(|_| BulkloadRefusal::FrameCodec)?;
+    write_bytes(
+        path,
+        &postcard::to_allocvec(value).map_err(|_| BulkloadRefusal::FrameCodec)?,
+    )
+}
+
+// [`write`] of a record already encoded.
+fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     // All callers hold a plan or phase lock. Retain interrupted publications
     // rather than overwrite their bytes or make them a permanent resume blocker.
     let mut generation = 0u64;
@@ -479,7 +586,7 @@ fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
             Err(error) => return Err(crate::refuse::io(&error, "estate::write")),
         }
     };
-    file.write_all(&bytes).refuse_at("estate::write")?;
+    file.write_all(bytes).refuse_at("estate::write")?;
     file.sync_file_counted().refuse_at("estate::write")?;
     fs::rename(&temporary, path).refuse_at("estate::write")?;
     fs::File::open(path.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
@@ -1156,25 +1263,36 @@ fn poisoned(key: [u8; 32]) -> [u8; 32] {
 }
 
 // The blob-reuse offer the plan makes (R25): the retained capture with its
-// recorded pass start, or why none is made. Without a recorded pass start no
-// retained seat can be proved non-racy.
-fn reuse_offer(
+// recorded pass start and, when its `.reuse` sidecar is bound to it, its
+// manifest (Q42 lane L7); or why none is made. Without a recorded pass start
+// no retained seat can be proved non-racy, and a manifest that does not
+// match its capture proves nothing about it.
+fn reuse_offer<'a>(
     plan: decide::Plan,
-    retained: Option<&Retained>,
+    retained: Option<&'a Retained>,
+    listing: &'a Listing,
 ) -> Result<(
-    Option<git_carry::RetainedCapture<'_>>,
+    Option<git_carry::RetainedCapture<'a>>,
     Option<git_carry::ReuseUnavailable>,
 )> {
     Ok(match plan.reuse {
         decide::ReuseEligibility::NoRetained => (None, None),
         decide::ReuseEligibility::BlobReuse => {
             let retained = retained.ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+            let manifest = match listing {
+                Listing::Mismatch => {
+                    return Ok((None, Some(git_carry::ReuseUnavailable::ManifestMismatch)));
+                }
+                Listing::Absent => None,
+                Listing::Bound(seats) => Some(seats.as_slice()),
+            };
             (
                 Some(git_carry::RetainedCapture {
                     bundle: &retained.bundle,
                     started_ns: retained
                         .started_ns
                         .ok_or(BulkloadRefusal::ContractSelfInconsistent)?,
+                    manifest,
                 }),
                 None,
             )
@@ -1347,7 +1465,6 @@ fn capture_item(
     refused: &Mutex<std::collections::BTreeSet<PathBuf>>,
     space: &CorpusSpace<'_>,
 ) -> Result<Completion> {
-    const SITE: &str = "estate::capture_item";
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
     let planned = preflight(item, owners, refused)?;
@@ -1378,7 +1495,10 @@ fn capture_item(
     // estimated bundle to CORPUS. An item that does not fit refuses
     // DESTINATION_SPACE_INSUFFICIENT as its own receipt; the pass goes on.
     let _reservation = space.reserve(estimated_bundle(&parts, retained_bundle)?)?;
-    let (reuse, unrecorded) = reuse_offer(plan, retained.as_ref())?;
+    // Q42 lane L7: the retained capture's manifest, read only when the plan
+    // reuses its blobs. The pass then reads the bundle only on a miss.
+    let listing = offered_manifest(corpus, plan, retained.as_ref());
+    let (reuse, unoffered) = reuse_offer(plan, retained.as_ref(), &listing)?;
     // A future-stamped seat blocked the whole-capture reuse above, and will on
     // every pass until the clock passes it: say so (round-3 N5).
     let future = (retained.is_some() && parts.stamped_after(git_carry::pass_start_ns()))
@@ -1429,6 +1549,7 @@ fn capture_item(
     drift.merge(key_drift)?;
     let recorded_key = if drift.is_empty() { key } else { poisoned(key) };
     let (name, digest, metadata) = publish_bundle(corpus, &identity, &export.bundle)?;
+    fault_point!(EstateAfterBundlePublish);
     if let Some(base) = base {
         // Publish dependency custody before the unchanged completion codec.
         write(&corpus.join(format!("{name}.base")), base)?;
@@ -1449,6 +1570,12 @@ fn capture_item(
             started_ns: export.started_ns,
         },
     )?;
+    // Q42 lane L7 (P70): the reuse manifest, bound to the bundle by its
+    // digest and durable before the record, like every sidecar above. A
+    // crash here leaves a manifest no record names, which nothing reads.
+    fault_point!(EstateBeforeReuseSidecar);
+    publish_reuse(corpus, &name, digest, export.manifest)?;
+    fault_point!(EstateAfterReuseSidecar);
     // A clean pass records its key, as it always did. A drifted pass records
     // a poisoned key no census can hash to, so the record itself, not the
     // sidecar, keeps it from ever being a reuse hit; the next pass re-reads
@@ -1462,33 +1589,42 @@ fn capture_item(
             identity: crate::freshness::StatIdentity::from_metadata(&metadata),
         },
     )?;
+    fault_point!(EstateAfterCaptureRecord);
     #[cfg(test)]
     git_carry::mid_pass::fire(
-        &fs::canonicalize(&item.source).refuse_at(SITE)?,
+        &fs::canonicalize(&item.source).refuse_at("estate::capture_item")?,
         git_carry::mid_pass::Stage::RecordWritten,
     );
-    if drift.is_empty() && drift_sidecar.try_exists().refuse_at(SITE)? {
-        // A clean pass can reproduce a drifted pass's bundle byte for byte
-        // when the drift lay only before the export's snapshot. Retire the
-        // stale record only after the clean completion is durable: a crash in
-        // between leaves the capture drifted, which costs one more pass and
-        // never a stale reuse.
-        fs::remove_file(&drift_sidecar).refuse_at(SITE)?;
-        fs::File::open(corpus)
-            .refuse_at(SITE)?
-            .sync_dir_counted()
-            .refuse_at(SITE)?;
+    if drift.is_empty() {
+        retire_drift(corpus, &drift_sidecar)?;
     }
     Ok(Completion {
         outcome: captured_outcome(&drift, extends),
         drift: drift.lines(),
         bytes_read: export.bytes_read,
-        reuse_unavailable: unrecorded
+        reuse_unavailable: unoffered
             .or(future)
             .or(export.reuse_unavailable)
             .map(git_carry::ReuseUnavailable::code),
         nested,
     })
+}
+
+// A clean pass can reproduce a drifted pass's bundle byte for byte when the
+// drift lay only before the export's snapshot. Retire the stale drift record
+// only after the clean completion is durable: a crash in between leaves the
+// capture drifted, which costs one more pass and never a stale reuse.
+fn retire_drift(corpus: &Path, drift_sidecar: &Path) -> Result<()> {
+    // The site its caller always recorded these under.
+    const SITE: &str = "estate::capture_item";
+    if drift_sidecar.try_exists().refuse_at(SITE)? {
+        fs::remove_file(drift_sidecar).refuse_at(SITE)?;
+        fs::File::open(corpus)
+            .refuse_at(SITE)?
+            .sync_dir_counted()
+            .refuse_at(SITE)?;
+    }
+    Ok(())
 }
 
 // The receipt outcome of a capture that exported: any drift wins, then a
@@ -1652,7 +1788,8 @@ fn publish_bundle(
 
 // The capture's sidecars beside its bundle, before its record: the drift rows
 // (only when it drifted), the nest custody (only when there is any, R-N73)
-// and the key parts. Returns the drift sidecar's path, present or not.
+// and the key parts. The reuse manifest follows them (`publish_reuse`).
+// Returns the drift sidecar's path, present or not.
 fn publish_sidecars(
     corpus: &Path,
     name: &str,
@@ -2562,6 +2699,67 @@ pub fn apply(
         }
     }
     outcome
+}
+
+/// Corpus custody as the fault harness reads it after a crash (P70).
+/// Compiled only with `fault-injection`; read-only.
+#[cfg(feature = "fault-injection")]
+pub mod custody_probe {
+    use super::{
+        filename, hash_file, id, read, reuse_sidecar, BulkloadRefusal, Capture, Path, Plan, Result,
+        ReuseManifest,
+    };
+    use crate::refuse::RefuseAt as _;
+
+    /// A manifest's seats: each path with the blob listed for it.
+    pub type Seats = Vec<(Vec<u8>, String)>;
+
+    /// For each plan item, in plan order, the bundle its `{item}.capture`
+    /// record names, or `None` without a record.
+    ///
+    /// # Errors
+    /// Refuses an unreadable plan or record.
+    pub fn recorded(plan: &Path, corpus: &Path) -> Result<Vec<Option<String>>> {
+        let contents: Plan = read(plan)?;
+        contents
+            .items
+            .iter()
+            .map(|item| {
+                let record = corpus.join(format!("{}.capture", id(item)?));
+                if !record.try_exists().refuse_at("estate::custody_probe")? {
+                    return Ok(None);
+                }
+                Ok(Some(read::<Capture>(&record)?.bundle))
+            })
+            .collect()
+    }
+
+    /// The reuse manifest published for `bundle`: each seat's path and
+    /// blob, or `None` without a `.reuse` sidecar.
+    ///
+    /// # Errors
+    /// `RECEIPT_BINDING_INVALID` for a manifest that is not bound to the
+    /// bytes at `bundle`'s name; refuses an unreadable bundle or sidecar.
+    pub fn manifest(corpus: &Path, bundle: &str) -> Result<Option<Seats>> {
+        if !filename(bundle) {
+            return Err(BulkloadRefusal::PathEscapesRoot);
+        }
+        let sidecar = reuse_sidecar(corpus, bundle);
+        if !sidecar.try_exists().refuse_at("estate::custody_probe")? {
+            return Ok(None);
+        }
+        let manifest: ReuseManifest = read(&sidecar)?;
+        if manifest.digest != hash_file(&corpus.join(bundle))? {
+            return Err(BulkloadRefusal::ReceiptBindingInvalid);
+        }
+        Ok(Some(
+            manifest
+                .seats
+                .into_iter()
+                .map(|seat| (seat.row.rel_path, seat.object))
+                .collect(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -6836,5 +7034,291 @@ mod l6b_grouped_chain {
         )
         .unwrap();
         assert!(!git_carry::shared::requires_base(flat.path()).unwrap());
+    }
+}
+
+// Q42 lane L7 (OI-1003-Q42, OI-1003-Q45, OI-1003-Q94): the `{bundle}.reuse`
+// manifest. P69 (`tests/git_reuse_cost.rs`) holds the cost law and P70's
+// crash order is the fault harness's (`tests/fault_harness/
+// estate_sidecar.rs`); these tests hold the binding: a manifest that does
+// not match its capture is never reused, and nothing but blob reuse reads
+// one.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used, clippy::indexing_slicing)]
+mod l7_manifest_reuse {
+    use super::*;
+    use std::process::Command;
+
+    fn git(path: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .arg("-C")
+            .arg(path)
+            .args([
+                "-c",
+                "user.name=Bulkload test",
+                "-c",
+                "user.email=test@localhost",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .output()
+            .expect("git command");
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    // Identity reuse needs seats older than one timestamp tick (R-N76).
+    fn settle() {
+        std::thread::sleep(std::time::Duration::from_nanos(
+            u64::try_from(git_carry::RACY_GRANULARITY_NS).unwrap() + 100_000_000,
+        ));
+    }
+
+    const FIRST: &[u8] = b"AAAA the content one commit back";
+    const SECOND: &[u8] = b"BBBB the content at HEAD, equal.";
+
+    struct Fixture {
+        root: PathBuf,
+        source: PathBuf,
+        target: PathBuf,
+        plan: PathBuf,
+        state: PathBuf,
+        corpus: PathBuf,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    // A clean checkout whose `tracked` file has two same-sized versions in
+    // history, so the source object store holds a wrong blob to offer.
+    fn fixture(name: &str) -> Fixture {
+        assert_eq!(FIRST.len(), SECOND.len());
+        let root =
+            std::env::temp_dir().join(format!("bulkload-estate-l7-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let source = root.join("source");
+        fs::create_dir(&source).unwrap();
+        git(&source, &["init", "--quiet", "--template=", "-b", "main"]);
+        fs::write(source.join("other"), b"another tracked seat").unwrap();
+        fs::write(source.join("tracked"), FIRST).unwrap();
+        git(&source, &["add", "."]);
+        git(&source, &["commit", "--quiet", "-m", "first"]);
+        fs::write(source.join("tracked"), SECOND).unwrap();
+        git(&source, &["commit", "--quiet", "-am", "second"]);
+        let target = root.join("target");
+        let plan = root.join("plan");
+        add(&plan, &source, &target, Some(&target)).unwrap();
+        Fixture {
+            source,
+            target,
+            plan,
+            state: root.join("state"),
+            corpus: root.join("corpus"),
+            root,
+        }
+    }
+
+    impl Fixture {
+        // One pass: its outcome, the bytes it read and why it reused nothing.
+        fn pass(&self) -> (&'static str, u64, Option<&'static str>) {
+            let rows = Mutex::new(Vec::new());
+            capture(&self.plan, &self.state, &self.corpus, 1, &|row| {
+                rows.lock()
+                    .unwrap()
+                    .push((row.outcome, row.bytes_read, row.reuse_unavailable));
+                Ok(())
+            })
+            .unwrap();
+            let mut rows = rows.into_inner().unwrap();
+            assert_eq!(rows.len(), 1);
+            rows.pop().unwrap()
+        }
+
+        fn record(&self) -> Capture {
+            let item = id(inspect(&self.plan).unwrap().first().unwrap()).unwrap();
+            read(&self.corpus.join(format!("{item}.capture"))).unwrap()
+        }
+
+        // The manifest of the capture the record names, and its path.
+        fn manifest(&self) -> (PathBuf, ReuseManifest) {
+            let path = reuse_sidecar(&self.corpus, &self.record().bundle);
+            let manifest = read(&path).unwrap();
+            (path, manifest)
+        }
+
+        // Move the capture key without touching a seat: a new branch.
+        fn move_key(&self, round: u32) {
+            git(&self.source, &["branch", &format!("extra-{round}")]);
+        }
+
+        fn seat_bytes(&self) -> u64 {
+            ["other", "tracked"]
+                .iter()
+                .map(|name| fs::metadata(self.source.join(name)).unwrap().len())
+                .sum()
+        }
+    }
+
+    // P70: a manifest is reused only when it is the record's own bundle's.
+    // Each forged sidecar below names blobs the source object store holds,
+    // at the seats' exact identities, so a pass that accepted it would put
+    // the wrong content under `tracked` with no miss and no read. Each must
+    // instead reuse nothing, say why, read every seat, and still capture.
+    #[test]
+    fn p70_a_manifest_that_does_not_match_its_capture_is_never_reused() {
+        let fixture = fixture("mismatch");
+        settle();
+        assert_eq!(fixture.pass(), ("captured", fixture.seat_bytes(), None));
+        let stale = git(&fixture.source, &["rev-parse", "HEAD~1:tracked"]);
+        let tree = git(&fixture.source, &["rev-parse", "HEAD:"]);
+        let swapped = |manifest: &ReuseManifest, object: &str| -> Vec<git_carry::ManifestSeat> {
+            manifest
+                .seats
+                .iter()
+                .cloned()
+                .map(|seat| git_carry::ManifestSeat {
+                    object: if seat.row.rel_path == b"tracked" {
+                        object.to_owned()
+                    } else {
+                        seat.object
+                    },
+                    ..seat
+                })
+                .collect()
+        };
+        let mismatch = ("captured", fixture.seat_bytes(), Some("manifest-mismatch"));
+
+        // The true manifest is reused whole: nothing is read.
+        fixture.move_key(0);
+        assert_eq!(fixture.pass(), ("captured", 0, None));
+
+        // Bound to another capture: the stale blob under another digest.
+        let (path, manifest) = fixture.manifest();
+        assert_eq!(manifest.digest, fixture.record().digest);
+        assert_eq!(manifest.seats.len(), 2);
+        write(
+            &path,
+            &ReuseManifest {
+                digest: [0x5a; 32],
+                seats: swapped(&manifest, &stale),
+            },
+        )
+        .unwrap();
+        fixture.move_key(1);
+        assert_eq!(fixture.pass(), mismatch);
+
+        // Not a manifest at all.
+        let (path, _) = fixture.manifest();
+        fs::write(&path, b"\xff\xff not a postcard manifest").unwrap();
+        fixture.move_key(2);
+        assert_eq!(fixture.pass(), mismatch);
+
+        // Bound to the record's bundle, and naming an object that is not a
+        // blob: it does not describe a worktree tree.
+        let (path, manifest) = fixture.manifest();
+        write(
+            &path,
+            &ReuseManifest {
+                digest: manifest.digest,
+                seats: swapped(&manifest, &tree),
+            },
+        )
+        .unwrap();
+        fixture.move_key(3);
+        assert_eq!(fixture.pass(), mismatch);
+
+        // Every pass published its own manifest again, and the restore is
+        // exact: the content at HEAD, never the stale blob.
+        let (_, manifest) = fixture.manifest();
+        assert_eq!(manifest.digest, fixture.record().digest);
+        apply(
+            &fixture.plan,
+            &fixture.corpus,
+            &fixture.root.join("applied"),
+            "neo",
+            1,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(fixture.target.join("tracked")).unwrap(), SECOND);
+        assert_eq!(
+            fs::read(fixture.target.join("other")).unwrap(),
+            b"another tracked seat"
+        );
+    }
+
+    // Deliverable 2: a reader that does not know the sidecar ignores it
+    // safely. Restore never reads `.reuse`: a corpus whose manifests are
+    // garbage, or gone, restores byte for byte; and a whole-capture hit
+    // reads none either.
+    #[test]
+    fn a_restore_and_a_hit_never_read_the_reuse_manifest() {
+        let fixture = fixture("ignored");
+        settle();
+        assert_eq!(fixture.pass().0, "captured");
+        fixture.move_key(1);
+        assert_eq!(fixture.pass(), ("captured", 0, None));
+        let (path, _) = fixture.manifest();
+        fs::write(&path, b"\xff garbage where a manifest was").unwrap();
+        // A hit: the key is unchanged, and the garbage is never opened (a
+        // pass that opened it would say `manifest-mismatch`).
+        assert_eq!(fixture.pass(), ("capture-reused-after-census", 0, None));
+        apply(
+            &fixture.plan,
+            &fixture.corpus,
+            &fixture.root.join("applied-garbage"),
+            "neo",
+            1,
+            &|_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(fs::read(fixture.target.join("tracked")).unwrap(), SECOND);
+        // Gone: what a corpus from before lane L7 looks like. The next
+        // changed capture fetches the bundle and reuses every seat.
+        fs::remove_file(&path).unwrap();
+        fixture.move_key(2);
+        assert_eq!(fixture.pass(), ("captured", 0, None));
+        let (_, manifest) = fixture.manifest();
+        assert_eq!(manifest.digest, fixture.record().digest);
+    }
+
+    // A shallow checkout's bundle is shallow-graph custody and is never
+    // reused, so its capture publishes no manifest.
+    #[test]
+    fn a_shallow_capture_publishes_no_manifest() {
+        let fixture = fixture("shallow");
+        let clone = fixture.root.join("shallow");
+        git(
+            &fixture.root,
+            &[
+                "clone",
+                "--quiet",
+                "--depth=1",
+                "--template=",
+                &format!("file://{}", fixture.source.display()),
+                clone.to_str().unwrap(),
+            ],
+        );
+        let plan = fixture.root.join("shallow-plan");
+        let target = fixture.root.join("shallow-target");
+        add(&plan, &clone, &target, Some(&target)).unwrap();
+        let (state, corpus) = (
+            fixture.root.join("shallow-state"),
+            fixture.root.join("shallow-corpus"),
+        );
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let sidecars: Vec<PathBuf> = fs::read_dir(&corpus)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "reuse"))
+            .collect();
+        assert!(sidecars.is_empty(), "{sidecars:?}");
     }
 }

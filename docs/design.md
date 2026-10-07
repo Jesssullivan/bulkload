@@ -381,6 +381,47 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   with `index-pack --fix-thin`, reading every base from the source object
   store: `read_source_capture_reuse_bytes` counts those bases beside the
   bundle, and the fetch's storage reads join the readback counter.
+- Reuse reads a manifest, not the bundle (Q42 lane L7; OI-1003-Q42,
+  OI-1003-Q45, OI-1003-Q94, 2026-10-07). A changed capture used to fetch
+  its whole retained bundle to learn what it held: 179 MB and 13.8 s of CPU
+  for a 5-object change to the estate's history-heavy item. A capture now
+  publishes a `{bundle}.reuse` sidecar: its regular seats, each with its
+  census row and its blob, bound to the bundle by digest. The next pass
+  takes from that list the seats it may reuse (the same rule as before:
+  an unchanged stat identity, not racy), then asks which of their blobs it
+  can read with one `cat-file --batch-check` in its private repository,
+  which sees the source's object store through `alternates`. That child
+  comes from the hardened Git builder: it writes nothing to the source and
+  takes no lock (S2).
+  - **No miss:** every blob is there, and the pass reuses them without
+    opening the bundle. `read_source_capture_reuse_bytes` is 0 and
+    `read_reuse_manifest_bytes` is the manifest's length (P69).
+  - **A miss** is a reusable seat whose blob only the retained bundle
+    holds: dirty content (untracked, ignored or uncommitted) that has not
+    moved since. The pass counts the seats (`reuse_dirty_misses`) and
+    fetches the bundle, exactly as before. A seat that did move is read
+    again and is never a miss. A checkout that keeps one such file still
+    therefore fetches its retained bundle on every changed capture: for
+    it, lane L7 changed nothing. The seat is not read again instead,
+    because its identity has not moved (R25).
+  - **No manifest:** a capture from before lane L7, a shallow one, or one
+    whose list is over 256 MiB. Its bundle is fetched, as before; old STATE
+    and CORPUS need no migration.
+  - **A manifest that does not match its capture** (it does not decode, it
+    is bound to another digest, or it names an object that is not a blob)
+    is never reused. The pass says `reuse_unavailable=manifest-mismatch`,
+    reads every seat and still captures: a value, never a refusal.
+
+  The sidecar is advisory. The bundle stays complete and self-describing,
+  a restore and a whole-capture hit never read the manifest, and an engine
+  from before lane L7 ignores the file and fetches the bundle. The manifest
+  is durable before the `{item}.capture` record, like every other sidecar,
+  so a record this engine wrote never lacks one. A crash in between leaves
+  a manifest no record names, which nothing reads; the reverse order would
+  restore just as well, but would leave a record whose capture every later
+  pass fetches whole. P70 crashes a capture at each `estate.*` fault point
+  around that publication and checks the order, that every manifest lists
+  its bundle's blobs, and that the restore is exact.
 - Grouped items chain under their plan base (Q42 lane L6b, fix 2;
   OI-1003-Q42, OI-1003-Q46, OI-1003-Q62, OI-1003-Q63, 2026-10-07). A later
   capture of an item on a shared plan base declares the base's commits and
@@ -464,7 +505,8 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   rewritten at the same size without its identity moving, as in Git's racy
   index, so it is read again. A pass that reuses none of the blobs it was
   offered says why: `reuse_unavailable=shallow`, `retained-unreadable`,
-  `pass-start-unrecorded` or `future-stamp` (a seat stamped later than the
+  `pass-start-unrecorded`, `manifest-mismatch` (the retained capture's
+  `.reuse` sidecar does not describe it) or `future-stamp` (a seat stamped later than the
   pass's clock blocks every whole-capture reuse until the clock passes it). A retained capture that cannot be read degrades
   to a full read, and its transient refs never reach the new bundle.
 - A seat stamped later than the current pass's own clock reading is racy too
@@ -475,7 +517,7 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   start earlier than the window, and the guard cannot see it. Bulkload never
   writes into a source to read the filesystem's clock.
 - Known limit: capture records and their sidecars (`.capture`, `.parts`,
-  `.drift`, `.base`) are not authenticated. Anyone who can write the corpus
+  `.drift`, `.base`, `.reuse`) are not authenticated. Anyone who can write the corpus
   can forge a record into a whole-capture reuse. The in-band drift marker
   still makes every restore verb refuse a drifted bundle, and apply still
   checks the bundle digest, but corpus integrity rests on its 0700 custody.
@@ -773,7 +815,8 @@ row under its path alone, which names no seat and answers nothing but "this
 store published the file with this identity here". An ownership row is
 written where there is no reuse row:
 
-- for an output published or adopted from a racy capture (#86). It is read
+- for an output published or adopted from a racy capture (#86; ruled as
+  built, OI-1003-Q101: an ownership row and no reuse row). It is read
   again on every run until its seat settles, and when the seat changes
   first, as an actively written file does, it is superseded;
 - by the sweep, for a superseding publish whose exchange took effect and
@@ -789,7 +832,10 @@ changed seat on a device probes for the exchange (two empty temporaries,
 once per device and session). Without it the seat is refused
 `DESTINATION_EXCHANGE_UNSUPPORTED` as soon as its manifest shows the output
 holds other bytes: nothing is staged, no chunk is asked of the source, and
-the old output keeps its row. Such a seat does not converge there.
+the old output keeps its row. Such a seat does not converge there. That is
+the ruled behaviour (OI-1003-Q100): the refusal stands, and there is no
+fallback to a rename over the output, which is the check-then-rename shape
+the formal model refutes.
 
 Refusals the destination remembers (#187 review, R25). A seat refused
 `DESTINATION_OCCUPIED` or `DESTINATION_EXCHANGE_UNSUPPORTED` after its
@@ -803,6 +849,13 @@ was settled: the same before and after it was read, and not stamped within
 the racy window of the read. A changed seat, a changed file, or a file
 system that has gained the exchange makes the record a miss. The record
 is a memo about no durable bytes; losing it costs one more source read.
+
+The formal model holds all of this since 2026-10-07 (OI-1003-Q102: model
+first, then merge): the intent and its sweep, the ownership row, the
+remembered refusal and the refusal without an exchange, with the
+invariants `NoClobber`, `SupersedeAtomic`, `OwnershipNeverReuse`,
+`RememberedRefusalSound` and `ExchangeRefusedUpFront`
+(`docs/formal/README.md`, "#187's records in the model").
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a

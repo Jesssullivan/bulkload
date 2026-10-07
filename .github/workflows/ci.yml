@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   merge_group:
     types: [checks_requested]
 
@@ -18,7 +18,7 @@ concurrency:
 jobs:
   test:
     name: ${{ matrix.gate }} terminal gate
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}
     runs-on: tinyland-nix
     timeout-minutes: 25
     strategy:

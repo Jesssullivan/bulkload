@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "2f3d115f5011c6be4c6181924ab8ebeb05ef8381f5b80d1d30ba10cc12f75c10"
+WORKFLOW_SHA256 = "7b8d63cc2b6075bfef24abcb99bf899e090e01a95e7d8f2c7bc79c1e4c63120f"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -58,14 +58,17 @@ EXPECTED_SHA_EXPRESSION = (
     "github.event_name == 'merge_group' && "
     "github.event.merge_group.head_sha || github.sha }}"
 )
-# The audited trigger inventory (R-N124): main pushes and release tags, pull
-# requests, and the main merge queue. Nothing else may start CI.
+# The audited trigger inventory (R-N124): release tags, pull requests, and
+# the main merge queue. Nothing else may start CI. OI-1003-Q111 (2026-10-07)
+# dropped main pushes: the ruleset's strict status-check policy merges a PR
+# only when it is up to date with main, so the merged tree is the tree its
+# own run tested, and a main run repeated it on the two shared runners.
 WORKFLOW_TRIGGERS = (
     "on:\n"
     "  push:\n"
-    "    branches: [main]\n"
     '    tags: ["v*"]\n'
     "  pull_request:\n"
+    "    types: [opened, synchronize, reopened, ready_for_review]\n"
     "  merge_group:\n"
     "    types: [checks_requested]\n"
     "\n"
@@ -82,9 +85,12 @@ HEAD_REPOSITORY_EXPRESSION = (
     "${{ github.event_name == 'pull_request' && "
     "github.event.pull_request.head.repo.full_name || github.repository }}"
 )
+# A draft pull request runs no gate (OI-1003-Q111); marking it ready for
+# review (ready_for_review) starts its run.
 SAME_REPOSITORY_GUARD = (
     "${{ github.event_name != 'pull_request' || "
-    "github.event.pull_request.head.repo.full_name == github.repository }}"
+    "github.event.pull_request.head.repo.full_name == github.repository "
+    "&& !github.event.pull_request.draft }}"
 )
 UPLOAD_EXPRESSION = (
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
@@ -155,9 +161,73 @@ PINNED_JUST_RECIPES = {
             "cd {{ root }} && cargo fmt --all -- --check",
             "cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings",
             "cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings",
-            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::",
-            "cd {{ root }} && {{ just_executable() }} io-partial-write-alone",
-            "cd {{ root }} && cargo test --workspace --locked",
+            "cd {{ root }} && {{ just_executable() }} rust-test",
+        ),
+    ),
+    "rust-test": (
+        "rust-test:",
+        (
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "cd {{ root }}",
+            "status=0",
+            "build=$(cargo test --workspace --locked --no-run 2>&1) || status=$?",
+            "printf '%s\\n' \"$build\"",
+            "if [[ $status -ne 0 ]]; then",
+            '    echo "rust-test: the test build failed with status $status" >&2',
+            '    exit "$status"',
+            "fi",
+            "built=$(grep -c '^ *Executable ' <<<\"$build\" || true)",
+            "early=()",
+            "middle=()",
+            "late=()",
+            "while IFS= read -r name; do",
+            "    case $name in",
+            '        [a-e]*) early+=(--test "$name") ;;',
+            '        [f-g]*) middle+=(--test "$name") ;;',
+            '        *) late+=(--test "$name") ;;',
+            "    esac",
+            "done < <(sed -n 's|^ *Executable tests/\\(.*\\)\\.rs (.*)$|\\1|p' <<<\"$build\")",
+            'logs=$(mktemp -d "${TMPDIR:-/tmp}/rust-test.XXXXXX")',
+            "trap 'rm -rf \"$logs\"' EXIT",
+            "groups=()",
+            "start() {",
+            "    local name=$1",
+            "    shift",
+            '    cargo test --workspace --locked "$@" >"$logs/$name" 2>&1 &',
+            '    groups+=("$!:$name")',
+            "}",
+            "start 1-unit --lib --bins",
+            "if [[ ${#early[@]} -gt 0 ]]; then",
+            '    start 2-integration-a-e "${early[@]}"',
+            "fi",
+            "if [[ ${#middle[@]} -gt 0 ]]; then",
+            '    start 3-integration-f-g "${middle[@]}"',
+            "fi",
+            "if [[ ${#late[@]} -gt 0 ]]; then",
+            '    start 4-integration-rest "${late[@]}"',
+            "fi",
+            "start 5-doc --doc",
+            "failed=0",
+            'for group in "${groups[@]}"; do',
+            "    status=0",
+            '    wait "${group%%:*}" || status=$?',
+            '    echo "rust-test: group ${group#*:} ended with status $status"',
+            '    cat "$logs/${group#*:}"',
+            "    if [[ $status -ne 0 ]]; then",
+            "        failed=1",
+            "    fi",
+            "done",
+            "if [[ $failed -ne 0 ]]; then",
+            '    echo "rust-test: a test group failed" >&2',
+            "    exit 1",
+            "fi",
+            "ran=$(cat \"$logs\"/* | grep -c '^ *Running ' || true)",
+            "if [[ $built -eq 0 || $ran -ne $built ]]; then",
+            '    echo "rust-test: the build made $built test executables but the groups ran $ran" >&2',
+            "    exit 1",
+            "fi",
+            'echo "rust-test: all $built test executables ran, in ${#groups[@]} groups"',
         ),
     ),
     "io-partial-write-alone": (
@@ -167,7 +237,7 @@ PINNED_JUST_RECIPES = {
             "set -euo pipefail",
             "cd {{ root }}",
             "status=0",
-            "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?",
+            "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?",
             "printf '%s\\n' \"$output\"",
             "if [[ $status -ne 0 ]]; then",
             '    echo "io-partial-write-alone: cargo test failed with status $status" >&2',
@@ -194,8 +264,10 @@ PINNED_JUST_RECIPES = {
         "fault-harness:",
         (
             "cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings",
-            "cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness",
-            "cd {{ root }} && cargo test -p bulkload-agent --locked --features io-trace --target-dir target/fault --test power_loss",
+            "cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness",
+            "cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test power_loss",
+            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::",
+            "cd {{ root }} && {{ just_executable() }} io-partial-write-alone",
             "cd {{ root }} && {{ just_executable() }} resume-power-loss",
         ),
     ),
@@ -206,7 +278,7 @@ PINNED_JUST_RECIPES = {
             "set -euo pipefail",
             "cd {{ root }}",
             "status=0",
-            "output=$(cargo test -p bulkload-agent --lib --locked --features io-trace --target-dir target/fault materialize::adoption_power_loss:: 2>&1) || status=$?",
+            "output=$(cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault materialize::adoption_power_loss:: 2>&1) || status=$?",
             "printf '%s\\n' \"$output\"",
             "if [[ $status -ne 0 ]]; then",
             '    echo "resume-power-loss: cargo test failed with status $status" >&2',
@@ -238,6 +310,83 @@ PINNED_JUST_RECIPES = {
         "ci-fault-harness: fault-harness",
         (),
     ),
+    # The deep tier (OI-1003-Q78, OI-1003-Q81): on demand, never a gate.
+    "props-deep": (
+        "props-deep:",
+        (
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "cd {{ root }}",
+            "export BULKLOAD_PROPTEST_DEEP=1",
+            "cargo test --workspace --locked -- --skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed --skip distinct_heavy_32768_refs_import_linearly_and_chain_thin --skip distinct_heavy_110000_refs_chain_falls_back_self_contained --skip an_old_format_capture_of_65536_refs_imports_like_the_new_format",
+            'log=$(mktemp "${TMPDIR:-/tmp}/props-deep.XXXXXX")',
+            "trap 'rm -f \"$log\"' EXIT",
+            "row() {",
+            "    local name=$1 marker=$2 status=0",
+            "    shift 2",
+            '    cargo test -p bulkload-agent --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee "$log" || status=$?',
+            "    if [[ $status -ne 0 ]]; then",
+            '        echo "props-deep: $name failed with status $status" >&2',
+            '        exit "$status"',
+            "    fi",
+            "    if grep -q 'skipped: set ' \"$log\"; then",
+            '        echo "props-deep: $name skipped itself" >&2',
+            "        exit 1",
+            "    fi",
+            "    results=$(grep -c '^test result: ' \"$log\" || true)",
+            "    passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' \"$log\" || true)",
+            '    proved=$(grep -c "^test $name \\.\\.\\. ok$" "$log" || true)',
+            '    marked=$(grep -c "^$marker" "$log" || true)',
+            "    if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then",
+            "        echo \"props-deep: $name: expected exactly one '1 passed; 0 failed' result, the row's own\" >&2",
+            "        exit 1",
+            "    fi",
+            "    if [[ $marked -ne 1 ]]; then",
+            "        echo \"props-deep: $name printed $marked '$marker' lines, not 1: the row did not run\" >&2",
+            "        exit 1",
+            "    fi",
+            "}",
+            "row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib",
+            "row git_carry::refs_scale_tests::an_old_format_capture_of_65536_refs_imports_like_the_new_format 'REFS-SCALE row=old-65536 refs=' --lib",
+            "row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct",
+            "row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct",
+            'echo "props-deep: the workspace and all 4 deep rows ran"',
+        ),
+    ),
+    "crash-sweep": (
+        "crash-sweep:",
+        (
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "cd {{ root }}",
+            'log=$(mktemp "${TMPDIR:-/tmp}/crash-sweep.XXXXXX")',
+            "trap 'rm -f \"$log\"' EXIT",
+            "status=0",
+            'BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness crash_sweep_every_point_and_nth -- --exact --nocapture 2>&1 | tee "$log" || status=$?',
+            "if [[ $status -ne 0 ]]; then",
+            '    echo "crash-sweep: cargo test failed with status $status" >&2',
+            '    exit "$status"',
+            "fi",
+            "if grep -q 'crash sweep skipped' \"$log\"; then",
+            '    echo "crash-sweep: the sweep skipped itself" >&2',
+            "    exit 1",
+            "fi",
+            "results=$(grep -c '^test result: ' \"$log\" || true)",
+            "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' \"$log\" || true)",
+            "proved=$(grep -c '^test crash_sweep_every_point_and_nth \\.\\.\\. ok$' \"$log\" || true)",
+            "if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then",
+            "    echo \"crash-sweep: expected exactly one '1 passed; 0 failed' result, the sweep's own\" >&2",
+            "    exit 1",
+            "fi",
+            "points=$(sed -n 's/^crash-sweep: \\([1-9][0-9]*\\) points, [1-9][0-9]* crashes, 0 failures, .*$/\\1/p' \"$log\")",
+            "swept=$(grep -c '^crash-sweep: [^ ]* hits=[1-9][0-9]* ' \"$log\" || true)",
+            "if [[ ! $points =~ ^[1-9][0-9]*$ || $swept -ne $points ]]; then",
+            "    echo \"crash-sweep: expected one '<n> points, <m> crashes, 0 failures' line and n 'hits=' lines; got '$points' and $swept\" >&2",
+            "    exit 1",
+            "fi",
+            'echo "crash-sweep: all $points points were swept"',
+        ),
+    ),
     "check": (
         "check:",
         (
@@ -268,7 +417,8 @@ def just_recipe(justfile: str, name: str) -> tuple[str, tuple[str, ...]]:
 
 P5_COMMAND = (
     "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib "
-    "--locked --features io-trace io::tests::traced::partial_write_prefix_is_traced "
+    "--locked --features fault-injection,io-trace --target-dir target/fault "
+    "io::tests::traced::partial_write_prefix_is_traced "
     "-- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?"
 )
 
@@ -278,12 +428,14 @@ def validate_p5_alone(justfile: str) -> None:
     `1 passed` unless BULKLOAD_IO_PARTIAL_WRITE_ALONE is set, so its recipe
     must set the variable, select the one test exactly, and reject a skip or
     any result other than one `1 passed; 0 failed`."""
-    _, rust_check = just_recipe(justfile, "rust-check")
-    if rust_check.count(
+    # P5 runs in the fault gate's feature-union build (OI-1003-Q81); the
+    # source gate no longer builds `io-trace` tests at all.
+    _, harness = just_recipe(justfile, "fault-harness")
+    if harness.count(
         "cd {{ root }} && {{ just_executable() }} io-partial-write-alone"
-    ) != 1 or any("partial_write_prefix_is_traced" in line for line in rust_check):
+    ) != 1 or any("partial_write_prefix_is_traced" in line for line in harness):
         raise ContractError(
-            "rust-check must run P5 only through io-partial-write-alone"
+            "fault-harness must run P5 only through io-partial-write-alone"
         )
     _, body = just_recipe(justfile, "io-partial-write-alone")
     required = (
@@ -300,6 +452,114 @@ def validate_p5_alone(justfile: str) -> None:
     for line in required:
         if body.count(line) != 1:
             raise ContractError(f"P5 must run alone and fail closed: {line}")
+
+
+# `rust-test` runs what `cargo test --workspace --locked` runs as concurrent
+# cargo invocations (OI-1003-Q81). Each line below is what makes the split
+# whole and fail closed: one build, whose `Executable` lines name and count
+# the test binaries; a `case` whose last arm takes every name the first two
+# leave; every group waited for and its status kept; and the count of
+# binaries run compared with the count built.
+RUST_TEST_REQUIRED = (
+    "build=$(cargo test --workspace --locked --no-run 2>&1) || status=$?",
+    "built=$(grep -c '^ *Executable ' <<<\"$build\" || true)",
+    '        [a-e]*) early+=(--test "$name") ;;',
+    '        [f-g]*) middle+=(--test "$name") ;;',
+    '        *) late+=(--test "$name") ;;',
+    "done < <(sed -n 's|^ *Executable tests/\\(.*\\)\\.rs (.*)$|\\1|p' <<<\"$build\")",
+    '    cargo test --workspace --locked "$@" >"$logs/$name" 2>&1 &',
+    '    groups+=("$!:$name")',
+    "start 1-unit --lib --bins",
+    '    start 2-integration-a-e "${early[@]}"',
+    '    start 3-integration-f-g "${middle[@]}"',
+    '    start 4-integration-rest "${late[@]}"',
+    "start 5-doc --doc",
+    'for group in "${groups[@]}"; do',
+    '    wait "${group%%:*}" || status=$?',
+    "if [[ $failed -ne 0 ]]; then",
+    "ran=$(cat \"$logs\"/* | grep -c '^ *Running ' || true)",
+    "if [[ $built -eq 0 || $ran -ne $built ]]; then",
+)
+
+
+def validate_rust_test_groups(justfile: str) -> None:
+    """`rust-test` must build once, run every group, and fail unless every
+    built test binary ran and every group passed."""
+    _, rust_check = just_recipe(justfile, "rust-check")
+    if rust_check.count("cd {{ root }} && {{ just_executable() }} rust-test") != 1:
+        raise ContractError("rust-check must run the workspace tests through rust-test")
+    _, body = just_recipe(justfile, "rust-test")
+    for line in RUST_TEST_REQUIRED:
+        if body.count(line) != 1:
+            raise ContractError(
+                f"rust-test must run every test and fail closed: {line}"
+            )
+    if sum("cargo test" in line for line in body) != 2:
+        raise ContractError(
+            "rust-test must run cargo test only as its build and groups"
+        )
+
+
+# The deep tier (OI-1003-Q78, OI-1003-Q81) is the only run of the tests
+# that left the PR gate, and each of them passes when it skips itself: a
+# heavy row returns early unless BULKLOAD_PROPTEST_DEEP=1, the sweep unless
+# BULKLOAD_CRASH_SWEEP=1, and a name filter that matches nothing reports `0
+# passed`. Each line below is what makes its recipe fail unless the test
+# really ran (R-N122).
+DEEP_ROWS = (
+    "row git_carry::refs_scale_tests::refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed 'REFS-SCALE row=fixed refs=' --lib",
+    "row git_carry::refs_scale_tests::an_old_format_capture_of_65536_refs_imports_like_the_new_format 'REFS-SCALE row=old-65536 refs=' --lib",
+    "row distinct_heavy_32768_refs_import_linearly_and_chain_thin 'REFS-SCALE-DISTINCT row=deep-32768 pass=2 ' --test refs_scale_distinct",
+    "row distinct_heavy_110000_refs_chain_falls_back_self_contained 'REFS-SCALE-DISTINCT row=deep pass=2 ' --test refs_scale_distinct",
+)
+PROPS_DEEP_REQUIRED = (
+    "export BULKLOAD_PROPTEST_DEEP=1",
+    "cargo test --workspace --locked -- "
+    "--skip refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed "
+    "--skip distinct_heavy_32768_refs_import_linearly_and_chain_thin "
+    "--skip distinct_heavy_110000_refs_chain_falls_back_self_contained "
+    "--skip an_old_format_capture_of_65536_refs_imports_like_the_new_format",
+    '    cargo test -p bulkload-agent --locked "$@" "$name" -- --exact --nocapture 2>&1 | tee "$log" || status=$?',
+    "    if [[ $status -ne 0 ]]; then",
+    "    if grep -q 'skipped: set ' \"$log\"; then",
+    "    results=$(grep -c '^test result: ' \"$log\" || true)",
+    "    passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' \"$log\" || true)",
+    '    proved=$(grep -c "^test $name \\.\\.\\. ok$" "$log" || true)',
+    '    marked=$(grep -c "^$marker" "$log" || true)',
+    "    if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then",
+    "    if [[ $marked -ne 1 ]]; then",
+    *DEEP_ROWS,
+)
+CRASH_SWEEP_REQUIRED = (
+    "BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked "
+    "--features fault-injection,io-trace --target-dir target/fault "
+    "--test fault_harness crash_sweep_every_point_and_nth "
+    '-- --exact --nocapture 2>&1 | tee "$log" || status=$?',
+    "if [[ $status -ne 0 ]]; then",
+    "if grep -q 'crash sweep skipped' \"$log\"; then",
+    "results=$(grep -c '^test result: ' \"$log\" || true)",
+    "passed=$(grep -c '^test result: ok\\. 1 passed; 0 failed;' \"$log\" || true)",
+    "proved=$(grep -c '^test crash_sweep_every_point_and_nth \\.\\.\\. ok$' \"$log\" || true)",
+    "if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then",
+    "points=$(sed -n 's/^crash-sweep: \\([1-9][0-9]*\\) points, [1-9][0-9]* crashes, 0 failures, .*$/\\1/p' \"$log\")",
+    "swept=$(grep -c '^crash-sweep: [^ ]* hits=[1-9][0-9]* ' \"$log\" || true)",
+    "if [[ ! $points =~ ^[1-9][0-9]*$ || $swept -ne $points ]]; then",
+)
+
+
+def validate_deep_recipes(justfile: str) -> None:
+    """`props-deep` and `crash-sweep` must fail unless the tests that left
+    the PR gate really ran."""
+    for name, required, runs in (
+        ("props-deep", PROPS_DEEP_REQUIRED, 2),
+        ("crash-sweep", CRASH_SWEEP_REQUIRED, 1),
+    ):
+        _, body = just_recipe(justfile, name)
+        for line in required:
+            if body.count(line) != 1:
+                raise ContractError(f"{name} must fail unless its tests ran: {line}")
+        if sum("cargo test -" in line for line in body) != runs:
+            raise ContractError(f"{name} must run cargo test only as pinned")
 
 
 # Top-level justfile lines that change how every recipe runs: settings,
@@ -347,6 +607,8 @@ def validate_just_recipes(justfile: str, imported: str | None = None) -> None:
             if just_header_count(imported, name):
                 raise ContractError(f"imported justfile must not declare {name}")
     validate_p5_alone(justfile)
+    validate_rust_test_groups(justfile)
+    validate_deep_recipes(justfile)
 
 
 def sha256(source: str) -> str:
@@ -2378,8 +2640,12 @@ class CiContractTest(unittest.TestCase):
             self.workflow.replace(queue, queue + "  workflow_dispatch:\n", 1),
             self.workflow.replace(queue, queue + "  pull_request_target:\n", 1),
             self.workflow.replace(
-                "    branches: [main]\n", "    branches: ['**']\n", 1
+                '    tags: ["v*"]\n', '    branches: [main]\n    tags: ["v*"]\n', 1
             ),
+            self.workflow.replace(
+                "    types: [opened, synchronize, reopened, ready_for_review]\n", "", 1
+            ),
+            self.workflow.replace(" && !github.event.pull_request.draft }}", " }}", 1),
             self.workflow.replace(
                 "github.event_name == 'merge_group' && "
                 "github.event.merge_group.head_sha || ",
@@ -3700,7 +3966,130 @@ class CiContractTest(unittest.TestCase):
         harness_test = PINNED_JUST_RECIPES["fault-harness"][1][1]
         variants = [
             justfile.replace(
-                "    cd {{ root }} && cargo test --workspace --locked\n", "", 1
+                "    cd {{ root }} && {{ just_executable() }} rust-test\n", "", 1
+            ),
+            # A dropped or narrowed test group, a name class that no longer
+            # takes the rest, and a group whose failure or absence no longer
+            # fails the recipe (OI-1003-Q81).
+            justfile.replace(
+                "    if [[ ${#middle[@]} -gt 0 ]]; then\n"
+                '        start 3-integration-f-g "${middle[@]}"\n'
+                "    fi\n",
+                "",
+                1,
+            ),
+            justfile.replace(
+                '            *) late+=(--test "$name") ;;\n',
+                '            [h-z]*) late+=(--test "$name") ;;\n',
+                1,
+            ),
+            justfile.replace(
+                "    start 1-unit --lib --bins\n", "    start 1-unit --lib\n", 1
+            ),
+            justfile.replace("    start 5-doc --doc\n", "", 1),
+            justfile.replace(
+                '        wait "${group%%:*}" || status=$?\n',
+                '        wait "${group%%:*}" || true\n',
+                1,
+            ),
+            justfile.replace(
+                "    if [[ $built -eq 0 || $ran -ne $built ]]; then\n",
+                "    if false; then\n",
+                1,
+            ),
+            justfile.replace(
+                "cargo test --workspace --locked --no-run 2>&1",
+                "cargo test -p bulkload-proto --locked --no-run 2>&1",
+                1,
+            ),
+            justfile.replace(
+                '        cargo test --workspace --locked "$@" >"$logs/$name" 2>&1 &\n',
+                '        cargo test --workspace --locked "$@" --no-run >"$logs/$name" 2>&1 &\n',
+                1,
+            ),
+            # The traced `io::` lib tests left the source gate for the fault
+            # gate's feature-union build; they must not leave PR CI.
+            justfile.replace(
+                "    cd {{ root }} && cargo test -p bulkload-agent --lib --locked "
+                "--features fault-injection,io-trace --target-dir target/fault io::\n",
+                "",
+                1,
+            ),
+            # A deep recipe wired into a gate.
+            justfile.replace(
+                "ci-source: check-source secrets-scan-history contract-test",
+                "ci-source: check-source secrets-scan-history contract-test props-deep",
+                1,
+            ),
+            # The deep recipes are the only run of the tests that left the PR
+            # gate, and each test passes when it skips itself. A recipe that
+            # loses its switch, its exact name, a row, or one of its "really
+            # ran" checks is green without running them (R-N122).
+            justfile.replace("    export BULKLOAD_PROPTEST_DEEP=1\n", "", 1),
+            justfile.replace("    " + DEEP_ROWS[0] + "\n", "", 1),
+            justfile.replace("    " + DEEP_ROWS[1] + "\n", "", 1),
+            justfile.replace("    " + DEEP_ROWS[2] + "\n", "", 1),
+            justfile.replace(
+                "'REFS-SCALE-DISTINCT row=deep-32768 pass=2 '",
+                "'REFS-SCALE-DISTINCT row=deep-32768 '",
+                1,
+            ),
+            justfile.replace(
+                '"$@" "$name" -- --exact --nocapture', '"$@" "$name" -- --nocapture', 1
+            ),
+            justfile.replace(
+                '"$@" "$name" -- --exact --nocapture', '"$@" "$name" -- --exact', 1
+            ),
+            justfile.replace(
+                "        if grep -q 'skipped: set ' \"$log\"; then\n",
+                "        if false; then\n",
+                1,
+            ),
+            justfile.replace(
+                "        if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then\n",
+                "        if [[ $results -ne 1 ]]; then\n",
+                1,
+            ),
+            justfile.replace(
+                "        if [[ $marked -ne 1 ]]; then\n", "        if false; then\n", 1
+            ),
+            justfile.replace(
+                '2>&1 | tee "$log" || status=$?\n        if',
+                '2>&1 | tee "$log" || true\n        if',
+                1,
+            ),
+            justfile.replace(
+                "    BULKLOAD_CRASH_SWEEP=1 cargo test", "    cargo test", 1
+            ),
+            justfile.replace(
+                "crash_sweep_every_point_and_nth -- --exact --nocapture",
+                "crash_sweep_every_point_and_nth -- --nocapture",
+                1,
+            ),
+            justfile.replace(
+                "crash_sweep_every_point_and_nth -- --exact --nocapture",
+                "crash_sweep_every_point_and_nth -- --exact",
+                1,
+            ),
+            justfile.replace(
+                "    if grep -q 'crash sweep skipped' \"$log\"; then\n",
+                "    if false; then\n",
+                1,
+            ),
+            justfile.replace(
+                "    if [[ $results -ne 1 || $passed -ne 1 || $proved -ne 1 ]]; then\n",
+                "    if [[ $passed -lt 1 ]]; then\n",
+                1,
+            ),
+            justfile.replace(
+                "    if [[ ! $points =~ ^[1-9][0-9]*$ || $swept -ne $points ]]; then\n",
+                "    if false; then\n",
+                1,
+            ),
+            justfile.replace(
+                "[1-9][0-9]* crashes, 0 failures, ",
+                "[0-9]* crashes, [0-9]* failures, ",
+                1,
             ),
             justfile.replace("    " + harness_test + "\n", "", 1),
             justfile.replace("ci-fault-harness: fault-harness", "ci-fault-harness:", 1),

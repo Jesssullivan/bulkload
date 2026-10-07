@@ -48,11 +48,19 @@ let Mutation =
       | adopt_unverified
       | reuse_ignores_row
       | adopt_unrecorded
+      | owned_ignores_identity
+      | sweep_drops_ownership
+      | exchange_before_intent
+      | own_is_reuse
+      | refusal_unbound
+      | late_exchange_refusal
       >
 
 {- Model properties a config can name: the frozen safety invariants, the
    wall-clock budget, #169's two properties (the strict R25 reading and
-   AdoptOnlyUnrowed) and the temporal properties.
+   AdoptOnlyUnrowed), the temporal properties, and the four properties of
+   #187's destination records (OI-1003-Q100..Q102): SupersedeAtomic,
+   OwnershipNeverReuse, RememberedRefusalSound and ExchangeRefusedUpFront.
    The reachability witnesses are a separate type (Witness), so a fail row
    can never name one and a reach row can name nothing else.
 -}
@@ -79,22 +87,32 @@ let Property =
       | AdoptOnlyUnrowed
       | RunsClose
       | AllRunsFinish
+      | SupersedeAtomic
+      | OwnershipNeverReuse
+      | RememberedRefusalSound
+      | ExchangeRefusedUpFront
       >
 
 let Witness =
       < Witness_LedgerManifest
       | Witness_LedgerChunkRead
       | Witness_LostRowRead
+      | Witness_ExchangeRefused
+      | Witness_RememberedRefusal
+      | Witness_OwnershipSuperseded
+      | Witness_SweepOwnership
+      | Witness_SweepRestore
       | Witness_FailedRowRead
       >
 
--- The 37 actions of Next, in the sorted order of configs.tsv's never column.
+-- The 38 actions of Next, in the sorted order of configs.tsv's never column.
 let Action =
       < AnswerHeld
       | BackupBegin
       | BackupEnd
       | BackupStepLock
       | BackupStepUnlock
+      | BeginSupersede
       | CheckOwn
       | Commit
       | CommitFail
@@ -150,6 +168,7 @@ let Constants =
       , StoreRootSealed : Bool
       , TrackStrictHeld : Bool
       , AdoptUnrowed : Bool
+      , ExchangeSupported : Bool
       }
 
 {- What a row expects, and only what that expectation needs:
@@ -218,11 +237,12 @@ let InvariantRow =
      is the sanity check. Every pass row checks all of them, and every one
      but TypeOK must have a fail row and a traceability row.
    - budget: the wall-clock bound (WithinBudget), checked by every config.
-   - finding: #169's properties, beside the safety invariants and not
-     frozen. R25's strict reading is checked by its finding row (the code
-     before #169) and by the strict pass rows; AdoptOnlyUnrowed by every
-     pass row that models #169's capture-record adoption, and by its
-     mutation row.
+   - finding: #169's and #187's properties, beside the safety invariants
+     and not frozen. R25's strict reading is checked by its finding row
+     (the code before #169) and by the strict pass rows; AdoptOnlyUnrowed
+     by every pass row that models #169's capture-record adoption, and by
+     its mutation row; #187's four by every pass row with the superseding
+     publish on (SupersedeMode exchange), and each by a mutation row.
    - temporal: a temporal property, checked under PROPERTY.
 -}
 let PropertyClass = < safety | budget | finding | temporal >
@@ -350,6 +370,26 @@ let propertyTable =
         , index = 21
         , class = PropertyClass.temporal
         }
+      , SupersedeAtomic =
+        { property = Property.SupersedeAtomic
+        , index = 22
+        , class = PropertyClass.finding
+        }
+      , OwnershipNeverReuse =
+        { property = Property.OwnershipNeverReuse
+        , index = 23
+        , class = PropertyClass.finding
+        }
+      , RememberedRefusalSound =
+        { property = Property.RememberedRefusalSound
+        , index = 24
+        , class = PropertyClass.finding
+        }
+      , ExchangeRefusedUpFront =
+        { property = Property.ExchangeRefusedUpFront
+        , index = 25
+        , class = PropertyClass.finding
+        }
       }
 
 let propertyIndex = \(p : Property) -> (merge propertyTable p).index
@@ -398,6 +438,12 @@ let mutationIndex =
           , adopt_unverified = 20
           , reuse_ignores_row = 21
           , adopt_unrecorded = 22
+          , owned_ignores_identity = 23
+          , sweep_drops_ownership = 24
+          , exchange_before_intent = 25
+          , own_is_reuse = 26
+          , refusal_unbound = 27
+          , late_exchange_refusal = 28
           }
           m
 
@@ -412,38 +458,39 @@ let actionTable =
       , BackupEnd = { action = Action.BackupEnd, index = 2 }
       , BackupStepLock = { action = Action.BackupStepLock, index = 3 }
       , BackupStepUnlock = { action = Action.BackupStepUnlock, index = 4 }
-      , CheckOwn = { action = Action.CheckOwn, index = 5 }
-      , Commit = { action = Action.Commit, index = 6 }
-      , CommitFail = { action = Action.CommitFail, index = 7 }
-      , CrashBoth = { action = Action.CrashBoth, index = 8 }
-      , CrashDst = { action = Action.CrashDst, index = 9 }
-      , CrashSrc = { action = Action.CrashSrc, index = 10 }
-      , DirSeal = { action = Action.DirSeal, index = 11 }
-      , Edit = { action = Action.Edit, index = 12 }
-      , Exchange = { action = Action.Exchange, index = 13 }
-      , Finish = { action = Action.Finish, index = 14 }
-      , ForeignDelete = { action = Action.ForeignDelete, index = 15 }
-      , ForeignWrite = { action = Action.ForeignWrite, index = 16 }
-      , GitRead = { action = Action.GitRead, index = 17 }
-      , LedgerCommit = { action = Action.LedgerCommit, index = 18 }
-      , Publish = { action = Action.Publish, index = 19 }
-      , RecvDecide = { action = Action.RecvDecide, index = 20 }
-      , RecvEnd = { action = Action.RecvEnd, index = 21 }
-      , RecvEntry = { action = Action.RecvEntry, index = 22 }
-      , RecvHeld = { action = Action.RecvHeld, index = 23 }
-      , RecvManifest = { action = Action.RecvManifest, index = 24 }
-      , RecvNeed = { action = Action.RecvNeed, index = 25 }
-      , RecvRefused = { action = Action.RecvRefused, index = 26 }
-      , RenameReplace = { action = Action.RenameReplace, index = 27 }
-      , SealAdopted = { action = Action.SealAdopted, index = 28 }
-      , SealTemp = { action = Action.SealTemp, index = 29 }
-      , SendSourceDone = { action = Action.SendSourceDone, index = 30 }
-      , SilentRewrite = { action = Action.SilentRewrite, index = 31 }
-      , StartRun = { action = Action.StartRun, index = 32 }
-      , Terminated = { action = Action.Terminated, index = 33 }
-      , Tick = { action = Action.Tick, index = 34 }
-      , VerifyDisp = { action = Action.VerifyDisp, index = 35 }
-      , Walk = { action = Action.Walk, index = 36 }
+      , BeginSupersede = { action = Action.BeginSupersede, index = 5 }
+      , CheckOwn = { action = Action.CheckOwn, index = 6 }
+      , Commit = { action = Action.Commit, index = 7 }
+      , CommitFail = { action = Action.CommitFail, index = 8 }
+      , CrashBoth = { action = Action.CrashBoth, index = 9 }
+      , CrashDst = { action = Action.CrashDst, index = 10 }
+      , CrashSrc = { action = Action.CrashSrc, index = 11 }
+      , DirSeal = { action = Action.DirSeal, index = 12 }
+      , Edit = { action = Action.Edit, index = 13 }
+      , Exchange = { action = Action.Exchange, index = 14 }
+      , Finish = { action = Action.Finish, index = 15 }
+      , ForeignDelete = { action = Action.ForeignDelete, index = 16 }
+      , ForeignWrite = { action = Action.ForeignWrite, index = 17 }
+      , GitRead = { action = Action.GitRead, index = 18 }
+      , LedgerCommit = { action = Action.LedgerCommit, index = 19 }
+      , Publish = { action = Action.Publish, index = 20 }
+      , RecvDecide = { action = Action.RecvDecide, index = 21 }
+      , RecvEnd = { action = Action.RecvEnd, index = 22 }
+      , RecvEntry = { action = Action.RecvEntry, index = 23 }
+      , RecvHeld = { action = Action.RecvHeld, index = 24 }
+      , RecvManifest = { action = Action.RecvManifest, index = 25 }
+      , RecvNeed = { action = Action.RecvNeed, index = 26 }
+      , RecvRefused = { action = Action.RecvRefused, index = 27 }
+      , RenameReplace = { action = Action.RenameReplace, index = 28 }
+      , SealAdopted = { action = Action.SealAdopted, index = 29 }
+      , SealTemp = { action = Action.SealTemp, index = 30 }
+      , SendSourceDone = { action = Action.SendSourceDone, index = 31 }
+      , SilentRewrite = { action = Action.SilentRewrite, index = 32 }
+      , StartRun = { action = Action.StartRun, index = 33 }
+      , Terminated = { action = Action.Terminated, index = 34 }
+      , Tick = { action = Action.Tick, index = 35 }
+      , VerifyDisp = { action = Action.VerifyDisp, index = 36 }
+      , Walk = { action = Action.Walk, index = 37 }
       }
 
 let actionIndex = \(a : Action) -> (merge actionTable a).index
@@ -453,6 +500,11 @@ let witnessTable =
       { Witness_LedgerManifest = Witness.Witness_LedgerManifest
       , Witness_LedgerChunkRead = Witness.Witness_LedgerChunkRead
       , Witness_LostRowRead = Witness.Witness_LostRowRead
+      , Witness_ExchangeRefused = Witness.Witness_ExchangeRefused
+      , Witness_RememberedRefusal = Witness.Witness_RememberedRefusal
+      , Witness_OwnershipSuperseded = Witness.Witness_OwnershipSuperseded
+      , Witness_SweepOwnership = Witness.Witness_SweepOwnership
+      , Witness_SweepRestore = Witness.Witness_SweepRestore
       , Witness_FailedRowRead = Witness.Witness_FailedRowRead
       }
 
@@ -520,6 +572,7 @@ let GcMutation =
       | skip_flatten_verify
       | hit_ignores_chain
       | reroot_pre_mismatch
+      | reuse_after_record
       >
 
 -- GitCarry.tla's properties: its safety invariants, its budget and ChainRecovery.
@@ -531,6 +584,7 @@ let GcProperty =
       | BaseNotReplacedWhileDepended
       | GCNeverDeletesDepended
       | SidecarsBeforeRecord
+      | ReuseManifestBeforeRecord
       | RestoreOrRecapture
       | WithinBudget
       | ChainRecovery
@@ -556,7 +610,7 @@ let gcWitnessTable =
 
 let gcWitnessSelf = \(w : GcWitness) -> merge gcWitnessTable w
 
--- The 11 actions of GitCarry.tla's Next, in the sorted order of the never column.
+-- The 12 actions of GitCarry.tla's Next, in the sorted order of the never column.
 let GcAction =
       < Advance
       | BaseRecord
@@ -566,6 +620,7 @@ let GcAction =
       | GC
       | Publish
       | Record
+      | ReuseSidecar
       | Rewrite
       | Sidecars
       | StartBase
@@ -585,6 +640,7 @@ let GcConstants =
       , DamageBase : Bool
       , DamageRewrites : Bool
       , BaseMissingTyped : Bool
+      , ReuseManifest : Bool
       , Mutation : Optional GcMutation
       , BudgetSeconds : Natural
       }
@@ -680,19 +736,24 @@ let gcPropertyTable =
         , index = 6
         , class = PropertyClass.safety
         }
+      , ReuseManifestBeforeRecord =
+        { property = GcProperty.ReuseManifestBeforeRecord
+        , index = 7
+        , class = PropertyClass.safety
+        }
       , RestoreOrRecapture =
         { property = GcProperty.RestoreOrRecapture
-        , index = 7
+        , index = 8
         , class = PropertyClass.safety
         }
       , WithinBudget =
         { property = GcProperty.WithinBudget
-        , index = 8
+        , index = 9
         , class = PropertyClass.budget
         }
       , ChainRecovery =
         { property = GcProperty.ChainRecovery
-        , index = 9
+        , index = 10
         , class = PropertyClass.temporal
         }
       }
@@ -723,6 +784,7 @@ let gcMutationIndex =
           , skip_flatten_verify = 4
           , hit_ignores_chain = 5
           , reroot_pre_mismatch = 6
+          , reuse_after_record = 7
           }
           m
 
@@ -737,9 +799,10 @@ let gcActionTable =
       , GC = { action = GcAction.GC, index = 5 }
       , Publish = { action = GcAction.Publish, index = 6 }
       , Record = { action = GcAction.Record, index = 7 }
-      , Rewrite = { action = GcAction.Rewrite, index = 8 }
-      , Sidecars = { action = GcAction.Sidecars, index = 9 }
-      , StartBase = { action = GcAction.StartBase, index = 10 }
+      , ReuseSidecar = { action = GcAction.ReuseSidecar, index = 8 }
+      , Rewrite = { action = GcAction.Rewrite, index = 9 }
+      , Sidecars = { action = GcAction.Sidecars, index = 10 }
+      , StartBase = { action = GcAction.StartBase, index = 11 }
       }
 
 let gcActionIndex = \(a : GcAction) -> (merge gcActionTable a).index

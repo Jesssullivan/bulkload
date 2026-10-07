@@ -1622,6 +1622,9 @@ fn export_pass(
     // #106: intent-to-add entries, which the staged tree cannot hold, are
     // carried as index custody beside it, read from the carried index bytes.
     record_intent_to_add(&private, repo, &index, &carried)?;
+    // Q42 lane L7: what the bundle holds, listed once while its tree is at
+    // hand, so the next pass need not fetch the bundle to learn it.
+    let manifest = reuse_manifest(&private, &tree, &carried, &authority.boundary)?;
     let nested_repositories = custody_metadata(&private, &census, &authority)?;
     // Omission is recorded, never silent. Sizes are measured once, here, and
     // deliberately excluded from both the reusable key and the before/after
@@ -1657,6 +1660,7 @@ fn export_pass(
         nested_repositories,
         pack,
         chained,
+        manifest,
     })
 }
 
@@ -1975,9 +1979,182 @@ fn reusable_blobs(
     seats: &[crate::RowSchema],
     now_ns: i128,
 ) -> Result<std::result::Result<raw_tree::Reuse, ReuseUnavailable>> {
-    let attempt = retained_blobs(private, retained, seats, now_ns);
+    let fetched = || {
+        retained_blobs(private, retained, seats, now_ns)
+            .map_err(|_| ReuseUnavailable::RetainedUnreadable)
+    };
+    // Without a manifest (a capture from before lane L7) the bundle is the
+    // only list.
+    let attempt = retained.manifest.map_or_else(fetched, |manifest| {
+        match manifest_blobs(private, manifest, retained, seats, now_ns) {
+            Ok(Listed::Held(reuse)) => Ok(reuse),
+            // Counted (`reuse_dirty_misses`); the bundle holds the blobs.
+            Ok(Listed::Missed) => fetched(),
+            Ok(Listed::Mismatch) => Err(ReuseUnavailable::ManifestMismatch),
+            Err(_) => Err(ReuseUnavailable::RetainedUnreadable),
+        }
+    });
     clear_reuse_refs(private)?;
-    Ok(attempt.map_err(|_| ReuseUnavailable::RetainedUnreadable))
+    Ok(attempt)
+}
+
+/// What a retained capture's manifest says this pass may reuse.
+enum Listed {
+    /// Every reusable seat's blob is in the pass's object stores (the
+    /// source's, through `alternates`): reuse these, and read no bundle.
+    Held(raw_tree::Reuse),
+    /// A reusable seat's blob is in neither store: only the retained bundle
+    /// holds it. Counted; the caller fetches the bundle.
+    Missed,
+    /// The manifest names something that is not a blob of a regular seat.
+    Mismatch,
+}
+
+/// Reuse from a retained capture's manifest (Q42 lane L7, P69).
+///
+/// The seats that qualify are exactly those [`retained_blobs`] takes from
+/// the bundle: regular, at an unchanged `StatIdentity`, not racy against the
+/// retained pass start. Their blobs are then looked up with one `cat-file
+/// --batch-check` in the private repository, which reads the source's object
+/// store through `alternates`: a read-only child from the [`git`] builder
+/// (no source write, no lock; S2). The retained bundle is not opened.
+fn manifest_blobs(
+    private: &Path,
+    manifest: &[ManifestSeat],
+    retained: &RetainedCapture<'_>,
+    seats: &[crate::RowSchema],
+    now_ns: i128,
+) -> Result<Listed> {
+    use bulkload_proto::FileKind;
+    let current: std::collections::BTreeMap<&[u8], &crate::RowSchema> = seats
+        .iter()
+        .map(|row| (row.rel_path.as_slice(), row))
+        .collect();
+    let mut reuse = raw_tree::Reuse::new();
+    for seat in manifest {
+        if seat.row.kind != FileKind::Regular || !oid(&seat.object) {
+            return Ok(Listed::Mismatch);
+        }
+        let Some(row) = current.get(seat.row.rel_path.as_slice()) else {
+            continue;
+        };
+        if row.kind == FileKind::Regular
+            && !racy(&seat.row, retained.started_ns, now_ns)
+            && seat_equivalent(&seat.row, row)
+            && raw_tree::mode_of(row)? == raw_tree::mode_of(&seat.row)?
+        {
+            reuse.insert(seat.row.rel_path.clone(), seat.object.clone());
+        }
+    }
+    if reuse.is_empty() {
+        return Ok(Listed::Held(reuse));
+    }
+    let wanted: std::collections::BTreeSet<&str> = reuse.values().map(String::as_str).collect();
+    let mut request = String::new();
+    for object in &wanted {
+        request.push_str(object);
+        request.push('\n');
+    }
+    let answers = String::from_utf8(input(
+        git(private).args(["cat-file", "--batch-check=%(objectname) %(objecttype)"]),
+        request.as_bytes(),
+    )?)
+    .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let mut answers = answers.lines();
+    let mut missing = std::collections::BTreeSet::new();
+    for object in &wanted {
+        match answers.next().and_then(|line| line.split_once(' ')) {
+            Some((name, "blob")) if name == *object => {}
+            Some((name, "missing")) if name == *object => {
+                missing.insert(*object);
+            }
+            // Present, and not a blob: the manifest does not describe a tree.
+            Some((name, _)) if name == *object => return Ok(Listed::Mismatch),
+            _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+        }
+    }
+    if answers.next().is_some() {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    if missing.is_empty() {
+        return Ok(Listed::Held(reuse));
+    }
+    crate::counters::add_len(
+        crate::counters::Counter::ReuseDirtyMiss,
+        reuse
+            .values()
+            .filter(|object| missing.contains(object.as_str()))
+            .count(),
+    );
+    Ok(Listed::Missed)
+}
+
+/// The reuse manifest of the capture a pass is writing (Q42 lane L7): each
+/// carried regular seat with the blob `tree` names at its path. `None` for
+/// a shallow checkout, whose bundle is shallow-graph custody and is never
+/// reused ([`ReuseUnavailable::Shallow`]).
+fn reuse_manifest(
+    private: &Path,
+    tree: &str,
+    carried: &[&crate::RowSchema],
+    boundary: &[u8],
+) -> Result<Option<Vec<ManifestSeat>>> {
+    use bulkload_proto::FileKind;
+    if !boundary.is_empty() {
+        return Ok(None);
+    }
+    if !carried.iter().any(|row| row.kind == FileKind::Regular) {
+        return Ok(Some(Vec::new()));
+    }
+    let mut blobs = std::collections::BTreeMap::new();
+    for (mode, object, path) in tree_blobs(private, tree)? {
+        blobs.insert(path, (mode, object));
+    }
+    let mut manifest = Vec::new();
+    for row in carried.iter().filter(|row| row.kind == FileKind::Regular) {
+        // Every carried regular seat is in the tree at its own mode: the
+        // tree was built from these rows.
+        match blobs.remove(row.rel_path.as_slice()) {
+            Some((mode, object)) if mode == raw_tree::mode_of(row)? => {
+                manifest.push(ManifestSeat {
+                    row: (*row).clone(),
+                    object,
+                });
+            }
+            _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+        }
+    }
+    Ok(Some(manifest))
+}
+
+// Every blob entry of `tree` (a tree, or a revision that peels to one) in
+// the private repository, as (mode, object, path).
+fn tree_blobs(private: &Path, tree: &str) -> Result<Vec<(String, String, Vec<u8>)>> {
+    let entries = output(git(private).args(["ls-tree", "-r", "-z", tree]))?;
+    let mut blobs = Vec::new();
+    for entry in entries.split(|byte| *byte == 0).filter(|e| !e.is_empty()) {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let (header, path) = entry.split_at(tab);
+        let path = path
+            .get(1..)
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let header =
+            std::str::from_utf8(header).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+        let mut fields = header.split(' ');
+        let (Some(mode), Some("blob"), Some(object)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        };
+        if !oid(object) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        blobs.push((mode.to_owned(), object.to_owned(), path.to_vec()));
+    }
+    Ok(blobs)
 }
 
 // Delete every transient reuse ref itself (never what a symbolic one names),
@@ -2056,29 +2233,10 @@ fn retained_blobs(
         .map(|row| (row.rel_path.as_slice(), row))
         .collect();
     #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax, not interpolation.
-    let entries =
-        output(git(private).args(["ls-tree", "-r", "-z", "refs/carry-reuse/worktree^{tree}"]))?;
-    for entry in entries.split(|byte| *byte == 0).filter(|e| !e.is_empty()) {
-        let tab = entry
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        let (header, path) = entry.split_at(tab);
-        let path = path
-            .get(1..)
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        let header =
-            std::str::from_utf8(header).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-        let mut fields = header.split(' ');
-        let (Some(mode), Some("blob"), Some(object)) =
-            (fields.next(), fields.next(), fields.next())
+    let blobs = tree_blobs(private, "refs/carry-reuse/worktree^{tree}")?;
+    for (mode, object, path) in blobs {
+        let (Some(row), Some(before)) = (current.get(path.as_slice()), held.get(path.as_slice()))
         else {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        };
-        if !oid(object) {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        }
-        let (Some(row), Some(before)) = (current.get(path), held.get(path)) else {
             continue;
         };
         if row.kind == FileKind::Regular
@@ -2086,7 +2244,7 @@ fn retained_blobs(
             && seat_equivalent(before, row)
             && raw_tree::mode_of(row)? == mode
         {
-            reuse.insert(path.to_vec(), object.to_owned());
+            reuse.insert(path, object);
         }
     }
     Ok(reuse)
@@ -2295,6 +2453,30 @@ pub struct RetainedCapture<'a> {
     pub bundle: &'a Path,
     /// [`Export::started_ns`] of the pass that wrote `bundle`.
     pub started_ns: i128,
+    /// What `bundle` holds, as the pass that wrote it listed it
+    /// ([`Export::manifest`]; Q42 lane L7), when the caller retained that
+    /// list and bound it to `bundle`. With it the pass decides what it can
+    /// reuse without reading the bundle, and fetches the bundle only on a
+    /// miss: a reusable seat whose blob the source object store does not
+    /// hold. `None` is a capture from before the list existed: its bundle
+    /// is fetched, as every retained bundle was.
+    pub manifest: Option<&'a [ManifestSeat]>,
+}
+
+/// One regular seat a capture holds: the row its census read and the blob
+/// its worktree tree names there (Q42 lane L7).
+///
+/// The list of these is a capture's reuse manifest: everything
+/// [`RetainedCapture`] reuse reads from a retained bundle (its
+/// `filesystem-v1` rows and its worktree tree), for regular seats, which
+/// are the only seats reused. It is advisory: a restore never reads it, and
+/// the bundle stays complete without it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ManifestSeat {
+    /// The seat's census row when the capture read it.
+    pub row: crate::RowSchema,
+    /// The blob the capture's worktree tree holds at the row's path.
+    pub object: String,
 }
 
 /// Timestamp granularity the racy-seat guard allows for, in nanoseconds.
@@ -2337,6 +2519,11 @@ pub enum ReuseUnavailable {
     /// every pass and the whole capture is never reused until the clock passes
     /// its stamp. Other seats may still be reused one by one.
     FutureStamp,
+    /// The retained capture's reuse manifest does not describe it: it does
+    /// not decode, it is bound to another bundle, or it names an object that
+    /// is not a blob (Q42 lane L7, P70). Nothing is reused from a manifest
+    /// that cannot be proved to match its capture; the pass read every seat.
+    ManifestMismatch,
 }
 
 impl ReuseUnavailable {
@@ -2348,6 +2535,7 @@ impl ReuseUnavailable {
             Self::RetainedUnreadable => "retained-unreadable",
             Self::PassStartUnrecorded => "pass-start-unrecorded",
             Self::FutureStamp => "future-stamp",
+            Self::ManifestMismatch => "manifest-mismatch",
         }
     }
 }
@@ -2385,6 +2573,11 @@ pub struct Export {
     /// prerequisites ([`ExportOptions::chain`]). A restore must then supply
     /// that capture's chain ([`chain::flatten`]).
     pub chained: bool,
+    /// The regular seats the bundle holds, each with its blob (Q42 lane
+    /// L7): what a later pass needs to reuse them without reading the
+    /// bundle ([`RetainedCapture::manifest`]). `None` for a shallow
+    /// checkout, whose bundle is never reused.
+    pub manifest: Option<Vec<ManifestSeat>>,
 }
 
 /// One metadata census of a checkout: typed seats plus custody for what the
@@ -9082,6 +9275,7 @@ mod tests {
             let retained = RetainedCapture {
                 bundle: &first.bundle,
                 started_ns,
+                manifest: None,
             };
             reusable_blobs(&private, &retained, &held, now_ns)
                 .unwrap()
@@ -9100,6 +9294,101 @@ mod tests {
         // Re-review finding 5: a stamp later than this pass's own clock comes
         // from a clock the pass cannot order against, and fails closed.
         assert!(!reuse_at(later, stamp - 1).contains_key(b"tracked".as_slice()));
+        assert!(!refs(&private).unwrap().contains(REUSE_NAMESPACE));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // The same guard on the manifest path (Q42 lane L7), which every changed
+    // capture since L7 takes. The checkout is clean, so every listed blob is
+    // in the source store and nothing can fall back to the bundle path above
+    // and its own guard: `manifest_blobs` is called directly, and each case
+    // must answer `Held`. The seat rule there is the whole of what keeps a
+    // same-size rewrite in the capture tick from being emitted by name.
+    #[test]
+    fn a_same_size_rewrite_in_the_capture_tick_is_never_reused_from_a_manifest() {
+        let root =
+            std::env::temp_dir().join(format!("bulkload-manifest-racy-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let source = root.join("source");
+        committed_repository(&source, b"tracked bytes at census");
+        let first =
+            export_repository_with_drift(&source, &root.join("first"), &ExportOptions::default())
+                .unwrap();
+        let manifest = first.manifest.clone().unwrap();
+        let listed = manifest
+            .iter()
+            .find(|seat| seat.row.rel_path == b"tracked")
+            .unwrap();
+        let held = held_census(&root.join("first/repository.git"));
+        let tracked = held.iter().find(|row| row.rel_path == b"tracked").unwrap();
+        assert_eq!(&listed.row, tracked);
+        let stamp = tracked.mtime_ns.max(tracked.ctime_ns);
+        fs::write(source.join("tracked"), b"TRACKED BYTES AT CENSUS").unwrap();
+        let second = root.join("second");
+        fs::create_dir(&second).unwrap();
+        let private = prepare_private(&source, &second).unwrap();
+        let reuse_of = |seats: &[crate::RowSchema], started_ns: i128, now_ns: i128| {
+            let retained = RetainedCapture {
+                bundle: &first.bundle,
+                started_ns,
+                manifest: Some(&manifest),
+            };
+            // `Held`, or the case fell back or mismatched: neither can
+            // happen to a clean checkout's own manifest.
+            match manifest_blobs(&private, &manifest, &retained, seats, now_ns).unwrap() {
+                Listed::Held(reuse) => Some(reuse),
+                Listed::Missed | Listed::Mismatch => None,
+            }
+            .unwrap()
+        };
+        let reuse_at = |started_ns: i128, now_ns: i128| reuse_of(&held, started_ns, now_ns);
+        let later = stamp + 60 * RACY_GRANULARITY_NS;
+        // Stamped in the tick the retained pass started in: racy.
+        assert!(
+            !reuse_at(stamp, later).contains_key(b"tracked".as_slice()),
+            "a racy seat is never reused from a manifest"
+        );
+        assert!(!reuse_at(stamp + RACY_GRANULARITY_NS, later).contains_key(b"tracked".as_slice()));
+        // Settled: reused by name, the blob the retained capture listed.
+        assert_eq!(
+            reuse_at(later, later).get(b"tracked".as_slice()),
+            Some(&listed.object)
+        );
+        // A stamp later than this pass's own clock fails closed.
+        assert!(!reuse_at(later, stamp - 1).contains_key(b"tracked".as_slice()));
+        // A settled seat whose identity moved is read again, whichever part
+        // of the identity moved.
+        let moved = |change: fn(&mut crate::RowSchema)| {
+            let mut seats = held.clone();
+            change(
+                seats
+                    .iter_mut()
+                    .find(|row| row.rel_path == b"tracked")
+                    .unwrap(),
+            );
+            reuse_of(&seats, later, later).contains_key(b"tracked".as_slice())
+        };
+        assert!(!moved(|row| row.mtime_ns += 1), "mtime moved");
+        assert!(!moved(|row| row.size += 1), "size moved");
+        assert!(!moved(|row| row.mode ^= 0o100), "mode moved");
+        // The whole path, as a pass calls it: the same answers, no bundle
+        // read into the private repository and no reuse ref left behind.
+        let whole = |started_ns: i128, now_ns: i128| {
+            let retained = RetainedCapture {
+                bundle: &first.bundle,
+                started_ns,
+                manifest: Some(&manifest),
+            };
+            reusable_blobs(&private, &retained, &held, now_ns)
+                .unwrap()
+                .unwrap()
+                .contains_key(b"tracked".as_slice())
+        };
+        assert!(!whole(stamp, later));
+        assert!(whole(later, later));
+        assert!(pack_files(&private.join("objects/pack"))
+            .unwrap()
+            .is_empty());
         assert!(!refs(&private).unwrap().contains(REUSE_NAMESPACE));
         fs::remove_dir_all(root).unwrap();
     }
@@ -9133,6 +9422,7 @@ mod tests {
                 reuse: Some(RetainedCapture {
                     bundle: &corrupt,
                     started_ns: first.started_ns,
+                    manifest: None,
                 }),
                 ..ExportOptions::default()
             },
@@ -9235,6 +9525,7 @@ mod tests {
                     bundle: &first.bundle,
                     // Settled: nothing is racy, so shallow is the only reason.
                     started_ns: first.started_ns + 60 * RACY_GRANULARITY_NS,
+                    manifest: None,
                 }),
                 ..ExportOptions::default()
             },

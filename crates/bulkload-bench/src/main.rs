@@ -8,6 +8,11 @@
 //! bench refuses, unless `--informational` is given; then each such sample is
 //! flagged `gated=false` and the verdict is informational only.
 //!
+//! Power is read per platform (OI-1003-Q96): `pmset -g batt` on macOS, and
+//! `/sys/class/power_supply` on Linux by the rule on [`linux_power`]. Any
+//! other platform reports `unknown`, which refuses. `bulkload-bench preflight`
+//! prints the reading and the probe that made it, and runs nothing.
+//!
 //! `bulkload-bench micro <name>` runs the M0 micro-benchmarks instead; see
 //! [`micro`].
 
@@ -107,7 +112,7 @@ const MAX_GATED_LOAD1: f64 = 2.5;
 /// Host conditions read immediately before a sample (R-N81).
 #[derive(Clone, Debug, PartialEq)]
 struct Preflight {
-    /// `ac`, `battery` or `unknown`, from `pmset -g batt`.
+    /// `ac`, `battery` or `unknown`, from [`POWER_PROBE`].
     power: &'static str,
     /// The 1-minute load average from `getloadavg`, if available.
     load1: Option<f64>,
@@ -115,16 +120,24 @@ struct Preflight {
 
 impl Preflight {
     fn read() -> Self {
-        let power = Command::new("pmset")
-            .args(["-g", "batt"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map_or("unknown", |output| {
-                power_source(&String::from_utf8_lossy(&output.stdout))
-            });
+        let power = if cfg!(target_os = "linux") {
+            linux_power(Path::new(POWER_SUPPLY_ROOT))
+        } else if cfg!(target_os = "macos") {
+            // The child stays in `read`: the S2 command registry (P76,
+            // `source_command_registry.rs`) pins it as `read("pmset")`.
+            Command::new("pmset")
+                .args(["-g", "batt"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map_or("unknown", |output| {
+                    power_source(&String::from_utf8_lossy(&output.stdout))
+                })
+        } else {
+            "unknown"
+        };
         Self {
             power,
             load1: load_average(),
@@ -152,6 +165,95 @@ impl Preflight {
             self.load1
                 .map_or_else(|| "unknown".to_owned(), |load| format!("{load:.2}"))
         )
+    }
+}
+
+/// The Linux power-supply class directory (sysfs).
+const POWER_SUPPLY_ROOT: &str = "/sys/class/power_supply";
+
+/// What [`Preflight::read`] asks for the power state on this platform.
+const POWER_PROBE: &str = if cfg!(target_os = "linux") {
+    "sysfs"
+} else if cfg!(target_os = "macos") {
+    "pmset"
+} else {
+    "none"
+};
+
+/// The per-file seal the native arm issues under `durability`, by name.
+///
+/// It mirrors `bulkload_agent::durable::seal_file` and must change with it:
+/// group mode is `F_BARRIERFSYNC` on Apple targets and `fsync` elsewhere
+/// (data and metadata durable, with a device cache flush on Linux); strict
+/// mode is `F_FULLFSYNC` on Apple targets and `fsync` elsewhere. The rclone
+/// arm is run with no sync flag, so what the native arm pays for durability
+/// differs by platform and a sample must say which seal it timed
+/// (OI-1003-Q97).
+const fn seal_primitive(durability: Durability) -> &'static str {
+    match durability {
+        Durability::Group if cfg!(target_vendor = "apple") => "F_BARRIERFSYNC",
+        Durability::Strict if cfg!(target_vendor = "apple") => "F_FULLFSYNC",
+        Durability::Group | Durability::Strict => "fsync",
+    }
+}
+
+fn sysfs_word(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .map(|text| text.trim().to_owned())
+}
+
+/// R-N81 power state from a Linux power-supply class tree (OI-1003-Q96).
+///
+/// The rule, in order. `r23_ab.py` applies the same one, and both are tested
+/// over the same fake trees.
+///
+/// 1. The class directory cannot be listed: `unknown`.
+/// 2. A supply whose `scope` is `Device` powers a peripheral (a mouse, a
+///    headset); it is ignored.
+/// 3. Any `Mains` supply with `online` = `1`: `ac`.
+/// 4. Otherwise, if a `Battery` or `UPS` supply exists: `battery`. A battery
+///    with no mains supply online is the only power the host can be on,
+///    whatever its `status` says.
+/// 5. Otherwise, if any supply's `type` could not be read: `unknown`.
+/// 6. Otherwise no battery exists (a desktop or a server, with or without an
+///    offline `Mains` entry): `ac`.
+///
+/// `USB`, `Wireless` and every other type never prove AC and never count as
+/// a battery; a host charged only through such a supply reads `battery`.
+fn linux_power(root: &Path) -> &'static str {
+    let Ok(entries) = fs::read_dir(root) else {
+        return "unknown";
+    };
+    let mut mains_online = false;
+    let mut battery = false;
+    let mut unreadable = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            unreadable = true;
+            continue;
+        };
+        let supply = entry.path();
+        if sysfs_word(&supply.join("scope")).as_deref() == Some("Device") {
+            continue;
+        }
+        match sysfs_word(&supply.join("type")).as_deref() {
+            Some("Mains") => {
+                mains_online |= sysfs_word(&supply.join("online")).as_deref() == Some("1");
+            }
+            Some("Battery" | "UPS") => battery = true,
+            Some(_) => (),
+            None => unreadable = true,
+        }
+    }
+    if mains_online {
+        "ac"
+    } else if battery {
+        "battery"
+    } else if unreadable {
+        "unknown"
+    } else {
+        "ac"
     }
 }
 
@@ -234,6 +336,17 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    if args.get(1).is_some_and(|word| word == "preflight") {
+        // The harness asks this before a gated sample, to learn whether this
+        // build reads the platform's power state itself (OI-1003-Q96).
+        println!(
+            "preflight {} power_probe={POWER_PROBE} os={} arch={}",
+            Preflight::read().render(),
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        );
+        return ExitCode::SUCCESS;
     }
     match run(&Cli::parse_from(args)) {
         Ok(()) => ExitCode::SUCCESS,
@@ -774,7 +887,7 @@ fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
 
 fn print_header(cli: &Cli, fixture: &Fixture, rclone_identity: &str) {
     println!(
-        "benchmark revision={} durability={} priority={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={}",
+        "benchmark revision={} durability={} priority={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={} power_probe={POWER_PROBE} os={} arch={} seal_primitive={}",
         cli.revision,
         cli.durability,
         cli.priority.label(),
@@ -785,6 +898,9 @@ fn print_header(cli: &Cli, fixture: &Fixture, rclone_identity: &str) {
         fixture.expected.len(),
         fixture.seed_source_read,
         fixture.seed_received,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        seal_primitive(cli.durability),
     );
     if let Some(rclone) = &cli.rclone {
         println!(
@@ -1085,6 +1201,117 @@ mod tests {
             load1: None,
         };
         assert!(blind.blocker().is_some());
+    }
+
+    /// One fake supply: `(name, type, online, status, scope)`; `None` leaves
+    /// the file out.
+    type Supply = (
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+        Option<&'static str>,
+    );
+
+    fn fake_sysfs(supplies: &[Supply]) -> io::Result<tempfile::TempDir> {
+        let root = tempfile::tempdir()?;
+        for (name, kind, online, status, scope) in supplies {
+            let supply = root.path().join(name);
+            fs::create_dir(&supply)?;
+            for (file, value) in [
+                ("type", kind),
+                ("online", online),
+                ("status", status),
+                ("scope", scope),
+            ] {
+                if let Some(value) = value {
+                    fs::write(supply.join(file), format!("{value}\n"))?;
+                }
+            }
+        }
+        Ok(root)
+    }
+
+    /// The same table as `LinuxPowerTests.CASES` in `test_r23_ab.py`.
+    #[test]
+    fn linux_power_rule_over_fake_sysfs_trees() -> io::Result<()> {
+        let mains_on: Supply = ("ADP1", Some("Mains"), Some("1"), None, None);
+        let mains_off: Supply = ("ADP1", Some("Mains"), Some("0"), None, None);
+        let full: Supply = ("BAT0", Some("Battery"), None, Some("Full"), None);
+        let draining: Supply = ("BAT0", Some("Battery"), None, Some("Discharging"), None);
+        let mouse: Supply = (
+            "hid-mouse",
+            Some("Battery"),
+            None,
+            Some("Discharging"),
+            Some("Device"),
+        );
+        let usb_on: Supply = ("ucsi0", Some("USB"), Some("1"), None, None);
+        let ups: Supply = ("ups0", Some("UPS"), None, Some("Full"), None);
+        let no_type: Supply = ("odd", None, Some("1"), None, None);
+        let cases: &[(&str, &[Supply], &str)] = &[
+            ("laptop on its adapter", &[mains_on, full], "ac"),
+            ("laptop off its adapter", &[mains_off, draining], "battery"),
+            (
+                "adapter online, battery draining",
+                &[mains_on, draining],
+                "ac",
+            ),
+            ("battery only, not discharging", &[full], "battery"),
+            ("usb supply never proves ac", &[usb_on, full], "battery"),
+            ("desktop: empty class", &[], "ac"),
+            ("desktop: offline mains, no battery", &[mains_off], "ac"),
+            ("desktop with a peripheral battery", &[mouse], "ac"),
+            (
+                "peripheral battery beside a real one",
+                &[mouse, draining],
+                "battery",
+            ),
+            ("ups without mains", &[ups], "battery"),
+            ("unreadable type, nothing else", &[no_type], "unknown"),
+            (
+                "unreadable type beside online mains",
+                &[no_type, mains_on],
+                "ac",
+            ),
+            (
+                "unreadable type beside a battery",
+                &[no_type, full],
+                "battery",
+            ),
+        ];
+        for (name, supplies, expected) in cases {
+            let root = fake_sysfs(supplies)?;
+            assert_eq!(linux_power(root.path()), *expected, "{name}");
+        }
+        let gone = tempfile::tempdir()?;
+        assert_eq!(linux_power(&gone.path().join("absent")), "unknown");
+        // A mains supply whose `online` is missing or not `1` is not online.
+        let silent: Supply = ("ADP1", Some("Mains"), None, None, None);
+        assert_eq!(linux_power(fake_sysfs(&[silent, full])?.path()), "battery");
+        Ok(())
+    }
+
+    #[test]
+    fn seal_primitive_names_this_platforms_seal() {
+        let group = seal_primitive(Durability::Group);
+        let strict = seal_primitive(Durability::Strict);
+        if cfg!(target_vendor = "apple") {
+            assert_eq!((group, strict), ("F_BARRIERFSYNC", "F_FULLFSYNC"));
+        } else {
+            assert_eq!((group, strict), ("fsync", "fsync"));
+        }
+    }
+
+    #[test]
+    fn preflight_reads_this_platforms_probe() {
+        assert!(matches!(POWER_PROBE, "sysfs" | "pmset" | "none"));
+        assert_eq!(cfg!(target_os = "linux"), POWER_PROBE == "sysfs");
+        let now = Preflight::read();
+        assert!(matches!(now.power, "ac" | "battery" | "unknown"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(now.power, linux_power(Path::new(POWER_SUPPLY_ROOT)));
+        }
     }
 
     #[test]
