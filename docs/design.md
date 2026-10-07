@@ -127,6 +127,22 @@ Source safety (S2, WP1):
   - The main database file stays byte-identical with its timestamps
     unchanged. A `-wal` that existed before the read stays byte-identical.
     Nothing else beside the source is written (P75).
+  - **Refused as root (OI-1003-Q76).** With an effective uid of 0, every
+    provider verb that opens a database to read it refuses
+    `SQLITE_SOURCE_AS_ROOT` before it opens anything: `snapshot`, `compose`,
+    `compose-state`, `hydrate-state` and `apply-state-candidate`.
+    - Why: run as root, SQLite re-applies the database's owner to the
+      `-wal` and the `-shm` it opens (`fchown`; as any other user it skips
+      the call). Measured on 2026-10-06: the same read-only, WAL-aware open
+      plus backup leaves an existing `-wal`'s ctime unchanged as uid 1000
+      and moves it as uid 0, with the `-wal`'s size, mtime and bytes
+      unchanged. That is a source metadata write that Q16, Q36 and Q72 do
+      not admit, and neither counter sees it.
+    - The refusal is by uid, not by journal mode: a rollback-journal source
+      is refused as well, and no extra read of the source is made.
+    - A refused verb leaves the source directory as it was: no `-shm`, no
+      `-wal`, no timestamp moved, both counters 0 (P75's root leg).
+    - Run the verb as the database's owner.
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated

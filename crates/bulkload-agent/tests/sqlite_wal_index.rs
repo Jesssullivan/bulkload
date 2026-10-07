@@ -58,9 +58,33 @@
 //! in-process connection. The child holds its connection until its stdin
 //! closes, then ends on its own.
 //!
-//! **Corpus.** CI runs two PINNED rows per shape and 12 fixed-seed cases
-//! (`prop_config`, mirrored from `test_support` as `tests/git_estimate_dag.rs`
-//! does); `BULKLOAD_PROPTEST_DEEP=1` runs 240 random-seed cases. The counters
+//! **As root (OI-1003-Q76).** Opened as root, `SQLite` re-applies the
+//! database's ownership to its `-wal` (`fchown`), which moves an existing
+//! `-wal`'s ctime while its size, mtime and bytes stay: a source metadata
+//! write no ruling admits, and the property above fails on it (CI runs as
+//! root). So the provider refuses to read a source as root, and with an
+//! effective uid of 0 each test here has two legs:
+//!
+//! - **the refusal** ([`refused_as_root`], [`cli_refused_as_root`]): over the
+//!   PINNED rows, `snapshot` returns `SQLITE_SOURCE_AS_ROOT`, writes no
+//!   output, adds 0 to both counters, and leaves the source directory as it
+//!   was: every entry byte- and metadata-identical (ctime included), with no
+//!   `-shm` and no `-wal` created;
+//! - **the property as an ordinary user** ([`unprivileged_leg`]): the same
+//!   test is re-run in a child process that drops to uid and gid
+//!   [`UNPRIVILEGED`] (`nobody`), so a root run keeps the whole of P75. The
+//!   child runs copies of this test binary and of the agent from a scratch
+//!   directory under `TMPDIR` that it owns, so the build tree need not be
+//!   readable by `nobody`. When the drop cannot be made (a user namespace
+//!   that maps only uid 0, a sandbox without the capability, a `TMPDIR`
+//!   `nobody` cannot reach), [`p75_unprivileged_probe`] fails first, the leg
+//!   is skipped, and a `p75 root:` line on stderr says so and why: that run
+//!   then proves the refusal only.
+//!
+//! **Corpus.** CI runs two PINNED rows per shape and 12 seeded cases through
+//! the shared `test_support::prop_config` (OI-1003-Q7, OI-1003-Q78; compiled
+//! in as `tests/git_estimate_dag.rs` does), which also owns the deep tier's
+//! case count (`BULKLOAD_PROPTEST_DEEP=1`: 240 cases). The counters
 //! are process scope, so every snapshot in this binary runs inside the one
 //! test that reads them; [`the_counters_line_reports_both_exceptions`] runs
 //! the `snapshot` verb as its own process and reads its `counters` line. Each
@@ -82,44 +106,26 @@ use std::fmt::Write as _;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::Duration;
 
 use bulkload_agent::counters::{Counter, Counters};
 use bulkload_agent::provider_sqlite::snapshot;
+use bulkload_agent::BulkloadRefusal;
 use proptest::prelude::*;
-use proptest::test_runner::{Config, RngSeed, TestRunner};
+use proptest::test_runner::TestRunner;
 use rusqlite::{Connection, OpenFlags};
 
 // ---------------------------------------------------------------------------
 // Corpus configuration
 // ---------------------------------------------------------------------------
 
-/// `test_support::CI_SEED`, mirrored: every CI run draws the same cases.
-const CI_SEED: u64 = 0x0B01_C0AD_2026_1003;
-
-/// `test_support::DEEP`, mirrored: the switch for the deep local tier.
-const DEEP: &str = "BULKLOAD_PROPTEST_DEEP";
-
-/// `test_support::prop_config`, mirrored for an integration test.
-fn prop_config(cases: u32) -> Config {
-    let deep = std::env::var_os(DEEP).is_some_and(|value| value == "1");
-    Config {
-        cases: if deep {
-            cases.saturating_mul(20)
-        } else {
-            cases
-        },
-        rng_seed: if deep {
-            RngSeed::Random
-        } else {
-            RngSeed::Fixed(CI_SEED)
-        },
-        failure_persistence: None,
-        ..Config::default()
-    }
-}
+/// The shared property-test configuration, compiled in from the library's
+/// `test_support`, so the seed and the deep switch cannot drift.
+#[path = "../src/test_support.rs"]
+mod test_support;
 
 // ---------------------------------------------------------------------------
 // The live writer: this binary, re-run as one test
@@ -650,14 +656,270 @@ fn check(case: &Case) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// As root (OI-1003-Q76)
+// ---------------------------------------------------------------------------
+
+/// The uid and gid the unprivileged leg drops to: `nobody` on Linux.
+const UNPRIVILEGED: u32 = 65_534;
+
+/// Set for [`p75_unprivileged_probe`]; unset, that test is a no-op.
+const PROBE: &str = "BULKLOAD_P75_PROBE";
+
+/// Names the agent binary for the unprivileged leg's child: a copy it can
+/// reach. Unset, the agent is the one cargo built for this test.
+const AGENT: &str = "BULKLOAD_P75_AGENT";
+
+fn agent() -> PathBuf {
+    std::env::var_os(AGENT).map_or_else(
+        || PathBuf::from(env!("CARGO_BIN_EXE_bulkload-agent")),
+        PathBuf::from,
+    )
+}
+
+/// The uid this process creates files as: its effective uid.
+fn effective_uid() -> u32 {
+    let made = tempfile::Builder::new()
+        .prefix("bulkload-p75-uid-")
+        .tempdir()
+        .unwrap();
+    fs::metadata(made.path()).unwrap().uid()
+}
+
+/// A line on the real stderr, which the harness does not capture: a CI log
+/// shows which legs a root run proved.
+fn note(line: &str) {
+    let _ = writeln!(std::io::stderr(), "p75 root: {line}");
+}
+
+/// What changed between two scans, for an assertion message.
+fn differences(before: &BTreeMap<OsString, Entry>, after: &BTreeMap<OsString, Entry>) -> String {
+    let mut text = String::new();
+    let brief = |entry: Option<&Entry>| {
+        entry.map(|entry| (entry.ino, entry.mode, entry.size, entry.mtime, entry.ctime))
+    };
+    let names: std::collections::BTreeSet<&OsString> = before.keys().chain(after.keys()).collect();
+    for name in names {
+        if before.get(name) != after.get(name) {
+            let _ = write!(
+                text,
+                "\n  {}: {:?} -> {:?}",
+                name.display(),
+                brief(before.get(name)),
+                brief(after.get(name))
+            );
+        }
+    }
+    text
+}
+
+/// The refusal leg: as root, a snapshot of every PINNED source is refused
+/// with the typed refusal before the source is opened. Nothing in the source
+/// directory is created, removed or changed (no `-shm`, no `-wal`, no ctime
+/// moved), no output is written and neither counter moves.
+fn refused_as_root() {
+    for case in pinned() {
+        let root = tempfile::Builder::new()
+            .prefix("bulkload-p75-root-")
+            .tempdir()
+            .unwrap();
+        let source = build(root.path(), &case);
+        let out = private_dir(&root.path().join("out"));
+        let output = out.join("snapshot.sqlite");
+        let shape = case.shape;
+
+        let before = scan(&source.dir);
+        let counted = Counters::snapshot();
+        let outcome = snapshot(&source.database, &output, 10_000);
+        let delta = Counters::snapshot().since(counted);
+        let after = scan(&source.dir);
+
+        // The directory first: were the uid check gone, this names the
+        // write root makes (the `-wal`'s ctime, or a sidecar it created).
+        assert!(
+            before == after,
+            "{shape:?}: a snapshot as root changed its source directory:{}",
+            differences(&before, &after)
+        );
+        assert_eq!(
+            outcome,
+            Err(BulkloadRefusal::SqliteSourceAsRoot),
+            "{shape:?}: a snapshot as root is refused (OI-1003-Q76)"
+        );
+        assert!(!output.exists(), "{shape:?}: a refused snapshot wrote");
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0, "{shape:?}: out");
+        assert_eq!(delta.get(Counter::SourceWalIndexTouched), 0, "{shape:?}");
+        assert_eq!(delta.get(Counter::SourceWalCreated), 0, "{shape:?}");
+        println!(
+            "p75 shape={shape:?} pending={} euid=0 refused=SQLITE_SOURCE_AS_ROOT source=unchanged",
+            case.pending.len()
+        );
+        if let Some(live) = source.live {
+            live.finish();
+        }
+    }
+}
+
+/// The CLI's refusal leg: as root the `snapshot` verb fails with the typed
+/// refusal on stderr, writes no output and leaves its source directory as
+/// it was.
+fn cli_refused_as_root() {
+    for shape in [Shape::CrashedNoShm, Shape::CleanClosed] {
+        let root = tempfile::Builder::new()
+            .prefix("bulkload-p75-cli-root-")
+            .tempdir()
+            .unwrap();
+        let case = Case {
+            shape,
+            page_size: 4096,
+            base: vec![vec![7; 300]; 3],
+            pending: vec![vec![9; 300]; 2],
+        };
+        let source = build(root.path(), &case);
+        let out = private_dir(&root.path().join("out"));
+        let before = scan(&source.dir);
+        let output = Command::new(agent())
+            .arg("snapshot")
+            .arg(&source.database)
+            .arg(out.join("snapshot.sqlite"))
+            .output()
+            .unwrap();
+        let after = scan(&source.dir);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            before == after,
+            "{shape:?}: the snapshot verb as root changed its source directory:{}",
+            differences(&before, &after)
+        );
+        assert!(!output.status.success(), "{shape:?}: {stderr}");
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line.ends_with("refused: SQLITE_SOURCE_AS_ROOT")),
+            "{shape:?}: no SQLITE_SOURCE_AS_ROOT refusal in {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("snapshot complete"),
+            "{shape:?}: a refused verb reported a snapshot"
+        );
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0, "{shape:?}: out");
+        // A counters line, where the refused verb prints one, reports no
+        // source write.
+        for line in stderr.lines().filter(|line| line.starts_with("counters ")) {
+            for field in ["source_wal_index_touched=0", "source_wal_created=0"] {
+                assert!(
+                    line.split(' ').any(|pair| pair == field),
+                    "{shape:?}: {field} not in {line}"
+                );
+            }
+        }
+    }
+}
+
+/// The probe the unprivileged leg runs first, as the dropped uid: this
+/// process is not root, can create files under its `TMPDIR` and can start
+/// the agent binary. Without `BULKLOAD_P75_PROBE` it is a no-op.
+#[test]
+fn p75_unprivileged_probe() {
+    if std::env::var_os(PROBE).is_none() {
+        return;
+    }
+    assert_ne!(effective_uid(), 0, "the probe runs after the drop");
+    Command::new(agent())
+        .arg("help")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap();
+}
+
+/// The copy of this test binary in `scratch`, run for one test as uid and
+/// gid [`UNPRIVILEGED`] with `scratch` as its `TMPDIR` and the copied agent.
+fn dropped(test: &str, scratch: &Path) -> Command {
+    let mut command = Command::new(scratch.join("p75-test"));
+    command
+        .args([test, "--exact", "--test-threads=1"])
+        .env("TMPDIR", scratch)
+        .env(AGENT, scratch.join("bulkload-agent"))
+        .env_remove(WRITER)
+        .env_remove(PROBE)
+        .stdin(Stdio::null())
+        .uid(UNPRIVILEGED)
+        .gid(UNPRIVILEGED);
+    command
+}
+
+/// The unprivileged leg of a root run: re-run `test` in a child process that
+/// has dropped to [`UNPRIVILEGED`], where it is the whole property again.
+/// The probe decides whether the drop can be made here; if it cannot, the
+/// leg is skipped and the reason is written to stderr.
+fn unprivileged_leg(test: &str) {
+    let scratch = tempfile::Builder::new()
+        .prefix("bulkload-p75-drop-")
+        .tempdir()
+        .unwrap();
+    let skipped = |why: String| {
+        note(&format!(
+            "{test}: unprivileged leg SKIPPED ({why}); this run proved the refusal only"
+        ));
+    };
+    if let Err(error) =
+        std::os::unix::fs::chown(scratch.path(), Some(UNPRIVILEGED), Some(UNPRIVILEGED))
+    {
+        return skipped(format!("chown of the scratch directory: {error}"));
+    }
+    // Copies keep the mode of the originals: readable and runnable by all.
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        scratch.path().join("p75-test"),
+    )
+    .unwrap();
+    fs::copy(agent(), scratch.path().join("bulkload-agent")).unwrap();
+    match dropped("p75_unprivileged_probe", scratch.path())
+        .env(PROBE, "1")
+        .output()
+    {
+        Err(error) => return skipped(format!("dropping to uid {UNPRIVILEGED}: {error}")),
+        Ok(probe) if !probe.status.success() => {
+            return skipped(format!(
+                "the probe as uid {UNPRIVILEGED} exited {}",
+                probe.status
+            ));
+        }
+        Ok(_) => {}
+    }
+    let run = dropped(test, scratch.path()).output().unwrap();
+    assert!(
+        run.status.success(),
+        "{test} as uid {UNPRIVILEGED} exited {}:\n{}\n{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        stdout.contains("1 passed") && stdout.contains("0 failed"),
+        "{test} as uid {UNPRIVILEGED} did not run exactly one test:\n{stdout}"
+    );
+    note(&format!(
+        "{test}: refusal proved as root; full property passed as uid {UNPRIVILEGED}"
+    ));
+}
+
 /// P75 over the PINNED rows, then over generated sources. One test, so every
 /// in-process snapshot (and the process-scope counters) is this test's own.
+/// As root: the refusal, then this test again as an ordinary user.
 #[test]
 fn p75_a_snapshot_writes_only_its_counted_sidecars() {
+    if effective_uid() == 0 {
+        refused_as_root();
+        unprivileged_leg("p75_a_snapshot_writes_only_its_counted_sidecars");
+        return;
+    }
     for case in pinned() {
         check(&case);
     }
-    TestRunner::new(prop_config(12))
+    TestRunner::new(test_support::prop_config(12))
         .run(&case(), |case| {
             check(&case);
             Ok(())
@@ -668,8 +930,14 @@ fn p75_a_snapshot_writes_only_its_counted_sidecars() {
 /// Both counters reach the `snapshot` verb's `counters` line. A source with a
 /// `-wal` and no wal-index: the read creates the `-shm` only. A checkpointed,
 /// closed source: the read creates the `-shm` and the empty `-wal`.
+/// As root: the verb's refusal, then this test again as an ordinary user.
 #[test]
 fn the_counters_line_reports_both_exceptions() {
+    if effective_uid() == 0 {
+        cli_refused_as_root();
+        unprivileged_leg("the_counters_line_reports_both_exceptions");
+        return;
+    }
     for (shape, index, wal) in [(Shape::CrashedNoShm, 1, 0), (Shape::CleanClosed, 1, 1)] {
         let root = tempfile::Builder::new()
             .prefix("bulkload-p75-cli-")
@@ -683,7 +951,7 @@ fn the_counters_line_reports_both_exceptions() {
         };
         let source = build(root.path(), &case);
         let out = private_dir(&root.path().join("out"));
-        let output = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        let output = Command::new(agent())
             .arg("snapshot")
             .arg(&source.database)
             .arg(out.join("snapshot.sqlite"))
