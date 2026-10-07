@@ -6,10 +6,11 @@
 //!   `decide`, decides exactly the row's output under the row's policy, with
 //!   each "-" input drawn at random (the fixed seed everywhere;
 //!   `BULKLOAD_PROPTEST_DEEP=1` draws more from it, OI-1003-Q78). That is all
-//!   three lanes: `v1`, whose policy is [`Policy::V1`], the one the code
-//!   runs, and `L6b` (a chain under a plan base) and `L8` (Q46's root
-//!   window), whose policies `decide` implements before their lanes land the
-//!   custody the callers need to act on them.
+//!   three lanes: `v1`, whose policy is [`Policy::V1`] (the code before
+//!   L6b), `L6b` (a chain under a plan base), whose policy is
+//!   [`Policy::CODE`], the one the code runs, and `L8` (Q46's root window),
+//!   whose policy `decide` implements before its lane lands the custody the
+//!   callers need to act on it.
 //! - **Labels.** The rows' output columns, over every lane, use exactly the
 //!   labels of the Rust unions. The reference refuses to render rows that
 //!   leave a label unreached, and `just formal-nv` requires its labels to be
@@ -20,7 +21,8 @@
 //!   and never past the limit, and so on (`well_formed`). Neither lazily read
 //!   input ([`reads_prev_base`], [`reads_tips_held`]) changes a decision that
 //!   is said not to rest on it.
-//! - **Stages.** Under [`Policy::V1`], the estate's decision (the record read,
+//! - **Stages.** Under [`Policy::CODE`] and under [`Policy::V1`], the
+//!   estate's decision (the record read,
 //!   the bound base only when the decision rests on it, and the write-time
 //!   inputs at their requested values), then the writer's decision on that
 //!   offer (the tips read only when the decision rests on them), equal one
@@ -444,13 +446,15 @@ fn well_formed(inputs: &Inputs, decision: Decision) -> Result<(), String> {
 }
 
 /// The estate's decision, then the writer's on its offer, as the code makes
-/// them under [`Policy::V1`]: [`decide_recorded`] (`estate::decide_capture`)
-/// and [`decide_offered`] (`shared::write_capture`), each lazy read answered
-/// from `inputs`.
+/// them: [`decide_recorded`] (`estate::decide_capture`) under the inputs'
+/// policy, and [`decide_offered`] (`shared::write_capture`), each lazy read
+/// answered from `inputs`. The writer always runs [`Policy::CODE`]: an
+/// estate under [`Policy::V1`] (the back-compat tests) never offers a link
+/// beside a plan base, so the writer decides the same under either.
 fn staged(inputs: &Inputs) -> Decision {
     // What `Inputs::new` leaves for later: the bound base and the write-time
     // inputs. `retained_capture` reads the rest, the record.
-    let fresh = Inputs::new(inputs.grouped, inputs.base, Policy::V1);
+    let fresh = Inputs::new(inputs.grouped, inputs.base, inputs.policy);
     let recorded = Inputs {
         prev_base: fresh.prev_base,
         tips_held: fresh.tips_held,
@@ -469,7 +473,7 @@ fn staged(inputs: &Inputs) -> Decision {
         plan.basis.based(),
         plan.basis.chained().then_some(()),
         inputs.shallow,
-        Policy::V1,
+        Policy::CODE,
         |()| Ok(inputs.tips_held),
     )
     .unwrap_or_else(|refusal| panic!("the writer refused {refusal:?} on {plan:?}, {inputs:?}"));
@@ -480,7 +484,7 @@ fn staged(inputs: &Inputs) -> Decision {
         } else {
             0
         },
-        // Informational in v1: the estate's. A shallow source at the depth
+        // Informational without a root window: the estate's. A shallow source at the depth
         // limit reads NewRoot to the estate and NoRebase to one decision; the
         // bundle is self-contained either way.
         rebase: Rebase::NoRebase,
@@ -507,11 +511,21 @@ fn p67_the_pinned_rows_are_the_reference_s_lanes_and_the_code_s_policy() {
         (lane("v1"), lane("L6b"), lane("L8"), rows.len()),
         (79, 85, 199, 363)
     );
-    // The v1 rows pin the code's policy: CHAIN_DEPTH_LIMIT, no window, no
-    // chain under a base.
+    // The L6b rows pin the code's policy: CHAIN_DEPTH_LIMIT, no window, a
+    // chain under a base. The v1 rows pin the policy before it.
+    for row in rows.iter().filter(|row| row.lane == "L6b") {
+        assert_eq!(row.policy, Policy::CODE, "line {}", row.line);
+    }
     for row in rows.iter().filter(|row| row.lane == "v1") {
         assert_eq!(row.policy, Policy::V1, "line {}", row.line);
     }
+    assert_eq!(
+        Policy::CODE,
+        Policy {
+            chain_under_base: true,
+            ..Policy::V1
+        }
+    );
 }
 
 #[test]
@@ -594,10 +608,12 @@ proptest! {
         }
     }
 
-    /// P67, stages: under the code's policy, the estate's decision and then
-    /// the writer's equal one decision on every input.
+    /// P67, stages: under the code's policy, and under v1's, the estate's
+    /// decision and then the writer's equal one decision on every input.
     #[test]
-    fn p67_the_staged_decisions_are_one_decision(inputs in any_inputs(Just(Policy::V1))) {
+    fn p67_the_staged_decisions_are_one_decision(
+        inputs in any_inputs(prop_oneof![Just(Policy::CODE), Just(Policy::V1)])
+    ) {
         prop_assert_eq!(unrebased(staged(&inputs)), unrebased(decide(&inputs)), "{:?}", inputs);
     }
 }
