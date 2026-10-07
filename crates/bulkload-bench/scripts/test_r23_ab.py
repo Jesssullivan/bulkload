@@ -30,6 +30,14 @@ if [ "$1" = micro ]; then
   echo "micro name=residency source=x files=1 source_resident_fraction=1.0000"
   exit 0
 fi
+# A build with the Linux preflight answers `preflight`; an older one refuses.
+if [ "$1" = preflight ]; then
+  [ -f "$0.native" ] || exit 2
+  echo "preflight power=ac load1=0.10 power_probe=sysfs os=linux arch=x86_64"
+  exit 0
+fi
+# Which pmset a rep would run (the shim directory, or nothing).
+command -v pmset >> "$0.pmset" || echo none >> "$0.pmset"
 # Like the real bench: with --informational (dry run, under load) and the host
 # outside the R-N81 gate, rows say gated=false and the verdict is informational
 # with no wins; --only runs one arm and gives a diagnostic verdict.
@@ -47,7 +55,7 @@ if [ -z "$gated" ]; then
 fi
 power=${STUB_POWER:-ac}
 sealed=$(cat "$2"/* 2>/dev/null | cksum | cut -d' ' -f1)
-echo "benchmark revision=r rclone_version=\\"rclone v1.75.0\\" sealed_corpus_blake3=s$sealed"
+echo "benchmark revision=r durability=group seal_primitive=${STUB_SEAL:-fsync} rclone_version=\\"${STUB_RCLONE:-rclone v1.74.4}\\" sealed_corpus_blake3=s$sealed"
 echo "sample sequence=0 arm=Native phase=initial elapsed_ms=100.0 workload_bytes=1000 transferred_content_bytes=900 source_bytes_read=1000 power=$power load1=1.00 gated=$gated"
 echo "native_timing sequence=0 phase=initial scope=s walk_ns=50 walk_ahead_wait_ns=20 queue_wait_ns=1"
 echo "native_counters sequence=0 phase=initial scope=s flush_barrier_ns=10000000 flush_full_ns=5000000 flush_dir_ns=0 files_materialized=10"
@@ -67,6 +75,34 @@ echo "median phase=delta native_ms=10.000 rclone_ms=20.000 native_wins=true"
 echo "verdict status=${STUB_VERDICT:-fail} r23_initial_win=false"
 exit 1
 """
+
+
+# The gated tests run on a fake field host named `rig-x`; gated evidence must
+# carry that name.
+EV = "r23-rig-x-ev.md"
+
+
+def fake_identity(node: str = "rig-x", **over: object) -> dict[str, object]:
+    """A complete host_identity for the platform the test patched in."""
+    system = ab.platform.system()
+    identity: dict[str, object] = {
+        "node": node,
+        "system": system,
+        "kernel": "6.0",
+        "machine": "x86_64",
+        "product": "TestBox1,1",
+        "cpu_model": "Test CPU",
+        "cpu_count": 4,
+        "cpu_logical": 4,
+        "cpu_physical_cores": 2,
+        "ram_bytes": 16 * 2**30,
+        "work_root_parent": "/x",
+        "work_root_fs_type": "xfs",
+        "power_probe": {"Linux": "sysfs", "Darwin": "pmset"}.get(system, "none"),
+        "power_supplies": [],
+    }
+    identity.update(over)
+    return identity
 
 
 def stub(path: Path) -> Path:
@@ -97,6 +133,208 @@ class ParseTests(unittest.TestCase):
         self.assertAlmostEqual(summary["files_per_s_median"], 100.0)
         self.assertEqual(summary["bytes_received_median"], 900)
         self.assertTrue(summary["all_gated"])
+
+
+MAINS_ON = {"name": "ADP1", "type": "Mains", "online": "1"}
+MAINS_OFF = {"name": "ADP1", "type": "Mains", "online": "0"}
+FULL = {"name": "BAT0", "type": "Battery", "status": "Full"}
+DRAINING = {"name": "BAT0", "type": "Battery", "status": "Discharging"}
+MOUSE = {
+    "name": "hid-mouse",
+    "type": "Battery",
+    "status": "Discharging",
+    "scope": "Device",
+}
+USB_ON = {"name": "ucsi0", "type": "USB", "online": "1"}
+UPS = {"name": "ups0", "type": "UPS", "status": "Full"}
+NO_TYPE = {"name": "odd", "online": "1"}
+
+
+def fake_sysfs(root: Path, supplies: list[dict[str, str]]) -> Path:
+    root.mkdir()
+    for supply in supplies:
+        directory = root / supply["name"]
+        directory.mkdir()
+        for key, value in supply.items():
+            if key != "name":
+                (directory / key).write_text(value + "\n")
+    return root
+
+
+class LinuxPowerTests(unittest.TestCase):
+    """The R-N81 Linux power rule (OI-1003-Q96).
+
+    The same table as `linux_power_rule_over_fake_sysfs_trees` in the Rust bench.
+    """
+
+    CASES = (
+        ("laptop on its adapter", [MAINS_ON, FULL], "ac"),
+        ("laptop off its adapter", [MAINS_OFF, DRAINING], "battery"),
+        ("adapter online, battery draining", [MAINS_ON, DRAINING], "ac"),
+        ("battery only, not discharging", [FULL], "battery"),
+        ("usb supply never proves ac", [USB_ON, FULL], "battery"),
+        ("desktop: empty class", [], "ac"),
+        ("desktop: offline mains, no battery", [MAINS_OFF], "ac"),
+        ("desktop with a peripheral battery", [MOUSE], "ac"),
+        ("peripheral battery beside a real one", [MOUSE, DRAINING], "battery"),
+        ("ups without mains", [UPS], "battery"),
+        ("unreadable type, nothing else", [NO_TYPE], "unknown"),
+        ("unreadable type beside online mains", [NO_TYPE, MAINS_ON], "ac"),
+        ("unreadable type beside a battery", [NO_TYPE, FULL], "battery"),
+    )
+
+    def setUp(self) -> None:
+        raw = tempfile.TemporaryDirectory()
+        self.addCleanup(raw.cleanup)
+        self.tmp = Path(raw.name)
+
+    def test_rule_over_fake_sysfs_trees(self) -> None:
+        for index, (name, supplies, expected) in enumerate(self.CASES):
+            root = fake_sysfs(self.tmp / f"case{index}", supplies)
+            state, read = ab.linux_power(root)
+            self.assertEqual(state, expected, name)
+            self.assertEqual(
+                sorted(s["name"] for s in read), sorted(s["name"] for s in supplies)
+            )
+
+    def test_missing_class_directory_and_silent_mains(self) -> None:
+        self.assertEqual(ab.linux_power(self.tmp / "absent"), ("unknown", []))
+        silent = {"name": "ADP1", "type": "Mains"}
+        root = fake_sysfs(self.tmp / "silent", [silent, FULL])
+        self.assertEqual(ab.linux_power(root)[0], "battery")
+
+    def test_power_source_by_platform(self) -> None:
+        root = fake_sysfs(self.tmp / "sys", [MAINS_OFF, DRAINING])
+        with (
+            mock.patch.object(ab, "POWER_SUPPLY_ROOT", root),
+            mock.patch.object(ab.platform, "system", return_value="Linux"),
+        ):
+            self.assertEqual(ab.power_source(), "battery")
+            self.assertFalse(ab.conditions()["ok"])
+        with mock.patch.object(ab.platform, "system", return_value="FreeBSD"):
+            self.assertEqual(ab.power_source(), "unknown")
+
+    def shim(self, supplies: list[dict[str, str]], name: str) -> tuple[int, str]:
+        root = fake_sysfs(self.tmp / name, supplies)
+        out = io.StringIO()
+        with (
+            mock.patch.object(ab, "POWER_SUPPLY_ROOT", root),
+            mock.patch.object(ab.platform, "system", return_value="Linux"),
+            contextlib.redirect_stdout(out),
+        ):
+            return ab.main(["--pmset-shim"]), out.getvalue()
+
+    def test_pmset_shim_speaks_pmset_and_never_invents_ac(self) -> None:
+        self.assertEqual(
+            self.shim([MAINS_ON, FULL], "a"), (0, "Now drawing from 'AC Power'\n")
+        )
+        self.assertEqual(
+            self.shim([MAINS_OFF, DRAINING], "b"),
+            (0, "Now drawing from 'Battery Power'\n"),
+        )
+        self.assertEqual(self.shim([NO_TYPE], "c"), (1, ""))
+        out = io.StringIO()
+        with (
+            mock.patch.object(ab.platform, "system", return_value="Darwin"),
+            contextlib.redirect_stdout(out),
+        ):
+            self.assertEqual(ab.main(["--pmset-shim"]), 1)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_pmset_shim_script_runs_this_harness(self) -> None:
+        directory = ab.write_pmset_shim(self.tmp)
+        script = directory / "pmset"
+        self.assertTrue(os.access(script, os.X_OK))
+        self.assertIn("--pmset-shim", script.read_text())
+        result = ab.subprocess.run(
+            [str(script), "-g", "batt"], capture_output=True, text=True, check=False
+        )
+        expected = {
+            "ac": (0, ab.PMSET_AC + "\n"),
+            "battery": (0, ab.PMSET_BATTERY + "\n"),
+        }.get(ab.power_source() if ab.platform.system() == "Linux" else "", (1, ""))
+        self.assertEqual((result.returncode, result.stdout), expected)
+
+
+class HostIdentityTests(unittest.TestCase):
+    MOUNTINFO = (
+        "22 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/rl-root rw\n"
+        "90 22 253:2 / /home rw,relatime shared:40 - ext4 /dev/mapper/rl-home rw\n"
+        "95 90 0:40 / /home/a\\040b rw - tmpfs tmpfs rw\n"
+        "malformed line\n"
+    )
+    MOUNT = (
+        "/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)\n"
+        "/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)\n"
+        "/dev/disk5s1 on /Volumes/TinylandState (hfs, local, journaled)\n"
+    )
+
+    def test_fs_type_takes_the_longest_containing_mount(self) -> None:
+        fs = ab.fs_type_from_mountinfo
+        self.assertEqual(fs(self.MOUNTINFO, "/home/jess/git-bulkload"), "ext4")
+        self.assertEqual(fs(self.MOUNTINFO, "/home"), "ext4")
+        self.assertEqual(fs(self.MOUNTINFO, "/homestead"), "xfs")
+        self.assertEqual(fs(self.MOUNTINFO, "/home/a b/x"), "tmpfs")
+        self.assertIsNone(fs("", "/home"))
+        darwin = ab.fs_type_from_mount
+        self.assertEqual(darwin(self.MOUNT, "/Volumes/TinylandState/x"), "hfs")
+        self.assertEqual(darwin(self.MOUNT, "/Users/jess"), "apfs")
+        self.assertIsNone(darwin("", "/"))
+
+    def test_physical_cores_are_not_logical_cpus(self) -> None:
+        """mbp-13's shape: 2 cores, 4 threads. os.cpu_count() would say 4."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for cpu, siblings in enumerate(("0,2", "1,3", "0,2", "1,3")):
+                topology = root / f"cpu{cpu}" / "topology"
+                topology.mkdir(parents=True)
+                (topology / "thread_siblings_list").write_text(siblings + "\n")
+            (root / "cpufreq").mkdir()
+            (root / "cpu9").mkdir()  # offline: no topology directory
+            self.assertEqual(ab.linux_physical_cores(root), 2)
+            (root / "cpu3" / "topology" / "thread_siblings_list").unlink()
+            self.assertIsNone(ab.linux_physical_cores(root))
+            self.assertIsNone(ab.linux_physical_cores(root / "absent"))
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(ab.linux_physical_cores(Path(tmp)))
+
+    def test_rig_role_comes_from_the_committed_list(self) -> None:
+        self.assertEqual(sorted(ab.RIG_OF_RECORD), ["mbp-13"])
+        record = {
+            "node": "mbp-13",
+            "system": "Linux",
+            "machine": "x86_64",
+            "product": "MacBookPro12,1",
+        }
+        self.assertEqual(ab.rig_role(record), ("record", None))
+        self.assertEqual(ab.rig_role({**record, "node": "mbp-13.lan"})[0], "record")
+        for node in ("neo", "sting", "yoga", "mbp-130", ""):
+            self.assertEqual(ab.rig_role({**record, "node": node}), ("field", None))
+        role, problem = ab.rig_role({**record, "product": "KVM"})
+        self.assertEqual(role, "field")
+        self.assertIn("identity differs", problem)
+        self.assertEqual(ab.rig_name("a b/c.example"), "a-b-c")
+        self.assertEqual(ab.rig_name(None), "unknown-host")
+
+    def test_cpu_model(self) -> None:
+        text = "processor\t: 0\nmodel name\t: Intel(R) Core(TM) i7\nflags\t: fpu\n"
+        self.assertEqual(ab.cpu_model_from_cpuinfo(text), "Intel(R) Core(TM) i7")
+        self.assertIsNone(ab.cpu_model_from_cpuinfo("processor: 0\n"))
+
+    def test_identity_names_the_rig(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            identity = ab.host_identity(Path(tmp))
+        self.assertEqual(identity["system"], ab.platform.system())
+        self.assertEqual(identity["cpu_count"], os.cpu_count())
+        self.assertEqual(identity["cpu_logical"], os.cpu_count())
+        if identity["system"] == "Linux":
+            self.assertGreaterEqual(identity["cpu_physical_cores"], 1)
+            self.assertLessEqual(identity["cpu_physical_cores"], os.cpu_count())
+        self.assertGreater(identity["ram_bytes"], 0)
+        if identity["system"] == "Linux":
+            self.assertEqual(identity["power_probe"], "sysfs")
+            self.assertTrue(identity["cpu_model"])
+            self.assertTrue(identity["work_root_fs_type"])
 
 
 def cond(
@@ -137,13 +375,36 @@ class HarnessTests(unittest.TestCase):
             "binary": str(bench),
             "sha256": "0" * 64,
         }
+        # A fake Nix store: the flake-pinned rclone, and another build.
+        self.pinned = self.fake_rclone("pin0-rclone-1.74.4")
+        self.other = self.fake_rclone("oth0-rclone-1.75.0")
+
+    def fake_rclone(self, name: str) -> Path:
+        binary = self.tmp / "store" / name / "bin" / "rclone"
+        binary.parent.mkdir(parents=True)
+        binary.write_text(name)
+        return binary
 
     def main(self, extra: list[str], **patches: object) -> int:
         """Run main() with builds, rclone and (unless given) host checks patched."""
         targets = {
             "build": mock.patch.object(ab, "build", return_value=self.info),
-            "resolve_rclone": mock.patch.object(
-                ab, "resolve_rclone", return_value=self.tmp / "rclone"
+            "flake_rclone": mock.patch.object(
+                ab, "flake_rclone", return_value=self.pinned
+            ),
+            "rclone_version": mock.patch.object(
+                ab, "rclone_version", return_value=ab.RCLONE_PIN["version"]
+            ),
+            "system_key": mock.patch.object(
+                ab, "system_key", return_value="test-system"
+            ),
+            "rclone_pin": mock.patch.dict(
+                ab.RCLONE_PIN["store_paths"],
+                {"test-system": str(self.pinned.parent.parent)},
+            ),
+            # `git rev-parse` of --rev-a on a rig of record: the pinned A.
+            "git": mock.patch.object(
+                ab, "git", return_value=ab.RIG_BASELINE_A["mbp-13"]["sha"]
             ),
             "conditions": mock.patch.object(ab, "conditions", return_value=cond()),
             "corpus_verify": mock.patch.object(ab, "corpus_verify", return_value=0),
@@ -151,13 +412,17 @@ class HarnessTests(unittest.TestCase):
                 ab, "corpus_shape", return_value=(ab.RECORD_FILES, ab.RECORD_BYTES)
             ),
             "system": mock.patch.object(ab.platform, "system", return_value="Darwin"),
+            "host_identity": mock.patch.object(
+                ab, "host_identity", side_effect=lambda _parent: fake_identity()
+            ),
         }
         for name, value in patches.items():
             targets[name] = value
         with contextlib.ExitStack() as stack:
             for patcher in targets.values():
                 stack.enter_context(patcher)
-            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            self.out = io.StringIO()
+            stack.enter_context(contextlib.redirect_stdout(self.out))
             return ab.main(
                 ["--repo", str(self.tmp), "--work-root", str(self.tmp / "work"), *extra]
             )
@@ -168,7 +433,7 @@ class HarnessTests(unittest.TestCase):
             str(self.corpus),
             "--coordinator-quiet",
             "--evidence",
-            str(self.tmp / "ev.md"),
+            str(self.tmp / EV),
             "--post-settle-seconds",
             "0",
         ]
@@ -210,13 +475,365 @@ class HarnessTests(unittest.TestCase):
         self.assertFalse((self.tmp / "work").exists())
 
     def test_gated_refusals(self) -> None:
+        other = mock.patch.object(ab.platform, "system", return_value="FreeBSD")
+        self.assertEqual(self.main(self.gated(), system=other), 2)
         linux = mock.patch.object(ab.platform, "system", return_value="Linux")
-        self.assertEqual(self.main(self.gated(), system=linux), 2)
+        no_corpus = [a for a in self.gated() if a not in ("--corpus", str(self.corpus))]
+        self.assertEqual(self.main(no_corpus, system=linux), 2)
         no_quiet = [a for a in self.gated() if a != "--coordinator-quiet"]
         self.assertEqual(self.main(no_quiet), 2)
         self.assertEqual(self.main([*self.gated(), "--expect-files", "1"]), 2)
         bad = mock.patch.object(ab, "corpus_verify", return_value=1)
         self.assertEqual(self.main(self.gated(), corpus_verify=bad), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def linux_builds(self, b_native: bool) -> mock._patch:
+        """Distinct stub binaries per label; B has the sysfs preflight or not."""
+        infos = {}
+        for label in ("B", "A", "V4"):
+            binary = stub(self.tmp / f"bench-{label}")
+            if label == "B" and b_native:
+                Path(f"{binary}.native").write_text("")
+            infos[label] = {
+                "rev": label,
+                "sha": {
+                    "B": "b" * 40,
+                    "A": ab.RIG_BASELINE_A["mbp-13"]["sha"],
+                    "V4": "4" * 40,
+                }[label],
+                "binary": str(binary),
+                "sha256": "0" * 64,
+            }
+        self.infos = infos
+        order = iter(("B", "A", "V4"))
+        return mock.patch.object(
+            ab, "build", side_effect=lambda *_a, **_k: infos[next(order)]
+        )
+
+    def test_gated_linux_refuses_a_b_without_its_own_preflight(self) -> None:
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        code = self.main(
+            self.gated(), system=linux, build=self.linux_builds(b_native=False)
+        )
+        self.assertEqual(code, 2)
+        self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+        self.assertFalse((self.tmp / EV).exists())
+        self.assertFalse(Path(self.infos["B"]["binary"] + ".pmset").exists())
+
+    def test_gated_linux_runs_b_native_and_baselines_behind_the_shim(self) -> None:
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(
+                self.gated(), system=linux, build=self.linux_builds(b_native=True)
+            )
+        self.assertEqual(code, 0)
+        report = self.report()
+        self.assertEqual(
+            {k: v["preflight"] for k, v in report["builds"].items()},
+            {"B": "native", "A": "pmset-shim", "V4": "pmset-shim"},
+        )
+        self.assertEqual(
+            [(r["label"], r["preflight"]) for r in report["reps"]],
+            [
+                ("B", "native"),
+                ("A", "pmset-shim"),
+                ("B", "native"),
+                ("A", "pmset-shim"),
+                ("B", "native"),
+                ("V4", "pmset-shim"),
+            ],
+        )
+        # The verdict rule is unchanged: every B rep passes, A decides nothing.
+        self.assertEqual(report["gate"]["verdict"], "PASS")
+        self.assertEqual(report["gate"]["b_reps"], 3)
+        self.assertIn("OI-1002-Q30", report["gate"]["rule"])
+        shim = str(self.tmp / "work" / "pmset-shim" / "pmset")
+        seen = {
+            label: Path(info["binary"] + ".pmset").read_text().split()
+            for label, info in self.infos.items()
+        }
+        self.assertEqual(seen["A"], [shim, shim])
+        self.assertEqual(seen["V4"], [shim])
+        self.assertEqual(len(seen["B"]), 3)
+        self.assertNotIn(shim, seen["B"])
+        identity = report["host_identity"]
+        for key in (
+            "node",
+            "system",
+            "kernel",
+            "machine",
+            "cpu_model",
+            "cpu_count",
+            "cpu_logical",
+            "cpu_physical_cores",
+            "ram_bytes",
+            "work_root_fs_type",
+            "power_probe",
+        ):
+            self.assertIn(key, identity)
+        self.assertEqual(identity["system"], "Linux")
+        self.assertEqual(identity["power_probe"], "sysfs")
+        md = (self.tmp / EV).read_text()
+        a12 = ab.RIG_BASELINE_A["mbp-13"]["sha"][:12]
+        self.assertIn(f"| A | `A` | `{a12}` | `0000000000000000` | pmset-shim |", md)
+        self.assertIn("B never runs behind it", md)
+        self.assertIn("- Rig: `", md)
+        self.assertIn("OI-1003-Q96", md)
+
+    def test_darwin_builds_are_never_shimmed(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated()), 0)
+        report = self.report()
+        self.assertFalse((self.tmp / "work" / "pmset-shim").exists())
+        self.assertTrue(all("preflight" not in b for b in report["builds"].values()))
+        self.assertTrue(all(r["preflight"] == "native" for r in report["reps"]))
+        self.assertNotIn("pmset-shim", (self.tmp / EV).read_text())
+
+    def no_a(self, name: str = "r23-rig-x-no-a-control.md") -> list[str]:
+        args = [a for a in self.gated() if a not in ("--evidence", str(self.tmp / EV))]
+        return [
+            *args,
+            "--evidence",
+            str(self.tmp / name),
+            "--b-only-no-a-control",
+            "--no-a-control-reason",
+            "A fails on this rig",
+        ]
+
+    def test_b_only_runs_bbb_and_marks_the_verdict(self) -> None:
+        for verdict, expected in (("pass", "PASS"), ("fail", "FAIL")):
+            with self.subTest(verdict=verdict):
+                self.setUp()
+                revs: list[str] = []
+
+                def record(_repo: Path, rev: str, *_a: object) -> dict[str, str]:
+                    revs.append(rev)
+                    return self.info
+
+                build = mock.patch.object(ab, "build", side_effect=record)
+                with mock.patch.dict(os.environ, {"STUB_VERDICT": verdict}):
+                    self.assertEqual(self.main(self.no_a(), build=build), 0)
+                self.assertEqual(revs, [ab.DEFAULT_B, ab.DEFAULT_V4])
+                report = self.report()
+                # B and V4 are built; A never is.
+                self.assertEqual(sorted(report["builds"]), ["B", "V4"])
+                self.assertEqual(
+                    [r["label"] for r in report["reps"]], ["B", "B", "B", "V4"]
+                )
+                self.assertEqual(report["mode"], "gated")
+                self.assertEqual(report["status"], "complete-draft-no-a-control")
+                self.assertEqual(report["pattern"], "BBB")
+                self.assertFalse(report["a_control"])
+                self.assertEqual(report["a_control_reason"], "A fails on this rig")
+                gate = report["gate"]
+                self.assertEqual(gate["verdict"], f"{expected}-NO-A-CONTROL")
+                self.assertNotIn(" ", gate["verdict"])
+                self.assertFalse(gate["of_record"])
+                self.assertFalse(gate["a_control"])
+                self.assertEqual(gate["b_reps"], 3)
+                self.assertIn("lacks the A control", gate["rule"])
+                self.assertIn("OI-1002-Q30", gate["rule"])
+                md = (self.tmp / "r23-rig-x-no-a-control.md").read_text()
+                self.assertIn("(DRAFT, NO A CONTROL)", md.splitlines()[0])
+                self.assertIn(
+                    f"**R23 gate verdict for B: {expected}-NO-A-CONTROL, rig `rig-x`,"
+                    " role `field`",
+                    md,
+                )
+                self.assertIn("A fails on this rig", md)
+                self.assertIn("operator's decision", md)
+
+    def test_b_only_keeps_every_gated_check(self) -> None:
+        busy = mock.patch.object(ab, "conditions", return_value=cond(False))
+        self.assertEqual(
+            self.main([*self.no_a(), "--settle-seconds", "0"], conditions=busy), 2
+        )
+        self.assertEqual(self.report()["gate"]["verdict"][:4], "NONE")
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_GATED": "false"}):
+            self.assertEqual(self.main(self.no_a()), 3)
+        self.setUp()
+        no_quiet = [a for a in self.no_a() if a != "--coordinator-quiet"]
+        self.assertEqual(self.main(no_quiet), 2)
+
+    def test_b_only_refusals(self) -> None:
+        self.assertEqual(self.main(self.no_a("r23-plain.md")), 2)
+        self.assertEqual(self.main(self.no_a()[:-2]), 2)
+        self.assertEqual(self.main([*self.no_a()[:-1], "  "]), 2)
+        self.assertEqual(self.main([*self.no_a(), "--pattern", "BBB"]), 2)
+        self.assertEqual(self.main([*self.no_a(), "--under-load"]), 2)
+        self.assertEqual(self.main([*self.no_a(), "--dry-run"]), 2)
+        self.assertEqual(self.main([*self.gated(), "--no-a-control-reason", "x"]), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_a_default_gated_sample_keeps_its_a_control(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated()), 0)
+        report = self.report()
+        self.assertTrue(report["a_control"])
+        self.assertTrue(report["gate"]["a_control"])
+        self.assertEqual(report["gate"]["verdict"], "PASS")
+        self.assertEqual(report["status"], "complete-draft")
+        self.assertNotIn("NO A CONTROL", (self.tmp / EV).read_text())
+
+    def record_rig(self, **over: object) -> mock._patch:
+        """Pretend to be mbp-13, the rig of record (Linux)."""
+        pinned = {"product": "MacBookPro12,1", **over}
+        return mock.patch.object(
+            ab,
+            "host_identity",
+            side_effect=lambda _parent: fake_identity("mbp-13", **pinned),
+        )
+
+    def run_on(self, argv: list[str], **patches: object) -> tuple[int, str]:
+        """main() with its stdout: the status line is what a poller reads."""
+        code = self.main(argv, **patches)
+        return code, self.out.getvalue()
+
+    def test_a_field_host_is_never_of_record(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code, out = self.run_on(self.gated())
+        self.assertEqual(code, 0)
+        report = self.report()
+        self.assertEqual((report["rig"], report["rig_role"]), ("rig-x", "field"))
+        self.assertEqual(report["gate"]["verdict"], "PASS")
+        self.assertFalse(report["gate"]["of_record"])
+        self.assertIn(" rig=rig-x rig_role=field of_record=false ", out)
+        self.assertTrue(out.strip().endswith("gate=PASS"))
+        md = (self.tmp / EV).read_text()
+        self.assertIn("rig rig-x, role field", md.splitlines()[0])
+        self.assertIn(
+            "**R23 gate verdict for B: PASS, rig `rig-x`, role `field`: a field"
+            " confirmation",
+            md,
+        )
+        self.assertIn("never the S1 verdict", md)
+
+    def test_the_rig_of_record_with_its_a_control_is_of_record(self) -> None:
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        argv = [a for a in self.gated() if a not in ("--evidence", str(self.tmp / EV))]
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "fail"}):
+            code, out = self.run_on(
+                argv,
+                system=linux,
+                build=self.linux_builds(b_native=True),
+                host_identity=self.record_rig(),
+            )
+        self.assertEqual(code, 0)
+        report = self.report()
+        self.assertEqual((report["rig"], report["rig_role"]), ("mbp-13", "record"))
+        self.assertEqual(report["gate"]["verdict"], "FAIL")
+        self.assertTrue(report["gate"]["of_record"])
+        self.assertIn(" rig=mbp-13 rig_role=record of_record=true ", out)
+        written = sorted((self.tmp / "docs" / "evidence").iterdir())
+        self.assertEqual(len(written), 1)
+        self.assertRegex(
+            written[0].name, r"^r23-\d{4}-\d{2}-\d{2}-\d{4}Z-mbp-13-record\.md$"
+        )
+        md = written[0].read_text()
+        self.assertIn("rig mbp-13, role record", md.splitlines()[0])
+        self.assertIn("role `record`: the rig of record; of_record=true**", md)
+
+    def test_b_only_on_the_rig_of_record_is_not_of_record(self) -> None:
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        argv = self.no_a()
+        at = argv.index("--evidence")
+        del argv[at : at + 2]
+        Path(f"{self.info['binary']}.native").write_text("")
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code, out = self.run_on(argv, system=linux, host_identity=self.record_rig())
+        self.assertEqual(code, 0)
+        gate = self.report()["gate"]
+        self.assertEqual(gate["verdict"], "PASS-NO-A-CONTROL")
+        self.assertFalse(gate["of_record"])
+        self.assertIn(" rig_role=record of_record=false ", out)
+        self.assertTrue(out.strip().endswith("gate=PASS-NO-A-CONTROL"))
+        self.assertNotRegex(out, r"gate=PASS(\s|$)")
+        written = sorted((self.tmp / "docs" / "evidence").iterdir())
+        self.assertRegex(written[0].name, r"Z-mbp-13-record-no-a-control\.md$")
+        self.assertIn(
+            "not a verdict of record (of_record=false)", written[0].read_text()
+        )
+
+    def test_gated_refuses_an_unnamed_or_impostor_rig(self) -> None:
+        for key in ab.IDENTITY_REQUIRED:
+            for empty in (None, ""):
+                blank = mock.patch.object(
+                    ab,
+                    "host_identity",
+                    side_effect=lambda _p, k=key, e=empty: fake_identity(**{k: e}),
+                )
+                code, out = self.run_on(self.gated(), host_identity=blank)
+                self.assertEqual(code, 2, key)
+                self.assertIn(f"host_identity has no {key}", out)
+        # Named like the rig of record, on the wrong platform or product.
+        code, out = self.run_on(self.gated(), host_identity=self.record_rig())
+        self.assertEqual(code, 2)
+        self.assertIn("identity differs", out)
+        # Evidence that does not carry the rig's name.
+        argv = self.gated()
+        argv[argv.index("--evidence") + 1] = str(self.tmp / "r23-ev.md")
+        code, out = self.run_on(argv)
+        self.assertEqual(code, 2)
+        self.assertIn("lacks rig-x", out)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_under_load_does_not_need_a_complete_identity(self) -> None:
+        blank = mock.patch.object(
+            ab, "host_identity", side_effect=lambda _p: fake_identity(product=None)
+        )
+        self.assertEqual(self.main(self.under_load(), host_identity=blank), 0)
+        self.assertIn("rig rig-x, role field", self.evidence_md().splitlines()[0])
+
+    def test_build_and_settle_are_recorded(self) -> None:
+        """The evidence says what was compiled in the sample and the load after."""
+        compiled = {**self.info, "compiled_in_this_run": True}
+        prebuilt = {**self.info, "compiled_in_this_run": False}
+        order = iter((compiled, prebuilt, prebuilt))
+        build = mock.patch.object(ab, "build", side_effect=lambda *_a: next(order))
+        after_build = mock.patch.object(
+            ab.os, "getloadavg", return_value=(2.03, 1.0, 0.5)
+        )
+        quiet = mock.patch.object(ab, "conditions", return_value=cond(load=1.5))
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(
+                self.gated(), build=build, conditions=quiet, loadavg=after_build
+            )
+        self.assertEqual(code, 0)
+        report = self.report()
+        self.assertEqual(report["post_build"]["load1"], 2.03)
+        self.assertEqual(report["settle"]["admitted"]["load1"], 1.5)
+        self.assertEqual(report["seal_primitive"], "fsync")
+        md = (self.tmp / EV).read_text()
+        self.assertIn("compiled inside this sample: **B**", md)
+        self.assertIn("load1 right after the builds: 2.03", md)
+        self.assertIn("not scaled to this rig's 2 physical cores", md)
+        self.assertIn("2 physical cores, 4 logical CPUs", md)
+        self.assertIn("per-file seal in this sample was `fsync`", md)
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated()), 0)
+        self.assertIn("none (every binary was prebuilt)", (self.tmp / EV).read_text())
+
+    def test_build_only_builds_and_runs_no_sample(self) -> None:
+        revs: list[str] = []
+
+        def record(_repo: Path, rev: str, *_a: object) -> dict[str, object]:
+            revs.append(rev)
+            return {**self.info, "compiled_in_this_run": True}
+
+        build = mock.patch.object(ab, "build", side_effect=record)
+        never = mock.patch.object(ab, "run_rep", side_effect=AssertionError)
+        code, out = self.run_on(["--build-only"], build=build, run_rep=never)
+        self.assertEqual(code, 0)
+        self.assertEqual(revs, [ab.DEFAULT_B, ab.DEFAULT_A, ab.DEFAULT_V4])
+        self.assertIn("status=built-not-a-sample", out)
+        self.assertEqual(out.count("compiled=true"), 3)
+        self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+        self.assertFalse((self.tmp / "docs").exists())
+        self.setUp()
+        self.assertEqual(self.main(["--build-only", "--dry-run"]), 2)
+        self.assertEqual(self.main(["--build-only", "--under-load"]), 2)
         self.assertFalse((self.tmp / "work").exists())
 
     def test_gated_refuses_any_pattern_but_babab(self) -> None:
@@ -276,7 +893,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(report["gate"]["b_reps_pass"], 3)
         self.assertTrue(report["content_verified_after"])
         self.assertIn(
-            "**R23 gate verdict for B: PASS**", (self.tmp / "ev.md").read_text()
+            "**R23 gate verdict for B: PASS, rig `rig-x`", (self.tmp / EV).read_text()
         )
 
     def test_gated_rollup_fails_when_any_b_rep_fails(self) -> None:
@@ -376,7 +993,7 @@ class HarnessTests(unittest.TestCase):
     def test_gated_evidence_still_cites_r_n91(self) -> None:
         with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
             self.assertEqual(self.main(self.gated()), 0)
-        md = (self.tmp / "ev.md").read_text()
+        md = (self.tmp / EV).read_text()
         self.assertIn(f"Rulings: {ab.RULINGS}.", md)
         self.assertIn("coordinator-quiet acknowledged: `True` (R-N91)", md)
 
@@ -393,7 +1010,7 @@ class HarnessTests(unittest.TestCase):
         self.assertIn(ab.UNDER_LOAD, written[0].read_text().splitlines()[0])
 
     def test_under_load_refuses_a_gate_style_evidence_name(self) -> None:
-        for name in ("ev.md", "r23-2026-10-04-1842Z.md"):
+        for name in (EV, "r23-2026-10-04-1842Z.md"):
             args = self.under_load()
             args[args.index("--evidence") + 1] = str(self.tmp / name)
             self.assertEqual(self.main(args), 2)
@@ -602,7 +1219,7 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(report["status"], "aborted")
         self.assertEqual(len(report["reps"]), 1)
         self.assertIn("precondition failed", report["reason"])
-        md = (self.tmp / "ev.md").read_text()
+        md = (self.tmp / EV).read_text()
         self.assertIn("(ABORTED)", md.splitlines()[0])
         self.assertNotIn("## Medians per revision", md)
 
@@ -640,6 +1257,377 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(report["status"], "aborted")
         self.assertFalse(report["content_verified_after"])
         self.assertIn("no longer verifies", report["reason"])
+
+    # --- OI-1003-Q105: the flake-pinned rclone is the rclone of every sample.
+
+    def choose(
+        self, given: Path | None, reason: str | None, mode: str, **patches: object
+    ) -> tuple[dict[str, object], str | None]:
+        targets = {
+            "flake_rclone": mock.patch.object(
+                ab, "flake_rclone", return_value=self.pinned
+            ),
+            "rclone_version": mock.patch.object(
+                ab, "rclone_version", return_value=ab.RCLONE_PIN["version"]
+            ),
+            "system_key": mock.patch.object(
+                ab, "system_key", return_value="test-system"
+            ),
+            "rclone_pin": mock.patch.dict(
+                ab.RCLONE_PIN["store_paths"],
+                {"test-system": str(self.pinned.parent.parent)},
+            ),
+        }
+        targets.update(patches)
+        with contextlib.ExitStack() as stack:
+            for patcher in targets.values():
+                stack.enter_context(patcher)
+            return ab.choose_rclone(
+                self.tmp, str(given) if given else None, reason, mode
+            )
+
+    def test_rclone_default_is_the_flake_pinned_build_and_is_recorded(self) -> None:
+        (self.tmp / "flake.lock").write_text(
+            json.dumps(
+                {
+                    "root": "root",
+                    "nodes": {
+                        "root": {"inputs": {"nixpkgs": "np"}},
+                        "np": {"locked": {"rev": "abc123"}},
+                    },
+                }
+            )
+        )
+        for mode in ("gated", "under-load", "dry-run"):
+            record, problem = self.choose(None, None, mode)
+            self.assertIsNone(problem, mode)
+            self.assertEqual(record["binary"], str(self.pinned))
+            self.assertEqual(record["store_path"], str(self.pinned.parent.parent))
+            self.assertEqual(record["version"], "rclone v1.74.4")
+            self.assertEqual(record["flake_nixpkgs_rev"], "abc123")
+            self.assertEqual(len(record["sha256"]), 64)
+            self.assertTrue(record["is_flake_pinned"])
+            self.assertTrue(record["matches_committed_pin"])
+            self.assertIsNone(record["override"])
+            self.assertEqual(
+                record["committed_pin"]["store_path"], str(self.pinned.parent.parent)
+            )
+        # Naming the pinned build by its path is the same build.
+        record, problem = self.choose(self.pinned, None, "gated")
+        self.assertIsNone(problem)
+        self.assertTrue(record["is_flake_pinned"])
+
+    def test_rclone_other_binary_is_refused_without_a_recorded_override(self) -> None:
+        for mode in ("gated", "under-load"):
+            record, problem = self.choose(self.other, None, mode)
+            self.assertIn("is not the flake-pinned rclone", problem)
+            self.assertIn("OI-1003-Q105", problem)
+            self.assertFalse(record["is_flake_pinned"])
+            for blank in ("", "   "):
+                self.assertIsNotNone(self.choose(self.other, blank, mode)[1])
+            record, problem = self.choose(self.other, "testing 1.75", mode)
+            self.assertIsNone(problem)
+            self.assertEqual(record["override"], {"reason": "testing 1.75"})
+            self.assertEqual(record["binary"], str(self.other))
+            self.assertEqual(record["flake_pinned_binary"], str(self.pinned))
+            self.assertFalse(record["matches_committed_pin"])
+            # A reason with the pinned build is a mistake, not an override.
+            for given in (None, self.pinned):
+                self.assertIn(
+                    "only for a --rclone that is not",
+                    self.choose(given, "why", mode)[1],
+                )
+
+    def test_rclone_a_moved_flake_is_refused_until_the_pin_records_it(self) -> None:
+        moved = mock.patch.object(ab, "flake_rclone", return_value=self.other)
+        record, problem = self.choose(None, None, "gated", flake_rclone=moved)
+        self.assertIn("a deliberate, recorded change (OI-1003-Q105)", problem)
+        self.assertIn("update RCLONE_PIN", problem)
+        self.assertTrue(record["is_flake_pinned"])
+        self.assertFalse(record["matches_committed_pin"])
+        # Same store path, another version string: still not the pin.
+        newer = mock.patch.object(ab, "rclone_version", return_value="rclone v9")
+        self.assertIsNotNone(self.choose(None, None, "gated", rclone_version=newer)[1])
+        # A system the pin does not list.
+        unlisted = mock.patch.object(ab, "system_key", return_value="riscv64-linux")
+        record, problem = self.choose(None, None, "gated", system_key=unlisted)
+        self.assertIn("committed pin for riscv64-linux is None", problem)
+        # Under load it is recorded, not refused; a dry run refuses nothing.
+        record, problem = self.choose(None, None, "under-load", flake_rclone=moved)
+        self.assertIsNone(problem)
+        self.assertFalse(record["matches_committed_pin"])
+        self.assertIsNone(self.choose(self.other, None, "dry-run")[1])
+
+    def test_rclone_that_cannot_be_resolved_or_read_is_refused(self) -> None:
+        broken = mock.patch.object(
+            ab, "flake_rclone", side_effect=ab.subprocess.CalledProcessError(1, "nix")
+        )
+        unreadable = mock.patch.object(ab, "rclone_version", return_value=None)
+        for mode in ("gated", "under-load"):
+            _record, problem = self.choose(None, None, mode, flake_rclone=broken)
+            self.assertIn("cannot resolve the flake-pinned rclone", problem)
+            # Even an override must record the pinned build it replaces.
+            self.assertIsNotNone(
+                self.choose(self.other, "why", mode, flake_rclone=broken)[1]
+            )
+            _record, problem = self.choose(None, None, mode, rclone_version=unreadable)
+            self.assertIn("cannot read", problem)
+        # A dry run with --rclone never calls nix.
+        never = mock.patch.object(ab, "flake_rclone", side_effect=AssertionError)
+        record, problem = self.choose(self.other, None, "dry-run", flake_rclone=never)
+        self.assertIsNone(problem)
+        self.assertIsNone(record["flake_pinned_binary"])
+
+    def test_flake_rclone_takes_the_output_that_has_the_binary(self) -> None:
+        man = self.tmp / "store" / "aaa-rclone-1.74.4-man"
+        man.mkdir()
+        out = mock.Mock(stdout=f"{man}\n{self.pinned.parent.parent}\n")
+        with mock.patch.object(ab.subprocess, "run", return_value=out) as run:
+            self.assertEqual(ab.flake_rclone(self.tmp), self.pinned)
+            self.assertEqual(
+                run.call_args.args[0][-3:],
+                ["--inputs-from", str(self.tmp), "nixpkgs#rclone"],
+            )
+        out.stdout = f"{self.pinned.parent.parent}\n{man}\n"
+        with mock.patch.object(ab.subprocess, "run", return_value=out):
+            self.assertEqual(ab.flake_rclone(self.tmp), self.pinned)
+        out.stdout = f"{man}\n"
+        with mock.patch.object(ab.subprocess, "run", return_value=out):
+            self.assertRaises(FileNotFoundError, ab.flake_rclone, self.tmp)
+
+    def test_rclone_version_and_system_key(self) -> None:
+        fake = self.tmp / "rclone-fake"
+        fake.write_text("#!/bin/sh\necho 'rclone v1.74.4'\necho '- os/version: x'\n")
+        fake.chmod(0o755)
+        self.assertEqual(ab.rclone_version(fake), "rclone v1.74.4")
+        fake.write_text("#!/bin/sh\nexit 3\n")
+        self.assertIsNone(ab.rclone_version(fake))
+        self.assertIsNone(ab.rclone_version(self.tmp / "absent"))
+        for machine, system, key in (
+            ("x86_64", "Linux", "x86_64-linux"),
+            ("arm64", "Darwin", "aarch64-darwin"),
+            ("aarch64", "Linux", "aarch64-linux"),
+        ):
+            with (
+                mock.patch.object(ab.platform, "machine", return_value=machine),
+                mock.patch.object(ab.platform, "system", return_value=system),
+            ):
+                self.assertEqual(ab.system_key(), key)
+
+    def test_the_committed_rclone_pin_follows_the_repo_flake_lock(self) -> None:
+        """A lock update that moves nixpkgs must also record the rclone pin."""
+        pin = ab.RCLONE_PIN
+        self.assertEqual(ab.flake_nixpkgs_rev(HERE.parents[2]), pin["nixpkgs_rev"])
+        self.assertRegex(pin["version"], r"^rclone v\d+\.\d+\.\d+$")
+        self.assertRegex(pin["recorded"], r"^\d{4}-\d{2}-\d{2}$")
+        number = pin["version"].removeprefix("rclone v")
+        self.assertIn("x86_64-linux", pin["store_paths"])
+        for system, path in pin["store_paths"].items():
+            self.assertRegex(
+                path, rf"^/nix/store/[0-9a-z]{{32}}-rclone-{number}$", system
+            )
+        self.assertIsNone(ab.flake_nixpkgs_rev(self.tmp / "absent"))
+
+    def test_gated_refuses_another_rclone_before_anything_is_written(self) -> None:
+        code, out = self.run_on([*self.gated(), "--rclone", str(self.other)])
+        self.assertEqual(code, 2)
+        self.assertIn("refused: --rclone", out)
+        self.assertIn("OI-1003-Q105", out)
+        code, out = self.run_on([*self.under_load(), "--rclone", str(self.other)])
+        self.assertEqual(code, 2)
+        moved = mock.patch.object(ab, "flake_rclone", return_value=self.other)
+        code, out = self.run_on(self.gated(), flake_rclone=moved)
+        self.assertEqual(code, 2)
+        self.assertIn("update RCLONE_PIN", out)
+        self.assertFalse((self.tmp / "work").exists())
+        self.assertFalse((self.tmp / EV).exists())
+        # Under load a moved flake is recorded and the sample runs.
+        self.assertEqual(self.main(self.under_load(), flake_rclone=moved), 0)
+        self.assertFalse(self.report()["rclone_record"]["matches_committed_pin"])
+        self.assertIn("**not** the committed pin", self.evidence_md())
+
+    def test_every_report_records_the_rclone_store_path_and_version(self) -> None:
+        store = str(self.pinned.parent.parent)
+        runs = (
+            (self.gated(), self.tmp / EV),
+            (self.under_load(), self.tmp / "r23-underload-test.md"),
+            (["--dry-run"], None),
+        )
+        for argv, evidence in runs:
+            self.setUp()
+            store = str(self.pinned.parent.parent)
+            with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+                code, out = self.run_on(argv)
+            self.assertEqual(code, 0, argv)
+            report = self.report()
+            self.assertEqual(report["rclone"], str(self.pinned))
+            self.assertEqual(report["rclone_store_path"], store)
+            self.assertEqual(report["rclone_version"], "rclone v1.74.4")
+            self.assertEqual(report["rclone_version_bench_header"], "rclone v1.74.4")
+            self.assertTrue(report["rclone_record"]["is_flake_pinned"])
+            self.assertFalse(report["gate"]["rclone_override"])
+            self.assertIn(" rclone_pinned=true ", out)
+            # Each rep ran that binary.
+            for rep in report["reps"]:
+                at = rep["command"].index("--rclone")
+                self.assertEqual(rep["command"][at + 1], str(self.pinned))
+            md = (
+                evidence or next((self.tmp / "work").glob("r23-dryrun-*Z.md"))
+            ).read_text()
+            self.assertIn(f"- rclone: store path `{store}`, version", md)
+            self.assertIn("`rclone v1.74.4`", md)
+            self.assertIn("OI-1003-Q105", md)
+        # An aborted sample records it too.
+        self.setUp()
+        busy = mock.patch.object(ab, "conditions", return_value=cond(False))
+        self.assertEqual(
+            self.main([*self.gated(), "--settle-seconds", "0"], conditions=busy), 2
+        )
+        self.assertEqual(self.report()["rclone_version"], "rclone v1.74.4")
+        self.assertIn("- rclone: store path `", (self.tmp / EV).read_text())
+
+    def test_an_rclone_override_is_recorded_and_never_of_record(self) -> None:
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        argv = [a for a in self.gated() if a not in ("--evidence", str(self.tmp / EV))]
+        argv += ["--rclone", str(self.other), "--rclone-override-reason", "try 1.75"]
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code, out = self.run_on(
+                argv,
+                system=linux,
+                build=self.linux_builds(b_native=True),
+                host_identity=self.record_rig(),
+            )
+        self.assertEqual(code, 0)
+        report = self.report()
+        gate = report["gate"]
+        self.assertEqual(gate["verdict"], "PASS-RCLONE-OVERRIDE")
+        self.assertTrue(gate["rclone_override"])
+        self.assertFalse(gate["of_record"])
+        self.assertEqual(report["rclone"], str(self.other))
+        self.assertEqual(report["rclone_record"]["override"], {"reason": "try 1.75"})
+        self.assertIn(" of_record=false rclone_pinned=false ", out)
+        self.assertNotRegex(out, r"gate=PASS(\s|$)")
+        md = next((self.tmp / "docs" / "evidence").iterdir()).read_text()
+        self.assertIn("(DRAFT, RCLONE OVERRIDE)", md.splitlines()[0])
+        self.assertIn("try 1.75", md)
+        self.assertIn("**not the flake-pinned build**", md)
+        self.assertIn("not a verdict of record", md)
+        # With no A control as well, both tokens are in the verdict.
+        self.setUp()
+        argv = [*self.no_a(), "--rclone", str(self.other)]
+        argv += ["--rclone-override-reason", "try 1.75"]
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "fail"}):
+            self.assertEqual(self.main(argv), 0)
+        self.assertEqual(
+            self.report()["gate"]["verdict"], "FAIL-NO-A-CONTROL-RCLONE-OVERRIDE"
+        )
+
+    def test_a_rep_that_ran_another_rclone_version_aborts(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_RCLONE": "rclone v1.75.0"}):
+            self.assertEqual(self.main(self.gated()), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertIn("bench header rclone_version", report["reason"])
+        self.assertEqual(len(report["reps"]), 1)
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_RCLONE": "rclone v1.75.0"}):
+            self.assertEqual(self.main(self.under_load()), 3)
+        # A dry run records the version and does not check it.
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_RCLONE": "rclone v1.75.0"}):
+            self.assertEqual(self.main(["--dry-run"]), 0)
+
+    # --- OI-1003-Q103: the rig of record has its own pinned A control.
+
+    def test_the_rig_baseline_pins_are_complete(self) -> None:
+        self.assertEqual(sorted(ab.RIG_BASELINE_A), sorted(ab.RIG_OF_RECORD))
+        for rig, pin in ab.RIG_BASELINE_A.items():
+            self.assertRegex(pin["sha"], r"^[0-9a-f]{40}$", rig)
+            self.assertRegex(pin["pinned"], r"^\d{4}-\d{2}-\d{2}$", rig)
+            self.assertGreater(len(pin["reason"]), 40, rig)
+            self.assertFalse(pin["sha"].startswith(ab.DEFAULT_A), rig)
+        self.assertEqual(ab.DEFAULT_A, "7c3ecc7")
+        self.assertIn("OI-1003-Q103", ab.RULINGS)
+        self.assertIn("OI-1003-Q105", ab.RULINGS)
+        self.assertIn("never decides the gate", ab.A_PURPOSE)
+
+    def built_revs(self, argv: list[str], **patches: object) -> tuple[int, list[str]]:
+        revs: list[str] = []
+
+        def record(_repo: Path, rev: str, *_a: object) -> dict[str, object]:
+            revs.append(rev)
+            sha = rev if len(rev) == 40 else self.info["sha"]
+            return {**self.info, "sha": sha, "compiled_in_this_run": False}
+
+        Path(f"{self.info['binary']}.native").write_text("")
+        build = mock.patch.object(ab, "build", side_effect=record)
+        return self.main(argv, build=build, **patches), revs
+
+    def test_the_rig_of_record_runs_its_pinned_a(self) -> None:
+        pin = ab.RIG_BASELINE_A["mbp-13"]
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        argv = [a for a in self.gated() if a not in ("--evidence", str(self.tmp / EV))]
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code, revs = self.built_revs(
+                argv, system=linux, host_identity=self.record_rig()
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(revs, [ab.DEFAULT_B, pin["sha"], ab.DEFAULT_V4])
+        report = self.report()
+        self.assertEqual([r["label"] for r in report["reps"]], list("BABAB") + ["V4"])
+        self.assertEqual(report["baseline_a"]["sha"], pin["sha"])
+        self.assertEqual(report["baseline_a"]["pin"], pin)
+        self.assertTrue(report["gate"]["of_record"])
+        md = next((self.tmp / "docs" / "evidence").iterdir()).read_text()
+        self.assertIn(f"- A control: `{pin['sha'][:12]}`, this rig's pinned", md)
+        self.assertIn(f"OI-1003-Q103, pinned {pin['pinned']}", md)
+        self.assertIn("drift of the rig", md)
+        # --build-only on the rig prebuilds the same A.
+        self.setUp()
+        code, revs = self.built_revs(
+            ["--build-only"], system=linux, host_identity=self.record_rig()
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(revs, [ab.DEFAULT_B, pin["sha"], ab.DEFAULT_V4])
+
+    def test_the_rig_of_record_refuses_any_other_a(self) -> None:
+        linux = mock.patch.object(ab.platform, "system", return_value="Linux")
+        other = mock.patch.object(ab, "git", return_value="c" * 40)
+        unknown = mock.patch.object(
+            ab, "git", side_effect=ab.subprocess.CalledProcessError(128, "git")
+        )
+        argv = [a for a in self.gated() if a not in ("--evidence", str(self.tmp / EV))]
+        for git in (other, unknown):
+            code, out = self.run_on(
+                [*argv, "--rev-a", ab.DEFAULT_A],
+                system=linux,
+                host_identity=self.record_rig(),
+                git=git,
+            )
+            self.assertEqual(code, 2)
+            self.assertIn("the A control is pinned to", out)
+            self.assertIn("OI-1003-Q103", out)
+        self.assertFalse((self.tmp / "work").exists())
+        self.assertFalse((self.tmp / "docs").exists())
+
+    def test_a_field_host_keeps_the_default_a(self) -> None:
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code, revs = self.built_revs(self.gated())
+        self.assertEqual(code, 0)
+        self.assertEqual(revs, [ab.DEFAULT_B, ab.DEFAULT_A, ab.DEFAULT_V4])
+        report = self.report()
+        self.assertIsNone(report["baseline_a"]["pin"])
+        self.assertIn(
+            "- A control: `ffffffffffff` (`7c3ecc7`).", (self.tmp / EV).read_text()
+        )
+        # A field host may name another A; nothing pins it there.
+        self.setUp()
+        code, revs = self.built_revs([*self.gated(), "--rev-a", "abc"])
+        self.assertEqual((code, revs[1]), (0, "abc"))
+        # A B/B/B sample has no A to record.
+        self.setUp()
+        self.assertEqual(self.main(self.no_a()), 0)
+        self.assertIsNone(self.report()["baseline_a"])
 
 
 if __name__ == "__main__":
