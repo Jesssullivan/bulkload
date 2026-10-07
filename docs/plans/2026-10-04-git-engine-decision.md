@@ -250,6 +250,16 @@ target that can be measured without an unruled allowance:
    history ÷ 9 per changed capture: about 19.9 MB for history-heavy.
 4. **Reuse without fetching the whole retained bundle.** Target: a
    one-commit history delta costs about an unchanged rerun's CPU, not 13.8 s.
+   **Done 2026-10-07 (Q42 lane L7; OI-1003-Q42, OI-1003-Q45, OI-1003-Q94):**
+   a capture publishes a `{bundle}.reuse` manifest, and the next pass
+   reuses from it and fetches the bundle only on a miss
+   ([docs/design.md](../design.md), "Reuse reads a manifest"; P69, P70).
+   Not re-measured on the estate corpus. In P69's fixture (a 36 MB
+   whole-history bundle) the capture costs 306 ms of CPU against 288 ms
+   for the same capture over a thin bundle; before, 2,273 ms against
+   476 ms. A changed capture still costs more than an unchanged rerun (a
+   hit: one census and no export, 55 ms there), by its four censuses and
+   its export, whatever its retained bundle weighs.
 5. **Capture bare repositories.** v1 refused every bare mirror on every
    pass, and plan `rest` exited `CONTRACT_SELF_INCONSISTENT`. #151 may type
    the refusal differently at `dfb9604`. Target: plan `rest` captures all 4
