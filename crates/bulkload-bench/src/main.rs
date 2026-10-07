@@ -111,7 +111,18 @@ impl Preflight {
         let power = if cfg!(target_os = "linux") {
             linux_power(Path::new(POWER_SUPPLY_ROOT))
         } else if cfg!(target_os = "macos") {
-            pmset_power()
+            // The child stays in `read`: the S2 command registry (P76,
+            // `source_command_registry.rs`) pins it as `read("pmset")`.
+            Command::new("pmset")
+                .args(["-g", "batt"])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map_or("unknown", |output| {
+                    power_source(&String::from_utf8_lossy(&output.stdout))
+                })
         } else {
             "unknown"
         };
@@ -172,19 +183,6 @@ const fn seal_primitive(durability: Durability) -> &'static str {
         Durability::Strict if cfg!(target_vendor = "apple") => "F_FULLFSYNC",
         Durability::Group | Durability::Strict => "fsync",
     }
-}
-
-fn pmset_power() -> &'static str {
-    Command::new("pmset")
-        .args(["-g", "batt"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map_or("unknown", |output| {
-            power_source(&String::from_utf8_lossy(&output.stdout))
-        })
 }
 
 fn sysfs_word(path: &Path) -> Option<String> {
