@@ -18,8 +18,13 @@ plan, the corpus's capture records and the apply ledger (outcome records and
 
 - `applied`: the item plans a workspace, and the exact journal for its
   current capture and SOURCE says `workspace-restored`.
-- `refused`: a typed refusal code. A bare `IO` or `FRAME_CODEC` names no
-  cause and does not close an item.
+- `refused-pending-review` (S4, 2026-10-06): a typed refusal code that no
+  operator review disposes yet. The item is accounted for, but the run is
+  not complete.
+- `refused`: a typed refusal code that a review disposes (accept, re-carry
+  or abandon; before 2026-10-06 this meant any typed refusal). A bare `IO`
+  or `FRAME_CODEC` names no cause and does not close an item, and neither
+  does a code that has since left the taxonomy (`refusal-code-retired`).
 
   Refusal codes stay typed at the source (WP3, 2026-10-03). Every taxonomy
   code is raised by product code, never kept as unused vocabulary. A Git
@@ -41,9 +46,14 @@ Anything else is `unaccounted`: a stale journal from an earlier capture, a
 record naming another source, or refs only for an item that plans a
 workspace. Stale and foreign journals are listed. The native `verdict`
 passes only when `unaccounted` is 0. The report's `gate` is the exit
-status: without an attestation ledger it equals `verdict`, and a failing
-gate exits nonzero with `CLOSURE_UNACCOUNTED`. A pass is necessary for completion, not sufficient:
-the daily-work bar above still applies.
+status, and a failing gate exits nonzero with `CLOSURE_UNACCOUNTED`. Since
+S4 (WP3 PR 3, 2026-10-06) `gate` no longer equals `verdict` without an
+attestation ledger: it also fails while any typed refusal is
+`refused-pending-review`, with or without `--attest`. `CLOSURE_UNACCOUNTED`
+therefore also covers refusals pending review, and can be raised while
+`verdict` is `pass` and `unaccounted` is 0 (`totals.pending_review` says how
+many). A pass is necessary for completion, not sufficient: the daily-work
+bar above still applies.
 
 `closure-report --attest LEDGER.json PLAN ...` (#95; the option is
 recognised only before PLAN, #133) joins a `bulkload.closure-ledger.v1`
@@ -61,6 +71,67 @@ counted as superseded, and disagreements listed). The top-level `verdict`
 stays native; `gate` passes only when every item is native-accounted or
 attested (#133). A ledger missing or naming another plan or SOURCE label,
 or listing an item twice, refuses.
+
+S4 (WP3 PR 3, 2026-10-06): outcome records are typed (`Outcome`,
+`Refusal{code, site, errno}`, postcard with no bytes left over; legacy string
+records are mapped), and a typed refusal is `refused-pending-review` until
+`closure-dispose` records an accept, re-carry or abandon review for it;
+`closure-report --dispositions LEDGER` joins those reviews, and `gate` then
+also requires every typed refusal, native or attested, to be reviewed. A
+bare `IO` can be neither reviewed nor attested away: whether an attestation
+may close an item is decided from the item's decoded record, so a bare `IO`
+recorded under another source (`record-source-mismatch`) is still refused
+(`native-refusal-untyped`).
+
+- **Item reviews are bound to the refusal instance.** `closure-dispose
+  [--attest LEDGER.json] LEDGER PLAN CORPUS SOURCE ITEM CODE DECISION
+  REVIEWER DATE PRIVATE_STATE...` reads the same inputs as `closure-report`
+  and refuses (`RECEIPT_BINDING_INVALID`) unless ITEM holds a typed refusal
+  with CODE now, so no review is written ahead of its refusal. The row
+  records that refusal's `instance`: a digest of the item's current capture
+  and its outcome record (source, code, site, errno, reason), printed on
+  every item row. A later refusal of the same code for the same item against
+  another capture or with another record is another instance; the old row
+  does not dispose it and is listed under `reviewed.unmatched` as
+  `refusal-instance-stale`. The record carries no time, so two refusals with
+  the same capture and a byte-identical record are one instance.
+- **Standing policies are open-ended.** `closure-dispose LEDGER PLAN CORPUS
+  SOURCE --policy CODE ...` disposes every refusal with CODE under the bound
+  plan and SOURCE label, now or later, for any item. It names no instance;
+  the plan digest and the label are its only bounds.
+- **The ledger is bound to the plan's bytes.** A disposition ledger records
+  its plan's path and a blake3 digest of the plan file. Reading or appending
+  refuses (`RECEIPT_BINDING_INVALID`) when the plan at that path now has
+  other bytes, and `closure-dispose` reads PLAN for every row, so a ledger is
+  never created for a path that holds no plan. Appending an item to the plan
+  (`estate-add`) therefore starts a new ledger.
+- **Retired codes fail closed per row.** Writers record only a code the
+  taxonomy holds now. Readers accept any well-formed code token: an outcome
+  record naming a code that has since left the taxonomy reads as
+  `unaccounted` with `refusal-code-retired` (never as unreadable), no review
+  or attestation closes it, and only a verb recording a current outcome
+  does. A review row naming such a code disposes nothing and is listed under
+  `reviewed.unmatched`; the rest of the ledger keeps working.
+
+The report schema is `bulkload.closure.v2` from this change (it was
+`bulkload.closure.v1`). What changed for a v1 reader:
+
+- `disposition` can be `refused-pending-review`; `refused` means reviewed.
+- `totals.refused` counts reviewed refusals only (0 without
+  `--dispositions`); `totals.refused_pending_review` and
+  `totals.pending_review` (native plus attested) are new. The `refusals`
+  map still counts every typed refusal by code, reviewed or not.
+- Each item row gains `instance`, and `review` when a review disposes it.
+- `refusal` (with `site` and `errno`) is still printed for typed refusals
+  only. A recorded refusal that is not typed for this item (a bare `IO` or
+  `FRAME_CODEC`, a retired code, a record naming another source) is printed
+  as `recorded_refusal` with the same `site` and `errno`.
+- `outcome` is still `"refused"` for a legacy refusal record that names no
+  code (`refusal-untyped`).
+- The `reviewed` block (`schema`, `ledger`, `plan_digest`, `totals`,
+  `decisions`, `policies`, `unmatched` with a `reason` per row) is new, and
+  the `attested` block gains `totals.pending_review`, a `pending_review`
+  list and `review` on reviewed rows.
 
 ## Live union
 

@@ -63,6 +63,7 @@ macro_rules! fault_mid_read {
 pub mod child;
 pub mod closure;
 pub mod counters;
+pub mod disposition;
 pub mod estate;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
@@ -126,6 +127,7 @@ pub mod crash_check {
     pub use crate::io::crash_check::*;
 }
 pub mod materialize;
+pub mod outcome;
 pub mod provider_sqlite;
 pub mod refuse;
 pub mod space;
