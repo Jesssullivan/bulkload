@@ -1,9 +1,11 @@
 # Bibliography for the bulkload whitepaper
 
 Companion to [bulkload.md](bulkload.md) (OI-1003-Q7). There is one entry per
-reference, keyed as the paper cites it. Every entry was checked on
-2026-10-03 against a DOI record, an ISBN, or the stable official page or
-repository named in it. "Verified via" names the tool and the identifier
+reference, keyed as the paper cites it. Every entry was first checked on
+2026-10-03 and **re-verified on 2026-10-07** for the whitepaper refresh
+(OI-1003-Q51), against a DOI record, an ISBN, or the stable official page or
+repository named in it. An entry that could not be re-verified would have
+been dropped; none was. "Verified via" names the tool and the identifier
 checked:
 
 - **Crossref** means the DOI resolved through the Crossref metadata service,
@@ -13,9 +15,21 @@ checked:
 - **Search** means a web search located the record, which was then fetched
   where possible.
 
+How the 2026-10-07 pass was made:
+
+- every DOI was resolved again through Crossref, and its title, authors,
+  venue, volume, issue and pages were compared with the entry;
+- every URL was fetched again (HTTP 200 in every case) and searched for the
+  phrase the entry relies on;
+- three entries were added for the formal method: [Dhall], [NVersion85] and
+  [KnightLeveson86].
+
+The per-entry log is in
+[`docs/agent-notes/2026-10-07-whitepaper-refresh.md`](../agent-notes/2026-10-07-whitepaper-refresh.md).
+
 Software documentation has no fixed publication year. It is cited as
-"accessed 2026-10-03". Nothing here is quoted at length; the paper
-paraphrases.
+"accessed 2026-10-07", the date of the last fetch. Nothing here is quoted at
+length; the paper paraphrases.
 
 ## Papers, reports and books
 
@@ -57,11 +71,12 @@ Testing File-System Crash Consistency." *ACM Transactions on Storage*
 **[FastCDC16]** Wen Xia, Yukun Zhou, Hong Jiang, Dan Feng, Yu Hua, Yuchong
 Hu, Yucheng Zhang and Qing Liu. "FastCDC: A Fast and Efficient
 Content-Defined Chunking Approach for Data Deduplication." *2016 USENIX
-Annual Technical Conference (USENIX ATC 16)*, USENIX Association, 2016.
-ISBN 978-1-931971-30-0.
+Annual Technical Conference (USENIX ATC 16)*, USENIX Association, 2016,
+pp. 101–114. ISBN 978-1-931971-30-0.
 <https://www.usenix.org/conference/atc16/technical-sessions/presentation/xia>
 - Verified via: fetched the USENIX presentation page (title, authors,
-  venue, ISBN).
+  venue, ISBN). The pages come from the BibTeX record embedded in it
+  (`pages = {101--114}`), read on 2026-10-07.
 
 **[FastCDC20]** Wen Xia, Xiangyu Zou, Hong Jiang, Yukun Zhou, Chuanyi Liu,
 Dan Feng, Yu Hua, Yuchong Hu and Yucheng Zhang. "The Design of Fast
@@ -73,7 +88,8 @@ pp. 2017–2031. DOI
   issue 9, pages 2017–2031). Its Crossref primary resource is IEEE Xplore
   document 9055082.
 - Note: bulkload uses the `fastcdc` crate's `v2020` module
-  (`crates/bulkload-agent/src/hash.rs`), at version 3.2.1 in `Cargo.lock`.
+  (`crates/bulkload-agent/src/hash.rs`), at version 3.2.1 in `Cargo.lock`
+  (still so at `a80c63b`).
   Re-resolved on 2026-10-03: that version's `src/v2020/mod.rs`, read from
   the crates.io package, names this paper as IEEE Xplore document 9055082,
   the same record as the DOI. Whether the code matches the paper is the
@@ -88,12 +104,32 @@ pp. 98–108. DOI
   Unison bibliography page,
   <https://www.cis.upenn.edu/~bcpierce/papers/unison_bib.html> (fetched).
 
+**[KnightLeveson86]** John C. Knight and Nancy G. Leveson. "An experimental
+evaluation of the assumption of independence in multiversion programming."
+*IEEE Transactions on Software Engineering* SE-12(1), 1986, pp. 96–109. DOI
+[10.1109/TSE.1986.6312924](https://doi.org/10.1109/TSE.1986.6312924).
+- Verified via: Crossref, DOI 10.1109/TSE.1986.6312924 (authors, title,
+  journal, volume SE-12, issue 1, pages, 1986). Added 2026-10-07.
+- The paper cites it only for its title's claim: that the independence of
+  separately written versions is an assumption to be tested. Its text was
+  not read here.
+
 **[LBFS01]** Athicha Muthitacharoen, Benjie Chen and David Mazières. "A
 Low-bandwidth Network File System." *Proceedings of the Eighteenth ACM
 Symposium on Operating Systems Principles (SOSP '01)*, ACM, 2001,
 pp. 174–187. DOI
 [10.1145/502034.502052](https://doi.org/10.1145/502034.502052).
 - Verified via: Crossref, DOI 10.1145/502034.502052.
+
+**[NVersion85]** Algirdas Avižienis. "The N-Version Approach to
+Fault-Tolerant Software." *IEEE Transactions on Software Engineering*
+SE-11(12), 1985, pp. 1491–1501. DOI
+[10.1109/TSE.1985.231893](https://doi.org/10.1109/TSE.1985.231893).
+- Verified via: Crossref, DOI 10.1109/TSE.1985.231893 (author "A.
+  Avizienis", title, journal, volume SE-11, issue 12, pages, 1985). Added
+  2026-10-07.
+- The paper cites it only as the origin of the term the formal model's
+  README uses ("N-version"). Its text was not read here.
 
 **[OptFS13]** Vijay Chidambaram, Thanumalayan Sankaranarayana Pillai,
 Andrea C. Arpaci-Dusseau and Remzi H. Arpaci-Dusseau. "Optimistic Crash
@@ -163,7 +199,7 @@ Science, University of Pennsylvania, 24 February 2004.
 ## Specifications and official documentation
 
 **[AppleDiskWrites]** Apple Inc. "Reducing disk writes." Apple Developer
-Documentation (Xcode). Accessed 2026-10-03.
+Documentation (Xcode). Accessed 2026-10-07.
 <https://developer.apple.com/documentation/xcode/reducing-disk-writes>
 - Verified via: fetched the page and its JSON data endpoint,
   <https://developer.apple.com/tutorials/data/documentation/xcode/reducing-disk-writes.json>,
@@ -181,7 +217,7 @@ Documentation (Xcode). Accessed 2026-10-03.
 
 **[AppleFcntl]** Apple Inc. "fcntl(2)" manual page, in the XNU kernel
 source as `bsd/man/man2/fcntl.2` (page date 12 August 2021). Accessed
-2026-10-03.
+2026-10-07.
 <https://github.com/apple-oss-distributions/xnu/blob/main/bsd/man/man2/fcntl.2>
 Older copy, which has no `F_BARRIERFSYNC` entry:
 <https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/fcntl.2.html>.
@@ -207,33 +243,44 @@ Reference implementation: <https://github.com/BLAKE3-team/BLAKE3>.
   derive_key) come from section 2.
 - Also fetched the BLAKE3 repository README (designers, modes).
 
+**[Dhall]** The Dhall authors. "The Dhall configuration language."
+Project site and language standard repository. Accessed 2026-10-07.
+<https://dhall-lang.org/> Repository:
+<https://github.com/dhall-lang/dhall-lang>.
+- Verified via: fetched the project site (it describes Dhall as a
+  programmable configuration language) and the repository's README, plus
+  the GitHub API repository record (`dhall-lang/dhall-lang`, "Maintainable
+  configuration files", BSD-3-Clause, not archived). Added 2026-10-07.
+- bulkload's catalogue is `docs/formal/catalogue/`; its README names Dhall
+  1.42 from the flake's pinned nixpkgs.
+
 **[GitBundle]** The Git project. "git-bundle: Move objects and refs by
-archive." Git documentation. Accessed 2026-10-03.
+archive." Git documentation. Accessed 2026-10-07.
 <https://git-scm.com/docs/git-bundle>
 - Verified via: fetched (page title and NAME line; prerequisites; incremental
   bundles from revision ranges).
 
 **[GitPackObjects]** The Git project. "git-pack-objects: Create a packed
-archive of objects." Git documentation. Accessed 2026-10-03.
+archive of objects." Git documentation. Accessed 2026-10-07.
 <https://git-scm.com/docs/git-pack-objects>
 - Verified via: fetched (page title and NAME line; `--thin`, which needs
   `index-pack --fix-thin` on receipt; `--delta-base-offset`).
 
 **[GitPackProto]** The Git project. "gitprotocol-pack: How packs are
-transferred over-the-wire." Git documentation. Accessed 2026-10-03.
+transferred over-the-wire." Git documentation. Accessed 2026-10-07.
 <https://git-scm.com/docs/gitprotocol-pack>
 - Verified via: fetched (page title and NAME line; want and have
   negotiation; the `thin-pack` capability).
 
 **[IoprioSet]** The Linux man-pages project. "ioprio_get(2),
 ioprio_set(2): get/set I/O scheduling class and priority." Accessed
-2026-10-03. <https://man7.org/linux/man-pages/man2/ioprio_set.2.html>
+2026-10-07. <https://man7.org/linux/man-pages/man2/ioprio_set.2.html>
 - Verified via: fetched (page title and NAME line; the idle class gets disk
   time only when no other process needs it; classes take effect only under
   a scheduler that implements them).
 
 **[RacyGit]** The Git project. "racy-git." Git technical documentation.
-Accessed 2026-10-03.
+Accessed 2026-10-07.
 <https://git-scm.com/docs/racy-git>
 - Verified via: fetched, title "Git - racy-git Documentation". Re-resolved
   on 2026-10-03 by fetching it again and reading the body: an entry is
@@ -241,20 +288,20 @@ Accessed 2026-10-03.
   the index file's own timestamp. Git then re-checks the entry's content
   against the recorded object.
 
-**[SQLiteBackup]** SQLite. "SQLite Backup API." Accessed 2026-10-03.
+**[SQLiteBackup]** SQLite. "SQLite Backup API." Accessed 2026-10-07.
 <https://www.sqlite.org/backup.html>
 - Verified via: fetched (incremental `sqlite3_backup_step`; the read lock is
   held only while a step reads; the backup restarts on a write from another
   connection).
 
-**[SQLiteWAL]** SQLite. "Write-Ahead Logging." Accessed 2026-10-03.
+**[SQLiteWAL]** SQLite. "Write-Ahead Logging." Accessed 2026-10-07.
 <https://www.sqlite.org/wal.html>
 - Verified via: fetched (separating a database from its WAL can lose
   committed transactions; the role of `-shm`; the conditions for read-only
   WAL access).
 
 **[ZfsSend]** OpenZFS. "zfs-send(8)." OpenZFS documentation, manual pages.
-Accessed 2026-10-03.
+Accessed 2026-10-07.
 <https://openzfs.github.io/openzfs-docs/man/master/8/zfs-send.8.html>
 - Verified via: fetched (incremental `-i`/`-I` streams between snapshots;
   resumable receive with `receive_resume_token` and `-t`).
@@ -264,7 +311,7 @@ Accessed 2026-10-03.
 **[Borg]** The BorgBackup project. Borg documentation, version 1.4.5 at
 access: "Data structures and file formats" (Internals) and "borg create"
 (Usage). Source: `src/borg/cache.py` on the `1.4-maint` branch. Accessed
-2026-10-03.
+2026-10-07.
 - <https://borgbackup.readthedocs.io/en/stable/internals/data-structures.html>
 - <https://borgbackup.readthedocs.io/en/stable/usage/create.html>
 - <https://github.com/borgbackup/borg/blob/1.4-maint/src/borg/cache.py>
@@ -276,7 +323,7 @@ access: "Data structures and file formats" (Internals) and "borg create"
     is the newest seen (lines 629–647 at access).
 
 **[Bup]** The bup project. "The Crazy Hacker's Crazy Guide to Bup
-Craziness" (`DESIGN.md`). Accessed 2026-10-03.
+Craziness" (`DESIGN.md`). Accessed 2026-10-07.
 <https://github.com/bup/bup/blob/main/DESIGN.md>
 - Verified via: fetched the raw file. The title is its first line, checked
   word for word. Also read: Git packfile storage, rolling-checksum
@@ -294,23 +341,24 @@ Repository: <https://github.com/systemd/casync>.
   casync in the present tense, so it follows the README.
 
 **[Desync]** folbricht. "desync: Alternative casync implementation."
-Software repository. Accessed 2026-10-03.
+Software repository. Accessed 2026-10-07.
 <https://github.com/folbricht/desync>
 - Verified via: fetched (casync-compatible formats and chunk stores,
   parallel chunking, BSD-3-Clause).
 
 **[Proptest]** The proptest authors. "proptest: Hypothesis-like property
-testing for Rust." Software repository. Accessed 2026-10-03.
+testing for Rust." Software repository. Accessed 2026-10-07.
 <https://github.com/proptest-rs/proptest>
 - Verified via: fetched, plus the GitHub API repository description
   (strategies, shrinking, Apache-2.0 or MIT).
 - bulkload declares `proptest` version `1` as a workspace dependency, and
-  `Cargo.lock` resolves it to 1.11.0 (checked at `6268175` and `dfb9604`;
+  `Cargo.lock` resolves it to 1.11.0 (checked at `6268175`, `dfb9604` and
+  `a80c63b`;
   [property-test plan](../plans/2026-10-03-property-test-plan.md),
   section 0).
 
 **[Rclone]** The rclone project. rclone documentation: "rclone copy", "Local
-Filesystem" and "Frequently Asked Questions." Accessed 2026-10-03.
+Filesystem" and "Frequently Asked Questions." Accessed 2026-10-07.
 - <https://rclone.org/commands/rclone_copy/>
 - <https://rclone.org/local/>
 - <https://rclone.org/faq/>
@@ -324,13 +372,13 @@ Filesystem" and "Frequently Asked Questions." Accessed 2026-10-03.
 
 **[Restic]** The restic authors. "References" (the repository design
 chapter). restic documentation, version 0.19.1 at access. Accessed
-2026-10-03.
+2026-10-07.
 <https://restic.readthedocs.io/en/stable/100_references.html>
 - Verified via: fetched (Rabin-fingerprint chunking of 512 KiB to 8 MiB;
   SHA-256 ids; encrypted packs, index and snapshots).
 
 **[RsyncMan]** The rsync project. "rsync(1)" manual page. Accessed
-2026-10-03. <https://download.samba.org/pub/rsync/rsync.1>
+2026-10-07. <https://download.samba.org/pub/rsync/rsync.1>
 Project home: <https://rsync.samba.org/>.
 - Verified via: fetched the manual page and read:
   - the default quick check by size and modification time;
@@ -342,7 +390,7 @@ Project home: <https://rsync.samba.org/>.
   Fetched the project home page.
 
 **[UnisonRepo]** Benjamin C. Pierce and contributors. "unison: Unison file
-synchronizer." Software repository. Accessed 2026-10-03.
+synchronizer." Software repository. Accessed 2026-10-07.
 <https://github.com/bcpierce00/unison>
 - Verified via: fetched, plus the GitHub API repository description
   (bidirectional synchronizer, archive-based update detection, conflicts
