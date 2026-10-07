@@ -1,8 +1,9 @@
 # 2026-10-07: slim the PR source gate (lane `ci-slim-source-gate`)
 
 Branch `ci/slim-source-gate-20261007`, worktree
-`bulkload.worktrees/ci-slim-source-gate-20261007`, host sting. No PR is open
-yet: the lane pushes the branch and the coordinator opens it.
+`bulkload.worktrees/ci-slim-source-gate-20261007`, host sting. The recheck
+stage opened the PR from this branch after the note's last section was
+written (`gh pr list --head ci/slim-source-gate-20261007`); it is not merged.
 
 Rulings: OI-1003-Q81 (the slim-CI source gate is in the next wave),
 OI-1003-Q7 and OI-1003-Q14 (CI stays slim; fixed-seed bounded corpus),
@@ -352,3 +353,68 @@ again line by line, and all nine files were checked whole (`cargo fmt
     check the recipe text, and by the skipped-row output shown under
     Validation.
 - Rulings cited: OI-1003-Q81, OI-1003-Q7, OI-1003-Q14, OI-1003-Q78, R-N13.
+
+## Recheck and ship (2026-10-07, 02:28 to 03:15 EDT)
+
+The recheck stage read the diff `0493713..c0afc52` against the five medium
+findings and found each one fixed. It changed no code, recipe or pin.
+
+- **Main moved.** `origin/main` went from `3931471` to `95f43dc` (#196: the S2
+  wal-index counter, `tests/sqlite_wal_index.rs`) during the recheck. Merged
+  as signed merge commit `1e887a6`, no conflict. #189 was still open, so the
+  seed guard's ceilings and `tests/git_carry_v2.rs` are unchanged; Open 6
+  and Open 8 still stand.
+- **`just check-fast`** (TMPDIR `/dev/shm/ci-slim-tmp`, the lane's own
+  `CARGO_TARGET_DIR`):
+  - on `c0afc52`: exit=0, 02:28 to 02:31, load 42 → 39, 31 `test result: ok`
+    lines, `rust-test: all 23 test executables ran, in 5 groups`;
+  - on `1e887a6`, first run: **exit=1**. The unit group failed on
+    `disposition::tests::a_ledger_is_bound_to_the_plan_bytes_not_only_its_path`
+    (`Err(Io(Some(11)))`, not `ReceiptBindingInvalid`). That is #200, a known
+    flake on main under load; this lane does not touch `disposition`;
+  - on `1e887a6`, second run: **exit=0**, 02:50 to 02:55, load 80 → 41, 32
+    `test result: ok` lines, `rust-test: all 24 test executables ran, in 5
+    groups` (the new one is `sqlite_wal_index`), the contract test OK.
+- **The refusing paths of both deep recipes were run**, which the fix round
+  had not done. Each recipe body was copied to a scratch script
+  (`/srv/cache/jess/ci-slim-mut/recheck`) with `cargo` replaced by a shell
+  function that prints a canned log. `props-deep` refused a skipped row, a
+  filter that matched nothing, a row without its measurement line and a
+  failing cargo status (the status is passed through). `crash-sweep` refused
+  a skipped sweep, a filter that matched nothing, fewer `hits=` lines than
+  points, a zero hit count and a non-zero failure count, and accepted a
+  well-formed log.
+- **The first line of `props-deep` was run, twice** (the 20-times workspace
+  run with the three `--skip` filters), which closes the "not run" item in
+  the receipts above:
+  - on `c0afc52`, load 80 to 99: **exit=101**. The lib binary failed on
+    `transfer::tests::a_run_leaves_the_source_lstat_census_unchanged` (P-S2)
+    with `Io(Some(32))`, EPIPE, at case 139 of 240. Alone and deep it then
+    failed 2 runs of 3 (cases 233 and 236); in the PR tier (12 cases) it
+    passed 60 runs of 60. The seed is fixed, so this is a timing race in
+    `transfer::copy`, whose sources are identical to main's here. Filed as
+    #201; not this lane's to fix.
+  - on `1e887a6`, with `--no-fail-fast`, load 78 → 34: **exit=0** in about
+    17 minutes. 27 results, all `ok`: lib 504 passed, 5 ignored, 1 filtered
+    out; `refs_scale_distinct` 1 passed, 2 filtered out, so the three
+    filters leave out exactly the three deep rows.
+  - The three rows were not run again after the merge; #196 does not touch
+    `git_carry`.
+- **Still true:** `just props-deep` as one command has not been green from
+  start to end in its new form. Every part of it has been, separately. On a
+  loaded host it can fail on #201.
+
+Open, added by the recheck:
+
+10. **#201**: `transfer::copy` can return a bare `Io(EPIPE)` for a finished
+    copy; P-S2 flakes in the deep tier under load.
+11. **#200** failed one check-fast of this lane (above). Both are bare IOs
+    under load on main.
+12. Low, not fixed: `decide_tests.rs` still says "the fixed seed everywhere"
+    of its own draws (true of that file, which is on the helper). With one
+    test thread (`RUST_TEST_THREADS=1` or a one-core runner) libtest prints
+    the test name before the row's output, so both deep recipes would refuse
+    a run that really happened; they fail closed.
+
+Shas: `1e887a6` (merge of `95f43dc`), then this note's commit (`git log`).
+Rulings cited: OI-1003-Q81, OI-1003-Q7, OI-1003-Q14, OI-1003-Q78, R-N13.
