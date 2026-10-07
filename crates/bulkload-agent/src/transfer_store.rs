@@ -501,6 +501,10 @@ impl Drop for Exclusive {
 pub(crate) struct StorePublisher {
     store: Store,
     side: PublisherSide,
+    /// How this publisher's ledger row commits reach disk (WP0(g)). `Full`
+    /// until [`StorePublisher::relax_ledger_rows`] relaxes a source
+    /// publisher; a destination publisher is never relaxed.
+    ledger_sync: crate::io::durable::LedgerSync,
     _exclusive: Exclusive,
 }
 
@@ -910,6 +914,14 @@ impl Store {
             .and_then(|count| u64::try_from(count).map_err(|_| BulkloadRefusal::SchemaMismatch))
     }
 
+    /// This connection's `PRAGMA synchronous`: 2 is FULL, 1 is NORMAL.
+    #[cfg(test)]
+    pub(crate) fn synchronous(&self) -> Result<i64> {
+        self.conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .map_err(sqlite_error)
+    }
+
     /// How many refusals the store remembers (#186).
     #[cfg(test)]
     pub(crate) fn refused_seats(&self) -> Result<u64> {
@@ -1279,8 +1291,32 @@ impl StorePublisher {
         Ok(Self {
             store,
             side: role,
+            ledger_sync: crate::io::durable::LedgerSync::Full,
             _exclusive: Exclusive(lock),
         })
+    }
+
+    /// Relax this SOURCE publisher's ledger row commits (WP0(g),
+    /// OI-1003-Q37): from here on its connection commits with
+    /// `synchronous=NORMAL`, `fullfsync=OFF`
+    /// ([`crate::io::durable::relax_ledger_rows`]).
+    ///
+    /// The publisher's store is already open, so the commit that created
+    /// it (schema and authority) returned under `synchronous=FULL` and its
+    /// root is sealed (#161): the only commits left on this connection are
+    /// ledger rows ([`StorePublisher::commit_captures`]).
+    ///
+    /// # Errors
+    /// Refuses `PROTOCOL_STATE_VIOLATION` for a destination publisher,
+    /// whose commits carry R25 and are never relaxed, and any `SQLite`
+    /// refusal of the settings.
+    fn relax_ledger_rows(&mut self) -> Result<()> {
+        if self.side != PublisherSide::Source {
+            return Err(BulkloadRefusal::ProtocolStateViolation);
+        }
+        crate::io::durable::relax_ledger_rows(&self.store.conn)?;
+        self.ledger_sync = crate::io::durable::LedgerSync::Relaxed;
+        Ok(())
     }
 
     /// The store this publisher writes.
@@ -1483,6 +1519,10 @@ impl StorePublisher {
 
     /// Commit completed captures, and refusals to remember (#186), to the
     /// ledger in one transaction.
+    ///
+    /// The only commit WP0(g) relaxes: on a relaxed source publisher
+    /// ([`StorePublisher::relax_ledger_rows`]) the `COMMIT` below appends
+    /// to the WAL and returns without syncing it.
     fn commit_captures(&self, captures: &[LedgerItem]) -> Result<()> {
         if captures.is_empty() {
             return Ok(());
@@ -1545,7 +1585,12 @@ impl StorePublisher {
             SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
             SQLITE_COMMIT_NS.fetch_add(nanos(commit_started), Ordering::Relaxed);
         }
-        counters::sqlite_commit(self.group_counter(), commit_started, &committed);
+        if counters::sqlite_commit(self.group_counter(), commit_started, &committed)
+            && self.ledger_sync == crate::io::durable::LedgerSync::Relaxed
+        {
+            // WP0(g): this commit returned without a sync of the WAL.
+            counters::bump(Counter::SourceLedgerRelaxedCommits);
+        }
         #[cfg(feature = "io-trace")]
         if committed.is_ok() {
             self.store.trace_commit(|| {
@@ -1579,20 +1624,48 @@ impl StorePublisher {
 /// group is a set of completed captures and remembered refusals (#186)
 /// committed in one transaction; there are no chunk bytes to write or seal
 /// first.
+///
+/// WP0(g) (OI-1003-Q20, Q37): under [`LedgerSync::Relaxed`] the group's
+/// commit is not synced, and a group whose commit fails is counted and
+/// dropped, not fatal (#163): the ledger is a cache, the destination's
+/// rows carry R25, and each dropped row costs at most one more read of its
+/// seat. A manifest that fails its own consistency check is not a failed
+/// commit: it is refused `DIGEST_MISMATCH` and stops the session in both
+/// modes.
+///
+/// [`LedgerSync::Relaxed`]: crate::io::durable::LedgerSync::Relaxed
 pub(crate) struct LedgerSink {
     publisher: StorePublisher,
     failed: Option<BulkloadRefusal>,
 }
 
 impl LedgerSink {
-    pub(crate) const fn new(publisher: StorePublisher) -> Self {
-        Self {
+    /// A sink for `publisher` whose row commits run in `sync` (`serve`
+    /// passes the process-wide mode, [`crate::io::durable::ledger_sync`]).
+    ///
+    /// # Errors
+    /// Refuses a relaxed sink on a destination publisher, and any `SQLite`
+    /// refusal of the relaxed settings.
+    pub(crate) fn with_sync(
+        mut publisher: StorePublisher,
+        sync: crate::io::durable::LedgerSync,
+    ) -> Result<Self> {
+        if sync == crate::io::durable::LedgerSync::Relaxed {
+            publisher.relax_ledger_rows()?;
+        }
+        Ok(Self {
             publisher,
             failed: None,
-        }
+        })
     }
 
     /// Commit one group of captures.
+    ///
+    /// # Errors
+    /// Refuses an inconsistent manifest. A failed commit is returned under
+    /// [`LedgerSync::Full`], and counted under `Relaxed`.
+    ///
+    /// [`LedgerSync::Full`]: crate::io::durable::LedgerSync::Full
     pub(crate) fn publish(&self, items: &[LedgerItem]) -> Result<()> {
         PUBLISH_GROUPS.fetch_add(1, Ordering::Relaxed);
         #[cfg(feature = "fault-injection")]
@@ -1618,7 +1691,17 @@ impl LedgerSink {
                 return Err(BulkloadRefusal::DigestMismatch);
             }
         }
-        self.publisher.commit_captures(items)
+        match self.publisher.commit_captures(items) {
+            Err(_) if self.publisher.ledger_sync == crate::io::durable::LedgerSync::Relaxed => {
+                // #163: counted, never fatal. The rows are not in the
+                // ledger (the transaction rolled back), so a later run
+                // misses them and reads their seats at most once more.
+                counters::bump(Counter::SourceLedgerCommitFailed);
+                counters::add_len(Counter::SourceLedgerRowsDropped, items.len());
+                Ok(())
+            }
+            committed => committed,
+        }
     }
 }
 
@@ -2005,10 +2088,24 @@ mod tests {
         }
     }
 
+    /// The default ledger: relaxed row commits (WP0(g)).
     fn ledger_sink(state: &Path) -> Result<LedgerSink> {
-        Ok(LedgerSink::new(
+        assert_eq!(
+            crate::io::durable::ledger_sync(),
+            crate::io::durable::LedgerSync::Relaxed,
+            "the default mode (OI-1003-Q37)"
+        );
+        LedgerSink::with_sync(
             Store::open(state)?.into_publisher(PublisherSide::Source)?,
-        ))
+            crate::io::durable::LedgerSync::Relaxed,
+        )
+    }
+
+    fn full_ledger_sink(state: &Path) -> Result<LedgerSink> {
+        LedgerSink::with_sync(
+            Store::open(state)?.into_publisher(PublisherSide::Source)?,
+            crate::io::durable::LedgerSync::Full,
+        )
     }
 
     #[test]
@@ -2623,6 +2720,143 @@ mod tests {
         Ok(())
     }
 
+    fn pragma(publisher: &StorePublisher, name: &str) -> Result<i64> {
+        publisher
+            .store
+            .conn
+            .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .map_err(sqlite_error)
+    }
+
+    /// WP0(g) (OI-1003-Q37): only the source publisher's row commits are
+    /// relaxed. The connection that creates a store, and with it the
+    /// authority, commits `synchronous=FULL`, `fullfsync=ON`; so does every
+    /// destination publisher, which refuses to be relaxed; and a checkpoint
+    /// stays a full barrier on the relaxed connection.
+    #[test]
+    fn only_a_source_ledgers_row_commits_are_relaxed() -> Result<()> {
+        use crate::io::durable::LedgerSync;
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        // The creating connection: the authority's commit is FULL.
+        let created = Store::open(&state)?;
+        assert_eq!(created.synchronous()?, 2);
+        let authority = created.authority()?;
+        drop(created);
+
+        let relaxed = ledger_sink(&state)?;
+        assert_eq!(relaxed.publisher.ledger_sync, LedgerSync::Relaxed);
+        assert_eq!(pragma(&relaxed.publisher, "synchronous")?, 1);
+        assert_eq!(pragma(&relaxed.publisher, "fullfsync")?, 0);
+        assert_eq!(pragma(&relaxed.publisher, "checkpoint_fullfsync")?, 1);
+        let before = counters::Counters::snapshot();
+        relaxed.publish(&[item(b"relaxed", b"relaxed row")])?;
+        let after = counters::Counters::snapshot().since(before);
+        assert!(after.get(Counter::SourceLedgerRelaxedCommits) >= 1);
+        drop(relaxed);
+        // Another connection reads the relaxed row, and the authority is
+        // the one the FULL commit made.
+        let reopened = Store::open(&state)?;
+        assert_eq!(reopened.synchronous()?, 2);
+        assert_eq!(reopened.authority()?, authority);
+        assert_eq!(
+            reopened.capture(b"relaxed")?,
+            Some(manifest(b"relaxed row"))
+        );
+        drop(reopened);
+
+        let full = full_ledger_sink(&state)?;
+        assert_eq!(full.publisher.ledger_sync, LedgerSync::Full);
+        assert_eq!(pragma(&full.publisher, "synchronous")?, 2);
+        assert_eq!(pragma(&full.publisher, "fullfsync")?, 1);
+        drop(full);
+
+        // A destination publisher is never relaxed, whatever the mode.
+        let destination = root.0.join("destination-state");
+        let mut publisher =
+            Store::open(&destination)?.into_publisher(PublisherSide::Destination)?;
+        assert_eq!(
+            publisher.relax_ledger_rows(),
+            Err(BulkloadRefusal::ProtocolStateViolation)
+        );
+        assert_eq!(publisher.ledger_sync, LedgerSync::Full);
+        assert_eq!(pragma(&publisher, "synchronous")?, 2);
+        assert_eq!(pragma(&publisher, "fullfsync")?, 1);
+        assert!(matches!(
+            LedgerSink::with_sync(publisher, LedgerSync::Relaxed),
+            Err(BulkloadRefusal::ProtocolStateViolation)
+        ));
+        Ok(())
+    }
+
+    /// #163 (WP0(g)): a relaxed ledger's failed row commit is counted and
+    /// dropped; the sink does not fail, later groups commit, and the
+    /// dropped row is simply absent (a miss, one more read of its seat).
+    /// Under `LedgerSync::Full` the same failure is sticky, as before.
+    #[test]
+    fn a_failed_relaxed_ledger_commit_is_counted_not_fatal() -> Result<()> {
+        use crate::io::durable::GroupSink as _;
+        for fault in [
+            PublishFault::AfterManifestInsert,
+            PublishFault::BeforeCommit,
+        ] {
+            let root = TestRoot::new()?;
+            let state = root.0.join("state");
+            let mut sink = ledger_sink(&state)?;
+            let before = counters::Counters::snapshot();
+            PUBLISH_FAULT.with(|active| active.set(fault));
+            sink.commit(vec![
+                item(b"dropped-1", b"dropped one"),
+                item(b"dropped-2", b"dropped two"),
+            ]);
+            PUBLISH_FAULT.with(|active| active.set(PublishFault::None));
+            let after = counters::Counters::snapshot().since(before);
+            assert_eq!(sink.failure(), None, "counted, not fatal");
+            assert!(after.get(Counter::SourceLedgerCommitFailed) >= 1);
+            assert!(after.get(Counter::SourceLedgerRowsDropped) >= 2);
+            // The next group commits on the same sink.
+            sink.commit(vec![item(b"later", b"later row")]);
+            assert_eq!(sink.failure(), None);
+            assert_eq!(sink.finish(), Ok(()));
+            let store = Store::open(&state)?;
+            assert!(store.capture(b"dropped-1")?.is_none());
+            assert!(store.capture(b"dropped-2")?.is_none());
+            assert_eq!(store.capture(b"later")?, Some(manifest(b"later row")));
+            drop(store);
+
+            let mut strict = full_ledger_sink(&state)?;
+            PUBLISH_FAULT.with(|active| active.set(fault));
+            strict.commit(vec![item(b"strict", b"strict row")]);
+            PUBLISH_FAULT.with(|active| active.set(PublishFault::None));
+            assert_eq!(strict.failure(), Some(BulkloadRefusal::Io(None)));
+            // Sticky: the later group is dropped and the sink reports it.
+            strict.commit(vec![item(b"strict-later", b"strict later")]);
+            assert_eq!(strict.finish(), Err(BulkloadRefusal::Io(None)));
+            assert!(Store::open(&state)?.capture(b"strict-later")?.is_none());
+        }
+        Ok(())
+    }
+
+    /// A manifest that fails its own consistency check is not a failed
+    /// commit: it stops a relaxed ledger too.
+    #[test]
+    fn an_inconsistent_manifest_stops_a_relaxed_ledger() -> Result<()> {
+        use crate::io::durable::GroupSink as _;
+        let root = TestRoot::new()?;
+        let mut sink = ledger_sink(&root.0.join("state"))?;
+        assert_eq!(
+            sink.publisher.ledger_sync,
+            crate::io::durable::LedgerSync::Relaxed
+        );
+        let mut bad = item(b"bad", b"bad");
+        if let LedgerRecord::Capture(manifest) = &mut bad.record {
+            manifest.root = [0; 32];
+        }
+        sink.commit(vec![bad]);
+        assert_eq!(sink.failure(), Some(BulkloadRefusal::DigestMismatch));
+        Ok(())
+    }
+
     #[test]
     fn publisher_is_exclusive() -> Result<()> {
         let root = TestRoot::new()?;
@@ -2646,7 +2880,9 @@ mod tests {
         ] {
             let root = TestRoot::new()?;
             let state = root.0.join("state");
-            let sink = ledger_sink(&state)?;
+            // The strict ledger returns the failure; the relaxed one counts
+            // it (`a_failed_relaxed_ledger_commit_is_counted_not_fatal`).
+            let sink = full_ledger_sink(&state)?;
             PUBLISH_FAULT.with(|active| active.set(fault));
             assert!(matches!(
                 sink.publish(&[item(b"capture", b"fault recovery content")]),

@@ -1265,3 +1265,198 @@ fn a_file_a_superseding_publish_displaced_survives_every_power_loss_state() {
         report.summary(&unsealed)
     );
 }
+
+// ---------------------------------------------------------------------------
+// WP0(g): the relaxed source ledger (OI-1003-Q20, Q37, Q104)
+// ---------------------------------------------------------------------------
+
+/// The source ledger's row commits in a trace, in the order they returned:
+/// each commit's capture keys.
+fn ledger_commits(events: &[Event], source_store: NodeId) -> Vec<Vec<Vec<u8>>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Commit { store, records } if *store == source_store => Some(
+                records
+                    .iter()
+                    .filter_map(|record| match record {
+                        CommitRecord::Capture { key } => Some(key.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .filter(|keys| !keys.is_empty())
+        .collect()
+}
+
+/// Bytes, or a link's target, by relative path.
+type Leaves = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// The regular files and symlinks under `root`, as [`expected`] reads them.
+fn tree(root: &Path) -> (Leaves, Leaves) {
+    let found = expected(root);
+    (found.files, found.links)
+}
+
+/// The source store at `state` after a power loss that kept the first
+/// `keep` bytes of its WAL (`pristine`) and nothing after them; the
+/// wal-index is never durable state, so it is gone too.
+fn lose_ledger_tail(state: &Path, pristine: &[u8], keep: u64) {
+    fs::write(
+        state.join("transfer.sqlite-wal"),
+        &pristine[..usize::try_from(keep).unwrap()],
+    )
+    .unwrap();
+    let _ = fs::remove_file(state.join("transfer.sqlite-shm"));
+}
+
+/// WP0(g) (OI-1003-Q20, adopted by OI-1003-Q37): the source ledger's row
+/// commits are not synced (`synchronous=NORMAL`), so a power loss may roll
+/// the newest of them back. Every such state of a real copy's ledger is
+/// built here as `SQLite` recovers from it: the store's WAL is cut at each
+/// frame boundary from the end of the creation commit, which is
+/// `synchronous=FULL` and so on disk (`transfer_store`'s
+/// `only_a_source_ledgers_row_commits_are_relaxed`, and P79's sync-mode
+/// floor), to its last byte, and its wal-index is removed.
+///
+/// The trace gives the order the row commits returned in. In every state:
+///
+/// - the store's authority is the creation commit's (a new one would re-key
+///   every row, `MC_wp0g_authority`);
+/// - the ledger holds a prefix of the traced row commits, whole: rows are
+///   lost newest first, and none is torn or wrong;
+/// - a resume against the destination the copy left reads 0 source bytes
+///   and changes nothing: every seat is held by a committed destination
+///   row, so the destination answers `Reuse` and the ledger is never asked
+///   (R25's committed-row reading, OI-1003-Q40).
+///
+/// Every prefix is reached, from no row to all of them. Then, with every
+/// row lost, a third party removes one output: the resume reads that seat's
+/// bytes once and nothing else, and every byte it leaves is the source's.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_power_loss_state_of_a_relaxed_ledger_costs_at_most_its_lost_seats() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("relaxed-ledger");
+    populate(&scratch.source());
+    let state = scratch.base.join("source-state");
+    let wal = state.join("transfer.sqlite-wal");
+    let database = state.join("transfer.sqlite");
+
+    // The store's creation: schema and authority, committed before any row.
+    let created = Store::open(&state).unwrap();
+    let authority = created.authority().unwrap();
+    drop(created);
+    let synced = fs::metadata(&wal).unwrap().len();
+
+    // Two traced copies, the second of two new seats, so the ledger's rows
+    // commit in at least two groups whatever the committer's timing.
+    let before = bulkload_agent::counters::Counters::snapshot();
+    let (_, events) = traced_copy(&scratch);
+    let mut commits = ledger_commits(&events, node(&state));
+    fs::write(scratch.source().join("f"), noise(101, 7_000)).unwrap();
+    fs::write(scratch.source().join("nested/g"), noise(103, 11_000)).unwrap();
+    bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    let (_, events) = traced_copy(&scratch);
+    let second = ledger_commits(&events, node(&state));
+    assert!(!commits.is_empty() && !second.is_empty());
+    commits.extend(second);
+    let counted = bulkload_agent::counters::Counters::snapshot().since(before);
+    assert!(
+        counted.get(bulkload_agent::counters::Counter::SourceLedgerRelaxedCommits)
+            >= commits.len() as u64,
+        "every row commit of the copy was relaxed"
+    );
+    let keys: Vec<Vec<u8>> = commits.iter().flatten().cloned().collect();
+    assert_eq!(keys.len(), 7, "one row per regular file of the corpus");
+
+    let pristine = fs::read(&wal).unwrap();
+    let main_before = fs::read(&database).unwrap();
+    // A WAL is a 32-byte header and frames of 24 bytes plus one page.
+    let page = u64::from(u32::from_be_bytes(pristine[8..12].try_into().unwrap()));
+    let frame = 24 + page;
+    let length = pristine.len() as u64;
+    assert!(
+        synced > 32 && (synced - 32).is_multiple_of(frame),
+        "{synced} {frame}"
+    );
+    assert!(
+        length > synced && (length - 32).is_multiple_of(frame),
+        "{length}"
+    );
+
+    let want = tree(&scratch.source());
+    let mut reached = BTreeSet::new();
+    let mut last = 0;
+    let mut cut = synced;
+    while cut <= length {
+        lose_ledger_tail(&state, &pristine, cut);
+        let recovered = Store::open(&state).unwrap();
+        assert_eq!(
+            recovered.authority().unwrap(),
+            authority,
+            "cut {cut}: the authority survives every loss of rows"
+        );
+        let held: Vec<bool> = keys
+            .iter()
+            .map(|key| recovered.capture(key).unwrap().is_some())
+            .collect();
+        drop(recovered);
+        // A prefix of the commits, whole: no commit is half there, and no
+        // later commit survives an earlier one's loss.
+        let survived = (0..=commits.len())
+            .find(|prefix| {
+                let rows: usize = commits[..*prefix].iter().map(Vec::len).sum();
+                held.iter()
+                    .enumerate()
+                    .all(|(row, here)| *here == (row < rows))
+            })
+            .unwrap_or_else(|| panic!("cut {cut}: not a prefix of the row commits: {held:?}"));
+        assert!(survived >= last, "cut {cut}: a longer WAL lost more rows");
+        last = survived;
+        reached.insert(survived);
+
+        let resumed = run_copy(&scratch);
+        assert!(
+            resumed.refusals.is_empty(),
+            "cut {cut}: {:?}",
+            resumed.refusals
+        );
+        assert_eq!(
+            resumed.source_bytes_read,
+            0,
+            "cut {cut}: {survived} of {} row commits survived, and no held seat is read",
+            commits.len()
+        );
+        assert_eq!(resumed.reused, 7, "cut {cut}");
+        assert_eq!(tree(&scratch.destination()), want, "cut {cut}");
+        cut += frame;
+    }
+    assert_eq!(
+        reached,
+        (0..=commits.len()).collect::<BTreeSet<_>>(),
+        "every prefix of the row commits is a power-loss state"
+    );
+    assert_eq!(
+        fs::read(&database).unwrap(),
+        main_before,
+        "no checkpoint moved a row out of the WAL, so the cuts are the whole loss"
+    );
+
+    // Every row lost, and a third party removes one output: its seat is
+    // read once, and only it.
+    lose_ledger_tail(&state, &pristine, synced);
+    fs::remove_file(scratch.destination().join("b")).unwrap();
+    let resumed = run_copy(&scratch);
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.source_bytes_read, 40_000, "seat b, once");
+    assert_eq!(resumed.reused, 6);
+    assert_eq!(tree(&scratch.destination()), want);
+    assert_eq!(Store::open(&state).unwrap().authority().unwrap(), authority);
+    let settled = run_copy(&scratch);
+    assert_eq!(settled.source_bytes_read, 0);
+    assert_eq!(settled.reused, 7);
+}

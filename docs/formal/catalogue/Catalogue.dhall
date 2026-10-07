@@ -701,6 +701,24 @@ let positives =
                 }
             //  faults
           )
+      , row
+          "MC_wp0g_strict"
+          (passStrict (wp0dOff # estateOff))
+          [ "WP0(g) with R25's strict reading (#169, OI-1003-Q40): MC_wp0g_deep's"
+          , "bound with TrackStrictHeld. A relaxed ledger that loses rows, to a"
+          , "power loss or to a failed commit, never costs a read of bytes the"
+          , "destination holds durably, with a row or (by the capture record)"
+          , "without one."
+          ]
+          (     defaults
+            //  { Seats = [ Seat.a ]
+                , MaxRuns = 3
+                , MaxCrashes = 2
+                , RelaxedSourceLedger = True
+                , TrackStrictHeld = True
+                }
+            //  faults
+          )
       , -- WP0(d) superseding publish, the exchange design: the code since #187.
         row
           "MC_wp0d_exchange"
@@ -958,6 +976,17 @@ let witnesses =
           , "by putting the old output's rows back (StartRun)."
           ]
           exchangeOne
+      ,     row
+              "MC_reach_wp0g_failed_commit"
+              (T.Expect.reach W.Witness_FailedRowRead)
+              [ "REACH (expected REACHED): at MC_wp0g's bound a relaxed ledger's row"
+              , "commit fails and is counted, not fatal (#163; LedgerSync::Relaxed),"
+              , "and with no crash at all a later run consults the ledger for that"
+              , "seat, misses, and reads it to build the manifest. So MC_wp0g's PASS"
+              , "covers the counted failure as well as the power loss."
+              ]
+              wp0g
+        //  { symmetry = True }
       ]
 
 -- Design and code findings: expected to fail.
@@ -1641,9 +1670,10 @@ let invariants
     : List T.InvariantRow
     = [ { tla = P.R25_NoDurableReread
         , slo = [ S.S3 ]
-        , ruling = [ "R25", "R-N58", "OI-1003-Q7", "OI-1003-Q20" ]
-        , codeSymbol = [ "output_matches", "source_bytes_read" ]
-        , ptest = [ "P23", "P21", "P19", "P24", "P33" ]
+        , ruling = [ "R25", "R-N58", "OI-1003-Q7", "OI-1003-Q20", "OI-1003-Q37" ]
+        , codeSymbol =
+          [ "output_matches", "source_bytes_read", "relax_ledger_rows" ]
+        , ptest = [ "P23", "P21", "P19", "P24", "P33", "P79" ]
         }
       , { tla = P.R25_NoCommittedCaptureReread
         , slo = [ S.S3 ]
@@ -1690,7 +1720,7 @@ let invariants
       , { tla = P.LedgerAfterHeld
         , slo = [ S.S3 ]
         , ruling = [ "R-N58", "R-N86" ]
-        , codeSymbol = [ "commit_captures" ]
+        , codeSymbol = [ "commit_captures", "LedgerSync" ]
         , ptest = [ "P17", "P29" ]
         }
       , { tla = P.DoneAfterLedger

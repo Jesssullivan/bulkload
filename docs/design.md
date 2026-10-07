@@ -768,6 +768,29 @@ flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
 
+The source ledger's rows are the one exception (WP0(g): OI-1003-Q20,
+adopted with conditions by OI-1003-Q37, built 2026-10-07 on OI-1003-Q104).
+The ledger is a cache of what the source already holds: a seat's row key
+and its chunk manifest, or a remembered refusal. Its ROW commits run
+`synchronous=NORMAL`, `fullfsync=OFF` (`LedgerSync::Relaxed`, the default;
+`io::durable::relax_ledger_rows` on the source publisher's connection
+only), so a power loss may roll back the newest of them. A lost row costs at
+most one more read of its seat, and only where the destination no longer
+holds that seat: a seat the destination holds is answered `Reuse` from the
+destination's own committed row, and the ledger is never asked (R25,
+OI-1003-Q40). A row commit that fails is counted
+(`source_ledger_commit_failed`) and the transfer goes on (#163); a ledger
+read that fails is a miss (`source_ledger_unreadable`). Nothing else is
+relaxed: the commit that creates a store, with its authority, and the
+state-root seals (#161) are fully synced on both sides, every destination
+commit is `synchronous=FULL`, `fullfsync=ON`, and a checkpoint on the
+relaxed connection is still a full flush. `--source-ledger-sync=full` syncs
+every row commit and fails the session on the first failed one, for
+comparison. `docs/formal` checks the relaxed ledger (`MC_wp0g`,
+`MC_wp0g_deep`, `MC_wp0g_strict`) and shows a relaxed authority breaking R25
+(`MC_wp0g_authority`); P79 and `tests/power_loss.rs` take the real store
+through every loss.
+
 Superseding publish (WP0(d), OI-1003-Q18, #187). A changed seat's new bytes
 replace the output at its path only when that output is this store's own,
 untouched: its `(dev, ino, size, mtime, ctime)` equals a row this store

@@ -31,6 +31,15 @@
 //! `full_flushes_total` counts one full flush per commit, so it is a lower
 //! bound when a checkpoint ran.
 //!
+//! The one exception is the SOURCE ledger's row commits under
+//! `LedgerSync::Relaxed` (WP0(g), OI-1003-Q20 and Q37; the default): they
+//! run `synchronous=NORMAL`, `fullfsync=OFF` and do not sync the WAL
+//! (`io::durable::relax_ledger_rows`). Each is counted in
+//! `sqlite_group_source_commits` and in `source_ledger_relaxed_commits`;
+//! `full_flushes_total` leaves the relaxed ones out. A relaxed commit that
+//! runs an automatic checkpoint does sync (the WAL, then the database), and
+//! that sync is not counted, so `full_flushes_total` stays a lower bound.
+//!
 //! Flush counts are attempts (a failed flush is still counted). `SQLite`
 //! commit counters count successful commits only.
 //!
@@ -236,6 +245,25 @@ counters! {
     // publish needs: one per device and session, at the first changed seat
     // found there (#187 review).
     ExchangeProbes => "exchange_probes",
+    // WP0(g) (OI-1003-Q20, Q37; #163), the source ledger under
+    // `LedgerSync::Relaxed`. Row commits that returned without a sync of
+    // the WAL (`synchronous=NORMAL`): each is also a
+    // `sqlite_group_source_commits`, and none is a full flush.
+    SourceLedgerRelaxedCommits => "source_ledger_relaxed_commits",
+    // Row commits that failed and were counted, not fatal, and the rows
+    // they held: each such row costs at most one more read of its seat.
+    SourceLedgerCommitFailed => "source_ledger_commit_failed",
+    SourceLedgerRowsDropped => "source_ledger_rows_dropped",
+    // Ledger reads that failed (a damaged ledger) and were answered as a
+    // miss: an unreadable ledger is an empty one.
+    SourceLedgerUnreadable => "source_ledger_unreadable",
+    // Seats read to build a manifest the destination asked for because the
+    // ledger had no row under the seat's key. Every row a crash lost that
+    // costs a read is counted here; so is a seat whose identity changed or
+    // that was never recorded, which makes this an upper bound on the rows
+    // lost and re-read. A seat the destination holds is answered `Reuse`
+    // and never reaches the ledger, whatever the ledger lost.
+    SourceLedgerMissReads => "source_ledger_miss_reads",
     // Metadata censuses of a Git checkout (one walk of its worktree each).
     CensusWalks => "census_walks",
     // Seats a Git capture could reuse by its retained capture's manifest
@@ -467,7 +495,8 @@ impl Counters {
         ])
     }
 
-    /// Every `SQLite` commit counted, each one full flush on Darwin.
+    /// Every `SQLite` commit counted. Each is one full flush on Darwin,
+    /// except the source ledger's relaxed row commits (WP0(g)).
     #[must_use]
     pub fn sqlite_commits(&self) -> u64 {
         self.sum(&[
@@ -491,6 +520,7 @@ impl Counters {
             Counter::FlushDir,
         ])
         .saturating_add(self.sqlite_commits())
+        .saturating_sub(self.get(Counter::SourceLedgerRelaxedCommits))
     }
 
     /// Space-separated `key=value` pairs, ending with the derived totals.

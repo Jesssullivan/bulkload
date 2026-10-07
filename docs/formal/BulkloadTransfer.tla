@@ -82,9 +82,21 @@
 (*     commit (MC_store_root_unsealed). Losing the destination store is   *)
 (*     not modelled: HeldPhys needs one of its rows, so R25 could not see *)
 (*     a re-read after such a loss.                                        *)
-(*   - A source ledger commit never fails here. In the code the first     *)
-(*     failed ledger group fails the whole session before SourceDone      *)
-(*     (LedgerSink::commit, Committer::submit); README, "Not proven".     *)
+(*   - RelaxedSourceLedger is the code's LedgerSync::Relaxed (WP0(g),    *)
+(*     built 2026-10-07): A/io/durable.rs relax_ledger_rows sets          *)
+(*     synchronous=NORMAL, fullfsync=OFF on the source publisher's        *)
+(*     connection only (A/transfer_store.rs                               *)
+(*     StorePublisher::relax_ledger_rows, LedgerSink::with_sync), after   *)
+(*     Store::open committed the schema and the authority FULL.           *)
+(*     RelaxedAuthority has no code: it is the mutation the ruling        *)
+(*     forbids (MC_wp0g_authority).                                       *)
+(*   - A failed source ledger commit: under RelaxedSourceLedger the       *)
+(*     group's rows are dropped and the session goes on (LedgerCommit's   *)
+(*     second branch; A/transfer_store.rs LedgerSink::publish counts      *)
+(*     source_ledger_commit_failed, #163). A strict ledger's commit      *)
+(*     never fails here; in the code (LedgerSync::Full) its first failed  *)
+(*     group fails the whole session before SourceDone (README, "Not      *)
+(*     proven").                                                          *)
 (*   - "Held" means a committed destination row (HeldPhys). Bytes that    *)
 (*     are durable at the final path with no row (a crash before          *)
 (*     commit_outputs, a failed group whose files were renamed) were read *)
@@ -173,7 +185,9 @@
 (*                   finish_receive (an adopted unrowed output's outcome)  *)
 (*   RecvHeld        A/transfer.rs Outbound::handle (Event::Held)          *)
 (*   LedgerCommit    A/transfer_store.rs LedgerSink::publish,              *)
-(*                   StorePublisher::commit_captures                       *)
+(*                   StorePublisher::commit_captures; relaxed by           *)
+(*                   StorePublisher::relax_ledger_rows                     *)
+(*                   (A/io/durable.rs relax_ledger_rows, LedgerSync)       *)
 (*   SendSourceDone  A/transfer.rs serve (committer.sync, SourceDone)      *)
 (*   Finish          A/transfer.rs Inbound::run, finish_receive            *)
 (*   StartRun        A/transfer.rs receive (sweep_root), serve (Open,      *)
@@ -235,6 +249,7 @@ CONSTANTS
     MaxCommitFails,      \* destination group commits that fail (full disk)
     SpaceRefusals,       \* the space preflight may refuse an entry (typed)
     RelaxedSourceLedger, \* WP0(g): source ledger synchronous=NORMAL, fullfsync=OFF
+                         \* (LedgerSync::Relaxed; row commits only)
     RelaxedAuthority,    \* WP0(g): the store-creation commit (schema and
                          \* authority) is relaxed too, not only the ledger rows
     SupersedeMode,       \* "off" (before #187) | "check_rename" (rejected)
@@ -338,8 +353,10 @@ VARIABLES
     sPend,        \* captures Held{true} and submitted, not yet committed
     srcLedger,    \* committed source ledger rows [seat, key, data]
     srcDone,      \* SourceDone sent this session
-    ledgerLost,   \* ghost: ledger rows a source power loss dropped
-                  \* [seat, key, run]; kept beside srcLedger
+    ledgerLost,   \* ghost: rows a relaxed ledger lost, [seat, key, run, by]:
+                  \* by "power_loss" (a source power loss dropped a
+                  \* committed row) or "commit_failed" (the row's commit
+                  \* failed and was counted); kept beside srcLedger
     srcAuth,      \* the source store's authority epoch (0: no store yet)
     srcStore,     \* "none" | "volatile" (creation not durable) | "durable"
     \* wire: at most one in-flight control frame per entry (request/response)
@@ -1301,17 +1318,27 @@ RecvHeld(s) ==
 (* A/transfer_store.rs LedgerSink::publish -> commit_captures: one        *)
 (* transaction per group. Also runs after the session broke (Committer     *)
 (* drop). Durable at commit unless RelaxedSourceLedger (see CrashSrc).     *)
-(* It never fails here. In the code a failed group (a full or failing     *)
-(* source state disk) is sticky: LedgerSink drops every later capture,    *)
-(* and Committer::submit / sync then fail the session before SourceDone.  *)
-(* So a lost ledger write costs the session, not one re-read (README,     *)
-(* "Not proven here" and the WP0(g) conditions).                          *)
+(* Under RelaxedSourceLedger (LedgerSync::Relaxed) the commit may also     *)
+(* fail (a full or failing source state disk): LedgerSink::publish counts  *)
+(* it, the group's rows are dropped, and the session goes on to           *)
+(* SourceDone (#163). Each dropped row costs at most one more read of its  *)
+(* seat, exactly as a row a power loss dropped. A strict ledger's commit   *)
+(* never fails here: in the code (LedgerSync::Full) a failed group is      *)
+(* sticky and fails the session before SourceDone (README, "Not proven     *)
+(* here").                                                                 *)
 LedgerCommit ==
     /\ sPend # {}
-    /\ srcLedger' = {r \in srcLedger : ~\E p \in sPend : p.seat = r.seat /\ p.key = r.key}
-                    \cup sPend
+    /\ \/ /\ srcLedger' = {r \in srcLedger :
+                              ~\E p \in sPend : p.seat = r.seat /\ p.key = r.key}
+                          \cup sPend
+          /\ UNCHANGED ledgerLost
+       \/ /\ RelaxedSourceLedger
+          /\ UNCHANGED srcLedger
+          /\ ledgerLost' = ledgerLost \cup
+                 {[seat |-> p.seat, key |-> p.key, run |-> run, by |-> "commit_failed"] :
+                    p \in sPend}
     /\ sPend' = {}
-    /\ UNCHANGED <<srcVars, authVars, sEnt, sRow, sCap, srcDone, ledgerLost, msg, dVars,
+    /\ UNCHANGED <<srcVars, authVars, sEnt, sRow, sCap, srcDone, msg, dVars,
                    runVars, estVars, ghostVars>>
 
 (* A/transfer.rs serve: committer.sync() returns before SourceDone.        *)
@@ -1505,8 +1532,9 @@ SrcLoss ==
             /\ IF RelaxedSourceLedger
                THEN srcLedger' \in SUBSET srcLedger
                ELSE UNCHANGED srcLedger
-    /\ ledgerLost' = ledgerLost \cup {[seat |-> r.seat, key |-> r.key, run |-> run] :
-                                        r \in srcLedger \ srcLedger'}
+    /\ ledgerLost' = ledgerLost \cup
+           {[seat |-> r.seat, key |-> r.key, run |-> run, by |-> "power_loss"] :
+              r \in srcLedger \ srcLedger'}
     /\ UNCHANGED srcAuth
 
 ResetSourceSession ==
@@ -1786,6 +1814,16 @@ Witness_LedgerChunkRead == \A r \in reads : r.kind # "chunks"
 \* relaxed ledger (or a lost store) puts rows in ledgerLost.
 Witness_LostRowRead ==
     ~\E s \in Seats : \E x \in ledgerLost :
+        /\ x.by = "power_loss"
+        /\ x.seat = s /\ x.key = SKey(s) /\ x.run < run
+        /\ sEnt[s] = "manifested" /\ ~sCap[s].led
+
+\* WP0(g), #163: a relaxed ledger's commit failed and was counted, and with
+\* no crash at all a later run consulted the ledger for that row, missed,
+\* and read the seat to build its manifest: the whole cost of the failure.
+Witness_FailedRowRead ==
+    ~\E s \in Seats : \E x \in ledgerLost :
+        /\ x.by = "commit_failed" /\ crashes = 0
         /\ x.seat = s /\ x.key = SKey(s) /\ x.run < run
         /\ sEnt[s] = "manifested" /\ ~sCap[s].led
 

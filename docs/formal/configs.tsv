@@ -22,6 +22,7 @@ MC_nv_core_adopt	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,
 MC_nv_ledger_adopt	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,CommitFail,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_wp0g	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,CommitFail,Edit,Exchange,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_wp0g_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
+MC_wp0g_strict	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_wp0d_exchange	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,GitRead,RenameReplace	-
 MC_supersede_main	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,CommitFail,ForeignDelete,ForeignWrite,GitRead,RenameReplace	-
 MC_supersede_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,CheckOwn,GitRead,RenameReplace	-
@@ -44,6 +45,7 @@ MC_reach_remembered_refusal	reach	Witness_RememberedRefusal	*	-
 MC_reach_ownership_superseded	reach	Witness_OwnershipSuperseded	*	-
 MC_reach_sweep_ownership	reach	Witness_SweepOwnership	*	-
 MC_reach_sweep_restore	reach	Witness_SweepRestore	*	-
+MC_reach_wp0g_failed_commit	reach	Witness_FailedRowRead	*	-
 MC_wp0g_authority	fail	R25_NoDurableReread	*	-
 MC_store_root_unsealed	fail	R25_NoDurableReread	*	-
 MC_r25_unrowed_no_adopt	fail	R25_StrictNoDurableReread	*	-

@@ -68,7 +68,7 @@ use bulkload_proto::{FileKind, PROTO_VERSION};
 
 use crate::counters::{self, Counter};
 use crate::freshness::StatIdentity;
-use crate::io::durable::Committer;
+use crate::io::durable::{Committer, LedgerSync};
 use crate::materialize::{
     owned_output, verify_existing, Destination, Displaced, OwnedOutput, PendingOutput, Publication,
     PublishSink, SharedDisplaced, StagedFile,
@@ -721,6 +721,9 @@ struct SourceWork<'a> {
     state: &'a Path,
     credit: &'a Credit,
     retain: Arc<AtomicU64>,
+    /// How this session's ledger rows are committed (WP0(g)); it also says
+    /// how a ledger read that fails is answered ([`ledger_read`]).
+    ledger: LedgerSync,
 }
 
 /// Walk-ahead slots: the walk thread takes one per item it hands over, and
@@ -863,9 +866,14 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         meta.node.ino,
     ))
     .refuse_at("transfer::serve")?;
-    let committer = Committer::spawn(LedgerSink::new(
+    // WP0(g): the store exists, and its authority is durable, since the
+    // open above returned; only this second connection's row commits are
+    // relaxed (`LedgerSink::with_sync`, `--source-ledger-sync`).
+    let ledger = crate::io::durable::ledger_sync();
+    let committer = Committer::spawn(LedgerSink::with_sync(
         Store::open(&state)?.into_publisher(PublisherSide::Source)?,
-    ))?;
+        ledger,
+    )?)?;
     write_control(
         output,
         &Control::Start {
@@ -884,6 +892,7 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         state: store.root(),
         credit: &credit,
         retain: Arc::new(AtomicU64::new(retain_budget(&root))),
+        ledger,
     };
     let (jobs, job_queue) = std::sync::mpsc::channel();
     let job_queue = Mutex::new(job_queue);
@@ -1429,12 +1438,14 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
 /// with the same code, before the file is opened: 0 source bytes. A seat
 /// whose identity moved has another key, and is sniffed again.
 fn remembered_refusal(work: &SourceWork<'_>, store: &Store, row: &RowSchema) -> Result<()> {
-    store
-        .refused_seat(&row_key(work.authority, row)?)?
-        .map_or(Ok(()), |refused| {
-            counters::bump(Counter::TransferRefusedSeatsRemembered);
-            Err(refused.refusal())
-        })
+    ledger_read(
+        work.ledger,
+        store.refused_seat(&row_key(work.authority, row)?),
+    )?
+    .map_or(Ok(()), |refused| {
+        counters::bump(Counter::TransferRefusedSeatsRemembered);
+        Err(refused.refusal())
+    })
 }
 
 /// Read, chunk and stream one file; its `End` carries the capture to record.
@@ -1484,6 +1495,22 @@ fn send_capture(
 /// and whether the capture was racy (#86).
 type Offer = (Option<Vec<u8>>, Manifest, Option<Retained>, bool);
 
+/// A source ledger read, as WP0(g) answers it (OI-1003-Q37: "a corrupt or
+/// absent source ledger is treated as empty"). Under
+/// [`LedgerSync::Relaxed`] a read that fails is counted
+/// (`source_ledger_unreadable`) and answered as a miss: the seat is read,
+/// or sniffed, once more, and no row of a damaged ledger is trusted. Under
+/// [`LedgerSync::Full`] the failure is returned, as before WP0(g).
+fn ledger_read<T>(mode: LedgerSync, read: Result<Option<T>>) -> Result<Option<T>> {
+    match read {
+        Err(_) if mode == LedgerSync::Relaxed => {
+            counters::bump(Counter::SourceLedgerUnreadable);
+            Ok(None)
+        }
+        read => read,
+    }
+}
+
 /// One entry's manifest: from the ledger when this exact stat identity is
 /// recorded (no source read), otherwise from one read of the file, whose
 /// chunks are all kept in memory for the requests that follow. `None` when
@@ -1497,11 +1524,15 @@ fn manifest_capture(
     sniffed: &mut Option<RefusedSeat>,
 ) -> Result<Option<Offer>> {
     let key = row_key(work.authority, row)?;
-    if let Some(manifest) = store.capture(&key)? {
+    if let Some(manifest) = ledger_read(work.ledger, store.capture(&key))? {
         if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
             return Ok(Some((None, manifest, None, false)));
         }
     }
+    // The ledger has no usable row under this key, so the seat is read to
+    // build the manifest. This is the whole cost of a row WP0(g) lost; a
+    // changed or never recorded seat is counted here too.
+    counters::bump(Counter::SourceLedgerMissReads);
     // Every chunk a fresh manifest names must be kept, so the requests that
     // follow are served from memory: a seat is read at most once a session.
     let Some(mut retained) = Retained::reserve(&work.retain, row.size) else {

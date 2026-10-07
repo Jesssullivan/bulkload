@@ -230,78 +230,91 @@ unchanged. All 43 rows matched again, and every pass row's distinct and
 generated counts and diameter equalled the table's ([Results
 (GitCarry)](#results-gitcarry)).
 
+The current table is from the WP0(g) merge run (2026-10-07 17:05 to 17:48
+EDT, sting, load average near 40 from other lanes). It covers WP0(g)'s
+branch merged with main `11ff019`, which brought #203's superseding-publish
+model round (`BeginSupersede`, the ownership and sweep rows). One full
+`just tla-check` over both modules passed the staleness and grounding gates,
+and **all 93 rows matched their expectation: 33 PASS, 12 REACHED, 46 FAIL,
+2 INCONCLUSIVE (the budget self-tests). Total wall time 2,561 s; peak RSS
+2,111 MiB.** Every row below carries that run's counts. The log is
+`tla-check-wp0g-merge-20261007.log` in the coordinator's worktree root;
+the counts are copied here.
+
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
-| `MC_budget_selftest` | {a,b} R2 C1 E1 sym budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 22,324 | 76,224 | 12 | 7s | 623 |
-| `MC_main` | {a,b} R2 C1 E1 sym budget 600 s | pass | **PASS** | – | 963,314 | 3,080,708 | 51 | 106s | 1946 |
-| `MC_main_deep` | {a} R3 C2 E1 F1 X1 space budget 600 s | pass | **PASS** | – | 457,464 | 1,787,195 | 49 | 35s | 1840 |
-| `MC_dest_faults` | {a,b} R2 C0 E0 F1 X1 space sym budget 600 s | pass | **PASS** | – | 216,196 | 597,125 | 52 | 25s | 1804 |
-| `MC_nv_core` | {a} R3 C2 E1 pre-#169 budget 600 s | pass | **PASS** | – | 15,834 | 44,312 | 45 | 4s | 586 |
-| `MC_nv_ledger` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | pass | **PASS** | – | 142,450 | 497,089 | 49 | 14s | 1656 |
-| `MC_nv_core_adopt` | {a} R3 C2 E1 budget 600 s | pass | **PASS** | – | 17,027 | 47,053 | 45 | 3s | 616 |
-| `MC_nv_ledger_adopt` | {a} R3 C2 E1 F1 budget 600 s | pass | **PASS** | – | 185,852 | 644,493 | 49 | 20s | 1755 |
-| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 646,491 | 1,826,609 | 74 | 68s | 1872 |
-| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 579,098 | 2,288,133 | 49 | 46s | 1807 |
-| `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 146,058 | 366,446 | 55 | 15s | 1667 |
-| `MC_supersede_main` | {a,b} R2 C1 E1 exchange sym budget 600 s | pass | **PASS** | – | 1,664,264 | 5,212,679 | 60 | 183s | 2101 |
-| `MC_supersede_deep` | {a} R3 C2 E1 F1 X1 space exchange budget 600 s | pass | **PASS** | – | 792,260 | 2,970,789 | 55 | 61s | 1864 |
-| `MC_supersede_strict_main` | {a,b} R2 C1 E1 exchange strict-held sym budget 600 s | pass | **PASS** | – | 1,664,264 | 5,212,679 | 60 | 174s | 2127 |
-| `MC_supersede_strict_deep` | {a} R3 C2 E1 F1 X1 space exchange strict-held budget 600 s | pass | **PASS** | – | 797,105 | 2,985,041 | 55 | 73s | 1861 |
-| `MC_supersede_noexchange` | {a} R3 C1 E1 F1 exchange no-exchange budget 600 s | pass | **PASS** | – | 105,398 | 263,597 | 49 | 12s | 1263 |
-| `MC_s2` | {a} R2 C1 E1 estate budget 600 s | pass | **PASS** | – | 64,386 | 243,765 | 39 | 10s | 1008 |
-| `MC_live` | {a,b} R2 C0 E0 space budget 600 s | pass | **PASS** | – | 12,649 | 31,118 | 47 | 9s | 823 |
-| `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | pass | **PASS** | – | 448 | 974 | 30 | 3s | 311 |
-| `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 45s | 1802 |
-| `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 86s | 1990 |
-| `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 2s | 350 |
-| `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,069 | 2,084 | 30 | 3s | 341 |
+| `MC_budget_selftest` | {a,b} R2 C1 E1 sym budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 22,047 | 75,081 | 12 | 7s | 640 |
+| `MC_main` | {a,b} R2 C1 E1 sym budget 600 s | pass | **PASS** | – | 963,314 | 3,080,708 | 51 | 100s | 1949 |
+| `MC_main_deep` | {a} R3 C2 E1 F1 X1 space budget 600 s | pass | **PASS** | – | 457,464 | 1,787,195 | 49 | 43s | 1812 |
+| `MC_dest_faults` | {a,b} R2 C0 E0 F1 X1 space sym budget 600 s | pass | **PASS** | – | 216,196 | 597,125 | 52 | 22s | 1792 |
+| `MC_nv_core` | {a} R3 C2 E1 pre-#169 budget 600 s | pass | **PASS** | – | 15,834 | 44,312 | 45 | 4s | 569 |
+| `MC_nv_ledger` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | pass | **PASS** | – | 142,450 | 497,089 | 49 | 19s | 1667 |
+| `MC_nv_core_adopt` | {a} R3 C2 E1 budget 600 s | pass | **PASS** | – | 17,027 | 47,053 | 45 | 5s | 581 |
+| `MC_nv_ledger_adopt` | {a} R3 C2 E1 F1 budget 600 s | pass | **PASS** | – | 185,852 | 644,493 | 49 | 20s | 1771 |
+| `MC_wp0g` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | pass | **PASS** | – | 945,031 | 2,586,810 | 75 | 117s | 1983 |
+| `MC_wp0g_deep` | {a} R3 C2 E1 F1 X1 space relaxed budget 600 s | pass | **PASS** | – | 711,661 | 2,776,377 | 49 | 73s | 1835 |
+| `MC_wp0g_strict` | {a} R3 C2 E1 F1 X1 space relaxed strict-held budget 600 s | pass | **PASS** | – | 717,633 | 2,794,980 | 49 | 77s | 1889 |
+| `MC_wp0d_exchange` | {a} R3 C1 E1 F1 exchange budget 600 s | pass | **PASS** | – | 146,058 | 366,446 | 55 | 20s | 1672 |
+| `MC_supersede_main` | {a,b} R2 C1 E1 exchange sym budget 600 s | pass | **PASS** | – | 1,664,264 | 5,212,679 | 60 | 199s | 2111 |
+| `MC_supersede_deep` | {a} R3 C2 E1 F1 X1 space exchange budget 600 s | pass | **PASS** | – | 792,260 | 2,970,789 | 55 | 78s | 1853 |
+| `MC_supersede_strict_main` | {a,b} R2 C1 E1 exchange strict-held sym budget 600 s | pass | **PASS** | – | 1,664,264 | 5,212,679 | 60 | 187s | 2095 |
+| `MC_supersede_strict_deep` | {a} R3 C2 E1 F1 X1 space exchange strict-held budget 600 s | pass | **PASS** | – | 797,105 | 2,985,041 | 55 | 79s | 1878 |
+| `MC_supersede_noexchange` | {a} R3 C1 E1 F1 exchange no-exchange budget 600 s | pass | **PASS** | – | 105,398 | 263,597 | 49 | 12s | 1260 |
+| `MC_s2` | {a} R2 C1 E1 estate budget 600 s | pass | **PASS** | – | 64,386 | 243,765 | 39 | 8s | 1024 |
+| `MC_live` | {a,b} R2 C0 E0 space budget 600 s | pass | **PASS** | – | 12,649 | 31,118 | 47 | 10s | 800 |
+| `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | pass | **PASS** | – | 448 | 974 | 30 | 2s | 297 |
+| `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 44s | 1774 |
+| `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 98s | 1964 |
+| `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 3s | 367 |
+| `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,188 | 2,303 | 30 | 2s | 369 |
 | `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space budget 600 s | simulate | **SIMULATION** | – | 1,144,601 | – | – | 40s | 1541 |
-| `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 36,495 | 116,393 | 19 | 5s | 796 |
-| `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 53,636 | 168,503 | 21 | 6s | 849 |
-| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 63,665 | 218,723 | 19 | 9s | 1319 |
-| `MC_reach_exchange_refused` | {a} R3 C1 E1 F1 exchange no-exchange budget 600 s | reach | **REACHED** | `Witness_ExchangeRefused` | 17,985 | 46,305 | 19 | 3s | 603 |
-| `MC_reach_remembered_refusal` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_RememberedRefusal` | 5,113 | 14,437 | 13 | 3s | 483 |
-| `MC_reach_ownership_superseded` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_OwnershipSuperseded` | 22,099 | 56,068 | 20 | 4s | 590 |
-| `MC_reach_sweep_ownership` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_SweepOwnership` | 54,094 | 125,879 | 27 | 5s | 833 |
-| `MC_reach_sweep_restore` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_SweepRestore` | 42,615 | 101,143 | 25 | 5s | 836 |
-| `MC_wp0g_authority` | {a} R2 C1 E0 relaxed relaxed-auth pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 755 | 1,416 | 18 | 2s | 314 |
-| `MC_store_root_unsealed` | {a} R2 C1 E0 unsealed-root pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 663 | 1,221 | 17 | 2s | 291 |
-| `MC_r25_unrowed_no_adopt` | {a} R2 C1 E0 strict-held pre-#169 budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 319 | 658 | 18 | 2s | 299 |
-| `MC_wp0d_check_rename` | {a} R2 C0 E1 F1 check_rename budget 300 s | fail | **FAIL** | `NoClobber` | 7,094 | 13,627 | 27 | 3s | 471 |
+| `MC_reach_ledger_manifest` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerManifest` | 37,543 | 119,680 | 19 | 5s | 844 |
+| `MC_reach_ledger_chunks` | {a} R3 C2 E1 F1 pre-#169 budget 600 s | reach | **REACHED** | `Witness_LedgerChunkRead` | 51,760 | 162,053 | 21 | 7s | 828 |
+| `MC_reach_wp0g_lost_row` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_LostRowRead` | 66,713 | 226,906 | 19 | 10s | 1372 |
+| `MC_reach_wp0g_failed_commit` | {a,b} R3 C1 E0 F1 relaxed sym budget 600 s | reach | **REACHED** | `Witness_FailedRowRead` | 268,470 | 802,831 | 29 | 27s | 1781 |
+| `MC_reach_exchange_refused` | {a} R3 C1 E1 F1 exchange no-exchange budget 600 s | reach | **REACHED** | `Witness_ExchangeRefused` | 18,393 | 47,246 | 19 | 4s | 631 |
+| `MC_reach_remembered_refusal` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_RememberedRefusal` | 5,976 | 16,897 | 13 | 3s | 484 |
+| `MC_reach_ownership_superseded` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_OwnershipSuperseded` | 21,932 | 55,697 | 20 | 5s | 620 |
+| `MC_reach_sweep_ownership` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_SweepOwnership` | 53,987 | 125,711 | 27 | 6s | 835 |
+| `MC_reach_sweep_restore` | {a} R3 C1 E1 F1 exchange budget 600 s | reach | **REACHED** | `Witness_SweepRestore` | 44,020 | 104,243 | 25 | 7s | 812 |
+| `MC_wp0g_authority` | {a} R2 C1 E0 relaxed relaxed-auth pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 679 | 1,241 | 17 | 2s | 312 |
+| `MC_store_root_unsealed` | {a} R2 C1 E0 unsealed-root pre-#169 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 692 | 1,274 | 17 | 2s | 335 |
+| `MC_r25_unrowed_no_adopt` | {a} R2 C1 E0 strict-held pre-#169 budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 285 | 586 | 16 | 2s | 288 |
+| `MC_wp0d_check_rename` | {a} R2 C0 E1 F1 check_rename budget 300 s | fail | **FAIL** | `NoClobber` | 6,974 | 13,317 | 27 | 3s | 504 |
 | `MC_neg_live_unfair` | {a} R1 C0 E0 budget 300 s | fail | **FAIL** | `RunsClose` | 78 | 109 | – | 2s | 278 |
-| `MC_neg_held_before_commit` | {a} R3 C2 E1 mut=held_before_commit budget 300 s | fail | **FAIL** | `HeldAfterCommit` | 241 | 572 | 7 | 1s | 299 |
-| `MC_neg_commit_before_fsync` | {a} R3 C2 E1 mut=commit_before_fsync budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 774 | 2,063 | 9 | 2s | 329 |
-| `MC_neg_commit_before_dirseal` | {a} R1 C0 E0 mut=commit_before_dirseal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 86 | 129 | 17 | 2s | 276 |
-| `MC_neg_adopt_without_seal` | {a} R1 C0 E0 F1 mut=adopt_without_seal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 269 | 418 | 12 | 1s | 282 |
-| `MC_neg_ledger_before_held` | {a} R1 C0 E0 mut=ledger_before_held budget 300 s | fail | **FAIL** | `LedgerAfterHeld` | 40 | 55 | 12 | 2s | 240 |
-| `MC_neg_done_before_sync` | {a} R1 C0 E0 mut=done_before_sync budget 300 s | fail | **FAIL** | `DoneAfterLedger` | 80 | 117 | 17 | 1s | 270 |
-| `MC_neg_reread_durable` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 367 | 756 | 21 | 2s | 301 |
-| `MC_neg_reread_unchanged` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_UnchangedReadsZero` | 409 | 861 | 24 | 1s | 303 |
-| `MC_neg_reread_changed_only` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_ReadsOnlyChanged` | 363 | 748 | 20 | 1s | 309 |
-| `MC_neg_reread_ignore_ledger` | {a} R2 C0 E0 mut=reread_ignore_ledger budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 119 | 162 | 29 | 2s | 294 |
-| `MC_neg_reread_exchange` | {a} R2 C0 E0 exchange mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 133 | 180 | 33 | 1s | 297 |
-| `MC_neg_skip_output_row` | {a} R1 C0 E0 mut=skip_output_row budget 300 s | fail | **FAIL** | `S3_ClosedPassIsHeld` | 78 | 107 | 18 | 2s | 282 |
-| `MC_neg_double_read` | {a} R1 C0 E0 mut=double_read budget 300 s | fail | **FAIL** | `ReadOnce` | 27 | 33 | 8 | 1s | 245 |
-| `MC_neg_src_ledger_carries_r25` | {a} R3 C2 E1 mut=src_ledger_carries_r25 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 3,836 | 9,912 | 15 | 3s | 469 |
-| `MC_neg_record_racy` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `ReuseSound` | 307 | 465 | 12 | 1s | 291 |
-| `MC_neg_record_racy_ledger` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `LedgerSound` | 447 | 683 | 15 | 3s | 293 |
-| `MC_neg_untyped_space` | {a} R1 C0 E0 X1 mut=untyped_space budget 300 s | fail | **FAIL** | `ClosureAccounted` | 98 | 128 | 15 | 2s | 272 |
-| `MC_neg_source_write` | {a} R1 C0 E0 mut=source_write budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 2s | 214 |
-| `MC_neg_pause_writer` | {a} R1 C0 E0 mut=pause_writer budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 1s | 234 |
-| `MC_neg_git_optional_locks` | {a} R1 C0 E0 estate mut=git_optional_locks budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 8 | 8 | 3 | 1s | 243 |
-| `MC_neg_unbounded_backup` | {a} R1 C0 E0 estate mut=unbounded_backup budget 300 s | fail | **FAIL** | `S2_BackupLockBounded` | 339 | 866 | 9 | 2s | 313 |
-| `MC_neg_supersede_unchecked` | {a} R1 C0 E0 F1 exchange mut=supersede_unchecked budget 300 s | fail | **FAIL** | `NoClobber` | 339 | 541 | 13 | 2s | 294 |
-| `MC_neg_sweep_displaced` | {a} R3 C1 E1 F1 exchange mut=sweep_displaced budget 300 s | fail | **FAIL** | `NoClobber` | 54,209 | 125,952 | 27 | 6s | 832 |
-| `MC_neg_adopt_unkeyed` | {a} R2 C1 E1 mut=adopt_unkeyed budget 300 s | fail | **FAIL** | `ReuseSound` | 1,591 | 3,637 | 15 | 2s | 402 |
-| `MC_neg_adopt_unverified` | {a} R2 C1 E0 F1 mut=adopt_unverified budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 1,752 | 4,446 | 15 | 2s | 426 |
-| `MC_neg_reuse_ignores_row` | {a} R2 C0 E0 mut=reuse_ignores_row budget 300 s | fail | **FAIL** | `AdoptOnlyUnrowed` | 118 | 161 | 30 | 1s | 288 |
-| `MC_neg_adopt_unrecorded` | {a} R3 C1 E0 strict-held mut=adopt_unrecorded budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 724 | 1,472 | 43 | 2s | 337 |
-| `MC_neg_owned_ignores_identity` | {a} R2 C0 E0 F1 exchange mut=owned_ignores_identity budget 300 s | fail | **FAIL** | `NoClobber` | 987 | 1,556 | 26 | 1s | 364 |
-| `MC_neg_sweep_drops_ownership` | {a} R3 C1 E1 exchange mut=sweep_drops_ownership budget 300 s | fail | **FAIL** | `SupersedeAtomic` | 5,120 | 10,438 | 26 | 3s | 510 |
-| `MC_neg_exchange_before_intent` | {a} R2 C1 E1 exchange mut=exchange_before_intent budget 300 s | fail | **FAIL** | `SupersedeAtomic` | 3,727 | 8,427 | 26 | 2s | 486 |
-| `MC_neg_own_is_reuse` | {a} R2 C0 E0 exchange mut=own_is_reuse budget 300 s | fail | **FAIL** | `OwnershipNeverReuse` | 90 | 120 | 21 | 1s | 283 |
-| `MC_neg_refusal_unbound` | {a} R2 C0 E0 F2 exchange mut=refusal_unbound budget 300 s | fail | **FAIL** | `RememberedRefusalSound` | 1,231 | 2,899 | 17 | 2s | 368 |
-| `MC_neg_late_exchange_refusal` | {a} R2 C0 E1 exchange no-exchange mut=late_exchange_refusal budget 300 s | fail | **FAIL** | `ExchangeRefusedUpFront` | 779 | 1,175 | 22 | 2s | 372 |
+| `MC_neg_held_before_commit` | {a} R3 C2 E1 mut=held_before_commit budget 300 s | fail | **FAIL** | `HeldAfterCommit` | 267 | 639 | 7 | 2s | 293 |
+| `MC_neg_commit_before_fsync` | {a} R3 C2 E1 mut=commit_before_fsync budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 794 | 2,141 | 10 | 2s | 362 |
+| `MC_neg_commit_before_dirseal` | {a} R1 C0 E0 mut=commit_before_dirseal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 86 | 129 | 17 | 1s | 270 |
+| `MC_neg_adopt_without_seal` | {a} R1 C0 E0 F1 mut=adopt_without_seal budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 317 | 510 | 13 | 2s | 289 |
+| `MC_neg_ledger_before_held` | {a} R1 C0 E0 mut=ledger_before_held budget 300 s | fail | **FAIL** | `LedgerAfterHeld` | 50 | 70 | 14 | 2s | 256 |
+| `MC_neg_done_before_sync` | {a} R1 C0 E0 mut=done_before_sync budget 300 s | fail | **FAIL** | `DoneAfterLedger` | 80 | 117 | 17 | 1s | 283 |
+| `MC_neg_reread_durable` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 368 | 764 | 20 | 2s | 291 |
+| `MC_neg_reread_unchanged` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_UnchangedReadsZero` | 361 | 749 | 20 | 2s | 295 |
+| `MC_neg_reread_changed_only` | {a} R2 C1 E0 mut=reread_durable budget 300 s | fail | **FAIL** | `S3_ReadsOnlyChanged` | 350 | 725 | 20 | 2s | 294 |
+| `MC_neg_reread_ignore_ledger` | {a} R2 C0 E0 mut=reread_ignore_ledger budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 119 | 162 | 29 | 1s | 283 |
+| `MC_neg_reread_exchange` | {a} R2 C0 E0 exchange mut=reread_durable budget 300 s | fail | **FAIL** | `R25_NoCommittedCaptureReread` | 133 | 180 | 33 | 2s | 312 |
+| `MC_neg_skip_output_row` | {a} R1 C0 E0 mut=skip_output_row budget 300 s | fail | **FAIL** | `S3_ClosedPassIsHeld` | 78 | 107 | 17 | 2s | 280 |
+| `MC_neg_double_read` | {a} R1 C0 E0 mut=double_read budget 300 s | fail | **FAIL** | `ReadOnce` | 27 | 33 | 8 | 2s | 240 |
+| `MC_neg_src_ledger_carries_r25` | {a} R3 C2 E1 mut=src_ledger_carries_r25 budget 300 s | fail | **FAIL** | `R25_NoDurableReread` | 3,687 | 9,524 | 15 | 2s | 500 |
+| `MC_neg_record_racy` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `ReuseSound` | 316 | 478 | 12 | 2s | 280 |
+| `MC_neg_record_racy_ledger` | {a} R1 C0 E1 mut=record_racy budget 300 s | fail | **FAIL** | `LedgerSound` | 459 | 698 | 15 | 2s | 313 |
+| `MC_neg_untyped_space` | {a} R1 C0 E0 X1 mut=untyped_space budget 300 s | fail | **FAIL** | `ClosureAccounted` | 100 | 131 | 16 | 1s | 280 |
+| `MC_neg_source_write` | {a} R1 C0 E0 mut=source_write budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 2s | 240 |
+| `MC_neg_pause_writer` | {a} R1 C0 E0 mut=pause_writer budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 13 | 16 | 5 | 2s | 243 |
+| `MC_neg_git_optional_locks` | {a} R1 C0 E0 estate mut=git_optional_locks budget 300 s | fail | **FAIL** | `S2_TypedSourceAccess` | 8 | 8 | 3 | 1s | 249 |
+| `MC_neg_unbounded_backup` | {a} R1 C0 E0 estate mut=unbounded_backup budget 300 s | fail | **FAIL** | `S2_BackupLockBounded` | 286 | 710 | 9 | 2s | 315 |
+| `MC_neg_supersede_unchecked` | {a} R1 C0 E0 F1 exchange mut=supersede_unchecked budget 300 s | fail | **FAIL** | `NoClobber` | 333 | 528 | 13 | 2s | 314 |
+| `MC_neg_sweep_displaced` | {a} R3 C1 E1 F1 exchange mut=sweep_displaced budget 300 s | fail | **FAIL** | `NoClobber` | 57,438 | 132,874 | 28 | 6s | 827 |
+| `MC_neg_adopt_unkeyed` | {a} R2 C1 E1 mut=adopt_unkeyed budget 300 s | fail | **FAIL** | `ReuseSound` | 1,695 | 3,870 | 15 | 3s | 432 |
+| `MC_neg_adopt_unverified` | {a} R2 C1 E0 F1 mut=adopt_unverified budget 300 s | fail | **FAIL** | `RecordImpliesBytes` | 1,646 | 4,097 | 15 | 2s | 409 |
+| `MC_neg_reuse_ignores_row` | {a} R2 C0 E0 mut=reuse_ignores_row budget 300 s | fail | **FAIL** | `AdoptOnlyUnrowed` | 118 | 161 | 31 | 1s | 290 |
+| `MC_neg_adopt_unrecorded` | {a} R3 C1 E0 strict-held mut=adopt_unrecorded budget 300 s | fail | **FAIL** | `R25_StrictNoDurableReread` | 724 | 1,472 | 43 | 2s | 331 |
+| `MC_neg_owned_ignores_identity` | {a} R2 C0 E0 F1 exchange mut=owned_ignores_identity budget 300 s | fail | **FAIL** | `NoClobber` | 994 | 1,567 | 27 | 2s | 356 |
+| `MC_neg_sweep_drops_ownership` | {a} R3 C1 E1 exchange mut=sweep_drops_ownership budget 300 s | fail | **FAIL** | `SupersedeAtomic` | 5,133 | 10,467 | 26 | 3s | 500 |
+| `MC_neg_exchange_before_intent` | {a} R2 C1 E1 exchange mut=exchange_before_intent budget 300 s | fail | **FAIL** | `SupersedeAtomic` | 3,728 | 8,442 | 26 | 3s | 474 |
+| `MC_neg_own_is_reuse` | {a} R2 C0 E0 exchange mut=own_is_reuse budget 300 s | fail | **FAIL** | `OwnershipNeverReuse` | 90 | 120 | 23 | 1s | 285 |
+| `MC_neg_refusal_unbound` | {a} R2 C0 E0 F2 exchange mut=refusal_unbound budget 300 s | fail | **FAIL** | `RememberedRefusalSound` | 1,264 | 2,984 | 17 | 2s | 406 |
+| `MC_neg_late_exchange_refusal` | {a} R2 C0 E1 exchange no-exchange mut=late_exchange_refusal budget 300 s | fail | **FAIL** | `ExchangeRefusedUpFront` | 762 | 1,151 | 22 | 2s | 337 |
 
 Reading the table:
 
@@ -427,7 +440,7 @@ enabled in another config:
 | `CrashSrc`, `CrashDst`, `CrashBoth` | `MaxCrashes = 0` | every config with `C1` or `C2` |
 
 **Branches, not only actions.** Action-level coverage can hide a dead branch
-inside an action. Eight reach rows prove that the branches R25, WP0(g) and
+inside an action. Nine reach rows prove that the branches R25, WP0(g) and
 #187's records depend on are reachable. Each runs at the bound of a pass
 row, so that pass row's complete search explores the branch:
 
@@ -435,12 +448,13 @@ row, so that pass row's complete search explores the branch:
 |---|---|---|---|
 | `MC_reach_ledger_manifest` | `Witness_LedgerManifest` | `RecvDecide`: a manifest served from the source ledger, with no read | `MC_nv_ledger` |
 | `MC_reach_ledger_chunks` | `Witness_LedgerChunkRead` | `RecvNeed`: a ledger manifest's chunks re-read (pread) to fill an absent output | `MC_nv_ledger` |
-| `MC_reach_wp0g_lost_row` | `Witness_LostRowRead` | WP0(g): a row a relaxed ledger lost, then a later run's ledger miss and read | `MC_wp0g` |
+| `MC_reach_wp0g_lost_row` | `Witness_LostRowRead` | WP0(g): a row a relaxed ledger lost to a power loss, then a later run's ledger miss and read | `MC_wp0g` |
 | `MC_reach_exchange_refused` | `Witness_ExchangeRefused` | `RecvManifest`, `RecvEnd`: a changed seat's own output refused `DESTINATION_EXCHANGE_UNSUPPORTED` (OI-1003-Q100) | `MC_supersede_noexchange` |
 | `MC_reach_remembered_refusal` | `Witness_RememberedRefusal` | `RecvEntry`: an entry refused from its remembered refusal, with no source read | `MC_wp0d_exchange` |
 | `MC_reach_ownership_superseded` | `Witness_OwnershipSuperseded` | `BeginSupersede`: a superseding publish of an output owned by its ownership row alone, a racy publish whose seat changed again (OI-1003-Q101) | `MC_wp0d_exchange` |
 | `MC_reach_sweep_ownership` | `Witness_SweepOwnership` | `StartRun`'s sweep: an interrupted supersede whose staged file is at the leaf gets the ownership row | `MC_wp0d_exchange` |
 | `MC_reach_sweep_restore` | `Witness_SweepRestore` | `StartRun`'s sweep: an interrupted supersede whose exchange did not take effect gets its rows back | `MC_wp0d_exchange` |
+| `MC_reach_wp0g_failed_commit` | `Witness_FailedRowRead` | WP0(g), #163: `LedgerCommit`'s failing branch (counted, not fatal), then with no crash a later run's ledger miss and read | `MC_wp0g` |
 
 A witness invariant is used instead of line counts from the coverage report,
 whose line numbers move with every spec edit. Neither ledger branch is
@@ -872,9 +886,8 @@ that never quiesces, or under unbounded crashes, is not claimed.
 
 **Q20 holds for the ledger's row commits, on one condition: the source
 store's creation must be durable before `Start`. That means both the commit
-that creates its authority and its state root's directory entry. The model
-also assumes a ledger commit never fails, which the code does not honour yet
-(the conditions below).**
+that creates its authority and its state root's directory entry. Built
+2026-10-07 on these conditions ([WP0(g) as built](#wp0g-as-built-2026-10-07)).**
 
 **1. Relaxed ledger rows are safe** (`MC_wp0g`, `MC_wp0g_deep` pass, and
 `MC_reach_wp0g_lost_row` shows `MC_wp0g` explores the relaxed-only path).
@@ -1006,6 +1019,49 @@ loss may also reorder writes. That is why the code must treat a corrupt or
 absent ledger as empty, and keep `checkpoint_fullfsync=ON` so that a
 checkpoint stays a full barrier and the WAL's frame checksums discard a torn
 tail. Corruption itself is outside the model and not proven here.
+
+### WP0(g) as built (2026-10-07)
+
+OI-1003-Q104 ruled WP0(g) built. `RelaxedSourceLedger = TRUE` is the code's
+`LedgerSync::Relaxed`, the default. The conditions above, and where the
+code meets each:
+
+| Condition | Code | Model | Test |
+|---|---|---|---|
+| Only the ledger's row commits are relaxed, and only on the source | `relax_ledger_rows` (`A/io/durable.rs`): `synchronous=NORMAL`, `fullfsync=OFF`, read back; called by `StorePublisher::relax_ledger_rows`, which refuses a destination publisher, from `LedgerSink::with_sync`, which `serve` calls on its second connection | `RelaxedSourceLedger`: `SrcLoss` may drop any subset of `srcLedger` | `only_a_source_ledgers_row_commits_are_relaxed` |
+| The creation commit (schema and authority) is FULL | `Store::open` runs `configure_sqlite` (unchanged) and commits before a publisher exists; `serve` opens the store, and sends `Start`, on that connection | `RelaxedAuthority = FALSE`; `MC_wp0g_authority` fails `R25_NoDurableReread` with it `TRUE` | P79 (the authority after every loss), `stores_commit_through_wal_with_full_flushes` |
+| After #161 (sealed state root) | `Store::open` seals the root and its parent (#166, on main) | `StoreRootSealed = TRUE`; `MC_store_root_unsealed` fails without it | `tests/power_loss.rs` (#166's) |
+| A corrupt or absent ledger is empty | `ledger_read` (`A/transfer.rs`): a failed ledger read is a miss, counted `source_ledger_unreadable` | the empty subset | `an_unreadable_relaxed_ledger_reads_as_a_miss` |
+| Never a new authority because rows are gone | `Store::open` inserts the authority once (`INSERT OR IGNORE`) | `SrcLoss` leaves `srcAuth` unless the store itself is lost | P79, `every_power_loss_state_of_a_relaxed_ledger_costs_at_most_its_lost_seats` |
+| A failed ledger commit is counted, never fatal (#163) | `LedgerSink::publish`: `source_ledger_commit_failed`, `source_ledger_rows_dropped`, `Ok` | `LedgerCommit`'s second branch (`ledgerLost`, `by = "commit_failed"`) | `a_failed_relaxed_ledger_commit_is_counted_not_fatal` |
+| The destination is untouched | no change to `configure_sqlite`, `commit_outputs`, `PublishSink`, `materialize.rs` or `Inbound::answer_held` | `HeldAfterCommit`, `RecordImpliesBytes`, every mutation row: unchanged expectations | the existing power-loss and fault harnesses, unchanged |
+
+**Which R25 reading holds with the relaxation.** Both, each within its
+stated limits:
+
+- The committed-row reading (`R25_NoDurableReread`, the SLO's obligation,
+  OI-1003-Q40) holds in `MC_wp0g` and `MC_wp0g_deep`, now with the counted
+  commit failure as well as the power loss.
+- The strict reading (`R25_StrictNoDurableReread`, #169) holds in
+  `MC_wp0g_strict`: `MC_wp0g_deep`'s bound with `TrackStrictHeld`. Its
+  limits are #169's ([R25's strict reading](#r25s-strict-reading-169)): a
+  non-racy capture whose record could be written.
+
+So a lost ledger row, whichever way it was lost, costs a read only of a
+seat the destination does not hold: no row there, and no durable unrowed
+bytes with a capture record. On the code, P79 and the power-loss test
+check the committed-row reading on the real store: every seat the
+destination holds is answered `Reuse` and reads 0 bytes whatever the
+ledger lost, and a lost row costs its seat's bytes once, only at a seat a
+third party removed.
+
+**What the model still abstracts.** The loss is any subset of the
+committed rows. `SQLite` in WAL mode loses commits newest first (a suffix),
+which P79 and the power-loss test check on the real WAL: cut, torn and
+garbled tails. Torn pages inside a checkpointed database are outside both
+(`checkpoint_fullfsync` stays ON, and `relax_ledger_rows` reads it back).
+The refusal rows of the ledger (#186) are not in the model; a lost one
+costs one more 16-byte sniff.
 
 ## WP0(d): exchange versus check-then-rename (OI-1003-Q18)
 
@@ -1139,7 +1195,7 @@ that test the same claim on the real code. SLOs are
 
 | Model property | Statement | SLO | Rulings | Property tests |
 |---|---|---|---|---|
-| `R25_NoDurableReread` | No source content read of a seat at a stat identity the destination holds durably. "Holds" means a committed row, recorded from that identity, vouches for the durable output at the path. Stated physically, under any source authority. **The operative R25 check in code shape.** "Held" is narrowed to "a committed row"; no ruling fixes that reading yet ([disagreements](#code-and-design-disagreements)). | S3 | R25 / R-N58, OI-1003-Q7, OI-1003-Q20 | P23, P21, P19, P24, P33 |
+| `R25_NoDurableReread` | No source content read of a seat at a stat identity the destination holds durably. "Holds" means a committed row, recorded from that identity, vouches for the durable output at the path. Stated physically, under any source authority. **The operative R25 check in code shape.** "Held" is narrowed to "a committed row"; no ruling fixes that reading yet ([disagreements](#code-and-design-disagreements)). | S3 | R25 / R-N58, OI-1003-Q7, OI-1003-Q20, OI-1003-Q37 | P23, P21, P19, P24, P33, P79 |
 | `R25_NoCommittedCaptureReread` | slo.md's wording: no committed capture (a source row whose output the destination still holds) is re-read. **Vacuous while `SupersedeMode = "off"` (the transfer before #187)**: the source reads with its ledger row present only to serve chunks for an absent output, so `reread_durable` (no `Reuse`) alone never violates it. It fails only when the source also ignores its ledger (`MC_neg_reread_ignore_ledger`) or under the exchange design (`MC_neg_reread_exchange`). Not evidence for R25 in code shape. | S3 | R-N58, OI-1003-Q7 | P23, P33 |
 | `ReadOnce` | A seat is read at most once per session. | S1, S3 | R-N58 | P23 |
 | `S3_ReadsOnlyChanged` | A run reads only seats not held when it began (changed, racy, never carried, or lost at the destination) or changed during it. | S3 | OI-1003-Q18 (WP0(c), inequality 1) | P21, P23 |
@@ -1287,13 +1343,15 @@ The model proves the protocol, within its bounds. It does not prove:
 - **Larger bounds.** The checked bounds are small (the small-scope
   hypothesis). The drafted two-seat, three-run, every-fault constants were
   only simulated (`MC_main_sim`), never model-checked.
-- **A failing source ledger commit.** `LedgerCommit` never fails. In the code
-  the first failed ledger group (a full or failing source state disk) is
-  sticky, and the session fails before `SourceDone` (`LedgerSink::commit`,
-  `Committer::submit`, `serve`). So `RunsClose`, `AllRunsFinish`,
-  `ClosureAccounted` and WP0(g)'s "losing a source row costs at most a
-  re-read" do not cover it. In the code today a lost ledger write costs the
-  whole session (WP0(g) conditions).
+- **A failing strict ledger commit.** Under `RelaxedSourceLedger`
+  `LedgerCommit` may fail: the group's rows are dropped and the session goes
+  on, as `LedgerSync::Relaxed` does in the code since 2026-10-07 (#163;
+  `MC_reach_wp0g_failed_commit`). A strict ledger's commit never fails in
+  the model. In the code (`LedgerSync::Full`, `--source-ledger-sync=full`)
+  its first failed group is sticky and the session fails before
+  `SourceDone` (`LedgerSink::commit`, `Committer::submit`, `serve`), so
+  `RunsClose`, `AllRunsFinish` and `ClosureAccounted` do not cover that
+  mode's failure.
 - **Losing a store's state root.** The positive configs assume each store's
   state root and database file are durable once its first commit returns
   (`StoreRootSealed = TRUE`; the code does not seal the parent yet). Losing
@@ -1581,9 +1639,9 @@ The model follows the code where the code and docs/design.md differ:
   seat's 16 sniffed bytes are not in `reads`. So that the source remembers
   such a refusal and does not sniff an unchanged seat again is not a model
   property; P21 and P23 with refused seats check it on the code.
-- **WP0(g).** It is ratified conditionally and not implemented: both stores
-  run `synchronous=FULL`, `fullfsync=ON` (`configure_sqlite`). The verdict
-  above sets the condition.
+- **WP0(g).** Built 2026-10-07 (OI-1003-Q104) as ratified
+  ([WP0(g) as built](#wp0g-as-built-2026-10-07)): the source ledger's row
+  commits are relaxed by default, and nothing else is.
 - **"Sealed".** design.md calls a file sealed by `F_BARRIERFSYNC` on Darwin,
   which is a barrier, not a flush. See the seal abstraction above.
 - **The state root is never sealed** (`MC_store_root_unsealed`).
@@ -1618,9 +1676,10 @@ The model follows the code where the code and docs/design.md differ:
     which `StartRun` omits.
   - `SALVAGE_BOUND_EXCEEDED` is a new typed refusal, missing from
     `TypedCodes`.
-- **A failed ledger commit fails the session.** slo.md's WP0(g) says "losing
-  a source row costs at most a re-read". In the code a failed ledger commit
-  fails the whole session ([Not proven here](#not-proven-here)).
+- **A failed ledger commit fails the session, in the strict mode only.**
+  Under `LedgerSync::Relaxed`, the default, it is counted and the session
+  goes on (#163). `--source-ledger-sync=full` keeps the behaviour before
+  WP0(g) ([Not proven here](#not-proven-here)).
 - **R25's model obligation in slo.md** is worded as
   `R25_NoCommittedCaptureReread`, which is vacuous in code shape
   ([Properties](#properties-slos-rulings-and-tests)).
@@ -1928,31 +1987,31 @@ of record.
 
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
-| `MC_gc_budget_selftest` | i1 L2 W4 gc C4 R1 X1 D1 budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 39,368 | 75,847 | 16 | 6s | 678 |
-| `MC_gc_core` | i1 L2 C3 R1 X1 D1 | pass | **PASS** | – | 45,062 | 81,520 | 29 | 10s | 778 |
-| `MC_gc_q46` | i1 L2 W4 gc C4 R1 X1 D1 | pass | **PASS** | – | 699,419 | 1,606,770 | 39 | 122s | 1805 |
-| `MC_gc_grouped` | i1,i2 L2 C2 X1 D1 db typed | pass | **PASS** | – | 85,941 | 184,923 | 35 | 21s | 1217 |
-| `MC_gc_fix2` | i1,i2 L1 W3 cub gc C2 X1 D1 db typed | pass | **PASS** | – | 392,515 | 807,467 | 39 | 104s | 1737 |
-| `MC_gc_reroot` | i1 L1 W4 gc C4 R1 X1 D1 | pass | **PASS** | – | 675,517 | 1,552,268 | 39 | 122s | 1763 |
-| `MC_gc_reroot_extended` | i1 L2 W5 gc C4 R1 X1 D1 | pass | **PASS** | – | 706,430 | 1,623,586 | 39 | 118s | 1717 |
-| `MC_gc_fix2_deep` | i1,i2 L2 W3 cub gc C2 X1 D1 db typed | pass | **PASS** | – | 366,285 | 736,323 | 39 | 117s | 1787 |
-| `MC_gc_reuse` | as `MC_gc_fix2`, `ReuseManifest` (L7's check) | pass | **PASS** | – | 588,517 | 1,148,997 | 47 | 142s | 1695 |
-| `MC_gc_live` | i1 L2 W4 gc C3 R1 X1 D1 deletes, `LiveSpec` | pass | **PASS** | – | 61,792 | 125,732 | 32 | 304s | 1543 |
-| `MC_gc_reach_reroot_extended` | as `MC_gc_reroot_extended` | reach | **REACHED** | `Witness_RerootExtended` | 240,683 | 463,116 | 23 | 25s | 1586 |
-| `MC_gc_reach_second_reroot` | as `MC_gc_reroot` | reach | **REACHED** | `Witness_SecondReroot` | 62,105 | 119,114 | 18 | 7s | 683 |
-| `MC_gc_reach_based_chain` | as `MC_gc_fix2_deep` | reach | **REACHED** | `Witness_BasedChainRestored` | 26,444 | 50,783 | 17 | 6s | 670 |
-| `MC_gc_base_missing_untyped` | i1,i2 L2 C0 D1 db typed budget 300 s (L6b's check) | pass | **PASS** | – | 137 | 249 | 16 | 2s | 358 |
+| `MC_gc_budget_selftest` | i1 L2 W4 gc C4 R1 X1 D1 budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 42,853 | 82,795 | 16 | 7s | 713 |
+| `MC_gc_core` | i1 L2 C3 R1 X1 D1 | pass | **PASS** | – | 45,062 | 81,520 | 29 | 10s | 768 |
+| `MC_gc_q46` | i1 L2 W4 gc C4 R1 X1 D1 | pass | **PASS** | – | 699,419 | 1,606,770 | 39 | 124s | 1792 |
+| `MC_gc_grouped` | i1,i2 L2 C2 X1 D1 db typed | pass | **PASS** | – | 85,941 | 184,923 | 35 | 19s | 1158 |
+| `MC_gc_fix2` | i1,i2 L1 W3 cub gc C2 X1 D1 db typed | pass | **PASS** | – | 392,515 | 807,467 | 39 | 113s | 1743 |
+| `MC_gc_reroot` | i1 L1 W4 gc C4 R1 X1 D1 | pass | **PASS** | – | 675,517 | 1,552,268 | 39 | 106s | 1788 |
+| `MC_gc_reroot_extended` | i1 L2 W5 gc C4 R1 X1 D1 | pass | **PASS** | – | 706,430 | 1,623,586 | 39 | 109s | 1785 |
+| `MC_gc_fix2_deep` | i1,i2 L2 W3 cub gc C2 X1 D1 db typed | pass | **PASS** | – | 366,285 | 736,323 | 39 | 94s | 1837 |
+| `MC_gc_reuse` | as `MC_gc_fix2`, `ReuseManifest` (L7's check) | pass | **PASS** | – | 588,517 | 1,148,997 | 47 | 168s | 1910 |
+| `MC_gc_live` | i1 L2 W4 gc C3 R1 X1 D1 deletes, `LiveSpec` | pass | **PASS** | – | 61,792 | 125,732 | 32 | 317s | 1577 |
+| `MC_gc_reach_reroot_extended` | as `MC_gc_reroot_extended` | reach | **REACHED** | `Witness_RerootExtended` | 245,863 | 473,575 | 23 | 30s | 1682 |
+| `MC_gc_reach_second_reroot` | as `MC_gc_reroot` | reach | **REACHED** | `Witness_SecondReroot` | 66,166 | 126,880 | 18 | 8s | 753 |
+| `MC_gc_reach_based_chain` | as `MC_gc_fix2_deep` | reach | **REACHED** | `Witness_BasedChainRestored` | 26,633 | 51,194 | 17 | 5s | 687 |
+| `MC_gc_base_missing_untyped` | i1,i2 L2 C0 D1 db typed budget 300 s (L6b's check) | pass | **PASS** | – | 137 | 249 | 16 | 2s | 361 |
 | `MC_gc_live_rewritten` | i1 L2 C0 D1, `LiveSpec`, budget 300 s | fail | **FAIL** | `ChainRecovery` | 12 | 17 | – | 2s | 346 |
 | `MC_gc_neg_live_unfair` | i1 L2 C0 budget 300 s | fail | **FAIL** | `ChainRecovery` | 4 | 5 | – | 2s | 320 |
 | `MC_gc_neg_chain_ignores_depth` | i1 L1 C2 | fail | **FAIL** | `ChainDepthBounded` | 40 | 55 | 13 | 2s | 335 |
-| `MC_gc_neg_gc_deletes_depended` | i1 L2 gc C1 | fail | **FAIL** | `GCNeverDeletesDepended` | 16 | 21 | 10 | 2s | 332 |
-| `MC_gc_neg_base_replaced_live` | i1,i2 L2 C1 D1 db typed | fail | **FAIL** | `BaseNotReplacedWhileDepended` | 376 | 576 | 11 | 2s | 390 |
-| `MC_gc_neg_sidecar_after_record` | i1 L2 C1 | fail | **FAIL** | `SidecarsBeforeRecord` | 14 | 18 | 8 | 2s | 319 |
-| `MC_gc_neg_skip_flatten_verify` | i1 L2 C1 D1 | fail | **FAIL** | `PrereqsSatisfiedByEarlierLinks` | 72 | 107 | 13 | 2s | 343 |
-| `MC_gc_neg_hit_ignores_chain` | i1 L2 C1 D1 | fail | **FAIL** | `BrokenLinkNeverReuseHit` | 69 | 104 | 13 | 2s | 351 |
-| `MC_gc_neg_hit_ignores_chain_restore` | i1 L2 C1 D1 | fail | **FAIL** | `RestoreOrRecapture` | 69 | 104 | 13 | 2s | 329 |
-| `MC_gc_neg_reroot_pre_mismatch` | i1 L1 W3 C2 | fail | **FAIL** | `PrereqsSatisfiedByEarlierLinks` | 41 | 56 | 14 | 3s | 343 |
-| `MC_gc_neg_reuse_after_record` | i1 L2 C1 `ReuseManifest` (L7's check) | fail | **FAIL** | `ReuseManifestBeforeRecord` | 11 | 11 | 5 | 1s | 319 |
+| `MC_gc_neg_gc_deletes_depended` | i1 L2 gc C1 | fail | **FAIL** | `GCNeverDeletesDepended` | 16 | 21 | 10 | 2s | 341 |
+| `MC_gc_neg_base_replaced_live` | i1,i2 L2 C1 D1 db typed | fail | **FAIL** | `BaseNotReplacedWhileDepended` | 341 | 537 | 11 | 2s | 405 |
+| `MC_gc_neg_sidecar_after_record` | i1 L2 C1 | fail | **FAIL** | `SidecarsBeforeRecord` | 14 | 18 | 8 | 2s | 332 |
+| `MC_gc_neg_skip_flatten_verify` | i1 L2 C1 D1 | fail | **FAIL** | `PrereqsSatisfiedByEarlierLinks` | 72 | 110 | 13 | 2s | 353 |
+| `MC_gc_neg_hit_ignores_chain` | i1 L2 C1 D1 | fail | **FAIL** | `BrokenLinkNeverReuseHit` | 69 | 104 | 13 | 2s | 341 |
+| `MC_gc_neg_hit_ignores_chain_restore` | i1 L2 C1 D1 | fail | **FAIL** | `RestoreOrRecapture` | 69 | 106 | 13 | 2s | 346 |
+| `MC_gc_neg_reroot_pre_mismatch` | i1 L1 W3 C2 | fail | **FAIL** | `PrereqsSatisfiedByEarlierLinks` | 41 | 56 | 14 | 1s | 344 |
+| `MC_gc_neg_reuse_after_record` | i1 L2 C1 `ReuseManifest` (L7's check) | fail | **FAIL** | `ReuseManifestBeforeRecord` | 11 | 11 | 5 | 1s | 315 |
 
 The self-test's row is the second invocation's; the first's tripped at
 36,610 distinct states.

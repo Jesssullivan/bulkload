@@ -102,6 +102,7 @@ let Witness =
       | Witness_OwnershipSuperseded
       | Witness_SweepOwnership
       | Witness_SweepRestore
+      | Witness_FailedRowRead
       >
 
 -- The 38 actions of Next, in the sorted order of configs.tsv's never column.
@@ -504,6 +505,7 @@ let witnessTable =
       , Witness_OwnershipSuperseded = Witness.Witness_OwnershipSuperseded
       , Witness_SweepOwnership = Witness.Witness_SweepOwnership
       , Witness_SweepRestore = Witness.Witness_SweepRestore
+      , Witness_FailedRowRead = Witness.Witness_FailedRowRead
       }
 
 let witnessSelf = \(w : Witness) -> merge witnessTable w
