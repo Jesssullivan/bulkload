@@ -6,8 +6,9 @@ rulings are recorded on TIN-4543 (comment of 2026-10-07 about 02:10 EDT).
 Branch `feat/s1-hermetic-rig-20261007`, from main `3931471`, merged with
 main `95f43dc` and then main `a80c63b` (#189). Commits `9d01b68`,
 `ef3fd75`, merge `3e7b5bf`, evidence `640093d`, merge `83d08dc` (the head
-the review read). The review-fix commits follow `83d08dc`; see "Review
-fixes" below and `git log 83d08dc..`. No PR opened.
+the review read). The review-fix commits follow `83d08dc`: `ff264c2`
+(bench and harness) and `3c26433` (slo.md, runbook, this note), then a
+merge of main `2a795cf` (#199); see "Review fixes" below. No PR opened.
 
 ## What changed
 
@@ -196,8 +197,12 @@ no ratified number or rule was changed.
   cores" is logical CPUs, its verdict reads `FAIL (NO A CONTROL)`, and it
   has no rig role. It is a `record`-rig sample with `of_record=false`.
 - Validation: `python3 crates/bulkload-bench/scripts/test_r23_ab.py`, 64
-  tests pass. `just check-fast` in `nix develop` on sting at the pushed
-  head: see the lane's final report (run after this note was written).
+  tests pass. `just check-fast` in `nix develop` on sting: exit 0 on the
+  tree of `3c26433` (pushed), and run again on the merge of main `2a795cf`
+  before that was pushed (result in the lane's final report). `3c26433`
+  was pushed in the same command that fetched and found main had moved to
+  `2a795cf`, so it went up validated against `a80c63b` only; the merge
+  followed at once.
   Checked on sting: with `TMPDIR` set, `nix develop` puts its
   `nix-shell.*` and `nix-develop-*` directories under it.
 
