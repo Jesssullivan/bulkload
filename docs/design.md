@@ -379,6 +379,29 @@ replaced inodes, journal gaps and lost source authority invalidate reuse, and
 correctness takes precedence over a zero-reread claim. Every run reports
 bytes read, bytes sent, flushes, memory and wall time.
 
+Since #169 an output whose bytes are durable but whose row never committed
+(a crash between publish and row commit, or a failed group) is adopted on
+resume from its capture record, by hashing the destination's own bytes: 0
+source bytes read.
+
+- The record is an extended attribute on the output. It names the walked
+  row (the seat's path and stat identity, with no store authority), the
+  capture's manifest root and its size.
+- A staged file gets it before its seal. An existing output adopted against
+  a manifest gets it, or has a stale one replaced, once its bytes are
+  verified.
+- Only a non-racy capture gets one. It needs extended attributes, and on an
+  adopted output a mode its owner can write. A record that could not be
+  written is counted (`transfer_capture_records_unset`).
+- An output with a matching row is never adopted: its `Reuse` comes from
+  the row. A clean rerun adopts nothing.
+- A source store that lost its authority re-keys every row, but its
+  outputs' records still match, so those outputs are adopted, not re-read.
+- An existing output with no matching row that no record proves is read
+  again and counted (`transfer_unrowed_unproven`): no record, bytes
+  rewritten in place, or a changed mode. A record that names another row
+  (the seat moved since that capture) is read again and not counted.
+
 ## M2 gates (current)
 
 The acceptance criteria for each M2 workstream as they stand today. Rulings
