@@ -46,9 +46,21 @@ Preconditions (gated mode, the default):
     under test (TinylandState on neo; ~/git-bulkload/ on the hermetic rig).
 
 Rig identity: the report's `host_identity` records the platform, kernel,
-machine, CPU model, core count, RAM and the filesystem type of the work
-root, so a sample from one rig is never read as another's (OI-1003-Q96,
-OI-1003-Q97). docs/slo.md says which rig is the gate of record.
+machine, CPU model, physical cores and logical CPUs (separately), RAM and
+the filesystem type of the work root, so a sample from one rig is never
+read as another's (OI-1003-Q96, OI-1003-Q97). A gated sample is refused
+when any of those fields cannot be read.
+
+Rig role (OI-1003-Q97): `RIG_OF_RECORD` below is the committed list of
+hosts whose gated gate (a) sample may be the S1 verdict of record; it
+follows docs/slo.md. A host on the list is `record`, every other host is
+`field` (a field confirmation, which never decides S1). A host that has a
+listed name but not the listed platform, machine and product is refused in
+gated mode. The rig name and role are in the status line (`rig=`,
+`rig_role=`, `of_record=`), in the evidence title and verdict line, and in
+the default evidence file name; a gated --evidence name that lacks the rig
+name is refused. `of_record=true` needs all of: gated mode, a `record` rig,
+the A control (B/A/B/A/B) and a completed sample.
 
 Baselines on Linux (OI-1003-Q96): the pinned baselines A (7c3ecc7) and V4
 (41bf9a4) predate the sysfs preflight; their bench runs `pmset` from PATH
@@ -75,7 +87,12 @@ is stable for one untouched copy and differs between copies. After the last rep,
 sealed corpus are verified again. Any failure aborts the sample (exit 3).
 
 Host checks: after the builds, the harness waits up to --settle-seconds for
-AC power and load1 < 2.5, and checks again before every repetition. After
+AC power and load1 < 2.5, and checks again before every repetition. The
+bound is R-N81's absolute 2.5; it is not scaled to the rig's core count, so
+the report records load1 right after the builds (`post_build`), how long
+the harness waited and the reading that admitted rep 0 (`settle`), and
+which revisions were compiled inside the sample. Prebuild with --build-only
+so that no compile runs inside a gated sample. After
 every repetition, power must still be AC, every bench row must say
 gated=true, and load1 must fall below 2.5 within --post-settle-seconds (the
 bench's own work raises it during the rep). The bench itself checks before
@@ -101,8 +118,12 @@ The per-revision CARGO_TARGET_DIR and the copied binaries stay under
 The harness never deletes anything outside the work root.
 
 Evidence: <work>/r23-ab.json holds everything, and the Markdown draft goes
-to docs/evidence/r23-<date>-<HHMM>Z.md. An aborted sample is titled ABORTED
+to docs/evidence/r23-<date>-<HHMM>Z-<rig>-<role>.md. An aborted sample is titled ABORTED
 and has no medians table.
+
+--build-only builds B, A (unless --b-only-no-a-control) and V4 into
+--build-root and exits 0 without a sample: no corpus, no host checks, no
+evidence. Run it before a gated sample and let the host go quiet again.
 
 --dry-run makes a tiny synthetic corpus, passes --informational and skips
 the platform, corpus-verify, quiet and load checks. Its output says
@@ -134,9 +155,12 @@ every gated check (platform, corpus v1, verify, seal, R-N81 before every rep
 and arm, R-N91) and changes one thing: the order is B/B/B, A is not built and
 no A rep runs. OI-1002-Q30 ratifies the order B/A/B/A/B, so this sample lacks
 its A control and says so everywhere: the status is
-`complete-draft-no-a-control`, the verdict is `PASS (NO A CONTROL)` or
-`FAIL (NO A CONTROL)` by the unchanged rule over the three B reps, and the
-evidence file name must contain `no-a-control`. Whether such a sample may
+`complete-draft-no-a-control`, the verdict is the single token
+`PASS-NO-A-CONTROL` or `FAIL-NO-A-CONTROL` (so a key=value reader of the
+status line never sees a bare PASS) by the unchanged rule over the three B
+reps, `of_record` is false, and the evidence file name must contain
+`no-a-control`. The three B reps run back to back, so they are not spread
+across A reps as the ratified order spreads them. Whether such a sample may
 stand as a gate verdict is the operator's decision, not this script's. The
 v4 dedup reference rep still runs.
 
@@ -218,6 +242,30 @@ RECV_STALL = re.compile(r"(recv|receive).*(stall|seal|block).*_ns$")
 PAIR = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
 NOT_GATE = "DRY RUN - NOT A GATE SAMPLE"
 NO_A_CONTROL = "NO A CONTROL"
+# The verdict suffix of a B/B/B sample: one token, so `gate=PASS-NO-A-CONTROL`
+# is never read as `gate=PASS` by a key=value parser.
+NO_A_TOKEN = "NO-A-CONTROL"
+# Hosts whose gated gate (a) sample may be the S1 verdict of record, with the
+# identity each must show (docs/slo.md, amendment 2026-10-07; OI-1003-Q96,
+# OI-1003-Q97). Every other host is a field confirmation. Change this list
+# only with the SLO text.
+RIG_OF_RECORD: dict[str, dict[str, str]] = {
+    "mbp-13": {"system": "Linux", "machine": "x86_64", "product": "MacBookPro12,1"},
+}
+# A gated sample is refused when any of these is missing from host_identity.
+IDENTITY_REQUIRED = (
+    "node",
+    "system",
+    "kernel",
+    "machine",
+    "product",
+    "cpu_model",
+    "cpu_physical_cores",
+    "cpu_logical",
+    "ram_bytes",
+    "work_root_fs_type",
+)
+CPU_TOPOLOGY_ROOT = Path("/sys/devices/system/cpu")
 B_ONLY_PATTERN = "B" * GATE_B_REPS
 UNDER_LOAD = "INFORMATIONAL UNDER LOAD - NOT A GATE SAMPLE"
 
@@ -450,10 +498,57 @@ def cpu_model_from_cpuinfo(text: str) -> str | None:
     return None
 
 
+def linux_physical_cores(root: Path) -> int | None:
+    """Physical cores: distinct hyperthread sibling sets under sysfs.
+
+    `os.cpu_count()` counts logical CPUs; on a 2-core, 4-thread host it says
+    4. None when the topology cannot be read for every CPU.
+    """
+    try:
+        cpus = [d for d in root.iterdir() if re.fullmatch(r"cpu\d+", d.name)]
+    except OSError:
+        return None
+    siblings = set()
+    for cpu in cpus:
+        if not (cpu / "topology").is_dir():
+            continue  # an offline CPU has no topology directory
+        word = sysfs_word(cpu / "topology" / "thread_siblings_list")
+        if not word:
+            return None
+        siblings.add(word)
+    return len(siblings) or None
+
+
+def rig_name(node: object) -> str:
+    """The short host name, safe to put in a file name."""
+    short = str(node or "").split(".")[0]
+    return re.sub(r"[^A-Za-z0-9_-]", "-", short) or "unknown-host"
+
+
+def rig_role(identity: dict[str, object]) -> tuple[str, str | None]:
+    """(`record` or `field`, problem). OI-1003-Q97.
+
+    A host named like a rig of record that does not show that rig's pinned
+    identity gets a problem text; a gated sample is then refused, so another
+    machine with the same name cannot produce a verdict of record.
+    """
+    pinned = RIG_OF_RECORD.get(rig_name(identity.get("node")))
+    if pinned is None:
+        return "field", None
+    wrong = {k: identity.get(k) for k, v in pinned.items() if identity.get(k) != v}
+    if wrong:
+        return "field", (
+            f"host is named {rig_name(identity.get('node'))}, a rig of record,"
+            f" but its identity differs: {wrong} (expected {pinned})"
+        )
+    return "record", None
+
+
 def host_identity(work_parent: Path) -> dict[str, object]:
     """What tells one rig's sample from another's (OI-1003-Q96, OI-1003-Q97)."""
     system = platform.system()
     path = str(work_parent)
+    physical: int | None = None
     cpu: str | None = None
     fs: str | None = None
     product: str | None = None
@@ -465,7 +560,10 @@ def host_identity(work_parent: Path) -> dict[str, object]:
         )
         product = sysfs_word(Path("/sys/class/dmi/id/product_name"))
         supplies = linux_power(POWER_SUPPLY_ROOT)[1]
+        physical = linux_physical_cores(CPU_TOPOLOGY_ROOT)
     elif system == "Darwin":
+        cores = command_text(["/usr/sbin/sysctl", "-n", "hw.physicalcpu"])
+        physical = int(cores) if cores.isdigit() else None
         cpu = (
             command_text(["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"]) or None
         )
@@ -482,7 +580,11 @@ def host_identity(work_parent: Path) -> dict[str, object]:
         "machine": platform.machine(),
         "product": product,
         "cpu_model": cpu,
+        # `cpu_count` is logical CPUs (kept under its first name); the two
+        # fields after it say which is which.
         "cpu_count": os.cpu_count(),
+        "cpu_logical": os.cpu_count(),
+        "cpu_physical_cores": physical,
         "ram_bytes": ram,
         "work_root_parent": path,
         "work_root_fs_type": fs,
@@ -529,7 +631,7 @@ def git(repo: Path, *args: str) -> str:
 
 def build(
     repo: Path, rev: str, build_root: Path, scratch: Path, jobs: int
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Build bulkload-bench at `rev` in its own tree and target dir.
 
     The exported source tree goes under `scratch` (inside the new work root).
@@ -587,7 +689,13 @@ def build(
     if recorded.read_text().strip() != digest:
         say(f"build refused: {binary} does not match its sha256 record")
         raise SystemExit(4)
-    return {"rev": rev, "sha": sha, "binary": str(binary), "sha256": digest}
+    return {
+        "rev": rev,
+        "sha": sha,
+        "binary": str(binary),
+        "sha256": digest,
+        "compiled_in_this_run": not cached,
+    }
 
 
 def resolve_rclone(repo: Path, given: str | None) -> Path:
@@ -829,7 +937,7 @@ def post_settle(
 
 def run_rep(
     label: str,
-    info: dict[str, str],
+    info: dict[str, object],
     args: argparse.Namespace,
     work: Path,
     corpus: Path,
@@ -1010,9 +1118,19 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
     else:
         verdict = "FAIL"
     no_a = report.get("a_control") is False
+    of_record = (
+        verdict in ("PASS", "FAIL")
+        and not no_a
+        and report["mode"] == "gated"
+        and report["status"] == "complete-draft"
+        and report.get("rig_role") == "record"
+    )
     if no_a and verdict in ("PASS", "FAIL"):
-        verdict += f" ({NO_A_CONTROL})"
+        verdict += f"-{NO_A_TOKEN}"
     return {
+        "rig": report.get("rig"),
+        "rig_role": report.get("rig_role"),
+        "of_record": of_record,
         "rule": (
             "under load there is no R23 verdict; B's bench statuses and the"
             " bench's informational native-vs-rclone medians are reported"
@@ -1088,10 +1206,56 @@ def identity_lines(identity: object) -> list[str]:
         f"- Rig: `{identity.get('node')}`, {identity.get('system')}"
         f" {identity.get('kernel')} {identity.get('machine')},"
         f" product `{identity.get('product')}`, CPU `{identity.get('cpu_model')}`,"
-        f" {identity.get('cpu_count')} cores,"
+        f" {identity.get('cpu_physical_cores', 'n/a')} physical cores,"
+        f" {identity.get('cpu_logical', identity.get('cpu_count'))} logical CPUs,"
         f" RAM {fmt(ram / 2**30, 1) if isinstance(ram, int) else 'n/a'} GiB,"
         f" work-root filesystem `{identity.get('work_root_fs_type')}`,"
         f" power probe `{identity.get('power_probe')}`.",
+    ]
+
+
+def rig_text(report: dict[str, object], gate: dict[str, object]) -> str:
+    """Which rig a sample is from and what that makes it (OI-1003-Q97)."""
+    rig = f"rig `{report.get('rig')}`"
+    if report.get("rig_role") != "record":
+        return (
+            f"{rig}, role `field`: a field confirmation, reported beside the rig"
+            " verdict; it is never the S1 verdict, in either direction"
+        )
+    if gate.get("of_record"):
+        return f"{rig}, role `record`: the rig of record; of_record=true"
+    return (
+        f"{rig}, role `record`: the rig of record, but this sample is not a"
+        " verdict of record (of_record=false)"
+    )
+
+
+def build_settle_lines(report: dict[str, object]) -> list[str]:
+    """What the host was doing between the builds and rep 0 (R-N81)."""
+    settle = report.get("settle")
+    if not isinstance(settle, dict):
+        return []
+    compiled = [
+        label
+        for label, info in report["builds"].items()
+        if info.get("compiled_in_this_run")
+    ]
+    post = report.get("post_build") or {}
+    admitted = settle.get("admitted") or {}
+    identity = report.get("host_identity") or {}
+    return [
+        "- Builds and settle: compiled inside this sample: "
+        + (
+            f"**{', '.join(compiled)}** (prebuild with `--build-only` so no"
+            " compile runs inside a gated sample)"
+            if compiled
+            else "none (every binary was prebuilt)"
+        )
+        + f". load1 right after the builds: {fmt(post.get('load1'), 2)}; the"
+        f" harness waited {fmt(settle.get('waited_seconds'), 0)} s; load1 when rep 0"
+        f" was admitted: {fmt(admitted.get('load1'), 2)}. The bound is R-N81's"
+        f" absolute load1 < {fmt(report.get('load_limit'), 1)}; it is not scaled to"
+        f" this rig's {identity.get('cpu_physical_cores', 'n/a')} physical cores.",
     ]
 
 
@@ -1101,6 +1265,8 @@ def evidence(report: dict[str, object]) -> str:
     gate = report["gate"]
     lines = []
     title = f"# R23 gate (a) B/A sample for #88 - {report['stamp']}"
+    if not dry:
+        title += f" - rig {report.get('rig')}, role {report.get('rig_role')}"
     if aborted:
         title += " (ABORTED)"
     elif dry:
@@ -1149,6 +1315,7 @@ def evidence(report: dict[str, object]) -> str:
         result = (
             f"**Informational result for B, not an R23 gate verdict:**"
             f" {gate['verdict']}. Rule: {gate['rule']}."
+            f" Sample from {rig_text(report, gate)}."
         )
         quiet = f"coordinator-quiet: `{report['coordinator_quiet']}`" + (
             " (acknowledged only; an under-load sample is not R-N91 gated)"
@@ -1157,8 +1324,10 @@ def evidence(report: dict[str, object]) -> str:
         )
     else:
         result = (
-            f"**R23 gate verdict for B: {gate['verdict']}** ({gate['b_reps_pass']}/"
-            f"{gate['b_reps']} B reps pass). Rule: {gate['rule']}."
+            f"**R23 gate verdict for B: {gate['verdict']}"
+            + ("" if dry else f", {rig_text(report, gate)}")
+            + f"** ({gate['b_reps_pass']}/{gate['b_reps']} B reps pass)."
+            f" Rule: {gate['rule']}."
         )
         quiet = (
             f"coordinator-quiet acknowledged: `{report['coordinator_quiet']}` (R-N91)"
@@ -1187,6 +1356,7 @@ def evidence(report: dict[str, object]) -> str:
         f" `{report.get('sealed_identity', 'n/a')}`.",
         f"- Work root: `{report['work_root']}`.",
         *identity_lines(report.get("host_identity")),
+        *build_settle_lines(report),
         f"- rclone: `{report['rclone']}` ({report.get('rclone_version', 'n/a')}), the r23-2026-09-18 flags.",
         "- Page cache: never dropped. The bench reads the whole source (BLAKE3) before"
         " every arm, so every timed arm starts source-hot. Residency is logged for the"
@@ -1316,6 +1486,15 @@ def evidence(report: dict[str, object]) -> str:
         "- Walk: walk-ahead wait keys found (#112):"
         f" `{sorted({k for r in report['reps'] for k in r['summary']['walk_ahead_wait_keys']})}`.",
         "- Gate (a) is single-host (R-N134: no cross-host run before W5).",
+        "- Seal: the native arm's per-file seal in this sample was"
+        f" `{report.get('seal_primitive') or 'not printed by this build'}` (bench"
+        " header `seal_primitive`, durability"
+        f" `{report.get('durability') or 'n/a'}`). In group mode that is `fsync` on"
+        " Linux, which makes data and metadata durable and flushes the device"
+        " cache, and `F_BARRIERFSYNC` on macOS, which orders the writes without"
+        " that flush. The rclone arm is run with no sync flag on either platform."
+        " So a native-to-rclone ratio from a Linux rig and one from a macOS host"
+        " time different durability work and are not the same test.",
         "- Raw bench stdout/stderr: `logs/` under the work root; every counter in `r23-ab.json`.",
         "",
     ]
@@ -1349,13 +1528,22 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
         header = first["parsed"]["header"]
         report["sealed_identity"] = header.get("sealed_corpus_blake3")
         report["rclone_version"] = header.get("rclone_version")
+    b_first = next(
+        (r for r in reps if r["label"] == "B" and r["parsed"].get("header")), None
+    )
+    if b_first:
+        report["seal_primitive"] = b_first["parsed"]["header"].get("seal_primitive")
+        report["durability"] = b_first["parsed"]["header"].get("durability")
     report["gate"] = gate_rollup(report)
     (work / "r23-ab.json").write_text(json.dumps(report, indent=2, default=str))
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text(evidence(report))
     say(
-        f"status={report['status']} gate={report['gate']['verdict']} "
-        f"json={work / 'r23-ab.json'} evidence={evidence_path}"
+        f"status={report['status']} rig={report.get('rig')}"
+        f" rig_role={report.get('rig_role')}"
+        f" of_record={str(report['gate']['of_record']).lower()}"
+        f" json={work / 'r23-ab.json'} evidence={evidence_path}"
+        f" gate={report['gate']['verdict']}"
     )
 
 
@@ -1415,6 +1603,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help=NOT_GATE)
     parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="build B, A and V4 into --build-root and exit; not a sample."
+        " Run it before a gated sample so that no compile runs inside one",
+    )
+    parser.add_argument(
         "--b-only-no-a-control",
         action="store_true",
         help=f"{NO_A_CONTROL}: gated B/B/B with no A rep, for a rig where the"
@@ -1464,6 +1658,29 @@ def main(argv: list[str] | None = None) -> int:
         say("refused: --no-a-control-reason needs --b-only-no-a-control")
         return 2
     pattern = B_ONLY_PATTERN if no_a else args.pattern
+    revisions = [("B", args.rev_b)]
+    if not no_a:
+        revisions.append(("A", args.rev_a))
+    if args.rev_v4:
+        revisions.append(("V4", args.rev_v4))
+    if args.build_only:
+        if args.dry_run or args.under_load:
+            say("refused: --build-only takes neither --dry-run nor --under-load")
+            return 2
+        work.mkdir(mode=0o700)
+        (work / "build-src").mkdir()
+        root = Path(args.build_root) if args.build_root else repo / "target" / "r23-ab"
+        root.mkdir(parents=True, exist_ok=True)
+        for label, rev in revisions:
+            info = build(repo, rev, root, work / "build-src", args.build_jobs)
+            say(
+                f"built label={label} sha={str(info['sha'])[:12]}"
+                f" sha256={str(info['sha256'])[:16]}"
+                f" compiled={str(bool(info.get('compiled_in_this_run'))).lower()}"
+                f" binary={info['binary']}"
+            )
+        say("status=built-not-a-sample (no rep ran; let the host go quiet again)")
+        return 0
     system = platform.system()
     if not args.dry_run:
         if system not in ("Darwin", "Linux"):
@@ -1479,6 +1696,21 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 2
     sealed = Path(args.corpus or DEFAULT_CORPUS).resolve()
+    identity = host_identity(work.parent)
+    rig = rig_name(identity.get("node"))
+    role, role_problem = rig_role(identity)
+    if not args.dry_run and not args.under_load:
+        # OI-1003-Q97: a gated sample must say exactly which rig it is from.
+        missing = [k for k in IDENTITY_REQUIRED if identity.get(k) in (None, "")]
+        if missing:
+            say(
+                "refused: a gated sample must name its rig; host_identity has no"
+                f" {', '.join(missing)}"
+            )
+            return 2
+        if role_problem:
+            say(f"refused: {role_problem}")
+            return 2
     if not args.dry_run:
         # OI-1003-Q39: an under-load sample runs with the lanes as they are.
         if not args.coordinator_quiet and not args.under_load:
@@ -1514,10 +1746,16 @@ def main(argv: list[str] | None = None) -> int:
             / (
                 f"r23-underload-{stamp}.md"
                 if args.under_load
-                else (f"r23-{stamp}-no-a-control.md" if no_a else f"r23-{stamp}.md")
+                else f"r23-{stamp}-{rig}-{role}{'-no-a-control' if no_a else ''}.md"
             )
         )
     )
+    if not args.dry_run and not args.under_load and rig not in evidence_path.name:
+        say(
+            "refused: gated evidence must carry its rig's name so it is never read"
+            f" as another rig's: {evidence_path.name} lacks {rig}"
+        )
+        return 2
     if no_a and "no-a-control" not in evidence_path.name:
         say(
             "refused: evidence of a sample without its A control must be named"
@@ -1557,11 +1795,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     build_root.mkdir(parents=True, exist_ok=True)
     scratch = work / "build-src"
-    builds = {"B": build(repo, args.rev_b, build_root, scratch, args.build_jobs)}
-    if not no_a:
-        builds["A"] = build(repo, args.rev_a, build_root, scratch, args.build_jobs)
-    if args.rev_v4:
-        builds["V4"] = build(repo, args.rev_v4, build_root, scratch, args.build_jobs)
+    builds = {
+        label: build(repo, rev, build_root, scratch, args.build_jobs)
+        for label, rev in revisions
+    }
+    # Read apart from conditions(): this is a record, not a gate check.
+    post_build = {
+        "utc": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "load1": round(os.getloadavg()[0], 2),
+    }
     if not args.dry_run and system == "Linux":
         # OI-1003-Q96: which builds read sysfs themselves. B must; an
         # informational baseline that does not runs behind the pmset shim.
@@ -1586,7 +1828,11 @@ def main(argv: list[str] | None = None) -> int:
         else ("under-load" if args.under_load else "gated"),
         "host": platform.node(),
         "platform": platform.platform(),
-        "host_identity": host_identity(work.parent),
+        "host_identity": identity,
+        "rig": rig,
+        "rig_role": role,
+        "rig_of_record_hosts": sorted(RIG_OF_RECORD),
+        "post_build": post_build,
         "coordinator_quiet": args.coordinator_quiet,
         "coordinator_quiet_meaning": (
             "acknowledged only; an under-load sample is not R-N91 gated (OI-1003-Q39)"
@@ -1614,7 +1860,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         # Gated: AC and load1 < 2.5. Under load: AC power once before the
         # first rep; the load gate alone is lifted (OI-1003-Q39).
-        deadline = time.monotonic() + args.settle_seconds
+        started = time.monotonic()
+        deadline = started + args.settle_seconds
         while not host_ready(now := conditions(), args.under_load):
             if time.monotonic() > deadline:
                 report["status"], report["reason"] = (
@@ -1624,6 +1871,10 @@ def main(argv: list[str] | None = None) -> int:
                 finish(report, work, evidence_path)
                 return 2
             time.sleep(15)
+        report["settle"] = {
+            "waited_seconds": round(time.monotonic() - started),
+            "admitted": now,
+        }
     order = [(label, False) for label in pattern]
     if args.rev_v4:
         order.append(("V4", True))

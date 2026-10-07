@@ -157,6 +157,23 @@ const POWER_PROBE: &str = if cfg!(target_os = "linux") {
     "none"
 };
 
+/// The per-file seal the native arm issues under `durability`, by name.
+///
+/// It mirrors `bulkload_agent::durable::seal_file` and must change with it:
+/// group mode is `F_BARRIERFSYNC` on Apple targets and `fsync` elsewhere
+/// (data and metadata durable, with a device cache flush on Linux); strict
+/// mode is `F_FULLFSYNC` on Apple targets and `fsync` elsewhere. The rclone
+/// arm is run with no sync flag, so what the native arm pays for durability
+/// differs by platform and a sample must say which seal it timed
+/// (OI-1003-Q97).
+const fn seal_primitive(durability: Durability) -> &'static str {
+    match durability {
+        Durability::Group if cfg!(target_vendor = "apple") => "F_BARRIERFSYNC",
+        Durability::Strict if cfg!(target_vendor = "apple") => "F_FULLFSYNC",
+        Durability::Group | Durability::Strict => "fsync",
+    }
+}
+
 fn pmset_power() -> &'static str {
     Command::new("pmset")
         .args(["-g", "batt"])
@@ -860,7 +877,7 @@ fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
 
 fn print_header(cli: &Cli, fixture: &Fixture, rclone_identity: &str) {
     println!(
-        "benchmark revision={} durability={} priority={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={} power_probe={POWER_PROBE} os={} arch={}",
+        "benchmark revision={} durability={} priority={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={} power_probe={POWER_PROBE} os={} arch={} seal_primitive={}",
         cli.revision,
         cli.durability,
         cli.priority.label(),
@@ -873,6 +890,7 @@ fn print_header(cli: &Cli, fixture: &Fixture, rclone_identity: &str) {
         fixture.seed_received,
         std::env::consts::OS,
         std::env::consts::ARCH,
+        seal_primitive(cli.durability),
     );
     if let Some(rclone) = &cli.rclone {
         println!(
@@ -1261,6 +1279,17 @@ mod tests {
         let silent: Supply = ("ADP1", Some("Mains"), None, None, None);
         assert_eq!(linux_power(fake_sysfs(&[silent, full])?.path()), "battery");
         Ok(())
+    }
+
+    #[test]
+    fn seal_primitive_names_this_platforms_seal() {
+        let group = seal_primitive(Durability::Group);
+        let strict = seal_primitive(Durability::Strict);
+        if cfg!(target_vendor = "apple") {
+            assert_eq!((group, strict), ("F_BARRIERFSYNC", "F_FULLFSYNC"));
+        } else {
+            assert_eq!((group, strict), ("fsync", "fsync"));
+        }
     }
 
     #[test]
