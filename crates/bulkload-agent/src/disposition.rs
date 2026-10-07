@@ -502,13 +502,21 @@ pub fn record(path: &Path, plan: &Path, source_label: &str, row: Row) -> Result<
         .custom_flags(libc::O_NOFOLLOW)
         .open(sibling(".lock"))
         .refuse_at("disposition::record")?;
-    // SAFETY: `lock` owns its descriptor for the whole call, so the lock is
-    // held until it drops at return; flock has no memory effects.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        return Err(crate::refuse::io(
-            &std::io::Error::last_os_error(),
-            "disposition::record",
-        ));
+    // Wait for the lock instead of failing at once (#200). Another recorder
+    // holds it only for one append, and a child forked by any thread of this
+    // process holds a copy of the descriptor from fork until its exec closes
+    // it (O_CLOEXEC), so a non-blocking attempt could fail with EWOULDBLOCK
+    // while no recorder was running at all, and surface as a bare IO.
+    loop {
+        // SAFETY: `lock` owns its descriptor for the whole call, so the lock
+        // is held until it drops at return; flock has no memory effects.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(crate::refuse::io(&error, "disposition::record"));
+        }
     }
     let mut ledger = if path.try_exists().refuse_at("disposition::record")? {
         Ledger::read_bound(path, plan, &digest, source_label)?
@@ -790,6 +798,48 @@ mod tests {
     // The ledger binds the plan's bytes, and `record` reads the plan for
     // every row: a policy row cannot be recorded against a path that holds
     // no plan, and a ledger does not follow a path to another plan.
+    /// #200: a recorder that meets the ledger lock held (by another
+    /// recorder, or by a descriptor copy a fork has not closed yet) waits for
+    /// it instead of failing with a bare IO (`EWOULDBLOCK`).
+    #[test]
+    fn a_held_ledger_lock_is_waited_for_not_refused() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let (plan, _) = plan_with(root.path(), "plan", "s1");
+        let ledger = root.path().join("reviews");
+        let row = || {
+            Row::new(
+                Scope::Policy,
+                "GIT_NEST_STASHED",
+                Decision::Accept,
+                "jess",
+                "2026-10-07",
+            )
+            .unwrap()
+        };
+        let mut lock_path = ledger.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(PathBuf::from(lock_path))
+            .unwrap();
+        // SAFETY: `holder` owns its descriptor until it drops below.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let waiting = {
+            let (ledger, plan) = (ledger.clone(), plan.clone());
+            std::thread::spawn(move || record(&ledger, &plan, "neo", row()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!waiting.is_finished(), "the recorder waits for the lock");
+        drop(holder);
+        let recorded = waiting.join().unwrap().unwrap();
+        assert_eq!(recorded.rows.len(), 1);
+        assert_eq!(Ledger::read(&ledger, &plan, "neo").unwrap().rows.len(), 1);
+    }
+
     #[test]
     fn a_ledger_is_bound_to_the_plan_bytes_not_only_its_path() {
         let root = tempfile::tempdir().unwrap();

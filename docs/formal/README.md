@@ -1362,6 +1362,10 @@ models v1 git carry's custody of what a capture depends on:
   since lane L6b, `decide::Policy::CODE`);
 - crashes between the bundle, its sidecars and the `{item}.capture`
   record;
+- lane L7's reuse manifest (`{bundle}.reuse`, `publish_reuse`), as a file
+  that exists or not, published after the dependency sidecars and before
+  the record (`ReuseSidecar`; the constant `ReuseManifest` turns the step
+  on);
 - content names: a bundle's CORPUS name is its digest, so a re-export of
   the same content lands on the same file. `publish_bundle` and
   `prepare_base` reuse it, link a deleted one again, or refuse
@@ -1402,7 +1406,7 @@ catalogue cites `write_capture`, and decide.rs's `decide`, `Rebase` and
 | Decision core of record | Rust [`git_carry/decide.rs`](../../crates/bulkload-agent/src/git_carry/decide.rs), lane L6a | A pure, total `decide(&Inputs) -> Decision`. It replaced the logic of `ExportOptions{prerequisite, chain}`: the "Ignored when prerequisite is set" rule (`chain_offer`'s filter), `chainable`'s rules and `export_pass`'s match. `prepare_base`, `capture_item` and the writer `shared::write_capture` call it and act on the decision. | P67 |
 | Reference decision core, a differential oracle | Haskell `decide` in [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | Derived by hand from the v1 rules at main and Q46's re-root policy. It renders 363 pinned rows to [`crates/bulkload-agent/tests/data/decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv), which L6's fixed-seed property test (P67) checks the Rust `decide` against. | `just formal-nv` (`rows --check`) |
 | Typed closed unions | Dhall: `Basis`, `Rebase`, `ReuseEligibility`, `Refusal`, `Decision` in [`catalogue/Types.dhall`](catalogue/Types.dhall) | The labels of what `decide` returns. Each union's table is merged over the union, so the label lists hold exactly its labels. `formal-nv` requires GitCarryCore's constructors (`schema`, from total case analyses, not a literal list) to equal them; `tla-check` requires GitCarry.tla's `Decisions`, `Bases`, `Rebases`, `Reuses` and `Refusals` sets to equal them. | `just formal-nv`, `just tla-check` |
-| Custody and crash order | TLA+ with TLC: [`GitCarry.tla`](GitCarry.tla) | Seven safety invariants and one liveness property over chain links, the plan base, GC and crash order. TLC checks only this; the decision's own rules are the pinned rows' job. | `just tla-check` |
+| Custody and crash order | TLA+ with TLC: [`GitCarry.tla`](GitCarry.tla) | Eight safety invariants and one liveness property over chain links, the plan base, GC, the reuse manifest and crash order. TLC checks only this; the decision's own rules are the pinned rows' job. | `just tla-check` |
 | Explorer parity | Haskell `explore` in GitCarryCore.hs | An explicit-state BFS of GitCarry.tla whose capture step calls the Haskell `decide`. It must reach TLC's state counts, so TLC's `DecideCore` and the Haskell `decide` agree on every input reachable in those bounds. | `just formal-nv` |
 
 This widens OI-1003-Q32 for this layer. Haskell is no longer only a second
@@ -1535,7 +1539,8 @@ of every closed union is reached by some row. P67 draws `-` inputs. `rows
 | `BrokenLinkNeverReuseHit` | A capture never reuses a record whose custody is broken: a missing or rewritten link, a lost base, a missing sidecar. | S3, S4 | OI-1003-Q15, R-N72 | `retained_capture`, `chain_links`, `LinkBinding`, `decide`, `Inputs` | P42, P67 |
 | `BaseNotReplacedWhileDepended` | The plan base record never moves while a record depends on its base. | S4 | OI-1003-Q15, R-N72 | `prepare_base`, `retained_base`, `requires_base`, `write_new` | P68 |
 | `GCNeverDeletesDepended` | GC never removes a bundle that a record or the base record depends on. GC's own choice is definitional (it collects one bundle that nothing depends on per step); what the invariant checks is that no later step makes a record depend on a collected bundle. It holds only with one CORPUS writer at a time: L8's GC must take a CORPUS-level exclusive lock that every capture and every apply also take. | S4 | OI-1003-Q46 | `chain_links` (STATE and CORPUS GC L8; GC's CORPUS-level exclusive lock L8) | P71 |
-| `SidecarsBeforeRecord` | A record names a published bundle whose dependency sidecars exist. | Durability, S4 | OI-1003-Q15, R-N86 | `capture_item`, `publish_bundle`, `publish_prior`, `publish_sidecars` (the `.reuse` sidecar L7) | P70 |
+| `SidecarsBeforeRecord` | A record names a published bundle whose dependency sidecars exist. | Durability, S4 | OI-1003-Q15, R-N86 | `capture_item`, `publish_bundle`, `publish_prior`, `publish_sidecars` | P70 |
+| `ReuseManifestBeforeRecord` | Lane L7: a record names a bundle whose reuse manifest (`{bundle}.reuse`) exists, so the pass after any crash reuses that capture's blobs from its manifest and does not fetch the bundle to learn what it holds. No restore and no decision reads the manifest (`ApplyOutcome` and `DecideCore` do not mention it), so either order restores; the invariant is the order's own claim. Checked where `ReuseManifest = TRUE` (`MC_gc_reuse`); vacuous elsewhere. That a manifest matches its bundle, and that reuse reads no bundle byte, are P70's and P69's (Rust). | Durability, S3 | OI-1003-Q42, OI-1003-Q45, OI-1003-Q94 | `capture_item`, `publish_reuse`, `ReuseManifest`, `reuse_sidecar`, `retained_manifest`, `reuse_offer`, `manifest_blobs`, `ManifestSeat` | P70, P69 |
 | `RestoreOrRecapture` | Every record restores, or its item's next capture recaptures, or it refuses by name and keeps the missing custody visible. An export whose content name holds rewritten bytes ends in `publish_bundle`'s `DIGEST_MISMATCH`, a refusal by name, so it counts. An apply that does not restore is a typed refusal, never a bare IO. | S4, S5 | OI-1003-Q1, OI-1003-Q46, R-N72 | `apply_item`, `import_base`, `stage_base`, `stage_bundle`, `retained_capture`, `bound_base` (GC L8) | P68, P69, P71 |
 | `ChainRecovery` | Under `WF_vars(Protocol)`, once the environment stops, every item whose record does not restore (or has none) gets one that does. Claimed where damage only deletes bundles and never reaches a base (`MC_gc_live`); a bundle rewritten in place defeats it while the source holds still (`MC_gc_live_rewritten`, [Findings](#findings)). | S4, S5 | OI-1003-Q46 | `chainable`, `retained_capture`, `publish_bundle`, `prepare_base` (the re-root window L8) | P71, P68 |
 
@@ -1555,6 +1560,7 @@ job (P64, lane L1).
 | `skip_flatten_verify` | `chain::flatten` restores without checking digests, the oldest link or prerequisites | `PrereqsSatisfiedByEarlierLinks` |
 | `hit_ignores_chain` | `retained_capture` drops `restorable` | `BrokenLinkNeverReuseHit`; also `RestoreOrRecapture` (`MC_gc_neg_hit_ignores_chain_restore`) |
 | `reroot_pre_mismatch` | A re-root declares the head's tips in its header while its `.prior` names the root: L8 deriving `ExportOptions.chain` and the link `Prior` from different chain paths | `PrereqsSatisfiedByEarlierLinks` |
+| `reuse_after_record` | `capture_item` writes the record before `publish_reuse` (lane L7) | `ReuseManifestBeforeRecord` |
 
 The plan named five mutations. `hit_ignores_chain` is a sixth: none of the
 five can reach `BrokenLinkNeverReuseHit`. The catalogue asserts, as for
@@ -1567,7 +1573,11 @@ model can say only because a bundle's declared prerequisites (`pre`) and
 its `.prior` are separate fields. `RestoreOrRecapture` has one fail row,
 `MC_gc_neg_hit_ignores_chain_restore`; the finding
 `MC_gc_base_missing_untyped` was its second until lane L6b fixed the code
-(#181), and is now an expected pass. `MC_gc_neg_base_replaced_live` runs at one
+(#181), and is now an expected pass. `reuse_after_record` is an eighth
+(lane L7): it reverses the manifest's order, and
+`MC_gc_neg_reuse_after_record` fails `ReuseManifestBeforeRecord` in the
+state after the record, before the manifest step runs.
+`MC_gc_neg_base_replaced_live` runs at one
 commit: a base exported again at the same tip has the same content name,
 so it is the same file, and only a later tip can replace it.
 
@@ -1614,6 +1624,30 @@ unchanged (only the comments of `MC_gc_grouped`, `MC_gc_fix2` and
 keeps their run of record. `just tla-render --check` found all 68 files
 current, and `rows --check` found the 363 pinned rows byte-identical.
 
+L7's check (2026-10-07, sting): lane L7 lands the reuse manifest
+(`{bundle}.reuse`), so the model gains the variable `manifest`, the action
+`ReuseSidecar`, the constant `ReuseManifest`, the invariant
+`ReuseManifestBeforeRecord` and the mutation `reuse_after_record`. The
+constant is `FALSE` in every row that existed, so each keeps its state
+count of record (and the explorer's presets their pins); the step is
+checked in two new rows, `MC_gc_reuse` and `MC_gc_neg_reuse_after_record`.
+One `just tla-check` run over all 25 GitCarry rows (04:24 to 04:41 EDT,
+1,009 s, peak RSS 1,792 MiB) matched every expectation: 10 PASS, 3
+REACHED, 11 FAIL and the INCONCLUSIVE self-test. Every pass row's distinct
+and generated counts equal the table's, and its never-enabled actions
+equal its `never` column, which now lists `ReuseSidecar` wherever the
+constant is off. The grounding step found 33 operators, 15 constants, 8
+mutations, 5 label sets and 38 code symbols for GitCarry.tla (L7's
+`publish_reuse`, `ReuseManifest`, `reuse_sidecar`, `retained_manifest`,
+`reuse_offer`, `manifest_blobs` and `ManifestSeat` among them) and printed
+4 pending ones, all L8's: L7's pending symbol (the `.reuse` sidecar) is
+grounded. `just tla-render --check` found all 81 files current. `just
+formal-nv` matched all 67 rows, 0 differing; `rows --check` found the 363
+pinned rows byte-identical (the reference `decide` did not change: the
+manifest is no input of the decision), and the schema check passed (5
+unions). The two new rows below are that run's; the others keep their run
+of record.
+
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
 | `MC_gc_budget_selftest` | i1 L2 W4 gc C4 R1 X1 D1 budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 39,368 | 75,847 | 16 | 6s | 678 |
@@ -1624,6 +1658,7 @@ current, and `rows --check` found the 363 pinned rows byte-identical.
 | `MC_gc_reroot` | i1 L1 W4 gc C4 R1 X1 D1 | pass | **PASS** | – | 675,517 | 1,552,268 | 39 | 122s | 1763 |
 | `MC_gc_reroot_extended` | i1 L2 W5 gc C4 R1 X1 D1 | pass | **PASS** | – | 706,430 | 1,623,586 | 39 | 118s | 1717 |
 | `MC_gc_fix2_deep` | i1,i2 L2 W3 cub gc C2 X1 D1 db typed | pass | **PASS** | – | 366,285 | 736,323 | 39 | 117s | 1787 |
+| `MC_gc_reuse` | as `MC_gc_fix2`, `ReuseManifest` (L7's check) | pass | **PASS** | – | 588,517 | 1,148,997 | 47 | 142s | 1695 |
 | `MC_gc_live` | i1 L2 W4 gc C3 R1 X1 D1 deletes, `LiveSpec` | pass | **PASS** | – | 61,792 | 125,732 | 32 | 304s | 1543 |
 | `MC_gc_reach_reroot_extended` | as `MC_gc_reroot_extended` | reach | **REACHED** | `Witness_RerootExtended` | 240,683 | 463,116 | 23 | 25s | 1586 |
 | `MC_gc_reach_second_reroot` | as `MC_gc_reroot` | reach | **REACHED** | `Witness_SecondReroot` | 62,105 | 119,114 | 18 | 7s | 683 |
@@ -1639,6 +1674,7 @@ current, and `rows --check` found the 363 pinned rows byte-identical.
 | `MC_gc_neg_hit_ignores_chain` | i1 L2 C1 D1 | fail | **FAIL** | `BrokenLinkNeverReuseHit` | 69 | 104 | 13 | 2s | 351 |
 | `MC_gc_neg_hit_ignores_chain_restore` | i1 L2 C1 D1 | fail | **FAIL** | `RestoreOrRecapture` | 69 | 104 | 13 | 2s | 329 |
 | `MC_gc_neg_reroot_pre_mismatch` | i1 L1 W3 C2 | fail | **FAIL** | `PrereqsSatisfiedByEarlierLinks` | 41 | 56 | 14 | 3s | 343 |
+| `MC_gc_neg_reuse_after_record` | i1 L2 C1 `ReuseManifest` (L7's check) | fail | **FAIL** | `ReuseManifestBeforeRecord` | 11 | 11 | 5 | 1s | 319 |
 
 The self-test's row is the second invocation's; the first's tripped at
 36,610 distinct states.
@@ -1669,7 +1705,10 @@ Reading the table:
   - `MC_gc_grouped`: `GC`, `Rewrite`;
   - `MC_gc_fix2` and `MC_gc_fix2_deep`: `Rewrite`.
 
-  Every action is enabled in some pass row.
+  Since lane L7 each of those rows also never enables `ReuseSidecar`
+  (`ReuseManifest = FALSE`), as does `MC_gc_base_missing_untyped`;
+  `MC_gc_reuse` never enables `Rewrite` alone. Every action is enabled in
+  some pass row.
 - **Bounds.** `MC_gc_fix2` was first drafted at `L2 W4 C3`, on two items
   with every fault. Its budget tripped at 600 s after 2,462,299 distinct
   states (a scratch run of the first round's model, not a result), so it
@@ -1694,6 +1733,11 @@ Built with `ghc -O1` on sting:
 | `gc_reroot` (`MC_gc_reroot`) | 675,517, 1,552,268, 39 | 675,517, 1,552,268, 39 | as `gc_q46` | yes |
 | `gc_reroot_extended` (`MC_gc_reroot_extended`) | 706,430, 1,623,586, 39 | 706,430, 1,623,586, 39 | as `gc_q46` | yes |
 | `gc_fix2_deep` (`MC_gc_fix2_deep`) | 366,285, 736,323, 39 | 366,285, 736,323, 39 | `Hit`, `Export:Base:NoRebase`, `Export:BaseAndChain:NoRebase`, `Refuse:ReceiptBindingInvalid` | yes |
+
+`MC_gc_reuse` has no preset, so `formal-nv` does not pin it. By hand
+(2026-10-07, `explore --preset gc_fix2 --reuse-manifest true`, 33 s) the
+explorer reached TLC's 588,517 distinct states, 1,148,997 generated and 47
+levels with no invariant violated.
 
 The generated counts match too. GitCarry.tla writes a guard that chooses no
 successor as an `IF`, never as a disjunction, because TLC branches on every
@@ -1721,6 +1765,7 @@ same first invariant after the same number of states:
 | `MC_gc_neg_hit_ignores_chain` | `BrokenLinkNeverReuseHit`, 10 | `BrokenLinkNeverReuseHit`, 10 | `BrokenLinkNeverReuseHit`, 10 |
 | `MC_gc_neg_hit_ignores_chain_restore` | `RestoreOrRecapture`, 10 | (an `also` row) | |
 | `MC_gc_neg_reroot_pre_mismatch` | `PrereqsSatisfiedByEarlierLinks`, 14 | `PrereqsSatisfiedByEarlierLinks`, 14 | `PrereqsSatisfiedByEarlierLinks`, 14 |
+| `MC_gc_neg_reuse_after_record` (L7's run, 2026-10-07) | `ReuseManifestBeforeRecord`, 4 | `ReuseManifestBeforeRecord`, 4 | `ReuseManifestBeforeRecord`, 4 |
 
 Every primary row stops first at its own verdict. Two counterexamples also
 violate `RestoreOrRecapture` in their last state:
@@ -1818,8 +1863,16 @@ differed.
 - **STATE GC.** STATE attempt directories are never depended on, because
   `publish_bundle` and `prepare_base` hard-link into CORPUS. So collecting
   them under the lock cannot break custody, and they are not modelled.
-- **Sidecar damage, the `.reuse` sidecar (L7), torn writes.** Every
-  durable write is atomic (`estate::write`). Only bundle files are damaged.
+- **Sidecar damage, torn writes.** Every durable write is atomic
+  (`estate::write`). Only bundle files are damaged.
+- **What a reuse manifest lists, and what a pass reuses from it** (L7).
+  The manifest is a file that exists or not. The model checks its order
+  against the record (`ReuseManifestBeforeRecord`) and nothing else: a
+  manifest bound to another bundle, one that does not decode, the
+  presence check on the source and the bytes a reuse reads are P70's and
+  P69's (Rust). A manifest a crash leaves without a record is harmless
+  there for the same reason: nothing reads it without the record that
+  names its bundle.
 - **Bare captures** (#172). `apply_item` refuses a bare capture planned with
   a workspace (`refuse_bare_capture`), before any chain or base step. That
   is a typed refusal outside custody.

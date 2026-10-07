@@ -515,6 +515,7 @@ let GcMutation =
       | skip_flatten_verify
       | hit_ignores_chain
       | reroot_pre_mismatch
+      | reuse_after_record
       >
 
 -- GitCarry.tla's properties: its safety invariants, its budget and ChainRecovery.
@@ -526,6 +527,7 @@ let GcProperty =
       | BaseNotReplacedWhileDepended
       | GCNeverDeletesDepended
       | SidecarsBeforeRecord
+      | ReuseManifestBeforeRecord
       | RestoreOrRecapture
       | WithinBudget
       | ChainRecovery
@@ -551,7 +553,7 @@ let gcWitnessTable =
 
 let gcWitnessSelf = \(w : GcWitness) -> merge gcWitnessTable w
 
--- The 11 actions of GitCarry.tla's Next, in the sorted order of the never column.
+-- The 12 actions of GitCarry.tla's Next, in the sorted order of the never column.
 let GcAction =
       < Advance
       | BaseRecord
@@ -561,6 +563,7 @@ let GcAction =
       | GC
       | Publish
       | Record
+      | ReuseSidecar
       | Rewrite
       | Sidecars
       | StartBase
@@ -580,6 +583,7 @@ let GcConstants =
       , DamageBase : Bool
       , DamageRewrites : Bool
       , BaseMissingTyped : Bool
+      , ReuseManifest : Bool
       , Mutation : Optional GcMutation
       , BudgetSeconds : Natural
       }
@@ -675,19 +679,24 @@ let gcPropertyTable =
         , index = 6
         , class = PropertyClass.safety
         }
+      , ReuseManifestBeforeRecord =
+        { property = GcProperty.ReuseManifestBeforeRecord
+        , index = 7
+        , class = PropertyClass.safety
+        }
       , RestoreOrRecapture =
         { property = GcProperty.RestoreOrRecapture
-        , index = 7
+        , index = 8
         , class = PropertyClass.safety
         }
       , WithinBudget =
         { property = GcProperty.WithinBudget
-        , index = 8
+        , index = 9
         , class = PropertyClass.budget
         }
       , ChainRecovery =
         { property = GcProperty.ChainRecovery
-        , index = 9
+        , index = 10
         , class = PropertyClass.temporal
         }
       }
@@ -718,6 +727,7 @@ let gcMutationIndex =
           , skip_flatten_verify = 4
           , hit_ignores_chain = 5
           , reroot_pre_mismatch = 6
+          , reuse_after_record = 7
           }
           m
 
@@ -732,9 +742,10 @@ let gcActionTable =
       , GC = { action = GcAction.GC, index = 5 }
       , Publish = { action = GcAction.Publish, index = 6 }
       , Record = { action = GcAction.Record, index = 7 }
-      , Rewrite = { action = GcAction.Rewrite, index = 8 }
-      , Sidecars = { action = GcAction.Sidecars, index = 9 }
-      , StartBase = { action = GcAction.StartBase, index = 10 }
+      , ReuseSidecar = { action = GcAction.ReuseSidecar, index = 8 }
+      , Rewrite = { action = GcAction.Rewrite, index = 9 }
+      , Sidecars = { action = GcAction.Sidecars, index = 10 }
+      , StartBase = { action = GcAction.StartBase, index = 11 }
       }
 
 let gcActionIndex = \(a : GcAction) -> (merge gcActionTable a).index
