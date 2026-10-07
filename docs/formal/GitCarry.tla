@@ -38,8 +38,8 @@
 (*     Q46's re-root policy (RootWindow > 0, no code yet: lane L8).        *)
 (*   - Q46's CORPUS GC between passes (GCOn, no code yet: lane L8), one    *)
 (*     bundle per step.                                                    *)
-(*   - L6b's fix 2, a chain kept under a plan base (ChainUnderBase, no     *)
-(*     code yet).                                                          *)
+(*   - L6b's fix 2, a chain kept under a plan base (ChainUnderBase; the   *)
+(*     code's only policy since lane L6b).                                 *)
 (*   - Crashes of the capture host between any two durable steps, in      *)
 (*     particular between the sidecars and the record.                    *)
 (*   - Third-party damage to CORPUS: a bundle deleted, or rewritten in     *)
@@ -134,9 +134,9 @@ CONSTANTS
     MaxDamage,        \* third-party deletes or rewrites of CORPUS bundles
     DamageBase,       \* damage may reach a plan base bundle
     DamageRewrites,   \* damage may rewrite a bundle in place (else it deletes)
-    BaseMissingTyped, \* apply refuses a missing plan base by name (an
-                      \* assumption the code does not meet: import_base
-                      \* stages it with a bare IO; README)
+    BaseMissingTyped, \* apply refuses a missing plan base by name, as the
+                      \* code does since lane L6b (stage_base, #181);
+                      \* FALSE is the bare IO before it (README)
     Mutation,         \* "none", or one deliberate rule break
     BudgetSeconds     \* wall-clock budget, checked by WithinBudget
 

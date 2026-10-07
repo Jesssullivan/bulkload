@@ -1358,7 +1358,8 @@ models v1 git carry's custody of what a capture depends on:
   tips as prerequisites (WP2, `{bundle}.prior`), and the chain's depth
   (`CHAIN_DEPTH_LIMIT`);
 - Q46's re-root policy and CORPUS GC (lane L8, no code yet);
-- L6b's fix 2, a chain kept under a plan base (no code yet);
+- L6b's fix 2, a chain kept under a plan base (the code's only policy
+  since lane L6b, `decide::Policy::CODE`);
 - crashes between the bundle, its sidecars and the `{item}.capture`
   record;
 - content names: a bundle's CORPUS name is its digest, so a re-export of
@@ -1469,7 +1470,8 @@ source's tips only when the decision rests on them, exactly where v1 did.
 Each stage is a function of `decide.rs` that takes its lazy read as a
 callback (`decide_recorded`, `decide_offered`), so P67 checks that the
 stages the code runs, composed, decide what one call on all the inputs
-decides. An estate test drives the bound-base read through `capture`
+decides, under the code's policy (fix 2, `Policy::CODE`) and under v1's.
+An estate test drives the bound-base read through `capture`
 itself: a retained based bundle bound to a lost base refuses
 `RECEIPT_BINDING_INVALID` while the group's regenerated base is retained.
 
@@ -1510,8 +1512,8 @@ flattens both links.
 
 | Lane | Policy | Rows |
 |---|---|---:|
-| `v1` | main's behaviour: depth limit 8, no re-root, no chain under a base | 79 |
-| `L6b` | fix 2: a chain kept under a plan base | 85 |
+| `v1` | the code before L6b: depth limit 8, no re-root, no chain under a base | 79 |
+| `L6b` | fix 2, the code's policy (`Policy::CODE`): a chain kept under a plan base | 85 |
 | `L8` | Q46: root window 27 (a row parameter, not a ruling), fix 2 | 199 |
 
 Each row covers a family: a lost base; no record or a gone bundle; the hit
@@ -1529,12 +1531,12 @@ of every closed union is reached by some row. P67 draws `-` inputs. `rows
 | Property | Statement | SLO | Rulings | Code symbols (pending) | P-tests |
 |---|---|---|---|---|---|
 | `ChainDepthBounded` | Every bundle's chain is at most the limit deep, so a restore stages at most limit + 1 bundles. Under Q46 its root is younger than the window. | S3, S4 | OI-1003-Q15, OI-1003-Q46 | `CHAIN_DEPTH_LIMIT`, `chainable`, `chain_offer`, `chain_links`, `ExportOptions`, `export_pass`, `write_capture`, `decide`, `Rebase` (the re-root window L8) | P67, P71 |
-| `PrereqsSatisfiedByEarlierLinks` | A restore whose digests check never fails `verify_bundle`: every bundle it applies (the oldest link's base first, under fix 2) declares only the prerequisite tips of intact bundles applied before it. A bundle's header (`ExportOptions.chain`'s tips, or the base's) and its `.prior` (the link `Prior`) are separate values in the model, as in the code, so this is the claim that a capture keeps them in step. | S4 | OI-1003-Q15, R-N72 | `flatten`, `prerequisites`, `verify_bundle`, `source_held_tips`, `write_bundle` (flatten's base import L6b; a re-root's header prerequisites and `.prior` from one chain path L8) | P68, P67 |
+| `PrereqsSatisfiedByEarlierLinks` | A restore whose digests check never fails `verify_bundle`: every bundle it applies (the oldest link's base first, under fix 2) declares only the prerequisite tips of intact bundles applied before it. A bundle's header (`ExportOptions.chain`'s tips, or the base's) and its `.prior` (the link `Prior`) are separate values in the model, as in the code, so this is the claim that a capture keeps them in step. | S4 | OI-1003-Q15, R-N72 | `flatten`, `prerequisites`, `verify_bundle`, `source_held_tips`, `write_bundle`, `write_capture`, `chain_links`, `bind_base` (a re-root's header prerequisites and `.prior` from one chain path L8) | P68, P67 |
 | `BrokenLinkNeverReuseHit` | A capture never reuses a record whose custody is broken: a missing or rewritten link, a lost base, a missing sidecar. | S3, S4 | OI-1003-Q15, R-N72 | `retained_capture`, `chain_links`, `LinkBinding`, `decide`, `Inputs` | P42, P67 |
-| `BaseNotReplacedWhileDepended` | The plan base record never moves while a record depends on its base. | S4 | OI-1003-Q15, R-N72 | `prepare_base`, `retained_base`, `requires_base` (the never-replace assertion L6b) | P68 |
+| `BaseNotReplacedWhileDepended` | The plan base record never moves while a record depends on its base. | S4 | OI-1003-Q15, R-N72 | `prepare_base`, `retained_base`, `requires_base`, `write_new` | P68 |
 | `GCNeverDeletesDepended` | GC never removes a bundle that a record or the base record depends on. GC's own choice is definitional (it collects one bundle that nothing depends on per step); what the invariant checks is that no later step makes a record depend on a collected bundle. It holds only with one CORPUS writer at a time: L8's GC must take a CORPUS-level exclusive lock that every capture and every apply also take. | S4 | OI-1003-Q46 | `chain_links` (STATE and CORPUS GC L8; GC's CORPUS-level exclusive lock L8) | P71 |
 | `SidecarsBeforeRecord` | A record names a published bundle whose dependency sidecars exist. | Durability, S4 | OI-1003-Q15, R-N86 | `capture_item`, `publish_bundle`, `publish_prior`, `publish_sidecars` (the `.reuse` sidecar L7) | P70 |
-| `RestoreOrRecapture` | Every record restores, or its item's next capture recaptures, or it refuses by name and keeps the missing custody visible. An export whose content name holds rewritten bytes ends in `publish_bundle`'s `DIGEST_MISMATCH`, a refusal by name, so it counts. An apply that does not restore is a typed refusal, never a bare IO. | S4, S5 | OI-1003-Q1, OI-1003-Q46, R-N72 | `apply_item`, `import_base`, `stage_bundle`, `retained_capture` (GC L8) | P68, P69, P71 |
+| `RestoreOrRecapture` | Every record restores, or its item's next capture recaptures, or it refuses by name and keeps the missing custody visible. An export whose content name holds rewritten bytes ends in `publish_bundle`'s `DIGEST_MISMATCH`, a refusal by name, so it counts. An apply that does not restore is a typed refusal, never a bare IO. | S4, S5 | OI-1003-Q1, OI-1003-Q46, R-N72 | `apply_item`, `import_base`, `stage_base`, `stage_bundle`, `retained_capture`, `bound_base` (GC L8) | P68, P69, P71 |
 | `ChainRecovery` | Under `WF_vars(Protocol)`, once the environment stops, every item whose record does not restore (or has none) gets one that does. Claimed where damage only deletes bundles and never reaches a base (`MC_gc_live`); a bundle rewritten in place defeats it while the source holds still (`MC_gc_live_rewritten`, [Findings](#findings)). | S4, S5 | OI-1003-Q46 | `chainable`, `retained_capture`, `publish_bundle`, `prepare_base` (the re-root window L8) | P71, P68 |
 
 `TypeOK` also evaluates the decision and the restore on every state, so a
@@ -1562,9 +1564,10 @@ and the sixth mutation is what gives `BrokenLinkNeverReuseHit` one.
 `PrereqsSatisfiedByEarlierLinks` on the apply side, with a link rewritten;
 this one breaks it on the capture side with every digest intact, which the
 model can say only because a bundle's declared prerequisites (`pre`) and
-its `.prior` are separate fields. `RestoreOrRecapture` has two fail rows:
-`MC_gc_neg_hit_ignores_chain_restore` and the finding
-`MC_gc_base_missing_untyped`. `MC_gc_neg_base_replaced_live` runs at one
+its `.prior` are separate fields. `RestoreOrRecapture` has one fail row,
+`MC_gc_neg_hit_ignores_chain_restore`; the finding
+`MC_gc_base_missing_untyped` was its second until lane L6b fixed the code
+(#181), and is now an expected pass. `MC_gc_neg_base_replaced_live` runs at one
 commit: a base exported again at the same tip has the same content name,
 so it is the same file, and only a later tip can replace it.
 
@@ -1597,6 +1600,20 @@ self-test was INCONCLUSIVE as expected, and `MC_gc_core` passed at 45,062
 distinct states, unchanged. `just formal-nv` matched all 55 rows, 0
 differing, and `rows --check` found the 363 rows current.
 
+L6b's check (2026-10-07, sting): lane L6b lands fix 2 as the code's only
+policy and fixes #181, so `MC_gc_base_missing_untyped` now sets
+`BaseMissingTyped = TRUE` and is an expected pass. `just tla-check
+MC_gc_base_missing_untyped` grounded 31 GitCarry code symbols (with
+`bind_base`, `bound_base`, `stage_base` and `write_new` for L6b's two
+pending symbols, which are now grounded) and printed 5 pending ones, all
+L7's and L8's. The self-test was INCONCLUSIVE as expected, and the row
+passed at 137 distinct states with `Advance`, `Crash`, `GC` and `Rewrite`
+never enabled, as its `never` column says. The other 21 rows' constants are
+unchanged (only the comments of `MC_gc_grouped`, `MC_gc_fix2` and
+`MC_gc_fix2_deep` moved), so they were not run again; the table below
+keeps their run of record. `just tla-render --check` found all 68 files
+current, and `rows --check` found the 363 pinned rows byte-identical.
+
 | Config | Constants | Expect | Verdict | Violated | Distinct | Generated | Diameter | Wall | RSS MiB |
 |---|---|---|---|---|---:|---:|---:|---:|---:|
 | `MC_gc_budget_selftest` | i1 L2 W4 gc C4 R1 X1 D1 budget 5 s | inconclusive | **INCONCLUSIVE** | `WithinBudget` | 39,368 | 75,847 | 16 | 6s | 678 |
@@ -1611,7 +1628,7 @@ differing, and `rows --check` found the 363 rows current.
 | `MC_gc_reach_reroot_extended` | as `MC_gc_reroot_extended` | reach | **REACHED** | `Witness_RerootExtended` | 240,683 | 463,116 | 23 | 25s | 1586 |
 | `MC_gc_reach_second_reroot` | as `MC_gc_reroot` | reach | **REACHED** | `Witness_SecondReroot` | 62,105 | 119,114 | 18 | 7s | 683 |
 | `MC_gc_reach_based_chain` | as `MC_gc_fix2_deep` | reach | **REACHED** | `Witness_BasedChainRestored` | 26,444 | 50,783 | 17 | 6s | 670 |
-| `MC_gc_base_missing_untyped` | i1,i2 L2 C0 D1 db budget 300 s | fail | **FAIL** | `RestoreOrRecapture` | 60 | 90 | 10 | 2s | 340 |
+| `MC_gc_base_missing_untyped` | i1,i2 L2 C0 D1 db typed budget 300 s (L6b's check) | pass | **PASS** | – | 137 | 249 | 16 | 2s | 358 |
 | `MC_gc_live_rewritten` | i1 L2 C0 D1, `LiveSpec`, budget 300 s | fail | **FAIL** | `ChainRecovery` | 12 | 17 | – | 2s | 346 |
 | `MC_gc_neg_live_unfair` | i1 L2 C0 budget 300 s | fail | **FAIL** | `ChainRecovery` | 4 | 5 | – | 2s | 320 |
 | `MC_gc_neg_chain_ignores_depth` | i1 L1 C2 | fail | **FAIL** | `ChainDepthBounded` | 40 | 55 | 13 | 2s | 335 |
@@ -1736,16 +1753,19 @@ differed.
   outside this lane: for example, `publish_bundle` and `prepare_base`
   could move a file whose digest differs from its name to a quarantine
   name that cannot collide, then link the fresh bytes.
-- **A missing plan base restores as a bare IO** (`MC_gc_base_missing_untyped`
-  fails `RestoreOrRecapture`). `estate::import_base` reads `{bundle}.base`,
-  then stages the base with `git_carry::stage_bundle`. That calls
-  `fs::canonicalize`, which fails `ENOENT` for a deleted base, so the apply
-  refuses `IO`. `apply_item` maps the same `ENOENT` to
-  `SEALED_OBJECT_MISSING` for the head bundle, and `chain_links` refuses a
-  missing link as `SEALED_OBJECT_MISSING`. A bare IO never counts (S4,
-  OI-1003-Q1). The positive grouped configs assume the typed refusal
-  (`BaseMissingTyped = TRUE`). The fix is outside this lane: map the
-  base's `ENOENT` as the head's is mapped.
+- **A missing plan base restored as a bare IO; fixed by lane L6b (#181).**
+  `MC_gc_base_missing_untyped` failed `RestoreOrRecapture` under
+  `BaseMissingTyped = FALSE`: `estate::import_base` read `{bundle}.base`,
+  then staged the base with `git_carry::stage_bundle`, whose
+  `fs::canonicalize` fails `ENOENT` for a deleted base, so the apply
+  refused `IO`. A bare IO never counts (S4, OI-1003-Q1). Since L6b
+  `estate::stage_base` refuses a missing base `SEALED_OBJECT_MISSING`, as
+  `apply_item` does for the head bundle and `chain_links` for a missing
+  link, and so do `chain_links` and `chain::flatten` for a base a chain is
+  bound to. The estate test `a_missing_plan_base_refuses_apply_by_name`
+  pins it. The row keeps its name, sets `BaseMissingTyped = TRUE` as the
+  positive grouped configs do, and is an expected pass. No config sets the
+  constant `FALSE` any more.
 - **A record written before its sidecar is stuck while the source holds
   still.** In `sidecar_after_record`'s 8-state counterexample, the record
   names a chained bundle with no `.prior`. Apply then reads the absent
@@ -1803,11 +1823,15 @@ differed.
 - **Bare captures** (#172). `apply_item` refuses a bare capture planned with
   a workspace (`refuse_bare_capture`), before any chain or base step. That
   is a typed refusal outside custody.
-- **The code beyond v1.** P67 checks the Rust `decide` against all 363
-  rows, so its L6b and L8 policies are checked too. The callers run only
-  v1's (`Policy::V1`) and refuse a plan v1 cannot carry out, so what the
-  code does with an L6b or L8 decision is unchecked until each lane lands
-  its custody.
+- **The code beyond L6b.** P67 checks the Rust `decide` against all 363
+  rows, so its L8 policy is checked too. The callers run only the L6b
+  policy (`Policy::CODE`, fix 2) and refuse a plan it cannot carry out (a
+  re-root), so what the code does with an L8 decision is unchecked until
+  that lane lands its custody. P68 checks what the code does with an L6b
+  decision. One estate rule is outside the reference: `chain_offer` never
+  offers a based link whose bound base is lost, where `extend` does not
+  read `prev_base` for a based link; the capture is then the plan base's
+  delta, as under v1.
 
 ## Frozen names
 
