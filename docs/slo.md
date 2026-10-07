@@ -425,6 +425,53 @@ Q10, Q18). It changes no number and no ruling.
     (`docs/formal/README.md`, "What the #187 review added to the code and
     not to the model").
 
+## Amendment 2026-10-07 (later): the superseding publish is ruled and modelled (OI-1003-Q100, Q101, Q102)
+
+Operator rulings of 2026-10-07 on #187 and its review. They supersede three
+statements of the amendment above: "Whether such destinations need a
+fallback is unruled", "None of this is ruled", and "The model does not hold
+these records yet". That amendment's text is left as written.
+
+- **OI-1003-Q100: no atomic exchange, no superseding publish.** A
+  destination file system without the atomic exchange of two names refuses
+  a superseding seat up front with `DESTINATION_EXCHANGE_UNSUPPORTED`, as
+  built: before anything is staged or asked of the source, and with no
+  fallback. The old output keeps its row; the refusal is typed (S4) and
+  remembered, so an unchanged rerun reads 0 source bytes. Such a seat does
+  not converge on that destination, by ruling.
+- **OI-1003-Q101: a racy publish is owned, never reused.** An output
+  published or adopted from a racy capture gets an ownership row and no
+  reuse row, as built. The ownership row lets a later change of the seat
+  supersede the output; it never answers `Reuse`, so a racy output is
+  never a reuse source (R25, #86).
+- **OI-1003-Q102: model first, then merge.** The TLA+ model covers what
+  #187 adds before it lands. `docs/formal/BulkloadTransfer.tla` now holds
+  the intent of a superseding publish and its sweep, the ownership row,
+  the remembered refusal and Q100's refusal, with five invariants checked
+  by TLC on every row that has the superseding publish on: `NoClobber`
+  (a destination file is replaced or removed only when its identity is one
+  this store recorded), `SupersedeAtomic` (after any crash, the old output
+  with its old rows or the new output with a row of its own, never mixed),
+  `OwnershipNeverReuse`, `RememberedRefusalSound` and
+  `ExchangeRefusedUpFront`. `R25_NoDurableReread` and
+  `R25_StrictNoDurableReread` hold with the superseding publish on. Seven
+  mutations each fail on their named property
+  (`docs/formal/README.md`, "#187's records in the model"). The Haskell
+  explorer does not have these records; they are pinned outside its
+  domain, and its four counts of record did not move.
+- **S3 status.** With #186 and #187 on main, WP0(c)'s inequality 1 (source
+  bytes read ≤ sizes of changed or racy seats, with refused seats in the
+  corpus) and inequality 2 (wire bytes ≤ absent chunks, for changed seats)
+  both hold on the file transfer, within the limits the amendment above
+  lists and Q100's. Evidence: P21 and P23 with refused seats and P21 over
+  in-place changes (`tests/s3_transfer_resume.rs`), P78, the power-loss
+  and crash-resume harnesses, and the model rows above. Still open under
+  S3: the twins reading of inequality 2
+  (`p21_pinned_twin_seats_cross_their_shared_chunks_once`, ignored and
+  unruled), gate (b)'s missing interrupted-resume phase, and the model
+  rows that do not yet combine the superseding publish with the relaxed
+  source ledger, a lost source authority, estate reads or liveness.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

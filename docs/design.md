@@ -750,7 +750,8 @@ row under its path alone, which names no seat and answers nothing but "this
 store published the file with this identity here". An ownership row is
 written where there is no reuse row:
 
-- for an output published or adopted from a racy capture (#86). It is read
+- for an output published or adopted from a racy capture (#86; ruled as
+  built, OI-1003-Q101: an ownership row and no reuse row). It is read
   again on every run until its seat settles, and when the seat changes
   first, as an actively written file does, it is superseded;
 - by the sweep, for a superseding publish whose exchange took effect and
@@ -766,7 +767,10 @@ changed seat on a device probes for the exchange (two empty temporaries,
 once per device and session). Without it the seat is refused
 `DESTINATION_EXCHANGE_UNSUPPORTED` as soon as its manifest shows the output
 holds other bytes: nothing is staged, no chunk is asked of the source, and
-the old output keeps its row. Such a seat does not converge there.
+the old output keeps its row. Such a seat does not converge there. That is
+the ruled behaviour (OI-1003-Q100): the refusal stands, and there is no
+fallback to a rename over the output, which is the check-then-rename shape
+the formal model refutes.
 
 Refusals the destination remembers (#187 review, R25). A seat refused
 `DESTINATION_OCCUPIED` or `DESTINATION_EXCHANGE_UNSUPPORTED` after its
@@ -780,6 +784,13 @@ was settled: the same before and after it was read, and not stamped within
 the racy window of the read. A changed seat, a changed file, or a file
 system that has gained the exchange makes the record a miss. The record
 is a memo about no durable bytes; losing it costs one more source read.
+
+The formal model holds all of this since 2026-10-07 (OI-1003-Q102: model
+first, then merge): the intent and its sweep, the ownership row, the
+remembered refusal and the refusal without an exchange, with the
+invariants `NoClobber`, `SupersedeAtomic`, `OwnershipNeverReuse`,
+`RememberedRefusalSound` and `ExchangeRefusedUpFront`
+(`docs/formal/README.md`, "#187's records in the model").
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a
