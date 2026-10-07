@@ -4,8 +4,8 @@
 //! - **Pinned rows.** Every row of `tests/data/decide_rows.tsv`, which
 //!   `docs/formal/hs/GitCarryCore.hs rows` renders from the reference
 //!   `decide`, decides exactly the row's output under the row's policy, with
-//!   each "-" input drawn at random (fixed seed in CI;
-//!   `BULKLOAD_PROPTEST_DEEP=1` draws more, at random seeds). That is all
+//!   each "-" input drawn at random (the fixed seed everywhere;
+//!   `BULKLOAD_PROPTEST_DEEP=1` draws more from it, OI-1003-Q78). That is all
 //!   three lanes: `v1`, whose policy is [`Policy::V1`], the one the code
 //!   runs, and `L6b` (a chain under a plan base) and `L8` (Q46's root
 //!   window), whose policies `decide` implements before their lanes land the

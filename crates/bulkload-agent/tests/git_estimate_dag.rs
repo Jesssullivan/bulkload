@@ -50,8 +50,8 @@
 //!
 //! **Corpus.** CI runs a fixed seed and 12 cases (`test_support::prop_config`),
 //! plus a PINNED table of shapes the generator reaches rarely.
-//! `BULKLOAD_PROPTEST_DEEP=1` switches to random seeds and twenty times the
-//! cases. The helper is `#[cfg(test)] pub(crate)` in the library, out of an
+//! `BULKLOAD_PROPTEST_DEEP=1` runs twenty times the cases from the same
+//! fixed seed (OI-1003-Q78). The helper is `#[cfg(test)] pub(crate)` in the library, out of an
 //! integration test's reach, so this file compiles the same source file as a
 //! local module (`#[path]`) instead of mirroring it or widening the library
 //! API. `tests/prop_seed_guard.rs` holds every property to that helper.

@@ -39,30 +39,103 @@ secrets-scan-history:
 
 # Rust gates for the workspace (fmt, clippy with warnings denied, tests
 # including the agent's dependency-wall test). The io layer's syscall trace
-# (R-N88) is linted, and its crash-state proofs run with `io-trace` on, ahead
-# of the workspace tests so no unrelated failure can hide them; the partial-
-# write proof sets a process-wide RLIMIT_FSIZE, so it runs alone. The W7 fault
-# harness is not here: it runs in its own CI gate (`just fault-harness`,
-# R-N122).
+# (R-N88) is linted here with `io-trace` alone, the one place PR CI compiles
+# that configuration. Its tests are not here: the traced `io::` lib tests and
+# the P5 partial-write proof run in the fault gate's feature-union build
+# (`just fault-harness`, R-N122), so this gate builds the agent once
+# (OI-1003-Q81).
 rust-check:
     cd {{ root }} && cargo fmt --all -- --check
     cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings
     cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings
-    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::
-    cd {{ root }} && {{ just_executable() }} io-partial-write-alone
-    cd {{ root }} && cargo test --workspace --locked
+    cd {{ root }} && {{ just_executable() }} rust-test
+
+# The workspace tests: what `cargo test --workspace --locked` runs, built
+# once and then run as up to five concurrent cargo invocations (OI-1003-Q81;
+# no new tool). The groups are the unit tests (`--lib --bins`), the doc
+# tests (`--doc`), and the integration binaries the build made, read from
+# its own `Executable tests/<name>.rs` lines and split by the first letter
+# of the name: a to e, f to g, and every other name. So a new integration
+# test joins a group without an edit here, and a target the build skipped
+# for a missing feature is not asked for. Each group's output is printed
+# whole, in order, once it ends. The recipe fails if any group fails, and
+# unless the groups ran exactly as many test executables as the build made:
+# a binary no group selects cannot pass silently (R-N122).
+rust-test:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    status=0
+    build=$(cargo test --workspace --locked --no-run 2>&1) || status=$?
+    printf '%s\n' "$build"
+    if [[ $status -ne 0 ]]; then
+        echo "rust-test: the test build failed with status $status" >&2
+        exit "$status"
+    fi
+    built=$(grep -c '^ *Executable ' <<<"$build" || true)
+    early=()
+    middle=()
+    late=()
+    while IFS= read -r name; do
+        case $name in
+            [a-e]*) early+=(--test "$name") ;;
+            [f-g]*) middle+=(--test "$name") ;;
+            *) late+=(--test "$name") ;;
+        esac
+    done < <(sed -n 's|^ *Executable tests/\(.*\)\.rs (.*)$|\1|p' <<<"$build")
+    logs=$(mktemp -d "${TMPDIR:-/tmp}/rust-test.XXXXXX")
+    trap 'rm -rf "$logs"' EXIT
+    groups=()
+    start() {
+        local name=$1
+        shift
+        cargo test --workspace --locked "$@" >"$logs/$name" 2>&1 &
+        groups+=("$!:$name")
+    }
+    start 1-unit --lib --bins
+    if [[ ${#early[@]} -gt 0 ]]; then
+        start 2-integration-a-e "${early[@]}"
+    fi
+    if [[ ${#middle[@]} -gt 0 ]]; then
+        start 3-integration-f-g "${middle[@]}"
+    fi
+    if [[ ${#late[@]} -gt 0 ]]; then
+        start 4-integration-rest "${late[@]}"
+    fi
+    start 5-doc --doc
+    failed=0
+    for group in "${groups[@]}"; do
+        status=0
+        wait "${group%%:*}" || status=$?
+        echo "rust-test: group ${group#*:} ended with status $status"
+        cat "$logs/${group#*:}"
+        if [[ $status -ne 0 ]]; then
+            failed=1
+        fi
+    done
+    if [[ $failed -ne 0 ]]; then
+        echo "rust-test: a test group failed" >&2
+        exit 1
+    fi
+    ran=$(cat "$logs"/* | grep -c '^ *Running ' || true)
+    if [[ $built -eq 0 || $ran -ne $built ]]; then
+        echo "rust-test: the build made $built test executables but the groups ran $ran" >&2
+        exit 1
+    fi
+    echo "rust-test: all $built test executables ran, in ${#groups[@]} groups"
 
 # P5 partial-write proof (#69). It sets a process-wide RLIMIT_FSIZE, so it runs
 # alone, and it acts only when BULKLOAD_IO_PARTIAL_WRITE_ALONE is set. A skipped
 # proof still reports `1 passed`, so this recipe fails unless the proof really
 # ran: on a cargo failure, on SKIPPED, or on anything but one `1 passed; 0
-# failed` result (R-N122).
+# failed` result (R-N122). It runs from `fault-harness`, in that gate's
+# feature-union build (OI-1003-Q81).
 io-partial-write-alone:
     #!/usr/bin/env bash
     set -euo pipefail
     cd {{ root }}
     status=0
-    output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?
+    output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?
     printf '%s\n' "$output"
     if [[ $status -ne 0 ]]; then
         echo "io-partial-write-alone: cargo test failed with status $status" >&2
@@ -84,23 +157,30 @@ io-partial-write-alone:
         exit 1
     fi
 
-# W7 crash-resume and live-writer harness, which needs the agent's
-# `fault-injection` feature; the R-N88 power-loss harness, which runs the
-# crash-state checker on the syscall trace of a real copy and needs
-# `io-trace`; and the in-crate directory resume proofs (#74 review B1 and
-# round 2 N1). CI runs all three as the separate `fault-harness` terminal
-# gate, in parallel with the source gate and under its own 15-minute cap
-# (R-N122). The harness builds go to their own target dir, so
-# `target/debug/bulkload-agent` is never replaced by a fault-enabled binary.
-# The feature clippy pass stays in the shared dir: it only type-checks and
-# writes no executables.
+# The fault gate. One feature-union build (`fault-injection` and `io-trace`,
+# OI-1003-Q81) in its own target dir runs: the W7 crash-resume and
+# live-writer harness, which needs `fault-injection`; the R-N88 power-loss
+# harness, which runs the crash-state checker on the syscall trace of a real
+# copy and needs `io-trace`; the `io::` lib tests with the trace compiled in
+# (the traced tests and the crash checker's); the P5 partial-write proof,
+# alone; and the in-crate directory resume proofs (#74 review B1 and round 2
+# N1). Both features are inert until a test arms them: a fault point fires
+# only under `BULKLOAD_FAULT`, and a traced call records only while a
+# recorder is attached. CI runs this as the separate `fault-harness`
+# terminal gate, in parallel with the source gate (R-N122). The harness
+# builds go to their own target dir, so `target/debug/bulkload-agent` is
+# never replaced by a fault-enabled binary. The feature clippy pass stays in
+# the shared dir: it only type-checks and writes no executables.
 fault-harness:
     cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings
-    cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness
-    cd {{ root }} && cargo test -p bulkload-agent --locked --features io-trace --target-dir target/fault --test power_loss
+    cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness
+    cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test power_loss
+    cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::
+    cd {{ root }} && {{ just_executable() }} io-partial-write-alone
     cd {{ root }} && {{ just_executable() }} resume-power-loss
 
-# Resume power-loss proofs, lib tests that need `io-trace`: the directory
+# Resume power-loss proofs, lib tests that need `io-trace`, run in the fault
+# gate's feature-union build (OI-1003-Q81): the directory
 # resume paths (#74 review B1 and round 2 N1) and the adoption of a durable
 # unrowed output from its capture record with 0 source bytes read (#169,
 # R-N58). A name filter that matches nothing still reports `0 passed`, so this
@@ -112,7 +192,7 @@ resume-power-loss:
     set -euo pipefail
     cd {{ root }}
     status=0
-    output=$(cargo test -p bulkload-agent --lib --locked --features io-trace --target-dir target/fault materialize::adoption_power_loss:: 2>&1) || status=$?
+    output=$(cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault materialize::adoption_power_loss:: 2>&1) || status=$?
     printf '%s\n' "$output"
     if [[ $status -ne 0 ]]; then
         echo "resume-power-loss: cargo test failed with status $status" >&2
@@ -227,6 +307,27 @@ check-optional:
 
 # Both tiers.
 check-full: check-fast check-optional
+
+# Deep tier (OI-1003-Q7, OI-1003-Q78, OI-1003-Q81): on demand, never a PR
+# gate, and in neither tier above, because it runs for many minutes.
+# `props-deep` runs the workspace tests with BULKLOAD_PROPTEST_DEEP=1: every
+# property draws twenty times its PR-gate cases from the same fixed seed
+# (`test_support::prop_config`; the seed is fixed everywhere), and the heavy
+# fixed rows that skip themselves in the PR gate run (REFS-SCALE's 131,072
+# refs; the distinct-heavy 32,768 and 110,000 commits). A deep failure
+# reproduces with the same command; pin its shape as an explicit test row.
+props-deep:
+    cd {{ root }} && BULKLOAD_PROPTEST_DEEP=1 cargo test --workspace --locked
+
+# Deep tier, on demand, never a PR gate: the W7 crash sweep. For every point
+# of the fault harness's `scenarios!` table it crashes one copy at every hit
+# (nth = 1, 2, ... until the copy runs out of hits), resumes, and holds each
+# crash to the pinned scenarios' own checks (I1 to I4, convergence). It
+# prints one `crash-sweep: <point> hits=<n>` line per point. The PR gate
+# runs only the table's pinned (point, nth) rows. BULKLOAD_CRASH_SWEEP_JOBS
+# sets how many points run at a time (default: a quarter of the cores).
+crash-sweep:
+    cd {{ root }} && BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness crash_sweep_every_point_and_nth -- --exact --nocapture
 
 # Normal attached gate: materialize the repo tools, then use the Flywheel
 # wrapper for the Bazel graph.

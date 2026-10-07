@@ -155,9 +155,73 @@ PINNED_JUST_RECIPES = {
             "cd {{ root }} && cargo fmt --all -- --check",
             "cd {{ root }} && cargo clippy --workspace --all-targets --locked -- -D warnings",
             "cd {{ root }} && cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings",
-            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features io-trace io::",
-            "cd {{ root }} && {{ just_executable() }} io-partial-write-alone",
-            "cd {{ root }} && cargo test --workspace --locked",
+            "cd {{ root }} && {{ just_executable() }} rust-test",
+        ),
+    ),
+    "rust-test": (
+        "rust-test:",
+        (
+            "#!/usr/bin/env bash",
+            "set -euo pipefail",
+            "cd {{ root }}",
+            "status=0",
+            "build=$(cargo test --workspace --locked --no-run 2>&1) || status=$?",
+            "printf '%s\\n' \"$build\"",
+            "if [[ $status -ne 0 ]]; then",
+            '    echo "rust-test: the test build failed with status $status" >&2',
+            '    exit "$status"',
+            "fi",
+            "built=$(grep -c '^ *Executable ' <<<\"$build\" || true)",
+            "early=()",
+            "middle=()",
+            "late=()",
+            "while IFS= read -r name; do",
+            "    case $name in",
+            '        [a-e]*) early+=(--test "$name") ;;',
+            '        [f-g]*) middle+=(--test "$name") ;;',
+            '        *) late+=(--test "$name") ;;',
+            "    esac",
+            "done < <(sed -n 's|^ *Executable tests/\\(.*\\)\\.rs (.*)$|\\1|p' <<<\"$build\")",
+            'logs=$(mktemp -d "${TMPDIR:-/tmp}/rust-test.XXXXXX")',
+            "trap 'rm -rf \"$logs\"' EXIT",
+            "groups=()",
+            "start() {",
+            "    local name=$1",
+            "    shift",
+            '    cargo test --workspace --locked "$@" >"$logs/$name" 2>&1 &',
+            '    groups+=("$!:$name")',
+            "}",
+            "start 1-unit --lib --bins",
+            "if [[ ${#early[@]} -gt 0 ]]; then",
+            '    start 2-integration-a-e "${early[@]}"',
+            "fi",
+            "if [[ ${#middle[@]} -gt 0 ]]; then",
+            '    start 3-integration-f-g "${middle[@]}"',
+            "fi",
+            "if [[ ${#late[@]} -gt 0 ]]; then",
+            '    start 4-integration-rest "${late[@]}"',
+            "fi",
+            "start 5-doc --doc",
+            "failed=0",
+            'for group in "${groups[@]}"; do',
+            "    status=0",
+            '    wait "${group%%:*}" || status=$?',
+            '    echo "rust-test: group ${group#*:} ended with status $status"',
+            '    cat "$logs/${group#*:}"',
+            "    if [[ $status -ne 0 ]]; then",
+            "        failed=1",
+            "    fi",
+            "done",
+            "if [[ $failed -ne 0 ]]; then",
+            '    echo "rust-test: a test group failed" >&2',
+            "    exit 1",
+            "fi",
+            "ran=$(cat \"$logs\"/* | grep -c '^ *Running ' || true)",
+            "if [[ $built -eq 0 || $ran -ne $built ]]; then",
+            '    echo "rust-test: the build made $built test executables but the groups ran $ran" >&2',
+            "    exit 1",
+            "fi",
+            'echo "rust-test: all $built test executables ran, in ${#groups[@]} groups"',
         ),
     ),
     "io-partial-write-alone": (
@@ -167,7 +231,7 @@ PINNED_JUST_RECIPES = {
             "set -euo pipefail",
             "cd {{ root }}",
             "status=0",
-            "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features io-trace io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?",
+            "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::tests::traced::partial_write_prefix_is_traced -- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?",
             "printf '%s\\n' \"$output\"",
             "if [[ $status -ne 0 ]]; then",
             '    echo "io-partial-write-alone: cargo test failed with status $status" >&2',
@@ -194,8 +258,10 @@ PINNED_JUST_RECIPES = {
         "fault-harness:",
         (
             "cd {{ root }} && cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings",
-            "cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection --target-dir target/fault --test fault_harness",
-            "cd {{ root }} && cargo test -p bulkload-agent --locked --features io-trace --target-dir target/fault --test power_loss",
+            "cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness",
+            "cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test power_loss",
+            "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::",
+            "cd {{ root }} && {{ just_executable() }} io-partial-write-alone",
             "cd {{ root }} && {{ just_executable() }} resume-power-loss",
         ),
     ),
@@ -206,7 +272,7 @@ PINNED_JUST_RECIPES = {
             "set -euo pipefail",
             "cd {{ root }}",
             "status=0",
-            "output=$(cargo test -p bulkload-agent --lib --locked --features io-trace --target-dir target/fault materialize::adoption_power_loss:: 2>&1) || status=$?",
+            "output=$(cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault materialize::adoption_power_loss:: 2>&1) || status=$?",
             "printf '%s\\n' \"$output\"",
             "if [[ $status -ne 0 ]]; then",
             '    echo "resume-power-loss: cargo test failed with status $status" >&2',
@@ -238,6 +304,17 @@ PINNED_JUST_RECIPES = {
         "ci-fault-harness: fault-harness",
         (),
     ),
+    # The deep tier (OI-1003-Q78, OI-1003-Q81): on demand, never a gate.
+    "props-deep": (
+        "props-deep:",
+        ("cd {{ root }} && BULKLOAD_PROPTEST_DEEP=1 cargo test --workspace --locked",),
+    ),
+    "crash-sweep": (
+        "crash-sweep:",
+        (
+            "cd {{ root }} && BULKLOAD_CRASH_SWEEP=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness crash_sweep_every_point_and_nth -- --exact --nocapture",
+        ),
+    ),
     "check": (
         "check:",
         (
@@ -268,7 +345,8 @@ def just_recipe(justfile: str, name: str) -> tuple[str, tuple[str, ...]]:
 
 P5_COMMAND = (
     "output=$(BULKLOAD_IO_PARTIAL_WRITE_ALONE=1 cargo test -p bulkload-agent --lib "
-    "--locked --features io-trace io::tests::traced::partial_write_prefix_is_traced "
+    "--locked --features fault-injection,io-trace --target-dir target/fault "
+    "io::tests::traced::partial_write_prefix_is_traced "
     "-- --ignored --exact --test-threads=1 --nocapture 2>&1) || status=$?"
 )
 
@@ -278,12 +356,14 @@ def validate_p5_alone(justfile: str) -> None:
     `1 passed` unless BULKLOAD_IO_PARTIAL_WRITE_ALONE is set, so its recipe
     must set the variable, select the one test exactly, and reject a skip or
     any result other than one `1 passed; 0 failed`."""
-    _, rust_check = just_recipe(justfile, "rust-check")
-    if rust_check.count(
+    # P5 runs in the fault gate's feature-union build (OI-1003-Q81); the
+    # source gate no longer builds `io-trace` tests at all.
+    _, harness = just_recipe(justfile, "fault-harness")
+    if harness.count(
         "cd {{ root }} && {{ just_executable() }} io-partial-write-alone"
-    ) != 1 or any("partial_write_prefix_is_traced" in line for line in rust_check):
+    ) != 1 or any("partial_write_prefix_is_traced" in line for line in harness):
         raise ContractError(
-            "rust-check must run P5 only through io-partial-write-alone"
+            "fault-harness must run P5 only through io-partial-write-alone"
         )
     _, body = just_recipe(justfile, "io-partial-write-alone")
     required = (
@@ -300,6 +380,52 @@ def validate_p5_alone(justfile: str) -> None:
     for line in required:
         if body.count(line) != 1:
             raise ContractError(f"P5 must run alone and fail closed: {line}")
+
+
+# `rust-test` runs what `cargo test --workspace --locked` runs as concurrent
+# cargo invocations (OI-1003-Q81). Each line below is what makes the split
+# whole and fail closed: one build, whose `Executable` lines name and count
+# the test binaries; a `case` whose last arm takes every name the first two
+# leave; every group waited for and its status kept; and the count of
+# binaries run compared with the count built.
+RUST_TEST_REQUIRED = (
+    "build=$(cargo test --workspace --locked --no-run 2>&1) || status=$?",
+    "built=$(grep -c '^ *Executable ' <<<\"$build\" || true)",
+    '        [a-e]*) early+=(--test "$name") ;;',
+    '        [f-g]*) middle+=(--test "$name") ;;',
+    '        *) late+=(--test "$name") ;;',
+    "done < <(sed -n 's|^ *Executable tests/\\(.*\\)\\.rs (.*)$|\\1|p' <<<\"$build\")",
+    '    cargo test --workspace --locked "$@" >"$logs/$name" 2>&1 &',
+    '    groups+=("$!:$name")',
+    "start 1-unit --lib --bins",
+    '    start 2-integration-a-e "${early[@]}"',
+    '    start 3-integration-f-g "${middle[@]}"',
+    '    start 4-integration-rest "${late[@]}"',
+    "start 5-doc --doc",
+    'for group in "${groups[@]}"; do',
+    '    wait "${group%%:*}" || status=$?',
+    "if [[ $failed -ne 0 ]]; then",
+    "ran=$(cat \"$logs\"/* | grep -c '^ *Running ' || true)",
+    "if [[ $built -eq 0 || $ran -ne $built ]]; then",
+)
+
+
+def validate_rust_test_groups(justfile: str) -> None:
+    """`rust-test` must build once, run every group, and fail unless every
+    built test binary ran and every group passed."""
+    _, rust_check = just_recipe(justfile, "rust-check")
+    if rust_check.count("cd {{ root }} && {{ just_executable() }} rust-test") != 1:
+        raise ContractError("rust-check must run the workspace tests through rust-test")
+    _, body = just_recipe(justfile, "rust-test")
+    for line in RUST_TEST_REQUIRED:
+        if body.count(line) != 1:
+            raise ContractError(
+                f"rust-test must run every test and fail closed: {line}"
+            )
+    if sum("cargo test" in line for line in body) != 2:
+        raise ContractError(
+            "rust-test must run cargo test only as its build and groups"
+        )
 
 
 # Top-level justfile lines that change how every recipe runs: settings,
@@ -347,6 +473,7 @@ def validate_just_recipes(justfile: str, imported: str | None = None) -> None:
             if just_header_count(imported, name):
                 raise ContractError(f"imported justfile must not declare {name}")
     validate_p5_alone(justfile)
+    validate_rust_test_groups(justfile)
 
 
 def sha256(source: str) -> str:
@@ -3700,7 +3827,65 @@ class CiContractTest(unittest.TestCase):
         harness_test = PINNED_JUST_RECIPES["fault-harness"][1][1]
         variants = [
             justfile.replace(
-                "    cd {{ root }} && cargo test --workspace --locked\n", "", 1
+                "    cd {{ root }} && {{ just_executable() }} rust-test\n", "", 1
+            ),
+            # A dropped or narrowed test group, a name class that no longer
+            # takes the rest, and a group whose failure or absence no longer
+            # fails the recipe (OI-1003-Q81).
+            justfile.replace(
+                "    if [[ ${#middle[@]} -gt 0 ]]; then\n"
+                '        start 3-integration-f-g "${middle[@]}"\n'
+                "    fi\n",
+                "",
+                1,
+            ),
+            justfile.replace(
+                '            *) late+=(--test "$name") ;;\n',
+                '            [h-z]*) late+=(--test "$name") ;;\n',
+                1,
+            ),
+            justfile.replace(
+                "    start 1-unit --lib --bins\n", "    start 1-unit --lib\n", 1
+            ),
+            justfile.replace("    start 5-doc --doc\n", "", 1),
+            justfile.replace(
+                '        wait "${group%%:*}" || status=$?\n',
+                '        wait "${group%%:*}" || true\n',
+                1,
+            ),
+            justfile.replace(
+                "    if [[ $built -eq 0 || $ran -ne $built ]]; then\n",
+                "    if false; then\n",
+                1,
+            ),
+            justfile.replace(
+                "cargo test --workspace --locked --no-run 2>&1",
+                "cargo test -p bulkload-proto --locked --no-run 2>&1",
+                1,
+            ),
+            justfile.replace(
+                '        cargo test --workspace --locked "$@" >"$logs/$name" 2>&1 &\n',
+                '        cargo test --workspace --locked "$@" --no-run >"$logs/$name" 2>&1 &\n',
+                1,
+            ),
+            # The traced `io::` lib tests left the source gate for the fault
+            # gate's feature-union build; they must not leave PR CI.
+            justfile.replace(
+                "    cd {{ root }} && cargo test -p bulkload-agent --lib --locked "
+                "--features fault-injection,io-trace --target-dir target/fault io::\n",
+                "",
+                1,
+            ),
+            # A deep recipe wired into a gate.
+            justfile.replace(
+                "ci-source: check-source secrets-scan-history contract-test",
+                "ci-source: check-source secrets-scan-history contract-test props-deep",
+                1,
+            ),
+            justfile.replace(
+                "    cd {{ root }} && BULKLOAD_PROPTEST_DEEP=1 cargo test --workspace --locked\n",
+                "    cd {{ root }} && cargo test --workspace --locked\n",
+                1,
             ),
             justfile.replace("    " + harness_test + "\n", "", 1),
             justfile.replace("ci-fault-harness: fault-harness", "ci-fault-harness:", 1),

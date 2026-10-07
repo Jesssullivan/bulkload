@@ -397,16 +397,14 @@ fn the_exemption_list_only_shrinks() {
 fn the_helper_fixes_the_seed_and_persists_nothing() {
     let config = test_support::prop_config(7);
     assert!(config.failure_persistence.is_none());
+    // The seed is fixed in every tier (OI-1003-Q78): the deep tier only
+    // multiplies the case count.
+    assert_eq!(
+        config.rng_seed,
+        proptest::test_runner::RngSeed::Fixed(test_support::CI_SEED)
+    );
     let deep = std::env::var_os(test_support::DEEP).is_some_and(|value| value == "1");
-    if deep {
-        assert_eq!(config.cases, 140);
-    } else {
-        assert_eq!(config.cases, 7);
-        assert_eq!(
-            config.rng_seed,
-            proptest::test_runner::RngSeed::Fixed(test_support::CI_SEED)
-        );
-    }
+    assert_eq!(config.cases, if deep { 140 } else { 7 });
 }
 
 #[test]

@@ -183,9 +183,23 @@ scan, the flake and Bazel graph) on demand; `just check-full` runs both. The
 fault harness, the R-N88/R-N119 power-loss proofs and the R25 counter tests
 are mandatory and never move to the optional tier.
 
+Deep tier (OI-1003-Q78, OI-1003-Q81): `just props-deep` and
+`just crash-sweep` run on demand. They are never a PR gate and are in
+neither tier above. `props-deep` sets `BULKLOAD_PROPTEST_DEEP=1`: every
+property draws twenty times its cases from the same fixed seed (the seed is
+fixed everywhere; `test_support::prop_config`), and the heavy fixed rows
+that skip themselves in the PR gate run. `crash-sweep` crashes one copy at
+every hit of every point in the fault harness's `scenarios!` table. A test
+moves to the deep tier only by a ruling, and its PR names it.
+
 `just check` runs the repository contract checks, `just rust-check`
 (`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`) and the W7 fault harness (`just fault-harness`). CI remains on GloriousFlywheel tinyland-nix; keep
+the `io-trace` clippy pass, and `just rust-test`: the workspace tests, built
+once and run as concurrent groups that must cover every built test binary)
+and the W7 fault harness (`just fault-harness`). The fault harness is one
+`fault-injection,io-trace` build; it also runs the traced `io::` lib tests
+and the P5 partial-write proof, which the source gate no longer builds
+(OI-1003-Q81). CI remains on GloriousFlywheel tinyland-nix; keep
 `.bazelrc.flywheel` endpoint-free. Changing `flake.nix`, the public-read guard
 or its composite action requires updating the pinned digests in
 `scripts/ci-public-read-guard.sh`, the action and `tests/test_ci_contract.py`.

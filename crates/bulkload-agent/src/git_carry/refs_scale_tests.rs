@@ -10,13 +10,20 @@
 //! ref under the import's namespace, with the same peeled objects. The bundle
 //! header stays under the cap and within a stated bound per distinct object,
 //! and the capture's private repository holds one ref per distinct object,
-//! not one per carried ref. The fixed row runs 131,072 refs.
+//! not one per carried ref. The fixed row runs 131,072 refs, in the deep
+//! tier (`BULKLOAD_PROPTEST_DEEP=1`, `just props-deep`; OI-1003-Q81 moved it
+//! out of the PR gate for its cost, over a minute of wall).
 //!
 //! **Red/green.** The same capture in the old format (one header line per
 //! carried ref, written by [`legacy_bundle`]) has a header over the cap at
 //! that size, and every reader refuses it `GIT_INVENTORY_OVER_CAP`; the new
 //! format carries it. The old code itself refused 119,761 carry-shaped refs
-//! `GIT_INVENTORY_MALFORMED` (lane note, before-binary run).
+//! `GIT_INVENTORY_MALFORMED` (lane note, before-binary run). The PR gate
+//! keeps the same red/green on a small generated shape
+//! ([`a_small_capture_carries_and_its_old_format_over_the_cap_is_refused_typed`]):
+//! the shape's old-format bundle is read, then its header is grown past the
+//! cap with further carried-ref lines, and the same readers refuse it by
+//! size.
 //!
 //! **Old-format compatibility.** An old-format capture imports to exactly the
 //! refs the new format imports (generated rows, and 65,536 refs, whose
@@ -619,13 +626,109 @@ proptest::proptest! {
     }
 }
 
+/// The readers the fixed row holds to the cap: each one's verdict on
+/// `bundle`, in a fixed order.
+fn reader_verdicts(bundle: &Path) -> [Result<(), BulkloadRefusal>; 3] {
+    [
+        shared::requires_base(bundle).map(|_| ()),
+        chain::advertised(bundle).map(|_| ()),
+        shared::PackStats::record(bundle, false, 0).map(|_| ()),
+    ]
+}
+
+/// REFS-SCALE's PR-gate row (OI-1003-Q81): a small blahaj-shaped source (12
+/// namespaces copying the native refs, annotated tags among them) carries
+/// and restores exactly in both formats under the header law. Its old-format
+/// bundle is accepted by every reader; the same bundle with its header grown
+/// past the cap, by further carried-ref lines of the old format's own shape,
+/// is refused by each of them as a typed size refusal, never as a malformed
+/// inventory. The 131,072-ref row, whose old format is over the cap on its
+/// own, runs in the deep tier.
+#[test]
+fn a_small_capture_carries_and_its_old_format_over_the_cap_is_refused_typed() {
+    use std::io::Write as _;
+
+    let shape = Shape {
+        commits: 40,
+        annotated: 8,
+        native: 24,
+        namespaces: 12,
+        loose_per_mille: 50,
+        shadowed: 4,
+        pack_all: false,
+        stash: true,
+        sha256: false,
+    };
+    let (source, header) = row("small-fixed", &shape, true);
+    assert!(header < shared::HEADER_CAP / 64, "{header}");
+    let work = scratch("small-fixed-over");
+    let capture = work.0.join("capture");
+    export_repository(&source.path, &capture).unwrap();
+    let old = legacy_bundle(&capture);
+    let old_header = header_len(&old);
+    assert!(old_header < shared::HEADER_CAP, "{old_header}");
+    assert_eq!(reader_verdicts(&old), [Ok(()), Ok(()), Ok(())]);
+    // Red: the same old-format bundle with more carried refs than the cap
+    // holds. Every added line is a well-formed old-format line at an object
+    // the bundle carries, so only the header's size is wrong.
+    let bytes = fs::read(&old).unwrap();
+    let (lines, pack) = bytes.split_at(old_header - 1);
+    let object = std::str::from_utf8(lines)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            line.split_once(" refs/carry-export/")
+                .map(|(object, _)| object)
+        })
+        .unwrap();
+    let mut grown = lines.to_vec();
+    let mut added = 0_u32;
+    while grown.len() <= shared::HEADER_CAP {
+        writeln!(
+            grown,
+            "{object} refs/carry-export/refs/heads/over-the-cap/{added:0>60}"
+        )
+        .unwrap();
+        added += 1;
+    }
+    grown.extend_from_slice(pack);
+    let over = work.0.join("over.bundle");
+    fs::write(&over, grown).unwrap();
+    let over_header = header_len(&over);
+    eprintln!(
+        "REFS-SCALE row=small-fixed refs={} distinct={} header={header} old_header={old_header} over_header={over_header} added={added}",
+        source.inventory.len(),
+        source.distinct(),
+    );
+    assert!(over_header > shared::HEADER_CAP, "{over_header}");
+    assert_eq!(
+        reader_verdicts(&over),
+        [
+            Err(BulkloadRefusal::GitInventoryOverCap),
+            Err(BulkloadRefusal::GitInventoryOverCap),
+            Err(BulkloadRefusal::GitInventoryOverCap)
+        ]
+    );
+}
+
 /// REFS-SCALE's fixed row: 131,072 refs over about 1,200 distinct objects,
 /// blahaj-shaped (157 namespaces copying the native refs, annotated tags
 /// among them). The new format carries and restores it exactly with a header
 /// of a few hundred KB; its old format is over the cap, and every reader
-/// refuses it as a typed size refusal.
+/// refuses it as a typed size refusal. A deep row
+/// (`BULKLOAD_PROPTEST_DEEP=1`, `just props-deep`): OI-1003-Q81 moved it out
+/// of the PR gate, where
+/// [`a_small_capture_carries_and_its_old_format_over_the_cap_is_refused_typed`]
+/// keeps the cap and the typed refusal.
 #[test]
 fn refs_scale_131072_refs_carry_and_the_old_format_is_refused_typed() {
+    if std::env::var_os(crate::test_support::DEEP).is_none_or(|value| value != "1") {
+        eprintln!(
+            "REFS-SCALE row=fixed skipped: set {}=1",
+            crate::test_support::DEEP
+        );
+        return;
+    }
     let shape = Shape {
         commits: 1_000,
         annotated: 160,
