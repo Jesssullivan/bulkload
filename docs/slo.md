@@ -424,6 +424,78 @@ as properties.
     informational (OI-1003-Q39).
 - Runbook: [plans/2026-10-07-s1-hermetic-rig.md](plans/2026-10-07-s1-hermetic-rig.md).
 
+## Amendment 2026-10-07 (later): corrections to the hermetic rig amendment (OI-1003-Q96, Q97)
+
+These come from the review of the amendment above, which is left as
+written. Where the two differ, this section is right. Nothing here changes
+a ratified number or rule; what needs the operator is listed at the end.
+
+- **mbp-13 is 2 cores and 4 threads.** The i7-5557U has 2 physical cores
+  with 2 threads each. "4 cores" in the hosts table counted logical CPUs,
+  because the harness printed `os.cpu_count()` as cores. The report now
+  records `cpu_physical_cores` and `cpu_logical` separately. yoga's "8
+  cores" was counted the same way and has not been probed again.
+- **R-N81 is unchanged in text, but looser in effect on this rig.** The
+  load bound is an absolute load1 below 2.5. It is not scaled to a rig's
+  core count. On a 2-core host, 2.5 is more than every physical core busy,
+  so the same number admits more on mbp-13 than it does on neo. The one
+  sample so far shows it: the harness compiled B inside the sample for
+  2 m 54 s, rep 0 began seconds later at load1 2.03, and the three B reps
+  ran at 1.8 to 2.0 on a host that idles at 0.00 to 0.10. Both arms of each
+  rep shared that state, so the 2.4 times FAIL is unlikely to turn on it; a
+  close result would. Since then the harness records load1 right after the
+  builds, how long it waited and the reading that admitted rep 0, and
+  names every revision compiled inside the sample; `--build-only` prebuilds
+  so that none is, and the runbook requires it. The bound itself is not
+  changed here.
+- **The rig is asserted, not only recorded.** `RIG_OF_RECORD` in
+  `r23_ab.py` is the committed list of gate-of-record hosts for gate (a):
+  mbp-13, pinned to Linux, x86_64 and its product name. A sample from a
+  listed host has `rig_role=record`; from any other host, `rig_role=field`.
+  The status line, the evidence title, the verdict line and the default
+  evidence file name all carry the rig and its role. `of_record=true` needs
+  gated mode, a `record` rig, the A control and a completed sample. A gated
+  sample is refused when an identity field cannot be read, when a host has
+  a listed name but not the listed identity, or when its evidence file name
+  lacks the rig's name. A field sample therefore cannot be read as the S1
+  verdict, and a rig sample cannot be read as a field one.
+- **B/B/B is weaker than B/A/B/A/B, and says so in one word.** The
+  ratified order has never completed on the rig, and the A-behind-translator
+  path has never run against a real A binary there. In B/B/B the three B
+  reps run back to back (33 s in the one sample), so "all three B reps
+  pass" would be three readings of one host moment, with no baseline rep to
+  show the rig was behaving normally. Its verdict is now the single token
+  `PASS-NO-A-CONTROL` or `FAIL-NO-A-CONTROL`, with `of_record=false`. It
+  stays reported only. A's `IO (errno 32)` on Linux is not diagnosed, so it
+  is not shown to be absent from B.
+- **What the rig does not cover: additions.**
+  - *The seal is a different operation on each platform.* In group mode the
+    native arm seals each file with `fsync` on Linux
+    (`durable::seal_file`), which makes data and metadata durable and, on
+    XFS, flushes the device write cache. On macOS it uses `F_BARRIERFSYNC`,
+    which orders the writes without that flush. (The io layer's own
+    `sys::barrier` on Linux is `fdatasync`; the group seal does not use it,
+    so a later `fchmod` is durable with the data.) The rclone arm is run
+    with no sync flag on either platform. So gate (a) on the rig compares a
+    flushed native copy with an unflushed rclone copy, and the native arm
+    pays more for its seal there than on neo. In the one sample, seal time
+    is 64 % of the native initial wall time, and rclone's 362 ms for 240 MB
+    is a page-cache copy. The rig verdict is not the same test as gate (a)
+    on neo: a rig fail beside a field pass could be this difference alone.
+    The bench header now prints `seal_primitive`, and the evidence names
+    it.
+  - *The rig's hardware class.* Two physical cores carry rclone's four
+    transfers and the native workers. A result here is a result for a
+    2-core laptop of 2015.
+  - *A load bound scaled to the rig.* See the R-N81 bullet above.
+- **For the operator.** Each of these needs a ruling; none is assumed.
+  1. Does the rig need a tighter load bound than 2.5 (for example one
+     scaled to physical cores), or a required quiet period after a build?
+  2. Is gate (a) on Linux meant to compare a flushed native copy with an
+     unflushed rclone copy?
+  3. The A control on the rig, as asked above. If B/B/B is accepted, should
+     the B reps be spaced (a v4 or rclone-only rep between them)?
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
