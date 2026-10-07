@@ -3,8 +3,9 @@
 
 Runs `bulkload-bench` built at two revisions in the order B/A/B/A/B
 (OI-1002-Q30), one bench invocation per repetition. B (--rev-b, default
-origin/main) is the candidate; A (--rev-a, default 7c3ecc7) is the
-informational baseline. Each invocation is the full R23 bench as in
+origin/main) is the candidate; A (--rev-a) is the informational baseline:
+the rig's pinned commit on a rig of record (RIG_BASELINE_A, OI-1003-Q103),
+7c3ecc7 on every other host. Each invocation is the full R23 bench as in
 docs/evidence/r23-2026-09-18.md: native and rclone alternate N/R/N/R/N
 (`--reps 3`), then warm resume, interrupted resume and the 1 % delta, so the
 rclone baseline runs the same way, with the same flags, inside every
@@ -27,8 +28,15 @@ Every key=value the bench prints is kept in the JSON, so a counter added
 later is captured without changing this script.
 
 Preconditions (gated mode, the default):
-  - Darwin only. The bench's own R-N81 preflight reads `pmset`; on Linux it
-    reports power=unknown and refuses every gated sample.
+  - Darwin or Linux (OI-1003-Q96). Power is read from `pmset -g batt` on
+    Darwin and from /sys/class/power_supply on Linux, by the rule on
+    `linux_power` below; the Rust bench applies the same rule. Any other
+    platform is refused.
+  - On Linux, --corpus is required: only Darwin has a default corpus path.
+  - On Linux, B must read sysfs itself (`bulkload-bench preflight` answers
+    `power_probe=sysfs`); a B without it is refused. An informational
+    baseline (A, V4) that only knows `pmset` runs unmodified behind a
+    translator: see "Baselines on Linux".
   - --coordinator-quiet: the operator or coordinator holds other lanes quiet
     (R-N91). It is recorded, not checked. --under-load does not require it.
   - The corpus is R23 corpus v1 (r23_corpus.py, OI-1002-Q28): 23 regular
@@ -36,7 +44,62 @@ Preconditions (gated mode, the default):
     committed manifest (content identity f4a7619f...). Gated mode refuses
     non-default --expect-files/--expect-bytes.
   - The work root does not exist yet. Its parent should be on the volume
-    under test (TinylandState for gate a).
+    under test (TinylandState on neo; ~/git-bulkload/ on the hermetic rig).
+
+Rig identity: the report's `host_identity` records the platform, kernel,
+machine, CPU model, physical cores and logical CPUs (separately), RAM and
+the filesystem type of the work root, so a sample from one rig is never
+read as another's (OI-1003-Q96, OI-1003-Q97). A gated sample is refused
+when any of those fields cannot be read.
+
+Rig role (OI-1003-Q97): `RIG_OF_RECORD` below is the committed list of
+hosts whose gated gate (a) sample may be the S1 verdict of record; it
+follows docs/slo.md. A host on the list is `record`, every other host is
+`field` (a field confirmation, which never decides S1). A host that has a
+listed name but not the listed platform, machine and product is refused in
+gated mode. The rig name and role are in the status line (`rig=`,
+`rig_role=`, `of_record=`), in the evidence title and verdict line, and in
+the default evidence file name; a gated --evidence name that lacks the rig
+name is refused. `of_record=true` needs all of: gated mode, a `record` rig,
+the A control (B/A/B/A/B) and a completed sample.
+
+The A control (OI-1003-Q103): A is a fixed commit run between the B reps.
+It shows drift of the rig itself, inside one sample and from one sample to
+the next: B changes with main, A does not, so a change in A's numbers is a
+change in the host. A never decides the gate (OI-1002-Q30). 7c3ecc7 cannot
+be that control on mbp-13, where its bench refuses with a bare `IO (errno
+32)`, so `RIG_BASELINE_A` pins a newer main commit for that rig, with its
+date and reason. A gated sample on a rig of record with its A control is
+refused when --rev-a resolves to any other commit; the pin changes with the
+SLO text, not on the command line. The report's `baseline_a` and the
+evidence name the commit and the pin.
+
+rclone (OI-1003-Q105): every sample uses the rclone build that the repo
+flake pins (`nix build --inputs-from <repo> nixpkgs#rclone`), on every
+host. `RCLONE_PIN` records that build's version and its store path per Nix
+system. A gated or under-load sample refuses a --rclone that is any other
+binary, unless --rclone-override-reason says why; an override is recorded,
+its verdict carries the token `RCLONE-OVERRIDE` and it is never of record.
+A gated sample is also refused when the flake resolves to a build other
+than the committed pin, so a version bump is a recorded edit and not a side
+effect of a lock update. Every report has `rclone_record` (store path,
+version, binary sha256, the flake's nixpkgs revision, the committed pin and
+whether they match), and a rep whose bench header names another rclone
+version aborts the sample. A dry run records the rclone and refuses nothing.
+
+Baselines on Linux (OI-1003-Q96): the baselines A (7c3ecc7, and the rig pin
+of OI-1003-Q103) and V4 (41bf9a4) predate the sysfs preflight; their bench
+runs `pmset` from PATH and refuses when it is missing. The harness does not patch or rebuild them.
+It builds each at its exact sha as usual, and runs a baseline that lacks
+the sysfs probe with <work>/pmset-shim first on PATH. That directory holds
+one script named `pmset`, which calls this file with --pmset-shim: it
+applies the `linux_power` rule and prints pmset's first line for AC or for
+battery, or prints nothing and exits 1 when the state is unknown. The
+baseline's own R-N81 check (AC and load1 < 2.5 before every arm) then runs
+unchanged on a true reading. Each build's `preflight` field says `native`
+or `pmset-shim`, and the evidence table shows it. B never runs behind the
+shim, so the arm that decides the gate always uses its own preflight. The
+verdict rule is unchanged (OI-1002-Q30).
 
 Corpus integrity: the sealed corpus is read-only (0444/0555). The harness
 copies it once into <work>/corpus with 0644/0755 modes, because the bench
@@ -49,7 +112,12 @@ is stable for one untouched copy and differs between copies. After the last rep,
 sealed corpus are verified again. Any failure aborts the sample (exit 3).
 
 Host checks: after the builds, the harness waits up to --settle-seconds for
-AC power and load1 < 2.5, and checks again before every repetition. After
+AC power and load1 < 2.5, and checks again before every repetition. The
+bound is R-N81's absolute 2.5; it is not scaled to the rig's core count, so
+the report records load1 right after the builds (`post_build`), how long
+the harness waited and the reading that admitted rep 0 (`settle`), and
+which revisions were compiled inside the sample. Prebuild with --build-only
+so that no compile runs inside a gated sample. After
 every repetition, power must still be AC, every bench row must say
 gated=true, and load1 must fall below 2.5 within --post-settle-seconds (the
 bench's own work raises it during the rep). The bench itself checks before
@@ -75,8 +143,12 @@ The per-revision CARGO_TARGET_DIR and the copied binaries stay under
 The harness never deletes anything outside the work root.
 
 Evidence: <work>/r23-ab.json holds everything, and the Markdown draft goes
-to docs/evidence/r23-<date>-<HHMM>Z.md. An aborted sample is titled ABORTED
+to docs/evidence/r23-<date>-<HHMM>Z-<rig>-<role>.md. An aborted sample is titled ABORTED
 and has no medians table.
+
+--build-only builds B, A (unless --b-only-no-a-control) and V4 into
+--build-root and exits 0 without a sample: no corpus, no host checks, no
+evidence. Run it before a gated sample and let the host go quiet again.
 
 --dry-run makes a tiny synthetic corpus, passes --informational and skips
 the platform, corpus-verify, quiet and load checks. Its output says
@@ -85,7 +157,7 @@ write under docs/evidence.
 
 --under-load (operator rulings OI-1003-Q39 and OI-1003-Q50) is an
 informational R23 sample under the host's real pressure; it is never an R23
-gate verdict. It keeps the gated mode's Darwin, corpus v1, verify and seal
+gate verdict. It keeps the gated mode's platform, corpus v1, verify and seal
 checks, and passes --informational to the bench. It lifts only the load gate:
 load1 is recorded before and right after every rep, but it is not required
 to be below 2.5, and the post-rep load wait is skipped. AC power is
@@ -102,6 +174,22 @@ native-vs-rclone initial and delta medians, not a pass count. The evidence
 goes to docs/evidence/r23-underload-<date>-<HHMM>Z.md; an --evidence name
 that does not contain `underload` is refused.
 
+--b-only-no-a-control (OI-1003-Q96) is for a rig where the pinned A cannot
+run. OI-1003-Q103 ruled on mbp-13's case: pin an A that runs and keep
+B/A/B/A/B, so this path is no longer how that rig samples. It needs --no-a-control-reason. It keeps
+every gated check (platform, corpus v1, verify, seal, R-N81 before every rep
+and arm, R-N91) and changes one thing: the order is B/B/B, A is not built and
+no A rep runs. OI-1002-Q30 ratifies the order B/A/B/A/B, so this sample lacks
+its A control and says so everywhere: the status is
+`complete-draft-no-a-control`, the verdict is the single token
+`PASS-NO-A-CONTROL` or `FAIL-NO-A-CONTROL` (so a key=value reader of the
+status line never sees a bare PASS) by the unchanged rule over the three B
+reps, `of_record` is false, and the evidence file name must contain
+`no-a-control`. The three B reps run back to back, so they are not spread
+across A reps as the ratified order spreads them. Whether such a sample may
+stand as a gate verdict is the operator's decision, not this script's. The
+v4 dedup reference rep still runs.
+
 Exit: 0 complete (the gate verdict is in the evidence, pass or fail),
 2 refused before the sample, 3 aborted during the sample, 4 build failure.
 """
@@ -117,6 +205,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import shutil
 import statistics
 import subprocess
@@ -140,8 +229,18 @@ DEFAULT_A = "7c3ecc7"
 DEFAULT_B = "origin/main"
 DEFAULT_V4 = "41bf9a4"
 RULINGS = (
-    "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
+    "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, OI-1003-Q96, OI-1003-Q97, OI-1003-Q103,"
+    " OI-1003-Q105, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
 )
+# What the A control is for (OI-1002-Q30, OI-1003-Q103). It never decides.
+A_PURPOSE = (
+    "A is a fixed commit run between the B reps. It shows drift of the rig"
+    " itself, inside a sample and from one sample to the next; it never"
+    " decides the gate"
+)
+POWER_SUPPLY_ROOT = Path("/sys/class/power_supply")
+PMSET_AC = "Now drawing from 'AC Power'"
+PMSET_BATTERY = "Now drawing from 'Battery Power'"
 # An under-load sample is not R-N81 load-gated and not R-N91 quiet-gated
 # (OI-1003-Q39), so it does not cite them as followed.
 RULINGS_UNDER_LOAD = (
@@ -174,6 +273,69 @@ WALK_WAIT = re.compile(r"(walk.*(wait|slot|ahead))|((slot|ahead).*wait)")
 RECV_STALL = re.compile(r"(recv|receive).*(stall|seal|block).*_ns$")
 PAIR = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S+)')
 NOT_GATE = "DRY RUN - NOT A GATE SAMPLE"
+NO_A_CONTROL = "NO A CONTROL"
+# The verdict suffix of a B/B/B sample: one token, so `gate=PASS-NO-A-CONTROL`
+# is never read as `gate=PASS` by a key=value parser.
+NO_A_TOKEN = "NO-A-CONTROL"
+# Hosts whose gated gate (a) sample may be the S1 verdict of record, with the
+# identity each must show (docs/slo.md, amendment 2026-10-07; OI-1003-Q96,
+# OI-1003-Q97). Every other host is a field confirmation. Change this list
+# only with the SLO text.
+RIG_OF_RECORD: dict[str, dict[str, str]] = {
+    "mbp-13": {"system": "Linux", "machine": "x86_64", "product": "MacBookPro12,1"},
+}
+# The A control of each rig of record (docs/slo.md, the 2026-10-07 Q103
+# amendment; OI-1003-Q103). DEFAULT_A (7c3ecc7) refuses on mbp-13 with a bare
+# `IO (errno 32)`; this pin replaces it there. A gated sample on a rig of
+# record with its A control runs exactly this commit or is refused. Change a
+# pin only with the SLO text. Every other host keeps DEFAULT_A.
+RIG_BASELINE_A: dict[str, dict[str, str]] = {
+    "mbp-13": {
+        "sha": "3931471738cc3995a0e564e73af3134d7a7f1ff2",
+        "pinned": "2026-10-07",
+        "reason": (
+            "main at the merge of #195, the last main commit before the rig work"
+            " of 2026-10-07. On mbp-13 it completed 24 of 24 native-only runs on"
+            " corpus v1 (12 informational, 12 R-N81 gated behind the pmset"
+            " translator) and 24 of 24 on the dry-run corpus. 7c3ecc7 refused"
+            " there with IO (errno 32) in 4 of 15 runs on corpus v1 and 15 of 15"
+            " on the dry-run corpus"
+        ),
+    },
+}
+# The rclone of every sample (OI-1003-Q105): the build the repo flake pins
+# (`nix build --inputs-from <repo> nixpkgs#rclone`), recorded here by version
+# and store path per Nix system. A gated sample is refused when the flake
+# resolves to anything else, so a version bump is this edit plus the SLO
+# text, never a side effect of a lock update. `aarch64-darwin` is the
+# evaluated output path; it was not built by the lane that recorded it.
+RCLONE_PIN: dict[str, object] = {
+    "version": "rclone v1.74.4",
+    "nixpkgs_rev": "241313f4e8e508cb9b13278c2b0fa25b9ca27163",
+    "recorded": "2026-10-07",
+    "store_paths": {
+        "x86_64-linux": "/nix/store/v5xbkynmfg8ml23d82m09s802nmj2r6f-rclone-1.74.4",
+        "aarch64-darwin": "/nix/store/5aw5dn7z12pnwjp1yghg9xar9bcl21fk-rclone-1.74.4",
+    },
+}
+RCLONE_OVERRIDE = "RCLONE OVERRIDE"
+# Verdict suffix of a sample that ran another rclone: one token, like NO_A_TOKEN.
+RCLONE_OVERRIDE_TOKEN = "RCLONE-OVERRIDE"
+# A gated sample is refused when any of these is missing from host_identity.
+IDENTITY_REQUIRED = (
+    "node",
+    "system",
+    "kernel",
+    "machine",
+    "product",
+    "cpu_model",
+    "cpu_physical_cores",
+    "cpu_logical",
+    "ram_bytes",
+    "work_root_fs_type",
+)
+CPU_TOPOLOGY_ROOT = Path("/sys/devices/system/cpu")
+B_ONLY_PATTERN = "B" * GATE_B_REPS
 UNDER_LOAD = "INFORMATIONAL UNDER LOAD - NOT A GATE SAMPLE"
 
 
@@ -230,8 +392,68 @@ def corpus_verify(corpus: Path) -> int:
     ).returncode
 
 
+def sysfs_word(path: Path) -> str | None:
+    try:
+        return path.read_text().strip()
+    except OSError:
+        return None
+
+
+def linux_power(root: Path) -> tuple[str, list[dict[str, object]]]:
+    """R-N81 power state from a Linux power-supply class tree (OI-1003-Q96).
+
+    Returns the state (`ac`, `battery` or `unknown`) and every supply read.
+    The rule, in order; `linux_power` in the Rust bench is the same rule and
+    both are tested over the same fake trees:
+
+    1. The class directory cannot be listed: `unknown`.
+    2. A supply whose `scope` is `Device` powers a peripheral; it is ignored.
+    3. Any `Mains` supply with `online` = `1`: `ac`.
+    4. Otherwise, if a `Battery` or `UPS` supply exists: `battery`, whatever
+       its `status` says. With no mains supply online, the battery is the
+       only power the host can be on.
+    5. Otherwise, if any supply's `type` could not be read: `unknown`.
+    6. Otherwise no battery exists (a desktop or a server, with or without
+       an offline `Mains` entry): `ac`.
+
+    `USB`, `Wireless` and every other type never prove AC and never count as
+    a battery; a host charged only through such a supply reads `battery`.
+    """
+    try:
+        names = sorted(entry.name for entry in root.iterdir())
+    except OSError:
+        return "unknown", []
+    supplies: list[dict[str, object]] = []
+    mains_online = battery = unreadable = False
+    for name in names:
+        supply = {
+            "name": name,
+            **{
+                key: sysfs_word(root / name / key)
+                for key in ("type", "online", "status", "scope")
+            },
+        }
+        supplies.append(supply)
+        if supply["scope"] == "Device":
+            continue
+        if supply["type"] == "Mains":
+            mains_online = mains_online or supply["online"] == "1"
+        elif supply["type"] in ("Battery", "UPS"):
+            battery = True
+        elif supply["type"] is None:
+            unreadable = True
+    if mains_online:
+        return "ac", supplies
+    if battery:
+        return "battery", supplies
+    if unreadable:
+        return "unknown", supplies
+    return "ac", supplies
+
+
 def power_source() -> str:
-    if platform.system() == "Darwin":
+    system = platform.system()
+    if system == "Darwin":
         try:
             text = subprocess.run(
                 ["/usr/bin/pmset", "-g", "batt"],
@@ -247,20 +469,197 @@ def power_source() -> str:
         if "'Battery Power'" in first:
             return "battery"
         return "unknown"
-    supplies = Path("/sys/class/power_supply")
-    mains = (
-        [
-            p
-            for p in supplies.glob("*")
-            if (p / "type").is_file() and (p / "type").read_text().strip() == "Mains"
-        ]
-        if supplies.is_dir()
-        else []
+    if system == "Linux":
+        return linux_power(POWER_SUPPLY_ROOT)[0]
+    return "unknown"
+
+
+def pmset_shim_main() -> int:
+    """Stand in for `pmset -g batt` on Linux, for a baseline bench (see the docstring).
+
+    Prints pmset's first line for the `linux_power` state. An unknown state
+    prints nothing and exits 1, which the baseline bench reads as `unknown`
+    and refuses.
+    """
+    state = linux_power(POWER_SUPPLY_ROOT)[0] if platform.system() == "Linux" else ""
+    line = {"ac": PMSET_AC, "battery": PMSET_BATTERY}.get(state)
+    if line is None:
+        return 1
+    print(line)
+    return 0
+
+
+def write_pmset_shim(work: Path) -> Path:
+    """<work>/pmset-shim/pmset; returns the directory to put first on PATH."""
+    directory = work / "pmset-shim"
+    directory.mkdir(exist_ok=True)
+    script = directory / "pmset"
+    script.write_text(
+        "#!/bin/sh\n"
+        "# R-N81 power translator for a baseline bench that only knows pmset\n"
+        "# (OI-1003-Q96). See r23_ab.py, 'Baselines on Linux'.\n"
+        f"exec {shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))}"
+        " --pmset-shim\n"
     )
-    if not mains:
-        return "unknown-no-supply-class"
-    online = any((p / "online").read_text().strip() == "1" for p in mains)
-    return "ac" if online else "battery"
+    script.chmod(0o755)
+    return directory
+
+
+def native_preflight(binary: Path) -> dict[str, object] | None:
+    """The build's own `preflight` answer, or None when it has no such probe."""
+    try:
+        result = subprocess.run(
+            [str(binary), "preflight"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("preflight "):
+            return pairs(line.partition(" ")[2])
+    return None
+
+
+def fs_type_from_mountinfo(text: str, path: str) -> str | None:
+    """Filesystem type of the longest mount point containing `path` (Linux)."""
+    best: tuple[int, str] | None = None
+    for line in text.splitlines():
+        left, sep, right = line.partition(" - ")
+        fields = left.split()
+        if not sep or len(fields) < 5 or not right.split():
+            continue
+        mount = fields[4].encode().decode("unicode_escape")
+        if path == mount or path.startswith(mount.rstrip("/") + "/"):
+            if best is None or len(mount) >= best[0]:
+                best = (len(mount), right.split()[0])
+    return best[1] if best else None
+
+
+def fs_type_from_mount(text: str, path: str) -> str | None:
+    """Filesystem type from Darwin `mount` output: `dev on /mnt (apfs, ...)`."""
+    best: tuple[int, str] | None = None
+    for line in text.splitlines():
+        found = re.match(r".* on (/.*) \(([^,)]+)", line)
+        if not found:
+            continue
+        mount = found.group(1)
+        if path == mount or path.startswith(mount.rstrip("/") + "/"):
+            if best is None or len(mount) >= best[0]:
+                best = (len(mount), found.group(2))
+    return best[1] if best else None
+
+
+def command_text(argv: list[str]) -> str:
+    try:
+        return subprocess.run(
+            argv, capture_output=True, text=True, check=False
+        ).stdout.strip()
+    except OSError:
+        return ""
+
+
+def cpu_model_from_cpuinfo(text: str) -> str | None:
+    for line in text.splitlines():
+        key, _, value = line.partition(":")
+        if key.strip() in ("model name", "Model", "Hardware") and value.strip():
+            return value.strip()
+    return None
+
+
+def linux_physical_cores(root: Path) -> int | None:
+    """Physical cores: distinct hyperthread sibling sets under sysfs.
+
+    `os.cpu_count()` counts logical CPUs; on a 2-core, 4-thread host it says
+    4. None when the topology cannot be read for every CPU.
+    """
+    try:
+        cpus = [d for d in root.iterdir() if re.fullmatch(r"cpu\d+", d.name)]
+    except OSError:
+        return None
+    siblings = set()
+    for cpu in cpus:
+        if not (cpu / "topology").is_dir():
+            continue  # an offline CPU has no topology directory
+        word = sysfs_word(cpu / "topology" / "thread_siblings_list")
+        if not word:
+            return None
+        siblings.add(word)
+    return len(siblings) or None
+
+
+def rig_name(node: object) -> str:
+    """The short host name, safe to put in a file name."""
+    short = str(node or "").split(".")[0]
+    return re.sub(r"[^A-Za-z0-9_-]", "-", short) or "unknown-host"
+
+
+def rig_role(identity: dict[str, object]) -> tuple[str, str | None]:
+    """(`record` or `field`, problem). OI-1003-Q97.
+
+    A host named like a rig of record that does not show that rig's pinned
+    identity gets a problem text; a gated sample is then refused, so another
+    machine with the same name cannot produce a verdict of record.
+    """
+    pinned = RIG_OF_RECORD.get(rig_name(identity.get("node")))
+    if pinned is None:
+        return "field", None
+    wrong = {k: identity.get(k) for k, v in pinned.items() if identity.get(k) != v}
+    if wrong:
+        return "field", (
+            f"host is named {rig_name(identity.get('node'))}, a rig of record,"
+            f" but its identity differs: {wrong} (expected {pinned})"
+        )
+    return "record", None
+
+
+def host_identity(work_parent: Path) -> dict[str, object]:
+    """What tells one rig's sample from another's (OI-1003-Q96, OI-1003-Q97)."""
+    system = platform.system()
+    path = str(work_parent)
+    physical: int | None = None
+    cpu: str | None = None
+    fs: str | None = None
+    product: str | None = None
+    supplies: list[dict[str, object]] = []
+    if system == "Linux":
+        cpu = cpu_model_from_cpuinfo(sysfs_word(Path("/proc/cpuinfo")) or "")
+        fs = fs_type_from_mountinfo(
+            sysfs_word(Path("/proc/self/mountinfo")) or "", path
+        )
+        product = sysfs_word(Path("/sys/class/dmi/id/product_name"))
+        supplies = linux_power(POWER_SUPPLY_ROOT)[1]
+        physical = linux_physical_cores(CPU_TOPOLOGY_ROOT)
+    elif system == "Darwin":
+        cores = command_text(["/usr/sbin/sysctl", "-n", "hw.physicalcpu"])
+        physical = int(cores) if cores.isdigit() else None
+        cpu = (
+            command_text(["/usr/sbin/sysctl", "-n", "machdep.cpu.brand_string"]) or None
+        )
+        fs = fs_type_from_mount(command_text(["/sbin/mount"]), path)
+        product = command_text(["/usr/sbin/sysctl", "-n", "hw.model"]) or None
+    try:
+        ram: int | None = os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError):
+        ram = None
+    return {
+        "node": platform.node(),
+        "system": system,
+        "kernel": platform.release(),
+        "machine": platform.machine(),
+        "product": product,
+        "cpu_model": cpu,
+        # `cpu_count` is logical CPUs (kept under its first name); the two
+        # fields after it say which is which.
+        "cpu_count": os.cpu_count(),
+        "cpu_logical": os.cpu_count(),
+        "cpu_physical_cores": physical,
+        "ram_bytes": ram,
+        "work_root_parent": path,
+        "work_root_fs_type": fs,
+        "power_probe": {"Linux": "sysfs", "Darwin": "pmset"}.get(system, "none"),
+        "power_supplies": supplies,
+    }
 
 
 def conditions() -> dict[str, object]:
@@ -301,7 +700,7 @@ def git(repo: Path, *args: str) -> str:
 
 def build(
     repo: Path, rev: str, build_root: Path, scratch: Path, jobs: int
-) -> dict[str, str]:
+) -> dict[str, object]:
     """Build bulkload-bench at `rev` in its own tree and target dir.
 
     The exported source tree goes under `scratch` (inside the new work root).
@@ -359,13 +758,18 @@ def build(
     if recorded.read_text().strip() != digest:
         say(f"build refused: {binary} does not match its sha256 record")
         raise SystemExit(4)
-    return {"rev": rev, "sha": sha, "binary": str(binary), "sha256": digest}
+    return {
+        "rev": rev,
+        "sha": sha,
+        "binary": str(binary),
+        "sha256": digest,
+        "compiled_in_this_run": not cached,
+    }
 
 
-def resolve_rclone(repo: Path, given: str | None) -> Path:
-    if given:
-        return Path(given).resolve()
-    out = subprocess.run(
+def flake_rclone(repo: Path) -> Path:
+    """The rclone binary of the nixpkgs that the repo flake pins (OI-1003-Q105)."""
+    outputs = subprocess.run(
         [
             "nix",
             "build",
@@ -379,7 +783,131 @@ def resolve_rclone(repo: Path, given: str | None) -> Path:
         text=True,
         check=True,
     ).stdout.split()
-    return Path(out[-1]) / "bin" / "rclone"
+    # nixpkgs#rclone has more than one output (`-man`); take the one with the binary.
+    for output in outputs:
+        if (Path(output) / "bin" / "rclone").is_file():
+            return Path(output) / "bin" / "rclone"
+    raise FileNotFoundError(f"no bin/rclone in {outputs}")
+
+
+def flake_nixpkgs_rev(repo: Path) -> str | None:
+    """The nixpkgs revision in the repo's flake.lock, or None."""
+    try:
+        nodes = json.loads((repo / "flake.lock").read_text())["nodes"]
+        return nodes[nodes["root"]["inputs"]["nixpkgs"]]["locked"]["rev"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def system_key() -> str:
+    """This host's Nix system name, the key of RCLONE_PIN's store paths."""
+    machine = {"arm64": "aarch64", "amd64": "x86_64"}.get(
+        platform.machine(), platform.machine()
+    )
+    return f"{machine}-{platform.system().lower()}"
+
+
+def rclone_version(binary: Path) -> str | None:
+    """First line of `rclone version`, as the bench header prints it; or None."""
+    try:
+        result = subprocess.run(
+            [str(binary), "version"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    lines = result.stdout.splitlines()
+    return lines[0].strip() if result.returncode == 0 and lines else None
+
+
+def store_path(binary: Path) -> str:
+    """`/nix/store/<hash>-rclone-<v>` for `<that>/bin/rclone`; else the binary."""
+    return str(binary.parent.parent if binary.parent.name == "bin" else binary)
+
+
+def choose_rclone(
+    repo: Path, given: str | None, override_reason: str | None, mode: str
+) -> tuple[dict[str, object], str | None]:
+    """Which rclone this run uses, its record, and why it is refused (or None).
+
+    OI-1003-Q105: every sample uses the flake-pinned build. `mode` is
+    `gated`, `under-load` or `dry-run`.
+
+    - No --rclone: the flake-pinned build.
+    - --rclone naming that same store path: accepted, it is the same build.
+    - --rclone naming anything else: refused in a gated or under-load
+      sample unless --rclone-override-reason says why. The override and its
+      reason are recorded, the verdict carries RCLONE_OVERRIDE_TOKEN and the
+      sample is never of record.
+    - Gated only: the flake-pinned build must be the committed RCLONE_PIN
+      (version and this system's store path). If the lock moved it, the
+      sample is refused until the pin and the SLO text record the bump.
+    - A dry run records what it used and refuses nothing here.
+    """
+    reason = (override_reason or "").strip()
+    pinned: Path | None = None
+    resolve_error: str | None = None
+    if mode != "dry-run" or not given:
+        try:
+            pinned = flake_rclone(repo).resolve()
+        except (OSError, subprocess.CalledProcessError) as error:
+            resolve_error = f"{type(error).__name__}: {error}"
+    used = Path(given).resolve() if given else pinned
+    system = system_key()
+    committed = RCLONE_PIN["store_paths"].get(system)  # type: ignore[union-attr]
+    version = rclone_version(used) if used else None
+    is_pinned = used is not None and used == pinned
+    on_pin = (
+        is_pinned and store_path(used) == committed and version == RCLONE_PIN["version"]
+    )
+    record: dict[str, object] = {
+        "binary": str(used) if used else None,
+        "store_path": store_path(used) if used else None,
+        "version": version,
+        "sha256": sha256(used) if used and used.is_file() else None,
+        "flake_pinned_binary": str(pinned) if pinned else None,
+        "flake_pinned_store_path": store_path(pinned) if pinned else None,
+        "flake_nixpkgs_rev": flake_nixpkgs_rev(repo),
+        "is_flake_pinned": is_pinned,
+        "system": system,
+        "committed_pin": {
+            "version": RCLONE_PIN["version"],
+            "store_path": committed,
+            "nixpkgs_rev": RCLONE_PIN["nixpkgs_rev"],
+            "recorded": RCLONE_PIN["recorded"],
+        },
+        "matches_committed_pin": on_pin,
+        "override": {"reason": reason} if reason else None,
+        "ruling": "OI-1003-Q105",
+    }
+    if mode == "dry-run":
+        return record, None
+    if pinned is None:
+        return record, (
+            "cannot resolve the flake-pinned rclone, which every sample must"
+            f" record (OI-1003-Q105): {resolve_error}"
+        )
+    if reason and is_pinned:
+        return record, (
+            "--rclone-override-reason is only for a --rclone that is not the"
+            " flake-pinned build; this run would use the pinned one"
+        )
+    if not is_pinned and not reason:
+        return record, (
+            f"--rclone {used} is not the flake-pinned rclone {pinned}; every"
+            " sample uses the pinned build (OI-1003-Q105). A deliberate"
+            " exception needs --rclone-override-reason, and is recorded"
+        )
+    if version is None:
+        return record, f"cannot read `{used} version`"
+    if mode == "gated" and is_pinned and not on_pin:
+        return record, (
+            f"the repo flake resolves rclone to {store_path(used)} ({version}),"
+            f" but the committed pin for {system} is {committed}"
+            f" ({RCLONE_PIN['version']}). A version bump is a deliberate,"
+            " recorded change (OI-1003-Q105): update RCLONE_PIN with the SLO"
+            " text first"
+        )
+    return record, None
 
 
 def synthetic_corpus(root: Path) -> None:
@@ -601,7 +1129,7 @@ def post_settle(
 
 def run_rep(
     label: str,
-    info: dict[str, str],
+    info: dict[str, object],
     args: argparse.Namespace,
     work: Path,
     corpus: Path,
@@ -634,8 +1162,15 @@ def run_rep(
         f"rep={index} label={label} sha={info['sha'][:12]} load1={before['load1']} "
         f"power={before['power']} source_residency={source_cache}"
     )
+    env = None
+    if info.get("preflight") == "pmset-shim":
+        # A baseline that only knows pmset: see "Baselines on Linux".
+        env = dict(os.environ)
+        env["PATH"] = f"{write_pmset_shim(work)}{os.pathsep}{env.get('PATH', '')}"
     started = time.monotonic()
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    result = subprocess.run(
+        command, capture_output=True, text=True, check=False, env=env
+    )
     wall_s = time.monotonic() - started
     (logs / f"rep{index}-{label}.stdout").write_text(result.stdout)
     (logs / f"rep{index}-{label}.stderr").write_text(result.stderr)
@@ -679,6 +1214,7 @@ def run_rep(
         "sha": info["sha"],
         "native_only": native_only,
         "command": command,
+        "preflight": info.get("preflight", "native"),
         "exit": result.returncode,
         "wall_s": round(wall_s, 3),
         "conditions_before": before,
@@ -695,6 +1231,11 @@ def run_rep(
     if sealed is None or sealed != expected:
         problems.append(f"sealed_corpus_blake3 {sealed} != first rep's {expected}")
     problems += power
+    # OI-1003-Q105: the bench must have run the rclone the report records.
+    wanted = state.get("rclone_version")
+    ran = parsed["header"].get("rclone_version")
+    if wanted is not None and ran not in (wanted, "not-run"):
+        problems.append(f"bench header rclone_version {ran!r} != recorded {wanted!r}")
     # OI-1003-Q39: an under-load sample records load but does not gate on it,
     # and its rows are gated=false by design; power is checked above instead.
     if not args.dry_run and not args.under_load:
@@ -761,6 +1302,7 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
         verdict = "NOT A GATE SAMPLE"
     elif report["status"] not in (
         "complete-draft",
+        "complete-draft-no-a-control",
         "complete-under-load-informational",
     ):
         verdict = "NONE (sample aborted or refused)"
@@ -772,7 +1314,24 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
         verdict = "PASS"
     else:
         verdict = "FAIL"
+    no_a = report.get("a_control") is False
+    rclone = report.get("rclone_record")
+    override = isinstance(rclone, dict) and bool(rclone.get("override"))
+    of_record = (
+        verdict in ("PASS", "FAIL")
+        and not no_a
+        and not override
+        and report["mode"] == "gated"
+        and report["status"] == "complete-draft"
+        and report.get("rig_role") == "record"
+    )
+    if verdict in ("PASS", "FAIL"):
+        verdict += f"-{NO_A_TOKEN}" if no_a else ""
+        verdict += f"-{RCLONE_OVERRIDE_TOKEN}" if override else ""
     return {
+        "rig": report.get("rig"),
+        "rig_role": report.get("rig_role"),
+        "of_record": of_record,
         "rule": (
             "under load there is no R23 verdict; B's bench statuses and the"
             " bench's informational native-vs-rclone medians are reported"
@@ -780,7 +1339,18 @@ def gate_rollup(report: dict[str, object]) -> dict[str, object]:
             if under_load
             else "B passes R23 iff every B rep's bench verdict passes;"
             " A is informational (OI-1002-Q30)"
+            + (
+                f". This sample ran {B_ONLY_PATTERN[0]}"
+                + f"/{B_ONLY_PATTERN[0]}" * (GATE_B_REPS - 1)
+                + " with no A rep (--b-only-no-a-control): it lacks the A control"
+                " of the ratified B/A/B/A/B order, and whether it stands as a"
+                " gate verdict is the operator's decision"
+                if no_a
+                else ""
+            )
         ),
+        "a_control": not no_a,
+        "rclone_override": override,
         "b_reps": len(b_reps),
         "b_reps_pass": passed,
         "b_statuses": statuses,
@@ -830,12 +1400,127 @@ def fmt(value: object, digits: int = 3) -> str:
     return str(value)
 
 
+def identity_lines(identity: object) -> list[str]:
+    if not isinstance(identity, dict):
+        return []
+    ram = identity.get("ram_bytes")
+    return [
+        f"- Rig: `{identity.get('node')}`, {identity.get('system')}"
+        f" {identity.get('kernel')} {identity.get('machine')},"
+        f" product `{identity.get('product')}`, CPU `{identity.get('cpu_model')}`,"
+        f" {identity.get('cpu_physical_cores', 'n/a')} physical cores,"
+        f" {identity.get('cpu_logical', identity.get('cpu_count'))} logical CPUs,"
+        f" RAM {fmt(ram / 2**30, 1) if isinstance(ram, int) else 'n/a'} GiB,"
+        f" work-root filesystem `{identity.get('work_root_fs_type')}`,"
+        f" power probe `{identity.get('power_probe')}`.",
+    ]
+
+
+def rig_text(report: dict[str, object], gate: dict[str, object]) -> str:
+    """Which rig a sample is from and what that makes it (OI-1003-Q97)."""
+    rig = f"rig `{report.get('rig')}`"
+    if report.get("rig_role") != "record":
+        return (
+            f"{rig}, role `field`: a field confirmation, reported beside the rig"
+            " verdict; it is never the S1 verdict, in either direction"
+        )
+    if gate.get("of_record"):
+        return f"{rig}, role `record`: the rig of record; of_record=true"
+    return (
+        f"{rig}, role `record`: the rig of record, but this sample is not a"
+        " verdict of record (of_record=false)"
+    )
+
+
+def build_settle_lines(report: dict[str, object]) -> list[str]:
+    """What the host was doing between the builds and rep 0 (R-N81)."""
+    settle = report.get("settle")
+    if not isinstance(settle, dict):
+        return []
+    compiled = [
+        label
+        for label, info in report["builds"].items()
+        if info.get("compiled_in_this_run")
+    ]
+    post = report.get("post_build") or {}
+    admitted = settle.get("admitted") or {}
+    identity = report.get("host_identity") or {}
+    return [
+        "- Builds and settle: compiled inside this sample: "
+        + (
+            f"**{', '.join(compiled)}** (prebuild with `--build-only` so no"
+            " compile runs inside a gated sample)"
+            if compiled
+            else "none (every binary was prebuilt)"
+        )
+        + f". load1 right after the builds: {fmt(post.get('load1'), 2)}; the"
+        f" harness waited {fmt(settle.get('waited_seconds'), 0)} s; load1 when rep 0"
+        f" was admitted: {fmt(admitted.get('load1'), 2)}. The bound is R-N81's"
+        f" absolute load1 < {fmt(report.get('load_limit'), 1)}; it is not scaled to"
+        f" this rig's {identity.get('cpu_physical_cores', 'n/a')} physical cores.",
+    ]
+
+
+def rclone_lines(report: dict[str, object]) -> list[str]:
+    """The rclone of the sample: store path, version and pin (OI-1003-Q105)."""
+    record = report.get("rclone_record")
+    if not isinstance(record, dict):
+        return [
+            f"- rclone: `{report['rclone']}` ({report.get('rclone_version', 'n/a')}),"
+            " the r23-2026-09-18 flags."
+        ]
+    pin = record.get("committed_pin") or {}
+    if record.get("override"):
+        standing = (
+            f"**not the flake-pinned build** (`{record.get('flake_pinned_store_path')}`);"
+            f" override reason: {record['override'].get('reason')}"
+        )
+    elif record.get("matches_committed_pin"):
+        standing = (
+            "the flake-pinned build, and the committed pin for"
+            f" `{record.get('system')}` (recorded {pin.get('recorded')})"
+        )
+    elif record.get("is_flake_pinned"):
+        standing = (
+            "the flake-pinned build; it is **not** the committed pin for"
+            f" `{record.get('system')}` (`{pin.get('store_path')}`,"
+            f" {pin.get('version')})"
+        )
+    else:
+        standing = "not compared with the flake-pinned build (dry run)"
+    return [
+        f"- rclone: store path `{record.get('store_path')}`, version"
+        f" `{record.get('version')}`, binary sha256"
+        f" `{str(record.get('sha256'))[:16]}`; {standing}; flake.lock nixpkgs"
+        f" `{record.get('flake_nixpkgs_rev')}` (OI-1003-Q105). The"
+        " r23-2026-09-18 flags."
+    ]
+
+
+def baseline_lines(report: dict[str, object]) -> list[str]:
+    """Which commit A is and what it is for (OI-1003-Q103)."""
+    baseline = report.get("baseline_a")
+    if not isinstance(baseline, dict):
+        return []
+    pin = baseline.get("pin")
+    if isinstance(pin, dict):
+        which = (
+            f"`{str(baseline.get('sha'))[:12]}`, this rig's pinned baseline"
+            f" (OI-1003-Q103, pinned {pin.get('pinned')}): {pin.get('reason')}"
+        )
+    else:
+        which = f"`{str(baseline.get('sha'))[:12]}` (`{baseline.get('rev')}`)"
+    return [f"- A control: {which}. {A_PURPOSE} (OI-1002-Q30)."]
+
+
 def evidence(report: dict[str, object]) -> str:
     dry = report["mode"] == "dry-run"
     aborted = report["status"] in ("aborted", "refused")
     gate = report["gate"]
     lines = []
     title = f"# R23 gate (a) B/A sample for #88 - {report['stamp']}"
+    if not dry:
+        title += f" - rig {report.get('rig')}, role {report.get('rig_role')}"
     if aborted:
         title += " (ABORTED)"
     elif dry:
@@ -843,8 +1528,33 @@ def evidence(report: dict[str, object]) -> str:
     elif report["mode"] == "under-load":
         title += f" ({UNDER_LOAD})"
     else:
-        title += " (DRAFT)"
+        marks = ["DRAFT"]
+        if report.get("a_control") is False:
+            marks.append(NO_A_CONTROL)
+        if gate.get("rclone_override"):
+            marks.append(RCLONE_OVERRIDE)
+        title += f" ({', '.join(marks)})"
     lines += [title, ""]
+    if gate.get("rclone_override"):
+        record = report["rclone_record"]
+        lines += [
+            f"> **{RCLONE_OVERRIDE}.** This sample ran `{record.get('binary')}`"
+            f" ({record.get('version')}), not the flake-pinned rclone"
+            f" `{record.get('flake_pinned_binary')}`. Reason given:"
+            f" {record['override'].get('reason')}. OI-1003-Q105 makes the"
+            " flake-pinned build the rclone of every sample, so this one is"
+            " not a verdict of record.",
+            "",
+        ]
+    if report.get("a_control") is False:
+        lines += [
+            f"> **{NO_A_CONTROL}.** Run with `--b-only-no-a-control`: the order was"
+            " B/B/B and no A rep ran. Every other gated check applied. Reason"
+            f" given: {report.get('a_control_reason')}. OI-1002-Q30 ratifies"
+            " B/A/B/A/B, so this sample lacks its A control; whether it stands"
+            " as a gate verdict is the operator's decision.",
+            "",
+        ]
     if dry:
         lines += [
             f"> **{NOT_GATE}.** Synthetic corpus, `--informational`, no host gating.",
@@ -873,6 +1583,7 @@ def evidence(report: dict[str, object]) -> str:
         result = (
             f"**Informational result for B, not an R23 gate verdict:**"
             f" {gate['verdict']}. Rule: {gate['rule']}."
+            f" Sample from {rig_text(report, gate)}."
         )
         quiet = f"coordinator-quiet: `{report['coordinator_quiet']}`" + (
             " (acknowledged only; an under-load sample is not R-N91 gated)"
@@ -881,8 +1592,10 @@ def evidence(report: dict[str, object]) -> str:
         )
     else:
         result = (
-            f"**R23 gate verdict for B: {gate['verdict']}** ({gate['b_reps_pass']}/"
-            f"{gate['b_reps']} B reps pass). Rule: {gate['rule']}."
+            f"**R23 gate verdict for B: {gate['verdict']}"
+            + ("" if dry else f", {rig_text(report, gate)}")
+            + f"** ({gate['b_reps_pass']}/{gate['b_reps']} B reps pass)."
+            f" Rule: {gate['rule']}."
         )
         quiet = (
             f"coordinator-quiet acknowledged: `{report['coordinator_quiet']}` (R-N91)"
@@ -910,20 +1623,32 @@ def evidence(report: dict[str, object]) -> str:
         f" copy, stat fields included; must match in every rep):"
         f" `{report.get('sealed_identity', 'n/a')}`.",
         f"- Work root: `{report['work_root']}`.",
-        f"- rclone: `{report['rclone']}` ({report.get('rclone_version', 'n/a')}), the r23-2026-09-18 flags.",
+        *identity_lines(report.get("host_identity")),
+        *build_settle_lines(report),
+        *rclone_lines(report),
+        *baseline_lines(report),
         "- Page cache: never dropped. The bench reads the whole source (BLAKE3) before"
         " every arm, so every timed arm starts source-hot. Residency is logged for the"
         " working copy before each rep and for the rep's private fixture (what the timed"
         " arms read) right after it.",
         "- Destinations: a new work root per repetition and a new destination per arm.",
         "",
-        "| label | rev | sha | binary sha256 |",
-        "|---|---|---|---|",
+        "| label | rev | sha | binary sha256 | R-N81 preflight |",
+        "|---|---|---|---|---|",
     ]
     for label, info in report["builds"].items():
         lines.append(
             f"| {label} | `{info['rev']}` | `{info['sha'][:12]}` | `{info['sha256'][:16]}` |"
+            f" {info.get('preflight', 'native')} |"
         )
+    if any(i.get("preflight") == "pmset-shim" for i in report["builds"].values()):
+        lines += [
+            "",
+            "`pmset-shim`: this baseline's bench only knows `pmset`. It is built at its"
+            " exact sha, unpatched, and run with a translator first on PATH that"
+            " reports the Linux power-supply state in pmset's words (OI-1003-Q96;"
+            ' `r23_ab.py`, "Baselines on Linux"). B never runs behind it.',
+        ]
     lines += [
         "",
         "## Per-rep bench verdicts",
@@ -1030,6 +1755,15 @@ def evidence(report: dict[str, object]) -> str:
         "- Walk: walk-ahead wait keys found (#112):"
         f" `{sorted({k for r in report['reps'] for k in r['summary']['walk_ahead_wait_keys']})}`.",
         "- Gate (a) is single-host (R-N134: no cross-host run before W5).",
+        "- Seal: the native arm's per-file seal in this sample was"
+        f" `{report.get('seal_primitive') or 'not printed by this build'}` (bench"
+        " header `seal_primitive`, durability"
+        f" `{report.get('durability') or 'n/a'}`). In group mode that is `fsync` on"
+        " Linux, which makes data and metadata durable and flushes the device"
+        " cache, and `F_BARRIERFSYNC` on macOS, which orders the writes without"
+        " that flush. The rclone arm is run with no sync flag on either platform."
+        " So a native-to-rclone ratio from a Linux rig and one from a macOS host"
+        " time different durability work and are not the same test.",
         "- Raw bench stdout/stderr: `logs/` under the work root; every counter in `r23-ab.json`.",
         "",
     ]
@@ -1062,14 +1796,25 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
     if first:
         header = first["parsed"]["header"]
         report["sealed_identity"] = header.get("sealed_corpus_blake3")
-        report["rclone_version"] = header.get("rclone_version")
+        report["rclone_version_bench_header"] = header.get("rclone_version")
+        report.setdefault("rclone_version", header.get("rclone_version"))
+    b_first = next(
+        (r for r in reps if r["label"] == "B" and r["parsed"].get("header")), None
+    )
+    if b_first:
+        report["seal_primitive"] = b_first["parsed"]["header"].get("seal_primitive")
+        report["durability"] = b_first["parsed"]["header"].get("durability")
     report["gate"] = gate_rollup(report)
     (work / "r23-ab.json").write_text(json.dumps(report, indent=2, default=str))
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_text(evidence(report))
     say(
-        f"status={report['status']} gate={report['gate']['verdict']} "
-        f"json={work / 'r23-ab.json'} evidence={evidence_path}"
+        f"status={report['status']} rig={report.get('rig')}"
+        f" rig_role={report.get('rig_role')}"
+        f" of_record={str(report['gate']['of_record']).lower()}"
+        f" rclone_pinned={str(not report['gate'].get('rclone_override')).lower()}"
+        f" json={work / 'r23-ab.json'} evidence={evidence_path}"
+        f" gate={report['gate']['verdict']}"
     )
 
 
@@ -1095,15 +1840,28 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--repo", default=str(Path(__file__).resolve().parents[3]))
     parser.add_argument(
-        "--corpus", default=DEFAULT_CORPUS, help="sealed corpus root (gated mode)"
+        "--corpus",
+        help="sealed corpus root (gated mode). Darwin default:"
+        f" {DEFAULT_CORPUS}; required on Linux",
     )
     parser.add_argument(
         "--work-root", required=True, help="new directory on the volume under test"
     )
     parser.add_argument(
-        "--rclone", help="rclone binary (default: nixpkgs from the repo flake)"
+        "--rclone",
+        help="rclone binary. Default, and the only one a sample accepts without"
+        " --rclone-override-reason: the build the repo flake pins (OI-1003-Q105)",
     )
-    parser.add_argument("--rev-a", default=DEFAULT_A)
+    parser.add_argument(
+        "--rclone-override-reason",
+        help="why this sample runs a --rclone that is not the flake-pinned build;"
+        " recorded, and the sample is then never of record (OI-1003-Q105)",
+    )
+    parser.add_argument(
+        "--rev-a",
+        help=f"default: the rig's pinned A on a rig of record (RIG_BASELINE_A,"
+        f" OI-1003-Q103), else {DEFAULT_A}",
+    )
     parser.add_argument("--rev-b", default=DEFAULT_B)
     parser.add_argument(
         "--rev-v4", default=DEFAULT_V4, help="'' skips the dedup reference"
@@ -1127,11 +1885,30 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--dry-run", action="store_true", help=NOT_GATE)
     parser.add_argument(
+        "--build-only",
+        action="store_true",
+        help="build B, A and V4 into --build-root and exit; not a sample."
+        " Run it before a gated sample so that no compile runs inside one",
+    )
+    parser.add_argument(
+        "--b-only-no-a-control",
+        action="store_true",
+        help=f"{NO_A_CONTROL}: gated B/B/B with no A rep, for a rig where the"
+        " pinned A cannot run; the verdict is marked as lacking its A control"
+        " (needs --no-a-control-reason)",
+    )
+    parser.add_argument(
+        "--no-a-control-reason",
+        help="why A cannot run here; recorded in the report and the evidence",
+    )
+    parser.add_argument(
         "--under-load",
         action="store_true",
         help=f"{UNDER_LOAD}: sealed corpus, bench --informational, load recorded"
         " but not gated, AC power still required (OI-1003-Q39, OI-1003-Q50)",
     )
+    if (sys.argv[1:] if argv is None else argv)[:1] == ["--pmset-shim"]:
+        return pmset_shim_main()
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
@@ -1148,13 +1925,78 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run and args.under_load:
         say("refused: --dry-run and --under-load are exclusive")
         return 2
-    sealed = Path(args.corpus).resolve()
-    if not args.dry_run:
-        if platform.system() != "Darwin":
+    no_a = args.b_only_no_a_control
+    if no_a:
+        if args.dry_run or args.under_load:
+            say("refused: --b-only-no-a-control is a gated mode only")
+            return 2
+        if not (args.no_a_control_reason or "").strip():
+            say("refused: --b-only-no-a-control needs --no-a-control-reason")
+            return 2
+        if args.pattern != DEFAULT_PATTERN:
+            say("refused: --b-only-no-a-control sets the order; do not pass --pattern")
+            return 2
+    elif args.no_a_control_reason:
+        say("refused: --no-a-control-reason needs --b-only-no-a-control")
+        return 2
+    pattern = B_ONLY_PATTERN if no_a else args.pattern
+    identity = host_identity(work.parent)
+    rig = rig_name(identity.get("node"))
+    role, role_problem = rig_role(identity)
+    # OI-1003-Q103: a rig of record has its own pinned A control.
+    rig_a = RIG_BASELINE_A.get(rig) if role == "record" else None
+    rev_a = args.rev_a or (rig_a["sha"] if rig_a else DEFAULT_A)
+    revisions = [("B", args.rev_b)]
+    if not no_a:
+        revisions.append(("A", rev_a))
+    if args.rev_v4:
+        revisions.append(("V4", args.rev_v4))
+    if args.build_only:
+        if args.dry_run or args.under_load:
+            say("refused: --build-only takes neither --dry-run nor --under-load")
+            return 2
+        work.mkdir(mode=0o700)
+        (work / "build-src").mkdir()
+        root = Path(args.build_root) if args.build_root else repo / "target" / "r23-ab"
+        root.mkdir(parents=True, exist_ok=True)
+        for label, rev in revisions:
+            info = build(repo, rev, root, work / "build-src", args.build_jobs)
             say(
-                "refused: gated samples need Darwin (the bench R-N81 preflight reads pmset); run on neo"
+                f"built label={label} sha={str(info['sha'])[:12]}"
+                f" sha256={str(info['sha256'])[:16]}"
+                f" compiled={str(bool(info.get('compiled_in_this_run'))).lower()}"
+                f" binary={info['binary']}"
+            )
+        say("status=built-not-a-sample (no rep ran; let the host go quiet again)")
+        return 0
+    system = platform.system()
+    if not args.dry_run:
+        if system not in ("Darwin", "Linux"):
+            say(
+                f"refused: no R-N81 power probe for {system}; gated and under-load"
+                " samples run on Darwin (pmset) or Linux (sysfs)"
             )
             return 2
+        if args.corpus is None and system != "Darwin":
+            say(
+                "refused: --corpus is required on Linux (only Darwin has a default"
+                " corpus path)"
+            )
+            return 2
+    sealed = Path(args.corpus or DEFAULT_CORPUS).resolve()
+    if not args.dry_run and not args.under_load:
+        # OI-1003-Q97: a gated sample must say exactly which rig it is from.
+        missing = [k for k in IDENTITY_REQUIRED if identity.get(k) in (None, "")]
+        if missing:
+            say(
+                "refused: a gated sample must name its rig; host_identity has no"
+                f" {', '.join(missing)}"
+            )
+            return 2
+        if role_problem:
+            say(f"refused: {role_problem}")
+            return 2
+    if not args.dry_run:
         # OI-1003-Q39: an under-load sample runs with the lanes as they are.
         if not args.coordinator_quiet and not args.under_load:
             say("refused: --coordinator-quiet is required (R-N91)")
@@ -1186,9 +2028,25 @@ def main(argv: list[str] | None = None) -> int:
             work / f"r23-dryrun-{stamp}.md"
             if args.dry_run
             else evidence_dir
-            / (f"r23-underload-{stamp}.md" if args.under_load else f"r23-{stamp}.md")
+            / (
+                f"r23-underload-{stamp}.md"
+                if args.under_load
+                else f"r23-{stamp}-{rig}-{role}{'-no-a-control' if no_a else ''}.md"
+            )
         )
     )
+    if not args.dry_run and not args.under_load and rig not in evidence_path.name:
+        say(
+            "refused: gated evidence must carry its rig's name so it is never read"
+            f" as another rig's: {evidence_path.name} lacks {rig}"
+        )
+        return 2
+    if no_a and "no-a-control" not in evidence_path.name:
+        say(
+            "refused: evidence of a sample without its A control must be named"
+            f" *no-a-control*: {evidence_path.name}"
+        )
+        return 2
     if args.dry_run and evidence_path.is_relative_to(evidence_dir):
         say("refused: dry-run evidence never goes under docs/evidence")
         return 2
@@ -1200,6 +2058,26 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if evidence_path.exists():
         say(f"refused: evidence file exists: {evidence_path}")
+        return 2
+    mode = "dry-run" if args.dry_run else ("under-load" if args.under_load else "gated")
+    if mode == "gated" and rig_a and not no_a:
+        # OI-1003-Q103: on a rig of record the A control is the pinned commit.
+        try:
+            a_sha = git(repo, "rev-parse", "--verify", f"{rev_a}^{{commit}}")
+        except (OSError, subprocess.CalledProcessError):
+            a_sha = None
+        if a_sha != rig_a["sha"]:
+            say(
+                f"refused: on rig {rig} the A control is pinned to {rig_a['sha']}"
+                f" (OI-1003-Q103); --rev-a {rev_a} resolves to {a_sha}. Change"
+                " RIG_BASELINE_A with the SLO text, not the command line"
+            )
+            return 2
+    rclone_record, rclone_problem = choose_rclone(
+        repo, args.rclone, args.rclone_override_reason, mode
+    )
+    if rclone_problem:
+        say(f"refused: {rclone_problem}")
         return 2
 
     work.mkdir(mode=0o700)
@@ -1223,20 +2101,41 @@ def main(argv: list[str] | None = None) -> int:
     build_root.mkdir(parents=True, exist_ok=True)
     scratch = work / "build-src"
     builds = {
-        "B": build(repo, args.rev_b, build_root, scratch, args.build_jobs),
-        "A": build(repo, args.rev_a, build_root, scratch, args.build_jobs),
+        label: build(repo, rev, build_root, scratch, args.build_jobs)
+        for label, rev in revisions
     }
-    if args.rev_v4:
-        builds["V4"] = build(repo, args.rev_v4, build_root, scratch, args.build_jobs)
-    rclone = resolve_rclone(repo, args.rclone)
+    # Read apart from conditions(): this is a record, not a gate check.
+    post_build = {
+        "utc": dt.datetime.now(dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "load1": round(os.getloadavg()[0], 2),
+    }
+    if not args.dry_run and system == "Linux":
+        # OI-1003-Q96: which builds read sysfs themselves. B must; an
+        # informational baseline that does not runs behind the pmset shim.
+        for label, info in builds.items():
+            probe = native_preflight(Path(info["binary"]))
+            native = probe is not None and probe.get("power_probe") == "sysfs"
+            info["preflight"] = "native" if native else "pmset-shim"
+            say(f"preflight label={label} sha={info['sha'][:12]} {info['preflight']}")
+        if builds["B"]["preflight"] != "native":
+            say(
+                "refused: B has no Linux (sysfs) R-N81 preflight; the pmset shim is"
+                " only for informational baselines, never for the arm that decides"
+                " the gate"
+            )
+            return 2
+    rclone = Path(str(rclone_record["binary"]))
     report: dict[str, object] = {
         "date": date,
         "stamp": stamp,
-        "mode": "dry-run"
-        if args.dry_run
-        else ("under-load" if args.under_load else "gated"),
+        "mode": mode,
         "host": platform.node(),
         "platform": platform.platform(),
+        "host_identity": identity,
+        "rig": rig,
+        "rig_role": role,
+        "rig_of_record_hosts": sorted(RIG_OF_RECORD),
+        "post_build": post_build,
         "coordinator_quiet": args.coordinator_quiet,
         "coordinator_quiet_meaning": (
             "acknowledged only; an under-load sample is not R-N91 gated (OI-1003-Q39)"
@@ -1251,8 +2150,21 @@ def main(argv: list[str] | None = None) -> int:
         "content_verified_before": verified_before,
         "work_root": str(work),
         "rclone": str(rclone),
+        "rclone_version": rclone_record["version"],
+        "rclone_store_path": rclone_record["store_path"],
+        "rclone_record": rclone_record,
+        "baseline_a": None
+        if no_a
+        else {
+            "rev": rev_a,
+            "sha": builds["A"]["sha"],
+            "pin": rig_a if rig_a and builds["A"]["sha"] == rig_a["sha"] else None,
+            "purpose": A_PURPOSE,
+        },
         "builds": builds,
-        "pattern": args.pattern,
+        "pattern": pattern,
+        "a_control": not no_a,
+        "a_control_reason": args.no_a_control_reason,
         "load_limit": LOAD_LIMIT,
         "load_gated": not args.under_load,
         "rulings": RULINGS_UNDER_LOAD if args.under_load else RULINGS,
@@ -1262,7 +2174,8 @@ def main(argv: list[str] | None = None) -> int:
     if not args.dry_run:
         # Gated: AC and load1 < 2.5. Under load: AC power once before the
         # first rep; the load gate alone is lifted (OI-1003-Q39).
-        deadline = time.monotonic() + args.settle_seconds
+        started = time.monotonic()
+        deadline = started + args.settle_seconds
         while not host_ready(now := conditions(), args.under_load):
             if time.monotonic() > deadline:
                 report["status"], report["reason"] = (
@@ -1272,10 +2185,16 @@ def main(argv: list[str] | None = None) -> int:
                 finish(report, work, evidence_path)
                 return 2
             time.sleep(15)
-    order = [(label, False) for label in args.pattern]
+        report["settle"] = {
+            "waited_seconds": round(time.monotonic() - started),
+            "admitted": now,
+        }
+    order = [(label, False) for label in pattern]
     if args.rev_v4:
         order.append(("V4", True))
     state: dict[str, object] = {}
+    if not args.dry_run:
+        state["rclone_version"] = rclone_record["version"]
     try:
         for index, (label, native_only) in enumerate(order):
             try:
@@ -1310,7 +2229,9 @@ def main(argv: list[str] | None = None) -> int:
         "dry-run-complete-not-a-gate-sample"
         if args.dry_run
         else (
-            "complete-under-load-informational" if args.under_load else "complete-draft"
+            "complete-under-load-informational"
+            if args.under_load
+            else ("complete-draft-no-a-control" if no_a else "complete-draft")
         )
     )
     finish(report, work, evidence_path)
