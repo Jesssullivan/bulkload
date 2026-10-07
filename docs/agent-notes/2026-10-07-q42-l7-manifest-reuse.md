@@ -148,6 +148,32 @@ Three medium findings; all three were right about the claim.
   The review's alternative (re-word the target, pin the cost) is what
   landed.
 
+## Recheck and ship (fourth session)
+
+Rechecked the review round at `0207a9a` (`8d6248d` tests, `0207a9a` docs),
+which equals the pushed branch and holds `origin/main` `600c765`.
+
+- **Racy guard on the manifest path: fixed.** Scratch mutant in
+  `/srv/cache/jess/q42-l7-manifest-reuse-mut` (removed): `manifest_blobs`
+  without `!racy(..)` fails
+  `a_same_size_rewrite_in_the_capture_tick_is_never_reused_from_a_manifest`
+  ("a racy seat is never reused from a manifest"); the two older
+  capture-tick tests pass under it.
+- **Target 4: fixed as a claim.** The packet says partly done, the seventh
+  P69 row pins the unimproved miss, and the refusal to read a stationary
+  seat again matches S3 as written in `docs/slo.md`. The limitation itself
+  stands and waits on the ruling under "Open"; no issue is filed for it.
+- **The fix round changed no product code:** one lib test, one P69 row and
+  its `row_over` helper, and docs.
+- **check-fast** on `0207a9a`: the first run failed on
+  `disposition::tests::a_ledger_is_bound_to_the_plan_bytes_not_only_its_path`
+  alone (`Io(Some(11))`, the known flake #200), which ends the lib suite
+  before any integration test. Rerun once: exit 0, with all seven P69 rows,
+  the P70 rows and the new lib test passing. Run again with this section in
+  the tree before it was committed.
+- The PR is opened by this session, not merged; its number is in the
+  return receipt.
+
 ## Open
 
 - **Ruling wanted:** may a stationary dirty seat whose blob only the
