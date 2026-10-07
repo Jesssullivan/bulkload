@@ -295,6 +295,35 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   and the restore imports both (D5). The base record itself is written
   no-replace: a record that appears concurrently stands, and the pass
   refuses `RECEIPT_BINDING_INVALID`.
+- A capture record never names a chain nothing can restore (Q42 L6b review,
+  2026-10-07). Under a plan base an export can reproduce, byte for byte, a
+  bundle the corpus already holds: its link's held tips are then the base's
+  own commits. It has that bundle's name, and identical bytes declare
+  identical prerequisites, so three rules decide its `.prior`. A name that
+  is the link, or is already in the link's own chain, gets none: the root's
+  or the shallower link's recorded custody stands, and no cycle
+  (root → link → root) is ever written. A `.prior` already recorded for the
+  name stands while its chain is intact. When the export declared no link
+  (a base's delta, or self-contained) and the name still carries a `.prior`
+  whose chain is broken, that sidecar is removed, durably, before the
+  record names the bundle: a chain broken by a lost base recovers on the
+  next capture as the new base's delta even when that delta is the old
+  head's bytes. A based bundle (its header declares prerequisites, no
+  `.prior`) whose own `.base` sidecar is gone has lost its base: it refuses
+  `RECEIPT_BINDING_INVALID` while its key holds and is never a chain link,
+  matching apply, which refuses it `SEALED_OBJECT_MISSING`.
+- Restore cost under fix 2 is not flat in the group (#148, open). Capture
+  bytes are flat in the pass count; restore is not. Apply flattens every
+  chained item on its own: it copies the head, every link and the plan base
+  beside the corpus and writes one self-contained bundle holding them all,
+  so it stages the base twice per chained item, where a delta on the base
+  alone stages the base once per destination repository. The space
+  preflight charges each chained item its head, links and base against the
+  repository volume, and the staging peak against the corpus volume. P68
+  pins it: `copied + n × base ≤ write_bundle_stage_bytes ≤ 2 × copied` for
+  `n` chained items. Measured with a 1.33 MB base: 7.44 MB staged for two
+  chained items at depth 1 and 11.16 MB for three, where their heads,
+  links and the base once are 2.40 MB and 2.93 MB of corpus bytes.
 - A drift-marked bundle may be a chain link (OI-1003-Q63 D1, #149). The
   pass after a drifted capture extends it clean, chained on the drifted
   bundle. Only that bundle's source-held tip commits become prerequisites,

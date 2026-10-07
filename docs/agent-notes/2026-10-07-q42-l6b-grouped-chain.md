@@ -16,10 +16,12 @@ it was re-read against main.
 | -- | -- |
 | `690b080` | P68 lands red: test only (`tests/git_grouped_chain.rs`, the shared `tests/git_group/mod.rs`) |
 | `0ec447f` | The fix: `decide.rs`, `shared.rs`, `chain.rs`, `estate.rs`, and the tests |
-| the commit that carries this note | `design.md`, the formal catalogue and its rendering, the property plan, this note |
+| `089e071` | `design.md`, the formal catalogue and its rendering, the property plan, this note |
+| `3a36f82` | Review round 1: `publish_prior` and `bound_base` in `estate.rs`, four custody tests, the P68 restore pin and the A → B → A row |
+| the commit after it | Review round 1 docs: `design.md`, the property plan, this note |
 
-All three are signed. No force-push, no rebase; `origin/main` had not moved
-from `34e945e` when the branch was pushed.
+All are signed. No force-push, no rebase; `origin/main` had not moved
+from `34e945e` at either push.
 
 ## What changed
 
@@ -48,8 +50,10 @@ only policy (D4: no flag; a reader from before it fails closed).
     bound to its `.base`; the root only when its header declares
     prerequisites. Under `Custody` a bound base that is gone or replaced
     breaks the chain.
-  - `bound_base`: a missing `.base` is `PrevBase::None`; a chained bundle
-    combines its own base with every link's.
+  - `bound_base`: a bundle with no `.prior` and no `.base` is
+    `PrevBase::None` only when its header declares no prerequisites; a
+    based bundle whose `.base` sidecar is gone is `PrevBase::Lost` (review
+    round 1). A chained bundle combines its own base with every link's.
   - `chain_offer`: the `BaseAndChain` refusal is gone; `Reroot` still
     refuses (L8).
   - `prepare_base`: the record is written with `write_new` (a hard link, so
@@ -80,7 +84,9 @@ only policy (D4: no flag; a reader from before it fails closed).
    The bundle then has the prior's name. `publish_prior` used to refuse a
    self-link `CONTRACT_SELF_INCONSISTENT`; five P64 grouped rows failed on
    it. It now leaves the link's recorded custody as it is and writes no
-   sidecar. The bundle is the link.
+   sidecar. The bundle is the link. Review round 1 found this guard one
+   step too short (below): the same holds for any bundle already in the
+   link's chain.
 2. **A based link whose bound base is lost is never offered**
    (`chain_offer`). The reference's `extend` does not read `prev_base` for
    a based link, so the plan says `BaseAndChain`; the estate offers no link
@@ -174,6 +180,11 @@ then captured under `Policy::CODE` in the same corpus, then applied.
   the chain is broken and the next capture is the new base's delta.
 - A drift-marked bundle is a chain link under the plan base (D1, #149).
 - A chain in a relative corpus path flattens (#183 item 2).
+- Review round 1: a capture that reproduces its chain's root stands as the
+  root; one that reproduces a link of its own chain keeps that link's
+  custody; a recapture that reproduces a broken chain's head drops its
+  stale `.prior`; a based bundle whose `.base` sidecar is gone is never a
+  hit or a link.
 
 Mutants, in a scratch copy under `/srv/cache/jess/q42-l6b-grouped-chain-mut`
 (never the lane worktree), each of which fails a test:
@@ -187,9 +198,73 @@ Mutants, in a scratch copy under `/srv/cache/jess/q42-l6b-grouped-chain-mut`
 | a based link with a lost base is offered | lost-base test |
 | `stage_base` leaves the missing base untyped | missing-base test |
 | the writer drops the link's tips | both P68 tables |
+| `publish_prior` without the chain-membership guard | root custody test, P68 A → B → A row |
+| `publish_prior` keeps a stale `.prior` on an unchained export | broken-head test |
+| `bound_base` answers `None` for a sidecar-less based bundle | sidecar test |
 
 The first mutant survived the first draft of the two-bases test, which
 never flattened the two-base chain; the test now does.
+
+## Review round 1 (2026-10-07)
+
+Five medium/high findings, all judged valid. Four are fixed in code; the
+fifth is measured and pinned, and its design choice is an open ruling.
+
+1. **A cycle on a reproduced root (high).** Grouped, untracked file added
+   then removed: pass 3's chained export has the first capture's bytes
+   (its link's held tips are the base's commits), and `publish_prior` wrote
+   `.prior` onto the root: root → link → root. `chain_links` refused
+   `RECEIPT_BINDING_INVALID` at depth 0, so the item was `captured` and
+   unrestorable. Fix: a name that is the link or is already in the link's
+   own chain (`chain_links(link)`) gets no `.prior`. Not the simpler rule
+   the review offered (never onto an existing bundle without a `.prior`):
+   a pass that crashed after publishing its bundle and before its `.prior`
+   leaves exactly that state, and the next pass must still write the link.
+2. **A stale `.prior` on a reproduced broken head (high).** Old base lost,
+   recapture as the new base's delta has the head's bytes when the head's
+   link tips are all in the new base; the record again named a bundle with
+   a broken chain. Fix: an export that declared no link removes a `.prior`
+   whose chain is not intact under `Custody`, and syncs the corpus
+   directory, before the record is written. An intact one stands. The
+   earlier two-bases test passed only because it deletes a branch; the new
+   test deletes none, and the claim in "Custody tests" above now holds for
+   both.
+3. **A sidecar-less based bundle was a clean hit (medium and high, one
+   fix).** `bound_base` now answers `Lost` for a bundle with no `.prior`,
+   no `.base` and declared prerequisites: the hit refuses
+   `RECEIPT_BINDING_INVALID` and `chain_offer` never offers it. On main
+   that state refused through a failed sidecar read (read from main's
+   code, not run).
+4. **Restore cost (medium): measured and pinned, not changed.** P68 now
+   reads `write_bundle_stage_bytes` at each restore and asserts
+   `copied + n × base ≤ staged ≤ 2 × copied` for `n` chained items
+   (`copied`: the corpus bytes the apply reads). Base 1,329,889 B:
+
+   | k | Probe-2 staged | chained | P64-3 staged | chained |
+   | --: | --: | --: | --: | --: |
+   | 1 | 7,440,717 | 2 | 11,160,834 | 3 |
+   | 2 | 9,550,591 | 2 | 14,325,718 | 3 |
+   | 9 (re-base) | 10,787,796 | 0 | 15,516,593 | 0 |
+   | 10 | 26,338,822 | 2 | 39,507,859 | 3 |
+   | 12 | 30,557,853 | 2 | 45,836,366 | 3 |
+
+   At `k = 1` the corpus bytes with the base read once are 2.40 MB
+   (Probe-2) and 2.93 MB (P64-3): the stage is about 3.1× and 3.8× that,
+   and the factor grows with the group. `item_space` charges every chained
+   item its base, so a destination that fit under v1 can refuse
+   `DESTINATION_SPACE_INSUFFICIENT`. `apply_item`, `item_space` and
+   `flatten` are unchanged: importing each base once per destination
+   repository means the flat bundle is no longer self-contained, which
+   changes the restore verbs' contract (R-N72 D2 says "restores from the
+   one flattened bundle") and the standalone-destination case. That is
+   #148 and needs a ruling (Open).
+
+The low findings were not fixed, by instruction: the head-versus-root
+`.base` asymmetry in `chain_links` against `import_base`; the thin
+verb-level coverage of `bound_base`'s chained branch and the missing
+join/leave/re-key tests; P68 never restoring the depth-8 chain; the red
+commit's `named()` decoder; and the half-checked shape of the re-base
+capture.
 
 ## Validation
 
@@ -211,6 +286,19 @@ never flattened the two-base chain; the test now does.
   (13.4%) and `/srv/fast-local/jess` (4.9%) were all under it when the
   lane started. No code or test was changed for this.
 
+- **Review round 1.** `just check-fast` (CI toolchain, detached and
+  polled, OI-1003-Q85) over the tree of `3a36f82` plus the round's
+  docs, 02:46Z to 02:54Z on 2026-10-07: **exit 0**, 32 test results, 0
+  failed; `l6b_grouped_chain` 12 tests, `git_grouped_chain` 3. Test
+  binaries ran with `TMPDIR` on `/dev/shm`, as before. After that run only
+  this note changed (the fix commit's sha was filled in). The three review
+  mutants ran in a scratch copy under
+  `/srv/cache/jess/q42-l6b-grouped-chain-mut` with its own target
+  directory, both since removed; each failed the test the table names and
+  no other. `just tla-check` and `formal-nv` were not run again: no
+  formal file, catalogue symbol or `decide` row changed. `origin/main`
+  was still `34e945e`.
+
 ## Open
 
 - **A ruling for item 2 above.** Should a based link whose bound base is
@@ -224,9 +312,11 @@ never flattened the two-base chain; the test now does.
   mutation row; none was added.
 - **The re-base cost** (about 4.73 MB per item at `k = 9` here) stays until
   L8 (Q62).
-- **#148** (apply fetches the base for every chained item) matters more
-  now: most grouped captures are chained, and each flatten stages and
-  fetches the base. Not touched here.
+- **#148, a ruling.** Apply stages the base twice per chained item (the
+  numbers are in "Review round 1"). Either accept `N × base` on restore
+  until #148, or import each bound base once per destination repository
+  and flatten only the links, which amends the R-N72 restore contract
+  (D2). P68's restore pin goes red on the day that changes, by design.
 - **The space floor on sting.** `git_group_minimality`,
   `git_grouped_chain` and `git_capture_counters` refuse under the default
   floor wherever `TMPDIR` has under 25% free. Every lane's check-fast on
