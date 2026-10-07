@@ -2136,6 +2136,9 @@ pub(crate) mod mid_pass {
         BundleChecked,
         /// After the index bytes are read, before they are validated.
         IndexRead,
+        /// Fired by the estate after a group's plan base bundle is
+        /// published, before its base record is written.
+        BasePublished,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -2277,10 +2280,11 @@ pub struct ExportOptions<'a> {
     /// A retained capture bundle of this checkout whose source-held tips
     /// become this bundle's prerequisites, so only what is new since it is
     /// packed (WP2, see [`chain`]). Whether they do is the decision core's
-    /// ([`decide::decide`]): under v1's policy a plan base (`prerequisite`)
-    /// wins, and a shallow source, or one that holds none of its tips, gets
-    /// a self-contained bundle. The caller owns the chain's custody and
-    /// depth bound.
+    /// ([`decide::decide`]): beside a plan base (`prerequisite`) the bundle
+    /// declares both (L6b's fix 2), a shallow source gets a self-contained
+    /// bundle, and one that holds none of its tips gets the plan base's
+    /// delta, or a self-contained bundle without one. The caller owns the
+    /// chain's custody and depth bound.
     pub chain: Option<&'a Path>,
 }
 

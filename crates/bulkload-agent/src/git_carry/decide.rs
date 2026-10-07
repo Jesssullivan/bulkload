@@ -17,8 +17,11 @@
 //! checks every row of every lane (`v1`, `L6b`, `L8`), drawing each "-"
 //! input at random. The policy is a column of each row, so every policy the
 //! reference has is checked here (L6b's chain under a plan base, Q46's root
-//! window). The code runs only [`Policy::V1`]: acting on the other policies
-//! waits for the lanes that land the custody they need.
+//! window). The code runs only [`Policy::CODE`], the L6b rows' policy (fix
+//! 2, OI-1003-Q63 D4: no flag, and a reader from before it fails closed):
+//! acting on Q46's root window waits for lane L8, which lands the custody
+//! it needs. [`Policy::V1`] is what the code ran before L6b; the v1 rows
+//! pin it, and the estate's back-compat tests capture under it.
 //!
 //! **Staged inputs.** The code reads its inputs in stages and decides at
 //! each: the decision never rests on an input not read yet, because it is
@@ -43,7 +46,8 @@
 //!
 //! The two stage functions take the lazy reads as callbacks, so the code
 //! and P67 run the same staging: P67 checks that these stages, composed,
-//! decide what one call on every input decides, under [`Policy::V1`].
+//! decide what one call on every input decides, under [`Policy::CODE`] and
+//! under [`Policy::V1`].
 
 use super::chain::CHAIN_DEPTH_LIMIT;
 use crate::{BulkloadRefusal, Result};
@@ -60,8 +64,20 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// The code: depth limit [`CHAIN_DEPTH_LIMIT`], no root window, and no
-    /// chain under a plan base.
+    /// The code's only policy (L6b's fix 2, OI-1003-Q63 D4): depth limit
+    /// [`CHAIN_DEPTH_LIMIT`], no root window, and a grouped item's capture
+    /// chains on its prior under the plan base. It is the L6b rows' policy.
+    /// With no root window the chain re-bases on its ninth changed capture
+    /// (OI-1003-Q62); only L8's re-root removes that re-pack.
+    pub const CODE: Self = Self {
+        depth_limit: CHAIN_DEPTH_LIMIT,
+        root_window: 0,
+        chain_under_base: true,
+    };
+
+    /// The code before L6b: depth limit [`CHAIN_DEPTH_LIMIT`], no root
+    /// window, and no chain under a plan base. No caller runs it; the v1
+    /// rows pin it and the back-compat tests write v1 corpora under it.
     pub const V1: Self = Self {
         depth_limit: CHAIN_DEPTH_LIMIT,
         root_window: 0,
@@ -332,7 +348,8 @@ pub const fn decide(inputs: &Inputs) -> Decision {
 /// Whether [`decide`] on `inputs` rests on the retained bundle's bound base.
 ///
 /// That is, whether reading it can change the decision. The code reads the
-/// `{bundle}.base` sidecar only then, as v1 did (a hit on a based bundle).
+/// `{bundle}.base` sidecars only then: a hit on a based bundle, as v1 did,
+/// and under fix 2 a hit on a chained one, whose links may each bind a base.
 #[must_use]
 pub fn reads_prev_base(inputs: &Inputs) -> bool {
     let retained = Inputs {
@@ -349,8 +366,9 @@ pub fn reads_prev_base(inputs: &Inputs) -> bool {
 /// Whether [`decide`] on `inputs` rests on the source holding a link's tip.
 ///
 /// That is, whether reading it can change the decision. The writer queries
-/// the source (`chain::source_held_tips`) only then, as v1 did: a chain link
-/// offered, no plan base, and a source that is not shallow.
+/// the source (`chain::source_held_tips`) only then: a chain link offered
+/// and a source that is not shallow (and, under [`Policy::V1`], no plan
+/// base, which wins there).
 #[must_use]
 pub fn reads_tips_held(inputs: &Inputs) -> bool {
     let held = Inputs {

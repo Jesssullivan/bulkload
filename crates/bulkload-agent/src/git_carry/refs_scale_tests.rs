@@ -37,7 +37,10 @@
 //! regime (one commit per ref, the import's CPU bounded per distinct object,
 //! a chained pass and its fallback) is `tests/refs_scale_distinct.rs`. A
 //! thin header over the cap is written self-contained
-//! ([`a_chained_pass_over_the_thin_cap_is_written_self_contained`]).
+//! ([`a_chained_pass_over_the_thin_cap_is_written_self_contained`]), and a
+//! chain under a plan base, whose header declares both prerequisite sets,
+//! reaches that cap sooner
+//! ([`a_chained_pass_under_a_plan_base_reaches_the_thin_cap_sooner_and_falls_back`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -805,6 +808,7 @@ fn a_new_capture_chains_on_an_old_format_prior_and_flattens_exactly() {
     let digest = blake3::hash(&fs::read(&prior).unwrap());
     let flat = chain::flatten(
         stage_bundle(&export.bundle).unwrap(),
+        &[],
         &[(prior, *digest.as_bytes())],
     )
     .unwrap();
@@ -1065,6 +1069,139 @@ fn a_chained_pass_over_the_thin_cap_is_written_self_contained() {
     assert_eq!(
         shared::prerequisites(&kept).unwrap(),
         shared::prerequisites(&export.bundle).unwrap()
+    );
+}
+
+/// REFS-SCALE, a chain under a plan base (Q42 lane L6b, fix 2): the header
+/// declares the base's commits and the prior's source-held tips, so it is
+/// one prerequisite line (54 B on SHA-1) longer than the plan base's delta
+/// for every held tip the base does not name, and reaches the cap sooner
+/// than either a based or a plainly chained pass. Over the cap the pass is
+/// written self-contained (`chained == false`) and imports exactly, as a
+/// chained pass is; at its own header length it stays thin, and flattens on
+/// the base and the prior to exactly the source's refs.
+#[test]
+fn a_chained_pass_under_a_plan_base_reaches_the_thin_cap_sooner_and_falls_back() {
+    const PREREQUISITE_LINE_SHA1: usize = 1 + 40 + " shared base\n".len();
+    let shape = Shape {
+        commits: 12,
+        annotated: 2,
+        native: 10,
+        namespaces: 2,
+        loose_per_mille: 300,
+        shadowed: 1,
+        pack_all: false,
+        stash: false,
+        sha256: false,
+    };
+    let mut source = generate("base-chain-cap", &shape);
+    let work = scratch("base-chain-cap-work");
+    let base = shared::export_base(&source.path, &work.0.join("base")).unwrap();
+    // A commit the base does not hold, advertised by the prior.
+    fs::write(source.path.join("f1"), b"changed after the base\n").unwrap();
+    g(
+        &source.path,
+        &["commit", "--quiet", "-am", "after the base"],
+    );
+    let held = g(&source.path, &["rev-parse", "HEAD"]);
+    let prior =
+        super::export_repository_with_prerequisite(&source.path, &work.0.join("first"), &base)
+            .unwrap();
+    let based: BTreeSet<String> = shared::prerequisites(&prior).unwrap().into_iter().collect();
+    assert!(!based.contains(&held));
+    fs::write(source.path.join("f1"), b"changed after the prior\n").unwrap();
+    g(
+        &source.path,
+        &["commit", "--quiet", "-am", "after the prior"],
+    );
+    g(&source.path, &["update-ref", "refs/heads/added", "HEAD"]);
+    source.inventory = listed_refs(&source.path);
+    let second = work.0.join("second");
+    let export = export_repository_with_drift(
+        &source.path,
+        &second,
+        &ExportOptions {
+            prerequisite: Some(&base),
+            chain: Some(&prior),
+            ..ExportOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(export.chained, "a link beside a plan base is chained on");
+    let declared: BTreeSet<String> = shared::prerequisites(&export.bundle)
+        .unwrap()
+        .into_iter()
+        .collect();
+    let added: Vec<&String> = declared.difference(&based).collect();
+    assert_eq!(added, vec![&held], "the base's commits and the held tip");
+    assert!(based.is_subset(&declared));
+    let thin = header_len(&export.bundle);
+    let private = second.join("repository.git");
+    let offer = shared::Offer {
+        base: Some(&base),
+        link: Some(shared::Link {
+            prior: &prior,
+            source: &source.path,
+        }),
+    };
+    // Sooner: the same pass as the plan base's delta alone has a header
+    // shorter by one prerequisite line per added tip.
+    let delta = work.0.join("delta.bundle");
+    let (_, chained) = shared::write_capture(
+        &private,
+        &delta,
+        shared::Offer {
+            base: Some(&base),
+            link: None,
+        },
+        shared::HEADER_CAP,
+    )
+    .unwrap();
+    assert!(!chained);
+    assert_eq!(
+        thin,
+        header_len(&delta) + added.len() * PREREQUISITE_LINE_SHA1
+    );
+    let fallback = work.0.join("fallback.bundle");
+    let (_, chained) = shared::write_capture(&private, &fallback, offer, thin - 1).unwrap();
+    assert!(!chained, "over the cap: self-contained");
+    assert!(shared::prerequisites(&fallback).unwrap().is_empty());
+    assert!(header_len(&fallback) < thin);
+    check_exact(&source, &fallback, &work.0, "fallback");
+    let kept = work.0.join("kept.bundle");
+    let (_, chained) = shared::write_capture(&private, &kept, offer, thin).unwrap();
+    assert!(chained, "at its own header length: thin");
+    assert_eq!(header_len(&kept), thin);
+    flattens_on_its_base(&source, &export.bundle, &base, &prior, &work.0);
+}
+
+// The source's refs, as `Source::inventory` holds them.
+fn listed_refs(path: &Path) -> BTreeMap<String, String> {
+    g(path, &["for-each-ref", "--format=%(refname) %(objectname)"])
+        .lines()
+        .map(|line| {
+            let (name, value) = line.split_once(' ').unwrap();
+            (name.to_owned(), value.to_owned())
+        })
+        .collect()
+}
+
+// The restore of a chain under a plan base: the base, then the prior, then
+// the head, to exactly the source's refs. Without the base nothing
+// satisfies the prior's prerequisites.
+fn flattens_on_its_base(source: &Source, head: &Path, base: &Path, prior: &Path, root: &Path) {
+    let digest = |path: &Path| *blake3::hash(&fs::read(path).unwrap()).as_bytes();
+    let links = [(prior.to_owned(), digest(prior))];
+    let flat = chain::flatten(
+        stage_bundle(head).unwrap(),
+        &[(base.to_owned(), digest(base))],
+        &links,
+    )
+    .unwrap();
+    check_exact(source, flat.path(), root, "flattened");
+    assert_eq!(
+        chain::flatten(stage_bundle(head).unwrap(), &[], &links).err(),
+        Some(BulkloadRefusal::ReceiptBindingInvalid)
     );
 }
 
