@@ -240,3 +240,32 @@ as above.
 Still open after this round: the list under "Open" above, less the two items
 ruled by Q74 and Q75. If #194 or #198 lands before #195, main is merged
 again and the seed guard is run.
+
+## Recheck and ship, second pass (2026-10-06)
+
+Recheck stage over `1d6474b`, diff read since the build head `b9a762f`.
+Rulings: OI-1003-Q73, Q74, Q75, OI-1003-Q1, OI-1003-Q14, R33, R-N13.
+
+- Finding (medium): #195 conflicted with main after #191, #192 and #193.
+  Verified fixed. `origin/main` (`34e945e`) is an ancestor of the branch head
+  and GitHub reports #195 MERGEABLE (merge state BLOCKED: checks and review,
+  not a conflict).
+- The fix round is the signed merge `f57d3ae` and the signed docs commit
+  `1d6474b`. The merge changes no file under `crates/bulkload-agent`,
+  `crates/bulkload-proto` or `docs/design.md` against `b9a762f`, and nothing
+  in `justfile` or `crates/bulkload-bench` against main. `docs/slo.md` holds
+  main's gate (b) amendment and this lane's S4 amendment in full, with no
+  conflict markers. No new defect found.
+- `estate.rs` against `origin/main`: this lane's hunks only (68 insertions,
+  35 deletions).
+- `just check-fast` inside `nix develop` was run again on the tree of
+  `1d6474b` plus this section. The commit carrying this section was made only
+  after it exited 0.
+- `origin/main` was still `34e945e` at push time; #194 (seed guard) and #198
+  are open, so `tests/prop_seed_guard.rs` does not exist here. P72 and P73
+  route through `test_support::prop_config(256)`.
+- Verdict CLEAN. PR #195 already exists; its body is updated, no second PR
+  is opened and nothing is merged by this stage.
+
+Open: unchanged from the lists above. If #194 or #198 lands before #195,
+main is merged again and the seed guard is run.
