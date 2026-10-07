@@ -217,7 +217,8 @@ fn shape() -> impl Strategy<Value = Shape> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 48, ..ProptestConfig::default() })]
+    // P2: the shared fixed-seed corpus (OI-1003-Q7).
+    #![proptest_config(crate::test_support::prop_config(48))]
 
     #[test]
     fn fused_and_segmented_match_the_oracle(

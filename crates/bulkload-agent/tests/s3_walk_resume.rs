@@ -26,12 +26,15 @@
 //! step used, so its stat identity always moves. A rewrite that leaves the
 //! identity unchanged is the racy case (P19), not this property's.
 //!
-//! **Corpus.** Fixed seed, 16 CI cases ([`prop_config`]). The deep local
-//! tier (`BULKLOAD_PROPTEST_DEEP=1`) runs twenty times the cases from the
-//! same fixed seed: this file never draws a random seed and never writes a
-//! failure-persistence file. `test_support::prop_config` is `#[cfg(test)]
-//! pub(crate)`, out of an integration test's reach, so the helper is
-//! mirrored here.
+//! **Corpus.** CI runs a fixed seed and 16 cases
+//! (`test_support::prop_config`). The deep local tier
+//! (`BULKLOAD_PROPTEST_DEEP=1`) switches to random seeds and twenty times
+//! the cases; nothing writes a failure-persistence file, so a failing deep
+//! seed is pinned as an explicit test row. The helper is `#[cfg(test)]
+//! pub(crate)` in the library, out of an integration test's reach, so this
+//! file compiles the same source file as a local module (`#[path]`) instead
+//! of mirroring it. `tests/prop_seed_guard.rs` holds every property to that
+//! helper.
 
 #![allow(
     clippy::unwrap_used,
@@ -51,30 +54,11 @@ use bulkload_agent::walk::{walk, HashPolicy, WalkOptions};
 use bulkload_agent::RowSchema;
 use bulkload_proto::FileKind;
 use proptest::prelude::*;
-use proptest::test_runner::{Config, RngSeed};
 
-/// `test_support::CI_SEED`, mirrored: every run draws the same cases.
-const CI_SEED: u64 = 0x0B01_C0AD_2026_1003;
-
-/// `test_support::DEEP`, mirrored: the switch for the deep local tier.
-const DEEP: &str = "BULKLOAD_PROPTEST_DEEP";
-
-/// `test_support::prop_config`, mirrored for an integration test, with the
-/// seed fixed in both tiers: `cases` cases in CI, twenty times as many under
-/// `BULKLOAD_PROPTEST_DEEP=1`. Nothing persists between runs.
-fn prop_config(cases: u32) -> Config {
-    let deep = std::env::var_os(DEEP).is_some_and(|value| value == "1");
-    Config {
-        cases: if deep {
-            cases.saturating_mul(20)
-        } else {
-            cases
-        },
-        rng_seed: RngSeed::Fixed(CI_SEED),
-        failure_persistence: None,
-        ..Config::default()
-    }
-}
+/// The shared helper itself (OI-1003-Q7): the same source file as the
+/// library's `test_support`, so the seed and the deep switch cannot drift.
+#[path = "../src/test_support.rs"]
+mod test_support;
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -364,7 +348,7 @@ fn check<C: FreshnessCache>(tree: &Tree, steps: &[Step], mut cache: C) {
 }
 
 proptest! {
-    #![proptest_config(prop_config(16))]
+    #![proptest_config(test_support::prop_config(16))]
 
     /// P21, walk leg: a warm walk reads exactly the changed files, re-reads
     /// nothing under `StaleOnly`, and every unchanged row is stable.
