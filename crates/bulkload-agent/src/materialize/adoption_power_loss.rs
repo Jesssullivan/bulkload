@@ -23,7 +23,9 @@
 //!
 //! - S1 (OI-1003-Q107): a group of several outputs is sealed device-wide,
 //!   one `syncfs` before its renames and one after. No power-loss state may
-//!   name an output whose bytes are not there.
+//!   name an output whose bytes are not there. A superseding output (WP0(d))
+//!   in the same group joins the first `syncfs`: its exchange never shows the
+//!   new name before the new bytes are durable.
 //!
 //! Each crashed run is replayed with the real calls the engine makes before
 //! its fault point. The resume then runs through `Destination::directory`, a
@@ -363,13 +365,23 @@ const GROUP: [(&str, &[u8]); 3] = [
     ("c", b"charlie-bytes!"),
 ];
 
-/// S1 (OI-1003-Q107): commit three outputs in one group, which Linux group
-/// mode seals device-wide. In every power-loss state of that commit, each
-/// final name is absent or holds exactly its output's bytes, and every
-/// committed output is present.
+/// The output the batched group proof supersedes (WP0(d)): its path, the
+/// bytes this store published there first, and the changed seat's bytes.
+const SUPERSEDED: (&str, &[u8], &[u8]) = ("d", b"delta-old", b"delta-new-and-longer");
+
+/// The authority the superseded output's rows are committed under.
+const SUPERSEDE_AUTHORITY: &[u8] = b"batched-authority";
+
+/// S1 (OI-1003-Q107): commit three new outputs and one superseding publish
+/// (WP0(d)) in one group, which Linux group mode seals device-wide. In every
+/// power-loss state of that commit, each new final name is absent or holds
+/// exactly its output's bytes, the superseded path holds the old output or
+/// the new one whole, a committed new row is never beside the old bytes, and
+/// every committed output is present. The superseding temporary takes no
+/// flush of its own: the group's first `syncfs` seals it before its exchange.
 #[test]
 fn a_batched_group_names_no_output_before_its_data_is_durable() {
-    if !crate::io::durable::batched(GROUP.len()) {
+    if !crate::io::durable::batched(GROUP.len() + 1) {
         return;
     }
     let base = scratch("batched");
@@ -378,16 +390,63 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
         base.join("destination"),
         base.join("state"),
     );
-    for (name, data) in GROUP {
-        std::fs::write(source.join(name), data).unwrap();
-    }
-    let all = rows(&source);
-    let store = Store::open(&state).unwrap();
-    let image = Image::scan(&destination).unwrap();
-    let recorder = Recorder::new();
+    let (superseded, old, new) = SUPERSEDED;
+    // Held from the first destination change: another proof's process-wide
+    // recorder would trace this one's setup.
     let _alone = ALONE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // This store's own output of `old`, published and committed before the
+    // recorded group (a single-file group: the per-file path).
+    std::fs::write(source.join(superseded), old).unwrap();
+    {
+        let row = rows(&source)
+            .into_iter()
+            .find(|row| row.rel_path == superseded.as_bytes())
+            .unwrap();
+        let store = Store::open(&state).unwrap();
+        let target = Destination::open(&destination, &store).unwrap();
+        let staged = target.stage(&row).unwrap();
+        crate::io::sys::pwrite_all(&**staged.file(), old, 0).unwrap();
+        let mut sink = PublishSink::new(
+            Store::open(&state)
+                .unwrap()
+                .into_publisher(PublisherSide::Destination)
+                .unwrap(),
+        )
+        .unwrap();
+        sink.commit(vec![Publication::Staged {
+            staged,
+            record: PendingOutput {
+                key: crate::transfer_store::row_key(SUPERSEDE_AUTHORITY, &row).unwrap(),
+                rel_path: row.rel_path.clone(),
+                size: row.size,
+                racy: false,
+                hints: Vec::new(),
+            },
+        }]);
+        assert!(sink.finish().iter().all(|(_, outcome)| outcome.is_ok()));
+    }
+    for (name, data) in GROUP {
+        std::fs::write(source.join(name), data).unwrap();
+    }
+    std::fs::write(source.join(superseded), new).unwrap();
+    let all = rows(&source);
+    let store = Store::open(&state).unwrap();
+    let changed = all
+        .iter()
+        .find(|row| row.rel_path == superseded.as_bytes())
+        .unwrap();
+    let owned = owned_output(
+        &store,
+        SUPERSEDE_AUTHORITY,
+        changed,
+        &File::open(destination.join(superseded)).unwrap(),
+    )
+    .unwrap()
+    .unwrap();
+    let image = Image::scan(&destination).unwrap();
+    let recorder = Recorder::new();
     {
         let _attached = recorder.attach_process();
         let target = Destination::open(&destination, &store).unwrap();
@@ -411,6 +470,20 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
                 },
             });
         }
+        let staged = target.stage(changed).unwrap();
+        crate::io::sys::pwrite_all(&**staged.file(), new, 0).unwrap();
+        crate::io::durable::start_writeback(staged.file());
+        publications.push(Publication::Superseding {
+            staged,
+            record: PendingOutput {
+                key: crate::transfer_store::row_key(SUPERSEDE_AUTHORITY, changed).unwrap(),
+                rel_path: changed.rel_path.clone(),
+                size: changed.size,
+                racy: false,
+                hints: Vec::new(),
+            },
+            owned,
+        });
         let mut sink = PublishSink::new(
             Store::open(&state)
                 .unwrap()
@@ -438,7 +511,23 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
             ))
             .count(),
         2,
-        "one syncfs before the renames and one after"
+        "one syncfs before the renames and the exchange, and one after"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Exchange { .. })),
+        "the superseding output was exchanged in"
+    );
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            Event::Sync {
+                kind: SyncKind::DataSync | SyncKind::Fsync,
+                ..
+            }
+        )),
+        "no output of the batched group took a flush of its own"
     );
     let options = Options {
         ignore_foreign: true,
@@ -453,6 +542,10 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
                 other => return Err(format!("output {name} is {other:?}")),
             }
         }
+        let held = match view.get(superseded.as_bytes()) {
+            Some(Entry::File { data: held, .. }) if held == old || held == new => held,
+            other => return Err(format!("superseded output is {other:?}")),
+        };
         for commit in &info.commits {
             let Event::Commit { records, .. } = &events[*commit] else {
                 continue;
@@ -464,6 +557,9 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
                             "committed output {} is not named",
                             String::from_utf8_lossy(rel_path)
                         ));
+                    }
+                    if rel_path == superseded.as_bytes() && held != new {
+                        return Err("the new row is committed beside the old bytes".into());
                     }
                 }
             }

@@ -82,9 +82,10 @@ A arm.
    R25 expects 0 bytes received and 0 content bytes read. The rep fails
    otherwise, as gate (a)'s `r25_warm_zero` does.
 
-   Content bytes read are `source_bytes_read` minus the SQLite magic probes.
-   The agent reads up to 16 bytes of every SQLite seat it refuses by magic,
-   on every pass, so that probe is netted out.
+   Content bytes read are the raw `source_bytes_read`. Since #186 the agent
+   counts the 16-byte header sniff of a SQLite seat it refuses by magic
+   apart (`source_sniff_bytes`) and sniffs an unchanged refused seat once,
+   so nothing is netted out (amended 2026-10-07).
 5. **The 1 % delta.**
    - The helper XORs 0xa5 over 1 % of the comparable regular-file bytes. It
      takes whole files in a seeded path-hash order, and the last file only up
@@ -126,8 +127,11 @@ can produce a gate verdict.
 
 Gate (a)'s rule is `initial_win && delta_win && warm_zero && interrupted_zero
 && rss_ok` (`enforce_verdict` in `crates/bulkload-bench/src/main.rs`). Gate
-(b)'s rule differs in two ways. Both are carried in every verdict
+(b)'s rule differs in one way, carried in every verdict
 (`deviations_from_gate_a`, and the `rule` string) until the operator rules.
+A second deviation, warm-resume reads net of the SQLite probes, was removed
+on 2026-10-07: #186 took the probes out of `source_bytes_read`, so gate (b)
+requires the raw counter to be 0, as gate (a) does.
 
 - **No interrupted resume.** Gate (a) stops a transfer after its payload
   in-process and requires the resume to move and read nothing. Over ssh that
@@ -135,9 +139,6 @@ Gate (a)'s rule is `initial_win && delta_win && warm_zero && interrupted_zero
   process. The phase is not run. Each rep verdict records
   `r25_interrupted_zero: null` and `r25_interrupted_resume: "not-run: …"`, so
   a gate (b) PASS does not claim it.
-- **Warm-resume reads are net of the SQLite probes.** Gate (a) requires raw
-  `source_bytes_read` = 0. Gate (b) requires `content_bytes_read` = 0, which
-  subtracts up to 16 bytes for every SQLite seat the agent refuses by magic.
 
 ## Destination disk budget
 

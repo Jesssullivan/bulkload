@@ -22,9 +22,9 @@ Three rules keep the paper honest:
 
 - **Every statement about a result cites a file on `main`**: an evidence
   file, `docs/slo.md`, `docs/formal/`, a test file or a dated agent note.
-  There is one exception, named where it occurs: the draft S1 sample of
-  section 5.3 is on an unmerged branch, and is cited by branch, commit and
-  path.
+  There is one exception, named where it occurs: the sample of PR #210 in
+  section 5.2 is on that pull request's unmerged branch, and is cited by
+  pull request and path.
 - **Every result carries one of three labels.**
   - *Gated*: enforced on every pull request by `just check-fast` and the two
     CI gates, or a benchmark sample taken under the R-N81 and R-N91 gate
@@ -72,14 +72,14 @@ state of the proof on `main` at `a80c63b`, in one paragraph each:
   small bounds. A Dhall catalogue renders their configurations, and a
   Haskell explorer reproduces TLC's state counts (section 4.2). No tier or
   CI gate runs them.
-- **Not met.** **S1 has no gated sample on `main`.** No file on `main`
-  records a benchmark of the wire v5 engine taken under the gate conditions.
-  The only S1 numbers on `main` since wire v5 are informational, taken under
-  load on 2026-10-04, and they favour native (section 5.2). One draft
-  gated-mode sample exists off `main`, on an unmerged branch and without its
-  A control. It points the other way: B failed, with 0 of 3 reps passing
-  (section 5.3). The S2 budget has never been measured. S4 does not yet
-  cover transfer and SQLite outcomes, and S5 still refuses HEAD and index movement.
+- **Not met: S1 fails on the rig of record.** The gated B/A/B/A/B sample on
+  the hermetic rig (mbp-13, 2026-10-07 14:10Z, on `main` through #206) is a
+  FAIL, 0 of 3 B reps: native initial copy 856.7 ms against rclone 360.7 ms,
+  1 % delta 140.5 against 107.7 ms (section 5.1). The profile and timers
+  since (section 5.2) place the gap in fixed per-copy work, not in hashing
+  or file syncs. The S2 budget has never been measured. S4 does not yet
+  cover transfer and SQLite outcomes, and S5 still refuses HEAD and index
+  movement.
 
 ## 1. Problem
 
@@ -1159,19 +1159,13 @@ never move to the optional tier (`AGENTS.md`, "Validation").
     no neo run happens until gate (a) passes
     ([`docs/slo.md`](../slo.md), "Amendment 2026-10-06: S1 gate (b)
     harness").
-- **The hermetic rig: ruled, in progress, not on `main`.** Operator rulings
+- **The hermetic rig: the S1 gate of record, on `main`.** Operator rulings
   OI-1003-Q96 and OI-1003-Q97 (2026-10-07) make a hermetic rig the S1 gate
-  of record: two quiet Linux hosts plus a macOS source, on a sealed corpus.
-  A neo → sting run then serves as a field confirmation, not as the gate.
-  The rig's enablement is in progress. At `a80c63b`, `docs/slo.md` carries
-  no amendment for these rulings and no rig code or evidence is on `main`;
-  this paper cites the rulings as this refresh's dispatch gave them. Until
-  the amendment lands, the gate text in `docs/slo.md` is the one above.
-  - **Pending, off `main`.** Branch `feat/s1-hermetic-rig-20261007` (head
-    `83d08dc` on 2026-10-07, no pull request) carries a draft `docs/slo.md`
-    amendment for these rulings, the harness changes, and one draft
-    gated-mode gate (a) sample at commit `640093d`. The sample has no A
-    control and its B verdict is FAIL, 0 of 3. Section 5.3 reports it.
+  of record; a neo → sting run is a field confirmation, not the gate. The
+  rig (mbp-13), its pinned A control `3931471` (OI-1003-Q103) and the
+  flake-pinned rclone (OI-1003-Q105) are on `main` through #206, with the
+  `docs/slo.md` amendments and the sample of record
+  ([evidence](../evidence/r23-2026-10-07-1410Z-mbp-13-record.md)).
 - **The estate-shaped corpus** (#159, OI-1003-Q19): a deterministic, sealed
   generator of Git-heavy, many-small-file trees
   ([evidence](../evidence/estate-corpus-v1-2026-10-03.md)).
@@ -1200,9 +1194,9 @@ property tier and every benchmark are outside both.
 
 | SLO | Instrument | State |
 |---|---|---|
-| S1 gate (a) | R23 A/B harness under R-N81 | **Not met. No gated sample of the wire v5 engine is on `main`.** Informational numbers only (section 5.2). Pending off `main`: one draft gated-mode sample with no A control, B FAIL 0 of 3 (section 5.3). |
+| S1 gate (a) | R23 A/B harness under R-N81 | **Not met. FAIL of record**: the rig sample of 2026-10-07 14:10Z, 0 of 3 B reps (section 5.1). |
 | S1 gate (b) | `gate_b.py` | Harness on `main`. Pending: no run, and the native multi-stream arm is not built. |
-| S1 gate of record | hermetic rig (OI-1003-Q96, Q97) | Ruled 2026-10-07; in progress; not on `main`. A draft amendment and one draft sample are on branch `feat/s1-hermetic-rig-20261007` (section 5.3). |
+| S1 gate of record | hermetic rig (OI-1003-Q96, Q97) | On `main` (#206): rig, pinned A control, flake-pinned rclone, and the FAIL above. |
 | S2 properties | P-S2, P34, P75, the priority test; `MC_s2` | Gated for the file path, the Git object store and the SQLite exceptions. Open: #188, the Q16 lock counter, P34's traced form. |
 | S2 budget | `s2_budget.py` | Pending. Never measured (#165). |
 | S3 file path | P21, P23, P18, P19, fault-harness I3; the model's S3 invariants | Gated, with three properties ignored against #186 and #187. |
@@ -1217,7 +1211,7 @@ property tier and every benchmark are outside both.
 ## 5. Results
 
 This section reports only what files on `main` record, with dates. The one
-exception is the draft S1 sample in section 5.3, which is on an unmerged
+exception is the sample of PR #210 in section 5.2, which is on an unmerged
 branch and is marked so. No number is rounded, extrapolated or combined
 from two files.
 
@@ -1247,19 +1241,37 @@ every pull request. These hold on `main` at `a80c63b`:
   proves the root refusal only (section 7).
 - **S4 for Git items**: P72 and P73 (`src/outcome.rs`, `src/closure.rs`).
 
-**No benchmark sample on `main` is gated.** No file on `main` records an
-S1, S2-budget or S3-ratio sample of the wire v5 engine taken under R-N81
-and R-N91. Off `main`, one draft S1 sample was taken in gated mode without
-its A control (section 5.3).
+**One benchmark sample on `main` is gated: S1's, and it fails.** The gated
+rig sample of 2026-10-07 14:10Z (B = `adfdf57`, A = the pinned `3931471`,
+rclone v1.74.4 flake-pinned; [evidence](../evidence/r23-2026-10-07-1410Z-mbp-13-record.md))
+is a FAIL, 0 of 3 B reps: native initial copy 856.7 ms against rclone
+360.7 ms, 1 % delta 140.5 against 107.7 ms. Warm and interrupted resume read
+zero in every rep, and peak memory stayed under its bound. No S2-budget or
+S3-ratio sample is gated.
 
 ### 5.2 Informational
 
 Each item below is on record but enforced by nothing.
 
-**S1. There is still no gated sample on `main`.** The only S1 numbers on
-`main` since wire v5 are these. **Read them beside section 5.3**: the
-under-load numbers below favour native, and the only gated-mode sample that
-exists, a draft off `main`, points the other way.
+**S1: where the gap is (2026-10-07 and 08, informational).** Measured after
+the FAIL of record, on the same rig, to find what native spends its time on:
+
+- **The syncs are not the critical path.** A gated sample of PR #210 (a
+  Linux group seal by `syncfs`, held for review; evidence on its branch)
+  batched 20 of 23 files and cut flush time by about 140 ms; wall time did
+  not move (852 against A's 876 ms).
+- **Native is not CPU-bound**
+  ([profile](../evidence/s1-profile-2026-10-07.md)). A copy spends about
+  1.1 user CPU-seconds against rclone's 0.85, but keeps about 1.5 of 4 CPUs
+  busy for 0.75 s where rclone keeps 2.7 busy for 0.32 s. No native thread
+  is saturated.
+- **Fixed per-copy work is the gap**
+  ([hand-off timers](../evidence/r23-2026-10-08-0239Z-mbp-13-handoff.md),
+  #212). The steady stream accounts for about 350 ms of the receiving
+  thread; the other 450 to 500 ms of each copy is outside it: two fresh
+  stores, about 17 fully synced SQLite commits, and the tail.
+
+Older S1 numbers, for the record:
 
 - **2026-10-04, under load, on neo** (B = `cd4ffad`;
   [coordinator note](../agent-notes/2026-10-05-coordinator.md), "Measured";
@@ -1274,10 +1286,10 @@ exists, a draft off `main`, points the other way.
     it suggests is not evidence of S1;
   - **no file under `docs/evidence/` records it.** The harness now writes
     under-load evidence files, but the rerun has not happened;
-  - **the only gated-mode sample points the other way.** In the draft
-    sample of 2026-10-07 on the hermetic rig, native lost the initial copy
-    and the delta in all three B reps (section 5.3). The two samples differ
-    in host, platform and load, so neither ratio transfers to the other.
+  - **the gated sample of record points the other way.** On the hermetic
+    rig, native lost the initial copy and the delta in all three B reps
+    (section 5.1). The two samples differ in host, platform and load, so
+    neither ratio transfers to the other.
 - **Before wire v5** (historical). The last completed gate sample,
   2026-09-18, **failed**: it lost the initial copy to rclone and won the
   1 % delta, and both are mandatory
@@ -1376,8 +1388,7 @@ history on disk and so motivated incremental Git carry
 
 | Result owed | Blocker or state |
 |---|---|
-| A gated S1 gate (a) sample on wire v5 | None on `main`. One draft sample without its A control is on an unmerged branch (below). The hermetic rig (OI-1003-Q96, Q97) is in progress. |
-| A ruling on the draft rig sample | The operator's decision: accept B/B/B on the rig, pin a newer A that runs on Linux, or record a refused A rep without aborting (the branch's draft `docs/slo.md` amendment, "Open: the A control on the rig"). |
+| An S1 PASS | The FAIL of record stands. Next: a setup / stream / tail timeline, then fewer and cheaper commits per copy (section 5.2). PR #210 (`syncfs` group seal) is held for review (OI-1003-Q112). |
 | An S1 gate (b) sample | Waits on gate (a) (OI-1003-Q66). The multi-stream arm is not built. |
 | A re-run of the under-load sample with the fixed harness | Open in the [under-load note](../agent-notes/2026-10-04-r23-under-load.md). |
 | The S2 measured budget | Issue #165. Never run. |
@@ -1389,34 +1400,10 @@ history on disk and so motivated incremental Git carry
 | The daily-work verdict on the destination | Issue #40. |
 | The neo read-only estimate pass | Deferred ([probes](../evidence/2026-10-04-q42-probes.md), "Pending"). |
 
-**The draft gated-mode S1 sample (off `main`).** This is the one result in
-the paper that no file on `main` records. It is on branch
-`feat/s1-hermetic-rig-20261007` at commit `640093d` (2026-10-07; branch
-head `83d08dc`; no pull request), in
-`docs/evidence/r23-2026-10-07-0652Z-no-a-control.md` and its `.json`. As
-that file records it:
-
-- **What ran.** Gate (a) in the harness's `gated` mode on mbp-13 (Linux
-  x86_64, XFS), on the sealed R23 corpus v1 (23 files, 239,819,837 bytes),
-  with rclone v1.74.4. Every rep row reads `gated=True` on AC power, with
-  a 1-minute load before the B reps of 2.03, 1.87 and 1.82, and the
-  coordinator-quiet acknowledgement set (R-N91). B was `3e7b5bf`, a commit
-  of that branch.
-- **No A control.** The order was B/B/B, not the ratified B/A/B/A/B
-  (OI-1002-Q30), because the pinned A refused on that host. The file's
-  status is `complete-draft-no-a-control`.
-- **Verdict as printed: "R23 gate verdict for B: FAIL (NO A CONTROL)", 0 of
-  3 B reps.** Native's initial-copy medians were 872.965, 914.173 and
-  854.826 ms against rclone's 367.994, 361.784 and 358.996 ms. The delta
-  win was `False` in all three reps as well. Warm and interrupted resume
-  read zero in every rep, and peak memory stayed under its bound.
-- **Standing.** It is not a gate verdict of record. The file says that
-  whether it stands "is the operator's decision". It may be amended, rerun
-  with an A control, or withdrawn before it reaches `main`.
-
-What it changes for this paper: "no gated sample" is a statement about
-`main`, not about what has been attempted. A gated-mode measurement of wire
-v5 has been attempted once, and native lost it.
+**The earlier draft S1 sample.** The draft gated-mode sample of
+2026-10-07 06:52Z (B/B/B, no A control) is superseded by the sample of
+record in section 5.1, which repeated it with the pinned A control and gave
+the same verdict.
 
 ## 6. Prior art
 
@@ -1579,16 +1566,10 @@ tested corpus is bounded and identical on every run (section 4.1).
 
 **Performance is unproven.**
 
-- **No gated S1 sample of the wire v5 engine is on `main`.** Every gated or
-  completed timing on `main` predates it, and the one sample on `main`
-  since is informational, aborted, and not in `docs/evidence/`
-  (section 5.2).
-- **The one gated-mode sample that exists is a draft, off `main`, and
-  native lost it.** B failed 0 of 3 on the hermetic rig, on the initial
-  copy and on the delta, with no A control (section 5.3). The under-load
-  numbers that favour native are therefore not the whole record.
-- The hermetic rig that is to be the gate of record is ruled and not built
-  into `main` (OI-1003-Q96, Q97).
+- **S1 fails on the rig of record.** B failed 0 of 3 on the initial copy and
+  on the delta (section 5.1). The gap is located, in fixed per-copy work,
+  but not closed (section 5.2). The under-load numbers that favour native
+  are not the whole record.
 - Gate (b)'s native multi-stream arm is not built, so gate (b) can only
   measure the single-stream engine today.
 - Buffer reuse is not wired in (section 2.1).
@@ -1736,13 +1717,10 @@ to `a80c63b`. In order of weight:
    `main`.
 7. **S3 has evidence on the estate corpus**, informational and taken before
    four later fixes.
-8. **S1 is unchanged in the way that matters: there is still no gated
-   sample on `main`.** The gate (a) run this paper's earlier revision said
-   had "started" produced no verdict. New since then: an under-load mode
-   and one informational sample, a gate (b) harness, and rulings that make
-   a hermetic rig the gate of record. Off `main`, the rig's branch holds
-   one draft gated-mode sample with no A control, in which B failed 0 of 3
-   (section 5.3).
+8. **S1 now has a verdict of record, and it is a FAIL.** The hermetic rig
+   (OI-1003-Q96, Q97) is on `main` with its pinned A control and rclone,
+   and its gated sample failed 0 of 3 (section 5.1). The profile and the
+   hand-off timers place the gap in fixed per-copy work (section 5.2).
 9. **CI went from four gates to two**, capped at 25 minutes (#190).
 10. **Rulings that were "not yet on `main`" now are**: OI-1003-Q24, Q25,
     Q26, Q34, Q36, Q37 and Q40 are all in `docs/slo.md`.

@@ -1,7 +1,7 @@
 //! Syscall trace for the crash-state checker (R-N88).
 //!
 //! With the `io-trace` feature on, every mutating call in `io::sys` (write,
-//! sync, rename, link, unlink, mkdir, symlink, fchmod, create) appends one
+//! sync, rename, exchange, link, unlink, mkdir, symlink, fchmod, create) appends one
 //! [`Event`] to the recorder attached to the calling thread, or to the
 //! process-wide recorder when none is. The stores add one [`Event::Commit`]
 //! per `SQLite` commit, naming what the commit made durable. The checker
@@ -102,6 +102,16 @@ pub enum Event {
         to_dir: NodeId,
         to: Vec<u8>,
     },
+    /// Entries `a` and `b` of `dir` traded their files in one atomic call
+    /// (`RENAME_EXCHANGE`, WP0(d)): `a` now names `a_node` and `b` now names
+    /// `b_node`. Nothing was replaced or removed.
+    Exchange {
+        dir: NodeId,
+        a: Vec<u8>,
+        a_node: NodeId,
+        b: Vec<u8>,
+        b_node: NodeId,
+    },
     /// Entry `name` removed from `dir`.
     Unlink { dir: NodeId, name: Vec<u8> },
     /// The call succeeded but its event could not be built (the identity
@@ -114,8 +124,27 @@ pub enum Event {
 pub enum CommitRecord {
     /// A destination output: `rel_path` holds the source's bytes.
     Output { rel_path: Vec<u8> },
+    /// A superseding publish was recorded ahead of its exchange (WP0(d),
+    /// #187): the rows of the output at `rel_path` left the store, and until
+    /// the record is settled the store says only that `rel_path` and
+    /// `temp_path` hold, in either order, the staged file `staged` and this
+    /// store's own output `owned`.
+    SupersedeBegun {
+        rel_path: Vec<u8>,
+        temp_path: Vec<u8>,
+        staged: NodeId,
+        owned: NodeId,
+    },
+    /// A superseding publish's record was deleted: with `restored`, the old
+    /// output's rows are back (the exchange did not happen); otherwise the
+    /// path is described only by an `Output` record of the same commit, if
+    /// any.
+    SupersedeSettled { rel_path: Vec<u8>, restored: bool },
     /// A source capture (manifest) under the store's row key.
     Capture { key: Vec<u8> },
+    /// A seat's remembered refusal under the store's row key (#186): the
+    /// source answers it from this record without opening the file.
+    RefusedSeat { key: Vec<u8> },
     /// A directory record bound to inode `node` with final `mode`, or, with
     /// `node` `None`, an intent recorded before a fallback `mkdirat`.
     DirectoryCreated {

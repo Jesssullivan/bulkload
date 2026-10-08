@@ -18,7 +18,8 @@
 //! write-back starts as it is queued ([`start_writeback`]); the group then
 //! runs one `syncfs` per device its outputs live on ([`seal_device`]), which
 //! makes every temporary's data durable under its temporary name; renames
-//! every output into place; and runs one `syncfs` per touched device again,
+//! every output into place (or, superseding one, exchanges it in: WP0(d));
+//! and runs one `syncfs` per touched device again,
 //! which makes the new entries durable, before the records commit. The
 //! renames never precede the first seal: a name must not survive a power
 //! loss that its data did not.
@@ -82,7 +83,75 @@ impl std::fmt::Display for Durability {
     }
 }
 
+/// How the SOURCE ledger's row commits reach disk (WP0(g): OI-1003-Q20,
+/// adopted with conditions by OI-1003-Q37, built on OI-1003-Q104).
+///
+/// The source ledger is a cache of what the source already holds: a row is
+/// a seat's row key and its chunk manifest, or a remembered refusal (#186).
+/// R25 is carried by the destination's committed rows, so losing a ledger
+/// row costs at most one more read (or sniff) of its seat, and only where
+/// the destination no longer holds that seat.
+///
+/// The mode covers the ledger's ROW commits and nothing else
+/// (`StorePublisher::commit_captures` on a source publisher). The commit
+/// that creates a store (its schema and its authority, in `Store::open`),
+/// the state root's seals (#161) and every destination commit are
+/// `synchronous=FULL`, `fullfsync=ON` in both modes
+/// ([`configure_sqlite`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LedgerSync {
+    /// `synchronous=NORMAL`, `fullfsync=OFF` on the source publisher's
+    /// connection ([`relax_ledger_rows`]). A row commit appends to the WAL
+    /// without syncing it, so a power loss may roll back the most recent
+    /// row commits; a process crash loses none. A failed row commit is
+    /// counted (`source_ledger_commit_failed`) and the transfer goes on
+    /// (#163). The default (OI-1003-Q37).
+    #[default]
+    Relaxed,
+    /// `synchronous=FULL`, `fullfsync=ON`: every row commit is durable when
+    /// it returns, and the first failed one fails the session, as before
+    /// WP0(g). For A/B comparison against [`LedgerSync::Relaxed`].
+    Full,
+}
+
+impl std::str::FromStr for LedgerSync {
+    type Err = BulkloadRefusal;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "relaxed" => Ok(Self::Relaxed),
+            "full" => Ok(Self::Full),
+            _ => Err(BulkloadRefusal::FieldDomainViolation),
+        }
+    }
+}
+
+impl std::fmt::Display for LedgerSync {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Relaxed => "relaxed",
+            Self::Full => "full",
+        })
+    }
+}
+
 static MODE: AtomicU8 = AtomicU8::new(0);
+static LEDGER_SYNC: AtomicU8 = AtomicU8::new(0);
+
+/// Set the process-wide source-ledger sync mode (`--source-ledger-sync`).
+pub fn set_ledger_sync(mode: LedgerSync) {
+    LEDGER_SYNC.store(u8::from(mode == LedgerSync::Full), Ordering::Relaxed);
+}
+
+/// The process-wide source-ledger sync mode.
+#[must_use]
+pub fn ledger_sync() -> LedgerSync {
+    if LEDGER_SYNC.load(Ordering::Relaxed) == 0 {
+        LedgerSync::Relaxed
+    } else {
+        LedgerSync::Full
+    }
+}
 
 /// Set the process-wide durability mode (`--durability`).
 pub fn set_durability(mode: Durability) {
@@ -305,6 +374,46 @@ pub fn configure_sqlite(conn: &rusqlite::Connection) -> Result<()> {
         true,
     )
     .map_err(refuse)?;
+    Ok(())
+}
+
+/// Relax the row commits of a SOURCE ledger connection (WP0(g),
+/// [`LedgerSync::Relaxed`]): `synchronous=NORMAL` and `fullfsync=OFF`.
+///
+/// Call it only on the source publisher's own connection, and only after
+/// `Store::open` has returned on it: the store's creation commit (schema
+/// and authority) and its root seals are then already durable, and nothing
+/// this connection commits afterwards can undo them. In WAL mode a NORMAL
+/// commit appends its frames without syncing the WAL. A power loss can
+/// then cut the WAL's tail, and recovery stops at the last commit whose
+/// frame checksums hold: commits are lost newest first, and a surviving
+/// row is never a torn one.
+///
+/// `checkpoint_fullfsync` stays ON ([`configure_sqlite`] set it): a
+/// checkpoint still syncs the WAL and then the database with a full flush
+/// (`F_FULLFSYNC` on Darwin), so what a checkpoint moved is durable and
+/// the WAL header a later commit rewrites is synced before its frames.
+///
+/// # Errors
+/// Refuses if `SQLite` rejects a setting or does not report it back.
+pub fn relax_ledger_rows(conn: &rusqlite::Connection) -> Result<()> {
+    let refuse = |_| BulkloadRefusal::SqliteIntegrityCheckFailed;
+    conn.execute_batch(
+        "PRAGMA synchronous=NORMAL;
+        PRAGMA fullfsync=OFF;",
+    )
+    .map_err(refuse)?;
+    let read = |pragma: &str| -> Result<i64> {
+        conn.query_row(pragma, [], |row| row.get(0)).map_err(refuse)
+    };
+    // 1 is NORMAL. A connection that did not take the settings would commit
+    // rows under a mode the counters do not report.
+    if read("PRAGMA synchronous")? != 1
+        || read("PRAGMA fullfsync")? != 0
+        || read("PRAGMA checkpoint_fullfsync")? != 1
+    {
+        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+    }
     Ok(())
 }
 

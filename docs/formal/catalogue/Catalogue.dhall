@@ -234,6 +234,10 @@ let constantLines =
               , pad = "       "
               , value = showBool c.AdoptUnrowed
               }
+            , { name = "ExchangeSupported"
+              , pad = "  "
+              , value = showBool c.ExchangeSupported
+              }
             ]
 
 let defaults
@@ -262,6 +266,12 @@ let defaults
           {- The code since #169: each non-racy staged file carries its
              capture record, and a resume adopts a durable unrowed output
              the record proves, without a source read.
+          -}
+          True
+      , ExchangeSupported =
+          {- OI-1003-Q100: the destination file system has the atomic
+             exchange of two names. Read only under SupersedeMode exchange;
+             MC_supersede_noexchange and its rows turn it off.
           -}
           True
       }
@@ -400,12 +410,22 @@ let verdict
           , adopt_unverified = P.RecordImpliesBytes
           , reuse_ignores_row = P.AdoptOnlyUnrowed
           , adopt_unrecorded = P.R25_StrictNoDurableReread
+          , owned_ignores_identity = P.NoClobber
+          , sweep_drops_ownership = P.SupersedeAtomic
+          , exchange_before_intent = P.SupersedeAtomic
+          , own_is_reuse = P.OwnershipNeverReuse
+          , refusal_unbound = P.RememberedRefusalSound
+          , late_exchange_refusal = P.ExchangeRefusedUpFront
           }
           m
 
 -- Coverage (README.md, "Coverage"): the actions a pass row's report must show
 -- never enabled. tla-check fails a pass row on any difference.
-let wp0dOff = [ A.CheckOwn, A.Exchange, A.RenameReplace, A.VerifyDisp ]
+let wp0dOff =
+      [ A.BeginSupersede, A.CheckOwn, A.Exchange, A.RenameReplace, A.VerifyDisp ]
+
+-- OI-1003-Q100: with no atomic exchange nothing is ever superseded.
+let noExchange = [ A.BeginSupersede, A.Exchange, A.VerifyDisp ]
 
 let checkRename = [ A.CheckOwn, A.RenameReplace ]
 
@@ -460,6 +480,51 @@ let passStrict =
           , properties = [] : List P
           , never
           }
+
+{- #187's four properties (OI-1003-Q100..Q102), beside the safety
+   invariants: checked by every pass row with the superseding publish on.
+-}
+let superseding =
+      [ P.SupersedeAtomic
+      , P.OwnershipNeverReuse
+      , P.RememberedRefusalSound
+      , P.ExchangeRefusedUpFront
+      ]
+
+-- A pass row of the code since #187: SupersedeMode exchange.
+let passSupersede =
+      \(never : List A) ->
+        T.Expect.pass
+          { invariants = safety # [ P.AdoptOnlyUnrowed ] # superseding
+          , properties = [] : List P
+          , never
+          }
+
+-- The same with R25's strict reading (TrackStrictHeld).
+let passSupersedeStrict =
+      \(never : List A) ->
+        T.Expect.pass
+          { invariants =
+                safety
+              # [ P.R25_StrictNoDurableReread, P.AdoptOnlyUnrowed ]
+              # superseding
+          , properties = [] : List P
+          , never
+          }
+
+{- The superseding publish's one-seat bound (MC_wp0d_exchange): three runs,
+   one crash, one edit, one third-party write.
+-}
+let exchangeOne =
+          defaults
+      //  { Seats = [ Seat.a ]
+          , MaxRuns = 3
+          , MaxForeign = 1
+          , SupersedeMode = Mode.exchange
+          }
+
+-- The same on a destination with no atomic exchange (OI-1003-Q100).
+let noExchangeOne = exchangeOne // { ExchangeSupported = False }
 
 -- #169's bound for R25's strict reading: one crash between runs.
 let strictOne =
@@ -534,14 +599,16 @@ let budgetSelftest =
       //  { symmetry = True }
 
 let positives =
-      [ -- The code as it is today.
+      [ -- The transfer without superseding publish: the code before #187
+        -- (README.md, "Rows that model the transfer before #187").
             row
               "MC_main"
               (passAdopt (noForeign # [ A.CommitFail ] # wp0dOff # estateOff))
-              [ "Main config, breadth: the code as it is today (strict source ledger,"
-              , "no superseding publish), with the state root assumed sealed. Two"
-              , "seats, two runs, one crash of either host or both, one source edit"
-              , "per seat; destination faults off."
+              [ "Main config, breadth: a strict source ledger and no superseding"
+              , "publish (the transfer before #187; MC_supersede_main is this bound"
+              , "with it), with the state root assumed sealed. Two seats, two runs,"
+              , "one crash of either host or both, one source edit per seat;"
+              , "destination faults off."
               ]
               main
         //  { symmetry = True }
@@ -634,23 +701,102 @@ let positives =
                 }
             //  faults
           )
-      , -- WP0(d) candidate designs (no code yet).
-        row
-          "MC_wp0d_exchange"
-          (passAdopt ([ A.CommitFail ] # checkRename # estateOff))
-          [ "WP0(d) superseding publish, exchange design (no code yet):"
-          , "RENAME_EXCHANGE, then the displaced identity is checked against this"
-          , "store's rows and a foreign file is swapped back; recovery restores a"
-          , "displaced foreign file. One seat, three runs, one crash, one edit,"
-          , "one third-party write."
+      , row
+          "MC_wp0g_strict"
+          (passStrict (wp0dOff # estateOff))
+          [ "WP0(g) with R25's strict reading (#169, OI-1003-Q40): MC_wp0g_deep's"
+          , "bound with TrackStrictHeld. A relaxed ledger that loses rows, to a"
+          , "power loss or to a failed commit, never costs a read of bytes the"
+          , "destination holds durably, with a row or (by the capture record)"
+          , "without one."
           ]
           (     defaults
             //  { Seats = [ Seat.a ]
                 , MaxRuns = 3
-                , MaxForeign = 1
+                , MaxCrashes = 2
+                , RelaxedSourceLedger = True
+                , TrackStrictHeld = True
+                }
+            //  faults
+          )
+      , -- WP0(d) superseding publish, the exchange design: the code since #187.
+        row
+          "MC_wp0d_exchange"
+          (passSupersede ([ A.CommitFail ] # checkRename # estateOff))
+          [ "WP0(d) superseding publish, exchange design (the code since #187):"
+          , "an intent that takes the path's rows, RENAME_EXCHANGE, then the"
+          , "displaced identity is checked against the intent and a foreign file"
+          , "is swapped back; the next session's sweep settles an intent a crash"
+          , "left (rows back, an ownership row, or a displaced foreign file"
+          , "restored). With the ownership row of a racy publish and the"
+          , "remembered refusal (OI-1003-Q101, Q102). One seat, three runs, one"
+          , "crash, one edit, one third-party write."
+          ]
+          exchangeOne
+      ,     row
+              "MC_supersede_main"
+              ( passSupersede
+                  (noForeign # [ A.CommitFail ] # checkRename # estateOff)
+              )
+              [ "The code since #187, breadth: MC_main's bound with the superseding"
+              , "publish (exchange design). Two seats, two runs, one crash of either"
+              , "host or both, one source edit per seat; destination faults off."
+              ]
+              (main // { SupersedeMode = Mode.exchange })
+        //  { symmetry = True }
+      , row
+          "MC_supersede_deep"
+          (passSupersede (checkRename # estateOff))
+          [ "The code since #187, depth: MC_main_deep's bound with the superseding"
+          , "publish. One seat through three runs and two crashes, with a source"
+          , "edit and every destination fault: a third-party write or delete, a"
+          , "failed group commit and the space refusal."
+          ]
+          (     defaults
+            //  { Seats = [ Seat.a ]
+                , MaxRuns = 3
+                , MaxCrashes = 2
                 , SupersedeMode = Mode.exchange
                 }
+            //  faults
           )
+      ,     row
+              "MC_supersede_strict_main"
+              ( passSupersedeStrict
+                  (noForeign # [ A.CommitFail ] # checkRename # estateOff)
+              )
+              [ "OI-1003-Q102: R25 with the superseding publish on, breadth."
+              , "MC_supersede_main's bound with TrackStrictHeld, so both"
+              , "R25_NoDurableReread and R25_StrictNoDurableReread are checked"
+              , "across the intent, the exchange and the sweep."
+              ]
+              (main // { SupersedeMode = Mode.exchange, TrackStrictHeld = True })
+        //  { symmetry = True }
+      , row
+          "MC_supersede_strict_deep"
+          (passSupersedeStrict (checkRename # estateOff))
+          [ "OI-1003-Q102: R25 with the superseding publish on, depth."
+          , "MC_supersede_deep's bound with TrackStrictHeld."
+          ]
+          (     defaults
+            //  { Seats = [ Seat.a ]
+                , MaxRuns = 3
+                , MaxCrashes = 2
+                , SupersedeMode = Mode.exchange
+                , TrackStrictHeld = True
+                }
+            //  faults
+          )
+      , row
+          "MC_supersede_noexchange"
+          (passSupersede ([ A.CommitFail ] # noExchange # checkRename # estateOff))
+          [ "OI-1003-Q100: the code since #187 on a destination with no atomic"
+          , "exchange. A seat whose output would be superseded is refused"
+          , "DESTINATION_EXCHANGE_UNSUPPORTED before anything is staged; there is"
+          , "no fallback, so nothing is ever replaced (ExchangeRefusedUpFront)."
+          , "The refusal is remembered. MC_wp0d_exchange's bound."
+          ]
+          noExchangeOne
       , -- S2.
         row
           "MC_s2"
@@ -786,6 +932,58 @@ let witnesses =
               , "misses, and reads it to build the manifest. A strict ledger never"
               , "loses a row, so this is the relaxed-only behaviour MC_wp0g must"
               , "explore for its PASS to say anything about OI-1003-Q20."
+              ]
+              wp0g
+        //  { symmetry = True }
+      , row
+          "MC_reach_exchange_refused"
+          (T.Expect.reach W.Witness_ExchangeRefused)
+          [ "REACH (expected REACHED): at MC_supersede_noexchange's bound a"
+          , "changed seat's own output is refused"
+          , "DESTINATION_EXCHANGE_UNSUPPORTED (OI-1003-Q100), so that pass row"
+          , "explores the refusal."
+          ]
+          noExchangeOne
+      , row
+          "MC_reach_remembered_refusal"
+          (T.Expect.reach W.Witness_RememberedRefusal)
+          [ "REACH (expected REACHED): at MC_wp0d_exchange's bound an entry is"
+          , "refused from its remembered refusal when it is offered (RecvEntry),"
+          , "with nothing read at the source."
+          ]
+          exchangeOne
+      , row
+          "MC_reach_ownership_superseded"
+          (T.Expect.reach W.Witness_OwnershipSuperseded)
+          [ "REACH (expected REACHED): at MC_wp0d_exchange's bound a superseding"
+          , "publish begins on an output this store owns by its ownership row"
+          , "alone: a racy publish whose seat changed again (OI-1003-Q101)."
+          ]
+          exchangeOne
+      , row
+          "MC_reach_sweep_ownership"
+          (T.Expect.reach W.Witness_SweepOwnership)
+          [ "REACH (expected REACHED): at MC_wp0d_exchange's bound the sweep"
+          , "settles an interrupted supersede whose staged file is at the leaf"
+          , "with the path's ownership row (StartRun)."
+          ]
+          exchangeOne
+      , row
+          "MC_reach_sweep_restore"
+          (T.Expect.reach W.Witness_SweepRestore)
+          [ "REACH (expected REACHED): at MC_wp0d_exchange's bound the sweep"
+          , "settles an interrupted supersede whose exchange did not take effect"
+          , "by putting the old output's rows back (StartRun)."
+          ]
+          exchangeOne
+      ,     row
+              "MC_reach_wp0g_failed_commit"
+              (T.Expect.reach W.Witness_FailedRowRead)
+              [ "REACH (expected REACHED): at MC_wp0g's bound a relaxed ledger's row"
+              , "commit fails and is counted, not fatal (#163; LedgerSync::Relaxed),"
+              , "and with no crash at all a later run consults the ledger for that"
+              , "seat, misses, and reads it to build the manifest. So MC_wp0g's PASS"
+              , "covers the counted failure as well as the power loss."
               ]
               wp0g
         //  { symmetry = True }
@@ -1073,6 +1271,101 @@ let primary =
             ]
           }
         }
+      , owned_ignores_identity =
+        { mutation = M.owned_ignores_identity
+        , constants =
+            one // { MaxRuns = 2, MaxForeign = 1, SupersedeMode = Mode.exchange }
+        , comment =
+          { head =
+              "#187: any file at a path that has an ownership row is superseded,"
+          , tail =
+            [ "whatever its identity (owned_output without the identity"
+            , "comparison): a third party's file that replaced a racy publish is"
+            , "exchanged away and removed."
+            ]
+          }
+        }
+      , sweep_drops_ownership =
+        { mutation = M.sweep_drops_ownership
+        , constants =
+                one
+            //  { MaxRuns = 3
+                , MaxCrashes = 1
+                , MaxEdits = 1
+                , SupersedeMode = Mode.exchange
+                }
+        , comment =
+          { head =
+              "#187: the sweep deletes the intent of an interrupted supersede"
+          , tail =
+            [ "whose staged file is at the leaf without recording its ownership"
+            , "(settle_supersede with no owned identity): the new output is left"
+            , "with no row of any kind."
+            ]
+          }
+        }
+      , exchange_before_intent =
+        { mutation = M.exchange_before_intent
+        , constants =
+                one
+            //  { MaxRuns = 2
+                , MaxCrashes = 1
+                , MaxEdits = 1
+                , SupersedeMode = Mode.exchange
+                }
+        , comment =
+          { head =
+              "#187: the exchange runs ahead of the intent's commit, which"
+          , tail =
+            [ "follows it (begin_supersedes after io::exchange). A crash between"
+            , "the two leaves the new output beside the old output's rows."
+            ]
+          }
+        }
+      , own_is_reuse =
+        { mutation = M.own_is_reuse
+        , constants = one // { MaxRuns = 2, SupersedeMode = Mode.exchange }
+        , comment =
+          { head =
+              "OI-1003-Q101: an output the path's ownership row names is answered"
+          , tail =
+            [ "Reuse (output_matches reading owned_outputs): a racy publish"
+            , "becomes a reuse source (#86)."
+            ]
+          }
+        }
+      , refusal_unbound =
+        { mutation = M.refusal_unbound
+        , constants =
+            one // { MaxRuns = 2, MaxForeign = 2, SupersedeMode = Mode.exchange }
+        , comment =
+          { head =
+              "#187 review: a remembered refusal is answered by its row key alone,"
+          , tail =
+            [ "without comparing the identity of the file now at the path"
+            , "(refused_output), so it outlives the file it was about."
+            ]
+          }
+        }
+      , late_exchange_refusal =
+        { mutation = M.late_exchange_refusal
+        , constants =
+                one
+            //  { MaxRuns = 2
+                , MaxEdits = 1
+                , SupersedeMode = Mode.exchange
+                , ExchangeSupported = False
+                }
+        , comment =
+          { head =
+              "OI-1003-Q100: no exchange probe at the plan, so on a destination"
+          , tail =
+            [ "with no atomic exchange a changed seat is staged and its chunks"
+            , "asked of the source before it is refused (the code before the #187"
+            , "review)."
+            ]
+          }
+        }
       }
 
 let primaryOf
@@ -1168,6 +1461,12 @@ let negRows
       , primaryOf M.adopt_unverified
       , primaryOf M.reuse_ignores_row
       , primaryOf M.adopt_unrecorded
+      , primaryOf M.owned_ignores_identity
+      , primaryOf M.sweep_drops_ownership
+      , primaryOf M.exchange_before_intent
+      , primaryOf M.own_is_reuse
+      , primaryOf M.refusal_unbound
+      , primaryOf M.late_exchange_refusal
       ]
 
 {- Every mutation label has exactly one primary row in negRows, and the
@@ -1371,9 +1670,10 @@ let invariants
     : List T.InvariantRow
     = [ { tla = P.R25_NoDurableReread
         , slo = [ S.S3 ]
-        , ruling = [ "R25", "R-N58", "OI-1003-Q7", "OI-1003-Q20" ]
-        , codeSymbol = [ "output_matches", "source_bytes_read" ]
-        , ptest = [ "P23", "P21", "P19", "P24", "P33" ]
+        , ruling = [ "R25", "R-N58", "OI-1003-Q7", "OI-1003-Q20", "OI-1003-Q37" ]
+        , codeSymbol =
+          [ "output_matches", "source_bytes_read", "relax_ledger_rows" ]
+        , ptest = [ "P23", "P21", "P19", "P24", "P33", "P79" ]
         }
       , { tla = P.R25_NoCommittedCaptureReread
         , slo = [ S.S3 ]
@@ -1420,7 +1720,7 @@ let invariants
       , { tla = P.LedgerAfterHeld
         , slo = [ S.S3 ]
         , ruling = [ "R-N58", "R-N86" ]
-        , codeSymbol = [ "commit_captures" ]
+        , codeSymbol = [ "commit_captures", "LedgerSync" ]
         , ptest = [ "P17", "P29" ]
         }
       , { tla = P.DoneAfterLedger
@@ -1444,8 +1744,9 @@ let invariants
       , { tla = P.NoClobber
         , slo = [ S.S4 ]
         , ruling = [ "OI-1003-Q18", "R-N119" ]
-        , codeSymbol = [ "publish_noreplace" ]
-        , ptest = [ "P7", "P8", "P26" ]
+        , codeSymbol =
+          [ "publish_noreplace", "owned_output", "settle_supersedes" ]
+        , ptest = [ "P7", "P8", "P26", "P78" ]
         }
       , { tla = P.S2_TypedSourceAccess
         , slo = [ S.S2 ]
@@ -1496,11 +1797,52 @@ let _ =
               invariants
         ===  map P Natural T.propertyIndex (filter P traced allProperties)
 
+{- #187's four properties (class finding, not frozen): the same traceability
+   as a frozen invariant's row, kept apart from `invariants`, whose rows are
+   the frozen ones. Their code symbols are grounded with the others.
+-}
+let supersedeInvariants
+    : List T.InvariantRow
+    = [ { tla = P.SupersedeAtomic
+        , slo = [ S.S4, S.Durability ]
+        , ruling = [ "OI-1003-Q18", "OI-1003-Q102", "R-N88" ]
+        , codeSymbol =
+          [ "begin_supersedes"
+          , "settle_supersede"
+          , "settle_supersedes"
+          , "settle_in"
+          ]
+        , ptest = [ "P78", "P33" ]
+        }
+      , { tla = P.OwnershipNeverReuse
+        , slo = [ S.S3, S.S5 ]
+        , ruling = [ "OI-1003-Q101", "#86", "R-N58" ]
+        , codeSymbol = [ "owner_key", "own_in", "output_matches" ]
+        , ptest = [ "P19", "P78" ]
+        }
+      , { tla = P.RememberedRefusalSound
+        , slo = [ S.S3, S.S4 ]
+        , ruling = [ "OI-1003-Q81", "R-N58" ]
+        , codeSymbol =
+          [ "refused_output", "remember_refused_output", "verify_settled" ]
+        , ptest = [ "P21", "P74" ]
+        }
+      , { tla = P.ExchangeRefusedUpFront
+        , slo = [ S.S4 ]
+        , ruling = [ "OI-1003-Q100" ]
+        , codeSymbol = [ "exchange_supported", "NoExchange" ]
+        , ptest = [ "P78" ]
+        }
+      ]
+
 -- The N-version explorer's rows (`just formal-nv`) ------------------------------
 
 {- The constants hs/Explorer.hs models: no failed group commit, no space
    refusal, a strict source ledger and store, no superseding publish, no
-   estate reads and a sealed state root. Seats, runs, crashes, edits and
+   estate reads and a sealed state root. #187's destination records (the
+   intent, the ownership row, the remembered refusal) and OI-1003-Q100's
+   refusal exist only under SupersedeMode exchange, so every row that
+   checks them is outside this domain; ExchangeSupported is pinned too. Seats, runs, crashes, edits and
    third-party writes are its bound flags; #169's capture record
    (AdoptUnrowed) and the strict-held ghost (TrackStrictHeld) are its
    --adopt and --strict-held switches (`switches` below).
@@ -1514,6 +1856,7 @@ let explorerModels =
         &&  merge { off = True, check_rename = False, exchange = False } c.SupersedeMode
         &&  c.EstateReads == False
         &&  c.StoreRootSealed
+        &&  c.ExchangeSupported
 
 {- Every mutation row inside the explorer's domain, with its bound as the
    explorer's flags. formal-nv runs each one on the explorer, which must
@@ -1632,7 +1975,7 @@ in  { files =
               T.InvariantRow
               Text
               (\(r : T.InvariantRow) -> r.codeSymbol)
-              invariants
+              (invariants # supersedeInvariants)
         , symbolMatch = showConstructor module.symbols
         , pendingSymbols = [] : List Text
         , labelSets = [] : List { name : Text, labels : List Text }
@@ -1640,6 +1983,7 @@ in  { files =
       , GitCarry.grounding
       ]
     , invariants
+    , supersedeInvariants
     , nversion
     , gitCarryInvariants = GitCarry.invariants
     , gitCarryNversion = GitCarry.nversion

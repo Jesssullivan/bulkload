@@ -20,7 +20,8 @@ bulkload-agent -- ordinary-file transport and offline SQLite composition
 
 USAGE:
     bulkload-agent [--durability=group|strict] [--min-free-percent=N]
-                   [--priority=background|normal] <SUBCOMMAND>
+                   [--priority=background|normal]
+                   [--source-ledger-sync=relaxed|full] <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
@@ -137,6 +138,14 @@ BOUNDARIES:
     --durability=group (the default) seals each file with a barrier and makes
     each group of files durable with one SQLite commit; --durability=strict
     fully flushes every file (A/B comparison). pull passes strict to serve.
+    --source-ledger-sync=relaxed (the default; WP0(g), OI-1003-Q37) commits
+    the SOURCE ledger's rows without syncing them: a power loss may lose the
+    newest rows, and each lost row costs at most one more read of its seat.
+    A failed row commit is counted (source_ledger_commit_failed), not fatal.
+    The store's creation commit (its authority) and every destination
+    commit stay fully synced. --source-ledger-sync=full syncs every row
+    commit and fails the session on the first failed one (A/B comparison).
+    pull passes full to serve.
     --min-free-percent=N (0-100, default 25): DESTINATION_SPACE_INSUFFICIENT
     when planned bytes would leave the destination filesystem (statvfs) with
     less than N% free. copy/pull refuse each entry that does not fit, as a
@@ -152,7 +161,14 @@ BOUNDARIES:
     --priority=normal is the explicit opt-out (gate (a)); every counters line
     records priority= and priority_from=default|flag.
     copy/pull require an existing destination directory.
-    copy/pull preserve divergent destinations and refuse live SQLite files.
+    copy/pull replace only their own untouched outputs, when the source seat
+    changed (superseding publish, WP0(d)); any other divergent destination
+    file is preserved and refused DESTINATION_OCCUPIED, and remembered: an
+    unchanged rerun does not read its seat again. On a file system with no
+    atomic exchange a changed seat is refused
+    DESTINATION_EXCHANGE_UNSUPPORTED before it is staged. They refuse live
+    SQLite files, sniffing each once (source_sniff_bytes on the counters
+    line) and remembering the refusal.
     They enumerate the source each run; completed content is resumable.
     File manifests allow 131072 chunks and frames at most 8 MiB; oversized files refuse.
     Git-native divergent union is not supplied by copy/pull.
@@ -348,8 +364,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// Remove `--durability=MODE` and `--min-free-percent=N` from the arguments
-/// and apply them process-wide, and `--priority=CLASS` into `priority`.
+/// Remove `--durability=MODE`, `--source-ledger-sync=MODE` and
+/// `--min-free-percent=N` from the arguments and apply them process-wide,
+/// and `--priority=CLASS` into `priority`.
 fn global_flags(
     args: Vec<std::ffi::OsString>,
     priority: &mut Option<bulkload_agent::priority::PriorityClass>,
@@ -361,6 +378,13 @@ fn global_flags(
             .and_then(|value| value.strip_prefix("--priority="))
         {
             *priority = Some(class.parse()?);
+            continue;
+        }
+        if let Some(mode) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--source-ledger-sync="))
+        {
+            bulkload_agent::durable::set_ledger_sync(mode.parse()?);
             continue;
         }
         match arg
@@ -1040,6 +1064,10 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
     ssh.arg("--").arg(host).arg(remote);
     if bulkload_agent::durable::durability() == bulkload_agent::durable::Durability::Strict {
         ssh.arg("--durability=strict");
+    }
+    // The remote `serve` is the source half: its ledger takes this mode.
+    if bulkload_agent::durable::ledger_sync() == bulkload_agent::durable::LedgerSync::Full {
+        ssh.arg("--source-ledger-sync=full");
     }
     let mut child = ssh
         .arg("serve")

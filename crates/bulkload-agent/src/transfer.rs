@@ -17,6 +17,20 @@
 //!   the stat identity is recorded), the destination answers
 //!   [`Control::NeedChunks`] by index, and the source sends only those.
 //!
+//! An existing output that no longer holds the seat's bytes is superseded
+//! when it is this store's own, untouched since its row was written (WP0(d),
+//! OI-1003-Q18, #187): the new file is staged beside it, filled from the old
+//! output's own chunks and the chunks the source sends, and exchanged with
+//! it in its group commit ([`crate::materialize`], "Superseding publish").
+//! Any other existing file is refused `DESTINATION_OCCUPIED` and left as it
+//! is.
+//!
+//! A seat the source refuses for its content (a `SQLite` header in its first
+//! bytes) is sniffed once: the refusal is remembered in the source ledger
+//! under the seat's row key, so a later run refuses the unchanged seat with
+//! the same code without opening it, and the sniffed bytes are counted as
+//! `source_sniff_bytes`, never as content (#186, R25).
+//!
 //! Data frames are paced by [`Control::Credit`]: the source never has more
 //! than the granted payload bytes in flight. The source keeps no byte pack;
 //! its ledger records digests and sizes only, so a refused capture leaves
@@ -54,12 +68,14 @@ use bulkload_proto::{FileKind, PROTO_VERSION};
 
 use crate::counters::{self, Counter};
 use crate::freshness::StatIdentity;
-use crate::io::durable::Committer;
+use crate::io::durable::{Committer, LedgerSync};
 use crate::materialize::{
-    verify_existing, Destination, PendingOutput, Publication, PublishSink, StagedFile,
+    owned_output, verify_existing, Destination, Displaced, OwnedOutput, PendingOutput, Publication,
+    PublishSink, SharedDisplaced, StagedFile,
 };
 use crate::transfer_store::{
-    row_key, ChunkHint, LedgerItem, LedgerSink, Manifest, OutputRecord, PublisherSide, Store,
+    row_key, ChunkHint, LedgerItem, LedgerRecord, LedgerSink, Manifest, OutputRecord,
+    PublisherSide, RefusedOutput, RefusedSeat, Store,
 };
 use crate::walk::{WalkItem, Walker};
 use crate::{BulkloadRefusal, Result, RowSchema};
@@ -92,6 +108,9 @@ const HINT_FILES: usize = 16;
 // Manifests are bounded separately. The walk is streamed; the source keeps
 // one small slot per offered entry and drops each row once it is retired.
 const MAX_MANIFEST_CHUNKS: usize = 131_072;
+/// Header bytes a capture reads before it can refuse a `SQLite` database or
+/// WAL by its magic (#186).
+const SNIFF_BYTES: u64 = 16;
 
 static WALK_NS: AtomicU64 = AtomicU64::new(0);
 static WALK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -100,6 +119,16 @@ static CDC_HASH_NS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static TRANSFER_NS: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+// Hand-off timers (S1, OI-1003-Q115): where each side of the wire blocks.
+static SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static SEND_HANDLE_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_READ_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_SETTLE_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_VERIFY_NS: AtomicU64 = AtomicU64::new(0);
+// The receiving side's timeline (S1, OI-1003-Q119): setup, stream, tail.
+static RECV_SETUP_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_STREAM_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_TAIL_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Receiver accounting; any refusal means the requested carry is incomplete.
 #[derive(Debug, Default)]
@@ -160,10 +189,36 @@ pub struct TransferTiming {
     /// (back-pressure, #112).
     pub walk_wait_ns: u64,
     pub reuse_census_ns: u64,
+    /// Capture workers' chunking and hashing, including the credit wait
+    /// they take inside it ([`Self::queue_wait_ns`]).
     pub cdc_hash_ns: u64,
+    /// Capture workers blocked on credit: the destination has not yet
+    /// returned the window's bytes.
     pub queue_wait_ns: u64,
+    /// The destination's data frames: wire verify and placement.
     pub transfer_ns: u64,
     pub materialize_ns: u64,
+    /// The source's sending thread blocked on its event queue, with nothing
+    /// to send (S1 hand-offs, OI-1003-Q115).
+    pub send_wait_ns: u64,
+    /// The sending thread handling an event, mostly writing frames to the
+    /// wire (blocked there when the wire is full).
+    pub send_handle_ns: u64,
+    /// The receiving thread in `read_frame`: blocked on the wire, or parsing.
+    pub recv_read_ns: u64,
+    /// The receiving thread answering committed outputs (`settle_held`).
+    pub recv_settle_ns: u64,
+    /// The receiving thread's wire verify, part of [`Self::transfer_ns`].
+    pub recv_verify_ns: u64,
+    /// `receive` before its frame loop: both stores and the destination
+    /// opened, the committer started, the root swept, `Open` / `Start`
+    /// exchanged (so the source's store opening too) (S1 timeline).
+    pub recv_setup_ns: u64,
+    /// `receive`'s frame loop, from the first frame to `SourceDone`.
+    pub recv_stream_ns: u64,
+    /// `receive` after its frame loop: the last group commits, directory
+    /// records and the session's flushes (`finish_receive`).
+    pub recv_tail_ns: u64,
 }
 
 impl TransferTiming {
@@ -177,6 +232,14 @@ impl TransferTiming {
             queue_wait_ns: QUEUE_WAIT_NS.load(Ordering::Relaxed),
             transfer_ns: TRANSFER_NS.load(Ordering::Relaxed),
             materialize_ns: MATERIALIZE_NS.load(Ordering::Relaxed),
+            send_wait_ns: SEND_WAIT_NS.load(Ordering::Relaxed),
+            send_handle_ns: SEND_HANDLE_NS.load(Ordering::Relaxed),
+            recv_read_ns: RECV_READ_NS.load(Ordering::Relaxed),
+            recv_settle_ns: RECV_SETTLE_NS.load(Ordering::Relaxed),
+            recv_verify_ns: RECV_VERIFY_NS.load(Ordering::Relaxed),
+            recv_setup_ns: RECV_SETUP_NS.load(Ordering::Relaxed),
+            recv_stream_ns: RECV_STREAM_NS.load(Ordering::Relaxed),
+            recv_tail_ns: RECV_TAIL_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -184,7 +247,7 @@ impl TransferTiming {
     #[must_use]
     pub fn render(&self) -> String {
         format!(
-            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={}",
+            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={} recv_setup_ns={} recv_stream_ns={} recv_tail_ns={}",
             self.walk_ns,
             self.walk_wait_ns,
             self.reuse_census_ns,
@@ -192,6 +255,14 @@ impl TransferTiming {
             self.queue_wait_ns,
             self.transfer_ns,
             self.materialize_ns,
+            self.send_wait_ns,
+            self.send_handle_ns,
+            self.recv_read_ns,
+            self.recv_settle_ns,
+            self.recv_verify_ns,
+            self.recv_setup_ns,
+            self.recv_stream_ns,
+            self.recv_tail_ns,
         )
     }
 
@@ -205,6 +276,14 @@ impl TransferTiming {
             queue_wait_ns: self.queue_wait_ns.saturating_sub(before.queue_wait_ns),
             transfer_ns: self.transfer_ns.saturating_sub(before.transfer_ns),
             materialize_ns: self.materialize_ns.saturating_sub(before.materialize_ns),
+            send_wait_ns: self.send_wait_ns.saturating_sub(before.send_wait_ns),
+            send_handle_ns: self.send_handle_ns.saturating_sub(before.send_handle_ns),
+            recv_read_ns: self.recv_read_ns.saturating_sub(before.recv_read_ns),
+            recv_settle_ns: self.recv_settle_ns.saturating_sub(before.recv_settle_ns),
+            recv_verify_ns: self.recv_verify_ns.saturating_sub(before.recv_verify_ns),
+            recv_setup_ns: self.recv_setup_ns.saturating_sub(before.recv_setup_ns),
+            recv_stream_ns: self.recv_stream_ns.saturating_sub(before.recv_stream_ns),
+            recv_tail_ns: self.recv_tail_ns.saturating_sub(before.recv_tail_ns),
         }
     }
 }
@@ -491,6 +570,9 @@ enum Event {
         entry: u64,
         refusal: BulkloadRefusal,
         bytes_read: u64,
+        /// The refusal to remember under this row key (#186): the seat's
+        /// header gave it, and the seat was not racy when it was sniffed.
+        remember: Option<(Vec<u8>, RefusedSeat)>,
     },
 }
 
@@ -655,6 +737,40 @@ fn set_capture_clock(root: &Path, clock: Option<i128>) {
 #[cfg(test)]
 static CAPTURE_CLOCK: Mutex<Vec<(PathBuf, i128)>> = Mutex::new(Vec::new());
 
+/// A test hook run on a capture thread.
+#[cfg(test)]
+type CaptureHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Test-only hooks by canonical source root, run between a refused seat's
+/// header sniff and the stat that decides whether its refusal may be
+/// remembered (#186): where a writer can still move the seat.
+#[cfg(test)]
+static AFTER_SNIFF: Mutex<Vec<(PathBuf, CaptureHook)>> = Mutex::new(Vec::new());
+
+/// Set (or, with `None`, clear) the after-sniff hook of a canonical source
+/// root.
+#[cfg(test)]
+fn set_after_sniff(root: &Path, hook: Option<CaptureHook>) {
+    let mut hooks = AFTER_SNIFF.lock().unwrap_or_else(PoisonError::into_inner);
+    hooks.retain(|(hooked_root, _)| hooked_root != root);
+    if let Some(hook) = hook {
+        hooks.push((root.to_path_buf(), hook));
+    }
+}
+
+#[cfg(test)]
+fn after_sniff(root: &Path) {
+    let hook = AFTER_SNIFF
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(hooked_root, _)| hooked_root == root)
+        .map(|(_, hook)| Arc::clone(hook));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 /// What every capture thread shares.
 struct SourceWork<'a> {
     /// The canonical source root, which keys test-only hooks and clocks.
@@ -665,6 +781,9 @@ struct SourceWork<'a> {
     state: &'a Path,
     credit: &'a Credit,
     retain: Arc<AtomicU64>,
+    /// How this session's ledger rows are committed (WP0(g)); it also says
+    /// how a ledger read that fails is answered ([`ledger_read`]).
+    ledger: LedgerSync,
 }
 
 /// Walk-ahead slots: the walk thread takes one per item it hands over, and
@@ -807,9 +926,14 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         meta.node.ino,
     ))
     .refuse_at("transfer::serve")?;
-    let committer = Committer::spawn(LedgerSink::new(
+    // WP0(g): the store exists, and its authority is durable, since the
+    // open above returned; only this second connection's row commits are
+    // relaxed (`LedgerSink::with_sync`, `--source-ledger-sync`).
+    let ledger = crate::io::durable::ledger_sync();
+    let committer = Committer::spawn(LedgerSink::with_sync(
         Store::open(&state)?.into_publisher(PublisherSide::Source)?,
-    ))?;
+        ledger,
+    )?)?;
     write_control(
         output,
         &Control::Start {
@@ -828,6 +952,7 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         state: store.root(),
         credit: &credit,
         retain: Arc::new(AtomicU64::new(retain_budget(&root))),
+        ledger,
     };
     let (jobs, job_queue) = std::sync::mpsc::channel();
     let job_queue = Mutex::new(job_queue);
@@ -967,7 +1092,10 @@ fn send_entries<W: Write>(
         if outbound.finished() {
             return Ok((outbound.bytes_read, outbound.entries.len() as u64));
         }
+        let waited = Instant::now();
         let event = events.recv().map_err(|_| BulkloadRefusal::WorkerLost)?;
+        SEND_WAIT_NS.fetch_add(elapsed_ns(waited), Ordering::Relaxed);
+        let _handle_timer = PhaseTimer(&SEND_HANDLE_NS, Instant::now());
         outbound.handle(event)?;
     }
 }
@@ -1120,7 +1248,7 @@ impl<W: Write> Outbound<'_, W> {
                     self.committer.submit(LedgerItem {
                         entry,
                         key,
-                        manifest,
+                        record: LedgerRecord::Capture(manifest),
                     })?;
                 }
             }
@@ -1152,9 +1280,20 @@ impl<W: Write> Outbound<'_, W> {
                 entry,
                 refusal,
                 bytes_read,
+                remember,
             } => {
                 self.bytes_read = self.bytes_read.saturating_add(bytes_read);
                 let row = self.finish_entry(entry)?;
+                // #186: a refusal the seat's bytes alone gave needs no
+                // `Held`: it is recorded at once, so the next run refuses
+                // the unchanged seat without opening it (R25).
+                if let Some((key, refused)) = remember {
+                    self.committer.submit(LedgerItem {
+                        entry,
+                        key,
+                        record: LedgerRecord::Refused(refused),
+                    })?;
+                }
                 write_control(
                     self.output,
                     &Control::Refused {
@@ -1260,6 +1399,7 @@ fn capture_worker(work: &SourceWork<'_>, jobs: &Mutex<Receiver<Job>>, events: &S
                 },
                 refusal: refusal.clone(),
                 bytes_read: 0,
+                remember: None,
             },
         };
         if events.send(event).is_err() {
@@ -1270,29 +1410,38 @@ fn capture_worker(work: &SourceWork<'_>, jobs: &Mutex<Receiver<Job>>, events: &S
 
 fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event>) -> Event {
     let mut bytes_read = 0;
-    let (entry, outcome) = match job {
-        Job::Send { entry, row } => (
-            entry,
-            send_capture(work, entry, &row, events, &mut bytes_read),
-        ),
-        Job::Manifest { entry, row } => (
-            entry,
-            match manifest_capture(work, store, &row, &mut bytes_read) {
-                Ok(Some((record, manifest, retained, racy))) => Ok(Event::Manifest {
-                    entry,
-                    record,
-                    manifest,
-                    retained,
-                    racy,
-                    bytes_read,
-                }),
-                // No ledger row and no room to keep the chunks: building a
-                // manifest first would read the seat twice (R25). Stream it
-                // instead; the destination takes data in place of a manifest.
-                Ok(None) => send_capture(work, entry, &row, events, &mut bytes_read),
-                Err(refusal) => Err(refusal),
-            },
-        ),
+    // What a capture's header sniff refused, to remember (#186).
+    let mut sniffed = None;
+    let (entry, seat, outcome) = match job {
+        Job::Send { entry, row } => {
+            let outcome = remembered_refusal(work, store, &row).and_then(|()| {
+                send_capture(work, entry, &row, events, &mut bytes_read, &mut sniffed)
+            });
+            (entry, Some(row), outcome)
+        }
+        Job::Manifest { entry, row } => {
+            let outcome = remembered_refusal(work, store, &row).and_then(|()| {
+                match manifest_capture(work, store, &row, &mut bytes_read, &mut sniffed) {
+                    Ok(Some((record, manifest, retained, racy))) => Ok(Event::Manifest {
+                        entry,
+                        record,
+                        manifest,
+                        retained,
+                        racy,
+                        bytes_read,
+                    }),
+                    // No ledger row and no room to keep the chunks: building
+                    // a manifest first would read the seat twice (R25).
+                    // Stream it instead; the destination takes data in place
+                    // of a manifest.
+                    Ok(None) => {
+                        send_capture(work, entry, &row, events, &mut bytes_read, &mut sniffed)
+                    }
+                    Err(refusal) => Err(refusal),
+                }
+            });
+            (entry, Some(row), outcome)
+        }
         Job::Serve {
             entry,
             row,
@@ -1303,6 +1452,7 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
             racy,
         } => (
             entry,
+            None,
             serve_chunks(
                 work,
                 entry,
@@ -1338,6 +1488,26 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
         entry,
         refusal,
         bytes_read,
+        // Remembered under the seat's row key, as a capture would be.
+        remember: sniffed.and_then(|refused| {
+            let row = seat.as_ref()?;
+            Some((row_key(work.authority, row).ok()?, refused))
+        }),
+    })
+}
+
+/// #186 (R25): a seat whose refusal the ledger remembers under this exact
+/// row key (its path and stat identity) is refused again from that record,
+/// with the same code, before the file is opened: 0 source bytes. A seat
+/// whose identity moved has another key, and is sniffed again.
+fn remembered_refusal(work: &SourceWork<'_>, store: &Store, row: &RowSchema) -> Result<()> {
+    ledger_read(
+        work.ledger,
+        store.refused_seat(&row_key(work.authority, row)?),
+    )?
+    .map_or(Ok(()), |refused| {
+        counters::bump(Counter::TransferRefusedSeatsRemembered);
+        Err(refused.refusal())
     })
 }
 
@@ -1348,9 +1518,10 @@ fn send_capture(
     row: &RowSchema,
     events: &Sender<Event>,
     bytes_read: &mut u64,
+    sniffed: &mut Option<RefusedSeat>,
 ) -> Result<Event> {
     let key = row_key(work.authority, row)?;
-    let (chunks, racy) = capture_file(work, row, bytes_read, |index, offset, digest, data| {
+    let sink = |index, offset, digest, data: Vec<u8>| {
         let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
         work.credit.acquire(u64::from(size))?;
         events
@@ -1365,7 +1536,8 @@ fn send_capture(
                 data: Arc::new(data),
             })
             .map_err(|_| BulkloadRefusal::WorkerLost)
-    })?;
+    };
+    let (chunks, racy) = capture_file(work, row, bytes_read, sniffed, sink)?;
     let manifest = Manifest::new(chunks);
     Ok(Event::End {
         entry,
@@ -1386,6 +1558,22 @@ fn send_capture(
 /// and whether the capture was racy (#86).
 type Offer = (Option<Vec<u8>>, Manifest, Option<Retained>, bool);
 
+/// A source ledger read, as WP0(g) answers it (OI-1003-Q37: "a corrupt or
+/// absent source ledger is treated as empty"). Under
+/// [`LedgerSync::Relaxed`] a read that fails is counted
+/// (`source_ledger_unreadable`) and answered as a miss: the seat is read,
+/// or sniffed, once more, and no row of a damaged ledger is trusted. Under
+/// [`LedgerSync::Full`] the failure is returned, as before WP0(g).
+fn ledger_read<T>(mode: LedgerSync, read: Result<Option<T>>) -> Result<Option<T>> {
+    match read {
+        Err(_) if mode == LedgerSync::Relaxed => {
+            counters::bump(Counter::SourceLedgerUnreadable);
+            Ok(None)
+        }
+        read => read,
+    }
+}
+
 /// One entry's manifest: from the ledger when this exact stat identity is
 /// recorded (no source read), otherwise from one read of the file, whose
 /// chunks are all kept in memory for the requests that follow. `None` when
@@ -1396,19 +1584,24 @@ fn manifest_capture(
     store: &Store,
     row: &RowSchema,
     bytes_read: &mut u64,
+    sniffed: &mut Option<RefusedSeat>,
 ) -> Result<Option<Offer>> {
     let key = row_key(work.authority, row)?;
-    if let Some(manifest) = store.capture(&key)? {
+    if let Some(manifest) = ledger_read(work.ledger, store.capture(&key))? {
         if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
             return Ok(Some((None, manifest, None, false)));
         }
     }
+    // The ledger has no usable row under this key, so the seat is read to
+    // build the manifest. This is the whole cost of a row WP0(g) lost; a
+    // changed or never recorded seat is counted here too.
+    counters::bump(Counter::SourceLedgerMissReads);
     // Every chunk a fresh manifest names must be kept, so the requests that
     // follow are served from memory: a seat is read at most once a session.
     let Some(mut retained) = Retained::reserve(&work.retain, row.size) else {
         return Ok(None);
     };
-    let (chunks, racy) = capture_file(work, row, bytes_read, |_, _, _, data| {
+    let (chunks, racy) = capture_file(work, row, bytes_read, sniffed, |_, _, _, data| {
         retained.chunks.push(Arc::new(data));
         Ok(())
     })?;
@@ -1535,6 +1728,15 @@ fn serve_chunks(
 /// fails either check is refused, and only its caller decides what any
 /// already-handed chunk means.
 ///
+/// The first [`SNIFF_BYTES`] are read ahead of the rest. A `SQLite` database
+/// or WAL magic there refuses the seat: those bytes are then counted as
+/// `source_sniff_bytes`, never as content (`bytes_read`,
+/// `read_source_file_bytes`), and `sniffed` is set when the refusal may be
+/// remembered (#186): the seat's stat identity did not move across the
+/// sniff and the seat is not racy, so the identity vouches for the header
+/// that was read. Otherwise the same bytes are the file's first content
+/// bytes, counted as such and chunked with the rest.
+///
 /// Returns the chunks and whether the capture was racy (#86): the seat's
 /// mtime or ctime falls within [`RACY_GRANULARITY_NS`] of the clock read
 /// before the file was opened, or later than the clock read after the final
@@ -1546,6 +1748,7 @@ fn capture_file(
     work: &SourceWork<'_>,
     row: &RowSchema,
     bytes_read: &mut u64,
+    sniffed: &mut Option<RefusedSeat>,
     mut sink: impl FnMut(u32, u64, [u8; 32], Vec<u8>) -> Result<()>,
 ) -> Result<(Vec<ChunkSpec>, bool)> {
     if row.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
@@ -1568,23 +1771,38 @@ fn capture_file(
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let mut prefix = Vec::new();
-    let mut reader = CountReader {
-        input: SourceReader {
-            file: &file,
-            offset: 0,
-        },
-        count: bytes_read,
-    };
-    (&mut reader)
-        .take(16)
-        .read_to_end(&mut prefix)
-        .refuse_at("transfer::capture_file")?;
+    SourceReader {
+        file: &file,
+        offset: 0,
+    }
+    .take(SNIFF_BYTES)
+    .read_to_end(&mut prefix)
+    .refuse_at("transfer::capture_file")?;
     if prefix.starts_with(b"SQLite format 3\0")
         || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x82])
         || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x83])
     {
+        counters::add_len(Counter::SourceSniff, prefix.len());
+        #[cfg(test)]
+        after_sniff(work.root);
+        let unmoved = file
+            .metadata()
+            .is_ok_and(|after| StatIdentity::from_metadata(&after) == expected);
+        if unmoved && !crate::git_carry::racy(row, started_ns, capture_clock(work.root)) {
+            *sniffed = Some(RefusedSeat::SqliteHeader);
+        }
         return Err(BulkloadRefusal::SqliteStateChanged);
     }
+    // Not refused: the sniffed bytes are the file's first content bytes.
+    *bytes_read = bytes_read.saturating_add(prefix.len() as u64);
+    counters::add_len(Counter::SourceFileRead, prefix.len());
+    let reader = CountReader {
+        input: SourceReader {
+            file: &file,
+            offset: prefix.len() as u64,
+        },
+        count: bytes_read,
+    };
     let mut chunks = Vec::new();
     let mut offset = 0_u64;
     let _cdc_timer = PhaseTimer(&CDC_HASH_NS, Instant::now());
@@ -1669,6 +1887,10 @@ impl<R: Read> Read for CountReader<'_, R> {
 struct ReceiveContext<'a> {
     target: &'a Destination,
     store: &'a Store,
+    /// The session's output authority, which keys this store's rows.
+    authority: &'a [u8],
+    /// The outputs this session's superseding publishes displace.
+    displaced: &'a SharedDisplaced,
     session: &'a SessionChunks,
     salvage: &'a Salvage,
 }
@@ -1839,16 +2061,19 @@ fn bound_salvage(
 
 /// The destination's committer, sized to the descriptor budget: a quarter
 /// for session reuse, a quarter for staged files queued or grouped for
-/// commit, which hold one descriptor each.
+/// commit, which hold one descriptor each, and an eighth for the outputs
+/// its superseding publishes displace ([`Displaced`]).
 fn publication_committer(
     state: &Path,
     budget: u64,
     notify: Sender<crate::materialize::GroupOutcomes>,
+    displaced: SharedDisplaced,
 ) -> Result<Committer<PublishSink>> {
     let staged = (budget / 8).clamp(2, crate::io::durable::GROUP_FILES);
     Committer::spawn_with(
         PublishSink::new(Store::open(state)?.into_publisher(PublisherSide::Destination)?)?
-            .with_notify(notify),
+            .with_notify(notify)
+            .with_displaced(displaced),
         crate::io::durable::Limits {
             group_files: staged,
             queue_depth: usize::try_from(staged).unwrap_or(1),
@@ -1974,6 +2199,8 @@ struct Inbound<'a, W> {
     authority: Vec<u8>,
     committer: &'a Committer<PublishSink>,
     session: SessionChunks,
+    /// The outputs this session's superseding publishes displace (WP0(d)).
+    displaced: SharedDisplaced,
     stats: TransferStats,
     incoming: HashMap<u64, Incoming>,
     open: usize,
@@ -2007,7 +2234,9 @@ struct Inbound<'a, W> {
 /// even without a group commit in between.
 const SPACE_REPROBE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Receive an ordinary-file carry without replacing divergent outputs.
+/// Receive an ordinary-file carry. A divergent output is replaced only when
+/// it is this store's own, untouched since its row was written (WP0(d)); any
+/// other is refused and kept.
 ///
 /// # Errors
 /// Refuses protocol errors and unsafe roots. Per-path conflicts remain in stats.
@@ -2019,6 +2248,7 @@ pub fn receive<R: Read, W: Write>(
     destination: &Path,
     destination_state: &Path,
 ) -> Result<TransferStats> {
+    let setup_timer = PhaseTimer(&RECV_SETUP_NS, Instant::now());
     let store = Store::open(destination_state)?;
     let mut target = Destination::open(destination, &store)?;
     if store.root().starts_with(target.path()) || target.path().starts_with(store.root()) {
@@ -2026,7 +2256,9 @@ pub fn receive<R: Read, W: Write>(
     }
     let budget = crate::io::limits::descriptor_budget();
     let (notify, group_outcomes) = std::sync::mpsc::channel();
-    let committer = publication_committer(destination_state, budget, notify)?;
+    let displaced = Displaced::shared(usize::try_from((budget / 8).clamp(1, 64)).unwrap_or(1));
+    let committer =
+        publication_committer(destination_state, budget, notify, Arc::clone(&displaced))?;
     // The committer holds the exclusive publisher, so no temporary of this
     // store is in flight while the root is swept.
     target.sweep_root(&store)?;
@@ -2064,6 +2296,7 @@ pub fn receive<R: Read, W: Write>(
         authority: output_authority,
         committer: &committer,
         session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
+        displaced,
         stats: TransferStats::default(),
         incoming: HashMap::new(),
         open: 0,
@@ -2080,7 +2313,12 @@ pub fn receive<R: Read, W: Write>(
         space: None,
         since_probe: 0,
     };
-    let source_bytes_read = receiver.run(input)?;
+    drop(setup_timer);
+    let source_bytes_read = {
+        let _stream_timer = PhaseTimer(&RECV_STREAM_NS, Instant::now());
+        receiver.run(input)?
+    };
+    let _tail_timer = PhaseTimer(&RECV_TAIL_NS, Instant::now());
     let Inbound {
         mut stats,
         session,
@@ -2105,8 +2343,15 @@ impl<W: Write> Inbound<'_, W> {
             // Before blocking on the next frame: answer what has committed,
             // and once the stream is drained, commit and answer the rest
             // (the source waits for every `Held` before it finishes).
-            self.settle_held()?;
-            match read_frame(input)? {
+            {
+                let _settle_timer = PhaseTimer(&RECV_SETTLE_NS, Instant::now());
+                self.settle_held()?;
+            }
+            let frame = {
+                let _read_timer = PhaseTimer(&RECV_READ_NS, Instant::now());
+                read_frame(input)?
+            };
+            match frame {
                 Frame::Control(Control::Entry { entry, row }) => {
                     if entry != offered || walk_done.is_some() {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
@@ -2182,6 +2427,15 @@ impl<W: Write> Inbound<'_, W> {
                     if self.store.output_matches(&key, identity)? {
                         self.stats.reused += 1;
                         return Ok(Decision::Reuse);
+                    }
+                    // Refused before for what the path holds, and neither
+                    // the seat nor that file has moved since: the same
+                    // answer, and the source reads nothing for it (R25).
+                    // Asked ahead of the capture record: a file that did
+                    // not verify against this seat cannot prove it either,
+                    // and proving hashes the whole output.
+                    if let Some(refused) = self.remembered_refusal(&row, &key, identity)? {
+                        return Err(refused.refusal());
                     }
                     if self.adopt_unrowed(&row, &key)? {
                         return Ok(Decision::Reuse);
@@ -2271,6 +2525,43 @@ impl<W: Write> Inbound<'_, W> {
             counters::bump(Counter::TransferUnrowedUnproven);
         }
         Ok(false)
+    }
+
+    /// The destination's remembered refusal of this entry ([`RefusedOutput`]),
+    /// when the file at its path still has the identity it was refused
+    /// with. A refusal for a missing exchange stands only while the file
+    /// system still has none (probed once a session).
+    fn remembered_refusal(
+        &self,
+        row: &RowSchema,
+        key: &[u8],
+        identity: &StatIdentity,
+    ) -> Result<Option<RefusedOutput>> {
+        let Some(refused) = self.store.refused_output(key, identity)? else {
+            return Ok(None);
+        };
+        if refused == RefusedOutput::ExchangeUnsupported && self.target.exchange_supported(row)? {
+            return Ok(None);
+        }
+        counters::bump(Counter::TransferRefusedOutputsRemembered);
+        Ok(Some(refused))
+    }
+
+    /// Remember that this entry was refused for what its path holds, so an
+    /// unchanged rerun refuses it when it is offered ([`RefusedOutput`]).
+    /// Only for a capture that was not racy and a file that was `settled`
+    /// when it was read ([`verify_settled`]). Best effort: a record that
+    /// cannot be written costs one more source read, never the session.
+    fn remember_refusal(
+        &self,
+        key: &[u8],
+        settled: Option<StatIdentity>,
+        racy: bool,
+        refused: RefusedOutput,
+    ) {
+        if let (false, Some(identity)) = (racy, settled) {
+            let _ = self.store.remember_refused_output(key, &identity, refused);
+        }
     }
 
     /// Reserve an entry's bytes against the destination's free-space floor
@@ -2366,6 +2657,8 @@ impl<W: Write> Inbound<'_, W> {
                 &ReceiveContext {
                     target: self.target,
                     store: self.store,
+                    authority: &self.authority,
+                    displaced: &self.displaced,
                     session: &self.session,
                     salvage: &self.salvage,
                 },
@@ -2388,7 +2681,7 @@ impl<W: Write> Inbound<'_, W> {
                 self.open += 1;
                 staging.missing.clone()
             }
-            Plan::Refuse(_) | Plan::Adopt(..) => Vec::new(),
+            Plan::Refuse(_) | Plan::Adopt(..) | Plan::NoExchange(_) => Vec::new(),
         };
         write_control(
             self.output,
@@ -2424,8 +2717,11 @@ impl<W: Write> Inbound<'_, W> {
             .checked_sub(size)
             .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         self.stats.bytes_received = self.stats.bytes_received.saturating_add(size);
-        let verified = payload.len() <= crate::hash::CDC_MAX_BYTES as usize
-            && counters::hash(Counter::HashWireVerify, payload) == header.digest;
+        let verified = {
+            let _verify_timer = PhaseTimer(&RECV_VERIFY_NS, Instant::now());
+            payload.len() <= crate::hash::CDC_MAX_BYTES as usize
+                && counters::hash(Counter::HashWireVerify, payload) == header.digest
+        };
         // A source that could not keep a manifest's chunks streams the entry
         // in place of the manifest (#77 review F1).
         if let Some(Incoming::AwaitManifest { .. }) = self.incoming.get(&header.entry) {
@@ -2594,20 +2890,50 @@ impl<W: Write> Inbound<'_, W> {
                 Ok(())
             }
         });
+        let mut supersede = None;
         if checked.is_ok() && adopt {
             // Streamed in place of a manifest: an existing output at the
             // path is adopted against the streamed chunks, as a manifest
-            // would have been checked, and the staged copy is dropped.
-            match self.target.existing(&row) {
-                Ok(Some((file, parent))) => {
+            // would have been checked, and the staged copy is dropped. One
+            // that holds other bytes is superseded by the staged copy when
+            // it is this store's own (WP0(d), #187), and refused otherwise.
+            let existing = self.target.existing(&row).and_then(|existing| {
+                let Some((file, parent)) = existing else {
+                    return Ok(None);
+                };
+                let manifest = Manifest {
+                    root,
+                    chunks: specs,
+                };
+                let (verified, settled) =
+                    verify_settled(self.target.path(), &file, &row, &manifest);
+                match verified {
+                    Ok(identity) => Ok(Some((file, parent, identity))),
+                    Err(BulkloadRefusal::DestinationOccupied) => {
+                        supersede = owned_output(self.store, &self.authority, &row, &file)?;
+                        if supersede.is_none() {
+                            self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
+                            Err(BulkloadRefusal::DestinationOccupied)
+                        } else if self.target.exchange_supported(&row)? {
+                            Ok(None)
+                        } else {
+                            self.remember_refusal(
+                                &key,
+                                settled,
+                                racy,
+                                RefusedOutput::ExchangeUnsupported,
+                            );
+                            Err(BulkloadRefusal::DestinationExchangeUnsupported)
+                        }
+                    }
+                    Err(refusal) => Err(refusal),
+                }
+            });
+            match existing {
+                Ok(Some((file, parent, identity))) => {
                     if let Some(staged) = staged {
                         let _ = staged.discard();
                     }
-                    let manifest = Manifest {
-                        root,
-                        chunks: specs,
-                    };
-                    let identity = verify_existing(&file, &row, &manifest)?;
                     return self.adopt(file, parent, &row, (key, racy, root), identity);
                 }
                 Ok(None) => (),
@@ -2631,7 +2957,7 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         fault_point!(ReceiveAfterChunks);
-        self.publish(staged, &row, (key, racy, root), hints)
+        self.publish(staged, &row, (key, racy, root), hints, supersede)
     }
 
     fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<()> {
@@ -2646,9 +2972,27 @@ impl<W: Write> Inbound<'_, W> {
         let root = manifest.root;
         match plan {
             Plan::Refuse(refusal) => Err(refusal),
-            Plan::Adopt(file, parent) => {
-                let identity = verify_existing(&file, &row, &manifest)?;
+            Plan::Adopt(file, parent, verified) => {
+                // Verified at the plan: read again only if it moved since.
+                let unmoved = verified.filter(|identity| {
+                    file.metadata()
+                        .is_ok_and(|found| StatIdentity::from_metadata(&found) == *identity)
+                });
+                let identity = if let Some(identity) = unmoved {
+                    identity
+                } else {
+                    let (verified, settled) =
+                        verify_settled(self.target.path(), &file, &row, &manifest);
+                    if matches!(verified, Err(BulkloadRefusal::DestinationOccupied)) {
+                        self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
+                    }
+                    verified?
+                };
                 self.adopt(file, parent, &row, (key, racy, root), identity)
+            }
+            Plan::NoExchange(settled) => {
+                self.remember_refusal(&key, settled, racy, RefusedOutput::ExchangeUnsupported);
+                Err(BulkloadRefusal::DestinationExchangeUnsupported)
             }
             Plan::Write(staging) => {
                 self.open -= 1;
@@ -2657,7 +3001,13 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
-                self.publish(staging.staged, &row, (key, racy, root), staging.hints)
+                self.publish(
+                    staging.staged,
+                    &row,
+                    (key, racy, root),
+                    staging.hints,
+                    staging.supersede.map(|owned| *owned),
+                )
             }
         }
     }
@@ -2710,12 +3060,16 @@ impl<W: Write> Inbound<'_, W> {
     /// final mode, and queue a fully written staged file for its group
     /// commit, which seals it (record included), renames it and seals its
     /// directory. The record goes first: a read-only mode would refuse it.
+    /// With `supersede`, the group commit exchanges it with this store's
+    /// own output at the path instead of renaming it into a free one
+    /// (WP0(d), #187).
     fn publish(
         &mut self,
         staged: StagedFile,
         row: &RowSchema,
         (key, racy, root): (Vec<u8>, bool, [u8; 32]),
         hints: Vec<ChunkHint>,
+        supersede: Option<OwnedOutput>,
     ) -> Result<()> {
         if !racy {
             match unrowed::record_key(row) {
@@ -2742,15 +3096,20 @@ impl<W: Write> Inbound<'_, W> {
         fault_point!(MaterializeAfterTempWrite);
         crate::io::durable::start_writeback(staged.file());
         self.session.insert(Arc::clone(staged.file()), &hints);
-        self.committer.submit(Publication::Staged {
-            staged,
-            record: PendingOutput {
-                key,
-                rel_path: row.rel_path.clone(),
-                size: row.size,
-                racy,
-                hints,
+        let record = PendingOutput {
+            key,
+            rel_path: row.rel_path.clone(),
+            size: row.size,
+            racy,
+            hints,
+        };
+        self.committer.submit(match supersede {
+            Some(owned) => Publication::Superseding {
+                staged,
+                record,
+                owned,
             },
+            None => Publication::Staged { staged, record },
         })
     }
 }
@@ -2812,12 +3171,61 @@ impl SessionChunks {
 /// How the destination will satisfy one manifest.
 enum Plan {
     Refuse(BulkloadRefusal),
-    Adopt(std::fs::File, Arc<std::fs::File>),
+    /// An existing output to adopt once the entry ends. The identity is the
+    /// one its bytes were already verified under, when the plan checked
+    /// them (an output of this store, WP0(d)); otherwise they are verified
+    /// then.
+    Adopt(std::fs::File, Arc<std::fs::File>, Option<StatIdentity>),
+    /// This store's own output holds other bytes than the manifest's, on a
+    /// file system with no atomic exchange to supersede it with: refused
+    /// `DESTINATION_EXCHANGE_UNSUPPORTED` once the entry ends, with nothing
+    /// staged and no chunk asked for. The identity is the output's, when
+    /// the refusal may be remembered ([`verify_settled`]).
+    NoExchange(Option<StatIdentity>),
     Write(Staging),
+}
+
+/// [`verify_existing`], and, when the output holds other bytes than the
+/// manifest's (`DESTINATION_OCCUPIED`), the identity that answer may be
+/// remembered under ([`RefusedOutput`]): the output's, when it was the same
+/// before and after it was read and was not stamped within
+/// [`RACY_GRANULARITY_NS`] of the read, so that the identity vouches for
+/// the bytes that were read, as a seat's does for a capture (#86). `root`
+/// is the destination root, whose clock the stamps are judged against.
+fn verify_settled(
+    root: &Path,
+    file: &std::fs::File,
+    row: &RowSchema,
+    manifest: &Manifest,
+) -> (Result<StatIdentity>, Option<StatIdentity>) {
+    let started_ns = capture_clock(root);
+    let before = file
+        .metadata()
+        .ok()
+        .map(|found| StatIdentity::from_metadata(&found));
+    let verified = verify_existing(file, row, manifest);
+    if !matches!(verified, Err(BulkloadRefusal::DestinationOccupied)) {
+        return (verified, None);
+    }
+    let settled = before.filter(|before| {
+        let window = started_ns.saturating_sub(RACY_GRANULARITY_NS);
+        let now_ns = capture_clock(root);
+        before.mtime_ns < window
+            && before.ctime_ns < window
+            && before.mtime_ns <= now_ns
+            && before.ctime_ns <= now_ns
+            && file
+                .metadata()
+                .is_ok_and(|after| StatIdentity::from_metadata(&after) == *before)
+    });
+    (verified, settled)
 }
 
 struct Staging {
     staged: StagedFile,
+    /// The staged file replaces this store's own output at the path
+    /// (WP0(d), #187), which the plan found there with other bytes.
+    supersede: Option<Box<OwnedOutput>>,
     /// Chunk indices to request: the first occurrence of each distinct chunk
     /// this destination could not fill, ascending.
     missing: Vec<u32>,
@@ -2829,6 +3237,17 @@ struct Staging {
 /// Validate a manifest against its row, adopt an existing output, or stage a
 /// new one and fill every chunk this destination already holds. Every
 /// salvaged temporary a chunk was staged from is added to `salvaged_from`.
+///
+/// An existing output that is this store's own, untouched since its row was
+/// written, and that no longer holds the manifest's bytes (the seat
+/// changed) is superseded (WP0(d), OI-1003-Q18, #187): the new file is
+/// staged beside it and filled like any other, the old output's own chunks
+/// included through its hints, and its group commit exchanges the two. On
+/// a file system with no atomic exchange it is refused
+/// `DESTINATION_EXCHANGE_UNSUPPORTED` instead, before anything is staged.
+/// Any other existing output is adopted if its bytes verify when the entry
+/// ends, and refused `DESTINATION_OCCUPIED` if they do not: it is never
+/// replaced.
 fn plan_file(
     context: &ReceiveContext<'_>,
     row: &RowSchema,
@@ -2865,11 +3284,36 @@ fn plan_file(
     if offset != row.size {
         return Plan::Refuse(BulkloadRefusal::DigestMismatch);
     }
-    match context.target.existing(row) {
-        Ok(Some((file, parent))) => return Plan::Adopt(file, parent),
-        Ok(None) => (),
+    let supersede = match context.target.existing(row) {
+        Ok(Some((file, parent))) => {
+            match owned_output(context.store, context.authority, row, &file) {
+                Ok(Some(owned)) => {
+                    let (verified, settled) =
+                        verify_settled(context.target.path(), &file, row, manifest);
+                    match verified {
+                        // The seat was touched, not changed: nothing to
+                        // replace.
+                        Ok(identity) => return Plan::Adopt(file, parent, Some(identity)),
+                        // Changed. Without an atomic exchange the output
+                        // cannot be superseded: say so now, before a byte
+                        // is staged or asked of the source.
+                        Err(BulkloadRefusal::DestinationOccupied) => {
+                            match context.target.exchange_supported(row) {
+                                Ok(true) => Some(Box::new(owned)),
+                                Ok(false) => return Plan::NoExchange(settled),
+                                Err(refusal) => return Plan::Refuse(refusal),
+                            }
+                        }
+                        Err(refusal) => return Plan::Refuse(refusal),
+                    }
+                }
+                Ok(None) => return Plan::Adopt(file, parent, None),
+                Err(refusal) => return Plan::Refuse(refusal),
+            }
+        }
+        Ok(None) => None,
         Err(refusal) => return Plan::Refuse(refusal),
-    }
+    };
     let staged = match context.target.stage(row) {
         Ok(staged) => staged,
         Err(refusal) => return Plan::Refuse(refusal),
@@ -2904,6 +3348,7 @@ fn plan_file(
     }
     Plan::Write(Staging {
         staged,
+        supersede,
         missing,
         placements,
         hints,
@@ -2912,7 +3357,8 @@ fn plan_file(
 
 /// A chunk this destination already holds, re-read and re-verified: from a
 /// file written earlier in this session, or from a published output through
-/// a committed hint, newest first. Any mismatch is a miss, never an error,
+/// a committed hint, newest first (and, for an output this session has
+/// superseded at that path, from the old output it displaced). Any mismatch is a miss, never an error,
 /// and a miss on one hint falls through to the next. A chunk read from a
 /// salvaged temporary adds its index to `salvaged_from`.
 fn local_chunk(
@@ -2958,6 +3404,17 @@ fn local_chunk(
             }
             found
         };
+        if found.is_some() {
+            return Ok(found);
+        }
+        // The hint may describe an output this session has since replaced
+        // at that path (WP0(d)): the old one is still readable.
+        let old = context
+            .displaced
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&hint.path);
+        let found = old.and_then(|file| read_verified(&file, hint.offset, size, digest));
         if found.is_some() {
             return Ok(found);
         }

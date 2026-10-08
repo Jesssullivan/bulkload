@@ -630,8 +630,8 @@ miss (#87).
   verifies every chunk against its digest, writes it at its offset, and checks
   coverage and the root before the output is queued for its group commit.
 - **WantManifest.** Chosen only when the destination could fill chunks
-  itself: the output path already exists (adopt or refuse), or published
-  outputs hold chunks (resume, incremental). The source sends `Manifest`, from
+  itself: the output path already exists (adopt, supersede or refuse; see
+  Durability), or published outputs hold chunks (resume, incremental). The source sends `Manifest`, from
   its ledger without reading when the stat identity is recorded; the
   destination fills what it can from verified local chunks and asks for the
   rest by index (`NeedChunks`); the source sends only those, then `End`. A
@@ -656,6 +656,16 @@ miss (#87).
   no ledger row, and `End{racy}` tells the destination to keep no output row
   under its key (its chunk hints are kept; they are re-verified on use). The
   next run reads the seat again (#86).
+- **Refused seats (#186).** A seat is refused for its content when its
+  first 16 bytes are a `SQLite` database or WAL magic
+  (`SQLITE_STATE_CHANGED`): provider state, which only the `SQLite` backup
+  path carries. Those bytes are a sniff, counted as `source_sniff_bytes` and
+  never as content (`source_bytes_read`, `read_source_file_bytes`). The
+  source ledger remembers the refusal under the seat's row key, when the
+  seat was not racy and its stat identity did not move across the sniff, so
+  a later run refuses the unchanged seat with the same code without opening
+  it (R25); a seat whose stat identity moved is sniffed again. The refusal
+  is reported on every run (S4).
 - **Rows from before the racy guard.** A store created by this engine
   carries a `racy_guard` marker from its first commit. A store without it was
   written before #86, so none of its ledger or output rows is proven
@@ -742,8 +752,9 @@ for these frames needs a contract of its own.
 ## Durability
 
 A record is never committed before the bytes it describes are durable on the
-destination. Existing destination files are never overwritten; publication is
-no-replace. A directory the engine creates is made under a tagged temporary
+destination. Existing destination files are never overwritten in place, and
+publication is no-replace, with one ruled exception (superseding publish,
+below). A directory the engine creates is made under a tagged temporary
 name, its record is bound to the new inode, and it is then renamed into place
 with no-replace. The engine never adopts a directory it did not create
 (R-N78, R-N102).
@@ -769,7 +780,100 @@ lost. `syncfs` is at least as strong as the per-file and per-directory
 flushes it replaces; it also flushes whatever else is dirty on that file
 system, which is why a single-file group keeps the per-file path. A kernel
 older than Linux 5.8, whose `syncfs` does not report write-back errors, keeps
-the per-file path too (OI-1003-Q113). Darwin is unchanged.
+the per-file path too (OI-1003-Q113). Darwin is unchanged. A superseding
+output (WP0(d), below) joins the first `syncfs` like any staged file, so its
+data is durable before its intent is recorded and before its
+`RENAME_EXCHANGE`, and the second `syncfs` makes the exchanged entry durable
+before the commit that settles the intent.
+
+The source ledger's rows are the one exception (WP0(g): OI-1003-Q20,
+adopted with conditions by OI-1003-Q37, built 2026-10-07 on OI-1003-Q104).
+The ledger is a cache of what the source already holds: a seat's row key
+and its chunk manifest, or a remembered refusal. Its ROW commits run
+`synchronous=NORMAL`, `fullfsync=OFF` (`LedgerSync::Relaxed`, the default;
+`io::durable::relax_ledger_rows` on the source publisher's connection
+only), so a power loss may roll back the newest of them. A lost row costs at
+most one more read of its seat, and only where the destination no longer
+holds that seat: a seat the destination holds is answered `Reuse` from the
+destination's own committed row, and the ledger is never asked (R25,
+OI-1003-Q40). A row commit that fails is counted
+(`source_ledger_commit_failed`) and the transfer goes on (#163); a ledger
+read that fails is a miss (`source_ledger_unreadable`). Nothing else is
+relaxed: the commit that creates a store, with its authority, and the
+state-root seals (#161) are fully synced on both sides, every destination
+commit is `synchronous=FULL`, `fullfsync=ON`, and a checkpoint on the
+relaxed connection is still a full flush. `--source-ledger-sync=full` syncs
+every row commit and fails the session on the first failed one, for
+comparison. `docs/formal` checks the relaxed ledger (`MC_wp0g`,
+`MC_wp0g_deep`, `MC_wp0g_strict`) and shows a relaxed authority breaking R25
+(`MC_wp0g_authority`); P79 and `tests/power_loss.rs` take the real store
+through every loss.
+
+Superseding publish (WP0(d), OI-1003-Q18, #187). A changed seat's new bytes
+replace the output at its path only when that output is this store's own,
+untouched: its `(dev, ino, size, mtime, ctime)` equals a row this store
+committed for the path. Any other file there is refused
+`DESTINATION_OCCUPIED` and left as it is. The replacement is the exchange
+design the formal model checks (`MC_wp0d_exchange`): the group's commit seals
+the staged file, records an intent that takes the output's rows out of the
+store, trades the staged name and the leaf in one `RENAME_EXCHANGE`
+(`RENAME_SWAP` on Darwin), checks the displaced file, removes it when it is
+the old output or exchanges it back when it is anyone else's, seals the
+directory, and commits the new row with the intent settled. A power loss
+leaves the old output or the new one, whole, and never a row beside other
+bytes; the next sweep gives an old output still in place its rows back,
+removes a displaced old output, and exchanges a displaced file of anyone
+else back (or keeps it aside and reports it). The new file is filled from
+the old output's own chunks, so only absent chunks cross the wire (WP0(c),
+inequality 2).
+
+What "this store's own" covers (#187 review, 2026-10-07). An output has a
+reuse row under its seat's row key, which answers `Reuse`, or an ownership
+row under its path alone, which names no seat and answers nothing but "this
+store published the file with this identity here". An ownership row is
+written where there is no reuse row:
+
+- for an output published or adopted from a racy capture (#86; ruled as
+  built, OI-1003-Q101: an ownership row and no reuse row). It is read
+  again on every run until its seat settles, and when the seat changes
+  first, as an actively written file does, it is superseded;
+- by the sweep, for a superseding publish whose exchange took effect and
+  whose row never committed (a crash, or a failed group commit). The
+  publish's record names the staged file by inode, size and mtime; when the
+  leaf holds exactly that file it is this store's own. It is adopted from
+  its capture record (#169) while its seat is unchanged, and superseded
+  when the seat has changed again. A file written since gets no row.
+
+A file system without an atomic exchange (one the first publish reaches
+through its link fallback: NFS, SMB, exFAT) cannot supersede. The first
+changed seat on a device probes for the exchange (two empty temporaries,
+once per device and session). Without it the seat is refused
+`DESTINATION_EXCHANGE_UNSUPPORTED` as soon as its manifest shows the output
+holds other bytes: nothing is staged, no chunk is asked of the source, and
+the old output keeps its row. Such a seat does not converge there. That is
+the ruled behaviour (OI-1003-Q100): the refusal stands, and there is no
+fallback to a rename over the output, which is the check-then-rename shape
+the formal model refutes.
+
+Refusals the destination remembers (#187 review, R25). A seat refused
+`DESTINATION_OCCUPIED` or `DESTINATION_EXCHANGE_UNSUPPORTED` after its
+manifest was read is not read again while nothing has changed. The
+destination store records the refusal under the entry's row key (the
+seat's path and stat identity) with the stat identity of the file at the
+path, and answers `Decision::Refuse` with the same code when the entry is
+offered again and that file still has that identity, so the source opens
+nothing. It is recorded only when the capture was not racy and the file
+was settled: the same before and after it was read, and not stamped within
+the racy window of the read. A changed seat, a changed file, or a file
+system that has gained the exchange makes the record a miss. The record
+is a memo about no durable bytes; losing it costs one more source read.
+
+The formal model holds all of this since 2026-10-07 (OI-1003-Q102: model
+first, then merge): the intent and its sweep, the ownership row, the
+remembered refusal and the refusal without an exchange, with the
+invariants `NoClobber`, `SupersedeAtomic`, `OwnershipNeverReuse`,
+`RememberedRefusalSound` and `ExchangeRefusedUpFront`
+(`docs/formal/README.md`, "#187's records in the model").
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a

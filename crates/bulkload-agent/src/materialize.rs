@@ -38,6 +38,50 @@
 //! Untagged `.bulkload-<pid>-<n>` names left by engines before the tagged
 //! grammar are therefore reported, never removed; the operator removes them.
 //!
+//! # Superseding publish (WP0(d), OI-1003-Q18, #187)
+//!
+//! A changed seat's new bytes replace the output at its path only when that
+//! output is this store's own, untouched: its `(dev, ino, size, mtime,
+//! ctime)` equals a row this store committed for the path
+//! ([`owned_output`]). Anything else stays no-clobber and refuses
+//! `DESTINATION_OCCUPIED`.
+//!
+//! The replacement is the exchange design the formal model checks
+//! (`docs/formal`, `MC_wp0d_exchange`), not check-then-rename, which leaves
+//! a window a third party's write falls into (`MC_wp0d_check_rename`). In
+//! the group's commit ([`PublishSink`]):
+//!
+//! 1. the staged file is sealed (in a [`crate::io::durable::batched`]
+//!    group, by the group's device seal, before any rename or exchange),
+//!    and the output at the leaf is opened and must still have the owned
+//!    identity;
+//! 2. one store commit records the group's [`SupersedeIntent`]s and takes
+//!    the outputs' rows out of the store, so no row vouches for a path
+//!    while either file may sit at it;
+//! 3. the staged name and the leaf trade files in one atomic
+//!    [`crate::io::exchange`]: nothing is replaced or removed by it;
+//! 4. the file now under the staged name, the displaced one, is checked:
+//!    this store's own output (the same inode, size and mtime as in step 1)
+//!    is removed; any other file is exchanged back, the directory sealed,
+//!    and the entry refused;
+//! 5. the group's directories are sealed (in a batched group, its touched
+//!    devices) and its commit writes the new output's row and deletes the
+//!    intent.
+//!
+//! A power loss anywhere leaves the leaf holding the whole old output or the
+//! whole new one, and no row for it that describes other bytes. The next
+//! session's sweep settles an intent a crash left, before any entry of that
+//! directory is decided ([`Destination::sweep`]): the old output still in
+//! place gets its rows back; the new one in place is adopted like any
+//! unrowed output (#169); a displaced file that is neither is exchanged
+//! back, or, when the leaf no longer holds the staged file, left where it is
+//! and reported, never removed.
+//!
+//! One limit: between the last look at the old output and the exchange, a
+//! third party that rewrites it in place and restores its mtime is not
+//! seen, because the exchange itself moves the displaced inode's ctime. A
+//! plain write (the mtime moves) or a replacement (another inode) is.
+//!
 //! # Durability
 //!
 //! Directory entries are sealed (`io::durable::seal_dir`) rather than fully
@@ -59,7 +103,8 @@ use std::sync::Arc;
 use crate::counters::{self, CountedSync as _, Counter};
 use crate::freshness::StatIdentity;
 use crate::transfer_store::{
-    ChunkHint, Manifest, OutputRecord, PendingDirectory, Store, StorePublisher,
+    identity_bytes, ChunkHint, Manifest, OutputRecord, OutputRow, PendingDirectory, Store,
+    StorePublisher, SupersedeIntent, SupersedeSettle,
 };
 use crate::{BulkloadRefusal, Result, RowSchema};
 
@@ -183,6 +228,9 @@ pub struct Destination {
     /// The most recent staged file's parent, shared by its siblings so each
     /// directory costs one descriptor rather than one per file.
     last_parent: std::cell::RefCell<Option<(Vec<u8>, Arc<File>)>>,
+    /// Whether each device probed so far offers the atomic exchange a
+    /// superseding publish needs ([`Destination::exchange_supported`]).
+    exchange: std::cell::RefCell<std::collections::HashMap<u64, bool>>,
     directories: Vec<OwnedDirectory>,
     /// Devices holding a directory entry sealed by barrier only, awaiting a
     /// full flush, each with one descriptor on it.
@@ -245,6 +293,7 @@ impl Destination {
                 .refuse_at("materialize::open")?
                 .dev(),
             last_parent: std::cell::RefCell::new(None),
+            exchange: std::cell::RefCell::new(std::collections::HashMap::new()),
             directories: Vec::new(),
             unflushed: std::collections::HashMap::new(),
             swept: Sweep::default(),
@@ -417,7 +466,7 @@ impl Destination {
                 return self.fallback_directory(row, &parent, &leaf, key, store);
             }
             return Err(if error.raw_os_error() == Some(libc::EEXIST) {
-                BulkloadRefusal::GitDestinationOccupied
+                BulkloadRefusal::DestinationOccupied
             } else {
                 crate::refuse::io(&error, "materialize::directory")
             });
@@ -479,7 +528,7 @@ impl Destination {
         if let Err(error) = crate::io::sys::mkdirat(parent, leaf, 0o700) {
             let _ = store.complete_directory(&key);
             return Err(if error.raw_os_error() == Some(libc::EEXIST) {
-                BulkloadRefusal::GitDestinationOccupied
+                BulkloadRefusal::DestinationOccupied
             } else {
                 crate::refuse::io(&error, "materialize::fallback_directory")
             });
@@ -563,7 +612,7 @@ impl Destination {
                 key: key.to_vec(),
             });
         } else if metadata.mode() & 0o7777 != mode {
-            return Err(BulkloadRefusal::GitDestinationOccupied);
+            return Err(BulkloadRefusal::DestinationOccupied);
         }
         Ok(())
     }
@@ -595,7 +644,14 @@ impl Destination {
         let mut removed = false;
         let mut renamed = false;
         let mut shared: Option<Arc<File>> = None;
+        // WP0(d): what an interrupted superseding publish displaced is
+        // settled first, so a file this store does not own is never taken
+        // for one of its temporaries.
+        let aside = self.settle_supersedes(directory, rel_dir, store, &mut removed)?;
         for (name, kind) in temporary_candidates(directory)? {
+            if aside.contains(name.as_bytes()) {
+                continue;
+            }
             let mut rel_path = rel_dir.to_vec();
             if !rel_path.is_empty() {
                 rel_path.push(b'/');
@@ -680,6 +736,90 @@ impl Destination {
         Ok(())
     }
 
+    /// Settle every superseding publish (WP0(d), #187) recorded for a name
+    /// directly inside `directory` that a crash, or a failed group commit,
+    /// left unsettled. Runs before the directory's temporaries are swept and
+    /// before any entry in it is decided.
+    ///
+    /// The record says what the staged name and the leaf may hold (see
+    /// [`SupersedeIntent`]):
+    ///
+    /// - the staged name is gone or still holds the staged file: the record
+    ///   is deleted, and when the leaf is still exactly the owned output its
+    ///   rows go back (the old output with its old row); the staged file is
+    ///   then this store's orphan, for the sweep;
+    /// - the staged name holds the owned output, displaced: the exchange
+    ///   took effect, so it is removed. The new file at the leaf, when it
+    ///   is still the file this store staged, gets an ownership row
+    ///   (`transfer_store::owner_key`): it is adopted like any unrowed
+    ///   output (#169) while its seat is unchanged, and superseded once the
+    ///   seat has changed again. The same holds when the staged name is
+    ///   already gone;
+    /// - the staged name holds any other file: one this store does not own,
+    ///   displaced. While the leaf still holds the staged file the two are
+    ///   exchanged back, the directory sealed, and the staged file removed.
+    ///   Otherwise the displaced file stays where it is, reported in
+    ///   [`Sweep::left`], with its record: never removed.
+    ///
+    /// Returns the names kept aside, which the sweep must not touch.
+    ///
+    /// # Errors
+    /// Refuses a record that cannot be read or settled.
+    fn settle_supersedes(
+        &mut self,
+        directory: &File,
+        rel_dir: &[u8],
+        store: &Store,
+        removed: &mut bool,
+    ) -> Result<std::collections::HashSet<Vec<u8>>> {
+        let mut aside = std::collections::HashSet::new();
+        for intent in store.supersede_intents(rel_dir)? {
+            let temp = cstring(&intent.temp)?;
+            let leaf = cstring(&intent.leaf)?;
+            let at_temp = stat_at(directory, &temp)?;
+            let at_leaf = stat_at(directory, &leaf)?;
+            let intact = at_leaf.is_some_and(|found| is_owned(&found, &intent.owned, true));
+            // The exchange took effect and the new file's row did not
+            // commit: the leaf holds the file this store staged. The record
+            // proves it, so the file keeps an ownership row and is adopted
+            // (#169) or, once its seat has changed again, superseded.
+            let own = at_leaf.and_then(|found| published(&found, &intent));
+            match at_temp {
+                None => store.settle_supersede(&intent, intact, own)?,
+                Some(found) if is_staged(&found, &intent) => {
+                    store.settle_supersede(&intent, intact, None)?;
+                }
+                Some(found) if is_owned(&found, &intent.owned, false) => {
+                    crate::io::sys::unlinkat(directory, &temp, false)
+                        .refuse_at("materialize::settle_supersedes")?;
+                    self.swept.removed += 1;
+                    *removed = true;
+                    store.settle_supersede(&intent, false, own)?;
+                }
+                Some(_) => {
+                    // Sealed between the exchange back and the unlink, so no
+                    // crash keeps the unlink alone: it would then hit the
+                    // displaced file.
+                    let restored = at_leaf.is_some_and(|found| is_staged(&found, &intent))
+                        && crate::io::exchange(directory, &temp, &leaf).is_ok()
+                        && crate::io::durable::seal_dir(directory).is_ok();
+                    if restored {
+                        crate::io::sys::unlinkat(directory, &temp, false)
+                            .refuse_at("materialize::settle_supersedes")?;
+                        self.swept.removed += 1;
+                        *removed = true;
+                        counters::bump(Counter::SupersedeRestored);
+                        store.settle_supersede(&intent, false, None)?;
+                    } else {
+                        self.swept.left.push(intent.temp_path());
+                        aside.insert(intent.temp);
+                    }
+                }
+            }
+        }
+        Ok(aside)
+    }
+
     /// Apply final modes to directories this invocation created, deepest
     /// first, one directory at a time: set the mode, seal it (fully flushing a
     /// directory off the store's device), then commit its completion. Each
@@ -707,7 +847,7 @@ impl Destination {
                 .metadata()
                 .refuse_at("materialize::finish_directories")?;
             if metadata.dev() != dev || metadata.ino() != ino {
-                return Err(BulkloadRefusal::GitDestinationOccupied);
+                return Err(BulkloadRefusal::DestinationOccupied);
             }
             crate::io::sys::fchmod(&directory, mode)
                 .refuse_at("materialize::finish_directories")?;
@@ -768,10 +908,10 @@ impl Destination {
         // it went away) means the leaf is not this symlink: refused as
         // occupied, as before the move to `io::sys` (#74 review, B2).
         let Ok(read) = crate::io::sys::readlinkat(&parent, &leaf, &mut bytes) else {
-            return Err(BulkloadRefusal::GitDestinationOccupied);
+            return Err(BulkloadRefusal::DestinationOccupied);
         };
         if read != target.len() || bytes.get(..target.len()) != Some(target.as_slice()) {
-            return Err(BulkloadRefusal::GitDestinationOccupied);
+            return Err(BulkloadRefusal::DestinationOccupied);
         }
         Ok(())
     }
@@ -788,6 +928,51 @@ impl Destination {
             Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+
+    /// Whether the file system holding `row`'s parent directory offers the
+    /// atomic exchange of two names, the one call a superseding publish
+    /// replaces an output with (WP0(d), #187). A file system the first
+    /// publish reaches through its link fallback (NFS, SMB, exFAT) may have
+    /// none; a changed seat there is refused before anything is staged or
+    /// asked of the source, not at its group commit.
+    ///
+    /// Probed once per device and session: two empty temporaries of this
+    /// store are created in the directory, exchanged and removed. A crash
+    /// between leaves them for the sweep, as any temporary.
+    ///
+    /// # Errors
+    /// Refuses an unsafe ancestor or a probe that failed for any other
+    /// reason than a missing exchange.
+    pub(crate) fn exchange_supported(&self, row: &RowSchema) -> Result<bool> {
+        let (parent, _) = self.shared_parent(&row.rel_path)?;
+        let device = parent
+            .metadata()
+            .refuse_at("materialize::exchange_supported")?
+            .dev();
+        if let Some(known) = self.exchange.borrow().get(&device) {
+            return Ok(*known);
+        }
+        let first = self.temporary(None)?;
+        let second = self.temporary(None)?;
+        crate::io::sys::create_excl_at(parent.as_fd(), &first, 0o600)
+            .refuse_at("materialize::exchange_supported")?;
+        if let Err(error) = crate::io::sys::create_excl_at(parent.as_fd(), &second, 0o600) {
+            let _ = unlink(&parent, &first);
+            return Err(crate::refuse::io(&error, "materialize::exchange_supported"));
+        }
+        let exchanged = crate::io::exchange(&parent, &first, &second);
+        for name in [&first, &second] {
+            let _ = unlink(&parent, name);
+        }
+        let supported = match exchanged {
+            Ok(()) => true,
+            Err(error) if crate::io::rename_unsupported(&error) => false,
+            Err(error) => return Err(crate::refuse::io(&error, "materialize::exchange_supported")),
+        };
+        counters::bump(Counter::ExchangeProbes);
+        self.exchange.borrow_mut().insert(device, supported);
+        Ok(supported)
     }
 
     /// Create a private temporary file (`O_EXCL`, mode 0600) beside `row`'s
@@ -926,7 +1111,7 @@ impl StagedFile {
         {
             let _ = unlink(&self.parent, &self.temporary);
             return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
-                BulkloadRefusal::GitDestinationOccupied
+                BulkloadRefusal::DestinationOccupied
             } else {
                 crate::refuse::io(&error, "materialize::publish")
             });
@@ -937,6 +1122,364 @@ impl StagedFile {
             StatIdentity::from_metadata(&self.file.metadata().refuse_at("materialize::publish")?),
             self.parent,
         ))
+    }
+
+    /// Step 1 of a superseding publish (module docs): seal the staged file,
+    /// open the output at the leaf and require the identity `owned` was
+    /// proven under, and draw up the intent to record before the exchange.
+    /// A failure removes the temporary: nothing else has changed.
+    fn prepare_supersede(
+        mut self,
+        rel_path: &[u8],
+        owned: OwnedOutput,
+    ) -> Result<PendingSupersede> {
+        let prepared = self.seal().and_then(|()| {
+            let old = open_regular(&self.parent, &self.leaf)?;
+            let found = old.metadata().refuse_at("materialize::prepare_supersede")?;
+            if StatIdentity::from_metadata(&found) != owned.identity {
+                return Err(BulkloadRefusal::DestinationOccupied);
+            }
+            let staged = self
+                .file
+                .metadata()
+                .refuse_at("materialize::prepare_supersede")?;
+            let stamp = StatIdentity::from_metadata(&staged);
+            Ok((
+                old,
+                (staged.dev(), staged.ino()),
+                (stamp.size, stamp.mtime_ns),
+            ))
+        });
+        match prepared {
+            Ok((old, staged, stamp)) => Ok(PendingSupersede {
+                old: Arc::new(old),
+                intent: SupersedeIntent {
+                    dir: rel_path
+                        .iter()
+                        .rposition(|byte| *byte == b'/')
+                        .and_then(|end| rel_path.get(..end))
+                        .unwrap_or_default()
+                        .to_vec(),
+                    temp: self.temporary.as_bytes().to_vec(),
+                    leaf: self.leaf.as_bytes().to_vec(),
+                    staged,
+                    stamp,
+                    owned: owned.identity,
+                    rows: owned.rows,
+                },
+                staged: self,
+            }),
+            Err(refusal) => {
+                let _ = unlink(&self.parent, &self.temporary);
+                // An absent or foreign leaf is one answer: not ours to replace.
+                Err(match refusal {
+                    BulkloadRefusal::Io(Some(libc::ENOENT)) => BulkloadRefusal::DestinationOccupied,
+                    other => other,
+                })
+            }
+        }
+    }
+
+    /// Steps 3 and 4 of a superseding publish (module docs), once its
+    /// intent is committed: exchange the staged name with the leaf, then
+    /// check the displaced file. `old` is the output as opened in step 1.
+    fn exchange(self, old: &File, intent: &SupersedeIntent) -> Exchanged {
+        // The last look: the output must still be exactly this store's own.
+        let unchanged = old
+            .metadata()
+            .is_ok_and(|found| StatIdentity::from_metadata(&found) == intent.owned);
+        if !unchanged {
+            let _ = unlink(&self.parent, &self.temporary);
+            return Exchanged::Undone {
+                refusal: BulkloadRefusal::DestinationOccupied,
+                restore: false,
+            };
+        }
+        #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+        before_exchange(&self.parent, self.leaf.as_bytes());
+        if let Err(error) = crate::io::exchange(&self.parent, &self.temporary, &self.leaf) {
+            let _ = unlink(&self.parent, &self.temporary);
+            // Nothing moved. The rows go back only if the leaf is still
+            // exactly the owned output (it may have vanished meanwhile).
+            let restore = stat_at(&self.parent, &self.leaf)
+                .ok()
+                .flatten()
+                .is_some_and(|found| is_owned(&found, &intent.owned, true));
+            return Exchanged::Undone {
+                // No atomic exchange here: the output stays as it is. The
+                // plan's probe refuses such a seat before it is staged;
+                // this is the same answer for a directory it did not cover.
+                refusal: if crate::io::rename_unsupported(&error) {
+                    BulkloadRefusal::DestinationExchangeUnsupported
+                } else if error.raw_os_error() == Some(libc::ENOENT) {
+                    BulkloadRefusal::DestinationOccupied
+                } else {
+                    crate::refuse::io(&error, "materialize::exchange")
+                },
+                restore,
+            };
+        }
+        fault_point!(SupersedeAfterExchange);
+        // The displaced file sits under the staged name. It is this store's
+        // own when it is the inode step 1 opened, with the size and mtime
+        // its row recorded; the exchange itself moved its ctime.
+        let displaced = stat_at(&self.parent, &self.temporary).ok().flatten();
+        let ours = displaced.is_some_and(|found| is_owned(&found, &intent.owned, false))
+            && old.metadata().is_ok_and(|found| {
+                let found = StatIdentity::from_metadata(&found);
+                found.size == intent.owned.size && found.mtime_ns == intent.owned.mtime_ns
+            });
+        if ours {
+            // A name that survives is this store's orphan: the sweep's.
+            let _ = unlink(&self.parent, &self.temporary);
+            counters::bump(Counter::FilesMaterialized);
+            return match self.file.metadata() {
+                Ok(found) => Exchanged::Done(StatIdentity::from_metadata(&found), self.parent),
+                Err(error) => Exchanged::Unrecorded(
+                    crate::refuse::io(&error, "materialize::exchange"),
+                    self.parent,
+                ),
+            };
+        }
+        // Not this store's file: exchange it back, if the staged file is
+        // still what the leaf holds.
+        let in_place = stat_at(&self.parent, &self.leaf)
+            .ok()
+            .flatten()
+            .is_some_and(|found| is_staged(&found, intent));
+        if in_place && crate::io::exchange(&self.parent, &self.temporary, &self.leaf).is_ok() {
+            // Sealed before the staged file's name goes, so no crash keeps
+            // that unlink without the exchange back: the unlink would then
+            // hit the displaced file.
+            if crate::io::durable::seal_dir(&self.parent).is_ok() {
+                let _ = unlink(&self.parent, &self.temporary);
+            }
+            counters::bump(Counter::SupersedeRestored);
+            return Exchanged::Restored(self.parent);
+        }
+        Exchanged::Stranded(self.parent)
+    }
+}
+
+/// A superseding publish between its preparation and its exchange.
+struct PendingSupersede {
+    staged: StagedFile,
+    /// The output at the leaf, opened in step 1.
+    old: Arc<File>,
+    intent: SupersedeIntent,
+}
+
+/// Outputs a superseding publish of this session is replacing, or has
+/// replaced, by destination-relative path: each stays readable through the
+/// descriptor its publish opened, whatever name it has or has lost.
+///
+/// A chunk hint names an output by path. Once a changed seat's new file has
+/// taken that path, a seat planned later in the same session that still
+/// wants the old output's chunks (a file moved or copied out of the changed
+/// one) would miss them there and ask the source for bytes the destination
+/// held when the run began (WP0(c), inequality 2). The receiving side reads
+/// them here instead; like every hint read, the bytes are verified against
+/// their digest. An output is entered before its exchange, so no planner
+/// can see the new file at the path without finding the old one here.
+///
+/// Bounded: past `capacity` the oldest descriptor is dropped, and its chunks
+/// are then asked for like any absent chunk.
+pub(crate) struct Displaced {
+    files: std::collections::HashMap<Vec<u8>, Arc<File>>,
+    order: std::collections::VecDeque<Vec<u8>>,
+    capacity: usize,
+}
+
+/// A session's [`Displaced`] outputs, shared by its receiving thread and its
+/// committer thread.
+pub(crate) type SharedDisplaced = Arc<std::sync::Mutex<Displaced>>;
+
+impl Displaced {
+    /// An empty set that keeps at most `capacity` descriptors open.
+    pub(crate) fn shared(capacity: usize) -> SharedDisplaced {
+        Arc::new(std::sync::Mutex::new(Self {
+            files: std::collections::HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            capacity: capacity.max(1),
+        }))
+    }
+
+    pub(crate) fn insert(&mut self, rel_path: Vec<u8>, file: Arc<File>) {
+        if self.files.insert(rel_path.clone(), file).is_none() {
+            self.order.push_back(rel_path);
+        }
+        while self.order.len() > self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.files.remove(&oldest);
+            }
+        }
+    }
+
+    /// The output this session displaced, or is displacing, at `rel_path`.
+    pub(crate) fn get(&self, rel_path: &[u8]) -> Option<Arc<File>> {
+        self.files.get(rel_path).map(Arc::clone)
+    }
+}
+
+/// How a superseding publish's exchange ended.
+enum Exchanged {
+    /// The new file is at the leaf and the old output is removed: the new
+    /// file's identity for its row, and the directory to seal.
+    Done(StatIdentity, Arc<File>),
+    /// The new file is at the leaf but its identity could not be read: no
+    /// row is written and its intent stays, so the next sweep gives it an
+    /// ownership row.
+    Unrecorded(BulkloadRefusal, Arc<File>),
+    /// Nothing was exchanged, and the temporary is gone. With `restore` the
+    /// leaf is still exactly the owned output, so its rows go back.
+    Undone {
+        refusal: BulkloadRefusal,
+        restore: bool,
+    },
+    /// The displaced file was not this store's: it is back at the leaf.
+    Restored(Arc<File>),
+    /// The displaced file was not this store's and could not be put back:
+    /// it stays under the staged name, with its intent, for the sweep to
+    /// keep aside and report.
+    Stranded(Arc<File>),
+}
+
+/// An output this store may supersede: the identity one of its rows records
+/// for the path, which the file there still has, and every row the store
+/// holds for that path.
+pub(crate) struct OwnedOutput {
+    pub identity: StatIdentity,
+    pub rows: Vec<OutputRow>,
+}
+
+/// Whether the existing output `file` at `row`'s path is this store's own,
+/// untouched since its row was written (WP0(d), OI-1003-Q18): its
+/// `(dev, ino, size, mtime, ctime)` equals a row this store committed for
+/// that path under `authority`: a seat's reuse row, or the path's
+/// ownership row (`transfer_store::owner_key`), which an output published
+/// from a racy capture, or exchanged into place without its row, has in
+/// its stead. Bulkload wrote or verified it, and nothing has touched it
+/// since. Returns what a superseding publish needs, or `None`
+/// for any other file: that one is never replaced.
+///
+/// # Errors
+/// Refuses a failed `fstat` or database read.
+pub(crate) fn owned_output(
+    store: &Store,
+    authority: &[u8],
+    row: &RowSchema,
+    file: &File,
+) -> Result<Option<OwnedOutput>> {
+    let identity =
+        StatIdentity::from_metadata(&file.metadata().refuse_at("materialize::owned_output")?);
+    let rows = store.output_rows(authority, &row.rel_path)?;
+    let recorded = identity_bytes(&identity)?;
+    Ok(rows
+        .iter()
+        .any(|(_, held)| *held == recorded)
+        .then_some(OwnedOutput { identity, rows }))
+}
+
+/// Whether `found` is the file `owned` records: the same inode, size and
+/// mtime, and with `exact` the same ctime too. An exchange moves the ctime
+/// of the files it trades, so a displaced file is compared without it.
+const fn is_owned(found: &crate::io::Stat, owned: &StatIdentity, exact: bool) -> bool {
+    found.is_file()
+        && found.node.dev == owned.dev
+        && found.node.ino == owned.ino
+        && found.size == owned.size
+        && found.mtime_ns == owned.mtime_ns
+        && (!exact || found.ctime_ns == owned.ctime_ns)
+}
+
+/// Whether `found` is the staged file an intent names.
+fn is_staged(found: &crate::io::Stat, intent: &SupersedeIntent) -> bool {
+    found.is_file() && (found.node.dev, found.node.ino) == intent.staged
+}
+
+/// The identity of the file an intent's staged file is now, when `found`
+/// (the leaf) is that file and has not been written since it was staged:
+/// its inode, and the size and mtime the intent recorded before the
+/// exchange, which moves only its ctime. Such a file is this store's own.
+fn published(found: &crate::io::Stat, intent: &SupersedeIntent) -> Option<StatIdentity> {
+    (is_staged(found, intent) && (found.size, found.mtime_ns) == intent.stamp).then_some(
+        StatIdentity {
+            dev: found.node.dev,
+            ino: found.node.ino,
+            size: found.size,
+            mtime_ns: found.mtime_ns,
+            ctime_ns: found.ctime_ns,
+        },
+    )
+}
+
+/// Test hooks run on the committer thread between a superseding publish's
+/// last look at the output and its exchange, where a third party's write
+/// can still land: by the output's directory (its device and inode) and
+/// leaf name.
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+type ExchangeHooks = Vec<(u64, (u64, u64), Vec<u8>, Arc<dyn Fn() + Send + Sync>)>;
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+static BEFORE_EXCHANGE: std::sync::Mutex<ExchangeHooks> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+static NEXT_EXCHANGE_HOOK: AtomicU64 = AtomicU64::new(0);
+
+/// Removes its hook when dropped.
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+#[must_use = "the hook is removed as soon as the guard is dropped"]
+pub struct BeforeExchange(u64);
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+impl Drop for BeforeExchange {
+    fn drop(&mut self) {
+        BEFORE_EXCHANGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, ..)| *id != self.0);
+    }
+}
+
+/// Test hook: run `hook` just before every superseding publish exchanges
+/// the output named `leaf` in `directory`, after its last identity check.
+///
+/// # Errors
+/// Returns the failure to stat `directory`.
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+pub fn set_before_exchange(
+    directory: &Path,
+    leaf: &[u8],
+    hook: impl Fn() + Send + Sync + 'static,
+) -> std::io::Result<BeforeExchange> {
+    let found = std::fs::metadata(directory)?;
+    let id = NEXT_EXCHANGE_HOOK.fetch_add(1, Ordering::Relaxed);
+    BEFORE_EXCHANGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((
+            id,
+            (found.dev(), found.ino()),
+            leaf.to_vec(),
+            Arc::new(hook),
+        ));
+    Ok(BeforeExchange(id))
+}
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+fn before_exchange(directory: &File, leaf: &[u8]) {
+    let Ok(found) = directory.metadata() else {
+        return;
+    };
+    let hooks: Vec<Arc<dyn Fn() + Send + Sync>> = BEFORE_EXCHANGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, node, name, _)| *node == (found.dev(), found.ino()) && name == leaf)
+        .map(|(.., hook)| Arc::clone(hook))
+        .collect();
+    for hook in hooks {
+        hook();
     }
 }
 
@@ -976,6 +1519,13 @@ pub(crate) enum Publication {
         file: File,
         parent: Arc<File>,
     },
+    /// A fully written staged file that replaces this store's own output at
+    /// its path (WP0(d), #187; module docs).
+    Superseding {
+        staged: StagedFile,
+        record: PendingOutput,
+        owned: OwnedOutput,
+    },
 }
 
 /// The record for a staged file, completed with its identity once published.
@@ -999,6 +1549,8 @@ pub(crate) struct PublishSink {
     /// Told each group's outcomes, by relative path, once the group's
     /// commit has returned: what the receiving side reports as held.
     notify: Option<std::sync::mpsc::Sender<GroupOutcomes>>,
+    /// Where the receiving side finds the outputs this sink supersedes.
+    displaced: Option<SharedDisplaced>,
 }
 
 /// One group's outcomes by relative path: `true` when committed.
@@ -1018,13 +1570,97 @@ impl PublishSink {
             store_device,
             outcomes: Vec::new(),
             notify: None,
+            displaced: None,
         })
+    }
+
+    /// Enter every output this sink supersedes into `displaced`, before its
+    /// exchange.
+    pub(crate) fn with_displaced(mut self, displaced: SharedDisplaced) -> Self {
+        self.displaced = Some(displaced);
+        self
     }
 
     /// Report every group's outcomes on `notify` after its commit.
     pub(crate) fn with_notify(mut self, notify: std::sync::mpsc::Sender<GroupOutcomes>) -> Self {
         self.notify = Some(notify);
         self
+    }
+
+    /// Steps 2 to 4 of the group's superseding publishes (module docs):
+    /// record every intent in one commit, then exchange each staged file
+    /// with its output and check what it displaced. A replaced output's
+    /// record joins `records` and its directory `touched`; a refused one's
+    /// outcome is reported here. Returns the intents the group's commit
+    /// settles, each with whether its old rows go back.
+    fn supersede(
+        &mut self,
+        superseding: Vec<(PendingSupersede, PendingOutput)>,
+        records: &mut Vec<OutputRecord>,
+        touched: &mut TouchedDevices,
+    ) -> Vec<(SupersedeIntent, bool)> {
+        if superseding.is_empty() {
+            return Vec::new();
+        }
+        let intents: Vec<SupersedeIntent> = superseding
+            .iter()
+            .map(|(pending, _)| pending.intent.clone())
+            .collect();
+        if let Err(refusal) = self.publisher.begin_supersedes(&intents) {
+            // Nothing was recorded, so nothing may be exchanged.
+            let refusal = space_refusal(refusal);
+            for (pending, record) in superseding {
+                let _ = pending.staged.discard();
+                self.outcomes.push((record.rel_path, Err(refusal.clone())));
+            }
+            return Vec::new();
+        }
+        fault_point!(SupersedeAfterIntent);
+        let mut settled = Vec::with_capacity(superseding.len());
+        for (pending, record) in superseding {
+            let PendingSupersede {
+                staged,
+                old,
+                intent,
+            } = pending;
+            match staged.exchange(&old, &intent) {
+                Exchanged::Done(identity, parent) => {
+                    touched.directory(parent);
+                    counters::bump(Counter::OutputsSuperseded);
+                    records.push(OutputRecord {
+                        key: record.key,
+                        rel_path: record.rel_path,
+                        identity,
+                        racy: record.racy,
+                        hints: record.hints,
+                    });
+                    settled.push((intent, false));
+                }
+                // Its intent stays: the next sweep finds the staged file at
+                // the leaf and gives it its ownership row.
+                Exchanged::Unrecorded(refusal, parent) => {
+                    touched.directory(parent);
+                    self.outcomes.push((record.rel_path, Err(refusal)));
+                }
+                Exchanged::Undone { refusal, restore } => {
+                    self.outcomes.push((record.rel_path, Err(refusal)));
+                    settled.push((intent, restore));
+                }
+                Exchanged::Restored(parent) => {
+                    touched.directory(parent);
+                    self.outcomes
+                        .push((record.rel_path, Err(BulkloadRefusal::DestinationOccupied)));
+                    settled.push((intent, false));
+                }
+                // Its intent stays: the sweep keeps the displaced file aside.
+                Exchanged::Stranded(parent) => {
+                    touched.directory(parent);
+                    self.outcomes
+                        .push((record.rel_path, Err(BulkloadRefusal::DestinationOccupied)));
+                }
+            }
+        }
+        settled
     }
 
     /// Treat the store as if it lived on `device` (tests of the
@@ -1095,12 +1731,14 @@ impl crate::io::durable::GroupSink for PublishSink {
 
     fn weight(item: &Publication) -> (u64, u64) {
         match item {
-            Publication::Staged { record, .. } => (1, record.size),
+            Publication::Staged { record, .. } | Publication::Superseding { record, .. } => {
+                (1, record.size)
+            }
             Publication::Adopted { .. } => (1, 0),
         }
     }
 
-    fn commit(&mut self, items: Vec<Publication>) {
+    fn commit(&mut self, mut items: Vec<Publication>) {
         let reported = self.outcomes.len();
         #[cfg(feature = "fault-injection")]
         let _note = {
@@ -1108,37 +1746,44 @@ impl crate::io::durable::GroupSink for PublishSink {
             let chunks = items
                 .iter()
                 .map(|item| match item {
-                    Publication::Staged { record, .. } => record.hints.len(),
+                    Publication::Staged { record, .. }
+                    | Publication::Superseding { record, .. } => record.hints.len(),
                     Publication::Adopted { .. } => 0,
                 })
                 .sum();
             crate::fault::note_group(&ids, chunks)
         };
         let batched = crate::io::durable::batched(items.len());
-        let mut items = items;
         if batched {
             if let Err(refusal) = seal_group_data(&mut items) {
-                // Nothing was renamed: each temporary is removed and each
-                // output of the group carries the seal's refusal.
-                let refusal = space_refusal(refusal);
-                for item in items {
-                    let rel_path = match item {
-                        Publication::Staged { staged, record } => {
-                            let _ = staged.discard();
-                            record.rel_path
-                        }
-                        Publication::Adopted { record, .. } => record.rel_path,
-                    };
-                    self.outcomes.push((rel_path, Err(refusal.clone())));
-                }
+                self.refuse_unsealed(items, &space_refusal(refusal));
                 self.notify_group(reported);
                 return;
             }
         }
         let mut records = Vec::with_capacity(items.len());
         let mut touched = TouchedDevices::default();
+        let mut superseding = Vec::new();
         for item in items {
             match item {
+                Publication::Superseding {
+                    staged,
+                    record,
+                    owned,
+                } => match staged.prepare_supersede(&record.rel_path, owned) {
+                    Ok(pending) => {
+                        if let Some(displaced) = &self.displaced {
+                            displaced
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .insert(record.rel_path.clone(), Arc::clone(&pending.old));
+                        }
+                        superseding.push((pending, record));
+                    }
+                    Err(refusal) => self
+                        .outcomes
+                        .push((record.rel_path, Err(space_refusal(refusal)))),
+                },
                 Publication::Staged { staged, record } => match staged.publish() {
                     Ok((identity, parent)) => {
                         touched.directory(parent);
@@ -1177,12 +1822,17 @@ impl crate::io::durable::GroupSink for PublishSink {
                 },
             }
         }
+        let settled = self.supersede(superseding, &mut records, &mut touched);
         let committed = touched.seal(self.store_device, batched).and_then(|_| {
             fault_point_in!(
                 PublishDestinationAfterDirSeal,
                 self.publisher.store().root()
             );
-            self.publisher.commit_outputs(&records)
+            let settled: Vec<SupersedeSettle<'_>> = settled
+                .iter()
+                .map(|(intent, restore)| SupersedeSettle::of(intent, *restore))
+                .collect();
+            self.publisher.commit_outputs(&records, &settled)
         });
         // A full disk under the group (a seal or the store commit) is the
         // typed space refusal, not a bare IO (#100).
@@ -1203,6 +1853,24 @@ impl crate::io::durable::GroupSink for PublishSink {
 }
 
 impl PublishSink {
+    /// A batched group whose device seal failed: nothing was renamed or
+    /// exchanged, and no intent was recorded. Each temporary, a superseding
+    /// publish's included, is removed and each output of the group carries
+    /// the seal's refusal.
+    fn refuse_unsealed(&mut self, items: Vec<Publication>, refusal: &BulkloadRefusal) {
+        for item in items {
+            let rel_path = match item {
+                Publication::Staged { staged, record }
+                | Publication::Superseding { staged, record, .. } => {
+                    let _ = staged.discard();
+                    record.rel_path
+                }
+                Publication::Adopted { record, .. } => record.rel_path,
+            };
+            self.outcomes.push((rel_path, Err(refusal.clone())));
+        }
+    }
+
     /// Tell the receiving side the outcomes of the group whose first outcome
     /// is at `reported`.
     fn notify_group(&self, reported: usize) {
@@ -1224,13 +1892,17 @@ impl PublishSink {
 /// The first step of a [`crate::io::durable::batched`] group: one
 /// [`crate::io::durable::seal_device`] per device the group's files live on,
 /// which makes every temporary's data durable under its temporary name (and
-/// every adopted output's), before any rename. Each temporary is then marked
-/// sealed, so publication renames it without a flush of its own.
+/// every adopted output's), before any rename or exchange. Each temporary,
+/// a superseding publish's included, is then marked sealed, so publication
+/// renames it, or `prepare_supersede` records and exchanges it, without a
+/// flush of its own.
 fn seal_group_data(items: &mut [Publication]) -> Result<()> {
     let mut devices: std::collections::HashMap<u64, &File> = std::collections::HashMap::new();
     for item in items.iter() {
         let file: &File = match item {
-            Publication::Staged { staged, .. } => &staged.file,
+            Publication::Staged { staged, .. } | Publication::Superseding { staged, .. } => {
+                &staged.file
+            }
             Publication::Adopted { file, .. } => file,
         };
         let device = file.metadata().refuse_at("materialize::seal")?.dev();
@@ -1240,9 +1912,12 @@ fn seal_group_data(items: &mut [Publication]) -> Result<()> {
         crate::io::durable::seal_device(handle).refuse_at("materialize::seal")?;
     }
     for item in items.iter_mut() {
-        if let Publication::Staged { staged, .. } = item {
-            staged.sealed = true;
-            fault_point!(MaterializeAfterTempSeal);
+        match item {
+            Publication::Staged { staged, .. } | Publication::Superseding { staged, .. } => {
+                staged.sealed = true;
+                fault_point!(MaterializeAfterTempSeal);
+            }
+            Publication::Adopted { .. } => {}
         }
     }
     Ok(())
@@ -1280,7 +1955,7 @@ pub(crate) fn verify_existing(
         || manifest.size() != Some(row.size)
         || before.mode() & 0o7777 != row.mode & 0o7777
     {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
+        return Err(BulkloadRefusal::DestinationOccupied);
     }
     let identity = StatIdentity::from_metadata(&before);
     let mut buffer = vec![0; crate::hash::CDC_MAX_BYTES as usize];
@@ -1293,7 +1968,7 @@ pub(crate) fn verify_existing(
             .refuse_at("materialize::verify_existing")?;
         counters::add_len(Counter::DestVerifyRead, size);
         if counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
-            return Err(BulkloadRefusal::GitDestinationOccupied);
+            return Err(BulkloadRefusal::DestinationOccupied);
         }
     }
     let mut tail = [0_u8; 1];
@@ -1304,7 +1979,7 @@ pub(crate) fn verify_existing(
         || StatIdentity::from_metadata(&file.metadata().refuse_at("materialize::verify_existing")?)
             != identity
     {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
+        return Err(BulkloadRefusal::DestinationOccupied);
     }
     Ok(identity)
 }
@@ -1369,7 +2044,7 @@ fn open_regular(parent: &File, name: &CStr) -> Result<File> {
         .refuse_at("materialize::open_regular")?
         .is_file()
     {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
+        return Err(BulkloadRefusal::DestinationOccupied);
     }
     Ok(file)
 }
@@ -1445,10 +2120,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(
             report,
-            [(
-                b"file".to_vec(),
-                Err(BulkloadRefusal::GitDestinationOccupied)
-            )]
+            [(b"file".to_vec(), Err(BulkloadRefusal::DestinationOccupied))]
         );
         assert_eq!(kept, b"theirs");
         assert_eq!(listed, 1, "the temporary name is removed");
@@ -1557,10 +2229,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
         assert_eq!(
             codes,
-            [
-                Some("GIT_DESTINATION_OCCUPIED"),
-                Some("GIT_DESTINATION_OCCUPIED")
-            ]
+            [Some("DESTINATION_OCCUPIED"), Some("DESTINATION_OCCUPIED")]
         );
         Ok(())
     }
@@ -1660,10 +2329,7 @@ mod tests {
             report,
             [
                 (b"free".to_vec(), Ok(())),
-                (
-                    b"taken".to_vec(),
-                    Err(BulkloadRefusal::GitDestinationOccupied)
-                ),
+                (b"taken".to_vec(), Err(BulkloadRefusal::DestinationOccupied)),
             ]
         );
         assert!(fallbacks >= 1, "the fallback path is recorded");
@@ -1676,3 +2342,6 @@ mod tests {
 
 #[cfg(all(test, feature = "io-trace"))]
 mod adoption_power_loss;
+
+#[cfg(test)]
+mod supersede_tests;

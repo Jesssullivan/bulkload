@@ -806,22 +806,15 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(plan, gb.delta_plan(list(reversed(rows)), excl))
         self.assertNotEqual(plan, gb.delta_plan(rows, excl, seed="other"))
 
-    def test_sqlite_probe_reads_are_netted_out_of_r25(self) -> None:
-        rows = [
-            ["a.db", "f", 0o644, 4096, "h"],
-            ["tiny.db", "f", 0o644, 4, "h"],
-            ["a.db-wal", "f", 0o644, 4096, "h"],
-            ["x", "f", 0o644, 10, "h"],
-        ]
-        excl = {
-            "a.db": "sqlite-magic",
-            "tiny.db": "sqlite-magic",
-            "a.db-wal": "sqlite-companion-name",
-        }
-        self.assertEqual(gb.probe_bytes(rows, excl), 20)
-        self.assertEqual(gb.content_bytes_read(20, 20), 0)
-        self.assertEqual(gb.content_bytes_read(52, 20), 32)
-        self.assertIsNone(gb.content_bytes_read(None, 20))
+    def test_r25_content_bytes_are_the_raw_counter(self) -> None:
+        # #186: the agent counts the SQLite header sniff apart, so nothing is
+        # netted out of source_bytes_read; a warm resume must report a raw 0.
+        self.assertFalse(hasattr(gb, "probe_bytes"))
+        self.assertEqual(gb.content_bytes_read(0), 0)
+        self.assertEqual(gb.content_bytes_read(52), 52)
+        self.assertIsNone(gb.content_bytes_read(None))
+        self.assertEqual(len(gb.DEVIATIONS), 1)
+        self.assertNotIn("probe", " ".join(gb.DEVIATIONS))
 
     def test_arm_order(self) -> None:
         self.assertEqual(

@@ -265,6 +265,16 @@ KNOWN_TIMING = {
     "queue_wait_ns",
     "transfer_ns",
     "materialize_ns",
+    # S1 hand-off timers (OI-1003-Q115).
+    "send_wait_ns",
+    "send_handle_ns",
+    "recv_read_ns",
+    "recv_settle_ns",
+    "recv_verify_ns",
+    # S1 receiving-side timeline (OI-1003-Q119).
+    "recv_setup_ns",
+    "recv_stream_ns",
+    "recv_tail_ns",
     "publish_groups",
     "sqlite_commits",
     "sqlite_commit_ns",
@@ -944,6 +954,7 @@ def parse_bench(stdout: str) -> dict[str, object]:
     parsed: dict[str, object] = {"samples": [], "medians": [], "header": {}}
     timing: dict[tuple[object, object], dict[str, object]] = {}
     counters: dict[tuple[object, object], dict[str, object]] = {}
+    syncs: dict[tuple[object, object], dict[str, object]] = {}
     for line in stdout.splitlines():
         kind, _, rest = line.partition(" ")
         row = pairs(rest)
@@ -957,6 +968,10 @@ def parse_bench(stdout: str) -> dict[str, object]:
             counters[(row.get("sequence"), row.get("phase"))] = row
         elif kind == "median":
             parsed["medians"].append(row)
+        elif kind == "rclone_sync":
+            syncs[(row.get("sequence"), row.get("phase"))] = row
+        elif kind == "rclone_synced":
+            parsed.setdefault("rclone_synced", []).append(row)
         elif kind in ("verdict", "delta", "rclone_command"):
             parsed[kind] = row
     for sample in parsed["samples"]:
@@ -965,6 +980,8 @@ def parse_bench(stdout: str) -> dict[str, object]:
             sample["timing"] = timing[key]
         if key in counters:
             sample["counters"] = counters[key]
+        if key in syncs:
+            sample["sync_after"] = syncs[key]
     return parsed
 
 
@@ -1067,6 +1084,16 @@ def summarize(parsed: dict[str, object]) -> dict[str, object]:
                 "rclone_ms": m.get("rclone_ms"),
             }
             for m in parsed["medians"]
+        },
+        # S1 at equal durability (OI-1003-Q107): rclone's copy plus one
+        # untimed-then-added syncfs of its destination. Informational; the
+        # verdict stays against rclone as shipped.
+        "bench_rclone_synced": {
+            str(m.get("phase")): {
+                "native_ms": m.get("native_ms"),
+                "rclone_synced_ms": m.get("rclone_synced_ms"),
+            }
+            for m in parsed.get("rclone_synced", [])
         },
         "verdict": parsed.get("verdict", {}),
     }
@@ -1665,6 +1692,31 @@ def evidence(report: dict[str, object]) -> str:
             f" {v.get('r25_warm_zero', 'n/a')} | {v.get('r25_interrupted_zero', 'n/a')} |"
             f" {v.get('native_rss_below_2gib', 'n/a')} |"
         )
+    if any(rep["summary"].get("bench_rclone_synced") for rep in report["reps"]):
+        lines += [
+            "",
+            "## Equal durability (informational, OI-1003-Q107)",
+            "",
+            "rclone syncs nothing; the native arm's outputs are durable when it"
+            " returns. After each rclone copy the bench runs one `syncfs` of its"
+            " destination outside the timed window; these medians add it back."
+            " The verdict above stays against rclone as shipped.",
+            "",
+            "| # | label | initial native ms | initial rclone+syncfs ms |"
+            " delta native ms | delta rclone+syncfs ms |",
+            "|---:|---|---:|---:|---:|---:|",
+        ]
+        for rep in report["reps"]:
+            synced = rep["summary"].get("bench_rclone_synced", {})
+            if not synced:
+                continue
+            lines.append(
+                f"| {rep['index']} | {rep['label']} |"
+                f" {fmt(synced.get('initial', {}).get('native_ms'))} |"
+                f" {fmt(synced.get('initial', {}).get('rclone_synced_ms'))} |"
+                f" {fmt(synced.get('delta', {}).get('native_ms'))} |"
+                f" {fmt(synced.get('delta', {}).get('rclone_synced_ms'))} |"
+            )
     if under_load:
         lines += [
             "",

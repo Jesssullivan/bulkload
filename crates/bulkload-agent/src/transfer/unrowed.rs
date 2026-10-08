@@ -177,7 +177,7 @@ pub fn refresh(
     {
         Ok(after)
     } else {
-        Err(BulkloadRefusal::GitDestinationOccupied)
+        Err(BulkloadRefusal::DestinationOccupied)
     }
 }
 

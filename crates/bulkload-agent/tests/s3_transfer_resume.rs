@@ -6,7 +6,7 @@
 //! system temp dir, and asserts the per-run counters of [`TransferStats`]
 //! (`source_bytes_read`, `bytes_received`, the S3 evidence's
 //! `transferred_content_bytes`) plus the process counters of one measured run
-//! (`read_source_file_bytes`, `read_hash_file_bytes`,
+//! (`read_source_file_bytes`, `source_sniff_bytes`, `read_hash_file_bytes`,
 //! `transfer_racy_captures`). Measured runs hold [`SERIAL`], so those
 //! process-scope deltas are exact inside this test binary.
 //!
@@ -33,32 +33,30 @@
 //!   sent and counted racy, no row commits under its key, so the next run
 //!   reads it again (never a Reuse) until it is settled.
 //!
-//! Two causes keep three properties red on main. They stay red and ignored,
-//! with their counterexamples on the named issues, because a false property
-//! is not weakened:
-//! - #186: a refused `SQLite` seat is sniffed again on every run
-//!   (inequality 1 and the unchanged clause);
-//! - #187: a changed seat is refused (`GIT_DESTINATION_OCCUPIED`) instead of
-//!   superseded (inequality 2 and convergence, blocked by WP0(d)).
+//! **Refused seats (#186).** A seat refused for its `SQLite` header is
+//! sniffed once: its [`SNIFF_BYTES`] are counted as `source_sniff_bytes`,
+//! never as content (`source_bytes_read`, `read_source_file_bytes`), and its
+//! refusal is remembered under its stat identity. Every run still reports
+//! the refusal, with the same code; a run over an unchanged refused seat
+//! opens nothing and reads 0 bytes of either kind. P23 and P21 hold with
+//! refused seats in the corpus, and a pinned row shows a changed refused
+//! seat sniffed again while its unchanged neighbour is not.
 //!
-//! The green properties cover the rest of each domain: inequality 1 over
-//! in-place changes, and every clause over added seats, where every drawn
-//! case adds at least one seat that shares chunks with a carried output, so
-//! inequality 2 is strictly below the added size in every case.
+//! **Changed seats (#187, WP0(d)).** A changed seat whose output this store
+//! published is superseded, so every clause of P21 holds over in-place
+//! changes too: both inequalities, convergence, and a rerun at 0 and 0. A
+//! pinned row shows the limit of that: a destination file this store does
+//! not own is refused `DESTINATION_OCCUPIED` and left as it is. Such a seat
+//! is read once: the destination remembers the refusal against the file it
+//! found, and an unchanged rerun reads 0 bytes for it. An output published
+//! from a racy capture is this store's own too (an ownership row, no reuse
+//! row), so an actively written seat is superseded, not refused.
 //!
-//! A fourth test is ignored for a different reason: inequality 2 read
-//! strictly (a chunk absent once crosses once per run) is unstable on main
-//! when two seats added in one run carry the same absent chunk ([`Twins`]).
-//! The green properties allow that chunk once per seat, the per-file reading
-//! of the S3 evidence harness; which reading is the contract is unruled.
-//!
-//! **The #186 residue, green.** With refused `SQLite` seats present, what
-//! main does hold is asserted by properties of their own ([`Sniff::EveryRun`]):
-//! the refusal set is the fixture's on every run, the other seats converge
-//! and are reused, an unchanged rerun receives 0, and each run reads exactly
-//! [`SNIFF_BYTES`] of each refused seat beyond the expected reads, never the
-//! seat. Those properties state the residue, not the contract: when #186 is
-//! fixed they go red and are deleted, and the ignored ones lose `#[ignore]`.
+//! One test is ignored, for another reason: inequality 2 read strictly (a
+//! chunk absent once crosses once per run) is unstable when two seats added
+//! in one run carry the same absent chunk ([`Twins`]). The green properties
+//! allow that chunk once per seat, the per-file reading of the S3 evidence
+//! harness; which reading is the contract is unruled.
 //!
 //! **Corpus.** CI runs a fixed seed and a small case count per property
 //! (`test_support::prop_config`, compiled here from the library's source
@@ -101,36 +99,17 @@ mod test_support;
 /// The transfer's credit window (`transfer::CREDIT_WINDOW`, private).
 const CREDIT_WINDOW: usize = 16 * 1024 * 1024;
 
-/// The bytes a source capture reads before it refuses a `SQLite` header.
+/// The header bytes a source capture reads of a seat before it refuses a
+/// `SQLite` header: counted as `source_sniff_bytes`, once per stat identity
+/// of the seat, and never as content (#186).
 const SNIFF_BYTES: u64 = 16;
-
-/// What a run may read of a refused `SQLite` seat after the first pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Sniff {
-    /// The contract (R25, R-N58): a refused seat whose stat identity is
-    /// unchanged is not read again. Red on main with a refused seat, #186.
-    Once,
-    /// The #186 residue, what main does: every run reads exactly
-    /// [`SNIFF_BYTES`] of each refused seat, and not one byte more.
-    EveryRun,
-}
-
-impl Sniff {
-    /// The bytes one run after the first reads of `refused` refused seats.
-    const fn residue(self, refused: usize) -> u64 {
-        match self {
-            Self::Once => 0,
-            Self::EveryRun => SNIFF_BYTES * refused as u64,
-        }
-    }
-}
 
 /// How inequality 2 counts an absent chunk that several seats changed or
 /// added in one run all carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Twins {
     /// The strict reading: a digest is absent once, so it crosses once per
-    /// run. Red on main when two seats of one run share an absent chunk.
+    /// run. Unstable when two seats of one run share an absent chunk.
     Once,
     /// What main does, and the per-file reading the S3 evidence harness
     /// uses: the chunk may cross once for each seat that carries it.
@@ -443,9 +422,48 @@ enum CutAt {
     Never,
 }
 
+/// A P23 case's first session, cut or whole: no session reads a byte twice,
+/// and a refused seat's header is never content. Returns the sniff bytes it
+/// read.
+fn first_session(fixture: &Fixture, cut: CutAt, total: u64, sqlite: &[String]) -> u64 {
+    let sniffed = SNIFF_BYTES * sqlite.len() as u64;
+    match cut {
+        CutAt::Never => {
+            let (first, counters) = fixture.run();
+            assert_eq!(refusals(&first), sqlite_refusals(sqlite));
+            assert_eq!(first.source_bytes_read, total);
+            assert_eq!(counters.get(Counter::SourceFileRead), total);
+            assert_eq!(
+                counters.get(Counter::SourceSniff),
+                sniffed,
+                "each refused seat is sniffed once"
+            );
+            sniffed
+        }
+        CutAt::Ends(count) => {
+            let counters = fixture.cut_session(Cut::AfterEnds(count));
+            assert!(counters.get(Counter::SourceFileRead) <= total);
+            assert!(counters.get(Counter::SourceSniff) <= sniffed);
+            counters.get(Counter::SourceSniff)
+        }
+        CutAt::SourceDone => {
+            let counters = fixture.cut_session(Cut::AtSourceDone);
+            assert!(counters.get(Counter::SourceFileRead) <= total);
+            // Every entry was settled before `SourceDone`: every refused
+            // seat was sniffed, and its refusal committed with the ledger.
+            assert_eq!(counters.get(Counter::SourceSniff), sniffed);
+            sniffed
+        }
+    }
+}
+
 /// One P23 case: files by (directory, length, seed), `refused` `SQLite`
-/// seats, the cut, and what a later run may read of a refused seat.
-fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt, sniff: Sniff) {
+/// seats, and the cut.
+///
+/// Content and sniff bytes are asserted apart (#186). A refused seat's
+/// header is sniffed at most once in any session, never as content; a run
+/// that follows a completed one reads nothing at all, of either kind.
+fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt) {
     let fixture = Fixture::new();
     let mut corpus: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for (index, (directory, length, seed)) in files.iter().enumerate() {
@@ -462,26 +480,9 @@ fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt, sniff: S
     }
     let total: u64 = corpus.values().map(|content| size_of(content)).sum();
     let sniffed = SNIFF_BYTES * refused as u64;
-    let residue = sniff.residue(refused);
     fixture.settle();
 
-    // The first session, cut or whole. No session reads a byte twice.
-    match cut {
-        CutAt::Never => {
-            let (first, counters) = fixture.run();
-            assert_eq!(refusals(&first), sqlite_refusals(&sqlite));
-            assert_eq!(first.source_bytes_read, total + sniffed);
-            assert_eq!(counters.get(Counter::SourceFileRead), total + sniffed);
-        }
-        CutAt::Ends(count) => {
-            let counters = fixture.cut_session(Cut::AfterEnds(count));
-            assert!(counters.get(Counter::SourceFileRead) <= total + sniffed);
-        }
-        CutAt::SourceDone => {
-            let counters = fixture.cut_session(Cut::AtSourceDone);
-            assert!(counters.get(Counter::SourceFileRead) <= total + sniffed);
-        }
-    }
+    let first_sniff = first_session(&fixture, cut, total, &sqlite);
     let applied: BTreeSet<&String> = corpus
         .iter()
         .filter(|(rel, content)| fixture.holds(rel, content))
@@ -498,7 +499,8 @@ fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt, sniff: S
         .map(|(_, content)| size_of(content))
         .sum();
 
-    // The resume reads exactly the files that were not applied, once.
+    // The resume reads exactly the files that were not applied, once, and
+    // not one content byte of a refused seat.
     let (resumed, counters) = fixture.run();
     assert_eq!(refusals(&resumed), sqlite_refusals(&sqlite));
     assert_eq!(resumed.reused, applied.len() as u64, "reused");
@@ -508,14 +510,33 @@ fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt, sniff: S
         "completed"
     );
     assert_eq!(
-        resumed.source_bytes_read,
-        unapplied + residue,
-        "resume source_bytes_read (unapplied {unapplied}, #186 residue {residue})"
+        resumed.source_bytes_read, unapplied,
+        "resume source_bytes_read (unapplied {unapplied})"
     );
     assert_eq!(
         counters.get(Counter::SourceFileRead),
         resumed.source_bytes_read
     );
+    // A refused seat the first session finished with is not sniffed again.
+    // One it was cut before is sniffed now, once.
+    let resume_sniff = counters.get(Counter::SourceSniff);
+    if matches!(cut, CutAt::Never | CutAt::SourceDone) {
+        assert_eq!(resume_sniff, 0, "a remembered refusal reads nothing");
+        assert_eq!(
+            counters.get(Counter::TransferRefusedSeatsRemembered),
+            refused as u64,
+            "each refusal of a completed session is answered from its record"
+        );
+    } else {
+        assert!(
+            resume_sniff <= sniffed && resume_sniff.is_multiple_of(SNIFF_BYTES),
+            "resume sniffed {resume_sniff} bytes of {refused} refused seats"
+        );
+        assert!(
+            first_sniff + resume_sniff >= sniffed,
+            "every refused seat was sniffed by now ({first_sniff} + {resume_sniff})"
+        );
+    }
     assert!(resumed.bytes_received <= unapplied, "resume bytes_received");
     assert_eq!(
         counters.get(Counter::HashFileRead),
@@ -526,15 +547,23 @@ fn check_p23(files: &[(usize, usize, u64)], refused: usize, cut: CutAt, sniff: S
         assert!(fixture.holds(rel, content), "{rel} did not converge");
     }
 
-    // A further rerun reads nothing and receives nothing.
+    // A further rerun reads nothing and receives nothing: no content byte,
+    // and no sniff byte of a refused seat, which it still reports.
     let (rerun, counters) = fixture.run();
     assert_eq!(refusals(&rerun), sqlite_refusals(&sqlite));
     assert_eq!(rerun.reused, corpus.len() as u64);
+    assert_eq!(rerun.source_bytes_read, 0, "rerun source_bytes_read");
+    assert_eq!(counters.get(Counter::SourceFileRead), 0);
     assert_eq!(
-        rerun.source_bytes_read, residue,
-        "rerun source_bytes_read (#186 residue {residue})"
+        counters.get(Counter::SourceSniff),
+        0,
+        "rerun sniffed a refused seat again (#186)"
     );
-    assert_eq!(counters.get(Counter::SourceFileRead), residue);
+    assert_eq!(
+        counters.get(Counter::TransferRefusedSeatsRemembered),
+        refused as u64,
+        "each refusal is answered from its record"
+    );
     assert_eq!(rerun.bytes_received, 0, "rerun bytes_received");
 }
 
@@ -562,57 +591,49 @@ proptest! {
     #[test]
     fn p23_a_resume_after_any_cut_reads_only_the_unapplied_files(case in p23_case()) {
         let (files, cut) = case;
-        check_p23(&files, 0, cut, Sniff::Once);
+        check_p23(&files, 0, cut);
     }
 }
 
 proptest! {
     #![proptest_config(test_support::prop_config(4))]
 
-    /// P23 with the fixture's refused seats: a refused `SQLite` seat is
-    /// sniffed again on every run, so the further rerun reads
-    /// 16 bytes per seat, not 0.
+    /// P23 with the fixture's refused seats (#186): after any cut the
+    /// refusal set is the fixture's on every run, the other files resume
+    /// exactly as without them, a refused seat is sniffed at most once in a
+    /// session and never as content, and the further rerun reads nothing.
     #[test]
-    #[ignore = "red on main: #186 (a refused SQLite seat is re-read for its sniff bytes on every run)"]
     fn p23_with_refused_seats_a_further_rerun_reads_nothing(
         case in p23_case(),
         refused in 1_usize..=2,
     ) {
         let (files, cut) = case;
-        check_p23(&files, refused, cut, Sniff::Once);
+        check_p23(&files, refused, cut);
     }
 }
 
-proptest! {
-    #![proptest_config(test_support::prop_config(3))]
-
-    /// P23 with the fixture's refused seats, the clauses that hold on main:
-    /// after any cut the refusal set is the fixture's on every run, the
-    /// other files are applied, resumed, reused and converge exactly as
-    /// without the refused seats, a further rerun receives nothing, and each
-    /// run reads exactly 16 bytes per refused seat beyond that (the #186
-    /// residue), never the seat itself.
-    #[test]
-    fn p23_issue_186_residue_a_refused_seat_costs_only_its_sniff_bytes(
-        case in p23_case(),
-        refused in 1_usize..=2,
-    ) {
-        let (files, cut) = case;
-        check_p23(&files, refused, cut, Sniff::EveryRun);
-    }
-}
-
-/// P23 PINNED, the #186 residue: two refused seats beside three files, cut
-/// after the first `End`. Each later run reads 32 bytes of the two 4112-byte
-/// seats and reports both refusals, once each.
+/// P23 PINNED (#186): two refused seats beside three files, cut after the
+/// first `End`. Every later run reports both refusals, once each, and a run
+/// that follows a completed one reads 0 bytes of the two 4112-byte seats.
 #[test]
-fn p23_pinned_issue_186_residue_two_refused_seats_across_a_cut() {
+fn p23_pinned_two_refused_seats_across_a_cut_are_not_sniffed_again() {
     check_p23(
         &[(0, 70_000, 31), (1, 4_096, 32), (2, 200_000, 33)],
         2,
         CutAt::Ends(1),
-        Sniff::EveryRun,
     );
+}
+
+/// P23 PINNED (#186, review): a corpus of refused seats only. Nothing is
+/// ever published, so the destination holds no chunk to fill a manifest
+/// from and answers every entry `Send`, not `WantManifest`: the one path on
+/// which a remembered refusal is consulted ahead of a streamed capture.
+/// Every other refused-seat row has carried files, so its reruns ask for
+/// manifests. The rerun sniffs nothing and answers both from their records.
+#[test]
+fn p23_pinned_only_refused_seats_are_answered_from_their_records() {
+    check_p23(&[], 2, CutAt::Never);
+    check_p23(&[], 1, CutAt::SourceDone);
 }
 
 /// P23 PINNED: one file past the credit window, cut after the first `End`
@@ -627,7 +648,6 @@ fn p23_pinned_a_file_past_the_credit_window() {
         ],
         0,
         CutAt::Ends(1),
-        Sniff::Once,
     );
 }
 
@@ -814,7 +834,7 @@ fn delta_model(case: &DeltaCase) -> DeltaModel {
     }
 }
 
-fn check_delta(case: &DeltaCase, clauses: Clauses, sniff: Sniff, twins: Twins) {
+fn check_delta(case: &DeltaCase, clauses: Clauses, twins: Twins) {
     let fixture = Fixture::new();
     let DeltaModel {
         first: carried,
@@ -823,7 +843,6 @@ fn check_delta(case: &DeltaCase, clauses: Clauses, sniff: Sniff, twins: Twins) {
         absent_bytes,
         twin_bytes,
     } = delta_model(case);
-    let residue = sniff.residue(case.refused);
     let wire_bound = match twins {
         Twins::Once => absent_bytes,
         Twins::PerSeat => absent_bytes + twin_bytes,
@@ -840,8 +859,22 @@ fn check_delta(case: &DeltaCase, clauses: Clauses, sniff: Sniff, twins: Twins) {
         fixture.write(rel, &sqlite_seat(index as u64));
     }
     fixture.settle();
-    let (first, _) = fixture.run();
+    let carried_bytes: u64 = corpus.values().map(|content| size_of(content)).sum();
+    let (first, counters) = fixture.run();
     assert_eq!(refusals(&first), sqlite_refusals(&sqlite), "first pass");
+    assert_eq!(
+        counters.get(Counter::SourceSniff),
+        SNIFF_BYTES * case.refused as u64,
+        "the first pass sniffs each refused seat once"
+    );
+    assert_eq!(
+        (
+            first.source_bytes_read,
+            counters.get(Counter::SourceFileRead)
+        ),
+        (carried_bytes, carried_bytes),
+        "each carried file is read once, and sniff bytes are never content"
+    );
 
     for (rel, content) in writes {
         fixture.write(&rel, &content);
@@ -853,9 +886,11 @@ fn check_delta(case: &DeltaCase, clauses: Clauses, sniff: Sniff, twins: Twins) {
 
     let (rerun, counters) = fixture.run();
     let context = format!(
-        "changed_bytes={changed_bytes} absent_bytes={absent_bytes} twin_bytes={twin_bytes} residue={residue} source_bytes_read={} bytes_received={} refusals={:?}",
+        "changed_bytes={changed_bytes} absent_bytes={absent_bytes} twin_bytes={twin_bytes} source_bytes_read={} sniffed={} bytes_received={} superseded={} refusals={:?}",
         rerun.source_bytes_read,
+        counters.get(Counter::SourceSniff),
         rerun.bytes_received,
+        counters.get(Counter::OutputsSuperseded),
         refusals(&rerun)
     );
     assert_eq!(
@@ -869,18 +904,16 @@ fn check_delta(case: &DeltaCase, clauses: Clauses, sniff: Sniff, twins: Twins) {
         "{context}"
     );
     assert!(
-        rerun.source_bytes_read <= changed_bytes + residue,
+        rerun.source_bytes_read <= changed_bytes,
         "inequality 1: {context}"
     );
-    if sniff == Sniff::EveryRun {
-        // The #186 residue is exact: the changed seats once, plus 16 bytes
-        // of each refused seat, never the seat.
-        assert_eq!(
-            rerun.source_bytes_read,
-            changed_bytes + residue,
-            "#186 residue: {context}"
-        );
-    }
+    // No refused seat changed, so none is opened: its remembered refusal
+    // answers, and not one sniff byte is read (#186).
+    assert_eq!(
+        counters.get(Counter::SourceSniff),
+        0,
+        "an unchanged refused seat is not sniffed again: {context}"
+    );
     if clauses == Clauses::ReadsOnly {
         return;
     }
@@ -899,14 +932,28 @@ fn check_delta(case: &DeltaCase, clauses: Clauses, sniff: Sniff, twins: Twins) {
             "{rel} did not converge: {context}"
         );
     }
+    assert_unchanged_estate_reads_nothing(&fixture, &sqlite);
+}
+
+/// The unchanged-estate clause: a run with nothing changed reads 0 content
+/// bytes and 0 sniff bytes, receives 0, replaces nothing, and still reports
+/// the fixture's refusals.
+fn assert_unchanged_estate_reads_nothing(fixture: &Fixture, sqlite: &[String]) {
     let (again, counters) = fixture.run();
-    assert_eq!(refusals(&again), sqlite_refusals(&sqlite));
+    assert_eq!(refusals(&again), sqlite_refusals(sqlite));
+    assert_eq!(again.source_bytes_read, 0, "unchanged estate reads 0");
+    assert_eq!(counters.get(Counter::SourceFileRead), 0);
     assert_eq!(
-        again.source_bytes_read, residue,
-        "unchanged estate reads 0 (#186 residue {residue})"
+        counters.get(Counter::SourceSniff),
+        0,
+        "unchanged estate sniffs nothing"
     );
-    assert_eq!(counters.get(Counter::SourceFileRead), residue);
     assert_eq!(again.bytes_received, 0, "unchanged estate receives 0");
+    assert_eq!(
+        counters.get(Counter::OutputsSuperseded),
+        0,
+        "nothing is replaced on an unchanged estate"
+    );
 }
 
 fn change() -> impl Strategy<Value = Change> {
@@ -1032,7 +1079,7 @@ proptest! {
     /// is metadata only.
     #[test]
     fn p21_a_rerun_reads_at_most_the_changed_seats(case in delta_case(true, 0..=0, false)) {
-        check_delta(&case, Clauses::ReadsOnly, Sniff::Once, Twins::PerSeat);
+        check_delta(&case, Clauses::ReadsOnly, Twins::PerSeat);
     }
 
     /// P21 transfer leg, every clause, over added seats (no in-place change):
@@ -1042,47 +1089,293 @@ proptest! {
     #[test]
     fn p21_added_seats_cross_as_absent_chunks_and_converge(case in delta_case(false, 0..=0, true)) {
         prop_assume!(shares_a_chunk(&case));
-        check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
-    }
-}
-
-proptest! {
-    #![proptest_config(test_support::prop_config(3))]
-
-    /// P21 transfer leg with refused `SQLite` seats, the clauses that hold
-    /// on main: both inequalities (inequality 1 with exactly 16 bytes per
-    /// refused seat on top, the #186 residue), the same refusal set on every
-    /// run, convergence of the other seats, and an unchanged rerun that
-    /// receives 0 and reads the residue alone.
-    #[test]
-    fn p21_issue_186_residue_a_refused_seat_costs_only_its_sniff_bytes(
-        case in delta_case(false, 1..=2, true),
-    ) {
-        prop_assume!(shares_a_chunk(&case));
-        check_delta(&case, Clauses::All, Sniff::EveryRun, Twins::PerSeat);
+        check_delta(&case, Clauses::All, Twins::PerSeat);
     }
 }
 
 proptest! {
     #![proptest_config(test_support::prop_config(4))]
 
-    /// P21 transfer leg, every clause, over in-place changes: a changed seat
-    /// whose old output this store wrote is refused as divergent instead of
-    /// superseded, so it never converges.
+    /// P21 transfer leg, every clause, over in-place changes (#187,
+    /// WP0(d)): a changed seat whose old output this store wrote is
+    /// superseded, so it crosses as its absent chunks, converges, and the
+    /// rerun after it reads and receives nothing.
     #[test]
-    #[ignore = "red on main: #187 (changed seats are refused, not superseded; blocked by WP0(d))"]
     fn p21_changed_seats_cross_as_absent_chunks_and_converge(case in delta_case(true, 0..=0, true)) {
-        check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
+        check_delta(&case, Clauses::All, Twins::PerSeat);
     }
 
-    /// P21 transfer leg, every clause, with refused `SQLite` seats: each is
-    /// sniffed again on every run, so an unchanged estate reads 16 bytes per
-    /// seat, not 0.
+    /// P21 transfer leg, every clause, with refused `SQLite` seats (#186):
+    /// each is sniffed once and refused from its record afterwards, so an
+    /// unchanged estate reads 0 bytes, content or sniff.
     #[test]
-    #[ignore = "red on main: #186 (a refused SQLite seat is re-read for its sniff bytes on every run)"]
     fn p21_with_refused_seats_an_unchanged_rerun_reads_nothing(case in delta_case(false, 1..=2, true)) {
-        check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
+        check_delta(&case, Clauses::All, Twins::PerSeat);
     }
+}
+
+/// P21 PINNED (#187's counterexample, with #186's beside it): after a first
+/// pass, one byte is appended to a 256 KiB file and 60 229 bytes to a
+/// smaller one, a third file is copied with a tail, and two refused seats
+/// stay as they are. Both changed seats are superseded and converge, the
+/// wire carries only their absent chunks, and no refused seat is opened.
+#[test]
+fn p21_pinned_changed_seats_are_superseded_beside_unchanged_refused_seats() {
+    let case = DeltaCase {
+        files: vec![
+            (0, 262_144, 51),
+            (0, 36_675, 52),
+            (2, 10_370, 53),
+            (1, 579, 54),
+            (1, 7_682, 55),
+            (2, 0, 56),
+        ],
+        changes: vec![
+            Change::Append {
+                length: 1,
+                seed: 57,
+            },
+            Change::Append {
+                length: 60_229,
+                seed: 58,
+            },
+            Change::Same,
+            Change::Same,
+            Change::Same,
+            Change::Same,
+        ],
+        added: vec![Added::CopyOf {
+            file: 2,
+            tail: 3_624,
+            seed: 59,
+        }],
+        refused: 2,
+    };
+    let model = delta_model(&case);
+    assert!(
+        model.absent_bytes < model.changed_bytes,
+        "the appended file keeps its leading chunks: absent {} of {}",
+        model.absent_bytes,
+        model.changed_bytes
+    );
+    check_delta(&case, Clauses::All, Twins::PerSeat);
+}
+
+/// P21 PINNED (#186): a refused seat is remembered by its stat identity. A
+/// rewritten one is sniffed again, exactly once; its unchanged neighbour is
+/// not opened. One rewritten as an ordinary file is carried, and the bytes
+/// its sniff read are then content, not sniff bytes.
+#[test]
+fn p21_pinned_a_changed_refused_seat_is_sniffed_again_and_an_unchanged_one_is_not() {
+    let fixture = Fixture::new();
+    let carried = noise(61, 30_000);
+    fixture.write("f0", &carried);
+    fixture.write("db0.sqlite", &sqlite_seat(0));
+    fixture.write("d0/db1.sqlite", &sqlite_seat(1));
+    let both = sqlite_refusals(&["db0.sqlite".to_owned(), "d0/db1.sqlite".to_owned()]);
+    fixture.settle();
+    let (first, counters) = fixture.run();
+    assert_eq!(refusals(&first), both);
+    assert_eq!(first.source_bytes_read, size_of(&carried));
+    assert_eq!(counters.get(Counter::SourceSniff), 2 * SNIFF_BYTES);
+
+    // One refused seat is rewritten, still a `SQLite` database.
+    fixture.write("db0.sqlite", &sqlite_seat(7));
+    fixture.settle();
+    let (second, counters) = fixture.run();
+    assert_eq!(refusals(&second), both, "the same refusals, the same code");
+    assert_eq!(second.source_bytes_read, 0);
+    assert_eq!(counters.get(Counter::SourceFileRead), 0);
+    assert_eq!(
+        counters.get(Counter::SourceSniff),
+        SNIFF_BYTES,
+        "only the changed seat is sniffed"
+    );
+    assert_eq!(counters.get(Counter::TransferRefusedSeatsRemembered), 1);
+    assert_eq!(second.bytes_received, 0);
+
+    // Unchanged again: nothing is opened.
+    let (third, counters) = fixture.run();
+    assert_eq!(refusals(&third), both);
+    assert_eq!(third.source_bytes_read, 0);
+    assert_eq!(counters.get(Counter::SourceSniff), 0);
+    assert_eq!(counters.get(Counter::TransferRefusedSeatsRemembered), 2);
+
+    // The other seat becomes an ordinary file: carried, read once as content.
+    let ordinary = noise(62, 5_000);
+    fixture.write("d0/db1.sqlite", &ordinary);
+    fixture.settle();
+    let (fourth, counters) = fixture.run();
+    assert_eq!(
+        refusals(&fourth),
+        sqlite_refusals(&["db0.sqlite".to_owned()])
+    );
+    assert_eq!(fourth.source_bytes_read, size_of(&ordinary));
+    assert_eq!(counters.get(Counter::SourceFileRead), size_of(&ordinary));
+    assert_eq!(counters.get(Counter::SourceSniff), 0);
+    assert!(fixture.holds("d0/db1.sqlite", &ordinary));
+}
+
+/// P21 PINNED (WP0(d), no-clobber): a rerun supersedes only an output whose
+/// identity is this store's own row. Of two changed seats, one whose output
+/// another writer replaced, and one whose output was rewritten in place, are
+/// refused `DESTINATION_OCCUPIED`, left byte for byte as they are, and cost
+/// no wire bytes; the third, untouched, is superseded.
+#[test]
+fn p21_pinned_a_changed_seat_never_supersedes_a_file_this_store_does_not_own() {
+    let fixture = Fixture::new();
+    let first: Vec<Vec<u8>> = (0..3).map(|index| noise(70 + index, 40_000)).collect();
+    for (index, content) in first.iter().enumerate() {
+        fixture.write(&format!("f{index}"), content);
+    }
+    fixture.settle();
+    let (pass, _) = fixture.run();
+    assert!(pass.refusals.is_empty(), "{:?}", pass.refusals);
+
+    // Another writer replaces f0's output (a new inode) and rewrites f1's
+    // in place (the same inode, other bytes).
+    let theirs = noise(80, 12_345);
+    let aside = fixture.base.join("aside");
+    std::fs::write(&aside, &theirs).unwrap();
+    std::fs::rename(&aside, fixture.destination().join("f0")).unwrap();
+    let rewritten = noise(81, 40_000);
+    std::fs::write(fixture.destination().join("f1"), &rewritten).unwrap();
+    // Every seat changes on the source.
+    let second: Vec<Vec<u8>> = (0..3).map(|index| noise(90 + index, 50_000)).collect();
+    for (index, content) in second.iter().enumerate() {
+        fixture.write(&format!("f{index}"), content);
+    }
+    fixture.settle();
+
+    let (rerun, counters) = fixture.run();
+    let occupied = |name: &str| (name.to_owned(), "DESTINATION_OCCUPIED".to_owned());
+    assert_eq!(refusals(&rerun), [occupied("f0"), occupied("f1")]);
+    assert!(
+        fixture.holds("f0", &theirs),
+        "another writer's file is kept"
+    );
+    assert!(
+        fixture.holds("f1", &rewritten),
+        "a rewritten output is kept"
+    );
+    assert!(
+        fixture.holds("f2", &second[2]),
+        "its own output is superseded"
+    );
+    assert_eq!(counters.get(Counter::OutputsSuperseded), 1);
+    assert!(
+        rerun.source_bytes_read <= 150_000,
+        "inequality 1: {}",
+        rerun.source_bytes_read
+    );
+    assert!(
+        rerun.bytes_received <= size_of(&second[2]),
+        "no wire bytes for a refused seat: {}",
+        rerun.bytes_received
+    );
+    // Nothing of this store's is left beside them.
+    let mut names: Vec<String> = std::fs::read_dir(fixture.destination())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["f0", "f1", "f2"]);
+
+    // The refusals stand on every run, and the superseded seat is reused.
+    // A refused seat is not read again (#187 review, R25): the destination
+    // remembers each refusal under the seat's row key and the identity of
+    // the file it found, and refuses the entry when it is offered.
+    for _ in 0..2 {
+        let (again, counters) = fixture.run();
+        assert_eq!(refusals(&again), [occupied("f0"), occupied("f1")]);
+        assert_eq!(again.reused, 1);
+        assert_eq!(again.bytes_received, 0);
+        assert_eq!(
+            again.source_bytes_read, 0,
+            "an unchanged seat standing refused is not opened"
+        );
+        assert_eq!(counters.get(Counter::SourceFileRead), 0);
+        assert_eq!(
+            counters.get(Counter::TransferRefusedOutputsRemembered),
+            2,
+            "each refusal is answered from the destination's record"
+        );
+        assert_eq!(counters.get(Counter::OutputsSuperseded), 0);
+        assert!(fixture.holds("f0", &theirs));
+        assert!(fixture.holds("f1", &rewritten));
+    }
+
+    // The other writer's file changes: the record no longer answers, the
+    // seat is read once more, and the new refusal is remembered.
+    let theirs = noise(82, 23_456);
+    std::fs::write(fixture.destination().join("f0"), &theirs).unwrap();
+    settle_racy_window(&fixture.destination()).unwrap();
+    let (moved, _) = fixture.run();
+    assert_eq!(refusals(&moved), [occupied("f0"), occupied("f1")]);
+    assert_eq!(moved.source_bytes_read, size_of(&second[0]));
+    let (after, _) = fixture.run();
+    assert_eq!(refusals(&after), [occupied("f0"), occupied("f1")]);
+    assert_eq!(after.source_bytes_read, 0);
+    assert!(fixture.holds("f0", &theirs));
+}
+
+/// P21 PINNED (WP0(c) inequality 2, across a supersede): a file is replaced
+/// by other bytes and its old bytes reappear under another name, 150 seats
+/// behind it in the walk (a rename with a new file in its place). The
+/// destination held those bytes when the run began, so they cross no wire,
+/// whether the new name is planned before the old output is exchanged away
+/// (they are read at its path) or after (they are read from the output the
+/// superseding publish displaced). Which of the two a run takes depends on
+/// when its group commits; `transfer::tests::
+/// a_chunk_of_a_superseded_output_is_still_filled_locally` pins the second.
+#[test]
+fn p21_pinned_a_seat_moved_out_of_a_changed_file_crosses_no_bytes() {
+    let fixture = Fixture::new();
+    let moved = noise(101, 600_000);
+    fixture.write("a", &moved);
+    fixture.settle();
+    let (first, _) = fixture.run();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+
+    let replaced = noise(102, 500_000);
+    let mut corpus: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    corpus.insert("a".to_owned(), replaced);
+    for index in 0..150_u64 {
+        corpus.insert(format!("m{index:03}"), noise(1_000 + index, 1_000));
+    }
+    corpus.insert("z".to_owned(), moved.clone());
+    for (rel, content) in &corpus {
+        fixture.write(rel, content);
+    }
+    fixture.settle();
+
+    let held: HashSet<[u8; 32]> = chunks(&moved)
+        .into_iter()
+        .map(|(digest, _)| digest)
+        .collect();
+    let absent: BTreeMap<[u8; 32], u64> = corpus
+        .values()
+        .flat_map(|content| chunks(content))
+        .filter(|(digest, _)| !held.contains(digest))
+        .collect();
+    let absent_bytes: u64 = absent.values().sum();
+    let changed_bytes: u64 = corpus.values().map(|content| size_of(content)).sum();
+    assert_eq!(absent_bytes, changed_bytes - size_of(&moved));
+
+    let (rerun, counters) = fixture.run();
+    assert!(rerun.refusals.is_empty(), "{:?}", rerun.refusals);
+    assert_eq!(counters.get(Counter::OutputsSuperseded), 1);
+    assert_eq!(rerun.source_bytes_read, changed_bytes, "each read once");
+    assert!(
+        rerun.bytes_received <= absent_bytes,
+        "inequality 2: received {} of {absent_bytes} absent bytes (the moved seat holds {})",
+        rerun.bytes_received,
+        moved.len()
+    );
+    for (rel, content) in &corpus {
+        assert!(fixture.holds(rel, content), "{rel} did not converge");
+    }
+    assert_unchanged_estate_reads_nothing(&fixture, &[]);
 }
 
 /// P21 PINNED: an added seat that copies a large carried file plus a tail
@@ -1108,7 +1401,7 @@ fn p21_pinned_an_added_copy_crosses_as_little_more_than_its_tail() {
         refused: 0,
     };
     assert!(shares_a_chunk(&case));
-    check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
+    check_delta(&case, Clauses::All, Twins::PerSeat);
 }
 
 /// The sharing shapes one run can mix: a holder in a nested directory is
@@ -1152,7 +1445,7 @@ fn twins_case() -> DeltaCase {
 
 /// P21 PINNED: two whole copies and a slice of one nested holder, and twin
 /// fresh seats, in one run. The copies put nothing on the wire; the twins'
-/// bytes are absent once and, on main, may cross once per seat.
+/// bytes are absent once and may cross once per seat.
 #[test]
 fn p21_pinned_copies_slices_and_twins_of_one_holder() {
     let case = twins_case();
@@ -1166,18 +1459,18 @@ fn p21_pinned_copies_slices_and_twins_of_one_holder() {
         model.absent_bytes,
         model.changed_bytes
     );
-    check_delta(&case, Clauses::All, Sniff::Once, Twins::PerSeat);
+    check_delta(&case, Clauses::All, Twins::PerSeat);
 }
 
 /// P21 PINNED, inequality 2 read strictly: a chunk two added seats of one
-/// run both carry is absent once, so it crosses once. On main that depends
+/// run both carry is absent once, so it crosses once. Today that depends
 /// on whether the first twin is staged before the second is planned: of two
 /// runs of this row, one received the twins' 200 000 bytes once and one
 /// received them twice.
 #[test]
-#[ignore = "unstable on main: twin added seats may cross their shared absent chunks once per seat (no issue yet; needs a ruling on the reading of inequality 2)"]
+#[ignore = "unstable: twin added seats may cross their shared absent chunks once per seat (no issue yet; needs a ruling on the reading of inequality 2)"]
 fn p21_pinned_twin_seats_cross_their_shared_chunks_once() {
-    check_delta(&twins_case(), Clauses::All, Sniff::Once, Twins::Once);
+    check_delta(&twins_case(), Clauses::All, Twins::Once);
 }
 
 // ---------------------------------------------------------------------------
@@ -1435,6 +1728,119 @@ fn racy_attempt(files: &[(usize, u64)], racy: &[(usize, u64)], how: Racy) -> boo
     );
     assert_eq!(fourth.bytes_received, 0);
     true
+}
+
+/// Stamp a source seat an hour ahead of the clock: racy on every run (#86).
+fn stamp_ahead(fixture: &Fixture, rel: &str) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.source().join(rel))
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_hours(1))
+        .unwrap();
+}
+
+/// P19 PINNED (#187 review): an output published from a racy capture is
+/// this store's own. It has no reuse row (#86), so it is read again on
+/// every run until its seat settles; but when the seat changes again
+/// first, as an actively written file does, the output is superseded: it
+/// is not refused `DESTINATION_OCCUPIED` for ever.
+#[test]
+fn p19_pinned_a_racy_publish_is_superseded_when_its_seat_changes_again() {
+    let fixture = Fixture::new();
+    fixture.write("settled", &noise(190, 30_000));
+    fixture.settle();
+    let (first, _) = fixture.run();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+
+    let written = noise(191, 60_000);
+    let (racy, counters) = fixture.run_after(|| {
+        fixture.write("live", &written);
+        stamp_ahead(&fixture, "live");
+    });
+    assert!(racy.refusals.is_empty(), "{:?}", racy.refusals);
+    assert_eq!(counters.get(Counter::TransferRacyCaptures), 1);
+    assert!(fixture.holds("live", &written));
+
+    // Written again before any settled run adopted the output.
+    let appended = noise(192, 70_000);
+    let (changed, counters) = fixture.run_after(|| {
+        fixture.write("live", &appended);
+        stamp_ahead(&fixture, "live");
+    });
+    assert!(
+        changed.refusals.is_empty(),
+        "a racy publish's output is this store's own: {:?}",
+        changed.refusals
+    );
+    assert_eq!(counters.get(Counter::OutputsSuperseded), 1);
+    assert_eq!(counters.get(Counter::TransferRacyCaptures), 1);
+    assert_eq!(changed.source_bytes_read, size_of(&appended));
+    assert!(fixture.holds("live", &appended));
+
+    // Unchanged and still racy: read again (no reuse row), adopted in
+    // place, replaced by nothing and refused by nothing.
+    let (again, counters) = fixture.run();
+    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
+    assert_eq!(again.source_bytes_read, size_of(&appended));
+    assert_eq!(again.bytes_received, 0);
+    assert_eq!(counters.get(Counter::OutputsSuperseded), 0);
+
+    // Settled at last: read once more, recorded, and then reused.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.source().join("live"))
+        .unwrap()
+        .set_modified(SystemTime::now())
+        .unwrap();
+    fixture.settle();
+    let (settled, counters) = fixture.run();
+    assert!(settled.refusals.is_empty(), "{:?}", settled.refusals);
+    assert_eq!(settled.source_bytes_read, size_of(&appended));
+    assert_eq!(settled.bytes_received, 0);
+    assert_eq!(counters.get(Counter::TransferRacyCaptures), 0);
+    let (warm, _) = fixture.run();
+    assert_eq!((warm.reused, warm.source_bytes_read), (2, 0));
+    assert!(fixture.holds("live", &appended));
+}
+
+/// P19 PINNED (#186, review): a refused seat that is racy when it is
+/// sniffed is refused, never as content, and not remembered: every run
+/// sniffs it again, 16 bytes, until it has settled; then it is sniffed once
+/// more, remembered, and not opened again.
+#[test]
+fn p19_pinned_a_racy_refused_seat_is_sniffed_on_every_run_until_it_settles() {
+    let fixture = Fixture::new();
+    let sqlite = ["db0.sqlite".to_owned()];
+    fixture.write(&sqlite[0], &sqlite_seat(0));
+    stamp_ahead(&fixture, &sqlite[0]);
+    for _ in 0..2 {
+        let (racy, counters) = fixture.run();
+        assert_eq!(refusals(&racy), sqlite_refusals(&sqlite));
+        assert_eq!(racy.source_bytes_read, 0, "a sniff is never content");
+        assert_eq!(counters.get(Counter::SourceFileRead), 0);
+        assert_eq!(
+            counters.get(Counter::SourceSniff),
+            SNIFF_BYTES,
+            "a racy refused seat is sniffed again"
+        );
+        assert_eq!(counters.get(Counter::TransferRefusedSeatsRemembered), 0);
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(fixture.source().join(&sqlite[0]))
+        .unwrap()
+        .set_modified(SystemTime::now())
+        .unwrap();
+    fixture.settle();
+    let (settled, counters) = fixture.run();
+    assert_eq!(refusals(&settled), sqlite_refusals(&sqlite));
+    assert_eq!(counters.get(Counter::SourceSniff), SNIFF_BYTES);
+    assert_eq!(counters.get(Counter::TransferRefusedSeatsRemembered), 0);
+    let (rerun, counters) = fixture.run();
+    assert_eq!(refusals(&rerun), sqlite_refusals(&sqlite));
+    assert_eq!(counters.get(Counter::SourceSniff), 0);
+    assert_eq!(counters.get(Counter::TransferRefusedSeatsRemembered), 1);
 }
 
 /// A P19 case: settled files and racy seats by (length, seed), and how the

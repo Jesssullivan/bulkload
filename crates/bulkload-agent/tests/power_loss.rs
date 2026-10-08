@@ -47,6 +47,21 @@
 //! the PR #59 review's M3 pack-seal order), and `--durability=strict` seals
 //! every destination file and directory with a full flush (M8).
 //!
+//! **Superseding publish** (WP0(d), OI-1003-Q18, #187). A rerun over
+//! changed seats is traced the same way, from the image the first copy left.
+//! In every power-loss state each final name holds the whole old output or
+//! the whole new one; no row, replayed from the commits that completed, sits
+//! beside bytes it does not describe (the old output with its old row, or
+//! the new output with its new row); and an old output displaced under a
+//! temporary name is explained by an unsettled intent, which is what lets
+//! the next sweep tell it from a temporary. A second trace puts another
+//! writer's file in the output's place just before the exchange: that file
+//! is at the leaf, or under the temporary name with the intent still
+//! recorded, in every state, never lost. Each proof is run again on its
+//! trace with one ordering undone (the intent's commit after the exchange,
+//! the directory seal ahead of the new row dropped, the seal between the
+//! exchange back and the unlink dropped), and must then fail.
+//!
 //! Tests run one at a time (`SERIAL`): the recorder is process-wide.
 
 #![allow(
@@ -233,6 +248,72 @@ fn key_path(key: &[u8]) -> Vec<u8> {
     postcard::from_bytes::<(Vec<u8>, Vec<u8>)>(key).unwrap().1
 }
 
+/// **committed ⇒ durable** and **captured ⇒ held**, for one record of a
+/// store commit that completed before the crash.
+fn committed_record(
+    expected: &Expected,
+    view: View<'_>,
+    record: &CommitRecord,
+) -> Result<(), String> {
+    let name = |rel: &[u8]| String::from_utf8_lossy(rel).into_owned();
+    match record {
+        CommitRecord::Output { rel_path } => match view.get(rel_path) {
+            Some(Entry::File { data, .. })
+                if expected.files.get(rel_path).map(Vec::as_slice) == Some(data) => {}
+            other => {
+                return Err(format!(
+                    "committed output {} is {:?}",
+                    name(rel_path),
+                    other.map(|entry| format!("{entry:?}").chars().take(60).collect::<String>())
+                ))
+            }
+        },
+        CommitRecord::DirectoryComplete { key } => {
+            let rel = key_path(key);
+            match view.get(&rel) {
+                Some(Entry::Dir { mode }) if expected.directories.get(&rel) == Some(&mode) => {}
+                other => return Err(format!("completed directory {} is {other:?}", name(&rel))),
+            }
+        }
+        CommitRecord::DirectoryCreated {
+            node: Some(node), ..
+        } => {
+            if !matches!(view.node(*node), Some(Entry::Dir { .. })) {
+                return Err(format!("recorded directory inode {node:?} is not named"));
+            }
+        }
+        // R25 strict (OI-1001-Q15, #77 round 2, N1): a committed
+        // capture means its bytes are held durably here, under the
+        // final name or a salvageable temporary, so the resume never
+        // reads them from the source again.
+        CommitRecord::Capture { key } => {
+            let (_, row): (Vec<u8>, RowSchema) = postcard::from_bytes(key).unwrap();
+            if let Some(want) = expected.files.get(&row.rel_path) {
+                let held = view.walk().into_iter().any(|(_, entry)| {
+                    matches!(entry, Entry::File { data, .. } if data == want.as_slice())
+                });
+                if !held {
+                    return Err(format!(
+                        "committed capture {} has no held bytes",
+                        name(&row.rel_path)
+                    ));
+                }
+            }
+        }
+        // The state roots lie outside the destination image; the
+        // store proofs below check what the marker vouches for. A
+        // remembered refusal (#186) names no destination bytes, and
+        // a first copy supersedes nothing (the superseding proofs
+        // below read those records).
+        CommitRecord::DirectoryCreated { node: None, .. }
+        | CommitRecord::RootSealed
+        | CommitRecord::RefusedSeat { .. }
+        | CommitRecord::SupersedeBegun { .. }
+        | CommitRecord::SupersedeSettled { .. } => {}
+    }
+    Ok(())
+}
+
 fn invariant(
     expected: &Expected,
     events: &[Event],
@@ -245,60 +326,7 @@ fn invariant(
             return Err(format!("event {commit} is not a commit"));
         };
         for record in records {
-            match record {
-                CommitRecord::Output { rel_path } => match view.get(rel_path) {
-                    Some(Entry::File { data, .. })
-                        if expected.files.get(rel_path).map(Vec::as_slice) == Some(data) => {}
-                    other => {
-                        return Err(format!(
-                            "committed output {} is {:?}",
-                            name(rel_path),
-                            other.map(|entry| format!("{entry:?}")
-                                .chars()
-                                .take(60)
-                                .collect::<String>())
-                        ))
-                    }
-                },
-                CommitRecord::DirectoryComplete { key } => {
-                    let rel = key_path(key);
-                    match view.get(&rel) {
-                        Some(Entry::Dir { mode })
-                            if expected.directories.get(&rel) == Some(&mode) => {}
-                        other => {
-                            return Err(format!("completed directory {} is {other:?}", name(&rel)))
-                        }
-                    }
-                }
-                CommitRecord::DirectoryCreated {
-                    node: Some(node), ..
-                } => {
-                    if !matches!(view.node(*node), Some(Entry::Dir { .. })) {
-                        return Err(format!("recorded directory inode {node:?} is not named"));
-                    }
-                }
-                // R25 strict (OI-1001-Q15, #77 round 2, N1): a committed
-                // capture means its bytes are held durably here, under the
-                // final name or a salvageable temporary, so the resume never
-                // reads them from the source again.
-                CommitRecord::Capture { key } => {
-                    let (_, row): (Vec<u8>, RowSchema) = postcard::from_bytes(key).unwrap();
-                    if let Some(want) = expected.files.get(&row.rel_path) {
-                        let held = view.walk().into_iter().any(|(_, entry)| {
-                            matches!(entry, Entry::File { data, .. } if data == want.as_slice())
-                        });
-                        if !held {
-                            return Err(format!(
-                                "committed capture {} has no held bytes",
-                                name(&row.rel_path)
-                            ));
-                        }
-                    }
-                }
-                // The state roots lie outside the destination image; the
-                // store proofs below check what the marker vouches for.
-                CommitRecord::DirectoryCreated { node: None, .. } | CommitRecord::RootSealed => {}
-            }
+            committed_record(expected, view, record)?;
         }
     }
     for (rel, entry) in view.walk() {
@@ -859,4 +887,576 @@ fn a_store_an_earlier_run_left_unsealed_is_sealed_by_the_next_open() {
     let events = [earlier.as_slice(), next.as_slice(), committing.as_slice()].concat();
     let report = check_store(&image, &events, earlier.len() + next.len());
     assert!(!report.violations.is_empty(), "{}", report.summary(&events));
+}
+
+// ---------------------------------------------------------------------------
+// Superseding publish (WP0(d), OI-1003-Q18, #187)
+// ---------------------------------------------------------------------------
+
+fn run_copy(scratch: &Scratch) -> bulkload_agent::transfer::TransferStats {
+    copy(
+        &scratch.source(),
+        &scratch.destination(),
+        &scratch.base.join("source-state"),
+        &scratch.base.join("destination-state"),
+    )
+    .unwrap()
+}
+
+/// A first copy of [`populate`]'s tree, then `change` applied to the source
+/// and settled. Returns the source as it was copied and as it is now.
+fn copied_then_changed(scratch: &Scratch, change: impl FnOnce(&Path)) -> (Expected, Expected) {
+    populate(&scratch.source());
+    let first = run_copy(scratch);
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    let before = expected(&scratch.source());
+    change(&scratch.source());
+    bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    (before, expected(&scratch.source()))
+}
+
+/// One rerun with every traced syscall recorded, from the image the first
+/// copy left.
+fn traced_rerun(scratch: &Scratch) -> (Image, Vec<Event>, bulkload_agent::transfer::TransferStats) {
+    let image = Image::scan(&scratch.destination()).unwrap();
+    let recorder = Recorder::new();
+    let stats = {
+        let _process = recorder.attach_process();
+        run_copy(scratch)
+    };
+    (image, recorder.take(), stats)
+}
+
+/// The store's view of the superseded paths in one crash state, replayed
+/// from the commits that completed: the bytes each path's row vouches for,
+/// and the intents recorded and not yet settled, by path.
+struct Rows<'a> {
+    rows: BTreeMap<Vec<u8>, &'a [u8]>,
+    intents: BTreeMap<Vec<u8>, Vec<u8>>,
+}
+
+fn replay_rows<'a>(
+    before: &'a Expected,
+    after: &'a Expected,
+    events: &[Event],
+    view: View<'_>,
+    info: &StateInfo,
+) -> Result<Rows<'a>, String> {
+    // The first copy committed a row for every file it carried.
+    let mut state = Rows {
+        rows: before
+            .files
+            .iter()
+            .map(|(rel, data)| (rel.clone(), data.as_slice()))
+            .collect(),
+        intents: BTreeMap::new(),
+    };
+    for commit in &info.commits {
+        let Event::Commit { records, .. } = &events[*commit] else {
+            return Err(format!("event {commit} is not a commit"));
+        };
+        for record in records {
+            match record {
+                CommitRecord::SupersedeBegun {
+                    rel_path,
+                    temp_path,
+                    ..
+                } => {
+                    state.rows.remove(rel_path);
+                    state.intents.insert(rel_path.clone(), temp_path.clone());
+                }
+                CommitRecord::SupersedeSettled { rel_path, restored } => {
+                    state.intents.remove(rel_path);
+                    if let (true, Some(data)) = (*restored, before.files.get(rel_path)) {
+                        state.rows.insert(rel_path.clone(), data);
+                    }
+                }
+                CommitRecord::Output { rel_path } => {
+                    if let Some(data) = after.files.get(rel_path) {
+                        state.rows.insert(rel_path.clone(), data);
+                    }
+                    committed_record(after, view, record)?;
+                }
+                other => committed_record(after, view, other)?,
+            }
+        }
+    }
+    Ok(state)
+}
+
+/// The superseding invariants of the module docs, for one crash state.
+fn superseding_invariant(
+    before: &Expected,
+    after: &Expected,
+    events: &[Event],
+    view: View<'_>,
+    info: &StateInfo,
+) -> Result<(), String> {
+    let name = |rel: &[u8]| String::from_utf8_lossy(rel).into_owned();
+    let state = replay_rows(before, after, events, view, info)?;
+    // A row never sits beside other bytes.
+    for (rel, want) in &state.rows {
+        if !matches!(view.get(rel), Some(Entry::File { data, .. }) if data == *want) {
+            return Err(format!("a row vouches for other bytes at {}", name(rel)));
+        }
+    }
+    for (rel, entry) in view.walk() {
+        let Entry::File { data, .. } = entry else {
+            continue;
+        };
+        if is_temporary(&rel) {
+            // An old output under a temporary name was displaced by an
+            // exchange: its intent must be recorded, and name this path.
+            let displaced = before
+                .files
+                .iter()
+                .find(|(path, old)| old.as_slice() == data && after.files.get(*path) != Some(*old));
+            if let Some((path, _)) = displaced {
+                if state.intents.get(path) != Some(&rel) {
+                    return Err(format!(
+                        "the old output of {} sits at {} with no intent recorded",
+                        name(path),
+                        name(&rel)
+                    ));
+                }
+            }
+            continue;
+        }
+        // The whole old output or the whole new one, never a mix.
+        let old = before.files.get(&rel).map(Vec::as_slice) == Some(data);
+        let new = after.files.get(&rel).map(Vec::as_slice) == Some(data);
+        if !old && !new {
+            return Err(format!("{} holds neither output", name(&rel)));
+        }
+    }
+    if info.complete {
+        for (rel, data) in &after.files {
+            if !matches!(view.get(rel), Some(Entry::File { data: held, .. }) if held == data.as_slice())
+            {
+                return Err(format!(
+                    "copy returned but {} is not the new output",
+                    name(rel)
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn superseding_report(
+    image: &Image,
+    events: &[Event],
+    before: &Expected,
+    after: &Expected,
+) -> Report {
+    check_view(image, events, &options(), |view, info| {
+        superseding_invariant(before, after, events, view, info)
+    })
+    .unwrap()
+}
+
+/// An exchange of a superseding publish: one of its two names is an output.
+/// The plan's probe for the exchange (`Destination::exchange_supported`,
+/// once per device) trades two empty temporaries of the store ahead of any
+/// intent; it names no output and is not one of these.
+fn superseding_exchange(event: &Event) -> bool {
+    use bulkload_agent::materialize::temporary_name;
+    matches!(event, Event::Exchange { a, b, .. }
+        if temporary_name(a).is_none() || temporary_name(b).is_none())
+}
+
+/// The probe's exchanges in a trace: both names are temporaries.
+fn probe_exchanges(events: &[Event]) -> usize {
+    events
+        .iter()
+        .filter(|event| matches!(event, Event::Exchange { .. }) && !superseding_exchange(event))
+        .count()
+}
+
+fn begins(event: &Event) -> bool {
+    matches!(event, Event::Commit { records, .. }
+        if records.iter().any(|record| matches!(record, CommitRecord::SupersedeBegun { .. })))
+}
+
+/// A rerun that supersedes two of this store's outputs (one grown, one
+/// rewritten at its size, in two directories) and adds a seat: every
+/// power-loss state keeps the old output with its old row or the new output
+/// with its new row. The same trace with the intent's commit moved after
+/// the first exchange, or with the directory seals ahead of the new rows
+/// dropped, must fail.
+#[test]
+fn every_power_loss_state_of_a_superseding_rerun_holds_the_old_or_the_new_output() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("supersede");
+    let (before, after) = copied_then_changed(&scratch, |source| {
+        let mut grown = fs::read(source.join("b")).unwrap();
+        grown.extend(noise(91, 7_000));
+        fs::write(source.join("b"), grown).unwrap();
+        fs::write(source.join("nested/c"), noise(92, 5_000)).unwrap();
+        fs::write(source.join("nested/added"), noise(93, 1_000)).unwrap();
+    });
+    let (image, events, stats) = traced_rerun(&scratch);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(expected(&scratch.destination()).files, after.files);
+    let exchanges: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| superseding_exchange(event))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(exchanges.len(), 2, "both changed outputs are exchanged");
+    assert_eq!(probe_exchanges(&events), 1, "one probe for the device");
+    let begun = events.iter().position(begins).unwrap();
+    assert!(
+        begun < exchanges[0],
+        "the intent commits before any exchange"
+    );
+
+    let report = superseding_report(&image, &events, &before, &after);
+    eprintln!("{}", report.summary(&events));
+    assert!(report.states > report.crash_points);
+    assert!(report.passed(), "{}", report.summary(&events));
+
+    // Teeth: the intent's commit after the exchange leaves the old row
+    // beside the new output.
+    let mut late = events.clone();
+    let intent = late.remove(begun);
+    late.insert(exchanges[0], intent);
+    let report = superseding_report(&image, &late, &before, &after);
+    assert!(
+        !report.violations.is_empty(),
+        "an exchange ahead of its intent must fail: {}",
+        report.summary(&late)
+    );
+
+    // Teeth: a new row committed without the directory seals that make the
+    // exchange durable can outlive it.
+    let directories: HashSet<NodeId> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Exchange { dir, .. } => Some(*dir),
+            _ => None,
+        })
+        .collect();
+    let unsealed: Vec<Event> = events
+        .iter()
+        .enumerate()
+        .filter(|(index, event)| {
+            !(*index > exchanges[0]
+                && matches!(event, Event::Sync { node, .. } if directories.contains(node)))
+        })
+        .map(|(_, event)| event.clone())
+        .collect();
+    assert!(
+        unsealed.len() < events.len(),
+        "the trace seals its directories"
+    );
+    let report = superseding_report(&image, &unsealed, &before, &after);
+    assert!(
+        !report.violations.is_empty(),
+        "a row ahead of its directory seal must fail: {}",
+        report.summary(&unsealed)
+    );
+}
+
+const THEIRS: &[u8] = b"another writer's file, which no rerun may lose";
+
+/// No-clobber across a power loss (`MC_wp0d_exchange`, and what
+/// `MC_wp0d_check_rename` and `MC_neg_sweep_displaced` break): another
+/// writer's file takes the output's place between the publish's last look
+/// and its exchange. In every crash state that file is at the leaf, or under
+/// the temporary name with the staged file at the leaf and the intent still
+/// recorded, which is the state the next sweep exchanges back. The same
+/// trace without the seal between the exchange back and the unlink must
+/// fail: a crash could keep the unlink and lose the exchange back.
+#[test]
+fn a_file_a_superseding_publish_displaced_survives_every_power_loss_state() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("displaced");
+    let (before, after) = copied_then_changed(&scratch, |source| {
+        fs::write(source.join("b"), noise(94, 30_000)).unwrap();
+    });
+    // The other writer's file waits in the destination, so the image holds
+    // it; its move over the leaf is that writer's own call, not a traced one,
+    // so the image keeps showing the old output at the leaf until the
+    // exchange, and `stray` as a second name of the file throughout.
+    let (stray, leaf) = (
+        scratch.destination().join("stray"),
+        scratch.destination().join("b"),
+    );
+    fs::write(&stray, THEIRS).unwrap();
+    let hook =
+        bulkload_agent::materialize::set_before_exchange(&scratch.destination(), b"b", move || {
+            fs::rename(&stray, &leaf).unwrap();
+        })
+        .unwrap();
+    let (image, events, stats) = traced_rerun(&scratch);
+    drop(hook);
+    assert_eq!(
+        stats.refusals,
+        [(b"b".to_vec(), "DESTINATION_OCCUPIED".to_owned())]
+    );
+    assert_eq!(fs::read(scratch.destination().join("b")).unwrap(), THEIRS);
+    let exchanges: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| superseding_exchange(event))
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(exchanges.len(), 2, "the exchange, and the exchange back");
+    assert_eq!(probe_exchanges(&events), 1, "one probe for the device");
+
+    let old = before.files[b"b".as_slice()].as_slice();
+    let new = after.files[b"b".as_slice()].as_slice();
+    let check = |events: &[Event]| {
+        check_view(&image, events, &options(), |view, info| {
+            let store = replay_rows(&before, &before, events, view, info)?;
+            let holds = |rel: &[u8], want: &[u8]| matches!(view.get(rel), Some(Entry::File { data, .. }) if data == want);
+            // Before the exchange the image still shows the old output.
+            if holds(b"b", THEIRS) || holds(b"b", old) {
+                return Ok(());
+            }
+            let aside = view
+                .walk()
+                .into_iter()
+                .find(|(rel, entry)| {
+                    is_temporary(rel)
+                        && matches!(entry, Entry::File { data, .. } if *data == THEIRS)
+                })
+                .map(|(rel, _)| rel);
+            match aside {
+                Some(rel) if holds(b"b", new) && store.intents.get(b"b".as_slice()) == Some(&rel) => {
+                    Ok(())
+                }
+                other => Err(format!(
+                    "the displaced file is lost or unexplained: leaf {:?}, aside {other:?}",
+                    view.get(b"b").map(|entry| matches!(entry, Entry::File { .. }))
+                )),
+            }
+        })
+        .unwrap()
+    };
+    let report = check(&events);
+    eprintln!("{}", report.summary(&events));
+    assert!(report.passed(), "{}", report.summary(&events));
+
+    // Teeth: without the seal between the exchange back and the unlink.
+    let Event::Exchange { dir, .. } = events[exchanges[1]] else {
+        unreachable!()
+    };
+    let seal = (exchanges[1]..events.len())
+        .find(|index| matches!(&events[*index], Event::Sync { node, .. } if *node == dir))
+        .unwrap();
+    let unlink = (exchanges[1]..events.len())
+        .find(|index| matches!(&events[*index], Event::Unlink { dir: from, .. } if *from == dir))
+        .unwrap();
+    assert!(
+        seal < unlink,
+        "the exchange back is sealed before the unlink"
+    );
+    let mut unsealed = events;
+    unsealed.remove(seal);
+    let report = check(&unsealed);
+    assert!(
+        !report.violations.is_empty(),
+        "an unlink ahead of the exchange back's seal must fail: {}",
+        report.summary(&unsealed)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP0(g): the relaxed source ledger (OI-1003-Q20, Q37, Q104)
+// ---------------------------------------------------------------------------
+
+/// The source ledger's row commits in a trace, in the order they returned:
+/// each commit's capture keys.
+fn ledger_commits(events: &[Event], source_store: NodeId) -> Vec<Vec<Vec<u8>>> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Commit { store, records } if *store == source_store => Some(
+                records
+                    .iter()
+                    .filter_map(|record| match record {
+                        CommitRecord::Capture { key } => Some(key.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .filter(|keys| !keys.is_empty())
+        .collect()
+}
+
+/// Bytes, or a link's target, by relative path.
+type Leaves = BTreeMap<Vec<u8>, Vec<u8>>;
+
+/// The regular files and symlinks under `root`, as [`expected`] reads them.
+fn tree(root: &Path) -> (Leaves, Leaves) {
+    let found = expected(root);
+    (found.files, found.links)
+}
+
+/// The source store at `state` after a power loss that kept the first
+/// `keep` bytes of its WAL (`pristine`) and nothing after them; the
+/// wal-index is never durable state, so it is gone too.
+fn lose_ledger_tail(state: &Path, pristine: &[u8], keep: u64) {
+    fs::write(
+        state.join("transfer.sqlite-wal"),
+        &pristine[..usize::try_from(keep).unwrap()],
+    )
+    .unwrap();
+    let _ = fs::remove_file(state.join("transfer.sqlite-shm"));
+}
+
+/// WP0(g) (OI-1003-Q20, adopted by OI-1003-Q37): the source ledger's row
+/// commits are not synced (`synchronous=NORMAL`), so a power loss may roll
+/// the newest of them back. Every such state of a real copy's ledger is
+/// built here as `SQLite` recovers from it: the store's WAL is cut at each
+/// frame boundary from the end of the creation commit, which is
+/// `synchronous=FULL` and so on disk (`transfer_store`'s
+/// `only_a_source_ledgers_row_commits_are_relaxed`, and P79's sync-mode
+/// floor), to its last byte, and its wal-index is removed.
+///
+/// The trace gives the order the row commits returned in. In every state:
+///
+/// - the store's authority is the creation commit's (a new one would re-key
+///   every row, `MC_wp0g_authority`);
+/// - the ledger holds a prefix of the traced row commits, whole: rows are
+///   lost newest first, and none is torn or wrong;
+/// - a resume against the destination the copy left reads 0 source bytes
+///   and changes nothing: every seat is held by a committed destination
+///   row, so the destination answers `Reuse` and the ledger is never asked
+///   (R25's committed-row reading, OI-1003-Q40).
+///
+/// Every prefix is reached, from no row to all of them. Then, with every
+/// row lost, a third party removes one output: the resume reads that seat's
+/// bytes once and nothing else, and every byte it leaves is the source's.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn every_power_loss_state_of_a_relaxed_ledger_costs_at_most_its_lost_seats() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("relaxed-ledger");
+    populate(&scratch.source());
+    let state = scratch.base.join("source-state");
+    let wal = state.join("transfer.sqlite-wal");
+    let database = state.join("transfer.sqlite");
+
+    // The store's creation: schema and authority, committed before any row.
+    let created = Store::open(&state).unwrap();
+    let authority = created.authority().unwrap();
+    drop(created);
+    let synced = fs::metadata(&wal).unwrap().len();
+
+    // Two traced copies, the second of two new seats, so the ledger's rows
+    // commit in at least two groups whatever the committer's timing.
+    let before = bulkload_agent::counters::Counters::snapshot();
+    let (_, events) = traced_copy(&scratch);
+    let mut commits = ledger_commits(&events, node(&state));
+    fs::write(scratch.source().join("f"), noise(101, 7_000)).unwrap();
+    fs::write(scratch.source().join("nested/g"), noise(103, 11_000)).unwrap();
+    bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    let (_, events) = traced_copy(&scratch);
+    let second = ledger_commits(&events, node(&state));
+    assert!(!commits.is_empty() && !second.is_empty());
+    commits.extend(second);
+    let counted = bulkload_agent::counters::Counters::snapshot().since(before);
+    assert!(
+        counted.get(bulkload_agent::counters::Counter::SourceLedgerRelaxedCommits)
+            >= commits.len() as u64,
+        "every row commit of the copy was relaxed"
+    );
+    let keys: Vec<Vec<u8>> = commits.iter().flatten().cloned().collect();
+    assert_eq!(keys.len(), 7, "one row per regular file of the corpus");
+
+    let pristine = fs::read(&wal).unwrap();
+    let main_before = fs::read(&database).unwrap();
+    // A WAL is a 32-byte header and frames of 24 bytes plus one page.
+    let page = u64::from(u32::from_be_bytes(pristine[8..12].try_into().unwrap()));
+    let frame = 24 + page;
+    let length = pristine.len() as u64;
+    assert!(
+        synced > 32 && (synced - 32).is_multiple_of(frame),
+        "{synced} {frame}"
+    );
+    assert!(
+        length > synced && (length - 32).is_multiple_of(frame),
+        "{length}"
+    );
+
+    let want = tree(&scratch.source());
+    let mut reached = BTreeSet::new();
+    let mut last = 0;
+    let mut cut = synced;
+    while cut <= length {
+        lose_ledger_tail(&state, &pristine, cut);
+        let recovered = Store::open(&state).unwrap();
+        assert_eq!(
+            recovered.authority().unwrap(),
+            authority,
+            "cut {cut}: the authority survives every loss of rows"
+        );
+        let held: Vec<bool> = keys
+            .iter()
+            .map(|key| recovered.capture(key).unwrap().is_some())
+            .collect();
+        drop(recovered);
+        // A prefix of the commits, whole: no commit is half there, and no
+        // later commit survives an earlier one's loss.
+        let survived = (0..=commits.len())
+            .find(|prefix| {
+                let rows: usize = commits[..*prefix].iter().map(Vec::len).sum();
+                held.iter()
+                    .enumerate()
+                    .all(|(row, here)| *here == (row < rows))
+            })
+            .unwrap_or_else(|| panic!("cut {cut}: not a prefix of the row commits: {held:?}"));
+        assert!(survived >= last, "cut {cut}: a longer WAL lost more rows");
+        last = survived;
+        reached.insert(survived);
+
+        let resumed = run_copy(&scratch);
+        assert!(
+            resumed.refusals.is_empty(),
+            "cut {cut}: {:?}",
+            resumed.refusals
+        );
+        assert_eq!(
+            resumed.source_bytes_read,
+            0,
+            "cut {cut}: {survived} of {} row commits survived, and no held seat is read",
+            commits.len()
+        );
+        assert_eq!(resumed.reused, 7, "cut {cut}");
+        assert_eq!(tree(&scratch.destination()), want, "cut {cut}");
+        cut += frame;
+    }
+    assert_eq!(
+        reached,
+        (0..=commits.len()).collect::<BTreeSet<_>>(),
+        "every prefix of the row commits is a power-loss state"
+    );
+    assert_eq!(
+        fs::read(&database).unwrap(),
+        main_before,
+        "no checkpoint moved a row out of the WAL, so the cuts are the whole loss"
+    );
+
+    // Every row lost, and a third party removes one output: its seat is
+    // read once, and only it.
+    lose_ledger_tail(&state, &pristine, synced);
+    fs::remove_file(scratch.destination().join("b")).unwrap();
+    let resumed = run_copy(&scratch);
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(resumed.source_bytes_read, 40_000, "seat b, once");
+    assert_eq!(resumed.reused, 6);
+    assert_eq!(tree(&scratch.destination()), want);
+    assert_eq!(Store::open(&state).unwrap().authority().unwrap(), authority);
+    let settled = run_copy(&scratch);
+    assert_eq!(settled.source_bytes_read, 0);
+    assert_eq!(settled.reused, 7);
 }

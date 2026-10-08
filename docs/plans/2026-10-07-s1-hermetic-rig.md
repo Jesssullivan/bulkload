@@ -181,6 +181,12 @@ nohup nice -n 10 nix develop .#default --command python3 crates/bulkload-bench/s
 - The native arm's seal on Linux is `fsync`, with a device cache flush; the
   rclone arm syncs nothing. The bench header prints `seal_primitive`. Read
   the result with that in mind (slo.md, the later 2026-10-07 amendment).
+- OI-1003-Q107: after each rclone copy the bench runs one `syncfs` of the
+  destination outside the timed window (`rclone_sync` lines), which also
+  leaves the next arm none of rclone's dirty pages to flush. The bench's
+  `rclone_synced` lines and the evidence's "Equal durability" table add it
+  back: native against rclone made equally durable. That comparison is
+  informational; the verdict stays against rclone as shipped.
 
 ### The A control (OI-1003-Q103)
 

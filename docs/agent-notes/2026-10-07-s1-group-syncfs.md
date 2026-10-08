@@ -66,6 +66,34 @@ counter pair is `flush_fs_count` / `flush_fs_ns`.
   - the early durability `syncfs` adds is the `persist` crash choice the model
     always offers.
 
+## Merge with main's WP0(d) superseding publish (2026-10-08)
+
+- **Decision: superseding temporaries join `seal_group_data`.** On main a
+  superseding temporary is sealed only by `StagedFile::seal` inside
+  `prepare_supersede` (per-file `fsync`). In a batched group that would be
+  one extra flush per changed seat, so `seal_group_data` now covers
+  `Publication::Superseding` too. It counts the file's device in the first
+  `syncfs` and marks the temporary `sealed`, so `prepare_supersede` skips
+  its own seal. The order holds: device seal, then the intent commit
+  (`begin_supersedes`), then `RENAME_EXCHANGE`, then
+  `TouchedDevices::seal(store_device, batched)`, then the record commit. No
+  name is exchanged or renamed in before its data is durable.
+- The model allows it: `BeginSupersede(s)` needs only `dPub[s] = "sealed"`
+  (`docs/formal/README.md`, "Seals" bullet extended).
+- The seal-failure path (`PublishSink::refuse_unsealed`, extracted to keep
+  `commit` under clippy's 100-line limit) matches every variant. A
+  superseding item's temporary is discarded with its refusal. No intent was
+  recorded and nothing was exchanged.
+- `touched.seal(self.store_device, batched)` runs after
+  `self.supersede(...)`, so the supersede step's touched directories are
+  sealed too.
+- The batched power-loss proof now also supersedes one output (`d`) in the
+  same group. It asserts: an `Exchange` happened, the trace has no
+  per-file `DataSync`/`Fsync`, and the trace has exactly 2 `FsSync`. In
+  every power-loss state, `d` holds the old or the new bytes whole, and a
+  committed `Output d` never sits beside the old bytes. The pin is still 4
+  proofs.
+
 ## Not done / open
 
 - **Merge is held** for the adversarial review when reviewers return (after

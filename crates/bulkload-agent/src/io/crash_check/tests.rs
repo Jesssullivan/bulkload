@@ -596,6 +596,7 @@ fn group_commit_trace(store: NodeId) -> Vec<Event> {
             },
             CommitRecord::DirectoryComplete { key: b"d".to_vec() },
             CommitRecord::RootSealed,
+            CommitRecord::RefusedSeat { key: b"r".to_vec() },
         ],
     });
     events
@@ -1311,4 +1312,302 @@ fn the_capture_record_follows_the_meta_class() {
             assert_eq!(seen, [None, kept].into(), "{kind:?}");
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Superseding publish (WP0(d), OI-1003-Q18, #187): the exchange protocol
+// ---------------------------------------------------------------------------
+
+const OLD: &[u8] = b"old-output";
+const FOREIGN: &[u8] = b"someone-elses";
+const OLD_NODE: NodeId = n(5);
+const FOREIGN_NODE: NodeId = n(6);
+
+/// What the superseding protocol's store commits said, in a crash state.
+#[derive(Default)]
+struct SupersedeStore {
+    /// The intent committed: the old rows are out of the store.
+    begun: bool,
+    /// The new output's row committed.
+    output: bool,
+    /// The intent was settled.
+    settled: bool,
+}
+
+fn supersede_store(events: &[Event], info: &StateInfo) -> SupersedeStore {
+    use crate::io::trace::CommitRecord;
+    let mut store = SupersedeStore::default();
+    for commit in &info.commits {
+        let Event::Commit { records, .. } = &events[*commit] else {
+            continue;
+        };
+        for record in records {
+            match record {
+                CommitRecord::SupersedeBegun { .. } => store.begun = true,
+                CommitRecord::Output { .. } => store.output = true,
+                CommitRecord::SupersedeSettled { .. } => store.settled = true,
+                _ => {}
+            }
+        }
+    }
+    store
+}
+
+fn begun() -> Event {
+    use crate::io::trace::CommitRecord;
+    Event::Commit {
+        store: LEDGER,
+        records: vec![CommitRecord::SupersedeBegun {
+            rel_path: b"data".to_vec(),
+            temp_path: b"tmp".to_vec(),
+            staged: TMP,
+            owned: OLD_NODE,
+        }],
+    }
+}
+
+fn settled(output: bool) -> Event {
+    use crate::io::trace::CommitRecord;
+    let mut records = vec![CommitRecord::SupersedeSettled {
+        rel_path: b"data".to_vec(),
+        restored: false,
+    }];
+    if output {
+        records.push(CommitRecord::Output {
+            rel_path: b"data".to_vec(),
+        });
+    }
+    Event::Commit {
+        store: LEDGER,
+        records,
+    }
+}
+
+/// `tmp` and `data` trade files; afterwards `tmp` names `at_tmp`.
+fn exchange(at_tmp: NodeId, at_data: NodeId) -> Event {
+    Event::Exchange {
+        dir: ROOT,
+        a: b"tmp".to_vec(),
+        a_node: at_tmp,
+        b: b"data".to_vec(),
+        b_node: at_data,
+    }
+}
+
+fn staged_new(file_sync: SyncKind) -> Vec<Event> {
+    vec![
+        Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"tmp".to_vec()),
+            node: TMP,
+            mode: 0o600,
+        },
+        write(TMP, NEW),
+        Event::Sync {
+            node: TMP,
+            kind: file_sync,
+        },
+    ]
+}
+
+/// The superseding publish of this store's own output `data`: stage and
+/// seal the new file, commit the intent, exchange, remove the displaced old
+/// output, seal the directory, commit the new row with the settled intent.
+/// `intent_first` false puts the exchange ahead of the intent's commit;
+/// `dir_sync` `None` drops the directory seal.
+fn supersede_trace(
+    file_sync: SyncKind,
+    dir_sync: Option<SyncKind>,
+    intent_first: bool,
+) -> Vec<Event> {
+    let mut events = staged_new(file_sync);
+    if intent_first {
+        events.push(begun());
+        events.push(exchange(OLD_NODE, TMP));
+    } else {
+        events.push(exchange(OLD_NODE, TMP));
+        events.push(begun());
+    }
+    events.push(Event::Unlink {
+        dir: ROOT,
+        name: b"tmp".to_vec(),
+    });
+    if let Some(kind) = dir_sync {
+        events.push(Event::Sync { node: ROOT, kind });
+    }
+    events.push(settled(true));
+    events
+}
+
+/// In every power-loss state of a superseding publish:
+///
+/// - `data` holds the whole old output or the whole new one;
+/// - a row never sits beside other bytes: the old row (no intent committed
+///   yet) means the old output, the new row means the new one;
+/// - the old output under the staged name means the intent is committed, so
+///   the next sweep knows the name holds this store's displaced output;
+/// - once the protocol returned, `data` is the new output.
+fn supersede_invariant(events: &[Event], view: View<'_>, info: &StateInfo) -> Result<(), String> {
+    let store = supersede_store(events, info);
+    let data = match view.get(b"data") {
+        Some(Entry::File { data, .. }) if data == OLD || data == NEW => data,
+        other => return Err(format!("data is neither output: {other:?}")),
+    };
+    if !store.begun && data != OLD {
+        return Err("the old row sits beside the new output".to_owned());
+    }
+    if store.output && data != NEW {
+        return Err("the new row sits beside the old output".to_owned());
+    }
+    if matches!(view.get(b"tmp"), Some(Entry::File { data, .. }) if data == OLD) && !store.begun {
+        return Err("a displaced output with no intent recorded".to_owned());
+    }
+    if info.complete && data != NEW {
+        return Err("the protocol returned but the new output is not durable".to_owned());
+    }
+    Ok(())
+}
+
+fn supersede_image() -> Image {
+    Image::empty(ROOT)
+        .with_file(b"data", OLD_NODE, OLD)
+        .with_file(b"ledger", LEDGER, b"")
+}
+
+fn supersede_report(events: &[Event], options: &Options) -> Report {
+    let report = check_view(&supersede_image(), events, options, |view, info| {
+        supersede_invariant(events, view, info)
+    })
+    .unwrap();
+    eprintln!("{}", report.summary(events));
+    report
+}
+
+/// The Linux shape (`fsync` seals) and the Darwin shape (barrier seals, a
+/// store commit that drains the drive) of the superseding publish pass, each
+/// checked exhaustively.
+#[test]
+fn a_superseding_publish_leaves_the_old_output_or_the_new_in_every_crash_state() {
+    let linux = supersede_report(
+        &supersede_trace(SyncKind::Fsync, Some(SyncKind::Fsync), true),
+        &Options {
+            commit_drains: false,
+            ..Options::default()
+        },
+    );
+    assert!(linux.passed() && linux.exhaustive());
+    assert!(linux.states > linux.crash_points);
+    for scope in [BarrierScope::Object, BarrierScope::Device] {
+        let darwin = supersede_report(
+            &supersede_trace(SyncKind::Barrier, Some(SyncKind::Barrier), true),
+            &Options {
+                commit_drains: true,
+                barrier_scope: scope,
+                ..Options::default()
+            },
+        );
+        assert!(darwin.passed() && darwin.exhaustive(), "{scope:?}");
+    }
+}
+
+/// The proof has teeth for each ordering it relies on: an exchange ahead of
+/// the intent's commit leaves the old row beside the new output (or a
+/// displaced output no record explains), and a new row committed without
+/// the directory seal can outlive the exchange it describes.
+#[test]
+fn a_superseding_publish_out_of_order_is_caught() {
+    let options = Options {
+        commit_drains: false,
+        ..Options::default()
+    };
+    let early = supersede_report(
+        &supersede_trace(SyncKind::Fsync, Some(SyncKind::Fsync), false),
+        &options,
+    );
+    assert!(!early.violations.is_empty(), "exchange before the intent");
+    let unsealed = supersede_report(&supersede_trace(SyncKind::Fsync, None, true), &options);
+    assert!(
+        unsealed
+            .violations
+            .iter()
+            .any(|violation| violation.message.contains("new row")),
+        "a row committed before its directory seal"
+    );
+}
+
+/// The exchange found another writer's file at `data` (it took the old
+/// output's place after the last look): exchange it back, seal the
+/// directory, and only then remove the staged file. `seal_back` `None`
+/// drops that seal.
+fn displaced_trace(seal_back: Option<SyncKind>) -> Vec<Event> {
+    let mut events = staged_new(SyncKind::Fsync);
+    events.push(begun());
+    events.push(exchange(FOREIGN_NODE, TMP));
+    events.push(exchange(TMP, FOREIGN_NODE));
+    if let Some(kind) = seal_back {
+        events.push(Event::Sync { node: ROOT, kind });
+    }
+    events.push(Event::Unlink {
+        dir: ROOT,
+        name: b"tmp".to_vec(),
+    });
+    events.push(Event::Sync {
+        node: ROOT,
+        kind: SyncKind::Fsync,
+    });
+    events.push(settled(false));
+    events
+}
+
+/// No-clobber across a power loss: the other writer's file is at `data`, or
+/// it sits under the staged name with the staged file at `data` and the
+/// intent committed and unsettled, which is the state the next sweep
+/// exchanges back. It is never unnamed.
+fn displaced_invariant(events: &[Event], view: View<'_>, info: &StateInfo) -> Result<(), String> {
+    let store = supersede_store(events, info);
+    let holds = |rel: &[u8], want: &[u8]| matches!(view.get(rel), Some(Entry::File { data, .. }) if data == want);
+    if holds(b"data", FOREIGN) {
+        return Ok(());
+    }
+    if holds(b"tmp", FOREIGN) && holds(b"data", NEW) && store.begun && !store.settled {
+        return Ok(());
+    }
+    Err(format!(
+        "the displaced file is lost or stranded: data {:?}, tmp {:?}",
+        view.get(b"data"),
+        view.get(b"tmp")
+    ))
+}
+
+fn displaced_report(events: &[Event]) -> Report {
+    let image = Image::empty(ROOT)
+        .with_file(b"data", FOREIGN_NODE, FOREIGN)
+        .with_file(b"ledger", LEDGER, b"");
+    let options = Options {
+        commit_drains: false,
+        ..Options::default()
+    };
+    let report = check_view(&image, events, &options, |view, info| {
+        displaced_invariant(events, view, info)
+    })
+    .unwrap();
+    eprintln!("{}", report.summary(events));
+    report
+}
+
+/// A file the exchange displaced survives every power loss, and the seal
+/// between the exchange back and the staged file's unlink is what keeps it:
+/// without it a crash can keep the first exchange and the unlink, which then
+/// removes the displaced file.
+#[test]
+fn a_file_the_exchange_displaced_survives_every_crash_state() {
+    let sealed = displaced_report(&displaced_trace(Some(SyncKind::Fsync)));
+    assert!(sealed.passed() && sealed.exhaustive());
+    let barrier = displaced_report(&displaced_trace(Some(SyncKind::Barrier)));
+    assert!(barrier.passed(), "a barrier orders the unlink after both");
+    let unsealed = displaced_report(&displaced_trace(None));
+    assert!(
+        !unsealed.violations.is_empty(),
+        "the unlink must not outlive the exchange back"
+    );
 }

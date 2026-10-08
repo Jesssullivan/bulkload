@@ -63,6 +63,8 @@
 //! | `materialize.after_temp_write` | a complete `.bulkload-*` temporary at its final mode, not sealed, not queued |
 //! | `materialize.after_temp_seal` | the temporary sealed, not renamed |
 //! | `materialize.after_rename` | the final name holding the sealed file; no output record |
+//! | `supersede.after_intent` | a superseding publish (WP0(d), #187): its sealed temporary, its intent committed and its output's rows out of the store; the old output still at the leaf |
+//! | `supersede.after_exchange` | the new file at the leaf, the old output displaced under the temporary name, the intent still recorded; no row for the path |
 //! | `publish.destination.after_dir_seal` | a group's files renamed and its directories sealed; no records |
 //! | `publish.destination.before_commit` | the group's records staged, `COMMIT` not issued |
 //! | `publish.destination.after_commit` | the group's output records and chunk hints committed |
@@ -199,6 +201,10 @@ pub enum Point {
     MaterializeAfterTempSeal,
     /// `materialize.after_rename`
     MaterializeAfterRename,
+    /// `supersede.after_intent`
+    SupersedeAfterIntent,
+    /// `supersede.after_exchange`
+    SupersedeAfterExchange,
     /// `publish.destination.after_dir_seal`
     PublishDestinationAfterDirSeal,
     /// `publish.destination.before_commit`
@@ -237,13 +243,15 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
         Self::MaterializeAfterTempWrite,
         Self::MaterializeAfterTempSeal,
         Self::MaterializeAfterRename,
+        Self::SupersedeAfterIntent,
+        Self::SupersedeAfterExchange,
         Self::PublishDestinationAfterDirSeal,
         Self::PublishDestinationBeforeCommit,
         Self::PublishDestinationAfterCommit,
@@ -273,6 +281,8 @@ impl Point {
             Self::MaterializeAfterTempWrite => "materialize.after_temp_write",
             Self::MaterializeAfterTempSeal => "materialize.after_temp_seal",
             Self::MaterializeAfterRename => "materialize.after_rename",
+            Self::SupersedeAfterIntent => "supersede.after_intent",
+            Self::SupersedeAfterExchange => "supersede.after_exchange",
             Self::PublishDestinationAfterDirSeal => "publish.destination.after_dir_seal",
             Self::PublishDestinationBeforeCommit => "publish.destination.before_commit",
             Self::PublishDestinationAfterCommit => "publish.destination.after_commit",
