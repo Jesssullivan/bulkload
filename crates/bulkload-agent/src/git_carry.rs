@@ -5318,10 +5318,13 @@ fn prepare_attachment(
     receipt: &Path,
 ) -> Result<(PathBuf, String)> {
     use std::os::unix::fs::DirBuilderExt;
+    // R-N114, #216: a receipt left by an earlier refused attachment is a
+    // collision refused by type, never a bare errno; it is kept as evidence,
+    // and a rerun names a new receipt.
     fs::DirBuilder::new()
         .mode(0o700)
         .create(receipt)
-        .refuse_at("git_carry::prepare_attachment")?;
+        .map_err(occupied)?;
     // Retain the actual input, not merely a pathname that may later disappear.
     let retained = receipt.join("capture.bundle");
     fs::copy(bundle, &retained).refuse_at("git_carry::prepare_attachment")?;
@@ -5478,10 +5481,14 @@ struct ConfigurationPlan {
 // `remote.origin.*` key stay in the receipt only, so the restored repository
 // has no `origin` remote at all (`git remote` lists nothing), never a
 // half-configured one with a fetch refspec and no URL.
-// `branch.*.remote = origin` still activates and names the absent remote:
-// Git reads `origin` as a path relative to the working directory, which the
-// restore never creates, so fetch, pull and push fail without reaching any
-// host until the operator adds an origin.
+// `branch.*.remote = origin` and `branch.*.pushremote = origin` are then
+// preserved-only too: Git reads an explicitly named but unconfigured remote
+// as a path relative to the working directory, and the restored worktree can
+// carry an `origin` entry (a bare repository, a bundle), which fetch, pull
+// and push would then read or write. Without them, fetch is a no-op, pull
+// reports no tracking information and push no configured destination; the
+// operator restores tracking with `git branch --set-upstream-to` once an
+// origin is added. `branch.*.merge` stays: it names no remote by itself.
 fn plan_standalone_configuration(
     private: &Path,
     heads: &str,
@@ -5537,7 +5544,12 @@ fn plan_standalone_configuration(
     for (key, value) in entries {
         let value = if key == "remote.origin.url" && origin_active {
             mapping.map_or(value, |(_, to)| to.to_owned())
-        } else if key.starts_with("remote.origin.") && !origin_active {
+        } else if !origin_active
+            && (key.starts_with("remote.origin.")
+                || (key.starts_with("branch.")
+                    && (key.ends_with(".remote") || key.ends_with(".pushremote"))
+                    && value == "origin"))
+        {
             preserved_only.push(key);
             continue;
         } else if safe_configuration_value(private, &key, &value) {
@@ -5748,11 +5760,13 @@ pub fn attach_matching_payload(
 ///
 /// # Errors
 /// Refuses payload divergence, occupied .git, invalid mapping or unknown origin.
-/// An invalid mapping refuses before the receipt is written; every other
-/// configuration refusal comes before `.git` is published, so the payload is
-/// left as it was (#216). The mapping path keeps its semantics: an origin
-/// other than `origin_from` refuses `GIT_AUTHORITY_CHANGED`, and a capture
-/// with no origin `GIT_INVENTORY_MALFORMED`.
+/// A mapping that is not absolute or whose `origin_to` is not a repository
+/// refuses before the receipt is written. A captured origin other than
+/// `origin_from` (`GIT_AUTHORITY_CHANGED`) or no origin at all
+/// (`GIT_INVENTORY_MALFORMED`) is decided from the imported capture, so it
+/// refuses after the receipt is written but before `.git` is published: the
+/// payload is left as it was, the receipt is kept, and a rerun into the
+/// same receipt refuses `GIT_DESTINATION_OCCUPIED` (#216).
 pub fn attach_standalone_payload(
     bundle: &Path,
     destination: &Path,
@@ -5946,9 +5960,9 @@ fn write_git_pointer(receipt: &Path, admin: &Path) -> Result<PathBuf> {
 /// Refuses malformed paths/modes, missing capture metadata, or an occupied target.
 /// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
 /// anything is created (S4, #162).
-/// Every configuration and authority refusal comes before the destination
-/// is created (#216); a destination created and then refused (malformed
-/// worktree custody, IO) is retained, never cleaned by recursive deletion.
+/// The checkout is built in a private `.bulkload-restore-*` stage beside the
+/// destination and published by one no-replace rename, so every refusal,
+/// and an interrupted run, leaves no destination (#216).
 pub fn restore_bundle(bundle: &Path, destination: &Path, source: &str) -> Result<()> {
     restore_bundle_configured(bundle, destination, source, None)
 }
@@ -5968,8 +5982,7 @@ pub fn restore_bundle(bundle: &Path, destination: &Path, source: &str) -> Result
 /// Refuses old captures lacking configuration, a mapping that is not absolute
 /// or does not name an existing repository, a mapped origin other than its
 /// `from`, occupied destinations, or any malformed filesystem/capture state.
-/// Every configuration and authority refusal comes before the destination is
-/// created.
+/// Every refusal comes before the destination is published.
 pub fn restore_bundle_configured(
     bundle: &Path,
     destination: &Path,
@@ -6000,14 +6013,18 @@ pub fn restore_staged(
     }
     let target = linked_destination(destination)?;
     let mapping = checked_mapping(mapping)?;
-    // #216 (OI-1003-Q129, OI-1003-Q135): the repository is assembled, and
-    // every configuration and authority decision made, in a private stage
-    // beside the destination. The destination is created only after them, so
-    // such a refusal leaves no destination and a rerun is never refused
-    // GIT_DESTINATION_OCCUPIED by a half-restored one. The stage shares the
-    // destination's filesystem, so its `.git` moves in by one rename; the
-    // stage is removed when dropped. A run interrupted before the destination
-    // is created leaves only a `.bulkload-restore-*` stage beside it.
+    // #216 (OI-1003-Q129, OI-1003-Q135): the whole checkout is built in a
+    // private stage beside the destination: the repository imported, every
+    // configuration and authority decision made, the worktree, index and
+    // captured modes laid down and the configuration applied. Only then is
+    // it published at the destination by one no-replace rename. A refusal,
+    // a full disk or a killed process before that leaves no destination, so
+    // a rerun is never refused GIT_DESTINATION_OCCUPIED by a half-restored
+    // one. The stage shares the destination's parent; a directory rename
+    // keeps every inode, so the index's stat data stays valid. The stage is
+    // removed when dropped (best effort: a captured read-only directory can
+    // keep part of it); a killed run leaves only a `.bulkload-restore-*`
+    // stage beside the destination.
     let stage =
         PrivateDir::create_beside(target.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?;
     let work = stage.path().join("repository");
@@ -6061,31 +6078,61 @@ pub fn restore_staged(
         .refuse_at(SITE)?;
     let configuration =
         plan_standalone_configuration(&work, &heads, &work.join(".git/carry-config"), mapping)?;
-    match fs::DirBuilder::new().mode(0o700).create(&target) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(BulkloadRefusal::GitDestinationOccupied);
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BulkloadRefusal::GitDestinationParentMissing);
-        }
-        Err(error) => return Err(crate::refuse::io(&error, SITE)),
-    }
-    let destination = target;
-    // Only this process writes the directory it just created (mode 0700).
-    fs::rename(work.join(".git"), destination.join(".git")).refuse_at(SITE)?;
-    restore_entries(&destination, &entries)?;
+    restore_entries(&work, &entries)?;
     let staged = find("staged")?;
-    restore_gitlink_directories(&destination, &staged, &heads)?;
-    output(git(&destination).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
-    restore_intent_to_add(&destination, None, &heads)?;
-    restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
-    apply_standalone_configuration(
-        &destination,
-        &destination.join(".git/carry-config"),
-        &configuration,
-    )?;
-    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).refuse_at(SITE)?;
+    restore_gitlink_directories(&work, &staged, &heads)?;
+    output(git(&work).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
+    restore_intent_to_add(&work, None, &heads)?;
+    restore_filesystem_rows(&work, &find("filesystem-v1")?)?;
+    apply_standalone_configuration(&work, &work.join(".git/carry-config"), &configuration)?;
+    // Before the rename: moving a directory to another parent needs write
+    // permission on it, whatever mode the capture gave the root.
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).refuse_at(SITE)?;
+    publish_restored(stage.path(), &work, &target)
+}
+
+// Publish a checkout built at `work` (directly inside `stage`) as `target`,
+// a sibling of `stage`, never replacing anything there: one exclusive
+// rename, or where the file system offers none, a fresh 0700 directory and
+// a rename of each top-level entry into it (R-N119). An occupied target is
+// GIT_DESTINATION_OCCUPIED, a parent gone GIT_DESTINATION_PARENT_MISSING.
+fn publish_restored(stage: &Path, work: &Path, target: &Path) -> Result<()> {
+    const SITE: &str = "git_carry::publish_restored";
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+    let parent = target.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
+    let typed = |error: std::io::Error| match error.raw_os_error() {
+        Some(libc::EEXIST | libc::ENOTEMPTY) => BulkloadRefusal::GitDestinationOccupied,
+        Some(libc::ENOENT) => BulkloadRefusal::GitDestinationParentMissing,
+        _ => crate::refuse::io(&error, SITE),
+    };
+    let name = |path: &Path| -> Result<std::ffi::CString> {
+        std::ffi::CString::new(
+            path.file_name()
+                .ok_or(BulkloadRefusal::PathNotAbsolute)?
+                .as_bytes(),
+        )
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)
+    };
+    let parent_dir = fs::File::open(parent).map_err(typed)?;
+    let stage_dir = fs::File::open(stage).refuse_at(SITE)?;
+    match crate::io::sys::rename_exclusive_at(&stage_dir, &name(work)?, &parent_dir, &name(target)?)
+    {
+        Ok(()) => {}
+        Err(error) if crate::io::rename_unsupported(&error) => {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(target)
+                .map_err(typed)?;
+            // Only this process writes the directory it just created (0700).
+            for entry in fs::read_dir(work).refuse_at(SITE)? {
+                let entry = entry.refuse_at(SITE)?;
+                fs::rename(entry.path(), target.join(entry.file_name())).refuse_at(SITE)?;
+            }
+        }
+        Err(error) => return Err(typed(error)),
+    }
+    parent_dir.sync_dir_counted().refuse_at(SITE)?;
     Ok(())
 }
 
@@ -6099,9 +6146,11 @@ pub fn restore_staged(
 /// Refuses occupied destinations, differing common excludes, and invalid capture.
 /// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
 /// anything is imported or created (S4, #162).
-/// Partially created worktrees are retained on failure for explicit recovery;
-/// after the worktree is added, only a concurrent writer moving HEAD or the
-/// common exclude refuses (#216).
+/// Partially created worktrees are retained on failure for explicit recovery.
+/// The capture's exclude policy and intent-to-add custody refuse before the
+/// worktree is added; after it, materialization can still refuse (a path
+/// collision, a malformed filesystem row, IO) and leave a partial worktree
+/// (#216).
 pub fn restore_linked(
     bundle: &Path,
     repository: &Path,
@@ -6112,11 +6161,20 @@ pub fn restore_linked(
 }
 
 // A new linked worktree's path, with its parent canonicalized. A parent
-// that does not exist is typed, never a bare errno (round 4 N4).
+// that does not exist is typed, never a bare errno (round 4 N4). A
+// single-component relative path's parent is the current directory, not
+// the empty path, which `canonicalize` reports missing (#216).
 fn linked_destination(destination: &Path) -> Result<PathBuf> {
     let parent = fs::canonicalize(
         destination
             .parent()
+            .map(|parent| {
+                if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                }
+            })
             .ok_or(BulkloadRefusal::PathNotAbsolute)?,
     )
     .map_err(|error| {
@@ -6223,11 +6281,13 @@ pub fn restore_linked_staged(
         .refuse_at("git_carry::restore_linked_staged")?;
     // #216: a linked worktree activates no captured configuration (it shares
     // the common repository's, origin included), so no configuration
-    // refusal can follow the write. Every capture-decided refusal (bare,
-    // exclude policy, intent-to-add) is above. The three after `worktree add`
-    // are concurrent-writer checks, HEAD or the common exclude moving under
-    // the restore, which no earlier check can decide; the partial worktree is
-    // retained for explicit recovery.
+    // refusal can follow the write; bare, exclude policy and intent-to-add
+    // are decided above. Materialization below can still refuse (a path
+    // collision or escape, a gitlink seat, a malformed filesystem row, IO),
+    // as can the concurrent-writer checks on HEAD and the common exclude.
+    // Unlike a standalone restore, the worktree is not staged and renamed
+    // into place, so such a refusal leaves the partial worktree, retained
+    // for explicit recovery.
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }

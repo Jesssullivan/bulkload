@@ -1,18 +1,22 @@
 //! #216 (OI-1003-Q129, OI-1003-Q135): a standalone restore carries a
 //! non-HTTPS origin as preserved-only configuration instead of refusing, and
-//! every configuration or authority refusal comes before the destination
-//! exists.
+//! every refusal comes before the destination exists.
 //!
 //! Each origin shape restores a complete standalone checkout. Only a plain
 //! HTTPS origin activates; any other leaves the restored repository with no
-//! `origin` remote, and the activation receipt names `remote.origin.url` (and
-//! the origin's fetch refspec) as preserved-only. A refused mapping leaves no
-//! destination and no stage, so the corrected rerun restores.
+//! `origin` remote and no branch naming one, and the activation receipt
+//! names `remote.origin.url`, the origin's fetch refspec and
+//! `branch.*.remote` as preserved-only. A refused mapping or a refusal while
+//! the checkout is materialized leaves no destination and no stage, so the
+//! corrected rerun restores.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{export_repository, git, output, restore_bundle, restore_bundle_configured, text};
+use super::{
+    attach_standalone_payload, export_repository, git, linked_destination, metadata, output,
+    restore_bundle, restore_bundle_configured, text,
+};
 use crate::BulkloadRefusal;
 
 // (activated keys, preserved-only keys, mapping): the receipt's codec.
@@ -35,6 +39,13 @@ fn fresh(name: &str) -> PathBuf {
 // `remote.origin.url` values (none for an empty slice). Returns the source,
 // its branch's full ref, and its capture bundle.
 fn captured(root: &Path, origins: &[&str]) -> (PathBuf, String, PathBuf) {
+    let (source, symbolic) = dirty_source(root, origins);
+    let bundle = export_repository(&source, &root.join("capture")).unwrap();
+    (source, symbolic, bundle)
+}
+
+// The source `captured` exports, not yet captured.
+fn dirty_source(root: &Path, origins: &[&str]) -> (PathBuf, String) {
     let source = root.join("source");
     fs::create_dir(&source).unwrap();
     output(git(&source).args(["init", "--template="])).unwrap();
@@ -65,8 +76,7 @@ fn captured(root: &Path, origins: &[&str]) -> (PathBuf, String, PathBuf) {
     output(git(&source).args(["add", "."])).unwrap();
     fs::write(source.join("tracked"), b"dirty").unwrap();
     fs::write(source.join("untracked"), b"kept").unwrap();
-    let bundle = export_repository(&source, &root.join("capture")).unwrap();
-    (source, symbolic, bundle)
+    (source, symbolic)
 }
 
 fn activation(destination: &Path) -> Activation {
@@ -113,8 +123,9 @@ fn assert_complete(source: &Path, destination: &Path) {
 }
 
 // A non-HTTPS origin restores with no `origin` remote: no URL, no fetch
-// refspec, `git remote` empty. The branch keeps `remote = origin`, naming a
-// remote that is absent until the operator adds one.
+// refspec, `git remote` empty. The branch's `remote = origin` is
+// preserved-only too, so nothing names `origin`, which Git would otherwise
+// read as a path; `merge` stays, naming no remote by itself.
 fn assert_inert(origins: &[&str], name: &str) {
     let root = fresh(name);
     let (source, symbolic, bundle) = captured(&root, origins);
@@ -125,9 +136,10 @@ fn assert_inert(origins: &[&str], name: &str) {
     assert!(text(git(&destination).args(["config", "remote.origin.url"])).is_err());
     assert!(text(git(&destination).args(["config", "remote.origin.fetch"])).is_err());
     assert_eq!(text(git(&destination).args(["remote"])).unwrap(), "");
+    assert!(text(git(&destination).args(["config", &format!("branch.{branch}.remote")])).is_err());
     assert_eq!(
-        text(git(&destination).args(["config", &format!("branch.{branch}.remote")])).unwrap(),
-        "origin"
+        text(git(&destination).args(["config", &format!("branch.{branch}.merge")])).unwrap(),
+        symbolic
     );
     let (activated, preserved, mapping) = activation(&destination);
     assert!(!activated
@@ -142,7 +154,8 @@ fn assert_inert(origins: &[&str], name: &str) {
     );
     assert!(preserved.iter().any(|key| key == "remote.origin.fetch"));
     assert!(preserved.iter().any(|key| key == "credential.helper"));
-    assert!(activated.contains(&format!("branch.{branch}.remote")));
+    assert!(preserved.contains(&format!("branch.{branch}.remote")));
+    assert!(!activated.contains(&format!("branch.{branch}.remote")));
     assert_eq!(mapping, None);
     no_stage_left(&root);
     fs::remove_dir_all(root).unwrap();
@@ -200,6 +213,7 @@ fn an_https_origin_is_still_activated() {
     let (activated, preserved, _) = activation(&destination);
     assert!(activated.iter().any(|key| key == "remote.origin.url"));
     assert!(activated.iter().any(|key| key == "remote.origin.fetch"));
+    assert!(activated.contains(&format!("branch.{branch}.remote")));
     assert!(!preserved
         .iter()
         .any(|key| key.starts_with("remote.origin.")));
@@ -255,6 +269,18 @@ fn a_refused_mapping_leaves_no_destination_and_the_rerun_restores() {
         assert!(destination.symlink_metadata().is_err(), "{refusal:?}");
         no_stage_left(&root);
     }
+    // A `to` that is not a repository refuses before anything is written.
+    let not_a_repository = root.join("not-a-repository");
+    fs::create_dir(&not_a_repository).unwrap();
+    assert!(restore_bundle_configured(
+        &bundle,
+        &destination,
+        "neo",
+        Some((Path::new(from), &not_a_repository))
+    )
+    .is_err());
+    assert!(destination.symlink_metadata().is_err());
+    no_stage_left(&root);
     // A capture with no origin cannot satisfy a mapping.
     let bare_root = root.join("no-origin");
     fs::create_dir(&bare_root).unwrap();
@@ -293,6 +319,209 @@ fn a_refused_mapping_leaves_no_destination_and_the_rerun_restores() {
         restore_bundle(&bundle, &destination, "neo"),
         Err(BulkloadRefusal::GitDestinationOccupied)
     );
+    no_stage_left(&root);
+    fs::remove_dir_all(root).unwrap();
+}
+
+// The carried worktree can hold an `origin` entry: here a bare repository
+// the source keeps untracked. With the origin inert, nothing names
+// `origin`, so Git never reads it as a path: push has no destination, pull
+// no tracking information, and the carried repository is never written.
+#[test]
+fn an_inert_origin_never_resolves_to_a_carried_origin_path() {
+    let root = fresh("carried-origin");
+    let (source, symbolic) = dirty_source(&root, &["yoga:git/x"]);
+    let carried = source.join("origin");
+    output(git(&source).args(["init", "-q", "--bare", "--template=", "origin"])).unwrap();
+    output(git(&source).args(["push", "-q", "./origin", &format!("HEAD:{symbolic}")])).unwrap();
+    let base = text(git(&carried).args(["rev-parse", &symbolic])).unwrap();
+    let bundle = export_repository(&source, &root.join("capture")).unwrap();
+    let destination = root.join("restored");
+    restore_bundle(&bundle, &destination, "neo").unwrap();
+    let restored_origin = destination.join("origin");
+    assert_eq!(
+        text(git(&restored_origin).args(["rev-parse", &symbolic])).unwrap(),
+        base
+    );
+    output(git(&destination).args(["-c", "commit.gpgsign=false", "commit", "-q", "-m", "next"]))
+        .unwrap();
+    assert!(output(git(&destination).args(["push"])).is_err());
+    assert!(output(git(&destination).args(["pull", "--ff-only"])).is_err());
+    output(git(&destination).args(["fetch"])).unwrap();
+    assert_eq!(
+        text(git(&restored_origin).args(["rev-parse", &symbolic])).unwrap(),
+        base
+    );
+    assert!(text(git(&destination).args(["rev-parse", "--verify", "FETCH_HEAD"])).is_err());
+    fs::remove_dir_all(root).unwrap();
+}
+
+// A refusal while the checkout is materialized (here a filesystem row whose
+// kind disagrees with the carried worktree) leaves no destination and no
+// stage, so the rerun with a sound capture restores instead of refusing
+// GIT_DESTINATION_OCCUPIED.
+#[test]
+fn a_materialization_refusal_leaves_no_destination_and_the_rerun_restores() {
+    let root = fresh("materialize");
+    let (source, _, bundle) = captured(&root, &["yoga:git/x"]);
+    let private = root.join("capture/repository.git");
+    let mut rows: Vec<crate::RowSchema> = postcard::from_bytes(
+        &output(git(&private).args(["show", "refs/carry-export/filesystem-v1:value"])).unwrap(),
+    )
+    .unwrap();
+    let row = rows
+        .iter_mut()
+        .find(|row| row.rel_path == b"tracked")
+        .unwrap();
+    row.kind = bulkload_proto::FileKind::Symlink;
+    output(git(&private).args(["update-ref", "-d", "refs/carry-export/filesystem-v1"])).unwrap();
+    metadata(
+        &private,
+        "filesystem-v1",
+        &postcard::to_allocvec(&rows).unwrap(),
+    )
+    .unwrap();
+    let malformed = root.join("malformed.bundle");
+    output(
+        git(&private)
+            .args(["bundle", "create", "-q"])
+            .arg(&malformed)
+            .arg("--all"),
+    )
+    .unwrap();
+    let destination = root.join("restored");
+    assert_eq!(
+        restore_bundle(&malformed, &destination, "neo"),
+        Err(BulkloadRefusal::GitInventoryMalformed)
+    );
+    assert!(destination.symlink_metadata().is_err());
+    no_stage_left(&root);
+    restore_bundle(&bundle, &destination, "neo").unwrap();
+    assert_complete(&source, &destination);
+    no_stage_left(&root);
+    fs::remove_dir_all(root).unwrap();
+}
+
+// A single-component relative destination is under the current directory,
+// never a parent missing.
+#[test]
+fn a_relative_destination_has_the_current_directory_as_its_parent() {
+    assert_eq!(
+        linked_destination(Path::new("restored-relative")),
+        Ok(fs::canonicalize(".").unwrap().join("restored-relative"))
+    );
+    assert_eq!(
+        linked_destination(Path::new("./restored-relative")),
+        Ok(fs::canonicalize(".").unwrap().join("restored-relative"))
+    );
+}
+
+// Attach standalone: a mapping that is not absolute, or whose `to` is not a
+// repository, refuses before the receipt exists. A captured origin other
+// than `from` refuses after the receipt is written but leaves the payload
+// without `.git`; a rerun into that receipt is a typed collision, and one
+// into a new receipt with the corrected mapping attaches.
+#[test]
+fn an_attachment_refuses_its_mapping_before_writing_the_receipt() {
+    let root = fresh("attach");
+    let from = "/srv/fast-local/jess/git/xoruby-2026";
+    let (_, _, bundle) = captured(&root, &[from]);
+    let upstream = root.join("upstream");
+    fs::create_dir(&upstream).unwrap();
+    output(git(&upstream).args(["init", "--template="])).unwrap();
+    let payload = root.join("payload");
+    restore_bundle_configured(&bundle, &payload, "neo", Some((Path::new(from), &upstream)))
+        .unwrap();
+    fs::rename(payload.join(".git"), root.join("original-git")).unwrap();
+    let not_a_repository = root.join("not-a-repository");
+    fs::create_dir(&not_a_repository).unwrap();
+    let receipt = root.join("receipt");
+    assert_eq!(
+        attach_standalone_payload(
+            &bundle,
+            &payload,
+            "neo",
+            &receipt,
+            Path::new("relative/x"),
+            &upstream
+        ),
+        Err(BulkloadRefusal::PathNotAbsolute)
+    );
+    assert_eq!(
+        attach_standalone_payload(
+            &bundle,
+            &payload,
+            "neo",
+            &receipt,
+            Path::new(from),
+            Path::new("relative/upstream")
+        ),
+        Err(BulkloadRefusal::PathNotAbsolute)
+    );
+    assert!(attach_standalone_payload(
+        &bundle,
+        &payload,
+        "neo",
+        &receipt,
+        Path::new(from),
+        &not_a_repository
+    )
+    .is_err());
+    assert!(receipt.symlink_metadata().is_err());
+    assert!(payload.join(".git").symlink_metadata().is_err());
+    assert_eq!(
+        attach_standalone_payload(
+            &bundle,
+            &payload,
+            "neo",
+            &receipt,
+            Path::new("/srv/fast-local/jess/git/other"),
+            &upstream
+        ),
+        Err(BulkloadRefusal::GitAuthorityChanged)
+    );
+    assert!(payload.join(".git").symlink_metadata().is_err());
+    assert!(receipt.is_dir());
+    assert_eq!(
+        attach_standalone_payload(
+            &bundle,
+            &payload,
+            "neo",
+            &receipt,
+            Path::new(from),
+            &upstream
+        ),
+        Err(BulkloadRefusal::GitDestinationOccupied)
+    );
+    assert!(payload.join(".git").symlink_metadata().is_err());
+    attach_standalone_payload(
+        &bundle,
+        &payload,
+        "neo",
+        &root.join("receipt-2"),
+        Path::new(from),
+        &upstream,
+    )
+    .unwrap();
+    assert_eq!(
+        text(git(&payload).args(["config", "remote.origin.url"])).unwrap(),
+        upstream.to_str().unwrap()
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+// R-N119: on a file system without an exclusive rename, the checkout is
+// published into a fresh directory entry by entry, and is just as complete.
+#[test]
+fn a_restore_publishes_without_an_exclusive_rename() {
+    let root = fresh("no-exclusive-rename");
+    let (source, _, bundle) = captured(&root, &["yoga:git/x"]);
+    let destination = root.join("restored");
+    crate::io::force_rename_unsupported(true);
+    let restored = restore_bundle(&bundle, &destination, "neo");
+    crate::io::force_rename_unsupported(false);
+    restored.unwrap();
+    assert_complete(&source, &destination);
     no_stage_left(&root);
     fs::remove_dir_all(root).unwrap();
 }
