@@ -1952,6 +1952,39 @@ fn walk_ahead_wait_is_accounted_apart_from_walk_work() {
     assert!(after.render().contains("walk_wait_ns="));
 }
 
+/// S1 hand-offs (OI-1003-Q115): a copy that sends data moves the sending
+/// thread's handling timer and the receiving thread's read and verify
+/// timers, and the rendering names every hand-off timer. The counters are
+/// process-wide and only grow, so other tests running at once cannot hide a
+/// timer this copy did not move.
+#[test]
+fn a_copy_moves_the_hand_off_timers() {
+    let corpus = Corpus::new();
+    std::fs::write(corpus.base.join("source/f"), noise(7, 3 << 20)).unwrap();
+    let before = TransferTiming::snapshot();
+    let stats = corpus.run().unwrap();
+    assert!(stats.bytes_received > 0);
+    let moved = TransferTiming::snapshot().since(before);
+    assert!(moved.send_handle_ns > 0, "{}", moved.render());
+    assert!(moved.recv_read_ns > 0, "{}", moved.render());
+    assert!(moved.recv_verify_ns > 0, "{}", moved.render());
+    assert!(
+        moved.recv_verify_ns <= moved.transfer_ns,
+        "{}",
+        moved.render()
+    );
+    let rendered = moved.render();
+    for key in [
+        "send_wait_ns=",
+        "send_handle_ns=",
+        "recv_read_ns=",
+        "recv_settle_ns=",
+        "recv_verify_ns=",
+    ] {
+        assert!(rendered.contains(key), "{rendered}");
+    }
+}
+
 /// Pins the capture clock for one source root while it lives.
 struct PinnedClock(PathBuf);
 impl PinnedClock {

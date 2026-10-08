@@ -119,6 +119,12 @@ static CDC_HASH_NS: AtomicU64 = AtomicU64::new(0);
 static QUEUE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static TRANSFER_NS: AtomicU64 = AtomicU64::new(0);
 static MATERIALIZE_NS: AtomicU64 = AtomicU64::new(0);
+// Hand-off timers (S1, OI-1003-Q115): where each side of the wire blocks.
+static SEND_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static SEND_HANDLE_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_READ_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_SETTLE_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_VERIFY_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Receiver accounting; any refusal means the requested carry is incomplete.
 #[derive(Debug, Default)]
@@ -179,10 +185,27 @@ pub struct TransferTiming {
     /// (back-pressure, #112).
     pub walk_wait_ns: u64,
     pub reuse_census_ns: u64,
+    /// Capture workers' chunking and hashing, including the credit wait
+    /// they take inside it ([`Self::queue_wait_ns`]).
     pub cdc_hash_ns: u64,
+    /// Capture workers blocked on credit: the destination has not yet
+    /// returned the window's bytes.
     pub queue_wait_ns: u64,
+    /// The destination's data frames: wire verify and placement.
     pub transfer_ns: u64,
     pub materialize_ns: u64,
+    /// The source's sending thread blocked on its event queue, with nothing
+    /// to send (S1 hand-offs, OI-1003-Q115).
+    pub send_wait_ns: u64,
+    /// The sending thread handling an event, mostly writing frames to the
+    /// wire (blocked there when the wire is full).
+    pub send_handle_ns: u64,
+    /// The receiving thread in `read_frame`: blocked on the wire, or parsing.
+    pub recv_read_ns: u64,
+    /// The receiving thread answering committed outputs (`settle_held`).
+    pub recv_settle_ns: u64,
+    /// The receiving thread's wire verify, part of [`Self::transfer_ns`].
+    pub recv_verify_ns: u64,
 }
 
 impl TransferTiming {
@@ -196,6 +219,11 @@ impl TransferTiming {
             queue_wait_ns: QUEUE_WAIT_NS.load(Ordering::Relaxed),
             transfer_ns: TRANSFER_NS.load(Ordering::Relaxed),
             materialize_ns: MATERIALIZE_NS.load(Ordering::Relaxed),
+            send_wait_ns: SEND_WAIT_NS.load(Ordering::Relaxed),
+            send_handle_ns: SEND_HANDLE_NS.load(Ordering::Relaxed),
+            recv_read_ns: RECV_READ_NS.load(Ordering::Relaxed),
+            recv_settle_ns: RECV_SETTLE_NS.load(Ordering::Relaxed),
+            recv_verify_ns: RECV_VERIFY_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -203,7 +231,7 @@ impl TransferTiming {
     #[must_use]
     pub fn render(&self) -> String {
         format!(
-            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={}",
+            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={}",
             self.walk_ns,
             self.walk_wait_ns,
             self.reuse_census_ns,
@@ -211,6 +239,11 @@ impl TransferTiming {
             self.queue_wait_ns,
             self.transfer_ns,
             self.materialize_ns,
+            self.send_wait_ns,
+            self.send_handle_ns,
+            self.recv_read_ns,
+            self.recv_settle_ns,
+            self.recv_verify_ns,
         )
     }
 
@@ -224,6 +257,11 @@ impl TransferTiming {
             queue_wait_ns: self.queue_wait_ns.saturating_sub(before.queue_wait_ns),
             transfer_ns: self.transfer_ns.saturating_sub(before.transfer_ns),
             materialize_ns: self.materialize_ns.saturating_sub(before.materialize_ns),
+            send_wait_ns: self.send_wait_ns.saturating_sub(before.send_wait_ns),
+            send_handle_ns: self.send_handle_ns.saturating_sub(before.send_handle_ns),
+            recv_read_ns: self.recv_read_ns.saturating_sub(before.recv_read_ns),
+            recv_settle_ns: self.recv_settle_ns.saturating_sub(before.recv_settle_ns),
+            recv_verify_ns: self.recv_verify_ns.saturating_sub(before.recv_verify_ns),
         }
     }
 }
@@ -1032,7 +1070,10 @@ fn send_entries<W: Write>(
         if outbound.finished() {
             return Ok((outbound.bytes_read, outbound.entries.len() as u64));
         }
+        let waited = Instant::now();
         let event = events.recv().map_err(|_| BulkloadRefusal::WorkerLost)?;
+        SEND_WAIT_NS.fetch_add(elapsed_ns(waited), Ordering::Relaxed);
+        let _handle_timer = PhaseTimer(&SEND_HANDLE_NS, Instant::now());
         outbound.handle(event)?;
     }
 }
@@ -2274,8 +2315,15 @@ impl<W: Write> Inbound<'_, W> {
             // Before blocking on the next frame: answer what has committed,
             // and once the stream is drained, commit and answer the rest
             // (the source waits for every `Held` before it finishes).
-            self.settle_held()?;
-            match read_frame(input)? {
+            {
+                let _settle_timer = PhaseTimer(&RECV_SETTLE_NS, Instant::now());
+                self.settle_held()?;
+            }
+            let frame = {
+                let _read_timer = PhaseTimer(&RECV_READ_NS, Instant::now());
+                read_frame(input)?
+            };
+            match frame {
                 Frame::Control(Control::Entry { entry, row }) => {
                     if entry != offered || walk_done.is_some() {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
@@ -2641,8 +2689,11 @@ impl<W: Write> Inbound<'_, W> {
             .checked_sub(size)
             .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         self.stats.bytes_received = self.stats.bytes_received.saturating_add(size);
-        let verified = payload.len() <= crate::hash::CDC_MAX_BYTES as usize
-            && counters::hash(Counter::HashWireVerify, payload) == header.digest;
+        let verified = {
+            let _verify_timer = PhaseTimer(&RECV_VERIFY_NS, Instant::now());
+            payload.len() <= crate::hash::CDC_MAX_BYTES as usize
+                && counters::hash(Counter::HashWireVerify, payload) == header.digest
+        };
         // A source that could not keep a manifest's chunks streams the entry
         // in place of the manifest (#77 review F1).
         if let Some(Incoming::AwaitManifest { .. }) = self.incoming.get(&header.entry) {

@@ -265,6 +265,12 @@ KNOWN_TIMING = {
     "queue_wait_ns",
     "transfer_ns",
     "materialize_ns",
+    # S1 hand-off timers (OI-1003-Q115).
+    "send_wait_ns",
+    "send_handle_ns",
+    "recv_read_ns",
+    "recv_settle_ns",
+    "recv_verify_ns",
     "publish_groups",
     "sqlite_commits",
     "sqlite_commit_ns",
