@@ -271,6 +271,10 @@ KNOWN_TIMING = {
     "recv_read_ns",
     "recv_settle_ns",
     "recv_verify_ns",
+    # S1 receiving-side timeline (OI-1003-Q119).
+    "recv_setup_ns",
+    "recv_stream_ns",
+    "recv_tail_ns",
     "publish_groups",
     "sqlite_commits",
     "sqlite_commit_ns",
