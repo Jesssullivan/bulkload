@@ -4514,6 +4514,85 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // #216 (OI-1003-Q129, OI-1003-Q135): a standalone item cloned from a
+    // local path (origin `/abs/path`, the xoruby estate's ~200 clones)
+    // restores complete instead of refusing GIT_AUTHORITY_CHANGED after its
+    // working tree was written. The origin is preserved inert, named in the
+    // activation receipt, and the destination has no `origin` remote; the
+    // journal is written, so a rerun replays rather than refusing
+    // GIT_DESTINATION_OCCUPIED.
+    #[test]
+    fn a_standalone_item_with_a_local_path_origin_restores_with_the_origin_inert() {
+        let root =
+            std::env::temp_dir().join(format!("tcfs-estate-inert-origin-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let upstream = root.join("upstream");
+        fs::create_dir(&upstream).unwrap();
+        git(&upstream, &["init", "--template="]);
+        fs::write(upstream.join("tracked"), b"base").unwrap();
+        git(&upstream, &["add", "tracked"]);
+        git(&upstream, &["commit", "-m", "base"]);
+        let source = root.join("source");
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--template=",
+                upstream.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ],
+        );
+        fs::write(source.join("tracked"), b"dirty").unwrap();
+        fs::write(source.join("untracked"), b"kept").unwrap();
+        let target = root.join("destination");
+        let plan = root.join("plan");
+        add(&plan, &source, &target, Some(&target)).unwrap();
+        let (state, corpus) = (root.join("state"), root.join("corpus"));
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let applied = root.join("applied");
+        let outcomes = Mutex::new(Vec::new());
+        let record = |row: &Receipt| {
+            outcomes
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.refusal.clone()));
+            Ok(())
+        };
+        apply(&plan, &corpus, &applied, "neo", 1, &record).unwrap();
+        apply(&plan, &corpus, &applied, "neo", 1, &record).unwrap();
+        assert_eq!(
+            outcomes.into_inner().unwrap(),
+            vec![
+                ("workspace-restored", None),
+                ("previous-workspace-restoration-not-revalidated", None)
+            ]
+        );
+        assert_eq!(fs::read(target.join("tracked")).unwrap(), b"dirty");
+        assert_eq!(fs::read(target.join("untracked")).unwrap(), b"kept");
+        let config = |key: &str| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&target)
+                .args(["config", "--local", key])
+                .output()
+                .unwrap()
+        };
+        assert!(!config("remote.origin.url").status.success());
+        assert!(!config("remote.origin.fetch").status.success());
+        let (activated, preserved, _): (Vec<String>, Vec<String>, Option<(String, String)>) =
+            postcard::from_bytes(
+                &fs::read(target.join(".git/carry-config/configuration-activation.postcard"))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(preserved.iter().any(|key| key == "remote.origin.url"));
+        assert!(!activated
+            .iter()
+            .any(|key| key.starts_with("remote.origin.")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     // A clean pass can reproduce a drifted pass's bundle byte for byte when the
     // drift lay only before the export's snapshot. The stale drift record must
     // not outlive it, or the capture could never be reused or applied again.
