@@ -256,6 +256,66 @@ neither an index nor a worktree (S4, #162).
   it, so no capture is recorded that a later reader refuses for size. A
   thin bundle (a chained link or a plan base's item) whose header would be
   over the cap is written self-contained instead of refused.
+- Standalone restore configuration (#216, OI-1003-Q129, OI-1003-Q135).
+  `git-restore` and estate-apply's standalone item (workspace equal to
+  repository) keep the source's local `config` and `config.worktree`
+  verbatim in `.git/carry-config/source-*`. They activate only safe
+  declarative keys: identity, core booleans, pull and push modes, branch
+  tracking, and the origin's default fetch refspec. Every other key is
+  preserved-only. `configuration-activation.postcard` lists the activated
+  and the preserved-only keys, never values.
+  - The origin activates only when every `remote.origin.url` value is a
+    plain `https://host/path` URL.
+  - Any other origin is preserved-only, never refused: scp-style
+    (`host:path`, `git@host:o/r`), `ssh://`, or a local path, absolute or
+    relative (a clone of a local repository). Its URL and every other
+    `remote.origin.*` key stay in the receipt.
+  - The restored repository then has no `origin` remote: no URL and no
+    fetch refspec, so `git remote` lists nothing. A fetch refspec alone
+    would list a half-configured `origin`.
+  - `branch.*.remote = origin` and `branch.*.pushremote = origin` are
+    then preserved-only too. Git reads a named but unconfigured remote as
+    a path relative to the working directory, and the restored worktree
+    can carry an `origin` entry (a bare repository, a bundle) that fetch,
+    pull and push would read or write. Without them, `git fetch` is a
+    no-op, `pull` reports no tracking information and `push` no
+    configured destination. `branch.*.merge` stays active; it names no
+    remote by itself. Once an origin is added, the operator restores
+    tracking with `git branch --set-upstream-to`.
+  - So no restored repository points at a remote or local path the
+    destination host did not choose.
+  - An explicit mapping (`restore_bundle_configured`,
+    `git-attach-standalone-payload`) is unchanged. `from` must be
+    absolute; `to` must be an absolute path to an existing repository.
+    Every captured origin value must equal `from` (else
+    `GIT_AUTHORITY_CHANGED`), and a capture without an origin refuses
+    `GIT_INVENTORY_MALFORMED`.
+  - A standalone restore builds the whole checkout in a private
+    `.bulkload-restore-*` stage beside the destination: the import, every
+    configuration and authority decision, the worktree, index, captured
+    modes and the configuration apply. It then publishes the checkout
+    with one no-replace rename (`renameat2(RENAME_NOREPLACE)`,
+    `renameatx_np(RENAME_EXCL)`); a file system without one gets a fresh
+    0700 directory and a rename of each top-level entry (R-N119). Any
+    refusal, a full disk or a killed run before that leaves no
+    destination, so a rerun is not refused `GIT_DESTINATION_OCCUPIED`.
+    A refused run removes its stage (best effort: a captured read-only
+    directory can keep part of it); a killed run leaves the stage, which
+    nothing reclaims automatically.
+  - `git-restore-linked` activates no captured configuration, since a
+    linked worktree shares its common repository's. Its exclude policy and
+    intent-to-add custody refuse before `worktree add`. It is not staged,
+    so a refusal while the worktree is materialized (a path collision, a
+    malformed filesystem row, IO) or by the checks on a concurrent writer
+    moving HEAD or the common exclude leaves the partial worktree.
+  - The `git-attach-*` verbs refuse a mapping that is not absolute, or
+    whose `to` is not a repository, before the receipt is written. A
+    captured origin other than `from`, or none, is decided from the
+    imported capture, after the receipt is written but before `.git` is
+    published, leaving the payload untouched and the receipt as
+    evidence; a rerun into the same receipt refuses
+    `GIT_DESTINATION_OCCUPIED`. The one check after publication catches a
+    concurrent writer.
 
 Import preserves divergence and leaves active HEADs, indexes and
 working bytes untouched. Account credentials carry privately; platform stores
