@@ -125,6 +125,10 @@ static SEND_HANDLE_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_READ_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_SETTLE_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_VERIFY_NS: AtomicU64 = AtomicU64::new(0);
+// The receiving side's timeline (S1, OI-1003-Q119): setup, stream, tail.
+static RECV_SETUP_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_STREAM_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_TAIL_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Receiver accounting; any refusal means the requested carry is incomplete.
 #[derive(Debug, Default)]
@@ -206,6 +210,15 @@ pub struct TransferTiming {
     pub recv_settle_ns: u64,
     /// The receiving thread's wire verify, part of [`Self::transfer_ns`].
     pub recv_verify_ns: u64,
+    /// `receive` before its frame loop: both stores and the destination
+    /// opened, the committer started, the root swept, `Open` / `Start`
+    /// exchanged (so the source's store opening too) (S1 timeline).
+    pub recv_setup_ns: u64,
+    /// `receive`'s frame loop, from the first frame to `SourceDone`.
+    pub recv_stream_ns: u64,
+    /// `receive` after its frame loop: the last group commits, directory
+    /// records and the session's flushes (`finish_receive`).
+    pub recv_tail_ns: u64,
 }
 
 impl TransferTiming {
@@ -224,6 +237,9 @@ impl TransferTiming {
             recv_read_ns: RECV_READ_NS.load(Ordering::Relaxed),
             recv_settle_ns: RECV_SETTLE_NS.load(Ordering::Relaxed),
             recv_verify_ns: RECV_VERIFY_NS.load(Ordering::Relaxed),
+            recv_setup_ns: RECV_SETUP_NS.load(Ordering::Relaxed),
+            recv_stream_ns: RECV_STREAM_NS.load(Ordering::Relaxed),
+            recv_tail_ns: RECV_TAIL_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -231,7 +247,7 @@ impl TransferTiming {
     #[must_use]
     pub fn render(&self) -> String {
         format!(
-            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={}",
+            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={} recv_setup_ns={} recv_stream_ns={} recv_tail_ns={}",
             self.walk_ns,
             self.walk_wait_ns,
             self.reuse_census_ns,
@@ -244,6 +260,9 @@ impl TransferTiming {
             self.recv_read_ns,
             self.recv_settle_ns,
             self.recv_verify_ns,
+            self.recv_setup_ns,
+            self.recv_stream_ns,
+            self.recv_tail_ns,
         )
     }
 
@@ -262,6 +281,9 @@ impl TransferTiming {
             recv_read_ns: self.recv_read_ns.saturating_sub(before.recv_read_ns),
             recv_settle_ns: self.recv_settle_ns.saturating_sub(before.recv_settle_ns),
             recv_verify_ns: self.recv_verify_ns.saturating_sub(before.recv_verify_ns),
+            recv_setup_ns: self.recv_setup_ns.saturating_sub(before.recv_setup_ns),
+            recv_stream_ns: self.recv_stream_ns.saturating_sub(before.recv_stream_ns),
+            recv_tail_ns: self.recv_tail_ns.saturating_sub(before.recv_tail_ns),
         }
     }
 }
@@ -2226,6 +2248,7 @@ pub fn receive<R: Read, W: Write>(
     destination: &Path,
     destination_state: &Path,
 ) -> Result<TransferStats> {
+    let setup_timer = PhaseTimer(&RECV_SETUP_NS, Instant::now());
     let store = Store::open(destination_state)?;
     let mut target = Destination::open(destination, &store)?;
     if store.root().starts_with(target.path()) || target.path().starts_with(store.root()) {
@@ -2290,7 +2313,12 @@ pub fn receive<R: Read, W: Write>(
         space: None,
         since_probe: 0,
     };
-    let source_bytes_read = receiver.run(input)?;
+    drop(setup_timer);
+    let source_bytes_read = {
+        let _stream_timer = PhaseTimer(&RECV_STREAM_NS, Instant::now());
+        receiver.run(input)?
+    };
+    let _tail_timer = PhaseTimer(&RECV_TAIL_NS, Instant::now());
     let Inbound {
         mut stats,
         session,
