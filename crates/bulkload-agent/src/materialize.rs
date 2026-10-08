@@ -51,8 +51,10 @@
 //! a window a third party's write falls into (`MC_wp0d_check_rename`). In
 //! the group's commit ([`PublishSink`]):
 //!
-//! 1. the staged file is sealed, and the output at the leaf is opened and
-//!    must still have the owned identity;
+//! 1. the staged file is sealed (in a [`crate::io::durable::batched`]
+//!    group, by the group's device seal, before any rename or exchange),
+//!    and the output at the leaf is opened and must still have the owned
+//!    identity;
 //! 2. one store commit records the group's [`SupersedeIntent`]s and takes
 //!    the outputs' rows out of the store, so no row vouches for a path
 //!    while either file may sit at it;
@@ -62,8 +64,9 @@
 //!    this store's own output (the same inode, size and mtime as in step 1)
 //!    is removed; any other file is exchanged back, the directory sealed,
 //!    and the entry refused;
-//! 5. the group's directories are sealed and its commit writes the new
-//!    output's row and deletes the intent.
+//! 5. the group's directories are sealed (in a batched group, its touched
+//!    devices) and its commit writes the new output's row and deletes the
+//!    intent.
 //!
 //! A power loss anywhere leaves the leaf holding the whole old output or the
 //! whole new one, and no row for it that describes other bytes. The next
@@ -1660,6 +1663,39 @@ impl PublishSink {
         settled
     }
 
+    /// Whether every device a group's files and their directories live on
+    /// may be sealed device-wide
+    /// ([`crate::io::durable::syncfs_seals_handle`]). One device off the
+    /// allowlist, an xfs realtime file, or a file or directory that cannot
+    /// be read keeps the whole group on the per-file path.
+    ///
+    /// Every handle is read again for every group (`fstatfs`, and on xfs
+    /// `FS_IOC_FSGETXATTR`): nothing is cached by device number, which an
+    /// unmount can hand to another file system (#210 review).
+    /// `/proc/self/mountinfo` is read at most once per group, for the ext
+    /// magic only.
+    #[allow(
+        clippy::unused_self,
+        reason = "a sink method beside the group it decides; no state since the #210 review"
+    )]
+    fn devices_batch(&self, items: &[Publication]) -> bool {
+        let mountinfo = std::cell::OnceCell::new();
+        for item in items {
+            let handles: [&File; 2] = match item {
+                Publication::Staged { staged, .. } | Publication::Superseding { staged, .. } => {
+                    [&staged.file, &staged.parent]
+                }
+                Publication::Adopted { file, parent, .. } => [file, parent],
+            };
+            for handle in handles {
+                if !crate::io::durable::syncfs_seals_handle(handle, &mountinfo) {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Treat the store as if it lived on `device` (tests of the
     /// cross-device flush without a second volume).
     #[cfg(test)]
@@ -1675,17 +1711,32 @@ struct TouchedDevices {
     directories: Vec<Arc<File>>,
     seen: std::collections::HashSet<(u64, u64)>,
     devices: std::collections::HashMap<u64, Arc<File>>,
+    /// Directories whose `fstat` failed: no device seal covers them, so a
+    /// batched group seals each on its own.
+    unstated: Vec<Arc<File>>,
 }
 
 impl TouchedDevices {
     fn directory(&mut self, directory: Arc<File>) {
-        if let Ok(metadata) = directory.metadata() {
+        let node = directory
+            .metadata()
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        self.add(directory, node);
+    }
+
+    /// Add `directory`, whose `(device, inode)` is `node`, or `None` when
+    /// its `fstat` failed.
+    fn add(&mut self, directory: Arc<File>, node: Option<(u64, u64)>) {
+        if let Some((device, inode)) = node {
             self.devices
-                .entry(metadata.dev())
+                .entry(device)
                 .or_insert_with(|| Arc::clone(&directory));
-            if !self.seen.insert((metadata.dev(), metadata.ino())) {
+            if !self.seen.insert((device, inode)) {
                 return;
             }
+        } else {
+            self.unstated.push(Arc::clone(&directory));
         }
         self.directories.push(directory);
     }
@@ -1693,7 +1744,24 @@ impl TouchedDevices {
     /// Seal every touched directory once, then, in group mode, fully flush
     /// each touched device other than `store_device`: the store commit that
     /// follows drains only its own device. Returns the devices flushed.
-    fn seal(&self, store_device: u64) -> Result<usize> {
+    ///
+    /// A `batched` group instead seals each touched device number once
+    /// ([`crate::io::durable::seal_device`], ending with an `fsync` of one
+    /// touched directory there), which makes every entry it renamed
+    /// durable, the store's device included. A directory whose
+    /// `fstat` failed has no device entry and takes its own
+    /// [`crate::io::durable::seal_dir`] (OI-1003-Q107 review): it is never
+    /// left unsealed.
+    fn seal(&self, store_device: u64, batched: bool) -> Result<usize> {
+        if batched {
+            for directory in &self.unstated {
+                crate::io::durable::seal_dir(directory).refuse_at("materialize::seal")?;
+            }
+            for handle in self.devices.values() {
+                crate::io::durable::seal_device(handle).refuse_at("materialize::seal")?;
+            }
+            return Ok(self.devices.len());
+        }
         for directory in &self.directories {
             crate::io::durable::seal_dir(directory).refuse_at("materialize::seal")?;
         }
@@ -1725,7 +1793,7 @@ impl crate::io::durable::GroupSink for PublishSink {
         }
     }
 
-    fn commit(&mut self, items: Vec<Publication>) {
+    fn commit(&mut self, mut items: Vec<Publication>) {
         let reported = self.outcomes.len();
         #[cfg(feature = "fault-injection")]
         let _note = {
@@ -1740,6 +1808,14 @@ impl crate::io::durable::GroupSink for PublishSink {
                 .sum();
             crate::fault::note_group(&ids, chunks)
         };
+        let batched = crate::io::durable::batched(items.len()) && self.devices_batch(&items);
+        if batched {
+            if let Err(refusal) = seal_group_data(&mut items) {
+                self.refuse_unsealed(items, &space_refusal(refusal));
+                self.notify_group(reported);
+                return;
+            }
+        }
         let mut records = Vec::with_capacity(items.len());
         let mut touched = TouchedDevices::default();
         let mut superseding = Vec::new();
@@ -1782,7 +1858,11 @@ impl crate::io::durable::GroupSink for PublishSink {
                     record,
                     file,
                     parent,
-                } => match crate::io::durable::seal_file(&file) {
+                } => match if batched {
+                    Ok(())
+                } else {
+                    crate::io::durable::seal_file(&file)
+                } {
                     Ok(()) => {
                         touched.directory(parent);
                         records.push(record);
@@ -1798,7 +1878,7 @@ impl crate::io::durable::GroupSink for PublishSink {
             }
         }
         let settled = self.supersede(superseding, &mut records, &mut touched);
-        let committed = touched.seal(self.store_device).and_then(|_| {
+        let committed = touched.seal(self.store_device, batched).and_then(|_| {
             fault_point_in!(
                 PublishDestinationAfterDirSeal,
                 self.publisher.store().root()
@@ -1815,6 +1895,40 @@ impl crate::io::durable::GroupSink for PublishSink {
         for record in records {
             self.outcomes.push((record.rel_path, committed.clone()));
         }
+        self.notify_group(reported);
+    }
+
+    fn failure(&self) -> Option<BulkloadRefusal> {
+        None
+    }
+
+    fn finish(self) -> Self::Report {
+        self.outcomes
+    }
+}
+
+impl PublishSink {
+    /// A batched group whose device seal failed: nothing was renamed or
+    /// exchanged, and no intent was recorded. Each temporary, a superseding
+    /// publish's included, is removed and each output of the group carries
+    /// the seal's refusal.
+    fn refuse_unsealed(&mut self, items: Vec<Publication>, refusal: &BulkloadRefusal) {
+        for item in items {
+            let rel_path = match item {
+                Publication::Staged { staged, record }
+                | Publication::Superseding { staged, record, .. } => {
+                    let _ = staged.discard();
+                    record.rel_path
+                }
+                Publication::Adopted { record, .. } => record.rel_path,
+            };
+            self.outcomes.push((rel_path, Err(refusal.clone())));
+        }
+    }
+
+    /// Tell the receiving side the outcomes of the group whose first outcome
+    /// is at `reported`.
+    fn notify_group(&self, reported: usize) {
         if let Some(notify) = &self.notify {
             let group = self
                 .outcomes
@@ -1828,14 +1942,61 @@ impl crate::io::durable::GroupSink for PublishSink {
             let _ = notify.send(group);
         }
     }
+}
 
-    fn failure(&self) -> Option<BulkloadRefusal> {
-        None
+/// The first step of a [`crate::io::durable::batched`] group: one
+/// [`crate::io::durable::seal_device`] per device number the group's files
+/// live on (`syncfs`, then `fsync` of one member file there), which makes
+/// every temporary's data durable under its temporary name (and every
+/// adopted output's), before any rename or exchange. The `fsync` matters
+/// most for a group of adopted outputs only on xfs: nothing is renamed, and
+/// an idle log's force sends no device-cache flush (#210 review).
+///
+/// `syncfs` reports a write-back error only against the cursor of the
+/// descriptor it is called on, so an error an earlier `syncfs` (another
+/// group's, or another process's) already consumed is not reported here.
+/// Each file's own write-back error is therefore checked next
+/// ([`crate::io::durable::check_writeback`]; no extra cache flush), as its
+/// per-file `fsync` would have: one failure refuses the whole group, before
+/// any rename (OI-1003-Q107 review).
+///
+/// Each temporary, a superseding publish's included, is then marked sealed,
+/// so publication renames it, or `prepare_supersede` records and exchanges
+/// it, without a flush of its own.
+fn seal_group_data(items: &mut [Publication]) -> Result<()> {
+    let mut devices: std::collections::HashMap<u64, &File> = std::collections::HashMap::new();
+    for item in items.iter() {
+        let file: &File = match item {
+            Publication::Staged { staged, .. } | Publication::Superseding { staged, .. } => {
+                &staged.file
+            }
+            Publication::Adopted { file, .. } => file,
+        };
+        let device = file.metadata().refuse_at("materialize::seal")?.dev();
+        devices.entry(device).or_insert(file);
     }
-
-    fn finish(self) -> Self::Report {
-        self.outcomes
+    for handle in devices.values() {
+        crate::io::durable::seal_device(handle).refuse_at("materialize::seal")?;
     }
+    for item in items.iter() {
+        let file: &File = match item {
+            Publication::Staged { staged, .. } | Publication::Superseding { staged, .. } => {
+                &staged.file
+            }
+            Publication::Adopted { file, .. } => file,
+        };
+        crate::io::durable::check_writeback(file).refuse_at("materialize::seal")?;
+    }
+    for item in items.iter_mut() {
+        match item {
+            Publication::Staged { staged, .. } | Publication::Superseding { staged, .. } => {
+                staged.sealed = true;
+                fault_point!(MaterializeAfterTempSeal);
+            }
+            Publication::Adopted { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 /// `ENOSPC` (or `SQLite`'s full-disk code, which the store reports as it)
@@ -2165,9 +2326,13 @@ mod tests {
         touched.directory(directory);
         assert_eq!(touched.directories.len(), 1, "one seal per directory");
         // Same device as the store: its commit drains the device.
-        assert_eq!(touched.seal(device)?, 0);
+        assert_eq!(touched.seal(device, false)?, 0);
         // Store elsewhere (PR #59 review): one full flush on this device.
-        assert_eq!(touched.seal(device.wrapping_add(1))?, 1);
+        assert_eq!(touched.seal(device.wrapping_add(1), false)?, 1);
+        // A batched group seals every touched device, the store's included.
+        if cfg!(target_os = "linux") {
+            assert_eq!(touched.seal(device, true)?, 1);
+        }
         Ok(())
     }
 
@@ -2247,6 +2412,437 @@ mod tests {
         assert_eq!(free, b"ours");
         assert_eq!(taken, b"theirs", "the fallback never replaces");
         assert_eq!(listed, 2, "no temporary is left behind");
+        Ok(())
+    }
+
+    /// A destination with one staged, fully written output per name, for
+    /// the batched-group tests. Returns the scratch base (its `destination`
+    /// and `state`) and the group's publications, in name order.
+    #[cfg(target_os = "linux")]
+    fn staged_group(tag: &str, names: &[&str]) -> Result<(PathBuf, Vec<Publication>)> {
+        let at = "materialize::tests::staged_group";
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        std::fs::create_dir_all(&source).refuse_at(at)?;
+        std::fs::create_dir_all(base.join("destination")).refuse_at(at)?;
+        for name in names {
+            std::fs::write(source.join(name), name.as_bytes()).refuse_at(at)?;
+        }
+        let mut rows = crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )?
+        .rows;
+        rows.retain(|row| row.size > 0);
+        rows.sort_by(|left, right| left.rel_path.cmp(&right.rel_path));
+        let target = Destination::open(
+            &base.join("destination"),
+            &Store::open(&base.join("state"))?,
+        )?;
+        let mut publications = Vec::new();
+        for row in &rows {
+            let staged = target.stage(row)?;
+            (&**staged.file()).write_all(&row.rel_path).refuse_at(at)?;
+            publications.push(Publication::Staged {
+                staged,
+                record: PendingOutput {
+                    key: row.rel_path.clone(),
+                    rel_path: row.rel_path.clone(),
+                    size: row.size,
+                    racy: false,
+                    hints: Vec::new(),
+                },
+            });
+        }
+        assert_eq!(publications.len(), names.len());
+        Ok((base, publications))
+    }
+
+    /// OI-1003-Q107 review, finding 1: `syncfs` checks write-back errors
+    /// against one descriptor's cursor only, so an error an earlier `syncfs`
+    /// consumed is not reported by the group's. Each member's own write-back
+    /// error is checked after the device seal: one on any member, not only
+    /// the first, refuses the whole group before any rename, and no record
+    /// commits.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_back_error_of_a_later_member_refuses_the_batched_group() -> Result<()> {
+        let at =
+            "materialize::tests::a_write_back_error_of_a_later_member_refuses_the_batched_group";
+        assert!(
+            crate::io::durable::batched(3),
+            "this kernel is below the syncfs floor: the batched path cannot be tested here"
+        );
+        let (base, publications) = staged_group("writeback-error", &["a", "b", "c"])?;
+        let Some(Publication::Staged { staged, .. }) = publications.get(1) else {
+            return Err(BulkloadRefusal::RequiredFieldMissing);
+        };
+        let metadata = staged.file().metadata().refuse_at(at)?;
+        let second = (metadata.dev(), metadata.ino());
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?;
+        let before = crate::io::durable::device_seals();
+        crate::io::durable::force_fs_magic(Some(crate::io::durable::TMPFS_MAGIC));
+        crate::io::durable::fail_writeback_of(Some(second));
+        sink.commit(publications);
+        crate::io::durable::fail_writeback_of(None);
+        crate::io::durable::force_fs_magic(None);
+        let seals = crate::io::durable::device_seals() - before;
+        let report = sink.finish();
+        let listed = std::fs::read_dir(base.join("destination"))
+            .refuse_at(at)?
+            .count();
+        let recorded = Store::open(&base.join("state"))?.conn_count("outputs")?;
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            seals, 1,
+            "the group was batched and stopped after its first seal"
+        );
+        assert_eq!(
+            report,
+            [
+                (b"a".to_vec(), Err(BulkloadRefusal::Io(Some(libc::EIO)))),
+                (b"b".to_vec(), Err(BulkloadRefusal::Io(Some(libc::EIO)))),
+                (b"c".to_vec(), Err(BulkloadRefusal::Io(Some(libc::EIO)))),
+            ]
+        );
+        assert_eq!(listed, 0, "nothing renamed in, every temporary removed");
+        assert_eq!(recorded, 0, "no record commits");
+        Ok(())
+    }
+
+    /// OI-1003-Q107 review, findings 2 and 5: a group on a file system whose
+    /// `syncfs` is weaker than `fsync` (FUSE here) keeps the per-file seals
+    /// and makes no device seal; the same group on an allowlisted one
+    /// (tmpfs) is sealed device-wide, twice.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_group_off_the_syncfs_allowlist_keeps_the_per_file_seals() -> Result<()> {
+        assert!(
+            crate::io::durable::batched(2),
+            "this kernel is below the syncfs floor: the batched path cannot be tested here"
+        );
+        let mut seals = Vec::new();
+        for magic in [
+            crate::io::durable::FUSE_SUPER_MAGIC,
+            crate::io::durable::TMPFS_MAGIC,
+        ] {
+            let (base, publications) = staged_group("allowlist", &["a", "b"])?;
+            let mut sink = PublishSink::new(
+                Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+            )?;
+            let before = crate::io::durable::device_seals();
+            crate::io::durable::force_fs_magic(Some(magic));
+            sink.commit(publications);
+            crate::io::durable::force_fs_magic(None);
+            seals.push(crate::io::durable::device_seals() - before);
+            let report = sink.finish();
+            let recorded = Store::open(&base.join("state"))?.conn_count("outputs")?;
+            let _ = std::fs::remove_dir_all(&base);
+            assert!(
+                report.iter().all(|(_, outcome)| outcome.is_ok()),
+                "{report:?}"
+            );
+            assert_eq!(recorded, 2);
+        }
+        assert_eq!(
+            seals,
+            [0, 2],
+            "FUSE: per-file seals; tmpfs: two device seals"
+        );
+        Ok(())
+    }
+
+    /// The allowlist itself: ext4 only under an ext4 or ext3 mount (the
+    /// ext2 driver shares the magic), and never FUSE, CIFS, SMB2, NFS, 9p,
+    /// vfat, exFAT, overlayfs or f2fs.
+    #[test]
+    fn the_syncfs_allowlist_names_ext4_xfs_btrfs_and_tmpfs_only() {
+        use crate::io::durable::{mount_fstype, syncfs_seals};
+        assert!(syncfs_seals(crate::io::durable::XFS_SUPER_MAGIC, None));
+        assert!(syncfs_seals(crate::io::durable::BTRFS_SUPER_MAGIC, None));
+        assert!(syncfs_seals(crate::io::durable::TMPFS_MAGIC, None));
+        assert!(syncfs_seals(0xEF53, Some("ext4")));
+        assert!(syncfs_seals(0xEF53, Some("ext3")));
+        assert!(!syncfs_seals(0xEF53, Some("ext2")));
+        assert!(!syncfs_seals(0xEF53, None));
+        for magic in [
+            0x6573_5546_u32, // FUSE
+            0xFF53_4D42,     // CIFS
+            0xFE53_4D42,     // SMB2
+            0x6969,          // NFS
+            0x0102_1997,     // 9p
+            0x4d44,          // vfat
+            0x2011_BAB0,     // exFAT
+            0x794C_7630,     // overlayfs
+            0xF2F5_2010,     // f2fs
+        ] {
+            assert!(!syncfs_seals(magic, Some("ext4")), "{magic:#x}");
+        }
+        let mountinfo = "22 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/root rw\n\
+                         41 22 8:17 / /mnt/usb rw,relatime shared:9 - ext2 /dev/sdb1 rw\n\
+                         42 22 8:18 / /mnt/data rw - ext4 /dev/sdb2 rw,errors=remount-ro\n";
+        assert_eq!(mount_fstype(mountinfo, (8, 17)), Some("ext2"));
+        assert_eq!(mount_fstype(mountinfo, (8, 18)), Some("ext4"));
+        assert_eq!(mount_fstype(mountinfo, (8, 19)), None);
+    }
+
+    /// #210 review (bare `st_dev` cache): a device number is read again for
+    /// every group. A tmpfs or btrfs subvolume's anonymous device number can
+    /// be handed to a FUSE or overlay mount after an unmount, so an answer
+    /// cached for the number would batch the new file system unchecked.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_device_number_reused_by_another_file_system_is_read_again() -> Result<()> {
+        let (base, publications) = staged_group("reused-device", &["a", "b"])?;
+        let sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?;
+        crate::io::durable::force_fs_magic(Some(crate::io::durable::TMPFS_MAGIC));
+        let first = sink.devices_batch(&publications);
+        crate::io::durable::force_fs_magic(Some(crate::io::durable::FUSE_SUPER_MAGIC));
+        let second = sink.devices_batch(&publications);
+        crate::io::durable::force_fs_magic(None);
+        drop(publications);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(first, "tmpfs is on the allowlist");
+        assert!(!second, "the same device number, now FUSE, is not");
+        Ok(())
+    }
+
+    /// #210 review (ext2 exclusion): the ext magic under a mount whose type
+    /// is not `ext4` or `ext3` keeps the per-file seals. The scratch
+    /// directory is not on an ext mount, so its real mountinfo line names
+    /// another type and no device seal is made.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_ext_magic_off_an_ext4_mount_keeps_the_per_file_seals() -> Result<()> {
+        assert!(
+            crate::io::durable::batched(2),
+            "this kernel is below the syncfs floor: the batched path cannot be tested here"
+        );
+        let (base, publications) = staged_group("ext-magic", &["a", "b"])?;
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?;
+        let before = crate::io::durable::device_seals();
+        crate::io::durable::force_fs_magic(Some(crate::io::durable::EXT4_SUPER_MAGIC));
+        sink.commit(publications);
+        crate::io::durable::force_fs_magic(None);
+        let seals = crate::io::durable::device_seals() - before;
+        let report = sink.finish();
+        let recorded = Store::open(&base.join("state"))?.conn_count("outputs")?;
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            report.iter().all(|(_, outcome)| outcome.is_ok()),
+            "{report:?}"
+        );
+        assert_eq!(recorded, 2);
+        assert_eq!(seals, 0, "the ext magic off an ext4 mount is not batched");
+        Ok(())
+    }
+
+    /// #210 review (ext2 exclusion): the mountinfo lookup of the code that
+    /// runs, against synthetic lines keyed to the handle's real device. An
+    /// `ext4` or `ext3` line batches, an `ext2` line or none does not, and a
+    /// line with major and minor swapped does not match.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_ext_magic_reads_its_mount_type_by_major_and_minor() -> Result<()> {
+        let at = "materialize::tests::the_ext_magic_reads_its_mount_type_by_major_and_minor";
+        let handle = File::open(std::env::temp_dir()).refuse_at(at)?;
+        let device = handle.metadata().refuse_at(at)?.dev();
+        let (major, minor) = (libc::major(device), libc::minor(device));
+        let line = |numbers: (u32, u32), fstype: &str| {
+            format!(
+                "22 1 253:0 / / rw shared:1 - xfs /dev/mapper/root rw\n\
+                 41 22 {}:{} / /mnt rw shared:9 - {fstype} /dev/sdz1 rw\n",
+                numbers.0, numbers.1
+            )
+        };
+        let answer = |mountinfo: String| {
+            crate::io::durable::syncfs_seals_handle(
+                &handle,
+                &std::cell::OnceCell::from(Some(mountinfo)),
+            )
+        };
+        crate::io::durable::force_fs_magic(Some(crate::io::durable::EXT4_SUPER_MAGIC));
+        let ext4 = answer(line((major, minor), "ext4"));
+        let ext3 = answer(line((major, minor), "ext3"));
+        let ext2 = answer(line((major, minor), "ext2"));
+        let swapped = (major != minor).then(|| answer(line((minor, major), "ext4")));
+        let absent =
+            crate::io::durable::syncfs_seals_handle(&handle, &std::cell::OnceCell::from(None));
+        crate::io::durable::force_fs_magic(None);
+        assert!(ext4, "an ext4 mount of this device batches");
+        assert!(ext3, "an ext3 mount of this device batches");
+        assert!(!ext2, "an ext2 mount of this device does not");
+        assert_ne!(swapped, Some(true), "minor:major is another device");
+        assert!(!absent, "no mountinfo, no batch");
+        Ok(())
+    }
+
+    /// #210 review (xfs realtime): an xfs file flagged `FS_XFLAG_REALTIME`
+    /// keeps its data on the realtime device, which the log force never
+    /// flushes, so its group keeps the per-file seals; the same group of
+    /// ordinary xfs files is sealed device-wide.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_realtime_xfs_member_keeps_the_per_file_seals() -> Result<()> {
+        assert!(
+            crate::io::durable::batched(2),
+            "this kernel is below the syncfs floor: the batched path cannot be tested here"
+        );
+        let mut seals = Vec::new();
+        for flags in [crate::io::durable::FS_XFLAG_REALTIME, 0] {
+            let (base, publications) = staged_group("realtime", &["a", "b"])?;
+            let mut sink = PublishSink::new(
+                Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+            )?;
+            let before = crate::io::durable::device_seals();
+            crate::io::durable::force_fs_magic(Some(crate::io::durable::XFS_SUPER_MAGIC));
+            crate::io::durable::force_xflags(Some(flags));
+            sink.commit(publications);
+            crate::io::durable::force_xflags(None);
+            crate::io::durable::force_fs_magic(None);
+            seals.push(crate::io::durable::device_seals() - before);
+            let report = sink.finish();
+            let recorded = Store::open(&base.join("state"))?.conn_count("outputs")?;
+            let _ = std::fs::remove_dir_all(&base);
+            assert!(
+                report.iter().all(|(_, outcome)| outcome.is_ok()),
+                "{report:?}"
+            );
+            assert_eq!(recorded, 2);
+        }
+        assert_eq!(
+            seals,
+            [0, 2],
+            "realtime: per-file seals; ordinary: two device seals"
+        );
+        Ok(())
+    }
+
+    /// #210 review (xfs idle log): a batched group of adopted outputs only,
+    /// on xfs. Nothing is renamed, so no log write of the group sends a
+    /// device-cache flush, and `xfs_log_force` with an idle log sends none
+    /// either (v6.12 `xfs_log.c`); `xfs_file_fsync` does
+    /// (`blkdev_issue_flush` when its log force was a no-op). Each device
+    /// seal therefore ends with an `fsync` of the descriptor it was called
+    /// on, recorded before the records commit.
+    #[cfg(all(target_os = "linux", feature = "io-trace"))]
+    #[test]
+    fn an_adopted_only_batched_group_flushes_its_device_before_it_commits() -> Result<()> {
+        use crate::io::trace::{Event, SyncKind};
+        let at = "materialize::tests::an_adopted_only_batched_group_flushes_its_device_before_it_commits";
+        assert!(
+            crate::io::durable::batched(2),
+            "this kernel is below the syncfs floor: the batched path cannot be tested here"
+        );
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-adopted-only-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let destination = base.join("destination");
+        std::fs::create_dir_all(&destination).refuse_at(at)?;
+        let parent = Arc::new(File::open(&destination).refuse_at(at)?);
+        let mut publications = Vec::new();
+        let mut members = Vec::new();
+        for name in ["a", "b"] {
+            std::fs::write(destination.join(name), name.as_bytes()).refuse_at(at)?;
+            let file = File::open(destination.join(name)).refuse_at(at)?;
+            let metadata = file.metadata().refuse_at(at)?;
+            members.push(crate::io::NodeId {
+                dev: metadata.dev(),
+                ino: metadata.ino(),
+            });
+            publications.push(Publication::Adopted {
+                record: OutputRecord {
+                    key: name.as_bytes().to_vec(),
+                    rel_path: name.as_bytes().to_vec(),
+                    identity: crate::freshness::StatIdentity::from_metadata(&metadata),
+                    racy: false,
+                    hints: Vec::new(),
+                },
+                file,
+                parent: Arc::clone(&parent),
+            });
+        }
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?;
+        let recorder = crate::io::trace::recorder::Recorder::new();
+        {
+            let _attached = recorder.attach();
+            crate::io::durable::force_fs_magic(Some(crate::io::durable::XFS_SUPER_MAGIC));
+            crate::io::durable::force_xflags(Some(0));
+            sink.commit(publications);
+            crate::io::durable::force_xflags(None);
+            crate::io::durable::force_fs_magic(None);
+        }
+        let events = recorder.take();
+        let report = sink.finish();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(
+            report.iter().all(|(_, outcome)| outcome.is_ok()),
+            "{report:?}"
+        );
+        let position = |wanted: &dyn Fn(&Event) -> bool| events.iter().position(wanted);
+        let commit = position(&|event| matches!(event, Event::Commit { .. }))
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let first_seal = position(&|event| {
+            matches!(
+                event,
+                Event::Sync {
+                    kind: SyncKind::FsSync,
+                    ..
+                }
+            )
+        })
+        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let member_flush = position(&|event| {
+            matches!(
+                event,
+                Event::Sync { kind: SyncKind::Fsync | SyncKind::DataSync, node }
+                    if members.contains(node)
+            )
+        });
+        assert!(
+            member_flush.is_some_and(|flush| flush < commit),
+            "no flush of a member before the commit: {events:?}"
+        );
+        assert!(
+            member_flush.is_some_and(|flush| flush < first_seal),
+            "the member's flush ends the first device seal: {events:?}"
+        );
+        Ok(())
+    }
+
+    /// OI-1003-Q107 review, finding 6: in a batched group a touched
+    /// directory whose `fstat` failed has no device to seal device-wide, so
+    /// it takes its own directory seal; it is never skipped.
+    #[test]
+    fn a_touched_directory_without_a_device_is_sealed_in_a_batched_group() -> Result<()> {
+        let directory = Arc::new(File::open(std::env::temp_dir()).refuse_at(
+            "materialize::tests::a_touched_directory_without_a_device_is_sealed_in_a_batched_group",
+        )?);
+        let mut touched = TouchedDevices::default();
+        touched.add(directory, None);
+        crate::io::durable::fail_dir_seals(true);
+        let sealed = touched.seal(0, true);
+        crate::io::durable::fail_dir_seals(false);
+        assert_eq!(
+            sealed,
+            Err(BulkloadRefusal::Io(Some(libc::EIO))),
+            "the directory's own seal ran (and failed here)"
+        );
+        assert_eq!(touched.seal(0, true)?, 0, "no device was sealed");
         Ok(())
     }
 }

@@ -183,10 +183,12 @@ fault-harness:
 # gate's feature-union build (OI-1003-Q81): the directory
 # resume paths (#74 review B1 and round 2 N1) and the adoption of a durable
 # unrowed output from its capture record with 0 source bytes read (#169,
-# R-N58). A name filter that matches nothing still reports `0 passed`, so this
-# recipe fails unless all three proofs ran: on a cargo failure, on anything
-# but one `3 passed; 0 failed` result, or when a proof is not among the
-# passing tests (#74 round 2 N2, R-N122).
+# R-N58), and on Linux the batched group seal (S1, OI-1003-Q107; compiled
+# for Linux only, where it fails rather than skips). A name filter that
+# matches nothing still reports `0 passed`, so this recipe fails unless every
+# proof for this platform ran: on a cargo failure, on anything but one
+# `N passed; 0 failed` result (N = 4 on Linux, 3 elsewhere), or when a proof
+# is not among the passing tests (#74 round 2 N2, R-N122).
 resume-power-loss:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -198,13 +200,17 @@ resume-power-loss:
         echo "resume-power-loss: cargo test failed with status $status" >&2
         exit "$status"
     fi
+    proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads)
+    if [[ $(uname -s) == Linux ]]; then
+        proofs+=(a_batched_group_names_no_output_before_its_data_is_durable)
+    fi
     results=$(grep -c '^test result: ' <<<"$output" || true)
-    passed=$(grep -c '^test result: ok\. 3 passed; 0 failed;' <<<"$output" || true)
+    passed=$(grep -c "^test result: ok\. ${#proofs[@]} passed; 0 failed;" <<<"$output" || true)
     if [[ $results -ne 1 || $passed -ne 1 ]]; then
-        echo "resume-power-loss: expected exactly one '3 passed; 0 failed' result" >&2
+        echo "resume-power-loss: expected exactly one '${#proofs[@]} passed; 0 failed' result" >&2
         exit 1
     fi
-    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads; do
+    for proof in "${proofs[@]}"; do
         if [[ $(grep -c "^test materialize::adoption_power_loss::$proof \.\.\. ok$" <<<"$output" || true) -ne 1 ]]; then
             echo "resume-power-loss: $proof was not among the passing tests" >&2
             exit 1

@@ -828,6 +828,86 @@ flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
 
+On Linux in group mode, a group of two or more outputs is sealed
+device-wide instead (S1, OI-1003-Q107; `io::durable::batched`). Each output
+starts write-back as it is queued (`sync_file_range(WRITE)`, not a
+durability step). The group then runs one device seal per device number its
+files live on (`syncfs`, then `fsync` of one of those files), which makes
+every temporary's data durable under its temporary name; renames each into
+place; runs one device seal per touched device number again (`syncfs`, then
+`fsync` of one touched directory), which makes the new entries durable; and
+only then commits its records. No rename precedes the first seal, so no
+power loss can keep a name whose data it lost. `syncfs` also flushes
+whatever else is dirty on that file system, which is why a single-file group
+keeps the per-file path.
+
+Device numbers are `st_dev`, and each btrfs subvolume has its own, though
+one `syncfs` commits the transaction of the whole file system. A group
+spread over N subvolumes of one btrfs therefore runs N seals per step, each
+a full transaction commit. Durability is unaffected, but the S1 gain is
+unmeasured there and may be lost or reversed; no gain is claimed for a
+multi-subvolume btrfs destination (#210 review; deduplication by the
+file system's UUID is a follow-up).
+
+`syncfs` is not in general as strong as the flushes it replaces, so four
+conditions bound the batched path (OI-1003-Q107 review, 2026-10-08):
+
+- **File system allowlist** (`io::durable::syncfs_seals`). A group is batched
+  only when every device its files and their directories live on is ext4
+  (or ext3, which the ext4 driver serves), xfs, btrfs or tmpfs, read with
+  `fstatfs` on every file and directory for every group (nothing is cached
+  by device number, which an unmount can hand to another file system); the
+  ext magic also needs the mount's type in `/proc/self/mountinfo` to be
+  `ext4` or `ext3`, because the ext2 driver shares it and its `syncfs` sends
+  no device-cache flush. An xfs file flagged `FS_XFLAG_REALTIME` keeps its
+  group on the per-file path: its data is on the realtime device, which the
+  log force never flushes.
+  Any other file system keeps the per-file path: on FUSE other than
+  virtiofs `syncfs` never reaches the daemon, CIFS/SMB and NFS do not flush
+  at the server, vfat and exFAT send no device-cache flush, overlayfs does
+  not report the upper layer's write-back errors, and f2fs's `syncfs` returns
+  0 without a checkpoint when checkpointing is disabled. On the allowlisted
+  file systems `syncfs` writes every file's data and entries (tmpfs has
+  nothing to make durable; its `fsync` is a no-op too), but even there it
+  is not as strong as `fsync` on its own: see the next condition.
+- **The seal's own `fsync`.** On xfs, `xfs_fs_sync_fs` only forces the log,
+  and with an idle log that force returns 0 without any I/O
+  (`xfs_log_force`, v6.12), so data written back in place with no log
+  write after it, typical of a group of adopted outputs only, can stay in
+  the drive's volatile cache; `xfs_file_fsync` sends the flush itself when
+  its log force was a no-op. On ext4 after a forced shutdown, `ext4_sync_fs`
+  returns 0 (v5.17 and v6.12) where `ext4_sync_file` returns `EIO`. Each
+  device seal therefore ends with an `fsync` of the descriptor its `syncfs`
+  ran on, which covers both, at the cost of one extra (usually empty) cache
+  flush per device per step.
+- **Each file's own write-back error.** `syncfs` reports a write-back error
+  against the cursor of the one descriptor it is called on, so an error an
+  earlier `syncfs` elsewhere already consumed is not reported again. After
+  the first `syncfs`, every file of the group is checked with
+  `sync_file_range(WAIT_BEFORE | WRITE | WAIT_AFTER)`, which returns that
+  file's own write-back error against its own descriptor's cursor, as its
+  `fsync` would, and flushes no cache. One failure refuses the whole group
+  before any rename.
+- **Kernel floor: Linux 5.17-rc3** (OI-1003-Q113 set 5.8; OI-1003-Q141, ruled
+  2026-10-08, moved it to 5.17, on the two commits below). 5.8 made `syncfs` report data write-back errors, but
+  until torvalds/linux commit 5679897eb104 ("vfs: make sync_filesystem
+  return errors from ->sync_fs") `sync_filesystem` discarded the file
+  system's own `->sync_fs` failure (journal commit, cache flush), and until
+  2d86293c7075 ("xfs: return errors in xfs_fs_sync_fs") xfs ignored its own
+  log force's failure. Both are first in v5.17-rc3, neither is in rc2, and
+  both are in v5.17 (checked against the upstream tree 2026-10-08). An older
+  kernel, a 5.17 rc1 or rc2, or one whose release cannot be read, keeps the
+  per-file path; a backport in a distribution kernel below 5.17 is not
+  detected.
+
+A touched directory whose `fstat` fails has no device to seal device-wide;
+a batched group seals it with its own directory flush. Darwin is unchanged.
+A superseding
+output (WP0(d), below) joins the first `syncfs` like any staged file, so its
+data is durable before its intent is recorded and before its
+`RENAME_EXCHANGE`, and the second `syncfs` makes the exchanged entry durable
+before the commit that settles the intent.
+
 The source ledger's rows are the one exception (WP0(g): OI-1003-Q20,
 adopted with conditions by OI-1003-Q37, built 2026-10-07 on OI-1003-Q104).
 The ledger is a cache of what the source already holds: a seat's row key

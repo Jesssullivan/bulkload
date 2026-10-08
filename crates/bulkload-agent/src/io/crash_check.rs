@@ -26,6 +26,19 @@
 //!    changes, a sync on `X` issued after `m` and completed before the crash
 //!    makes it durable: `DataSync` for data and namespace classes, `Fsync` and
 //!    `FullFlush` for every class. `Kick` and `Barrier` make nothing durable.
+//!    An `FsSync` (Linux `syncfs`) on any node makes every mutation issued
+//!    before it on that node's drive durable, whatever object it changes.
+//!    The engine's `FsSync` event is its whole device seal, recorded once
+//!    both calls returned: `syncfs`, then `fsync` of the same descriptor
+//!    (traced just before it). `syncfs` alone does not earn the rule: on xfs
+//!    with an idle log it sends no device-cache flush, which the `fsync`
+//!    sends, and an xfs realtime file's data is on a device neither
+//!    flushes (never batched). The rule holds only where the engine issues
+//!    the seal: Linux 5.17-rc3 or later, on a file system
+//!    `io::durable::syncfs_seals` allows (ext4, xfs, btrfs, tmpfs), with
+//!    each file's own write-back error checked after it. On others (FUSE,
+//!    CIFS/SMB, NFS, 9p, vfat, exFAT, overlayfs, f2fs) `syncfs` can be
+//!    weaker than `fsync`, and the engine never batches there.
 //! 2. **Drain.** A completed `FullFlush` (Darwin `F_FULLFSYNC`) empties the
 //!    whole drive cache, so a mutation already *sent* to the device before it
 //!    is durable, whichever file it belongs to. Sent means every object of the
@@ -510,7 +523,7 @@ const fn durable_on_object(kind: SyncKind, class: Class) -> bool {
     match kind {
         SyncKind::Kick | SyncKind::Barrier => false,
         SyncKind::DataSync => !matches!(class, Class::Meta),
-        SyncKind::Fsync | SyncKind::FullFlush => true,
+        SyncKind::Fsync | SyncKind::FullFlush | SyncKind::FsSync => true,
     }
 }
 
@@ -995,6 +1008,19 @@ impl Plan {
         }
     }
 
+    /// The first `FsSync` after mutation `m` on the drive `dev` (rule 1).
+    fn fs_synced_at(&self, m: usize, dev: Option<u64>) -> Option<usize> {
+        let dev = dev?;
+        self.ops
+            .iter()
+            .enumerate()
+            .skip(m + 1)
+            .find(|(_, op)| {
+                matches!(op.action, Action::Sync { node, kind: SyncKind::FsSync } if node.dev == dev)
+            })
+            .map(|(index, _)| index)
+    }
+
     fn compute_persistence(&mut self) {
         for m in 0..self.ops.len() {
             let Some((_, objects)) = self.ops.get(m).and_then(Op::mutation) else {
@@ -1002,7 +1028,13 @@ impl Plan {
             };
             let dev = device(objects);
             let sent = self.covered_at(m, sends);
-            let direct = self.covered_at(m, durable_on_object);
+            let direct = match (
+                self.covered_at(m, durable_on_object),
+                self.fs_synced_at(m, dev),
+            ) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
             let drained = sent.and_then(|sent| {
                 self.ops
                     .iter()

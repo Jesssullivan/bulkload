@@ -358,6 +358,13 @@ group commit then:
    that commit's `F_FULLFSYNC` drains the store's device, so a group whose
    files share that device needs no other device-cache flush.
 
+On Linux a group of two or more outputs replaces steps 1, 3 and 4 with two
+device-wide seals (S1, OI-1003-Q107): one `syncfs` per device before any
+rename, which makes every temporary's data durable, and one per touched
+device after the renames, which makes the entries durable. The record
+commit follows both. Step 1's order is kept: no output is renamed before
+its data is durable.
+
 A group closes on a file count, a byte count or a short idle time
 (`GROUP_FILES`, `GROUP_BYTES`, `GROUP_IDLE`). A directory the engine creates
 gets a tagged temporary name, its record is bound to the new inode, and it
