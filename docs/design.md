@@ -256,6 +256,54 @@ neither an index nor a worktree (S4, #162).
   it, so no capture is recorded that a later reader refuses for size. A
   thin bundle (a chained link or a plan base's item) whose header would be
   over the cap is written self-contained instead of refused.
+- Standalone restore configuration (#216, OI-1003-Q129, OI-1003-Q135).
+  `git-restore` and estate-apply's standalone item (workspace equal to
+  repository) keep the source's local `config` and `config.worktree`
+  verbatim in `.git/carry-config/source-*`. They activate only safe
+  declarative keys: identity, core booleans, pull and push modes, branch
+  tracking, and the origin's default fetch refspec. Every other key is
+  preserved-only. `configuration-activation.postcard` lists the activated
+  and the preserved-only keys, never values.
+  - The origin activates only when every `remote.origin.url` value is a
+    plain `https://host/path` URL.
+  - Any other origin is preserved-only, never refused: scp-style
+    (`host:path`, `git@host:o/r`), `ssh://`, or a local path, absolute or
+    relative (a clone of a local repository). Its URL and every other
+    `remote.origin.*` key stay in the receipt.
+  - The restored repository then has no `origin` remote: no URL and no
+    fetch refspec, so `git remote` lists nothing. A fetch refspec alone
+    would list a half-configured `origin`.
+  - `branch.*.remote = origin` stays active and names the absent remote.
+    Git then reads `origin` as a path relative to the working directory,
+    which the restore never creates, so `git fetch`, `pull` and `push`
+    fail ("'origin' does not appear to be a git repository") without
+    reaching any host. Tracking resumes once the operator adds an origin.
+  - So no restored repository points at a remote or local path the
+    destination host did not choose.
+  - An explicit mapping (`restore_bundle_configured`,
+    `git-attach-standalone-payload`) is unchanged. `from` must be
+    absolute; `to` must be an absolute path to an existing repository.
+    Every captured origin value must equal `from` (else
+    `GIT_AUTHORITY_CHANGED`), and a capture without an origin refuses
+    `GIT_INVENTORY_MALFORMED`.
+  - Every configuration and authority refusal of a standalone restore
+    comes before its destination exists. The repository is imported and
+    its configuration planned in a private `.bulkload-restore-*` stage
+    beside the destination, on the same filesystem. The destination is
+    created only after that, and the stage's `.git` moves in by one
+    rename. A refusal there leaves no destination, so a rerun is not
+    refused `GIT_DESTINATION_OCCUPIED`.
+  - After the destination exists, a standalone restore can still refuse
+    on malformed worktree custody or IO; that partial destination is kept
+    for inspection.
+  - `git-restore-linked` activates no captured configuration, since a
+    linked worktree shares its common repository's. Its capture-decided
+    refusals come before `worktree add`; the only checks after it catch a
+    concurrent writer moving HEAD or the common exclude.
+  - The `git-attach-*` verbs refuse an invalid mapping before the receipt
+    is written. Every other configuration refusal comes before `.git` is
+    published, leaving the payload untouched. The one check after
+    publication catches a concurrent writer.
 
 Import preserves divergence and leaves active HEADs, indexes and
 working bytes untouched. Account credentials carry privately; platform stores

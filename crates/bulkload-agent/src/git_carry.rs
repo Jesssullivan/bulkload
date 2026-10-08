@@ -30,6 +30,14 @@ pub mod decide;
 )]
 mod decide_tests;
 pub mod estimate;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod inert_origin_tests;
 mod raw_tree;
 mod ref_table;
 #[cfg(test)]
@@ -1819,6 +1827,26 @@ impl PrivateDir {
             }
         }
         Err(BulkloadRefusal::Io(None))
+    }
+
+    // Only in `parent`, never TMPDIR: a stage whose contents are renamed into
+    // a sibling must share its filesystem (#216).
+    fn create_beside(parent: &Path) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let candidate = parent.join(format!(
+                ".bulkload-restore-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                Ok(()) => return Ok(Self(candidate)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(crate::refuse::io(&error, "git_carry::create_beside")),
+            }
+        }
     }
 
     fn path(&self) -> &Path {
@@ -5407,13 +5435,13 @@ fn safe_configuration_value(private: &Path, key: &str, value: &str) -> bool {
     false
 }
 
-fn activate_standalone_configuration(
-    private: &Path,
-    heads: &str,
-    receipt: &Path,
-    mapping: Option<(&Path, &Path)>,
-) -> Result<()> {
-    let mapping = mapping
+// An explicit origin mapping: an absolute local `from` the captured origin must
+// name exactly, and an absolute `to` that is an existing local repository.
+// Checked before anything is written (#216).
+fn checked_mapping<'a>(
+    mapping: Option<(&'a Path, &'a Path)>,
+) -> Result<Option<(&'a str, &'a str)>> {
+    mapping
         .map(|(from, to)| {
             if !from.is_absolute() || !to.is_absolute() {
                 return Err(BulkloadRefusal::PathNotAbsolute);
@@ -5425,21 +5453,55 @@ fn activate_standalone_configuration(
                 to.to_str().ok_or(BulkloadRefusal::GitInventoryMalformed)?,
             ))
         })
-        .transpose()?;
+        .transpose()
+}
+
+/// What a standalone restore or attachment activates from the captured local
+/// configuration, decided in full before anything is activated (#216,
+/// OI-1003-Q129, OI-1003-Q135). Every refusal of the configuration policy is
+/// raised while this is built; applying it only writes.
+#[derive(Debug)]
+struct ConfigurationPlan {
+    // `git config --local --add` key and value pairs, in source order.
+    activate: Vec<(String, String)>,
+    // Keys kept only in the receipt's verbatim `source-*` copies.
+    preserved_only: Vec<String>,
+    mapping: Option<(String, String)>,
+}
+
+// The captured origin is activated only when every `remote.origin.url` value
+// can be: with a mapping, each must name its `from` exactly (else
+// GIT_AUTHORITY_CHANGED, and no origin at all is GIT_INVENTORY_MALFORMED);
+// without one, each must be a plain HTTPS URL. Any other origin (scp-style,
+// `ssh://`, `git://`, `file://`, an absolute or relative local path) is
+// preserved inert, never refused (#216): its URL and every other
+// `remote.origin.*` key stay in the receipt only, so the restored repository
+// has no `origin` remote at all (`git remote` lists nothing), never a
+// half-configured one with a fetch refspec and no URL.
+// `branch.*.remote = origin` still activates and names the absent remote:
+// Git reads `origin` as a path relative to the working directory, which the
+// restore never creates, so fetch, pull and push fail without reaching any
+// host until the operator adds an origin.
+fn plan_standalone_configuration(
+    private: &Path,
+    heads: &str,
+    receipt: &Path,
+    mapping: Option<(&str, &str)>,
+) -> Result<ConfigurationPlan> {
+    const SITE: &str = "git_carry::plan_standalone_configuration";
     let files: Vec<(String, Vec<u8>)> = postcard::from_bytes(&output(git(private).args([
         "show",
         &format!("{}:value", capture_revision(heads, "configuration-v1")?),
     ]))?)
     .map_err(|_| BulkloadRefusal::FrameCodec)?;
-    let mut activated = Vec::new();
+    let mut entries = Vec::new();
     let mut preserved_only = Vec::new();
-    let mut origin_seen = false;
     for (name, bytes) in files {
         if !matches!(name.as_str(), "config" | "config.worktree") {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         let retained = receipt.join(format!("source-{name}"));
-        fs::write(&retained, bytes).refuse_at("git_carry::activate_standalone_configuration")?;
+        fs::write(&retained, bytes).refuse_at(SITE)?;
         // Worktree-local configuration may be dormant unless the source enables
         // its extension. Preserve it, but do not silently flatten its authority.
         if name == "config.worktree" {
@@ -5455,33 +5517,64 @@ fn activate_standalone_configuration(
             let entry =
                 std::str::from_utf8(entry).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
             let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
-            let value = if key == "remote.origin.url" {
-                origin_seen = true;
-                match mapping {
-                    Some((from, to)) if value == from => to,
-                    None if safe_https_origin(value) => value,
-                    _ => return Err(BulkloadRefusal::GitAuthorityChanged),
-                }
-            } else if safe_configuration_value(private, key, value) {
-                value
-            } else {
-                preserved_only.push(key.to_owned());
-                continue;
-            };
-            output(git(private).args(["config", "--local", "--add", key, value]))?;
-            activated.push(key.to_owned());
+            entries.push((key.to_owned(), value.to_owned()));
         }
     }
-    if mapping.is_some() && !origin_seen {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+    let mut origins = entries
+        .iter()
+        .filter(|(key, _)| key == "remote.origin.url")
+        .map(|(_, value)| value.as_str())
+        .peekable();
+    let origin_active = match mapping {
+        Some(_) if origins.peek().is_none() => return Err(BulkloadRefusal::GitInventoryMalformed),
+        Some((from, _)) if origins.any(|value| value != from) => {
+            return Err(BulkloadRefusal::GitAuthorityChanged)
+        }
+        Some(_) => true,
+        None => origins.peek().is_some() && origins.all(safe_https_origin),
+    };
+    let mut activate = Vec::new();
+    for (key, value) in entries {
+        let value = if key == "remote.origin.url" && origin_active {
+            mapping.map_or(value, |(_, to)| to.to_owned())
+        } else if key.starts_with("remote.origin.") && !origin_active {
+            preserved_only.push(key);
+            continue;
+        } else if safe_configuration_value(private, &key, &value) {
+            value
+        } else {
+            preserved_only.push(key);
+            continue;
+        };
+        activate.push((key, value));
     }
-    // Keys, not potentially sensitive values, explain the deliberate policy boundary.
+    Ok(ConfigurationPlan {
+        activate,
+        preserved_only,
+        mapping: mapping.map(|(from, to)| (from.to_owned(), to.to_owned())),
+    })
+}
+
+// Activate a plan in `private` and record it. Keys, not potentially sensitive
+// values, explain the deliberate policy boundary; the receipt's codec is the
+// one every earlier build wrote: (activated keys, preserved-only keys,
+// mapping).
+fn apply_standalone_configuration(
+    private: &Path,
+    receipt: &Path,
+    plan: &ConfigurationPlan,
+) -> Result<()> {
+    let mut activated = Vec::with_capacity(plan.activate.len());
+    for (key, value) in &plan.activate {
+        output(git(private).args(["config", "--local", "--add", key, value]))?;
+        activated.push(key.as_str());
+    }
     fs::write(
         receipt.join("configuration-activation.postcard"),
-        postcard::to_allocvec(&(activated, preserved_only, mapping))
+        postcard::to_allocvec(&(activated, &plan.preserved_only, &plan.mapping))
             .map_err(|_| BulkloadRefusal::FrameCodec)?,
     )
-    .refuse_at("git_carry::activate_standalone_configuration")?;
+    .refuse_at("git_carry::apply_standalone_configuration")?;
     Ok(())
 }
 
@@ -5655,6 +5748,11 @@ pub fn attach_matching_payload(
 ///
 /// # Errors
 /// Refuses payload divergence, occupied .git, invalid mapping or unknown origin.
+/// An invalid mapping refuses before the receipt is written; every other
+/// configuration refusal comes before `.git` is published, so the payload is
+/// left as it was (#216). The mapping path keeps its semantics: an origin
+/// other than `origin_from` refuses `GIT_AUTHORITY_CHANGED`, and a capture
+/// with no origin `GIT_INVENTORY_MALFORMED`.
 pub fn attach_standalone_payload(
     bundle: &Path,
     destination: &Path,
@@ -5693,6 +5791,8 @@ fn attach_payload(
         .transpose()
         .refuse_at(SITE)?;
     let common = repository.as_deref().map(common_repository).transpose()?;
+    // #216: an invalid mapping refuses before the receipt is written.
+    let mapping = checked_mapping(mapping)?;
     let receipt_parent =
         fs::canonicalize(receipt.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
             .refuse_at(SITE)?;
@@ -5752,8 +5852,12 @@ fn attach_payload(
     let admin = if let Some(repository) = &repository {
         prepare_linked_attachment(repository, &destination, source, &receipt, &private, &heads)?
     } else {
-        let (from, to) = mapping.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        activate_standalone_configuration(&private, &heads, &receipt, Some((from, to)))?;
+        // #216: every configuration refusal is raised by the plan, and the
+        // plan's repository is the receipt's, so a refusal here leaves the
+        // destination's payload as it was, with no `.git`.
+        let mapping = mapping.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let plan = plan_standalone_configuration(&private, &heads, &receipt, Some(mapping))?;
+        apply_standalone_configuration(&private, &receipt, &plan)?;
         private.clone()
     };
     let pointer = write_git_pointer(&receipt, &admin)?;
@@ -5784,6 +5888,10 @@ fn attach_payload(
         .refuse_at(SITE)?
         .sync_dir_counted()
         .refuse_at(SITE)?;
+    // #216: the one refusal after publication. It is a concurrent writer
+    // caught moving the payload, the common policy or HEAD under the
+    // attachment, which no check before the write can decide; the published
+    // `.git` is retained for inspection.
     if filesystem_rows(&destination)? != before
         || &common_repository(&destination)? != common.as_ref().unwrap_or(&private)
         || repository
@@ -5838,7 +5946,9 @@ fn write_git_pointer(receipt: &Path, admin: &Path) -> Result<PathBuf> {
 /// Refuses malformed paths/modes, missing capture metadata, or an occupied target.
 /// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
 /// anything is created (S4, #162).
-/// Partial new destinations are retained, never cleaned by recursive deletion.
+/// Every configuration and authority refusal comes before the destination
+/// is created (#216); a destination created and then refused (malformed
+/// worktree custody, IO) is retained, never cleaned by recursive deletion.
 pub fn restore_bundle(bundle: &Path, destination: &Path, source: &str) -> Result<()> {
     restore_bundle_configured(bundle, destination, source, None)
 }
@@ -5846,13 +5956,20 @@ pub fn restore_bundle(bundle: &Path, destination: &Path, source: &str) -> Result
 /// Restore an absent standalone checkout with explicit local-origin mapping.
 ///
 /// Without a mapping, a captured HTTPS origin is retained unchanged; no origin
-/// is invented when the source has none. Other origin schemes require a reviewed
-/// mapping. Configuration omissions remain named in .git/carry-config receipts.
-/// No network operation or captured executable configuration is activated.
+/// is invented when the source has none. Any other origin (scp-style, `ssh://`,
+/// a local path) is preserved inert: the restored repository has no `origin`
+/// remote, and the receipt names `remote.origin.url` as preserved-only (#216,
+/// OI-1003-Q129, OI-1003-Q135). With a mapping, the captured origin must be
+/// exactly its `from`. Configuration omissions remain named in
+/// .git/carry-config receipts. No network operation or captured executable
+/// configuration is activated.
 ///
 /// # Errors
-/// Refuses old captures lacking configuration, unsafe/unmapped origins, occupied
-/// destinations, or any malformed filesystem/capture state.
+/// Refuses old captures lacking configuration, a mapping that is not absolute
+/// or does not name an existing repository, a mapped origin other than its
+/// `from`, occupied destinations, or any malformed filesystem/capture state.
+/// Every configuration and authority refusal comes before the destination is
+/// created.
 pub fn restore_bundle_configured(
     bundle: &Path,
     destination: &Path,
@@ -5872,32 +5989,41 @@ pub fn restore_staged(
     source: &str,
     mapping: Option<(&Path, &Path)>,
 ) -> Result<()> {
+    const SITE: &str = "git_carry::restore_staged";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     refuse_bare_capture(staged)?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
-    // never as a bare errno.
-    match fs::DirBuilder::new().mode(0o700).create(destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(BulkloadRefusal::GitDestinationOccupied);
-        }
-        // Round 4 N4: the enclosing item never laid the parent down.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BulkloadRefusal::GitDestinationParentMissing);
-        }
-        Err(error) => return Err(crate::refuse::io(&error, "git_carry::restore_staged")),
+    // never as a bare errno; round 4 N4: so is a parent never laid down.
+    if destination.symlink_metadata().is_ok() {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
     }
-    let destination = fs::canonicalize(destination).refuse_at("git_carry::restore_staged")?;
+    let target = linked_destination(destination)?;
+    let mapping = checked_mapping(mapping)?;
+    // #216 (OI-1003-Q129, OI-1003-Q135): the repository is assembled, and
+    // every configuration and authority decision made, in a private stage
+    // beside the destination. The destination is created only after them, so
+    // such a refusal leaves no destination and a rerun is never refused
+    // GIT_DESTINATION_OCCUPIED by a half-restored one. The stage shares the
+    // destination's filesystem, so its `.git` moves in by one rename; the
+    // stage is removed when dropped. A run interrupted before the destination
+    // is created leaves only a `.bulkload-restore-*` stage beside it.
+    let stage =
+        PrivateDir::create_beside(target.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?;
+    let work = stage.path().join("repository");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&work)
+        .refuse_at(SITE)?;
     // Read bundle headers without assuming the destination's object format.
-    let heads = text(git(&destination).args(["bundle", "list-heads"]).arg(bundle))?;
+    let heads = text(git(&work).args(["bundle", "list-heads"]).arg(bundle))?;
     if !shallow::is_custody(&heads) {
         capture_revision(&heads, "configuration-v1")?;
     }
     let format = bundle_object_format(&heads)?;
-    output(git(&destination).args(["init", "--template=", &format!("--object-format={format}")]))?;
-    import_verified(&destination, bundle, source)?;
-    let heads = shallow::headers(&destination, bundle)?;
+    output(git(&work).args(["init", "--template=", &format!("--object-format={format}")]))?;
+    import_verified(&work, bundle, source)?;
+    let heads = shallow::headers(&work, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
             .lines()
@@ -5911,40 +6037,55 @@ pub fn restore_staged(
     };
     let head = find("head")?;
     find("configuration-v1")?;
-    let symbolic =
-        text(git(&destination).args(["show", &format!("{}:value", find("head-symbolic")?)]))?;
+    let symbolic = text(git(&work).args(["show", &format!("{}:value", find("head-symbolic")?)]))?;
     if symbolic.is_empty() {
-        output(git(&destination).args(["update-ref", "--no-deref", "HEAD", &head]))?;
+        output(git(&work).args(["update-ref", "--no-deref", "HEAD", &head]))?;
     } else {
         if !symbolic.starts_with("refs/heads/") {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
-        output(git(&destination).args(["check-ref-format", &symbolic]))?;
-        set_ref(&destination, &symbolic, &head)?;
-        output(git(&destination).args(["symbolic-ref", "HEAD", &symbolic]))?;
+        output(git(&work).args(["check-ref-format", &symbolic]))?;
+        set_ref(&work, &symbolic, &head)?;
+        output(git(&work).args(["symbolic-ref", "HEAD", &symbolic]))?;
     }
-    let exclude = output(git(&destination).args(["show", &format!("{}:value", find("exclude")?)]))?;
-    fs::create_dir_all(destination.join(".git/info")).refuse_at("git_carry::restore_staged")?;
-    fs::write(destination.join(".git/info/exclude"), exclude)
-        .refuse_at("git_carry::restore_staged")?;
+    let exclude = output(git(&work).args(["show", &format!("{}:value", find("exclude")?)]))?;
+    fs::create_dir_all(work.join(".git/info")).refuse_at(SITE)?;
+    fs::write(work.join(".git/info/exclude"), exclude).refuse_at(SITE)?;
     let worktree = find("worktree")?;
-    let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &worktree]))?;
+    let entries = output(git(&work).args(["ls-tree", "-r", "-z", &worktree]))?;
     // #131: before any worktree byte.
-    intent_to_add_restorable(&carried_intent_to_add(&destination, &heads)?, &entries)?;
+    intent_to_add_restorable(&carried_intent_to_add(&work, &heads)?, &entries)?;
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(work.join(".git/carry-config"))
+        .refuse_at(SITE)?;
+    let configuration =
+        plan_standalone_configuration(&work, &heads, &work.join(".git/carry-config"), mapping)?;
+    match fs::DirBuilder::new().mode(0o700).create(&target) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(BulkloadRefusal::GitDestinationParentMissing);
+        }
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    }
+    let destination = target;
+    // Only this process writes the directory it just created (mode 0700).
+    fs::rename(work.join(".git"), destination.join(".git")).refuse_at(SITE)?;
     restore_entries(&destination, &entries)?;
     let staged = find("staged")?;
     restore_gitlink_directories(&destination, &staged, &heads)?;
     output(git(&destination).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
     restore_intent_to_add(&destination, None, &heads)?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
-    let config_receipt = destination.join(".git/carry-config");
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&config_receipt)
-        .refuse_at("git_carry::restore_staged")?;
-    activate_standalone_configuration(&destination, &heads, &config_receipt, mapping)?;
-    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
-        .refuse_at("git_carry::restore_staged")?;
+    apply_standalone_configuration(
+        &destination,
+        &destination.join(".git/carry-config"),
+        &configuration,
+    )?;
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700)).refuse_at(SITE)?;
     Ok(())
 }
 
@@ -5958,7 +6099,9 @@ pub fn restore_staged(
 /// Refuses occupied destinations, differing common excludes, and invalid capture.
 /// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
 /// anything is imported or created (S4, #162).
-/// Partially created worktrees are retained on failure for explicit recovery.
+/// Partially created worktrees are retained on failure for explicit recovery;
+/// after the worktree is added, only a concurrent writer moving HEAD or the
+/// common exclude refuses (#216).
 pub fn restore_linked(
     bundle: &Path,
     repository: &Path,
@@ -6078,6 +6221,13 @@ pub fn restore_linked_staged(
     // --no-checkout has created administration only, not captured payload.
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
         .refuse_at("git_carry::restore_linked_staged")?;
+    // #216: a linked worktree activates no captured configuration (it shares
+    // the common repository's, origin included), so no configuration
+    // refusal can follow the write. Every capture-decided refusal (bare,
+    // exclude policy, intent-to-add) is above. The three after `worktree add`
+    // are concurrent-writer checks, HEAD or the common exclude moving under
+    // the restore, which no earlier check can decide; the partial worktree is
+    // retained for explicit recovery.
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
