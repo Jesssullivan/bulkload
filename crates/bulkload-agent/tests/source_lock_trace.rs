@@ -469,6 +469,13 @@ fn write_opens(roots: &[PathBuf], ignore: &BTreeSet<RawFd>) -> Vec<WriteOpen> {
         let Ok(info) = fs::read_to_string(format!("/proc/self/fdinfo/{fd}")) else {
             continue;
         };
+        // The verb may close the descriptor and reuse its number for another
+        // file between the two reads, pairing a source path with that file's
+        // flags (seen in CI: a destination's O_RDWR under a source path).
+        // Only a descriptor whose link is the same after `fdinfo` counts.
+        if fs::read_link(entry.path()).ok().as_deref() != Some(target.as_path()) {
+            continue;
+        }
         let flags = info
             .lines()
             .find_map(|line| line.strip_prefix("flags:"))
