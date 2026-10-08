@@ -118,20 +118,44 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
-/// `syncfs`: every file of the file system holding `file` is durable, its
-/// data, metadata and directory entries, and the device cache is flushed.
-/// The group seal of the batched protocol (S1, OI-1003-Q107): one call per
-/// device in place of a flush per file and per directory. Linux 5.8 and
-/// later report a write-back error of any file of the file system here.
+/// `syncfs`, then `fsync` of `file` itself: the group seal of the batched
+/// protocol (S1, OI-1003-Q107), one call pair per device in place of a
+/// flush per file and per directory. The engine calls it only on the file
+/// systems `io::durable::syncfs_seals` allows; elsewhere `syncfs` can be
+/// weaker than `fsync`.
+///
+/// `syncfs` writes back every file of the file system and runs its
+/// `->sync_fs` (the ext4 journal commit, the xfs log force, the btrfs
+/// transaction commit). That alone does not always flush the device cache
+/// or report a failure:
+///
+/// - xfs: with an idle log `xfs_log_force` returns 0 without any I/O, so
+///   data written back in place (no log write after it) can stay in the
+///   drive's volatile cache. `xfs_file_fsync` then calls
+///   `blkdev_issue_flush` itself (v6.12 `xfs_file.c`; not for a realtime
+///   file, which the engine never batches).
+/// - ext4: on a forced shutdown `ext4_sync_fs` returns 0 (v5.17, v6.12),
+///   while `ext4_sync_file` returns `EIO`.
+///
+/// The `fsync` that follows covers both. Write-back errors are reported by
+/// `syncfs` (Linux 5.8, errseq) only against this descriptor's cursor, so an
+/// error another `syncfs` already reported is not reported again
+/// ([`wait_writeback`] checks each file's own); the file system's own
+/// `->sync_fs` failure is reported from 5.17 (5679897eb104, and for xfs
+/// 2d86293c7075).
+///
+/// Traced as the `fsync` of `file`, then one `FsSync`, recorded only once
+/// both returned: the device seal is complete at the `FsSync`.
 ///
 /// # Errors
-/// Returns the flush failure.
+/// Returns the first failure.
 pub fn sync_fs(file: impl AsFd) -> io::Result<()> {
     trace_serial!();
     let fd = file.as_fd();
     // SAFETY: the descriptor is live for every call of the closure; `syncfs`
     // takes no pointers.
     retry_eintr(|| unsafe { libc::syncfs(fd.as_raw_fd()) })?;
+    full_flush(fd)?;
     trace_event!(
         "syncfs",
         Ok(super::trace::Event::Sync {
@@ -164,6 +188,107 @@ pub fn start_writeback(file: impl AsFd) -> io::Result<()> {
         })
     );
     Ok(())
+}
+
+/// `sync_file_range(WAIT_BEFORE | WRITE | WAIT_AFTER)` over the whole file:
+/// write any dirty page and wait for its write-back, then return the file's
+/// own write-back error, checked against this descriptor's errseq cursor
+/// (`file_fdatawait_range` returns `file_check_and_advance_wb_err`; errseq
+/// since Linux 4.14). It flushes no device cache. Traced as a kick: it makes
+/// nothing durable.
+///
+/// # Errors
+/// Returns the file's write-back error.
+pub fn wait_writeback(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
+    let fd = file.as_fd();
+    // SAFETY: the descriptor is live for every call of the closure;
+    // `sync_file_range` takes no pointers.
+    retry_eintr(|| unsafe {
+        libc::sync_file_range(
+            fd.as_raw_fd(),
+            0,
+            0,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                | libc::SYNC_FILE_RANGE_WRITE
+                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+        )
+    })?;
+    trace_event!(
+        "sync_file_range",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::Kick,
+        })
+    );
+    Ok(())
+}
+
+/// `fstatfs`: the type (`f_type`, a file system magic) of the file system
+/// holding `file`, as its low 32 bits (every magic fits in them).
+///
+/// # Errors
+/// Returns the failed call.
+#[allow(
+    clippy::useless_conversion,
+    reason = "f_type is i64 on x86_64 and aarch64 but u32 on s390x Linux"
+)]
+pub fn fs_type(file: impl AsFd) -> io::Result<u32> {
+    let fd = file.as_fd();
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the descriptor is live; `stats` is a writable `statfs` that
+    // outlives the call.
+    retry_eintr(|| unsafe { libc::fstatfs(fd.as_raw_fd(), stats.as_mut_ptr()) })?;
+    // SAFETY: a successful fstatfs initialized the whole structure.
+    let stats = unsafe { stats.assume_init() };
+    u32::try_from(i64::from(stats.f_type) & 0xFFFF_FFFF)
+        .map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+/// `struct fsxattr` of `<linux/fs.h>`, the argument of `FS_IOC_FSGETXATTR`.
+#[repr(C)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the field names of the kernel's struct fsxattr"
+)]
+struct FsXattr {
+    fsx_xflags: u32,
+    fsx_extsize: u32,
+    fsx_nextents: u32,
+    fsx_projid: u32,
+    fsx_cowextsize: u32,
+    fsx_pad: [u8; 8],
+}
+
+/// `FS_IOC_FSGETXATTR`, `_IOR('X', 31, struct fsxattr)`.
+const FS_IOC_FSGETXATTR: libc::Ioctl = libc::_IOR::<FsXattr>(b'X' as u32, 31);
+
+/// `FS_IOC_FSGETXATTR`: the inode flags (`fsx_xflags`, such as
+/// `FS_XFLAG_REALTIME`) of `file`.
+///
+/// # Errors
+/// Returns the failed call (`ENOTTY` where the file system has no such
+/// flags).
+pub fn fs_xflags(file: impl AsFd) -> io::Result<u32> {
+    let fd = file.as_fd();
+    let mut attributes = FsXattr {
+        fsx_xflags: 0,
+        fsx_extsize: 0,
+        fsx_nextents: 0,
+        fsx_projid: 0,
+        fsx_cowextsize: 0,
+        fsx_pad: [0; 8],
+    };
+    // SAFETY: the descriptor is live; `attributes` is a writable
+    // `struct fsxattr` that outlives the call.
+    retry_eintr(|| unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            FS_IOC_FSGETXATTR,
+            std::ptr::addr_of_mut!(attributes),
+        )
+    })?;
+    Ok(attributes.fsx_xflags)
 }
 
 /// The running kernel's release string (`uname -r`), if it can be read.

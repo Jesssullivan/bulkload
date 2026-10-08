@@ -1190,7 +1190,16 @@ What the abstractions are:
   checked on the real trace by
   `a_batched_group_names_no_output_before_its_data_is_durable`
   (`A/materialize/adoption_power_loss.rs`), which fails when both `syncfs`
-  calls follow the renames.
+  calls follow the renames. The refinement assumes a successful device
+  seal means the group's own data is durable. `syncfs` alone does not earn
+  that even on the allowlist (an idle xfs log sends no cache flush; a
+  shut-down ext4's `syncfs` returns 0). The code earns it with the seal's
+  `fsync` of the same descriptor after each `syncfs`, only on Linux
+  5.17-rc3 or later, on an allowlisted file system with no xfs realtime
+  file (`io::durable::syncfs_seals_handle`), and with each file's own
+  write-back error checked after the seal (`io::durable::check_writeback`);
+  anywhere else the group keeps the per-file `SealTemp` (OI-1003-Q107
+  review; the 5.17 floor is OI-1003-Q141).
 - **Relaxed source store.** A power loss drops any subset of committed ledger
   rows, or, under `RelaxedAuthority` before its creation is synced, the
   whole store. Under `StoreRootSealed = FALSE` (the code today) a strict

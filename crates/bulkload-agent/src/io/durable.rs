@@ -13,14 +13,20 @@
 //!    drains the store's device, which is the only device-cache flush a
 //!    group needs when its files share that device.
 //!
-//! On Linux in group mode a group of [`BATCH_MIN_FILES`] or more outputs is
-//! sealed in two device-wide steps instead (S1, OI-1003-Q107): each output's
-//! write-back starts as it is queued ([`start_writeback`]); the group then
-//! runs one `syncfs` per device its outputs live on ([`seal_device`]), which
-//! makes every temporary's data durable under its temporary name; renames
-//! every output into place (or, superseding one, exchanges it in: WP0(d));
-//! and runs one `syncfs` per touched device again,
-//! which makes the new entries durable, before the records commit. The
+//! On Linux 5.17 (rc3) or later in group mode, a group of
+//! [`BATCH_MIN_FILES`] or more outputs whose devices are all on the
+//! [`syncfs_seals`] allowlist is sealed in two device-wide steps instead
+//! (S1, OI-1003-Q107): each output's write-back starts as it is queued
+//! ([`start_writeback`]); the group then runs one device seal per device
+//! number its outputs live on ([`seal_device`]: `syncfs`, then `fsync` of
+//! the same descriptor), which makes every temporary's data durable under
+//! its temporary name, and checks each file's own write-back error
+//! ([`check_writeback`]); renames every output into place (or, superseding
+//! one, exchanges it in: WP0(d)); and runs one device seal per touched
+//! device number again, which makes the new entries durable, before the
+//! records commit. Each btrfs subvolume has its own device number, so a
+//! group spread over N subvolumes of one btrfs pays N transaction commits
+//! per step. The
 //! renames never precede the first seal: a name must not survive a power
 //! loss that its data did not.
 //!
@@ -173,16 +179,33 @@ pub fn durability() -> Durability {
 /// flushes whatever else is dirty on that file system.
 pub const BATCH_MIN_FILES: usize = 2;
 
-/// The first Linux release whose `syncfs` reports write-back errors.
+/// The first Linux release whose `syncfs` reports the file system's own
+/// sync failure (its rc1 and rc2 do not: [`release_meets_floor`]).
 ///
-/// From 5.8 a write-back error of any file of the file system is reported
-/// (errseq on the superblock). Before it, a failed write could go unreported
-/// by a group's device seal, so an older kernel keeps the per-file seals
-/// (OI-1003-Q113).
-pub const SYNCFS_REPORTS_ERRORS_SINCE: (u32, u32) = (5, 8);
+/// From 5.8 `syncfs` reports a data write-back error of the file system
+/// (errseq on the superblock, checked against the calling descriptor's
+/// cursor). Until 5.17 `sync_filesystem` still threw away the return value of
+/// the file system's `->sync_fs` (ext4's journal commit or cache flush, xfs's
+/// log force, btrfs's transaction commit), so `syncfs` could return 0 after
+/// those failed. Fixed by torvalds/linux commit 5679897eb104 ("vfs: make
+/// `sync_filesystem` return errors from `->sync_fs`", Darrick J. Wong,
+/// 2022-01-30); xfs needed 2d86293c7075 ("xfs: return errors in
+/// `xfs_fs_sync_fs`") as well, since before it `xfs_fs_sync_fs` ignored its
+/// own log force's result. Both are first tagged in v5.17-rc3 (neither is in
+/// v5.17-rc2) and released in v5.17 (checked against the upstream tree on
+/// 2026-10-08). An older kernel keeps the per-file seals (OI-1003-Q113 set
+/// 5.8; the move to 5.17 rests on these commits, from the OI-1003-Q107
+/// review, and its ruling is pending).
+///
+/// A distribution kernel below 5.17 that carries the fix as a backport is
+/// still treated as too old: only the release number is read.
+pub const SYNCFS_REPORTS_ERRORS_SINCE: (u32, u32) = (5, 17);
 
-/// Whether a group of `files` outputs is sealed device-wide (Linux 5.8 or
-/// later, group mode, at least [`BATCH_MIN_FILES`]).
+/// Whether a group of `files` outputs may be sealed device-wide.
+///
+/// Linux 5.17 or later, group mode, at least [`BATCH_MIN_FILES`]. The group
+/// is batched only if, in addition, every device it touches passes
+/// [`syncfs_seals_handle`].
 #[must_use]
 pub fn batched(files: usize) -> bool {
     cfg!(target_os = "linux")
@@ -191,8 +214,8 @@ pub fn batched(files: usize) -> bool {
         && syncfs_reports_errors()
 }
 
-/// Whether this kernel's `syncfs` reports write-back errors, read once. An
-/// unreadable release counts as too old.
+/// Whether this kernel's `syncfs` reports write-back and `->sync_fs`
+/// errors, read once. An unreadable release counts as too old.
 fn syncfs_reports_errors() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -200,14 +223,226 @@ fn syncfs_reports_errors() -> bool {
         *REPORTS.get_or_init(|| {
             super::sys::kernel_release()
                 .as_deref()
-                .and_then(release_version)
-                .is_some_and(|version| version >= SYNCFS_REPORTS_ERRORS_SINCE)
+                .is_some_and(release_meets_floor)
         })
     }
     #[cfg(not(target_os = "linux"))]
     {
         false
     }
+}
+
+/// `f_type` of ext4 (shared with ext2 and ext3: see [`syncfs_seals`]).
+pub const EXT4_SUPER_MAGIC: u32 = 0xEF53;
+/// `f_type` of xfs.
+pub const XFS_SUPER_MAGIC: u32 = 0x5846_5342;
+/// `f_type` of btrfs.
+pub const BTRFS_SUPER_MAGIC: u32 = 0x9123_683E;
+/// `f_type` of tmpfs.
+pub const TMPFS_MAGIC: u32 = 0x0102_1994;
+/// `f_type` of FUSE (not on the allowlist; named for tests).
+pub const FUSE_SUPER_MAGIC: u32 = 0x6573_5546;
+
+/// Whether a file system of type `magic` may take the group's device seal
+/// ([`seal_device`]) in place of the per-file and per-directory seals.
+///
+/// `magic` is `fstatfs`'s `f_type`; `fstype` is the mount's type name,
+/// needed only for the ext magic. `syncfs` alone is not as strong as those
+/// seals even here, and does not report every failure they would: with an
+/// idle log xfs's sends no device-cache flush, and a shut-down ext4's
+/// returns 0 (`ext4_sync_fs`, v5.17 and v6.12) where its `fsync` returns
+/// `EIO`. The batch is sound on the allowlist only together with the
+/// `fsync` that ends each device seal and the per-file
+/// [`check_writeback`] (kernel floor: [`SYNCFS_REPORTS_ERRORS_SINCE`]). The
+/// allowlist (OI-1003-Q107 review):
+///
+/// - ext4 (and ext3, which ext4 serves): `ext4_sync_fs` commits the journal
+///   and flushes the device, or flushes it alone without a journal. The
+///   ext2 driver shares the magic, but `ext2_sync_fs` never flushes the
+///   device cache while its `fsync` does, so the ext magic is allowed only
+///   when the mount's type is `ext4` or `ext3`.
+/// - xfs (`xfs_fs_sync_fs` forces the log; the seal's `fsync` flushes the
+///   data device when the log force was a no-op) and btrfs (`btrfs_sync_fs`
+///   commits the transaction). An xfs realtime file is refused by
+///   [`syncfs_seals_handle`]: its data is on the realtime device, which
+///   neither flushes.
+/// - tmpfs: there is nothing to make durable; its `fsync` is a no-op too,
+///   so the batch is exactly as strong as the per-file path.
+///
+/// Everything else keeps the per-file seals, among them FUSE other than
+/// virtiofs (`fuse_sync_fs` sends nothing unless the connection opted in,
+/// while `fsync` sends `FUSE_FSYNC`), CIFS/SMB and NFS (no `->sync_fs` that
+/// reaches the server, while `fsync` flushes there), 9p, vfat and exFAT
+/// (`syncfs` sends no device-cache flush, their `fsync` does), overlayfs
+/// (upper-layer write-back errors are not reported through the overlay's
+/// superblock), and f2fs (`f2fs_sync_fs` returns 0 without a checkpoint
+/// when checkpointing is disabled or has failed).
+#[must_use]
+pub fn syncfs_seals(magic: u32, fstype: Option<&str>) -> bool {
+    match magic {
+        XFS_SUPER_MAGIC | BTRFS_SUPER_MAGIC | TMPFS_MAGIC => true,
+        EXT4_SUPER_MAGIC => matches!(fstype, Some("ext4" | "ext3")),
+        _ => false,
+    }
+}
+
+/// The type name (`ext4`, `ext2`, ...) of the mount of device
+/// `(major, minor)` in a `/proc/self/mountinfo` listing, if it has one.
+#[must_use]
+pub fn mount_fstype(mountinfo: &str, device: (u32, u32)) -> Option<&str> {
+    let wanted = format!("{}:{}", device.0, device.1);
+    mountinfo.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.nth(2)? != wanted {
+            return None;
+        }
+        fields.skip_while(|field| *field != "-").nth(1)
+    })
+}
+
+/// Whether the device holding `handle` may be sealed device-wide
+/// ([`syncfs_seals`]).
+///
+/// Its type is read with `fstatfs` on every call; nothing is cached across
+/// groups, because an anonymous device number (tmpfs, a btrfs subvolume)
+/// can be handed to another file system after an unmount. For the ext magic
+/// the mount's type is looked up by device number in `mountinfo`, which is
+/// filled from `/proc/self/mountinfo` on first use (a group shares one).
+/// On xfs a file flagged `FS_XFLAG_REALTIME` (read with
+/// `FS_IOC_FSGETXATTR`) answers `false`: its data is on the realtime
+/// device, which the group's seal does not flush. Anything that cannot be
+/// read answers `false`, the per-file path.
+#[must_use]
+pub fn syncfs_seals_handle(handle: &File, mountinfo: &std::cell::OnceCell<Option<String>>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(magic) = fs_magic(handle) else {
+            return false;
+        };
+        // A realtime file's data lives on the realtime device, which neither
+        // the log force nor the seal's `fsync` of another file flushes.
+        if magic == XFS_SUPER_MAGIC
+            && xflags(handle).is_none_or(|flags| flags & FS_XFLAG_REALTIME != 0)
+        {
+            return false;
+        }
+        if magic != EXT4_SUPER_MAGIC {
+            return syncfs_seals(magic, None);
+        }
+        let Ok(metadata) = handle.metadata() else {
+            return false;
+        };
+        let device = std::os::unix::fs::MetadataExt::dev(&metadata);
+        let Some(mountinfo) = mountinfo
+            .get_or_init(|| std::fs::read_to_string("/proc/self/mountinfo").ok())
+            .as_deref()
+        else {
+            return false;
+        };
+        syncfs_seals(
+            magic,
+            mount_fstype(mountinfo, (libc::major(device), libc::minor(device))),
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (handle, mountinfo);
+        false
+    }
+}
+
+/// `fstatfs`'s `f_type` of the file system holding `handle` (or the
+/// [`force_fs_magic`] override in tests), if it can be read.
+#[cfg(target_os = "linux")]
+fn fs_magic(handle: &File) -> Option<u32> {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_FS_MAGIC.with(std::cell::Cell::get) {
+        return Some(forced);
+    }
+    super::sys::fs_type(handle).ok()
+}
+
+/// The `FS_IOC_FSGETXATTR` flags of `handle` (or the [`force_xflags`]
+/// override in tests), if they can be read.
+#[cfg(target_os = "linux")]
+fn xflags(handle: &File) -> Option<u32> {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_XFLAGS.with(std::cell::Cell::get) {
+        return Some(forced);
+    }
+    super::sys::fs_xflags(handle).ok()
+}
+
+/// `FS_XFLAG_REALTIME`: an xfs file whose data lives on the realtime device.
+pub const FS_XFLAG_REALTIME: u32 = 0x1;
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_FS_MAGIC: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static FORCE_XFLAGS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+    static FAIL_WRITEBACK: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    static DEVICE_SEALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Test hook: while `Some`, this thread's [`syncfs_seals_handle`] takes
+/// that `f_type` in place of `fstatfs`'s answer.
+#[cfg(test)]
+pub fn force_fs_magic(magic: Option<u32>) {
+    FORCE_FS_MAGIC.with(|forced| forced.set(magic));
+}
+
+/// Test hook: while `Some`, this thread reads those `FS_IOC_FSGETXATTR`
+/// flags for every handle in place of the ioctl's answer.
+#[cfg(test)]
+pub fn force_xflags(flags: Option<u32>) {
+    FORCE_XFLAGS.with(|forced| forced.set(flags));
+}
+
+/// Test hook: while `Some((dev, ino))`, this thread's [`check_writeback`]
+/// of that file fails with `EIO` after the real call.
+///
+/// It stands in for a write-back error an earlier `syncfs` already
+/// consumed, which only this per-file check still reports.
+#[cfg(test)]
+pub fn fail_writeback_of(node: Option<(u64, u64)>) {
+    FAIL_WRITEBACK.with(|failing| failing.set(node));
+}
+
+/// Test hook: how many [`seal_device`] calls this thread has made.
+#[cfg(test)]
+#[must_use]
+pub fn device_seals() -> usize {
+    DEVICE_SEALS.with(std::cell::Cell::get)
+}
+
+/// Whether the kernel release string `release` is at or above
+/// [`SYNCFS_REPORTS_ERRORS_SINCE`].
+///
+/// A 5.17 release candidate before rc3 is below it: both commits the floor
+/// rests on, 5679897eb104 (VFS) and 2d86293c7075 (xfs), are first in
+/// v5.17-rc3. The candidate number is read from an `rcN` that follows a
+/// `-` or `.` (`5.17.0-rc2`, Fedora's `5.17.0-0.rc2.<date>git...`). An
+/// unreadable release is below the floor.
+#[must_use]
+pub fn release_meets_floor(release: &str) -> bool {
+    /// The first 5.17 release candidate that carries both commits.
+    const FIRST_CANDIDATE: u32 = 3;
+    let Some(version) = release_version(release) else {
+        return false;
+    };
+    if version != SYNCFS_REPORTS_ERRORS_SINCE {
+        return version > SYNCFS_REPORTS_ERRORS_SINCE;
+    }
+    let candidate = release
+        .split(['-', '.'])
+        .filter_map(|part| part.strip_prefix("rc"))
+        .find_map(|digits| {
+            let end = digits
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(digits.len());
+            digits[..end].parse::<u32>().ok()
+        });
+    candidate.is_none_or(|number| number >= FIRST_CANDIDATE)
 }
 
 /// `(major, minor)` of a kernel release string such as `6.12.0-211.el10`.
@@ -234,11 +469,18 @@ pub fn start_writeback(file: &File) {
 }
 
 /// Seal every file of the file system holding `handle`: its data, metadata
-/// and directory entries (Linux `syncfs`). Only a [`batched`] group calls it.
+/// and directory entries.
+///
+/// Linux `syncfs`, then `fsync` of `handle` itself, which flushes the device
+/// cache where the `syncfs` did not (an idle xfs log) and fails where it
+/// returned 0 (a shut-down ext4); see `sys::sync_fs`. Only a [`batched`] group calls it, on a regular file of
+/// the group in its first step and a touched directory in its second.
 ///
 /// # Errors
 /// Returns the flush failure; `Unsupported` off Linux.
 pub fn seal_device(handle: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    DEVICE_SEALS.with(|seals| seals.set(seals.get() + 1));
     #[cfg(target_os = "linux")]
     {
         counters::timed(Counter::FlushFs, Counter::FlushFsNs, || {
@@ -248,6 +490,45 @@ pub fn seal_device(handle: &File) -> std::io::Result<()> {
     #[cfg(not(target_os = "linux"))]
     {
         let _ = handle;
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+/// Check one file's own write-back after its group's [`seal_device`].
+///
+/// Linux `sync_file_range(WAIT_BEFORE | WRITE | WAIT_AFTER)` over the whole
+/// file, which waits for its pages and returns its own write-back error
+/// (`file_check_and_advance_wb_err` against this descriptor's cursor), with
+/// no device-cache flush of its own.
+///
+/// `syncfs` reports a write-back error only against the cursor of the one
+/// descriptor it is called on, so an error an earlier `syncfs` elsewhere has
+/// already consumed is not reported by the group's. The per-file path's
+/// `fsync` checks each file's own cursor; this restores that check for the
+/// batched path (OI-1003-Q107 review).
+///
+/// # Errors
+/// Returns the file's write-back error; `Unsupported` off Linux.
+pub fn check_writeback(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        super::sys::wait_writeback(file)?;
+        #[cfg(test)]
+        if let Some(node) = FAIL_WRITEBACK.with(std::cell::Cell::get) {
+            let metadata = file.metadata()?;
+            let found = (
+                std::os::unix::fs::MetadataExt::dev(&metadata),
+                std::os::unix::fs::MetadataExt::ino(&metadata),
+            );
+            if found == node {
+                return Err(std::io::Error::from_raw_os_error(libc::EIO));
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
         Err(std::io::ErrorKind::Unsupported.into())
     }
 }
@@ -671,8 +952,12 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
 
-    /// OI-1003-Q113: a release is read as `(major, minor)`, and only 5.8 or
-    /// later seals a group device-wide.
+    /// OI-1003-Q113, floor moved to 5.17 by OI-1003-Q141 (ruled 2026-10-08,
+    /// Linear TIN-4543): a release is read as `(major, minor)`, and only 5.17-rc3 or
+    /// later seals a group device-wide. 5.8 to 5.16, and 5.17-rc1 and rc2,
+    /// report data write-back errors from `syncfs` but drop the file
+    /// system's own `->sync_fs` failure (journal commit, log force, cache
+    /// flush).
     #[test]
     fn the_syncfs_floor_reads_the_release_major_and_minor() {
         assert_eq!(
@@ -684,9 +969,40 @@ mod tests {
         assert_eq!(release_version("4.19"), Some((4, 19)));
         assert_eq!(release_version("garbage"), None);
         assert_eq!(release_version("6"), None);
-        assert!(release_version("5.7.19").is_some_and(|v| v < SYNCFS_REPORTS_ERRORS_SINCE));
-        assert!(release_version("5.8.0").is_some_and(|v| v >= SYNCFS_REPORTS_ERRORS_SINCE));
-        assert!(release_version("5.10.1").is_some_and(|v| v >= SYNCFS_REPORTS_ERRORS_SINCE));
+        assert_eq!(SYNCFS_REPORTS_ERRORS_SINCE, (5, 17));
+        for below in [
+            "5.7.19",
+            "5.8.0",
+            "5.10.1",
+            "5.14.0-503.el9",
+            "5.15.0-91-generic",
+            "5.16.20",
+            "5.17.0-rc1",
+            "5.17.0-rc2",
+            "5.17.0-0.rc2.20220208git555f3d7be914.85.fc36",
+        ] {
+            assert!(
+                !release_meets_floor(below),
+                "{below} must keep the per-file seals"
+            );
+        }
+        for at_or_above in [
+            "5.17.0",
+            "5.17.0-rc3",
+            "5.17.0-rc8",
+            "5.17.0-0.rc3.89.fc36.x86_64",
+            "5.17.15-arch1-1",
+            "6.1.0-18-amd64",
+            "6.12.0",
+            "6.12.0-211.51.1.el10_2.x86_64",
+            "6.0.0-rc1",
+        ] {
+            assert!(
+                release_meets_floor(at_or_above),
+                "{at_or_above} may seal a group device-wide"
+            );
+        }
+        assert!(!release_meets_floor("garbage"));
     }
 
     struct Recorder(Arc<Mutex<Vec<Vec<u64>>>>);

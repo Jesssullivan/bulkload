@@ -28,6 +28,17 @@
 //!    `FullFlush` for every class. `Kick` and `Barrier` make nothing durable.
 //!    An `FsSync` (Linux `syncfs`) on any node makes every mutation issued
 //!    before it on that node's drive durable, whatever object it changes.
+//!    The engine's `FsSync` event is its whole device seal, recorded once
+//!    both calls returned: `syncfs`, then `fsync` of the same descriptor
+//!    (traced just before it). `syncfs` alone does not earn the rule: on xfs
+//!    with an idle log it sends no device-cache flush, which the `fsync`
+//!    sends, and an xfs realtime file's data is on a device neither
+//!    flushes (never batched). The rule holds only where the engine issues
+//!    the seal: Linux 5.17-rc3 or later, on a file system
+//!    `io::durable::syncfs_seals` allows (ext4, xfs, btrfs, tmpfs), with
+//!    each file's own write-back error checked after it. On others (FUSE,
+//!    CIFS/SMB, NFS, 9p, vfat, exFAT, overlayfs, f2fs) `syncfs` can be
+//!    weaker than `fsync`, and the engine never batches there.
 //! 2. **Drain.** A completed `FullFlush` (Darwin `F_FULLFSYNC`) empties the
 //!    whole drive cache, so a mutation already *sent* to the device before it
 //!    is durable, whichever file it belongs to. Sent means every object of the

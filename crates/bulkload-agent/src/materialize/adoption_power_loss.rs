@@ -44,7 +44,9 @@ use super::*;
 use crate::io::crash_check::{check, check_view, Entry, Image, Options};
 use crate::io::durable::GroupSink as _;
 use crate::io::trace::recorder::Recorder;
-use crate::io::trace::{CommitRecord, Event, SyncKind};
+#[cfg(target_os = "linux")]
+use crate::io::trace::SyncKind;
+use crate::io::trace::{CommitRecord, Event};
 use crate::transfer_store::PublisherSide;
 
 fn scratch(tag: &str) -> PathBuf {
@@ -359,6 +361,7 @@ fn chunk_specs(data: &[u8]) -> Vec<bulkload_proto::frame::ChunkSpec> {
 }
 
 /// The outputs of the batched group proof.
+#[cfg(target_os = "linux")]
 const GROUP: [(&str, &[u8]); 3] = [
     ("a", b"alpha-bytes"),
     ("b", b"bravo"),
@@ -367,9 +370,11 @@ const GROUP: [(&str, &[u8]); 3] = [
 
 /// The output the batched group proof supersedes (WP0(d)): its path, the
 /// bytes this store published there first, and the changed seat's bytes.
+#[cfg(target_os = "linux")]
 const SUPERSEDED: (&str, &[u8], &[u8]) = ("d", b"delta-old", b"delta-new-and-longer");
 
 /// The authority the superseded output's rows are committed under.
+#[cfg(target_os = "linux")]
 const SUPERSEDE_AUTHORITY: &[u8] = b"batched-authority";
 
 /// S1 (OI-1003-Q107): commit three new outputs and one superseding publish
@@ -378,12 +383,23 @@ const SUPERSEDE_AUTHORITY: &[u8] = b"batched-authority";
 /// exactly its output's bytes, the superseded path holds the old output or
 /// the new one whole, a committed new row is never beside the old bytes, and
 /// every committed output is present. The superseding temporary takes no
-/// flush of its own: the group's first `syncfs` seals it before its exchange.
+/// flush of its own: the group's first `syncfs` seals it before its exchange
+/// (each device seal's `fsync` of its own descriptor aside).
+///
+/// Linux only: elsewhere no group is batched, so there is nothing to prove,
+/// and `just resume-power-loss` expects this proof on Linux alone. On Linux
+/// it never passes without running (OI-1003-Q107 review): a kernel below
+/// the `syncfs` floor fails it. The recorded group's file system is taken as
+/// tmpfs (`force_fs_magic`), so the proof runs whatever file system holds
+/// the test's scratch directory; the allowlist has its own tests.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_batched_group_names_no_output_before_its_data_is_durable() {
-    if !crate::io::durable::batched(GROUP.len() + 1) {
-        return;
-    }
+    assert!(
+        crate::io::durable::batched(GROUP.len() + 1),
+        "Linux below the syncfs floor {:?}: the batched proof cannot run here",
+        crate::io::durable::SYNCFS_REPORTS_ERRORS_SINCE
+    );
     let base = scratch("batched");
     let (source, destination, state) = (
         base.join("source"),
@@ -491,7 +507,9 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
                 .unwrap(),
         )
         .unwrap();
+        crate::io::durable::force_fs_magic(Some(crate::io::durable::TMPFS_MAGIC));
         sink.commit(publications);
+        crate::io::durable::force_fs_magic(None);
         let report = sink.finish();
         assert!(
             report.iter().all(|(_, outcome)| outcome.is_ok()),
@@ -519,16 +537,24 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
             .any(|event| matches!(event, Event::Exchange { .. })),
         "the superseding output was exchanged in"
     );
-    assert!(
-        !events.iter().any(|event| matches!(
-            event,
-            Event::Sync {
-                kind: SyncKind::DataSync | SyncKind::Fsync,
-                ..
-            }
-        )),
-        "no output of the batched group took a flush of its own"
-    );
+    // The only per-object flushes are the device seals' own `fsync`s, each
+    // of the descriptor its `syncfs` ran on and recorded just before that
+    // seal's `FsSync` (#210 review, xfs idle log).
+    for (at, event) in events.iter().enumerate() {
+        if let Event::Sync {
+            kind: SyncKind::DataSync | SyncKind::Fsync,
+            node,
+        } = event
+        {
+            assert!(
+                matches!(
+                    events.get(at + 1),
+                    Some(Event::Sync { kind: SyncKind::FsSync, node: sealed }) if sealed == node
+                ),
+                "no output of the batched group took a flush of its own: {event:?}"
+            );
+        }
+    }
     let options = Options {
         ignore_foreign: true,
         accept_bounded: true,
