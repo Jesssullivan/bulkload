@@ -1,4 +1,4 @@
-//! Native resumable transfer over one full-duplex framed stream (wire v5).
+//! Native resumable transfer over one full-duplex framed stream (wire v6).
 //!
 //! The source walks its root and offers every seat as a numbered
 //! [`Control::Entry`], up to [`ENTRY_WINDOW`] undecided at once. The
@@ -31,6 +31,27 @@
 //! the same code without opening it, and the sniffed bytes are counted as
 //! `source_sniff_bytes`, never as content (#186, R25).
 //!
+//! **`SQLite` snapshot seats (#218).** With `--sqlite=snapshot`
+//! ([`SqliteMode::Snapshot`], chosen by the destination and carried in
+//! `Open`), a seat whose sniff sees a `SQLite` database magic is not refused:
+//! the source takes a backup-API snapshot of it into its private state
+//! (`provider_sqlite::snapshot_for_carry`, under OI-1003-Q16's stepped lock
+//! and Q36/Q72's counted writes; never as root, OI-1003-Q76, and never as
+//! another user than the database's owner), announces it with
+//! [`Control::SqliteSnapshot`] and streams the snapshot, never the live
+//! file. The destination verifies it (`integrity_check`) before publishing
+//! it in journal mode DELETE, never beside a sidecar of its own. A changed
+//! store's new snapshot supersedes its older output only through the
+//! superseding exchange (OI-1003-Q146): when this store published that
+//! output and it is untouched since, and no `-wal`, `-journal` or `-shm`
+//! sits beside it at Decide or at the last look before the exchange; any
+//! other output is refused `DESTINATION_OCCUPIED`. The live `-wal`, `-shm` and
+//! `-journal` are never carried: the walk reports each one beside a regular
+//! base as [`Control::SqliteSidecar`], and its outcome is its base's. A
+//! snapshot seat is keyed on its row and its `-wal`'s identity
+//! ([`sqlite_key`]), so an unchanged store is `Reuse`d with nothing opened.
+//! See `docs/agent-notes/2026-10-08-sqlite-carry-design.md`.
+//!
 //! Data frames are paced by [`Control::Credit`]: the source never has more
 //! than the granted payload bytes in flight. The source keeps no byte pack;
 //! its ledger records digests and sizes only, so a refused capture leaves
@@ -49,7 +70,7 @@
 //! out of the root. Content is read with `pread`, never mapped.
 
 use crate::refuse::RefuseAt as _;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{IoSlice, Read, Write};
 use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
@@ -62,7 +83,8 @@ use std::time::Instant;
 
 use bulkload_proto::frame::{
     data_prefix, manifest_root, wire_id, ChunkSpec, Control, DataHeader, Decision, Frame,
-    DATA_HEADER_BYTES, FRAME_HEADER_BYTES, MAX_DATA_PAYLOAD, MAX_FRAME_BYTES, TAG_DATA,
+    SidecarId, SqliteMode, DATA_HEADER_BYTES, FRAME_HEADER_BYTES, MAX_DATA_PAYLOAD,
+    MAX_FRAME_BYTES, TAG_DATA,
 };
 use bulkload_proto::{FileKind, PROTO_VERSION};
 
@@ -74,7 +96,7 @@ use crate::materialize::{
     PublishSink, SharedDisplaced, StagedFile,
 };
 use crate::transfer_store::{
-    row_key, ChunkHint, LedgerItem, LedgerRecord, LedgerSink, Manifest, OutputRecord,
+    row_key, sqlite_key, ChunkHint, LedgerItem, LedgerRecord, LedgerSink, Manifest, OutputRecord,
     PublisherSide, RefusedOutput, RefusedSeat, Store,
 };
 use crate::walk::{WalkItem, Walker};
@@ -111,6 +133,79 @@ const MAX_MANIFEST_CHUNKS: usize = 131_072;
 /// Header bytes a capture reads before it can refuse a `SQLite` database or
 /// WAL by its magic (#186).
 const SNIFF_BYTES: u64 = 16;
+/// Bytes of `SQLite` snapshot slots the source keeps at once, streamed or
+/// kept for chunk requests (#218, design D9: the salvage bound's figure;
+/// unruled). Every slot is reserved before its backup and holds its
+/// reservation until it is removed (#218 review); a capture thread waits
+/// up to [`crate::provider_sqlite::CARRY_WALL`] for room. A store whose
+/// main file and `-wal` together exceed it, or that finds no room in that
+/// time, is refused `BUDGET_EXCEEDED` (not remembered).
+const SLOT_BYTES: u64 = 4 << 30;
+/// The private directory, inside the source state, that holds snapshot
+/// slots (#218). Emptied when `serve` starts: no record depends on a slot.
+const SLOT_DIR: &str = "sqlite-snapshots";
+/// The session's `SQLite` mode when the caller names none: `refuse` (design
+/// D1), unless `--sqlite=` set it for the process.
+static SQLITE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set the process's default [`SqliteMode`] for `copy` and `receive`
+/// (`--sqlite=refuse|snapshot`).
+pub fn set_sqlite_mode(mode: SqliteMode) {
+    SQLITE_MODE.store(mode == SqliteMode::Snapshot, Ordering::Relaxed);
+}
+
+/// The process's default [`SqliteMode`]: `refuse` unless set.
+#[must_use]
+pub fn sqlite_mode() -> SqliteMode {
+    if SQLITE_MODE.load(Ordering::Relaxed) {
+        SqliteMode::Snapshot
+    } else {
+        SqliteMode::Refuse
+    }
+}
+
+/// Parse `--sqlite=`'s value.
+///
+/// # Errors
+/// Refuses anything but `refuse` or `snapshot` `FIELD_DOMAIN_VIOLATION`.
+pub fn parse_sqlite_mode(value: &str) -> Result<SqliteMode> {
+    match value {
+        "refuse" => Ok(SqliteMode::Refuse),
+        "snapshot" => Ok(SqliteMode::Snapshot),
+        _ => Err(BulkloadRefusal::FieldDomainViolation),
+    }
+}
+
+/// The printed name of a [`SqliteMode`], as `--sqlite=` takes it.
+#[must_use]
+pub const fn sqlite_mode_label(mode: SqliteMode) -> &'static str {
+    match mode {
+        SqliteMode::Refuse => "refuse",
+        SqliteMode::Snapshot => "snapshot",
+    }
+}
+
+/// The default S4 disposition ruled for a transfer refusal, if any, from
+/// its code and the `SQLite` result code it carries
+/// ([`BulkloadRefusal::sqlite_code`]).
+///
+/// It is printed beside the refusal: `abandon` for an integrity failure
+/// (OI-1003-Q148: a store that fails its integrity check is not carried,
+/// and is closed as abandoned unless the operator reviews it otherwise).
+/// That is `SQLITE_INTEGRITY_CHECK_FAILED`, and `SQLITE_BACKUP_FAILED` whose
+/// primary code is 11 (`SQLITE_CORRUPT`) or 26 (`SQLITE_NOTADB`): corruption
+/// the backup step itself met, which never reaches `integrity_check` (the
+/// same primary codes a snapshot refusal is remembered by, R10). Transfer
+/// refusals are not yet rows of the closure ledger (WP3 PR 4); until they
+/// are, this is the report's text only, and every other refusal has no
+/// default.
+#[must_use]
+pub fn default_disposition(code: &str, sqlite_code: Option<i32>) -> Option<&'static str> {
+    let integrity = code == BulkloadRefusal::SqliteIntegrityCheckFailed.code()
+        || (code == BulkloadRefusal::SqliteBackupFailed(None).code()
+            && sqlite_code.is_some_and(|sqlite| matches!(sqlite & 0xff, 11 | 26)));
+    integrity.then_some("abandon")
+}
 
 static WALK_NS: AtomicU64 = AtomicU64::new(0);
 static WALK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -143,6 +238,10 @@ pub struct TransferStats {
     pub source_bytes_read: u64,
     /// Relative paths and refusal codes. Contents and credentials are never logged.
     pub refusals: Vec<(Vec<u8>, String)>,
+    /// `SQLite`'s result code of a refusal in [`Self::refusals`] that
+    /// carries one (`SQLITE_BACKUP_FAILED`), by relative path: what
+    /// [`Self::default_disposition`] reads (OI-1003-Q148).
+    pub refusal_sqlite_codes: BTreeMap<Vec<u8>, i32>,
     /// Orphaned temporaries of this destination store removed by name.
     pub temporaries_removed: u64,
     /// Temporary-grammar names left in place because the sweep could not
@@ -163,9 +262,35 @@ pub struct TransferStats {
     /// each asked for by manifest as before (#169;
     /// `transfer_unrowed_unproven`).
     pub unrowed_unproven: u64,
+    /// The session's `SQLite` mode (#218).
+    pub sqlite_mode: SqliteMode,
+    /// Database seats published from a source snapshot, or adopted or reused
+    /// as one (#218), by relative path.
+    pub sqlite_snapshots: Vec<Vec<u8>>,
+    /// Live `-wal`, `-shm` and `-journal` files the source reported beside a
+    /// base that was carried as a snapshot: covered by it, never carried
+    /// (#218), by relative path. A sidecar whose base was not is a refusal.
+    pub sqlite_sidecars_covered: Vec<Vec<u8>>,
 }
 
 impl TransferStats {
+    /// Record a refusal of `rel_path` with `code` and the `SQLite` result
+    /// code it carries, if any.
+    fn refuse(&mut self, rel_path: Vec<u8>, code: String, sqlite_code: Option<i32>) {
+        if let Some(sqlite_code) = sqlite_code {
+            self.refusal_sqlite_codes
+                .insert(rel_path.clone(), sqlite_code);
+        }
+        self.refusals.push((rel_path, code));
+    }
+
+    /// The default S4 disposition of the refusal of `rel_path` with `code`
+    /// ([`default_disposition`], OI-1003-Q148).
+    #[must_use]
+    pub fn default_disposition(&self, rel_path: &[u8], code: &str) -> Option<&'static str> {
+        default_disposition(code, self.refusal_sqlite_codes.get(rel_path).copied())
+    }
+
     /// Refusals that are walk caps (#129): subtrees the source walk did not
     /// carry because they lie past its depth or path-length bound. Each is
     /// also in [`Self::refusals`], by path and code, so a capped subtree is
@@ -326,7 +451,8 @@ fn canonical_state(state: &Path) -> Result<PathBuf> {
     }
 }
 
-/// Run the same framed protocol locally over a bounded Unix stream pair.
+/// Run the same framed protocol locally over a bounded Unix stream pair,
+/// in the process's [`sqlite_mode`].
 ///
 /// # Errors
 /// Refuses overlapping roots, malformed data and transport or source failures.
@@ -335,6 +461,28 @@ pub fn copy(
     destination: &Path,
     source_state: &Path,
     destination_state: &Path,
+) -> Result<TransferStats> {
+    copy_with(
+        source,
+        destination,
+        source_state,
+        destination_state,
+        sqlite_mode(),
+    )
+}
+
+/// [`copy`] in the given [`SqliteMode`] (#218). Its source half is
+/// [`serve`], in this process, so every source rule `serve` applies holds
+/// here too, the root refusal of `snapshot` mode included.
+///
+/// # Errors
+/// As [`copy`].
+pub fn copy_with(
+    source: &Path,
+    destination: &Path,
+    source_state: &Path,
+    destination_state: &Path,
+    sqlite: SqliteMode,
 ) -> Result<TransferStats> {
     let source_root = std::fs::canonicalize(source).refuse_at("transfer::copy")?;
     let destination_root = std::fs::canonicalize(destination).refuse_at("transfer::copy")?;
@@ -382,13 +530,14 @@ pub fn copy(
             .refuse_at("transfer::copy")?;
         let result = {
             let mut output = receiver.try_clone().refuse_at("transfer::copy")?;
-            receive(
+            receive_with(
                 &mut receiver,
                 &mut output,
                 source,
                 source_state,
                 destination,
                 destination_state,
+                sqlite,
             )
         };
         let _ = receiver.shutdown(std::net::Shutdown::Both);
@@ -470,9 +619,13 @@ impl Credit {
 }
 
 /// Chunk bytes held between a fresh manifest and its chunk requests, with
-/// their reservation against [`RETAIN_BYTES`], released on drop.
+/// their reservation against [`RETAIN_BYTES`], released on drop. A `SQLite`
+/// snapshot's manifest keeps its slot file instead, which holds its own
+/// reservation against [`SLOT_BYTES`] (#218): the chunks are read from it
+/// again.
 struct Retained {
     chunks: Vec<Arc<Vec<u8>>>,
+    slot: Option<SlotFile>,
     reserved: u64,
     budget: Arc<AtomicU64>,
 }
@@ -487,9 +640,132 @@ impl Retained {
             .ok()?;
         Some(Self {
             chunks: Vec::new(),
+            slot: None,
             reserved: bytes,
             budget: Arc::clone(budget),
         })
+    }
+
+    /// Keep a snapshot's slot file, which holds its own reservation against
+    /// the slot budget (#218 review): nothing of `budget` is taken.
+    fn slot(budget: &Arc<AtomicU64>, slot: SlotFile) -> Self {
+        Self {
+            chunks: Vec::new(),
+            slot: Some(slot),
+            reserved: 0,
+            budget: Arc::clone(budget),
+        }
+    }
+}
+
+/// A `SQLite` snapshot the source took into its private state (#218): open
+/// for reading, and removed when dropped, at the end of the entry's content
+/// (its streamed `End`, or the chunk requests after its manifest), on a
+/// refusal and when the session ends. A crash leaves it for the next
+/// `serve`, which empties the slot directory: no record depends on a slot.
+struct SlotFile {
+    file: std::fs::File,
+    path: PathBuf,
+    /// Its share of the slot budget, given back once the file is removed.
+    reserved: SlotReservation,
+}
+
+impl Drop for SlotFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The source's budget of snapshot slot bytes alive at once (#218 review,
+/// [`SLOT_BYTES`]): every slot, streamed or kept for a manifest, is
+/// reserved before its backup writes it and given back once it is removed,
+/// so the slots of every capture thread together never pass it.
+struct SlotBudget {
+    total: u64,
+    left: Mutex<u64>,
+    freed: Condvar,
+}
+
+impl SlotBudget {
+    const fn new(total: u64) -> Self {
+        Self {
+            total,
+            left: Mutex::new(total),
+            freed: Condvar::new(),
+        }
+    }
+
+    /// Reserve `bytes`, waiting at most `wait` for other slots to be
+    /// removed; `None` when they still do not fit, or never could.
+    fn reserve(self: &Arc<Self>, bytes: u64, wait: std::time::Duration) -> Option<SlotReservation> {
+        if bytes > self.total {
+            return None;
+        }
+        let deadline = Instant::now() + wait;
+        let mut left = self.left.lock().unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if *left >= bytes {
+                *left -= bytes;
+                return Some(SlotReservation {
+                    budget: Arc::clone(self),
+                    bytes,
+                });
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            left = self
+                .freed
+                .wait_timeout(left, remaining)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+}
+
+/// One slot's share of the [`SlotBudget`], given back when dropped.
+struct SlotReservation {
+    budget: Arc<SlotBudget>,
+    bytes: u64,
+}
+
+impl SlotReservation {
+    /// Make this reservation exactly `bytes`: what is over is given back at
+    /// once; more is taken only when it is free now. `false` when it is not.
+    fn true_up(&mut self, bytes: u64) -> bool {
+        let mut left = self
+            .budget
+            .left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let fits = bytes <= self.bytes || *left >= bytes - self.bytes;
+        if fits {
+            // `left + self.bytes` is at most twice the budget, and at
+            // least `bytes` when it fits.
+            *left = (*left + self.bytes) - bytes;
+        }
+        drop(left);
+        if !fits {
+            return false;
+        }
+        let shrunk = bytes < self.bytes;
+        self.bytes = bytes;
+        if shrunk {
+            self.budget.freed.notify_all();
+        }
+        true
+    }
+}
+
+impl Drop for SlotReservation {
+    fn drop(&mut self) {
+        *self
+            .budget
+            .left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += self.bytes;
+        self.budget.freed.notify_all();
     }
 }
 
@@ -499,12 +775,21 @@ impl Drop for Retained {
     }
 }
 
-/// Work for a capture thread.
+/// Work for a capture thread. `wal`: the `-wal` identity the walk offered
+/// with the entry (#218), which keys its remembered snapshot refusals.
 enum Job {
     /// Read, chunk and stream entry `entry`.
-    Send { entry: u64, row: Arc<RowSchema> },
+    Send {
+        entry: u64,
+        row: Arc<RowSchema>,
+        wal: Option<SidecarId>,
+    },
     /// Produce entry `entry`'s manifest, from the ledger when it can.
-    Manifest { entry: u64, row: Arc<RowSchema> },
+    Manifest {
+        entry: u64,
+        row: Arc<RowSchema>,
+        wal: Option<SidecarId>,
+    },
     /// Send the requested chunks of an offered manifest, then `End`.
     Serve {
         entry: u64,
@@ -544,6 +829,13 @@ enum Event {
         header: DataHeader,
         data: Arc<Vec<u8>>,
     },
+    /// An entry's content is a `SQLite` snapshot (#218): sent before its
+    /// first chunk or its manifest.
+    Snapshot {
+        entry: u64,
+        size: u64,
+        wal: Option<SidecarId>,
+    },
     Manifest {
         entry: u64,
         /// The row key to record, for a manifest that is not yet in the ledger.
@@ -570,8 +862,9 @@ enum Event {
         entry: u64,
         refusal: BulkloadRefusal,
         bytes_read: u64,
-        /// The refusal to remember under this row key (#186): the seat's
-        /// header gave it, and the seat was not racy when it was sniffed.
+        /// The refusal to remember under this key (#186): the seat's bytes
+        /// alone gave it, and the seat was not racy when it was read (its
+        /// row key, or for a snapshot refusal its snapshot key, #218).
         remember: Option<(Vec<u8>, RefusedSeat)>,
     },
 }
@@ -771,9 +1064,200 @@ fn after_sniff(root: &Path) {
     }
 }
 
+/// Test-only: who a `snapshot`-mode session's source half takes itself to
+/// be, by canonical source root. Unit tests of what the source does once it
+/// may read run as root in CI, so they assume an ordinary user; tests of the
+/// refusals assume root, or another user than a database's owner. The
+/// refusals themselves are proved with the real uid as well
+/// (`tests/sqlite_carry.rs`), as the provider's `assume_unprivileged` seam
+/// is.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+enum AssumeUid {
+    /// Not root; the real effective uid otherwise.
+    Unprivileged,
+    /// Root.
+    Root,
+    /// This effective uid, not root.
+    Euid(u32),
+}
+
+#[cfg(test)]
+static ASSUMED_UID: Mutex<Vec<(PathBuf, AssumeUid)>> = Mutex::new(Vec::new());
+
+/// Test-only: assume `uid` for `root`'s sessions (`None` stops).
+#[cfg(test)]
+fn assume_uid(root: &Path, uid: Option<AssumeUid>) {
+    let mut roots = ASSUMED_UID.lock().unwrap_or_else(PoisonError::into_inner);
+    roots.retain(|(known, _)| known != root);
+    if let Some(uid) = uid {
+        roots.push((root.to_path_buf(), uid));
+    }
+}
+
+#[cfg(test)]
+fn assumed_uid(root: &Path) -> Option<AssumeUid> {
+    ASSUMED_UID
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(known, _)| known == root)
+        .map(|(_, uid)| *uid)
+}
+
+/// Whether a `snapshot`-mode source would open its databases as root
+/// (OI-1003-Q76): the effective uid is 0.
+#[cfg(not(test))]
+fn reads_as_root(_root: &Path) -> bool {
+    crate::io::sys::effective_uid() == 0
+}
+
+/// Whether a `snapshot`-mode source would open its databases as root; unit
+/// tests may assume otherwise for a root ([`assume_uid`]).
+#[cfg(test)]
+fn reads_as_root(root: &Path) -> bool {
+    match assumed_uid(root) {
+        Some(AssumeUid::Root) => true,
+        Some(AssumeUid::Unprivileged | AssumeUid::Euid(_)) => false,
+        None => crate::io::sys::effective_uid() == 0,
+    }
+}
+
+/// The effective uid a database seat's owner is compared with (#218, R4).
+#[cfg(not(test))]
+fn source_euid(_root: &Path) -> u32 {
+    crate::io::sys::effective_uid()
+}
+
+/// The effective uid a database seat's owner is compared with; unit tests
+/// may assume another ([`assume_uid`]).
+#[cfg(test)]
+fn source_euid(root: &Path) -> u32 {
+    match assumed_uid(root) {
+        Some(AssumeUid::Euid(uid)) => uid,
+        _ => crate::io::sys::effective_uid(),
+    }
+}
+
+/// Test-only hooks by canonical source root, run once a snapshot's backup
+/// and its post-stat are done and before its slot is chunked (#218, review
+/// R12): where a writer's commit must not reach the carried bytes.
+#[cfg(test)]
+static AFTER_SNAPSHOT: Mutex<Vec<(PathBuf, CaptureHook)>> = Mutex::new(Vec::new());
+
+/// Set (or, with `None`, clear) the after-snapshot hook of a canonical
+/// source root.
+#[cfg(test)]
+fn set_after_snapshot(root: &Path, hook: Option<CaptureHook>) {
+    let mut hooks = AFTER_SNAPSHOT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    hooks.retain(|(hooked_root, _)| hooked_root != root);
+    if let Some(hook) = hook {
+        hooks.push((root.to_path_buf(), hook));
+    }
+}
+
+#[cfg(test)]
+fn after_snapshot(root: &Path) {
+    let hook = AFTER_SNAPSHOT
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(hooked_root, _)| hooked_root == root)
+        .map(|(_, hook)| Arc::clone(hook));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Test-only hooks by canonical source root, run inside a snapshot's backup
+/// lock, after its pre-stats and before `SQLite` opens the seat by its path
+/// (#218 review, R9): where a directory swapped for a symlink would be
+/// followed.
+#[cfg(test)]
+static BEFORE_BACKUP: Mutex<Vec<(PathBuf, CaptureHook)>> = Mutex::new(Vec::new());
+
+/// Set (or, with `None`, clear) the before-backup hook of a canonical source
+/// root.
+#[cfg(test)]
+fn set_before_backup(root: &Path, hook: Option<CaptureHook>) {
+    let mut hooks = BEFORE_BACKUP.lock().unwrap_or_else(PoisonError::into_inner);
+    hooks.retain(|(hooked_root, _)| hooked_root != root);
+    if let Some(hook) = hook {
+        hooks.push((root.to_path_buf(), hook));
+    }
+}
+
+#[cfg(test)]
+fn before_backup(root: &Path) {
+    let hook = BEFORE_BACKUP
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(hooked_root, _)| hooked_root == root)
+        .map(|(_, hook)| Arc::clone(hook));
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: this thread holds its `serve`'s backup lock.
+    static HOLDS_BACKUP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: sniffed database descriptors closed by a thread that did not
+/// hold the backup lock (#218 review: such a close drops every POSIX lock
+/// this process holds on the inode, a live backup's included).
+#[cfg(test)]
+static SNIFF_CLOSED_UNLOCKED: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only: marks this thread as holding the backup lock while alive.
+#[cfg(test)]
+struct BackupHeld;
+
+#[cfg(test)]
+impl BackupHeld {
+    fn mark() -> Self {
+        HOLDS_BACKUP.set(true);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for BackupHeld {
+    fn drop(&mut self) {
+        HOLDS_BACKUP.set(false);
+    }
+}
+
+/// The retained-slot budget; tests set a smaller one per source root.
+#[cfg(not(test))]
+const fn slot_budget(_root: &Path) -> u64 {
+    SLOT_BYTES
+}
+
+/// The retained-slot budget; tests set a smaller one per source root.
+#[cfg(test)]
+fn slot_budget(root: &Path) -> u64 {
+    SLOT_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(override_root, _)| override_root == root)
+        .map_or(SLOT_BYTES, |(_, bytes)| *bytes)
+}
+
+/// Test-only slot budgets by canonical source root.
+#[cfg(test)]
+static SLOT_OVERRIDE: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
 /// What every capture thread shares.
 struct SourceWork<'a> {
     /// The canonical source root, which keys test-only hooks and clocks.
+    /// `SQLite` opens a snapshot seat by its path beneath it (#218, R9).
     root: &'a Path,
     /// The source root every read resolves beneath, component by component.
     root_fd: BorrowedFd<'a>,
@@ -784,6 +1268,20 @@ struct SourceWork<'a> {
     /// How this session's ledger rows are committed (WP0(g)); it also says
     /// how a ledger read that fails is answered ([`ledger_read`]).
     ledger: LedgerSync,
+    /// The session's `SQLite` mode (#218).
+    sqlite: SqliteMode,
+    /// The effective uid: a database seat owned by another is refused
+    /// `SQLITE_SOURCE_NOT_OWNER` before `SQLite` opens it (#218, R4).
+    euid: u32,
+    /// The provider's own root refusal (OI-1003-Q76), passed through; a
+    /// `snapshot`-mode session as root is refused at `Open` already.
+    as_root: bool,
+    /// One backup at a time per `serve` (#218, design D9).
+    backup: &'a Mutex<()>,
+    /// The private slot directory snapshots are written to (#218).
+    slots: &'a Path,
+    /// What is left of [`SLOT_BYTES`] for slots alive at once.
+    slot_budget: Arc<SlotBudget>,
 }
 
 /// Walk-ahead slots: the walk thread takes one per item it hands over, and
@@ -890,20 +1388,7 @@ fn walk_source<I: IntoIterator<Item = WalkItem>>(
 /// Refuses malformed frames, a peer on another wire, unsafe state roots,
 /// source failures and broken I/O.
 pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -> Result<()> {
-    let Frame::Control(Control::Open {
-        proto,
-        wire_id: id,
-        root,
-        state,
-    }) = read_frame(&mut input)?
-    else {
-        return Err(BulkloadRefusal::ProtocolStateViolation);
-    };
-    if proto != PROTO_VERSION || id != wire_id() {
-        return Err(BulkloadRefusal::FrameCodec);
-    }
-    let root = std::fs::canonicalize(path(root)).refuse_at("transfer::serve")?;
-    let state = path(state);
+    let (root, state, sqlite, as_root) = read_open(&mut input)?;
     // S2 (WP1 PR 3): refuse before `Store::open` creates the state root, so
     // an overlapping state never writes a byte inside the source.
     if overlaps(&canonical_state(&state)?, &root) {
@@ -940,7 +1425,9 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
             authority: authority.clone(),
         },
     )?;
-    let walker = Walker::new(root_fd.as_fd(), true)?;
+    let walker = Walker::new(root_fd.as_fd(), true)?.with_sqlite(sqlite == SqliteMode::Snapshot);
+    let slots = open_slots(store.root(), sqlite)?;
+    let backup = Mutex::new(());
     let credit = Arc::new(Credit::new());
     let gate = WalkGate::new();
     let (events_sender, events) = std::sync::mpsc::channel();
@@ -953,6 +1440,12 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         credit: &credit,
         retain: Arc::new(AtomicU64::new(retain_budget(&root))),
         ledger,
+        sqlite,
+        euid: source_euid(&root),
+        as_root,
+        backup: &backup,
+        slots: &slots,
+        slot_budget: Arc::new(SlotBudget::new(slot_budget(&root))),
     };
     let (jobs, job_queue) = std::sync::mpsc::channel();
     let job_queue = Mutex::new(job_queue);
@@ -994,6 +1487,67 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
         },
     )?;
     committer.finish()?
+}
+
+/// Read the session's `Open`: the canonical source root, the private state,
+/// the `SQLite` mode, and whether a database would be opened as root.
+///
+/// The root is canonical: `SQLite` opens a snapshot seat by its path
+/// beneath it, so no component of the root may be a symlink
+/// `SQLITE_OPEN_NOFOLLOW` would refuse (#218, R9); the root descriptor is
+/// opened from the same path. A `snapshot`-mode session as root is refused
+/// here (OI-1003-Q76, #218): it would open databases WAL-aware, and as root
+/// `SQLite` re-applies their owner to the `-wal` and `-shm` it opens. That
+/// is before any store is created or anything beneath the root is opened,
+/// and `copy` runs [`serve`] as its source half, so the one check covers
+/// both verbs (R14).
+fn read_open<R: Read>(input: &mut R) -> Result<(PathBuf, PathBuf, SqliteMode, bool)> {
+    let Frame::Control(Control::Open {
+        proto,
+        wire_id: id,
+        root,
+        state,
+        sqlite,
+    }) = read_frame(input)?
+    else {
+        return Err(BulkloadRefusal::ProtocolStateViolation);
+    };
+    if proto != PROTO_VERSION || id != wire_id() {
+        return Err(BulkloadRefusal::FrameCodec);
+    }
+    let root = std::fs::canonicalize(path(root)).refuse_at("transfer::serve")?;
+    let as_root = reads_as_root(&root);
+    if sqlite == SqliteMode::Snapshot && as_root {
+        return Err(BulkloadRefusal::SqliteSourceAsRoot);
+    }
+    Ok((root, path(state), sqlite, as_root))
+}
+
+/// The private directory snapshot slots are written to (#218), emptied of
+/// whatever a crashed session left: no record depends on a slot. Created
+/// (mode 0700, inside the private state root) only in `snapshot` mode; in
+/// `refuse` mode an existing one is still emptied.
+fn open_slots(state: &Path, sqlite: SqliteMode) -> Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    let slots = state.join(SLOT_DIR);
+    if sqlite == SqliteMode::Snapshot {
+        match std::fs::DirBuilder::new().mode(0o700).create(&slots) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(crate::refuse::io(&error, "transfer::open_slots")),
+        }
+    }
+    match std::fs::read_dir(&slots) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.refuse_at("transfer::open_slots")?;
+                std::fs::remove_file(entry.path()).refuse_at("transfer::open_slots")?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(crate::refuse::io(&error, "transfer::open_slots")),
+    }
+    Ok(slots)
 }
 
 /// Read the destination's frames for the whole session: credit is granted
@@ -1043,14 +1597,18 @@ struct Outbound<'a, W> {
     committer: &'a Committer<LedgerSink>,
     jobs: Sender<Job>,
     gate: &'a WalkGate,
-    /// Walked rows not yet offered, in walk order.
-    pending: VecDeque<RowSchema>,
+    /// Walked rows not yet offered, in walk order, each with its `-wal`'s
+    /// identity in `snapshot` mode (#218).
+    pending: VecDeque<(RowSchema, Option<SidecarId>)>,
     /// Whether the walk thread has yielded its last item.
     walked: bool,
     /// One slot per offered entry, by entry number.
     entries: Vec<SourceEntry>,
     /// Each offered entry's row, dropped once the entry is retired.
     rows: Vec<Option<Arc<RowSchema>>>,
+    /// The `-wal` identity an undecided entry was offered with (#218); few
+    /// entries have one.
+    wals: HashMap<u64, SidecarId>,
     undecided: usize,
     walk_done: bool,
     queue: VecDeque<Job>,
@@ -1080,6 +1638,7 @@ fn send_entries<W: Write>(
         walked: false,
         entries: Vec::new(),
         rows: Vec::new(),
+        wals: HashMap::new(),
         undecided: 0,
         walk_done: false,
         queue: VecDeque::new(),
@@ -1106,7 +1665,7 @@ impl<W: Write> Outbound<'_, W> {
     /// active bound.
     fn offer(&mut self) -> Result<()> {
         while self.undecided < ENTRY_WINDOW {
-            let Some(row) = self.pending.pop_front() else {
+            let Some((row, wal)) = self.pending.pop_front() else {
                 break;
             };
             let entry = self.entries.len() as u64;
@@ -1115,8 +1674,12 @@ impl<W: Write> Outbound<'_, W> {
                 &Control::Entry {
                     entry,
                     row: row.clone(),
+                    wal,
                 },
             )?;
+            if let Some(wal) = wal {
+                self.wals.insert(entry, wal);
+            }
             self.gate.give();
             self.entries.push(SourceEntry::Undecided);
             self.rows.push(Some(Arc::new(row)));
@@ -1180,8 +1743,17 @@ impl<W: Write> Outbound<'_, W> {
         match item {
             WalkItem::Row(row) => {
                 // Its walk-ahead slot is given back once it is offered.
-                self.pending.push_back(row);
+                self.pending.push_back((row, None));
                 return Ok(());
+            }
+            WalkItem::RowWithWal(row, wal) => {
+                self.pending.push_back((row, Some(wal)));
+                return Ok(());
+            }
+            // Recorded, never carried: the receiver binds it to its base's
+            // outcome (#218, R2).
+            WalkItem::SqliteSidecar { rel_path, database } => {
+                write_control(self.output, &Control::SqliteSidecar { rel_path, database })?;
             }
             WalkItem::Refused(seat) => write_control(
                 self.output,
@@ -1189,6 +1761,7 @@ impl<W: Write> Outbound<'_, W> {
                     entry: None,
                     rel_path: seat.rel_path,
                     code: seat.refusal.code().to_owned(),
+                    sqlite_code: seat.refusal.sqlite_code(),
                 },
             )?,
             // Recorded, never carried: the receiver reports each one (R-N79).
@@ -1208,6 +1781,7 @@ impl<W: Write> Outbound<'_, W> {
             Event::Decide { entry, decision } => self.decide(entry, &decision)?,
             Event::NeedChunks { entry, indices } => self.need_chunks(entry, indices)?,
             Event::Chunk { header, data } => write_data(self.output, &header, &data)?,
+            Event::Snapshot { entry, size, wal } => self.snapshot(entry, size, wal)?,
             Event::Manifest {
                 entry,
                 record,
@@ -1300,6 +1874,7 @@ impl<W: Write> Outbound<'_, W> {
                         entry: Some(entry),
                         rel_path: row.rel_path.clone(),
                         code: refusal.code().to_owned(),
+                        sqlite_code: refusal.sqlite_code(),
                     },
                 )?;
             }
@@ -1307,7 +1882,18 @@ impl<W: Write> Outbound<'_, W> {
         Ok(())
     }
 
+    /// Announce an entry's content as a snapshot (#218): only while its
+    /// job is on a capture thread.
+    fn snapshot(&mut self, entry: u64, size: u64, wal: Option<SidecarId>) -> Result<()> {
+        let (slot, _) = self.slot(entry)?;
+        if !matches!(slot, SourceEntry::Queued | SourceEntry::Working) {
+            return Err(BulkloadRefusal::ProtocolStateViolation);
+        }
+        write_control(self.output, &Control::SqliteSnapshot { entry, size, wal })
+    }
+
     fn decide(&mut self, entry: u64, decision: &Decision) -> Result<()> {
+        let wal = self.wals.remove(&entry);
         let (slot, held) = self.slot(entry)?;
         if !matches!(slot, SourceEntry::Undecided) {
             return Err(BulkloadRefusal::ProtocolStateViolation);
@@ -1330,6 +1916,7 @@ impl<W: Write> Outbound<'_, W> {
                 Some(Job::Send {
                     entry,
                     row: Arc::clone(row),
+                    wal,
                 }),
             ),
             Decision::WantManifest => (
@@ -1337,6 +1924,7 @@ impl<W: Write> Outbound<'_, W> {
                 Some(Job::Manifest {
                     entry,
                     row: Arc::clone(row),
+                    wal,
                 }),
             ),
         };
@@ -1410,19 +1998,34 @@ fn capture_worker(work: &SourceWork<'_>, jobs: &Mutex<Receiver<Job>>, events: &S
 
 fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event>) -> Event {
     let mut bytes_read = 0;
-    // What a capture's header sniff refused, to remember (#186).
+    // What a capture's own bytes refused, to remember, and under which key
+    // (#186; a snapshot's under its snapshot key, #218).
     let mut sniffed = None;
-    let (entry, seat, outcome) = match job {
-        Job::Send { entry, row } => {
-            let outcome = remembered_refusal(work, store, &row).and_then(|()| {
-                send_capture(work, entry, &row, events, &mut bytes_read, &mut sniffed)
+    let (entry, outcome) = match job {
+        Job::Send { entry, row, wal } => {
+            let outcome = remembered_refusal(work, store, &row, wal.as_ref()).and_then(|()| {
+                send_capture(
+                    work,
+                    (entry, &row, wal.as_ref()),
+                    false,
+                    events,
+                    &mut bytes_read,
+                    &mut sniffed,
+                )
             });
-            (entry, Some(row), outcome)
+            (entry, outcome)
         }
-        Job::Manifest { entry, row } => {
-            let outcome = remembered_refusal(work, store, &row).and_then(|()| {
-                match manifest_capture(work, store, &row, &mut bytes_read, &mut sniffed) {
-                    Ok(Some((record, manifest, retained, racy))) => Ok(Event::Manifest {
+        Job::Manifest { entry, row, wal } => {
+            let outcome = remembered_refusal(work, store, &row, wal.as_ref()).and_then(|()| {
+                match manifest_capture(
+                    work,
+                    store,
+                    (entry, &row, wal.as_ref()),
+                    events,
+                    &mut bytes_read,
+                    &mut sniffed,
+                ) {
+                    Ok(Offered::Offer((record, manifest, retained, racy))) => Ok(Event::Manifest {
                         entry,
                         record,
                         manifest,
@@ -1430,17 +2033,28 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
                         racy,
                         bytes_read,
                     }),
+                    // A snapshot seat: its manifest, or its streamed content
+                    // when its slot could not be kept (#218).
+                    Ok(Offered::Done(event)) => Ok(event),
                     // No ledger row and no room to keep the chunks: building
                     // a manifest first would read the seat twice (R25).
                     // Stream it instead; the destination takes data in place
-                    // of a manifest.
-                    Ok(None) => {
-                        send_capture(work, entry, &row, events, &mut bytes_read, &mut sniffed)
-                    }
+                    // of a manifest. A database seat is still offered as a
+                    // manifest: its slot, not memory, keeps its chunks, so
+                    // the slot budget alone decides (#218 review, design
+                    // 5.6).
+                    Ok(Offered::NoRoom) => send_capture(
+                        work,
+                        (entry, &row, wal.as_ref()),
+                        true,
+                        events,
+                        &mut bytes_read,
+                        &mut sniffed,
+                    ),
                     Err(refusal) => Err(refusal),
                 }
             });
-            (entry, Some(row), outcome)
+            (entry, outcome)
         }
         Job::Serve {
             entry,
@@ -1452,7 +2066,6 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
             racy,
         } => (
             entry,
-            None,
             serve_chunks(
                 work,
                 entry,
@@ -1488,11 +2101,7 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
         entry,
         refusal,
         bytes_read,
-        // Remembered under the seat's row key, as a capture would be.
-        remember: sniffed.and_then(|refused| {
-            let row = seat.as_ref()?;
-            Some((row_key(work.authority, row).ok()?, refused))
-        }),
+        remember: sniffed,
     })
 }
 
@@ -1500,44 +2109,75 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
 /// row key (its path and stat identity) is refused again from that record,
 /// with the same code, before the file is opened: 0 source bytes. A seat
 /// whose identity moved has another key, and is sniffed again.
-fn remembered_refusal(work: &SourceWork<'_>, store: &Store, row: &RowSchema) -> Result<()> {
-    ledger_read(
+///
+/// The records depend on the session's mode (#218, R8): `refuse` mode
+/// honours the v5 header record and the WAL-header record; `snapshot` mode
+/// honours the WAL-header record, ignores the v5 one (it does not say which
+/// magic was seen: the seat is sniffed once more), and honours a snapshot
+/// refusal under the seat's snapshot key, its row and the `-wal` identity
+/// the walk offered.
+fn remembered_refusal(
+    work: &SourceWork<'_>,
+    store: &Store,
+    row: &RowSchema,
+    wal: Option<&SidecarId>,
+) -> Result<()> {
+    let by_row = ledger_read(
         work.ledger,
         store.refused_seat(&row_key(work.authority, row)?),
     )?
-    .map_or(Ok(()), |refused| {
+    .filter(|refused| work.sqlite == SqliteMode::Refuse || *refused != RefusedSeat::SqliteHeader);
+    let refused = match by_row {
+        Some(refused) => Some(refused),
+        None if work.sqlite == SqliteMode::Snapshot && row.kind == FileKind::Regular => {
+            ledger_read(
+                work.ledger,
+                store.refused_seat(&sqlite_key(work.authority, row, wal)?),
+            )?
+        }
+        None => None,
+    };
+    refused.map_or(Ok(()), |refused| {
         counters::bump(Counter::TransferRefusedSeatsRemembered);
         Err(refused.refusal())
     })
 }
 
+/// One offered seat: its entry, its row and the `-wal` identity the walk
+/// offered beside it (#218).
+type Offering<'s> = (u64, &'s RowSchema, Option<&'s SidecarId>);
+
 /// Read, chunk and stream one file; its `End` carries the capture to record.
+/// A database seat in `snapshot` mode is snapshotted instead (#218): its
+/// manifest is offered when `want_manifest` (the destination asked for one),
+/// its content streamed otherwise.
 fn send_capture(
     work: &SourceWork<'_>,
-    entry: u64,
-    row: &RowSchema,
+    (entry, row, wal): Offering<'_>,
+    want_manifest: bool,
     events: &Sender<Event>,
     bytes_read: &mut u64,
-    sniffed: &mut Option<RefusedSeat>,
+    sniffed: &mut Option<(Vec<u8>, RefusedSeat)>,
 ) -> Result<Event> {
     let key = row_key(work.authority, row)?;
     let sink = |index, offset, digest, data: Vec<u8>| {
-        let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
-        work.credit.acquire(u64::from(size))?;
-        events
-            .send(Event::Chunk {
-                header: DataHeader {
-                    entry,
-                    index,
-                    size,
-                    offset,
-                    digest,
-                },
-                data: Arc::new(data),
-            })
-            .map_err(|_| BulkloadRefusal::WorkerLost)
+        send_chunk(work, events, entry, index, offset, digest, data)
     };
-    let (chunks, racy) = capture_file(work, row, bytes_read, sniffed, sink)?;
+    let (chunks, racy) = match capture_file(work, row, wal, bytes_read, sniffed, sink)? {
+        Captured::Raw(chunks, racy) => (chunks, racy),
+        Captured::Database(opened) => {
+            return snapshot_seat(
+                work,
+                entry,
+                row,
+                opened,
+                want_manifest,
+                events,
+                bytes_read,
+                sniffed,
+            );
+        }
+    };
     let manifest = Manifest::new(chunks);
     Ok(Event::End {
         entry,
@@ -1553,10 +2193,48 @@ fn send_capture(
     })
 }
 
+/// Hand one chunk to the sending thread, once its credit is taken.
+fn send_chunk(
+    work: &SourceWork<'_>,
+    events: &Sender<Event>,
+    entry: u64,
+    index: u32,
+    offset: u64,
+    digest: [u8; 32],
+    data: Vec<u8>,
+) -> Result<()> {
+    let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+    work.credit.acquire(u64::from(size))?;
+    events
+        .send(Event::Chunk {
+            header: DataHeader {
+                entry,
+                index,
+                size,
+                offset,
+                digest,
+            },
+            data: Arc::new(data),
+        })
+        .map_err(|_| BulkloadRefusal::WorkerLost)
+}
+
 /// A manifest to offer: the row key to record (none when it came from the
 /// ledger, or when the capture was racy), the manifest, its retained chunks,
 /// and whether the capture was racy (#86).
 type Offer = (Option<Vec<u8>>, Manifest, Option<Retained>, bool);
+
+/// What a manifest job produced.
+enum Offered {
+    /// A manifest to offer.
+    Offer(Offer),
+    /// No ledger row, and the file does not fit the retention budget: the
+    /// caller streams it instead.
+    NoRoom,
+    /// A snapshot seat's whole answer (#218): its manifest, or its content
+    /// streamed in place of one.
+    Done(Event),
+}
 
 /// A source ledger read, as WP0(g) answers it (OI-1003-Q37: "a corrupt or
 /// absent source ledger is treated as empty"). Under
@@ -1576,20 +2254,28 @@ fn ledger_read<T>(mode: LedgerSync, read: Result<Option<T>>) -> Result<Option<T>
 
 /// One entry's manifest: from the ledger when this exact stat identity is
 /// recorded (no source read), otherwise from one read of the file, whose
-/// chunks are all kept in memory for the requests that follow. `None` when
-/// the retention budget cannot hold the file: the caller streams it instead
-/// of reading it twice (#77 review F1).
+/// chunks are all kept in memory for the requests that follow.
+/// [`Offered::NoRoom`] when the retention budget cannot hold the file: the
+/// caller streams it instead of reading it twice (#77 review F1). A
+/// database seat in `snapshot` mode is snapshotted instead (#218).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one capture job's inputs, each used once"
+)]
 fn manifest_capture(
     work: &SourceWork<'_>,
     store: &Store,
-    row: &RowSchema,
+    (entry, row, wal): Offering<'_>,
+    events: &Sender<Event>,
     bytes_read: &mut u64,
-    sniffed: &mut Option<RefusedSeat>,
-) -> Result<Option<Offer>> {
+    sniffed: &mut Option<(Vec<u8>, RefusedSeat)>,
+) -> Result<Offered> {
     let key = row_key(work.authority, row)?;
+    // A database seat is never recorded, so a ledger row names a file that
+    // was carried raw under this exact identity.
     if let Some(manifest) = ledger_read(work.ledger, store.capture(&key))? {
         if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
-            return Ok(Some((None, manifest, None, false)));
+            return Ok(Offered::Offer((None, manifest, None, false)));
         }
     }
     // The ledger has no usable row under this key, so the seat is read to
@@ -1599,23 +2285,31 @@ fn manifest_capture(
     // Every chunk a fresh manifest names must be kept, so the requests that
     // follow are served from memory: a seat is read at most once a session.
     let Some(mut retained) = Retained::reserve(&work.retain, row.size) else {
-        return Ok(None);
+        return Ok(Offered::NoRoom);
     };
-    let (chunks, racy) = capture_file(work, row, bytes_read, sniffed, |_, _, _, data| {
+    let captured = capture_file(work, row, wal, bytes_read, sniffed, |_, _, _, data| {
         retained.chunks.push(Arc::new(data));
         Ok(())
     })?;
-    Ok(Some((
-        (!racy).then_some(key),
-        Manifest::new(chunks),
-        Some(retained),
-        racy,
-    )))
+    match captured {
+        Captured::Raw(chunks, racy) => Ok(Offered::Offer((
+            (!racy).then_some(key),
+            Manifest::new(chunks),
+            Some(retained),
+            racy,
+        ))),
+        Captured::Database(opened) => {
+            drop(retained);
+            snapshot_seat(work, entry, row, opened, true, events, bytes_read, sniffed)
+                .map(Offered::Done)
+        }
+    }
 }
 
 /// Send the requested chunks of an offered manifest, from memory when they
-/// were retained, otherwise read again at their offsets and re-verified
-/// against the manifest under an unchanged stat identity.
+/// were retained, from its snapshot slot for a `SQLite` snapshot (#218),
+/// otherwise read again at their offsets and re-verified against the
+/// manifest under an unchanged stat identity.
 #[allow(
     clippy::too_many_arguments,
     reason = "one capture job's inputs, each used once"
@@ -1638,8 +2332,10 @@ fn serve_chunks(
             .checked_add(chunk.size)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
     }
-    let held = retained.filter(|held| held.chunks.len() == manifest.chunks.len());
-    let opened = if held.is_none() && !indices.is_empty() {
+    let slot = retained.and_then(|held| held.slot.as_ref());
+    let held =
+        retained.filter(|held| held.slot.is_none() && held.chunks.len() == manifest.chunks.len());
+    let opened = if held.is_none() && slot.is_none() && !indices.is_empty() {
         let file = open_source(work, row)?;
         if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::serve_chunks")?)
             != StatIdentity::from_row(row)
@@ -1665,6 +2361,8 @@ fn serve_chunks(
                     .get(at)
                     .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
             )
+        } else if let Some(slot) = slot {
+            slot_chunk(slot, spec, offset)?
         } else {
             let file = opened
                 .as_ref()
@@ -1715,11 +2413,98 @@ fn serve_chunks(
         root: manifest.root,
         chunks: u32::try_from(manifest.chunks.len())
             .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
-        size: row.size,
+        // The manifest's own size: a snapshot's is not its row's (#218).
+        size: manifest.size().unwrap_or(row.size),
         // The caller sets the offer's own `racy`.
         racy: false,
         bytes_read: *bytes_read,
     })
+}
+
+/// One chunk of the snapshot a manifest was built from, read again from its
+/// slot and checked against its digest: private state, not a source read
+/// (#218).
+fn slot_chunk(slot: &SlotFile, spec: &ChunkSpec, offset: u64) -> Result<Arc<Vec<u8>>> {
+    let mut data =
+        vec![0_u8; usize::try_from(spec.size).map_err(|_| BulkloadRefusal::BudgetExceeded)?];
+    let read = crate::io::sys::pread_full(&slot.file, &mut data, offset)
+        .refuse_at("transfer::slot_chunk")?;
+    counters::add_len(Counter::SourceSnapshotRead, read);
+    if read != data.len() || counters::hash(Counter::HashCaptureChunk, &data) != spec.digest {
+        return Err(BulkloadRefusal::DigestMismatch);
+    }
+    Ok(Arc::new(data))
+}
+
+/// What [`capture_file`] did with a seat.
+enum Captured<'w> {
+    /// Read and chunked: the chunks, and whether the capture was racy.
+    Raw(Vec<ChunkSpec>, bool),
+    /// `snapshot` mode only (#218): the seat's first bytes are a `SQLite`
+    /// database magic. Nothing past the sniff was read, and no chunk was
+    /// handed on; the caller snapshots it ([`snapshot_seat`]).
+    Database(Opened<'w>),
+}
+
+/// A seat opened for its sniff (#218).
+///
+/// In `snapshot` mode its descriptor is closed only under the session's
+/// backup lock, unless the sniff found no database (#218 review): closing
+/// any descriptor of an inode drops every POSIX lock this process holds on
+/// it, so a sniff of a hard link closed while another seat's backup of the
+/// same store holds `SHARED` would let a writer take `EXCLUSIVE` under that
+/// backup. Every `SQLite` connection the source opens lives under that
+/// lock, so no close can meet one.
+struct Opened<'w> {
+    /// The seat, opened beneath the root; its stat identity is the row's.
+    /// `None` once closed or released.
+    file: Option<std::fs::File>,
+    /// The clock read before it was opened, which its racy check uses.
+    started_ns: i128,
+    /// The lock its descriptor is closed under (`snapshot` mode).
+    backup: Option<&'w Mutex<()>>,
+}
+
+impl Opened<'_> {
+    fn file(&self) -> Result<&std::fs::File> {
+        self.file.as_ref().ok_or(BulkloadRefusal::WorkerLost)
+    }
+
+    /// The descriptor of a seat that is not a database: read and closed as
+    /// any file's.
+    fn release(&mut self) -> Result<std::fs::File> {
+        self.file.take().ok_or(BulkloadRefusal::WorkerLost)
+    }
+
+    /// Close the descriptor; the caller holds the backup lock.
+    fn close_locked(&mut self) {
+        Self::close(self.file.take());
+    }
+
+    fn close(file: Option<std::fs::File>) {
+        #[cfg(test)]
+        if file.is_some() && !HOLDS_BACKUP.get() {
+            SNIFF_CLOSED_UNLOCKED.fetch_add(1, Ordering::Relaxed);
+        }
+        drop(file);
+    }
+}
+
+impl Drop for Opened<'_> {
+    fn drop(&mut self) {
+        let file = self.file.take();
+        if file.is_none() {
+            return;
+        }
+        let Some(backup) = self.backup else {
+            drop(file);
+            return;
+        };
+        let _one = backup.lock().unwrap_or_else(PoisonError::into_inner);
+        #[cfg(test)]
+        let _held = BackupHeld::mark();
+        Self::close(file);
+    }
 }
 
 /// Read one source file once, chunk it and hash each chunk, handing every
@@ -1735,7 +2520,10 @@ fn serve_chunks(
 /// remembered (#186): the seat's stat identity did not move across the
 /// sniff and the seat is not racy, so the identity vouches for the header
 /// that was read. Otherwise the same bytes are the file's first content
-/// bytes, counted as such and chunked with the rest.
+/// bytes, counted as such and chunked with the rest. In `snapshot` mode a
+/// database magic is not refused: the sniff is counted, and the opened seat
+/// is returned for its snapshot ([`Captured::Database`], #218); a WAL magic
+/// is refused and remembered as such ([`RefusedSeat::SqliteWalHeader`]).
 ///
 /// Returns the chunks and whether the capture was racy (#86): the seat's
 /// mtime or ctime falls within [`RACY_GRANULARITY_NS`] of the clock read
@@ -1744,54 +2532,104 @@ fn serve_chunks(
 /// so the identity cannot vouch for the bytes read, exactly as in the Git
 /// carry census (R-N76): the capture is sent, but never recorded as a reuse
 /// key on either side.
-fn capture_file(
-    work: &SourceWork<'_>,
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sniff, its refusals and one read, in the order they happen"
+)]
+fn capture_file<'w>(
+    work: &SourceWork<'w>,
     row: &RowSchema,
+    beside: Option<&SidecarId>,
     bytes_read: &mut u64,
-    sniffed: &mut Option<RefusedSeat>,
+    sniffed: &mut Option<(Vec<u8>, RefusedSeat)>,
     mut sink: impl FnMut(u32, u64, [u8; 32], Vec<u8>) -> Result<()>,
-) -> Result<(Vec<ChunkSpec>, bool)> {
+) -> Result<Captured<'w>> {
     if row.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
-    if row.rel_path.ends_with(b"-wal")
-        || row.rel_path.ends_with(b"-shm")
-        || row.rel_path.ends_with(b"-journal")
+    if crate::walk::SQLITE_SIDECAR_SUFFIXES
+        .iter()
+        .any(|suffix| row.rel_path.ends_with(suffix))
     {
         return Err(BulkloadRefusal::SqliteStateChanged);
     }
     #[cfg(feature = "fault-injection")]
     let file_path = work.root.join(crate::walk::rel_path(&row.rel_path));
     let started_ns = capture_clock(work.root);
-    let file = open_source(work, row)?;
+    let mut opened = Opened {
+        file: Some(open_source(work, row)?),
+        started_ns,
+        backup: (work.sqlite == SqliteMode::Snapshot).then_some(work.backup),
+    };
     let expected = StatIdentity::from_row(row);
-    if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::capture_file")?)
-        != expected
-    {
+    // A seat that moved since the walk is refused, except that in
+    // `snapshot` mode it is sniffed first: a live database moving between
+    // the walk and its capture is the normal case, and its snapshot is
+    // consistent whatever moved; it is just not settled (#218, design
+    // section 5.4).
+    let moved = StatIdentity::from_metadata(
+        &opened
+            .file()?
+            .metadata()
+            .refuse_at("transfer::capture_file")?,
+    ) != expected;
+    if moved && work.sqlite == SqliteMode::Refuse {
         return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     let mut prefix = Vec::new();
     SourceReader {
-        file: &file,
+        file: opened.file()?,
         offset: 0,
     }
     .take(SNIFF_BYTES)
     .read_to_end(&mut prefix)
     .refuse_at("transfer::capture_file")?;
-    if prefix.starts_with(b"SQLite format 3\0")
-        || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x82])
-        || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x83])
-    {
+    let database = prefix.starts_with(SQLITE_DATABASE_MAGIC);
+    if database && work.sqlite == SqliteMode::Snapshot {
         counters::add_len(Counter::SourceSniff, prefix.len());
+        return Ok(Captured::Database(opened));
+    }
+    // Not a database for this session: closed as any file is.
+    let file = opened.release()?;
+    let wal = prefix.starts_with(&[0x37, 0x7f, 0x06, 0x82])
+        || prefix.starts_with(&[0x37, 0x7f, 0x06, 0x83]);
+    if database || wal {
+        counters::add_len(Counter::SourceSniff, prefix.len());
+        if moved {
+            return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
+        }
         #[cfg(test)]
         after_sniff(work.root);
         let unmoved = file
             .metadata()
             .is_ok_and(|after| StatIdentity::from_metadata(&after) == expected);
         if unmoved && !crate::git_carry::racy(row, started_ns, capture_clock(work.root)) {
-            *sniffed = Some(RefusedSeat::SqliteHeader);
+            let kind = match work.sqlite {
+                SqliteMode::Refuse => RefusedSeat::SqliteHeader,
+                SqliteMode::Snapshot => RefusedSeat::SqliteWalHeader,
+            };
+            *sniffed = Some((row_key(work.authority, row)?, kind));
         }
         return Err(BulkloadRefusal::SqliteStateChanged);
+    }
+    // #218 review: in `snapshot` mode a file without the database magic (an
+    // encrypted store) beside a `-wal` that holds frames is refused, never
+    // carried raw: its main file alone may miss every transaction still in
+    // the `-wal`, or hold a checkpoint half done. Its row and the `-wal`'s
+    // identity vouch for the refusal together, so it is remembered under
+    // its snapshot key when the main file did not move and was not racy. A
+    // `-wal` with no frame (empty) leaves the main file whole.
+    if work.sqlite == SqliteMode::Snapshot && beside.is_some_and(|wal| wal.size > 0) {
+        counters::add_len(Counter::SourceSniff, prefix.len());
+        if !moved {
+            *sniffed = refused_beside_wal(work, row, &file, started_ns, beside)?;
+        }
+        return Err(BulkloadRefusal::SqliteStateChanged);
+    }
+    if moved {
+        // Read only to tell a database apart: a sniff, never content.
+        counters::add_len(Counter::SourceSniff, prefix.len());
+        return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
     }
     // Not refused: the sniffed bytes are the file's first content bytes.
     *bytes_read = bytes_read.saturating_add(prefix.len() as u64);
@@ -1836,7 +2674,462 @@ fn capture_file(
     if racy {
         counters::bump(Counter::TransferRacyCaptures);
     }
-    Ok((chunks, racy))
+    Ok(Captured::Raw(chunks, racy))
+}
+
+/// The record of a file without the database magic refused beside a `-wal`
+/// that holds frames (#218 review): under its snapshot key, when the file
+/// did not move across the sniff and is not racy.
+fn refused_beside_wal(
+    work: &SourceWork<'_>,
+    row: &RowSchema,
+    file: &std::fs::File,
+    started_ns: i128,
+    beside: Option<&SidecarId>,
+) -> Result<Option<(Vec<u8>, RefusedSeat)>> {
+    #[cfg(test)]
+    after_sniff(work.root);
+    let unmoved = file
+        .metadata()
+        .is_ok_and(|after| StatIdentity::from_metadata(&after) == StatIdentity::from_row(row));
+    if unmoved && !crate::git_carry::racy(row, started_ns, capture_clock(work.root)) {
+        return Ok(Some((
+            sqlite_key(work.authority, row, beside)?,
+            RefusedSeat::SqliteBesideWal,
+        )));
+    }
+    Ok(None)
+}
+
+/// The serial of this process's next snapshot slot name (#218).
+static SLOT_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// `SQLITE_CANTOPEN_SYMLINK`: `SQLITE_OPEN_NOFOLLOW` met a symlink at some
+/// component of the path.
+const SQLITE_CANTOPEN_SYMLINK: i32 = 0x060E;
+
+/// The first 16 bytes of every `SQLite` database file.
+const SQLITE_DATABASE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// A database seat taken as a snapshot (#218).
+struct Snapshotted {
+    slot: SlotFile,
+    size: u64,
+    /// The `-wal`'s identity after the backup (`None`: none).
+    wal: Option<SidecarId>,
+    /// The capture is settled (design section 5.4): neither the main file
+    /// nor the `-wal` moved between the walk, the pre-stat and the
+    /// post-stat, and neither is stamped within the racy allowance, so the
+    /// row and `wal` vouch for the snapshot's bytes.
+    settled: bool,
+}
+
+/// Snapshot one database seat and answer its entry (#218): announce the
+/// snapshot ([`Control::SqliteSnapshot`]), then offer its manifest (its slot
+/// kept for the chunk requests, within the slot budget it reserved before
+/// its backup) when `want_manifest`, or stream its chunks and `End`. Nothing is recorded in the
+/// source ledger: the slot is gone after the entry, so a ledger manifest
+/// could never be served again (design section 5.5). An unsettled capture
+/// is sent as racy, so neither side keeps a reuse key for it.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one capture job's inputs, each used once"
+)]
+fn snapshot_seat(
+    work: &SourceWork<'_>,
+    entry: u64,
+    row: &RowSchema,
+    mut opened: Opened<'_>,
+    want_manifest: bool,
+    events: &Sender<Event>,
+    bytes_read: &mut u64,
+    sniffed: &mut Option<(Vec<u8>, RefusedSeat)>,
+) -> Result<Event> {
+    // R4: another user's database would get `-shm` and `-wal` files owned
+    // by this one. Refused before `SQLite` opens it, from the descriptor the
+    // sniff holds.
+    if opened
+        .file()?
+        .metadata()
+        .refuse_at("transfer::snapshot_seat")?
+        .uid()
+        != work.euid
+    {
+        return Err(BulkloadRefusal::SqliteSourceNotOwner);
+    }
+    // The sniff's descriptor is closed under the backup lock: by
+    // `take_snapshot` once its backup is done, or by its drop (#218 review).
+    let taken = take_snapshot(work, row, &mut opened, bytes_read, sniffed)?;
+    drop(opened);
+    events
+        .send(Event::Snapshot {
+            entry,
+            size: taken.size,
+            wal: taken.wal,
+        })
+        .map_err(|_| BulkloadRefusal::WorkerLost)?;
+    #[cfg(test)]
+    after_snapshot(work.root);
+    let racy = !taken.settled;
+    if want_manifest {
+        // The slot already holds its reservation (#218 review).
+        let retained = Retained::slot(&work.retain, taken.slot);
+        let chunks = chunk_slot(
+            retained.slot.as_ref().ok_or(BulkloadRefusal::WorkerLost)?,
+            taken.size,
+            |_, _, _, _| Ok(()),
+        )?;
+        return Ok(Event::Manifest {
+            entry,
+            record: None,
+            manifest: Manifest::new(chunks),
+            retained: Some(retained),
+            racy,
+            bytes_read: *bytes_read,
+        });
+    }
+    let slot = taken.slot;
+    let chunks = chunk_slot(&slot, taken.size, |index, offset, digest, data| {
+        send_chunk(work, events, entry, index, offset, digest, data)
+    })?;
+    drop(slot);
+    let manifest = Manifest::new(chunks);
+    Ok(Event::End {
+        entry,
+        record: None,
+        root: manifest.root,
+        chunks: u32::try_from(manifest.chunks.len())
+            .map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+        size: taken.size,
+        racy,
+        bytes_read: *bytes_read,
+    })
+}
+
+/// Chunk a snapshot slot as a capture chunks a seat. A private read, counted
+/// as `read_source_snapshot_bytes`, never as a source read.
+fn chunk_slot(
+    slot: &SlotFile,
+    size: u64,
+    mut sink: impl FnMut(u32, u64, [u8; 32], Vec<u8>) -> Result<()>,
+) -> Result<Vec<ChunkSpec>> {
+    let mut chunks = Vec::new();
+    let mut offset = 0_u64;
+    let _cdc_timer = PhaseTimer(&CDC_HASH_NS, Instant::now());
+    for chunk in fastcdc::v2020::StreamCDC::new(
+        SlotReader {
+            file: &slot.file,
+            offset: 0,
+        },
+        crate::hash::CDC_MIN_BYTES,
+        crate::hash::CDC_AVG_BYTES,
+        crate::hash::CDC_MAX_BYTES,
+    ) {
+        let chunk = chunk.map_err(|error| match error {
+            fastcdc::v2020::Error::IoError(error) => {
+                crate::refuse::io(&error, "transfer::chunk_slot")
+            }
+            // The slot is this process's own file: anything else means its
+            // bytes are not the snapshot's.
+            _ => BulkloadRefusal::DigestMismatch,
+        })?;
+        if chunks.len() >= MAX_MANIFEST_CHUNKS {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        let digest = counters::hash(Counter::HashCaptureChunk, &chunk.data);
+        let length = chunk.data.len() as u64;
+        let index = u32::try_from(chunks.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        chunks.push(ChunkSpec {
+            digest,
+            size: length,
+        });
+        sink(index, offset, digest, chunk.data)?;
+        offset = offset
+            .checked_add(length)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+    }
+    if offset == size {
+        Ok(chunks)
+    } else {
+        Err(BulkloadRefusal::DigestMismatch)
+    }
+}
+
+/// Sequential `pread`s of a snapshot slot, counted as private reads.
+struct SlotReader<'a> {
+    file: &'a std::fs::File,
+    offset: u64,
+}
+
+impl Read for SlotReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = crate::io::sys::pread_full(self.file, buffer, self.offset)?;
+        self.offset = self.offset.saturating_add(read as u64);
+        counters::add_len(Counter::SourceSnapshotRead, read);
+        Ok(read)
+    }
+}
+
+/// The `-wal` beside a seat, as an `lstat` beneath the seat's directory
+/// sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WalStat {
+    /// No `-wal`.
+    Absent,
+    /// A regular `-wal` with this identity.
+    Present(SidecarId),
+    /// Not a regular file, or the `lstat` failed otherwise: it cannot vouch
+    /// for anything.
+    Unknown,
+}
+
+impl WalStat {
+    fn of(parent: BorrowedFd<'_>, leaf: &[u8]) -> Self {
+        let mut name = leaf.to_vec();
+        name.extend_from_slice(b"-wal");
+        let Ok(name) = std::ffi::CString::new(name) else {
+            return Self::Unknown;
+        };
+        match crate::io::sys::fstatat_nofollow(parent, &name) {
+            Ok(stat) if stat.is_file() => Self::Present(SidecarId {
+                dev: stat.node.dev,
+                ino: stat.node.ino,
+                size: stat.size,
+                mtime_ns: stat.mtime_ns,
+                ctime_ns: stat.ctime_ns,
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// The identity a key carries: `None` when there is no `-wal` (or none
+    /// that could be told).
+    const fn id(self) -> Option<SidecarId> {
+        match self {
+            Self::Present(id) => Some(id),
+            Self::Absent | Self::Unknown => None,
+        }
+    }
+
+    /// The size a wal-index rebuild could read.
+    const fn size(self) -> u64 {
+        match self {
+            Self::Present(id) => id.size,
+            Self::Absent | Self::Unknown => 0,
+        }
+    }
+}
+
+/// Whether a stamp pair is racy against a capture's clocks, as
+/// `git_carry::racy` judges a row (#86).
+const fn stamps_racy(mtime_ns: i128, ctime_ns: i128, started_ns: i128, now_ns: i128) -> bool {
+    let window = started_ns.saturating_sub(RACY_GRANULARITY_NS);
+    mtime_ns >= window || ctime_ns >= window || mtime_ns > now_ns || ctime_ns > now_ns
+}
+
+/// Whether a `-wal` before and after a backup lets the capture settle: the
+/// same identity, not stamped within the racy allowance, or none before and
+/// an empty one after (OI-1003-Q72's file, created by the read itself). An
+/// empty `-wal` holds no frame, so its stamps vouch for nothing and are not
+/// judged: the database is then its main file, whose own identity and
+/// stamps are checked. A `-wal` that could not be told never settles.
+fn wal_settled(before: WalStat, after: WalStat, started_ns: i128, now_ns: i128) -> bool {
+    match (before, after) {
+        (WalStat::Absent, WalStat::Absent) => true,
+        (WalStat::Absent, WalStat::Present(created)) => created.size == 0,
+        (WalStat::Present(before), WalStat::Present(after)) => {
+            before == after
+                && (after.size == 0
+                    || !stamps_racy(after.mtime_ns, after.ctime_ns, started_ns, now_ns))
+        }
+        _ => false,
+    }
+}
+
+/// A seat's directory beneath the root, opened component by component
+/// (`None`: the root itself), and its leaf name.
+fn seat_directory<'r>(
+    work: &SourceWork<'_>,
+    row: &'r RowSchema,
+) -> Result<(Option<std::os::fd::OwnedFd>, &'r [u8])> {
+    Ok(match row.rel_path.iter().rposition(|byte| *byte == b'/') {
+        Some(at) => (
+            Some(
+                crate::io::sys::openat_beneath(
+                    work.root_fd,
+                    crate::walk::rel_path(row.rel_path.get(..at).unwrap_or_default()),
+                    crate::io::OpenMode::Directory,
+                )
+                .refuse_at("transfer::seat_directory")?,
+            ),
+            row.rel_path.get(at + 1..).unwrap_or_default(),
+        ),
+        None => (None, row.rel_path.as_slice()),
+    })
+}
+
+/// Take one database seat's snapshot into a new slot (#218). The backup is
+/// the provider's stepped one, from the canonical path beneath the root;
+/// one runs at a time per `serve`. The main file and its `-wal` are stat'ed
+/// beneath the seat's directory before and after; the walked inode must
+/// still be at the path afterwards, or the snapshot is discarded and
+/// refused `PATH_ESCAPES_ROOT` (design section 7.5); so is a path through a
+/// symlink at any component, which `SQLITE_OPEN_NOFOLLOW` refuses
+/// (`SQLITE_CANTOPEN_SYMLINK`). A refusal the database's bytes alone decide
+/// is remembered under the snapshot key when the capture settled (R10).
+///
+/// Before the backup (#218 review) the slot is reserved against the slot
+/// budget, waiting up to [`crate::provider_sqlite::CARRY_WALL`] for room,
+/// and the slot directory's filesystem must keep the free-space floor
+/// (`--min-free-percent`) with the slot written: either refuses
+/// `BUDGET_EXCEEDED`, not remembered. The sniff's descriptor is closed
+/// under the backup lock once the backup is done.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one backup between its pre- and post-stats, read top to bottom"
+)]
+fn take_snapshot(
+    work: &SourceWork<'_>,
+    row: &RowSchema,
+    opened: &mut Opened<'_>,
+    bytes_read: &mut u64,
+    sniffed: &mut Option<(Vec<u8>, RefusedSeat)>,
+) -> Result<Snapshotted> {
+    let (directory, leaf) = seat_directory(work, row)?;
+    let parent = directory
+        .as_ref()
+        .map_or(work.root_fd, std::os::fd::AsFd::as_fd);
+    let leaf_name = std::ffi::CString::new(leaf).map_err(|_| BulkloadRefusal::PathNotPortable)?;
+    let stat_main = || {
+        crate::io::sys::fstatat_nofollow(parent, &leaf_name)
+            .ok()
+            .filter(crate::io::Stat::is_file)
+    };
+    let opened_node = crate::io::sys::fstat(opened.file()?)
+        .refuse_at("transfer::take_snapshot")?
+        .node;
+    // The slot's room first, outside the backup lock: a thread waiting for
+    // another slot to go never holds up a backup that fits.
+    let mut reserved = work
+        .slot_budget
+        .reserve(
+            row.size.saturating_add(WalStat::of(parent, leaf).size()),
+            crate::provider_sqlite::CARRY_WALL,
+        )
+        .ok_or(BulkloadRefusal::BudgetExceeded)?;
+    let _one = work.backup.lock().unwrap_or_else(PoisonError::into_inner);
+    #[cfg(test)]
+    let _held = BackupHeld::mark();
+    let pre_main = stat_main();
+    let pre_wal = WalStat::of(parent, leaf);
+    let wal_bound = pre_wal.size();
+    room_for_slot(work, &mut reserved, row.size.saturating_add(wal_bound))?;
+    let slot_path = work.slots.join(format!(
+        "{}-{}.sqlite",
+        std::process::id(),
+        SLOT_SERIAL.fetch_add(1, Ordering::Relaxed)
+    ));
+    let source = work.root.join(crate::walk::rel_path(&row.rel_path));
+    #[cfg(test)]
+    before_backup(work.root);
+    let (report, source_bytes) = crate::provider_sqlite::snapshot_for_carry(
+        &source,
+        &slot_path,
+        work.as_root,
+        wal_bound,
+        crate::provider_sqlite::CARRY_WALL,
+    );
+    // Source content read, refused or not (R13).
+    *bytes_read = bytes_read.saturating_add(source_bytes);
+    // Whatever the backup did, the slot goes when this is dropped, and its
+    // reservation with it.
+    let slot = std::fs::File::open(&slot_path).map(|file| SlotFile {
+        file,
+        path: slot_path.clone(),
+        reserved,
+    });
+    if slot.is_err() {
+        let _ = std::fs::remove_file(&slot_path);
+    }
+    let post_main = stat_main();
+    let post_wal = WalStat::of(parent, leaf);
+    // No `SQLite` connection is open now: the sniff closes under the lock.
+    opened.close_locked();
+    let now_ns = capture_clock(work.root);
+    let same_inode = post_main
+        .as_ref()
+        .is_some_and(|main| main.node == opened_node);
+    let identity = |stat: &crate::io::Stat| StatIdentity {
+        dev: stat.node.dev,
+        ino: stat.node.ino,
+        size: stat.size,
+        mtime_ns: stat.mtime_ns,
+        ctime_ns: stat.ctime_ns,
+    };
+    let settled = same_inode
+        && pre_main.as_ref().map(identity) == Some(StatIdentity::from_row(row))
+        && post_main.as_ref().map(identity) == pre_main.as_ref().map(identity)
+        && !crate::git_carry::racy(row, opened.started_ns, now_ns)
+        && wal_settled(pre_wal, post_wal, opened.started_ns, now_ns);
+    let report = match report {
+        Ok(report) => report,
+        // A directory of the path swapped for a symlink since the walk:
+        // `SQLITE_OPEN_NOFOLLOW` refuses a symlink at any component.
+        Err(BulkloadRefusal::SqliteBackupFailed(Some(SQLITE_CANTOPEN_SYMLINK))) => {
+            return Err(BulkloadRefusal::PathEscapesRoot);
+        }
+        Err(refusal) => {
+            if settled {
+                if let Some(kind) = RefusedSeat::of_snapshot_refusal(&refusal) {
+                    *sniffed = Some((
+                        sqlite_key(work.authority, row, post_wal.id().as_ref())?,
+                        kind,
+                    ));
+                }
+            }
+            return Err(refusal);
+        }
+    };
+    let mut slot = slot.refuse_at("transfer::take_snapshot")?;
+    if !same_inode {
+        // `SQLite` resolved the path to another file than the walked seat.
+        return Err(BulkloadRefusal::PathEscapesRoot);
+    }
+    // A snapshot can outgrow its bound when a writer committed between
+    // steps: it keeps its slot only when the budget has that room now.
+    if report.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES)
+        || !slot.reserved.true_up(report.size)
+    {
+        return Err(BulkloadRefusal::BudgetExceeded);
+    }
+    if !settled {
+        counters::bump(Counter::SourceSqliteUnsettled);
+    }
+    Ok(Snapshotted {
+        slot,
+        size: report.size,
+        wal: post_wal.id(),
+        settled,
+    })
+}
+
+/// A slot of at most `bound` bytes fits (#218 review): its reservation is
+/// trued up to `bound` without waiting, and the slot directory's filesystem
+/// keeps the free-space floor with it written. The slot shares that
+/// filesystem with the private state, most often with the live stores
+/// themselves, so it must not take it under the floor, where a live writer
+/// could meet `SQLITE_FULL` (S2). `BUDGET_EXCEEDED` otherwise.
+fn room_for_slot(work: &SourceWork<'_>, reserved: &mut SlotReservation, bound: u64) -> Result<()> {
+    if !reserved.true_up(bound) {
+        return Err(BulkloadRefusal::BudgetExceeded);
+    }
+    crate::space::check(
+        bound,
+        crate::space::probe(work.slots)?,
+        crate::space::min_free_percent(),
+    )
+    .map_err(|_| BulkloadRefusal::BudgetExceeded)
 }
 
 /// Open a source seat for reading, component by component beneath the
@@ -1966,13 +3259,18 @@ fn finish_receive(
     committer: Committer<PublishSink>,
     stats: &mut TransferStats,
     salvage_staged: &HashMap<Vec<u8>, Vec<usize>>,
+    sidecars: &[SidecarReport],
+    snapshot_bases: &HashSet<Vec<u8>>,
 ) -> Result<()> {
     for (rel_path, outcome) in committer.finish()? {
         match outcome {
             Ok(()) => stats.completed += 1,
-            Err(refusal) => stats.refusals.push((rel_path, refusal.code().to_owned())),
+            Err(refusal) => {
+                stats.refuse(rel_path, refusal.code().to_owned(), refusal.sqlite_code());
+            }
         }
     }
+    resolve_sidecars(stats, sidecars, snapshot_bases);
     let keep = salvage_to_keep(target, stats, salvage_staged);
     target.retire_salvaged(&keep)?;
     stats.temporaries_removed = target.swept().removed;
@@ -1985,6 +3283,53 @@ fn finish_receive(
         target.finish_directories(store)?;
     }
     target.flush_session()
+}
+
+/// A sidecar the source reported (#218): its relative path and its base's.
+type SidecarReport = (Vec<u8>, Vec<u8>);
+
+/// Bind each `SQLite` sidecar the source reported to its base's outcome
+/// (#218, review R2), once every outcome of the session is known: covered
+/// when the base is held here as a snapshot (published from one in this
+/// session and not refused since, or reused or adopted as one); refused by
+/// name, `SQLITE_STATE_CHANGED` as v5 refuses every sidecar, otherwise. So
+/// a sidecar is never counted covered by its name alone: the `-wal` of a
+/// database without the `SQLite` magic (an encrypted store) carried raw, or
+/// a user's `notes-journal` beside a plain `notes`, stays a visible refusal.
+fn resolve_sidecars(
+    stats: &mut TransferStats,
+    sidecars: &[SidecarReport],
+    snapshot_bases: &HashSet<Vec<u8>>,
+) {
+    let refused: HashSet<Vec<u8>> = stats
+        .refusals
+        .iter()
+        .map(|(rel_path, _)| rel_path.clone())
+        .collect();
+    // A snapshot whose group commit failed is not held here.
+    stats
+        .sqlite_snapshots
+        .retain(|rel_path| !refused.contains(rel_path));
+    if sidecars.is_empty() {
+        return;
+    }
+    let mut covered = Vec::new();
+    let mut uncovered = Vec::new();
+    for (rel_path, database) in sidecars {
+        if snapshot_bases.contains(database) && !refused.contains(database) {
+            covered.push(rel_path.clone());
+        } else {
+            uncovered.push(rel_path.clone());
+        }
+    }
+    counters::add(Counter::SqliteSidecarsCovered, covered.len() as u64);
+    stats.sqlite_sidecars_covered.extend(covered);
+    let code = BulkloadRefusal::SqliteStateChanged.code();
+    stats.refusals.extend(
+        uncovered
+            .into_iter()
+            .map(|rel_path| (rel_path, code.to_owned())),
+    );
 }
 
 /// Which salvaged temporaries outlive the session (#124, OI-1002-Q33).
@@ -2082,10 +3427,42 @@ fn publication_committer(
     )
 }
 
+/// What the destination knows of an entry before its content arrives.
+struct Seat {
+    /// The row its content is checked against: the walked row, or for a
+    /// `SQLite` snapshot that row with the snapshot's size (#218).
+    row: RowSchema,
+    /// The key its output row is recorded under: its row key, or its
+    /// snapshot key ([`sqlite_key`], #218).
+    key: Vec<u8>,
+    /// Its capture record's key (#169): [`unrowed::record_key`], or
+    /// [`unrowed::sqlite_record_key`] for a snapshot (#218, R1).
+    record: [u8; 32],
+    /// Its content is a `SQLite` snapshot ([`Control::SqliteSnapshot`]).
+    snapshot: bool,
+    /// A refusal decided before any content arrived: a snapshot that does
+    /// not fit the destination's free-space floor or the chunk bound (R7).
+    failure: Option<BulkloadRefusal>,
+}
+
+impl Seat {
+    fn file(row: RowSchema, key: Vec<u8>) -> Result<Self> {
+        Ok(Self {
+            record: unrowed::record_key(&row)?,
+            row,
+            key,
+            snapshot: false,
+            failure: None,
+        })
+    }
+}
+
 /// A streamed entry: chunks arrive in order and are written at once.
 struct Streaming {
     row: RowSchema,
     key: Vec<u8>,
+    record: [u8; 32],
+    snapshot: bool,
     staged: Option<StagedFile>,
     specs: Vec<ChunkSpec>,
     offset: u64,
@@ -2157,16 +3534,18 @@ impl Streaming {
         Ok(())
     }
 
-    fn new(row: RowSchema, key: Vec<u8>, adopt: bool) -> Self {
+    fn new(seat: Seat, adopt: bool) -> Self {
         Self {
-            row,
-            key,
+            row: seat.row,
+            key: seat.key,
+            record: seat.record,
+            snapshot: seat.snapshot,
             staged: None,
             specs: Vec::new(),
             offset: 0,
             hints: Vec::new(),
             seen: HashSet::new(),
-            failure: None,
+            failure: seat.failure,
             adopt,
         }
     }
@@ -2177,6 +3556,8 @@ impl Streaming {
 struct Filling {
     row: RowSchema,
     key: Vec<u8>,
+    record: [u8; 32],
+    snapshot: bool,
     manifest: Manifest,
     offsets: Vec<u64>,
     plan: Plan,
@@ -2187,7 +3568,7 @@ struct Filling {
 /// An entry the destination expects content for.
 enum Incoming {
     Streaming(Streaming),
-    AwaitManifest { row: RowSchema, key: Vec<u8> },
+    AwaitManifest(Seat),
     Filling(Filling),
 }
 
@@ -2228,15 +3609,24 @@ struct Inbound<'a, W> {
     space: Option<crate::space::Space>,
     /// Bytes admitted since the last probe.
     since_probe: u64,
+    /// The session's `SQLite` mode, which this side chose (#218).
+    sqlite: SqliteMode,
+    /// The source's `SqliteSidecar` reports, as (sidecar, base), resolved
+    /// against their bases' outcomes when the session ends (R2).
+    sidecars: Vec<SidecarReport>,
+    /// Bases published from a snapshot, or reused or adopted as one.
+    snapshot_bases: HashSet<Vec<u8>>,
 }
 
 /// Re-probe the destination filesystem after admitting this many bytes,
 /// even without a group commit in between.
 const SPACE_REPROBE_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Receive an ordinary-file carry. A divergent output is replaced only when
-/// it is this store's own, untouched since its row was written (WP0(d)); any
-/// other is refused and kept.
+/// Receive an ordinary-file carry, in the process's [`sqlite_mode`].
+///
+/// A divergent output is replaced only when it is this store's own,
+/// untouched since its row was written (WP0(d)); any other is refused and
+/// kept.
 ///
 /// # Errors
 /// Refuses protocol errors and unsafe roots. Per-path conflicts remain in stats.
@@ -2247,6 +3637,31 @@ pub fn receive<R: Read, W: Write>(
     source_state: &Path,
     destination: &Path,
     destination_state: &Path,
+) -> Result<TransferStats> {
+    receive_with(
+        input,
+        output,
+        source,
+        source_state,
+        destination,
+        destination_state,
+        sqlite_mode(),
+    )
+}
+
+/// [`receive`] in the given [`SqliteMode`], which the session's `Open`
+/// carries to the source (#218).
+///
+/// # Errors
+/// As [`receive`].
+pub fn receive_with<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    source: &Path,
+    source_state: &Path,
+    destination: &Path,
+    destination_state: &Path,
+    sqlite: SqliteMode,
 ) -> Result<TransferStats> {
     let setup_timer = PhaseTimer(&RECV_SETUP_NS, Instant::now());
     let store = Store::open(destination_state)?;
@@ -2270,6 +3685,7 @@ pub fn receive<R: Read, W: Write>(
             wire_id: wire_id(),
             root: source.as_os_str().as_bytes().to_vec(),
             state: source_state.as_os_str().as_bytes().to_vec(),
+            sqlite,
         },
     )?;
     let Frame::Control(Control::Start { authority }) = read_frame(input)? else {
@@ -2297,7 +3713,10 @@ pub fn receive<R: Read, W: Write>(
         committer: &committer,
         session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
         displaced,
-        stats: TransferStats::default(),
+        stats: TransferStats {
+            sqlite_mode: sqlite,
+            ..TransferStats::default()
+        },
         incoming: HashMap::new(),
         open: 0,
         fill_locally,
@@ -2312,6 +3731,9 @@ pub fn receive<R: Read, W: Write>(
         reserved_bytes: 0,
         space: None,
         since_probe: 0,
+        sqlite,
+        sidecars: Vec::new(),
+        snapshot_bases: HashSet::new(),
     };
     drop(setup_timer);
     let source_bytes_read = {
@@ -2323,11 +3745,21 @@ pub fn receive<R: Read, W: Write>(
         mut stats,
         session,
         salvage_staged,
+        sidecars,
+        snapshot_bases,
         ..
     } = receiver;
     stats.source_bytes_read = source_bytes_read;
     drop(session);
-    finish_receive(&mut target, &store, committer, &mut stats, &salvage_staged)?;
+    finish_receive(
+        &mut target,
+        &store,
+        committer,
+        &mut stats,
+        &salvage_staged,
+        &sidecars,
+        &snapshot_bases,
+    )?;
     Ok(stats)
 }
 
@@ -2352,23 +3784,43 @@ impl<W: Write> Inbound<'_, W> {
                 read_frame(input)?
             };
             match frame {
-                Frame::Control(Control::Entry { entry, row }) => {
+                Frame::Control(Control::Entry { entry, row, wal }) => {
                     if entry != offered || walk_done.is_some() {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
                     offered += 1;
-                    self.entry(entry, row)?;
+                    self.entry(entry, row, wal)?;
+                }
+                Frame::Control(Control::SqliteSidecar { rel_path, database })
+                    if self.sqlite == SqliteMode::Snapshot =>
+                {
+                    self.sidecars.push((rel_path, database));
+                }
+                Frame::Control(Control::SqliteSnapshot { entry, size, wal })
+                    if self.sqlite == SqliteMode::Snapshot =>
+                {
+                    self.sqlite_snapshot(entry, size, wal)?;
+                }
+                // Only `SQLITE_BACKUP_FAILED` carries `SQLite`'s code.
+                Frame::Control(Control::Refused {
+                    code, sqlite_code, ..
+                }) if sqlite_code.is_some()
+                    && code != BulkloadRefusal::SqliteBackupFailed(None).code() =>
+                {
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 Frame::Control(Control::Refused {
                     entry: None,
                     rel_path,
                     code,
-                }) => self.stats.refusals.push((rel_path, code)),
+                    sqlite_code,
+                }) => self.stats.refuse(rel_path, code, sqlite_code),
                 Frame::Control(Control::Refused {
                     entry: Some(entry),
                     rel_path,
                     code,
-                }) => self.refused(entry, &rel_path, code)?,
+                    sqlite_code,
+                }) => self.refused(entry, &rel_path, code, sqlite_code)?,
                 Frame::Control(Control::EngineTemporary { rel_path }) => {
                     self.stats.source_engine_temporaries.push(rel_path);
                 }
@@ -2413,9 +3865,31 @@ impl<W: Write> Inbound<'_, W> {
     }
 
     /// Decide one offered entry.
-    fn entry(&mut self, entry: u64, row: RowSchema) -> Result<()> {
+    ///
+    /// In `snapshot` mode (#218) a regular entry is looked up under its
+    /// snapshot key ([`sqlite_key`], with the `-wal` identity it was offered
+    /// with) as well as its row key: an unchanged store is `Reuse`d with
+    /// nothing opened on the source. A file that is not a database keeps its
+    /// row key, so no existing row changes key (R2). Before its content is
+    /// asked for, a path with a `-wal`, `-journal` or `-shm` beside it here
+    /// is refused `DESTINATION_OCCUPIED` (R5): a snapshot published there
+    /// could be rolled back or overlaid by it. The check reads only this
+    /// side, so it is not remembered; removing the sidecar converges.
+    fn entry(&mut self, entry: u64, row: RowSchema, wal: Option<SidecarId>) -> Result<()> {
         let census_started = Instant::now();
+        let snapshot_mode = self.sqlite == SqliteMode::Snapshot;
+        if wal.is_some() && (!snapshot_mode || row.kind != FileKind::Regular) {
+            return Err(BulkloadRefusal::ProtocolStateViolation);
+        }
         let key = row_key(&self.authority, &row)?;
+        let snapshot = if snapshot_mode && row.kind == FileKind::Regular {
+            Some((
+                sqlite_key(&self.authority, &row, wal.as_ref())?,
+                unrowed::sqlite_record_key(&row, wal.as_ref())?,
+            ))
+        } else {
+            None
+        };
         let decided = match row.kind {
             FileKind::Directory => self
                 .target
@@ -2424,6 +3898,13 @@ impl<W: Write> Inbound<'_, W> {
             FileKind::Symlink => self.target.symlink(&row).map(|()| Decision::Skip),
             FileKind::Regular => self.target.identity(&row).and_then(|identity| {
                 if let Some(identity) = &identity {
+                    if let Some((snapshot_key, _)) = &snapshot {
+                        if self.store.output_matches(snapshot_key, identity)? {
+                            self.stats.reused += 1;
+                            self.snapshot_applied(&row.rel_path);
+                            return Ok(Decision::Reuse);
+                        }
+                    }
                     if self.store.output_matches(&key, identity)? {
                         self.stats.reused += 1;
                         return Ok(Decision::Reuse);
@@ -2434,12 +3915,20 @@ impl<W: Write> Inbound<'_, W> {
                     // Asked ahead of the capture record: a file that did
                     // not verify against this seat cannot prove it either,
                     // and proving hashes the whole output.
-                    if let Some(refused) = self.remembered_refusal(&row, &key, identity)? {
-                        return Err(refused.refusal());
+                    for remembered in std::iter::once(&key).chain(snapshot.as_ref().map(|(k, _)| k))
+                    {
+                        if let Some(refused) =
+                            self.remembered_refusal(&row, remembered, identity)?
+                        {
+                            return Err(refused.refusal());
+                        }
                     }
-                    if self.adopt_unrowed(&row, &key)? {
+                    if self.adopt_unrowed(&row, &key, snapshot.as_ref())? {
                         return Ok(Decision::Reuse);
                     }
+                }
+                if snapshot_mode && self.target.sqlite_sidecars_present(&row.rel_path)? {
+                    return Err(BulkloadRefusal::DestinationOccupied);
                 }
                 // A manifest first only when something here could fill it:
                 // an existing output to adopt, or chunks held by published
@@ -2458,11 +3947,14 @@ impl<W: Write> Inbound<'_, W> {
         // OI-1001-Q2: an entry whose bytes would take the destination under
         // its free-space floor is refused as a value, before any of its
         // content is requested. The session continues and stays resumable;
-        // nothing durable is read again (R25).
+        // nothing durable is read again (R25). A database's snapshot can be
+        // as large as its main file and its `-wal` together (#218, R7); its
+        // exact size is admitted again when the source announces it.
+        let bound = row
+            .size
+            .saturating_add(wal.as_ref().map_or(0, |wal| wal.size));
         let decided = decided.and_then(|decision| match decision {
-            Decision::Send | Decision::WantManifest => {
-                self.admit(entry, row.size).map(|()| decision)
-            }
+            Decision::Send | Decision::WantManifest => self.admit(entry, bound).map(|()| decision),
             other => Ok(other),
         });
         let decision = match decided {
@@ -2476,12 +3968,14 @@ impl<W: Write> Inbound<'_, W> {
         };
         match decision {
             Decision::Send => {
-                self.incoming
-                    .insert(entry, Incoming::Streaming(Streaming::new(row, key, false)));
+                self.incoming.insert(
+                    entry,
+                    Incoming::Streaming(Streaming::new(Seat::file(row, key)?, false)),
+                );
             }
             Decision::WantManifest => {
                 self.incoming
-                    .insert(entry, Incoming::AwaitManifest { row, key });
+                    .insert(entry, Incoming::AwaitManifest(Seat::file(row, key)?));
             }
             Decision::Skip | Decision::Reuse | Decision::Refuse { .. } => (),
         }
@@ -2490,33 +3984,108 @@ impl<W: Write> Inbound<'_, W> {
         Ok(())
     }
 
+    /// A database at `rel_path` is held here as a snapshot: published from
+    /// one, or reused or adopted as one (#218). Its sidecars are covered.
+    fn snapshot_applied(&mut self, rel_path: &[u8]) {
+        if self.snapshot_bases.insert(rel_path.to_vec()) {
+            self.stats.sqlite_snapshots.push(rel_path.to_vec());
+        }
+    }
+
+    /// The source announces an entry's content as a `SQLite` snapshot of
+    /// `size` bytes, its `-wal` at `wal` after the backup (#218): the entry
+    /// is keyed and checked as a snapshot from here on. Only before any of
+    /// its content. Its exact size is admitted against the free-space floor
+    /// again (R7); one that does not fit, or is past the chunk bound, is
+    /// refused when it ends, its content discarded as it arrives.
+    fn sqlite_snapshot(&mut self, entry: u64, size: u64, wal: Option<SidecarId>) -> Result<()> {
+        let (mut seat, streamed) = match self.incoming.remove(&entry) {
+            Some(Incoming::AwaitManifest(seat)) if !seat.snapshot => (seat, false),
+            Some(Incoming::Streaming(streaming))
+                if !streaming.snapshot
+                    && streaming.specs.is_empty()
+                    && streaming.staged.is_none()
+                    && !streaming.adopt =>
+            {
+                let seat = Seat {
+                    row: streaming.row,
+                    key: streaming.key,
+                    record: streaming.record,
+                    snapshot: false,
+                    failure: streaming.failure,
+                };
+                (seat, true)
+            }
+            _ => return Err(BulkloadRefusal::ProtocolStateViolation),
+        };
+        seat.key = sqlite_key(&self.authority, &seat.row, wal.as_ref())?;
+        seat.record = unrowed::sqlite_record_key(&seat.row, wal.as_ref())?;
+        seat.snapshot = true;
+        seat.row.size = size;
+        if seat.failure.is_none() {
+            if size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
+                seat.failure = Some(BulkloadRefusal::BudgetExceeded);
+            } else {
+                self.release(entry);
+                if let Err(refusal) = self.admit(entry, size) {
+                    seat.failure = Some(refusal);
+                }
+            }
+        }
+        self.incoming.insert(
+            entry,
+            if streamed {
+                Incoming::Streaming(Streaming::new(seat, false))
+            } else {
+                Incoming::AwaitManifest(seat)
+            },
+        );
+        Ok(())
+    }
+
     /// R25's strict reading (#169): an existing output with no matching row
     /// whose capture record proves it is this entry's capture is queued for
     /// its row as an adopted publication, and the entry is answered `Reuse`,
     /// so the source reads nothing. Its commit outcome reaches the session's
-    /// report like any output's. See [`unrowed`].
-    fn adopt_unrowed(&mut self, row: &RowSchema, key: &[u8]) -> Result<bool> {
+    /// report like any output's. See [`unrowed`]. In `snapshot` mode the
+    /// record may instead name the settled snapshot `snapshot` keys (#218,
+    /// R1): the output is then adopted under the snapshot key.
+    fn adopt_unrowed(
+        &mut self,
+        row: &RowSchema,
+        key: &[u8],
+        snapshot: Option<&(Vec<u8>, [u8; 32])>,
+    ) -> Result<bool> {
         let record_key = unrowed::record_key(row)?;
         let verdict = match self.target.existing(row) {
-            Ok(Some((file, parent))) => match unrowed::prove(&file, row, &record_key) {
-                unrowed::Verdict::Proven(identity, hints) => {
-                    self.committer.submit(Publication::Adopted {
-                        record: OutputRecord {
-                            key: key.to_vec(),
-                            rel_path: row.rel_path.clone(),
-                            identity,
-                            racy: false,
-                            hints,
-                        },
-                        file,
-                        parent,
-                    })?;
-                    self.stats.unrowed_adopted += 1;
-                    counters::bump(Counter::TransferUnrowedAdopted);
-                    return Ok(true);
+            Ok(Some((file, parent))) => {
+                match unrowed::prove(&file, row, &record_key, snapshot.map(|(_, record)| record)) {
+                    unrowed::Verdict::Proven(identity, hints, is_snapshot) => {
+                        let key = match (is_snapshot, snapshot) {
+                            (true, Some((snapshot_key, _))) => snapshot_key.clone(),
+                            _ => key.to_vec(),
+                        };
+                        self.committer.submit(Publication::Adopted {
+                            record: OutputRecord {
+                                key,
+                                rel_path: row.rel_path.clone(),
+                                identity,
+                                racy: false,
+                                hints,
+                            },
+                            file,
+                            parent,
+                        })?;
+                        if is_snapshot {
+                            self.snapshot_applied(&row.rel_path);
+                        }
+                        self.stats.unrowed_adopted += 1;
+                        counters::bump(Counter::TransferUnrowedAdopted);
+                        return Ok(true);
+                    }
+                    verdict => verdict,
                 }
-                verdict => verdict,
-            },
+            }
             Ok(None) => unrowed::Verdict::Other,
             Err(_) => unrowed::Verdict::Unproven,
         };
@@ -2601,7 +4170,13 @@ impl<W: Write> Inbound<'_, W> {
     }
 
     /// The source refused an entry's capture after any of its data.
-    fn refused(&mut self, entry: u64, rel_path: &[u8], code: String) -> Result<()> {
+    fn refused(
+        &mut self,
+        entry: u64,
+        rel_path: &[u8],
+        code: String,
+        sqlite_code: Option<i32>,
+    ) -> Result<()> {
         self.release(entry);
         let incoming = self
             .incoming
@@ -2615,7 +4190,7 @@ impl<W: Write> Inbound<'_, W> {
                 }
                 row
             }
-            Incoming::AwaitManifest { row, .. } => row,
+            Incoming::AwaitManifest(seat) => seat.row,
             Incoming::Filling(Filling { row, plan, .. }) => {
                 if let Plan::Write(staging) = plan {
                     self.open -= 1;
@@ -2627,7 +4202,7 @@ impl<W: Write> Inbound<'_, W> {
         if row.rel_path != rel_path {
             return Err(BulkloadRefusal::ProtocolStateViolation);
         }
-        self.stats.refusals.push((row.rel_path, code));
+        self.stats.refuse(row.rel_path, code, sqlite_code);
         Ok(())
     }
 
@@ -2636,7 +4211,14 @@ impl<W: Write> Inbound<'_, W> {
         if chunks.len() > MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::FrameCodec);
         }
-        let Some(Incoming::AwaitManifest { row, key }) = self.incoming.remove(&entry) else {
+        let Some(Incoming::AwaitManifest(Seat {
+            row,
+            key,
+            record,
+            snapshot,
+            failure,
+        })) = self.incoming.remove(&entry)
+        else {
             return Err(BulkloadRefusal::ProtocolStateViolation);
         };
         let manifest = Manifest { root, chunks };
@@ -2649,7 +4231,9 @@ impl<W: Write> Inbound<'_, W> {
         let materialize_started = Instant::now();
         self.salvage.refresh(self.target);
         let mut salvaged_from = Vec::new();
-        let plan = if manifest.is_consistent() {
+        let plan = if let Some(refusal) = failure {
+            Plan::Refuse(refusal)
+        } else if manifest.is_consistent() {
             if self.open >= MAX_OPEN_ENTRIES {
                 return Err(BulkloadRefusal::ProtocolStateViolation);
             }
@@ -2695,6 +4279,8 @@ impl<W: Write> Inbound<'_, W> {
             Incoming::Filling(Filling {
                 row,
                 key,
+                record,
+                snapshot,
                 manifest,
                 offsets,
                 plan,
@@ -2724,12 +4310,11 @@ impl<W: Write> Inbound<'_, W> {
         };
         // A source that could not keep a manifest's chunks streams the entry
         // in place of the manifest (#77 review F1).
-        if let Some(Incoming::AwaitManifest { .. }) = self.incoming.get(&header.entry) {
-            if let Some(Incoming::AwaitManifest { row, key }) = self.incoming.remove(&header.entry)
-            {
+        if let Some(Incoming::AwaitManifest(_)) = self.incoming.get(&header.entry) {
+            if let Some(Incoming::AwaitManifest(seat)) = self.incoming.remove(&header.entry) {
                 self.incoming.insert(
                     header.entry,
-                    Incoming::Streaming(Streaming::new(row, key, true)),
+                    Incoming::Streaming(Streaming::new(seat, true)),
                 );
             }
         }
@@ -2795,14 +4380,19 @@ impl<W: Write> Inbound<'_, W> {
             .incoming
             .remove(&entry)
             .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
-        let (rel_path, outcome) = match incoming {
-            Incoming::AwaitManifest { .. } => return Err(BulkloadRefusal::ProtocolStateViolation),
+        let (rel_path, snapshot, outcome) = match incoming {
+            Incoming::AwaitManifest(_) => return Err(BulkloadRefusal::ProtocolStateViolation),
             Incoming::Streaming(streaming) => {
                 if chunks as usize != streaming.specs.len() || size != streaming.offset {
                     return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 let rel_path = streaming.row.rel_path.clone();
-                (rel_path, self.end_streaming(streaming, root, racy))
+                let snapshot = streaming.snapshot;
+                (
+                    rel_path,
+                    snapshot,
+                    self.end_streaming(streaming, root, racy),
+                )
             }
             Incoming::Filling(filling) => {
                 if !filling.expected.is_empty()
@@ -2813,9 +4403,13 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
                 let rel_path = filling.row.rel_path.clone();
-                (rel_path, self.end_filling(filling, racy))
+                let snapshot = filling.snapshot;
+                (rel_path, snapshot, self.end_filling(filling, racy))
             }
         };
+        if snapshot && outcome.is_ok() {
+            self.snapshot_applied(&rel_path);
+        }
         // Every End is answered. `held` is sent once the output's group
         // has committed: its file and directory are sealed and the store
         // commit has drained them, so the bytes are durable here under the
@@ -2872,6 +4466,8 @@ impl<W: Write> Inbound<'_, W> {
         let Streaming {
             row,
             key,
+            record,
+            snapshot,
             staged,
             specs,
             offset,
@@ -2896,7 +4492,9 @@ impl<W: Write> Inbound<'_, W> {
             // path is adopted against the streamed chunks, as a manifest
             // would have been checked, and the staged copy is dropped. One
             // that holds other bytes is superseded by the staged copy when
-            // it is this store's own (WP0(d), #187), and refused otherwise.
+            // it is this store's own (WP0(d), #187), and refused otherwise;
+            // a snapshot's too (#218, OI-1003-Q146), its sidecars checked
+            // once more just before the exchange.
             let existing = self.target.existing(&row).and_then(|existing| {
                 let Some((file, parent)) = existing else {
                     return Ok(None);
@@ -2934,7 +4532,7 @@ impl<W: Write> Inbound<'_, W> {
                     if let Some(staged) = staged {
                         let _ = staged.discard();
                     }
-                    return self.adopt(file, parent, &row, (key, racy, root), identity);
+                    return self.adopt(file, parent, &row, (key, record, racy, root), identity);
                 }
                 Ok(None) => (),
                 Err(refusal) => {
@@ -2945,7 +4543,7 @@ impl<W: Write> Inbound<'_, W> {
                 }
             }
         }
-        let staged = match (checked, staged) {
+        let mut staged = match (checked, staged) {
             (Ok(()), Some(staged)) => staged,
             // An empty file has no data frame; it is staged here.
             (Ok(()), None) => self.target.stage(&row)?,
@@ -2957,13 +4555,40 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         fault_point!(ReceiveAfterChunks);
-        self.publish(staged, &row, (key, racy, root), hints, supersede)
+        if snapshot {
+            if let Err(refusal) = self.verify_snapshot(&staged, &row) {
+                let _ = staged.discard();
+                return Err(refusal);
+            }
+            staged.mark_sqlite();
+        }
+        self.publish(staged, &row, (key, record, racy, root), hints, supersede)
+    }
+
+    /// A received snapshot's last checks before it is published (#218):
+    /// still no `-wal`, `-journal` or `-shm` beside its path (R5's check
+    /// again, as late as it can be made: one appearing after it is a stated
+    /// residual), and the staged file is a sound database in journal mode
+    /// DELETE whose `integrity_check` says `ok` (design section 9,
+    /// `provider_sqlite::verify_received`). A failure refuses the entry; the
+    /// caller discards the staged file.
+    fn verify_snapshot(&self, staged: &StagedFile, row: &RowSchema) -> Result<()> {
+        if self.target.sqlite_sidecars_present(&row.rel_path)? {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        crate::provider_sqlite::verify_received(
+            staged.file(),
+            &self.target.staged_path(&row.rel_path, staged),
+            row.size,
+        )
     }
 
     fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<()> {
         let Filling {
             row,
             key,
+            record,
+            snapshot,
             manifest,
             plan,
             failure,
@@ -2988,23 +4613,30 @@ impl<W: Write> Inbound<'_, W> {
                     }
                     verified?
                 };
-                self.adopt(file, parent, &row, (key, racy, root), identity)
+                self.adopt(file, parent, &row, (key, record, racy, root), identity)
             }
             Plan::NoExchange(settled) => {
                 self.remember_refusal(&key, settled, racy, RefusedOutput::ExchangeUnsupported);
                 Err(BulkloadRefusal::DestinationExchangeUnsupported)
             }
-            Plan::Write(staging) => {
+            Plan::Write(mut staging) => {
                 self.open -= 1;
                 if let Some(refusal) = failure {
                     let _ = staging.staged.discard();
                     return Err(refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
+                if snapshot {
+                    if let Err(refusal) = self.verify_snapshot(&staging.staged, &row) {
+                        let _ = staging.staged.discard();
+                        return Err(refusal);
+                    }
+                    staging.staged.mark_sqlite();
+                }
                 self.publish(
                     staging.staged,
                     &row,
-                    (key, racy, root),
+                    (key, record, racy, root),
                     staging.hints,
                     staging.supersede.map(|owned| *owned),
                 )
@@ -3021,13 +4653,14 @@ impl<W: Write> Inbound<'_, W> {
     /// its row then never commits (a failed group, a crash), the next run
     /// adopts it from the record without a source read. Its row records the
     /// identity after the record's write, and the group's file seal makes
-    /// the record durable before the row commits.
+    /// the record durable before the row commits. `record` is the record's
+    /// key: a snapshot's is keyed on its settled `-wal` too (#218, R1).
     fn adopt(
         &self,
         file: std::fs::File,
         parent: Arc<std::fs::File>,
         row: &RowSchema,
-        (key, racy, root): (Vec<u8>, bool, [u8; 32]),
+        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
         identity: StatIdentity,
     ) -> Result<()> {
         let identity = if racy {
@@ -3036,7 +4669,7 @@ impl<W: Write> Inbound<'_, W> {
             unrowed::refresh(
                 &file,
                 &unrowed::CaptureRecord {
-                    key: unrowed::record_key(row)?,
+                    key: record,
                     root,
                     size: row.size,
                 },
@@ -3062,30 +4695,24 @@ impl<W: Write> Inbound<'_, W> {
     /// directory. The record goes first: a read-only mode would refuse it.
     /// With `supersede`, the group commit exchanges it with this store's
     /// own output at the path instead of renaming it into a free one
-    /// (WP0(d), #187).
+    /// (WP0(d), #187). `record` is the record's key (#218, R1).
     fn publish(
         &mut self,
         staged: StagedFile,
         row: &RowSchema,
-        (key, racy, root): (Vec<u8>, bool, [u8; 32]),
+        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
         hints: Vec<ChunkHint>,
         supersede: Option<OwnedOutput>,
     ) -> Result<()> {
         if !racy {
-            match unrowed::record_key(row) {
-                Ok(record_key) => unrowed::write_record(
-                    staged.file(),
-                    &unrowed::CaptureRecord {
-                        key: record_key,
-                        root,
-                        size: row.size,
-                    },
-                ),
-                Err(refusal) => {
-                    let _ = staged.discard();
-                    return Err(refusal);
-                }
-            }
+            unrowed::write_record(
+                staged.file(),
+                &unrowed::CaptureRecord {
+                    key: record,
+                    root,
+                    size: row.size,
+                },
+            );
         }
         if let Err(refusal) = crate::io::sys::fchmod(&**staged.file(), row.mode & 0o7777)
             .refuse_at("transfer::publish")
@@ -3246,7 +4873,8 @@ struct Staging {
 /// `DESTINATION_EXCHANGE_UNSUPPORTED` instead, before anything is staged.
 /// Any other existing output is adopted if its bytes verify when the entry
 /// ends, and refused `DESTINATION_OCCUPIED` if they do not: it is never
-/// replaced.
+/// replaced. A `SQLite` snapshot's output follows the same rule (#218,
+/// OI-1003-Q146).
 fn plan_file(
     context: &ReceiveContext<'_>,
     row: &RowSchema,
@@ -3295,7 +4923,11 @@ fn plan_file(
                         Ok(identity) => return Plan::Adopt(file, parent, Some(identity)),
                         // Changed. Without an atomic exchange the output
                         // cannot be superseded: say so now, before a byte
-                        // is staged or asked of the source.
+                        // is staged or asked of the source. A snapshot
+                        // output is superseded the same way (#218,
+                        // OI-1003-Q146): its sidecars were checked at
+                        // Decide and are checked again just before the
+                        // exchange.
                         Err(BulkloadRefusal::DestinationOccupied) => {
                             match context.target.exchange_supported(row) {
                                 Ok(true) => Some(Box::new(owned)),

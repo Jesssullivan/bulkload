@@ -21,7 +21,8 @@ bulkload-agent -- ordinary-file transport and offline SQLite composition
 USAGE:
     bulkload-agent [--durability=group|strict] [--min-free-percent=N]
                    [--priority=background|normal]
-                   [--source-ledger-sync=relaxed|full] <SUBCOMMAND>
+                   [--source-ledger-sync=relaxed|full]
+                   [--sqlite=refuse|snapshot] <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
@@ -166,9 +167,36 @@ BOUNDARIES:
     file is preserved and refused DESTINATION_OCCUPIED, and remembered: an
     unchanged rerun does not read its seat again. On a file system with no
     atomic exchange a changed seat is refused
-    DESTINATION_EXCHANGE_UNSUPPORTED before it is staged. They refuse live
-    SQLite files, sniffing each once (source_sniff_bytes on the counters
-    line) and remembering the refusal.
+    DESTINATION_EXCHANGE_UNSUPPORTED before it is staged. With
+    --sqlite=refuse (the default) they refuse live SQLite files, sniffing
+    each once (source_sniff_bytes on the counters line) and remembering the
+    refusal, and every -wal, -shm and -journal by name.
+    --sqlite=snapshot (#218; copy and pull, carried to serve in its Open):
+    a database is carried as a backup-API snapshot the source takes into its
+    private state (SOURCE_STATE/sqlite-snapshots, at most 4 GiB of slots
+    at once, and never past the --min-free-percent floor of that
+    filesystem: BUDGET_EXCEEDED), never its live bytes, and verified
+    (integrity_check, at the source and again at the destination) before
+    it is published, in journal mode DELETE. A file without the SQLite
+    magic beside a -wal that holds frames (an encrypted store) is refused
+    SQLITE_STATE_CHANGED, never carried raw. An unchanged store is reused with nothing opened: its key is its
+    row and its -wal's identity. A -wal, -shm or -journal beside a database
+    is never carried: it is covered when its database was carried as a
+    snapshot, and refused SQLITE_STATE_CHANGED otherwise. A changed store
+    supersedes its own older snapshot output through the same exchange
+    (OI-1003-Q146) only when no -wal, -journal or -shm sits beside the
+    path here, checked at the decision and again just before the exchange;
+    a path with one beside it, or holding a file this store did not land
+    or that was touched since, is refused DESTINATION_OCCUPIED and left as
+    it is. A store failing integrity_check is refused
+    SQLITE_INTEGRITY_CHECK_FAILED (disposition abandon, OI-1003-Q148).
+    The default stays --sqlite=refuse (OI-1003-Q147): a pull that must
+    carry databases passes --sqlite=snapshot.
+    The source half refuses SQLITE_SOURCE_AS_ROOT as root
+    (the whole session, before anything is opened) and
+    SQLITE_SOURCE_NOT_OWNER for a database another user owns. The
+    transfer line reports sqlite_mode=, sqlite_snapshots= and
+    sqlite_sidecars_covered=.
     They enumerate the source each run; completed content is resumable.
     File manifests allow 131072 chunks and frames at most 8 MiB; oversized files refuse.
     Git-native divergent union is not supplied by copy/pull.
@@ -378,6 +406,15 @@ fn global_flags(
             .and_then(|value| value.strip_prefix("--priority="))
         {
             *priority = Some(class.parse()?);
+            continue;
+        }
+        if let Some(mode) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--sqlite="))
+        {
+            bulkload_agent::transfer::set_sqlite_mode(bulkload_agent::transfer::parse_sqlite_mode(
+                mode,
+            )?);
             continue;
         }
         if let Some(mode) = arg
@@ -1159,17 +1196,27 @@ fn report_counters(verb: &str, started: std::time::Instant, priority: Priority) 
 fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()> {
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
-         source_engine_temporaries={} capped_subtrees={}",
+         source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
+         sqlite_sidecars_covered={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
         stats.source_bytes_read,
         stats.refusals.len(),
         stats.source_engine_temporaries.len(),
-        stats.capped_subtrees()
+        stats.capped_subtrees(),
+        bulkload_agent::transfer::sqlite_mode_label(stats.sqlite_mode),
+        stats.sqlite_snapshots.len(),
+        stats.sqlite_sidecars_covered.len()
     );
     for (path, code) in &stats.refusals {
         eprintln!("refused {}: {code}", path.escape_ascii());
+        if let Some(disposition) = stats.default_disposition(path, code) {
+            eprintln!(
+                "default-disposition {}: {disposition} ({code}, OI-1003-Q148)",
+                path.escape_ascii()
+            );
+        }
     }
     if stats.temporaries_removed > 0 {
         eprintln!("temporaries-removed {}", stats.temporaries_removed);
@@ -1231,7 +1278,11 @@ fn selftest() -> Result<()> {
     }
     println!("  freshness     stale -> record -> fresh (ok)");
 
-    let frame = Frame::Control(Control::Entry { entry: 0, row });
+    let frame = Frame::Control(Control::Entry {
+        entry: 0,
+        row,
+        wal: None,
+    });
     let encoded = frame.encode()?;
     let (decoded, consumed) = Frame::decode(&encoded)?;
     if decoded != frame || consumed != encoded.len() {

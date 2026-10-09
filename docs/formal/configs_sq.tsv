@@ -1,0 +1,38 @@
+# SqliteCarry.tla's TLC configs, checked by `just tla-check` in this order (README.md, "SqliteCarry").
+# Rendered from catalogue/SqliteCarry.dhall by `just tla-render`; edit the catalogue, not this file.
+# Tab-separated columns, as configs.tsv's:
+#   name            the config, MC_<name>.cfg
+#   expect          pass | fail | reach | inconclusive
+#   named-property  fail: the one property it must violate;
+#                   reach: the Witness_ invariant it must violate;
+#                   inconclusive: WithinBudget; otherwise all
+#   never           pass: the actions coverage must show never enabled,
+#                   comma-separated and sorted (- for none);
+#                   * for any other row (not checked)
+#   flags           extra TLC flags (- for none)
+name	expect	named-property	never	flags
+MC_sq_budget_selftest	inconclusive	WithinBudget	*	-
+MC_sq_wal	pass	all	BackupRefused,RenameAfterUnlink,SqlCommitRollback	-
+MC_sq_rollback	pass	all	BackupRefused,RenameAfterUnlink,SqlCheckpoint,SqlCommitWal,SqlWalReset	-
+MC_sq_root	pass	all	BackupBegin,BackupEnd,BackupRefused,BackupStep,CommitRow,Crash,Decide,DestTouch,Exchange,Publish,RenameAfterUnlink,SidecarAppear,SidecarRemoved,SqlCommitRollback,StepUnlock,WalkWal	-
+MC_sq_not_owner	pass	all	BackupBegin,BackupEnd,BackupRefused,BackupStep,CommitRow,DestTouch,Exchange,Publish,RenameAfterUnlink,SidecarAppear,SidecarRemoved,SqlCommitRollback,StepUnlock	-
+MC_sq_raw_base	pass	all	BackupBegin,BackupEnd,BackupRefused,BackupStep,CommitRow,DestTouch,Exchange,Publish,RenameAfterUnlink,SidecarAppear,SidecarRemoved,SqlCommitRollback,StepUnlock	-
+MC_sq_v5_record	pass	all	BackupRefused,DestTouch,RenameAfterUnlink,SqlCommitRollback	-
+MC_sq_reach_reuse	reach	Witness_Reuse	*	-
+MC_sq_reach_restart	reach	Witness_Restart	*	-
+MC_sq_reach_superseded	reach	Witness_Superseded	*	-
+MC_sq_neg_sqlite_raw_send	fail	SqliteNeverTorn	*	-
+MC_sq_neg_sqlite_key_main_only	fail	SqliteReuseSound	*	-
+MC_sq_neg_sqlite_record_unsettled	fail	SqliteReuseSound	*	-
+MC_sq_neg_sqlite_capture_record_main_only	fail	SqliteReuseSound	*	-
+MC_sq_neg_wal_lock_exclusive	fail	WalWriterNeverBlocked	*	-
+MC_sq_neg_sqlite_unbounded_pinned	fail	S2_BackupLockBounded	*	-
+MC_sq_neg_sqlite_as_root	fail	SqliteRootRefusedUpFront	*	-
+MC_sq_neg_sqlite_not_owner_opened	fail	SqliteOwnerRefused	*	-
+MC_sq_neg_sqlite_publish_beside_sidecar	fail	SqliteNoForeignSidecar	*	-
+MC_sq_neg_sqlite_supersede_no_recheck	fail	SqliteNoForeignSidecar	*	-
+MC_sq_neg_sqlite_supersede_unowned	fail	SqliteNoClobber	*	-
+MC_sq_neg_sqlite_supersede_unlink_rename	fail	SqliteOldOrNewWhole	*	-
+MC_sq_neg_sidecar_covered_by_name	fail	SidecarCoverageSound	*	-
+MC_sq_neg_sqlite_header_refusal_in_snapshot_mode	fail	SnapshotModeIgnoresV5Record	*	-
+MC_sq_neg_sqlite_reuse_ignored	fail	S3_UnchangedSqliteZero	*	-

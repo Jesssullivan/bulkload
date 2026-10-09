@@ -161,14 +161,28 @@ pub enum BulkloadRefusal {
     GitChildFailed(StderrClass),
 
     // ---- sqlite -----------------------------------------------------------
-    /// `PRAGMA quick_check` or the foreign-key check failed.
+    /// `PRAGMA quick_check` or the foreign-key check failed; for a `SQLite`
+    /// snapshot seat (#218), the snapshot's `integrity_check` at the source
+    /// or the destination. Its default S4 disposition is `abandon`
+    /// (OI-1003-Q148).
     SqliteIntegrityCheckFailed,
     /// The database yielded a value type or magnitude the schema cannot carry.
     SqliteUnsupportedValue,
-    /// Shared rows diverged between planning and apply.
+    /// `SQLite` state that may not be read or carried as it is: shared rows
+    /// diverged between planning and apply (the provider verbs); a seat
+    /// whose first bytes are a `SQLite` database or WAL magic, or a `-wal`,
+    /// `-shm` or `-journal` by name (the transfer, #186; in `--sqlite=snapshot`
+    /// mode only WAL magic, an orphan sidecar and a sidecar whose base was not
+    /// carried as a snapshot, #218); or a backup step that met a writer's
+    /// lock (busy timeout 0).
     SqliteStateChanged,
     /// The `SQLite` online backup (open, step or finish) failed (WP3).
-    /// Carries `SQLite`'s extended result code when `SQLite` reported one.
+    /// Carries `SQLite`'s extended result code when `SQLite` reported one,
+    /// which crosses the wire beside the code ([`Self::sqlite_code`]):
+    /// corruption found by the backup step (primary code 11
+    /// `SQLITE_CORRUPT` or 26 `SQLITE_NOTADB`) is an integrity failure and
+    /// takes [`Self::SqliteIntegrityCheckFailed`]'s default S4 disposition,
+    /// `abandon` (OI-1003-Q148).
     SqliteBackupFailed(Option<i32>),
     /// A provider verb that reads a source database was run with effective
     /// uid 0 (S2, OI-1003-Q76). Opened as root, `SQLite` re-applies the
@@ -176,6 +190,14 @@ pub enum BulkloadRefusal {
     /// `-wal`'s ctime: a source metadata write no ruling admits. The verb
     /// refuses before it opens anything; run it as the database's owner.
     SqliteSourceAsRoot,
+    /// A database seat a `--sqlite=snapshot` transfer would open with
+    /// `SQLite` is owned by another user than the reader (S2, #218). `SQLite`
+    /// creates the database's `-shm` (and, under OI-1003-Q72, an empty
+    /// `-wal`) owned by the reading user, and the owner's own writer may then
+    /// fail to open them read-write. Refused per seat, from the `fstat` of
+    /// the descriptor the sniff already holds, before any `SQLite` open; run
+    /// the transfer's source half as the database's owner.
+    SqliteSourceNotOwner,
 
     // ---- budgets / transport ------------------------------------------------
     /// A capture, row, or spill budget was exceeded.
@@ -227,6 +249,18 @@ pub enum BulkloadRefusal {
 }
 
 impl BulkloadRefusal {
+    /// `SQLite`'s extended result code, which only
+    /// [`Self::SqliteBackupFailed`] carries; sent beside the code in a
+    /// refusal frame, so the receiver can tell the backup's corruption
+    /// (OI-1003-Q148) from its other failures.
+    #[must_use]
+    pub const fn sqlite_code(&self) -> Option<i32> {
+        match *self {
+            Self::SqliteBackupFailed(code) => code,
+            _ => None,
+        }
+    }
+
     /// The stable machine-readable code for this refusal.
     ///
     /// These strings are the wire/log identity of a refusal and must not change
@@ -277,6 +311,7 @@ impl BulkloadRefusal {
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
             Self::SqliteBackupFailed(_) => "SQLITE_BACKUP_FAILED",
             Self::SqliteSourceAsRoot => "SQLITE_SOURCE_AS_ROOT",
+            Self::SqliteSourceNotOwner => "SQLITE_SOURCE_NOT_OWNER",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::DestinationOccupied => "DESTINATION_OCCUPIED",
@@ -339,6 +374,7 @@ impl BulkloadRefusal {
         "SQLITE_STATE_CHANGED",
         "SQLITE_BACKUP_FAILED",
         "SQLITE_SOURCE_AS_ROOT",
+        "SQLITE_SOURCE_NOT_OWNER",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
         "DESTINATION_OCCUPIED",
@@ -546,6 +582,7 @@ mod tests {
             BulkloadRefusal::SqliteStateChanged,
             BulkloadRefusal::SqliteBackupFailed(None),
             BulkloadRefusal::SqliteSourceAsRoot,
+            BulkloadRefusal::SqliteSourceNotOwner,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::DestinationOccupied,

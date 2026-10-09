@@ -1,7 +1,8 @@
 {- docs/formal's typed catalogue (OI-1003-Q32): every TLC config of
    BulkloadTransfer.tla, the verdict of every mutation, and the
    traceability row of every model property. GitCarry.dhall holds the same
-   for GitCarry.tla (OI-1003-Q43), and this file renders both modules
+   for GitCarry.tla (OI-1003-Q43), SqliteCarry.dhall for SqliteCarry.tla
+   (#218, OI-1003-Q146), and this file renders every module
    (T.Module): `files` holds each module's run order and configs, and
    `grounding` one entry per module.
 
@@ -1944,6 +1945,9 @@ let constantNames =
 -- GitCarry.tla's part (OI-1003-Q43).
 let GitCarry = ./GitCarry.dhall
 
+-- SqliteCarry.tla's part (#218, OI-1003-Q146).
+let SqliteCarry = ./SqliteCarry.dhall
+
 let module = T.moduleEntry T.Module.BulkloadTransfer
 
 in  { files =
@@ -1954,6 +1958,7 @@ in  { files =
               (\(r : T.Row) -> { name = "${r.name}.cfg", text = cfgText r })
               rows
         # GitCarry.files
+        # SqliteCarry.files
     , grounding =
       [ { module = showConstructor module.module
         , spec = module.spec
@@ -1981,6 +1986,7 @@ in  { files =
         , labelSets = [] : List { name : Text, labels : List Text }
         }
       , GitCarry.grounding
+      , SqliteCarry.grounding
       ]
     , invariants
     , supersedeInvariants
@@ -1988,4 +1994,5 @@ in  { files =
     , gitCarryInvariants = GitCarry.invariants
     , gitCarryNversion = GitCarry.nversion
     , decide = GitCarry.decide
+    , sqliteCarryInvariants = SqliteCarry.invariants
     }

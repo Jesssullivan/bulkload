@@ -13,7 +13,8 @@
 //!   in place gets its rows back, this store's displaced output is removed
 //!   and the staged file at the leaf keeps an ownership row,
 //!   and a displaced file of anyone else is exchanged back, or kept aside
-//!   and reported when the leaf no longer holds the staged file.
+//!   and reported when the leaf no longer holds the staged file as staged
+//!   (another file, or the staged one written since).
 
 #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
@@ -536,6 +537,47 @@ fn a_displaced_file_of_another_writer_is_restored_by_the_sweep() {
     assert_eq!(salvaged, 0);
     assert_eq!(fixture.rows(), 0);
     assert_eq!(fixture.intents(), 0);
+}
+
+/// The displaced file is exchanged back only over the staged file as it was
+/// staged. A crash between the exchange and its displaced check leaves the
+/// new file at the leaf; written since (an application's commit after a
+/// reboot, the normal case for a `SQLite` snapshot, OI-1003-Q146), by size or
+/// by mtime alone, it is no longer the file this store staged: exchanging
+/// back and unlinking the staged name would delete those writes. Both stay
+/// where they are, the displaced file kept aside and reported with its
+/// record, as when the leaf holds another file.
+#[test]
+fn a_displaced_file_is_not_put_back_over_writes_to_the_new_output() {
+    for grown in [true, false] {
+        let fixture = Fixture::published();
+        let temporary = fixture.interrupted(true, || fixture.replace_leaf(FOREIGN));
+        assert_eq!(std::fs::read(&temporary).unwrap(), FOREIGN);
+        let mut file = File::options().write(true).open(fixture.leaf()).unwrap();
+        if grown {
+            file.set_len(NEW.len() as u64 + 16).unwrap();
+        } else {
+            file.write_all(b"THE").unwrap();
+            file.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        drop(file);
+        let written = std::fs::read(fixture.leaf()).unwrap();
+        let name = temporary.file_name().unwrap().as_encoded_bytes().to_vec();
+
+        let (swept, salvaged) = fixture.sweep();
+
+        assert_eq!(
+            std::fs::read(fixture.leaf()).unwrap(),
+            written,
+            "grown={grown}: the writes made to the new file are kept"
+        );
+        assert_eq!(std::fs::read(&temporary).unwrap(), FOREIGN, "grown={grown}");
+        assert_eq!(swept.left, std::slice::from_ref(&name), "grown={grown}");
+        assert_eq!(swept.removed, 0, "grown={grown}");
+        assert_eq!(salvaged, 0, "grown={grown}");
+        assert_eq!(fixture.intents(), 1, "grown={grown}: its record is kept");
+    }
 }
 
 /// The displaced file cannot be exchanged back once the leaf holds

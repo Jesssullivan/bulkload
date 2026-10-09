@@ -71,8 +71,9 @@
 //! directory is decided ([`Destination::sweep`]): the old output still in
 //! place gets its rows back; the new one in place is adopted like any
 //! unrowed output (#169); a displaced file that is neither is exchanged
-//! back, or, when the leaf no longer holds the staged file, left where it is
-//! and reported, never removed.
+//! back, or, when the leaf no longer holds the staged file as it was staged
+//! (another file, or the staged one written since), left where it is and
+//! reported, never removed.
 //!
 //! One limit: between the last look at the old output and the exchange, a
 //! third party that rewrites it in place and restores its mtime is not
@@ -92,6 +93,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{Read as _, Seek as _};
 use std::os::fd::AsFd as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -753,8 +755,10 @@ impl Destination {
     ///   seat has changed again. The same holds when the staged name is
     ///   already gone;
     /// - the staged name holds any other file: one this store does not own,
-    ///   displaced. While the leaf still holds the staged file the two are
-    ///   exchanged back, the directory sealed, and the staged file removed.
+    ///   displaced. While the leaf still holds the staged file, unwritten
+    ///   since it was staged (its inode, and the size and mtime the record
+    ///   holds), the two are exchanged back, the directory sealed, and the
+    ///   staged file removed.
     ///   Otherwise the displaced file stays where it is, reported in
     ///   [`Sweep::left`], with its record: never removed.
     ///
@@ -794,10 +798,14 @@ impl Destination {
                     store.settle_supersede(&intent, false, own)?;
                 }
                 Some(_) => {
+                    // Exchanged back only over the staged file as staged
+                    // (`own`): one written since the crash (an application
+                    // committing to a new snapshot after a reboot,
+                    // OI-1003-Q146) holds writes the unlink would delete.
                     // Sealed between the exchange back and the unlink, so no
                     // crash keeps the unlink alone: it would then hit the
                     // displaced file.
-                    let restored = at_leaf.is_some_and(|found| is_staged(&found, &intent))
+                    let restored = own.is_some()
                         && crate::io::exchange(directory, &temp, &leaf).is_ok()
                         && crate::io::durable::seal_dir(directory).is_ok();
                     if restored {
@@ -1002,7 +1010,41 @@ impl Destination {
             leaf,
             file: Arc::new(file),
             sealed: false,
+            sqlite: false,
         })
+    }
+
+    /// Whether a `-wal`, `-journal` or `-shm` of any kind sits beside the
+    /// path `rel_path` names (#218, review R5). `SQLite` would apply a stale
+    /// `-wal`, or roll a stale hot `-journal` back, into a database
+    /// published there; a snapshot is published with no sidecar beside it.
+    /// Only `lstat`s beneath the output's directory. A missing directory has
+    /// none; an `lstat` that fails for any other reason counts as present
+    /// (fail closed).
+    ///
+    /// # Errors
+    /// Refuses an unsafe ancestor.
+    pub(crate) fn sqlite_sidecars_present(&self, rel_path: &[u8]) -> Result<bool> {
+        let (parent, leaf) = match self.shared_parent(rel_path) {
+            Ok(found) => found,
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => return Ok(false),
+            Err(refusal) => return Err(refusal),
+        };
+        sqlite_sidecar_beside(&parent, &leaf)
+    }
+
+    /// The path of a staged file under this destination's root, for a
+    /// reader that opens by path (#218: `SQLite`'s verification of a
+    /// received snapshot, `SQLITE_OPEN_NOFOLLOW`).
+    pub(crate) fn staged_path(&self, rel_path: &[u8], staged: &StagedFile) -> PathBuf {
+        let mut path = self.path().to_path_buf();
+        if let Some(at) = rel_path.iter().rposition(|byte| *byte == b'/') {
+            path.push(std::ffi::OsStr::from_bytes(
+                rel_path.get(..at).unwrap_or_default(),
+            ));
+        }
+        path.push(std::ffi::OsStr::from_bytes(staged.temporary.as_bytes()));
+        path
     }
 
     /// Open a published output read-only by relative path, component by
@@ -1067,6 +1109,10 @@ pub(crate) struct StagedFile {
     /// Sealed by [`StagedFile::seal`] already; publication does not seal it
     /// again.
     sealed: bool,
+    /// A received `SQLite` snapshot (#218): its publication, a rename or a
+    /// superseding exchange, first checks once more that no `-wal`,
+    /// `-journal` or `-shm` sits beside the leaf (OI-1003-Q146).
+    sqlite: bool,
 }
 
 impl StagedFile {
@@ -1089,6 +1135,21 @@ impl StagedFile {
         &self.file
     }
 
+    /// Mark the staged file as a verified `SQLite` snapshot (#218): its
+    /// rename into a free leaf, or its exchange with this store's own
+    /// output (OI-1003-Q146), is refused `DESTINATION_OCCUPIED` when a
+    /// `-wal`, `-journal` or `-shm` sits beside the leaf immediately before
+    /// it, and the old output, if any, stays where it is.
+    pub(crate) const fn mark_sqlite(&mut self) {
+        self.sqlite = true;
+    }
+
+    /// Whether a sidecar now sits beside the leaf of a staged snapshot.
+    /// Fails closed: an `lstat` that fails other than `ENOENT` counts.
+    fn sqlite_sidecar_appeared(&self) -> bool {
+        self.sqlite && sqlite_sidecar_beside(&self.parent, &self.leaf).unwrap_or(true)
+    }
+
     /// Remove the temporary name, abandoning the file.
     ///
     /// # Errors
@@ -1103,6 +1164,15 @@ impl StagedFile {
         if let Err(error) = self.seal() {
             let _ = unlink(&self.parent, &self.temporary);
             return Err(error);
+        }
+        #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+        before_rename(&self.parent, self.leaf.as_bytes());
+        // The same last look as the exchange's (#218): a snapshot never
+        // lands beside a sidecar a third party left at a free path.
+        if self.sqlite_sidecar_appeared() {
+            let _ = unlink(&self.parent, &self.temporary);
+            counters::bump(Counter::DestSqliteSidecarRefused);
+            return Err(BulkloadRefusal::DestinationOccupied);
         }
         if let Err(error) = crate::io::publish_noreplace(&self.parent, &self.temporary, &self.leaf)
         {
@@ -1194,6 +1264,22 @@ impl StagedFile {
         }
         #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
         before_exchange(&self.parent, self.leaf.as_bytes());
+        // A snapshot never lands beside a sidecar (#218, OI-1003-Q146): a
+        // stale `-wal` would be applied to it, a hot `-journal` rolled into
+        // it. Looked at last, after the identity check, so the window to
+        // the exchange is one `lstat` per suffix (a stated residual).
+        if self.sqlite_sidecar_appeared() {
+            let _ = unlink(&self.parent, &self.temporary);
+            counters::bump(Counter::DestSqliteSidecarRefused);
+            let restore = stat_at(&self.parent, &self.leaf)
+                .ok()
+                .flatten()
+                .is_some_and(|found| is_owned(&found, &intent.owned, true));
+            return Exchanged::Undone {
+                refusal: BulkloadRefusal::DestinationOccupied,
+                restore,
+            };
+        }
         if let Err(error) = crate::io::exchange(&self.parent, &self.temporary, &self.leaf) {
             let _ = unlink(&self.parent, &self.temporary);
             // Nothing moved. The rows go back only if the leaf is still
@@ -1239,11 +1325,12 @@ impl StagedFile {
             };
         }
         // Not this store's file: exchange it back, if the staged file is
-        // still what the leaf holds.
+        // still what the leaf holds, as staged (the sweep's test: a file
+        // written since holds writes the unlink would delete).
         let in_place = stat_at(&self.parent, &self.leaf)
             .ok()
             .flatten()
-            .is_some_and(|found| is_staged(&found, intent));
+            .is_some_and(|found| published(&found, intent).is_some());
         if in_place && crate::io::exchange(&self.parent, &self.temporary, &self.leaf).is_ok() {
             // Sealed before the staged file's name goes, so no crash keeps
             // that unlink without the exchange back: the unlink would then
@@ -1377,6 +1464,25 @@ pub(crate) fn owned_output(
         .then_some(OwnedOutput { identity, rows }))
 }
 
+/// Whether a `-wal`, `-journal` or `-shm` of any kind sits beside `leaf`
+/// in `parent` (#218, review R5, OI-1003-Q146). Only `lstat`s; an `lstat`
+/// that fails other than `ENOENT` counts as present (fail closed).
+///
+/// # Errors
+/// Refuses a sidecar name that cannot be a C string.
+fn sqlite_sidecar_beside(parent: &File, leaf: &CStr) -> Result<bool> {
+    for suffix in crate::walk::SQLITE_SIDECAR_SUFFIXES {
+        let mut name = leaf.to_bytes().to_vec();
+        name.extend_from_slice(suffix);
+        let name = cstring(&name)?;
+        match crate::io::sys::fstatat_nofollow(parent.as_fd(), &name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
 /// Whether `found` is the file `owned` records: the same inode, size and
 /// mtime, and with `exact` the same ctime too. An exchange moves the ctime
 /// of the files it trades, so a displaced file is compared without it.
@@ -1414,6 +1520,9 @@ fn published(found: &crate::io::Stat, intent: &SupersedeIntent) -> Option<StatId
 /// last look at the output and its exchange, where a third party's write
 /// can still land: by the output's directory (its device and inode) and
 /// leaf name.
+///
+/// [`BEFORE_RENAME`] holds the same for a fresh publish, between its seal
+/// and its last look before the rename.
 #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
 type ExchangeHooks = Vec<(u64, (u64, u64), Vec<u8>, Arc<dyn Fn() + Send + Sync>)>;
 
@@ -1421,21 +1530,45 @@ type ExchangeHooks = Vec<(u64, (u64, u64), Vec<u8>, Arc<dyn Fn() + Send + Sync>)
 static BEFORE_EXCHANGE: std::sync::Mutex<ExchangeHooks> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+static BEFORE_RENAME: std::sync::Mutex<ExchangeHooks> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
 static NEXT_EXCHANGE_HOOK: AtomicU64 = AtomicU64::new(0);
 
 /// Removes its hook when dropped.
 #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
 #[must_use = "the hook is removed as soon as the guard is dropped"]
-pub struct BeforeExchange(u64);
+pub struct BeforeExchange(u64, &'static std::sync::Mutex<ExchangeHooks>);
 
 #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
 impl Drop for BeforeExchange {
     fn drop(&mut self) {
-        BEFORE_EXCHANGE
+        self.1
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retain(|(id, ..)| *id != self.0);
     }
+}
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+fn set_hook(
+    hooks: &'static std::sync::Mutex<ExchangeHooks>,
+    directory: &Path,
+    leaf: &[u8],
+    hook: impl Fn() + Send + Sync + 'static,
+) -> std::io::Result<BeforeExchange> {
+    let found = std::fs::metadata(directory)?;
+    let id = NEXT_EXCHANGE_HOOK.fetch_add(1, Ordering::Relaxed);
+    hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((
+            id,
+            (found.dev(), found.ino()),
+            leaf.to_vec(),
+            Arc::new(hook),
+        ));
+    Ok(BeforeExchange(id, hooks))
 }
 
 /// Test hook: run `hook` just before every superseding publish exchanges
@@ -1449,26 +1582,32 @@ pub fn set_before_exchange(
     leaf: &[u8],
     hook: impl Fn() + Send + Sync + 'static,
 ) -> std::io::Result<BeforeExchange> {
-    let found = std::fs::metadata(directory)?;
-    let id = NEXT_EXCHANGE_HOOK.fetch_add(1, Ordering::Relaxed);
-    BEFORE_EXCHANGE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((
-            id,
-            (found.dev(), found.ino()),
-            leaf.to_vec(),
-            Arc::new(hook),
-        ));
-    Ok(BeforeExchange(id))
+    set_hook(&BEFORE_EXCHANGE, directory, leaf, hook)
+}
+
+/// Test hook: run `hook` before a fresh publish of `leaf` in `directory`.
+///
+/// It runs after the staged file is sealed and before the publish's last
+/// look and its rename without replacement (#218: a sidecar that appears
+/// there).
+///
+/// # Errors
+/// Returns the failure to stat `directory`.
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+pub fn set_before_rename(
+    directory: &Path,
+    leaf: &[u8],
+    hook: impl Fn() + Send + Sync + 'static,
+) -> std::io::Result<BeforeExchange> {
+    set_hook(&BEFORE_RENAME, directory, leaf, hook)
 }
 
 #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
-fn before_exchange(directory: &File, leaf: &[u8]) {
+fn run_hooks(hooks: &std::sync::Mutex<ExchangeHooks>, directory: &File, leaf: &[u8]) {
     let Ok(found) = directory.metadata() else {
         return;
     };
-    let hooks: Vec<Arc<dyn Fn() + Send + Sync>> = BEFORE_EXCHANGE
+    let hooks: Vec<Arc<dyn Fn() + Send + Sync>> = hooks
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
@@ -1478,6 +1617,16 @@ fn before_exchange(directory: &File, leaf: &[u8]) {
     for hook in hooks {
         hook();
     }
+}
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+fn before_exchange(directory: &File, leaf: &[u8]) {
+    run_hooks(&BEFORE_EXCHANGE, directory, leaf);
+}
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+fn before_rename(directory: &File, leaf: &[u8]) {
+    run_hooks(&BEFORE_RENAME, directory, leaf);
 }
 
 fn full_flush_counted(handle: &File) -> Result<()> {
@@ -1620,10 +1769,14 @@ impl PublishSink {
                 old,
                 intent,
             } = pending;
+            let sqlite = staged.sqlite;
             match staged.exchange(&old, &intent) {
                 Exchanged::Done(identity, parent) => {
                     touched.directory(parent);
                     counters::bump(Counter::OutputsSuperseded);
+                    if sqlite {
+                        counters::bump(Counter::DestSqliteSuperseded);
+                    }
                     records.push(OutputRecord {
                         key: record.key,
                         rel_path: record.rel_path,

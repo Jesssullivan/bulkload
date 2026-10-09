@@ -33,6 +33,14 @@ fn every_control() -> Vec<Control> {
             wire_id: wire_id(),
             root: b"/src".to_vec(),
             state: b"/state".to_vec(),
+            sqlite: SqliteMode::Refuse,
+        },
+        Control::Open {
+            proto: PROTO_VERSION,
+            wire_id: wire_id(),
+            root: b"/src".to_vec(),
+            state: b"/state".to_vec(),
+            sqlite: SqliteMode::Snapshot,
         },
         Control::Start {
             authority: vec![1, 2, 3],
@@ -40,16 +48,30 @@ fn every_control() -> Vec<Control> {
         Control::Entry {
             entry: 7,
             row: row(),
+            wal: None,
+        },
+        Control::Entry {
+            entry: 7,
+            row: row(),
+            wal: Some(sidecar()),
         },
         Control::Refused {
             entry: Some(7),
             rel_path: b"dir/file".to_vec(),
             code: "SOURCE_CHANGED_AFTER_SNAPSHOT".to_owned(),
+            sqlite_code: None,
+        },
+        Control::Refused {
+            entry: Some(8),
+            rel_path: b"store.db".to_vec(),
+            code: "SQLITE_BACKUP_FAILED".to_owned(),
+            sqlite_code: Some(267),
         },
         Control::Refused {
             entry: None,
             rel_path: b"odd".to_vec(),
             code: "PATH_NOT_PORTABLE".to_owned(),
+            sqlite_code: None,
         },
         Control::EngineTemporary {
             rel_path: b".bulkload-0123456789abcdef-1-2".to_vec(),
@@ -154,7 +176,31 @@ fn every_control() -> Vec<Control> {
             entry: 4,
             held: true,
         },
+        Control::SqliteSidecar {
+            rel_path: b"dir/state.db-wal".to_vec(),
+            database: b"dir/state.db".to_vec(),
+        },
+        Control::SqliteSnapshot {
+            entry: 7,
+            size: 8192,
+            wal: Some(sidecar()),
+        },
+        Control::SqliteSnapshot {
+            entry: 8,
+            size: 4096,
+            wal: None,
+        },
     ]
+}
+
+fn sidecar() -> SidecarId {
+    SidecarId {
+        dev: 1,
+        ino: 9,
+        size: 32,
+        mtime_ns: -4,
+        ctime_ns: i128::MAX,
+    }
 }
 
 #[test]
@@ -370,13 +416,49 @@ fn decode_exact_refuses_a_remainder() {
     );
 }
 
+/// Wire v6 is a hard cut too (#218): a v5 `Open`, which has no `sqlite`
+/// field, does not decode as a v6 one, and the v6 decoder refuses it
+/// `FRAME_CODEC` before anything else is read.
+#[test]
+fn a_v5_open_is_refused() {
+    #[derive(serde::Serialize)]
+    enum V5 {
+        Open {
+            proto: u16,
+            wire_id: [u8; 32],
+            root: Vec<u8>,
+            state: Vec<u8>,
+        },
+    }
+    let body = postcard::to_stdvec(&V5::Open {
+        proto: 5,
+        wire_id: [0; 32],
+        root: b"/src".to_vec(),
+        state: b"/state".to_vec(),
+    })
+    .unwrap();
+    assert_eq!(
+        Frame::decode_body(TAG_CONTROL, &body),
+        Err(BulkloadRefusal::FrameCodec)
+    );
+}
+
+/// The mode's encoding is part of the wire (`sqlitemode` in the schema).
+#[test]
+fn sqlite_mode_indices_match_the_schema() {
+    assert_eq!(postcard::to_stdvec(&SqliteMode::Refuse).unwrap(), [0]);
+    assert_eq!(postcard::to_stdvec(&SqliteMode::Snapshot).unwrap(), [1]);
+    assert!(WIRE_SCHEMA.contains("sqlitemode 0 Refuse, 1 Snapshot"));
+    assert_eq!(SqliteMode::default(), SqliteMode::Refuse);
+}
+
 /// `wire_id` is pinned: a change to `WIRE_SCHEMA` must be deliberate.
 #[test]
 fn wire_id_is_pinned() {
     assert_eq!(wire_id(), *blake3::hash(WIRE_SCHEMA.as_bytes()).as_bytes());
     assert_eq!(
         hex(&wire_id()),
-        "070bb548f74916265d03283e2034dcbc0d43ae3c37dcb05729e0209a919e9e03",
+        "a6e9842a405ff5fa62d5624a79d5012d9f278f2834152896473ed7630203a5d0",
         "WIRE_SCHEMA changed: update this pin and treat it as a wire change"
     );
 }
