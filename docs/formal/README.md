@@ -2223,6 +2223,30 @@ differed.
   read `prev_base` for a based link; the capture is then the plan base's
   delta, as under v1.
 
+## EstateConverge: destination custody (pending, estate-converge-20261008)
+
+Not modelled yet. `docs/agent-notes/2026-10-08-estate-converge-design.md`
+section 11 specifies the module (`EstateConverge.tla`) and its mutation
+rows; section 16 amends it (the checked-out guard, tombstones, the HEAD
+branch moving with HEAD, the index compare-and-swap, the stash instant, the
+content-classified settle, `GIT_CONVERGE_INTERRUPTED` unaccounted). The
+converge code is on `feat/estate-converge-20261008` and its merge is held
+for this model and an operator ruling (Q1 there), as OI-1003-Q102 held
+#187. Nothing here is in the catalogue, so `tla-check` neither renders nor
+grounds it. The code symbols the module will cite, all pending until it
+lands:
+
+| Property | Code symbols (pending) | P-tests |
+|---|---|---|
+| `ConvergeNoClobber` | `prove`, `Engine`, `publish_index`, `set_head`, `native_refs::decide`, `transact` | P82, crash rows `estate_converge_*` |
+| `ComponentOldOrNew` | `WorkspaceIntent`, `RefIntent`, `settle`, `native_refs::settle` | crash rows `estate_converge_*` |
+| `JournalImpliesLanded` | `apply_workspace`, `LandedWorkspace`, `apply_item` | crash row `estate_converge_after_landed` |
+| `RefNeverLost` | `import_verified_instance`, `native_refs::plan` | P81 |
+| `NoStaleRegress` | `native_refs::decide` (rows R6, S, tombstones), `stash_decision` | P84 |
+| `ModifiedRefusedUntouched` | `prove` | P82 |
+| `NoopReadsZero` | `converge::pending`, `apply_item` | P83 |
+| `Accounted` (with `converge-interrupted`) | `closure::classify` | closure unit row, `estate_converge_seat_foreign` |
+
 ## Frozen names
 
 The whitepaper and the property-test plan cite these names. They are frozen:

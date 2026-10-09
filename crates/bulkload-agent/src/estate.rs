@@ -1,7 +1,10 @@
 //! Explicit reviewed Git batches. Capture reuse still performs a metadata census.
 //!
 //! Ref custody and usable restored workspaces are separate outcomes. Completed
-//! restores are never replayed over subsequent operator edits.
+//! restores are never replayed over subsequent operator edits: a re-apply of
+//! a changed capture converges a landed checkout only when its ledger proves
+//! nobody changed it, and refuses `GIT_DESTINATION_MODIFIED` otherwise
+//! (`git_carry::converge`, estate converge 2026-10-08).
 
 use crate::counters::CountedSync as _;
 use crate::refuse::RefuseAt as _;
@@ -282,6 +285,9 @@ struct Completion {
     reuse_unavailable: Option<&'static str>,
     /// Receipt lines, one per nest, already naming any carrying item.
     nested: Vec<String>,
+    /// An apply's ref and seat custody counts (estate converge), as
+    /// `key=value` words carried in the receipt's reason.
+    custody: Option<String>,
 }
 
 impl Completion {
@@ -292,6 +298,7 @@ impl Completion {
             bytes_read: 0,
             reuse_unavailable: None,
             nested: Vec::new(),
+            custody: None,
         }
     }
 
@@ -1455,6 +1462,7 @@ fn decide_capture(
 }
 
 #[allow(clippy::too_many_arguments)] // Pass-wide state is caller-owned.
+#[allow(clippy::too_many_lines)]
 fn capture_item(
     item: &Item,
     state: &Path,
@@ -1607,6 +1615,7 @@ fn capture_item(
             .or(export.reuse_unavailable)
             .map(git_carry::ReuseUnavailable::code),
         nested,
+        custody: None,
     })
 }
 
@@ -1832,6 +1841,7 @@ fn execute(
                     let counts: Vec<String> = [
                         (!done.drift.is_empty()).then(|| format!("drift={}", done.drift.len())),
                         (!done.nested.is_empty()).then(|| format!("nested={}", done.nested.len())),
+                        done.custody.clone(),
                     ]
                     .into_iter()
                     .flatten()
@@ -2095,22 +2105,27 @@ fn import_base(
     corpus: &Path,
     source: &str,
     imported: &ImportedBases,
-) -> Result<()> {
+) -> Result<Option<git_carry::StagedBundle>> {
     if !git_carry::shared::requires_base(bundle)? {
-        return Ok(());
+        return Ok(None);
     }
     // A delta whose `.base` sidecar is gone names no base to import.
     let base = bound(corpus, &captured.bundle)?.ok_or(BulkloadRefusal::SealedObjectMissing)?;
-    // Existing shared repositories are the supported optimization. Creating a
-    // standalone destination needs a separate private preseed implementation.
+    // Estate converge: a standalone item takes its plan base where its
+    // capture lands, in its private stage at a first landing or before a
+    // converge's import, so one plan lands a main and its linked worktrees.
+    if item
+        .workspace
+        .as_ref()
+        .is_some_and(|workspace| workspace == &item.repository)
+    {
+        return stage_base(corpus, &base).map(Some);
+    }
+    // A linked or refs-only item imports into its existing repository.
     if !item
         .repository
         .try_exists()
         .refuse_at("estate::import_base")?
-        || item
-            .workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace == &item.repository)
     {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
@@ -2120,7 +2135,7 @@ fn import_base(
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
         .contains(&key)
     {
-        return Ok(());
+        return Ok(None);
     }
     let staged = stage_base(corpus, &base)?;
     git_carry::import_staged(&item.repository, &staged, source)?;
@@ -2128,7 +2143,7 @@ fn import_base(
         .lock()
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
         .insert(key);
-    Ok(())
+    Ok(None)
 }
 
 fn apply_item(
@@ -2163,14 +2178,30 @@ fn apply_item(
     // uncaptured seats) is deferred (bulkload#48); carry v2, the W6 engine it
     // was deferred to, is deleted (OI-1003-Q44, OI-1003-Q56).
     let journal = journal_path(state, &identity, source, &captured.digest);
+    // A3 (estate converge): this item's own converge a crash interrupted is
+    // settled before its journal is trusted. A ref intent another item of
+    // the repository left is settled here without proving or restaging this
+    // item (review 2 finding 7). Metadata only: no-op reruns stay no-ops.
     if journal.try_exists().refuse_at("estate::apply_item")? {
-        let done: String = read(&journal)?;
-        let outcome = match done.as_str() {
-            "workspace-restored" => "previous-workspace-restoration-not-revalidated",
-            "refs-imported" => "previous-ref-custody-not-workspace-parity",
-            _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
-        };
-        return Ok(Completion::clean(outcome).naming(nested));
+        let pending =
+            git_carry::converge::pending(item.workspace.as_deref(), &item.repository, source)?;
+        if !pending.workspace {
+            let done: String = read(&journal)?;
+            let outcome = match done.as_str() {
+                "workspace-restored" => "previous-workspace-restoration-not-revalidated",
+                "refs-imported" => "previous-ref-custody-not-workspace-parity",
+                _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
+            };
+            let mut done = Completion::clean(outcome).naming(nested);
+            if pending.refs {
+                done.custody = git_carry::converge::settle_refs(
+                    item.workspace.as_deref(),
+                    &item.repository,
+                    source,
+                )?;
+            }
+            return Ok(done);
+        }
     }
     // After the journal (round-4 P2): a re-apply of a done item stages and
     // copies nothing. Otherwise one private stage next to the corpus is the
@@ -2198,29 +2229,73 @@ fn apply_item(
     // (R-N72): a chain under a plan base binds every base and every link by
     // name and digest, and the flatten imports every bound base before the
     // oldest link.
-    let staged = if prior_sidecar(corpus, &captured.bundle)
+    let (staged, base) = if prior_sidecar(corpus, &captured.bundle)
         .try_exists()
         .refuse_at("estate::apply_item")?
     {
         let chain = chain_links(corpus, &captured.bundle, LinkBinding::Digest)?;
-        git_carry::chain::flatten(staged, &chain.bases, &chain.links)?
+        (
+            git_carry::chain::flatten(staged, &chain.bases, &chain.links)?,
+            None,
+        )
     } else {
-        import_base(item, &captured, staged.path(), corpus, source, imported)?;
-        staged
+        let base = import_base(item, &captured, staged.path(), corpus, source, imported)?;
+        (staged, base)
     };
-    let outcome = if let Some(workspace) = &item.workspace {
-        if item.repository == *workspace {
-            git_carry::restore_staged(&staged, workspace, source, None)?;
-        } else {
-            git_carry::restore_linked_staged(&staged, &item.repository, workspace, source)?;
-        }
-        "workspace-restored"
+    // Estate converge: a first landing restores native refs and records
+    // ledgers; a landed checkout whose capture changed converges when its
+    // ledger proves it unchanged (`git_carry::converge`).
+    let landing = git_carry::converge::Landing {
+        item: &identity,
+        observed_ns: retained_parts(corpus, &captured.bundle)?.map_or(0, |parts| parts.started_ns),
+        capture: captured.digest,
+    };
+    let target = git_carry::converge::Target {
+        repository: &item.repository,
+        workspace: item.workspace.as_deref(),
+        source,
+        base: base.as_ref(),
+    };
+    let (outcome, applied) = if item.workspace.is_some() {
+        let landed_before = landed_before(state, &identity, source, &journal)?;
+        (
+            "workspace-restored",
+            git_carry::converge::apply_workspace(&staged, &target, &landing, landed_before)?,
+        )
     } else {
-        git_carry::import_staged(&item.repository, &staged, source)?;
-        "refs-imported"
+        (
+            "refs-imported",
+            git_carry::converge::apply_refs(&staged, &target, &landing)?,
+        )
     };
     write(&journal, &outcome.to_owned())?;
-    Ok(Completion::clean(outcome).naming(nested))
+    let mut done = Completion::clean(outcome).naming(nested);
+    done.custody = applied
+        .custody
+        .map(|words| {
+            if applied.converged {
+                format!("converged {words}")
+            } else {
+                words
+            }
+        })
+        .or_else(|| applied.converged.then(|| "converged".to_owned()));
+    Ok(done)
+}
+
+// Finding 13: whether STATE holds a journal of this item for a capture
+// other than the current one, so a destination now absent was removed.
+fn landed_before(state: &Path, identity: &str, source: &str, current: &Path) -> Result<bool> {
+    let prefix = format!("{identity}-{}-", blake3::hash(source.as_bytes()).to_hex());
+    for entry in fs::read_dir(state).refuse_at("estate::landed_before")? {
+        let entry = entry.refuse_at("estate::landed_before")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".done") && entry.path() != current {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The outcome `git-repair-missing-index` records into a state dir (#95).
@@ -2637,12 +2712,13 @@ pub fn apply(
     let mut groups = std::collections::BTreeMap::new();
     let imported = ImportedBases::default();
     for item in &contents.items {
-        // A standalone restore's repository is its own workspace: if it is
-        // already there, that is a collision the restore refuses by type
-        // (R-N114), not Git administration to serialise on.
-        let standalone = item.workspace.as_ref() == Some(&item.repository);
-        let common = if !standalone && item.repository.try_exists().refuse_at("estate::apply")? {
-            git_carry::common_repository(&item.repository)?
+        // Estate converge: one key per repository, standalone or not, so a
+        // main and its linked worktrees never hold two mutexes for one
+        // repository. A repository not there yet keys by its path, which is
+        // also what its linked items key by until it lands.
+        let common = if item.repository.try_exists().refuse_at("estate::apply")? {
+            git_carry::common_repository(&item.repository)
+                .unwrap_or_else(|_| item.repository.clone())
         } else {
             item.repository.clone()
         };
@@ -2690,6 +2766,11 @@ pub fn apply(
         };
         levels.entry(depth).or_default().items.push(item.clone());
     }
+    // Estate converge: an item whose repository is another planned item's
+    // standalone workspace runs after that item's level, so mains land (and
+    // converge) before their linked worktrees and refs-only items, with no
+    // Plan A/B split.
+    let levels = after_mains(levels)?;
     let mut outcome = Ok(());
     for level in levels.values() {
         if let Err(error) = execute(level, jobs, &operation, &|row| {
@@ -2699,6 +2780,38 @@ pub fn apply(
         }
     }
     outcome
+}
+
+// Move every item whose repository is a planned standalone workspace to a
+// level after that workspace's own.
+fn after_mains(
+    levels: std::collections::BTreeMap<usize, Plan>,
+) -> Result<std::collections::BTreeMap<usize, Plan>> {
+    let mut mains = Vec::new();
+    for (depth, plan) in &levels {
+        for item in &plan.items {
+            if item.workspace.as_ref() == Some(&item.repository) {
+                mains.push((target_key(&item.repository)?, *depth));
+            }
+        }
+    }
+    let mut placed = std::collections::BTreeMap::<usize, Plan>::new();
+    for (depth, plan) in levels {
+        for item in plan.items {
+            let mut at = depth;
+            if item.workspace.as_ref() != Some(&item.repository) {
+                let key = target_key(&item.repository)?;
+                for (main, main_depth) in &mains {
+                    let (this, that) = comparable(&key, main);
+                    if this == that {
+                        at = at.max(main_depth + 1);
+                    }
+                }
+            }
+            placed.entry(at).or_default().items.push(item);
+        }
+    }
+    Ok(placed)
 }
 
 /// Corpus custody as the fault harness reads it after a crash (P70).

@@ -1208,6 +1208,12 @@ impl Scenario for Fixture {
 mod estate_sidecar;
 use estate_sidecar::EstateSidecar;
 
+// The `estate.converge.*` points (estate converge, 2026-10-08): a re-apply
+// that converges a landed checkout, crashed and settled forward.
+#[path = "fault_harness/estate_converge.rs"]
+mod estate_converge;
+use estate_converge::EstateConverge;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
@@ -1283,6 +1289,23 @@ scenarios! {
     estate_after_reuse_sidecar_changed => EstateAfterReuseSidecar: 1, EstateSidecar::Changed;
     estate_after_capture_record_first => EstateAfterCaptureRecord: 1, EstateSidecar::First;
     estate_after_capture_record_changed => EstateAfterCaptureRecord: 1, EstateSidecar::Changed;
+    // Estate converge: every point of the converge, each crash settled
+    // forward by the rerun (ComponentOldOrNew, then a fresh restore's equal).
+    estate_converge_after_import => EstateConvergeAfterImport: 1, EstateConverge::Delta;
+    estate_converge_after_intent => EstateConvergeAfterIntent: 1, EstateConverge::Delta;
+    estate_converge_after_ref_intent => EstateConvergeAfterRefIntent: 1, EstateConverge::Delta;
+    estate_converge_after_refs => EstateConvergeAfterRefs: 1, EstateConverge::Delta;
+    estate_converge_seat_before_exchange_first => EstateConvergeSeatBeforeExchange: 1, EstateConverge::Delta;
+    estate_converge_seat_before_exchange_mid => EstateConvergeSeatBeforeExchange: 3, EstateConverge::Delta;
+    estate_converge_seat_after_exchange_first => EstateConvergeSeatAfterExchange: 1, EstateConverge::Delta;
+    estate_converge_seat_after_exchange_mid => EstateConvergeSeatAfterExchange: 4, EstateConverge::Delta;
+    estate_converge_after_seat_first => EstateConvergeAfterSeat: 1, EstateConverge::Delta;
+    estate_converge_after_seat_mid => EstateConvergeAfterSeat: 6, EstateConverge::Delta;
+    estate_converge_index_locked => EstateConvergeIndexLocked: 1, EstateConverge::Delta;
+    estate_converge_after_index => EstateConvergeAfterIndex: 1, EstateConverge::Delta;
+    estate_converge_after_head => EstateConvergeAfterHead: 1, EstateConverge::Delta;
+    estate_converge_after_landed => EstateConvergeAfterLanded: 1, EstateConverge::Delta;
+    estate_converge_seat_foreign => EstateConvergeSeatAfterExchange: 1, EstateConverge::ForeignWrite;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

@@ -43,8 +43,10 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   before writing anything, and estate-apply restores the workspace (#132).
 
 Anything else is `unaccounted`: a stale journal from an earlier capture, a
-record naming another source, or refs only for an item that plans a
-workspace. Stale and foreign journals are listed. The native `verdict`
+record naming another source, refs only for an item that plans a
+workspace, or a `GIT_CONVERGE_INTERRUPTED` refusal (`converge-interrupted`:
+a converge left its checkout part old, part new under a pending intent; no
+review or attestation closes it, only a rerun that settles it, 2026-10-08). Stale and foreign journals are listed. The native `verdict`
 passes only when `unaccounted` is 0. The report's `gate` is the exit
 status, and a failing gate exits nonzero with `CLOSURE_UNACCOUNTED`. Since
 S4 (WP3 PR 3, 2026-10-06) `gate` no longer equals `verdict` without an
@@ -317,8 +319,72 @@ neither an index nor a worktree (S4, #162).
     `GIT_DESTINATION_OCCUPIED`. The one check after publication catches a
     concurrent writer.
 
-Import preserves divergence and leaves active HEADs, indexes and
-working bytes untouched. Account credentials carry privately; platform stores
+Estate converge (2026-10-08, branch `feat/estate-converge-20261008`;
+`docs/agent-notes/2026-10-08-estate-converge-design.md`). **The
+converge half is held for an operator ruling and its TLA+ model (Q1 of
+that note) before merge.**
+
+- **Native refs (#215).** A standalone first landing restores every
+  carried ref natively inside its private stage (the repository bulkload
+  creates): `refs/heads`, `refs/tags`, `refs/remotes`, `refs/notes` and any
+  other namespace, and the stash with the source's reflog order and
+  messages (a capture with a stash carries `stash-order-v1`). Never
+  natively: `refs/carry/**`, `refs/carry-*/**`, `refs/stash` (its own table),
+  per-worktree refs, `refs/remotes/*/HEAD`, and any ref that is a symref at
+  the destination. Provenance under `refs/carry/v1/<SOURCE>/<instance>/` is
+  written as before. HEAD goes on the source's branch, or detached at the
+  captured head with the branch recorded (`head-detached-ref-conflict`);
+  no `carry/*` branch is created. A linked item attaches the same way; a
+  repository bulkload did not create gets no native ref but the linked
+  item's own HEAD branch (created by `worktree add -b` when absent).
+- **Ledgers.** A ref ledger (`$GIT_COMMON_DIR/bulkload/v1/<SOURCE>/refs.landed`,
+  with the repository marker, tombstones, the stash and the exclude, each
+  with its capture instant) and a workspace ledger
+  (`$GIT_DIR/bulkload/v1/<SOURCE>/workspace.landed`: capture, HEAD, index
+  entries digest, the stat print of every seat on its file system) record
+  what bulkload landed, next to it. Each is written atomically after the
+  Git writes it names, which run with `core.fsync=reference,index,objects`;
+  a Git older than 2.46 refuses `GIT_UNAVAILABLE`.
+- **Refs converge** on every apply into a repository bulkload created: a
+  ref follows the source only while it still holds the value bulkload set
+  and the capture is newer (compare-and-swap); a ref changed or deleted at
+  the destination, or any worktree's checked-out branch, is left alone and
+  reported; a remote-tracking ref the source pruned is deleted, a local
+  branch or tag is kept. A ref Git cannot create because a ref that stays
+  sits above or below its name (`foo` kept, `foo/bar` new) stays at
+  provenance (`ref-name-conflict`); a pruned name is deleted in its own
+  transaction before its successor is created. A checkout's new HEAD
+  branch moves only with HEAD, never in the ref step.
+- **Checkouts converge** when the capture changed: the landed checkout is
+  proved unchanged against its ledger (HEAD, index entries, a standalone
+  item's exclude, every landed seat by print or by content); a failed proof
+  refuses `GIT_DESTINATION_MODIFIED` with nothing written. Otherwise only
+  the delta is written, under a durable intent: refs, each seat by
+  `RENAME_EXCHANGE` with the displaced file checked (put back if it is not
+  the landed one), the index under `index.lock` by compare-and-swap, then
+  HEAD and its branch in one transaction. A crash leaves every component
+  old or new; the next apply settles the intent forward before anything
+  else. An older capture refuses `GIT_CONVERGE_STALE_CAPTURE`, a changed
+  shallow frontier, nested custody or rebuildable set
+  `GIT_CONVERGE_SHAPE_CHANGED`, a checkout this item landed and an
+  operator removed `GIT_DESTINATION_MODIFIED`, and so does a landed
+  directory the source turned into a file or symlink while it holds an
+  entry bulkload did not land (checked before the intent). Configuration
+  is applied once at the first landing and only reported after.
+- **Not the landings made before this branch.** A checkout landed without
+  ledgers (the 2026-10-08 landing under `/srv/data`) still refuses
+  `GIT_DESTINATION_OCCUPIED` on a re-apply, and a repository without the
+  ref ledger's marker gets provenance only. Converging it needs an
+  adoption verb (`--adopt`) or a fresh landing; both await a ruling (Q4,
+  Q8 of that note).
+- One plan lands a main and its linked worktrees: an item whose repository
+  is a planned standalone workspace applies a level after it, and a
+  standalone item's plan base is imported into its stage.
+
+Import preserves divergence and leaves active HEADs, indexes and working
+bytes untouched, with one exception pending the ruling above: a checkout
+bulkload landed and nobody changed since is converged to a newer capture
+of the same source. Account credentials carry privately; platform stores
 may require a format transcode. Destination machine keys and Home Manager
 links are preserved. Credential contents are never printed.
 
