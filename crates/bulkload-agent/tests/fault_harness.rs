@@ -1303,9 +1303,17 @@ scenarios! {
     estate_converge_after_seat_mid => EstateConvergeAfterSeat: 6, EstateConverge::Delta;
     estate_converge_index_locked => EstateConvergeIndexLocked: 1, EstateConverge::Delta;
     estate_converge_after_index => EstateConvergeAfterIndex: 1, EstateConverge::Delta;
+    estate_converge_head_branch => EstateConvergeHeadBranch: 1, EstateConverge::Delta;
     estate_converge_after_head => EstateConvergeAfterHead: 1, EstateConverge::Delta;
+    estate_converge_after_head_switch_back => EstateConvergeAfterHead: 1, EstateConverge::SwitchBack;
     estate_converge_after_landed => EstateConvergeAfterLanded: 1, EstateConverge::Delta;
     estate_converge_seat_foreign => EstateConvergeSeatAfterExchange: 1, EstateConverge::ForeignWrite;
+    estate_converge_linked_added => EstateConvergeLinkedAdded: 1, EstateConverge::LinkedLanding;
+    // Review 4 (2026-10-09): the operator's Git around a crash.
+    estate_converge_head_branch_double_checkout => EstateConvergeHeadBranch: 1, EstateConverge::DoubleCheckout;
+    estate_converge_index_locked_fresh_lock => EstateConvergeIndexLocked: 1, EstateConverge::FreshIndexLock;
+    estate_converge_after_ref_intent_packed_new => EstateConvergeAfterRefIntent: 1, EstateConverge::PackedNew;
+    estate_converge_linked_added_operator => EstateConvergeLinkedAdded: 1, EstateConverge::LinkedOperator;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

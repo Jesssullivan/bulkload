@@ -249,9 +249,29 @@ pub(super) fn index_digest(worktree: &Path, index: Option<&Path>) -> Result<[u8;
     Ok(*hasher.finalize().as_bytes())
 }
 
-/// A worktree's HEAD.
+/// A worktree's HEAD. An unborn one (an orphan switch, or the checked-out
+/// branch deleted) has an empty oid, never a refusal of its own (review 3
+/// finding 4): the proof then refuses `GIT_DESTINATION_MODIFIED` and a
+/// settle `GIT_CONVERGE_INTERRUPTED`, as for any other HEAD.
 pub(super) fn head_of(worktree: &Path) -> Result<Head> {
-    let oid = text(git(worktree).args(["rev-parse", "--verify", "HEAD"]))?;
+    let verified = git(worktree)
+        .args(["rev-parse", "-q", "--verify", "HEAD"])
+        .output()
+        .refuse_at("git_carry::converge::head_of")?;
+    let oid = match verified.status.code() {
+        Some(0) => {
+            let oid = String::from_utf8(verified.stdout)
+                .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+                .trim_end()
+                .to_owned();
+            if !super::oid(&oid) {
+                return Err(BulkloadRefusal::GitInventoryMalformed);
+            }
+            oid
+        }
+        Some(1) => String::new(),
+        _ => return Err(super::estimate::child_failed(&verified.stderr)),
+    };
     let symbolic = git(worktree)
         .args(["symbolic-ref", "-q", "HEAD"])
         .output()
@@ -287,23 +307,116 @@ fn read_exclude(common: &Path) -> Result<Vec<u8>> {
     }
 }
 
-/// Branches checked out by each worktree of `repo`: (worktree path, branch).
-pub(super) fn checked_out_by(repo: &Path) -> Result<Vec<(PathBuf, String)>> {
+/// Each worktree of `repo` as `worktree list --porcelain` lists it: its
+/// path and the branch its HEAD names, if any.
+fn worktrees(repo: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
     let listed = output(git(repo).args(["worktree", "list", "--porcelain", "-z"]))?;
-    let mut found = Vec::new();
-    let mut current: Option<PathBuf> = None;
+    let mut found: Vec<(PathBuf, Option<String>)> = Vec::new();
     for field in listed.split(|byte| *byte == 0) {
         if let Some(path) = field.strip_prefix(b"worktree ") {
-            current = Some(PathBuf::from(OsStr::from_bytes(path)));
+            found.push((PathBuf::from(OsStr::from_bytes(path)), None));
         } else if let Some(name) = field.strip_prefix(b"branch ") {
             let name =
                 std::str::from_utf8(name).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-            if let Some(path) = &current {
-                found.push((path.clone(), name.to_owned()));
+            if let Some((_, branch)) = found.last_mut() {
+                *branch = Some(name.to_owned());
             }
         }
     }
     Ok(found)
+}
+
+/// The git directory of every worktree of `repo` that has one (the main
+/// worktree's `.git`, each linked worktree's `worktrees/<id>`).
+pub(super) fn worktree_git_dirs(repo: &Path) -> Result<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    for (path, _) in worktrees(repo)? {
+        if let Some(git_dir) = landed::worktree_git_dir(&path)?.filter(|dir| dir.is_dir()) {
+            dirs.push(git_dir);
+        }
+    }
+    Ok(dirs)
+}
+
+/// Whether `a` and `b` are one directory.
+pub(super) fn same_dir(a: &Path, b: &Path) -> bool {
+    same_path(a, b)
+}
+
+// A small Git state file of `git_dir`, trimmed; `None` when absent.
+fn state_file(git_dir: &Path, name: &str) -> Result<Option<String>> {
+    match fs::read(git_dir.join(name)) {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).trim_end().to_owned())),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(crate::refuse::io(&error, "git_carry::converge::state_file")),
+    }
+}
+
+/// The branch a rebase or a bisect in progress in the worktree whose git
+/// directory is `git_dir` detached it from (review 3 finding 2): Git's own
+/// `rebase-merge/head-name`, `rebase-apply/head-name` and `BISECT_START`,
+/// which `is_worktree_being_rebased` and `_bisected` read so that `git
+/// branch -f` refuses that branch.
+fn held_branches(git_dir: &Path) -> Result<Vec<String>> {
+    let mut held = Vec::new();
+    for name in ["rebase-merge/head-name", "rebase-apply/head-name"] {
+        if let Some(branch) = state_file(git_dir, name)?.filter(|b| b.starts_with("refs/heads/")) {
+            held.push(branch);
+        }
+    }
+    if let Some(start) =
+        state_file(git_dir, "BISECT_START")?.filter(|start| !start.is_empty() && !oid(start))
+    {
+        held.push(if start.starts_with("refs/heads/") {
+            start
+        } else {
+            format!("refs/heads/{start}")
+        });
+    }
+    Ok(held)
+}
+
+/// Branches checked out by each worktree of `repo`: (worktree path,
+/// branch): its HEAD's branch, and the branch a rebase or bisect in
+/// progress holds (review 3 finding 2: a rebasing worktree's HEAD is
+/// detached, but its branch is the rebase's to move).
+pub(super) fn checked_out_by(repo: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut found = Vec::new();
+    for (path, branch) in worktrees(repo)? {
+        if let Some(branch) = branch {
+            found.push((path.clone(), branch));
+        }
+        if let Some(git_dir) = landed::worktree_git_dir(&path)? {
+            for held in held_branches(&git_dir)? {
+                found.push((path.clone(), held));
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The branches a pending workspace intent of any worktree of `repo` (for
+/// `source`) moves with HEAD or puts HEAD on: only that item's `set_head`
+/// moves them, so every other ref step leaves them (the earlier report's
+/// finding 2: a step that moved one made the item's settle replay a stale
+/// compare-and-swap).
+pub(super) fn intent_branches(repo: &Path, source: &str) -> Result<BTreeSet<String>> {
+    let mut branches = BTreeSet::new();
+    for git_dir in worktree_git_dirs(repo)? {
+        let path = landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_INTENT);
+        if let Some(intent) = landed::read::<WorkspaceIntent>(&path)? {
+            branches.extend(intent.branch.map(|(name, _, _)| name));
+            branches.extend(intent.head.1.symbolic);
+        }
+    }
+    Ok(branches)
 }
 
 fn same_path(a: &Path, b: &Path) -> bool {
@@ -327,9 +440,13 @@ fn census(worktree: &Path, rows: &[crate::RowSchema]) -> Result<Vec<SeatPrint>> 
 }
 
 /// The workspace ledger of a checkout just landed at `worktree` (git
-/// directory `git_dir`, common `common`) from `meta`. `None` over the
-/// ledger cap: the checkout is landed without one and reported
-/// `not-convergeable` (finding 20.6).
+/// directory `git_dir`, common `common`) from `meta`. `index` is the digest
+/// of the index the landing installed (review 3 finding 3: a linked
+/// landing, laid down in place, never re-reads it); `None` reads it, for a
+/// private stage nobody else sees. `false` over the ledger cap: the
+/// checkout is landed without one and reported `not-convergeable` (finding
+/// 20.6).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn record_landing(
     worktree: &Path,
     git_dir: &Path,
@@ -338,7 +455,12 @@ pub(super) fn record_landing(
     landing: &Landing<'_>,
     meta: &Meta,
     head: (Head, Option<String>),
+    index: Option<[u8; 32]>,
 ) -> Result<bool> {
+    let index = match index {
+        Some(index) => index,
+        None => index_digest(worktree, None)?,
+    };
     let ledger = LandedWorkspace {
         item: landing.item.to_owned(),
         capture: landing.capture,
@@ -346,7 +468,7 @@ pub(super) fn record_landing(
         instance: meta.instance.clone(),
         head: head.0,
         intended_branch: head.1,
-        index: index_digest(worktree, None)?,
+        index,
         exclude: exclude_digest(&read_exclude(common)?),
         recorded_ns: super::pass_start_ns(),
         fsid: landed::fsid(worktree)?,
@@ -381,15 +503,18 @@ pub(super) struct HeadPlan {
 /// otherwise detached at `h1` with the branch recorded as intended.
 /// `others` are the branches other worktrees have checked out; `ledger` is
 /// the ref ledger of a repository bulkload created (`None`: a foreign one,
-/// where a branch is used only when it already names `h1`).
+/// where a branch is used only when it already names `h1`). `refs` are the
+/// destination's native refs and the names of its symbolic ones (review 4:
+/// a branch beside or at a symbolic ref can never be created).
 pub(super) fn head_plan(
     symbolic: Option<&str>,
     h1: &str,
-    native: &BTreeMap<String, String>,
+    refs: (&BTreeMap<String, String>, &BTreeSet<String>),
     ledger: Option<&RefLedger>,
     others: &BTreeSet<String>,
     t: i128,
 ) -> HeadPlan {
+    let (native, symbolic_refs) = refs;
     let detached = |intended: Option<&str>, line: Option<&'static str>| HeadPlan {
         head: Head {
             symbolic: None,
@@ -420,7 +545,13 @@ pub(super) fn head_plan(
     // Review 2 finding 3: a branch whose name is a path prefix of an
     // existing ref, or under one (`foo` kept by R7, `foo/bar` new), cannot
     // be created; it detaches with the branch recorded.
-    if current.is_none() && native_refs::name_conflict(branch, native.keys().map(String::as_str)) {
+    if current.is_none()
+        && (symbolic_refs.contains(branch)
+            || native_refs::name_conflict(
+                branch,
+                native.keys().chain(symbolic_refs).map(String::as_str),
+            ))
+    {
         return detached(Some(branch), Some("head-detached-ref-conflict"));
     }
     // A foreign repository: its branches are not bulkload's. One that
@@ -462,17 +593,32 @@ pub(super) fn head_plan(
     }
 }
 
-/// Move HEAD from `old` to `plan` in one compare-and-swap transaction, the
-/// branch move with it.
+/// Move HEAD from `old` to `new` by compare-and-swap, the branch move with
+/// it. With both, the branch commits first in a transaction of its own,
+/// under every worktree's HEAD lock with this worktree's HEAD verified as
+/// `old` and the branch checked out nowhere, then HEAD in a second
+/// transaction (review 3 finding 13, the earlier report's finding 3: one
+/// transaction a killed Git child cut short could commit HEAD, which sorts
+/// first, without its branch). Between the two, or when the HEAD line
+/// loses its compare-and-swap, the branch is at its new value and HEAD at
+/// its old one: a state the intent names, which the settle finishes.
+///
+/// A HEAD line that attaches HEAD to a branch it is not on already holds
+/// every other worktree's HEAD lock from before the branch's transaction
+/// to after HEAD's, and refuses `GIT_CONVERGE_INTERRUPTED` when another
+/// worktree has the branch checked out (or held by a rebase or bisect),
+/// read under them (review 4, the blocker: an operator's `git switch` or
+/// `git worktree add` of the branch since the plan, or since a crash,
+/// ended with two worktrees on one branch, Git's own invariant broken).
+/// This worktree's own HEAD is left to the HEAD line's compare-and-swap.
 fn set_head(
     worktree: &Path,
     old: &Head,
     new: &Head,
     branch: Option<&(String, Option<String>, String)>,
 ) -> Result<()> {
-    let mut lines = Vec::new();
-    // A branch already at its new value is done (a settle after another
-    // item's ref step moved it): HEAD alone moves.
+    // A branch already at its new value is done (a settle after the
+    // branch's transaction, or after another item's step): HEAD alone.
     let branch = match branch {
         Some((name, _, after)) => {
             let (native, _) = native_refs::native_refs(worktree)?;
@@ -480,38 +626,133 @@ fn set_head(
         }
         None => None,
     };
-    if let Some((name, before, after)) = branch {
-        lines.extend_from_slice(
-            before
-                .as_ref()
-                .map_or_else(
-                    || format!("create {name}\0{after}\0"),
-                    |before| format!("update {name}\0{after}\0{before}\0"),
-                )
-                .as_bytes(),
-        );
-    }
-    match (&old.symbolic, &new.symbolic) {
-        (Some(a), Some(b)) if a == b => {}
+    let branch_line = branch.map(|(name, before, after)| {
+        before.as_ref().map_or_else(
+            || format!("create {name}\0{after}\0"),
+            |before| format!("update {name}\0{after}\0{before}\0"),
+        )
+    });
+    let head_line = match (&old.symbolic, &new.symbolic) {
+        (Some(a), Some(b)) if a == b => None,
         (_, Some(b)) => {
             let check = old
                 .symbolic
                 .as_ref()
                 .map_or_else(|| format!("oid\0{}\0", old.oid), |a| format!("ref\0{a}\0"));
-            lines.extend_from_slice(format!("symref-update HEAD\0{b}\0{check}").as_bytes());
+            Some(format!("symref-update HEAD\0{b}\0{check}"))
         }
-        (_, None) => {
-            if old.symbolic.is_some() || old.oid != new.oid {
-                lines.extend_from_slice(
-                    format!("update HEAD\0{}\0{}\0", new.oid, old.oid).as_bytes(),
-                );
+        (_, None) => (old.symbolic.is_some() || old.oid != new.oid)
+            .then(|| format!("update HEAD\0{}\0{}\0", new.oid, old.oid)),
+    };
+    let (git_dir, _) = native_refs::git_dirs(worktree)?;
+    // The branch HEAD is attached to, when it is not on it already.
+    let attach = new
+        .symbolic
+        .as_ref()
+        .filter(|b| head_line.is_some() && old.symbolic.as_ref() != Some(*b));
+    let others = match attach {
+        Some(_) => Some(native_refs::HeadLocks::take_except(
+            worktree,
+            Some(&git_dir),
+        )?),
+        None => None,
+    };
+    let checked_elsewhere = |name: &str| -> Result<bool> {
+        Ok(checked_out_by(worktree)?
+            .iter()
+            .any(|(path, checked)| checked == name && !same_path(path, worktree)))
+    };
+    let mut branch_first = false;
+    if let (Some((name, _, _)), Some(line)) = (branch, &branch_line) {
+        if head_line.is_some() {
+            branch_first = true;
+            let own = native_refs::HeadLocks::take_dirs([git_dir])?;
+            if head_of(worktree)? != *old
+                || checked_out_by(worktree)?
+                    .iter()
+                    .any(|(_, checked)| checked == name)
+            {
+                return Err(interrupted());
             }
+            native_refs::update_refs(worktree, None, line.as_bytes(), &[name.as_str()])?;
+            drop(own);
+            fault_point!(EstateConvergeHeadBranch);
+        } else {
+            // HEAD stays on this branch: Git locks HEAD itself for its log.
+            native_refs::update_refs(worktree, None, line.as_bytes(), &[name.as_str()])?;
         }
     }
-    if lines.is_empty() {
+    let Some(line) = head_line else {
         return Ok(());
+    };
+    if let Some(target) = attach {
+        if checked_elsewhere(target)? {
+            return Err(interrupted());
+        }
     }
-    native_refs::update_refs(worktree, None, &lines)
+    let result = match native_refs::update_refs(worktree, None, line.as_bytes(), &["HEAD"]) {
+        // After the branch's transaction, HEAD already at its new value (an
+        // operator's `git switch` to the very branch) is done.
+        Err(_) if branch_first && head_of(worktree)? == *new => Ok(()),
+        other => other,
+    };
+    drop(others);
+    result
+}
+
+/// Remove the HEAD and branch locks a killed `set_head` of `intent` left in
+/// the worktree whose git directory is `git_dir` (their content is the
+/// intent's new HEAD or branch value, so they are bulkload's; `common` is
+/// the repository's common directory). Returns how many.
+fn remove_intent_head_locks(
+    git_dir: &Path,
+    common: &Path,
+    intent: &WorkspaceIntent,
+) -> Result<u64> {
+    let new = &intent.head.1;
+    let head = new.symbolic.as_ref().map_or_else(
+        || format!("{}\n", new.oid),
+        |branch| format!("ref: {branch}\n"),
+    );
+    let mut removed = u64::from(native_refs::remove_owned_lock(
+        &git_dir.join("HEAD.lock"),
+        &[head.into_bytes()],
+    )?);
+    if let Some((name, _, after)) = &intent.branch {
+        removed += u64::from(native_refs::remove_owned_lock(
+            &common.join(format!("{name}.lock")),
+            &[format!("{after}\n").into_bytes()],
+        )?);
+    }
+    Ok(removed)
+}
+
+/// The crash leftovers of every pending converge of `repo` (for `source`),
+/// under the destination lock, before anything else reads or writes a ref
+/// (review 4: a `HEAD.lock` a killed `set_head` left made every later ref
+/// transaction of the repository refuse, so a ref intent another item left
+/// could never settle, and the item whose intent named the lock never
+/// reached its own settle): each worktree's lock temporaries
+/// ([`native_refs::sweep_lock_temps`]), the HEAD locks bulkload marks as
+/// its own, and the HEAD and branch locks a killed `set_head` of each
+/// pending workspace intent left. Then the pending ref intent is settled
+/// ([`native_refs::settle`]).
+///
+/// # Errors
+/// As [`native_refs::settle`].
+pub(super) fn settle_repository(repo: &Path, common: &Path, source: &str) -> Result<Custody> {
+    let mut removed = 0;
+    for git_dir in worktree_git_dirs(repo)? {
+        native_refs::sweep_lock_temps(&git_dir)?;
+        let path = landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_INTENT);
+        if let Some(intent) = landed::read::<WorkspaceIntent>(&path)? {
+            removed += remove_intent_head_locks(&git_dir, common, &intent)?;
+        }
+    }
+    removed += native_refs::remove_marked_head_locks(repo)?;
+    let mut custody = native_refs::settle(repo, &landed::ledger_dir(common, source))?;
+    custody.add("git-lock-removed", removed);
+    Ok(custody)
 }
 
 // ---- the seat delta ----------------------------------------------------------
@@ -594,6 +835,9 @@ struct Op {
     action: Action,
     old: Option<Side>,
     new: Option<Side>,
+    /// The path is a directory once the delta has run (a `Remove` of a file
+    /// the source turned into a directory).
+    to_dir: bool,
 }
 
 // One planned seat operation before it is numbered.
@@ -604,6 +848,7 @@ type Planned = (Action, Vec<u8>, Option<Side>, Option<Side>);
 /// (shallowest first), replacements, additions and mode changes, then the
 /// directory modes (deepest first).
 fn delta(old: &BTreeMap<Vec<u8>, Side>, new: &BTreeMap<Vec<u8>, Side>) -> Vec<Op> {
+    let new_sides = new;
     let mut ops: Vec<Planned> = Vec::new();
     let paths: BTreeSet<&Vec<u8>> = old.keys().chain(new.keys()).collect();
     for path in paths {
@@ -658,6 +903,9 @@ fn delta(old: &BTreeMap<Vec<u8>, Side>, new: &BTreeMap<Vec<u8>, Side>) -> Vec<Op
         .enumerate()
         .map(|(n, (action, path, old, new))| Op {
             n,
+            to_dir: new_sides
+                .get(&path)
+                .is_some_and(|side| side.kind == Kind::Directory),
             path,
             action,
             old,
@@ -1033,7 +1281,11 @@ impl Engine<'_> {
             {
                 return Ok(());
             }
-            Err(refusal) => return Err(refusal),
+            // Any other: a seat's parent the operator removed or replaced
+            // after the intent. Every refusal after the intent is
+            // GIT_CONVERGE_INTERRUPTED (review 3 finding 5), never a path
+            // or Io code.
+            Err(_) => return Err(interrupted()),
         };
         match op.action {
             Action::Remove => self.remove(&seat, op),
@@ -1089,13 +1341,21 @@ impl Engine<'_> {
 
     fn remove(&mut self, seat: &Seat, op: &Op) -> Result<()> {
         self.sweep(seat, op)?;
-        if lstat(&seat.path)?.is_none() {
+        let Some(meta) = lstat(&seat.path)? else {
             // Settling: done. Fresh: removed by someone since the proof.
             return if self.proof.is_none() {
                 Ok(())
             } else {
                 Err(interrupted())
             };
+        };
+        // Settling a file the source turned into a directory: the seat
+        // already holds the new directory (its MkDir ran before the crash),
+        // so the removal is done (the earlier report's finding 1; before,
+        // `expected` asked a directory for the old file and refused on
+        // every rerun). The MkDir and the additions under it check it.
+        if self.proof.is_none() && op.to_dir && meta.is_dir() {
+            return Ok(());
         }
         let expected = self.expected(seat, op)?.ok_or_else(interrupted)?;
         self.writable(&seat.parent)?;
@@ -1302,12 +1562,19 @@ impl Engine<'_> {
 }
 
 /// Refuse `DESTINATION_EXCHANGE_UNSUPPORTED` up front, before any write a
-/// replacement needs (OI-1003-Q100), by exchanging two probe files.
+/// replacement needs (OI-1003-Q100), by exchanging two probe files, each
+/// created new and never through a link.
 fn probe_exchange(worktree: &Path, tag: &str) -> Result<()> {
     let a = format!(".bulkload-converge-{tag}-probe-a");
     let b = format!(".bulkload-converge-{tag}-probe-b");
     for name in [&a, &b] {
-        fs::write(worktree.join(name), b"").refuse_at("git_carry::converge::probe")?;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(worktree.join(name))
+            .refuse_at("git_carry::converge::probe")?;
     }
     let directory = fs::File::open(worktree).refuse_at("git_carry::converge::probe")?;
     let exchanged =
@@ -1324,6 +1591,31 @@ fn probe_exchange(worktree: &Path, tag: &str) -> Result<()> {
     }
 }
 
+/// Whether `name` is a probe file of [`probe_exchange`]'s, any pass's.
+fn is_probe(name: &[u8]) -> bool {
+    name.starts_with(b".bulkload-converge-")
+        && (name.ends_with(b"-probe-a") || name.ends_with(b"-probe-b"))
+}
+
+/// Remove the probe files a crashed pass left in the worktree root (review
+/// 3 finding 9): under the destination lock no other pass is probing.
+/// Returns how many.
+fn sweep_probes(worktree: &Path) -> Result<u64> {
+    const SITE: &str = "git_carry::converge::sweep_probes";
+    let mut removed = 0;
+    for entry in fs::read_dir(worktree).refuse_at(SITE)? {
+        let entry = entry.refuse_at(SITE)?;
+        if is_probe(entry.file_name().as_bytes()) && !entry.file_type().refuse_at(SITE)?.is_dir() {
+            fs::remove_file(entry.path()).refuse_at(SITE)?;
+            removed += 1;
+        }
+    }
+    if removed > 0 {
+        landed::sync_dir(worktree)?;
+    }
+    Ok(removed)
+}
+
 // ---- the index ---------------------------------------------------------------
 
 /// Publish the index of `new` under Git's own `index.lock`, by
@@ -1331,13 +1623,16 @@ fn probe_exchange(worktree: &Path, tag: &str) -> Result<()> {
 /// entries the converge replaces (`old`) are checked under it, and only
 /// then is the new index renamed over. A two-way `read-tree -m` keeps the
 /// stat cache of every unchanged entry; a fresh one is the fallback.
+/// Returns the entries digest of the index it installed (or found already
+/// installed), which the ledger records (review 3 finding 3: never a
+/// re-read, which would take an operator's `git add` since for landed).
 fn publish_index(
     worktree: &Path,
     git_dir: &Path,
     metas: (&Meta, &Meta),
     old: [u8; 32],
     tag: &str,
-) -> Result<()> {
+) -> Result<[u8; 32]> {
     const SITE: &str = "git_carry::converge::publish_index";
     let (before, after) = metas;
     let lock = git_dir.join("index.lock");
@@ -1345,9 +1640,16 @@ fn publish_index(
     let fresh = git_dir.join(format!("bulkload-index-{tag}-fresh"));
     let merged = git_dir.join(format!("bulkload-index-{tag}-merged"));
     let marker = format!("bulkload-converge {tag}\n");
+    // The scratch indexes and the locks Git takes on them: a `read-tree`
+    // killed while holding one left it, and the settle (same tag) failed
+    // on it for good (review 4). Private names, under the destination lock.
     let cleanup = || {
-        let _ = fs::remove_file(&fresh);
-        let _ = fs::remove_file(&merged);
+        for path in [&fresh, &merged] {
+            let _ = fs::remove_file(path);
+            let mut lock = path.clone().into_os_string();
+            lock.push(".lock");
+            let _ = fs::remove_file(lock);
+        }
     };
     cleanup();
     let staged =
@@ -1371,24 +1673,19 @@ fn publish_index(
     let current = index_digest(worktree, None)?;
     if current == target {
         cleanup();
-        return Ok(());
+        return Ok(target);
     }
     if current != old {
         cleanup();
         return Err(interrupted());
     }
-    let Ok(mut held) = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&lock)
-    else {
+    // The marker exists before the lock's name (review 4: a lock created
+    // empty and left so by a power loss proved nothing, and wedged every
+    // rerun and the operator's Git).
+    if !native_refs::publish_lock(&lock, marker.as_bytes())? {
         cleanup();
         return Err(interrupted());
-    };
-    held.write_all(marker.as_bytes()).refuse_at(SITE)?;
-    drop(held);
+    }
     fault_point!(EstateConvergeIndexLocked);
     if index_digest(worktree, None)? != old {
         let _ = fs::remove_file(&lock);
@@ -1413,7 +1710,54 @@ fn publish_index(
     fs::rename(&lock, &index).refuse_at(SITE)?;
     landed::sync_dir(git_dir)?;
     cleanup();
-    Ok(())
+    Ok(target)
+}
+
+/// The entries digest of the index a landing of `meta` installs in the
+/// worktree at `worktree` (git directory `git_dir`): built in a scratch
+/// index file from the capture, never read back from the worktree's own,
+/// which an operator may already have changed (review 3 finding 3, the
+/// linked first landing).
+///
+/// The scratch file has one name per worktree, removed with Git's lock on
+/// it before and after (review 4: a per-process name left by a killed
+/// `read-tree` was never removed); callers hold the destination lock.
+pub(super) fn installed_index(worktree: &Path, git_dir: &Path, meta: &Meta) -> Result<[u8; 32]> {
+    let scratch = git_dir.join("bulkload-index-landing");
+    let scratch_lock = git_dir.join("bulkload-index-landing.lock");
+    let cleanup = || {
+        let _ = fs::remove_file(&scratch);
+        let _ = fs::remove_file(&scratch_lock);
+    };
+    cleanup();
+    let digest = super::read_tree(
+        git(worktree).env("GIT_INDEX_FILE", &scratch),
+        &[&format!("{}^{{tree}}", meta.get("staged")?)],
+    )
+    .and_then(|()| super::restore_intent_to_add(worktree, Some(&scratch), &meta.heads()))
+    .and_then(|()| index_digest(worktree, Some(&scratch)));
+    cleanup();
+    digest
+}
+
+/// The entries digest of an index with no entries: an absent index, or the
+/// one `git worktree add --no-checkout` leaves.
+pub(super) fn empty_index_digest() -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bulkload-index-entries-v1\0");
+    *hasher.finalize().as_bytes()
+}
+
+/// Every refusal after a workspace intent is written is
+/// `GIT_CONVERGE_INTERRUPTED` (section 8, finding 6): a Git child that
+/// fails there (a lock a killed child left, a scratch index Git cannot
+/// lock) is a converge interrupted, never an untyped `GIT_CHILD_FAILED`
+/// (review 4).
+fn after_intent(refusal: BulkloadRefusal) -> BulkloadRefusal {
+    match refusal {
+        BulkloadRefusal::GitChildFailed(_) => interrupted(),
+        other => other,
+    }
 }
 
 // ---- the drivers ---------------------------------------------------------------
@@ -1431,14 +1775,16 @@ fn tag(landing: &Landing<'_>) -> String {
         .to_owned()
 }
 
-/// The new workspace ledger after a converge or a settle.
+/// The new workspace ledger after a converge or a settle. `installed` is
+/// the index digest `publish_index` installed and the exclude digest the
+/// converge wrote or proved (review 3 finding 3: neither is read back).
 #[allow(clippy::too_many_arguments)]
 fn next_ledger(
     worktree: &Path,
-    common: &Path,
     before: &LandedWorkspace,
     to: ([u8; 32], i128, &str),
     head: (Head, Option<String>),
+    installed: ([u8; 32], [u8; 32]),
     new: &BTreeMap<Vec<u8>, Side>,
     kept: &BTreeMap<Vec<u8>, SeatPrint>,
     written: &BTreeMap<Vec<u8>, SeatPrint>,
@@ -1463,8 +1809,8 @@ fn next_ledger(
         instance: to.2.to_owned(),
         head: head.0,
         intended_branch: head.1,
-        index: index_digest(worktree, None)?,
-        exclude: exclude_digest(&read_exclude(common)?),
+        index: installed.0,
+        exclude: installed.1,
         recorded_ns: super::pass_start_ns(),
         fsid: landed::fsid(worktree)?,
         seats,
@@ -1503,7 +1849,18 @@ impl Place<'_> {
     /// checkout's HEAD moves to: only [`set_head`] moves it, with HEAD
     /// (findings 1 and 2; review 2 finding 1: a step that created or moved
     /// it first made `set_head`'s compare-and-swap fail on every rerun).
-    fn refs(&self, meta: &Meta, t: i128, head: Option<&str>, custody: &mut Custody) -> Result<()> {
+    /// So is every branch a pending workspace intent names
+    /// ([`intent_branches`], the earlier report's finding 2). `only` plans
+    /// that one ref, the branch HEAD left, after `set_head` (the earlier
+    /// report's finding 5).
+    fn refs(
+        &self,
+        meta: &Meta,
+        t: i128,
+        head: Option<&str>,
+        only: Option<&str>,
+        custody: &mut Custody,
+    ) -> Result<()> {
         let Some(ledger) = self.ref_ledger()? else {
             return Ok(());
         };
@@ -1512,6 +1869,7 @@ impl Place<'_> {
             .map(|(_, branch)| branch)
             .collect();
         skip.extend(head.map(str::to_owned));
+        skip.extend(intent_branches(self.worktree, self.source)?);
         let (_, more) = native_refs::step(
             self.worktree,
             &self.ref_dir(),
@@ -1520,9 +1878,43 @@ impl Place<'_> {
             &meta.instance,
             t,
             &skip,
+            only,
+            true,
         )?;
         custody.merge(more);
         Ok(())
+    }
+
+    /// The step after `set_head` for the branch HEAD left (`old`, when HEAD
+    /// moved off it): no longer checked out, it is brought to the capture
+    /// now, not left behind while the source holds still (the earlier
+    /// report's finding 5, review 2 finding 1's stated limit).
+    fn left_branch(
+        &self,
+        meta: &Meta,
+        t: i128,
+        old: &Head,
+        new: &Head,
+        custody: &mut Custody,
+    ) -> Result<()> {
+        match &old.symbolic {
+            Some(left) if new.symbolic.as_ref() != Some(left) => {
+                match self.refs(meta, t, new.symbolic.as_deref(), Some(left), custody) {
+                    // The branch checked out again, or a concurrent writer:
+                    // the ref intent stays for the next apply's settle, and
+                    // the item goes on to its ledger. Refusing here would
+                    // leave the workspace intent pending with HEAD already
+                    // moved, and its settle would move HEAD off a branch the
+                    // operator switched back to.
+                    Err(BulkloadRefusal::GitConvergeInterrupted) => {
+                        custody.count("ref-left-branch-deferred");
+                        Ok(())
+                    }
+                    other => other,
+                }
+            }
+            _ => Ok(()),
+        }
     }
 
     /// Write the HEAD branch's ref ledger row.
@@ -1611,12 +2003,29 @@ pub fn apply_workspace(
         standalone,
     };
     let ledger_path = place.workspace_dir().join(landed::WORKSPACE_LANDED);
-    // A12: no ledger, not bulkload's (checked before any write).
-    if !landed::exists(&ledger_path)? {
+    // A12: no ledger, not bulkload's (checked before any write), unless a
+    // landing intent names the worktree: a first linked landing a crash cut
+    // short (#216's residual), finished forward under the lock.
+    let destination = super::linked_destination(workspace)?;
+    let landing_intent = landed::landing_intent_path(&place.ref_dir(), &destination);
+    let recovering = !landed::exists(&ledger_path)?;
+    if recovering && (standalone || !landed::exists(&landing_intent)?) {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     let _lock = landed::lock(&place.common, place.source)?;
-    let mut custody = native_refs::settle(workspace, &place.ref_dir())?;
+    let mut custody = settle_repository(workspace, &place.common, place.source)?;
+    // Review 3 finding 9: probe files a crashed pass left.
+    custody.add("probe-removed", sweep_probes(workspace)?);
+    if recovering {
+        let intent: landed::LandingIntent =
+            landed::read(&landing_intent)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
+        if intent.item != landing.item || intent.destination != destination.as_os_str().as_bytes() {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
+        super::recover_linked_landing(&destination, &place.common, target.source, &intent)?;
+        landed::remove(&landing_intent)?;
+        custody.count("landing-recovered");
+    }
     let mut ledger: LandedWorkspace =
         landed::read(&ledger_path)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
     // Finding 15(b): a plan edit is not a destination edit.
@@ -1625,7 +2034,7 @@ pub fn apply_workspace(
     }
     let converged = landed::exists(&place.workspace_dir().join(landed::WORKSPACE_INTENT))?;
     if converged {
-        custody.merge(settle(&place, &ledger)?);
+        custody.merge(settle(&place, &ledger).map_err(after_intent)?);
         ledger = landed::read(&ledger_path)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
     }
     let meta0 = Meta::read(workspace, place.source, &ledger.instance)?;
@@ -1717,12 +2126,12 @@ fn converge(
         .filter(|(path, _)| !same_path(path, worktree))
         .map(|(_, branch)| branch)
         .collect();
-    let (native, _) = native_refs::native_refs(worktree)?;
+    let (native, symrefs) = native_refs::native_refs(worktree)?;
     let symbolic = meta1.symbolic(worktree)?;
     let plan = head_plan(
         symbolic.as_deref(),
         meta1.get("head")?,
-        &native,
+        (&native, &symrefs),
         place.ref_ledger()?.as_ref(),
         &others,
         landing.observed_ns,
@@ -1730,7 +2139,7 @@ fn converge(
     let exclude_bytes = meta1.exclude(worktree)?;
     let exclude = (place.standalone && exclude_digest(&exclude_bytes) != ledger.exclude)
         .then(|| (ledger.exclude, exclude_digest(&exclude_bytes)));
-    let intent = WorkspaceIntent {
+    let mut intent = WorkspaceIntent {
         from: ledger.capture,
         to: landing.capture,
         to_instance: instance.clone(),
@@ -1741,70 +2150,83 @@ fn converge(
         branch: plan.branch.clone(),
         intended_branch: plan.intended.clone(),
         exclude,
+        head_done: false,
     };
     let intent_path = place.workspace_dir().join(landed::WORKSPACE_INTENT);
     landed::write(&intent_path, &intent)?;
     fault_point!(EstateConvergeAfterIntent);
-    let mut custody = Custody::default();
-    // Q6: configuration is applied once, at a first landing; a changed one
-    // is reported, never converged.
-    if meta0.optional("configuration-v1") != meta1.optional("configuration-v1") {
-        custody.count("configuration-not-converged");
-    }
-    place.refs(
-        &meta1,
-        landing.observed_ns,
-        symbolic.as_deref(),
-        &mut custody,
-    )?;
-    fault_point!(EstateConvergeAfterRefs);
-    let mut engine = Engine {
-        worktree,
-        tag: &tag,
-        proof: Some(&proof.prints),
-        objects: BatchObjects::new(worktree)?,
-        touched: BTreeMap::new(),
-        written: BTreeMap::new(),
-        custody: Custody::default(),
+    let after = || -> Result<Custody> {
+        let mut custody = Custody::default();
+        // Q6: configuration is applied once, at a first landing; a changed one
+        // is reported, never converged.
+        if meta0.optional("configuration-v1") != meta1.optional("configuration-v1") {
+            custody.count("configuration-not-converged");
+        }
+        place.refs(
+            &meta1,
+            landing.observed_ns,
+            symbolic.as_deref(),
+            None,
+            &mut custody,
+        )?;
+        fault_point!(EstateConvergeAfterRefs);
+        let mut engine = Engine {
+            worktree,
+            tag: &tag,
+            proof: Some(&proof.prints),
+            objects: BatchObjects::new(worktree)?,
+            touched: BTreeMap::new(),
+            written: BTreeMap::new(),
+            custody: Custody::default(),
+        };
+        for op in &ops {
+            engine.run(op)?;
+            fault_point!(EstateConvergeAfterSeat);
+        }
+        engine.modes(&new)?;
+        engine.objects.finish()?;
+        place.exclude(intent.exclude, &exclude_bytes)?;
+        super::restore_gitlink_directories(worktree, meta1.get("staged")?, &meta1.heads())?;
+        let index = publish_index(
+            worktree,
+            &place.git_dir,
+            (meta0, &meta1),
+            ledger.index,
+            &tag,
+        )?;
+        fault_point!(EstateConvergeAfterIndex);
+        set_head(worktree, &ledger.head, &plan.head, plan.branch.as_ref())
+            .map_err(|_| interrupted())?;
+        head_done(&intent_path, &mut intent)?;
+        place.branch_row(plan.row.as_ref())?;
+        fault_point!(EstateConvergeAfterHead);
+        place.left_branch(
+            &meta1,
+            landing.observed_ns,
+            &ledger.head,
+            &plan.head,
+            &mut custody,
+        )?;
+        if let Some(line) = plan.line {
+            custody.count(line);
+        }
+        let next = next_ledger(
+            worktree,
+            ledger,
+            (landing.capture, landing.observed_ns, &instance),
+            (plan.head, plan.intended),
+            (index, intent.exclude.map_or(ledger.exclude, |(_, new)| new)),
+            &new,
+            &proof.prints,
+            &engine.written,
+        )?;
+        landed::write(&place.workspace_dir().join(landed::WORKSPACE_LANDED), &next)?;
+        landed::remove(&intent_path)?;
+        fault_point!(EstateConvergeAfterLanded);
+        custody.merge(engine.custody);
+        Ok(custody)
     };
-    for op in &ops {
-        engine.run(op)?;
-        fault_point!(EstateConvergeAfterSeat);
-    }
-    engine.modes(&new)?;
-    engine.objects.finish()?;
-    place.exclude(intent.exclude, &exclude_bytes)?;
-    super::restore_gitlink_directories(worktree, meta1.get("staged")?, &meta1.heads())?;
-    publish_index(
-        worktree,
-        &place.git_dir,
-        (meta0, &meta1),
-        ledger.index,
-        &tag,
-    )?;
-    fault_point!(EstateConvergeAfterIndex);
-    set_head(worktree, &ledger.head, &plan.head, plan.branch.as_ref())
-        .map_err(|_| interrupted())?;
-    place.branch_row(plan.row.as_ref())?;
-    fault_point!(EstateConvergeAfterHead);
-    if let Some(line) = plan.line {
-        custody.count(line);
-    }
-    let next = next_ledger(
-        worktree,
-        &place.common,
-        ledger,
-        (landing.capture, landing.observed_ns, &instance),
-        (plan.head, plan.intended),
-        &new,
-        &proof.prints,
-        &engine.written,
-    )?;
-    landed::write(&place.workspace_dir().join(landed::WORKSPACE_LANDED), &next)?;
-    landed::remove(&intent_path)?;
-    fault_point!(EstateConvergeAfterLanded);
-    custody.merge(engine.custody);
-    Ok(custody)
+    after().map_err(after_intent)
 }
 
 // Whether the directory `at` (the seat `relative`) holds, at any depth, an
@@ -1832,24 +2254,36 @@ fn holds_unlanded(at: &Path, relative: &[u8], old: &BTreeMap<Vec<u8>, Side>) -> 
 
 /// Settle a pending workspace intent forward (A3): every component that is
 /// old is brought to new, one that is new is done, and anything else is a
-/// third party's: `GIT_CONVERGE_INTERRUPTED`, the intent kept.
+/// third party's: `GIT_CONVERGE_INTERRUPTED`, the intent kept. HEAD still
+/// at its old value whose branch line can no longer apply (the branch
+/// moved, deleted or checked out since, or its create blocked by a ref put
+/// back) is re-planned against the destination now, the intent rewritten
+/// first (the earlier report's finding 2, review 3's finding 19): replaying
+/// the line would refuse on every rerun.
+#[allow(clippy::too_many_lines)]
 fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
     let worktree = place.worktree;
     let intent_path = place.workspace_dir().join(landed::WORKSPACE_INTENT);
-    let intent: WorkspaceIntent = landed::read(&intent_path)?.ok_or_else(interrupted)?;
+    let mut intent: WorkspaceIntent = landed::read(&intent_path)?.ok_or_else(interrupted)?;
     let meta0 = Meta::read(worktree, place.source, &ledger.instance)?;
     let meta1 = Meta::read(worktree, place.source, &intent.to_instance)?;
     let (old, new) = (sides(worktree, &meta0)?, sides(worktree, &meta1)?);
     let mut custody = Custody::default();
+    custody.add(
+        "git-lock-removed",
+        remove_intent_head_locks(&place.git_dir, &place.common, &intent)?,
+    );
     place.refs(
         &meta1,
         intent.to_observed_ns,
         meta1.symbolic(worktree)?.as_deref(),
+        None,
         &mut custody,
     )?;
+    let tag = intent.tag.clone();
     let mut engine = Engine {
         worktree,
-        tag: &intent.tag,
+        tag: &tag,
         proof: None,
         objects: BatchObjects::new(worktree)?,
         touched: BTreeMap::new(),
@@ -1863,31 +2297,93 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
     engine.objects.finish()?;
     place.exclude(intent.exclude, &meta1.exclude(worktree)?)?;
     super::restore_gitlink_directories(worktree, meta1.get("staged")?, &meta1.heads())?;
-    publish_index(
+    let index = publish_index(
         worktree,
         &place.git_dir,
         (&meta0, &meta1),
         intent.index_old,
         &intent.tag,
     )?;
-    let (head_old, head_new) = &intent.head;
+    let head_old = intent.head.0.clone();
     let current = head_of(worktree)?;
-    if current != *head_new {
-        if current != *head_old {
-            return Err(interrupted());
-        }
-        set_head(worktree, head_old, head_new, intent.branch.as_ref())
-            .map_err(|_| interrupted())?;
-    }
-    if let Some((name, _, value)) = &intent.branch {
-        place.branch_row(Some(&(
+    let mut row = intent.branch.as_ref().map(|(name, _, value)| {
+        (
             name.clone(),
             LandedRef {
                 oid: Some(value.clone()),
                 observed_ns: intent.to_observed_ns,
             },
-        )))?;
+        )
+    });
+    if current != intent.head.1 {
+        // Once HEAD was recorded at its new value, any other HEAD is the
+        // operator's: refused, never moved again.
+        if intent.head_done || current != head_old {
+            return Err(interrupted());
+        }
+        let others: BTreeSet<String> = checked_out_by(worktree)?
+            .into_iter()
+            .filter(|(path, _)| !same_path(path, worktree))
+            .map(|(_, branch)| branch)
+            .collect();
+        // Review 4 (the blocker): the branch HEAD goes to, checked out by
+        // another worktree since the intent (an operator's `git switch` or
+        // `git worktree add`), whether or not a branch line remains.
+        let taken = intent
+            .head
+            .1
+            .symbolic
+            .as_ref()
+            .is_some_and(|b| others.contains(b) && current.symbolic.as_ref() != Some(b));
+        if taken || branch_line_fails(worktree, intent.branch.as_ref(), &others)? {
+            let (native, symrefs) = native_refs::native_refs(worktree)?;
+            let plan = head_plan(
+                meta1.symbolic(worktree)?.as_deref(),
+                meta1.get("head")?,
+                (&native, &symrefs),
+                place.ref_ledger()?.as_ref(),
+                &others,
+                intent.to_observed_ns,
+            );
+            if plan.head != intent.head.1 || plan.branch != intent.branch {
+                // A branch line the crash left done (its own transaction
+                // committed) is bulkload's write: its row stays recorded.
+                let done = intent
+                    .branch
+                    .as_ref()
+                    .filter(|(name, _, after)| native.get(name) == Some(after))
+                    .map(|(name, _, value)| {
+                        (
+                            name.clone(),
+                            LandedRef {
+                                oid: Some(value.clone()),
+                                observed_ns: intent.to_observed_ns,
+                            },
+                        )
+                    });
+                intent.head.1 = plan.head;
+                intent.branch = plan.branch;
+                intent.intended_branch = plan.intended;
+                landed::write(&intent_path, &intent)?;
+                row = plan.row.or(done);
+                custody.count("head-replanned");
+                if let Some(line) = plan.line {
+                    custody.count(line);
+                }
+            }
+        }
+        set_head(worktree, &head_old, &intent.head.1, intent.branch.as_ref())
+            .map_err(|_| interrupted())?;
     }
+    head_done(&intent_path, &mut intent)?;
+    place.branch_row(row.as_ref())?;
+    place.left_branch(
+        &meta1,
+        intent.to_observed_ns,
+        &head_old,
+        &intent.head.1,
+        &mut custody,
+    )?;
     let kept: BTreeMap<Vec<u8>, SeatPrint> = ledger
         .seats
         .iter()
@@ -1895,10 +2391,10 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
         .collect();
     let next = next_ledger(
         worktree,
-        &place.common,
         ledger,
         (intent.to, intent.to_observed_ns, &intent.to_instance),
-        (head_new.clone(), intent.intended_branch.clone()),
+        (intent.head.1.clone(), intent.intended_branch.clone()),
+        (index, intent.exclude.map_or(ledger.exclude, |(_, new)| new)),
         &new,
         &kept,
         &engine.written,
@@ -1908,6 +2404,55 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
     custody.merge(engine.custody);
     custody.count("workspace-intent-settled");
     Ok(custody)
+}
+
+/// Record in the pending intent that HEAD is at its new value, right after
+/// `set_head`: a settle then never moves
+/// HEAD again, so an operator's switch back to the old HEAD while this pass
+/// still runs (the branch row, the left branch's step, the ledger) is kept
+/// and refused typed, not undone (found by EstateConverge.tla,
+/// `MC_ec_head_concurrent_crash`).
+fn head_done(intent_path: &Path, intent: &mut WorkspaceIntent) -> Result<()> {
+    if intent.head_done {
+        return Ok(());
+    }
+    intent.head_done = true;
+    landed::write(intent_path, intent)
+}
+
+/// Whether the HEAD branch line of a pending intent (`name`, old, new) can
+/// no longer apply: another worktree has the branch checked out (`others`;
+/// checked first, review 4: a branch already at its new value is no
+/// license to attach a second worktree to it), the branch is neither its
+/// old nor its new value, or its create sits beside a ref that exists (a
+/// symbolic one too).
+fn branch_line_fails(
+    worktree: &Path,
+    branch: Option<&(String, Option<String>, String)>,
+    others: &BTreeSet<String>,
+) -> Result<bool> {
+    let Some((name, before, after)) = branch else {
+        return Ok(false);
+    };
+    if others.contains(name) {
+        return Ok(true);
+    }
+    let (native, symrefs) = native_refs::native_refs(worktree)?;
+    let now = native.get(name);
+    if now == Some(after) {
+        return Ok(false);
+    }
+    Ok(now != before.as_ref()
+        || (before.is_none()
+            && (symrefs.contains(name)
+                || native_refs::name_conflict(
+                    name,
+                    native
+                        .keys()
+                        .chain(&symrefs)
+                        .map(String::as_str)
+                        .filter(|other| other != name),
+                ))))
 }
 
 /// Apply one refs-only item: the import, and into a repository bulkload
@@ -1936,10 +2481,11 @@ pub fn apply_refs(
         return Ok(Applied::default());
     }
     let _lock = landed::lock(&common, target.source)?;
-    let mut custody = native_refs::settle(repo, &ref_dir)?;
+    let mut custody = settle_repository(repo, &common, target.source)?;
     let ledger = landed::read::<RefLedger>(&ref_dir.join(landed::REFS_LANDED))?.unwrap_or_default();
     let (_, instance) = super::import_verified_instance(repo, staged.path(), target.source)?;
-    let skip = native_refs::checked_out(repo)?;
+    let mut skip = native_refs::checked_out(repo)?;
+    skip.extend(intent_branches(repo, target.source)?);
     let (_, more) = native_refs::step(
         repo,
         &ref_dir,
@@ -1948,6 +2494,8 @@ pub fn apply_refs(
         &instance,
         landing.observed_ns,
         &skip,
+        None,
+        true,
     )?;
     custody.merge(more);
     Ok(Applied::of(false, &custody))
@@ -2020,7 +2568,7 @@ pub fn settle_refs(
     super::destination_git_ready()?;
     let _lock = landed::lock(&common, source)?;
     let repo = workspace.unwrap_or(repository);
-    Ok(native_refs::settle(repo, &landed::ledger_dir(&common, source))?.words())
+    Ok(settle_repository(repo, &common, source)?.words())
 }
 
 // ---- first landings (#215) ---------------------------------------------------
@@ -2055,18 +2603,20 @@ pub(super) fn land_standalone_refs(
         instance,
         t,
         &BTreeSet::new(),
+        None,
+        false,
     )?;
-    let (native, _) = native_refs::native_refs(work)?;
+    let (native, symrefs) = native_refs::native_refs(work)?;
     let plan = head_plan(
         meta.symbolic(work)?.as_deref(),
         meta.get("head")?,
-        &native,
+        (&native, &symrefs),
         Some(&ledger),
         &BTreeSet::new(),
         t,
     );
     if let Some((name, before, after)) = &plan.branch {
-        native_refs::transact(
+        native_refs::transact_private(
             work,
             &[landed::RefOp {
                 name: name.clone(),
@@ -2087,6 +2637,7 @@ pub(super) fn land_standalone_refs(
             work,
             None,
             format!("update HEAD\0{}\0\0", plan.head.oid).as_bytes(),
+            &["HEAD"],
         )?,
     }
     if let Some((name, row)) = &plan.row {
@@ -2127,7 +2678,7 @@ pub(super) fn plan_linked(
     let common = super::common_repository(repository)?;
     let lock = landed::lock(&common, source)?;
     let directory = landed::ledger_dir(&common, source);
-    let mut custody = native_refs::settle(repository, &directory)?;
+    let mut custody = settle_repository(repository, &common, source)?;
     let meta = Meta::read(repository, source, instance)?;
     let mut ledger = landed::read::<RefLedger>(&directory.join(landed::REFS_LANDED))?
         .filter(|ledger| ledger.created);
@@ -2136,17 +2687,19 @@ pub(super) fn plan_linked(
         .map(|(_, branch)| branch)
         .collect();
     if let Some(current) = &ledger {
+        let mut skip = checked.clone();
+        skip.extend(intent_branches(repository, source)?);
         let (next, more) = native_refs::step(
-            repository, &directory, current, source, instance, t, &checked,
+            repository, &directory, current, source, instance, t, &skip, None, true,
         )?;
         custody.merge(more);
         ledger = Some(next);
     }
-    let (native, _) = native_refs::native_refs(repository)?;
+    let (native, symrefs) = native_refs::native_refs(repository)?;
     let head = head_plan(
         meta.symbolic(repository)?.as_deref(),
         meta.get("head")?,
-        &native,
+        (&native, &symrefs),
         ledger.as_ref(),
         &checked,
         t,
@@ -2171,6 +2724,7 @@ pub(super) fn plan_linked(
                 None,
                 next,
                 Custody::default(),
+                true,
             )?;
         }
         // A foreign repository: `worktree add -b` creates the branch, and
@@ -2209,14 +2763,18 @@ pub(super) fn exclude_newer(common: &Path, source: &str, existing: &[u8], t: i12
 }
 
 /// Record a first landing's workspace ledger at `worktree`; `custody`
-/// gains `not-convergeable` when the ledger is over its cap.
+/// gains `not-convergeable` when the ledger is over its cap. `index` is
+/// the digest of the index the landing installed (a linked landing's,
+/// [`installed_index`]); `None` reads a private stage's.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn finish_landing(
     worktree: &Path,
     common: &Path,
     source: &str,
     landing: &Landing<'_>,
     meta: &Meta,
-    head: &HeadPlan,
+    head: (&Head, Option<&String>),
+    index: Option<[u8; 32]>,
     mut custody: Custody,
 ) -> Result<Applied> {
     let git_dir =
@@ -2234,7 +2792,8 @@ pub(super) fn finish_landing(
         &target,
         landing,
         meta,
-        (head.head.clone(), head.intended.clone()),
+        (head.0.clone(), head.1.cloned()),
+        index,
     )? {
         custody.count("not-convergeable");
     }

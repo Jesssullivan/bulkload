@@ -9,7 +9,7 @@ findings) and amended: section 16 records each finding accepted or rejected
 with its reason, section 17 the open questions decided, and section 18 what
 was built on this branch, how it was tested and what is deferred. The built
 code had a second review (eight findings); section 19 records each and its
-fix. Where sections 1 to 15 and sections 16 to 19 disagree, 16 to 19 win; the text of
+fix. Sections 20 and 21 record the fixes after review 3 and review 4 (2026-10-09). Where sections 1 to 15 and sections 16 to 21 disagree, 16 to 21 win; the text of
 1 to 15 is kept as the reviewed design. The code is staged, uncommitted: the
 coordinator commits and opens the PR, signed. **Merge is held** for the
 operator ruling and the TLA+ model of Q1 (section 17). Evidence: the 2026-10-08 neo->sting run (Linear TIN-3692;
@@ -1102,3 +1102,228 @@ OI-1003-Q1, Q2, Q11 (S4, S5), R-N98 (fixture repositories only), R-N13.
   `prop_seed_guard` 8, `dep_graph` 2, all passed; whole lib 575 passed, 5
   ignored; `bulkload-proto` 14 passed.
 
+
+## 20. Fixes after review 3 and the EstateConverge model (2026-10-09)
+
+Lane: the convergence lane, worktree
+`bulkload.worktrees/estate-converge-20261008`, branch
+`feat/estate-converge-20261008` at `5b8e550` (this code merged with
+`origin/main` `91d4294`, #222's S4 sweep included, and with the
+EstateConverge model branch `feat/formal-estate-converge-20261009`).
+Rulings cited: OI-1003-Q144 (the convergence merges only when the model
+passes against the code), OI-1003-Q32 and Q43 (the catalogue and
+tla-check pipeline), OI-1003-Q7, R-N11 (only processes this lane started;
+none signalled), R-N98 (fixture repositories only), R-N13 (this section and
+the formal note). Nothing committed or pushed; everything is staged.
+
+Every finding the model reported against the code
+(`2026-10-09-formal-estate-converge.md`, "Model-vs-implementation
+discrepancies") is fixed in the code, except items 6 and 18, kept as
+documented limits. Each fix has a Rust row that fails on the code before
+it: an integration row run against the pre-fix tree (`git archive 5b8e550`
+with the new test file), or a unit row run against a mutation that puts
+the old code back (the "Evidence" column). In the model each fixed
+finding row became a pass row and the code before the fix a mutation whose
+`MC_ec_neg_` row fails the finding's property; the review 3 mutations
+(CODE BEFORE THE FIX in the catalogue) keep their rows.
+
+| Item | Finding | Status | Code | Rust row (evidence) | Model |
+|---|---|---|---|---|---|
+| 16 | Settle moves a branch checked out since the crash (blocker) | Fixed | `native_refs::finish` reads `checked_out_by` (HEADs, rebases, bisects) and never redoes an op on such a branch: row restored, `ref-checked-out-elsewhere` | `a_settle_never_moves_a_branch_checked_out_since_the_crash` (mutation MU1: moved `topic` under the operator's HEAD) | `MC_ec_neg_settle_moves_checked_out` fails; every pass row holds the rule |
+| 17 | No HEAD verification in the ref transaction | Fixed | `transact` holds every worktree's HEAD with Git's own `HEAD.lock` (`HeadLocks`; `update-ref` refuses `worktrees/<id>/HEAD`, so `symref-verify` can name only its own worktree) and reads the checked-out set under them; an op on a checked-out or held branch, or a HEAD locked by another writer, refuses `GIT_CONVERGE_INTERRUPTED` | `a_transaction_never_moves_a_checked_out_or_held_branch` (MU2: moved it) | `MC_ec_neg_txn_no_symref_verify` |
+| 8 | `finish`'s names after the step | Fixed | only the deletes that will run leave the names after the step, the creates that will run join; a blocked create is dropped (`ref-name-conflict`) | `a_create_beside_a_delete_that_will_not_run_is_dropped` (MU3: `GIT_CONVERGE_INTERRUPTED`) | `MC_ec_neg_finish_after_all_deletes`, `MC_ec_refs_rename_op` |
+| 9 | Rebase/bisect branch not in the skip set | Fixed | `checked_out_by` adds `rebase-merge/head-name`, `rebase-apply/head-name`, `BISECT_START` (`held_branches`) | `a_branch_under_a_rebase_or_bisect_counts_as_checked_out` (MU6), and the bisect half of the item 17 row | `MC_ec_neg_rebase_unguarded`, `MC_ec_rebase` |
+| 10 | Ledger re-reads the index and exclude | Fixed | `publish_index` returns the digest it installed and `next_ledger` records it, with the exclude the converge wrote or proved; a first linked landing records `installed_index` (built from the capture in a scratch index file) | `the_ledger_records_the_installed_index_not_a_re_read` (MU9) | `MC_ec_neg_ledger_reads_index`, `MC_ec_index_concurrent` |
+| 3 (finding 4) | Unborn HEAD untyped | Fixed | `head_of`: `rev-parse -q --verify HEAD`, exit 1 is an unborn HEAD (empty oid): the proof refuses `GIT_DESTINATION_MODIFIED`, a settle `GIT_CONVERGE_INTERRUPTED` | `an_unborn_head_refuses_modified` (pre-fix tree: `GIT_CHILD_FAILED`), `an_unborn_head_reads_as_no_commit` (MU7) | `MC_ec_neg_unborn_head_untyped`, `MC_ec_head_op` |
+| 12 | Seat parent not a directory after the intent | Fixed | `Engine::run` maps `Seat::at`'s error to `GIT_CONVERGE_INTERRUPTED` (the settle skip for Remove, RmDir and DirMode kept) | `a_seat_parent_replaced_after_the_intent_refuses_interrupted` (pre-fix: `PATH_ESCAPES_ROOT`) | `MC_ec_neg_seat_parent_untyped`, `MC_ec_seat_parent` |
+| 13 | Git ref renames not durable before the ledgers | Fixed | `update_refs` takes the ref names it writes and syncs the directories their renames changed (`ref_dirs`: each ref's and its reflog's directory, the git directory for HEAD, the common directory for `packed-refs`) before returning | `a_ref_write_syncs_the_directories_its_renames_changed` (MU11) | `MC_ec_neg_refs_unsynced` |
+| 15 | Probe files left by a crash | Fixed | `apply_workspace` removes `.bulkload-converge-*-probe-{a,b}` under the lock (`sweep_probes`); probes are created with `O_EXCL` and `O_NOFOLLOW` | `probe_files_a_crashed_pass_left_are_removed` (pre-fix: left), `the_probe_sweep_removes_only_probe_files` (MU8) | `MC_ec_neg_probe_left` |
+| 1 | File -> directory settle wedge | Fixed | `Op::to_dir`; a settling `Remove` whose seat already holds the new directory is done | `a_file_turned_directory_settles_after_an_interrupted_converge` (pre-fix: `GIT_CONVERGE_INTERRUPTED` forever), `a_file_turned_directory_marks_its_removal` (MU10), fault row `estate_converge_after_seat_mid` (the source's day now turns a file into a directory) | `MC_ec_file_to_dir_settle` (LiveSpec) passes; `MC_ec_neg_settle_remove_dir` fails `NoWedge` |
+| 2 | Stale settle branch move | Fixed | every ref step skips the branches a pending workspace intent of any item names (`intent_branches`, in `Place::refs`, `plan_linked`, `apply_refs`); the settle re-plans (item 19) | `a_pending_intents_head_branch_is_left_to_its_item` (pre-fix: the linked item's step moved `other`, the main's settle refused forever) | `MC_ec_settle_stale_branch` (seeded simulation) passes; `MC_ec_neg_step_moves_intent_branch` fails `CrashAtomicity` (simulation) |
+| 19 | Settle replays a HEAD-branch create a put-back ref blocks | Fixed | the workspace settle, HEAD still old, checks whether the intent's branch line can still apply (`branch_line_fails`: moved, deleted, checked out by another worktree, create beside an existing ref); if not it re-plans with `head_plan`, rewrites the intent, then `set_head` (`head-replanned`) | `a_settle_re_plans_a_head_branch_a_put_back_ref_blocks` (pre-fix: `GIT_CONVERGE_INTERRUPTED` forever) | `MC_ec_settle_branch_conflict` passes; `MC_ec_neg_settle_replays_branch` fails `TypedRefusal` |
+| 3 | Git child lock leftovers; `set_head` one transaction | Fixed | `native_refs::settle` removes a lock file of its intent whose content proves it bulkload's (the op's new value; an empty delete lock older than a timestamp tick; `refs/stash.lock` holding a stash entry it stores; `packed-refs.lock` empty and old with a delete pending) and every HEAD lock marked by `HeadLocks`; the workspace settle removes `HEAD.lock` and the branch lock holding the intent's new values (`remove_head_locks`). Any other lock refuses typed. `set_head` commits the branch first in its own transaction under every worktree's HEAD lock with this HEAD verified, then HEAD (new fault point `estate.converge.head_branch` between) | `a_settle_removes_a_killed_childs_lock_and_keeps_anyone_elses` (MU4: refused forever; a killed stash store cleared the stash row), fault row `estate_converge_head_branch` | `MC_ec_child_crash_live` (LiveSpec), `MC_ec_set_head_partial` pass; `MC_ec_neg_stale_lock_kept` fails `NoWedge`, `MC_ec_neg_stale_stash_lock` `TypedRefusal`, `MC_ec_neg_set_head_one_txn` `CrashAtomicity` |
+| 14 | Killed stash store | Fixed | item 3's lock removal; a store that meets `refs/stash.lock` refuses `GIT_CONVERGE_INTERRUPTED`, never clears the stash row | as item 3 | `MC_ec_stash_lock` |
+| 4 | Stash settle undoes an operator's drop | Fixed | `RefIntent::stash_at`: each store's reflog is made durable in the intent; `stash_apply` continues only from it or one store past it (`stash_path`); anything else is the operator's, kept, `stash-modified-at-destination`, and the ledger's stash row names the reflog bulkload last landed (a cleared row read an emptied stash as never restored, and the next step restored it: found by the model, `MC_ec_stash_settle_revert`) | `a_stash_settle_never_undoes_an_operators_drop` (MU5b, the old any-suffix rule: re-stored the dropped entries; MU13, the row cleared: the next decision restored) | `MC_ec_stash_settle_revert` passes; `MC_ec_neg_stash_settle_any_suffix` fails `NoLocalWorkLost`; the stash ghost follows review 3 finding 14's rule (old is no longer bulkload's once a store is made) |
+| 5 | Old HEAD branch stays stale | Fixed | after `set_head` (converge and settle) a ref step for the branch HEAD left alone (`Place::left_branch`; `native_refs::step`'s `only`); when its transaction fails (the operator checked it out again, another writer) the item still lands and the ref intent waits for the next apply (`ref-left-branch-deferred`): a refusal there left HEAD moved under a pending workspace intent, and its settle moved HEAD off a branch the operator switched back to (found by the model, `MC_ec_head_concurrent`) | `the_branch_head_left_converges_with_it` (pre-fix: `main` stayed at its landed value), `the_branch_head_left_waits_for_a_writer_without_refusing` (MU12: refused), fault rows (the source's day switches to `side`) | `MC_ec_old_head_branch` (LiveSpec) passes; `MC_ec_neg_old_head_branch_skipped` fails `ConvergesWhenQuiet` |
+| 7 | #216 residual: crashed first linked landing | Fixed | `restore_linked_staged_landed` writes a `LandingIntent` (common ledger directory, keyed by the destination) before `git worktree add` and removes it after the ledger; `apply_workspace` finds a worktree without a ledger that a landing intent names and finishes it forward under the lock (`recover_linked_landing`: HEAD must be the planned one; each capture seat absent is written, its bytes or a prefix of them (bulkload's cut-short write) are kept or rewritten, anything else is `GIT_DESTINATION_MODIFIED`); new fault point `estate.converge.linked_added` | fault row `estate_converge_linked_added` (pre-fix tree: no landing intent, so the rerun refuses `GIT_DESTINATION_OCCUPIED`) | `MC_ec_first_linked_crash` (LiveSpec) passes; `MC_ec_neg_no_landing_intent` fails `NoWedge` |
+| new | A settle moves HEAD off a branch the operator switched back to after `set_head` (found by the model while re-checking these fixes) | Fixed | `WorkspaceIntent::head_done`, written right after `set_head` (`head_done`); a settle with it set refuses any HEAD but the new one; a HEAD transaction that fails after the branch's while HEAD already reads as new is done | fault row `estate_converge_after_head_switch_back` (MU14: the settle moved HEAD back to `side`) | `MC_ec_head_concurrent_crash` passes; `MC_ec_neg_head_not_recorded` fails `NoLocalWorkLost` |
+| 6 | Detached HEAD never re-attaches on a no-op | **Documented limit** | none | none | `MC_ec_finding_detached_reattach` (fails `ConvergesWhenQuiet`, as a limit) |
+| 18 | Restored ref never re-planned on an A4 no-op | **Documented limit** | none | none | `MC_ec_finding_restored_ref` (fails `ConvergesWhenQuiet`, as a limit) |
+| 20 | Transaction and HEAD compare-and-swap | Already right | none | existing | `MC_ec_neg_txn_no_cas`, `MC_ec_neg_head_no_cas` |
+
+**Why 6 and 18 stay limits.** Both are liveness only: nothing is lost,
+overwritten or refused; the HEAD stays detached with its branch recorded,
+the ref stays at the operator's put-back value (equal to bulkload's
+landed one), and the next changed capture converges both (its converge
+re-runs the attach rule and plans every ref). Fixing them needs the
+journal no-op (A4) to read the workspace ledger and run the attach rule or
+a ref step on every rerun of an unchanged source, which spends S3's zero
+read budget on every no-op apply and which no ruling allows. Operator
+decision asked: allow a metadata-only A4 check (ref ledger and
+`intended_branch` only), or rule both known limits.
+
+**Further stated limits of the fixes.** A lock left empty by a Git child
+killed between creating and writing it (a create or update; Git writes a
+delete's lock empty, which an age rule covers), and a `packed-refs.lock`
+with content, are not provably bulkload's: the settle refuses
+`GIT_CONVERGE_INTERRUPTED` naming no lock until the operator removes it.
+HEAD locks bulkload holds for a transaction refuse a concurrent `git
+switch` for that moment; one a crash leaves is marked and removed by the
+next settle. `git bisect start` with no commit, between the HEAD-locked
+read and the transaction, is not excluded. Reftable repositories are not
+covered by the lock recovery (bulkload creates files-backend repositories).
+
+**Fault harness.** Two points (`estate.converge.head_branch`,
+`estate.converge.linked_added`, `Point::ALL` 38) and their rows; the
+source's day now switches HEAD to a moved branch and turns a file into a
+directory, so the existing rows cover set_head's two transactions, the
+left branch and the file-to-directory settle; a seat whose kind changes
+may be absent between its removal and addition (as the model's
+`CrashAtomicity`). A new scenario, `LinkedLanding`, crashes a first landing
+of a main and its linked worktree after `worktree add` and checks the
+rerun finishes it forward and equals a fresh restore.
+
+**Found while re-checking the model against the fixed code.** Four
+interactions the first runs of the new rows showed, each fixed in both the
+code and the model before the final run: the settle's re-plan counted the
+item's own checked-out branch as "checked out elsewhere" (a stutter loop
+in `MC_ec_child_crash_live`; `branch_line_fails` now takes the other
+worktrees' branches, and a re-plan that changes nothing is not written);
+the stash row cleared after an operator's change made the next step
+restore the stash (above, item 4); the left-branch step's refusal (above,
+item 5); and a settle that moved HEAD again after `set_head` (above, the
+`head_done` row, found by a probe of `MC_ec_head_concurrent` with a crash,
+now the pass row `MC_ec_head_concurrent_crash`). The settle's re-plan also removed the wedge of the old
+mutation `head_branch_in_step`; its row now names the unjustified
+`GIT_CONVERGE_INTERRUPTED` (`TypedRefusal`) the mutation still causes, and
+the mutation skips neither the HEAD branch nor its own intent's.
+
+**Two repairs outside the findings.** `destination_git_ready` probes the
+Git version with `run_git` directly, not through `output`: a test's
+injected child fault (`scratch_fault::Site::Child`) taken by that probe
+was cached for the process, so `cargo test --lib estate::s4_sweep_tests`
+alone failed 7 rows with `GIT_UNAVAILABLE` (the same 7 on the pre-fix
+tree; the whole-crate run passed only by test order). And the recovery's
+`read-tree` goes through the registered `read_tree` writer (the S2 command
+registry's ceiling of 6 `read-tree` uses).
+
+**Validation (2026-10-09, in `nix develop`, git 2.54, lane target dir
+`/srv/fast-local/jess/cache/cargo-target/converge`, host load 60 to 100).**
+
+- Before the fixes: the 7 new integration rows against the pre-fix tree
+  (`git archive 5b8e550` plus the new test file) all failed
+  (`GIT_CHILD_FAILED`, probes left, `GIT_CONVERGE_INTERRUPTED` forever for
+  file -> directory, `main` left at its landed value, `PATH_ESCAPES_ROOT`,
+  `GIT_CONVERGE_INTERRUPTED` forever for the put-back `other`, `other` moved
+  by the linked item); the extended fault harness on the pre-fix tree
+  failed 17 of 18 converge rows (the left branch, the file -> directory
+  wedge, no landing intent, the `head_branch` point never reached); each
+  unit row failed against its mutation (MU1 to MU14, `logs/mutation-
+  evidence.log`: every one "FAIL (as required)").
+- After: `cargo fmt --all -- --check` clean; `cargo clippy --workspace
+  --all-targets --locked -- -D warnings` clean, the `io-trace` pass clean,
+  the `fault-injection,io-trace` pass clean; `cargo test -p bulkload-agent
+  --locked`: lib 607 passed, 5 ignored, every integration binary ok
+  (`estate_converge` 19, `source_command_registry` 16, `refusal_taxonomy`
+  5, ...); `--lib estate::s4_sweep_tests` 14 passed; `--features
+  fault-injection,io-trace --test fault_harness` 79 passed, `--test
+  power_loss` 12 passed; `python3 tests/test_ci_contract.py` 24 OK; TLC:
+  all 74 `MC_ec_` rows matched (formal note).
+
+## 21. Review 4 of the fixed code and model (2026-10-09, later)
+
+Lane: the convergence lane, worktree
+`bulkload.worktrees/estate-converge-20261008`, branch
+`feat/estate-converge-20261008` at `5b8e550` with section 20's fixes and
+these staged. Rulings cited: OI-1003-Q144, OI-1003-Q32 and Q43, OI-1003-Q7,
+R-N11 (only processes this lane started; none signalled), R-N98 (fixture
+repositories only), R-N104 (no PID liveness check: the live-writer row
+polls for its lock file and reaps its own child), R-N13 (this section and
+the formal note's "Review 4"). Nothing committed or pushed.
+
+Thirteen findings; twelve fixed in code (findings 1 and 8 are one defect),
+finding 11 a stated limit. Model side: the formal note, "Review 4".
+Evidence before the fix: the new integration and fault-harness rows run
+against the tree as review 4 found it (`git checkout-index` of the staged
+tree before any edit, plus the new test files; `logs/r4/prefix-*.log`), and
+each unit row against a mutant that puts that code back
+(`logs/r4/mutation-evidence-r4.log`, MU15 to MU21).
+
+| # | Finding | Code | Rust row (evidence before the fix) |
+|---|---|---|---|
+| 1, 8 | Settle or `set_head` attaches HEAD to a branch another worktree has checked out (blocker) | `set_head`: when it attaches HEAD to a branch it is not on, every other worktree's `HEAD.lock` is held from before the branch transaction to after HEAD's, and the branch checked out or held by another worktree, read under them, refuses `GIT_CONVERGE_INTERRUPTED` (with or without a branch line; the branch transaction itself also holds this worktree's lock). `settle`: `branch_line_fails` checks the other worktrees first; a HEAD whose target another worktree took since the intent re-plans even with no branch line (`taken`), detached, `head-detached-ref-conflict`; a done branch line keeps its ledger row | `set_head_never_puts_a_second_worktree_on_a_branch` (MU18: attached, two worktrees on `side`); fault row `estate_converge_head_branch_double_checkout` (pre-fix: the rerun attached the checkout to `side` beside the operator's `git worktree add`) |
+| 2 | `recover_linked_landing` discarded the operator's staged index and overwrote a prefix | the index must have no entries (`empty_index_digest`) or be `installed_index`'s, else `GIT_DESTINATION_MODIFIED`; every check runs before any write; the prefix rule is gone: a linked landing writes each entry under `.bulkload-landing-temporary` and renames it into place without replacing (`restore_entries_with`), so a file at an entry's name that is not its blob is the operator's; the recovery removes that temporary; its own killed `read-tree`'s `index.lock` (whose entries are the installed index) is removed, any other refuses INTERRUPTED; `read-tree` runs only if the index is not already the installed one | fault row `estate_converge_linked_added_operator` (pre-fix: `workspace-restored`, `mine.txt` unstaged, `f1` overwritten) |
+| 3 | Stash reflog never fsynced | `update_refs` fsyncs `logs/refs/stash` (`ref_files`, `sync_ref_files`) before the directory syncs, so before `record` and the ledger | `a_stash_store_syncs_its_reflog` (MU17). Not power-loss traced (Git's syscalls are a child's) |
+| 4 | Empty `HEAD.lock`/`index.lock` after a power loss | `native_refs::publish_lock`: the marker goes to `bulkload-lock-<pid>-<n>` in the git directory, is synced, and is renamed to the lock without replacing (the link fallback where there is no exclusive rename): the lock never exists without its marker. `HeadLocks` and `publish_index` use it; `sweep_lock_temps` removes a crash's temporaries (`settle_repository`) | `a_lock_bulkload_takes_holds_its_marker_from_the_moment_it_exists` (MU16: the lock existed empty) |
+| 5 | A killed `read-tree` left `bulkload-index-<tag>-fresh.lock`: `GIT_CHILD_FAILED` on every rerun | `publish_index`'s cleanup removes `fresh.lock` and `merged.lock` too; `installed_index` uses `bulkload-index-landing` per worktree, removed with its lock before and after; `after_intent` maps every `GIT_CHILD_FAILED` after a workspace intent (converge and settle) to `GIT_CONVERGE_INTERRUPTED` | fault row `estate_converge_index_locked_fresh_lock` (pre-fix: `GIT_CHILD_FAILED stderr_class=other`) |
+| 6 | `packed-refs.new` left by a killed delete wedged | `remove_orphan_packed_new` in `remove_stale_locks`: with deletes or a stash op pending and no `packed-refs.lock`, the orphan is removed (lock checked first; Git creates the file exclusively, so no writer can make one while it stays) | `an_orphan_packed_refs_new_is_removed_once_no_lock_holds_it` (MU20); fault row `estate_converge_after_ref_intent_packed_new` (pre-fix: the empty `packed-refs.lock` was removed by age, `.new` stayed) |
+| 7 | A create beside an operator's symbolic ref never demoted | `plan_names` and `finish` count the destination's symbolic refs among the names after the step; `head_plan` and `branch_line_fails` among the names a branch conflicts with | `a_create_beside_a_symbolic_ref_is_dropped` (MU21); `a_create_beside_an_operators_symbolic_ref_is_dropped` (pre-fix: `GIT_CONVERGE_INTERRUPTED`) |
+| 9 | A killed `set_head`'s `HEAD.lock` beside a pending ref intent wedged | `converge::settle_repository` replaces the bare `native_refs::settle` in `apply_workspace`, `apply_refs`, `settle_refs` and `plan_linked`: first, for every worktree with a pending workspace intent, the HEAD and branch locks holding that intent's new values (`remove_intent_head_locks`), the marked HEAD locks and lock temporaries; then the ref settle | `a_killed_set_heads_lock_beside_a_pending_ref_intent_settles` (pre-fix: `GIT_CONVERGE_INTERRUPTED` forever) |
+| 10 | Settle removed live Git locks ("empty and older than 2 s") | `remove_owned_lock` removes only a lock whose content proves it bulkload's; an empty lock is never removed, `packed-refs.lock` never. The transaction that meets one refuses `GIT_CONVERGE_INTERRUPTED` until its owner finishes or the operator removes it, as Git instructs (stated limit; `NoWedge`'s exception in the model) | `an_empty_lock_is_never_removed_even_when_old` (MU19: a live `update-ref --stdin` session's `packed-refs.lock` removed) |
+| 11 | `git switch` reads the branch before `HEAD.lock` | stated limit, `transact`'s doc comment and below | none (no lock closes it) |
+| 12 | No Rust row pins `set_head`'s two transactions | a test hook over `update_refs` (`UPDATE_REFS`, test builds only) plays Git's killed child: given HEAD's line and the branch's in one transaction it commits HEAD's (Git renames `HEAD` first) and fails | `set_head_never_commits_head_without_its_branch` (MU15: HEAD on `side` with `side` at its old value) |
+| 13 | Unseeded negative simulation | catalogue only (formal note) | n/a |
+
+**Stated limits added (review 4).**
+
+- An empty lock is never provably bulkload's: a delete's ref lock, a
+  stash rewrite's `refs/stash.lock`, `packed-refs.lock`, and the empty
+  `HEAD.lock` Git takes for the HEAD reflog when `set_head` moves the
+  branch HEAD stays on (a log-only update; `strace`, git 2.52: created,
+  never written, unlinked: `logs/r4/strace-head-log-only-lock.log`). One a killed Git child left
+  makes the item refuse `GIT_CONVERGE_INTERRUPTED` until the operator
+  removes it, as Git's own message instructs; the next rerun then settles
+  (and removes an orphan `packed-refs.new`). A live writer's is never
+  touched.
+- `HEAD.lock` serialises only the final HEAD write of a `git switch`
+  (finding 11): a ref transaction that moves a branch after a switch read
+  it and before the switch writes HEAD leaves that worktree on the branch
+  over its old commit's files and index. Not closed by any lock (the
+  switch commits the index before it locks HEAD); not modelled.
+- A power loss between Git's rename of `refs/stash` and bulkload's fsync
+  of its reflog can still leave the tip ahead of the reflog; the settle
+  then reports `stash-modified-at-destination` and keeps the stash (its
+  entries stay at provenance).
+- `recover_linked_landing` reads an absent capture seat as not yet
+  written: a capture file the operator removed (or `mv`'d away without
+  Git) before the recovery is written again. Any index change refuses.
+- An operator's write into a linked worktree while its first landing
+  runs (between `worktree add` and the index) is not checked.
+- A `read-tree` killed while it wrote a linked worktree's `index.lock`
+  leaves a lock whose entries do not read back as the installed index: the
+  recovery refuses `GIT_CONVERGE_INTERRUPTED` until the operator removes
+  it (one it finished writing is removed).
+- Lock temporaries (`bulkload-lock-*`) are swept under the destination
+  lock of one SOURCE label; two labels applying into one repository at
+  once could remove each other's in-flight temporary (the publish then
+  refuses typed).
+
+**Validation (2026-10-09, later; in `nix develop`, lane target dir).**
+Host load 70 to 110 on 32 cores; logs under the lane's cache,
+`/srv/fast-local/jess/cache/cargo-target/converge/logs/r4/`.
+
+- Before the fixes (the tree review 4 found, `prefix-int.log`,
+  `prefix-fault.log`): both new integration rows and all four new
+  fault-harness rows failed: `a_killed_set_heads_lock_beside_a_pending_ref_intent_settles`
+  (refused), `a_create_beside_an_operators_symbolic_ref_is_dropped`
+  (refused), `estate_converge_head_branch_double_checkout` (the rerun
+  converged with no re-plan, attaching the checkout to `side` beside the
+  operator's worktree), `estate_converge_linked_added_operator`
+  (`workspace-restored ... landing-recovered=1` over the operator's work),
+  `estate_converge_index_locked_fresh_lock` (`GIT_CHILD_FAILED
+  stderr_class=other`), `estate_converge_after_ref_intent_packed_new` (the
+  empty `packed-refs.lock` removed by age). Each unit row failed against
+  its mutant (`mutation-evidence-r4.log`): MU15 `set_head_one_txn`, MU16
+  `lock_written_after_create`, MU17 `stash_reflog_unsynced`, MU18
+  `head_attach_unchecked`, MU19 `empty_lock_removed`, MU20
+  `packed_new_kept`, MU21 `symref_names_unplanned`: every one "FAIL (as
+  required)".
+- After (`final/`): `cargo fmt --all -- --check` clean; `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` clean, the
+  `io-trace` pass clean, the `fault-injection,io-trace` pass clean; `cargo
+  test -p bulkload-agent --locked`: lib 614 passed, 5 ignored, every
+  integration binary ok (`estate_converge` 21, `source_command_registry`
+  16, `refusal_taxonomy` 5, ...); `--lib estate::s4_sweep_tests` 14
+  passed; `--features fault-injection,io-trace --test fault_harness` 83
+  passed, `--test power_loss` 12 passed; `python3
+  tests/test_ci_contract.py` 24 OK. TLC: the formal note, "Review 4".

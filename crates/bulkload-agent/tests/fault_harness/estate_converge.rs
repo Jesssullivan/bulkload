@@ -27,6 +27,19 @@
 //! party's bytes, and closure counts the item unaccounted whatever its
 //! review. Once the operator puts the seat back, the rerun converges.
 //!
+//! The source's day also switches HEAD to a branch that moves with it, so
+//! `set_head` runs its two transactions (`estate.converge.head_branch`
+//! between them) and the branch HEAD left converges after it; and it turns
+//! a file into a directory, which a crash after its `MkDir` leaves for the
+//! settle (the convergence lane's fixes, 2026-10-09). A seat whose kind
+//! changes may be absent between its removal and its addition, as
+//! EstateConverge.tla's `CrashAtomicity` allows.
+//!
+//! The `LinkedLanding` row crashes a first landing of a linked worktree
+//! after its `git worktree add` (`estate.converge.linked_added`, #216's
+//! residual): the rerun finishes it forward from its landing intent, never
+//! `GIT_DESTINATION_OCCUPIED`, and it equals a fresh restore.
+//!
 //! `_exit` models a process crash only (see the harness header).
 
 use std::collections::BTreeMap;
@@ -53,11 +66,43 @@ pub enum EstateConverge {
     /// A crash, a third party's write to a seat not yet converged, then the
     /// rerun.
     ForeignWrite,
+    /// A first landing of a main and its linked worktree, crashed inside
+    /// the linked one's, then the rerun.
+    LinkedLanding,
+    /// A crash after `set_head`, then the operator puts HEAD back on the
+    /// branch it left: the rerun refuses and keeps it (the intent records
+    /// HEAD at its new value), then converges once HEAD is put forward.
+    SwitchBack,
+    /// A crash between `set_head`'s branch transaction and its HEAD
+    /// transaction, then the operator's `git worktree add` of that branch
+    /// (review 4, the blocker): the rerun must never put the landed
+    /// checkout on it too; it re-plans HEAD detached.
+    DoubleCheckout,
+    /// A crash with the index locked, and the lock Git takes on the
+    /// converge's scratch index left as a killed `read-tree` leaves it
+    /// (review 4): the rerun removes it and converges.
+    FreshIndexLock,
+    /// The landed refs packed by the operator, a crash with the prune's ref
+    /// intent pending, and what a killed delete child leaves: an empty, old
+    /// `packed-refs.lock` and a `packed-refs.new` (review 4). The lock is
+    /// not provably bulkload's: the rerun refuses and keeps it; once the
+    /// operator removes it, the rerun removes the orphan `packed-refs.new`
+    /// and converges.
+    PackedNew,
+    /// A first linked landing crashed after `worktree add`, then the
+    /// operator's work in it: a file staged, and a seat holding a prefix of
+    /// its blob (review 4). The rerun refuses `GIT_DESTINATION_MODIFIED`
+    /// and changes nothing of it.
+    LinkedOperator,
 }
 
 impl Scenario for EstateConverge {
     fn run(self, point: Point, nth: u64) {
-        scenario(point, nth, self);
+        if matches!(self, Self::LinkedLanding | Self::LinkedOperator) {
+            linked_landing(point, nth, self);
+        } else {
+            scenario(point, nth, self);
+        }
     }
 }
 
@@ -107,6 +152,12 @@ impl Drop for World {
 
 impl World {
     fn new(tag: &str) -> Self {
+        Self::with(tag, false)
+    }
+
+    /// `linked`: the source has a linked worktree on `feat`, planned with
+    /// the main into the same destination repository.
+    fn with(tag: &str, linked: bool) -> Self {
         let base = std::env::temp_dir().join(format!(
             "bulkload-w7-converge-{tag}-{}-{}",
             std::process::id(),
@@ -126,6 +177,7 @@ impl World {
         fs::write(src.join("kind.txt"), b"a file at c0\n").unwrap();
         fs::create_dir(src.join("d")).unwrap();
         fs::write(src.join("d/x.txt"), b"a directory at c0\n").unwrap();
+        fs::write(src.join("todir"), b"a file at c0, a directory at c1\n").unwrap();
         fs::write(src.join("exec.sh"), b"#!/bin/sh\n").unwrap();
         fs::write(src.join("keep.txt"), b"unchanged\n").unwrap();
         git(&src, &["add", "."]);
@@ -136,16 +188,35 @@ impl World {
         git(&src, &["update-ref", "refs/remotes/origin/old", "HEAD"]);
         fs::write(src.join("keep.txt"), b"stashed\n").unwrap();
         git(&src, &["stash", "push", "--quiet", "-m", "one"]);
+        if linked {
+            let feat = world.base.join("src-feat");
+            git(
+                &src,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "feat",
+                    feat.to_str().unwrap(),
+                ],
+            );
+            fs::write(feat.join("feat.txt"), b"the linked worktree's own\n").unwrap();
+        }
         for (set, plan) in [("dst", "plan"), ("fresh", "plan-fresh")] {
-            estate::add_batch(
-                &world.base.join(plan),
-                &[Item {
-                    source: src.clone(),
+            let mut items = vec![Item {
+                source: src.clone(),
+                repository: world.base.join(set),
+                workspace: Some(world.base.join(set)),
+            }];
+            if linked {
+                items.push(Item {
+                    source: world.base.join("src-feat"),
                     repository: world.base.join(set),
-                    workspace: Some(world.base.join(set)),
-                }],
-            )
-            .unwrap();
+                    workspace: Some(world.base.join(format!("{set}-feat"))),
+                });
+            }
+            estate::add_batch(&world.base.join(plan), &items).unwrap();
         }
         world
     }
@@ -203,6 +274,9 @@ impl World {
         }
         git(&src, &["commit", "--quiet", "-am", "c1"]);
         git(&src, &["update-ref", "refs/heads/side", "HEAD"]);
+        // HEAD moves to a branch that moves with it: set_head's two
+        // transactions, and `main` converged after HEAD has left it.
+        git(&src, &["switch", "--quiet", "side"]);
         git(&src, &["branch", "-D", "doomed"]);
         git(&src, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(&src, &["update-ref", "-d", "refs/remotes/origin/old"]);
@@ -215,6 +289,9 @@ impl World {
         fs::write(src.join("d"), b"a file at c1\n").unwrap();
         fs::set_permissions(src.join("exec.sh"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(src.join("added.txt"), b"new at c1\n").unwrap();
+        fs::remove_file(src.join("todir")).unwrap();
+        fs::create_dir(src.join("todir")).unwrap();
+        fs::write(src.join("todir/inner"), b"a directory at c1\n").unwrap();
     }
 }
 
@@ -373,6 +450,7 @@ fn temporaries(root: &Path) -> Vec<PathBuf> {
     found
 }
 
+#[allow(clippy::too_many_lines)]
 fn scenario(point: Point, nth: u64, kind: EstateConverge) {
     let label = format!("{}:{nth}/{kind:?}", point.name());
     let world = World::new(&point.name().replace('.', "-"));
@@ -388,6 +466,9 @@ fn scenario(point: Point, nth: u64, kind: EstateConverge) {
     let fresh = world.apply("plan-fresh", "corpus-fresh", "applied-fresh");
     assert_eq!(fresh, vec![("workspace-restored", None)], "{label}");
     let new = snapshot(&world.base.join("fresh"));
+    if kind == EstateConverge::PackedNew {
+        git(&world.dst(), &["pack-refs", "--all"]);
+    }
 
     crash(&world, &format!("{}:{nth}", point.name()));
 
@@ -395,10 +476,19 @@ fn scenario(point: Point, nth: u64, kind: EstateConverge) {
     let crashed = snapshot(&world.dst());
     let keys: std::collections::BTreeSet<&String> =
         old.keys().chain(new.keys()).chain(crashed.keys()).collect();
+    let kind_of = |value: Option<&String>| {
+        value.map(|value| value.split(' ').next().unwrap_or("").to_owned())
+    };
     for key in keys {
         let found = crashed.get(key);
+        // A seat whose kind changes may be absent between its removal and
+        // its addition (CrashAtomicity's TypeChange).
+        let between = found.is_none()
+            && old.contains_key(key)
+            && new.contains_key(key)
+            && kind_of(old.get(key)) != kind_of(new.get(key));
         assert!(
-            found == old.get(key) || found == new.get(key),
+            found == old.get(key) || found == new.get(key) || between,
             "{label}: {key} is neither old nor new: {found:?} (old {:?}, new {:?})",
             old.get(key),
             new.get(key)
@@ -409,6 +499,20 @@ fn scenario(point: Point, nth: u64, kind: EstateConverge) {
         1,
         "{label}: journal-missing before the rerun"
     );
+
+    if kind == EstateConverge::SwitchBack {
+        switch_back(&world, &label);
+    }
+    if kind == EstateConverge::DoubleCheckout {
+        double_checkout(&world, &label);
+        return;
+    }
+    if kind == EstateConverge::FreshIndexLock {
+        fresh_index_lock(&world, &label);
+    }
+    if kind == EstateConverge::PackedNew {
+        packed_new(&world, &label);
+    }
 
     if kind == EstateConverge::ForeignWrite {
         // A seat the converge has not reached: f4 (replaced last).
@@ -467,4 +571,224 @@ fn scenario(point: Point, nth: u64, kind: EstateConverge) {
         vec![("previous-workspace-restoration-not-revalidated", None)],
         "{label}"
     );
+}
+
+/// The `LinkedLanding` row: a main and its linked worktree land for the
+/// first time; the child crashes inside the linked worktree's landing at
+/// `point` (after `git worktree add`). The rerun finishes the linked
+/// worktree forward from its landing intent (#216's residual: before the
+/// fix every rerun refused `GIT_DESTINATION_OCCUPIED`), and it equals a
+/// fresh restore of the same capture.
+fn linked_landing(point: Point, nth: u64, kind: EstateConverge) {
+    let label = format!("{}:{nth}/{kind:?}", point.name());
+    let world = World::with(&point.name().replace('.', "-"), true);
+    world.capture("plan", "corpus");
+    world.capture("plan-fresh", "corpus-fresh");
+    let fresh = world.apply("plan-fresh", "corpus-fresh", "applied-fresh");
+    assert!(
+        fresh.len() == 2 && fresh.iter().all(|row| row.0 == "workspace-restored"),
+        "{label}: {fresh:?}"
+    );
+
+    crash(&world, &format!("{}:{nth}", point.name()));
+
+    let feat = world.base.join("dst-feat");
+    assert!(
+        feat.join(".git").is_file(),
+        "{label}: the worktree was added"
+    );
+    let ledgers = world.dst().join(".git/bulkload/v1/neo");
+    let intents = || -> Vec<String> {
+        fs::read_dir(&ledgers)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("landing-"))
+            .collect()
+    };
+    assert_eq!(intents().len(), 1, "{label}: the landing intent names it");
+    assert_eq!(world.unaccounted(), 1, "{label}: journal-missing");
+
+    if kind == EstateConverge::LinkedOperator {
+        fs::write(feat.join("mine.txt"), b"the operator's\n").unwrap();
+        git(&feat, &["add", "mine.txt"]);
+        // A prefix of f1's blob ("seat 1, c0\n").
+        fs::write(feat.join("f1"), b"seat").unwrap();
+        let rows = world.apply("plan", "corpus", "applied");
+        assert_eq!(rows.len(), 2, "{label}: {rows:?}");
+        assert_eq!(
+            rows[1],
+            ("refused", Some("GIT_DESTINATION_MODIFIED".to_owned())),
+            "{label}"
+        );
+        assert!(
+            !git(&feat, &["ls-files", "--stage", "mine.txt"]).is_empty(),
+            "{label}: the operator's staged file is kept"
+        );
+        assert_eq!(fs::read(feat.join("f1")).unwrap(), b"seat", "{label}");
+        assert_eq!(intents().len(), 1, "{label}: the landing intent stays");
+        return;
+    }
+
+    let rows = world.apply("plan", "corpus", "applied");
+    assert_eq!(rows.len(), 2, "{label}: {rows:?}");
+    assert_eq!(
+        rows[0],
+        ("previous-workspace-restoration-not-revalidated", None),
+        "{label}"
+    );
+    assert_eq!(rows[1].0, "workspace-restored", "{label}: {rows:?}");
+    assert!(
+        rows[1]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("landing-recovered=1")),
+        "{label}: {rows:?}"
+    );
+    assert!(
+        intents().is_empty(),
+        "{label}: the landing intent is removed"
+    );
+    assert!(world
+        .dst()
+        .join(".git/worktrees/dst-feat/bulkload/v1/neo/workspace.landed")
+        .is_file());
+    assert_eq!(
+        snapshot(&feat),
+        snapshot(&world.base.join("fresh-feat")),
+        "{label}: the recovered landing equals a fresh restore"
+    );
+    assert_eq!(world.unaccounted(), 0, "{label}");
+    let rows = world.apply("plan", "corpus", "applied");
+    assert_eq!(
+        rows,
+        vec![
+            ("previous-workspace-restoration-not-revalidated", None),
+            ("previous-workspace-restoration-not-revalidated", None),
+        ],
+        "{label}"
+    );
+}
+
+/// The `SwitchBack` row's middle: after a crash past `set_head`, the
+/// operator puts HEAD back on the branch it left; the rerun refuses and
+/// leaves it there (the intent records HEAD done), and the operator puts it
+/// forward again.
+fn switch_back(world: &World, label: &str) {
+    git(&world.dst(), &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    let rows = world.apply("plan", "corpus", "applied");
+    assert_eq!(
+        rows,
+        vec![("refused", Some("GIT_CONVERGE_INTERRUPTED".to_owned()))],
+        "{label}: the operator's HEAD is never moved again"
+    );
+    assert_eq!(
+        git(&world.dst(), &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/main",
+        "{label}"
+    );
+    git(&world.dst(), &["symbolic-ref", "HEAD", "refs/heads/side"]);
+}
+
+/// The `DoubleCheckout` row's end: the crash left `side` at its new value
+/// and HEAD on `main`; the operator adds a worktree on `side`, as Git
+/// allows. The rerun re-plans HEAD (detached at the captured head, `side`
+/// recorded) and never puts a second worktree on `side`.
+fn double_checkout(world: &World, label: &str) {
+    let operator = world.base.join("operator-wt");
+    git(
+        &world.dst(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            operator.to_str().unwrap(),
+            "side",
+        ],
+    );
+    let rows = world.apply("plan", "corpus", "applied");
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
+    let reason = rows[0].1.clone().unwrap_or_default();
+    assert!(reason.contains("head-replanned=1"), "{label}: {reason}");
+    assert!(
+        reason.contains("head-detached-ref-conflict=1"),
+        "{label}: {reason}"
+    );
+    let listed = git(&world.dst(), &["worktree", "list", "--porcelain"]);
+    assert_eq!(
+        listed
+            .lines()
+            .filter(|line| *line == "branch refs/heads/side")
+            .count(),
+        1,
+        "{label}: one worktree on side: {listed}"
+    );
+    let symbolic = git_command(&world.dst())
+        .args(["symbolic-ref", "-q", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(!symbolic.status.success(), "{label}: HEAD stays detached");
+    assert_eq!(
+        git(&world.dst(), &["rev-parse", "HEAD"]),
+        git(&world.src(), &["rev-parse", "HEAD"]),
+        "{label}"
+    );
+    assert_eq!(
+        git(&operator, &["symbolic-ref", "HEAD"]).trim(),
+        "refs/heads/side",
+        "{label}"
+    );
+    for intent in ["workspace.intent", "refs.intent"] {
+        assert!(
+            !world
+                .dst()
+                .join(".git/bulkload/v1/neo")
+                .join(intent)
+                .exists(),
+            "{label}: {intent}"
+        );
+    }
+    assert_eq!(world.unaccounted(), 0, "{label}");
+}
+
+/// The `PackedNew` row's middle: what a killed delete child leaves beside
+/// the pending prune; the rerun keeps the lock (not provably bulkload's)
+/// and refuses typed; the operator removes it, as Git instructs.
+fn packed_new(world: &World, label: &str) {
+    let git_dir = world.dst().join(".git");
+    let (lock, new) = (
+        git_dir.join("packed-refs.lock"),
+        git_dir.join("packed-refs.new"),
+    );
+    fs::write(&lock, b"").unwrap();
+    fs::write(&new, b"# pack-refs with: peeled fully-peeled sorted \n").unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
+    for path in [&lock, &new] {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(past))
+            .unwrap();
+    }
+    let rows = world.apply("plan", "corpus", "applied");
+    assert_eq!(
+        rows,
+        vec![("refused", Some("GIT_CONVERGE_INTERRUPTED".to_owned()))],
+        "{label}"
+    );
+    assert!(lock.exists(), "{label}: an empty lock is never removed");
+    fs::remove_file(&lock).unwrap();
+}
+
+/// The `FreshIndexLock` row's middle: the lock Git takes on the converge's
+/// scratch index, as a `read-tree` killed while holding it leaves it.
+fn fresh_index_lock(world: &World, label: &str) {
+    let git_dir = world.dst().join(".git");
+    let fresh = fs::read_dir(&git_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .find(|name| name.starts_with("bulkload-index-") && name.ends_with("-fresh"))
+        .unwrap_or_else(|| panic!("{label}: no scratch index at the crash"));
+    fs::write(git_dir.join(format!("{fresh}.lock")), b"DIRC").unwrap();
 }

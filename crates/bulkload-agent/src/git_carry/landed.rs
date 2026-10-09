@@ -41,6 +41,9 @@ pub const REFS_INTENT: &str = "refs.intent";
 pub const WORKSPACE_LANDED: &str = "workspace.landed";
 /// The workspace intent's file name.
 pub const WORKSPACE_INTENT: &str = "workspace.intent";
+/// A first linked landing's intent: `landing-<key>.intent` in the common
+/// ledger directory, `<key>` naming the destination (#216's residual).
+pub const LANDING_INTENT_PREFIX: &str = "landing-";
 /// The destination lock's file name.
 const LOCK: &str = "lock";
 /// The largest record read or written: a 200k-seat ledger is about 16 MiB.
@@ -134,6 +137,41 @@ pub struct RefIntent {
     /// The ledger to write once every op is settled, before the
     /// adjustments for ops a third party overtook.
     pub ledger: RefLedger,
+    /// The stash reflog the stash op has reached, made durable after each
+    /// store (`None`: its old order, no store made). A settle continues the
+    /// stash only from here, or from one store past it (the earlier
+    /// report's finding 4: an operator's drop or clear is never undone).
+    pub stash_at: Option<Vec<String>>,
+}
+
+/// A first linked landing, durable before `git worktree add` and removed
+/// after the worktree's ledger (#216's residual, the earlier report's
+/// finding 7): a crash between leaves a worktree without a ledger that this
+/// record names as bulkload's, which the rerun finishes forward.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingIntent {
+    /// `estate::id` of the item.
+    pub item: String,
+    /// The new worktree's path, as `worktree add` was given it.
+    pub destination: Vec<u8>,
+    /// The capture landed, its instant and its provenance instance.
+    pub capture: [u8; 32],
+    pub observed_ns: i128,
+    pub instance: String,
+    /// HEAD as the landing plans it, and the branch recorded when detached.
+    pub head: Head,
+    pub intended_branch: Option<String>,
+}
+
+/// The landing intent of a linked worktree at `destination`, in the common
+/// ledger directory `ledger_dir`.
+pub fn landing_intent_path(ledger_dir: &Path, destination: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt as _;
+    let key = blake3::hash(destination.as_os_str().as_bytes()).to_hex();
+    ledger_dir.join(format!(
+        "{LANDING_INTENT_PREFIX}{}.intent",
+        key.get(..32).unwrap_or_default()
+    ))
 }
 
 /// A worktree's HEAD: its symbolic ref (`None` = detached) and its commit.
@@ -249,6 +287,10 @@ pub struct WorkspaceIntent {
     pub intended_branch: Option<String>,
     /// The standalone item's `info/exclude`, before and after.
     pub exclude: Option<([u8; 32], [u8; 32])>,
+    /// HEAD is at its new value: written right after `set_head`, so a
+    /// settle never moves HEAD again (an operator's switch back to the old
+    /// HEAD while the pass still ran is theirs).
+    pub head_done: bool,
 }
 
 /// Directory of `label`'s ledgers under the git directory `git_dir`.

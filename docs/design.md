@@ -379,23 +379,56 @@ that note) before merge.**
 - **Refs converge** on every apply into a repository bulkload created: a
   ref follows the source only while it still holds the value bulkload set
   and the capture is newer (compare-and-swap); a ref changed or deleted at
-  the destination, or any worktree's checked-out branch, is left alone and
-  reported; a remote-tracking ref the source pruned is deleted, a local
-  branch or tag is kept. A ref Git cannot create because a ref that stays
+  the destination, any worktree's checked-out branch, and a branch a rebase
+  or bisect in progress holds (`rebase-merge/head-name`,
+  `rebase-apply/head-name`, `BISECT_START`), is left alone and reported; a
+  remote-tracking ref the source pruned is deleted, a local branch or tag
+  is kept. Every worktree's HEAD is held by Git's own `HEAD.lock` while a
+  ref transaction runs and the checked-out set is read under it, so no
+  HEAD is written onto a branch the transaction then moves (2026-10-09;
+  a `git switch` that read the branch before that lock is a stated limit
+  below). A ref Git cannot create because a ref that stays
   sits above or below its name (`foo` kept, `foo/bar` new) stays at
   provenance (`ref-name-conflict`); a pruned name is deleted in its own
   transaction before its successor is created. A checkout's new HEAD
-  branch moves only with HEAD, never in the ref step.
+  branch moves only with HEAD, never in the ref step, and so does any
+  branch a pending workspace intent of another item names; the branch a
+  HEAD left is brought to the capture by a ref step after HEAD moved
+  (left to the next apply's settle, never a refusal, when another writer
+  holds it then).
+  Every ref write syncs the directories its renames changed before a
+  ledger names it.
 - **Checkouts converge** when the capture changed: the landed checkout is
   proved unchanged against its ledger (HEAD, index entries, a standalone
   item's exclude, every landed seat by print or by content); a failed proof
   refuses `GIT_DESTINATION_MODIFIED` with nothing written. Otherwise only
   the delta is written, under a durable intent: refs, each seat by
   `RENAME_EXCHANGE` with the displaced file checked (put back if it is not
-  the landed one), the index under `index.lock` by compare-and-swap, then
-  HEAD and its branch in one transaction. A crash leaves every component
-  old or new; the next apply settles the intent forward before anything
-  else. An older capture refuses `GIT_CONVERGE_STALE_CAPTURE`, a changed
+  the landed one), the index under `index.lock` by compare-and-swap (the
+  ledger records the digest of the index installed, never a re-read), then
+  the HEAD branch in its own transaction under every worktree's HEAD lock
+  with this HEAD verified, then HEAD, and the intent records HEAD done (a
+  settle then never moves HEAD again). HEAD is never attached to a branch
+  another worktree has checked out or holds: read under every other
+  worktree's HEAD lock, held until HEAD is written; a settle re-plans such
+  a HEAD detached with the branch recorded (review 4). A crash leaves every component old
+  or new; the next apply settles the intent forward before anything else:
+  Git lock files a killed Git child left are removed when their content
+  proves them bulkload's, and so are the HEAD locks of every pending
+  intent before any ref transaction; an empty lock never is (any other
+  refuses `GIT_CONVERGE_INTERRUPTED`), and an orphan `packed-refs.new`
+  with no `packed-refs.lock` is removed; bulkload's own locks hold their
+  marker from the moment they exist; a
+  ref op on a branch checked out since is not redone, a HEAD branch line
+  that can no longer apply is re-planned (detached with the branch
+  recorded when it must), a file the source turned into a directory is
+  found done, the stash continues only from the progress its intent
+  records (an operator's drop is kept, and the ledger keeps the reflog
+  bulkload last landed, so later applies keep it too), and probe files a
+  crashed pass left are removed. Every refusal after the intent is
+  `GIT_CONVERGE_INTERRUPTED`, and an unborn HEAD refuses
+  `GIT_DESTINATION_MODIFIED`. An older capture refuses
+  `GIT_CONVERGE_STALE_CAPTURE`, a changed
   shallow frontier, nested custody or rebuildable set
   `GIT_CONVERGE_SHAPE_CHANGED`, a checkout this item landed and an
   operator removed `GIT_DESTINATION_MODIFIED`, and so does a landed
@@ -410,7 +443,24 @@ that note) before merge.**
   Q8 of that note).
 - One plan lands a main and its linked worktrees: an item whose repository
   is a planned standalone workspace applies a level after it, and a
-  standalone item's plan base is imported into its stage.
+  standalone item's plan base is imported into its stage. A first linked
+  landing writes a landing intent before `git worktree add`; a crash before
+  its ledger leaves a worktree the rerun finishes forward (only absent
+  seats are written: each entry is laid down under a temporary name and
+  renamed into place, so an operator's file at an entry's name, or any
+  index the landing did not write, refuses `GIT_DESTINATION_MODIFIED`),
+  never `GIT_DESTINATION_OCCUPIED` for good.
+- **Limits (2026-10-09).** A HEAD detached because its branch was checked
+  out elsewhere re-attaches, and a ref the operator put back to its landed
+  value converges, only on the next capture: the journal no-op (A4) reads
+  nothing. An empty Git lock (a delete's, `packed-refs.lock`, the
+  `HEAD.lock` Git takes for the HEAD reflog), or one with content that is
+  not bulkload's, is not provably bulkload's: a killed child's refuses
+  typed until the operator removes it, as Git instructs, and a live
+  writer's is never touched (review 4). `HEAD.lock` serialises only the
+  final HEAD write of a `git switch`: a transaction that moves a branch
+  after a switch read it leaves that worktree on the branch over its old
+  commit's files and index.
 
 Import preserves divergence and leaves active HEADs, indexes and working
 bytes untouched, with one exception pending the ruling above: a checkout

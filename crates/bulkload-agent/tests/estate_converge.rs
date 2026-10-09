@@ -950,3 +950,393 @@ fn a_sibling_ref_intent_does_not_re_prove_a_finished_item() {
     assert!(main.contains("ref-intent-settled=1"), "{main}");
     assert_eq!(world.unaccounted(&plan, "corpus", "applied"), 0);
 }
+
+// ---- the convergence lane's fixes (2026-10-09) -------------------------------
+//
+// Each test names the EstateConverge.tla mutation that is the code before
+// its fix; the model's MC_ec_neg_<mutation> row fails, and the fixed
+// behaviour's MC_ec_ row passes.
+
+/// Hold the main checkout's `index.lock` as an operator's Git command
+/// would, so a converge stops at its index compare-and-swap with its
+/// workspace intent pending and every seat written.
+fn hold_index(dst: &Path) -> PathBuf {
+    let lock = dst.join(".git/index.lock");
+    fs::write(&lock, b"an operator's git add\n").unwrap();
+    lock
+}
+
+/// Review 3 finding 4 (mutation `unborn_head_untyped`): the operator deletes
+/// the checked-out branch, so HEAD is unborn. The item refuses
+/// `GIT_DESTINATION_MODIFIED` and is left as it was; before the fix
+/// `rev-parse --verify HEAD` failed and it refused `GIT_CHILD_FAILED`.
+#[test]
+fn an_unborn_head_refuses_modified() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let dst = world.dst("dst");
+    settle();
+    fs::write(world.src().join("a.txt"), b"alpha, moved on\n").unwrap();
+    git(&world.src(), &["commit", "--quiet", "-am", "c2"]);
+    settle();
+    world.capture(&plan, "corpus");
+    git(&dst, &["update-ref", "-d", "refs/heads/main"]);
+    let before = (files(&dst), restorable(&dst));
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(!ok);
+    assert_eq!(
+        outcome_of(&rows, &world.src()).2.as_deref(),
+        Some("GIT_DESTINATION_MODIFIED"),
+        "{rows:?}"
+    );
+    assert_eq!((files(&dst), restorable(&dst)), before);
+}
+
+/// Review 3 finding 9 (mutation `probe_left`): probe files a crashed pass
+/// left in the worktree root are removed by the next apply; before the fix
+/// they stayed for good.
+#[test]
+fn probe_files_a_crashed_pass_left_are_removed() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let dst = world.dst("dst");
+    let probes = [
+        dst.join(".bulkload-converge-00ff00ff00ff00ff-probe-a"),
+        dst.join(".bulkload-converge-00ff00ff00ff00ff-probe-b"),
+    ];
+    for probe in &probes {
+        fs::write(probe, b"").unwrap();
+    }
+    settle();
+    fs::write(world.src().join("a.txt"), b"alpha, moved on\n").unwrap();
+    git(&world.src(), &["commit", "--quiet", "-am", "c2"]);
+    settle();
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    assert!(probes.iter().all(|probe| !probe.exists()));
+    assert_eq!(files(&dst), files(&world.src()));
+}
+
+/// The earlier report's finding 1 (mutation `settle_remove_dir`): a file
+/// the source turns into a directory, and a converge stopped after its
+/// seats (an operator's Git held the index). The settle's removal of the
+/// file finds the new directory there and is done; before the fix it
+/// refused `GIT_CONVERGE_INTERRUPTED` on every rerun.
+#[test]
+fn a_file_turned_directory_settles_after_an_interrupted_converge() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let (src, dst) = (world.src(), world.dst("dst"));
+    settle();
+    fs::remove_file(src.join("kind.txt")).unwrap();
+    fs::create_dir(src.join("kind.txt")).unwrap();
+    fs::write(src.join("kind.txt/inner"), b"a directory now\n").unwrap();
+    settle();
+    world.capture(&plan, "corpus");
+    let lock = hold_index(&dst);
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(!ok);
+    assert_eq!(
+        outcome_of(&rows, &src).2.as_deref(),
+        Some("GIT_CONVERGE_INTERRUPTED")
+    );
+    assert!(
+        dst.join("kind.txt/inner").is_file(),
+        "the seats were written"
+    );
+    fs::remove_file(lock).unwrap();
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    assert_eq!(view(&dst), view(&src));
+    assert!(!dst.join(".git/bulkload/v1/neo/workspace.intent").exists());
+}
+
+/// Review 3 finding 5 (mutation `seat_parent_untyped`): after the intent,
+/// the operator replaces a landed directory that holds a pending seat with
+/// a file. The settle refuses `GIT_CONVERGE_INTERRUPTED` and keeps the
+/// operator's file; before the fix `Seat::at`'s error passed on
+/// (`PATH_ESCAPES_ROOT`).
+#[test]
+fn a_seat_parent_replaced_after_the_intent_refuses_interrupted() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let (src, dst) = (world.src(), world.dst("dst"));
+    settle();
+    fs::write(src.join("dir/b.txt"), b"beta, moved on\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "c2"]);
+    settle();
+    world.capture(&plan, "corpus");
+    let lock = hold_index(&dst);
+    let (ok, _) = world.apply(&plan, "corpus", "applied");
+    assert!(!ok);
+    fs::remove_file(lock).unwrap();
+    fs::remove_dir_all(dst.join("dir")).unwrap();
+    fs::write(dst.join("dir"), b"the operator's file\n").unwrap();
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(!ok);
+    assert_eq!(
+        outcome_of(&rows, &src).2.as_deref(),
+        Some("GIT_CONVERGE_INTERRUPTED"),
+        "{rows:?}"
+    );
+    assert_eq!(fs::read(dst.join("dir")).unwrap(), b"the operator's file\n");
+    assert!(dst.join(".git/bulkload/v1/neo/workspace.intent").exists());
+}
+
+/// The earlier report's finding 5 (review 2 finding 1's stated limit;
+/// mutation `old_head_branch_skipped`): a commit on the checkout's branch,
+/// then a switch to another. The step skips the old branch while HEAD is
+/// on it; a step after `set_head` brings it to the capture. Before the fix
+/// it stayed behind while the source held still.
+#[test]
+fn the_branch_head_left_converges_with_it() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let (src, dst) = (world.src(), world.dst("dst"));
+    settle();
+    fs::write(src.join("a.txt"), b"alpha, on main\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "c2"]);
+    git(&src, &["switch", "--quiet", "other"]);
+    settle();
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    assert_eq!(head(&dst).0, "refs/heads/other");
+    assert_eq!(
+        restorable(&dst).get("refs/heads/main"),
+        restorable(&src).get("refs/heads/main")
+    );
+    assert_eq!(view(&dst), view(&src));
+}
+
+/// Review 3's finding 19 (mutation `settle_replays_branch`): the source
+/// renames `other` to `other/bar` and switches to it; the operator deletes
+/// `other`, so the converge plans HEAD onto a new `other/bar`; the converge
+/// stops before `set_head`; the operator puts `other` back. The settle
+/// re-plans HEAD (detached at the captured head, `other/bar` recorded)
+/// instead of replaying a create Git refuses beside `other`, which refused
+/// `GIT_CONVERGE_INTERRUPTED` on every rerun before the fix.
+#[test]
+fn a_settle_re_plans_a_head_branch_a_put_back_ref_blocks() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let (src, dst) = (world.src(), world.dst("dst"));
+    let other = restorable(&dst).get("refs/heads/other").unwrap().clone();
+    settle();
+    git(&src, &["branch", "-m", "other", "other/bar"]);
+    git(&src, &["switch", "--quiet", "other/bar"]);
+    settle();
+    world.capture(&plan, "corpus");
+    git(&dst, &["branch", "-D", "--quiet", "other"]);
+    let lock = hold_index(&dst);
+    let (ok, _) = world.apply(&plan, "corpus", "applied");
+    assert!(!ok);
+    fs::remove_file(lock).unwrap();
+    git(&dst, &["update-ref", "refs/heads/other", &other]);
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let reason = outcome_of(&rows, &src).2.clone().unwrap();
+    assert!(reason.contains("head-replanned=1"), "{reason}");
+    assert!(reason.contains("head-detached-ref-conflict=1"), "{reason}");
+    assert_eq!(head(&dst), (String::new(), head(&src).1));
+    assert_eq!(restorable(&dst).get("refs/heads/other"), Some(&other));
+    assert!(!restorable(&dst).contains_key("refs/heads/other/bar"));
+    assert_eq!(files(&dst), files(&src));
+    assert!(!dst.join(".git/bulkload/v1/neo/workspace.intent").exists());
+}
+
+/// The earlier report's finding 2 (mutation `step_moves_intent_branch`):
+/// the main's intent moves HEAD onto `other` and `other` with it, and stops
+/// (an operator's Git holds the main's index) twice, while the source
+/// moves `other` again. The linked worktrees' ref steps leave `other` to
+/// the main's pending intent; before the fix they moved it to the newer
+/// capture's value, and the main's settle replayed a compare-and-swap that
+/// could never hold again, refusing on every rerun.
+#[test]
+fn a_pending_intents_head_branch_is_left_to_its_item() {
+    let world = World::new();
+    let plan = world.plan("dst", true);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let (src, dst) = (world.src(), world.dst("dst"));
+    let landed = restorable(&dst).get("refs/heads/other").unwrap().clone();
+    settle();
+    git(&src, &["switch", "--quiet", "other"]);
+    fs::write(src.join("a.txt"), b"alpha, on other\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "c2"]);
+    settle();
+    world.capture(&plan, "corpus");
+    let lock = hold_index(&dst);
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(!ok);
+    assert_eq!(
+        outcome_of(&rows, &src).2.as_deref(),
+        Some("GIT_CONVERGE_INTERRUPTED")
+    );
+    assert_eq!(restorable(&dst).get("refs/heads/other"), Some(&landed));
+    settle();
+    fs::write(src.join("a.txt"), b"alpha, on other again\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "c3"]);
+    settle();
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(!ok, "{rows:?}");
+    assert_eq!(restorable(&dst).get("refs/heads/other"), Some(&landed));
+    fs::remove_file(lock).unwrap();
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    assert_eq!(head(&dst).0, "refs/heads/other");
+    assert_eq!(view(&dst), view(&src));
+    assert_eq!(
+        restorable(&dst).get("refs/heads/other"),
+        restorable(&src).get("refs/heads/other")
+    );
+    assert_eq!(world.unaccounted(&plan, "corpus", "applied"), 0);
+}
+
+/// The step for the branch HEAD left runs after `set_head`; when another
+/// writer holds that branch, the item still lands (HEAD moved, ledger
+/// written), the branch's ref intent stays for the next apply, which
+/// settles it. A refusal there would leave HEAD moved under a pending
+/// workspace intent (EstateConverge.tla, `LeftBranchDeferred`).
+#[test]
+fn the_branch_head_left_waits_for_a_writer_without_refusing() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let (src, dst) = (world.src(), world.dst("dst"));
+    let landed = restorable(&dst).get("refs/heads/main").unwrap().clone();
+    settle();
+    fs::write(src.join("a.txt"), b"alpha, on main\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "c2"]);
+    git(&src, &["switch", "--quiet", "other"]);
+    settle();
+    world.capture(&plan, "corpus");
+    let lock = dst.join(".git/refs/heads/main.lock");
+    fs::write(&lock, b"").unwrap();
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let reason = outcome_of(&rows, &src).2.clone().unwrap();
+    assert!(reason.contains("ref-left-branch-deferred=1"), "{reason}");
+    assert_eq!(head(&dst).0, "refs/heads/other");
+    assert_eq!(restorable(&dst).get("refs/heads/main"), Some(&landed));
+    assert!(dst.join(".git/bulkload/v1/neo/refs.intent").exists());
+    assert!(!dst.join(".git/bulkload/v1/neo/workspace.intent").exists());
+    fs::remove_file(&lock).unwrap();
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    assert!(!dst.join(".git/bulkload/v1/neo/refs.intent").exists());
+    assert_eq!(
+        restorable(&dst).get("refs/heads/main"),
+        restorable(&src).get("refs/heads/main")
+    );
+    assert_eq!(world.unaccounted(&plan, "corpus", "applied"), 0);
+}
+
+/// Review 4 (mutation `intent_head_lock_kept`): a Git child killed inside
+/// `set_head`'s HEAD transaction leaves `HEAD.lock` holding Git's own
+/// content (the intent's new HEAD), and a ref intent of the repository is
+/// pending too (here: a step stopped by another writer's lock). Every ref
+/// transaction holds every worktree's HEAD, so before the fix the ref
+/// settle, which runs first, met that `HEAD.lock` on every rerun and never
+/// reached the workspace settle that removes it. Now the leftovers of every
+/// pending workspace intent go first, and the rerun converges.
+#[test]
+fn a_killed_set_heads_lock_beside_a_pending_ref_intent_settles() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let (src, dst) = (world.src(), world.dst("dst"));
+    settle();
+    git(&src, &["switch", "--quiet", "other"]);
+    fs::write(src.join("a.txt"), b"alpha, on other\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "c2"]);
+    git(&src, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    settle();
+    world.capture(&plan, "corpus");
+    // Another writer holds origin/main: the converge's ref step stops with
+    // its ref intent pending, after the workspace intent.
+    let foreign = dst.join(".git/refs/remotes/origin/main.lock");
+    fs::write(&foreign, b"another writer\n").unwrap();
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(!ok);
+    assert_eq!(
+        outcome_of(&rows, &src).2.as_deref(),
+        Some("GIT_CONVERGE_INTERRUPTED"),
+        "{rows:?}"
+    );
+    fs::remove_file(&foreign).unwrap();
+    assert!(dst.join(".git/bulkload/v1/neo/refs.intent").exists());
+    assert!(dst.join(".git/bulkload/v1/neo/workspace.intent").exists());
+    // What a killed `set_head` HEAD transaction leaves.
+    fs::write(dst.join(".git/HEAD.lock"), b"ref: refs/heads/other\n").unwrap();
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let reason = outcome_of(&rows, &src).2.clone().unwrap();
+    assert!(reason.contains("git-lock-removed=1"), "{reason}");
+    assert!(!dst.join(".git/HEAD.lock").exists());
+    assert_eq!(head(&dst).0, "refs/heads/other");
+    assert_eq!(view(&dst), view(&src));
+    assert_eq!(world.unaccounted(&plan, "corpus", "applied"), 0);
+}
+
+/// Review 4 (mutation `symref_names_unplanned`): the operator makes a
+/// symbolic ref `refs/heads/alias`, and the source creates `alias/x`. Git
+/// can never create it beside the symbolic ref, so the converge drops the
+/// create (`ref-name-conflict`) and lands everything else; before the fix
+/// every pass refused `GIT_CONVERGE_INTERRUPTED` and the checkout never
+/// converged again.
+#[test]
+fn a_create_beside_an_operators_symbolic_ref_is_dropped() {
+    let world = World::new();
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let (src, dst) = (world.src(), world.dst("dst"));
+    git(
+        &dst,
+        &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+    );
+    settle();
+    git(&src, &["branch", "alias/x"]);
+    fs::write(src.join("a.txt"), b"alpha, moved on\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "c2"]);
+    settle();
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let reason = outcome_of(&rows, &src).2.clone().unwrap();
+    assert!(reason.contains("ref-name-conflict=1"), "{reason}");
+    assert!(!restorable(&dst).contains_key("refs/heads/alias/x"));
+    assert_eq!(
+        git(&dst, &["symbolic-ref", "refs/heads/alias"]).trim(),
+        "refs/heads/main"
+    );
+    assert_eq!(files(&dst), files(&src));
+    assert!(!dst.join(".git/bulkload/v1/neo/refs.intent").exists());
+}

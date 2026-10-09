@@ -44,13 +44,33 @@
 (*     landed value; between applies or (OpConcurrent) while an apply is  *)
 (*     in flight (a restore only between applies).                        *)
 (*   - Review 3 (2026-10-09, findings 1 to 14): where the reviewers named *)
-(*     the rule, the model holds that rule and the code's current         *)
-(*     behaviour is a Mutation marked CODE TODAY in the catalogue         *)
-(*     (finish_after_all_deletes, rebase_unguarded, ledger_reads_index,   *)
+(*     the rule, the model holds that rule and the code's behaviour       *)
+(*     before the fix is a Mutation (CODE BEFORE in the catalogue:        *)
+(*     finish_after_all_deletes, rebase_unguarded, ledger_reads_index,    *)
 (*     unborn_head_untyped, seat_parent_untyped, refs_unsynced,           *)
 (*     probe_left, settle_moves_checked_out, txn_no_symref_verify; and    *)
-(*     txn_no_cas, head_no_cas, which the code already does right);       *)
-(*     where the fix is open, a finding row fails on the code as it is.  *)
+(*     txn_no_cas, head_no_cas, which the code always did right).         *)
+(*   - The convergence lane's fixes (2026-10-09, after review 3): each   *)
+(*     earlier finding row whose defect the code now fixes became a pass *)
+(*     row, and the code's behaviour before the fix a Mutation whose     *)
+(*     MC_ec_neg_ row fails the finding's property (settle_remove_dir,   *)
+(*     step_moves_intent_branch, settle_replays_branch, stale_lock_kept, *)
+(*     set_head_one_txn, stash_settle_any_suffix,                        *)
+(*     old_head_branch_skipped, no_landing_intent). Two finding rows     *)
+(*     stay, as documented limits (a HEAD detached for a conflict and a  *)
+(*     ref put back converge only on the next capture: the A4 no-op      *)
+(*     reads nothing).                                                   *)
+(*   - Review 4 (2026-10-09, later): OneCheckout (no branch on two        *)
+(*     worktrees; set_head's attach check and the settle's re-plan,       *)
+(*     head_attach_unchecked); a killed Git child INTERRUPTED in a pass   *)
+(*     that goes on, and every pending intent's HEAD locks removed before *)
+(*     any ref transaction (intent_head_lock_kept); empty locks (a        *)
+(*     delete's, packed-refs.lock) never removed, an operator's live      *)
+(*     writer holding one (OpLock), packed-refs.new removed once no lock  *)
+(*     holds it (empty_lock_removed, packed_new_kept; NoWedge's stated    *)
+(*     exception); the stash reflog synced (stash_reflog_unsynced); and   *)
+(*     the linked worktree's own content as one component wtw that a      *)
+(*     crashed first landing's recovery checks (recovery_overwrites).     *)
 (*                                                                         *)
 (* ABSTRACTIONS (what is NOT modelled)                                     *)
 (*   - Values are opaque ids from one counter: a commit, a blob, an index *)
@@ -67,7 +87,12 @@
 (*     (converged like a seat, digest old or new), configuration (report- *)
 (*     only, Q6) and the shape refusal (A8) are not modelled.             *)
 (*   - The linked worktree is HEAD only: its seats and index behave as    *)
-(*     the main's do. Refs-only items, bare repositories, foreign         *)
+(*     the main's do, except wtw, its content as one component, which    *)
+(*     only a first landing and its recovery read and write (review 4).  *)
+(*     An operator's write into it while its first landing runs is not   *)
+(*     modelled. A `git switch` is one atomic step: Git's read of the    *)
+(*     branch before its HEAD.lock (review 4's stated limit) is not      *)
+(*     modelled. Refs-only items, bare repositories, foreign              *)
 (*     repositories (no `created` marker) and --adopt are not modelled.   *)
 (*   - Symbolic refs and per-worktree refs are not modelled (never        *)
 (*     restored natively). Tombstone retention (90 days) is not modelled.*)
@@ -88,24 +113,33 @@
 (*   Capture        E capture_item; git_carry.rs capture_administration    *)
 (*   Begin          E apply_item (A2, A4 journal no-op, pending, settle_refs)*)
 (*                  and C apply_workspace (A5 first landing, finding 13,  *)
-(*                  A12, the lock, native_refs::settle)                   *)
+(*                  A12 and a landing intent, the lock, sweep_probes,     *)
+(*                  C settle_repository: remove_intent_head_locks, then   *)
+(*                  native_refs::settle, N remove_stale_locks and         *)
+(*                  remove_orphan_packed_new)                             *)
 (*   FirstLandMain  git_carry.rs restore_staged_landed, C land_standalone_ *)
 (*                  refs, record_landing                                   *)
 (*   FirstStepWt, FirstPlanWt, FirstAddWt, FirstLedgerWt                  *)
-(*                  git_carry.rs restore_linked_staged_landed, C          *)
-(*                  plan_linked, finish_landing                            *)
-(*   Decide_        C apply_workspace (A3 settle start, A6, A7, prove)     *)
+(*                  git_carry.rs restore_linked_staged_landed (its        *)
+(*                  LandingIntent), C plan_linked, finish_landing,        *)
+(*                  installed_index                                        *)
+(*   Decide_        C apply_workspace (A3 settle start and                *)
+(*                  remove_head_locks, A6, A7, prove); git_carry.rs       *)
+(*                  recover_linked_landing                                 *)
 (*   Import         C converge (import_verified_instance, the clash and   *)
 (*                  holds_unlanded checks)                                *)
 (*   ProbeExchange  C probe_exchange, then head_plan                      *)
 (*   WriteIntent    C converge (WorkspaceIntent, landed::write)            *)
-(*   RefStep        C Place::refs; N step, plan, decide, stash_decision    *)
+(*   RefStep        C Place::refs (intent_branches), Place::left_branch;  *)
+(*                  N step, plan, decide, stash_decision                   *)
 (*   RefFinish, RefTxnDeletes, RefTxnWrites, RefStash, RefLedger           *)
-(*                  N commit, finish, transact, update_refs, stash_apply,  *)
+(*                  N commit, finish, transact (HeadLocks), update_refs   *)
+(*                  (ref_dirs), stash_apply (stash_path, stash_at),       *)
 (*                  settle                                                 *)
 (*   SeatOp, SeatVerify   C Engine::run, remove, replace, add, sweep      *)
 (*   IndexPublish   C publish_index                                        *)
-(*   HeadSet        C set_head (fresh) and settle's HEAD check             *)
+(*   HeadSet        C set_head (fresh; two transactions) and settle's     *)
+(*                  HEAD check (branch_line_fails, head_plan's re-plan)   *)
 (*   BranchRow      C Place::branch_row                                    *)
 (*   WriteLanded    C next_ledger, landed::write, landed::remove           *)
 (*   Journal        E apply_item's journal write                           *)
@@ -144,7 +178,14 @@ Mutations == {"none", "proof_stat_only", "proof_stat_strict",
               "rebase_unguarded", "ledger_reads_index", "unborn_head_untyped",
               "seat_parent_untyped", "refs_unsynced", "probe_left",
               "settle_moves_checked_out", "txn_no_symref_verify",
-              "txn_no_cas", "head_no_cas"}
+              "txn_no_cas", "head_no_cas", "settle_remove_dir",
+              "step_moves_intent_branch", "settle_replays_branch",
+              "stale_lock_kept", "set_head_one_txn",
+              "stash_settle_any_suffix", "old_head_branch_skipped",
+              "no_landing_intent", "head_not_recorded",
+              "head_attach_unchecked", "intent_head_lock_kept",
+              "empty_lock_removed", "packed_new_kept",
+              "stash_reflog_unsynced", "recovery_overwrites"}
 
 (* The closed unions the catalogue types (tla-check requires these sets   *)
 (* to equal the catalogue's labels).                                      *)
@@ -157,7 +198,7 @@ AllPaths == {"d", "d/f"}
 SrcKindSet == {"move", "create", "delete", "rename", "switch", "stash",
                "seat", "dirfile", "filedir", "index", "worktree"}
 OpKindSet == {"seat", "racy", "touch", "untracked", "index", "ref", "stash",
-              "stashdrop", "head", "restore", "rebase", "dir"}
+              "stashdrop", "head", "restore", "rebase", "dir", "lock", "wtwork"}
 
 ASSUME /\ Items \subseteq AllItems /\ "main" \in Items
        /\ Refs \subseteq AllRefs /\ "main" \in Refs
@@ -214,10 +255,13 @@ NoPlan == [head |-> Det(0), br |-> NoBr, row |-> [set |-> FALSE, r |-> NoRow],
            line |-> "none"]
 NoWsLed == [has |-> FALSE, t |-> 0, head |-> Det(0), index |-> 0,
             seats |-> [p \in Paths |-> NoSeatRec]]
+\* hdone: the intent records HEAD at its new value (C head_done).
 NoWsInt == [on |-> FALSE, from |-> 0, to |-> 0, hold |-> Det(0),
-            hnew |-> Det(0), br |-> NoBr, iold |-> 0]
+            hnew |-> Det(0), br |-> NoBr, iold |-> 0, hdone |-> FALSE]
+\* sp: the stash reflog the intent records as reached (the progress a
+\* store is made durable with; the stash op's old order before any store).
 NoRefInt == [on |-> FALSE, ops |-> {}, sop |-> NoSop, led |-> NoLed,
-             sled |-> NoSLed]
+             sled |-> NoSLed, sp |-> << >>]
 Idle == [st |-> "idle", i |-> "main", c |-> 0, cur |-> 0, mode |-> "fresh",
          ops |-> << >>, k |-> 1, sub |-> 0, P |-> [p \in Paths |-> 0],
          wr |-> {}, ws |-> [p \in Paths |-> 0], F |-> NoSeats, T |-> NoSeats, plan |-> NoPlan,
@@ -261,16 +305,31 @@ VARIABLES
     dur,       \* what of nat, dhead and dstash survives a power loss
     edSince,   \* item -> the components the operator edited since its run
                \* began, or since its pending intent was written (ghost)
-    probe      \* probe_exchange's file pairs in the main's worktree root
+    probe,     \* probe_exchange's file pairs in the main's worktree root
                \* (each pass's own tag: a pass removes only its own)
+    opLock,    \* the empty locks the operator's live Git writers hold (ghost)
+    wtw        \* the linked worktree's own content (its seats and index as
+               \* one component): 0 none (worktree add --no-checkout),
+               \* WTLANDED the landing's, anything else the operator's
 
 vars == <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
           dindex, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
           outcome, why, pc, crashes, opN, fresh, opLive, opStash, opHead,
-          reread, badLine, bkSet, everImported, dur, edSince, probe>>
+          reread, badLine, bkSet, everImported, dur, edSince, probe,
+          opLock, wtw>>
 
 
-OpComps == Refs \cup Paths \cup {"index"}
+OpComps == Refs \cup Paths \cup {"index"} \cup (IF "wt" \in Items THEN {"wtw"} ELSE {})
+
+\* The linked worktree's content as its first landing lays it down
+\* (recover_linked_landing's component, review 4).
+WTLANDED == 1
+
+\* Lock files no content proves bulkload's (review 4): Git leaves a
+\* delete's lock, a stash rewrite's delete lock and packed-refs.lock empty,
+\* for a live writer and a killed one alike. "N:packed" is packed-refs.new.
+EmptyLocks == {"E:" \o r : r \in Refs} \cup {"E:packed", "E:stash"}
+Unproven == locks \cap EmptyLocks # {}
 
 -----------------------------------------------------------------------------
 (* State functions                                                         *)
@@ -286,13 +345,16 @@ HeadOf(i) == IF dhead[i].sym = "det" THEN Det(dhead[i].oid)
 \* The branches worktree j holds (C checked_out_by): its HEAD's branch, and
 \* the branch an in-progress rebase or bisect detached it from
 \* (rebase-merge/head-name, rebase-apply/head-name, BISECT_START: Git's
-\* is_worktree_being_rebased and _bisected; review 3 finding 2). The code
-\* today reads `worktree list --porcelain` only (rebase_unguarded).
+\* is_worktree_being_rebased and _bisected; review 3 finding 2). Before
+\* the fix the code read `worktree list --porcelain` only
+\* (rebase_unguarded).
 CheckedBy(j) == (IF dhead[j].sym # "det" THEN {dhead[j].sym} ELSE {})
                 \cup (IF dhead[j].held # "none" /\ ~Mut("rebase_unguarded")
                       THEN {dhead[j].held} ELSE {})
 \* Branches some destination worktree has checked out or holds.
 Checked == UNION {CheckedBy(j) : j \in {x \in Items : dhead[x].on}}
+\* ... some worktree other than i.
+OthersChecked(i) == UNION {CheckedBy(j) : j \in {x \in Items \ {i} : dhead[x].on}}
 
 HeadBranchOf(i, c) == IF i = "main" THEN caps[c].head ELSE caps[c].wt
 
@@ -302,6 +364,14 @@ Proj(i, s) == IF i = "main"
               ELSE [refs |-> s.refs, stash |-> s.stash, wt |-> s.wt]
 
 IsSuffix(s, t) == Len(s) <= Len(t) /\ SubSeq(t, Len(t) - Len(s) + 1, Len(t)) = s
+
+\* N stash_apply's path from a stash op's old order to its new one: an
+\* append stores each new entry on top; a rewrite first deletes the old
+\* tip (compare-and-swap), then stores every entry. StashNext(op, s) is the
+\* reflog the next store makes from s.
+StoreNext(op, dst) == << op.new[Len(op.new) - Len(dst)] >> \o dst
+StashNext(op, s) == IF IsSuffix(s, op.new) /\ s # op.new THEN StoreNext(op, s)
+                    ELSE IF s = op.old THEN << >> ELSE s
 
 \* The values bulkload landed (or is landing) at a component: a write of
 \* one of these by the operator restores landed content and is no edit.
@@ -332,21 +402,35 @@ AfterOp(op) == CASE op.a \in {"Remove", "RmDir"} -> ABSENT
 SeatDone(p) == {k \in 1..Len(pc.ops) : pc.ops[k].p = p /\ (k < pc.k \/ (k = pc.k /\ pc.sub = 1))}
 PreSeats == {"w_import", "w_probe", "w_intent", "w_refs", "r_fin", "r_txd", "r_txw",
              "r_stash", "r_led"}
+\* The ref step after set_head (the old HEAD branch, review 2 finding 1's
+\* limit, fixed): its r_* states come after every seat and HEAD write.
+SecondStep == pc.ret = "w_landed" /\ pc.st \in {"r_fin", "r_txd", "r_txw", "r_stash", "r_led"}
 LandedSeat(p) ==
     LET busy == pc.st # "idle" /\ pc.i = "main"
         D == SeatDone(p)
-    IN IF busy /\ pc.mode = "fresh" /\ pc.st \in PreSeats THEN {wsLed["main"].seats[p].v}
+    IN IF busy /\ pc.mode = "fresh" /\ pc.st \in PreSeats /\ ~SecondStep
+       THEN {wsLed["main"].seats[p].v}
        ELSE IF busy /\ pc.st = "w_seats" /\ D # {}
             THEN {AfterOp(pc.ops[CHOOSE k \in D : \A j \in D : j <= k])}
        ELSE IF busy /\ pc.st = "w_seats" /\ pc.mode = "fresh" THEN {pc.F[p]}
-       ELSE IF busy /\ pc.st \in {"w_index", "w_head", "w_brow", "w_landed"} THEN {pc.T[p]}
+       ELSE IF busy /\ (pc.st \in {"w_index", "w_head", "w_brow", "w_refs2", "w_landed"} \/ SecondStep)
+            THEN {pc.T[p]}
        ELSE LandedSeatAt(p)
 LandedIndex == {wsLed["main"].index}
                \cup (IF wsInt["main"].on THEN {wsInt["main"].iold, caps[wsInt["main"].to].index} ELSE {})
 LandedVals(c) == IF c \in Refs THEN LandedRef(c)
-                 ELSE IF c = "index" THEN LandedIndex ELSE LandedSeat(c)
-LandedStash == (IF stashLed.has THEN {stashLed.order} ELSE {})
-               \cup (IF refInt.sop.on THEN {refInt.sop.old, refInt.sop.new} ELSE {})
+                 ELSE IF c = "index" THEN LandedIndex
+                 ELSE IF c = "wtw" THEN {WTLANDED}
+                 ELSE LandedSeat(c)
+\* The stash bulkload holds: under a pending stash op, the reflog its intent
+\* records as reached and the one the next store makes from it (a crash
+\* between a store and its progress record leaves that one); review 3
+\* finding 14's rule, as for HEAD and the seats: once a store is made, the
+\* old order is no longer bulkload's, and an operator's drop back to it is
+\* an edit. Otherwise the ledger's order.
+LandedStash == IF refInt.sop.on
+               THEN {refInt.sp, StashNext(refInt.sop, refInt.sp)}
+               ELSE IF stashLed.has THEN {stashLed.order} ELSE {}
 \* HEAD: the value bulkload holds for worktree i now (review 3 finding 14).
 \* While i's own fresh converge is in flight before set_head, only the
 \* proved HEAD; after set_head, only the new one (a switch back to the old
@@ -356,9 +440,11 @@ FreshPreHead == {"w_import", "w_probe", "w_intent", "w_refs", "r_fin", "r_txd",
                  "r_txw", "r_stash", "r_led", "w_seats", "w_index", "w_head"}
 LandedHead(i) ==
     LET busy == pc.st # "idle" /\ pc.i = i IN
-    IF busy /\ pc.st \in {"w_brow", "w_landed"} THEN {pc.hnew}
+    IF busy /\ (pc.st \in {"w_brow", "w_refs2", "w_landed"} \/ SecondStep) THEN {pc.hnew}
     ELSE IF busy /\ pc.mode = "fresh" /\ pc.st \in FreshPreHead THEN {pc.hold}
-    ELSE {wsLed[i].head} \cup (IF wsInt[i].on THEN {wsInt[i].hold, wsInt[i].hnew} ELSE {})
+    ELSE IF wsInt[i].on
+         THEN IF wsInt[i].hdone THEN {wsInt[i].hnew} ELSE {wsInt[i].hold, wsInt[i].hnew}
+    ELSE {wsLed[i].head}
 
 \* The components whose operator edit makes item i's proof fail.
 ItemCause(i) ==
@@ -366,6 +452,7 @@ ItemCause(i) ==
     \/ (wsLed[i].head.sym # "det" /\ opLive[wsLed[i].head.sym].on)
     \/ (i = "main" /\ \E p \in Paths : opLive[p].on)
     \/ (i = "main" /\ IndexOn /\ opLive["index"].on)
+    \/ (i = "wt" /\ "wtw" \in OpComps /\ opLive["wtw"].on)
 
 \* What justifies item i's INTERRUPTED at each kind of step (Interrupted):
 \* an operator edit of the component since i's run began or its intent
@@ -374,9 +461,16 @@ Ed(i, c) == c \in edSince[i] /\ opLive[c].on
 EdHead(i, j) == ("HEAD:" \o j) \in edSince[i] /\ opHead[j].on
 RefEdited(i, r) == \/ Ed(i, r)
                    \/ r \in locks
+                   \/ ("E:" \o r) \in locks
                    \/ \E q \in Refs : Conflicting(q, r) /\ Ed(i, q)
                    \/ \E j \in Items : dhead[j].on /\ EdHead(i, j) /\ r \in CheckedBy(j)
-RefWhy(i, T) == \E op \in T : RefEdited(i, op.name)
+\* A lock that fails a transaction's line: on its ref (bulkload's own, or
+\* an empty one), and for a delete packed-refs.lock or packed-refs.new
+\* (review 4).
+LockedOn(op) == \/ op.name \in locks
+                \/ ("E:" \o op.name) \in locks
+                \/ op.new = 0 /\ {"E:packed", "N:packed"} \cap locks # {}
+RefWhy(i, T) == \E op \in T : RefEdited(i, op.name) \/ LockedOn(op)
 SeatWhy(i) == \E q \in Paths : Ed(i, q)
 IndexWhy(i) == IndexOn /\ Ed(i, "index")
 HeadWhy(i, hold, hnew, br) ==
@@ -388,6 +482,9 @@ HeadWhy(i, hold, hnew, br) ==
 Clean == /\ \A c \in OpComps : ~opLive[c].on
          /\ ~opStash.on
          /\ \A i \in Items : ~opHead[i].on
+         \* No lock left that only its owner, or the operator as Git
+         \* instructs, may remove (review 4).
+         /\ ~Unproven
 
 -----------------------------------------------------------------------------
 (* The per-ref decision (N decide, design 7.2 as amended).                 *)
@@ -459,8 +556,20 @@ StepOf(c, skip) ==
 \* The skip set of item i's ref step at capture c: every branch some
 \* worktree has checked out (finding 1) and the branch this checkout's HEAD
 \* moves to (review 2 finding 1).
+\* The fix of the earlier report's finding 2: the branches a pending
+\* workspace intent of any item moves with HEAD or puts HEAD on
+\* (C intent_branches); only that item's set_head moves them. Before the
+\* fix every step skipped only checked-out branches
+\* (step_moves_intent_branch).
+\* (head_branch_in_step, the code before review 2's fix, skipped neither the
+\* branch its own HEAD moves to nor its own intent's.)
+IntentBr(i) == IF Mut("step_moves_intent_branch") THEN {}
+               ELSE UNION {(IF wsInt[j].br.on THEN {wsInt[j].br.name} ELSE {})
+                           \cup (IF wsInt[j].hnew.sym # "det" THEN {wsInt[j].hnew.sym} ELSE {}) :
+                           j \in {x \in Items : wsInt[x].on /\ (x # i \/ ~Mut("head_branch_in_step"))}}
 SkipFor(i, c) == (IF Mut("no_checkout_guard") THEN {} ELSE Checked)
                  \cup (IF Mut("head_branch_in_step") THEN {} ELSE {HeadBranchOf(i, c)})
+                 \cup IntentBr(i)
 
 \* A custody word that blames the destination with no operator edit there.
 BadLines(S) == \/ \E r \in Refs : S.lines[r] \in {"modified-at-destination", "deleted-at-destination"}
@@ -469,19 +578,27 @@ BadLines(S) == \/ \E r \in Refs : S.lines[r] \in {"modified-at-destination", "de
 
 \* N transact's compare-and-swap: every line's old value holds, no lock is
 \* left on it, and a create sits above or below no existing name (Git
-\* checks the names that exist before the transaction). With
-\* `symref-verify` lines for every worktree's HEAD (review 3 finding 10),
-\* a branch some worktree checked out since the plan fails the
-\* transaction; the code today has none (txn_no_symref_verify, and in the
+\* checks the names that exist before the transaction). Every worktree's
+\* HEAD is held for the transaction (review 3 finding 10: Git's own
+\* HEAD.lock of each worktree, its HEAD and any rebase or bisect read
+\* under it; update-ref refuses another worktree's HEAD in a transaction,
+\* so a symref-verify line can name only the worktree it runs in), so a
+\* branch some worktree checked out since the plan fails the transaction.
+\* Before the fix nothing held them (txn_no_symref_verify, and in the
 \* settle settle_moves_checked_out).
-TxnOK(T) == \A op \in T :
+\* Review 4: every worktree's HEAD.lock is taken for the transaction
+\* (HeadLocks::take), so any HEAD lock left fails it; and a lock no content
+\* proves bulkload's fails the line it is on (LockedOn).
+TxnLineOK(T, op) ==
     /\ nat[op.name] = op.old \/ Mut("txn_no_cas")
-    /\ op.name \notin locks
+    /\ ~LockedOn(op)
     /\ \/ op.name \notin Checked
        \/ Mut("txn_no_symref_verify")
        \/ (pc.fin /\ Mut("settle_moves_checked_out"))
     /\ (op.old = 0 /\ op.new # 0) =>
           ~NameConflict(op.name, LiveNames \cup {o.name : o \in {x \in T : x.new # 0 /\ x.name # op.name}})
+TxnOK(T) == /\ \A j \in Items : ("HEAD:" \o j) \notin locks
+            /\ \A op \in T : TxnLineOK(T, op)
 TxnApply(T) == [r \in Refs |-> IF \E op \in T : op.name = r
                                THEN (CHOOSE op \in T : op.name = r).new ELSE nat[r]]
 \* The ghost of the local branches and tags bulkload deleted (a
@@ -564,12 +681,29 @@ BrLine(br) == br.on /\ (Mut("head_branch_in_step") \/ nat[br.name] # br.new)
 HeadLine(i, hold, hnew) == ~(hold.sym # "det" /\ hold.sym = hnew.sym)
                            /\ (hnew.sym # "det" \/ hold.sym # "det" \/ hold.oid # hnew.oid)
 \* head_no_cas: neither line carries its old value (review 3 finding 11).
+\* The fix of the earlier report's finding 3 (review 3 finding 13): the
+\* branch line commits in its own transaction first, under every
+\* worktree's HEAD lock with this one's HEAD verified, and the branch is
+\* checked out by no worktree; then HEAD in a second transaction. Before
+\* the fix both lines were one transaction, which a killed Git child can
+\* leave with HEAD committed alone (set_head_one_txn).
+\* Review 4 (the blocker): a HEAD line that attaches HEAD to a branch it is
+\* not on holds every other worktree's HEAD lock and refuses when another
+\* worktree has that branch checked out (or held), so no two worktrees are
+\* ever on one branch (OneCheckout). Before the fix nothing checked it
+\* (head_attach_unchecked).
+Attaches(hold, hnew) == hnew.sym # "det" /\ hnew.sym # hold.sym
 HeadTxnOK(i, hold, hnew, br) ==
     LET cur == HeadOf(i) IN
     /\ BrLine(br) =>
           /\ nat[br.name] = br.old \/ Mut("head_no_cas")
           /\ br.name \notin locks
+          /\ ("E:" \o br.name) \notin locks
           /\ br.old = 0 => ~NameConflict(br.name, LiveNames \ {br.name})
+          /\ HeadLine(i, hold, hnew) /\ ~Mut("set_head_one_txn") => br.name \notin Checked
+    /\ (HeadLine(i, hold, hnew) /\ Attaches(hold, hnew) /\ ~Mut("head_attach_unchecked")) =>
+          /\ hnew.sym \notin OthersChecked(i)
+          /\ \A j \in Items \ {i} : ("HEAD:" \o j) \notin locks
     /\ HeadLine(i, hold, hnew) =>
           /\ ("HEAD:" \o i) \notin locks
           /\ \/ Mut("head_no_cas")
@@ -578,12 +712,45 @@ HeadTxnOK(i, hold, hnew, br) ==
                 ELSE cur.sym = "det" /\ cur.oid = hold.oid
 NewDhead(hnew) == IF hnew.sym = "det" THEN [on |-> TRUE, sym |-> "det", oid |-> hnew.oid, held |-> "none"]
                   ELSE [on |-> TRUE, sym |-> hnew.sym, oid |-> 0, held |-> "none"]
+\* Once HEAD is at its new value the intent records it (C head_done,
+\* `WorkspaceIntent::head_done`, written right after set_head): a settle
+\* then never moves HEAD again, so an operator's switch back to the old
+\* HEAD while the pass is still running is kept and refused typed (the
+\* window between set_head and that record is one step here).
+\* Before the fix nothing recorded it (head_not_recorded).
+HeadDone(i) == IF wsInt[i].on /\ ~Mut("head_not_recorded")
+               THEN [wsInt EXCEPT ![i].hdone = TRUE] ELSE wsInt
+\* set_head runs two transactions (the branch, then HEAD) when it has both.
+TwoTxns(i, hold, hnew, br) == BrLine(br) /\ HeadLine(i, hold, hnew) /\ ~Mut("set_head_one_txn")
+\* The fix of finding 19 (and the earlier report's finding 2): a settle
+\* whose HEAD is still the old one and whose branch line can no longer
+\* apply (the branch moved, deleted, checked out, or its create blocked
+\* by a put-back ref) re-plans HEAD against the destination now (C
+\* head_plan), the intent rewritten first. Before the fix the settle
+\* replayed the intent's line (settle_replays_branch).
+\* Review 4: another worktree's checkout of the branch is checked first
+\* (a branch line already done is no license to attach a second worktree),
+\* and with no branch line too (TargetTaken).
+BrLineFails(i, br) ==
+    \/ /\ br.on /\ br.name \in OthersChecked(i) /\ ~Mut("head_attach_unchecked")
+    \/ /\ BrLine(br)
+       /\ \/ nat[br.name] # br.old
+          \/ br.old = 0 /\ NameConflict(br.name, LiveNames \ {br.name})
+          \/ br.name \in OthersChecked(i)
+TargetTaken(i, hold, hnew) == /\ Attaches(hold, hnew) /\ hnew.sym \in OthersChecked(i)
+                              /\ ~Mut("head_attach_unchecked")
+ReplanDue(i) == /\ pc.mode = "settle" /\ pc.sub = 0 /\ ~Mut("settle_replays_branch")
+                /\ ~wsInt[i].hdone
+                /\ HeadOf(i) = pc.hold /\ HeadOf(i) # pc.hnew
+                /\ BrLineFails(i, pc.br) \/ TargetTaken(i, pc.hold, pc.hnew)
+                /\ LET P == HeadPlan(i, pc.c) IN P.head # pc.hnew \/ P.br # pc.br
 
 \* C next_ledger: written seats' prints now, kept seats' earlier prints
 \* (the proof's when fresh, the old ledger's when settling), others now.
 \* The index digest is the one publish_index installed (review 3 finding 3);
-\* the code today re-reads the index after publishing it, so an operator's
-\* `git add` in between is recorded as landed (ledger_reads_index).
+\* before the fix the code re-read the index after publishing it, so an
+\* operator's `git add` in between was recorded as landed
+\* (ledger_reads_index).
 NextLedger(i, c, hnew) ==
     [has |-> TRUE, t |-> c, head |-> hnew,
      index |-> IF i # "main" THEN 0
@@ -603,11 +770,18 @@ NextLedger(i, c, hnew) ==
 \* directory; a power loss can undo the rename although the ledgers, which
 \* bulkload writes with a directory fsync, record it. The rule: bulkload
 \* syncs the directories its Git writes touched before any ledger write,
-\* so each of its Git writes is durable at once. The code today does not
-\* (refs_unsynced). The operator's own Git writes are taken as durable.
+\* so each of its Git writes is durable at once. Before the fix the code
+\* did not (refs_unsynced). The operator's own Git writes are taken as durable.
 \* (Each of these is an action's last conjunct: it reads the new state.)
+\* Review 4: update-ref appends the stash's reflog and never fsyncs it;
+\* the rule is that bulkload syncs it after every store, before the
+\* store's progress record. Before the fix the reflog stayed unsynced
+\* (stash_reflog_unsynced): a power loss could undo the reflog that the
+\* records name.
 DurNow == [nat |-> nat', head |-> dhead', stash |-> dstash']
-GitSync == dur' = IF Mut("refs_unsynced") THEN dur ELSE DurNow
+GitSync == dur' = IF Mut("refs_unsynced") THEN dur
+                  ELSE IF Mut("stash_reflog_unsynced") THEN [DurNow EXCEPT !.stash = dur.stash]
+                  ELSE DurNow
 OpDur == dur' = [nat |-> [r \in Refs |-> IF nat'[r] # nat[r] THEN nat'[r] ELSE dur.nat[r]],
                  head |-> [i \in Items |-> IF dhead'[i] # dhead[i] THEN dhead'[i] ELSE dur.head[i]],
                  stash |-> IF dstash' # dstash THEN dstash' ELSE dur.stash]
@@ -638,10 +812,23 @@ Capture(i) ==
     /\ Proj(i, src) # Proj(i, caps[capt[i]])
     /\ caps' = Append(caps, src)
     /\ capt' = [capt EXCEPT ![i] = Len(caps) + 1]
-    /\ UNCHANGED <<src, srcN, nextV, nat, locks, dstash, dseat, temp, dindex, dhead,
+    /\ UNCHANGED <<src, srcN, nextV, nat, locks, opLock, dstash, dseat, temp, dindex, wtw, dhead,
                    prov, refLed, stashLed, refInt, wsLed, wsInt, jour, outcome, why,
                    pc, crashes, opN, fresh, opLive, opStash, opHead, reread,
                    badLine, bkSet, everImported, dur, probe, edSince>>
+
+RefIntLocks == {op.name : op \in refInt.ops} \cup (IF refInt.sop.on THEN {"stash"} ELSE {})
+RefIntDeletes == (\E op \in refInt.ops : op.new = 0) \/ refInt.sop.on
+\* The empty locks a pending ref intent's lines could have left: never
+\* provably bulkload's (review 4); the code before the fix removed them
+\* when older than a timestamp tick (empty_lock_removed).
+RefIntEmptyLocks == {"E:" \o op.name : op \in {o \in refInt.ops : o.new = 0}}
+                    \cup (IF RefIntDeletes THEN {"E:packed"} ELSE {})
+                    \cup (IF refInt.sop.on THEN {"E:stash"} ELSE {})
+\* The HEAD and branch locks a killed set_head of each pending workspace
+\* intent left (their content is its new values).
+IntentHeadLocks == UNION {{"HEAD:" \o j} \cup (IF wsInt[j].br.on THEN {wsInt[j].br.name} ELSE {}) :
+                          j \in {x \in Items : wsInt[x].on}}
 
 RefSettle(i, ret) == [Idle EXCEPT !.st = "r_fin", !.i = i, !.c = capt[i], !.cur = capt[i],
                                  !.mode = "settle", !.ret = ret, !.fin = FALSE,
@@ -666,7 +853,7 @@ Begin(i) ==
           /\ reread' = (reread \/ (noop /\ full))
           \* C apply_workspace, under the lock and before anything else:
           \* the probe files a crashed pass left are removed (review 3
-          \* finding 9; the code today never does: probe_left).
+          \* finding 9; before the fix nothing did: probe_left).
           /\ edSince' = IF wsInt[i].on THEN edSince ELSE [edSince EXCEPT ![i] = {}]
           /\ probe' = IF /\ full /\ i = "main" /\ dhead[i].on /\ wsLed[i].has
                          /\ ~Mut("probe_left")
@@ -683,16 +870,41 @@ Begin(i) ==
                        /\ pc' = IF refInt.on THEN RefSettle(i, "f_step")
                                 ELSE [Idle EXCEPT !.st = "f_step", !.i = i, !.c = c, !.cur = c]
                        /\ UNCHANGED <<outcome, why>>
-             ELSE IF ~wsLed[i].has THEN Refuse(i, "OCCUPIED")
+             \* A worktree with no ledger is not bulkload's, unless a landing
+             \* intent names it: a first linked landing a crash cut short
+             \* (the fix of #216's residual), finished in Decide_.
+             ELSE IF ~wsLed[i].has /\ ~(wsInt[i].on /\ wsInt[i].from = 0)
+             THEN Refuse(i, "OCCUPIED")
              ELSE IF refInt.on /\ ~Mut("converge_before_ref_settle")
              THEN /\ pc' = RefSettle(i, "w_decide")
                   /\ UNCHANGED <<outcome, why>>
              ELSE /\ pc' = [Idle EXCEPT !.st = "w_decide", !.i = i, !.c = c, !.cur = c]
                   /\ UNCHANGED <<outcome, why>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
+          \* native_refs::settle, under the lock: a Git lock a killed child
+          \* left on a ref, or on refs/stash, of the pending ref intent is
+          \* bulkload's (its content is the value the op writes) and is
+          \* removed first. Before the fix nothing removed it
+          \* (stale_lock_kept). Review 4 (C settle_repository): first, for
+          \* every pending workspace intent of the repository, the HEAD and
+          \* branch locks a killed set_head left, so no ref transaction
+          \* meets them (before the fix only that item's own settle, which
+          \* the ref settle never reached, removed them:
+          \* intent_head_lock_kept); an empty lock is never removed
+          \* (empty_lock_removed: the code before the fix), and a
+          \* packed-refs.new with no packed-refs.lock beside it is removed
+          \* when the intent deletes (packed_new_kept: before the fix).
+          /\ LET settling == pc'.st = "r_fin"
+                 heads == IF Mut("intent_head_lock_kept") THEN {} ELSE IntentHeadLocks
+                 refs == IF settling /\ ~Mut("stale_lock_kept") THEN RefIntLocks ELSE {}
+                 empty == IF settling /\ Mut("empty_lock_removed") THEN RefIntEmptyLocks ELSE {}
+                 pnew == IF /\ settling /\ RefIntDeletes /\ ~Mut("packed_new_kept")
+                            /\ "E:packed" \notin locks \ empty
+                         THEN {"N:packed"} ELSE {}
+             IN locks' = locks \ (heads \cup refs \cup empty \cup pnew)
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
                    jour, crashes, opN, fresh, opLive, opStash, opHead, badLine,
-                   bkSet, everImported, dur>>
+                   bkSet, everImported, dur, opLock>>
 
 \* git_carry.rs restore_staged_landed: a standalone first landing in its
 \* private stage (native refs, stash, HEAD, both ledgers), published with
@@ -719,9 +931,9 @@ FirstLandMain ==
           /\ everImported' = everImported \cup {c}
           /\ bkSet' = bkSet
           /\ pc' = [pc EXCEPT !.st = "w_journal"]
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, temp, refInt, wsInt, jour,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, temp, refInt, wsInt, jour,
                    outcome, why, crashes, opN, opLive, opStash, opHead, reread,
-                   badLine, probe, edSince>>
+                   badLine, probe, edSince, wtw>>
     /\ dur' = DurNow
 
 \* Start a native ref step (C Place::refs, N step and commit): with writes,
@@ -731,7 +943,8 @@ StartStep(c, skip, ret) ==
         writes == S.ops # {} \/ S.sop.on
     IN /\ badLine' = (badLine \/ BadLines(S))
        /\ IF writes
-          THEN /\ refInt' = [on |-> TRUE, ops |-> S.ops, sop |-> S.sop, led |-> S.led, sled |-> S.sled]
+          THEN /\ refInt' = [on |-> TRUE, ops |-> S.ops, sop |-> S.sop, led |-> S.led, sled |-> S.sled,
+                             sp |-> S.sop.old]
                /\ pc' = [pc EXCEPT !.st = "r_txd", !.again = S.ops, !.fin = FALSE,
                                    !.nled = S.led, !.nsled = S.sled, !.sgo = FALSE,
                                    !.ret = ret]
@@ -747,9 +960,9 @@ FirstStepWt ==
     /\ pc.st = "f_step"
     /\ prov' = prov \cup {pc.c}
     /\ everImported' = everImported \cup {pc.c}
-    /\ StartStep(pc.c, Checked, "f_plan")
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, wsLed, wsInt, jour, outcome, why, crashes, opN,
+    /\ StartStep(pc.c, Checked \cup IntentBr(pc.i), "f_plan")
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, wsLed, wsInt, jour, outcome, why, crashes, opN,
                    fresh, opLive, opStash, opHead, reread, bkSet, dur, probe, edSince>>
 
 \* C plan_linked: the HEAD plan; its branch line goes through
@@ -765,7 +978,7 @@ FirstPlanWt ==
                     before |-> refLed[P.br.name]]}
        IN IF P.br.on
           THEN /\ refInt' = [on |-> TRUE, ops |-> ops, sop |-> NoSop, led |-> led,
-                             sled |-> stashLed]
+                             sled |-> stashLed, sp |-> << >>]
                /\ pc' = [pc EXCEPT !.st = "r_txd", !.again = ops, !.fin = FALSE,
                                    !.nled = led, !.nsled = stashLed, !.sgo = FALSE,
                                    !.ret = "f_add", !.plan = P]
@@ -773,30 +986,49 @@ FirstPlanWt ==
           ELSE /\ refLed' = led
                /\ pc' = [pc EXCEPT !.st = "f_add", !.plan = P]
                /\ UNCHANGED refInt
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, stashLed, wsLed, wsInt, jour, outcome, why,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, stashLed, wsLed, wsInt, jour, outcome, why,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
                    bkSet, everImported, dur, probe, edSince>>
 
 \* `git worktree add --no-checkout` and the checkout: the worktree exists.
+\* The fix of #216's residual: a landing intent (C LandingIntent, in the
+\* common ledger directory: the item, the destination, the capture and
+\* HEAD's plan) is durable before `worktree add`, so a crash before the
+\* ledger leaves a worktree bulkload can name; here it is the item's
+\* workspace intent with `from` 0. A crash between the intent and `worktree
+\* add` leaves an intent and no worktree, which the rerun's first landing
+\* writes again: one step here. Before the fix there was no landing intent
+\* (no_landing_intent).
 FirstAddWt ==
     /\ pc.st = "f_add"
     /\ dhead' = [dhead EXCEPT !["wt"] = NewDhead(pc.plan.head)]
+    /\ wtw' = 0
+    /\ wsInt' = IF Mut("no_landing_intent") THEN wsInt
+                ELSE [wsInt EXCEPT !["wt"] = [NoWsInt EXCEPT !.on = TRUE, !.to = pc.c,
+                                                             !.hnew = pc.plan.head]]
     /\ pc' = [pc EXCEPT !.st = "f_ledger"]
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, prov, refLed, stashLed, refInt, wsLed, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
                    reread, badLine, bkSet, everImported, probe, edSince>>
     /\ dur' = DurNow
 
-\* C finish_landing: the linked worktree's ledger.
+\* C finish_landing: the linked worktree's ledger, then the landing intent
+\* removed. A recovered landing (Decide_) of a capture older than the
+\* item's current one goes on to decide the current one.
 FirstLedgerWt ==
     /\ pc.st = "f_ledger"
+    \* The checkout (each entry under a temporary name, renamed into place
+    \* without replacing), the index and the ledger.
+    /\ wtw' = WTLANDED
     /\ wsLed' = [wsLed EXCEPT !["wt"] = [NoWsLed EXCEPT !.has = TRUE, !.t = pc.c,
                                                        !.head = pc.plan.head]]
-    /\ pc' = [pc EXCEPT !.st = "w_journal"]
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, refLed, stashLed, refInt, wsInt, jour,
+    /\ wsInt' = [wsInt EXCEPT !["wt"] = NoWsInt]
+    /\ pc' = IF pc.c = pc.cur THEN [pc EXCEPT !.st = "w_journal"]
+             ELSE [pc EXCEPT !.st = "w_decide", !.c = pc.cur]
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, dhead, prov, refLed, stashLed, refInt, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
                    reread, badLine, bkSet, everImported, dur, probe, edSince>>
 
@@ -805,7 +1037,7 @@ FirstLedgerWt ==
 \* branch); prove (A6 and A9) and settle pass that error on as
 \* GIT_CHILD_FAILED. The rule (review 3 finding 4): an unborn HEAD reads as
 \* a HEAD with no oid, which the proof refuses MODIFIED and the settle
-\* INTERRUPTED. The code today: unborn_head_untyped.
+\* INTERRUPTED. The code before the fix: unborn_head_untyped.
 Unborn(i) == dhead[i].sym # "det" /\ nat[dhead[i].sym] = 0
 UnbornUntyped(i) == Mut("unborn_head_untyped") /\ Unborn(i)
 
@@ -818,8 +1050,25 @@ Decide_ ==
            c == pc.cur
            L == wsLed[i]
            I == wsInt[i]
-       IN IF I.on
-          THEN /\ pc' = [pc EXCEPT !.st = "s_refs", !.mode = "settle", !.c = I.to,
+       IN \* A first linked landing a crash cut short (C recover_linked_landing):
+          \* the worktree is finished forward when its HEAD is the planned
+          \* one, and refused MODIFIED when the operator moved it.
+          \* Review 4: its content (seats and index, wtw) must be none or
+          \* the landing's; anything else is the operator's, refused
+          \* MODIFIED. Before the fix the recovery checked HEAD only and
+          \* laid its content over the operator's (recovery_overwrites).
+          IF I.on /\ I.from = 0
+          THEN IF HeadOf(i) = I.hnew /\ (wtw \in {0, WTLANDED} \/ Mut("recovery_overwrites"))
+               THEN /\ pc' = [pc EXCEPT !.st = "f_ledger", !.c = I.to,
+                                        !.plan = [NoPlan EXCEPT !.head = I.hnew]]
+                    /\ UNCHANGED <<outcome, why, locks, opLock>>
+               ELSE Refuse(i, "MODIFIED") /\ UNCHANGED locks
+          ELSE IF I.on
+          THEN \* C settle: the HEAD and branch locks a killed set_head left
+               \* (their content is the intent's new values) go first.
+               /\ locks' = IF Mut("stale_lock_kept") THEN locks
+                           ELSE locks \ ({"HEAD:" \o i} \cup (IF I.br.on THEN {I.br.name} ELSE {}))
+               /\ pc' = [pc EXCEPT !.st = "s_refs", !.mode = "settle", !.c = I.to,
                                    !.F = caps[L.t].seats, !.T = caps[I.to].seats,
                                    !.ops = IF i = "main" THEN Delta(caps[L.t].seats, caps[I.to].seats)
                                            ELSE << >>,
@@ -827,26 +1076,27 @@ Decide_ ==
                                    !.hold = I.hold, !.hnew = I.hnew, !.br = I.br,
                                    !.iold = I.iold]
                /\ UNCHANGED <<outcome, why>>
-          ELSE IF L.t = c
-          THEN IF UnbornUntyped(i) THEN RefuseAs(i, "UNTYPED", FALSE)
-               ELSE IF Proved(i)
-               THEN /\ pc' = [pc EXCEPT !.st = "w_journal"]
-                    /\ UNCHANGED <<outcome, why>>
-               ELSE Refuse(i, "MODIFIED")
-          ELSE IF c < L.t THEN Refuse(i, "STALE")
-          ELSE IF UnbornUntyped(i) THEN RefuseAs(i, "UNTYPED", FALSE)
-          ELSE IF ~Proved(i) THEN Refuse(i, "MODIFIED")
-          ELSE /\ pc' = [pc EXCEPT !.st = "w_import", !.mode = "fresh", !.c = c,
-                                   !.P = Prints, !.F = caps[L.t].seats, !.T = caps[c].seats,
-                                   !.ops = IF i = "main" THEN Delta(caps[L.t].seats, caps[c].seats)
-                                           ELSE << >>,
-                                   !.k = 1, !.sub = 0, !.wr = {}, !.hold = L.head,
-                                   !.iold = L.index]
-               /\ UNCHANGED <<outcome, why>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
+          ELSE /\ UNCHANGED locks
+               /\ IF L.t = c
+                  THEN IF UnbornUntyped(i) THEN RefuseAs(i, "UNTYPED", FALSE)
+                       ELSE IF Proved(i)
+                       THEN /\ pc' = [pc EXCEPT !.st = "w_journal"]
+                            /\ UNCHANGED <<outcome, why>>
+                       ELSE Refuse(i, "MODIFIED")
+                  ELSE IF c < L.t THEN Refuse(i, "STALE")
+                  ELSE IF UnbornUntyped(i) THEN RefuseAs(i, "UNTYPED", FALSE)
+                  ELSE IF ~Proved(i) THEN Refuse(i, "MODIFIED")
+                  ELSE /\ pc' = [pc EXCEPT !.st = "w_import", !.mode = "fresh", !.c = c,
+                                           !.P = Prints, !.F = caps[L.t].seats, !.T = caps[c].seats,
+                                           !.ops = IF i = "main" THEN Delta(caps[L.t].seats, caps[c].seats)
+                                                   ELSE << >>,
+                                           !.k = 1, !.sub = 0, !.wr = {}, !.hold = L.head,
+                                           !.iold = L.index]
+                       /\ UNCHANGED <<outcome, why>>
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
                    jour, crashes, opN, fresh, opLive, opStash, opHead, reread,
-                   badLine, bkSet, everImported, dur, probe, edSince>>
+                   badLine, bkSet, everImported, dur, probe, edSince, opLock>>
 
 \* C converge: import the capture (additive), then refuse a third party's
 \* seat where the source adds one; with a replacement to make, the probe
@@ -864,8 +1114,8 @@ Import ==
             /\ UNCHANGED <<outcome, why>>
        ELSE /\ pc' = [pc EXCEPT !.st = "w_intent", !.plan = HeadPlan(pc.i, pc.c)]
             /\ UNCHANGED <<outcome, why, probe>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, refLed, stashLed, refInt, wsLed, wsInt, jour,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
                    bkSet, dur, edSince>>
 
@@ -876,8 +1126,8 @@ ProbeExchange ==
     /\ pc.st = "w_probe"
     /\ probe' = probe - 1
     /\ pc' = [pc EXCEPT !.st = "w_intent", !.plan = HeadPlan(pc.i, pc.c)]
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
                    reread, badLine, bkSet, everImported, dur, edSince>>
 
@@ -888,19 +1138,23 @@ WriteIntent ==
                 ELSE [wsInt EXCEPT ![pc.i] =
                         [on |-> TRUE, from |-> wsLed[pc.i].t, to |-> pc.c,
                          hold |-> pc.hold, hnew |-> pc.plan.head, br |-> pc.plan.br,
-                         iold |-> pc.iold]]
+                         iold |-> pc.iold, hdone |-> FALSE]]
     /\ pc' = [pc EXCEPT !.st = "w_refs", !.hnew = pc.plan.head, !.br = pc.plan.br]
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, refLed, stashLed, refInt, wsLed, jour,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
                    reread, badLine, bkSet, everImported, dur, probe, edSince>>
 
-\* C Place::refs inside a converge (w_refs) or a settle (s_refs).
+\* C Place::refs inside a converge (w_refs) or a settle (s_refs), and
+\* again after set_head (w_refs2): the branch HEAD left is no longer
+\* checked out, so this step brings it to the capture (the fix of review 2
+\* finding 1's stated limit; before it, the old HEAD branch stayed behind
+\* while the source held still: old_head_branch_skipped).
 RefStep ==
-    /\ pc.st \in {"w_refs", "s_refs"}
-    /\ StartStep(pc.c, SkipFor(pc.i, pc.c), "w_seats")
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, wsLed, wsInt, jour, outcome, why, crashes,
+    /\ pc.st \in {"w_refs", "s_refs", "w_refs2"}
+    /\ StartStep(pc.c, SkipFor(pc.i, pc.c), IF pc.st = "w_refs2" THEN "w_landed" ELSE "w_seats")
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, wsLed, wsInt, jour, outcome, why, crashes,
                    opN, fresh, opLive, opStash, opHead, reread, bkSet, everImported,
                    dur, probe, edSince>>
 
@@ -909,11 +1163,11 @@ RefStep ==
 \* finding 3), anything else is the destination's: its row restored.
 \* Review 3: an op on a branch some worktree now has checked out (or holds
 \* for a rebase) is never redone; its row is restored and it is reported
-\* checked-out-elsewhere (finding 10; the code today redoes it:
+\* checked-out-elsewhere (finding 10; before the fix the code redid it:
 \* settle_moves_checked_out). The names that exist after the step are the
 \* native ones less the deletes that will run, plus the creates that will
-\* (finding 1; the code today removes every delete's name, whether it runs
-\* or not: finish_after_all_deletes).
+\* (finding 1; before the fix the code removed every delete's name,
+\* whether it ran or not: finish_after_all_deletes).
 RefFinish ==
     /\ pc.st = "r_fin"
     /\ LET I == refInt
@@ -933,10 +1187,20 @@ RefFinish ==
                                    ELSE I.led[r]]
        IN /\ pc' = [pc EXCEPT !.st = "r_txd", !.again = again, !.fin = TRUE, !.nled = nled]
           /\ badLine' = (badLine \/ \E op \in bad : ~blocked(op) /\ ~chk(op) /\ ~opLive[op.name].on)
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
                    jour, outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
                    reread, bkSet, everImported, dur, probe, edSince>>
+
+\* The step for the branch HEAD left runs after set_head: when its
+\* transaction fails (the branch checked out again, a concurrent writer),
+\* the item goes on to its ledger and the ref intent stays for the next
+\* apply's settle (C Place::left_branch); refusing there would leave the
+\* workspace intent pending with HEAD already moved, and its settle would
+\* move HEAD off a branch the operator switched back to.
+LeftBranchDeferred == /\ SecondStep
+                      /\ pc' = [pc EXCEPT !.st = "w_landed"]
+                      /\ UNCHANGED <<outcome, why>>
 
 TxnDeletes == IF Mut("single_ref_txn") THEN pc.again ELSE {op \in pc.again : op.new = 0}
 TxnWrites == IF Mut("single_ref_txn") THEN {} ELSE {op \in pc.again : op.new # 0}
@@ -947,13 +1211,14 @@ RefTxnDeletes ==
     /\ pc.st = "r_txd"
     /\ LET T == TxnDeletes IN
        IF T # {} /\ ~TxnOK(T)
-       THEN /\ Interrupted(pc.i, RefWhy(pc.i, T))
+       THEN /\ \/ LeftBranchDeferred
+               \/ ~SecondStep /\ Interrupted(pc.i, RefWhy(pc.i, T))
             /\ UNCHANGED <<nat, bkSet>>
        ELSE /\ nat' = TxnApply(T)
             /\ bkSet' = BkSet(T)
             /\ pc' = [pc EXCEPT !.st = "r_txw", !.again = TxnWrites]
             /\ UNCHANGED <<outcome, why>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, dstash, dseat, temp, dindex,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, dstash, dseat, temp, dindex, wtw,
                    dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
                    everImported, probe, edSince>>
@@ -963,46 +1228,69 @@ RefTxnWrites ==
     /\ pc.st = "r_txw"
     /\ LET T == pc.again IN
        IF T # {} /\ ~TxnOK(T)
-       THEN /\ Interrupted(pc.i, RefWhy(pc.i, T))
+       THEN /\ \/ LeftBranchDeferred
+               \/ ~SecondStep /\ Interrupted(pc.i, RefWhy(pc.i, T))
             /\ UNCHANGED <<nat, bkSet>>
        ELSE /\ nat' = TxnApply(T)
             /\ bkSet' = BkSet(T)
             /\ pc' = [pc EXCEPT !.st = IF pc.fin THEN "r_stash" ELSE "r_fin"]
             /\ UNCHANGED <<outcome, why>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, dstash, dseat, temp, dindex,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, dstash, dseat, temp, dindex, wtw,
                    dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
                    everImported, probe, edSince>>
     /\ GitSync
 
-\* N stash_apply: re-read once; a reflog that is a suffix of the new order
-\* is continued, one equal to the old order is deleted by compare-and-swap
-\* and rebuilt, anything else is the destination's (finding 4). Every store
-\* is a compare-and-swap on the tip this run saw.
-StoreNext(op, dst) == << op.new[Len(op.new) - Len(dst)] >> \o dst
+\* N stash_apply: each store is a compare-and-swap on the stash tip, and the
+\* reflog it reaches is made durable in the ref intent (its progress, sp)
+\* before the next. The stash is continued only from the progress, or from
+\* the reflog one store past it (a crash between a store and its progress
+\* record); anything else is the destination's (finding 4: an operator's
+\* drop or clear is never undone). Before the fix a settle continued from
+\* any suffix of the new order, the empty one included
+\* (stash_settle_any_suffix). A refs/stash.lock (a killed store's, which
+\* the settle removes first) refuses typed; before the fix it failed the
+\* store and cleared the stash row (stale_lock_kept).
 RefStash ==
     /\ pc.st = "r_stash"
     /\ LET op == refInt.sop
            dst == dstash
-           fail == /\ pc' = [pc EXCEPT !.st = "r_led", !.nsled = NoSLed]
+           sp == refInt.sp
+           \* The destination's stash is kept; the row names the reflog
+           \* bulkload last landed, so later decisions keep it too. Before
+           \* the fix the row was cleared, and an emptied stash read as
+           \* never restored (stash_settle_any_suffix, stale_lock_kept).
+           fail == /\ pc' = [pc EXCEPT !.st = "r_led",
+                                       !.nsled = IF Mut("stash_settle_any_suffix") \/ Mut("stale_lock_kept")
+                                                 THEN NoSLed
+                                                 ELSE [has |-> TRUE, order |-> sp, t |-> refInt.sled.t]]
                    /\ badLine' = (badLine \/ ~opStash.on)
-                   /\ UNCHANGED <<dstash>>
+                   /\ UNCHANGED <<dstash, refInt, outcome, why>>
            go(s) == /\ dstash' = s
-                    /\ pc' = [pc EXCEPT !.sgo = TRUE, !.sexp = s]
-                    /\ UNCHANGED badLine
+                    /\ refInt' = [refInt EXCEPT !.sp = s]
+                    /\ pc' = IF Mut("stash_settle_any_suffix")
+                             THEN [pc EXCEPT !.sgo = TRUE, !.sexp = s] ELSE pc
+                    /\ UNCHANGED <<badLine, outcome, why>>
        IN IF ~op.on \/ dst = op.new
           THEN /\ pc' = [pc EXCEPT !.st = "r_led"]
-               /\ UNCHANGED <<dstash, badLine>>
-          \* A refs/stash.lock a killed store left fails every later store
-          \* (stash_apply returns false; finish clears the stash row).
-          ELSE IF "stash" \in locks THEN fail
-          ELSE IF pc.sgo /\ dst # pc.sexp THEN fail
-          ELSE IF IsSuffix(dst, op.new) THEN go(StoreNext(op, dst))
-          ELSE IF ~pc.sgo /\ (dst = op.old \/ Mut("stash_clear_blind")) THEN go(<< >>)
+               /\ UNCHANGED <<dstash, badLine, refInt, outcome, why>>
+          ELSE IF "stash" \in locks
+          THEN IF Mut("stale_lock_kept") THEN fail
+               ELSE Interrupted(pc.i, TRUE) /\ UNCHANGED <<dstash, badLine, refInt>>
+          ELSE IF Mut("stash_settle_any_suffix")
+          THEN IF pc.sgo /\ dst # pc.sexp THEN fail
+               ELSE IF IsSuffix(dst, op.new) THEN go(StoreNext(op, dst))
+               ELSE IF ~pc.sgo /\ (dst = op.old \/ Mut("stash_clear_blind")) THEN go(<< >>)
+               ELSE fail
+          ELSE IF dst = sp THEN go(StashNext(op, sp))
+          ELSE IF dst = StashNext(op, sp) THEN go(StashNext(op, dst))
+          \* stash_clear_blind: a rewrite's first step clears whatever is there.
+          ELSE IF Mut("stash_clear_blind") /\ sp = op.old /\ ~IsSuffix(op.old, op.new)
+          THEN go(<< >>)
           ELSE fail
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dseat, temp, dindex,
-                   dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
-                   outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dseat, temp, dindex, wtw,
+                   dhead, prov, refLed, stashLed, wsLed, wsInt, jour,
+                   crashes, opN, fresh, opLive, opStash, opHead,
                    reread, bkSet, everImported, probe, edSince>>
     /\ GitSync
 
@@ -1018,8 +1306,8 @@ RefLedger ==
             /\ why' = [why EXCEPT ![pc.i] = TRUE]
        ELSE /\ pc' = [pc EXCEPT !.st = pc.ret]
             /\ UNCHANGED <<outcome, why>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, wsLed, wsInt, jour, crashes, opN, fresh,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, wsLed, wsInt, jour, crashes, opN, fresh,
                    opLive, opStash, opHead, reread, badLine, bkSet, everImported,
                    dur, probe, edSince>>
 
@@ -1053,8 +1341,8 @@ SeatOp ==
                 \* Seat::at fails: the seat's parent is not a directory.
                 orphan == p = "d/f" /\ dseat["d"].v # DIR
                 \* Every refusal after the intent is INTERRUPTED (review 3
-                \* finding 5); the code today passes Seat::at's error on
-                \* (PATH_ESCAPES_ROOT, Io): seat_parent_untyped.
+                \* finding 5); before the fix the code passed Seat::at's
+                \* error on (PATH_ESCAPES_ROOT, Io): seat_parent_untyped.
                 halt == IF orphan /\ Mut("seat_parent_untyped")
                         THEN RefuseAs(pc.i, "UNTYPED", FALSE)
                         ELSE Interrupted(pc.i, SeatWhy(pc.i))
@@ -1074,6 +1362,12 @@ SeatOp ==
                         THEN SeatNext({}) /\ temp' = [temp EXCEPT ![p] = NoSeat]
                              /\ UNCHANGED <<dseat, fresh, outcome, why>>
                         ELSE stop
+                   \* Settling a file the source turned into a directory: the
+                   \* seat already holds the new directory (the MkDir after it
+                   \* ran before the crash), so the removal is done. Before
+                   \* the fix it refused on every rerun (settle_remove_dir).
+                   ELSE IF settle /\ cur.v = DIR /\ op.n = DIR /\ ~Mut("settle_remove_dir")
+                   THEN skip({})
                    ELSE IF (settle /\ cur.v = op.o) \/ (~settle /\ checked)
                    THEN /\ dseat' = Write(p, ABSENT)
                         /\ temp' = [temp EXCEPT ![p] = NoSeat]
@@ -1121,7 +1415,7 @@ SeatOp ==
                              /\ SeatNext({}) /\ UNCHANGED <<temp, fresh, outcome, why>>
                    ELSE IF cur.v = ABSENT \/ settle THEN skip({})
                    ELSE stop
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dindex, dhead,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dindex, wtw, dhead,
                    prov, refLed, stashLed, refInt, wsLed, wsInt, jour, crashes, opN,
                    opLive, opStash, opHead, reread, badLine, bkSet, everImported,
                    dur, probe, edSince>>
@@ -1139,7 +1433,7 @@ SeatVerify ==
        ELSE /\ dseat' = [dseat EXCEPT ![p] = temp[p]]
             /\ temp' = [temp EXCEPT ![p] = NoSeat]
             /\ Interrupted(pc.i, SeatWhy(pc.i))
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dindex, dhead,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dindex, wtw, dhead,
                    prov, refLed, stashLed, refInt, wsLed, wsInt, jour, crashes, opN,
                    fresh, opLive, opStash, opHead, reread, badLine, bkSet,
                    everImported, dur, probe, edSince>>
@@ -1152,40 +1446,70 @@ IndexPublish ==
            target == caps[pc.c].index
        IN IF dindex = target
           THEN /\ pc' = [pc EXCEPT !.st = "w_head"]
-               /\ UNCHANGED <<dindex, outcome, why>>
+               /\ UNCHANGED <<dindex, wtw, outcome, why>>
           ELSE IF dindex # old /\ ~Mut("index_no_cas")
           THEN Interrupted(pc.i, IndexWhy(pc.i)) /\ UNCHANGED dindex
           ELSE /\ dindex' = target
                /\ pc' = [pc EXCEPT !.st = "w_head"]
                /\ UNCHANGED <<outcome, why>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
-                   bkSet, everImported, dur, probe, edSince>>
+                   bkSet, everImported, dur, probe, edSince, wtw>>
 
 \* C set_head (fresh), or settle's check: HEAD at its new value is done,
-\* at its old value is redone, anything else refuses.
+\* at its old value is redone (re-planned first when the intent's branch
+\* line can no longer apply: ReplanDue), anything else refuses. With a
+\* branch line and a HEAD line, the branch commits first in its own
+\* transaction (pc.sub 0 -> 1), then HEAD (TwoTxns).
 HeadSet ==
     /\ pc.st = "w_head"
     /\ LET i == pc.i
            cur == HeadOf(i)
-           skip == pc.mode = "settle" /\ cur = pc.hnew
-       IN IF pc.mode = "settle" /\ UnbornUntyped(i)
-          THEN RefuseAs(i, "UNTYPED", FALSE) /\ UNCHANGED <<nat, dhead, bkSet>>
+           settle == pc.mode = "settle" /\ pc.sub = 0
+           \* HEAD already at its new value: a settle's, or the HEAD phase
+           \* after the branch's (an operator's switch to the very branch).
+           skip == (settle \/ pc.sub = 1) /\ cur = pc.hnew
+           P == HeadPlan(i, pc.c)
+           two == pc.sub = 0 /\ TwoTxns(i, pc.hold, pc.hnew, pc.br)
+           \* The HEAD transaction after the branch's: its line alone.
+           ok == IF pc.sub = 1 THEN HeadTxnOK(i, pc.hold, pc.hnew, NoBr)
+                 ELSE HeadTxnOK(i, pc.hold, pc.hnew, pc.br)
+       IN IF settle /\ UnbornUntyped(i)
+          THEN RefuseAs(i, "UNTYPED", FALSE) /\ UNCHANGED <<nat, dhead, bkSet, wsInt>>
           ELSE IF skip
-          THEN /\ pc' = [pc EXCEPT !.st = "w_brow"]
+          THEN /\ pc' = [pc EXCEPT !.st = "w_brow", !.sub = 0]
+               /\ wsInt' = HeadDone(i)
                /\ UNCHANGED <<nat, dhead, bkSet, outcome, why>>
-          ELSE IF (pc.mode = "settle" /\ cur # pc.hold) \/ ~HeadTxnOK(i, pc.hold, pc.hnew, pc.br)
+          ELSE IF ReplanDue(i)
+          THEN \* the intent rewritten with the new plan (durable), then set_head;
+               \* a branch line the crash left done is bulkload's write, and
+               \* its row is still recorded (review 4)
+               /\ wsInt' = [wsInt EXCEPT ![i].hnew = P.head, ![i].br = P.br]
+               /\ pc' = [pc EXCEPT !.hnew = P.head, !.br = P.br,
+                                   !.plan = IF ~P.row.set /\ pc.br.on /\ nat[pc.br.name] = pc.br.new
+                                            THEN [P EXCEPT !.row = [set |-> TRUE,
+                                                     r |-> [has |-> TRUE, oid |-> pc.br.new, t |-> pc.c]]]
+                                            ELSE P]
+               /\ UNCHANGED <<nat, dhead, bkSet, outcome, why>>
+          ELSE IF (settle /\ (cur # pc.hold \/ wsInt[i].hdone)) \/ ~ok
           THEN /\ Interrupted(i, HeadWhy(i, pc.hold, pc.hnew, pc.br))
-               /\ UNCHANGED <<nat, dhead, bkSet>>
-          ELSE /\ nat' = IF BrLine(pc.br) THEN [nat EXCEPT ![pc.br.name] = pc.br.new] ELSE nat
+               /\ UNCHANGED <<nat, dhead, bkSet, wsInt>>
+          ELSE IF two
+          THEN /\ nat' = [nat EXCEPT ![pc.br.name] = pc.br.new]
+               /\ bkSet' = bkSet
+               /\ pc' = [pc EXCEPT !.sub = 1]
+               /\ UNCHANGED <<dhead, outcome, why, wsInt>>
+          ELSE /\ nat' = IF pc.sub = 0 /\ BrLine(pc.br) THEN [nat EXCEPT ![pc.br.name] = pc.br.new]
+                         ELSE nat
                /\ bkSet' = bkSet
                /\ dhead' = IF HeadLine(i, pc.hold, pc.hnew) THEN [dhead EXCEPT ![i] = NewDhead(pc.hnew)]
                            ELSE dhead
-               /\ pc' = [pc EXCEPT !.st = "w_brow"]
+               /\ pc' = [pc EXCEPT !.st = "w_brow", !.sub = 0]
+               /\ wsInt' = HeadDone(i)
                /\ UNCHANGED <<outcome, why>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, dstash, dseat, temp, dindex,
-                   prov, refLed, stashLed, refInt, wsLed, wsInt, jour, crashes, opN,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, dstash, dseat, temp, dindex, wtw,
+                   prov, refLed, stashLed, refInt, wsLed, jour, crashes, opN,
                    fresh, opLive, opStash, opHead, reread, badLine, everImported,
                    probe, edSince>>
     /\ GitSync
@@ -1196,12 +1520,15 @@ BranchRow ==
     /\ refLed' = IF pc.mode = "fresh"
                  THEN IF pc.plan.row.set THEN [refLed EXCEPT ![HeadBranchOf(pc.i, pc.c)] = pc.plan.row.r]
                       ELSE refLed
+                 \* A settle that re-planned HEAD writes the new plan's row.
+                 ELSE IF pc.plan.row.set
+                      THEN [refLed EXCEPT ![HeadBranchOf(pc.i, pc.c)] = pc.plan.row.r]
                  ELSE IF pc.br.on
                       THEN [refLed EXCEPT ![pc.br.name] = [has |-> TRUE, oid |-> pc.br.new, t |-> pc.c]]
                       ELSE refLed
-    /\ pc' = [pc EXCEPT !.st = "w_landed"]
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, stashLed, refInt, wsLed, wsInt, jour,
+    /\ pc' = [pc EXCEPT !.st = IF Mut("old_head_branch_skipped") THEN "w_landed" ELSE "w_refs2"]
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, stashLed, refInt, wsLed, wsInt, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
                    reread, badLine, bkSet, everImported, dur, probe, edSince>>
 
@@ -1223,8 +1550,8 @@ WriteLanded ==
     /\ wsInt' = [wsInt EXCEPT ![pc.i] = NoWsInt]
     /\ pc' = IF pc.mode = "fresh" THEN [pc EXCEPT !.st = "w_journal"]
              ELSE [pc EXCEPT !.st = "w_decide", !.mode = "fresh", !.c = pc.cur]
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, prov, refLed, stashLed, refInt, jour, outcome,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, refLed, stashLed, refInt, jour, outcome,
                    why, crashes, opN, fresh, opStash, reread, badLine, bkSet,
                    everImported, dur, probe, edSince>>
 
@@ -1236,8 +1563,8 @@ Journal ==
     /\ why' = [why EXCEPT ![pc.i] = TRUE]
     /\ pc' = Idle
     /\ prov' = IF Mut("drop_provenance") THEN {pc.cur} ELSE prov
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
-                   dindex, dhead, refLed, stashLed, refInt, wsLed, wsInt, crashes,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, refLed, stashLed, refInt, wsLed, wsInt, crashes,
                    opN, fresh, opLive, opStash, opHead, reread, badLine, bkSet,
                    everImported, dur, probe, edSince>>
 
@@ -1249,7 +1576,7 @@ SrcStep(s2) ==
     /\ src' = s2
     /\ srcN' = srcN + 1
     /\ nextV' = nextV + 1
-    /\ UNCHANGED <<caps, capt, nat, locks, dstash, dseat, temp, dindex, dhead, prov,
+    /\ UNCHANGED <<caps, capt, nat, locks, opLock, dstash, dseat, temp, dindex, wtw, dhead, prov,
                    refLed, stashLed, refInt, wsLed, wsInt, jour, outcome, why, pc,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
                    bkSet, everImported, dur, probe, edSince>>
@@ -1319,7 +1646,7 @@ MarkHead(i, h) == IF h \in LandedHead(i) THEN [on |-> FALSE, v |-> Det(0)] ELSE 
 \* An operator edit of components cs (each item's edSince records them).
 OpStep(cs) == /\ opN' = opN + 1
               /\ edSince' = [i \in Items |-> edSince[i] \cup cs]
-OpKeep == UNCHANGED <<src, srcN, caps, capt, locks, dhead, prov, refLed,
+OpKeep == UNCHANGED <<src, srcN, caps, capt, locks, opLock, dhead, prov, refLed,
                       stashLed, refInt, wsLed, wsInt, jour, outcome, why, pc,
                       crashes, reread, badLine, bkSet, everImported, dur, probe>>
 
@@ -1343,20 +1670,20 @@ OpSeat(p) ==
                /\ nextV' = IF nv = ABSENT THEN nextV ELSE nextV + 1
           /\ temp' = [temp EXCEPT !["d/f"] = NoSeat]
     /\ OpStep({p} \cup {c \in OpComps : opLive'[c] # opLive[c]})
-    /\ OpKeep /\ UNCHANGED <<nat, dstash, dindex, fresh, opStash, opHead>>
+    /\ OpKeep /\ UNCHANGED <<nat, dstash, dindex, wtw, fresh, opStash, opHead>>
 \* A write in the same tick as bulkload's write of the seat keeps its stat.
 OpRacy(p) ==
     /\ OpGate("racy") /\ RacyEdits /\ pc.st = "idle"
     /\ p \in fresh /\ IsFile(dseat[p].v)
     /\ dseat' = [dseat EXCEPT ![p].v = nextV] /\ Mark(p, nextV)
     /\ nextV' = nextV + 1
-    /\ OpStep({p}) /\ OpKeep /\ UNCHANGED <<nat, temp, dstash, dindex, fresh, opStash, opHead>>
+    /\ OpStep({p}) /\ OpKeep /\ UNCHANGED <<nat, temp, dstash, dindex, wtw, fresh, opStash, opHead>>
 \* `touch`, an identical save, `git status`: the stat moves, the content not.
 OpTouch(p) ==
     /\ OpGate("touch") /\ IsFile(dseat[p].v)
     /\ dseat' = [dseat EXCEPT ![p].st = dseat[p].st + 1]
     /\ opN' = opN + 1
-    /\ OpKeep /\ UNCHANGED <<nat, temp, nextV, dstash, dindex, fresh, opLive, opStash, opHead,
+    /\ OpKeep /\ UNCHANGED <<nat, temp, nextV, dstash, dindex, wtw, fresh, opLive, opStash, opHead,
                              edSince>>
 \* An untracked file the operator adds in a landed directory.
 OpUntracked(p) ==
@@ -1364,22 +1691,22 @@ OpUntracked(p) ==
     /\ p = "d/f" => dseat["d"].v = DIR
     /\ dseat' = Write(p, nextV) /\ Mark(p, nextV)
     /\ nextV' = nextV + 1
-    /\ OpStep({p}) /\ OpKeep /\ UNCHANGED <<nat, temp, dstash, dindex, fresh, opStash, opHead>>
+    /\ OpStep({p}) /\ OpKeep /\ UNCHANGED <<nat, temp, dstash, dindex, wtw, fresh, opStash, opHead>>
 \* `git add`.
 OpIndex == /\ OpGate("index") /\ IndexOn
            /\ dindex' = nextV /\ Mark("index", nextV) /\ nextV' = nextV + 1
-           /\ OpStep({"index"}) /\ OpKeep /\ UNCHANGED <<nat, temp, dstash, dseat, fresh, opStash, opHead>>
+           /\ OpStep({"index"}) /\ OpKeep /\ UNCHANGED <<nat, temp, dstash, dseat, fresh, opStash, opHead, wtw>>
 
 \* Operator Git writes: refs, the stash, HEAD (taken as durable: OpDur).
-OpGitKeep == UNCHANGED <<src, srcN, caps, capt, locks, temp, prov, refLed,
+OpGitKeep == UNCHANGED <<src, srcN, caps, capt, locks, opLock, temp, prov, refLed,
                          stashLed, refInt, wsLed, wsInt, jour, outcome, why, pc,
                          crashes, reread, badLine, bkSet, everImported, probe,
-                         dseat, dindex, fresh>>
+                         dseat, dindex, wtw, fresh>>
 \* A commit, `branch -f`, `update-ref -d`, a fetch, a tag: any native ref.
 \* `update-ref -d` deletes a checked-out branch too: its worktree's HEAD is
 \* then unborn (review 3 finding 4).
 OpRef(r) ==
-    /\ OpGate("ref") /\ r \notin locks
+    /\ OpGate("ref") /\ r \notin locks /\ ("E:" \o r) \notin locks
     /\ \E nv \in {nextV, 0} :
          /\ IF nv = 0 THEN nat[r] # 0 ELSE nat[r] # 0 \/ ~NameConflict(r, LiveNames)
          /\ nat' = [nat EXCEPT ![r] = nv] /\ Mark(r, nv)
@@ -1395,7 +1722,7 @@ MarkStash(s) == opStash' = IF s \in LandedStash THEN [on |-> FALSE, v |-> << >>]
 \* `git stash push` ("stash"); `git stash drop` and `git stash clear`
 \* ("stashdrop"). A refs/stash.lock left by a killed store fails them.
 OpStash ==
-    /\ "stash" \notin locks
+    /\ {"stash", "E:stash"} \cap locks = {}
     /\ \/ /\ OpGate("stash") /\ Len(dstash) < 2
           /\ dstash' = << nextV >> \o dstash /\ nextV' = nextV + 1
           /\ MarkStash(<< nextV >> \o dstash)
@@ -1413,13 +1740,16 @@ OpStash ==
 \* the branch's value the operation's own (its final update-ref expects
 \* it; review 3 finding 2).
 OpHead ==
-    /\ \/ /\ OpGate("head") /\ dhead["main"].held = "none" /\ "HEAD:main" \notin locks
-          /\ \E b \in Branches :
-               /\ b # dhead["main"].sym /\ b \notin Checked
+    \* Review 4: in any worktree (`git switch` there; Git refuses a branch
+    \* another worktree has checked out).
+    /\ \/ /\ OpGate("head")
+          /\ \E i \in Items, b \in Branches :
+               /\ dhead[i].on /\ dhead[i].held = "none" /\ ("HEAD:" \o i) \notin locks
+               /\ b # dhead[i].sym /\ b \notin Checked
                /\ nat[b] # 0 \/ ~NameConflict(b, LiveNames)
-               /\ dhead' = [dhead EXCEPT !["main"] = [on |-> TRUE, sym |-> b, oid |-> 0,
-                                                     held |-> "none"]]
-               /\ opHead' = [opHead EXCEPT !["main"] = MarkHead("main", [sym |-> b, oid |-> nat[b]])]
+               /\ dhead' = [dhead EXCEPT ![i] = [on |-> TRUE, sym |-> b, oid |-> 0,
+                                                 held |-> "none"]]
+               /\ opHead' = [opHead EXCEPT ![i] = MarkHead(i, [sym |-> b, oid |-> nat[b]])]
           /\ UNCHANGED opLive
        \/ /\ OpGate("rebase")
           /\ \E i \in Items :
@@ -1443,7 +1773,7 @@ OpRestore ==
             /\ p = "d/f" => dseat["d"].v = DIR
             /\ dseat' = Write(p, wsLed["main"].seats[p].v)
             /\ opLive' = [opLive EXCEPT ![p] = [on |-> FALSE, v |-> 0]]
-            /\ UNCHANGED <<nat, dindex, opHead>>
+            /\ UNCHANGED <<nat, dindex, wtw, opHead>>
        \/ /\ opLive["index"].on /\ dindex' = wsLed["main"].index
           /\ opLive' = [opLive EXCEPT !["index"] = [on |-> FALSE, v |-> 0]]
           /\ UNCHANGED <<nat, dseat, opHead>>
@@ -1459,16 +1789,45 @@ OpRestore ==
             /\ opHead' = [j \in Items |-> IF opHead[j].on /\ dhead[j].sym = r
                                           THEN [on |-> TRUE, v |-> [sym |-> r, oid |-> refLed[r].oid]]
                                           ELSE opHead[j]]
-            /\ UNCHANGED <<dseat, dindex>>
+            /\ UNCHANGED <<dseat, dindex, wtw>>
     /\ OpStep({c \in OpComps : opLive'[c] # opLive[c]})
-    /\ UNCHANGED <<src, srcN, caps, capt, locks, temp, prov, refLed, stashLed,
+    /\ UNCHANGED <<src, srcN, caps, capt, locks, opLock, temp, prov, refLed, stashLed,
                    refInt, wsLed, wsInt, jour, outcome, why, pc, crashes, reread,
                    badLine, bkSet, everImported, nextV, dstash, dhead, fresh,
-                   opStash, probe>>
+                   opStash, probe, wtw>>
     /\ OpDur
+
+\* Review 4, "lock": a live Git writer of the operator's (an `update-ref
+\* --stdin` session that prepared a delete, `git pack-refs`) holds an empty
+\* ref lock or packed-refs.lock for as long as it likes, then lets it go;
+\* or the operator removes a lock no live writer holds, as Git instructs
+\* (never packed-refs.new). Its own write is not modelled: only that its
+\* lock is never taken from it (NoLocalWorkLost).
+OpLock ==
+    /\ OpGate("lock")
+    /\ \/ \E x \in {"E:" \o r : r \in Refs} \cup {"E:packed"} :
+            /\ x \notin locks
+            /\ locks' = locks \cup {x} /\ opLock' = opLock \cup {x}
+       \/ \E x \in opLock : locks' = locks \ {x} /\ opLock' = opLock \ {x}
+       \/ \E x \in (locks \cap EmptyLocks) \ opLock : locks' = locks \ {x} /\ UNCHANGED opLock
+    /\ opN' = opN + 1
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, dstash, dseat, temp, dindex, wtw,
+                   dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
+                   outcome, why, pc, crashes, fresh, opLive, opStash, opHead,
+                   reread, badLine, bkSet, everImported, dur, edSince, probe>>
+\* Review 4, "wtwork": the operator's work in the linked worktree (a file
+\* written, `git add`, `git rm --cached`, a write over a seat), between
+\* applies.
+OpWtWork ==
+    /\ OpGate("wtwork") /\ pc.st = "idle"
+    /\ "wt" \in Items /\ dhead["wt"].on
+    /\ wtw' = nextV /\ Mark("wtw", nextV) /\ nextV' = nextV + 1
+    /\ OpStep({"wtw"}) /\ OpKeep
+    /\ UNCHANGED <<nat, temp, dstash, dindex, dseat, fresh, opStash, opHead, opLock>>
 
 Operator == \/ \E p \in Paths : OpSeat(p) \/ OpRacy(p) \/ OpTouch(p) \/ OpUntracked(p)
             \/ OpIndex \/ (\E r \in Refs : OpRef(r)) \/ OpStash \/ OpHead \/ OpRestore
+            \/ OpLock \/ OpWtWork
 
 \* The apply host crashes between two steps: the volatile pc is lost. A
 \* power loss also loses what of Git's writes is not durable (dur); under
@@ -1478,13 +1837,13 @@ Crash ==
     /\ crashes < MaxCrashes
     /\ \/ /\ pc.st # "idle"
           /\ UNCHANGED <<nat, dhead, dstash>>
-       \/ /\ Mut("refs_unsynced")
+       \/ /\ Mut("refs_unsynced") \/ Mut("stash_reflog_unsynced")
           /\ <<nat, dhead, dstash>> # <<dur.nat, dur.head, dur.stash>>
           /\ nat' = dur.nat /\ dhead' = dur.head /\ dstash' = dur.stash
     /\ pc' = Idle
     /\ outcome' = IF pc.st # "idle" THEN [outcome EXCEPT ![pc.i] = "crashed"] ELSE outcome
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, dseat, temp, dindex, prov,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, dseat, temp, dindex, wtw, prov,
                    refLed, stashLed, refInt, wsLed, wsInt, jour, why, opN, fresh,
                    opLive, opStash, opHead, reread, badLine, bkSet, everImported,
                    dur, probe, edSince>>
@@ -1494,9 +1853,21 @@ StashStores ==
     LET op == refInt.sop
         dst == dstash
     IN /\ op.on /\ dst # op.new /\ "stash" \notin locks
-       /\ ~(pc.sgo /\ dst # pc.sexp)
-       /\ \/ IsSuffix(dst, op.new)
-          \/ ~pc.sgo /\ (dst = op.old \/ Mut("stash_clear_blind"))
+       /\ IF Mut("stash_settle_any_suffix")
+          THEN /\ ~(pc.sgo /\ dst # pc.sexp)
+               /\ \/ IsSuffix(dst, op.new)
+                  \/ ~pc.sgo /\ (dst = op.old \/ Mut("stash_clear_blind"))
+          ELSE \/ dst = refInt.sp
+               \/ dst = StashNext(op, refInt.sp)
+               \/ Mut("stash_clear_blind") /\ refInt.sp = op.old /\ ~IsSuffix(op.old, op.new)
+
+\* A Git child killed while the pass goes on (review 4: the item refuses
+\* GIT_CONVERGE_INTERRUPTED, justified by the lock the child left, and the
+\* next item of the pass runs), or the host crashing in it.
+KilledOrCrashed ==
+    /\ pc' = Idle
+    /\ \E o \in {"crashed", "INTERRUPTED"} : outcome' = [outcome EXCEPT ![pc.i] = o]
+    /\ why' = [why EXCEPT ![pc.i] = TRUE]
 
 \* A crash inside a Git ref transaction (a killed child, power loss): any
 \* subset of its lines is committed, and Git's lock file stays for every
@@ -1510,49 +1881,74 @@ ChildCrashTxn ==
              /\ \E S \in SUBSET T :
                   /\ S # T
                   /\ nat' = TxnApply(S)
-                  /\ locks' = locks \cup {op.name : op \in T \ S}
+                  \* Review 4: a delete's lock is empty (not provably
+                  \* bulkload's), and a transaction with deletes held
+                  \* packed-refs.lock (empty) and may have written
+                  \* packed-refs.new.
+                  /\ \E pnew \in IF \E op \in T : op.new = 0 THEN {{}, {"N:packed"}} ELSE {{}} :
+                       locks' = locks \cup {IF op.new = 0 THEN "E:" \o op.name ELSE op.name : op \in T \ S}
+                                      \cup (IF \E op \in T : op.new = 0 THEN {"E:packed"} ELSE {})
+                                      \cup pnew
        \/ /\ pc.st = "r_stash" /\ StashStores
-          /\ locks' = locks \cup {"stash"}
+          \* A rewrite's first step deletes refs/stash: its lock is empty.
+          /\ LET next == IF dstash = refInt.sp THEN StashNext(refInt.sop, refInt.sp)
+                         ELSE StashNext(refInt.sop, dstash)
+             IN locks' = locks \cup {IF next = << >> THEN "E:stash" ELSE "stash"}
           /\ UNCHANGED nat
-    /\ pc' = Idle
-    /\ outcome' = [outcome EXCEPT ![pc.i] = "crashed"]
+    /\ KilledOrCrashed
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, dstash, dseat, temp, dindex, dhead,
-                   prov, refLed, stashLed, refInt, wsLed, wsInt, jour, why, opN,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, dstash, dseat, temp, dindex, wtw, dhead,
+                   prov, refLed, stashLed, refInt, wsLed, wsInt, jour, opN,
                    fresh, opLive, opStash, opHead, reread, badLine, bkSet,
-                   everImported, probe, edSince>>
+                   everImported, probe, edSince, opLock>>
     /\ GitSync
 
-\* The same inside set_head's transaction: HEAD ("HEAD" sorts before
-\* "refs/") or the branch line committed alone.
+\* The same inside set_head. Its branch transaction killed before the
+\* rename: nothing committed, the branch's lock left; its HEAD transaction
+\* killed: the branch at its new value, HEAD.lock left. Before the fix
+\* (set_head_one_txn) one transaction held both lines, and HEAD ("HEAD"
+\* sorts before "refs/") or the branch line could commit alone.
 ChildCrashHead ==
     /\ ChildCrash /\ crashes < MaxCrashes /\ pc.st = "w_head"
     /\ LET i == pc.i IN
-       /\ ~(pc.mode = "settle" /\ HeadOf(i) = pc.hnew)
-       /\ ~(pc.mode = "settle" /\ HeadOf(i) # pc.hold)
-       /\ ~(pc.mode = "settle" /\ UnbornUntyped(i))
-       /\ HeadTxnOK(i, pc.hold, pc.hnew, pc.br)
-       /\ BrLine(pc.br) /\ HeadLine(i, pc.hold, pc.hnew)
-       /\ \/ /\ dhead' = [dhead EXCEPT ![i] = NewDhead(pc.hnew)]
-             /\ locks' = locks \cup {pc.br.name}
-             /\ UNCHANGED nat
-          \/ /\ nat' = [nat EXCEPT ![pc.br.name] = pc.br.new]
-             /\ locks' = locks \cup {"HEAD:" \o i}
-             /\ UNCHANGED dhead
-    /\ pc' = Idle
-    /\ outcome' = [outcome EXCEPT ![pc.i] = "crashed"]
+       /\ ~(pc.mode = "settle" /\ pc.sub = 0 /\ HeadOf(i) = pc.hnew)
+       /\ ~(pc.mode = "settle" /\ pc.sub = 0 /\ HeadOf(i) # pc.hold)
+       /\ ~(pc.mode = "settle" /\ pc.sub = 0 /\ UnbornUntyped(i))
+       /\ ~(pc.mode = "settle" /\ pc.sub = 0 /\ wsInt[i].hdone)
+       /\ ~ReplanDue(i)
+       /\ IF Mut("set_head_one_txn")
+          THEN /\ HeadTxnOK(i, pc.hold, pc.hnew, pc.br)
+               /\ BrLine(pc.br) /\ HeadLine(i, pc.hold, pc.hnew)
+               /\ \/ /\ dhead' = [dhead EXCEPT ![i] = NewDhead(pc.hnew)]
+                     /\ locks' = locks \cup {pc.br.name}
+                     /\ UNCHANGED nat
+                  \/ /\ nat' = [nat EXCEPT ![pc.br.name] = pc.br.new]
+                     /\ locks' = locks \cup {"HEAD:" \o i}
+                     /\ UNCHANGED dhead
+          ELSE IF pc.sub = 0 /\ TwoTxns(i, pc.hold, pc.hnew, pc.br)
+          THEN /\ HeadTxnOK(i, pc.hold, pc.hnew, pc.br)
+               /\ locks' = locks \cup {pc.br.name}
+               /\ UNCHANGED <<nat, dhead>>
+          \* The HEAD transaction: after the branch's, or alone (review 4: a
+          \* HEAD-only set_head's child killed leaves HEAD.lock too).
+          ELSE /\ pc.sub = 1 \/ ~BrLine(pc.br)
+               /\ HeadLine(i, pc.hold, pc.hnew)
+               /\ HeadTxnOK(i, pc.hold, pc.hnew, NoBr)
+               /\ locks' = locks \cup {"HEAD:" \o i}
+               /\ UNCHANGED <<nat, dhead>>
+    /\ KilledOrCrashed
     /\ crashes' = crashes + 1
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, dstash, dseat, temp, dindex, prov,
-                   refLed, stashLed, refInt, wsLed, wsInt, jour, why, opN, fresh,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, dstash, dseat, temp, dindex, wtw, prov,
+                   refLed, stashLed, refInt, wsLed, wsInt, jour, opN, fresh,
                    opLive, opStash, opHead, reread, badLine, bkSet, everImported,
-                   probe, edSince>>
+                   probe, edSince, opLock>>
     /\ GitSync
 
 \* The timestamp tick passes: no later write can keep a seat's stat.
 Tick == /\ fresh # {}
         /\ fresh' = {}
-        /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat,
-                       temp, dindex, dhead, prov, refLed, stashLed, refInt, wsLed,
+        /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat,
+                       temp, dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed,
                        wsInt, jour, outcome, why, pc, crashes, opN, opLive, opStash,
                        opHead, reread, badLine, bkSet, everImported, dur, probe, edSince>>
 
@@ -1584,6 +1980,8 @@ Init ==
     /\ badLine = FALSE
     /\ probe = 0
     /\ edSince = [i \in Items |-> {}]
+    /\ opLock = {}
+    /\ wtw = IF Landed /\ "wt" \in Items THEN WTLANDED ELSE 0
     /\ IF Landed
        THEN /\ nat = S0.refs
             /\ dstash = << >>
@@ -1662,7 +2060,8 @@ TypeOK ==
                      stash : Seq(Nat), seats : [Paths -> Nat], index : Nat])
     /\ capt \in [Items -> 1..Len(caps)]
     /\ nat \in [Refs -> Nat]
-    /\ locks \subseteq Refs \cup {"HEAD:main", "HEAD:wt", "stash"}
+    /\ locks \subseteq Refs \cup {"HEAD:main", "HEAD:wt", "stash", "N:packed"} \cup EmptyLocks
+    /\ opLock \subseteq EmptyLocks /\ wtw \in Nat
     /\ probe \in Nat
     /\ dstash \in Seq(Nat)
     /\ dseat \in [Paths -> [v : Nat, st : Nat]]
@@ -1677,7 +2076,7 @@ TypeOK ==
     /\ pc.st \in {"idle", "f_land", "f_step", "f_plan", "f_add", "f_ledger",
                   "w_decide", "w_import", "w_probe", "w_intent", "w_refs", "s_refs",
                   "r_fin", "r_txd", "r_txw", "r_stash", "r_led", "w_seats",
-                  "w_index", "w_head", "w_brow", "w_landed", "w_journal"}
+                  "w_index", "w_head", "w_brow", "w_refs2", "w_landed", "w_journal"}
     /\ crashes \in 0..MaxCrashes /\ opN \in 0..MaxOp /\ srcN \in 0..MaxSrc
 
 \* Q144: an operator edit is never overwritten or removed. Every value the
@@ -1687,9 +2086,21 @@ NoLocalWorkLost ==
     /\ \A c \in OpComps : opLive[c].on =>
           IF c \in Refs THEN nat[c] = opLive[c].v
           ELSE IF c = "index" THEN dindex = opLive[c].v
+          ELSE IF c = "wtw" THEN wtw = opLive[c].v
           ELSE dseat[c].v = opLive[c].v \/ (opLive[c].v # ABSENT /\ temp[c].v = opLive[c].v)
     /\ opStash.on => dstash = opStash.v
     /\ \A i \in Items : opHead[i].on => HeadOf(i) = opHead[i].v
+    \* Review 4: a lock an operator's live Git writer holds is never taken
+    \* from it (two writers would then race on packed-refs).
+    /\ opLock \subseteq locks
+
+\* Review 4 (the blocker): no branch is checked out by two worktrees
+\* (Git's own invariant: a commit in either would move the branch under
+\* the other's index and files).
+OneCheckout ==
+    \A i, j \in Items :
+        (i # j /\ dhead[i].on /\ dhead[j].on /\ dhead[i].sym # "det")
+            => dhead[i].sym \notin {dhead[j].sym, dhead[j].held}
 
 \* Every capture ever imported keeps its provenance instance (every ref
 \* tip and stash it carried); a local branch or tag bulkload set is never
@@ -1722,7 +2133,10 @@ NoReRead == ~reread
 \* operator's; with no intent pending, every component is the ledger's or
 \* the operator's.
 CrashAtomicity ==
-    /\ \A i \in Items : (dhead[i].on /\ pc.st = "idle") => wsLed[i].has
+    \* No worktree without its ledger between applies, unless its landing
+    \* intent names it (a first linked landing a crash cut short).
+    /\ \A i \in Items : (dhead[i].on /\ pc.st = "idle") =>
+          (wsLed[i].has \/ (wsInt[i].on /\ wsInt[i].from = 0))
     \* No bulkload residue outside an intent: probe files only while the
     \* main's pass that made them runs, or until its next apply after a
     \* crash (review 3 finding 9).
@@ -1741,7 +2155,9 @@ CrashAtomicity ==
          (wsLed[i].has /\ dhead[i].on /\ ~opHead[i].on
           /\ ~(wsLed[i].head.sym # "det" /\ opLive[wsLed[i].head.sym].on)
           /\ ~(wsInt[i].on /\ wsInt[i].hnew.sym # "det" /\ opLive[wsInt[i].hnew.sym].on)) =>
-            IF wsInt[i].on THEN HeadOf(i) \in {wsInt[i].hold, wsInt[i].hnew}
+            IF wsInt[i].on
+            THEN HeadOf(i) \in (IF wsInt[i].hdone THEN {wsInt[i].hnew}
+                                 ELSE {wsInt[i].hold, wsInt[i].hnew})
             ELSE HeadOf(i) = wsLed[i].head
     \* The branch a pending intent moves with HEAD is a component of the
     \* checkout (finding 2): old or new until HEAD is on it.
@@ -1806,9 +2222,12 @@ Converged ==
 ConvergesWhenQuiet == (<>[]Clean) => <>[]Converged
 
 \* No item refuses forever unless an operator edit of its own checkout or
-\* HEAD branch stays: in particular no crash leftover, ref name or plan
-\* replayed from before a crash wedges it (the foo -> foo/bar blocker).
+\* HEAD branch stays, or a lock no content proves bulkload's (an empty
+\* one: a live writer's, or a killed delete's until the operator removes
+\* it as Git instructs; review 4, the stated exception): in particular no
+\* crash leftover bulkload can prove its own, ref name or plan replayed
+\* from before a crash wedges it (the foo -> foo/bar blocker).
 NoWedge == \A i \in Items :
-    (<>[](outcome[i] \in Refusals /\ capt[i] \notin jour[i])) => <>[]ItemCause(i)
+    (<>[](outcome[i] \in Refusals /\ capt[i] \notin jour[i])) => <>[](ItemCause(i) \/ Unproven)
 
 =============================================================================

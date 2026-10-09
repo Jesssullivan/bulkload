@@ -9,7 +9,8 @@
    a verdict and one primary row (total merges), every safety invariant but
    TypeOK has a fail row, and every traced property has one traceability
    row, in table order. The module's types live here, not in Types.dhall:
-   only its Module entry and the Converge lane are shared.
+   only its Module entry is shared (no symbol is pending: the Converge
+   lane's symbols are on feat/estate-converge-20261008 since 2026-10-09).
 -}
 let T = ./Types.dhall
 
@@ -123,6 +124,8 @@ let OpKind =
       | restore
       | rebase
       | dir
+      | lock
+      | wtwork
       >
 
 let opKindTable =
@@ -138,6 +141,8 @@ let opKindTable =
       , restore = OpKind.restore
       , rebase = OpKind.rebase
       , dir = OpKind.dir
+      , lock = OpKind.lock
+      , wtwork = OpKind.wtwork
       }
 
 let Refusal = < MODIFIED | OCCUPIED | STALE | INTERRUPTED | UNTYPED >
@@ -190,6 +195,21 @@ let Mutation =
       | txn_no_symref_verify
       | txn_no_cas
       | head_no_cas
+      | settle_remove_dir
+      | step_moves_intent_branch
+      | settle_replays_branch
+      | stale_lock_kept
+      | set_head_one_txn
+      | stash_settle_any_suffix
+      | old_head_branch_skipped
+      | no_landing_intent
+      | head_not_recorded
+      | head_attach_unchecked
+      | intent_head_lock_kept
+      | empty_lock_removed
+      | packed_new_kept
+      | stash_reflog_unsynced
+      | recovery_overwrites
       >
 
 let mutationIndex =
@@ -223,6 +243,21 @@ let mutationIndex =
           , txn_no_symref_verify = 25
           , txn_no_cas = 26
           , head_no_cas = 27
+          , settle_remove_dir = 28
+          , step_moves_intent_branch = 29
+          , settle_replays_branch = 30
+          , stale_lock_kept = 31
+          , set_head_one_txn = 32
+          , stash_settle_any_suffix = 33
+          , old_head_branch_skipped = 34
+          , no_landing_intent = 35
+          , head_not_recorded = 36
+          , head_attach_unchecked = 37
+          , intent_head_lock_kept = 38
+          , empty_lock_removed = 39
+          , packed_new_kept = 40
+          , stash_reflog_unsynced = 41
+          , recovery_overwrites = 42
           }
           m
 
@@ -234,6 +269,7 @@ let Property =
       | TypedRefusal
       | NoReRead
       | CrashAtomicity
+      | OneCheckout
       | WithinBudget
       | ConvergesWhenQuiet
       | NoWedge
@@ -266,18 +302,23 @@ let propertyTable =
         , index = 5
         , class = T.PropertyClass.safety
         }
+      , OneCheckout =
+        { property = Property.OneCheckout
+        , index = 6
+        , class = T.PropertyClass.safety
+        }
       , WithinBudget =
         { property = Property.WithinBudget
-        , index = 6
+        , index = 7
         , class = T.PropertyClass.budget
         }
       , ConvergesWhenQuiet =
         { property = Property.ConvergesWhenQuiet
-        , index = 7
+        , index = 8
         , class = T.PropertyClass.temporal
         }
       , NoWedge =
-        { property = Property.NoWedge, index = 8, class = T.PropertyClass.temporal }
+        { property = Property.NoWedge, index = 9, class = T.PropertyClass.temporal }
       }
 
 let propertyIndex = \(p : Property) -> (merge propertyTable p).index
@@ -311,7 +352,7 @@ let witnessTable =
       , Witness_CapturedNotLanded = Witness.Witness_CapturedNotLanded
       }
 
--- The 49 actions of EstateConverge.tla's Next, in the sorted order of the never column.
+-- The 51 actions of EstateConverge.tla's Next, in the sorted order of the never column.
 let Action =
       < Begin
       | BranchRow
@@ -331,6 +372,7 @@ let Action =
       | Journal
       | OpHead
       | OpIndex
+      | OpLock
       | OpRacy
       | OpRef
       | OpRestore
@@ -338,6 +380,7 @@ let Action =
       | OpStash
       | OpTouch
       | OpUntracked
+      | OpWtWork
       | ProbeExchange
       | Quiet
       | RefFinish
@@ -385,37 +428,39 @@ let actionIndex =
           , Journal = 15
           , OpHead = 16
           , OpIndex = 17
-          , OpRacy = 18
-          , OpRef = 19
-          , OpRestore = 20
-          , OpSeat = 21
-          , OpStash = 22
-          , OpTouch = 23
-          , OpUntracked = 24
-          , ProbeExchange = 25
-          , Quiet = 26
-          , RefFinish = 27
-          , RefLedger = 28
-          , RefStash = 29
-          , RefStep = 30
-          , RefTxnDeletes = 31
-          , RefTxnWrites = 32
-          , SeatOp = 33
-          , SeatVerify = 34
-          , SrcCreate = 35
-          , SrcDelete = 36
-          , SrcMove = 37
-          , SrcRename = 38
-          , SrcSeat = 39
-          , SrcStage = 40
-          , SrcStashDrop = 41
-          , SrcStashPush = 42
-          , SrcSwitch = 43
-          , SrcTypeChange = 44
-          , SrcWorktree = 45
-          , Tick = 46
-          , WriteIntent = 47
-          , WriteLanded = 48
+          , OpLock = 18
+          , OpRacy = 19
+          , OpRef = 20
+          , OpRestore = 21
+          , OpSeat = 22
+          , OpStash = 23
+          , OpTouch = 24
+          , OpUntracked = 25
+          , OpWtWork = 26
+          , ProbeExchange = 27
+          , Quiet = 28
+          , RefFinish = 29
+          , RefLedger = 30
+          , RefStash = 31
+          , RefStep = 32
+          , RefTxnDeletes = 33
+          , RefTxnWrites = 34
+          , SeatOp = 35
+          , SeatVerify = 36
+          , SrcCreate = 37
+          , SrcDelete = 38
+          , SrcMove = 39
+          , SrcRename = 40
+          , SrcSeat = 41
+          , SrcStage = 42
+          , SrcStashDrop = 43
+          , SrcStashPush = 44
+          , SrcSwitch = 45
+          , SrcTypeChange = 46
+          , SrcWorktree = 47
+          , Tick = 48
+          , WriteIntent = 49
+          , WriteLanded = 50
           }
           a
 
@@ -438,6 +483,7 @@ let actionTable =
       , Journal = Action.Journal
       , OpHead = Action.OpHead
       , OpIndex = Action.OpIndex
+      , OpLock = Action.OpLock
       , OpRacy = Action.OpRacy
       , OpRef = Action.OpRef
       , OpRestore = Action.OpRestore
@@ -445,6 +491,7 @@ let actionTable =
       , OpStash = Action.OpStash
       , OpTouch = Action.OpTouch
       , OpUntracked = Action.OpUntracked
+      , OpWtWork = Action.OpWtWork
       , ProbeExchange = Action.ProbeExchange
       , Quiet = Action.Quiet
       , RefFinish = Action.RefFinish
@@ -699,8 +746,8 @@ let refs =
 
 {- Refs under operator edits: the local pair, the operator moving,
    creating or deleting a ref and putting a landed value back, a crash.
-   No source switch: with one, a put-back ref wedges the settle
-   (MC_ec_finding_settle_branch_conflict).
+   No source switch (it stays this row's bound): a switch with a put-back
+   ref is MC_ec_settle_branch_conflict's.
 -}
 let refsOp =
           defaults
@@ -914,7 +961,8 @@ let childCrashRefs =
           }
 
 {- Finding 12: liveness after seat and HEAD edits that the operator puts
-   back (ref edits put back are MC_ec_finding_restored_ref's).
+   back (ref edits put back are the documented limit
+   MC_ec_finding_restored_ref's).
 -}
 let liveOps =
           defaults
@@ -926,6 +974,151 @@ let liveOps =
           , MaxOp = 2
           , MaxCrashes = 1
           }
+
+{- The convergence lane's fixes (2026-10-09): the bounds of the earlier
+   finding rows, now a pass row each (the fixed code) and the primary row
+   of the mutation that is the code before the fix.
+-}
+let fileToDir =
+          defaults
+      //  { Paths = [ Path.d, Path.d_f ]
+          , SrcKinds = [ SrcKind.dirfile, SrcKind.filedir ]
+          , MaxSrc = 2
+          , MaxCrashes = 1
+          }
+
+let staleBranch =
+          defaults
+      //  { Items = [ Item.main, Item.wt ]
+          , Refs = [ Ref.main, Ref.dev, Ref.foo ]
+          , IndexOn = True
+          , SrcKinds = [ SrcKind.move, SrcKind.switch ]
+          , OpKinds = [ OpKind.index ]
+          , MaxSrc = 3
+          , MaxOp = 1
+          , MaxCrashes = 1
+          }
+
+{- The simulated rows: the pass row explores 20,000 seeded traces (the
+   finding's simulation reached its violation within a few hundred); the
+   mutation's row stops at its first violation.
+-}
+let simulateFlags = "-simulate num=200000 -depth 40 -seed 20261009"
+
+let simulatePassFlags = "-simulate num=20000 -depth 40 -seed 20261009"
+
+let branchConflict =
+          defaults
+      //  { Refs = [ Ref.main, Ref.foo, Ref.foo_bar ]
+          , SrcKinds = [ SrcKind.rename, SrcKind.switch ]
+          , OpKinds = [ OpKind.ref, OpKind.restore ]
+          , MaxSrc = 2
+          , MaxOp = 2
+          , MaxCrashes = 1
+          }
+
+let childCrashLive =
+          defaults
+      //  { Refs = [ Ref.main, Ref.foo ]
+          , SrcKinds = [ SrcKind.move ]
+          , MaxSrc = 1
+          , MaxCrashes = 1
+          , ChildCrash = True
+          }
+
+let stashLock =
+          defaults
+      //  { SrcKinds = [ SrcKind.stash ]
+          , MaxSrc = 1
+          , MaxCrashes = 1
+          , ChildCrash = True
+          }
+
+let setHeadPartial =
+          defaults
+      //  { Refs = [ Ref.main, Ref.foo ]
+          , SrcKinds = [ SrcKind.move, SrcKind.switch ]
+          , MaxSrc = 2
+          , MaxCrashes = 1
+          , ChildCrash = True
+          }
+
+let stashRevert =
+          defaults
+      //  { SrcKinds = [ SrcKind.stash ]
+          , OpKinds = [ OpKind.stashdrop ]
+          , MaxSrc = 2
+          , MaxOp = 1
+          , MaxCrashes = 1
+          }
+
+let oldHeadBranch =
+          defaults
+      //  { Refs = [ Ref.main, Ref.foo ]
+          , SrcKinds = [ SrcKind.move, SrcKind.switch ]
+          , MaxSrc = 2
+          }
+
+let firstLinkedCrash =
+      first // { Paths = [] : List Path, SrcKinds = [] : List SrcKind, MaxSrc = 0, MaxCrashes = 1 }
+
+{- Review 4 (2026-10-09, later). The blocker: the source moves its linked
+   worktree to another branch while the operator switches a worktree, with
+   applies in flight (OneCheckout).
+-}
+let oneCheckout =
+          defaults
+      //  { Items = [ Item.main, Item.wt ]
+          , Refs = [ Ref.main, Ref.dev, Ref.foo ]
+          , SrcKinds = [ SrcKind.worktree ]
+          , OpKinds = [ OpKind.head ]
+          , OpConcurrent = True
+          , MaxSrc = 2
+          , MaxOp = 1
+          }
+
+-- ... with commits and a crash, the operator's switch between applies.
+let oneCheckoutCrash =
+          oneCheckout
+      //  { SrcKinds = [ SrcKind.worktree, SrcKind.move ]
+          , MaxCrashes = 1
+          , OpConcurrent = False
+          }
+
+{- A killed Git child in a pass that goes on, a main and its linked
+   worktree: set_head's HEAD lock, then the linked worktree's ref step.
+-}
+let childCrashLinked =
+          defaults
+      //  { Items = [ Item.main, Item.wt ]
+          , Refs = [ Ref.main, Ref.dev, Ref.foo, Ref.t ]
+          , SrcKinds = [ SrcKind.move, SrcKind.switch ]
+          , MaxSrc = 2
+          , MaxCrashes = 1
+          , ChildCrash = True
+          }
+
+{- Empty locks: a remote-tracking ref pruned at the source (a delete), a
+   killed delete child, and the operator's live writer holding an empty
+   ref lock or packed-refs.lock, or removing a stale one.
+-}
+let emptyLock =
+          defaults
+      //  { Refs = [ Ref.main, Ref.o_x ]
+          , SrcKinds = [ SrcKind.delete ]
+          , OpKinds = [ OpKind.lock ]
+          , MaxSrc = 1
+          , MaxOp = 2
+          , MaxCrashes = 1
+          , ChildCrash = True
+          }
+
+-- The operator's work in a linked worktree whose first landing a crash cut short.
+let firstLinkedCrashOp = firstLinkedCrash // { OpKinds = [ OpKind.wtwork ], MaxOp = 1 }
+
+-- The stash, one push, a crash that may be a power loss.
+let stashCrash =
+      defaults // { SrcKinds = [ SrcKind.stash ], MaxSrc = 1, MaxCrashes = 1 }
 
 -- Properties -------------------------------------------------------------------------
 
@@ -949,7 +1142,7 @@ let verdict
           , stash_clear_blind = Property.NoLocalWorkLost
           , name_conflict_unchecked = Property.NoWedge
           , single_ref_txn = Property.NoWedge
-          , head_branch_in_step = Property.NoWedge
+          , head_branch_in_step = Property.TypedRefusal
           , no_checkout_guard = Property.TypedRefusal
           , converge_before_ref_settle = Property.TypedRefusal
           , dir_replace_unchecked = Property.TypedRefusal
@@ -968,6 +1161,21 @@ let verdict
           , txn_no_symref_verify = Property.NoLocalWorkLost
           , txn_no_cas = Property.NoLocalWorkLost
           , head_no_cas = Property.NoLocalWorkLost
+          , settle_remove_dir = Property.NoWedge
+          , step_moves_intent_branch = Property.CrashAtomicity
+          , settle_replays_branch = Property.TypedRefusal
+          , stale_lock_kept = Property.NoWedge
+          , set_head_one_txn = Property.CrashAtomicity
+          , stash_settle_any_suffix = Property.NoLocalWorkLost
+          , old_head_branch_skipped = Property.ConvergesWhenQuiet
+          , no_landing_intent = Property.NoWedge
+          , head_not_recorded = Property.NoLocalWorkLost
+          , head_attach_unchecked = Property.OneCheckout
+          , intent_head_lock_kept = Property.TypedRefusal
+          , empty_lock_removed = Property.NoLocalWorkLost
+          , packed_new_kept = Property.NoWedge
+          , stash_reflog_unsynced = Property.TypedRefusal
+          , recovery_overwrites = Property.NoLocalWorkLost
           }
           m
 
@@ -975,7 +1183,17 @@ let verdict
 
 let Pass = { invariants : List Property, properties : List Property, never : List Action }
 
-let Expect = < pass : Pass | fail : Property | reach : Witness | inconclusive >
+{- simulate: a seeded or random -simulate run that must end with no
+   violation of the invariants it names (never a model-checking result);
+   for a scenario BFS cannot reach at any affordable bound.
+-}
+let Expect =
+      < pass : Pass
+      | fail : Property
+      | reach : Witness
+      | simulate : List Property
+      | inconclusive
+      >
 
 let Row =
       { name : Text
@@ -1059,7 +1277,14 @@ let neg =
                 )
                 (n.constants // { Mutation = Some n.mutation })
 
-        in  if isTemporal property then liveRow r else r
+        let r = if isTemporal property then liveRow r else r
+
+        -- BFS cannot reach this mutation's trace at an affordable bound.
+        in  if    natEq
+                    (mutationIndex n.mutation)
+                    (mutationIndex Mutation.step_moves_intent_branch)
+            then  r // { flags = Some simulateFlags }
+            else  r
 
 -- The configs, in run order ---------------------------------------------------------
 
@@ -1078,7 +1303,7 @@ let budgetSelftest =
 let positives =
       [ row
           "MC_ec_refs"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.SeatVerify, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick , Action.ProbeExchange ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.SeatVerify, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick , Action.ProbeExchange, Action.OpLock, Action.OpWtWork ])
           [ "Refs (Q144: remote-tracking refs follow the source; local branches"
           , "and tags deleted at the source are kept and reported): every class,"
           , "the foo -> foo/bar rename both ways, o/x -> o/x/y, HEAD switches and"
@@ -1087,18 +1312,18 @@ let positives =
           refs
       , row
           "MC_ec_refs_op"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
           [ "Refs under operator edits (Q144: a ref the operator changed is kept"
           , "and reported, ref-modified-at-destination): the operator moves,"
           , "creates or deletes a ref (a checked-out one too), or puts a landed"
           , "value back, between the source's moves, deletes and renames; a"
           , "crash. Source switches with a put-back ref are"
-          , "MC_ec_finding_settle_branch_conflict's."
+          , "MC_ec_settle_branch_conflict's."
           ]
           refsOp
       , row
           "MC_ec_seats"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpStash, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcWorktree ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpStash, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcWorktree, Action.OpLock, Action.OpWtWork ])
           [ "The checkout (Q144: content, not stat): seat edits, additions,"
           , "removals and a directory turned into a file at the source; operator"
           , "edits, touches, an untracked file in a landed directory and"
@@ -1107,15 +1332,15 @@ let positives =
           seats
       , row
           "MC_ec_stash"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick , Action.ProbeExchange ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick , Action.ProbeExchange, Action.OpLock, Action.OpWtWork ])
           [ "The stash (findings 4, 8): pushes and drops at the source, every"
           , "store a compare-and-swap; an operator push while the step runs, and"
-          , "a crash. Operator drops are MC_ec_finding_stash_settle_revert's."
+          , "a crash. Operator drops are MC_ec_stash_settle_revert's."
           ]
           stash
       , row
           "MC_ec_linked"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.Tick , Action.ProbeExchange ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.Tick , Action.ProbeExchange, Action.OpLock, Action.OpWtWork ])
           [ "A main and a linked worktree in one repository (findings 1, 11,"
           , "review 2 finding 1): commits, switches, worktree remove and add,"
           , "each item's ref step leaving the other's checked-out branch alone,"
@@ -1124,7 +1349,7 @@ let positives =
           linked
       , row
           "MC_ec_concurrent"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.OpLock, Action.OpWtWork ])
           [ "Operator edits of a seat and of the index while an apply is in"
           , "flight (findings 3, 10): the exchange's displaced check and the"
           , "index compare-and-swap keep them."
@@ -1132,7 +1357,7 @@ let positives =
           concurrent
       , row
           "MC_ec_racy"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.OpLock, Action.OpWtWork ])
           [ "A racy write (design 4.2): the operator writes a seat in the"
           , "timestamp tick of bulkload's write, keeping its stat; the proof"
           , "reads a racy seat's content, so the edit refuses."
@@ -1140,17 +1365,17 @@ let positives =
           racy
       , row
           "MC_ec_first"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcSeat, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree , Action.ProbeExchange ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcSeat, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree , Action.ProbeExchange, Action.OpLock, Action.OpWtWork ])
           [ "First landings (#215): the main from an empty destination, then its"
           , "linked worktree, natively, with no carry/* branch; then a converge."
-          , "No crash: a crashed linked first landing is #216's residual"
-          , "(MC_ec_finding_first_linked_crash)."
+          , "No crash: a crashed linked first landing (#216's residual) is"
+          , "MC_ec_first_linked_crash's."
           ]
           first
       , liveRow
           ( row
               "MC_ec_live"
-              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpUntracked, Action.SrcCreate, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpUntracked, Action.SrcCreate, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.OpLock, Action.OpWtWork ])
               [ "Liveness under fair captures and applies (SF per item): once the"
               , "source and the operator stop, with no operator edit left, every"
               , "item converges (ConvergesWhenQuiet), and no item refuses forever"
@@ -1163,17 +1388,17 @@ let positives =
       , liveRow
           ( row
               "MC_ec_live_linked"
-              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick , Action.ProbeExchange ])
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick , Action.ProbeExchange, Action.OpLock, Action.OpWtWork ])
               [ "Liveness, a main and its linked worktree: commits on both"
-              , "checkouts' branches, a crash. Switches are the findings'"
-              , "(MC_ec_finding_old_head_branch, MC_ec_finding_detached_reattach)."
+              , "checkouts' branches, a crash. Switches are MC_ec_old_head_branch's"
+              , "and the documented limit MC_ec_finding_detached_reattach's."
               ]
               liveLinked
           )
       , liveRow
           ( row
               "MC_ec_refs_rename_op"
-              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
               [ "Review 3 finding 1: o/x -> o/x/y with the operator moving o/x"
               , "while the ref intent is pending (a crash). finish keeps o/x (its"
               , "delete will not run), so the create of o/x/y is dropped"
@@ -1183,7 +1408,7 @@ let positives =
           )
       , row
           "MC_ec_rebase"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
           [ "Review 3 finding 2: a rebase or bisect detaches the main's HEAD and"
           , "holds its branch; every ref step, the linked worktree's included,"
           , "leaves the held branch (rebase-merge/head-name, BISECT_START)."
@@ -1191,7 +1416,7 @@ let positives =
           rebase
       , row
           "MC_ec_index_concurrent"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
           [ "Review 3 finding 3: `git add` while an apply is in flight, over two"
           , "converges: the ledger records the index publish_index installed, so"
           , "an add after the publish fails the next proof (MODIFIED)."
@@ -1199,7 +1424,7 @@ let positives =
           indexConcurrent
       , row
           "MC_ec_head_op"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
           [ "Review 3 findings 4 and 10: the operator switches HEAD (to a branch"
           , "or an unborn one) and moves or deletes refs, a checked-out branch"
           , "too, around a crashed converge: the settle never moves a branch"
@@ -1209,7 +1434,7 @@ let positives =
       , liveRow
           ( row
               "MC_ec_seat_parent"
-              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.OpLock, Action.OpWtWork ])
               [ "Review 3 finding 5: the operator removes the landed directory or"
               , "replaces it with a file while a seat under it is pending; the"
               , "settle refuses GIT_CONVERGE_INTERRUPTED (never a path code), and"
@@ -1219,37 +1444,192 @@ let positives =
           )
       , row
           "MC_ec_head_concurrent"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
           [ "Review 3 findings 10, 11 and 14: the operator switches HEAD while an"
-          , "apply that moves and switches is in flight: the ref step's"
-          , "symref-verify lines and set_head's compare-and-swap keep it."
+          , "apply that moves and switches is in flight: every worktree's HEAD"
+          , "held for the ref transaction, and set_head's compare-and-swap, keep"
+          , "it."
           ]
           headConcurrent
       , row
+          "MC_ec_head_concurrent_crash"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
+          [ "MC_ec_head_concurrent's bound with a crash: a settle's HEAD phase,"
+          , "after the branch's transaction, finds HEAD already at its new value"
+          , "(the operator switched to the very branch) and is done, never an"
+          , "unjustified refusal (found by a probe of this bound, 2026-10-09)."
+          ]
+          (headConcurrent // { MaxCrashes = 1 })
+      , row
           "MC_ec_refs_concurrent"
-          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
           [ "Review 3 finding 11: a ref edit while the ref step is in flight:"
           , "the transaction's compare-and-swap keeps it."
           ]
           refsConcurrent
       , row
           "MC_ec_child_crash"
-          (pass [ Action.ChildCrashHead, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          (pass [ Action.ChildCrashHead, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
           [ "Review 3 finding 13: every safety invariant with crashes inside"
           , "Git's ref transactions (any partial commit, lock files left), no"
-          , "HEAD switch and no stash (MC_ec_finding_set_head_partial and"
-          , "MC_ec_finding_stash_lock fail on those)."
+          , "HEAD switch and no stash (MC_ec_set_head_partial and"
+          , "MC_ec_stash_lock have those)."
           ]
           childCrashRefs
       , liveRow
           ( row
               "MC_ec_live_ops"
-              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.OpLock, Action.OpWtWork ])
               [ "Review 3 finding 12: liveness with seat edits and HEAD switches"
               , "the operator puts back, and a crash."
               ]
               liveOps
           )
+      , liveRow
+          ( row
+              "MC_ec_file_to_dir_settle"
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcSeat, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcWorktree, Action.OpLock, Action.OpWtWork ])
+              [ "The earlier report's finding 1, fixed: the source turns the landed"
+              , "directory into a file and back, a crash at any step. A crash after"
+              , "the MkDir of a file turned into a directory leaves the new"
+              , "directory at the seat; the settle's Remove (Engine::remove,"
+              , "settling) finds the new side there and is done, never refusing."
+              ]
+              fileToDir
+          )
+      ,     row
+              "MC_ec_settle_stale_branch"
+              (Expect.simulate safety)
+              [ "SIMULATION (BFS needs depth 25 past millions of states): the"
+              , "earlier report's finding 2, fixed. The main's intent moves HEAD to"
+              , "a branch it also moves (foo, 2 -> 5); a crash, then an operator"
+              , "`git add`, makes its settle refuse once; the linked worktree's ref"
+              , "step skips foo (a pending workspace intent names it:"
+              , "intent_branches), and a settle whose branch line can no longer"
+              , "apply re-plans HEAD. Every safety invariant holds on every trace."
+              ]
+              staleBranch
+        //  { flags = Some simulatePassFlags }
+      , row
+          "MC_ec_settle_branch_conflict"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
+          [ "Review 3's finding 19, fixed: the source renames foo to foo/bar and"
+          , "switches to it; the operator deletes foo, so the converge plans"
+          , "HEAD onto a new foo/bar; a crash before set_head; the operator puts"
+          , "foo back. The settle's `create foo/bar` can no longer apply, so it"
+          , "re-plans HEAD (detached at the captured head, the branch recorded:"
+          , "head-detached-ref-conflict) instead of refusing on every rerun."
+          ]
+          branchConflict
+      , liveRow
+          ( row
+              "MC_ec_child_crash_live"
+              (passLive [ Action.ChildCrashHead, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
+              [ "The earlier report's finding 3, fixed: a crash inside Git's"
+              , "update-ref child leaves its lock; the settle removes a lock whose"
+              , "content is the value its pending op writes (bulkload's own), so"
+              , "no rerun refuses forever."
+              ]
+              childCrashLive
+          )
+      , row
+          "MC_ec_stash_lock"
+          (pass [ Action.ChildCrashHead, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
+          [ "Review 3 finding 8, fixed: a crash inside a stash store leaves"
+          , "refs/stash.lock; the settle removes it (its content is a stash entry"
+          , "the op stores), and a store that meets a lock refuses typed instead"
+          , "of clearing the stash row."
+          ]
+          stashLock
+      , row
+          "MC_ec_set_head_partial"
+          (pass [ Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
+          [ "Review 3 finding 13 (the earlier report's finding 3), fixed:"
+          , "set_head commits the branch line in its own transaction, then HEAD,"
+          , "so a killed Git child never leaves HEAD on a branch at a value that"
+          , "is neither the intent's old nor its new one."
+          ]
+          setHeadPartial
+      , row
+          "MC_ec_stash_settle_revert"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
+          [ "The earlier report's finding 4, fixed: each stash store's reflog is"
+          , "made durable in the ref intent, and a settle continues only from"
+          , "that progress (or one store past it); an operator's `git stash drop`"
+          , "or `clear` after a crash is kept, never undone."
+          ]
+          stashRevert
+      , liveRow
+          ( row
+              "MC_ec_old_head_branch"
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.OpLock, Action.OpWtWork ])
+              [ "The earlier report's finding 5 (review 2 finding 1's stated"
+              , "limit), fixed: a commit on the checkout's branch, then a switch to"
+              , "another. A second ref step after set_head brings the branch HEAD"
+              , "left to the capture, so it converges while the source holds still."
+              ]
+              oldHeadBranch
+          )
+      , liveRow
+          ( row
+              "MC_ec_first_linked_crash"
+              (passLive [ Action.BranchRow, Action.Capture, Action.ChildCrashHead, Action.ChildCrashTxn, Action.HeadSet, Action.Import, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefStep, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SeatOp, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.WriteIntent, Action.WriteLanded, Action.OpLock, Action.OpWtWork ])
+              [ "The earlier report's finding 7 (#216's residual), fixed: a landing"
+              , "intent is durable before `worktree add`, so a crash before the"
+              , "linked worktree's ledger leaves a worktree the rerun finishes"
+              , "forward (recover_linked_landing), never GIT_DESTINATION_OCCUPIED."
+              ]
+              firstLinkedCrash
+          )
+      , row
+          "MC_ec_one_checkout"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.Crash, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpLock, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpWtWork, Action.ProbeExchange, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.Tick ])
+          [ "Review 4, the blocker: the source moves its linked worktree to"
+          , "another branch while the operator switches a worktree, applies in"
+          , "flight. set_head never attaches HEAD to a branch another worktree"
+          , "has checked out (OneCheckout): it refuses, and the settle re-plans"
+          , "HEAD detached with the branch recorded."
+          ]
+          oneCheckout
+      , row
+          "MC_ec_one_checkout_crash"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpIndex, Action.OpLock, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpWtWork, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.Tick ])
+          [ "MC_ec_one_checkout's bound with commits and a crash, the operator's"
+          , "switch between applies: a settle whose"
+          , "HEAD branch another worktree checked out since the intent re-plans"
+          , "HEAD (head-detached-ref-conflict), branch line done or not."
+          ]
+          oneCheckoutCrash
+      , row
+          "MC_ec_child_crash_linked"
+          (pass [ Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpWtWork, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          [ "Review 4: a killed Git child in a pass that goes on (the item"
+          , "refuses INTERRUPTED, the next runs), a main and its linked"
+          , "worktree. Every pending intent's HEAD and branch locks a killed"
+          , "set_head left are removed before any ref transaction, which holds"
+          , "every worktree's HEAD."
+          ]
+          childCrashLinked
+      , liveRow
+          ( row
+              "MC_ec_empty_lock"
+              (passLive [ Action.ChildCrashHead, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpWtWork, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+              [ "Review 4: an empty lock (a killed delete's, packed-refs.lock, an"
+              , "operator's live writer's) is never removed by bulkload; the item"
+              , "refuses typed until its owner, or the operator as Git"
+              , "instructs, removes it (NoWedge's stated exception), and an"
+              , "orphan packed-refs.new is removed once no lock holds it."
+              ]
+              emptyLock
+          )
+      , row
+          "MC_ec_first_linked_crash_op"
+          (pass [ Action.BranchRow, Action.Capture, Action.ChildCrashHead, Action.ChildCrashTxn, Action.HeadSet, Action.Import, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRef, Action.OpRestore, Action.OpStash, Action.ProbeExchange, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefStep, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SeatOp, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick, Action.WriteIntent, Action.WriteLanded ])
+          [ "Review 4: the operator's work in a linked worktree whose first"
+          , "landing a crash cut short (a staged file, a write over a seat):"
+          , "the recovery refuses GIT_DESTINATION_MODIFIED and changes nothing."
+          ]
+          firstLinkedCrashOp
       ]
 
 -- Reachability witnesses: expected REACHED.
@@ -1278,82 +1658,23 @@ let witnesses =
           (refs // { MaxCrashes = 0 })
       ]
 
-{- Findings against the code on feat/estate-converge-20261008: each row is
-   the current code at a bound that reaches the defect, expected to fail its
-   named property. README.md, "Findings (EstateConverge)".
+{- Documented limits of the code on feat/estate-converge-20261008 (the
+   convergence lane's fixes, 2026-10-09): each row is the code at a bound
+   that reaches the limit, expected to fail its named property. Both need
+   an A4 no-op that reads the ledgers; the next capture converges them.
+   README.md, "Findings (EstateConverge)".
 -}
 let findings =
       [ liveRow
           ( row
-              "MC_ec_finding_file_to_dir_settle"
-              (Expect.fail Property.NoWedge)
-              [ "CODE FINDING (expected to fail): the source turns the landed"
-              , "directory into a file and back. A file the source turns into a"
-              , "directory converges as Remove, MkDir, Add (converge::delta). A crash"
-              , "after the MkDir leaves the new directory at the seat; the settle's"
-              , "Remove (Engine::remove, settling) finds it neither absent nor the"
-              , "old file (`holds` on a directory is false) and refuses"
-              , "GIT_CONVERGE_INTERRUPTED on every rerun, with no operator edit."
-              ]
-              (     defaults
-                //  { Paths = [ Path.d, Path.d_f ]
-                    , SrcKinds = [ SrcKind.dirfile, SrcKind.filedir ]
-                    , MaxSrc = 2
-                    , MaxCrashes = 1
-                    }
-              )
-          )
-      ,     row
-              "MC_ec_finding_settle_stale_branch"
-              (Expect.fail Property.CrashAtomicity)
-              [ "CODE FINDING (expected to fail; found by simulation, as BFS needs"
-              , "depth 25 past millions of states): the main's intent moves HEAD to"
-              , "a branch it also moves (foo, 2 -> 5); a crash, then an operator"
-              , "`git add`, makes the main's settle refuse once (publish_index); the"
-              , "linked worktree's ref step, which skips only checked-out branches,"
-              , "moves foo to its newer capture's value. The settle replays"
-              , "set_head with the intent's compare-and-swap (foo 2 -> 5), which can"
-              , "never hold again: once the operator puts the index back, the main"
-              , "refuses GIT_CONVERGE_INTERRUPTED on every rerun."
-              ]
-              (     defaults
-                //  { Items = [ Item.main, Item.wt ]
-                    , Refs = [ Ref.main, Ref.dev, Ref.foo ]
-                    , IndexOn = True
-                    , SrcKinds = [ SrcKind.move, SrcKind.switch ]
-                    , OpKinds = [ OpKind.index ]
-                    , MaxSrc = 3
-                    , MaxOp = 1
-                    , MaxCrashes = 1
-                    }
-              )
-        //  { flags = Some "-simulate num=200000 -depth 40" }
-      , liveRow
-          ( row
-              "MC_ec_finding_old_head_branch"
-              (Expect.fail Property.ConvergesWhenQuiet)
-              [ "CODE FINDING (expected to fail; review 2 finding 1's stated limit):"
-              , "a commit on the checkout's branch, then a switch to another. The"
-              , "step skips the old HEAD branch (it is checked out until set_head),"
-              , "the journal makes every later apply a no-op, and the branch stays"
-              , "at its old value while the source holds still."
-              ]
-              (     defaults
-                //  { Refs = [ Ref.main, Ref.foo ]
-                    , SrcKinds = [ SrcKind.move, SrcKind.switch ]
-                    , MaxSrc = 2
-                    }
-              )
-          )
-      , liveRow
-          ( row
               "MC_ec_finding_detached_reattach"
               (Expect.fail Property.ConvergesWhenQuiet)
-              [ "CODE FINDING (expected to fail; finding 11's re-attach): the source"
-              , "moves its linked worktree off dev and the main onto dev. The main,"
-              , "applied first, detaches (dev is the destination worktree's); the"
-              , "worktree then leaves dev, but the main's journal makes every later"
-              , "apply a no-op, so it never re-attaches while the source holds still."
+              [ "DOCUMENTED LIMIT (expected to fail; finding 11's re-attach): the"
+              , "source moves its linked worktree off dev and the main onto dev. The"
+              , "main, applied first, detaches (dev is the destination worktree's);"
+              , "the worktree then leaves dev, but the main's journal makes every"
+              , "later apply a no-op (A4 reads nothing), so it re-attaches only on"
+              , "the next capture, not while the source holds still."
               ]
               (     linked
                 //  { SrcKinds = [ SrcKind.switch, SrcKind.worktree ]
@@ -1364,97 +1685,13 @@ let findings =
           )
       , liveRow
           ( row
-              "MC_ec_finding_child_crash"
-              (Expect.fail Property.NoWedge)
-              [ "CODE FINDING (expected to fail): a crash inside Git's update-ref"
-              , "child (power loss, a killed cgroup) leaves its lock file; nothing"
-              , "in the converge removes a stale ref lock, so the settle's"
-              , "compare-and-swap fails on every rerun (GIT_CONVERGE_INTERRUPTED)."
-              , "set_head's transaction can also leave HEAD on a branch whose line"
-              , "did not commit. The fault harness's _exit points never reach this."
-              ]
-              (     defaults
-                //  { Refs = [ Ref.main, Ref.foo ]
-                    , SrcKinds = [ SrcKind.move ]
-                    , MaxSrc = 1
-                    , MaxCrashes = 1
-                    , ChildCrash = True
-                    }
-              )
-          )
-      , row
-          "MC_ec_finding_stash_settle_revert"
-          (Expect.fail Property.NoLocalWorkLost)
-          [ "CODE FINDING (expected to fail): stash_apply continues from any"
-          , "suffix of the new order, the empty reflog included. An operator's"
-          , "`git stash drop` or `clear` while a stash op is pending (a crash, or"
-          , "between the decision and the stores) is undone by re-storing the"
-          , "entries. No bytes are lost (every entry is at provenance); the"
-          , "operator's edit is."
-          ]
-          (     defaults
-            //  { SrcKinds = [ SrcKind.stash ]
-                , OpKinds = [ OpKind.stashdrop ]
-                , MaxSrc = 2
-                , MaxOp = 1
-                , MaxCrashes = 1
-                }
-          )
-      , liveRow
-          ( row
-              "MC_ec_finding_first_linked_crash"
-              (Expect.fail Property.NoWedge)
-              [ "CODE FINDING (expected to fail; #216's stated residual): a crash"
-              , "between `worktree add` and the linked worktree's ledger leaves a"
-              , "worktree without a ledger, which every rerun refuses"
-              , "GIT_DESTINATION_OCCUPIED."
-              ]
-              (first // { Paths = [] : List Path, SrcKinds = [] : List SrcKind, MaxSrc = 0, MaxCrashes = 1 })
-          )
-      , row
-          "MC_ec_finding_stash_lock"
-          (Expect.fail Property.TypedRefusal)
-          [ "CODE FINDING (expected to fail; review 3 finding 8): a crash inside"
-          , "stash_apply's update-ref leaves refs/stash.lock. Every later store"
-          , "fails, stash_apply returns false, and finish clears the stash row"
-          , "and reports stash-modified-at-destination with no operator edit;"
-          , "the capture's stash never lands and the operator's own `git stash`"
-          , "fails on the lock."
-          ]
-          (     defaults
-            //  { SrcKinds = [ SrcKind.stash ]
-                , MaxSrc = 1
-                , MaxCrashes = 1
-                , ChildCrash = True
-                }
-          )
-      , row
-          "MC_ec_finding_set_head_partial"
-          (Expect.fail Property.CrashAtomicity)
-          [ "CODE FINDING (expected to fail; review 3 finding 13, the earlier"
-          , "report's finding 3): set_head's one transaction can commit HEAD"
-          , "without its branch line when the Git child dies, leaving HEAD on a"
-          , "branch that is neither the intent's old nor its new value."
-          ]
-          (     defaults
-            //  { Refs = [ Ref.main, Ref.foo ]
-                , SrcKinds = [ SrcKind.move, SrcKind.switch ]
-                , MaxSrc = 2
-                , MaxCrashes = 1
-                , ChildCrash = True
-                }
-          )
-      , liveRow
-          ( row
               "MC_ec_finding_restored_ref"
               (Expect.fail Property.ConvergesWhenQuiet)
-              [ "CODE FINDING (expected to fail; review 3 finding 12): the source"
-              , "moves foo; the operator moves it too, so the converge keeps it"
-              , "(ref-modified-at-destination) and journals the capture. The"
-              , "operator then puts foo back to its landed value: every edit is"
-              , "undone, but A4's journal no-op never plans foo again, so it stays"
-              , "behind the source while the source holds still (Q144 counts"
-              , "content: a ref put back is unchanged)."
+              [ "DOCUMENTED LIMIT (expected to fail; review 3 finding 12): the"
+              , "source moves foo; the operator moves it too, so the converge keeps"
+              , "it (ref-modified-at-destination) and journals the capture. The"
+              , "operator then puts foo back to its landed value: A4's journal no-op"
+              , "never plans foo again, so it converges only on the next capture."
               ]
               (     defaults
                 //  { Refs = [ Ref.main, Ref.foo ]
@@ -1465,27 +1702,6 @@ let findings =
                     , MaxCrashes = 1
                     }
               )
-          )
-      , row
-          "MC_ec_finding_settle_branch_conflict"
-          (Expect.fail Property.TypedRefusal)
-          [ "CODE FINDING (expected to fail; found by review 3 finding 6's"
-          , "tighter TypedRefusal; the class of the earlier report's finding 2):"
-          , "the source renames foo to foo/bar and switches to it; the operator"
-          , "deletes foo, so the converge plans HEAD onto a new foo/bar. A crash"
-          , "before set_head, then the operator puts foo back. The settle replays"
-          , "the intent's `create foo/bar`, which Git refuses beside foo, so the"
-          , "main refuses GIT_CONVERGE_INTERRUPTED on every rerun with every"
-          , "operator edit undone."
-          ]
-          (     defaults
-            //  { Refs = [ Ref.main, Ref.foo, Ref.foo_bar ]
-                , SrcKinds = [ SrcKind.rename, SrcKind.switch ]
-                , OpKinds = [ OpKind.ref, OpKind.restore ]
-                , MaxSrc = 2
-                , MaxOp = 2
-                , MaxCrashes = 1
-                }
           )
       , row
           "MC_ec_neg_live_unfair"
@@ -1609,7 +1825,12 @@ let primary =
         , comment =
           { head = "the ref step moves the branch HEAD switches to, and set_head"
           , tail =
-            [ "keeps its compare-and-swap line (review 2 finding 1, the blocker)." ]
+            [ "keeps its compare-and-swap line (review 2 finding 1, the blocker):"
+            , "the converge refuses GIT_CONVERGE_INTERRUPTED with no operator edit."
+            , "Its wedge (NoWedge before) is gone since a settle re-plans a branch"
+            , "line that can no longer apply (finding 19), so the row names the"
+            , "unjustified refusal."
+            ]
           }
         }
       , no_checkout_guard =
@@ -1699,7 +1920,7 @@ let primary =
         { mutation = Mutation.finish_after_all_deletes
         , constants = renameOp
         , comment =
-          { head = "CODE TODAY (review 3 finding 1): finish removes every delete's"
+          { head = "CODE BEFORE THE FIX (review 3 finding 1): finish removes every delete's"
           , tail =
             [ "name from the names after the step, whether the delete runs or"
             , "not, so a create beside a kept o/x is retried forever."
@@ -1710,7 +1931,7 @@ let primary =
         { mutation = Mutation.rebase_unguarded
         , constants = rebase // { MaxCrashes = 0 }
         , comment =
-          { head = "CODE TODAY (review 3 finding 2): the skip set is `worktree list"
+          { head = "CODE BEFORE THE FIX (review 3 finding 2): the skip set is `worktree list"
           , tail =
             [ "--porcelain`'s branches only, so a branch under a rebase or bisect"
             , "(its worktree detached) is moved by another item's ref step."
@@ -1721,7 +1942,7 @@ let primary =
         { mutation = Mutation.ledger_reads_index
         , constants = indexConcurrent
         , comment =
-          { head = "CODE TODAY (review 3 finding 3): next_ledger re-reads the index"
+          { head = "CODE BEFORE THE FIX (review 3 finding 3): next_ledger re-reads the index"
           , tail =
             [ "after publishing it, so an operator's `git add` in between is"
             , "recorded as landed and replaced by the next converge."
@@ -1738,7 +1959,7 @@ let primary =
                 , MaxOp = 1
                 }
         , comment =
-          { head = "CODE TODAY (review 3 finding 4): head_of's `rev-parse --verify"
+          { head = "CODE BEFORE THE FIX (review 3 finding 4): head_of's `rev-parse --verify"
           , tail = [ "HEAD` fails on an unborn HEAD: GIT_CHILD_FAILED, not MODIFIED." ]
           }
         }
@@ -1746,7 +1967,7 @@ let primary =
         { mutation = Mutation.seat_parent_untyped
         , constants = seatParent // { OpKinds = [ OpKind.dir ], MaxOp = 1 }
         , comment =
-          { head = "CODE TODAY (review 3 finding 5): Engine::run passes Seat::at's"
+          { head = "CODE BEFORE THE FIX (review 3 finding 5): Engine::run passes Seat::at's"
           , tail =
             [ "error on after the intent (PATH_ESCAPES_ROOT, Io) when a seat's"
             , "parent is no longer a directory."
@@ -1763,7 +1984,7 @@ let primary =
                 , MaxCrashes = 1
                 }
         , comment =
-          { head = "CODE TODAY (review 3 finding 7): no directory sync after"
+          { head = "CODE BEFORE THE FIX (review 3 finding 7): no directory sync after"
           , tail =
             [ "update-ref; a power loss undoes a ref rename the ledgers record,"
             , "and the next apply blames the destination."
@@ -1774,7 +1995,7 @@ let primary =
         { mutation = Mutation.probe_left
         , constants = seat1 // { MaxCrashes = 1 }
         , comment =
-          { head = "CODE TODAY (review 3 finding 9): probe_exchange's files a crash"
+          { head = "CODE BEFORE THE FIX (review 3 finding 9): probe_exchange's files a crash"
           , tail = [ "leaves in the worktree root are never removed." ]
           }
         }
@@ -1782,7 +2003,7 @@ let primary =
         { mutation = Mutation.settle_moves_checked_out
         , constants = headOp // { OpKinds = [ OpKind.head ], MaxOp = 1 }
         , comment =
-          { head = "CODE TODAY (review 3 finding 10, the blocker): finish redoes an"
+          { head = "CODE BEFORE THE FIX (review 3 finding 10, the blocker): finish redoes an"
           , tail =
             [ "op on a branch the operator checked out after the crash, and its"
             , "transaction has no symref-verify line."
@@ -1799,7 +2020,7 @@ let primary =
                 , OpConcurrent = True
                 }
         , comment =
-          { head = "CODE TODAY (review 3 finding 10): the ref step's transaction has"
+          { head = "CODE BEFORE THE FIX (review 3 finding 10): the ref step's transaction has"
           , tail =
             [ "no symref-verify line, so a `git switch` between the plan and the"
             , "update-ref has its branch moved under it."
@@ -1818,6 +2039,178 @@ let primary =
             headConcurrent // { SrcKinds = [ SrcKind.switch ], MaxSrc = 1 }
         , comment =
             line "set_head's HEAD and branch lines carry no old value (review 3 finding 11)."
+        }
+      , settle_remove_dir =
+        { mutation = Mutation.settle_remove_dir
+        , constants = fileToDir
+        , comment =
+          { head = "CODE BEFORE THE FIX (the earlier report's finding 1): a settle's"
+          , tail =
+            [ "Remove of a file the source turned into a directory refuses when"
+            , "the seat already holds the new directory, on every rerun."
+            ]
+          }
+        }
+      , step_moves_intent_branch =
+        { mutation = Mutation.step_moves_intent_branch
+        , constants = staleBranch
+        , comment =
+          { head = "CODE BEFORE THE FIX (the earlier report's finding 2; by"
+          , tail =
+            [ "simulation): a ref step skips only checked-out branches, so the"
+            , "linked worktree's step moves the branch the main's pending intent"
+            , "moves with HEAD."
+            ]
+          }
+        }
+      , settle_replays_branch =
+        { mutation = Mutation.settle_replays_branch
+        , constants = branchConflict
+        , comment =
+          { head = "CODE BEFORE THE FIX (finding 19): the settle replays the"
+          , tail =
+            [ "intent's `create foo/bar` beside a put-back foo, refusing"
+            , "GIT_CONVERGE_INTERRUPTED on every rerun with every edit undone."
+            ]
+          }
+        }
+      , stale_lock_kept =
+        { mutation = Mutation.stale_lock_kept
+        , constants = childCrashLive
+        , comment =
+          { head = "CODE BEFORE THE FIX (the earlier report's finding 3): nothing"
+          , tail =
+            [ "removes the lock a killed update-ref child left, so every"
+            , "settle's compare-and-swap fails."
+            ]
+          }
+        }
+      , set_head_one_txn =
+        { mutation = Mutation.set_head_one_txn
+        , constants = setHeadPartial
+        , comment =
+          { head = "CODE BEFORE THE FIX (review 3 finding 13): set_head's one"
+          , tail =
+            [ "transaction can commit HEAD without its branch line when the Git"
+            , "child dies."
+            ]
+          }
+        }
+      , stash_settle_any_suffix =
+        { mutation = Mutation.stash_settle_any_suffix
+        , constants = stashRevert
+        , comment =
+          { head = "CODE BEFORE THE FIX (the earlier report's finding 4): a settle"
+          , tail =
+            [ "continues the stash from any suffix of the new order, so an"
+            , "operator's drop or clear after a crash is undone."
+            ]
+          }
+        }
+      , old_head_branch_skipped =
+        { mutation = Mutation.old_head_branch_skipped
+        , constants = oldHeadBranch
+        , comment =
+          { head = "CODE BEFORE THE FIX (the earlier report's finding 5): no ref step"
+          , tail =
+            [ "after set_head, so the branch HEAD left stays behind while the"
+            , "source holds still."
+            ]
+          }
+        }
+      , head_not_recorded =
+        { mutation = Mutation.head_not_recorded
+        , constants = headConcurrent // { MaxCrashes = 1 }
+        , comment =
+          { head = "CODE BEFORE THE FIX (found by the model, 2026-10-09): nothing"
+          , tail =
+            [ "records HEAD at its new value after set_head, so after a crash a"
+            , "settle moves HEAD off the branch the operator switched back to"
+            , "while the pass still ran."
+            ]
+          }
+        }
+      , no_landing_intent =
+        { mutation = Mutation.no_landing_intent
+        , constants = firstLinkedCrash
+        , comment =
+          { head = "CODE BEFORE THE FIX (#216's residual): no landing intent, so a"
+          , tail =
+            [ "crash between `worktree add` and the linked worktree's ledger"
+            , "leaves a worktree every rerun refuses GIT_DESTINATION_OCCUPIED."
+            ]
+          }
+        }
+      , head_attach_unchecked =
+        { mutation = Mutation.head_attach_unchecked
+        , constants = oneCheckout
+        , comment =
+          { head = "CODE BEFORE THE FIX (review 4, the blocker): set_head attaches"
+          , tail =
+            [ "HEAD to a branch with no check of the other worktrees, and the"
+            , "settle replays it once the branch line is done, so an operator's"
+            , "`git switch` since the plan ends with two worktrees on one branch."
+            ]
+          }
+        }
+      , intent_head_lock_kept =
+        { mutation = Mutation.intent_head_lock_kept
+        , constants = childCrashLinked
+        , comment =
+          { head = "CODE BEFORE THE FIX (review 4): a HEAD.lock a killed set_head"
+          , tail =
+            [ "left is removed only by that item's own workspace settle, so the"
+            , "linked worktree's ref transaction (which holds every HEAD) meets"
+            , "it and refuses with no cause it writes, and the ref settle that"
+            , "runs first never reaches the workspace settle."
+            ]
+          }
+        }
+      , empty_lock_removed =
+        { mutation = Mutation.empty_lock_removed
+        , constants = emptyLock
+        , comment =
+          { head = "CODE BEFORE THE FIX (review 4): the settle removes an empty lock"
+          , tail =
+            [ "of its intent's deletes, and packed-refs.lock, when older than a"
+            , "timestamp tick: a live writer's (the operator's update-ref"
+            , "--stdin session) is taken from it."
+            ]
+          }
+        }
+      , packed_new_kept =
+        { mutation = Mutation.packed_new_kept
+        , constants = emptyLock
+        , comment =
+          { head = "CODE BEFORE THE FIX (review 4): a packed-refs.new a killed"
+          , tail =
+            [ "delete left is never removed, so once the operator removed the"
+            , "stale packed-refs.lock every rerun's delete still fails on it."
+            ]
+          }
+        }
+      , stash_reflog_unsynced =
+        { mutation = Mutation.stash_reflog_unsynced
+        , constants = stashCrash
+        , comment =
+          { head = "CODE BEFORE THE FIX (review 4): update-ref appends the stash's"
+          , tail =
+            [ "reflog and never syncs it, so a power loss leaves the reflog"
+            , "behind the progress and ledger that name it, and the stash is"
+            , "read as the operator's (stash-modified-at-destination)."
+            ]
+          }
+        }
+      , recovery_overwrites =
+        { mutation = Mutation.recovery_overwrites
+        , constants = firstLinkedCrashOp
+        , comment =
+          { head = "CODE BEFORE THE FIX (review 4): the recovery of a crashed first"
+          , tail =
+            [ "linked landing checks HEAD only, and lays the landing's index and"
+            , "seats over the operator's work in the worktree."
+            ]
+          }
         }
       }
 
@@ -1878,6 +2271,34 @@ let negRows
       , primaryOf Mutation.txn_no_symref_verify
       , primaryOf Mutation.txn_no_cas
       , primaryOf Mutation.head_no_cas
+      , primaryOf Mutation.settle_remove_dir
+      , primaryOf Mutation.step_moves_intent_branch
+      , primaryOf Mutation.settle_replays_branch
+      , primaryOf Mutation.stale_lock_kept
+      , { mutation = Mutation.stale_lock_kept
+        , against =
+            Against.also { suffix = "stale_stash_lock", property = Property.TypedRefusal }
+        , constants = stashLock
+        , comment =
+          { head = "CODE BEFORE THE FIX (review 3 finding 8): a killed stash store's"
+          , tail =
+            [ "refs/stash.lock stays; every later store fails, and finish clears"
+            , "the stash row and reports stash-modified-at-destination with no"
+            , "operator edit."
+            ]
+          }
+        }
+      , primaryOf Mutation.set_head_one_txn
+      , primaryOf Mutation.stash_settle_any_suffix
+      , primaryOf Mutation.old_head_branch_skipped
+      , primaryOf Mutation.no_landing_intent
+      , primaryOf Mutation.head_not_recorded
+      , primaryOf Mutation.head_attach_unchecked
+      , primaryOf Mutation.intent_head_lock_kept
+      , primaryOf Mutation.empty_lock_removed
+      , primaryOf Mutation.packed_new_kept
+      , primaryOf Mutation.stash_reflog_unsynced
+      , primaryOf Mutation.recovery_overwrites
       ]
 
 let primaryPositions =
@@ -1915,6 +2336,7 @@ let failProperty =
           { pass = \(_ : Pass) -> [] : List Property
           , fail = \(p : Property) -> [ p ]
           , reach = \(_ : Witness) -> [] : List Property
+          , simulate = \(_ : List Property) -> [] : List Property
           , inconclusive = [] : List Property
           }
           r.expect
@@ -1951,6 +2373,9 @@ let checks =
           , reach =
               \(w : Witness) ->
                 { invariants = [ "TypeOK", showW w ], properties = [] : List Text }
+          , simulate =
+              \(ps : List Property) ->
+                { invariants = map Property Text showP ps, properties = [] : List Text }
           , inconclusive = { invariants = [ "TypeOK" ], properties = [] : List Text }
           }
           r.expect
@@ -1993,6 +2418,7 @@ let tsvRow =
               { pass = \(_ : Pass) -> "all"
               , fail = showP
               , reach = showW
+              , simulate = \(_ : List Property) -> "all"
               , inconclusive = "WithinBudget"
               }
               r.expect
@@ -2000,6 +2426,7 @@ let tsvRow =
               { pass = \(p : Pass) -> neverColumn p.never
               , fail = \(_ : Property) -> "*"
               , reach = \(_ : Witness) -> "*"
+              , simulate = \(_ : List Property) -> "*"
               , inconclusive = "*"
               }
               r.expect
@@ -2012,7 +2439,7 @@ let tsv =
             , provenance.tsv
             , "# Tab-separated columns, as configs.tsv's:"
             , "#   name            the config, MC_<name>.cfg"
-            , "#   expect          pass | fail | reach | inconclusive"
+            , "#   expect          pass | fail | reach | simulate | inconclusive"
             , "#   named-property  fail: the one property it must violate;"
             , "#                   reach: the Witness_ invariant it must violate;"
             , "#                   inconclusive: WithinBudget; otherwise all"
@@ -2029,10 +2456,11 @@ let tsv =
 -- Traceability (README.md, "EstateConverge") ------------------------------------------
 
 {- A property's traceability: the SLOs it serves, the rulings it carries, the
-   code symbols it is about that origin/main already has (`definition`
-   grounding), the convergence symbols on feat/estate-converge-20261008
-   (pending until that branch merges: lane Converge), and the property
-   tests the design names (P80-P85, proposed; section 13).
+   code symbols it is about (`definition` grounding: each a Rust definition
+   in crates/, the convergence's on this branch since the merge of
+   feat/formal-estate-converge-20261009 into feat/estate-converge-20261008,
+   2026-10-09; none pending), and the property tests the design names
+   (P80-P85; section 13) with the Rust rows that pin each fix.
 -}
 let InvariantRow =
       { tla : Property
@@ -2043,93 +2471,166 @@ let InvariantRow =
       , ptest : List Text
       }
 
-let pending = \(symbol : Text) -> { symbol, lands = Lane.Converge }
+let none = [] : List T.PendingSymbol
 
 let invariants
     : List InvariantRow
     = [ { tla = Property.NoLocalWorkLost
         , slo = [ S.S4, S.Durability ]
         , ruling = [ "OI-1003-Q144", "OI-1003-Q18", "OI-1003-Q100", "OI-1003-Q102" ]
-        , codeSymbol = [ "apply_item", "restore_staged", "restore_linked_staged" ]
-        , pending =
-          [ pending "converge::prove"
-          , pending "converge::Engine (replace, remove, sweep)"
-          , pending "converge::publish_index"
-          , pending "converge::set_head"
-          , pending "native_refs::stash_apply"
-          , pending "native_refs::decide"
-          , pending "converge::checked_out_by (rebase and bisect heads)"
-          , pending "converge::next_ledger (the installed index)"
-          , pending "native_refs::transact (symref-verify)"
-          , pending "native_refs::finish (checked-out ops)"
+        , codeSymbol =
+          [ "apply_item"
+          , "restore_staged"
+          , "restore_linked_staged"
+          , "prove"
+          , "Engine"
+          , "publish_index"
+          , "set_head"
+          , "stash_apply"
+          , "decide"
+          , "checked_out_by"
+          , "held_branches"
+          , "next_ledger"
+          , "installed_index"
+          , "transact"
+          , "HeadLocks"
+          , "finish"
+          , "empty_index_digest"
+          , "LANDING_TEMPORARY"
           ]
-        , ptest = [ "P82", "P84", "P85" ]
+        , pending = none
+        , ptest =
+          [ "P82"
+          , "P84"
+          , "P85"
+          , "a_settle_never_moves_a_branch_checked_out_since_the_crash"
+          , "a_transaction_never_moves_a_checked_out_or_held_branch"
+          , "a_stash_settle_never_undoes_an_operators_drop"
+          , "the_ledger_records_the_installed_index_not_a_re_read"
+          , "estate_converge_linked_added_operator"
+          ]
         }
       , { tla = Property.NoSourceWorkLost
         , slo = [ S.S4, S.S5 ]
         , ruling = [ "OI-1003-Q144", "OI-1003-Q2", "OI-1003-Q11" ]
-        , codeSymbol = [ "import_verified", "import_staged", "capture_item" ]
-        , pending =
-          [ pending "native_refs::decide (R7, tombstones)"
-          , pending "native_refs::plan (ref-name-conflict)"
-          ]
+        , codeSymbol =
+          [ "import_verified", "import_staged", "capture_item", "decide", "plan" ]
+        , pending = none
         , ptest = [ "P80", "P81", "P84" ]
         }
       , { tla = Property.TypedRefusal
         , slo = [ S.S4 ]
         , ruling = [ "OI-1003-Q144", "OI-1003-Q1", "OI-1003-Q74", "OI-1003-Q75" ]
-        , codeSymbol = [ "apply_item" ]
-        , pending =
-          [ pending "GIT_DESTINATION_MODIFIED"
-          , pending "GIT_CONVERGE_INTERRUPTED"
-          , pending "GIT_CONVERGE_STALE_CAPTURE"
-          , pending "converge::holds_unlanded"
-          , pending "native_refs::finish"
-          , pending "converge::head_of (unborn HEAD)"
-          , pending "converge::Engine::run (Seat::at after the intent)"
-          , pending "native_refs::update_refs (directory sync)"
+        , codeSymbol =
+          [ "apply_item"
+          , "BulkloadRefusal"
+          , "interrupted"
+          , "holds_unlanded"
+          , "finish"
+          , "head_of"
+          , "Engine"
+          , "update_refs"
+          , "remove_stale_locks"
+          , "stash_apply"
           ]
-        , ptest = [ "P82" ]
+        , pending = none
+        , ptest =
+          [ "P82"
+          , "an_unborn_head_refuses_modified"
+          , "a_seat_parent_replaced_after_the_intent_refuses_interrupted"
+          , "a_settle_re_plans_a_head_branch_a_put_back_ref_blocks"
+          , "a_settle_removes_a_killed_childs_lock_and_keeps_anyone_elses"
+          , "a_ref_write_syncs_the_directories_its_renames_changed"
+          ]
         }
       , { tla = Property.NoReRead
         , slo = [ S.S3 ]
         , ruling = [ "OI-1003-Q6", "OI-1003-Q10", "R25" ]
-        , codeSymbol = [ "apply_item", "journal_path", "stage_bundle" ]
-        , pending = [ pending "converge::pending", pending "converge::settle_refs" ]
+        , codeSymbol =
+          [ "apply_item", "journal_path", "stage_bundle", "pending", "settle_refs" ]
+        , pending = none
         , ptest = [ "P83" ]
         }
       , { tla = Property.CrashAtomicity
         , slo = [ S.Durability, S.S4 ]
         , ruling = [ "OI-1003-Q144", "OI-1003-Q102" ]
-        , codeSymbol = [ "apply_item" ]
-        , pending =
-          [ pending "landed::WorkspaceIntent"
-          , pending "landed::RefIntent"
-          , pending "converge::settle"
-          , pending "native_refs::settle"
-          , pending "estate.converge.* fault points"
-          , pending "converge::probe_exchange (the sweep)"
+        , codeSymbol =
+          [ "apply_item"
+          , "WorkspaceIntent"
+          , "RefIntent"
+          , "LandingIntent"
+          , "settle"
+          , "probe_exchange"
+          , "sweep_probes"
+          , "remove_intent_head_locks"
+          , "settle_repository"
+          , "publish_lock"
+          , "sweep_lock_temps"
+          , "ref_files"
+          , "Point"
           ]
-        , ptest = [ "P81", "the estate_converge fault-harness rows" ]
+        , pending = none
+        , ptest =
+          [ "P81"
+          , "the estate_converge fault-harness rows"
+          , "the_probe_sweep_removes_only_probe_files"
+          , "probe_files_a_crashed_pass_left_are_removed"
+          , "a_lock_bulkload_takes_holds_its_marker_from_the_moment_it_exists"
+          , "a_stash_store_syncs_its_reflog"
+          , "set_head_never_commits_head_without_its_branch"
+          ]
+        }
+      , { tla = Property.OneCheckout
+        , slo = [ S.S4 ]
+        , ruling = [ "OI-1003-Q144" ]
+        , codeSymbol =
+          [ "set_head", "branch_line_fails", "HeadLocks", "checked_out_by", "head_plan", "settle" ]
+        , pending = none
+        , ptest =
+          [ "set_head_never_puts_a_second_worktree_on_a_branch"
+          , "estate_converge_head_branch_double_checkout"
+          ]
         }
       , { tla = Property.ConvergesWhenQuiet
         , slo = [ S.S4, S.S5 ]
         , ruling = [ "OI-1003-Q144", "OI-1003-Q13" ]
-        , codeSymbol = [ "apply_item", "capture_item" ]
-        , pending = [ pending "converge::converge", pending "converge::head_plan" ]
-        , ptest = [ "P81", "P83" ]
+        , codeSymbol =
+          [ "apply_item", "capture_item", "converge", "head_plan", "left_branch" ]
+        , pending = none
+        , ptest = [ "P81", "P83", "the_branch_head_left_converges_with_it" ]
         }
       , { tla = Property.NoWedge
         , slo = [ S.S4 ]
         , ruling = [ "OI-1003-Q144" ]
-        , codeSymbol = [ "apply_item" ]
-        , pending =
-          [ pending "native_refs::plan (name conflicts)"
-          , pending "native_refs::transact (deletes first)"
-          , pending "converge::settle"
-          , pending "native_refs::finish (the names after the step)"
+        , codeSymbol =
+          [ "apply_item"
+          , "plan"
+          , "transact"
+          , "settle"
+          , "finish"
+          , "remove_stale_locks"
+          , "remove_orphan_packed_new"
+          , "recover_linked_landing"
+          , "branch_line_fails"
+          , "intent_branches"
+          , "after_intent"
+          , "remove_owned_lock"
           ]
-        , ptest = [ "P84", "the estate_converge fault-harness rows" ]
+        , pending = none
+        , ptest =
+          [ "P84"
+          , "the estate_converge fault-harness rows"
+          , "a_create_beside_a_delete_that_will_not_run_is_dropped"
+          , "a_file_turned_directory_settles_after_an_interrupted_converge"
+          , "a_pending_intents_head_branch_is_left_to_its_item"
+          , "estate_converge_linked_added"
+          , "an_empty_lock_is_never_removed_even_when_old"
+          , "an_orphan_packed_refs_new_is_removed_once_no_lock_holds_it"
+          , "a_create_beside_a_symbolic_ref_is_dropped"
+          , "a_killed_set_heads_lock_beside_a_pending_ref_intent_settles"
+          , "estate_converge_index_locked_fresh_lock"
+          , "estate_converge_after_ref_intent_packed_new"
+          ]
         }
       ]
 

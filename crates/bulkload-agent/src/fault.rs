@@ -275,15 +275,21 @@ pub enum Point {
     EstateConvergeIndexLocked,
     /// `estate.converge.after_index`
     EstateConvergeAfterIndex,
+    /// `estate.converge.head_branch`: `set_head` committed the HEAD
+    /// branch's transaction and not yet HEAD's (review 3 finding 13).
+    EstateConvergeHeadBranch,
     /// `estate.converge.after_head`
     EstateConvergeAfterHead,
     /// `estate.converge.after_landed`
     EstateConvergeAfterLanded,
+    /// `estate.converge.linked_added`: a first linked landing's `git
+    /// worktree add` done, its checkout and ledger not (#216's residual).
+    EstateConvergeLinkedAdded,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 38] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -318,8 +324,10 @@ impl Point {
         Self::EstateConvergeAfterSeat,
         Self::EstateConvergeIndexLocked,
         Self::EstateConvergeAfterIndex,
+        Self::EstateConvergeHeadBranch,
         Self::EstateConvergeAfterHead,
         Self::EstateConvergeAfterLanded,
+        Self::EstateConvergeLinkedAdded,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -360,8 +368,10 @@ impl Point {
             Self::EstateConvergeAfterSeat => "estate.converge.after_seat",
             Self::EstateConvergeIndexLocked => "estate.converge.index_locked",
             Self::EstateConvergeAfterIndex => "estate.converge.after_index",
+            Self::EstateConvergeHeadBranch => "estate.converge.head_branch",
             Self::EstateConvergeAfterHead => "estate.converge.after_head",
             Self::EstateConvergeAfterLanded => "estate.converge.after_landed",
+            Self::EstateConvergeLinkedAdded => "estate.converge.linked_added",
         }
     }
 

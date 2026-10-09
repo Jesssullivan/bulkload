@@ -528,3 +528,612 @@ fn the_stash_table() {
         (None, Some("stash-stale"))
     );
 }
+
+// ---- the ref step against a real repository (the convergence lane's fixes,
+// 2026-10-09; EstateConverge.tla's mutations named per test) -----------------
+
+/// A repository with commits `A` and `B` on `main`, `main` at `B`, and a
+/// branch `topic` at `A`; the ledger directory of SOURCE `neo`.
+struct Repo {
+    _dir: tempfile::TempDir,
+    path: std::path::PathBuf,
+    ledgers: std::path::PathBuf,
+    a: String,
+    b: String,
+}
+
+fn run(repo: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+        ])
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
+}
+
+impl Repo {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::fs::canonicalize(dir.path()).unwrap().join("repo");
+        std::fs::create_dir(&path).unwrap();
+        run(&path, &["init", "--quiet", "--template=", "-b", "main"]);
+        std::fs::write(path.join("f"), b"a\n").unwrap();
+        run(&path, &["add", "f"]);
+        run(&path, &["commit", "--quiet", "-m", "A"]);
+        let a = run(&path, &["rev-parse", "HEAD"]);
+        run(&path, &["branch", "topic"]);
+        std::fs::write(path.join("f"), b"b\n").unwrap();
+        run(&path, &["commit", "--quiet", "-am", "B"]);
+        let b = run(&path, &["rev-parse", "HEAD"]);
+        let ledgers = super::super::landed::ensure_dir(&path.join(".git"), "neo").unwrap();
+        Self {
+            _dir: dir,
+            path,
+            ledgers,
+            a,
+            b,
+        }
+    }
+
+    fn value(&self, name: &str) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .args(["-C"])
+            .arg(&self.path)
+            .args(["rev-parse", "-q", "--verify", name])
+            .output()
+            .unwrap();
+        out.status
+            .success()
+            .then(|| String::from_utf8(out.stdout).unwrap().trim().to_owned())
+    }
+
+    /// A pending ref intent of `ops` (and `stash`), as a crash leaves it.
+    fn intent(&self, ops: Vec<RefOp>, stash: Option<StashOp>, stash_at: Option<Vec<String>>) {
+        let ledger = RefLedger {
+            created: true,
+            ..RefLedger::default()
+        };
+        super::super::landed::write(
+            &self.ledgers.join(super::super::landed::REFS_INTENT),
+            &RefIntent {
+                ops,
+                stash,
+                ledger,
+                stash_at,
+            },
+        )
+        .unwrap();
+    }
+
+    fn pending(&self) -> bool {
+        self.ledgers
+            .join(super::super::landed::REFS_INTENT)
+            .exists()
+    }
+}
+
+fn op(name: &str, old: Option<&str>, new: Option<&str>) -> RefOp {
+    RefOp {
+        name: name.to_owned(),
+        old: old.map(str::to_owned),
+        new: new.map(str::to_owned),
+        before: None,
+        after: new.map(|value| live(value, 2)),
+    }
+}
+
+/// The blocker (review 3 finding 10; mutation `settle_moves_checked_out`):
+/// a ref intent pending from a crash moves `topic`; the operator then
+/// checks `topic` out. The settle must not move it under the operator's
+/// HEAD: its row is restored and it is reported checked out elsewhere.
+/// Before the fix `finish` redid the op and moved the branch.
+#[test]
+fn a_settle_never_moves_a_branch_checked_out_since_the_crash() {
+    let repo = Repo::new();
+    repo.intent(
+        vec![op("refs/heads/topic", Some(&repo.a), Some(&repo.b))],
+        None,
+        None,
+    );
+    run(&repo.path, &["switch", "--quiet", "topic"]);
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(repo.value("refs/heads/topic"), Some(repo.a.clone()));
+    assert_eq!(run(&repo.path, &["rev-parse", "HEAD"]), repo.a);
+    assert_eq!(custody.0.get("ref-checked-out-elsewhere"), Some(&1));
+    assert!(!repo.pending());
+}
+
+/// Review 3 findings 2 and 10 (mutations `txn_no_symref_verify`,
+/// `rebase_unguarded`): a transaction refuses an op on a branch some
+/// worktree has checked out, or holds for a rebase or bisect, read under
+/// every worktree's HEAD lock; and a HEAD another writer has locked (a
+/// `git switch` in progress) refuses it too. Before the fix the
+/// transaction checked nothing and moved the branch.
+#[test]
+fn a_transaction_never_moves_a_checked_out_or_held_branch() {
+    let repo = Repo::new();
+    let ops = [op("refs/heads/topic", Some(&repo.a), Some(&repo.b))];
+    // Checked out by a linked worktree.
+    let linked = repo.path.with_file_name("linked");
+    run(
+        &repo.path,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            linked.to_str().unwrap(),
+            "topic",
+        ],
+    );
+    assert_eq!(
+        transact(&repo.path, &ops).unwrap_err(),
+        BulkloadRefusal::GitConvergeInterrupted
+    );
+    assert_eq!(repo.value("refs/heads/topic"), Some(repo.a.clone()));
+    // Held by a bisect started on it (its HEAD is still on it here), then
+    // by a bisect alone once the worktree is detached.
+    run(&linked, &["bisect", "start"]);
+    run(&linked, &["switch", "--quiet", "--detach"]);
+    assert_eq!(
+        transact(&repo.path, &ops).unwrap_err(),
+        BulkloadRefusal::GitConvergeInterrupted
+    );
+    run(&linked, &["bisect", "reset", "HEAD"]);
+    // Free now, but another writer holds the linked worktree's HEAD.
+    let lock = repo.path.join(".git/worktrees/linked/HEAD.lock");
+    std::fs::write(&lock, b"").unwrap();
+    assert_eq!(
+        transact(&repo.path, &ops).unwrap_err(),
+        BulkloadRefusal::GitConvergeInterrupted
+    );
+    assert_eq!(repo.value("refs/heads/topic"), Some(repo.a.clone()));
+    assert!(lock.exists(), "another writer's lock is never removed");
+    std::fs::remove_file(&lock).unwrap();
+    transact(&repo.path, &ops).unwrap();
+    assert_eq!(repo.value("refs/heads/topic"), Some(repo.b.clone()));
+    // Every HEAD lock this process took is gone.
+    assert!(!repo.path.join(".git/HEAD.lock").exists());
+    assert!(!lock.exists());
+}
+
+/// Review 3 finding 1 (mutation `finish_after_all_deletes`): o/x -> o/x/y
+/// with the operator moving o/x while the ref intent is pending. The
+/// delete of o/x will not run, so the create of o/x/y beside it is dropped
+/// (`ref-name-conflict`), not retried forever. Before the fix `finish`
+/// counted every delete as run and refused on every rerun.
+#[test]
+fn a_create_beside_a_delete_that_will_not_run_is_dropped() {
+    let repo = Repo::new();
+    run(&repo.path, &["update-ref", "refs/remotes/o/x", &repo.a]);
+    repo.intent(
+        vec![
+            op("refs/remotes/o/x", Some(&repo.a), None),
+            op("refs/remotes/o/x/y", None, Some(&repo.a)),
+        ],
+        None,
+        None,
+    );
+    run(&repo.path, &["update-ref", "refs/remotes/o/x", &repo.b]);
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(repo.value("refs/remotes/o/x"), Some(repo.b.clone()));
+    assert_eq!(repo.value("refs/remotes/o/x/y"), None);
+    assert_eq!(custody.0.get("ref-name-conflict"), Some(&1));
+    assert_eq!(custody.0.get("ref-modified-at-destination"), Some(&1));
+    assert!(!repo.pending());
+}
+
+/// The earlier report's finding 3 and review 3 finding 8 (mutation
+/// `stale_lock_kept`): a Git child killed inside its transaction leaves
+/// `<ref>.lock` (holding the new value) or `refs/stash.lock`; the settle
+/// removes a lock whose content proves it bulkload's and finishes the
+/// intent. A lock that is not provably bulkload's stays, and the settle
+/// refuses typed. Before the fix nothing removed the lock: every settle
+/// refused, and a killed stash store cleared the stash row.
+#[test]
+fn a_settle_removes_a_killed_childs_lock_and_keeps_anyone_elses() {
+    let repo = Repo::new();
+    let lock = repo.path.join(".git/refs/heads/topic.lock");
+    // Someone else's lock (another value): kept, the settle refuses typed.
+    repo.intent(
+        vec![op("refs/heads/topic", Some(&repo.a), Some(&repo.b))],
+        None,
+        None,
+    );
+    std::fs::write(&lock, format!("{}\n", repo.a)).unwrap();
+    assert_eq!(
+        settle(&repo.path, &repo.ledgers).unwrap_err(),
+        BulkloadRefusal::GitConvergeInterrupted
+    );
+    assert!(lock.exists());
+    assert!(repo.pending());
+    // The killed child's own lock: its new value.
+    std::fs::write(&lock, format!("{}\n", repo.b)).unwrap();
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert!(!lock.exists());
+    assert_eq!(repo.value("refs/heads/topic"), Some(repo.b.clone()));
+    assert_eq!(custody.0.get("git-lock-removed"), Some(&1));
+    assert!(!repo.pending());
+    // A killed stash store: refs/stash.lock holding the entry it stored.
+    std::fs::write(repo.path.join("f"), b"stashed\n").unwrap();
+    run(&repo.path, &["stash", "push", "--quiet", "-m", "s"]);
+    let entry = repo.value("refs/stash").unwrap();
+    run(&repo.path, &["stash", "drop", "--quiet"]);
+    repo.intent(
+        Vec::new(),
+        Some(StashOp {
+            old: Vec::new(),
+            new: vec![entry.clone()],
+            messages: vec!["On main: s".to_owned()],
+            observed_ns: 2,
+        }),
+        None,
+    );
+    let stash_lock = repo.path.join(".git/refs/stash.lock");
+    std::fs::write(&stash_lock, format!("{entry}\n")).unwrap();
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert!(!stash_lock.exists());
+    assert_eq!(stash_reflog(&repo.path).unwrap(), vec![entry]);
+    assert_eq!(custody.0.get("stash-modified-at-destination"), None);
+}
+
+/// The earlier report's finding 4 (mutation `stash_settle_any_suffix`): a
+/// stash op pending from a crash, and the operator drops an entry. The
+/// settle continues the stash only from the reflog its intent records as
+/// reached, or one store past it; the drop is kept and reported. Before
+/// the fix a settle continued from any suffix of the new order and stored
+/// the dropped entry again.
+#[test]
+fn a_stash_settle_never_undoes_an_operators_drop() {
+    let repo = Repo::new();
+    let mut entries = Vec::new();
+    for message in ["one", "two"] {
+        std::fs::write(repo.path.join("f"), message).unwrap();
+        run(&repo.path, &["stash", "push", "--quiet", "-m", message]);
+        entries.insert(0, repo.value("refs/stash").unwrap());
+    }
+    // The destination holds [one]; the capture appends two: [two, one].
+    run(&repo.path, &["stash", "drop", "--quiet", "stash@{0}"]);
+    let (one, two) = (entries[1].clone(), entries[0].clone());
+    let stash = StashOp {
+        old: vec![one.clone()],
+        new: vec![two.clone(), one.clone()],
+        messages: vec!["On main: two".to_owned(), "On main: one".to_owned()],
+        observed_ns: 2,
+    };
+    assert_eq!(
+        stash_path(&stash),
+        vec![vec![one.clone()], vec![two.clone(), one.clone()]]
+    );
+    repo.intent(Vec::new(), Some(stash), None);
+    // The operator drops `one` after the crash: the reflog is empty.
+    run(&repo.path, &["stash", "drop", "--quiet"]);
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(stash_reflog(&repo.path).unwrap(), Vec::<String>::new());
+    assert_eq!(custody.0.get("stash-modified-at-destination"), Some(&1));
+    // The row names what bulkload last landed, so the next capture's
+    // decision keeps the operator's empty stash too (with no row, an empty
+    // stash read as never restored and was restored again).
+    let row = super::super::landed::read::<RefLedger>(
+        &repo.ledgers.join(super::super::landed::REFS_LANDED),
+    )
+    .unwrap()
+    .unwrap()
+    .stash;
+    assert_eq!(
+        row.as_ref().map(|row| row.order.clone()),
+        Some(vec![one.clone()])
+    );
+    let carried = [
+        (two.clone(), "On main: two".to_owned()),
+        (one.clone(), "On main: one".to_owned()),
+    ];
+    assert_eq!(
+        stash_decision(&[], row.as_ref(), &carried, 3),
+        (None, Some("stash-modified-at-destination"))
+    );
+    // A crash between a store and its progress record: the reflog is one
+    // store past the progress, and the settle goes on from there.
+    let rewrite = StashOp {
+        old: Vec::new(),
+        new: vec![two.clone(), one.clone()],
+        messages: vec!["On main: two".to_owned(), "On main: one".to_owned()],
+        observed_ns: 2,
+    };
+    run(
+        &repo.path,
+        &["update-ref", "--create-reflog", "refs/stash", &one],
+    );
+    repo.intent(Vec::new(), Some(rewrite.clone()), None);
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(
+        stash_reflog(&repo.path).unwrap(),
+        vec![two.clone(), one.clone()]
+    );
+    assert_eq!(custody.0.get("stash-modified-at-destination"), None);
+    // Its progress past [one], and the operator drops back to [one]: an
+    // earlier state bulkload landed is no edit, and the store is made again.
+    run(&repo.path, &["stash", "drop", "--quiet"]);
+    repo.intent(Vec::new(), Some(rewrite), Some(vec![one.clone()]));
+    settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(stash_reflog(&repo.path).unwrap(), vec![two, one]);
+}
+
+/// Review 3 finding 7 (mutation `refs_unsynced`): the directories a ref
+/// write's renames changed, synced before any ledger names the write.
+#[test]
+fn a_ref_write_syncs_the_directories_its_renames_changed() {
+    let (git_dir, common) = (Path::new("/r/.git/worktrees/w"), Path::new("/r/.git"));
+    let dirs = ref_dirs(git_dir, common, &["refs/heads/a/b", "HEAD"]);
+    for expected in [
+        "/r/.git",
+        "/r/.git/refs/heads/a",
+        "/r/.git/logs/refs/heads/a",
+        "/r/.git/worktrees/w",
+        "/r/.git/worktrees/w/logs",
+    ] {
+        assert!(dirs.contains(Path::new(expected)), "{expected}: {dirs:?}");
+    }
+}
+
+// ---- review 4 (2026-10-09, later) --------------------------------------------
+
+/// Set `path`'s modification time an hour back, as a lock a killed child
+/// left long ago.
+fn age(path: &Path) {
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let past = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
+    file.set_times(std::fs::FileTimes::new().set_modified(past))
+        .unwrap();
+}
+
+/// Review 4 (mutation `empty_lock_removed`): an empty lock is never
+/// provably bulkload's. A live `update-ref --stdin` session that has
+/// prepared a delete holds `packed-refs.lock` and the delete's own lock,
+/// both empty, for as long as it likes; a settle whose intent deletes must
+/// leave them and refuse typed. Before the fix an empty lock older than one
+/// timestamp tick was removed, and two writers then raced on packed-refs.
+#[test]
+fn an_empty_lock_is_never_removed_even_when_old() {
+    use std::io::Write as _;
+    let repo = Repo::new();
+    run(&repo.path, &["update-ref", "refs/remotes/o/x", &repo.a]);
+    run(&repo.path, &["update-ref", "refs/heads/z", &repo.a]);
+    repo.intent(
+        vec![op("refs/remotes/o/x", Some(&repo.a), None)],
+        None,
+        None,
+    );
+    let mut live = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(&repo.path)
+        .args(["update-ref", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = live.stdin.take().unwrap();
+    stdin
+        .write_all(format!("start\ndelete refs/heads/z {}\nprepare\n", repo.a).as_bytes())
+        .unwrap();
+    stdin.flush().unwrap();
+    let packed = repo.path.join(".git/packed-refs.lock");
+    let started = std::time::Instant::now();
+    while !packed.exists() {
+        assert!(started.elapsed() < std::time::Duration::from_mins(1));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Older than one timestamp tick, as the code before the fix required.
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    assert_eq!(
+        settle(&repo.path, &repo.ledgers).unwrap_err(),
+        BulkloadRefusal::GitConvergeInterrupted
+    );
+    assert!(packed.exists(), "a live writer's packed-refs.lock is kept");
+    assert!(repo.path.join(".git/refs/heads/z.lock").exists());
+    assert!(repo.pending());
+    // The live session commits; the settle then goes through.
+    stdin.write_all(b"commit\n").unwrap();
+    drop(stdin);
+    assert!(live.wait().unwrap().success());
+    assert_eq!(repo.value("refs/heads/z"), None);
+    settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(repo.value("refs/remotes/o/x"), None);
+    assert!(!repo.pending());
+    // A killed delete's lock: empty and old. It stays, and the settle
+    // refuses typed until the operator removes it, as Git instructs.
+    run(&repo.path, &["update-ref", "refs/remotes/o/x", &repo.a]);
+    repo.intent(
+        vec![op("refs/remotes/o/x", Some(&repo.a), None)],
+        None,
+        None,
+    );
+    let lock = repo.path.join(".git/refs/remotes/o/x.lock");
+    std::fs::write(&lock, b"").unwrap();
+    age(&lock);
+    assert_eq!(
+        settle(&repo.path, &repo.ledgers).unwrap_err(),
+        BulkloadRefusal::GitConvergeInterrupted
+    );
+    assert!(lock.exists());
+    std::fs::remove_file(&lock).unwrap();
+    settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(repo.value("refs/remotes/o/x"), None);
+}
+
+/// Review 4 (mutation `packed_new_kept`): a killed delete of a packed ref
+/// leaves `packed-refs.lock` (empty) and `packed-refs.new`. The lock is not
+/// provably bulkload's and stays; once it is gone (the operator removed it,
+/// as Git instructs), the settle removes the orphan `packed-refs.new`,
+/// which Git creates exclusively, and goes through. Before the fix it
+/// stayed, and every rerun's delete failed on it.
+#[test]
+fn an_orphan_packed_refs_new_is_removed_once_no_lock_holds_it() {
+    let repo = Repo::new();
+    run(&repo.path, &["update-ref", "refs/remotes/o/x", &repo.a]);
+    run(&repo.path, &["pack-refs", "--all"]);
+    repo.intent(
+        vec![op("refs/remotes/o/x", Some(&repo.a), None)],
+        None,
+        None,
+    );
+    let (lock, new) = (
+        repo.path.join(".git/packed-refs.lock"),
+        repo.path.join(".git/packed-refs.new"),
+    );
+    std::fs::write(&lock, b"").unwrap();
+    std::fs::write(&new, b"# pack-refs with: peeled fully-peeled sorted \n").unwrap();
+    age(&lock);
+    age(&new);
+    assert_eq!(
+        settle(&repo.path, &repo.ledgers).unwrap_err(),
+        BulkloadRefusal::GitConvergeInterrupted
+    );
+    assert!(lock.exists() && new.exists());
+    let _ = std::fs::remove_file(&lock);
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert!(!new.exists());
+    assert_eq!(repo.value("refs/remotes/o/x"), None);
+    assert_eq!(custody.0.get("git-lock-removed"), Some(&1));
+    assert!(!repo.pending());
+}
+
+/// Review 4 (mutation `lock_written_after_create`): a lock bulkload takes
+/// (every worktree's `HEAD.lock`, the index lock) holds its marker from the
+/// moment its name exists, so no power loss can leave it empty (an empty
+/// lock is not provably bulkload's, and wedged every rerun). Before the fix
+/// the lock was created, then written, never synced. A temporary a crash
+/// left before publishing is bulkload's and swept.
+#[test]
+fn a_lock_bulkload_takes_holds_its_marker_from_the_moment_it_exists() {
+    let repo = Repo::new();
+    let linked = repo.path.with_file_name("linked");
+    run(
+        &repo.path,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            linked.to_str().unwrap(),
+            "topic",
+        ],
+    );
+    let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let record = std::rc::Rc::clone(&seen);
+    LOCK_VISIBLE.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |lock: &Path| {
+            record
+                .borrow_mut()
+                .push((lock.to_path_buf(), std::fs::read(lock).unwrap()));
+        }));
+    });
+    let held = HeadLocks::take(&repo.path).unwrap();
+    LOCK_VISIBLE.with(|hook| *hook.borrow_mut() = None);
+    let seen = seen.borrow().clone();
+    assert_eq!(seen.len(), 2, "{seen:?}");
+    for (lock, content) in &seen {
+        assert_eq!(content.as_slice(), HEAD_LOCK_MARKER, "{}", lock.display());
+    }
+    // Held: a second taker refuses, and nothing of its attempt is left.
+    assert_eq!(
+        HeadLocks::take(&repo.path).unwrap_err(),
+        BulkloadRefusal::GitConvergeInterrupted
+    );
+    drop(held);
+    let git_dir = repo.path.join(".git");
+    let leftovers = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(LOCK_TEMP_PREFIX)
+            })
+            .count()
+    };
+    assert_eq!(leftovers(&git_dir), 0);
+    assert!(!git_dir.join("HEAD.lock").exists());
+    // A temporary a crash left between writing and publishing: swept.
+    std::fs::write(
+        git_dir.join(format!("{LOCK_TEMP_PREFIX}1-0")),
+        HEAD_LOCK_MARKER,
+    )
+    .unwrap();
+    assert_eq!(sweep_lock_temps(&git_dir).unwrap(), 1);
+    assert_eq!(leftovers(&git_dir), 0);
+}
+
+/// Review 4 (mutation `stash_reflog_unsynced`): a stash store's reflog,
+/// which `update-ref` appends to and never syncs, is synced with the
+/// directories before any record names the store; no other reflog is read
+/// back, so no other is synced.
+#[test]
+fn a_stash_store_syncs_its_reflog() {
+    let common = Path::new("/r/.git");
+    assert_eq!(
+        ref_files(common, &["refs/stash"]),
+        vec![PathBuf::from("/r/.git/logs/refs/stash")]
+    );
+    assert!(ref_files(common, &["refs/heads/a", "HEAD"]).is_empty());
+}
+
+/// Review 4 (finding 7 of the review; mutation `symref_names_unplanned`): a
+/// create beside an operator's symbolic ref (`refs/heads/alias` ->
+/// `refs/heads/main`, then the source's `alias/x`) is dropped
+/// (`ref-name-conflict`), in the plan and in a settle, never retried
+/// forever. Before the fix the symbolic name was not among the names after
+/// the step, and update-ref failed on every pass.
+#[test]
+fn a_create_beside_a_symbolic_ref_is_dropped() {
+    let repo = Repo::new();
+    run(
+        &repo.path,
+        &["symbolic-ref", "refs/heads/alias", "refs/heads/main"],
+    );
+    let (native, symbolic) = native_refs(&repo.path).unwrap();
+    let carried: BTreeMap<String, String> =
+        [("refs/heads/alias/x".to_owned(), repo.a.clone())].into();
+    let planned = plan_names(
+        &native,
+        &RefLedger {
+            created: true,
+            ..RefLedger::default()
+        },
+        &carried,
+        2,
+        &symbolic,
+        (&symbolic, None),
+    );
+    assert!(planned.ops.is_empty(), "{:?}", planned.ops);
+    assert_eq!(planned.custody.0.get("ref-name-conflict"), Some(&1));
+    repo.intent(
+        vec![op("refs/heads/alias/x", None, Some(&repo.a))],
+        None,
+        None,
+    );
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(custody.0.get("ref-name-conflict"), Some(&1));
+    assert_eq!(repo.value("refs/heads/alias/x"), None);
+    assert!(!repo.pending());
+}
