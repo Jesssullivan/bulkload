@@ -57,7 +57,7 @@ power=${STUB_POWER:-ac}
 sealed=$(cat "$2"/* 2>/dev/null | cksum | cut -d' ' -f1)
 echo "benchmark revision=r durability=group seal_primitive=${STUB_SEAL:-fsync} rclone_version=\\"${STUB_RCLONE:-rclone v1.74.4}\\" sealed_corpus_blake3=s$sealed"
 echo "sample sequence=0 arm=Native phase=initial elapsed_ms=100.0 workload_bytes=1000 transferred_content_bytes=900 source_bytes_read=1000 power=$power load1=1.00 gated=$gated"
-echo "native_timing sequence=0 phase=initial scope=s walk_ns=50 walk_ahead_wait_ns=20 queue_wait_ns=1"
+echo "native_timing sequence=0 phase=initial scope=s walk_ns=50 walk_ahead_wait_ns=20 queue_wait_ns=1 recv_setup_ns=10000000 recv_stream_ns=80000000 recv_tail_ns=6000000 recv_drain_ns=30000000 recv_first_data_ns=4000000"
 echo "native_counters sequence=0 phase=initial scope=s flush_barrier_ns=10000000 flush_full_ns=5000000 flush_dir_ns=0 files_materialized=10"
 echo "sample sequence=1 arm=Rclone phase=initial elapsed_ms=80.0 workload_bytes=1000 transferred_content_bytes=unknown source_bytes_read=unknown power=$power load1=1.00 gated=$gated"
 echo "rclone_sync sequence=1 phase=initial sync_ms=30.000 timed=false"
@@ -142,6 +142,19 @@ class ParseTests(unittest.TestCase):
             {"initial": {"native_ms": 100.0, "rclone_synced_ms": 110.0}},
         )
         self.assertEqual(summary["bench_medians"]["initial"]["rclone_ms"], 80.0)
+        # The timeline and its drain and ramp (OI-1003-Q143 step 1a) are known
+        # keys, and setup + stream + tail cover 96 of the 100 ms; the drain
+        # and ramp lie inside the stream and are never added to the cover.
+        for key in ("recv_drain_ns", "recv_first_data_ns"):
+            self.assertNotIn(key, summary["new_timing_keys"])
+        self.assertEqual(summary["new_timing_keys"], ["walk_ahead_wait_ns"])
+        timeline = summary["receive_timeline"]["initial"]
+        self.assertAlmostEqual(timeline["recv_drain_ms_median"], 30.0)
+        self.assertAlmostEqual(timeline["recv_first_data_ms_median"], 4.0)
+        self.assertAlmostEqual(timeline["recv_setup_ms_median"], 10.0)
+        self.assertAlmostEqual(timeline["cover_share_of_wall_median"], 0.96)
+        self.assertEqual(timeline["samples"], 1)
+        self.assertNotIn("delta", summary["receive_timeline"])
 
 
 MAINS_ON = {"name": "ADP1", "type": "Mains", "online": "1"}

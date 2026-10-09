@@ -275,6 +275,18 @@ KNOWN_TIMING = {
     "recv_setup_ns",
     "recv_stream_ns",
     "recv_tail_ns",
+    # Inside the stream: the final drain and the first-data ramp
+    # (OI-1003-Q143 step 1a).
+    "recv_drain_ns",
+    "recv_first_data_ns",
+    # The receive workers and the sending thread's wire writes
+    # (OI-1003-Q143 item 3, #217 review): worker-summed verify and writes,
+    # the receiving thread's wait on them, and the sender blocked on the
+    # wire.
+    "recv_worker_verify_ns",
+    "recv_worker_place_ns",
+    "recv_pool_wait_ns",
+    "send_write_ns",
     "publish_groups",
     "sqlite_commits",
     "sqlite_commit_ns",
@@ -997,6 +1009,54 @@ def median(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
+# The receiving side's timeline (OI-1003-Q119) and, inside its stream, the
+# final drain and the first-data ramp (OI-1003-Q143 step 1a).
+TIMELINE_KEYS = (
+    "recv_setup_ns",
+    "recv_stream_ns",
+    "recv_tail_ns",
+    "recv_drain_ns",
+    "recv_first_data_ns",
+)
+# Setup, stream and tail are disjoint and cover `receive`; drain and
+# first-data lie inside the stream, so they are never added to the cover.
+TIMELINE_COVER = ("recv_setup_ns", "recv_stream_ns", "recv_tail_ns")
+
+
+def receive_timeline(parsed: dict[str, object]) -> dict[str, object]:
+    """Per phase, the native samples' timeline medians in ms, and the median
+    share of each sample's wall time that setup + stream + tail covers.
+    Phases whose rows predate the timeline are left out."""
+    out: dict[str, object] = {}
+    for phase in ("initial", "delta"):
+        rows = [
+            s
+            for s in parsed["samples"]
+            if s.get("arm") == "Native"
+            and s.get("phase") == phase
+            and all(k in s.get("timing", {}) for k in TIMELINE_COVER)
+        ]
+        if not rows:
+            continue
+        entry: dict[str, object] = {
+            k.removesuffix("_ns") + "_ms_median": median(
+                [float(s["timing"].get(k, 0)) / 1e6 for s in rows]
+            )
+            for k in TIMELINE_KEYS
+        }
+        entry["cover_share_of_wall_median"] = median(
+            [
+                sum(float(s["timing"][k]) for k in TIMELINE_COVER)
+                / (float(s["elapsed_ms"]) * 1e6)
+                for s in rows
+                if float(s["elapsed_ms"]) > 0
+            ]
+        )
+        entry["samples"] = len(rows)
+        out[phase] = entry
+    return out
+
+
 def summarize(parsed: dict[str, object]) -> dict[str, object]:
     natives = native_initial(parsed)
     rclones = [
@@ -1074,6 +1134,7 @@ def summarize(parsed: dict[str, object]) -> dict[str, object]:
             for k in walk_wait_keys
         },
         "new_timing_keys": sorted(timing_keys - KNOWN_TIMING),
+        "receive_timeline": receive_timeline(parsed),
         "all_gated": all(bool(s.get("gated")) for s in parsed["samples"]),
         "all_power_ac": all(s.get("power") == "ac" for s in parsed["samples"]),
         # The bench's own native-vs-rclone medians; under load (gated=false

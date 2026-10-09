@@ -48,6 +48,21 @@ std::thread_local! {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static FAIL_DIRECTORY_RECORDS_AFTER_COMMIT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+/// Test hook: while `on`, this thread's [`Store::record_directories_created`]
+/// commits its records and then reports `EIO`, as a COMMIT whose log fsync
+/// failed after its frames reached the disk would.
+#[cfg(test)]
+pub(crate) fn fail_directory_records_after_commit(on: bool) {
+    FAIL_DIRECTORY_RECORDS_AFTER_COMMIT.with(|flag| flag.set(on));
+}
+
+#[cfg(test)]
 fn inject_fault(point: PublishFault) -> Result<()> {
     if PUBLISH_FAULT.with(std::cell::Cell::get) == point {
         return Err(BulkloadRefusal::Io(None));
@@ -1169,32 +1184,83 @@ impl Store {
         ino: u64,
         mode: u32,
     ) -> Result<()> {
-        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })
-            .refuse_at("transfer_store::record_directory_created")?;
+        self.record_directories_created(&[(key, PendingDirectory { dev, ino, mode })])
+    }
+
+    /// Bind pending directories, each to the inode this state created for
+    /// it, in one transaction (OI-1003-Q143 item 2: one commit per level of
+    /// a batch of new directories). Traced as one commit of every record.
+    ///
+    /// # Errors
+    /// Refuses persistence failures; none is bound then.
+    pub fn record_directories_created(&self, records: &[(&[u8], PendingDirectory)]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let encoded = records
+            .iter()
+            .map(|(key, record)| {
+                postcard::to_stdvec(record)
+                    .refuse_at("transfer_store::record_directories_created")
+                    .map(|identity| (*key, identity))
+            })
+            .collect::<Result<Vec<_>>>()?;
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
-        let recorded = self
-            .conn
-            .execute(
-                "INSERT INTO directories VALUES (?1, ?2)
+        let recorded = self.in_transaction(|conn| {
+            for (key, identity) in &encoded {
+                conn.execute(
+                    "INSERT INTO directories VALUES (?1, ?2)
             ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                (key, identity),
-            )
-            .map_err(sqlite_error);
+                    (key, identity),
+                )
+                .map_err(sqlite_error)?;
+            }
+            Ok(())
+        });
         counters::sqlite_commit(Counter::SqliteDirectoryPending, started, &recorded);
         recorded?;
         #[cfg(feature = "io-trace")]
         self.trace_commit(|| {
-            vec![crate::io::trace::CommitRecord::DirectoryCreated {
-                key: key.to_vec(),
-                node: (dev, ino)
-                    .ne(&(0, 0))
-                    .then_some(crate::io::NodeId { dev, ino }),
-                mode,
-            }]
+            records
+                .iter()
+                .map(
+                    |(key, record)| crate::io::trace::CommitRecord::DirectoryCreated {
+                        key: key.to_vec(),
+                        node: (record.dev, record.ino)
+                            .ne(&(0, 0))
+                            .then_some(crate::io::NodeId {
+                                dev: record.dev,
+                                ino: record.ino,
+                            }),
+                        mode: record.mode,
+                    },
+                )
+                .collect()
         });
+        // A COMMIT that reports a failure although its frames reached the
+        // log (the WAL's fsync returns EIO; the frames recover on the next
+        // open): the caller must treat every record as possibly bound.
+        #[cfg(test)]
+        if FAIL_DIRECTORY_RECORDS_AFTER_COMMIT.with(std::cell::Cell::get) {
+            return Err(BulkloadRefusal::Io(Some(libc::EIO)));
+        }
         Ok(())
+    }
+
+    /// Run `body` in one `BEGIN IMMEDIATE` transaction, committed if it
+    /// succeeds and rolled back otherwise.
+    fn in_transaction(&self, body: impl FnOnce(&rusqlite::Connection) -> Result<()>) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(sqlite_error)?;
+        let done =
+            body(&self.conn).and_then(|()| self.conn.execute_batch("COMMIT").map_err(sqlite_error));
+        if done.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        done
     }
 
     /// The unfinished-directory record for `key`, if any.
@@ -1248,10 +1314,8 @@ impl Store {
             }
             bound
         };
-        for key in bound {
-            self.complete_directory(&key)?;
-        }
-        Ok(())
+        let keys: Vec<&[u8]> = bound.iter().map(Vec::as_slice).collect();
+        self.clear_directories(&keys)
     }
 
     /// Retire pending ownership after directory metadata is durable.
@@ -1259,19 +1323,68 @@ impl Store {
     /// # Errors
     /// Refuses persistence failures.
     pub fn complete_directory(&self, key: &[u8]) -> Result<()> {
+        self.complete_directories(&[key])
+    }
+
+    /// Retire the pending ownership of several directories whose final
+    /// modes are all durable, in one transaction (OI-1003-Q143 item 2).
+    /// Traced as one commit of a `DirectoryComplete` per key.
+    ///
+    /// # Errors
+    /// Refuses persistence failures; none is retired then.
+    pub fn complete_directories(&self, keys: &[&[u8]]) -> Result<()> {
+        self.delete_directories(keys, Counter::SqliteDirectoryComplete, true)
+    }
+
+    /// Clear directory records that complete nothing: a creation undone
+    /// before its directory was published, a record bound to a temporary
+    /// the sweep removes, a stale record. Clearing never vouches for a
+    /// directory, so it is traced apart from a completion (#217 review).
+    ///
+    /// # Errors
+    /// Refuses persistence failures.
+    pub fn clear_directory(&self, key: &[u8]) -> Result<()> {
+        self.clear_directories(&[key])
+    }
+
+    /// [`Store::clear_directory`] for several keys, in one transaction.
+    ///
+    /// # Errors
+    /// Refuses persistence failures; none is cleared then.
+    pub fn clear_directories(&self, keys: &[&[u8]]) -> Result<()> {
+        self.delete_directories(keys, Counter::SqliteDirectoryCleared, false)
+    }
+
+    fn delete_directories(&self, keys: &[&[u8]], counter: Counter, complete: bool) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
-        let completed = self
-            .conn
-            .execute("DELETE FROM directories WHERE key = ?1", [key])
-            .map_err(sqlite_error);
-        counters::sqlite_commit(Counter::SqliteDirectoryComplete, started, &completed);
-        completed?;
+        let deleted = self.in_transaction(|conn| {
+            for key in keys {
+                conn.execute("DELETE FROM directories WHERE key = ?1", [key])
+                    .map_err(sqlite_error)?;
+            }
+            Ok(())
+        });
+        counters::sqlite_commit(counter, started, &deleted);
+        deleted?;
         #[cfg(feature = "io-trace")]
         self.trace_commit(|| {
-            vec![crate::io::trace::CommitRecord::DirectoryComplete { key: key.to_vec() }]
+            keys.iter()
+                .map(|key| {
+                    if complete {
+                        crate::io::trace::CommitRecord::DirectoryComplete { key: key.to_vec() }
+                    } else {
+                        crate::io::trace::CommitRecord::DirectoryCleared { key: key.to_vec() }
+                    }
+                })
+                .collect()
         });
+        #[cfg(not(feature = "io-trace"))]
+        let _ = complete;
         Ok(())
     }
 }

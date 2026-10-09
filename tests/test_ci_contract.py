@@ -284,7 +284,7 @@ PINNED_JUST_RECIPES = {
             '    echo "resume-power-loss: cargo test failed with status $status" >&2',
             '    exit "$status"',
             "fi",
-            "proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads)",
+            "proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads a_level_crashed_after_its_commit_is_swept_and_its_records_cleared a_level_crashed_after_some_renames_adopts_the_renamed_and_makes_the_rest a_finish_crashed_after_some_seals_completes_every_directory_in_one_commit a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it)",
             "if [[ $(uname -s) == Linux ]]; then",
             "    proofs+=(a_batched_group_names_no_output_before_its_data_is_durable)",
             "fi",

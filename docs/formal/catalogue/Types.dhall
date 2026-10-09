@@ -515,7 +515,7 @@ let witnessSelf = \(w : Witness) -> merge witnessTable w
    module, with its own budget self-test first. The table is merged over the
    union, so a module added without an entry does not type-check.
 -}
-let Module = < BulkloadTransfer | GitCarry >
+let Module = < BulkloadTransfer | GitCarry | DirectoryRecords >
 
 {- How tla-check grounds a module's code symbols. Either way only a Rust
    source under crates/ outside a tests/ directory counts, never a data
@@ -550,6 +550,13 @@ let moduleTable =
         , spec = "GitCarry.tla"
         , tsv = "configs_gc.tsv"
         , symbols = SymbolMatch.definition
+        }
+      , DirectoryRecords =
+        { module = Module.DirectoryRecords
+        , index = 2
+        , spec = "DirectoryRecords.tla"
+        , tsv = "configs_dir.tsv"
+        , symbols = SymbolMatch.code
         }
       }
 

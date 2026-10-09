@@ -1,0 +1,31 @@
+# DirectoryRecords.tla's TLC configs, checked by `just tla-check` in this order (README.md, "Directory records").
+# Rendered from catalogue/Directories.dhall by `just tla-render`; edit the catalogue, not this file.
+# Tab-separated columns, as configs.tsv's:
+#   name            the config, MC_<name>.cfg
+#   expect          pass | fail | reach | inconclusive
+#   named-property  fail: the one property it must violate;
+#                   reach: the Witness_ invariant it must violate;
+#                   inconclusive: WithinBudget; otherwise all
+#   never           pass: the actions coverage must show never enabled,
+#                   comma-separated and sorted (- for none);
+#                   * for any other row (not checked)
+#   flags           extra TLC flags, one argv element per
+#                   space-separated word (- for none)
+name	expect	named-property	never	flags
+MC_dir_budget_selftest	inconclusive	WithinBudget	*	-
+MC_dir_per_dir	pass	all	Bind,FallbackMkdir,ForeignReplace,Intent	-
+MC_dir_batched	pass	all	Bind,FallbackMkdir,ForeignReplace,Intent	-
+MC_dir_batched_crashes	pass	all	Bind,FallbackMkdir,ForeignReplace,Intent	-
+MC_dir_foreign_replace	pass	all	Bind,FallbackMkdir,Intent	-
+MC_dir_fallback	pass	all	DiscardClear,DiscardUnlink,ForeignReplace,Mkdir,Record,Rename	-
+MC_dir_reach_partial_level	reach	Witness_PartialLevel	*	-
+MC_dir_reach_adopt_batched	reach	Witness_AdoptBatched	*	-
+MC_dir_neg_record_before_seal	fail	RecordNamesDirectory	*	-
+MC_dir_neg_rename_before_record	fail	NoStrandedDirectory	*	-
+MC_dir_neg_child_before_dirseal	fail	ChildImpliesNamed	*	-
+MC_dir_neg_complete_before_seal	fail	CompleteImpliesFinal	*	-
+MC_dir_neg_level_seals_one_parent	fail	RecordNamesDirectory	*	-
+MC_dir_neg_level_rename_seals_one_parent	fail	ChildImpliesNamed	*	-
+MC_dir_neg_adopt_unbound	fail	NeverAdoptForeign	*	-
+MC_dir_neg_discard_unlink_before_clear	fail	NeverAdoptForeign	*	-
+MC_dir_neg_admit_under_held	fail	NoDirectoryUnderTemporary	*	-

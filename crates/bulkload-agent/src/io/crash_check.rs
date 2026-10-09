@@ -1342,6 +1342,54 @@ impl<'a> View<'a> {
         out
     }
 
+    /// The inode at `rel`, if the path resolves.
+    #[must_use]
+    pub fn node_at(self, rel: &[u8]) -> Option<NodeId> {
+        let mut node = self.image.root;
+        for part in rel
+            .split(|byte| *byte == b'/')
+            .filter(|part| !part.is_empty())
+        {
+            let Node::Dir { entries, .. } = self.image.nodes.get(&node)? else {
+                return None;
+            };
+            node = *entries.get(part)?;
+        }
+        Some(node)
+    }
+
+    /// Every path beneath the root naming inode `node`, sorted.
+    ///
+    /// Where a directory record's inode is reached from the root, if it is
+    /// (#217 review: a record bound to a directory inside an orphaned
+    /// temporary).
+    #[must_use]
+    pub fn paths_of(self, node: NodeId) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut stack = vec![(Vec::new(), self.image.root, 0_usize)];
+        while let Some((path, at, depth)) = stack.pop() {
+            let Some(Node::Dir { entries, .. }) = self.image.nodes.get(&at) else {
+                continue;
+            };
+            if depth > 64 {
+                continue;
+            }
+            for (name, child) in entries {
+                let mut rel = path.clone();
+                if !rel.is_empty() {
+                    rel.push(b'/');
+                }
+                rel.extend_from_slice(name);
+                if *child == node {
+                    out.push(rel.clone());
+                }
+                stack.push((rel, *child, depth + 1));
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Whether inode `node` is reachable in this state: named by some entry.
     #[must_use]
     pub fn names(self, node: NodeId) -> bool {

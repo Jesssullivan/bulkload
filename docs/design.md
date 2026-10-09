@@ -908,6 +908,66 @@ data is durable before its intent is recorded and before its
 `RENAME_EXCHANGE`, and the second `syncfs` makes the exchanged entry durable
 before the commit that settles the intent.
 
+Write-back while the data streams (S1, OI-1003-Q143 item 1a, extending
+OI-1003-Q107). On Linux in group mode, an entry's staged file is kicked into
+write-back (`sync_file_range(WRITE)`, `io::durable::kick_writeback`) each
+time its placed bytes cross a multiple of 8 MiB: in the stream, and once
+right after a manifest's local fill, before `NeedChunks` goes out, so a
+delta's locally filled bytes are written back while the source captures the
+rest. A kick makes nothing durable, never moves a descriptor's errseq cursor
+(no `WAIT_AFTER`), and leaves every seal above unchanged; an error a kick
+returns refuses its entry (a full device as `DESTINATION_SPACE_INSUFFICIENT`).
+Each is counted (`writeback_kicks`). Strict mode and Darwin do not kick.
+
+Receive workers (S1, OI-1003-Q143 item 3). The destination verifies each
+data frame against its digest and writes it on a small pool of worker
+threads (`BULKLOAD_RECV_WORKERS`, default 2, at most the spare cores; 0 is
+the inline path). Every protocol decision stays on the receiving thread, in
+stream order: the credit check, the index, offset, size and manifest checks,
+the stage, `End`, `publish` and `Held`. Within one chunk the refusal order is
+fixed (its verify or size, then the stage, then the write, then the kick),
+the least chunk index wins, and the chunk that stages a streamed file is
+verified on the receiving thread first, so a corrupt first chunk stages
+nothing: the refusal is the inline path's. An entry's `End` waits for all
+its writes before the file is checked, published or discarded, so every
+write precedes its file's seal. The workers hold at most 8 MiB, each job
+charged at least 4 KiB; a worker that panics answers its job as lost and the
+session ends `WORKER_LOST`.
+
+Directory batching (S1, OI-1003-Q143 item 2, R-N102). New directories are
+created a level at a time: a tagged `mkdirat` each, one seal per distinct
+parent, one store commit binding every record of the level, an exclusive
+rename each, one seal per distinct parent again; finishing applies and seals
+every final mode deepest first, then completes them all in one commit. Each
+directory keeps its own order (entry sealed before its record, record
+before its name, name sealed before anything inside it is decided, mode
+sealed before its completion), so each recovers on its own, whatever the
+others' state. The walk is depth-first, so batching siblings defers their
+decisions: from the first new directory on, every walk frame is held, in
+stream order, until `WalkDone`, 64 members (fewer under a small descriptor
+budget: a level holds one descriptor per distinct parent) or 256 held
+frames, then the batch is created and every held frame decided as it would
+have been. A directory joins only when its parent is the root, a member or
+a directory decided before; one under a held, undecided directory (an
+existing one, whose sweep and adoption seal must come first) closes the
+batch before it is looked at, and so does a directory whose path the batch
+already holds (a source offering it twice), so no two members share a
+record's key. A member refused at its rename (a third party's directory
+appeared there) leaves its children to be decided against the file system,
+as without batching. A discarded creation clears its record before its
+temporary goes (#74 N3), a level whose shared seal or commit failed
+included (its commit may have reached the log although it reported a
+failure), and every clear is traced apart from a completion
+(`DirectoryCleared`). `docs/formal/DirectoryRecords.tla` checks
+the records under per-name power loss, journal seals and reused inode
+numbers (README, "Directory records").
+
+The two stores are opened at once (S1, OI-1003-Q143 item 1b): the
+destination sends `Open`, with its whole credit window, before it opens its
+own store, so the source opens its store meanwhile. Every overlap of a state
+root with the other state root or either root is refused before either store
+exists.
+
 The source ledger's rows are the one exception (WP0(g): OI-1003-Q20,
 adopted with conditions by OI-1003-Q37, built 2026-10-07 on OI-1003-Q104).
 The ledger is a cache of what the source already holds: a seat's row key

@@ -199,6 +199,10 @@ counters! {
     // A batched group seal: one `syncfs` per touched device (S1, Q107).
     FlushFs => "flush_fs_count",
     FlushFsNs => "flush_fs_ns",
+    // Write-back kicks of a staged file while its data still streams, one
+    // per 8 MiB placed (`sync_file_range(WRITE)`; S1, OI-1003-Q143 item
+    // 1a). Not a flush: nothing is durable by it.
+    WritebackKicks => "writeback_kicks",
     // Group commit (io::durable) and transport tuning.
     DurableGroups => "durable_groups",
     TransportTuned => "transport_buffers_raised",
@@ -210,6 +214,10 @@ counters! {
     SqliteRecordCapture => "sqlite_record_capture_commits",
     SqliteDirectoryPending => "sqlite_directory_pending_commits",
     SqliteDirectoryComplete => "sqlite_directory_complete_commits",
+    // Directory records cleared without completing their directory: a
+    // creation undone, a record of a swept temporary, a stale record
+    // (#217 review).
+    SqliteDirectoryCleared => "sqlite_directory_cleared_commits",
     // A superseding publish's record, written before its exchange, and a
     // record a crash left, settled by the next sweep (WP0(d), #187).
     SqliteSupersede => "sqlite_supersede_commits",
@@ -512,6 +520,7 @@ impl Counters {
             Counter::SqliteRecordCapture,
             Counter::SqliteDirectoryPending,
             Counter::SqliteDirectoryComplete,
+            Counter::SqliteDirectoryCleared,
             Counter::SqliteSupersede,
             Counter::SqliteRefusedOutput,
         ])

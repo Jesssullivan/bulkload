@@ -1944,6 +1944,9 @@ let constantNames =
 -- GitCarry.tla's part (OI-1003-Q43).
 let GitCarry = ./GitCarry.dhall
 
+-- DirectoryRecords.tla's part (OI-1003-Q143 item 2).
+let Directories = ./Directories.dhall
+
 let module = T.moduleEntry T.Module.BulkloadTransfer
 
 in  { files =
@@ -1954,6 +1957,7 @@ in  { files =
               (\(r : T.Row) -> { name = "${r.name}.cfg", text = cfgText r })
               rows
         # GitCarry.files
+        # Directories.files
     , grounding =
       [ { module = showConstructor module.module
         , spec = module.spec
@@ -1981,6 +1985,7 @@ in  { files =
         , labelSets = [] : List { name : Text, labels : List Text }
         }
       , GitCarry.grounding
+      , Directories.grounding
       ]
     , invariants
     , supersedeInvariants
@@ -1988,4 +1993,5 @@ in  { files =
     , gitCarryInvariants = GitCarry.invariants
     , gitCarryNversion = GitCarry.nversion
     , decide = GitCarry.decide
+    , directoryInvariants = Directories.invariants
     }

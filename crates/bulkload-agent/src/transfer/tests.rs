@@ -1230,8 +1230,9 @@ fn a_stream_past_the_chunk_bound_ends_the_session() {
     let mut open = 0;
     assert_eq!(
         streaming
-            .accept(&target, &mut open, &header, b"x", false)
-            .unwrap_err(),
+            .accept(&target, &mut open, &header, b"x".to_vec(), |_| false)
+            .err()
+            .unwrap(),
         BulkloadRefusal::BudgetExceeded
     );
     assert_eq!(streaming.specs.len(), MAX_MANIFEST_CHUNKS);
@@ -1980,6 +1981,40 @@ fn a_copy_moves_the_hand_off_timers() {
         "recv_read_ns=",
         "recv_settle_ns=",
         "recv_verify_ns=",
+    ] {
+        assert!(rendered.contains(key), "{rendered}");
+    }
+}
+
+/// S1 receiving-side timeline (OI-1003-Q119) and its drain and ramp
+/// (OI-1003-Q143 step 1a): a two-file copy moves setup, stream and tail, the
+/// final drain (the open group's commit, waited for in `settle_held`) and
+/// the first-data offset, and the rendering names each. The counters are
+/// process-wide and only grow, so other tests running at once cannot hide a
+/// timer this copy did not move; for the same reason no cross-timer bound is
+/// asserted here.
+#[test]
+fn a_copy_moves_the_timeline_timers() {
+    let corpus = Corpus::new();
+    std::fs::write(corpus.base.join("source/a"), noise(11, 2 << 20)).unwrap();
+    std::fs::write(corpus.base.join("source/b"), noise(12, 1 << 20)).unwrap();
+    let before = TransferTiming::snapshot();
+    let stats = corpus.run().unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert!(stats.bytes_received > 0);
+    let moved = TransferTiming::snapshot().since(before);
+    assert!(moved.recv_setup_ns > 0, "{}", moved.render());
+    assert!(moved.recv_stream_ns > 0, "{}", moved.render());
+    assert!(moved.recv_tail_ns > 0, "{}", moved.render());
+    assert!(moved.recv_drain_ns > 0, "{}", moved.render());
+    assert!(moved.recv_first_data_ns > 0, "{}", moved.render());
+    let rendered = moved.render();
+    for key in [
+        "recv_setup_ns=",
+        "recv_stream_ns=",
+        "recv_tail_ns=",
+        "recv_drain_ns=",
+        "recv_first_data_ns=",
     ] {
         assert!(rendered.contains(key), "{rendered}");
     }
@@ -2928,3 +2963,6 @@ fn a_recreated_source_store_adopts_from_capture_records() {
 
 // ---- WP0(g) (OI-1003-Q20, Q37, Q104): P79 RELAXED-LEDGER-LOSS --------------
 mod wp0g;
+
+// ---- S1 throughput (OI-1003-Q143 items 1 to 3, #217 review) ----------------
+mod throughput;

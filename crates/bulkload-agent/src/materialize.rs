@@ -237,6 +237,9 @@ pub struct Destination {
     unflushed: std::collections::HashMap<u64, File>,
     swept: Sweep,
     created: Creation,
+    /// The most new directories one batch creates together; 1 creates and
+    /// finishes each alone (OI-1003-Q143 item 2).
+    batch: usize,
     /// This store's orphaned file temporaries, kept for their chunks: bytes
     /// the destination already holds are not sent again within the session.
     /// Every one is indexed, however many: a session can leave up to a whole
@@ -285,9 +288,11 @@ impl Destination {
         let root = File::from(
             crate::io::sys::open_dir_path_nofollow(path).refuse_at("materialize::open")?,
         );
+        let path = std::fs::canonicalize(path).refuse_at("materialize::open")?;
         Ok(Self {
             root,
-            path: std::fs::canonicalize(path).refuse_at("materialize::open")?,
+            batch: directory_batch(&path),
+            path,
             tag: temporary_tag(&store.authority()?),
             store_device: std::fs::metadata(store.root())
                 .refuse_at("materialize::open")?
@@ -391,6 +396,13 @@ impl Destination {
         &self.created
     }
 
+    /// The most new directories one batch into this root creates together
+    /// (OI-1003-Q143 item 2); 1 when directories are not batched.
+    #[must_use]
+    pub const fn batch(&self) -> usize {
+        self.batch
+    }
+
     /// Canonical destination root for completion-store namespacing.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -460,6 +472,8 @@ impl Destination {
             }
         };
         fault_point!(DirectoryAfterPendingRecord);
+        #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+        before_directory_rename(&parent, leaf.as_bytes());
         if let Err(error) = crate::io::rename_exclusive(&parent, &temporary, &leaf) {
             discard_directory(&parent, &temporary, &key, store);
             if crate::io::rename_unsupported(&error) {
@@ -483,6 +497,264 @@ impl Destination {
             key,
         });
         Ok(())
+    }
+
+    /// Whether `row`'s leaf is free, so its directory would be created new:
+    /// its parent opens and holds nothing at the leaf. Any failure is
+    /// `false`: the directory is then decided alone, by
+    /// [`Destination::directory`], which refuses it as before.
+    pub(crate) fn directory_is_new(&self, row: &RowSchema) -> bool {
+        self.parent(&row.rel_path)
+            .and_then(|(parent, leaf)| stat_at(&parent, &leaf))
+            .is_ok_and(|found| found.is_none())
+    }
+
+    /// Create one level of a batch of new directories (OI-1003-Q143 item 2,
+    /// R-N102), each as [`Destination::directory`] creates one, with the
+    /// level's steps shared:
+    ///
+    /// 1. a tagged `mkdirat` per directory, and its `(dev, ino)`;
+    /// 2. one seal per distinct parent (a full flush off the store's
+    ///    device), so every temporary's entry is durable before
+    /// 3. one store commit binds every record to its inode;
+    /// 4. an exclusive rename per directory: a taken leaf refuses that
+    ///    directory `DESTINATION_OCCUPIED` and discards its temporary and
+    ///    record (the record cleared first, so a recycled inode never
+    ///    inherits it); a file system with no no-replace rename sends it
+    ///    through the `mkdirat` fallback (R-N119), as one alone would be;
+    /// 5. one seal per distinct parent holding a renamed directory, before
+    ///    any entry inside them is decided (#74 round 2, N1).
+    ///
+    /// Every row's leaf must be free (`directory_is_new`), or its parent a
+    /// directory of the level before, made by this batch. A failure of a
+    /// shared step refuses every directory it covers with the same code.
+    /// One descriptor is held per distinct parent of the level, so the
+    /// batch's size is bounded by the descriptor budget
+    /// ([`directory_batch`]).
+    #[allow(clippy::too_many_lines)] // One level's five steps, each per directory.
+    pub(crate) fn create_directories(
+        &mut self,
+        rows: &[&RowSchema],
+        store: &Store,
+        authority: &[u8],
+    ) -> Vec<Result<()>> {
+        struct Made {
+            at: usize,
+            parent: usize,
+            leaf: CString,
+            temporary: CString,
+            key: Vec<u8>,
+            mode: u32,
+            dev: u64,
+            ino: u64,
+        }
+        let mut outcomes: Vec<Option<Result<()>>> = vec![None; rows.len()];
+        let mut parents: Vec<(Vec<u8>, File)> = Vec::new();
+        let mut made: Vec<Made> = Vec::new();
+        for (at, row) in rows.iter().enumerate() {
+            let created = (|| -> Result<Made> {
+                let key = postcard::to_stdvec(&(authority, &row.rel_path))
+                    .refuse_at("materialize::create_directories")?;
+                let parent = self.level_parent(&row.rel_path, &mut parents)?;
+                let (path, handle) = parents.get(parent).ok_or(BulkloadRefusal::Io(None))?;
+                let leaf = cstring(
+                    row.rel_path
+                        .get(path.len()..)
+                        .map(|rest| rest.strip_prefix(b"/").unwrap_or(rest))
+                        .ok_or(BulkloadRefusal::PathEscapesRoot)?,
+                )?;
+                #[cfg(feature = "fault-injection")]
+                crate::fault::note_directory(Some("rename"));
+                let temporary = self.temporary(Some(DIRECTORY_MARK))?;
+                crate::io::sys::mkdirat(handle, &temporary, 0o700)
+                    .refuse_at("materialize::create_directories")?;
+                fault_point!(DirectoryAfterMkdir);
+                let metadata = open_dir(handle, &temporary)
+                    .and_then(|created| {
+                        created
+                            .metadata()
+                            .refuse_at("materialize::create_directories")
+                    })
+                    .inspect_err(|_| {
+                        // This level bound no record to it yet; a stale one
+                        // at its key is cleared as one alone would clear it.
+                        discard_directory(handle, &temporary, &key, store);
+                    })?;
+                Ok(Made {
+                    at,
+                    parent,
+                    leaf,
+                    temporary,
+                    key,
+                    mode: row.mode & 0o7777,
+                    dev: metadata.dev(),
+                    ino: metadata.ino(),
+                })
+            })();
+            match created {
+                Ok(one) => made.push(one),
+                Err(refusal) => {
+                    if let Some(slot) = outcomes.get_mut(at) {
+                        *slot = Some(Err(refusal));
+                    }
+                }
+            }
+        }
+        // One seal per distinct parent, then one commit for the level. A
+        // failure of either refuses every directory made so far and
+        // discards it as one alone is discarded (`discard_directory`): its
+        // key's record cleared first (a commit that reported a failure may
+        // still have bound it, and a stale record may sit at the key), then
+        // its temporary removed, so no record outlives its inode (#74 N3).
+        let mut sealed = vec![false; parents.len()];
+        let bound = made
+            .iter()
+            .try_for_each(|one| {
+                if sealed.get(one.parent) == Some(&false) {
+                    let (_, handle) = parents.get(one.parent).ok_or(BulkloadRefusal::Io(None))?;
+                    self.seal_entry(handle)?;
+                    if let Some(flag) = sealed.get_mut(one.parent) {
+                        *flag = true;
+                    }
+                }
+                Ok(())
+            })
+            .and_then(|()| {
+                let records: Vec<(&[u8], PendingDirectory)> = made
+                    .iter()
+                    .map(|one| {
+                        (
+                            one.key.as_slice(),
+                            PendingDirectory {
+                                dev: one.dev,
+                                ino: one.ino,
+                                mode: one.mode,
+                            },
+                        )
+                    })
+                    .collect();
+                store.record_directories_created(&records)
+            });
+        if let Err(refusal) = bound {
+            // Ignored on purpose, as in `discard_directory`: every directory
+            // is refused already, and what survives is swept later.
+            let keys: Vec<&[u8]> = made.iter().map(|one| one.key.as_slice()).collect();
+            let _ = store.clear_directories(&keys);
+            for one in &made {
+                if let Some((_, handle)) = parents.get(one.parent) {
+                    let _ = crate::io::sys::unlinkat(handle, &one.temporary, true);
+                }
+                if let Some(slot) = outcomes.get_mut(one.at) {
+                    *slot = Some(Err(refusal.clone()));
+                }
+            }
+            return outcomes
+                .into_iter()
+                .map(|outcome| outcome.unwrap_or(Err(BulkloadRefusal::Io(None))))
+                .collect();
+        }
+        if !made.is_empty() {
+            fault_point!(DirectoryAfterPendingRecord);
+        }
+        let mut renamed: Vec<Made> = Vec::new();
+        for one in made {
+            let Some((_, handle)) = parents.get(one.parent) else {
+                continue;
+            };
+            #[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+            before_directory_rename(handle, one.leaf.as_bytes());
+            match crate::io::rename_exclusive(handle, &one.temporary, &one.leaf) {
+                Ok(()) => {
+                    fault_point!(DirectoryAfterRename);
+                    renamed.push(one);
+                }
+                Err(error) => {
+                    discard_directory(handle, &one.temporary, &one.key, store);
+                    let outcome = if crate::io::rename_unsupported(&error) {
+                        match (rows.get(one.at), handle.try_clone()) {
+                            (Some(row), Ok(parent)) => {
+                                self.fallback_directory(row, &parent, &one.leaf, one.key, store)
+                            }
+                            (_, Err(error)) => {
+                                Err(crate::refuse::io(&error, "materialize::create_directories"))
+                            }
+                            (None, _) => Err(BulkloadRefusal::Io(None)),
+                        }
+                    } else if error.raw_os_error() == Some(libc::EEXIST) {
+                        Err(BulkloadRefusal::DestinationOccupied)
+                    } else {
+                        Err(crate::refuse::io(&error, "materialize::create_directories"))
+                    };
+                    if let Some(slot) = outcomes.get_mut(one.at) {
+                        *slot = Some(outcome);
+                    }
+                }
+            }
+        }
+        // Each renamed directory's parent is sealed before anything inside
+        // it is decided.
+        let mut resealed: Vec<Option<Result<()>>> = vec![None; parents.len()];
+        for one in renamed {
+            let sealed = if let Some(Some(sealed)) = resealed.get(one.parent) {
+                sealed.clone()
+            } else {
+                let sealed = parents
+                    .get(one.parent)
+                    .ok_or(BulkloadRefusal::Io(None))
+                    .and_then(|(_, handle)| {
+                        crate::io::durable::seal_dir(handle)
+                            .refuse_at("materialize::create_directories")?;
+                        self.note_unflushed(
+                            handle
+                                .try_clone()
+                                .refuse_at("materialize::create_directories")?,
+                        );
+                        Ok(())
+                    });
+                if let Some(slot) = resealed.get_mut(one.parent) {
+                    *slot = Some(sealed.clone());
+                }
+                sealed
+            };
+            if sealed.is_ok() {
+                self.created.renamed += 1;
+                if let Some(row) = rows.get(one.at) {
+                    self.directories.push(OwnedDirectory {
+                        path: row.rel_path.clone(),
+                        mode: one.mode,
+                        dev: one.dev,
+                        ino: one.ino,
+                        key: one.key,
+                    });
+                }
+            }
+            if let Some(slot) = outcomes.get_mut(one.at) {
+                *slot = Some(sealed);
+            }
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| outcome.unwrap_or(Err(BulkloadRefusal::Io(None))))
+            .collect()
+    }
+
+    /// The index in `parents` of `path`'s parent directory, opened once per
+    /// level.
+    fn level_parent(&self, path: &[u8], parents: &mut Vec<(Vec<u8>, File)>) -> Result<usize> {
+        let directory = path
+            .iter()
+            .rposition(|byte| *byte == b'/')
+            .and_then(|end| path.get(..end))
+            .unwrap_or_default();
+        if let Some(at) = parents
+            .iter()
+            .position(|(at, _)| at.as_slice() == directory)
+        {
+            return Ok(at);
+        }
+        let (parent, _) = self.parent(path)?;
+        parents.push((directory.to_vec(), parent));
+        Ok(parents.len() - 1)
     }
 
     /// Seal `parent`'s entries ahead of a record that depends on them, with a
@@ -526,7 +798,7 @@ impl Destination {
         crate::fault::note_directory(Some("fallback"));
         store.record_directory_created(&key, INTENT.0, INTENT.1, mode)?;
         if let Err(error) = crate::io::sys::mkdirat(parent, leaf, 0o700) {
-            let _ = store.complete_directory(&key);
+            let _ = store.clear_directory(&key);
             return Err(if error.raw_os_error() == Some(libc::EEXIST) {
                 BulkloadRefusal::DestinationOccupied
             } else {
@@ -597,7 +869,7 @@ impl Destination {
             // A record that does not own this directory is stale; clear it
             // so it can never adopt one later (R-N102, F3).
             Ok(Some(_)) | Err(BulkloadRefusal::SchemaMismatch) => {
-                store.complete_directory(key)?;
+                store.clear_directory(key)?;
                 false
             }
             Ok(None) => false,
@@ -821,9 +1093,14 @@ impl Destination {
     }
 
     /// Apply final modes to directories this invocation created, deepest
-    /// first, one directory at a time: set the mode, seal it (fully flushing a
-    /// directory off the store's device), then commit its completion. Each
-    /// completion commit drains the store's device.
+    /// first, one directory at a time: set the mode, then seal it (fully
+    /// flushing a directory off the store's device). Each directory's
+    /// completion is committed only after its own mode is sealed; with
+    /// batching (OI-1003-Q143 item 2, [`Destination::batch`] above 1), every
+    /// directory's completion goes in one commit after the last seal,
+    /// otherwise each in its own. Each
+    /// completion commit drains the store's device. A directory that has
+    /// changed refuses the finish; the ones sealed before it still commit.
     ///
     /// One descriptor is open at a time, so any number of new directories
     /// finish within the descriptor limit.
@@ -834,29 +1111,48 @@ impl Destination {
         if self.directories.is_empty() {
             return Ok(());
         }
+        let batched = self.batch > 1;
+        let mut sealed: Vec<Vec<u8>> = Vec::new();
+        let mut failure = None;
         for index in (0..self.directories.len()).rev() {
             let Some(pending) = self.directories.get(index) else {
                 continue;
             };
             let (path, dev, ino, mode) =
                 (pending.path.clone(), pending.dev, pending.ino, pending.mode);
-            let (parent, leaf) = self.parent(&path)?;
-            let directory = open_dir(&parent, &leaf)?;
-            drop(parent);
-            let metadata = directory
-                .metadata()
-                .refuse_at("materialize::finish_directories")?;
-            if metadata.dev() != dev || metadata.ino() != ino {
-                return Err(BulkloadRefusal::DestinationOccupied);
+            let finished = (|| -> Result<()> {
+                let (parent, leaf) = self.parent(&path)?;
+                let directory = open_dir(&parent, &leaf)?;
+                drop(parent);
+                let metadata = directory
+                    .metadata()
+                    .refuse_at("materialize::finish_directories")?;
+                if metadata.dev() != dev || metadata.ino() != ino {
+                    return Err(BulkloadRefusal::DestinationOccupied);
+                }
+                crate::io::sys::fchmod(&directory, mode)
+                    .refuse_at("materialize::finish_directories")?;
+                self.seal_entry(&directory)
+            })();
+            if let Err(refusal) = finished {
+                failure = Some(refusal);
+                break;
             }
-            crate::io::sys::fchmod(&directory, mode)
-                .refuse_at("materialize::finish_directories")?;
-            self.seal_entry(&directory)?;
             fault_point!(DirectoryBeforeComplete);
             if let Some(pending) = self.directories.get(index) {
-                store.complete_directory(&pending.key)?;
+                if batched {
+                    sealed.push(pending.key.clone());
+                } else {
+                    store.complete_directory(&pending.key)?;
+                    counters::bump(Counter::DirectoriesFinished);
+                }
             }
-            counters::bump(Counter::DirectoriesFinished);
+        }
+        let keys: Vec<&[u8]> = sealed.iter().map(Vec::as_slice).collect();
+        store.complete_directories(&keys)?;
+        counters::add(Counter::DirectoriesFinished, keys.len() as u64);
+        if let Some(refusal) = failure {
+            return Err(refusal);
         }
         // The completion commits drained the store's device; entries sealed
         // on other devices still wait for `flush_session`.
@@ -1483,6 +1779,124 @@ fn before_exchange(directory: &File, leaf: &[u8]) {
     }
 }
 
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+static BEFORE_DIRECTORY_RENAME: std::sync::Mutex<ExchangeHooks> = std::sync::Mutex::new(Vec::new());
+
+/// Removes its hook when dropped.
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+#[must_use = "the hook is removed as soon as the guard is dropped"]
+pub struct BeforeDirectoryRename(u64);
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+impl Drop for BeforeDirectoryRename {
+    fn drop(&mut self) {
+        BEFORE_DIRECTORY_RENAME
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, ..)| *id != self.0);
+    }
+}
+
+/// Test hook: run `hook` just before a new directory's temporary is renamed
+/// to `leaf` in `directory`, after its record committed.
+///
+/// A third party's directory made there then is the race a batch's rename
+/// must refuse (#217 review).
+///
+/// # Errors
+/// Returns the failure to stat `directory`.
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+pub fn set_before_directory_rename(
+    directory: &Path,
+    leaf: &[u8],
+    hook: impl Fn() + Send + Sync + 'static,
+) -> std::io::Result<BeforeDirectoryRename> {
+    let found = std::fs::metadata(directory)?;
+    let id = NEXT_EXCHANGE_HOOK.fetch_add(1, Ordering::Relaxed);
+    BEFORE_DIRECTORY_RENAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((
+            id,
+            (found.dev(), found.ino()),
+            leaf.to_vec(),
+            Arc::new(hook),
+        ));
+    Ok(BeforeDirectoryRename(id))
+}
+
+#[cfg(any(test, feature = "fault-injection", feature = "io-trace"))]
+fn before_directory_rename(directory: &File, leaf: &[u8]) {
+    let Ok(found) = directory.metadata() else {
+        return;
+    };
+    let hooks: Vec<Arc<dyn Fn() + Send + Sync>> = BEFORE_DIRECTORY_RENAME
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|(_, node, name, _)| *node == (found.dev(), found.ino()) && name == leaf)
+        .map(|(.., hook)| Arc::clone(hook))
+        .collect();
+    for hook in hooks {
+        hook();
+    }
+}
+
+/// The most new directories one batch creates together by default
+/// (OI-1003-Q143 item 2), and so the most distinct parents a level holds
+/// open.
+pub const DIRECTORY_BATCH: usize = 64;
+
+/// With `fault-injection`: every batch of new directories holds at most
+/// this many (`1` creates each alone, as before batching).
+#[cfg(feature = "fault-injection")]
+pub const DIRECTORY_BATCH_ENV: &str = "BULKLOAD_FAULT_DIR_BATCH";
+
+static DIRECTORY_BATCH_OVERRIDE: std::sync::Mutex<Vec<(PathBuf, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Batch new directories into the canonical destination `root` at most
+/// `cap` at a time (`Some(1)`: one at a time, as before batching; `None`:
+/// the default again). Test hook.
+#[doc(hidden)]
+pub fn set_directory_batch(root: &Path, cap: Option<usize>) {
+    let mut overrides = DIRECTORY_BATCH_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(cap) = cap {
+        overrides.push((root.to_path_buf(), cap.max(1)));
+    }
+}
+
+/// How many new directories one batch into `root` may hold: at most
+/// [`DIRECTORY_BATCH`], and a sixteenth of the descriptor budget, since a
+/// level holds one descriptor per distinct parent beside the session's
+/// reuse files, its committer's queue and its open entries (#217 review).
+/// `1` means no batching.
+pub(crate) fn directory_batch(root: &Path) -> usize {
+    let found = DIRECTORY_BATCH_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, cap)| *cap);
+    if let Some(cap) = found {
+        return cap;
+    }
+    #[cfg(feature = "fault-injection")]
+    if let Some(cap) = std::env::var(DIRECTORY_BATCH_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|cap| *cap > 0)
+    {
+        return cap;
+    }
+    usize::try_from(crate::io::limits::descriptor_budget() / 16)
+        .unwrap_or(DIRECTORY_BATCH)
+        .clamp(1, DIRECTORY_BATCH)
+}
+
 fn full_flush_counted(handle: &File) -> Result<()> {
     counters::timed(Counter::FlushFull, Counter::FlushFullNs, || {
         crate::io::sys::full_flush(handle)
@@ -2002,7 +2416,7 @@ fn seal_group_data(items: &mut [Publication]) -> Result<()> {
 /// `ENOSPC` (or `SQLite`'s full-disk code, which the store reports as it)
 /// is [`BulkloadRefusal::DestinationSpaceInsufficient`]: the group could not
 /// be made durable for lack of space (OI-1001-Q2, #100).
-fn space_refusal(refusal: BulkloadRefusal) -> BulkloadRefusal {
+pub(crate) fn space_refusal(refusal: BulkloadRefusal) -> BulkloadRefusal {
     match refusal {
         BulkloadRefusal::Io(Some(libc::ENOSPC)) => BulkloadRefusal::DestinationSpaceInsufficient,
         other => other,
@@ -2081,7 +2495,7 @@ fn discard_directory(parent: &File, temporary: &CStr, key: &[u8], store: &Store)
     // Ignored on purpose: the caller already refuses, a surviving record
     // names an inode that no final directory holds, and a surviving empty
     // temporary is removed by the next sweep.
-    let _ = store.complete_directory(key);
+    let _ = store.clear_directory(key);
     // AT_REMOVEDIR removes only an empty directory.
     let _ = crate::io::sys::unlinkat(parent, temporary, true);
 }
@@ -2844,6 +3258,98 @@ mod tests {
         );
         assert_eq!(touched.seal(0, true)?, 0, "no device was sealed");
         Ok(())
+    }
+
+    /// A level of new directories `a` and `b` under a fresh destination,
+    /// with `b`'s key already holding a stale record (bound to an inode
+    /// this level never made). Returns the scratch base, the destination,
+    /// its store, the rows and their keys.
+    #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    fn failing_level(tag: &str) -> (PathBuf, PathBuf, Store, Vec<RowSchema>, Vec<Vec<u8>>) {
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-materialize-{tag}-{}-{}",
+            std::process::id(),
+            NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed)
+        ));
+        let source = base.join("source");
+        let destination = base.join("destination");
+        for directory in ["a", "b"] {
+            std::fs::create_dir_all(source.join(directory)).unwrap();
+        }
+        std::fs::create_dir_all(&destination).unwrap();
+        let rows: Vec<RowSchema> = crate::walk::walk(
+            &crate::walk::WalkOptions::new(source),
+            &mut crate::freshness::NullCache,
+        )
+        .unwrap()
+        .rows
+        .into_iter()
+        .filter(|row| row.kind == bulkload_proto::FileKind::Directory)
+        .collect();
+        assert_eq!(rows.len(), 2);
+        let keys: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|row| postcard::to_stdvec(&(b"level".as_slice(), &row.rel_path)).unwrap())
+            .collect();
+        let store = Store::open(&base.join("state")).unwrap();
+        store
+            .record_directory_created(&keys[1], u64::MAX, u64::MAX, rows[1].mode & 0o7777)
+            .unwrap();
+        (base, destination, store, rows, keys)
+    }
+
+    /// S1 throughput review (2026-10-09), finding 1: a level whose one
+    /// commit reports a failure after its records reached the log (a COMMIT
+    /// whose WAL fsync returned `EIO`; the frames recover on the next open)
+    /// clears every record it may have bound before it removes the
+    /// temporaries, as one directory alone does (`discard_directory`, #74
+    /// N3), so no record outlives the inode it names.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_level_whose_commit_fails_clears_its_records_before_its_temporaries() {
+        let (base, destination, store, rows, keys) = failing_level("level-commit-fails");
+        let mut target = Destination::open(&destination, &store).unwrap();
+        let level: Vec<&RowSchema> = rows.iter().collect();
+        crate::transfer_store::fail_directory_records_after_commit(true);
+        let outcomes = target.create_directories(&level, &store, b"level");
+        crate::transfer_store::fail_directory_records_after_commit(false);
+        assert!(
+            outcomes
+                .iter()
+                .all(|outcome| *outcome == Err(BulkloadRefusal::Io(Some(libc::EIO)))),
+            "{outcomes:?}"
+        );
+        for key in &keys {
+            assert_eq!(
+                store.directory_record(key).unwrap(),
+                None,
+                "a record outlives the temporary it named"
+            );
+        }
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// S1 throughput review (2026-10-09), finding 1: a level whose parent
+    /// seal fails clears a stale record already at a member's key, as one
+    /// directory alone does (`discard_directory` clears the key).
+    #[test]
+    #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    fn a_level_whose_seal_fails_clears_a_stale_record_at_its_keys() {
+        let (base, destination, store, rows, keys) = failing_level("level-seal-fails");
+        let mut target = Destination::open(&destination, &store).unwrap();
+        let level: Vec<&RowSchema> = rows.iter().collect();
+        crate::io::durable::fail_dir_seals(true);
+        let outcomes = target.create_directories(&level, &store, b"level");
+        crate::io::durable::fail_dir_seals(false);
+        assert!(outcomes.iter().all(Result::is_err), "{outcomes:?}");
+        assert_eq!(
+            store.directory_record(&keys[1]).unwrap(),
+            None,
+            "the stale record at b's key survives the discard"
+        );
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
 

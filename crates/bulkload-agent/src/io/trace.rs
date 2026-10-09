@@ -158,6 +158,11 @@ pub enum CommitRecord {
     },
     /// A directory's final mode is durable and its record retired.
     DirectoryComplete { key: Vec<u8> },
+    /// A directory record cleared without completing its directory: a
+    /// creation undone before it published, a record bound to a temporary
+    /// the sweep removes, or a stale record (#217 review). It vouches for
+    /// nothing.
+    DirectoryCleared { key: Vec<u8> },
     /// The store's `root_sealed` setting (#161): `Store::open` sealed the
     /// state root's entry and its database's entry before this commit, and
     /// every later open trusts the marker without sealing again.

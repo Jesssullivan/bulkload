@@ -111,6 +111,29 @@ const MAX_MANIFEST_CHUNKS: usize = 131_072;
 /// Header bytes a capture reads before it can refuse a `SQLite` database or
 /// WAL by its magic (#186).
 const SNIFF_BYTES: u64 = 16;
+/// An entry's staged file is kicked into write-back each time its placed
+/// bytes cross a multiple of this, while the data still streams
+/// (OI-1003-Q143 item 1a, extending OI-1003-Q107). Group mode on Linux only.
+const WRITEBACK_KICK_BYTES: u64 = 8 * 1024 * 1024;
+/// Receive workers verifying and writing data frames beside the receiving
+/// thread, by default (OI-1003-Q143 item 3). Zero is the inline path.
+const RECV_WORKERS: usize = 2;
+/// The most receive workers [`RECV_WORKERS_ENV`] may ask for.
+const RECV_WORKERS_MAX: usize = 16;
+/// Sets the receive workers for a process (`0` to [`RECV_WORKERS_MAX`]), for
+/// the bench's A/B (OI-1003-Q143 item 3). Unset or malformed keeps the
+/// default.
+pub const RECV_WORKERS_ENV: &str = "BULKLOAD_RECV_WORKERS";
+/// Payload bytes the receive workers may hold queued or in progress. Each
+/// job is charged at least [`RECV_JOB_MIN_BYTES`], so empty or tiny frames
+/// are bounded too (#217 review).
+const RECV_POOL_BYTES: u64 = 8 * 1024 * 1024;
+/// The least a job is charged against [`RECV_POOL_BYTES`].
+const RECV_JOB_MIN_BYTES: u64 = 4096;
+/// Walk frames a batch of new directories may hold back, every kind
+/// counted (#217 review); well below [`ENTRY_WINDOW`], so the source always
+/// has window to keep offering (OI-1003-Q143 item 2).
+const DIRECTORY_BATCH_FRAMES: usize = 256;
 
 static WALK_NS: AtomicU64 = AtomicU64::new(0);
 static WALK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -129,6 +152,18 @@ static RECV_VERIFY_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_SETUP_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_STREAM_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_TAIL_NS: AtomicU64 = AtomicU64::new(0);
+// Inside the stream (S1, OI-1003-Q143 step 1a): the wait for the open
+// group's commit once nothing more can arrive, and the frame loop's ramp to
+// its first data frame.
+static RECV_DRAIN_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_FIRST_DATA_NS: AtomicU64 = AtomicU64::new(0);
+// The receive workers (OI-1003-Q143 item 3, #217 review): their verify and
+// their writes, summed over workers; the receiving thread's wait on them;
+// and the sending thread's writes to the wire.
+static RECV_WORKER_VERIFY_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_WORKER_PLACE_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_POOL_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static SEND_WRITE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Receiver accounting; any refusal means the requested carry is incomplete.
 #[derive(Debug, Default)]
@@ -219,6 +254,27 @@ pub struct TransferTiming {
     /// `receive` after its frame loop: the last group commits, directory
     /// records and the session's flushes (`finish_receive`).
     pub recv_tail_ns: u64,
+    /// The receiving thread waiting in `settle_held` for the open group's
+    /// commit (`committer.sync()`: its file and directory seals and its
+    /// store commit) once every entry is offered and none has content
+    /// outstanding: the final drain. Part of [`Self::recv_stream_ns`], and
+    /// of [`Self::recv_settle_ns`] when the loop's own settle call drains.
+    pub recv_drain_ns: u64,
+    /// The frame loop's start to its first data frame: the stream's ramp,
+    /// part of [`Self::recv_stream_ns`]. Zero for a copy with no data frame.
+    pub recv_first_data_ns: u64,
+    /// The receive workers' wire verify, summed over workers (item 3). The
+    /// receiving thread's own verify stays in [`Self::recv_verify_ns`].
+    pub recv_worker_verify_ns: u64,
+    /// The receive workers' writes and write-back kicks, summed over
+    /// workers (items 1a and 3).
+    pub recv_worker_place_ns: u64,
+    /// The receiving thread blocked on the receive workers: their byte
+    /// budget, or an entry's last writes before its `End` (item 3).
+    pub recv_pool_wait_ns: u64,
+    /// The sending thread writing frames to the wire, blocked there when
+    /// the wire is full; part of [`Self::send_handle_ns`].
+    pub send_write_ns: u64,
 }
 
 impl TransferTiming {
@@ -240,6 +296,12 @@ impl TransferTiming {
             recv_setup_ns: RECV_SETUP_NS.load(Ordering::Relaxed),
             recv_stream_ns: RECV_STREAM_NS.load(Ordering::Relaxed),
             recv_tail_ns: RECV_TAIL_NS.load(Ordering::Relaxed),
+            recv_drain_ns: RECV_DRAIN_NS.load(Ordering::Relaxed),
+            recv_first_data_ns: RECV_FIRST_DATA_NS.load(Ordering::Relaxed),
+            recv_worker_verify_ns: RECV_WORKER_VERIFY_NS.load(Ordering::Relaxed),
+            recv_worker_place_ns: RECV_WORKER_PLACE_NS.load(Ordering::Relaxed),
+            recv_pool_wait_ns: RECV_POOL_WAIT_NS.load(Ordering::Relaxed),
+            send_write_ns: SEND_WRITE_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -247,7 +309,7 @@ impl TransferTiming {
     #[must_use]
     pub fn render(&self) -> String {
         format!(
-            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={} recv_setup_ns={} recv_stream_ns={} recv_tail_ns={}",
+            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={} recv_setup_ns={} recv_stream_ns={} recv_tail_ns={} recv_drain_ns={} recv_first_data_ns={} recv_worker_verify_ns={} recv_worker_place_ns={} recv_pool_wait_ns={} send_write_ns={}",
             self.walk_ns,
             self.walk_wait_ns,
             self.reuse_census_ns,
@@ -263,6 +325,12 @@ impl TransferTiming {
             self.recv_setup_ns,
             self.recv_stream_ns,
             self.recv_tail_ns,
+            self.recv_drain_ns,
+            self.recv_first_data_ns,
+            self.recv_worker_verify_ns,
+            self.recv_worker_place_ns,
+            self.recv_pool_wait_ns,
+            self.send_write_ns,
         )
     }
 
@@ -284,6 +352,20 @@ impl TransferTiming {
             recv_setup_ns: self.recv_setup_ns.saturating_sub(before.recv_setup_ns),
             recv_stream_ns: self.recv_stream_ns.saturating_sub(before.recv_stream_ns),
             recv_tail_ns: self.recv_tail_ns.saturating_sub(before.recv_tail_ns),
+            recv_drain_ns: self.recv_drain_ns.saturating_sub(before.recv_drain_ns),
+            recv_first_data_ns: self
+                .recv_first_data_ns
+                .saturating_sub(before.recv_first_data_ns),
+            recv_worker_verify_ns: self
+                .recv_worker_verify_ns
+                .saturating_sub(before.recv_worker_verify_ns),
+            recv_worker_place_ns: self
+                .recv_worker_place_ns
+                .saturating_sub(before.recv_worker_place_ns),
+            recv_pool_wait_ns: self
+                .recv_pool_wait_ns
+                .saturating_sub(before.recv_pool_wait_ns),
+            send_write_ns: self.send_write_ns.saturating_sub(before.send_write_ns),
         }
     }
 }
@@ -346,9 +428,14 @@ pub fn copy(
     // all decided before either store exists.
     let source_state_root = canonical_state(source_state)?;
     let destination_state_root = canonical_state(destination_state)?;
+    // The two stores are opened at once (OI-1003-Q143 item 1b), so neither
+    // state root may hold or lie inside the other, or inside the
+    // destination root that the destination's setup sweeps (#217 review).
     if overlaps(&source_state_root, &source_root)
         || overlaps(&destination_state_root, &source_root)
         || overlaps(&destination_state_root, &destination_root)
+        || overlaps(&source_state_root, &destination_root)
+        || overlaps(&source_state_root, &destination_state_root)
     {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
@@ -393,8 +480,17 @@ pub fn copy(
         };
         let _ = receiver.shutdown(std::net::Shutdown::Both);
         drop(receiver);
-        producer.join().map_err(|_| BulkloadRefusal::WorkerLost)??;
-        result
+        let served = producer.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
+        match (result, served) {
+            // The destination refused for a reason of its own (its setup,
+            // which now runs while the source opens its store, item 1b): the
+            // source's broken stream is only the echo of it.
+            (Err(refusal), Err(_)) if !matches!(refusal, BulkloadRefusal::Io(_)) => Err(refusal),
+            (result, served) => {
+                served?;
+                result
+            }
+        }
     })
 }
 
@@ -1037,6 +1133,27 @@ fn spawn_reader<R: Read + Send + 'static>(
     Ok(())
 }
 
+/// The sending thread's writes to the wire, timed (`send_write_ns`, #217
+/// review): where the source's one serial sending stage blocks on the wire.
+struct TimedWrite<W>(W);
+
+impl<W: Write> Write for TimedWrite<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let _timer = PhaseTimer(&SEND_WRITE_NS, Instant::now());
+        self.0.write(data)
+    }
+
+    fn write_vectored(&mut self, data: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let _timer = PhaseTimer(&SEND_WRITE_NS, Instant::now());
+        self.0.write_vectored(data)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _timer = PhaseTimer(&SEND_WRITE_NS, Instant::now());
+        self.0.flush()
+    }
+}
+
 /// The sending thread's view of the session.
 struct Outbound<'a, W> {
     output: &'a mut W,
@@ -1071,8 +1188,9 @@ fn send_entries<W: Write>(
     jobs: Sender<Job>,
     gate: &WalkGate,
 ) -> Result<(u64, u64)> {
+    let mut output = TimedWrite(output);
     let mut outbound = Outbound {
-        output,
+        output: &mut output,
         committer,
         jobs,
         gate,
@@ -2082,16 +2200,321 @@ fn publication_committer(
     )
 }
 
+/// Where in handling one chunk an entry's content failed. Within one chunk
+/// index the order is fixed: its verify (or its size), then the stage of the
+/// entry's file, then its write, then its write-back kick (#217 review), so
+/// the refusal is the same whichever thread found which failure first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Step {
+    Verify,
+    Stage,
+    Place,
+    Kick,
+}
+
+/// An entry's first content failure, by chunk index and [`Step`]. Today's
+/// inline path refused with the failure it met first, and it met them in
+/// index order; the receive workers keep that answer by keeping the least.
+#[derive(Clone, Debug)]
+struct Failure {
+    index: u32,
+    step: Step,
+    refusal: BulkloadRefusal,
+}
+
+/// Keep the earlier of an entry's failure and `found`.
+fn fold_failure(failure: &mut Option<Failure>, found: Failure) {
+    if failure
+        .as_ref()
+        .is_none_or(|kept| (found.index, found.step) < (kept.index, kept.step))
+    {
+        *failure = Some(found);
+    }
+}
+
+/// An entry's staged file as its chunk writes see it, shared by the jobs
+/// that write it: the bytes placed so far, which time its write-back kicks
+/// (item 1a), and whether a write has failed, after which none is tried.
+struct WriteTarget {
+    file: Arc<std::fs::File>,
+    placed: AtomicU64,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl WriteTarget {
+    fn new(file: &Arc<std::fs::File>, placed: u64) -> Arc<Self> {
+        Arc::new(Self {
+            file: Arc::clone(file),
+            placed: AtomicU64::new(placed),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+/// The bytes after which an entry's file is kicked into write-back.
+#[cfg(not(any(test, feature = "io-trace")))]
+const fn kick_bytes() -> u64 {
+    WRITEBACK_KICK_BYTES
+}
+
+/// The kick interval; a traced or test build may set a smaller one.
+#[cfg(any(test, feature = "io-trace"))]
+fn kick_bytes() -> u64 {
+    match KICK_BYTES_OVERRIDE.load(Ordering::Relaxed) {
+        0 => WRITEBACK_KICK_BYTES,
+        bytes => bytes,
+    }
+}
+
+/// Kick interval in bytes for a traced or test build (0: the default).
+#[cfg(any(test, feature = "io-trace"))]
+static KICK_BYTES_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds each receive worker waits before its job, for a traced or
+/// test build (0: none).
+#[cfg(any(test, feature = "io-trace"))]
+static RECV_WORKER_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Make every receive worker wait `millis` before each job (`0`: none),
+/// process-wide, so a trace shows whether `End` waits for its entry's
+/// writes (S1 throughput review, 2026-10-09). Only in a traced or test
+/// build.
+#[cfg(any(test, feature = "io-trace"))]
+#[doc(hidden)]
+pub fn set_recv_worker_delay(millis: u64) {
+    RECV_WORKER_DELAY_MS.store(millis, Ordering::Relaxed);
+}
+
+/// Kick every staged file into write-back each `bytes` placed (`0`: the
+/// default, [`WRITEBACK_KICK_BYTES`]), process-wide, so a power-loss trace
+/// of small files holds kicks (S1 throughput review, 2026-10-09). Only in a
+/// traced or test build.
+#[cfg(any(test, feature = "io-trace"))]
+#[doc(hidden)]
+pub fn set_writeback_kick_bytes(bytes: u64) {
+    KICK_BYTES_OVERRIDE.store(bytes, Ordering::Relaxed);
+}
+
+/// Kick `file` into write-back when `placed` bytes, after `before`, crossed
+/// a multiple of the kick interval (OI-1003-Q143 item 1a). An error the
+/// kick returns is the entry's refusal, a full device its typed space
+/// refusal; write-back errors it does not return are still reported by the
+/// file's seal.
+fn kick_after(file: &std::fs::File, before: u64, placed: u64) -> Result<()> {
+    if !crosses(before, placed, kick_bytes()) {
+        return Ok(());
+    }
+    crate::io::durable::kick_writeback(file).map_err(|error| {
+        crate::materialize::space_refusal(crate::refuse::io(&error, "transfer::kick_after"))
+    })
+}
+
+/// Whether `placed` bytes after `before` cross a multiple of `interval`.
+const fn crosses(before: u64, placed: u64, interval: u64) -> bool {
+    placed > 0 && interval > 0 && before / interval != before.saturating_add(placed) / interval
+}
+
+/// Write `data` at `offsets` of an entry's staged file and kick its
+/// write-back when that crosses the interval.
+fn place_counted(
+    target: &WriteTarget,
+    data: &[u8],
+    offsets: &[u64],
+) -> std::result::Result<(), (Step, BulkloadRefusal)> {
+    if target.failed.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    place(&target.file, data, offsets).map_err(|refusal| (Step::Place, refusal))?;
+    let placed = (data.len() as u64).saturating_mul(offsets.len() as u64);
+    let before = target.placed.fetch_add(placed, Ordering::Relaxed);
+    kick_after(&target.file, before, placed).map_err(|refusal| (Step::Kick, refusal))
+}
+
+/// One data frame's verify and write, for a receive worker or inline.
+struct RecvJob {
+    entry: u64,
+    index: u32,
+    digest: [u8; 32],
+    payload: Vec<u8>,
+    /// False when the receiving thread already verified it: the chunk that
+    /// staged its entry's file (#217 review).
+    verify: bool,
+    /// Where it is written, or `None` once its entry has failed or when it
+    /// fills no offset.
+    write: Option<(Arc<WriteTarget>, Vec<u64>)>,
+    /// What it holds of [`RECV_POOL_BYTES`].
+    charge: u64,
+}
+
+/// A finished [`RecvJob`]: its failure, if any, or a worker that panicked.
+struct RecvDone {
+    entry: u64,
+    failure: Option<Failure>,
+    charge: u64,
+    lost: bool,
+}
+
+/// Verify one data frame against its digest (the one integrity check on
+/// received bytes), then write it. `on_worker` picks the timers.
+fn run_recv_job(job: RecvJob, on_worker: bool) -> RecvDone {
+    let RecvJob {
+        entry,
+        index,
+        digest,
+        payload,
+        verify,
+        write,
+        charge,
+    } = job;
+    #[cfg(test)]
+    #[allow(clippy::panic)]
+    if on_worker
+        && PANIC_DIGESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&digest)
+    {
+        panic!("test: a receive worker panics on its job");
+    }
+    #[cfg(any(test, feature = "io-trace"))]
+    if on_worker {
+        let delay = RECV_WORKER_DELAY_MS.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
+    let mut failure = None;
+    if verify {
+        let started = Instant::now();
+        let verified = payload.len() <= crate::hash::CDC_MAX_BYTES as usize
+            && counters::hash(Counter::HashWireVerify, &payload) == digest;
+        let timer = if on_worker {
+            &RECV_WORKER_VERIFY_NS
+        } else {
+            &RECV_VERIFY_NS
+        };
+        timer.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        if !verified {
+            failure = Some(Failure {
+                index,
+                step: Step::Verify,
+                refusal: BulkloadRefusal::DigestMismatch,
+            });
+        }
+    }
+    if let Some((target, offsets)) = &write {
+        if failure.is_none() {
+            let started = Instant::now();
+            if let Err((step, refusal)) = place_counted(target, &payload, offsets) {
+                failure = Some(Failure {
+                    index,
+                    step,
+                    refusal,
+                });
+            }
+            if on_worker {
+                RECV_WORKER_PLACE_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+            }
+        }
+        if failure.is_some() {
+            target.failed.store(true, Ordering::Relaxed);
+        }
+    }
+    RecvDone {
+        entry,
+        failure,
+        charge,
+        lost: false,
+    }
+}
+
+/// One receive worker: run jobs until the queue closes. A job that panics
+/// is answered as lost, so the receiving thread ends the session with
+/// `WORKER_LOST` instead of waiting on it (#217 review).
+fn recv_worker(jobs: &Mutex<Receiver<RecvJob>>, done: &Sender<RecvDone>) {
+    loop {
+        let job = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
+        let Ok(job) = job else {
+            return;
+        };
+        let (entry, charge) = (job.entry, job.charge);
+        let finished =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_recv_job(job, true)))
+                .unwrap_or(RecvDone {
+                    entry,
+                    failure: None,
+                    charge,
+                    lost: true,
+                });
+        if done.send(finished).is_err() {
+            return;
+        }
+    }
+}
+
+/// The receiving thread's side of the receive workers.
+struct RecvPool {
+    jobs: Sender<RecvJob>,
+    done: Receiver<RecvDone>,
+    /// Charged bytes and jobs queued or in progress.
+    bytes: u64,
+    queued: usize,
+}
+
+/// How many receive workers a session at `root` runs.
+fn recv_workers(root: &Path) -> usize {
+    let found = RECV_WORKERS_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, workers)| *workers);
+    if let Some(workers) = found {
+        return workers.min(RECV_WORKERS_MAX);
+    }
+    if let Some(workers) = std::env::var(RECV_WORKERS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|workers| *workers <= RECV_WORKERS_MAX)
+    {
+        return workers;
+    }
+    let spare =
+        std::thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(1));
+    RECV_WORKERS.min(spare)
+}
+
+/// Receive workers by canonical destination root, for tests and benches
+/// that compare worker counts in one process (OI-1003-Q143 item 3).
+static RECV_WORKERS_OVERRIDE: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+/// Run sessions into the canonical destination `root` with `workers`
+/// receive workers (`None`: the default again). Test and bench hook.
+#[doc(hidden)]
+pub fn set_recv_workers(root: &Path, workers: Option<usize>) {
+    let mut overrides = RECV_WORKERS_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(workers) = workers {
+        overrides.push((root.to_path_buf(), workers));
+    }
+}
+
 /// A streamed entry: chunks arrive in order and are written at once.
 struct Streaming {
     row: RowSchema,
     key: Vec<u8>,
     staged: Option<StagedFile>,
+    /// The staged file as its chunk writes see it.
+    target: Option<Arc<WriteTarget>>,
     specs: Vec<ChunkSpec>,
     offset: u64,
     hints: Vec<ChunkHint>,
     seen: HashSet<[u8; 32]>,
-    failure: Option<BulkloadRefusal>,
+    failure: Option<Failure>,
+    /// Chunk jobs not yet finished.
+    outstanding: usize,
     /// Streamed in answer to `WantManifest` (the source could not keep the
     /// chunks for a manifest): an existing output at the path is adopted
     /// against the streamed chunks instead of refused.
@@ -2100,16 +2523,21 @@ struct Streaming {
 
 impl Streaming {
     /// One streamed chunk: it must be the next index at the next offset.
-    /// It is written once verified; a content fault becomes the entry's
-    /// refusal and the stream stays in step.
+    /// Returns the job that verifies it and writes it once verified; a
+    /// content fault becomes the entry's refusal and the stream stays in
+    /// step.
+    ///
+    /// The chunk that would stage the entry's file is verified here first,
+    /// with `verify`, so a corrupt first chunk stages nothing, as before
+    /// the receive workers.
     fn accept(
         &mut self,
         target: &Destination,
         open: &mut usize,
         header: &DataHeader,
-        payload: &[u8],
-        verified: bool,
-    ) -> Result<()> {
+        payload: Vec<u8>,
+        verify: impl FnOnce(&[u8]) -> bool,
+    ) -> Result<Option<RecvJob>> {
         if header.index as usize != self.specs.len() || header.offset != self.offset {
             return Err(BulkloadRefusal::ProtocolStateViolation);
         }
@@ -2120,28 +2548,46 @@ impl Streaming {
         }
         let size = payload.len() as u64;
         let end = self.offset.saturating_add(size);
-        if self.failure.is_none() && (!verified || end > self.row.size) {
-            self.failure = Some(BulkloadRefusal::DigestMismatch);
+        let failed = |step, refusal| Failure {
+            index: header.index,
+            step,
+            refusal,
+        };
+        if end > self.row.size {
+            fold_failure(
+                &mut self.failure,
+                failed(Step::Verify, BulkloadRefusal::DigestMismatch),
+            );
         }
+        let mut job_verifies = true;
         if self.failure.is_none() && self.staged.is_none() {
-            if *open >= MAX_OPEN_ENTRIES {
-                return Err(BulkloadRefusal::ProtocolStateViolation);
-            }
-            match target.stage(&self.row) {
-                Ok(staged) => {
-                    *open += 1;
-                    self.staged = Some(staged);
+            job_verifies = false;
+            if verify(&payload) {
+                if *open >= MAX_OPEN_ENTRIES {
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
-                Err(refusal) => self.failure = Some(refusal),
+                match target.stage(&self.row) {
+                    Ok(staged) => {
+                        *open += 1;
+                        self.target = Some(WriteTarget::new(staged.file(), 0));
+                        self.staged = Some(staged);
+                    }
+                    Err(refusal) => fold_failure(&mut self.failure, failed(Step::Stage, refusal)),
+                }
+            } else {
+                fold_failure(
+                    &mut self.failure,
+                    failed(Step::Verify, BulkloadRefusal::DigestMismatch),
+                );
             }
         }
-        if self.failure.is_none() {
-            if let Some(staged) = &self.staged {
-                if let Err(refusal) = place(staged.file(), payload, &[self.offset]) {
-                    self.failure = Some(refusal);
-                }
-            }
-        }
+        let write = if self.failure.is_none() {
+            self.target
+                .as_ref()
+                .map(|target| (Arc::clone(target), vec![self.offset]))
+        } else {
+            None
+        };
         self.specs.push(ChunkSpec {
             digest: header.digest,
             size,
@@ -2154,7 +2600,19 @@ impl Streaming {
             });
         }
         self.offset = end;
-        Ok(())
+        if !job_verifies && write.is_none() {
+            return Ok(None);
+        }
+        self.outstanding += 1;
+        Ok(Some(RecvJob {
+            entry: header.entry,
+            index: header.index,
+            digest: header.digest,
+            charge: size.max(RECV_JOB_MIN_BYTES),
+            payload,
+            verify: job_verifies,
+            write,
+        }))
     }
 
     fn new(row: RowSchema, key: Vec<u8>, adopt: bool) -> Self {
@@ -2162,11 +2620,13 @@ impl Streaming {
             row,
             key,
             staged: None,
+            target: None,
             specs: Vec::new(),
             offset: 0,
             hints: Vec::new(),
             seen: HashSet::new(),
             failure: None,
+            outstanding: 0,
             adopt,
         }
     }
@@ -2180,8 +2640,12 @@ struct Filling {
     manifest: Manifest,
     offsets: Vec<u64>,
     plan: Plan,
+    /// The staged file of a [`Plan::Write`] as its chunk writes see it.
+    target: Option<Arc<WriteTarget>>,
     expected: VecDeque<u32>,
-    failure: Option<BulkloadRefusal>,
+    failure: Option<Failure>,
+    /// Chunk jobs not yet finished.
+    outstanding: usize,
 }
 
 /// An entry the destination expects content for.
@@ -2228,6 +2692,64 @@ struct Inbound<'a, W> {
     space: Option<crate::space::Space>,
     /// Bytes admitted since the last probe.
     since_probe: u64,
+    /// The receive workers, or `None` to verify and write inline.
+    pool: Option<RecvPool>,
+    /// New directories waiting to be created together, and the walk frames
+    /// held back behind them (OI-1003-Q143 item 2).
+    batch: DirectoryBatch,
+    /// A created batch's outcome for each of its directories, taken when
+    /// the directory's held entry is decided.
+    batched: HashMap<Vec<u8>, Result<()>>,
+}
+
+/// A walk frame: what a batch of new directories holds back.
+enum Walked {
+    Entry { entry: u64, row: RowSchema },
+    Refused { rel_path: Vec<u8>, code: String },
+    EngineTemporary { rel_path: Vec<u8> },
+}
+
+/// A batch of new directories (OI-1003-Q143 item 2, R-N102).
+///
+/// The walk is depth-first, so sibling directories are not adjacent in the
+/// stream: batching them defers decisions. A batch opens at a directory
+/// whose leaf is free; from then on every walk frame is held back, in
+/// stream order, and a directory joins the batch as a member when its leaf
+/// is free and its parent is the root, a member, or a directory decided
+/// before the batch opened. A directory whose parent is held but is no
+/// member (an existing directory, whose sweep and adoption seal must come
+/// first, #74 N1) closes the batch before it is looked at (#217 review), and
+/// so does a directory whose path the batch already holds (a source that
+/// offers it twice), so no two members share a key. The batch also closes
+/// at `WalkDone`, at [`Destination::batch`] members
+/// and at [`DIRECTORY_BATCH_FRAMES`] held frames: walk frames only, so its
+/// bounds never depend on timing.
+///
+/// Closing creates the members level by level, shallowest first
+/// ([`Destination::create_directories`]), then decides every held frame in
+/// stream order as it would have been decided at once, a member by its
+/// creation's outcome. A member whose parent member was not created is
+/// decided alone then, against the file system, as without batching.
+#[derive(Default)]
+struct DirectoryBatch {
+    held: Vec<Walked>,
+    /// The held directory entries by path: a member, or held only.
+    directories: HashMap<Vec<u8>, bool>,
+    members: usize,
+}
+
+/// Test-only: destination roots whose batches admit a directory under a
+/// held, undecided parent, the design the #217 review refuted (finding 1),
+/// so a proof can show it fails.
+#[cfg(test)]
+pub(crate) static ADMIT_UNDER_HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// `path`'s parent directory: everything before its last `/`.
+fn parent_of(path: &[u8]) -> &[u8] {
+    path.iter()
+        .rposition(|byte| *byte == b'/')
+        .and_then(|end| path.get(..end))
+        .unwrap_or_default()
 }
 
 /// Re-probe the destination filesystem after admitting this many bytes,
@@ -2240,6 +2762,7 @@ const SPACE_REPROBE_BYTES: u64 = 256 * 1024 * 1024;
 ///
 /// # Errors
 /// Refuses protocol errors and unsafe roots. Per-path conflicts remain in stats.
+#[allow(clippy::too_many_lines)] // Setup, the workers' scope, the frame loop, the tail.
 pub fn receive<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,
@@ -2249,6 +2772,35 @@ pub fn receive<R: Read, W: Write>(
     destination_state: &Path,
 ) -> Result<TransferStats> {
     let setup_timer = PhaseTimer(&RECV_SETUP_NS, Instant::now());
+    // S2: the overlap of the destination's state and root is refused before
+    // either store exists, so `Open` can go out first and the source opens
+    // its store while this side opens its own (OI-1003-Q143 item 1b). The
+    // check on the store's own canonical root below still guards a state
+    // swapped for a symlink in between.
+    let destination_root = std::fs::canonicalize(destination).refuse_at("transfer::receive")?;
+    if overlaps(&canonical_state(destination_state)?, &destination_root) {
+        return Err(BulkloadRefusal::SnapshotRootsOverlap);
+    }
+    write_control(
+        output,
+        &Control::Open {
+            proto: PROTO_VERSION,
+            wire_id: wire_id(),
+            root: source.as_os_str().as_bytes().to_vec(),
+            state: source_state.as_os_str().as_bytes().to_vec(),
+        },
+    )?;
+    // The whole window is granted with `Open`, not after this side's setup:
+    // a source with nothing to send may finish, and close the stream, while
+    // this side still opens its store, so nothing may be written to it after
+    // the source's last need (item 1b). The source's reader takes the grant
+    // once its store is open.
+    write_control(
+        output,
+        &Control::Credit {
+            bytes: CREDIT_WINDOW,
+        },
+    )?;
     let store = Store::open(destination_state)?;
     let mut target = Destination::open(destination, &store)?;
     if store.root().starts_with(target.path()) || target.path().starts_with(store.root()) {
@@ -2263,15 +2815,6 @@ pub fn receive<R: Read, W: Write>(
     // store is in flight while the root is swept.
     target.sweep_root(&store)?;
     let fill_locally = store.has_output_hints()?;
-    write_control(
-        output,
-        &Control::Open {
-            proto: PROTO_VERSION,
-            wire_id: wire_id(),
-            root: source.as_os_str().as_bytes().to_vec(),
-            state: source_state.as_os_str().as_bytes().to_vec(),
-        },
-    )?;
     let Frame::Control(Control::Start { authority }) = read_frame(input)? else {
         return Err(BulkloadRefusal::ProtocolStateViolation);
     };
@@ -2283,48 +2826,71 @@ pub fn receive<R: Read, W: Write>(
         target_meta.ino(),
     ))
     .refuse_at("transfer::receive")?;
-    write_control(
-        output,
-        &Control::Credit {
-            bytes: CREDIT_WINDOW,
-        },
-    )?;
-    let mut receiver = Inbound {
-        output,
-        target: &mut target,
-        store: &store,
-        authority: output_authority,
-        committer: &committer,
-        session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
-        displaced,
-        stats: TransferStats::default(),
-        incoming: HashMap::new(),
-        open: 0,
-        fill_locally,
-        salvage: Salvage::default(),
-        salvage_staged: HashMap::new(),
-        pending_held: HashMap::new(),
-        committed: group_outcomes,
-        walk_done: false,
-        granted: CREDIT_WINDOW,
-        consumed: 0,
-        reserved: HashMap::new(),
-        reserved_bytes: 0,
-        space: None,
-        since_probe: 0,
-    };
-    drop(setup_timer);
-    let source_bytes_read = {
-        let _stream_timer = PhaseTimer(&RECV_STREAM_NS, Instant::now());
-        receiver.run(input)?
-    };
+    // The receive workers (item 3) live in this scope: a session that ends,
+    // by `SourceDone` or by a refusal, closes their queue, and the scope
+    // joins them before anything below runs.
+    let workers = recv_workers(target.path());
+    let (job_queue, jobs) = std::sync::mpsc::channel();
+    let jobs = Mutex::new(jobs);
+    let (done, finished) = std::sync::mpsc::channel();
+    let streamed = std::thread::scope(|scope| -> Result<_> {
+        for _ in 0..workers {
+            let (jobs, done) = (&jobs, done.clone());
+            std::thread::Builder::new()
+                .name("bulkload-recv-worker".to_owned())
+                .spawn_scoped(scope, move || recv_worker(jobs, &done))
+                .refuse_at("transfer::receive")?;
+        }
+        drop(done);
+        let mut receiver = Inbound {
+            output,
+            target: &mut target,
+            store: &store,
+            authority: output_authority,
+            committer: &committer,
+            session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
+            displaced,
+            stats: TransferStats::default(),
+            incoming: HashMap::new(),
+            open: 0,
+            fill_locally,
+            salvage: Salvage::default(),
+            salvage_staged: HashMap::new(),
+            pending_held: HashMap::new(),
+            committed: group_outcomes,
+            walk_done: false,
+            granted: CREDIT_WINDOW,
+            consumed: 0,
+            reserved: HashMap::new(),
+            reserved_bytes: 0,
+            space: None,
+            since_probe: 0,
+            pool: (workers > 0).then_some(RecvPool {
+                jobs: job_queue,
+                done: finished,
+                bytes: 0,
+                queued: 0,
+            }),
+            batch: DirectoryBatch::default(),
+            batched: HashMap::new(),
+        };
+        drop(setup_timer);
+        let source_bytes_read = {
+            let _stream_timer = PhaseTimer(&RECV_STREAM_NS, Instant::now());
+            receiver.run(input)
+        };
+        let Inbound {
+            stats,
+            session,
+            salvage_staged,
+            pool,
+            ..
+        } = receiver;
+        drop(pool);
+        Ok((source_bytes_read?, stats, session, salvage_staged))
+    });
+    let (source_bytes_read, mut stats, session, salvage_staged) = streamed?;
     let _tail_timer = PhaseTimer(&RECV_TAIL_NS, Instant::now());
-    let Inbound {
-        mut stats,
-        session,
-        salvage_staged,
-        ..
-    } = receiver;
     stats.source_bytes_read = source_bytes_read;
     drop(session);
     finish_receive(&mut target, &store, committer, &mut stats, &salvage_staged)?;
@@ -2339,6 +2905,8 @@ impl<W: Write> Inbound<'_, W> {
     fn run<R: Read>(&mut self, input: &mut R) -> Result<u64> {
         let mut offered = 0_u64;
         let mut walk_done = None;
+        // The stream's ramp: from here to the first data frame.
+        let mut first_data = Some(Instant::now());
         loop {
             // Before blocking on the next frame: answer what has committed,
             // and once the stream is drained, commit and answer the rest
@@ -2357,25 +2925,26 @@ impl<W: Write> Inbound<'_, W> {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
                     offered += 1;
-                    self.entry(entry, row)?;
+                    self.walked(Walked::Entry { entry, row })?;
                 }
                 Frame::Control(Control::Refused {
                     entry: None,
                     rel_path,
                     code,
-                }) => self.stats.refusals.push((rel_path, code)),
+                }) => self.walked(Walked::Refused { rel_path, code })?,
                 Frame::Control(Control::Refused {
                     entry: Some(entry),
                     rel_path,
                     code,
                 }) => self.refused(entry, &rel_path, code)?,
                 Frame::Control(Control::EngineTemporary { rel_path }) => {
-                    self.stats.source_engine_temporaries.push(rel_path);
+                    self.walked(Walked::EngineTemporary { rel_path })?;
                 }
                 Frame::Control(Control::WalkDone { entries }) => {
                     if entries != offered || walk_done.is_some() {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
+                    self.close_batch()?;
                     walk_done = Some(entries);
                     self.walk_done = true;
                     self.settle_held()?;
@@ -2392,7 +2961,12 @@ impl<W: Write> Inbound<'_, W> {
                     size,
                     racy,
                 }) => self.end(entry, root, chunks, size, racy)?,
-                Frame::Data { header, payload } => self.data(&header, &payload)?,
+                Frame::Data { header, payload } => {
+                    if let Some(started) = first_data.take() {
+                        RECV_FIRST_DATA_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+                    }
+                    self.data(&header, payload)?;
+                }
                 Frame::Control(Control::SourceDone {
                     entries,
                     source_bytes_read,
@@ -2406,6 +2980,139 @@ impl<W: Write> Inbound<'_, W> {
 }
 
 impl<W: Write> Inbound<'_, W> {
+    /// One walk frame: handled now, or held back by a batch of new
+    /// directories (see [`DirectoryBatch`]).
+    fn walked(&mut self, frame: Walked) -> Result<()> {
+        let cap = self.target.batch();
+        if cap <= 1 {
+            return self.handle_walked(frame);
+        }
+        let directory = match &frame {
+            Walked::Entry { row, .. } if row.kind == FileKind::Directory => {
+                Some(row.rel_path.clone())
+            }
+            _ => None,
+        };
+        #[cfg(test)]
+        let admit_under_held = ADMIT_UNDER_HELD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|root| root == self.target.path());
+        #[cfg(not(test))]
+        let admit_under_held = false;
+        if let Some(path) = &directory {
+            // Its parent is held and is no member: that parent's decision
+            // (its sweep, its adoption's seal) must come before anything is
+            // made inside it. A path the batch already holds (a source that
+            // offers one directory twice) is decided after the first offer,
+            // as one at a time decides it: it adopts what the first made,
+            // never a second member at the same key.
+            if (self.batch.directories.get(parent_of(path)) == Some(&false) && !admit_under_held)
+                || self.batch.directories.contains_key(path)
+            {
+                self.close_batch()?;
+            }
+        }
+        let member = match (&frame, &directory) {
+            (Walked::Entry { row, .. }, Some(path)) => {
+                match self.batch.directories.get(parent_of(path)) {
+                    Some(true) => true,
+                    Some(false) if !admit_under_held => false,
+                    _ => self.target.directory_is_new(row),
+                }
+            }
+            _ => false,
+        };
+        if !member && self.batch.held.is_empty() {
+            return self.handle_walked(frame);
+        }
+        if let Some(path) = directory {
+            self.batch.directories.insert(path, member);
+        }
+        if member {
+            self.batch.members += 1;
+        }
+        self.batch.held.push(frame);
+        if self.batch.members >= cap || self.batch.held.len() >= DIRECTORY_BATCH_FRAMES {
+            self.close_batch()?;
+        }
+        Ok(())
+    }
+
+    /// A walk frame's own handling.
+    fn handle_walked(&mut self, frame: Walked) -> Result<()> {
+        match frame {
+            Walked::Entry { entry, row } => self.entry(entry, row),
+            Walked::Refused { rel_path, code } => {
+                self.stats.refusals.push((rel_path, code));
+                Ok(())
+            }
+            Walked::EngineTemporary { rel_path } => {
+                self.stats.source_engine_temporaries.push(rel_path);
+                Ok(())
+            }
+        }
+    }
+
+    /// Create the batch's new directories, level by level, then handle
+    /// every frame it held, in stream order.
+    fn close_batch(&mut self) -> Result<()> {
+        let batch = std::mem::take(&mut self.batch);
+        if batch.held.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut members: Vec<(usize, &RowSchema)> = batch
+            .held
+            .iter()
+            .filter_map(|frame| match frame {
+                Walked::Entry { row, .. }
+                    if batch.directories.get(&row.rel_path) == Some(&true) =>
+                {
+                    let depth = row.rel_path.split(|byte| *byte == b'/').count();
+                    Some((depth, row))
+                }
+                _ => None,
+            })
+            .collect();
+        members.sort_by_key(|(depth, _)| *depth);
+        let mut level_start = 0;
+        while let Some((depth, _)) = members.get(level_start) {
+            let depth = *depth;
+            let level_end = members
+                .iter()
+                .skip(level_start)
+                .position(|(at, _)| *at != depth)
+                .map_or(members.len(), |offset| level_start + offset);
+            // A member whose parent member was not created is left to be
+            // decided alone, as it would be without batching.
+            let level: Vec<&RowSchema> = members
+                .get(level_start..level_end)
+                .unwrap_or_default()
+                .iter()
+                .map(|(_, row)| *row)
+                .filter(|row| {
+                    let parent = parent_of(&row.rel_path);
+                    batch.directories.get(parent) != Some(&true)
+                        || matches!(self.batched.get(parent), Some(Ok(())))
+                })
+                .collect();
+            let created = self
+                .target
+                .create_directories(&level, self.store, &self.authority);
+            for (row, outcome) in level.iter().zip(created) {
+                self.batched.insert(row.rel_path.clone(), outcome);
+            }
+            level_start = level_end;
+        }
+        REUSE_CENSUS_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        for frame in batch.held {
+            self.handle_walked(frame)?;
+        }
+        Ok(())
+    }
+
     fn refuse(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
         self.stats
             .refusals
@@ -2417,10 +3124,13 @@ impl<W: Write> Inbound<'_, W> {
         let census_started = Instant::now();
         let key = row_key(&self.authority, &row)?;
         let decided = match row.kind {
-            FileKind::Directory => self
-                .target
-                .directory(&row, self.store, &self.authority)
-                .map(|()| Decision::Skip),
+            FileKind::Directory => match self.batched.remove(&row.rel_path) {
+                Some(created) => created.map(|()| Decision::Skip),
+                None => self
+                    .target
+                    .directory(&row, self.store, &self.authority)
+                    .map(|()| Decision::Skip),
+            },
             FileKind::Symlink => self.target.symlink(&row).map(|()| Decision::Skip),
             FileKind::Regular => self.target.identity(&row).and_then(|identity| {
                 if let Some(identity) = &identity {
@@ -2603,6 +3313,7 @@ impl<W: Write> Inbound<'_, W> {
     /// The source refused an entry's capture after any of its data.
     fn refused(&mut self, entry: u64, rel_path: &[u8], code: String) -> Result<()> {
         self.release(entry);
+        self.settle_entry(entry)?;
         let incoming = self
             .incoming
             .remove(&entry)
@@ -2676,12 +3387,15 @@ impl<W: Write> Inbound<'_, W> {
                 .insert(row.rel_path.clone(), salvaged_from);
         }
         MATERIALIZE_NS.fetch_add(elapsed_ns(materialize_started), Ordering::Relaxed);
-        let indices = match &plan {
+        let (indices, target) = match &plan {
             Plan::Write(staging) => {
                 self.open += 1;
-                staging.missing.clone()
+                (
+                    staging.missing.clone(),
+                    Some(WriteTarget::new(staging.staged.file(), staging.placed)),
+                )
             }
-            Plan::Refuse(_) | Plan::Adopt(..) | Plan::NoExchange(_) => Vec::new(),
+            Plan::Refuse(_) | Plan::Adopt(..) | Plan::NoExchange(_) => (Vec::new(), None),
         };
         write_control(
             self.output,
@@ -2698,18 +3412,22 @@ impl<W: Write> Inbound<'_, W> {
                 manifest,
                 offsets,
                 plan,
+                target,
                 expected: indices.into(),
                 failure: None,
+                outstanding: 0,
             }),
         );
         Ok(())
     }
 
-    /// One data frame: account its credit, verify it against its digest (the
-    /// one integrity check on received bytes) and write it where it belongs.
-    /// Content faults become the entry's refusal and the stream stays in
-    /// step; protocol faults end the session.
-    fn data(&mut self, header: &DataHeader, payload: &[u8]) -> Result<()> {
+    /// One data frame: account its credit, then hand it to the receive
+    /// workers (or run it inline), which verify it against its digest (the
+    /// one integrity check on received bytes) and write it where it
+    /// belongs. Content faults become the entry's refusal and the stream
+    /// stays in step; protocol faults end the session, decided here, in
+    /// stream order.
+    fn data(&mut self, header: &DataHeader, payload: Vec<u8>) -> Result<()> {
         let _transfer_timer = PhaseTimer(&TRANSFER_NS, Instant::now());
         let size = payload.len() as u64;
         self.granted = self
@@ -2717,11 +3435,6 @@ impl<W: Write> Inbound<'_, W> {
             .checked_sub(size)
             .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         self.stats.bytes_received = self.stats.bytes_received.saturating_add(size);
-        let verified = {
-            let _verify_timer = PhaseTimer(&RECV_VERIFY_NS, Instant::now());
-            payload.len() <= crate::hash::CDC_MAX_BYTES as usize
-                && counters::hash(Counter::HashWireVerify, payload) == header.digest
-        };
         // A source that could not keep a manifest's chunks streams the entry
         // in place of the manifest (#77 review F1).
         if let Some(Incoming::AwaitManifest { .. }) = self.incoming.get(&header.entry) {
@@ -2733,9 +3446,13 @@ impl<W: Write> Inbound<'_, W> {
                 );
             }
         }
-        match self.incoming.get_mut(&header.entry) {
+        let job = match self.incoming.get_mut(&header.entry) {
             Some(Incoming::Streaming(streaming)) => {
-                streaming.accept(self.target, &mut self.open, header, payload, verified)?;
+                streaming.accept(self.target, &mut self.open, header, payload, |payload| {
+                    let _verify_timer = PhaseTimer(&RECV_VERIFY_NS, Instant::now());
+                    payload.len() <= crate::hash::CDC_MAX_BYTES as usize
+                        && counters::hash(Counter::HashWireVerify, payload) == header.digest
+                })?
             }
             Some(Incoming::Filling(filling)) => {
                 if filling.expected.pop_front() != Some(header.index) {
@@ -2753,28 +3470,113 @@ impl<W: Write> Inbound<'_, W> {
                 {
                     return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
-                if filling.failure.is_none() {
-                    if verified {
-                        if let Plan::Write(staging) = &filling.plan {
-                            if let Some((_, offsets)) = staging.placements.get(&header.digest) {
-                                if let Err(refusal) = place(staging.staged.file(), payload, offsets)
-                                {
-                                    filling.failure = Some(refusal);
-                                }
-                            }
-                        }
-                    } else {
-                        filling.failure = Some(BulkloadRefusal::DigestMismatch);
-                    }
-                }
+                let write = match (&filling.failure, &filling.plan, &filling.target) {
+                    (None, Plan::Write(staging), Some(target)) => staging
+                        .placements
+                        .get(&header.digest)
+                        .map(|(_, offsets)| (Arc::clone(target), offsets.clone())),
+                    _ => None,
+                };
+                filling.outstanding += 1;
+                Some(RecvJob {
+                    entry: header.entry,
+                    index: header.index,
+                    digest: header.digest,
+                    charge: size.max(RECV_JOB_MIN_BYTES),
+                    payload,
+                    verify: true,
+                    write,
+                })
             }
             _ => return Err(BulkloadRefusal::ProtocolStateViolation),
+        };
+        if let Some(job) = job {
+            self.dispatch(job)?;
         }
         self.consumed = self.consumed.saturating_add(size);
         if self.consumed >= CREDIT_RETURN {
             let bytes = std::mem::take(&mut self.consumed);
             self.granted = self.granted.saturating_add(bytes);
             write_control(self.output, &Control::Credit { bytes })?;
+        }
+        Ok(())
+    }
+
+    /// Run one chunk job inline, or queue it for the receive workers once
+    /// their byte budget has room (OI-1003-Q143 item 3).
+    fn dispatch(&mut self, job: RecvJob) -> Result<()> {
+        let Some(pool) = &self.pool else {
+            let done = run_recv_job(job, false);
+            return self.finished(done);
+        };
+        let charge = job.charge;
+        if pool.queued > 0 && pool.bytes.saturating_add(charge) > RECV_POOL_BYTES {
+            let _wait_timer = PhaseTimer(&RECV_POOL_WAIT_NS, Instant::now());
+            while self.pool.as_ref().is_some_and(|pool| {
+                pool.queued > 0 && pool.bytes.saturating_add(charge) > RECV_POOL_BYTES
+            }) {
+                self.reap()?;
+            }
+        }
+        let pool = self.pool.as_mut().ok_or(BulkloadRefusal::WorkerLost)?;
+        pool.jobs
+            .send(job)
+            .map_err(|_| BulkloadRefusal::WorkerLost)?;
+        pool.bytes = pool.bytes.saturating_add(charge);
+        pool.queued += 1;
+        #[cfg(test)]
+        POOL_HIGH_WATER.fetch_max(pool.bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Wait for one receive job to finish and fold its outcome.
+    fn reap(&mut self) -> Result<()> {
+        let done = self
+            .pool
+            .as_ref()
+            .ok_or(BulkloadRefusal::WorkerLost)?
+            .done
+            .recv()
+            .map_err(|_| BulkloadRefusal::WorkerLost)?;
+        if let Some(pool) = self.pool.as_mut() {
+            pool.bytes = pool.bytes.saturating_sub(done.charge);
+            pool.queued = pool.queued.saturating_sub(1);
+        }
+        self.finished(done)
+    }
+
+    /// Fold a finished chunk job into its entry.
+    fn finished(&mut self, done: RecvDone) -> Result<()> {
+        if done.lost {
+            return Err(BulkloadRefusal::WorkerLost);
+        }
+        let (outstanding, failure) = match self.incoming.get_mut(&done.entry) {
+            Some(Incoming::Streaming(streaming)) => {
+                (&mut streaming.outstanding, &mut streaming.failure)
+            }
+            Some(Incoming::Filling(filling)) => (&mut filling.outstanding, &mut filling.failure),
+            _ => return Err(BulkloadRefusal::WorkerLost),
+        };
+        *outstanding = outstanding.saturating_sub(1);
+        if let Some(found) = done.failure {
+            fold_failure(failure, found);
+        }
+        Ok(())
+    }
+
+    /// Wait until every chunk job of `entry` has finished, so its file holds
+    /// all its writes before it is published or discarded.
+    fn settle_entry(&mut self, entry: u64) -> Result<()> {
+        let pending = |incoming: &HashMap<u64, Incoming>| match incoming.get(&entry) {
+            Some(Incoming::Streaming(streaming)) => streaming.outstanding > 0,
+            Some(Incoming::Filling(filling)) => filling.outstanding > 0,
+            _ => false,
+        };
+        if pending(&self.incoming) {
+            let _wait_timer = PhaseTimer(&RECV_POOL_WAIT_NS, Instant::now());
+            while pending(&self.incoming) {
+                self.reap()?;
+            }
         }
         Ok(())
     }
@@ -2791,6 +3593,9 @@ impl<W: Write> Inbound<'_, W> {
         size: u64,
         racy: bool,
     ) -> Result<()> {
+        // Every write of the entry lands before its file is checked,
+        // published or discarded (item 3): its submit, so its seal, follows.
+        self.settle_entry(entry)?;
         let incoming = self
             .incoming
             .remove(&entry)
@@ -2859,7 +3664,10 @@ impl<W: Write> Inbound<'_, W> {
         if self.pending_held.is_empty() || !self.walk_done || !self.incoming.is_empty() {
             return self.answer_held();
         }
-        self.committer.sync()?;
+        {
+            let _drain_timer = PhaseTimer(&RECV_DRAIN_NS, Instant::now());
+            self.committer.sync()?;
+        }
         self.answer_held()?;
         if self.pending_held.is_empty() {
             Ok(())
@@ -2883,13 +3691,15 @@ impl<W: Write> Inbound<'_, W> {
         if staged.is_some() {
             self.open -= 1;
         }
-        let checked = failure.map_or(Ok(()), Err).and_then(|()| {
-            if offset != row.size || manifest_root(&specs) != root {
-                Err(BulkloadRefusal::DigestMismatch)
-            } else {
-                Ok(())
-            }
-        });
+        let checked = failure
+            .map_or(Ok(()), |failure| Err(failure.refusal))
+            .and_then(|()| {
+                if offset != row.size || manifest_root(&specs) != root {
+                    Err(BulkloadRefusal::DigestMismatch)
+                } else {
+                    Ok(())
+                }
+            });
         let mut supersede = None;
         if checked.is_ok() && adopt {
             // Streamed in place of a manifest: an existing output at the
@@ -2996,9 +3806,9 @@ impl<W: Write> Inbound<'_, W> {
             }
             Plan::Write(staging) => {
                 self.open -= 1;
-                if let Some(refusal) = failure {
+                if let Some(failure) = failure {
                     let _ = staging.staged.discard();
-                    return Err(refusal);
+                    return Err(failure.refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
                 self.publish(
@@ -3232,6 +4042,8 @@ struct Staging {
     /// Every offset each distinct chunk occupies, with its size.
     placements: HashMap<[u8; 32], (u64, Vec<u64>)>,
     hints: Vec<ChunkHint>,
+    /// Bytes filled locally, every offset counted (item 1a).
+    placed: u64,
 }
 
 /// Validate a manifest against its row, adopt an existing output, or stage a
@@ -3248,6 +4060,7 @@ struct Staging {
 /// Any other existing output is adopted if its bytes verify when the entry
 /// ends, and refused `DESTINATION_OCCUPIED` if they do not: it is never
 /// replaced.
+#[allow(clippy::too_many_lines)] // Validate, adopt or supersede, stage, fill, kick.
 fn plan_file(
     context: &ReceiveContext<'_>,
     row: &RowSchema,
@@ -3321,6 +4134,7 @@ fn plan_file(
     let mut missing = Vec::new();
     let mut hints = Vec::with_capacity(order.len());
     let mut outputs = HashMap::new();
+    let mut placed = 0_u64;
     for (digest, index) in order {
         let Some((size, offsets)) = placements.get(&digest) else {
             continue;
@@ -3338,7 +4152,9 @@ fn plan_file(
                     .transpose()
             });
         match filled {
-            Ok(Some(())) => (),
+            Ok(Some(())) => {
+                placed = placed.saturating_add(size.saturating_mul(offsets.len() as u64));
+            }
             Ok(None) => missing.push(index),
             Err(refusal) => {
                 let _ = staged.discard();
@@ -3346,12 +4162,20 @@ fn plan_file(
             }
         }
     }
+    // What was filled here is written back while the source captures the
+    // rest, before `NeedChunks` goes out (item 1a, #217 review): a delta's
+    // changed file is mostly local bytes, and no wire chunk would kick them.
+    if let Err(refusal) = kick_after(staged.file(), 0, placed) {
+        let _ = staged.discard();
+        return Plan::Refuse(refusal);
+    }
     Plan::Write(Staging {
         staged,
         supersede,
         missing,
         placements,
         hints,
+        placed,
     })
 }
 
@@ -3502,6 +4326,25 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
     if header.size as usize != payload.len() {
         return Err(BulkloadRefusal::FrameCodec);
     }
+    // Test-only: a chunk sent with one byte flipped, so the destination's
+    // verify refuses it (#217 review: a bad chunk mid-stream).
+    #[cfg(test)]
+    let corrupted;
+    #[cfg(test)]
+    let payload = if CORRUPT_DIGESTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&header.digest)
+    {
+        corrupted = payload
+            .iter()
+            .enumerate()
+            .map(|(at, byte)| if at == 0 { !byte } else { *byte })
+            .collect::<Vec<u8>>();
+        corrupted.as_slice()
+    } else {
+        payload
+    };
     let prefix = data_prefix(header)?;
     let mut slices = [IoSlice::new(&prefix), IoSlice::new(payload)];
     let mut remaining: &mut [IoSlice<'_>] = &mut slices;
@@ -3523,6 +4366,18 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
     counters::add_len(Counter::WireBytesSent, prefix.len() + payload.len());
     Ok(())
 }
+
+/// Test-only: data frames of these digests are sent corrupted.
+#[cfg(test)]
+pub(crate) static CORRUPT_DIGESTS: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+
+/// Test-only: a receive job of one of these digests panics on its worker.
+#[cfg(test)]
+pub(crate) static PANIC_DIGESTS: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+
+/// Test-only: the most bytes any receive pool held queued or in progress.
+#[cfg(test)]
+pub(crate) static POOL_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
 
 /// Write one control frame and flush it.
 ///

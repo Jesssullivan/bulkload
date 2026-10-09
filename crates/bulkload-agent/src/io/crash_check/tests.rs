@@ -595,6 +595,7 @@ fn group_commit_trace(store: NodeId) -> Vec<Event> {
                 mode: 0o755,
             },
             CommitRecord::DirectoryComplete { key: b"d".to_vec() },
+            CommitRecord::DirectoryCleared { key: b"c".to_vec() },
             CommitRecord::RootSealed,
             CommitRecord::RefusedSeat { key: b"r".to_vec() },
         ],
@@ -1610,4 +1611,27 @@ fn a_file_the_exchange_displaced_survives_every_crash_state() {
         !unsealed.violations.is_empty(),
         "the unlink must not outlive the exchange back"
     );
+}
+
+/// `View::node_at` and `View::paths_of` (#217 review): the inode at a path,
+/// and every path naming an inode, as the directory-record proofs read them.
+#[test]
+fn a_view_finds_an_inode_by_path_and_its_paths() {
+    let root = NodeId { dev: 1, ino: 1 };
+    let file = NodeId { dev: 1, ino: 2 };
+    let image = Image::empty(root).with_file(b"data", file, b"bytes");
+    let report = check_view(&image, &[], &Options::default(), |view, _| {
+        if view.node_at(b"data") != Some(file) || view.node_at(b"") != Some(root) {
+            return Err("node_at".to_owned());
+        }
+        if view.node_at(b"missing").is_some() {
+            return Err("node_at missing".to_owned());
+        }
+        if view.paths_of(file) != [b"data".to_vec()] || !view.paths_of(root).is_empty() {
+            return Err("paths_of".to_owned());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(report.passed(), "{report:?}");
 }

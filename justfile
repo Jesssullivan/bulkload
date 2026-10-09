@@ -183,11 +183,14 @@ fault-harness:
 # gate's feature-union build (OI-1003-Q81): the directory
 # resume paths (#74 review B1 and round 2 N1) and the adoption of a durable
 # unrowed output from its capture record with 0 source bytes read (#169,
-# R-N58), and on Linux the batched group seal (S1, OI-1003-Q107; compiled
-# for Linux only, where it fails rather than skips). A name filter that
-# matches nothing still reports `0 passed`, so this recipe fails unless every
-# proof for this platform ran: on a cargo failure, on anything but one
-# `N passed; 0 failed` result (N = 4 on Linux, 3 elsewhere), or when a proof
+# R-N58), the batched directory levels (OI-1003-Q143 item 2: a level
+# crashed after its commit, after some renames, in its finish, and a batch
+# that must wait for a held adoptable parent, #217 review), and on Linux the
+# batched group seal (S1, OI-1003-Q107; compiled for Linux only, where it
+# fails rather than skips). A name filter that matches nothing still reports
+# `0 passed`, so this recipe fails unless every proof for this platform ran:
+# on a cargo failure, on anything but one `N passed; 0 failed` result (N = 8
+# on Linux, 7 elsewhere), or when a proof
 # is not among the passing tests (#74 round 2 N2, R-N122).
 resume-power-loss:
     #!/usr/bin/env bash
@@ -200,7 +203,7 @@ resume-power-loss:
         echo "resume-power-loss: cargo test failed with status $status" >&2
         exit "$status"
     fi
-    proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads)
+    proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads a_level_crashed_after_its_commit_is_swept_and_its_records_cleared a_level_crashed_after_some_renames_adopts_the_renamed_and_makes_the_rest a_finish_crashed_after_some_seals_completes_every_directory_in_one_commit a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it)
     if [[ $(uname -s) == Linux ]]; then
         proofs+=(a_batched_group_names_no_output_before_its_data_is_durable)
     fi
@@ -445,7 +448,8 @@ import? "justfile.flywheel"
 
 # docs/formal's typed catalogue (OI-1003-Q32, OI-1003-Q43): render each
 # module's run order (configs.tsv for BulkloadTransfer.tla, configs_gc.tsv
-# for GitCarry.tla) and every MC_*.cfg from docs/formal/catalogue/
+# for GitCarry.tla, configs_dir.tsv for DirectoryRecords.tla) and every
+# MC_*.cfg from docs/formal/catalogue/
 # Catalogue.dhall into OUT (default docs/formal). Every MC_*.cfg already in
 # OUT is removed first, so a config dropped from the catalogue leaves no
 # stale file. dhall-to-json evaluates the catalogue, which also checks its
@@ -512,8 +516,10 @@ tla-render out="" json="":
     echo "tla-render: all $count committed files equal the catalogue's rendering"
 
 # TLA+ models of the proof package (OI-1003-Q7; docs/formal/README.md):
-# BulkloadTransfer.tla (wire v5, Held, the group commits and resume) and
-# GitCarry.tla (git carry's chain and base custody, OI-1003-Q43).
+# BulkloadTransfer.tla (wire v5, Held, the group commits and resume),
+# GitCarry.tla (git carry's chain and base custody, OI-1003-Q43) and
+# DirectoryRecords.tla (directory records and their batching, R-N102,
+# OI-1003-Q143).
 # Standalone and on demand: no tier depends on it, so check-fast,
 # check-optional, check-full and CI never start TLC. TLC comes from the
 # flake's pinned nixpkgs (no flake change). Before any TLC run, two

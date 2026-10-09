@@ -115,7 +115,7 @@ use bulkload_agent::fault::{
     FAULT_RECEIPT_ENV, GROUP_DESTINATION_ENV, GROUP_FILES_ENV, GROUP_SOURCE_ENV,
 };
 use bulkload_agent::freshness::NullCache;
-use bulkload_agent::materialize::RENAME_UNSUPPORTED_ENV;
+use bulkload_agent::materialize::{DIRECTORY_BATCH_ENV, RENAME_UNSUPPORTED_ENV};
 use bulkload_agent::transfer::{copy, TransferStats};
 use bulkload_agent::transfer_store::Manifest;
 use bulkload_agent::walk::{walk, WalkOptions};
@@ -207,7 +207,26 @@ struct Fixture {
     /// The fault is armed in a rerun over changed seats, after a clean first
     /// copy (see "Superseding reruns").
     superseding: bool,
+    /// Directory batching (OI-1003-Q143 item 2): [`BATCH_DIRECTORIES`] more
+    /// new directories, two levels of one batch.
+    directories: bool,
+    /// The crash child's batch cap ([`DIRECTORY_BATCH_ENV`]); 0 keeps the
+    /// default.
+    batch: u8,
 }
+
+/// The directories of a `directories` fixture, beside `nested`: four
+/// siblings under the root and a child under two of them, each with a file
+/// and a mode other than 0700. With `nested` the batch's first level holds
+/// five directories and its second two (`nested`'s files are no directory).
+const BATCH_DIRECTORIES: [(&str, u32); 6] = [
+    ("batch-a", 0o755),
+    ("batch-a/inner", 0o750),
+    ("batch-b", 0o751),
+    ("batch-c", 0o755),
+    ("batch-c/inner", 0o755),
+    ("batch-d", 0o710),
+];
 
 /// The transfer.rs shapes: many small distinct files (half in a nested
 /// directory), one file larger than `LARGE_CHUNKS × CDC_MAX`, and optionally
@@ -224,6 +243,23 @@ fn populate(source: &Path, fixture: Fixture) {
         .unwrap();
     }
     fs::write(source.join("large"), large_content()).unwrap();
+    if fixture.directories {
+        for (index, (directory, _)) in BATCH_DIRECTORIES.iter().enumerate() {
+            fs::create_dir(source.join(directory)).unwrap();
+            fs::write(
+                source.join(directory).join("f"),
+                noise(500 + index as u64, 3_000 + index),
+            )
+            .unwrap();
+        }
+        for (directory, mode) in BATCH_DIRECTORIES.iter().rev() {
+            fs::set_permissions(
+                source.join(directory),
+                std::os::unix::fs::PermissionsExt::from_mode(*mode),
+            )
+            .unwrap();
+        }
+    }
     if fixture.refused {
         fs::write(source.join(REFUSED), b"SQLite format 3\0refused raw copy").unwrap();
     }
@@ -537,8 +573,14 @@ enum Swept {
 
 /// [`crash_child`] for the crash sweep, where running out of hits is the
 /// end of a point's sweep and not a failure.
-fn crash_child_if_reached(scratch: &Scratch, point: Point, label: &str, mid: bool) -> Swept {
-    let child = run_crash_child(scratch, point, label, mid, &[]);
+fn crash_child_if_reached(
+    scratch: &Scratch,
+    point: Point,
+    label: &str,
+    mid: bool,
+    envs: &[(&str, &str)],
+) -> Swept {
+    let child = run_crash_child(scratch, point, label, mid, envs);
     if child.status.code() == Some(0)
         && String::from_utf8_lossy(&child.stderr).contains(NOT_REACHED)
     {
@@ -735,12 +777,20 @@ fn assert_complete(
         );
     }
     if !fixture.refused {
-        let mode = |root: PathBuf| fs::metadata(root.join("nested")).unwrap().mode() & 0o7777;
-        assert_eq!(
-            mode(scratch.destination()),
-            mode(scratch.source()),
-            "{label}: directory mode not finalized"
+        let directories = std::iter::once("nested").chain(
+            BATCH_DIRECTORIES
+                .iter()
+                .filter(|_| fixture.directories)
+                .map(|(directory, _)| *directory),
         );
+        for directory in directories {
+            let mode = |root: PathBuf| fs::metadata(root.join(directory)).unwrap().mode() & 0o7777;
+            assert_eq!(
+                mode(scratch.destination()),
+                mode(scratch.source()),
+                "{label}: directory mode of {directory} not finalized"
+            );
+        }
     }
 }
 
@@ -999,7 +1049,12 @@ fn crash_resume_with(
     let label = format!("{}:{nth}", point.name());
     let scratch = Scratch::new(&point.name().replace('.', "-"));
     populate(&scratch.source(), fixture);
-    let group = crash_child(&scratch, point, &label, nth > 1, envs);
+    let batch = fixture.batch.to_string();
+    let mut envs = envs.to_vec();
+    if fixture.batch > 0 {
+        envs.push((DIRECTORY_BATCH_ENV, batch.as_str()));
+    }
+    let group = crash_child(&scratch, point, &label, nth > 1, &envs);
     resume_after_crash(point, &label, &scratch, fixture, group, check_before);
 }
 
@@ -1009,7 +1064,14 @@ fn crash_resume_if_reached(point: Point, nth: u64, fixture: Fixture) -> bool {
     let label = format!("{}:{nth}", point.name());
     let scratch = Scratch::new(&point.name().replace('.', "-"));
     populate(&scratch.source(), fixture);
-    let Swept::Crashed(group) = crash_child_if_reached(&scratch, point, &label, nth > 1) else {
+    let batch = fixture.batch.to_string();
+    let envs: Vec<(&str, &str)> = if fixture.batch > 0 {
+        vec![(DIRECTORY_BATCH_ENV, batch.as_str())]
+    } else {
+        Vec::new()
+    };
+    let Swept::Crashed(group) = crash_child_if_reached(&scratch, point, &label, nth > 1, &envs)
+    else {
         return false;
     };
     resume_after_crash(point, &label, &scratch, fixture, group, |_| {});
@@ -1170,14 +1232,35 @@ fn crash_child_entry() {
 const WITH_REFUSAL: Fixture = Fixture {
     refused: true,
     superseding: false,
+    directories: false,
+    batch: 0,
 };
 const NO_REFUSAL: Fixture = Fixture {
     refused: false,
     superseding: false,
+    directories: false,
+    batch: 0,
+};
+/// Directory batching (OI-1003-Q143 item 2): the batch's directories, at
+/// the child's default cap.
+const DIRECTORIES: Fixture = Fixture {
+    refused: false,
+    superseding: false,
+    directories: true,
+    batch: 0,
+};
+/// The same directories, one at a time (`BULKLOAD_FAULT_DIR_BATCH=1`).
+const DIRECTORIES_ONE: Fixture = Fixture {
+    refused: false,
+    superseding: false,
+    directories: true,
+    batch: 1,
 };
 const SUPERSEDING: Fixture = Fixture {
     refused: false,
     superseding: true,
+    directories: false,
+    batch: 0,
 };
 
 /// What a row of the `scenarios!` table runs at its fault point: a `copy`
@@ -1256,6 +1339,24 @@ scenarios! {
     // take the mkdirat fallback; its intent record, committed first, lets the
     // resume adopt the directory the crash left.
     directory_after_fallback_mkdir => DirectoryAfterFallbackMkdir: 1, NO_REFUSAL;
+    // OI-1003-Q143 item 2: a batch of seven new directories in two levels
+    // (five, then two), crashed at its first, a middle and its last member,
+    // after each level's one commit, and in its finish; and the same points
+    // with the batch cap at one, as before batching.
+    directory_batch_after_mkdir_first => DirectoryAfterMkdir: 1, DIRECTORIES;
+    directory_batch_after_mkdir_mid => DirectoryAfterMkdir: 3, DIRECTORIES;
+    directory_batch_after_mkdir_last => DirectoryAfterMkdir: 7, DIRECTORIES;
+    directory_batch_after_pending_record_first => DirectoryAfterPendingRecord: 1, DIRECTORIES;
+    directory_batch_after_pending_record_last => DirectoryAfterPendingRecord: 2, DIRECTORIES;
+    directory_batch_after_rename_first => DirectoryAfterRename: 1, DIRECTORIES;
+    directory_batch_after_rename_mid => DirectoryAfterRename: 3, DIRECTORIES;
+    directory_batch_after_rename_last => DirectoryAfterRename: 7, DIRECTORIES;
+    directory_batch_before_complete_first => DirectoryBeforeComplete: 1, DIRECTORIES;
+    directory_batch_before_complete_mid => DirectoryBeforeComplete: 4, DIRECTORIES;
+    directory_batch_before_complete_last => DirectoryBeforeComplete: 7, DIRECTORIES;
+    directory_one_after_mkdir_mid => DirectoryAfterMkdir: 3, DIRECTORIES_ONE;
+    directory_one_after_rename_mid => DirectoryAfterRename: 3, DIRECTORIES_ONE;
+    directory_one_before_complete_mid => DirectoryBeforeComplete: 4, DIRECTORIES_ONE;
     serve_after_content_mid => ServeAfterContent: 25, WITH_REFUSAL;
     serve_before_done => ServeBeforeDone: 1, WITH_REFUSAL;
     receive_after_decide_first => ReceiveAfterDecide: 1, WITH_REFUSAL;
@@ -1304,10 +1405,12 @@ const SWEEP_FAILURES_PER_POINT: usize = 3;
 fn sweep_rows() -> Vec<(Point, Fixture, u64)> {
     let mut rows: Vec<(Point, Fixture, u64)> = Vec::new();
     for (point, nth, fixture) in &scenarios() {
-        if let Some(row) = rows
-            .iter_mut()
-            .find(|row| row.0 == *point && row.1.superseding == fixture.superseding)
-        {
+        if let Some(row) = rows.iter_mut().find(|row| {
+            row.0 == *point
+                && row.1.superseding == fixture.superseding
+                && row.1.directories == fixture.directories
+                && row.1.batch == fixture.batch
+        }) {
             assert_eq!(
                 row.1.refused,
                 fixture.refused,

@@ -136,28 +136,40 @@ fn noise(seed: u64, length: usize) -> Vec<u8> {
         .collect()
 }
 
-/// Small files in the root and in two nested directories whose modes differ
-/// from the 0700 they are created with, and one symlink.
+/// Small files in the root and in nested directories whose modes differ
+/// from the 0700 they are created with, and one symlink. The directories
+/// make two levels of a batch (OI-1003-Q143 item 2): `nested` and `nested2`
+/// under the root, then `nested/deeper`, `nested/deeper2` and
+/// `nested2/inner` under two parents. `nested2` holds no file of its own,
+/// so only the batch's own seal makes `inner`'s name durable before
+/// `inner/g` commits.
 fn populate(source: &Path) {
     fs::create_dir_all(source.join("nested/deeper")).unwrap();
+    fs::create_dir_all(source.join("nested/deeper2")).unwrap();
+    fs::create_dir_all(source.join("nested2/inner")).unwrap();
     for (index, (path, length)) in [
         ("a", 3_000),
         ("b", 40_000),
         ("nested/c", 5_000),
         ("nested/d", 9_000),
         ("nested/deeper/e", 2_000),
+        ("nested/deeper2/h", 1_000),
+        ("nested2/inner/g", 1_500),
     ]
     .into_iter()
     .enumerate()
     {
         fs::write(source.join(path), noise(index as u64 + 7, length)).unwrap();
     }
-    fs::set_permissions(source.join("nested"), fs::Permissions::from_mode(0o750)).unwrap();
-    fs::set_permissions(
-        source.join("nested/deeper"),
-        fs::Permissions::from_mode(0o755),
-    )
-    .unwrap();
+    for (directory, mode) in [
+        ("nested", 0o750),
+        ("nested/deeper", 0o755),
+        ("nested/deeper2", 0o751),
+        ("nested2", 0o755),
+        ("nested2/inner", 0o750),
+    ] {
+        fs::set_permissions(source.join(directory), fs::Permissions::from_mode(mode)).unwrap();
+    }
     std::os::unix::fs::symlink("a", source.join("link")).unwrap();
     // Fresh seats are racy for one timestamp tick and their captures are
     // never recorded (#86); settle them so every capture commits and the
@@ -306,10 +318,94 @@ fn committed_record(
         // a first copy supersedes nothing (the superseding proofs
         // below read those records).
         CommitRecord::DirectoryCreated { node: None, .. }
+        | CommitRecord::DirectoryCleared { .. }
         | CommitRecord::RootSealed
         | CommitRecord::RefusedSeat { .. }
         | CommitRecord::SupersedeBegun { .. }
         | CommitRecord::SupersedeSettled { .. } => {}
+    }
+    Ok(())
+}
+
+/// The directory a key names, for a directory record.
+fn parent_of(rel: &[u8]) -> &[u8] {
+    rel.iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or(&[][..], |end| &rel[..end])
+}
+
+/// **Directory ownership** (R-N102; #217 review, findings 1, 9 and 10),
+/// replayed from the commits that completed: a record bound to an inode
+/// names it at the record's path, or under a temporary name directly in
+/// the record's parent, never inside a directory a sweep could not remove;
+/// and every directory at a final name the pre-copy image did not hold is
+/// bound by its record to that very inode, covered by an intent, or
+/// completed. A cleared record (`DirectoryCleared`: a discard, a swept
+/// temporary, a stale record) vouches for nothing.
+fn directory_ownership(
+    events: &[Event],
+    view: View<'_>,
+    info: &StateInfo,
+    before: &BTreeSet<Vec<u8>>,
+) -> Result<(), String> {
+    let name = |rel: &[u8]| String::from_utf8_lossy(rel).into_owned();
+    let mut bound: BTreeMap<Vec<u8>, Option<NodeId>> = BTreeMap::new();
+    let mut completed = BTreeSet::new();
+    for commit in &info.commits {
+        let Event::Commit { records, .. } = &events[*commit] else {
+            continue;
+        };
+        for record in records {
+            match record {
+                CommitRecord::DirectoryCreated { key, node, .. } => {
+                    completed.remove(&key_path(key));
+                    bound.insert(key_path(key), *node);
+                }
+                CommitRecord::DirectoryComplete { key } => {
+                    bound.remove(&key_path(key));
+                    completed.insert(key_path(key));
+                }
+                CommitRecord::DirectoryCleared { key } => {
+                    bound.remove(&key_path(key));
+                }
+                _ => {}
+            }
+        }
+    }
+    for (rel, node) in &bound {
+        let Some(node) = node else {
+            continue;
+        };
+        for path in view.paths_of(*node) {
+            if path != *rel && !(parent_of(&path) == parent_of(rel) && is_temporary(&path)) {
+                return Err(format!(
+                    "recorded directory {} is reached at {}, inside a directory not yet named",
+                    name(rel),
+                    name(&path)
+                ));
+            }
+        }
+    }
+    for (rel, entry) in view.walk() {
+        if !matches!(entry, Entry::Dir { .. })
+            || before.contains(&rel)
+            || rel
+                .split(|byte| *byte == b'/')
+                .any(|part| part.starts_with(TEMP_PREFIX))
+        {
+            continue;
+        }
+        let owned = match bound.get(&rel) {
+            Some(Some(node)) => view.node_at(&rel) == Some(*node),
+            Some(None) => true,
+            None => completed.contains(&rel),
+        };
+        if !owned {
+            return Err(format!(
+                "directory {} at its final name is owned by no record",
+                name(&rel)
+            ));
+        }
     }
     Ok(())
 }
@@ -329,6 +425,7 @@ fn invariant(
             committed_record(expected, view, record)?;
         }
     }
+    directory_ownership(events, view, info, &BTreeSet::new())?;
     for (rel, entry) in view.walk() {
         if is_temporary(&rel) {
             continue;
@@ -1360,6 +1457,8 @@ fn every_power_loss_state_of_a_relaxed_ledger_costs_at_most_its_lost_seats() {
     fs::write(scratch.source().join("f"), noise(101, 7_000)).unwrap();
     fs::write(scratch.source().join("nested/g"), noise(103, 11_000)).unwrap();
     bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    // One reuse row per regular file of the corpus, the two new seats in.
+    let files = expected(&scratch.source()).files.len() as u64;
     let (_, events) = traced_copy(&scratch);
     let second = ledger_commits(&events, node(&state));
     assert!(!commits.is_empty() && !second.is_empty());
@@ -1371,7 +1470,11 @@ fn every_power_loss_state_of_a_relaxed_ledger_costs_at_most_its_lost_seats() {
         "every row commit of the copy was relaxed"
     );
     let keys: Vec<Vec<u8>> = commits.iter().flatten().cloned().collect();
-    assert_eq!(keys.len(), 7, "one row per regular file of the corpus");
+    assert_eq!(
+        keys.len() as u64,
+        files,
+        "one row per regular file of the corpus"
+    );
 
     let pristine = fs::read(&wal).unwrap();
     let main_before = fs::read(&database).unwrap();
@@ -1431,7 +1534,7 @@ fn every_power_loss_state_of_a_relaxed_ledger_costs_at_most_its_lost_seats() {
             "cut {cut}: {survived} of {} row commits survived, and no held seat is read",
             commits.len()
         );
-        assert_eq!(resumed.reused, 7, "cut {cut}");
+        assert_eq!(resumed.reused, files, "cut {cut}");
         assert_eq!(tree(&scratch.destination()), want, "cut {cut}");
         cut += frame;
     }
@@ -1453,10 +1556,411 @@ fn every_power_loss_state_of_a_relaxed_ledger_costs_at_most_its_lost_seats() {
     let resumed = run_copy(&scratch);
     assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
     assert_eq!(resumed.source_bytes_read, 40_000, "seat b, once");
-    assert_eq!(resumed.reused, 6);
+    assert_eq!(resumed.reused, files - 1, "every seat but b");
     assert_eq!(tree(&scratch.destination()), want);
     assert_eq!(Store::open(&state).unwrap().authority().unwrap(), authority);
     let settled = run_copy(&scratch);
     assert_eq!(settled.source_bytes_read, 0);
-    assert_eq!(settled.reused, 7);
+    assert_eq!(settled.reused, files);
+}
+
+// ---------------------------------------------------------------------------
+// Directory batching (OI-1003-Q143 item 2, #217 review)
+// ---------------------------------------------------------------------------
+
+/// The level-2 directories of [`populate`] and their two parents, by node.
+struct Level {
+    members: Vec<NodeId>,
+    parents: [NodeId; 2],
+    all: Vec<NodeId>,
+}
+
+fn level(scratch: &Scratch) -> Level {
+    let at = |rel: &str| node(&scratch.destination().join(rel));
+    Level {
+        members: vec![
+            at("nested/deeper"),
+            at("nested/deeper2"),
+            at("nested2/inner"),
+        ],
+        parents: [at("nested"), at("nested2")],
+        all: [
+            "nested",
+            "nested2",
+            "nested/deeper",
+            "nested/deeper2",
+            "nested2/inner",
+        ]
+        .into_iter()
+        .map(at)
+        .collect(),
+    }
+}
+
+/// The trace index of the one commit binding every member of the level.
+fn level_commit(events: &[Event], level: &Level) -> usize {
+    let found: Vec<usize> = (0..events.len())
+        .filter(|at| {
+            matches!(&events[*at], Event::Commit { records, .. } if level.members.iter().all(|member| records.iter().any(|record| matches!(record, CommitRecord::DirectoryCreated { node: Some(node), .. } if node == member))))
+        })
+        .collect();
+    assert_eq!(found.len(), 1, "one commit binds the whole level");
+    found[0]
+}
+
+/// Move the event at `from` to just before `to`.
+fn moved(events: &[Event], from: usize, to: usize) -> Vec<Event> {
+    let mut out = events.to_vec();
+    let event = out.remove(from);
+    let to = if from < to { to - 1 } else { to };
+    out.insert(to, event);
+    out
+}
+
+fn violations(image: &Image, want: &Expected, events: &[Event]) -> Vec<String> {
+    let report = check_view(image, events, &options(), |view, info| {
+        invariant(want, events, view, info)
+    })
+    .unwrap();
+    report
+        .violations
+        .iter()
+        .map(|violation| violation.message.clone())
+        .collect()
+}
+
+/// The batched directory proofs have teeth: one strict-mode copy of
+/// [`populate`] (strict, so no batched group's device seal persists the
+/// level's names behind the batch's back), then each of the batch's orders
+/// undone in its trace, and each must fail:
+///
+/// - the level's commit moved before its parents' seals: a record names an
+///   inode a power loss can still lose;
+/// - the level's renames moved before its commit: a directory at its final
+///   name with no record;
+/// - the second parent's seal after the renames dropped: an output
+///   committed inside a directory whose name is not durable;
+/// - the finish's one commit moved before the last directory's seal: a
+///   completed directory without its final mode.
+#[test]
+fn the_batched_directory_proofs_have_teeth() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Strict);
+    let scratch = Scratch::new("batch-teeth");
+    populate(&scratch.source());
+    let want = expected(&scratch.source());
+    let (image, events) = traced_copy(&scratch);
+    set_durability(Durability::Group);
+    let level = level(&scratch);
+    assert!(
+        violations(&image, &want, &events).is_empty(),
+        "the unmutated trace passes"
+    );
+    let commit = level_commit(&events, &level);
+    let last_mkdir = (0..commit)
+        .rev()
+        .find(
+            |at| matches!(&events[*at], Event::Mkdir { node, .. } if level.members.contains(node)),
+        )
+        .unwrap();
+    // The level's commit before its parents' seals.
+    let early = moved(&events, commit, last_mkdir + 1);
+    let found = violations(&image, &want, &early);
+    assert!(
+        found
+            .iter()
+            .any(|message| message.starts_with("recorded directory inode")),
+        "a level committed before its parents' seals: {found:?}"
+    );
+    // The level's renames before its commit.
+    let renames: Vec<usize> = (commit..events.len())
+        .filter(
+            |at| matches!(&events[*at], Event::Rename { node, .. } if level.members.contains(node)),
+        )
+        .collect();
+    assert_eq!(renames.len(), level.members.len());
+    let mut renamed_first = events.clone();
+    for (shift, at) in renames.iter().enumerate() {
+        renamed_first = moved(&renamed_first, *at, commit + shift);
+    }
+    let found = violations(&image, &want, &renamed_first);
+    assert!(
+        found
+            .iter()
+            .any(|message| message.contains("owned by no record")),
+        "renames before the level's commit: {found:?}"
+    );
+    // The second parent's seal after the renames dropped.
+    let last_rename = *renames.last().unwrap();
+    let second_seal = (last_rename..events.len())
+        .find(|at| matches!(&events[*at], Event::Sync { node, .. } if *node == level.parents[1]))
+        .unwrap();
+    let mut unsealed = events.clone();
+    unsealed.remove(second_seal);
+    let found = violations(&image, &want, &unsealed);
+    assert!(
+        found
+            .iter()
+            .any(|message| message.contains("nested2/inner/g")),
+        "the second parent's seal dropped: {found:?}"
+    );
+    // The finish's commit before the last directory's seal.
+    let finish = (0..events.len())
+        .find(|at| {
+            matches!(&events[*at], Event::Commit { records, .. } if records.iter().filter(|record| matches!(record, CommitRecord::DirectoryComplete { .. })).count() == level.all.len())
+        })
+        .expect("one commit completes every directory");
+    let last_seal = (0..finish)
+        .rev()
+        .find(|at| matches!(&events[*at], Event::Sync { node, .. } if level.all.contains(node)))
+        .unwrap();
+    let completed_first = moved(&events, finish, last_seal);
+    let found = violations(&image, &want, &completed_first);
+    assert!(
+        found
+            .iter()
+            .any(|message| message.starts_with("completed directory")),
+        "the finish committed before the last seal: {found:?}"
+    );
+}
+
+/// The directory segment alone, exhaustively (#217 review, finding 9): a
+/// copy of a tree of directories only, two levels of two siblings each,
+/// whose every crash point is explored with every subset of its optional
+/// operations (no bounded point), in group mode.
+#[test]
+fn every_power_loss_state_of_a_directory_batch_is_explored() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("directories-only");
+    for directory in ["p", "q", "p/r", "q/s"] {
+        fs::create_dir(scratch.source().join(directory)).unwrap();
+        fs::set_permissions(
+            scratch.source().join(directory),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    let want = expected(&scratch.source());
+    let (image, events) = traced_copy(&scratch);
+    let report = check_view(
+        &image,
+        &events,
+        &Options {
+            ignore_foreign: true,
+            accept_bounded: false,
+            exhaustive_limit: 16,
+            ..Options::default()
+        },
+        |view, info| invariant(&want, &events, view, info),
+    )
+    .unwrap();
+    eprintln!("{}", report.summary(&events));
+    assert!(report.bounded.is_empty(), "{}", report.summary(&events));
+    assert!(report.passed(), "{}", report.summary(&events));
+}
+
+/// A whole strict copy, explored exhaustively (S1 throughput review,
+/// 2026-10-09, findings 3 and 4): every crash point with every subset of
+/// its optional operations. [`populate`]'s strict copy is bounded (30 of
+/// its crash points here; the pre-batching fixture's was bounded at 12 to
+/// 14 of 60 already, at `dd33936`), so this small tree keeps an exhaustive
+/// strict-mode proof of a copy: a file and a symlink in the root, two
+/// levels of two sibling directories (one batch, a level with two
+/// parents), and a file under a second-level member, so the batch's rule
+/// that a member's name is sealed before anything inside it commits is
+/// proven with a file present.
+#[test]
+fn every_power_loss_state_of_a_small_strict_copy_is_explored() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Strict);
+    let scratch = Scratch::new("strict-small");
+    for directory in ["p", "q", "p/r", "q/s"] {
+        fs::create_dir(scratch.source().join(directory)).unwrap();
+    }
+    fs::write(scratch.source().join("a"), noise(19, 300)).unwrap();
+    fs::write(scratch.source().join("q/s/f"), noise(17, 600)).unwrap();
+    std::os::unix::fs::symlink("a", scratch.source().join("link")).unwrap();
+    for directory in ["p", "q", "p/r", "q/s"] {
+        fs::set_permissions(
+            scratch.source().join(directory),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    let want = expected(&scratch.source());
+    let (image, events) = traced_copy(&scratch);
+    set_durability(Durability::Group);
+    assert!(
+        events.iter().any(|event| matches!(event, Event::Commit { records, .. }
+            if records.iter().any(|record| matches!(record, CommitRecord::Output { rel_path } if rel_path == b"q/s/f")))),
+        "the file under the second level commits"
+    );
+    let report = check_view(
+        &image,
+        &events,
+        &Options {
+            ignore_foreign: true,
+            accept_bounded: false,
+            exhaustive_limit: 16,
+            ..Options::default()
+        },
+        |view, info| invariant(&want, &events, view, info),
+    )
+    .unwrap();
+    eprintln!("{}", report.summary(&events));
+    assert!(report.bounded.is_empty(), "{}", report.summary(&events));
+    assert!(report.passed(), "{}", report.summary(&events));
+    // Teeth: without the seal of `q` after `q/s`'s rename, `q/s/f` commits
+    // inside a directory whose name a power loss can still take.
+    let (parent, member) = (
+        node(&scratch.destination().join("q")),
+        node(&scratch.destination().join("q/s")),
+    );
+    let renamed = events
+        .iter()
+        .position(|event| matches!(event, Event::Rename { node, .. } if *node == member))
+        .unwrap();
+    let seal = (renamed..events.len())
+        .find(|at| matches!(&events[*at], Event::Sync { node, .. } if *node == parent))
+        .unwrap();
+    let mut unsealed = events;
+    unsealed.remove(seal);
+    let found = violations(&image, &want, &unsealed);
+    assert!(
+        found.iter().any(|message| message.contains("q/s/f")),
+        "the member's parent seal dropped: {found:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Receive workers and write-back kicks (OI-1003-Q143 items 1a and 3)
+// ---------------------------------------------------------------------------
+
+/// **Every write precedes its file's seal** (OI-1003-Q143 item 3: `End`
+/// waits for every chunk job of its entry): the writes of `file`, published
+/// at `rel`, all come before the seal its output commit relies on, which is
+/// the last durable sync of the file itself (a kick is none) or the last
+/// device seal before that commit. Returns how many writes it checked.
+fn writes_precede_seal(events: &[Event], file: NodeId, rel: &[u8]) -> Result<usize, String> {
+    let commit = events
+        .iter()
+        .position(|event| {
+            matches!(event, Event::Commit { records, .. }
+                if records.iter().any(|record| matches!(record, CommitRecord::Output { rel_path } if rel_path == rel)))
+        })
+        .ok_or("the output never commits")?;
+    let seal = (0..commit)
+        .rev()
+        .find(|at| match &events[*at] {
+            Event::Sync { node, kind } => {
+                matches!(kind, SyncKind::FsSync)
+                    || (*node == file && !matches!(kind, SyncKind::Kick))
+            }
+            _ => false,
+        })
+        .ok_or("the file is never sealed before its commit")?;
+    let mut checked = 0;
+    for (at, event) in events.iter().enumerate() {
+        if matches!(event, Event::Write { node, .. } if *node == file) {
+            if at > seal {
+                return Err(format!(
+                    "write at event {at} comes after the seal at event {seal} its commit at event {commit} relies on"
+                ));
+            }
+            checked += 1;
+        }
+    }
+    Ok(checked)
+}
+
+/// S1 throughput review (2026-10-09), finding 6: a power-loss trace with
+/// chunks written by two receive workers and write-back kicked while the
+/// data streams. A file of several chunks (and a small one) is copied in
+/// group mode with two workers, each waiting 300 ms before its job (so
+/// `End` arrives while the file's jobs are still running, and only its
+/// wait keeps their writes ahead of the seal), and a 64 KiB kick interval.
+/// The ordering is checked first, before the copy's outcome: every write
+/// precedes the file's seal. Then the trace holds the chunk writes and, on
+/// Linux, the kicks, and every power-loss state is consistent. Last, the
+/// trace with one chunk write moved after the file's output commit must
+/// fail both the ordering check and the power-loss check.
+#[test]
+fn every_power_loss_state_of_a_worker_written_copy_is_consistent() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("workers");
+    fs::write(scratch.source().join("large"), noise(23, 400_000)).unwrap();
+    fs::write(scratch.source().join("small"), noise(29, 2_000)).unwrap();
+    bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    let want = expected(&scratch.source());
+    let destination = fs::canonicalize(scratch.destination()).unwrap();
+    bulkload_agent::transfer::set_recv_workers(&destination, Some(2));
+    bulkload_agent::transfer::set_writeback_kick_bytes(64 * 1024);
+    bulkload_agent::transfer::set_recv_worker_delay(300);
+    let before = bulkload_agent::transfer::TransferTiming::snapshot();
+    let image = Image::scan(&scratch.destination()).unwrap();
+    let recorder = Recorder::new();
+    let copied = {
+        let _process = recorder.attach_process();
+        copy(
+            &scratch.source(),
+            &scratch.destination(),
+            &scratch.base.join("source-state"),
+            &scratch.base.join("destination-state"),
+        )
+    };
+    let events = recorder.take();
+    let timing = bulkload_agent::transfer::TransferTiming::snapshot().since(before);
+    bulkload_agent::transfer::set_recv_worker_delay(0);
+    bulkload_agent::transfer::set_writeback_kick_bytes(0);
+    bulkload_agent::transfer::set_recv_workers(&destination, None);
+    let large = node(&scratch.destination().join("large"));
+    let writes = writes_precede_seal(&events, large, b"large").unwrap();
+    let stats = copied.unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert!(
+        timing.recv_worker_place_ns > 0,
+        "the receive workers wrote: {}",
+        timing.render()
+    );
+    assert!(writes >= 4, "{writes} chunk writes");
+    let kicks = events
+        .iter()
+        .filter(
+            |event| matches!(event, Event::Sync { node, kind: SyncKind::Kick } if *node == large),
+        )
+        .count();
+    if cfg!(target_os = "linux") {
+        assert!(kicks >= 4, "{kicks} kicks while the data streamed");
+    }
+    let report = check_view(&image, &events, &options(), |view, info| {
+        invariant(&want, &events, view, info)
+    })
+    .unwrap();
+    eprintln!("{}", report.summary(&events));
+    assert!(report.passed(), "{}", report.summary(&events));
+    // Teeth: the file's last chunk write moved after its output commit.
+    let last = events
+        .iter()
+        .rposition(|event| matches!(event, Event::Write { node, .. } if *node == large))
+        .unwrap();
+    let commit = events
+        .iter()
+        .position(|event| {
+            matches!(event, Event::Commit { records, .. }
+                if records.iter().any(|record| matches!(record, CommitRecord::Output { rel_path } if rel_path == b"large")))
+        })
+        .unwrap();
+    let late = moved(&events, last, commit + 1);
+    assert!(
+        writes_precede_seal(&late, large, b"large").is_err(),
+        "a write after the seal passes the ordering check"
+    );
+    let found = violations(&image, &want, &late);
+    assert!(
+        found.iter().any(|message| message.contains("large")),
+        "a write after the file's commit passes the power-loss check: {found:?}"
+    );
 }

@@ -46,6 +46,8 @@ and design disagreements](#code-and-design-disagreements)).
 | [`configs_gc.tsv`](configs_gc.tsv), `MC_gc_*.cfg` | GitCarry.tla's run order and configs, in the same format, rendered from [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall). |
 | [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by both modules. |
 | [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | The reference decision core `decide`, its pinned rows ([`decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv)), and an explorer of GitCarry.tla. |
+| [`DirectoryRecords.tla`](DirectoryRecords.tla) | Directory records (R-N102, R-N119) and their batching (OI-1003-Q143 item 2), under per-name power loss and reused inode numbers ([Directory records](#directory-records-r-n102-oi-1003-q143)). |
+| [`configs_dir.tsv`](configs_dir.tsv), `MC_dir_*.cfg` | DirectoryRecords.tla's run order and configs, rendered from [`catalogue/Directories.dhall`](catalogue/Directories.dhall). |
 
 ## Running it
 
@@ -1359,8 +1361,10 @@ The model proves the protocol, within its bounds. It does not prove:
   are deleted (OI-1003-Q44, OI-1003-Q56; tag `carry-v2-final`), so there is
   nothing of them to model. The reserved git sub-stream frames and estate
   apply's `.done` journals are modelled nowhere.
-- **The tree.** Directories and their records (R-N102), symlinks, `Skip`,
-  engine temporaries, walk caps and devices other than the store's.
+- **The tree.** Symlinks, `Skip`, engine temporaries, walk caps and
+  devices other than the store's. Directories and their records (R-N102)
+  are [DirectoryRecords.tla](#directory-records-r-n102-oi-1003-q143)'s,
+  not BulkloadTransfer.tla's.
 - **Storage below the store.** The Darwin barrier model belongs to
   `crash_check` (R-N88: P13, P14). SQLite corruption, torn pages and
   reordered writes under `fullfsync=OFF` are outside the model (see the
@@ -2247,6 +2251,94 @@ differed.
   offers a based link whose bound base is lost, where `extend` does not
   read `prev_base` for a based link; the capture is then the plan base's
   delta, as under v1.
+
+## Directory records (R-N102, OI-1003-Q143)
+
+`DirectoryRecords.tla` is a module of its own (as GitCarry is): the
+directory records' only coupling to the transfer is "an output commits
+inside a directory only after its rename is sealed", which it models as
+`ChildCommit`. Composing per-directory state into `BulkloadTransfer.tla`
+would multiply a state space already at its budget.
+
+**What it models.** Two siblings under the root and, with `Deep`, a child
+under each (a level with two parents). Each directory is created as
+`Destination::directory` and `Destination::create_directories` create one:
+a tagged `mkdirat`, its parent sealed, its record bound to the inode
+(`Record(S)`: one commit for a set under `BatchCreate`), an exclusive
+rename (a taken name: `EEXIST`, discarded record first, then the
+temporary), its parent sealed again; or, with `NoReplaceRename = FALSE`,
+R-N119's intent, a plain `mkdirat` at the final name, its parent sealed,
+the record bound. A directory is decided only after its parent
+(`CanDecide`: the root, a created or adopted directory, or a third party's
+directory at a refused name); deciding an existing directory sweeps it
+(records bound to a temporary cleared first, then the empty temporary
+removed and the directory sealed) and adopts it only when its record names
+its inode, sealing its parent first. Finishing is deepest first, mode then
+seal, then the completion (`Complete(S)`: every finished directory in one
+commit under `BatchFinish`). The environment: `Stop` (the process dies;
+names stay), `PowerLoss` (each unsealed name kept or lost on its own, as a
+prefix of its mkdir and rename; each unsealed mode kept or lost; nothing
+inside a directory whose creation was lost), `EnvSeal(p)` (any other seal
+of `p`, or a journal force), `Foreign` and `ForeignReplace` (a third
+party's directory at a free name, taking any free inode number,
+`SYMMETRY InoSymmetry`).
+
+**Properties.** `RecordNamesDirectory` (a record bound to an inode names
+its directory under a durable name), `NoStrandedDirectory` (R-N102: a
+directory of ours durable at its final name, never completed, is bound by
+its record or an intent), `CompleteImpliesFinal`, `ChildImpliesNamed`,
+`NeverAdoptForeign`, `NoDirectoryUnderTemporary` (#217 review, finding 1:
+nothing of ours is durable inside a directory of ours whose final name is
+not). Witnesses: `Witness_PartialLevel` (one power loss keeps one sibling's
+rename and loses the other's, under one parent) and `Witness_AdoptBatched`
+(a directory bound in a shared commit is adopted after a crash).
+
+**Mutations** (each `MC_dir_neg_<mutation>`, which must violate its
+property): `record_before_seal` (`RecordNamesDirectory`),
+`rename_before_record` (`NoStrandedDirectory`), `child_before_dirseal`
+(`ChildImpliesNamed`), `complete_before_seal` (`CompleteImpliesFinal`),
+`level_seals_one_parent` (`RecordNamesDirectory`),
+`level_rename_seals_one_parent` (`ChildImpliesNamed`), `adopt_unbound`
+(`NeverAdoptForeign`), `discard_unlink_before_clear` (`NeverAdoptForeign`:
+the N3 hazard, a record bound to a freed inode number a third party's
+directory takes), `admit_under_held` (`NoDirectoryUnderTemporary`: the
+batch rule the #217 review refuted).
+
+**Abstraction map.** Files are `ChildCommit` only. Store commits are
+atomic and durable on return. One device (the code fully flushes a parent
+off the store's device). A fallback directory may revert to a temporary
+name in `PowerLoss` (an over-approximation). On a file system with no
+exclusive rename the code first makes a temporary and fails its rename;
+that discard is the `EEXIST` one, so the fallback is modelled from its
+intent. A third party's directory never has mode 0700 (R-N119's accepted
+limit: a same-user empty 0700 directory made between an intent and its
+`mkdirat`). `Record(S)` commits any set of sealed directories, a superset
+of the code's one level. Liveness is not modelled.
+
+**Results** (`just tla-check` with every `MC_dir_` config; TLC 1.7.4,
+3 workers; sting, shared and loaded, so wall times are not of record):
+
+| Config | Expect | Outcome | Violated | Distinct | Generated | Depth | Wall | RSS MiB |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| `MC_dir_budget_selftest` | inconclusive | **INCONCLUSIVE** | WithinBudget | ? | ? | - | 23s | 159 |
+| `MC_dir_per_dir` | pass | **PASS** | - | 306150 | 871198 | 47 | 750s | 1818 |
+| `MC_dir_batched` | pass | **PASS** | - | 581639 | 1692991 | 42 | 1181s | 1836 |
+| `MC_dir_batched_crashes` | pass | **PASS** | - | 41224 | 125290 | 29 | 41s | 765 |
+| `MC_dir_foreign_replace` | pass | **PASS** | - | 26533 | 91040 | 25 | 40s | 727 |
+| `MC_dir_fallback` | pass | **PASS** | - | 91044 | 258046 | 39 | 224s | 1574 |
+| `MC_dir_reach_partial_level` | reach | **REACHED** | Witness_PartialLevel | 304 | 714 | 11 | 118s | 293 |
+| `MC_dir_reach_adopt_batched` | reach | **REACHED** | Witness_AdoptBatched | 676 | 1497 | 12 | 69s | 305 |
+| `MC_dir_neg_record_before_seal` | fail | **FAIL** | RecordNamesDirectory | 21 | 36 | 5 | 24s | 200 |
+| `MC_dir_neg_rename_before_record` | fail | **FAIL** | NoStrandedDirectory | 66 | 126 | 6 | 22s | 204 |
+| `MC_dir_neg_child_before_dirseal` | fail | **FAIL** | ChildImpliesNamed | 108 | 224 | 8 | 21s | 233 |
+| `MC_dir_neg_complete_before_seal` | fail | **FAIL** | CompleteImpliesFinal | 585 | 1453 | 12 | 32s | 361 |
+| `MC_dir_neg_level_seals_one_parent` | fail | **FAIL** | RecordNamesDirectory | 487 | 1183 | 12 | 55s | 397 |
+| `MC_dir_neg_level_rename_seals_one_parent` | fail | **FAIL** | ChildImpliesNamed | 669 | 1673 | 12 | 58s | 357 |
+| `MC_dir_neg_adopt_unbound` | fail | **FAIL** | NeverAdoptForeign | 82 | 187 | 5 | 76s | 183 |
+| `MC_dir_neg_discard_unlink_before_clear` | fail | **FAIL** | NeverAdoptForeign | 7177 | 19725 | 13 | 44s | 382 |
+| `MC_dir_neg_admit_under_held` | fail | **FAIL** | NoDirectoryUnderTemporary | 490 | 1212 | 11 | 38s | 418 |
+
+Total wall 2807 s, peak RSS 1836 MiB (sting, load 150 to 250, 2026-10-08/09). Every pass row's never-enabled set matched its `never` column. Grounding: 36 operators, 10 constants, 9 mutations, 20 code symbols, all found. An extra, uncatalogued run of `MC_dir_batched`'s bound with two crashes (Deep, two runs, `MaxCrashes = 2`) passed at 1,191,551 distinct states in 4787 s with every invariant but `WithinBudget`; it is too long for the run order. `MC_dir_foreign_replace` was added after that run (S1 throughput review, 2026-10-09, finding 5: no pass row enabled `ForeignReplace`, which needs `MaxForeign = 2`, so only the negative `MC_dir_neg_discard_unlink_before_clear` exercised it) and checked on its own, `just tla-check MC_dir_foreign_replace`, 2026-10-09: PASS, `ForeignReplace` enabled (its never-enabled set is `Bind`, `FallbackMkdir`, `Intent` only).
 
 ## Frozen names
 

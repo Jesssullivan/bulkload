@@ -468,6 +468,31 @@ pub fn start_writeback(file: &File) {
     let _ = file;
 }
 
+/// Start write-back of a staged file while its data still streams
+/// (OI-1003-Q143 item 1a).
+///
+/// `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the whole file queues only
+/// dirty pages not already under write-back. Linux, group mode only, like
+/// [`start_writeback`]; a no-op elsewhere.
+///
+/// Nothing is durable by it, and the file's seal is unchanged. Without
+/// `WAIT_AFTER` the call never reaches `file_check_and_advance_wb_err`, so
+/// it leaves the descriptor's errseq cursor alone, and a later write-back
+/// error is still reported by the file's own `fsync`, or by a batched
+/// group's write-back check.
+///
+/// # Errors
+/// Returns the failed call: the caller refuses the entry with it.
+pub fn kick_writeback(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if durability() == Durability::Group {
+        counters::bump(Counter::WritebackKicks);
+        return super::sys::start_writeback(file);
+    }
+    let _ = file;
+    Ok(())
+}
+
 /// Seal every file of the file system holding `handle`: its data, metadata
 /// and directory entries.
 ///
