@@ -659,15 +659,23 @@ const PROBE_NOT_A_REPOSITORY: i32 = 4;
 /// Exit status of [`PROBE_SCRIPT`] when Git may not honour
 /// `GIT_NO_LAZY_FETCH`, or its version does not parse.
 const PROBE_GIT_TOO_OLD: i32 = 5;
+/// Exit status of [`PROBE_SCRIPT`] when the source borrows through
+/// alternates a capture cannot follow; its one stdout line is `alternates `
+/// and the alternates file that says so (S4, #219).
+const PROBE_ALTERNATES: i32 = 6;
 
 /// The offer probe, run by `bash -s -- PATH` locally and over ssh alike.
 ///
 /// POSIX sh plus `local`, so bash 3.2 (macOS) and bash 5 (sting) read it the
 /// same way. It runs no program but Git (`git version`, `rev-parse`,
 /// `config --get*` and `for-each-ref`) and reads the shallow and alternates
-/// files with the shell's `read`. Output: `gitdir` and `ceiling` lines
-/// (absolute paths), one `partial 0|1` line, then `shallow` and `tip` lines
-/// carrying one oid each, then `end`.
+/// files with the shell's `read` (and resolves an alternate with `cd -P`).
+/// Output: `gitdir` and `ceiling` lines (absolute paths), one `partial 0|1`
+/// line, then `shallow` and `tip` lines carrying one oid each, then `end`.
+/// Its alternates walk is capture's ([`super::alternates_walk`]): each
+/// store linked once, by its real path, so a self-reference, cycle or
+/// diamond costs no depth; an entry five stores down naming a store not yet
+/// linked, or a quoted entry, exits [`PROBE_ALTERNATES`] naming the file.
 pub const PROBE_SCRIPT: &str = r#"set -eu
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_NAMESPACE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CEILING_DIRECTORIES GIT_DISCOVERY_ACROSS_FILESYSTEM
 export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_GLOBAL=/dev/null GIT_NO_LAZY_FETCH=1 GIT_OPTIONAL_LOCKS=0 LC_ALL=C LANGUAGE=
@@ -737,22 +745,38 @@ for file in "$common/config" "$common/config.worktree" "$common"/worktrees/*/con
   [ -f "$file" ] || continue
   partial_config config --file "$file" --includes
 done
-promisor_packs() {
-  local store=$1 depth=$2 pack alternate
+unfollowable() { printf 'alternates %s\n' "$1"; exit 6; }
+linked=
+link_alternates() {
+  local store=$1 depth=$2 pack alternate real
   for pack in "$store"/pack/*.promisor; do [ ! -e "$pack" ] || partial=1; done
+  [ "$partial" = 0 ] || return 0
   [ -f "$store/info/alternates" ] || return 0
-  [ "$depth" -lt 5 ] || exit 1
   while IFS= read -r alternate || [ -n "$alternate" ]; do
     case "$alternate" in
       ''|'#'*) continue ;;
-      '"'*) exit 1 ;;
+      '"'*) unfollowable "$store/info/alternates" ;;
       /*) ;;
       *) alternate=$store/$alternate ;;
     esac
-    [ ! -d "$alternate" ] || promisor_packs "$alternate" $((depth + 1))
+    real=$(cd -P -- "$alternate" 2>/dev/null && pwd -P) || continue
+    case "$linked" in *"
+$real
+"*) continue ;; esac
+    [ "$depth" -lt 5 ] || unfollowable "$store/info/alternates"
+    linked="$linked$real
+"
+    link_alternates "$alternate" $((depth + 1))
+    [ "$partial" = 0 ] || return 0
   done < "$store/info/alternates"
 }
-promisor_packs "$objects" 0
+if [ "$partial" = 0 ]; then
+  real=$(cd -P -- "$objects" && pwd -P) || exit 1
+  linked="
+$real
+"
+  link_alternates "$objects" 0
+fi
 printf 'gitdir %s\n' "$gitdir"
 printf 'ceiling %s\n' "$GIT_CEILING_DIRECTORIES"
 printf 'root %s\n' "$root"
@@ -867,7 +891,19 @@ fn run_probe(
         Some(0) => None,
         Some(PROBE_NOT_A_REPOSITORY) => Some(BulkloadRefusal::GitRepositoryNotAtPath),
         Some(PROBE_GIT_TOO_OLD | 255) | None => Some(BulkloadRefusal::GitUnavailable),
-        Some(_) => Some(BulkloadRefusal::GitChildFailed(StderrClass::of(&head))),
+        // S4 (#219): the refusal capture raises for the same source.
+        Some(PROBE_ALTERNATES) => Some(
+            answer
+                .as_ref()
+                .ok()
+                .and_then(|stdout| stdout.strip_prefix(b"alternates "))
+                .and_then(|line| line.strip_suffix(b"\n"))
+                .filter(|path| !path.is_empty() && !path.contains(&b'\n'))
+                .map_or(BulkloadRefusal::GitInventoryMalformed, |path| {
+                    BulkloadRefusal::GitSourceAlternates(path.to_vec())
+                }),
+        ),
+        Some(_) => Some(v1_child_refusal(StderrClass::of(&head))),
     };
     let Some(refusal) = refusal else {
         if let (Some(store), Some(capture)) = (store, capture) {
@@ -969,27 +1005,37 @@ impl StderrTap {
         }))
     }
 
-    /// The refusal of a child that exited non-zero: `GIT_CHILD_FAILED` with
-    /// its stderr class, or `WORKER_LOST` if the drain thread did not finish.
+    /// The refusal of a child that exited non-zero: [`v1_child_refusal`] of its
+    /// stderr class, or `WORKER_LOST` if the drain thread did not finish.
     pub(in crate::git_carry) fn failed(self) -> BulkloadRefusal {
         self.0
             .map(std::thread::JoinHandle::join)
             .transpose()
             .map_or(BulkloadRefusal::WorkerLost, |head| {
-                BulkloadRefusal::GitChildFailed(StderrClass::of(
-                    head.as_deref().unwrap_or_default(),
-                ))
+                v1_child_refusal(StderrClass::of(head.as_deref().unwrap_or_default()))
             })
     }
 }
 
 /// The refusal of a finished child whose stderr was captured whole by
-/// `Command::output`: `GIT_CHILD_FAILED` with its class (R-N121). The bytes
+/// `Command::output`: [`v1_child_refusal`] of its class (R-N121). The bytes
 /// are classified, never kept.
 pub(in crate::git_carry) fn child_failed(stderr: &[u8]) -> BulkloadRefusal {
-    BulkloadRefusal::GitChildFailed(StderrClass::of(
+    v1_child_refusal(StderrClass::of(
         stderr.get(..CLASSIFY_LIMIT).unwrap_or(stderr),
     ))
+}
+
+/// A failed v1 child's refusal from its stderr class: `GIT_CHILD_FAILED`
+/// with the class, except that a child that ran out of space or quota
+/// refuses `SPACE_EXHAUSTED` (S4, #220). It names no directory: the stderr
+/// that would say which is never carried (R-N121).
+fn v1_child_refusal(class: StderrClass) -> BulkloadRefusal {
+    if class == StderrClass::NoSpace {
+        BulkloadRefusal::SpaceExhausted(None)
+    } else {
+        BulkloadRefusal::GitChildFailed(class)
+    }
 }
 
 /// Run a v1 Git child to completion (WP3): `input`, when given, is written
@@ -1392,6 +1438,93 @@ fn count_pack(mut stream: impl Read) -> Result<ThinPack> {
 mod tests {
     use super::super::{output, text};
     use super::*;
+
+    // S4 (#220): a v1 child that ran out of space or quota refuses the typed
+    // space refusal; every other failure keeps GIT_CHILD_FAILED and its class.
+    #[test]
+    fn a_child_out_of_space_refuses_space_exhausted() {
+        for stderr in [
+            &b"fatal: sha1 file '/x/objects/pack/tmp_pack_q': write error: No space left on device"
+                [..],
+            b"error: unable to write file: Disk quota exceeded",
+        ] {
+            assert_eq!(child_failed(stderr), BulkloadRefusal::SpaceExhausted(None));
+        }
+        assert_eq!(
+            child_failed(b"fatal: bad object HEAD"),
+            BulkloadRefusal::GitChildFailed(StderrClass::BadObject)
+        );
+    }
+
+    // S4 (#219): the estimate probe walks alternates exactly as capture does
+    // ([`super::super::alternates_walk`]), and refuses with capture's code:
+    // a quoted entry, and a store five down naming one more, refuse
+    // `GIT_SOURCE_ALTERNATES` naming the file (they used to refuse
+    // `GIT_CHILD_FAILED stderr_class=other`); a comment-only alternates file
+    // five down, and a store that lists itself, are followed (the first used
+    // to refuse). Mutation checked: the probe's old walk fails this test.
+    #[test]
+    fn the_probe_and_capture_walk_alternates_alike() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let fixture = Fixture::new("alternates-parity");
+        let root = std::fs::canonicalize(&fixture.root).unwrap();
+        let bare = |name: &str, alternates: &[u8]| -> PathBuf {
+            let store = root.join(name);
+            output(
+                git(&root)
+                    .args(["init", "--quiet", "--bare", "--template="])
+                    .arg(&store),
+            )
+            .unwrap();
+            std::fs::create_dir_all(store.join("objects/info")).unwrap();
+            std::fs::write(store.join("objects/info/alternates"), alternates).unwrap();
+            store
+        };
+        let line = |store: &Path| [store.join("objects").as_os_str().as_bytes(), b"\n"].concat();
+        let quoted = bare("quoted.git", b"\"/elsewhere/objects\"\n");
+        // A chain: `chain[0]` borrows `bottom`, each later store the one before.
+        let chain = |name: &str, bottom: &[u8]| -> Vec<PathBuf> {
+            let mut stores = vec![bare(&format!("{name}-0.git"), bottom)];
+            for level in 1..6 {
+                let below = line(stores.last().unwrap());
+                stores.push(bare(&format!("{name}-{level}.git"), &below));
+            }
+            stores
+        };
+        let seed = bare("seed.git", b"");
+        let deep = chain("deep", &line(&seed));
+        let commented = chain("commented", b"# nothing borrowed here\n");
+        let own = bare("self.git", b"");
+        std::fs::write(own.join("objects/info/alternates"), line(&own)).unwrap();
+        let file = |store: &Path| {
+            store
+                .join("objects/info/alternates")
+                .as_os_str()
+                .as_bytes()
+                .to_vec()
+        };
+        let cases: [(&Path, Option<Vec<u8>>); 6] = [
+            (&quoted, Some(file(&quoted))),
+            (&deep[5], Some(file(&deep[0]))),
+            (&deep[4], None),
+            // `commented[0]`'s file, five stores below `commented[5]`, names
+            // nothing.
+            (&commented[5], None),
+            (&own, None),
+            (&seed, None),
+        ];
+        for (source, refused) in cases {
+            let expected = refused.map_or(Ok(()), |path| {
+                Err(BulkloadRefusal::GitSourceAlternates(path))
+            });
+            let captured = super::super::partial_clone(source).map(|partial| assert!(!partial));
+            let probed = run_probe(&mut local_probe(source), None)
+                .map(|probe| assert!(!probe.partial))
+                .map_err(|refused| refused.refusal);
+            assert_eq!(captured, expected, "capture: {}", source.display());
+            assert_eq!(probed, expected, "probe: {}", source.display());
+        }
+    }
 
     struct Fixture {
         root: PathBuf,

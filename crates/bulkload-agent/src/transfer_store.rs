@@ -694,13 +694,14 @@ impl Store {
                 }
                 Ok(())
             })
-            .map_err(sqlite_error);
+            .map_err(sqlite_failed(&conn));
         if created.is_err() {
             let _ = conn.execute_batch("ROLLBACK");
         } else if conn.total_changes() != before {
             counters::sqlite_commit(Counter::SqliteSchema, started, &created);
         }
-        created?;
+        // S4 (#126): a full state directory names itself, on either side.
+        created.map_err(|refusal| named_space(refusal, root))?;
         counters::add_len(Counter::TransferLegacyRowsInvalidated, invalidated);
         Ok(Self {
             root: fs::canonicalize(root).refuse_at("transfer_store::open")?,
@@ -1088,7 +1089,11 @@ impl Store {
                 owned,
             },
         )
-        .and_then(|()| self.conn.execute_batch("COMMIT").map_err(sqlite_error));
+        .and_then(|()| {
+            self.conn
+                .execute_batch("COMMIT")
+                .map_err(sqlite_failed(&self.conn))
+        });
         if settled.is_err() {
             let _ = self.conn.execute_batch("ROLLBACK");
         }
@@ -1400,14 +1405,14 @@ impl StorePublisher {
             self.store
                 .conn
                 .execute_batch("COMMIT")
-                .map_err(sqlite_error)
+                .map_err(sqlite_failed(&self.store.conn))
         });
         #[cfg(not(test))]
         let committed = self
             .store
             .conn
             .execute_batch("COMMIT")
-            .map_err(sqlite_error);
+            .map_err(sqlite_failed(&self.store.conn));
         counters::sqlite_commit(self.group_counter(), started, &committed);
         #[cfg(feature = "io-trace")]
         if committed.is_ok() {
@@ -1489,7 +1494,7 @@ impl StorePublisher {
             self.store
                 .conn
                 .execute_batch("COMMIT")
-                .map_err(sqlite_error)
+                .map_err(sqlite_failed(&self.store.conn))
         })();
         if recorded.is_err() {
             let _ = self.store.conn.execute_batch("ROLLBACK");
@@ -1572,14 +1577,14 @@ impl StorePublisher {
             self.store
                 .conn
                 .execute_batch("COMMIT")
-                .map_err(sqlite_error)
+                .map_err(sqlite_failed(&self.store.conn))
         });
         #[cfg(not(test))]
         let committed = self
             .store
             .conn
             .execute_batch("COMMIT")
-            .map_err(sqlite_error);
+            .map_err(sqlite_failed(&self.store.conn));
         if committed.is_ok() {
             // Successful commits only, matching `counters::sqlite_commit`.
             SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -1691,7 +1696,13 @@ impl LedgerSink {
                 return Err(BulkloadRefusal::DigestMismatch);
             }
         }
-        match self.publisher.commit_captures(items) {
+        // S4 (#126): the source ledger's full state directory names itself;
+        // it is never the destination's space.
+        match self
+            .publisher
+            .commit_captures(items)
+            .map_err(|refusal| named_space(refusal, self.publisher.store.root()))
+        {
             Err(_) if self.publisher.ledger_sync == crate::io::durable::LedgerSync::Relaxed => {
                 // #163: counted, never fatal. The rows are not in the
                 // ledger (the transaction rolled back), so a later run
@@ -2039,17 +2050,145 @@ fn resolve_leaf(path: &Path) -> Result<std::borrow::Cow<'_, Path>> {
     reason = "the `map_err` callback shape every store call uses"
 )]
 fn sqlite_error(error: rusqlite::Error) -> BulkloadRefusal {
-    // A full disk is reported as the `ENOSPC` it is, so a failed group
-    // commit names its cause (#100); anything else is the store's fault.
-    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
-        return BulkloadRefusal::Io(Some(libc::ENOSPC));
+    sqlite_refusal(&error, 0)
+}
+
+/// [`sqlite_error`] for a call on `conn` that may write (a `COMMIT`), with
+/// the OS errno `SQLite` saw, read before any other call on `conn`.
+fn sqlite_failed(conn: &rusqlite::Connection) -> impl Fn(rusqlite::Error) -> BulkloadRefusal + '_ {
+    move |error| {
+        // SAFETY: `conn` is open and borrowed for this call, so its handle is
+        // a live connection; `sqlite3_system_errno` only reads that
+        // connection's last recorded errno, and nothing else calls into it
+        // between the failed call and this read.
+        let errno = unsafe { rusqlite::ffi::sqlite3_system_errno(conn.handle()) };
+        sqlite_refusal(&error, errno)
     }
-    BulkloadRefusal::SqliteIntegrityCheckFailed
+}
+
+/// A store's `SQLite` failure as a refusal (S4, #126), given the OS errno
+/// `SQLite` recorded (0 when the caller cannot read it).
+///
+/// Out of space is `SPACE_EXHAUSTED` with no path: `SQLITE_FULL`, which
+/// `SQLite` raises for `ENOSPC` on a write, and an I/O error whose errno is
+/// `ENOSPC` or `EDQUOT` (a quota, or a full disk met at a sync or a
+/// truncate, which `SQLite` reports as `SQLITE_IOERR_*`). The caller that
+/// knows the store names its root ([`named_space`]); a destination group
+/// commit, which the transfer's space preflight charges, lifts it to
+/// `DESTINATION_SPACE_INSUFFICIENT` (`materialize::space_refusal`). Any
+/// other I/O error is `IO` with its errno (`EIO`, `SQLite`'s own "disk I/O
+/// error", when the errno is unknown), never the store's corruption.
+/// Anything else is the store's fault.
+fn sqlite_refusal(error: &rusqlite::Error, errno: std::ffi::c_int) -> BulkloadRefusal {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DiskFull) => BulkloadRefusal::SpaceExhausted(None),
+        Some(rusqlite::ErrorCode::SystemIoFailure) => match errno {
+            libc::ENOSPC | libc::EDQUOT => BulkloadRefusal::SpaceExhausted(None),
+            0 => BulkloadRefusal::Io(Some(libc::EIO)),
+            errno => BulkloadRefusal::Io(Some(errno)),
+        },
+        _ => BulkloadRefusal::SqliteIntegrityCheckFailed,
+    }
+}
+
+/// A store's unnamed out-of-space refusal, named with its `root` (S4,
+/// #126): the directory whose filesystem filled, which no preflight charges.
+fn named_space(refusal: BulkloadRefusal, root: &Path) -> BulkloadRefusal {
+    use std::os::unix::ffi::OsStrExt as _;
+    match refusal {
+        BulkloadRefusal::SpaceExhausted(None) => {
+            BulkloadRefusal::SpaceExhausted(Some(root.as_os_str().as_bytes().to_vec()))
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // S4 (#126): a real `SQLITE_FULL` (a database held to two pages) is the
+    // unnamed space refusal, never a bare `IO` and never the destination's
+    // space: only a destination group commit lifts it to that
+    // (`materialize::space_refusal`).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_full_store_refuses_the_typed_space_refusal() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (v BLOB); PRAGMA max_page_count = 2;")
+            .unwrap();
+        let full = conn
+            .execute("INSERT INTO t VALUES (zeroblob(65536))", [])
+            .unwrap_err();
+        assert_eq!(
+            full.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DiskFull)
+        );
+        assert_eq!(sqlite_error(full), BulkloadRefusal::SpaceExhausted(None));
+    }
+
+    // S4 (#126): the source ledger's full state directory refuses
+    // `SPACE_EXHAUSTED` naming that directory under `LedgerSync::Full`,
+    // never `DESTINATION_SPACE_INSUFFICIENT`, which points at the other host.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_full_source_ledger_names_its_state_directory() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = TestRoot::new()?;
+        let sink = full_ledger_sink(&root.0.join("state"))?;
+        let conn = &sink.publisher.store.conn;
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        conn.execute_batch(&format!("PRAGMA max_page_count = {pages}"))
+            .unwrap();
+        let items: Vec<LedgerItem> = (0..512_u32)
+            .map(|n| {
+                item(
+                    &[n.to_le_bytes().as_slice(), &[0xa5; 60]].concat(),
+                    b"payload",
+                )
+            })
+            .collect();
+        let state = sink.publisher.store.root().as_os_str().as_bytes().to_vec();
+        assert_eq!(
+            sink.publish(&items),
+            Err(BulkloadRefusal::SpaceExhausted(Some(state)))
+        );
+        Ok(())
+    }
+
+    // S4 (#126): `SQLite` reports a quota (`EDQUOT`), or a full disk met at a
+    // sync or a truncate, as `SQLITE_IOERR_*`, not `SQLITE_FULL`. With the
+    // errno it recorded, that is the space refusal; any other I/O error is
+    // `IO` with its errno, never the store's corruption.
+    #[test]
+    fn an_io_error_is_never_the_store_s_corruption() {
+        let io =
+            |extended| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(extended), None);
+        for (extended, errno) in [
+            (rusqlite::ffi::SQLITE_IOERR_WRITE, libc::EDQUOT),
+            (rusqlite::ffi::SQLITE_IOERR_FSYNC, libc::ENOSPC),
+            (rusqlite::ffi::SQLITE_IOERR_TRUNCATE, libc::EDQUOT),
+        ] {
+            assert_eq!(
+                sqlite_refusal(&io(extended), errno),
+                BulkloadRefusal::SpaceExhausted(None)
+            );
+        }
+        assert_eq!(
+            sqlite_refusal(&io(rusqlite::ffi::SQLITE_IOERR_WRITE), libc::EROFS),
+            BulkloadRefusal::Io(Some(libc::EROFS))
+        );
+        assert_eq!(
+            sqlite_error(io(rusqlite::ffi::SQLITE_IOERR_WRITE)),
+            BulkloadRefusal::Io(Some(libc::EIO))
+        );
+        assert_eq!(
+            sqlite_error(io(rusqlite::ffi::SQLITE_CORRUPT)),
+            BulkloadRefusal::SqliteIntegrityCheckFailed
+        );
+    }
 
     struct TestRoot(PathBuf);
 
