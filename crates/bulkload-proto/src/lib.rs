@@ -4,7 +4,7 @@
 //! (`bulkload-agent` running as source and as destination). It holds three
 //! things and deliberately nothing else:
 //!
-//! * [`frame`] -- the wire v5 frame codec (R-N118).
+//! * [`frame`] -- the wire v6 frame codec (R-N118).
 //! * [`row`] -- the scanned-row schema the agent emits.
 //! * [`refusal`] -- the [`BulkloadRefusal`] taxonomy.
 //!

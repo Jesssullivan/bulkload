@@ -1,9 +1,10 @@
 {- Types of docs/formal's typed catalogue (OI-1003-Q32, OI-1003-Q43).
 
    Catalogue.dhall uses these to describe every TLC config of each module
-   (BulkloadTransfer.tla, and GitCarry.tla through GitCarry.dhall) and the
+   (BulkloadTransfer.tla, GitCarry.tla through GitCarry.dhall, and
+   SqliteCarry.tla through SqliteCarry.dhall, whose own types it holds) and the
    traceability row of every model property. `just tla-render` renders each
-   module's run order (configs.tsv, configs_gc.tsv) and every MC_*.cfg from
+   module's run order (configs.tsv, configs_gc.tsv, configs_sq.tsv) and every MC_*.cfg from
    it, and `just tla-check` refuses to run TLC unless the committed files
    equal that rendering and every name below is grounded in its module
    (README.md, "Hybrid roles").
@@ -515,7 +516,7 @@ let witnessSelf = \(w : Witness) -> merge witnessTable w
    module, with its own budget self-test first. The table is merged over the
    union, so a module added without an entry does not type-check.
 -}
-let Module = < BulkloadTransfer | GitCarry >
+let Module = < BulkloadTransfer | GitCarry | SqliteCarry >
 
 {- How tla-check grounds a module's code symbols. Either way only a Rust
    source under crates/ outside a tests/ directory counts, never a data
@@ -550,6 +551,13 @@ let moduleTable =
         , spec = "GitCarry.tla"
         , tsv = "configs_gc.tsv"
         , symbols = SymbolMatch.definition
+        }
+      , SqliteCarry =
+        { module = Module.SqliteCarry
+        , index = 2
+        , spec = "SqliteCarry.tla"
+        , tsv = "configs_sq.tsv"
+        , symbols = SymbolMatch.code
         }
       }
 

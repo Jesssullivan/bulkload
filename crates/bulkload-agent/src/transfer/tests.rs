@@ -1212,7 +1212,7 @@ fn a_stream_past_the_chunk_bound_ends_the_session() {
     .unwrap()
     .rows
     .remove(0);
-    let mut streaming = Streaming::new(row, Vec::new(), false);
+    let mut streaming = Streaming::new(Seat::file(row, Vec::new()).unwrap(), false);
     streaming.specs = vec![
         ChunkSpec {
             digest: [0; 32],
@@ -1537,6 +1537,7 @@ fn a_peer_on_another_wire_is_refused() {
                     .as_os_str()
                     .as_bytes()
                     .to_vec(),
+                sqlite: SqliteMode::Refuse,
             },
         )
         .unwrap();
@@ -1844,6 +1845,7 @@ fn a_source_read_never_follows_a_swapped_directory() {
     std::os::unix::fs::symlink(&outside, source.join("dir")).unwrap();
     let root_fd = crate::io::sys::open_root(&source).unwrap();
     let credit = Credit::new();
+    let backup = Mutex::new(());
     let work = SourceWork {
         root: &source,
         root_fd: root_fd.as_fd(),
@@ -1852,11 +1854,23 @@ fn a_source_read_never_follows_a_swapped_directory() {
         credit: &credit,
         retain: Arc::new(AtomicU64::new(0)),
         ledger: LedgerSync::Relaxed,
+        sqlite: SqliteMode::Refuse,
+        euid: crate::io::sys::effective_uid(),
+        as_root: false,
+        backup: &backup,
+        slots: &corpus.base,
+        slot_budget: Arc::new(SlotBudget::new(0)),
     };
     let mut bytes_read = 0;
-    let refused = capture_file(&work, &row, &mut bytes_read, &mut None, |_, _, _, _| {
-        panic!("no chunk may be read through the symlink")
-    })
+    let refused = capture_file(
+        &work,
+        &row,
+        None,
+        &mut bytes_read,
+        &mut None,
+        |_, _, _, _| panic!("no chunk may be read through the symlink"),
+    )
+    .map(|_| ())
     .unwrap_err();
     assert!(
         matches!(
@@ -2378,6 +2392,7 @@ fn serve_refuses_a_state_inside_the_source_before_creating_it() {
             wire_id: wire_id(),
             root: source.as_os_str().as_bytes().to_vec(),
             state: state.as_os_str().as_bytes().to_vec(),
+            sqlite: SqliteMode::Refuse,
         },
     )
     .unwrap();
@@ -2927,4 +2942,5 @@ fn a_recreated_source_store_adopts_from_capture_records() {
 }
 
 // ---- WP0(g) (OI-1003-Q20, Q37, Q104): P79 RELAXED-LEDGER-LOSS --------------
+mod sqlite_carry;
 mod wp0g;

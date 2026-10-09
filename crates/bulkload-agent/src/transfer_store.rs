@@ -272,16 +272,44 @@ pub(crate) enum LedgerRecord {
 
 /// Why the source refused a seat for its content (#186, R25).
 ///
-/// It is remembered under the seat's row key (its path and stat identity),
-/// so that a rerun refuses the seat again without opening the file. Only a
-/// refusal that depends on nothing but the seat's bytes is remembered, and
-/// only when the seat was not racy when it was sniffed: its stat identity
-/// then vouches for those bytes, exactly as it does for a capture (#86).
+/// It is remembered under the seat's key, so that a rerun refuses the seat
+/// again without opening the file. Only a refusal that depends on nothing
+/// but the seat's bytes is remembered, and only when the seat was not racy
+/// when it was read: its stat identity then vouches for those bytes,
+/// exactly as it does for a capture (#86).
+///
+/// The kinds that depend on the session's [`SqliteMode`] are kept apart
+/// (#218 review, R8): `refuse` mode writes [`Self::SqliteHeader`] under the
+/// row key, exactly as v5 does; `snapshot` mode ignores it (it does not say
+/// which magic was seen) and writes [`Self::SqliteWalHeader`] for WAL magic
+/// under the row key, and the snapshot kinds and [`Self::SqliteBesideWal`]
+/// under the snapshot key ([`sqlite_key`]), which no row key ever equals.
+///
+/// [`SqliteMode`]: bulkload_proto::frame::SqliteMode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefusedSeat {
     /// The file starts with a `SQLite` database or WAL magic: provider state,
-    /// which only the `SQLite` backup path carries.
+    /// which only the `SQLite` backup path carries. `refuse` mode's record,
+    /// v5's own.
     SqliteHeader,
+    /// `snapshot` mode: the snapshot of an unchanged database failed its
+    /// integrity check (`SQLITE_INTEGRITY_CHECK_FAILED`).
+    SqliteSnapshotIntegrity,
+    /// The file starts with a `SQLite` WAL magic: a stray WAL is not a
+    /// database, in either mode.
+    SqliteWalHeader,
+    /// `snapshot` mode: the backup of an unchanged database reported
+    /// `SQLITE_CORRUPT` (primary code 11).
+    SqliteSnapshotCorrupt,
+    /// `snapshot` mode: the backup of an unchanged file reported
+    /// `SQLITE_NOTADB` (primary code 26).
+    SqliteSnapshotNotADatabase,
+    /// `snapshot` mode (#218 review): a file without the database magic (an
+    /// encrypted store) beside a `-wal` that holds frames. Its main file
+    /// alone may miss committed transactions or hold a half-done
+    /// checkpoint, so it is never carried raw. Keyed on the row and the
+    /// `-wal`'s identity, which vouch for it together.
+    SqliteBesideWal,
 }
 
 impl RefusedSeat {
@@ -289,21 +317,53 @@ impl RefusedSeat {
     const fn tag(self) -> i64 {
         match self {
             Self::SqliteHeader => 1,
+            Self::SqliteSnapshotIntegrity => 2,
+            Self::SqliteWalHeader => 3,
+            Self::SqliteSnapshotCorrupt => 4,
+            Self::SqliteSnapshotNotADatabase => 5,
+            Self::SqliteBesideWal => 6,
         }
     }
 
     const fn from_tag(tag: i64) -> Option<Self> {
         match tag {
             1 => Some(Self::SqliteHeader),
+            2 => Some(Self::SqliteSnapshotIntegrity),
+            3 => Some(Self::SqliteWalHeader),
+            4 => Some(Self::SqliteSnapshotCorrupt),
+            5 => Some(Self::SqliteSnapshotNotADatabase),
+            6 => Some(Self::SqliteBesideWal),
             _ => None,
         }
     }
 
-    /// The refusal this record stands for, with the code the sniff gave.
+    /// The refusal this record stands for, with the code the read gave.
     #[must_use]
     pub const fn refusal(self) -> BulkloadRefusal {
         match self {
-            Self::SqliteHeader => BulkloadRefusal::SqliteStateChanged,
+            Self::SqliteHeader | Self::SqliteWalHeader | Self::SqliteBesideWal => {
+                BulkloadRefusal::SqliteStateChanged
+            }
+            Self::SqliteSnapshotIntegrity => BulkloadRefusal::SqliteIntegrityCheckFailed,
+            Self::SqliteSnapshotCorrupt => BulkloadRefusal::SqliteBackupFailed(Some(11)),
+            Self::SqliteSnapshotNotADatabase => BulkloadRefusal::SqliteBackupFailed(Some(26)),
+        }
+    }
+
+    /// The record a snapshot refusal is remembered as, when the refusal
+    /// depends on the database's bytes alone: an integrity failure, or a
+    /// backup that reported corruption or not-a-database (#218, R10: the
+    /// extended code is masked to its primary code first).
+    #[must_use]
+    pub fn of_snapshot_refusal(refusal: &BulkloadRefusal) -> Option<Self> {
+        match refusal {
+            BulkloadRefusal::SqliteIntegrityCheckFailed => Some(Self::SqliteSnapshotIntegrity),
+            BulkloadRefusal::SqliteBackupFailed(Some(code)) => match code & 0xff {
+                11 => Some(Self::SqliteSnapshotCorrupt),
+                26 => Some(Self::SqliteSnapshotNotADatabase),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -405,7 +465,8 @@ pub(crate) type OutputRow = (Vec<u8>, Vec<u8>);
 /// - `owned`, the output this store's rows named, at `leaf` or, displaced,
 ///   at `temp`;
 /// - anything else at `temp` is a file this store does not own, displaced
-///   by the exchange: it is exchanged back, never removed.
+///   by the exchange: it is exchanged back while `leaf` holds `staged`
+///   unwritten since (`stamp`), otherwise kept aside; never removed.
 ///
 /// Settling deletes the record: with the new output's row, in its group's
 /// commit; or, when the exchange did not happen and the output is still
@@ -1750,6 +1811,32 @@ pub fn row_key(authority: &[u8], row: &RowSchema) -> Result<Vec<u8>> {
     postcard::to_stdvec(&(authority, row)).refuse_at("transfer_store::row_key")
 }
 
+/// The marker a snapshot seat's key carries after its row (#218).
+const SQLITE_KEY_MARK: &[u8] = b"bulkload sqlite snapshot seat v1";
+
+/// The key of a `SQLite` snapshot seat (#218): its row, a marker, and the
+/// identity of its `-wal` (`None`: none beside it).
+///
+/// A WAL-mode commit writes only the `-wal` until a checkpoint, so the main
+/// file's row alone cannot vouch for the database; the pair can (design
+/// section 5.2). The key is never equal to any [`row_key`] (postcard decodes
+/// a row from the front of either, and this one has bytes after it), so a
+/// reuse row under it says the output is a snapshot, and a raw file's row
+/// never answers for a snapshot or the reverse (R2, R8). It starts with
+/// the row key's own prefix, so [`path_prefix`] and [`owner_key`] read it
+/// as they read any row key of the path.
+///
+/// # Errors
+/// Refuses serialization failure.
+pub fn sqlite_key(
+    authority: &[u8],
+    row: &RowSchema,
+    wal: Option<&bulkload_proto::frame::SidecarId>,
+) -> Result<Vec<u8>> {
+    postcard::to_stdvec(&(authority, row, SQLITE_KEY_MARK, wal))
+        .refuse_at("transfer_store::sqlite_key")
+}
+
 /// The prefix every row key of one destination path shares under
 /// `authority`: a row key is the postcard encoding of `(authority, row)`,
 /// and a row's first field is its relative path, so the key starts with the
@@ -2413,6 +2500,107 @@ mod tests {
         assert_eq!(prefix_end(&[0xff, 0xff]), None);
         assert_eq!(prefix_end(&[]), None);
         Ok(())
+    }
+
+    /// #218 (R2, R8): a snapshot seat's key shares its path's prefix and
+    /// ownership key with the row key, but never equals a row key (of the
+    /// same row, or of any row that decodes from its front), with or
+    /// without a `-wal`, and differs for every `-wal` identity.
+    #[test]
+    fn a_snapshot_key_shares_the_path_prefix_and_is_never_a_row_key() -> Result<()> {
+        use bulkload_proto::frame::SidecarId;
+        let row = seat_row(b"dir/state.db", 7);
+        let wal = |size| SidecarId {
+            dev: 1,
+            ino: 8,
+            size,
+            mtime_ns: 3,
+            ctime_ns: 4,
+        };
+        let prefix = path_prefix(b"authority", b"dir/state.db")?;
+        let plain = row_key(b"authority", &row)?;
+        let mut keys = vec![sqlite_key(b"authority", &row, None)?];
+        for size in [0, 32, 4096] {
+            keys.push(sqlite_key(b"authority", &row, Some(&wal(size)))?);
+        }
+        for key in &keys {
+            assert!(key.starts_with(&prefix));
+            assert_ne!(*key, plain);
+            assert_eq!(owner_key(key), owner_key(&plain));
+            assert_eq!(owner_key(key), Some(prefix.as_slice()));
+            // The row decodes from the front, and bytes are left after it.
+            let (_, rest) = postcard::take_from_bytes::<(&[u8], RowSchema)>(key)
+                .map_err(|_| BulkloadRefusal::FrameCodec)?;
+            assert!(!rest.is_empty());
+        }
+        let mut distinct = keys.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), keys.len());
+        Ok(())
+    }
+
+    /// #218 (R8, R10): every refused-seat kind round-trips through its tag,
+    /// tags never collide, and a snapshot refusal is remembered only for
+    /// codes the bytes alone decide, the extended code masked to its
+    /// primary code.
+    #[test]
+    fn refused_seat_kinds_round_trip_and_mask_extended_codes() {
+        let kinds = [
+            RefusedSeat::SqliteHeader,
+            RefusedSeat::SqliteSnapshotIntegrity,
+            RefusedSeat::SqliteWalHeader,
+            RefusedSeat::SqliteSnapshotCorrupt,
+            RefusedSeat::SqliteSnapshotNotADatabase,
+            RefusedSeat::SqliteBesideWal,
+        ];
+        let mut tags: Vec<i64> = kinds.iter().map(|kind| kind.tag()).collect();
+        for kind in kinds {
+            assert_eq!(RefusedSeat::from_tag(kind.tag()), Some(kind));
+        }
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), kinds.len());
+        assert_eq!(RefusedSeat::SqliteHeader.tag(), 1, "v5's own tag");
+        for (refusal, kind) in [
+            (
+                BulkloadRefusal::SqliteIntegrityCheckFailed,
+                Some(RefusedSeat::SqliteSnapshotIntegrity),
+            ),
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(11)),
+                Some(RefusedSeat::SqliteSnapshotCorrupt),
+            ),
+            // SQLITE_CORRUPT_INDEX, _SEQUENCE and _VTAB.
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(779)),
+                Some(RefusedSeat::SqliteSnapshotCorrupt),
+            ),
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(523)),
+                Some(RefusedSeat::SqliteSnapshotCorrupt),
+            ),
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(267)),
+                Some(RefusedSeat::SqliteSnapshotCorrupt),
+            ),
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(26)),
+                Some(RefusedSeat::SqliteSnapshotNotADatabase),
+            ),
+            (BulkloadRefusal::SqliteBackupFailed(Some(5)), None),
+            (BulkloadRefusal::SqliteBackupFailed(Some(1032)), None),
+            (BulkloadRefusal::SqliteBackupFailed(None), None),
+            (BulkloadRefusal::SqliteStateChanged, None),
+            (BulkloadRefusal::BudgetExceeded, None),
+            (BulkloadRefusal::SqliteSourceNotOwner, None),
+        ] {
+            assert_eq!(
+                RefusedSeat::of_snapshot_refusal(&refusal),
+                kind,
+                "{refusal}"
+            );
+        }
     }
 
     /// WP0(d), #187: a superseding publish's intent takes its output's rows

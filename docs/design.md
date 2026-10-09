@@ -172,12 +172,14 @@ Source safety (S2, WP1):
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
 - SQLite provider snapshots are S2's stated exceptions: one lock and two
   writes. Every source is read through the backup API from a read-only,
-  WAL-aware connection; none is read `immutable=1`. All three are bounded.
-  The two writes are counted; the lock is not yet:
+  WAL-aware connection; none is read `immutable=1`. All three are bounded
+  and counted:
   - **Lock (OI-1003-Q16).** The backup API's shared read lock on the source
-    database, held only for the bounded read. Q16 calls it "counted", but no
-    counter for it exists yet (neither a lock count nor a lock time). That
-    is an open gap; neither write counter covers it.
+    database, held only inside one step of the bounded read. Counted since
+    #218 as `source_sqlite_lock_ns`: the source connection's whole life,
+    from open to close, an upper bound on the lock (a WAL-mode connection
+    holds `SHARED` on the main file until it closes, and a step's read mark
+    in the `-shm`), with restarts in `source_sqlite_backup_restarts`.
   - **Write: the wal-index (OI-1003-Q36).** The source's `<db>-shm`:
     SQLite's own coordination file, which holds no user data. A WAL-aware
     read opens it read-write, maps it and takes `fcntl` locks on it. It
@@ -219,6 +221,15 @@ Source safety (S2, WP1):
     - A refused verb leaves the source directory as it was: no `-shm`, no
       `-wal`, no timestamp moved, both counters 0 (P75's root leg).
     - Run the verb as the database's owner.
+    - The transfer's `--sqlite=snapshot` mode (#218, "SQLite snapshot
+      seats" under Wire v6) reads through the same provider code under the
+      same lock and the same two counted writes. As root its whole session
+      is refused at `Open`; a database owned by another user than the
+      reader is refused `SQLITE_SOURCE_NOT_OWNER` before `SQLite` opens it,
+      since `SQLite` would create that database's `-shm` (and an empty
+      `-wal`) owned by the reader, which the owner's own writer may then
+      fail to open. The lock is now counted: `source_sqlite_lock_ns` is
+      each source connection's life, for the verb and the transfer alike.
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
@@ -601,7 +612,7 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   instead (R-N76).
 - An incremental pass reuses a retained blob only for a seat whose stat
   identity is unchanged and which was not racy. The transfer applies the
-  same rule to its ledger and output rows (see Wire v5, racy captures). A seat stamped within one
+  same rule to its ledger and output rows (see Wire v6, racy captures). A seat stamped within one
   timestamp tick (a 2 s allowance) of the retained pass start can be
   rewritten at the same size without its identity moving, as in Git's racy
   index, so it is read again. A pass that reuses none of the blobs it was
@@ -686,10 +697,16 @@ and each sample row records both. The coordinator keeps the other lanes
 quiet while gated samples run (R-N81, R-N91). The clone fast path never
 counts toward a gate (R-N57, R-N63).
 
-## Wire v5
+## Wire v6
 
-The transfer wire is protocol 5, a hard cut with no dual stack (R-N59,
-R-N118). `bulkload-proto` holds the codec and its schema text, `WIRE_SCHEMA`;
+The transfer wire is protocol 6, a hard cut with no dual stack (R-N59,
+R-N118). v6 (#218, 2026-10-08) is v5 plus the SQLite snapshot seat: the
+session's `SqliteMode` in `Open`, a database's `-wal` identity in `Entry`,
+the `SqliteSidecar` (21) and `SqliteSnapshot` (22) controls, and the
+`SQLite` result code of a `SQLITE_BACKUP_FAILED` refusal in `Refused`
+(`sqlite_code`, `None` for every other code); see "SQLite snapshot seats"
+below. Every other frame, the W6 reserved ones
+included, is v5's. `bulkload-proto` holds the codec and its schema text, `WIRE_SCHEMA`;
 a peer whose `Open` names another protocol or another BLAKE3 of the schema
 (`wire_id`) is refused before anything else. Every frame is a 4-byte
 big-endian length, a tag byte and a body: tag 1 is a postcard control
@@ -757,16 +774,146 @@ miss (#87).
   no ledger row, and `End{racy}` tells the destination to keep no output row
   under its key (its chunk hints are kept; they are re-verified on use). The
   next run reads the seat again (#86).
-- **Refused seats (#186).** A seat is refused for its content when its
-  first 16 bytes are a `SQLite` database or WAL magic
-  (`SQLITE_STATE_CHANGED`): provider state, which only the `SQLite` backup
-  path carries. Those bytes are a sniff, counted as `source_sniff_bytes` and
+- **Refused seats (#186).** With `--sqlite=refuse` (the default) a seat is
+  refused for its content when its first 16 bytes are a `SQLite` database or
+  WAL magic (`SQLITE_STATE_CHANGED`): provider state, which only the
+  `SQLite` backup path carries. With `--sqlite=snapshot` a database magic is
+  a snapshot seat instead (below); a WAL magic is still refused. Those bytes are a sniff, counted as `source_sniff_bytes` and
   never as content (`source_bytes_read`, `read_source_file_bytes`). The
   source ledger remembers the refusal under the seat's row key, when the
   seat was not racy and its stat identity did not move across the sniff, so
   a later run refuses the unchanged seat with the same code without opening
   it (R25); a seat whose stat identity moved is sniffed again. The refusal
-  is reported on every run (S4).
+  is reported on every run (S4). The record depends on the mode (#218
+  review R8): `refuse` mode writes v5's tag 1 and honours it; `snapshot` mode
+  ignores tag 1 (it does not say which magic was seen) and writes tag 3 for
+  a WAL magic.
+- **SQLite snapshot seats (#218; `--sqlite=snapshot`; operator rulings
+  OI-1003-Q146 to Q148 of 2026-10-09, Linear TIN-4543, and unruled
+  defaults in `docs/agent-notes/2026-10-08-sqlite-carry-design.md`
+  section 0).** The destination chooses the mode; `Open` carries it to the
+  source. The default stays `--sqlite=refuse` (OI-1003-Q147): `snapshot` is
+  opt-in, and a run that must carry databases, such as the full neo→sting
+  pull, passes `--sqlite=snapshot` explicitly.
+  - *Walk.* A regular file with a regular `<name>-wal` beside it is offered
+    with that file's identity (`Entry.wal`). A regular `-wal`, `-shm` or
+    `-journal` beside a regular base is never an entry: it is reported as
+    `SqliteSidecar`, and its outcome is its base's, resolved when the session
+    ends: covered when the base was published from a snapshot or reused as
+    one, refused by name (`SQLITE_STATE_CHANGED`) otherwise. A sidecar with
+    no base is offered and refused by name, as in v5. A sidecar listed and
+    gone before its stat (a live rollback-mode store's `-journal`) is still
+    its base's sidecar, not an `IO` refusal. A base without the
+    database magic (an encrypted store) offered beside a `-wal` that holds
+    frames is refused `SQLITE_STATE_CHANGED`, never carried raw: its main
+    file alone may miss the `-wal`'s transactions or hold a half-done
+    checkpoint (#218 review). The refusal is remembered under its row and
+    the `-wal`'s identity. Beside an empty `-wal` it is carried raw.
+  - *Key.* A snapshot seat's reuse row is keyed on its row, a marker and its
+    `-wal`'s identity after the backup (`sqlite_key`), never equal to a row
+    key: an unchanged store is `Reuse`d with nothing opened on the source,
+    and a file that is not a database keeps its row key. Its capture record
+    (#169) is keyed in its own domain on the same pair (`unrowed::
+    sqlite_record_key`), so an unrowed snapshot is adopted only while its
+    `-wal` has not moved (review R1).
+  - *Capture.* A database seat is sniffed (16 bytes, never content); one
+    owned by another user than the reader is refused
+    `SQLITE_SOURCE_NOT_OWNER` before `SQLite` opens it. Otherwise the source
+    takes the `snapshot` verb's stepped backup (OI-1003-Q16; one at a time,
+    a step budget and a 30 s cap: `BUDGET_EXCEEDED`, not remembered) from
+    `canonical_root/rel_path`, opened read-only, WAL-aware and
+    `SQLITE_OPEN_NOFOLLOW` (which refuses a symlink at any component of the
+    path, `SQLITE_CANTOPEN_SYMLINK`, refused as `PATH_ESCAPES_ROOT`), into a
+    slot in its private state (`sqlite-snapshots/`, emptied when `serve`
+    starts), converts the slot to journal mode DELETE and runs
+    `integrity_check` on it, the destination's own check (`quick_check`
+    does not compare index content with table content). Every slot,
+    streamed or kept for a manifest, is reserved against 4 GiB of slots
+    alive at once before its backup, waiting up to 30 s for room, and the
+    slot directory's filesystem must keep the `--min-free-percent` floor
+    with it written: `BUDGET_EXCEEDED` otherwise, not remembered. A
+    sniffed database's descriptor is closed only under the backup lock, so
+    it never drops the POSIX locks of a backup of a hard link of the same
+    store. A residual stands: a directory swapped between `SQLite`'s own
+    symlink check of the path and its `open` of it, or before it opens the
+    `-wal` and `-shm` by name, is not seen. The main file and the
+    `-wal` are stat'ed beneath the seat's directory before and after; the
+    walked inode must still be at the path (`PATH_ESCAPES_ROOT`). The
+    capture is settled when the walked, pre- and post-stat main file agree,
+    the `-wal` did not move (or is the empty one the read created,
+    OI-1003-Q72), and neither is racy; an unsettled capture is sent as racy:
+    published, never a reuse key. `SqliteSnapshot{entry, size, wal}`
+    precedes the entry's content, which is the slot's chunks, never the live
+    file's. No source ledger row is kept for a snapshot. A corruption the
+    database's bytes alone decide (`SQLITE_INTEGRITY_CHECK_FAILED`, or
+    `SQLITE_BACKUP_FAILED` whose primary code is 11 or 26) is remembered
+    under the snapshot key when the capture settled.
+  - *Destination.* Admission reserves the main file's and the `-wal`'s
+    sizes at Decide and the snapshot's exact size when it is announced. A
+    path with a `-wal`, `-journal` or `-shm` beside it is refused
+    `DESTINATION_OCCUPIED` at Decide (nothing is read on the source; not
+    remembered; removing the sidecar converges) and again just before
+    publish. The staged file is verified (header, size, not WAL,
+    `integrity_check` exactly `ok`, opened `immutable=1`) before it is
+    published; a failure refuses `SQLITE_INTEGRITY_CHECK_FAILED`, whose
+    default S4 disposition is `abandon` (OI-1003-Q148; printed beside the
+    refusal as `default-disposition <path>: abandon` until transfer
+    refusals are closure-ledger rows, WP3 PR 4). Corruption the backup step
+    itself reports (`SQLITE_BACKUP_FAILED` with primary code 11
+    `SQLITE_CORRUPT` or 26 `SQLITE_NOTADB`) never reaches
+    `integrity_check`; it keeps its own code, and takes the same `abandon`
+    default and report line: the source sends `SQLite`'s code beside the
+    refusal (`Refused.sqlite_code`), and the receiver reads it
+    (`transfer::default_disposition`). A backup that failed otherwise
+    (busy, I/O, a hot journal) has no default.
+  - *Supersede (OI-1003-Q146).* A changed store's new snapshot replaces
+    the output at its path only through the superseding publish below
+    (WP0(d)'s `prepare_supersede`, intent, `RENAME_EXCHANGE` and displaced
+    check), and only when this store landed that output and its ownership
+    proof holds (its identity is still a row this store committed: nothing
+    touched it since), and no `-wal`, `-journal` or `-shm` sits beside it
+    at Decide and again at the exchange's last look, immediately before
+    the exchange (`StagedFile::sqlite_sidecar_appeared`, after the
+    identity check). A sidecar found at that look refuses the entry
+    `DESTINATION_OCCUPIED`: nothing is exchanged, the intent is settled
+    with the old output's rows given back, and removing the sidecar
+    converges by the exchange on the next run (not remembered,
+    `dest_sqlite_sidecar_refused`). A file this store did not land, or
+    landed and something touched since, is refused `DESTINATION_OCCUPIED`
+    and left byte-identical, remembered as for files. The fresh publish
+    (rename without replacement) makes the same last look. A crash at any
+    step leaves the old snapshot or the new one at the path, whole, as for
+    files. Residuals, stated: (1) a `-journal` or `-wal` created between
+    that last `lstat` and the exchange (a connection that began writing in
+    that window); (2) an application whose SQLite predates 3.8.3, or that
+    uses a VFS whose files do not track their inode (on Linux `unix-none`,
+    `unix-dotlock`, `unix-flock`, or a custom VFS), whose next write after
+    the exchange can create its `-journal` beside the new file. A modern
+    SQLite connection on the default `unix` VFS still open on the old
+    inode does not write silently: before it opens a rollback journal the
+    pager asks whether the file moved (`pager_open_journal` calls
+    `databaseIsUnmoved`, `SQLITE_FCNTL_HAS_MOVED`, which `stat`s the path
+    and compares the inode it opened), so its next write fails
+    `SQLITE_READONLY_DBMOVED` ("attempt to write a readonly database"),
+    creates no `-journal`, and the new file stays `integrity_check` ok
+    (read in the bundled SQLite 3.46.0; checked 2026-10-09 with SQLite
+    3.51.2, an idle connection and one in `BEGIN IMMEDIATE` that had not
+    yet journaled). Its reads keep seeing the old inode until it reopens.
+    A connection whose `-journal` already exists is seen by the look and
+    refused. (The conservative build had refused every supersede, D7, for
+    the idle-connection case, which Q146 replaces.)
+    `dest_sqlite_superseded` counts the replacements.
+  - *S2.* The source access is the provider verb's: the Q16 lock, the Q36
+    and Q72 writes, counted (`source_wal_index_touched`,
+    `source_wal_created`), and the connection's whole life as
+    `source_sqlite_lock_ns` (a WAL-mode connection holds `SHARED` on the main
+    file until it closes). A `snapshot`-mode session as root is refused
+    `SQLITE_SOURCE_AS_ROOT` at `Open`, before anything is opened or created;
+    `copy` runs `serve` as its source half, so it is refused the same way.
+  - *S3.* `source_sqlite_backup_bytes` (pages stepped times page size,
+    restarts included, plus the `-wal`'s size: a bound on its wal-index
+    rebuild) is added to the session's source bytes; the slot's re-read is
+    `read_source_snapshot_bytes`, not a source read.
 - **Rows from before the racy guard.** A store created by this engine
   carries a `racy_guard` marker from its first commit. A store without it was
   written before #86, so none of its ledger or output rows is proven
@@ -827,8 +974,8 @@ Control variants 12 to 19 and tag 3 are reserved for W6 git carry over the
 same session and are refused today. A sub-stream carries negotiated thin
 packs for one repository (R-N60). Since carry_v2's deletion (2026-10-05,
 OI-1003-Q44, OI-1003-Q56) no code builds or consumes them. They stay in wire
-v5 unchanged (`WIRE_SCHEMA` and `wire_id` do not move) and go with WP3's v6
-cut.
+v5, and in v6 (#218) unchanged; they go with WP3's v7 cut (design D8 of
+the #218 note, unruled).
 
 | Frame | Direction | Meaning |
 |---|---|---|
@@ -906,9 +1053,16 @@ directory, and commits the new row with the intent settled. A power loss
 leaves the old output or the new one, whole, and never a row beside other
 bytes; the next sweep gives an old output still in place its rows back,
 removes a displaced old output, and exchanges a displaced file of anyone
-else back (or keeps it aside and reports it). The new file is filled from
+else back while the leaf holds the staged file unwritten since it was
+staged (its inode, size and mtime as the intent recorded); otherwise it
+keeps the displaced file aside and reports it, so writes made to the new
+file after the crash are never deleted. The new file is filled from
 the old output's own chunks, so only absent chunks cross the wire (WP0(c),
-inequality 2).
+inequality 2). A `SQLite` snapshot output (#218) is superseded the same
+way (OI-1003-Q146), with one more look: no `-wal`, `-journal` or `-shm`
+beside it at Decide and immediately before the exchange ("SQLite
+snapshot seats", Wire v6); `docs/formal/SqliteCarry.tla` checks it
+(`SqliteNoClobber`, `SqliteOldOrNewWhole`, `SqliteNoForeignSidecar`).
 
 What "this store's own" covers (#187 review, 2026-10-07). An output has a
 reuse row under its seat's row key, which answers `Reuse`, or an ownership
@@ -972,7 +1126,7 @@ filesystem (`statvfs`; `statfs` on Darwin) with less than
 the space available) refuses `DESTINATION_SPACE_INSUFFICIENT` before it
 starts.
 
-- `copy` and `pull` decide it per entry on wire v5. An entry decided
+- `copy` and `pull` decide it per entry on wire v6. An entry decided
   `Send` or `WantManifest` reserves its size until its `Held`. Each
   admission checks every reserved byte against a probe that is refreshed on
   each group commit and every 256 MiB admitted. An entry that does not fit

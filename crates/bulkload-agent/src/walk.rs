@@ -79,6 +79,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
+use bulkload_proto::frame::SidecarId;
 use bulkload_proto::{BulkloadRefusal, FileKind, Result, RowSchema};
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
@@ -267,7 +268,25 @@ pub enum WalkItem {
     Refused(RefusedSeat),
     /// An engine temporary, by relative path: recorded, never carried.
     Engine(Vec<u8>),
+    /// A walk with [`Walker::with_sqlite`] only (#218): an accepted regular
+    /// file with a regular `<name>-wal` beside it, and that file's identity,
+    /// which keys the seat if it is a `SQLite` database.
+    RowWithWal(RowSchema, SidecarId),
+    /// A walk with [`Walker::with_sqlite`] only (#218): a regular
+    /// `<base>-wal`, `<base>-shm` or `<base>-journal` whose `<base>` is a
+    /// regular file in the same directory. Never a row: its outcome is its
+    /// base's. One whose base is absent or not a regular file is a
+    /// [`WalkItem::Row`], as in any walk.
+    SqliteSidecar {
+        /// The sidecar's relative path.
+        rel_path: Vec<u8>,
+        /// Its base's relative path.
+        database: Vec<u8>,
+    },
 }
+
+/// The names `SQLite` gives a database's sidecars (#218).
+pub const SQLITE_SIDECAR_SUFFIXES: [&[u8]; 3] = [b"-wal", b"-shm", b"-journal"];
 
 /// One directory being listed: its descriptor, the length of its relative
 /// path in the walker's shared path buffer, and the names in it still to
@@ -275,7 +294,22 @@ pub enum WalkItem {
 struct Level {
     dir: OwnedFd,
     prefix_len: usize,
-    names: std::vec::IntoIter<CString>,
+    /// Every name in the directory, in byte order.
+    names: Vec<CString>,
+    /// The next name to visit.
+    next: usize,
+}
+
+impl Level {
+    /// The names not yet visited.
+    fn remaining(&self) -> &[CString] {
+        self.names.get(self.next..).unwrap_or_default()
+    }
+
+    /// Whether the directory holds `name` (visited or not).
+    fn holds(&self, name: &[u8]) -> bool {
+        CString::new(name).is_ok_and(|name| self.names.binary_search(&name).is_ok())
+    }
 }
 
 /// The streaming walk beneath one root descriptor. An iterator of
@@ -290,6 +324,8 @@ pub struct Walker<'root> {
     path: Vec<u8>,
     ready: VecDeque<WalkItem>,
     directories_listed: u64,
+    /// Classify `SQLite` sidecars and attach `-wal` identities (#218).
+    sqlite: bool,
     _root: BorrowedFd<'root>,
 }
 
@@ -331,6 +367,7 @@ impl<'root> Walker<'root> {
             path: Vec::new(),
             ready: VecDeque::new(),
             directories_listed: 0,
+            sqlite: false,
             _root: root,
         };
         match sys::open_dir_at(root, c".")
@@ -349,6 +386,19 @@ impl<'root> Walker<'root> {
         Ok(walker)
     }
 
+    /// Classify `SQLite` sidecars for a `--sqlite=snapshot` transfer (#218):
+    /// a regular file with a regular `<name>-wal` beside it is yielded as a
+    /// [`WalkItem::RowWithWal`], and a regular `-wal`, `-shm` or `-journal`
+    /// whose base is a regular file beside it as a
+    /// [`WalkItem::SqliteSidecar`]. The names come from the directory
+    /// listing the walk already holds; each costs one `fstatat` beneath the
+    /// directory, and nothing is read.
+    #[must_use]
+    pub const fn with_sqlite(mut self, on: bool) -> Self {
+        self.sqlite = on;
+        self
+    }
+
     /// Directories listed so far, the root included. A streaming consumer
     /// sees its first item after one listing, not after the whole tree.
     #[must_use]
@@ -359,6 +409,18 @@ impl<'root> Walker<'root> {
     fn visit(&self, parent: BorrowedFd<'_>, name: &CStr, rel_path: Vec<u8>) -> Visit {
         let stat = match sys::fstatat_nofollow(parent, name) {
             Ok(stat) => stat,
+            // A live rollback-mode store's `-journal` comes and goes with
+            // each commit (#218 review round 2): one listed and gone before
+            // its stat is still its base's sidecar, whose outcome follows
+            // the base's. Nothing of it would have been carried.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && self.sqlite => {
+                return self
+                    .sidecar_of(parent, name.to_bytes(), &rel_path)
+                    .map_or_else(
+                        || refuse(rel_path, crate::refuse::io(&error, "walk::visit")),
+                        |item| Visit::Items(vec![item]),
+                    );
+            }
             Err(error) => return refuse(rel_path, crate::refuse::io(&error, "walk::visit")),
         };
         if !self.cross_device && stat.node.dev != self.root_dev {
@@ -381,8 +443,68 @@ impl<'root> Walker<'root> {
                 row.link_target = read_link(parent, name, stat.size);
                 Visit::Items(vec![WalkItem::Row(row)])
             }
+            FileKind::Regular if self.sqlite => {
+                Visit::Items(vec![self.sqlite_item(parent, name, rel_path, &stat)])
+            }
             _ => Visit::Items(vec![WalkItem::Row(row_from_stat(rel_path, &stat))]),
         }
+    }
+
+    /// A regular file in a [`Walker::with_sqlite`] walk (#218): a sidecar of
+    /// a regular base beside it, a row with its `-wal`'s identity, or a row.
+    fn sqlite_item(
+        &self,
+        parent: BorrowedFd<'_>,
+        name: &CStr,
+        rel_path: Vec<u8>,
+        stat: &Stat,
+    ) -> WalkItem {
+        let Some(level) = self.stack.last() else {
+            return WalkItem::Row(row_from_stat(rel_path, stat));
+        };
+        let leaf = name.to_bytes();
+        if let Some(sidecar) = self.sidecar_of(parent, leaf, &rel_path) {
+            return sidecar;
+        }
+        let regular = |name: &[u8]| {
+            CString::new(name)
+                .ok()
+                .and_then(|name| sys::fstatat_nofollow(parent, &name).ok())
+                .filter(Stat::is_file)
+        };
+        let mut wal = leaf.to_vec();
+        wal.extend_from_slice(b"-wal");
+        let row = row_from_stat(rel_path, stat);
+        if level.holds(&wal) {
+            if let Some(found) = regular(&wal) {
+                return WalkItem::RowWithWal(row, sidecar_id(&found));
+            }
+        }
+        WalkItem::Row(row)
+    }
+
+    /// `leaf` as a `-wal`, `-shm` or `-journal` of a regular base listed
+    /// beside it (#218), or `None`.
+    fn sidecar_of(&self, parent: BorrowedFd<'_>, leaf: &[u8], rel_path: &[u8]) -> Option<WalkItem> {
+        let level = self.stack.last()?;
+        SQLITE_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
+            let base = leaf.strip_suffix(*suffix)?;
+            // `<base>` sorts before its sidecars: it was listed, and is
+            // stat'ed again for its kind.
+            let regular = !base.is_empty()
+                && level.holds(base)
+                && CString::new(base)
+                    .ok()
+                    .and_then(|name| sys::fstatat_nofollow(parent, &name).ok())
+                    .is_some_and(|stat| stat.is_file());
+            regular.then(|| WalkItem::SqliteSidecar {
+                rel_path: rel_path.to_vec(),
+                database: rel_path
+                    .get(..rel_path.len() - suffix.len())
+                    .unwrap_or_default()
+                    .to_vec(),
+            })
+        })
     }
 
     /// Open and list a directory through the descriptor its row is taken
@@ -474,7 +596,7 @@ impl<'root> Walker<'root> {
     /// cannot be statted counts as content. `level` closes on return.
     fn at_depth_cap(&self, row: RowSchema, level: &Level, rel_path: Vec<u8>) -> Visit {
         let mut temporaries = Vec::new();
-        for name in level.names.as_slice() {
+        for name in level.remaining() {
             let Ok(stat) = sys::fstatat_nofollow(&level.dir, name) else {
                 return capped(row, rel_path);
             };
@@ -497,7 +619,7 @@ impl<'root> Walker<'root> {
     /// `None` when anything else is in it, or a name cannot be statted.
     fn only_file_temporaries(&self, level: &Level, prefix: &[u8]) -> Option<Vec<Vec<u8>>> {
         let mut temporaries = Vec::new();
-        for name in level.names.as_slice() {
+        for name in level.remaining() {
             let stat = sys::fstatat_nofollow(&level.dir, name).ok()?;
             if !self.cross_device && stat.node.dev != self.root_dev {
                 continue;
@@ -520,15 +642,19 @@ impl Iterator for Walker<'_> {
                 return Some(item);
             }
             let level = self.stack.last_mut()?;
-            let Some(name) = level.names.next() else {
+            let at = level.next;
+            if at >= level.names.len() {
                 // Every name beneath this directory is visited; release its
                 // descriptor before the walk moves on.
                 self.stack.pop();
                 continue;
-            };
+            }
+            level.next += 1;
             // The shared buffer still holds this level's prefix: anything
             // past it is the previous sibling's name, or a popped subtree's.
             let prefix_len = level.prefix_len;
+            let level = self.stack.last()?;
+            let name = level.names.get(at)?;
             self.path.truncate(prefix_len);
             if prefix_len != 0 {
                 self.path.push(b'/');
@@ -536,8 +662,7 @@ impl Iterator for Walker<'_> {
             self.path.extend_from_slice(name.to_bytes());
             // The length cap is applied in `visit`, after the stat (#129).
             let rel_path = self.path.clone();
-            let level = self.stack.last()?;
-            match self.visit(level.dir.as_fd(), &name, rel_path) {
+            match self.visit(level.dir.as_fd(), name, rel_path) {
                 Visit::Skip => {}
                 Visit::Items(items) => self.ready.extend(items),
                 Visit::Descend { row, level } => {
@@ -557,8 +682,20 @@ fn level_of(dir: OwnedFd, prefix_len: usize) -> Result<Level> {
     Ok(Level {
         dir,
         prefix_len,
-        names: names.into_iter(),
+        names,
+        next: 0,
     })
+}
+
+/// A `-wal` sidecar's identity from its `fstatat` (#218).
+const fn sidecar_id(stat: &Stat) -> SidecarId {
+    SidecarId {
+        dev: stat.node.dev,
+        ino: stat.node.ino,
+        size: stat.size,
+        mtime_ns: stat.mtime_ns,
+        ctime_ns: stat.ctime_ns,
+    }
 }
 
 /// A directory at the depth cap with contents: its row, then its contents
@@ -637,7 +774,15 @@ pub fn walk<C: FreshnessCache>(options: &WalkOptions, cache: &mut C) -> Result<W
 
     for item in Walker::with_limits(root.as_fd(), options.cross_device, options.limits)? {
         let mut row = match item {
-            WalkItem::Row(row) => row,
+            // Only a walk `with_sqlite` yields the last two; this one is not.
+            WalkItem::Row(row) | WalkItem::RowWithWal(row, _) => row,
+            WalkItem::SqliteSidecar { rel_path, .. } => {
+                outcome.refusals.push(RefusedSeat {
+                    rel_path,
+                    refusal: BulkloadRefusal::SqliteStateChanged,
+                });
+                continue;
+            }
             WalkItem::Refused(seat) => {
                 outcome.refusals.push(seat);
                 continue;
@@ -1419,5 +1564,47 @@ mod tests {
         assert!(!rows_of(&outcome)
             .iter()
             .any(|row| row.starts_with(b"long-enough/")));
+    }
+
+    /// #218 review round 2 (found by P80 under load): a live rollback-mode
+    /// store's `-journal` comes and goes with each commit. One listed and
+    /// gone before its stat, beside its base, is that base's sidecar in a
+    /// `snapshot` walk (its outcome follows the base's), not an `IO`
+    /// refusal; without a base it is still refused.
+    #[test]
+    fn a_sidecar_gone_before_its_stat_is_its_bases_sidecar() {
+        use std::os::fd::AsFd as _;
+        let corpus = Corpus::new("vanished-journal");
+        std::fs::write(corpus.root.join("store.db"), b"base").unwrap();
+        std::fs::write(corpus.root.join("store.db-journal"), b"hot").unwrap();
+        std::fs::write(corpus.root.join("orphan-journal"), b"hot").unwrap();
+        let root = crate::io::sys::open_root(&corpus.root).unwrap();
+        let walker = Walker::new(root.as_fd(), false).unwrap().with_sqlite(true);
+        // Listed with the root: both are gone before the walk stats them.
+        std::fs::remove_file(corpus.root.join("store.db-journal")).unwrap();
+        std::fs::remove_file(corpus.root.join("orphan-journal")).unwrap();
+        let items: Vec<WalkItem> = walker.collect();
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                WalkItem::SqliteSidecar { rel_path, database }
+                    if rel_path == b"store.db-journal" && database == b"store.db"
+            )),
+            "{items:?}"
+        );
+        assert!(
+            items.iter().any(|item| matches!(
+                item,
+                WalkItem::Refused(seat) if seat.rel_path == b"orphan-journal"
+            )),
+            "{items:?}"
+        );
+        assert!(
+            !items.iter().any(|item| matches!(
+                item,
+                WalkItem::Refused(seat) if seat.rel_path == b"store.db-journal"
+            )),
+            "{items:?}"
+        );
     }
 }

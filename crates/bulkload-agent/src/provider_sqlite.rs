@@ -181,11 +181,124 @@ pub(crate) fn assume_unprivileged() {
     assume_uid(1000);
 }
 
+/// Pages one backup step copies (OI-1003-Q16's bounded step): the read
+/// lock is taken and released inside each step.
+const STEP_PAGES: i32 = 128;
+
+/// A test hook run after each step of a carry backup, with the step's
+/// number (from 1, restarts included) and whether it was the last.
+#[cfg(test)]
+pub(crate) type StepHook = std::sync::Arc<dyn Fn(u64, bool) + Send + Sync>;
+
+/// Test-only: per source directory, the pages each step of a carry backup
+/// copies in place of [`STEP_PAGES`], and a hook run after each step (#218
+/// review: a store small enough for one step never shows a commit landing
+/// between steps).
+#[cfg(test)]
+static CARRY_STEPS: std::sync::Mutex<Vec<(PathBuf, i32, Option<StepHook>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Test-only: carry backups of databases beneath `root` step `pages` pages
+/// at a time and run `hook` after each step (`None` stops).
+#[cfg(test)]
+pub(crate) fn set_carry_steps(root: &Path, steps: Option<(i32, Option<StepHook>)>) {
+    let mut roots = CARRY_STEPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    roots.retain(|(known, _, _)| known != root);
+    if let Some((pages, hook)) = steps {
+        roots.push((root.to_path_buf(), pages, hook));
+    }
+}
+
+/// The pages a carry backup of `source` steps, and its test hook.
+#[cfg(test)]
+fn carry_steps(source: &Path) -> (i32, Option<StepHook>) {
+    CARRY_STEPS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(root, _, _)| source.starts_with(root))
+        .map_or((STEP_PAGES, None), |(_, pages, hook)| {
+            (*pages, hook.clone())
+        })
+}
+
+/// How many steps a backup may take before it is refused
+/// `BUDGET_EXCEEDED`.
+#[derive(Clone, Copy, Debug)]
+enum StepBudget {
+    /// At most this many steps, restarts included (the provider verbs).
+    Fixed(u32),
+    /// A carry snapshot (#218): `max(4, ceil(pages / 128) x 4)` steps,
+    /// restarts included, and at most `wall` on the clock (engineering
+    /// defaults, design D9; unruled).
+    Carry { wall: Duration },
+}
+
+/// What one backup did, for its counters, whether or not it finished.
+#[derive(Clone, Copy, Debug, Default)]
+struct BackupStats {
+    /// The source connection opened (so its first read may have rebuilt
+    /// a wal-index from the `-wal`).
+    opened: bool,
+    /// Pages copied, restarts included.
+    pages: u64,
+    /// The page size, once the destination has it.
+    page_size: u64,
+    /// Times the backup restarted from page 1 because another connection
+    /// committed between steps (each also counted as it happens,
+    /// `source_sqlite_backup_restarts`).
+    restarts: u64,
+}
+
+/// Counts the source connection's lifetime as `source_sqlite_lock_ns` when
+/// dropped (#218, review R13): in WAL mode a connection holds `SHARED` on
+/// the main file from its open to its close, not only inside a step.
+/// Declared before the connection, so it is dropped after it.
+struct LockSpan(std::time::Instant);
+
+impl Drop for LockSpan {
+    fn drop(&mut self) {
+        counters::add(Counter::SourceSqliteLockNs, counters::elapsed_ns(self.0));
+    }
+}
+
 /// Run the online backup of `source` into a new private `output`. The source
 /// connection is closed when this returns, on success and on refusal alike.
 fn copy_source(source: &Path, output: &Path, max_steps: u32) -> Result<(fs::File, Connection)> {
-    let source = Connection::open_with_flags(source, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(backup_refusal)?;
+    backup_into(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        output,
+        StepBudget::Fixed(max_steps),
+        &mut BackupStats::default(),
+    )
+}
+
+/// The stepped online backup every source read uses (OI-1003-Q16): a
+/// read-only, WAL-aware source connection with a zero busy timeout, one
+/// [`STEP_PAGES`] step at a time, so the source read lock is never held
+/// past a step. A step that meets a writer's lock refuses
+/// `SQLITE_STATE_CHANGED` at once; a backup past its budget refuses
+/// `BUDGET_EXCEEDED`. `stats` says what was read, refused or not.
+fn backup_into(
+    source: &Path,
+    flags: OpenFlags,
+    output: &Path,
+    budget: StepBudget,
+    stats: &mut BackupStats,
+) -> Result<(fs::File, Connection)> {
+    #[cfg(test)]
+    let (pages, hook) = match budget {
+        StepBudget::Carry { .. } => carry_steps(source),
+        StepBudget::Fixed(_) => (STEP_PAGES, None),
+    };
+    #[cfg(not(test))]
+    let pages = STEP_PAGES;
+    let _span = LockSpan(std::time::Instant::now());
+    let source = Connection::open_with_flags(source, flags).map_err(backup_refusal)?;
+    stats.opened = true;
     source
         .busy_timeout(Duration::ZERO)
         .map_err(backup_refusal)?;
@@ -201,25 +314,275 @@ fn copy_source(source: &Path, output: &Path, max_steps: u32) -> Result<(fs::File
     destination
         .busy_timeout(Duration::ZERO)
         .map_err(backup_refusal)?;
-    {
-        let backup = Backup::new(&source, &mut destination).map_err(backup_refusal)?;
-        let mut complete = false;
-        for _ in 0..max_steps {
-            match backup.step(128).map_err(backup_refusal)? {
-                StepResult::Done => {
-                    complete = true;
-                    break;
-                }
-                StepResult::More => {}
-                // Do not spin or sleep while another process holds a lock.
-                _ => return Err(BulkloadRefusal::SqliteStateChanged),
+    let stepped = step_all(
+        &source,
+        &mut destination,
+        budget,
+        pages,
+        stats,
+        #[cfg(test)]
+        hook.as_deref(),
+    );
+    stats.page_size = destination
+        .query_row("PRAGMA page_size", [], |row| row.get::<_, i64>(0))
+        .ok()
+        .and_then(|size| u64::try_from(size).ok())
+        .unwrap_or(0);
+    stepped?;
+    Ok((file, destination))
+}
+
+/// Step one backup to its end within `budget`, `pages` pages a step
+/// ([`STEP_PAGES`] outside unit tests), counting what it copies.
+fn step_all(
+    source: &Connection,
+    destination: &mut Connection,
+    budget: StepBudget,
+    pages: i32,
+    stats: &mut BackupStats,
+    #[cfg(test)] hook: Option<&(dyn Fn(u64, bool) + Send + Sync)>,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let backup = Backup::new(source, destination).map_err(backup_refusal)?;
+    let mut steps = 0_u64;
+    let mut before: Option<u64> = None;
+    loop {
+        let step = backup.step(pages).map_err(backup_refusal)?;
+        steps += 1;
+        let progress = backup.progress();
+        let (remaining, total) = (
+            u64::try_from(progress.remaining).unwrap_or(0),
+            u64::try_from(progress.pagecount).unwrap_or(0),
+        );
+        let copied = match before {
+            Some(before) if remaining < before => before - remaining,
+            // A step that copied pages and left as many to go, or more,
+            // began from page 1 again: another connection committed since
+            // the last one.
+            Some(_) if remaining > 0 => {
+                stats.restarts += 1;
+                counters::bump(Counter::SourceSqliteBackupRestarts);
+                total.saturating_sub(remaining)
             }
+            Some(_) => 0,
+            None => total.saturating_sub(remaining),
+        };
+        stats.pages = stats.pages.saturating_add(copied);
+        before = Some(remaining);
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook(steps, matches!(step, StepResult::Done));
         }
-        if !complete {
+        match step {
+            StepResult::Done => return Ok(()),
+            StepResult::More => {}
+            // Do not spin or sleep while another process holds a lock.
+            _ => return Err(BulkloadRefusal::SqliteStateChanged),
+        }
+        let over = match budget {
+            StepBudget::Fixed(max) => steps >= u64::from(max),
+            StepBudget::Carry { wall } => {
+                steps
+                    >= total
+                        .div_ceil(pages.unsigned_abs().into())
+                        .saturating_mul(4)
+                        .max(4)
+                    || started.elapsed() > wall
+            }
+        };
+        if over {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
     }
-    Ok((file, destination))
+}
+
+/// The bounds of a carry snapshot (#218, design D9): the wall-clock cap per
+/// backup. Engineering default, unruled; narrowed from the design's 120 s
+/// by review R3, since a WAL-mode source connection holds `SHARED` on the
+/// main file for its whole life.
+pub(crate) const CARRY_WALL: Duration = Duration::from_secs(30);
+
+/// What one carry snapshot read, wrote and found (#218).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CarryReport {
+    /// The snapshot file's size in bytes.
+    pub size: u64,
+    /// Source bytes read, as bounded for S3 (review R13): pages stepped x
+    /// page size, restarts included, plus `wal_bound`, the `-wal`'s size
+    /// before the read (a wal-index rebuild reads it once more). A refused
+    /// backup's are returned beside its refusal.
+    pub source_bytes: u64,
+    /// Restarts from page 1.
+    pub restarts: u64,
+    /// Foreign-key violations the snapshot holds: carried, not refused
+    /// (design D3).
+    pub fk_violations: u64,
+}
+
+/// Snapshot the live database at `source` into a new private `output` for a
+/// `--sqlite=snapshot` transfer (#218). The source read is exactly the
+/// `snapshot` verb's: the stepped backup from a read-only, WAL-aware
+/// connection (OI-1003-Q16, never `immutable=1`), with its counted wal-index
+/// and empty `-wal` (OI-1003-Q36, Q72). The connection is opened
+/// `SQLITE_OPEN_NOFOLLOW`, so a symlink at the leaf is refused; the caller
+/// passes a path under its canonical root and checks the walked inode
+/// (review R9). `as_root` refuses `SQLITE_SOURCE_AS_ROOT` before any open
+/// (OI-1003-Q76; the transfer refuses such a session at `Open` already).
+///
+/// The snapshot is converted to journal mode DELETE (design D4) and must
+/// pass `integrity_check`, the destination's own check (design D3, amended
+/// by the #218 review: `quick_check` does not compare index content with
+/// table content, so a store it passed was refused at the destination on
+/// every run and never remembered); its foreign-key violations are
+/// counted, not refused. The output is not synced: it is a private, transient file
+/// the transfer reads once more and removes.
+///
+/// # Errors
+/// Refuses root, an existing output, the budget (`BUDGET_EXCEEDED`), a
+/// busy step (`SQLITE_STATE_CHANGED`), `SQLite` errors
+/// (`SQLITE_BACKUP_FAILED` with the extended code) and a failed
+/// `integrity_check` (`SQLITE_INTEGRITY_CHECK_FAILED`).
+pub(crate) fn snapshot_for_carry(
+    source: &Path,
+    output: &Path,
+    as_root: bool,
+    wal_bound: u64,
+    wall: Duration,
+) -> (Result<CarryReport>, u64) {
+    if as_root {
+        return (Err(BulkloadRefusal::SqliteSourceAsRoot), 0);
+    }
+    let footprint = Footprint::observe(source);
+    let mut stats = BackupStats::default();
+    let copied = backup_into(
+        source,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        output,
+        StepBudget::Carry { wall },
+        &mut stats,
+    );
+    footprint.settle();
+    let source_bytes = if stats.opened {
+        stats
+            .pages
+            .saturating_mul(stats.page_size)
+            .saturating_add(wal_bound)
+    } else {
+        0
+    };
+    counters::add(Counter::SourceSqliteBackupBytes, source_bytes);
+    let report = copied.and_then(|(file, destination)| {
+        finish_carry(destination).map(|fk_violations| CarryReport {
+            size: file.metadata().map_or(0, |meta| meta.len()),
+            source_bytes,
+            restarts: stats.restarts,
+            fk_violations,
+        })
+    });
+    if let Ok(report) = &report {
+        counters::bump(Counter::SourceSqliteSnapshots);
+        counters::add(Counter::SourceSqliteFkViolations, report.fk_violations);
+    }
+    (report, source_bytes)
+}
+
+/// A carry snapshot's own checks, on the private copy only: journal mode
+/// DELETE (design D4), `integrity_check` exactly `ok`, as the destination
+/// will check it ([`verify_received`]; D3), and its foreign-key violations,
+/// counted, not refused. Closes the copy's connection.
+fn finish_carry(destination: Connection) -> Result<u64> {
+    let mode: String = destination
+        .query_row("PRAGMA journal_mode=DELETE", [], |row| row.get(0))
+        .map_err(backup_refusal)?;
+    if mode != "delete" {
+        return Err(BulkloadRefusal::SqliteStateChanged);
+    }
+    let check = destination
+        .prepare("PRAGMA integrity_check")
+        .and_then(|mut statement| {
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()
+        })
+        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
+    if check != ["ok"] {
+        return Err(BulkloadRefusal::SqliteIntegrityCheckFailed);
+    }
+    let fk_violations: i64 = destination
+        .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })
+        .map_err(|_| BulkloadRefusal::SqliteIntegrityCheckFailed)?;
+    destination
+        .close()
+        .map_err(|(_, error)| backup_refusal(error))?;
+    Ok(u64::try_from(fk_violations).unwrap_or(0))
+}
+
+/// Verify a received snapshot before it is published (#218, design section
+/// 9): the header's magic, its page size times its page count equals
+/// `size`, its journal mode is not WAL, and `PRAGMA integrity_check`
+/// returns exactly `ok`. The file is the destination's own staged
+/// temporary, opened read-only with `immutable=1` and
+/// `SQLITE_OPEN_NOFOLLOW`, so `SQLite` creates no `-shm`, `-wal` or
+/// `-journal` beside it and takes no lock.
+///
+/// # Errors
+/// Refuses anything else `SQLITE_INTEGRITY_CHECK_FAILED`.
+pub(crate) fn verify_received(file: &fs::File, path: &Path, size: u64) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    let failed = BulkloadRefusal::SqliteIntegrityCheckFailed;
+    let mut header = [0_u8; 100];
+    file.read_exact_at(&mut header, 0)
+        .map_err(|_| failed.clone())?;
+    let byte = |at: usize| header.get(at).copied().unwrap_or(0);
+    let page_size = match u16::from_be_bytes([byte(16), byte(17)]) {
+        1 => 65_536_u64,
+        size if size >= 512 && size.is_power_of_two() => u64::from(size),
+        _ => return Err(failed),
+    };
+    let pages = u64::from(u32::from_be_bytes([byte(28), byte(29), byte(30), byte(31)]));
+    // Bytes 18 and 19 are the write and read versions: 1 is the rollback
+    // journal, 2 is WAL (design D4: a snapshot is published in DELETE mode).
+    if !header.starts_with(b"SQLite format 3\0")
+        || byte(18) != 1
+        || byte(19) != 1
+        || pages.checked_mul(page_size) != Some(size)
+        || file.metadata().map(|meta| meta.len()).ok() != Some(size)
+    {
+        return Err(failed);
+    }
+    let mut uri = b"file:".to_vec();
+    for byte in path.as_os_str().as_encoded_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-_.~".contains(byte) {
+            uri.push(*byte);
+        } else {
+            uri.extend_from_slice(format!("%{byte:02X}").as_bytes());
+        }
+    }
+    uri.extend_from_slice(b"?immutable=1");
+    let uri = String::from_utf8(uri).map_err(|_| failed.clone())?;
+    let connection = Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_URI
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| failed.clone())?;
+    let mut statement = connection
+        .prepare("PRAGMA integrity_check")
+        .map_err(|_| failed.clone())?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|_| failed.clone())?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|_| failed.clone())?;
+    counters::bump(Counter::DestSqliteVerified);
+    counters::add(Counter::DestSqliteVerifyBytes, size);
+    if rows != ["ok"] {
+        return Err(failed);
+    }
+    Ok(())
 }
 
 /// What a snapshot's read leaves beside its source database (S2; OI-1003-Q16,

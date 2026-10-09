@@ -116,9 +116,10 @@ use bulkload_agent::fault::{
 };
 use bulkload_agent::freshness::NullCache;
 use bulkload_agent::materialize::RENAME_UNSUPPORTED_ENV;
-use bulkload_agent::transfer::{copy, TransferStats};
+use bulkload_agent::transfer::{copy, copy_with, TransferStats};
 use bulkload_agent::transfer_store::Manifest;
 use bulkload_agent::walk::{walk, WalkOptions};
+use bulkload_proto::frame::SqliteMode;
 use bulkload_proto::{BulkloadRefusal, RowSchema};
 
 /// Maximal chunks in the large fixture file (the v4 pack's batch size).
@@ -1158,11 +1159,18 @@ fn crash_child_entry() {
     });
     // An armed fault point ends this process inside `copy`. Returning at all
     // means the point was never reached, which the parent reports.
-    let outcome = copy(
+    // A `SqliteSupersede` scenario's child copies in `snapshot` mode (#218).
+    let sqlite = if std::env::var_os(sqlite_supersede::SQLITE_CHILD_ENV).is_some() {
+        SqliteMode::Snapshot
+    } else {
+        SqliteMode::Refuse
+    };
+    let outcome = copy_with(
         &base.join("source"),
         &base.join("destination"),
         &base.join("source-state"),
         &base.join("destination-state"),
+        sqlite,
     );
     eprintln!("fault point not reached; copy returned {outcome:?}");
 }
@@ -1186,6 +1194,17 @@ const SUPERSEDING: Fixture = Fixture {
 trait Scenario {
     fn run(self, point: Point, nth: u64);
 
+    /// [`Scenario::run`] for the `scenarios!` row named `test`, which a
+    /// scenario that re-runs itself in a child process (as another uid)
+    /// needs to name.
+    fn run_named(self, point: Point, nth: u64, test: &str)
+    where
+        Self: Sized,
+    {
+        let _ = test;
+        self.run(point, nth);
+    }
+
     /// The `copy` fixture the crash sweep runs this row against, if any.
     fn copy_fixture(&self) -> Option<Fixture> {
         None
@@ -1208,12 +1227,17 @@ impl Scenario for Fixture {
 mod estate_sidecar;
 use estate_sidecar::EstateSidecar;
 
+// #218, OI-1003-Q146: a `SQLite` snapshot superseding its own older output.
+#[path = "fault_harness/sqlite_supersede.rs"]
+mod sqlite_supersede;
+use sqlite_supersede::SqliteSupersede;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
             #[test]
             fn $name() {
-                Scenario::run($fixture, Point::$point, $nth);
+                Scenario::run_named($fixture, Point::$point, $nth, stringify!($name));
             }
         )*
 
@@ -1274,6 +1298,16 @@ scenarios! {
     superseding_before_commit_mid => PublishDestinationBeforeCommit: 3, SUPERSEDING;
     superseding_after_commit_mid => PublishDestinationAfterCommit: 9, SUPERSEDING;
     superseding_receive_after_end_mid => ReceiveAfterEnd: 8, SUPERSEDING;
+    // #218, OI-1003-Q146: the same exchange for a changed SQLite store's
+    // snapshot (module fault_harness/sqlite_supersede.rs; not swept).
+    sqlite_superseding_after_temp_write => MaterializeAfterTempWrite: 1, SqliteSupersede;
+    sqlite_superseding_after_temp_seal => MaterializeAfterTempSeal: 1, SqliteSupersede;
+    sqlite_supersede_after_intent => SupersedeAfterIntent: 1, SqliteSupersede;
+    sqlite_supersede_after_exchange_first => SupersedeAfterExchange: 1, SqliteSupersede;
+    sqlite_supersede_after_exchange_second => SupersedeAfterExchange: 2, SqliteSupersede;
+    sqlite_superseding_after_dir_seal => PublishDestinationAfterDirSeal: 1, SqliteSupersede;
+    sqlite_superseding_before_commit => PublishDestinationBeforeCommit: 1, SqliteSupersede;
+    sqlite_superseding_after_commit => PublishDestinationAfterCommit: 1, SqliteSupersede;
     // P70 SIDECAR-ORDER: each point on a first capture and on a changed one.
     estate_after_bundle_publish_first => EstateAfterBundlePublish: 1, EstateSidecar::First;
     estate_after_bundle_publish_changed => EstateAfterBundlePublish: 1, EstateSidecar::Changed;
