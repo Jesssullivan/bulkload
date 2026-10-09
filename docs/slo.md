@@ -351,6 +351,43 @@ as properties.
   record naming a code that has left the taxonomy stays unaccounted
   (`refusal-code-retired`); no disposition or attestation closes it.
 
+## Amendment 2026-10-08: S4 refusal sweep (#219, #220, #162, #183, #126)
+
+A proof-status line, not a new ruling (OI-1003-Q1). Each refusal below now
+names the fact its site knows, so a disposition reviews the real cause.
+
+- **New codes.** The taxonomy gains three codes, each raised by product code
+  and pinned by a test that fails without it:
+
+  | Code | Raised when | Was |
+  |---|---|---|
+  | `CAPTURE_ABSENT` | estate-apply meets a planned item whose capture the corpus does not hold (its capture refused, or none ran; the capture's own outcome record names why) (#219) | `SEALED_OBJECT_MISSING` |
+  | `GIT_SOURCE_ALTERNATES path=` | a source borrows through alternates deeper than a capture follows (a store five down naming one not yet linked; self-references, cycles and diamonds are linked once, as Git links them), or through a quoted entry, decided at capture and by the estimate probe before any export; or a capture misses an object behind an alternates entry naming a store Git cannot open (#219) | `GIT_INVENTORY_MALFORMED`; `GIT_CHILD_FAILED` (estimate, missing lender) |
+  | `SPACE_EXHAUSTED [path=]` | a write meets `ENOSPC` or `EDQUOT` and its site names the directory that filled: a capture's temporary under `TMPDIR`, a bundle stage (the directory that outlives it), a capture's Git child (PRIVATE_STATE, which nothing charges), a store's state directory (`Store::open`, the source ledger); with no path, a Git child of a verb that names no directory, such as the estimate probe (R-N121) (#220, #126) | bare `IO`, with or without an errno |
+
+- **Existing codes at more sites.** A bare repository with an unborn HEAD
+  captures as ref custody instead of refusing `GIT_CHILD_FAILED` (#162). A
+  refs import into a missing destination repository, or a directory Git
+  finds no repository in, refuses `GIT_REPOSITORY_NOT_AT_PATH` as that
+  item's receipt instead of `GIT_INVENTORY_MALFORMED` or
+  `GIT_DESTINATION_OCCUPIED`, or (an existing non-repository) aborting the
+  whole apply with no item record (#183). A destination group commit whose
+  store is out of space, and an estate-apply Git child out of space, refuse
+  `DESTINATION_SPACE_INSUFFICIENT` (the writes the preflight charges)
+  instead of `IO (errno 28)` or `GIT_CHILD_FAILED` (#126, #220). A store's
+  I/O error is `IO` with its errno, never `SQLITE_INTEGRITY_CHECK_FAILED`
+  (#126). A lender's repack under a capture of a source that borrows from
+  it is drift custody, not `GIT_CHILD_FAILED` (#219, S5).
+- **Old records.** No code left the taxonomy, so no recorded refusal becomes
+  `refusal-code-retired`. A record written before this change keeps the code
+  it names (`SEALED_OBJECT_MISSING` for a never-captured item, a bare `IO`
+  for a full `TMPDIR`); re-running the verb records the new code, and only
+  that record can be dispositioned under it.
+- **Still open.** A bare `IO` carries its errno but no path; a path would
+  need a new payload on the `IO` variant. An unborn HEAD in a non-bare
+  repository still refuses `GIT_CHILD_FAILED`. The capture space preflight
+  does not charge `TMPDIR` (#134).
+
 ## Amendment 2026-10-07: the hermetic rig is S1's gate of record (OI-1003-Q96, Q97)
 
 - **Why.** neo and sting are live, busy hosts. R-N81's gate (AC power, load1

@@ -419,7 +419,6 @@ fn io_none_sites() -> BTreeMap<String, usize> {
 /// site lowers its count here in the same change.
 const IO_NONE_ALLOWLIST: &[(&str, usize)] = &[
     ("crates/bulkload-agent/src/freshness.rs", 2),
-    ("crates/bulkload-agent/src/git_carry.rs", 1),
     ("crates/bulkload-agent/src/git_carry/batch_objects.rs", 3),
     ("crates/bulkload-agent/src/git_carry/estimate.rs", 5),
     (

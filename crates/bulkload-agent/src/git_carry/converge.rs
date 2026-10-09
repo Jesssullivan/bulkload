@@ -1923,6 +1923,10 @@ pub fn apply_refs(
 ) -> Result<Applied> {
     super::destination_git_ready()?;
     let repo = target.repository;
+    // S4 (#183): a destination that is missing, or a directory Git finds no
+    // repository in, refuses `GIT_REPOSITORY_NOT_AT_PATH` before the ledger
+    // lookup asks Git for its common directory.
+    super::destination_repository(repo)?;
     let common = super::common_repository(repo)?;
     let ref_dir = landed::ledger_dir(&common, target.source);
     let created = landed::read::<RefLedger>(&ref_dir.join(landed::REFS_LANDED))?
