@@ -475,13 +475,17 @@ mod tests {
                 .prop_map(BulkloadRefusal::GitNestConversionAttribute),
             path.clone()
                 .prop_map(BulkloadRefusal::GitNestPopulatedSubmodule),
-            path.prop_map(BulkloadRefusal::GitNestCarrierRefused),
+            path.clone()
+                .prop_map(BulkloadRefusal::GitNestCarrierRefused),
+            path.clone().prop_map(BulkloadRefusal::GitSourceAlternates),
+            proptest::option::of(path).prop_map(BulkloadRefusal::SpaceExhausted),
             prop_oneof![
                 Just(StderrClass::NotARepository),
                 Just(StderrClass::AuthFailed),
                 Just(StderrClass::HostUnreachable),
                 Just(StderrClass::Timeout),
                 Just(StderrClass::BadObject),
+                Just(StderrClass::NoSpace),
                 Just(StderrClass::Other),
             ]
             .prop_map(BulkloadRefusal::GitChildFailed),

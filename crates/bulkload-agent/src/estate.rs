@@ -2021,18 +2021,20 @@ fn capture_in(
     // knows whether each planned carrier's own capture refused in this pass.
     let refused = Mutex::new(std::collections::BTreeSet::new());
     let operation = |item: &Item| {
-        let result = group_base(item, &groups, state, corpus).and_then(|base| {
-            capture_item(
-                item,
-                state,
-                corpus,
-                base.as_ref(),
-                (policy, decision),
-                &owners,
-                &refused,
-                space,
-            )
-        });
+        let result = group_base(item, &groups, state, corpus)
+            .and_then(|base| {
+                capture_item(
+                    item,
+                    state,
+                    corpus,
+                    base.as_ref(),
+                    (policy, decision),
+                    &owners,
+                    &refused,
+                    space,
+                )
+            })
+            .map_err(|refusal| capture_refusal(refusal, item, state));
         if result.is_err() {
             refused
                 .lock()
@@ -2062,6 +2064,36 @@ fn capture_in(
 }
 
 type ImportedBases = Mutex<std::collections::BTreeSet<(PathBuf, [u8; 32])>>;
+
+// S4 (#220): a Git child that ran out of space names no directory (its
+// stderr is never carried, R-N121), but its verb knows where its children
+// write. Apply's write into the destination repository and its corpus
+// stages, both charged by apply's space preflight: the destination's space,
+// `DESTINATION_SPACE_INSUFFICIENT`.
+fn charged_space(refusal: BulkloadRefusal) -> BulkloadRefusal {
+    match refusal {
+        BulkloadRefusal::SpaceExhausted(None) => BulkloadRefusal::DestinationSpaceInsufficient,
+        other => other,
+    }
+}
+
+// A capture's refusal with the facts only the verb knows. S4 (#220): a
+// capture's Git children write only under PRIVATE_STATE (the attempt and
+// plan-base directories), which no preflight charges, so an unnamed
+// out-of-space refusal names it. S4 (#219): a missed object in a source
+// whose alternates name a store Git cannot open (a lender moved or deleted)
+// names that alternates file.
+fn capture_refusal(refusal: BulkloadRefusal, item: &Item, state: &Path) -> BulkloadRefusal {
+    use std::os::unix::ffi::OsStrExt as _;
+    match refusal {
+        BulkloadRefusal::SpaceExhausted(None) => {
+            BulkloadRefusal::SpaceExhausted(Some(state.as_os_str().as_bytes().to_vec()))
+        }
+        other => git_carry::missing_alternate(&item.source, &other).map_or(other, |file| {
+            BulkloadRefusal::GitSourceAlternates(file.as_os_str().as_bytes().to_vec())
+        }),
+    }
+}
 
 // A missing corpus file is a typed refusal, never a bare IO errno (S4).
 fn sealed(refusal: BulkloadRefusal) -> BulkloadRefusal {
@@ -2103,17 +2135,16 @@ fn import_base(
     let base = bound(corpus, &captured.bundle)?.ok_or(BulkloadRefusal::SealedObjectMissing)?;
     // Existing shared repositories are the supported optimization. Creating a
     // standalone destination needs a separate private preseed implementation.
-    if !item
-        .repository
-        .try_exists()
-        .refuse_at("estate::import_base")?
-        || item
-            .workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace == &item.repository)
+    if item
+        .workspace
+        .as_ref()
+        .is_some_and(|workspace| workspace == &item.repository)
     {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
+    // S4 (#183): a destination repository that is missing, or a directory
+    // that holds none, is named as such, never as an occupied one.
+    git_carry::destination_repository(&item.repository)?;
     let key = (git_carry::common_repository(&item.repository)?, base.digest);
     if imported
         .lock()
@@ -2142,9 +2173,10 @@ fn apply_item(
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
     // Round 4 N5: an item whose capture refused has no record. That is a
-    // typed refusal, never a bare IO errno.
+    // typed refusal, never a bare IO errno; and it names the absent capture
+    // (S4, #219), never a sealed object a capture recorded and lost.
     if !record.try_exists().refuse_at("estate::apply_item")? {
-        return Err(BulkloadRefusal::SealedObjectMissing);
+        return Err(BulkloadRefusal::CaptureAbsent);
     }
     let captured: Capture = read(&record)?;
     if !filename(&captured.bundle) {
@@ -2641,8 +2673,12 @@ pub fn apply(
         // already there, that is a collision the restore refuses by type
         // (R-N114), not Git administration to serialise on.
         let standalone = item.workspace.as_ref() == Some(&item.repository);
+        // S4 (#183): a destination Git cannot read as a repository (an empty
+        // directory, an unfinished `git init`) keys by its path, and its item
+        // refuses on its own; it never aborts the verb before any item runs.
         let common = if !standalone && item.repository.try_exists().refuse_at("estate::apply")? {
-            git_carry::common_repository(&item.repository)?
+            git_carry::common_repository(&item.repository)
+                .unwrap_or_else(|_| item.repository.clone())
         } else {
             item.repository.clone()
         };
@@ -2660,7 +2696,7 @@ pub fn apply(
         let _guard = lock
             .lock()
             .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
-        apply_item(item, corpus, state, source, &imported, &owners)
+        apply_item(item, corpus, state, source, &imported, &owners).map_err(charged_space)
     };
     // R-N114: an item whose workspace lies inside another item's workspace
     // restores after it, level by level, so the outer checkout lays down the
@@ -2761,6 +2797,10 @@ pub mod custody_probe {
         ))
     }
 }
+
+// S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
+#[cfg(test)]
+mod s4_sweep_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
@@ -4511,6 +4551,85 @@ mod tests {
             reuse_signals(&plan, &state, &corpus),
             vec![("captured", Some("shallow"))]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // #216 (OI-1003-Q129, OI-1003-Q135): a standalone item cloned from a
+    // local path (origin `/abs/path`, the xoruby estate's ~200 clones)
+    // restores complete instead of refusing GIT_AUTHORITY_CHANGED after its
+    // working tree was written. The origin is preserved inert, named in the
+    // activation receipt, and the destination has no `origin` remote; the
+    // journal is written, so a rerun replays rather than refusing
+    // GIT_DESTINATION_OCCUPIED.
+    #[test]
+    fn a_standalone_item_with_a_local_path_origin_restores_with_the_origin_inert() {
+        let root =
+            std::env::temp_dir().join(format!("tcfs-estate-inert-origin-{}", std::process::id()));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let upstream = root.join("upstream");
+        fs::create_dir(&upstream).unwrap();
+        git(&upstream, &["init", "--template="]);
+        fs::write(upstream.join("tracked"), b"base").unwrap();
+        git(&upstream, &["add", "tracked"]);
+        git(&upstream, &["commit", "-m", "base"]);
+        let source = root.join("source");
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--template=",
+                upstream.to_str().unwrap(),
+                source.to_str().unwrap(),
+            ],
+        );
+        fs::write(source.join("tracked"), b"dirty").unwrap();
+        fs::write(source.join("untracked"), b"kept").unwrap();
+        let target = root.join("destination");
+        let plan = root.join("plan");
+        add(&plan, &source, &target, Some(&target)).unwrap();
+        let (state, corpus) = (root.join("state"), root.join("corpus"));
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let applied = root.join("applied");
+        let outcomes = Mutex::new(Vec::new());
+        let record = |row: &Receipt| {
+            outcomes
+                .lock()
+                .unwrap()
+                .push((row.outcome, row.refusal.clone()));
+            Ok(())
+        };
+        apply(&plan, &corpus, &applied, "neo", 1, &record).unwrap();
+        apply(&plan, &corpus, &applied, "neo", 1, &record).unwrap();
+        assert_eq!(
+            outcomes.into_inner().unwrap(),
+            vec![
+                ("workspace-restored", None),
+                ("previous-workspace-restoration-not-revalidated", None)
+            ]
+        );
+        assert_eq!(fs::read(target.join("tracked")).unwrap(), b"dirty");
+        assert_eq!(fs::read(target.join("untracked")).unwrap(), b"kept");
+        let config = |key: &str| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&target)
+                .args(["config", "--local", key])
+                .output()
+                .unwrap()
+        };
+        assert!(!config("remote.origin.url").status.success());
+        assert!(!config("remote.origin.fetch").status.success());
+        let (activated, preserved, _): (Vec<String>, Vec<String>, Option<(String, String)>) =
+            postcard::from_bytes(
+                &fs::read(target.join(".git/carry-config/configuration-activation.postcard"))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert!(preserved.iter().any(|key| key == "remote.origin.url"));
+        assert!(!activated
+            .iter()
+            .any(|key| key.starts_with("remote.origin.")));
         fs::remove_dir_all(root).unwrap();
     }
 

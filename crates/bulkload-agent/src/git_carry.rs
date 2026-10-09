@@ -30,6 +30,14 @@ pub mod decide;
 )]
 mod decide_tests;
 pub mod estimate;
+#[cfg(test)]
+#[allow(
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::unwrap_used
+)]
+mod inert_origin_tests;
 mod raw_tree;
 mod ref_table;
 #[cfg(test)]
@@ -243,54 +251,144 @@ pub fn partial_clone(repo: &Path) -> Result<bool> {
             }
         }
     }
+    Ok(alternates_walk(repo)?.promisor)
+}
+
+/// What [`alternates_walk`] found under one source's object store.
+#[derive(Debug, Default)]
+pub(crate) struct AlternatesWalk {
+    /// A `.promisor` pack in a followed store (the walk stops there).
+    pub promisor: bool,
+    /// Every store the walk followed, the source's own first, each once, in
+    /// the order Git links them.
+    pub stores: Vec<PathBuf>,
+    /// Each alternates file with an entry naming a directory Git cannot
+    /// open: a lender moved or deleted after `clone --shared`.
+    pub missing: Vec<PathBuf>,
+}
+
+/// The source's object store and every store it borrows through
+/// `objects/info/alternates`, walked as Git links them (S4, #219).
+///
+/// Git links alternates depth first, in file order, and links each store
+/// once: an entry naming the primary store, or a store already linked (by
+/// its real path), is skipped, so a self-reference, a cycle or a diamond
+/// costs no depth. Git reads alternates files at most six levels down. The
+/// capture's private repository borrows the source's store, one level more
+/// than the source itself, so a store five levels below the source is the
+/// deepest the private repository reads: an entry there naming a store not
+/// yet linked names a store no capture reads, and refuses
+/// `GIT_SOURCE_ALTERNATES` with that alternates file, before any export. So
+/// does a quoted entry, which Git unquotes and this walk does not. An entry
+/// naming a missing directory is skipped, as Git skips it, and recorded:
+/// the capture names that file if the export then misses an object
+/// ([`missing_alternate`]). Every store this walk follows, the bundle
+/// follows: it packs reachable objects wherever they are stored, and a
+/// landing built from it borrows nothing. The estimate probe's walk
+/// ([`estimate::PROBE_SCRIPT`]) applies the same rules.
+///
+/// # Errors
+/// `GIT_SOURCE_ALTERNATES` for alternates no capture follows; refuses a
+/// store or alternates file it cannot read.
+pub(crate) fn alternates_walk(repo: &Path) -> Result<AlternatesWalk> {
     let objects = PathBuf::from(text(git(repo).args([
         "rev-parse",
         "--path-format=absolute",
         "--git-path",
         "objects",
     ]))?);
-    promisor_packs(&objects, 0)
+    let mut walk = AlternatesWalk::default();
+    let mut linked = std::collections::BTreeSet::new();
+    linked.insert(fs::canonicalize(&objects).refuse_at("git_carry::alternates_walk")?);
+    walk.stores.push(objects.clone());
+    link_alternates(&objects, 0, &mut linked, &mut walk)?;
+    Ok(walk)
 }
 
-// A `.promisor` pack in `store` or, through `info/alternates`, in any store it
-// borrows from, at most five levels deep (the estimate probe's bound).
-fn promisor_packs(store: &Path, depth: u8) -> Result<bool> {
+/// The alternates file a failed capture should name (S4, #219).
+///
+/// It is the first whose entry names a store Git cannot open, when
+/// `refusal` is a Git child that failed on what such a store leaves: a
+/// missing object (`bad_object`),
+/// or a revision that no longer resolves (`other`; Git's own error is then
+/// only "unable to normalize alternate object path"). A child that failed
+/// for a named cause (auth, network, not a repository, no space) keeps it,
+/// as does any other refusal, and a source with no such entry names none.
+#[must_use]
+pub fn missing_alternate(repo: &Path, refusal: &BulkloadRefusal) -> Option<PathBuf> {
+    use estimate::StderrClass;
+    if !matches!(
+        refusal,
+        BulkloadRefusal::GitChildFailed(StderrClass::BadObject | StderrClass::Other)
+    ) {
+        return None;
+    }
+    alternates_walk(repo).ok()?.missing.into_iter().next()
+}
+
+// One store of [`alternates_walk`] at `depth` below the source's own.
+fn link_alternates(
+    store: &Path,
+    depth: u8,
+    linked: &mut std::collections::BTreeSet<PathBuf>,
+    walk: &mut AlternatesWalk,
+) -> Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
+    const SITE: &str = "git_carry::alternates_walk";
     match fs::read_dir(store.join("pack")) {
         Ok(entries) => {
             for entry in entries {
-                if Path::new(&entry.refuse_at("git_carry::promisor_packs")?.file_name())
+                if Path::new(&entry.refuse_at(SITE)?.file_name())
                     .extension()
                     .is_some_and(|extension| extension == "promisor")
                 {
-                    return Ok(true);
+                    walk.promisor = true;
+                    return Ok(());
                 }
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(crate::refuse::io(&error, "git_carry::promisor_packs")),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
     }
-    let alternates = match fs::read(store.join("info/alternates")) {
+    let file = store.join("info/alternates");
+    let alternates = match fs::read(&file) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(crate::refuse::io(&error, "git_carry::promisor_packs")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
     };
-    if depth >= 5 {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
+    let unfollowable =
+        || BulkloadRefusal::GitSourceAlternates(file.as_os_str().as_bytes().to_vec());
     for line in alternates.split(|byte| *byte == b'\n') {
         if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
         if line.starts_with(b"\"") {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
+            return Err(unfollowable());
         }
         let alternate = store.join(std::ffi::OsStr::from_bytes(line));
-        if alternate.is_dir() && promisor_packs(&alternate, depth + 1)? {
-            return Ok(true);
+        // Git cannot open it either; skipped, and named if it is missed.
+        let Ok(real) = fs::canonicalize(&alternate) else {
+            walk.missing.push(file.clone());
+            continue;
+        };
+        if !real.is_dir() {
+            walk.missing.push(file.clone());
+            continue;
+        }
+        if linked.contains(&real) {
+            continue;
+        }
+        if depth >= 5 {
+            return Err(unfollowable());
+        }
+        linked.insert(real);
+        walk.stores.push(alternate.clone());
+        link_alternates(&alternate, depth + 1, linked, walk)?;
+        if walk.promisor {
+            return Ok(());
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 /// Refuse a partial-clone source before any other read (WP1 PR 1).
@@ -308,6 +406,13 @@ pub fn refuse_partial_clone(repo: &Path) -> Result<()> {
 // A v1 Git child run to completion; a non-zero exit refuses
 // GIT_CHILD_FAILED with its stderr class (WP3, R-N121).
 fn output(command: &mut Command) -> Result<Vec<u8>> {
+    // A test can make this child fail as one that ran out of space does.
+    #[cfg(test)]
+    if scratch_fault::take(scratch_fault::Site::Child).is_err() {
+        return Err(estimate::child_failed(
+            b"fatal: write error: No space left on device",
+        ));
+    }
     estimate::run_git(command, None)
 }
 
@@ -922,7 +1027,6 @@ pub struct CarriedAuthority {
 // reflog is read only when `inventory` lists refs/stash, exactly as the key
 // always read it. No census walk.
 fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
-    let head = text(git(repo).args(["rev-parse", "--verify", "HEAD"]))?;
     let symbolic = git(repo)
         .args(["symbolic-ref", "-q", "HEAD"])
         .output()
@@ -930,6 +1034,7 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
     if !symbolic.status.success() && symbolic.status.code() != Some(1) {
         return Err(estimate::child_failed(&symbolic.stderr));
     }
+    let head = carried_head(repo, symbolic.status.success())?;
     let (_, index, gitlinks) = source_index(repo)?;
     let exclude_path = text(git(repo).args([
         "rev-parse",
@@ -957,6 +1062,28 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
         boundary: shallow::frontier(repo)?,
         gitlinks,
     })
+}
+
+// HEAD's commit, as `rev-parse --verify HEAD` names it. S4 (#162, #219): a
+// bare repository whose HEAD is a branch that does not exist (unborn, as
+// `init --bare` or a mirror of a renamed default branch leaves it) is a valid
+// state, carried as ref custody: its refs and its symbolic HEAD, and the
+// empty string here, so no `refs/carry-export/head` is exported. Any other
+// HEAD that does not resolve still refuses as the child failed.
+fn carried_head(repo: &Path, symbolic: bool) -> Result<String> {
+    let resolved = git(repo)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .refuse_at("git_carry::carried_head")?;
+    if resolved.status.success() {
+        return String::from_utf8(resolved.stdout)
+            .map(|head| head.trim_end().to_owned())
+            .map_err(|_| BulkloadRefusal::GitInventoryMalformed);
+    }
+    if resolved.status.code() == Some(1) && symbolic && bare_root(repo)? {
+        return Ok(String::new());
+    }
+    Err(estimate::child_failed(&resolved.stderr))
 }
 
 /// The typed inputs of the reusable capture key for `repo`, default policy.
@@ -1446,36 +1573,46 @@ fn refusing_drift(export: Exported) -> Result<Export> {
     }
 }
 
-/// The identity of the source's pack listing: every entry of
-/// `<common>/objects/pack` by name, inode and size, hashed in name order. A
-/// `gc`, `repack` or `prune --expire` writes or removes packs, so it changes
-/// this; reading through the store never does. A missing pack directory is
-/// the empty listing.
-fn pack_listing(common: &Path) -> Result<[u8; 32]> {
+/// The identity of the source's pack listings: every entry of each store's
+/// `pack` directory by name, inode and size, hashed in name order, store by
+/// store. `stores` are the source's own and every store it borrows
+/// ([`alternates_walk`]; S4, #219): a `gc`, `repack` or `prune --expire` in
+/// a lender rewrites what the capture reads as surely as one in the source.
+/// A rewrite writes or removes packs, so it changes this; reading through a
+/// store never does. A missing pack directory is the empty listing.
+fn pack_listing(stores: &[PathBuf]) -> Result<[u8; 32]> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
-    let mut entries = Vec::new();
-    match fs::read_dir(common.join("objects/pack")) {
-        Ok(listing) => {
-            for entry in listing {
-                let entry = entry.refuse_at("git_carry::pack_listing")?;
-                // A pack removed between the listing and its stat is the
-                // rewrite itself; record it as absent.
-                let (ino, size) = entry
-                    .metadata()
-                    .map_or((0, u64::MAX), |meta| (meta.ino(), meta.size()));
-                entries.push((entry.file_name().as_bytes().to_vec(), ino, size));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(crate::refuse::io(&error, "git_carry::pack_listing")),
-    }
-    entries.sort_unstable();
     let mut hash = blake3::Hasher::new();
-    for (name, ino, size) in &entries {
-        framed(&mut hash, name)?;
-        hash.update(&ino.to_le_bytes());
-        hash.update(&size.to_le_bytes());
+    for store in stores {
+        let mut entries = Vec::new();
+        match fs::read_dir(store.join("pack")) {
+            Ok(listing) => {
+                for entry in listing {
+                    let entry = entry.refuse_at("git_carry::pack_listing")?;
+                    // A pack removed between the listing and its stat is the
+                    // rewrite itself; record it as absent.
+                    let (ino, size) = entry
+                        .metadata()
+                        .map_or((0, u64::MAX), |meta| (meta.ino(), meta.size()));
+                    entries.push((entry.file_name().as_bytes().to_vec(), ino, size));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(crate::refuse::io(&error, "git_carry::pack_listing")),
+        }
+        entries.sort_unstable();
+        framed(&mut hash, store.as_os_str().as_bytes())?;
+        hash.update(
+            &u64::try_from(entries.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for (name, ino, size) in &entries {
+            framed(&mut hash, name)?;
+            hash.update(&ino.to_le_bytes());
+            hash.update(&size.to_le_bytes());
+        }
     }
     Ok(*hash.finalize().as_bytes())
 }
@@ -1508,10 +1645,13 @@ fn export_repository_inner(
     // not parse refuses GIT_INVENTORY_MALFORMED. Exactly those two are the
     // rewrite's footprint; every other refusal stays a refusal.
     let common = common_repository(&repo)?;
-    let packs = pack_listing(&common)?;
+    // S4 (#219): the lenders' listings too; the private repository reads
+    // through them as it reads through the source's own store.
+    let stores = alternates_walk(&repo)?.stores;
+    let packs = pack_listing(&stores)?;
     match export_pass(&repo, &capture, &common, options) {
         Err(BulkloadRefusal::GitInventoryMalformed | BulkloadRefusal::GitChildFailed(_))
-            if pack_listing(&common)? != packs =>
+            if pack_listing(&stores)? != packs =>
         {
             let mut drift = CaptureDrift::default();
             drift.extend([DriftRow::seat(
@@ -1797,12 +1937,76 @@ pub(crate) const fn refuse_bare_capture(staged: &StagedBundle) -> Result<()> {
 #[derive(Debug)]
 struct PrivateDir(PathBuf);
 
+/// Test-only (S4, #220): the next write this thread makes at an armed site
+/// fails with the armed errno, as a full or over-quota filesystem fails it.
+/// Each arming fails one write, in arming order. Thread-local, so parallel
+/// tests never see each other's fault.
+#[cfg(test)]
+pub(crate) mod scratch_fault {
+    use std::cell::RefCell;
+
+    /// Where an armed fault fails a write.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Site {
+        /// The mkdir of a private directory, in any parent it tries.
+        Mkdir,
+        /// The private copy of the source index (`source_index`).
+        IndexWrite,
+        /// The create of a bundle stage (`copy_hashing`).
+        StageCreate,
+        /// A write into a bundle stage (`copy_hashing`).
+        StageWrite,
+        /// The next v1 Git child (`output`): it fails as a child whose
+        /// stderr says no space left on device (the errno is not read).
+        Child,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Vec<(Site, i32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Fail the next private-directory mkdir with `errno`.
+    pub fn arm(errno: i32) {
+        arm_at(Site::Mkdir, errno);
+    }
+
+    /// Fail the next write at `site` with `errno`.
+    pub fn arm_at(site: Site, errno: i32) {
+        ARMED.with(|armed| armed.borrow_mut().push((site, errno)));
+    }
+
+    /// The fault armed first at `site`, consumed.
+    pub(super) fn take(site: Site) -> std::io::Result<()> {
+        ARMED.with(|armed| {
+            let mut armed = armed.borrow_mut();
+            armed
+                .iter()
+                .position(|(armed_site, _)| *armed_site == site)
+                .map_or(Ok(()), |index| {
+                    Err(std::io::Error::from_raw_os_error(armed.remove(index).1))
+                })
+        })
+    }
+}
+
+// mkdir 0700 `candidate`; a test can arm a fault first.
+fn create_private(candidate: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    #[cfg(test)]
+    scratch_fault::take(scratch_fault::Site::Mkdir)?;
+    fs::DirBuilder::new().mode(0o700).create(candidate)
+}
+
 impl PrivateDir {
     fn create(near: Option<&Path>) -> Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir();
+        // S4 (#220): a full or over-quota filesystem names the parent that
+        // ran out (`SPACE_EXHAUSTED`), and is the verb's refusal even when a
+        // later parent then fails otherwise; else the last parent's refusal,
+        // with its errno. Never a bare IO with neither.
+        let mut refused = BulkloadRefusal::ContractSelfInconsistent;
         for parent in near.into_iter().chain(std::iter::once(temp.as_path())) {
             loop {
                 let candidate = parent.join(format!(
@@ -1810,15 +2014,41 @@ impl PrivateDir {
                     std::process::id(),
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ));
-                match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                match create_private(&candidate) {
                     Ok(()) => return Ok(Self(candidate)),
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     // This parent refuses a private directory; try the next.
-                    Err(_) => break,
+                    Err(error) => {
+                        if !matches!(refused, BulkloadRefusal::SpaceExhausted(_)) {
+                            refused =
+                                crate::refuse::io_in(&error, parent, "git_carry::private_dir");
+                        }
+                        break;
+                    }
                 }
             }
         }
-        Err(BulkloadRefusal::Io(None))
+        Err(refused)
+    }
+
+    // Only in `parent`, never TMPDIR: a stage whose contents are renamed into
+    // a sibling must share its filesystem (#216).
+    fn create_beside(parent: &Path) -> Result<Self> {
+        use std::os::unix::fs::DirBuilderExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        loop {
+            let candidate = parent.join(format!(
+                ".bulkload-restore-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                Ok(()) => return Ok(Self(candidate)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(crate::refuse::io(&error, "git_carry::create_beside")),
+            }
+        }
     }
 
     fn path(&self) -> &Path {
@@ -1869,7 +2099,7 @@ impl StagedBundle {
 
 // Copy `source` to a new private file while hashing it: one read, one write,
 // counted as `read_bundle_stage_bytes`, `blake3_bundle_stage_bytes` and
-// `write_bundle_stage_bytes`.
+// `write_bundle_stage_bytes`. `destination` is a file in a [`PrivateDir`].
 fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
     use crate::counters::{add_len, update, Counter};
     use std::io::{Read, Write};
@@ -1879,12 +2109,30 @@ fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(source)
         .refuse_at("git_carry::copy_hashing")?;
-    let mut to = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination)
-        .refuse_at("git_carry::copy_hashing")?;
+    // S4 (#220): a stage that fills its filesystem, at its create (inodes,
+    // directory blocks) or at a write, names the directory the stage's
+    // private directory was made in. The private directory itself is gone
+    // once the refusal drops it.
+    let full = |error: std::io::Error| {
+        let directory = destination
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(destination);
+        crate::refuse::io_in(&error, directory, "git_carry::copy_hashing")
+    };
+    #[cfg(test)]
+    let armed = scratch_fault::take(scratch_fault::Site::StageCreate);
+    #[cfg(not(test))]
+    let armed = Ok(());
+    let mut to = armed
+        .and_then(|()| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(destination)
+        })
+        .map_err(full)?;
     let mut hash = blake3::Hasher::new();
     let mut buffer = vec![0; 1 << 20];
     loop {
@@ -1897,7 +2145,11 @@ fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
         add_len(Counter::BundleStageRead, count);
         let chunk = buffer.get(..count).ok_or(BulkloadRefusal::FrameCodec)?;
         update(&mut hash, Counter::HashBundleStage, chunk);
-        to.write_all(chunk).refuse_at("git_carry::copy_hashing")?;
+        #[cfg(test)]
+        let armed = scratch_fault::take(scratch_fault::Site::StageWrite);
+        #[cfg(not(test))]
+        let armed = Ok(());
+        armed.and_then(|()| to.write_all(chunk)).map_err(full)?;
         add_len(Counter::BundleStageWrite, count);
     }
     Ok(*hash.finalize().as_bytes())
@@ -1945,7 +2197,10 @@ fn carry_authority(
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
     capture_refs(&private, inventory, &authority.stash)?;
-    set_ref(&private, "refs/carry-export/head", &authority.head)?;
+    // An unborn HEAD (bare only, [`carried_head`]) names no commit to export.
+    if !authority.head.is_empty() {
+        set_ref(&private, "refs/carry-export/head", &authority.head)?;
+    }
     capture_administration(&private, authority)?;
     Ok(private)
 }
@@ -4825,7 +5080,17 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
     // moment later (round-4 R2): every check reads a private copy of them.
     let scratch = PrivateDir::create(None)?;
     let carried = scratch.path().join("index");
-    fs::write(&carried, &before_index).refuse_at("git_carry::source_index")?;
+    let full = |error: std::io::Error| {
+        let directory = scratch.path().parent().unwrap_or_else(|| scratch.path());
+        crate::refuse::io_in(&error, directory, "git_carry::source_index")
+    };
+    #[cfg(test)]
+    let armed = scratch_fault::take(scratch_fault::Site::IndexWrite);
+    #[cfg(not(test))]
+    let armed = Ok(());
+    armed
+        .and_then(|()| fs::write(&carried, &before_index))
+        .map_err(full)?;
     let checked = |args: &[&str]| -> Result<Vec<u8>> {
         output(git(repo).env("GIT_INDEX_FILE", &carried).args(args))
     };
@@ -5017,12 +5282,44 @@ pub fn import_staged(repo: &Path, staged: &StagedBundle, source: &str) -> Result
     import_verified(repo, staged.path(), source)
 }
 
+/// Refuse a refs-import destination that is not a repository (S4, #183):
+/// `GIT_REPOSITORY_NOT_AT_PATH` when `repo` is missing, not a directory, or
+/// a directory Git (stopped at its parent) finds no repository in, such as
+/// an empty directory, an unfinished `git init` or a partial cleanup. Any
+/// other failure keeps its own refusal: an unreadable path is IO with its
+/// errno, never "not there".
+///
+/// # Errors
+/// As above.
+pub(crate) fn destination_repository(repo: &Path) -> Result<()> {
+    const SITE: &str = "git_carry::destination_repository";
+    if !repo.try_exists().refuse_at(SITE)? || !fs::metadata(repo).refuse_at(SITE)?.is_dir() {
+        return Err(BulkloadRefusal::GitRepositoryNotAtPath);
+    }
+    let found = git(repo)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .refuse_at(SITE)?;
+    if found.status.success() {
+        return Ok(());
+    }
+    match estimate::child_failed(&found.stderr) {
+        BulkloadRefusal::GitChildFailed(estimate::StderrClass::NotARepository) => {
+            Err(BulkloadRefusal::GitRepositoryNotAtPath)
+        }
+        refusal => Err(refusal),
+    }
+}
+
 // `import_bundle` for a verb that already staged and checked its bundle, and
 // reads only the staged copy.
 pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Result<usize> {
     if !source_slug(source) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
+    // S4 (#183): before `bundle verify` reads its failure as a malformed
+    // bundle.
+    destination_repository(repo)?;
     let bundle = fs::canonicalize(bundle).refuse_at("git_carry::import_verified")?;
     verify_bundle(repo, &bundle)?;
     let listed = text(git(repo).args(["bundle", "list-heads"]).arg(&bundle))?;
@@ -5290,10 +5587,13 @@ fn prepare_attachment(
     receipt: &Path,
 ) -> Result<(PathBuf, String)> {
     use std::os::unix::fs::DirBuilderExt;
+    // R-N114, #216: a receipt left by an earlier refused attachment is a
+    // collision refused by type, never a bare errno; it is kept as evidence,
+    // and a rerun names a new receipt.
     fs::DirBuilder::new()
         .mode(0o700)
         .create(receipt)
-        .refuse_at("git_carry::prepare_attachment")?;
+        .map_err(occupied)?;
     // Retain the actual input, not merely a pathname that may later disappear.
     let retained = receipt.join("capture.bundle");
     fs::copy(bundle, &retained).refuse_at("git_carry::prepare_attachment")?;
@@ -5407,13 +5707,13 @@ fn safe_configuration_value(private: &Path, key: &str, value: &str) -> bool {
     false
 }
 
-fn activate_standalone_configuration(
-    private: &Path,
-    heads: &str,
-    receipt: &Path,
-    mapping: Option<(&Path, &Path)>,
-) -> Result<()> {
-    let mapping = mapping
+// An explicit origin mapping: an absolute local `from` the captured origin must
+// name exactly, and an absolute `to` that is an existing local repository.
+// Checked before anything is written (#216).
+fn checked_mapping<'a>(
+    mapping: Option<(&'a Path, &'a Path)>,
+) -> Result<Option<(&'a str, &'a str)>> {
+    mapping
         .map(|(from, to)| {
             if !from.is_absolute() || !to.is_absolute() {
                 return Err(BulkloadRefusal::PathNotAbsolute);
@@ -5425,21 +5725,59 @@ fn activate_standalone_configuration(
                 to.to_str().ok_or(BulkloadRefusal::GitInventoryMalformed)?,
             ))
         })
-        .transpose()?;
+        .transpose()
+}
+
+/// What a standalone restore or attachment activates from the captured local
+/// configuration, decided in full before anything is activated (#216,
+/// OI-1003-Q129, OI-1003-Q135). Every refusal of the configuration policy is
+/// raised while this is built; applying it only writes.
+#[derive(Debug)]
+struct ConfigurationPlan {
+    // `git config --local --add` key and value pairs, in source order.
+    activate: Vec<(String, String)>,
+    // Keys kept only in the receipt's verbatim `source-*` copies.
+    preserved_only: Vec<String>,
+    mapping: Option<(String, String)>,
+}
+
+// The captured origin is activated only when every `remote.origin.url` value
+// can be: with a mapping, each must name its `from` exactly (else
+// GIT_AUTHORITY_CHANGED, and no origin at all is GIT_INVENTORY_MALFORMED);
+// without one, each must be a plain HTTPS URL. Any other origin (scp-style,
+// `ssh://`, `git://`, `file://`, an absolute or relative local path) is
+// preserved inert, never refused (#216): its URL and every other
+// `remote.origin.*` key stay in the receipt only, so the restored repository
+// has no `origin` remote at all (`git remote` lists nothing), never a
+// half-configured one with a fetch refspec and no URL.
+// `branch.*.remote = origin` and `branch.*.pushremote = origin` are then
+// preserved-only too: Git reads an explicitly named but unconfigured remote
+// as a path relative to the working directory, and the restored worktree can
+// carry an `origin` entry (a bare repository, a bundle), which fetch, pull
+// and push would then read or write. Without them, fetch is a no-op, pull
+// reports no tracking information and push no configured destination; the
+// operator restores tracking with `git branch --set-upstream-to` once an
+// origin is added. `branch.*.merge` stays: it names no remote by itself.
+fn plan_standalone_configuration(
+    private: &Path,
+    heads: &str,
+    receipt: &Path,
+    mapping: Option<(&str, &str)>,
+) -> Result<ConfigurationPlan> {
+    const SITE: &str = "git_carry::plan_standalone_configuration";
     let files: Vec<(String, Vec<u8>)> = postcard::from_bytes(&output(git(private).args([
         "show",
         &format!("{}:value", capture_revision(heads, "configuration-v1")?),
     ]))?)
     .map_err(|_| BulkloadRefusal::FrameCodec)?;
-    let mut activated = Vec::new();
+    let mut entries = Vec::new();
     let mut preserved_only = Vec::new();
-    let mut origin_seen = false;
     for (name, bytes) in files {
         if !matches!(name.as_str(), "config" | "config.worktree") {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         let retained = receipt.join(format!("source-{name}"));
-        fs::write(&retained, bytes).refuse_at("git_carry::activate_standalone_configuration")?;
+        fs::write(&retained, bytes).refuse_at(SITE)?;
         // Worktree-local configuration may be dormant unless the source enables
         // its extension. Preserve it, but do not silently flatten its authority.
         if name == "config.worktree" {
@@ -5455,33 +5793,69 @@ fn activate_standalone_configuration(
             let entry =
                 std::str::from_utf8(entry).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
             let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
-            let value = if key == "remote.origin.url" {
-                origin_seen = true;
-                match mapping {
-                    Some((from, to)) if value == from => to,
-                    None if safe_https_origin(value) => value,
-                    _ => return Err(BulkloadRefusal::GitAuthorityChanged),
-                }
-            } else if safe_configuration_value(private, key, value) {
-                value
-            } else {
-                preserved_only.push(key.to_owned());
-                continue;
-            };
-            output(git(private).args(["config", "--local", "--add", key, value]))?;
-            activated.push(key.to_owned());
+            entries.push((key.to_owned(), value.to_owned()));
         }
     }
-    if mapping.is_some() && !origin_seen {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+    let mut origins = entries
+        .iter()
+        .filter(|(key, _)| key == "remote.origin.url")
+        .map(|(_, value)| value.as_str())
+        .peekable();
+    let origin_active = match mapping {
+        Some(_) if origins.peek().is_none() => return Err(BulkloadRefusal::GitInventoryMalformed),
+        Some((from, _)) if origins.any(|value| value != from) => {
+            return Err(BulkloadRefusal::GitAuthorityChanged)
+        }
+        Some(_) => true,
+        None => origins.peek().is_some() && origins.all(safe_https_origin),
+    };
+    let mut activate = Vec::new();
+    for (key, value) in entries {
+        let value = if key == "remote.origin.url" && origin_active {
+            mapping.map_or(value, |(_, to)| to.to_owned())
+        } else if !origin_active
+            && (key.starts_with("remote.origin.")
+                || (key.starts_with("branch.")
+                    && (key.ends_with(".remote") || key.ends_with(".pushremote"))
+                    && value == "origin"))
+        {
+            preserved_only.push(key);
+            continue;
+        } else if safe_configuration_value(private, &key, &value) {
+            value
+        } else {
+            preserved_only.push(key);
+            continue;
+        };
+        activate.push((key, value));
     }
-    // Keys, not potentially sensitive values, explain the deliberate policy boundary.
+    Ok(ConfigurationPlan {
+        activate,
+        preserved_only,
+        mapping: mapping.map(|(from, to)| (from.to_owned(), to.to_owned())),
+    })
+}
+
+// Activate a plan in `private` and record it. Keys, not potentially sensitive
+// values, explain the deliberate policy boundary; the receipt's codec is the
+// one every earlier build wrote: (activated keys, preserved-only keys,
+// mapping).
+fn apply_standalone_configuration(
+    private: &Path,
+    receipt: &Path,
+    plan: &ConfigurationPlan,
+) -> Result<()> {
+    let mut activated = Vec::with_capacity(plan.activate.len());
+    for (key, value) in &plan.activate {
+        output(git(private).args(["config", "--local", "--add", key, value]))?;
+        activated.push(key.as_str());
+    }
     fs::write(
         receipt.join("configuration-activation.postcard"),
-        postcard::to_allocvec(&(activated, preserved_only, mapping))
+        postcard::to_allocvec(&(activated, &plan.preserved_only, &plan.mapping))
             .map_err(|_| BulkloadRefusal::FrameCodec)?,
     )
-    .refuse_at("git_carry::activate_standalone_configuration")?;
+    .refuse_at("git_carry::apply_standalone_configuration")?;
     Ok(())
 }
 
@@ -5655,6 +6029,13 @@ pub fn attach_matching_payload(
 ///
 /// # Errors
 /// Refuses payload divergence, occupied .git, invalid mapping or unknown origin.
+/// A mapping that is not absolute or whose `origin_to` is not a repository
+/// refuses before the receipt is written. A captured origin other than
+/// `origin_from` (`GIT_AUTHORITY_CHANGED`) or no origin at all
+/// (`GIT_INVENTORY_MALFORMED`) is decided from the imported capture, so it
+/// refuses after the receipt is written but before `.git` is published: the
+/// payload is left as it was, the receipt is kept, and a rerun into the
+/// same receipt refuses `GIT_DESTINATION_OCCUPIED` (#216).
 pub fn attach_standalone_payload(
     bundle: &Path,
     destination: &Path,
@@ -5693,6 +6074,8 @@ fn attach_payload(
         .transpose()
         .refuse_at(SITE)?;
     let common = repository.as_deref().map(common_repository).transpose()?;
+    // #216: an invalid mapping refuses before the receipt is written.
+    let mapping = checked_mapping(mapping)?;
     let receipt_parent =
         fs::canonicalize(receipt.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)
             .refuse_at(SITE)?;
@@ -5752,8 +6135,12 @@ fn attach_payload(
     let admin = if let Some(repository) = &repository {
         prepare_linked_attachment(repository, &destination, source, &receipt, &private, &heads)?
     } else {
-        let (from, to) = mapping.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        activate_standalone_configuration(&private, &heads, &receipt, Some((from, to)))?;
+        // #216: every configuration refusal is raised by the plan, and the
+        // plan's repository is the receipt's, so a refusal here leaves the
+        // destination's payload as it was, with no `.git`.
+        let mapping = mapping.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let plan = plan_standalone_configuration(&private, &heads, &receipt, Some(mapping))?;
+        apply_standalone_configuration(&private, &receipt, &plan)?;
         private.clone()
     };
     let pointer = write_git_pointer(&receipt, &admin)?;
@@ -5784,6 +6171,10 @@ fn attach_payload(
         .refuse_at(SITE)?
         .sync_dir_counted()
         .refuse_at(SITE)?;
+    // #216: the one refusal after publication. It is a concurrent writer
+    // caught moving the payload, the common policy or HEAD under the
+    // attachment, which no check before the write can decide; the published
+    // `.git` is retained for inspection.
     if filesystem_rows(&destination)? != before
         || &common_repository(&destination)? != common.as_ref().unwrap_or(&private)
         || repository
@@ -5838,7 +6229,9 @@ fn write_git_pointer(receipt: &Path, admin: &Path) -> Result<PathBuf> {
 /// Refuses malformed paths/modes, missing capture metadata, or an occupied target.
 /// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
 /// anything is created (S4, #162).
-/// Partial new destinations are retained, never cleaned by recursive deletion.
+/// The checkout is built in a private `.bulkload-restore-*` stage beside the
+/// destination and published by one no-replace rename, so every refusal,
+/// and an interrupted run, leaves no destination (#216).
 pub fn restore_bundle(bundle: &Path, destination: &Path, source: &str) -> Result<()> {
     restore_bundle_configured(bundle, destination, source, None)
 }
@@ -5846,13 +6239,19 @@ pub fn restore_bundle(bundle: &Path, destination: &Path, source: &str) -> Result
 /// Restore an absent standalone checkout with explicit local-origin mapping.
 ///
 /// Without a mapping, a captured HTTPS origin is retained unchanged; no origin
-/// is invented when the source has none. Other origin schemes require a reviewed
-/// mapping. Configuration omissions remain named in .git/carry-config receipts.
-/// No network operation or captured executable configuration is activated.
+/// is invented when the source has none. Any other origin (scp-style, `ssh://`,
+/// a local path) is preserved inert: the restored repository has no `origin`
+/// remote, and the receipt names `remote.origin.url` as preserved-only (#216,
+/// OI-1003-Q129, OI-1003-Q135). With a mapping, the captured origin must be
+/// exactly its `from`. Configuration omissions remain named in
+/// .git/carry-config receipts. No network operation or captured executable
+/// configuration is activated.
 ///
 /// # Errors
-/// Refuses old captures lacking configuration, unsafe/unmapped origins, occupied
-/// destinations, or any malformed filesystem/capture state.
+/// Refuses old captures lacking configuration, a mapping that is not absolute
+/// or does not name an existing repository, a mapped origin other than its
+/// `from`, occupied destinations, or any malformed filesystem/capture state.
+/// Every refusal comes before the destination is published.
 pub fn restore_bundle_configured(
     bundle: &Path,
     destination: &Path,
@@ -5872,32 +6271,45 @@ pub fn restore_staged(
     source: &str,
     mapping: Option<(&Path, &Path)>,
 ) -> Result<()> {
+    const SITE: &str = "git_carry::restore_staged";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     refuse_bare_capture(staged)?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
-    // never as a bare errno.
-    match fs::DirBuilder::new().mode(0o700).create(destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(BulkloadRefusal::GitDestinationOccupied);
-        }
-        // Round 4 N4: the enclosing item never laid the parent down.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(BulkloadRefusal::GitDestinationParentMissing);
-        }
-        Err(error) => return Err(crate::refuse::io(&error, "git_carry::restore_staged")),
+    // never as a bare errno; round 4 N4: so is a parent never laid down.
+    if destination.symlink_metadata().is_ok() {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
     }
-    let destination = fs::canonicalize(destination).refuse_at("git_carry::restore_staged")?;
+    let target = linked_destination(destination)?;
+    let mapping = checked_mapping(mapping)?;
+    // #216 (OI-1003-Q129, OI-1003-Q135): the whole checkout is built in a
+    // private stage beside the destination: the repository imported, every
+    // configuration and authority decision made, the worktree, index and
+    // captured modes laid down and the configuration applied. Only then is
+    // it published at the destination by one no-replace rename. A refusal,
+    // a full disk or a killed process before that leaves no destination, so
+    // a rerun is never refused GIT_DESTINATION_OCCUPIED by a half-restored
+    // one. The stage shares the destination's parent; a directory rename
+    // keeps every inode, so the index's stat data stays valid. The stage is
+    // removed when dropped (best effort: a captured read-only directory can
+    // keep part of it); a killed run leaves only a `.bulkload-restore-*`
+    // stage beside the destination.
+    let stage =
+        PrivateDir::create_beside(target.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?;
+    let work = stage.path().join("repository");
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&work)
+        .refuse_at(SITE)?;
     // Read bundle headers without assuming the destination's object format.
-    let heads = text(git(&destination).args(["bundle", "list-heads"]).arg(bundle))?;
+    let heads = text(git(&work).args(["bundle", "list-heads"]).arg(bundle))?;
     if !shallow::is_custody(&heads) {
         capture_revision(&heads, "configuration-v1")?;
     }
     let format = bundle_object_format(&heads)?;
-    output(git(&destination).args(["init", "--template=", &format!("--object-format={format}")]))?;
-    import_verified(&destination, bundle, source)?;
-    let heads = shallow::headers(&destination, bundle)?;
+    output(git(&work).args(["init", "--template=", &format!("--object-format={format}")]))?;
+    import_verified(&work, bundle, source)?;
+    let heads = shallow::headers(&work, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
             .lines()
@@ -5911,40 +6323,85 @@ pub fn restore_staged(
     };
     let head = find("head")?;
     find("configuration-v1")?;
-    let symbolic =
-        text(git(&destination).args(["show", &format!("{}:value", find("head-symbolic")?)]))?;
+    let symbolic = text(git(&work).args(["show", &format!("{}:value", find("head-symbolic")?)]))?;
     if symbolic.is_empty() {
-        output(git(&destination).args(["update-ref", "--no-deref", "HEAD", &head]))?;
+        output(git(&work).args(["update-ref", "--no-deref", "HEAD", &head]))?;
     } else {
         if !symbolic.starts_with("refs/heads/") {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
-        output(git(&destination).args(["check-ref-format", &symbolic]))?;
-        set_ref(&destination, &symbolic, &head)?;
-        output(git(&destination).args(["symbolic-ref", "HEAD", &symbolic]))?;
+        output(git(&work).args(["check-ref-format", &symbolic]))?;
+        set_ref(&work, &symbolic, &head)?;
+        output(git(&work).args(["symbolic-ref", "HEAD", &symbolic]))?;
     }
-    let exclude = output(git(&destination).args(["show", &format!("{}:value", find("exclude")?)]))?;
-    fs::create_dir_all(destination.join(".git/info")).refuse_at("git_carry::restore_staged")?;
-    fs::write(destination.join(".git/info/exclude"), exclude)
-        .refuse_at("git_carry::restore_staged")?;
+    let exclude = output(git(&work).args(["show", &format!("{}:value", find("exclude")?)]))?;
+    fs::create_dir_all(work.join(".git/info")).refuse_at(SITE)?;
+    fs::write(work.join(".git/info/exclude"), exclude).refuse_at(SITE)?;
     let worktree = find("worktree")?;
-    let entries = output(git(&destination).args(["ls-tree", "-r", "-z", &worktree]))?;
+    let entries = output(git(&work).args(["ls-tree", "-r", "-z", &worktree]))?;
     // #131: before any worktree byte.
-    intent_to_add_restorable(&carried_intent_to_add(&destination, &heads)?, &entries)?;
-    restore_entries(&destination, &entries)?;
-    let staged = find("staged")?;
-    restore_gitlink_directories(&destination, &staged, &heads)?;
-    output(git(&destination).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
-    restore_intent_to_add(&destination, None, &heads)?;
-    restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
-    let config_receipt = destination.join(".git/carry-config");
+    intent_to_add_restorable(&carried_intent_to_add(&work, &heads)?, &entries)?;
     fs::DirBuilder::new()
         .mode(0o700)
-        .create(&config_receipt)
-        .refuse_at("git_carry::restore_staged")?;
-    activate_standalone_configuration(&destination, &heads, &config_receipt, mapping)?;
-    fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
-        .refuse_at("git_carry::restore_staged")?;
+        .create(work.join(".git/carry-config"))
+        .refuse_at(SITE)?;
+    let configuration =
+        plan_standalone_configuration(&work, &heads, &work.join(".git/carry-config"), mapping)?;
+    restore_entries(&work, &entries)?;
+    let staged = find("staged")?;
+    restore_gitlink_directories(&work, &staged, &heads)?;
+    output(git(&work).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
+    restore_intent_to_add(&work, None, &heads)?;
+    restore_filesystem_rows(&work, &find("filesystem-v1")?)?;
+    apply_standalone_configuration(&work, &work.join(".git/carry-config"), &configuration)?;
+    // Before the rename: moving a directory to another parent needs write
+    // permission on it, whatever mode the capture gave the root.
+    fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).refuse_at(SITE)?;
+    publish_restored(stage.path(), &work, &target)
+}
+
+// Publish a checkout built at `work` (directly inside `stage`) as `target`,
+// a sibling of `stage`, never replacing anything there: one exclusive
+// rename, or where the file system offers none, a fresh 0700 directory and
+// a rename of each top-level entry into it (R-N119). An occupied target is
+// GIT_DESTINATION_OCCUPIED, a parent gone GIT_DESTINATION_PARENT_MISSING.
+fn publish_restored(stage: &Path, work: &Path, target: &Path) -> Result<()> {
+    const SITE: &str = "git_carry::publish_restored";
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+    let parent = target.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?;
+    let typed = |error: std::io::Error| match error.raw_os_error() {
+        Some(libc::EEXIST | libc::ENOTEMPTY) => BulkloadRefusal::GitDestinationOccupied,
+        Some(libc::ENOENT) => BulkloadRefusal::GitDestinationParentMissing,
+        _ => crate::refuse::io(&error, SITE),
+    };
+    let name = |path: &Path| -> Result<std::ffi::CString> {
+        std::ffi::CString::new(
+            path.file_name()
+                .ok_or(BulkloadRefusal::PathNotAbsolute)?
+                .as_bytes(),
+        )
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)
+    };
+    let parent_dir = fs::File::open(parent).map_err(typed)?;
+    let stage_dir = fs::File::open(stage).refuse_at(SITE)?;
+    match crate::io::sys::rename_exclusive_at(&stage_dir, &name(work)?, &parent_dir, &name(target)?)
+    {
+        Ok(()) => {}
+        Err(error) if crate::io::rename_unsupported(&error) => {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(target)
+                .map_err(typed)?;
+            // Only this process writes the directory it just created (0700).
+            for entry in fs::read_dir(work).refuse_at(SITE)? {
+                let entry = entry.refuse_at(SITE)?;
+                fs::rename(entry.path(), target.join(entry.file_name())).refuse_at(SITE)?;
+            }
+        }
+        Err(error) => return Err(typed(error)),
+    }
+    parent_dir.sync_dir_counted().refuse_at(SITE)?;
     Ok(())
 }
 
@@ -5959,6 +6416,10 @@ pub fn restore_staged(
 /// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
 /// anything is imported or created (S4, #162).
 /// Partially created worktrees are retained on failure for explicit recovery.
+/// The capture's exclude policy and intent-to-add custody refuse before the
+/// worktree is added; after it, materialization can still refuse (a path
+/// collision, a malformed filesystem row, IO) and leave a partial worktree
+/// (#216).
 pub fn restore_linked(
     bundle: &Path,
     repository: &Path,
@@ -5969,11 +6430,20 @@ pub fn restore_linked(
 }
 
 // A new linked worktree's path, with its parent canonicalized. A parent
-// that does not exist is typed, never a bare errno (round 4 N4).
+// that does not exist is typed, never a bare errno (round 4 N4). A
+// single-component relative path's parent is the current directory, not
+// the empty path, which `canonicalize` reports missing (#216).
 fn linked_destination(destination: &Path) -> Result<PathBuf> {
     let parent = fs::canonicalize(
         destination
             .parent()
+            .map(|parent| {
+                if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                }
+            })
             .ok_or(BulkloadRefusal::PathNotAbsolute)?,
     )
     .map_err(|error| {
@@ -6078,6 +6548,15 @@ pub fn restore_linked_staged(
     // --no-checkout has created administration only, not captured payload.
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
         .refuse_at("git_carry::restore_linked_staged")?;
+    // #216: a linked worktree activates no captured configuration (it shares
+    // the common repository's, origin included), so no configuration
+    // refusal can follow the write; bare, exclude policy and intent-to-add
+    // are decided above. Materialization below can still refuse (a path
+    // collision or escape, a gitlink seat, a malformed filesystem row, IO),
+    // as can the concurrent-writer checks on HEAD and the common exclude.
+    // Unlike a standalone restore, the worktree is not staged and renamed
+    // into place, so such a refusal leaves the partial worktree, retained
+    // for explicit recovery.
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }

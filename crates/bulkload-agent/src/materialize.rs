@@ -1991,12 +1991,16 @@ impl crate::io::durable::GroupSink for PublishSink {
     }
 }
 
-/// `ENOSPC` (or `SQLite`'s full-disk code, which the store reports as it)
-/// is [`BulkloadRefusal::DestinationSpaceInsufficient`]: the group could not
-/// be made durable for lack of space (OI-1001-Q2, #100).
+/// `ENOSPC` is [`BulkloadRefusal::DestinationSpaceInsufficient`]: the group
+/// could not be made durable for lack of space (OI-1001-Q2, #100). So is the
+/// destination store's own out-of-space refusal (`SQLITE_FULL`, or a quota
+/// met at a sync), which the store raises unnamed (S4, #126): this group
+/// commit is the write the transfer's space preflight charges.
 fn space_refusal(refusal: BulkloadRefusal) -> BulkloadRefusal {
     match refusal {
-        BulkloadRefusal::Io(Some(libc::ENOSPC)) => BulkloadRefusal::DestinationSpaceInsufficient,
+        BulkloadRefusal::Io(Some(libc::ENOSPC)) | BulkloadRefusal::SpaceExhausted(None) => {
+            BulkloadRefusal::DestinationSpaceInsufficient
+        }
         other => other,
     }
 }
@@ -2127,6 +2131,23 @@ mod tests {
     use crate::io::durable::GroupSink as _;
     use crate::transfer_store::PublisherSide;
     use std::io::Write as _;
+
+    // S4 (#126): the destination store's unnamed out-of-space refusal is the
+    // destination's space at a group commit, which the transfer's preflight
+    // charges; a named one (a directory bulkload wrote) keeps its name.
+    #[test]
+    fn a_full_destination_store_is_the_destination_s_space() {
+        assert_eq!(
+            space_refusal(BulkloadRefusal::SpaceExhausted(None)),
+            BulkloadRefusal::DestinationSpaceInsufficient
+        );
+        assert_eq!(
+            space_refusal(BulkloadRefusal::Io(Some(libc::ENOSPC))),
+            BulkloadRefusal::DestinationSpaceInsufficient
+        );
+        let named = BulkloadRefusal::SpaceExhausted(Some(b"/state".to_vec()));
+        assert_eq!(space_refusal(named.clone()), named);
+    }
 
     #[test]
     fn publish_never_replaces_an_output_that_appeared_meanwhile() -> Result<()> {

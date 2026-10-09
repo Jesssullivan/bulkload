@@ -47,6 +47,28 @@ pub fn io(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
     BulkloadRefusal::Io(error.raw_os_error())
 }
 
+/// The refusal for an I/O error writing under `directory` at `site`.
+///
+/// A full filesystem or an exceeded quota (`ENOSPC`, `EDQUOT`) is
+/// `SPACE_EXHAUSTED` naming `directory` (S4, #220); anything else is
+/// [`io`]. For a write no space preflight charged, such as one of
+/// bulkload's own temporaries under `TMPDIR`.
+#[must_use]
+pub fn io_in(
+    error: &std::io::Error,
+    directory: &std::path::Path,
+    site: &'static str,
+) -> BulkloadRefusal {
+    use std::os::unix::ffi::OsStrExt as _;
+    match error.raw_os_error() {
+        Some(libc::ENOSPC | libc::EDQUOT) => {
+            debug_assert!(is_site(site), "refusal site {site:?} is not a path");
+            BulkloadRefusal::SpaceExhausted(Some(directory.as_os_str().as_bytes().to_vec()))
+        }
+        _ => io(error, site),
+    }
+}
+
 /// The refusal for a postcard error at `site`.
 #[must_use]
 pub fn codec(site: &'static str) -> BulkloadRefusal {
@@ -103,6 +125,31 @@ mod tests {
                 Ok(value)
             );
         }
+    }
+
+    // S4 (#220): a full or over-quota filesystem names the directory; any
+    // other errno stays IO with its errno.
+    #[test]
+    fn a_full_disk_names_its_directory() {
+        let dir = std::path::Path::new("/scratch/tmp");
+        for errno in [libc::ENOSPC, libc::EDQUOT] {
+            assert_eq!(
+                super::io_in(
+                    &std::io::Error::from_raw_os_error(errno),
+                    dir,
+                    "refuse::tests"
+                ),
+                BulkloadRefusal::SpaceExhausted(Some(b"/scratch/tmp".to_vec()))
+            );
+        }
+        assert_eq!(
+            super::io_in(
+                &std::io::Error::from_raw_os_error(libc::EACCES),
+                dir,
+                "refuse::tests"
+            ),
+            BulkloadRefusal::Io(Some(libc::EACCES))
+        );
     }
 
     #[test]
