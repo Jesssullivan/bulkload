@@ -84,10 +84,40 @@ impl Drop for Dropped {
     }
 }
 
+/// A temporary root that [`UNPRIVILEGED`] can reach: every ancestor must be
+/// searchable by others, or exec of the binary copy fails EACCES. CI's
+/// TMPDIR sits under the runner's home, which is not, so `TMPDIR` is tried
+/// first and then the world-searchable system roots. None reachable fails the
+/// row: a root run that cannot drop proves nothing.
+fn searchable_temp_root(test: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    let searchable = |root: &Path| {
+        root.is_absolute()
+            && root.ancestors().all(|dir| {
+                fs::metadata(dir)
+                    .is_ok_and(|meta| meta.is_dir() && meta.permissions().mode() & 0o001 != 0)
+            })
+    };
+    [
+        std::env::temp_dir(),
+        PathBuf::from("/tmp"),
+        PathBuf::from("/dev/shm"),
+        PathBuf::from("/var/tmp"),
+    ]
+    .into_iter()
+    .find(|root| searchable(root))
+    .unwrap_or_else(|| {
+        panic!(
+            "{test}: as root this row runs as uid {UNPRIVILEGED}, and no temporary root \
+             is searchable by that uid; a root run that cannot drop proves nothing, so it fails"
+        )
+    })
+}
+
 /// The root leg (module docs): run the row `test` in a copy of this binary
 /// as [`UNPRIVILEGED`], and require that it ran exactly that row and passed.
 fn as_unprivileged(test: &str) {
-    let scratch = Dropped(std::env::temp_dir().join(format!(
+    let scratch = Dropped(searchable_temp_root(test).join(format!(
         "bulkload-w7-sqlite-drop-{}-{}",
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -107,6 +137,7 @@ fn as_unprivileged(test: &str) {
     let run = Command::new(&binary)
         .args([test, "--exact", "--test-threads=1", "--nocapture"])
         .env("TMPDIR", &scratch.0)
+        .current_dir(&scratch.0)
         .env_remove(CHILD_ENV)
         .env_remove(SQLITE_CHILD_ENV)
         .stdin(Stdio::null())
