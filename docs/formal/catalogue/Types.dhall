@@ -515,7 +515,7 @@ let witnessSelf = \(w : Witness) -> merge witnessTable w
    module, with its own budget self-test first. The table is merged over the
    union, so a module added without an entry does not type-check.
 -}
-let Module = < BulkloadTransfer | GitCarry >
+let Module = < BulkloadTransfer | GitCarry | EstateConverge >
 
 {- How tla-check grounds a module's code symbols. Either way only a Rust
    source under crates/ outside a tests/ directory counts, never a data
@@ -549,6 +549,13 @@ let moduleTable =
         , index = 1
         , spec = "GitCarry.tla"
         , tsv = "configs_gc.tsv"
+        , symbols = SymbolMatch.definition
+        }
+      , EstateConverge =
+        { module = Module.EstateConverge
+        , index = 2
+        , spec = "EstateConverge.tla"
+        , tsv = "configs_ec.tsv"
         , symbols = SymbolMatch.definition
         }
       }
@@ -682,8 +689,11 @@ let GcNegRow =
 -}
 let PId = < P42 | P64 | P65 | P66 | P67 | P68 | P69 | P70 | P71 >
 
--- The lane that lands a symbol a GitCarry row cites before the code has it.
-let Lane = < L6a | L6b | L7 | L8 >
+{- The lane that lands a symbol a GitCarry or EstateConverge row cites
+   before the code has it. Converge: feat/estate-converge-20261008, the
+   estate convergence (held for OI-1003-Q144 and EstateConverge.tla).
+-}
+let Lane = < L6a | L6b | L7 | L8 | Converge >
 
 let PendingSymbol = { symbol : Text, lands : Lane }
 

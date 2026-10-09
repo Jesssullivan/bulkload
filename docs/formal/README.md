@@ -44,7 +44,9 @@ and design disagreements](#code-and-design-disagreements)).
 | [`configs.tsv`](configs.tsv) | The run order. Columns: `name`, `expect`, `named-property` (the one property a fail or reach row must violate), `never` (a pass row's exact never-enabled actions), `flags` (extra TLC arguments, one argv element per word). |
 | [`GitCarry.tla`](GitCarry.tla) | The git carry custody module (OI-1003-Q43): chain links, the plan base, depth, Q46's re-root and GC, crash order and restore-or-recapture ([GitCarry](#gitcarry-chain-and-base-custody-oi-1003-q43-oi-1003-q46)). |
 | [`configs_gc.tsv`](configs_gc.tsv), `MC_gc_*.cfg` | GitCarry.tla's run order and configs, in the same format, rendered from [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall). |
-| [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by both modules. |
+| [`EstateConverge.tla`](EstateConverge.tla) | The estate convergence module (OI-1003-Q144): destination custody of a re-apply that brings a checkout bulkload landed to a newer capture ([EstateConverge](#estateconverge-destination-custody-of-estate-convergence-oi-1003-q144)). |
+| [`configs_ec.tsv`](configs_ec.tsv), `MC_ec_*.cfg` | EstateConverge.tla's run order and configs, rendered from [`catalogue/EstateConverge.dhall`](catalogue/EstateConverge.dhall). |
+| [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by every module. |
 | [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | The reference decision core `decide`, its pinned rows ([`decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv)), and an explorer of GitCarry.tla. |
 
 ## Running it
@@ -55,6 +57,7 @@ just tla-render --check     # fail unless the committed files are the catalogue'
 just tla-check              # every row of configs.tsv, then of configs_gc.tsv
 just tla-check MC_nv_core   # that module's budget self-test, then the named configs
 just tla-check MC_gc_core   # the same for GitCarry.tla
+just tla-check MC_ec_refs   # the same for EstateConverge.tla
 just formal-nv              # the Haskell cross-checks of both modules (Hybrid roles)
 ```
 
@@ -2223,6 +2226,359 @@ differed.
   read `prev_base` for a based link; the capture is then the plan base's
   delta, as under v1.
 
+## EstateConverge: destination custody of estate convergence (OI-1003-Q144)
+
+[`EstateConverge.tla`](EstateConverge.tla) models the estate convergence
+built on `feat/estate-converge-20261008` (design: that branch's
+`docs/agent-notes/2026-10-08-estate-converge-design.md`, sections 2 to 11
+as amended by its review sections 16 to 19). GitCarry models CORPUS
+custody; this module models the destination. Ruling OI-1003-Q144 (Linear
+TIN-4543, 2026-10-09) holds the convergence's merge on it:
+
+- a checkout bulkload itself landed may be updated only when it is
+  unchanged locally since landing, by content, not stat;
+- otherwise the item refuses with a typed code;
+- local branches and tags deleted at the source are kept and reported;
+- remote-tracking refs follow the source;
+- configuration changes are report-only.
+
+The module's header states its scope, its abstractions and its code map;
+every action names the function it models. Its symbols are on the
+convergence branch, not on `origin/main`, so the catalogue grounds only the
+symbols `main` already has (`apply_item`, `capture_item`,
+`import_verified`, ...) and lists the convergence's as pending (lane
+`Converge`) until that branch merges.
+
+### What it models
+
+- One repository: the main checkout (standalone, seats `d` and `d/f`, an
+  index and HEAD) and optionally a linked worktree (HEAD only), sharing one
+  ref ledger, with refs of every class (`main`, `dev`, `foo` and `foo/bar`,
+  remote-tracking `o/x` and `o/x/y`, a tag `t`) and a stash.
+- The source over time: commits and moves, creates, deletes, renames
+  (`foo -> foo/bar` and back, `o/x -> o/x/y`), HEAD switches, worktree
+  remove and add, stash push and drop, seat edits, additions and removals,
+  directory to file and file to directory, staged changes.
+- Captures, and applies: estate-apply's rows A3 to A12, the ownership
+  proof, the workspace intent, the native ref step and its ref intent
+  (plan, compare-and-swap transactions with deletes first, the stash
+  table), the seat engine (exchange and displaced check, settling by
+  content), the index compare-and-swap, HEAD and its branch, the ledgers,
+  the journal, and the settle of a pending intent.
+- Crashes at every step boundary; a power loss that undoes Git renames no
+  directory sync made durable (the variable `dur`); with `ChildCrash`, a
+  crash inside a Git ref transaction (a partial commit and Git's lock
+  files left) or inside a stash store (`refs/stash.lock` left).
+- Operator edits: seat contents, the landed directory removed or replaced
+  by a file, untracked additions, touches, racy writes, `git add`, refs
+  (a checked-out branch's `update-ref -d` too), the stash, HEAD (a switch,
+  an orphan switch to an unborn branch, a rebase or bisect that detaches
+  HEAD and holds its branch), and restoring a landed value; between
+  applies or (`OpConcurrent`) while one is in flight (a restore only
+  between applies).
+- `probe_exchange`'s probe files (a pre-intent write with its own crash
+  point, `ProbeExchange`).
+
+Review 3 (2026-10-09, fourteen findings against this model and the code)
+changed the module in two ways. Where the reviewers named the rule the code
+must follow, the model now holds that rule and the code's current behaviour
+is a mutation marked CODE TODAY in the catalogue; its `MC_ec_neg_` row
+fails, and the code fix turns it into the model's default (the
+convergence lane's fix list, the 2026-10-09 agent note). Where the fix is
+still open, a finding row fails on the code as it is.
+
+### Properties
+
+| Property | Claim |
+|---|---|
+| `NoLocalWorkLost` | An operator edit is never overwritten or removed: every value the operator wrote that is not a landed value is still where they put it (or at its seat's temporary name, displaced and kept); a branch under a rebase or bisect keeps its value. Restoring a landed value is no edit (Q144: content). While the item's own pass runs, the landed value is the one bulkload holds at that point (old before its write, new after: review 3 finding 14), and an operator write equal to what bulkload then lands stops being an edit. |
+| `NoSourceWorkLost` | Every capture ever imported keeps its provenance instance (every ref tip and stash it carried), and a local branch or tag bulkload set is never deleted by bulkload (Q144: kept and reported). |
+| `TypedRefusal` | Every refusal is a typed code whose cause is real: `MODIFIED` only over an operator edit of the item's checkout or HEAD branch; `INTERRUPTED` only over an operator edit, made since the item's run began or its pending intent was written and still live, of a component the failing step writes, or a Git lock left on one (an edit elsewhere, an edit put back, an edit older than the run, or a crash with no lock left does not justify it: review 3 finding 6); never a code that names no converge cause (`UNTYPED`: `GIT_CHILD_FAILED`, `PATH_ESCAPES_ROOT`, an Io refusal); and no custody word blames the destination for a change nobody made there. |
+| `NoReRead` | R25: an item whose journal names its current capture, with no workspace intent of its own pending, reads no content (no stage, no proof). |
+| `CrashAtomicity` | Per item and per component, old or new: under a pending intent every seat, the index, HEAD and the branch HEAD moves to are the intent's old or new value (or absent between a type change's removal and addition), and every ref op of a pending ref intent is old or new; with no intent pending, every component is the ledger's; no worktree exists without its ledger between applies; no probe file is left outside the pass that made it, except until the next apply after a crash. |
+| `ConvergesWhenQuiet` | Liveness (`LiveSpec`: fair captures, strong fairness per item's apply): once the source and the operator stop with no operator edit left, every item reaches the source, the ruled exceptions aside (a kept local branch or tag, a ref whose name conflicts with a kept one, HEAD detached for that reason). |
+| `NoWedge` | Liveness: no item refuses forever unless an operator edit of its own checkout or HEAD branch stays. |
+
+### Mutations
+
+| Mutation | Fails | What it breaks |
+|---|---|---|
+| `proof_stat_only` | `NoLocalWorkLost` | prove trusts an unchanged print of a racy seat (design 4.2) |
+| `proof_stat_strict` | `TypedRefusal` | any print change refuses (Q144 rules content, not stat) |
+| `overwrite_modified` | `NoLocalWorkLost` | converge proceeds when the proof fails |
+| `no_intent` | `CrashAtomicity` | no workspace intent before the first write |
+| `exchange_unchecked` | `NoLocalWorkLost` | no print check before the exchange, no displaced check after (finding 10) |
+| `index_no_cas` | `NoLocalWorkLost` | the index is renamed over without its compare-and-swap (finding 3) |
+| `stash_clear_blind` | `NoLocalWorkLost` | `stash clear` instead of a compare-and-swap delete (finding 4) |
+| `name_conflict_unchecked` | `NoWedge` | no create kept back beside a kept ref: the `foo -> foo/bar` blocker (review 2 finding 3) |
+| `single_ref_txn` | `NoWedge` | deletes and creates in one transaction (`o/x -> o/x/y`, review 2 finding 3) |
+| `head_branch_in_step` | `NoWedge` | the ref step moves the branch HEAD switches to and set_head keeps its line (review 2 finding 1) |
+| `no_checkout_guard` | `TypedRefusal` | a ref step moves another worktree's checked-out branch (finding 1) |
+| `converge_before_ref_settle` | `TypedRefusal` | a pending ref intent is not settled first |
+| `dir_replace_unchecked` | `TypedRefusal` | no `holds_unlanded` check: a directory turned into a file refuses only after writes (review 2 findings 2, 4) |
+| `prune_local` | `NoSourceWorkLost` | a local branch deleted at the source is deleted (Q144) |
+| `drop_provenance` | `NoSourceWorkLost` | a converge drops the replaced instance's provenance (Q5) |
+| `noop_restages` | `NoReRead` | a journaled item is staged and proved again |
+| `sibling_intent_reproves` | `NoReRead` | another item's ref intent re-proves a finished item (review 2 finding 7) |
+| `finish_after_all_deletes` | `NoWedge` | CODE TODAY (review 3 finding 1): `finish` removes every delete's name from the names after the step, run or not, so `create o/x/y` beside a kept `o/x` is retried forever |
+| `rebase_unguarded` | `NoLocalWorkLost` | CODE TODAY (finding 2): the skip set misses a branch under a rebase or bisect |
+| `ledger_reads_index` | `NoLocalWorkLost` | CODE TODAY (finding 3): `next_ledger` re-reads the index after publishing it |
+| `unborn_head_untyped` | `TypedRefusal` | CODE TODAY (finding 4): `head_of` fails on an unborn HEAD (`GIT_CHILD_FAILED`) |
+| `seat_parent_untyped` | `TypedRefusal` | CODE TODAY (finding 5): `Engine::run` passes `Seat::at`'s error on after the intent |
+| `refs_unsynced` | `TypedRefusal` | CODE TODAY (finding 7): no directory sync after `update-ref` before the ledgers |
+| `probe_left` | `CrashAtomicity` | CODE TODAY (finding 9): a crashed pass's probe files are never removed |
+| `settle_moves_checked_out` | `NoLocalWorkLost` | CODE TODAY (finding 10, the blocker): `finish` redoes an op on a branch checked out since the crash |
+| `txn_no_symref_verify` | `NoLocalWorkLost` | CODE TODAY (finding 10): the ref transaction has no `symref-verify` line for each worktree's HEAD |
+| `txn_no_cas` | `NoLocalWorkLost` | `transact`'s lines carry no old value (finding 11; the code is right) |
+| `head_no_cas` | `NoLocalWorkLost` | `set_head`'s lines carry no old value (finding 11; the code is right) |
+
+### Results (EstateConverge)
+
+`just tla-check` on every `MC_ec_` row after review 3, 2026-10-09, TLC
+from the flake's pinned nixpkgs, `-workers 3`, nice 10, in two concurrent
+invocations (20 and 42 rows, each after its budget self-test) on a shared
+host at load average about 200 on 32 cores (wall times are that host's,
+not TLC's). All 63 rows matched their expectation (19 pass, 5 of them
+under `LiveSpec`; 3 reach; 11 finding rows and the unfair negative fail
+their named property; 28 mutations fail theirs; the budget self-test
+inconclusive). Total wall 3,033 s and 2,590 s; peak RSS 2,010 MiB.
+`just tla-render --check`: all 163 files equal the catalogue. Grounding:
+75 operators, 15 constants, 28 mutations, 3 label sets, 8 code symbols on
+`origin/main`, the convergence's symbols pending (lane `Converge`).
+`MC_ec_finding_settle_stale_branch` runs `-simulate num=200000 -depth 40`
+(its distinct column counts states checked).
+
+| Config | Expect | Outcome | Violated | Distinct | Depth | Wall |
+|---|---|---|---|---|---|---|
+| `MC_ec_budget_selftest` | inconclusive | INCONCLUSIVE | WithinBudget | ? | - | 44s |
+| `MC_ec_refs` | pass | PASS | - | 48872 | 46 | 126s |
+| `MC_ec_refs_op` | pass | PASS | - | 256956 | 53 | 278s |
+| `MC_ec_seats` | pass | PASS | - | 54392 | 50 | 135s |
+| `MC_ec_stash` | pass | PASS | - | 7375 | 49 | 67s |
+| `MC_ec_linked` | pass | PASS | - | 238150 | 68 | 261s |
+| `MC_ec_concurrent` | pass | PASS | - | 315 | 21 | 99s |
+| `MC_ec_racy` | pass | PASS | - | 392 | 33 | 89s |
+| `MC_ec_first` | pass | PASS | - | 1374 | 40 | 69s |
+| `MC_ec_live` | pass | PASS | - | 78009 | 47 | 502s |
+| `MC_ec_live_linked` | pass | PASS | - | 198678 | 68 | 935s |
+| `MC_ec_refs_rename_op` | pass | PASS | - | 617 | 29 | 62s |
+| `MC_ec_rebase` | pass | PASS | - | 10417 | 40 | 78s |
+| `MC_ec_index_concurrent` | pass | PASS | - | 278 | 28 | 83s |
+| `MC_ec_head_op` | pass | PASS | - | 4868 | 34 | 63s |
+| `MC_ec_seat_parent` | pass | PASS | - | 2589 | 33 | 71s |
+| `MC_ec_head_concurrent` | pass | PASS | - | 11064 | 44 | 52s |
+| `MC_ec_refs_concurrent` | pass | PASS | - | 918 | 25 | 111s |
+| `MC_ec_child_crash` | pass | PASS | - | 18930 | 46 | 111s |
+| `MC_ec_live_ops` | pass | PASS | - | 5398 | 34 | 109s |
+| `MC_ec_reach_converged` | reach | REACHED | Witness_Converged | 10091 | 15 | 43s |
+| `MC_ec_reach_settled` | reach | REACHED | Witness_SettledAfterCrash | 15014 | 18 | 48s |
+| `MC_ec_reach_captured_not_landed` | reach | REACHED | Witness_CapturedNotLanded | 160 | 5 | 51s |
+| `MC_ec_finding_file_to_dir_settle` | fail | FAIL | NoWedge | 1230 | - | 45s |
+| `MC_ec_finding_settle_stale_branch` | fail | FAIL | CrashAtomicity | 109337 | - | 44s |
+| `MC_ec_finding_old_head_branch` | fail | FAIL | ConvergesWhenQuiet | 624 | - | 46s |
+| `MC_ec_finding_detached_reattach` | fail | FAIL | ConvergesWhenQuiet | 1123 | - | 51s |
+| `MC_ec_finding_child_crash` | fail | FAIL | NoWedge | 167 | - | 39s |
+| `MC_ec_finding_stash_settle_revert` | fail | FAIL | NoLocalWorkLost | 1130 | 26 | 30s |
+| `MC_ec_finding_first_linked_crash` | fail | FAIL | NoWedge | 41 | - | 22s |
+| `MC_ec_finding_stash_lock` | fail | FAIL | TypedRefusal | 117 | 28 | 54s |
+| `MC_ec_finding_set_head_partial` | fail | FAIL | CrashAtomicity | 835 | 12 | 75s |
+| `MC_ec_finding_restored_ref` | fail | FAIL | ConvergesWhenQuiet | 4691 | - | 96s |
+| `MC_ec_finding_settle_branch_conflict` | fail | FAIL | TypedRefusal | 20023 | 16 | 102s |
+| `MC_ec_neg_live_unfair` | fail | FAIL | ConvergesWhenQuiet | 32 | - | 54s |
+| `MC_ec_neg_proof_stat_only` | fail | FAIL | NoLocalWorkLost | 364 | 27 | 55s |
+| `MC_ec_neg_proof_stat_strict` | fail | FAIL | TypedRefusal | 41 | 15 | 38s |
+| `MC_ec_neg_overwrite_modified` | fail | FAIL | NoLocalWorkLost | 75 | 12 | 48s |
+| `MC_ec_neg_no_intent` | fail | FAIL | CrashAtomicity | 37 | 11 | 44s |
+| `MC_ec_neg_exchange_unchecked` | fail | FAIL | NoLocalWorkLost | 134 | 17 | 51s |
+| `MC_ec_neg_index_no_cas` | fail | FAIL | NoLocalWorkLost | 38 | 15 | 45s |
+| `MC_ec_neg_stash_clear_blind` | fail | FAIL | NoLocalWorkLost | 525 | 16 | 36s |
+| `MC_ec_neg_name_conflict_unchecked` | fail | FAIL | NoWedge | 13 | - | 37s |
+| `MC_ec_neg_single_ref_txn` | fail | FAIL | NoWedge | 11 | - | 35s |
+| `MC_ec_neg_head_branch_in_step` | fail | FAIL | NoWedge | 656 | - | 44s |
+| `MC_ec_neg_no_checkout_guard` | fail | FAIL | TypedRefusal | 82 | 11 | 46s |
+| `MC_ec_neg_converge_before_ref_settle` | fail | FAIL | TypedRefusal | 138 | 27 | 84s |
+| `MC_ec_neg_dir_replace_unchecked` | fail | FAIL | TypedRefusal | 750 | 28 | 75s |
+| `MC_ec_neg_prune_local` | fail | FAIL | NoSourceWorkLost | 9 | 9 | 100s |
+| `MC_ec_neg_drop_provenance` | fail | FAIL | NoSourceWorkLost | 32 | 20 | 87s |
+| `MC_ec_neg_noop_restages` | fail | FAIL | NoReRead | 2 | 2 | 46s |
+| `MC_ec_neg_sibling_intent_reproves` | fail | FAIL | NoReRead | 5235 | 10 | 62s |
+| `MC_ec_neg_finish_after_all_deletes` | fail | FAIL | NoWedge | 611 | - | 88s |
+| `MC_ec_neg_rebase_unguarded` | fail | FAIL | NoLocalWorkLost | 402 | 12 | 40s |
+| `MC_ec_neg_ledger_reads_index` | fail | FAIL | NoLocalWorkLost | 308 | 28 | 41s |
+| `MC_ec_neg_unborn_head_untyped` | fail | FAIL | TypedRefusal | 31 | 14 | 55s |
+| `MC_ec_neg_seat_parent_untyped` | fail | FAIL | TypedRefusal | 226 | 15 | 58s |
+| `MC_ec_neg_refs_unsynced` | fail | FAIL | TypedRefusal | 798 | 16 | 29s |
+| `MC_ec_neg_probe_left` | fail | FAIL | CrashAtomicity | 212 | 25 | 37s |
+| `MC_ec_neg_settle_moves_checked_out` | fail | FAIL | NoLocalWorkLost | 286 | 29 | 40s |
+| `MC_ec_neg_txn_no_symref_verify` | fail | FAIL | NoLocalWorkLost | 85 | 21 | 23s |
+| `MC_ec_neg_txn_no_cas` | fail | FAIL | NoLocalWorkLost | 471 | 13 | 31s |
+| `MC_ec_neg_head_no_cas` | fail | FAIL | NoLocalWorkLost | 84 | 11 | 39s |
+
+The pass rows check every safety invariant (`MC_ec_live`,
+`MC_ec_live_linked`, `MC_ec_refs_rename_op`, `MC_ec_seat_parent` and
+`MC_ec_live_ops` also both temporal properties) with their exact
+never-enabled actions (`configs_ec.tsv`).
+
+### Findings (EstateConverge)
+
+Each finding row is the code on `feat/estate-converge-20261008` (read
+2026-10-09) at a bound that reaches the defect; each is expected to fail
+its named property. Rows 1, 2, 4 and 5 are new; 3 is reachable only under
+a crash class the fault harness does not exercise; 6 to 8 are limits the
+design states; 9 to 12 are review 3's (2026-10-09). The defects whose fix
+review 3 named are mutations marked CODE TODAY (the table above), not
+finding rows.
+
+1. **A file the source turns into a directory wedges after a crash**
+   (`MC_ec_finding_file_to_dir_settle`, `NoWedge`). `converge::delta`
+   plans the change as `Remove d`, `MkDir d`, `Add d/f`. A crash after the
+   `MkDir` leaves the new directory at `d`. The rerun's settle runs
+   `Engine::remove` for `d`: the path exists, and `expected` (settling)
+   asks `holds(old)`, which is false for a directory, so the item refuses
+   `GIT_CONVERGE_INTERRUPTED`, on every rerun, with no operator edit.
+   (`TypedRefusal` fails too: an `INTERRUPTED` no edit explains.) Fix:
+   while settling, a `Remove` whose path already holds the new side's
+   directory (a later `MkDir` of the same path) is done.
+2. **A settle replays a HEAD-branch compare-and-swap another item has
+   overtaken** (`MC_ec_finding_settle_stale_branch`, `CrashAtomicity`;
+   found by simulation at depth 25). The main's intent moves HEAD to `foo`
+   and `foo` from 2 to 5. It crashes before `set_head`; an operator `git
+   add` makes its settle refuse once (`publish_index`), so the linked
+   worktree runs in that pass. Its ref step skips only checked-out
+   branches (`Place::refs`, `checked_out_by`), so it moves `foo` to its
+   newer capture's value. `settle` then calls `set_head` with
+   `intent.branch` (`update foo 5 2`), which can never hold: once the
+   operator puts the index back, the main refuses
+   `GIT_CONVERGE_INTERRUPTED` on every rerun (a wedge `NoWedge` would
+   show at a larger bound). Fix: every ref step also skips the branch a
+   pending workspace intent names (`WorkspaceIntent.branch`), or the
+   settle re-plans the branch line (dropped when the branch already holds
+   a newer owned value, detached with the branch recorded otherwise).
+3. **A crash inside Git's ref transaction wedges the item**
+   (`MC_ec_finding_child_crash`, `NoWedge`). A killed `update-ref` child
+   (power loss, a stopped cgroup) leaves `<ref>.lock`; nothing in
+   `native_refs` or `converge` removes it, so every settle's
+   compare-and-swap fails. `set_head`'s one transaction can also commit
+   `HEAD` (it sorts first) without the branch line, and `head_of` then
+   reads a HEAD that is neither the intent's old nor its new value.
+   `fault.rs`'s `_exit` points sit between whole Git commands, so the
+   harness never reaches this; the power-loss replay is deferred (design
+   section 18). Fix: treat a Git lock file left under the destination
+   lock by a crashed run as bulkload's (remove it, typed, in the settle),
+   and settle HEAD and its branch as two components. Review 3 finding 13
+   added `MC_ec_finding_set_head_partial` (`CrashAtomicity`: HEAD
+   committed without its branch line) and the safety row
+   `MC_ec_child_crash` (every invariant under partial ref transactions,
+   no HEAD switch, no stash).
+4. **A stash settle undoes an operator's drop**
+   (`MC_ec_finding_stash_settle_revert`, `NoLocalWorkLost`).
+   `native_refs::stash_apply` continues from any suffix of the new order,
+   the empty reflog included. After a crash with a stash op pending (or
+   between the decision and the stores), an operator's `git stash drop`
+   or `clear` is undone by re-storing the entries. No bytes are lost (each
+   entry is at provenance); the operator's edit is. Fix: continue an
+   append only from a suffix at least as long as the old order, and make
+   a rewrite's delete durable in the intent before its stores.
+5. **The old HEAD branch is never converged while the source holds
+   still** (`MC_ec_finding_old_head_branch`, `ConvergesWhenQuiet`; review
+   2 finding 1's stated limit). A commit on the checkout's branch, then a
+   switch: the ref step skips the old branch (still checked out until
+   `set_head`), and the journal makes every later apply a no-op (A4).
+6. **A HEAD detached for a conflict never re-attaches while the source
+   holds still** (`MC_ec_finding_detached_reattach`,
+   `ConvergesWhenQuiet`; finding 11). The attach rule runs only on a
+   converge; a no-op apply never re-runs it. Fix for 5 and 6: a no-op
+   apply whose ledgers record unfinished ref custody (an `intended_branch`,
+   a skipped old HEAD branch) runs the metadata-only ref and attach steps.
+7. **A crashed linked first landing refuses forever**
+   (`MC_ec_finding_first_linked_crash`, `NoWedge`; #216's residual,
+   design section 18): a worktree without its ledger is
+   `GIT_DESTINATION_OCCUPIED` on every rerun.
+8. **Without fairness nothing converges** (`MC_ec_neg_live_unfair`): the
+   liveness claims rest on fair captures and applies.
+9. **A killed stash store clears stash custody**
+   (`MC_ec_finding_stash_lock`, `TypedRefusal`; review 3 finding 8). A
+   crash inside `stash_apply`'s `update-ref` leaves `refs/stash.lock`;
+   every later store fails, `stash_apply` returns false, and `finish`
+   clears the stash row and reports `stash-modified-at-destination` with
+   no operator edit. The capture's stash never lands, and the operator's
+   own `git stash` fails on the lock. Fix: remove bulkload's own stale lock
+   under the destination lock, or refuse typed instead of clearing the
+   row. (`FirstPlanWt` now goes through `native_refs::commit`, as
+   `plan_linked` does, so a crash or a killed child there is settled like
+   any ref step.)
+10. **A ref the operator puts back is never converged while the source
+    holds still** (`MC_ec_finding_restored_ref`, `ConvergesWhenQuiet`;
+    review 3 finding 12). The source moves `foo`; the operator moves it
+    too, so the converge keeps it (`ref-modified-at-destination`) and
+    journals the capture. The operator then puts `foo` back to its landed
+    value; A4's journal no-op never plans it again. Fix: on an A4 no-op, a
+    metadata check re-plans a ref kept for an edit whose native value again
+    equals its ledger row; or a ruling that this is a known limit.
+11. **A settle replays a HEAD-branch create a put-back ref blocks**
+    (`MC_ec_finding_settle_branch_conflict`, `TypedRefusal`; found by
+    review 3 finding 6's tighter `TypedRefusal`, the class of finding 2).
+    The source renames `foo` to `foo/bar` and switches to it; the operator
+    deletes `foo`, so the converge plans HEAD onto a new `foo/bar`; a crash
+    before `set_head`; the operator puts `foo` back. The settle replays the
+    intent's `create foo/bar`, which Git refuses beside `foo`, so the main
+    refuses `GIT_CONVERGE_INTERRUPTED` on every rerun with every edit
+    undone. `MC_ec_refs_op` no longer has source switches for this reason.
+    Fix: finding 2's (the settle re-plans the branch line).
+12. **Finding 2 and `TypedRefusal`.** Under review 3's justification the
+    main's endless `INTERRUPTED` in finding 2's trace (after the operator
+    puts the index back) names no live edit, so it should fail
+    `TypedRefusal` too. Not shown: a probe of that row's constants with
+    `TypedRefusal` under `-simulate num=200000 -depth 40` reached its
+    1,800 s budget without a violation (simulation is random; the
+    `CrashAtomicity` row found its trace at depth 25). Its row still names
+    `CrashAtomicity`.
+
+The model also states two readings where the code's behaviour is accepted
+rather than flagged: a settle re-adds a seat the operator deleted while a
+type change was pending (absent is a landed value then), and a capture a
+later capture superseded before any apply never reaches the destination
+(`MC_ec_reach_captured_not_landed`; CORPUS keeps it as a chain link).
+
+### What EstateConverge does not prove
+
+- **Bytes, modes, symlinks, gitlinks, exclude, configuration.** A seat's
+  content is an opaque id; modes and directory modes are not modelled; the
+  exclude converges like a seat; configuration is report-only (Q6) and not
+  modelled; the shape refusal (A8) is not modelled.
+- **The timestamp-granularity window inside one seat operation.** A racy
+  write lands only between applies. The code's displaced and moved checks
+  compare inode, size and mtime; a same-size write in the same timestamp
+  tick as a seat's last write, between the settle's content check and its
+  rename, would pass them. The model does not explore it.
+- **Refs-only items, foreign repositories, `--adopt`, symbolic refs,
+  per-worktree refs, tombstone retention.** None is modelled; the ref
+  decision is P84's (Rust, exhaustive over its domain).
+- **Two applies at once.** The destination lock serializes them; the
+  model runs one apply at a time and orders a main before its linked
+  worktree within a pass (`after_mains`).
+- **What CORPUS keeps.** A capture superseded before any apply never
+  reaches the destination (`MC_ec_reach_captured_not_landed`); its tips
+  live in CORPUS as chain links, which is GitCarry.tla's custody.
+- **The in-flight ghost for refs and the stash.** Review 3 finding 14's
+  rule (an operator write is no edit only when it equals what bulkload
+  holds at that point of its pass) is modelled for HEAD and the seats. For
+  refs and the stash the ghost still takes a pending op's old and new
+  values: the operator's ref writes are fresh values or deletes, a
+  restore runs only between applies, and no concurrent row has a create
+  or delete op in flight.
+- **Power loss.** Only Git's ref, HEAD and stash renames can be lost
+  (`dur`); bulkload's own writes and the index publish sync their
+  directory. The operator's Git writes are taken as durable. The rule
+  modelled is the fix (a directory sync after each Git write, before any
+  ledger write); under `refs_unsynced` a power loss may also strike
+  between applies.
+- **The linked first landing's ledger and the exclude digest.**
+  `record_landing` and `next_ledger` read the index and the exclude from
+  disk (review 3 finding 3); the model fixes the index (the digest
+  `publish_index` installed) but models neither the exclude nor a linked
+  first landing's index.
+
 ## Frozen names
 
 The whitepaper and the property-test plan cite these names. They are frozen:
@@ -2240,7 +2596,8 @@ renaming one is a breaking change to the proof package and needs a ruling.
 - The N-version core: `MC_nv_core`.
 
 GitCarry.tla's names (the module, its properties, mutations, constants and
-configs) are new and not frozen; freezing them needs a ruling.
+configs) are new and not frozen; freezing them needs a ruling. The same
+holds for EstateConverge.tla's (OI-1003-Q144).
 
 The names of #187's records (2026-10-07, OI-1003-Q102) are not frozen
 either: the properties `SupersedeAtomic`, `OwnershipNeverReuse`,
