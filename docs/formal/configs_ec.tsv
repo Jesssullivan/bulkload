@@ -1,0 +1,77 @@
+# EstateConverge.tla's TLC configs, checked by `just tla-check` in this order (README.md, "EstateConverge").
+# Rendered from catalogue/EstateConverge.dhall by `just tla-render`; edit the catalogue, not this file.
+# Tab-separated columns, as configs.tsv's:
+#   name            the config, MC_<name>.cfg
+#   expect          pass | fail | reach | inconclusive
+#   named-property  fail: the one property it must violate;
+#                   reach: the Witness_ invariant it must violate;
+#                   inconclusive: WithinBudget; otherwise all
+#   never           pass: the actions coverage must show never enabled,
+#                   comma-separated and sorted (- for none);
+#                   * for any other row (not checked)
+#   flags           extra TLC flags, one argv element per
+#                   space-separated word (- for none)
+name	expect	named-property	never	flags
+MC_ec_budget_selftest	inconclusive	WithinBudget	*	-
+MC_ec_refs	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRef,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcStage,SrcStashDrop,SrcStashPush,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_refs_op	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_seats	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,OpHead,OpRacy,OpRef,OpRestore,OpStash,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStashDrop,SrcStashPush,SrcSwitch,SrcWorktree	-
+MC_ec_stash	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRef,OpRestore,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_linked	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRef,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcTypeChange,Tick	-
+MC_ec_concurrent	pass	all	ChildCrashHead,ChildCrashTxn,Crash,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,OpHead,OpRacy,OpRef,OpRestore,OpStash,OpTouch,OpUntracked,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
+MC_ec_racy	pass	all	ChildCrashHead,ChildCrashTxn,Crash,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRef,OpRestore,OpSeat,OpStash,OpTouch,OpUntracked,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
+MC_ec_first	pass	all	ChildCrashHead,ChildCrashTxn,Crash,IndexPublish,OpHead,OpIndex,OpRacy,OpRef,OpRestore,OpSeat,OpStash,OpTouch,OpUntracked,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcSeat,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
+MC_ec_live	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRacy,OpRef,OpRestore,OpSeat,OpStash,OpUntracked,SrcCreate,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
+MC_ec_live_linked	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRef,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_refs_rename_op	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcMove,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_rebase	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpIndex,OpRef,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_index_concurrent	pass	all	ChildCrashHead,ChildCrashTxn,Crash,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,OpHead,OpRef,OpRestore,OpStash,ProbeExchange,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SeatVerify,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_head_op	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpIndex,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_seat_parent	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRacy,OpRef,OpStash,OpTouch,OpUntracked,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
+MC_ec_head_concurrent	pass	all	ChildCrashHead,ChildCrashTxn,Crash,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpIndex,OpRef,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_refs_concurrent	pass	all	ChildCrashHead,ChildCrashTxn,Crash,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_child_crash	pass	all	ChildCrashHead,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRef,OpRestore,OpStash,ProbeExchange,SeatVerify,SrcCreate,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
+MC_ec_live_ops	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpIndex,OpRacy,OpRef,OpStash,OpTouch,OpUntracked,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
+MC_ec_reach_converged	reach	Witness_Converged	*	-
+MC_ec_reach_settled	reach	Witness_SettledAfterCrash	*	-
+MC_ec_reach_captured_not_landed	reach	Witness_CapturedNotLanded	*	-
+MC_ec_finding_file_to_dir_settle	fail	NoWedge	*	-
+MC_ec_finding_settle_stale_branch	fail	CrashAtomicity	*	-simulate num=200000 -depth 40
+MC_ec_finding_old_head_branch	fail	ConvergesWhenQuiet	*	-
+MC_ec_finding_detached_reattach	fail	ConvergesWhenQuiet	*	-
+MC_ec_finding_child_crash	fail	NoWedge	*	-
+MC_ec_finding_stash_settle_revert	fail	NoLocalWorkLost	*	-
+MC_ec_finding_first_linked_crash	fail	NoWedge	*	-
+MC_ec_finding_stash_lock	fail	TypedRefusal	*	-
+MC_ec_finding_set_head_partial	fail	CrashAtomicity	*	-
+MC_ec_finding_restored_ref	fail	ConvergesWhenQuiet	*	-
+MC_ec_finding_settle_branch_conflict	fail	TypedRefusal	*	-
+MC_ec_neg_live_unfair	fail	ConvergesWhenQuiet	*	-
+MC_ec_neg_proof_stat_only	fail	NoLocalWorkLost	*	-
+MC_ec_neg_proof_stat_strict	fail	TypedRefusal	*	-
+MC_ec_neg_overwrite_modified	fail	NoLocalWorkLost	*	-
+MC_ec_neg_no_intent	fail	CrashAtomicity	*	-
+MC_ec_neg_exchange_unchecked	fail	NoLocalWorkLost	*	-
+MC_ec_neg_index_no_cas	fail	NoLocalWorkLost	*	-
+MC_ec_neg_stash_clear_blind	fail	NoLocalWorkLost	*	-
+MC_ec_neg_name_conflict_unchecked	fail	NoWedge	*	-
+MC_ec_neg_single_ref_txn	fail	NoWedge	*	-
+MC_ec_neg_head_branch_in_step	fail	NoWedge	*	-
+MC_ec_neg_no_checkout_guard	fail	TypedRefusal	*	-
+MC_ec_neg_converge_before_ref_settle	fail	TypedRefusal	*	-
+MC_ec_neg_dir_replace_unchecked	fail	TypedRefusal	*	-
+MC_ec_neg_prune_local	fail	NoSourceWorkLost	*	-
+MC_ec_neg_drop_provenance	fail	NoSourceWorkLost	*	-
+MC_ec_neg_noop_restages	fail	NoReRead	*	-
+MC_ec_neg_sibling_intent_reproves	fail	NoReRead	*	-
+MC_ec_neg_finish_after_all_deletes	fail	NoWedge	*	-
+MC_ec_neg_rebase_unguarded	fail	NoLocalWorkLost	*	-
+MC_ec_neg_ledger_reads_index	fail	NoLocalWorkLost	*	-
+MC_ec_neg_unborn_head_untyped	fail	TypedRefusal	*	-
+MC_ec_neg_seat_parent_untyped	fail	TypedRefusal	*	-
+MC_ec_neg_refs_unsynced	fail	TypedRefusal	*	-
+MC_ec_neg_probe_left	fail	CrashAtomicity	*	-
+MC_ec_neg_settle_moves_checked_out	fail	NoLocalWorkLost	*	-
+MC_ec_neg_txn_no_symref_verify	fail	NoLocalWorkLost	*	-
+MC_ec_neg_txn_no_cas	fail	NoLocalWorkLost	*	-
+MC_ec_neg_head_no_cas	fail	NoLocalWorkLost	*	-

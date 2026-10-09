@@ -1944,6 +1944,9 @@ let constantNames =
 -- GitCarry.tla's part (OI-1003-Q43).
 let GitCarry = ./GitCarry.dhall
 
+-- EstateConverge.tla's part (OI-1003-Q144).
+let EstateConverge = ./EstateConverge.dhall
+
 let module = T.moduleEntry T.Module.BulkloadTransfer
 
 in  { files =
@@ -1954,6 +1957,7 @@ in  { files =
               (\(r : T.Row) -> { name = "${r.name}.cfg", text = cfgText r })
               rows
         # GitCarry.files
+        # EstateConverge.files
     , grounding =
       [ { module = showConstructor module.module
         , spec = module.spec
@@ -1981,11 +1985,13 @@ in  { files =
         , labelSets = [] : List { name : Text, labels : List Text }
         }
       , GitCarry.grounding
+      , EstateConverge.grounding
       ]
     , invariants
     , supersedeInvariants
     , nversion
     , gitCarryInvariants = GitCarry.invariants
     , gitCarryNversion = GitCarry.nversion
+    , estateConvergeInvariants = EstateConverge.invariants
     , decide = GitCarry.decide
     }
