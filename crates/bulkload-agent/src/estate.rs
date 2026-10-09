@@ -2021,18 +2021,20 @@ fn capture_in(
     // knows whether each planned carrier's own capture refused in this pass.
     let refused = Mutex::new(std::collections::BTreeSet::new());
     let operation = |item: &Item| {
-        let result = group_base(item, &groups, state, corpus).and_then(|base| {
-            capture_item(
-                item,
-                state,
-                corpus,
-                base.as_ref(),
-                (policy, decision),
-                &owners,
-                &refused,
-                space,
-            )
-        });
+        let result = group_base(item, &groups, state, corpus)
+            .and_then(|base| {
+                capture_item(
+                    item,
+                    state,
+                    corpus,
+                    base.as_ref(),
+                    (policy, decision),
+                    &owners,
+                    &refused,
+                    space,
+                )
+            })
+            .map_err(|refusal| capture_refusal(refusal, item, state));
         if result.is_err() {
             refused
                 .lock()
@@ -2062,6 +2064,36 @@ fn capture_in(
 }
 
 type ImportedBases = Mutex<std::collections::BTreeSet<(PathBuf, [u8; 32])>>;
+
+// S4 (#220): a Git child that ran out of space names no directory (its
+// stderr is never carried, R-N121), but its verb knows where its children
+// write. Apply's write into the destination repository and its corpus
+// stages, both charged by apply's space preflight: the destination's space,
+// `DESTINATION_SPACE_INSUFFICIENT`.
+fn charged_space(refusal: BulkloadRefusal) -> BulkloadRefusal {
+    match refusal {
+        BulkloadRefusal::SpaceExhausted(None) => BulkloadRefusal::DestinationSpaceInsufficient,
+        other => other,
+    }
+}
+
+// A capture's refusal with the facts only the verb knows. S4 (#220): a
+// capture's Git children write only under PRIVATE_STATE (the attempt and
+// plan-base directories), which no preflight charges, so an unnamed
+// out-of-space refusal names it. S4 (#219): a missed object in a source
+// whose alternates name a store Git cannot open (a lender moved or deleted)
+// names that alternates file.
+fn capture_refusal(refusal: BulkloadRefusal, item: &Item, state: &Path) -> BulkloadRefusal {
+    use std::os::unix::ffi::OsStrExt as _;
+    match refusal {
+        BulkloadRefusal::SpaceExhausted(None) => {
+            BulkloadRefusal::SpaceExhausted(Some(state.as_os_str().as_bytes().to_vec()))
+        }
+        other => git_carry::missing_alternate(&item.source, &other).map_or(other, |file| {
+            BulkloadRefusal::GitSourceAlternates(file.as_os_str().as_bytes().to_vec())
+        }),
+    }
+}
 
 // A missing corpus file is a typed refusal, never a bare IO errno (S4).
 fn sealed(refusal: BulkloadRefusal) -> BulkloadRefusal {
@@ -2103,17 +2135,16 @@ fn import_base(
     let base = bound(corpus, &captured.bundle)?.ok_or(BulkloadRefusal::SealedObjectMissing)?;
     // Existing shared repositories are the supported optimization. Creating a
     // standalone destination needs a separate private preseed implementation.
-    if !item
-        .repository
-        .try_exists()
-        .refuse_at("estate::import_base")?
-        || item
-            .workspace
-            .as_ref()
-            .is_some_and(|workspace| workspace == &item.repository)
+    if item
+        .workspace
+        .as_ref()
+        .is_some_and(|workspace| workspace == &item.repository)
     {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
+    // S4 (#183): a destination repository that is missing, or a directory
+    // that holds none, is named as such, never as an occupied one.
+    git_carry::destination_repository(&item.repository)?;
     let key = (git_carry::common_repository(&item.repository)?, base.digest);
     if imported
         .lock()
@@ -2142,9 +2173,10 @@ fn apply_item(
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
     // Round 4 N5: an item whose capture refused has no record. That is a
-    // typed refusal, never a bare IO errno.
+    // typed refusal, never a bare IO errno; and it names the absent capture
+    // (S4, #219), never a sealed object a capture recorded and lost.
     if !record.try_exists().refuse_at("estate::apply_item")? {
-        return Err(BulkloadRefusal::SealedObjectMissing);
+        return Err(BulkloadRefusal::CaptureAbsent);
     }
     let captured: Capture = read(&record)?;
     if !filename(&captured.bundle) {
@@ -2641,8 +2673,12 @@ pub fn apply(
         // already there, that is a collision the restore refuses by type
         // (R-N114), not Git administration to serialise on.
         let standalone = item.workspace.as_ref() == Some(&item.repository);
+        // S4 (#183): a destination Git cannot read as a repository (an empty
+        // directory, an unfinished `git init`) keys by its path, and its item
+        // refuses on its own; it never aborts the verb before any item runs.
         let common = if !standalone && item.repository.try_exists().refuse_at("estate::apply")? {
-            git_carry::common_repository(&item.repository)?
+            git_carry::common_repository(&item.repository)
+                .unwrap_or_else(|_| item.repository.clone())
         } else {
             item.repository.clone()
         };
@@ -2660,7 +2696,7 @@ pub fn apply(
         let _guard = lock
             .lock()
             .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
-        apply_item(item, corpus, state, source, &imported, &owners)
+        apply_item(item, corpus, state, source, &imported, &owners).map_err(charged_space)
     };
     // R-N114: an item whose workspace lies inside another item's workspace
     // restores after it, level by level, so the outer checkout lays down the
@@ -2761,6 +2797,10 @@ pub mod custody_probe {
         ))
     }
 }
+
+// S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
+#[cfg(test)]
+mod s4_sweep_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]

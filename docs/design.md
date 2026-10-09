@@ -30,9 +30,14 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   code is raised by product code, never kept as unused vocabulary. A Git
   child that exits non-zero refuses `GIT_CHILD_FAILED` with a
   `stderr_class=` from a closed set; its stderr is classified, never echoed
-  or kept (R-N121). No blanket conversion turns an OS or codec error into a
-  refusal: each site names itself with `.refuse_at(site)`. The sites that
-  still raise a bare `IO` with no errno are an allowlist that only shrinks.
+  or kept (R-N121). A child whose stderr says it ran out of space or quota
+  (class `no_space`) refuses a space code instead (#220): the verb names
+  where its children write (see Space). No blanket
+  conversion turns an OS or codec error into a refusal: each site names
+  itself with `.refuse_at(site)`. The sites that still raise a bare `IO`
+  with no errno are an allowlist that only shrinks. A bare `IO` carries its
+  errno; it carries no path, so a site that knows its path and a typed
+  cause raises the typed code (`SPACE_EXHAUSTED` names its directory).
 - `referenced-only`: the item plans no workspace, and the exact
   current-capture journal says `refs-imported`. `git-repair-missing-index`
   given `PLAN CORPUS PRIVATE_STATE` binds its bundle to the planned item
@@ -235,6 +240,32 @@ neither an index nor a worktree (S4, #162).
   worktree) refuses `GIT_INVENTORY_INDEX_ABSENT`. Git reads the absent file
   as an unborn index that `git checkout` populates, and an empty index file
   does not, so no carried index restores it.
+- A bare repository whose HEAD names a branch that does not exist (unborn:
+  `init --bare`, or a mirror whose default branch is gone) is valid and
+  captures as ref custody: its refs and its symbolic HEAD, with no
+  `refs/carry-export/head` (S4, #162, #219). An empty bare repository, with
+  no ref at all, captures the same way. An unborn HEAD in a non-bare
+  repository still refuses `GIT_CHILD_FAILED`.
+- Alternates (`objects/info/alternates`) are followed, decided at capture
+  (S4, #219). The capture's private repository borrows the source's store,
+  and the bundle packs every reachable object wherever it is stored, so a
+  landing (a refs import or a checkout) is self-contained: it has no
+  alternates file and `git fsck --full` is clean. Git reads alternates at
+  most six levels down, and the private repository adds one, so a source
+  can borrow through at most five stores. Git links each store once, by
+  its real path, depth first in file order, and the capture's walk does the
+  same: an entry naming the source's own store, a cycle, or a diamond
+  reaching a store already linked costs no depth. An alternates file five
+  stores down that names a store not yet linked, or a quoted alternates
+  entry, refuses `GIT_SOURCE_ALTERNATES` with that file's path, before any
+  export; the estimate probe walks and refuses the same way. An entry
+  naming a store Git cannot open (a lender moved or deleted after
+  `clone --shared`) is skipped as Git skips it; if the capture then misses
+  an object (`GIT_CHILD_FAILED` of class `bad_object` or `other`), it
+  refuses `GIT_SOURCE_ALTERNATES` naming that file. A `gc` or repack in a
+  lender under the pass is drift custody, as one in the source is: the
+  rewrite check reads every followed store's pack listing. A promisor pack
+  in any followed store still refuses `GIT_SOURCE_PARTIAL_CLONE`.
 - A capture's header does not list every carried ref (OI-1003-Q54, #178;
   `docs/plans/2026-10-05-v1-header.md`). The refs travel in a
   content-addressed ref table commit (`refs/carry-ref-table/v1`), with one
@@ -318,7 +349,17 @@ neither an index nor a worktree (S4, #162).
     concurrent writer.
 
 Import preserves divergence and leaves active HEADs, indexes and
-working bytes untouched. Account credentials carry privately; platform stores
+working bytes untouched. estate-apply refuses a planned item whose capture
+the corpus does not hold (its capture refused, or none ran) with
+`CAPTURE_ABSENT`, before it reads anything else; `SEALED_OBJECT_MISSING`
+names only a recorded capture whose bundle, link or base the corpus lost
+(S4, #219). A refs import into a destination repository that does not
+exist, or into a directory Git finds no repository in (an empty directory,
+an unfinished `git init`), refuses `GIT_REPOSITORY_NOT_AT_PATH` as that
+item's own receipt, never `GIT_INVENTORY_MALFORMED` or
+`GIT_DESTINATION_OCCUPIED`, and never aborts the apply's other items (S4,
+#183). A standalone item on a plan base still refuses
+`GIT_DESTINATION_OCCUPIED`: a standalone destination is never preseeded. Account credentials carry privately; platform stores
 may require a format transcode. Destination machine keys and Home Manager
 links are preserved. Credential contents are never printed.
 
@@ -952,6 +993,28 @@ starts.
   `DESTINATION_SPACE_INSUFFICIENT` as its own receipt; the other items run
   and the next pass retries it. A reuse hit writes nothing and reserves
   nothing. Shared-base preparation is not charged.
+- No preflight charges `TMPDIR`. A capture's own temporaries there (a
+  private copy of the source index) and a stage beside a bundle that meet
+  `ENOSPC` or `EDQUOT` (at the create or a write) refuse `SPACE_EXHAUSTED`
+  with the directory that ran out and outlives the refusal (TMPDIR, or the
+  directory a stage's private directory was made in), never the removed
+  private directory itself (S4, #220). A Git child that reports no space
+  names no directory (R-N121); its verb does. estate-apply's children write
+  into the destination repository and its corpus stages, which its
+  preflight charges, so they refuse `DESTINATION_SPACE_INSUFFICIENT`.
+  estate-capture's children write only under PRIVATE_STATE, which nothing
+  charges, so they refuse `SPACE_EXHAUSTED` naming it. A child of another
+  verb (the estimate probe) refuses `SPACE_EXHAUSTED` with no path. The item refuses as its own receipt and the pass goes
+  on; a pass with room retries it.
+- A store out of space (`SQLITE_FULL`, or `SQLITE_IOERR_*` whose errno is
+  `ENOSPC` or `EDQUOT`: a quota, or a full disk met at a sync) is a space
+  refusal, never a bare `IO` and never the store's corruption (S4, #126). A
+  destination group commit, which the transfer's preflight charges,
+  refuses `DESTINATION_SPACE_INSUFFICIENT`. The source ledger's commit and
+  `Store::open` on either side refuse `SPACE_EXHAUSTED` naming the state
+  directory: no preflight charges it, and a source-side full disk is never
+  reported as the destination's. Any other I/O error a store meets is `IO`
+  with its errno (`EIO` where the errno cannot be read).
 
 ## Reclaim
 
