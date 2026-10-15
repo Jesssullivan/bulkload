@@ -38,13 +38,15 @@ and design disagreements](#code-and-design-disagreements)).
 | File | What it is |
 |---|---|
 | [`BulkloadTransfer.tla`](BulkloadTransfer.tla) | The specification. Its header states the scope, the abstractions and the code map. Every action cites the function it models. |
-| [`catalogue/Catalogue.dhall`](catalogue/Catalogue.dhall) | The typed catalogue: every config's constants and expectation, every mutation's verdict, and every property's traceability row. `just tla-render` renders every `MC_*.cfg`, `configs.tsv` and `configs_gc.tsv` from it (GitCarry's part is [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall)). Edit the catalogue, never the outputs. It replaced `gen_cfgs.py` (OI-1003-Q32). |
+| [`catalogue/Catalogue.dhall`](catalogue/Catalogue.dhall) | The typed catalogue: every config's constants and expectation, every mutation's verdict, and every property's traceability row. `just tla-render` renders every `MC_*.cfg`, `configs.tsv`, `configs_gc.tsv`, `configs_sq.tsv` and `configs_dir.tsv` from it (GitCarry's part is [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall), SqliteCarry's [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall), DirectoryRecords' [`catalogue/Directories.dhall`](catalogue/Directories.dhall)). Edit the catalogue, never the outputs. It replaced `gen_cfgs.py` (OI-1003-Q32). |
 | [`catalogue/Types.dhall`](catalogue/Types.dhall) | The catalogue's types. Union labels are the TLA+ names themselves. |
 | `MC_*.cfg` | TLC configurations, rendered from the catalogue. |
 | [`configs.tsv`](configs.tsv) | The run order. Columns: `name`, `expect`, `named-property` (the one property a fail or reach row must violate), `never` (a pass row's exact never-enabled actions), `flags` (extra TLC arguments, one argv element per word). |
 | [`GitCarry.tla`](GitCarry.tla) | The git carry custody module (OI-1003-Q43): chain links, the plan base, depth, Q46's re-root and GC, crash order and restore-or-recapture ([GitCarry](#gitcarry-chain-and-base-custody-oi-1003-q43-oi-1003-q46)). |
 | [`configs_gc.tsv`](configs_gc.tsv), `MC_gc_*.cfg` | GitCarry.tla's run order and configs, in the same format, rendered from [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall). |
 | [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by both modules. |
+| [`SqliteCarry.tla`](SqliteCarry.tla) | The SQLite snapshot seat module (#218): the stepped backup, the settled key, sidecars, root and owner refusals, and OI-1003-Q146's superseding publish of a changed store's snapshot ([SqliteCarry](#sqlitecarry-the-sqlite-snapshot-seat-218-oi-1003-q146)). |
+| [`configs_sq.tsv`](configs_sq.tsv), `MC_sq_*.cfg` | SqliteCarry.tla's run order and configs, rendered from [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall). |
 | [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | The reference decision core `decide`, its pinned rows ([`decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv)), and an explorer of GitCarry.tla. |
 | [`DirectoryRecords.tla`](DirectoryRecords.tla) | Directory records (R-N102, R-N119) and their batching (OI-1003-Q143 item 2), under per-name power loss and reused inode numbers ([Directory records](#directory-records-r-n102-oi-1003-q143)). |
 | [`configs_dir.tsv`](configs_dir.tsv), `MC_dir_*.cfg` | DirectoryRecords.tla's run order and configs, rendered from [`catalogue/Directories.dhall`](catalogue/Directories.dhall). |
@@ -52,9 +54,9 @@ and design disagreements](#code-and-design-disagreements)).
 ## Running it
 
 ```sh
-just tla-render             # re-render configs.tsv, configs_gc.tsv and MC_*.cfg from the catalogue
+just tla-render             # re-render configs*.tsv and MC_*.cfg from the catalogue
 just tla-render --check     # fail unless the committed files are the catalogue's rendering
-just tla-check              # every row of configs.tsv, then of configs_gc.tsv
+just tla-check              # every row of configs.tsv, configs_gc.tsv, configs_sq.tsv, configs_dir.tsv
 just tla-check MC_nv_core   # that module's budget self-test, then the named configs
 just tla-check MC_gc_core   # the same for GitCarry.tla
 just formal-nv              # the Haskell cross-checks of both modules (Hybrid roles)
@@ -267,6 +269,7 @@ the counts are copied here.
 | `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | pass | **PASS** | – | 448 | 974 | 30 | 2s | 297 |
 | `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 44s | 1774 |
 | `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 98s | 1964 |
+| `MC_r25_strict_three` (added 2026-10-15, after the run above; its own run's counts) | {a,b,c} R2 C1 E0 strict-held sym budget 600 s | pass | **PASS** | – | 636,976 | 2,409,822 | 66 | 112s | 2032 |
 | `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 3s | 367 |
 | `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,188 | 2,303 | 30 | 2s | 369 |
 | `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space budget 600 s | simulate | **SIMULATION** | – | 1,144,601 | – | – | 40s | 1541 |
@@ -427,6 +430,7 @@ violation, and a simulation only samples.
 | `MC_r25_unrowed_bytes`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority` | `Edit`, `SilentRewrite`, `RecvRefused`, `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
 | `MC_r25_strict_deep` | – | WP0(d), estate |
 | `MC_r25_strict_main` | `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
+| `MC_r25_strict_three` | `Edit`, `SilentRewrite`, `RecvRefused`, `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
 
 Each action is off because of that config's own constants, and every one is
 enabled in another config:
@@ -514,7 +518,7 @@ What the catalogue guarantees, at the type level or by an `assert`, every
 time it is evaluated (a catalogue that breaks one renders nothing):
 
 - **Typed constants.** Each config's constants are a `Constants` record:
-  `Seats` is a list of `< a | b >`, `SupersedeMode` is
+  `Seats` is a list of `< a | b | c >`, `SupersedeMode` is
   `< off | check_rename | exchange >`, and `Mutation` is an optional
   `Mutation`. A misspelt value does not type-check.
 - **An expectation carries only what its kind needs.** A pass row carries
@@ -1246,7 +1250,7 @@ Not frozen, and not the SLO's obligation (OI-1003-Q40):
 
 | Property | What it is for |
 |---|---|
-| `R25_StrictNoDurableReread` | R25 under the strict reading of "held durably" (OI-1002-Q33): bulkload's own output from a non-racy capture, published or adopted and sealed, durable at the final path with the seat's current bytes, counts as held whether or not a row records it. Meaningful only under `TrackStrictHeld`. The transfer before #169 fails it (`MC_r25_unrowed_no_adopt`), and so does a manifest adoption that writes no record (`MC_neg_adopt_unrecorded`). With the capture record's adoption (`AdoptUnrowed`) it holds beside every safety invariant, within [stated limits](#r25s-strict-reading-169) (`MC_r25_unrowed_bytes`, `MC_r25_strict_deep`, `MC_r25_strict_main`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority`). |
+| `R25_StrictNoDurableReread` | R25 under the strict reading of "held durably" (OI-1002-Q33): bulkload's own output from a non-racy capture, published or adopted and sealed, durable at the final path with the seat's current bytes, counts as held whether or not a row records it. Meaningful only under `TrackStrictHeld`. The transfer before #169 fails it (`MC_r25_unrowed_no_adopt`), and so does a manifest adoption that writes no record (`MC_neg_adopt_unrecorded`). With the capture record's adoption (`AdoptUnrowed`) it holds beside every safety invariant, within [stated limits](#r25s-strict-reading-169) (`MC_r25_unrowed_bytes`, `MC_r25_strict_deep`, `MC_r25_strict_main`, `MC_r25_strict_three`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority`). |
 | `AdoptOnlyUnrowed` | #169's adoption is for outputs with no row: an entry queued as an unrowed adoption never has a committed row for its key and its output's identity. A rowed output is answered `Reuse` from its row. Checked by every pass row with `AdoptUnrowed` on; `MC_neg_reuse_ignores_row` fails it. It exists because a regression of `Store::output_matches` would otherwise be invisible: the adoption takes over, hashes and re-rows every output on every run, and reads 0 source bytes, so no R25 or S3 property fires. Rust: `transfer::tests::a_clean_rerun_reuses_rowed_outputs_and_adopts_none`. |
 | `SupersedeAtomic` | #187, OI-1003-Q18, OI-1003-Q102: a superseding publish is atomic across any crash. Once it is settled (no intent recorded, no stage of its group pending), while the new file is at the leaf this store holds a row for it (its reuse row, or the ownership row the sweep gives it) and none for the old output; while the old output is at the leaf this store still holds a row for it and none for the new file. Never one file beside the other's rows. A leaf a third party wrote since is neither file. Checked by every pass row with `SupersedeMode = "exchange"`; `MC_neg_sweep_drops_ownership` and `MC_neg_exchange_before_intent` fail it. Rust: P78, `tests/power_loss.rs` (the superseding rerun), `tests/fault_harness.rs` (the `SUPERSEDING` rows). |
 | `OwnershipNeverReuse` | OI-1003-Q101, R25, #86: `Reuse` is answered only from a reuse row for the entry's key and the output's identity. An ownership row (a racy publish, an interrupted supersede) names no seat and is never a reuse source. `MC_neg_own_is_reuse` fails it. Rust: `transfer_store::tests::a_racy_output_has_an_ownership_row_and_no_reuse_row`, P19. |
@@ -1467,6 +1471,7 @@ has no record or one that does not verify. A record that names another row
 | `MC_r25_unrowed_bytes` (one seat, a crash between runs) | pass | **PASS** | – | 448 | 974 | 30 |
 | `MC_r25_strict_deep` (`MC_main_deep`'s bound) | pass | **PASS** | – | 461,893 | 1,801,788 | 49 |
 | `MC_r25_strict_main` (`MC_main`'s bound, two seats) | pass | **PASS** | – | 963,928 | 3,081,821 | 51 |
+| `MC_r25_strict_three` (three seats, no edit: groups of one to three) | pass | **PASS** | – | 636,976 | 2,409,822 | 66 |
 | `MC_r25_strict_unsealed` (a lost source store) | pass | **PASS** | – | 1,050 | 2,035 | 30 |
 | `MC_r25_strict_authority` (a relaxed creation commit) | pass | **PASS** | – | 1,069 | 2,084 | 30 |
 | `MC_r25_unrowed_no_adopt` (the transfer before #169) | fail | **FAIL** | `R25_StrictNoDurableReread` | 302 | 624 | 17 |
@@ -1489,6 +1494,22 @@ same claims:
 - `a_recreated_source_store_adopts_from_capture_records`;
 - `a_clean_rerun_reuses_rowed_outputs_and_adopts_none`
   (`AdoptOnlyUnrowed`).
+
+**Group size (OI-1003-Q154 lever 3b, review 2026-10-15).** The engine's
+destination groups grew (a 250 ms idle and a 1 s age bound in place of a
+20 ms idle). `Commit` takes any nonempty set of ready seats at any step,
+so every close rule (idle, age, file and byte bounds, the stream's drain)
+picks one of the model's choices; timing is outside the model. Every other
+row has at most two seats, so `MC_r25_strict_three` checks groups of one,
+two and three under the strict reading with a crash between two runs (no
+source edit: with one per seat the search outgrew the budget, more than
+6.3 million distinct states after 7 minutes). An ad hoc action property,
+"no step moves all three seats from `ready` to `committed`", fails at that
+bound, so a three-seat group commit is reachable there (scratch module
+`Witness3.tla`, not a row; 622,609 distinct states when it fails). The
+code's side is the power-loss checker over the copy of
+`tests/power_loss.rs` at every destination group size of its tree, 1 to 7
+files (`BULKLOAD_FAULT_GROUP_DESTINATION`).
 
 ### What the #169 review changed
 
@@ -2252,6 +2273,135 @@ differed.
   read `prev_base` for a based link; the capture is then the plan base's
   delta, as under v1.
 
+## SqliteCarry: the SQLite snapshot seat (#218, OI-1003-Q146)
+
+[`SqliteCarry.tla`](SqliteCarry.tla) models the SQLite snapshot seat of
+wire v6 (`--sqlite=snapshot`), as built on `feat/sqlite-carry-20261008`
+([the design note](../agent-notes/2026-10-08-sqlite-carry-design.md),
+sections 0 and 16). It is model first, per OI-1003-Q102's precedent. Its
+configs are rendered from [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall)
+into `configs_sq.tsv` and `MC_sq_*.cfg`, and `just tla-check` runs them
+(the third `Module`; its code symbols are grounded with the `code` match,
+as BulkloadTransfer's). Until 2026-10-09 it lived in `docs/formal/sqlite/`
+with hand-written configs outside the catalogue.
+
+### What it models
+
+One live store, one destination path, at most three runs and one crash.
+
+- The store: a logical version `lv`, and stat identities of the main file and
+  the `-wal` that only grow. A WAL commit moves the `-wal` (never blocked by a
+  reader); a checkpoint moves the main file (it waits while a step reads); a
+  WAL reset moves the `-wal`; a rollback-mode commit moves the main file (it
+  waits while a step holds `SHARED`).
+- A run: the walk stats the main file and the `-wal` in two separate steps,
+  commits possible between (R11); Decide reuses from the row or adopts an
+  unrowed output from its capture record, only for the output this store
+  landed and nothing touched since; it refuses for a destination sidecar
+  (R5), a non-owner (R4), a refuse-mode record only under the mutation (R8);
+  a session as root opens nothing (OI-1003-Q76). The backup pre-stats, steps
+  with the lock released between steps (OI-1003-Q16, D2), restarts on a
+  commit between steps, ends within its step budget or is refused,
+  post-stats and settles (design 5.4).
+- Publish (OI-1003-Q146): beside a sidecar it is refused; into a free leaf
+  it renames; over the same bytes it adopts; over this store's own,
+  untouched output it takes WP0(d)'s intent (the old rows out), then
+  `Exchange`, whose last look refuses a touched output (no rows back) or a
+  sidecar that appeared since Decide (the old rows back), and otherwise
+  trades the files in one step; `CommitRow` settles the intent. Over any
+  other file it is refused. A crash at any step is followed by the sweep:
+  an old output still in place and still owned gets its rows back.
+- Third parties: `SidecarAppear` (a sidecar beside the published output, at
+  any step of a run), `SidecarRemoved` (between runs), `DestTouch` (an
+  in-place write of the output, at any step: it is then `Foreign` and no
+  longer this store's).
+- Session end: a sidecar is covered only by its base's snapshot (R2).
+
+### Properties and mutations
+
+| Property | Meaning | Mutation that fails it |
+|---|---|---|
+| `SqliteNeverTorn` | a published output is a committed version | `sqlite_raw_send` |
+| `SqliteReuseSound` | a Reuse (row or adopted record) is of the version at the walk | `sqlite_key_main_only`, `sqlite_record_unsettled`, `sqlite_capture_record_main_only` (R1) |
+| `WalWriterNeverBlocked` | in WAL mode a writer's commit is always enabled | `wal_lock_exclusive` |
+| `S2_BackupLockBounded` | the lock is held inside one step; steps are bounded | `sqlite_unbounded_pinned` |
+| `SqliteRootRefusedUpFront` | as root, nothing is opened | `sqlite_as_root` |
+| `SqliteOwnerRefused` | another user's database is never opened (R4) | `sqlite_not_owner_opened` |
+| `SqliteNoForeignSidecar` | never published, by a rename or an exchange, beside a sidecar (R5, Q146) | `sqlite_publish_beside_sidecar`, `sqlite_supersede_no_recheck` |
+| `SqliteNoClobber` | only the output this store landed, untouched, is ever replaced (Q146) | `sqlite_supersede_unowned` |
+| `SqliteOldOrNewWhole` | once published, the path always holds a whole database; during a supersede, exactly the old output or the new snapshot (Q146) | `sqlite_supersede_unlink_rename` |
+| `SidecarCoverageSound` | a sidecar is covered only by its base's snapshot (R2) | `sidecar_covered_by_name` |
+| `SnapshotModeIgnoresV5Record` | snapshot mode does not honour tag 1 (R8) | `sqlite_header_refusal_in_snapshot_mode` |
+| `S3_UnchangedSqliteZero` | a run whose key the destination proves takes no backup | `sqlite_reuse_ignored` |
+
+`SqliteReuseSound` is defined against `lv` when the main file was walked,
+not "now": a commit after the walk is the next run's (review R11).
+`SqliteNeverSupersede` (D7, "never supersede a snapshot output") and its
+mutation `sqlite_supersede` are gone: OI-1003-Q146 replaced D7. The
+reachability witness `Witness_Superseded` shows a supersede is reached and
+its row commits (`MC_sq_reach_superseded`).
+
+### Results (SqliteCarry)
+
+`just tla-check` on 2026-10-09 (TLC 1.7.4, 3 workers, coverage on; the
+shared host at a load average of about 200), every row of `configs_sq.tsv`
+as expected. Total wall 816 s, peak RSS 1702 MiB.
+
+| Config | Expect | Outcome | Violated | Distinct states | Wall |
+|---|---|---|---|---|---|
+| `MC_sq_budget_selftest` | inconclusive | INCONCLUSIVE | WithinBudget | ? | 15s |
+| `MC_sq_wal` | pass | PASS | - | 827494 | 180s |
+| `MC_sq_rollback` | pass | PASS | - | 30908 | 26s |
+| `MC_sq_root` | pass | PASS | - | 63 | 12s |
+| `MC_sq_not_owner` | pass | PASS | - | 1479 | 20s |
+| `MC_sq_raw_base` | pass | PASS | - | 1479 | 15s |
+| `MC_sq_v5_record` | pass | PASS | - | 373702 | 70s |
+| `MC_sq_reach_reuse` | reach | REACHED | Witness_Reuse | 8742 | 35s |
+| `MC_sq_reach_restart` | reach | REACHED | Witness_Restart | 1339 | 22s |
+| `MC_sq_reach_superseded` | reach | REACHED | Witness_Superseded | 79781 | 65s |
+| `MC_sq_neg_sqlite_raw_send` | fail | FAIL | SqliteNeverTorn | 3959 | 38s |
+| `MC_sq_neg_sqlite_key_main_only` | fail | FAIL | SqliteReuseSound | 9512 | 27s |
+| `MC_sq_neg_sqlite_record_unsettled` | fail | FAIL | SqliteReuseSound | 14304 | 21s |
+| `MC_sq_neg_sqlite_capture_record_main_only` | fail | FAIL | SqliteReuseSound | 10745 | 15s |
+| `MC_sq_neg_wal_lock_exclusive` | fail | FAIL | WalWriterNeverBlocked | 172 | 28s |
+| `MC_sq_neg_sqlite_unbounded_pinned` | fail | FAIL | S2_BackupLockBounded | 540 | 17s |
+| `MC_sq_neg_sqlite_as_root` | fail | FAIL | SqliteRootRefusedUpFront | 106 | 12s |
+| `MC_sq_neg_sqlite_not_owner_opened` | fail | FAIL | SqliteOwnerRefused | 142 | 20s |
+| `MC_sq_neg_sqlite_publish_beside_sidecar` | fail | FAIL | SqliteNoForeignSidecar | 57213 | 34s |
+| `MC_sq_neg_sqlite_supersede_no_recheck` | fail | FAIL | SqliteNoForeignSidecar | 76204 | 32s |
+| `MC_sq_neg_sqlite_supersede_unowned` | fail | FAIL | SqliteNoClobber | 113132 | 33s |
+| `MC_sq_neg_sqlite_supersede_unlink_rename` | fail | FAIL | SqliteOldOrNewWhole | 63451 | 22s |
+| `MC_sq_neg_sidecar_covered_by_name` | fail | FAIL | SidecarCoverageSound | 157 | 8s |
+| `MC_sq_neg_sqlite_header_refusal_in_snapshot_mode` | fail | FAIL | SnapshotModeIgnoresV5Record | 58 | 13s |
+| `MC_sq_neg_sqlite_reuse_ignored` | fail | FAIL | S3_UnchangedSqliteZero | 11610 | 20s |
+
+The pass rows' never-enabled actions are the `never` column of
+`configs_sq.tsv`; every pass row checks every safety invariant, and
+`RenameAfterUnlink` (the unlink-then-rename mutation's second step) is
+never enabled in any of them.
+
+### What SqliteCarry does not prove
+
+- SQLite's own internals: that a backup whose steps all saw one version
+  copies that version is an axiom here, checked by P80, not proved.
+- Clocks: the racy rule is folded into "settled"; same-tick rewrites are the
+  racy rule's, as for files (#86).
+- The path race of design section 7.5; chunks, credit and the wire; the file
+  seat and every property `BulkloadTransfer.tla` already holds for it,
+  WP0(d)'s exchange for files included (`MC_wp0d_exchange`).
+- The window between the exchange's last sidecar `lstat` and the exchange:
+  here the look and the exchange are one step. A `-journal` or `-wal`
+  created in that window, and an application on SQLite before 3.8.3 (or a
+  VFS whose files do not track their inode: `unix-none`, `unix-dotlock`,
+  `unix-flock`, a custom one) whose next write after the exchange
+  journals beside the new file, are the residuals OI-1003-Q146 accepts; a
+  modern unix-VFS connection on the old inode gets
+  `SQLITE_READONLY_DBMOVED` instead (design.md, "SQLite snapshot seats").
+- The exclusive-mode opener and the checkpointer's busy handler beyond "waits
+  while a step reads": their wait is the backup connection's life
+  (`StepBudget` steps), which `S2_BackupLockBounded` bounds.
+- The Haskell explorer does not cover this module.
+
 ## Directory records (R-N102, OI-1003-Q143)
 
 `DirectoryRecords.tla` is a module of its own (as GitCarry is): the
@@ -2358,6 +2508,10 @@ renaming one is a breaking change to the proof package and needs a ruling.
 
 GitCarry.tla's names (the module, its properties, mutations, constants and
 configs) are new and not frozen; freezing them needs a ruling.
+
+SqliteCarry.tla's names (the module, its properties, witnesses, mutations,
+constants and configs, #218 and OI-1003-Q146) are new and not frozen;
+freezing them needs a ruling.
 
 The names of #187's records (2026-10-07, OI-1003-Q102) are not frozen
 either: the properties `SupersedeAtomic`, `OwnershipNeverReuse`,

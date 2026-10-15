@@ -30,6 +30,13 @@ pub enum BulkloadRefusal {
     /// A capture recorded drift under its pass, so it does not hold every
     /// seat's bytes; apply refuses it until a later pass extends it clean.
     CaptureDrifted,
+    /// The corpus holds no capture record for a planned item (S4, #219): its
+    /// capture refused, and the capture's own outcome record names why, or
+    /// no capture ran. Apply refuses it before reading anything else; a
+    /// capture pass that records the item is the recovery. Distinct from
+    /// `SEALED_OBJECT_MISSING`, which names a recorded capture whose bundle,
+    /// link or base the corpus has lost.
+    CaptureAbsent,
 
     // ---- digest / sealing -------------------------------------------------
     /// A content digest did not match the digest the plan was sealed against.
@@ -155,20 +162,45 @@ pub enum BulkloadRefusal {
     /// store or an alternate). Reading it could fault in a lazy fetch, so v1
     /// carry refuses it before any other read (S2, OI-1003-Q16).
     GitSourcePartialClone,
+    /// A Git source borrows objects through `objects/info/alternates` in a
+    /// way a capture cannot follow (S4, #219): a chain of alternates deeper
+    /// than Git reads through the capture's private repository (which adds
+    /// one level), or an entry the capture does not resolve (a quoted path).
+    /// Decided at capture, before any export, so no landing ever depends on
+    /// a store it does not carry. Alternates a capture can follow are
+    /// followed: the bundle packs every reachable object wherever it is
+    /// stored, and the landing has no alternates. Carries the alternates
+    /// file that names the unfollowable entry, raw bytes; [`fmt::Display`]
+    /// prints it escaped.
+    GitSourceAlternates(Vec<u8>),
     /// A Git child process exited non-zero (WP3). Carries its stderr's class
     /// from the closed [`StderrClass`] set; no byte of the stderr itself is
     /// carried or printed (R-N121).
     GitChildFailed(StderrClass),
 
     // ---- sqlite -----------------------------------------------------------
-    /// `PRAGMA quick_check` or the foreign-key check failed.
+    /// `PRAGMA quick_check` or the foreign-key check failed; for a `SQLite`
+    /// snapshot seat (#218), the snapshot's `integrity_check` at the source
+    /// or the destination. Its default S4 disposition is `abandon`
+    /// (OI-1003-Q148).
     SqliteIntegrityCheckFailed,
     /// The database yielded a value type or magnitude the schema cannot carry.
     SqliteUnsupportedValue,
-    /// Shared rows diverged between planning and apply.
+    /// `SQLite` state that may not be read or carried as it is: shared rows
+    /// diverged between planning and apply (the provider verbs); a seat
+    /// whose first bytes are a `SQLite` database or WAL magic, or a `-wal`,
+    /// `-shm` or `-journal` by name (the transfer, #186; in `--sqlite=snapshot`
+    /// mode only WAL magic, an orphan sidecar and a sidecar whose base was not
+    /// carried as a snapshot, #218); or a backup step that met a writer's
+    /// lock (busy timeout 0).
     SqliteStateChanged,
     /// The `SQLite` online backup (open, step or finish) failed (WP3).
-    /// Carries `SQLite`'s extended result code when `SQLite` reported one.
+    /// Carries `SQLite`'s extended result code when `SQLite` reported one,
+    /// which crosses the wire beside the code ([`Self::sqlite_code`]):
+    /// corruption found by the backup step (primary code 11
+    /// `SQLITE_CORRUPT` or 26 `SQLITE_NOTADB`) is an integrity failure and
+    /// takes [`Self::SqliteIntegrityCheckFailed`]'s default S4 disposition,
+    /// `abandon` (OI-1003-Q148).
     SqliteBackupFailed(Option<i32>),
     /// A provider verb that reads a source database was run with effective
     /// uid 0 (S2, OI-1003-Q76). Opened as root, `SQLite` re-applies the
@@ -176,6 +208,14 @@ pub enum BulkloadRefusal {
     /// `-wal`'s ctime: a source metadata write no ruling admits. The verb
     /// refuses before it opens anything; run it as the database's owner.
     SqliteSourceAsRoot,
+    /// A database seat a `--sqlite=snapshot` transfer would open with
+    /// `SQLite` is owned by another user than the reader (S2, #218). `SQLite`
+    /// creates the database's `-shm` (and, under OI-1003-Q72, an empty
+    /// `-wal`) owned by the reading user, and the owner's own writer may then
+    /// fail to open them read-write. Refused per seat, from the `fstat` of
+    /// the descriptor the sniff already holds, before any `SQLite` open; run
+    /// the transfer's source half as the database's owner.
+    SqliteSourceNotOwner,
 
     // ---- budgets / transport ------------------------------------------------
     /// A capture, row, or spill budget was exceeded.
@@ -184,6 +224,17 @@ pub enum BulkloadRefusal {
     /// less free space than the configured floor (`--min-free-percent`,
     /// default 25%), or with no room at all (OI-1001-Q2).
     DestinationSpaceInsufficient,
+    /// A write met `ENOSPC` or `EDQUOT` (S4, #220, #126), named by the site
+    /// that knows where it wrote: one of bulkload's own temporaries (under
+    /// `TMPDIR`), a bundle stage, a store's state directory, or a capture's
+    /// Git children (under `PRIVATE_STATE`, which no preflight charges).
+    /// Carries the directory whose filesystem ran out, raw bytes
+    /// ([`fmt::Display`] prints it escaped); `None` when no site can name
+    /// it: a Git child's stderr is classified and never carried (R-N121). A
+    /// write a space preflight charged that then runs out (an estate-apply
+    /// Git child, a destination group commit) refuses
+    /// `DESTINATION_SPACE_INSUFFICIENT` instead.
+    SpaceExhausted(Option<Vec<u8>>),
     /// A transfer's regular-file destination path holds something this
     /// store cannot replace: a file it has no row for, or one changed since
     /// its row was written; a node of another kind; a file that appeared
@@ -227,6 +278,18 @@ pub enum BulkloadRefusal {
 }
 
 impl BulkloadRefusal {
+    /// `SQLite`'s extended result code, which only
+    /// [`Self::SqliteBackupFailed`] carries; sent beside the code in a
+    /// refusal frame, so the receiver can tell the backup's corruption
+    /// (OI-1003-Q148) from its other failures.
+    #[must_use]
+    pub const fn sqlite_code(&self) -> Option<i32> {
+        match *self {
+            Self::SqliteBackupFailed(code) => code,
+            _ => None,
+        }
+    }
+
     /// The stable machine-readable code for this refusal.
     ///
     /// These strings are the wire/log identity of a refusal and must not change
@@ -237,6 +300,7 @@ impl BulkloadRefusal {
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
             Self::SourceChangedAfterSnapshot => "SOURCE_CHANGED_AFTER_SNAPSHOT",
             Self::CaptureDrifted => "CAPTURE_DRIFTED",
+            Self::CaptureAbsent => "CAPTURE_ABSENT",
             Self::DigestMismatch => "DIGEST_MISMATCH",
             Self::SealedObjectMissing => "SEALED_OBJECT_MISSING",
             Self::ReceiptBindingInvalid => "RECEIPT_BINDING_INVALID",
@@ -271,14 +335,17 @@ impl BulkloadRefusal {
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
+            Self::GitSourceAlternates(_) => "GIT_SOURCE_ALTERNATES",
             Self::GitChildFailed(_) => "GIT_CHILD_FAILED",
             Self::SqliteIntegrityCheckFailed => "SQLITE_INTEGRITY_CHECK_FAILED",
             Self::SqliteUnsupportedValue => "SQLITE_UNSUPPORTED_VALUE",
             Self::SqliteStateChanged => "SQLITE_STATE_CHANGED",
             Self::SqliteBackupFailed(_) => "SQLITE_BACKUP_FAILED",
             Self::SqliteSourceAsRoot => "SQLITE_SOURCE_AS_ROOT",
+            Self::SqliteSourceNotOwner => "SQLITE_SOURCE_NOT_OWNER",
             Self::BudgetExceeded => "BUDGET_EXCEEDED",
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
+            Self::SpaceExhausted(_) => "SPACE_EXHAUSTED",
             Self::DestinationOccupied => "DESTINATION_OCCUPIED",
             Self::DestinationExchangeUnsupported => "DESTINATION_EXCHANGE_UNSUPPORTED",
             Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
@@ -299,6 +366,7 @@ impl BulkloadRefusal {
         "SNAPSHOT_ROOTS_OVERLAP",
         "SOURCE_CHANGED_AFTER_SNAPSHOT",
         "CAPTURE_DRIFTED",
+        "CAPTURE_ABSENT",
         "DIGEST_MISMATCH",
         "SEALED_OBJECT_MISSING",
         "RECEIPT_BINDING_INVALID",
@@ -333,14 +401,17 @@ impl BulkloadRefusal {
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_SOURCE_PARTIAL_CLONE",
+        "GIT_SOURCE_ALTERNATES",
         "GIT_CHILD_FAILED",
         "SQLITE_INTEGRITY_CHECK_FAILED",
         "SQLITE_UNSUPPORTED_VALUE",
         "SQLITE_STATE_CHANGED",
         "SQLITE_BACKUP_FAILED",
         "SQLITE_SOURCE_AS_ROOT",
+        "SQLITE_SOURCE_NOT_OWNER",
         "BUDGET_EXCEEDED",
         "DESTINATION_SPACE_INSUFFICIENT",
+        "SPACE_EXHAUSTED",
         "DESTINATION_OCCUPIED",
         "DESTINATION_EXCHANGE_UNSUPPORTED",
         "SALVAGE_BOUND_EXCEEDED",
@@ -372,7 +443,9 @@ impl fmt::Display for BulkloadRefusal {
             Self::GitNestInnerRepository(ref path)
             | Self::GitNestConversionAttribute(ref path)
             | Self::GitNestPopulatedSubmodule(ref path)
-            | Self::GitNestCarrierRefused(ref path) => {
+            | Self::GitNestCarrierRefused(ref path)
+            | Self::GitSourceAlternates(ref path)
+            | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
             }
             _ => f.write_str(self.code()),
@@ -396,6 +469,12 @@ pub enum StderrClass {
     Timeout,
     /// Git reported a missing, bad or corrupt object.
     BadObject,
+    /// A write failed for lack of space or quota (`ENOSPC`, `EDQUOT`; S4,
+    /// #220). A v1 child of this class refuses a space code, never
+    /// `GIT_CHILD_FAILED`: `SPACE_EXHAUSTED`, which its verb names, or
+    /// `DESTINATION_SPACE_INSUFFICIENT` where its verb's preflight charged
+    /// the write.
+    NoSpace,
     /// Anything else.
     Other,
 }
@@ -410,6 +489,7 @@ impl StderrClass {
             Self::HostUnreachable => "host_unreachable",
             Self::Timeout => "timeout",
             Self::BadObject => "bad_object",
+            Self::NoSpace => "no_space",
             Self::Other => "other",
         }
     }
@@ -422,7 +502,12 @@ impl StderrClass {
     /// counts after git's or the shell's change-directory failure.
     #[must_use]
     pub fn of(raw: &[u8]) -> Self {
-        const PATTERNS: [(StderrClass, &[&str]); 5] = [
+        const PATTERNS: [(StderrClass, &[&str]); 6] = [
+            // First: a full disk under any other failure is the cause.
+            (
+                StderrClass::NoSpace,
+                &["no space left on device", "disk quota exceeded"],
+            ),
             (
                 StderrClass::Timeout,
                 &["timed out", "timeout, server", "connection timeout"],
@@ -506,6 +591,7 @@ mod tests {
             BulkloadRefusal::SnapshotRootsOverlap,
             BulkloadRefusal::SourceChangedAfterSnapshot,
             BulkloadRefusal::CaptureDrifted,
+            BulkloadRefusal::CaptureAbsent,
             BulkloadRefusal::DigestMismatch,
             BulkloadRefusal::SealedObjectMissing,
             BulkloadRefusal::ReceiptBindingInvalid,
@@ -540,14 +626,17 @@ mod tests {
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitSourcePartialClone,
+            BulkloadRefusal::GitSourceAlternates(Vec::new()),
             BulkloadRefusal::GitChildFailed(StderrClass::Other),
             BulkloadRefusal::SqliteIntegrityCheckFailed,
             BulkloadRefusal::SqliteUnsupportedValue,
             BulkloadRefusal::SqliteStateChanged,
             BulkloadRefusal::SqliteBackupFailed(None),
             BulkloadRefusal::SqliteSourceAsRoot,
+            BulkloadRefusal::SqliteSourceNotOwner,
             BulkloadRefusal::BudgetExceeded,
             BulkloadRefusal::DestinationSpaceInsufficient,
+            BulkloadRefusal::SpaceExhausted(None),
             BulkloadRefusal::DestinationOccupied,
             BulkloadRefusal::DestinationExchangeUnsupported,
             BulkloadRefusal::SalvageBoundExceeded,
@@ -578,6 +667,39 @@ mod tests {
                 "code {code} is not SCREAMING_SNAKE_CASE"
             );
         }
+    }
+
+    #[test]
+    fn path_refusals_print_their_path_escaped() {
+        assert_eq!(
+            BulkloadRefusal::SpaceExhausted(Some(b"/tmp/a\nb".to_vec())).to_string(),
+            "SPACE_EXHAUSTED path=\"/tmp/a\\nb\""
+        );
+        assert_eq!(
+            BulkloadRefusal::SpaceExhausted(None).to_string(),
+            "SPACE_EXHAUSTED"
+        );
+        assert_eq!(
+            BulkloadRefusal::GitSourceAlternates(b"/s/objects/info/alternates".to_vec())
+                .to_string(),
+            "GIT_SOURCE_ALTERNATES path=\"/s/objects/info/alternates\""
+        );
+    }
+
+    #[test]
+    fn a_full_disk_classifies_ahead_of_every_other_phrase() {
+        assert_eq!(
+            StderrClass::of(b"fatal: unable to write: No space left on device"),
+            StderrClass::NoSpace
+        );
+        assert_eq!(
+            StderrClass::of(b"error: cannot create file: Disk quota exceeded\nfatal: bad object"),
+            StderrClass::NoSpace
+        );
+        assert_eq!(
+            StderrClass::of(b"fatal: bad object HEAD"),
+            StderrClass::BadObject
+        );
     }
 
     #[test]

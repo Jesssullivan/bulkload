@@ -38,6 +38,8 @@ if [ "$1" = preflight ]; then
 fi
 # Which pmset a rep would run (the shim directory, or nothing).
 command -v pmset >> "$0.pmset" || echo none >> "$0.pmset"
+# The lever knob a rep ran with (--b-env), or unset.
+echo "${BULKLOAD_LOOPBACK_HANDOFF:-unset}" >> "$0.env"
 # Like the real bench: with --informational (dry run, under load) and the host
 # outside the R-N81 gate, rows say gated=false and the verdict is informational
 # with no wins; --only runs one arm and gives a diagnostic verdict.
@@ -1004,6 +1006,45 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("R-N81", rulings)
         self.assertIn("not required under load", md)
         self.assertNotIn("(R-N91).", md)
+
+    def test_an_inherited_bulkload_variable_is_refused(self) -> None:
+        # OI-1003-Q154 review: a variable the harness inherits would reach
+        # every revision's reps unrecorded; a lever arm is --b-env only.
+        with mock.patch.dict(os.environ, {"BULKLOAD_LOOPBACK_HANDOFF": "0"}):
+            self.assertEqual(self.main(self.under_load()), 2)
+            self.assertIn("BULKLOAD_LOOPBACK_HANDOFF", self.out.getvalue())
+            self.assertEqual(self.main(self.gated()), 2)
+            self.assertEqual(self.main(["--build-only"]), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_b_env_reaches_the_b_reps_only_and_is_recorded(self) -> None:
+        knob = "BULKLOAD_LOOPBACK_HANDOFF=0"
+        self.assertEqual(self.main([*self.under_load(), "--b-env", knob]), 0)
+        report = self.report()
+        self.assertEqual(report["b_env"], {"BULKLOAD_LOOPBACK_HANDOFF": "0"})
+        seen = (self.tmp / "bench.env").read_text().split()
+        labels = [r["label"] for r in report["reps"]]
+        self.assertEqual(labels, ["B", "A", "B", "A", "B", "V4"])
+        self.assertEqual(seen, ["0", "unset", "0", "unset", "0", "unset"])
+        for rep in report["reps"]:
+            expected = {"BULKLOAD_LOOPBACK_HANDOFF": "0"} if rep["label"] == "B" else {}
+            self.assertEqual(rep["env"], expected, rep["label"])
+        md = self.evidence_md()
+        self.assertIn(f"`{knob}`", md)
+        self.assertIn(f"| 0 | B ({knob}) |", md)
+        self.assertIn("| 1 | A |", md)
+
+    def test_b_env_refusals(self) -> None:
+        knob = "BULKLOAD_LOOPBACK_HANDOFF=0"
+        # A gated sample runs B as built; a lever arm is informational.
+        self.assertEqual(self.main([*self.gated(), "--b-env", knob]), 2)
+        self.assertEqual(self.main(["--build-only", "--b-env", knob]), 2)
+        for bad in ("FOO=1", "BULKLOAD_X", "=0", "bulkload_x=1"):
+            self.assertEqual(self.main([*self.under_load(), "--b-env", bad]), 2, bad)
+        self.assertEqual(
+            self.main([*self.under_load(), "--b-env", knob, "--b-env", knob]), 2
+        )
+        self.assertFalse((self.tmp / "work").exists())
 
     def test_under_load_records_coordinator_quiet_as_acknowledged_only(self) -> None:
         self.assertEqual(self.main([*self.under_load(), "--coordinator-quiet"]), 0)

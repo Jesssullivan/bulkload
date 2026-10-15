@@ -251,54 +251,144 @@ pub fn partial_clone(repo: &Path) -> Result<bool> {
             }
         }
     }
+    Ok(alternates_walk(repo)?.promisor)
+}
+
+/// What [`alternates_walk`] found under one source's object store.
+#[derive(Debug, Default)]
+pub(crate) struct AlternatesWalk {
+    /// A `.promisor` pack in a followed store (the walk stops there).
+    pub promisor: bool,
+    /// Every store the walk followed, the source's own first, each once, in
+    /// the order Git links them.
+    pub stores: Vec<PathBuf>,
+    /// Each alternates file with an entry naming a directory Git cannot
+    /// open: a lender moved or deleted after `clone --shared`.
+    pub missing: Vec<PathBuf>,
+}
+
+/// The source's object store and every store it borrows through
+/// `objects/info/alternates`, walked as Git links them (S4, #219).
+///
+/// Git links alternates depth first, in file order, and links each store
+/// once: an entry naming the primary store, or a store already linked (by
+/// its real path), is skipped, so a self-reference, a cycle or a diamond
+/// costs no depth. Git reads alternates files at most six levels down. The
+/// capture's private repository borrows the source's store, one level more
+/// than the source itself, so a store five levels below the source is the
+/// deepest the private repository reads: an entry there naming a store not
+/// yet linked names a store no capture reads, and refuses
+/// `GIT_SOURCE_ALTERNATES` with that alternates file, before any export. So
+/// does a quoted entry, which Git unquotes and this walk does not. An entry
+/// naming a missing directory is skipped, as Git skips it, and recorded:
+/// the capture names that file if the export then misses an object
+/// ([`missing_alternate`]). Every store this walk follows, the bundle
+/// follows: it packs reachable objects wherever they are stored, and a
+/// landing built from it borrows nothing. The estimate probe's walk
+/// ([`estimate::PROBE_SCRIPT`]) applies the same rules.
+///
+/// # Errors
+/// `GIT_SOURCE_ALTERNATES` for alternates no capture follows; refuses a
+/// store or alternates file it cannot read.
+pub(crate) fn alternates_walk(repo: &Path) -> Result<AlternatesWalk> {
     let objects = PathBuf::from(text(git(repo).args([
         "rev-parse",
         "--path-format=absolute",
         "--git-path",
         "objects",
     ]))?);
-    promisor_packs(&objects, 0)
+    let mut walk = AlternatesWalk::default();
+    let mut linked = std::collections::BTreeSet::new();
+    linked.insert(fs::canonicalize(&objects).refuse_at("git_carry::alternates_walk")?);
+    walk.stores.push(objects.clone());
+    link_alternates(&objects, 0, &mut linked, &mut walk)?;
+    Ok(walk)
 }
 
-// A `.promisor` pack in `store` or, through `info/alternates`, in any store it
-// borrows from, at most five levels deep (the estimate probe's bound).
-fn promisor_packs(store: &Path, depth: u8) -> Result<bool> {
+/// The alternates file a failed capture should name (S4, #219).
+///
+/// It is the first whose entry names a store Git cannot open, when
+/// `refusal` is a Git child that failed on what such a store leaves: a
+/// missing object (`bad_object`),
+/// or a revision that no longer resolves (`other`; Git's own error is then
+/// only "unable to normalize alternate object path"). A child that failed
+/// for a named cause (auth, network, not a repository, no space) keeps it,
+/// as does any other refusal, and a source with no such entry names none.
+#[must_use]
+pub fn missing_alternate(repo: &Path, refusal: &BulkloadRefusal) -> Option<PathBuf> {
+    use estimate::StderrClass;
+    if !matches!(
+        refusal,
+        BulkloadRefusal::GitChildFailed(StderrClass::BadObject | StderrClass::Other)
+    ) {
+        return None;
+    }
+    alternates_walk(repo).ok()?.missing.into_iter().next()
+}
+
+// One store of [`alternates_walk`] at `depth` below the source's own.
+fn link_alternates(
+    store: &Path,
+    depth: u8,
+    linked: &mut std::collections::BTreeSet<PathBuf>,
+    walk: &mut AlternatesWalk,
+) -> Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
+    const SITE: &str = "git_carry::alternates_walk";
     match fs::read_dir(store.join("pack")) {
         Ok(entries) => {
             for entry in entries {
-                if Path::new(&entry.refuse_at("git_carry::promisor_packs")?.file_name())
+                if Path::new(&entry.refuse_at(SITE)?.file_name())
                     .extension()
                     .is_some_and(|extension| extension == "promisor")
                 {
-                    return Ok(true);
+                    walk.promisor = true;
+                    return Ok(());
                 }
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(crate::refuse::io(&error, "git_carry::promisor_packs")),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
     }
-    let alternates = match fs::read(store.join("info/alternates")) {
+    let file = store.join("info/alternates");
+    let alternates = match fs::read(&file) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(crate::refuse::io(&error, "git_carry::promisor_packs")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
     };
-    if depth >= 5 {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
+    let unfollowable =
+        || BulkloadRefusal::GitSourceAlternates(file.as_os_str().as_bytes().to_vec());
     for line in alternates.split(|byte| *byte == b'\n') {
         if line.is_empty() || line.starts_with(b"#") {
             continue;
         }
         if line.starts_with(b"\"") {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
+            return Err(unfollowable());
         }
         let alternate = store.join(std::ffi::OsStr::from_bytes(line));
-        if alternate.is_dir() && promisor_packs(&alternate, depth + 1)? {
-            return Ok(true);
+        // Git cannot open it either; skipped, and named if it is missed.
+        let Ok(real) = fs::canonicalize(&alternate) else {
+            walk.missing.push(file.clone());
+            continue;
+        };
+        if !real.is_dir() {
+            walk.missing.push(file.clone());
+            continue;
+        }
+        if linked.contains(&real) {
+            continue;
+        }
+        if depth >= 5 {
+            return Err(unfollowable());
+        }
+        linked.insert(real);
+        walk.stores.push(alternate.clone());
+        link_alternates(&alternate, depth + 1, linked, walk)?;
+        if walk.promisor {
+            return Ok(());
         }
     }
-    Ok(false)
+    Ok(())
 }
 
 /// Refuse a partial-clone source before any other read (WP1 PR 1).
@@ -316,6 +406,13 @@ pub fn refuse_partial_clone(repo: &Path) -> Result<()> {
 // A v1 Git child run to completion; a non-zero exit refuses
 // GIT_CHILD_FAILED with its stderr class (WP3, R-N121).
 fn output(command: &mut Command) -> Result<Vec<u8>> {
+    // A test can make this child fail as one that ran out of space does.
+    #[cfg(test)]
+    if scratch_fault::take(scratch_fault::Site::Child).is_err() {
+        return Err(estimate::child_failed(
+            b"fatal: write error: No space left on device",
+        ));
+    }
     estimate::run_git(command, None)
 }
 
@@ -930,7 +1027,6 @@ pub struct CarriedAuthority {
 // reflog is read only when `inventory` lists refs/stash, exactly as the key
 // always read it. No census walk.
 fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
-    let head = text(git(repo).args(["rev-parse", "--verify", "HEAD"]))?;
     let symbolic = git(repo)
         .args(["symbolic-ref", "-q", "HEAD"])
         .output()
@@ -938,6 +1034,7 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
     if !symbolic.status.success() && symbolic.status.code() != Some(1) {
         return Err(estimate::child_failed(&symbolic.stderr));
     }
+    let head = carried_head(repo, symbolic.status.success())?;
     let (_, index, gitlinks) = source_index(repo)?;
     let exclude_path = text(git(repo).args([
         "rev-parse",
@@ -965,6 +1062,28 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
         boundary: shallow::frontier(repo)?,
         gitlinks,
     })
+}
+
+// HEAD's commit, as `rev-parse --verify HEAD` names it. S4 (#162, #219): a
+// bare repository whose HEAD is a branch that does not exist (unborn, as
+// `init --bare` or a mirror of a renamed default branch leaves it) is a valid
+// state, carried as ref custody: its refs and its symbolic HEAD, and the
+// empty string here, so no `refs/carry-export/head` is exported. Any other
+// HEAD that does not resolve still refuses as the child failed.
+fn carried_head(repo: &Path, symbolic: bool) -> Result<String> {
+    let resolved = git(repo)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .refuse_at("git_carry::carried_head")?;
+    if resolved.status.success() {
+        return String::from_utf8(resolved.stdout)
+            .map(|head| head.trim_end().to_owned())
+            .map_err(|_| BulkloadRefusal::GitInventoryMalformed);
+    }
+    if resolved.status.code() == Some(1) && symbolic && bare_root(repo)? {
+        return Ok(String::new());
+    }
+    Err(estimate::child_failed(&resolved.stderr))
 }
 
 /// The typed inputs of the reusable capture key for `repo`, default policy.
@@ -1454,36 +1573,46 @@ fn refusing_drift(export: Exported) -> Result<Export> {
     }
 }
 
-/// The identity of the source's pack listing: every entry of
-/// `<common>/objects/pack` by name, inode and size, hashed in name order. A
-/// `gc`, `repack` or `prune --expire` writes or removes packs, so it changes
-/// this; reading through the store never does. A missing pack directory is
-/// the empty listing.
-fn pack_listing(common: &Path) -> Result<[u8; 32]> {
+/// The identity of the source's pack listings: every entry of each store's
+/// `pack` directory by name, inode and size, hashed in name order, store by
+/// store. `stores` are the source's own and every store it borrows
+/// ([`alternates_walk`]; S4, #219): a `gc`, `repack` or `prune --expire` in
+/// a lender rewrites what the capture reads as surely as one in the source.
+/// A rewrite writes or removes packs, so it changes this; reading through a
+/// store never does. A missing pack directory is the empty listing.
+fn pack_listing(stores: &[PathBuf]) -> Result<[u8; 32]> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
-    let mut entries = Vec::new();
-    match fs::read_dir(common.join("objects/pack")) {
-        Ok(listing) => {
-            for entry in listing {
-                let entry = entry.refuse_at("git_carry::pack_listing")?;
-                // A pack removed between the listing and its stat is the
-                // rewrite itself; record it as absent.
-                let (ino, size) = entry
-                    .metadata()
-                    .map_or((0, u64::MAX), |meta| (meta.ino(), meta.size()));
-                entries.push((entry.file_name().as_bytes().to_vec(), ino, size));
-            }
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(crate::refuse::io(&error, "git_carry::pack_listing")),
-    }
-    entries.sort_unstable();
     let mut hash = blake3::Hasher::new();
-    for (name, ino, size) in &entries {
-        framed(&mut hash, name)?;
-        hash.update(&ino.to_le_bytes());
-        hash.update(&size.to_le_bytes());
+    for store in stores {
+        let mut entries = Vec::new();
+        match fs::read_dir(store.join("pack")) {
+            Ok(listing) => {
+                for entry in listing {
+                    let entry = entry.refuse_at("git_carry::pack_listing")?;
+                    // A pack removed between the listing and its stat is the
+                    // rewrite itself; record it as absent.
+                    let (ino, size) = entry
+                        .metadata()
+                        .map_or((0, u64::MAX), |meta| (meta.ino(), meta.size()));
+                    entries.push((entry.file_name().as_bytes().to_vec(), ino, size));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(crate::refuse::io(&error, "git_carry::pack_listing")),
+        }
+        entries.sort_unstable();
+        framed(&mut hash, store.as_os_str().as_bytes())?;
+        hash.update(
+            &u64::try_from(entries.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        for (name, ino, size) in &entries {
+            framed(&mut hash, name)?;
+            hash.update(&ino.to_le_bytes());
+            hash.update(&size.to_le_bytes());
+        }
     }
     Ok(*hash.finalize().as_bytes())
 }
@@ -1516,10 +1645,13 @@ fn export_repository_inner(
     // not parse refuses GIT_INVENTORY_MALFORMED. Exactly those two are the
     // rewrite's footprint; every other refusal stays a refusal.
     let common = common_repository(&repo)?;
-    let packs = pack_listing(&common)?;
+    // S4 (#219): the lenders' listings too; the private repository reads
+    // through them as it reads through the source's own store.
+    let stores = alternates_walk(&repo)?.stores;
+    let packs = pack_listing(&stores)?;
     match export_pass(&repo, &capture, &common, options) {
         Err(BulkloadRefusal::GitInventoryMalformed | BulkloadRefusal::GitChildFailed(_))
-            if pack_listing(&common)? != packs =>
+            if pack_listing(&stores)? != packs =>
         {
             let mut drift = CaptureDrift::default();
             drift.extend([DriftRow::seat(
@@ -1805,12 +1937,76 @@ pub(crate) const fn refuse_bare_capture(staged: &StagedBundle) -> Result<()> {
 #[derive(Debug)]
 struct PrivateDir(PathBuf);
 
+/// Test-only (S4, #220): the next write this thread makes at an armed site
+/// fails with the armed errno, as a full or over-quota filesystem fails it.
+/// Each arming fails one write, in arming order. Thread-local, so parallel
+/// tests never see each other's fault.
+#[cfg(test)]
+pub(crate) mod scratch_fault {
+    use std::cell::RefCell;
+
+    /// Where an armed fault fails a write.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Site {
+        /// The mkdir of a private directory, in any parent it tries.
+        Mkdir,
+        /// The private copy of the source index (`source_index`).
+        IndexWrite,
+        /// The create of a bundle stage (`copy_hashing`).
+        StageCreate,
+        /// A write into a bundle stage (`copy_hashing`).
+        StageWrite,
+        /// The next v1 Git child (`output`): it fails as a child whose
+        /// stderr says no space left on device (the errno is not read).
+        Child,
+    }
+
+    thread_local! {
+        static ARMED: RefCell<Vec<(Site, i32)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Fail the next private-directory mkdir with `errno`.
+    pub fn arm(errno: i32) {
+        arm_at(Site::Mkdir, errno);
+    }
+
+    /// Fail the next write at `site` with `errno`.
+    pub fn arm_at(site: Site, errno: i32) {
+        ARMED.with(|armed| armed.borrow_mut().push((site, errno)));
+    }
+
+    /// The fault armed first at `site`, consumed.
+    pub(super) fn take(site: Site) -> std::io::Result<()> {
+        ARMED.with(|armed| {
+            let mut armed = armed.borrow_mut();
+            armed
+                .iter()
+                .position(|(armed_site, _)| *armed_site == site)
+                .map_or(Ok(()), |index| {
+                    Err(std::io::Error::from_raw_os_error(armed.remove(index).1))
+                })
+        })
+    }
+}
+
+// mkdir 0700 `candidate`; a test can arm a fault first.
+fn create_private(candidate: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    #[cfg(test)]
+    scratch_fault::take(scratch_fault::Site::Mkdir)?;
+    fs::DirBuilder::new().mode(0o700).create(candidate)
+}
+
 impl PrivateDir {
     fn create(near: Option<&Path>) -> Result<Self> {
-        use std::os::unix::fs::DirBuilderExt;
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let temp = std::env::temp_dir();
+        // S4 (#220): a full or over-quota filesystem names the parent that
+        // ran out (`SPACE_EXHAUSTED`), and is the verb's refusal even when a
+        // later parent then fails otherwise; else the last parent's refusal,
+        // with its errno. Never a bare IO with neither.
+        let mut refused = BulkloadRefusal::ContractSelfInconsistent;
         for parent in near.into_iter().chain(std::iter::once(temp.as_path())) {
             loop {
                 let candidate = parent.join(format!(
@@ -1818,15 +2014,21 @@ impl PrivateDir {
                     std::process::id(),
                     NEXT.fetch_add(1, Ordering::Relaxed)
                 ));
-                match fs::DirBuilder::new().mode(0o700).create(&candidate) {
+                match create_private(&candidate) {
                     Ok(()) => return Ok(Self(candidate)),
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                     // This parent refuses a private directory; try the next.
-                    Err(_) => break,
+                    Err(error) => {
+                        if !matches!(refused, BulkloadRefusal::SpaceExhausted(_)) {
+                            refused =
+                                crate::refuse::io_in(&error, parent, "git_carry::private_dir");
+                        }
+                        break;
+                    }
                 }
             }
         }
-        Err(BulkloadRefusal::Io(None))
+        Err(refused)
     }
 
     // Only in `parent`, never TMPDIR: a stage whose contents are renamed into
@@ -1897,7 +2099,7 @@ impl StagedBundle {
 
 // Copy `source` to a new private file while hashing it: one read, one write,
 // counted as `read_bundle_stage_bytes`, `blake3_bundle_stage_bytes` and
-// `write_bundle_stage_bytes`.
+// `write_bundle_stage_bytes`. `destination` is a file in a [`PrivateDir`].
 fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
     use crate::counters::{add_len, update, Counter};
     use std::io::{Read, Write};
@@ -1907,12 +2109,30 @@ fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(source)
         .refuse_at("git_carry::copy_hashing")?;
-    let mut to = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(destination)
-        .refuse_at("git_carry::copy_hashing")?;
+    // S4 (#220): a stage that fills its filesystem, at its create (inodes,
+    // directory blocks) or at a write, names the directory the stage's
+    // private directory was made in. The private directory itself is gone
+    // once the refusal drops it.
+    let full = |error: std::io::Error| {
+        let directory = destination
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(destination);
+        crate::refuse::io_in(&error, directory, "git_carry::copy_hashing")
+    };
+    #[cfg(test)]
+    let armed = scratch_fault::take(scratch_fault::Site::StageCreate);
+    #[cfg(not(test))]
+    let armed = Ok(());
+    let mut to = armed
+        .and_then(|()| {
+            fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(destination)
+        })
+        .map_err(full)?;
     let mut hash = blake3::Hasher::new();
     let mut buffer = vec![0; 1 << 20];
     loop {
@@ -1925,7 +2145,11 @@ fn copy_hashing(source: &Path, destination: &Path) -> Result<[u8; 32]> {
         add_len(Counter::BundleStageRead, count);
         let chunk = buffer.get(..count).ok_or(BulkloadRefusal::FrameCodec)?;
         update(&mut hash, Counter::HashBundleStage, chunk);
-        to.write_all(chunk).refuse_at("git_carry::copy_hashing")?;
+        #[cfg(test)]
+        let armed = scratch_fault::take(scratch_fault::Site::StageWrite);
+        #[cfg(not(test))]
+        let armed = Ok(());
+        armed.and_then(|()| to.write_all(chunk)).map_err(full)?;
         add_len(Counter::BundleStageWrite, count);
     }
     Ok(*hash.finalize().as_bytes())
@@ -1973,7 +2197,10 @@ fn carry_authority(
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
     capture_refs(&private, inventory, &authority.stash)?;
-    set_ref(&private, "refs/carry-export/head", &authority.head)?;
+    // An unborn HEAD (bare only, [`carried_head`]) names no commit to export.
+    if !authority.head.is_empty() {
+        set_ref(&private, "refs/carry-export/head", &authority.head)?;
+    }
     capture_administration(&private, authority)?;
     Ok(private)
 }
@@ -4853,7 +5080,17 @@ fn source_index(repo: &Path) -> Result<(PathBuf, Vec<u8>, Vec<NestedRepository>)
     // moment later (round-4 R2): every check reads a private copy of them.
     let scratch = PrivateDir::create(None)?;
     let carried = scratch.path().join("index");
-    fs::write(&carried, &before_index).refuse_at("git_carry::source_index")?;
+    let full = |error: std::io::Error| {
+        let directory = scratch.path().parent().unwrap_or_else(|| scratch.path());
+        crate::refuse::io_in(&error, directory, "git_carry::source_index")
+    };
+    #[cfg(test)]
+    let armed = scratch_fault::take(scratch_fault::Site::IndexWrite);
+    #[cfg(not(test))]
+    let armed = Ok(());
+    armed
+        .and_then(|()| fs::write(&carried, &before_index))
+        .map_err(full)?;
     let checked = |args: &[&str]| -> Result<Vec<u8>> {
         output(git(repo).env("GIT_INDEX_FILE", &carried).args(args))
     };
@@ -5045,12 +5282,44 @@ pub fn import_staged(repo: &Path, staged: &StagedBundle, source: &str) -> Result
     import_verified(repo, staged.path(), source)
 }
 
+/// Refuse a refs-import destination that is not a repository (S4, #183):
+/// `GIT_REPOSITORY_NOT_AT_PATH` when `repo` is missing, not a directory, or
+/// a directory Git (stopped at its parent) finds no repository in, such as
+/// an empty directory, an unfinished `git init` or a partial cleanup. Any
+/// other failure keeps its own refusal: an unreadable path is IO with its
+/// errno, never "not there".
+///
+/// # Errors
+/// As above.
+pub(crate) fn destination_repository(repo: &Path) -> Result<()> {
+    const SITE: &str = "git_carry::destination_repository";
+    if !repo.try_exists().refuse_at(SITE)? || !fs::metadata(repo).refuse_at(SITE)?.is_dir() {
+        return Err(BulkloadRefusal::GitRepositoryNotAtPath);
+    }
+    let found = git(repo)
+        .args(["rev-parse", "--absolute-git-dir"])
+        .output()
+        .refuse_at(SITE)?;
+    if found.status.success() {
+        return Ok(());
+    }
+    match estimate::child_failed(&found.stderr) {
+        BulkloadRefusal::GitChildFailed(estimate::StderrClass::NotARepository) => {
+            Err(BulkloadRefusal::GitRepositoryNotAtPath)
+        }
+        refusal => Err(refusal),
+    }
+}
+
 // `import_bundle` for a verb that already staged and checked its bundle, and
 // reads only the staged copy.
 pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Result<usize> {
     if !source_slug(source) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
+    // S4 (#183): before `bundle verify` reads its failure as a malformed
+    // bundle.
+    destination_repository(repo)?;
     let bundle = fs::canonicalize(bundle).refuse_at("git_carry::import_verified")?;
     verify_bundle(repo, &bundle)?;
     let listed = text(git(repo).args(["bundle", "list-heads"]).arg(&bundle))?;

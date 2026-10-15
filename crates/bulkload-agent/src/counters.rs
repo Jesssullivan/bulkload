@@ -177,6 +177,12 @@ counters! {
     WireBytesSent => "wire_bytes_sent",
     WireFramesReceived => "wire_frames_received",
     WireBytesReceived => "wire_bytes_received",
+    // Chunk payload bytes a local `copy`'s destination took from its
+    // in-process source by hand-off instead of reading them from the socket
+    // (OI-1003-Q154 levers 1 and 2). The source hashed exactly these bytes,
+    // so they are not in `blake3_dest_wire_verify_bytes`: every received
+    // byte is in exactly one of the two. Always 0 for `pull` and `serve`.
+    WireHandedBytes => "wire_handed_bytes",
     // BLAKE3 bytes hashed, by purpose.
     HashCaptureChunk => "blake3_capture_chunk_bytes",
     HashWireVerify => "blake3_dest_wire_verify_bytes",
@@ -225,6 +231,10 @@ counters! {
     // remembered so a rerun refuses it without a source read (#187 review).
     SqliteRefusedOutput => "sqlite_refused_output_commits",
     SqliteCommitNs => "sqlite_commit_ns",
+    // New stores created directly in WAL mode from the template, with no
+    // rollback-journal switch (OI-1003-Q154 lever 3a); 0 under
+    // `BULKLOAD_STORE_WAL_TEMPLATE=0`, the lever's A/B arm.
+    StoreWalTemplates => "store_wal_templates",
     // Destination publication events.
     FilesMaterialized => "files_materialized",
     DirectoriesFinished => "directories_finished",
@@ -292,6 +302,42 @@ counters! {
     // Provider `SQLite` snapshots that left a `-wal` beside a source that had
     // none: the empty `-wal` a WAL-aware open creates (OI-1003-Q72).
     SourceWalCreated => "source_wal_created",
+    // #218: `SQLite` snapshot seats (`--sqlite=snapshot`). Backups the
+    // transfer's source half completed.
+    SourceSqliteSnapshots => "source_sqlite_snapshots",
+    // Source bytes those backups read: pages stepped x page size, restarts
+    // included, plus the `-wal`'s size at the pre-stat (an upper bound on
+    // rebuilding its wal-index). Also added to the session's
+    // `source_bytes_read`; never part of `read_source_file_bytes`.
+    SourceSqliteBackupBytes => "source_sqlite_backup_bytes",
+    // Backups restarted because another connection committed between steps.
+    SourceSqliteBackupRestarts => "source_sqlite_backup_restarts",
+    // Nanoseconds a source connection was open, from open to close: in WAL
+    // mode it holds `SHARED` on the main file that long (OI-1003-Q16's lock,
+    // for the transfer and the `snapshot` verb alike).
+    SourceSqliteLockNs => "source_sqlite_lock_ns",
+    // Snapshot captures whose main file or `-wal` moved, or was stamped
+    // within the racy allowance, across the backup: sent, never recorded.
+    SourceSqliteUnsettled => "source_sqlite_unsettled",
+    // Foreign-key violations carried in snapshots, not refused (informational).
+    SourceSqliteFkViolations => "source_sqlite_fk_violations",
+    // The private re-read of a snapshot slot to chunk it and serve chunk
+    // requests: not a source read.
+    SourceSnapshotRead => "read_source_snapshot_bytes",
+    // Live `-wal`, `-shm` and `-journal` files covered by their database's
+    // snapshot (never carried).
+    SqliteSidecarsCovered => "sqlite_sidecars_covered",
+    // Snapshots the destination verified (`integrity_check`) before publish,
+    // and the bytes of those files.
+    DestSqliteVerified => "dest_sqlite_verified",
+    DestSqliteVerifyBytes => "dest_sqlite_verify_bytes",
+    // Snapshot outputs this store published that a changed store's new
+    // snapshot replaced through the superseding exchange (OI-1003-Q146).
+    DestSqliteSuperseded => "dest_sqlite_superseded",
+    // Snapshot publications (a rename or a superseding exchange) refused at
+    // their last look because a `-wal`, `-journal` or `-shm` had appeared
+    // beside the path since the entry was decided (OI-1003-Q146).
+    DestSqliteSidecarRefused => "dest_sqlite_sidecar_refused",
 }
 
 const COUNT: usize = Counter::ALL.len();

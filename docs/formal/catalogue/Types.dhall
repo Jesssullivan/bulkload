@@ -1,19 +1,21 @@
 {- Types of docs/formal's typed catalogue (OI-1003-Q32, OI-1003-Q43).
 
    Catalogue.dhall uses these to describe every TLC config of each module
-   (BulkloadTransfer.tla, and GitCarry.tla through GitCarry.dhall) and the
-   traceability row of every model property. `just tla-render` renders each
-   module's run order (configs.tsv, configs_gc.tsv) and every MC_*.cfg from
-   it, and `just tla-check` refuses to run TLC unless the committed files
-   equal that rendering and every name below is grounded in its module
-   (README.md, "Hybrid roles").
+   (BulkloadTransfer.tla, GitCarry.tla through GitCarry.dhall,
+   SqliteCarry.tla through SqliteCarry.dhall, whose own types it holds, and
+   DirectoryRecords.tla through Directories.dhall) and the traceability row
+   of every model property. `just tla-render` renders each module's run
+   order (configs.tsv, configs_gc.tsv, configs_sq.tsv, configs_dir.tsv) and
+   every MC_*.cfg from it, and `just tla-check` refuses to run TLC unless
+   the committed files equal that rendering and every name below is
+   grounded in its module (README.md, "Hybrid roles").
 
    Union labels are the TLA+ names themselves: `showConstructor` turns a
    label into the name TLC reads, so the catalogue cannot misspell one, and
    tla-check's grounding step finds every label in the .tla. The names are
    frozen (README.md, "Frozen names"); do not rename a label.
 -}
-let Seat = < a | b >
+let Seat = < a | b | c >
 
 let SupersedeMode = < off | check_rename | exchange >
 
@@ -515,7 +517,7 @@ let witnessSelf = \(w : Witness) -> merge witnessTable w
    module, with its own budget self-test first. The table is merged over the
    union, so a module added without an entry does not type-check.
 -}
-let Module = < BulkloadTransfer | GitCarry | DirectoryRecords >
+let Module = < BulkloadTransfer | GitCarry | SqliteCarry | DirectoryRecords >
 
 {- How tla-check grounds a module's code symbols. Either way only a Rust
    source under crates/ outside a tests/ directory counts, never a data
@@ -551,9 +553,16 @@ let moduleTable =
         , tsv = "configs_gc.tsv"
         , symbols = SymbolMatch.definition
         }
+      , SqliteCarry =
+        { module = Module.SqliteCarry
+        , index = 2
+        , spec = "SqliteCarry.tla"
+        , tsv = "configs_sq.tsv"
+        , symbols = SymbolMatch.code
+        }
       , DirectoryRecords =
         { module = Module.DirectoryRecords
-        , index = 2
+        , index = 3
         , spec = "DirectoryRecords.tla"
         , tsv = "configs_dir.tsv"
         , symbols = SymbolMatch.code

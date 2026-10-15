@@ -166,7 +166,8 @@ io-partial-write-alone:
 # alone; and the in-crate directory resume proofs (#74 review B1 and round 2
 # N1). Both features are inert until a test arms them: a fault point fires
 # only under `BULKLOAD_FAULT`, and a traced call records only while a
-# recorder is attached. CI runs this as the separate `fault-harness`
+# recorder is attached. Then the same suites in the hand-off's off arm
+# (`handoff-off`). CI runs this as the separate `fault-harness`
 # terminal gate, in parallel with the source gate (R-N122). The harness
 # builds go to their own target dir, so `target/debug/bulkload-agent` is
 # never replaced by a fault-enabled binary. The feature clippy pass stays in
@@ -178,6 +179,23 @@ fault-harness:
     cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::
     cd {{ root }} && {{ just_executable() }} io-partial-write-alone
     cd {{ root }} && {{ just_executable() }} resume-power-loss
+    cd {{ root }} && {{ just_executable() }} handoff-off
+
+# The loopback hand-off's off arm (OI-1003-Q154 review). A local `copy`
+# takes the hand-off by default (levers 1 and 2: handed chunks, not
+# hashed again on the destination, no per-frame flush), so every
+# copy-based crash, power-loss and resume suite exercises that path only.
+# This arm runs them again with `BULKLOAD_LOOPBACK_HANDOFF=0`: the plain
+# protocol that `pull` runs across hosts, with the destination's
+# worker-side verify, the inline verify before a stage, and every frame
+# flushed as written. Crash children inherit the variable. `w3_engine`
+# runs first in the same environment and proves the arm took: it asserts
+# `blake3_dest_wire_verify_bytes == bytes_received` and
+# `wire_handed_bytes == 0` when the variable is `0`.
+handoff-off:
+    cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine
+    cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test s3_transfer_resume --test sqlite_carry
+    cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 {{ just_executable() }} resume-power-loss
 
 # Resume power-loss proofs, lib tests that need `io-trace`, run in the fault
 # gate's feature-union build (OI-1003-Q81): the directory
@@ -448,8 +466,8 @@ import? "justfile.flywheel"
 
 # docs/formal's typed catalogue (OI-1003-Q32, OI-1003-Q43): render each
 # module's run order (configs.tsv for BulkloadTransfer.tla, configs_gc.tsv
-# for GitCarry.tla, configs_dir.tsv for DirectoryRecords.tla) and every
-# MC_*.cfg from docs/formal/catalogue/
+# for GitCarry.tla, configs_sq.tsv for SqliteCarry.tla, configs_dir.tsv for
+# DirectoryRecords.tla) and every MC_*.cfg from docs/formal/catalogue/
 # Catalogue.dhall into OUT (default docs/formal). Every MC_*.cfg already in
 # OUT is removed first, so a config dropped from the catalogue leaves no
 # stale file. dhall-to-json evaluates the catalogue, which also checks its
@@ -517,8 +535,9 @@ tla-render out="" json="":
 
 # TLA+ models of the proof package (OI-1003-Q7; docs/formal/README.md):
 # BulkloadTransfer.tla (wire v5, Held, the group commits and resume),
-# GitCarry.tla (git carry's chain and base custody, OI-1003-Q43) and
-# DirectoryRecords.tla (directory records and their batching, R-N102,
+# GitCarry.tla (git carry's chain and base custody, OI-1003-Q43),
+# SqliteCarry.tla (the SQLite snapshot seat of wire v6, #218, OI-1003-Q146)
+# and DirectoryRecords.tla (directory records and their batching, R-N102,
 # OI-1003-Q143).
 # Standalone and on demand: no tier depends on it, so check-fast,
 # check-optional, check-full and CI never start TLC. TLC comes from the

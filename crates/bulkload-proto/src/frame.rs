@@ -1,4 +1,4 @@
-//! Wire v5: bounded frames for a full-duplex bulkload session (R-N118).
+//! Wire v6: bounded frames for a full-duplex bulkload session (R-N118).
 //!
 //! Every frame is a 4-byte big-endian body length, then a one-byte tag, then
 //! the body:
@@ -10,7 +10,12 @@
 //! - [`TAG_PACK_DATA`]: reserved for the Git sub-stream (W6), a fixed
 //!   [`PACK_HEADER_BYTES`]-byte [`PackDataHeader`] and raw pack bytes.
 //!
-//! v5 is a hard cut (R-N59/R-N118): there is no v3 or v4 codec. The session
+//! v6 is a hard cut (R-N59/R-N118): there is no v5 codec. It adds the
+//! `SQLite` snapshot seat (#218): the session's [`SqliteMode`] in
+//! [`Control::Open`], a database's `-wal` identity in [`Control::Entry`],
+//! the [`Control::SqliteSidecar`] and [`Control::SqliteSnapshot`] frames,
+//! and `SQLite`'s result code in [`Control::Refused`]. Every other frame is
+//! v5's, the W6 reserved frames included. The session
 //! opens with [`Control::Open`], which carries [`PROTO_VERSION`] and
 //! [`wire_id`], the BLAKE3 of [`WIRE_SCHEMA`]; a peer with either one
 //! different refuses the session. A corrupt, truncated or oversized frame is
@@ -23,8 +28,8 @@ use crate::refusal::BulkloadRefusal;
 use crate::row::RowSchema;
 use crate::Result;
 
-/// Wire protocol version (R-N118: the W4 wire is v5).
-pub const PROTO_VERSION: u16 = 5;
+/// Wire protocol version (R-N118; v6 adds the `SQLite` snapshot seat, #218).
+pub const PROTO_VERSION: u16 = 6;
 
 /// Bytes of frame header carrying the body length.
 pub const LENGTH_PREFIX_BYTES: usize = 4;
@@ -54,15 +59,15 @@ pub const PACK_HEADER_BYTES: usize = 32;
 
 /// The wire schema whose BLAKE3 is [`wire_id`]. Any change to a frame's
 /// layout, a [`Control`] variant or its order must change this text.
-pub const WIRE_SCHEMA: &str = "bulkload wire v5 (2026-10-02)
+pub const WIRE_SCHEMA: &str = "bulkload wire v6 (2026-10-08)
 frame: u32be body_len, u8 tag, body
 tag 0x01 control: postcard Control, the whole body and nothing after it
 tag 0x02 data: 64-byte header (u64le entry, u32le index, u32le size, u64le offset, [u8;32] digest, [u8;8] zero) + size payload bytes
 tag 0x03 pack_data (reserved, W6): 32-byte header (u32le sub, u32le segment, u64le offset, u32le size, [u8;12] zero) + size payload bytes
-control 0 Open{proto u16, wire_id [u8;32], root bytes, state bytes}
+control 0 Open{proto u16, wire_id [u8;32], root bytes, state bytes, sqlite SqliteMode}
 control 1 Start{authority bytes}
-control 2 Entry{entry u64, row RowSchema}
-control 3 Refused{entry Option<u64>, rel_path bytes, code string}
+control 2 Entry{entry u64, row RowSchema, wal Option<SidecarId>}
+control 3 Refused{entry Option<u64>, rel_path bytes, code string, sqlite_code Option<i32>}
 control 4 EngineTemporary{rel_path bytes}
 control 5 WalkDone{entries u64}
 control 6 Decide{entry u64, decision Decision}
@@ -80,6 +85,10 @@ control 17 GitRefs{sub u32, updates Vec<RefUpdate>} (reserved, W6)
 control 18 GitCommitted{sub u32, transaction_digest [u8;32]} (reserved, W6)
 control 19 GitResume{sub u32, durable_segments Vec<u32>} (reserved, W6)
 control 20 Held{entry u64, held bool}
+control 21 SqliteSidecar{rel_path bytes, database bytes}
+control 22 SqliteSnapshot{entry u64, size u64, wal Option<SidecarId>}
+sqlitemode 0 Refuse, 1 Snapshot
+sidecarid {dev u64, ino u64, size u64, mtime_ns i128, ctime_ns i128}
 decision 0 Skip, 1 Reuse, 2 Send, 3 WantManifest, 4 Refuse{code string}
 subkind 0 GitPack{repo bytes, refs_digest [u8;32]}
 chunkspec {digest [u8;32], size u64}
@@ -134,6 +143,42 @@ pub enum Decision {
     Refuse { code: String },
 }
 
+/// How the destination asks the source to treat `SQLite` provider state
+/// (#218). The destination chooses it; it is carried in
+/// [`Control::Open`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SqliteMode {
+    /// v5's behaviour: a seat whose first bytes are a `SQLite` database or
+    /// WAL magic, and every `-wal`, `-shm` or `-journal` by name, is refused
+    /// `SQLITE_STATE_CHANGED`. No raw `SQLite` byte crosses the wire.
+    #[default]
+    Refuse,
+    /// A database seat is carried as a backup-API snapshot the source takes
+    /// into its private state ([`Control::SqliteSnapshot`]); its live
+    /// sidecars are never carried ([`Control::SqliteSidecar`]). WAL magic
+    /// and orphan sidecars stay refused.
+    Snapshot,
+}
+
+/// The stat identity of a database's `<name>-wal` sidecar (#218).
+///
+/// With the main file's row it keys a snapshot seat, because a WAL-mode
+/// commit writes the `-wal` and leaves the main file untouched until a
+/// checkpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SidecarId {
+    /// Containing device id.
+    pub dev: u64,
+    /// Inode number.
+    pub ino: u64,
+    /// Apparent size in bytes.
+    pub size: u64,
+    /// Modification time, nanoseconds since the unix epoch.
+    pub mtime_ns: i128,
+    /// Inode change time, nanoseconds since the unix epoch.
+    pub ctime_ns: i128,
+}
+
 /// The kind of a Git sub-stream (reserved, W6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SubKind {
@@ -161,24 +206,39 @@ pub struct RefUpdate {
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Control {
-    /// →S. Opens the session: protocol and schema identity, and the source
-    /// root and private source state to use.
+    /// →S. Opens the session: protocol and schema identity, the source
+    /// root and private source state to use, and how `SQLite` provider state
+    /// is treated.
     Open {
         proto: u16,
         wire_id: [u8; 32],
         root: Vec<u8>,
         state: Vec<u8>,
+        sqlite: SqliteMode,
     },
     /// →D. The source's authority: its store and root identity.
     Start { authority: Vec<u8> },
-    /// →D. One scanned seat, numbered in stream order.
-    Entry { entry: u64, row: RowSchema },
+    /// →D. One scanned seat, numbered in stream order. `wal`: in
+    /// [`SqliteMode::Snapshot`] only, the identity of a regular `<name>-wal`
+    /// beside the seat, which keys a snapshot seat with the row; always
+    /// `None` in [`SqliteMode::Refuse`].
+    Entry {
+        entry: u64,
+        row: RowSchema,
+        wal: Option<SidecarId>,
+    },
     /// →D. A refusal: of a walked seat (`entry` `None`) or of an entry's
     /// capture (after any of its data frames).
     Refused {
         entry: Option<u64>,
         rel_path: Vec<u8>,
         code: String,
+        /// `SQLite`'s extended result code, for `SQLITE_BACKUP_FAILED` only
+        /// ([`BulkloadRefusal::sqlite_code`]): the receiver reads the
+        /// backup's corruption from it (OI-1003-Q148). `None` for every
+        /// other code; a peer that sends one with another code violates
+        /// the protocol.
+        sqlite_code: Option<i32>,
     },
     /// →D. A source file in the materializer's tagged temporary-name grammar:
     /// recorded by the walk and never carried. Not a refusal.
@@ -262,6 +322,27 @@ pub enum Control {
     /// and the capture is not recorded (R25: a committed capture never
     /// costs a source read again).
     Held { entry: u64, held: bool },
+    /// →D. [`SqliteMode::Snapshot`] only: a `-wal`, `-shm` or `-journal`
+    /// beside its regular base file `database`, both relative paths. Never
+    /// carried and never an entry; its outcome is its base's: covered when
+    /// the base is published from a snapshot or reused as one, and refused
+    /// by name otherwise.
+    SqliteSidecar {
+        rel_path: Vec<u8>,
+        database: Vec<u8>,
+    },
+    /// →D. [`SqliteMode::Snapshot`] only, before an entry's first data frame
+    /// or its [`Control::Manifest`]: the entry's content is a backup-API
+    /// snapshot of `size` bytes the source took into its private state, not
+    /// the live file. `wal` is the database's `-wal` identity after the
+    /// backup, under which the destination keys its row; `End.racy` says
+    /// the capture was not settled (an identity moved, or was stamped
+    /// within the racy allowance), so no reuse row is kept.
+    SqliteSnapshot {
+        entry: u64,
+        size: u64,
+        wal: Option<SidecarId>,
+    },
 }
 
 /// The fixed header of a [`TAG_DATA`] frame.

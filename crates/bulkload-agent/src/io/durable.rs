@@ -1,8 +1,10 @@
 //! Group commit for the transfer engine (M2 W3).
 //!
 //! A committer thread collects work items and makes them durable in groups.
-//! A group closes at [`GROUP_FILES`] files, [`GROUP_BYTES`] bytes or
-//! [`GROUP_IDLE`] without a new item. For each group the sink:
+//! A group closes at [`GROUP_FILES`] files, [`GROUP_BYTES`] bytes,
+//! [`GROUP_IDLE`] without a new item, or, when its limits set one, an age
+//! since its first item ([`Limits::group_age`]); a caller's
+//! [`Committer::sync`] closes it at once. For each group the sink:
 //!
 //! 1. seals every file's data with [`seal_file`]: `F_BARRIERFSYNC` on Darwin,
 //!    `fsync` elsewhere, or a full flush under [`Durability::Strict`];
@@ -683,6 +685,124 @@ pub fn configure_sqlite(conn: &rusqlite::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Bytes of page 1 of a store created directly in WAL mode
+/// ([`wal_database_template`]).
+pub const WAL_TEMPLATE_BYTES: usize = 4096;
+
+/// Where the template keeps the version number of the `SQLite` that wrote
+/// it (`SQLITE_VERSION_NUMBER`, big-endian): any value is a valid header.
+const TEMPLATE_VERSION: std::ops::Range<usize> = 96..100;
+
+/// Page 1 of an empty `SQLite` database in WAL mode.
+///
+/// Byte for byte what `SQLite` writes when `PRAGMA journal_mode=WAL`
+/// switches a new, empty database (4096-byte pages, read and write
+/// versions 2, one page, change counter 1, an empty `sqlite_schema` leaf),
+/// with this build's `SQLite` version number. `io::durable::tests` checks
+/// it against `SQLite`'s own.
+#[must_use]
+pub fn wal_database_template() -> [u8; WAL_TEMPLATE_BYTES] {
+    let mut page = [0_u8; WAL_TEMPLATE_BYTES];
+    let page_size = u16::try_from(WAL_TEMPLATE_BYTES).unwrap_or(u16::MAX);
+    let version = u32::try_from(rusqlite::version_number()).unwrap_or(0);
+    let fields: [(usize, &[u8]); 10] = [
+        (0, b"SQLite format 3\0"),
+        (16, &page_size.to_be_bytes()),
+        // Write and read versions 2: WAL. Reserved bytes 0; payload
+        // fractions 64, 32, 32.
+        (18, &[2, 2, 0, 64, 32, 32]),
+        // File change counter, then the database's size in pages.
+        (24, &1_u32.to_be_bytes()),
+        (28, &1_u32.to_be_bytes()),
+        // The change counter the version number below is valid for.
+        (92, &1_u32.to_be_bytes()),
+        (TEMPLATE_VERSION.start, &version.to_be_bytes()),
+        // `sqlite_schema`'s root: an empty table leaf whose cell content
+        // area starts at the end of the page.
+        (100, &[0x0d, 0, 0, 0, 0]),
+        (105, &page_size.to_be_bytes()),
+        (107, &[0]),
+    ];
+    for (at, bytes) in fields {
+        if let Some(slot) = page.get_mut(at..at + bytes.len()) {
+            slot.copy_from_slice(bytes);
+        }
+    }
+    page
+}
+
+/// Make a new, empty bulkload store file a database in WAL mode before
+/// `SQLite` opens it.
+///
+/// OI-1003-Q154 lever 3, stores created directly in WAL mode: write
+/// [`wal_database_template`] and sync it.
+///
+/// `SQLite` would otherwise switch the new database to WAL with a commit of
+/// its own in rollback-journal mode, which syncs a `-journal` twice and
+/// the database once (3 `fsync`s per store, 2026-10-08 trace). Opening a
+/// file whose header already says WAL, it writes nothing to the main file
+/// and makes no journal: the store's first write is its creation commit,
+/// in the WAL, at `synchronous=FULL` as before.
+///
+/// The page must reach stable media no later than the store's first WAL
+/// frame does: `SQLite` discards the WAL of a database file that reads as
+/// empty. [`template_seal`] gives that order with the cheapest call that
+/// does. On Linux it is an `fsync`, the same call each of `SQLite`'s three
+/// syncs was. On Darwin it is `F_BARRIERFSYNC`, never `F_FULLFSYNC`:
+/// `SQLite`'s three syncs there were plain `fsync`s (`fullfsync` is set
+/// only after the switch, [`configure_sqlite`]), which drain no device
+/// cache, so an `F_FULLFSYNC` here would add a device-cache flush per
+/// store that the old path never paid (OI-1003-Q154 review). The barrier orders the page ahead of every later write,
+/// and the store's state-root seal ([`seal_state_root`], a full flush of
+/// the root) and its creation commit (`F_FULLFSYNC` of the WAL) each drain
+/// the device after it, so the page is on stable media before the store's
+/// first commit returns, as `BulkloadTransfer.tla` assumes. Like the
+/// `SQLite` syncs it replaces, this seal is the database file's own I/O,
+/// outside the flush counters and the R-N88 trace. Under
+/// [`Durability::Strict`] it is a full flush.
+///
+/// # Errors
+/// Returns the write or sync failure.
+pub fn init_wal_database(file: &File) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, &wal_database_template(), 0)?;
+    template_seal(file)
+}
+
+/// [`init_wal_database`]'s seal: a full flush under
+/// [`Durability::Strict`]; otherwise `F_BARRIERFSYNC` on Darwin (untraced)
+/// and `fsync` elsewhere.
+fn template_seal(file: &File) -> std::io::Result<()> {
+    if durability() == Durability::Strict {
+        return file.sync_all();
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        super::sys::barrier_untraced(file)
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    {
+        file.sync_all()
+    }
+}
+
+/// Whether `bytes`, a store file's whole content, are what a crash can
+/// leave of [`init_wal_database`].
+///
+/// At most one page, every byte zero or the template's (the version number
+/// any value). A file like that holds no store and is made whole again; any
+/// other is left to `SQLite`.
+#[must_use]
+pub fn interrupted_wal_init(bytes: &[u8]) -> bool {
+    bytes.len() <= WAL_TEMPLATE_BYTES
+        && bytes
+            .iter()
+            .zip(wal_database_template())
+            .enumerate()
+            .all(|(at, (found, template))| {
+                *found == 0 || *found == template || TEMPLATE_VERSION.contains(&at)
+            })
+}
+
 /// Relax the row commits of a SOURCE ledger connection (WP0(g),
 /// [`LedgerSync::Relaxed`]): `synchronous=NORMAL` and `fullfsync=OFF`.
 ///
@@ -768,6 +888,10 @@ pub struct Limits {
     pub group_idle: Duration,
     /// Queued items before [`Committer::submit`] blocks the producer.
     pub queue_depth: usize,
+    /// Close a group once this long has passed since its first item, idle
+    /// or not (`None`: no such bound). A group that waits for idleness
+    /// longer than [`GROUP_IDLE`] still commits at least this often.
+    pub group_age: Option<Duration>,
 }
 
 impl Default for Limits {
@@ -777,6 +901,7 @@ impl Default for Limits {
             group_bytes: GROUP_BYTES,
             group_idle: GROUP_IDLE,
             queue_depth: QUEUE_DEPTH,
+            group_age: None,
         }
     }
 }
@@ -817,7 +942,11 @@ impl<S: GroupSink> Committer<S> {
             });
             if let Some((files, idle)) = crate::fault::side_group(S::SIDE) {
                 limits.group_files = files;
-                limits.group_idle = idle.unwrap_or(limits.group_idle);
+                if let Some(idle) = idle {
+                    // A harness row's own idle, as before any age bound.
+                    limits.group_idle = idle;
+                    limits.group_age = None;
+                }
             }
             limits
         };
@@ -902,6 +1031,8 @@ struct OpenGroup<T> {
     items: Vec<T>,
     files: u64,
     bytes: u64,
+    /// When its first item arrived.
+    opened: Option<std::time::Instant>,
 }
 
 impl<T> OpenGroup<T> {
@@ -910,7 +1041,27 @@ impl<T> OpenGroup<T> {
             items: Vec::new(),
             files: 0,
             bytes: 0,
+            opened: None,
         }
+    }
+
+    /// How long the committer may wait for the next item before this group
+    /// closes: its idle time, cut short by what is left of its age.
+    fn wait(&self, limits: &Limits) -> Duration {
+        match (limits.group_age, self.opened) {
+            (Some(age), Some(opened)) => {
+                limits.group_idle.min(age.saturating_sub(opened.elapsed()))
+            }
+            _ => limits.group_idle,
+        }
+    }
+
+    /// Whether the group has reached its age bound.
+    fn aged(&self, limits: &Limits) -> bool {
+        matches!(
+            (limits.group_age, self.opened),
+            (Some(age), Some(opened)) if opened.elapsed() >= age
+        )
     }
 
     fn close<S: GroupSink<Item = T>>(&mut self, sink: &mut S, failure: &Failure) {
@@ -920,6 +1071,7 @@ impl<T> OpenGroup<T> {
         counters::bump(Counter::DurableGroups);
         self.files = 0;
         self.bytes = 0;
+        self.opened = None;
         sink.commit(std::mem::take(&mut self.items));
         if let Some(refusal) = sink.failure() {
             if let Ok(mut shared) = failure.lock() {
@@ -943,7 +1095,7 @@ fn run<S: GroupSink>(
                 Err(_) => break,
             }
         } else {
-            match receiver.recv_timeout(limits.group_idle) {
+            match receiver.recv_timeout(group.wait(&limits)) {
                 Ok(message) => message,
                 Err(RecvTimeoutError::Timeout) => {
                     group.close(&mut sink, failure);
@@ -957,8 +1109,12 @@ fn run<S: GroupSink>(
                 let (files, bytes) = S::weight(&item);
                 group.files = group.files.saturating_add(files);
                 group.bytes = group.bytes.saturating_add(bytes);
+                group.opened.get_or_insert_with(std::time::Instant::now);
                 group.items.push(item);
-                if group.files >= limits.group_files || group.bytes >= limits.group_bytes {
+                if group.files >= limits.group_files
+                    || group.bytes >= limits.group_bytes
+                    || group.aged(&limits)
+                {
                     group.close(&mut sink, failure);
                 }
             }
@@ -1095,6 +1251,115 @@ mod tests {
         }
         drop(committer);
         Ok(())
+    }
+
+    fn group_sizes(groups: &Arc<Mutex<Vec<Vec<u64>>>>) -> Vec<usize> {
+        groups
+            .lock()
+            .map(|groups| groups.iter().map(Vec::len).collect())
+            .unwrap_or_default()
+    }
+
+    /// OI-1003-Q154 lever 3: items that land less than the idle apart share
+    /// a group; the age bound still closes a group that never goes idle,
+    /// and a 20 ms idle (the bound before the lever) splits the same items.
+    #[test]
+    fn a_group_waits_out_its_idle_and_closes_at_its_age() -> Result<()> {
+        let gapped = |idle: Duration, age: Option<Duration>, gaps: usize| -> Result<Vec<usize>> {
+            let groups = Arc::new(Mutex::new(Vec::new()));
+            let committer = Committer::spawn_with(
+                Recorder(Arc::clone(&groups)),
+                Limits {
+                    group_idle: idle,
+                    group_age: age,
+                    ..Limits::default()
+                },
+            )?;
+            committer.submit(1)?;
+            for _ in 0..gaps {
+                std::thread::sleep(Duration::from_millis(60));
+                committer.submit(1)?;
+            }
+            committer.sync()?;
+            drop(committer);
+            Ok(group_sizes(&groups))
+        };
+        // Five items 60 ms apart under a 2 s idle: one group, closed by sync.
+        assert_eq!(gapped(Duration::from_secs(2), None, 4)?, [5]);
+        // The same under a 20 ms idle: each item alone.
+        assert_eq!(gapped(Duration::from_millis(20), None, 4)?, [1; 5]);
+        // Twenty items 60 ms apart (over 1.1 s) under a 2 s idle and a 300 ms
+        // age: closed by age, more than once, nothing lost.
+        let aged = gapped(Duration::from_secs(2), Some(Duration::from_millis(300)), 19)?;
+        assert!(aged.len() >= 3, "{aged:?}");
+        assert_eq!(aged.iter().sum::<usize>(), 20, "{aged:?}");
+        Ok(())
+    }
+
+    /// OI-1003-Q154 lever 3: the template is the page `SQLite` itself writes
+    /// when it switches a new, empty database to WAL.
+    #[test]
+    fn the_wal_template_is_sqlites_own_first_page() -> Result<()> {
+        let scratch =
+            std::env::temp_dir().join(format!("bulkload-wal-template-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir(&scratch).map_err(|_| BulkloadRefusal::Io(None))?;
+        let path = scratch.join("own.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).map_err(|_| BulkloadRefusal::Io(None))?;
+            let mode: String = conn
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+                .map_err(|_| BulkloadRefusal::Io(None))?;
+            assert_eq!(mode, "wal");
+        }
+        let own = std::fs::read(&path).map_err(|_| BulkloadRefusal::Io(None))?;
+        assert_eq!(own.as_slice(), wal_database_template().as_slice());
+
+        // A database made from the template opens in WAL mode without a
+        // write to its main file, and takes a schema.
+        let made = scratch.join("made.sqlite");
+        let file = std::fs::File::create(&made).map_err(|_| BulkloadRefusal::Io(None))?;
+        init_wal_database(&file).map_err(|_| BulkloadRefusal::Io(None))?;
+        drop(file);
+        {
+            let conn = rusqlite::Connection::open(&made).map_err(|_| BulkloadRefusal::Io(None))?;
+            configure_sqlite(&conn)?;
+            conn.execute_batch("CREATE TABLE t(a); INSERT INTO t VALUES (1);")
+                .map_err(|_| BulkloadRefusal::Io(None))?;
+            assert!(!scratch.join("made.sqlite-journal").exists());
+            assert_eq!(
+                std::fs::read(&made).map_err(|_| BulkloadRefusal::Io(None))?,
+                wal_database_template(),
+                "nothing written to the main file before a checkpoint"
+            );
+            let check: String = conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .map_err(|_| BulkloadRefusal::Io(None))?;
+            assert_eq!(check, "ok");
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
+        Ok(())
+    }
+
+    /// What a crash can leave of the template's write is recognised; any
+    /// other content is not.
+    #[test]
+    fn an_interrupted_wal_init_is_recognised() {
+        let template = wal_database_template();
+        assert!(interrupted_wal_init(&[]));
+        assert!(interrupted_wal_init(&template));
+        assert!(interrupted_wal_init(&template[..512]));
+        assert!(interrupted_wal_init(&[0; WAL_TEMPLATE_BYTES]));
+        let mut torn = template;
+        torn[..512].fill(0);
+        assert!(interrupted_wal_init(&torn));
+        let mut other_version = template;
+        other_version[96..100].copy_from_slice(&3_046_001_u32.to_be_bytes());
+        assert!(interrupted_wal_init(&other_version));
+        let mut foreign = template;
+        foreign[200] = 7;
+        assert!(!interrupted_wal_init(&foreign));
+        assert!(!interrupted_wal_init(&[template.as_slice(), &[0]].concat()));
     }
 
     #[test]

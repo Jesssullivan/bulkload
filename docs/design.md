@@ -30,9 +30,14 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   code is raised by product code, never kept as unused vocabulary. A Git
   child that exits non-zero refuses `GIT_CHILD_FAILED` with a
   `stderr_class=` from a closed set; its stderr is classified, never echoed
-  or kept (R-N121). No blanket conversion turns an OS or codec error into a
-  refusal: each site names itself with `.refuse_at(site)`. The sites that
-  still raise a bare `IO` with no errno are an allowlist that only shrinks.
+  or kept (R-N121). A child whose stderr says it ran out of space or quota
+  (class `no_space`) refuses a space code instead (#220): the verb names
+  where its children write (see Space). No blanket
+  conversion turns an OS or codec error into a refusal: each site names
+  itself with `.refuse_at(site)`. The sites that still raise a bare `IO`
+  with no errno are an allowlist that only shrinks. A bare `IO` carries its
+  errno; it carries no path, so a site that knows its path and a typed
+  cause raises the typed code (`SPACE_EXHAUSTED` names its directory).
 - `referenced-only`: the item plans no workspace, and the exact
   current-capture journal says `refs-imported`. `git-repair-missing-index`
   given `PLAN CORPUS PRIVATE_STATE` binds its bundle to the planned item
@@ -167,12 +172,14 @@ Source safety (S2, WP1):
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
 - SQLite provider snapshots are S2's stated exceptions: one lock and two
   writes. Every source is read through the backup API from a read-only,
-  WAL-aware connection; none is read `immutable=1`. All three are bounded.
-  The two writes are counted; the lock is not yet:
+  WAL-aware connection; none is read `immutable=1`. All three are bounded
+  and counted:
   - **Lock (OI-1003-Q16).** The backup API's shared read lock on the source
-    database, held only for the bounded read. Q16 calls it "counted", but no
-    counter for it exists yet (neither a lock count nor a lock time). That
-    is an open gap; neither write counter covers it.
+    database, held only inside one step of the bounded read. Counted since
+    #218 as `source_sqlite_lock_ns`: the source connection's whole life,
+    from open to close, an upper bound on the lock (a WAL-mode connection
+    holds `SHARED` on the main file until it closes, and a step's read mark
+    in the `-shm`), with restarts in `source_sqlite_backup_restarts`.
   - **Write: the wal-index (OI-1003-Q36).** The source's `<db>-shm`:
     SQLite's own coordination file, which holds no user data. A WAL-aware
     read opens it read-write, maps it and takes `fcntl` locks on it. It
@@ -214,6 +221,15 @@ Source safety (S2, WP1):
     - A refused verb leaves the source directory as it was: no `-shm`, no
       `-wal`, no timestamp moved, both counters 0 (P75's root leg).
     - Run the verb as the database's owner.
+    - The transfer's `--sqlite=snapshot` mode (#218, "SQLite snapshot
+      seats" under Wire v6) reads through the same provider code under the
+      same lock and the same two counted writes. As root its whole session
+      is refused at `Open`; a database owned by another user than the
+      reader is refused `SQLITE_SOURCE_NOT_OWNER` before `SQLite` opens it,
+      since `SQLite` would create that database's `-shm` (and an empty
+      `-wal`) owned by the reader, which the owner's own writer may then
+      fail to open. The lock is now counted: `source_sqlite_lock_ns` is
+      each source connection's life, for the verb and the transfer alike.
 
 Git carry retains refs, objects, real stash commits including binaries and
 untracked files, indexes and dirt, worktree administration and translated
@@ -235,6 +251,32 @@ neither an index nor a worktree (S4, #162).
   worktree) refuses `GIT_INVENTORY_INDEX_ABSENT`. Git reads the absent file
   as an unborn index that `git checkout` populates, and an empty index file
   does not, so no carried index restores it.
+- A bare repository whose HEAD names a branch that does not exist (unborn:
+  `init --bare`, or a mirror whose default branch is gone) is valid and
+  captures as ref custody: its refs and its symbolic HEAD, with no
+  `refs/carry-export/head` (S4, #162, #219). An empty bare repository, with
+  no ref at all, captures the same way. An unborn HEAD in a non-bare
+  repository still refuses `GIT_CHILD_FAILED`.
+- Alternates (`objects/info/alternates`) are followed, decided at capture
+  (S4, #219). The capture's private repository borrows the source's store,
+  and the bundle packs every reachable object wherever it is stored, so a
+  landing (a refs import or a checkout) is self-contained: it has no
+  alternates file and `git fsck --full` is clean. Git reads alternates at
+  most six levels down, and the private repository adds one, so a source
+  can borrow through at most five stores. Git links each store once, by
+  its real path, depth first in file order, and the capture's walk does the
+  same: an entry naming the source's own store, a cycle, or a diamond
+  reaching a store already linked costs no depth. An alternates file five
+  stores down that names a store not yet linked, or a quoted alternates
+  entry, refuses `GIT_SOURCE_ALTERNATES` with that file's path, before any
+  export; the estimate probe walks and refuses the same way. An entry
+  naming a store Git cannot open (a lender moved or deleted after
+  `clone --shared`) is skipped as Git skips it; if the capture then misses
+  an object (`GIT_CHILD_FAILED` of class `bad_object` or `other`), it
+  refuses `GIT_SOURCE_ALTERNATES` naming that file. A `gc` or repack in a
+  lender under the pass is drift custody, as one in the source is: the
+  rewrite check reads every followed store's pack listing. A promisor pack
+  in any followed store still refuses `GIT_SOURCE_PARTIAL_CLONE`.
 - A capture's header does not list every carried ref (OI-1003-Q54, #178;
   `docs/plans/2026-10-05-v1-header.md`). The refs travel in a
   content-addressed ref table commit (`refs/carry-ref-table/v1`), with one
@@ -318,7 +360,17 @@ neither an index nor a worktree (S4, #162).
     concurrent writer.
 
 Import preserves divergence and leaves active HEADs, indexes and
-working bytes untouched. Account credentials carry privately; platform stores
+working bytes untouched. estate-apply refuses a planned item whose capture
+the corpus does not hold (its capture refused, or none ran) with
+`CAPTURE_ABSENT`, before it reads anything else; `SEALED_OBJECT_MISSING`
+names only a recorded capture whose bundle, link or base the corpus lost
+(S4, #219). A refs import into a destination repository that does not
+exist, or into a directory Git finds no repository in (an empty directory,
+an unfinished `git init`), refuses `GIT_REPOSITORY_NOT_AT_PATH` as that
+item's own receipt, never `GIT_INVENTORY_MALFORMED` or
+`GIT_DESTINATION_OCCUPIED`, and never aborts the apply's other items (S4,
+#183). A standalone item on a plan base still refuses
+`GIT_DESTINATION_OCCUPIED`: a standalone destination is never preseeded. Account credentials carry privately; platform stores
 may require a format transcode. Destination machine keys and Home Manager
 links are preserved. Credential contents are never printed.
 
@@ -560,7 +612,7 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   instead (R-N76).
 - An incremental pass reuses a retained blob only for a seat whose stat
   identity is unchanged and which was not racy. The transfer applies the
-  same rule to its ledger and output rows (see Wire v5, racy captures). A seat stamped within one
+  same rule to its ledger and output rows (see Wire v6, racy captures). A seat stamped within one
   timestamp tick (a 2 s allowance) of the retained pass start can be
   rewritten at the same size without its identity moving, as in Git's racy
   index, so it is read again. A pass that reuses none of the blobs it was
@@ -589,7 +641,16 @@ median (R-N57):
 
 - **(a) Loopback:** the native engine, running its full protocol over a local
   socket with no clone fast path, beats `rclone copy` as shipped on the same
-  corpus and volume.
+  corpus and volume. Since OI-1003-Q154 (levers 1 and 2) the loopback's two
+  halves are joined by an in-process hand-off: every control frame still
+  crosses the socket as a wire v6 frame, and every chunk's 64-byte data
+  header crosses it in v6's layout and stream order, but inside a handed
+  frame (tag 0xB1), which is no v6 frame; the chunk's bytes are handed over
+  in memory and hashed once, by the source (Wire v6, "Loopback hand-off").
+  Whether "its full protocol over a local socket" (R-N57) covers that is the
+  operator's to word; OI-1003-Q154 authorized the change. `BULKLOAD_LOOPBACK_HANDOFF=0` runs the
+  plain protocol for A/B. Gate (b) is unchanged: `pull` and `serve` never
+  hand anything over and the destination hashes every byte.
 - **(b) Cross-host:** a pull between two hosts beats rclone over sftp on the
   same corpus.
 
@@ -645,10 +706,16 @@ and each sample row records both. The coordinator keeps the other lanes
 quiet while gated samples run (R-N81, R-N91). The clone fast path never
 counts toward a gate (R-N57, R-N63).
 
-## Wire v5
+## Wire v6
 
-The transfer wire is protocol 5, a hard cut with no dual stack (R-N59,
-R-N118). `bulkload-proto` holds the codec and its schema text, `WIRE_SCHEMA`;
+The transfer wire is protocol 6, a hard cut with no dual stack (R-N59,
+R-N118). v6 (#218, 2026-10-08) is v5 plus the SQLite snapshot seat: the
+session's `SqliteMode` in `Open`, a database's `-wal` identity in `Entry`,
+the `SqliteSidecar` (21) and `SqliteSnapshot` (22) controls, and the
+`SQLite` result code of a `SQLITE_BACKUP_FAILED` refusal in `Refused`
+(`sqlite_code`, `None` for every other code); see "SQLite snapshot seats"
+below. Every other frame, the W6 reserved ones
+included, is v5's. `bulkload-proto` holds the codec and its schema text, `WIRE_SCHEMA`;
 a peer whose `Open` names another protocol or another BLAKE3 of the schema
 (`wire_id`) is refused before anything else. Every frame is a 4-byte
 big-endian length, a tag byte and a body: tag 1 is a postcard control
@@ -689,6 +756,30 @@ miss (#87).
   capture was racy. The destination
   verifies every chunk against its digest, writes it at its offset, and checks
   coverage and the root before the output is queued for its group commit.
+  A local `copy`'s handed chunks are the one exception: the source's digest
+  of those very bytes is their verify ("Loopback hand-off" below).
+- **Loopback hand-off (local `copy` only, OI-1003-Q154 levers 1 and 2).**
+  `copy` runs both halves in one process, from one build, over a socket pair
+  it makes, and joins them with a hand-off queue (`transfer/handoff.rs`)
+  that only it can make: `serve`, `receive` and `pull` take none, and
+  neither half can be serialised, so nothing that arrives over a transport
+  can stand for one. The source moves each chunk's allocation into the
+  queue, then writes only its 64-byte data header on the socket under a
+  tag outside v6's (0xB1), so the frame keeps a data frame's place among
+  the control frames; the destination takes the chunk when it reads that
+  frame. A chunk can only be made by hashing its bytes, and its bytes sit
+  behind an immutable `Arc`, so a handed chunk whose digest is its frame's
+  is the very buffer the source hashed to it: the destination writes it
+  without hashing it again (verify once; `wire_handed_bytes` counts these
+  bytes, `blake3_dest_wire_verify_bytes` every other received byte, and
+  every received byte is in exactly one). Bytes read from any transport
+  are always hashed. A reader without the hand-off, and the proto codec,
+  refuse a handed frame `FRAME_CODEC`. The source also batches its frames
+  until it is about to wait for an event, and both halves read the socket
+  through a 64 KiB buffer. Credit, the windows, every check of a frame's
+  index, offset, size and manifest, and every durable step are unchanged;
+  crash adoption (#169) and local reuse still hash the destination's own
+  bytes. `BULKLOAD_LOOPBACK_HANDOFF=0` turns all of it off.
 - **WantManifest.** Chosen only when the destination could fill chunks
   itself: the output path already exists (adopt, supersede or refuse; see
   Durability), or published outputs hold chunks (resume, incremental). The source sends `Manifest`, from
@@ -716,16 +807,146 @@ miss (#87).
   no ledger row, and `End{racy}` tells the destination to keep no output row
   under its key (its chunk hints are kept; they are re-verified on use). The
   next run reads the seat again (#86).
-- **Refused seats (#186).** A seat is refused for its content when its
-  first 16 bytes are a `SQLite` database or WAL magic
-  (`SQLITE_STATE_CHANGED`): provider state, which only the `SQLite` backup
-  path carries. Those bytes are a sniff, counted as `source_sniff_bytes` and
+- **Refused seats (#186).** With `--sqlite=refuse` (the default) a seat is
+  refused for its content when its first 16 bytes are a `SQLite` database or
+  WAL magic (`SQLITE_STATE_CHANGED`): provider state, which only the
+  `SQLite` backup path carries. With `--sqlite=snapshot` a database magic is
+  a snapshot seat instead (below); a WAL magic is still refused. Those bytes are a sniff, counted as `source_sniff_bytes` and
   never as content (`source_bytes_read`, `read_source_file_bytes`). The
   source ledger remembers the refusal under the seat's row key, when the
   seat was not racy and its stat identity did not move across the sniff, so
   a later run refuses the unchanged seat with the same code without opening
   it (R25); a seat whose stat identity moved is sniffed again. The refusal
-  is reported on every run (S4).
+  is reported on every run (S4). The record depends on the mode (#218
+  review R8): `refuse` mode writes v5's tag 1 and honours it; `snapshot` mode
+  ignores tag 1 (it does not say which magic was seen) and writes tag 3 for
+  a WAL magic.
+- **SQLite snapshot seats (#218; `--sqlite=snapshot`; operator rulings
+  OI-1003-Q146 to Q148 of 2026-10-09, Linear TIN-4543, and unruled
+  defaults in `docs/agent-notes/2026-10-08-sqlite-carry-design.md`
+  section 0).** The destination chooses the mode; `Open` carries it to the
+  source. The default stays `--sqlite=refuse` (OI-1003-Q147): `snapshot` is
+  opt-in, and a run that must carry databases, such as the full neo→sting
+  pull, passes `--sqlite=snapshot` explicitly.
+  - *Walk.* A regular file with a regular `<name>-wal` beside it is offered
+    with that file's identity (`Entry.wal`). A regular `-wal`, `-shm` or
+    `-journal` beside a regular base is never an entry: it is reported as
+    `SqliteSidecar`, and its outcome is its base's, resolved when the session
+    ends: covered when the base was published from a snapshot or reused as
+    one, refused by name (`SQLITE_STATE_CHANGED`) otherwise. A sidecar with
+    no base is offered and refused by name, as in v5. A sidecar listed and
+    gone before its stat (a live rollback-mode store's `-journal`) is still
+    its base's sidecar, not an `IO` refusal. A base without the
+    database magic (an encrypted store) offered beside a `-wal` that holds
+    frames is refused `SQLITE_STATE_CHANGED`, never carried raw: its main
+    file alone may miss the `-wal`'s transactions or hold a half-done
+    checkpoint (#218 review). The refusal is remembered under its row and
+    the `-wal`'s identity. Beside an empty `-wal` it is carried raw.
+  - *Key.* A snapshot seat's reuse row is keyed on its row, a marker and its
+    `-wal`'s identity after the backup (`sqlite_key`), never equal to a row
+    key: an unchanged store is `Reuse`d with nothing opened on the source,
+    and a file that is not a database keeps its row key. Its capture record
+    (#169) is keyed in its own domain on the same pair (`unrowed::
+    sqlite_record_key`), so an unrowed snapshot is adopted only while its
+    `-wal` has not moved (review R1).
+  - *Capture.* A database seat is sniffed (16 bytes, never content); one
+    owned by another user than the reader is refused
+    `SQLITE_SOURCE_NOT_OWNER` before `SQLite` opens it. Otherwise the source
+    takes the `snapshot` verb's stepped backup (OI-1003-Q16; one at a time,
+    a step budget and a 30 s cap: `BUDGET_EXCEEDED`, not remembered) from
+    `canonical_root/rel_path`, opened read-only, WAL-aware and
+    `SQLITE_OPEN_NOFOLLOW` (which refuses a symlink at any component of the
+    path, `SQLITE_CANTOPEN_SYMLINK`, refused as `PATH_ESCAPES_ROOT`), into a
+    slot in its private state (`sqlite-snapshots/`, emptied when `serve`
+    starts), converts the slot to journal mode DELETE and runs
+    `integrity_check` on it, the destination's own check (`quick_check`
+    does not compare index content with table content). Every slot,
+    streamed or kept for a manifest, is reserved against 4 GiB of slots
+    alive at once before its backup, waiting up to 30 s for room, and the
+    slot directory's filesystem must keep the `--min-free-percent` floor
+    with it written: `BUDGET_EXCEEDED` otherwise, not remembered. A
+    sniffed database's descriptor is closed only under the backup lock, so
+    it never drops the POSIX locks of a backup of a hard link of the same
+    store. A residual stands: a directory swapped between `SQLite`'s own
+    symlink check of the path and its `open` of it, or before it opens the
+    `-wal` and `-shm` by name, is not seen. The main file and the
+    `-wal` are stat'ed beneath the seat's directory before and after; the
+    walked inode must still be at the path (`PATH_ESCAPES_ROOT`). The
+    capture is settled when the walked, pre- and post-stat main file agree,
+    the `-wal` did not move (or is the empty one the read created,
+    OI-1003-Q72), and neither is racy; an unsettled capture is sent as racy:
+    published, never a reuse key. `SqliteSnapshot{entry, size, wal}`
+    precedes the entry's content, which is the slot's chunks, never the live
+    file's. No source ledger row is kept for a snapshot. A corruption the
+    database's bytes alone decide (`SQLITE_INTEGRITY_CHECK_FAILED`, or
+    `SQLITE_BACKUP_FAILED` whose primary code is 11 or 26) is remembered
+    under the snapshot key when the capture settled.
+  - *Destination.* Admission reserves the main file's and the `-wal`'s
+    sizes at Decide and the snapshot's exact size when it is announced. A
+    path with a `-wal`, `-journal` or `-shm` beside it is refused
+    `DESTINATION_OCCUPIED` at Decide (nothing is read on the source; not
+    remembered; removing the sidecar converges) and again just before
+    publish. The staged file is verified (header, size, not WAL,
+    `integrity_check` exactly `ok`, opened `immutable=1`) before it is
+    published; a failure refuses `SQLITE_INTEGRITY_CHECK_FAILED`, whose
+    default S4 disposition is `abandon` (OI-1003-Q148; printed beside the
+    refusal as `default-disposition <path>: abandon` until transfer
+    refusals are closure-ledger rows, WP3 PR 4). Corruption the backup step
+    itself reports (`SQLITE_BACKUP_FAILED` with primary code 11
+    `SQLITE_CORRUPT` or 26 `SQLITE_NOTADB`) never reaches
+    `integrity_check`; it keeps its own code, and takes the same `abandon`
+    default and report line: the source sends `SQLite`'s code beside the
+    refusal (`Refused.sqlite_code`), and the receiver reads it
+    (`transfer::default_disposition`). A backup that failed otherwise
+    (busy, I/O, a hot journal) has no default.
+  - *Supersede (OI-1003-Q146).* A changed store's new snapshot replaces
+    the output at its path only through the superseding publish below
+    (WP0(d)'s `prepare_supersede`, intent, `RENAME_EXCHANGE` and displaced
+    check), and only when this store landed that output and its ownership
+    proof holds (its identity is still a row this store committed: nothing
+    touched it since), and no `-wal`, `-journal` or `-shm` sits beside it
+    at Decide and again at the exchange's last look, immediately before
+    the exchange (`StagedFile::sqlite_sidecar_appeared`, after the
+    identity check). A sidecar found at that look refuses the entry
+    `DESTINATION_OCCUPIED`: nothing is exchanged, the intent is settled
+    with the old output's rows given back, and removing the sidecar
+    converges by the exchange on the next run (not remembered,
+    `dest_sqlite_sidecar_refused`). A file this store did not land, or
+    landed and something touched since, is refused `DESTINATION_OCCUPIED`
+    and left byte-identical, remembered as for files. The fresh publish
+    (rename without replacement) makes the same last look. A crash at any
+    step leaves the old snapshot or the new one at the path, whole, as for
+    files. Residuals, stated: (1) a `-journal` or `-wal` created between
+    that last `lstat` and the exchange (a connection that began writing in
+    that window); (2) an application whose SQLite predates 3.8.3, or that
+    uses a VFS whose files do not track their inode (on Linux `unix-none`,
+    `unix-dotlock`, `unix-flock`, or a custom VFS), whose next write after
+    the exchange can create its `-journal` beside the new file. A modern
+    SQLite connection on the default `unix` VFS still open on the old
+    inode does not write silently: before it opens a rollback journal the
+    pager asks whether the file moved (`pager_open_journal` calls
+    `databaseIsUnmoved`, `SQLITE_FCNTL_HAS_MOVED`, which `stat`s the path
+    and compares the inode it opened), so its next write fails
+    `SQLITE_READONLY_DBMOVED` ("attempt to write a readonly database"),
+    creates no `-journal`, and the new file stays `integrity_check` ok
+    (read in the bundled SQLite 3.46.0; checked 2026-10-09 with SQLite
+    3.51.2, an idle connection and one in `BEGIN IMMEDIATE` that had not
+    yet journaled). Its reads keep seeing the old inode until it reopens.
+    A connection whose `-journal` already exists is seen by the look and
+    refused. (The conservative build had refused every supersede, D7, for
+    the idle-connection case, which Q146 replaces.)
+    `dest_sqlite_superseded` counts the replacements.
+  - *S2.* The source access is the provider verb's: the Q16 lock, the Q36
+    and Q72 writes, counted (`source_wal_index_touched`,
+    `source_wal_created`), and the connection's whole life as
+    `source_sqlite_lock_ns` (a WAL-mode connection holds `SHARED` on the main
+    file until it closes). A `snapshot`-mode session as root is refused
+    `SQLITE_SOURCE_AS_ROOT` at `Open`, before anything is opened or created;
+    `copy` runs `serve` as its source half, so it is refused the same way.
+  - *S3.* `source_sqlite_backup_bytes` (pages stepped times page size,
+    restarts included, plus the `-wal`'s size: a bound on its wal-index
+    rebuild) is added to the session's source bytes; the slot's re-read is
+    `read_source_snapshot_bytes`, not a source read.
 - **Rows from before the racy guard.** A store created by this engine
   carries a `racy_guard` marker from its first commit. A store without it was
   written before #86, so none of its ledger or output rows is proven
@@ -786,8 +1007,8 @@ Control variants 12 to 19 and tag 3 are reserved for W6 git carry over the
 same session and are refused today. A sub-stream carries negotiated thin
 packs for one repository (R-N60). Since carry_v2's deletion (2026-10-05,
 OI-1003-Q44, OI-1003-Q56) no code builds or consumes them. They stay in wire
-v5 unchanged (`WIRE_SCHEMA` and `wire_id` do not move) and go with WP3's v6
-cut.
+v5, and in v6 (#218) unchanged; they go with WP3's v7 cut (design D8 of
+the #218 note, unruled).
 
 | Frame | Direction | Meaning |
 |---|---|---|
@@ -827,6 +1048,37 @@ than the state store's is fully flushed. Then one `SQLite` WAL commit
 flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
+
+A destination group closes at its file or byte bound, when the stream
+drains, after 250 ms with no new output, or 1 s after its first output
+(OI-1003-Q154 lever 3, fewer synced commits; the idle was 20 ms, and
+`BULKLOAD_DEST_GROUP_IDLE_MS` sets it for A/B). With the 20 ms idle a local
+copy of corpus v1 committed 10 to 18 destination groups on the rig; with
+250 ms it is expected to commit once or twice there, as it did in sting's
+informational census (1 destination group commit against 3 to 5,
+2026-10-15, not of record), until the rig series measures it. Each group still
+seals before its one FULL commit and every `Held` still follows that commit
+(R25: `BulkloadTransfer.tla`'s `Commit` takes any nonempty set of ready
+seats, so a larger group is a behaviour the model already checks), and the
+most a crash leaves unrecorded is still one group within the same bounds;
+#169's adoption recovers it without a source read. No commit is relaxed:
+WP0(g) relaxes only the source ledger's rows, as before.
+
+A new store is created directly in WAL mode (OI-1003-Q154 lever 3): before
+`SQLite` opens the new file, the engine writes page 1 of an empty WAL-mode
+database (byte for byte `SQLite`'s own) and seals it, so no
+rollback-journal commit switches it to WAL. Before, that commit synced a
+`-journal` twice and the database once per store: plain `fsync`s on every
+platform, since `fullfsync` is set only after the switch. The seal is one
+`fsync` on Linux and one `F_BARRIERFSYNC` on Darwin (never `F_FULLFSYNC`,
+which would add a device-cache flush the old path never paid); the store's
+root seal and its first commit drain the device after it, so the page is on
+stable media no later than the store's first WAL frame, which a WAL needs.
+`BULKLOAD_STORE_WAL_TEMPLATE=0` restores `SQLite`'s own switch for A/B
+(`store_wal_templates` counts the stores made from the template). A crash
+inside that write leaves at most one page of zeros and template bytes with
+no `-wal`; the next open writes it again. A short or torn main file beside
+a `-wal` is a store, never touched.
 
 On Linux in group mode, a group of two or more outputs is sealed
 device-wide instead (S1, OI-1003-Q107; `io::durable::batched`). Each output
@@ -1005,9 +1257,16 @@ directory, and commits the new row with the intent settled. A power loss
 leaves the old output or the new one, whole, and never a row beside other
 bytes; the next sweep gives an old output still in place its rows back,
 removes a displaced old output, and exchanges a displaced file of anyone
-else back (or keeps it aside and reports it). The new file is filled from
+else back while the leaf holds the staged file unwritten since it was
+staged (its inode, size and mtime as the intent recorded); otherwise it
+keeps the displaced file aside and reports it, so writes made to the new
+file after the crash are never deleted. The new file is filled from
 the old output's own chunks, so only absent chunks cross the wire (WP0(c),
-inequality 2).
+inequality 2). A `SQLite` snapshot output (#218) is superseded the same
+way (OI-1003-Q146), with one more look: no `-wal`, `-journal` or `-shm`
+beside it at Decide and immediately before the exchange ("SQLite
+snapshot seats", Wire v6); `docs/formal/SqliteCarry.tla` checks it
+(`SqliteNoClobber`, `SqliteOldOrNewWhole`, `SqliteNoForeignSidecar`).
 
 What "this store's own" covers (#187 review, 2026-10-07). An output has a
 reuse row under its seat's row key, which answers `Reuse`, or an ownership
@@ -1071,7 +1330,7 @@ filesystem (`statvfs`; `statfs` on Darwin) with less than
 the space available) refuses `DESTINATION_SPACE_INSUFFICIENT` before it
 starts.
 
-- `copy` and `pull` decide it per entry on wire v5. An entry decided
+- `copy` and `pull` decide it per entry on wire v6. An entry decided
   `Send` or `WantManifest` reserves its size until its `Held`. Each
   admission checks every reserved byte against a probe that is refreshed on
   each group commit and every 256 MiB admitted. An entry that does not fit
@@ -1092,6 +1351,28 @@ starts.
   `DESTINATION_SPACE_INSUFFICIENT` as its own receipt; the other items run
   and the next pass retries it. A reuse hit writes nothing and reserves
   nothing. Shared-base preparation is not charged.
+- No preflight charges `TMPDIR`. A capture's own temporaries there (a
+  private copy of the source index) and a stage beside a bundle that meet
+  `ENOSPC` or `EDQUOT` (at the create or a write) refuse `SPACE_EXHAUSTED`
+  with the directory that ran out and outlives the refusal (TMPDIR, or the
+  directory a stage's private directory was made in), never the removed
+  private directory itself (S4, #220). A Git child that reports no space
+  names no directory (R-N121); its verb does. estate-apply's children write
+  into the destination repository and its corpus stages, which its
+  preflight charges, so they refuse `DESTINATION_SPACE_INSUFFICIENT`.
+  estate-capture's children write only under PRIVATE_STATE, which nothing
+  charges, so they refuse `SPACE_EXHAUSTED` naming it. A child of another
+  verb (the estimate probe) refuses `SPACE_EXHAUSTED` with no path. The item refuses as its own receipt and the pass goes
+  on; a pass with room retries it.
+- A store out of space (`SQLITE_FULL`, or `SQLITE_IOERR_*` whose errno is
+  `ENOSPC` or `EDQUOT`: a quota, or a full disk met at a sync) is a space
+  refusal, never a bare `IO` and never the store's corruption (S4, #126). A
+  destination group commit, which the transfer's preflight charges,
+  refuses `DESTINATION_SPACE_INSUFFICIENT`. The source ledger's commit and
+  `Store::open` on either side refuse `SPACE_EXHAUSTED` naming the state
+  directory: no preflight charges it, and a source-side full disk is never
+  reported as the destination's. Any other I/O error a store meets is `IO`
+  with its errno (`EIO` where the errno cannot be read).
 
 ## Reclaim
 

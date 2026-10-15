@@ -1,7 +1,9 @@
 {- docs/formal's typed catalogue (OI-1003-Q32): every TLC config of
    BulkloadTransfer.tla, the verdict of every mutation, and the
    traceability row of every model property. GitCarry.dhall holds the same
-   for GitCarry.tla (OI-1003-Q43), and this file renders both modules
+   for GitCarry.tla (OI-1003-Q43), SqliteCarry.dhall for SqliteCarry.tla
+   (#218, OI-1003-Q146), Directories.dhall for DirectoryRecords.tla
+   (OI-1003-Q143 item 2), and this file renders every module
    (T.Module): `files` holds each module's run order and configs, and
    `grounding` one entry per module.
 
@@ -868,6 +870,22 @@ let positives =
               , "seat), with TrackStrictHeld."
               ]
               (main // { TrackStrictHeld = True })
+        //  { symmetry = True }
+      ,     row
+              "MC_r25_strict_three"
+              (passStrict (noForeign # [ A.CommitFail ] # noEdit # wp0dOff # estateOff))
+              [ "OI-1003-Q154 lever 3b (larger destination groups): R25's strict"
+              , "reading with three seats, so a group of every size up to three"
+              , "commits (Commit takes any nonempty set of ready seats), with two"
+              , "runs and one crash of either host or both. No source edit: with"
+              , "one per seat the search outgrows the budget."
+              ]
+              (     main
+                //  { Seats = [ Seat.a, Seat.b, Seat.c ]
+                    , MaxEdits = 0
+                    , TrackStrictHeld = True
+                    }
+              )
         //  { symmetry = True }
       , row
           "MC_r25_strict_unsealed"
@@ -1944,6 +1962,9 @@ let constantNames =
 -- GitCarry.tla's part (OI-1003-Q43).
 let GitCarry = ./GitCarry.dhall
 
+-- SqliteCarry.tla's part (#218, OI-1003-Q146).
+let SqliteCarry = ./SqliteCarry.dhall
+
 -- DirectoryRecords.tla's part (OI-1003-Q143 item 2).
 let Directories = ./Directories.dhall
 
@@ -1957,6 +1978,7 @@ in  { files =
               (\(r : T.Row) -> { name = "${r.name}.cfg", text = cfgText r })
               rows
         # GitCarry.files
+        # SqliteCarry.files
         # Directories.files
     , grounding =
       [ { module = showConstructor module.module
@@ -1985,6 +2007,7 @@ in  { files =
         , labelSets = [] : List { name : Text, labels : List Text }
         }
       , GitCarry.grounding
+      , SqliteCarry.grounding
       , Directories.grounding
       ]
     , invariants
@@ -1993,5 +2016,6 @@ in  { files =
     , gitCarryInvariants = GitCarry.invariants
     , gitCarryNversion = GitCarry.nversion
     , decide = GitCarry.decide
+    , sqliteCarryInvariants = SqliteCarry.invariants
     , directoryInvariants = Directories.invariants
     }

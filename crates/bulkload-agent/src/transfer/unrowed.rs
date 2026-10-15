@@ -57,6 +57,16 @@
 //!
 //! The record stays on the output after its row commits: removing it would
 //! move the output's ctime, which is part of the identity its row records.
+//!
+//! **`SQLite` snapshot seats (#218, review R1).** A snapshot's bytes are not
+//! the walked main file's: a WAL-mode commit moves only the `-wal`, so a
+//! record keyed on the main file's row alone would let a stale snapshot be
+//! adopted as current after a commit with no checkpoint. A snapshot output's
+//! record is keyed in its own domain on the walked row **and** the settled
+//! `-wal` identity ([`sqlite_record_key`]), and its size is the snapshot's.
+//! Only a settled snapshot gets one (an unsettled capture is treated as a
+//! racy one). [`prove`] compares a record against both keys, so a file's
+//! record never proves a snapshot or the reverse.
 
 use std::fs::File;
 use std::io::Read;
@@ -130,6 +140,24 @@ pub fn record_key(row: &RowSchema) -> Result<[u8; 32]> {
     Ok(crate::hash::hash_bytes(&row_key(RECORD_DOMAIN, row)?))
 }
 
+/// Domain of a snapshot seat's capture record key (#218): never a file's.
+const SQLITE_RECORD_DOMAIN: &[u8] = b"bulkload sqlite snapshot capture record";
+
+/// The capture record's key for a `SQLite` snapshot of the walked `row`
+/// whose `-wal` had the identity `wal` when the capture settled (`None`:
+/// no `-wal`). Like [`record_key`] it holds no store authority.
+///
+/// # Errors
+/// Refuses a row that does not encode.
+pub fn sqlite_record_key(
+    row: &RowSchema,
+    wal: Option<&bulkload_proto::frame::SidecarId>,
+) -> Result<[u8; 32]> {
+    let encoded = postcard::to_stdvec(&(SQLITE_RECORD_DOMAIN, row, wal))
+        .refuse_at("unrowed::sqlite_record_key")?;
+    Ok(crate::hash::hash_bytes(&encoded))
+}
+
 /// Write `record` on a staged file, before its seal. A file system without
 /// extended attributes only costs the counted fallback on a later resume, so
 /// a failure is counted (`transfer_capture_records_unset`), never refused.
@@ -184,9 +212,10 @@ pub fn refresh(
 /// What an existing output with no matching row proves.
 #[derive(Debug)]
 pub enum Verdict {
-    /// Its bytes are the capture `key` names: the identity they were proven
-    /// under, and the first occurrence of each chunk, for the output row.
-    Proven(StatIdentity, Vec<ChunkHint>),
+    /// Its bytes are the capture a key names: the identity they were proven
+    /// under, the first occurrence of each chunk, for the output row, and
+    /// whether the key was the snapshot key ([`sqlite_record_key`]).
+    Proven(StatIdentity, Vec<ChunkHint>, bool),
     /// Its record names another row: the seat's row changed since that
     /// capture, so read it again (not counted).
     Other,
@@ -195,17 +224,24 @@ pub enum Verdict {
 }
 
 /// Prove the existing output `file` is the non-racy capture that `key`
-/// ([`record_key`]) names, reading only the destination.
-pub fn prove(file: &File, row: &RowSchema, key: &[u8; 32]) -> Verdict {
+/// ([`record_key`]) names, or, given `snapshot`, the settled snapshot that
+/// key ([`sqlite_record_key`]) names, reading only the destination. A file
+/// capture's size must be the row's; a snapshot's is its record's.
+pub fn prove(file: &File, row: &RowSchema, key: &[u8; 32], snapshot: Option<&[u8; 32]>) -> Verdict {
     let Some(record) = read_record(file) else {
         return Verdict::Unproven;
     };
-    if record.key != *key {
+    let is_snapshot = if record.key == *key {
+        false
+    } else if snapshot == Some(&record.key) {
+        true
+    } else {
         return Verdict::Other;
-    }
-    match chunk_existing(file, row, record.size) {
+    };
+    let expected = (!is_snapshot).then_some(row.size);
+    match chunk_existing(file, row, record.size, expected) {
         Some((identity, specs, hints)) if manifest_root(&specs) == record.root => {
-            Verdict::Proven(identity, hints)
+            Verdict::Proven(identity, hints, is_snapshot)
         }
         _ => Verdict::Unproven,
     }
@@ -213,14 +249,19 @@ pub fn prove(file: &File, row: &RowSchema, key: &[u8; 32]) -> Verdict {
 
 /// Chunk an existing output as the source chunks a capture (`FastCDC` with
 /// [`crate::hash`]'s bounds, BLAKE3 per chunk), through `pread`, checking
-/// its size and mode against the row and its identity before and after.
+/// its size (against `expected`, when given) and mode against the row and
+/// its identity before and after.
 fn chunk_existing(
     file: &File,
     row: &RowSchema,
     size: u64,
+    expected: Option<u64>,
 ) -> Option<(StatIdentity, Vec<ChunkSpec>, Vec<ChunkHint>)> {
     let before = file.metadata().ok()?;
-    if size != row.size || before.len() != size || before.mode() & 0o7777 != row.mode & 0o7777 {
+    if expected.is_some_and(|expected| expected != size)
+        || before.len() != size
+        || before.mode() & 0o7777 != row.mode & 0o7777
+    {
         return None;
     }
     let identity = StatIdentity::from_metadata(&before);

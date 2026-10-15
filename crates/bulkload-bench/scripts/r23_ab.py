@@ -190,6 +190,17 @@ across A reps as the ratified order spreads them. Whether such a sample may
 stand as a gate verdict is the operator's decision, not this script's. The
 v4 dedup reference rep still runs.
 
+Lever arms (OI-1003-Q154 review): --b-env KEY=VALUE (repeatable, BULKLOAD_*
+keys only) sets a variable for every B rep and no other, so a lever's knob
+(for example BULKLOAD_LOOPBACK_HANDOFF=0 or BULKLOAD_DEST_GROUP_IDLE_MS=20)
+is measured as its own B arm. It is informational only: --under-load or
+--dry-run, never a gated sample. The report's `b_env`, each rep's `env`, the
+evidence header and the label of every B row in the Repetitions table name
+it. Each lever split is its own --under-load run with its own *underload*
+evidence. A BULKLOAD_* variable in the harness's own environment would reach
+every revision's builds and reps unrecorded, so any is refused, in every
+mode.
+
 Exit: 0 complete (the gate verdict is in the evidence, pass or fail),
 2 refused before the sample, 3 aborted during the sample, 4 build failure.
 """
@@ -1215,6 +1226,27 @@ def post_settle(
     return first, now
 
 
+B_ENV_KEY = re.compile(r"BULKLOAD_[A-Z0-9_]+")
+
+
+def parse_b_env(pairs_given: list[str]) -> tuple[dict[str, str], str | None]:
+    """--b-env KEY=VALUE pairs as a map, or the reason they are refused."""
+    env: dict[str, str] = {}
+    for given in pairs_given:
+        key, sep, value = given.partition("=")
+        if not sep or B_ENV_KEY.fullmatch(key) is None:
+            return {}, f"--b-env {given!r} is not BULKLOAD_<NAME>=<value>"
+        if key in env:
+            return {}, f"--b-env names {key} twice"
+        env[key] = value
+    return env, None
+
+
+def inherited_bulkload_env() -> list[str]:
+    """BULKLOAD_* variables in the harness's own environment."""
+    return sorted(key for key in os.environ if key.startswith("BULKLOAD_"))
+
+
 def run_rep(
     label: str,
     info: dict[str, object],
@@ -1251,9 +1283,13 @@ def run_rep(
         f"power={before['power']} source_residency={source_cache}"
     )
     env = None
+    # A lever arm's knob reaches the B reps and no other (--b-env).
+    extra = dict(getattr(args, "b_env_map", {})) if label == "B" else {}
+    if info.get("preflight") == "pmset-shim" or extra:
+        env = dict(os.environ)
+        env.update(extra)
     if info.get("preflight") == "pmset-shim":
         # A baseline that only knows pmset: see "Baselines on Linux".
-        env = dict(os.environ)
         env["PATH"] = f"{write_pmset_shim(work)}{os.pathsep}{env.get('PATH', '')}"
     started = time.monotonic()
     result = subprocess.run(
@@ -1302,6 +1338,7 @@ def run_rep(
         "sha": info["sha"],
         "native_only": native_only,
         "command": command,
+        "env": extra,
         "preflight": info.get("preflight", "native"),
         "exit": result.returncode,
         "wall_s": round(wall_s, 3),
@@ -1648,6 +1685,15 @@ def evidence(report: dict[str, object]) -> str:
             f"> **{NOT_GATE}.** Synthetic corpus, `--informational`, no host gating.",
             "",
         ]
+    if report.get("b_env"):
+        knobs = ", ".join(f"`{key}={value}`" for key, value in report["b_env"].items())
+        lines += [
+            f"> **B ENVIRONMENT: {knobs}.** Every B rep ran with this setting"
+            " (`--b-env`, OI-1003-Q154 review); A and V4 ran without it. This"
+            " sample measures B with that setting, informationally, and is no"
+            " sample of B as built.",
+            "",
+        ]
     if report.get("refused_reps"):
         lines += [
             "Informational reps the bench refused under load (recorded, not fatal; OI-1003-Q50):",
@@ -1821,8 +1867,11 @@ def evidence(report: dict[str, object]) -> str:
     ]
     for rep in report["reps"]:
         s = rep["summary"]
+        label = rep["label"]
+        if rep.get("env"):
+            label += f" ({' '.join(f'{k}={v}' for k, v in rep['env'].items())})"
         lines.append(
-            f"| {rep['index']} | {rep['label']} | {rep['conditions_before']['load1']}/"
+            f"| {rep['index']} | {label} | {rep['conditions_before']['load1']}/"
             f"{rep['conditions_after']['load1']}/{rep['conditions_after_settled']['load1']} |"
             f" {rep['conditions_before']['power']} | {fmt(rep['source_resident_fraction'])}/"
             f"{fmt(rep['fixture_resident_fraction_after'])} | {fmt(s['native_initial_median_ms'])} |"
@@ -2020,6 +2069,15 @@ def main(argv: list[str] | None = None) -> int:
         help=f"{UNDER_LOAD}: sealed corpus, bench --informational, load recorded"
         " but not gated, AC power still required (OI-1003-Q39, OI-1003-Q50)",
     )
+    parser.add_argument(
+        "--b-env",
+        action="append",
+        default=[],
+        metavar="BULKLOAD_NAME=VALUE",
+        help="set this variable for every B rep and no other: a lever's own"
+        " informational arm (--under-load or --dry-run only), recorded in the"
+        " report and the evidence (OI-1003-Q154 review)",
+    )
     if (sys.argv[1:] if argv is None else argv)[:1] == ["--pmset-shim"]:
         return pmset_shim_main()
     args = parser.parse_args(argv)
@@ -2038,6 +2096,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run and args.under_load:
         say("refused: --dry-run and --under-load are exclusive")
         return 2
+    inherited = inherited_bulkload_env()
+    if inherited:
+        say(
+            f"refused: {', '.join(inherited)} set in the harness's environment would"
+            " reach every revision's builds and reps unrecorded; unset it, and pass a"
+            " lever's knob to B with --b-env (OI-1003-Q154 review)"
+        )
+        return 2
+    b_env, b_env_problem = parse_b_env(args.b_env)
+    if b_env_problem:
+        say(f"refused: {b_env_problem}")
+        return 2
+    if b_env and (args.build_only or not (args.dry_run or args.under_load)):
+        say(
+            "refused: --b-env is a lever's informational arm: --under-load or"
+            " --dry-run only, never a gated sample or --build-only"
+        )
+        return 2
+    args.b_env_map = b_env
     no_a = args.b_only_no_a_control
     if no_a:
         if args.dry_run or args.under_load:
@@ -2242,6 +2319,7 @@ def main(argv: list[str] | None = None) -> int:
         "date": date,
         "stamp": stamp,
         "mode": mode,
+        "b_env": b_env,
         "host": platform.node(),
         "platform": platform.platform(),
         "host_identity": identity,

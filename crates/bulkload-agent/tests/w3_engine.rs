@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use bulkload_agent::counters::{Counter, Counters};
 use bulkload_agent::durable::{set_durability, Durability};
-use bulkload_agent::transfer::{copy, settle_racy_window, TransferStats};
+use bulkload_agent::transfer::{copy, settle_racy_window, TransferStats, LOOPBACK_HANDOFF_ENV};
 
 struct Scratch(PathBuf);
 
@@ -94,11 +94,8 @@ fn w3_engine_properties() {
         "destination hashed {} of {payload}",
         counted.blake3_destination()
     );
-    assert_eq!(
-        counted.get(Counter::HashWireVerify),
-        first.bytes_received,
-        "every received byte is verified exactly once"
-    );
+    // Every received byte is verified exactly once (OI-1003-Q154 lever 1).
+    verified_once(&counted, first.bytes_received);
     assert_eq!(counted.get(Counter::DestVerifyRead), 0);
     assert_eq!(counted.get(Counter::HashVerifyExisting), 0);
     assert_eq!(counted.get(Counter::SourcePackReadback), 0);
@@ -178,4 +175,34 @@ fn w3_engine_properties() {
     assert_eq!(grown.source_bytes_read, extended.len() as u64);
     assert!(grown.bytes_received < extended.len() as u64);
     assert!(counted.get(Counter::DestLocalReuseRead) > 0);
+    // The requested tail, verified exactly once in either arm.
+    verified_once(&counted, grown.bytes_received);
+}
+
+/// Every received byte is verified exactly once.
+///
+/// A local copy's chunks are handed over in process, and the source's own hash of those very bytes is
+/// their verify (OI-1003-Q154 lever 1); bytes that cross a transport are
+/// hashed by the destination (`tests/loopback_handoff.rs`). The gates run this
+/// binary in both arms: with the hand-off (the default) and with it off
+/// (`BULKLOAD_LOOPBACK_HANDOFF=0`, the transport path every `pull` takes,
+/// `just handoff-off`), where the destination hashes every byte.
+fn verified_once(counted: &Counters, received: u64) {
+    let (verified, handed) = (
+        counted.get(Counter::HashWireVerify),
+        counted.get(Counter::WireHandedBytes),
+    );
+    assert_eq!(verified + handed, received, "{}", counted.render());
+    if handoff_off() {
+        assert_eq!(handed, 0, "the plain arm hands nothing over");
+        assert_eq!(verified, received, "the plain arm verifies every byte");
+    } else {
+        assert_eq!(verified, 0, "verify once: {}", counted.render());
+    }
+}
+
+/// The arm this run is in: the hand-off off (`BULKLOAD_LOOPBACK_HANDOFF=0`)
+/// or on (the default).
+fn handoff_off() -> bool {
+    std::env::var(LOOPBACK_HANDOFF_ENV).is_ok_and(|value| value == "0")
 }

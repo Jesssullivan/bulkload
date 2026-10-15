@@ -287,16 +287,44 @@ pub(crate) enum LedgerRecord {
 
 /// Why the source refused a seat for its content (#186, R25).
 ///
-/// It is remembered under the seat's row key (its path and stat identity),
-/// so that a rerun refuses the seat again without opening the file. Only a
-/// refusal that depends on nothing but the seat's bytes is remembered, and
-/// only when the seat was not racy when it was sniffed: its stat identity
-/// then vouches for those bytes, exactly as it does for a capture (#86).
+/// It is remembered under the seat's key, so that a rerun refuses the seat
+/// again without opening the file. Only a refusal that depends on nothing
+/// but the seat's bytes is remembered, and only when the seat was not racy
+/// when it was read: its stat identity then vouches for those bytes,
+/// exactly as it does for a capture (#86).
+///
+/// The kinds that depend on the session's [`SqliteMode`] are kept apart
+/// (#218 review, R8): `refuse` mode writes [`Self::SqliteHeader`] under the
+/// row key, exactly as v5 does; `snapshot` mode ignores it (it does not say
+/// which magic was seen) and writes [`Self::SqliteWalHeader`] for WAL magic
+/// under the row key, and the snapshot kinds and [`Self::SqliteBesideWal`]
+/// under the snapshot key ([`sqlite_key`]), which no row key ever equals.
+///
+/// [`SqliteMode`]: bulkload_proto::frame::SqliteMode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefusedSeat {
     /// The file starts with a `SQLite` database or WAL magic: provider state,
-    /// which only the `SQLite` backup path carries.
+    /// which only the `SQLite` backup path carries. `refuse` mode's record,
+    /// v5's own.
     SqliteHeader,
+    /// `snapshot` mode: the snapshot of an unchanged database failed its
+    /// integrity check (`SQLITE_INTEGRITY_CHECK_FAILED`).
+    SqliteSnapshotIntegrity,
+    /// The file starts with a `SQLite` WAL magic: a stray WAL is not a
+    /// database, in either mode.
+    SqliteWalHeader,
+    /// `snapshot` mode: the backup of an unchanged database reported
+    /// `SQLITE_CORRUPT` (primary code 11).
+    SqliteSnapshotCorrupt,
+    /// `snapshot` mode: the backup of an unchanged file reported
+    /// `SQLITE_NOTADB` (primary code 26).
+    SqliteSnapshotNotADatabase,
+    /// `snapshot` mode (#218 review): a file without the database magic (an
+    /// encrypted store) beside a `-wal` that holds frames. Its main file
+    /// alone may miss committed transactions or hold a half-done
+    /// checkpoint, so it is never carried raw. Keyed on the row and the
+    /// `-wal`'s identity, which vouch for it together.
+    SqliteBesideWal,
 }
 
 impl RefusedSeat {
@@ -304,21 +332,53 @@ impl RefusedSeat {
     const fn tag(self) -> i64 {
         match self {
             Self::SqliteHeader => 1,
+            Self::SqliteSnapshotIntegrity => 2,
+            Self::SqliteWalHeader => 3,
+            Self::SqliteSnapshotCorrupt => 4,
+            Self::SqliteSnapshotNotADatabase => 5,
+            Self::SqliteBesideWal => 6,
         }
     }
 
     const fn from_tag(tag: i64) -> Option<Self> {
         match tag {
             1 => Some(Self::SqliteHeader),
+            2 => Some(Self::SqliteSnapshotIntegrity),
+            3 => Some(Self::SqliteWalHeader),
+            4 => Some(Self::SqliteSnapshotCorrupt),
+            5 => Some(Self::SqliteSnapshotNotADatabase),
+            6 => Some(Self::SqliteBesideWal),
             _ => None,
         }
     }
 
-    /// The refusal this record stands for, with the code the sniff gave.
+    /// The refusal this record stands for, with the code the read gave.
     #[must_use]
     pub const fn refusal(self) -> BulkloadRefusal {
         match self {
-            Self::SqliteHeader => BulkloadRefusal::SqliteStateChanged,
+            Self::SqliteHeader | Self::SqliteWalHeader | Self::SqliteBesideWal => {
+                BulkloadRefusal::SqliteStateChanged
+            }
+            Self::SqliteSnapshotIntegrity => BulkloadRefusal::SqliteIntegrityCheckFailed,
+            Self::SqliteSnapshotCorrupt => BulkloadRefusal::SqliteBackupFailed(Some(11)),
+            Self::SqliteSnapshotNotADatabase => BulkloadRefusal::SqliteBackupFailed(Some(26)),
+        }
+    }
+
+    /// The record a snapshot refusal is remembered as, when the refusal
+    /// depends on the database's bytes alone: an integrity failure, or a
+    /// backup that reported corruption or not-a-database (#218, R10: the
+    /// extended code is masked to its primary code first).
+    #[must_use]
+    pub fn of_snapshot_refusal(refusal: &BulkloadRefusal) -> Option<Self> {
+        match refusal {
+            BulkloadRefusal::SqliteIntegrityCheckFailed => Some(Self::SqliteSnapshotIntegrity),
+            BulkloadRefusal::SqliteBackupFailed(Some(code)) => match code & 0xff {
+                11 => Some(Self::SqliteSnapshotCorrupt),
+                26 => Some(Self::SqliteSnapshotNotADatabase),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -420,7 +480,8 @@ pub(crate) type OutputRow = (Vec<u8>, Vec<u8>);
 /// - `owned`, the output this store's rows named, at `leaf` or, displaced,
 ///   at `temp`;
 /// - anything else at `temp` is a file this store does not own, displaced
-///   by the exchange: it is exchanged back, never removed.
+///   by the exchange: it is exchanged back while `leaf` holds `staged`
+///   unwritten since (`stamp`), otherwise kept aside; never removed.
 ///
 /// Settling deletes the record: with the new output's row, in its group's
 /// commit; or, when the exchange did not happen and the output is still
@@ -561,6 +622,66 @@ const RACY_GUARD_SETTING: &str = "racy_guard";
 /// without it, then adds it.
 const ROOT_SEALED_SETTING: &str = "root_sealed";
 
+/// The A/B knob of OI-1003-Q154 lever 3a.
+///
+/// `0` makes a new store as before the lever, an empty file `SQLite`
+/// switches to WAL with a rollback-journal commit of its own. Unset or any
+/// other value writes the WAL template
+/// ([`crate::io::durable::init_wal_database`]).
+pub const STORE_WAL_TEMPLATE_ENV: &str = "BULKLOAD_STORE_WAL_TEMPLATE";
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: this thread's new stores skip the template, as
+    /// [`STORE_WAL_TEMPLATE_ENV`] `=0` would.
+    static WAL_TEMPLATE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Templates this thread's `Store::open` calls wrote.
+    static WAL_TEMPLATES_WRITTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a new store is created from the WAL template (lever 3a): on,
+/// unless [`STORE_WAL_TEMPLATE_ENV`] is `0` (or a test turned it off for
+/// its thread). Either way is safe: off only adds `SQLite`'s own switch.
+fn wal_template() -> bool {
+    #[cfg(test)]
+    if WAL_TEMPLATE_OFF.with(std::cell::Cell::get) {
+        return false;
+    }
+    std::env::var(STORE_WAL_TEMPLATE_ENV).map_or(true, |value| value != "0")
+}
+
+/// Make whole a store file that a crash left inside
+/// [`crate::io::durable::init_wal_database`] (OI-1003-Q154 lever 3): at
+/// most one page, with no `-wal` beside it, of zeros and template bytes
+/// only. Such a file holds no store (its first commit would have made the
+/// WAL), and `SQLite` would refuse a torn header for good; it is written
+/// again. A file with a `-wal` (a store, maybe open in this process: its
+/// connections keep the WAL while they live, and a closed descriptor would
+/// drop their locks), a longer file, or any other content is left to
+/// `SQLite`, as before.
+fn finish_wal_init(state: &fs::File, root: &Path, size: u64) -> Result<()> {
+    let small =
+        usize::try_from(size).is_ok_and(|size| size <= crate::io::durable::WAL_TEMPLATE_BYTES);
+    if !small || crate::io::sys::fstatat_nofollow(state, c"transfer.sqlite-wal").is_ok() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join("transfer.sqlite"))
+        .refuse_at("transfer_store::finish_wal_init")?;
+    let mut found = Vec::new();
+    file.read_to_end(&mut found)
+        .refuse_at("transfer_store::finish_wal_init")?;
+    if found.as_slice() == crate::io::durable::wal_database_template()
+        || !crate::io::durable::interrupted_wal_init(&found)
+    {
+        return Ok(());
+    }
+    crate::io::durable::init_wal_database(&file).refuse_at("transfer_store::finish_wal_init")
+}
+
 /// A private, source-bound transfer state directory.
 pub struct Store {
     root: PathBuf,
@@ -599,19 +720,32 @@ impl Store {
     /// A root that still needs its seal under a parent the agent may search
     /// but not read refuses with `IO` (`EACCES`): its entry cannot be made
     /// durable, so no record may commit in it.
+    #[allow(clippy::too_many_lines)] // Create, configure, seal, the creation commit.
     pub fn open(root: &Path) -> Result<Self> {
         let mut state = StateRoot::open(root)?;
         let name = c"transfer.sqlite";
         // Created through `io::sys`, so the R-N88 trace sees the entry the
         // root seal below makes durable.
         match crate::io::sys::create_excl_at(state.root.as_fd(), name, 0o600) {
-            Ok(_) => {}
+            // Created directly in WAL mode (OI-1003-Q154 lever 3): no
+            // rollback-journal commit switches it, so no `-journal` sync.
+            // With the knob off, `SQLite` switches the empty file, as before.
+            Ok(created) => {
+                if wal_template() {
+                    crate::io::durable::init_wal_database(&fs::File::from(created))
+                        .refuse_at("transfer_store::open")?;
+                    counters::bump(Counter::StoreWalTemplates);
+                    #[cfg(test)]
+                    WAL_TEMPLATES_WRITTEN.with(|written| written.set(written.get() + 1));
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let found = crate::io::sys::fstatat_nofollow(&state.root, name)
                     .refuse_at("transfer_store::open")?;
                 if !found.is_file() || found.mode & 0o077 != 0 {
                     return Err(BulkloadRefusal::PathEscapesRoot);
                 }
+                finish_wal_init(&state.root, root, found.size)?;
             }
             Err(error) => return Err(crate::refuse::io(&error, "transfer_store::open")),
         }
@@ -709,13 +843,14 @@ impl Store {
                 }
                 Ok(())
             })
-            .map_err(sqlite_error);
+            .map_err(sqlite_failed(&conn));
         if created.is_err() {
             let _ = conn.execute_batch("ROLLBACK");
         } else if conn.total_changes() != before {
             counters::sqlite_commit(Counter::SqliteSchema, started, &created);
         }
-        created?;
+        // S4 (#126): a full state directory names itself, on either side.
+        created.map_err(|refusal| named_space(refusal, root))?;
         counters::add_len(Counter::TransferLegacyRowsInvalidated, invalidated);
         Ok(Self {
             root: fs::canonicalize(root).refuse_at("transfer_store::open")?,
@@ -1103,7 +1238,11 @@ impl Store {
                 owned,
             },
         )
-        .and_then(|()| self.conn.execute_batch("COMMIT").map_err(sqlite_error));
+        .and_then(|()| {
+            self.conn
+                .execute_batch("COMMIT")
+                .map_err(sqlite_failed(&self.conn))
+        });
         if settled.is_err() {
             let _ = self.conn.execute_batch("ROLLBACK");
         }
@@ -1513,14 +1652,14 @@ impl StorePublisher {
             self.store
                 .conn
                 .execute_batch("COMMIT")
-                .map_err(sqlite_error)
+                .map_err(sqlite_failed(&self.store.conn))
         });
         #[cfg(not(test))]
         let committed = self
             .store
             .conn
             .execute_batch("COMMIT")
-            .map_err(sqlite_error);
+            .map_err(sqlite_failed(&self.store.conn));
         counters::sqlite_commit(self.group_counter(), started, &committed);
         #[cfg(feature = "io-trace")]
         if committed.is_ok() {
@@ -1602,7 +1741,7 @@ impl StorePublisher {
             self.store
                 .conn
                 .execute_batch("COMMIT")
-                .map_err(sqlite_error)
+                .map_err(sqlite_failed(&self.store.conn))
         })();
         if recorded.is_err() {
             let _ = self.store.conn.execute_batch("ROLLBACK");
@@ -1685,14 +1824,14 @@ impl StorePublisher {
             self.store
                 .conn
                 .execute_batch("COMMIT")
-                .map_err(sqlite_error)
+                .map_err(sqlite_failed(&self.store.conn))
         });
         #[cfg(not(test))]
         let committed = self
             .store
             .conn
             .execute_batch("COMMIT")
-            .map_err(sqlite_error);
+            .map_err(sqlite_failed(&self.store.conn));
         if committed.is_ok() {
             // Successful commits only, matching `counters::sqlite_commit`.
             SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -1804,7 +1943,13 @@ impl LedgerSink {
                 return Err(BulkloadRefusal::DigestMismatch);
             }
         }
-        match self.publisher.commit_captures(items) {
+        // S4 (#126): the source ledger's full state directory names itself;
+        // it is never the destination's space.
+        match self
+            .publisher
+            .commit_captures(items)
+            .map_err(|refusal| named_space(refusal, self.publisher.store.root()))
+        {
             Err(_) if self.publisher.ledger_sync == crate::io::durable::LedgerSync::Relaxed => {
                 // #163: counted, never fatal. The rows are not in the
                 // ledger (the transaction rolled back), so a later run
@@ -1850,6 +1995,32 @@ impl crate::io::durable::GroupSink for LedgerSink {
 /// Refuses serialization failure.
 pub fn row_key(authority: &[u8], row: &RowSchema) -> Result<Vec<u8>> {
     postcard::to_stdvec(&(authority, row)).refuse_at("transfer_store::row_key")
+}
+
+/// The marker a snapshot seat's key carries after its row (#218).
+const SQLITE_KEY_MARK: &[u8] = b"bulkload sqlite snapshot seat v1";
+
+/// The key of a `SQLite` snapshot seat (#218): its row, a marker, and the
+/// identity of its `-wal` (`None`: none beside it).
+///
+/// A WAL-mode commit writes only the `-wal` until a checkpoint, so the main
+/// file's row alone cannot vouch for the database; the pair can (design
+/// section 5.2). The key is never equal to any [`row_key`] (postcard decodes
+/// a row from the front of either, and this one has bytes after it), so a
+/// reuse row under it says the output is a snapshot, and a raw file's row
+/// never answers for a snapshot or the reverse (R2, R8). It starts with
+/// the row key's own prefix, so [`path_prefix`] and [`owner_key`] read it
+/// as they read any row key of the path.
+///
+/// # Errors
+/// Refuses serialization failure.
+pub fn sqlite_key(
+    authority: &[u8],
+    row: &RowSchema,
+    wal: Option<&bulkload_proto::frame::SidecarId>,
+) -> Result<Vec<u8>> {
+    postcard::to_stdvec(&(authority, row, SQLITE_KEY_MARK, wal))
+        .refuse_at("transfer_store::sqlite_key")
 }
 
 /// The prefix every row key of one destination path shares under
@@ -2152,17 +2323,145 @@ fn resolve_leaf(path: &Path) -> Result<std::borrow::Cow<'_, Path>> {
     reason = "the `map_err` callback shape every store call uses"
 )]
 fn sqlite_error(error: rusqlite::Error) -> BulkloadRefusal {
-    // A full disk is reported as the `ENOSPC` it is, so a failed group
-    // commit names its cause (#100); anything else is the store's fault.
-    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
-        return BulkloadRefusal::Io(Some(libc::ENOSPC));
+    sqlite_refusal(&error, 0)
+}
+
+/// [`sqlite_error`] for a call on `conn` that may write (a `COMMIT`), with
+/// the OS errno `SQLite` saw, read before any other call on `conn`.
+fn sqlite_failed(conn: &rusqlite::Connection) -> impl Fn(rusqlite::Error) -> BulkloadRefusal + '_ {
+    move |error| {
+        // SAFETY: `conn` is open and borrowed for this call, so its handle is
+        // a live connection; `sqlite3_system_errno` only reads that
+        // connection's last recorded errno, and nothing else calls into it
+        // between the failed call and this read.
+        let errno = unsafe { rusqlite::ffi::sqlite3_system_errno(conn.handle()) };
+        sqlite_refusal(&error, errno)
     }
-    BulkloadRefusal::SqliteIntegrityCheckFailed
+}
+
+/// A store's `SQLite` failure as a refusal (S4, #126), given the OS errno
+/// `SQLite` recorded (0 when the caller cannot read it).
+///
+/// Out of space is `SPACE_EXHAUSTED` with no path: `SQLITE_FULL`, which
+/// `SQLite` raises for `ENOSPC` on a write, and an I/O error whose errno is
+/// `ENOSPC` or `EDQUOT` (a quota, or a full disk met at a sync or a
+/// truncate, which `SQLite` reports as `SQLITE_IOERR_*`). The caller that
+/// knows the store names its root ([`named_space`]); a destination group
+/// commit, which the transfer's space preflight charges, lifts it to
+/// `DESTINATION_SPACE_INSUFFICIENT` (`materialize::space_refusal`). Any
+/// other I/O error is `IO` with its errno (`EIO`, `SQLite`'s own "disk I/O
+/// error", when the errno is unknown), never the store's corruption.
+/// Anything else is the store's fault.
+fn sqlite_refusal(error: &rusqlite::Error, errno: std::ffi::c_int) -> BulkloadRefusal {
+    match error.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::DiskFull) => BulkloadRefusal::SpaceExhausted(None),
+        Some(rusqlite::ErrorCode::SystemIoFailure) => match errno {
+            libc::ENOSPC | libc::EDQUOT => BulkloadRefusal::SpaceExhausted(None),
+            0 => BulkloadRefusal::Io(Some(libc::EIO)),
+            errno => BulkloadRefusal::Io(Some(errno)),
+        },
+        _ => BulkloadRefusal::SqliteIntegrityCheckFailed,
+    }
+}
+
+/// A store's unnamed out-of-space refusal, named with its `root` (S4,
+/// #126): the directory whose filesystem filled, which no preflight charges.
+fn named_space(refusal: BulkloadRefusal, root: &Path) -> BulkloadRefusal {
+    use std::os::unix::ffi::OsStrExt as _;
+    match refusal {
+        BulkloadRefusal::SpaceExhausted(None) => {
+            BulkloadRefusal::SpaceExhausted(Some(root.as_os_str().as_bytes().to_vec()))
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // S4 (#126): a real `SQLITE_FULL` (a database held to two pages) is the
+    // unnamed space refusal, never a bare `IO` and never the destination's
+    // space: only a destination group commit lifts it to that
+    // (`materialize::space_refusal`).
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_full_store_refuses_the_typed_space_refusal() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (v BLOB); PRAGMA max_page_count = 2;")
+            .unwrap();
+        let full = conn
+            .execute("INSERT INTO t VALUES (zeroblob(65536))", [])
+            .unwrap_err();
+        assert_eq!(
+            full.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DiskFull)
+        );
+        assert_eq!(sqlite_error(full), BulkloadRefusal::SpaceExhausted(None));
+    }
+
+    // S4 (#126): the source ledger's full state directory refuses
+    // `SPACE_EXHAUSTED` naming that directory under `LedgerSync::Full`,
+    // never `DESTINATION_SPACE_INSUFFICIENT`, which points at the other host.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_full_source_ledger_names_its_state_directory() -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let root = TestRoot::new()?;
+        let sink = full_ledger_sink(&root.0.join("state"))?;
+        let conn = &sink.publisher.store.conn;
+        let pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        conn.execute_batch(&format!("PRAGMA max_page_count = {pages}"))
+            .unwrap();
+        let items: Vec<LedgerItem> = (0..512_u32)
+            .map(|n| {
+                item(
+                    &[n.to_le_bytes().as_slice(), &[0xa5; 60]].concat(),
+                    b"payload",
+                )
+            })
+            .collect();
+        let state = sink.publisher.store.root().as_os_str().as_bytes().to_vec();
+        assert_eq!(
+            sink.publish(&items),
+            Err(BulkloadRefusal::SpaceExhausted(Some(state)))
+        );
+        Ok(())
+    }
+
+    // S4 (#126): `SQLite` reports a quota (`EDQUOT`), or a full disk met at a
+    // sync or a truncate, as `SQLITE_IOERR_*`, not `SQLITE_FULL`. With the
+    // errno it recorded, that is the space refusal; any other I/O error is
+    // `IO` with its errno, never the store's corruption.
+    #[test]
+    fn an_io_error_is_never_the_store_s_corruption() {
+        let io =
+            |extended| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(extended), None);
+        for (extended, errno) in [
+            (rusqlite::ffi::SQLITE_IOERR_WRITE, libc::EDQUOT),
+            (rusqlite::ffi::SQLITE_IOERR_FSYNC, libc::ENOSPC),
+            (rusqlite::ffi::SQLITE_IOERR_TRUNCATE, libc::EDQUOT),
+        ] {
+            assert_eq!(
+                sqlite_refusal(&io(extended), errno),
+                BulkloadRefusal::SpaceExhausted(None)
+            );
+        }
+        assert_eq!(
+            sqlite_refusal(&io(rusqlite::ffi::SQLITE_IOERR_WRITE), libc::EROFS),
+            BulkloadRefusal::Io(Some(libc::EROFS))
+        );
+        assert_eq!(
+            sqlite_error(io(rusqlite::ffi::SQLITE_IOERR_WRITE)),
+            BulkloadRefusal::Io(Some(libc::EIO))
+        );
+        assert_eq!(
+            sqlite_error(io(rusqlite::ffi::SQLITE_CORRUPT)),
+            BulkloadRefusal::SqliteIntegrityCheckFailed
+        );
+    }
 
     struct TestRoot(PathBuf);
 
@@ -2389,6 +2688,107 @@ mod tests {
         Ok(())
     }
 
+    /// #218 (R2, R8): a snapshot seat's key shares its path's prefix and
+    /// ownership key with the row key, but never equals a row key (of the
+    /// same row, or of any row that decodes from its front), with or
+    /// without a `-wal`, and differs for every `-wal` identity.
+    #[test]
+    fn a_snapshot_key_shares_the_path_prefix_and_is_never_a_row_key() -> Result<()> {
+        use bulkload_proto::frame::SidecarId;
+        let row = seat_row(b"dir/state.db", 7);
+        let wal = |size| SidecarId {
+            dev: 1,
+            ino: 8,
+            size,
+            mtime_ns: 3,
+            ctime_ns: 4,
+        };
+        let prefix = path_prefix(b"authority", b"dir/state.db")?;
+        let plain = row_key(b"authority", &row)?;
+        let mut keys = vec![sqlite_key(b"authority", &row, None)?];
+        for size in [0, 32, 4096] {
+            keys.push(sqlite_key(b"authority", &row, Some(&wal(size)))?);
+        }
+        for key in &keys {
+            assert!(key.starts_with(&prefix));
+            assert_ne!(*key, plain);
+            assert_eq!(owner_key(key), owner_key(&plain));
+            assert_eq!(owner_key(key), Some(prefix.as_slice()));
+            // The row decodes from the front, and bytes are left after it.
+            let (_, rest) = postcard::take_from_bytes::<(&[u8], RowSchema)>(key)
+                .map_err(|_| BulkloadRefusal::FrameCodec)?;
+            assert!(!rest.is_empty());
+        }
+        let mut distinct = keys.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), keys.len());
+        Ok(())
+    }
+
+    /// #218 (R8, R10): every refused-seat kind round-trips through its tag,
+    /// tags never collide, and a snapshot refusal is remembered only for
+    /// codes the bytes alone decide, the extended code masked to its
+    /// primary code.
+    #[test]
+    fn refused_seat_kinds_round_trip_and_mask_extended_codes() {
+        let kinds = [
+            RefusedSeat::SqliteHeader,
+            RefusedSeat::SqliteSnapshotIntegrity,
+            RefusedSeat::SqliteWalHeader,
+            RefusedSeat::SqliteSnapshotCorrupt,
+            RefusedSeat::SqliteSnapshotNotADatabase,
+            RefusedSeat::SqliteBesideWal,
+        ];
+        let mut tags: Vec<i64> = kinds.iter().map(|kind| kind.tag()).collect();
+        for kind in kinds {
+            assert_eq!(RefusedSeat::from_tag(kind.tag()), Some(kind));
+        }
+        tags.sort_unstable();
+        tags.dedup();
+        assert_eq!(tags.len(), kinds.len());
+        assert_eq!(RefusedSeat::SqliteHeader.tag(), 1, "v5's own tag");
+        for (refusal, kind) in [
+            (
+                BulkloadRefusal::SqliteIntegrityCheckFailed,
+                Some(RefusedSeat::SqliteSnapshotIntegrity),
+            ),
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(11)),
+                Some(RefusedSeat::SqliteSnapshotCorrupt),
+            ),
+            // SQLITE_CORRUPT_INDEX, _SEQUENCE and _VTAB.
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(779)),
+                Some(RefusedSeat::SqliteSnapshotCorrupt),
+            ),
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(523)),
+                Some(RefusedSeat::SqliteSnapshotCorrupt),
+            ),
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(267)),
+                Some(RefusedSeat::SqliteSnapshotCorrupt),
+            ),
+            (
+                BulkloadRefusal::SqliteBackupFailed(Some(26)),
+                Some(RefusedSeat::SqliteSnapshotNotADatabase),
+            ),
+            (BulkloadRefusal::SqliteBackupFailed(Some(5)), None),
+            (BulkloadRefusal::SqliteBackupFailed(Some(1032)), None),
+            (BulkloadRefusal::SqliteBackupFailed(None), None),
+            (BulkloadRefusal::SqliteStateChanged, None),
+            (BulkloadRefusal::BudgetExceeded, None),
+            (BulkloadRefusal::SqliteSourceNotOwner, None),
+        ] {
+            assert_eq!(
+                RefusedSeat::of_snapshot_refusal(&refusal),
+                kind,
+                "{refusal}"
+            );
+        }
+    }
+
     /// WP0(d), #187: a superseding publish's intent takes its output's rows
     /// out of the store in the commit that records it, and is settled
     /// either by putting them back or by the new output's row, in one
@@ -2613,6 +3013,163 @@ mod tests {
         drop(store);
         let store = Store::open(&state)?;
         assert!(has_setting(&store.conn, ROOT_SEALED_SETTING).map_err(sqlite_error)?);
+        Ok(())
+    }
+
+    /// OI-1003-Q154 lever 3: a new store is created directly in WAL mode.
+    /// `SQLite` never writes its main file before a checkpoint (the template
+    /// is there unchanged: no rollback-journal commit switched it, which
+    /// would have moved its change counter) and no `-journal` remains; the
+    /// store's creation commit is in its WAL, and it reopens with its
+    /// authority.
+    #[test]
+    fn a_new_store_is_created_directly_in_wal_mode() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let store = Store::open(&state)?;
+        let authority = store.authority()?;
+        let database = state.join("transfer.sqlite");
+        let main = fs::read(&database).refuse_at("transfer_store::tests")?;
+        assert_eq!(
+            main.as_slice(),
+            crate::io::durable::wal_database_template().as_slice()
+        );
+        assert!(!state.join("transfer.sqlite-journal").exists());
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(sqlite_error)?;
+        assert_eq!(mode, "wal");
+        drop(store);
+        assert_eq!(Store::open(&state)?.authority()?, authority);
+        Ok(())
+    }
+
+    /// OI-1003-Q154 lever 3: a store file a crash left inside its template's
+    /// write (empty, short, or torn: zeros where the page did not land) is
+    /// made whole by the next open, which then creates the store; a file
+    /// with any other content is left to `SQLite`, which refuses it as
+    /// before. A store with a WAL is never touched
+    /// (`a_store_file_beside_a_wal_is_never_rewritten`).
+    #[test]
+    fn a_store_file_left_inside_its_template_write_is_made_whole() -> Result<()> {
+        let template = crate::io::durable::wal_database_template();
+        let mut torn = template;
+        torn[..512].fill(0);
+        for (case, bytes) in [
+            ("empty", Vec::new()),
+            ("short", template[..1000].to_vec()),
+            ("zeros", vec![0; template.len()]),
+            ("torn", torn.to_vec()),
+        ] {
+            let root = TestRoot::new()?;
+            let state = root.0.join("state");
+            drop(Store::open(&state)?);
+            for name in [
+                "transfer.sqlite",
+                "transfer.sqlite-wal",
+                "transfer.sqlite-shm",
+            ] {
+                let _ = fs::remove_file(state.join(name));
+            }
+            fs::write(state.join("transfer.sqlite"), &bytes).refuse_at("transfer_store::tests")?;
+            fs::set_permissions(
+                state.join("transfer.sqlite"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .refuse_at("transfer_store::tests")?;
+            let store = Store::open(&state).map_err(|refusal| {
+                eprintln!("{case}: {refusal:?}");
+                refusal
+            })?;
+            assert!(store.authority().is_ok(), "{case}");
+        }
+
+        // Not ours: a byte the template never has. SQLite refuses it.
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        drop(Store::open(&state)?);
+        for name in ["transfer.sqlite-wal", "transfer.sqlite-shm"] {
+            let _ = fs::remove_file(state.join(name));
+        }
+        let mut foreign = template;
+        foreign[0] = b'X';
+        fs::write(state.join("transfer.sqlite"), foreign).refuse_at("transfer_store::tests")?;
+        assert!(Store::open(&state).is_err());
+        assert_eq!(
+            fs::read(state.join("transfer.sqlite")).refuse_at("transfer_store::tests")?,
+            foreign,
+            "a file that is not the template's is never rewritten"
+        );
+        Ok(())
+    }
+
+    /// OI-1003-Q154 lever 3 (review): a short or torn main file beside a
+    /// live `-wal` is a store, maybe open in this process, never an
+    /// interrupted template write. `Store::open` leaves the main file's
+    /// bytes as they are, whatever `SQLite` then makes of it.
+    #[test]
+    fn a_store_file_beside_a_wal_is_never_rewritten() -> Result<()> {
+        let template = crate::io::durable::wal_database_template();
+        let mut torn = template;
+        torn[..512].fill(0);
+        // Not empty: `SQLite` itself discards the WAL of an empty file and
+        // makes a new database in it.
+        for (case, bytes) in [
+            ("short", template[..1000].to_vec()),
+            ("zeros", vec![0; template.len()]),
+            ("torn", torn.to_vec()),
+        ] {
+            let root = TestRoot::new()?;
+            let state = root.0.join("state");
+            drop(Store::open(&state)?);
+            let wal = fs::metadata(state.join("transfer.sqlite-wal"))
+                .refuse_at("transfer_store::tests")?;
+            assert!(wal.len() > 0, "{case}: the creation commit is in the WAL");
+            fs::write(state.join("transfer.sqlite"), &bytes).refuse_at("transfer_store::tests")?;
+            drop(Store::open(&state));
+            let found =
+                fs::read(state.join("transfer.sqlite")).refuse_at("transfer_store::tests")?;
+            assert!(
+                found == bytes,
+                "{case}: a store file beside a WAL is never rewritten"
+            );
+        }
+        Ok(())
+    }
+
+    /// Lever 3a's A/B knob (OI-1003-Q154 review): with the template off a
+    /// new store is made as before the lever, by `SQLite`'s own switch to
+    /// WAL, which writes the same page 1; with it on (the default) the
+    /// template is written. Either store takes its creation commit and
+    /// reopens with its authority.
+    #[test]
+    fn the_wal_template_knob_turns_lever_3a_off() -> Result<()> {
+        for off in [true, false] {
+            let root = TestRoot::new()?;
+            let state = root.0.join("state");
+            WAL_TEMPLATE_OFF.with(|flag| flag.set(off));
+            let before = WAL_TEMPLATES_WRITTEN.with(std::cell::Cell::get);
+            let store = Store::open(&state);
+            let written = WAL_TEMPLATES_WRITTEN.with(std::cell::Cell::get) - before;
+            WAL_TEMPLATE_OFF.with(|flag| flag.set(false));
+            let store = store?;
+            assert_eq!(written, u64::from(!off), "template off {off}");
+            let mode: String = store
+                .conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            assert_eq!(mode, "wal", "template off {off}");
+            let main =
+                fs::read(state.join("transfer.sqlite")).refuse_at("transfer_store::tests")?;
+            assert!(
+                main.as_slice() == crate::io::durable::wal_database_template().as_slice(),
+                "template off {off}: the same page 1 either way"
+            );
+            let authority = store.authority()?;
+            drop(store);
+            assert_eq!(Store::open(&state)?.authority()?, authority);
+        }
         Ok(())
     }
 

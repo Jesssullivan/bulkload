@@ -459,6 +459,9 @@ fn a_corrupt_first_chunk_is_refused_before_its_stage_fails() {
         .unwrap();
         settle_racy_window(&source).unwrap();
         set_recv_workers(&canonical(&destination), Some(workers));
+        // The corruption is a transport's: the loopback hand-off has none
+        // (its chunks are the source's own bytes, OI-1003-Q154 lever 1).
+        set_loopback_handoff(&canonical(&destination), Some(false));
         let digest = chunk_digests(&data)[0];
         CORRUPT_DIGESTS.lock().unwrap().push(digest);
         let corrupt = corpus.run().unwrap();
@@ -468,6 +471,7 @@ fn a_corrupt_first_chunk_is_refused_before_its_stage_fails() {
             .retain(|found| *found != digest);
         let whole = corpus.run().unwrap();
         set_recv_workers(&canonical(&destination), None);
+        set_loopback_handoff(&canonical(&destination), None);
         for directory in [source.join("ro"), destination.join("ro")] {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
@@ -652,6 +656,8 @@ proptest::proptest! {
             }
             settle_racy_window(&corpus.base.join("source")).unwrap();
             set_recv_workers(&canonical(&corpus.base.join("destination")), Some(workers));
+            // A transport's corruption: not on the loopback hand-off.
+            set_loopback_handoff(&canonical(&corpus.base.join("destination")), Some(false));
             CORRUPT_DIGESTS.lock().unwrap().extend(digests.iter().copied());
             let stats = corpus.run().unwrap();
             CORRUPT_DIGESTS
@@ -659,6 +665,7 @@ proptest::proptest! {
                 .unwrap()
                 .retain(|digest| !digests.contains(digest));
             set_recv_workers(&canonical(&corpus.base.join("destination")), None);
+            set_loopback_handoff(&canonical(&corpus.base.join("destination")), None);
             (outcome(&stats), tree(&corpus.base.join("destination")))
         };
         proptest::prop_assert_eq!(run(workers), run(0));
@@ -933,6 +940,7 @@ impl<W: Write> Write for Repeat<W> {
                         encode(&Control::Entry {
                             entry: entries,
                             row,
+                            wal: None,
                         }),
                         encode(&Control::WalkDone {
                             entries: entries + 1,
