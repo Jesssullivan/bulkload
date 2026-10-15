@@ -1158,9 +1158,10 @@ landed one), and the next changed capture converges both (its converge
 re-runs the attach rule and plans every ref). Fixing them needs the
 journal no-op (A4) to read the workspace ledger and run the attach rule or
 a ref step on every rerun of an unchanged source, which spends S3's zero
-read budget on every no-op apply and which no ruling allows. Operator
-decision asked: allow a metadata-only A4 check (ref ledger and
-`intended_branch` only), or rule both known limits.
+read budget on every no-op apply and which no ruling allows. **Ruled
+2026-10-15 (OI-1003-Q149, Linear TIN-4543): both are known limits**, as is
+finding 11 (`git switch` racing the HEAD locks); S3's zero-read no-op
+stays intact and convergence merges with them stated.
 
 **Further stated limits of the fixes.** A lock left empty by a Git child
 killed between creating and writing it (a create or update; Git writes a
