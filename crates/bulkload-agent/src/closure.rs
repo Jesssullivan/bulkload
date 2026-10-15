@@ -25,7 +25,9 @@
 //!
 //! Anything else is `unaccounted`: no outcome record, an unreadable record,
 //! a record naming another source, a bare `IO` or `FRAME_CODEC` refusal (it
-//! names no cause), a refusal whose code has left the taxonomy
+//! names no cause), a `GIT_CONVERGE_INTERRUPTED` refusal (a converge left
+//! its checkout part old, part new; only a rerun that settles it closes the
+//! item, whatever its disposition, `converge-interrupted`), a refusal whose code has left the taxonomy
 //! (`refusal-code-retired`), an outcome that does not match whether the item plans a
 //! workspace, a missing or mismatched current-capture journal (a stale
 //! journal from an earlier capture proves nothing), or an outcome that is not
@@ -167,6 +169,10 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
         Outcome::Refused(refusal) => match refusal.code() {
             "IO" => Disposition::Unaccounted("refusal-untyped-io"),
             "FRAME_CODEC" => Disposition::Unaccounted("refusal-untyped-frame-codec"),
+            // Estate converge (finding 6): a converge cut short left the
+            // checkout part old, part new under a pending intent. No review
+            // closes it; only a rerun that settles the intent does.
+            "GIT_CONVERGE_INTERRUPTED" => Disposition::Unaccounted("converge-interrupted"),
             // The code left the taxonomy after the record was written: it
             // names no cause the taxonomy holds, and no review can name it.
             _ if refusal.is_retired() => Disposition::Unaccounted("refusal-code-retired"),
@@ -779,6 +785,10 @@ impl AttestationRow {
         match native.outcome.as_ref().and_then(Outcome::refusal) {
             Some(refusal) if refusal.is_retired() => return Err("native-refusal-code-retired"),
             Some(refusal) if !refusal.is_typed() => return Err("native-refusal-untyped"),
+            // Finding 6: only a rerun that settles the intent closes it.
+            Some(refusal) if refusal.code() == "GIT_CONVERGE_INTERRUPTED" => {
+                return Err("native-converge-interrupted")
+            }
             _ => {}
         }
         if native.unreadable == Some(crate::outcome::Unreadable::RefusalUntyped) {
@@ -1528,6 +1538,40 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    // Estate converge (finding 6): a converge cut short is never accounted:
+    // not natively, and not by a disposition, whatever the review says.
+    #[test]
+    fn an_interrupted_converge_is_unaccounted_whatever_its_review() {
+        let refused = entry(
+            'g',
+            true,
+            Some(("refused", Some("GIT_CONVERGE_INTERRUPTED"))),
+            JournalState::Absent,
+        );
+        assert_eq!(
+            classify(&refused),
+            Disposition::Unaccounted("converge-interrupted")
+        );
+        let modified = entry(
+            'h',
+            true,
+            Some(("refused", Some("GIT_DESTINATION_MODIFIED"))),
+            JournalState::Absent,
+        );
+        assert_eq!(
+            classify(&modified),
+            Disposition::RefusedPendingReview("GIT_DESTINATION_MODIFIED".into())
+        );
+        let ledger = crate::estate::Ledger {
+            entries: vec![refused],
+            foreign_records: Vec::new(),
+            unmatched_journals: Vec::new(),
+        };
+        let report = Report::from_ledger(&ledger);
+        assert_eq!(report.unaccounted, 1);
+        assert_eq!(report.refused_pending_review, 0);
     }
 
     #[test]
@@ -2361,6 +2405,42 @@ mod tests {
         ), "{json}");
     }
 
+    // Estate converge (finding 6, review 2): an attestation row bound to the
+    // item's current capture and source still cannot close an interrupted
+    // converge; only a rerun that settles the intent does.
+    #[test]
+    fn attestation_cannot_close_an_interrupted_converge() {
+        let ledger = Ledger {
+            entries: vec![entry(
+                'd',
+                true,
+                Some(("refused", Some("GIT_CONVERGE_INTERRUPTED"))),
+                JournalState::Absent,
+            )],
+            ..Ledger::default()
+        };
+        let document = format!(
+            r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[{{"item":"{}","source":"/src/d","capture":"{}","disposition":"source-absent","basis":"audit","evidence":"e"}}]}}"#,
+            "d".repeat(64),
+            digest('d')
+        );
+        let mut report = Report::from_ledger(&ledger);
+        assert_eq!(report.unaccounted, 1);
+        report
+            .attest(
+                &AttestationLedger::parse(&document, std::path::Path::new("/plan"), "neo").unwrap(),
+            )
+            .unwrap();
+        let attested = report.attested.clone().unwrap();
+        assert!(attested.items.is_empty());
+        assert_eq!(
+            attested.rejected,
+            vec![("d".repeat(64), "native-converge-interrupted")]
+        );
+        assert_eq!(report.remaining_unaccounted(), 1);
+        assert!(!report.passes());
+    }
+
     // S4: item rows dispose exactly their (item, code); a standing policy
     // disposes its code for every item; rows that dispose nothing are listed.
     #[test]
@@ -2823,11 +2903,16 @@ mod tests {
 
         const RETIRED: &str = "RETIRED_FOR_P73";
 
+        // The codes a review can close. `GIT_CONVERGE_INTERRUPTED` is typed
+        // but never closed by a review (estate converge, finding 6); its
+        // own row is `an_interrupted_converge_is_unaccounted_whatever_its_review`.
         fn typed_codes() -> Vec<&'static str> {
             BulkloadRefusal::CODES
                 .iter()
                 .copied()
-                .filter(|code| crate::outcome::is_typed_code(code))
+                .filter(|code| {
+                    crate::outcome::is_typed_code(code) && *code != "GIT_CONVERGE_INTERRUPTED"
+                })
                 .collect()
         }
 

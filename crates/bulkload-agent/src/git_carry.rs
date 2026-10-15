@@ -20,6 +20,7 @@ use crate::{BulkloadRefusal, Result};
 
 mod batch_objects;
 pub mod chain;
+pub mod converge;
 pub mod decide;
 #[cfg(test)]
 #[allow(
@@ -38,6 +39,8 @@ pub mod estimate;
     clippy::unwrap_used
 )]
 mod inert_origin_tests;
+pub(crate) mod landed;
+pub(crate) mod native_refs;
 mod raw_tree;
 mod ref_table;
 #[cfg(test)]
@@ -126,6 +129,16 @@ pub(crate) mod git_env {
     /// repository's own store lists it as its first alternate, so every
     /// reader (bundle, pack, fetch, fast-import, update-ref) sees both.
     pub const WRITE_STORE: &str = "objects-written";
+
+    /// `-c` overrides every destination write runs with (estate converge,
+    /// finding 7): Git's default fsyncs objects only, so a ref, packed-refs,
+    /// reflog or index write could be lost to a power cut after the bulkload
+    /// ledger naming it was made durable. With these, Git makes each durable
+    /// before it returns.
+    pub const DESTINATION: &[&str] = &[
+        "core.fsync=reference,index,objects",
+        "core.fsyncMethod=fsync",
+    ];
 }
 
 /// A Git child for the repository at `repo`, hardened from [`git_env`]:
@@ -155,6 +168,81 @@ fn git(repo: &Path) -> Command {
         command.env("GIT_CEILING_DIRECTORIES", ceiling);
     }
     command
+}
+
+/// The oldest Git whose destination writes this carry trusts: 2.46 has
+/// `core.fsync=reference` (2.36) and `update-ref --stdin`'s `symref-*`
+/// commands, which move a worktree's HEAD and its branch in one
+/// compare-and-swap transaction (estate converge, findings 2 and 7).
+pub(crate) const DESTINATION_GIT_MINIMUM: (u32, u32) = (2, 46);
+
+/// Make `command` (a [`git`] child) a destination writer: the
+/// [`git_env::DESTINATION`] fsync overrides, and a fixed committer for the
+/// reflog entries it writes (no global identity is read).
+fn durable(command: &mut Command) {
+    for value in git_env::DESTINATION {
+        command.args(["-c", value]);
+    }
+    command
+        .env("GIT_COMMITTER_NAME", "bulkload")
+        .env("GIT_COMMITTER_EMAIL", "bulkload@localhost")
+        .env("GIT_AUTHOR_NAME", "bulkload")
+        .env("GIT_AUTHOR_EMAIL", "bulkload@localhost");
+}
+
+/// `read-tree` into the index `command` names (a [`git`] child, often with
+/// `GIT_INDEX_FILE`): one tree, or a two-way merge.
+fn read_tree(command: &mut Command, trees: &[&str]) -> Result<()> {
+    durable(command);
+    command.arg("read-tree");
+    if trees.len() > 1 {
+        // A two-way merge of the index alone: the worktree already holds
+        // the new seats, so its check is off (`-i`). Unchanged entries keep
+        // their stat data.
+        command.args(["-m", "-i"]);
+    }
+    output(command.args(trees)).map(drop)
+}
+
+/// The metadata ref carrying a capture's stash reflog order (estate
+/// converge, design 3.1), newest first.
+const STASH_ORDER_METADATA: &str = "stash-order-v1";
+
+/// The metadata revision naming a capture's worktree tree.
+const WORKTREE_REVISION: &str = "worktree";
+
+/// Refuse `GIT_UNAVAILABLE` unless the host's Git is at least
+/// [`DESTINATION_GIT_MINIMUM`]: an older Git ignores `core.fsync` silently,
+/// so its ref writes would not be durable before the ledgers naming them.
+///
+/// # Errors
+/// `GIT_UNAVAILABLE` for a Git that is absent, unparseable or too old.
+pub(crate) fn destination_git_ready() -> Result<()> {
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Run directly, not through `output`: the version probe is no child a
+    // test's injected fault is aimed at, and its answer is cached for the
+    // process (a fault taken here made every later apply in the test binary
+    // refuse GIT_UNAVAILABLE, depending on which test ran first).
+    let ready = *READY.get_or_init(|| {
+        estimate::run_git(git(Path::new("/")).arg("version"), None)
+            .ok()
+            .and_then(|found| String::from_utf8(found).ok())
+            .and_then(|found| git_version(found.trim_end()))
+            .is_some_and(|version| version >= DESTINATION_GIT_MINIMUM)
+    });
+    if ready {
+        Ok(())
+    } else {
+        Err(BulkloadRefusal::GitUnavailable)
+    }
+}
+
+// `git version 2.52.0` (or `2.39.3 (Apple Git-146)`) as (major, minor).
+fn git_version(line: &str) -> Option<(u32, u32)> {
+    let mut parts = line.strip_prefix("git version ")?.trim().split(['.', ' ']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// A Git child that writes objects into the capture's private repository at
@@ -1829,6 +1917,14 @@ fn capture_administration(private: &Path, authority: &CarriedAuthority) -> Resul
         .trim_end();
     metadata(private, "head-symbolic", symbolic.as_bytes())?;
     metadata(private, "exclude", &authority.exclude)?;
+    // Estate converge (design 3.1): the stash reflog's order, exactly the
+    // bytes the snapshot read (newest first), so a restore rebuilds the
+    // stash in the source's order. Only when there is a stash, so every
+    // other capture's bundle is unchanged; no key change (the key already
+    // hashes these bytes).
+    if !authority.stash.is_empty() {
+        metadata(private, STASH_ORDER_METADATA, &authority.stash)?;
+    }
     if !authority.boundary.is_empty() {
         metadata(private, "shallow-frontier-v1", &authority.boundary)?;
     }
@@ -5314,6 +5410,16 @@ pub(crate) fn destination_repository(repo: &Path) -> Result<()> {
 // `import_bundle` for a verb that already staged and checked its bundle, and
 // reads only the staged copy.
 pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Result<usize> {
+    import_verified_instance(repo, bundle, source).map(|(count, _)| count)
+}
+
+// [`import_verified`], also naming the provenance instance it wrote:
+// `refs/carry/v1/<source>/<instance>/`.
+pub(super) fn import_verified_instance(
+    repo: &Path,
+    bundle: &Path,
+    source: &str,
+) -> Result<(usize, String)> {
     if !source_slug(source) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
@@ -5405,12 +5511,14 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
     // One atomic compare/create transaction, including unchanged refs: a
     // concurrent update or deletion refuses instead of publishing a partial set.
     if !transaction.is_empty() {
+        let mut command = git(repo);
+        durable(&mut command);
         input(
-            git(repo).args(["update-ref", "--no-deref", "--stdin", "-z"]),
+            command.args(["update-ref", "--no-deref", "--stdin", "-z"]),
             &transaction,
         )?;
     }
-    Ok(names.len())
+    Ok((names.len(), digest.to_string()))
 }
 
 /// The ref lines `bundle` carries, in the old format's terms: its header, or,
@@ -6271,8 +6379,37 @@ pub fn restore_staged(
     source: &str,
     mapping: Option<(&Path, &Path)>,
 ) -> Result<()> {
+    restore_staged_landed(
+        staged,
+        destination,
+        source,
+        (mapping, None),
+        &converge::Landing {
+            item: "",
+            observed_ns: 0,
+            capture: staged.digest(),
+        },
+    )
+    .map(drop)
+}
+
+/// [`restore_staged`] for an estate item (#215): native refs, the stash and
+/// HEAD as at the source (or detached with the branch recorded), and both
+/// ledgers, all inside the private stage, published with the checkout.
+///
+/// # Errors
+/// As [`restore_staged`]; `GIT_UNAVAILABLE` for a Git older than
+/// [`DESTINATION_GIT_MINIMUM`].
+pub(crate) fn restore_staged_landed(
+    staged: &StagedBundle,
+    destination: &Path,
+    source: &str,
+    (mapping, base): (Option<(&Path, &Path)>, Option<&StagedBundle>),
+    landing: &converge::Landing<'_>,
+) -> Result<converge::Applied> {
     const SITE: &str = "git_carry::restore_staged";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    destination_git_ready()?;
     refuse_bare_capture(staged)?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
@@ -6308,7 +6445,11 @@ pub fn restore_staged(
     }
     let format = bundle_object_format(&heads)?;
     output(git(&work).args(["init", "--template=", &format!("--object-format={format}")]))?;
-    import_verified(&work, bundle, source)?;
+    // A based capture's plan base, into the stage first (estate converge).
+    if let Some(base) = base {
+        import_verified(&work, base.path(), source)?;
+    }
+    let (_, instance) = import_verified_instance(&work, bundle, source)?;
     let heads = shallow::headers(&work, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
@@ -6321,23 +6462,14 @@ pub fn restore_staged(
             .filter(|value| oid(value))
             .ok_or(BulkloadRefusal::GitInventoryMalformed)
     };
-    let head = find("head")?;
     find("configuration-v1")?;
-    let symbolic = text(git(&work).args(["show", &format!("{}:value", find("head-symbolic")?)]))?;
-    if symbolic.is_empty() {
-        output(git(&work).args(["update-ref", "--no-deref", "HEAD", &head]))?;
-    } else {
-        if !symbolic.starts_with("refs/heads/") {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        }
-        output(git(&work).args(["check-ref-format", &symbolic]))?;
-        set_ref(&work, &symbolic, &head)?;
-        output(git(&work).args(["symbolic-ref", "HEAD", &symbolic]))?;
-    }
+    // #215: every carried native ref, the stash and HEAD, natively; no
+    // `carry/*` branch.
+    let (head, meta, custody) = converge::land_standalone_refs(&work, source, &instance, landing)?;
     let exclude = output(git(&work).args(["show", &format!("{}:value", find("exclude")?)]))?;
     fs::create_dir_all(work.join(".git/info")).refuse_at(SITE)?;
     fs::write(work.join(".git/info/exclude"), exclude).refuse_at(SITE)?;
-    let worktree = find("worktree")?;
+    let worktree = find(WORKTREE_REVISION)?;
     let entries = output(git(&work).args(["ls-tree", "-r", "-z", &worktree]))?;
     // #131: before any worktree byte.
     intent_to_add_restorable(&carried_intent_to_add(&work, &heads)?, &entries)?;
@@ -6350,14 +6482,25 @@ pub fn restore_staged(
     restore_entries(&work, &entries)?;
     let staged = find("staged")?;
     restore_gitlink_directories(&work, &staged, &heads)?;
-    output(git(&work).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
+    read_tree(&mut git(&work), &[&format!("{staged}^{{tree}}")])?;
     restore_intent_to_add(&work, None, &heads)?;
     restore_filesystem_rows(&work, &find("filesystem-v1")?)?;
     apply_standalone_configuration(&work, &work.join(".git/carry-config"), &configuration)?;
+    let applied = converge::finish_landing(
+        &work,
+        &work.join(".git"),
+        source,
+        landing,
+        &meta,
+        (&head.head, head.intended.as_ref()),
+        None,
+        custody,
+    )?;
     // Before the rename: moving a directory to another parent needs write
     // permission on it, whatever mode the capture gave the root.
     fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).refuse_at(SITE)?;
-    publish_restored(stage.path(), &work, &target)
+    publish_restored(stage.path(), &work, &target)?;
+    Ok(applied)
 }
 
 // Publish a checkout built at `work` (directly inside `stage`) as `target`,
@@ -6470,8 +6613,38 @@ pub fn restore_linked_staged(
     destination: &Path,
     source: &str,
 ) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
+    restore_linked_staged_landed(
+        staged,
+        repository,
+        destination,
+        source,
+        &converge::Landing {
+            item: "",
+            observed_ns: 0,
+            capture: staged.digest(),
+        },
+    )
+    .map(drop)
+}
+
+/// [`restore_linked_staged`] for an estate item (#215): native refs first
+/// (into a repository bulkload created), then the worktree on the source's
+/// branch, or detached at the captured head with the branch recorded
+/// (`head-detached-ref-conflict`, finding 11); never a `carry/*` branch.
+/// The workspace ledger is written after the checkout.
+///
+/// # Errors
+/// As [`restore_linked_staged`].
+#[allow(clippy::too_many_lines)]
+pub(crate) fn restore_linked_staged_landed(
+    staged: &StagedBundle,
+    repository: &Path,
+    destination: &Path,
+    source: &str,
+    landing: &converge::Landing<'_>,
+) -> Result<converge::Applied> {
     use std::os::unix::fs::PermissionsExt;
+    destination_git_ready()?;
     refuse_bare_capture(staged)?;
     let bundle = staged.path();
     if destination.symlink_metadata().is_ok() {
@@ -6479,7 +6652,7 @@ pub fn restore_linked_staged(
     }
     let destination = linked_destination(destination)?;
     let repository = fs::canonicalize(repository).refuse_at("git_carry::restore_linked_staged")?;
-    import_verified(&repository, bundle, source)?;
+    let (_, instance) = import_verified_instance(&repository, bundle, source)?;
     let heads = shallow::headers(&repository, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
@@ -6493,8 +6666,6 @@ pub fn restore_linked_staged(
             .ok_or(BulkloadRefusal::GitInventoryMalformed)
     };
     let head = find("head")?;
-    let symbolic =
-        text(git(&repository).args(["show", &format!("{}:value", find("head-symbolic")?)]))?;
     let exclude = output(git(&repository).args(["show", &format!("{}:value", find("exclude")?)]))?;
     let exclude_path = text(git(&repository).args([
         "rev-parse",
@@ -6502,49 +6673,78 @@ pub fn restore_linked_staged(
         "--git-path",
         "info/exclude",
     ]))?;
-    let existing_exclude = match fs::read(&exclude_path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(crate::refuse::io(
-                &error,
-                "git_carry::restore_linked_staged",
-            ))
-        }
+    let read_exclude = |path: &str| match fs::read(path) {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(crate::refuse::io(
+            &error,
+            "git_carry::restore_linked_staged",
+        )),
     };
-    if exclude != existing_exclude {
+    let existing_exclude = read_exclude(&exclude_path)?;
+    let common = common_repository(&repository)?;
+    // Finding 12: the main item may have set a newer exclude than this
+    // capture's; that one is kept, never refused.
+    let expected_exclude = if exclude == existing_exclude
+        || converge::exclude_newer(&common, source, &existing_exclude, landing.observed_ns)?
+    {
+        existing_exclude
+    } else {
         return Err(BulkloadRefusal::GitIgnorePolicyConflict);
-    }
+    };
     // #131: before the worktree is added, so a capture whose intent-to-add
     // custody cannot be restored refuses with nothing laid down.
     let entries = output(git(&repository).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
     intent_to_add_restorable(&carried_intent_to_add(&repository, &heads)?, &entries)?;
-    let attached = text(git(&repository).args(["worktree", "list", "--porcelain"]))?;
-    let source_tip = text(git(&repository).args(["rev-parse", "--verify", &symbolic]));
-    let reuse = symbolic.starts_with("refs/heads/")
-        && source_tip.as_ref().is_ok_and(|value| value == &head)
-        && !attached
-            .lines()
-            .any(|line| line == format!("branch {symbolic}"));
-    let branch = if reuse {
-        symbolic
-            .strip_prefix("refs/heads/")
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)?
-            .to_owned()
-    } else {
-        let digest = blake3::hash(destination.as_os_str().as_bytes()).to_hex();
-        format!("carry/{source}/{digest}")
-    };
-    let mut command = git(&repository);
-    command.args(["worktree", "add", "--no-checkout"]);
-    if !reuse {
-        command.args(["-b", &branch]);
+    let plan = converge::plan_linked(&repository, source, &instance, landing)?;
+    // #216's residual (the earlier report's finding 7): the landing is
+    // durable as an intent before `worktree add`, so a crash before the
+    // worktree's ledger leaves a worktree the rerun can name as bulkload's
+    // and finish forward (`recover_linked_landing`), never refused
+    // GIT_DESTINATION_OCCUPIED for good.
+    let landing_intent =
+        landed::landing_intent_path(&landed::ledger_dir(&plan.common, source), &destination);
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        landed::write(
+            &landing_intent,
+            &landed::LandingIntent {
+                item: landing.item.to_owned(),
+                destination: destination.as_os_str().as_bytes().to_vec(),
+                capture: landing.capture,
+                observed_ns: landing.observed_ns,
+                instance,
+                head: plan.head.head.clone(),
+                intended_branch: plan.head.intended.clone(),
+            },
+        )?;
     }
-    command
-        .arg("--")
-        .arg(&destination)
-        .arg(if reuse { &branch } else { &head });
+    let mut command = git(&repository);
+    durable(&mut command);
+    command.args(["worktree", "add", "--no-checkout"]);
+    match &plan.head.head.symbolic {
+        Some(branch) => {
+            let name = branch
+                .strip_prefix("refs/heads/")
+                .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+            if plan.create.is_some() {
+                command
+                    .args(["-b", name, "--"])
+                    .arg(&destination)
+                    .arg(&head);
+            } else {
+                command.arg("--").arg(&destination).arg(name);
+            }
+        }
+        None => {
+            command
+                .args(["--detach", "--"])
+                .arg(&destination)
+                .arg(&head);
+        }
+    }
     output(&mut command)?;
+    fault_point!(EstateConvergeLinkedAdded);
     // --no-checkout has created administration only, not captured payload.
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
         .refuse_at("git_carry::restore_linked_staged")?;
@@ -6560,28 +6760,196 @@ pub fn restore_linked_staged(
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    restore_entries(&destination, &entries)?;
+    restore_entries_with(&destination, &entries, true)?;
     restore_gitlink_directories(&destination, &find("staged")?, &heads)?;
-    output(git(&destination).args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
+    let mut command = git(&destination);
+    durable(&mut command);
+    output(command.args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
     restore_intent_to_add(&destination, None, &heads)?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
-    let final_exclude = match fs::read(exclude_path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(crate::refuse::io(
-                &error,
-                "git_carry::restore_linked_staged",
-            ))
-        }
-    };
-    if final_exclude != exclude {
+    if read_exclude(&exclude_path)? != expected_exclude {
         return Err(BulkloadRefusal::GitIgnorePolicyConflict);
     }
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    Ok(())
+    let converge::LinkedPlan {
+        head: head_plan,
+        meta,
+        custody,
+        common,
+        lock,
+        ..
+    } = plan;
+    // Review 3 finding 3: the index this landing installed, built from the
+    // capture, never read back from the worktree an operator can change.
+    let git_dir =
+        landed::worktree_git_dir(&destination)?.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let index = converge::installed_index(&destination, &git_dir, &meta)?;
+    let applied = converge::finish_landing(
+        &destination,
+        &common,
+        source,
+        landing,
+        &meta,
+        (&head_plan.head, head_plan.intended.as_ref()),
+        Some(index),
+        custody,
+    )?;
+    landed::remove(&landing_intent)?;
+    drop(lock);
+    Ok(applied)
+}
+
+/// Finish a first linked landing a crash cut short between `worktree add`
+/// and its ledger (#216's residual, the earlier report's finding 7), under
+/// the destination lock: `intent` names the worktree at `destination` as
+/// bulkload's. Its HEAD must still be the planned one; its index must have
+/// no entries (what `worktree add --no-checkout` leaves) or be the one the
+/// landing installs; and every seat the capture holds must be absent
+/// (written now) or the capture's content (review 4: the landing writes
+/// each entry under [`LANDING_TEMPORARY`] and renames it into place, so a
+/// file at an entry's name that is not its blob, a prefix of it included,
+/// is an operator's, and so is any index the landing did not write: a `git
+/// add`, `git rm --cached` or `git mv` since the crash). Anything else is
+/// `GIT_DESTINATION_MODIFIED`, checked before any write, and nothing an
+/// operator put there is changed. Then the index, modes and the ledger, as
+/// the landing would have.
+///
+/// # Errors
+/// `GIT_DESTINATION_MODIFIED` as above; `GIT_CONVERGE_INTERRUPTED` when an
+/// `index.lock` that is not the landing's own is held; whatever the
+/// restore refuses.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn recover_linked_landing(
+    destination: &Path,
+    common: &Path,
+    source: &str,
+    intent: &landed::LandingIntent,
+) -> Result<()> {
+    const SITE: &str = "git_carry::recover_linked_landing";
+    use std::os::unix::ffi::OsStrExt;
+    let modified = BulkloadRefusal::GitDestinationModified;
+    if converge::head_of(destination)? != intent.head {
+        return Err(modified);
+    }
+    let meta = converge::Meta::read(destination, source, &intent.instance)?;
+    let heads = meta.heads();
+    let git_dir =
+        landed::worktree_git_dir(destination)?.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let target = converge::installed_index(destination, &git_dir, &meta)?;
+    // The landing's own `read-tree`, killed before its rename, left the
+    // whole new index in `index.lock`; anyone else's lock stays.
+    let lock = git_dir.join("index.lock");
+    if fs::symlink_metadata(&lock).is_ok() {
+        if converge::index_digest(destination, Some(&lock)).ok() != Some(target) {
+            return Err(BulkloadRefusal::GitConvergeInterrupted);
+        }
+        fs::remove_file(&lock).refuse_at(SITE)?;
+        landed::sync_dir(&git_dir)?;
+    }
+    let index = converge::index_digest(destination, None)?;
+    if index != target && index != converge::empty_index_digest() {
+        return Err(modified);
+    }
+    let entries =
+        output(git(destination).args(["ls-tree", "-r", "-z", meta.get(WORKTREE_REVISION)?]))?;
+    let mut objects = batch_objects::BatchObjects::new(destination)?;
+    // Every check first, so a refusal writes nothing.
+    let mut missing = Vec::new();
+    let mut parents = std::collections::BTreeSet::new();
+    for entry in entries
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let header = std::str::from_utf8(entry.get(..tab).unwrap_or_default())
+            .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+        let mut fields = header.split_whitespace();
+        let (Some(mode), Some(_), Some(value)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        };
+        let relative = Path::new(std::ffi::OsStr::from_bytes(
+            entry.get(tab + 1..).unwrap_or_default(),
+        ));
+        let path = match safe_destination(destination, relative) {
+            Ok(path) => path,
+            // A parent not laid down yet: the entry is written below.
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {
+                missing.push(entry);
+                continue;
+            }
+            Err(_) => return Err(modified),
+        };
+        if let Some(parent) = path.parent() {
+            parents.insert(parent.to_path_buf());
+        }
+        let Some(found) = (match fs::symlink_metadata(&path) {
+            Ok(found) => Some(found),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        }) else {
+            missing.push(entry);
+            continue;
+        };
+        let mut blob = Vec::new();
+        objects.copy_into(value, &mut blob, None)?;
+        let ours = if mode == "120000" {
+            found.file_type().is_symlink()
+                && fs::read_link(&path).refuse_at(SITE)?.as_os_str().as_bytes() == blob
+        } else {
+            found.is_file() && {
+                let bytes = fs::read(&path).refuse_at(SITE)?;
+                crate::counters::add_len(crate::counters::Counter::DestVerifyRead, bytes.len());
+                bytes == blob
+            }
+        };
+        if !ours {
+            return Err(modified);
+        }
+    }
+    objects.finish()?;
+    // The temporary a crash left inside a landing's entry write.
+    for parent in parents {
+        match fs::remove_file(parent.join(LANDING_TEMPORARY)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        }
+    }
+    let mut objects = batch_objects::BatchObjects::new(destination)?;
+    for entry in missing {
+        restore_entry(destination, entry, &mut objects, true)?;
+    }
+    objects.finish()?;
+    restore_gitlink_directories(destination, meta.get("staged")?, &heads)?;
+    if index != target {
+        read_tree(
+            &mut git(destination),
+            &[&format!("{}^{{tree}}", meta.get("staged")?)],
+        )?;
+        restore_intent_to_add(destination, None, &heads)?;
+    }
+    restore_filesystem_rows(destination, meta.get("filesystem-v1")?)?;
+    converge::finish_landing(
+        destination,
+        common,
+        source,
+        &converge::Landing {
+            item: &intent.item,
+            observed_ns: intent.observed_ns,
+            capture: intent.capture,
+        },
+        &meta,
+        (&intent.head, intent.intended_branch.as_ref()),
+        Some(target),
+        native_refs::Custody::default(),
+    )
+    .map(drop)
 }
 
 // N7 (R-N73): a populated submodule is a directory nest, so its seat is not
@@ -6692,20 +7060,35 @@ fn occupied(error: std::io::Error) -> BulkloadRefusal {
 }
 
 fn restore_entries(destination: &Path, entries: &[u8]) -> Result<()> {
+    restore_entries_with(destination, entries, false)
+}
+
+// [`restore_entries`]; with `published`, each entry through
+// [`LANDING_TEMPORARY`] (a linked landing in place, review 4).
+fn restore_entries_with(destination: &Path, entries: &[u8], published: bool) -> Result<()> {
     let mut objects = batch_objects::BatchObjects::new(destination)?;
     for entry in entries
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
-        restore_entry(destination, entry, &mut objects)?;
+        restore_entry(destination, entry, &mut objects, published)?;
     }
     objects.finish()
 }
 
+/// The name a linked landing lays each entry down under before it is
+/// renamed to its own, without replacing (review 4): a write a crash cuts
+/// short never sits at an entry's name, so a file there that differs from
+/// its blob is an operator's, never bulkload's. One entry is written at a
+/// time, so one name per directory; the recovery removes it.
+pub(crate) const LANDING_TEMPORARY: &str = ".bulkload-landing-temporary";
+
+#[allow(clippy::too_many_lines)]
 fn restore_entry(
     destination: &Path,
     entry: &[u8],
     objects: &mut batch_objects::BatchObjects,
+    published: bool,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -6764,11 +7147,22 @@ fn restore_entry(
             Err(error) => return Err(crate::refuse::io(&error, "git_carry::restore_entry")),
         }
     }
+    let at = if published {
+        let temp = parent.join(LANDING_TEMPORARY);
+        match fs::remove_file(&temp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(crate::refuse::io(&error, "git_carry::restore_entry")),
+        }
+        temp
+    } else {
+        path.clone()
+    };
     match mode {
         "120000" => {
             let mut target = Vec::new();
             objects.copy_into(value, &mut target, Some(65_536))?;
-            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), path)
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &at)
                 .map_err(occupied)?;
         }
         "100644" | "100755" => {
@@ -6776,7 +7170,7 @@ fn restore_entry(
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&path)
+                .open(&at)
                 .map_err(occupied)?;
             objects.copy_into(value, &mut file, None)?;
             file.set_permissions(fs::Permissions::from_mode(if mode == "100755" {
@@ -6789,6 +7183,17 @@ fn restore_entry(
                 .refuse_at("git_carry::restore_entry")?;
         }
         _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+    if published {
+        let directory = fs::File::open(parent).refuse_at("git_carry::restore_entry")?;
+        let leaf = path.file_name().ok_or(BulkloadRefusal::PathEscapesRoot)?;
+        let from = crate::io::c_name(LANDING_TEMPORARY.as_bytes())
+            .refuse_at("git_carry::restore_entry")?;
+        let to = crate::io::c_name(leaf.as_bytes()).refuse_at("git_carry::restore_entry")?;
+        if let Err(error) = crate::io::publish_noreplace(&directory, &from, &to) {
+            let _ = fs::remove_file(&at);
+            return Err(occupied(error));
+        }
     }
     Ok(())
 }

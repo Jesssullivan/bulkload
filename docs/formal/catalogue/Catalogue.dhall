@@ -1948,6 +1948,9 @@ let GitCarry = ./GitCarry.dhall
 -- SqliteCarry.tla's part (#218, OI-1003-Q146).
 let SqliteCarry = ./SqliteCarry.dhall
 
+-- EstateConverge.tla's part (OI-1003-Q144).
+let EstateConverge = ./EstateConverge.dhall
+
 let module = T.moduleEntry T.Module.BulkloadTransfer
 
 in  { files =
@@ -1959,6 +1962,7 @@ in  { files =
               rows
         # GitCarry.files
         # SqliteCarry.files
+        # EstateConverge.files
     , grounding =
       [ { module = showConstructor module.module
         , spec = module.spec
@@ -1987,12 +1991,14 @@ in  { files =
         }
       , GitCarry.grounding
       , SqliteCarry.grounding
+      , EstateConverge.grounding
       ]
     , invariants
     , supersedeInvariants
     , nversion
     , gitCarryInvariants = GitCarry.invariants
     , gitCarryNversion = GitCarry.nversion
+    , estateConvergeInvariants = EstateConverge.invariants
     , decide = GitCarry.decide
     , sqliteCarryInvariants = SqliteCarry.invariants
     }

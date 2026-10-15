@@ -798,6 +798,29 @@ ruling, and it is not an S1 result.
   and its default are this change's; OI-1003-Q37 names the settings, not a
   flag.
 
+## Amendment 2026-10-15: estate convergence ruled, with three stated limits (OI-1003-Q144, Q149)
+
+- **Convergence is ruled (OI-1003-Q144).** A rerun of `estate-apply` may update
+  a checkout bulkload itself landed only when its ledger proves it unchanged
+  since landing, by content; any local change refuses
+  `GIT_DESTINATION_MODIFIED` and is never overwritten. Branches and tags
+  deleted at the source are kept and reported, remote-tracking refs follow the
+  source, configuration changes are report-only. The `EstateConverge` model
+  (`docs/formal/EstateConverge.tla`) passes against the code.
+- **Three known limits (OI-1003-Q149).** None loses or overwrites work.
+  1. A HEAD detached for a branch-name conflict re-attaches only at the next
+     changed capture, not on a no-op rerun.
+  2. A ref the operator changed and put back to the landed value re-converges
+     only at the next changed capture.
+  3. A concurrent `git switch` can race the HEAD locks: Git commits the index
+     before it takes `HEAD.lock`, so no lock closes the window.
+
+  Limits 1 and 2 follow from S3: an unchanged rerun reads 0 content bytes and
+  does not re-read the ledgers. Their model rows fail `ConvergesWhenQuiet` as
+  stated limits.
+- **Existing landings** (before this change) carry no ledger and are not
+  converged; `--adopt` is not built (OI-1003-Q145).
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
