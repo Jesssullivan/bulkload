@@ -111,6 +111,26 @@ mode, content hash and stat fields (dev, ino, mtime, ctime, nlink), so it
 is stable for one untouched copy and differs between copies. After the last rep, both the working copy and the
 sealed corpus are verified again. Any failure aborts the sample (exit 3).
 
+No clone (S2, OI-1003-Q165 (b)): the working copy is an explicit read and
+write (`r23_corpus.plain_copy_tree`: os.read/os.write, never `cp` or
+`shutil`, whose Linux fast copy is `copy_file_range` from Python 3.14 and
+clones on a reflink file system). Before any build, FIEMAP must show it
+sharing no extent with any other file: a shared extent refuses the sample
+(exit 2) in every mode, and on Linux a work root whose sharing FIEMAP
+cannot show (anything but xfs, btrfs, bcachefs and ocfs2; ext4 and tmpfs
+cannot reflink and count 0) refuses a gated sample (an informational one
+records `unsupported`; off Linux it is `n/a`). After every rep the working
+copy and the rep's private fixture (the bench's seed, which the timed arms
+read) are checked again, and a shared extent aborts the sample (exit 3).
+FIEMAP sees sharing that still exists at the check: a clone of either by an
+arm that is still in place is refused, but a clone whose target the arm
+then overwrote in full or deleted is not seen (the source keeps no visible
+mark). P84's static scan is what rules out a clone call by bulkload; the
+rclone arm is held to this check only. The sealed corpus is checked once:
+since OI-1003-Q166 re-sealed the rig's corpus as an unshared copy, a shared
+sealed corpus refuses a gated sample (exit 2) and is recorded in an
+informational one.
+
 Host checks: after the builds, the harness waits up to --settle-seconds for
 AC power and load1 < 2.5, and checks again before every repetition. The
 bound is R-N81's absolute 2.5; it is not scaled to the rig's core count, so
@@ -241,7 +261,7 @@ DEFAULT_B = "origin/main"
 DEFAULT_V4 = "41bf9a4"
 RULINGS = (
     "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, OI-1003-Q96, OI-1003-Q97, OI-1003-Q103,"
-    " OI-1003-Q105, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
+    " OI-1003-Q105, OI-1003-Q165, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
 )
 # What the A control is for (OI-1002-Q30, OI-1003-Q103). It never decides.
 A_PURPOSE = (
@@ -255,7 +275,8 @@ PMSET_BATTERY = "Now drawing from 'Battery Power'"
 # An under-load sample is not R-N81 load-gated and not R-N91 quiet-gated
 # (OI-1003-Q39), so it does not cite them as followed.
 RULINGS_UNDER_LOAD = (
-    "OI-1003-Q39, OI-1003-Q50, OI-1002-Q30, OI-1002-Q28, R23, R-N57, R-N134, R-N13"
+    "OI-1003-Q39, OI-1003-Q50, OI-1002-Q30, OI-1002-Q28, OI-1003-Q165, R23, R-N57,"
+    " R-N134, R-N13"
 )
 DEFAULT_PATTERN = "BABAB"
 GATE_B_REPS = DEFAULT_PATTERN.count("B")
@@ -1330,6 +1351,19 @@ def run_rep(
     fixture_cache = (
         residency(Path(info["binary"]), fixture) if fixture.is_dir() else None
     )
+    # OI-1003-Q165 (b): no arm cloned the working copy or the rep's fixture.
+    no_clone: dict[str, object] = {}
+    clone_problems = []
+    for name, tree in (("working_copy", corpus), ("fixture", fixture)):
+        if not tree.is_dir():
+            no_clone[name] = "absent"
+            continue
+        record, problem = r23_corpus.require_unshared(
+            tree, f"the {name.replace('_', ' ')} after rep{index}", required=False
+        )
+        no_clone[name] = record
+        if problem:
+            clone_problems.append(problem)
     summary = summarize(parsed)
     sealed = parsed["header"].get("sealed_corpus_blake3")
     rep = {
@@ -1348,6 +1382,7 @@ def run_rep(
         "source_resident_fraction": source_cache,
         "fixture_resident_fraction_after": fixture_cache,
         "sealed_corpus_blake3": sealed,
+        "shared_extents_after": no_clone,
         "summary": summary,
         "parsed": parsed,
     }
@@ -1356,6 +1391,7 @@ def run_rep(
     if sealed is None or sealed != expected:
         problems.append(f"sealed_corpus_blake3 {sealed} != first rep's {expected}")
     problems += power
+    problems += clone_problems
     # OI-1003-Q105: the bench must have run the rclone the report records.
     wanted = state.get("rclone_version")
     ran = parsed["header"].get("rclone_version")
@@ -1638,6 +1674,18 @@ def baseline_lines(report: dict[str, object]) -> list[str]:
     return [f"- A control: {which}. {A_PURPOSE} (OI-1002-Q30)."]
 
 
+def shared_after(report: dict[str, object]) -> str:
+    """Each rep's FIEMAP-shared extents after it, as `rep0 0/0`."""
+    parts = []
+    for rep in report.get("reps", []):
+        counts = rep.get("shared_extents_after") or {}
+        parts.append(
+            f"`rep{rep.get('index')} {counts.get('working_copy', 'n/a')}"
+            f"/{counts.get('fixture', 'n/a')}`"
+        )
+    return ", ".join(parts) or "no rep ran"
+
+
 def evidence(report: dict[str, object]) -> str:
     dry = report["mode"] == "dry-run"
     aborted = report["status"] in ("aborted", "refused")
@@ -1753,6 +1801,11 @@ def evidence(report: dict[str, object]) -> str:
         f"- Content identity `{report['content_identity']}`; content_verified before:"
         f" `{report['content_verified_before']}`, after the last rep:"
         f" `{report.get('content_verified_after', 'n/a')}`.",
+        f"- No clone (S2, OI-1003-Q165): working copy by"
+        f" `{report.get('copy_method', 'n/a')}`, FIEMAP-shared extents before the"
+        f" builds `{report.get('working_copy_shared_extents', 'n/a')}`; the sealed"
+        f" corpus's (recorded only) `{report.get('sealed_corpus_shared_extents', 'n/a')}`;"
+        f" after each rep, working copy and fixture: {shared_after(report)}.",
         f"- Bench `sealed_corpus_blake3` (content-and-metadata hash of the working"
         f" copy, stat fields included; must match in every rep):"
         f" `{report.get('sealed_identity', 'n/a')}`.",
@@ -1986,15 +2039,12 @@ def working_copy(sealed: Path, work: Path) -> Path:
     The bench copies its source into a private fixture with modes preserved
     and then mutates that fixture for the 1 % delta, so it cannot read a
     0444/0555 sealed tree directly. The copy keeps mtimes and gets 0644/0755.
+    It is made by read and write (OI-1003-Q165), and checked unshared by
+    the caller.
     """
     corpus = work / "corpus"
-    shutil.copytree(sealed, corpus, symlinks=True)
-    for dirpath, dirs, names in os.walk(corpus):
-        for name in dirs:
-            (Path(dirpath) / name).chmod(0o755)
-        for name in names:
-            (Path(dirpath) / name).chmod(0o644)
-    corpus.chmod(0o755)
+    # OI-1003-Q165 (b): a read and a write, never a clone. Not shutil.
+    r23_corpus.plain_copy_tree(sealed, corpus, file_mode=0o644, dir_mode=0o755)
     return corpus
 
 
@@ -2278,12 +2328,30 @@ def main(argv: list[str] | None = None) -> int:
         corpus = work / "corpus"
         synthetic_corpus(corpus)
         verified_before: object = "n/a (synthetic dry-run corpus)"
+        sealed_shared = "n/a (synthetic)"
     else:
         corpus = working_copy(sealed, work)
         if corpus_verify(corpus) != 0:
             say("refused: the working copy does not verify")
             return 2
         verified_before = True
+        sealed_shared, sealed_problem = r23_corpus.require_unshared(
+            sealed, "the sealed corpus", required=False
+        )
+        # OI-1003-Q166 re-sealed the rig's corpus unshared: a shared sealed
+        # corpus was cloned, and refuses a gated sample.
+        if sealed_problem and mode == "gated":
+            say(f"refused: {sealed_problem} (OI-1003-Q166)")
+            return 2
+    # OI-1003-Q165 (b): before any build or rep, the copy the bench reads
+    # shares no extent; a gated sample needs FIEMAP to say so.
+    copy_shared, problem = r23_corpus.require_unshared(
+        corpus, "the working copy", required=mode == "gated"
+    )
+    say(f"no-clone working_copy_shared_extents={copy_shared} sealed={sealed_shared}")
+    if problem:
+        say(f"refused: {problem}")
+        return 2
     files, size = corpus_shape(corpus)
     build_root = (
         Path(args.build_root) if args.build_root else repo / "target" / "r23-ab"
@@ -2339,6 +2407,9 @@ def main(argv: list[str] | None = None) -> int:
         "corpus_bytes": size,
         "content_identity": CONTENT_IDENTITY if not args.dry_run else "n/a (synthetic)",
         "content_verified_before": verified_before,
+        "copy_method": "read-write (os.read/os.write; OI-1003-Q165)",
+        "working_copy_shared_extents": copy_shared,
+        "sealed_corpus_shared_extents": sealed_shared,
         "work_root": str(work),
         "rclone": str(rclone),
         "rclone_version": rclone_record["version"],

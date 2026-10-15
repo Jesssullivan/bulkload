@@ -3839,3 +3839,755 @@ fn the_dynamic_oracle_names_each_breach() {
     );
     assert!(snapshot.is_empty(), "{snapshot:?}");
 }
+
+// ------------------------------- P84: no clone call on a source file (Q165)
+
+/// Calls and ioctls that remap, clone or reflink one file's blocks into
+/// another (OI-1003-Q165). Each one writes the source inode (its reflink
+/// flag and its extents' reference counts) while every `stat` field stays
+/// the same, so no `lstat` census sees it. `copy_file_range` is one of them:
+/// on a reflink file system the kernel serves it as a clone before it falls
+/// back to a byte copy. No non-test code in any crate may name one, for any
+/// file: the agent has no use for a remap, and a remap call on a
+/// destination-only file is still one edit away from a source descriptor.
+/// `sendfile` and `splice` read the source and are allowed.
+const REMAP_CALLS: &[&str] = &[
+    "copy_file_range",
+    "SYS_copy_file_range",
+    "FICLONE",
+    "FICLONERANGE",
+    "FIDEDUPERANGE",
+    "file_clone_range",
+    "file_dedupe_range",
+    "BTRFS_IOC_CLONE",
+    "BTRFS_IOC_CLONE_RANGE",
+    "BTRFS_IOC_FILE_EXTENT_SAME",
+    "clonefile",
+    "clonefileat",
+    "fclonefileat",
+    "copyfile",
+    "fcopyfile",
+    "COPYFILE_CLONE",
+    "COPYFILE_CLONE_FORCE",
+    "remap_file_range",
+];
+
+/// The clone ioctls' request numbers by value, with what each one is
+/// (`FICLONE`, `FICLONERANGE`, `FIDEDUPERANGE`; the btrfs clone ioctls have
+/// the same numbers), and the `0x94` ioctl type they and every btrfs ioctl
+/// share. A literal matches by value, whatever its radix, `_` separators or
+/// type suffix: `0x4004_9409`, `1074041865u32`, `148` and `0o224` all match.
+/// `FIDEDUPERANGE` has its top bit set, so it is also listed as the
+/// magnitude of its negative `i32` (`-1072131018`), the form a `c_int`
+/// request takes.
+const REMAP_NUMBERS: &[(u128, &str)] = &[
+    (0x4004_9409, "FICLONE"),
+    (0x4020_940D, "FICLONERANGE"),
+    (0xC018_9436, "FIDEDUPERANGE"),
+    (
+        0x1_0000_0000 - 0xC018_9436,
+        "FIDEDUPERANGE as a negative i32",
+    ),
+    (0x94, "the clone ioctls' type"),
+];
+
+/// The integer type suffixes a literal may carry.
+const INTEGER_SUFFIXES: &[&str] = &[
+    "u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize",
+];
+
+/// The value of the integer literal `text` (any radix, `_` separators, an
+/// integer type suffix), or `None` for a float or anything else.
+fn integer_value(text: &str) -> Option<u128> {
+    let lower = text.to_ascii_lowercase().replace('_', "");
+    let (radix, digits) = [(16, "0x"), (8, "0o"), (2, "0b")]
+        .into_iter()
+        .find_map(|(radix, prefix)| lower.strip_prefix(prefix).map(|rest| (radix, rest)))
+        .unwrap_or((10, lower.as_str()));
+    let end = digits
+        .find(|c: char| !c.is_digit(radix))
+        .unwrap_or(digits.len());
+    let (number, suffix) = digits.split_at(end);
+    if number.is_empty() || !(suffix.is_empty() || INTEGER_SUFFIXES.contains(&suffix)) {
+        return None;
+    }
+    u128::from_str_radix(number, radix).ok()
+}
+
+/// Every integer literal in `code` (comments and literals already blanked):
+/// its offset, its value and its text. A digit run that continues an
+/// identifier (`x148`) is not one; a float's parts are not either.
+fn integer_literals(code: &str) -> Vec<(usize, u128, &str)> {
+    let bytes = code.as_bytes();
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at < bytes.len() {
+        if !bytes[at].is_ascii_digit() || (at > 0 && is_ident(bytes[at - 1])) {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end < bytes.len() && is_ident(bytes[end]) {
+            end += 1;
+        }
+        let text = &code[at..end];
+        // `1.5e148`: the exponent is not a literal of its own, and neither
+        // part of a float is an integer.
+        let float = bytes.get(end) == Some(&b'.')
+            && bytes.get(end + 1).is_some_and(u8::is_ascii_digit)
+            || (at > 0 && bytes[at - 1] == b'.' && at > 1 && bytes[at - 2].is_ascii_digit());
+        if !float {
+            if let Some(value) = integer_value(text) {
+                found.push((at, value, text));
+            }
+        }
+        at = end;
+        if float {
+            while at < bytes.len() && (is_ident(bytes[at]) || bytes[at] == b'.') {
+                at += 1;
+            }
+        }
+    }
+    found
+}
+
+/// A `use` names `module` and imports all of it: `module::*`, or a `*`
+/// directly inside `module::{..}`.
+fn glob_of(item: &str, module: &str) -> bool {
+    let squeezed: String = item.chars().filter(|c| !c.is_whitespace()).collect();
+    tokens(&squeezed, module).into_iter().any(|at| {
+        let after = &squeezed[at + module.len()..];
+        if after.starts_with("::*") {
+            return true;
+        }
+        let Some(group) = after.strip_prefix("::{") else {
+            return false;
+        };
+        let mut depth = 0_usize;
+        for (offset, c) in group.char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' if depth == 0 => return false,
+                '}' => depth -= 1,
+                '*' if depth == 0 => {
+                    let before = group[..offset].chars().last();
+                    return before.is_none_or(|b| b == ',' || b == '{');
+                }
+                _ => {}
+            }
+        }
+        false
+    })
+}
+
+/// A `std::fs::copy` or `std::io::copy` that non-test code makes.
+///
+/// `std::fs::copy` uses `copy_file_range` on Linux, so on a reflink file
+/// system it clones its input (the clone study, §3.1, [C14]); on macOS it
+/// uses `fcopyfile`. `std::io::copy` uses `copy_file_range` when its reader
+/// and its writer are both regular files, `splice` when either is a pipe
+/// and `sendfile` from a file to a socket. So each site is registered with
+/// the text of the call and why its input is not a source file.
+struct CopySite {
+    /// `fs` or `io`.
+    kind: &'static str,
+    /// The enclosing function, `crate::module::function`.
+    id: &'static str,
+    /// The call, comments and whitespace removed, from its path to its
+    /// closing parenthesis.
+    call: &'static str,
+    /// What its input is, and why that is not a source file.
+    input: &'static str,
+}
+
+/// Every `std::fs::copy` and `std::io::copy` in non-test code (P84,
+/// OI-1003-Q165).
+const COPY_SITES: &[CopySite] = &[
+    CopySite {
+        kind: "fs",
+        id: "agent::git_carry::prepare_attachment",
+        call: "fs::copy(bundle,&retained)",
+        input: "Destination side. `bundle` is `stage_bundle`'s private staged \
+                copy (`copy_hashing`, a read and write that hashes the bytes) \
+                in bulkload's own private directory, copied into the attach \
+                receipt bulkload just created. Neither file is a source file. \
+                On a reflink file system the receipt may share extents with \
+                the staged copy (the clone study's Q-d), which S2 does not \
+                govern.",
+    },
+    CopySite {
+        kind: "fs",
+        id: "agent::git_carry::registered::restore",
+        call: "fs::copy(staged.path(),receipt.join(\"capture.bundle\"))",
+        input: "Destination side. `staged` is `stage_bundle`'s private staged \
+                copy of the capture bundle (a hashing read and write), copied \
+                into the restore receipt bulkload just created. Neither file \
+                is a source file; sharing between the two is the clone \
+                study's Q-d, not S2.",
+    },
+    CopySite {
+        kind: "io",
+        id: "agent::git_carry::batch_objects::close",
+        call: "std::io::copy(&mutoutput,&mutstd::io::sink())",
+        input: "Drains `git cat-file --batch`'s stdout, a pipe \
+                (`BufReader<ChildStdout>`), into `io::sink`. No file is \
+                either side.",
+    },
+    CopySite {
+        kind: "io",
+        id: "agent::git_carry::batch_objects::read_body",
+        call: "std::io::copy(&mut(&mut*reader).take(length),writer)",
+        input: "The reader is `git cat-file --batch`'s stdout, a pipe (its one \
+                non-test caller, `copy_into`, passes the `BufReader<ChildStdout>`). \
+                A pipe is never a remap input.",
+    },
+    CopySite {
+        kind: "io",
+        id: "agent::git_carry::raw_tree::regular",
+        call: "std::io::copy(&mutRead::by_ref(file).take(row.size),writer)",
+        input: "The one site that reads a source file: a seat streamed into \
+                `git fast-import`. Its writer is pinned to the child's stdin \
+                pipe (`p84_the_raw_tree_capture_writes_only_into_a_pipe`), and \
+                std's Linux fast path from a file into a pipe is `splice`, a \
+                read; `copy_file_range` needs a regular-file writer.",
+    },
+    CopySite {
+        kind: "io",
+        id: "agent::git_carry::raw_tree::regular",
+        call: "std::io::copy(&mutstd::io::repeat(0).take(remaining),writer)",
+        input: "Zero fill for a seat that drifted mid-read: the reader is \
+                `io::repeat(0)`, not a file.",
+    },
+];
+
+/// One `fs::copy` or `io::copy` the scan found.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CopyCall {
+    kind: &'static str,
+    id: String,
+    call: String,
+    shown: String,
+}
+
+/// Every remap call `source` names, every clone ioctl number it spells (by
+/// value, in any radix), and every `use` that would hide an `fs::copy` or
+/// `io::copy` from the scan: an import of `copy` itself, `fs`/`io` renamed
+/// (as a path segment or as `self`), or a glob import of either.
+fn remap_breaches(source: &Source) -> Vec<String> {
+    let code = &source.file.code;
+    let mut found = Vec::new();
+    for word in REMAP_CALLS {
+        for at in tokens(code, word) {
+            found.push(format!(
+                "{}: `{word}` remaps a file's blocks (S2, OI-1003-Q165)",
+                source.at(at)
+            ));
+        }
+    }
+    for (at, value, text) in integer_literals(code) {
+        if let Some((_, name)) = REMAP_NUMBERS.iter().find(|(number, _)| *number == value) {
+            found.push(format!(
+                "{}: `{value:#x}` spells {name} (written `{text}`) (S2, OI-1003-Q165)",
+                source.at(at)
+            ));
+        }
+    }
+    for at in tokens(code, "use") {
+        let item = &code[at..statement_end(code, at)];
+        let names_module = !tokens(item, "fs").is_empty() || !tokens(item, "io").is_empty();
+        if names_module && !tokens(item, "copy").is_empty() {
+            found.push(format!(
+                "{}: a `use` imports `copy` from `fs` or `io`, which hides the call",
+                source.at(at)
+            ));
+        }
+        if names_module {
+            for inner in tokens(item, "self") {
+                let after = item[inner + "self".len()..].trim_start();
+                if after
+                    .strip_prefix("as")
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                {
+                    found.push(format!(
+                        "{}: a `use` renames `self` of `fs` or `io`, which hides its `copy`",
+                        source.at(at)
+                    ));
+                }
+            }
+        }
+        for module in ["fs", "io"] {
+            if glob_of(item, module) {
+                found.push(format!(
+                    "{}: a `use` imports all of `{module}`, which hides its `copy`",
+                    source.at(at)
+                ));
+            }
+            for inner in tokens(item, module) {
+                let after = item[inner + module.len()..].trim_start();
+                if after
+                    .strip_prefix("as")
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace))
+                {
+                    found.push(format!(
+                        "{}: a `use` renames `{module}`, which hides its `copy`",
+                        source.at(at)
+                    ));
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Every `fs::copy` and `io::copy` in `source`'s non-test code, under any
+/// path that ends in that module (`std::fs::copy`, `fs::copy`), called or
+/// named as a function value.
+fn copy_calls(source: &Source) -> Vec<CopyCall> {
+    let file = &source.file;
+    let code = &file.code;
+    let mut calls = Vec::new();
+    for at in tokens(code, "copy") {
+        let Some(path) = code[..at].trim_end().strip_suffix("::") else {
+            continue;
+        };
+        let path = path.trim_end();
+        let module = &path[path
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .map_or(0, |x| x + 1)..];
+        let kind = match module {
+            "fs" => "fs",
+            "io" => "io",
+            _ => continue,
+        };
+        let start = code[..at]
+            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            .map_or(0, |x| x + 1);
+        let after = at + "copy".len();
+        let end = if code[after..].trim_start().starts_with('(') {
+            group_end(code, after + code[after..].find('(').unwrap())
+        } else {
+            after
+        };
+        calls.push(CopyCall {
+            kind,
+            id: file.path_at(&source.module, at),
+            call: file.squeeze(start..end),
+            shown: source.at(at),
+        });
+    }
+    calls
+}
+
+/// Breaches of [`COPY_SITES`] in `calls`: an unregistered call, and a
+/// registered call that is gone. The registry is exact.
+fn copy_breaches(calls: &[CopyCall], sites: &[CopySite]) -> Vec<String> {
+    let mut unmatched: Vec<&CopySite> = sites.iter().collect();
+    let mut found = Vec::new();
+    for call in calls {
+        match unmatched
+            .iter()
+            .position(|site| site.kind == call.kind && site.id == call.id && site.call == call.call)
+        {
+            Some(at) => {
+                unmatched.remove(at);
+            }
+            None => found.push(format!(
+                "{} at {}: `{}::copy` is not registered: {}",
+                call.id, call.shown, call.kind, call.call
+            )),
+        }
+    }
+    for site in unmatched {
+        found.push(format!(
+            "{}: the registered `{}::copy` is gone: {}",
+            site.id, site.kind, site.call
+        ));
+    }
+    found
+}
+
+/// A raw `syscall` in non-test code, registered by its number's `libc`
+/// name. A raw syscall reaches `copy_file_range` by number (326 on
+/// `x86_64`, 285 on `aarch64`), which no name scan sees.
+struct SyscallSite {
+    /// The enclosing function, `crate::module::function`.
+    id: &'static str,
+    /// The first argument, whitespace removed: a `libc::SYS_*` constant.
+    number: &'static str,
+    /// What the call is, and why it touches no file.
+    why: &'static str,
+}
+
+/// Every raw `syscall` in non-test code (P84, OI-1003-Q165).
+const SYSCALL_SITES: &[SyscallSite] = &[
+    SyscallSite {
+        id: "agent::io::sys_linux::enter_background",
+        number: "libc::SYS_ioprio_set",
+        why: "Sets the calling thread's IO priority class to idle (WP0(f)); \
+              three integers, no descriptor, no file.",
+    },
+    SyscallSite {
+        id: "agent::io::sys_linux::in_background",
+        number: "libc::SYS_ioprio_get",
+        why: "Reads the calling thread's IO priority; two integers, no \
+              descriptor, no file.",
+    },
+];
+
+/// Every `syscall` token in `source`'s non-test code, as (function, first
+/// argument or `<not called>`, where).
+fn syscall_calls(source: &Source) -> Vec<(String, String, String)> {
+    let file = &source.file;
+    let code = &file.code;
+    let mut calls = Vec::new();
+    for at in tokens(code, "syscall") {
+        let after = at + "syscall".len();
+        let rest = code[after..].trim_start();
+        let number = if rest.starts_with('(') {
+            let open = after + code[after..].find('(').unwrap();
+            let close = group_end(code, open) - 1;
+            let mut depth = 0_usize;
+            let mut end = close;
+            for (offset, c) in code[open + 1..close].char_indices() {
+                match c {
+                    '(' | '[' | '{' => depth += 1,
+                    ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                    ',' if depth == 0 => {
+                        end = open + 1 + offset;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            file.squeeze(open + 1..end)
+        } else {
+            "<not called>".to_owned()
+        };
+        calls.push((file.path_at(&source.module, at), number, source.at(at)));
+    }
+    calls
+}
+
+/// Breaches of [`SYSCALL_SITES`] in `calls`: an unregistered raw syscall
+/// (a number, another call, or one not called), and a registered one that
+/// is gone. The registry is exact.
+fn syscall_breaches(calls: &[(String, String, String)], sites: &[SyscallSite]) -> Vec<String> {
+    let mut unmatched: Vec<&SyscallSite> = sites.iter().collect();
+    let mut found = Vec::new();
+    for (id, number, shown) in calls {
+        match unmatched
+            .iter()
+            .position(|site| site.id == id && site.number == number)
+        {
+            Some(at) => {
+                unmatched.remove(at);
+            }
+            None => found.push(format!(
+                "{id} at {shown}: a raw `syscall({number}` is not registered: a \
+                 number can be copy_file_range's (S2, OI-1003-Q165)"
+            )),
+        }
+    }
+    for site in unmatched {
+        found.push(format!(
+            "{}: the registered raw `syscall({}` is gone",
+            site.id, site.number
+        ));
+    }
+    found
+}
+
+/// The scan names every way of reaching a remap, and only those: a remap
+/// call or ioctl number in any spelling, `fs::copy` and `io::copy` under any
+/// path, and an import that would hide one. Comments, literals and test
+/// items are ignored.
+#[test]
+fn p84_the_scan_finds_every_remap_and_copy() {
+    let code = "use std::io::{self, Read as _};\n\
+        fn a(src: &File, dst: &File) { unsafe { libc::copy_file_range(1, null_mut(), 2, null_mut(), 9, 0) }; }\n\
+        fn b(fd: i32, src: i32) { unsafe { libc::ioctl(fd, libc::FICLONE, src) }; }\n\
+        fn c(fd: i32, src: i32) { unsafe { libc::ioctl(fd, 0x40049409, src) }; }\n\
+        fn c2(fd: i32, src: i32) { unsafe { libc::ioctl(fd, 0X4020940Du64, src) }; }\n\
+        fn d(a: &Path, b: &Path) { std::fs::copy(a, b).unwrap(); }\n\
+        fn e(a: &Path, b: &Path) { let _ = fs::copy(a, b); }\n\
+        fn f(r: &mut File, w: &mut File) { io::copy(r, w).ok(); }\n\
+        fn g() { let pointer = std::fs::copy; }\n\
+        use std::fs::copy;\n\
+        use std::io as stdio;\n\
+        fn harmless(v: Vec<u8>) { let n = 0x940; let m = 0x9400_u32; v.copy_within(0..1, 2); x.copy(); copy_into(); }\n\
+        // std::fs::copy(a, b) and FICLONE in a comment\n\
+        const S: &str = \"copy_file_range(fs::copy)\";\n\
+        #[cfg(test)]\nmod tests { fn t() { std::fs::copy(\"a\", \"b\"); libc::copy_file_range(); } }\n";
+    let source = synthetic("m", code);
+    let remaps = remap_breaches(&source);
+    let joined = remaps.join("\n");
+    for expected in [
+        "m.rs:2: `copy_file_range`",
+        "m.rs:3: `FICLONE`",
+        "m.rs:4: `0x40049409`",
+        "m.rs:5: `0x4020940d`",
+        "m.rs:10: a `use` imports `copy`",
+        "m.rs:11: a `use` renames `io`",
+    ] {
+        assert!(
+            joined.contains(expected),
+            "{expected} not found in:\n{joined}"
+        );
+    }
+    assert_eq!(remaps.len(), 6, "{joined}");
+    let calls: Vec<(&str, String, String)> = copy_calls(&source)
+        .into_iter()
+        .map(|call| (call.kind, call.id, call.call))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("fs", "m::d".to_owned(), "std::fs::copy(a,b)".to_owned()),
+            ("fs", "m::e".to_owned(), "fs::copy(a,b)".to_owned()),
+            ("io", "m::f".to_owned(), "io::copy(r,w)".to_owned()),
+            ("fs", "m::g".to_owned(), "std::fs::copy".to_owned()),
+            ("fs", "m::<module>".to_owned(), "std::fs::copy".to_owned()),
+        ]
+    );
+    let registered = [CopySite {
+        kind: "fs",
+        id: "m::e",
+        call: "fs::copy(a,b)",
+        input: "a synthetic site",
+    }];
+    let found = copy_breaches(&copy_calls(&source), &registered);
+    assert_eq!(found.len(), 4, "{found:#?}");
+    let gone = [CopySite {
+        kind: "io",
+        id: "m::gone",
+        call: "io::copy(r,w)",
+        input: "a synthetic site",
+    }];
+    assert!(copy_breaches(&[], &gone)[0].contains("is gone"));
+}
+
+/// The spellings the first scan missed (review, 2026-10-15): `self` renamed
+/// inside a `use` of `fs` or `io`, a glob import of either, and a clone
+/// ioctl number written with `_` separators, in another radix, or built
+/// from its type `0x94` written in decimal. Each is a breach; an import of
+/// the crate's own `io` module by glob, and numbers that only contain the
+/// digits, are not.
+#[test]
+fn p84_the_scan_finds_renames_globs_and_every_spelling_of_the_numbers() {
+    let code = "use std::io::{self as sio};\n\
+        fn m1(r: &mut File, w: &mut File) { sio::copy(r, w).ok(); }\n\
+        use std::io::*;\n\
+        use tokio::fs::{File as F, *};\n\
+        fn m3(a: i32, b: i32) { unsafe { libc::syscall(326, a, 0, b, 0, 9, 0) }; }\n\
+        fn m4(a: i32, b: i32) { unsafe { libc::ioctl(b, 0x4004_9409, a) }; }\n\
+        fn m5() -> u64 { libc::_IOW::<c_int>(148, 9) }\n\
+        fn m6() -> u64 { (1<<30)|(4<<16)|(148<<8)|9 }\n\
+        fn m7() -> u64 { 0o224 + 0b1001_0100 + 3_222_836_278u64 + 1072131018 }\n\
+        use crate::io::durable::*;\n\
+        use std::io::{self, Read as _};\n\
+        fn harmless() { let a = 1480; let b = 0x948; let c = 14_8_0; let d = 1.5e148; let e = x148; }\n";
+    let source = synthetic("m", code);
+    let remaps = remap_breaches(&source);
+    let joined = remaps.join("\n");
+    for expected in [
+        "m.rs:1: a `use` renames `self`",
+        "m.rs:3: a `use` imports all of `io`",
+        "m.rs:4: a `use` imports all of `fs`",
+        "m.rs:6: `0x40049409` spells FICLONE",
+        "m.rs:7: `0x94` spells",
+        "m.rs:8: `0x94` spells",
+        "m.rs:9: `0x94` spells the clone ioctls' type (written `0o224`)",
+        "m.rs:9: `0x94` spells the clone ioctls' type (written `0b1001_0100`)",
+        "m.rs:9: `0xc0189436` spells FIDEDUPERANGE",
+        "m.rs:9: `0x3fe76bca` spells FIDEDUPERANGE",
+    ] {
+        assert!(
+            joined.contains(expected),
+            "{expected} not found in:\n{joined}"
+        );
+    }
+    assert_eq!(remaps.len(), 10, "{joined}");
+}
+
+/// A raw `syscall` can reach `copy_file_range` by number (326 on `x86_64`),
+/// which no name scan sees. So every `syscall` in non-test code is a
+/// registered site, named with its `libc::SYS_*` constant; a number, any
+/// other call and a `syscall` that is not called are breaches.
+#[test]
+fn p84_a_raw_syscall_is_registered_by_its_number_s_name() {
+    let code = "fn m3(a: i32, b: i32) { unsafe { libc::syscall(326, a, 0, b, 0, 9, 0) }; }\n\
+        fn ok(a: i32) { unsafe { libc::syscall(libc::SYS_ioprio_get, a, 0) }; }\n\
+        fn other(a: i32) { unsafe { libc::syscall(libc::SYS_gettid) }; }\n\
+        fn pointer() { let f = libc::syscall; }\n\
+        // libc::syscall(326) in a comment\n\
+        #[cfg(test)]\nmod tests { fn t() { unsafe { libc::syscall(326) }; } }\n";
+    let source = synthetic("m", code);
+    let registered = [SyscallSite {
+        id: "m::ok",
+        number: "libc::SYS_ioprio_get",
+        why: "a synthetic site",
+    }];
+    let found = syscall_breaches(&syscall_calls(&source), &registered);
+    let joined = found.join("\n");
+    for expected in [
+        "m::m3 at m.rs:1: a raw `syscall(326` is not registered",
+        "m::other at m.rs:3: a raw `syscall(libc::SYS_gettid` is not registered",
+        "m::pointer at m.rs:4: a raw `syscall(<not called>` is not registered",
+    ] {
+        assert!(
+            joined.contains(expected),
+            "{expected} not found in:\n{joined}"
+        );
+    }
+    assert_eq!(found.len(), 3, "{joined}");
+    let gone = syscall_breaches(&[], &registered);
+    assert!(gone[0].contains("is gone"), "{gone:?}");
+}
+
+/// P84 SOURCE-NO-CLONE (S2, OI-1003-Q165): no non-test code in any crate
+/// names a remap call, and every `std::fs::copy` and `std::io::copy` is a
+/// registered site whose input is not a source file. The raw-tree capture's
+/// `io::copy` reads a source file, so its writer is pinned to `git
+/// fast-import`'s stdin, a pipe: std's Linux fast path for a pipe writer is
+/// `splice`, never `copy_file_range`.
+#[test]
+fn p84_no_source_file_is_ever_the_input_of_a_clone() {
+    let sources = workspace_sources();
+    let remaps: Vec<String> = sources.iter().flat_map(remap_breaches).collect();
+    assert!(
+        remaps.is_empty(),
+        "a remap call in non-test code (S2, OI-1003-Q165): a source file is \
+         read with pread, read or splice, never cloned:\n{}",
+        remaps.join("\n")
+    );
+    let calls: Vec<CopyCall> = sources.iter().flat_map(copy_calls).collect();
+    let found = copy_breaches(&calls, COPY_SITES);
+    assert!(
+        found.is_empty(),
+        "fs::copy and io::copy outside the P84 registry (S2, OI-1003-Q165): \
+         either clones its input on a reflink file system, so a new site \
+         argues why its input is never a source file:\n{}",
+        found.join("\n")
+    );
+    for site in COPY_SITES {
+        assert!(site.input.len() > 40, "{}: say what the input is", site.id);
+    }
+    let syscalls: Vec<(String, String, String)> = sources.iter().flat_map(syscall_calls).collect();
+    let found = syscall_breaches(&syscalls, SYSCALL_SITES);
+    assert!(
+        found.is_empty(),
+        "a raw syscall outside the P84 registry (S2, OI-1003-Q165): a raw \
+         number can be copy_file_range's, so each site is named by its \
+         libc::SYS_* constant:\n{}",
+        found.join("\n")
+    );
+    for site in SYSCALL_SITES {
+        assert!(site.why.len() > 40, "{}: say what the call is", site.id);
+    }
+}
+
+/// `batch_objects::read_body` is a registered `io::copy` whose parameters
+/// are `impl Read` and `impl Write`: the registry's call text alone would
+/// let a new caller hand it two files, which std serves with
+/// `copy_file_range`, a clone on a reflink file system. So its callers are
+/// pinned (review, 2026-10-15): its one non-test caller is `copy_into`,
+/// which passes `self.output`, the `BufReader<ChildStdout>` of `git
+/// cat-file --batch`, a pipe. `close`'s `io::copy` needs no pin: its writer
+/// is `io::sink`, in the registered call text.
+#[test]
+fn p84_the_batch_reader_reads_only_git_s_pipe() {
+    let batch: Vec<Source> = agent_sources()
+        .into_iter()
+        .filter(|source| source.module == "agent::git_carry::batch_objects")
+        .collect();
+    assert_eq!(
+        batch.len(),
+        1,
+        "agent::git_carry::batch_objects not scanned"
+    );
+    assert_eq!(
+        calls_of(&batch, "read_body"),
+        [(
+            "agent::git_carry::batch_objects::copy_into".to_owned(),
+            "read_body(output,target,length)?;".to_owned()
+        )]
+    );
+    let file = &batch[0].file;
+    let copy_into = file
+        .functions
+        .iter()
+        .find(|block| block.name == "copy_into")
+        .unwrap();
+    let body = file.squeeze(copy_into.open..copy_into.span.end);
+    let pinned = "letoutput=self.output.as_mut().ok_or(BulkloadRefusal::Io(None))?;";
+    assert!(body.contains(pinned), "{pinned} not in copy_into: {body}");
+    assert_eq!(body.matches("letoutput").count(), 1, "{body}");
+    let open = file.code.find("pub(super) struct BatchObjects").unwrap();
+    let declared =
+        file.squeeze(open..group_end(&file.code, file.code[open..].find('{').unwrap() + open));
+    assert!(
+        declared.contains("output:Option<BufReader<ChildStdout>>,"),
+        "{declared}"
+    );
+    let new = file
+        .functions
+        .iter()
+        .find(|block| block.name == "new")
+        .unwrap();
+    let body = file.squeeze(new.open..new.span.end);
+    for pinned in [
+        "letmutchild=git(repository).args([\"cat-file\",\"--batch\"])",
+        ".stdout(Stdio::piped())",
+        "letoutput=child.stdout.take().map(BufReader::new);",
+    ] {
+        assert!(body.contains(pinned), "{pinned} not in new: {body}");
+    }
+}
+
+/// The raw-tree capture's `io::copy` reads a source file (P84's one such
+/// site), so its writer is pinned: `regular` is called only by `stream`,
+/// `stream` only by `capture`, with `git fast-import`'s stdin, a
+/// `ChildStdin` pipe. A regular-file writer there would let std's
+/// `io::copy` choose `copy_file_range`, which clones on a reflink file
+/// system.
+#[test]
+fn p84_the_raw_tree_capture_writes_only_into_a_pipe() {
+    let sources = agent_sources();
+    let raw_tree: Vec<Source> = sources
+        .into_iter()
+        .filter(|source| source.module == "agent::git_carry::raw_tree")
+        .collect();
+    assert_eq!(raw_tree.len(), 1, "agent::git_carry::raw_tree not scanned");
+    let calls = |name: &str| -> Vec<(String, String)> { calls_of(&raw_tree, name) };
+    let regular = calls("regular");
+    assert_eq!(regular.len(), 1, "{regular:#?}");
+    assert_eq!(regular[0].0, "agent::git_carry::raw_tree::stream");
+    assert!(
+        regular[0]
+            .1
+            .starts_with("matchregular(writer,&mutfile,&path,row)?"),
+        "{regular:#?}"
+    );
+    assert_eq!(
+        calls("stream"),
+        [(
+            "agent::git_carry::raw_tree::capture".to_owned(),
+            "letresult=stream(&mutstdin,repo,rows,reuse,&mutdrift);".to_owned()
+        )]
+    );
+    let file = &raw_tree[0].file;
+    let capture = file
+        .functions
+        .iter()
+        .find(|block| block.name == "capture")
+        .unwrap();
+    let body = file.squeeze(capture.open..capture.span.end);
+    for pinned in [
+        "letmutchild=git(private).args([\"fast-import\",\"--quiet\",\"--done\"])\
+         .stdin(Stdio::piped())",
+        "letmutstdin=child.stdin.take().ok_or(BulkloadRefusal::Io(None))?;",
+    ] {
+        assert!(body.contains(pinned), "{pinned} not in capture: {body}");
+    }
+    assert_eq!(body.matches("letmutstdin").count(), 1, "{body}");
+}

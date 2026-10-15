@@ -433,6 +433,46 @@ crash-sweep:
     fi
     echo "crash-sweep: all $points points were swept"
 
+# On demand, never a PR gate (OI-1003-Q165 review, R-N122): P84
+# SOURCE-NO-CLONE's kernel leg and the reflink halves of the bench and
+# harness no-clone tests, required to run. Each returns early where its
+# directory cannot clone, and cargo and unittest still report that as `ok`
+# or a skip, so the PR gate's counts are no proof that they ran. Here
+# BULKLOAD_P84_REQUIRE_REFLINK turns that early return into a failure,
+# TMPDIR is P84_REFLINK_DIR (default `target/p84-reflink`, the build's own
+# file system), and each leg must print its own line. It needs Linux with
+# that directory on xfs `reflink=1`, btrfs or bcachefs; elsewhere it fails.
+p84-reflink:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    dir=${P84_REFLINK_DIR:-${CARGO_TARGET_DIR:-target}/p84-reflink}
+    mkdir -p "$dir"
+    TMPDIR=$(cd "$dir" && pwd)
+    export TMPDIR BULKLOAD_P84_REQUIRE_REFLINK=1
+    log=$(mktemp "$TMPDIR/p84-reflink.XXXXXX")
+    trap 'rm -f "$log"' EXIT
+    cargo test -p bulkload-agent --locked --test source_lock_trace p84_ -- --nocapture 2>&1 | tee "$log"
+    if [[ $(grep -c '^test result: ok\. 3 passed; 0 failed;' "$log" || true) -ne 1 ]]; then
+        echo "p84-reflink: expected one '3 passed; 0 failed' result, the kernel leg's own" >&2
+        exit 1
+    fi
+    for marker in 'p84 self-test: FICLONE shared ' 'p84 copy and serve: source ' 'p84 git and sqlite: repository '; do
+        if [[ $(grep -c "^$marker" "$log" || true) -ne 1 ]]; then
+            echo "p84-reflink: no '$marker' line: that leg did not run" >&2
+            exit 1
+        fi
+    done
+    cargo test -p bulkload-bench --locked tests::a_fixture_that_shares_an_extent_refuses_the_sample -- --exact --nocapture 2>&1 | tee "$log"
+    if [[ $(grep -c '^bench no-clone: reflinked fixture and sealed corpus refused$' "$log" || true) -ne 1 ]]; then
+        echo "p84-reflink: the bench's reflinked half did not run" >&2
+        exit 1
+    fi
+    python3 crates/bulkload-bench/scripts/test_r23_corpus.py NoCloneTests
+    python3 crates/bulkload-bench/scripts/test_r23_ab.py HarnessTests.test_a_cloning_copy_is_refused_by_fiemap_on_a_reflink_file_system
+    python3 crates/bulkload-bench/scripts/test_gate_b.py HelperTests.test_prepare_copies_by_read_and_write_and_refuses_a_shared_copy
+    echo "p84-reflink: the kernel leg, the bench and the harness reflink halves ran under $TMPDIR"
+
 # Normal attached gate: materialize the repo tools, then use the Flywheel
 # wrapper for the Bazel graph.
 check:

@@ -9,11 +9,15 @@ patched, not real.
 from __future__ import annotations
 
 import contextlib
+import errno
+import fcntl
 import importlib.util
 import io
 import json
 import os
+import shutil
 import stat
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -107,6 +111,40 @@ def fake_identity(node: str = "rig-x", **over: object) -> dict[str, object]:
     }
     identity.update(over)
     return identity
+
+
+# `just p84-reflink` sets this to make the reflink half fail instead of
+# skip (R-N122). It is taken out of the environment here: the harness refuses
+# a sample while any BULKLOAD_* variable is in its own environment.
+REQUIRE_REFLINK = bool(os.environ.pop("BULKLOAD_P84_REQUIRE_REFLINK", ""))
+# FIEMAP's answer for an unshared tree, the default in HarnessTests: the
+# tests' temporary directory may have no FIEMAP (tmpfs). OI-1003-Q165.
+UNSHARED = {"files": 1, "extents": 1, "shared": 0, "shared_files": []}
+# FICLONE, _IOW(0x94, 9, int): the tests' own clone.
+FICLONE = 0x40049409
+
+
+def clone_file(source: Path, target: Path) -> None:
+    """A reflink of `source` at the new file `target` (a cloning copy)."""
+    with open(source, "rb") as inp, open(target, "xb") as out:
+        fcntl.ioctl(out.fileno(), FICLONE, inp.fileno())
+
+
+def can_clone(directory: Path) -> str | None:
+    """None when `directory` can clone and FIEMAP sees it; else why not."""
+    if sys.platform != "linux":
+        return "not Linux"
+    probe, twin = directory / "clone-probe", directory / "clone-probe-twin"
+    probe.write_bytes(b"p" * 65536)
+    try:
+        clone_file(probe, twin)
+    except OSError as error:
+        return f"{directory} cannot clone ({errno.errorcode.get(error.errno)})"
+    finally:
+        probe.unlink()
+        if twin.exists():
+            twin.unlink()
+    return None
 
 
 def stub(path: Path) -> Path:
@@ -438,6 +476,9 @@ class HarnessTests(unittest.TestCase):
             "system": mock.patch.object(ab.platform, "system", return_value="Darwin"),
             "host_identity": mock.patch.object(
                 ab, "host_identity", side_effect=lambda _parent: fake_identity()
+            ),
+            "sharing": mock.patch.object(
+                ab.r23_corpus, "tree_sharing", return_value=UNSHARED, create=True
             ),
         }
         for name, value in patches.items():
@@ -1617,6 +1658,9 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(ab.DEFAULT_A, "7c3ecc7")
         self.assertIn("OI-1003-Q103", ab.RULINGS)
         self.assertIn("OI-1003-Q105", ab.RULINGS)
+        # OI-1003-Q165 (b): every sample enforces the no-clone copy rule.
+        self.assertIn("OI-1003-Q165", ab.RULINGS)
+        self.assertIn("OI-1003-Q165", ab.RULINGS_UNDER_LOAD)
         self.assertIn("never decides the gate", ab.A_PURPOSE)
 
     def built_revs(self, argv: list[str], **patches: object) -> tuple[int, list[str]]:
@@ -1696,6 +1740,170 @@ class HarnessTests(unittest.TestCase):
         self.setUp()
         self.assertEqual(self.main(self.no_a()), 0)
         self.assertIsNone(self.report()["baseline_a"])
+
+    # --- OI-1003-Q165 (b): the working copy is never a clone
+
+    def test_the_working_copy_is_a_read_and_write_never_shutil(self) -> None:
+        def refused(*_a: object, **_k: object) -> None:
+            raise AssertionError("a cloning copy path was used (OI-1003-Q165)")
+
+        (self.corpus / "d").mkdir()
+        (self.corpus / "d" / "g").write_bytes(b"y" * 70000)
+        (self.corpus / "f").chmod(0o444)
+        cloning = [
+            mock.patch.object(shutil, name, side_effect=refused)
+            for name in ("copytree", "copy2", "copyfile", "copy", "copyfileobj")
+        ]
+        cloning += [
+            mock.patch.object(os, name, side_effect=refused, create=True)
+            for name in ("copy_file_range", "sendfile", "splice")
+        ]
+        with contextlib.ExitStack() as stack:
+            for patcher in cloning:
+                stack.enter_context(patcher)
+            with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+                self.assertEqual(self.main(self.gated()), 0)
+        copy = self.tmp / "work" / "corpus"
+        self.assertEqual((copy / "d" / "g").read_bytes(), b"y" * 70000)
+        self.assertEqual(stat.S_IMODE((copy / "f").stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE((copy / "d").stat().st_mode), 0o755)
+        self.assertEqual(
+            (copy / "f").stat().st_mtime_ns, (self.corpus / "f").stat().st_mtime_ns
+        )
+        report = self.report()
+        self.assertEqual(report["working_copy_shared_extents"], "0")
+        self.assertIn("read-write", report["copy_method"])
+        self.assertEqual(
+            report["reps"][0]["shared_extents_after"],
+            {"working_copy": "0", "fixture": "absent"},
+        )
+        self.assertIn("No clone (S2, OI-1003-Q165)", (self.tmp / EV).read_text())
+
+    def test_a_shared_working_copy_refuses_the_sample(self) -> None:
+        shared = {"files": 1, "extents": 1, "shared": 1, "shared_files": ["f"]}
+        sharing = mock.patch.object(
+            ab.r23_corpus, "tree_sharing", return_value=shared, create=True
+        )
+        for mode in (self.gated(), self.under_load(), ["--dry-run"]):
+            self.setUp()
+            self.assertEqual(self.main(mode, sharing=sharing), 2, mode)
+            self.assertIn(
+                "shares 1 extent(s) with another file (f)", self.out.getvalue()
+            )
+            self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+
+    def test_no_fiemap_refuses_a_gated_sample_and_is_recorded_otherwise(self) -> None:
+        none = mock.patch.object(
+            ab.r23_corpus, "tree_sharing", return_value=None, create=True
+        )
+        linux = mock.patch.object(ab.r23_corpus.sys, "platform", "linux")
+        self.assertEqual(self.main(self.gated(), sharing=none, sys_platform=linux), 2)
+        self.assertIn("cannot be verified unshared", self.out.getvalue())
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(self.under_load(), sharing=none, sys_platform=linux)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.report()["working_copy_shared_extents"], "unsupported")
+        self.setUp()
+        darwin = mock.patch.object(ab.r23_corpus.sys, "platform", "darwin")
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(self.gated(), sharing=none, sys_platform=darwin)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.report()["working_copy_shared_extents"], "n/a")
+
+    def test_a_shared_sealed_corpus_refuses_a_gated_sample(self) -> None:
+        """OI-1003-Q166 re-sealed the corpus unshared: a shared one now refuses."""
+
+        def sharing(root: Path) -> dict[str, object]:
+            if Path(root).name == "sealed":
+                return {"files": 1, "extents": 1, "shared": 1, "shared_files": ["f"]}
+            return UNSHARED
+
+        patched = mock.patch.object(
+            ab.r23_corpus, "tree_sharing", side_effect=sharing, create=True
+        )
+        self.assertEqual(self.main(self.gated(), sharing=patched), 2)
+        self.assertIn("the sealed corpus shares 1 extent(s)", self.out.getvalue())
+        self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(self.under_load(), sharing=patched)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.report()["sealed_corpus_shared_extents"], "1")
+
+    def test_a_clone_during_a_rep_aborts_the_sample(self) -> None:
+        calls = []
+
+        def sharing(root: Path) -> dict[str, object]:
+            calls.append(Path(root).name)
+            # The sealed corpus and the copy before the builds, then rep0.
+            if len(calls) > 2:
+                return {"files": 1, "extents": 1, "shared": 1, "shared_files": ["f"]}
+            return UNSHARED
+
+        patched = mock.patch.object(
+            ab.r23_corpus, "tree_sharing", side_effect=sharing, create=True
+        )
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated(), sharing=patched), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertIn(
+            "the working copy after rep0 shares 1 extent(s)", report["reason"]
+        )
+        self.assertEqual(calls[:3], ["sealed", "corpus", "corpus"])
+
+    def test_a_cloning_copy_is_refused_by_fiemap_on_a_reflink_file_system(self) -> None:
+        """Real FIEMAP, a real clone: the scratch directory must be able to clone.
+
+        A copy that clones (as `shutil` does on Python 3.14 through
+        `copy_file_range`, and `cp` by default) stands in for the copy
+        function; the harness must refuse before any build. The default
+        `TMPDIR` may be tmpfs: set it to a reflink file system (xfs reflink=1)
+        for this test to run.
+        """
+        why = can_clone(self.tmp)
+        if why:
+            if REQUIRE_REFLINK:
+                self.fail(f"required by BULKLOAD_P84_REQUIRE_REFLINK: {why}")
+            self.skipTest(f"{why}: set TMPDIR to a reflink file system")
+        (self.corpus / "big").write_bytes(os.urandom(1 << 20))
+
+        def cloning_copy(
+            source: Path, target: Path, *rest: object, **_k: object
+        ) -> object:
+            clone_file(Path(source), Path(target))
+            if rest and isinstance(rest[0], int):
+                os.chmod(target, rest[0])
+            return target
+
+        cloning = [
+            mock.patch.object(shutil, "copyfile", side_effect=cloning_copy),
+            mock.patch.object(
+                ab.r23_corpus, "plain_copy_file", side_effect=cloning_copy, create=True
+            ),
+        ]
+        real = contextlib.nullcontext()
+        # A clone shares both sides: gated, the shared sealed corpus refuses
+        # first (OI-1003-Q166); informational, the working copy does.
+        for mode, which in (
+            (self.gated(), "the sealed corpus shares"),
+            (self.under_load(), "the working copy shares"),
+        ):
+            self.setUp()
+            (self.corpus / "big").write_bytes(os.urandom(1 << 20))
+            with contextlib.ExitStack() as stack:
+                for patcher in cloning:
+                    stack.enter_context(patcher)
+                self.assertEqual(self.main(mode, sharing=real), 2, mode)
+            self.assertIn(which, self.out.getvalue())
+            self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+        # The same tree copied by the harness's own copy shares nothing.
+        self.setUp()
+        (self.corpus / "big").write_bytes(os.urandom(1 << 20))
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated(), sharing=real), 0)
+        self.assertEqual(self.report()["working_copy_shared_extents"], "0")
 
 
 if __name__ == "__main__":

@@ -27,7 +27,9 @@ The SLO text is the three 2026-10-07 amendments in [../slo.md](../slo.md).
 ```
 ~/git-bulkload/
   bulkload/                 clone of Jesssullivan/bulkload
-  r23-corpus-v1/corpus/     sealed R23 corpus v1 (0444/0555)
+  r23-corpus-v1-unshared/corpus/  sealed R23 corpus v1 (0444/0555): the default (OI-1003-Q166)
+  r23-corpus-v1/corpus/     the first seal, reflink-shared with sota/src; kept, not used
+  q165b-20261015/rigcopy.py read/write copy and FIEMAP check for rig tooling (OI-1003-Q165 (b))
   build/                    --build-root: per-revision target dirs and binaries
   cargo-home/  xdg-cache/   CARGO_HOME and XDG_CACHE_HOME for the builds
   tmp/                      TMPDIR (nix develop's temporary directories)
@@ -63,16 +65,39 @@ Record both.
 
 ## 2. Generate, verify and seal the corpus
 
+This section is the rig's canonical corpus default (OI-1003-Q166). The
+default is `~/git-bulkload/r23-corpus-v1-unshared/corpus`. The dated run
+scripts under `~/git-bulkload/` are records of past runs, not defaults.
+
+On a new host:
+
 ```
 cd ~/git-bulkload/bulkload
-nix develop .#default --command python3 crates/bulkload-bench/scripts/r23_corpus.py generate ~/git-bulkload/r23-corpus-v1
-nix develop .#default --command python3 crates/bulkload-bench/scripts/r23_corpus.py seal ~/git-bulkload/r23-corpus-v1
-nix develop .#default --command python3 crates/bulkload-bench/scripts/r23_corpus.py verify ~/git-bulkload/r23-corpus-v1/corpus
+nix develop .#default --command python3 crates/bulkload-bench/scripts/r23_corpus.py generate ~/git-bulkload/r23-corpus-v1-unshared
+nix develop .#default --command python3 crates/bulkload-bench/scripts/r23_corpus.py seal ~/git-bulkload/r23-corpus-v1-unshared
+nix develop .#default --command python3 crates/bulkload-bench/scripts/r23_corpus.py verify ~/git-bulkload/r23-corpus-v1-unshared/corpus
+nix develop .#default --command python3 crates/bulkload-bench/scripts/r23_corpus.py fiemap ~/git-bulkload/r23-corpus-v1-unshared/corpus
 ```
+
+Make any further copy of a sealed corpus with `r23_corpus.py copy CORPUS
+OUT` (a read and write, verified, FIEMAP-checked), never `cp` or `shutil`
+(OI-1003-Q165 (b)). `fiemap` must print `shared=0`.
 
 `verify` must print `identity=f4a7619f7b88f2e0e1eeadb5995c79a809eafa8b4a8cf3f82d1ff6f29b5b07c7`
 and exit 0. The harness verifies it again before and after the sample and
-refuses any other corpus.
+refuses any other corpus. A gated sample also refuses a sealed corpus or a
+working copy that shares an extent.
+
+On mbp-13 (2026-10-15):
+
+- The first seal, `~/git-bulkload/r23-corpus-v1/corpus`, shares the extents
+  of all 23 of its files with `~/git-bulkload/sota/src`, which `cp -a` made
+  (`--reflink=auto`). It is kept and no longer used.
+- `~/git-bulkload/r23-corpus-v1-unshared/corpus` is the re-seal. It was made
+  by an `os.read`/`os.write` copy, then verified to the identity above, with
+  0 of its 25 extents shared (the 23 corpus files, `MANIFEST.tsv` and
+  `README.md`). The receipt is
+  `~/git-bulkload/logs/reseal-corpus-v1-20261015.receipt`.
 
 ## 3. rclone (OI-1003-Q105)
 
@@ -146,7 +171,7 @@ and `crates/bulkload-proto` relate to main (`git diff --stat origin/main
 cd ~/git-bulkload/bulkload
 stamp=$(date -u +%Y%m%d-%H%MZ)
 nohup nice -n 10 nix develop .#default --command python3 crates/bulkload-bench/scripts/r23_ab.py \
-  --corpus ~/git-bulkload/r23-corpus-v1/corpus \
+  --corpus ~/git-bulkload/r23-corpus-v1-unshared/corpus \
   --work-root ~/git-bulkload/runs/r23-ab-$stamp \
   --build-root ~/git-bulkload/build \
   --rev-b <sha> --coordinator-quiet \

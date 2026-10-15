@@ -798,6 +798,149 @@ ruling, and it is not an S1 result.
   and its default are this change's; OI-1003-Q37 names the settings, not a
   flag.
 
+## Amendment 2026-10-15: S2 forbids a clone of a source file (OI-1003-Q164, Q165, Q166)
+
+The clone-lever study (OI-1003-Q164,
+[agent note](agent-notes/2026-10-15-s1-clone-lever.md)) measured that a
+clone writes the source while every `stat` field stays the same. The
+operator ruled the clone **excluded** (OI-1003-Q165), and S2 gains a typed
+rule. No SLO number changes.
+
+- **Why it is a source write.** `FICLONE`, `FICLONERANGE` and a
+  same-file-system `copy_file_range` (which reflink XFS and btrfs serve as
+  a clone) set the source inode's reflink flag in a logged transaction, bump
+  its `i_version` and add references to its extents. Writers to the source
+  stall for the whole remap, and every later write to a shared block is
+  copy-on-write. Only `FIEMAP`'s `SHARED` flag shows it outside the kernel;
+  the stat rows, the bench's source-row check and P34/P77's `lstat` census
+  do not.
+- **(a) No clone call on a source file (S2 property, OI-1003-Q165).** A
+  source file is read by `pread`, or by `read`/`splice` into a pipe. It is
+  never the input of `FICLONE`, `FICLONERANGE`, `FIDEDUPERANGE`,
+  `copy_file_range`, `clonefile`/`fclonefileat` or
+  `copyfile`/`fcopyfile` (remap). `sendfile` is allowed: it only reads.
+  - Rust's `std::fs::copy` uses `copy_file_range` on Linux, and
+    `std::io::copy` does when both ends are regular files. So both count as
+    remaps for this rule.
+  - **Enforced in the typed source access layer.** The rule is stated on
+    the io layer (`io/mod.rs`, "Source access never clones"). P84
+    SOURCE-NO-CLONE (`tests/source_command_registry.rs`) scans every crate's
+    non-test code.
+    - No remap call is named.
+    - No clone ioctl number is written, matched by value in any radix,
+      with `_` separators or a type suffix (`0x4004_9409`, `148`).
+    - No `use` hides a copy: an import of `copy`, `fs` or `io` renamed
+      (`self as` too), or a glob import of either.
+    - Every raw `syscall` is a registered site named by its `libc::SYS_*`
+      constant, so no number can reach `copy_file_range`.
+    - Every `fs::copy` and `io::copy` must be a registered site whose input
+      is argued not to be a source file. A registered site with generic
+      parameters has its callers pinned too: the raw-tree capture's
+      `io::copy` reads a source file, and its writer is pinned to `git
+      fast-import`'s stdin, a pipe, for which std uses `splice`.
+      `batch_objects::read_body`'s one caller passes `git cat-file`'s stdout.
+  - **Proven on the kernel.** P84's kernel leg (`tests/source_lock_trace.rs`)
+    proves on the host that `FIEMAP` sees a `FICLONE` and a `std::fs::copy`
+    that the `lstat` census misses. Then three verbs must leave every source
+    extent unshared: a real `copy`, a `serve` in its own process, and a v1
+    Git capture, whose raw-tree pass reads every seat. A `SQLite` provider
+    snapshot must too, as an ordinary user; as root the provider refuses
+    to read a source at all (OI-1003-Q76).
+    - The leg needs a directory on a reflink file system: `TMPDIR`, or else
+      cargo's `CARGO_TARGET_TMPDIR`.
+    - Where neither can clone, the leg says so on stderr and returns, and
+      cargo still reports `ok`. The same holds for the bench's and the
+      harness scripts' reflinked halves. So a pass count from the PR gate
+      or `cargo test` is not proof that these legs ran.
+    - `just p84-reflink` is that proof. It sets
+      `BULKLOAD_P84_REQUIRE_REFLINK`, which turns each early return into a
+      failure, and it requires each leg's own output line. It is on
+      demand, like `props-deep`, and is not a PR gate.
+  - **What `FIEMAP` can say.** It shows sharing that exists when it looks.
+    A clone whose target is then overwritten in full, or unlinked and
+    freed, leaves the source unshared again, although the clone call wrote
+    the source inode. So a `0` means "shares nothing now", not "was never
+    cloned"; the static half is what rules the call out.
+    - `FIEMAP_EXTENT_SHARED` is trusted only on xfs, btrfs, bcachefs and
+      ocfs2.
+    - ext2/3/4 and tmpfs cannot reflink, so a file there counts as 0 by
+      construction.
+    - Any other file system (CIFS/SMB3, which clones but never sets the
+      flag, NFS, overlayfs, ZFS) counts as `unsupported`, never `0`.
+    - An unreadable directory fails the check instead of being skipped.
+  - **The two destination-side `std::fs::copy` calls stay.**
+    `git_carry::prepare_attachment` and `git_carry::registered::restore`
+    copy bulkload's own private staged capture bundle into a receipt it has
+    just created. Neither file is a source file, so S2 does not govern them.
+    On a reflink file system the receipt may share extents with the staged
+    copy; that is the study's Q-d, not ruled here.
+- **(b) Rig corpus copies are read and write, verified unshared
+  (OI-1003-Q165).** Every copy of the sealed corpus a sample reads is an
+  explicit `read`/`write` copy. It is never `cp`, whose default is
+  `--reflink=auto`, and never `shutil`, which uses `copy_file_range` on
+  Linux from Python 3.14. The copy is checked with `FIEMAP`
+  (`FIEMAP_EXTENT_SHARED` never set) before the sample runs, and a shared
+  extent refuses the sample.
+  - `r23_ab.py`'s working copy is `r23_corpus.plain_copy_tree`. It is
+    checked before any build, and a shared extent refuses with exit 2 in
+    every mode.
+  - On Linux, a work root whose sharing cannot be known (above) refuses a
+    gated sample, and an informational one records `unsupported`. Off
+    Linux the check is `n/a`.
+  - After every rep, the working copy and the rep's private fixture are
+    checked again. A shared extent aborts the sample with exit 3.
+  - The bench (`bulkload-bench`) checks its seeded fixture after the seed
+    and after every arm, and refuses on a shared extent in every mode. Its
+    header records `fixture_shared_extents` and
+    `sealed_corpus_shared_extents`, and every sample row records
+    `source_shared_extents`.
+  - `gate_b.py`'s source working copy follows the same rule: a read/write
+    copy, and a shared extent refuses SOURCE.
+  - `r23_corpus.py copy` makes a read/write, verified, unshared copy of a
+    corpus. `seal` refuses a copy that shares an extent, and `fiemap`
+    prints a tree's count.
+  - The sealed corpus is checked once per sample. Since Q166 re-sealed the
+    rig's corpus unshared, a shared sealed corpus refuses a gated sample in
+    both the bench and `r23_ab.py`; an informational one records the count.
+  - The rig's own tooling, outside the repository, follows the rule
+    (receipt `~/git-bulkload/logs/q165b-rig-tooling-20261015.receipt`,
+    sha256 `5cc030df4a6ae8b1…`):
+    - The sota driver's working copy is `~/git-bulkload/sota/src-unshared`,
+      a read and write copy with 0 shared extents. The old `sota/src`, a
+      `cp -a` reflink, is kept and no longer used.
+    - The driver checks the copy before and after every sample, and refuses
+      its clone configurations.
+    - `diag.sh` and `pin-diag.sh` copy with `rigcopy.py`, not `cp -R`.
+    - Every run script refuses a checkout whose `r23_ab.py` lacks this
+      gate.
+- **(c) Re-seal (OI-1003-Q166), done 2026-10-15 on mbp-13.** Corpus v1
+  shared all 23 of its files' extents with `~/git-bulkload/sota/src` (the
+  study's §1).
+  - **Old path (kept, not deleted):** `~/git-bulkload/r23-corpus-v1/corpus`.
+  - **New path (the rig default):**
+    `~/git-bulkload/r23-corpus-v1-unshared/corpus`.
+  - **Made** by an explicit `os.read`/`os.write` copy:
+    - The tool was `~/git-bulkload/reseal-20261015/reseal_copy.py` (sha256
+      `523a06458c47cbfa…`), a rig script; the repository's
+      `r23_corpus.py copy` was not on the rig's checkout yet.
+    - `strace` showed no `copy_file_range`, `sendfile`, `splice` or clone
+      ioctl.
+    - It was then sealed 0444/0555, as the original was.
+  - **Verified** to the same content identity
+    (`f4a7619f7b88f2e0e1eeadb5995c79a809eafa8b4a8cf3f82d1ff6f29b5b07c7`,
+    `r23_corpus.py verify` at 59e5e60).
+  - **Unshared:** 0 of its 25 extents are shared, by
+    `~/git-bulkload/reseal-20261015/fiemap_check.py` (sha256
+    `0ff568b6d8203bae…`).
+  - **Receipt:** `~/git-bulkload/logs/reseal-corpus-v1-20261015.receipt`,
+    sha256 `5e716ee5988a7107…`.
+  - **The default** is the runbook's `--corpus`
+    (`docs/plans/2026-10-07-s1-hermetic-rig.md` §2 and §5). The rig's dated
+    run scripts are records of past runs, not defaults.
+
+  A re-seal changes inode and ctime, so the stat-based fixture identity
+  (`sealed_corpus_blake3`) starts a new series.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

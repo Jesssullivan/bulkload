@@ -563,12 +563,30 @@ CRASH_SWEEP_REQUIRED = (
 )
 
 
+P84_REFLINK_REQUIRED = (
+    "export TMPDIR BULKLOAD_P84_REQUIRE_REFLINK=1",
+    "cargo test -p bulkload-agent --locked --test source_lock_trace p84_ "
+    '-- --nocapture 2>&1 | tee "$log"',
+    "if [[ $(grep -c '^test result: ok\\. 3 passed; 0 failed;' \"$log\" || true) -ne 1 ]]; then",
+    "for marker in 'p84 self-test: FICLONE shared ' 'p84 copy and serve: source ' "
+    "'p84 git and sqlite: repository '; do",
+    '    if [[ $(grep -c "^$marker" "$log" || true) -ne 1 ]]; then',
+    "cargo test -p bulkload-bench --locked "
+    "tests::a_fixture_that_shares_an_extent_refuses_the_sample "
+    '-- --exact --nocapture 2>&1 | tee "$log"',
+    "if [[ $(grep -c '^bench no-clone: reflinked fixture and sealed corpus refused$' "
+    '"$log" || true) -ne 1 ]]; then',
+    "python3 crates/bulkload-bench/scripts/test_r23_corpus.py NoCloneTests",
+)
+
+
 def validate_deep_recipes(justfile: str) -> None:
-    """`props-deep` and `crash-sweep` must fail unless the tests that left
-    the PR gate really ran."""
+    """`props-deep`, `crash-sweep` and `p84-reflink` must fail unless the
+    tests that skip themselves elsewhere really ran."""
     for name, required, runs in (
         ("props-deep", PROPS_DEEP_REQUIRED, 2),
         ("crash-sweep", CRASH_SWEEP_REQUIRED, 1),
+        ("p84-reflink", P84_REFLINK_REQUIRED, 2),
     ):
         _, body = just_recipe(justfile, name)
         for line in required:

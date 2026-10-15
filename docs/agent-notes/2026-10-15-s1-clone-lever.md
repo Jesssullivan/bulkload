@@ -607,6 +607,242 @@ Recommendation A is unchanged. This pass changed:
       that leave out the SQLite FULL commit.
     - rclone's `sync_after_ms` falls outside the timed window.
 
+## 11. Follow-up: OI-1003-Q165 and Q166 ruled; Q165 built (2026-10-15)
+
+**Rulings.**
+
+- **OI-1003-Q165.** The clone stays excluded. That answers §8 Q-a with
+  option A, and the clone's invisible source write counts as a write under
+  S2.
+  - (a) S2 gains a typed rule: no clone call on a source file.
+  - (b) Rig corpus copies are explicit read/write copies, verified unshared
+    by `FIEMAP`; a shared extent refuses the sample.
+  - The two destination-side `std::fs::copy` calls may stay (§3.5). This
+    answers §8 Q-d for now; the receipt may still share media with its
+    input.
+- **OI-1003-Q166** answers §8 Q-c. Corpus v1 on mbp-13 is re-sealed as an
+  unshared copy:
+  - made by an explicit read/write copy;
+  - verified to the same content identity and `FIEMAP`-unshared;
+  - with the rig's default corpus path pointed at it.
+
+  The old reflinked copy is kept. §8 Q-b (rclone `--local-no-clone` on
+  macOS) is still open.
+
+**Built by the follow-up lane** (staged on `docs/s1-clone-study-20261015`,
+not committed; docs/slo.md "Amendment 2026-10-15" is the rule text):
+
+- **(a) In the typed source access layer.**
+  - `io/mod.rs` states the rule ("Source access never clones").
+  - `io::sys::extent_sharing` is a read-only `FS_IOC_FIEMAP` probe, with no
+    `FIEMAP_FLAG_SYNC`. `bulkload_agent::extents` exposes it per file and
+    per tree.
+  - **P84 SOURCE-NO-CLONE** is static, in `tests/source_command_registry.rs`.
+    No non-test code in any crate names a remap call (`copy_file_range`,
+    `FICLONE`, `FICLONERANGE`, `FIDEDUPERANGE`, `clonefile`/`fclonefileat`,
+    `copyfile`/`fcopyfile`, the btrfs clone ioctls) or a clone ioctl number,
+    and no `use` hides `fs::copy` or `io::copy`.
+  - Every `std::fs::copy` and `std::io::copy` is one of six registered
+    sites, each with the reason its input is not a source file. The raw-tree
+    capture's `io::copy` reads a source file, so its writer is pinned to
+    `git fast-import`'s stdin pipe, for which std uses `splice`.
+  - **P84's kernel leg** is in `tests/source_lock_trace.rs`. A self-test
+    proves that `FIEMAP` sees a `FICLONE` and a `std::fs::copy` that the
+    `lstat` census misses. Then a real `copy` and a `serve` in its own
+    process must leave every source extent unshared.
+- **(b) The rig.**
+  - `r23_corpus.py` gains:
+    - `plain_copy_tree`, an `os.read`/`os.write` copy;
+    - `tree_sharing`, `FIEMAP` through `fcntl.ioctl`;
+    - `require_unshared`;
+    - the subcommands `copy` (a read/write, verified, unshared copy, for
+      Q166) and `fiemap`;
+    - a `seal` that refuses a shared copy.
+  - `r23_ab.py`'s working copy uses `plain_copy_tree` and is checked before
+    any build: a shared extent refuses with exit 2. A gated sample on Linux
+    without `FIEMAP` is refused too.
+  - After every rep, `r23_ab.py` checks the working copy and the rep's
+    fixture again; a shared extent aborts with exit 3.
+  - `bulkload-bench` checks its seeded fixture after the seed and after
+    every arm. Its header records `fixture_shared_extents` and
+    `sealed_corpus_shared_extents`, and each sample row records
+    `source_shared_extents`.
+  - `gate_b.py`'s source working copy is a read/write copy in the remote
+    helper, and a shared extent refuses SOURCE.
+
+**Failing-first evidence** (sting, `/srv/fast-local` xfs `reflink=1`, kernel
+6.12):
+
+- **P84 static, with an empty registry.** It failed and named exactly six
+  sites, and no remap call:
+  - `io::copy` in `batch_objects::close`, `batch_objects::read_body` and
+    twice in `raw_tree::regular`;
+  - `fs::copy` in `registered::restore` and `prepare_attachment`.
+
+  It passes with the six registered.
+- **Mutations in `transfer::open_source`.**
+  - M1, a File-to-File `std::io::copy` of the source: the scan names
+    `agent::transfer::open_source`, and the kernel leg fails with 16 of 29
+    source extents shared.
+  - M2, `std::fs::copy` of the source through `/proc/self/fd`: the scan
+    names it, and the kernel leg fails the same way.
+- **Mutation M3,** a raw `libc::copy_file_range` in `io::sys`: the scan
+  names `sys_posix.rs`.
+- **The kernel leg unmutated.** `FICLONE` shared 1 extent and
+  `std::fs::copy` 1 more, with the census unchanged. `copy` and `serve`
+  over 30 files and 29 extents left 0 shared. Under the default tmpfs
+  `TMPDIR`, the leg prints that it did not run and returns.
+- **Bench.** With the after-arm check removed, the reflinked-fixture test
+  fails because the sample was not refused.
+- **Harness tests against HEAD's scripts.**
+  - `test_r23_ab.py` adds 5 tests, and all 5 fail on HEAD:
+    - the shutil path is used;
+    - a shared copy is not refused;
+    - no `FIEMAP` is not refused;
+    - a clone during a rep is not refused;
+    - the real reflinked copy is not refused.
+
+    The pin test also failed there, only because the relocated copy had
+    no `flake.lock`.
+  - `test_r23_corpus.py` adds 4 tests, which error on HEAD. Its b3sum round
+    trip on xfs ran `generate`, `copy`, `seal` and `verify` to the
+    committed identity.
+  - `test_gate_b.py` adds 1 test, which fails on HEAD: `shutil.copytree`
+    is used.
+
+**Receipt (R-N13, OI-1003-Q165).** Sting only:
+
+- edits in this worktree, staged;
+- the cargo target `/srv/fast-local/jess/cache/cargo-target/clone`;
+- `TMPDIR` `/dev/shm/clone-tmp`;
+- reflink scratch under `/srv/fast-local/jess/cache/clone-tests`, removed
+  at the end.
+
+No mbp-13 access, no Linear post, and no process signalled.
+
+**Open** (as this lane left them; §12 closes or restates each).
+
+- Q166 was not done by this lane. It was done on mbp-13 afterwards (§12).
+- The sota tooling on the rig was not changed by this lane (§12 does it).
+- **Darwin has no `FIEMAP`.** The bench and the harnesses record `n/a`
+  there, and APFS clone detection is unmeasured.
+- **The bench's seed-time check** cannot be mutation-tested without a
+  cloning seed; the after-arm check is tested.
+
+## 12. Q166 done, and the review of the Q165 build fixed (2026-10-15)
+
+**Q166 (done on mbp-13 by a rig lane, receipted there).**
+
+- **Paths.** Old: `~/git-bulkload/r23-corpus-v1/corpus`, kept, 23 of 25
+  extents shared. New: `~/git-bulkload/r23-corpus-v1-unshared/corpus`.
+- **Copy.** Made by `~/git-bulkload/reseal-20261015/reseal_copy.py`
+  (sha256 `523a06458c47cbfa73e156fb1adc3736a22bb804d76a93fd39f358fc7a3d55d1`).
+  It is an `os.read`/`os.write` copy, not `r23_corpus.py copy`, which was
+  not on the rig's checkout. `strace` showed no `copy_file_range`,
+  `sendfile`, `splice` or clone ioctl. The copy was sealed 0444/0555 like
+  the original.
+- **Identity.** `f4a7619f7b88f2e0e1eeadb5995c79a809eafa8b4a8cf3f82d1ff6f29b5b07c7`,
+  by `r23_corpus.py verify` at 59e5e60.
+- **FIEMAP.** 0 of 25 extents shared, by
+  `~/git-bulkload/reseal-20261015/fiemap_check.py` (sha256
+  `0ff568b6d8203baed3110586359b07b2b0706de31fec13fde36066412f26af15`).
+- **Receipt.** `~/git-bulkload/logs/reseal-corpus-v1-20261015.receipt`,
+  sha256 `5e716ee5988a710724c413d6740cf102d4b611790d9ae30e0f4f96f1c8ae1c68`.
+- **Default.** The canonical default is now the runbook
+  (`docs/plans/2026-10-07-s1-hermetic-rig.md` §2 and §5), which names the
+  new path. The four dated `run-*.sh` the rig lane repointed are records of
+  past runs, not defaults.
+
+**Review findings and what changed** (staged, with failing-first evidence
+on sting `/srv/fast-local`, xfs `reflink=1`, unless noted):
+
+1. **The reflink legs passed without running.** Under the lane's tmpfs
+   `TMPDIR`, P84's kernel leg and the reflinked halves of the bench and
+   harness tests returned early and still reported `ok`.
+   - The kernel leg now falls back to `CARGO_TARGET_TMPDIR` (the build's
+     file system), so it ran under `TMPDIR=/dev/shm` here.
+   - `just p84-reflink` (on demand, R-N122) sets
+     `BULKLOAD_P84_REQUIRE_REFLINK` and requires each leg's own line. It
+     runs the bench and harness reflinked halves the same way; the Python
+     tests fail instead of skipping under it.
+   - It ran here, with all legs. Under a tmpfs `P84_REFLINK_DIR` it fails
+     (exit 101). `tests/test_ci_contract.py` pins its lines.
+   - Running the reflinked r23_ab half for the first time exposed a stale
+     assertion; it is corrected for item 6.
+   - Not done: a required CI job. The CI host's file system is unknown,
+     and a PR gate needs a ruling.
+2. **The static scan missed spellings.** The review's six bypasses (M1–M6)
+   now each fail `p84_no_source_file_is_ever_the_input_of_a_clone`; each
+   was planted in `extents.rs` and reverted.
+   - Numbers match by value, in any radix.
+   - `self as` renames and globs of `fs`/`io` are refused.
+   - Raw `syscall`s are a registry of two, `SYS_ioprio_set` and
+     `SYS_ioprio_get`.
+   - The new self-test failed first with no breach found.
+3. **The registry pinned text, not types.** `read_body`'s caller is now
+   pinned (`p84_the_batch_reader_reads_only_git_s_pipe`). The review's
+   `clone_by_registered_site` makes it fail.
+   - The kernel leg gained a v1 Git capture and a `SQLite` snapshot. A
+     `std::fs::copy` of every seat in `raw_tree::capture` makes the Git leg
+     fail with 30 extents shared.
+4. **What `FIEMAP` can say.** Both the docs and the code now say "shares
+   nothing now", not "never cloned".
+   - Sharing is trusted only on xfs, btrfs, bcachefs and ocfs2.
+   - ext2/3/4 and tmpfs count 0 by construction.
+   - Any other file system is unsupported, never a silent 0. The Rust
+     `extents::basis` and the Python `fs_magic` both read it with
+     `fstatfs`.
+   - Tests failed first: tmpfs was `EOPNOTSUPP`, and a CIFS magic gave a
+     number.
+   - Not done: tracing arms with `strace`/seccomp. It would perturb the
+     timed window, and the static scan is the exact half for bulkload's
+     own code.
+5. **Unreadable directories.** The Python walks (`tree_sharing`,
+   `plain_copy_tree`, gate B's `tree_shared` and `plain_copy`) now raise.
+   The tests failed first. Rust already failed closed, and now has a
+   test.
+6. **Rig sota and diagnostic tooling, and a shared seal.**
+   - A shared sealed corpus now refuses a gated sample in the bench and in
+     `r23_ab.py`; an informational one records it. Tests failed first.
+   - On mbp-13 (receipt `~/git-bulkload/logs/q165b-rig-tooling-20261015.receipt`,
+     sha256 `5cc030df4a6ae8b12d673cafc5fc99b1476114033d98baefb4ba83955617456d`):
+     - `sota/src-unshared` was made by `q165b-20261015/rigcopy.py` (sha256
+       `c263121aed604800…`, a verbatim copy of the staged `r23_corpus.py`
+       functions). It has identity `f4a7619f…` and 0 of 23 extents shared.
+       `strace` showed no `copy_file_range`, `sendfile` or `splice`. The
+       old `sota/src` (23 shared) is kept, unused.
+     - `placedrive.py` uses the new copy. It checks before and after every
+       sample, and refuses its `cfr` and `clone` configurations (smoke
+       logs in `q165b-20261015/logs/`).
+     - `diag.sh` and `pin-diag.sh` copy with `rigcopy.py`.
+     - All six run and gate scripts refuse a checkout without the Q165 (b)
+       copy gate (exit 5). Each original is kept as `*.pre-q165`.
+7. **Reconciliation.** The runbook, `docs/slo.md` (b) and (c), the P84
+   row and `docs/design.md` now record what was done. The TIN-4543 comment
+   is posted (`61ccc412-75c8-42d1-9237-0f623072f3a3`).
+
+**Receipt (R-N13; OI-1003-Q165, Q166).**
+
+- **Sting:** edits in this worktree, staged; the cargo target
+  `/srv/fast-local/jess/cache/cargo-target/clone` and its `p84-reflink`
+  directory; `/srv/fast-local/jess/cache/clone-tests` as a reflink
+  `TMPDIR`.
+- **mbp-13:** only what the q165b receipt lists. There was no deletion of
+  pre-existing files and no process signalled.
+
+**Still open.**
+
+- A CI job that runs `just p84-reflink` (needs a reflink runner and a
+  ruling).
+- The rig checkout gets the gate when the branch lands; until then every
+  rig run script refuses.
+- Darwin and APFS.
+- §8 Q-b and Q-d.
+- Not this lane's: `transfer::tests::a_copy_moves_the_hand_off_timers` fails
+  at HEAD (9806d36, from 59e5e60's loopback verify-once lever:
+  `recv_verify_ns=0`), so `just rust-test` is red on this branch for that
+  one unit test. Every other group passed.
+
 ## References (each fetched or checked on 2026-10-15)
 
 - [C1] Linux v6.19, `fs/xfs/xfs_reflink.c`: `xfs_reflink_set_inode_flag` L1175–1229, `xfs_reflink_remap_extent` L1313–1520, `xfs_reflink_remap_prep` L1652–1730, `xfs_reflink_try_clear_inode_flag` L1827, `xfs_reflink_unshare` L1895. <https://github.com/torvalds/linux/blob/v6.19/fs/xfs/xfs_reflink.c>

@@ -291,6 +291,129 @@ pub fn fs_xflags(file: impl AsFd) -> io::Result<u32> {
     Ok(attributes.fsx_xflags)
 }
 
+/// `struct fiemap` of `<linux/fiemap.h>` without its trailing extent array:
+/// the size `FS_IOC_FIEMAP` encodes.
+#[repr(C)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the field names of the kernel's struct fiemap"
+)]
+struct FiemapHeader {
+    fm_start: u64,
+    fm_length: u64,
+    fm_flags: u32,
+    fm_mapped_extents: u32,
+    fm_extent_count: u32,
+    fm_reserved: u32,
+}
+
+/// `struct fiemap_extent` of `<linux/fiemap.h>`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the field names of the kernel's struct fiemap_extent"
+)]
+struct FiemapExtent {
+    fe_logical: u64,
+    fe_physical: u64,
+    fe_length: u64,
+    fe_reserved64: [u64; 2],
+    fe_flags: u32,
+    fe_reserved: [u32; 3],
+}
+
+/// How many extents one `FS_IOC_FIEMAP` call asks for, as the array length
+/// and as `fm_extent_count` (the same number).
+const FIEMAP_BATCH: usize = 64;
+const FIEMAP_BATCH_COUNT: u32 = 64;
+
+/// One `FS_IOC_FIEMAP` argument: the header, then room for
+/// [`FIEMAP_BATCH`] extents, as the kernel lays it out.
+#[repr(C)]
+struct FiemapRequest {
+    header: FiemapHeader,
+    extents: [FiemapExtent; FIEMAP_BATCH],
+}
+
+/// `FS_IOC_FIEMAP`, `_IOWR('f', 11, struct fiemap)`.
+const FS_IOC_FIEMAP: libc::Ioctl = libc::_IOWR::<FiemapHeader>(b'f' as u32, 11);
+/// `FIEMAP_EXTENT_LAST`: the file's last extent.
+const FIEMAP_EXTENT_LAST: u32 = 0x1;
+/// `FIEMAP_EXTENT_SHARED`: the extent's blocks also belong to another file.
+const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
+
+/// A file's mapped extents, and how many of them share their blocks with
+/// another file (a reflink or clone, OI-1003-Q165).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtentSharing {
+    /// Mapped extents, delayed allocations included.
+    pub extents: u64,
+    /// Extents flagged `FIEMAP_EXTENT_SHARED`.
+    pub shared: u64,
+}
+
+/// `FS_IOC_FIEMAP` over the whole of `file`: how many extents it maps and how
+/// many of them are shared with another file (OI-1003-Q165). Read-only: no
+/// `FIEMAP_FLAG_SYNC`, so the probe never starts write-back of the file it
+/// looks at, and it moves no timestamp.
+///
+/// # Errors
+/// Returns the failed call (`EOPNOTSUPP` where the file system has no
+/// extent map, such as tmpfs).
+pub fn extent_sharing(file: impl AsFd) -> io::Result<ExtentSharing> {
+    let fd = file.as_fd();
+    let mut sharing = ExtentSharing::default();
+    let mut start = 0_u64;
+    loop {
+        let mut request = FiemapRequest {
+            header: FiemapHeader {
+                fm_start: start,
+                fm_length: u64::MAX,
+                fm_flags: 0,
+                fm_mapped_extents: 0,
+                fm_extent_count: FIEMAP_BATCH_COUNT,
+                fm_reserved: 0,
+            },
+            extents: [FiemapExtent {
+                fe_logical: 0,
+                fe_physical: 0,
+                fe_length: 0,
+                fe_reserved64: [0; 2],
+                fe_flags: 0,
+                fe_reserved: [0; 3],
+            }; FIEMAP_BATCH],
+        };
+        // SAFETY: the descriptor is live; `request` is a writable `struct
+        // fiemap` followed by room for `fm_extent_count` extents, and it
+        // outlives the call.
+        retry_eintr(|| unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                FS_IOC_FIEMAP,
+                std::ptr::addr_of_mut!(request),
+            )
+        })?;
+        let mapped = usize::try_from(request.header.fm_mapped_extents).unwrap_or(FIEMAP_BATCH);
+        let mut last = mapped == 0;
+        let mut next = start;
+        for extent in request.extents.iter().take(mapped) {
+            sharing.extents += 1;
+            if extent.fe_flags & FIEMAP_EXTENT_SHARED != 0 {
+                sharing.shared += 1;
+            }
+            last |= extent.fe_flags & FIEMAP_EXTENT_LAST != 0;
+            next = extent.fe_logical.saturating_add(extent.fe_length);
+        }
+        // A batch that ends short of the last extent continues after it; a
+        // map that does not advance ends, so the walk always terminates.
+        if last || mapped < FIEMAP_BATCH || next <= start {
+            return Ok(sharing);
+        }
+        start = next;
+    }
+}
+
 /// The running kernel's release string (`uname -r`), if it can be read.
 #[must_use]
 pub fn kernel_release() -> Option<String> {

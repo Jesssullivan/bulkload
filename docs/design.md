@@ -170,6 +170,28 @@ Source safety (S2, WP1):
   counters line and the bench header record the class.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
+- No clone of a source file (OI-1003-Q165).
+  - A source file is read by `pread`, or by `read`/`splice` into a pipe.
+    It is never the input of a remap: `FICLONE`, `FICLONERANGE`,
+    `FIDEDUPERANGE`, `copy_file_range`, `clonefile` or `copyfile`.
+  - `std::fs::copy`, and `std::io::copy` between two regular files, are
+    remaps on Linux, because both use `copy_file_range`.
+  - A clone writes the source inode, with its reflink flag and extent
+    reference counts, and moves no `stat` field. Only `FIEMAP`'s
+    `SHARED` flag shows it.
+  - P84 SOURCE-NO-CLONE enforces the rule in two halves:
+    - a registry scan refuses every remap call in non-test code, and pins
+      each `fs::copy` and `io::copy` site with the reason its input is not a
+      source file;
+    - a kernel leg runs a real `copy`, `serve`, v1 Git capture and
+      `SQLite` snapshot on a reflink file system and requires every source
+      extent to stay unshared (`just p84-reflink` proves that it ran).
+  - `FIEMAP` shows sharing that exists when it looks, not a clone later
+    undone, and is trusted only on file systems that report it (xfs,
+    btrfs, bcachefs, ocfs2); the static half rules the call out.
+  - The two `std::fs::copy` calls left copy bulkload's own staged capture
+    bundle into its receipts, on the destination side.
+  - `bulkload_agent::extents` is the read-only `FIEMAP` probe.
 - SQLite provider snapshots are S2's stated exceptions: one lock and two
   writes. Every source is read through the backup API from a read-only,
   WAL-aware connection; none is read `immutable=1`. All three are bounded
@@ -704,7 +726,13 @@ updated.
 Gated benchmark samples require AC power and a 1-minute load below 2.5,
 and each sample row records both. The coordinator keeps the other lanes
 quiet while gated samples run (R-N81, R-N91). The clone fast path never
-counts toward a gate (R-N57, R-N63).
+counts toward a gate (R-N57, R-N63). The clone lever is excluded
+(OI-1003-Q164, Q165): the engine has no clone path, and S2 forbids one on a
+source file (Live union, "No clone of a source file"). Every copy of the
+sealed corpus a sample reads is an explicit read and write, checked with
+`FIEMAP` before the sample. The bench rechecks its fixture after every arm,
+and a shared extent refuses the sample (docs/slo.md, the 2026-10-15
+amendment).
 
 ## Wire v6
 
