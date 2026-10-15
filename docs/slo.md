@@ -821,6 +821,79 @@ ruling, and it is not an S1 result.
 - **Existing landings** (before this change) carry no ledger and are not
   converged; `--adopt` is not built (OI-1003-Q145).
 
+## Amendment 2026-10-15 (later): S4 transfers, S5 HEAD and index drift, the S2 harness alongside a run (OI-1003-Q152)
+
+Proof-status lines, not new rulings (OI-1003-Q1, Q2, Q5, Q11, Q148, Q152,
+Q155). No SLO number changes.
+
+- **S4 covers a whole run (WP3 PR 4).** Every `copy` and `pull` session
+  records its outcome in its DEST_STATE (`transfer.closure.d`, one record
+  per transfer, so transfers sharing a DEST_STATE never replace each
+  other's rows; a session that ends refused keeps the earlier session's
+  refused rows; the S2 overlap checks run before the first record write),
+  and `closure-report --transfer DEST_STATE` joins it to the same report,
+  disposition ledger and gate as the planned estate items: a session row
+  (`applied` when it ended; `unaccounted` when it never ended, left no
+  record, or refused with a bare `IO`), one row per refused path, typed and
+  pending review like an estate refusal, and one `covered` row per live
+  SQLite sidecar a snapshot covers. An integrity failure
+  (`SQLITE_INTEGRITY_CHECK_FAILED`, or `SQLITE_BACKUP_FAILED` with primary
+  code 11 or 26) carries OI-1003-Q148's default `abandon`, which a review
+  overrides. The run's expected transfers are bound to its PLAN by a
+  transfer manifest (`transfer-expect`, `closure-report
+  --transfer-manifest`): a listed transfer with no record, or whose session
+  started before the manifest, is unaccounted, and no transfer row counts
+  twice. With the manifest, one report shows 0 unaccounted over estate
+  items and transfers, and a bare `IO` or `FRAME_CODEC` never counts.
+  Without it the report covers only the transfers named. This replaces
+  the 2026-10-06 amendment's "until then S4 is proven for estate items
+  only". Still outside: the offline provider verbs (`snapshot`, `compose`,
+  `compose-state`, `hydrate-state`, `apply-state-candidate`), which belong
+  to no run. Proof: P86 (`closure/transfer_tests.rs`), the CLI row in
+  `tests/space_closure_cli.rs`, report schema `bulkload.closure.v3`.
+- **S5: HEAD and index drift is custody (#38, OI-1003-Q11, under
+  OI-1003-Q152).** An agent committing, switching or staging inside a
+  captured checkout, or in a worktree nested in it, during a capture pass
+  no longer refuses `GIT_AUTHORITY_CHANGED`. The pass records `HeadMoved`,
+  `IndexRewritten` or `NestedWorktreeMoved` drift custody (also when the
+  move went away and back across the windows outside the export, nested
+  worktrees included); its key is poisoned, so it is never a reuse hit,
+  and the next quiet pass carries the move. A capture whose export the
+  move raced (in-band drift) is never laid down; a capture the move raced
+  only outside the export's window (key drift) is a coherent snapshot of
+  the state the export read and applies, and the closure counts it
+  applied, as it would a clean pass the source moved past a moment later.
+  So the run closes by converging deltas with no freeze. Still refusals: the exclude file, the stash reflog,
+  configuration, the shallow frontier, foreign nests and gitlinks, and the
+  omitted roots moving under a pass. Proof: P87 (capture raced by a commit
+  and a stage, then a switch; each recapture converges the landing to the
+  source), the three git_carry drift tests, the `r3_*` round trips (a
+  nested worktree's among them), and the EstateConverge rows
+  `MC_ec_capture_raced` (pass; it models both drift classes and checks
+  `NoDriftedLanding`), `MC_ec_reach_drift_carried` and
+  `MC_ec_reach_key_drift_landed` (reached), `MC_ec_neg_drift_key_reused`
+  (fails `ConvergesWhenQuiet`) and `MC_ec_neg_drift_applied` (fails
+  `NoDriftedLanding`).
+- **S2 budget alongside a real run (#165).** `s2_budget.py observe` samples
+  the reference workload and load1 on the source host for the length of a
+  real run and starts nothing; it reads the host's load (agents' and
+  bulkload's) without touching any agent process. `alongside` joins it with
+  the run's own intervals (`mark`, or `START END` lines) into OFF and ON
+  windows and gives `analyze`'s verdict and evidence rows. It runs on Darwin
+  (vm.loadavg, pmset). Each ON window starts one settle before its pass, so
+  a pass's first minute is measured; missed ticks stream to disk; an
+  observation with no recorded end, or whose wall and monotonic clocks
+  part by more than 2 s, is INCONCLUSIVE; evidence needs the kept windows
+  to alternate OFF/ON with at least two ON windows once same-state
+  neighbours merge.
+- **Open for the operator (not ruled here).** (1) Whether an alongside
+  observation counts as a gated S2 run: as built, `--evidence` labels it so
+  only with every kept window at least 300 s, at least five windows, the
+  pinned gate, AC power and an OFF baseline under R-N81's 2.5, with no
+  coordinator quiet (OI-1003-Q152 keeps neo live), so a busy neo stays not
+  evidence. (2) Whether HEAD and index drift should also cover the stash
+  reflog (`git stash` under a pass still refuses).
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

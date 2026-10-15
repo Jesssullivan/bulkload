@@ -966,23 +966,25 @@ impl KeyParts {
         Ok(*hash.finalize().as_bytes())
     }
 
-    /// Whether every key input outside the two drift-tolerant ones is unchanged.
+    /// Whether every key input outside the drift-tolerant ones is unchanged.
     ///
     /// The ref inventory and the worktree census are the concurrency classes a
-    /// sibling agent lane or a build tool produces. Everything else moving is
-    /// Git authority changing under the capture and stays a refusal (R-N30).
+    /// sibling agent lane or a build tool produces. HEAD, the index and the
+    /// nested worktrees' HEADs are what an agent working in the checkout
+    /// moves (#38, OI-1003-Q11): since S5 under OI-1003-Q152 they are drift
+    /// custody too, carried by the next pass. Everything else moving (the
+    /// exclude file, the stash reflog, the configuration, the shallow
+    /// frontier, foreign nests and gitlinks, the omitted roots, the
+    /// repository's identity) is Git authority changing under the capture
+    /// and stays a refusal (R-N30).
     #[must_use]
     pub fn drift_only(&self, other: &Self) -> bool {
         self.repo == other.repo
             && self.common == other.common
-            && self.head == other.head
-            && self.symbolic == other.symbolic
-            && self.index == other.index
             && self.exclude == other.exclude
             && self.stash == other.stash
             && self.configuration == other.configuration
             && self.boundary == other.boundary
-            && self.nested == other.nested
             && self.nested_repositories == other.nested_repositories
             && self.omitted == other.omitted
             && self.identities == other.identities
@@ -1016,10 +1018,20 @@ impl KeyParts {
     /// Whether these parts name exactly the authority an export carried.
     #[must_use]
     pub fn carries(&self, carried: &CarriedAuthority) -> bool {
-        self.head == carried.head
-            && self.symbolic == carried.symbolic
-            && self.index == carried.index
-            && self.exclude == carried.exclude
+        self.carries_fixed(carried)
+            && head_index_drift(
+                (&self.head, &self.symbolic, &self.index),
+                (&carried.head, &carried.symbolic, &carried.index),
+            )
+            .is_empty()
+    }
+
+    /// Whether these parts name the authority an export carried in every
+    /// part that is never drift: the exclude file, the stash reflog, the
+    /// configuration and the shallow frontier.
+    #[must_use]
+    pub fn carries_fixed(&self, carried: &CarriedAuthority) -> bool {
+        self.exclude == carried.exclude
             && self.stash == carried.stash
             && self.configuration == carried.configuration
             && self.boundary == carried.boundary
@@ -1035,21 +1047,46 @@ impl KeyParts {
     /// equal to `later`, yet the bundle lacks it; only comparing the keyed
     /// inventories with the export's own names it (R-N72).
     ///
-    /// Git authority is never drift. HEAD, the symbolic HEAD, the index, the
+    /// HEAD, the symbolic HEAD and the index that moved between a key and
+    /// the export's snapshot or end are drift custody (#38, S5): the export
+    /// carries the values its own snapshot read, which the source held then,
+    /// and the moves are named (`HeadMoved`, `IndexRewritten`), so the
+    /// recorded key is poisoned and the next pass carries the new values.
+    /// They are named even when they moved away and back, leaving the two
+    /// keys equal (R-N72), and so are nested worktrees' HEADs, compared with
+    /// the export's own census before and after its pass. The rest of Git authority is never drift: the
     /// exclude file, the stash reflog, the configuration or the shallow
-    /// frontier that moved away and back between a key and the export's
-    /// snapshot or end, leaving the two keys equal, still refuses: the bundle
+    /// frontier that moved, even away and back, still refuses: the bundle
     /// carries what the source held at neither key.
     ///
     /// # Errors
     /// Refuses [`BulkloadRefusal::GitAuthorityChanged`] unless both key parts
-    /// name exactly the authority the export carried, as
-    /// [`KeyParts::drift_to`] does, and on malformed inventories.
+    /// name the authority the export carried in every part that is never
+    /// drift ([`KeyParts::carries_fixed`]), as [`KeyParts::drift_to`] does,
+    /// and on malformed inventories.
     pub fn drift_across(&self, export: &Export, later: &Self) -> Result<CaptureDrift> {
-        if !self.carries(&export.authority) || !later.carries(&export.authority) {
+        if !self.carries_fixed(&export.authority) || !later.carries_fixed(&export.authority) {
             return Err(BulkloadRefusal::GitAuthorityChanged);
         }
+        let carried = (
+            export.authority.head.as_str(),
+            export.authority.symbolic.as_slice(),
+            export.authority.index.as_slice(),
+        );
         let mut drift = self.drift_to(later)?;
+        drift.extend(head_index_drift(
+            (&self.head, &self.symbolic, &self.index),
+            carried,
+        ));
+        drift.extend(head_index_drift(
+            carried,
+            (&later.head, &later.symbolic, &later.index),
+        ));
+        // Nested worktrees likewise (review finding 4): a HEAD switched
+        // away before the export's census and back after its re-read
+        // leaves both keys equal, yet the bundle's custody names it.
+        drift.extend(nested_worktree_drift(&self.nested, &export.nested_before));
+        drift.extend(nested_worktree_drift(&export.nested_after, &later.nested));
         drift.extend(reference_drift(&self.inventory, &export.refs_before)?);
         drift.extend(reference_drift(&export.refs_after, &later.inventory)?);
         drift.seal()?;
@@ -1080,6 +1117,12 @@ impl KeyParts {
         let mut drift = CaptureDrift::default();
         drift.extend(reference_drift(&self.inventory, &later.inventory)?);
         drift.extend(seat_drift_by(&self.rows, &later.rows, |a, b| a == b));
+        // #38 (S5): HEAD, the index and nested worktrees' HEADs are custody.
+        drift.extend(head_index_drift(
+            (&self.head, &self.symbolic, &self.index),
+            (&later.head, &later.symbolic, &later.index),
+        ));
+        drift.extend(nested_worktree_drift(&self.nested, &later.nested));
         drift.seal()?;
         // Fail closed: a key that moved must name what moved.
         if drift.is_empty() != (self == later) {
@@ -1605,9 +1648,13 @@ pub fn export_repository_with_prerequisite(
 /// halt agent work or git work). A drifted seat's bytes are carried by neither
 /// the worktree tree nor `filesystem-v1`; the drift list is the statement that
 /// they are absent, and the next pass re-reads exactly those seats (R-N28).
-/// Git authority moving -- HEAD, the index, configuration, the shallow
-/// boundary, nested worktree custody, the omitted rebuildable roots -- is still
-/// a refusal (R-N30).
+/// HEAD, the index and nested worktrees' HEADs moving under the pass (an
+/// agent committing, switching or staging in the checkout) are drift custody
+/// too: `HeadMoved`, `IndexRewritten` and `NestedWorktreeMoved` rows, and the
+/// bundle carries the HEAD and index its snapshot read (#38, OI-1003-Q11,
+/// S5 under OI-1003-Q152). The rest of Git authority moving -- the exclude
+/// file, the stash reflog, configuration, the shallow boundary, foreign nests
+/// and gitlinks, the omitted rebuildable roots -- is still a refusal (R-N30).
 ///
 /// # Errors
 /// Refuses changing Git authority, unsupported Git or filesystem state, invalid
@@ -1806,22 +1853,14 @@ fn export_pass(
     )?;
     let pass = raw_tree::capture(&private, repo, seats, &reuse)?;
     let after = capture_census_planned(repo, common, options.policy, options.planned)?;
-    // Git authority moving under the capture is never drift. The nested
-    // worktree and nested repository censuses are compared apart from the
-    // seats precisely because they carry each nested HEAD (and a foreign
-    // nest's cleanliness, unpushed count and carried-ignored count), which
-    // must keep its refusal (R-N73, B4); so is the omitted set, because it is
-    // a key input a rebuild can move.
-    let refs_after = refs(repo)?;
-    if !authority_held(repo, &authority, &refs_after)?
-        || census.nested_worktrees != after.nested_worktrees
-        || census.nested_repositories != after.nested_repositories
-        || census.omitted != after.omitted
-        || census.bare != after.bare
-    {
-        return Err(BulkloadRefusal::GitAuthorityChanged);
-    }
-    let drift = observed_drift(pass.drift, &before_refs, &refs_after, seats, &after.rows)?;
+    // The nested worktree and nested repository censuses are compared apart
+    // from the seats because they carry each nested HEAD. A nested
+    // worktree's HEAD moving is drift custody (#38); a foreign nest's
+    // (with its cleanliness, unpushed count and carried-ignored count) keeps
+    // its refusal (R-N73, B4), and so does the omitted set, a key input a
+    // rebuild can move.
+    let (drift, refs_after) =
+        pass_drift(repo, &authority, &census, &after, pass.drift, &before_refs)?;
     // A seat whose identity moved only after its bytes were streamed is already
     // in the tree; withdraw it rather than present bytes the pass cannot vouch for.
     let withdrawn = drift.withdrawn(seats);
@@ -1885,11 +1924,51 @@ fn export_pass(
         refs_before: before_refs,
         refs_after,
         authority,
+        nested_before: census.nested_worktrees,
+        nested_after: after.nested_worktrees,
         nested_repositories,
         pack,
         chained,
         manifest,
     })
+}
+
+// Everything one export pass saw move, and its post-pass ref inventory; or
+// GIT_AUTHORITY_CHANGED when Git authority that is never drift moved.
+fn pass_drift(
+    repo: &Path,
+    authority: &CarriedAuthority,
+    census: &Census,
+    after: &Census,
+    in_pass: Vec<DriftRow>,
+    before_refs: &str,
+) -> Result<(CaptureDrift, String)> {
+    let refs_after = refs(repo)?;
+    // #38 (S5, OI-1003-Q152): HEAD, the index and the nested worktrees'
+    // HEADs moving under the pass are drift custody, not refusals. The
+    // bundle carries the HEAD and index bytes the snapshot read; the
+    // in-band drift marker keeps every restore off it, and the next pass
+    // carries the new values. The rest of the authority, re-read against
+    // the same inventory rule the snapshot used, still refuses.
+    let held = read_authority(repo, &refs_after)?;
+    if !authority.fixed_equal(&held)
+        || census.nested_repositories != after.nested_repositories
+        || census.omitted != after.omitted
+        || census.bare != after.bare
+    {
+        return Err(BulkloadRefusal::GitAuthorityChanged);
+    }
+    let mut drift = observed_drift(in_pass, before_refs, &refs_after, &census.rows, &after.rows)?;
+    drift.extend(head_index_drift(
+        (&authority.head, &authority.symbolic, &authority.index),
+        (&held.head, &held.symbolic, &held.index),
+    ));
+    drift.extend(nested_worktree_drift(
+        &census.nested_worktrees,
+        &after.nested_worktrees,
+    ));
+    drift.seal()?;
+    Ok((drift, refs_after))
 }
 
 // In-band, emitted only when the pass raced something: a clean capture's ref
@@ -2301,11 +2380,51 @@ fn carry_authority(
     Ok(private)
 }
 
-// The whole carried authority, re-read against the same inventory rule the
-// snapshot used: a stash reflog rewritten under refs/stash, a symbolic HEAD or
-// an exclude file moving under the pass all refuse.
-fn authority_held(repo: &Path, carried: &CarriedAuthority, inventory: &str) -> Result<bool> {
-    Ok(read_authority(repo, inventory)? == *carried)
+impl CarriedAuthority {
+    // Every part that is never drift, the snapshot's and a re-read's: a stash
+    // reflog rewritten under refs/stash, an exclude file, the configuration,
+    // the shallow frontier or the gitlinks (foreign custody) moving under
+    // the pass all refuse. HEAD and the index are [`head_index_drift`]'s.
+    fn fixed_equal(&self, other: &Self) -> bool {
+        self.exclude == other.exclude
+            && self.stash == other.stash
+            && self.configuration == other.configuration
+            && self.boundary == other.boundary
+            && self.gitlinks == other.gitlinks
+    }
+}
+
+// HEAD (its commit and the branch it names) and the index, before and after:
+// a `HeadMoved` row named `HEAD` when either part of HEAD moved, an
+// `IndexRewritten` row named `index` when the index bytes changed (#38).
+fn head_index_drift(before: (&str, &[u8], &[u8]), after: (&str, &[u8], &[u8])) -> Vec<DriftRow> {
+    let mut rows = Vec::new();
+    if before.0 != after.0 || before.1 != after.1 {
+        rows.push(DriftRow::seat(DriftKind::HeadMoved, b"HEAD"));
+    }
+    if before.2 != after.2 {
+        rows.push(DriftRow::seat(DriftKind::IndexRewritten, b"index"));
+    }
+    rows
+}
+
+// Nested worktrees, keyed on their path: one `NestedWorktreeMoved` row for
+// each that appeared, vanished, or whose name or HEAD moved (#38).
+fn nested_worktree_drift(before: &[NestedWorktree], after: &[NestedWorktree]) -> Vec<DriftRow> {
+    let keyed = |rows: &[NestedWorktree]| -> std::collections::BTreeMap<Vec<u8>, NestedWorktree> {
+        rows.iter()
+            .map(|row| (row.rel_path.clone(), row.clone()))
+            .collect()
+    };
+    let (before, after) = (keyed(before), keyed(after));
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .map(|path| DriftRow::seat(DriftKind::NestedWorktreeMoved, path))
+        .collect()
 }
 
 /// Transient refs a retained capture is fetched under. Never carried on.
@@ -2917,6 +3036,12 @@ pub struct Export {
     pub refs_after: String,
     /// The Git authority this export read once and carried.
     pub authority: CarriedAuthority,
+    /// The nested worktrees (their HEADs) the export's own census read at
+    /// its snapshot, which the bundle's custody carries, and re-read after
+    /// its pass: a caller's pre- and post-pass keys are compared with them,
+    /// as with the ref inventories (R-N72, #38 review finding 4).
+    pub nested_before: Vec<NestedWorktree>,
+    pub nested_after: Vec<NestedWorktree>,
     /// What packing the bundle cost (WP2): its pack's bytes and objects, and
     /// the packing child's storage reads.
     pub pack: shared::PackStats,
@@ -3144,6 +3269,22 @@ pub enum DriftKind {
     /// through it failed: nothing was captured, and the next pass captures
     /// the rewritten store (WP1 PR 4, S5). Named `objects/pack`.
     ObjectStoreRewritten,
+    /// HEAD moved under the pass: a commit, a switch, a reset or a detach
+    /// changed the commit it resolves to or the branch it names (#38,
+    /// OI-1003-Q11, S5 under OI-1003-Q152). The capture carries the HEAD
+    /// its own snapshot read; the next pass carries the new one. Named
+    /// `HEAD`.
+    HeadMoved,
+    /// The index was rewritten under the pass (a `git add`, `commit`,
+    /// `reset` or `switch`): the capture carries the index bytes its own
+    /// snapshot read, and the next pass carries the new ones (#38). Named
+    /// `index`.
+    IndexRewritten,
+    /// A registered worktree nested in the checkout appeared, vanished or
+    /// moved its HEAD under the pass (an agent committing in
+    /// `.claude/worktrees/<name>`): its custody row is the snapshot's, and
+    /// the next pass records the new one (#38). Named by its path.
+    NestedWorktreeMoved,
 }
 
 impl DriftKind {
@@ -9907,10 +10048,16 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // (a)/(b) tolerance must not leak into HEAD (R-N30).
+    // #38 (OI-1003-Q11, S5 under OI-1003-Q152): an agent committing inside
+    // the captured worktree moves HEAD (and the index) under the pass. That
+    // is drift custody, not GIT_AUTHORITY_CHANGED: the bundle carries the
+    // HEAD its snapshot read, is marked drifted in-band (no restore lays it
+    // down), and the next pass carries the new HEAD. Before #38 this
+    // refused (`head_moving_during_capture_still_refuses`).
     #[test]
-    fn head_moving_during_capture_still_refuses() {
+    fn head_moving_during_capture_is_drift_custody() {
         let (root, source) = drift_fixture("head-moves");
+        let before = text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap();
         let inside = source.clone();
         mid_pass::arm(&source, move || {
             output(git(&inside).args([
@@ -9923,38 +10070,96 @@ mod tests {
             ]))
             .unwrap();
         });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        // An empty commit rewrites no index entry: HEAD moved, with the
+        // branch it names (a ref row); Git may rewrite the index file too.
+        assert!(export
+            .drift
+            .rows
+            .contains(&row(DriftKind::HeadMoved, b"HEAD")));
+        assert!(export.drift.rows.iter().all(|drift| match drift.kind {
+            DriftKind::HeadMoved | DriftKind::IndexRewritten => true,
+            DriftKind::RefChanged => drift.name.starts_with(b"refs/heads/"),
+            _ => false,
+        }));
+        let private = capture.join("repository.git");
+        assert_eq!(drift_sidecar(&private), export.drift);
+        // The bundle carries the HEAD the snapshot read, not the new one.
+        assert_eq!(
+            text(git(&private).args(["rev-parse", "refs/carry-export/head"])).unwrap(),
+            before
+        );
+        assert_ne!(
+            text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap(),
+            before
+        );
         assert!(matches!(
-            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
+            restore_bundle(&export.bundle, &root.join("restored"), "neo"),
+            Err(BulkloadRefusal::CaptureDrifted)
+        ));
+        // The pre-#38 contract stands for a caller that never asked for
+        // tolerance: a strict export still refuses.
+        let again = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&again).args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "again",
+            ]))
+            .unwrap();
+        });
+        assert!(matches!(
+            export_repository(&source, &root.join("strict")),
             Err(BulkloadRefusal::GitAuthorityChanged)
         ));
         fs::remove_dir_all(root).unwrap();
     }
 
-    // Separability from the index (R-N30): HEAD pinned, index rewritten.
+    // Separability from HEAD (R-N30, #38): HEAD pinned, the index rewritten
+    // by a `git add` is drift custody named `index`; the staged tree the
+    // bundle carries is the snapshot's index, without the new entry.
     #[test]
-    fn index_rewritten_during_capture_still_refuses() {
+    fn index_rewritten_during_capture_is_drift_custody() {
         let (root, source) = drift_fixture("index-rewritten");
         let head = text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap();
+        // The file exists before the pass: only the index moves under it.
+        fs::write(source.join("staged-mid-pass"), b"added to the index").unwrap();
         let inside = source.clone();
         mid_pass::arm(&source, move || {
-            fs::write(inside.join("staged-mid-pass"), b"added to the index").unwrap();
             output(git(&inside).args(["add", "staged-mid-pass"])).unwrap();
         });
-        assert!(matches!(
-            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
-            Err(BulkloadRefusal::GitAuthorityChanged)
-        ));
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![row(DriftKind::IndexRewritten, b"index")]
+        );
         assert_eq!(
             head,
             text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap()
         );
+        let private = capture.join("repository.git");
+        let staged =
+            text(git(&private).args(["ls-tree", "-r", "--name-only", "refs/carry-export/staged"]))
+                .unwrap();
+        assert!(!staged.contains("staged-mid-pass"), "{staged}");
+        // The worktree seat itself held still and is carried.
+        assert!(carried_paths(&private).contains("staged-mid-pass"));
+        assert!(drift_ref_present(&private));
         fs::remove_dir_all(root).unwrap();
     }
 
-    // The Census split holds: a nested worktree's HEAD is custody, not seats,
-    // and it moving under the pass is still a refusal.
+    // The Census split holds: a nested worktree's HEAD is custody, not seats.
+    // An agent committing in it under the pass is drift custody named by the
+    // nested worktree's path (#38); before #38 it refused.
     #[test]
-    fn nested_worktree_head_moving_during_capture_still_refuses() {
+    fn nested_worktree_head_moving_during_capture_is_drift_custody() {
         let (root, source) = drift_fixture("nested-head");
         let nested = source.join(".claude/worktrees/agent-x");
         fs::create_dir_all(source.join(".claude/worktrees")).unwrap();
@@ -9977,10 +10182,17 @@ mod tests {
             ]))
             .unwrap();
         });
-        assert!(matches!(
-            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
-            Err(BulkloadRefusal::GitAuthorityChanged)
-        ));
+        let export =
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
+                .unwrap();
+        // The branch the agent committed on moved too: a ref row.
+        assert_eq!(
+            export.drift.rows,
+            vec![
+                row(DriftKind::RefChanged, b"refs/heads/agent-x"),
+                row(DriftKind::NestedWorktreeMoved, b".claude/worktrees/agent-x"),
+            ]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

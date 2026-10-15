@@ -47,9 +47,12 @@ MC_ec_one_checkout_crash	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstL
 MC_ec_child_crash_linked	pass	all	FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpLock,OpRef,OpRestore,OpStash,OpWtWork,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcTypeChange,SrcWorktree,Tick	-
 MC_ec_empty_lock	pass	all	ChildCrashHead,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpRef,OpRestore,OpStash,OpWtWork,ProbeExchange,SeatVerify,SrcCreate,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
 MC_ec_first_linked_crash_op	pass	all	BranchRow,Capture,ChildCrashHead,ChildCrashTxn,HeadSet,Import,IndexPublish,OpHead,OpIndex,OpLock,OpRef,OpRestore,OpStash,ProbeExchange,RefFinish,RefLedger,RefStash,RefStep,RefTxnDeletes,RefTxnWrites,SeatOp,SeatVerify,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree,Tick,WriteIntent,WriteLanded	-
+MC_ec_capture_raced	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,OpHead,OpIndex,OpLock,OpRef,OpRestore,OpStash,OpWtWork,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcTypeChange,SrcWorktree,Tick	-
 MC_ec_reach_converged	reach	Witness_Converged	*	-
 MC_ec_reach_settled	reach	Witness_SettledAfterCrash	*	-
 MC_ec_reach_captured_not_landed	reach	Witness_CapturedNotLanded	*	-
+MC_ec_reach_drift_carried	reach	Witness_DriftCarried	*	-
+MC_ec_reach_key_drift_landed	reach	Witness_KeyDriftLanded	*	-
 MC_ec_finding_detached_reattach	fail	ConvergesWhenQuiet	*	-
 MC_ec_finding_restored_ref	fail	ConvergesWhenQuiet	*	-
 MC_ec_neg_live_unfair	fail	ConvergesWhenQuiet	*	-
@@ -97,3 +100,5 @@ MC_ec_neg_empty_lock_removed	fail	NoLocalWorkLost	*	-
 MC_ec_neg_packed_new_kept	fail	NoWedge	*	-
 MC_ec_neg_stash_reflog_unsynced	fail	TypedRefusal	*	-
 MC_ec_neg_recovery_overwrites	fail	NoLocalWorkLost	*	-
+MC_ec_neg_drift_key_reused	fail	ConvergesWhenQuiet	*	-
+MC_ec_neg_drift_applied	fail	NoDriftedLanding	*	-

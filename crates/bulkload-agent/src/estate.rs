@@ -571,8 +571,9 @@ fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     )
 }
 
-// [`write`] of a record already encoded.
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+// [`write`] of a record already encoded. Also the transfer closure
+// record's writer (`transfer_outcome::write`, WP3 PR 4).
+pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     // All callers hold a plan or phase lock. Retain interrupted publications
     // rather than overwrite their bytes or make them a permanent resume blocker.
     let mut generation = 0u64;
@@ -2911,6 +2912,10 @@ pub mod custody_probe {
 #[cfg(test)]
 mod s4_sweep_tests;
 
+// P87 (#38, S5 under OI-1003-Q152): HEAD and index drift is custody.
+#[cfg(test)]
+mod drift_custody_tests;
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
@@ -4252,7 +4257,12 @@ mod tests {
     // R-N72 round-3 N1: Git authority A->B->A across the two windows no export
     // comparison brackets (pre-pass key -> export snapshot, export end ->
     // post-pass key). The pre- and post-pass keys are equal. The capture must
-    // refuse, and must never leave a whole-capture Hit on a bundle carrying B.
+    // never leave a whole-capture Hit on a bundle carrying B. The exclude
+    // file and the configuration refuse. HEAD (detached or symbolic) and the
+    // index are drift custody since #38 (S5 under OI-1003-Q152): the bundle
+    // carries B, which the source held at the export's snapshot, the moves
+    // are named, the key is poisoned, and the next pass carries A.
+    #[allow(clippy::too_many_lines)]
     fn r3_authority_round_trip(class: &str) {
         use git_carry::mid_pass::Stage;
         let (root, source, _, plan, corpus) = drifting_plan(&format!("r3-auth-{class}"));
@@ -4294,6 +4304,37 @@ mod tests {
                     Box::new(move || fs::write(&p2, b"# A\n").unwrap()),
                 )
             }
+            // Review finding 4 (#38): an agent switching a nested worktree
+            // away and back across the two unguarded windows. The export's
+            // census holds the switched HEAD, both keys the original one.
+            "nested-worktree" => {
+                let nested = inside.join(".claude/worktrees/agent-x");
+                fs::create_dir_all(inside.join(".claude/worktrees")).unwrap();
+                r3_git_out(
+                    &inside,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        "agent-x",
+                        nested.to_str().unwrap(),
+                    ],
+                );
+                // agent-y: another commit of the same tree, so the switch
+                // moves the nested HEAD (its custody) and no seat.
+                #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax.
+                let tree = rev_parse(&inside, "HEAD^{tree}");
+                let y = r3_git_out(&inside, &["commit-tree", &tree, "-p", &a, "-m", "y"])
+                    .trim()
+                    .to_owned();
+                git(&inside, &["branch", "agent-y", &y]);
+                let n2 = nested.clone();
+                (
+                    Box::new(move || git(&nested, &["switch", "-q", "agent-y"])),
+                    Box::new(move || git(&n2, &["switch", "-q", "agent-x"])),
+                )
+            }
             "config" => {
                 let path = inside.join(".git/config");
                 let original = fs::read(&path).unwrap();
@@ -4319,7 +4360,19 @@ mod tests {
         settle();
         git_carry::mid_pass::arm_at(&source, Stage::Snapshot, to_b);
         git_carry::mid_pass::arm_at(&source, Stage::AfterPass, to_a);
-        let first = attempt(&plan, &state, &corpus);
+        // Every receipt of the first capture, with its drift rows.
+        let rows = Mutex::new(Vec::new());
+        let _ = capture(&plan, &state, &corpus, 2, &|row| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone(), row.drift.clone()));
+            Ok(())
+        });
+        let drifted = rows.into_inner().unwrap();
+        let first: Vec<(&str, Option<String>)> = drifted
+            .iter()
+            .map(|(outcome, reason, _)| (*outcome, reason.clone()))
+            .collect();
         settle();
         let second = attempt(&plan, &state, &corpus);
         let hit = second.first().unwrap().0 == "capture-reused-after-census";
@@ -4333,27 +4386,57 @@ mod tests {
                 "exclude" => r3_git_out(&scratch, &["show", "refs/b/exclude:value"]) == "# A\n",
                 "config" => !r3_git_out(&scratch, &["show", "refs/b/configuration-v1:value"])
                     .contains("never at a key"),
+                // The bundle's nested custody names agent-y: never a Hit.
+                "nested-worktree" => false,
                 #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax.
                 _ => r3_git_out(&scratch, &["ls-tree", "refs/b/staged^{tree}"])
                     .contains("100644 blob"),
             };
             assert!(carried, "{class}: a whole-capture Hit on a stale bundle");
         }
-        assert_eq!(
-            first,
-            vec![("refused", Some("GIT_AUTHORITY_CHANGED".to_owned()))],
-            "{class}: authority moved inside the capture window"
-        );
+        match class {
+            "detached-head" | "symbolic-head" | "index" | "nested-worktree" => {
+                let name = match class {
+                    "index" => "IndexRewritten \"index\"",
+                    "nested-worktree" => "NestedWorktreeMoved \".claude/worktrees/agent-x\"",
+                    _ => "HeadMoved \"HEAD\"",
+                };
+                assert_eq!(first.len(), 1, "{class}: {first:?}");
+                assert_eq!(
+                    first.first().unwrap().0,
+                    "captured-with-drift",
+                    "{class}: {first:?}"
+                );
+                assert!(
+                    drifted.first().unwrap().2.contains(&name.to_owned()),
+                    "{class}: {drifted:?}"
+                );
+                assert!(!hit, "{class}: a drifted capture is never a Hit");
+                // The next pass carries A, the source's state again.
+                assert!(
+                    matches!(
+                        second.first().unwrap().0,
+                        "captured" | "capture-extended-from-drift"
+                    ),
+                    "{class}: {second:?}"
+                );
+            }
+            _ => assert_eq!(
+                first,
+                vec![("refused", Some("GIT_AUTHORITY_CHANGED".to_owned()))],
+                "{class}: authority moved inside the capture window"
+            ),
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn r3_detached_head_round_trip_across_unguarded_windows_refuses() {
+    fn r3_detached_head_round_trip_across_unguarded_windows_is_drift_custody() {
         r3_authority_round_trip("detached-head");
     }
 
     #[test]
-    fn r3_symbolic_head_round_trip_across_unguarded_windows_refuses() {
+    fn r3_symbolic_head_round_trip_across_unguarded_windows_is_drift_custody() {
         r3_authority_round_trip("symbolic-head");
     }
 
@@ -4368,7 +4451,12 @@ mod tests {
     }
 
     #[test]
-    fn r3_index_round_trip_across_unguarded_windows_refuses() {
+    fn r3_nested_worktree_round_trip_across_unguarded_windows_is_drift_custody() {
+        r3_authority_round_trip("nested-worktree");
+    }
+
+    #[test]
+    fn r3_index_round_trip_across_unguarded_windows_is_drift_custody() {
         r3_authority_round_trip("index");
     }
 

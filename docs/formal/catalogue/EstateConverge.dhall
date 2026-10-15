@@ -95,6 +95,7 @@ let SrcKind =
       | filedir
       | index
       | worktree
+      | race
       >
 
 let srcKindTable =
@@ -109,6 +110,7 @@ let srcKindTable =
       , filedir = SrcKind.filedir
       , index = SrcKind.index
       , worktree = SrcKind.worktree
+      , race = SrcKind.race
       }
 
 let OpKind =
@@ -210,6 +212,8 @@ let Mutation =
       | packed_new_kept
       | stash_reflog_unsynced
       | recovery_overwrites
+      | drift_key_reused
+      | drift_applied
       >
 
 let mutationIndex =
@@ -258,6 +262,8 @@ let mutationIndex =
           , packed_new_kept = 40
           , stash_reflog_unsynced = 41
           , recovery_overwrites = 42
+          , drift_key_reused = 43
+          , drift_applied = 44
           }
           m
 
@@ -270,6 +276,7 @@ let Property =
       | NoReRead
       | CrashAtomicity
       | OneCheckout
+      | NoDriftedLanding
       | WithinBudget
       | ConvergesWhenQuiet
       | NoWedge
@@ -307,18 +314,23 @@ let propertyTable =
         , index = 6
         , class = T.PropertyClass.safety
         }
+      , NoDriftedLanding =
+        { property = Property.NoDriftedLanding
+        , index = 7
+        , class = T.PropertyClass.safety
+        }
       , WithinBudget =
         { property = Property.WithinBudget
-        , index = 7
+        , index = 8
         , class = T.PropertyClass.budget
         }
       , ConvergesWhenQuiet =
         { property = Property.ConvergesWhenQuiet
-        , index = 8
+        , index = 9
         , class = T.PropertyClass.temporal
         }
       , NoWedge =
-        { property = Property.NoWedge, index = 9, class = T.PropertyClass.temporal }
+        { property = Property.NoWedge, index = 10, class = T.PropertyClass.temporal }
       }
 
 let propertyIndex = \(p : Property) -> (merge propertyTable p).index
@@ -344,12 +356,19 @@ let propertyEq =
    names, so a reach row's REACHED shows that state is reached.
 -}
 let Witness =
-      < Witness_Converged | Witness_SettledAfterCrash | Witness_CapturedNotLanded >
+      < Witness_Converged
+      | Witness_SettledAfterCrash
+      | Witness_CapturedNotLanded
+      | Witness_DriftCarried
+      | Witness_KeyDriftLanded
+      >
 
 let witnessTable =
       { Witness_Converged = Witness.Witness_Converged
       , Witness_SettledAfterCrash = Witness.Witness_SettledAfterCrash
       , Witness_CapturedNotLanded = Witness.Witness_CapturedNotLanded
+      , Witness_DriftCarried = Witness.Witness_DriftCarried
+      , Witness_KeyDriftLanded = Witness.Witness_KeyDriftLanded
       }
 
 -- The 51 actions of EstateConverge.tla's Next, in the sorted order of the never column.
@@ -1117,6 +1136,31 @@ let emptyLock =
 let firstLinkedCrashOp = firstLinkedCrash // { OpKinds = [ OpKind.wtwork ], MaxOp = 1 }
 
 -- The stash, one push, a crash that may be a power loss.
+{- #38 (2026-10-15, S5 under OI-1003-Q152): the main's capture pass is
+   raced by the source (HEAD switched, or the index staged, under it);
+   commits and switches between passes; a crash. A raced pass records
+   drift custody (a drifted capture no apply lays down), and the next
+   pass carries the move.
+-}
+let raced =
+          defaults
+      //  { Refs = [ Ref.main, Ref.foo ]
+          , IndexOn = True
+          , SrcKinds = [ SrcKind.race, SrcKind.switch, SrcKind.move ]
+          , MaxSrc = 2
+          , MaxCrashes = 1
+          }
+
+{- #38: a raced switch away and the source switched back, so the source
+   equals the drifted capture's state; no crash.
+-}
+let racedBack =
+          defaults
+      //  { Refs = [ Ref.main, Ref.foo ]
+          , SrcKinds = [ SrcKind.race, SrcKind.switch ]
+          , MaxSrc = 2
+          }
+
 let stashCrash =
       defaults // { SrcKinds = [ SrcKind.stash ], MaxSrc = 1, MaxCrashes = 1 }
 
@@ -1176,6 +1220,8 @@ let verdict
           , packed_new_kept = Property.NoWedge
           , stash_reflog_unsynced = Property.TypedRefusal
           , recovery_overwrites = Property.NoLocalWorkLost
+          , drift_key_reused = Property.ConvergesWhenQuiet
+          , drift_applied = Property.NoDriftedLanding
           }
           m
 
@@ -1630,6 +1676,20 @@ let positives =
           , "the recovery refuses GIT_DESTINATION_MODIFIED and changes nothing."
           ]
           firstLinkedCrashOp
+      , liveRow
+          ( row
+              "MC_ec_capture_raced"
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpWtWork, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+              [ "#38 (S5 under OI-1003-Q152, no freeze window): the source switches"
+              , "HEAD or stages its index while the main's capture pass runs, and"
+              , "commits and switches between passes; a crash. A raced pass is"
+              , "drift custody, never a refusal: export drift (a capture never laid"
+              , "down, NoDriftedLanding) or key drift (a coherent capture that"
+              , "applies), its key poisoned either way, and once the source holds"
+              , "still the next pass's capture converges the landing to it."
+              ]
+              raced
+          )
       ]
 
 -- Reachability witnesses: expected REACHED.
@@ -1656,6 +1716,21 @@ let witnesses =
           , "natively nor at provenance: only CORPUS (GitCarry.tla) keeps it."
           ]
           (refs // { MaxCrashes = 0 })
+      , row
+          "MC_ec_reach_drift_carried"
+          (Expect.reach Witness.Witness_DriftCarried)
+          [ "REACH (expected REACHED): #38's drift custody is carried: a drifted"
+          , "capture is followed by a converge that journals a later capture."
+          ]
+          racedBack
+      , row
+          "MC_ec_reach_key_drift_landed"
+          (Expect.reach Witness.Witness_KeyDriftLanded)
+          [ "REACH (expected REACHED): #38's key-drift class (the move outside"
+          , "the export's window: key poisoned, no in-band marker) is a coherent"
+          , "capture an apply lays down and journals, as the code does."
+          ]
+          racedBack
       ]
 
 {- Documented limits of the code on feat/estate-converge-20261008 (the
@@ -2201,6 +2276,29 @@ let primary =
             ]
           }
         }
+      , drift_key_reused =
+        { mutation = Mutation.drift_key_reused
+        , constants = racedBack
+        , comment =
+          { head = "#38: a drifted capture records the key its pass computed (not"
+          , tail =
+            [ "the poisoned one), so when the source comes back to the state the"
+            , "raced snapshot read, the next pass is a reuse hit on a capture no"
+            , "apply lays down, and the landing never converges."
+            ]
+          }
+        }
+      , drift_applied =
+        { mutation = Mutation.drift_applied
+        , constants = racedBack
+        , comment =
+          { head = "#38 review finding 11: Begin is enabled on a capture its export"
+          , tail =
+            [ "saw drift (the in-band marker not read), so an apply lays down a"
+            , "capture that does not hold what moved under it."
+            ]
+          }
+        }
       , recovery_overwrites =
         { mutation = Mutation.recovery_overwrites
         , constants = firstLinkedCrashOp
@@ -2299,6 +2397,8 @@ let negRows
       , primaryOf Mutation.packed_new_kept
       , primaryOf Mutation.stash_reflog_unsynced
       , primaryOf Mutation.recovery_overwrites
+      , primaryOf Mutation.drift_key_reused
+      , primaryOf Mutation.drift_applied
       ]
 
 let primaryPositions =
@@ -2589,6 +2689,17 @@ let invariants
         , ptest =
           [ "set_head_never_puts_a_second_worktree_on_a_branch"
           , "estate_converge_head_branch_double_checkout"
+          ]
+        }
+      , { tla = Property.NoDriftedLanding
+        , slo = [ S.S5, S.S4 ]
+        , ruling = [ "OI-1003-Q11", "OI-1003-Q152", "R-N72" ]
+        , codeSymbol = [ "apply_item", "capture_item", "mark_drift", "pass_drift" ]
+        , pending = none
+        , ptest =
+          [ "P87"
+          , "deleting_the_drift_sidecar_never_makes_a_drifted_capture_a_hit"
+          , "a_key_only_drifted_capture_is_a_coherent_snapshot_and_applies"
           ]
         }
       , { tla = Property.ConvergesWhenQuiet
