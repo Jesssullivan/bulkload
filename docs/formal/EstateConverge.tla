@@ -36,6 +36,11 @@
 (*     applies. Either way its key is poisoned, so the next pass captures *)
 (*     again even when the source has come back to that state            *)
 (*     (drift_key_reused breaks it).                                       *)
+(*   - OI-1003-Q161 (2026-10-15): a stash push or drop racing a main's    *)
+(*     capture pass (SrcKinds "stashrace") is the same drift custody, in  *)
+(*     the same two classes (git_carry.rs stash_drift): the stash path    *)
+(*     changes no protocol step, so Capture is unchanged and only its     *)
+(*     raced moves grow.                                                  *)
 (*   - Apply passes, one item at a time under the destination lock: the   *)
 (*     estate-apply rows A3 to A12 (converge::apply_workspace), the       *)
 (*     ownership proof, the workspace intent, the native ref step with    *)
@@ -124,6 +129,7 @@
 (* E = crates/bulkload-agent/src/estate.rs)                               *)
 (*   Capture        E capture_item; git_carry.rs capture_administration,  *)
 (*                  pass_drift, KeyParts::drift_to and drift_across (#38) *)
+(*                  and stash_drift (OI-1003-Q161)                        *)
 (*   Begin          E apply_item (A2, A4 journal no-op, pending, settle_refs)*)
 (*                  and C apply_workspace (A5 first landing, finding 13,  *)
 (*                  A12 and a landing intent, the lock, sweep_probes,     *)
@@ -210,7 +216,8 @@ AllItems == {"main", "wt"}
 AllRefs  == {"main", "dev", "foo", "foo/bar", "o/x", "o/x/y", "t"}
 AllPaths == {"d", "d/f"}
 SrcKindSet == {"move", "create", "delete", "rename", "switch", "stash",
-               "seat", "dirfile", "filedir", "index", "worktree", "race"}
+               "seat", "dirfile", "filedir", "index", "worktree", "race",
+               "stashrace"}
 OpKindSet == {"seat", "racy", "touch", "untracked", "index", "ref", "stash",
               "stashdrop", "head", "restore", "rebase", "dir", "lock", "wtwork"}
 
@@ -826,12 +833,20 @@ Refuse(i, code) == RefuseAs(i, code, CASE code = "MODIFIED" -> ItemCause(i)
 Interrupted(i, j) == RefuseAs(i, "INTERRUPTED", j)
 
 \* The source moves that can race a main's capture pass (#38): HEAD
-\* switched to another branch, or the index staged.
+\* switched to another branch, or the index staged; with "stashrace"
+\* (OI-1003-Q161), a stash push or drop (pop is a drop with the seats).
 RacedMoves(i) ==
-    IF "race" \in SrcKinds /\ i = "main" /\ srcN < MaxSrc
-    THEN {[src EXCEPT !.head = b] : b \in {b \in Branches : src.refs[b] # 0 /\ b # src.head
-                                                          /\ b # src.wt}}
-         \cup (IF IndexOn THEN {[src EXCEPT !.index = nextV]} ELSE {})
+    IF i = "main" /\ srcN < MaxSrc
+    THEN (IF "race" \in SrcKinds
+          THEN {[src EXCEPT !.head = b] : b \in {b \in Branches : src.refs[b] # 0 /\ b # src.head
+                                                                /\ b # src.wt}}
+               \cup (IF IndexOn THEN {[src EXCEPT !.index = nextV]} ELSE {})
+          ELSE {})
+         \cup (IF "stashrace" \in SrcKinds
+               THEN (IF Len(src.stash) < 2
+                     THEN {[src EXCEPT !.stash = << nextV >> \o src.stash]} ELSE {})
+                    \cup (IF src.stash # << >> THEN {[src EXCEPT !.stash = Tail(src.stash)]} ELSE {})
+               ELSE {})
     ELSE {}
 
 \* E capture_item: a new {item}.capture at the next instant when the

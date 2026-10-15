@@ -798,8 +798,10 @@ pub fn common_repository(repo: &Path) -> Result<PathBuf> {
 /// The key is an opaque digest and cannot say *what* moved. These parts can, so
 /// a caller re-reading them after a pass can tell drift it may tolerate (the ref
 /// inventory and the worktree census: what a sibling agent lane or a build tool
-/// produces) from Git authority it must refuse (HEAD, the index, configuration,
-/// the shallow boundary, nested worktree custody, the omitted rebuildable roots).
+/// produces, and since #38 and OI-1003-Q161 HEAD, the index, the stash reflog
+/// and nested worktrees' HEADs: what an agent in the checkout moves) from Git
+/// authority it must refuse (the exclude file, configuration, the shallow
+/// boundary, foreign nests and gitlinks, the omitted rebuildable roots).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyParts {
     repo: Vec<u8>,
@@ -972,17 +974,16 @@ impl KeyParts {
     /// sibling agent lane or a build tool produces. HEAD, the index and the
     /// nested worktrees' HEADs are what an agent working in the checkout
     /// moves (#38, OI-1003-Q11): since S5 under OI-1003-Q152 they are drift
-    /// custody too, carried by the next pass. Everything else moving (the
-    /// exclude file, the stash reflog, the configuration, the shallow
-    /// frontier, foreign nests and gitlinks, the omitted roots, the
-    /// repository's identity) is Git authority changing under the capture
-    /// and stays a refusal (R-N30).
+    /// custody too, carried by the next pass, and so is the stash reflog
+    /// (OI-1003-Q161: a stash push, pop or drop). Everything else moving
+    /// (the exclude file, the configuration, the shallow frontier, foreign
+    /// nests and gitlinks, the omitted roots, the repository's identity) is
+    /// Git authority changing under the capture and stays a refusal (R-N30).
     #[must_use]
     pub fn drift_only(&self, other: &Self) -> bool {
         self.repo == other.repo
             && self.common == other.common
             && self.exclude == other.exclude
-            && self.stash == other.stash
             && self.configuration == other.configuration
             && self.boundary == other.boundary
             && self.nested_repositories == other.nested_repositories
@@ -1024,15 +1025,16 @@ impl KeyParts {
                 (&carried.head, &carried.symbolic, &carried.index),
             )
             .is_empty()
+            && stash_drift(&self.stash, &carried.stash).is_empty()
     }
 
     /// Whether these parts name the authority an export carried in every
-    /// part that is never drift: the exclude file, the stash reflog, the
-    /// configuration and the shallow frontier.
+    /// part that is never drift: the exclude file, the configuration and
+    /// the shallow frontier. HEAD, the index and the stash reflog are drift
+    /// custody (#38, OI-1003-Q161).
     #[must_use]
     pub fn carries_fixed(&self, carried: &CarriedAuthority) -> bool {
         self.exclude == carried.exclude
-            && self.stash == carried.stash
             && self.configuration == carried.configuration
             && self.boundary == carried.boundary
     }
@@ -1047,17 +1049,18 @@ impl KeyParts {
     /// equal to `later`, yet the bundle lacks it; only comparing the keyed
     /// inventories with the export's own names it (R-N72).
     ///
-    /// HEAD, the symbolic HEAD and the index that moved between a key and
-    /// the export's snapshot or end are drift custody (#38, S5): the export
-    /// carries the values its own snapshot read, which the source held then,
-    /// and the moves are named (`HeadMoved`, `IndexRewritten`), so the
-    /// recorded key is poisoned and the next pass carries the new values.
-    /// They are named even when they moved away and back, leaving the two
-    /// keys equal (R-N72), and so are nested worktrees' HEADs, compared with
-    /// the export's own census before and after its pass. The rest of Git authority is never drift: the
-    /// exclude file, the stash reflog, the configuration or the shallow
-    /// frontier that moved, even away and back, still refuses: the bundle
-    /// carries what the source held at neither key.
+    /// HEAD, the symbolic HEAD, the index and the stash reflog that moved
+    /// between a key and the export's snapshot or end are drift custody
+    /// (#38, OI-1003-Q161, S5): the export carries the values its own
+    /// snapshot read, which the source held then, and the moves are named
+    /// (`HeadMoved`, `IndexRewritten`, `StashMoved`), so the recorded key is
+    /// poisoned and the next pass carries the new values. They are named
+    /// even when they moved away and back, leaving the two keys equal
+    /// (R-N72), and so are nested worktrees' HEADs, compared with the
+    /// export's own census before and after its pass. The rest of Git
+    /// authority is never drift: the exclude file, the configuration or the
+    /// shallow frontier that moved, even away and back, still refuses: the
+    /// bundle carries what the source held at neither key.
     ///
     /// # Errors
     /// Refuses [`BulkloadRefusal::GitAuthorityChanged`] unless both key parts
@@ -1082,6 +1085,10 @@ impl KeyParts {
             carried,
             (&later.head, &later.symbolic, &later.index),
         ));
+        // OI-1003-Q161: the stash likewise, away and back included (a
+        // `stash drop` of an older entry moves only the reflog).
+        drift.extend(stash_drift(&self.stash, &export.authority.stash));
+        drift.extend(stash_drift(&export.authority.stash, &later.stash));
         // Nested worktrees likewise (review finding 4): a HEAD switched
         // away before the export's census and back after its re-read
         // leaves both keys equal, yet the bundle's custody names it.
@@ -1117,11 +1124,13 @@ impl KeyParts {
         let mut drift = CaptureDrift::default();
         drift.extend(reference_drift(&self.inventory, &later.inventory)?);
         drift.extend(seat_drift_by(&self.rows, &later.rows, |a, b| a == b));
-        // #38 (S5): HEAD, the index and nested worktrees' HEADs are custody.
+        // #38 (S5): HEAD, the index and nested worktrees' HEADs are custody,
+        // and the stash reflog (OI-1003-Q161).
         drift.extend(head_index_drift(
             (&self.head, &self.symbolic, &self.index),
             (&later.head, &later.symbolic, &later.index),
         ));
+        drift.extend(stash_drift(&self.stash, &later.stash));
         drift.extend(nested_worktree_drift(&self.nested, &later.nested));
         drift.seal()?;
         // Fail closed: a key that moved must name what moved.
@@ -1179,7 +1188,9 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
         Err(error) => return Err(crate::refuse::io(&error, "git_carry::read_authority")),
     };
     let stash = if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
-        output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"]))?
+        #[cfg(test)]
+        mid_pass::fire(repo, mid_pass::Stage::StashReflog);
+        source_stash_reflog(repo)?
     } else {
         Vec::new()
     };
@@ -1193,6 +1204,31 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
         boundary: shallow::frontier(repo)?,
         gitlinks,
     })
+}
+
+// The stash reflog, newest first, for an inventory that listed refs/stash.
+// OI-1003-Q161 review: a `git stash pop` or `drop` of the last stash after
+// that inventory was read deletes refs/stash and its reflog, and the read
+// fails. When refs/stash no longer resolves, that is the stash as it is now
+// (none), read as drift custody by the comparisons that follow it (the
+// carried stash against none: `StashMoved`; the inventory against the next:
+// `RefRemoved`; a torn key no consistent key equals), never
+// GIT_CHILD_FAILED. Any other failure still refuses as the child failed.
+fn source_stash_reflog(repo: &Path) -> Result<Vec<u8>> {
+    match output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"])) {
+        Err(refusal @ BulkloadRefusal::GitChildFailed(_)) => {
+            let resolved = git(repo)
+                .args(["rev-parse", "--verify", "-q", "refs/stash"])
+                .output()
+                .refuse_at("git_carry::source_stash_reflog")?;
+            if resolved.status.code() == Some(1) {
+                Ok(Vec::new())
+            } else {
+                Err(refusal)
+            }
+        }
+        read => read,
+    }
 }
 
 // HEAD's commit, as `rev-parse --verify HEAD` names it. S4 (#162, #219): a
@@ -1648,13 +1684,14 @@ pub fn export_repository_with_prerequisite(
 /// halt agent work or git work). A drifted seat's bytes are carried by neither
 /// the worktree tree nor `filesystem-v1`; the drift list is the statement that
 /// they are absent, and the next pass re-reads exactly those seats (R-N28).
-/// HEAD, the index and nested worktrees' HEADs moving under the pass (an
-/// agent committing, switching or staging in the checkout) are drift custody
-/// too: `HeadMoved`, `IndexRewritten` and `NestedWorktreeMoved` rows, and the
-/// bundle carries the HEAD and index its snapshot read (#38, OI-1003-Q11,
+/// HEAD, the index, the stash reflog and nested worktrees' HEADs moving
+/// under the pass (an agent committing, switching, staging or stashing in
+/// the checkout) are drift custody too: `HeadMoved`, `IndexRewritten`,
+/// `StashMoved` and `NestedWorktreeMoved` rows, and the bundle carries the
+/// HEAD, index and stash its snapshot read (#38, OI-1003-Q11, OI-1003-Q161,
 /// S5 under OI-1003-Q152). The rest of Git authority moving -- the exclude
-/// file, the stash reflog, configuration, the shallow boundary, foreign nests
-/// and gitlinks, the omitted rebuildable roots -- is still a refusal (R-N30).
+/// file, configuration, the shallow boundary, foreign nests and gitlinks,
+/// the omitted rebuildable roots -- is still a refusal (R-N30).
 ///
 /// # Errors
 /// Refuses changing Git authority, unsupported Git or filesystem state, invalid
@@ -1945,11 +1982,12 @@ fn pass_drift(
 ) -> Result<(CaptureDrift, String)> {
     let refs_after = refs(repo)?;
     // #38 (S5, OI-1003-Q152): HEAD, the index and the nested worktrees'
-    // HEADs moving under the pass are drift custody, not refusals. The
-    // bundle carries the HEAD and index bytes the snapshot read; the
-    // in-band drift marker keeps every restore off it, and the next pass
-    // carries the new values. The rest of the authority, re-read against
-    // the same inventory rule the snapshot used, still refuses.
+    // HEADs moving under the pass are drift custody, not refusals, and so
+    // is the stash reflog (OI-1003-Q161: an agent's stash push, pop or
+    // drop). The bundle carries the HEAD, index and stash the snapshot
+    // read; the in-band drift marker keeps every restore off it, and the
+    // next pass carries the new values. The rest of the authority, re-read
+    // against the same inventory rule the snapshot used, still refuses.
     let held = read_authority(repo, &refs_after)?;
     if !authority.fixed_equal(&held)
         || census.nested_repositories != after.nested_repositories
@@ -1963,6 +2001,7 @@ fn pass_drift(
         (&authority.head, &authority.symbolic, &authority.index),
         (&held.head, &held.symbolic, &held.index),
     ));
+    drift.extend(stash_drift(&authority.stash, &held.stash));
     drift.extend(nested_worktree_drift(
         &census.nested_worktrees,
         &after.nested_worktrees,
@@ -2381,13 +2420,13 @@ fn carry_authority(
 }
 
 impl CarriedAuthority {
-    // Every part that is never drift, the snapshot's and a re-read's: a stash
-    // reflog rewritten under refs/stash, an exclude file, the configuration,
-    // the shallow frontier or the gitlinks (foreign custody) moving under
-    // the pass all refuse. HEAD and the index are [`head_index_drift`]'s.
+    // Every part that is never drift, the snapshot's and a re-read's: an
+    // exclude file, the configuration, the shallow frontier or the gitlinks
+    // (foreign custody) moving under the pass all refuse. HEAD and the
+    // index are [`head_index_drift`]'s, the stash reflog [`stash_drift`]'s
+    // (OI-1003-Q161).
     fn fixed_equal(&self, other: &Self) -> bool {
         self.exclude == other.exclude
-            && self.stash == other.stash
             && self.configuration == other.configuration
             && self.boundary == other.boundary
             && self.gitlinks == other.gitlinks
@@ -2406,6 +2445,19 @@ fn head_index_drift(before: (&str, &[u8], &[u8]), after: (&str, &[u8], &[u8])) -
         rows.push(DriftRow::seat(DriftKind::IndexRewritten, b"index"));
     }
     rows
+}
+
+// The stash reflog (newest first, as `reflog show refs/stash` lists it),
+// before and after: one `StashMoved` row named `refs/stash` when it changed
+// at all, a push, pop, drop, clear or store (OI-1003-Q161). The ref row
+// refs/stash may name the same move; this one also names a drop below the
+// tip, which leaves refs/stash where it was.
+fn stash_drift(before: &[u8], after: &[u8]) -> Vec<DriftRow> {
+    if before == after {
+        Vec::new()
+    } else {
+        vec![DriftRow::seat(DriftKind::StashMoved, b"refs/stash")]
+    }
 }
 
 // Nested worktrees, keyed on their path: one `NestedWorktreeMoved` row for
@@ -2767,6 +2819,10 @@ pub(crate) mod mid_pass {
         /// Fired by the estate after a group's plan base bundle is
         /// published, before its base record is written.
         BasePublished,
+        /// Inside one authority read, after the ref inventory it was given
+        /// was read and before the stash reflog is: the window in which a
+        /// `git stash pop` or `drop` of the last stash deletes both.
+        StashReflog,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -3285,6 +3341,12 @@ pub enum DriftKind {
     /// `.claude/worktrees/<name>`): its custody row is the snapshot's, and
     /// the next pass records the new one (#38). Named by its path.
     NestedWorktreeMoved,
+    /// The stash moved under the pass: a `git stash push`, `pop`, `drop`,
+    /// `clear` or `store` rewrote the stash reflog (refs/stash with it, or
+    /// only the entries below it). The capture carries the stash its own
+    /// snapshot read; the next pass carries the new one (OI-1003-Q161, as
+    /// #38 for HEAD and the index). Named `refs/stash`.
+    StashMoved,
 }
 
 impl DriftKind {
@@ -10151,6 +10213,224 @@ mod tests {
         assert!(!staged.contains("staged-mid-pass"), "{staged}");
         // The worktree seat itself held still and is carried.
         assert!(carried_paths(&private).contains("staged-mid-pass"));
+        assert!(drift_ref_present(&private));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // OI-1003-Q161 (S5 under OI-1003-Q152): an agent stashing under the
+    // pass moves refs/stash and its reflog. That is drift custody like
+    // HEAD and the index, named `StashMoved "refs/stash"`: the bundle
+    // carries the stash its snapshot read, is marked drifted in-band (no
+    // restore lays it down), and the next pass carries the new stash.
+    // Before Q161 this refused GIT_AUTHORITY_CHANGED.
+    #[test]
+    fn stash_pushed_during_capture_is_drift_custody() {
+        let (root, source) = drift_fixture("stash-pushed");
+        // A stash commit made before the pass, so storing it under the pass
+        // moves only refs/stash and its reflog: no seat and no index entry.
+        fs::write(source.join("tracked"), b"stashed edit").unwrap();
+        let stash = text(git(&source).args(["stash", "create"])).unwrap();
+        output(git(&source).args(["checkout", "--", "tracked"])).unwrap();
+        let pre = capture_key_parts(&source).unwrap();
+        let inside = source.clone();
+        let stored = stash.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&inside).args(["stash", "store", "-m", "agent, mid-pass", &stored]))
+                .unwrap();
+        });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![
+                row(DriftKind::RefAdded, b"refs/stash"),
+                row(DriftKind::StashMoved, b"refs/stash"),
+            ]
+        );
+        assert_eq!(
+            export.drift.lines(),
+            vec![
+                "RefAdded \"refs/stash\"".to_owned(),
+                "StashMoved \"refs/stash\"".to_owned()
+            ]
+        );
+        let private = capture.join("repository.git");
+        assert_eq!(drift_sidecar(&private), export.drift);
+        // The bundle carries the snapshot's stash: none.
+        let heads = carried_heads(&export.bundle, Some(&source.join(".git/objects"))).unwrap();
+        assert!(!heads.contains(&stash), "{heads}");
+        assert!(matches!(
+            restore_bundle(&export.bundle, &root.join("restored"), "neo"),
+            Err(BulkloadRefusal::CaptureDrifted)
+        ));
+        // Between two key reads the stash moving is drift too, never a
+        // refusal; the two keys differ, so the next pass captures it.
+        let post = capture_key_parts(&source).unwrap();
+        assert!(pre.drift_only(&post));
+        assert_eq!(
+            pre.drift_to(&post).unwrap().rows,
+            vec![
+                row(DriftKind::RefAdded, b"refs/stash"),
+                row(DriftKind::StashMoved, b"refs/stash"),
+            ]
+        );
+        assert_ne!(pre.digest().unwrap(), post.digest().unwrap());
+        // The next quiet pass carries the new stash, clean.
+        let next =
+            export_repository_with_drift(&source, &root.join("next"), &ExportOptions::default())
+                .unwrap();
+        assert!(next.drift.is_empty(), "{:?}", next.drift);
+        let heads = carried_heads(&next.bundle, Some(&source.join(".git/objects"))).unwrap();
+        assert!(
+            heads.contains(&format!("refs/carry-export/stashes/{stash}")),
+            "{heads}"
+        );
+        // A strict export, a caller that never asked for tolerance, still
+        // refuses (the pre-drift contract).
+        let again = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&again).args(["stash", "drop", "-q"])).unwrap();
+        });
+        assert!(matches!(
+            export_repository(&source, &root.join("strict")),
+            Err(BulkloadRefusal::GitAuthorityChanged)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // OI-1003-Q161 review: `git stash pop` of the only stash between the
+    // ref inventory read and the stash reflog read deletes refs/stash and
+    // its reflog, so the reflog read fails. That is drift custody like any
+    // other stash move, never GIT_CHILD_FAILED: in the pass's own re-read
+    // (the snapshot's stash against none: `StashMoved`), in the export's
+    // snapshot (refs/stash removed under the pass: `RefRemoved`) and in a
+    // key read (a torn key no consistent key equals).
+    #[test]
+    fn stash_popped_between_ref_read_and_reflog_read_is_drift_custody() {
+        let (root, source) = drift_fixture("stash-popped-torn");
+        let stash_one = |content: &[u8]| {
+            fs::write(source.join("tracked"), content).unwrap();
+            output(git(&source).args(["stash", "push", "-q"])).unwrap();
+            text(git(&source).args(["rev-parse", "refs/stash"])).unwrap()
+        };
+        let pop_at_reflog_read = |repo: &Path| {
+            let inner = repo.to_path_buf();
+            mid_pass::arm_at(repo, mid_pass::Stage::StashReflog, move || {
+                output(git(&inner).args(["stash", "pop", "-q"])).unwrap();
+            });
+        };
+        // The pass's own re-read: armed from the byte pass, so the hook
+        // fires in `pass_drift`, after the snapshot carried the stash.
+        let stash = stash_one(b"stashed edit one");
+        let outer = source.clone();
+        mid_pass::arm(&source, move || pop_at_reflog_read(&outer));
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert!(
+            export
+                .drift
+                .rows
+                .contains(&row(DriftKind::StashMoved, b"refs/stash")),
+            "{:?}",
+            export.drift
+        );
+        let heads = carried_heads(&export.bundle, Some(&source.join(".git/objects"))).unwrap();
+        assert!(
+            heads.contains(&format!("refs/carry-export/stashes/{stash}")),
+            "{heads}"
+        );
+        assert!(drift_ref_present(&capture.join("repository.git")));
+        assert!(matches!(
+            restore_bundle(&export.bundle, &root.join("restored"), "neo"),
+            Err(BulkloadRefusal::CaptureDrifted)
+        ));
+        // A key read torn the same way is not a refusal, and no consistent
+        // key equals it, so its capture is never reused.
+        stash_one(b"stashed edit two");
+        pop_at_reflog_read(&source);
+        let torn = capture_key_parts(&source).unwrap();
+        let after = capture_key_parts(&source).unwrap();
+        assert!(torn.drift_only(&after));
+        assert_ne!(torn.digest().unwrap(), after.digest().unwrap());
+        // The export's own snapshot torn: refs/stash removed under the pass.
+        stash_one(b"stashed edit three");
+        pop_at_reflog_read(&source);
+        let snapshot = root.join("snapshot");
+        let export =
+            export_repository_with_drift(&source, &snapshot, &ExportOptions::default()).unwrap();
+        assert!(
+            export
+                .drift
+                .rows
+                .contains(&row(DriftKind::RefRemoved, b"refs/stash")),
+            "{:?}",
+            export.drift
+        );
+        assert!(drift_ref_present(&snapshot.join("repository.git")));
+        // The next quiet pass is clean and carries no stash.
+        let next =
+            export_repository_with_drift(&source, &root.join("next"), &ExportOptions::default())
+                .unwrap();
+        assert!(next.drift.is_empty(), "{:?}", next.drift);
+        let heads = carried_heads(&next.bundle, Some(&source.join(".git/objects"))).unwrap();
+        assert!(!heads.contains("refs/carry-export/stashes/"), "{heads}");
+        // Any other failure of the reflog read still refuses: here the
+        // child runs out of space while refs/stash still resolves, so it is
+        // the child failing, not the stash moving.
+        stash_one(b"stashed edit four");
+        mid_pass::arm_at(&source, mid_pass::Stage::StashReflog, || {
+            scratch_fault::arm_at(scratch_fault::Site::Child, 28);
+        });
+        let failed = capture_key_parts(&source);
+        assert!(
+            matches!(failed, Err(BulkloadRefusal::SpaceExhausted(_))),
+            "{failed:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // OI-1003-Q161: a `git stash drop` of an older entry under the pass
+    // rewrites only the stash reflog (refs/stash keeps its value), the
+    // move no ref row can name. It is `StashMoved` alone; the bundle
+    // carries both stash commits and the snapshot's order.
+    #[test]
+    fn stash_dropped_during_capture_is_drift_custody() {
+        let (root, source) = drift_fixture("stash-dropped");
+        let mut stashes = Vec::new();
+        for content in [b"stash one".as_slice(), b"stash two"] {
+            fs::write(source.join("tracked"), content).unwrap();
+            output(git(&source).args(["stash", "push", "-q"])).unwrap();
+            stashes.push(text(git(&source).args(["rev-parse", "refs/stash"])).unwrap());
+        }
+        let inside = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&inside).args(["stash", "drop", "-q", "stash@{1}"])).unwrap();
+        });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![row(DriftKind::StashMoved, b"refs/stash")]
+        );
+        let private = capture.join("repository.git");
+        let heads = carried_heads(&export.bundle, Some(&source.join(".git/objects"))).unwrap();
+        for stash in &stashes {
+            assert!(
+                heads.contains(&format!("refs/carry-export/stashes/{stash}")),
+                "{heads}"
+            );
+        }
+        assert_eq!(
+            text(git(&private).args([
+                "show",
+                &format!("refs/carry-export/{STASH_ORDER_METADATA}:value")
+            ]))
+            .unwrap(),
+            stashes.iter().rev().cloned().collect::<Vec<_>>().join("\n")
+        );
         assert!(drift_ref_present(&private));
         fs::remove_dir_all(root).unwrap();
     }

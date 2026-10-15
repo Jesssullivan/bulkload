@@ -96,6 +96,7 @@ let SrcKind =
       | index
       | worktree
       | race
+      | stashrace
       >
 
 let srcKindTable =
@@ -111,6 +112,7 @@ let srcKindTable =
       , index = SrcKind.index
       , worktree = SrcKind.worktree
       , race = SrcKind.race
+      , stashrace = SrcKind.stashrace
       }
 
 let OpKind =
@@ -1161,6 +1163,22 @@ let racedBack =
           , MaxSrc = 2
           }
 
+{- OI-1003-Q161: the source pushes or drops a stash while the main's
+   capture pass runs, and pushes and drops between passes; a crash.
+-}
+let racedStash =
+          defaults
+      //  { SrcKinds = [ SrcKind.stashrace, SrcKind.stash ]
+          , MaxSrc = 2
+          , MaxCrashes = 1
+          }
+
+{- OI-1003-Q161: a raced stash push and the source dropping it again, so
+   the source equals the drifted capture's state; no crash.
+-}
+let racedStashBack =
+      defaults // { SrcKinds = [ SrcKind.stashrace, SrcKind.stash ], MaxSrc = 2 }
+
 let stashCrash =
       defaults // { SrcKinds = [ SrcKind.stash ], MaxSrc = 1, MaxCrashes = 1 }
 
@@ -1690,6 +1708,19 @@ let positives =
               ]
               raced
           )
+      , liveRow
+          ( row
+              "MC_ec_capture_raced_stash"
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpWtWork, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+              [ "OI-1003-Q161 (S5 under OI-1003-Q152): the source pushes or drops a"
+              , "stash while the main's capture pass runs, and between passes; a"
+              , "crash. The same drift custody as #38's HEAD and index, in the same"
+              , "two classes (git_carry.rs stash_drift): never laid down when the"
+              , "export saw it, its key poisoned either way, and once the source"
+              , "holds still the next pass carries the stash in the source's order."
+              ]
+              racedStash
+          )
       ]
 
 -- Reachability witnesses: expected REACHED.
@@ -1731,6 +1762,14 @@ let witnesses =
           , "capture an apply lays down and journals, as the code does."
           ]
           racedBack
+      , row
+          "MC_ec_reach_stash_drift_carried"
+          (Expect.reach Witness.Witness_DriftCarried)
+          [ "REACH (expected REACHED): OI-1003-Q161's stash drift custody is"
+          , "carried: a capture a stash push or drop raced is followed by a"
+          , "converge that journals a later capture."
+          ]
+          racedStashBack
       ]
 
 {- Documented limits of the code on feat/estate-converge-20261008 (the
@@ -2398,7 +2437,38 @@ let negRows
       , primaryOf Mutation.stash_reflog_unsynced
       , primaryOf Mutation.recovery_overwrites
       , primaryOf Mutation.drift_key_reused
+      , { mutation = Mutation.drift_key_reused
+        , against =
+            Against.also
+              { suffix = "stash_drift_key_reused"
+              , property = Property.ConvergesWhenQuiet
+              }
+        , constants = racedStashBack
+        , comment =
+          { head = "OI-1003-Q161: a capture a stash push raced records the key its"
+          , tail =
+            [ "pass computed (not the poisoned one), so when the source drops"
+            , "the stash again, the next pass is a reuse hit on a capture no"
+            , "apply lays down, and the landing never converges."
+            ]
+          }
+        }
       , primaryOf Mutation.drift_applied
+      , { mutation = Mutation.drift_applied
+        , against =
+            Against.also
+              { suffix = "stash_drift_applied"
+              , property = Property.NoDriftedLanding
+              }
+        , constants = racedStashBack
+        , comment =
+          { head = "OI-1003-Q161: Begin is enabled on a capture whose export a stash"
+          , tail =
+            [ "push or drop raced (the in-band marker not read), so an apply"
+            , "lays down a stash the source no longer holds."
+            ]
+          }
+        }
       ]
 
 let primaryPositions =
@@ -2693,11 +2763,13 @@ let invariants
         }
       , { tla = Property.NoDriftedLanding
         , slo = [ S.S5, S.S4 ]
-        , ruling = [ "OI-1003-Q11", "OI-1003-Q152", "R-N72" ]
-        , codeSymbol = [ "apply_item", "capture_item", "mark_drift", "pass_drift" ]
+        , ruling = [ "OI-1003-Q11", "OI-1003-Q152", "OI-1003-Q161", "R-N72" ]
+        , codeSymbol =
+          [ "apply_item", "capture_item", "mark_drift", "pass_drift", "stash_drift" ]
         , pending = none
         , ptest =
           [ "P87"
+          , "stash_pushed_during_capture_is_drift_custody"
           , "deleting_the_drift_sidecar_never_makes_a_drifted_capture_a_hit"
           , "a_key_only_drifted_capture_is_a_coherent_snapshot_and_applies"
           ]

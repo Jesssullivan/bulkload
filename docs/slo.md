@@ -892,7 +892,66 @@ Q155). No SLO number changes.
   pinned gate, AC power and an OFF baseline under R-N81's 2.5, with no
   coordinator quiet (OI-1003-Q152 keeps neo live), so a busy neo stays not
   evidence. (2) Whether HEAD and index drift should also cover the stash
-  reflog (`git stash` under a pass still refuses).
+  reflog (`git stash` under a pass still refuses). Both are ruled in the
+  next amendment (OI-1003-Q160, Q161).
+
+## Amendment 2026-10-15 (ruled): S2 alongside a live baseline, the stash as drift custody (OI-1003-Q160, Q161)
+
+Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
+
+- **S2 alongside a live run is judged against the source's own live load
+  (OI-1003-Q160).** An observation alongside a real run (Q152; `s2_budget.py
+  alongside`) takes the OFF windows between passes as the baseline, with
+  **no absolute load1 cap**: R-N81's load1 < 2.5 is amended for alongside
+  observations only. Standalone gated S2 runs (`s2_budget.py run`) keep
+  R-N81 unchanged. The budget is unchanged: at most +25 % p95 latency and
+  +2.0 load1 relative to the OFF baseline. Evidence still needs AC power at
+  every window boundary, at least five alternating windows of at least
+  300 s, and recorded load1 in every window; it is labelled `alongside,
+  live baseline (OI-1003-Q160)`. A pathological baseline is guarded, not
+  capped: the verdict reports the OFF windows' load1 levels and spread
+  (still INCONCLUSIVE when the spread exceeds half the budget) and compares
+  each ON window with the OFF windows on both sides of it, interpolated in
+  time to the pass, which removes a linear drift whatever the windows'
+  lengths. Pairs are judged gate by gate: a pooled PASS stands only when
+  every pair passes both gates; a pooled FAIL stands when every pair fails
+  a gate that failed pooled (a pair also over the other gate adds a reason,
+  never a downgrade); otherwise the verdict is INCONCLUSIVE, keeping the
+  pooled reasons and naming each pair, its worst gated metric and its
+  baseline drift; a pass with no OFF window on one side is not judged. A
+  PASS also needs the OFF windows after passes free of a recovery tail
+  (pooled, their first settled half at most half the budget over their
+  second, on p95 and load1), since a pass's cost that outlasts it sits on
+  both sides of every pair. Evidence needs every pair compared on every
+  gated metric, `--min-window-seconds` pinned at 300, no pass dropped as a
+  short ON window (every pass is judged; a converge run's passes under
+  about 240 s cannot be alongside evidence, and dropped passes and their
+  seconds are reported), and no recorded pass ending within one settle plus
+  300 s before the observation began. The pair rule removes linear drift
+  only: host load correlated with the passes themselves (agents quiet
+  while bulkload runs) is not separable from bulkload's cost, and the
+  instrument never lists processes to separate it (R-N11, R-N104). Proof:
+  `AlongsideLiveBaselineTests` and `LiveBaselineReviewTests` in
+  `test_s2_budget.py`.
+- **A stash push, pop or drop during a capture pass is drift custody
+  (OI-1003-Q161),** as HEAD and index moves are (#38): the pass records a
+  `StashMoved` row named `refs/stash` (beside any `refs/stash` ref row; a
+  drop below the tip moves only the reflog, which only this row names);
+  the raced capture is never laid down (in-band marker, `CAPTURE_DRIFTED`)
+  or reused (its key is poisoned, a move away and back included), and the
+  next pass carries the new stash, which the apply converges in the
+  source's order. It no longer refuses `GIT_AUTHORITY_CHANGED`; the exclude
+  file, configuration, the shallow frontier, foreign nests and gitlinks and
+  the omitted roots still do. The stash path changes no protocol step: the
+  EstateConverge model's raced moves gain the stash (`stashrace`), with
+  rows `MC_ec_capture_raced_stash` (pass), `MC_ec_reach_stash_drift_carried`
+  (reached), `MC_ec_neg_stash_drift_key_reused` (fails
+  `ConvergesWhenQuiet`) and `MC_ec_neg_stash_drift_applied` (fails
+  `NoDriftedLanding`). Proof: P87's stash row (`p87_an_agent_stashing_...`:
+  push, pop and drop under passes, each converged), the git_carry rows
+  `stash_pushed_during_capture_is_drift_custody` and
+  `stash_dropped_during_capture_is_drift_custody`, and
+  `r3_stash_reflog_round_trip_across_unguarded_windows_is_drift_custody`.
 
 ## Priority (OI-1003-Q4)
 

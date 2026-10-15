@@ -441,8 +441,11 @@ that note) before merge.**
 - **Native refs (#215).** A standalone first landing restores every
   carried ref natively inside its private stage (the repository bulkload
   creates): `refs/heads`, `refs/tags`, `refs/remotes`, `refs/notes` and any
-  other namespace, and the stash with the source's reflog order and
-  messages (a capture with a stash carries `stash-order-v1`). Never
+  other namespace, and the stash with the source's reflog order (a
+  capture with a stash carries `stash-order-v1`) and each stash commit's
+  subject as its message, which is the reflog message for `git stash
+  push`; a `git stash store -m` message is not carried, and a change to a
+  stash's message alone moves no key (open, 2026-10-15 review). Never
   natively: `refs/carry/**`, `refs/carry-*/**`, `refs/stash` (its own table),
   per-worktree refs, `refs/remotes/*/HEAD`, and any ref that is a symref at
   the destination. Provenance under `refs/carry/v1/<SOURCE>/<instance>/` is
@@ -590,8 +593,24 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   its pass). A key-drift capture is a coherent snapshot of the state the
   export read: it applies and the closure counts it applied. Either way
   the next pass captures the new HEAD and index, and the apply after it
-  converges the landing. The exclude file,
-  the stash reflog, configuration, the shallow frontier, foreign nests and
+  converges the landing.
+- The stash is drift custody too, since OI-1003-Q161 (2026-10-15): an
+  agent's `git stash push`, `pop`, `drop`, `clear` or `store` under the
+  pass rewrites the stash reflog (and refs/stash with it, except a drop
+  below the tip). It is a `StashMoved` row named `refs/stash`
+  (`stash_drift`), beside any `refs/stash` ref row, in the same two classes
+  as HEAD and the index: the bundle carries the stash its snapshot read
+  (its commits and the stash order), a move under the export is never laid
+  down, a move outside it poisons the key (away and back too), and the
+  next pass carries the new stash, which the apply converges in the
+  source's order (P87's stash row). A `pop` or `drop` of the last stash
+  between a read of the ref inventory and the read of the stash reflog
+  (refs/stash and its reflog deleted) reads as no stash, so it too is a
+  move (`StashMoved`, or `RefRemoved` in the snapshot, or a torn key),
+  never `GIT_CHILD_FAILED`; any other failure of that read still refuses.
+  The EstateConverge model's raced moves include it (`stashrace`); no
+  protocol step changes.
+- The exclude file, configuration, the shallow frontier, foreign nests and
   gitlinks (a staged gitlink change too), or the omitted rebuildable roots
   moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30).
   `git-export` and the other strict exports still refuse any drift.
@@ -616,9 +635,10 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   checks validate a private copy of the carried bytes, never the live index):
   HEAD, the symbolic HEAD, the index bytes, `info/exclude`, the stash reflog, the
   configuration files and the shallow frontier. The export re-reads all of
-  it at the end of its pass. HEAD, the symbolic HEAD and the index that
-  moved, under the export or between a key and it, even away and back, are
-  named as drift rows (#38), so the recorded key is poisoned and a stale
+  it at the end of its pass. HEAD, the symbolic HEAD, the index and the
+  stash reflog that moved, under the export or between a key and it, even
+  away and back, are named as drift rows (#38, OI-1003-Q161), so the
+  recorded key is poisoned and a stale
   bundle never stands behind an equal key; the rest refuses
   `GIT_AUTHORITY_CHANGED` unless both key parts name exactly what the
   export carried.
@@ -907,6 +927,25 @@ Gated benchmark samples require AC power and a 1-minute load below 2.5,
 and each sample row records both. The coordinator keeps the other lanes
 quiet while gated samples run (R-N81, R-N91). The clone fast path never
 counts toward a gate (R-N57, R-N63).
+
+S2's budget measured alongside a real run (#165, `s2_budget.py observe` and
+`alongside`; OI-1003-Q152 keeps the source live) is judged against the
+source's own live load (OI-1003-Q160): the OFF windows between passes are
+the baseline, with no absolute load1 cap (R-N81's 2.5 is amended for
+alongside observations only; a gated `s2_budget.py run` keeps it). The
+budget is unchanged (+25 % p95, +2.0 load1 over that baseline), and AC
+power, at least five alternating windows of at least 300 s and recorded
+load are still required. The verdict reports the OFF windows' load spread
+and compares each pass with the OFF windows on both sides of it,
+interpolated to the pass's time, gate by gate: a pooled PASS stands only
+when every pair passes, a pooled FAIL when every pair fails a gate that
+failed pooled. A PASS also needs no recovery tail in the OFF windows after
+passes. Every pass is judged (a pass dropped as a short ON window is not
+evidence), and the first OFF window must be clear of a pass recorded just
+before the observation. This removes linear drift in the source's own
+load; load that rises and falls with the passes themselves is not
+separable, and the instrument lists no processes to separate it (R-N104).
+Such evidence is labelled `alongside, live baseline (OI-1003-Q160)`.
 
 ## Wire v6
 

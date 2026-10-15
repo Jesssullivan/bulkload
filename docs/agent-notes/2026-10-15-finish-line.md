@@ -256,3 +256,195 @@ code edit (one rustfmt-only reflow of a test line followed; `cargo fmt
 - A staged gitlink change under a pass still refuses (nested custody).
 - No Linear or GitHub comment posted by this lane; the coordinator owns
   them.
+
+## Q160 and Q161 (2026-10-15, lane `q160-q161`)
+
+Worktree `bulkload.worktrees/q160-q161-20261015`, branch
+`feat/q160-q161-20261015` off `feat/finish-line-20261015` (PR #225).
+Changes are staged, not committed: the coordinator commits signed.
+Rulings: OI-1003-Q160 and OI-1003-Q161 (Linear TIN-4543, 2026-10-15), under
+OI-1003-Q152; R-N81 (amended for alongside observations only), R-N13.
+The two operator questions in "Open" above (alongside evidence under
+R-N81; the stash reflog as drift) are answered by these rulings.
+
+### Q160: S2 alongside a live run, judged against the live baseline
+
+- `s2_budget.py`: in `analyze`, R-N81's OFF-level cap (2.5) applies to
+  `run` evidence only; alongside, power is still checked at every window
+  boundary. New `live_baseline` (the OFF windows' load1 levels, min, max,
+  spread; per ON window its nearest OFF window before and after, equally
+  weighted: `baseline_load1`, `drift_load1`, `d_load1`, `d_p95` per metric),
+  `pair_latency`, `pair_disagreements` (a pooled PASS or FAIL of the load1
+  or latency gate stands only when every pair gives it; a pass with no OFF
+  window on one side is not judged) and `live_baseline_problems` (evidence
+  needs recorded load1 in every window, a known spread, every pair
+  compared). The verdict carries `live_baseline` and `evidence_label`
+  (`alongside, live baseline (OI-1003-Q160)`, or `gated run (R-N81)`);
+  `summary.md` gains a live-baseline table, `evidence.tsv` a `baseline`
+  row and one `pair` row per pass, and its label column carries the
+  alongside label. Budget, window rules and the noise floor unchanged.
+- Tests: `AlongsideLiveBaselineTests` (8). Red-first: the 8 tests and the
+  amended `test_evidence_rows_carry_every_gated_metric_and_window`, run
+  against the pre-change `s2_budget.py` (HEAD's, in a `/dev/shm` copy),
+  all fail (busy baseline INCONCLUSIVE by R-N81; falling-baseline and
+  latency-drift cases PASS; rising-baseline case FAIL; no-OFF-after case
+  PASS; evidence with a load gap labelled evidence; missing
+  `live_baseline`/label keys).
+
+### Q161: a stash push, pop or drop during a pass is drift custody
+
+- `git_carry.rs`: `DriftKind::StashMoved` (appended: recorded sidecars keep
+  their encoding), named `refs/stash`; `stash_drift`; the stash reflog
+  leaves `fixed_equal`, `drift_only` and `carries_fixed` and joins
+  `pass_drift`, `drift_to`, `drift_across` (both unguarded windows) and
+  `carries`. The bundle carries the snapshot's stash (commits and
+  `stash-order-v1`); in-band moves are marked (never laid down); key moves
+  poison the key (never reused, away and back included). `main.rs` USAGE.
+- Tests: git_carry `stash_pushed_during_capture_is_drift_custody` (store
+  under the pass: `RefAdded`+`StashMoved`, snapshot stash carried,
+  `CAPTURE_DRIFTED`, key parts `drift_to` names it, next pass carries the
+  stash, strict export still refuses) and
+  `stash_dropped_during_capture_is_drift_custody` (drop below the tip:
+  `StashMoved` alone); `r3_stash_reflog_round_trip_..._is_drift_custody`
+  (was `..._refuses`); P87 stash row
+  `p87_an_agent_stashing_through_every_pass_is_carried_by_the_next_converging_delta`
+  (push, pop and drop each under a pass: custody, nothing laid down; each
+  next quiet pass converges seats, index, HEAD and the stash in the
+  source's order on sting; closure 0 unaccounted, gate green).
+  Red-first: with only the variant added (old behaviour), all four fail
+  (`GitAuthorityChanged` / `refused GIT_AUTHORITY_CHANGED`).
+- Model: `EstateConverge.tla` `RacedMoves` gains stash push/drop under the
+  new `SrcKinds` label `stashrace` (no protocol step changes; rows without
+  `race`/`stashrace` unchanged by construction). Catalogue: `SrcKind.stashrace`,
+  `racedStash`/`racedStashBack`, rows `MC_ec_capture_raced_stash` (pass,
+  82086 states), `MC_ec_reach_stash_drift_carried` (REACHED),
+  `MC_ec_neg_stash_drift_key_reused` (FAIL ConvergesWhenQuiet) and
+  `MC_ec_neg_stash_drift_applied` (FAIL NoDriftedLanding), both via
+  `Against.also` on #38's mutations; `stash_drift` grounded on
+  NoDriftedLanding.
+
+### Mutation evidence (scratch copies under /dev/shm; sources untouched)
+
+| mutant | result |
+|---|---|
+| S2-a OFF cap dropped in run mode too | KILLED `test_a_gated_run_keeps_r_n81s_load_cap`, `test_a_busy_off_baseline_is_inconclusive` |
+| S2-b OFF cap kept alongside (pre-Q160) | KILLED `test_a_busy_live_baseline_is_alongside_evidence` |
+| S2-c no pair guard | KILLED falling, rising, latency-drift and no-OFF-after tests |
+| S2-d load bracket = OFF before only | KILLED falling, rising, spread/pairs tests |
+| S2-e pooled load FAIL not checked by pairs | KILLED `test_a_rising_baseline_does_not_fail_as_bulkload_cost` |
+| S2-f latency pairs not checked | KILLED `test_a_latency_baseline_drift_is_seen_pair_by_pair` |
+| S2-g no live-baseline evidence problems | KILLED `test_evidence_needs_load_recorded_and_every_pair_compared` |
+| S2-h run label on alongside evidence | KILLED busy-baseline and evidence-rows tests |
+| S2-i p95 bracket = OFF before only | KILLED latency-drift test |
+| S2-j a pass with no comparison not a disagreement | KILLED `test_a_pass_with_no_off_window_after_it_is_not_judged` |
+| S2-k spread unreported | KILLED 4 tests |
+| S2-l power unchecked alongside | KILLED busy-baseline, `test_battery_is_not_evidence`, power-in-window test |
+| Q1 stash compared as fixed authority again (pre-Q161) | KILLED all four stash rows |
+| Q2 `pass_drift` names no stash row | KILLED both git_carry stash tests |
+| Q3 `drift_across` names no stash | KILLED `r3_stash_reflog_round_trip_...` |
+| Q4 `drift_to` names no stash | KILLED `stash_pushed_during_capture_is_drift_custody` |
+| Q5 key-drift stash refuses (`carries_fixed`) | KILLED P87 stash row, `r3_stash_...` |
+
+Unmutated copy: the 49 filtered lib rows pass; S2 copies restored per mutant.
+
+### Validation (2026-10-15, sting, inside `nix develop`, lane target dir `cargo-target/q160`)
+
+Host shared, load average about 19 on 32 CPUs. Final pass after the last
+code edit (docs edited after it):
+
+| step | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+| `cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings` | exit 0 |
+| `cargo test -p bulkload-agent --locked --no-fail-fast` | exit 0: lib 672 passed, 5 ignored; every integration binary ok, among them `estate_converge` 21, `space_closure_cli` 10, `source_command_registry` 16, `refusal_taxonomy` 5 |
+| `cargo test ... --features fault-injection,io-trace --test fault_harness` | 91 passed |
+| `cargo test ... --features fault-injection,io-trace --test power_loss` | 12 passed |
+| `python3 tests/test_ci_contract.py` | 24 tests OK |
+| `python3 -m unittest crates/bulkload-bench/scripts/test_s2_budget.py` | 104 tests OK; `ruff check` and `ruff format --check` clean |
+| `just tla-render --check` | all 220 committed files equal the catalogue's rendering |
+| `just tla-check` the 9 raced rows | exit 0: 2 PASS, 3 REACHED, 4 FAIL as expected, self-test INCONCLUSIVE; 334 s; peak 2004 MiB; `MC_ec_capture_raced` 135185 states (unchanged) |
+
+### Open (Q160/Q161)
+
+- No alongside observation has been run on neo; the verdict logic is
+  proven on synthetic traces only.
+- The pair rule is conservative in both directions: a real cost that one
+  pass does not show, or a real PASS across a baseline step, reads
+  INCONCLUSIVE, not PASS or FAIL.
+- AGENTS.md's R-N81 lane bullet now carries the alongside amendment
+  (review round below, finding 7).
+- The model's stash race is on the main only and a pop is modelled as a
+  drop (the seats it restores are the Rust rows').
+- No Linear or GitHub comment posted by this lane; the coordinator owns them.
+
+### Review round (2026-10-15, lane `q160-q161`, same worktree, staged)
+
+Nine reviewer findings against the staged Q160/Q161 change. Rulings:
+OI-1003-Q160, OI-1003-Q161 (TIN-4543), R-N11, R-N104, R-N13.
+
+| # | finding | outcome |
+|---|---|---|
+| 1 | pair veto crossed gates; FAIL reasons replaced | fixed: `judge_pairs` judges gate by gate. A pooled PASS needs every pair to pass both gates; a pooled FAIL stands when every pair fails a gate that failed pooled, and a pair also over the other gate adds an "also reads" reason; a downgrade keeps the pooled reasons |
+| 2 | short passes dropped, run still alongside evidence | fixed: under `--evidence`, any pass dropped as a short ON window is an evidence problem, and `min_window_seconds` is pinned at 300; the verdict's `dropped_on` (windows, pass seconds) goes to the emit line, `summary.md` and an `evidence.tsv` `dropped` row |
+| 3 | post-pass recovery tail in every OFF baseline | fixed: `recovery_after_passes` pools the OFF windows that start at or after the first pass and compares the first settled half with the second (p95 by 30 s blocks; load1 lag-corrected per half). Over half the budget on a gated metric or on load1 turns a PASS INCONCLUSIVE. Evidence also needs no recorded pass ending within settle + 300 s before the origin; pre-origin intervals are kept in `config.pre_origin_intervals`. Reported in `summary.md` and as an `evidence.tsv` `recovery` row |
+| 4 | ON/OFF placement unchecked (passes in quiet spells) | partly accepted: the doc claim is softened everywhere to "removes linear drift only", and the limitation is stated. Rejected: per-process CPU via `ps`, because the instrument never lists processes (R-N11, R-N104; module docstring). Rejected: receipts instead of marks, because in E5 the intervals are accurate and the confound is the host's own timing. Open for the operator |
+| 5 | "cancels a linear drift" false with unequal OFF windows | fixed: the two OFF levels and p95s are interpolated to the ON window's settled midpoint (`settled_mid`) |
+| 6 | three surviving pair mutants; reason named step | fixed: the pair reason names the gated metric furthest over (ties: step); tests for an each-op-only overrun, a missing op p95, and a pooled latency FAIL contradicted by one pass |
+| 7 | AGENTS.md R-N81 bullet had no alongside exemption | fixed: the bullet now says a standalone `run` keeps load1 < 2.5 and an alongside observation is judged against its live OFF baseline (OI-1003-Q160) |
+| 8 | popping or dropping the last stash between the ref read and the reflog read refused GIT_CHILD_FAILED | fixed: `source_stash_reflog`. When the reflog read fails as `GitChildFailed` and `rev-parse --verify -q refs/stash` exits 1, the read is no stash, so the move is `StashMoved` (pass re-read), `RefRemoved` (snapshot) or a torn key. Other failures still refuse. New test stage `mid_pass::Stage::StashReflog` |
+| 9 | stash messages: commit subject, not reflog message; message-only change unseen | real, predates Q161 (#215 native refs), **not fixed**: the fix makes the message part of the stash identity in the key, in `stash-order` (v2), in the destination's `LandedStash` ledger and `stash_decision`, and in the ratified stash table. That is an operator decision. `docs/design.md` no longer claims reflog messages are carried |
+
+Tests (red first: the S2 tests against the index's pre-round
+`s2_budget.py` in a `/dev/shm` copy; the Rust test before the fix):
+`LiveBaselineReviewTests` (12; 11 red, `test_a_pair_missing_one_operation_is_not_evidence`
+kills a mutant only), amended `test_the_baseline_spread_and_each_adjacent_pair_are_reported`
+(pass 3's baseline 1.741, interpolated; red at 1.75), and
+`stash_popped_between_ref_read_and_reflog_read_is_drift_custody` (red:
+`GitChildFailed(Other)`).
+
+Mutants (scratch copies under `/dev/shm/q160-tmp`; sources restored):
+all 14 S2 mutants KILLED (both-gate ignoring ops; complete-on-step-only;
+FAIL never checked by pairs; no "also reads"; downgrade dropping pooled
+reasons; equal weights; no recovery check; recovery at the full budget;
+recovery load unchecked; dropped pass not a problem; window rule
+unpinned; pre-origin unchecked; reading always step; PASS needing
+latency pairs only). Rust: an empty stash on any failed reflog read is
+KILLED (the out-of-space assertion). Not killable with the available
+injection: an empty stash on every `GitChildFailed` (the scratch fault
+classifies as `SpaceExhausted`).
+
+Reviewer repros after the fix: E1/E6 FAIL with the breach reason and an
+"also reads" reason; E2 not evidence (4 passes, 800 s dropped); E3
+INCONCLUSIVE (recovery); E4 pair errors 0.005 to 0.008 (were 0.013 to
+0.058); E5 unchanged (finding 4, open); E7b names `git +32.0%`.
+
+Open (review round):
+- Finding 4: load correlated with the passes themselves is not separable
+  without listing processes, which R-N104 rules out for this instrument.
+  The way out is protocol, for example pass start times independent of
+  the host's load. Operator decision.
+- Finding 9: stash reflog messages as stash identity. Operator decision
+  (a key invalidation and a ledger format change).
+- The recovery check and the dropped-pass rule are alongside only;
+  gated `run` is unchanged.
+- A converge run whose passes are under about 240 s cannot be alongside
+  evidence. That follows from the ruled 300 s window.
+
+Validation (review round, sting, inside `nix develop`, target dir
+`cargo-target/q160`, after the last code edit; docs edited after it):
+
+| step | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+| `cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings` | exit 0 |
+| `cargo test -p bulkload-agent --locked --no-fail-fast` | exit 0: lib 673 passed, 5 ignored; every integration binary ok (`estate_converge` 21, `space_closure_cli` 10, `source_command_registry` 16, `refusal_taxonomy` 5) |
+| `cargo test ... --features fault-injection,io-trace --test fault_harness` | 91 passed |
+| `cargo test ... --features fault-injection,io-trace --test power_loss` | 12 passed |
+| `python3 tests/test_ci_contract.py` | 24 tests OK |
+| `python3 -m unittest crates/bulkload-bench/scripts/test_s2_budget.py` | 116 tests OK; `ruff check` and `ruff format --check` clean |
+| `just tla-render --check` | exit 0 |
+| `just tla-check` the 9 raced rows | exit 0: 2 PASS, 3 REACHED, 4 FAIL as expected, self-test INCONCLUSIVE; 484 s; `MC_ec_capture_raced` 135185 and `MC_ec_capture_raced_stash` 82086 states (unchanged; no model change this round) |

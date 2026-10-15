@@ -646,6 +646,10 @@ scenarios in `crates/bulkload-agent/tests/fault_harness.rs`).
   implemented on branch `feat/finish-line-20261015` (2026-10-15, not yet on `main`): `HeadMoved`,
   `IndexRewritten` and `NestedWorktreeMoved` drift custody, carried by the
   next converging pass (P87; EstateConverge `MC_ec_capture_raced`).
+- A stash push, pop or drop under a pass refuses too. OI-1003-Q161 rules it
+  drift custody; branch `feat/q160-q161-20261015` (2026-10-15, not yet on
+  `main`) records `StashMoved` and carries the stash in the next pass (P87's
+  stash row; EstateConverge `MC_ec_capture_raced_stash`).
 - Configuration, the shallow frontier, nested worktree custody and the
   omitted rebuildable roots moving under a pass also refuse. No ruling makes
   them drift classes.
@@ -826,7 +830,10 @@ as root").
   No gated run exists. Under OI-1003-Q152 (no freeze window) branch `feat/finish-line-20261015` (2026-10-15, not yet on `main`) adds
   `observe` and `alongside`: the same workload and load1 sampler for the
   length of a real run, starting nothing and touching no agent, joined
-  with the run's own intervals.
+  with the run's own intervals. OI-1003-Q160 rules such an observation
+  judged against the source's own live load (the OFF windows between
+  passes, no absolute load1 cap; each pass compared with the OFF windows on
+  both sides of it); branch `feat/q160-q161-20261015` implements it.
 - **The Q16 lock is not counted** (the table above).
 - P34's traced form (no mutating syscall and no lock event beneath the
   source root, over copies, carries and estimates) and P35's per-thread
