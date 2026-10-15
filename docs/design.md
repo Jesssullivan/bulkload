@@ -441,11 +441,22 @@ that note) before merge.**
 - **Native refs (#215).** A standalone first landing restores every
   carried ref natively inside its private stage (the repository bulkload
   creates): `refs/heads`, `refs/tags`, `refs/remotes`, `refs/notes` and any
-  other namespace, and the stash with the source's reflog order (a
-  capture with a stash carries `stash-order-v1`) and each stash commit's
-  subject as its message, which is the reflog message for `git stash
-  push`; a `git stash store -m` message is not carried, and a change to a
-  stash's message alone moves no key (open, 2026-10-15 review). Never
+  other namespace, and the stash exactly as `git stash list` shows it at
+  the source: its order and each entry's reflog message, byte for byte
+  (stash-order-v2, OI-1003-Q169: a capture with a stash carries
+  `stash-order-v2`, each entry's commit and reflog message, and the
+  message is part of each entry's identity in the capture key, in the
+  ledger's stash row and in the stash table, so a message-only change at
+  the source moves the key and converges as a rewrite). The format change
+  moved the key of every checkout with a stash once, on purpose: its
+  retained capture is re-captured at the next pass. A capture taken
+  before Q169 (`stash-order-v1`) still applies, with each commit's
+  subject as its message (`stash-messages-inferred`); a ref ledger or ref
+  intent written before Q169 decodes through its own layout (a ledger's
+  stash row then names its entries by commit, and is upgraded to the
+  destination's entries, messages included, the first time it names them,
+  `stash-ledger-upgraded`); a pending v1 intent is resolved against the
+  destination's stash; anything else refuses `FRAME_CODEC`. Never
   natively: `refs/carry/**`, `refs/carry-*/**`, `refs/stash` (its own table),
   per-worktree refs, `refs/remotes/*/HEAD`, and any ref that is a symref at
   the destination. Provenance under `refs/carry/v1/<SOURCE>/<instance>/` is
@@ -946,6 +957,19 @@ before the observation. This removes linear drift in the source's own
 load; load that rises and falls with the passes themselves is not
 separable, and the instrument lists no processes to separate it (R-N104).
 Such evidence is labelled `alongside, live baseline (OI-1003-Q160)`.
+During an S2-measured run the passes start on a schedule fixed (or
+seeded-random) and recorded in advance, never on the host's load
+(OI-1003-Q168): `s2_budget.py schedule` writes it (slot times, or a first
+time, period and pass count with a seeded jitter, sealed by a digest),
+`observe --schedule` records it in the observation at its start, and
+`drive` starts each pass at its slot's time, marking it with its slot and
+the schedule's digest and waiting for it to exit. `alongside --evidence`
+refuses evidence unless the observation recorded a valid schedule made
+before it began, every pass names a slot of it, no slot has two passes,
+every slot inside the observation has a pass, and every pass started
+within 5 s of its slot (deviations are reported in the verdict, the
+summary and an `evidence.tsv` `schedule` row). So pass placement cannot
+follow the source's own activity.
 
 ## Wire v6
 

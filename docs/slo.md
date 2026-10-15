@@ -953,6 +953,80 @@ Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
   `stash_dropped_during_capture_is_drift_custody`, and
   `r3_stash_reflog_round_trip_across_unguarded_windows_is_drift_custody`.
 
+## Amendment 2026-10-15 (ruled, later): S2 passes on a schedule recorded in advance, stash-order-v2 (OI-1003-Q168, Q169)
+
+Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
+
+- **During an S2-measured run, pass start times come from a schedule
+  recorded in advance, never from host load (OI-1003-Q168).** The schedule
+  is fixed (slot times) or seeded-random (a first time, a period, a pass
+  count and a uniform jitter drawn from a recorded seed, which re-derives
+  from those parameters alone), sealed by a digest, and made before any of
+  its slots (`s2_budget.py schedule`). `observe --schedule` records it in
+  the observation at its start; `drive` starts each pass at its slot's
+  time, marks it with its slot and the schedule's digest, and waits for it
+  to exit (never ended early, R-N11; it never reads the host's load). A
+  pass still running at the next slot's time makes that pass late; a slot
+  already past when the drive began is recorded as skipped, never run
+  late, as a `skip` record. `alongside --evidence` verifies the schedule
+  was followed and refuses evidence otherwise: the observation recorded a
+  valid schedule made before it began; the observation covers the whole
+  schedule (no slot before its origin or within 5 s of its end, so which
+  slots are measured is never chosen by when the run started or stopped);
+  every pass that did not end before the observation began names a slot
+  of it; no slot has two passes, none was skipped and none inside the
+  observation lacks a pass; every pass exited 0 (a pass that failed or
+  refused, or recorded no exit status, is not evidence: a failure under
+  load would correlate with neo's activity; this lane's choice, the
+  operator may relax it to a stated deviation); the passes were started
+  by `drive` on the observed host (its `drive` record names the host and
+  its monotonic clock), and every pass started within 5 s of its slot
+  measured on the observed host's monotonic clock against the
+  observation's own origin, with the drive's wall-clock marks within 2 s
+  of that clock. The deviations (on the observer's clock and on the
+  drive's), skews, failed, skipped and outside slots are reported (the
+  verdict's `schedule`, `summary.md`, an `evidence.tsv` `schedule` row).
+  `drive` must therefore run on the observed host.
+  This answers the 2026-10-15 review's finding 4 by protocol: pass
+  placement cannot correlate with neo's own activity; load that the passes
+  themselves cause is bulkload's cost. Proof: `ScheduleTests` in
+  `test_s2_budget.py`, two of them live drives.
+- **stash-order-v2: a stash entry is its commit and its reflog message
+  (OI-1003-Q169).** The source's stash list is read as each entry's commit
+  and reflog message; the capture key hashes both, a capture with a stash
+  carries `stash-order-v2` (that list, byte for byte), the destination's
+  ledger stash row (`LandedStash`) records both, and the stash table
+  (T1 to T6) compares entries by both, storing each entry under its own
+  message (an empty one and one that is not UTF-8 included). So a
+  converged stash is the source's `git stash list` exactly, messages and
+  order; a message-only change at the source moves the key (a `StashMoved`
+  drift row when it races a pass) and converges as a rewrite (T5); one at
+  the destination is the destination's (T6). **Deliberate invalidation:**
+  the key of every checkout with a stash changed once with the format, so
+  its retained capture is re-captured at its next pass (a checkout with
+  no stash keeps its key). Old records still decode or refuse typed,
+  never misread: a capture taken before Q169 (`stash-order-v1`) applies
+  with each commit's subject, folded as Git folds a reflog message, as its
+  message (`stash-messages-inferred`); a ref ledger or ref intent written
+  before Q169 has its own prefix and decodes through its own layout (a
+  ledger's stash row then names entries by commit, and is upgraded to the
+  destination's entries the first time it names them,
+  `stash-ledger-upgraded`; a landing whose source messages differed from
+  the subjects is then rewritten once, T5); a pending v1 intent is
+  resolved against the destination's stash; any other prefix or layout
+  refuses `FRAME_CODEC`. The EstateConverge model needs no change: its
+  stash values are opaque ids, one per entry. Proof:
+  `p85_the_stash_list_is_the_sources_exactly_messages_and_order`
+  (capture, apply, then pushes, a pop, a drop, a stored message and a
+  message-only change, each converged to the source's `git stash list`),
+  `p85_a_source_message_git_would_fold_lands_folded_and_later_pushes_land`
+  (a message Git itself would never write, from a libgit2 tool or a
+  hand-edited log, lands folded as Git folds every reflog message it
+  writes, counted `stash-message-folded`: the list then equals the
+  source's up to Git's normalization, and later pushes still land),
+  `a_stash_message_is_part_of_the_key_and_the_capture`, and the stash
+  table, decode and store rows in `native_refs/tests.rs`.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
