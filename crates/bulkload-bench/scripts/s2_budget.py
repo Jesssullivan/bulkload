@@ -164,10 +164,36 @@ labels it evidence only under the alongside protocol: every kept window at
 least 300 s, at least five, alternating OFF and ON once adjacent windows of
 one state are merged (OFF first and last, at least two ON), every ON window
 with its whole settle before its pass, the pinned gate, AC power at every window
-boundary and the OFF baseline under R-N81's load limit; coordinator quiet is
-not asked for (the source stays live, Q152), and the ON runs' priority and
+boundary and recorded load1 in every window; coordinator quiet is not asked
+for (the source stays live, Q152), and the ON runs' priority and
 source-write counters are not seen (the run's own counters lines carry
-them).
+them). Such evidence is labelled `alongside, live baseline (OI-1003-Q160)`.
+Live baseline (OI-1003-Q160): alongside a real run the OFF windows between
+passes are the baseline, with no absolute load1 cap (R-N81's 2.5 is amended
+for alongside runs only; a gated `run` keeps it); the budget is unchanged,
++25 % p95 and +2.0 load1 over that baseline. Because the host's own load
+can drift, the verdict reports the OFF windows' load1 levels and their
+spread (still INCONCLUSIVE over half the budget), and compares each ON
+window with the OFF windows on both sides of it, interpolated in time to
+the pass, which removes a linear drift whatever the windows' lengths
+(`live_baseline`). It is judged gate by gate (`judge_pairs`): a pooled PASS
+stands only when every pair passes both gates; a pooled FAIL stands when
+every pair fails a gate that failed pooled, and a pair that also overruns
+the other gate adds a reason, never downgrading it; otherwise the verdict
+is INCONCLUSIVE, keeping the pooled reasons and naming each pair, its
+reading (the gated metric furthest over) and its baseline drift. A PASS
+also needs the OFF windows after passes free of a recovery tail: pooled,
+their first settled half may read at most half the budget over their
+second, on p95 and on lag-corrected load1 (`recovery_after_passes`), since
+a pass's cost that outlasts it sits on both sides of every pair. Evidence
+needs every pair compared on every gated metric, the window rule pinned
+(--min-window-seconds 300), no pass dropped as a short ON window (every
+pass is judged; dropped passes and their seconds are reported), and no
+recorded pass ending within one settle plus 300 s before the observation
+began (passes before it are recorded, never dropped silently). The pair
+rule removes linear drift only: host load that rises and falls with the
+passes themselves (an agent quiet while bulkload runs) is not separable,
+and the instrument never lists processes to separate it (R-N11, R-N104).
 
 Output: OUT/trace.json (config, host, every sample, windows, verdict),
 OUT/summary.md, and OUT/on-runs/ (a log and a run_dir per ON run). The work
@@ -651,7 +677,10 @@ def alongside_problems(config: dict, gate: dict) -> list[str]:
     """Why an observation alongside a real run (#165) is not evidence, or []:
     its kept windows are the run's own intervals, so each must be long
     enough on its own, and there must be enough of them. No coordinator quiet
-    and no ON-command settings apply (OI-1003-Q152: the source stays live)."""
+    and no ON-command settings apply (OI-1003-Q152: the source stays live),
+    and no absolute load1 cap: the OFF windows between passes are the
+    baseline (OI-1003-Q160). The live baseline's own checks need the
+    verdict and are `live_baseline_problems`."""
     out = []
     if (config.get("window_seconds") or 0) < EVIDENCE_MIN_WINDOW:
         out.append(
@@ -681,7 +710,358 @@ def alongside_problems(config: dict, gate: dict) -> list[str]:
         )
     if config.get("open_interval"):
         out.append("an ON interval was still open when the observation ended")
+    # OI-1003-Q160 review: every pass is judged. The window rule is pinned,
+    # as the gate is, and a pass whose ON window fell under it and was
+    # dropped was never compared with anything.
+    if config.get("min_window_seconds") != EVIDENCE_MIN_WINDOW:
+        out.append(
+            "evidence uses the SLO protocol unchanged: min_window_seconds is "
+            f"pinned at {EVIDENCE_MIN_WINDOW:.0f} "
+            f"(got {config.get('min_window_seconds')})"
+        )
+    dropped = [w for w in config.get("dropped_windows") or [] if w["state"] == ON]
+    if dropped:
+        seconds = sum(w["end"] - w["start"] - w.get("lead_s", 0.0) for w in dropped)
+        many = len(dropped) != 1
+        out.append(
+            f"evidence judges every pass (OI-1003-Q160): {len(dropped)} "
+            f"pass{'es' if many else ''} ({seconds:.0f} s of pass time) "
+            f"{'were' if many else 'was'} dropped as ON windows under "
+            f"{config.get('min_window_seconds') or 0:.0f} s, never compared"
+        )
+    # The first OFF window is the only baseline with no pass of this
+    # observation before it; a recorded pass that ended shortly before the
+    # observation began leaves its tail in it.
+    clear = gate.get("settle_seconds", 0.0) + EVIDENCE_MIN_WINDOW
+    for start, end in config.get("pre_origin_intervals") or []:
+        if end > -clear:
+            out.append(
+                "evidence needs the first OFF window clear of a pass's tail "
+                f"(OI-1003-Q160): a recorded pass ended {-end:.0f} s before the "
+                f"observation began (under {clear:.0f} s)"
+            )
     return out + pinned_gate_problems(gate)
+
+
+RUN_EVIDENCE_LABEL = "gated run (R-N81)"
+ALONGSIDE_EVIDENCE_LABEL = "alongside, live baseline (OI-1003-Q160)"
+
+
+def settled_mid(window: dict, settle: float) -> float:
+    """The midpoint of a window's settled span (its whole span when the
+    settle is longer than it)."""
+    begin = min(window["start"] + settle, window["end"])
+    return (begin + window["end"]) / 2.0
+
+
+def live_baseline(per_window: list[dict], windows: list[dict], gate: dict) -> dict:
+    """The live baseline of an observation alongside a real run
+    (OI-1003-Q160): the OFF windows' load1 levels and their spread, and per
+    ON window its comparison with the nearest OFF window before and after
+    it. The baseline at the ON window is the two OFF levels (and p95s)
+    interpolated in time to its settled midpoint, so a baseline drifting
+    linearly across the pair cancels whatever the OFF windows' lengths; it
+    removes linear drift only. `drift_load1` is how far the baseline moved
+    across the pair (after minus before)."""
+    settle = gate["settle_seconds"]
+    mids = [settled_mid(window, settle) for window in windows]
+    offs = [w for w in per_window if w["state"] == OFF]
+    levels = [w["load1_level"] for w in offs]
+    known = [level for level in levels if level is not None]
+    spread = max(known) - min(known) if len(known) >= 2 else None
+    pairs = []
+    for position, window in enumerate(per_window):
+        if window["state"] != ON:
+            continue
+        before = next(
+            (p for p in range(position - 1, -1, -1) if per_window[p]["state"] == OFF),
+            None,
+        )
+        after = next(
+            (
+                p
+                for p in range(position + 1, len(per_window))
+                if per_window[p]["state"] == OFF
+            ),
+            None,
+        )
+        pair = {
+            "on": window["index"],
+            "off_before": None if before is None else per_window[before]["index"],
+            "off_after": None if after is None else per_window[after]["index"],
+            "baseline_load1": None,
+            "drift_load1": None,
+            "d_load1": None,
+            "d_p95": {m: None for m in METRICS},
+        }
+        if before is not None and after is not None:
+            span = mids[after] - mids[before]
+            weight = (mids[position] - mids[before]) / span if span > 0 else 0.5
+
+            def at(first: float, second: float) -> float:
+                return first + (second - first) * weight
+
+            low, high = per_window[before], per_window[after]
+            sides = (low["load1_level"], high["load1_level"])
+            if None not in sides and window["load1_level"] is not None:
+                base = at(*sides)
+                pair["baseline_load1"] = rounded(base)
+                pair["drift_load1"] = rounded(sides[1] - sides[0])
+                pair["d_load1"] = rounded(window["load1_level"] - base)
+            for metric in METRICS:
+                bracket = (low["p95_ms"][metric], high["p95_ms"][metric])
+                on = window["p95_ms"][metric]
+                if None not in bracket and on is not None and at(*bracket) > 0:
+                    pair["d_p95"][metric] = rounded(on / at(*bracket) - 1.0)
+        pairs.append(pair)
+    return {
+        "off_load1_levels": [rounded(level) for level in levels],
+        "off_load1_min": rounded(min(known)) if known else None,
+        "off_load1_max": rounded(max(known)) if known else None,
+        "off_load1_spread": rounded(spread),
+        "budget_load1": gate["budget_load1"],
+        "budget_p95": gate["budget_p95"],
+        "pairs": pairs,
+        "recovery": None,
+    }
+
+
+def gated_metrics(gate: dict) -> tuple[str, ...]:
+    return {"step": (STEP,), "each-op": OPS}.get(gate["gate_metric"], METRICS)
+
+
+def pair_latency(pair: dict, gate: dict) -> str | None:
+    """One pair's latency decision on its point estimates, by the gate
+    metric's rule: PASS, FAIL, or (gate `both`) MIXED when step and each-op
+    disagree; None when a gated metric is missing."""
+    budget = gate["budget_p95"]
+    d = pair["d_p95"]
+
+    def over(metrics) -> list[bool] | None:
+        values = [d[m] for m in metrics]
+        if None in values:
+            return None
+        return [value > budget + EPS for value in values]
+
+    step, ops = over((STEP,)), over(OPS)
+    step_status = None if step is None else ("FAIL" if any(step) else "PASS")
+    op_status = None if ops is None else ("FAIL" if any(ops) else "PASS")
+    if gate["gate_metric"] == "step":
+        return step_status
+    if gate["gate_metric"] == "each-op":
+        return op_status
+    if None in (step_status, op_status):
+        return None
+    return step_status if step_status == op_status else "MIXED"
+
+
+def pair_gates(pair: dict, gate: dict) -> dict:
+    """One pair's decision per gate, on its point estimates (None when it
+    has no complete comparison)."""
+    load = None
+    if pair["d_load1"] is not None:
+        load = "FAIL" if pair["d_load1"] > gate["budget_load1"] + EPS else "PASS"
+    return {"latency": pair_latency(pair, gate), "load1": load}
+
+
+def pair_reading(pair: dict, gate: dict, name: str) -> str:
+    """What one pair reads on one gate: load1 with the baseline's drift, or
+    the gated metric furthest over (ties: step first)."""
+    if name == "load1":
+        return (
+            f"load1 {pair['d_load1']:+.2f} (baseline drift {pair['drift_load1']:+.2f})"
+        )
+    known = [m for m in gated_metrics(gate) if pair["d_p95"][m] is not None]
+    worst = max(known, key=lambda m: pair["d_p95"][m])
+    return f"p95 {worst} {pair['d_p95'][worst]:+.1%}"
+
+
+def judge_pairs(
+    pairs: list[dict],
+    gate: dict,
+    pooled: dict,
+    status: str,
+    over: dict,
+) -> tuple[str, list[str]]:
+    """The verdict against the live baseline (OI-1003-Q160), gate by gate.
+    `pooled` is each gate's pooled decision ({"latency", "load1"}), `status`
+    the pooled PASS or FAIL and `over` each gate's pooled FAIL reasons.
+
+    A pooled PASS stands only when every pair passes every gate. A pooled
+    FAIL stands when every pair fails a gate that failed pooled; a pair
+    that also overruns a gate that passed pooled adds a reason and never
+    downgrades it. Otherwise the verdict is INCONCLUSIVE, keeping the
+    pooled reasons and naming each pair that does not hold, and a pair with
+    no comparison is never judged."""
+    where = {
+        id(pair): (
+            f"ON window {pair['on']} against OFF windows {pair['off_before']} "
+            f"and {pair['off_after']}"
+        )
+        for pair in pairs
+    }
+    decided = [(pair, pair_gates(pair, gate)) for pair in pairs]
+    missing = [
+        f"live baseline (OI-1003-Q160): {where[id(pair)]} has no comparison, so "
+        "drift in the host's own load cannot be told from bulkload's"
+        for pair, gates in decided
+        if None in gates.values()
+    ]
+    compared = [(pair, gates) for pair, gates in decided if None not in gates.values()]
+
+    def against(name: str) -> list[str]:
+        return [
+            f"live baseline (OI-1003-Q160): {where[id(pair)]} reads "
+            f"{pair_reading(pair, gate, name)} ({name} {gates[name]}), so the "
+            f"pooled {name} {pooled[name]} does not hold pair by pair"
+            for pair, gates in compared
+            if gates[name] != pooled[name]
+        ]
+
+    names = ("latency", "load1")
+    if status == "PASS":
+        disagree = [line for name in names for line in against(name)]
+        if missing or disagree:
+            return "INCONCLUSIVE", missing + disagree
+        return "PASS", []
+    failing = [name for name in names if pooled[name] == "FAIL"]
+    standing = [name for name in failing if not missing and not against(name)]
+    if not standing:
+        pooled_reasons = [line for name in failing for line in over[name]]
+        disagree = [line for name in failing for line in against(name)]
+        return "INCONCLUSIVE", pooled_reasons + missing + disagree
+    reasons = [line for name in standing for line in over[name]]
+    for name in failing:
+        if name not in standing:
+            reasons += against(name)
+    for name in names:
+        if pooled[name] != "PASS":
+            continue
+        reasons += [
+            f"live baseline (OI-1003-Q160): {where[id(pair)]} also reads "
+            f"{pair_reading(pair, gate, name)} ({name} {gates[name]}) against "
+            f"the pooled {name} PASS; the {' and '.join(standing)} FAIL stands "
+            "on every pass"
+            for pair, gates in compared
+            if gates[name] != "PASS"
+        ]
+    return "FAIL", reasons
+
+
+def recovery_after_passes(
+    windows: list[dict],
+    buckets: list[dict],
+    estimates: list[tuple[list[tuple[float, float]], float | None]],
+    first_pass: float | None,
+    gate: dict,
+) -> dict:
+    """How much higher the OFF windows after a pass read in their first
+    settled half than in their second (OI-1003-Q160): a pass's cost that
+    outlasts it (a cache refill, writeback, a stall's missed ticks) sits in
+    the OFF baseline on both sides of every pair, where neither the pair
+    rule nor the spread can see it. Pooled over every OFF window that
+    starts at or after the first pass (kept or dropped): each window's
+    settled 30 s blocks split into halves (the middle block of an odd count
+    left out) for p95, and its settled load1 rows split at its settled
+    midpoint, each half lag-corrected (`load1_level`)."""
+    settle = gate["settle_seconds"]
+    early = {m: [] for m in METRICS}
+    late = {m: [] for m in METRICS}
+    levels = {"early": [], "late": []}
+    used = []
+    for window, bucket, (rows, _) in zip(windows, buckets, estimates, strict=True):
+        if window["state"] != OFF or first_pass is None:
+            continue
+        if window["start"] + EPS < first_pass:
+            continue
+        used.append(window["index"])
+        blocks = [block for _, block in sorted(bucket["blocks"].items())]
+        half = len(blocks) // 2
+        for block in blocks[:half]:
+            for metric in METRICS:
+                early[metric].extend(block[metric])
+        for block in blocks[len(blocks) - half :]:
+            for metric in METRICS:
+                late[metric].extend(block[metric])
+        mid = settled_mid(window, settle)
+        first = [row for row in rows if row[0] < mid]
+        second = [row for row in rows if row[0] >= mid]
+        if first and second:
+            levels["early"].append((len(first), load1_level(first, None)))
+            levels["late"].append((len(second), load1_level(second, first[-1])))
+
+    def pooled_level(parts: list[tuple[int, float | None]]) -> float | None:
+        total = sum(n for n, level in parts if level is not None)
+        if not total:
+            return None
+        return sum(n * level for n, level in parts if level is not None) / total
+
+    d_p95 = {}
+    for metric in METRICS:
+        high, low = p95(early[metric]), p95(late[metric])
+        d_p95[metric] = rounded(high / low - 1.0) if high is not None and low else None
+    high, low = pooled_level(levels["early"]), pooled_level(levels["late"])
+    return {
+        "off_windows": used,
+        "d_p95": d_p95,
+        "d_load1": rounded(high - low) if None not in (high, low) else None,
+    }
+
+
+def recovery_reasons(recovery: dict, gate: dict) -> list[str]:
+    """Why the OFF baseline holds a pass's tail: its first half over its
+    second by more than half the budget on a gated metric or on load1."""
+    over = []
+    for metric in gated_metrics(gate):
+        value = recovery["d_p95"][metric]
+        if value is not None and value > gate["budget_p95"] / 2 + EPS:
+            over.append(f"p95 {metric} {value:+.1%}")
+    if (
+        recovery["d_load1"] is not None
+        and recovery["d_load1"] > gate["budget_load1"] / 2 + EPS
+    ):
+        over.append(f"load1 {recovery['d_load1']:+.2f}")
+    if not over:
+        return []
+    return [
+        "live baseline (OI-1003-Q160): recovery after a pass: the OFF windows "
+        f"after passes ({', '.join(map(str, recovery['off_windows']))}) read "
+        f"{' and '.join(over)} in their first settled half over their second, "
+        f"more than half the budget (+{gate['budget_p95'] / 2:.1%}, "
+        f"+{gate['budget_load1'] / 2:.2f}), so the baseline holds a pass's tail "
+        "and a PASS cannot be read from it"
+    ]
+
+
+def live_baseline_problems(
+    baseline: dict, per_window: list[dict], gate: dict
+) -> list[str]:
+    """Why an alongside observation's live baseline is not evidence
+    (OI-1003-Q160): every window must have recorded load1, the OFF
+    windows' load spread must be known, and every ON window must have its
+    comparison with the OFF windows on both sides, on every gated metric."""
+    out = []
+    for w in per_window:
+        if not w["load_n"]:
+            out.append(
+                f"evidence needs recorded load1 in every window (OI-1003-Q160): "
+                f"window {w['index']} ({w['state']}) has none after settle"
+            )
+    if baseline["off_load1_spread"] is None:
+        out.append(
+            "evidence reports the live baseline's load spread (OI-1003-Q160): "
+            "it needs a load1 level in at least 2 OFF windows"
+        )
+    for pair in baseline["pairs"]:
+        if pair["d_load1"] is None or any(
+            pair["d_p95"][m] is None for m in gated_metrics(gate)
+        ):
+            out.append(
+                f"evidence compares each ON window with the OFF windows on "
+                f"both sides (OI-1003-Q160): ON window {pair['on']} has no "
+                "complete comparison"
+            )
+    return out
 
 
 def load1_level(
@@ -891,7 +1271,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     windows = trace["windows"]
     settle = gate["settle_seconds"]
     budget, budget_load = gate["budget_p95"], gate["budget_load1"]
-    gated = {"step": (STEP,), "each-op": OPS}.get(gate["gate_metric"], METRICS)
+    gated = gated_metrics(gate)
     starts = [w["start"] for w in windows]
 
     def locate(t: float) -> int | None:
@@ -1063,7 +1443,10 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     # R-N81: a gated sample is taken only on AC power with load1 under the
     # limit. Under evidence, power is checked at every window boundary and
     # each OFF window's lag-corrected level (the host baseline, without the
-    # previous ON window's EWMA tail) must stay under LOAD_LIMIT.
+    # previous ON window's EWMA tail) must stay under LOAD_LIMIT. Alongside
+    # a real run (OI-1003-Q160) the load cap does not apply: the source is
+    # live (Q152), its OFF windows are the baseline whatever its load, and
+    # `live_baseline` guards that baseline instead. Power still applies.
     rn81 = []
     if evidence:
         for w in windows:
@@ -1073,7 +1456,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                         f"R-N81: window {w['index']} {key.replace('_', ' ')} "
                         f"was {w.get(key, 'unrecorded')}, not AC power"
                     )
-        for w in per_window:
+        for w in per_window if not alongside else []:
             level = w["load1_level"]
             if w["state"] == OFF and level is not None and level >= LOAD_LIMIT:
                 rn81.append(
@@ -1176,15 +1559,17 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     else:
         latency_status = "INCONCLUSIVE"
 
-    over, undecided = [], []
+    over_by = {"latency": [], "load1": []}
+    undecided = []
     if latency_status == "FAIL":
         if STEP in gated:
-            over.append(p95_reason(STEP, "exceeds"))
+            over_by["latency"].append(p95_reason(STEP, "exceeds"))
         for metric in OPS if gate["gate_metric"] != "step" else ():
             if op_lower[metric] is not None and op_lower[metric] > budget + EPS:
-                over.append(p95_reason(metric, "exceeds"))
+                over_by["latency"].append(p95_reason(metric, "exceeds"))
     if load_status == "FAIL":
-        over.append(load1_reason("exceeds"))
+        over_by["load1"].append(load1_reason("exceeds"))
+    over = over_by["latency"] + over_by["load1"]
     if gate["gate_metric"] == "both" and step_status != op_status:
         undecided.append(
             f"the latency gates disagree (step {step_status}, each-op "
@@ -1236,10 +1621,52 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         else:
             status = "INCONCLUSIVE"
             reasons = undecided or ["the bounds do not decide the budget"]
+    # OI-1003-Q160: alongside a real run the baseline is the host's own
+    # live load, which can drift. Each ON window is compared with the OFF
+    # windows on both sides of it, interpolated to its time, which cancels
+    # a linear drift. Gate by gate: a pooled PASS stands only when every
+    # pair passes, a pooled FAIL when every pair fails a gate that failed
+    # pooled. A PASS also needs the OFF windows after passes free of a
+    # recovery tail, which would sit on both sides of every pair.
+    baseline = None
+    dropped_on = None
+    if alongside:
+        dropped = [
+            w for w in config.get("dropped_windows") or [] if w.get("state") == ON
+        ]
+        dropped_on = {
+            "windows": len(dropped),
+            "pass_seconds": rounded(
+                sum(w["end"] - w["start"] - w.get("lead_s", 0.0) for w in dropped), 3
+            ),
+        }
+        baseline = live_baseline(per_window, windows, gate)
+        first_pass = min(
+            [w["start"] + w.get("lead_s", 0.0) for w in dropped]
+            + [w["start"] + w.get("lead_s", 0.0) for w in windows if w["state"] == ON],
+            default=None,
+        )
+        baseline["recovery"] = recovery_after_passes(
+            windows, buckets, estimates, first_pass, gate
+        )
+        if status in ("PASS", "FAIL"):
+            status, reasons = judge_pairs(
+                baseline["pairs"],
+                gate,
+                {"latency": latency_status, "load1": load_status},
+                status,
+                over_by,
+            )
+        if status == "PASS":
+            tail = recovery_reasons(baseline["recovery"], gate)
+            if tail:
+                status, reasons = "INCONCLUSIVE", tail
     if not config.get("evidence"):
         evidence_problems = ["the run was made without --evidence"]
     else:
         evidence_problems = protocol_problems(config, trace.get("gate", {})) + rn81
+        if baseline is not None:
+            evidence_problems += live_baseline_problems(baseline, per_window, gate)
         if trace.get("schema") != SCHEMA:
             evidence_problems.append(
                 f"trace schema {trace.get('schema')} is not {SCHEMA}"
@@ -1250,11 +1677,20 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                     f"analyze override {key}={overrides[key]} differs from the "
                     f"recorded {recorded.get(key)}"
                 )
+    if evidence_problems:
+        evidence_label = None
+    elif alongside:
+        evidence_label = ALONGSIDE_EVIDENCE_LABEL
+    else:
+        evidence_label = RUN_EVIDENCE_LABEL
     return {
         "status": status,
         "mode": mode,
         "evidence": not evidence_problems,
+        "evidence_label": evidence_label,
         "evidence_problems": evidence_problems,
+        "live_baseline": baseline,
+        "dropped_on": dropped_on,
         "reasons": reasons,
         "raw_comparison": raw,
         "gate": gate,
@@ -1673,7 +2109,12 @@ def session(args: argparse.Namespace, states: list[str], workdir: Path) -> dict:
 
 def render_summary(trace: dict, verdict: dict) -> str:
     config, host = trace["config"], trace["host"]
-    label = "" if verdict["evidence"] else f" ({NOT_EVIDENCE})"
+    if not verdict["evidence"]:
+        label = f" ({NOT_EVIDENCE})"
+    elif config.get("alongside"):
+        label = f" (evidence: {verdict['evidence_label']})"
+    else:
+        label = ""
     kind = "A/A noise run" if config["aa"] else "S2 budget run"
     if config.get("alongside"):
         kind = "S2 budget alongside a real run"
@@ -1727,7 +2168,11 @@ def render_summary(trace: dict, verdict: dict) -> str:
         (
             f"- ON windows: the run's own intervals (`{config.get('intervals')}`); "
             f"{len(config.get('dropped_windows', []))} window(s) under "
-            f"{config.get('min_window_seconds')} s dropped; nothing was started"
+            f"{config.get('min_window_seconds')} s dropped; "
+            f"{passes_dropped(verdict.get('dropped_on'))} dropped with them, "
+            "never compared; "
+            f"{len(config.get('pre_origin_intervals') or [])} pass(es) ended "
+            "before the observation began; nothing was started"
             if config.get("alongside")
             else f"- ON command: `{' '.join(config['on_command']) or '(none, A/A)'}` at "
             f"priority `{config['priority']}`, repeat={config['repeat']}"
@@ -1787,13 +2232,53 @@ def render_summary(trace: dict, verdict: dict) -> str:
             f"{len(raw.get('runs', []))} | "
             f"{raw.get('power_start', '?')}/{raw.get('power_end', '?')} |"
         )
+    baseline = verdict.get("live_baseline")
+    if baseline is not None:
+        levels = ", ".join(num(v, ".2f") for v in baseline["off_load1_levels"])
+        recovery = baseline.get("recovery") or {"d_p95": {}, "d_load1": None}
+        lines += [
+            "",
+            "Live baseline (OI-1003-Q160): the OFF windows between passes, with "
+            "no absolute load1 cap. OFF load1 levels "
+            f"{levels or '-'}; spread "
+            f"{num(baseline['off_load1_spread'], '.2f')} (noise floor: half "
+            f"the budget, {gate['budget_load1'] / 2:.2f}). Recovery after a "
+            "pass (the OFF windows after passes, first settled half over "
+            f"second): p95 step {pct(recovery['d_p95'].get(STEP))}, load1 "
+            f"{num(recovery['d_load1'], '+.2f')} (a PASS needs both within "
+            "half the budget). Each ON window against the OFF windows on both "
+            "sides, interpolated to its time (this removes linear drift only):",
+            "",
+            "| ON window | OFF before | OFF after | baseline load1 | drift "
+            "| d_load1 | d_p95 step |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for pair in baseline["pairs"]:
+            lines.append(
+                f"| {pair['on']} | {pair['off_before']} | {pair['off_after']} | "
+                f"{num(pair['baseline_load1'], '.2f')} | "
+                f"{num(pair['drift_load1'], '+.2f')} | "
+                f"{num(pair['d_load1'], '+.2f')} | {pct(pair['d_p95'][STEP])} |"
+            )
     return "\n".join(lines) + "\n"
+
+
+def passes_dropped(dropped: dict | None) -> str:
+    """`N pass(es) (S s)` of pass time dropped as short ON windows."""
+    if not dropped:
+        return "0 passes (0 s)"
+    many = dropped["windows"] != 1
+    return (
+        f"{dropped['windows']} pass{'es' if many else ''} "
+        f"({dropped['pass_seconds']:.0f} s)"
+    )
 
 
 def emit(verdict: dict) -> None:
     say(
         f"verdict status={verdict['status']} mode={verdict['mode']} "
         f"evidence={str(verdict['evidence']).lower()} "
+        f"evidence_label={verdict['evidence_label']!r} "
         f"delta_p95={verdict['delta_p95']} worst={verdict['worst_metric']} "
         f"delta_load1={verdict['delta_load1']} noise_p95={verdict['noise_p95']} "
         f"noise_load1={verdict['noise_load1']} raw={verdict['raw_comparison']}"
@@ -1898,7 +2383,10 @@ def command_analyze(args: argparse.Namespace) -> int:
 # --- alongside a real run (#165) ---------------------------------------------
 
 ALONGSIDE_SCHEMA = "bulkload.s2-alongside.v1"
-ALONGSIDE_RULINGS = RULINGS + ", OI-1003-Q152 (no freeze window), OI-1003-Q155"
+ALONGSIDE_RULINGS = (
+    RULINGS + ", OI-1003-Q152 (no freeze window), OI-1003-Q155, "
+    "OI-1003-Q160 (alongside: the live OFF windows are the baseline)"
+)
 # Power is sampled this often while observing (R-N81), and rows are fsynced
 # this often, so an observation the instrument does not finish keeps them.
 POWER_EVERY_S = 60.0
@@ -2287,6 +2775,12 @@ def alongside_trace(
     settle = gate["settle_seconds"]
     relative = [(start - origin, end - origin) for start, end in intervals]
     kept, dropped = derive_windows(relative, span, min_window, lead=settle)
+    # Passes that ended before the observation began are recorded, never
+    # dropped silently: one ending shortly before leaves its tail in the
+    # first OFF window (OI-1003-Q160 review).
+    pre_origin = [
+        [rounded(start, 3), rounded(end, 3)] for start, end in relative if end <= 0.0
+    ]
     # An observation that never recorded its end was stopped before it
     # closed its record (killed, or its host lost): what it missed after
     # its last row is unknown, and so is whether its tail is whole.
@@ -2340,6 +2834,7 @@ def alongside_trace(
             "short_leads": short_leads,
             "min_window_seconds": min_window,
             "dropped_windows": dropped,
+            "pre_origin_intervals": pre_origin,
             "source": header["config"]["source"],
             "workdir": header["config"]["workdir"],
             "out": header["config"]["out"],
@@ -2393,7 +2888,12 @@ def evidence_rows(trace: dict, verdict: dict) -> list[list[str]]:
         return str(value)
 
     gate = verdict["gate"]
-    label = "evidence" if verdict["evidence"] else "not-evidence"
+    if not verdict["evidence"]:
+        label = "not-evidence"
+    elif trace["config"].get("alongside"):
+        label = verdict["evidence_label"]
+    else:
+        label = "evidence"
     out = [["kind", "name", "value", "lower", "upper", "budget", "decision", "label"]]
     out.append(
         [
@@ -2459,6 +2959,62 @@ def evidence_rows(trace: dict, verdict: dict) -> list[list[str]]:
             label,
         ]
     )
+    dropped = verdict.get("dropped_on")
+    if dropped is not None:
+        # OI-1003-Q160 review: passes dropped as short ON windows.
+        out.append(
+            [
+                "dropped",
+                "on_windows",
+                cell(dropped["windows"]),
+                "-",
+                "-",
+                "-",
+                f"pass seconds {dropped['pass_seconds']:.0f}",
+                label,
+            ]
+        )
+    baseline = verdict.get("live_baseline")
+    if baseline is not None:
+        recovery = baseline.get("recovery") or {"d_p95": {}, "d_load1": None}
+        out.append(
+            [
+                "recovery",
+                "off_first_half_over_second",
+                cell(recovery["d_load1"]),
+                "-",
+                "-",
+                cell(gate["budget_load1"] / 2),
+                f"d_p95 step {cell(recovery['d_p95'].get(STEP))}",
+                label,
+            ]
+        )
+        # OI-1003-Q160: the live baseline's spread and every adjacent pair.
+        out.append(
+            [
+                "baseline",
+                "off_load1_spread",
+                cell(baseline["off_load1_spread"]),
+                cell(baseline["off_load1_min"]),
+                cell(baseline["off_load1_max"]),
+                cell(gate["budget_load1"] / 2),
+                "-",
+                label,
+            ]
+        )
+        for pair in baseline["pairs"]:
+            out.append(
+                [
+                    "pair",
+                    f"{pair['on']}:ON vs {pair['off_before']},{pair['off_after']}:OFF",
+                    cell(pair["d_load1"]),
+                    cell(pair["baseline_load1"]),
+                    cell(pair["drift_load1"]),
+                    cell(gate["budget_load1"]),
+                    f"d_p95 step {cell(pair['d_p95'][STEP])}",
+                    label,
+                ]
+            )
     for raw, stats in zip(trace["windows"], verdict["windows"], strict=True):
         out.append(
             [
@@ -2511,6 +3067,8 @@ def command_alongside(args: argparse.Namespace) -> int:
     say(
         f"alongside windows={len(trace['windows'])} "
         f"dropped={len(trace['config']['dropped_windows'])} "
+        f"dropped_passes={verdict['dropped_on']['windows']} "
+        f"dropped_pass_seconds={verdict['dropped_on']['pass_seconds']} "
         f"trace={out_dir / 'trace.json'} evidence={out_dir / 'evidence.tsv'}"
     )
     return 0

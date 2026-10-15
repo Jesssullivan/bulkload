@@ -279,3 +279,153 @@ fn p87_an_agent_working_through_every_pass_is_carried_by_the_next_converging_del
     assert_eq!(report.unaccounted, 0);
     assert!(report.passes(), "{}", report.to_json());
 }
+
+/// The stash an agent sees, newest first: each entry's commit and subject.
+fn stash_list(worktree: &Path) -> String {
+    let listed = Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(worktree)
+        .args(["reflog", "show", "--format=%H %gs", "refs/stash"])
+        .output()
+        .expect("git reflog");
+    // No stash at all is the empty list (refs/stash absent).
+    if listed.status.success() {
+        String::from_utf8(listed.stdout).unwrap()
+    } else {
+        String::new()
+    }
+}
+
+/// One capture raced by `race` (an agent's stash op under the byte pass):
+/// drift custody naming the stash, and nothing laid down.
+fn raced_stash_pass(
+    (src, dst): (&Path, &Path),
+    (plan, cstate, corpus, astate): (&Path, &Path, &Path, &Path),
+    race: &'static [&'static str],
+) {
+    // The agent also edits a note between passes, so the pass is no reuse
+    // hit and its export runs (the race fires inside it).
+    fs::write(src.join("notes.txt"), race.join(" ")).unwrap();
+    settle();
+    let landed = (view(dst), stash_list(dst));
+    let agent = fs::canonicalize(src).unwrap();
+    git_carry::mid_pass::arm(src, move || {
+        git_out(&agent, race);
+    });
+    let raced = captured(plan, cstate, corpus);
+    assert_eq!(raced.len(), 1);
+    assert_eq!(raced[0].0, "captured-with-drift", "{race:?}: {raced:?}");
+    assert!(
+        raced[0].2.contains(&"StashMoved \"refs/stash\"".to_owned()),
+        "{race:?}: {raced:?}"
+    );
+    let rows = applied(plan, corpus, astate);
+    assert_eq!(
+        rows,
+        vec![("refused", Some(BulkloadRefusal::CaptureDrifted.to_string()))],
+        "{race:?}"
+    );
+    assert_eq!((view(dst), stash_list(dst)), landed, "{race:?}");
+}
+
+/// The next quiet pass: no drift, and the apply converges the landing to
+/// the source, its stash in the source's order included.
+fn converging_pass(
+    (src, dst): (&Path, &Path),
+    (plan, cstate, corpus, astate): (&Path, &Path, &Path, &Path),
+) {
+    settle();
+    let quiet = captured(plan, cstate, corpus);
+    assert!(
+        matches!(quiet[0].0, "captured" | "capture-extended-from-drift"),
+        "{quiet:?}"
+    );
+    assert!(quiet[0].2.is_empty(), "{quiet:?}");
+    let rows = applied(plan, corpus, astate);
+    assert_eq!(rows[0].0, "workspace-restored", "{rows:?}");
+    assert_eq!(view(dst), view(src));
+    assert_eq!(stash_list(dst), stash_list(src));
+}
+
+// P87, the stash (OI-1003-Q161): an agent's `git stash push`, `pop` and
+// `drop` during a pass are drift custody like its commits and switches.
+// Each raced pass records `StashMoved` and lays nothing down; the next
+// quiet pass carries the new stash, and the landing converges to the
+// source with the stash present on the destination in the source's order.
+// Before Q161 each raced pass refused GIT_AUTHORITY_CHANGED.
+#[test]
+fn p87_an_agent_stashing_through_every_pass_is_carried_by_the_next_converging_delta() {
+    let root = Root::new("stash");
+    let (src, dst) = (root.join("src"), root.join("sting/src"));
+    let (plan, cstate, corpus, astate) = (
+        root.join("plan"),
+        root.join("capture-state"),
+        root.join("corpus"),
+        root.join("apply-state"),
+    );
+    fs::create_dir(&src).unwrap();
+    git_out(&src, &["init", "-q", "--template="]);
+    fs::write(src.join("a.txt"), b"alpha\n").unwrap();
+    fs::write(src.join("b.txt"), b"beta\n").unwrap();
+    git_out(&src, &["add", "."]);
+    git_out(&src, &["commit", "-q", "-m", "c1"]);
+    // A stash the agent made before the run.
+    fs::write(src.join("b.txt"), b"beta, stashed before the run\n").unwrap();
+    git_out(&src, &["stash", "push", "-q", "-m", "before the run"]);
+    fs::create_dir(root.join("sting")).unwrap();
+    add(&plan, &src, &dst, Some(&dst)).unwrap();
+    let paths = (src.as_path(), dst.as_path());
+    let state = (
+        plan.as_path(),
+        cstate.as_path(),
+        corpus.as_path(),
+        astate.as_path(),
+    );
+
+    // Pass 1, quiet: the first landing carries the stash.
+    converging_pass(paths, state);
+    assert_eq!(stash_list(&dst).lines().count(), 1);
+
+    // Pass 2: the agent stashes an edit while the capture runs (refs/stash,
+    // its reflog, the seat and the index move under the pass).
+    settle();
+    fs::write(src.join("a.txt"), b"alpha, an edit the agent stashes\n").unwrap();
+    settle();
+    raced_stash_pass(
+        paths,
+        state,
+        &["stash", "push", "-q", "-m", "agent, mid-pass"],
+    );
+    // Pass 3, quiet: two stashes on sting, newest first, as on the source.
+    converging_pass(paths, state);
+    assert_eq!(stash_list(&dst).lines().count(), 2);
+    assert!(stash_list(&dst)
+        .lines()
+        .next()
+        .is_some_and(|line| line.ends_with("agent, mid-pass")));
+
+    // Pass 4: the agent pops it back under the pass.
+    settle();
+    raced_stash_pass(paths, state, &["stash", "pop", "-q"]);
+    converging_pass(paths, state);
+    assert_eq!(stash_list(&dst).lines().count(), 1);
+    assert_eq!(
+        fs::read(dst.join("a.txt")).unwrap(),
+        fs::read(src.join("a.txt")).unwrap()
+    );
+
+    // Pass 6: the agent drops the last stash under the pass; refs/stash
+    // goes with it, and the converging delta leaves sting with no stash.
+    settle();
+    raced_stash_pass(paths, state, &["stash", "drop", "-q"]);
+    converging_pass(paths, state);
+    assert_eq!(stash_list(&dst), "");
+
+    // S4: the run closes with nothing unaccounted and nothing to review.
+    let ledger = ledger(&plan, &corpus, "neo", &[astate]).unwrap();
+    let report = crate::closure::Report::from_ledger(&ledger);
+    assert_eq!(report.unaccounted, 0);
+    assert!(report.passes(), "{}", report.to_json());
+}

@@ -2660,7 +2660,49 @@ pre-move state as a whole (the code also withdraws seats that drifted
 under the byte pass, which only the Rust rows check); HEAD and index moves
 are modelled for the main only; nested worktrees (including a HEAD moved
 away and back across the windows outside the export, review finding 4)
-and the stash reflog (which still refuses) are the Rust rows'.
+are the Rust rows'. The stash, which refused here, is drift custody since
+OI-1003-Q161 (next section).
+
+### OI-1003-Q161: captures raced by a stash (2026-10-15)
+
+Operator ruling OI-1003-Q161 (Linear TIN-4543): a `git stash push`, `pop`
+or `drop` during a capture pass is drift custody like a HEAD or index move:
+recorded (`StashMoved`, `git_carry.rs` `stash_drift`), the raced capture
+never laid down or reused, the next pass carrying the new stash. The code
+puts the stash reflog in the same two drift classes as HEAD and the index,
+so the stash path changes no protocol step: `Capture(i)`, `Begin(i)` and
+the poisoned key are unchanged, and only `RacedMoves(i)` grows. Under the
+new `SrcKinds` label `"stashrace"` the main's pass may be raced by a stash
+push (a new entry on top) or a drop (the newest entry removed; a pop is a
+drop with the seats, which this model's stash row does not carry). Rows
+without `"stashrace"` enable no new move, so their state spaces are
+unchanged. The two negative rows reuse #38's mutations on a stash-only
+source: `drift_key_reused` (the raced capture's key kept: the source drops
+the stash again, the next pass is a reuse hit on a capture no apply lays
+down, and the landing never converges) and `drift_applied` (`Begin`
+enabled on a capture whose export the stash raced). Rust rows: P87's stash
+row (`p87_an_agent_stashing_through_every_pass_is_carried_by_the_next_converging_delta`),
+`stash_pushed_during_capture_is_drift_custody`,
+`stash_dropped_during_capture_is_drift_custody` and
+`r3_stash_reflog_round_trip_across_unguarded_windows_is_drift_custody`.
+
+`just tla-check` of the nine rows that enable a raced move (the four new
+ones and #38's five), 2026-10-15, sting, `-workers 3`, nice 10, load
+average about 19 on 32 CPUs; each matched its expectation, total wall
+334 s, peak RSS 2004 MiB. `MC_ec_capture_raced` explores exactly its
+recorded 135185 distinct states, so restructuring `RacedMoves` changed
+nothing for `"race"` alone:
+
+| config | expect | outcome | violated | distinct | depth | wall |
+|---|---|---|---|---:|---:|---:|
+| `MC_ec_capture_raced_stash` (LiveSpec) | pass | PASS | - | 82086 | 72 | 51s |
+| `MC_ec_reach_stash_drift_carried` | reach | REACHED | Witness_DriftCarried | 2345 | 15 | 22s |
+| `MC_ec_neg_stash_drift_key_reused` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 4954 | - | 18s |
+| `MC_ec_neg_stash_drift_applied` | fail | FAIL | NoDriftedLanding | 63 | 5 | 19s |
+
+The other EstateConverge rows were not re-run: without `"race"` or
+`"stashrace"` in `SrcKinds`, `RacedMoves(i)` is the empty set exactly as
+before, so their state spaces are unchanged by construction.
 
 ### Findings (EstateConverge)
 

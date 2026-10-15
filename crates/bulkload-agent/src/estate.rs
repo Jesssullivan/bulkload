@@ -4461,9 +4461,14 @@ mod tests {
     }
 
     // N1, stash: refs/stash keeps its value throughout; only the reflog below
-    // it is rewritten and restored, so stash S1 is missing from the bundle.
+    // it is rewritten and restored, so the export's snapshot (B) lacks stash
+    // S1 while both keys (A) hold it. Since OI-1003-Q161 the stash is drift
+    // custody like HEAD and the index: the move is named (`StashMoved`), the
+    // key is poisoned, so the stale bundle is never a whole-capture Hit, and
+    // the next pass carries A, S1 included. Before Q161 it refused
+    // GIT_AUTHORITY_CHANGED.
     #[test]
-    fn r3_stash_reflog_round_trip_across_unguarded_windows_refuses() {
+    fn r3_stash_reflog_round_trip_across_unguarded_windows_is_drift_custody() {
         use git_carry::mid_pass::Stage;
         let (root, source, _, plan, corpus) = drifting_plan("r3-stash");
         let state = root.join("state");
@@ -4485,25 +4490,45 @@ mod tests {
             git(&i2, &["stash", "store", "-m", "one", &s1c]);
             git(&i2, &["stash", "store", "-m", "two", &s2c]);
         });
-        let first = attempt(&plan, &state, &corpus);
+        let rows = Mutex::new(Vec::new());
+        let _ = capture(&plan, &state, &corpus, 2, &|row| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone(), row.drift.clone()));
+            Ok(())
+        });
+        let first = rows.into_inner().unwrap();
         assert_eq!(
             r3_git_out(&source, &["reflog", "show", "--format=%H", "refs/stash"]),
             format!("{s2}\n{s1}\n"),
             "the source is back at A"
         );
+        assert_eq!(first.len(), 1, "{first:?}");
+        let (outcome, _, drift) = first.first().unwrap();
+        assert_eq!(*outcome, "captured-with-drift", "{first:?}");
+        assert!(
+            drift.contains(&"StashMoved \"refs/stash\"".to_owned()),
+            "{first:?}"
+        );
+        // The drifted capture's bundle is B: it lost S1.
+        assert!(!recorded_heads(&plan, &corpus, &source).contains(&format!("stashes/{s1}")));
         settle();
         let second = attempt(&plan, &state, &corpus);
-        let heads = recorded_heads(&plan, &corpus, &source);
-        assert!(
-            second.first().unwrap().0 != "capture-reused-after-census"
-                || heads.contains(&format!("stashes/{s1}")),
+        assert_ne!(
+            second.first().unwrap().0,
+            "capture-reused-after-census",
             "a whole-capture Hit on a bundle that lost stash S1"
         );
-        assert_eq!(
-            first,
-            vec![("refused", Some("GIT_AUTHORITY_CHANGED".to_owned()))]
+        assert!(
+            matches!(
+                second.first().unwrap().0,
+                "captured" | "capture-extended-from-drift"
+            ),
+            "{second:?}"
         );
-        assert!(heads.contains(&format!("stashes/{s1}")));
+        let heads = recorded_heads(&plan, &corpus, &source);
+        assert!(heads.contains(&format!("stashes/{s1}")), "{heads}");
+        assert!(heads.contains(&format!("stashes/{s2}")), "{heads}");
         fs::remove_dir_all(root).unwrap();
     }
 

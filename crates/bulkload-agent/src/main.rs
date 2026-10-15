@@ -270,11 +270,12 @@ BOUNDARIES:
     A bundle that drifted under its export carries an in-band marker, and
     estate-apply and every git-restore/import/attach/repair verb refuse it
     with CAPTURE_DRIFTED; run estate-capture again first. An agent
-    committing, switching or staging under a pass is drift custody too
-    (#38, S5): HeadMoved HEAD, IndexRewritten index and NestedWorktreeMoved
-    rows, the bundle carries the HEAD and index its snapshot read, and the
-    next estate-capture carries the new ones. Exclude, stash reflog,
-    config, shallow or nested-repository changes under a pass still refuse
+    committing, switching, staging or stashing under a pass is drift
+    custody too (#38, OI-1003-Q161, S5): HeadMoved HEAD, IndexRewritten
+    index, StashMoved refs/stash and NestedWorktreeMoved rows, the bundle
+    carries the HEAD, index and stash its snapshot read, and the next
+    estate-capture carries the new ones. Exclude, config, shallow or
+    nested-repository changes under a pass still refuse
     GIT_AUTHORITY_CHANGED;
     git-export never tolerates drift.
 
