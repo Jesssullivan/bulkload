@@ -1140,5 +1140,559 @@ class LiveRunTests(unittest.TestCase):
         self.assertEqual(trace["verdict"]["status"], "INCONCLUSIVE")
 
 
+ORIGIN = 1_760_000_000.0
+
+
+def observation(trace, power="ac"):
+    """An `observe` header and its rows, from a synthetic trace: the same
+    samples, timestamped from ORIGIN, and the run's ON windows as an
+    intervals file of epoch seconds."""
+    span = trace["windows"][-1]["end"]
+    header = {
+        "schema": s2.ALONGSIDE_SCHEMA,
+        "rulings": s2.ALONGSIDE_RULINGS,
+        "label": "synthetic",
+        "config": {
+            "source": "/src",
+            "workdir": "/work",
+            "out": "/out",
+            "search_tool": "rg",
+            "workload": "v0",
+        },
+        "host": {
+            "hostname": "neo",
+            "system": "Darwin",
+            "release": "x",
+            "machine": "arm64",
+            "cpus": 12,
+            "git": "git",
+            "search": "rg",
+            "load_source": "sysctl -n vm.loadavg",
+        },
+        "start_utc": "2026-10-15T00:00:00Z",
+        "end_utc": "2026-10-15T01:00:00Z",
+        "origin_epoch": ORIGIN,
+        "span_s": span,
+        "end_reason": "stop file",
+        "errors": [],
+        "skipped_ticks": {"sampler": 0, "workload": 0},
+    }
+    rows = [{"k": "lat", **row} for row in trace["latency"]]
+    # Sampler rows carry the wall clock beside the monotonic offset.
+    rows += [{"k": "load", "e": ORIGIN + row["t"], **row} for row in trace["load"]]
+    rows += [
+        {"k": "power", "t": t, "power": power} for t in range(0, int(span) + 1, 60)
+    ]
+    rows.append({"k": "end", "t": span, "reason": "stop file"})
+    intervals = "\n".join(
+        f"{ORIGIN + w['start']:.3f} {ORIGIN + w['end']:.3f} pass{w['index']}"
+        for w in trace["windows"]
+        if w["state"] == "ON"
+    )
+    return header, rows, intervals
+
+
+def alongside_verdict(
+    trace, evidence=True, min_window=300.0, intervals=None, power="ac", edit=None
+):
+    header, rows, derived = observation(trace, power)
+    if edit is not None:
+        header, rows = edit(header, rows)
+    built = s2.alongside_trace(
+        header,
+        rows,
+        derived if intervals is None else intervals,
+        "intervals.txt",
+        min_window,
+        evidence,
+        dict(s2.DEFAULT_GATE),
+    )
+    return built, s2.analyze(built)
+
+
+def long_synth(**kwargs):
+    """A synthetic trace with 400 s windows at 1 Hz: each OFF gap keeps at
+    least 300 s once the next pass's settle lead is taken from it."""
+    return synth(window=400.0, n=400, **kwargs)
+
+
+class AlongsideTests(unittest.TestCase):
+    """#165 (S2 budget alongside a real run; OI-1003-Q152: no freeze window)."""
+
+    def test_intervals_read_epochs_iso_and_marks_and_merge(self) -> None:
+        text = "\n".join(
+            [
+                "# pass one",
+                "100 400 pass1",
+                "350 500",
+                "2026-10-15T00:00:00Z 2026-10-15T00:05:00Z",
+                "on 9000 pass3",
+                "off 9600",
+            ]
+        )
+        intervals, open_interval, problems = s2.parse_intervals(text)
+        midnight = s2.parse_time("2026-10-15T00:00:00Z")
+        self.assertEqual(problems, [])
+        self.assertFalse(open_interval)
+        self.assertEqual(
+            intervals, [(100.0, 500.0), (9000.0, 9600.0), (midnight, midnight + 300)]
+        )
+
+    def test_an_open_mark_and_a_bad_line_are_kept_apart(self) -> None:
+        intervals, open_interval, problems = s2.parse_intervals(
+            "on 10\nbogus line\noff 5 early\n500 400\non 600"
+        )
+        self.assertTrue(open_interval)
+        # The second `on` while one is open is a problem, never a restart.
+        self.assertEqual(len(problems), 4, problems)
+        self.assertIn("on after on", problems[-1])
+        self.assertEqual(intervals[-1][1], float("inf"))
+
+    def test_windows_alternate_and_short_ones_are_dropped(self) -> None:
+        kept, dropped = s2.derive_windows([(400, 800), (850, 1300)], 2000, 300)
+        self.assertEqual(
+            [(w["state"], w["start"], w["end"]) for w in kept],
+            [
+                ("OFF", 0.0, 400.0),
+                ("ON", 400.0, 800.0),
+                ("ON", 850.0, 1300.0),
+                ("OFF", 1300.0, 2000.0),
+            ],
+        )
+        self.assertEqual([w["index"] for w in kept], [0, 1, 2, 3])
+        self.assertEqual([(w["state"], w["start"]) for w in dropped], [("OFF", 800.0)])
+
+    def test_a_real_runs_intervals_give_the_budget_verdict(self) -> None:
+        built, verdict = alongside_verdict(
+            long_synth(on_factor=1.10, on_add=0.5, evidence=True)
+        )
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+        self.assertEqual(built["config"]["pattern"], list(FIVE))
+        # Nothing was started: no ON-run reason is ever raised.
+        self.assertNotIn("ran no command", reasons(verdict))
+        _, failing = alongside_verdict(long_synth(on_factor=1.5, evidence=True))
+        self.assertEqual(failing["status"], "FAIL", reasons(failing))
+        _, loaded = alongside_verdict(long_synth(on_add=2.5, evidence=True))
+        self.assertEqual(loaded["status"], "FAIL", reasons(loaded))
+
+    def test_short_windows_are_not_evidence(self) -> None:
+        _, verdict = alongside_verdict(
+            synth(window=120.0, n=120, evidence=True), min_window=100.0
+        )
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any("at least 300 s" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_an_interval_still_open_is_inconclusive_and_not_evidence(self) -> None:
+        trace = long_synth(on_factor=1.10, evidence=True)
+        start = trace["windows"][1]["start"]
+        _, verdict = alongside_verdict(trace, intervals=f"on {ORIGIN + start:.3f}")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("still open", reasons(verdict))
+
+    def test_battery_is_not_evidence(self) -> None:
+        _, verdict = alongside_verdict(long_synth(evidence=True), power="battery")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertFalse(verdict["evidence"])
+
+    def test_evidence_rows_carry_every_gated_metric_and_window(self) -> None:
+        built, verdict = alongside_verdict(long_synth(on_factor=1.10, evidence=True))
+        rows = s2.evidence_rows(built, verdict)
+        kinds = [row[0] for row in rows[1:]]
+        self.assertEqual(rows[0][0], "kind")
+        self.assertEqual(kinds.count("delta_p95"), len(s2.METRICS))
+        self.assertEqual(kinds.count("delta_load1"), 1)
+        self.assertEqual(kinds.count("window"), len(FIVE))
+        self.assertEqual(rows[1][:3], ["verdict", "S2", "PASS"])
+        self.assertTrue(all(row[-1] == "evidence" for row in rows[1:]))
+
+    def test_observe_starts_nothing_and_alongside_reads_it(self) -> None:
+        before = threading.active_count()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            out_dir = Path(tmp) / "observed"
+            stop = Path(tmp) / "stop"
+            marks = Path(tmp) / "intervals"
+            timer = threading.Timer(3.5, stop.touch)
+            timer.start()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    s2.main(["mark", str(marks), "on", "--label", "pass"]), 0
+                )
+                status = s2.main(
+                    [
+                        "observe",
+                        "--source",
+                        str(source),
+                        "--out",
+                        str(out_dir),
+                        "--stop-file",
+                        str(stop),
+                        "--max-seconds",
+                        "60",
+                    ]
+                )
+                self.assertEqual(s2.main(["mark", str(marks), "off"]), 0)
+                along = s2.main(
+                    [
+                        "alongside",
+                        str(out_dir),
+                        "--intervals",
+                        str(marks),
+                        "--min-window-seconds",
+                        "0",
+                    ]
+                )
+            timer.join()
+            header = json.loads((out_dir / "observe.json").read_text())
+            rows = [
+                json.loads(line)
+                for line in (out_dir / "rows.jsonl").read_text().splitlines()
+            ]
+            evidence = (out_dir / "alongside" / "evidence.tsv").read_text()
+            listing = sorted(path.name for path in out_dir.iterdir())
+            leftovers = list(Path(tmp).glob("s2-observe-workload-*"))
+        self.assertEqual((status, along), (0, 0))
+        self.assertEqual(threading.active_count(), before)
+        self.assertEqual(header["end_reason"], "stop file")
+        self.assertEqual(header["errors"], [])
+        kinds = {row["k"] for row in rows}
+        self.assertTrue({"lat", "load", "power"} <= kinds, kinds)
+        self.assertEqual(
+            {row["op"] for row in rows if row["k"] == "lat"},
+            {"jsonl", "sqlite", "git", "search", "step"},
+        )
+        # Its own files only: no ON command ran, nothing else was made.
+        self.assertEqual(listing, ["alongside", "observe.json", "rows.jsonl"])
+        self.assertEqual(leftovers, [])
+        self.assertTrue(evidence.startswith("kind\tname\tvalue"))
+        self.assertIn("not-evidence", evidence)
+
+    def test_observe_refusals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            (Path(tmp) / "exists").mkdir()
+            with contextlib.redirect_stdout(io.StringIO()):
+                taken = s2.main(
+                    [
+                        "observe",
+                        "--source",
+                        str(source),
+                        "--out",
+                        str(Path(tmp) / "exists"),
+                    ]
+                )
+                inside = s2.main(
+                    [
+                        "observe",
+                        "--source",
+                        str(source),
+                        "--out",
+                        str(Path(tmp) / "o"),
+                        "--stop-file",
+                        str(source / "stop"),
+                    ]
+                )
+            made = (Path(tmp) / "o").exists()
+        self.assertEqual((taken, inside), (2, 2))
+        self.assertFalse(made)
+
+
+def shifted(rows, after, by):
+    """The rows with the wall clock of every sampler row after `after`
+    seconds moved by `by` seconds: a sleep or a clock step mid-run."""
+    out = []
+    for row in rows:
+        if "e" in row and row["t"] > after:
+            row = {**row, "e": row["e"] + by}
+        out.append(row)
+    return out
+
+
+def raised_starts(trace, seconds, factor):
+    """The trace with every latency sample in the first `seconds` of each ON
+    window multiplied by `factor`: a pass slow only while it walks."""
+    for window in trace["windows"]:
+        if window["state"] != "ON":
+            continue
+        for row in trace["latency"]:
+            if window["start"] <= row["t"] < window["start"] + seconds:
+                row["ms"] *= factor
+    return trace
+
+
+class AlongsideReviewTests(unittest.TestCase):
+    """The 2026-10-15 review of #165's alongside mode: each test is red on a
+    mutant or on the code before the fix (the agent note's table)."""
+
+    def test_an_observation_with_no_recorded_end_is_cut_short(self) -> None:
+        def unended(header, rows):
+            # The header never closed (its end row alone is no proof).
+            header = {
+                k: v for k, v in header.items() if k not in ("end_reason", "span_s")
+            }
+            return header, rows
+
+        _, verdict = alongside_verdict(long_synth(on_factor=1.10), edit=unended)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("cut short", reasons(verdict))
+
+        def no_end_row(header, rows):
+            return header, [row for row in rows if row.get("k") != "end"]
+
+        _, verdict = alongside_verdict(long_synth(on_factor=1.10), edit=no_end_row)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("cut short", reasons(verdict))
+
+    def test_missed_ticks_are_backfilled_into_their_windows(self) -> None:
+        trace = long_synth(on_factor=1.0)
+
+        def missed(header, rows):
+            extra = []
+            for window in trace["windows"]:
+                if window["state"] == "ON":
+                    for k in range(100, 160):
+                        extra.append(
+                            {
+                                "k": "missed",
+                                "loop": "workload",
+                                "t": window["start"] + k + 0.5,
+                                "lag_ms": 5000.0,
+                            }
+                        )
+            return header, rows + extra
+
+        _, verdict = alongside_verdict(trace, edit=missed)
+        # Back-filled at their 5 s wait, the step p95 is over the budget.
+        self.assertEqual(verdict["gates"]["step"], "FAIL", reasons(verdict))
+        self.assertEqual(verdict["samples"]["ON"]["missed_ticks"], 120)
+        _, clean = alongside_verdict(long_synth(on_factor=1.0))
+        self.assertEqual(clean["gates"]["step"], "PASS", reasons(clean))
+
+    def test_one_on_window_among_five_is_not_evidence(self) -> None:
+        trace = long_synth(pattern=("OFF", "OFF", "ON", "OFF", "OFF"), on_factor=1.10)
+        intervals = "\n".join(
+            f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}"
+            for a, b in ((390, 400), (800, 1200), (1590, 1600))
+        )
+        built, verdict = alongside_verdict(trace, intervals=intervals)
+        self.assertEqual(built["config"]["pattern"], ["OFF", "OFF", "ON", "OFF", "OFF"])
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any("2 ON" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_three_windows_are_not_evidence_by_the_five_window_rule(self) -> None:
+        _, verdict = alongside_verdict(long_synth(pattern=("OFF", "ON", "OFF")))
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any("at least 5 windows" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_the_start_of_every_pass_is_measured(self) -> None:
+        trace = raised_starts(
+            synth(window=600.0, n=600, on_factor=1.0, evidence=True), 60.0, 3.0
+        )
+        built, verdict = alongside_verdict(trace)
+        # Before the fix the first minute was the settle: PASS at +0 %. Now
+        # it is measured: the point is over the budget, and two raised
+        # 30 s blocks in twenty leave the bounds straddling it.
+        self.assertNotEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertGreater(verdict["delta_p95_by_metric"]["step"], 0.25)
+        on = [w for w in built["windows"] if w["state"] == "ON"]
+        # Each ON window starts one settle before its pass.
+        self.assertEqual(
+            [(w["start"], w["lead_s"]) for w in on], [(540.0, 60.0), (1740.0, 60.0)]
+        )
+
+    def test_a_pass_with_no_room_for_its_settle_is_not_evidence(self) -> None:
+        trace = long_synth(on_factor=1.10)
+        # Two passes 30 s apart: the second has no 60 s gap before it.
+        intervals = "\n".join(
+            f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}"
+            for a, b in ((400, 800), (830, 1200), (1600, 2000))
+        )
+        _, verdict = alongside_verdict(trace, intervals=intervals, min_window=0.0)
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any("settle" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_a_wall_clock_jump_is_an_instrument_error(self) -> None:
+        def slept(header, rows):
+            return header, shifted(rows, 1000.0, 600.0)
+
+        _, verdict = alongside_verdict(long_synth(on_factor=1.10), edit=slept)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("instrument errors", reasons(verdict))
+
+        def unclocked(header, rows):
+            return header, [{k: v for k, v in row.items() if k != "e"} for row in rows]
+
+        _, verdict = alongside_verdict(long_synth(on_factor=1.10), edit=unclocked)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+
+    def test_power_that_changes_inside_a_window_is_not_evidence(self) -> None:
+        trace = long_synth(on_factor=1.10)
+
+        def unplugged(header, rows):
+            # Battery from the middle of window 2 on (sampled every 60 s).
+            out = []
+            for row in rows:
+                if row.get("k") == "power" and row["t"] >= 1000:
+                    row = {**row, "power": "battery"}
+                out.append(row)
+            return header, out
+
+        built, verdict = alongside_verdict(trace, edit=unplugged)
+        window = built["windows"][2]
+        self.assertEqual(
+            (window["power_start"], window["power_end"]), ("ac", "battery")
+        )
+        self.assertFalse(verdict["evidence"])
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+
+    def test_a_bad_intervals_line_is_inconclusive(self) -> None:
+        trace = long_synth(on_factor=1.10)
+        _, _, derived = observation(trace)
+        _, verdict = alongside_verdict(trace, intervals=derived + "\nnot a line\n")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("instrument errors", reasons(verdict))
+
+    def test_a_torn_row_is_inconclusive(self) -> None:
+        trace = long_synth(on_factor=1.10)
+        header, rows, derived = observation(trace)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "observe.json").write_text(json.dumps(header))
+            text = "".join(json.dumps(row) + "\n" for row in rows)
+            (directory / "rows.jsonl").write_text(text + '{"k":"lat","t":1')
+            read_header, read_rows = s2.read_observation(directory)
+        built = s2.alongside_trace(
+            read_header, read_rows, derived, "i", 300.0, True, dict(s2.DEFAULT_GATE)
+        )
+        verdict = s2.analyze(built)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("instrument errors", reasons(verdict))
+
+    def test_an_open_interval_is_named_among_five_kept_windows(self) -> None:
+        trace = long_synth(on_factor=1.10)
+        _, _, derived = observation(trace)
+        # A last pass started 50 s before the observation ended.
+        opened = derived + f"\non {ORIGIN + 1950:.3f}"
+        built, verdict = alongside_verdict(trace, intervals=opened, min_window=100.0)
+        self.assertGreaterEqual(len(built["config"]["pattern"]), 5)
+        self.assertTrue(
+            any("still open" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_the_shortest_kept_window_decides_the_window_rule(self) -> None:
+        trace = synth(
+            pattern=("OFF", "ON", "OFF", "ON", "OFF"),
+            window=400.0,
+            n=400,
+            evidence=True,
+        )
+        # The middle OFF gap is 200 s (+ lead): kept under --min-window 100.
+        intervals = "\n".join(
+            f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}" for a, b in ((400, 800), (1000, 1400))
+        )
+        built, verdict = alongside_verdict(trace, intervals=intervals, min_window=100.0)
+        self.assertEqual(len(built["windows"]), 5)
+        self.assertLess(built["config"]["window_seconds"], 300.0)
+        self.assertFalse(verdict["evidence"])
+
+    def test_observe_streams_missed_ticks_and_ends_its_record_on_request(
+        self,
+    ) -> None:
+        import signal
+
+        original = s2.Workload.step
+        calls = [0]
+
+        def slow(workload):
+            calls[0] += 1
+            if calls[0] == 3:
+                threading.Event().wait(2.6)
+            return original(workload)
+
+        before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+        seen = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            out_dir = Path(tmp) / "observed"
+
+            def request_end() -> None:
+                # Wait (bounded) for a missed tick on disk while the
+                # observation still runs, then ask it to end.
+                waited = threading.Event()
+                for _ in range(600):
+                    rows_file = out_dir / "rows.jsonl"
+                    rows = (
+                        rows_file.read_text().splitlines() if rows_file.exists() else []
+                    )
+                    seen["missed"] = sum('"k":"missed"' in row for row in rows)
+                    if seen["missed"]:
+                        break
+                    waited.wait(0.1)
+                handler = signal.getsignal(signal.SIGTERM)
+                seen["handled"] = callable(handler)
+                if callable(handler):
+                    handler(signal.SIGTERM, None)
+
+            timer = threading.Thread(target=request_end)
+            timer.start()
+            with (
+                mock.patch.object(s2.Workload, "step", slow),
+                mock.patch.object(s2, "POWER_EVERY_S", 1.0),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                status = s2.main(
+                    [
+                        "observe",
+                        "--source",
+                        str(source),
+                        "--out",
+                        str(out_dir),
+                        "--max-seconds",
+                        "120",
+                    ]
+                )
+            timer.join()
+            header = json.loads((out_dir / "observe.json").read_text())
+            rows = [
+                json.loads(line)
+                for line in (out_dir / "rows.jsonl").read_text().splitlines()
+            ]
+        after = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+        self.assertEqual(status, 0)
+        # The missed ticks were on disk before the observation ended.
+        self.assertGreaterEqual(seen.get("missed", 0), 1, seen)
+        self.assertTrue(seen.get("handled"), seen)
+        self.assertEqual(header["end_reason"], "SIGTERM")
+        self.assertEqual(rows[-1]["k"], "end")
+        # Power sampled on its cadence while observing, not only at the end.
+        self.assertGreaterEqual(
+            sum(
+                1
+                for row in rows
+                if row["k"] == "power" and row["t"] < header["span_s"] - 0.5
+            ),
+            2,
+        )
+        self.assertEqual(after, before)
+
+
 if __name__ == "__main__":
     unittest.main()

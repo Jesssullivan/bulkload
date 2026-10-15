@@ -28,9 +28,15 @@ SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
     walk PATH   Stat-walk PATH and print the row and refusal counts
     copy SOURCE DEST SOURCE_STATE DEST_STATE
-                Native local copy with private resumable chunk stores
+                Native local copy with private resumable chunk stores; the
+                session's outcomes are recorded in
+                DEST_STATE/transfer.closure.d, one record per transfer, for
+                closure-report --transfer (WP3 PR 4). The S2 overlap checks
+                run before anything is written; a session that ends refused
+                keeps the earlier session's refused rows
     pull HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
-                Native SSH pull; remote bulkload-agent must be installed
+                Native SSH pull; remote bulkload-agent must be installed; the
+                session is recorded in DEST_STATE as copy's is
     serve       Serve one framed request on stdin/stdout (for SSH)
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
@@ -56,12 +62,12 @@ SUBCOMMANDS:
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
     estate-apply PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces
-    closure-report [--attest LEDGER.json] [--dispositions LEDGER] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+    closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
                 are mapped) and journals (later directories override earlier
                 outcome records), with SOURCE the label estate-apply was
-                given. Prints a bulkload.closure.v2 JSON ledger: every planned
+                given. Prints a bulkload.closure.v3 JSON ledger: every planned
                 item is applied (workspace, exact current-capture journal),
                 refused-pending-review (typed code; a bare IO or FRAME_CODEC
                 is not typed, nor is a code retired from the taxonomy),
@@ -85,7 +91,22 @@ SUBCOMMANDS:
                 evidence.
                 --dispositions LEDGER: join the closure-dispose ledger bound
                 to this PLAN (its path and its bytes) and SOURCE (S4)
-    closure-dispose [--attest LEDGER.json] LEDGER PLAN CORPUS SOURCE ITEM|--policy CODE accept|re-carry|abandon REVIEWER YYYY-MM-DD [PRIVATE_STATE ...]
+                --transfer DEST_STATE (repeatable, WP3 PR 4): join every copy
+                or pull session DEST_STATE records (transfer.closure.d) as
+                rows of the same report and gate (one DEST_STATE named twice
+                under any spelling, or a row joined twice, refuses
+                FIELD_DOMAIN_VIOLATION): the session (applied when
+                it ended; unaccounted when it never ended, left no record, or
+                refused with a bare IO), one row per refused path (typed:
+                pending review; SQLITE_INTEGRITY_CHECK_FAILED and a corrupt
+                SQLITE_BACKUP_FAILED carry the ruled default abandon,
+                OI-1003-Q148, unless a review says otherwise) and one covered
+                row per live SQLite sidecar a snapshot covers
+                --transfer-manifest MANIFEST: join exactly the transfers
+                transfer-expect listed, bound to PLAN: a listed transfer with
+                no record, or whose session started before the manifest's
+                since, is unaccounted
+    closure-dispose [--attest LEDGER.json] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] LEDGER PLAN CORPUS SOURCE ITEM|--policy CODE accept|re-carry|abandon REVIEWER YYYY-MM-DD [PRIVATE_STATE ...]
                 Record an operator review of a typed refusal (S4) in LEDGER,
                 created when absent and bound to PLAN (its path and a digest
                 of its bytes; PLAN must be a plan) and SOURCE. With ITEM: the
@@ -102,7 +123,16 @@ SUBCOMMANDS:
                 are not read. Rows are appended; the latest item row for the
                 instance wins, then the latest policy. IO and FRAME_CODEC
                 name no cause and refuse (FIELD_DOMAIN_VIOLATION), as does a
-                CODE the taxonomy does not hold
+                CODE the taxonomy does not hold. --transfer and
+                --transfer-manifest join transfer rows as closure-report
+                does, so ITEM may name one
+    transfer-expect MANIFEST PLAN copy SOURCE DEST DEST_STATE
+    transfer-expect MANIFEST PLAN pull HOST SOURCE DEST DEST_STATE
+                List one transfer a run expects in MANIFEST
+                (bulkload.transfer-manifest.v1), created bound to PLAN with
+                since = now when absent (create it when the run, or its
+                closing pass, starts). Paths are named as copy and pull
+                record them
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -239,9 +269,12 @@ BOUNDARIES:
     rewritten store.
     A bundle that drifted under its export carries an in-band marker, and
     estate-apply and every git-restore/import/attach/repair verb refuse it
-    with CAPTURE_DRIFTED; run estate-capture again first. HEAD, index,
-    config, shallow,
-    nested-worktree or nested-repository changes under a pass still refuse
+    with CAPTURE_DRIFTED; run estate-capture again first. An agent
+    committing, switching or staging under a pass is drift custody too
+    (#38, S5): HeadMoved HEAD, IndexRewritten index and NestedWorktreeMoved
+    rows, the bundle carries the HEAD and index its snapshot read, and the
+    next estate-capture carries the new ones. Exclude, stash reflog,
+    config, shallow or nested-repository changes under a pass still refuse
     GIT_AUTHORITY_CHANGED;
     git-export never tolerates drift.
 
@@ -360,6 +393,7 @@ fn main() -> ExitCode {
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
+        Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
         Some("serve") => {
             let (input, output) = (std::io::stdin(), std::io::stdout());
             bulkload_agent::transfer::tune_stream(&input);
@@ -452,14 +486,31 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     // is still a state.
     let mut attest = None;
     let mut dispositions = None;
+    let mut manifest = None;
+    let mut transfers = Vec::new();
     let mut positional = args;
     loop {
+        // WP3 PR 4: `--transfer DEST_STATE`, repeatable, also only before PLAN.
+        if let [flag, state, rest @ ..] = positional {
+            if flag == "--transfer" {
+                transfers.push(PathBuf::from(state));
+                positional = rest;
+                continue;
+            }
+        }
         let (slot, ledger, rest) = match positional {
             [flag, ledger, rest @ ..] if flag == "--attest" => (&mut attest, ledger, rest),
             [flag, ledger, rest @ ..] if flag == "--dispositions" => {
                 (&mut dispositions, ledger, rest)
             }
-            [flag] if flag == "--attest" || flag == "--dispositions" => {
+            // Review finding 3: the run's expected transfers, bound to PLAN.
+            [flag, path, rest @ ..] if flag == "--transfer-manifest" => (&mut manifest, path, rest),
+            [flag]
+                if flag == "--attest"
+                    || flag == "--dispositions"
+                    || flag == "--transfer"
+                    || flag == "--transfer-manifest" =>
+            {
                 return Err(BulkloadRefusal::RequiredFieldMissing)
             }
             _ => break,
@@ -480,6 +531,12 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     let ledger =
         bulkload_agent::estate::ledger(Path::new(plan), Path::new(corpus), source, &states)?;
     let mut report = bulkload_agent::closure::Report::from_ledger(&ledger);
+    join_transfer_inputs(
+        &mut report,
+        &transfers,
+        manifest.as_deref(),
+        Path::new(plan),
+    )?;
     if let Some(attest) = attest {
         report.attest(&bulkload_agent::closure::AttestationLedger::read(
             &attest,
@@ -500,6 +557,23 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     report.gate()
 }
 
+// WP3 PR 4 and review finding 3: the transfer rows a report joins, from
+// `--transfer` states and a `--transfer-manifest` bound to PLAN.
+fn join_transfer_inputs(
+    report: &mut bulkload_agent::closure::Report,
+    transfers: &[PathBuf],
+    manifest: Option<&Path>,
+    plan: &Path,
+) -> Result<()> {
+    report.join_transfers(transfers)?;
+    if let Some(manifest) = manifest {
+        report.join_manifest(&bulkload_agent::transfer_outcome::Manifest::read(
+            manifest, plan,
+        )?)?;
+    }
+    Ok(())
+}
+
 // S4 (WP3 PR 3): record one operator review of a typed refusal. Positional,
 // like estate-add; `--policy` stands in for ITEM. An item review is bound to
 // the refusal instance the report holds now, so the verb reads the same
@@ -509,17 +583,45 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
     fn text(value: &std::ffi::OsString) -> Result<&str> {
         value.to_str().ok_or(BulkloadRefusal::PathNotPortable)
     }
-    let (attest, positional) = match args {
-        [flag, ledger, rest @ ..] if flag == "--attest" => (Some(PathBuf::from(ledger)), rest),
-        [flag] if flag == "--attest" => return Err(BulkloadRefusal::RequiredFieldMissing),
-        rest => (None, rest),
-    };
+    let mut attest = None;
+    let mut manifest = None;
+    let mut transfers = Vec::new();
+    let mut positional = args;
+    loop {
+        match positional {
+            // Each at most once.
+            [flag, value, rest @ ..] if flag == "--attest" || flag == "--transfer-manifest" => {
+                let slot = if flag == "--attest" {
+                    &mut attest
+                } else {
+                    &mut manifest
+                };
+                if slot.replace(PathBuf::from(value)).is_some() {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
+                positional = rest;
+            }
+            // WP3 PR 4: transfer rows can be reviewed like planned items.
+            [flag, state, rest @ ..] if flag == "--transfer" => {
+                transfers.push(PathBuf::from(state));
+                positional = rest;
+            }
+            [flag]
+                if flag == "--attest" || flag == "--transfer" || flag == "--transfer-manifest" =>
+            {
+                return Err(BulkloadRefusal::RequiredFieldMissing)
+            }
+            _ => break,
+        }
+    }
     let [ledger, plan, corpus, source, target, code, decision, reviewer, date, states @ ..] =
         positional
     else {
         return Err(BulkloadRefusal::RequiredFieldMissing);
     };
     let (plan, source, code) = (Path::new(plan), text(source)?, text(code)?);
+    // WP3 PR 4: a transfer row the report joined may be reviewed too.
+    let mut joined = Vec::new();
     let scope = match text(target)? {
         // A standing policy names no instance: nothing else is read.
         "--policy" => Scope::Policy,
@@ -534,6 +636,7 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
             let states: Vec<PathBuf> = states.iter().map(PathBuf::from).collect();
             let estate = bulkload_agent::estate::ledger(plan, Path::new(corpus), source, &states)?;
             let mut report = bulkload_agent::closure::Report::from_ledger(&estate);
+            join_transfer_inputs(&mut report, &transfers, manifest.as_deref(), plan)?;
             if let Some(attest) = &attest {
                 report.attest(&bulkload_agent::closure::AttestationLedger::read(
                     attest, plan, source,
@@ -544,6 +647,13 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
             let instance = report
                 .reviewable(item, code)
                 .ok_or(BulkloadRefusal::ReceiptBindingInvalid)?;
+            joined.extend(
+                report
+                    .rows
+                    .iter()
+                    .filter(|row| row.kind != bulkload_agent::closure::RowKind::Estate)
+                    .map(|row| row.item.clone()),
+            );
             Scope::Item {
                 item: item.to_owned(),
                 instance: instance.to_owned(),
@@ -557,7 +667,7 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
         text(reviewer)?,
         text(date)?,
     )?;
-    let recorded = disposition::record(Path::new(ledger), plan, source, row)?;
+    let recorded = disposition::record_joined(Path::new(ledger), plan, source, row, &joined)?;
     let mut stdout = std::io::stdout().lock();
     if let Some(row) = recorded.rows.last() {
         writeln!(
@@ -654,10 +764,10 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             Ok(())
         }
         "copy" if args.len() == 4 => {
-            let stats = bulkload_agent::transfer::copy(path(0)?, path(1)?, path(2)?, path(3)?)?;
-            report_transfer(&stats)
+            // WP3 PR 4: the session's outcomes are closure rows.
+            copy_recorded(path(0)?, path(1)?, path(2)?, path(3)?)
         }
-        "pull" if (5..=7).contains(&args.len()) => pull_command(args),
+        "pull" if (5..=7).contains(&args.len()) => pull_recorded(args),
         "snapshot" if (2..=3).contains(&args.len()) => {
             bulkload_agent::provider_sqlite::snapshot(path(0)?, path(1)?, steps(args.get(2))?)?;
             println!("snapshot complete");
@@ -1069,7 +1179,79 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
     Ok(())
 }
 
-fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
+// WP3 PR 4: a copy session's outcomes are closure rows, keyed on the
+// canonical SOURCE and DEST so a rerun spelled another way names the same
+// rows. S2 (review finding 1): the overlap decision is made before the
+// record's first write, so a refused overlap writes nothing anywhere.
+fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &Path) -> Result<()> {
+    let stats = bulkload_agent::transfer_outcome::record_session(
+        dest_state,
+        "copy",
+        &bulkload_agent::transfer_outcome::copy_source(source),
+        &bulkload_agent::transfer_outcome::stable(dest),
+        "transfer::copy",
+        || bulkload_agent::transfer::copy_roots_apart(source, dest, source_state, dest_state),
+        || bulkload_agent::transfer::copy(source, dest, source_state, dest_state),
+    )?;
+    report_transfer(&stats)
+}
+
+// WP3 PR 4: a pull session's outcomes are closure rows, keyed on
+// HOST:SOURCE and the canonical DEST, recorded in DEST_STATE around the
+// session (`pull_command`, whose ssh child the S2 registry pins).
+fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
+    let path = |index: usize| {
+        args.get(index)
+            .map(Path::new)
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)
+    };
+    let host = args.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    bulkload_agent::transfer_outcome::record_session(
+        path(4)?,
+        "pull",
+        &bulkload_agent::transfer_outcome::pull_source(host, path(1)?),
+        &bulkload_agent::transfer_outcome::stable(path(2)?),
+        "transfer::pull",
+        || bulkload_agent::transfer::receive_roots_apart(path(2)?, path(4)?),
+        || pull_command(args),
+    )
+    .and_then(|stats| report_transfer(&stats))
+}
+
+// Review finding 3 (S4): list one transfer a run expects in its manifest,
+// bound to PLAN; `closure-report --transfer-manifest` joins exactly these.
+fn expect_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::transfer_outcome::{self as outcome, Expected};
+    let [manifest, plan, verb, rest @ ..] = args else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let expected = match (verb.to_str(), rest) {
+        (Some("copy"), [source, destination, state]) => Expected {
+            verb: "copy".to_owned(),
+            source: outcome::copy_source(Path::new(source)),
+            destination: outcome::stable(Path::new(destination)),
+            state: outcome::stable(Path::new(state)),
+        },
+        (Some("pull"), [host, source, destination, state]) => Expected {
+            verb: "pull".to_owned(),
+            source: outcome::pull_source(host, Path::new(source)),
+            destination: outcome::stable(Path::new(destination)),
+            state: outcome::stable(Path::new(state)),
+        },
+        (Some("copy" | "pull"), _) => return Err(BulkloadRefusal::RequiredFieldMissing),
+        _ => return Err(BulkloadRefusal::FieldDomainViolation),
+    };
+    let item = expected.item();
+    let written = outcome::expect(Path::new(manifest), Path::new(plan), expected)?;
+    println!(
+        "transfer-expect item={item} transfers={} since={}",
+        written.transfers.len(),
+        written.since
+    );
+    Ok(())
+}
+
+fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer::TransferStats> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -1132,7 +1314,7 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<()> {
     if !exit_status.success() {
         return Err(BulkloadRefusal::Io(None));
     }
-    report_transfer(&stats)
+    Ok(stats)
 }
 
 fn steps(value: Option<&std::ffi::OsString>) -> Result<u32> {

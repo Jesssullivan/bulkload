@@ -120,7 +120,79 @@ recorded under another source (`record-source-mismatch`) is still refused
   does. A review row naming such a code disposes nothing and is listed under
   `reviewed.unmatched`; the rest of the ledger keeps working.
 
-The report schema is `bulkload.closure.v2` from this change (it was
+**Transfers in the same report (WP3 PR 4, 2026-10-15, S4).** Every `copy`
+and `pull` session leaves a durable record in its DEST_STATE, one per
+transfer under `transfer.closure.d/<item>.closure` (`<item>` is the
+session row's identity; `bulkload.transfer-closure.v1`, postcard after a
+magic, decoded strictly). The session first makes the verb's S2 overlap
+decision (`transfer::copy_roots_apart`, `receive_roots_apart`), so a
+refused overlap writes nothing; then, when DEST_STATE already exists (a
+record never creates a state root), takes the record's lock (a second
+session of the same transfer refuses before it writes) and writes
+`running`; and writes its end when it ends. A rerun of the same transfer
+replaces its record; another transfer sharing the DEST_STATE has its own.
+A session that ends refused, or never ends, keeps the refused and covered
+rows of the record it replaced; only a completed session (which walked
+the whole source again) replaces them. An unreadable earlier record is
+never overwritten, and a DEST_STATE that exists after a session but took
+no closing record refuses `CLOSURE_UNACCOUNTED`. `closure-report
+--transfer DEST_STATE` (repeatable, only before PLAN; canonicalized, so one
+state under two spellings refuses, as does any transfer row joined twice)
+joins every record there as rows of the
+same report, totals and gate:
+
+- a **session** row (`kind: transfer-session`): `applied` when the session
+  ran to its end; a typed refusal when the session itself refused; and
+  `unaccounted` when the record still says `running`
+  (`transfer-interrupted`: a crash or a kill cut it short), when there is no
+  record (`no-transfer-record`) or none that decodes
+  (`transfer-record-unreadable`), or when the session refused with a bare
+  `IO` or `FRAME_CODEC`;
+- one **entry** row per refused path (`kind: transfer-entry`), classified
+  exactly as an estate item's recorded refusal (`closure::refusal_disposition`):
+  pending review until a review disposes it, never closed when untyped or
+  retired. `SQLITE_INTEGRITY_CHECK_FAILED`, and `SQLITE_BACKUP_FAILED` whose
+  primary code is 11 or 26, carry their ruled default disposition,
+  `abandon` (OI-1003-Q148): it disposes the row unless an item review or a
+  standing policy says otherwise (the review wins), and the row's `review`
+  prints `basis: ruled-default` with the ruling;
+- one **covered** row per live `-wal`, `-shm` or `-journal` the source
+  reported beside a database carried as a snapshot (`covered`, accounted).
+
+A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
+source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
+and the code (or `covered`); its refusal `instance` digests the row's
+record, so a rerun that refuses identically keeps its review and any other
+record is a new instance. `closure-dispose --transfer DEST_STATE` reviews a
+transfer row as it reviews a planned item, in the same plan-bound ledger.
+
+A run's expected transfers are bound to its PLAN by a transfer manifest
+(`bulkload.transfer-manifest.v1`, text): `transfer-expect MANIFEST PLAN
+copy|pull ...` lists each transfer (named as the verb records it, its
+DEST_STATE canonical), creating the manifest with the PLAN's digest and
+`since` (now) when absent. `closure-report --transfer-manifest MANIFEST`
+(and `closure-dispose`) refuses `RECEIPT_BINDING_INVALID` for another
+PLAN's manifest and joins exactly the listed transfers: one with no record
+is `no-transfer-record`, one whose session started before `since` is
+`transfer-record-stale` (its entry rows still joined), and a record of
+another verb is `transfer-record-mismatch`, all unaccounted. Creating the
+manifest when the closing pass starts makes `since` that pass's marker.
+The report prints a `transfer_manifest` block when one is joined; without
+one it covers only the transfers named, which the absent block shows.
+An attestation names planned items only: it never closes a transfer row.
+Not joined: `snapshot` and the offline compose verbs, which belong to no
+run; a source's tagged engine temporaries a walk skipped are listed by the
+transfer, not rows.
+
+The report schema is `bulkload.closure.v3` from WP3 PR 4. What changed for
+a v2 reader: a transfer row names its `kind` and adds `transfer` (the
+DEST_STATE), `path`, `transfer_outcome` and, with its refusal, `sqlite_code`
+(an estate row prints as in v2); `disposition` can be `covered`; the totals
+add `transfer_rows`, `covered` and `ruled_default`, and `applied`,
+`refused`, `refused_pending_review` and `unaccounted` count transfer rows
+too (`planned` still counts planned estate items only).
+
+The report schema was `bulkload.closure.v2` from WP3 PR 3 (it was
 `bulkload.closure.v1`). What changed for a v1 reader:
 
 - `disposition` can be `refused-pending-review`; `refused` means reviewed.
@@ -502,9 +574,27 @@ their snapshots for explicit resolution.
 A capture pass tolerates refs and worktree seats moving under it (R25), so
 writers never pause for a capture. What moved is recorded, never absorbed:
 
-- Only ref and seat drift is tolerated. HEAD, the index, configuration, the
-  shallow frontier, nested worktree custody or the omitted rebuildable roots
+- Ref and seat drift is tolerated, and since #38 (2026-10-15, OI-1003-Q11;
+  S5 under OI-1003-Q152: no freeze window, the run closes by converging
+  deltas while the source stays live) so are HEAD, the index and nested
+  worktrees' HEADs: an agent committing, switching or staging in the
+  captured checkout, or in a worktree nested in it, under the pass. Each is
+  a drift row, `HeadMoved` named `HEAD` (the commit HEAD resolves to or the
+  branch it names), `IndexRewritten` named `index`, `NestedWorktreeMoved`
+  named by the nested worktree's path. The bundle carries the HEAD and the
+  index bytes its own snapshot read, which the source held then; a move
+  under the export marks it drifted in-band, so no restore or apply lays it
+  down (`CAPTURE_DRIFTED`), and a move outside the export's window poisons
+  the recorded key (a move away and back across those windows too, nested
+  worktrees' HEADs compared with the export's own census before and after
+  its pass). A key-drift capture is a coherent snapshot of the state the
+  export read: it applies and the closure counts it applied. Either way
+  the next pass captures the new HEAD and index, and the apply after it
+  converges the landing. The exclude file,
+  the stash reflog, configuration, the shallow frontier, foreign nests and
+  gitlinks (a staged gitlink change too), or the omitted rebuildable roots
   moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30).
+  `git-export` and the other strict exports still refuse any drift.
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
 - An object-store rewrite is drift too (WP1, S5). The export reads the
@@ -526,10 +616,12 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   checks validate a private copy of the carried bytes, never the live index):
   HEAD, the symbolic HEAD, the index bytes, `info/exclude`, the stash reflog, the
   configuration files and the shallow frontier. The export re-reads all of
-  it at the end of its pass, and the capture refuses `GIT_AUTHORITY_CHANGED`
-  unless both key parts name exactly what the export carried, so authority
-  that moves away and back outside the export's window can never leave a
-  stale bundle behind an equal key.
+  it at the end of its pass. HEAD, the symbolic HEAD and the index that
+  moved, under the export or between a key and it, even away and back, are
+  named as drift rows (#38), so the recorded key is poisoned and a stale
+  bundle never stands behind an equal key; the rest refuses
+  `GIT_AUTHORITY_CHANGED` unless both key parts name exactly what the
+  export carried.
 - Index entry flags (#106): an intent-to-add entry (`git add -N`) is
   carried as index custody, `refs/carry-export/intent-to-add-v1` (path,
   mode, empty-blob flag), recorded only when there is one; its seat's bytes
@@ -976,8 +1068,8 @@ miss (#87).
     `integrity_check` exactly `ok`, opened `immutable=1`) before it is
     published; a failure refuses `SQLITE_INTEGRITY_CHECK_FAILED`, whose
     default S4 disposition is `abandon` (OI-1003-Q148; printed beside the
-    refusal as `default-disposition <path>: abandon` until transfer
-    refusals are closure-ledger rows, WP3 PR 4). Corruption the backup step
+    refusal as `default-disposition <path>: abandon`, and since WP3 PR 4
+    the transfer's closure row carries it: `closure-report --transfer`). Corruption the backup step
     itself reports (`SQLITE_BACKUP_FAILED` with primary code 11
     `SQLITE_CORRUPT` or 26 `SQLITE_NOTADB`) never reaches
     `integrity_check`; it keeps its own code, and takes the same `abandon`

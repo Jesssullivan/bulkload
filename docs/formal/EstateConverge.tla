@@ -24,6 +24,18 @@
 (*     file and file to directory changes, and index (staged) changes.    *)
 (*   - Capture passes: each item's {item}.capture moves to a new instant  *)
 (*     when its projection of the source changed (otherwise reuse).       *)
+(*   - #38 (2026-10-15, S5 under OI-1003-Q152, no freeze window): a main's *)
+(*     capture pass raced by the source (HEAD switched or the index        *)
+(*     staged, SrcKinds "race") records drift custody, never a refusal,   *)
+(*     in one of the code's two classes. Export drift (the move under the *)
+(*     export itself): a capture of the state its snapshot read, marked   *)
+(*     in-band, which no apply lays down (CAPTURE_DRIFTED: Begin is not   *)
+(*     enabled on it; NoDriftedLanding; drift_applied breaks it). Key     *)
+(*     drift (the move between a key and the export's snapshot, or after  *)
+(*     its end): a coherent capture of the state the snapshot read, which *)
+(*     applies. Either way its key is poisoned, so the next pass captures *)
+(*     again even when the source has come back to that state            *)
+(*     (drift_key_reused breaks it).                                       *)
 (*   - Apply passes, one item at a time under the destination lock: the   *)
 (*     estate-apply rows A3 to A12 (converge::apply_workspace), the       *)
 (*     ownership proof, the workspace intent, the native ref step with    *)
@@ -110,7 +122,8 @@
 (* CODE MAP (on feat/estate-converge-20261008; C = crates/bulkload-agent/  *)
 (* src/git_carry/converge.rs, N = .../git_carry/native_refs.rs,            *)
 (* E = crates/bulkload-agent/src/estate.rs)                               *)
-(*   Capture        E capture_item; git_carry.rs capture_administration    *)
+(*   Capture        E capture_item; git_carry.rs capture_administration,  *)
+(*                  pass_drift, KeyParts::drift_to and drift_across (#38) *)
 (*   Begin          E apply_item (A2, A4 journal no-op, pending, settle_refs)*)
 (*                  and C apply_workspace (A5 first landing, finding 13,  *)
 (*                  A12 and a landing intent, the lock, sweep_probes,     *)
@@ -185,7 +198,8 @@ Mutations == {"none", "proof_stat_only", "proof_stat_strict",
               "no_landing_intent", "head_not_recorded",
               "head_attach_unchecked", "intent_head_lock_kept",
               "empty_lock_removed", "packed_new_kept",
-              "stash_reflog_unsynced", "recovery_overwrites"}
+              "stash_reflog_unsynced", "recovery_overwrites",
+              "drift_key_reused", "drift_applied"}
 
 (* The closed unions the catalogue types (tla-check requires these sets   *)
 (* to equal the catalogue's labels).                                      *)
@@ -196,7 +210,7 @@ AllItems == {"main", "wt"}
 AllRefs  == {"main", "dev", "foo", "foo/bar", "o/x", "o/x/y", "t"}
 AllPaths == {"d", "d/f"}
 SrcKindSet == {"move", "create", "delete", "rename", "switch", "stash",
-               "seat", "dirfile", "filedir", "index", "worktree"}
+               "seat", "dirfile", "filedir", "index", "worktree", "race"}
 OpKindSet == {"seat", "racy", "touch", "untracked", "index", "ref", "stash",
               "stashdrop", "head", "restore", "rebase", "dir", "lock", "wtwork"}
 
@@ -241,6 +255,14 @@ InitSeats == [p \in Paths |-> IF p = "d" /\ "d/f" \in Paths THEN DIR ELSE 3]
 S0 == [refs |-> InitRefs, head |-> "main",
        wt |-> IF "wt" \in Items THEN "dev" ELSE "none",
        stash |-> << >>, seats |-> InitSeats, index |-> IF IndexOn THEN 4 ELSE 0]
+
+\* A capture of source state s (#38): `drift` when a source move raced its
+\* pass (its key is poisoned: never a reuse hit), `inband` when the move
+\* raced the export itself (the bundle's capture-drift-v1 marker: never
+\* laid down). Key drift is `drift` without `inband`: a coherent capture
+\* of the state its snapshot read, which applies.
+CapOf(s, d, ib) == [refs |-> s.refs, head |-> s.head, wt |-> s.wt, stash |-> s.stash,
+                    seats |-> s.seats, index |-> s.index, drift |-> d, inband |-> ib]
 
 NoRow == [has |-> FALSE, oid |-> 0, t |-> 0]
 NoBr == [on |-> FALSE, name |-> "main", old |-> 0, new |-> 0]
@@ -803,16 +825,46 @@ Refuse(i, code) == RefuseAs(i, code, CASE code = "MODIFIED" -> ItemCause(i)
 \* or a crash with no lock left does not justify it.
 Interrupted(i, j) == RefuseAs(i, "INTERRUPTED", j)
 
+\* The source moves that can race a main's capture pass (#38): HEAD
+\* switched to another branch, or the index staged.
+RacedMoves(i) ==
+    IF "race" \in SrcKinds /\ i = "main" /\ srcN < MaxSrc
+    THEN {[src EXCEPT !.head = b] : b \in {b \in Branches : src.refs[b] # 0 /\ b # src.head
+                                                          /\ b # src.wt}}
+         \cup (IF IndexOn THEN {[src EXCEPT !.index = nextV]} ELSE {})
+    ELSE {}
+
 \* E capture_item: a new {item}.capture at the next instant when the
 \* item's projection of the source moved; otherwise the capture reuses
 \* (0 source bytes). A removed source worktree's capture refuses (the S4
 \* lane's GIT_SOURCE_VANISHED) and keeps its record.
+\* #38 (git_carry.rs pass_drift, KeyParts::drift_to and drift_across): a
+\* pass the source raced (s2 # src) records a drifted capture and the
+\* source moves on; never a refusal. Its class is where the move fell:
+\* "export", under the export (pass_drift): the capture holds the state
+\* its snapshot read and is in-band drifted (mark_drift), never laid down;
+\* "after", after the export's last read and before the post-pass key
+\* (drift_across against the export's own reads): the snapshot's state,
+\* coherent, applies; "before", between the pre-pass key and the export's
+\* snapshot: the moved state, coherent, applies. A drifted record's key is
+\* poisoned (E capture_item's `poisoned`), so it is never a reuse hit:
+\* the next pass captures again, even when the source came back to the
+\* drifted capture's state (drift_key_reused: the key kept).
 Capture(i) ==
     /\ i = "wt" => src.wt # "none"
-    /\ Proj(i, src) # Proj(i, caps[capt[i]])
-    /\ caps' = Append(caps, src)
-    /\ capt' = [capt EXCEPT ![i] = Len(caps) + 1]
-    /\ UNCHANGED <<src, srcN, nextV, nat, locks, opLock, dstash, dseat, temp, dindex, wtw, dhead,
+    /\ \E s2 \in {src} \cup RacedMoves(i) :
+       \E cls \in IF s2 = src THEN {"clean"} ELSE {"export", "after", "before"} :
+         LET raced == s2 # src
+         IN /\ \/ raced
+               \/ Proj(i, src) # Proj(i, caps[capt[i]])
+               \/ caps[capt[i]].drift /\ ~Mut("drift_key_reused")
+            /\ caps' = Append(caps, CapOf(IF cls = "before" THEN s2 ELSE src, raced,
+                                         cls = "export"))
+            /\ capt' = [capt EXCEPT ![i] = Len(caps) + 1]
+            /\ src' = s2
+            /\ srcN' = IF raced THEN srcN + 1 ELSE srcN
+            /\ nextV' = IF raced THEN nextV + 1 ELSE nextV
+    /\ UNCHANGED <<nat, locks, opLock, dstash, dseat, temp, dindex, wtw, dhead,
                    prov, refLed, stashLed, refInt, wsLed, wsInt, jour, outcome, why,
                    pc, crashes, opN, fresh, opLive, opStash, opHead, reread,
                    badLine, bkSet, everImported, dur, probe, edSince>>
@@ -841,6 +893,11 @@ RefSettle(i, ret) == [Idle EXCEPT !.st = "r_fin", !.i = i, !.c = capt[i], !.cur 
 Begin(i) ==
     /\ pc.st = "idle"
     /\ i \in Items
+    \* #38: an in-band drifted capture is refused CAPTURE_DRIFTED before
+    \* the apply reads or writes anything (no workspace is laid down from
+    \* it; drift_applied: the code before the marker was read). A key-drift
+    \* capture is a coherent snapshot and applies.
+    /\ ~caps[capt[i]].inband \/ Mut("drift_applied")
     \* Mains run a level before their linked worktrees (E after_mains): a
     \* linked item starts while the main's intent is pending only after the
     \* main refused in this pass.
@@ -1963,7 +2020,7 @@ Init ==
     /\ src = S0
     /\ srcN = 0
     /\ nextV = 5
-    /\ caps = << S0 >>
+    /\ caps = << CapOf(S0, FALSE, FALSE) >>
     /\ capt = [i \in Items |-> 1]
     /\ locks = {}
     /\ temp = [p \in Paths |-> NoSeat]
@@ -2057,7 +2114,8 @@ TypeOK ==
     /\ src.refs \in [Refs -> Nat] /\ src.head \in Branches
     /\ src.wt \in Branches \cup {"none"}
     /\ caps \in Seq([refs : [Refs -> Nat], head : Branches, wt : Branches \cup {"none"},
-                     stash : Seq(Nat), seats : [Paths -> Nat], index : Nat])
+                     stash : Seq(Nat), seats : [Paths -> Nat], index : Nat,
+                     drift : BOOLEAN, inband : BOOLEAN])
     /\ capt \in [Items -> 1..Len(caps)]
     /\ nat \in [Refs -> Nat]
     /\ locks \subseteq Refs \cup {"HEAD:main", "HEAD:wt", "stash", "N:packed"} \cup EmptyLocks
@@ -2172,6 +2230,16 @@ CrashAtomicity ==
                \/ \E i \in Items : wsInt[i].on /\ wsInt[i].br.on /\ wsInt[i].br.name = r
                                    /\ nat[r] \in {wsInt[i].br.old, wsInt[i].br.new}
 
+\* #38 (S5): no capture its export saw drift (in-band, CAPTURE_DRIFTED) is
+\* ever laid down: never the capture an apply in flight works from, never
+\* a journaled capture, never the landing's ledger (review finding 11:
+\* the contract checked directly, not through convergence).
+NoDriftedLanding ==
+    LET clean(c) == c \in 1..Len(caps) => ~caps[c].inband
+    IN /\ \A i \in Items : \A c \in jour[i] : clean(c)
+       /\ \A i \in Items : wsLed[i].has => clean(wsLed[i].t)
+       /\ pc.st # "idle" => clean(pc.c)
+
 \* Wall-clock budget, evaluated on every state (README, "The budget is
 \* state-level").
 WithinBudget == srcN \in 0..MaxSrc => TLCGet("duration") < BudgetSeconds
@@ -2182,6 +2250,18 @@ Witness_Converged == ~\E c \in jour["main"] : c > 1 /\ wsLed["main"].t = c /\ c 
 
 \* A crashed converge settled forward and journaled by a rerun.
 Witness_SettledAfterCrash == ~(crashes > 0 /\ ~wsInt["main"].on /\ \E c \in jour["main"] : c > 1)
+
+\* #38: a drifted capture was followed by a converge that journaled a later
+\* capture: the move a pass raced was carried by the next converging delta.
+Witness_DriftCarried ==
+    ~\E k \in 1..Len(caps) :
+        /\ caps[k].drift
+        /\ \E c \in jour["main"] : c > k /\ wsLed["main"].t = c
+
+\* #38: a key-drift capture (its key poisoned, no in-band marker) was laid
+\* down: the class the code applies is explored, not only refused.
+Witness_KeyDriftLanded ==
+    ~\E c \in jour["main"] : caps[c].drift /\ ~caps[c].inband
 
 \* A captured ref tip that never reached the destination: superseded
 \* before any apply, it is neither native nor at provenance (CORPUS keeps

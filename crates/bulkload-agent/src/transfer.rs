@@ -195,10 +195,10 @@ pub const fn sqlite_mode_label(mode: SqliteMode) -> &'static str {
 /// That is `SQLITE_INTEGRITY_CHECK_FAILED`, and `SQLITE_BACKUP_FAILED` whose
 /// primary code is 11 (`SQLITE_CORRUPT`) or 26 (`SQLITE_NOTADB`): corruption
 /// the backup step itself met, which never reaches `integrity_check` (the
-/// same primary codes a snapshot refusal is remembered by, R10). Transfer
-/// refusals are not yet rows of the closure ledger (WP3 PR 4); until they
-/// are, this is the report's text only, and every other refusal has no
-/// default.
+/// same primary codes a snapshot refusal is remembered by, R10). Since WP3
+/// PR 4 it is also the default disposition of the refusal's closure row
+/// (`closure-report --transfer`, [`crate::transfer_outcome`]), which an
+/// operator review overrides; every other refusal has no default.
 #[must_use]
 pub fn default_disposition(code: &str, sqlite_code: Option<i32>) -> Option<&'static str> {
     let integrity = code == BulkloadRefusal::SqliteIntegrityCheckFailed.code()
@@ -451,6 +451,57 @@ fn canonical_state(state: &Path) -> Result<PathBuf> {
     }
 }
 
+/// `copy`'s S2 overlap decision, read-only.
+///
+/// The source and the destination apart, neither state root inside the
+/// source, and each apart from its own root (WP1 PR 3). [`copy_with`] makes it before either store exists, and
+/// [`crate::transfer_outcome::record_session`] before its first record
+/// write, so a refused overlap writes nothing anywhere (review finding 1).
+///
+/// # Errors
+/// `SNAPSHOT_ROOTS_OVERLAP`, or the refusal of a root that does not resolve.
+pub fn copy_roots_apart(
+    source: &Path,
+    destination: &Path,
+    source_state: &Path,
+    destination_state: &Path,
+) -> Result<()> {
+    let source_root = std::fs::canonicalize(source).refuse_at("transfer::copy")?;
+    let destination_root = std::fs::canonicalize(destination).refuse_at("transfer::copy")?;
+    if overlaps(&source_root, &destination_root) {
+        return Err(BulkloadRefusal::SnapshotRootsOverlap);
+    }
+    // S2 (WP1 PR 3): both halves run at once, so neither state root may be
+    // created inside the source, and each must stay apart from its own root,
+    // all decided before either store exists.
+    let source_state_root = canonical_state(source_state)?;
+    let destination_state_root = canonical_state(destination_state)?;
+    if overlaps(&source_state_root, &source_root)
+        || overlaps(&destination_state_root, &source_root)
+        || overlaps(&destination_state_root, &destination_root)
+    {
+        return Err(BulkloadRefusal::SnapshotRootsOverlap);
+    }
+    Ok(())
+}
+
+/// `pull`'s local half of the same decision, read-only.
+///
+/// The destination state root apart from the destination (the source is
+/// the remote `serve`'s to check). [`receive_with`] checks it again on the open store.
+///
+/// # Errors
+/// `SNAPSHOT_ROOTS_OVERLAP`, or the refusal of a path that does not resolve.
+pub fn receive_roots_apart(destination: &Path, destination_state: &Path) -> Result<()> {
+    if overlaps(
+        &canonical_state(destination)?,
+        &canonical_state(destination_state)?,
+    ) {
+        return Err(BulkloadRefusal::SnapshotRootsOverlap);
+    }
+    Ok(())
+}
+
 /// Run the same framed protocol locally over a bounded Unix stream pair,
 /// in the process's [`sqlite_mode`].
 ///
@@ -484,22 +535,7 @@ pub fn copy_with(
     destination_state: &Path,
     sqlite: SqliteMode,
 ) -> Result<TransferStats> {
-    let source_root = std::fs::canonicalize(source).refuse_at("transfer::copy")?;
-    let destination_root = std::fs::canonicalize(destination).refuse_at("transfer::copy")?;
-    if overlaps(&source_root, &destination_root) {
-        return Err(BulkloadRefusal::SnapshotRootsOverlap);
-    }
-    // S2 (WP1 PR 3): both halves run at once, so neither state root may be
-    // created inside the source, and each must stay apart from its own root,
-    // all decided before either store exists.
-    let source_state_root = canonical_state(source_state)?;
-    let destination_state_root = canonical_state(destination_state)?;
-    if overlaps(&source_state_root, &source_root)
-        || overlaps(&destination_state_root, &source_root)
-        || overlaps(&destination_state_root, &destination_root)
-    {
-        return Err(BulkloadRefusal::SnapshotRootsOverlap);
-    }
+    copy_roots_apart(source, destination, source_state, destination_state)?;
     let (mut sender, mut receiver) =
         std::os::unix::net::UnixStream::pair().refuse_at("transfer::copy")?;
     for stream in [&sender, &receiver] {

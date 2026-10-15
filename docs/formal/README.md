@@ -2440,6 +2440,7 @@ below).
 | `NoReRead` | R25: an item whose journal names its current capture, with no workspace intent of its own pending, reads no content (no stage, no proof). |
 | `CrashAtomicity` | Per item and per component, old or new: under a pending intent every seat, the index, HEAD and the branch HEAD moves to are the intent's old or new value (or absent between a type change's removal and addition), and every ref op of a pending ref intent is old or new; with no intent pending, every component is the ledger's; no worktree exists without its ledger between applies; no probe file is left outside the pass that made it, except until the next apply after a crash. |
 | `OneCheckout` | Review 4 (the blocker): no branch is checked out (or held by a rebase or bisect) by two worktrees, Git's own invariant: a commit in either would move the branch under the other's index and files. |
+| `NoDriftedLanding` | #38 (2026-10-15, review finding 11): no capture whose export a source move raced (in-band drift, `CAPTURE_DRIFTED`) is ever laid down: never the capture an apply in flight works from, never a journaled capture, never the landing's ledger. A key-drift capture (the move outside the export's window) is a coherent snapshot and may land. |
 | `ConvergesWhenQuiet` | Liveness (`LiveSpec`: fair captures, strong fairness per item's apply): once the source and the operator stop with no operator edit left and no lock that only its owner or the operator may remove, every item reaches the source, the ruled exceptions aside (a kept local branch or tag, a ref whose name conflicts with a kept one, HEAD detached for that reason). |
 | `NoWedge` | Liveness: no item refuses forever unless an operator edit of its own checkout or HEAD branch stays, or a lock no content proves bulkload's (an empty one: a live writer's, or a killed delete's until the operator removes it as Git instructs; review 4's stated exception). |
 
@@ -2490,6 +2491,8 @@ below).
 | `packed_new_kept` | `NoWedge` | CODE BEFORE THE FIX (review 4): a `packed-refs.new` a killed delete left was never removed, so every rerun's delete failed on it once the stale lock was gone |
 | `stash_reflog_unsynced` | `TypedRefusal` | CODE BEFORE THE FIX (review 4): `update-ref` appends the stash reflog and never syncs it; a power loss left it behind the records naming it |
 | `recovery_overwrites` | `NoLocalWorkLost` | CODE BEFORE THE FIX (review 4): a crashed first linked landing's recovery checked HEAD only and laid its index and seats over the operator's work |
+| `drift_key_reused` | `ConvergesWhenQuiet` | #38 (2026-10-15): a capture a source move raced records the key its pass computed, not a poisoned one, so when the source comes back to the raced snapshot's state the next pass is a reuse hit on a capture no apply lays down |
+| `drift_applied` | `NoDriftedLanding` | #38 review finding 11: `Begin` is enabled on a capture its export saw drift (the in-band marker not read), so an apply lays down a capture that does not hold what moved under it |
 
 ### Results (EstateConverge)
 
@@ -2600,6 +2603,64 @@ every one a Rust definition on this branch; none pending.
 | `MC_ec_neg_packed_new_kept` | fail | FAIL | NoWedge | 849 | - | 93s |
 | `MC_ec_neg_stash_reflog_unsynced` | fail | FAIL | TypedRefusal | 105 | 25 | 78s |
 | `MC_ec_neg_recovery_overwrites` | fail | FAIL | NoLocalWorkLost | 55 | 14 | 97s |
+
+### #38: captures raced by the source (2026-10-15)
+
+S5 under OI-1003-Q152 (no freeze window): the full run closes by
+converging deltas while the source stays live, so a capture pass an agent
+races (a commit, a switch, a `git add` in the captured checkout) is drift
+custody, never `GIT_AUTHORITY_CHANGED`. The model's `Capture(i)` gains that
+case as one action (so every earlier row's coverage is unchanged): under
+`SrcKinds` `"race"` the main's pass may be raced by a HEAD switch or an
+index stage, and the source moves on. The code has two drift classes, and
+the model has both (review finding 5, 2026-10-15): export drift (the move
+under the export: `pass_drift`, `mark_drift`) records a capture of the
+state its snapshot read marked `drift` and `inband`, which `Begin(i)` is
+not enabled on (the code refuses `CAPTURE_DRIFTED` before it reads or
+writes anything); key drift (the move between the pre-pass key and the
+export's snapshot, or after the export's last read: `drift_across`)
+records a coherent capture, of the moved state or of the snapshot's,
+marked `drift` only, which applies as the code applies it
+(`a_key_only_drifted_capture_is_a_coherent_snapshot_and_applies`). Every
+drifted capture is never a reuse hit (the code poisons its key), so
+`Capture(i)` is enabled again even when the source comes back to the
+drifted state. `NoDriftedLanding` states the `CAPTURE_DRIFTED` contract
+directly (review finding 11: before it, removing `Begin`'s guard left
+`MC_ec_capture_raced` passing, because a capture of an earlier source
+state is harmless in the model, and only `MC_ec_neg_drift_key_reused`
+noticed); `drift_applied` removes the guard and must violate it. Code:
+`git_carry.rs` `pass_drift`, `mark_drift`, `KeyParts::drift_to` and
+`drift_across`, `estate.rs` `capture_item`'s `poisoned`; Rust rows P87.
+
+| config | expect | outcome | violated | distinct | depth | wall |
+|---|---|---|---|---:|---:|---:|
+| `MC_ec_capture_raced` (LiveSpec) | pass | PASS | - | 135185 | 61 | 115s |
+| `MC_ec_reach_drift_carried` | reach | REACHED | Witness_DriftCarried | 1201 | 14 | 13s |
+| `MC_ec_reach_key_drift_landed` | reach | REACHED | Witness_KeyDriftLanded | 1182 | 14 | 15s |
+| `MC_ec_neg_drift_key_reused` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 1635 | - | 20s |
+| `MC_ec_neg_drift_applied` | fail | FAIL | NoDriftedLanding | 37 | 4 | 13s |
+
+(Reach and fail rows stop at their first violation; with three workers
+their distinct counts vary from run to run. The pass row's count is
+exact: 135185 in both the targeted and the full run.)
+
+Every `MC_ec_` row (89 and the budget self-test) was run again on the
+changed spec and catalogue, 2026-10-15 (review round), `just tla-check`
+with all of them, `-workers 3`, nice 10, on sting at load average 40 to
+53: each matched its expectation (34 PASS, 49 FAIL, 5 REACHED, 1
+SIMULATION, the self-test INCONCLUSIVE), total wall 3133 s, peak RSS 2370
+MiB, and every pass row but `MC_ec_capture_raced` explored the same number
+of distinct states as in the results above (the raced classes are not
+enabled without `"race"`, and `NoDriftedLanding`, now checked by every
+pass row, adds no state). The distinct counts in this section's table are
+the review round's (before it, with one drift class: 13027).
+
+What the rows do not prove: the drifted capture's content is the
+pre-move state as a whole (the code also withdraws seats that drifted
+under the byte pass, which only the Rust rows check); HEAD and index moves
+are modelled for the main only; nested worktrees (including a HEAD moved
+away and back across the windows outside the export, review finding 4)
+and the stash reflog (which still refuses) are the Rust rows'.
 
 ### Findings (EstateConverge)
 

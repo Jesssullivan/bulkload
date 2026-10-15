@@ -478,8 +478,26 @@ impl Ledger {
 /// bound elsewhere; the plan's and the ledger's read refusals; `IO` when
 /// another writer holds the lock or a write fails.
 pub fn record(path: &Path, plan: &Path, source_label: &str, row: Row) -> Result<Ledger> {
+    record_joined(path, plan, source_label, row, &[])
+}
+
+/// [`record`], where an item row may also name a joined transfer row.
+///
+/// One of `joined` is a transfer row the caller's closure report joined (WP3 PR 4, `closure-dispose
+/// --transfer`) and proved holds the refusal it reviews. Every other item
+/// must still be one `plan` holds.
+///
+/// # Errors
+/// As [`record`].
+pub fn record_joined(
+    path: &Path,
+    plan: &Path,
+    source_label: &str,
+    row: Row,
+    joined: &[String],
+) -> Result<Ledger> {
     let digest = plan_digest(plan)?;
-    if let Some(item) = row.item() {
+    if let Some(item) = row.item().filter(|item| !joined.iter().any(|j| j == item)) {
         let mut planned = false;
         for candidate in crate::estate::inspect(plan)? {
             planned |= crate::estate::id(&candidate)? == item;

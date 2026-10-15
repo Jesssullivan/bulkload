@@ -129,6 +129,46 @@ when no line reports it), and the verdict records each total and how many
 runs reported it. In evidence mode an ON run that does not report both
 counters is INCONCLUSIVE, so evidence always carries them.
 
+Alongside a real run (#165; S5 under OI-1003-Q152: no freeze window, so
+the full neo->sting run is not a window the instrument can switch). `observe`
+runs the same reference workload and load1 sampler on the source host, for
+as long as the run takes, and starts nothing else: no ON command, no child
+but its own fixed-input git, rg/grep, sysctl and pmset probes. It reads the
+host's load (sysctl vm.loadavg on Darwin, /proc/loadavg on Linux), which is
+the live agents' load plus bulkload's, and what the agents' work feels like
+through the workload's own latencies. It never lists, signals, attaches to
+or asks about any agent process (R-N11, R-N104). Rows stream to
+OUT/rows.jsonl as they are taken (flushed per row, fsynced every 30 s),
+missed workload ticks included, so a long observation survives the
+instrument being stopped; power is sampled every 60 s (R-N81), and every
+sampler row carries the wall clock beside its monotonic offset. It ends
+when --stop-file appears, at --max-seconds, or on SIGTERM or SIGHUP (which
+it only receives), and then writes a terminal `end` row and its header's
+end. An observation with no recorded end (killed, or lost with its host)
+is cut short: `alongside` gives INCONCLUSIVE, as it does when the wall
+clock and the monotonic clock part by more than 2 s (a sleep or a clock
+step would map the run's intervals onto the wrong rows).
+The run's own record says when bulkload ran on the source: an intervals
+file of `START END [LABEL]` lines (epoch seconds or ISO-8601 UTC), or of
+`on TIME` / `off TIME` marks that `mark FILE on|off` appends around each
+delta pass. `alongside OBSERVE_DIR --intervals FILE` joins the two: the
+intervals are the ON windows, the gaps between them the OFF windows (a
+window under --min-window-seconds is dropped and listed). Each ON window
+starts one settle (60 s) before its pass, taken from the gap before it, so
+the settled span `analyze` measures is the pass itself, its first minute
+included. The verdict is
+`analyze`'s, unchanged, written with OUT/alongside/evidence.tsv, one row per
+gated metric, per noise floor and per window. An ON interval still open when
+the observation ended makes the verdict INCONCLUSIVE. `alongside --evidence`
+labels it evidence only under the alongside protocol: every kept window at
+least 300 s, at least five, alternating OFF and ON once adjacent windows of
+one state are merged (OFF first and last, at least two ON), every ON window
+with its whole settle before its pass, the pinned gate, AC power at every window
+boundary and the OFF baseline under R-N81's load limit; coordinator quiet is
+not asked for (the source stays live, Q152), and the ON runs' priority and
+source-write counters are not seen (the run's own counters lines carry
+them).
+
 Output: OUT/trace.json (config, host, every sample, windows, verdict),
 OUT/summary.md, and OUT/on-runs/ (a log and a run_dir per ON run). The work
 directory is removed at the end unless --keep-workdir.
@@ -136,6 +176,11 @@ directory is removed at the end unless --keep-workdir.
   run --source SRC --out OUT [options] -- ON_COMMAND...
   run --source SRC --out OUT --aa [options]
   analyze TRACE.json [gate options]   re-derive the verdict from a trace
+  observe --source SRC --out OUT [--stop-file F] [--max-seconds N]
+                                      sample alongside a real run (#165)
+  mark FILE on|off [--label L]        append a run-interval mark
+  alongside OBSERVE_DIR --intervals FILE [--evidence] [gate options]
+                                      the verdict of an observation
   selftest                            run test_s2_budget.py
 
 Exit: 0 complete (the verdict is in the output, whatever it is), 2 refused
@@ -156,6 +201,7 @@ import platform
 import random
 import re
 import shutil
+import signal
 import sqlite3
 import statistics
 import subprocess
@@ -563,6 +609,8 @@ def protocol_problems(config: dict, gate: dict) -> list[str]:
     """Why a run with this configuration and gate is not the S2 evidence
     protocol, or [] when it is. `run --evidence` refuses on any of them and
     `analyze` labels a trace evidence only when there are none."""
+    if config.get("alongside"):
+        return alongside_problems(config, gate)
     out = []
     if config.get("aa"):
         out.append("an A/A run is a noise measurement, not evidence")
@@ -578,6 +626,12 @@ def protocol_problems(config: dict, gate: dict) -> list[str]:
         out.append(f"evidence keeps --max-runs at {DEFAULT_MAX_RUNS} or more")
     if not config.get("coordinator_quiet"):
         out.append("evidence needs --coordinator-quiet (R-N91)")
+    return out + pinned_gate_problems(gate)
+
+
+def pinned_gate_problems(gate: dict) -> list[str]:
+    """The gate values evidence pins, and the floors it only lets rise."""
+    out = []
     for key in EVIDENCE_PINNED:
         if gate.get(key) != DEFAULT_GATE[key]:
             out.append(
@@ -591,6 +645,43 @@ def protocol_problems(config: dict, gate: dict) -> list[str]:
                 f"evidence needs {key} of at least {DEFAULT_GATE[key]} (got {value})"
             )
     return out
+
+
+def alongside_problems(config: dict, gate: dict) -> list[str]:
+    """Why an observation alongside a real run (#165) is not evidence, or []:
+    its kept windows are the run's own intervals, so each must be long
+    enough on its own, and there must be enough of them. No coordinator quiet
+    and no ON-command settings apply (OI-1003-Q152: the source stays live)."""
+    out = []
+    if (config.get("window_seconds") or 0) < EVIDENCE_MIN_WINDOW:
+        out.append(
+            f"evidence needs every window at least {EVIDENCE_MIN_WINDOW:.0f} s "
+            f"(the shortest kept is {config.get('window_seconds') or 0:.0f} s)"
+        )
+    pattern = config.get("pattern") or []
+    if len(pattern) < EVIDENCE_MIN_WINDOWS:
+        out.append(f"evidence needs at least {EVIDENCE_MIN_WINDOWS} windows")
+    # Run mode's pattern rule, on the kept windows: a dropped short pass
+    # splits one OFF gap into two kept OFF windows, which must not count as
+    # two. Merged, the pattern alternates OFF/ON/.../OFF with at least two
+    # ON windows, so the bootstrap's between-window spread is a real one.
+    merged = [s for i, s in enumerate(pattern) if i == 0 or pattern[i - 1] != s]
+    if merged.count(ON) < 2 or merged[:1] != [OFF] or merged[-1:] != [OFF]:
+        out.append(
+            "evidence needs at least 2 ON and 3 OFF windows in alternation, "
+            f"OFF first and last, once adjacent windows of one state merge "
+            f"(kept pattern {','.join(pattern) or '-'})"
+        )
+    for index, lead in config.get("short_leads") or []:
+        out.append(
+            f"evidence needs each pass's whole settle "
+            f"({gate.get('settle_seconds', 0):.0f} s) observed before it: ON "
+            f"window {index} had {lead:.0f} s, so the start of its pass was "
+            "not measured"
+        )
+    if config.get("open_interval"):
+        out.append("an ON interval was still open when the observation ended")
+    return out + pinned_gate_problems(gate)
 
 
 def load1_level(
@@ -795,6 +886,8 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     gate = {**recorded, **(overrides or {})}
     config = trace.get("config", {})
     aa = bool(config.get("aa"))
+    # #165: the ON windows are a real run's intervals; it started no command.
+    alongside = bool(config.get("alongside"))
     windows = trace["windows"]
     settle = gate["settle_seconds"]
     budget, budget_load = gate["budget_p95"], gate["budget_load1"]
@@ -988,7 +1081,9 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                     f"not under {LOAD_LIMIT}"
                 )
     structural.extend(rn81)
-    if not aa:
+    if config.get("open_interval"):
+        structural.append("an ON interval was still open when the observation ended")
+    if not aa and not alongside:
         requested = config.get("priority")
         for w in windows:
             if w["state"] != ON:
@@ -1580,6 +1675,8 @@ def render_summary(trace: dict, verdict: dict) -> str:
     config, host = trace["config"], trace["host"]
     label = "" if verdict["evidence"] else f" ({NOT_EVIDENCE})"
     kind = "A/A noise run" if config["aa"] else "S2 budget run"
+    if config.get("alongside"):
+        kind = "S2 budget alongside a real run"
     gate = verdict["gate"]
     response = verdict["load1_model"]["response_to_unit_add"]
     wal_index = verdict["source_wal_index_touched"]
@@ -1627,8 +1724,14 @@ def render_summary(trace: dict, verdict: dict) -> str:
         f"- Windows: {','.join(config['pattern'])} x {config['window_seconds']:.0f} s, "
         f"settle {gate['settle_seconds']:.0f} s; {trace['start_utc']} to "
         f"{trace.get('end_utc')}",
-        f"- ON command: `{' '.join(config['on_command']) or '(none, A/A)'}` at "
-        f"priority `{config['priority']}`, repeat={config['repeat']}",
+        (
+            f"- ON windows: the run's own intervals (`{config.get('intervals')}`); "
+            f"{len(config.get('dropped_windows', []))} window(s) under "
+            f"{config.get('min_window_seconds')} s dropped; nothing was started"
+            if config.get("alongside")
+            else f"- ON command: `{' '.join(config['on_command']) or '(none, A/A)'}` at "
+            f"priority `{config['priority']}`, repeat={config['repeat']}"
+        ),
         f"- Workload: {config['workload']}; source `{config['source']}`, workdir "
         f"`{config['workdir']}`",
         f"- Skipped ticks: {trace.get('skipped_ticks')}; settled workload ticks "
@@ -1792,6 +1895,637 @@ def command_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- alongside a real run (#165) ---------------------------------------------
+
+ALONGSIDE_SCHEMA = "bulkload.s2-alongside.v1"
+ALONGSIDE_RULINGS = RULINGS + ", OI-1003-Q152 (no freeze window), OI-1003-Q155"
+# Power is sampled this often while observing (R-N81), and rows are fsynced
+# this often, so an observation the instrument does not finish keeps them.
+POWER_EVERY_S = 60.0
+FSYNC_EVERY_S = 30.0
+# Every sampler row carries time.time() beside its monotonic offset. When
+# they part by more than this, the host slept or its clock stepped, and the
+# run's wall-clock intervals no longer map onto the rows (#165 review).
+CLOCK_SLACK_S = 2.0
+# What ends an observation besides its stop file and its bound. Received
+# only: the instrument never sends one (R-N11).
+OBSERVE_END_SIGNALS = ("SIGTERM", "SIGHUP")
+# A single observation ends here at the latest: twelve hours.
+DEFAULT_OBSERVE_SECONDS = 12 * 3600.0
+ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+class RowSink:
+    """JSON-lines rows, one writer at a time: each row flushed as it is
+    written, the file fsynced at most every FSYNC_EVERY_S and on close."""
+
+    def __init__(self, path: Path) -> None:
+        self.handle = path.open("a", encoding="utf-8")
+        self.lock = threading.Lock()
+        self.synced = time.monotonic()
+
+    def write(self, row: dict) -> None:
+        with self.lock:
+            self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+            self.handle.flush()
+            if time.monotonic() - self.synced >= FSYNC_EVERY_S:
+                os.fsync(self.handle.fileno())
+                self.synced = time.monotonic()
+
+    def close(self) -> None:
+        with self.lock:
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+            self.handle.close()
+
+
+def observe_refusals(args: argparse.Namespace) -> list[str]:
+    out = []
+    if args.max_seconds <= 0:
+        out.append("--max-seconds must be positive")
+    source = args.source.resolve()
+    if not source.is_dir():
+        out.append(f"source {source} is not a directory")
+    out_dir = args.out.resolve()
+    if out_dir.exists():
+        out.append(f"out {out_dir} already exists")
+    elif not out_dir.parent.is_dir():
+        out.append(f"out parent {out_dir.parent} is not a directory")
+    if source.is_dir() and is_within(out_dir, source):
+        out.append(f"out {out_dir} is inside the source")
+    if (
+        args.stop_file
+        and source.is_dir()
+        and is_within(args.stop_file.resolve(), source)
+    ):
+        out.append("--stop-file is inside the source")
+    return out
+
+
+def observe_session(args: argparse.Namespace, workdir: Path, out_dir: Path) -> dict:
+    """Sample the reference workload and load1 until the stop file appears
+    or --max-seconds pass. Starts nothing but the workload's own probes."""
+    git = shutil.which("git")
+    tool, search = search_command(workdir / "tree")
+    source_name = load_source()
+    workdir.mkdir()
+    build_fixtures(workdir, git)
+    workload = Workload(workdir, git, search)
+    workload.step()  # warm-up, not recorded
+    header = {
+        "schema": ALONGSIDE_SCHEMA,
+        "rulings": ALONGSIDE_RULINGS,
+        "label": args.label,
+        "config": {
+            "source": str(args.source.resolve()),
+            "workdir": str(workdir),
+            "out": str(out_dir),
+            "stop_file": str(args.stop_file) if args.stop_file else None,
+            "max_seconds": args.max_seconds,
+            "search_tool": tool,
+            "workload": "v0: jsonl+fsync, sqlite WAL synchronous=FULL, "
+            "git status+diff, search",
+        },
+        "host": host_record(git, search, source_name, workload.git_env),
+        "start_utc": utc_now(),
+        "end_utc": None,
+        "end_reason": None,
+        "errors": [],
+        "skipped_ticks": {},
+    }
+    sink = RowSink(out_dir / "rows.jsonl")
+    stop = threading.Event()
+    origin = time.monotonic()
+    header["origin_epoch"] = time.time()
+    (out_dir / "observe.json").write_text(json.dumps(header, indent=1) + "\n")
+    until = origin + args.max_seconds
+    errors = header["errors"]
+    last_power = [-math.inf]
+
+    def work() -> None:
+        t = round(time.monotonic() - origin, 3)
+        results = workload.step()
+        for name, ms, error in results:
+            row = {
+                "k": "lat",
+                "t": t,
+                "op": name,
+                "ms": round(ms, 3),
+                "ok": error is None,
+            }
+            if error:
+                row["error"] = error
+            sink.write(row)
+        sink.write(
+            {
+                "k": "lat",
+                "t": t,
+                "op": STEP,
+                "ms": round(sum(ms for _, ms, _ in results), 3),
+                "ok": all(error is None for _, _, error in results),
+            }
+        )
+
+    def sample() -> None:
+        t = round(time.monotonic() - origin, 3)
+        try:
+            load1 = read_load1(source_name)
+            sink.write(
+                {"k": "load", "t": t, "e": round(time.time(), 3), "load1": load1}
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            errors.append(f"load1 at {t}: {type(exc).__name__}: {exc}")
+        if t - last_power[0] >= POWER_EVERY_S:
+            last_power[0] = t
+            sink.write({"k": "power", "t": t, "power": r23_ab.power_source()})
+
+    class MissedRows:
+        """Each missed tick goes to disk as the loop skips it, so an
+        observation stopped without its end keeps its coordinated-omission
+        rows (#165 review)."""
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def append(self, item: tuple[float, float]) -> None:
+            t, lag = item
+            sink.write({"k": "missed", "loop": self.name, "t": t, "lag_ms": lag})
+
+    def loop(name: str, phase: float, body) -> threading.Thread:
+        def target() -> None:
+            try:
+                header["skipped_ticks"][name] = cadence(
+                    origin, phase, stop, until, body, MissedRows(name)
+                )
+            except Exception as exc:  # recorded; the verdict is INCONCLUSIVE
+                errors.append(f"{name} loop: {type(exc).__name__}: {exc}")
+
+        return threading.Thread(target=target, name=f"s2-observe-{name}")
+
+    # SIGTERM and SIGHUP end the observation as its stop file does, so its
+    # end is recorded. Received only, and only from the main thread.
+    requested: list[str] = []
+    wake = threading.Event()
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for name in OBSERVE_END_SIGNALS:
+            number = getattr(signal, name)
+
+            def handler(_signum, _frame, name=name) -> None:
+                requested.append(name)
+                wake.set()
+
+            previous[number] = signal.signal(number, handler)
+    loops = [loop("sampler", 0.0, sample), loop("workload", 0.5, work)]
+    for thread in loops:
+        thread.start()
+    try:
+        while True:
+            if requested:
+                header["end_reason"] = requested[0]
+                break
+            if args.stop_file and args.stop_file.exists():
+                header["end_reason"] = "stop file"
+                break
+            if time.monotonic() >= until:
+                header["end_reason"] = "max seconds"
+                break
+            wake.wait(1.0)
+    finally:
+        stop.set()
+        for thread in loops:
+            thread.join()
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        workload.close()
+        end_t = round(time.monotonic() - origin, 3)
+        sink.write({"k": "power", "t": end_t, "power": r23_ab.power_source()})
+        header["span_s"] = end_t
+        header["end_epoch"] = time.time()
+        header["end_utc"] = utc_now()
+        # The terminal row: only an observation that ended writes it. One
+        # an exception ended has no end_reason and no end row: cut short.
+        if header["end_reason"]:
+            sink.write({"k": "end", "t": end_t, "reason": header["end_reason"]})
+        sink.close()
+        (out_dir / "observe.json").write_text(json.dumps(header, indent=1) + "\n")
+    return header
+
+
+def command_observe(args: argparse.Namespace) -> int:
+    refusals = observe_refusals(args)
+    source = args.source.resolve()
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    workdir = (args.workdir or source.parent / f"s2-observe-workload-{stamp}").resolve()
+    if source.is_dir():
+        refusal = workdir_refusal(source, workdir)
+        if refusal:
+            refusals.append(refusal)
+    if not shutil.which("git"):
+        refusals.append("git is not on PATH")
+    if search_command(workdir / "tree") is None:
+        refusals.append("neither rg nor grep is on PATH")
+    if refusals:
+        for refusal in refusals:
+            say(f"refused reason={refusal!r}")
+        return 2
+    out_dir = args.out.resolve()
+    out_dir.mkdir()
+    say(
+        f"observe workdir={workdir} out={out_dir} stop_file={args.stop_file} "
+        f"max_seconds={args.max_seconds}"
+    )
+    try:
+        header = observe_session(args, workdir, out_dir)
+    except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
+        say(f"aborted reason={f'{type(exc).__name__}: {exc}'!r}")
+        return 3
+    finally:
+        if workdir.exists() and not args.keep_workdir:
+            shutil.rmtree(workdir)
+    say(
+        f"observed span_s={header['span_s']} end={header['end_reason']} "
+        f"errors={len(header['errors'])} rows={out_dir / 'rows.jsonl'}"
+    )
+    return 0
+
+
+def parse_time(text: str) -> float:
+    """Epoch seconds, or ISO-8601 UTC (`2026-10-15T10:00:00Z`)."""
+    if ISO_UTC.match(text):
+        stamp = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return stamp.timestamp()
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"not a time: {text!r}")
+    return value
+
+
+def parse_intervals(text: str) -> tuple[list[tuple[float, float]], bool, list[str]]:
+    """The run's ON intervals, in epoch seconds, merged; whether one was
+    still open (an `on` with no `off`); and the lines that did not parse.
+    Lines: `START END [LABEL]`, or `on TIME [LABEL]` / `off TIME [LABEL]`;
+    `#` starts a comment."""
+    intervals: list[tuple[float, float]] = []
+    problems: list[str] = []
+    opened: float | None = None
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        try:
+            if parts[0] in ("on", "off"):
+                at = parse_time(parts[1])
+                if parts[0] == "on":
+                    if opened is not None:
+                        raise ValueError("on after on")
+                    opened = at
+                else:
+                    if opened is None or at < opened:
+                        raise ValueError("off without an earlier on")
+                    intervals.append((opened, at))
+                    opened = None
+            else:
+                start, end = parse_time(parts[0]), parse_time(parts[1])
+                if end < start:
+                    raise ValueError("ends before it starts")
+                intervals.append((start, end))
+        except (IndexError, ValueError) as exc:
+            problems.append(f"line {number}: {exc}: {raw.strip()!r}")
+    open_interval = opened is not None
+    if open_interval:
+        intervals.append((opened, math.inf))
+    intervals.sort()
+    merged: list[tuple[float, float]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged, open_interval, problems
+
+
+def derive_windows(
+    intervals: list[tuple[float, float]],
+    span: float,
+    min_window: float,
+    lead: float = 0.0,
+) -> tuple[list[dict], list[dict]]:
+    """OFF and ON windows over [0, span] from ON intervals already relative
+    to the observation's origin: each interval an ON window, each gap an OFF
+    window. Each ON window starts `lead` seconds before its interval (the
+    settle `analyze` drops, so the settled span is the pass itself), taken
+    from the gap before it; `lead_s` records how much it got, less when the
+    gap or the observation before the pass was shorter. A window under
+    min_window is dropped (returned apart); the rest are renumbered in time
+    order."""
+    raw = []
+    cursor = 0.0
+    for start, end in intervals:
+        end = min(span, end)
+        if end <= cursor or start >= span:
+            continue
+        begin = max(cursor, start - lead)
+        if begin > cursor:
+            raw.append((OFF, cursor, begin, None))
+        raw.append((ON, begin, end, max(0.0, start - begin)))
+        cursor = end
+    if cursor < span:
+        raw.append((OFF, cursor, span, None))
+    kept, dropped = [], []
+    for state, start, end, lead_s in raw:
+        window = {"state": state, "start": round(start, 3), "end": round(end, 3)}
+        if lead_s is not None:
+            window["lead_s"] = round(lead_s, 3)
+        (kept if end - start >= min_window else dropped).append(window)
+    for index, window in enumerate(kept):
+        window["index"] = index
+    return kept, dropped
+
+
+def power_at(power: list[dict], t: float) -> str:
+    """The power state sampled nearest before `t` (else the first after)."""
+    before = [row for row in power if row["t"] <= t]
+    if before:
+        return before[-1]["power"]
+    return power[0]["power"] if power else "unrecorded"
+
+
+def read_observation(directory: Path) -> tuple[dict, list[dict]]:
+    header = json.loads((directory / "observe.json").read_text())
+    if header.get("schema") != ALONGSIDE_SCHEMA:
+        raise ValueError(f"{directory} holds no {ALONGSIDE_SCHEMA} observation")
+    rows = []
+    with (directory / "rows.jsonl").open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                # A row torn by an observation that did not finish.
+                header.setdefault("errors", []).append("a torn row was skipped")
+    return header, rows
+
+
+def alongside_trace(
+    header: dict,
+    rows: list[dict],
+    intervals_text: str,
+    intervals_name: str,
+    min_window: float,
+    evidence: bool,
+    gate: dict,
+) -> dict:
+    """An `analyze` trace from an observation and the run's intervals."""
+    intervals, open_interval, problems = parse_intervals(intervals_text)
+    origin = header["origin_epoch"]
+    last = max((row["t"] for row in rows if "t" in row), default=0.0)
+    span = header.get("span_s") or last
+    settle = gate["settle_seconds"]
+    relative = [(start - origin, end - origin) for start, end in intervals]
+    kept, dropped = derive_windows(relative, span, min_window, lead=settle)
+    # An observation that never recorded its end was stopped before it
+    # closed its record (killed, or its host lost): what it missed after
+    # its last row is unknown, and so is whether its tail is whole.
+    cut_short = None
+    if not header.get("end_reason") or header.get("span_s") is None:
+        cut_short = "the observation recorded no end (stopped before it closed)"
+    elif not any(row.get("k") == "end" for row in rows):
+        cut_short = "rows.jsonl has no end row (its tail was lost)"
+    # The run's intervals are wall-clock; rows are monotonic offsets from
+    # one origin. Every sampler row carries both, so a sleep or a clock step
+    # that parts them is seen, never silently mapped onto the wrong rows.
+    clock_errors = []
+    sampled = [row for row in rows if row.get("k") == "load"]
+    if any("e" not in row for row in sampled):
+        clock_errors.append("clock: sampler rows carry no wall clock")
+    elif sampled:
+        worst = max(abs(row["e"] - origin - row["t"]) for row in sampled)
+        if worst > CLOCK_SLACK_S:
+            clock_errors.append(
+                f"clock: wall and monotonic clocks parted by {worst:.1f} s "
+                f"(over {CLOCK_SLACK_S:.0f} s: a sleep or a clock step)"
+            )
+    short_leads = [
+        [window["index"], window["lead_s"]]
+        for window in kept
+        if window["state"] == ON and window["lead_s"] < settle - EPS
+    ]
+    power = sorted(
+        (row for row in rows if row.get("k") == "power"), key=lambda r: r["t"]
+    )
+    for window in kept:
+        window["planned_end"] = window["end"]
+        window["overrun_s"] = 0.0
+        window["power_start"] = power_at(power, window["start"])
+        window["power_end"] = power_at(power, window["end"])
+    errors = (
+        list(header.get("errors", []))
+        + [f"intervals {problem}" for problem in problems]
+        + clock_errors
+    )
+    return {
+        "schema": SCHEMA,
+        "rulings": header.get("rulings", ALONGSIDE_RULINGS),
+        "label": header.get("label", ""),
+        "config": {
+            "evidence": evidence,
+            "aa": False,
+            "alongside": True,
+            "intervals": intervals_name,
+            "open_interval": open_interval,
+            "short_leads": short_leads,
+            "min_window_seconds": min_window,
+            "dropped_windows": dropped,
+            "source": header["config"]["source"],
+            "workdir": header["config"]["workdir"],
+            "out": header["config"]["out"],
+            "pattern": [window["state"] for window in kept],
+            "window_seconds": min((w["end"] - w["start"] for w in kept), default=0.0),
+            "priority": None,
+            "repeat": True,
+            "max_runs": DEFAULT_MAX_RUNS,
+            "on_command": [],
+            "coordinator_quiet": False,
+            "search_tool": header["config"]["search_tool"],
+            "workload": header["config"]["workload"],
+        },
+        "gate": gate,
+        "host": header["host"],
+        "start_utc": header["start_utc"],
+        "end_utc": header.get("end_utc"),
+        "windows": kept,
+        "latency": [
+            {key: row[key] for key in ("t", "op", "ms", "ok", "error") if key in row}
+            for row in rows
+            if row.get("k") == "lat"
+        ],
+        "load": [
+            {"t": row["t"], "load1": row["load1"]}
+            for row in rows
+            if row.get("k") == "load"
+        ],
+        "errors": errors,
+        "skipped_ticks": header.get("skipped_ticks", {}),
+        "missed_ticks": {
+            "workload": [
+                {"t": row["t"], "lag_ms": row["lag_ms"]}
+                for row in rows
+                if row.get("k") == "missed" and row.get("loop") == "workload"
+            ]
+        },
+        "cut_short": cut_short,
+    }
+
+
+def evidence_rows(trace: dict, verdict: dict) -> list[list[str]]:
+    """One row per gated metric, per noise floor, per window and the
+    verdict: what a docs/evidence table or a Linear comment carries."""
+
+    def cell(value) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, float):
+            return f"{value:.4f}"
+        return str(value)
+
+    gate = verdict["gate"]
+    label = "evidence" if verdict["evidence"] else "not-evidence"
+    out = [["kind", "name", "value", "lower", "upper", "budget", "decision", "label"]]
+    out.append(
+        [
+            "verdict",
+            "S2",
+            verdict["status"],
+            "-",
+            "-",
+            "-",
+            "; ".join(verdict["reasons"]) or "-",
+            label,
+        ]
+    )
+    for metric in METRICS:
+        low, high = verdict["delta_p95_bounds"][metric]
+        decision = verdict["gates"]["step"] if metric == STEP else "each-op"
+        out.append(
+            [
+                "delta_p95",
+                metric,
+                cell(verdict["delta_p95_by_metric"][metric]),
+                cell(low),
+                cell(high),
+                cell(gate["budget_p95"]),
+                cell(decision),
+                label,
+            ]
+        )
+    low, high = verdict["delta_load1_bounds"]
+    out.append(
+        [
+            "delta_load1",
+            "load1",
+            cell(verdict["delta_load1"]),
+            cell(low),
+            cell(high),
+            cell(gate["budget_load1"]),
+            cell(verdict["gates"]["load1"]),
+            label,
+        ]
+    )
+    out.append(
+        [
+            "noise",
+            "p95",
+            cell(verdict["noise_p95"]),
+            "-",
+            "-",
+            cell(gate["budget_p95"] / 2),
+            "-",
+            label,
+        ]
+    )
+    out.append(
+        [
+            "noise",
+            "load1",
+            cell(verdict["noise_load1"]),
+            "-",
+            "-",
+            cell(gate["budget_load1"] / 2),
+            "-",
+            label,
+        ]
+    )
+    for raw, stats in zip(trace["windows"], verdict["windows"], strict=True):
+        out.append(
+            [
+                "window",
+                f"{raw['index']}:{raw['state']}:{raw['start']:.0f}-{raw['end']:.0f}s",
+                cell(stats["p95_ms"][STEP]),
+                cell(stats["load1_level"]),
+                "-",
+                "-",
+                f"power {raw.get('power_start')}/{raw.get('power_end')}",
+                label,
+            ]
+        )
+    return out
+
+
+def command_alongside(args: argparse.Namespace) -> int:
+    directory = args.observation.resolve()
+    try:
+        header, rows = read_observation(directory)
+        intervals_text = args.intervals.read_text()
+    except (OSError, ValueError) as exc:
+        say(f"refused reason={f'{type(exc).__name__}: {exc}'!r}")
+        return 2
+    gate = {
+        key: getattr(args, key)
+        if getattr(args, key, None) is not None
+        else DEFAULT_GATE[key]
+        for key in DEFAULT_GATE
+    }
+    trace = alongside_trace(
+        header,
+        rows,
+        intervals_text,
+        str(args.intervals),
+        args.min_window_seconds,
+        bool(args.evidence),
+        gate,
+    )
+    verdict = analyze(trace)
+    trace["verdict"] = verdict
+    out_dir = (args.out or directory / "alongside").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "trace.json").write_text(json.dumps(trace, indent=1) + "\n")
+    (out_dir / "summary.md").write_text(render_summary(trace, verdict))
+    (out_dir / "evidence.tsv").write_text(
+        "\n".join("\t".join(row) for row in evidence_rows(trace, verdict)) + "\n"
+    )
+    emit(verdict)
+    say(
+        f"alongside windows={len(trace['windows'])} "
+        f"dropped={len(trace['config']['dropped_windows'])} "
+        f"trace={out_dir / 'trace.json'} evidence={out_dir / 'evidence.tsv'}"
+    )
+    return 0
+
+
+def command_mark(args: argparse.Namespace) -> int:
+    """Append `on|off EPOCH [LABEL]` to the intervals file, fsynced."""
+    label = f" {args.label}" if args.label else ""
+    with args.file.open("a", encoding="utf-8") as handle:
+        handle.write(f"{args.state} {time.time():.3f}{label}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return 0
+
+
 def command_selftest(_args: argparse.Namespace) -> int:
     suite = unittest.defaultTestLoader.discover(
         str(HERE), pattern="test_s2_budget.py", top_level_dir=str(HERE)
@@ -1848,6 +2582,32 @@ def parser() -> argparse.ArgumentParser:
     again.add_argument("trace", type=Path)
     gate_arguments(again, defaults=False)
     again.set_defaults(handler=command_analyze)
+    observe = sub.add_parser(
+        "observe", help="sample alongside a real run, starting nothing (#165)"
+    )
+    observe.add_argument("--source", type=Path, required=True)
+    observe.add_argument("--out", type=Path, required=True)
+    observe.add_argument("--workdir", type=Path)
+    observe.add_argument("--keep-workdir", action="store_true")
+    observe.add_argument("--stop-file", type=Path)
+    observe.add_argument("--max-seconds", type=float, default=DEFAULT_OBSERVE_SECONDS)
+    observe.add_argument("--label", default="")
+    observe.set_defaults(handler=command_observe)
+    mark = sub.add_parser("mark", help="append a run-interval mark")
+    mark.add_argument("file", type=Path)
+    mark.add_argument("state", choices=("on", "off"))
+    mark.add_argument("--label", default="")
+    mark.set_defaults(handler=command_mark)
+    along = sub.add_parser(
+        "alongside", help="the verdict of an observation and the run's intervals"
+    )
+    along.add_argument("observation", type=Path)
+    along.add_argument("--intervals", type=Path, required=True)
+    along.add_argument("--out", type=Path)
+    along.add_argument("--min-window-seconds", type=float, default=EVIDENCE_MIN_WINDOW)
+    along.add_argument("--evidence", action="store_true")
+    gate_arguments(along, defaults=False)
+    along.set_defaults(handler=command_alongside)
     selftest = sub.add_parser("selftest", help="run test_s2_budget.py")
     selftest.set_defaults(handler=command_selftest)
     return top
