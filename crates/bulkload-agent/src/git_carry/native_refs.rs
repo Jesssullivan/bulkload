@@ -13,8 +13,10 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 
-use super::landed::{LandedRef, LandedStash, RefIntent, RefLedger, RefOp, StashOp};
-use super::{durable, git, input, oid, text};
+use super::landed::{
+    LandedRef, LandedStash, PendingRefIntent, RefIntent, RefLedger, RefOp, StashEntry, StashOp,
+};
+use super::{durable, git, input, oid, output, text};
 use crate::{BulkloadRefusal, Result};
 
 /// What kind of ref a name is, for the rows that treat kinds differently.
@@ -548,13 +550,20 @@ fn transact_in(repo: &Path, ops: &[RefOp], guarded: bool) -> Result<()> {
 
 /// One `update-ref --stdin -z` transaction of `lines` in `repo` (the one
 /// destination ref writer of the converge; every line it is given is a
-/// compare-and-swap), with `message` on a reflog it creates for a stash
-/// entry. `names` are the refs the lines write (`HEAD` for the worktree's
+/// compare-and-swap), with `message` on the reflog entry it writes for a
+/// stash entry: exactly those bytes (OI-1003-Q169), an empty message
+/// included (Git refuses `-m ""`, so an empty one is written by giving no
+/// `-m`). `names` are the refs the lines write (`HEAD` for the worktree's
 /// own): once Git has renamed them into place, the directories that hold
 /// them and their reflogs are synced (review 3 finding 7: `core.fsync=
 /// reference` syncs each file, never the directory its rename changed), so
 /// each write is durable before any ledger names it.
-pub fn update_refs(repo: &Path, message: Option<&str>, lines: &[u8], names: &[&str]) -> Result<()> {
+pub fn update_refs(
+    repo: &Path,
+    message: Option<&[u8]>,
+    lines: &[u8],
+    names: &[&str],
+) -> Result<()> {
     #[cfg(test)]
     if let Some(result) = UPDATE_REFS.with(|hook| {
         hook.borrow()
@@ -567,7 +576,11 @@ pub fn update_refs(repo: &Path, message: Option<&str>, lines: &[u8], names: &[&s
     durable(&mut command);
     command.arg("update-ref");
     if let Some(message) = message {
-        command.args(["--create-reflog", "-m", message]);
+        use std::os::unix::ffi::OsStrExt as _;
+        command.arg("--create-reflog");
+        if !message.is_empty() {
+            command.arg("-m").arg(std::ffi::OsStr::from_bytes(message));
+        }
     }
     input(command.args(["--no-deref", "--stdin", "-z"]), lines)?;
     sync_ref_files(repo, names)?;
@@ -958,7 +971,7 @@ pub fn remove_stale_locks(repo: &Path, intent: &RefIntent) -> Result<u64> {
     }
     let deletes = intent.ops.iter().any(|op| op.new.is_none());
     if let Some(stash) = &intent.stash {
-        let owned: Vec<Vec<u8>> = stash.new.iter().map(|value| line(value)).collect();
+        let owned: Vec<Vec<u8>> = stash.new.iter().map(|entry| line(&entry.oid)).collect();
         removed += u64::from(remove_owned_lock(&common.join("refs/stash.lock"), &owned)?);
     }
     if deletes || intent.stash.is_some() {
@@ -997,8 +1010,10 @@ pub fn remove_orphan_packed_new(common: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// The destination's stash reflog, newest first.
-pub fn stash_reflog(repo: &Path) -> Result<Vec<String>> {
+/// The destination's stash reflog, newest first, each entry with its
+/// reflog message (stash-order-v2, OI-1003-Q169): what `git stash list`
+/// shows.
+pub fn stash_reflog(repo: &Path) -> Result<Vec<StashEntry>> {
     let present = git(repo)
         .args(["rev-parse", "--verify", "--quiet", "refs/stash"])
         .output()
@@ -1006,25 +1021,43 @@ pub fn stash_reflog(repo: &Path) -> Result<Vec<String>> {
     if !present.status.success() {
         return Ok(Vec::new());
     }
-    Ok(
-        text(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"]))?
-            .lines()
-            .map(str::to_owned)
-            .collect(),
-    )
+    super::landed::parse_stash_list(&output(git(repo).args([
+        "reflog",
+        "show",
+        super::landed::STASH_LIST_FORMAT,
+        "refs/stash",
+    ]))?)
 }
 
-/// The carried stash of a provenance instance, newest first, with each
-/// commit's subject as its message (for `git stash push` that is the reflog
-/// message byte for byte). The order is the capture's `stash-order-v1`; a
-/// capture without it (taken before this lane) is ordered by committer time,
-/// newest first, the carried `refs/stash` tip first, and says so
-/// (`stash-order-inferred`).
+/// Where a carried stash's order and messages came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StashProvenance {
+    /// The capture's `stash-order-v2`: the source's reflog, commits and
+    /// messages, exactly (OI-1003-Q169).
+    Exact,
+    /// A `stash-order-v1` capture (before OI-1003-Q169): the order exact,
+    /// each message its commit's subject (`stash-messages-inferred`).
+    MessagesInferred,
+    /// No order metadata (a capture before the converge lane): the order by
+    /// committer time and the subjects (`stash-order-inferred`).
+    OrderInferred,
+}
+
+/// The carried stash of a provenance instance, newest first. A capture's
+/// `stash-order-v2` is the source's `git stash list` exactly: each entry's
+/// commit and reflog message. An older capture's `stash-order-v1` gives
+/// the order, and each message is its commit's subject (for `git stash
+/// push` that is the reflog message; `git stash store -m` differs); a
+/// capture without either is ordered by committer time, newest first, the
+/// carried `refs/stash` tip first. Subjects are folded as Git folds a
+/// reflog message, so a stored entry reads back as carried; a v2 message
+/// is returned as the source holds it, and `step` folds it before it
+/// becomes a target ([`super::landed::folded`], `stash-message-folded`).
 pub fn carried_stash(
     repo: &Path,
     source: &str,
     instance: &str,
-) -> Result<(Vec<(String, String)>, bool)> {
+) -> Result<(Vec<StashEntry>, StashProvenance)> {
     let prefix = format!("refs/carry/v1/{source}/{instance}/");
     let listed = text(git(repo).args([
         "for-each-ref",
@@ -1032,8 +1065,10 @@ pub fn carried_stash(
         &format!("{prefix}stashes/"),
         &format!("{prefix}refs/stash"),
         &format!("{prefix}{}", super::STASH_ORDER_METADATA),
+        &format!("{prefix}{}", super::STASH_ORDER_V1_METADATA),
     ]))?;
     let mut tip = None;
+    let mut exact = None;
     let mut order = None;
     let mut commits = BTreeSet::new();
     for line in listed.lines() {
@@ -1044,6 +1079,10 @@ pub fn carried_stash(
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         if name.ends_with(super::STASH_ORDER_METADATA) {
+            exact = Some(value.to_owned());
+            continue;
+        }
+        if name.ends_with(super::STASH_ORDER_V1_METADATA) {
             order = Some(value.to_owned());
             continue;
         }
@@ -1053,26 +1092,42 @@ pub fn carried_stash(
         commits.insert(value.to_owned());
     }
     if commits.is_empty() {
-        return Ok((Vec::new(), false));
+        return Ok((Vec::new(), StashProvenance::Exact));
+    }
+    if let Some(exact) = exact {
+        let entries = super::landed::parse_stash_list(&output(
+            git(repo).args(["show", &format!("{exact}:value")]),
+        )?)?;
+        if entries.iter().any(|entry| !commits.contains(&entry.oid)) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        return Ok((entries, StashProvenance::Exact));
     }
     let mut command = git(repo);
     command.args(["show", "-s", "--no-walk=unsorted", "--format=%H %ct %s"]);
     command.args(commits.iter());
-    let described = text(&mut command)?;
+    let described = output(&mut command)?;
     let mut subjects = BTreeMap::new();
     let mut rows = Vec::new();
-    for line in described.lines() {
-        let mut fields = line.splitn(3, ' ');
+    for line in described.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.splitn(3, |byte| *byte == b' ');
         let (Some(value), Some(time)) = (fields.next(), fields.next()) else {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         };
-        let time: i64 = time
-            .parse()
-            .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-        let subject = fields.next().unwrap_or_default().to_owned();
-        let first = tip.as_deref() == Some(value);
-        subjects.insert(value.to_owned(), subject.clone());
-        rows.push((!first, std::cmp::Reverse(time), value.to_owned(), subject));
+        let value = std::str::from_utf8(value)
+            .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?
+            .to_owned();
+        let time: i64 = std::str::from_utf8(time)
+            .ok()
+            .and_then(|time| time.parse().ok())
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let subject = super::landed::reflog_message(fields.next().unwrap_or_default());
+        let first = tip.as_deref() == Some(value.as_str());
+        subjects.insert(value.clone(), subject.clone());
+        rows.push((!first, std::cmp::Reverse(time), value, subject));
     }
     if let Some(order) = order {
         let bytes = text(git(repo).args(["show", &format!("{order}:value")]))?;
@@ -1081,44 +1136,45 @@ pub fn carried_stash(
             let subject = subjects
                 .get(value)
                 .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-            carried.push((value.to_owned(), subject.clone()));
+            carried.push(StashEntry::new(value, subject.clone()));
         }
-        return Ok((carried, false));
+        return Ok((carried, StashProvenance::MessagesInferred));
     }
     rows.sort();
     rows.dedup_by(|a, b| a.2 == b.2);
     Ok((
         rows.into_iter()
-            .map(|(_, _, value, subject)| (value, subject))
+            .map(|(_, _, value, subject)| StashEntry::new(value, subject))
             .collect(),
-        true,
+        StashProvenance::OrderInferred,
     ))
 }
 
-/// The stash table (design 7.3, amended by finding 4): `dst` is the
-/// destination's reflog, `ledger` what bulkload built last, `carried` the
-/// capture's stash at `t`. `Ok(None)` writes nothing.
+/// The stash table (design 7.3, amended by finding 4; stash-order-v2 by
+/// OI-1003-Q169): `dst` is the destination's reflog, `ledger` what
+/// bulkload built last, `carried` the capture's stash at `t`. Every
+/// comparison is entry by entry, commit and message: a message that
+/// changed at the source is a rewrite (T5), one changed at the destination
+/// is the destination's (T6). A stash-order-v1 row names `dst` by commit
+/// only ([`LandedStash::names`]); `step` upgrades one that does before it
+/// decides. `Ok(None)` writes nothing.
 pub fn stash_decision(
-    dst: &[String],
+    dst: &[StashEntry],
     ledger: Option<&LandedStash>,
-    carried: &[(String, String)],
+    carried: &[StashEntry],
     t: i128,
 ) -> (Option<StashOp>, Option<&'static str>) {
-    let new: Vec<String> = carried.iter().map(|(value, _)| value.clone()).collect();
-    let messages: Vec<String> = carried.iter().map(|(_, subject)| subject.clone()).collect();
-    let op = |old: &[String]| StashOp {
+    let new = carried.to_vec();
+    let op = |old: &[StashEntry]| StashOp {
         old: old.to_vec(),
         new: new.clone(),
-        messages: messages.clone(),
         observed_ns: t,
     };
     match ledger {
         None if new.is_empty() => (None, None),
         None if dst.is_empty() => (Some(op(dst)), Some("stash-restored")),
         None => (None, Some("stash-kept-destination")),
-        Some(landed) if dst != landed.order.as_slice() => {
-            (None, Some("stash-modified-at-destination"))
-        }
+        Some(landed) if !landed.names(dst) => (None, Some("stash-modified-at-destination")),
         Some(landed) if landed.order == new => (None, None),
         Some(landed) if t <= landed.observed_ns => (None, Some("stash-stale")),
         Some(landed) if new.ends_with(&landed.order) => (Some(op(dst)), Some("stash-appended")),
@@ -1130,7 +1186,7 @@ pub fn stash_decision(
 /// one: an append stores each new entry on top of the old order; a rewrite
 /// first deletes the old tip (a compare-and-swap that drops the whole
 /// reflog), then stores every entry, oldest first.
-pub fn stash_path(op: &StashOp) -> Vec<Vec<String>> {
+pub fn stash_path(op: &StashOp) -> Vec<Vec<StashEntry>> {
     let mut path = vec![op.old.clone()];
     let base = if op.new.ends_with(&op.old) {
         op.old.len()
@@ -1161,8 +1217,8 @@ pub fn stash_path(op: &StashOp) -> Vec<Vec<String>> {
 pub fn stash_apply(
     repo: &Path,
     op: &StashOp,
-    at: Option<&[String]>,
-    record: &mut dyn FnMut(&[String]) -> Result<()>,
+    at: Option<&[StashEntry]>,
+    record: &mut dyn FnMut(&[StashEntry]) -> Result<()>,
 ) -> Result<bool> {
     let path = stash_path(op);
     let dst = stash_reflog(repo)?;
@@ -1184,23 +1240,15 @@ pub fn stash_apply(
         let (message, line) = match to.first() {
             None => {
                 let tip = from.first().ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-                (None, format!("delete refs/stash\0{tip}\0"))
+                (None, format!("delete refs/stash\0{}\0", tip.oid))
             }
-            Some(value) => {
-                let message = op
-                    .messages
-                    .get(op.new.len() - to.len())
-                    .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-                let message = if message.is_empty() {
-                    "bulkload stash"
-                } else {
-                    message.as_str()
-                };
+            // The entry's own message, byte for byte (OI-1003-Q169).
+            Some(entry) => {
                 let line = from.first().map_or_else(
-                    || format!("create refs/stash\0{value}\0"),
-                    |tip| format!("update refs/stash\0{value}\0{tip}\0"),
+                    || format!("create refs/stash\0{}\0", entry.oid),
+                    |tip| format!("update refs/stash\0{}\0{}\0", entry.oid, tip.oid),
                 );
-                (Some(message), line)
+                (Some(entry.message.as_slice()), line)
             }
         };
         if update_refs(repo, message, line.as_bytes(), &["refs/stash"]).is_err() {
@@ -1247,24 +1295,32 @@ pub fn step(
     let carried_refs = carried(repo, source, instance)?;
     let mut planned = plan_names(&native, ledger, &carried_refs, t, &skip, (&symbolic, only));
     let stash = if only.is_none() {
-        let (carried_stash, inferred) = carried_stash(repo, source, instance)?;
-        if inferred {
-            planned.custody.count("stash-order-inferred");
+        let (carried_stash, provenance) = carried_stash(repo, source, instance)?;
+        // A source message Git would fold is landed folded, and said so
+        // (review finding 5): the target is what Git will write, so the op
+        // ends at it and the row names the destination's stash. The list
+        // then equals the source's up to Git's own normalization.
+        let (carried_stash, folded) = super::landed::folded(carried_stash);
+        planned.custody.add("stash-message-folded", folded);
+        match provenance {
+            StashProvenance::Exact => {}
+            StashProvenance::MessagesInferred => planned.custody.count("stash-messages-inferred"),
+            StashProvenance::OrderInferred => planned.custody.count("stash-order-inferred"),
         }
-        let (op, word) = stash_decision(
-            &stash_reflog(repo)?,
-            ledger.stash.as_ref(),
-            &carried_stash,
-            t,
-        );
+        let dst = stash_reflog(repo)?;
+        // OI-1003-Q169: a stash-order-v1 row that names the destination's
+        // stash by commit becomes that stash, messages included, once.
+        let row = ledger.stash.as_ref().map(|row| row.upgraded(&dst));
+        if row != ledger.stash {
+            planned.custody.count("stash-ledger-upgraded");
+            planned.ledger.stash.clone_from(&row);
+        }
+        let (op, word) = stash_decision(&dst, row.as_ref(), &carried_stash, t);
         if let Some(word) = word {
             planned.custody.count(word);
         }
         if let Some(op) = &op {
-            planned.ledger.stash = Some(LandedStash {
-                order: op.new.clone(),
-                observed_ns: t,
-            });
+            planned.ledger.stash = Some(LandedStash::of(op.new.clone(), t));
         }
         op
     } else {
@@ -1336,8 +1392,14 @@ pub fn commit(
 /// `GIT_CONVERGE_INTERRUPTED` when a redo loses its compare-and-swap.
 pub fn settle(repo: &Path, ledger_dir: &Path) -> Result<Custody> {
     let intent_path = ledger_dir.join(super::landed::REFS_INTENT);
-    let Some(intent) = super::landed::read::<RefIntent>(&intent_path)? else {
+    let Some(pending) = super::landed::read_ref_intent(&intent_path)? else {
         return Ok(Custody::default());
+    };
+    // A stash-order-v1 intent (a crash before OI-1003-Q169) is resolved
+    // against the destination's stash as it stands under the lock.
+    let intent = match pending {
+        PendingRefIntent::Current(intent) => intent,
+        PendingRefIntent::V1(intent) => intent.resolve(&stash_reflog(repo)?)?,
     };
     let removed = remove_stale_locks(repo, &intent)?;
     let (ledger, mut custody) =
@@ -1425,7 +1487,7 @@ fn finish(
     );
     if let Some(op) = &intent.stash {
         let mut reached = intent.stash_at.clone().unwrap_or_else(|| op.old.clone());
-        let mut record = |at: &[String]| -> Result<()> {
+        let mut record = |at: &[StashEntry]| -> Result<()> {
             reached = at.to_vec();
             let Some(path) = intent_path else {
                 return Ok(());
@@ -1441,10 +1503,7 @@ fn finish(
             // kept); with no row an emptied stash read as never restored
             // and was restored again.
             custody.count("stash-modified-at-destination");
-            ledger.stash = Some(LandedStash {
-                order: reached,
-                observed_ns: op.observed_ns,
-            });
+            ledger.stash = Some(LandedStash::of(reached, op.observed_ns));
         }
     }
     Ok((ledger, custody))

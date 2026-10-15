@@ -4478,6 +4478,16 @@ mod tests {
         fs::write(source.join("tracked"), b"stash two").unwrap();
         git(&source, &["stash", "push", "-q"]);
         let s2 = rev_parse(&source, "refs/stash");
+        // The stash list A, messages included: stored back under the same
+        // messages it is A again (OI-1003-Q169: a message is identity).
+        let a = r3_git_out(
+            &source,
+            &["reflog", "show", "--format=%H %gs", "refs/stash"],
+        );
+        let mut messages = a
+            .lines()
+            .map(|line| line.split_once(' ').unwrap().1.to_owned());
+        let (m2, m1) = (messages.next().unwrap(), messages.next().unwrap());
         let inside = fs::canonicalize(&source).unwrap();
         let (i1, i2) = (inside.clone(), inside);
         let (s1c, s2c) = (s1.clone(), s2.clone());
@@ -4487,8 +4497,8 @@ mod tests {
         });
         git_carry::mid_pass::arm_at(&source, Stage::AfterPass, move || {
             git(&i2, &["stash", "clear"]);
-            git(&i2, &["stash", "store", "-m", "one", &s1c]);
-            git(&i2, &["stash", "store", "-m", "two", &s2c]);
+            git(&i2, &["stash", "store", "-m", &m1, &s1c]);
+            git(&i2, &["stash", "store", "-m", &m2, &s2c]);
         });
         let rows = Mutex::new(Vec::new());
         let _ = capture(&plan, &state, &corpus, 2, &|row| {
@@ -4499,10 +4509,14 @@ mod tests {
         });
         let first = rows.into_inner().unwrap();
         assert_eq!(
-            r3_git_out(&source, &["reflog", "show", "--format=%H", "refs/stash"]),
-            format!("{s2}\n{s1}\n"),
+            r3_git_out(
+                &source,
+                &["reflog", "show", "--format=%H %gs", "refs/stash"]
+            ),
+            a,
             "the source is back at A"
         );
+        assert!(a.starts_with(&format!("{s2} ")), "{a}");
         assert_eq!(first.len(), 1, "{first:?}");
         let (outcome, _, drift) = first.first().unwrap();
         assert_eq!(*outcome, "captured-with-drift", "{first:?}");

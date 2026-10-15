@@ -167,6 +167,9 @@ Adopted from lab `LAB-FEDERATED-EFFICIENCY-20261001`, by operator direction on
   against its own OFF windows as the live baseline, with no absolute load1
   cap and the budget unchanged (OI-1003-Q160, Linear TIN-4543); it is not
   interchangeable with a gated `run` and carries its own evidence label.
+  Its passes start on a schedule recorded in advance (`s2_budget.py
+  schedule`, `observe --schedule`, `drive`), never on the host's load, and
+  evidence verifies the schedule was followed (OI-1003-Q168).
 
 ## Durable notes
 

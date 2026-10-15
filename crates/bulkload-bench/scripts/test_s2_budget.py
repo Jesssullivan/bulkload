@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import random
+import re
 import tempfile
 import threading
 import unittest
@@ -1141,6 +1142,9 @@ class LiveRunTests(unittest.TestCase):
 
 
 ORIGIN = 1_760_000_000.0
+# The observed host's monotonic clock at ORIGIN (OI-1003-Q168 review: a
+# pass's start is placed on the observer's timeline by this clock).
+OBSERVER_MONO = 50_000.0
 
 
 def observation(trace, power="ac"):
@@ -1172,6 +1176,7 @@ def observation(trace, power="ac"):
         "start_utc": "2026-10-15T00:00:00Z",
         "end_utc": "2026-10-15T01:00:00Z",
         "origin_epoch": ORIGIN,
+        "origin_monotonic": OBSERVER_MONO,
         "span_s": span,
         "end_reason": "stop file",
         "errors": [],
@@ -1184,12 +1189,56 @@ def observation(trace, power="ac"):
         {"k": "power", "t": t, "power": power} for t in range(0, int(span) + 1, 60)
     ]
     rows.append({"k": "end", "t": span, "reason": "stop file"})
-    intervals = "\n".join(
-        f"{ORIGIN + w['start']:.3f} {ORIGIN + w['end']:.3f} pass{w['index']}"
-        for w in trace["windows"]
-        if w["state"] == "ON"
+    # OI-1003-Q168: the passes start on a schedule recorded in advance, which
+    # the observation carries, and each interval names its slot.
+    header["schedule"], intervals = scheduled_passes(
+        [(w["start"], w["end"]) for w in trace["windows"] if w["state"] == "ON"]
     )
     return header, rows, intervals
+
+
+# Recorded an hour before the observation began (OI-1003-Q168).
+SCHEDULE_CREATED = ORIGIN - 3600.0
+
+
+def scheduled_passes(passes, created=SCHEDULE_CREATED):
+    """A fixed schedule recorded at `created` whose slots are the starts of
+    the passes that end after ORIGIN (seconds from ORIGIN), and the passes
+    as the intervals file `drive` writes (`driven`). A pass that ended
+    before the observation began is no pass of its run: a plain mark
+    (OI-1003-Q160's pre-origin rule judges it)."""
+    timed = [(a, b) for a, b in passes if b > 0.0]
+    schedule = s2.fixed_schedule([ORIGIN + a for a, _ in timed], created=created)
+    slots = {pair: k for k, pair in enumerate(timed)}
+    return schedule, driven(schedule, [(a, b, slots.get((a, b))) for a, b in passes])
+
+
+def driven(schedule, passes, host="neo", skew=None, exits=None):
+    """The intervals file `drive` writes on the observed host for `passes`
+    (start, end, slot) in seconds from ORIGIN: its record (host, wall and
+    monotonic clocks), then each pass with its slot, schedule, exit status
+    and monotonic start. A pass with slot None is a hand mark naming none.
+    `skew` (slot to seconds) moves a pass's wall-clock marks off the
+    observer's clock; `exits` (slot to status) a pass's exit status."""
+    skew, exits = skew or {}, exits or {}
+    begun = min((a for a, _, _ in passes), default=0.0) - 60.0
+    lines = [
+        f"drive {ORIGIN + begun:.3f} host={host} mono={OBSERVER_MONO + begun:.3f} "
+        f"schedule={schedule['digest'][:12]}"
+    ]
+    for a, b, slot in passes:
+        if slot is None:
+            lines.append(f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}")
+            continue
+        moved = skew.get(slot, 0.0)
+        code = exits.get(slot, 0)
+        lines.append(
+            f"{ORIGIN + a + moved:.3f} {ORIGIN + b + moved:.3f} "
+            f"{s2.slot_label(slot, schedule)}"
+            + ("" if code is None else f" exit={code}")
+            + f" mono={OBSERVER_MONO + a:.3f}"
+        )
+    return "\n".join(lines)
 
 
 def alongside_verdict(
@@ -1942,7 +1991,7 @@ def timeline(span, passes, lat, load, ewma=False):
     rows.append({"k": "end", "t": span, "reason": "stop file"})
     header, _, _ = observation(long_synth())
     header = {**header, "span_s": span}
-    intervals = "\n".join(f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}" for a, b in passes)
+    header["schedule"], intervals = scheduled_passes(passes)
     return header, rows, intervals
 
 
@@ -2271,6 +2320,589 @@ class LiveBaselineReviewTests(unittest.TestCase):
         )
         for pair in verdict["live_baseline"]["pairs"]:
             self.assertAlmostEqual(pair["d_load1"], 2.2, delta=0.01, msg=pair)
+
+
+def scheduled_verdict(
+    passes, starts=None, schedule=None, span=None, edit=None, **drive
+):
+    """The alongside verdict (evidence asked) of a quiet, cheap run whose
+    passes ran at `passes` (seconds from ORIGIN, each with its slot) while
+    the recorded schedule named `starts` (default: the passes' own); the
+    intervals as `drive` writes them (`driven`, given `drive`'s keywords)."""
+    span = span or passes[-1][1] + 900.0
+    header, rows, _ = timeline(
+        span,
+        [(a, b) for a, b, _ in passes],
+        lambda _t, on: 1.10 if on else 1.0,
+        lambda _t, on: 1.0 + (0.5 if on else 0.0),
+    )
+    if schedule is None:
+        schedule = s2.fixed_schedule(
+            [ORIGIN + a for a in (starts or [a for a, _, _ in passes])],
+            created=SCHEDULE_CREATED,
+        )
+    header["schedule"] = schedule
+    intervals = driven(schedule, passes, **drive)
+    if edit is not None:
+        header, intervals = edit(header, intervals)
+    built = s2.alongside_trace(
+        header, rows, intervals, "i.txt", 300.0, True, dict(s2.DEFAULT_GATE)
+    )
+    return built, s2.analyze(built)
+
+
+# The slots of `three_passes`: its passes' starts when none is late.
+THREE_SLOTS = [600.0, 1800.0, 3000.0]
+
+
+def three_passes(late=0.0):
+    """Three 600 s passes 1200 s apart, the second `late` seconds late."""
+    return [
+        (600.0, 1200.0, 0),
+        (1800.0 + late, 2400.0 + late, 1),
+        (3000.0, 3600.0, 2),
+    ]
+
+
+def problems_of(verdict) -> str:
+    return " | ".join(verdict["evidence_problems"])
+
+
+class ScheduleTests(unittest.TestCase):
+    """OI-1003-Q168 (Linear TIN-4543): during an S2-measured run, pass start
+    times come from a schedule fixed (or seeded-random) and recorded in
+    advance, never from host load; alongside evidence verifies the recorded
+    schedule was followed and refuses evidence otherwise."""
+
+    def test_a_seeded_schedule_is_fixed_in_advance_and_re_derives(self) -> None:
+        first = ORIGIN + 600.0
+        one = s2.make_schedule(first, 1800.0, 6, jitter=300.0, seed=7, created=ORIGIN)
+        two = s2.make_schedule(first, 1800.0, 6, jitter=300.0, seed=7, created=ORIGIN)
+        self.assertEqual(one["starts"], two["starts"])
+        self.assertEqual(one["digest"], two["digest"])
+        for k, start in enumerate(one["starts"]):
+            self.assertGreaterEqual(start, first + k * 1800.0)
+            self.assertLess(start, first + k * 1800.0 + 300.0)
+        self.assertEqual(s2.schedule_defects(one), [])
+        other = s2.make_schedule(first, 1800.0, 6, jitter=300.0, seed=8, created=ORIGIN)
+        self.assertNotEqual(one["starts"], other["starts"])
+        # A start edited after the fact no longer re-derives from its seed,
+        # and a digest no longer matches its body.
+        edited = json.loads(json.dumps(one))
+        edited["starts"][2] += 60.0
+        self.assertTrue(
+            any("re-derive" in d for d in s2.schedule_defects(edited)),
+            s2.schedule_defects(edited),
+        )
+        resealed = {**edited, "digest": s2.schedule_digest(edited)}
+        self.assertTrue(
+            any("re-derive" in d for d in s2.schedule_defects(resealed)),
+            s2.schedule_defects(resealed),
+        )
+        torn = {**one, "starts": one["starts"][:-1]}
+        self.assertTrue(
+            any("digest" in d for d in s2.schedule_defects(torn)),
+            s2.schedule_defects(torn),
+        )
+        # Recorded in advance: no slot at or before the schedule was made.
+        late = s2.fixed_schedule([ORIGIN + 10.0, ORIGIN + 20.0], created=ORIGIN + 15.0)
+        self.assertTrue(
+            any("in advance" in d for d in s2.schedule_defects(late)),
+            s2.schedule_defects(late),
+        )
+
+    def test_the_schedule_command_records_a_schedule_in_advance(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "schedule.json"
+            first = f"{s2.time.time() + 600:.3f}"
+            args = ["schedule", "--out", str(out), "--first", first]
+            with contextlib.redirect_stdout(io.StringIO()):
+                made = s2.main(
+                    args
+                    + ["--every", "1800", "--passes", "4", "--jitter", "300"]
+                    + ["--seed", "7"]
+                )
+                again = s2.main(args + ["--every", "1800", "--passes", "4"])
+                past = s2.main(
+                    ["schedule", "--out", str(Path(tmp) / "p.json"), "--first"]
+                    + [f"{s2.time.time() - 5:.3f}", "--every", "60", "--passes", "2"]
+                )
+                wide = s2.main(
+                    ["schedule", "--out", str(Path(tmp) / "w.json"), "--first", first]
+                    + ["--every", "60", "--passes", "2", "--jitter", "60"]
+                )
+                fixed = s2.main(
+                    ["schedule", "--out", str(Path(tmp) / "f.json"), "--at", first]
+                    + [f"{float(first) + 900:.3f}"]
+                )
+                doc = json.loads(out.read_text())
+                pinned = json.loads((Path(tmp) / "f.json").read_text())
+        self.assertEqual((made, again, past, wide, fixed), (0, 2, 2, 2, 0))
+        self.assertEqual(doc["schema"], s2.SCHEDULE_SCHEMA)
+        self.assertEqual(doc["kind"], "seeded")
+        self.assertEqual(len(doc["starts"]), 4)
+        self.assertLess(doc["created_epoch"], doc["starts"][0])
+        self.assertEqual(s2.schedule_defects(doc), [])
+        self.assertEqual(pinned["kind"], "fixed")
+        self.assertEqual(s2.schedule_defects(pinned), [])
+
+    def test_passes_on_their_schedule_are_evidence(self) -> None:
+        built, verdict = scheduled_verdict(three_passes())
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+        report = verdict["schedule"]
+        self.assertEqual(report["max_deviation_s"], 0.0)
+        self.assertEqual([p["slot"] for p in report["passes"]], [0, 1, 2])
+        self.assertEqual(
+            (report["late"], report["missing"], report["unscheduled"]), ([], [], [])
+        )
+        # Reported in the summary and as an evidence row.
+        self.assertIn(
+            "Schedule (OI-1003-Q168): fixed", s2.render_summary(built, verdict)
+        )
+        rows = [r for r in s2.evidence_rows(built, verdict) if r[0] == "schedule"]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0][2], "0.0000")
+
+    def test_an_observation_with_no_recorded_schedule_is_not_evidence(self) -> None:
+        def unscheduled(header, intervals):
+            header = {k: v for k, v in header.items() if k != "schedule"}
+            return header, intervals
+
+        _, verdict = scheduled_verdict(three_passes(), edit=unscheduled)
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("recorded in advance (OI-1003-Q168)", problems_of(verdict))
+        self.assertIsNone(verdict["schedule"])
+
+    def test_a_late_pass_is_not_evidence_and_its_deviation_is_reported(self) -> None:
+        _, verdict = scheduled_verdict(three_passes(late=30.0), starts=THREE_SLOTS)
+        self.assertFalse(verdict["evidence"])
+        self.assertIn(
+            "slot 1's pass started +30.0 s from its scheduled time",
+            problems_of(verdict),
+        )
+        report = verdict["schedule"]
+        self.assertEqual(report["late"], [1])
+        self.assertEqual(report["max_deviation_s"], 30.0)
+        # Within the bound it is reported, not a problem.
+        _, close = scheduled_verdict(
+            three_passes(late=s2.SCHEDULE_SLACK_S - 1.0), starts=THREE_SLOTS
+        )
+        self.assertTrue(close["evidence"], close["evidence_problems"])
+        self.assertEqual(close["schedule"]["max_deviation_s"], s2.SCHEDULE_SLACK_S - 1)
+        # An early start is as far off the schedule as a late one.
+        _, early = scheduled_verdict(three_passes(late=-20.0), starts=THREE_SLOTS)
+        self.assertFalse(early["evidence"])
+        self.assertEqual(early["schedule"]["late"], [1])
+
+    def test_a_slot_with_no_pass_is_not_evidence(self) -> None:
+        passes = three_passes()
+        starts = [a for a, _, _ in passes] + [4200.0]
+        _, verdict = scheduled_verdict(passes, starts=starts, span=5000.0)
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("slot 3, scheduled inside the observation", problems_of(verdict))
+        self.assertEqual(verdict["schedule"]["missing"], [3])
+        # A slot after the observation ended is not missing: it is outside
+        # the observation, which must cover the whole schedule (review
+        # finding 1), and is refused as such.
+        _, after = scheduled_verdict(passes, starts=starts, span=4100.0)
+        self.assertEqual(after["schedule"]["missing"], [])
+        self.assertEqual(after["schedule"]["outside"], [3])
+        self.assertFalse(after["evidence"])
+        self.assertIn("slot 3 lies outside the observation", problems_of(after))
+
+    def test_a_pass_off_the_schedule_is_not_evidence(self) -> None:
+        # A pass naming no slot, as a hand mark or a load-triggered pass would.
+        passes = [*three_passes()[:2], (3000.0, 3600.0, None)]
+        _, verdict = scheduled_verdict(passes, starts=[600.0, 1800.0])
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("names no slot of the recorded schedule", problems_of(verdict))
+        self.assertEqual(len(verdict["schedule"]["unscheduled"]), 1)
+
+        # Marks naming another schedule's slots.
+        def other(header, intervals):
+            stranger = s2.fixed_schedule([ORIGIN + 1.0], created=SCHEDULE_CREATED - 9)
+            return header, intervals.replace(
+                header["schedule"]["digest"][:12], stranger["digest"][:12]
+            )
+
+        _, foreign = scheduled_verdict(three_passes(), edit=other)
+        self.assertFalse(foreign["evidence"])
+        self.assertEqual(len(foreign["schedule"]["unscheduled"]), 3)
+
+        # Two passes in one slot.
+        twice = [(600.0, 1200.0, 0), (1800.0, 2400.0, 0), (3000.0, 3600.0, 2)]
+        _, doubled = scheduled_verdict(twice, starts=[600.0, 1800.0, 3000.0])
+        self.assertFalse(doubled["evidence"])
+        self.assertIn("slot 0 has 2 passes", problems_of(doubled))
+
+    def test_a_schedule_that_is_not_valid_is_not_evidence(self) -> None:
+        def tampered(header, intervals):
+            schedule = json.loads(json.dumps(header["schedule"]))
+            schedule["starts"][1] += 1.0
+            return {**header, "schedule": schedule}, intervals
+
+        _, verdict = scheduled_verdict(three_passes(), edit=tampered)
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("the recorded schedule is not valid", problems_of(verdict))
+
+        def recorded_late(header, intervals):
+            schedule = s2.fixed_schedule(
+                header["schedule"]["starts"], created=ORIGIN + 10.0
+            )
+            labelled = intervals.replace(
+                header["schedule"]["digest"][:12], schedule["digest"][:12]
+            )
+            return {**header, "schedule": schedule}, labelled
+
+        _, after = scheduled_verdict(three_passes(), edit=recorded_late)
+        self.assertFalse(after["evidence"])
+        self.assertIn("made after the observation began", problems_of(after))
+
+    def test_drive_starts_each_pass_at_its_scheduled_time_and_waits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            schedule_path = Path(tmp) / "schedule.json"
+            marks = Path(tmp) / "marks"
+            ran = Path(tmp) / "ran"
+            schedule = s2.make_schedule(s2.time.time() + 1.5, 1.0, 3)
+            schedule_path.write_text(json.dumps(schedule))
+            script = (
+                "import sys, time; time.sleep(0.1); "
+                "open(sys.argv[1], 'a').write(sys.argv[2] + '\\n')"
+            )
+            out = io.StringIO()
+            # The driver never reads the host's load: placement comes from
+            # the schedule alone.
+            with (
+                contextlib.redirect_stdout(out),
+                mock.patch.object(s2, "read_load1", side_effect=AssertionError),
+                mock.patch.object(s2, "load_source", side_effect=AssertionError),
+            ):
+                status = s2.main(
+                    ["drive", "--schedule", str(schedule_path), "--intervals"]
+                    + [str(marks), "--", s2.sys.executable, "-c", script]
+                    + [str(ran), "{slot}"]
+                )
+            text = marks.read_text()
+            done = ran.read_text().split()
+        self.assertEqual(status, 0, out.getvalue())
+        self.assertEqual(done, ["0", "1", "2"])
+        passes, open_interval, problems = s2.read_marks(text)
+        self.assertEqual((open_interval, problems), (False, []))
+        self.assertEqual([p["slot"] for p in passes], [0, 1, 2])
+        for passed, start in zip(passes, schedule["starts"], strict=True):
+            self.assertEqual(passed["schedule"], schedule["digest"][:12])
+            # Never early; late only by what starting a child costs on a
+            # loaded host, inside the protocol's bound.
+            self.assertGreaterEqual(passed["start"], start - 0.01)
+            self.assertLess(passed["start"] - start, s2.SCHEDULE_SLACK_S)
+            self.assertGreater(passed["end"], passed["start"])
+        report = s2.schedule_report(schedule, passes, ORIGIN, 1e12)
+        self.assertEqual(report["unscheduled"], [])
+        self.assertIn("slot=2", out.getvalue())
+
+    def test_drive_records_a_pass_that_overran_its_next_slot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            schedule_path = Path(tmp) / "schedule.json"
+            marks = Path(tmp) / "marks"
+            schedule = s2.make_schedule(s2.time.time() + 1.0, 0.3, 2)
+            schedule_path.write_text(json.dumps(schedule))
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = s2.main(
+                    ["drive", "--schedule", str(schedule_path), "--intervals"]
+                    + [str(marks), "--", s2.sys.executable, "-c"]
+                    + ["import time; time.sleep(0.8)"]
+                )
+            passes, _, _ = s2.read_marks(marks.read_text())
+        self.assertEqual(status, 0)
+        # Slot 1 could start only when slot 0's pass ended: late, recorded.
+        report = s2.schedule_report(schedule, passes, schedule["starts"][0] - 1, 60)
+        self.assertGreater(report["passes"][1]["deviation_s"], 0.3)
+        with mock.patch.object(s2, "SCHEDULE_SLACK_S", 0.2):
+            report = s2.schedule_report(schedule, passes, schedule["starts"][0] - 1, 60)
+        self.assertIn(1, report["late"])
+        self.assertTrue(
+            any("slot 1's pass started" in p for p in s2.schedule_problems(report))
+        )
+
+    def test_drive_refusals_and_a_slot_already_past_at_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            good = Path(tmp) / "good.json"
+            bad = Path(tmp) / "bad.json"
+            marks = Path(tmp) / "marks"
+            now = s2.time.time()
+            schedule = s2.fixed_schedule([now - 30.0, now + 0.3], created=now - 60.0)
+            good.write_text(json.dumps(schedule))
+            bad.write_text(json.dumps({**schedule, "digest": "0" * 64}))
+            with contextlib.redirect_stdout(io.StringIO()):
+                empty = s2.main(
+                    ["drive", "--schedule", str(good), "--intervals", str(marks)]
+                )
+                torn = s2.main(
+                    ["drive", "--schedule", str(bad), "--intervals", str(marks)]
+                    + ["--", "true"]
+                )
+                ran = s2.main(
+                    ["drive", "--schedule", str(good), "--intervals", str(marks)]
+                    + ["--", "true"]
+                )
+            text = marks.read_text()
+        self.assertEqual((empty, torn, ran), (2, 2, 0))
+        # The slot already past is never run late; a `skip` record (not a
+        # comment) records it, so `alongside` counts and refuses it (review
+        # finding 1).
+        self.assertNotIn("# skipped", text)
+        marks = s2.read_records(text)
+        self.assertEqual(marks["problems"], [])
+        self.assertEqual([p["slot"] for p in marks["passes"]], [1])
+        self.assertEqual([k["slot"] for k in marks["skipped"]], [0])
+        report = s2.schedule_report(
+            schedule, marks["passes"], now - 60.0, 120.0, marks=marks
+        )
+        self.assertEqual(report["skipped"], [0])
+        self.assertTrue(
+            any("slot 0 was skipped" in p for p in s2.schedule_problems(report))
+        )
+
+    def test_observe_records_its_schedule_at_its_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            schedule_path = Path(tmp) / "schedule.json"
+            schedule = s2.make_schedule(s2.time.time() + 3600, 1800.0, 2)
+            schedule_path.write_text(json.dumps(schedule))
+            (Path(tmp) / "bad.json").write_text("{}")
+            out_dir = Path(tmp) / "observed"
+            with contextlib.redirect_stdout(io.StringIO()):
+                refused = s2.main(
+                    ["observe", "--source", str(source), "--out"]
+                    + [str(Path(tmp) / "o2"), "--schedule", str(Path(tmp) / "bad.json")]
+                )
+                status = s2.main(
+                    ["observe", "--source", str(source), "--out", str(out_dir)]
+                    + ["--schedule", str(schedule_path), "--max-seconds", "1.5"]
+                )
+            header = json.loads((out_dir / "observe.json").read_text())
+        self.assertEqual((refused, status), (2, 0))
+        self.assertEqual(header["schedule"], schedule)
+        # Its monotonic origin, which places the drive's starts on its clock.
+        self.assertLessEqual(header["origin_monotonic"], s2.time.monotonic())
+
+
+class ScheduleReviewTests(unittest.TestCase):
+    """The 2026-10-15 review of OI-1003-Q168's schedule: each test is red
+    on the code before its fix (the agent note's table)."""
+
+    # Finding 1: the observation is bound to the whole schedule.
+
+    def test_a_schedule_longer_than_the_observation_is_not_evidence(self) -> None:
+        # 24 slots 1200 s apart recorded long before; the observation (and
+        # its passes) covers slots 7, 8 and 9 only, chosen by when it ran.
+        starts = [600.0 + 1200.0 * (k - 7) for k in range(24)]
+        schedule = s2.fixed_schedule(
+            [ORIGIN + t for t in starts], created=ORIGIN - 20000.0
+        )
+        passes = [(a, b, slot + 7) for a, b, slot in three_passes()]
+        _, verdict = scheduled_verdict(passes, schedule=schedule, span=4100.0)
+        report = verdict["schedule"]
+        self.assertFalse(verdict["evidence"])
+        self.assertEqual(report["outside"], [*range(7), *range(10, 24)])
+        self.assertEqual(report["missing"], [])
+        self.assertIn("slot 0 lies outside the observation", problems_of(verdict))
+        self.assertIn("slot 23 lies outside the observation", problems_of(verdict))
+        # Reported beside the passes, not only as a count of slots.
+        self.assertIn("outside the observation [0", s2.schedule_summary(report))
+
+    def test_a_slot_before_the_origin_is_outside_not_missing(self) -> None:
+        # Mutation M1: a slot before the observation's origin is no missing
+        # pass of it; it is outside, and that is what refuses it.
+        passes = three_passes()
+        starts = [-600.0] + [a for a, _, _ in passes]
+        shifted = [(a, b, slot + 1) for a, b, slot in passes]
+        _, verdict = scheduled_verdict(shifted, starts=starts)
+        report = verdict["schedule"]
+        self.assertEqual(report["missing"], [])
+        self.assertEqual(report["outside"], [0])
+        self.assertFalse(verdict["evidence"])
+
+    def test_a_slot_the_drive_skipped_is_reported_and_refused(self) -> None:
+        passes = three_passes()
+
+        def skipped(header, intervals):
+            digest = header["schedule"]["digest"][:12]
+            return header, intervals + (
+                f"\nskip {ORIGIN + 1801.0:.3f} slot=1 schedule={digest}"
+            )
+
+        _, verdict = scheduled_verdict(passes, edit=skipped)
+        self.assertEqual(verdict["schedule"]["skipped"], [1])
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("slot 1 was skipped by the drive", problems_of(verdict))
+
+    # Finding 2: each offending pass's own deviation.
+
+    def test_a_duplicate_slot_reports_each_offending_pass_deviation(self) -> None:
+        passes = [
+            (600.0, 1200.0, 0),
+            (1770.0, 1780.0, 1),
+            (1800.2, 2400.0, 1),
+            (3000.0, 3600.0, 2),
+        ]
+        _, verdict = scheduled_verdict(passes, starts=THREE_SLOTS)
+        problems = problems_of(verdict)
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("slot 1's pass started -30.0 s from its scheduled time", problems)
+        self.assertNotIn("+0.2 s from its scheduled time", problems)
+        self.assertIn("slot 1 has 2 passes", problems)
+
+    # Finding 3: a pass's exit status is read and judged.
+
+    def test_a_pass_that_failed_is_reported_and_not_evidence(self) -> None:
+        marks = s2.read_records(
+            "on 10.0 slot=0 schedule=abc mono=5.0\noff 20.0 slot=0 schedule=abc "
+            "exit=3\n30.0 40.0 slot=1 schedule=abc exit=0\n"
+        )
+        self.assertEqual([p["exit"] for p in marks["passes"]], ["3", "0"])
+        built, verdict = scheduled_verdict(three_passes(), exits={1: 3})
+        report = verdict["schedule"]
+        self.assertEqual(report["failed"], [[1, "3"]])
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("slot 1's pass exited 3", problems_of(verdict))
+        self.assertIn("failed [[1, '3']]", s2.schedule_summary(report))
+        row = [r for r in s2.evidence_rows(built, verdict) if r[0] == "schedule"]
+        self.assertIn("failed 1", row[0][6])
+        # A pass on a slot that recorded no exit status is not known to
+        # have completed.
+        _, unknown = scheduled_verdict(three_passes(), exits={2: None})
+        self.assertIn("slot 2's pass recorded no exit status", problems_of(unknown))
+
+    # Finding 4: the drive runs on the observed host and its starts are
+    # measured on the observer's clock.
+
+    def test_a_drive_on_another_host_is_not_evidence(self) -> None:
+        _, verdict = scheduled_verdict(three_passes(), host="sting")
+        self.assertFalse(verdict["evidence"])
+        self.assertIn(
+            "driven on sting, not on the observed host neo", problems_of(verdict)
+        )
+        self.assertEqual(verdict["schedule"]["drive_hosts"], ["sting"])
+
+    def test_a_pass_start_is_judged_on_the_observers_clock(self) -> None:
+        # Slot 1's wall-clock marks 30 s off the observer's clock (the
+        # drive's clock stepped, or it ran elsewhere): by its own clock the
+        # pass started 30 s late; on the observed host's monotonic clock, on
+        # time. The start is judged on the observer's clock, and the parted
+        # clocks are refused (the windows are placed by the wall marks).
+        _, verdict = scheduled_verdict(three_passes(), skew={1: 30.0})
+        report = verdict["schedule"]
+        self.assertFalse(verdict["evidence"])
+        row = [r for r in report["passes"] if r["slot"] == 1][0]
+        self.assertEqual(row["drive_deviation_s"], 30.0)
+        self.assertEqual(row["deviation_s"], 0.0)
+        self.assertEqual(report["max_clock_skew_s"], 30.0)
+        self.assertIn("parted from the observer's", problems_of(verdict))
+
+    def test_passes_with_no_clock_or_drive_record_are_not_evidence(self) -> None:
+        def no_drive(header, intervals):
+            lines = intervals.splitlines()
+            return header, "\n".join(lines[1:])
+
+        _, verdict = scheduled_verdict(three_passes(), edit=no_drive)
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("no drive record", problems_of(verdict))
+
+        def no_origin_clock(header, intervals):
+            header = {k: v for k, v in header.items() if k != "origin_monotonic"}
+            return header, intervals
+
+        _, verdict = scheduled_verdict(three_passes(), edit=no_origin_clock)
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("recorded no monotonic origin", problems_of(verdict))
+
+        def hand_marked(header, intervals):
+            return header, re.sub(r" mono=[0-9.]+", "", intervals)
+
+        _, verdict = scheduled_verdict(three_passes(), edit=hand_marked)
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("recorded no monotonic start", problems_of(verdict))
+
+    def test_drive_records_its_host_and_clocks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            schedule_path = Path(tmp) / "schedule.json"
+            marks = Path(tmp) / "marks"
+            schedule = s2.make_schedule(s2.time.time() + 0.5, 0.5, 2)
+            schedule_path.write_text(json.dumps(schedule))
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = s2.main(
+                    ["drive", "--schedule", str(schedule_path), "--intervals"]
+                    + [str(marks), "--", s2.sys.executable, "-c", "raise SystemExit(4)"]
+                )
+            record = s2.read_records(marks.read_text())
+        self.assertEqual(status, 0)
+        self.assertEqual(record["problems"], [])
+        self.assertEqual([d["host"] for d in record["drives"]], [s2.platform.node()])
+        self.assertTrue(all(p["mono"] is not None for p in record["passes"]))
+        self.assertEqual([p["exit"] for p in record["passes"]], ["4", "4"])
+        # Its pass starts land on the observer's timeline on this host.
+        origin, origin_mono = s2.time.time() - 30.0, s2.time.monotonic() - 30.0
+        report = s2.schedule_report(
+            schedule,
+            record["passes"],
+            origin,
+            60.0,
+            marks=record,
+            observer={"hostname": s2.platform.node(), "origin_monotonic": origin_mono},
+        )
+        self.assertLess(report["max_clock_skew_s"], s2.CLOCK_SLACK_S)
+        self.assertEqual(report["failed"], [[0, "4"], [1, "4"]])
+
+    # Finding 7: rules the suite left alive under mutation.
+
+    def test_a_schedule_with_a_repeated_slot_is_refused(self) -> None:
+        # Mutation M2: slots strictly increasing.
+        with tempfile.TemporaryDirectory() as tmp:
+            at = f"{s2.time.time() + 600:.3f}"
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = s2.main(
+                    ["schedule", "--out", str(Path(tmp) / "s.json"), "--at", at, at]
+                )
+        self.assertEqual(status, 2)
+        doc = s2.fixed_schedule([ORIGIN + 10.0, ORIGIN + 10.0], created=ORIGIN)
+        self.assertIn("its slots are not strictly increasing", s2.schedule_defects(doc))
+        edited = s2.fixed_schedule([ORIGIN + 10.0, ORIGIN + 20.0], created=ORIGIN)
+        edited["params"]["at"] = edited["starts"] = [ORIGIN + 20.0, ORIGIN + 10.0]
+        edited = s2.sealed(edited)
+        self.assertIn(
+            "its slots are not strictly increasing", s2.schedule_defects(edited)
+        )
+
+    def test_a_slot_at_the_moment_it_was_made_is_not_in_advance(self) -> None:
+        # Mutation M6: `starts[0] <= created`, not `<`.
+        doc = s2.fixed_schedule([ORIGIN + 10.0, ORIGIN + 20.0], created=ORIGIN + 10.0)
+        self.assertTrue(
+            any("in advance" in d for d in s2.schedule_defects(doc)),
+            s2.schedule_defects(doc),
+        )
+
+    def test_drive_runs_a_slot_it_reaches_within_the_slack(self) -> None:
+        # Mutation M5: a slot under SCHEDULE_SLACK_S past at launch is run
+        # (late by that much, reported), never skipped.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "schedule.json"
+            marks = Path(tmp) / "marks"
+            now = s2.time.time()
+            schedule = s2.fixed_schedule([now - 2.0, now + 0.5], created=now - 60.0)
+            path.write_text(json.dumps(schedule))
+            with contextlib.redirect_stdout(io.StringIO()):
+                status = s2.main(
+                    ["drive", "--schedule", str(path), "--intervals", str(marks)]
+                    + ["--", "true"]
+                )
+            record = s2.read_records(marks.read_text())
+        self.assertEqual(status, 0)
+        self.assertEqual([p["slot"] for p in record["passes"]], [0, 1])
+        self.assertEqual(record["skipped"], [])
 
 
 if __name__ == "__main__":

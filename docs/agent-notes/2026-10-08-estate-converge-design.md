@@ -410,6 +410,14 @@ source (R5), and its worktree converges to the new head with it.
 
 `Dst` is the destination's `reflog show --format=%H refs/stash`. `S0` is the
 ledger's order. `Sn` is the carried `stash-order-v1`, all newest first.
+(Since OI-1003-Q169, 2026-10-15, each entry is its commit and its reflog
+message in `Dst`, `S0` and `Sn` (`stash-order-v2`), and every row compares
+both; a v1 ledger row names entries by commit until it is upgraded. `Sn`'s
+messages are folded as Git folds a reflog message it writes before any row
+reads them, since Git stores them so whatever bulkload asks: a source
+message Git would fold, from a libgit2 tool or a hand-edited log, lands
+folded and is counted `stash-message-folded`; unfolded, `Dst` never read
+back as `Sn` and every later pass was T6, the review's finding 5.)
 
 | Row | Condition | Action | Custody line |
 |---|---|---|---|
@@ -1074,11 +1082,12 @@ OI-1003-Q1, Q2, Q11 (S4, S5), R-N98 (fixture repositories only), R-N13.
   `upstream/HEAD`, which restore-refs-C fast-forwarded. Carrying symref
   targets is a capture-side change, handed to the S4 lane (finding 16);
   the coordinator confirms the handoff.
-- Stash messages come from each stash commit's subject (`%s`), not the
-  source reflog's message. They differ for `git stash store -m <other>`
-  and any entry whose reflog message is not its subject. Optional later:
-  capture the reflog messages next to `stash-order-v1` (the capture key
-  already hashes the reflog, so S2/S3 are unchanged).
+- Closed 2026-10-15 by OI-1003-Q169 (stash-order-v2; `docs/slo.md`,
+  `2026-10-15-finish-line.md`): the capture reads and carries each stash
+  entry's commit and reflog message, the key hashes both, and the ledger
+  row and the stash table compare both. Before it, messages were each
+  commit's subject (`%s`), which differs for `git stash store -m <other>`;
+  a v1 capture still applies that way (`stash-messages-inferred`).
 - A capture reused from before this branch has no `stash-order-v1`; its
   stash order is inferred from committer time (`stash-order-inferred`)
   and can swap two stashes made in the same second.
