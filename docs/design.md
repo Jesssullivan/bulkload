@@ -631,7 +631,16 @@ that note) before merge.**
   seats are written: each entry is laid down under a temporary name and
   renamed into place, so an operator's file at an entry's name, or any
   index the landing did not write, refuses `GIT_DESTINATION_MODIFIED`),
-  never `GIT_DESTINATION_OCCUPIED` for good.
+  never `GIT_DESTINATION_OCCUPIED` for good. Every refusal a first linked
+  landing can decide without a write (a bare capture, an occupied path, a
+  missing parent, the capture's metadata, a common exclude that is neither
+  the capture's nor a newer one the main item set
+  (`GIT_IGNORE_POLICY_CONFLICT`), intent-to-add custody) is decided from a
+  scratch repository before its first write to the destination
+  repository, so it leaves that repository's refs and objects as they
+  were; the import then runs under the destination lock. `estate-diff`
+  runs the same checks and says `ignore-policy-conflict` or
+  `parent-missing` (dogfood of 2026-10-16, F1 and F2).
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads

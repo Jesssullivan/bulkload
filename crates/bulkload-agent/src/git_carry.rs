@@ -6762,14 +6762,11 @@ pub(crate) fn restore_staged_landed(
     const SITE: &str = "git_carry::restore_staged";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     destination_git_ready()?;
-    refuse_bare_capture(staged)?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
     // never as a bare errno; round 4 N4: so is a parent never laid down.
-    if destination.symlink_metadata().is_ok() {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
-    }
-    let target = linked_destination(destination)?;
+    // `estate-diff` reports the same checks (dogfood of 2026-10-16, F1).
+    let target = converge::first_landing_target(staged, destination)?;
     let mapping = checked_mapping(mapping)?;
     // #216 (OI-1003-Q129, OI-1003-Q135): the whole checkout is built in a
     // private stage beside the destination: the repository imported, every
@@ -7149,10 +7146,12 @@ pub(crate) fn land_bare_staged(
 /// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
 /// anything is imported or created (S4, #162).
 /// Partially created worktrees are retained on failure for explicit recovery.
-/// The capture's exclude policy and intent-to-add custody refuse before the
-/// worktree is added; after it, materialization can still refuse (a path
-/// collision, a malformed filesystem row, IO) and leave a partial worktree
-/// (#216).
+/// The capture's exclude policy and intent-to-add custody refuse before
+/// anything is imported into `repository` (read from a scratch repository;
+/// dogfood of 2026-10-16, F2), so such a refusal leaves its refs as they
+/// were; after the worktree is added, materialization can still refuse (a
+/// path collision, a malformed filesystem row, IO) and leave a partial
+/// worktree (#216).
 pub fn restore_linked(
     bundle: &Path,
     repository: &Path,
@@ -7205,7 +7204,7 @@ pub fn restore_linked_staged(
 ) -> Result<()> {
     restore_linked_staged_landed(
         staged,
-        repository,
+        (repository, None),
         destination,
         source,
         &converge::Landing {
@@ -7228,42 +7227,32 @@ pub fn restore_linked_staged(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn restore_linked_staged_landed(
     staged: &StagedBundle,
-    repository: &Path,
+    (repository, base): (&Path, Option<&StagedBundle>),
     destination: &Path,
     source: &str,
     landing: &converge::Landing<'_>,
 ) -> Result<converge::Applied> {
     use std::os::unix::fs::PermissionsExt;
     destination_git_ready()?;
-    refuse_bare_capture(staged)?;
-    let bundle = staged.path();
-    if destination.symlink_metadata().is_ok() {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
-    }
-    let destination = linked_destination(destination)?;
-    let repository = fs::canonicalize(repository).refuse_at("git_carry::restore_linked_staged")?;
-    let (_, instance) = import_verified_instance(&repository, bundle, source)?;
-    let heads = shallow::headers(&repository, bundle)?;
-    let find = |suffix: &str| -> Result<String> {
-        heads
-            .lines()
-            .find_map(|line| {
-                line.split_once(' ')
-                    .filter(|(_, name)| *name == format!("refs/carry-export/{suffix}"))
-            })
-            .map(|(value, _)| value.to_owned())
-            .filter(|value| oid(value))
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)
-    };
+    // Dogfood of 2026-10-16, F2 (OI-1003-Q171, Q172, Q173): every refusal
+    // that needs no write (bare capture, occupied, parent missing, the
+    // capture's metadata, the common exclude policy, intent-to-add
+    // custody) is decided from a scratch repository before the first
+    // write to the destination repository; `estate-diff` runs the same
+    // checks. The import then runs under the lock, in `plan_linked`.
+    let checked = converge::check_linked(
+        staged,
+        (repository, base),
+        destination,
+        source,
+        landing.observed_ns,
+    )?;
+    let destination = checked.destination.clone();
+    let repository = checked.repository.clone();
+    let heads = checked.heads.clone();
+    let find = |suffix: &str| capture_revision(&heads, suffix);
     let head = find("head")?;
-    let exclude = output(git(&repository).args(["show", &format!("{}:value", find("exclude")?)]))?;
-    let exclude_path = text(git(&repository).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        "info/exclude",
-    ]))?;
-    let read_exclude = |path: &str| match fs::read(path) {
+    let read_exclude = |path: &Path| match fs::read(path) {
         Ok(value) => Ok(value),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(crate::refuse::io(
@@ -7271,22 +7260,11 @@ pub(crate) fn restore_linked_staged_landed(
             "git_carry::restore_linked_staged",
         )),
     };
-    let existing_exclude = read_exclude(&exclude_path)?;
-    let common = common_repository(&repository)?;
-    // Finding 12: the main item may have set a newer exclude than this
-    // capture's; that one is kept, never refused.
-    let expected_exclude = if exclude == existing_exclude
-        || converge::exclude_newer(&common, source, &existing_exclude, landing.observed_ns)?
-    {
-        existing_exclude
-    } else {
-        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
-    };
-    // #131: before the worktree is added, so a capture whose intent-to-add
-    // custody cannot be restored refuses with nothing laid down.
-    let entries = output(git(&repository).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
-    intent_to_add_restorable(&carried_intent_to_add(&repository, &heads)?, &entries)?;
-    let plan = converge::plan_linked(&repository, source, &instance, landing)?;
+    let plan = converge::plan_linked(&checked, (staged.path(), base), source, landing)?;
+    let instance = plan.instance.clone();
+    let expected_exclude = plan.exclude.clone();
+    let exclude_path = checked.exclude_path;
+    let entries = checked.entries;
     // #216's residual (the earlier report's finding 7): the landing is
     // durable as an intent before `worktree add`, so a crash before the
     // worktree's ledger leaves a worktree the rerun can name as bulkload's

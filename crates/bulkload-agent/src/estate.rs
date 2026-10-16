@@ -2152,6 +2152,11 @@ fn stage_base(corpus: &Path, base: &Base) -> Result<git_carry::StagedBundle> {
     Ok(staged)
 }
 
+// A plan base a linked item's apply imports itself (its repository's
+// common directory and the base's digest), recorded in `ImportedBases`
+// only once that apply succeeded.
+type DeferredBase = Option<(PathBuf, [u8; 32])>;
+
 // `bundle` is the staged copy of the capture this apply restores; `bare`
 // whether it is a capture of a bare repository.
 fn import_base(
@@ -2161,9 +2166,9 @@ fn import_base(
     corpus: &Path,
     source: &str,
     imported: &ImportedBases,
-) -> Result<Option<git_carry::StagedBundle>> {
+) -> Result<(Option<git_carry::StagedBundle>, DeferredBase)> {
     if !git_carry::shared::requires_base(bundle)? {
-        return Ok(None);
+        return Ok((None, None));
     }
     // A delta whose `.base` sidecar is gone names no base to import.
     let base = bound(corpus, &captured.bundle)?.ok_or(BulkloadRefusal::SealedObjectMissing)?;
@@ -2183,7 +2188,7 @@ fn import_base(
             .as_ref()
             .is_some_and(|workspace| workspace == &item.repository)
     {
-        return stage_base(corpus, &base).map(Some);
+        return Ok((Some(stage_base(corpus, &base)?), None));
     }
     // A linked or refs-only item imports into its existing repository.
     // S4 (#183): a destination repository that is missing, or a directory
@@ -2195,15 +2200,22 @@ fn import_base(
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
         .contains(&key)
     {
-        return Ok(None);
+        return Ok((None, None));
     }
     let staged = stage_base(corpus, &base)?;
+    // Dogfood of 2026-10-16, F2 (OI-1003-Q171, Q172, Q173): a linked item
+    // imports its base itself, after every refusal it can decide without a
+    // write (a first landing's `check_linked`, an adopt proof, a converge
+    // proof), never here before them.
+    if item.workspace.is_some() {
+        return Ok((Some(staged), Some(key)));
+    }
     git_carry::import_staged(&item.repository, &staged, source)?;
     imported
         .lock()
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
         .insert(key);
-    Ok(None)
+    Ok((None, None))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2291,7 +2303,7 @@ fn apply_item(
     // (R-N72): a chain under a plan base binds every base and every link by
     // name and digest, and the flatten imports every bound base before the
     // oldest link.
-    let (staged, base) = if prior_sidecar(corpus, &captured.bundle)
+    let (staged, base, deferred) = if prior_sidecar(corpus, &captured.bundle)
         .try_exists()
         .refuse_at("estate::apply_item")?
     {
@@ -2299,9 +2311,10 @@ fn apply_item(
         (
             git_carry::chain::flatten(staged, &chain.bases, &chain.links)?,
             None,
+            None,
         )
     } else {
-        let base = import_base(
+        let (base, deferred) = import_base(
             item,
             &captured,
             (staged.path(), staged.is_bare()),
@@ -2309,7 +2322,7 @@ fn apply_item(
             source,
             imported,
         )?;
-        (staged, base)
+        (staged, base, deferred)
     };
     // Estate converge: a first landing restores native refs and records
     // ledgers; a landed checkout whose capture changed converges when its
@@ -2332,16 +2345,20 @@ fn apply_item(
     };
     let (outcome, applied) = if item.workspace.is_some() {
         let landed_before = landed_before(state, &identity, source, &journal)?;
-        (
-            "workspace-restored",
-            git_carry::converge::apply_workspace(
-                &staged,
-                &target,
-                &landing,
-                landed_before,
-                &policy,
-            )?,
-        )
+        let applied = git_carry::converge::apply_workspace(
+            &staged,
+            &target,
+            &landing,
+            landed_before,
+            &policy,
+        )?;
+        if let Some(key) = deferred {
+            imported
+                .lock()
+                .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
+                .insert(key);
+        }
+        ("workspace-restored", applied)
     } else {
         (
             "refs-imported",

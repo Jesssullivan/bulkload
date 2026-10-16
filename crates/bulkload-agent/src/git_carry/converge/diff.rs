@@ -25,7 +25,9 @@ use super::super::{git, text};
 use super::adopt::{
     ancestor, foreign_shape, objects_of, prove_adoptable, rekey_refusal, Found, Scratch,
 };
-use super::{head_of, lstat, prove, sides, Landing, Meta, Target};
+use super::{
+    check_linked, first_landing_target, head_of, lstat, prove, sides, Landing, Meta, Target,
+};
 use crate::{BulkloadRefusal, Result};
 
 /// One ref of an item's repository, as `estate-diff` reports it.
@@ -56,7 +58,10 @@ pub struct ItemRow {
     pub hint: Option<&'static str>,
     /// `ledger` (three-way) or `none` (two-way).
     pub baseline: &'static str,
-    /// What `estate-apply` does here: `landing` (A5), `bare-landing`
+    /// What `estate-apply` does here: `landing` (A5), and where A5's own
+    /// checks refuse it, `ignore-policy-conflict`
+    /// (`GIT_IGNORE_POLICY_CONFLICT`) or `parent-missing`
+    /// (`GIT_DESTINATION_PARENT_MISSING`); `bare-landing`
     /// (A11c), `adoptable` (A11a, A11d), `diverged`, `occupied-foreign`,
     /// `symlinked-path` and `occupied-shape` (`GIT_DESTINATION_OCCUPIED`
     /// before any proof, `adopt::foreign_shape`), `ledgered`,
@@ -64,7 +69,9 @@ pub struct ItemRow {
     /// `not-a-repository`, `not-at-path`.
     pub adopt: &'static str,
     /// The components that differ: `head`, `index`, `exclude`,
-    /// `seats=<n>`, `seat=<path>`, `unrelated`; or, for an occupied shape
+    /// `seats=<n>`, `seat=<path>`, `unrelated`; `repository-absent` for a
+    /// first linked landing whose repository the apply's main item lands
+    /// first (its exclude policy is not checked); or, for an occupied shape
     /// or a re-key `--adopt` refuses, its reason (`symlinked-path`,
     /// `other-repository`, `linked-as-standalone`, `worktree-link`,
     /// `item-in-plan`, `other-tree`).
@@ -97,6 +104,41 @@ fn occupied(row: &mut ItemRow, reason: &'static str) {
     row.components.push(reason.to_owned());
 }
 
+// What a first landing (A5) answers (dogfood of 2026-10-16, F1): the
+// apply's own pre-landing checks, never a guess. A first linked landing
+// runs [`check_linked`] when its repository exists (when it does not, the
+// apply's main item lands it first: only the path is checked, and the row
+// says `repository-absent`). `GIT_IGNORE_POLICY_CONFLICT` is
+// `ignore-policy-conflict`, `GIT_DESTINATION_PARENT_MISSING`
+// `parent-missing`; any other refusal is the row's refusal.
+fn first_landing(
+    staged: &super::super::StagedBundle,
+    target: &Target<'_>,
+    landing: &Landing<'_>,
+) -> Result<&'static str> {
+    let workspace = target
+        .workspace
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let checked = if workspace == target.repository || lstat(target.repository)?.is_none() {
+        first_landing_target(staged, workspace).map(drop)
+    } else {
+        check_linked(
+            staged,
+            (target.repository, target.base),
+            workspace,
+            target.source,
+            landing.observed_ns,
+        )
+        .map(drop)
+    };
+    match checked {
+        Ok(()) => Ok("landing"),
+        Err(BulkloadRefusal::GitIgnorePolicyConflict) => Ok("ignore-policy-conflict"),
+        Err(BulkloadRefusal::GitDestinationParentMissing) => Ok("parent-missing"),
+        Err(other) => Err(other),
+    }
+}
+
 /// Report one workspace item (`target.workspace` is set). `items` are the
 /// plan's item ids, which A11b never re-keys from.
 ///
@@ -120,10 +162,13 @@ pub fn workspace(
     };
     if lstat(workspace)?.is_none() {
         row.class = "source-only";
-        row.adopt = "landing";
-        if standalone {
+        row.adopt = first_landing(staged, target, landing)?;
+        if standalone && row.adopt == "landing" {
             let scratch = Scratch::new(staged, None, target.base, target.source)?;
             row.origin = origin(&scratch, target.source, origins)?;
+        }
+        if !standalone && lstat(target.repository)?.is_none() {
+            row.components.push("repository-absent".to_owned());
         }
         return Ok(row);
     }
@@ -246,7 +291,7 @@ fn ledgered(
             target.repository,
             (git_dir, common),
             standalone,
-            target.base.filter(|_| standalone),
+            target.base,
             target.source,
             ledger,
             landing,
