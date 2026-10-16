@@ -1,5 +1,7 @@
 # bulkload architecture review and refactor plan (2026-10-03)
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** Analysis of `origin/main` at `727493a`. Since then, among others: background priority is built (WP0(f)), `census_walks` exists, carry_v2 is deleted (`docs/slo.md`, amendment 2026-10-05), HEAD and index drift is custody (#38), and the charter (#137) is merged. Current state: `docs/slo.md` and `docs/design.md`.
+
 Ruling: OI-1003-Q14 (adversarial architecture review and sprawl audit), R-N13. This is analysis only: nothing was edited, committed, commented or filed.
 Base: `origin/main` @ `727493a` (64,782 Rust lines). The charter is PR #137 `docs/slo.md` (still open).
 Inputs: 63 critic findings from four lenses (sprawl, architecture, parallelism, slo-provability). After deduplication they reduce to 11 work packages.

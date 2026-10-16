@@ -1,5 +1,7 @@
 # 2026-10-07: s1-hermetic-rig lane
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** mbp-13 has 2 physical cores and 4 threads; "4 cores" below counted logical CPUs (`docs/slo.md`, the 2026-10-07 corrections amendment).
+
 Rulings: OI-1003-Q96 (hermetic rig), OI-1003-Q97 (gate of record),
 OI-1003-Q99 (gated gate (a) on mbp-13), OI-1002-Q30, R-N81, R-N13. The
 rulings are recorded on TIN-4543 (comment of 2026-10-07 about 02:10 EDT).

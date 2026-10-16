@@ -1,5 +1,7 @@
 # Estate-shaped corpus v1 — 2026-10-03
 
+> **Label (2026-10-16, R-N13; body unchanged).** As of 2026-10-03. The S3 measurement harness it calls unbuilt is built (`crates/bulkload-bench/scripts/s3_estate.py`; `s3-estate-sting-2026-10-04.md`).
+
 Rulings: OI-1003-Q19 (WP0(e): an estate-shaped S1 corpus beside R23's),
 OI-1003-Q23, OI-1003-Q35 (Sprint 2 S3 measurement on this corpus), R-N13.
 Context: [docs/slo.md](../slo.md) WP0(e), S1 and S3, and

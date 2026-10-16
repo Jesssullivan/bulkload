@@ -1,4 +1,19 @@
-# Formal model: wire v5, Held, group commits and resume; git carry custody
+# Formal model: the transfer, Git carry custody, the SQLite seat, directory records and estate convergence
+
+Modules: `BulkloadTransfer.tla` (the transfer: wire v5's entry protocol,
+`Held`, group commits and resume; the wire is v6 since #218, which adds the
+SQLite seat, modelled in `SqliteCarry.tla`), `GitCarry.tla`,
+`SqliteCarry.tla`, `DirectoryRecords.tla` and `EstateConverge.tla`. Each
+module's run order is its `configs*.tsv`; `just tla-check` rechecks every
+cited code symbol against the tree it runs on (grounding), so a commit pin
+below dates a results paragraph, not the model's scope. [Labelled
+2026-10-16, R-N13: the opening below is the 2026-10-03/04 text and is
+historical; "the table below is one run" (Results) and "the current table"
+name two different runs, and the 73 rows of `configs.tsv` at `0d96dbd`
+(24 pass, 38 fail, 9 reach, 1 simulate, 1 inconclusive) have no single
+recorded run over all of them. The checker is the flake-pinned nixpkgs
+`tlaplus` 1.7.4, whose TLC banner reads "Version 2.19"; "TLC 2.19" and
+"TLC 1.7.4" below name the same binary.]
 
 The proof package's formal model ([docs/slo.md](../slo.md), OI-1003-Q7): a
 TLA+ specification of bulkload's transfer, model-checked with TLC. TLA+ and
@@ -1733,8 +1748,9 @@ The model follows the code where the code and docs/design.md differ:
   describes; `fix(transfer): bounded salvage …; distrust pre-racy-guard
   rows`). It implements OI-1003-Q24 (salvage bounds: 1024 temporaries and
   4 GiB) and OI-1003-Q26 (a pre-guard store is invalidated in place). Both
-  rulings are recorded on the coordinator branch (978446734), not yet in
-  slo.md. The model has **not** been re-checked against it. The re-check
+  rulings are in `docs/slo.md` (amendment 2026-10-03, evening)
+  [2026-10-16: this line said "not yet in slo.md"]. The model has **not**
+  been re-checked against it. The re-check
   needs:
   - `Store::open` will delete every `captures` and `outputs` row when the
     `racy_guard` marker is missing. That is a durable effect at session start

@@ -23,10 +23,20 @@ statement holds only for the stack and not for `main`, it says so.
 after `a8d837a` and is **not** in this tree; section 3.3 and 2.11 cite it
 by pull request where they mention it.
 
+**Since then (labelled 2026-10-16, R-N13).** The whole S1 stack is on `main`:
+#230 (`1d826ab`) merged it with #210 and #228, then #233 (`--adopt`,
+`estate-diff`, native bare landing, closure v4) and #235 (the delta lever)
+followed; `main` is `0d96dbd`. Every "on the S1 stack", "not on `main`" and
+"not in this tree" qualifier below is therefore stale: what it qualifies is
+on `main`. Statements this label corrects are marked `[2026-10-16]`; counts
+not so marked were not re-verified at `0d96dbd`.
+
 This paper explains and argues. It is not a source of truth. Where it and a
 normative document disagree, the normative document wins:
 
-- [`docs/design.md`](../design.md) is the product contract;
+- [`docs/SOURCES.md`](../SOURCES.md) names the canonical file for each kind
+  of fact: [`docs/SPEC.md`](../SPEC.md) (#236) for what bulkload must
+  achieve, [`docs/design.md`](../design.md) for how it works;
 - [`docs/slo.md`](../slo.md) defines S1–S5 and the completion bar, with
   every dated amendment;
 - [`docs/formal/README.md`](../formal/README.md) holds every model-checking
@@ -47,8 +57,8 @@ Four rules keep the paper honest:
   - CI and issue states read from GitHub on 2026-10-16.
 - **Every result carries one of four labels.**
   - *Gated*: enforced on every pull request by `just check-fast` and the two
-    CI gates, or a benchmark sample taken under the R-N81 and R-N91 gate
-    conditions.
+    CI gates, or a benchmark sample taken under the R-N81 gate conditions
+    (R-N91 is superseded by OI-1003-Q194 C18 [2026-10-16]).
   - *Informational*: measured or checked on record, but enforced by no
     gate. Every TLC run is in this class, because no tier starts TLC. A
     benchmark sample taken with the load gate set aside is
@@ -678,10 +688,10 @@ estate convergence ruled"; [`docs/design.md`](../design.md), "Live union").
   because an unchanged rerun reads nothing (S3); and a concurrent
   `git switch` can race the HEAD locks, because Git commits the index
   before it takes `HEAD.lock`, so no lock closes that window.
-- **Not converged.** Landings made before #224 carry no ledger. `--adopt`,
-  which would make such a landing bulkload's by proof, is not built
-  (OI-1003-Q145); #226 tracks it, and its design is on an unmerged branch
-  (section 5.4).
+- **Not converged until adopted.** Landings made before #224 carry no
+  ledger. `--adopt` makes such a landing bulkload's by proof; it is built
+  and on `main` (#233, closing #226; `docs/design.md`, "Live union", `--adopt`)
+  [2026-10-16].
 
 The design came with its own TLA+ module, `EstateConverge.tla`, and the
 module's properties gated the merge (section 4.2).
@@ -1092,7 +1102,7 @@ OI-1003-Q32 makes the model a hybrid of three tools, each with one job
 | Role | Tool | Job |
 |---|---|---|
 | Checker of record | TLA+ with TLC [TLA94] [Specifying02] [TLC99] | Every verdict, count and counterexample cited as a result is TLC's. |
-| Typed catalogue | Dhall [Dhall] (`docs/formal/catalogue/`) | Holds every configuration's constants and expectation, every mutation's verdict and every property's traceability row, for all five modules. It renders every `configs*.tsv` and `MC_*.cfg`: 243 files in this tree. |
+| Typed catalogue | Dhall [Dhall] (`docs/formal/catalogue/`) | Holds every configuration's constants and expectation, every mutation's verdict and every property's traceability row, for all five modules. It renders every `configs*.tsv` and `MC_*.cfg` (257 files at `0d96dbd`; `just tla-render --check` prints the current count) [2026-10-16]. |
 | N-version cross-check | Haskell (`docs/formal/hs/`) | A second encoding of BulkloadTransfer and GitCarry that must reproduce TLC's state counts and mutation verdicts, and the reference decision core. It does not cover the three newer modules. |
 
 **None of this is gated.** `just tla-check`, `just tla-render` and
@@ -1207,7 +1217,10 @@ negative, 43 mutation rows and one `also` row, and the self-test); 53 cited
 code symbols, none pending. #38 and Q161 added the raced-capture rows; every
 `MC_ec_` row was run again on 2026-10-15 (89 rows and the self-test: 34
 PASS, 49 FAIL, 5 REACHED, 1 SIMULATION), and every pass row but
-`MC_ec_capture_raced` explored its recorded count. The two documented-limit
+`MC_ec_capture_raced` explored its recorded count. [2026-10-16: the adopt
+rows (#233) brought `configs_ec.tsv` to 108 rows, and the 2026-10-16 run
+matched all of them; the current counts are in `docs/formal/README.md`,
+"Results (EstateConverge)".] The two documented-limit
 rows are Q149's limits 1 and 2, which fail `ConvergesWhenQuiet` by ruling.
 
 What it does not prove (README, "What EstateConverge does not prove"):
@@ -1274,7 +1287,8 @@ All of these are *gated*: they are in the mandatory `check-fast` tier
 - **Gate (a), local.** `r23_ab.py` builds the candidate B and the baseline
   A and runs B/A/B/A/B; B passes only if every B rep passes, and A is
   informational (OI-1002-Q30). A sample is gated only on AC power with the
-  1-minute load under the R-N81 limit, with other lanes held quiet (R-N91).
+  1-minute load under the R-N81 limit. (Holding other lanes quiet, R-N91,
+  is superseded by OI-1003-Q194 C18 [2026-10-16].)
   `--under-load` lifts only the load gate and never produces a verdict
   (OI-1003-Q39, Q50).
 - **The hermetic rig is the gate of record** (OI-1003-Q96, Q97): mbp-13, a
@@ -1331,7 +1345,7 @@ is an inference from the merged pull requests, not an observed run.
 
 | SLO | Instrument | State |
 |---|---|---|
-| S1 gate (a) | R23 A/B harness on the rig | **Not met.** The one gated sample of record (2026-10-07) is a FAIL, 0 of 3 B reps (section 5.2). Informational, under load: the stack is at about 1.13x plain rclone on the initial copy (section 5.3), short of Q143's 0.90x admission margin. |
+| S1 gate (a) | R23 A/B harness on the rig | **Not met.** The one gated sample of record (2026-10-07) is a FAIL, 0 of 3 B reps (section 5.2). Informational, under load: no series has reached Q143's 0.90x admission margin on the initial copy; the series are in `docs/evidence/` (latest: `r23-2026-10-16-mbp-13-s1delta-underload.md`), and the rig drifts between them (PR #238) [2026-10-16]. |
 | S1 gate (b) | `gate_b.py` | Pending: no run, and the native multi-stream arm is not built. |
 | S2 properties | P-S2, P34, P75, P76, P77, P84, the priority test; `MC_s2`, `SqliteCarry` | Gated for the file path, the Git object store, the command registry, the lock trace, the clone ban (static half) and the SQLite exceptions. The clone ban's kernel half is on demand. #188 is open. |
 | S2 budget | `s2_budget.py` (`run`, `observe`, `alongside`; Q168's schedule on `main`) | **Pending. Never measured** (#165). |
@@ -1343,7 +1357,7 @@ is an inference from the merged pull requests, not an observed run.
 | Durability order | fault harness, R-N88 checker, resume proofs; transfer and directory-record invariants | Gated. The real-copy proof is bounded; the new batched and fold proofs are exhaustive. |
 | S4 | closure gate, disposition ledger; P72, P73, P86; `ClosureAccounted` | Gated **over a whole run**: estate items and transfers. 56 bare `IO` sites remain. The manifest is optional. |
 | S5 | P87, drift tests; `EstateConverge` raced rows | Gated: ref, seat, object-store, HEAD, index, nested-worktree and stash drift are custody. The exclude, configuration, shallow frontier, foreign nests and omitted roots still refuse. |
-| Convergence (Q144) | `estate_converge` tests, fault-harness rows; `EstateConverge.tla` | Gated on the code; model run informational. Three ruled limits (Q149). `--adopt` not built. |
+| Convergence (Q144) | `estate_converge` tests, fault-harness rows; `EstateConverge.tla` | Gated on the code; model run informational. Three ruled limits (Q149). `--adopt` built (#233) [2026-10-16]. |
 
 ## 5. Results
 
@@ -1368,7 +1382,7 @@ every pull request. These hold in this tree:
 - **S5 and convergence**: P87, the drift tests, and the `estate_converge`
   suite.
 
-On the S1 stack (not on `main`): the levers' proofs (section 2.2), the WAL
+On `main` since #230 [2026-10-16]: the levers' proofs (section 2.2), the WAL
 template and fold tests, and the new power-loss proofs. The stack's last
 `just check-fast` passed on sting with 728 library tests and 5 ignored
 ([fold note](../agent-notes/2026-10-16-s1-fold.md), section 8). On Darwin
@@ -1581,9 +1595,9 @@ origins rule requires.
   script (`reconcile.receipt`, sha256
   `637867b736b02c37774982aa0bd58e43f2941e6b7b455cadcbc5a42ac73a03c2`: 26
   occupied names swapped aside, 165 destination refs imported create-only,
-  `verify_rc=0`, under OI-1003-Q163 and Q167). Issue #226 asks for this
-  natively; its design (`estate-apply --adopt` into live paths) is staged on
-  an unmerged branch and is not described here as a result.
+  `verify_rc=0`, under OI-1003-Q163 and Q167). Issue #226 asked for this
+  natively; `estate-apply --adopt` into live paths has since merged (#233)
+  [2026-10-16], and this carry predates it.
 - It ran on an unchanged source for the rerun, so it shows S3's unchanged
   clause, not S5's convergence under a moving source; P87 and the
   `estate_converge` suite carry that.
@@ -1600,7 +1614,7 @@ origins rule requires.
 | The S2 measured budget | #165. No alongside observation on neo; Q168's schedule is on `main`, not in this tree. |
 | S3 on the estate corpus after #172, #177, #182, #186, #187 and the SQLite seat | Not re-measured. |
 | A gated S3 rerun-ratio verdict | None recorded. |
-| `--adopt` and protect (#226) | Designed and staged on an unmerged branch; OI-1003-Q145 had held it unbuilt. |
+| Protect (`--protect`, `EstateProtect.tla`) | Not built. `--adopt` is built (#233) [2026-10-16]. |
 | The re-root policy and CORPUS GC, P71 | Lane L8; no code. |
 | The daily-work verdict on the destination | Issue #40. |
 
@@ -1750,8 +1764,8 @@ the tested corpus is bounded and identical on every run (section 4.1).
 - **S1 fails on the rig of record**, and the stack has not reached the
   admission margin for another gated sample (sections 5.2, 5.3). Every
   later number is under load and never of record.
-- **The stack is not on `main`.** #210 and everything stacked on it wait on
-  the independent review OI-1003-Q173 requires.
+- **The stack is on `main`** (#230, after the independent review OI-1003-Q173
+  requires) [2026-10-16].
 - **The hand-off and R-N57.** Whether gate (a)'s "full protocol over a
   local socket" admits the loopback hand-off is an operator wording
   decision, open before any gated S1 sample.
@@ -1803,9 +1817,9 @@ the tested corpus is bounded and identical on every run (section 4.1).
   and omitted roots still refuse under a moving source.
 - Nested worktree custody is the nested HEAD commit only: a switch between
   two branches at one commit is no custody change.
-- Q149's three limits, and convergence only for landings with ledgers;
-  `--adopt` is not built, and a bare repository has no native landing into
-  a fresh root (the GFTB finding).
+- Q149's three limits, and convergence only for landings with ledgers or
+  adopted by proof (`--adopt`, #233); a bare capture into an absent path now
+  lands natively (#233) [2026-10-16].
 
 **Restore cost is undercounted (#147).** `estate-apply`'s space preflight
 undercounts a chained apply, and no evidence file measures a full workspace
@@ -1837,17 +1851,11 @@ capturing host's clock. Capture records and sidecars are not
 authenticated; the capture record's hash check against the output's own
 bytes is what guards it.
 
-**Documentation drift in this tree.**
-
-- `docs/design.md` still says the converge half is "held for an operator
-  ruling" (section "Live union"), although `docs/slo.md` records
-  OI-1003-Q144 as ruled; it still calls the salvage bounds unruled.
-- `docs/slo.md` carries no amendment text for OI-1003-Q143 or Q154; their
-  text is in the agent notes and on Linear TIN-4543 only. It still words
-  S3's unchanged-estate bound on wall-clock and has no text for OI-1003-Q35.
-- `docs/formal/README.md`'s opening still pins the transfer model to
-  `adb9c66` and calls itself a model of "wire v5".
-- GitHub issues #181 and #187 are open although their fixes are on `main`.
+**Documentation drift in this tree.** [2026-10-16: the items this list
+named were fixed at their source by the truthing pass (`docs/SOURCES.md`):
+design.md's converge "held" and salvage "unruled", the formal README's
+opening pin. GitHub issues closed by merged fixes are listed in that pass's
+pull request; issue state is GitHub's.]
 
 **The sample is narrow.** Two hosts, one operator, one estate, one field
 carry.
@@ -1905,10 +1913,11 @@ What stands between this text and a publishable paper (OI-1003-Q155):
    the 2026-10-16 fold series
    ([evidence](../evidence/r23-2026-10-16-mbp-13-s1fold-underload.md)).
    Section 5's S1 series and field results are now recorded in the tree.
-2. **The stack must land on `main`** (OI-1003-Q173), or this paper's
-   S1-stack statements must be re-scoped to a branch at publication.
+2. **The stack must land on `main`** (OI-1003-Q173). Done: #230
+   [2026-10-16].
 3. **Re-pin to current `main`** to take in #228 (Q168, Q169) and whatever
-   follows.
+   follows. Open: the label under "Code base" marks what changed; the
+   counts are not re-verified at `0d96dbd`.
 4. **An S1 verdict to report.** Today the paper can only report a FAIL of
    record and an under-load trend. The fold's rig series has run, under
    load (section 5.3): about 1.04x plain rclone on the initial copy with

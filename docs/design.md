@@ -1,15 +1,15 @@
-# Bulkload product contract
+# Bulkload design
+
+How bulkload works: its contracts, records and refusal codes. What it must
+achieve and when it is done is [SPEC.md](SPEC.md) (#236); the SLOs and their
+proofs are [slo.md](slo.md); [SOURCES.md](SOURCES.md) maps the rest.
 
 ## Completion
 
-The destination must support daily work: authenticated agents with history,
-SSH, Git commits and pushes, PR operations, editors and persistent terminal
-sessions. Counts, manifests and documentation merges alone do not establish
-completion.
-
-Coverage includes both hosts' unique Git and agent state, credentials, dots,
-SQLite and worktrees. Unsupported items remain outstanding with preserved
-custody; nothing is silently excluded.
+Done is defined in SPEC.md (OI-1003-Q194 C20). On the design side: coverage
+includes both hosts' unique Git and agent state, credentials, dots, SQLite
+and worktrees. Unsupported items remain outstanding with preserved custody;
+nothing is silently excluded (OI-1003-Q185, Q192).
 
 Closure is bulkload's own gate, never a metric defined outside it
 (OI-1001-Q2). `closure-report PLAN CORPUS SOURCE PRIVATE_STATE...` reads the
@@ -236,7 +236,11 @@ Source safety (S2, WP1):
   no hooks, fsmonitor, automatic gc or maintenance, optional locks, lazy
   fetch, system or global config, or replace objects; the C locale; and a
   discovery ceiling at the given path's parent. The estimate's remote probe
-  is tested against the same table.
+  is tested against the same table. Exceptions: the four child builders the
+  P76 registry tolerates and argues (`BYPASSES` in
+  `tests/source_command_registry.rs`, #188), among them the estimate's local
+  probe `bash` (its scrubbed environment is a hand copy of 9 of the table's
+  11 cleared keys) and its remote probe over ssh.
 - A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
   read, in `git-export` and `estate-capture`.
 - The source's object store is read-only to a capture (#162).
@@ -253,7 +257,9 @@ Source safety (S2, WP1):
 - Source-side verbs (`serve`, `estate-capture`, `snapshot`,
   `git-carry-estimate`, `git-export`, `copy`) enter background CPU and IO
   priority before anything else (WP0(f)), inherited by every thread and
-  child. `--priority=normal` is the explicit, recorded opt-out; every
+  child. The remote estimate probe's `bash` runs at default priority on the
+  remote host (WP0(f) covers only the local verb; #188). `--priority=normal`
+  is the explicit, recorded opt-out; every
   counters line and the bench header record the class.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
@@ -489,10 +495,10 @@ neither an index nor a worktree (S4, #162).
     `GIT_DESTINATION_OCCUPIED`. The one check after publication catches a
     concurrent writer.
 
-Estate converge (2026-10-08, branch `feat/estate-converge-20261008`;
-`docs/agent-notes/2026-10-08-estate-converge-design.md`). **The
-converge half is held for an operator ruling and its TLA+ model (Q1 of
-that note) before merge.**
+Estate converge (2026-10-08; `docs/agent-notes/2026-10-08-estate-converge-design.md`).
+Merged in #224 (2026-10-15) and ruled with three stated limits
+(OI-1003-Q144, Q149; `docs/slo.md`, amendment 2026-10-15); its model is
+`docs/formal/EstateConverge.tla`.
 
 - **Native refs (#215).** A standalone first landing restores every
   carried ref natively inside its private stage (the repository bulkload
@@ -680,7 +686,7 @@ that note) before merge.**
   commit's files and index.
 
 Import preserves divergence and leaves active HEADs, indexes and working
-bytes untouched, with one exception pending the ruling above: a checkout
+bytes untouched, with one ruled exception (OI-1003-Q144): a checkout
 bulkload landed and nobody changed since is converged to a newer capture
 of the same source, and, under `--adopt`, an existing checkout that proves
 equal to its capture becomes bulkload's with nothing written to it (#226).
@@ -753,7 +759,9 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   protocol step changes.
 - The exclude file, configuration, the shallow frontier, foreign nests and
   gitlinks (a staged gitlink change too), or the omitted rebuildable roots
-  moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30).
+  moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30). These
+  residual refusals are a design choice; no operator ruling scopes them
+  (the rulings cover HEAD and index, #38, and the stash, Q161).
   `git-export` and the other strict exports still refuse any drift.
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
@@ -1008,8 +1016,9 @@ writers never pause for a capture. What moved is recorded, never absorbed:
 
 ## Performance
 
-Performance is the product bar (R23, R25). Two gates, each a 3-rep A/B/A/B/A
-median (R-N57):
+Performance is the product bar (R23, R25). Two gates (R-N57); their order,
+verdict rule, hosts and corpus are S1 in [slo.md](slo.md) (OI-1002-Q30's
+B/A/B/A/B; OI-1003-Q97; OI-1003-Q194 C2):
 
 - **(a) Loopback:** the native engine, running its full protocol over a local
   socket with no clone fast path, beats `rclone copy` as shipped on the same
@@ -1060,11 +1069,15 @@ source bytes read.
   rewritten in place, or a changed mode. A record that names another row
   (the seat moved since that capture) is read again and not counted.
 
-## M2 gates (current)
+## M2 gates (historical)
 
-The acceptance criteria for each M2 workstream as they stand today. Rulings
-are recorded on TIN-3692. When a ruling changes a gate, this table is
-updated.
+[Historical, labelled 2026-10-16 (R-N13).] The M2 workstream acceptance
+table as of 2026-10-05. S1–S5 in [slo.md](slo.md) replaced this framing;
+gate rules, orders and targets there win. Stale here: W4's "wire v5" (the
+wire is v6) and "< 1.5 s on the TinylandState corpus" (that corpus was lost;
+OI-1003-Q3 sets no hard SLA); W5's neo→sting gate (b) (decided on the rig,
+OI-1003-Q97, and reframed by OI-1003-Q194 C2). Rulings are recorded on
+Linear TIN-4543.
 
 | Workstream | Acceptance | Rulings |
 |---|---|---|
@@ -1077,8 +1090,8 @@ updated.
 | W7 proofs | I1 (a record implies its bytes), I2 (no partial leaves) and I3 (a committed file means 0 source reads on resume) hold at every process-crash fault point. Power-loss ordering is proven by a syscall-trace crash-state checker. Darwin barriers are modelled device-wide, with the per-fd model available as a strict option. | R-N86, R-N88, R-N103 |
 
 Gated benchmark samples require AC power and a 1-minute load below 2.5,
-and each sample row records both. The coordinator keeps the other lanes
-quiet while gated samples run (R-N81, R-N91). The clone fast path never
+and each sample row records both (R-N81). (R-N91's quiet lanes are
+superseded by OI-1003-Q194 C18; `docs/slo.md`, amendment 2026-10-16.) The clone fast path never
 counts toward a gate (R-N57, R-N63). The clone lever is excluded
 (OI-1003-Q164, Q165): the engine has no clone path, and S2 forbids one on a
 source file (Live union, "No clone of a source file"). Every copy of the
@@ -1408,7 +1421,7 @@ miss (#87).
   which R25 allows (its row cannot show it was not racy), and recorded under
   the guard; chunk hints are kept, so content the destination still holds is
   adopted after verification and never crosses the wire again (#125). The
-  single migration run (OI-1002-Q24) may therefore start from existing
+  migration runs (OI-1003-Q13: a repeatable run, not a one-off) may therefore start from existing
   pre-migration state.
 - **Known limit: clocks.** The racy predicate compares the source
   filesystem's mtime and ctime with the capturing host's wall clock, as in
@@ -1440,8 +1453,8 @@ miss (#87).
   reported as left (#124, OI-1002-Q33). An entry refused before it staged
   anything keeps nothing, so a path refused on every run never keeps
   temporaries (#97). What is kept is bounded, 1024 temporaries and 4 GiB per
-  session (unruled engineering defaults: OI-1002-Q33 ruled that salvage is
-  bounded, not these numbers; a ruling may change them); a temporary past the bound is removed and refused as a value,
+  session at a destination root (OI-1003-Q24, which ratified these numbers; OI-1002-Q33
+  ruled that salvage is bounded); a temporary past the bound is removed and refused as a value,
   `SALVAGE_BOUND_EXCEEDED` under its current name, and its chunks are sent
   again.
 - **Hints.** The destination records, per digest, every published output

@@ -1,5 +1,7 @@
 # 2026-10-02 — estate-closure lane: #95, #101, #106
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** "The single migration run" (OI-1002-Q24) is superseded by OI-1003-Q13 (a repeatable run) and OI-1003-Q142 / Q194 C6 (`docs/slo.md`, amendment 2026-10-16).
+
 Lane: estate-closure, host sting. Worktree
 `bulkload.worktrees/estate-closure-20261002`, branch
 `feat/estate-closure-20261002`, cut from origin/main 41c8892 (#114).
