@@ -1,5 +1,7 @@
 # 2026-10-02: coordinator session — merges, closure, and the gate plan
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** Its gate plan is superseded: gate (b) moved to the hermetic rig (OI-1003-Q97); "the single migration run" is a repeatable run (OI-1003-Q13); R-N56's freeze and the run-before-lift order are superseded by OI-1003-Q142 and Q194 C6 (`docs/slo.md`, amendment 2026-10-16). Live status: the Linear SSOT document (`docs/SOURCES.md`).
+
 **Seat:** sting coordinator, Claude Code session `neo:f1c4ead8`.
 
 **Rulings:** these operator interviews, all cited in their receipts with

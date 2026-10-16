@@ -2864,6 +2864,10 @@ pub(crate) mod mid_pass {
         /// Keyed by a destination checkout: inside the adopt proof, after a
         /// seat's bytes were read equal and before its print is taken again.
         AdoptSeatRead,
+        /// Keyed by a destination checkout: a hand-off render after its
+        /// targets were written and before their prints are taken (TIN-6569,
+        /// review of 2026-10-16).
+        HandoffWritten,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -4308,11 +4312,37 @@ const NEST_SUBMODULE_DEPTH: usize = 8;
 // own files and which Git passes down to the submodule statuses it spawns;
 // env keys also avoid any `-c key=value` parsing ambiguity in a hostile name.
 fn nest_status(directory: &Path) -> Result<Command> {
-    use std::os::unix::ffi::OsStrExt;
     let mut drivers = std::collections::BTreeSet::new();
     if filter_drivers(directory, 0, &mut drivers)? {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
+    Ok(unfiltered(directory, &drivers))
+}
+
+/// `git` for a read-only `status` of a checkout bulkload reads but does not
+/// own (an estate hand-off's live sibling or destination-only worktree,
+/// OI-1003-Q189): every filter driver its configuration or a populated
+/// submodule's names is switched off as for a nest, so the read runs no
+/// program the repository configured (a clean filter, a long-running
+/// process such as git-lfs) and a required driver cannot fail it
+/// (re-review 3 of 2026-10-16, finding 5). Unlike a nest, a configured
+/// driver is no refusal: the status compares raw bytes, so a file whose
+/// filter changes its bytes and whose index stat is stale reads as
+/// modified (never as clean).
+///
+/// # Errors
+/// The repository's configuration or index cannot be read.
+fn unfiltered_status(directory: &Path) -> Result<Command> {
+    let mut drivers = std::collections::BTreeSet::new();
+    filter_drivers(directory, 0, &mut drivers)?;
+    Ok(unfiltered(directory, &drivers))
+}
+
+/// [`git`] in `directory` with every filter driver of `drivers` switched off
+/// and the status comparisons at full strength, as command-scope
+/// configuration (see [`nest_status`]).
+fn unfiltered(directory: &Path, drivers: &std::collections::BTreeSet<Vec<u8>>) -> Command {
+    use std::os::unix::ffi::OsStrExt;
     // B1 (round 3): the nest's own config must not weaken what status
     // compares. Stat checks at full strength, modes and symlinks compared,
     // no line-ending conversion.
@@ -4332,7 +4362,7 @@ fn nest_status(directory: &Path) -> Result<Command> {
         // worst a case difference shows as dirt and the nest refuses.
         ("core.ignoreCase".into(), "false"),
     ];
-    for name in &drivers {
+    for name in drivers {
         for (variable, value) in [
             ("clean", ""),
             ("smudge", ""),
@@ -4353,7 +4383,7 @@ fn nest_status(directory: &Path) -> Result<Command> {
             .env(format!("GIT_CONFIG_KEY_{index}"), key)
             .env(format!("GIT_CONFIG_VALUE_{index}"), value);
     }
-    Ok(command)
+    command
 }
 
 // Every `filter.<name>.*` subsection visible to the repository at `directory`

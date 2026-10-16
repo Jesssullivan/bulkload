@@ -20,7 +20,7 @@ jobs:
     name: ${{ matrix.gate }} terminal gate
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}
     runs-on: tinyland-nix
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:

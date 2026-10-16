@@ -147,6 +147,18 @@
 //! | `reseat.after_undo_cwd` | `--undo` put re-spelled rows' old `cwd` back and committed; the ledger rows not yet `undone` |
 //! | `reseat.after_undo_exchange` | `--undo` exchanged a regularized transcript back to its symlink: the symlink at the path, the regular copy under the temporary name; the ledger row not yet `undone` |
 //!
+//! The hand-off block (TIN-6569, OI-1003-Q183), in
+//! `git_carry::converge::handoff`:
+//!
+//! | Name | Crash leaves (at the destination) |
+//! |------|------------------------------------|
+//! | `estate.handoff.after_intent` | `handoff.intent` durable; every target old |
+//! | `estate.handoff.after_temp` | a target's new bytes at its `.bulkload-handoff-<tag>-<n>` temporary; the target old |
+//! | `estate.handoff.after_exchange` | a target new, the old file displaced at the temporary (a created file: new, no temporary) |
+//! | `estate.handoff.after_record` | the new `handoff.landed`, the intent still pending |
+//! | `estate.handoff.clear_after_exchange` | a clear's target stripped (or a created file renamed away), the displaced file at the temporary |
+//! | `estate.handoff.lift_after_unlink` | converge's lift unlinked a created block; the record still names it |
+//!
 //! # Group size
 //!
 //! Group commit closes a group by count, size or idle time, so how many
@@ -350,11 +362,29 @@ pub enum Point {
     ReseatAfterUndoCwd,
     /// `reseat.after_undo_exchange`
     ReseatAfterUndoExchange,
+    /// `estate.handoff.after_intent`: the hand-off intent durable; no
+    /// target written (TIN-6569, OI-1003-Q183).
+    EstateHandoffAfterIntent,
+    /// `estate.handoff.after_temp`: a target's new bytes fsynced at its
+    /// `.bulkload-handoff-<tag>-<n>` temporary, not exchanged.
+    EstateHandoffAfterTemp,
+    /// `estate.handoff.after_exchange`: a target exchanged (or created):
+    /// the new file at the path, the old one displaced at the temporary.
+    EstateHandoffAfterExchange,
+    /// `estate.handoff.after_record`: the new hand-off record written, the
+    /// intent pending.
+    EstateHandoffAfterRecord,
+    /// `estate.handoff.clear_after_exchange`: a clear's target exchanged
+    /// (or a created file renamed away), the displaced file not checked.
+    EstateHandoffClearAfterExchange,
+    /// `estate.handoff.lift_after_unlink`: converge lifted a created
+    /// hand-off file before its add; the hand-off record not updated.
+    EstateHandoffLiftAfterUnlink,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 55] = [
+    pub const ALL: [Self; 61] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -410,6 +440,12 @@ impl Point {
         Self::ReseatAfterRegularizeExchange,
         Self::ReseatAfterUndoCwd,
         Self::ReseatAfterUndoExchange,
+        Self::EstateHandoffAfterIntent,
+        Self::EstateHandoffAfterTemp,
+        Self::EstateHandoffAfterExchange,
+        Self::EstateHandoffAfterRecord,
+        Self::EstateHandoffClearAfterExchange,
+        Self::EstateHandoffLiftAfterUnlink,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -471,6 +507,12 @@ impl Point {
             Self::ReseatAfterRegularizeExchange => "reseat.after_regularize_exchange",
             Self::ReseatAfterUndoCwd => "reseat.after_undo_cwd",
             Self::ReseatAfterUndoExchange => "reseat.after_undo_exchange",
+            Self::EstateHandoffAfterIntent => "estate.handoff.after_intent",
+            Self::EstateHandoffAfterTemp => "estate.handoff.after_temp",
+            Self::EstateHandoffAfterExchange => "estate.handoff.after_exchange",
+            Self::EstateHandoffAfterRecord => "estate.handoff.after_record",
+            Self::EstateHandoffClearAfterExchange => "estate.handoff.clear_after_exchange",
+            Self::EstateHandoffLiftAfterUnlink => "estate.handoff.lift_after_unlink",
         }
     }
 

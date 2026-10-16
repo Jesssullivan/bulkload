@@ -1,15 +1,15 @@
-# Bulkload product contract
+# Bulkload design
+
+How bulkload works: its contracts, records and refusal codes. What it must
+achieve and when it is done is [SPEC.md](SPEC.md) (#236); the SLOs and their
+proofs are [slo.md](slo.md); [SOURCES.md](SOURCES.md) maps the rest.
 
 ## Completion
 
-The destination must support daily work: authenticated agents with history,
-SSH, Git commits and pushes, PR operations, editors and persistent terminal
-sessions. Counts, manifests and documentation merges alone do not establish
-completion.
-
-Coverage includes both hosts' unique Git and agent state, credentials, dots,
-SQLite and worktrees. Unsupported items remain outstanding with preserved
-custody; nothing is silently excluded.
+Done is defined in SPEC.md (OI-1003-Q194 C20). On the design side: coverage
+includes both hosts' unique Git and agent state, credentials, dots, SQLite
+and worktrees. Unsupported items remain outstanding with preserved custody;
+nothing is silently excluded (OI-1003-Q185, Q192).
 
 Closure is bulkload's own gate, never a metric defined outside it
 (OI-1001-Q2). `closure-report PLAN CORPUS SOURCE PRIVATE_STATE...` reads the
@@ -236,7 +236,11 @@ Source safety (S2, WP1):
   no hooks, fsmonitor, automatic gc or maintenance, optional locks, lazy
   fetch, system or global config, or replace objects; the C locale; and a
   discovery ceiling at the given path's parent. The estimate's remote probe
-  is tested against the same table.
+  is tested against the same table. Exceptions: the agent's four child builders
+  the P76 registry tolerates and argues (`BYPASSES` in
+  `crates/bulkload-agent/tests/source_command_registry.rs`, #188), among them the estimate's local
+  probe `bash` (its scrubbed environment is a hand copy of 9 of the table's
+  11 cleared keys) and its remote probe over ssh.
 - A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
   read, in `git-export` and `estate-capture`.
 - The source's object store is read-only to a capture (#162).
@@ -253,7 +257,9 @@ Source safety (S2, WP1):
 - Source-side verbs (`serve`, `estate-capture`, `snapshot`,
   `git-carry-estimate`, `git-export`, `copy`) enter background CPU and IO
   priority before anything else (WP0(f)), inherited by every thread and
-  child. `--priority=normal` is the explicit, recorded opt-out; every
+  child. The remote estimate probe's `bash` runs at default priority on the
+  remote host (WP0(f) covers only the local verb; #188). `--priority=normal`
+  is the explicit, recorded opt-out; every
   counters line and the bench header record the class.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
@@ -489,10 +495,10 @@ neither an index nor a worktree (S4, #162).
     `GIT_DESTINATION_OCCUPIED`. The one check after publication catches a
     concurrent writer.
 
-Estate converge (2026-10-08, branch `feat/estate-converge-20261008`;
-`docs/agent-notes/2026-10-08-estate-converge-design.md`). **The
-converge half is held for an operator ruling and its TLA+ model (Q1 of
-that note) before merge.**
+Estate converge (2026-10-08; `docs/agent-notes/2026-10-08-estate-converge-design.md`).
+Merged in #224 (2026-10-15) and ruled with three stated limits
+(OI-1003-Q144, Q149; `docs/slo.md`, amendment 2026-10-15); its model is
+`docs/formal/EstateConverge.tla`.
 
 - **Native refs (#215).** A standalone first landing restores every
   carried ref natively inside its private stage (the repository bulkload
@@ -649,6 +655,140 @@ that note) before merge.**
   - `estate-diff` reports all of this beforehand, read-only.
   - Not built: `--protect` (land the source's state beside a destination
     adopt refuses).
+- **Hand-off block (TIN-6569, OI-1003-Q183, 2026-10-16;
+  `docs/agent-notes/2026-10-16-estate-handoff-design.md`).**
+  `estate-handoff PLAN CORPUS PRIVATE_STATE SOURCE` writes a dated,
+  delimited block at byte 0 of `AGENTS.md` and `CLAUDE.md` in each landed
+  workspace, of an existing `AGENTS.override.md` (Codex reads it instead of
+  `AGENTS.md`), and of an existing `README.md` only with `--readme` (neither
+  is ever created). The block names this landing, its source path on SOURCE and a
+  live sibling (`--sibling LANDED_PREFIX=LIVE_PREFIX`) by absolute path;
+  the capture, landing and build; each worktree of the repository at
+  capture and now; `estate-diff`'s ref classes against the landed capture,
+  destination-only worktrees and recorded refusals; and the instruction to
+  converge and consolidate with the user before any other work, with the
+  exact `estate-diff`, `--check` and `--clear` commands.
+  - **Owned by a record, never by inference.** The block is recorded in
+    `handoff.landed` beside `workspace.landed` (its length and blake3),
+    with `handoff.intent` durable before any target is written. Each
+    target goes through a temporary, fsync, `RENAME_EXCHANGE` and a
+    check of the displaced file against the print read (a created file
+    by a no-replace rename); a writer that raced it is put back and the
+    run refuses. A rerun of either verb settles a crash forward: a
+    pending render's record is made to name exactly the blocks in place,
+    and a pending clear is finished, never undone (the H step included).
+  - **Owned by identity.** The BEGIN line names the landing it was
+    rendered for (`for=`, a digest of the destination host, the
+    workspace path and SOURCE). A block that names another landing came
+    with the source's bytes (a re-carried, handed-off tree), and so did a
+    block of this landing's identity that the target's landed blob itself
+    starts with (a round trip: carried back to the source and landed
+    again at the same path, after the record is gone or while it stands,
+    and whatever the user has written below it since; re-review 3 of
+    2026-10-16): it is content (OI-1003-Q185, nothing is dropped from a
+    carry), kept byte for byte below this landing's block, named in it as
+    carried, and cleared only by the opt-in `--clear --clear-carried`
+    (below). Any other block of this landing's identity that its record
+    does not name (edited inside, cut, or its record lost) is never
+    presented as carried: the hand-off refuses `HANDOFF_BLOCK_MODIFIED`. A block a
+    person removed by hand (retired in the record with its digest) and
+    then put back byte for byte, by an editor's undo or a `git stash
+    pop`, is this landing's again: converge accepts it, the next render
+    takes it back into the record (`restored`) and renders it current,
+    and `--clear` removes it.
+  - **Converge keeps an intact block.** A landed seat holds landed
+    content when its bytes are the landed blob, or a recorded block
+    followed by it (`holds`, through `landed_sides`). An edit inside the
+    block or below it is the user's: converge refuses
+    `GIT_DESTINATION_MODIFIED` as for any edit. The record's print of a
+    target lets converge skip the read only when it is out of the racy
+    window and its `base` is the landed blob; every write of that print
+    (a rerun over a kept block, a settle, a re-dating) checks the bytes
+    under the block against the landed blob again first, so it never
+    vouches for an edit below the block. A file the hand-off created is
+    lifted (removed, when it is exactly its block) before the source adds
+    the same path; it stays `created` when a later render replaces its
+    block, so the lift and `--clear` still remove it.
+  - **The H step.** After the last level of an `estate-apply`, each
+    workspace of a repository the run changed that holds a record (or a
+    pending intent) has its block re-rendered from the estate as it now
+    stands, under the record's options; a refused item's own workspace is
+    left alone. Its result is a line of its own (`item=<id>
+    handoff=written|unchanged|<CODE>`), never an item's outcome.
+  - **Removal** is `estate-handoff --clear`, a recorded step that restores
+    the bytes and `git status` exactly. Carried blocks stay hands-off by
+    default; `--clear --clear-carried` (OI-1003-Q190, only with `--clear`)
+    also removes the carried blocks at the head of a target's landed
+    content, under this landing's block or alone, by the same intent,
+    temporary, exchange with the displaced file checked, and a record,
+    `handoff.stripped`, which outlives `handoff.landed`: converge and
+    `estate-diff` accept the landed blob without those bytes (alone or
+    under a later block) while that blob stands, and the landing's objects
+    still hold them. Above content that is not the landed blob (a user's
+    edit) a carried block is kept (`carried-kept`). A crashed clear that
+    the next run finishes records each removal whose target no longer
+    starts with the removed blocks, a user's later edit included. A
+    converge that lands a new blob of the target lands what the source
+    has, carried block included.
+  - **Commit detection** (`--check`, read-only; OI-1003-Q191): a token
+    line is one holding the `BULKLOAD-HANDOFF-DO-NOT-COMMIT` token that the
+    source's history (the commits the carried capture, `refs/carry/`,
+    reaches) never added; every BEGIN line names its block's id and
+    landing, so a block of this landing's always has one. `staged` when a
+    target's index blob holds a token line that its HEAD blob lacks;
+    `committed` when a commit that the carried capture does not reach, in
+    the history of any branch, tag, remote-tracking ref, stash entry or a
+    detached HEAD, adds one (a block committed and removed again is still
+    published by a push; the block says to stash nothing that holds it).
+    Both exit `HANDOFF_MARKER_COMMITTED`. A block the source committed,
+    also when cherry-picked or rebased here, is reported once per
+    workspace as information (`"source_history":true`), never as
+    committed. Every name
+    a hand-off may write (`AGENTS.md`, `CLAUDE.md`, `AGENTS.override.md`,
+    `README.md`) is read, whether or not it is a target now. No hook is
+    installed.
+  - **Open rows and `ready`.** Diverged and source-ahead refs, a live
+    sibling whose HEAD the landing does not hold (on a branch or in its
+    HEAD's history; a sibling strictly ahead is open), destination-only
+    worktrees whose HEAD no other
+    branch holds, recorded refusals, and a newer capture not applied.
+    A destination commit, a dest-ahead ref or a seat edited since landing
+    is consolidation, not an open row, so `ready` is reachable by
+    consolidating. `ready` also needs a clean working tree in the live
+    sibling and in every destination-only worktree (OI-1003-Q189): a
+    read-only `git status` (`--no-optional-locks`, untracked files
+    counted, ignored ones not) of each, on every run, with every filter
+    driver the checkout configures switched off (no clean filter or
+    long-running process such as git-lfs runs there, and a required one
+    cannot fail the read; a filtered file whose index stat is stale reads
+    as modified until the checkout's own `git status` refreshes it); one
+    that lists an entry or cannot be read is an open row.
+  - **Options persist.** A rerun, the H step and the `--check` a block
+    prints keep the `--sibling` and `--readme` the record was rendered
+    with unless they are given again.
+  - **Always written (OI-1003-Q188).** The privacy guard is removed ("an
+    erroneous overreach; such a block is irrelevant to bulkload"): the
+    block is written into every landed workspace whatever its remotes,
+    and no remote URL is read for it, rendered or printed. Absolute paths
+    and host names are written only into the targets, `.git/bulkload/`
+    and PRIVATE_STATE, and printed on stdout (the rows, and `--dry-run`'s
+    blocks); commit detection reports a block committed here.
+  - **Typed refusals,** each with nothing written: `HANDOFF_NOT_LANDED`,
+    `HANDOFF_TARGET_UNSUPPORTED` (a symlink other
+    than `CLAUDE.md -> AGENTS.md` in the same worktree, which is covered by
+    `AGENTS.md`'s block, or any other non-regular target),
+    `HANDOFF_BLOCK_MODIFIED` (a block of this landing's identity that is
+    not the record's and that the landed blob does not start with: edited
+    inside, cut, or its record lost), and `HANDOFF_MARKER_COMMITTED`.
+  - **S3.** Rendering is a pure function of metadata and an `as_of`
+    instant kept while its inputs digest holds. An unchanged rerun reads 0
+    destination bytes and writes nothing once a rerun has re-dated a
+    record whose prints were racy, as Git re-dates a racily clean index.
+  - Not built: the estate-wide `INDEX.md` under PRIVATE_STATE, a
+    `handoff` field in `estate-diff` rows and the opt-in `--commit-guard`
+    hook. A capture never strips a block (OI-1003-Q185: nothing is
+    excluded from a carry); the next landing's identity check handles a
+    carried one.
 - One plan lands a main and its linked worktrees: an item whose repository
   is a planned standalone workspace applies a level after it, and a
   standalone item's plan base is imported into its stage. A first linked
@@ -680,7 +820,7 @@ that note) before merge.**
   commit's files and index.
 
 Import preserves divergence and leaves active HEADs, indexes and working
-bytes untouched, with one exception pending the ruling above: a checkout
+bytes untouched, with one ruled exception (OI-1003-Q144): a checkout
 bulkload landed and nobody changed since is converged to a newer capture
 of the same source, and, under `--adopt`, an existing checkout that proves
 equal to its capture becomes bulkload's with nothing written to it (#226).
@@ -753,7 +893,9 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   protocol step changes.
 - The exclude file, configuration, the shallow frontier, foreign nests and
   gitlinks (a staged gitlink change too), or the omitted rebuildable roots
-  moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30).
+  moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30). These
+  residual refusals are a design choice; no operator ruling scopes them
+  (the rulings cover HEAD and index, #38, and the stash, Q161).
   `git-export` and the other strict exports still refuse any drift.
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
@@ -1008,8 +1150,9 @@ writers never pause for a capture. What moved is recorded, never absorbed:
 
 ## Performance
 
-Performance is the product bar (R23, R25). Two gates, each a 3-rep A/B/A/B/A
-median (R-N57):
+Performance is the product bar (R23, R25). Two gates (R-N57); their order,
+verdict rule, hosts and corpus are S1 in [slo.md](slo.md) (OI-1002-Q30's
+B/A/B/A/B; OI-1003-Q97; OI-1003-Q194 C2):
 
 - **(a) Loopback:** the native engine, running its full protocol over a local
   socket with no clone fast path, beats `rclone copy` as shipped on the same
@@ -1060,11 +1203,15 @@ source bytes read.
   rewritten in place, or a changed mode. A record that names another row
   (the seat moved since that capture) is read again and not counted.
 
-## M2 gates (current)
+## M2 gates (historical)
 
-The acceptance criteria for each M2 workstream as they stand today. Rulings
-are recorded on TIN-3692. When a ruling changes a gate, this table is
-updated.
+[Historical, labelled 2026-10-16 (R-N13).] The M2 workstream acceptance
+table as of 2026-10-05. S1–S5 in [slo.md](slo.md) replaced this framing;
+gate rules, orders and targets there win. Stale here: W4's "wire v5" (the
+wire is v6) and "< 1.5 s on the TinylandState corpus" (that corpus was lost;
+OI-1003-Q3 sets no hard SLA); W5's neo→sting gate (b) (decided on the rig,
+OI-1003-Q97, and reframed by OI-1003-Q194 C2). Rulings are recorded on
+Linear TIN-4543.
 
 | Workstream | Acceptance | Rulings |
 |---|---|---|
@@ -1077,8 +1224,10 @@ updated.
 | W7 proofs | I1 (a record implies its bytes), I2 (no partial leaves) and I3 (a committed file means 0 source reads on resume) hold at every process-crash fault point. Power-loss ordering is proven by a syscall-trace crash-state checker. Darwin barriers are modelled device-wide, with the per-fd model available as a strict option. | R-N86, R-N88, R-N103 |
 
 Gated benchmark samples require AC power and a 1-minute load below 2.5,
-and each sample row records both. The coordinator keeps the other lanes
-quiet while gated samples run (R-N81, R-N91). The clone fast path never
+and each sample row records both (R-N81). (R-N91's quiet lanes are
+read as superseded by OI-1003-Q194 C18 together with SPEC R3, "Samples run
+on live hosts"; RUL-18 does not name R-N91, and how R-N81 fits SPEC R3 is
+open: `docs/slo.md`, amendment 2026-10-16.) The clone fast path never
 counts toward a gate (R-N57, R-N63). The clone lever is excluded
 (OI-1003-Q164, Q165): the engine has no clone path, and S2 forbids one on a
 source file (Live union, "No clone of a source file"). Every copy of the
@@ -1408,7 +1557,7 @@ miss (#87).
   which R25 allows (its row cannot show it was not racy), and recorded under
   the guard; chunk hints are kept, so content the destination still holds is
   adopted after verification and never crosses the wire again (#125). The
-  single migration run (OI-1002-Q24) may therefore start from existing
+  migration runs (OI-1003-Q13: a repeatable run, not a one-off) may therefore start from existing
   pre-migration state.
 - **Known limit: clocks.** The racy predicate compares the source
   filesystem's mtime and ctime with the capturing host's wall clock, as in
@@ -1440,8 +1589,8 @@ miss (#87).
   reported as left (#124, OI-1002-Q33). An entry refused before it staged
   anything keeps nothing, so a path refused on every run never keeps
   temporaries (#97). What is kept is bounded, 1024 temporaries and 4 GiB per
-  session (unruled engineering defaults: OI-1002-Q33 ruled that salvage is
-  bounded, not these numbers; a ruling may change them); a temporary past the bound is removed and refused as a value,
+  session at a destination root (OI-1003-Q24, which ratified these numbers; OI-1002-Q33
+  ruled that salvage is bounded); a temporary past the bound is removed and refused as a value,
   `SALVAGE_BOUND_EXCEEDED` under its current name, and its chunks are sent
   again.
 - **Hints.** The destination records, per digest, every published output

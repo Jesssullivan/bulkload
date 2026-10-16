@@ -1333,6 +1333,12 @@ use estate_adopt::EstateAdopt;
 mod reseat;
 use reseat::Reseat;
 
+// The `estate.handoff.*` points (TIN-6569, OI-1003-Q183): a hand-off
+// render, clear or converge lift crashed, and the rerun finishing it.
+#[path = "fault_harness/estate_handoff.rs"]
+mod estate_handoff;
+use estate_handoff::EstateHandoff;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
@@ -1495,6 +1501,30 @@ scenarios! {
     reseat_q198_after_synth_row_insert => ReseatAfterSynthRowInsert: 1, Reseat::Q198;
     reseat_q198_undo_after_exchange => ReseatAfterUndoExchange: 1, Reseat::Undo;
     reseat_q198_undo_after_cwd => ReseatAfterUndoCwd: 1, Reseat::Undo;
+    // The hand-off block (TIN-6569): every point of a render, a clear and
+    // converge's lift, each finished by the rerun.
+    estate_handoff_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::Render;
+    estate_handoff_after_temp => EstateHandoffAfterTemp: 1, EstateHandoff::Render;
+    estate_handoff_after_exchange => EstateHandoffAfterExchange: 1, EstateHandoff::Render;
+    estate_handoff_after_exchange_second => EstateHandoffAfterExchange: 2, EstateHandoff::Render;
+    estate_handoff_after_record => EstateHandoffAfterRecord: 1, EstateHandoff::Render;
+    estate_handoff_clear_after_exchange => EstateHandoffClearAfterExchange: 1, EstateHandoff::Clear;
+    estate_handoff_lift_after_unlink => EstateHandoffLiftAfterUnlink: 1, EstateHandoff::Lift;
+    estate_handoff_converge_after_intent => EstateConvergeAfterIntent: 1, EstateHandoff::Converge;
+    estate_handoff_converge_seat_after_exchange => EstateConvergeSeatAfterExchange: 1, EstateHandoff::Converge;
+    estate_handoff_h_step_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_temp => EstateHandoffAfterTemp: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_exchange => EstateHandoffAfterExchange: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_record => EstateHandoffAfterRecord: 1, EstateHandoff::HStep;
+    // Review of 2026-10-16: a crashed re-render over a user's edit, settled
+    // by a run that refuses; a crashed clear finished by a no-op apply.
+    estate_handoff_rerender_over_edit => EstateHandoffAfterIntent: 1, EstateHandoff::RerenderOverEdit;
+    estate_handoff_clear_noop_apply => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearNoOpApply;
+    estate_handoff_clear_carried_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::ClearCarried;
+    estate_handoff_clear_carried_after_exchange => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearCarried;
+    // Re-review 3 of 2026-10-16, finding 3: a crashed clear-carried
+    // finished after a user's edit still records its removal.
+    estate_handoff_clear_carried_edit_revert => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearCarriedEditRevert;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

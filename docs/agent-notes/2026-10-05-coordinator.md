@@ -1,5 +1,7 @@
 # 2026-10-04/05: coordinator session — Q42 git-carry push, v1 ref table, pause
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** Its "Next" queue is stale: L6b and L7 landed (#199, #205); L8 (re-root and GC, P71), L9 (the `git_carry.rs` split) and W4 PR 4 (`import-v3-state`) never landed and no ruling dropped them. Live status: the Linear SSOT document (`docs/SOURCES.md`).
+
 **Seat:** sting coordinator, Claude Code session `neo:f1c4ead8`.
 **Earlier:** this note continues `2026-10-03-coordinator.md`, which covers rulings Q23–Q38.
 **Linear:** TIN-4543, comments from 2026-10-04 14:45 EDT to 2026-10-05; the SSOT document's sections "Afternoon 2026-10-04" and "RESUME HERE (2026-10-06)".

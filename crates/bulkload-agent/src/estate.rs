@@ -2850,6 +2850,33 @@ pub fn apply_with(
     options: &ApplyOptions,
     receipt: &(impl Fn(&Receipt) -> Result<()> + Sync),
 ) -> Result<()> {
+    apply_reporting(
+        plan,
+        corpus,
+        state,
+        source,
+        (jobs, options),
+        receipt,
+        &mut |_| Ok(()),
+    )
+}
+
+/// [`apply_with`], with each hand-off H step's line (TIN-6569,
+/// OI-1003-Q183: `item=<id> handoff=<written|unchanged|CODE>`) handed to
+/// `handoff_line` after the last level.
+///
+/// # Errors
+/// As [`apply_with`]; a refusal of `handoff_line` itself.
+#[allow(clippy::too_many_lines)]
+pub fn apply_reporting(
+    plan: &Path,
+    corpus: &Path,
+    state: &Path,
+    source: &str,
+    (jobs, options): (usize, &ApplyOptions),
+    receipt: &(impl Fn(&Receipt) -> Result<()> + Sync),
+    handoff_line: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
     if !options
         .activate_origin
         .iter()
@@ -2893,6 +2920,10 @@ pub fn apply_with(
         .iter()
         .map(id)
         .collect::<Result<Vec<String>>>()?;
+    let touched = Mutex::new((
+        std::collections::BTreeSet::<PathBuf>::new(),
+        std::collections::BTreeSet::<String>::new(),
+    ));
     let operation = |item: &Item| {
         let common = groups
             .get(&id(item)?)
@@ -2903,7 +2934,7 @@ pub fn apply_with(
         let _guard = lock
             .lock()
             .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
-        apply_item(
+        let done = apply_item(
             item,
             corpus,
             state,
@@ -2911,7 +2942,23 @@ pub fn apply_with(
             (&imported, &owners),
             (options, &items),
         )
-        .map_err(charged_space)
+        .map_err(charged_space);
+        // TIN-6569: a repository whose item did more than a journal no-op
+        // gets the H step after the last level; a refused item's own
+        // workspace never does (design 6.4: the converge left it as it was).
+        if done
+            .as_ref()
+            .map_or(true, |done| !done.outcome.starts_with("previous-"))
+        {
+            let mut touched = touched
+                .lock()
+                .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
+            touched.0.insert(common.clone());
+            if done.is_err() {
+                touched.1.insert(id(item)?);
+            }
+        }
+        done
     };
     // R-N114: an item whose workspace lies inside another item's workspace
     // restores after it, level by level, so the outer checkout lays down the
@@ -2954,6 +3001,24 @@ pub fn apply_with(
             outcome = Err(error);
         }
     }
+    // TIN-6569 (OI-1003-Q183), the H step (design 6.4): after every level,
+    // with every outcome record written.
+    let (touched, refused) = touched
+        .into_inner()
+        .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
+    handoff::after_levels(
+        &contents,
+        (plan, corpus, state),
+        source,
+        &|item| {
+            let identity = id(item)?;
+            Ok(groups
+                .get(&identity)
+                .is_some_and(|common| touched.contains(common))
+                && !refused.contains(&identity))
+        },
+        handoff_line,
+    )?;
     outcome
 }
 
@@ -3053,6 +3118,10 @@ pub mod custody_probe {
 // `estate-diff` (#226 item 1).
 mod diff;
 pub use diff::{diff, DiffOptions, Summary as DiffSummary, SCHEMA as DIFF_SCHEMA};
+
+// `estate-handoff` (TIN-6569, OI-1003-Q183).
+mod handoff;
+pub use handoff::{handoff, HandoffMode, HandoffOptions, HandoffSummary, SCHEMA as HANDOFF_SCHEMA};
 
 // S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
 #[cfg(test)]

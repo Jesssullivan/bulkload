@@ -1,5 +1,7 @@
 # 2026-10-03 walk-estate-policy (#129, #131, #89)
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** "The single migration run" (OI-1002-Q24) is superseded by OI-1003-Q13 (a repeatable run) and OI-1003-Q142 / Q194 C6 (`docs/slo.md`, amendment 2026-10-16).
+
 Lane: walk-estate-policy, branch `feat/walk-estate-policy-20261003` from
 `origin/main` (c65dee5). Rulings: OI-1002-Q24 (bulkload completes before the
 single migration run), OI-1002-Q29 (ultracode, full steam), OI-1002-Q34

@@ -1,5 +1,7 @@
 # 2026-10-02 ingest-journal lane (#82, #92, #94)
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** The ingest and journal this lane worked on were deleted with carry_v2 (#189; OI-1003-Q44, Q56). "The single migration run" (OI-1002-Q24) is superseded by OI-1003-Q13 and OI-1003-Q142 / Q194 C6 (`docs/slo.md`, amendment 2026-10-16).
+
 Rulings: OI-1002-Q24 (bulkload completes before the single migration run),
 OI-1002-Q25 (gate plan / pre-migration fixes), OI-1002-Q29 (operator
 "ultracode, full steam ahead", 2026-10-02), R25 / R-N58 strict per

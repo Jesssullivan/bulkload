@@ -792,14 +792,29 @@ pub(super) fn settle_repository(repo: &Path, common: &Path, source: &str) -> Res
 
 // ---- the seat delta ----------------------------------------------------------
 
-/// One side of a seat: what the capture holds at a path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One side of a seat: what the capture holds at a path. `prefix` (the old
+/// side only, [`handoff::landed_sides`]) lists the hand-off blocks the seat
+/// may carry above its landed bytes (TIN-6569, OI-1003-Q183); it is not
+/// part of the side's identity, so the delta never plans a write for it.
+#[derive(Debug, Clone)]
 struct Side {
     kind: Kind,
     mode: u32,
     blob: Option<String>,
     link: Option<Vec<u8>>,
+    prefix: Vec<handoff::Prefix>,
 }
+
+impl PartialEq for Side {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.mode == other.mode
+            && self.blob == other.blob
+            && self.link == other.link
+    }
+}
+
+impl Eq for Side {}
 
 fn sides(repo: &Path, meta: &Meta) -> Result<BTreeMap<Vec<u8>, Side>> {
     let rows = meta.rows(repo)?;
@@ -845,6 +860,7 @@ fn sides(repo: &Path, meta: &Meta) -> Result<BTreeMap<Vec<u8>, Side>> {
                 mode: row.mode & 0o777,
                 blob,
                 link: row.link_target.clone(),
+                prefix: Vec::new(),
             },
         );
     }
@@ -1043,7 +1059,11 @@ fn write_temp(seat: &Seat, side: &Side, objects: &mut BatchObjects) -> Result<Op
 
 /// Whether the seat at `path` holds `side`'s content (kind, bytes or link
 /// target; not the mode). Reads destination bytes only, counted, compared
-/// with the blob as the object store holds it.
+/// with the blob as the object store holds it. A regular seat whose side
+/// carries hand-off prefixes also holds it as one of those blocks followed
+/// by the blob (TIN-6569: the block is bulkload's, never work), or by the
+/// blob without the carried blocks a recorded `--clear --clear-carried`
+/// removed from its head (OI-1003-Q190).
 fn holds(objects: &mut BatchObjects, path: &Path, side: &Side) -> Result<bool> {
     let Some(meta) = lstat(path)? else {
         return Ok(false);
@@ -1064,40 +1084,77 @@ fn holds(objects: &mut BatchObjects, path: &Path, side: &Side) -> Result<bool> {
                 .blob
                 .as_deref()
                 .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-                .refuse_at("git_carry::converge::holds")?;
-            let mut compare = Compare {
-                file: std::io::BufReader::new(file),
-                equal: true,
-                scratch: Vec::new(),
+            let open = || {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(path)
+                    .refuse_at("git_carry::converge::holds")
             };
-            let length = objects.copy_into(blob, &mut compare, None);
-            let mut rest = [0u8; 1];
-            let ended = std::io::Read::read(&mut compare.file, &mut rest)
-                .refuse_at("git_carry::converge::holds")?
-                == 0;
-            crate::counters::add_len(
-                crate::counters::Counter::DestVerifyRead,
-                usize::try_from(meta.len()).unwrap_or(usize::MAX),
-            );
-            length.map(|_| compare.equal && ended)
+            let candidates = if side.prefix.is_empty() {
+                Vec::new()
+            } else {
+                handoff::matching(&mut open()?, &side.prefix)?
+            };
+            for prefix in candidates {
+                let mut file = open()?;
+                std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(prefix.len))
+                    .refuse_at("git_carry::converge::holds")?;
+                if holds_blob(objects, file, blob, prefix.strip, meta.len())? {
+                    return Ok(true);
+                }
+            }
+            holds_blob(objects, open()?, blob, 0, meta.len())
         }
     }
 }
 
-/// A writer that compares what it is given with a file's next bytes.
+// Whether `file`, from its position on, is `blob`'s bytes after its first
+// `skip` and nothing more.
+fn holds_blob(
+    objects: &mut BatchObjects,
+    file: fs::File,
+    blob: &str,
+    skip: u64,
+    len: u64,
+) -> Result<bool> {
+    let mut compare = Compare {
+        file: std::io::BufReader::new(file),
+        equal: true,
+        scratch: Vec::new(),
+        skip,
+    };
+    let length = objects.copy_into(blob, &mut compare, None);
+    let mut rest = [0u8; 1];
+    let ended = std::io::Read::read(&mut compare.file, &mut rest)
+        .refuse_at("git_carry::converge::holds")?
+        == 0;
+    crate::counters::add_len(
+        crate::counters::Counter::DestVerifyRead,
+        usize::try_from(len).unwrap_or(usize::MAX),
+    );
+    length.map(|_| compare.equal && ended && compare.skip == 0)
+}
+
+/// A writer that compares what it is given, after its first `skip` bytes,
+/// with a file's next bytes.
 struct Compare {
     file: std::io::BufReader<fs::File>,
     equal: bool,
     scratch: Vec<u8>,
+    skip: u64,
 }
 
 impl std::io::Write for Compare {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.equal {
+    fn write(&mut self, given: &[u8]) -> std::io::Result<usize> {
+        let skipped = usize::try_from(self.skip)
+            .unwrap_or(usize::MAX)
+            .min(given.len());
+        self.skip = self
+            .skip
+            .saturating_sub(u64::try_from(skipped).unwrap_or(u64::MAX));
+        let bytes = given.get(skipped..).unwrap_or_default();
+        if self.equal && !bytes.is_empty() {
             self.scratch.resize(bytes.len(), 0);
             let mut filled = 0;
             while filled < bytes.len() {
@@ -1112,7 +1169,7 @@ impl std::io::Write for Compare {
             }
             self.equal = filled == bytes.len() && self.scratch.get(..filled) == Some(bytes);
         }
-        Ok(bytes.len())
+        Ok(given.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1170,9 +1227,20 @@ fn prove(
             prints.insert(seat.path.clone(), seat.clone());
             continue;
         }
+        let side = old.get(&seat.path).ok_or_else(|| modified.clone())?;
+        // A hand-off record's print of the seat (its block on the landed
+        // bytes), unchanged and not racy, is trusted as the ledger's is
+        // (TIN-6569).
+        if side
+            .prefix
+            .iter()
+            .any(|prefix| prefix.trusted.as_ref().is_some_and(|print| now.same(print)))
+        {
+            prints.insert(seat.path.clone(), now);
+            continue;
+        }
         // The content fallback: the landed bytes, under a print that held
         // still while they were read, are adopted under that print.
-        let side = old.get(&seat.path).ok_or_else(|| modified.clone())?;
         if !holds(&mut objects, &path, side)? {
             return Err(modified);
         }
@@ -2094,7 +2162,7 @@ pub fn apply_workspace(
         ledger = landed::read(&ledger_path)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
     }
     let meta0 = Meta::read(workspace, place.source, &ledger.instance)?;
-    let old = sides(workspace, &meta0)?;
+    let old = handoff::landed_sides(workspace, &place.git_dir, place.source, &meta0)?;
     if ledger.capture == landing.capture {
         // A6 (finding 15a): the ledger is ahead of the journal; prove it.
         prove(workspace, &place.common, &ledger, standalone, &old)?;
@@ -2136,6 +2204,15 @@ fn converge(
     shape(meta0, &meta1)?;
     let new = sides(worktree, &meta1)?;
     let ops = delta(old, &new);
+    // TIN-6569: a file the hand-off created where the source now adds one
+    // is bulkload's own when it is exactly its recorded block: lifted
+    // before the clash check (design 6.3).
+    let adds: Vec<&[u8]> = ops
+        .iter()
+        .filter(|op| op.action == Action::Add && !old.contains_key(&op.path))
+        .map(|op| op.path.as_slice())
+        .collect();
+    let lifted = handoff::lift(worktree, &place.git_dir, place.source, &adds)?;
     // A seat a third party put where the source added one (after an
     // additive import; nothing else written).
     // A path the converge removes first is the landed seat's, checked by
@@ -2280,6 +2357,7 @@ fn converge(
         landed::remove(&intent_path)?;
         fault_point!(EstateConvergeAfterLanded);
         custody.merge(engine.custody);
+        custody.add("handoff-lifted", lifted);
         Ok(custody)
     };
     after().map_err(after_intent)
@@ -2323,7 +2401,10 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
     let mut intent: WorkspaceIntent = landed::read(&intent_path)?.ok_or_else(interrupted)?;
     let meta0 = Meta::read(worktree, place.source, &ledger.instance)?;
     let meta1 = Meta::read(worktree, place.source, &intent.to_instance)?;
-    let (old, new) = (sides(worktree, &meta0)?, sides(worktree, &meta1)?);
+    let (old, new) = (
+        handoff::landed_sides(worktree, &place.git_dir, place.source, &meta0)?,
+        sides(worktree, &meta1)?,
+    );
     let mut custody = Custody::default();
     custody.add(
         "git-lock-removed",
@@ -3040,6 +3121,7 @@ pub(super) fn finish_landing(
 
 mod adopt;
 pub mod diff;
+pub mod handoff;
 
 #[cfg(test)]
 mod tests;

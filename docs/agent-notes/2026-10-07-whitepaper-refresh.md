@@ -1,5 +1,7 @@
 # 2026-10-07: whitepaper refresh after the carry_v2 deletion (lane whitepaper-refresh)
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** Its workstream table is a 2026-10-07 snapshot: "Estate operations: held (R-N56)" is superseded by OI-1003-Q142 and Q194 C6 (`docs/slo.md`, amendment 2026-10-16), and the PRs it lists as open (#164, #197, #199) have since merged. Live status: the Linear SSOT document (`docs/SOURCES.md`).
+
 **Lane:** `whitepaper-refresh`, workflow subagent on sting. Worktree
 `bulkload.worktrees/whitepaper-20261003`, branch `docs/whitepaper-20261003`,
 PR #164 (opened 2026-10-04, held for this refresh). This session was the

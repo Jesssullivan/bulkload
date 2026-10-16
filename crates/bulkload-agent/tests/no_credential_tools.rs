@@ -54,6 +54,11 @@ fn the_agent_has_no_handoff_verb() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown subcommand"), "{stderr}");
-    // The only mention is the echoed unknown verb; USAGE lists no handoff.
-    assert_eq!(stderr.matches("handoff").count(), 1, "{stderr}");
+    // The only mention is the echoed unknown verb; USAGE lists no handoff
+    // verb. One named exception: `estate-handoff` (TIN-6569, OI-1003-Q183)
+    // writes the agents' hand-off block into landed checkouts and runs no
+    // credential tool; its name and its schema's are the only other
+    // mentions, each spelled `estate-handoff`.
+    let bare = stderr.matches("handoff").count() - stderr.matches("estate-handoff").count();
+    assert_eq!(bare, 1, "{stderr}");
 }
