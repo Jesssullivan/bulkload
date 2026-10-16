@@ -1341,3 +1341,41 @@ fn p106_absent_parents_are_never_made_through_a_link() {
     assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
     assert!(parents_records(&run.applied).is_empty());
 }
+
+/// P107 PARENTS-ORDER (M2 item 1 review): a bare repository planned below
+/// a standalone workspace of the same plan lands after it, whatever the
+/// plan's order: the bare landing never makes the workspace's own
+/// directory as its parent (which would leave the workspace
+/// `GIT_DESTINATION_OCCUPIED` for good).
+#[test]
+fn p107_a_bare_landing_below_a_planned_workspace_lands_after_it() {
+    let world = Gftb::new();
+    let outer = world.sting("outer");
+    let bare = world.sting("outer/sub/preservation.git");
+    let run = named_run(
+        &world,
+        "order",
+        &[
+            (&world.neo("preservation.git"), &bare, None),
+            (&world.neo("lamesh"), &outer, Some(&outer)),
+        ],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    let ran = run.apply(&[]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let rows = receipts(&ran.stdout);
+    assert_eq!(
+        receipt(&rows, &world.neo("lamesh")).1,
+        "workspace-restored",
+        "{rows:?}"
+    );
+    let row = receipt(&rows, &world.neo("preservation.git"));
+    assert_eq!(row.1, "refs-imported", "{row:?}");
+    assert!(row.2.contains("parent-created=1"), "{row:?}");
+    assert_eq!(
+        git(&bare, &["rev-parse", "--is-bare-repository"]).trim(),
+        "true"
+    );
+}

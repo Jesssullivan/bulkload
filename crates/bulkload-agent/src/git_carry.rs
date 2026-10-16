@@ -14180,8 +14180,8 @@ mod review_pr53d {
     // outcome asserted. Where case folds, TARGET/vendor/inner is the outer's
     // target/vendor/inner: it must refuse at add or restore cleanly after the
     // outer. Where case matters they are different targets and must not
-    // overlap: both are added, the outer restores, and the nest item meets a
-    // missing parent (root/TARGET/vendor) as a typed refusal, never an errno.
+    // overlap: both are added and both restore, the nest item's absent
+    // parents (root/TARGET/vendor) made by the apply (M2 item 1).
     #[test]
     fn rv4_case_folded_nest_target_is_refused_or_typed() {
         let (root, outer, inner) = outer_with_nest("case-target");
@@ -14207,17 +14207,17 @@ mod review_pr53d {
                 "case-folded overlap neither refused at add nor restored cleanly: {app:#?}"
             );
         } else {
+            // M2 item 1: the nest item's absent parents (root/TARGET and
+            // root/TARGET/vendor) are made, so both items land.
             assert!(added.iter().all(Result::is_ok), "{added:?}");
             assert!(outer_restored, "{app:#?}");
-            let parent_missing = BulkloadRefusal::GitDestinationParentMissing.to_string();
             assert!(
-                app.iter().any(|row| row.0 == "workspace-restored"),
+                app.iter().all(|row| row.0 == "workspace-restored"),
                 "{app:#?}"
             );
             assert!(
                 app.iter()
-                    .any(|row| row.0 == "refused"
-                        && row.1.as_deref() == Some(parent_missing.as_str())),
+                    .any(|row| row.1.as_deref() == Some("parent-created=2")),
                 "{app:#?}"
             );
         }

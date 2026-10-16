@@ -2990,23 +2990,22 @@ pub fn apply_reporting(
     for item in &contents.items {
         // Compared in target_key form (round 4 N4), so a case or `..`
         // variant of an enclosing target still orders after it.
-        let depth = match &item.workspace {
-            None => 0,
-            Some(workspace) => {
-                let key = target_key(workspace)?;
-                let mut depth = 0;
-                for other in contents
-                    .items
-                    .iter()
-                    .filter_map(|other| other.workspace.as_ref())
-                {
-                    if nests_within(&key, &target_key(other)?) {
-                        depth += 1;
-                    }
-                }
-                depth
+        // A refs-only item is placed by its repository's path (M2 item 1
+        // review): a bare landing below a planned workspace that has not
+        // landed yet would otherwise make that workspace's directory as its
+        // parent, and the workspace would then find its path occupied.
+        let place = item.workspace.as_ref().unwrap_or(&item.repository);
+        let key = target_key(place)?;
+        let mut depth = 0;
+        for other in contents
+            .items
+            .iter()
+            .filter_map(|other| other.workspace.as_ref())
+        {
+            if nests_within(&key, &target_key(other)?) {
+                depth += 1;
             }
-        };
+        }
         levels.entry(depth).or_default().items.push(item.clone());
     }
     // Estate converge: an item whose repository is another planned item's

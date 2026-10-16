@@ -34,12 +34,29 @@ typed refusal rather than a bare `IO`. CLI restore verbs keep the refusal
 (`Landing::parents` is `None`). `estate-diff`: `landing`/`bare-landing`
 with `parents=<n>`, `parent-missing` only where the policy refuses.
 
-Tests: `git_carry::parents::tests` (5: create and record, policy, swap
-race, raced level, existing parent); `estate_adopt` P105 (standalone,
+Tests: `git_carry::parents::tests` (7: create and record, policy, swap
+race, raced level, existing parent, `..` and unwritable boundary, no
+temporary left); `estate_adopt` P105 (standalone,
 linked and bare under absent parents, diff read-only, modes, records,
-no-op rerun) and P106 (never through a link); P103/P104 now refuse through
+no-op rerun), P106 (never through a link) and P107 (bare below a planned
+workspace lands after it); P103/P104 now refuse through
 a regular file; fault point `estate.apply.parents_made` with the
 `EstateAdopt::Parents` crash row.
 
+Refuter round (2 opus reviewers): confirmed and fixed: a `..` in the
+planned path made a level then refused with nothing recorded (now refused
+up front, and any levels made before a refusal are recorded); a bare item
+planned below a not-yet-landed standalone workspace made that workspace's
+directory and locked it out `GIT_DESTINATION_OCCUPIED` (refs-only items now
+ordered by their repository path, P107); a crash between `mkdirat` and
+`fchmod` could leave a final-named level at the umask mode, and a level
+another job made was used unsynced (levels now made under a temporary,
+0755, synced, renamed no-replace; every parent synced); an unwritable
+boundary made the diff say `landing` and the apply `IO` (now
+`parent-missing` in both). Docs: `parents=<n>` counts levels absent now.
+`rv4_case_folded_nest_target_is_refused_or_typed` updated (its
+case-sensitive branch now lands both items).
+
 Open: a crash between the levels and the record leaves unrecorded empty
-directories (documented; the rerun lands into them).
+directories or an empty `.bulkload-parent-*` temporary (documented; the
+rerun lands into them).
