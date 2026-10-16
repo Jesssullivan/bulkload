@@ -1149,6 +1149,14 @@ def summarize(parsed: dict[str, object]) -> dict[str, object]:
         "native_initial_wall_ns_total": int(wall_ns),
         "receive_stall_share_of_wall": (stall_ns / wall_ns) if wall_ns else None,
         "files_per_s_median": median(files_per_s),
+        # The loopback hand-off (OI-1003-Q154 levers 1 and 2): the payload
+        # bytes handed in memory, or None from a build that does not count
+        # them (S1 stack review, 2026-10-15, finding 8).
+        "wire_handed_bytes_total": (
+            total("wire_handed_bytes")
+            if any("wire_handed_bytes" in s.get("counters", {}) for s in natives)
+            else None
+        ),
         "bytes_received_median": median(
             [
                 float(s["transferred_content_bytes"])
@@ -1742,6 +1750,19 @@ def evidence(report: dict[str, object]) -> str:
             " sample of B as built.",
             "",
         ]
+    if report.get("loopback_handoff"):
+        states = ", ".join(
+            f"{label} {state}" for label, state in report["loopback_handoff"].items()
+        )
+        lines += [
+            f"> **LOOPBACK HAND-OFF: {states}.** From each rep's"
+            " `wire_handed_bytes`: `on` means the native copy's chunks crossed"
+            " the loopback in memory (OI-1003-Q154 levers 1 and 2), with the"
+            " control frames and chunk headers still on the socket. Gate (a)"
+            ' (R-N57) reads "its full protocol over a local socket"; whether'
+            " that covers the hand-off is not ruled (design.md, Performance).",
+            "",
+        ]
     if report.get("refused_reps"):
         lines += [
             "Informational reps the bench refused under load (recorded, not fatal; OI-1003-Q50):",
@@ -1985,6 +2006,31 @@ def evidence(report: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def loopback_handoff(reps: list[dict[str, object]]) -> dict[str, str]:
+    """Each label's loopback hand-off state, from its reps' own counters.
+
+    `on`: every rep that reported `wire_handed_bytes` handed some; `off`:
+    none did; `mixed`: both; `not reported`: no rep's build counts it.
+    """
+    states: dict[str, str] = {}
+    for label in sorted({str(r["label"]) for r in reps}):
+        handed = [
+            r["summary"].get("wire_handed_bytes_total")
+            for r in reps
+            if r["label"] == label
+        ]
+        known = [value for value in handed if value is not None]
+        if not known:
+            states[label] = "not reported"
+        elif all(value > 0 for value in known):
+            states[label] = "on"
+        elif all(value == 0 for value in known):
+            states[label] = "off"
+        else:
+            states[label] = "mixed"
+    return states
+
+
 def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
     builds = report["builds"]
     reps = report["reps"]
@@ -2007,6 +2053,7 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
             if got is not None and unique is not None and payload:
                 dedup[f"{label.lower()}_dup_share"] = (got - unique) / payload
     report["dedup"] = dedup
+    report["loopback_handoff"] = loopback_handoff(reps)
     first = next((r for r in reps if r["parsed"].get("header")), None)
     if first:
         header = first["parsed"]["header"]

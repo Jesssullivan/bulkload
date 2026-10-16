@@ -39,8 +39,11 @@
 //! P84 SOURCE-NO-CLONE (`tests/source_command_registry.rs`) holds every crate
 //! to this: no non-test code names a remap call, and every `std::fs::copy`
 //! and `std::io::copy` is a registered site whose input is argued not to be a
-//! source file. The two `std::fs::copy` sites copy bulkload's own capture
-//! bundle into its own receipt. `sys::extent_sharing` (`FIEMAP`, read-only)
+//! source file. The three `std::fs::copy` sites are all on the destination
+//! side: two copy bulkload's own staged capture bundle into its own receipt,
+//! and estate converge copies the landed checkout's `.git/index` (which the
+//! operator's Git may have rewritten since landing) to its private merged
+//! index beside it. `sys::extent_sharing` (`FIEMAP`, read-only)
 //! is the observation: [`crate::extents`] and P84's kernel leg in
 //! `tests/source_lock_trace.rs`.
 //!

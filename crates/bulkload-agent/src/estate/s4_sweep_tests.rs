@@ -659,8 +659,10 @@ fn on_a_base(plan: &Path, corpus: &Path) {
 // requires the plan base, applied into a destination repository that does
 // not exist, refuses `GIT_REPOSITORY_NOT_AT_PATH` (it used to refuse
 // `GIT_DESTINATION_OCCUPIED`), and creates nothing. A standalone item on the
-// base (its workspace is its repository) still refuses
-// `GIT_DESTINATION_OCCUPIED`: a standalone destination is never preseeded.
+// base (its workspace is its repository) is never preseeded into an existing
+// destination: estate converge (#215) stages its plan base into its own
+// private stage, so it lands, and so does its sibling in the shared
+// repository.
 // Mutation checked: the old combined guard (missing or standalone, one
 // `GIT_DESTINATION_OCCUPIED`) fails this test.
 #[test]
@@ -689,12 +691,13 @@ fn a_plan_base_import_into_a_missing_repository_refuses_by_name() {
     let (ok, rows) = capture_rows(&plan, &root.join("state"), &corpus);
     assert!(ok, "{rows:?}");
     on_a_base(&plan, &corpus);
-    let (_, rows) = apply_rows(&plan, &corpus, &root.join("applied"));
-    assert!(
-        rows.contains(&("refused", Some("GIT_DESTINATION_OCCUPIED".to_owned()))),
-        "{rows:?}"
-    );
-    assert!(!targets[0].exists(), "the standalone is not laid down");
+    let (ok, rows) = apply_rows(&plan, &corpus, &root.join("applied"));
+    assert!(ok, "{rows:?}");
+    assert_eq!(rows, vec![("workspace-restored", None); 2]);
+    for target in &targets {
+        assert!(target.exists(), "{} is laid down", target.display());
+    }
+    fsck_clean(&targets[0]);
 }
 
 // #162: the unborn-HEAD exemption is bare-only. A non-bare checkout whose

@@ -119,6 +119,28 @@ pub enum BulkloadRefusal {
     GitBareCaptureWorkspace,
     /// The git destination already exists or is non-empty.
     GitDestinationOccupied,
+    /// A checkout or ref bulkload landed was changed at the destination
+    /// since it landed (estate converge): a seat, the index, HEAD, a
+    /// standalone item's `info/exclude`, or a seat added where the source
+    /// added one. Or a checkout this item landed before was removed. The
+    /// item's proof failed before anything but an additive object import
+    /// was written; the operator's change is never overwritten.
+    GitDestinationModified,
+    /// Between the capture a checkout holds and the current one, the source
+    /// changed what converge does not carry: the shallow frontier, nested
+    /// repository custody, the omitted rebuildable roots or bareness.
+    /// Nothing is written but an additive object import.
+    GitConvergeShapeChanged,
+    /// The capture is not newer than the one the destination checkout
+    /// already holds (an older corpus applied over a newer landing).
+    /// Nothing is written.
+    GitConvergeStaleCapture,
+    /// A converge was interrupted, by a crash or by a third party's write
+    /// to a component it was replacing (which is kept, or put back). Its
+    /// intent is kept: the checkout is part old, part new. Closure counts
+    /// the item unaccounted whatever its disposition, until a rerun settles
+    /// it forward.
+    GitConvergeInterrupted,
     /// Captured and destination Git ignore policies differ.
     GitIgnorePolicyConflict,
     /// A restore destination's parent directory does not exist (R-N114):
@@ -324,6 +346,10 @@ impl BulkloadRefusal {
             Self::GitInventoryOverCap => "GIT_INVENTORY_OVER_CAP",
             Self::GitBareCaptureWorkspace => "GIT_BARE_CAPTURE_WORKSPACE",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
+            Self::GitDestinationModified => "GIT_DESTINATION_MODIFIED",
+            Self::GitConvergeShapeChanged => "GIT_CONVERGE_SHAPE_CHANGED",
+            Self::GitConvergeStaleCapture => "GIT_CONVERGE_STALE_CAPTURE",
+            Self::GitConvergeInterrupted => "GIT_CONVERGE_INTERRUPTED",
             Self::GitIgnorePolicyConflict => "GIT_IGNORE_POLICY_CONFLICT",
             Self::GitDestinationParentMissing => "GIT_DESTINATION_PARENT_MISSING",
             Self::GitNestStashed => "GIT_NEST_STASHED",
@@ -390,6 +416,10 @@ impl BulkloadRefusal {
         "GIT_INVENTORY_OVER_CAP",
         "GIT_BARE_CAPTURE_WORKSPACE",
         "GIT_DESTINATION_OCCUPIED",
+        "GIT_DESTINATION_MODIFIED",
+        "GIT_CONVERGE_SHAPE_CHANGED",
+        "GIT_CONVERGE_STALE_CAPTURE",
+        "GIT_CONVERGE_INTERRUPTED",
         "GIT_IGNORE_POLICY_CONFLICT",
         "GIT_DESTINATION_PARENT_MISSING",
         "GIT_NEST_STASHED",
@@ -615,6 +645,10 @@ mod tests {
             BulkloadRefusal::GitInventoryOverCap,
             BulkloadRefusal::GitBareCaptureWorkspace,
             BulkloadRefusal::GitDestinationOccupied,
+            BulkloadRefusal::GitDestinationModified,
+            BulkloadRefusal::GitConvergeShapeChanged,
+            BulkloadRefusal::GitConvergeStaleCapture,
+            BulkloadRefusal::GitConvergeInterrupted,
             BulkloadRefusal::GitIgnorePolicyConflict,
             BulkloadRefusal::GitDestinationParentMissing,
             BulkloadRefusal::GitNestStashed,

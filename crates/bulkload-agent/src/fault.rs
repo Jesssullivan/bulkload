@@ -110,6 +110,24 @@
 //! | `estate.after_reuse_sidecar` | the bundle, its sidecars and its `.reuse` manifest; the record still names the capture before |
 //! | `estate.after_capture_record` | the record naming the bundle; no outcome record for the pass |
 //!
+//! Git estate converge, in `git_carry::converge` (estate converge,
+//! 2026-10-08). A re-apply whose capture changed brings a landed checkout to
+//! it; the rerun settles whatever a crash left forward:
+//!
+//! | Name | Crash leaves (in the destination) |
+//! |------|-----------------------------------|
+//! | `estate.converge.after_import` | the capture's objects and provenance imported; no intent, nothing else written |
+//! | `estate.converge.after_intent` | the workspace intent durable; no ref, seat, index or HEAD written |
+//! | `estate.converge.after_ref_intent` | the ref intent durable; no native ref or stash written |
+//! | `estate.converge.after_refs` | native refs, stash and the ref ledger new; every seat, the index and HEAD old |
+//! | `estate.converge.seat_before_exchange` | a seat's new bytes at its `.bulkload-converge-<tag>-<n>` temporary, not exchanged |
+//! | `estate.converge.seat_after_exchange` | a seat exchanged: the new file at the path, the landed one displaced under the temporary name |
+//! | `estate.converge.after_seat` | one more seat operation complete and sealed |
+//! | `estate.converge.index_locked` | `index.lock` held, holding this converge's marker; the index old |
+//! | `estate.converge.after_index` | every seat and the index new; HEAD old |
+//! | `estate.converge.after_head` | HEAD and its branch new; the workspace ledger old, its intent pending |
+//! | `estate.converge.after_landed` | the new workspace ledger, no intent; no journal or outcome record |
+//!
 //! # Group size
 //!
 //! Group commit closes a group by count, size or idle time, so how many
@@ -246,11 +264,39 @@ pub enum Point {
     EstateAfterReuseSidecar,
     /// `estate.after_capture_record`
     EstateAfterCaptureRecord,
+    /// `estate.converge.after_import`
+    EstateConvergeAfterImport,
+    /// `estate.converge.after_intent`
+    EstateConvergeAfterIntent,
+    /// `estate.converge.after_ref_intent`
+    EstateConvergeAfterRefIntent,
+    /// `estate.converge.after_refs`
+    EstateConvergeAfterRefs,
+    /// `estate.converge.seat_before_exchange`
+    EstateConvergeSeatBeforeExchange,
+    /// `estate.converge.seat_after_exchange`
+    EstateConvergeSeatAfterExchange,
+    /// `estate.converge.after_seat`
+    EstateConvergeAfterSeat,
+    /// `estate.converge.index_locked`
+    EstateConvergeIndexLocked,
+    /// `estate.converge.after_index`
+    EstateConvergeAfterIndex,
+    /// `estate.converge.head_branch`: `set_head` committed the HEAD
+    /// branch's transaction and not yet HEAD's (review 3 finding 13).
+    EstateConvergeHeadBranch,
+    /// `estate.converge.after_head`
+    EstateConvergeAfterHead,
+    /// `estate.converge.after_landed`
+    EstateConvergeAfterLanded,
+    /// `estate.converge.linked_added`: a first linked landing's `git
+    /// worktree add` done, its checkout and ledger not (#216's residual).
+    EstateConvergeLinkedAdded,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 38] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -276,6 +322,19 @@ impl Point {
         Self::EstateBeforeReuseSidecar,
         Self::EstateAfterReuseSidecar,
         Self::EstateAfterCaptureRecord,
+        Self::EstateConvergeAfterImport,
+        Self::EstateConvergeAfterIntent,
+        Self::EstateConvergeAfterRefIntent,
+        Self::EstateConvergeAfterRefs,
+        Self::EstateConvergeSeatBeforeExchange,
+        Self::EstateConvergeSeatAfterExchange,
+        Self::EstateConvergeAfterSeat,
+        Self::EstateConvergeIndexLocked,
+        Self::EstateConvergeAfterIndex,
+        Self::EstateConvergeHeadBranch,
+        Self::EstateConvergeAfterHead,
+        Self::EstateConvergeAfterLanded,
+        Self::EstateConvergeLinkedAdded,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -307,6 +366,19 @@ impl Point {
             Self::EstateBeforeReuseSidecar => "estate.before_reuse_sidecar",
             Self::EstateAfterReuseSidecar => "estate.after_reuse_sidecar",
             Self::EstateAfterCaptureRecord => "estate.after_capture_record",
+            Self::EstateConvergeAfterImport => "estate.converge.after_import",
+            Self::EstateConvergeAfterIntent => "estate.converge.after_intent",
+            Self::EstateConvergeAfterRefIntent => "estate.converge.after_ref_intent",
+            Self::EstateConvergeAfterRefs => "estate.converge.after_refs",
+            Self::EstateConvergeSeatBeforeExchange => "estate.converge.seat_before_exchange",
+            Self::EstateConvergeSeatAfterExchange => "estate.converge.seat_after_exchange",
+            Self::EstateConvergeAfterSeat => "estate.converge.after_seat",
+            Self::EstateConvergeIndexLocked => "estate.converge.index_locked",
+            Self::EstateConvergeAfterIndex => "estate.converge.after_index",
+            Self::EstateConvergeHeadBranch => "estate.converge.head_branch",
+            Self::EstateConvergeAfterHead => "estate.converge.after_head",
+            Self::EstateConvergeAfterLanded => "estate.converge.after_landed",
+            Self::EstateConvergeLinkedAdded => "estate.converge.linked_added",
         }
     }
 

@@ -1969,35 +1969,71 @@ fn walk_ahead_wait_is_accounted_apart_from_walk_work() {
 }
 
 /// S1 hand-offs (OI-1003-Q115): a copy that sends data moves the sending
-/// thread's handling timer and the receiving thread's read and verify
-/// timers, and the rendering names every hand-off timer. The counters are
+/// thread's handling timer and the receiving thread's read timer, and the
+/// rendering names every hand-off timer. Where the received bytes are
+/// verified depends on the arm (OI-1003-Q154 lever 1): with the loopback
+/// hand-off the destination takes the source's own BLAKE3, so the bytes are
+/// handed (`wire_handed_bytes`) and the verify timer need not move; with it
+/// off every byte is hashed again (`blake3_dest_wire_verify_bytes`) under a
+/// verify timer, inline or on a receive worker. The counters are
 /// process-wide and only grow, so other tests running at once cannot hide a
-/// timer this copy did not move.
+/// counter this copy did not move; for the same reason no arm asserts that
+/// the other arm's counter stayed still.
 #[test]
 fn a_copy_moves_the_hand_off_timers() {
-    let corpus = Corpus::new();
-    std::fs::write(corpus.base.join("source/f"), noise(7, 3 << 20)).unwrap();
-    let before = TransferTiming::snapshot();
-    let stats = corpus.run().unwrap();
-    assert!(stats.bytes_received > 0);
-    let moved = TransferTiming::snapshot().since(before);
-    assert!(moved.send_handle_ns > 0, "{}", moved.render());
-    assert!(moved.recv_read_ns > 0, "{}", moved.render());
-    assert!(moved.recv_verify_ns > 0, "{}", moved.render());
-    assert!(
-        moved.recv_verify_ns <= moved.transfer_ns,
-        "{}",
-        moved.render()
-    );
-    let rendered = moved.render();
-    for key in [
-        "send_wait_ns=",
-        "send_handle_ns=",
-        "recv_read_ns=",
-        "recv_settle_ns=",
-        "recv_verify_ns=",
-    ] {
-        assert!(rendered.contains(key), "{rendered}");
+    use crate::counters::{Counter, Counters};
+    const SIZE: usize = 3 << 20;
+    for handoff in [true, false] {
+        let corpus = Corpus::new();
+        std::fs::write(corpus.base.join("source/f"), noise(7, SIZE)).unwrap();
+        let root = std::fs::canonicalize(corpus.base.join("destination")).unwrap();
+        set_loopback_handoff(&root, Some(handoff));
+        let before = TransferTiming::snapshot();
+        let counted_before = Counters::snapshot();
+        let stats = corpus.run();
+        set_loopback_handoff(&root, None);
+        let stats = stats.unwrap();
+        let counted = Counters::snapshot().since(counted_before);
+        let moved = TransferTiming::snapshot().since(before);
+        assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+        assert!(stats.bytes_received > 0);
+        assert!(moved.send_handle_ns > 0, "{}", moved.render());
+        assert!(moved.recv_read_ns > 0, "{}", moved.render());
+        assert!(
+            moved.recv_verify_ns <= moved.transfer_ns,
+            "{}",
+            moved.render()
+        );
+        let size = SIZE as u64;
+        if handoff {
+            assert!(
+                counted.get(Counter::WireHandedBytes) >= size,
+                "hand-off: {}",
+                counted.render()
+            );
+        } else {
+            assert!(
+                counted.get(Counter::HashWireVerify) >= size,
+                "plain: {}",
+                counted.render()
+            );
+            assert!(
+                moved.recv_verify_ns + moved.recv_worker_verify_ns > 0,
+                "plain: {}",
+                moved.render()
+            );
+        }
+        let rendered = moved.render();
+        for key in [
+            "send_wait_ns=",
+            "send_handle_ns=",
+            "recv_read_ns=",
+            "recv_settle_ns=",
+            "recv_verify_ns=",
+            "recv_worker_verify_ns=",
+        ] {
+            assert!(rendered.contains(key), "{rendered}");
+        }
     }
 }
 

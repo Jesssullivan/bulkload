@@ -25,7 +25,9 @@
 //!
 //! Anything else is `unaccounted`: no outcome record, an unreadable record,
 //! a record naming another source, a bare `IO` or `FRAME_CODEC` refusal (it
-//! names no cause), a refusal whose code has left the taxonomy
+//! names no cause), a `GIT_CONVERGE_INTERRUPTED` refusal (a converge left
+//! its checkout part old, part new; only a rerun that settles it closes the
+//! item, whatever its disposition, `converge-interrupted`), a refusal whose code has left the taxonomy
 //! (`refusal-code-retired`), an outcome that does not match whether the item plans a
 //! workspace, a missing or mismatched current-capture journal (a stale
 //! journal from an earlier capture proves nothing), or an outcome that is not
@@ -47,7 +49,32 @@
 //! from `verdict` whenever a typed refusal is pending review, with or
 //! without an attestation ledger.
 //!
-//! The report is `bulkload.closure.v2` (it was v1 before WP3 PR 3):
+//! Transfers join the same report (WP3 PR 4, `--transfer DEST_STATE`,
+//! [`Report::join_transfers`]): each `copy` or `pull` session's durable
+//! record ([`crate::transfer_outcome`]) becomes rows beside the planned
+//! items, classified by the same rules. A session row is `applied` when the
+//! session ran to its end, and `unaccounted` when it never ended
+//! (`transfer-interrupted`), left no record (`no-transfer-record`), or
+//! refused with a bare `IO` or `FRAME_CODEC`. Each refused path is an entry
+//! row, a typed refusal pending review like any other; a `SQLite` integrity
+//! failure carries its ruled default disposition `abandon` (OI-1003-Q148),
+//! which disposes it unless a review row says otherwise. Each live sidecar
+//! covered by its database's snapshot is `covered` (accounted). A run's
+//! expected transfers are bound to its PLAN by a transfer manifest
+//! ([`Report::join_manifest`], `--transfer-manifest`): a listed transfer
+//! with no record, or one older than the manifest, is unaccounted. With it,
+//! one report and one gate cover a whole run: estate items and transfers,
+//! with 0 unaccounted possible and a bare `IO` never counting. Without it,
+//! the report covers the transfers the operator named (`--transfer`) and
+//! says so (no `transfer_manifest` block).
+//!
+//! The report is `bulkload.closure.v3` (v2 from WP3 PR 3 to WP3 PR 4, v1
+//! before): a transfer row names its `kind` (an estate row prints as in
+//! v2), and adds `transfer`, `path`, `transfer_outcome` and `sqlite_code`, `disposition` can be `covered`, and the
+//! totals add `covered`, `transfer_rows` and `ruled_default`; a session
+//! row prints its `started` (Unix seconds), and a joined manifest prints a
+//! `transfer_manifest` block (path, plan digest, since, expected). `planned`
+//! still counts planned estate items only. Before v3 (unchanged from v2):
 //! `disposition` gained `refused-pending-review`, `totals.refused` counts
 //! reviewed refusals only, and each item row names its refusal `instance`.
 //! `refusal` is still printed for typed refusals only; a recorded refusal
@@ -73,6 +100,9 @@ pub enum Disposition {
     RefusedPendingReview(String),
     /// Ref custody imported, journal present; no working bytes.
     ReferencedOnly,
+    /// A live `SQLite` sidecar a transfer did not carry because its
+    /// database was carried as a snapshot that covers it (WP3 PR 4, #218).
+    Covered,
     /// Not provably closed, for this reason.
     Unaccounted(&'static str),
 }
@@ -86,6 +116,7 @@ impl Disposition {
             Self::Refused(_) => "refused",
             Self::RefusedPendingReview(_) => "refused-pending-review",
             Self::ReferencedOnly => "referenced-only",
+            Self::Covered => "covered",
             Self::Unaccounted(_) => "unaccounted",
         }
     }
@@ -163,15 +194,7 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
         JournalState::CaptureUnreadable => Disposition::Unaccounted("capture-record-unreadable"),
     };
     match &record.outcome {
-        // A bare IO or FRAME_CODEC names no cause (S4).
-        Outcome::Refused(refusal) => match refusal.code() {
-            "IO" => Disposition::Unaccounted("refusal-untyped-io"),
-            "FRAME_CODEC" => Disposition::Unaccounted("refusal-untyped-frame-codec"),
-            // The code left the taxonomy after the record was written: it
-            // names no cause the taxonomy holds, and no review can name it.
-            _ if refusal.is_retired() => Disposition::Unaccounted("refusal-code-retired"),
-            code => Disposition::RefusedPendingReview(code.to_owned()),
-        },
+        Outcome::Refused(refusal) => refusal_disposition(refusal),
         Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
             if entry.has_workspace {
                 journal("workspace-restored", Disposition::Applied)
@@ -203,6 +226,71 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
         | Outcome::DeferredWithDrift => Disposition::Unaccounted("not-an-apply-outcome"),
     }
 }
+
+/// A recorded refusal, natively: pending review when typed, else
+/// unaccounted. The one rule estate items and transfer rows share (S4).
+#[must_use]
+pub fn refusal_disposition(refusal: &crate::outcome::Refusal) -> Disposition {
+    match refusal.code() {
+        // A bare IO or FRAME_CODEC names no cause (S4).
+        "IO" => Disposition::Unaccounted("refusal-untyped-io"),
+        "FRAME_CODEC" => Disposition::Unaccounted("refusal-untyped-frame-codec"),
+        // Estate converge (finding 6): a converge cut short left the
+        // checkout part old, part new under a pending intent. No review
+        // closes it; only a rerun that settles the intent does.
+        "GIT_CONVERGE_INTERRUPTED" => Disposition::Unaccounted("converge-interrupted"),
+        // The code left the taxonomy after the record was written: it
+        // names no cause the taxonomy holds, and no review can name it.
+        _ if refusal.is_retired() => Disposition::Unaccounted("refusal-code-retired"),
+        code => Disposition::RefusedPendingReview(code.to_owned()),
+    }
+}
+
+/// What a report row stands for (WP3 PR 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A planned estate item.
+    Estate,
+    /// One transfer session (`copy` or `pull`) from its `DEST_STATE` record.
+    TransferSession,
+    /// One refused or covered path of a transfer session.
+    TransferEntry,
+}
+
+impl RowKind {
+    /// The kind's stable JSON name.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Estate => "estate",
+            Self::TransferSession => "transfer-session",
+            Self::TransferEntry => "transfer-entry",
+        }
+    }
+}
+
+/// What a transfer row reports beyond an estate row's fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransferDetail {
+    /// The `DEST_STATE` the record was read from, canonical when it
+    /// resolves.
+    pub state: PathBuf,
+    /// Unix seconds the session started (session rows with a record).
+    pub started: Option<u64>,
+    /// The refused or covered path (entry rows).
+    pub path: Option<Vec<u8>>,
+    /// The row's outcome name: `completed`, `running` or `refused` for a
+    /// session, `refused` or `sidecar-covered` for an entry, `null` with no
+    /// readable record.
+    pub outcome: Option<&'static str>,
+    /// The recorded refusal, typed or not.
+    pub refusal: Option<crate::outcome::Refusal>,
+    /// `SQLite`'s result code a `SQLITE_BACKUP_FAILED` carries.
+    pub sqlite_code: Option<i32>,
+}
+
+/// The ruling that gives a transfer refusal its default disposition.
+pub const DEFAULT_DISPOSITION_RULING: &str = "OI-1003-Q148";
 
 /// What the corpus holds for a planned item's current capture (#133).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -242,6 +330,16 @@ pub struct Row {
     pub instance: String,
     /// The review that disposes this row's typed refusal (S4).
     pub review: Option<crate::disposition::Row>,
+    /// What the row stands for (WP3 PR 4).
+    pub kind: RowKind,
+    /// A transfer row's own fields.
+    pub transfer: Option<TransferDetail>,
+    /// The ruled default disposition of this row's refusal, when one is
+    /// ruled ([`DEFAULT_DISPOSITION_RULING`]): it disposes the refusal when
+    /// no review row does.
+    pub ruled_default: Option<crate::disposition::Decision>,
+    /// Whether [`Self::ruled_default`] is what disposes it now.
+    pub by_default: bool,
 }
 
 /// The per-item closure ledger and its totals.
@@ -254,7 +352,11 @@ pub struct Report {
     /// Typed refusals no review disposes yet.
     pub refused_pending_review: u64,
     pub referenced_only: u64,
+    /// Transfer sidecars covered by a snapshot (WP3 PR 4).
+    pub covered: u64,
     pub unaccounted: u64,
+    /// Typed refusals disposed by their ruled default, not a review.
+    pub ruled_default: u64,
     /// Typed refusal counts by code, reviewed or not.
     pub refusals: std::collections::BTreeMap<String, u64>,
     /// Outcome records for items the plan does not hold. Reported, not
@@ -267,6 +369,18 @@ pub struct Report {
     pub attested: Option<Attested>,
     /// The review block, when a disposition ledger was given (S4).
     pub reviewed: Option<Reviewed>,
+    /// The transfer manifest joined, when one was (review finding 3).
+    pub transfer_manifest: Option<ManifestJoined>,
+}
+
+/// What a joined transfer manifest bound the report to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestJoined {
+    pub path: PathBuf,
+    pub plan_digest: String,
+    pub since: u64,
+    /// Transfers it lists.
+    pub expected: u64,
 }
 
 impl Report {
@@ -295,6 +409,10 @@ impl Report {
                 capture: CaptureId::of(entry),
                 instance: instance(entry),
                 review: None,
+                kind: RowKind::Estate,
+                transfer: None,
+                ruled_default: None,
+                by_default: false,
             });
         }
         report.recount();
@@ -303,6 +421,7 @@ impl Report {
 
     // Apply the reviews (when a disposition ledger was given) to every typed
     // refusal, native and attested, and recount the totals.
+    #[allow(clippy::too_many_lines)]
     fn recount(&mut self) {
         let ledger = self.reviewed.as_ref().map(|reviewed| &reviewed.ledger);
         let review = |item: &str, instance: &str, code: &str| {
@@ -316,17 +435,25 @@ impl Report {
             self.refused,
             self.refused_pending_review,
             self.referenced_only,
+            self.covered,
             self.unaccounted,
-        ) = (0, 0, 0, 0, 0);
+            self.ruled_default,
+        ) = (0, 0, 0, 0, 0, 0, 0);
         self.refusals.clear();
         for row in &mut self.rows {
             if let Some(code) = row.disposition.refusal().map(str::to_owned) {
                 row.review = review(&row.item, &row.instance, &code);
                 current.insert((row.item.clone(), row.instance.clone(), code.clone()));
+                // A review row wins; else a ruled default disposes it
+                // (OI-1003-Q148, transfer rows only).
+                row.by_default = row.review.is_none() && row.ruled_default.is_some();
                 if let Some(found) = &row.review {
                     *decisions.entry(found.decision().name()).or_default() += 1;
+                } else if let Some(default) = row.ruled_default {
+                    *decisions.entry(default.name()).or_default() += 1;
+                    self.ruled_default += 1;
                 }
-                row.disposition = if row.review.is_some() {
+                row.disposition = if row.review.is_some() || row.by_default {
                     Disposition::Refused(code.clone())
                 } else {
                     Disposition::RefusedPendingReview(code.clone())
@@ -338,6 +465,7 @@ impl Report {
                 Disposition::Refused(_) => self.refused += 1,
                 Disposition::RefusedPendingReview(_) => self.refused_pending_review += 1,
                 Disposition::ReferencedOnly => self.referenced_only += 1,
+                Disposition::Covered => self.covered += 1,
                 Disposition::Unaccounted(_) => self.unaccounted += 1,
             }
         }
@@ -353,7 +481,11 @@ impl Report {
                     continue;
                 };
                 // An accepted row always names a planned item.
-                let Some(native) = self.rows.iter().find(|native| native.item == row.item) else {
+                let Some(native) = self
+                    .rows
+                    .iter()
+                    .find(|native| native.kind == RowKind::Estate && native.item == row.item)
+                else {
                     continue;
                 };
                 current.insert((row.item.clone(), native.instance.clone(), code.to_owned()));
@@ -420,10 +552,89 @@ impl Report {
             .then_some(native.instance.as_str())
     }
 
-    /// Planned items in the report.
+    /// Planned estate items in the report.
     #[must_use]
-    pub const fn planned(&self) -> u64 {
-        self.rows.len() as u64
+    pub fn planned(&self) -> u64 {
+        self.rows
+            .iter()
+            .filter(|row| row.kind == RowKind::Estate)
+            .count() as u64
+    }
+
+    /// Transfer rows in the report (WP3 PR 4).
+    #[must_use]
+    pub fn transfer_rows(&self) -> u64 {
+        self.rows
+            .iter()
+            .filter(|row| row.kind != RowKind::Estate)
+            .count() as u64
+    }
+
+    /// Join every transfer session recorded in each `DEST_STATE` (WP3 PR
+    /// 4): their session, refusal and covered rows join this report's rows
+    /// and its totals, under the same classification, reviews and gate. A
+    /// `DEST_STATE` with no record is one unaccounted row. A state directory
+    /// named twice, under any spelling (it is canonicalized first), refuses
+    /// (`FIELD_DOMAIN_VIOLATION`), as a ledger listing an item twice does,
+    /// and so does one transfer row joined twice (review finding 3).
+    ///
+    /// # Errors
+    /// `FIELD_DOMAIN_VIOLATION` for a `DEST_STATE` given twice or a
+    /// transfer row that would count twice.
+    pub fn join_transfers(&mut self, states: &[PathBuf]) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for state in states {
+            let state = crate::transfer_outcome::stable(state);
+            if !seen.insert(state.clone()) {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            self.rows.extend(transfer_rows(&state));
+        }
+        self.joined_once()?;
+        self.recount();
+        Ok(())
+    }
+
+    /// Join exactly the transfers `manifest` lists (review finding 3): each
+    /// one's record in its `DEST_STATE`, whatever else that state holds. A
+    /// listed transfer with no record is unaccounted (`no-transfer-record`),
+    /// one whose session started before the manifest's `since` is stale
+    /// (`transfer-record-stale`, its entry rows still joined), and a record
+    /// that is not the listed transfer's is `transfer-record-mismatch`. The
+    /// caller binds the manifest to the report's PLAN
+    /// ([`crate::transfer_outcome::Manifest::read`]).
+    ///
+    /// # Errors
+    /// `FIELD_DOMAIN_VIOLATION` for a second manifest or a transfer row that
+    /// would count twice.
+    pub fn join_manifest(&mut self, manifest: &crate::transfer_outcome::Manifest) -> Result<()> {
+        if self.transfer_manifest.is_some() {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+        for expected in &manifest.transfers {
+            self.rows.extend(expected_rows(expected, manifest.since));
+        }
+        self.transfer_manifest = Some(ManifestJoined {
+            path: manifest.path.clone(),
+            plan_digest: manifest.plan_digest.clone(),
+            since: manifest.since,
+            expected: manifest.transfers.len() as u64,
+        });
+        self.joined_once()?;
+        self.recount();
+        Ok(())
+    }
+
+    // Every transfer row counts once: a row joined twice (one DEST_STATE
+    // through two joins, or one transfer recorded in two states) refuses.
+    fn joined_once(&self) -> Result<()> {
+        let mut seen = std::collections::BTreeSet::new();
+        for row in self.rows.iter().filter(|row| row.kind != RowKind::Estate) {
+            if !seen.insert(row.item.as_str()) {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+        }
+        Ok(())
     }
 
     /// The native verdict (`verdict`): every planned item is accounted for
@@ -483,7 +694,13 @@ impl Report {
             if !seen.insert(row.item.clone()) {
                 return Err(BulkloadRefusal::FieldDomainViolation);
             }
-            let Some(native) = self.rows.iter().find(|native| native.item == row.item) else {
+            // A transfer row is closed by its own session, never by an
+            // audit (WP3 PR 4): an attestation names planned items only.
+            let Some(native) = self
+                .rows
+                .iter()
+                .find(|native| native.kind == RowKind::Estate && native.item == row.item)
+            else {
                 attested.foreign.push(row.item.clone());
                 continue;
             };
@@ -539,22 +756,26 @@ impl Report {
         }
     }
 
-    /// The report as one JSON document (`bulkload.closure.v2`).
+    /// The report as one JSON document ([`SCHEMA`], `bulkload.closure.v3`).
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_json(&self) -> String {
         let mut out = String::new();
         let _ = write!(
             out,
-            "{{\"schema\":\"bulkload.closure.v2\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"applied\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"unaccounted\":{},\"pending_review\":{}}},\"refusals\":{{",
+            "{{\"schema\":\"{SCHEMA}\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"transfer_rows\":{},\"applied\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"covered\":{},\"unaccounted\":{},\"pending_review\":{},\"ruled_default\":{}}},\"refusals\":{{",
             if self.native_passes() { "pass" } else { "fail" },
             if self.passes() { "pass" } else { "fail" },
             self.planned(),
+            self.transfer_rows(),
             self.applied,
             self.refused,
             self.refused_pending_review,
             self.referenced_only,
+            self.covered,
             self.unaccounted,
             self.pending_review(),
+            self.ruled_default,
         );
         for (index, (code, count)) in self.refusals.iter().enumerate() {
             let _ = write!(
@@ -589,6 +810,11 @@ impl Report {
                 },
                 row.disposition.name(),
             );
+            // An estate row prints as in v2; a transfer row names its kind.
+            if let Some(detail) = &row.transfer {
+                let _ = write!(out, ",\"kind\":\"{}\"", row.kind.name());
+                write_transfer(&mut out, row, detail);
+            }
             if let Some(refusal) = row.outcome.as_ref().and_then(Outcome::refusal) {
                 // `refusal` names a typed refusal only, as it always did. A
                 // recorded refusal that is not one (a bare IO, a retired
@@ -614,6 +840,12 @@ impl Report {
             if let Some(review) = &row.review {
                 out.push_str(",\"review\":");
                 write_review(&mut out, review);
+            } else if let (true, Some(default)) = (row.by_default, row.ruled_default) {
+                let _ = write!(
+                    out,
+                    ",\"review\":{{\"decision\":\"{}\",\"reviewer\":null,\"date\":null,\"basis\":\"ruled-default\",\"ruling\":\"{DEFAULT_DISPOSITION_RULING}\"}}",
+                    default.name()
+                );
             }
             out.push('}');
         }
@@ -632,6 +864,16 @@ impl Report {
             out.push_str(&json_string(name));
         }
         out.push(']');
+        if let Some(joined) = &self.transfer_manifest {
+            let _ = write!(
+                out,
+                ",\"transfer_manifest\":{{\"path\":{},\"plan_digest\":{},\"since\":{},\"expected\":{}}}",
+                json_string(&joined.path.to_string_lossy()),
+                json_string(&joined.plan_digest),
+                joined.since,
+                joined.expected,
+            );
+        }
         if let Some(attested) = &self.attested {
             attested.write_json(&mut out, self);
         }
@@ -641,6 +883,261 @@ impl Report {
         out.push('}');
         out
     }
+}
+
+/// The report's schema name.
+pub const SCHEMA: &str = "bulkload.closure.v3";
+
+// A transfer row's own fields as JSON: its DEST_STATE, path, outcome and
+// recorded refusal (typed or not, as an estate row prints it).
+fn write_transfer(out: &mut String, row: &Row, detail: &TransferDetail) {
+    let _ = write!(
+        out,
+        ",\"transfer\":{},\"path\":{},\"transfer_outcome\":{}",
+        json_string(&detail.state.to_string_lossy()),
+        detail.path.as_ref().map_or_else(
+            || "null".to_owned(),
+            |path| json_string(&path.escape_ascii().to_string())
+        ),
+        detail
+            .outcome
+            .map_or_else(|| "null".to_owned(), json_string),
+    );
+    if let Some(started) = detail.started {
+        let _ = write!(out, ",\"started\":{started}");
+    }
+    if let Some(refusal) = &detail.refusal {
+        let _ = write!(
+            out,
+            ",\"{}\":{},\"site\":{},\"errno\":{},\"sqlite_code\":{}",
+            if row.disposition.refusal().is_some() {
+                "refusal"
+            } else {
+                "recorded_refusal"
+            },
+            json_string(refusal.code()),
+            json_string(refusal.site()),
+            refusal
+                .errno()
+                .map_or_else(|| "null".to_owned(), |errno| errno.to_string()),
+            detail
+                .sqlite_code
+                .map_or_else(|| "null".to_owned(), |code| code.to_string()),
+        );
+    }
+}
+
+// The rows of every transfer record in one DEST_STATE (WP3 PR 4); one
+// unaccounted row when it holds none.
+fn transfer_rows(state: &std::path::Path) -> Vec<Row> {
+    let records = crate::transfer_outcome::records(state);
+    if records.is_empty() {
+        let item = blake3::hash(state.as_os_str().as_encoded_bytes())
+            .to_hex()
+            .to_string();
+        return vec![unrecorded(state, item, "", "no-transfer-record")];
+    }
+    records
+        .iter()
+        .flat_map(|(item, path)| {
+            record_rows(
+                state,
+                item,
+                "",
+                crate::transfer_outcome::read_file(path),
+                None,
+            )
+        })
+        .collect()
+}
+
+// The rows of one transfer a manifest lists (review finding 3).
+fn expected_rows(expected: &crate::transfer_outcome::Expected, since: u64) -> Vec<Row> {
+    let item = expected.item();
+    let record = crate::transfer_outcome::read(&expected.state, &item);
+    if let Some(Ok(found)) = &record {
+        if found.verb != expected.verb {
+            return vec![unrecorded(
+                &expected.state,
+                item,
+                &expected.source,
+                "transfer-record-mismatch",
+            )];
+        }
+    }
+    record_rows(
+        &expected.state,
+        &item,
+        &expected.source,
+        record,
+        Some(since),
+    )
+}
+
+// One unaccounted session row with no readable record, named `item`.
+fn unrecorded(state: &std::path::Path, item: String, source: &str, why: &'static str) -> Row {
+    transfer_row(
+        item,
+        source,
+        why.as_bytes(),
+        Disposition::Unaccounted(why),
+        TransferDetail {
+            state: state.to_path_buf(),
+            started: None,
+            path: None,
+            outcome: None,
+            refusal: None,
+            sqlite_code: None,
+        },
+    )
+}
+
+fn transfer_row(
+    item: String,
+    source: &str,
+    record: &[u8],
+    disposition: Disposition,
+    detail: TransferDetail,
+) -> Row {
+    Row {
+        instance: crate::transfer_outcome::instance(&item, record),
+        item,
+        source: PathBuf::from(source),
+        outcome: None,
+        unreadable: None,
+        disposition,
+        capture: CaptureId::None,
+        review: None,
+        kind: RowKind::TransferSession,
+        transfer: Some(detail),
+        ruled_default: None,
+        by_default: false,
+    }
+}
+
+// The rows of one record read from `state` under the transfer `item` (its
+// file stem): the session row and one row per entry. `since`, from a
+// manifest, makes a session that started earlier stale.
+#[allow(clippy::too_many_lines)]
+fn record_rows(
+    state: &std::path::Path,
+    item: &str,
+    source: &str,
+    read: Option<
+        std::result::Result<crate::transfer_outcome::TransferRecord, crate::outcome::Unreadable>,
+    >,
+    since: Option<u64>,
+) -> Vec<Row> {
+    use crate::transfer_outcome::{EntryOutcome, Session};
+    let detail = |path, outcome, refusal, sqlite_code, started| TransferDetail {
+        state: state.to_path_buf(),
+        started,
+        path,
+        outcome,
+        refusal,
+        sqlite_code,
+    };
+    let record = match read {
+        None => {
+            return vec![unrecorded(
+                state,
+                item.to_owned(),
+                source,
+                "no-transfer-record",
+            )]
+        }
+        Some(Err(why)) => {
+            return vec![unrecorded(
+                state,
+                item.to_owned(),
+                source,
+                match why {
+                    crate::outcome::Unreadable::Codec => "transfer-record-unreadable",
+                    other => other.reason(),
+                },
+            )]
+        }
+        Some(Ok(record)) => record,
+    };
+    // A record filed under another transfer's name proves nothing about
+    // either transfer.
+    if record.session_item() != item {
+        return vec![unrecorded(
+            state,
+            item.to_owned(),
+            &record.source,
+            "transfer-record-misplaced",
+        )];
+    }
+    let (outcome, refusal, disposition) = match &record.session {
+        Session::Running => (
+            "running",
+            None,
+            Disposition::Unaccounted("transfer-interrupted"),
+        ),
+        Session::Completed => ("completed", None, Disposition::Applied),
+        Session::Refused(refusal) => (
+            "refused",
+            Some(refusal.clone()),
+            refusal_disposition(refusal),
+        ),
+    };
+    // Older than the run the manifest names: whatever it says, it is not
+    // this run's session.
+    let disposition = if since.is_some_and(|since| record.started < since) {
+        Disposition::Unaccounted("transfer-record-stale")
+    } else {
+        disposition
+    };
+    let mut rows = vec![transfer_row(
+        record.session_item(),
+        &record.source,
+        &encoded(&record.session),
+        disposition,
+        detail(None, Some(outcome), refusal, None, Some(record.started)),
+    )];
+    for entry in &record.entries {
+        let (outcome, refusal, sqlite_code, disposition, default) = match &entry.outcome {
+            EntryOutcome::Refused {
+                refusal,
+                sqlite_code,
+            } => (
+                "refused",
+                Some(refusal.clone()),
+                *sqlite_code,
+                refusal_disposition(refusal),
+                crate::transfer::default_disposition(refusal.code(), *sqlite_code)
+                    .and_then(|name| crate::disposition::Decision::parse(name).ok()),
+            ),
+            EntryOutcome::SidecarCovered => {
+                ("sidecar-covered", None, None, Disposition::Covered, None)
+            }
+        };
+        let mut entry_row = transfer_row(
+            record.entry_item(entry),
+            &record.source,
+            &encoded(entry),
+            disposition,
+            detail(
+                Some(entry.rel_path.clone()),
+                Some(outcome),
+                refusal,
+                sqlite_code,
+                None,
+            ),
+        );
+        entry_row.kind = RowKind::TransferEntry;
+        // Only a typed refusal can carry a default: a bare IO never counts.
+        entry_row.ruled_default = default.filter(|_| entry_row.disposition.refusal().is_some());
+        rows.push(entry_row);
+    }
+    rows
+}
+
+// The canonical bytes of a record part, for a refusal instance. A decoded
+// record always re-encodes (its parts came from postcard).
+fn encoded<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    postcard::to_allocvec(value).unwrap_or_default()
 }
 
 // One review as JSON: its decision, reviewer, date and basis.
@@ -779,6 +1276,10 @@ impl AttestationRow {
         match native.outcome.as_ref().and_then(Outcome::refusal) {
             Some(refusal) if refusal.is_retired() => return Err("native-refusal-code-retired"),
             Some(refusal) if !refusal.is_typed() => return Err("native-refusal-untyped"),
+            // Finding 6: only a rerun that settles the intent closes it.
+            Some(refusal) if refusal.code() == "GIT_CONVERGE_INTERRUPTED" => {
+                return Err("native-converge-interrupted")
+            }
             _ => {}
         }
         if native.unreadable == Some(crate::outcome::Unreadable::RefusalUntyped) {
@@ -1395,6 +1896,11 @@ pub fn json_string(value: &str) -> String {
     out
 }
 
+// P86 TRANSFER-CLOSURE (WP3 PR 4).
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+mod transfer_tests;
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
@@ -1528,6 +2034,40 @@ mod tests {
                 "{reason}"
             );
         }
+    }
+
+    // Estate converge (finding 6): a converge cut short is never accounted:
+    // not natively, and not by a disposition, whatever the review says.
+    #[test]
+    fn an_interrupted_converge_is_unaccounted_whatever_its_review() {
+        let refused = entry(
+            'g',
+            true,
+            Some(("refused", Some("GIT_CONVERGE_INTERRUPTED"))),
+            JournalState::Absent,
+        );
+        assert_eq!(
+            classify(&refused),
+            Disposition::Unaccounted("converge-interrupted")
+        );
+        let modified = entry(
+            'h',
+            true,
+            Some(("refused", Some("GIT_DESTINATION_MODIFIED"))),
+            JournalState::Absent,
+        );
+        assert_eq!(
+            classify(&modified),
+            Disposition::RefusedPendingReview("GIT_DESTINATION_MODIFIED".into())
+        );
+        let ledger = crate::estate::Ledger {
+            entries: vec![refused],
+            foreign_records: Vec::new(),
+            unmatched_journals: Vec::new(),
+        };
+        let report = Report::from_ledger(&ledger);
+        assert_eq!(report.unaccounted, 1);
+        assert_eq!(report.refused_pending_review, 0);
     }
 
     #[test]
@@ -1686,7 +2226,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v2\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"applied\":1,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"unaccounted\":1,\"pending_review\":1},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
+            "{\"schema\":\"bulkload.closure.v3\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
         ), "{json}");
         // A typed refusal row names its code, recording site and errno.
         assert!(json.contains(
@@ -1870,7 +2410,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v2\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"unaccounted\":4,\"pending_review\":1}"
+            "{\"schema\":\"bulkload.closure.v3\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
         ), "{json}");
         // The attested refusal of c is a typed refusal: it needs a review.
         assert!(json.contains(
@@ -1935,7 +2475,7 @@ mod tests {
         assert_eq!(report.gate(), Ok(()));
         let json = report.to_json();
         assert!(
-            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"unaccounted\":4,\"pending_review\":0}"),
+            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":0,\"ruled_default\":0}"),
             "{json}"
         );
         assert!(json.contains(
@@ -2359,6 +2899,42 @@ mod tests {
         assert!(json.contains(
             "\"outcome\":\"refused\",\"disposition\":\"unaccounted\",\"unaccounted_reason\":\"refusal-untyped\""
         ), "{json}");
+    }
+
+    // Estate converge (finding 6, review 2): an attestation row bound to the
+    // item's current capture and source still cannot close an interrupted
+    // converge; only a rerun that settles the intent does.
+    #[test]
+    fn attestation_cannot_close_an_interrupted_converge() {
+        let ledger = Ledger {
+            entries: vec![entry(
+                'd',
+                true,
+                Some(("refused", Some("GIT_CONVERGE_INTERRUPTED"))),
+                JournalState::Absent,
+            )],
+            ..Ledger::default()
+        };
+        let document = format!(
+            r#"{{"schema":"bulkload.closure-ledger.v1","plan":"/plan","source_label":"neo","items":[{{"item":"{}","source":"/src/d","capture":"{}","disposition":"source-absent","basis":"audit","evidence":"e"}}]}}"#,
+            "d".repeat(64),
+            digest('d')
+        );
+        let mut report = Report::from_ledger(&ledger);
+        assert_eq!(report.unaccounted, 1);
+        report
+            .attest(
+                &AttestationLedger::parse(&document, std::path::Path::new("/plan"), "neo").unwrap(),
+            )
+            .unwrap();
+        let attested = report.attested.clone().unwrap();
+        assert!(attested.items.is_empty());
+        assert_eq!(
+            attested.rejected,
+            vec![("d".repeat(64), "native-converge-interrupted")]
+        );
+        assert_eq!(report.remaining_unaccounted(), 1);
+        assert!(!report.passes());
     }
 
     // S4: item rows dispose exactly their (item, code); a standing policy
@@ -2823,11 +3399,16 @@ mod tests {
 
         const RETIRED: &str = "RETIRED_FOR_P73";
 
+        // The codes a review can close. `GIT_CONVERGE_INTERRUPTED` is typed
+        // but never closed by a review (estate converge, finding 6); its
+        // own row is `an_interrupted_converge_is_unaccounted_whatever_its_review`.
         fn typed_codes() -> Vec<&'static str> {
             BulkloadRefusal::CODES
                 .iter()
                 .copied()
-                .filter(|code| crate::outcome::is_typed_code(code))
+                .filter(|code| {
+                    crate::outcome::is_typed_code(code) && *code != "GIT_CONVERGE_INTERRUPTED"
+                })
                 .collect()
         }
 

@@ -238,6 +238,23 @@ resume-power-loss:
         fi
     done
 
+# Darwin check (S1 stack review, 2026-10-15, finding 3). CI runs on Linux
+# only (tinyland-nix), so the Darwin code (`io/sys_darwin.rs`, the `apple`
+# and `not(linux)` branches) is compiled and tested nowhere else. Run it on
+# a Darwin host (neo with the R-N69 prefix, or pzm) before merging a change
+# that touches that code: the rust-check passes (fmt, both clippy passes,
+# the workspace tests) and the whole fault harness, as on Linux.
+darwin-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(uname -s)" != Darwin ]]; then
+        echo "darwin-check: run this on a Darwin host" >&2
+        exit 2
+    fi
+    cd {{ root }}
+    {{ just_executable() }} rust-check
+    {{ just_executable() }} fault-harness
+
 # Chunker micro-bench (M2 W4): fused slice-FastCDC + BLAKE3 against the
 # current hash.rs path. Release build; size via BULKLOAD_CHUNKER_BENCH_MIB.
 bench-io-chunker:

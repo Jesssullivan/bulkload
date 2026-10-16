@@ -4026,6 +4026,20 @@ const COPY_SITES: &[CopySite] = &[
                 study's Q-d, not S2.",
     },
     CopySite {
+        kind: "fs",
+        id: "agent::git_carry::converge::publish_index",
+        call: "fs::copy(&index,&merged)",
+        input: "Destination side (estate converge, OI-1003-Q144). `index` is \
+                the landed checkout's `.git/index` on the destination: \
+                bulkload wrote it at landing, and the operator's Git may have \
+                rewritten it since (`git add`); it is never a source file. \
+                `merged` is converge's private `bulkload-index-<tag>-merged` \
+                beside it, under the `index.lock` this converge holds. \
+                Sharing between the two is the clone study's Q-d, which \
+                OI-1003-Q165 answered for the two receipt copies only; it is \
+                not S2.",
+    },
+    CopySite {
         kind: "io",
         id: "agent::git_carry::batch_objects::close",
         call: "std::io::copy(&mutoutput,&mutstd::io::sink())",

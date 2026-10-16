@@ -196,8 +196,8 @@ pub const BATCH_MIN_FILES: usize = 2;
 /// own log force's result. Both are first tagged in v5.17-rc3 (neither is in
 /// v5.17-rc2) and released in v5.17 (checked against the upstream tree on
 /// 2026-10-08). An older kernel keeps the per-file seals (OI-1003-Q113 set
-/// 5.8; the move to 5.17 rests on these commits, from the OI-1003-Q107
-/// review, and its ruling is pending).
+/// 5.8; OI-1003-Q141, ruled 2026-10-08 (Linear TIN-4543 comment 7734678e),
+/// moved it to 5.17 on these commits, from the OI-1003-Q107 review).
 ///
 /// A distribution kernel below 5.17 that carries the fix as a backport is
 /// still treated as too old: only the release number is read.
@@ -218,6 +218,13 @@ pub fn batched(files: usize) -> bool {
 
 /// Whether this kernel's `syncfs` reports write-back and `->sync_fs`
 /// errors, read once. An unreadable release counts as too old.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "the body is Linux-only; a const fn on the other platforms alone would be no API"
+    )
+)]
 fn syncfs_reports_errors() -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -314,6 +321,13 @@ pub fn mount_fstype(mountinfo: &str, device: (u32, u32)) -> Option<&str> {
 /// `FS_IOC_FSGETXATTR`) answers `false`: its data is on the realtime
 /// device, which the group's seal does not flush. Anything that cannot be
 /// read answers `false`, the per-file path.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "the body is Linux-only; a const fn on the other platforms alone would be no API"
+    )
+)]
 #[must_use]
 pub fn syncfs_seals_handle(handle: &File, mountinfo: &std::cell::OnceCell<Option<String>>) -> bool {
     #[cfg(target_os = "linux")]
@@ -384,6 +398,47 @@ thread_local! {
     static FORCE_XFLAGS: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
     static FAIL_WRITEBACK: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
     static DEVICE_SEALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SUPERBLOCK_ERROR: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static SUPERBLOCK_REPORTED: std::cell::RefCell<std::collections::HashSet<(u64, u64, i32)>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+/// Test hook: while `Some(dev)`, the superblock of device `dev` holds a
+/// write-back error raised after every descriptor this test opened, and
+/// before any [`seal_device`] opened its own.
+///
+/// It models `syncfs`'s errseq check (Linux 5.8,
+/// `errseq_check_and_advance(&sb->s_wb_err, &file->f_sb_err)`, the cursor
+/// sampled when the descriptor was opened): this thread's [`seal_device`]
+/// fails with `EIO` once per descriptor that predates the error, and never
+/// on a descriptor the seal opened itself.
+#[cfg(test)]
+pub fn superblock_error(device: Option<u64>) {
+    SUPERBLOCK_ERROR.with(|error| error.set(device));
+    SUPERBLOCK_REPORTED.with(|reported| reported.borrow_mut().clear());
+}
+
+/// The [`superblock_error`] model's answer for a `syncfs` on `through`,
+/// which the seal opened itself when `fresh`.
+#[cfg(all(test, target_os = "linux"))]
+fn superblock_reports(through: &File, fresh: bool) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd as _;
+    let Some(device) = SUPERBLOCK_ERROR.with(std::cell::Cell::get) else {
+        return Ok(());
+    };
+    let metadata = through.metadata()?;
+    let descriptor = (
+        std::os::unix::fs::MetadataExt::dev(&metadata),
+        std::os::unix::fs::MetadataExt::ino(&metadata),
+        through.as_raw_fd(),
+    );
+    if fresh
+        || descriptor.0 != device
+        || !SUPERBLOCK_REPORTED.with(|reported| reported.borrow_mut().insert(descriptor))
+    {
+        return Ok(());
+    }
+    Err(std::io::Error::from_raw_os_error(libc::EIO))
 }
 
 /// Test hook: while `Some`, this thread's [`syncfs_seals_handle`] takes
@@ -461,6 +516,13 @@ pub fn release_version(release: &str) -> Option<(u32, u32)> {
 /// Linux, group mode only, so the group's [`seal_device`] finds less to
 /// write. Not a durability step: a failure is ignored, and the group seal
 /// still makes the data durable.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "the body is Linux-only; a const fn on the other platforms alone would be no API"
+    )
+)]
 pub fn start_writeback(file: &File) {
     #[cfg(target_os = "linux")]
     if durability() == Durability::Group {
@@ -485,6 +547,13 @@ pub fn start_writeback(file: &File) {
 ///
 /// # Errors
 /// Returns the failed call: the caller refuses the entry with it.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        clippy::missing_const_for_fn,
+        reason = "the body is Linux-only; a const fn on the other platforms alone would be no API"
+    )
+)]
 pub fn kick_writeback(file: &File) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     if durability() == Durability::Group {
@@ -498,25 +567,45 @@ pub fn kick_writeback(file: &File) -> std::io::Result<()> {
 /// Seal every file of the file system holding `handle`: its data, metadata
 /// and directory entries.
 ///
-/// Linux `syncfs`, then `fsync` of `handle` itself, which flushes the device
-/// cache where the `syncfs` did not (an idle xfs log) and fails where it
-/// returned 0 (a shut-down ext4); see `sys::sync_fs`. Only a [`batched`] group calls it, on a regular file of
-/// the group in its first step and a touched directory in its second.
+/// Linux `syncfs` on a descriptor of `directory` (a directory on the same
+/// file system) opened for this seal, then `fsync` of `handle` itself,
+/// which flushes the device cache where the `syncfs` did not (an idle xfs
+/// log) and fails where it returned 0 (a shut-down ext4); see
+/// `sys::sync_fs`. Only a [`batched`] group calls it, on a regular file of
+/// the group and its parent in its first step, and on a touched directory
+/// (as both) in its second.
+///
+/// `syncfs` reports the superblock's write-back error against the cursor of
+/// the descriptor it runs on, sampled when that descriptor was opened. A
+/// long-lived descriptor (a staged temporary, a destination directory) would
+/// report an error raised since its open again for every later group whose
+/// seal happens to run on another such descriptor, so one bad file, or
+/// another process's error on a shared file system, could refuse every
+/// later healthy group (S1 stack review, 2026-10-15, finding 1). The fresh
+/// descriptor reports only what is raised during the seal. The group's own
+/// data errors are each member's [`check_writeback`]; the file system's own
+/// `->sync_fs` failure is returned by `syncfs` whatever the cursor. If the
+/// directory cannot be opened again (no read permission), `syncfs` runs on
+/// `directory` itself: that can only report more, never less.
 ///
 /// # Errors
 /// Returns the flush failure; `Unsupported` off Linux.
-pub fn seal_device(handle: &File) -> std::io::Result<()> {
+pub fn seal_device(handle: &File, directory: &File) -> std::io::Result<()> {
     #[cfg(test)]
     DEVICE_SEALS.with(|seals| seals.set(seals.get() + 1));
     #[cfg(target_os = "linux")]
     {
+        let fresh = super::sys::open_dir_at(directory, c".").map(File::from);
+        let through = fresh.as_ref().unwrap_or(directory);
+        #[cfg(test)]
+        superblock_reports(through, fresh.is_ok())?;
         counters::timed(Counter::FlushFs, Counter::FlushFsNs, || {
-            super::sys::sync_fs(handle)
+            super::sys::sync_fs(through, handle)
         })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = handle;
+        let _ = (handle, directory);
         Err(std::io::ErrorKind::Unsupported.into())
     }
 }
@@ -1265,7 +1354,11 @@ mod tests {
     /// and a 20 ms idle (the bound before the lever) splits the same items.
     #[test]
     fn a_group_waits_out_its_idle_and_closes_at_its_age() -> Result<()> {
-        let gapped = |idle: Duration, age: Option<Duration>, gaps: usize| -> Result<Vec<usize>> {
+        let gapped = |idle: Duration,
+                      age: Option<Duration>,
+                      gaps: usize,
+                      gap: Duration|
+         -> Result<Vec<usize>> {
             let groups = Arc::new(Mutex::new(Vec::new()));
             let committer = Committer::spawn_with(
                 Recorder(Arc::clone(&groups)),
@@ -1277,20 +1370,37 @@ mod tests {
             )?;
             committer.submit(1)?;
             for _ in 0..gaps {
-                std::thread::sleep(Duration::from_millis(60));
+                std::thread::sleep(gap);
                 committer.submit(1)?;
             }
             committer.sync()?;
             drop(committer);
             Ok(group_sizes(&groups))
         };
+        let gap = Duration::from_millis(60);
         // Five items 60 ms apart under a 2 s idle: one group, closed by sync.
-        assert_eq!(gapped(Duration::from_secs(2), None, 4)?, [5]);
-        // The same under a 20 ms idle: each item alone.
-        assert_eq!(gapped(Duration::from_millis(20), None, 4)?, [1; 5]);
+        assert_eq!(gapped(Duration::from_secs(2), None, 4, gap)?, [5]);
+        // Five items under a 20 ms idle: each item alone. The gap is ten
+        // idles, not three, so a committer thread descheduled for a while
+        // on a loaded host still sees each idle out before the next item
+        // (a 60 ms gap grouped two items at load 45 to 60 on 32 CPUs).
+        assert_eq!(
+            gapped(
+                Duration::from_millis(20),
+                None,
+                4,
+                Duration::from_millis(200)
+            )?,
+            [1; 5]
+        );
         // Twenty items 60 ms apart (over 1.1 s) under a 2 s idle and a 300 ms
         // age: closed by age, more than once, nothing lost.
-        let aged = gapped(Duration::from_secs(2), Some(Duration::from_millis(300)), 19)?;
+        let aged = gapped(
+            Duration::from_secs(2),
+            Some(Duration::from_millis(300)),
+            19,
+            gap,
+        )?;
         assert!(aged.len() >= 3, "{aged:?}");
         assert_eq!(aged.iter().sum::<usize>(), 20, "{aged:?}");
         Ok(())

@@ -129,6 +129,72 @@ when no line reports it), and the verdict records each total and how many
 runs reported it. In evidence mode an ON run that does not report both
 counters is INCONCLUSIVE, so evidence always carries them.
 
+Alongside a real run (#165; S5 under OI-1003-Q152: no freeze window, so
+the full neo->sting run is not a window the instrument can switch). `observe`
+runs the same reference workload and load1 sampler on the source host, for
+as long as the run takes, and starts nothing else: no ON command, no child
+but its own fixed-input git, rg/grep, sysctl and pmset probes. It reads the
+host's load (sysctl vm.loadavg on Darwin, /proc/loadavg on Linux), which is
+the live agents' load plus bulkload's, and what the agents' work feels like
+through the workload's own latencies. It never lists, signals, attaches to
+or asks about any agent process (R-N11, R-N104). Rows stream to
+OUT/rows.jsonl as they are taken (flushed per row, fsynced every 30 s),
+missed workload ticks included, so a long observation survives the
+instrument being stopped; power is sampled every 60 s (R-N81), and every
+sampler row carries the wall clock beside its monotonic offset. It ends
+when --stop-file appears, at --max-seconds, or on SIGTERM or SIGHUP (which
+it only receives), and then writes a terminal `end` row and its header's
+end. An observation with no recorded end (killed, or lost with its host)
+is cut short: `alongside` gives INCONCLUSIVE, as it does when the wall
+clock and the monotonic clock part by more than 2 s (a sleep or a clock
+step would map the run's intervals onto the wrong rows).
+The run's own record says when bulkload ran on the source: an intervals
+file of `START END [LABEL]` lines (epoch seconds or ISO-8601 UTC), or of
+`on TIME` / `off TIME` marks that `mark FILE on|off` appends around each
+delta pass. `alongside OBSERVE_DIR --intervals FILE` joins the two: the
+intervals are the ON windows, the gaps between them the OFF windows (a
+window under --min-window-seconds is dropped and listed). Each ON window
+starts one settle (60 s) before its pass, taken from the gap before it, so
+the settled span `analyze` measures is the pass itself, its first minute
+included. The verdict is
+`analyze`'s, unchanged, written with OUT/alongside/evidence.tsv, one row per
+gated metric, per noise floor and per window. An ON interval still open when
+the observation ended makes the verdict INCONCLUSIVE. `alongside --evidence`
+labels it evidence only under the alongside protocol: every kept window at
+least 300 s, at least five, alternating OFF and ON once adjacent windows of
+one state are merged (OFF first and last, at least two ON), every ON window
+with its whole settle before its pass, the pinned gate, AC power at every window
+boundary and recorded load1 in every window; coordinator quiet is not asked
+for (the source stays live, Q152), and the ON runs' priority and
+source-write counters are not seen (the run's own counters lines carry
+them). Such evidence is labelled `alongside, live baseline (OI-1003-Q160)`.
+Live baseline (OI-1003-Q160): alongside a real run the OFF windows between
+passes are the baseline, with no absolute load1 cap (R-N81's 2.5 is amended
+for alongside runs only; a gated `run` keeps it); the budget is unchanged,
++25 % p95 and +2.0 load1 over that baseline. Because the host's own load
+can drift, the verdict reports the OFF windows' load1 levels and their
+spread (still INCONCLUSIVE over half the budget), and compares each ON
+window with the OFF windows on both sides of it, interpolated in time to
+the pass, which removes a linear drift whatever the windows' lengths
+(`live_baseline`). It is judged gate by gate (`judge_pairs`): a pooled PASS
+stands only when every pair passes both gates; a pooled FAIL stands when
+every pair fails a gate that failed pooled, and a pair that also overruns
+the other gate adds a reason, never downgrading it; otherwise the verdict
+is INCONCLUSIVE, keeping the pooled reasons and naming each pair, its
+reading (the gated metric furthest over) and its baseline drift. A PASS
+also needs the OFF windows after passes free of a recovery tail: pooled,
+their first settled half may read at most half the budget over their
+second, on p95 and on lag-corrected load1 (`recovery_after_passes`), since
+a pass's cost that outlasts it sits on both sides of every pair. Evidence
+needs every pair compared on every gated metric, the window rule pinned
+(--min-window-seconds 300), no pass dropped as a short ON window (every
+pass is judged; dropped passes and their seconds are reported), and no
+recorded pass ending within one settle plus 300 s before the observation
+began (passes before it are recorded, never dropped silently). The pair
+rule removes linear drift only: host load that rises and falls with the
+passes themselves (an agent quiet while bulkload runs) is not separable,
+and the instrument never lists processes to separate it (R-N11, R-N104).
+
 Output: OUT/trace.json (config, host, every sample, windows, verdict),
 OUT/summary.md, and OUT/on-runs/ (a log and a run_dir per ON run). The work
 directory is removed at the end unless --keep-workdir.
@@ -136,6 +202,11 @@ directory is removed at the end unless --keep-workdir.
   run --source SRC --out OUT [options] -- ON_COMMAND...
   run --source SRC --out OUT --aa [options]
   analyze TRACE.json [gate options]   re-derive the verdict from a trace
+  observe --source SRC --out OUT [--stop-file F] [--max-seconds N]
+                                      sample alongside a real run (#165)
+  mark FILE on|off [--label L]        append a run-interval mark
+  alongside OBSERVE_DIR --intervals FILE [--evidence] [gate options]
+                                      the verdict of an observation
   selftest                            run test_s2_budget.py
 
 Exit: 0 complete (the verdict is in the output, whatever it is), 2 refused
@@ -156,6 +227,7 @@ import platform
 import random
 import re
 import shutil
+import signal
 import sqlite3
 import statistics
 import subprocess
@@ -563,6 +635,8 @@ def protocol_problems(config: dict, gate: dict) -> list[str]:
     """Why a run with this configuration and gate is not the S2 evidence
     protocol, or [] when it is. `run --evidence` refuses on any of them and
     `analyze` labels a trace evidence only when there are none."""
+    if config.get("alongside"):
+        return alongside_problems(config, gate)
     out = []
     if config.get("aa"):
         out.append("an A/A run is a noise measurement, not evidence")
@@ -578,6 +652,12 @@ def protocol_problems(config: dict, gate: dict) -> list[str]:
         out.append(f"evidence keeps --max-runs at {DEFAULT_MAX_RUNS} or more")
     if not config.get("coordinator_quiet"):
         out.append("evidence needs --coordinator-quiet (R-N91)")
+    return out + pinned_gate_problems(gate)
+
+
+def pinned_gate_problems(gate: dict) -> list[str]:
+    """The gate values evidence pins, and the floors it only lets rise."""
+    out = []
     for key in EVIDENCE_PINNED:
         if gate.get(key) != DEFAULT_GATE[key]:
             out.append(
@@ -589,6 +669,397 @@ def protocol_problems(config: dict, gate: dict) -> list[str]:
         if value is None or value < DEFAULT_GATE[key]:
             out.append(
                 f"evidence needs {key} of at least {DEFAULT_GATE[key]} (got {value})"
+            )
+    return out
+
+
+def alongside_problems(config: dict, gate: dict) -> list[str]:
+    """Why an observation alongside a real run (#165) is not evidence, or []:
+    its kept windows are the run's own intervals, so each must be long
+    enough on its own, and there must be enough of them. No coordinator quiet
+    and no ON-command settings apply (OI-1003-Q152: the source stays live),
+    and no absolute load1 cap: the OFF windows between passes are the
+    baseline (OI-1003-Q160). The live baseline's own checks need the
+    verdict and are `live_baseline_problems`."""
+    out = []
+    if (config.get("window_seconds") or 0) < EVIDENCE_MIN_WINDOW:
+        out.append(
+            f"evidence needs every window at least {EVIDENCE_MIN_WINDOW:.0f} s "
+            f"(the shortest kept is {config.get('window_seconds') or 0:.0f} s)"
+        )
+    pattern = config.get("pattern") or []
+    if len(pattern) < EVIDENCE_MIN_WINDOWS:
+        out.append(f"evidence needs at least {EVIDENCE_MIN_WINDOWS} windows")
+    # Run mode's pattern rule, on the kept windows: a dropped short pass
+    # splits one OFF gap into two kept OFF windows, which must not count as
+    # two. Merged, the pattern alternates OFF/ON/.../OFF with at least two
+    # ON windows, so the bootstrap's between-window spread is a real one.
+    merged = [s for i, s in enumerate(pattern) if i == 0 or pattern[i - 1] != s]
+    if merged.count(ON) < 2 or merged[:1] != [OFF] or merged[-1:] != [OFF]:
+        out.append(
+            "evidence needs at least 2 ON and 3 OFF windows in alternation, "
+            f"OFF first and last, once adjacent windows of one state merge "
+            f"(kept pattern {','.join(pattern) or '-'})"
+        )
+    for index, lead in config.get("short_leads") or []:
+        out.append(
+            f"evidence needs each pass's whole settle "
+            f"({gate.get('settle_seconds', 0):.0f} s) observed before it: ON "
+            f"window {index} had {lead:.0f} s, so the start of its pass was "
+            "not measured"
+        )
+    if config.get("open_interval"):
+        out.append("an ON interval was still open when the observation ended")
+    # OI-1003-Q160 review: every pass is judged. The window rule is pinned,
+    # as the gate is, and a pass whose ON window fell under it and was
+    # dropped was never compared with anything.
+    if config.get("min_window_seconds") != EVIDENCE_MIN_WINDOW:
+        out.append(
+            "evidence uses the SLO protocol unchanged: min_window_seconds is "
+            f"pinned at {EVIDENCE_MIN_WINDOW:.0f} "
+            f"(got {config.get('min_window_seconds')})"
+        )
+    dropped = [w for w in config.get("dropped_windows") or [] if w["state"] == ON]
+    if dropped:
+        seconds = sum(w["end"] - w["start"] - w.get("lead_s", 0.0) for w in dropped)
+        many = len(dropped) != 1
+        out.append(
+            f"evidence judges every pass (OI-1003-Q160): {len(dropped)} "
+            f"pass{'es' if many else ''} ({seconds:.0f} s of pass time) "
+            f"{'were' if many else 'was'} dropped as ON windows under "
+            f"{config.get('min_window_seconds') or 0:.0f} s, never compared"
+        )
+    # The first OFF window is the only baseline with no pass of this
+    # observation before it; a recorded pass that ended shortly before the
+    # observation began leaves its tail in it.
+    clear = gate.get("settle_seconds", 0.0) + EVIDENCE_MIN_WINDOW
+    for start, end in config.get("pre_origin_intervals") or []:
+        if end > -clear:
+            out.append(
+                "evidence needs the first OFF window clear of a pass's tail "
+                f"(OI-1003-Q160): a recorded pass ended {-end:.0f} s before the "
+                f"observation began (under {clear:.0f} s)"
+            )
+    return out + pinned_gate_problems(gate)
+
+
+RUN_EVIDENCE_LABEL = "gated run (R-N81)"
+ALONGSIDE_EVIDENCE_LABEL = "alongside, live baseline (OI-1003-Q160)"
+
+
+def settled_mid(window: dict, settle: float) -> float:
+    """The midpoint of a window's settled span (its whole span when the
+    settle is longer than it)."""
+    begin = min(window["start"] + settle, window["end"])
+    return (begin + window["end"]) / 2.0
+
+
+def live_baseline(per_window: list[dict], windows: list[dict], gate: dict) -> dict:
+    """The live baseline of an observation alongside a real run
+    (OI-1003-Q160): the OFF windows' load1 levels and their spread, and per
+    ON window its comparison with the nearest OFF window before and after
+    it. The baseline at the ON window is the two OFF levels (and p95s)
+    interpolated in time to its settled midpoint, so a baseline drifting
+    linearly across the pair cancels whatever the OFF windows' lengths; it
+    removes linear drift only. `drift_load1` is how far the baseline moved
+    across the pair (after minus before)."""
+    settle = gate["settle_seconds"]
+    mids = [settled_mid(window, settle) for window in windows]
+    offs = [w for w in per_window if w["state"] == OFF]
+    levels = [w["load1_level"] for w in offs]
+    known = [level for level in levels if level is not None]
+    spread = max(known) - min(known) if len(known) >= 2 else None
+    pairs = []
+    for position, window in enumerate(per_window):
+        if window["state"] != ON:
+            continue
+        before = next(
+            (p for p in range(position - 1, -1, -1) if per_window[p]["state"] == OFF),
+            None,
+        )
+        after = next(
+            (
+                p
+                for p in range(position + 1, len(per_window))
+                if per_window[p]["state"] == OFF
+            ),
+            None,
+        )
+        pair = {
+            "on": window["index"],
+            "off_before": None if before is None else per_window[before]["index"],
+            "off_after": None if after is None else per_window[after]["index"],
+            "baseline_load1": None,
+            "drift_load1": None,
+            "d_load1": None,
+            "d_p95": {m: None for m in METRICS},
+        }
+        if before is not None and after is not None:
+            span = mids[after] - mids[before]
+            weight = (mids[position] - mids[before]) / span if span > 0 else 0.5
+
+            def at(first: float, second: float) -> float:
+                return first + (second - first) * weight
+
+            low, high = per_window[before], per_window[after]
+            sides = (low["load1_level"], high["load1_level"])
+            if None not in sides and window["load1_level"] is not None:
+                base = at(*sides)
+                pair["baseline_load1"] = rounded(base)
+                pair["drift_load1"] = rounded(sides[1] - sides[0])
+                pair["d_load1"] = rounded(window["load1_level"] - base)
+            for metric in METRICS:
+                bracket = (low["p95_ms"][metric], high["p95_ms"][metric])
+                on = window["p95_ms"][metric]
+                if None not in bracket and on is not None and at(*bracket) > 0:
+                    pair["d_p95"][metric] = rounded(on / at(*bracket) - 1.0)
+        pairs.append(pair)
+    return {
+        "off_load1_levels": [rounded(level) for level in levels],
+        "off_load1_min": rounded(min(known)) if known else None,
+        "off_load1_max": rounded(max(known)) if known else None,
+        "off_load1_spread": rounded(spread),
+        "budget_load1": gate["budget_load1"],
+        "budget_p95": gate["budget_p95"],
+        "pairs": pairs,
+        "recovery": None,
+    }
+
+
+def gated_metrics(gate: dict) -> tuple[str, ...]:
+    return {"step": (STEP,), "each-op": OPS}.get(gate["gate_metric"], METRICS)
+
+
+def pair_latency(pair: dict, gate: dict) -> str | None:
+    """One pair's latency decision on its point estimates, by the gate
+    metric's rule: PASS, FAIL, or (gate `both`) MIXED when step and each-op
+    disagree; None when a gated metric is missing."""
+    budget = gate["budget_p95"]
+    d = pair["d_p95"]
+
+    def over(metrics) -> list[bool] | None:
+        values = [d[m] for m in metrics]
+        if None in values:
+            return None
+        return [value > budget + EPS for value in values]
+
+    step, ops = over((STEP,)), over(OPS)
+    step_status = None if step is None else ("FAIL" if any(step) else "PASS")
+    op_status = None if ops is None else ("FAIL" if any(ops) else "PASS")
+    if gate["gate_metric"] == "step":
+        return step_status
+    if gate["gate_metric"] == "each-op":
+        return op_status
+    if None in (step_status, op_status):
+        return None
+    return step_status if step_status == op_status else "MIXED"
+
+
+def pair_gates(pair: dict, gate: dict) -> dict:
+    """One pair's decision per gate, on its point estimates (None when it
+    has no complete comparison)."""
+    load = None
+    if pair["d_load1"] is not None:
+        load = "FAIL" if pair["d_load1"] > gate["budget_load1"] + EPS else "PASS"
+    return {"latency": pair_latency(pair, gate), "load1": load}
+
+
+def pair_reading(pair: dict, gate: dict, name: str) -> str:
+    """What one pair reads on one gate: load1 with the baseline's drift, or
+    the gated metric furthest over (ties: step first)."""
+    if name == "load1":
+        return (
+            f"load1 {pair['d_load1']:+.2f} (baseline drift {pair['drift_load1']:+.2f})"
+        )
+    known = [m for m in gated_metrics(gate) if pair["d_p95"][m] is not None]
+    worst = max(known, key=lambda m: pair["d_p95"][m])
+    return f"p95 {worst} {pair['d_p95'][worst]:+.1%}"
+
+
+def judge_pairs(
+    pairs: list[dict],
+    gate: dict,
+    pooled: dict,
+    status: str,
+    over: dict,
+) -> tuple[str, list[str]]:
+    """The verdict against the live baseline (OI-1003-Q160), gate by gate.
+    `pooled` is each gate's pooled decision ({"latency", "load1"}), `status`
+    the pooled PASS or FAIL and `over` each gate's pooled FAIL reasons.
+
+    A pooled PASS stands only when every pair passes every gate. A pooled
+    FAIL stands when every pair fails a gate that failed pooled; a pair
+    that also overruns a gate that passed pooled adds a reason and never
+    downgrades it. Otherwise the verdict is INCONCLUSIVE, keeping the
+    pooled reasons and naming each pair that does not hold, and a pair with
+    no comparison is never judged."""
+    where = {
+        id(pair): (
+            f"ON window {pair['on']} against OFF windows {pair['off_before']} "
+            f"and {pair['off_after']}"
+        )
+        for pair in pairs
+    }
+    decided = [(pair, pair_gates(pair, gate)) for pair in pairs]
+    missing = [
+        f"live baseline (OI-1003-Q160): {where[id(pair)]} has no comparison, so "
+        "drift in the host's own load cannot be told from bulkload's"
+        for pair, gates in decided
+        if None in gates.values()
+    ]
+    compared = [(pair, gates) for pair, gates in decided if None not in gates.values()]
+
+    def against(name: str) -> list[str]:
+        return [
+            f"live baseline (OI-1003-Q160): {where[id(pair)]} reads "
+            f"{pair_reading(pair, gate, name)} ({name} {gates[name]}), so the "
+            f"pooled {name} {pooled[name]} does not hold pair by pair"
+            for pair, gates in compared
+            if gates[name] != pooled[name]
+        ]
+
+    names = ("latency", "load1")
+    if status == "PASS":
+        disagree = [line for name in names for line in against(name)]
+        if missing or disagree:
+            return "INCONCLUSIVE", missing + disagree
+        return "PASS", []
+    failing = [name for name in names if pooled[name] == "FAIL"]
+    standing = [name for name in failing if not missing and not against(name)]
+    if not standing:
+        pooled_reasons = [line for name in failing for line in over[name]]
+        disagree = [line for name in failing for line in against(name)]
+        return "INCONCLUSIVE", pooled_reasons + missing + disagree
+    reasons = [line for name in standing for line in over[name]]
+    for name in failing:
+        if name not in standing:
+            reasons += against(name)
+    for name in names:
+        if pooled[name] != "PASS":
+            continue
+        reasons += [
+            f"live baseline (OI-1003-Q160): {where[id(pair)]} also reads "
+            f"{pair_reading(pair, gate, name)} ({name} {gates[name]}) against "
+            f"the pooled {name} PASS; the {' and '.join(standing)} FAIL stands "
+            "on every pass"
+            for pair, gates in compared
+            if gates[name] != "PASS"
+        ]
+    return "FAIL", reasons
+
+
+def recovery_after_passes(
+    windows: list[dict],
+    buckets: list[dict],
+    estimates: list[tuple[list[tuple[float, float]], float | None]],
+    first_pass: float | None,
+    gate: dict,
+) -> dict:
+    """How much higher the OFF windows after a pass read in their first
+    settled half than in their second (OI-1003-Q160): a pass's cost that
+    outlasts it (a cache refill, writeback, a stall's missed ticks) sits in
+    the OFF baseline on both sides of every pair, where neither the pair
+    rule nor the spread can see it. Pooled over every OFF window that
+    starts at or after the first pass (kept or dropped): each window's
+    settled 30 s blocks split into halves (the middle block of an odd count
+    left out) for p95, and its settled load1 rows split at its settled
+    midpoint, each half lag-corrected (`load1_level`)."""
+    settle = gate["settle_seconds"]
+    early = {m: [] for m in METRICS}
+    late = {m: [] for m in METRICS}
+    levels = {"early": [], "late": []}
+    used = []
+    for window, bucket, (rows, _) in zip(windows, buckets, estimates, strict=True):
+        if window["state"] != OFF or first_pass is None:
+            continue
+        if window["start"] + EPS < first_pass:
+            continue
+        used.append(window["index"])
+        blocks = [block for _, block in sorted(bucket["blocks"].items())]
+        half = len(blocks) // 2
+        for block in blocks[:half]:
+            for metric in METRICS:
+                early[metric].extend(block[metric])
+        for block in blocks[len(blocks) - half :]:
+            for metric in METRICS:
+                late[metric].extend(block[metric])
+        mid = settled_mid(window, settle)
+        first = [row for row in rows if row[0] < mid]
+        second = [row for row in rows if row[0] >= mid]
+        if first and second:
+            levels["early"].append((len(first), load1_level(first, None)))
+            levels["late"].append((len(second), load1_level(second, first[-1])))
+
+    def pooled_level(parts: list[tuple[int, float | None]]) -> float | None:
+        total = sum(n for n, level in parts if level is not None)
+        if not total:
+            return None
+        return sum(n * level for n, level in parts if level is not None) / total
+
+    d_p95 = {}
+    for metric in METRICS:
+        high, low = p95(early[metric]), p95(late[metric])
+        d_p95[metric] = rounded(high / low - 1.0) if high is not None and low else None
+    high, low = pooled_level(levels["early"]), pooled_level(levels["late"])
+    return {
+        "off_windows": used,
+        "d_p95": d_p95,
+        "d_load1": rounded(high - low) if None not in (high, low) else None,
+    }
+
+
+def recovery_reasons(recovery: dict, gate: dict) -> list[str]:
+    """Why the OFF baseline holds a pass's tail: its first half over its
+    second by more than half the budget on a gated metric or on load1."""
+    over = []
+    for metric in gated_metrics(gate):
+        value = recovery["d_p95"][metric]
+        if value is not None and value > gate["budget_p95"] / 2 + EPS:
+            over.append(f"p95 {metric} {value:+.1%}")
+    if (
+        recovery["d_load1"] is not None
+        and recovery["d_load1"] > gate["budget_load1"] / 2 + EPS
+    ):
+        over.append(f"load1 {recovery['d_load1']:+.2f}")
+    if not over:
+        return []
+    return [
+        "live baseline (OI-1003-Q160): recovery after a pass: the OFF windows "
+        f"after passes ({', '.join(map(str, recovery['off_windows']))}) read "
+        f"{' and '.join(over)} in their first settled half over their second, "
+        f"more than half the budget (+{gate['budget_p95'] / 2:.1%}, "
+        f"+{gate['budget_load1'] / 2:.2f}), so the baseline holds a pass's tail "
+        "and a PASS cannot be read from it"
+    ]
+
+
+def live_baseline_problems(
+    baseline: dict, per_window: list[dict], gate: dict
+) -> list[str]:
+    """Why an alongside observation's live baseline is not evidence
+    (OI-1003-Q160): every window must have recorded load1, the OFF
+    windows' load spread must be known, and every ON window must have its
+    comparison with the OFF windows on both sides, on every gated metric."""
+    out = []
+    for w in per_window:
+        if not w["load_n"]:
+            out.append(
+                f"evidence needs recorded load1 in every window (OI-1003-Q160): "
+                f"window {w['index']} ({w['state']}) has none after settle"
+            )
+    if baseline["off_load1_spread"] is None:
+        out.append(
+            "evidence reports the live baseline's load spread (OI-1003-Q160): "
+            "it needs a load1 level in at least 2 OFF windows"
+        )
+    for pair in baseline["pairs"]:
+        if pair["d_load1"] is None or any(
+            pair["d_p95"][m] is None for m in gated_metrics(gate)
+        ):
+            out.append(
+                f"evidence compares each ON window with the OFF windows on "
+                f"both sides (OI-1003-Q160): ON window {pair['on']} has no "
+                "complete comparison"
             )
     return out
 
@@ -795,10 +1266,12 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     gate = {**recorded, **(overrides or {})}
     config = trace.get("config", {})
     aa = bool(config.get("aa"))
+    # #165: the ON windows are a real run's intervals; it started no command.
+    alongside = bool(config.get("alongside"))
     windows = trace["windows"]
     settle = gate["settle_seconds"]
     budget, budget_load = gate["budget_p95"], gate["budget_load1"]
-    gated = {"step": (STEP,), "each-op": OPS}.get(gate["gate_metric"], METRICS)
+    gated = gated_metrics(gate)
     starts = [w["start"] for w in windows]
 
     def locate(t: float) -> int | None:
@@ -970,7 +1443,10 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     # R-N81: a gated sample is taken only on AC power with load1 under the
     # limit. Under evidence, power is checked at every window boundary and
     # each OFF window's lag-corrected level (the host baseline, without the
-    # previous ON window's EWMA tail) must stay under LOAD_LIMIT.
+    # previous ON window's EWMA tail) must stay under LOAD_LIMIT. Alongside
+    # a real run (OI-1003-Q160) the load cap does not apply: the source is
+    # live (Q152), its OFF windows are the baseline whatever its load, and
+    # `live_baseline` guards that baseline instead. Power still applies.
     rn81 = []
     if evidence:
         for w in windows:
@@ -980,7 +1456,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                         f"R-N81: window {w['index']} {key.replace('_', ' ')} "
                         f"was {w.get(key, 'unrecorded')}, not AC power"
                     )
-        for w in per_window:
+        for w in per_window if not alongside else []:
             level = w["load1_level"]
             if w["state"] == OFF and level is not None and level >= LOAD_LIMIT:
                 rn81.append(
@@ -988,7 +1464,9 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                     f"not under {LOAD_LIMIT}"
                 )
     structural.extend(rn81)
-    if not aa:
+    if config.get("open_interval"):
+        structural.append("an ON interval was still open when the observation ended")
+    if not aa and not alongside:
         requested = config.get("priority")
         for w in windows:
             if w["state"] != ON:
@@ -1081,15 +1559,17 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
     else:
         latency_status = "INCONCLUSIVE"
 
-    over, undecided = [], []
+    over_by = {"latency": [], "load1": []}
+    undecided = []
     if latency_status == "FAIL":
         if STEP in gated:
-            over.append(p95_reason(STEP, "exceeds"))
+            over_by["latency"].append(p95_reason(STEP, "exceeds"))
         for metric in OPS if gate["gate_metric"] != "step" else ():
             if op_lower[metric] is not None and op_lower[metric] > budget + EPS:
-                over.append(p95_reason(metric, "exceeds"))
+                over_by["latency"].append(p95_reason(metric, "exceeds"))
     if load_status == "FAIL":
-        over.append(load1_reason("exceeds"))
+        over_by["load1"].append(load1_reason("exceeds"))
+    over = over_by["latency"] + over_by["load1"]
     if gate["gate_metric"] == "both" and step_status != op_status:
         undecided.append(
             f"the latency gates disagree (step {step_status}, each-op "
@@ -1141,10 +1621,52 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         else:
             status = "INCONCLUSIVE"
             reasons = undecided or ["the bounds do not decide the budget"]
+    # OI-1003-Q160: alongside a real run the baseline is the host's own
+    # live load, which can drift. Each ON window is compared with the OFF
+    # windows on both sides of it, interpolated to its time, which cancels
+    # a linear drift. Gate by gate: a pooled PASS stands only when every
+    # pair passes, a pooled FAIL when every pair fails a gate that failed
+    # pooled. A PASS also needs the OFF windows after passes free of a
+    # recovery tail, which would sit on both sides of every pair.
+    baseline = None
+    dropped_on = None
+    if alongside:
+        dropped = [
+            w for w in config.get("dropped_windows") or [] if w.get("state") == ON
+        ]
+        dropped_on = {
+            "windows": len(dropped),
+            "pass_seconds": rounded(
+                sum(w["end"] - w["start"] - w.get("lead_s", 0.0) for w in dropped), 3
+            ),
+        }
+        baseline = live_baseline(per_window, windows, gate)
+        first_pass = min(
+            [w["start"] + w.get("lead_s", 0.0) for w in dropped]
+            + [w["start"] + w.get("lead_s", 0.0) for w in windows if w["state"] == ON],
+            default=None,
+        )
+        baseline["recovery"] = recovery_after_passes(
+            windows, buckets, estimates, first_pass, gate
+        )
+        if status in ("PASS", "FAIL"):
+            status, reasons = judge_pairs(
+                baseline["pairs"],
+                gate,
+                {"latency": latency_status, "load1": load_status},
+                status,
+                over_by,
+            )
+        if status == "PASS":
+            tail = recovery_reasons(baseline["recovery"], gate)
+            if tail:
+                status, reasons = "INCONCLUSIVE", tail
     if not config.get("evidence"):
         evidence_problems = ["the run was made without --evidence"]
     else:
         evidence_problems = protocol_problems(config, trace.get("gate", {})) + rn81
+        if baseline is not None:
+            evidence_problems += live_baseline_problems(baseline, per_window, gate)
         if trace.get("schema") != SCHEMA:
             evidence_problems.append(
                 f"trace schema {trace.get('schema')} is not {SCHEMA}"
@@ -1155,11 +1677,20 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
                     f"analyze override {key}={overrides[key]} differs from the "
                     f"recorded {recorded.get(key)}"
                 )
+    if evidence_problems:
+        evidence_label = None
+    elif alongside:
+        evidence_label = ALONGSIDE_EVIDENCE_LABEL
+    else:
+        evidence_label = RUN_EVIDENCE_LABEL
     return {
         "status": status,
         "mode": mode,
         "evidence": not evidence_problems,
+        "evidence_label": evidence_label,
         "evidence_problems": evidence_problems,
+        "live_baseline": baseline,
+        "dropped_on": dropped_on,
         "reasons": reasons,
         "raw_comparison": raw,
         "gate": gate,
@@ -1578,8 +2109,15 @@ def session(args: argparse.Namespace, states: list[str], workdir: Path) -> dict:
 
 def render_summary(trace: dict, verdict: dict) -> str:
     config, host = trace["config"], trace["host"]
-    label = "" if verdict["evidence"] else f" ({NOT_EVIDENCE})"
+    if not verdict["evidence"]:
+        label = f" ({NOT_EVIDENCE})"
+    elif config.get("alongside"):
+        label = f" (evidence: {verdict['evidence_label']})"
+    else:
+        label = ""
     kind = "A/A noise run" if config["aa"] else "S2 budget run"
+    if config.get("alongside"):
+        kind = "S2 budget alongside a real run"
     gate = verdict["gate"]
     response = verdict["load1_model"]["response_to_unit_add"]
     wal_index = verdict["source_wal_index_touched"]
@@ -1627,8 +2165,18 @@ def render_summary(trace: dict, verdict: dict) -> str:
         f"- Windows: {','.join(config['pattern'])} x {config['window_seconds']:.0f} s, "
         f"settle {gate['settle_seconds']:.0f} s; {trace['start_utc']} to "
         f"{trace.get('end_utc')}",
-        f"- ON command: `{' '.join(config['on_command']) or '(none, A/A)'}` at "
-        f"priority `{config['priority']}`, repeat={config['repeat']}",
+        (
+            f"- ON windows: the run's own intervals (`{config.get('intervals')}`); "
+            f"{len(config.get('dropped_windows', []))} window(s) under "
+            f"{config.get('min_window_seconds')} s dropped; "
+            f"{passes_dropped(verdict.get('dropped_on'))} dropped with them, "
+            "never compared; "
+            f"{len(config.get('pre_origin_intervals') or [])} pass(es) ended "
+            "before the observation began; nothing was started"
+            if config.get("alongside")
+            else f"- ON command: `{' '.join(config['on_command']) or '(none, A/A)'}` at "
+            f"priority `{config['priority']}`, repeat={config['repeat']}"
+        ),
         f"- Workload: {config['workload']}; source `{config['source']}`, workdir "
         f"`{config['workdir']}`",
         f"- Skipped ticks: {trace.get('skipped_ticks')}; settled workload ticks "
@@ -1684,13 +2232,53 @@ def render_summary(trace: dict, verdict: dict) -> str:
             f"{len(raw.get('runs', []))} | "
             f"{raw.get('power_start', '?')}/{raw.get('power_end', '?')} |"
         )
+    baseline = verdict.get("live_baseline")
+    if baseline is not None:
+        levels = ", ".join(num(v, ".2f") for v in baseline["off_load1_levels"])
+        recovery = baseline.get("recovery") or {"d_p95": {}, "d_load1": None}
+        lines += [
+            "",
+            "Live baseline (OI-1003-Q160): the OFF windows between passes, with "
+            "no absolute load1 cap. OFF load1 levels "
+            f"{levels or '-'}; spread "
+            f"{num(baseline['off_load1_spread'], '.2f')} (noise floor: half "
+            f"the budget, {gate['budget_load1'] / 2:.2f}). Recovery after a "
+            "pass (the OFF windows after passes, first settled half over "
+            f"second): p95 step {pct(recovery['d_p95'].get(STEP))}, load1 "
+            f"{num(recovery['d_load1'], '+.2f')} (a PASS needs both within "
+            "half the budget). Each ON window against the OFF windows on both "
+            "sides, interpolated to its time (this removes linear drift only):",
+            "",
+            "| ON window | OFF before | OFF after | baseline load1 | drift "
+            "| d_load1 | d_p95 step |",
+            "|---:|---:|---:|---:|---:|---:|---:|",
+        ]
+        for pair in baseline["pairs"]:
+            lines.append(
+                f"| {pair['on']} | {pair['off_before']} | {pair['off_after']} | "
+                f"{num(pair['baseline_load1'], '.2f')} | "
+                f"{num(pair['drift_load1'], '+.2f')} | "
+                f"{num(pair['d_load1'], '+.2f')} | {pct(pair['d_p95'][STEP])} |"
+            )
     return "\n".join(lines) + "\n"
+
+
+def passes_dropped(dropped: dict | None) -> str:
+    """`N pass(es) (S s)` of pass time dropped as short ON windows."""
+    if not dropped:
+        return "0 passes (0 s)"
+    many = dropped["windows"] != 1
+    return (
+        f"{dropped['windows']} pass{'es' if many else ''} "
+        f"({dropped['pass_seconds']:.0f} s)"
+    )
 
 
 def emit(verdict: dict) -> None:
     say(
         f"verdict status={verdict['status']} mode={verdict['mode']} "
         f"evidence={str(verdict['evidence']).lower()} "
+        f"evidence_label={verdict['evidence_label']!r} "
         f"delta_p95={verdict['delta_p95']} worst={verdict['worst_metric']} "
         f"delta_load1={verdict['delta_load1']} noise_p95={verdict['noise_p95']} "
         f"noise_load1={verdict['noise_load1']} raw={verdict['raw_comparison']}"
@@ -1792,6 +2380,710 @@ def command_analyze(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- alongside a real run (#165) ---------------------------------------------
+
+ALONGSIDE_SCHEMA = "bulkload.s2-alongside.v1"
+ALONGSIDE_RULINGS = (
+    RULINGS + ", OI-1003-Q152 (no freeze window), OI-1003-Q155, "
+    "OI-1003-Q160 (alongside: the live OFF windows are the baseline)"
+)
+# Power is sampled this often while observing (R-N81), and rows are fsynced
+# this often, so an observation the instrument does not finish keeps them.
+POWER_EVERY_S = 60.0
+FSYNC_EVERY_S = 30.0
+# Every sampler row carries time.time() beside its monotonic offset. When
+# they part by more than this, the host slept or its clock stepped, and the
+# run's wall-clock intervals no longer map onto the rows (#165 review).
+CLOCK_SLACK_S = 2.0
+# What ends an observation besides its stop file and its bound. Received
+# only: the instrument never sends one (R-N11).
+OBSERVE_END_SIGNALS = ("SIGTERM", "SIGHUP")
+# A single observation ends here at the latest: twelve hours.
+DEFAULT_OBSERVE_SECONDS = 12 * 3600.0
+ISO_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$")
+
+
+class RowSink:
+    """JSON-lines rows, one writer at a time: each row flushed as it is
+    written, the file fsynced at most every FSYNC_EVERY_S and on close."""
+
+    def __init__(self, path: Path) -> None:
+        self.handle = path.open("a", encoding="utf-8")
+        self.lock = threading.Lock()
+        self.synced = time.monotonic()
+
+    def write(self, row: dict) -> None:
+        with self.lock:
+            self.handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+            self.handle.flush()
+            if time.monotonic() - self.synced >= FSYNC_EVERY_S:
+                os.fsync(self.handle.fileno())
+                self.synced = time.monotonic()
+
+    def close(self) -> None:
+        with self.lock:
+            self.handle.flush()
+            os.fsync(self.handle.fileno())
+            self.handle.close()
+
+
+def observe_refusals(args: argparse.Namespace) -> list[str]:
+    out = []
+    if args.max_seconds <= 0:
+        out.append("--max-seconds must be positive")
+    source = args.source.resolve()
+    if not source.is_dir():
+        out.append(f"source {source} is not a directory")
+    out_dir = args.out.resolve()
+    if out_dir.exists():
+        out.append(f"out {out_dir} already exists")
+    elif not out_dir.parent.is_dir():
+        out.append(f"out parent {out_dir.parent} is not a directory")
+    if source.is_dir() and is_within(out_dir, source):
+        out.append(f"out {out_dir} is inside the source")
+    if (
+        args.stop_file
+        and source.is_dir()
+        and is_within(args.stop_file.resolve(), source)
+    ):
+        out.append("--stop-file is inside the source")
+    return out
+
+
+def observe_session(args: argparse.Namespace, workdir: Path, out_dir: Path) -> dict:
+    """Sample the reference workload and load1 until the stop file appears
+    or --max-seconds pass. Starts nothing but the workload's own probes."""
+    git = shutil.which("git")
+    tool, search = search_command(workdir / "tree")
+    source_name = load_source()
+    workdir.mkdir()
+    build_fixtures(workdir, git)
+    workload = Workload(workdir, git, search)
+    workload.step()  # warm-up, not recorded
+    header = {
+        "schema": ALONGSIDE_SCHEMA,
+        "rulings": ALONGSIDE_RULINGS,
+        "label": args.label,
+        "config": {
+            "source": str(args.source.resolve()),
+            "workdir": str(workdir),
+            "out": str(out_dir),
+            "stop_file": str(args.stop_file) if args.stop_file else None,
+            "max_seconds": args.max_seconds,
+            "search_tool": tool,
+            "workload": "v0: jsonl+fsync, sqlite WAL synchronous=FULL, "
+            "git status+diff, search",
+        },
+        "host": host_record(git, search, source_name, workload.git_env),
+        "start_utc": utc_now(),
+        "end_utc": None,
+        "end_reason": None,
+        "errors": [],
+        "skipped_ticks": {},
+    }
+    sink = RowSink(out_dir / "rows.jsonl")
+    stop = threading.Event()
+    origin = time.monotonic()
+    header["origin_epoch"] = time.time()
+    (out_dir / "observe.json").write_text(json.dumps(header, indent=1) + "\n")
+    until = origin + args.max_seconds
+    errors = header["errors"]
+    last_power = [-math.inf]
+
+    def work() -> None:
+        t = round(time.monotonic() - origin, 3)
+        results = workload.step()
+        for name, ms, error in results:
+            row = {
+                "k": "lat",
+                "t": t,
+                "op": name,
+                "ms": round(ms, 3),
+                "ok": error is None,
+            }
+            if error:
+                row["error"] = error
+            sink.write(row)
+        sink.write(
+            {
+                "k": "lat",
+                "t": t,
+                "op": STEP,
+                "ms": round(sum(ms for _, ms, _ in results), 3),
+                "ok": all(error is None for _, _, error in results),
+            }
+        )
+
+    def sample() -> None:
+        t = round(time.monotonic() - origin, 3)
+        try:
+            load1 = read_load1(source_name)
+            sink.write(
+                {"k": "load", "t": t, "e": round(time.time(), 3), "load1": load1}
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            errors.append(f"load1 at {t}: {type(exc).__name__}: {exc}")
+        if t - last_power[0] >= POWER_EVERY_S:
+            last_power[0] = t
+            sink.write({"k": "power", "t": t, "power": r23_ab.power_source()})
+
+    class MissedRows:
+        """Each missed tick goes to disk as the loop skips it, so an
+        observation stopped without its end keeps its coordinated-omission
+        rows (#165 review)."""
+
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def append(self, item: tuple[float, float]) -> None:
+            t, lag = item
+            sink.write({"k": "missed", "loop": self.name, "t": t, "lag_ms": lag})
+
+    def loop(name: str, phase: float, body) -> threading.Thread:
+        def target() -> None:
+            try:
+                header["skipped_ticks"][name] = cadence(
+                    origin, phase, stop, until, body, MissedRows(name)
+                )
+            except Exception as exc:  # recorded; the verdict is INCONCLUSIVE
+                errors.append(f"{name} loop: {type(exc).__name__}: {exc}")
+
+        return threading.Thread(target=target, name=f"s2-observe-{name}")
+
+    # SIGTERM and SIGHUP end the observation as its stop file does, so its
+    # end is recorded. Received only, and only from the main thread.
+    requested: list[str] = []
+    wake = threading.Event()
+    previous = {}
+    if threading.current_thread() is threading.main_thread():
+        for name in OBSERVE_END_SIGNALS:
+            number = getattr(signal, name)
+
+            def handler(_signum, _frame, name=name) -> None:
+                requested.append(name)
+                wake.set()
+
+            previous[number] = signal.signal(number, handler)
+    loops = [loop("sampler", 0.0, sample), loop("workload", 0.5, work)]
+    for thread in loops:
+        thread.start()
+    try:
+        while True:
+            if requested:
+                header["end_reason"] = requested[0]
+                break
+            if args.stop_file and args.stop_file.exists():
+                header["end_reason"] = "stop file"
+                break
+            if time.monotonic() >= until:
+                header["end_reason"] = "max seconds"
+                break
+            wake.wait(1.0)
+    finally:
+        stop.set()
+        for thread in loops:
+            thread.join()
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+        workload.close()
+        end_t = round(time.monotonic() - origin, 3)
+        sink.write({"k": "power", "t": end_t, "power": r23_ab.power_source()})
+        header["span_s"] = end_t
+        header["end_epoch"] = time.time()
+        header["end_utc"] = utc_now()
+        # The terminal row: only an observation that ended writes it. One
+        # an exception ended has no end_reason and no end row: cut short.
+        if header["end_reason"]:
+            sink.write({"k": "end", "t": end_t, "reason": header["end_reason"]})
+        sink.close()
+        (out_dir / "observe.json").write_text(json.dumps(header, indent=1) + "\n")
+    return header
+
+
+def command_observe(args: argparse.Namespace) -> int:
+    refusals = observe_refusals(args)
+    source = args.source.resolve()
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%SZ")
+    workdir = (args.workdir or source.parent / f"s2-observe-workload-{stamp}").resolve()
+    if source.is_dir():
+        refusal = workdir_refusal(source, workdir)
+        if refusal:
+            refusals.append(refusal)
+    if not shutil.which("git"):
+        refusals.append("git is not on PATH")
+    if search_command(workdir / "tree") is None:
+        refusals.append("neither rg nor grep is on PATH")
+    if refusals:
+        for refusal in refusals:
+            say(f"refused reason={refusal!r}")
+        return 2
+    out_dir = args.out.resolve()
+    out_dir.mkdir()
+    say(
+        f"observe workdir={workdir} out={out_dir} stop_file={args.stop_file} "
+        f"max_seconds={args.max_seconds}"
+    )
+    try:
+        header = observe_session(args, workdir, out_dir)
+    except (OSError, subprocess.SubprocessError, sqlite3.Error) as exc:
+        say(f"aborted reason={f'{type(exc).__name__}: {exc}'!r}")
+        return 3
+    finally:
+        if workdir.exists() and not args.keep_workdir:
+            shutil.rmtree(workdir)
+    say(
+        f"observed span_s={header['span_s']} end={header['end_reason']} "
+        f"errors={len(header['errors'])} rows={out_dir / 'rows.jsonl'}"
+    )
+    return 0
+
+
+def parse_time(text: str) -> float:
+    """Epoch seconds, or ISO-8601 UTC (`2026-10-15T10:00:00Z`)."""
+    if ISO_UTC.match(text):
+        stamp = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return stamp.timestamp()
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"not a time: {text!r}")
+    return value
+
+
+def parse_intervals(text: str) -> tuple[list[tuple[float, float]], bool, list[str]]:
+    """The run's ON intervals, in epoch seconds, merged; whether one was
+    still open (an `on` with no `off`); and the lines that did not parse.
+    Lines: `START END [LABEL]`, or `on TIME [LABEL]` / `off TIME [LABEL]`;
+    `#` starts a comment."""
+    intervals: list[tuple[float, float]] = []
+    problems: list[str] = []
+    opened: float | None = None
+    for number, raw in enumerate(text.splitlines(), 1):
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split()
+        try:
+            if parts[0] in ("on", "off"):
+                at = parse_time(parts[1])
+                if parts[0] == "on":
+                    if opened is not None:
+                        raise ValueError("on after on")
+                    opened = at
+                else:
+                    if opened is None or at < opened:
+                        raise ValueError("off without an earlier on")
+                    intervals.append((opened, at))
+                    opened = None
+            else:
+                start, end = parse_time(parts[0]), parse_time(parts[1])
+                if end < start:
+                    raise ValueError("ends before it starts")
+                intervals.append((start, end))
+        except (IndexError, ValueError) as exc:
+            problems.append(f"line {number}: {exc}: {raw.strip()!r}")
+    open_interval = opened is not None
+    if open_interval:
+        intervals.append((opened, math.inf))
+    intervals.sort()
+    merged: list[tuple[float, float]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged, open_interval, problems
+
+
+def derive_windows(
+    intervals: list[tuple[float, float]],
+    span: float,
+    min_window: float,
+    lead: float = 0.0,
+) -> tuple[list[dict], list[dict]]:
+    """OFF and ON windows over [0, span] from ON intervals already relative
+    to the observation's origin: each interval an ON window, each gap an OFF
+    window. Each ON window starts `lead` seconds before its interval (the
+    settle `analyze` drops, so the settled span is the pass itself), taken
+    from the gap before it; `lead_s` records how much it got, less when the
+    gap or the observation before the pass was shorter. A window under
+    min_window is dropped (returned apart); the rest are renumbered in time
+    order."""
+    raw = []
+    cursor = 0.0
+    for start, end in intervals:
+        end = min(span, end)
+        if end <= cursor or start >= span:
+            continue
+        begin = max(cursor, start - lead)
+        if begin > cursor:
+            raw.append((OFF, cursor, begin, None))
+        raw.append((ON, begin, end, max(0.0, start - begin)))
+        cursor = end
+    if cursor < span:
+        raw.append((OFF, cursor, span, None))
+    kept, dropped = [], []
+    for state, start, end, lead_s in raw:
+        window = {"state": state, "start": round(start, 3), "end": round(end, 3)}
+        if lead_s is not None:
+            window["lead_s"] = round(lead_s, 3)
+        (kept if end - start >= min_window else dropped).append(window)
+    for index, window in enumerate(kept):
+        window["index"] = index
+    return kept, dropped
+
+
+def power_at(power: list[dict], t: float) -> str:
+    """The power state sampled nearest before `t` (else the first after)."""
+    before = [row for row in power if row["t"] <= t]
+    if before:
+        return before[-1]["power"]
+    return power[0]["power"] if power else "unrecorded"
+
+
+def read_observation(directory: Path) -> tuple[dict, list[dict]]:
+    header = json.loads((directory / "observe.json").read_text())
+    if header.get("schema") != ALONGSIDE_SCHEMA:
+        raise ValueError(f"{directory} holds no {ALONGSIDE_SCHEMA} observation")
+    rows = []
+    with (directory / "rows.jsonl").open(encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                # A row torn by an observation that did not finish.
+                header.setdefault("errors", []).append("a torn row was skipped")
+    return header, rows
+
+
+def alongside_trace(
+    header: dict,
+    rows: list[dict],
+    intervals_text: str,
+    intervals_name: str,
+    min_window: float,
+    evidence: bool,
+    gate: dict,
+) -> dict:
+    """An `analyze` trace from an observation and the run's intervals."""
+    intervals, open_interval, problems = parse_intervals(intervals_text)
+    origin = header["origin_epoch"]
+    last = max((row["t"] for row in rows if "t" in row), default=0.0)
+    span = header.get("span_s") or last
+    settle = gate["settle_seconds"]
+    relative = [(start - origin, end - origin) for start, end in intervals]
+    kept, dropped = derive_windows(relative, span, min_window, lead=settle)
+    # Passes that ended before the observation began are recorded, never
+    # dropped silently: one ending shortly before leaves its tail in the
+    # first OFF window (OI-1003-Q160 review).
+    pre_origin = [
+        [rounded(start, 3), rounded(end, 3)] for start, end in relative if end <= 0.0
+    ]
+    # An observation that never recorded its end was stopped before it
+    # closed its record (killed, or its host lost): what it missed after
+    # its last row is unknown, and so is whether its tail is whole.
+    cut_short = None
+    if not header.get("end_reason") or header.get("span_s") is None:
+        cut_short = "the observation recorded no end (stopped before it closed)"
+    elif not any(row.get("k") == "end" for row in rows):
+        cut_short = "rows.jsonl has no end row (its tail was lost)"
+    # The run's intervals are wall-clock; rows are monotonic offsets from
+    # one origin. Every sampler row carries both, so a sleep or a clock step
+    # that parts them is seen, never silently mapped onto the wrong rows.
+    clock_errors = []
+    sampled = [row for row in rows if row.get("k") == "load"]
+    if any("e" not in row for row in sampled):
+        clock_errors.append("clock: sampler rows carry no wall clock")
+    elif sampled:
+        worst = max(abs(row["e"] - origin - row["t"]) for row in sampled)
+        if worst > CLOCK_SLACK_S:
+            clock_errors.append(
+                f"clock: wall and monotonic clocks parted by {worst:.1f} s "
+                f"(over {CLOCK_SLACK_S:.0f} s: a sleep or a clock step)"
+            )
+    short_leads = [
+        [window["index"], window["lead_s"]]
+        for window in kept
+        if window["state"] == ON and window["lead_s"] < settle - EPS
+    ]
+    power = sorted(
+        (row for row in rows if row.get("k") == "power"), key=lambda r: r["t"]
+    )
+    for window in kept:
+        window["planned_end"] = window["end"]
+        window["overrun_s"] = 0.0
+        window["power_start"] = power_at(power, window["start"])
+        window["power_end"] = power_at(power, window["end"])
+    errors = (
+        list(header.get("errors", []))
+        + [f"intervals {problem}" for problem in problems]
+        + clock_errors
+    )
+    return {
+        "schema": SCHEMA,
+        "rulings": header.get("rulings", ALONGSIDE_RULINGS),
+        "label": header.get("label", ""),
+        "config": {
+            "evidence": evidence,
+            "aa": False,
+            "alongside": True,
+            "intervals": intervals_name,
+            "open_interval": open_interval,
+            "short_leads": short_leads,
+            "min_window_seconds": min_window,
+            "dropped_windows": dropped,
+            "pre_origin_intervals": pre_origin,
+            "source": header["config"]["source"],
+            "workdir": header["config"]["workdir"],
+            "out": header["config"]["out"],
+            "pattern": [window["state"] for window in kept],
+            "window_seconds": min((w["end"] - w["start"] for w in kept), default=0.0),
+            "priority": None,
+            "repeat": True,
+            "max_runs": DEFAULT_MAX_RUNS,
+            "on_command": [],
+            "coordinator_quiet": False,
+            "search_tool": header["config"]["search_tool"],
+            "workload": header["config"]["workload"],
+        },
+        "gate": gate,
+        "host": header["host"],
+        "start_utc": header["start_utc"],
+        "end_utc": header.get("end_utc"),
+        "windows": kept,
+        "latency": [
+            {key: row[key] for key in ("t", "op", "ms", "ok", "error") if key in row}
+            for row in rows
+            if row.get("k") == "lat"
+        ],
+        "load": [
+            {"t": row["t"], "load1": row["load1"]}
+            for row in rows
+            if row.get("k") == "load"
+        ],
+        "errors": errors,
+        "skipped_ticks": header.get("skipped_ticks", {}),
+        "missed_ticks": {
+            "workload": [
+                {"t": row["t"], "lag_ms": row["lag_ms"]}
+                for row in rows
+                if row.get("k") == "missed" and row.get("loop") == "workload"
+            ]
+        },
+        "cut_short": cut_short,
+    }
+
+
+def evidence_rows(trace: dict, verdict: dict) -> list[list[str]]:
+    """One row per gated metric, per noise floor, per window and the
+    verdict: what a docs/evidence table or a Linear comment carries."""
+
+    def cell(value) -> str:
+        if value is None:
+            return "-"
+        if isinstance(value, float):
+            return f"{value:.4f}"
+        return str(value)
+
+    gate = verdict["gate"]
+    if not verdict["evidence"]:
+        label = "not-evidence"
+    elif trace["config"].get("alongside"):
+        label = verdict["evidence_label"]
+    else:
+        label = "evidence"
+    out = [["kind", "name", "value", "lower", "upper", "budget", "decision", "label"]]
+    out.append(
+        [
+            "verdict",
+            "S2",
+            verdict["status"],
+            "-",
+            "-",
+            "-",
+            "; ".join(verdict["reasons"]) or "-",
+            label,
+        ]
+    )
+    for metric in METRICS:
+        low, high = verdict["delta_p95_bounds"][metric]
+        decision = verdict["gates"]["step"] if metric == STEP else "each-op"
+        out.append(
+            [
+                "delta_p95",
+                metric,
+                cell(verdict["delta_p95_by_metric"][metric]),
+                cell(low),
+                cell(high),
+                cell(gate["budget_p95"]),
+                cell(decision),
+                label,
+            ]
+        )
+    low, high = verdict["delta_load1_bounds"]
+    out.append(
+        [
+            "delta_load1",
+            "load1",
+            cell(verdict["delta_load1"]),
+            cell(low),
+            cell(high),
+            cell(gate["budget_load1"]),
+            cell(verdict["gates"]["load1"]),
+            label,
+        ]
+    )
+    out.append(
+        [
+            "noise",
+            "p95",
+            cell(verdict["noise_p95"]),
+            "-",
+            "-",
+            cell(gate["budget_p95"] / 2),
+            "-",
+            label,
+        ]
+    )
+    out.append(
+        [
+            "noise",
+            "load1",
+            cell(verdict["noise_load1"]),
+            "-",
+            "-",
+            cell(gate["budget_load1"] / 2),
+            "-",
+            label,
+        ]
+    )
+    dropped = verdict.get("dropped_on")
+    if dropped is not None:
+        # OI-1003-Q160 review: passes dropped as short ON windows.
+        out.append(
+            [
+                "dropped",
+                "on_windows",
+                cell(dropped["windows"]),
+                "-",
+                "-",
+                "-",
+                f"pass seconds {dropped['pass_seconds']:.0f}",
+                label,
+            ]
+        )
+    baseline = verdict.get("live_baseline")
+    if baseline is not None:
+        recovery = baseline.get("recovery") or {"d_p95": {}, "d_load1": None}
+        out.append(
+            [
+                "recovery",
+                "off_first_half_over_second",
+                cell(recovery["d_load1"]),
+                "-",
+                "-",
+                cell(gate["budget_load1"] / 2),
+                f"d_p95 step {cell(recovery['d_p95'].get(STEP))}",
+                label,
+            ]
+        )
+        # OI-1003-Q160: the live baseline's spread and every adjacent pair.
+        out.append(
+            [
+                "baseline",
+                "off_load1_spread",
+                cell(baseline["off_load1_spread"]),
+                cell(baseline["off_load1_min"]),
+                cell(baseline["off_load1_max"]),
+                cell(gate["budget_load1"] / 2),
+                "-",
+                label,
+            ]
+        )
+        for pair in baseline["pairs"]:
+            out.append(
+                [
+                    "pair",
+                    f"{pair['on']}:ON vs {pair['off_before']},{pair['off_after']}:OFF",
+                    cell(pair["d_load1"]),
+                    cell(pair["baseline_load1"]),
+                    cell(pair["drift_load1"]),
+                    cell(gate["budget_load1"]),
+                    f"d_p95 step {cell(pair['d_p95'][STEP])}",
+                    label,
+                ]
+            )
+    for raw, stats in zip(trace["windows"], verdict["windows"], strict=True):
+        out.append(
+            [
+                "window",
+                f"{raw['index']}:{raw['state']}:{raw['start']:.0f}-{raw['end']:.0f}s",
+                cell(stats["p95_ms"][STEP]),
+                cell(stats["load1_level"]),
+                "-",
+                "-",
+                f"power {raw.get('power_start')}/{raw.get('power_end')}",
+                label,
+            ]
+        )
+    return out
+
+
+def command_alongside(args: argparse.Namespace) -> int:
+    directory = args.observation.resolve()
+    try:
+        header, rows = read_observation(directory)
+        intervals_text = args.intervals.read_text()
+    except (OSError, ValueError) as exc:
+        say(f"refused reason={f'{type(exc).__name__}: {exc}'!r}")
+        return 2
+    gate = {
+        key: getattr(args, key)
+        if getattr(args, key, None) is not None
+        else DEFAULT_GATE[key]
+        for key in DEFAULT_GATE
+    }
+    trace = alongside_trace(
+        header,
+        rows,
+        intervals_text,
+        str(args.intervals),
+        args.min_window_seconds,
+        bool(args.evidence),
+        gate,
+    )
+    verdict = analyze(trace)
+    trace["verdict"] = verdict
+    out_dir = (args.out or directory / "alongside").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "trace.json").write_text(json.dumps(trace, indent=1) + "\n")
+    (out_dir / "summary.md").write_text(render_summary(trace, verdict))
+    (out_dir / "evidence.tsv").write_text(
+        "\n".join("\t".join(row) for row in evidence_rows(trace, verdict)) + "\n"
+    )
+    emit(verdict)
+    say(
+        f"alongside windows={len(trace['windows'])} "
+        f"dropped={len(trace['config']['dropped_windows'])} "
+        f"dropped_passes={verdict['dropped_on']['windows']} "
+        f"dropped_pass_seconds={verdict['dropped_on']['pass_seconds']} "
+        f"trace={out_dir / 'trace.json'} evidence={out_dir / 'evidence.tsv'}"
+    )
+    return 0
+
+
+def command_mark(args: argparse.Namespace) -> int:
+    """Append `on|off EPOCH [LABEL]` to the intervals file, fsynced."""
+    label = f" {args.label}" if args.label else ""
+    with args.file.open("a", encoding="utf-8") as handle:
+        handle.write(f"{args.state} {time.time():.3f}{label}\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    return 0
+
+
 def command_selftest(_args: argparse.Namespace) -> int:
     suite = unittest.defaultTestLoader.discover(
         str(HERE), pattern="test_s2_budget.py", top_level_dir=str(HERE)
@@ -1848,6 +3140,32 @@ def parser() -> argparse.ArgumentParser:
     again.add_argument("trace", type=Path)
     gate_arguments(again, defaults=False)
     again.set_defaults(handler=command_analyze)
+    observe = sub.add_parser(
+        "observe", help="sample alongside a real run, starting nothing (#165)"
+    )
+    observe.add_argument("--source", type=Path, required=True)
+    observe.add_argument("--out", type=Path, required=True)
+    observe.add_argument("--workdir", type=Path)
+    observe.add_argument("--keep-workdir", action="store_true")
+    observe.add_argument("--stop-file", type=Path)
+    observe.add_argument("--max-seconds", type=float, default=DEFAULT_OBSERVE_SECONDS)
+    observe.add_argument("--label", default="")
+    observe.set_defaults(handler=command_observe)
+    mark = sub.add_parser("mark", help="append a run-interval mark")
+    mark.add_argument("file", type=Path)
+    mark.add_argument("state", choices=("on", "off"))
+    mark.add_argument("--label", default="")
+    mark.set_defaults(handler=command_mark)
+    along = sub.add_parser(
+        "alongside", help="the verdict of an observation and the run's intervals"
+    )
+    along.add_argument("observation", type=Path)
+    along.add_argument("--intervals", type=Path, required=True)
+    along.add_argument("--out", type=Path)
+    along.add_argument("--min-window-seconds", type=float, default=EVIDENCE_MIN_WINDOW)
+    along.add_argument("--evidence", action="store_true")
+    gate_arguments(along, defaults=False)
+    along.set_defaults(handler=command_alongside)
     selftest = sub.add_parser("selftest", help="run test_s2_budget.py")
     selftest.set_defaults(handler=command_selftest)
     return top

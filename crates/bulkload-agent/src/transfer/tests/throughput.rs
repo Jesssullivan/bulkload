@@ -591,7 +591,13 @@ fn a_protocol_violation_with_jobs_in_flight_ends_the_session() {
             &corpus.base.join("destination"),
             &corpus.base.join("destination-state"),
         );
+        // The source may be blocked writing a data frame into a full
+        // socket. On Darwin a `shutdown` of this end leaves that write
+        // blocked; closing every descriptor of this end ends it (`EPIPE`),
+        // as `copy_with` does (S1 stack review, 2026-10-15, finding 3).
         let _ = receiver.shutdown(std::net::Shutdown::Both);
+        drop(output);
+        drop(receiver);
         let _ = producer.join().unwrap();
         outcome
     });

@@ -798,6 +798,161 @@ ruling, and it is not an S1 result.
   and its default are this change's; OI-1003-Q37 names the settings, not a
   flag.
 
+## Amendment 2026-10-15: estate convergence ruled, with three stated limits (OI-1003-Q144, Q149)
+
+- **Convergence is ruled (OI-1003-Q144).** A rerun of `estate-apply` may update
+  a checkout bulkload itself landed only when its ledger proves it unchanged
+  since landing, by content; any local change refuses
+  `GIT_DESTINATION_MODIFIED` and is never overwritten. Branches and tags
+  deleted at the source are kept and reported, remote-tracking refs follow the
+  source, configuration changes are report-only. The `EstateConverge` model
+  (`docs/formal/EstateConverge.tla`) passes against the code.
+- **Three known limits (OI-1003-Q149).** None loses or overwrites work.
+  1. A HEAD detached for a branch-name conflict re-attaches only at the next
+     changed capture, not on a no-op rerun.
+  2. A ref the operator changed and put back to the landed value re-converges
+     only at the next changed capture.
+  3. A concurrent `git switch` can race the HEAD locks: Git commits the index
+     before it takes `HEAD.lock`, so no lock closes the window.
+
+  Limits 1 and 2 follow from S3: an unchanged rerun reads 0 content bytes and
+  does not re-read the ledgers. Their model rows fail `ConvergesWhenQuiet` as
+  stated limits.
+- **Existing landings** (before this change) carry no ledger and are not
+  converged; `--adopt` is not built (OI-1003-Q145).
+
+## Amendment 2026-10-15 (later): S4 transfers, S5 HEAD and index drift, the S2 harness alongside a run (OI-1003-Q152)
+
+Proof-status lines, not new rulings (OI-1003-Q1, Q2, Q5, Q11, Q148, Q152,
+Q155). No SLO number changes.
+
+- **S4 covers a whole run (WP3 PR 4).** Every `copy` and `pull` session
+  records its outcome in its DEST_STATE (`transfer.closure.d`, one record
+  per transfer, so transfers sharing a DEST_STATE never replace each
+  other's rows; a session that ends refused keeps the earlier session's
+  refused rows; the S2 overlap checks run before the first record write),
+  and `closure-report --transfer DEST_STATE` joins it to the same report,
+  disposition ledger and gate as the planned estate items: a session row
+  (`applied` when it ended; `unaccounted` when it never ended, left no
+  record, or refused with a bare `IO`), one row per refused path, typed and
+  pending review like an estate refusal, and one `covered` row per live
+  SQLite sidecar a snapshot covers. An integrity failure
+  (`SQLITE_INTEGRITY_CHECK_FAILED`, or `SQLITE_BACKUP_FAILED` with primary
+  code 11 or 26) carries OI-1003-Q148's default `abandon`, which a review
+  overrides. The run's expected transfers are bound to its PLAN by a
+  transfer manifest (`transfer-expect`, `closure-report
+  --transfer-manifest`): a listed transfer with no record, or whose session
+  started before the manifest, is unaccounted, and no transfer row counts
+  twice. With the manifest, one report shows 0 unaccounted over estate
+  items and transfers, and a bare `IO` or `FRAME_CODEC` never counts.
+  Without it the report covers only the transfers named. This replaces
+  the 2026-10-06 amendment's "until then S4 is proven for estate items
+  only". Still outside: the offline provider verbs (`snapshot`, `compose`,
+  `compose-state`, `hydrate-state`, `apply-state-candidate`), which belong
+  to no run. Proof: P86 (`closure/transfer_tests.rs`), the CLI row in
+  `tests/space_closure_cli.rs`, report schema `bulkload.closure.v3`.
+- **S5: HEAD and index drift is custody (#38, OI-1003-Q11, under
+  OI-1003-Q152).** An agent committing, switching or staging inside a
+  captured checkout, or in a worktree nested in it, during a capture pass
+  no longer refuses `GIT_AUTHORITY_CHANGED`. The pass records `HeadMoved`,
+  `IndexRewritten` or `NestedWorktreeMoved` drift custody (also when the
+  move went away and back across the windows outside the export, nested
+  worktrees included); its key is poisoned, so it is never a reuse hit,
+  and the next quiet pass carries the move. A capture whose export the
+  move raced (in-band drift) is never laid down; a capture the move raced
+  only outside the export's window (key drift) is a coherent snapshot of
+  the state the export read and applies, and the closure counts it
+  applied, as it would a clean pass the source moved past a moment later.
+  So the run closes by converging deltas with no freeze. Still refusals: the exclude file, the stash reflog,
+  configuration, the shallow frontier, foreign nests and gitlinks, and the
+  omitted roots moving under a pass. Proof: P87 (capture raced by a commit
+  and a stage, then a switch; each recapture converges the landing to the
+  source), the three git_carry drift tests, the `r3_*` round trips (a
+  nested worktree's among them), and the EstateConverge rows
+  `MC_ec_capture_raced` (pass; it models both drift classes and checks
+  `NoDriftedLanding`), `MC_ec_reach_drift_carried` and
+  `MC_ec_reach_key_drift_landed` (reached), `MC_ec_neg_drift_key_reused`
+  (fails `ConvergesWhenQuiet`) and `MC_ec_neg_drift_applied` (fails
+  `NoDriftedLanding`).
+- **S2 budget alongside a real run (#165).** `s2_budget.py observe` samples
+  the reference workload and load1 on the source host for the length of a
+  real run and starts nothing; it reads the host's load (agents' and
+  bulkload's) without touching any agent process. `alongside` joins it with
+  the run's own intervals (`mark`, or `START END` lines) into OFF and ON
+  windows and gives `analyze`'s verdict and evidence rows. It runs on Darwin
+  (vm.loadavg, pmset). Each ON window starts one settle before its pass, so
+  a pass's first minute is measured; missed ticks stream to disk; an
+  observation with no recorded end, or whose wall and monotonic clocks
+  part by more than 2 s, is INCONCLUSIVE; evidence needs the kept windows
+  to alternate OFF/ON with at least two ON windows once same-state
+  neighbours merge.
+- **Open for the operator (not ruled here).** (1) Whether an alongside
+  observation counts as a gated S2 run: as built, `--evidence` labels it so
+  only with every kept window at least 300 s, at least five windows, the
+  pinned gate, AC power and an OFF baseline under R-N81's 2.5, with no
+  coordinator quiet (OI-1003-Q152 keeps neo live), so a busy neo stays not
+  evidence. (2) Whether HEAD and index drift should also cover the stash
+  reflog (`git stash` under a pass still refuses). Both are ruled in the
+  next amendment (OI-1003-Q160, Q161).
+
+## Amendment 2026-10-15 (ruled): S2 alongside a live baseline, the stash as drift custody (OI-1003-Q160, Q161)
+
+Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
+
+- **S2 alongside a live run is judged against the source's own live load
+  (OI-1003-Q160).** An observation alongside a real run (Q152; `s2_budget.py
+  alongside`) takes the OFF windows between passes as the baseline, with
+  **no absolute load1 cap**: R-N81's load1 < 2.5 is amended for alongside
+  observations only. Standalone gated S2 runs (`s2_budget.py run`) keep
+  R-N81 unchanged. The budget is unchanged: at most +25 % p95 latency and
+  +2.0 load1 relative to the OFF baseline. Evidence still needs AC power at
+  every window boundary, at least five alternating windows of at least
+  300 s, and recorded load1 in every window; it is labelled `alongside,
+  live baseline (OI-1003-Q160)`. A pathological baseline is guarded, not
+  capped: the verdict reports the OFF windows' load1 levels and spread
+  (still INCONCLUSIVE when the spread exceeds half the budget) and compares
+  each ON window with the OFF windows on both sides of it, interpolated in
+  time to the pass, which removes a linear drift whatever the windows'
+  lengths. Pairs are judged gate by gate: a pooled PASS stands only when
+  every pair passes both gates; a pooled FAIL stands when every pair fails
+  a gate that failed pooled (a pair also over the other gate adds a reason,
+  never a downgrade); otherwise the verdict is INCONCLUSIVE, keeping the
+  pooled reasons and naming each pair, its worst gated metric and its
+  baseline drift; a pass with no OFF window on one side is not judged. A
+  PASS also needs the OFF windows after passes free of a recovery tail
+  (pooled, their first settled half at most half the budget over their
+  second, on p95 and load1), since a pass's cost that outlasts it sits on
+  both sides of every pair. Evidence needs every pair compared on every
+  gated metric, `--min-window-seconds` pinned at 300, no pass dropped as a
+  short ON window (every pass is judged; a converge run's passes under
+  about 240 s cannot be alongside evidence, and dropped passes and their
+  seconds are reported), and no recorded pass ending within one settle plus
+  300 s before the observation began. The pair rule removes linear drift
+  only: host load correlated with the passes themselves (agents quiet
+  while bulkload runs) is not separable from bulkload's cost, and the
+  instrument never lists processes to separate it (R-N11, R-N104). Proof:
+  `AlongsideLiveBaselineTests` and `LiveBaselineReviewTests` in
+  `test_s2_budget.py`.
+- **A stash push, pop or drop during a capture pass is drift custody
+  (OI-1003-Q161),** as HEAD and index moves are (#38): the pass records a
+  `StashMoved` row named `refs/stash` (beside any `refs/stash` ref row; a
+  drop below the tip moves only the reflog, which only this row names);
+  the raced capture is never laid down (in-band marker, `CAPTURE_DRIFTED`)
+  or reused (its key is poisoned, a move away and back included), and the
+  next pass carries the new stash, which the apply converges in the
+  source's order. It no longer refuses `GIT_AUTHORITY_CHANGED`; the exclude
+  file, configuration, the shallow frontier, foreign nests and gitlinks and
+  the omitted roots still do. The stash path changes no protocol step: the
+  EstateConverge model's raced moves gain the stash (`stashrace`), with
+  rows `MC_ec_capture_raced_stash` (pass), `MC_ec_reach_stash_drift_carried`
+  (reached), `MC_ec_neg_stash_drift_key_reused` (fails
+  `ConvergesWhenQuiet`) and `MC_ec_neg_stash_drift_applied` (fails
+  `NoDriftedLanding`). Proof: P87's stash row (`p87_an_agent_stashing_...`:
+  push, pop and drop under passes, each converged), the git_carry rows
+  `stash_pushed_during_capture_is_drift_custody` and
+  `stash_dropped_during_capture_is_drift_custody`, and
+  `r3_stash_reflog_round_trip_across_unguarded_windows_is_drift_custody`.
+
 ## Amendment 2026-10-15: S2 forbids a clone of a source file (OI-1003-Q164, Q165, Q166)
 
 The clone-lever study (OI-1003-Q164,
@@ -873,7 +1028,17 @@ rule. No SLO number changes.
     copy bulkload's own private staged capture bundle into a receipt it has
     just created. Neither file is a source file, so S2 does not govern them.
     On a reflink file system the receipt may share extents with the staged
-    copy; that is the study's Q-d, not ruled here.
+    copy; that is the study's Q-d, answered by Q165 for these two: they may
+    stay.
+  - **A third destination-side copy arrived with estate converge
+    (OI-1003-Q144), after Q165.** `git_carry::converge::publish_index`
+    copies the landed checkout's `.git/index` (on the destination; the
+    operator's Git may have rewritten it since landing) to converge's
+    private merged index beside it, under the `index.lock` it holds. Its
+    input is never a source file, so S2 does not govern it, and P84 pins it
+    with that reason. Q165 named only the two receipt copies; whether Q-d's
+    answer extends to this one (the merged index may share extents with the
+    live index until Git rewrites it) is not ruled.
 - **(b) Rig corpus copies are read and write, verified unshared
   (OI-1003-Q165).** Every copy of the sealed corpus a sample reads is an
   explicit `read`/`write` copy. It is never `cp`, whose default is

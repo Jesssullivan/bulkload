@@ -118,7 +118,7 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
-/// `syncfs`, then `fsync` of `file` itself: the group seal of the batched
+/// `syncfs` through `through`, then `fsync` of `file`: the group seal of the batched
 /// protocol (S1, OI-1003-Q107), one call pair per device in place of a
 /// flush per file and per directory. The engine calls it only on the file
 /// systems `io::durable::syncfs_seals` allows; elsewhere `syncfs` can be
@@ -138,23 +138,28 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
 ///   while `ext4_sync_file` returns `EIO`.
 ///
 /// The `fsync` that follows covers both. Write-back errors are reported by
-/// `syncfs` (Linux 5.8, errseq) only against this descriptor's cursor, so an
-/// error another `syncfs` already reported is not reported again
-/// ([`wait_writeback`] checks each file's own); the file system's own
-/// `->sync_fs` failure is reported from 5.17 (5679897eb104, and for xfs
-/// 2d86293c7075).
+/// `syncfs` (Linux 5.8, errseq) only against the cursor of `through`, which
+/// the kernel sampled when `through` was opened, so an error another
+/// `syncfs` already reported is not reported again ([`wait_writeback`]
+/// checks each file's own), and one raised before `through` was opened is
+/// not reported at all. The caller opens `through` for the seal (S1 stack
+/// review, 2026-10-15, finding 1). The file system's own `->sync_fs`
+/// failure is returned directly, from 5.17 (5679897eb104, and for xfs
+/// 2d86293c7075), whatever the cursor.
 ///
-/// Traced as the `fsync` of `file`, then one `FsSync`, recorded only once
-/// both returned: the device seal is complete at the `FsSync`.
+/// `through` and `file` must be on one file system. Traced as the `fsync`
+/// of `file`, then one `FsSync` naming `file`, recorded only once both
+/// returned: the device seal is complete at the `FsSync`.
 ///
 /// # Errors
 /// Returns the first failure.
-pub fn sync_fs(file: impl AsFd) -> io::Result<()> {
+pub fn sync_fs(through: impl AsFd, file: impl AsFd) -> io::Result<()> {
     trace_serial!();
+    let through = through.as_fd();
     let fd = file.as_fd();
     // SAFETY: the descriptor is live for every call of the closure; `syncfs`
     // takes no pointers.
-    retry_eintr(|| unsafe { libc::syncfs(fd.as_raw_fd()) })?;
+    retry_eintr(|| unsafe { libc::syncfs(through.as_raw_fd()) })?;
     full_flush(fd)?;
     trace_event!(
         "syncfs",

@@ -77,9 +77,11 @@ state of the proof on `main` at `a80c63b`, in one paragraph each:
   FAIL, 0 of 3 B reps: native initial copy 856.7 ms against rclone 360.7 ms,
   1 % delta 140.5 against 107.7 ms (section 5.1). The profile and timers
   since (section 5.2) place the gap in fixed per-copy work, not in hashing
-  or file syncs. The S2 budget has never been measured. S4 does not yet
-  cover transfer and SQLite outcomes, and S5 still refuses HEAD and index
-  movement.
+  or file syncs. The S2 budget has never been measured. On `main`, S4 does
+  not yet cover transfer and SQLite outcomes, and S5 still refuses HEAD and
+  index movement; branch `feat/finish-line-20261015` (2026-10-15, not yet on `main`) closes both (transfer
+  rows in the closure report, HEAD and index drift as custody) and adds a
+  harness that measures the S2 budget alongside a real run.
 
 ## 1. Problem
 
@@ -604,10 +606,14 @@ since the first draft, which listed it as future work.
   close it. A refusal whose code has left the taxonomy fails closed
   (OI-1003-Q74, Q75).
 
-**What this does not cover yet.** Closure covers the estate ledger, which
-is Git items. Transfer and SQLite provider outcomes are not in the ledger;
-they join in WP3 PR 4. Until then S4 is proven for estate items only
-([`docs/slo.md`](../slo.md), "Amendment 2026-10-06: S4 proof status"). The
+**What this does not cover yet.** On `main`, closure covers the estate
+ledger, which is Git items; transfer outcomes are not in it, and S4 is
+proven for estate items only ([`docs/slo.md`](../slo.md), "Amendment
+2026-10-06: S4 proof status"). WP3 PR 4, on branch `feat/finish-line-20261015` (2026-10-15, not yet on `main`), joins every `copy` and `pull` session to the same report
+and gate (`closure-report --transfer`): a session row, a typed row per
+refused path with OI-1003-Q148's `abandon` default for an integrity
+failure, and a covered row per SQLite sidecar a snapshot covers (P86). The
+offline SQLite provider verbs, which belong to no run, stay outside. The
 charter's daily-work verdict on the destination (#40) is also still owed.
 
 ### 2.10 Drift custody (S5)
@@ -643,8 +649,14 @@ scenarios in `crates/bulkload-agent/tests/fault_harness.rs`).
 ([`docs/design.md`](../design.md), "Drift"):
 
 - HEAD and index movement inside a captured worktree refuse
-  `GIT_AUTHORITY_CHANGED`. OI-1003-Q11 rules them drift classes; issue #38
-  is open and no code implements it.
+  `GIT_AUTHORITY_CHANGED`. OI-1003-Q11 rules them drift classes; #38 is
+  implemented on branch `feat/finish-line-20261015` (2026-10-15, not yet on `main`): `HeadMoved`,
+  `IndexRewritten` and `NestedWorktreeMoved` drift custody, carried by the
+  next converging pass (P87; EstateConverge `MC_ec_capture_raced`).
+- A stash push, pop or drop under a pass refuses too. OI-1003-Q161 rules it
+  drift custody; branch `feat/q160-q161-20261015` (2026-10-15, not yet on
+  `main`) records `StashMoved` and carries the stash in the next pass (P87's
+  stash row; EstateConverge `MC_ec_capture_raced_stash`).
 - Configuration, the shallow frontier, nested worktree custody and the
   omitted rebuildable roots moving under a pass also refuse. No ruling makes
   them drift classes.
@@ -822,7 +834,13 @@ as root").
   convention for those four sites, not a tested property.
 - **The measured budget has never been run** (#165). The instrument is on
   `main` (`crates/bulkload-bench/scripts/s2_budget.py`, #168, OI-1003-Q34).
-  No gated run exists.
+  No gated run exists. Under OI-1003-Q152 (no freeze window) branch `feat/finish-line-20261015` (2026-10-15, not yet on `main`) adds
+  `observe` and `alongside`: the same workload and load1 sampler for the
+  length of a real run, starting nothing and touching no agent, joined
+  with the run's own intervals. OI-1003-Q160 rules such an observation
+  judged against the source's own live load (the OFF windows between
+  passes, no absolute load1 cap; each pass compared with the OFF windows on
+  both sides of it); branch `feat/q160-q161-20261015` implements it.
 - **The Q16 lock is not counted** (the table above).
 - P34's traced form (no mutating syscall and no lock event beneath the
   source root, over copies, carries and estimates) and P35's per-thread
@@ -1206,7 +1224,7 @@ property tier and every benchmark are outside both.
 | R25 | P74, I3, the power-loss proofs; `R25_NoDurableReread` | Gated on the code; holds in the model within its bounds. Strict reading holds within stated limits (section 3.1). |
 | Durability order | fault harness I1–I4, R-N88 checker, resume proofs; four model invariants | Gated. #161 is fixed. The real-copy proof is bounded. |
 | S4 | closure gate, disposition ledger; P72, P73; `ClosureAccounted` | Gated **for Git estate items only**. Transfer and SQLite outcomes are not in the ledger. 57 bare `IO` sites remain. |
-| S5 | drift custody tests | Ref, seat and object-store drift on `main`. HEAD and index still refuse (#38). |
+| S5 | drift custody tests | Ref, seat and object-store drift on `main`, where HEAD and index still refuse; HEAD and index drift custody on `feat/finish-line-20261015` (#38, P87). |
 
 ## 5. Results
 
@@ -1391,12 +1409,12 @@ history on disk and so motivated incremental Git carry
 | An S1 PASS | The FAIL of record stands. Next: a setup / stream / tail timeline, then fewer and cheaper commits per copy (section 5.2). PR #210 (`syncfs` group seal) is held for review (OI-1003-Q112). |
 | An S1 gate (b) sample | Waits on gate (a) (OI-1003-Q66). The multi-stream arm is not built. |
 | A re-run of the under-load sample with the fixed harness | Open in the [under-load note](../agent-notes/2026-10-04-r23-under-load.md). |
-| The S2 measured budget | Issue #165. Never run. |
+| The S2 measured budget | Issue #165. Never run; the alongside harness is on `feat/finish-line-20261015`. |
 | S3 on the estate corpus after #172, #177 and #182 | Not re-measured. |
 | A gated S3 rerun-ratio verdict | None recorded. |
 | Grouped chaining, P68 | PR #199, in review. |
 | The Git command registry, P76 | PR #197, in review; issue #188. |
-| Transfer and SQLite outcomes in the disposition ledger | WP3 PR 4, not started on `main`. |
+| Transfer and SQLite outcomes in the disposition ledger | WP3 PR 4 on `feat/finish-line-20261015` (P86), not on `main`. |
 | The daily-work verdict on the destination | Issue #40. |
 | The neo read-only estimate pass | Deferred ([probes](../evidence/2026-10-04-q42-probes.md), "Pending"). |
 
@@ -1616,10 +1634,10 @@ tested corpus is bounded and identical on every run (section 4.1).
 - Issues #181 and #183: a missing plan base refused as a bare `IO`, and two
   misattributed `GIT_INVENTORY_MALFORMED` refusals.
 
-**S5 drift is incomplete (#38).** HEAD moves and index rewrites inside a
-captured worktree still refuse the item, although OI-1003-Q11 rules them
-drift classes. An agent that commits while a pass reads its repository
-makes that item refuse. Configuration, shallow-frontier, nest and
+**S5 drift is incomplete on `main` (#38).** HEAD moves and index rewrites
+inside a captured worktree still refuse the item there, although
+OI-1003-Q11 rules them drift classes: an agent that commits while a pass
+reads its repository makes that item refuse. Branch `feat/finish-line-20261015` (2026-10-15, not yet on `main`) makes them drift custody (P87). Configuration, shallow-frontier, nest and
 directory-shape movement refuse too, with no ruling.
 
 **Restore cost is undercounted (#147).** `estate-apply`'s space preflight

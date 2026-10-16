@@ -950,7 +950,11 @@ fn sync_destination(destination: &Path) -> io::Result<Option<f64>> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::unnecessary_wraps, reason = "the signature matches Linux's")]
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "the signature matches Linux's"
+)]
 fn sync_destination(_destination: &Path) -> io::Result<Option<f64>> {
     Ok(None)
 }

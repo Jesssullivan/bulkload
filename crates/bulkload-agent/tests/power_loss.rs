@@ -99,7 +99,10 @@ struct Scratch {
 
 impl Scratch {
     fn new(tag: &str) -> Self {
-        let base = std::env::temp_dir().join(format!(
+        Self::new_in(&std::env::temp_dir(), tag)
+    }
+    fn new_in(parent: &Path, tag: &str) -> Self {
+        let base = parent.join(format!(
             "bulkload-power-loss-{tag}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -1840,9 +1843,13 @@ fn every_power_loss_state_of_a_small_strict_copy_is_explored() {
 
 /// **Every write precedes its file's seal** (OI-1003-Q143 item 3: `End`
 /// waits for every chunk job of its entry): the writes of `file`, published
-/// at `rel`, all come before the seal its output commit relies on, which is
-/// the last durable sync of the file itself (a kick is none) or the last
-/// device seal before that commit. Returns how many writes it checked.
+/// at `rel`, all come before the seal its data relies on when it is renamed
+/// in. That is the last durable sync ahead of the file's rename (ahead of
+/// its output commit, if it is never renamed) that is either the file's own
+/// (a kick is none) or a device seal (`FsSync`) of the file's own device.
+/// In a batched group it is the device seal before the renames, not the one
+/// after them (S1 stack review, 2026-10-15, finding 5). Returns how many
+/// writes it checked.
 fn writes_precede_seal(events: &[Event], file: NodeId, rel: &[u8]) -> Result<usize, String> {
     let commit = events
         .iter()
@@ -1851,22 +1858,27 @@ fn writes_precede_seal(events: &[Event], file: NodeId, rel: &[u8]) -> Result<usi
                 if records.iter().any(|record| matches!(record, CommitRecord::Output { rel_path } if rel_path == rel)))
         })
         .ok_or("the output never commits")?;
-    let seal = (0..commit)
+    let published = (0..commit)
+        .rev()
+        .find(|at| matches!(&events[*at], Event::Rename { node, .. } if *node == file))
+        .unwrap_or(commit);
+    let seal = (0..published)
         .rev()
         .find(|at| match &events[*at] {
-            Event::Sync { node, kind } => {
-                matches!(kind, SyncKind::FsSync)
-                    || (*node == file && !matches!(kind, SyncKind::Kick))
-            }
+            Event::Sync { node, kind } => match kind {
+                SyncKind::FsSync => node.dev == file.dev,
+                SyncKind::Kick => false,
+                _ => *node == file,
+            },
             _ => false,
         })
-        .ok_or("the file is never sealed before its commit")?;
+        .ok_or("the file is never sealed before it is published")?;
     let mut checked = 0;
     for (at, event) in events.iter().enumerate() {
         if matches!(event, Event::Write { node, .. } if *node == file) {
             if at > seal {
                 return Err(format!(
-                    "write at event {at} comes after the seal at event {seal} its commit at event {commit} relies on"
+                    "write at event {at} comes after the seal at event {seal} its publication at event {published} relies on"
                 ));
             }
             checked += 1;
@@ -1962,5 +1974,170 @@ fn every_power_loss_state_of_a_worker_written_copy_is_consistent() {
     assert!(
         found.iter().any(|message| message.contains("large")),
         "a write after the file's commit passes the power-loss check: {found:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The batched group seal on a real trace (S1 stack review, 2026-10-15)
+// ---------------------------------------------------------------------------
+
+/// Whether `event` is a device seal (`FsSync`) of device `dev`.
+#[cfg(target_os = "linux")]
+const fn fs_sync_of(event: &Event, dev: u64) -> bool {
+    matches!(event, Event::Sync { node, kind: SyncKind::FsSync } if node.dev == dev)
+}
+
+/// S1 stack review (2026-10-15), findings 4 and 5: a small group-mode copy
+/// whose files share one batched group, explored exhaustively (no bounded
+/// crash point): `a` and `b` in the root and `p/c` one directory level
+/// down. The destination is on tmpfs (`/dev/shm`), on the `syncfs`
+/// allowlist, so the trace must hold the group's two device seals (one
+/// before its renames, one after); a silent fall back to the per-file
+/// seals fails here rather than passing as the per-file proof.
+///
+/// Teeth, on the real trace:
+///
+/// - the device seal ahead of the renames dropped: a file of the group
+///   other than the one the seal's `fsync` names is renamed in with its
+///   data not yet durable, and a power-loss state holds wrong bytes under
+///   its final name;
+/// - one write of that file moved to just after that seal (still before
+///   its rename), and every device seal moved to another device: each fails
+///   the write-order check.
+#[cfg(target_os = "linux")]
+#[test]
+#[allow(clippy::too_many_lines)] // One trace, its proof and its three mutations.
+fn every_power_loss_state_of_a_small_batched_copy_is_explored() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    assert!(
+        bulkload_agent::durable::batched(2),
+        "this kernel is below the syncfs floor: the batched path cannot be proven here"
+    );
+    let shm = Path::new("/dev/shm");
+    let parent = if shm.is_dir() {
+        shm.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    let scratch = Scratch::new_in(&parent, "batched-small");
+    fs::create_dir(scratch.source().join("p")).unwrap();
+    let files: [(&str, u64, usize); 3] = [("a", 31, 300), ("b", 37, 500), ("p/c", 41, 400)];
+    for (path, seed, length) in files {
+        fs::write(scratch.source().join(path), noise(seed, length)).unwrap();
+    }
+    fs::set_permissions(
+        scratch.source().join("p"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    let want = expected(&scratch.source());
+    let (image, events) = traced_copy(&scratch);
+    let device = node(&scratch.destination()).dev;
+    let seals: Vec<usize> = (0..events.len())
+        .filter(|at| fs_sync_of(&events[*at], device))
+        .collect();
+    assert!(
+        seals.len() >= 2,
+        "the group was sealed device-wide before and after its renames: {} device seals on {}",
+        seals.len(),
+        scratch.destination().display()
+    );
+    let exhaustive = |events: &[Event]| {
+        check_view(
+            &image,
+            events,
+            &Options {
+                ignore_foreign: true,
+                accept_bounded: false,
+                exhaustive_limit: 16,
+                ..Options::default()
+            },
+            |view, info| invariant(&want, events, view, info),
+        )
+        .unwrap()
+    };
+    let report = exhaustive(&events);
+    eprintln!("{}", report.summary(&events));
+    assert!(report.bounded.is_empty(), "{}", report.summary(&events));
+    assert!(report.passed(), "{}", report.summary(&events));
+    let nodes: Vec<(&str, NodeId)> = files
+        .iter()
+        .map(|(path, ..)| (*path, node(&scratch.destination().join(path))))
+        .collect();
+    for (path, file) in &nodes {
+        writes_precede_seal(&events, *file, path.as_bytes()).unwrap();
+    }
+    // The file the first device seal covers through no `fsync` of its own:
+    // written before that seal and renamed in after it.
+    let first = seals[0];
+    let Event::Sync {
+        node: member,
+        kind: SyncKind::Fsync,
+    } = &events[first - 1]
+    else {
+        panic!(
+            "the device seal's own fsync precedes it: {:?}",
+            events[first - 1]
+        );
+    };
+    let (path, other) = nodes
+        .iter()
+        .copied()
+        .find(|(_, file)| {
+            file != member
+                && events[..first]
+                    .iter()
+                    .any(|event| matches!(event, Event::Write { node, .. } if node == file))
+                && events[first..]
+                    .iter()
+                    .any(|event| matches!(event, Event::Rename { node, .. } if node == file))
+        })
+        .expect("a second file of the batched group");
+    // Teeth: the seal ahead of the renames dropped.
+    let mut unsealed = events.clone();
+    unsealed.remove(first);
+    let found: Vec<String> = exhaustive(&unsealed)
+        .violations
+        .iter()
+        .map(|violation| violation.message.clone())
+        .collect();
+    assert!(
+        found
+            .iter()
+            .any(|message| message.contains(&format!(" {path} "))),
+        "the device seal ahead of the renames dropped: {found:?}"
+    );
+    // Teeth: a write after the seal its data relies on, before its rename.
+    let last = events
+        .iter()
+        .rposition(|event| matches!(event, Event::Write { node, .. } if *node == other))
+        .unwrap();
+    let late = moved(&events, last, first + 1);
+    assert!(
+        writes_precede_seal(&late, other, path.as_bytes()).is_err(),
+        "a write after the device seal ahead of its rename passes the ordering check"
+    );
+    // Teeth: device seals of another device seal nothing of this file.
+    let elsewhere: Vec<Event> = events
+        .iter()
+        .map(|event| match event {
+            Event::Sync {
+                node,
+                kind: SyncKind::FsSync,
+            } => Event::Sync {
+                node: NodeId {
+                    dev: node.dev ^ 1,
+                    ino: node.ino,
+                },
+                kind: SyncKind::FsSync,
+            },
+            other => other.clone(),
+        })
+        .collect();
+    assert!(
+        writes_precede_seal(&elsewhere, other, path.as_bytes()).is_err(),
+        "a device seal of another device passes the ordering check"
     );
 }

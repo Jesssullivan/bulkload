@@ -2320,7 +2320,7 @@ impl TouchedDevices {
                 crate::io::durable::seal_dir(directory).refuse_at("materialize::seal")?;
             }
             for handle in self.devices.values() {
-                crate::io::durable::seal_device(handle).refuse_at("materialize::seal")?;
+                crate::io::durable::seal_device(handle, handle).refuse_at("materialize::seal")?;
             }
             return Ok(self.devices.len());
         }
@@ -2508,7 +2508,8 @@ impl PublishSink {
 
 /// The first step of a [`crate::io::durable::batched`] group: one
 /// [`crate::io::durable::seal_device`] per device number the group's files
-/// live on (`syncfs`, then `fsync` of one member file there), which makes
+/// live on (`syncfs` through a descriptor of the member's parent opened for
+/// the seal, then `fsync` of that member file), which makes
 /// every temporary's data durable under its temporary name (and every
 /// adopted output's), before any rename or exchange. The `fsync` matters
 /// most for a group of adopted outputs only on xfs: nothing is renamed, and
@@ -2516,7 +2517,8 @@ impl PublishSink {
 ///
 /// `syncfs` reports a write-back error only against the cursor of the
 /// descriptor it is called on, so an error an earlier `syncfs` (another
-/// group's, or another process's) already consumed is not reported here.
+/// group's, or another process's) already consumed, or one raised before
+/// the seal opened its descriptor, is not reported here.
 /// Each file's own write-back error is therefore checked next
 /// ([`crate::io::durable::check_writeback`]; no extra cache flush), as its
 /// per-file `fsync` would have: one failure refuses the whole group, before
@@ -2526,19 +2528,20 @@ impl PublishSink {
 /// so publication renames it, or `prepare_supersede` records and exchanges
 /// it, without a flush of its own.
 fn seal_group_data(items: &mut [Publication]) -> Result<()> {
-    let mut devices: std::collections::HashMap<u64, &File> = std::collections::HashMap::new();
+    let mut devices: std::collections::HashMap<u64, (&File, &File)> =
+        std::collections::HashMap::new();
     for item in items.iter() {
-        let file: &File = match item {
+        let (file, parent): (&File, &File) = match item {
             Publication::Staged { staged, .. } | Publication::Superseding { staged, .. } => {
-                &staged.file
+                (&staged.file, &staged.parent)
             }
-            Publication::Adopted { file, .. } => file,
+            Publication::Adopted { file, parent, .. } => (file, parent),
         };
         let device = file.metadata().refuse_at("materialize::seal")?.dev();
-        devices.entry(device).or_insert(file);
+        devices.entry(device).or_insert((file, parent));
     }
-    for handle in devices.values() {
-        crate::io::durable::seal_device(handle).refuse_at("materialize::seal")?;
+    for (handle, parent) in devices.values() {
+        crate::io::durable::seal_device(handle, parent).refuse_at("materialize::seal")?;
     }
     for item in items.iter() {
         let file: &File = match item {
@@ -3096,6 +3099,71 @@ mod tests {
         );
         assert_eq!(listed, 0, "nothing renamed in, every temporary removed");
         assert_eq!(recorded, 0, "no record commits");
+        Ok(())
+    }
+
+    /// S1 stack review (2026-10-15), finding 1: one write-back error on the
+    /// file system refuses the group that holds the failed file, and no
+    /// later group. `syncfs` reports the superblock's error against the
+    /// cursor of the descriptor it runs on, sampled when that descriptor was
+    /// opened; a staged temporary opened before the error would report it
+    /// again for every later group (each group's first member is another
+    /// descriptor). The device seal therefore runs `syncfs` on a descriptor
+    /// it opens itself. Here two groups are staged first; the error
+    /// (modelled by `superblock_error`) is on group 1's `a`, whose own
+    /// write-back check refuses group 1, and group 2 commits whole.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_back_error_refuses_its_own_group_and_no_later_one() -> Result<()> {
+        let at = "materialize::tests::a_write_back_error_refuses_its_own_group_and_no_later_one";
+        assert!(
+            crate::io::durable::batched(2),
+            "this kernel is below the syncfs floor: the batched path cannot be tested here"
+        );
+        let (base, mut publications) = staged_group("superblock-error", &["a", "b", "c", "d"])?;
+        let later = publications.split_off(2);
+        let Some(Publication::Staged { staged, .. }) = publications.first() else {
+            return Err(BulkloadRefusal::RequiredFieldMissing);
+        };
+        let metadata = staged.file().metadata().refuse_at(at)?;
+        let failed = (metadata.dev(), metadata.ino());
+        let mut sink = PublishSink::new(
+            Store::open(&base.join("state"))?.into_publisher(PublisherSide::Destination)?,
+        )?;
+        let before = crate::io::durable::device_seals();
+        crate::io::durable::force_fs_magic(Some(crate::io::durable::TMPFS_MAGIC));
+        crate::io::durable::superblock_error(Some(failed.0));
+        crate::io::durable::fail_writeback_of(Some(failed));
+        sink.commit(publications);
+        crate::io::durable::fail_writeback_of(None);
+        sink.commit(later);
+        crate::io::durable::superblock_error(None);
+        crate::io::durable::force_fs_magic(None);
+        let seals = crate::io::durable::device_seals() - before;
+        let report = sink.finish();
+        let mut listed: Vec<_> = std::fs::read_dir(base.join("destination"))
+            .refuse_at(at)?
+            .map(|entry| entry.map(|entry| entry.file_name()))
+            .collect::<std::io::Result<_>>()
+            .refuse_at(at)?;
+        listed.sort();
+        let recorded = Store::open(&base.join("state"))?.conn_count("outputs")?;
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(
+            report,
+            [
+                (b"a".to_vec(), Err(BulkloadRefusal::Io(Some(libc::EIO)))),
+                (b"b".to_vec(), Err(BulkloadRefusal::Io(Some(libc::EIO)))),
+                (b"c".to_vec(), Ok(())),
+                (b"d".to_vec(), Ok(())),
+            ]
+        );
+        assert_eq!(listed, ["c", "d"], "only group 2 is renamed in");
+        assert_eq!(recorded, 2, "group 2's records commit");
+        assert_eq!(
+            seals, 3,
+            "group 1 stops at its data seal; group 2 seals twice"
+        );
         Ok(())
     }
 

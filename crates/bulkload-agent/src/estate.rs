@@ -1,7 +1,10 @@
 //! Explicit reviewed Git batches. Capture reuse still performs a metadata census.
 //!
 //! Ref custody and usable restored workspaces are separate outcomes. Completed
-//! restores are never replayed over subsequent operator edits.
+//! restores are never replayed over subsequent operator edits: a re-apply of
+//! a changed capture converges a landed checkout only when its ledger proves
+//! nobody changed it, and refuses `GIT_DESTINATION_MODIFIED` otherwise
+//! (`git_carry::converge`, estate converge 2026-10-08).
 
 use crate::counters::CountedSync as _;
 use crate::refuse::RefuseAt as _;
@@ -282,6 +285,9 @@ struct Completion {
     reuse_unavailable: Option<&'static str>,
     /// Receipt lines, one per nest, already naming any carrying item.
     nested: Vec<String>,
+    /// An apply's ref and seat custody counts (estate converge), as
+    /// `key=value` words carried in the receipt's reason.
+    custody: Option<String>,
 }
 
 impl Completion {
@@ -292,6 +298,7 @@ impl Completion {
             bytes_read: 0,
             reuse_unavailable: None,
             nested: Vec::new(),
+            custody: None,
         }
     }
 
@@ -564,8 +571,9 @@ fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     )
 }
 
-// [`write`] of a record already encoded.
-fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+// [`write`] of a record already encoded. Also the transfer closure
+// record's writer (`transfer_outcome::write`, WP3 PR 4).
+pub(crate) fn write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     // All callers hold a plan or phase lock. Retain interrupted publications
     // rather than overwrite their bytes or make them a permanent resume blocker.
     let mut generation = 0u64;
@@ -1455,6 +1463,7 @@ fn decide_capture(
 }
 
 #[allow(clippy::too_many_arguments)] // Pass-wide state is caller-owned.
+#[allow(clippy::too_many_lines)]
 fn capture_item(
     item: &Item,
     state: &Path,
@@ -1607,6 +1616,7 @@ fn capture_item(
             .or(export.reuse_unavailable)
             .map(git_carry::ReuseUnavailable::code),
         nested,
+        custody: None,
     })
 }
 
@@ -1832,6 +1842,7 @@ fn execute(
                     let counts: Vec<String> = [
                         (!done.drift.is_empty()).then(|| format!("drift={}", done.drift.len())),
                         (!done.nested.is_empty()).then(|| format!("nested={}", done.nested.len())),
+                        done.custody.clone(),
                     ]
                     .into_iter()
                     .flatten()
@@ -2127,21 +2138,23 @@ fn import_base(
     corpus: &Path,
     source: &str,
     imported: &ImportedBases,
-) -> Result<()> {
+) -> Result<Option<git_carry::StagedBundle>> {
     if !git_carry::shared::requires_base(bundle)? {
-        return Ok(());
+        return Ok(None);
     }
     // A delta whose `.base` sidecar is gone names no base to import.
     let base = bound(corpus, &captured.bundle)?.ok_or(BulkloadRefusal::SealedObjectMissing)?;
-    // Existing shared repositories are the supported optimization. Creating a
-    // standalone destination needs a separate private preseed implementation.
+    // Estate converge: a standalone item takes its plan base where its
+    // capture lands, in its private stage at a first landing or before a
+    // converge's import, so one plan lands a main and its linked worktrees.
     if item
         .workspace
         .as_ref()
         .is_some_and(|workspace| workspace == &item.repository)
     {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
+        return stage_base(corpus, &base).map(Some);
     }
+    // A linked or refs-only item imports into its existing repository.
     // S4 (#183): a destination repository that is missing, or a directory
     // that holds none, is named as such, never as an occupied one.
     git_carry::destination_repository(&item.repository)?;
@@ -2151,7 +2164,7 @@ fn import_base(
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
         .contains(&key)
     {
-        return Ok(());
+        return Ok(None);
     }
     let staged = stage_base(corpus, &base)?;
     git_carry::import_staged(&item.repository, &staged, source)?;
@@ -2159,7 +2172,7 @@ fn import_base(
         .lock()
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
         .insert(key);
-    Ok(())
+    Ok(None)
 }
 
 fn apply_item(
@@ -2195,14 +2208,30 @@ fn apply_item(
     // uncaptured seats) is deferred (bulkload#48); carry v2, the W6 engine it
     // was deferred to, is deleted (OI-1003-Q44, OI-1003-Q56).
     let journal = journal_path(state, &identity, source, &captured.digest);
+    // A3 (estate converge): this item's own converge a crash interrupted is
+    // settled before its journal is trusted. A ref intent another item of
+    // the repository left is settled here without proving or restaging this
+    // item (review 2 finding 7). Metadata only: no-op reruns stay no-ops.
     if journal.try_exists().refuse_at("estate::apply_item")? {
-        let done: String = read(&journal)?;
-        let outcome = match done.as_str() {
-            "workspace-restored" => "previous-workspace-restoration-not-revalidated",
-            "refs-imported" => "previous-ref-custody-not-workspace-parity",
-            _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
-        };
-        return Ok(Completion::clean(outcome).naming(nested));
+        let pending =
+            git_carry::converge::pending(item.workspace.as_deref(), &item.repository, source)?;
+        if !pending.workspace {
+            let done: String = read(&journal)?;
+            let outcome = match done.as_str() {
+                "workspace-restored" => "previous-workspace-restoration-not-revalidated",
+                "refs-imported" => "previous-ref-custody-not-workspace-parity",
+                _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
+            };
+            let mut done = Completion::clean(outcome).naming(nested);
+            if pending.refs {
+                done.custody = git_carry::converge::settle_refs(
+                    item.workspace.as_deref(),
+                    &item.repository,
+                    source,
+                )?;
+            }
+            return Ok(done);
+        }
     }
     // After the journal (round-4 P2): a re-apply of a done item stages and
     // copies nothing. Otherwise one private stage next to the corpus is the
@@ -2230,29 +2259,73 @@ fn apply_item(
     // (R-N72): a chain under a plan base binds every base and every link by
     // name and digest, and the flatten imports every bound base before the
     // oldest link.
-    let staged = if prior_sidecar(corpus, &captured.bundle)
+    let (staged, base) = if prior_sidecar(corpus, &captured.bundle)
         .try_exists()
         .refuse_at("estate::apply_item")?
     {
         let chain = chain_links(corpus, &captured.bundle, LinkBinding::Digest)?;
-        git_carry::chain::flatten(staged, &chain.bases, &chain.links)?
+        (
+            git_carry::chain::flatten(staged, &chain.bases, &chain.links)?,
+            None,
+        )
     } else {
-        import_base(item, &captured, staged.path(), corpus, source, imported)?;
-        staged
+        let base = import_base(item, &captured, staged.path(), corpus, source, imported)?;
+        (staged, base)
     };
-    let outcome = if let Some(workspace) = &item.workspace {
-        if item.repository == *workspace {
-            git_carry::restore_staged(&staged, workspace, source, None)?;
-        } else {
-            git_carry::restore_linked_staged(&staged, &item.repository, workspace, source)?;
-        }
-        "workspace-restored"
+    // Estate converge: a first landing restores native refs and records
+    // ledgers; a landed checkout whose capture changed converges when its
+    // ledger proves it unchanged (`git_carry::converge`).
+    let landing = git_carry::converge::Landing {
+        item: &identity,
+        observed_ns: retained_parts(corpus, &captured.bundle)?.map_or(0, |parts| parts.started_ns),
+        capture: captured.digest,
+    };
+    let target = git_carry::converge::Target {
+        repository: &item.repository,
+        workspace: item.workspace.as_deref(),
+        source,
+        base: base.as_ref(),
+    };
+    let (outcome, applied) = if item.workspace.is_some() {
+        let landed_before = landed_before(state, &identity, source, &journal)?;
+        (
+            "workspace-restored",
+            git_carry::converge::apply_workspace(&staged, &target, &landing, landed_before)?,
+        )
     } else {
-        git_carry::import_staged(&item.repository, &staged, source)?;
-        "refs-imported"
+        (
+            "refs-imported",
+            git_carry::converge::apply_refs(&staged, &target, &landing)?,
+        )
     };
     write(&journal, &outcome.to_owned())?;
-    Ok(Completion::clean(outcome).naming(nested))
+    let mut done = Completion::clean(outcome).naming(nested);
+    done.custody = applied
+        .custody
+        .map(|words| {
+            if applied.converged {
+                format!("converged {words}")
+            } else {
+                words
+            }
+        })
+        .or_else(|| applied.converged.then(|| "converged".to_owned()));
+    Ok(done)
+}
+
+// Finding 13: whether STATE holds a journal of this item for a capture
+// other than the current one, so a destination now absent was removed.
+fn landed_before(state: &Path, identity: &str, source: &str, current: &Path) -> Result<bool> {
+    let prefix = format!("{identity}-{}-", blake3::hash(source.as_bytes()).to_hex());
+    for entry in fs::read_dir(state).refuse_at("estate::landed_before")? {
+        let entry = entry.refuse_at("estate::landed_before")?;
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && name.ends_with(".done") && entry.path() != current {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// The outcome `git-repair-missing-index` records into a state dir (#95).
@@ -2669,14 +2742,14 @@ pub fn apply(
     let mut groups = std::collections::BTreeMap::new();
     let imported = ImportedBases::default();
     for item in &contents.items {
-        // A standalone restore's repository is its own workspace: if it is
-        // already there, that is a collision the restore refuses by type
-        // (R-N114), not Git administration to serialise on.
-        let standalone = item.workspace.as_ref() == Some(&item.repository);
-        // S4 (#183): a destination Git cannot read as a repository (an empty
-        // directory, an unfinished `git init`) keys by its path, and its item
+        // Estate converge: one key per repository, standalone or not, so a
+        // main and its linked worktrees never hold two mutexes for one
+        // repository. A repository not there yet keys by its path, which is
+        // also what its linked items key by until it lands. S4 (#183): a
+        // destination Git cannot read as a repository (an empty directory,
+        // an unfinished `git init`) keys by its path too, and its item
         // refuses on its own; it never aborts the verb before any item runs.
-        let common = if !standalone && item.repository.try_exists().refuse_at("estate::apply")? {
+        let common = if item.repository.try_exists().refuse_at("estate::apply")? {
             git_carry::common_repository(&item.repository)
                 .unwrap_or_else(|_| item.repository.clone())
         } else {
@@ -2726,6 +2799,11 @@ pub fn apply(
         };
         levels.entry(depth).or_default().items.push(item.clone());
     }
+    // Estate converge: an item whose repository is another planned item's
+    // standalone workspace runs after that item's level, so mains land (and
+    // converge) before their linked worktrees and refs-only items, with no
+    // Plan A/B split.
+    let levels = after_mains(levels)?;
     let mut outcome = Ok(());
     for level in levels.values() {
         if let Err(error) = execute(level, jobs, &operation, &|row| {
@@ -2735,6 +2813,38 @@ pub fn apply(
         }
     }
     outcome
+}
+
+// Move every item whose repository is a planned standalone workspace to a
+// level after that workspace's own.
+fn after_mains(
+    levels: std::collections::BTreeMap<usize, Plan>,
+) -> Result<std::collections::BTreeMap<usize, Plan>> {
+    let mut mains = Vec::new();
+    for (depth, plan) in &levels {
+        for item in &plan.items {
+            if item.workspace.as_ref() == Some(&item.repository) {
+                mains.push((target_key(&item.repository)?, *depth));
+            }
+        }
+    }
+    let mut placed = std::collections::BTreeMap::<usize, Plan>::new();
+    for (depth, plan) in levels {
+        for item in plan.items {
+            let mut at = depth;
+            if item.workspace.as_ref() != Some(&item.repository) {
+                let key = target_key(&item.repository)?;
+                for (main, main_depth) in &mains {
+                    let (this, that) = comparable(&key, main);
+                    if this == that {
+                        at = at.max(main_depth + 1);
+                    }
+                }
+            }
+            placed.entry(at).or_default().items.push(item);
+        }
+    }
+    Ok(placed)
 }
 
 /// Corpus custody as the fault harness reads it after a crash (P70).
@@ -2801,6 +2911,10 @@ pub mod custody_probe {
 // S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
 #[cfg(test)]
 mod s4_sweep_tests;
+
+// P87 (#38, S5 under OI-1003-Q152): HEAD and index drift is custody.
+#[cfg(test)]
+mod drift_custody_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
@@ -4143,7 +4257,12 @@ mod tests {
     // R-N72 round-3 N1: Git authority A->B->A across the two windows no export
     // comparison brackets (pre-pass key -> export snapshot, export end ->
     // post-pass key). The pre- and post-pass keys are equal. The capture must
-    // refuse, and must never leave a whole-capture Hit on a bundle carrying B.
+    // never leave a whole-capture Hit on a bundle carrying B. The exclude
+    // file and the configuration refuse. HEAD (detached or symbolic) and the
+    // index are drift custody since #38 (S5 under OI-1003-Q152): the bundle
+    // carries B, which the source held at the export's snapshot, the moves
+    // are named, the key is poisoned, and the next pass carries A.
+    #[allow(clippy::too_many_lines)]
     fn r3_authority_round_trip(class: &str) {
         use git_carry::mid_pass::Stage;
         let (root, source, _, plan, corpus) = drifting_plan(&format!("r3-auth-{class}"));
@@ -4185,6 +4304,37 @@ mod tests {
                     Box::new(move || fs::write(&p2, b"# A\n").unwrap()),
                 )
             }
+            // Review finding 4 (#38): an agent switching a nested worktree
+            // away and back across the two unguarded windows. The export's
+            // census holds the switched HEAD, both keys the original one.
+            "nested-worktree" => {
+                let nested = inside.join(".claude/worktrees/agent-x");
+                fs::create_dir_all(inside.join(".claude/worktrees")).unwrap();
+                r3_git_out(
+                    &inside,
+                    &[
+                        "worktree",
+                        "add",
+                        "-q",
+                        "-b",
+                        "agent-x",
+                        nested.to_str().unwrap(),
+                    ],
+                );
+                // agent-y: another commit of the same tree, so the switch
+                // moves the nested HEAD (its custody) and no seat.
+                #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax.
+                let tree = rev_parse(&inside, "HEAD^{tree}");
+                let y = r3_git_out(&inside, &["commit-tree", &tree, "-p", &a, "-m", "y"])
+                    .trim()
+                    .to_owned();
+                git(&inside, &["branch", "agent-y", &y]);
+                let n2 = nested.clone();
+                (
+                    Box::new(move || git(&nested, &["switch", "-q", "agent-y"])),
+                    Box::new(move || git(&n2, &["switch", "-q", "agent-x"])),
+                )
+            }
             "config" => {
                 let path = inside.join(".git/config");
                 let original = fs::read(&path).unwrap();
@@ -4210,7 +4360,19 @@ mod tests {
         settle();
         git_carry::mid_pass::arm_at(&source, Stage::Snapshot, to_b);
         git_carry::mid_pass::arm_at(&source, Stage::AfterPass, to_a);
-        let first = attempt(&plan, &state, &corpus);
+        // Every receipt of the first capture, with its drift rows.
+        let rows = Mutex::new(Vec::new());
+        let _ = capture(&plan, &state, &corpus, 2, &|row| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone(), row.drift.clone()));
+            Ok(())
+        });
+        let drifted = rows.into_inner().unwrap();
+        let first: Vec<(&str, Option<String>)> = drifted
+            .iter()
+            .map(|(outcome, reason, _)| (*outcome, reason.clone()))
+            .collect();
         settle();
         let second = attempt(&plan, &state, &corpus);
         let hit = second.first().unwrap().0 == "capture-reused-after-census";
@@ -4224,27 +4386,57 @@ mod tests {
                 "exclude" => r3_git_out(&scratch, &["show", "refs/b/exclude:value"]) == "# A\n",
                 "config" => !r3_git_out(&scratch, &["show", "refs/b/configuration-v1:value"])
                     .contains("never at a key"),
+                // The bundle's nested custody names agent-y: never a Hit.
+                "nested-worktree" => false,
                 #[allow(clippy::literal_string_with_formatting_args)] // Git revision syntax.
                 _ => r3_git_out(&scratch, &["ls-tree", "refs/b/staged^{tree}"])
                     .contains("100644 blob"),
             };
             assert!(carried, "{class}: a whole-capture Hit on a stale bundle");
         }
-        assert_eq!(
-            first,
-            vec![("refused", Some("GIT_AUTHORITY_CHANGED".to_owned()))],
-            "{class}: authority moved inside the capture window"
-        );
+        match class {
+            "detached-head" | "symbolic-head" | "index" | "nested-worktree" => {
+                let name = match class {
+                    "index" => "IndexRewritten \"index\"",
+                    "nested-worktree" => "NestedWorktreeMoved \".claude/worktrees/agent-x\"",
+                    _ => "HeadMoved \"HEAD\"",
+                };
+                assert_eq!(first.len(), 1, "{class}: {first:?}");
+                assert_eq!(
+                    first.first().unwrap().0,
+                    "captured-with-drift",
+                    "{class}: {first:?}"
+                );
+                assert!(
+                    drifted.first().unwrap().2.contains(&name.to_owned()),
+                    "{class}: {drifted:?}"
+                );
+                assert!(!hit, "{class}: a drifted capture is never a Hit");
+                // The next pass carries A, the source's state again.
+                assert!(
+                    matches!(
+                        second.first().unwrap().0,
+                        "captured" | "capture-extended-from-drift"
+                    ),
+                    "{class}: {second:?}"
+                );
+            }
+            _ => assert_eq!(
+                first,
+                vec![("refused", Some("GIT_AUTHORITY_CHANGED".to_owned()))],
+                "{class}: authority moved inside the capture window"
+            ),
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn r3_detached_head_round_trip_across_unguarded_windows_refuses() {
+    fn r3_detached_head_round_trip_across_unguarded_windows_is_drift_custody() {
         r3_authority_round_trip("detached-head");
     }
 
     #[test]
-    fn r3_symbolic_head_round_trip_across_unguarded_windows_refuses() {
+    fn r3_symbolic_head_round_trip_across_unguarded_windows_is_drift_custody() {
         r3_authority_round_trip("symbolic-head");
     }
 
@@ -4259,14 +4451,24 @@ mod tests {
     }
 
     #[test]
-    fn r3_index_round_trip_across_unguarded_windows_refuses() {
+    fn r3_nested_worktree_round_trip_across_unguarded_windows_is_drift_custody() {
+        r3_authority_round_trip("nested-worktree");
+    }
+
+    #[test]
+    fn r3_index_round_trip_across_unguarded_windows_is_drift_custody() {
         r3_authority_round_trip("index");
     }
 
     // N1, stash: refs/stash keeps its value throughout; only the reflog below
-    // it is rewritten and restored, so stash S1 is missing from the bundle.
+    // it is rewritten and restored, so the export's snapshot (B) lacks stash
+    // S1 while both keys (A) hold it. Since OI-1003-Q161 the stash is drift
+    // custody like HEAD and the index: the move is named (`StashMoved`), the
+    // key is poisoned, so the stale bundle is never a whole-capture Hit, and
+    // the next pass carries A, S1 included. Before Q161 it refused
+    // GIT_AUTHORITY_CHANGED.
     #[test]
-    fn r3_stash_reflog_round_trip_across_unguarded_windows_refuses() {
+    fn r3_stash_reflog_round_trip_across_unguarded_windows_is_drift_custody() {
         use git_carry::mid_pass::Stage;
         let (root, source, _, plan, corpus) = drifting_plan("r3-stash");
         let state = root.join("state");
@@ -4288,25 +4490,45 @@ mod tests {
             git(&i2, &["stash", "store", "-m", "one", &s1c]);
             git(&i2, &["stash", "store", "-m", "two", &s2c]);
         });
-        let first = attempt(&plan, &state, &corpus);
+        let rows = Mutex::new(Vec::new());
+        let _ = capture(&plan, &state, &corpus, 2, &|row| {
+            rows.lock()
+                .unwrap()
+                .push((row.outcome, row.reason.clone(), row.drift.clone()));
+            Ok(())
+        });
+        let first = rows.into_inner().unwrap();
         assert_eq!(
             r3_git_out(&source, &["reflog", "show", "--format=%H", "refs/stash"]),
             format!("{s2}\n{s1}\n"),
             "the source is back at A"
         );
+        assert_eq!(first.len(), 1, "{first:?}");
+        let (outcome, _, drift) = first.first().unwrap();
+        assert_eq!(*outcome, "captured-with-drift", "{first:?}");
+        assert!(
+            drift.contains(&"StashMoved \"refs/stash\"".to_owned()),
+            "{first:?}"
+        );
+        // The drifted capture's bundle is B: it lost S1.
+        assert!(!recorded_heads(&plan, &corpus, &source).contains(&format!("stashes/{s1}")));
         settle();
         let second = attempt(&plan, &state, &corpus);
-        let heads = recorded_heads(&plan, &corpus, &source);
-        assert!(
-            second.first().unwrap().0 != "capture-reused-after-census"
-                || heads.contains(&format!("stashes/{s1}")),
+        assert_ne!(
+            second.first().unwrap().0,
+            "capture-reused-after-census",
             "a whole-capture Hit on a bundle that lost stash S1"
         );
-        assert_eq!(
-            first,
-            vec![("refused", Some("GIT_AUTHORITY_CHANGED".to_owned()))]
+        assert!(
+            matches!(
+                second.first().unwrap().0,
+                "captured" | "capture-extended-from-drift"
+            ),
+            "{second:?}"
         );
-        assert!(heads.contains(&format!("stashes/{s1}")));
+        let heads = recorded_heads(&plan, &corpus, &source);
+        assert!(heads.contains(&format!("stashes/{s1}")), "{heads}");
+        assert!(heads.contains(&format!("stashes/{s2}")), "{heads}");
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -38,15 +38,17 @@ and design disagreements](#code-and-design-disagreements)).
 | File | What it is |
 |---|---|
 | [`BulkloadTransfer.tla`](BulkloadTransfer.tla) | The specification. Its header states the scope, the abstractions and the code map. Every action cites the function it models. |
-| [`catalogue/Catalogue.dhall`](catalogue/Catalogue.dhall) | The typed catalogue: every config's constants and expectation, every mutation's verdict, and every property's traceability row. `just tla-render` renders every `MC_*.cfg`, `configs.tsv`, `configs_gc.tsv`, `configs_sq.tsv` and `configs_dir.tsv` from it (GitCarry's part is [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall), SqliteCarry's [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall), DirectoryRecords' [`catalogue/Directories.dhall`](catalogue/Directories.dhall)). Edit the catalogue, never the outputs. It replaced `gen_cfgs.py` (OI-1003-Q32). |
+| [`catalogue/Catalogue.dhall`](catalogue/Catalogue.dhall) | The typed catalogue: every config's constants and expectation, every mutation's verdict, and every property's traceability row. `just tla-render` renders every `MC_*.cfg`, `configs.tsv`, `configs_gc.tsv`, `configs_sq.tsv`, `configs_ec.tsv` and `configs_dir.tsv` from it (GitCarry's part is [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall), SqliteCarry's [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall), EstateConverge's [`catalogue/EstateConverge.dhall`](catalogue/EstateConverge.dhall), DirectoryRecords' [`catalogue/Directories.dhall`](catalogue/Directories.dhall)). Edit the catalogue, never the outputs. It replaced `gen_cfgs.py` (OI-1003-Q32). |
 | [`catalogue/Types.dhall`](catalogue/Types.dhall) | The catalogue's types. Union labels are the TLA+ names themselves. |
 | `MC_*.cfg` | TLC configurations, rendered from the catalogue. |
 | [`configs.tsv`](configs.tsv) | The run order. Columns: `name`, `expect`, `named-property` (the one property a fail or reach row must violate), `never` (a pass row's exact never-enabled actions), `flags` (extra TLC arguments, one argv element per word). |
 | [`GitCarry.tla`](GitCarry.tla) | The git carry custody module (OI-1003-Q43): chain links, the plan base, depth, Q46's re-root and GC, crash order and restore-or-recapture ([GitCarry](#gitcarry-chain-and-base-custody-oi-1003-q43-oi-1003-q46)). |
 | [`configs_gc.tsv`](configs_gc.tsv), `MC_gc_*.cfg` | GitCarry.tla's run order and configs, in the same format, rendered from [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall). |
-| [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by both modules. |
 | [`SqliteCarry.tla`](SqliteCarry.tla) | The SQLite snapshot seat module (#218): the stepped backup, the settled key, sidecars, root and owner refusals, and OI-1003-Q146's superseding publish of a changed store's snapshot ([SqliteCarry](#sqlitecarry-the-sqlite-snapshot-seat-218-oi-1003-q146)). |
 | [`configs_sq.tsv`](configs_sq.tsv), `MC_sq_*.cfg` | SqliteCarry.tla's run order and configs, rendered from [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall). |
+| [`EstateConverge.tla`](EstateConverge.tla) | The estate convergence module (OI-1003-Q144): destination custody of a re-apply that brings a checkout bulkload landed to a newer capture ([EstateConverge](#estateconverge-destination-custody-of-estate-convergence-oi-1003-q144)). |
+| [`configs_ec.tsv`](configs_ec.tsv), `MC_ec_*.cfg` | EstateConverge.tla's run order and configs, rendered from [`catalogue/EstateConverge.dhall`](catalogue/EstateConverge.dhall). |
+| [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by every module. |
 | [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | The reference decision core `decide`, its pinned rows ([`decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv)), and an explorer of GitCarry.tla. |
 | [`DirectoryRecords.tla`](DirectoryRecords.tla) | Directory records (R-N102, R-N119) and their batching (OI-1003-Q143 item 2), under per-name power loss and reused inode numbers ([Directory records](#directory-records-r-n102-oi-1003-q143)). |
 | [`configs_dir.tsv`](configs_dir.tsv), `MC_dir_*.cfg` | DirectoryRecords.tla's run order and configs, rendered from [`catalogue/Directories.dhall`](catalogue/Directories.dhall). |
@@ -56,9 +58,10 @@ and design disagreements](#code-and-design-disagreements)).
 ```sh
 just tla-render             # re-render configs*.tsv and MC_*.cfg from the catalogue
 just tla-render --check     # fail unless the committed files are the catalogue's rendering
-just tla-check              # every row of configs.tsv, configs_gc.tsv, configs_sq.tsv, configs_dir.tsv
+just tla-check              # every row of configs.tsv, configs_gc.tsv, configs_sq.tsv, configs_ec.tsv, configs_dir.tsv
 just tla-check MC_nv_core   # that module's budget self-test, then the named configs
 just tla-check MC_gc_core   # the same for GitCarry.tla
+just tla-check MC_ec_refs   # the same for EstateConverge.tla
 just formal-nv              # the Haskell cross-checks of both modules (Hybrid roles)
 ```
 
@@ -2402,6 +2405,580 @@ never enabled in any of them.
   (`StepBudget` steps), which `S2_BackupLockBounded` bounds.
 - The Haskell explorer does not cover this module.
 
+## EstateConverge: destination custody of estate convergence (OI-1003-Q144)
+
+[`EstateConverge.tla`](EstateConverge.tla) models the estate convergence
+built on `feat/estate-converge-20261008` (design: that branch's
+`docs/agent-notes/2026-10-08-estate-converge-design.md`, sections 2 to 11
+as amended by its review sections 16 to 19). GitCarry models CORPUS
+custody; this module models the destination. Ruling OI-1003-Q144 (Linear
+TIN-4543, 2026-10-09) holds the convergence's merge on it:
+
+- a checkout bulkload itself landed may be updated only when it is
+  unchanged locally since landing, by content, not stat;
+- otherwise the item refuses with a typed code;
+- local branches and tags deleted at the source are kept and reported;
+- remote-tracking refs follow the source;
+- configuration changes are report-only.
+
+The module's header states its scope, its abstractions and its code map;
+every action names the function it models. The model now sits on the
+convergence branch with the code it models (2026-10-09), so the catalogue
+grounds every symbol it cites as a Rust definition there (`prove`,
+`publish_index`, `set_head`, `finish`, `HeadLocks`, `recover_linked_landing`,
+...); none is pending.
+
+### What it models
+
+- One repository: the main checkout (standalone, seats `d` and `d/f`, an
+  index and HEAD) and optionally a linked worktree (HEAD only), sharing one
+  ref ledger, with refs of every class (`main`, `dev`, `foo` and `foo/bar`,
+  remote-tracking `o/x` and `o/x/y`, a tag `t`) and a stash.
+- The source over time: commits and moves, creates, deletes, renames
+  (`foo -> foo/bar` and back, `o/x -> o/x/y`), HEAD switches, worktree
+  remove and add, stash push and drop, seat edits, additions and removals,
+  directory to file and file to directory, staged changes.
+- Captures, and applies: estate-apply's rows A3 to A12, the ownership
+  proof, the workspace intent, the native ref step and its ref intent
+  (plan, compare-and-swap transactions with deletes first, the stash
+  table), the seat engine (exchange and displaced check, settling by
+  content), the index compare-and-swap, HEAD and its branch, the ledgers,
+  the journal, and the settle of a pending intent.
+- Crashes at every step boundary; a power loss that undoes Git renames no
+  directory sync made durable (the variable `dur`); with `ChildCrash`, a
+  crash inside a Git ref transaction (a partial commit and Git's lock
+  files left) or inside a stash store (`refs/stash.lock` left).
+- Operator edits: seat contents, the landed directory removed or replaced
+  by a file, untracked additions, touches, racy writes, `git add`, refs
+  (a checked-out branch's `update-ref -d` too), the stash, HEAD (a switch,
+  an orphan switch to an unborn branch, a rebase or bisect that detaches
+  HEAD and holds its branch), and restoring a landed value; between
+  applies or (`OpConcurrent`) while one is in flight (a restore only
+  between applies).
+- `probe_exchange`'s probe files (a pre-intent write with its own crash
+  point, `ProbeExchange`).
+- Review 4 (2026-10-09, later): a killed Git child as an `INTERRUPTED`
+  refusal in a pass that goes on (or a host crash); empty locks that no
+  content proves bulkload's (`E:<ref>`, `E:packed`, `E:stash`) and
+  `packed-refs.new` (`N:packed`), an operator's live writer holding one or
+  the operator removing a stale one (kind `lock`, ghost `opLock`); the
+  linked worktree's own content as one component `wtw` (kind `wtwork`),
+  which a crashed first landing's recovery checks; and `git switch` in
+  any worktree.
+
+Review 3 (2026-10-09, fourteen findings against this model and the code)
+changed the module in two ways. Where the reviewers named the rule the code
+must follow, the model holds that rule and the code's behaviour before the
+fix is a mutation (CODE BEFORE THE FIX in the catalogue) whose `MC_ec_neg_`
+row fails. The convergence lane then fixed the code (2026-10-09, the agent
+notes of that date): every review 3 rule is the code's, and every earlier
+finding row whose defect the code fixed became a pass row, with the code
+before its fix a new mutation whose `MC_ec_neg_` row fails the finding's
+property. Two finding rows stay, as documented limits (Findings,
+below).
+
+### Properties
+
+| Property | Claim |
+|---|---|
+| `NoLocalWorkLost` | An operator edit is never overwritten or removed: every value the operator wrote that is not a landed value is still where they put it (or at its seat's temporary name, displaced and kept); a branch under a rebase or bisect keeps its value. Restoring a landed value is no edit (Q144: content). While the item's own pass runs, the landed value is the one bulkload holds at that point (old before its write, new after: review 3 finding 14), and an operator write equal to what bulkload then lands stops being an edit. |
+| `NoSourceWorkLost` | Every capture ever imported keeps its provenance instance (every ref tip and stash it carried), and a local branch or tag bulkload set is never deleted by bulkload (Q144: kept and reported). |
+| `TypedRefusal` | Every refusal is a typed code whose cause is real: `MODIFIED` only over an operator edit of the item's checkout or HEAD branch; `INTERRUPTED` only over an operator edit, made since the item's run began or its pending intent was written and still live, of a component the failing step writes, or a Git lock left on one (an edit elsewhere, an edit put back, an edit older than the run, or a crash with no lock left does not justify it: review 3 finding 6); never a code that names no converge cause (`UNTYPED`: `GIT_CHILD_FAILED`, `PATH_ESCAPES_ROOT`, an Io refusal); and no custody word blames the destination for a change nobody made there. |
+| `NoReRead` | R25: an item whose journal names its current capture, with no workspace intent of its own pending, reads no content (no stage, no proof). |
+| `CrashAtomicity` | Per item and per component, old or new: under a pending intent every seat, the index, HEAD and the branch HEAD moves to are the intent's old or new value (or absent between a type change's removal and addition), and every ref op of a pending ref intent is old or new; with no intent pending, every component is the ledger's; no worktree exists without its ledger between applies; no probe file is left outside the pass that made it, except until the next apply after a crash. |
+| `OneCheckout` | Review 4 (the blocker): no branch is checked out (or held by a rebase or bisect) by two worktrees, Git's own invariant: a commit in either would move the branch under the other's index and files. |
+| `NoDriftedLanding` | #38 (2026-10-15, review finding 11): no capture whose export a source move raced (in-band drift, `CAPTURE_DRIFTED`) is ever laid down: never the capture an apply in flight works from, never a journaled capture, never the landing's ledger. A key-drift capture (the move outside the export's window) is a coherent snapshot and may land. |
+| `ConvergesWhenQuiet` | Liveness (`LiveSpec`: fair captures, strong fairness per item's apply): once the source and the operator stop with no operator edit left and no lock that only its owner or the operator may remove, every item reaches the source, the ruled exceptions aside (a kept local branch or tag, a ref whose name conflicts with a kept one, HEAD detached for that reason). |
+| `NoWedge` | Liveness: no item refuses forever unless an operator edit of its own checkout or HEAD branch stays, or a lock no content proves bulkload's (an empty one: a live writer's, or a killed delete's until the operator removes it as Git instructs; review 4's stated exception). |
+
+### Mutations
+
+| Mutation | Fails | What it breaks |
+|---|---|---|
+| `proof_stat_only` | `NoLocalWorkLost` | prove trusts an unchanged print of a racy seat (design 4.2) |
+| `proof_stat_strict` | `TypedRefusal` | any print change refuses (Q144 rules content, not stat) |
+| `overwrite_modified` | `NoLocalWorkLost` | converge proceeds when the proof fails |
+| `no_intent` | `CrashAtomicity` | no workspace intent before the first write |
+| `exchange_unchecked` | `NoLocalWorkLost` | no print check before the exchange, no displaced check after (finding 10) |
+| `index_no_cas` | `NoLocalWorkLost` | the index is renamed over without its compare-and-swap (finding 3) |
+| `stash_clear_blind` | `NoLocalWorkLost` | `stash clear` instead of a compare-and-swap delete (finding 4) |
+| `name_conflict_unchecked` | `NoWedge` | no create kept back beside a kept ref: the `foo -> foo/bar` blocker (review 2 finding 3) |
+| `single_ref_txn` | `NoWedge` | deletes and creates in one transaction (`o/x -> o/x/y`, review 2 finding 3) |
+| `head_branch_in_step` | `TypedRefusal` | the ref step moves the branch HEAD switches to and set_head keeps its line (review 2 finding 1): an unjustified `GIT_CONVERGE_INTERRUPTED` (it failed `NoWedge` until the settle's re-plan, finding 19, removed the wedge) |
+| `no_checkout_guard` | `TypedRefusal` | a ref step moves another worktree's checked-out branch (finding 1) |
+| `converge_before_ref_settle` | `TypedRefusal` | a pending ref intent is not settled first |
+| `dir_replace_unchecked` | `TypedRefusal` | no `holds_unlanded` check: a directory turned into a file refuses only after writes (review 2 findings 2, 4) |
+| `prune_local` | `NoSourceWorkLost` | a local branch deleted at the source is deleted (Q144) |
+| `drop_provenance` | `NoSourceWorkLost` | a converge drops the replaced instance's provenance (Q5) |
+| `noop_restages` | `NoReRead` | a journaled item is staged and proved again |
+| `sibling_intent_reproves` | `NoReRead` | another item's ref intent re-proves a finished item (review 2 finding 7) |
+| `finish_after_all_deletes` | `NoWedge` | CODE BEFORE THE FIX (review 3 finding 1): `finish` removed every delete's name from the names after the step, run or not, so `create o/x/y` beside a kept `o/x` was retried forever |
+| `rebase_unguarded` | `NoLocalWorkLost` | CODE BEFORE THE FIX (finding 2): the skip set missed a branch under a rebase or bisect |
+| `ledger_reads_index` | `NoLocalWorkLost` | CODE BEFORE THE FIX (finding 3): `next_ledger` re-read the index after publishing it |
+| `unborn_head_untyped` | `TypedRefusal` | CODE BEFORE THE FIX (finding 4): `head_of` failed on an unborn HEAD (`GIT_CHILD_FAILED`) |
+| `seat_parent_untyped` | `TypedRefusal` | CODE BEFORE THE FIX (finding 5): `Engine::run` passed `Seat::at`'s error on after the intent |
+| `refs_unsynced` | `TypedRefusal` | CODE BEFORE THE FIX (finding 7): no directory sync after `update-ref` before the ledgers |
+| `probe_left` | `CrashAtomicity` | CODE BEFORE THE FIX (finding 9): a crashed pass's probe files were never removed |
+| `settle_moves_checked_out` | `NoLocalWorkLost` | CODE BEFORE THE FIX (finding 10, the blocker): `finish` redid an op on a branch checked out since the crash |
+| `txn_no_symref_verify` | `NoLocalWorkLost` | CODE BEFORE THE FIX (finding 10): nothing held any worktree's HEAD across the ref transaction (now Git's own `HEAD.lock` of every worktree: `update-ref` refuses another worktree's HEAD, so `symref-verify` can name only its own) |
+| `txn_no_cas` | `NoLocalWorkLost` | `transact`'s lines carry no old value (finding 11; the code is right) |
+| `head_no_cas` | `NoLocalWorkLost` | `set_head`'s lines carry no old value (finding 11; the code is right) |
+| `settle_remove_dir` | `NoWedge` | CODE BEFORE THE FIX (earlier finding 1): a settle's `Remove` of a file the source turned into a directory refused when the new directory was already there |
+| `step_moves_intent_branch` | `CrashAtomicity` | CODE BEFORE THE FIX (earlier finding 2; by simulation): a ref step skipped only checked-out branches, so it moved the branch another item's pending intent moves with HEAD |
+| `settle_replays_branch` | `TypedRefusal` | CODE BEFORE THE FIX (finding 19): a settle replayed the intent's HEAD branch line, a `create foo/bar` beside a put-back `foo` included |
+| `stale_lock_kept` | `NoWedge` | CODE BEFORE THE FIX (earlier finding 3): nothing removed a lock a killed Git child left; with `MC_ec_neg_stale_stash_lock` (`TypedRefusal`, review 3 finding 8): a killed stash store's `refs/stash.lock` cleared the stash row |
+| `set_head_one_txn` | `CrashAtomicity` | CODE BEFORE THE FIX (review 3 finding 13): HEAD and its branch in one transaction, which a killed child could leave with HEAD committed alone |
+| `stash_settle_any_suffix` | `NoLocalWorkLost` | CODE BEFORE THE FIX (earlier finding 4): a settle continued the stash from any suffix of the new order, undoing an operator's drop |
+| `old_head_branch_skipped` | `ConvergesWhenQuiet` | CODE BEFORE THE FIX (earlier finding 5): no ref step after `set_head`, so the branch HEAD left stayed behind |
+| `no_landing_intent` | `NoWedge` | CODE BEFORE THE FIX (earlier finding 7, #216's residual): no landing intent, so a crashed linked first landing refused `GIT_DESTINATION_OCCUPIED` for good |
+| `head_not_recorded` | `NoLocalWorkLost` | CODE BEFORE THE FIX (found by the model while re-checking the fixes, `MC_ec_head_concurrent_crash`'s bound): nothing recorded HEAD at its new value after `set_head`, so after a crash a settle moved HEAD off the branch the operator had switched back to while the pass still ran |
+| `head_attach_unchecked` | `OneCheckout` | CODE BEFORE THE FIX (review 4, the blocker): `set_head` attached HEAD to a branch with no check of the other worktrees, and the settle replayed it once the branch line was done |
+| `intent_head_lock_kept` | `TypedRefusal` | CODE BEFORE THE FIX (review 4): a killed `set_head`'s `HEAD.lock` was removed only by that item's own workspace settle, so another item's ref transaction (which holds every HEAD) refused on it, and the ref settle that runs first never reached that workspace settle |
+| `empty_lock_removed` | `NoLocalWorkLost` | CODE BEFORE THE FIX (review 4): the settle removed an empty lock of its intent's deletes, and `packed-refs.lock`, when older than a timestamp tick, taking a live writer's lock from it |
+| `packed_new_kept` | `NoWedge` | CODE BEFORE THE FIX (review 4): a `packed-refs.new` a killed delete left was never removed, so every rerun's delete failed on it once the stale lock was gone |
+| `stash_reflog_unsynced` | `TypedRefusal` | CODE BEFORE THE FIX (review 4): `update-ref` appends the stash reflog and never syncs it; a power loss left it behind the records naming it |
+| `recovery_overwrites` | `NoLocalWorkLost` | CODE BEFORE THE FIX (review 4): a crashed first linked landing's recovery checked HEAD only and laid its index and seats over the operator's work |
+| `drift_key_reused` | `ConvergesWhenQuiet` | #38 (2026-10-15): a capture a source move raced records the key its pass computed, not a poisoned one, so when the source comes back to the raced snapshot's state the next pass is a reuse hit on a capture no apply lays down |
+| `drift_applied` | `NoDriftedLanding` | #38 review finding 11: `Begin` is enabled on a capture its export saw drift (the in-band marker not read), so an apply lays down a capture that does not hold what moved under it |
+
+### Results (EstateConverge)
+
+`just tla-check` on every `MC_ec_` row against the model of the code after
+review 4's fixes, 2026-10-09 (spec sha256 `809734fa...9e18`), TLC from the
+flake's pinned nixpkgs, `-workers 3`, nice 10, in two concurrent
+invocations (34 pass and simulate rows; 50 reach, finding and negative
+rows; each after its budget self-test) on a shared host at load average
+70 to 110 on 32 cores (wall times are that host's, not TLC's). All 85 rows
+matched their expectation: 33 pass (10 of them under `LiveSpec` with both
+temporal properties), 1 seeded simulation clean (`MC_ec_settle_stale_branch`,
+`-simulate num=20000 -depth 40 -seed 20261009`; its distinct column counts
+states checked; a BFS of its bound passed 2 million states at depth 16
+and does not fit the budget), 3 reach, 2 documented-limit finding rows and
+the unfair negative failing `ConvergesWhenQuiet`, 43 primary mutation rows
+and one `also` row failing their named property, the budget self-test
+inconclusive. Total wall 5,360 s and 3,689 s; peak RSS 2,641 MiB.
+`MC_ec_neg_step_moves_intent_branch` runs `-simulate num=200000 -depth 40
+-seed 20261009` (seeded since review 4) and stops at its first violation.
+`just tla-render --check`: all 185 files equal the catalogue. Grounding:
+78 operators, 15 constants, 43 mutations, 3 label sets, 53 code symbols,
+every one a Rust definition on this branch; none pending.
+
+| Config | Expect | Outcome | Violated | Distinct | Depth | Wall |
+|---|---|---|---|---|---|---|
+| `MC_ec_budget_selftest` | inconclusive | INCONCLUSIVE | WithinBudget | ? | - | 65s |
+| `MC_ec_refs` | pass | PASS | - | 54141 | 48 | 110s |
+| `MC_ec_refs_op` | pass | PASS | - | 300997 | 55 | 301s |
+| `MC_ec_seats` | pass | PASS | - | 64478 | 51 | 155s |
+| `MC_ec_stash` | pass | PASS | - | 7685 | 51 | 87s |
+| `MC_ec_linked` | pass | PASS | - | 267480 | 72 | 154s |
+| `MC_ec_concurrent` | pass | PASS | - | 330 | 22 | 45s |
+| `MC_ec_racy` | pass | PASS | - | 422 | 35 | 96s |
+| `MC_ec_first` | pass | PASS | - | 1445 | 42 | 72s |
+| `MC_ec_live` | pass | PASS | - | 87492 | 49 | 583s |
+| `MC_ec_live_linked` | pass | PASS | - | 223978 | 72 | 1382s |
+| `MC_ec_refs_rename_op` | pass | PASS | - | 699 | 29 | 76s |
+| `MC_ec_rebase` | pass | PASS | - | 11841 | 41 | 97s |
+| `MC_ec_index_concurrent` | pass | PASS | - | 292 | 30 | 57s |
+| `MC_ec_head_op` | pass | PASS | - | 5551 | 35 | 50s |
+| `MC_ec_seat_parent` | pass | PASS | - | 3003 | 34 | 78s |
+| `MC_ec_head_concurrent` | pass | PASS | - | 12252 | 45 | 93s |
+| `MC_ec_head_concurrent_crash` | pass | PASS | - | 81421 | 49 | 130s |
+| `MC_ec_refs_concurrent` | pass | PASS | - | 977 | 26 | 50s |
+| `MC_ec_child_crash` | pass | PASS | - | 22641 | 48 | 106s |
+| `MC_ec_live_ops` | pass | PASS | - | 6044 | 35 | 69s |
+| `MC_ec_file_to_dir_settle` | pass | PASS | - | 1442 | 45 | 56s |
+| `MC_ec_settle_stale_branch` | simulate | SIMULATION | - | 2400001 | - | 426s |
+| `MC_ec_settle_branch_conflict` | pass | PASS | - | 75817 | 44 | 117s |
+| `MC_ec_child_crash_live` | pass | PASS | - | 190 | 28 | 74s |
+| `MC_ec_stash_lock` | pass | PASS | - | 129 | 29 | 61s |
+| `MC_ec_set_head_partial` | pass | PASS | - | 5532 | 48 | 78s |
+| `MC_ec_stash_settle_revert` | pass | PASS | - | 2246 | 51 | 39s |
+| `MC_ec_old_head_branch` | pass | PASS | - | 703 | 41 | 74s |
+| `MC_ec_first_linked_crash` | pass | PASS | - | 41 | 12 | 48s |
+| `MC_ec_one_checkout` | pass | PASS | - | 110 | 22 | 27s |
+| `MC_ec_one_checkout_crash` | pass | PASS | - | 1061046 | 74 | 245s |
+| `MC_ec_child_crash_linked` | pass | PASS | - | 562192 | 72 | 150s |
+| `MC_ec_empty_lock` | pass | PASS | - | 837 | 30 | 66s |
+| `MC_ec_first_linked_crash_op` | pass | PASS | - | 55 | 14 | 28s |
+| `MC_ec_reach_converged` | reach | REACHED | Witness_Converged | 11923 | 16 | 66s |
+| `MC_ec_reach_settled` | reach | REACHED | Witness_SettledAfterCrash | 16351 | 17 | 100s |
+| `MC_ec_reach_captured_not_landed` | reach | REACHED | Witness_CapturedNotLanded | 127 | 5 | 62s |
+| `MC_ec_finding_detached_reattach` | fail | FAIL | ConvergesWhenQuiet | 1229 | - | 79s |
+| `MC_ec_finding_restored_ref` | fail | FAIL | ConvergesWhenQuiet | 5385 | - | 85s |
+| `MC_ec_neg_live_unfair` | fail | FAIL | ConvergesWhenQuiet | 34 | - | 52s |
+| `MC_ec_neg_proof_stat_only` | fail | FAIL | NoLocalWorkLost | 385 | 27 | 67s |
+| `MC_ec_neg_proof_stat_strict` | fail | FAIL | TypedRefusal | 53 | 19 | 54s |
+| `MC_ec_neg_overwrite_modified` | fail | FAIL | NoLocalWorkLost | 73 | 12 | 72s |
+| `MC_ec_neg_no_intent` | fail | FAIL | CrashAtomicity | 36 | 11 | 33s |
+| `MC_ec_neg_exchange_unchecked` | fail | FAIL | NoLocalWorkLost | 126 | 16 | 32s |
+| `MC_ec_neg_index_no_cas` | fail | FAIL | NoLocalWorkLost | 40 | 16 | 29s |
+| `MC_ec_neg_stash_clear_blind` | fail | FAIL | NoLocalWorkLost | 1064 | 44 | 66s |
+| `MC_ec_neg_name_conflict_unchecked` | fail | FAIL | NoWedge | 13 | - | 79s |
+| `MC_ec_neg_single_ref_txn` | fail | FAIL | NoWedge | 11 | - | 36s |
+| `MC_ec_neg_head_branch_in_step` | fail | FAIL | TypedRefusal | 525 | 19 | 66s |
+| `MC_ec_neg_no_checkout_guard` | fail | FAIL | TypedRefusal | 87 | 11 | 42s |
+| `MC_ec_neg_converge_before_ref_settle` | fail | FAIL | TypedRefusal | 151 | 28 | 57s |
+| `MC_ec_neg_dir_replace_unchecked` | fail | FAIL | TypedRefusal | 875 | 34 | 57s |
+| `MC_ec_neg_prune_local` | fail | FAIL | NoSourceWorkLost | 9 | 9 | 33s |
+| `MC_ec_neg_drop_provenance` | fail | FAIL | NoSourceWorkLost | 34 | 21 | 91s |
+| `MC_ec_neg_noop_restages` | fail | FAIL | NoReRead | 2 | 2 | 95s |
+| `MC_ec_neg_sibling_intent_reproves` | fail | FAIL | NoReRead | 6077 | 11 | 95s |
+| `MC_ec_neg_finish_after_all_deletes` | fail | FAIL | NoWedge | 692 | - | 84s |
+| `MC_ec_neg_rebase_unguarded` | fail | FAIL | NoLocalWorkLost | 387 | 12 | 78s |
+| `MC_ec_neg_ledger_reads_index` | fail | FAIL | NoLocalWorkLost | 322 | 30 | 82s |
+| `MC_ec_neg_unborn_head_untyped` | fail | FAIL | TypedRefusal | 32 | 15 | 93s |
+| `MC_ec_neg_seat_parent_untyped` | fail | FAIL | TypedRefusal | 211 | 16 | 82s |
+| `MC_ec_neg_refs_unsynced` | fail | FAIL | TypedRefusal | 932 | 16 | 81s |
+| `MC_ec_neg_probe_left` | fail | FAIL | CrashAtomicity | 246 | 26 | 65s |
+| `MC_ec_neg_settle_moves_checked_out` | fail | FAIL | NoLocalWorkLost | 311 | 29 | 91s |
+| `MC_ec_neg_txn_no_symref_verify` | fail | FAIL | NoLocalWorkLost | 91 | 22 | 53s |
+| `MC_ec_neg_txn_no_cas` | fail | FAIL | NoLocalWorkLost | 458 | 12 | 79s |
+| `MC_ec_neg_head_no_cas` | fail | FAIL | NoLocalWorkLost | 89 | 12 | 77s |
+| `MC_ec_neg_settle_remove_dir` | fail | FAIL | NoWedge | 1436 | - | 90s |
+| `MC_ec_neg_step_moves_intent_branch` | fail | FAIL | CrashAtomicity | 204947 | - | 93s |
+| `MC_ec_neg_settle_replays_branch` | fail | FAIL | TypedRefusal | 20094 | 16 | 77s |
+| `MC_ec_neg_stale_lock_kept` | fail | FAIL | NoWedge | 150 | - | 61s |
+| `MC_ec_neg_stale_stash_lock` | fail | FAIL | TypedRefusal | 124 | 29 | 71s |
+| `MC_ec_neg_set_head_one_txn` | fail | FAIL | CrashAtomicity | 788 | 12 | 70s |
+| `MC_ec_neg_stash_settle_any_suffix` | fail | FAIL | NoLocalWorkLost | 745 | 23 | 46s |
+| `MC_ec_neg_old_head_branch_skipped` | fail | FAIL | ConvergesWhenQuiet | 628 | - | 58s |
+| `MC_ec_neg_no_landing_intent` | fail | FAIL | NoWedge | 41 | - | 47s |
+| `MC_ec_neg_head_not_recorded` | fail | FAIL | NoLocalWorkLost | 28375 | 18 | 84s |
+| `MC_ec_neg_head_attach_unchecked` | fail | FAIL | OneCheckout | 98 | 22 | 78s |
+| `MC_ec_neg_intent_head_lock_kept` | fail | FAIL | TypedRefusal | 119775 | 20 | 165s |
+| `MC_ec_neg_empty_lock_removed` | fail | FAIL | NoLocalWorkLost | 198 | 11 | 77s |
+| `MC_ec_neg_packed_new_kept` | fail | FAIL | NoWedge | 849 | - | 93s |
+| `MC_ec_neg_stash_reflog_unsynced` | fail | FAIL | TypedRefusal | 105 | 25 | 78s |
+| `MC_ec_neg_recovery_overwrites` | fail | FAIL | NoLocalWorkLost | 55 | 14 | 97s |
+
+### #38: captures raced by the source (2026-10-15)
+
+S5 under OI-1003-Q152 (no freeze window): the full run closes by
+converging deltas while the source stays live, so a capture pass an agent
+races (a commit, a switch, a `git add` in the captured checkout) is drift
+custody, never `GIT_AUTHORITY_CHANGED`. The model's `Capture(i)` gains that
+case as one action (so every earlier row's coverage is unchanged): under
+`SrcKinds` `"race"` the main's pass may be raced by a HEAD switch or an
+index stage, and the source moves on. The code has two drift classes, and
+the model has both (review finding 5, 2026-10-15): export drift (the move
+under the export: `pass_drift`, `mark_drift`) records a capture of the
+state its snapshot read marked `drift` and `inband`, which `Begin(i)` is
+not enabled on (the code refuses `CAPTURE_DRIFTED` before it reads or
+writes anything); key drift (the move between the pre-pass key and the
+export's snapshot, or after the export's last read: `drift_across`)
+records a coherent capture, of the moved state or of the snapshot's,
+marked `drift` only, which applies as the code applies it
+(`a_key_only_drifted_capture_is_a_coherent_snapshot_and_applies`). Every
+drifted capture is never a reuse hit (the code poisons its key), so
+`Capture(i)` is enabled again even when the source comes back to the
+drifted state. `NoDriftedLanding` states the `CAPTURE_DRIFTED` contract
+directly (review finding 11: before it, removing `Begin`'s guard left
+`MC_ec_capture_raced` passing, because a capture of an earlier source
+state is harmless in the model, and only `MC_ec_neg_drift_key_reused`
+noticed); `drift_applied` removes the guard and must violate it. Code:
+`git_carry.rs` `pass_drift`, `mark_drift`, `KeyParts::drift_to` and
+`drift_across`, `estate.rs` `capture_item`'s `poisoned`; Rust rows P87.
+
+| config | expect | outcome | violated | distinct | depth | wall |
+|---|---|---|---|---:|---:|---:|
+| `MC_ec_capture_raced` (LiveSpec) | pass | PASS | - | 135185 | 61 | 115s |
+| `MC_ec_reach_drift_carried` | reach | REACHED | Witness_DriftCarried | 1201 | 14 | 13s |
+| `MC_ec_reach_key_drift_landed` | reach | REACHED | Witness_KeyDriftLanded | 1182 | 14 | 15s |
+| `MC_ec_neg_drift_key_reused` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 1635 | - | 20s |
+| `MC_ec_neg_drift_applied` | fail | FAIL | NoDriftedLanding | 37 | 4 | 13s |
+
+(Reach and fail rows stop at their first violation; with three workers
+their distinct counts vary from run to run. The pass row's count is
+exact: 135185 in both the targeted and the full run.)
+
+Every `MC_ec_` row (89 and the budget self-test) was run again on the
+changed spec and catalogue, 2026-10-15 (review round), `just tla-check`
+with all of them, `-workers 3`, nice 10, on sting at load average 40 to
+53: each matched its expectation (34 PASS, 49 FAIL, 5 REACHED, 1
+SIMULATION, the self-test INCONCLUSIVE), total wall 3133 s, peak RSS 2370
+MiB, and every pass row but `MC_ec_capture_raced` explored the same number
+of distinct states as in the results above (the raced classes are not
+enabled without `"race"`, and `NoDriftedLanding`, now checked by every
+pass row, adds no state). The distinct counts in this section's table are
+the review round's (before it, with one drift class: 13027).
+
+What the rows do not prove: the drifted capture's content is the
+pre-move state as a whole (the code also withdraws seats that drifted
+under the byte pass, which only the Rust rows check); HEAD and index moves
+are modelled for the main only; nested worktrees (including a HEAD moved
+away and back across the windows outside the export, review finding 4)
+are the Rust rows'. The stash, which refused here, is drift custody since
+OI-1003-Q161 (next section).
+
+### OI-1003-Q161: captures raced by a stash (2026-10-15)
+
+Operator ruling OI-1003-Q161 (Linear TIN-4543): a `git stash push`, `pop`
+or `drop` during a capture pass is drift custody like a HEAD or index move:
+recorded (`StashMoved`, `git_carry.rs` `stash_drift`), the raced capture
+never laid down or reused, the next pass carrying the new stash. The code
+puts the stash reflog in the same two drift classes as HEAD and the index,
+so the stash path changes no protocol step: `Capture(i)`, `Begin(i)` and
+the poisoned key are unchanged, and only `RacedMoves(i)` grows. Under the
+new `SrcKinds` label `"stashrace"` the main's pass may be raced by a stash
+push (a new entry on top) or a drop (the newest entry removed; a pop is a
+drop with the seats, which this model's stash row does not carry). Rows
+without `"stashrace"` enable no new move, so their state spaces are
+unchanged. The two negative rows reuse #38's mutations on a stash-only
+source: `drift_key_reused` (the raced capture's key kept: the source drops
+the stash again, the next pass is a reuse hit on a capture no apply lays
+down, and the landing never converges) and `drift_applied` (`Begin`
+enabled on a capture whose export the stash raced). Rust rows: P87's stash
+row (`p87_an_agent_stashing_through_every_pass_is_carried_by_the_next_converging_delta`),
+`stash_pushed_during_capture_is_drift_custody`,
+`stash_dropped_during_capture_is_drift_custody` and
+`r3_stash_reflog_round_trip_across_unguarded_windows_is_drift_custody`.
+
+`just tla-check` of the nine rows that enable a raced move (the four new
+ones and #38's five), 2026-10-15, sting, `-workers 3`, nice 10, load
+average about 19 on 32 CPUs; each matched its expectation, total wall
+334 s, peak RSS 2004 MiB. `MC_ec_capture_raced` explores exactly its
+recorded 135185 distinct states, so restructuring `RacedMoves` changed
+nothing for `"race"` alone:
+
+| config | expect | outcome | violated | distinct | depth | wall |
+|---|---|---|---|---:|---:|---:|
+| `MC_ec_capture_raced_stash` (LiveSpec) | pass | PASS | - | 82086 | 72 | 51s |
+| `MC_ec_reach_stash_drift_carried` | reach | REACHED | Witness_DriftCarried | 2345 | 15 | 22s |
+| `MC_ec_neg_stash_drift_key_reused` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 4954 | - | 18s |
+| `MC_ec_neg_stash_drift_applied` | fail | FAIL | NoDriftedLanding | 63 | 5 | 19s |
+
+The other EstateConverge rows were not re-run: without `"race"` or
+`"stashrace"` in `SrcKinds`, `RacedMoves(i)` is the empty set exactly as
+before, so their state spaces are unchanged by construction.
+
+### Findings (EstateConverge)
+
+Every finding below was a row that failed on the code on
+`feat/estate-converge-20261008` as read on 2026-10-09. The convergence
+lane fixed the code the same day (agent notes
+`2026-10-08-estate-converge-design.md`, "Fixes after review 3", and
+`2026-10-09-formal-estate-converge.md`). Each fixed finding is now a pass
+row (the fixed code) and a mutation (the code before the fix) whose
+`MC_ec_neg_` row fails the finding's property; each has a Rust row that
+fails on the code before the fix. Two stay finding rows, as documented
+limits.
+
+Fixed (pass row; mutation row; Rust rows):
+
+1. **A file the source turns into a directory wedged after a crash**
+   (`MC_ec_file_to_dir_settle`, LiveSpec; `MC_ec_neg_settle_remove_dir`,
+   `NoWedge`). A settle's `Remove` of the file now finds the new directory
+   there (its `MkDir` ran before the crash) and is done
+   (`Engine::remove`, `Op::to_dir`). Rust:
+   `a_file_turned_directory_settles_after_an_interrupted_converge`, the
+   fault harness's `estate_converge_after_seat_mid` (the source's day now
+   turns a file into a directory).
+2. **A settle replayed a HEAD-branch compare-and-swap another item had
+   overtaken** (`MC_ec_settle_stale_branch`, a seeded simulation of
+   20,000 traces with every safety invariant;
+   `MC_ec_neg_step_moves_intent_branch`, `CrashAtomicity`, by
+   simulation). Every ref step now skips the branches a pending workspace
+   intent of any item names (`intent_branches`), and a settle whose branch
+   line can no longer apply re-plans HEAD (item 11's fix). Rust:
+   `a_pending_intents_head_branch_is_left_to_its_item`.
+3. **A crash inside Git's ref transaction wedged the item**
+   (`MC_ec_child_crash_live`, LiveSpec; `MC_ec_neg_stale_lock_kept`,
+   `NoWedge`), and **`set_head`'s one transaction could commit HEAD
+   without its branch** (`MC_ec_set_head_partial`;
+   `MC_ec_neg_set_head_one_txn`, `CrashAtomicity`). A settle under the
+   destination lock removes a lock file whose content proves it
+   bulkload's (the value its pending op writes; an empty delete lock older
+   than a timestamp tick; a HEAD lock bulkload marked), and any other lock
+   refuses typed (`remove_stale_locks`, `remove_head_locks`). `set_head`
+   commits the branch in its own transaction first, under every
+   worktree's HEAD lock with this HEAD verified, then HEAD. Rust:
+   `a_settle_removes_a_killed_childs_lock_and_keeps_anyone_elses`, the
+   fault harness's `estate_converge_head_branch` (between the two
+   transactions).
+4. **A stash settle undid an operator's drop**
+   (`MC_ec_stash_settle_revert`; `MC_ec_neg_stash_settle_any_suffix`,
+   `NoLocalWorkLost`). Each store's reflog is made durable in the ref
+   intent (`RefIntent::stash_at`), and a settle continues only from it or
+   one store past it; anything else is the operator's, kept and reported,
+   and the ledger's stash row names the reflog bulkload last landed (with
+   the row cleared, the next step read an emptied stash as never restored
+   and restored it: the first run of the pass row showed it). The ghost
+   follows review 3 finding 14's rule for the stash too: once a store is
+   made, the old order is no longer bulkload's. Rust:
+   `a_stash_settle_never_undoes_an_operators_drop`.
+5. **The old HEAD branch stayed behind while the source held still**
+   (`MC_ec_old_head_branch`, LiveSpec;
+   `MC_ec_neg_old_head_branch_skipped`, `ConvergesWhenQuiet`). A ref step
+   for that one branch runs after `set_head` (`Place::left_branch`); when
+   its transaction fails (the branch checked out again, another writer)
+   the item still lands and the ref intent waits for the next apply
+   (`LeftBranchDeferred`: a refusal there left HEAD moved under a pending
+   workspace intent, whose settle then moved HEAD off a branch the
+   operator switched back to; `MC_ec_head_concurrent` showed it). Rust:
+   `the_branch_head_left_converges_with_it`,
+   `the_branch_head_left_waits_for_a_writer_without_refusing`.
+7. **A crashed linked first landing refused forever**
+   (`MC_ec_first_linked_crash`, LiveSpec; `MC_ec_neg_no_landing_intent`,
+   `NoWedge`; #216's residual). A landing intent is durable before `git
+   worktree add`; the rerun finishes the worktree forward
+   (`recover_linked_landing`: absent seats and bulkload's own cut-short
+   writes are written, anything else is `GIT_DESTINATION_MODIFIED`). Rust:
+   the fault harness's `estate_converge_linked_added`.
+9. **A killed stash store cleared stash custody**
+   (`MC_ec_stash_lock`; `MC_ec_neg_stale_stash_lock`, `TypedRefusal`).
+   Item 3's lock removal, and a store that meets a lock refuses typed.
+11. **A settle replayed a HEAD-branch create a put-back ref blocks**
+    (`MC_ec_settle_branch_conflict`; `MC_ec_neg_settle_replays_branch`,
+    `TypedRefusal`). A settle with HEAD still old whose branch line can no
+    longer apply (moved, deleted, checked out by another worktree, or its
+    create beside an existing ref) re-plans HEAD with `head_plan`, the
+    intent rewritten first; here HEAD lands detached at the captured head,
+    `head-detached-ref-conflict`. Rust:
+    `a_settle_re_plans_a_head_branch_a_put_back_ref_blocks`.
+
+Found while re-checking the fixed code (pass row; mutation row; Rust row):
+
+- **A settle moved HEAD off a branch the operator switched back to**
+  (`MC_ec_head_concurrent_crash`; `MC_ec_neg_head_not_recorded`,
+  `NoLocalWorkLost`). Between `set_head` and the ledger write (the branch
+  row, the left branch's step), an operator's switch back to the old HEAD
+  followed by a crash made the settle redo `set_head`. The intent now
+  records HEAD at its new value right after `set_head`
+  (`WorkspaceIntent::head_done`); a settle then refuses any other HEAD,
+  typed. A HEAD phase that finds HEAD already at its new value (after the
+  branch's transaction) is done. Rust: the fault harness's
+  `estate_converge_after_head_switch_back`.
+
+Documented limits (finding rows, expected to fail):
+
+6. **A HEAD detached for a conflict re-attaches only on the next capture**
+   (`MC_ec_finding_detached_reattach`, `ConvergesWhenQuiet`; finding 11).
+10. **A ref the operator puts back converges only on the next capture**
+    (`MC_ec_finding_restored_ref`, `ConvergesWhenQuiet`; review 3 finding
+    12).
+
+    Both need the journal no-op (A4) to read the ledgers and run the attach
+    rule or a ref step on every rerun, which R25/S3 keep at zero content
+    reads and which no ruling allows; nothing is lost or refused meanwhile,
+    and the next capture converges them. The 2026-10-09 note asks for the
+    ruling.
+
+8. **Without fairness nothing converges** (`MC_ec_neg_live_unfair`): the
+   liveness claims rest on fair captures and applies.
+12. **Finding 2 and `TypedRefusal`** (historical): not shown before the
+    fix; the fix removes the trace.
+
+The model also states two readings where the code's behaviour is accepted
+rather than flagged: a settle re-adds a seat the operator deleted while a
+type change was pending (absent is a landed value then), and a capture a
+later capture superseded before any apply never reaches the destination
+(`MC_ec_reach_captured_not_landed`; CORPUS keeps it as a chain link).
+
+Review 4 (2026-10-09, later; thirteen findings against the fixed code and
+this model; agent notes `2026-10-09-formal-estate-converge.md`, "Review
+4", and the design note's section 21). Each fix is in the code and the
+model, with a pass row, a mutation (the code before the fix) whose
+`MC_ec_neg_` row fails, and a Rust row that fails on the code before it:
+
+1. **A second worktree on one branch** (the blocker): `set_head` attached
+   HEAD with no check of the other worktrees, and the settle replayed an
+   attach whose branch line was done. Invariant `OneCheckout`;
+   `MC_ec_one_checkout`, `MC_ec_one_checkout_crash`;
+   `MC_ec_neg_head_attach_unchecked`.
+2. **A killed `set_head`'s `HEAD.lock` beside a pending ref intent**: every
+   ref transaction holds every HEAD, so it refused forever.
+   `MC_ec_child_crash_linked`; `MC_ec_neg_intent_head_lock_kept`
+   (`TypedRefusal`). A killed Git child is now an `INTERRUPTED` refusal in
+   a pass that goes on, or a host crash.
+3. **Empty locks removed by age**: a live writer's `packed-refs.lock` or
+   delete lock is empty too. Never removed now (`NoWedge`'s exception);
+   an orphan `packed-refs.new` is removed once no lock holds it.
+   `MC_ec_empty_lock` (LiveSpec); `MC_ec_neg_empty_lock_removed`
+   (`NoLocalWorkLost`), `MC_ec_neg_packed_new_kept` (`NoWedge`).
+4. **The stash reflog never synced** by Git: bulkload syncs it.
+   `MC_ec_neg_stash_reflog_unsynced` (`TypedRefusal`).
+5. **A crashed first linked landing's recovery over the operator's work**
+   (a staged file, a prefix of a blob). `MC_ec_first_linked_crash_op`;
+   `MC_ec_neg_recovery_overwrites` (`NoLocalWorkLost`).
+
+Code-only (Rust rows): the locks bulkload takes hold their marker from
+the moment they exist; a killed `read-tree`'s scratch-index lock is
+removed and every `GIT_CHILD_FAILED` after an intent is
+`GIT_CONVERGE_INTERRUPTED`; a create beside an operator's symbolic ref is
+dropped; `set_head`'s two transactions are pinned by a test that plays
+Git's killed child. Stated limit: a `git switch` reads its branch before
+`HEAD.lock` (below).
+
+### What EstateConverge does not prove
+
+- **Bytes, modes, symlinks, gitlinks, exclude, configuration.** A seat's
+  content is an opaque id; modes and directory modes are not modelled; the
+  exclude converges like a seat; configuration is report-only (Q6) and not
+  modelled; the shape refusal (A8) is not modelled.
+- **The timestamp-granularity window inside one seat operation.** A racy
+  write lands only between applies. The code's displaced and moved checks
+  compare inode, size and mtime; a same-size write in the same timestamp
+  tick as a seat's last write, between the settle's content check and its
+  rename, would pass them. The model does not explore it.
+- **Refs-only items, foreign repositories, `--adopt`, symbolic refs,
+  per-worktree refs, tombstone retention.** None is modelled; the ref
+  decision is P84's (Rust, exhaustive over its domain). A create beside an
+  operator's symbolic ref is review 4's Rust rows'
+  (`a_create_beside_a_symbolic_ref_is_dropped`).
+- **`git switch` is one step.** Git resolves the branch, checks out its
+  files and commits the index before it takes `HEAD.lock`, and writes HEAD
+  without comparing the branch: a ref transaction that moves the branch in
+  between leaves that worktree on it over the old commit's files and index
+  (review 4 finding 11, a stated limit no lock closes).
+- **Two applies at once.** The destination lock serializes them; the
+  model runs one apply at a time and orders a main before its linked
+  worktree within a pass (`after_mains`).
+- **What CORPUS keeps.** A capture superseded before any apply never
+  reaches the destination (`MC_ec_reach_captured_not_landed`); its tips
+  live in CORPUS as chain links, which is GitCarry.tla's custody.
+- **The in-flight ghost for refs.** Review 3 finding 14's rule (an
+  operator write is no edit only when it equals what bulkload holds at
+  that point of its pass) is modelled for HEAD, the seats and the stash
+  (its recorded progress). For refs the ghost still takes a pending op's
+  old and new values: the operator's ref writes are fresh values or
+  deletes, a restore runs only between applies, and no concurrent row has
+  a create or delete op in flight.
+- **`set_head` and its `head_done` record are one step.** An operator's
+  switch back to the old HEAD in the microseconds between them, followed
+  by a crash before the record, is not explored.
+- **A stash store and its progress record are one step.** The code makes
+  the progress durable after each store; a settle also continues from the
+  reflog one store past the progress, which the model holds landed.
+- **Lock contents and HEAD locks.** A lock with content a killed Git
+  child left is bulkload's in the model (the code removes one only when
+  its content is the value the op writes); an empty one is never
+  bulkload's (review 4: `E:` locks; the code never removes an empty lock,
+  `NoWedge` excepts them). Bulkload's own HEAD and index locks are
+  published with their marker (`publish_lock`) and not modelled; neither
+  is a `git switch` refused while they are held, nor the empty `HEAD.lock`
+  Git takes for the HEAD reflog when `set_head` moves the branch HEAD
+  stays on.
+- **`bisect start` with no commit.** It holds the branch without moving
+  HEAD; one between the HEAD-locked read of the checked-out set and the
+  transaction is not excluded (the window is that one read).
+- **Power loss.** Only Git's ref, HEAD and stash renames can be lost
+  (`dur`); bulkload's own writes and the index publish sync their
+  directory. The operator's Git writes are taken as durable. The rule
+  modelled is the fix (a directory sync after each Git write, before any
+  ledger write); under `refs_unsynced` a power loss may also strike
+  between applies.
+- **The exclude digest and a linked first landing's index.** The code
+  records the exclude it wrote or proved and the index a linked landing
+  installed (`installed_index`), never a re-read; the model holds the
+  index rule for a converge only (the exclude and a linked worktree's
+  index are not modelled).
+- **A first linked landing's checkout.** The linked worktree's content is
+  one component (`wtw`, review 4): the recovery refuses unless it is none
+  or the landing's. The per-seat and index rules (absent or the capture's
+  bytes, no prefix; an index with no entries or the installed one) are
+  the Rust rows'. An operator write while the first landing itself runs
+  is not modelled.
+
 ## Directory records (R-N102, OI-1003-Q143)
 
 `DirectoryRecords.tla` is a module of its own (as GitCarry is): the
@@ -2507,7 +3084,8 @@ renaming one is a breaking change to the proof package and needs a ruling.
 - The N-version core: `MC_nv_core`.
 
 GitCarry.tla's names (the module, its properties, mutations, constants and
-configs) are new and not frozen; freezing them needs a ruling.
+configs) are new and not frozen; freezing them needs a ruling. The same
+holds for EstateConverge.tla's (OI-1003-Q144).
 
 SqliteCarry.tla's names (the module, its properties, witnesses, mutations,
 constants and configs, #218 and OI-1003-Q146) are new and not frozen;

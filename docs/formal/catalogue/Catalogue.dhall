@@ -1965,6 +1965,9 @@ let GitCarry = ./GitCarry.dhall
 -- SqliteCarry.tla's part (#218, OI-1003-Q146).
 let SqliteCarry = ./SqliteCarry.dhall
 
+-- EstateConverge.tla's part (OI-1003-Q144).
+let EstateConverge = ./EstateConverge.dhall
+
 -- DirectoryRecords.tla's part (OI-1003-Q143 item 2).
 let Directories = ./Directories.dhall
 
@@ -1979,6 +1982,7 @@ in  { files =
               rows
         # GitCarry.files
         # SqliteCarry.files
+        # EstateConverge.files
         # Directories.files
     , grounding =
       [ { module = showConstructor module.module
@@ -2008,6 +2012,7 @@ in  { files =
         }
       , GitCarry.grounding
       , SqliteCarry.grounding
+      , EstateConverge.grounding
       , Directories.grounding
       ]
     , invariants
@@ -2015,6 +2020,7 @@ in  { files =
     , nversion
     , gitCarryInvariants = GitCarry.invariants
     , gitCarryNversion = GitCarry.nversion
+    , estateConvergeInvariants = EstateConverge.invariants
     , decide = GitCarry.decide
     , sqliteCarryInvariants = SqliteCarry.invariants
     , directoryInvariants = Directories.invariants

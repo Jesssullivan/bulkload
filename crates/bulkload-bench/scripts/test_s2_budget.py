@@ -1140,5 +1140,1138 @@ class LiveRunTests(unittest.TestCase):
         self.assertEqual(trace["verdict"]["status"], "INCONCLUSIVE")
 
 
+ORIGIN = 1_760_000_000.0
+
+
+def observation(trace, power="ac"):
+    """An `observe` header and its rows, from a synthetic trace: the same
+    samples, timestamped from ORIGIN, and the run's ON windows as an
+    intervals file of epoch seconds."""
+    span = trace["windows"][-1]["end"]
+    header = {
+        "schema": s2.ALONGSIDE_SCHEMA,
+        "rulings": s2.ALONGSIDE_RULINGS,
+        "label": "synthetic",
+        "config": {
+            "source": "/src",
+            "workdir": "/work",
+            "out": "/out",
+            "search_tool": "rg",
+            "workload": "v0",
+        },
+        "host": {
+            "hostname": "neo",
+            "system": "Darwin",
+            "release": "x",
+            "machine": "arm64",
+            "cpus": 12,
+            "git": "git",
+            "search": "rg",
+            "load_source": "sysctl -n vm.loadavg",
+        },
+        "start_utc": "2026-10-15T00:00:00Z",
+        "end_utc": "2026-10-15T01:00:00Z",
+        "origin_epoch": ORIGIN,
+        "span_s": span,
+        "end_reason": "stop file",
+        "errors": [],
+        "skipped_ticks": {"sampler": 0, "workload": 0},
+    }
+    rows = [{"k": "lat", **row} for row in trace["latency"]]
+    # Sampler rows carry the wall clock beside the monotonic offset.
+    rows += [{"k": "load", "e": ORIGIN + row["t"], **row} for row in trace["load"]]
+    rows += [
+        {"k": "power", "t": t, "power": power} for t in range(0, int(span) + 1, 60)
+    ]
+    rows.append({"k": "end", "t": span, "reason": "stop file"})
+    intervals = "\n".join(
+        f"{ORIGIN + w['start']:.3f} {ORIGIN + w['end']:.3f} pass{w['index']}"
+        for w in trace["windows"]
+        if w["state"] == "ON"
+    )
+    return header, rows, intervals
+
+
+def alongside_verdict(
+    trace, evidence=True, min_window=300.0, intervals=None, power="ac", edit=None
+):
+    header, rows, derived = observation(trace, power)
+    if edit is not None:
+        header, rows = edit(header, rows)
+    built = s2.alongside_trace(
+        header,
+        rows,
+        derived if intervals is None else intervals,
+        "intervals.txt",
+        min_window,
+        evidence,
+        dict(s2.DEFAULT_GATE),
+    )
+    return built, s2.analyze(built)
+
+
+def long_synth(**kwargs):
+    """A synthetic trace with 400 s windows at 1 Hz: each OFF gap keeps at
+    least 300 s once the next pass's settle lead is taken from it."""
+    return synth(window=400.0, n=400, **kwargs)
+
+
+class AlongsideTests(unittest.TestCase):
+    """#165 (S2 budget alongside a real run; OI-1003-Q152: no freeze window)."""
+
+    def test_intervals_read_epochs_iso_and_marks_and_merge(self) -> None:
+        text = "\n".join(
+            [
+                "# pass one",
+                "100 400 pass1",
+                "350 500",
+                "2026-10-15T00:00:00Z 2026-10-15T00:05:00Z",
+                "on 9000 pass3",
+                "off 9600",
+            ]
+        )
+        intervals, open_interval, problems = s2.parse_intervals(text)
+        midnight = s2.parse_time("2026-10-15T00:00:00Z")
+        self.assertEqual(problems, [])
+        self.assertFalse(open_interval)
+        self.assertEqual(
+            intervals, [(100.0, 500.0), (9000.0, 9600.0), (midnight, midnight + 300)]
+        )
+
+    def test_an_open_mark_and_a_bad_line_are_kept_apart(self) -> None:
+        intervals, open_interval, problems = s2.parse_intervals(
+            "on 10\nbogus line\noff 5 early\n500 400\non 600"
+        )
+        self.assertTrue(open_interval)
+        # The second `on` while one is open is a problem, never a restart.
+        self.assertEqual(len(problems), 4, problems)
+        self.assertIn("on after on", problems[-1])
+        self.assertEqual(intervals[-1][1], float("inf"))
+
+    def test_windows_alternate_and_short_ones_are_dropped(self) -> None:
+        kept, dropped = s2.derive_windows([(400, 800), (850, 1300)], 2000, 300)
+        self.assertEqual(
+            [(w["state"], w["start"], w["end"]) for w in kept],
+            [
+                ("OFF", 0.0, 400.0),
+                ("ON", 400.0, 800.0),
+                ("ON", 850.0, 1300.0),
+                ("OFF", 1300.0, 2000.0),
+            ],
+        )
+        self.assertEqual([w["index"] for w in kept], [0, 1, 2, 3])
+        self.assertEqual([(w["state"], w["start"]) for w in dropped], [("OFF", 800.0)])
+
+    def test_a_real_runs_intervals_give_the_budget_verdict(self) -> None:
+        built, verdict = alongside_verdict(
+            long_synth(on_factor=1.10, on_add=0.5, evidence=True)
+        )
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+        self.assertEqual(built["config"]["pattern"], list(FIVE))
+        # Nothing was started: no ON-run reason is ever raised.
+        self.assertNotIn("ran no command", reasons(verdict))
+        _, failing = alongside_verdict(long_synth(on_factor=1.5, evidence=True))
+        self.assertEqual(failing["status"], "FAIL", reasons(failing))
+        _, loaded = alongside_verdict(long_synth(on_add=2.5, evidence=True))
+        self.assertEqual(loaded["status"], "FAIL", reasons(loaded))
+
+    def test_short_windows_are_not_evidence(self) -> None:
+        _, verdict = alongside_verdict(
+            synth(window=120.0, n=120, evidence=True), min_window=100.0
+        )
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any("at least 300 s" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_an_interval_still_open_is_inconclusive_and_not_evidence(self) -> None:
+        trace = long_synth(on_factor=1.10, evidence=True)
+        start = trace["windows"][1]["start"]
+        _, verdict = alongside_verdict(trace, intervals=f"on {ORIGIN + start:.3f}")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertFalse(verdict["evidence"])
+        self.assertIn("still open", reasons(verdict))
+
+    def test_battery_is_not_evidence(self) -> None:
+        _, verdict = alongside_verdict(long_synth(evidence=True), power="battery")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertFalse(verdict["evidence"])
+
+    def test_evidence_rows_carry_every_gated_metric_and_window(self) -> None:
+        built, verdict = alongside_verdict(long_synth(on_factor=1.10, evidence=True))
+        rows = s2.evidence_rows(built, verdict)
+        kinds = [row[0] for row in rows[1:]]
+        self.assertEqual(rows[0][0], "kind")
+        self.assertEqual(kinds.count("delta_p95"), len(s2.METRICS))
+        self.assertEqual(kinds.count("delta_load1"), 1)
+        self.assertEqual(kinds.count("window"), len(FIVE))
+        self.assertEqual(rows[1][:3], ["verdict", "S2", "PASS"])
+        # OI-1003-Q160: alongside evidence is labelled as such, and carries
+        # the live baseline's spread and every adjacent pair.
+        self.assertTrue(all(row[-1] == s2.ALONGSIDE_EVIDENCE_LABEL for row in rows[1:]))
+        self.assertEqual(kinds.count("baseline"), 1)
+        self.assertEqual(kinds.count("pair"), FIVE.count("ON"))
+
+    def test_observe_starts_nothing_and_alongside_reads_it(self) -> None:
+        before = threading.active_count()
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            out_dir = Path(tmp) / "observed"
+            stop = Path(tmp) / "stop"
+            marks = Path(tmp) / "intervals"
+            timer = threading.Timer(3.5, stop.touch)
+            timer.start()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(
+                    s2.main(["mark", str(marks), "on", "--label", "pass"]), 0
+                )
+                status = s2.main(
+                    [
+                        "observe",
+                        "--source",
+                        str(source),
+                        "--out",
+                        str(out_dir),
+                        "--stop-file",
+                        str(stop),
+                        "--max-seconds",
+                        "60",
+                    ]
+                )
+                self.assertEqual(s2.main(["mark", str(marks), "off"]), 0)
+                along = s2.main(
+                    [
+                        "alongside",
+                        str(out_dir),
+                        "--intervals",
+                        str(marks),
+                        "--min-window-seconds",
+                        "0",
+                    ]
+                )
+            timer.join()
+            header = json.loads((out_dir / "observe.json").read_text())
+            rows = [
+                json.loads(line)
+                for line in (out_dir / "rows.jsonl").read_text().splitlines()
+            ]
+            evidence = (out_dir / "alongside" / "evidence.tsv").read_text()
+            listing = sorted(path.name for path in out_dir.iterdir())
+            leftovers = list(Path(tmp).glob("s2-observe-workload-*"))
+        self.assertEqual((status, along), (0, 0))
+        self.assertEqual(threading.active_count(), before)
+        self.assertEqual(header["end_reason"], "stop file")
+        self.assertEqual(header["errors"], [])
+        kinds = {row["k"] for row in rows}
+        self.assertTrue({"lat", "load", "power"} <= kinds, kinds)
+        self.assertEqual(
+            {row["op"] for row in rows if row["k"] == "lat"},
+            {"jsonl", "sqlite", "git", "search", "step"},
+        )
+        # Its own files only: no ON command ran, nothing else was made.
+        self.assertEqual(listing, ["alongside", "observe.json", "rows.jsonl"])
+        self.assertEqual(leftovers, [])
+        self.assertTrue(evidence.startswith("kind\tname\tvalue"))
+        self.assertIn("not-evidence", evidence)
+
+    def test_observe_refusals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            (Path(tmp) / "exists").mkdir()
+            with contextlib.redirect_stdout(io.StringIO()):
+                taken = s2.main(
+                    [
+                        "observe",
+                        "--source",
+                        str(source),
+                        "--out",
+                        str(Path(tmp) / "exists"),
+                    ]
+                )
+                inside = s2.main(
+                    [
+                        "observe",
+                        "--source",
+                        str(source),
+                        "--out",
+                        str(Path(tmp) / "o"),
+                        "--stop-file",
+                        str(source / "stop"),
+                    ]
+                )
+            made = (Path(tmp) / "o").exists()
+        self.assertEqual((taken, inside), (2, 2))
+        self.assertFalse(made)
+
+
+def shifted(rows, after, by):
+    """The rows with the wall clock of every sampler row after `after`
+    seconds moved by `by` seconds: a sleep or a clock step mid-run."""
+    out = []
+    for row in rows:
+        if "e" in row and row["t"] > after:
+            row = {**row, "e": row["e"] + by}
+        out.append(row)
+    return out
+
+
+def raised_starts(trace, seconds, factor):
+    """The trace with every latency sample in the first `seconds` of each ON
+    window multiplied by `factor`: a pass slow only while it walks."""
+    for window in trace["windows"]:
+        if window["state"] != "ON":
+            continue
+        for row in trace["latency"]:
+            if window["start"] <= row["t"] < window["start"] + seconds:
+                row["ms"] *= factor
+    return trace
+
+
+class AlongsideReviewTests(unittest.TestCase):
+    """The 2026-10-15 review of #165's alongside mode: each test is red on a
+    mutant or on the code before the fix (the agent note's table)."""
+
+    def test_an_observation_with_no_recorded_end_is_cut_short(self) -> None:
+        def unended(header, rows):
+            # The header never closed (its end row alone is no proof).
+            header = {
+                k: v for k, v in header.items() if k not in ("end_reason", "span_s")
+            }
+            return header, rows
+
+        _, verdict = alongside_verdict(long_synth(on_factor=1.10), edit=unended)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("cut short", reasons(verdict))
+
+        def no_end_row(header, rows):
+            return header, [row for row in rows if row.get("k") != "end"]
+
+        _, verdict = alongside_verdict(long_synth(on_factor=1.10), edit=no_end_row)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("cut short", reasons(verdict))
+
+    def test_missed_ticks_are_backfilled_into_their_windows(self) -> None:
+        trace = long_synth(on_factor=1.0)
+
+        def missed(header, rows):
+            extra = []
+            for window in trace["windows"]:
+                if window["state"] == "ON":
+                    for k in range(100, 160):
+                        extra.append(
+                            {
+                                "k": "missed",
+                                "loop": "workload",
+                                "t": window["start"] + k + 0.5,
+                                "lag_ms": 5000.0,
+                            }
+                        )
+            return header, rows + extra
+
+        _, verdict = alongside_verdict(trace, edit=missed)
+        # Back-filled at their 5 s wait, the step p95 is over the budget.
+        self.assertEqual(verdict["gates"]["step"], "FAIL", reasons(verdict))
+        self.assertEqual(verdict["samples"]["ON"]["missed_ticks"], 120)
+        _, clean = alongside_verdict(long_synth(on_factor=1.0))
+        self.assertEqual(clean["gates"]["step"], "PASS", reasons(clean))
+
+    def test_one_on_window_among_five_is_not_evidence(self) -> None:
+        trace = long_synth(pattern=("OFF", "OFF", "ON", "OFF", "OFF"), on_factor=1.10)
+        intervals = "\n".join(
+            f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}"
+            for a, b in ((390, 400), (800, 1200), (1590, 1600))
+        )
+        built, verdict = alongside_verdict(trace, intervals=intervals)
+        self.assertEqual(built["config"]["pattern"], ["OFF", "OFF", "ON", "OFF", "OFF"])
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any("2 ON" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_three_windows_are_not_evidence_by_the_five_window_rule(self) -> None:
+        _, verdict = alongside_verdict(long_synth(pattern=("OFF", "ON", "OFF")))
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any("at least 5 windows" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_the_start_of_every_pass_is_measured(self) -> None:
+        trace = raised_starts(
+            synth(window=600.0, n=600, on_factor=1.0, evidence=True), 60.0, 3.0
+        )
+        built, verdict = alongside_verdict(trace)
+        # Before the fix the first minute was the settle: PASS at +0 %. Now
+        # it is measured: the point is over the budget, and two raised
+        # 30 s blocks in twenty leave the bounds straddling it.
+        self.assertNotEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertGreater(verdict["delta_p95_by_metric"]["step"], 0.25)
+        on = [w for w in built["windows"] if w["state"] == "ON"]
+        # Each ON window starts one settle before its pass.
+        self.assertEqual(
+            [(w["start"], w["lead_s"]) for w in on], [(540.0, 60.0), (1740.0, 60.0)]
+        )
+
+    def test_a_pass_with_no_room_for_its_settle_is_not_evidence(self) -> None:
+        trace = long_synth(on_factor=1.10)
+        # Two passes 30 s apart: the second has no 60 s gap before it.
+        intervals = "\n".join(
+            f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}"
+            for a, b in ((400, 800), (830, 1200), (1600, 2000))
+        )
+        _, verdict = alongside_verdict(trace, intervals=intervals, min_window=0.0)
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any("settle" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_a_wall_clock_jump_is_an_instrument_error(self) -> None:
+        def slept(header, rows):
+            return header, shifted(rows, 1000.0, 600.0)
+
+        _, verdict = alongside_verdict(long_synth(on_factor=1.10), edit=slept)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("instrument errors", reasons(verdict))
+
+        def unclocked(header, rows):
+            return header, [{k: v for k, v in row.items() if k != "e"} for row in rows]
+
+        _, verdict = alongside_verdict(long_synth(on_factor=1.10), edit=unclocked)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+
+    def test_power_that_changes_inside_a_window_is_not_evidence(self) -> None:
+        trace = long_synth(on_factor=1.10)
+
+        def unplugged(header, rows):
+            # Battery from the middle of window 2 on (sampled every 60 s).
+            out = []
+            for row in rows:
+                if row.get("k") == "power" and row["t"] >= 1000:
+                    row = {**row, "power": "battery"}
+                out.append(row)
+            return header, out
+
+        built, verdict = alongside_verdict(trace, edit=unplugged)
+        window = built["windows"][2]
+        self.assertEqual(
+            (window["power_start"], window["power_end"]), ("ac", "battery")
+        )
+        self.assertFalse(verdict["evidence"])
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+
+    def test_a_bad_intervals_line_is_inconclusive(self) -> None:
+        trace = long_synth(on_factor=1.10)
+        _, _, derived = observation(trace)
+        _, verdict = alongside_verdict(trace, intervals=derived + "\nnot a line\n")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("instrument errors", reasons(verdict))
+
+    def test_a_torn_row_is_inconclusive(self) -> None:
+        trace = long_synth(on_factor=1.10)
+        header, rows, derived = observation(trace)
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "observe.json").write_text(json.dumps(header))
+            text = "".join(json.dumps(row) + "\n" for row in rows)
+            (directory / "rows.jsonl").write_text(text + '{"k":"lat","t":1')
+            read_header, read_rows = s2.read_observation(directory)
+        built = s2.alongside_trace(
+            read_header, read_rows, derived, "i", 300.0, True, dict(s2.DEFAULT_GATE)
+        )
+        verdict = s2.analyze(built)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("instrument errors", reasons(verdict))
+
+    def test_an_open_interval_is_named_among_five_kept_windows(self) -> None:
+        trace = long_synth(on_factor=1.10)
+        _, _, derived = observation(trace)
+        # A last pass started 50 s before the observation ended.
+        opened = derived + f"\non {ORIGIN + 1950:.3f}"
+        built, verdict = alongside_verdict(trace, intervals=opened, min_window=100.0)
+        self.assertGreaterEqual(len(built["config"]["pattern"]), 5)
+        self.assertTrue(
+            any("still open" in p for p in verdict["evidence_problems"]),
+            verdict["evidence_problems"],
+        )
+
+    def test_the_shortest_kept_window_decides_the_window_rule(self) -> None:
+        trace = synth(
+            pattern=("OFF", "ON", "OFF", "ON", "OFF"),
+            window=400.0,
+            n=400,
+            evidence=True,
+        )
+        # The middle OFF gap is 200 s (+ lead): kept under --min-window 100.
+        intervals = "\n".join(
+            f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}" for a, b in ((400, 800), (1000, 1400))
+        )
+        built, verdict = alongside_verdict(trace, intervals=intervals, min_window=100.0)
+        self.assertEqual(len(built["windows"]), 5)
+        self.assertLess(built["config"]["window_seconds"], 300.0)
+        self.assertFalse(verdict["evidence"])
+
+    def test_observe_streams_missed_ticks_and_ends_its_record_on_request(
+        self,
+    ) -> None:
+        import signal
+
+        original = s2.Workload.step
+        calls = [0]
+
+        def slow(workload):
+            calls[0] += 1
+            if calls[0] == 3:
+                threading.Event().wait(2.6)
+            return original(workload)
+
+        before = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+        seen = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            out_dir = Path(tmp) / "observed"
+
+            def request_end() -> None:
+                # Wait (bounded) for a missed tick on disk while the
+                # observation still runs, then ask it to end.
+                waited = threading.Event()
+                for _ in range(600):
+                    rows_file = out_dir / "rows.jsonl"
+                    rows = (
+                        rows_file.read_text().splitlines() if rows_file.exists() else []
+                    )
+                    seen["missed"] = sum('"k":"missed"' in row for row in rows)
+                    if seen["missed"]:
+                        break
+                    waited.wait(0.1)
+                handler = signal.getsignal(signal.SIGTERM)
+                seen["handled"] = callable(handler)
+                if callable(handler):
+                    handler(signal.SIGTERM, None)
+
+            timer = threading.Thread(target=request_end)
+            timer.start()
+            with (
+                mock.patch.object(s2.Workload, "step", slow),
+                mock.patch.object(s2, "POWER_EVERY_S", 1.0),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                status = s2.main(
+                    [
+                        "observe",
+                        "--source",
+                        str(source),
+                        "--out",
+                        str(out_dir),
+                        "--max-seconds",
+                        "120",
+                    ]
+                )
+            timer.join()
+            header = json.loads((out_dir / "observe.json").read_text())
+            rows = [
+                json.loads(line)
+                for line in (out_dir / "rows.jsonl").read_text().splitlines()
+            ]
+        after = (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGHUP))
+        self.assertEqual(status, 0)
+        # The missed ticks were on disk before the observation ended.
+        self.assertGreaterEqual(seen.get("missed", 0), 1, seen)
+        self.assertTrue(seen.get("handled"), seen)
+        self.assertEqual(header["end_reason"], "SIGTERM")
+        self.assertEqual(rows[-1]["k"], "end")
+        # Power sampled on its cadence while observing, not only at the end.
+        self.assertGreaterEqual(
+            sum(
+                1
+                for row in rows
+                if row["k"] == "power" and row["t"] < header["span_s"] - 0.5
+            ),
+            2,
+        )
+        self.assertEqual(after, before)
+
+
+def relevel(trace, levels):
+    """The trace with every load1 row of window i set to levels[i]."""
+    for window in trace["windows"]:
+        for row in trace["load"]:
+            if window["start"] <= row["t"] < window["end"]:
+                row["load1"] = levels[window["index"]]
+    return trace
+
+
+def stepped(n_on, step_after, before, after, add):
+    """A long alternating observation (OFF first and last, n_on ON passes)
+    whose live baseline steps from `before` to `after` once window
+    `step_after` ends, each pass adding `add` to the baseline of its time."""
+    pattern = ("OFF", "ON") * n_on + ("OFF",)
+    levels = [
+        (before if index <= step_after else after) + (add if state == "ON" else 0.0)
+        for index, state in enumerate(pattern)
+    ]
+    return relevel(long_synth(pattern=pattern, on_factor=1.10, evidence=True), levels)
+
+
+def rescaled(trace, step_after, factor):
+    """The trace with every latency sample after window `step_after`
+    multiplied by `factor`: the host's own latency stepping down."""
+    for window in trace["windows"]:
+        if window["index"] > step_after:
+            for row in trace["latency"]:
+                if window["start"] <= row["t"] < window["end"]:
+                    row["ms"] *= factor
+    return trace
+
+
+class AlongsideLiveBaselineTests(unittest.TestCase):
+    """OI-1003-Q160: an observation alongside a live run is judged against
+    the host's own live load. Its OFF windows between passes are the
+    baseline with no absolute load1 cap (R-N81's 2.5 is amended for
+    alongside runs only); the budget, AC power, the window rules and the
+    recorded load are unchanged; and every ON window is compared with the
+    OFF windows on both sides of it, so linear drift in the host's own load
+    is not read as bulkload's cost or credit."""
+
+    def test_a_busy_live_baseline_is_alongside_evidence(self) -> None:
+        # Red before Q160: "R-N81: OFF window 0 load1 level 6.00 is not
+        # under 2.5", INCONCLUSIVE and not evidence.
+        built, verdict = alongside_verdict(
+            long_synth(off_load=6.0, on_factor=1.10, on_add=0.5, evidence=True)
+        )
+        self.assertEqual(verdict["status"], "PASS", reasons(verdict))
+        self.assertTrue(verdict["evidence"], verdict["evidence_problems"])
+        self.assertEqual(
+            verdict["evidence_label"], "alongside, live baseline (OI-1003-Q160)"
+        )
+        self.assertNotIn("R-N81", reasons(verdict))
+        summary = s2.render_summary(built, verdict)
+        self.assertIn(
+            "PASS (evidence: alongside, live baseline (OI-1003-Q160))", summary
+        )
+        self.assertIn("Live baseline (OI-1003-Q160)", summary)
+        # The budget is unchanged: +2.0 load1 over the live baseline fails.
+        _, loaded = alongside_verdict(
+            long_synth(off_load=6.0, on_add=2.5, evidence=True)
+        )
+        self.assertEqual(loaded["status"], "FAIL", reasons(loaded))
+        self.assertIn("load1 +2.", reasons(loaded))
+        # AC power still applies to a busy live baseline.
+        _, battery = alongside_verdict(
+            long_synth(off_load=6.0, on_factor=1.10, evidence=True), power="battery"
+        )
+        self.assertEqual(battery["status"], "INCONCLUSIVE")
+        self.assertFalse(battery["evidence"])
+        self.assertIsNone(battery["evidence_label"])
+        self.assertIn("not AC power", reasons(battery))
+
+    def test_a_gated_run_keeps_r_n81s_load_cap(self) -> None:
+        # Standalone gated runs are unchanged: an OFF level at 6.0 is not
+        # evidence and the verdict is INCONCLUSIVE (R-N81).
+        verdict = s2.analyze(
+            synth(evidence=True, off_load=6.0, on_factor=1.10, on_add=0.5)
+        )
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+        self.assertIn("R-N81: OFF window 0 load1 level 6.00", reasons(verdict))
+        self.assertFalse(verdict["evidence"])
+        self.assertIsNone(verdict["live_baseline"])
+        quiet = s2.analyze(synth(evidence=True, off_load=2.4, on_factor=1.10))
+        self.assertTrue(quiet["evidence"], quiet["evidence_problems"])
+        self.assertEqual(quiet["evidence_label"], "gated run (R-N81)")
+
+    def test_the_baseline_spread_and_each_adjacent_pair_are_reported(self) -> None:
+        # A baseline rising 1.0 -> 1.5 -> 2.0: its spread is reported, and
+        # each pass against the OFF windows on both sides of it.
+        built, verdict = alongside_verdict(
+            long_synth(
+                off_load=[1.0, 0.0, 1.5, 0.0, 2.0],
+                on_factor=1.10,
+                on_add=0.5,
+                evidence=True,
+            )
+        )
+        baseline = verdict["live_baseline"]
+        self.assertEqual(baseline["off_load1_levels"], [1.0, 1.5, 2.0])
+        self.assertEqual(baseline["off_load1_spread"], 1.0)
+        pairs = [
+            (p["on"], p["off_before"], p["off_after"], p["baseline_load1"])
+            for p in baseline["pairs"]
+        ]
+        # Interpolated to each pass's time (OI-1003-Q160 review): OFF window
+        # 4 is 400 s against window 2's 340 s (the lead), so pass 3 sits
+        # nearer window 2 and its baseline is a little under the plain mean.
+        self.assertEqual(pairs, [(1, 0, 2, 1.25), (3, 2, 4, 1.741)])
+        self.assertEqual([p["drift_load1"] for p in baseline["pairs"]], [0.5, 0.5])
+        for pair in baseline["pairs"]:
+            self.assertAlmostEqual(pair["d_p95"]["step"], 0.10, places=6)
+        # The two passes add the same, but the second reads about 0.5 lower
+        # than the first (the first pass's step also tilts its own level):
+        # the rising baseline, which the pairs make visible.
+        first, second = (p["d_load1"] for p in baseline["pairs"])
+        self.assertAlmostEqual(first - second, 0.5, delta=0.1)
+        rows = s2.evidence_rows(built, verdict)
+        spread = [row for row in rows if row[0] == "baseline"]
+        self.assertEqual(spread[0][1:3], ["off_load1_spread", "1.0000"])
+        self.assertEqual(
+            [row[1] for row in rows if row[0] == "pair"],
+            ["1:ON vs 0,2:OFF", "3:ON vs 2,4:OFF"],
+        )
+
+    def test_a_falling_baseline_does_not_pass_as_bulkload_credit(self) -> None:
+        # 31 windows; the host's own load falls by 1.0 as pass 15 ends.
+        # Pooled, the bounds say PASS (old code: PASS). Against its own
+        # neighbours pass 15 reads +2.11, over the budget: the pooled PASS
+        # does not hold pair by pair, so the verdict is INCONCLUSIVE.
+        trace = stepped(15, 15, before=2.0, after=1.0, add=1.4)
+        _, verdict = alongside_verdict(trace)
+        self.assertEqual(verdict["gates"]["load1"], "PASS")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+        self.assertIn(
+            "live baseline (OI-1003-Q160): ON window 15 against OFF windows 14 "
+            "and 16 reads load1 +2.11 (baseline drift -1.00)",
+            reasons(verdict),
+        )
+        # The same passes on a steady baseline pass.
+        _, steady = alongside_verdict(stepped(15, 99, before=2.0, after=2.0, add=1.4))
+        self.assertEqual(steady["status"], "PASS", reasons(steady))
+
+    def test_a_rising_baseline_does_not_fail_as_bulkload_cost(self) -> None:
+        # The host's own load rises by 1.0 as pass 15 ends. Pooled, the
+        # bounds say FAIL (old code: FAIL); against its own neighbours pass
+        # 15 reads +1.91, within the budget. A FAIL must show on every pass.
+        _, verdict = alongside_verdict(stepped(15, 15, before=1.0, after=2.0, add=2.1))
+        self.assertEqual(verdict["gates"]["load1"], "FAIL")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+        self.assertIn("reads load1 +1.91 (baseline drift +1.00)", reasons(verdict))
+        self.assertIn("pooled load1 FAIL does not hold pair by pair", reasons(verdict))
+
+    def test_a_latency_baseline_drift_is_seen_pair_by_pair(self) -> None:
+        # The host's own latency falls 10 % as pass 27 of 31 windows ends;
+        # every pass costs +20 % over the latency of its time. Pooled, the
+        # bounds say PASS (old code: PASS); pass 27 against its neighbours
+        # reads +26.3 %, so the pooled latency PASS does not hold.
+        pattern = ("OFF", "ON") * 15 + ("OFF",)
+        trace = rescaled(
+            long_synth(pattern=pattern, on_factor=1.2, evidence=True), 27, 0.9
+        )
+        _, verdict = alongside_verdict(trace)
+        self.assertEqual(verdict["gates"]["latency"], "PASS")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+        self.assertIn(
+            "ON window 27 against OFF windows 26 and 28 reads p95 step +26.3% "
+            "(latency FAIL), so the pooled latency PASS does not hold pair by pair",
+            reasons(verdict),
+        )
+        # A smaller step (8 %) leaves that pass at +25.0 %, within budget.
+        trace = rescaled(
+            long_synth(pattern=pattern, on_factor=1.2, evidence=True), 27, 0.92
+        )
+        _, small = alongside_verdict(trace)
+        self.assertEqual(small["status"], "PASS", reasons(small))
+
+    def test_a_pass_with_no_off_window_after_it_is_not_judged(self) -> None:
+        # The observation ended while the last pass ran: that pass has no
+        # OFF window after it, so the host's drift across it is unknown and
+        # the pooled PASS is not given (old code: PASS).
+        trace = long_synth(pattern=("OFF", "ON", "OFF", "ON"), on_factor=1.10)
+        _, verdict = alongside_verdict(trace, evidence=False)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+        self.assertIn(
+            "ON window 3 against OFF windows 2 and None has no comparison",
+            reasons(verdict),
+        )
+
+    def test_evidence_needs_load_recorded_and_every_pair_compared(self) -> None:
+        trace = long_synth(on_factor=1.10, evidence=True)
+        end = trace["windows"][2]["end"]
+        start = trace["windows"][2]["start"]
+        # The sampler recorded no load1 in the middle OFF window.
+        trace["load"] = [row for row in trace["load"] if not start <= row["t"] < end]
+        _, verdict = alongside_verdict(trace)
+        self.assertFalse(verdict["evidence"])
+        problems = " | ".join(verdict["evidence_problems"])
+        self.assertIn("evidence needs recorded load1 in every window", problems)
+        self.assertIn("ON window 1 has no complete comparison", problems)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE")
+
+
+def timeline(span, passes, lat, load, ewma=False):
+    """An `observe` header, rows and intervals over [0, span) at 1 Hz, with
+    the run's passes as (start, end) seconds from ORIGIN (a pass may end
+    before it: recorded before the observation began). `lat(t, on)` is the
+    latency factor (or a {op: factor} dict), `load(t, on)` the run queue;
+    with `ewma` load1 is what the kernel reports for it (the 5 s EWMA)."""
+
+    def on_at(t):
+        return any(a <= t < b for a, b in passes)
+
+    rows = []
+    level, update = load(0.0, on_at(0.0)), 2.5
+    for k in range(int(span)):
+        t = float(k)
+        on = on_at(t)
+        spread = 1.0 + (k % 30) / 30.0
+        factor = lat(t, on)
+        step = 0.0
+        for op in s2.OPS:
+            ms = (
+                10.0
+                / 4.0
+                * spread
+                * (factor[op] if isinstance(factor, dict) else factor)
+            )
+            step += ms
+            rows.append({"k": "lat", "t": t, "op": op, "ms": ms, "ok": True})
+        rows.append({"k": "lat", "t": t, "op": "step", "ms": step, "ok": True})
+        if ewma:
+            while update <= t:
+                n = load(update, on_at(update))
+                level = level * s2.LOAD1_DECAY + n * (1.0 - s2.LOAD1_DECAY)
+                update += s2.LOAD1_UPDATE_S
+            value = round(level, 2)
+        else:
+            value = load(t, on)
+        rows.append({"k": "load", "t": t, "e": ORIGIN + t, "load1": value})
+    rows += [{"k": "power", "t": t, "power": "ac"} for t in range(0, int(span) + 1, 60)]
+    rows.append({"k": "end", "t": span, "reason": "stop file"})
+    header, _, _ = observation(long_synth())
+    header = {**header, "span_s": span}
+    intervals = "\n".join(f"{ORIGIN + a:.3f} {ORIGIN + b:.3f}" for a, b in passes)
+    return header, rows, intervals
+
+
+def timeline_verdict(span, passes, lat, load, min_window=300.0, ewma=False):
+    header, rows, intervals = timeline(span, passes, lat, load, ewma)
+    built = s2.alongside_trace(
+        header, rows, intervals, "i.txt", min_window, True, dict(s2.DEFAULT_GATE)
+    )
+    return built, s2.analyze(built)
+
+
+def alternating(n, on_s, off_s, first=None):
+    """n passes of on_s seconds, off_s apart, the first at `first` (else
+    off_s); and the span that ends one off_s after the last."""
+    passes, t = [], off_s if first is None else first
+    for _ in range(n):
+        passes.append((t, t + on_s))
+        t += on_s + off_s
+    return passes, t
+
+
+class LiveBaselineReviewTests(unittest.TestCase):
+    """The 2026-10-15 review of OI-1003-Q160's live baseline: each test is
+    red on the code before its fix (the agent note's table)."""
+
+    # Finding 1: pairs are judged gate by gate.
+
+    def test_a_load_breach_on_every_pass_stands_when_one_also_overruns_p95(
+        self,
+    ) -> None:
+        # Every pass adds +3.0 load1 (each pair FAILs load1) and pass 15 is
+        # also +30 % p95. Before: INCONCLUSIVE, the load1 reason dropped.
+        pattern = ("OFF", "ON") * 15 + ("OFF",)
+        factors = [1.30 if index == 15 else 1.02 for index in range(len(pattern))]
+        _, verdict = alongside_verdict(
+            long_synth(pattern=pattern, on_factor=factors, on_add=3.0, evidence=True)
+        )
+        self.assertEqual(verdict["gates"]["load1"], "FAIL")
+        self.assertEqual(verdict["gates"]["latency"], "PASS")
+        self.assertEqual(verdict["status"], "FAIL", reasons(verdict))
+        self.assertIn("load1 +3.", reasons(verdict))
+        self.assertIn(
+            "ON window 15 against OFF windows 14 and 16 also reads p95 step "
+            "+30.0% (latency FAIL)",
+            reasons(verdict),
+        )
+
+    def test_a_latency_breach_on_every_pass_stands_when_one_also_overruns_load(
+        self,
+    ) -> None:
+        # Every pass is +40 % p95 and pass 7 also reads load1 +2.3. Before:
+        # INCONCLUSIVE, the p95 reason dropped.
+        pattern = ("OFF", "ON") * 15 + ("OFF",)
+        trace = long_synth(pattern=pattern, on_factor=1.40, evidence=True)
+        levels = [
+            1.0 + (0.0 if state == "OFF" else 2.3 if index == 7 else 0.3)
+            for index, state in enumerate(pattern)
+        ]
+        _, verdict = alongside_verdict(relevel(trace, levels))
+        self.assertEqual(verdict["gates"]["latency"], "FAIL")
+        self.assertEqual(verdict["status"], "FAIL", reasons(verdict))
+        self.assertIn("p95 step +40.0% exceeds", reasons(verdict))
+        self.assertIn(
+            "ON window 7 against OFF windows 6 and 8 also reads load1 +2.",
+            reasons(verdict),
+        )
+
+    def test_a_pooled_latency_fail_one_pass_contradicts_is_inconclusive(
+        self,
+    ) -> None:
+        # Every pass +40 % but pass 9 +10 %: the pooled FAIL is not shown by
+        # every pass, so it does not stand; its reason is kept beside the
+        # pair's (before: replaced by it).
+        pattern = ("OFF", "ON") * 15 + ("OFF",)
+        factors = [1.10 if index == 9 else 1.40 for index in range(len(pattern))]
+        _, verdict = alongside_verdict(
+            long_synth(pattern=pattern, on_factor=factors, evidence=True)
+        )
+        self.assertEqual(verdict["gates"]["latency"], "FAIL")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+        self.assertIn("exceeds +25%", reasons(verdict))
+        self.assertIn(
+            "ON window 9 against OFF windows 8 and 10 reads p95 step +10.0% "
+            "(latency PASS), so the pooled latency FAIL does not hold pair by pair",
+            reasons(verdict),
+        )
+
+    # Finding 6: the pair reason names the gated metric over the budget.
+
+    def test_one_operation_over_on_one_pass_is_seen_under_gate_both(self) -> None:
+        # Pass 7 has git x1.32 alone (step +8 %): that pass's latency is
+        # MIXED, so the pooled PASS does not hold, and the reason names git.
+        pattern = ("OFF", "ON") * 15 + ("OFF",)
+        factors = [1.03] * len(pattern)
+        factors[7] = 1.0
+        trace = long_synth(pattern=pattern, on_factor=factors, evidence=True)
+        for row in trace["latency"]:
+            window = trace["windows"][7]
+            if window["start"] <= row["t"] < window["end"] and row["op"] in (
+                "git",
+                "step",
+            ):
+                if row["op"] == "git":
+                    row["ms"] *= 1.32
+        # The step is the sum of the operations.
+        by_t = {}
+        for row in trace["latency"]:
+            if row["op"] != "step":
+                by_t[row["t"]] = by_t.get(row["t"], 0.0) + row["ms"]
+        for row in trace["latency"]:
+            if row["op"] == "step":
+                row["ms"] = by_t[row["t"]]
+        _, verdict = alongside_verdict(trace)
+        self.assertEqual(verdict["gates"]["latency"], "PASS")
+        self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+        self.assertIn(
+            "ON window 7 against OFF windows 6 and 8 reads p95 git +32.0% "
+            "(latency MIXED)",
+            reasons(verdict),
+        )
+
+    def test_a_pair_missing_one_operation_is_not_evidence(self) -> None:
+        trace = long_synth(on_factor=1.10, evidence=True)
+        window = trace["windows"][2]
+        trace["latency"] = [
+            row
+            for row in trace["latency"]
+            if not (row["op"] == "git" and window["start"] <= row["t"] < window["end"])
+        ]
+        _, verdict = alongside_verdict(trace)
+        self.assertFalse(verdict["evidence"])
+        problems = " | ".join(verdict["evidence_problems"])
+        self.assertIn("ON window 1 has no complete comparison", problems)
+
+    # Finding 2: no pass escapes the verdict.
+
+    def test_a_dropped_pass_is_not_evidence_and_is_reported(self) -> None:
+        # A 100 s pass inside the first gap is under 300 s with its lead:
+        # dropped, never compared. Before: evidence, nothing reported.
+        trace = synth(window=600.0, n=600, on_factor=1.10, evidence=True)
+        _, _, derived = observation(trace)
+        intervals = f"{ORIGIN + 100:.3f} {ORIGIN + 200:.3f} short\n" + derived
+        built, verdict = alongside_verdict(trace, intervals=intervals)
+        self.assertEqual(built["config"]["pattern"], list(FIVE))
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any(
+                "1 pass (100 s of pass time) was dropped" in p
+                for p in verdict["evidence_problems"]
+            ),
+            verdict["evidence_problems"],
+        )
+        self.assertEqual(verdict["dropped_on"], {"windows": 1, "pass_seconds": 100.0})
+        self.assertIn("1 pass (100 s) dropped", s2.render_summary(built, verdict))
+        rows = s2.evidence_rows(built, verdict)
+        self.assertIn(
+            [
+                "dropped",
+                "on_windows",
+                "1",
+                "-",
+                "-",
+                "-",
+                "pass seconds 100",
+                "not-evidence",
+            ],
+            rows,
+        )
+
+    def test_heavy_short_passes_do_not_hide_behind_gentle_long_ones(self) -> None:
+        # The reviewer's E2: four gentle 600 s passes judged, four heavy
+        # 200 s passes (a quarter of the pass time) dropped.
+        passes, t, heavy = [], 600.0, []
+        for _ in range(4):
+            passes.append((t, t + 600))
+            t += 600
+            heavy.append((t + 900, t + 1100))
+            passes.append(heavy[-1])
+            t += 2000
+
+        def is_heavy(t):
+            return any(a <= t < b for a, b in heavy)
+
+        def lat(t, on):
+            return (2.0 if is_heavy(t) else 1.05) if on else 1.0
+
+        def load(t, on):
+            return 1.0 + ((5.0 if is_heavy(t) else 0.3) if on else 0.0)
+
+        _, verdict = timeline_verdict(t + 600, passes, lat, load)
+        self.assertFalse(verdict["evidence"])
+        self.assertIsNone(verdict["evidence_label"])
+        self.assertEqual(verdict["dropped_on"]["windows"], 4)
+
+    def test_the_minimum_window_is_pinned_under_evidence(self) -> None:
+        _, verdict = alongside_verdict(
+            long_synth(on_factor=1.10, evidence=True), min_window=200.0
+        )
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any(
+                "min_window_seconds is pinned at 300" in p
+                for p in verdict["evidence_problems"]
+            ),
+            verdict["evidence_problems"],
+        )
+
+    # Finding 3: a recovery tail after each pass inflates the baseline.
+
+    def test_a_recovery_tail_after_every_pass_is_not_a_pass(self) -> None:
+        # The reviewer's E3: each pass x1.35 p95 and +2.2 load1, then a
+        # 300 s tail of x1.25 and +1.6; the observation began as a pass
+        # ended, so every OFF baseline holds a tail and their spread is
+        # nil. Before: PASS, evidence, at +11.9 % and +1.83.
+        passes, span = alternating(6, 600, 600)
+        passes = [(-600.0, 0.0), *passes]
+
+        def tail(t):
+            ends = [b for _, b in passes if b <= t]
+            return bool(ends) and t - max(ends) < 300
+
+        def lat(t, on):
+            return 1.35 if on else 1.25 if tail(t) else 1.0
+
+        def load(t, on):
+            return 1.0 + (2.2 if on else 1.6 if tail(t) else 0.0)
+
+        _, verdict = timeline_verdict(span, passes, lat, load, ewma=True)
+        self.assertEqual(verdict["noise_p95"], 0.0)
+        self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+        self.assertIn("recovery after a pass", reasons(verdict))
+        self.assertFalse(verdict["evidence"])
+        recovery = verdict["live_baseline"]["recovery"]
+        self.assertGreater(recovery["d_p95"]["step"], 0.125)
+        self.assertGreater(recovery["d_load1"], 1.0)
+
+        # The same passes with no tail pass: the pass's own load1 decaying
+        # (the kernel's EWMA) is not read as a recovery.
+        def clean_lat(t, on):
+            return 1.10 if on else 1.0
+
+        def clean_load(t, on):
+            return 1.0 + (1.9 if on else 0.0)
+
+        _, clean = timeline_verdict(span, passes[1:], clean_lat, clean_load, ewma=True)
+        self.assertEqual(clean["status"], "PASS", reasons(clean))
+        self.assertTrue(clean["evidence"], clean["evidence_problems"])
+
+    def test_a_latency_tail_or_a_load_tail_alone_is_seen(self) -> None:
+        # Each half of the recovery rule on its own: a tail of x1.20 p95
+        # alone (over half the budget, under the whole) and one of +1.5
+        # load1 alone. Passes cost x1.10 and +0.5; the observation began as
+        # a pass ended.
+        passes, span = alternating(6, 600, 600)
+        passes = [(-600.0, 0.0), *passes]
+
+        def tail(t):
+            ends = [b for _, b in passes if b <= t]
+            return bool(ends) and t - max(ends) < 300
+
+        cases = {
+            "latency": (1.20, 0.0, "p95 step +20.0%"),
+            "load1": (1.0, 1.5, "load1 +1."),
+        }
+        for name, (factor, add, named) in cases.items():
+            with self.subTest(name):
+
+                def lat(t, on, factor=factor):
+                    return 1.10 if on else factor if tail(t) else 1.0
+
+                def load(t, on, add=add):
+                    return 1.0 + (0.5 if on else add if tail(t) else 0.0)
+
+                _, verdict = timeline_verdict(span, passes, lat, load, ewma=True)
+                self.assertEqual(verdict["status"], "INCONCLUSIVE", reasons(verdict))
+                self.assertIn("recovery after a pass", reasons(verdict))
+                self.assertIn(named, reasons(verdict))
+
+    def test_a_pass_ending_just_before_the_observation_is_not_evidence(self) -> None:
+        # The first OFF window is the only baseline with no pass before it:
+        # a recorded pass ending 100 s before the origin leaves its tail in
+        # it. Before: the interval was skipped silently.
+        passes, span = alternating(3, 600, 600)
+        _, verdict = timeline_verdict(
+            span,
+            [(-700.0, -100.0), *passes],
+            lambda t, on: 1.10 if on else 1.0,
+            lambda t, on: 1.0 + (0.5 if on else 0.0),
+        )
+        self.assertFalse(verdict["evidence"])
+        self.assertTrue(
+            any(
+                "ended 100 s before the observation began" in p
+                for p in verdict["evidence_problems"]
+            ),
+            verdict["evidence_problems"],
+        )
+        # A pass long enough before the origin is recorded, not a problem.
+        built, early = timeline_verdict(
+            span,
+            [(-1600.0, -1000.0), *passes],
+            lambda t, on: 1.10 if on else 1.0,
+            lambda t, on: 1.0 + (0.5 if on else 0.0),
+        )
+        self.assertTrue(early["evidence"], early["evidence_problems"])
+        self.assertEqual(built["config"]["pre_origin_intervals"], [[-1600.0, -1000.0]])
+
+    # Finding 5: unequal OFF windows.
+
+    def test_unequal_off_windows_cancel_a_linear_drift(self) -> None:
+        # The reviewer's E4: gaps growing 360 to 4800 s and the host's load
+        # rising linearly. Each pass adds 2.2; the plain mean of the two
+        # OFF levels read the baseline up to 0.06 high.
+        gaps, on_s = [360, 600, 1200, 2400, 4800], 400
+        passes, t = [], gaps[0]
+        for gap in gaps[1:]:
+            passes.append((t, t + on_s))
+            t += on_s + gap
+        slope = 0.95 / t
+
+        def load(time, on):
+            return 1.0 + slope * time + (2.2 if on else 0.0)
+
+        _, verdict = timeline_verdict(
+            t, passes, lambda _t, on: 1.05 if on else 1.0, load, ewma=True
+        )
+        for pair in verdict["live_baseline"]["pairs"]:
+            self.assertAlmostEqual(pair["d_load1"], 2.2, delta=0.01, msg=pair)
+
+
 if __name__ == "__main__":
     unittest.main()

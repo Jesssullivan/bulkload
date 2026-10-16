@@ -48,8 +48,10 @@ plan, the corpus's capture records and the apply ledger (outcome records and
   before writing anything, and estate-apply restores the workspace (#132).
 
 Anything else is `unaccounted`: a stale journal from an earlier capture, a
-record naming another source, or refs only for an item that plans a
-workspace. Stale and foreign journals are listed. The native `verdict`
+record naming another source, refs only for an item that plans a
+workspace, or a `GIT_CONVERGE_INTERRUPTED` refusal (`converge-interrupted`:
+a converge left its checkout part old, part new under a pending intent; no
+review or attestation closes it, only a rerun that settles it, 2026-10-08). Stale and foreign journals are listed. The native `verdict`
 passes only when `unaccounted` is 0. The report's `gate` is the exit
 status, and a failing gate exits nonzero with `CLOSURE_UNACCOUNTED`. Since
 S4 (WP3 PR 3, 2026-10-06) `gate` no longer equals `verdict` without an
@@ -118,7 +120,79 @@ recorded under another source (`record-source-mismatch`) is still refused
   does. A review row naming such a code disposes nothing and is listed under
   `reviewed.unmatched`; the rest of the ledger keeps working.
 
-The report schema is `bulkload.closure.v2` from this change (it was
+**Transfers in the same report (WP3 PR 4, 2026-10-15, S4).** Every `copy`
+and `pull` session leaves a durable record in its DEST_STATE, one per
+transfer under `transfer.closure.d/<item>.closure` (`<item>` is the
+session row's identity; `bulkload.transfer-closure.v1`, postcard after a
+magic, decoded strictly). The session first makes the verb's S2 overlap
+decision (`transfer::copy_roots_apart`, `receive_roots_apart`), so a
+refused overlap writes nothing; then, when DEST_STATE already exists (a
+record never creates a state root), takes the record's lock (a second
+session of the same transfer refuses before it writes) and writes
+`running`; and writes its end when it ends. A rerun of the same transfer
+replaces its record; another transfer sharing the DEST_STATE has its own.
+A session that ends refused, or never ends, keeps the refused and covered
+rows of the record it replaced; only a completed session (which walked
+the whole source again) replaces them. An unreadable earlier record is
+never overwritten, and a DEST_STATE that exists after a session but took
+no closing record refuses `CLOSURE_UNACCOUNTED`. `closure-report
+--transfer DEST_STATE` (repeatable, only before PLAN; canonicalized, so one
+state under two spellings refuses, as does any transfer row joined twice)
+joins every record there as rows of the
+same report, totals and gate:
+
+- a **session** row (`kind: transfer-session`): `applied` when the session
+  ran to its end; a typed refusal when the session itself refused; and
+  `unaccounted` when the record still says `running`
+  (`transfer-interrupted`: a crash or a kill cut it short), when there is no
+  record (`no-transfer-record`) or none that decodes
+  (`transfer-record-unreadable`), or when the session refused with a bare
+  `IO` or `FRAME_CODEC`;
+- one **entry** row per refused path (`kind: transfer-entry`), classified
+  exactly as an estate item's recorded refusal (`closure::refusal_disposition`):
+  pending review until a review disposes it, never closed when untyped or
+  retired. `SQLITE_INTEGRITY_CHECK_FAILED`, and `SQLITE_BACKUP_FAILED` whose
+  primary code is 11 or 26, carry their ruled default disposition,
+  `abandon` (OI-1003-Q148): it disposes the row unless an item review or a
+  standing policy says otherwise (the review wins), and the row's `review`
+  prints `basis: ruled-default` with the ruling;
+- one **covered** row per live `-wal`, `-shm` or `-journal` the source
+  reported beside a database carried as a snapshot (`covered`, accounted).
+
+A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
+source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
+and the code (or `covered`); its refusal `instance` digests the row's
+record, so a rerun that refuses identically keeps its review and any other
+record is a new instance. `closure-dispose --transfer DEST_STATE` reviews a
+transfer row as it reviews a planned item, in the same plan-bound ledger.
+
+A run's expected transfers are bound to its PLAN by a transfer manifest
+(`bulkload.transfer-manifest.v1`, text): `transfer-expect MANIFEST PLAN
+copy|pull ...` lists each transfer (named as the verb records it, its
+DEST_STATE canonical), creating the manifest with the PLAN's digest and
+`since` (now) when absent. `closure-report --transfer-manifest MANIFEST`
+(and `closure-dispose`) refuses `RECEIPT_BINDING_INVALID` for another
+PLAN's manifest and joins exactly the listed transfers: one with no record
+is `no-transfer-record`, one whose session started before `since` is
+`transfer-record-stale` (its entry rows still joined), and a record of
+another verb is `transfer-record-mismatch`, all unaccounted. Creating the
+manifest when the closing pass starts makes `since` that pass's marker.
+The report prints a `transfer_manifest` block when one is joined; without
+one it covers only the transfers named, which the absent block shows.
+An attestation names planned items only: it never closes a transfer row.
+Not joined: `snapshot` and the offline compose verbs, which belong to no
+run; a source's tagged engine temporaries a walk skipped are listed by the
+transfer, not rows.
+
+The report schema is `bulkload.closure.v3` from WP3 PR 4. What changed for
+a v2 reader: a transfer row names its `kind` and adds `transfer` (the
+DEST_STATE), `path`, `transfer_outcome` and, with its refusal, `sqlite_code`
+(an estate row prints as in v2); `disposition` can be `covered`; the totals
+add `transfer_rows`, `covered` and `ruled_default`, and `applied`,
+`refused`, `refused_pending_review` and `unaccounted` count transfer rows
+too (`planned` still counts planned estate items only).
+
+The report schema was `bulkload.closure.v2` from WP3 PR 3 (it was
 `bulkload.closure.v1`). What changed for a v1 reader:
 
 - `disposition` can be `refused-pending-review`; `refused` means reviewed.
@@ -189,8 +263,12 @@ Source safety (S2, WP1):
   - `FIEMAP` shows sharing that exists when it looks, not a clone later
     undone, and is trusted only on file systems that report it (xfs,
     btrfs, bcachefs, ocfs2); the static half rules the call out.
-  - The two `std::fs::copy` calls left copy bulkload's own staged capture
-    bundle into its receipts, on the destination side.
+  - Three `std::fs::copy` calls are left, all on the destination side and
+    none with a source file as input. Two copy bulkload's own staged
+    capture bundle into its receipts. The third, estate converge's
+    `publish_index` (OI-1003-Q144), copies the landed checkout's
+    `.git/index`, which the operator's Git may have rewritten since
+    landing, to converge's private merged index beside it.
   - `bulkload_agent::extents` is the read-only `FIEMAP` probe.
 - SQLite provider snapshots are S2's stated exceptions: one lock and two
   writes. Every source is read through the backup API from a read-only,
@@ -381,8 +459,125 @@ neither an index nor a worktree (S4, #162).
     `GIT_DESTINATION_OCCUPIED`. The one check after publication catches a
     concurrent writer.
 
-Import preserves divergence and leaves active HEADs, indexes and
-working bytes untouched. estate-apply refuses a planned item whose capture
+Estate converge (2026-10-08, branch `feat/estate-converge-20261008`;
+`docs/agent-notes/2026-10-08-estate-converge-design.md`). **The
+converge half is held for an operator ruling and its TLA+ model (Q1 of
+that note) before merge.**
+
+- **Native refs (#215).** A standalone first landing restores every
+  carried ref natively inside its private stage (the repository bulkload
+  creates): `refs/heads`, `refs/tags`, `refs/remotes`, `refs/notes` and any
+  other namespace, and the stash with the source's reflog order (a
+  capture with a stash carries `stash-order-v1`) and each stash commit's
+  subject as its message, which is the reflog message for `git stash
+  push`; a `git stash store -m` message is not carried, and a change to a
+  stash's message alone moves no key (open, 2026-10-15 review). Never
+  natively: `refs/carry/**`, `refs/carry-*/**`, `refs/stash` (its own table),
+  per-worktree refs, `refs/remotes/*/HEAD`, and any ref that is a symref at
+  the destination. Provenance under `refs/carry/v1/<SOURCE>/<instance>/` is
+  written as before. HEAD goes on the source's branch, or detached at the
+  captured head with the branch recorded (`head-detached-ref-conflict`);
+  no `carry/*` branch is created. A linked item attaches the same way; a
+  repository bulkload did not create gets no native ref but the linked
+  item's own HEAD branch (created by `worktree add -b` when absent).
+- **Ledgers.** A ref ledger (`$GIT_COMMON_DIR/bulkload/v1/<SOURCE>/refs.landed`,
+  with the repository marker, tombstones, the stash and the exclude, each
+  with its capture instant) and a workspace ledger
+  (`$GIT_DIR/bulkload/v1/<SOURCE>/workspace.landed`: capture, HEAD, index
+  entries digest, the stat print of every seat on its file system) record
+  what bulkload landed, next to it. Each is written atomically after the
+  Git writes it names, which run with `core.fsync=reference,index,objects`;
+  a Git older than 2.46 refuses `GIT_UNAVAILABLE`.
+- **Refs converge** on every apply into a repository bulkload created: a
+  ref follows the source only while it still holds the value bulkload set
+  and the capture is newer (compare-and-swap); a ref changed or deleted at
+  the destination, any worktree's checked-out branch, and a branch a rebase
+  or bisect in progress holds (`rebase-merge/head-name`,
+  `rebase-apply/head-name`, `BISECT_START`), is left alone and reported; a
+  remote-tracking ref the source pruned is deleted, a local branch or tag
+  is kept. Every worktree's HEAD is held by Git's own `HEAD.lock` while a
+  ref transaction runs and the checked-out set is read under it, so no
+  HEAD is written onto a branch the transaction then moves (2026-10-09;
+  a `git switch` that read the branch before that lock is a stated limit
+  below). A ref Git cannot create because a ref that stays
+  sits above or below its name (`foo` kept, `foo/bar` new) stays at
+  provenance (`ref-name-conflict`); a pruned name is deleted in its own
+  transaction before its successor is created. A checkout's new HEAD
+  branch moves only with HEAD, never in the ref step, and so does any
+  branch a pending workspace intent of another item names; the branch a
+  HEAD left is brought to the capture by a ref step after HEAD moved
+  (left to the next apply's settle, never a refusal, when another writer
+  holds it then).
+  Every ref write syncs the directories its renames changed before a
+  ledger names it.
+- **Checkouts converge** when the capture changed: the landed checkout is
+  proved unchanged against its ledger (HEAD, index entries, a standalone
+  item's exclude, every landed seat by print or by content); a failed proof
+  refuses `GIT_DESTINATION_MODIFIED` with nothing written. Otherwise only
+  the delta is written, under a durable intent: refs, each seat by
+  `RENAME_EXCHANGE` with the displaced file checked (put back if it is not
+  the landed one), the index under `index.lock` by compare-and-swap (the
+  ledger records the digest of the index installed, never a re-read), then
+  the HEAD branch in its own transaction under every worktree's HEAD lock
+  with this HEAD verified, then HEAD, and the intent records HEAD done (a
+  settle then never moves HEAD again). HEAD is never attached to a branch
+  another worktree has checked out or holds: read under every other
+  worktree's HEAD lock, held until HEAD is written; a settle re-plans such
+  a HEAD detached with the branch recorded (review 4). A crash leaves every component old
+  or new; the next apply settles the intent forward before anything else:
+  Git lock files a killed Git child left are removed when their content
+  proves them bulkload's, and so are the HEAD locks of every pending
+  intent before any ref transaction; an empty lock never is (any other
+  refuses `GIT_CONVERGE_INTERRUPTED`), and an orphan `packed-refs.new`
+  with no `packed-refs.lock` is removed; bulkload's own locks hold their
+  marker from the moment they exist; a
+  ref op on a branch checked out since is not redone, a HEAD branch line
+  that can no longer apply is re-planned (detached with the branch
+  recorded when it must), a file the source turned into a directory is
+  found done, the stash continues only from the progress its intent
+  records (an operator's drop is kept, and the ledger keeps the reflog
+  bulkload last landed, so later applies keep it too), and probe files a
+  crashed pass left are removed. Every refusal after the intent is
+  `GIT_CONVERGE_INTERRUPTED`, and an unborn HEAD refuses
+  `GIT_DESTINATION_MODIFIED`. An older capture refuses
+  `GIT_CONVERGE_STALE_CAPTURE`, a changed
+  shallow frontier, nested custody or rebuildable set
+  `GIT_CONVERGE_SHAPE_CHANGED`, a checkout this item landed and an
+  operator removed `GIT_DESTINATION_MODIFIED`, and so does a landed
+  directory the source turned into a file or symlink while it holds an
+  entry bulkload did not land (checked before the intent). Configuration
+  is applied once at the first landing and only reported after.
+- **Not the landings made before this branch.** A checkout landed without
+  ledgers (the 2026-10-08 landing under `/srv/data`) still refuses
+  `GIT_DESTINATION_OCCUPIED` on a re-apply, and a repository without the
+  ref ledger's marker gets provenance only. Converging it needs an
+  adoption verb (`--adopt`) or a fresh landing; both await a ruling (Q4,
+  Q8 of that note).
+- One plan lands a main and its linked worktrees: an item whose repository
+  is a planned standalone workspace applies a level after it, and a
+  standalone item's plan base is imported into its stage. A first linked
+  landing writes a landing intent before `git worktree add`; a crash before
+  its ledger leaves a worktree the rerun finishes forward (only absent
+  seats are written: each entry is laid down under a temporary name and
+  renamed into place, so an operator's file at an entry's name, or any
+  index the landing did not write, refuses `GIT_DESTINATION_MODIFIED`),
+  never `GIT_DESTINATION_OCCUPIED` for good.
+- **Limits (2026-10-09).** A HEAD detached because its branch was checked
+  out elsewhere re-attaches, and a ref the operator put back to its landed
+  value converges, only on the next capture: the journal no-op (A4) reads
+  nothing. An empty Git lock (a delete's, `packed-refs.lock`, the
+  `HEAD.lock` Git takes for the HEAD reflog), or one with content that is
+  not bulkload's, is not provably bulkload's: a killed child's refuses
+  typed until the operator removes it, as Git instructs, and a live
+  writer's is never touched (review 4). `HEAD.lock` serialises only the
+  final HEAD write of a `git switch`: a transaction that moves a branch
+  after a switch read it leaves that worktree on the branch over its old
+  commit's files and index.
+
+Import preserves divergence and leaves active HEADs, indexes and working
+bytes untouched, with one exception pending the ruling above: a checkout
+bulkload landed and nobody changed since is converged to a newer capture
+of the same source. estate-apply refuses a planned item whose capture
 the corpus does not hold (its capture refused, or none ran) with
 `CAPTURE_ABSENT`, before it reads anything else; `SEALED_OBJECT_MISSING`
 names only a recorded capture whose bundle, link or base the corpus lost
@@ -391,8 +586,11 @@ exist, or into a directory Git finds no repository in (an empty directory,
 an unfinished `git init`), refuses `GIT_REPOSITORY_NOT_AT_PATH` as that
 item's own receipt, never `GIT_INVENTORY_MALFORMED` or
 `GIT_DESTINATION_OCCUPIED`, and never aborts the apply's other items (S4,
-#183). A standalone item on a plan base still refuses
-`GIT_DESTINATION_OCCUPIED`: a standalone destination is never preseeded. Account credentials carry privately; platform stores
+#183). A standalone item on a plan base is never preseeded into an
+existing destination: its plan base is staged into its own private stage
+(estate converge, above), and an occupied standalone destination without
+ledgers still refuses `GIT_DESTINATION_OCCUPIED`. Account credentials
+carry privately; platform stores
 may require a format transcode. Destination machine keys and Home Manager
 links are preserved. Credential contents are never printed.
 
@@ -405,9 +603,43 @@ their snapshots for explicit resolution.
 A capture pass tolerates refs and worktree seats moving under it (R25), so
 writers never pause for a capture. What moved is recorded, never absorbed:
 
-- Only ref and seat drift is tolerated. HEAD, the index, configuration, the
-  shallow frontier, nested worktree custody or the omitted rebuildable roots
+- Ref and seat drift is tolerated, and since #38 (2026-10-15, OI-1003-Q11;
+  S5 under OI-1003-Q152: no freeze window, the run closes by converging
+  deltas while the source stays live) so are HEAD, the index and nested
+  worktrees' HEADs: an agent committing, switching or staging in the
+  captured checkout, or in a worktree nested in it, under the pass. Each is
+  a drift row, `HeadMoved` named `HEAD` (the commit HEAD resolves to or the
+  branch it names), `IndexRewritten` named `index`, `NestedWorktreeMoved`
+  named by the nested worktree's path. The bundle carries the HEAD and the
+  index bytes its own snapshot read, which the source held then; a move
+  under the export marks it drifted in-band, so no restore or apply lays it
+  down (`CAPTURE_DRIFTED`), and a move outside the export's window poisons
+  the recorded key (a move away and back across those windows too, nested
+  worktrees' HEADs compared with the export's own census before and after
+  its pass). A key-drift capture is a coherent snapshot of the state the
+  export read: it applies and the closure counts it applied. Either way
+  the next pass captures the new HEAD and index, and the apply after it
+  converges the landing.
+- The stash is drift custody too, since OI-1003-Q161 (2026-10-15): an
+  agent's `git stash push`, `pop`, `drop`, `clear` or `store` under the
+  pass rewrites the stash reflog (and refs/stash with it, except a drop
+  below the tip). It is a `StashMoved` row named `refs/stash`
+  (`stash_drift`), beside any `refs/stash` ref row, in the same two classes
+  as HEAD and the index: the bundle carries the stash its snapshot read
+  (its commits and the stash order), a move under the export is never laid
+  down, a move outside it poisons the key (away and back too), and the
+  next pass carries the new stash, which the apply converges in the
+  source's order (P87's stash row). A `pop` or `drop` of the last stash
+  between a read of the ref inventory and the read of the stash reflog
+  (refs/stash and its reflog deleted) reads as no stash, so it too is a
+  move (`StashMoved`, or `RefRemoved` in the snapshot, or a torn key),
+  never `GIT_CHILD_FAILED`; any other failure of that read still refuses.
+  The EstateConverge model's raced moves include it (`stashrace`); no
+  protocol step changes.
+- The exclude file, configuration, the shallow frontier, foreign nests and
+  gitlinks (a staged gitlink change too), or the omitted rebuildable roots
   moving under a pass still refuse `GIT_AUTHORITY_CHANGED` (R-N30).
+  `git-export` and the other strict exports still refuse any drift.
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
 - An object-store rewrite is drift too (WP1, S5). The export reads the
@@ -429,10 +661,13 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   checks validate a private copy of the carried bytes, never the live index):
   HEAD, the symbolic HEAD, the index bytes, `info/exclude`, the stash reflog, the
   configuration files and the shallow frontier. The export re-reads all of
-  it at the end of its pass, and the capture refuses `GIT_AUTHORITY_CHANGED`
-  unless both key parts name exactly what the export carried, so authority
-  that moves away and back outside the export's window can never leave a
-  stale bundle behind an equal key.
+  it at the end of its pass. HEAD, the symbolic HEAD, the index and the
+  stash reflog that moved, under the export or between a key and it, even
+  away and back, are named as drift rows (#38, OI-1003-Q161), so the
+  recorded key is poisoned and a stale
+  bundle never stands behind an equal key; the rest refuses
+  `GIT_AUTHORITY_CHANGED` unless both key parts name exactly what the
+  export carried.
 - Index entry flags (#106): an intent-to-add entry (`git add -N`) is
   carried as index custody, `refs/carry-export/intent-to-add-v1` (path,
   mode, empty-blob flag), recorded only when there is one; its seat's bytes
@@ -734,6 +969,25 @@ sealed corpus a sample reads is an explicit read and write, checked with
 and a shared extent refuses the sample (docs/slo.md, the 2026-10-15
 amendment).
 
+S2's budget measured alongside a real run (#165, `s2_budget.py observe` and
+`alongside`; OI-1003-Q152 keeps the source live) is judged against the
+source's own live load (OI-1003-Q160): the OFF windows between passes are
+the baseline, with no absolute load1 cap (R-N81's 2.5 is amended for
+alongside observations only; a gated `s2_budget.py run` keeps it). The
+budget is unchanged (+25 % p95, +2.0 load1 over that baseline), and AC
+power, at least five alternating windows of at least 300 s and recorded
+load are still required. The verdict reports the OFF windows' load spread
+and compares each pass with the OFF windows on both sides of it,
+interpolated to the pass's time, gate by gate: a pooled PASS stands only
+when every pair passes, a pooled FAIL when every pair fails a gate that
+failed pooled. A PASS also needs no recovery tail in the OFF windows after
+passes. Every pass is judged (a pass dropped as a short ON window is not
+evidence), and the first OFF window must be clear of a pass recorded just
+before the observation. This removes linear drift in the source's own
+load; load that rises and falls with the passes themselves is not
+separable, and the instrument lists no processes to separate it (R-N104).
+Such evidence is labelled `alongside, live baseline (OI-1003-Q160)`.
+
 ## Wire v6
 
 The transfer wire is protocol 6, a hard cut with no dual stack (R-N59,
@@ -918,8 +1172,8 @@ miss (#87).
     `integrity_check` exactly `ok`, opened `immutable=1`) before it is
     published; a failure refuses `SQLITE_INTEGRITY_CHECK_FAILED`, whose
     default S4 disposition is `abandon` (OI-1003-Q148; printed beside the
-    refusal as `default-disposition <path>: abandon` until transfer
-    refusals are closure-ledger rows, WP3 PR 4). Corruption the backup step
+    refusal as `default-disposition <path>: abandon`, and since WP3 PR 4
+    the transfer's closure row carries it: `closure-report --transfer`). Corruption the backup step
     itself reports (`SQLITE_BACKUP_FAILED` with primary code 11
     `SQLITE_CORRUPT` or 26 `SQLITE_NOTADB`) never reaches
     `integrity_check`; it keeps its own code, and takes the same `abandon`
@@ -1102,6 +1356,10 @@ platform, since `fullfsync` is set only after the switch. The seal is one
 which would add a device-cache flush the old path never paid); the store's
 root seal and its first commit drain the device after it, so the page is on
 stable media no later than the store's first WAL frame, which a WAL needs.
+That ordering rests on this argument alone: the template's write and seal
+are the database file's own I/O, outside the R-N88 trace, so no power-loss
+proof explores them on either platform, and the Darwin seal is compiled
+and tested (`just darwin-check`) but not measured on APFS.
 `BULKLOAD_STORE_WAL_TEMPLATE=0` restores `SQLite`'s own switch for A/B
 (`store_wal_templates` counts the stores made from the template). A crash
 inside that write leaves at most one page of zeros and template bytes with
@@ -1112,7 +1370,8 @@ On Linux in group mode, a group of two or more outputs is sealed
 device-wide instead (S1, OI-1003-Q107; `io::durable::batched`). Each output
 starts write-back as it is queued (`sync_file_range(WRITE)`, not a
 durability step). The group then runs one device seal per device number its
-files live on (`syncfs`, then `fsync` of one of those files), which makes
+files live on (`syncfs` through that file's parent directory, opened again
+for the seal, then `fsync` of one of those files), which makes
 every temporary's data durable under its temporary name; renames each into
 place; runs one device seal per touched device number again (`syncfs`, then
 `fsync` of one touched directory), which makes the new entries durable; and
@@ -1157,9 +1416,9 @@ conditions bound the batched path (OI-1003-Q107 review, 2026-10-08):
   the drive's volatile cache; `xfs_file_fsync` sends the flush itself when
   its log force was a no-op. On ext4 after a forced shutdown, `ext4_sync_fs`
   returns 0 (v5.17 and v6.12) where `ext4_sync_file` returns `EIO`. Each
-  device seal therefore ends with an `fsync` of the descriptor its `syncfs`
-  ran on, which covers both, at the cost of one extra (usually empty) cache
-  flush per device per step.
+  device seal therefore ends with an `fsync` of one member file (or, in the
+  second step, the touched directory), which covers both, at the cost of one
+  extra (usually empty) cache flush per device per step.
 - **Each file's own write-back error.** `syncfs` reports a write-back error
   against the cursor of the one descriptor it is called on, so an error an
   earlier `syncfs` elsewhere already consumed is not reported again. After
@@ -1167,7 +1426,14 @@ conditions bound the batched path (OI-1003-Q107 review, 2026-10-08):
   `sync_file_range(WAIT_BEFORE | WRITE | WAIT_AFTER)`, which returns that
   file's own write-back error against its own descriptor's cursor, as its
   `fsync` would, and flushes no cache. One failure refuses the whole group
-  before any rename.
+  before any rename. The `syncfs` itself runs on a directory descriptor the
+  seal opens for it, whose cursor starts at the superblock's current
+  error: a long-lived descriptor (a staged temporary, a destination
+  directory) would report an error raised since its open, by one bad file
+  or another process on a shared file system, again for every later group
+  whose seal ran on another such descriptor, refusing healthy groups (S1
+  stack review, 2026-10-15). The file system's own `->sync_fs` failure is
+  returned whatever the cursor.
 - **Kernel floor: Linux 5.17-rc3** (OI-1003-Q113 set 5.8; OI-1003-Q141, ruled
   2026-10-08, moved it to 5.17, on the two commits below). 5.8 made `syncfs` report data write-back errors, but
   until torvalds/linux commit 5679897eb104 ("vfs: make sync_filesystem

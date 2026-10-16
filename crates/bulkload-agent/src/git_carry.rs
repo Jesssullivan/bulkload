@@ -20,6 +20,7 @@ use crate::{BulkloadRefusal, Result};
 
 mod batch_objects;
 pub mod chain;
+pub mod converge;
 pub mod decide;
 #[cfg(test)]
 #[allow(
@@ -38,6 +39,8 @@ pub mod estimate;
     clippy::unwrap_used
 )]
 mod inert_origin_tests;
+pub(crate) mod landed;
+pub(crate) mod native_refs;
 mod raw_tree;
 mod ref_table;
 #[cfg(test)]
@@ -126,6 +129,16 @@ pub(crate) mod git_env {
     /// repository's own store lists it as its first alternate, so every
     /// reader (bundle, pack, fetch, fast-import, update-ref) sees both.
     pub const WRITE_STORE: &str = "objects-written";
+
+    /// `-c` overrides every destination write runs with (estate converge,
+    /// finding 7): Git's default fsyncs objects only, so a ref, packed-refs,
+    /// reflog or index write could be lost to a power cut after the bulkload
+    /// ledger naming it was made durable. With these, Git makes each durable
+    /// before it returns.
+    pub const DESTINATION: &[&str] = &[
+        "core.fsync=reference,index,objects",
+        "core.fsyncMethod=fsync",
+    ];
 }
 
 /// A Git child for the repository at `repo`, hardened from [`git_env`]:
@@ -155,6 +168,81 @@ fn git(repo: &Path) -> Command {
         command.env("GIT_CEILING_DIRECTORIES", ceiling);
     }
     command
+}
+
+/// The oldest Git whose destination writes this carry trusts: 2.46 has
+/// `core.fsync=reference` (2.36) and `update-ref --stdin`'s `symref-*`
+/// commands, which move a worktree's HEAD and its branch in one
+/// compare-and-swap transaction (estate converge, findings 2 and 7).
+pub(crate) const DESTINATION_GIT_MINIMUM: (u32, u32) = (2, 46);
+
+/// Make `command` (a [`git`] child) a destination writer: the
+/// [`git_env::DESTINATION`] fsync overrides, and a fixed committer for the
+/// reflog entries it writes (no global identity is read).
+fn durable(command: &mut Command) {
+    for value in git_env::DESTINATION {
+        command.args(["-c", value]);
+    }
+    command
+        .env("GIT_COMMITTER_NAME", "bulkload")
+        .env("GIT_COMMITTER_EMAIL", "bulkload@localhost")
+        .env("GIT_AUTHOR_NAME", "bulkload")
+        .env("GIT_AUTHOR_EMAIL", "bulkload@localhost");
+}
+
+/// `read-tree` into the index `command` names (a [`git`] child, often with
+/// `GIT_INDEX_FILE`): one tree, or a two-way merge.
+fn read_tree(command: &mut Command, trees: &[&str]) -> Result<()> {
+    durable(command);
+    command.arg("read-tree");
+    if trees.len() > 1 {
+        // A two-way merge of the index alone: the worktree already holds
+        // the new seats, so its check is off (`-i`). Unchanged entries keep
+        // their stat data.
+        command.args(["-m", "-i"]);
+    }
+    output(command.args(trees)).map(drop)
+}
+
+/// The metadata ref carrying a capture's stash reflog order (estate
+/// converge, design 3.1), newest first.
+const STASH_ORDER_METADATA: &str = "stash-order-v1";
+
+/// The metadata revision naming a capture's worktree tree.
+const WORKTREE_REVISION: &str = "worktree";
+
+/// Refuse `GIT_UNAVAILABLE` unless the host's Git is at least
+/// [`DESTINATION_GIT_MINIMUM`]: an older Git ignores `core.fsync` silently,
+/// so its ref writes would not be durable before the ledgers naming them.
+///
+/// # Errors
+/// `GIT_UNAVAILABLE` for a Git that is absent, unparseable or too old.
+pub(crate) fn destination_git_ready() -> Result<()> {
+    static READY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // Run directly, not through `output`: the version probe is no child a
+    // test's injected fault is aimed at, and its answer is cached for the
+    // process (a fault taken here made every later apply in the test binary
+    // refuse GIT_UNAVAILABLE, depending on which test ran first).
+    let ready = *READY.get_or_init(|| {
+        estimate::run_git(git(Path::new("/")).arg("version"), None)
+            .ok()
+            .and_then(|found| String::from_utf8(found).ok())
+            .and_then(|found| git_version(found.trim_end()))
+            .is_some_and(|version| version >= DESTINATION_GIT_MINIMUM)
+    });
+    if ready {
+        Ok(())
+    } else {
+        Err(BulkloadRefusal::GitUnavailable)
+    }
+}
+
+// `git version 2.52.0` (or `2.39.3 (Apple Git-146)`) as (major, minor).
+fn git_version(line: &str) -> Option<(u32, u32)> {
+    let mut parts = line.strip_prefix("git version ")?.trim().split(['.', ' ']);
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    Some((major, minor))
 }
 
 /// A Git child that writes objects into the capture's private repository at
@@ -710,8 +798,10 @@ pub fn common_repository(repo: &Path) -> Result<PathBuf> {
 /// The key is an opaque digest and cannot say *what* moved. These parts can, so
 /// a caller re-reading them after a pass can tell drift it may tolerate (the ref
 /// inventory and the worktree census: what a sibling agent lane or a build tool
-/// produces) from Git authority it must refuse (HEAD, the index, configuration,
-/// the shallow boundary, nested worktree custody, the omitted rebuildable roots).
+/// produces, and since #38 and OI-1003-Q161 HEAD, the index, the stash reflog
+/// and nested worktrees' HEADs: what an agent in the checkout moves) from Git
+/// authority it must refuse (the exclude file, configuration, the shallow
+/// boundary, foreign nests and gitlinks, the omitted rebuildable roots).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyParts {
     repo: Vec<u8>,
@@ -878,23 +968,24 @@ impl KeyParts {
         Ok(*hash.finalize().as_bytes())
     }
 
-    /// Whether every key input outside the two drift-tolerant ones is unchanged.
+    /// Whether every key input outside the drift-tolerant ones is unchanged.
     ///
     /// The ref inventory and the worktree census are the concurrency classes a
-    /// sibling agent lane or a build tool produces. Everything else moving is
+    /// sibling agent lane or a build tool produces. HEAD, the index and the
+    /// nested worktrees' HEADs are what an agent working in the checkout
+    /// moves (#38, OI-1003-Q11): since S5 under OI-1003-Q152 they are drift
+    /// custody too, carried by the next pass, and so is the stash reflog
+    /// (OI-1003-Q161: a stash push, pop or drop). Everything else moving
+    /// (the exclude file, the configuration, the shallow frontier, foreign
+    /// nests and gitlinks, the omitted roots, the repository's identity) is
     /// Git authority changing under the capture and stays a refusal (R-N30).
     #[must_use]
     pub fn drift_only(&self, other: &Self) -> bool {
         self.repo == other.repo
             && self.common == other.common
-            && self.head == other.head
-            && self.symbolic == other.symbolic
-            && self.index == other.index
             && self.exclude == other.exclude
-            && self.stash == other.stash
             && self.configuration == other.configuration
             && self.boundary == other.boundary
-            && self.nested == other.nested
             && self.nested_repositories == other.nested_repositories
             && self.omitted == other.omitted
             && self.identities == other.identities
@@ -928,11 +1019,22 @@ impl KeyParts {
     /// Whether these parts name exactly the authority an export carried.
     #[must_use]
     pub fn carries(&self, carried: &CarriedAuthority) -> bool {
-        self.head == carried.head
-            && self.symbolic == carried.symbolic
-            && self.index == carried.index
-            && self.exclude == carried.exclude
-            && self.stash == carried.stash
+        self.carries_fixed(carried)
+            && head_index_drift(
+                (&self.head, &self.symbolic, &self.index),
+                (&carried.head, &carried.symbolic, &carried.index),
+            )
+            .is_empty()
+            && stash_drift(&self.stash, &carried.stash).is_empty()
+    }
+
+    /// Whether these parts name the authority an export carried in every
+    /// part that is never drift: the exclude file, the configuration and
+    /// the shallow frontier. HEAD, the index and the stash reflog are drift
+    /// custody (#38, OI-1003-Q161).
+    #[must_use]
+    pub fn carries_fixed(&self, carried: &CarriedAuthority) -> bool {
+        self.exclude == carried.exclude
             && self.configuration == carried.configuration
             && self.boundary == carried.boundary
     }
@@ -947,21 +1049,51 @@ impl KeyParts {
     /// equal to `later`, yet the bundle lacks it; only comparing the keyed
     /// inventories with the export's own names it (R-N72).
     ///
-    /// Git authority is never drift. HEAD, the symbolic HEAD, the index, the
-    /// exclude file, the stash reflog, the configuration or the shallow
-    /// frontier that moved away and back between a key and the export's
-    /// snapshot or end, leaving the two keys equal, still refuses: the bundle
-    /// carries what the source held at neither key.
+    /// HEAD, the symbolic HEAD, the index and the stash reflog that moved
+    /// between a key and the export's snapshot or end are drift custody
+    /// (#38, OI-1003-Q161, S5): the export carries the values its own
+    /// snapshot read, which the source held then, and the moves are named
+    /// (`HeadMoved`, `IndexRewritten`, `StashMoved`), so the recorded key is
+    /// poisoned and the next pass carries the new values. They are named
+    /// even when they moved away and back, leaving the two keys equal
+    /// (R-N72), and so are nested worktrees' HEADs, compared with the
+    /// export's own census before and after its pass. The rest of Git
+    /// authority is never drift: the exclude file, the configuration or the
+    /// shallow frontier that moved, even away and back, still refuses: the
+    /// bundle carries what the source held at neither key.
     ///
     /// # Errors
     /// Refuses [`BulkloadRefusal::GitAuthorityChanged`] unless both key parts
-    /// name exactly the authority the export carried, as
-    /// [`KeyParts::drift_to`] does, and on malformed inventories.
+    /// name the authority the export carried in every part that is never
+    /// drift ([`KeyParts::carries_fixed`]), as [`KeyParts::drift_to`] does,
+    /// and on malformed inventories.
     pub fn drift_across(&self, export: &Export, later: &Self) -> Result<CaptureDrift> {
-        if !self.carries(&export.authority) || !later.carries(&export.authority) {
+        if !self.carries_fixed(&export.authority) || !later.carries_fixed(&export.authority) {
             return Err(BulkloadRefusal::GitAuthorityChanged);
         }
+        let carried = (
+            export.authority.head.as_str(),
+            export.authority.symbolic.as_slice(),
+            export.authority.index.as_slice(),
+        );
         let mut drift = self.drift_to(later)?;
+        drift.extend(head_index_drift(
+            (&self.head, &self.symbolic, &self.index),
+            carried,
+        ));
+        drift.extend(head_index_drift(
+            carried,
+            (&later.head, &later.symbolic, &later.index),
+        ));
+        // OI-1003-Q161: the stash likewise, away and back included (a
+        // `stash drop` of an older entry moves only the reflog).
+        drift.extend(stash_drift(&self.stash, &export.authority.stash));
+        drift.extend(stash_drift(&export.authority.stash, &later.stash));
+        // Nested worktrees likewise (review finding 4): a HEAD switched
+        // away before the export's census and back after its re-read
+        // leaves both keys equal, yet the bundle's custody names it.
+        drift.extend(nested_worktree_drift(&self.nested, &export.nested_before));
+        drift.extend(nested_worktree_drift(&export.nested_after, &later.nested));
         drift.extend(reference_drift(&self.inventory, &export.refs_before)?);
         drift.extend(reference_drift(&export.refs_after, &later.inventory)?);
         drift.seal()?;
@@ -992,6 +1124,14 @@ impl KeyParts {
         let mut drift = CaptureDrift::default();
         drift.extend(reference_drift(&self.inventory, &later.inventory)?);
         drift.extend(seat_drift_by(&self.rows, &later.rows, |a, b| a == b));
+        // #38 (S5): HEAD, the index and nested worktrees' HEADs are custody,
+        // and the stash reflog (OI-1003-Q161).
+        drift.extend(head_index_drift(
+            (&self.head, &self.symbolic, &self.index),
+            (&later.head, &later.symbolic, &later.index),
+        ));
+        drift.extend(stash_drift(&self.stash, &later.stash));
+        drift.extend(nested_worktree_drift(&self.nested, &later.nested));
         drift.seal()?;
         // Fail closed: a key that moved must name what moved.
         if drift.is_empty() != (self == later) {
@@ -1048,7 +1188,9 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
         Err(error) => return Err(crate::refuse::io(&error, "git_carry::read_authority")),
     };
     let stash = if inventory.lines().any(|line| line.ends_with(" refs/stash")) {
-        output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"]))?
+        #[cfg(test)]
+        mid_pass::fire(repo, mid_pass::Stage::StashReflog);
+        source_stash_reflog(repo)?
     } else {
         Vec::new()
     };
@@ -1062,6 +1204,31 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
         boundary: shallow::frontier(repo)?,
         gitlinks,
     })
+}
+
+// The stash reflog, newest first, for an inventory that listed refs/stash.
+// OI-1003-Q161 review: a `git stash pop` or `drop` of the last stash after
+// that inventory was read deletes refs/stash and its reflog, and the read
+// fails. When refs/stash no longer resolves, that is the stash as it is now
+// (none), read as drift custody by the comparisons that follow it (the
+// carried stash against none: `StashMoved`; the inventory against the next:
+// `RefRemoved`; a torn key no consistent key equals), never
+// GIT_CHILD_FAILED. Any other failure still refuses as the child failed.
+fn source_stash_reflog(repo: &Path) -> Result<Vec<u8>> {
+    match output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"])) {
+        Err(refusal @ BulkloadRefusal::GitChildFailed(_)) => {
+            let resolved = git(repo)
+                .args(["rev-parse", "--verify", "-q", "refs/stash"])
+                .output()
+                .refuse_at("git_carry::source_stash_reflog")?;
+            if resolved.status.code() == Some(1) {
+                Ok(Vec::new())
+            } else {
+                Err(refusal)
+            }
+        }
+        read => read,
+    }
 }
 
 // HEAD's commit, as `rev-parse --verify HEAD` names it. S4 (#162, #219): a
@@ -1517,9 +1684,14 @@ pub fn export_repository_with_prerequisite(
 /// halt agent work or git work). A drifted seat's bytes are carried by neither
 /// the worktree tree nor `filesystem-v1`; the drift list is the statement that
 /// they are absent, and the next pass re-reads exactly those seats (R-N28).
-/// Git authority moving -- HEAD, the index, configuration, the shallow
-/// boundary, nested worktree custody, the omitted rebuildable roots -- is still
-/// a refusal (R-N30).
+/// HEAD, the index, the stash reflog and nested worktrees' HEADs moving
+/// under the pass (an agent committing, switching, staging or stashing in
+/// the checkout) are drift custody too: `HeadMoved`, `IndexRewritten`,
+/// `StashMoved` and `NestedWorktreeMoved` rows, and the bundle carries the
+/// HEAD, index and stash its snapshot read (#38, OI-1003-Q11, OI-1003-Q161,
+/// S5 under OI-1003-Q152). The rest of Git authority moving -- the exclude
+/// file, configuration, the shallow boundary, foreign nests and gitlinks,
+/// the omitted rebuildable roots -- is still a refusal (R-N30).
 ///
 /// # Errors
 /// Refuses changing Git authority, unsupported Git or filesystem state, invalid
@@ -1718,22 +1890,14 @@ fn export_pass(
     )?;
     let pass = raw_tree::capture(&private, repo, seats, &reuse)?;
     let after = capture_census_planned(repo, common, options.policy, options.planned)?;
-    // Git authority moving under the capture is never drift. The nested
-    // worktree and nested repository censuses are compared apart from the
-    // seats precisely because they carry each nested HEAD (and a foreign
-    // nest's cleanliness, unpushed count and carried-ignored count), which
-    // must keep its refusal (R-N73, B4); so is the omitted set, because it is
-    // a key input a rebuild can move.
-    let refs_after = refs(repo)?;
-    if !authority_held(repo, &authority, &refs_after)?
-        || census.nested_worktrees != after.nested_worktrees
-        || census.nested_repositories != after.nested_repositories
-        || census.omitted != after.omitted
-        || census.bare != after.bare
-    {
-        return Err(BulkloadRefusal::GitAuthorityChanged);
-    }
-    let drift = observed_drift(pass.drift, &before_refs, &refs_after, seats, &after.rows)?;
+    // The nested worktree and nested repository censuses are compared apart
+    // from the seats because they carry each nested HEAD. A nested
+    // worktree's HEAD moving is drift custody (#38); a foreign nest's
+    // (with its cleanliness, unpushed count and carried-ignored count) keeps
+    // its refusal (R-N73, B4), and so does the omitted set, a key input a
+    // rebuild can move.
+    let (drift, refs_after) =
+        pass_drift(repo, &authority, &census, &after, pass.drift, &before_refs)?;
     // A seat whose identity moved only after its bytes were streamed is already
     // in the tree; withdraw it rather than present bytes the pass cannot vouch for.
     let withdrawn = drift.withdrawn(seats);
@@ -1797,11 +1961,53 @@ fn export_pass(
         refs_before: before_refs,
         refs_after,
         authority,
+        nested_before: census.nested_worktrees,
+        nested_after: after.nested_worktrees,
         nested_repositories,
         pack,
         chained,
         manifest,
     })
+}
+
+// Everything one export pass saw move, and its post-pass ref inventory; or
+// GIT_AUTHORITY_CHANGED when Git authority that is never drift moved.
+fn pass_drift(
+    repo: &Path,
+    authority: &CarriedAuthority,
+    census: &Census,
+    after: &Census,
+    in_pass: Vec<DriftRow>,
+    before_refs: &str,
+) -> Result<(CaptureDrift, String)> {
+    let refs_after = refs(repo)?;
+    // #38 (S5, OI-1003-Q152): HEAD, the index and the nested worktrees'
+    // HEADs moving under the pass are drift custody, not refusals, and so
+    // is the stash reflog (OI-1003-Q161: an agent's stash push, pop or
+    // drop). The bundle carries the HEAD, index and stash the snapshot
+    // read; the in-band drift marker keeps every restore off it, and the
+    // next pass carries the new values. The rest of the authority, re-read
+    // against the same inventory rule the snapshot used, still refuses.
+    let held = read_authority(repo, &refs_after)?;
+    if !authority.fixed_equal(&held)
+        || census.nested_repositories != after.nested_repositories
+        || census.omitted != after.omitted
+        || census.bare != after.bare
+    {
+        return Err(BulkloadRefusal::GitAuthorityChanged);
+    }
+    let mut drift = observed_drift(in_pass, before_refs, &refs_after, &census.rows, &after.rows)?;
+    drift.extend(head_index_drift(
+        (&authority.head, &authority.symbolic, &authority.index),
+        (&held.head, &held.symbolic, &held.index),
+    ));
+    drift.extend(stash_drift(&authority.stash, &held.stash));
+    drift.extend(nested_worktree_drift(
+        &census.nested_worktrees,
+        &after.nested_worktrees,
+    ));
+    drift.seal()?;
+    Ok((drift, refs_after))
 }
 
 // In-band, emitted only when the pass raced something: a clean capture's ref
@@ -1829,6 +2035,14 @@ fn capture_administration(private: &Path, authority: &CarriedAuthority) -> Resul
         .trim_end();
     metadata(private, "head-symbolic", symbolic.as_bytes())?;
     metadata(private, "exclude", &authority.exclude)?;
+    // Estate converge (design 3.1): the stash reflog's order, exactly the
+    // bytes the snapshot read (newest first), so a restore rebuilds the
+    // stash in the source's order. Only when there is a stash, so every
+    // other capture's bundle is unchanged; no key change (the key already
+    // hashes these bytes).
+    if !authority.stash.is_empty() {
+        metadata(private, STASH_ORDER_METADATA, &authority.stash)?;
+    }
     if !authority.boundary.is_empty() {
         metadata(private, "shallow-frontier-v1", &authority.boundary)?;
     }
@@ -2205,11 +2419,64 @@ fn carry_authority(
     Ok(private)
 }
 
-// The whole carried authority, re-read against the same inventory rule the
-// snapshot used: a stash reflog rewritten under refs/stash, a symbolic HEAD or
-// an exclude file moving under the pass all refuse.
-fn authority_held(repo: &Path, carried: &CarriedAuthority, inventory: &str) -> Result<bool> {
-    Ok(read_authority(repo, inventory)? == *carried)
+impl CarriedAuthority {
+    // Every part that is never drift, the snapshot's and a re-read's: an
+    // exclude file, the configuration, the shallow frontier or the gitlinks
+    // (foreign custody) moving under the pass all refuse. HEAD and the
+    // index are [`head_index_drift`]'s, the stash reflog [`stash_drift`]'s
+    // (OI-1003-Q161).
+    fn fixed_equal(&self, other: &Self) -> bool {
+        self.exclude == other.exclude
+            && self.configuration == other.configuration
+            && self.boundary == other.boundary
+            && self.gitlinks == other.gitlinks
+    }
+}
+
+// HEAD (its commit and the branch it names) and the index, before and after:
+// a `HeadMoved` row named `HEAD` when either part of HEAD moved, an
+// `IndexRewritten` row named `index` when the index bytes changed (#38).
+fn head_index_drift(before: (&str, &[u8], &[u8]), after: (&str, &[u8], &[u8])) -> Vec<DriftRow> {
+    let mut rows = Vec::new();
+    if before.0 != after.0 || before.1 != after.1 {
+        rows.push(DriftRow::seat(DriftKind::HeadMoved, b"HEAD"));
+    }
+    if before.2 != after.2 {
+        rows.push(DriftRow::seat(DriftKind::IndexRewritten, b"index"));
+    }
+    rows
+}
+
+// The stash reflog (newest first, as `reflog show refs/stash` lists it),
+// before and after: one `StashMoved` row named `refs/stash` when it changed
+// at all, a push, pop, drop, clear or store (OI-1003-Q161). The ref row
+// refs/stash may name the same move; this one also names a drop below the
+// tip, which leaves refs/stash where it was.
+fn stash_drift(before: &[u8], after: &[u8]) -> Vec<DriftRow> {
+    if before == after {
+        Vec::new()
+    } else {
+        vec![DriftRow::seat(DriftKind::StashMoved, b"refs/stash")]
+    }
+}
+
+// Nested worktrees, keyed on their path: one `NestedWorktreeMoved` row for
+// each that appeared, vanished, or whose name or HEAD moved (#38).
+fn nested_worktree_drift(before: &[NestedWorktree], after: &[NestedWorktree]) -> Vec<DriftRow> {
+    let keyed = |rows: &[NestedWorktree]| -> std::collections::BTreeMap<Vec<u8>, NestedWorktree> {
+        rows.iter()
+            .map(|row| (row.rel_path.clone(), row.clone()))
+            .collect()
+    };
+    let (before, after) = (keyed(before), keyed(after));
+    before
+        .keys()
+        .chain(after.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .map(|path| DriftRow::seat(DriftKind::NestedWorktreeMoved, path))
+        .collect()
 }
 
 /// Transient refs a retained capture is fetched under. Never carried on.
@@ -2552,6 +2819,10 @@ pub(crate) mod mid_pass {
         /// Fired by the estate after a group's plan base bundle is
         /// published, before its base record is written.
         BasePublished,
+        /// Inside one authority read, after the ref inventory it was given
+        /// was read and before the stash reflog is: the window in which a
+        /// `git stash pop` or `drop` of the last stash deletes both.
+        StashReflog,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -2821,6 +3092,12 @@ pub struct Export {
     pub refs_after: String,
     /// The Git authority this export read once and carried.
     pub authority: CarriedAuthority,
+    /// The nested worktrees (their HEADs) the export's own census read at
+    /// its snapshot, which the bundle's custody carries, and re-read after
+    /// its pass: a caller's pre- and post-pass keys are compared with them,
+    /// as with the ref inventories (R-N72, #38 review finding 4).
+    pub nested_before: Vec<NestedWorktree>,
+    pub nested_after: Vec<NestedWorktree>,
     /// What packing the bundle cost (WP2): its pack's bytes and objects, and
     /// the packing child's storage reads.
     pub pack: shared::PackStats,
@@ -3048,6 +3325,28 @@ pub enum DriftKind {
     /// through it failed: nothing was captured, and the next pass captures
     /// the rewritten store (WP1 PR 4, S5). Named `objects/pack`.
     ObjectStoreRewritten,
+    /// HEAD moved under the pass: a commit, a switch, a reset or a detach
+    /// changed the commit it resolves to or the branch it names (#38,
+    /// OI-1003-Q11, S5 under OI-1003-Q152). The capture carries the HEAD
+    /// its own snapshot read; the next pass carries the new one. Named
+    /// `HEAD`.
+    HeadMoved,
+    /// The index was rewritten under the pass (a `git add`, `commit`,
+    /// `reset` or `switch`): the capture carries the index bytes its own
+    /// snapshot read, and the next pass carries the new ones (#38). Named
+    /// `index`.
+    IndexRewritten,
+    /// A registered worktree nested in the checkout appeared, vanished or
+    /// moved its HEAD under the pass (an agent committing in
+    /// `.claude/worktrees/<name>`): its custody row is the snapshot's, and
+    /// the next pass records the new one (#38). Named by its path.
+    NestedWorktreeMoved,
+    /// The stash moved under the pass: a `git stash push`, `pop`, `drop`,
+    /// `clear` or `store` rewrote the stash reflog (refs/stash with it, or
+    /// only the entries below it). The capture carries the stash its own
+    /// snapshot read; the next pass carries the new one (OI-1003-Q161, as
+    /// #38 for HEAD and the index). Named `refs/stash`.
+    StashMoved,
 }
 
 impl DriftKind {
@@ -5314,6 +5613,16 @@ pub(crate) fn destination_repository(repo: &Path) -> Result<()> {
 // `import_bundle` for a verb that already staged and checked its bundle, and
 // reads only the staged copy.
 pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Result<usize> {
+    import_verified_instance(repo, bundle, source).map(|(count, _)| count)
+}
+
+// [`import_verified`], also naming the provenance instance it wrote:
+// `refs/carry/v1/<source>/<instance>/`.
+pub(super) fn import_verified_instance(
+    repo: &Path,
+    bundle: &Path,
+    source: &str,
+) -> Result<(usize, String)> {
     if !source_slug(source) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
@@ -5405,12 +5714,14 @@ pub(super) fn import_verified(repo: &Path, bundle: &Path, source: &str) -> Resul
     // One atomic compare/create transaction, including unchanged refs: a
     // concurrent update or deletion refuses instead of publishing a partial set.
     if !transaction.is_empty() {
+        let mut command = git(repo);
+        durable(&mut command);
         input(
-            git(repo).args(["update-ref", "--no-deref", "--stdin", "-z"]),
+            command.args(["update-ref", "--no-deref", "--stdin", "-z"]),
             &transaction,
         )?;
     }
-    Ok(names.len())
+    Ok((names.len(), digest.to_string()))
 }
 
 /// The ref lines `bundle` carries, in the old format's terms: its header, or,
@@ -6271,8 +6582,37 @@ pub fn restore_staged(
     source: &str,
     mapping: Option<(&Path, &Path)>,
 ) -> Result<()> {
+    restore_staged_landed(
+        staged,
+        destination,
+        source,
+        (mapping, None),
+        &converge::Landing {
+            item: "",
+            observed_ns: 0,
+            capture: staged.digest(),
+        },
+    )
+    .map(drop)
+}
+
+/// [`restore_staged`] for an estate item (#215): native refs, the stash and
+/// HEAD as at the source (or detached with the branch recorded), and both
+/// ledgers, all inside the private stage, published with the checkout.
+///
+/// # Errors
+/// As [`restore_staged`]; `GIT_UNAVAILABLE` for a Git older than
+/// [`DESTINATION_GIT_MINIMUM`].
+pub(crate) fn restore_staged_landed(
+    staged: &StagedBundle,
+    destination: &Path,
+    source: &str,
+    (mapping, base): (Option<(&Path, &Path)>, Option<&StagedBundle>),
+    landing: &converge::Landing<'_>,
+) -> Result<converge::Applied> {
     const SITE: &str = "git_carry::restore_staged";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    destination_git_ready()?;
     refuse_bare_capture(staged)?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
@@ -6308,7 +6648,11 @@ pub fn restore_staged(
     }
     let format = bundle_object_format(&heads)?;
     output(git(&work).args(["init", "--template=", &format!("--object-format={format}")]))?;
-    import_verified(&work, bundle, source)?;
+    // A based capture's plan base, into the stage first (estate converge).
+    if let Some(base) = base {
+        import_verified(&work, base.path(), source)?;
+    }
+    let (_, instance) = import_verified_instance(&work, bundle, source)?;
     let heads = shallow::headers(&work, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
@@ -6321,23 +6665,14 @@ pub fn restore_staged(
             .filter(|value| oid(value))
             .ok_or(BulkloadRefusal::GitInventoryMalformed)
     };
-    let head = find("head")?;
     find("configuration-v1")?;
-    let symbolic = text(git(&work).args(["show", &format!("{}:value", find("head-symbolic")?)]))?;
-    if symbolic.is_empty() {
-        output(git(&work).args(["update-ref", "--no-deref", "HEAD", &head]))?;
-    } else {
-        if !symbolic.starts_with("refs/heads/") {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        }
-        output(git(&work).args(["check-ref-format", &symbolic]))?;
-        set_ref(&work, &symbolic, &head)?;
-        output(git(&work).args(["symbolic-ref", "HEAD", &symbolic]))?;
-    }
+    // #215: every carried native ref, the stash and HEAD, natively; no
+    // `carry/*` branch.
+    let (head, meta, custody) = converge::land_standalone_refs(&work, source, &instance, landing)?;
     let exclude = output(git(&work).args(["show", &format!("{}:value", find("exclude")?)]))?;
     fs::create_dir_all(work.join(".git/info")).refuse_at(SITE)?;
     fs::write(work.join(".git/info/exclude"), exclude).refuse_at(SITE)?;
-    let worktree = find("worktree")?;
+    let worktree = find(WORKTREE_REVISION)?;
     let entries = output(git(&work).args(["ls-tree", "-r", "-z", &worktree]))?;
     // #131: before any worktree byte.
     intent_to_add_restorable(&carried_intent_to_add(&work, &heads)?, &entries)?;
@@ -6350,14 +6685,25 @@ pub fn restore_staged(
     restore_entries(&work, &entries)?;
     let staged = find("staged")?;
     restore_gitlink_directories(&work, &staged, &heads)?;
-    output(git(&work).args(["read-tree", &format!("{staged}^{{tree}}")]))?;
+    read_tree(&mut git(&work), &[&format!("{staged}^{{tree}}")])?;
     restore_intent_to_add(&work, None, &heads)?;
     restore_filesystem_rows(&work, &find("filesystem-v1")?)?;
     apply_standalone_configuration(&work, &work.join(".git/carry-config"), &configuration)?;
+    let applied = converge::finish_landing(
+        &work,
+        &work.join(".git"),
+        source,
+        landing,
+        &meta,
+        (&head.head, head.intended.as_ref()),
+        None,
+        custody,
+    )?;
     // Before the rename: moving a directory to another parent needs write
     // permission on it, whatever mode the capture gave the root.
     fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).refuse_at(SITE)?;
-    publish_restored(stage.path(), &work, &target)
+    publish_restored(stage.path(), &work, &target)?;
+    Ok(applied)
 }
 
 // Publish a checkout built at `work` (directly inside `stage`) as `target`,
@@ -6470,8 +6816,38 @@ pub fn restore_linked_staged(
     destination: &Path,
     source: &str,
 ) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
+    restore_linked_staged_landed(
+        staged,
+        repository,
+        destination,
+        source,
+        &converge::Landing {
+            item: "",
+            observed_ns: 0,
+            capture: staged.digest(),
+        },
+    )
+    .map(drop)
+}
+
+/// [`restore_linked_staged`] for an estate item (#215): native refs first
+/// (into a repository bulkload created), then the worktree on the source's
+/// branch, or detached at the captured head with the branch recorded
+/// (`head-detached-ref-conflict`, finding 11); never a `carry/*` branch.
+/// The workspace ledger is written after the checkout.
+///
+/// # Errors
+/// As [`restore_linked_staged`].
+#[allow(clippy::too_many_lines)]
+pub(crate) fn restore_linked_staged_landed(
+    staged: &StagedBundle,
+    repository: &Path,
+    destination: &Path,
+    source: &str,
+    landing: &converge::Landing<'_>,
+) -> Result<converge::Applied> {
     use std::os::unix::fs::PermissionsExt;
+    destination_git_ready()?;
     refuse_bare_capture(staged)?;
     let bundle = staged.path();
     if destination.symlink_metadata().is_ok() {
@@ -6479,7 +6855,7 @@ pub fn restore_linked_staged(
     }
     let destination = linked_destination(destination)?;
     let repository = fs::canonicalize(repository).refuse_at("git_carry::restore_linked_staged")?;
-    import_verified(&repository, bundle, source)?;
+    let (_, instance) = import_verified_instance(&repository, bundle, source)?;
     let heads = shallow::headers(&repository, bundle)?;
     let find = |suffix: &str| -> Result<String> {
         heads
@@ -6493,8 +6869,6 @@ pub fn restore_linked_staged(
             .ok_or(BulkloadRefusal::GitInventoryMalformed)
     };
     let head = find("head")?;
-    let symbolic =
-        text(git(&repository).args(["show", &format!("{}:value", find("head-symbolic")?)]))?;
     let exclude = output(git(&repository).args(["show", &format!("{}:value", find("exclude")?)]))?;
     let exclude_path = text(git(&repository).args([
         "rev-parse",
@@ -6502,49 +6876,78 @@ pub fn restore_linked_staged(
         "--git-path",
         "info/exclude",
     ]))?;
-    let existing_exclude = match fs::read(&exclude_path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(crate::refuse::io(
-                &error,
-                "git_carry::restore_linked_staged",
-            ))
-        }
+    let read_exclude = |path: &str| match fs::read(path) {
+        Ok(value) => Ok(value),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(crate::refuse::io(
+            &error,
+            "git_carry::restore_linked_staged",
+        )),
     };
-    if exclude != existing_exclude {
+    let existing_exclude = read_exclude(&exclude_path)?;
+    let common = common_repository(&repository)?;
+    // Finding 12: the main item may have set a newer exclude than this
+    // capture's; that one is kept, never refused.
+    let expected_exclude = if exclude == existing_exclude
+        || converge::exclude_newer(&common, source, &existing_exclude, landing.observed_ns)?
+    {
+        existing_exclude
+    } else {
         return Err(BulkloadRefusal::GitIgnorePolicyConflict);
-    }
+    };
     // #131: before the worktree is added, so a capture whose intent-to-add
     // custody cannot be restored refuses with nothing laid down.
     let entries = output(git(&repository).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
     intent_to_add_restorable(&carried_intent_to_add(&repository, &heads)?, &entries)?;
-    let attached = text(git(&repository).args(["worktree", "list", "--porcelain"]))?;
-    let source_tip = text(git(&repository).args(["rev-parse", "--verify", &symbolic]));
-    let reuse = symbolic.starts_with("refs/heads/")
-        && source_tip.as_ref().is_ok_and(|value| value == &head)
-        && !attached
-            .lines()
-            .any(|line| line == format!("branch {symbolic}"));
-    let branch = if reuse {
-        symbolic
-            .strip_prefix("refs/heads/")
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)?
-            .to_owned()
-    } else {
-        let digest = blake3::hash(destination.as_os_str().as_bytes()).to_hex();
-        format!("carry/{source}/{digest}")
-    };
-    let mut command = git(&repository);
-    command.args(["worktree", "add", "--no-checkout"]);
-    if !reuse {
-        command.args(["-b", &branch]);
+    let plan = converge::plan_linked(&repository, source, &instance, landing)?;
+    // #216's residual (the earlier report's finding 7): the landing is
+    // durable as an intent before `worktree add`, so a crash before the
+    // worktree's ledger leaves a worktree the rerun can name as bulkload's
+    // and finish forward (`recover_linked_landing`), never refused
+    // GIT_DESTINATION_OCCUPIED for good.
+    let landing_intent =
+        landed::landing_intent_path(&landed::ledger_dir(&plan.common, source), &destination);
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        landed::write(
+            &landing_intent,
+            &landed::LandingIntent {
+                item: landing.item.to_owned(),
+                destination: destination.as_os_str().as_bytes().to_vec(),
+                capture: landing.capture,
+                observed_ns: landing.observed_ns,
+                instance,
+                head: plan.head.head.clone(),
+                intended_branch: plan.head.intended.clone(),
+            },
+        )?;
     }
-    command
-        .arg("--")
-        .arg(&destination)
-        .arg(if reuse { &branch } else { &head });
+    let mut command = git(&repository);
+    durable(&mut command);
+    command.args(["worktree", "add", "--no-checkout"]);
+    match &plan.head.head.symbolic {
+        Some(branch) => {
+            let name = branch
+                .strip_prefix("refs/heads/")
+                .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+            if plan.create.is_some() {
+                command
+                    .args(["-b", name, "--"])
+                    .arg(&destination)
+                    .arg(&head);
+            } else {
+                command.arg("--").arg(&destination).arg(name);
+            }
+        }
+        None => {
+            command
+                .args(["--detach", "--"])
+                .arg(&destination)
+                .arg(&head);
+        }
+    }
     output(&mut command)?;
+    fault_point!(EstateConvergeLinkedAdded);
     // --no-checkout has created administration only, not captured payload.
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o700))
         .refuse_at("git_carry::restore_linked_staged")?;
@@ -6560,28 +6963,196 @@ pub fn restore_linked_staged(
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    restore_entries(&destination, &entries)?;
+    restore_entries_with(&destination, &entries, true)?;
     restore_gitlink_directories(&destination, &find("staged")?, &heads)?;
-    output(git(&destination).args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
+    let mut command = git(&destination);
+    durable(&mut command);
+    output(command.args(["read-tree", &format!("{}^{{tree}}", find("staged")?)]))?;
     restore_intent_to_add(&destination, None, &heads)?;
     restore_filesystem_rows(&destination, &find("filesystem-v1")?)?;
-    let final_exclude = match fs::read(exclude_path) {
-        Ok(value) => value,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => {
-            return Err(crate::refuse::io(
-                &error,
-                "git_carry::restore_linked_staged",
-            ))
-        }
-    };
-    if final_exclude != exclude {
+    if read_exclude(&exclude_path)? != expected_exclude {
         return Err(BulkloadRefusal::GitIgnorePolicyConflict);
     }
     if text(git(&destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    Ok(())
+    let converge::LinkedPlan {
+        head: head_plan,
+        meta,
+        custody,
+        common,
+        lock,
+        ..
+    } = plan;
+    // Review 3 finding 3: the index this landing installed, built from the
+    // capture, never read back from the worktree an operator can change.
+    let git_dir =
+        landed::worktree_git_dir(&destination)?.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let index = converge::installed_index(&destination, &git_dir, &meta)?;
+    let applied = converge::finish_landing(
+        &destination,
+        &common,
+        source,
+        landing,
+        &meta,
+        (&head_plan.head, head_plan.intended.as_ref()),
+        Some(index),
+        custody,
+    )?;
+    landed::remove(&landing_intent)?;
+    drop(lock);
+    Ok(applied)
+}
+
+/// Finish a first linked landing a crash cut short between `worktree add`
+/// and its ledger (#216's residual, the earlier report's finding 7), under
+/// the destination lock: `intent` names the worktree at `destination` as
+/// bulkload's. Its HEAD must still be the planned one; its index must have
+/// no entries (what `worktree add --no-checkout` leaves) or be the one the
+/// landing installs; and every seat the capture holds must be absent
+/// (written now) or the capture's content (review 4: the landing writes
+/// each entry under [`LANDING_TEMPORARY`] and renames it into place, so a
+/// file at an entry's name that is not its blob, a prefix of it included,
+/// is an operator's, and so is any index the landing did not write: a `git
+/// add`, `git rm --cached` or `git mv` since the crash). Anything else is
+/// `GIT_DESTINATION_MODIFIED`, checked before any write, and nothing an
+/// operator put there is changed. Then the index, modes and the ledger, as
+/// the landing would have.
+///
+/// # Errors
+/// `GIT_DESTINATION_MODIFIED` as above; `GIT_CONVERGE_INTERRUPTED` when an
+/// `index.lock` that is not the landing's own is held; whatever the
+/// restore refuses.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn recover_linked_landing(
+    destination: &Path,
+    common: &Path,
+    source: &str,
+    intent: &landed::LandingIntent,
+) -> Result<()> {
+    const SITE: &str = "git_carry::recover_linked_landing";
+    use std::os::unix::ffi::OsStrExt;
+    let modified = BulkloadRefusal::GitDestinationModified;
+    if converge::head_of(destination)? != intent.head {
+        return Err(modified);
+    }
+    let meta = converge::Meta::read(destination, source, &intent.instance)?;
+    let heads = meta.heads();
+    let git_dir =
+        landed::worktree_git_dir(destination)?.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let target = converge::installed_index(destination, &git_dir, &meta)?;
+    // The landing's own `read-tree`, killed before its rename, left the
+    // whole new index in `index.lock`; anyone else's lock stays.
+    let lock = git_dir.join("index.lock");
+    if fs::symlink_metadata(&lock).is_ok() {
+        if converge::index_digest(destination, Some(&lock)).ok() != Some(target) {
+            return Err(BulkloadRefusal::GitConvergeInterrupted);
+        }
+        fs::remove_file(&lock).refuse_at(SITE)?;
+        landed::sync_dir(&git_dir)?;
+    }
+    let index = converge::index_digest(destination, None)?;
+    if index != target && index != converge::empty_index_digest() {
+        return Err(modified);
+    }
+    let entries =
+        output(git(destination).args(["ls-tree", "-r", "-z", meta.get(WORKTREE_REVISION)?]))?;
+    let mut objects = batch_objects::BatchObjects::new(destination)?;
+    // Every check first, so a refusal writes nothing.
+    let mut missing = Vec::new();
+    let mut parents = std::collections::BTreeSet::new();
+    for entry in entries
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let tab = entry
+            .iter()
+            .position(|byte| *byte == b'\t')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let header = std::str::from_utf8(entry.get(..tab).unwrap_or_default())
+            .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+        let mut fields = header.split_whitespace();
+        let (Some(mode), Some(_), Some(value)) = (fields.next(), fields.next(), fields.next())
+        else {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        };
+        let relative = Path::new(std::ffi::OsStr::from_bytes(
+            entry.get(tab + 1..).unwrap_or_default(),
+        ));
+        let path = match safe_destination(destination, relative) {
+            Ok(path) => path,
+            // A parent not laid down yet: the entry is written below.
+            Err(BulkloadRefusal::Io(Some(libc::ENOENT))) => {
+                missing.push(entry);
+                continue;
+            }
+            Err(_) => return Err(modified),
+        };
+        if let Some(parent) = path.parent() {
+            parents.insert(parent.to_path_buf());
+        }
+        let Some(found) = (match fs::symlink_metadata(&path) {
+            Ok(found) => Some(found),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        }) else {
+            missing.push(entry);
+            continue;
+        };
+        let mut blob = Vec::new();
+        objects.copy_into(value, &mut blob, None)?;
+        let ours = if mode == "120000" {
+            found.file_type().is_symlink()
+                && fs::read_link(&path).refuse_at(SITE)?.as_os_str().as_bytes() == blob
+        } else {
+            found.is_file() && {
+                let bytes = fs::read(&path).refuse_at(SITE)?;
+                crate::counters::add_len(crate::counters::Counter::DestVerifyRead, bytes.len());
+                bytes == blob
+            }
+        };
+        if !ours {
+            return Err(modified);
+        }
+    }
+    objects.finish()?;
+    // The temporary a crash left inside a landing's entry write.
+    for parent in parents {
+        match fs::remove_file(parent.join(LANDING_TEMPORARY)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        }
+    }
+    let mut objects = batch_objects::BatchObjects::new(destination)?;
+    for entry in missing {
+        restore_entry(destination, entry, &mut objects, true)?;
+    }
+    objects.finish()?;
+    restore_gitlink_directories(destination, meta.get("staged")?, &heads)?;
+    if index != target {
+        read_tree(
+            &mut git(destination),
+            &[&format!("{}^{{tree}}", meta.get("staged")?)],
+        )?;
+        restore_intent_to_add(destination, None, &heads)?;
+    }
+    restore_filesystem_rows(destination, meta.get("filesystem-v1")?)?;
+    converge::finish_landing(
+        destination,
+        common,
+        source,
+        &converge::Landing {
+            item: &intent.item,
+            observed_ns: intent.observed_ns,
+            capture: intent.capture,
+        },
+        &meta,
+        (&intent.head, intent.intended_branch.as_ref()),
+        Some(target),
+        native_refs::Custody::default(),
+    )
+    .map(drop)
 }
 
 // N7 (R-N73): a populated submodule is a directory nest, so its seat is not
@@ -6692,20 +7263,35 @@ fn occupied(error: std::io::Error) -> BulkloadRefusal {
 }
 
 fn restore_entries(destination: &Path, entries: &[u8]) -> Result<()> {
+    restore_entries_with(destination, entries, false)
+}
+
+// [`restore_entries`]; with `published`, each entry through
+// [`LANDING_TEMPORARY`] (a linked landing in place, review 4).
+fn restore_entries_with(destination: &Path, entries: &[u8], published: bool) -> Result<()> {
     let mut objects = batch_objects::BatchObjects::new(destination)?;
     for entry in entries
         .split(|byte| *byte == 0)
         .filter(|entry| !entry.is_empty())
     {
-        restore_entry(destination, entry, &mut objects)?;
+        restore_entry(destination, entry, &mut objects, published)?;
     }
     objects.finish()
 }
 
+/// The name a linked landing lays each entry down under before it is
+/// renamed to its own, without replacing (review 4): a write a crash cuts
+/// short never sits at an entry's name, so a file there that differs from
+/// its blob is an operator's, never bulkload's. One entry is written at a
+/// time, so one name per directory; the recovery removes it.
+pub(crate) const LANDING_TEMPORARY: &str = ".bulkload-landing-temporary";
+
+#[allow(clippy::too_many_lines)]
 fn restore_entry(
     destination: &Path,
     entry: &[u8],
     objects: &mut batch_objects::BatchObjects,
+    published: bool,
 ) -> Result<()> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -6764,11 +7350,22 @@ fn restore_entry(
             Err(error) => return Err(crate::refuse::io(&error, "git_carry::restore_entry")),
         }
     }
+    let at = if published {
+        let temp = parent.join(LANDING_TEMPORARY);
+        match fs::remove_file(&temp) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(crate::refuse::io(&error, "git_carry::restore_entry")),
+        }
+        temp
+    } else {
+        path.clone()
+    };
     match mode {
         "120000" => {
             let mut target = Vec::new();
             objects.copy_into(value, &mut target, Some(65_536))?;
-            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), path)
+            std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(&target), &at)
                 .map_err(occupied)?;
         }
         "100644" | "100755" => {
@@ -6776,7 +7373,7 @@ fn restore_entry(
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
-                .open(&path)
+                .open(&at)
                 .map_err(occupied)?;
             objects.copy_into(value, &mut file, None)?;
             file.set_permissions(fs::Permissions::from_mode(if mode == "100755" {
@@ -6789,6 +7386,17 @@ fn restore_entry(
                 .refuse_at("git_carry::restore_entry")?;
         }
         _ => return Err(BulkloadRefusal::GitInventoryMalformed),
+    }
+    if published {
+        let directory = fs::File::open(parent).refuse_at("git_carry::restore_entry")?;
+        let leaf = path.file_name().ok_or(BulkloadRefusal::PathEscapesRoot)?;
+        let from = crate::io::c_name(LANDING_TEMPORARY.as_bytes())
+            .refuse_at("git_carry::restore_entry")?;
+        let to = crate::io::c_name(leaf.as_bytes()).refuse_at("git_carry::restore_entry")?;
+        if let Err(error) = crate::io::publish_noreplace(&directory, &from, &to) {
+            let _ = fs::remove_file(&at);
+            return Err(occupied(error));
+        }
     }
     Ok(())
 }
@@ -9502,10 +10110,16 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // (a)/(b) tolerance must not leak into HEAD (R-N30).
+    // #38 (OI-1003-Q11, S5 under OI-1003-Q152): an agent committing inside
+    // the captured worktree moves HEAD (and the index) under the pass. That
+    // is drift custody, not GIT_AUTHORITY_CHANGED: the bundle carries the
+    // HEAD its snapshot read, is marked drifted in-band (no restore lays it
+    // down), and the next pass carries the new HEAD. Before #38 this
+    // refused (`head_moving_during_capture_still_refuses`).
     #[test]
-    fn head_moving_during_capture_still_refuses() {
+    fn head_moving_during_capture_is_drift_custody() {
         let (root, source) = drift_fixture("head-moves");
+        let before = text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap();
         let inside = source.clone();
         mid_pass::arm(&source, move || {
             output(git(&inside).args([
@@ -9518,38 +10132,314 @@ mod tests {
             ]))
             .unwrap();
         });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        // An empty commit rewrites no index entry: HEAD moved, with the
+        // branch it names (a ref row); Git may rewrite the index file too.
+        assert!(export
+            .drift
+            .rows
+            .contains(&row(DriftKind::HeadMoved, b"HEAD")));
+        assert!(export.drift.rows.iter().all(|drift| match drift.kind {
+            DriftKind::HeadMoved | DriftKind::IndexRewritten => true,
+            DriftKind::RefChanged => drift.name.starts_with(b"refs/heads/"),
+            _ => false,
+        }));
+        let private = capture.join("repository.git");
+        assert_eq!(drift_sidecar(&private), export.drift);
+        // The bundle carries the HEAD the snapshot read, not the new one.
+        assert_eq!(
+            text(git(&private).args(["rev-parse", "refs/carry-export/head"])).unwrap(),
+            before
+        );
+        assert_ne!(
+            text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap(),
+            before
+        );
         assert!(matches!(
-            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
+            restore_bundle(&export.bundle, &root.join("restored"), "neo"),
+            Err(BulkloadRefusal::CaptureDrifted)
+        ));
+        // The pre-#38 contract stands for a caller that never asked for
+        // tolerance: a strict export still refuses.
+        let again = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&again).args([
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "again",
+            ]))
+            .unwrap();
+        });
+        assert!(matches!(
+            export_repository(&source, &root.join("strict")),
             Err(BulkloadRefusal::GitAuthorityChanged)
         ));
         fs::remove_dir_all(root).unwrap();
     }
 
-    // Separability from the index (R-N30): HEAD pinned, index rewritten.
+    // Separability from HEAD (R-N30, #38): HEAD pinned, the index rewritten
+    // by a `git add` is drift custody named `index`; the staged tree the
+    // bundle carries is the snapshot's index, without the new entry.
     #[test]
-    fn index_rewritten_during_capture_still_refuses() {
+    fn index_rewritten_during_capture_is_drift_custody() {
         let (root, source) = drift_fixture("index-rewritten");
         let head = text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap();
+        // The file exists before the pass: only the index moves under it.
+        fs::write(source.join("staged-mid-pass"), b"added to the index").unwrap();
         let inside = source.clone();
         mid_pass::arm(&source, move || {
-            fs::write(inside.join("staged-mid-pass"), b"added to the index").unwrap();
             output(git(&inside).args(["add", "staged-mid-pass"])).unwrap();
         });
-        assert!(matches!(
-            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
-            Err(BulkloadRefusal::GitAuthorityChanged)
-        ));
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![row(DriftKind::IndexRewritten, b"index")]
+        );
         assert_eq!(
             head,
             text(git(&source).args(["rev-parse", "--verify", "HEAD"])).unwrap()
         );
+        let private = capture.join("repository.git");
+        let staged =
+            text(git(&private).args(["ls-tree", "-r", "--name-only", "refs/carry-export/staged"]))
+                .unwrap();
+        assert!(!staged.contains("staged-mid-pass"), "{staged}");
+        // The worktree seat itself held still and is carried.
+        assert!(carried_paths(&private).contains("staged-mid-pass"));
+        assert!(drift_ref_present(&private));
         fs::remove_dir_all(root).unwrap();
     }
 
-    // The Census split holds: a nested worktree's HEAD is custody, not seats,
-    // and it moving under the pass is still a refusal.
+    // OI-1003-Q161 (S5 under OI-1003-Q152): an agent stashing under the
+    // pass moves refs/stash and its reflog. That is drift custody like
+    // HEAD and the index, named `StashMoved "refs/stash"`: the bundle
+    // carries the stash its snapshot read, is marked drifted in-band (no
+    // restore lays it down), and the next pass carries the new stash.
+    // Before Q161 this refused GIT_AUTHORITY_CHANGED.
     #[test]
-    fn nested_worktree_head_moving_during_capture_still_refuses() {
+    fn stash_pushed_during_capture_is_drift_custody() {
+        let (root, source) = drift_fixture("stash-pushed");
+        // A stash commit made before the pass, so storing it under the pass
+        // moves only refs/stash and its reflog: no seat and no index entry.
+        fs::write(source.join("tracked"), b"stashed edit").unwrap();
+        let stash = text(git(&source).args(["stash", "create"])).unwrap();
+        output(git(&source).args(["checkout", "--", "tracked"])).unwrap();
+        let pre = capture_key_parts(&source).unwrap();
+        let inside = source.clone();
+        let stored = stash.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&inside).args(["stash", "store", "-m", "agent, mid-pass", &stored]))
+                .unwrap();
+        });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![
+                row(DriftKind::RefAdded, b"refs/stash"),
+                row(DriftKind::StashMoved, b"refs/stash"),
+            ]
+        );
+        assert_eq!(
+            export.drift.lines(),
+            vec![
+                "RefAdded \"refs/stash\"".to_owned(),
+                "StashMoved \"refs/stash\"".to_owned()
+            ]
+        );
+        let private = capture.join("repository.git");
+        assert_eq!(drift_sidecar(&private), export.drift);
+        // The bundle carries the snapshot's stash: none.
+        let heads = carried_heads(&export.bundle, Some(&source.join(".git/objects"))).unwrap();
+        assert!(!heads.contains(&stash), "{heads}");
+        assert!(matches!(
+            restore_bundle(&export.bundle, &root.join("restored"), "neo"),
+            Err(BulkloadRefusal::CaptureDrifted)
+        ));
+        // Between two key reads the stash moving is drift too, never a
+        // refusal; the two keys differ, so the next pass captures it.
+        let post = capture_key_parts(&source).unwrap();
+        assert!(pre.drift_only(&post));
+        assert_eq!(
+            pre.drift_to(&post).unwrap().rows,
+            vec![
+                row(DriftKind::RefAdded, b"refs/stash"),
+                row(DriftKind::StashMoved, b"refs/stash"),
+            ]
+        );
+        assert_ne!(pre.digest().unwrap(), post.digest().unwrap());
+        // The next quiet pass carries the new stash, clean.
+        let next =
+            export_repository_with_drift(&source, &root.join("next"), &ExportOptions::default())
+                .unwrap();
+        assert!(next.drift.is_empty(), "{:?}", next.drift);
+        let heads = carried_heads(&next.bundle, Some(&source.join(".git/objects"))).unwrap();
+        assert!(
+            heads.contains(&format!("refs/carry-export/stashes/{stash}")),
+            "{heads}"
+        );
+        // A strict export, a caller that never asked for tolerance, still
+        // refuses (the pre-drift contract).
+        let again = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&again).args(["stash", "drop", "-q"])).unwrap();
+        });
+        assert!(matches!(
+            export_repository(&source, &root.join("strict")),
+            Err(BulkloadRefusal::GitAuthorityChanged)
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // OI-1003-Q161 review: `git stash pop` of the only stash between the
+    // ref inventory read and the stash reflog read deletes refs/stash and
+    // its reflog, so the reflog read fails. That is drift custody like any
+    // other stash move, never GIT_CHILD_FAILED: in the pass's own re-read
+    // (the snapshot's stash against none: `StashMoved`), in the export's
+    // snapshot (refs/stash removed under the pass: `RefRemoved`) and in a
+    // key read (a torn key no consistent key equals).
+    #[test]
+    fn stash_popped_between_ref_read_and_reflog_read_is_drift_custody() {
+        let (root, source) = drift_fixture("stash-popped-torn");
+        let stash_one = |content: &[u8]| {
+            fs::write(source.join("tracked"), content).unwrap();
+            output(git(&source).args(["stash", "push", "-q"])).unwrap();
+            text(git(&source).args(["rev-parse", "refs/stash"])).unwrap()
+        };
+        let pop_at_reflog_read = |repo: &Path| {
+            let inner = repo.to_path_buf();
+            mid_pass::arm_at(repo, mid_pass::Stage::StashReflog, move || {
+                output(git(&inner).args(["stash", "pop", "-q"])).unwrap();
+            });
+        };
+        // The pass's own re-read: armed from the byte pass, so the hook
+        // fires in `pass_drift`, after the snapshot carried the stash.
+        let stash = stash_one(b"stashed edit one");
+        let outer = source.clone();
+        mid_pass::arm(&source, move || pop_at_reflog_read(&outer));
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert!(
+            export
+                .drift
+                .rows
+                .contains(&row(DriftKind::StashMoved, b"refs/stash")),
+            "{:?}",
+            export.drift
+        );
+        let heads = carried_heads(&export.bundle, Some(&source.join(".git/objects"))).unwrap();
+        assert!(
+            heads.contains(&format!("refs/carry-export/stashes/{stash}")),
+            "{heads}"
+        );
+        assert!(drift_ref_present(&capture.join("repository.git")));
+        assert!(matches!(
+            restore_bundle(&export.bundle, &root.join("restored"), "neo"),
+            Err(BulkloadRefusal::CaptureDrifted)
+        ));
+        // A key read torn the same way is not a refusal, and no consistent
+        // key equals it, so its capture is never reused.
+        stash_one(b"stashed edit two");
+        pop_at_reflog_read(&source);
+        let torn = capture_key_parts(&source).unwrap();
+        let after = capture_key_parts(&source).unwrap();
+        assert!(torn.drift_only(&after));
+        assert_ne!(torn.digest().unwrap(), after.digest().unwrap());
+        // The export's own snapshot torn: refs/stash removed under the pass.
+        stash_one(b"stashed edit three");
+        pop_at_reflog_read(&source);
+        let snapshot = root.join("snapshot");
+        let export =
+            export_repository_with_drift(&source, &snapshot, &ExportOptions::default()).unwrap();
+        assert!(
+            export
+                .drift
+                .rows
+                .contains(&row(DriftKind::RefRemoved, b"refs/stash")),
+            "{:?}",
+            export.drift
+        );
+        assert!(drift_ref_present(&snapshot.join("repository.git")));
+        // The next quiet pass is clean and carries no stash.
+        let next =
+            export_repository_with_drift(&source, &root.join("next"), &ExportOptions::default())
+                .unwrap();
+        assert!(next.drift.is_empty(), "{:?}", next.drift);
+        let heads = carried_heads(&next.bundle, Some(&source.join(".git/objects"))).unwrap();
+        assert!(!heads.contains("refs/carry-export/stashes/"), "{heads}");
+        // Any other failure of the reflog read still refuses: here the
+        // child runs out of space while refs/stash still resolves, so it is
+        // the child failing, not the stash moving.
+        stash_one(b"stashed edit four");
+        mid_pass::arm_at(&source, mid_pass::Stage::StashReflog, || {
+            scratch_fault::arm_at(scratch_fault::Site::Child, 28);
+        });
+        let failed = capture_key_parts(&source);
+        assert!(
+            matches!(failed, Err(BulkloadRefusal::SpaceExhausted(_))),
+            "{failed:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // OI-1003-Q161: a `git stash drop` of an older entry under the pass
+    // rewrites only the stash reflog (refs/stash keeps its value), the
+    // move no ref row can name. It is `StashMoved` alone; the bundle
+    // carries both stash commits and the snapshot's order.
+    #[test]
+    fn stash_dropped_during_capture_is_drift_custody() {
+        let (root, source) = drift_fixture("stash-dropped");
+        let mut stashes = Vec::new();
+        for content in [b"stash one".as_slice(), b"stash two"] {
+            fs::write(source.join("tracked"), content).unwrap();
+            output(git(&source).args(["stash", "push", "-q"])).unwrap();
+            stashes.push(text(git(&source).args(["rev-parse", "refs/stash"])).unwrap());
+        }
+        let inside = source.clone();
+        mid_pass::arm(&source, move || {
+            output(git(&inside).args(["stash", "drop", "-q", "stash@{1}"])).unwrap();
+        });
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            export.drift.rows,
+            vec![row(DriftKind::StashMoved, b"refs/stash")]
+        );
+        let private = capture.join("repository.git");
+        let heads = carried_heads(&export.bundle, Some(&source.join(".git/objects"))).unwrap();
+        for stash in &stashes {
+            assert!(
+                heads.contains(&format!("refs/carry-export/stashes/{stash}")),
+                "{heads}"
+            );
+        }
+        assert_eq!(
+            text(git(&private).args([
+                "show",
+                &format!("refs/carry-export/{STASH_ORDER_METADATA}:value")
+            ]))
+            .unwrap(),
+            stashes.iter().rev().cloned().collect::<Vec<_>>().join("\n")
+        );
+        assert!(drift_ref_present(&private));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // The Census split holds: a nested worktree's HEAD is custody, not seats.
+    // An agent committing in it under the pass is drift custody named by the
+    // nested worktree's path (#38); before #38 it refused.
+    #[test]
+    fn nested_worktree_head_moving_during_capture_is_drift_custody() {
         let (root, source) = drift_fixture("nested-head");
         let nested = source.join(".claude/worktrees/agent-x");
         fs::create_dir_all(source.join(".claude/worktrees")).unwrap();
@@ -9572,10 +10462,17 @@ mod tests {
             ]))
             .unwrap();
         });
-        assert!(matches!(
-            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default()),
-            Err(BulkloadRefusal::GitAuthorityChanged)
-        ));
+        let export =
+            export_repository_with_drift(&source, &root.join("capture"), &ExportOptions::default())
+                .unwrap();
+        // The branch the agent committed on moved too: a ref row.
+        assert_eq!(
+            export.drift.rows,
+            vec![
+                row(DriftKind::RefChanged, b"refs/heads/agent-x"),
+                row(DriftKind::NestedWorktreeMoved, b".claude/worktrees/agent-x"),
+            ]
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

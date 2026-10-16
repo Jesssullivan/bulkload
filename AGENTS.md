@@ -162,6 +162,11 @@ Adopted from lab `LAB-FEDERATED-EFFICIENCY-20261001`, by operator direction on
 - A gated benchmark sample is recorded only on AC power with a 1-minute
   load under 2.5. Every sample row records power and load (R-N81). The
   coordinator holds the other lanes quiet while gated samples run (R-N91).
+  Standalone `s2_budget.py run` keeps load1 < 2.5. An S2 observation
+  alongside a live run (`observe`/`alongside`, OI-1003-Q152) is judged
+  against its own OFF windows as the live baseline, with no absolute load1
+  cap and the budget unchanged (OI-1003-Q160, Linear TIN-4543); it is not
+  interchangeable with a gated `run` and carries its own evidence label.
 
 ## Durable notes
 
