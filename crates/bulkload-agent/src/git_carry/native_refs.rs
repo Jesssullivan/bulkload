@@ -1150,6 +1150,11 @@ pub fn carried_stash(
     ))
 }
 
+/// The custody word of the stash table's row T0: a destination reflog equal
+/// to the carried stash, entry by entry (commit and message), in a
+/// repository bulkload adopted, adopted with no write (estate adopt, #226).
+pub const STASH_ADOPTED: &str = "stash-adopted";
+
 /// The stash table (design 7.3, amended by finding 4; stash-order-v2 by
 /// OI-1003-Q169): `dst` is the destination's reflog, `ledger` what
 /// bulkload built last, `carried` the capture's stash at `t`. Every
@@ -1173,6 +1178,10 @@ pub fn stash_decision(
     match ledger {
         None if new.is_empty() => (None, None),
         None if dst.is_empty() => (Some(op(dst)), Some("stash-restored")),
+        // T0 (estate adopt, #226): a destination reflog equal to the carried
+        // order, in a repository bulkload adopted, is the carried stash: it
+        // is adopted with no write, so the next capture's T3 to T5 apply.
+        None if dst == new.as_slice() => (None, Some(STASH_ADOPTED)),
         None => (None, Some("stash-kept-destination")),
         Some(landed) if !landed.names(dst) => (None, Some("stash-modified-at-destination")),
         Some(landed) if landed.order == new => (None, None),
@@ -1321,6 +1330,8 @@ pub fn step(
         }
         if let Some(op) = &op {
             planned.ledger.stash = Some(LandedStash::of(op.new.clone(), t));
+        } else if word == Some(STASH_ADOPTED) {
+            planned.ledger.stash = Some(LandedStash::of(carried_stash.clone(), t));
         }
         op
     } else {

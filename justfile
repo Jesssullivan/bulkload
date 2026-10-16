@@ -506,8 +506,13 @@ check-local: check-source test-local
 ci-source: check-source secrets-scan-history contract-test
 
 # The CI `fault-harness` terminal gate (R-N122); the composite action execs it
-# inside the repo flake, like `ci-source`.
-ci-fault-harness: fault-harness
+# inside the repo flake, like `ci-source`. The tinyland-nix runner pod is
+# capped at 2 GiB: the fault-feature build OOM-killed it on #230 and #233
+# (2026-10-16, rustc at 1.5 GiB RSS beside a linker), so CI builds this
+# gate two jobs wide with line-tables-only debug info. Local runs of
+# `fault-harness` are unchanged.
+ci-fault-harness:
+    cd {{ root }} && CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-tables-only {{ just_executable() }} fault-harness
 
 # CI is fail-closed on the fleet-managed GloriousFlywheel profile and drives
 # every Bazel target through the canonical cache-backed wrapper.

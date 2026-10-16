@@ -323,7 +323,7 @@ pub fn flatten(
     // The head's own stage is no longer read; remove it now.
     drop(head);
     Ok(StagedBundle {
-        _directory: directory,
+        directory,
         bundle: flat,
         digest,
         bare,

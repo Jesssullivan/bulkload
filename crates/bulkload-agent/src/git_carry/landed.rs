@@ -44,6 +44,10 @@ pub const WORKSPACE_INTENT: &str = "workspace.intent";
 /// A first linked landing's intent: `landing-<key>.intent` in the common
 /// ledger directory, `<key>` naming the destination (#216's residual).
 pub const LANDING_INTENT_PREFIX: &str = "landing-";
+/// The adoption record's file name, beside `refs.landed` (estate adopt,
+/// #226): how the repository marker was set when bulkload did not create
+/// the repository.
+pub const ADOPTED: &str = "adopted";
 /// The destination lock's file name.
 const LOCK: &str = "lock";
 /// The largest record read or written: a 200k-seat ledger is about 16 MiB.
@@ -271,6 +275,28 @@ impl RefLedger {
     }
 }
 
+/// How a repository bulkload did not create came to carry the repository
+/// marker (estate adopt, #226, OI-1003-Q171/Q172): an explicit `--adopt`
+/// run proved it related to the capture (it holds a root commit of the
+/// capture's refs, or it has no refs at all). Written durable before the
+/// marker; informational for receipts and `estate-diff`. The marker keeps
+/// its one meaning for the ref step: bulkload owns native refs here, by
+/// creation or by adoption.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Adopted {
+    /// `estate::id` of the item whose apply adopted the repository.
+    pub item: String,
+    /// The capture it was adopted against, and that capture's instant.
+    pub capture: [u8; 32],
+    pub observed_ns: i128,
+    /// When the adoption was recorded.
+    pub recorded_ns: i128,
+    /// The native refs the repository held, and how many equalled the
+    /// carried value (each an R2 row of the ref step that follows).
+    pub native: u64,
+    pub equal: u64,
+}
+
 /// One planned native ref write: `old` and `new` are the compare-and-swap
 /// values (`None` = absent), `before` the ledger row before it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -495,6 +521,10 @@ impl Record for WorkspaceIntent {
 }
 
 impl Record for LandingIntent {
+    const MAGIC: &'static [u8; 16] = MAGIC;
+}
+
+impl Record for Adopted {
     const MAGIC: &'static [u8; 16] = MAGIC;
 }
 

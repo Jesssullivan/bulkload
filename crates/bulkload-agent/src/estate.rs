@@ -333,6 +333,25 @@ struct Parts {
     started_ns: i128,
 }
 
+// #226 item 5: the `{bundle}.omissions` sidecar, the rebuildable roots a
+// capture omitted with their measured entries and bytes. Written beside the
+// other sidecars before the record; a reuse hit keeps its capture's.
+fn omissions_sidecar(corpus: &Path, bundle: &str) -> PathBuf {
+    corpus.join(format!("{bundle}.omissions"))
+}
+
+/// The rebuildable roots a capture omitted, as its `.omissions` sidecar
+/// records them (#226 item 5); `None` for a capture taken before the
+/// sidecar existed, or one whose sidecar is gone or unreadable: unknown,
+/// never zero.
+fn retained_omissions(corpus: &Path, bundle: &str) -> Option<Vec<git_carry::RebuildableOmission>> {
+    let path = omissions_sidecar(corpus, bundle);
+    if !path.is_file() {
+        return None;
+    }
+    read(&path).ok()
+}
+
 // A drifted capture deliberately omits the drifted seats' bytes, so its sidecar
 // is the record of what it does not hold. Absent means the pass raced nothing.
 fn retained_drift(corpus: &Path, bundle: &str) -> Result<git_carry::CaptureDrift> {
@@ -1579,6 +1598,9 @@ fn capture_item(
             started_ns: export.started_ns,
         },
     )?;
+    // #226 item 5: the rebuildable roots this capture omitted, counted, so
+    // closure reads "equal except N counted roots" without the bundle.
+    write(&omissions_sidecar(corpus, &name), &export.omitted)?;
     // Q42 lane L7 (P70): the reuse manifest, bound to the bundle by its
     // digest and durable before the record, like every sidecar above. A
     // crash here leaves a manifest no record names, which nothing reads.
@@ -2130,29 +2152,43 @@ fn stage_base(corpus: &Path, base: &Base) -> Result<git_carry::StagedBundle> {
     Ok(staged)
 }
 
-// `bundle` is the staged copy of the capture this apply restores.
+// A plan base a linked item's apply imports itself (its repository's
+// common directory and the base's digest), recorded in `ImportedBases`
+// only once that apply succeeded.
+type DeferredBase = Option<(PathBuf, [u8; 32])>;
+
+// `bundle` is the staged copy of the capture this apply restores; `bare`
+// whether it is a capture of a bare repository.
 fn import_base(
     item: &Item,
     captured: &Capture,
-    bundle: &Path,
+    (bundle, bare_capture): (&Path, bool),
     corpus: &Path,
     source: &str,
     imported: &ImportedBases,
-) -> Result<Option<git_carry::StagedBundle>> {
+) -> Result<(Option<git_carry::StagedBundle>, DeferredBase)> {
     if !git_carry::shared::requires_base(bundle)? {
-        return Ok(None);
+        return Ok((None, None));
     }
     // A delta whose `.base` sidecar is gone names no base to import.
     let base = bound(corpus, &captured.bundle)?.ok_or(BulkloadRefusal::SealedObjectMissing)?;
     // Estate converge: a standalone item takes its plan base where its
     // capture lands, in its private stage at a first landing or before a
     // converge's import, so one plan lands a main and its linked worktrees.
-    if item
-        .workspace
-        .as_ref()
-        .is_some_and(|workspace| workspace == &item.repository)
+    // So does a bare refs-only capture into a path that does not exist
+    // (#226 item 4): the bare repository bulkload makes takes it in its
+    // stage.
+    let fresh_bare = item.workspace.is_none()
+        && bare_capture
+        && fs::symlink_metadata(&item.repository)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+    if fresh_bare
+        || item
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| workspace == &item.repository)
     {
-        return stage_base(corpus, &base).map(Some);
+        return Ok((Some(stage_base(corpus, &base)?), None));
     }
     // A linked or refs-only item imports into its existing repository.
     // S4 (#183): a destination repository that is missing, or a directory
@@ -2164,24 +2200,32 @@ fn import_base(
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
         .contains(&key)
     {
-        return Ok(None);
+        return Ok((None, None));
     }
     let staged = stage_base(corpus, &base)?;
+    // Dogfood of 2026-10-16, F2 (OI-1003-Q171, Q172, Q173): a linked item
+    // imports its base itself, after every refusal it can decide without a
+    // write (a first landing's `check_linked`, an adopt proof, a converge
+    // proof), never here before them.
+    if item.workspace.is_some() {
+        return Ok((Some(staged), Some(key)));
+    }
     git_carry::import_staged(&item.repository, &staged, source)?;
     imported
         .lock()
         .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
         .insert(key);
-    Ok(None)
+    Ok((None, None))
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_item(
     item: &Item,
     corpus: &Path,
     state: &Path,
     source: &str,
-    imported: &ImportedBases,
-    owners: &Owners,
+    (imported, owners): (&ImportedBases, &Owners),
+    (options, items): (&ApplyOptions, &[String]),
 ) -> Result<Completion> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
@@ -2259,7 +2303,7 @@ fn apply_item(
     // (R-N72): a chain under a plan base binds every base and every link by
     // name and digest, and the flatten imports every bound base before the
     // oldest link.
-    let (staged, base) = if prior_sidecar(corpus, &captured.bundle)
+    let (staged, base, deferred) = if prior_sidecar(corpus, &captured.bundle)
         .try_exists()
         .refuse_at("estate::apply_item")?
     {
@@ -2267,10 +2311,18 @@ fn apply_item(
         (
             git_carry::chain::flatten(staged, &chain.bases, &chain.links)?,
             None,
+            None,
         )
     } else {
-        let base = import_base(item, &captured, staged.path(), corpus, source, imported)?;
-        (staged, base)
+        let (base, deferred) = import_base(
+            item,
+            &captured,
+            (staged.path(), staged.is_bare()),
+            corpus,
+            source,
+            imported,
+        )?;
+        (staged, base, deferred)
     };
     // Estate converge: a first landing restores native refs and records
     // ledgers; a landed checkout whose capture changed converges when its
@@ -2286,16 +2338,31 @@ fn apply_item(
         source,
         base: base.as_ref(),
     };
+    let policy = git_carry::converge::Policy {
+        adopt: options.adopt,
+        origins: &options.activate_origin,
+        items,
+    };
     let (outcome, applied) = if item.workspace.is_some() {
         let landed_before = landed_before(state, &identity, source, &journal)?;
-        (
-            "workspace-restored",
-            git_carry::converge::apply_workspace(&staged, &target, &landing, landed_before)?,
-        )
+        let applied = git_carry::converge::apply_workspace(
+            &staged,
+            &target,
+            &landing,
+            landed_before,
+            &policy,
+        )?;
+        if let Some(key) = deferred {
+            imported
+                .lock()
+                .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
+                .insert(key);
+        }
+        ("workspace-restored", applied)
     } else {
         (
             "refs-imported",
-            git_carry::converge::apply_refs(&staged, &target, &landing)?,
+            git_carry::converge::apply_refs(&staged, &target, &landing, &policy)?,
         )
     };
     write(&journal, &outcome.to_owned())?;
@@ -2498,6 +2565,10 @@ pub struct LedgerEntry {
     /// holds a readable `{item}.capture` record. An attestation row binds to
     /// it (#133).
     pub capture: Option<String>,
+    /// The rebuildable roots the current capture omitted (#226 item 5),
+    /// from its `.omissions` sidecar; `None` when that is unknown (a
+    /// capture from before the sidecar, or no readable capture).
+    pub omitted: Option<Vec<git_carry::RebuildableOmission>>,
 }
 
 /// A plan's items joined with their outcome records and apply journals.
@@ -2563,9 +2634,13 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
         }
         let record_path = corpus.join(format!("{identity}.capture"));
         let mut capture = None;
+        let mut omitted = None;
         let journal = if !record_path.try_exists().refuse_at("estate::ledger")? {
             JournalState::NoCapture
         } else if let Ok(captured) = read::<Capture>(&record_path) {
+            if filename(&captured.bundle) {
+                omitted = retained_omissions(corpus, &captured.bundle);
+            }
             capture = Some(
                 blake3::Hash::from_bytes(captured.digest)
                     .to_hex()
@@ -2593,6 +2668,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             record: record.cloned(),
             journal,
             capture,
+            omitted,
             item: identity,
         });
     }
@@ -2717,6 +2793,25 @@ fn space_plan(
     by_device.into_values().collect()
 }
 
+/// What one `estate-apply` run may do beyond the default (#226,
+/// OI-1003-Q171/Q172). Explicit per run, never inferred; each receipt it
+/// changes says so.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ApplyOptions {
+    /// `--adopt`: an existing checkout or repository bulkload never landed
+    /// becomes bulkload's by proof (rows A11a and A11d), and a workspace
+    /// ledger naming another plan's item is re-keyed after its proof when
+    /// the capture is the landed tree's (A11b). A checkout that differs
+    /// refuses `GIT_DESTINATION_DIVERGED`; one that is not the item's to
+    /// adopt (spelled through a symlink, another or an unrelated
+    /// repository, a stale worktree backlink) `GIT_DESTINATION_OCCUPIED`.
+    pub adopt: bool,
+    /// `--activate-origin PREFIX` (repeatable): a first landing activates
+    /// an scp-style or `ssh://` origin starting with one of these; a local
+    /// path never ([`git_carry::origin_prefix_allowed`]).
+    pub activate_origin: Vec<String>,
+}
+
 /// Apply explicit restores only; common Git administration is serialized.
 ///
 /// # Errors
@@ -2730,6 +2825,38 @@ pub fn apply(
     jobs: usize,
     receipt: &(impl Fn(&Receipt) -> Result<()> + Sync),
 ) -> Result<()> {
+    apply_with(
+        plan,
+        corpus,
+        state,
+        source,
+        jobs,
+        &ApplyOptions::default(),
+        receipt,
+    )
+}
+
+/// [`apply`] under explicit [`ApplyOptions`] (#226).
+///
+/// # Errors
+/// As [`apply`]; `FIELD_DOMAIN_VIOLATION` for an `--activate-origin`
+/// prefix that is not an scp-style or `ssh://` URL prefix.
+pub fn apply_with(
+    plan: &Path,
+    corpus: &Path,
+    state: &Path,
+    source: &str,
+    jobs: usize,
+    options: &ApplyOptions,
+    receipt: &(impl Fn(&Receipt) -> Result<()> + Sync),
+) -> Result<()> {
+    if !options
+        .activate_origin
+        .iter()
+        .all(|prefix| git_carry::origin_prefix_allowed(prefix))
+    {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
     private_directory(state)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let contents: Plan = read(plan)?;
@@ -2759,6 +2886,13 @@ pub fn apply(
         locks.entry(common).or_insert_with(|| Mutex::new(()));
     }
     let owners = owners(&contents)?;
+    // A11b never re-keys a ledger naming one of the plan's own items
+    // (review of 2026-10-16, finding 2).
+    let items = contents
+        .items
+        .iter()
+        .map(id)
+        .collect::<Result<Vec<String>>>()?;
     let operation = |item: &Item| {
         let common = groups
             .get(&id(item)?)
@@ -2769,7 +2903,15 @@ pub fn apply(
         let _guard = lock
             .lock()
             .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
-        apply_item(item, corpus, state, source, &imported, &owners).map_err(charged_space)
+        apply_item(
+            item,
+            corpus,
+            state,
+            source,
+            (&imported, &owners),
+            (options, &items),
+        )
+        .map_err(charged_space)
     };
     // R-N114: an item whose workspace lies inside another item's workspace
     // restores after it, level by level, so the outer checkout lays down the
@@ -2907,6 +3049,10 @@ pub mod custody_probe {
         ))
     }
 }
+
+// `estate-diff` (#226 item 1).
+mod diff;
+pub use diff::{diff, DiffOptions, Summary as DiffSummary, SCHEMA as DIFF_SCHEMA};
 
 // S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
 #[cfg(test)]

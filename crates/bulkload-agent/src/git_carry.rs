@@ -2311,7 +2311,7 @@ impl Drop for PrivateDir {
 #[derive(Debug)]
 pub struct StagedBundle {
     // Held only so dropping the stage removes its private directory.
-    _directory: PrivateDir,
+    directory: PrivateDir,
     bundle: PathBuf,
     digest: [u8; 32],
     // Whether its headers mark a capture of a bare repository (S4, #162).
@@ -2329,6 +2329,19 @@ impl StagedBundle {
     #[must_use]
     pub const fn digest(&self) -> [u8; 32] {
         self.digest
+    }
+
+    /// Whether the capture is of a bare repository (S4, #162).
+    #[must_use]
+    pub const fn is_bare(&self) -> bool {
+        self.bare
+    }
+
+    /// The private directory the stage lives in, removed with it: where a
+    /// verb builds its own scratch repository (estate adopt and
+    /// `estate-diff`, #226), never at the destination.
+    pub(crate) fn private_dir(&self) -> &Path {
+        self.directory.path()
     }
 }
 
@@ -2411,7 +2424,7 @@ pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
     #[cfg(test)]
     mid_pass::fire(&source, mid_pass::Stage::BundleChecked);
     Ok(StagedBundle {
-        _directory: directory,
+        directory,
         bundle: path,
         digest,
         bare: bare_marked(&heads),
@@ -2844,6 +2857,13 @@ pub(crate) mod mid_pass {
         /// was read and before the stash reflog is: the window in which a
         /// `git stash pop` or `drop` of the last stash deletes both.
         StashReflog,
+        /// Keyed by a destination checkout: estate adopt (#226) between its
+        /// read-only proof and the destination lock, the window its
+        /// re-checks under the lock close (review of 2026-10-16, finding 9).
+        AdoptBeforeLock,
+        /// Keyed by a destination checkout: inside the adopt proof, after a
+        /// seat's bytes were read equal and before its print is taken again.
+        AdoptSeatRead,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -6071,6 +6091,78 @@ struct ConfigurationPlan {
     // Keys kept only in the receipt's verbatim `source-*` copies.
     preserved_only: Vec<String>,
     mapping: Option<(String, String)>,
+    // Every `--activate-origin` prefix an scp-style or `ssh://` origin
+    // value was activated by (#226 item 6), recorded beside the receipt;
+    // empty when none was.
+    by_prefix: Vec<String>,
+}
+
+/// The receipt file naming the `--activate-origin` prefixes that activated
+/// a landing's origin (#226 item 6).
+///
+/// One line per prefix that matched a `remote.origin.url` value, in order.
+/// Absent when the origin was HTTPS, mapped, inert or missing.
+pub const ORIGIN_PREFIX_RECEIPT: &str = "origin-activated-by-prefix";
+
+/// Whether `prefix` may be given to `--activate-origin` (#226 item 6).
+///
+/// It must be an scp-style (`host:path`, `user@host:path`) or `ssh://` URL
+/// prefix, never a local path, with no whitespace or control byte, and it
+/// must name its host whole: an scp-style prefix carries the `:` after the
+/// host, an `ssh://` one a `/` after it, so `ssh://yoga` (which would
+/// match `ssh://yoga.example.net/x`) is refused (review of 2026-10-16,
+/// finding 12). The prefix is matched literally, at a path boundary
+/// (`activating_prefix`); nothing is inferred from a host, an ssh config
+/// or a user name.
+#[must_use]
+pub fn origin_prefix_allowed(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && !prefix
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        && (prefix.strip_prefix("ssh://").is_some_and(|rest| {
+            rest.split_once('/')
+                .is_some_and(|(host, _)| !host.is_empty())
+        }) || scp_like(prefix))
+}
+
+// An scp-style Git URL: `[user@]host:path`, with a colon before any slash,
+// a host that is not empty, and no local-path or URL-scheme shape (Git
+// reads `./x:y`, `/x:y` and `scheme://` otherwise).
+fn scp_like(value: &str) -> bool {
+    let Some((host, _)) = value.split_once(':') else {
+        return false;
+    };
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
+    !host.is_empty()
+        && !host.contains('/')
+        && !value.starts_with(['/', '.', '~'])
+        && !value.contains("://")
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b".-_".contains(&byte))
+}
+
+// The `--activate-origin` prefix that activates `value`, if any: `value`
+// is itself an scp-style or `ssh://` URL with no whitespace or control
+// byte, and starts with the prefix at a boundary (#226 item 6): the prefix
+// ends in `/` or `:`, or the value's next byte is one, so
+// `git@github.com:Jesssullivan` never activates
+// `git@github.com:Jesssullivan-other/x.git` (review of 2026-10-16, finding
+// 12). A local path never matches.
+fn activating_prefix<'a>(value: &str, prefixes: &'a [String]) -> Option<&'a str> {
+    if !origin_prefix_allowed(value) {
+        return None;
+    }
+    prefixes
+        .iter()
+        .filter(|prefix| origin_prefix_allowed(prefix))
+        .find(|prefix| {
+            value.strip_prefix(prefix.as_str()).is_some_and(|rest| {
+                prefix.ends_with(['/', ':']) || rest.is_empty() || rest.starts_with(['/', ':'])
+            })
+        })
+        .map(String::as_str)
 }
 
 // The captured origin is activated only when every `remote.origin.url` value
@@ -6095,6 +6187,7 @@ fn plan_standalone_configuration(
     heads: &str,
     receipt: &Path,
     mapping: Option<(&str, &str)>,
+    prefixes: &[String],
 ) -> Result<ConfigurationPlan> {
     const SITE: &str = "git_carry::plan_standalone_configuration";
     let files: Vec<(String, Vec<u8>)> = postcard::from_bytes(&output(git(private).args([
@@ -6133,14 +6226,32 @@ fn plan_standalone_configuration(
         .filter(|(key, _)| key == "remote.origin.url")
         .map(|(_, value)| value.as_str())
         .peekable();
+    let mut by_prefix: Vec<String> = Vec::new();
     let origin_active = match mapping {
         Some(_) if origins.peek().is_none() => return Err(BulkloadRefusal::GitInventoryMalformed),
         Some((from, _)) if origins.any(|value| value != from) => {
             return Err(BulkloadRefusal::GitAuthorityChanged)
         }
         Some(_) => true,
-        None => origins.peek().is_some() && origins.all(safe_https_origin),
+        // #226 item 6: an scp-style or `ssh://` origin is activated only
+        // when every value starts with an `--activate-origin` prefix the
+        // run named; any other stays inert (#216).
+        None => {
+            origins.peek().is_some()
+                && origins.all(|value| {
+                    safe_https_origin(value)
+                        || activating_prefix(value, prefixes).is_some_and(|prefix| {
+                            if !by_prefix.iter().any(|named| named == prefix) {
+                                by_prefix.push(prefix.to_owned());
+                            }
+                            true
+                        })
+                })
+        }
     };
+    if !origin_active {
+        by_prefix.clear();
+    }
     let mut activate = Vec::new();
     for (key, value) in entries {
         let value = if key == "remote.origin.url" && origin_active {
@@ -6165,6 +6276,7 @@ fn plan_standalone_configuration(
         activate,
         preserved_only,
         mapping: mapping.map(|(from, to)| (from.to_owned(), to.to_owned())),
+        by_prefix,
     })
 }
 
@@ -6188,6 +6300,20 @@ fn apply_standalone_configuration(
             .map_err(|_| BulkloadRefusal::FrameCodec)?,
     )
     .refuse_at("git_carry::apply_standalone_configuration")?;
+    // The record's codec is unchanged; the prefixes are their own file
+    // (#226), every one that matched a value.
+    if !plan.by_prefix.is_empty() {
+        let lines = plan
+            .by_prefix
+            .iter()
+            .fold(String::new(), |mut lines, prefix| {
+                lines.push_str(prefix);
+                lines.push('\n');
+                lines
+            });
+        fs::write(receipt.join(ORIGIN_PREFIX_RECEIPT), lines)
+            .refuse_at("git_carry::apply_standalone_configuration")?;
+    }
     Ok(())
 }
 
@@ -6471,7 +6597,7 @@ fn attach_payload(
         // plan's repository is the receipt's, so a refusal here leaves the
         // destination's payload as it was, with no `.git`.
         let mapping = mapping.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        let plan = plan_standalone_configuration(&private, &heads, &receipt, Some(mapping))?;
+        let plan = plan_standalone_configuration(&private, &heads, &receipt, Some(mapping), &[])?;
         apply_standalone_configuration(&private, &receipt, &plan)?;
         private.clone()
     };
@@ -6613,6 +6739,7 @@ pub fn restore_staged(
             observed_ns: 0,
             capture: staged.digest(),
         },
+        &[],
     )
     .map(drop)
 }
@@ -6630,18 +6757,16 @@ pub(crate) fn restore_staged_landed(
     source: &str,
     (mapping, base): (Option<(&Path, &Path)>, Option<&StagedBundle>),
     landing: &converge::Landing<'_>,
+    origins: &[String],
 ) -> Result<converge::Applied> {
     const SITE: &str = "git_carry::restore_staged";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     destination_git_ready()?;
-    refuse_bare_capture(staged)?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
     // never as a bare errno; round 4 N4: so is a parent never laid down.
-    if destination.symlink_metadata().is_ok() {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
-    }
-    let target = linked_destination(destination)?;
+    // `estate-diff` reports the same checks (dogfood of 2026-10-16, F1).
+    let target = converge::first_landing_target(staged, destination)?;
     let mapping = checked_mapping(mapping)?;
     // #216 (OI-1003-Q129, OI-1003-Q135): the whole checkout is built in a
     // private stage beside the destination: the repository imported, every
@@ -6668,7 +6793,7 @@ pub(crate) fn restore_staged_landed(
         capture_revision(&heads, "configuration-v1")?;
     }
     let format = bundle_object_format(&heads)?;
-    output(git(&work).args(["init", "--template=", &format!("--object-format={format}")]))?;
+    init_repository(&work, format, false)?;
     // A based capture's plan base, into the stage first (estate converge).
     if let Some(base) = base {
         import_verified(&work, base.path(), source)?;
@@ -6689,7 +6814,8 @@ pub(crate) fn restore_staged_landed(
     find("configuration-v1")?;
     // #215: every carried native ref, the stash and HEAD, natively; no
     // `carry/*` branch.
-    let (head, meta, custody) = converge::land_standalone_refs(&work, source, &instance, landing)?;
+    let (head, meta, mut custody) =
+        converge::land_standalone_refs(&work, source, &instance, landing)?;
     let exclude = output(git(&work).args(["show", &format!("{}:value", find("exclude")?)]))?;
     fs::create_dir_all(work.join(".git/info")).refuse_at(SITE)?;
     fs::write(work.join(".git/info/exclude"), exclude).refuse_at(SITE)?;
@@ -6701,8 +6827,16 @@ pub(crate) fn restore_staged_landed(
         .mode(0o700)
         .create(work.join(".git/carry-config"))
         .refuse_at(SITE)?;
-    let configuration =
-        plan_standalone_configuration(&work, &heads, &work.join(".git/carry-config"), mapping)?;
+    let configuration = plan_standalone_configuration(
+        &work,
+        &heads,
+        &work.join(".git/carry-config"),
+        mapping,
+        origins,
+    )?;
+    if !configuration.by_prefix.is_empty() {
+        custody.count("origin-activated-by-prefix");
+    }
     restore_entries(&work, &entries)?;
     let staged = find("staged")?;
     restore_gitlink_directories(&work, &staged, &heads)?;
@@ -6772,6 +6906,235 @@ fn publish_restored(stage: &Path, work: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The symbolic HEAD a provenance instance carries (`None`: detached, or no
+/// metadata), read from `repo` (estate adopt, #226): a bare capture's HEAD
+/// may be unborn, so this reads the one metadata ref alone, never the
+/// instance's whole [`converge::Meta`].
+///
+/// # Errors
+/// `GIT_INVENTORY_MALFORMED` for a value that is not a branch name.
+pub(crate) fn carried_symbolic(
+    repo: &Path,
+    source: &str,
+    instance: &str,
+) -> Result<Option<String>> {
+    let name = format!("refs/carry/v1/{source}/{instance}/head-symbolic");
+    let found = git(repo)
+        .args(["rev-parse", "--verify", "-q", &name])
+        .output()
+        .refuse_at("git_carry::carried_symbolic")?;
+    if !found.status.success() {
+        return Ok(None);
+    }
+    let value = output(git(repo).args(["show", &format!("{name}:value")]))?;
+    let value = String::from_utf8(value).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let value = value.trim_end();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !value.starts_with("refs/heads/") {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    output(git(repo).args(["check-ref-format", value]))?;
+    Ok(Some(value.to_owned()))
+}
+
+/// Put an unborn HEAD of the bare repository `repo` on the captured branch
+/// (#226 item 4): only when `repo` is bare and its HEAD resolves to no
+/// commit, so a HEAD anybody set to a commit is never moved. Returns
+/// whether it wrote.
+///
+/// # Errors
+/// Whatever reading or writing HEAD refuses.
+pub(crate) fn settle_bare_head(repo: &Path, symbolic: Option<&str>) -> Result<bool> {
+    let Some(symbolic) = symbolic else {
+        return Ok(false);
+    };
+    if text(git(repo).args(["rev-parse", "--is-bare-repository"]))? != "true" {
+        return Ok(false);
+    }
+    let resolved = git(repo)
+        .args(["rev-parse", "--verify", "-q", "HEAD"])
+        .output()
+        .refuse_at("git_carry::settle_bare_head")?;
+    if resolved.status.success() {
+        return Ok(false);
+    }
+    let current = text(git(repo).args(["symbolic-ref", "-q", "HEAD"])).unwrap_or_default();
+    if current == symbolic {
+        return Ok(false);
+    }
+    set_symbolic_head(repo, symbolic)?;
+    Ok(true)
+}
+
+/// Point HEAD of the destination repository `repo` at `branch`, as a
+/// destination writer (finding 7): a first standalone landing's stage, or
+/// a bare landing's unborn HEAD (#226). The one such site (P76).
+pub(crate) fn set_symbolic_head(repo: &Path, branch: &str) -> Result<()> {
+    let mut command = git(repo);
+    durable(&mut command);
+    output(command.args(["symbolic-ref", "HEAD", branch])).map(drop)
+}
+
+/// `git init` in the empty directory `directory`, in object `format`,
+/// bare or not: a landing's private stage (standalone or bare, #226) or
+/// the adopt scratch. The one such site of the landings (P76).
+pub(crate) fn init_repository(directory: &Path, format: &str, bare: bool) -> Result<()> {
+    let mut command = git(directory);
+    command.args([
+        "init",
+        "--quiet",
+        "--template=",
+        &format!("--object-format={format}"),
+    ]);
+    if bare {
+        command.arg("--bare");
+    }
+    output(&mut command).map(drop)
+}
+
+/// Whether the existing repository `repo` is the capture's (estate adopt,
+/// #226): it has no native ref at all, or a native ref equals a carried
+/// tip, or it holds a root commit of a carried tip on a native ref. Run
+/// where `tips`' history is readable: `history` (a scratch repository
+/// borrowing `repo`'s objects, or `repo` itself after an import). Reads
+/// only.
+///
+/// # Errors
+/// Whatever the Git children refuse.
+pub(crate) fn related_repository(repo: &Path, history: &Path, tips: &[String]) -> Result<bool> {
+    let (native, _) = native_refs::native_refs(repo)?;
+    if native.is_empty() {
+        return Ok(true);
+    }
+    if tips
+        .iter()
+        .any(|tip| native.values().any(|value| value == tip))
+    {
+        return Ok(true);
+    }
+    if tips.is_empty() {
+        return Ok(false);
+    }
+    let mut roots = git(history);
+    roots.args(["rev-list", "--max-parents=0"]);
+    roots.args(tips.iter());
+    for root in text(&mut roots)?.lines() {
+        if !oid(root) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        let present = git(repo)
+            .args(["cat-file", "-e", &format!("{root}^{{commit}}")])
+            .output()
+            .refuse_at("git_carry::related_repository")?;
+        if !present.status.success() {
+            continue;
+        }
+        let holding = text(git(repo).args([
+            "for-each-ref",
+            "--count=1",
+            &format!("--contains={root}"),
+            "--format=%(refname)",
+            "--exclude=refs/carry/",
+            "--exclude=refs/carry-reuse/",
+            "--exclude=refs/carry-export/",
+        ]))?;
+        if !holding.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A refs-only item whose capture is of a bare repository, into a path
+/// that does not exist (#226 item 4, A11c): bulkload makes the bare
+/// repository itself, in a private stage beside the destination: `init
+/// --bare` in the capture's object format, the plan base and the capture
+/// imported, every native ref and the stash through the ref step with the
+/// repository marker (all R1), the captured symbolic HEAD, and the
+/// configuration under the standalone rule (an HTTPS origin, or one an
+/// `--activate-origin` prefix names, is activated; any other stays in the
+/// receipt only, #216). Published by the same no-replace rename as a
+/// standalone landing, so a crash leaves either nothing at the destination
+/// or the whole repository with its ledger.
+///
+/// # Errors
+/// `GIT_DESTINATION_OCCUPIED` when the destination exists,
+/// `GIT_DESTINATION_PARENT_MISSING` without its parent; whatever the
+/// import, the ref step or the configuration refuses.
+pub(crate) fn land_bare_staged(
+    staged: &StagedBundle,
+    destination: &Path,
+    source: &str,
+    base: Option<&StagedBundle>,
+    landing: &converge::Landing<'_>,
+    origins: &[String],
+) -> Result<converge::Applied> {
+    const SITE: &str = "git_carry::land_bare_staged";
+    destination_git_ready()?;
+    if !staged.is_bare() {
+        return Err(BulkloadRefusal::GitRepositoryNotAtPath);
+    }
+    if destination.symlink_metadata().is_ok() {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    let target = linked_destination(destination)?;
+    let stage =
+        PrivateDir::create_beside(target.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?;
+    let work = stage.path().join("repository.git");
+    let bundle = staged.path();
+    let listed = text(git(stage.path()).args(["bundle", "list-heads"]).arg(bundle))?;
+    let format = bundle_object_format(&listed)?;
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&work)
+            .refuse_at(SITE)?;
+    }
+    init_repository(&work, format, true)?;
+    if let Some(base) = base {
+        import_verified(&work, base.path(), source)?;
+    }
+    let (_, instance) = import_verified_instance(&work, bundle, source)?;
+    let directory = landed::ensure_dir(&work, source)?;
+    let (_, mut custody) = native_refs::step(
+        &work,
+        &directory,
+        &landed::RefLedger {
+            created: true,
+            ..landed::RefLedger::default()
+        },
+        source,
+        &instance,
+        landing.observed_ns,
+        &std::collections::BTreeSet::new(),
+        None,
+        false,
+    )?;
+    if settle_bare_head(
+        &work,
+        carried_symbolic(&work, source, &instance)?.as_deref(),
+    )? {
+        custody.count("head-symbolic-set");
+    }
+    let heads = shallow::headers(&work, bundle)?;
+    if capture_revision(&heads, "configuration-v1").is_ok() {
+        let receipt = work.join("carry-config");
+        fs::create_dir(&receipt).refuse_at(SITE)?;
+        let plan = plan_standalone_configuration(&work, &heads, &receipt, None, origins)?;
+        if !plan.by_prefix.is_empty() {
+            custody.count("origin-activated-by-prefix");
+        }
+        apply_standalone_configuration(&work, &receipt, &plan)?;
+    }
+    custody.count("bare-landed");
+    fault_point!(EstateAdoptBareStaged);
+    publish_restored(stage.path(), &work, &target)?;
+    Ok(converge::Applied::first(&custody))
+}
+
 /// Restore into a new linked worktree without changing any existing checkout.
 ///
 /// The source branch is reused only when its tip matches and Git permits a new
@@ -6783,10 +7146,12 @@ fn publish_restored(stage: &Path, work: &Path, target: &Path) -> Result<()> {
 /// A capture of a bare repository refuses `GIT_BARE_CAPTURE_WORKSPACE` before
 /// anything is imported or created (S4, #162).
 /// Partially created worktrees are retained on failure for explicit recovery.
-/// The capture's exclude policy and intent-to-add custody refuse before the
-/// worktree is added; after it, materialization can still refuse (a path
-/// collision, a malformed filesystem row, IO) and leave a partial worktree
-/// (#216).
+/// The capture's exclude policy and intent-to-add custody refuse before
+/// anything is imported into `repository` (read from a scratch repository;
+/// dogfood of 2026-10-16, F2), so such a refusal leaves its refs as they
+/// were; after the worktree is added, materialization can still refuse (a
+/// path collision, a malformed filesystem row, IO) and leave a partial
+/// worktree (#216).
 pub fn restore_linked(
     bundle: &Path,
     repository: &Path,
@@ -6839,7 +7204,7 @@ pub fn restore_linked_staged(
 ) -> Result<()> {
     restore_linked_staged_landed(
         staged,
-        repository,
+        (repository, None),
         destination,
         source,
         &converge::Landing {
@@ -6862,42 +7227,32 @@ pub fn restore_linked_staged(
 #[allow(clippy::too_many_lines)]
 pub(crate) fn restore_linked_staged_landed(
     staged: &StagedBundle,
-    repository: &Path,
+    (repository, base): (&Path, Option<&StagedBundle>),
     destination: &Path,
     source: &str,
     landing: &converge::Landing<'_>,
 ) -> Result<converge::Applied> {
     use std::os::unix::fs::PermissionsExt;
     destination_git_ready()?;
-    refuse_bare_capture(staged)?;
-    let bundle = staged.path();
-    if destination.symlink_metadata().is_ok() {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
-    }
-    let destination = linked_destination(destination)?;
-    let repository = fs::canonicalize(repository).refuse_at("git_carry::restore_linked_staged")?;
-    let (_, instance) = import_verified_instance(&repository, bundle, source)?;
-    let heads = shallow::headers(&repository, bundle)?;
-    let find = |suffix: &str| -> Result<String> {
-        heads
-            .lines()
-            .find_map(|line| {
-                line.split_once(' ')
-                    .filter(|(_, name)| *name == format!("refs/carry-export/{suffix}"))
-            })
-            .map(|(value, _)| value.to_owned())
-            .filter(|value| oid(value))
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)
-    };
+    // Dogfood of 2026-10-16, F2 (OI-1003-Q171, Q172, Q173): every refusal
+    // that needs no write (bare capture, occupied, parent missing, the
+    // capture's metadata, the common exclude policy, intent-to-add
+    // custody) is decided from a scratch repository before the first
+    // write to the destination repository; `estate-diff` runs the same
+    // checks. The import then runs under the lock, in `plan_linked`.
+    let checked = converge::check_linked(
+        staged,
+        (repository, base),
+        destination,
+        source,
+        landing.observed_ns,
+    )?;
+    let destination = checked.destination.clone();
+    let repository = checked.repository.clone();
+    let heads = checked.heads.clone();
+    let find = |suffix: &str| capture_revision(&heads, suffix);
     let head = find("head")?;
-    let exclude = output(git(&repository).args(["show", &format!("{}:value", find("exclude")?)]))?;
-    let exclude_path = text(git(&repository).args([
-        "rev-parse",
-        "--path-format=absolute",
-        "--git-path",
-        "info/exclude",
-    ]))?;
-    let read_exclude = |path: &str| match fs::read(path) {
+    let read_exclude = |path: &Path| match fs::read(path) {
         Ok(value) => Ok(value),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(error) => Err(crate::refuse::io(
@@ -6905,22 +7260,11 @@ pub(crate) fn restore_linked_staged_landed(
             "git_carry::restore_linked_staged",
         )),
     };
-    let existing_exclude = read_exclude(&exclude_path)?;
-    let common = common_repository(&repository)?;
-    // Finding 12: the main item may have set a newer exclude than this
-    // capture's; that one is kept, never refused.
-    let expected_exclude = if exclude == existing_exclude
-        || converge::exclude_newer(&common, source, &existing_exclude, landing.observed_ns)?
-    {
-        existing_exclude
-    } else {
-        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
-    };
-    // #131: before the worktree is added, so a capture whose intent-to-add
-    // custody cannot be restored refuses with nothing laid down.
-    let entries = output(git(&repository).args(["ls-tree", "-r", "-z", &find("worktree")?]))?;
-    intent_to_add_restorable(&carried_intent_to_add(&repository, &heads)?, &entries)?;
-    let plan = converge::plan_linked(&repository, source, &instance, landing)?;
+    let plan = converge::plan_linked(&checked, (staged.path(), base), source, landing)?;
+    let instance = plan.instance.clone();
+    let expected_exclude = plan.exclude.clone();
+    let exclude_path = checked.exclude_path;
+    let entries = checked.entries;
     // #216's residual (the earlier report's finding 7): the landing is
     // durable as an intent before `worktree add`, so a crash before the
     // worktree's ledger leaves a worktree the rerun can name as bulkload's

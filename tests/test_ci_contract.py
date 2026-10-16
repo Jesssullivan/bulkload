@@ -323,8 +323,10 @@ PINNED_JUST_RECIPES = {
         (),
     ),
     "ci-fault-harness": (
-        "ci-fault-harness: fault-harness",
-        (),
+        "ci-fault-harness:",
+        (
+            "cd {{ root }} && CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-tables-only {{ just_executable() }} fault-harness",
+        ),
     ),
     # The deep tier (OI-1003-Q78, OI-1003-Q81): on demand, never a gate.
     "props-deep": (
@@ -4135,7 +4137,11 @@ class CiContractTest(unittest.TestCase):
                 1,
             ),
             justfile.replace("    " + harness_test + "\n", "", 1),
-            justfile.replace("ci-fault-harness: fault-harness", "ci-fault-harness:", 1),
+            justfile.replace(
+                "line-tables-only {{ just_executable() }} fault-harness\n",
+                "line-tables-only true\n",
+                1,
+            ),
             justfile.replace(
                 "ci-source: check-source secrets-scan-history",
                 "ci-source: secrets-scan-history",

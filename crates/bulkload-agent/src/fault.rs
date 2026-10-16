@@ -292,11 +292,26 @@ pub enum Point {
     /// `estate.converge.linked_added`: a first linked landing's `git
     /// worktree add` done, its checkout and ledger not (#216's residual).
     EstateConvergeLinkedAdded,
+    /// `estate.adopt.after_import`: an adopt proof passed and the capture
+    /// is imported; no marker, ref or ledger written (#226).
+    EstateAdoptAfterImport,
+    /// `estate.adopt.after_marker`: the adoption record and the repository
+    /// marker written, the native ref step not run.
+    EstateAdoptAfterMarker,
+    /// `estate.adopt.after_refs`: the native ref step done, the workspace
+    /// ledger not written.
+    EstateAdoptAfterRefs,
+    /// `estate.adopt.after_ledger`: the workspace ledger written, the
+    /// journal not.
+    EstateAdoptAfterLedger,
+    /// `estate.adopt.bare_staged`: a bare first landing complete in its
+    /// private stage, not published (#226 item 4).
+    EstateAdoptBareStaged,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 38] = [
+    pub const ALL: [Self; 43] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -335,6 +350,11 @@ impl Point {
         Self::EstateConvergeAfterHead,
         Self::EstateConvergeAfterLanded,
         Self::EstateConvergeLinkedAdded,
+        Self::EstateAdoptAfterImport,
+        Self::EstateAdoptAfterMarker,
+        Self::EstateAdoptAfterRefs,
+        Self::EstateAdoptAfterLedger,
+        Self::EstateAdoptBareStaged,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -379,6 +399,11 @@ impl Point {
             Self::EstateConvergeAfterHead => "estate.converge.after_head",
             Self::EstateConvergeAfterLanded => "estate.converge.after_landed",
             Self::EstateConvergeLinkedAdded => "estate.converge.linked_added",
+            Self::EstateAdoptAfterImport => "estate.adopt.after_import",
+            Self::EstateAdoptAfterMarker => "estate.adopt.after_marker",
+            Self::EstateAdoptAfterRefs => "estate.adopt.after_refs",
+            Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
+            Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
         }
     }
 

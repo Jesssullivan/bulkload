@@ -68,8 +68,16 @@
 //! the report covers the transfers the operator named (`--transfer`) and
 //! says so (no `transfer_manifest` block).
 //!
-//! The report is `bulkload.closure.v3` (v2 from WP3 PR 3 to WP3 PR 4, v1
-//! before): a transfer row names its `kind` (an estate row prints as in
+//! The report is `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
+//! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
+//! `unmatched_journals`, `omissions`: the rebuildable roots the planned
+//! items' current captures omitted, from each capture's `.omissions`
+//! sidecar (`items_known`, `items_unknown`, `roots`, `entries`, `bytes`,
+//! one row per root with `item`, `path`, `entries` and `bytes`, and the
+//! `unknown` items whose capture predates the sidecar, never counted as
+//! zero). Nothing else changes from v3: rows, totals, dispositions and the
+//! gate are as before, and omissions are outside every one of them. In v3
+//! (unchanged): a transfer row names its `kind` (an estate row prints as in
 //! v2), and adds `transfer`, `path`, `transfer_outcome` and `sqlite_code`, `disposition` can be `covered`, and the
 //! totals add `covered`, `transfer_rows` and `ruled_default`; a session
 //! row prints its `started` (Unix seconds), and a joined manifest prints a
@@ -371,6 +379,43 @@ pub struct Report {
     pub reviewed: Option<Reviewed>,
     /// The transfer manifest joined, when one was (review finding 3).
     pub transfer_manifest: Option<ManifestJoined>,
+    /// The rebuildable roots the planned items' current captures omitted
+    /// (#226 item 5, v4).
+    pub omissions: Omissions,
+}
+
+/// The rebuildable roots the planned items' current captures omitted (#226
+/// item 5, closure v4).
+///
+/// Each capture's `.omissions` sidecar counts them. They are accounted
+/// custody, outside `planned` and every disposition. An item whose capture
+/// predates the sidecar is listed `unknown`, never counted as zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Omissions {
+    /// Items whose omissions are known (zero roots included).
+    pub known: u64,
+    /// Items whose omissions are unknown.
+    pub unknown: Vec<String>,
+    /// One row per omitted root: item, path, entries, bytes.
+    pub rows: Vec<(String, Vec<u8>, u64, u64)>,
+}
+
+impl Omissions {
+    /// Total entries of every omitted root.
+    #[must_use]
+    pub fn entries(&self) -> u64 {
+        self.rows
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(row.2))
+    }
+
+    /// Total bytes of every omitted root.
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.rows
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(row.3))
+    }
 }
 
 /// What a joined transfer manifest bound the report to.
@@ -393,6 +438,20 @@ impl Report {
             ..Self::default()
         };
         for entry in &ledger.entries {
+            match &entry.omitted {
+                Some(omitted) => {
+                    report.omissions.known += 1;
+                    report.omissions.rows.extend(omitted.iter().map(|root| {
+                        (
+                            entry.item.clone(),
+                            root.rel_path.clone(),
+                            root.entries,
+                            root.bytes,
+                        )
+                    }));
+                }
+                None => report.omissions.unknown.push(entry.item.clone()),
+            }
             report.rows.push(Row {
                 item: entry.item.clone(),
                 source: entry.source.clone(),
@@ -756,7 +815,7 @@ impl Report {
         }
     }
 
-    /// The report as one JSON document ([`SCHEMA`], `bulkload.closure.v3`).
+    /// The report as one JSON document ([`SCHEMA`], `bulkload.closure.v4`).
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn to_json(&self) -> String {
@@ -864,6 +923,33 @@ impl Report {
             out.push_str(&json_string(name));
         }
         out.push(']');
+        // v4 (#226 item 5): the rebuildable roots the captures omitted.
+        let _ = write!(
+            out,
+            ",\"omissions\":{{\"items_known\":{},\"items_unknown\":{},\"roots\":{},\"entries\":{},\"bytes\":{},\"rows\":[",
+            self.omissions.known,
+            self.omissions.unknown.len(),
+            self.omissions.rows.len(),
+            self.omissions.entries(),
+            self.omissions.bytes(),
+        );
+        for (index, (item, path, entries, bytes)) in self.omissions.rows.iter().enumerate() {
+            let _ = write!(
+                out,
+                "{}{{\"item\":{},\"path\":{},\"entries\":{entries},\"bytes\":{bytes}}}",
+                if index == 0 { "" } else { "," },
+                json_string(item),
+                json_string(&path.escape_ascii().to_string()),
+            );
+        }
+        out.push_str("],\"unknown\":[");
+        for (index, item) in self.omissions.unknown.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&json_string(item));
+        }
+        out.push_str("]}");
         if let Some(joined) = &self.transfer_manifest {
             let _ = write!(
                 out,
@@ -886,7 +972,7 @@ impl Report {
 }
 
 /// The report's schema name.
-pub const SCHEMA: &str = "bulkload.closure.v3";
+pub const SCHEMA: &str = "bulkload.closure.v4";
 
 // A transfer row's own fields as JSON: its DEST_STATE, path, outcome and
 // recorded refusal (typed or not, as an estate row prints it).
@@ -1934,6 +2020,7 @@ mod tests {
             }),
             journal,
             capture,
+            omitted: None,
         }
     }
 
@@ -2226,7 +2313,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v3\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
+            "{\"schema\":\"bulkload.closure.v4\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
         ), "{json}");
         // A typed refusal row names its code, recording site and errno.
         assert!(json.contains(
@@ -2249,10 +2336,13 @@ mod tests {
             "\"disposition\":\"unaccounted\",\"unaccounted_reason\":\"no-outcome-record\""
         ));
         assert!(json.contains("\"outcome\":null"));
-        assert!(json.ends_with(&format!(
-            "\"foreign_outcome_records\":[\"{}\"],\"unmatched_journals\":[\"stale.done\"]}}",
+        // v4 (#226 item 5): the omissions block follows; these test
+        // entries carry no `.omissions` sidecar, so each is unknown.
+        assert!(json.contains(&format!(
+            "\"foreign_outcome_records\":[\"{}\"],\"unmatched_journals\":[\"stale.done\"],\"omissions\":{{\"items_known\":0,\"items_unknown\":4,\"roots\":0,\"entries\":0,\"bytes\":0,\"rows\":[],\"unknown\":[",
             "f".repeat(64)
         )));
+        assert!(json.ends_with("]}}"), "{json}");
     }
 
     #[test]
@@ -2410,7 +2500,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v3\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
+            "{\"schema\":\"bulkload.closure.v4\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
         ), "{json}");
         // The attested refusal of c is a typed refusal: it needs a review.
         assert!(json.contains(
@@ -2818,6 +2908,67 @@ mod tests {
         );
         let shallow = format!("{}{}", "[".repeat(60), "]".repeat(60));
         assert!(Json::parse(&shallow).is_ok());
+    }
+
+    /// #226 item 5 (closure v4): the rebuildable roots each current
+    /// capture omitted are counted exactly, outside every disposition; a
+    /// capture with no `.omissions` sidecar is `unknown`, never zero.
+    #[test]
+    fn omitted_rebuildable_roots_are_counted_and_unknown_is_not_zero() {
+        let known = LedgerEntry {
+            omitted: Some(vec![
+                crate::git_carry::RebuildableOmission {
+                    rel_path: b"node_modules".to_vec(),
+                    bytes: 4116,
+                    entries: 3,
+                },
+                crate::git_carry::RebuildableOmission {
+                    rel_path: b"web/.direnv".to_vec(),
+                    bytes: 10,
+                    entries: 2,
+                },
+            ]),
+            ..entry(
+                'a',
+                true,
+                Some(("workspace-restored", None)),
+                JournalState::Present("workspace-restored".to_owned()),
+            )
+        };
+        let none = LedgerEntry {
+            omitted: Some(Vec::new()),
+            ..entry(
+                'b',
+                true,
+                Some(("workspace-restored", None)),
+                JournalState::Present("workspace-restored".to_owned()),
+            )
+        };
+        let legacy = entry(
+            'c',
+            true,
+            Some(("workspace-restored", None)),
+            JournalState::Present("workspace-restored".to_owned()),
+        );
+        let report = Report::from_ledger(&Ledger {
+            entries: vec![known, none, legacy],
+            ..Ledger::default()
+        });
+        assert_eq!(report.applied, 3);
+        assert!(report.native_passes());
+        let json = report.to_json();
+        assert!(
+            json.starts_with("{\"schema\":\"bulkload.closure.v4\""),
+            "{json}"
+        );
+        assert!(
+            json.contains(&format!(
+                ",\"omissions\":{{\"items_known\":2,\"items_unknown\":1,\"roots\":2,\"entries\":5,\"bytes\":4126,\"rows\":[{{\"item\":\"{a}\",\"path\":\"node_modules\",\"entries\":3,\"bytes\":4116}},{{\"item\":\"{a}\",\"path\":\"web/.direnv\",\"entries\":2,\"bytes\":10}}],\"unknown\":[\"{c}\"]}}",
+                a = "a".repeat(64),
+                c = "c".repeat(64),
+            )),
+            "{json}"
+        );
     }
 
     #[test]
@@ -3536,6 +3687,7 @@ mod tests {
                     record: outcome,
                     journal,
                     capture: Some(item(index)),
+                    omitted: None,
                 });
                 let Kind::Typed(code, how) = kind else {
                     continue;

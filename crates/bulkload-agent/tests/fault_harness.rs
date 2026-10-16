@@ -1321,6 +1321,12 @@ use sqlite_supersede::SqliteSupersede;
 mod estate_converge;
 use estate_converge::EstateConverge;
 
+// The `estate.adopt.*` points (#226): an `--adopt` apply crashed, and the
+// rerun finishing it.
+#[path = "fault_harness/estate_adopt.rs"]
+mod estate_adopt;
+use estate_adopt::EstateAdopt;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
@@ -1449,6 +1455,13 @@ scenarios! {
     estate_converge_index_locked_fresh_lock => EstateConvergeIndexLocked: 1, EstateConverge::FreshIndexLock;
     estate_converge_after_ref_intent_packed_new => EstateConvergeAfterRefIntent: 1, EstateConverge::PackedNew;
     estate_converge_linked_added_operator => EstateConvergeLinkedAdded: 1, EstateConverge::LinkedOperator;
+    // Estate adopt (#226): every point of an adoption and of a bare first
+    // landing, each finished by the rerun.
+    estate_adopt_after_import => EstateAdoptAfterImport: 1, EstateAdopt::Workspace;
+    estate_adopt_after_marker => EstateAdoptAfterMarker: 1, EstateAdopt::Workspace;
+    estate_adopt_after_refs => EstateAdoptAfterRefs: 1, EstateAdopt::Workspace;
+    estate_adopt_after_ledger => EstateAdoptAfterLedger: 1, EstateAdopt::Workspace;
+    estate_adopt_bare_staged => EstateAdoptBareStaged: 1, EstateAdopt::Bare;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

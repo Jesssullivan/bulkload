@@ -184,7 +184,20 @@ Not joined: `snapshot` and the offline compose verbs, which belong to no
 run; a source's tagged engine temporaries a walk skipped are listed by the
 transfer, not rows.
 
-The report schema is `bulkload.closure.v3` from WP3 PR 4. What changed for
+The report schema is `bulkload.closure.v4` from #226 (OI-1003-Q171/Q172,
+2026-10-15). What changed for a v3 reader: one top-level block after
+`unmatched_journals`, `omissions`: the rebuildable roots the planned items'
+current captures omitted (`node_modules`, `.direnv`, `__pycache__`,
+`.terraform` and the rest of `REBUILDABLE_DIRECTORIES`), from each
+capture's `{bundle}.omissions` sidecar: `items_known`, `items_unknown`,
+`roots`, `entries`, `bytes`, one row per root (`item`, `path`, `entries`,
+`bytes`) and the `unknown` items, whose capture predates the sidecar and
+is never counted as zero. Rows, totals, dispositions and the gate are
+v3's: an omitted root is accounted custody outside `planned` and every
+disposition. "Equals the source" reads exactly: equal except these
+counted roots.
+
+The report schema was `bulkload.closure.v3` from WP3 PR 4. What changed for
 a v2 reader: a transfer row names its `kind` and adds `transfer` (the
 DEST_STATE), `path`, `transfer_outcome` and, with its refusal, `sqlite_code`
 (an estate row prints as in v2); `disposition` can be `covered`; the totals
@@ -426,6 +439,23 @@ neither an index nor a worktree (S4, #162).
     tracking with `git branch --set-upstream-to`.
   - So no restored repository points at a remote or local path the
     destination host did not choose.
+  - `estate-apply --activate-origin PREFIX` (repeatable; #226 item 6,
+    OI-1003-Q171/Q172) is the destination host's choice, made per run: a
+    first standalone or bare landing activates an origin whose every
+    value is scp-style (`host:path`, `user@host:path`) or `ssh://` and
+    starts with a named prefix (`yoga:git/`,
+    `git@github.com:Jesssullivan/`) at a path boundary (the prefix ends
+    in `/` or `:`, or the value's next byte is one, so
+    `git@github.com:Jesssullivan` never matches
+    `git@github.com:Jesssullivan-other/x`), with `branch.*.remote` naming
+    it. A local path never matches, and a prefix that is not scp-style or
+    `ssh://`, or does not name its host whole (`ssh://yoga`), refuses
+    `FIELD_DOMAIN_VIOLATION` before anything runs. Nothing is inferred
+    from a host, an ssh config or a user name. The receipt counts
+    `origin-activated-by-prefix`, and
+    `carry-config/origin-activated-by-prefix` names every prefix that
+    matched a value, one per line. An adopted repository keeps its own
+    configuration: the flag never touches it.
   - An explicit mapping (`restore_bundle_configured`,
     `git-attach-standalone-payload`) is unchanged. `from` must be
     absolute; `to` must be an absolute path to an existing repository.
@@ -558,12 +588,67 @@ that note) before merge.**
   directory the source turned into a file or symlink while it holds an
   entry bulkload did not land (checked before the intent). Configuration
   is applied once at the first landing and only reported after.
-- **Not the landings made before this branch.** A checkout landed without
-  ledgers (the 2026-10-08 landing under `/srv/data`) still refuses
-  `GIT_DESTINATION_OCCUPIED` on a re-apply, and a repository without the
-  ref ledger's marker gets provenance only. Converging it needs an
-  adoption verb (`--adopt`) or a fresh landing; both await a ruling (Q4,
-  Q8 of that note).
+- **Adopt: landing into the live tree (#226, OI-1003-Q171/Q172,
+  2026-10-15; `docs/agent-notes/2026-10-15-estate-adopt-design.md`).**
+  Without `--adopt` a destination bulkload never landed still refuses
+  `GIT_DESTINATION_OCCUPIED`, and a repository without the marker gets
+  provenance only. With `estate-apply --adopt`, explicit per run, an
+  existing checkout becomes bulkload's by proof, with nothing moved:
+  - The checkout must be the item's to adopt, before any proof: its path
+    and the plan's repository spelled canonically (never through a
+    symlink: a ledger is keyed by the item, the item by its spelled
+    paths), its repository the plan's, a standalone item's checkout a
+    main worktree, and its git directory naming it back (a linked
+    worktree moved without `git worktree repair`, or a copy sharing
+    another's admin directory, is not). Otherwise
+    `GIT_DESTINATION_OCCUPIED` with nothing written; `estate-diff` says
+    `symlinked-path` or `occupied-shape` with the reason.
+  - Its repository must be the capture's: it holds a carried tip or a
+    root commit of one, or it has no native ref. An unrelated repository
+    stays `GIT_DESTINATION_OCCUPIED` with nothing written.
+  - The proof is read-only and runs before any lock or write. The capture
+    is read from a scratch repository beside its staged bundle, borrowing
+    the destination's objects. HEAD (branch and commit), the index entries
+    (with intent-to-add), a standalone item's exclude, and every carried
+    seat's kind, mode and bytes (each print held still while read) must
+    equal the capture's. Extra destination seats, the omitted rebuildable
+    roots and planned nests are left alone.
+  - Any difference refuses `GIT_DESTINATION_DIVERGED` with nothing
+    written: never claimed, never overwritten. The refusal is pending
+    review; accept, re-carry or abandon disposes it, and `--policy` makes
+    a standing accept.
+  - On equality, under the destination lock, the checkout must still have
+    no workspace ledger (another apply may have written one), and the
+    proved prints are checked again. Then come the import, an `adopted` record and the
+    repository marker with the HEAD branch's R2 row, and the native ref
+    step:
+    - R1 creates carried refs the destination lacks;
+    - R2 adopts equal ones;
+    - R3 keeps differing ones;
+    - R10 leaves destination-only ones;
+    - checked-out branches are skipped;
+    - the stash goes by T0 (an equal reflog adopted), T1 or T2.
+
+    Then the workspace ledger from the proof's prints.
+  - No seat, index, HEAD or configuration is written, and no ref is
+    deleted. A crash leaves the checkout as it was and the item
+    `journal-missing`. Before the workspace ledger, the rerun with
+    `--adopt` finishes; after it, any rerun does.
+  - A ledger that names another plan's item (a landing moved to its live
+    name) is re-keyed under `--adopt` after its normal proof, and only
+    when the checkout is spelled canonically, the ledger's item is not one
+    of this plan's, and the capture is the landed tree's (the same
+    capture, or its HEAD is the ledger's HEAD or descends from it).
+    Otherwise `GIT_DESTINATION_OCCUPIED`, nothing rewritten: a plan typo
+    or two items aliasing one tree never hand a landing to another
+    source.
+  - A refs-only item's related or empty repository is adopted the same
+    way, and an unborn HEAD of a bare one is put on the captured branch.
+    An unrelated one keeps the provenance import and refuses
+    `GIT_DESTINATION_OCCUPIED` (pending review, never counted applied).
+  - `estate-diff` reports all of this beforehand, read-only.
+  - Not built: `--protect` (land the source's state beside a destination
+    adopt refuses).
 - One plan lands a main and its linked worktrees: an item whose repository
   is a planned standalone workspace applies a level after it, and a
   standalone item's plan base is imported into its stage. A first linked
@@ -572,7 +657,16 @@ that note) before merge.**
   seats are written: each entry is laid down under a temporary name and
   renamed into place, so an operator's file at an entry's name, or any
   index the landing did not write, refuses `GIT_DESTINATION_MODIFIED`),
-  never `GIT_DESTINATION_OCCUPIED` for good.
+  never `GIT_DESTINATION_OCCUPIED` for good. Every refusal a first linked
+  landing can decide without a write (a bare capture, an occupied path, a
+  missing parent, the capture's metadata, a common exclude that is neither
+  the capture's nor a newer one the main item set
+  (`GIT_IGNORE_POLICY_CONFLICT`), intent-to-add custody) is decided from a
+  scratch repository before its first write to the destination
+  repository, so it leaves that repository's refs and objects as they
+  were; the import then runs under the destination lock. `estate-diff`
+  runs the same checks and says `ignore-policy-conflict` or
+  `parent-missing` (dogfood of 2026-10-16, F1 and F2).
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads
@@ -588,7 +682,9 @@ that note) before merge.**
 Import preserves divergence and leaves active HEADs, indexes and working
 bytes untouched, with one exception pending the ruling above: a checkout
 bulkload landed and nobody changed since is converged to a newer capture
-of the same source. estate-apply refuses a planned item whose capture
+of the same source, and, under `--adopt`, an existing checkout that proves
+equal to its capture becomes bulkload's with nothing written to it (#226).
+estate-apply refuses a planned item whose capture
 the corpus does not hold (its capture refused, or none ran) with
 `CAPTURE_ABSENT`, before it reads anything else; `SEALED_OBJECT_MISSING`
 names only a recorded capture whose bundle, link or base the corpus lost
@@ -597,7 +693,15 @@ exist, or into a directory Git finds no repository in (an empty directory,
 an unfinished `git init`), refuses `GIT_REPOSITORY_NOT_AT_PATH` as that
 item's own receipt, never `GIT_INVENTORY_MALFORMED` or
 `GIT_DESTINATION_OCCUPIED`, and never aborts the apply's other items (S4,
-#183). A standalone item on a plan base is never preseeded into an
+#183). The exception is a capture of a bare repository into a path that
+does not exist (#226 item 4): bulkload lands the bare repository itself.
+It is built in a private `.bulkload-restore-*` stage beside the path: `init
+--bare` in the capture's object format, the plan base and the capture
+imported, every native ref and the stash through the ref step with the
+repository marker, the captured symbolic HEAD, and the configuration
+under the standalone rule. It is published by the standalone landing's
+no-replace rename and borrows nothing (`alternates` at the source are
+packed into the bundle). A standalone item on a plan base is never preseeded into an
 existing destination: its plan base is staged into its own private stage
 (estate converge, above), and an occupied standalone destination without
 ledgers still refuses `GIT_DESTINATION_OCCUPIED`. Account credentials
