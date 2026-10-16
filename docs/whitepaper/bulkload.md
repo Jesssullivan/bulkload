@@ -1425,10 +1425,8 @@ record, on the rig:
   rclone+syncfs.
 
 **S1 levers, 2026-10-15** (B = `59e5e60`, A = `8a24161`, 5 rounds of
-`r23-s1lev-20261015-underload-{1..5}.md` on mbp-13; these files are rig
-logs, not in this tree, and are cited through the
-[fold note](../agent-notes/2026-10-16-s1-fold.md), section 5, and the
-[clone note](../agent-notes/2026-10-15-s1-clone-lever.md), section 4): B's
+`r23-s1lev-20261015-underload-{1..5}.md` on mbp-13;
+[evidence](../evidence/r23-2026-10-15-mbp-13-s1lev-underload.md)): B's
 round medians for the initial copy were 360.8, 419.9, 402.9, 402.4 and
 406.3 ms against rclone at 347.4 to 362.7 ms; the median of the round
 medians is 402.9 against 356.8 ms, **1.13x**. The series read the old
@@ -1442,8 +1440,27 @@ note](../agent-notes/2026-10-16-s1-fold.md), section 4). Every rep of a
 census removed four directory seals and one FULL commit per copy, as
 designed. Timers showed the tail shrinking by about 7 to 9.5 ms and the
 drain growing by about 6 to 8 ms, because the drain now sets the final
-modes; the wall difference was within noise in either direction. The rig
-series that would measure it needs a commit (section 5.5).
+modes; the wall difference was within noise in either direction.
+
+**The fold on the rig, 2026-10-16** (B = `51d1d4c`, A = `8a24161`, on the
+unshared corpus; 5 rounds, each a fold-on run and then a
+`BULKLOAD_DIRECTORY_FOLD=0` run;
+[evidence](../evidence/r23-2026-10-16-mbp-13-s1fold-underload.md)):
+
+- the counters moved exactly as the fold note predicted: 4
+  `directories_folded` per initial copy with the fold on and 0 with it
+  off, directory barriers 4 against 8, SQLite commits 5 against 6;
+- B's initial median was lower with the fold on in all five paired rounds,
+  by 9.3 to 79.9 ms; the medians of the round medians were 372.0 against
+  437.3 ms, 65.3 ms apart. A, the same binary in both arms, was also
+  slower in every fold-off run, by 12 to 50 ms, and the fold-off run always
+  went second, so part of the gap is order and drift. The receive tail
+  accounts for about 28 ms (28.4 to 0.7 ms), and on the rig the drain did
+  not grow to absorb it;
+- against plain rclone the fold-on round medians ran 0.948x to 1.151x
+  (median 1.038x): not at Q143's 0.90x;
+- the 1 % delta was slower than rclone in 9 of the 10 round medians, in
+  both arms; the fold does not touch it.
 
 **Where S1 stands, and why the margin is narrow: the SOTA study**
 (2026-10-15, rig micro-benchmarks, not R23 samples;
@@ -1523,9 +1540,10 @@ any gate, deciding no SLO.
 `/srv/fast-local/jess/bulkload/gftb-resume-20261015/carry.receipt` on
 sting (sha256
 `d2d4852f71c51148e47d6e73373de40408286fe7b99831468bf6c628ff6a5713`), under
-OI-1003-Q163. No file in this tree records them; section 9 lists that as a
-gap. The agent was `main` at `f4988060` (#224), built on both hosts, **not**
-the S1 stack. The receipt records that the live sting repositories, and
+OI-1003-Q163, and are now recorded in the
+[field evidence](../evidence/field-2026-10-15-gftb-carry.md). The agent
+was `main` at `f4988060` (#224), built on both hosts, **not** the S1
+stack. The receipt records that the live sting repositories, and
 neo's GFTB repositories (read-only, with neo's probe identical before the
 first capture and after the rerun capture), were left untouched.
 
@@ -1572,7 +1590,7 @@ origins rule requires.
 | Result owed | Blocker or state |
 |---|---|
 | An S1 PASS | The FAIL of record stands. First, an informational series at or under Q143's 0.90x on both initial and delta. |
-| The fold's rig series | Needs a signed, pushed commit of this tree: `r23_ab.py` builds revisions from commits. Then two alternating series of the same B on the unshared corpus, fold on and `BULKLOAD_DIRECTORY_FOLD=0` ([fold note](../agent-notes/2026-10-16-s1-fold.md), section 5). |
+| The fold's rig series, separated from drift | The 2026-10-16 series ran under load with the fold-on run always first ([evidence](../evidence/r23-2026-10-16-mbp-13-s1fold-underload.md)); its A control moved 12 to 50 ms between arms. |
 | An S1 gate (b) sample | Waits on gate (a) (OI-1003-Q66). The multi-stream arm is not built. |
 | The S2 measured budget | #165. No alongside observation on neo; Q168's schedule is on `main`, not in this tree. |
 | S3 on the estate corpus after #172, #177, #182, #186, #187 and the SQLite seat | Not re-measured. |
@@ -1847,7 +1865,8 @@ The previous revision was pinned to `main` at `a80c63b`. This one describes
 5. **S1 moved and is still not met.** The throughput work and the levers
    (on the stack) took the rig's informational initial copy from about
    856 ms to about 400 ms against rclone's about 357 ms; the SOTA study
-   bounds what is left; the fold is built and unmeasured on the rig.
+   bounds what is left; the fold's rig series (under load) puts the
+   initial copy at about 1.04x rclone with the fold on.
 6. **The clone is excluded and S2 forbids it** (Q164–Q166; P84); the rig's
    corpus was re-sealed unshared.
 7. **S2's budget method**: alongside a live run against its own baseline
@@ -1873,17 +1892,23 @@ The previous revision was pinned to `main` at `a80c63b`. This one describes
 
 What stands between this text and a publishable paper (OI-1003-Q155):
 
-1. **Commit the field and rig evidence into the tree.** The GFTB receipts
-   (section 5.4) and the 2026-10-15 levers series (section 5.3) are cited
-   from outside the repository. Each needs an evidence file under
-   `docs/evidence/`.
+1. **Commit the field and rig evidence into the tree.** Done on
+   2026-10-16: the GFTB carry and reconcile receipts
+   ([field evidence](../evidence/field-2026-10-15-gftb-carry.md)), the
+   2026-10-15 levers series
+   ([evidence](../evidence/r23-2026-10-15-mbp-13-s1lev-underload.md)) and
+   the 2026-10-16 fold series
+   ([evidence](../evidence/r23-2026-10-16-mbp-13-s1fold-underload.md)).
+   Section 5's S1 series and field results are now recorded in the tree.
 2. **The stack must land on `main`** (OI-1003-Q173), or this paper's
    S1-stack statements must be re-scoped to a branch at publication.
 3. **Re-pin to current `main`** to take in #228 (Q168, Q169) and whatever
    follows.
 4. **An S1 verdict to report.** Today the paper can only report a FAIL of
-   record and an under-load trend. The fold's rig series is the next
-   measurement; an S1 PASS needs Q143's margin first.
+   record and an under-load trend. The fold's rig series has run, under
+   load (section 5.3): about 1.04x plain rclone on the initial copy with
+   the fold on, and the 1 % delta still slower than rclone. An S1 PASS
+   needs Q143's margin first.
 5. **One S2 budget measurement** alongside a real run (#165).
 6. **A re-measurement of S3 on the estate corpus.**
 7. **A recount of the property plan** against the code (section 4.1).
