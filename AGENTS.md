@@ -212,8 +212,9 @@ no longer true (R-N55).
 Merge gate (OI-1003-Q199, 2026-10-16, Linear TIN-4543 comment `b208cbae`):
 a PR merges on a local receipt from sting, not on runner CI.
 `just local-gate-receipt` (`scripts/local-gate-receipt.sh`) runs
-`just local-gate` (`check-fast`, `secrets-scan-history` and the Bazel graph
-load `bazel-graph`; the contract test holds it to CI's gate set) inside
+`just local-gate` (`check-fast`, the history secret scan limited to HEAD's
+ancestry `secrets-scan-head`, and the Bazel graph load `bazel-graph`; the
+contract test holds it to CI's gate set) inside
 `nix develop` on the exact PR head brought up to date with main, and records
 head, tree, main, the flake.lock and log digests and the exit code. Docs PRs
 need the receipt only; code PRs also need the lanes' adversarial review

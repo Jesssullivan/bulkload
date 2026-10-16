@@ -37,6 +37,15 @@ secrets-scan-history:
     cd {{ root }} && command -v gitleaks >/dev/null 2>&1
     cd {{ root }} && gitleaks git --config .gitleaks.toml --redact .
 
+# The merge gate's history scan (OI-1003-Q199): `secrets-scan-history`
+# limited to HEAD's ancestry, the history the PR would merge. A local
+# checkout also holds refs no PR contains (backup branches, other lanes'
+# work), which CI's fresh clone never sees; scanning them failed #236's gate
+# on a commit it does not contain.
+secrets-scan-head:
+    cd {{ root }} && command -v gitleaks >/dev/null 2>&1
+    cd {{ root }} && gitleaks git --config .gitleaks.toml --redact --log-opts=HEAD .
+
 # Rust gates for the workspace (fmt, clippy with warnings denied, tests
 # including the agent's dependency-wall test). The io layer's syscall trace
 # (R-N88) is linted here with `io-trace` alone, the one place PR CI compiles
@@ -373,11 +382,12 @@ bazel-graph:
 # `nix develop .#default`, on the exact PR head brought up to date with
 # main; `scripts/local-gate-receipt.sh` (`just local-gate-receipt`) runs it
 # and writes the receipt the merge needs. It runs everything CI's `ci-source`
-# and `ci-fault-harness` run (the contract test holds the sets equal) plus
+# and `ci-fault-harness` run (the contract test holds the sets equal), with
+# the history scan limited to HEAD's ancestry (`secrets-scan-head`), plus
 # the Bazel graph load. CI runs only on `v*` tags and workflow_dispatch, as
 # the backstop. It retires when GloriousFlywheel v4 fabric check runs land
 # (TIN-5946).
-local-gate: check-fast secrets-scan-history bazel-graph
+local-gate: check-fast secrets-scan-head bazel-graph
 
 # Run `local-gate` on HEAD and print its receipt line; `--pr N --post` also
 # comments it on PR N. See the script's header for the checks it makes.

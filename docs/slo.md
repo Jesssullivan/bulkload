@@ -1377,7 +1377,9 @@ proof obligation above stands.
 
 - **Gate location.** A PR merges on `just local-gate` run on sting inside
   `nix develop`, on the exact PR head brought up to date with main. The gate
-  is `check-fast` plus `secrets-scan-history` plus a Bazel graph load
+  is `check-fast` plus the history secret scan of HEAD's ancestry
+  (`secrets-scan-head`; a shared checkout's other refs are not the PR's)
+  plus a Bazel graph load
   (`bazel-graph`, a query that closes the OI-1003-Q65 gap, not a build); the
   CI contract test holds it to CI's gate set. GitHub CI runs only on `v*`
   tags and `workflow_dispatch`, as the backstop, and the "Protect main"

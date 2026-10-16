@@ -10,8 +10,11 @@ requires status checks) was made before this lane and is not in the repo.
 
 ## What changed
 
-- `justfile`: `local-gate` (= `check-fast` + `secrets-scan-history` +
-  `bazel-graph`), `bazel-graph` (a `bazelisk query` of
+- `justfile`: `local-gate` (= `check-fast` + `secrets-scan-head` +
+  `bazel-graph`), `secrets-scan-head` (`secrets-scan-history` with
+  `--log-opts=HEAD`: the coordinator found the full scan failed #236's
+  gate on a local-only backup branch's test fixture, commit `b765b444`,
+  which CI's fresh clone never sees), `bazel-graph` (a `bazelisk query` of
   `deps(//:bulkload + //:tests)` with `--lockfile_mode=error`; no build),
   `local-gate-receipt`, `darwin-touched`; `shell-lint` covers the new
   scripts; the `darwin-check` comment drops "neo with the R-N69 prefix".
@@ -35,7 +38,9 @@ requires status checks) was made before this lane and is not in the repo.
   digests; the trigger inventory must equal {push tags v*,
   workflow_dispatch}; the guard's event arms must equal {push,
   workflow_dispatch}; `local-gate`'s recipe closure must equal CI's
-  (`ci-source` + `ci-fault-harness`) plus `check-fast` and `bazel-graph`;
+  (`ci-source` + `ci-fault-harness`, with the history scan swapped for the
+  HEAD-scoped one, whose body must be CI's plus `--log-opts=HEAD` only)
+  plus `check-fast` and `bazel-graph`;
   the receipt script must run `local-gate` and record every field. Each
   has mutation tests that fail closed.
 - `AGENTS.md` (Agent lanes bullet and Validation only) and `docs/slo.md`

@@ -328,8 +328,17 @@ PINNED_JUST_RECIPES = {
         (),
     ),
     "local-gate": (
-        "local-gate: check-fast secrets-scan-history bazel-graph",
+        "local-gate: check-fast secrets-scan-head bazel-graph",
         (),
+    ),
+    # The gate's history scan covers HEAD's ancestry only: a local checkout
+    # holds refs no PR contains (OI-1003-Q199, #236's false failure).
+    "secrets-scan-head": (
+        "secrets-scan-head:",
+        (
+            "cd {{ root }} && command -v gitleaks >/dev/null 2>&1",
+            "cd {{ root }} && gitleaks git --config .gitleaks.toml --redact --log-opts=HEAD .",
+        ),
     ),
     "bazel-graph": (
         "bazel-graph:",
@@ -691,9 +700,15 @@ def just_closure(justfile: str, name: str) -> set[str]:
 
 
 # OI-1003-Q199: the local merge gate must run every recipe CI's two gates
-# run, plus the history secret scan and the Bazel graph load, so the merge
-# gate and the tag backstop cannot drift apart.
+# run, plus the Bazel graph load, so the merge gate and the tag backstop
+# cannot drift apart. Its one substitution: CI's history scan runs in a
+# fresh clone, so the gate scans HEAD's ancestry (`secrets-scan-head`), not
+# every ref of a shared local checkout.
 LOCAL_GATE_EXTRA = {"check-fast", "bazel-graph"}
+HISTORY_SCAN = "cd {{ root }} && gitleaks git --config .gitleaks.toml --redact ."
+HEAD_SCAN = (
+    "cd {{ root }} && gitleaks git --config .gitleaks.toml --redact --log-opts=HEAD ."
+)
 
 
 def validate_local_gate(justfile: str) -> None:
@@ -703,10 +718,22 @@ def validate_local_gate(justfile: str) -> None:
     local = just_closure(justfile, "local-gate")
     if "fault-harness" not in ci or "secrets-scan-history" not in ci:
         raise ContractError("CI gate closure lost the fault harness or history scan")
-    if local - LOCAL_GATE_EXTRA != ci:
+    expected = (ci - {"secrets-scan-history"}) | {"secrets-scan-head"}
+    if local - LOCAL_GATE_EXTRA != expected:
         raise ContractError("local-gate must run exactly the CI gate set")
     if not LOCAL_GATE_EXTRA <= local:
         raise ContractError("local-gate must run check-fast and the Bazel graph load")
+    # The HEAD-scoped scan is CI's scan with only `--log-opts=HEAD` added.
+    _, history = just_recipe(justfile, "secrets-scan-history")
+    _, head = just_recipe(justfile, "secrets-scan-head")
+    if (
+        history.count(HISTORY_SCAN) != 1
+        or tuple(HEAD_SCAN if line == HISTORY_SCAN else line for line in history)
+        != head
+    ):
+        raise ContractError(
+            "local-gate's history scan must be CI's scan scoped to HEAD"
+        )
 
 
 # The receipt (OI-1003-Q199): what `scripts/local-gate-receipt.sh` must run
@@ -4445,20 +4472,42 @@ class CiContractTest(unittest.TestCase):
         validate_local_gate(justfile)
         self.assertEqual(
             just_closure(justfile, "local-gate") - LOCAL_GATE_EXTRA,
-            just_closure(justfile, "ci-source")
-            | just_closure(justfile, "ci-fault-harness"),
+            (
+                just_closure(justfile, "ci-source")
+                | just_closure(justfile, "ci-fault-harness")
+            )
+            - {"secrets-scan-history"}
+            | {"secrets-scan-head"},
         )
-        self.assertIn("secrets-scan-history", just_closure(justfile, "local-gate"))
+        self.assertIn("secrets-scan-head", just_closure(justfile, "local-gate"))
+        self.assertNotIn("secrets-scan-history", just_closure(justfile, "local-gate"))
         self.assertIn("fault-harness", just_closure(justfile, "local-gate"))
+        head_scan = "--redact --log-opts=HEAD ."
         variants = [
             justfile.replace(
-                "local-gate: check-fast secrets-scan-history bazel-graph",
+                "local-gate: check-fast secrets-scan-head bazel-graph",
                 "local-gate: check-fast bazel-graph",
                 1,
             ),
             justfile.replace(
+                "local-gate: check-fast secrets-scan-head bazel-graph",
+                "local-gate: check-fast secrets-scan-head",
+                1,
+            ),
+            # The gate's scan widened back to every local ref, or drifted.
+            justfile.replace(
+                "local-gate: check-fast secrets-scan-head bazel-graph",
                 "local-gate: check-fast secrets-scan-history bazel-graph",
-                "local-gate: check-fast secrets-scan-history",
+                1,
+            ),
+            justfile.replace(head_scan, "--redact .", 1),
+            justfile.replace(head_scan, "--redact --log-opts=--all .", 1),
+            justfile.replace(
+                head_scan, "--redact --log-opts=HEAD --max-target-megabytes=1 .", 1
+            ),
+            justfile.replace(
+                "--config .gitleaks.toml --redact --log-opts=HEAD",
+                "--redact --log-opts=HEAD",
                 1,
             ),
             justfile.replace(
@@ -4484,9 +4533,25 @@ class CiContractTest(unittest.TestCase):
                 self.assertNotEqual(unsafe, justfile)
                 with self.assertRaises(ContractError):
                     validate_just_recipes(unsafe)
-        # The closure check alone catches a CI-only gate even if the pins move.
-        with self.assertRaises(ContractError):
-            validate_local_gate(variants[3])
+        # The closure check alone catches a CI-only gate even if the pins move,
+        # and a gate scan that is not CI's scan scoped to HEAD.
+        for unsafe in (
+            justfile.replace(
+                "ci-source: check-source secrets-scan-history contract-test",
+                "ci-source: check-source secrets-scan-history contract-test flake-check",
+                1,
+            ),
+            justfile.replace(head_scan, "--redact .", 1),
+            justfile.replace(
+                "    cd {{ root }} && gitleaks git --config .gitleaks.toml --redact .\n",
+                "    cd {{ root }} && gitleaks git --config .gitleaks.toml --redact"
+                " --no-banner .\n",
+                1,
+            ),
+        ):
+            self.assertNotEqual(unsafe, justfile)
+            with self.assertRaises(ContractError):
+                validate_local_gate(unsafe)
 
     def test_local_gate_receipt_runs_the_gate_and_records_the_receipt(self) -> None:
         script = (self.root / LOCAL_GATE_RECEIPT_PATH).read_text(encoding="utf-8")
