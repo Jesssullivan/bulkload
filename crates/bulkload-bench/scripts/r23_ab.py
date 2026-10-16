@@ -111,6 +111,26 @@ mode, content hash and stat fields (dev, ino, mtime, ctime, nlink), so it
 is stable for one untouched copy and differs between copies. After the last rep, both the working copy and the
 sealed corpus are verified again. Any failure aborts the sample (exit 3).
 
+No clone (S2, OI-1003-Q165 (b)): the working copy is an explicit read and
+write (`r23_corpus.plain_copy_tree`: os.read/os.write, never `cp` or
+`shutil`, whose Linux fast copy is `copy_file_range` from Python 3.14 and
+clones on a reflink file system). Before any build, FIEMAP must show it
+sharing no extent with any other file: a shared extent refuses the sample
+(exit 2) in every mode, and on Linux a work root whose sharing FIEMAP
+cannot show (anything but xfs, btrfs, bcachefs and ocfs2; ext4 and tmpfs
+cannot reflink and count 0) refuses a gated sample (an informational one
+records `unsupported`; off Linux it is `n/a`). After every rep the working
+copy and the rep's private fixture (the bench's seed, which the timed arms
+read) are checked again, and a shared extent aborts the sample (exit 3).
+FIEMAP sees sharing that still exists at the check: a clone of either by an
+arm that is still in place is refused, but a clone whose target the arm
+then overwrote in full or deleted is not seen (the source keeps no visible
+mark). P84's static scan is what rules out a clone call by bulkload; the
+rclone arm is held to this check only. The sealed corpus is checked once:
+since OI-1003-Q166 re-sealed the rig's corpus as an unshared copy, a shared
+sealed corpus refuses a gated sample (exit 2) and is recorded in an
+informational one.
+
 Host checks: after the builds, the harness waits up to --settle-seconds for
 AC power and load1 < 2.5, and checks again before every repetition. The
 bound is R-N81's absolute 2.5; it is not scaled to the rig's core count, so
@@ -190,6 +210,17 @@ across A reps as the ratified order spreads them. Whether such a sample may
 stand as a gate verdict is the operator's decision, not this script's. The
 v4 dedup reference rep still runs.
 
+Lever arms (OI-1003-Q154 review): --b-env KEY=VALUE (repeatable, BULKLOAD_*
+keys only) sets a variable for every B rep and no other, so a lever's knob
+(for example BULKLOAD_LOOPBACK_HANDOFF=0 or BULKLOAD_DEST_GROUP_IDLE_MS=20)
+is measured as its own B arm. It is informational only: --under-load or
+--dry-run, never a gated sample. The report's `b_env`, each rep's `env`, the
+evidence header and the label of every B row in the Repetitions table name
+it. Each lever split is its own --under-load run with its own *underload*
+evidence. A BULKLOAD_* variable in the harness's own environment would reach
+every revision's builds and reps unrecorded, so any is refused, in every
+mode.
+
 Exit: 0 complete (the gate verdict is in the evidence, pass or fail),
 2 refused before the sample, 3 aborted during the sample, 4 build failure.
 """
@@ -230,7 +261,7 @@ DEFAULT_B = "origin/main"
 DEFAULT_V4 = "41bf9a4"
 RULINGS = (
     "OI-1002-Q30, OI-1002-Q28, OI-1002-Q27, OI-1003-Q96, OI-1003-Q97, OI-1003-Q103,"
-    " OI-1003-Q105, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
+    " OI-1003-Q105, OI-1003-Q165, R23, R-N57, R-N81, R-N91, R-N134, R-N13"
 )
 # What the A control is for (OI-1002-Q30, OI-1003-Q103). It never decides.
 A_PURPOSE = (
@@ -244,7 +275,8 @@ PMSET_BATTERY = "Now drawing from 'Battery Power'"
 # An under-load sample is not R-N81 load-gated and not R-N91 quiet-gated
 # (OI-1003-Q39), so it does not cite them as followed.
 RULINGS_UNDER_LOAD = (
-    "OI-1003-Q39, OI-1003-Q50, OI-1002-Q30, OI-1002-Q28, R23, R-N57, R-N134, R-N13"
+    "OI-1003-Q39, OI-1003-Q50, OI-1002-Q30, OI-1002-Q28, OI-1003-Q165, R23, R-N57,"
+    " R-N134, R-N13"
 )
 DEFAULT_PATTERN = "BABAB"
 GATE_B_REPS = DEFAULT_PATTERN.count("B")
@@ -275,6 +307,18 @@ KNOWN_TIMING = {
     "recv_setup_ns",
     "recv_stream_ns",
     "recv_tail_ns",
+    # Inside the stream: the final drain and the first-data ramp
+    # (OI-1003-Q143 step 1a).
+    "recv_drain_ns",
+    "recv_first_data_ns",
+    # The receive workers and the sending thread's wire writes
+    # (OI-1003-Q143 item 3, #217 review): worker-summed verify and writes,
+    # the receiving thread's wait on them, and the sender blocked on the
+    # wire.
+    "recv_worker_verify_ns",
+    "recv_worker_place_ns",
+    "recv_pool_wait_ns",
+    "send_write_ns",
     "publish_groups",
     "sqlite_commits",
     "sqlite_commit_ns",
@@ -997,6 +1041,54 @@ def median(values: list[float]) -> float | None:
     return statistics.median(values) if values else None
 
 
+# The receiving side's timeline (OI-1003-Q119) and, inside its stream, the
+# final drain and the first-data ramp (OI-1003-Q143 step 1a).
+TIMELINE_KEYS = (
+    "recv_setup_ns",
+    "recv_stream_ns",
+    "recv_tail_ns",
+    "recv_drain_ns",
+    "recv_first_data_ns",
+)
+# Setup, stream and tail are disjoint and cover `receive`; drain and
+# first-data lie inside the stream, so they are never added to the cover.
+TIMELINE_COVER = ("recv_setup_ns", "recv_stream_ns", "recv_tail_ns")
+
+
+def receive_timeline(parsed: dict[str, object]) -> dict[str, object]:
+    """Per phase, the native samples' timeline medians in ms, and the median
+    share of each sample's wall time that setup + stream + tail covers.
+    Phases whose rows predate the timeline are left out."""
+    out: dict[str, object] = {}
+    for phase in ("initial", "delta"):
+        rows = [
+            s
+            for s in parsed["samples"]
+            if s.get("arm") == "Native"
+            and s.get("phase") == phase
+            and all(k in s.get("timing", {}) for k in TIMELINE_COVER)
+        ]
+        if not rows:
+            continue
+        entry: dict[str, object] = {
+            k.removesuffix("_ns") + "_ms_median": median(
+                [float(s["timing"].get(k, 0)) / 1e6 for s in rows]
+            )
+            for k in TIMELINE_KEYS
+        }
+        entry["cover_share_of_wall_median"] = median(
+            [
+                sum(float(s["timing"][k]) for k in TIMELINE_COVER)
+                / (float(s["elapsed_ms"]) * 1e6)
+                for s in rows
+                if float(s["elapsed_ms"]) > 0
+            ]
+        )
+        entry["samples"] = len(rows)
+        out[phase] = entry
+    return out
+
+
 def summarize(parsed: dict[str, object]) -> dict[str, object]:
     natives = native_initial(parsed)
     rclones = [
@@ -1057,6 +1149,23 @@ def summarize(parsed: dict[str, object]) -> dict[str, object]:
         "native_initial_wall_ns_total": int(wall_ns),
         "receive_stall_share_of_wall": (stall_ns / wall_ns) if wall_ns else None,
         "files_per_s_median": median(files_per_s),
+        # The loopback hand-off (OI-1003-Q154 levers 1 and 2): the payload
+        # bytes handed in memory, or None from a build that does not count
+        # them (S1 stack review, 2026-10-15, finding 8).
+        "wire_handed_bytes_total": (
+            total("wire_handed_bytes")
+            if any("wire_handed_bytes" in s.get("counters", {}) for s in natives)
+            else None
+        ),
+        # The directory finish folded into the last output group
+        # (OI-1003-Q154 lever 3): directories completed by that group's
+        # commit, 0 with BULKLOAD_DIRECTORY_FOLD=0, or None from a build
+        # that does not count them.
+        "directories_folded_total": (
+            total("directories_folded")
+            if any("directories_folded" in s.get("counters", {}) for s in natives)
+            else None
+        ),
         "bytes_received_median": median(
             [
                 float(s["transferred_content_bytes"])
@@ -1074,6 +1183,7 @@ def summarize(parsed: dict[str, object]) -> dict[str, object]:
             for k in walk_wait_keys
         },
         "new_timing_keys": sorted(timing_keys - KNOWN_TIMING),
+        "receive_timeline": receive_timeline(parsed),
         "all_gated": all(bool(s.get("gated")) for s in parsed["samples"]),
         "all_power_ac": all(s.get("power") == "ac" for s in parsed["samples"]),
         # The bench's own native-vs-rclone medians; under load (gated=false
@@ -1154,6 +1264,27 @@ def post_settle(
     return first, now
 
 
+B_ENV_KEY = re.compile(r"BULKLOAD_[A-Z0-9_]+")
+
+
+def parse_b_env(pairs_given: list[str]) -> tuple[dict[str, str], str | None]:
+    """--b-env KEY=VALUE pairs as a map, or the reason they are refused."""
+    env: dict[str, str] = {}
+    for given in pairs_given:
+        key, sep, value = given.partition("=")
+        if not sep or B_ENV_KEY.fullmatch(key) is None:
+            return {}, f"--b-env {given!r} is not BULKLOAD_<NAME>=<value>"
+        if key in env:
+            return {}, f"--b-env names {key} twice"
+        env[key] = value
+    return env, None
+
+
+def inherited_bulkload_env() -> list[str]:
+    """BULKLOAD_* variables in the harness's own environment."""
+    return sorted(key for key in os.environ if key.startswith("BULKLOAD_"))
+
+
 def run_rep(
     label: str,
     info: dict[str, object],
@@ -1190,9 +1321,13 @@ def run_rep(
         f"power={before['power']} source_residency={source_cache}"
     )
     env = None
+    # A lever arm's knob reaches the B reps and no other (--b-env).
+    extra = dict(getattr(args, "b_env_map", {})) if label == "B" else {}
+    if info.get("preflight") == "pmset-shim" or extra:
+        env = dict(os.environ)
+        env.update(extra)
     if info.get("preflight") == "pmset-shim":
         # A baseline that only knows pmset: see "Baselines on Linux".
-        env = dict(os.environ)
         env["PATH"] = f"{write_pmset_shim(work)}{os.pathsep}{env.get('PATH', '')}"
     started = time.monotonic()
     result = subprocess.run(
@@ -1233,6 +1368,19 @@ def run_rep(
     fixture_cache = (
         residency(Path(info["binary"]), fixture) if fixture.is_dir() else None
     )
+    # OI-1003-Q165 (b): no arm cloned the working copy or the rep's fixture.
+    no_clone: dict[str, object] = {}
+    clone_problems = []
+    for name, tree in (("working_copy", corpus), ("fixture", fixture)):
+        if not tree.is_dir():
+            no_clone[name] = "absent"
+            continue
+        record, problem = r23_corpus.require_unshared(
+            tree, f"the {name.replace('_', ' ')} after rep{index}", required=False
+        )
+        no_clone[name] = record
+        if problem:
+            clone_problems.append(problem)
     summary = summarize(parsed)
     sealed = parsed["header"].get("sealed_corpus_blake3")
     rep = {
@@ -1241,6 +1389,7 @@ def run_rep(
         "sha": info["sha"],
         "native_only": native_only,
         "command": command,
+        "env": extra,
         "preflight": info.get("preflight", "native"),
         "exit": result.returncode,
         "wall_s": round(wall_s, 3),
@@ -1250,6 +1399,7 @@ def run_rep(
         "source_resident_fraction": source_cache,
         "fixture_resident_fraction_after": fixture_cache,
         "sealed_corpus_blake3": sealed,
+        "shared_extents_after": no_clone,
         "summary": summary,
         "parsed": parsed,
     }
@@ -1258,6 +1408,7 @@ def run_rep(
     if sealed is None or sealed != expected:
         problems.append(f"sealed_corpus_blake3 {sealed} != first rep's {expected}")
     problems += power
+    problems += clone_problems
     # OI-1003-Q105: the bench must have run the rclone the report records.
     wanted = state.get("rclone_version")
     ran = parsed["header"].get("rclone_version")
@@ -1540,6 +1691,18 @@ def baseline_lines(report: dict[str, object]) -> list[str]:
     return [f"- A control: {which}. {A_PURPOSE} (OI-1002-Q30)."]
 
 
+def shared_after(report: dict[str, object]) -> str:
+    """Each rep's FIEMAP-shared extents after it, as `rep0 0/0`."""
+    parts = []
+    for rep in report.get("reps", []):
+        counts = rep.get("shared_extents_after") or {}
+        parts.append(
+            f"`rep{rep.get('index')} {counts.get('working_copy', 'n/a')}"
+            f"/{counts.get('fixture', 'n/a')}`"
+        )
+    return ", ".join(parts) or "no rep ran"
+
+
 def evidence(report: dict[str, object]) -> str:
     dry = report["mode"] == "dry-run"
     aborted = report["status"] in ("aborted", "refused")
@@ -1585,6 +1748,28 @@ def evidence(report: dict[str, object]) -> str:
     if dry:
         lines += [
             f"> **{NOT_GATE}.** Synthetic corpus, `--informational`, no host gating.",
+            "",
+        ]
+    if report.get("b_env"):
+        knobs = ", ".join(f"`{key}={value}`" for key, value in report["b_env"].items())
+        lines += [
+            f"> **B ENVIRONMENT: {knobs}.** Every B rep ran with this setting"
+            " (`--b-env`, OI-1003-Q154 review); A and V4 ran without it. This"
+            " sample measures B with that setting, informationally, and is no"
+            " sample of B as built.",
+            "",
+        ]
+    if report.get("loopback_handoff"):
+        states = ", ".join(
+            f"{label} {state}" for label, state in report["loopback_handoff"].items()
+        )
+        lines += [
+            f"> **LOOPBACK HAND-OFF: {states}.** From each rep's"
+            " `wire_handed_bytes`: `on` means the native copy's chunks crossed"
+            " the loopback in memory (OI-1003-Q154 levers 1 and 2), with the"
+            " control frames and chunk headers still on the socket. Gate (a)"
+            ' (R-N57) reads "its full protocol over a local socket"; whether'
+            " that covers the hand-off is not ruled (design.md, Performance).",
             "",
         ]
     if report.get("refused_reps"):
@@ -1646,6 +1831,11 @@ def evidence(report: dict[str, object]) -> str:
         f"- Content identity `{report['content_identity']}`; content_verified before:"
         f" `{report['content_verified_before']}`, after the last rep:"
         f" `{report.get('content_verified_after', 'n/a')}`.",
+        f"- No clone (S2, OI-1003-Q165): working copy by"
+        f" `{report.get('copy_method', 'n/a')}`, FIEMAP-shared extents before the"
+        f" builds `{report.get('working_copy_shared_extents', 'n/a')}`; the sealed"
+        f" corpus's (recorded only) `{report.get('sealed_corpus_shared_extents', 'n/a')}`;"
+        f" after each rep, working copy and fixture: {shared_after(report)}.",
         f"- Bench `sealed_corpus_blake3` (content-and-metadata hash of the working"
         f" copy, stat fields included; must match in every rep):"
         f" `{report.get('sealed_identity', 'n/a')}`.",
@@ -1760,8 +1950,11 @@ def evidence(report: dict[str, object]) -> str:
     ]
     for rep in report["reps"]:
         s = rep["summary"]
+        label = rep["label"]
+        if rep.get("env"):
+            label += f" ({' '.join(f'{k}={v}' for k, v in rep['env'].items())})"
         lines.append(
-            f"| {rep['index']} | {rep['label']} | {rep['conditions_before']['load1']}/"
+            f"| {rep['index']} | {label} | {rep['conditions_before']['load1']}/"
             f"{rep['conditions_after']['load1']}/{rep['conditions_after_settled']['load1']} |"
             f" {rep['conditions_before']['power']} | {fmt(rep['source_resident_fraction'])}/"
             f"{fmt(rep['fixture_resident_fraction_after'])} | {fmt(s['native_initial_median_ms'])} |"
@@ -1822,6 +2015,31 @@ def evidence(report: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def loopback_handoff(reps: list[dict[str, object]]) -> dict[str, str]:
+    """Each label's loopback hand-off state, from its reps' own counters.
+
+    `on`: every rep that reported `wire_handed_bytes` handed some; `off`:
+    none did; `mixed`: both; `not reported`: no rep's build counts it.
+    """
+    states: dict[str, str] = {}
+    for label in sorted({str(r["label"]) for r in reps}):
+        handed = [
+            r["summary"].get("wire_handed_bytes_total")
+            for r in reps
+            if r["label"] == label
+        ]
+        known = [value for value in handed if value is not None]
+        if not known:
+            states[label] = "not reported"
+        elif all(value > 0 for value in known):
+            states[label] = "on"
+        elif all(value == 0 for value in known):
+            states[label] = "off"
+        else:
+            states[label] = "mixed"
+    return states
+
+
 def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
     builds = report["builds"]
     reps = report["reps"]
@@ -1844,6 +2062,7 @@ def finish(report: dict[str, object], work: Path, evidence_path: Path) -> None:
             if got is not None and unique is not None and payload:
                 dedup[f"{label.lower()}_dup_share"] = (got - unique) / payload
     report["dedup"] = dedup
+    report["loopback_handoff"] = loopback_handoff(reps)
     first = next((r for r in reps if r["parsed"].get("header")), None)
     if first:
         header = first["parsed"]["header"]
@@ -1876,15 +2095,12 @@ def working_copy(sealed: Path, work: Path) -> Path:
     The bench copies its source into a private fixture with modes preserved
     and then mutates that fixture for the 1 % delta, so it cannot read a
     0444/0555 sealed tree directly. The copy keeps mtimes and gets 0644/0755.
+    It is made by read and write (OI-1003-Q165), and checked unshared by
+    the caller.
     """
     corpus = work / "corpus"
-    shutil.copytree(sealed, corpus, symlinks=True)
-    for dirpath, dirs, names in os.walk(corpus):
-        for name in dirs:
-            (Path(dirpath) / name).chmod(0o755)
-        for name in names:
-            (Path(dirpath) / name).chmod(0o644)
-    corpus.chmod(0o755)
+    # OI-1003-Q165 (b): a read and a write, never a clone. Not shutil.
+    r23_corpus.plain_copy_tree(sealed, corpus, file_mode=0o644, dir_mode=0o755)
     return corpus
 
 
@@ -1959,6 +2175,15 @@ def main(argv: list[str] | None = None) -> int:
         help=f"{UNDER_LOAD}: sealed corpus, bench --informational, load recorded"
         " but not gated, AC power still required (OI-1003-Q39, OI-1003-Q50)",
     )
+    parser.add_argument(
+        "--b-env",
+        action="append",
+        default=[],
+        metavar="BULKLOAD_NAME=VALUE",
+        help="set this variable for every B rep and no other: a lever's own"
+        " informational arm (--under-load or --dry-run only), recorded in the"
+        " report and the evidence (OI-1003-Q154 review)",
+    )
     if (sys.argv[1:] if argv is None else argv)[:1] == ["--pmset-shim"]:
         return pmset_shim_main()
     args = parser.parse_args(argv)
@@ -1977,6 +2202,25 @@ def main(argv: list[str] | None = None) -> int:
     if args.dry_run and args.under_load:
         say("refused: --dry-run and --under-load are exclusive")
         return 2
+    inherited = inherited_bulkload_env()
+    if inherited:
+        say(
+            f"refused: {', '.join(inherited)} set in the harness's environment would"
+            " reach every revision's builds and reps unrecorded; unset it, and pass a"
+            " lever's knob to B with --b-env (OI-1003-Q154 review)"
+        )
+        return 2
+    b_env, b_env_problem = parse_b_env(args.b_env)
+    if b_env_problem:
+        say(f"refused: {b_env_problem}")
+        return 2
+    if b_env and (args.build_only or not (args.dry_run or args.under_load)):
+        say(
+            "refused: --b-env is a lever's informational arm: --under-load or"
+            " --dry-run only, never a gated sample or --build-only"
+        )
+        return 2
+    args.b_env_map = b_env
     no_a = args.b_only_no_a_control
     if no_a:
         if args.dry_run or args.under_load:
@@ -2140,12 +2384,30 @@ def main(argv: list[str] | None = None) -> int:
         corpus = work / "corpus"
         synthetic_corpus(corpus)
         verified_before: object = "n/a (synthetic dry-run corpus)"
+        sealed_shared = "n/a (synthetic)"
     else:
         corpus = working_copy(sealed, work)
         if corpus_verify(corpus) != 0:
             say("refused: the working copy does not verify")
             return 2
         verified_before = True
+        sealed_shared, sealed_problem = r23_corpus.require_unshared(
+            sealed, "the sealed corpus", required=False
+        )
+        # OI-1003-Q166 re-sealed the rig's corpus unshared: a shared sealed
+        # corpus was cloned, and refuses a gated sample.
+        if sealed_problem and mode == "gated":
+            say(f"refused: {sealed_problem} (OI-1003-Q166)")
+            return 2
+    # OI-1003-Q165 (b): before any build or rep, the copy the bench reads
+    # shares no extent; a gated sample needs FIEMAP to say so.
+    copy_shared, problem = r23_corpus.require_unshared(
+        corpus, "the working copy", required=mode == "gated"
+    )
+    say(f"no-clone working_copy_shared_extents={copy_shared} sealed={sealed_shared}")
+    if problem:
+        say(f"refused: {problem}")
+        return 2
     files, size = corpus_shape(corpus)
     build_root = (
         Path(args.build_root) if args.build_root else repo / "target" / "r23-ab"
@@ -2181,6 +2443,7 @@ def main(argv: list[str] | None = None) -> int:
         "date": date,
         "stamp": stamp,
         "mode": mode,
+        "b_env": b_env,
         "host": platform.node(),
         "platform": platform.platform(),
         "host_identity": identity,
@@ -2200,6 +2463,9 @@ def main(argv: list[str] | None = None) -> int:
         "corpus_bytes": size,
         "content_identity": CONTENT_IDENTITY if not args.dry_run else "n/a (synthetic)",
         "content_verified_before": verified_before,
+        "copy_method": "read-write (os.read/os.write; OI-1003-Q165)",
+        "working_copy_shared_extents": copy_shared,
+        "sealed_corpus_shared_extents": sealed_shared,
         "work_root": str(work),
         "rclone": str(rclone),
         "rclone_version": rclone_record["version"],

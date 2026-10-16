@@ -940,6 +940,89 @@ class HelperTests(unittest.TestCase):
                 for dirpath, _dirs, _files in os.walk(sealed):
                     Path(dirpath).chmod(0o755)
 
+    @unittest.skipIf(os.geteuid() == 0, "root reads a mode-000 directory")
+    def test_the_helper_walks_fail_on_an_unreadable_directory(self) -> None:
+        """Review, 2026-10-15: os.walk skips an unreadable directory unless told."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "t"
+            (root / "hidden").mkdir(parents=True)
+            (root / "hidden" / "x").write_bytes(b"x")
+            (root / "hidden").chmod(0)
+            try:
+                with mock.patch.dict(gb.HELPER, {"shared_extents": lambda _p: 1}):
+                    with self.assertRaises(PermissionError):
+                        gb.HELPER["tree_shared"](str(root))
+                with self.assertRaises(PermissionError):
+                    gb.HELPER["plain_copy"](str(root), str(Path(tmp) / "copy"))
+            finally:
+                (root / "hidden").chmod(0o755)
+
+    def test_helper_fiemap_is_trusted_only_where_sharing_is_reported(self) -> None:
+        """Review, 2026-10-15: CIFS answers FIEMAP but never flags sharing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "f"
+            path.write_bytes(b"f" * 4096)
+            with mock.patch.dict(gb.HELPER, {"fs_magic": lambda _fd: 0xFF534D42}):
+                self.assertIsNone(gb.HELPER["shared_extents"](str(path)))
+                if sys.platform.startswith("linux"):
+                    self.assertEqual(gb.HELPER["tree_shared"](tmp), "unsupported")
+            if not sys.platform.startswith("linux"):
+                return
+            with mock.patch.dict(gb.HELPER, {"fs_magic": lambda _fd: 0x01021994}):
+                self.assertEqual(gb.HELPER["shared_extents"](str(path)), 0)
+
+    def test_prepare_copies_by_read_and_write_and_refuses_a_shared_copy(self) -> None:
+        """OI-1003-Q165 (b): no shutil, and a shared extent refuses."""
+
+        class NoShutil:
+            def __getattr__(self, name: str) -> object:
+                raise AssertionError(f"shutil.{name} used (OI-1003-Q165)")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sealed = Path(tmp) / "sealed"
+            self.tree(sealed / "corpus")
+            agent = executable(Path(tmp) / "agent", "#!/bin/sh\nexit 0\n")
+            args = {
+                "corpus": str(sealed),
+                "python": sys.executable,
+                "agent": str(agent),
+                "flags": [],
+            }
+            with mock.patch.dict(gb.HELPER, {"shutil": NoShutil()}):
+                out = gb.HELPER["op_prepare"]({**args, "work": str(Path(tmp) / "w1")})
+            copy = Path(out["corpus"])
+            self.assertEqual((copy / "d" / "a.txt").read_bytes(), b"x" * 5000)
+            self.assertEqual(os.readlink(copy / "d" / "link"), "a.txt")
+            self.assertTrue((copy / "empty").is_dir())
+            self.assertIn(out["shared_extents"], (0, "unsupported", "n/a"))
+            with mock.patch.dict(gb.HELPER, {"tree_shared": lambda _root: 2}):
+                with self.assertRaisesRegex(RuntimeError, "shares 2 extent"):
+                    gb.HELPER["op_prepare"]({**args, "work": str(Path(tmp) / "w2")})
+            # Real FIEMAP where the directory can clone: a reflinked sealed
+            # file is shared, its read-and-write copy is not.
+            twin = Path(tmp) / "twin"
+            try:
+                with (
+                    open(sealed / "corpus" / "d" / "a.txt", "rb") as inp,
+                    open(twin, "xb") as dst,
+                ):
+                    import fcntl
+
+                    fcntl.ioctl(dst.fileno(), 0x40049409, inp.fileno())
+            except OSError as error:
+                if os.environ.get("BULKLOAD_P84_REQUIRE_REFLINK"):
+                    self.fail(f"required by BULKLOAD_P84_REQUIRE_REFLINK: {error}")
+                print(
+                    f"gate-b no-clone: reflinked half not run ({error})",
+                    file=sys.stderr,
+                )
+                return
+            self.assertEqual(
+                gb.HELPER["shared_extents"](str(sealed / "corpus" / "d" / "a.txt")), 1
+            )
+            out = gb.HELPER["op_prepare"]({**args, "work": str(Path(tmp) / "w3")})
+            self.assertEqual(out["shared_extents"], 0)
+
     def test_transport_helper_through_a_loopback_shim(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             shim = executable(

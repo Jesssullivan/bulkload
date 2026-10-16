@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use bulkload_agent::counters::{Counter, Counters};
 use bulkload_agent::durable::{set_durability, Durability};
-use bulkload_agent::transfer::{copy, settle_racy_window, TransferStats};
+use bulkload_agent::transfer::{copy, settle_racy_window, TransferStats, LOOPBACK_HANDOFF_ENV};
 
 struct Scratch(PathBuf);
 
@@ -94,16 +94,19 @@ fn w3_engine_properties() {
         "destination hashed {} of {payload}",
         counted.blake3_destination()
     );
-    assert_eq!(
-        counted.get(Counter::HashWireVerify),
-        first.bytes_received,
-        "every received byte is verified exactly once"
-    );
+    // Every received byte is verified exactly once (OI-1003-Q154 lever 1).
+    verified_once(&counted, first.bytes_received);
     assert_eq!(counted.get(Counter::DestVerifyRead), 0);
     assert_eq!(counted.get(Counter::HashVerifyExisting), 0);
     assert_eq!(counted.get(Counter::SourcePackReadback), 0);
     assert_eq!(counted.get(Counter::FilesMaterialized), 4);
-    assert!(counted.get(Counter::FlushBarrier) >= 4);
+    // Each file sealed: a barrier each, or a batched Linux group's two
+    // device seals, one before its renames and one after (S1, Q107).
+    assert!(
+        counted.get(Counter::FlushBarrier) >= 4 || counted.get(Counter::FlushFs) >= 2,
+        "{}",
+        counted.render()
+    );
     assert_eq!(counted.get(Counter::FlushFull), 0);
     // One commit per group, plus, per freshly created store, its schema
     // commit and the full flush that seals its state root (#161).
@@ -136,14 +139,15 @@ fn w3_engine_properties() {
     assert_eq!((adopted.source_bytes_read, adopted.bytes_received), (0, 0));
     assert_eq!(counted.get(Counter::DestVerifyRead), payload);
     assert_eq!(counted.get(Counter::FilesMaterialized), 0);
-    // Adopted outputs are sealed, and their directory too, before the record.
+    // Adopted outputs are sealed, and their directory too, before the record:
+    // file by file, or by a batched group's two device seals.
     assert!(
-        counted.get(Counter::FlushBarrier) >= 4,
+        counted.get(Counter::FlushBarrier) >= 4 || counted.get(Counter::FlushFs) >= 2,
         "{}",
         counted.render()
     );
     assert!(
-        counted.get(Counter::FlushDirBarrier) >= 1,
+        counted.get(Counter::FlushDirBarrier) >= 1 || counted.get(Counter::FlushFs) >= 2,
         "{}",
         counted.render()
     );
@@ -156,6 +160,7 @@ fn w3_engine_properties() {
     assert_eq!(strict.completed, 4);
     assert!(counted.get(Counter::FlushFull) >= 4);
     assert_eq!(counted.get(Counter::FlushBarrier), 0);
+    assert_eq!(counted.get(Counter::FlushFs), 0, "strict never batches");
 
     // A new file sharing a prefix with published outputs is built from their
     // chunks, re-read and re-verified through committed hints; only its new
@@ -170,4 +175,34 @@ fn w3_engine_properties() {
     assert_eq!(grown.source_bytes_read, extended.len() as u64);
     assert!(grown.bytes_received < extended.len() as u64);
     assert!(counted.get(Counter::DestLocalReuseRead) > 0);
+    // The requested tail, verified exactly once in either arm.
+    verified_once(&counted, grown.bytes_received);
+}
+
+/// Every received byte is verified exactly once.
+///
+/// A local copy's chunks are handed over in process, and the source's own hash of those very bytes is
+/// their verify (OI-1003-Q154 lever 1); bytes that cross a transport are
+/// hashed by the destination (`tests/loopback_handoff.rs`). The gates run this
+/// binary in both arms: with the hand-off (the default) and with it off
+/// (`BULKLOAD_LOOPBACK_HANDOFF=0`, the transport path every `pull` takes,
+/// `just handoff-off`), where the destination hashes every byte.
+fn verified_once(counted: &Counters, received: u64) {
+    let (verified, handed) = (
+        counted.get(Counter::HashWireVerify),
+        counted.get(Counter::WireHandedBytes),
+    );
+    assert_eq!(verified + handed, received, "{}", counted.render());
+    if handoff_off() {
+        assert_eq!(handed, 0, "the plain arm hands nothing over");
+        assert_eq!(verified, received, "the plain arm verifies every byte");
+    } else {
+        assert_eq!(verified, 0, "verify once: {}", counted.render());
+    }
+}
+
+/// The arm this run is in: the hand-off off (`BULKLOAD_LOOPBACK_HANDOFF=0`)
+/// or on (the default).
+fn handoff_off() -> bool {
+    std::env::var(LOOPBACK_HANDOFF_ENV).is_ok_and(|value| value == "0")
 }

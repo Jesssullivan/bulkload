@@ -48,6 +48,21 @@ std::thread_local! {
 }
 
 #[cfg(test)]
+std::thread_local! {
+    static FAIL_DIRECTORY_RECORDS_AFTER_COMMIT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+/// Test hook: while `on`, this thread's [`Store::record_directories_created`]
+/// commits its records and then reports `EIO`, as a COMMIT whose log fsync
+/// failed after its frames reached the disk would.
+#[cfg(test)]
+pub(crate) fn fail_directory_records_after_commit(on: bool) {
+    FAIL_DIRECTORY_RECORDS_AFTER_COMMIT.with(|flag| flag.set(on));
+}
+
+#[cfg(test)]
 fn inject_fault(point: PublishFault) -> Result<()> {
     if PUBLISH_FAULT.with(std::cell::Cell::get) == point {
         return Err(BulkloadRefusal::Io(None));
@@ -108,6 +123,20 @@ pub(crate) fn fail_group_commits(root: &Path, on: bool) {
     }
 }
 
+/// Destination store roots whose next output group commit alone fails.
+#[cfg(test)]
+static FAIL_NEXT_GROUP_COMMIT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Test hook: the next `commit_outputs` of the store at `root` (canonical)
+/// fails with `ENOSPC` before `COMMIT`, and rolls back; later ones commit.
+#[cfg(test)]
+pub(crate) fn fail_next_group_commit(root: &Path) {
+    FAIL_NEXT_GROUP_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(root.to_path_buf());
+}
+
 #[cfg(test)]
 fn group_commit_fault(root: &Path) -> Result<()> {
     let failing = FAIL_GROUP_COMMITS
@@ -115,7 +144,16 @@ fn group_commit_fault(root: &Path) -> Result<()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .any(|failing| failing == root);
-    if failing {
+    let next = {
+        let mut next = FAIL_NEXT_GROUP_COMMIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = next.iter().position(|failing| failing == root);
+        let taken = found.map(|at| next.remove(at)).is_some();
+        drop(next);
+        taken
+    };
+    if failing || next {
         return Err(BulkloadRefusal::Io(Some(libc::ENOSPC)));
     }
     output_commit_fault(root)
@@ -607,6 +645,66 @@ const RACY_GUARD_SETTING: &str = "racy_guard";
 /// without it, then adds it.
 const ROOT_SEALED_SETTING: &str = "root_sealed";
 
+/// The A/B knob of OI-1003-Q154 lever 3a.
+///
+/// `0` makes a new store as before the lever, an empty file `SQLite`
+/// switches to WAL with a rollback-journal commit of its own. Unset or any
+/// other value writes the WAL template
+/// ([`crate::io::durable::init_wal_database`]).
+pub const STORE_WAL_TEMPLATE_ENV: &str = "BULKLOAD_STORE_WAL_TEMPLATE";
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: this thread's new stores skip the template, as
+    /// [`STORE_WAL_TEMPLATE_ENV`] `=0` would.
+    static WAL_TEMPLATE_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Templates this thread's `Store::open` calls wrote.
+    static WAL_TEMPLATES_WRITTEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a new store is created from the WAL template (lever 3a): on,
+/// unless [`STORE_WAL_TEMPLATE_ENV`] is `0` (or a test turned it off for
+/// its thread). Either way is safe: off only adds `SQLite`'s own switch.
+fn wal_template() -> bool {
+    #[cfg(test)]
+    if WAL_TEMPLATE_OFF.with(std::cell::Cell::get) {
+        return false;
+    }
+    std::env::var(STORE_WAL_TEMPLATE_ENV).map_or(true, |value| value != "0")
+}
+
+/// Make whole a store file that a crash left inside
+/// [`crate::io::durable::init_wal_database`] (OI-1003-Q154 lever 3): at
+/// most one page, with no `-wal` beside it, of zeros and template bytes
+/// only. Such a file holds no store (its first commit would have made the
+/// WAL), and `SQLite` would refuse a torn header for good; it is written
+/// again. A file with a `-wal` (a store, maybe open in this process: its
+/// connections keep the WAL while they live, and a closed descriptor would
+/// drop their locks), a longer file, or any other content is left to
+/// `SQLite`, as before.
+fn finish_wal_init(state: &fs::File, root: &Path, size: u64) -> Result<()> {
+    let small =
+        usize::try_from(size).is_ok_and(|size| size <= crate::io::durable::WAL_TEMPLATE_BYTES);
+    if !small || crate::io::sys::fstatat_nofollow(state, c"transfer.sqlite-wal").is_ok() {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(root.join("transfer.sqlite"))
+        .refuse_at("transfer_store::finish_wal_init")?;
+    let mut found = Vec::new();
+    file.read_to_end(&mut found)
+        .refuse_at("transfer_store::finish_wal_init")?;
+    if found.as_slice() == crate::io::durable::wal_database_template()
+        || !crate::io::durable::interrupted_wal_init(&found)
+    {
+        return Ok(());
+    }
+    crate::io::durable::init_wal_database(&file).refuse_at("transfer_store::finish_wal_init")
+}
+
 /// A private, source-bound transfer state directory.
 pub struct Store {
     root: PathBuf,
@@ -645,19 +743,32 @@ impl Store {
     /// A root that still needs its seal under a parent the agent may search
     /// but not read refuses with `IO` (`EACCES`): its entry cannot be made
     /// durable, so no record may commit in it.
+    #[allow(clippy::too_many_lines)] // Create, configure, seal, the creation commit.
     pub fn open(root: &Path) -> Result<Self> {
         let mut state = StateRoot::open(root)?;
         let name = c"transfer.sqlite";
         // Created through `io::sys`, so the R-N88 trace sees the entry the
         // root seal below makes durable.
         match crate::io::sys::create_excl_at(state.root.as_fd(), name, 0o600) {
-            Ok(_) => {}
+            // Created directly in WAL mode (OI-1003-Q154 lever 3): no
+            // rollback-journal commit switches it, so no `-journal` sync.
+            // With the knob off, `SQLite` switches the empty file, as before.
+            Ok(created) => {
+                if wal_template() {
+                    crate::io::durable::init_wal_database(&fs::File::from(created))
+                        .refuse_at("transfer_store::open")?;
+                    counters::bump(Counter::StoreWalTemplates);
+                    #[cfg(test)]
+                    WAL_TEMPLATES_WRITTEN.with(|written| written.set(written.get() + 1));
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 let found = crate::io::sys::fstatat_nofollow(&state.root, name)
                     .refuse_at("transfer_store::open")?;
                 if !found.is_file() || found.mode & 0o077 != 0 {
                     return Err(BulkloadRefusal::PathEscapesRoot);
                 }
+                finish_wal_init(&state.root, root, found.size)?;
             }
             Err(error) => return Err(crate::refuse::io(&error, "transfer_store::open")),
         }
@@ -1235,32 +1346,83 @@ impl Store {
         ino: u64,
         mode: u32,
     ) -> Result<()> {
-        let identity = postcard::to_stdvec(&PendingDirectory { dev, ino, mode })
-            .refuse_at("transfer_store::record_directory_created")?;
+        self.record_directories_created(&[(key, PendingDirectory { dev, ino, mode })])
+    }
+
+    /// Bind pending directories, each to the inode this state created for
+    /// it, in one transaction (OI-1003-Q143 item 2: one commit per level of
+    /// a batch of new directories). Traced as one commit of every record.
+    ///
+    /// # Errors
+    /// Refuses persistence failures; none is bound then.
+    pub fn record_directories_created(&self, records: &[(&[u8], PendingDirectory)]) -> Result<()> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let encoded = records
+            .iter()
+            .map(|(key, record)| {
+                postcard::to_stdvec(record)
+                    .refuse_at("transfer_store::record_directories_created")
+                    .map(|identity| (*key, identity))
+            })
+            .collect::<Result<Vec<_>>>()?;
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
-        let recorded = self
-            .conn
-            .execute(
-                "INSERT INTO directories VALUES (?1, ?2)
+        let recorded = self.in_transaction(|conn| {
+            for (key, identity) in &encoded {
+                conn.execute(
+                    "INSERT INTO directories VALUES (?1, ?2)
             ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                (key, identity),
-            )
-            .map_err(sqlite_error);
+                    (key, identity),
+                )
+                .map_err(sqlite_error)?;
+            }
+            Ok(())
+        });
         counters::sqlite_commit(Counter::SqliteDirectoryPending, started, &recorded);
         recorded?;
         #[cfg(feature = "io-trace")]
         self.trace_commit(|| {
-            vec![crate::io::trace::CommitRecord::DirectoryCreated {
-                key: key.to_vec(),
-                node: (dev, ino)
-                    .ne(&(0, 0))
-                    .then_some(crate::io::NodeId { dev, ino }),
-                mode,
-            }]
+            records
+                .iter()
+                .map(
+                    |(key, record)| crate::io::trace::CommitRecord::DirectoryCreated {
+                        key: key.to_vec(),
+                        node: (record.dev, record.ino)
+                            .ne(&(0, 0))
+                            .then_some(crate::io::NodeId {
+                                dev: record.dev,
+                                ino: record.ino,
+                            }),
+                        mode: record.mode,
+                    },
+                )
+                .collect()
         });
+        // A COMMIT that reports a failure although its frames reached the
+        // log (the WAL's fsync returns EIO; the frames recover on the next
+        // open): the caller must treat every record as possibly bound.
+        #[cfg(test)]
+        if FAIL_DIRECTORY_RECORDS_AFTER_COMMIT.with(std::cell::Cell::get) {
+            return Err(BulkloadRefusal::Io(Some(libc::EIO)));
+        }
         Ok(())
+    }
+
+    /// Run `body` in one `BEGIN IMMEDIATE` transaction, committed if it
+    /// succeeds and rolled back otherwise.
+    fn in_transaction(&self, body: impl FnOnce(&rusqlite::Connection) -> Result<()>) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(sqlite_error)?;
+        let done =
+            body(&self.conn).and_then(|()| self.conn.execute_batch("COMMIT").map_err(sqlite_error));
+        if done.is_err() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        done
     }
 
     /// The unfinished-directory record for `key`, if any.
@@ -1285,6 +1447,14 @@ impl Store {
                 _ => Err(BulkloadRefusal::SchemaMismatch),
             })
             .transpose()
+    }
+
+    /// How many directory records (pending or intents) the store holds.
+    #[cfg(test)]
+    pub(crate) fn directory_records(&self) -> Result<u64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM directories", [], |row| row.get(0))
+            .map_err(sqlite_error)
     }
 
     /// Clear every pending record bound to `(dev, ino)`, once that inode is
@@ -1314,10 +1484,8 @@ impl Store {
             }
             bound
         };
-        for key in bound {
-            self.complete_directory(&key)?;
-        }
-        Ok(())
+        let keys: Vec<&[u8]> = bound.iter().map(Vec::as_slice).collect();
+        self.clear_directories(&keys)
     }
 
     /// Retire pending ownership after directory metadata is durable.
@@ -1325,19 +1493,68 @@ impl Store {
     /// # Errors
     /// Refuses persistence failures.
     pub fn complete_directory(&self, key: &[u8]) -> Result<()> {
+        self.complete_directories(&[key])
+    }
+
+    /// Retire the pending ownership of several directories whose final
+    /// modes are all durable, in one transaction (OI-1003-Q143 item 2).
+    /// Traced as one commit of a `DirectoryComplete` per key.
+    ///
+    /// # Errors
+    /// Refuses persistence failures; none is retired then.
+    pub fn complete_directories(&self, keys: &[&[u8]]) -> Result<()> {
+        self.delete_directories(keys, Counter::SqliteDirectoryComplete, true)
+    }
+
+    /// Clear directory records that complete nothing: a creation undone
+    /// before its directory was published, a record bound to a temporary
+    /// the sweep removes, a stale record. Clearing never vouches for a
+    /// directory, so it is traced apart from a completion (#217 review).
+    ///
+    /// # Errors
+    /// Refuses persistence failures.
+    pub fn clear_directory(&self, key: &[u8]) -> Result<()> {
+        self.clear_directories(&[key])
+    }
+
+    /// [`Store::clear_directory`] for several keys, in one transaction.
+    ///
+    /// # Errors
+    /// Refuses persistence failures; none is cleared then.
+    pub fn clear_directories(&self, keys: &[&[u8]]) -> Result<()> {
+        self.delete_directories(keys, Counter::SqliteDirectoryCleared, false)
+    }
+
+    fn delete_directories(&self, keys: &[&[u8]], counter: Counter, complete: bool) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
         #[cfg(feature = "io-trace")]
         let _serial = crate::io::trace::serialize();
         let started = Instant::now();
-        let completed = self
-            .conn
-            .execute("DELETE FROM directories WHERE key = ?1", [key])
-            .map_err(sqlite_error);
-        counters::sqlite_commit(Counter::SqliteDirectoryComplete, started, &completed);
-        completed?;
+        let deleted = self.in_transaction(|conn| {
+            for key in keys {
+                conn.execute("DELETE FROM directories WHERE key = ?1", [key])
+                    .map_err(sqlite_error)?;
+            }
+            Ok(())
+        });
+        counters::sqlite_commit(counter, started, &deleted);
+        deleted?;
         #[cfg(feature = "io-trace")]
         self.trace_commit(|| {
-            vec![crate::io::trace::CommitRecord::DirectoryComplete { key: key.to_vec() }]
+            keys.iter()
+                .map(|key| {
+                    if complete {
+                        crate::io::trace::CommitRecord::DirectoryComplete { key: key.to_vec() }
+                    } else {
+                        crate::io::trace::CommitRecord::DirectoryCleared { key: key.to_vec() }
+                    }
+                })
+                .collect()
         });
+        #[cfg(not(feature = "io-trace"))]
+        let _ = complete;
         Ok(())
     }
 }
@@ -1410,10 +1627,32 @@ impl StorePublisher {
     ///
     /// # Errors
     /// Refuses serialization or database failures; nothing is committed then.
+    #[cfg(test)]
     pub(crate) fn commit_outputs(
         &self,
         outputs: &[OutputRecord],
         settled: &[SupersedeSettle<'_>],
+    ) -> Result<()> {
+        self.commit_outputs_finishing(outputs, settled, &[])
+    }
+
+    /// [`StorePublisher::commit_outputs`] that also completes the
+    /// directories `completed` names, in the same transaction: the
+    /// session's last group carrying the directory finish (OI-1003-Q154
+    /// lever 3, `DirectoryRecords.tla` `GroupFinish`). Each key's pending
+    /// record is deleted as [`Store::complete_directories`] deletes it, and
+    /// traced as a `DirectoryComplete` in the group's one commit. The caller
+    /// set each directory's final mode before the group's renames and
+    /// sealed it with the group's seal, so every completion follows its
+    /// seal, as a completion of its own does.
+    ///
+    /// # Errors
+    /// As [`StorePublisher::commit_outputs`]; no directory completes then.
+    pub(crate) fn commit_outputs_finishing(
+        &self,
+        outputs: &[OutputRecord],
+        settled: &[SupersedeSettle<'_>],
+        completed: &[&[u8]],
     ) -> Result<()> {
         // The trace's serial lock is taken before SQLite's write lock, the
         // order every traced store write uses (#74 review, D5).
@@ -1448,6 +1687,12 @@ impl StorePublisher {
             }
             for settle in settled {
                 settle_in(&self.store.conn, settle)?;
+            }
+            for key in completed {
+                self.store
+                    .conn
+                    .execute("DELETE FROM directories WHERE key = ?1", [key])
+                    .map_err(sqlite_error)?;
             }
             Ok(())
         })();
@@ -1488,6 +1733,9 @@ impl StorePublisher {
                             rel_path: settle.intent.rel_path(),
                             restored: settle.restore,
                         }
+                    }))
+                    .chain(completed.iter().map(|key| {
+                        crate::io::trace::CommitRecord::DirectoryComplete { key: key.to_vec() }
                     }))
                     .collect()
             });
@@ -1781,6 +2029,7 @@ impl crate::io::durable::GroupSink for LedgerSink {
     const SIDE: crate::io::durable::GroupSide = crate::io::durable::GroupSide::Source;
     type Item = LedgerItem;
     type Report = Result<()>;
+    type Last = ();
 
     fn weight(_: &LedgerItem) -> (u64, u64) {
         (1, 0)
@@ -2827,6 +3076,163 @@ mod tests {
         drop(store);
         let store = Store::open(&state)?;
         assert!(has_setting(&store.conn, ROOT_SEALED_SETTING).map_err(sqlite_error)?);
+        Ok(())
+    }
+
+    /// OI-1003-Q154 lever 3: a new store is created directly in WAL mode.
+    /// `SQLite` never writes its main file before a checkpoint (the template
+    /// is there unchanged: no rollback-journal commit switched it, which
+    /// would have moved its change counter) and no `-journal` remains; the
+    /// store's creation commit is in its WAL, and it reopens with its
+    /// authority.
+    #[test]
+    fn a_new_store_is_created_directly_in_wal_mode() -> Result<()> {
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        let store = Store::open(&state)?;
+        let authority = store.authority()?;
+        let database = state.join("transfer.sqlite");
+        let main = fs::read(&database).refuse_at("transfer_store::tests")?;
+        assert_eq!(
+            main.as_slice(),
+            crate::io::durable::wal_database_template().as_slice()
+        );
+        assert!(!state.join("transfer.sqlite-journal").exists());
+        let mode: String = store
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .map_err(sqlite_error)?;
+        assert_eq!(mode, "wal");
+        drop(store);
+        assert_eq!(Store::open(&state)?.authority()?, authority);
+        Ok(())
+    }
+
+    /// OI-1003-Q154 lever 3: a store file a crash left inside its template's
+    /// write (empty, short, or torn: zeros where the page did not land) is
+    /// made whole by the next open, which then creates the store; a file
+    /// with any other content is left to `SQLite`, which refuses it as
+    /// before. A store with a WAL is never touched
+    /// (`a_store_file_beside_a_wal_is_never_rewritten`).
+    #[test]
+    fn a_store_file_left_inside_its_template_write_is_made_whole() -> Result<()> {
+        let template = crate::io::durable::wal_database_template();
+        let mut torn = template;
+        torn[..512].fill(0);
+        for (case, bytes) in [
+            ("empty", Vec::new()),
+            ("short", template[..1000].to_vec()),
+            ("zeros", vec![0; template.len()]),
+            ("torn", torn.to_vec()),
+        ] {
+            let root = TestRoot::new()?;
+            let state = root.0.join("state");
+            drop(Store::open(&state)?);
+            for name in [
+                "transfer.sqlite",
+                "transfer.sqlite-wal",
+                "transfer.sqlite-shm",
+            ] {
+                let _ = fs::remove_file(state.join(name));
+            }
+            fs::write(state.join("transfer.sqlite"), &bytes).refuse_at("transfer_store::tests")?;
+            fs::set_permissions(
+                state.join("transfer.sqlite"),
+                fs::Permissions::from_mode(0o600),
+            )
+            .refuse_at("transfer_store::tests")?;
+            let store = Store::open(&state).map_err(|refusal| {
+                eprintln!("{case}: {refusal:?}");
+                refusal
+            })?;
+            assert!(store.authority().is_ok(), "{case}");
+        }
+
+        // Not ours: a byte the template never has. SQLite refuses it.
+        let root = TestRoot::new()?;
+        let state = root.0.join("state");
+        drop(Store::open(&state)?);
+        for name in ["transfer.sqlite-wal", "transfer.sqlite-shm"] {
+            let _ = fs::remove_file(state.join(name));
+        }
+        let mut foreign = template;
+        foreign[0] = b'X';
+        fs::write(state.join("transfer.sqlite"), foreign).refuse_at("transfer_store::tests")?;
+        assert!(Store::open(&state).is_err());
+        assert_eq!(
+            fs::read(state.join("transfer.sqlite")).refuse_at("transfer_store::tests")?,
+            foreign,
+            "a file that is not the template's is never rewritten"
+        );
+        Ok(())
+    }
+
+    /// OI-1003-Q154 lever 3 (review): a short or torn main file beside a
+    /// live `-wal` is a store, maybe open in this process, never an
+    /// interrupted template write. `Store::open` leaves the main file's
+    /// bytes as they are, whatever `SQLite` then makes of it.
+    #[test]
+    fn a_store_file_beside_a_wal_is_never_rewritten() -> Result<()> {
+        let template = crate::io::durable::wal_database_template();
+        let mut torn = template;
+        torn[..512].fill(0);
+        // Not empty: `SQLite` itself discards the WAL of an empty file and
+        // makes a new database in it.
+        for (case, bytes) in [
+            ("short", template[..1000].to_vec()),
+            ("zeros", vec![0; template.len()]),
+            ("torn", torn.to_vec()),
+        ] {
+            let root = TestRoot::new()?;
+            let state = root.0.join("state");
+            drop(Store::open(&state)?);
+            let wal = fs::metadata(state.join("transfer.sqlite-wal"))
+                .refuse_at("transfer_store::tests")?;
+            assert!(wal.len() > 0, "{case}: the creation commit is in the WAL");
+            fs::write(state.join("transfer.sqlite"), &bytes).refuse_at("transfer_store::tests")?;
+            drop(Store::open(&state));
+            let found =
+                fs::read(state.join("transfer.sqlite")).refuse_at("transfer_store::tests")?;
+            assert!(
+                found == bytes,
+                "{case}: a store file beside a WAL is never rewritten"
+            );
+        }
+        Ok(())
+    }
+
+    /// Lever 3a's A/B knob (OI-1003-Q154 review): with the template off a
+    /// new store is made as before the lever, by `SQLite`'s own switch to
+    /// WAL, which writes the same page 1; with it on (the default) the
+    /// template is written. Either store takes its creation commit and
+    /// reopens with its authority.
+    #[test]
+    fn the_wal_template_knob_turns_lever_3a_off() -> Result<()> {
+        for off in [true, false] {
+            let root = TestRoot::new()?;
+            let state = root.0.join("state");
+            WAL_TEMPLATE_OFF.with(|flag| flag.set(off));
+            let before = WAL_TEMPLATES_WRITTEN.with(std::cell::Cell::get);
+            let store = Store::open(&state);
+            let written = WAL_TEMPLATES_WRITTEN.with(std::cell::Cell::get) - before;
+            WAL_TEMPLATE_OFF.with(|flag| flag.set(false));
+            let store = store?;
+            assert_eq!(written, u64::from(!off), "template off {off}");
+            let mode: String = store
+                .conn
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .map_err(sqlite_error)?;
+            assert_eq!(mode, "wal", "template off {off}");
+            let main =
+                fs::read(state.join("transfer.sqlite")).refuse_at("transfer_store::tests")?;
+            assert!(
+                main.as_slice() == crate::io::durable::wal_database_template().as_slice(),
+                "template off {off}: the same page 1 either way"
+            );
+            let authority = store.authority()?;
+            drop(store);
+            assert_eq!(Store::open(&state)?.authority()?, authority);
+        }
         Ok(())
     }
 

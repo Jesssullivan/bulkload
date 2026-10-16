@@ -9,11 +9,15 @@ patched, not real.
 from __future__ import annotations
 
 import contextlib
+import errno
+import fcntl
 import importlib.util
 import io
 import json
 import os
+import shutil
 import stat
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -38,6 +42,8 @@ if [ "$1" = preflight ]; then
 fi
 # Which pmset a rep would run (the shim directory, or nothing).
 command -v pmset >> "$0.pmset" || echo none >> "$0.pmset"
+# The lever knob a rep ran with (--b-env), or unset.
+echo "${BULKLOAD_LOOPBACK_HANDOFF:-unset}" >> "$0.env"
 # Like the real bench: with --informational (dry run, under load) and the host
 # outside the R-N81 gate, rows say gated=false and the verdict is informational
 # with no wins; --only runs one arm and gives a diagnostic verdict.
@@ -57,8 +63,8 @@ power=${STUB_POWER:-ac}
 sealed=$(cat "$2"/* 2>/dev/null | cksum | cut -d' ' -f1)
 echo "benchmark revision=r durability=group seal_primitive=${STUB_SEAL:-fsync} rclone_version=\\"${STUB_RCLONE:-rclone v1.74.4}\\" sealed_corpus_blake3=s$sealed"
 echo "sample sequence=0 arm=Native phase=initial elapsed_ms=100.0 workload_bytes=1000 transferred_content_bytes=900 source_bytes_read=1000 power=$power load1=1.00 gated=$gated"
-echo "native_timing sequence=0 phase=initial scope=s walk_ns=50 walk_ahead_wait_ns=20 queue_wait_ns=1"
-echo "native_counters sequence=0 phase=initial scope=s flush_barrier_ns=10000000 flush_full_ns=5000000 flush_dir_ns=0 files_materialized=10"
+echo "native_timing sequence=0 phase=initial scope=s walk_ns=50 walk_ahead_wait_ns=20 queue_wait_ns=1 recv_setup_ns=10000000 recv_stream_ns=80000000 recv_tail_ns=6000000 recv_drain_ns=30000000 recv_first_data_ns=4000000"
+echo "native_counters sequence=0 phase=initial scope=s flush_barrier_ns=10000000 flush_full_ns=5000000 flush_dir_ns=0 files_materialized=10${STUB_HANDED:+ wire_handed_bytes=$STUB_HANDED}${STUB_FOLDED:+ directories_folded=$STUB_FOLDED}"
 echo "sample sequence=1 arm=Rclone phase=initial elapsed_ms=80.0 workload_bytes=1000 transferred_content_bytes=unknown source_bytes_read=unknown power=$power load1=1.00 gated=$gated"
 echo "rclone_sync sequence=1 phase=initial sync_ms=30.000 timed=false"
 if [ "$only" = 1 ]; then
@@ -107,6 +113,40 @@ def fake_identity(node: str = "rig-x", **over: object) -> dict[str, object]:
     return identity
 
 
+# `just p84-reflink` sets this to make the reflink half fail instead of
+# skip (R-N122). It is taken out of the environment here: the harness refuses
+# a sample while any BULKLOAD_* variable is in its own environment.
+REQUIRE_REFLINK = bool(os.environ.pop("BULKLOAD_P84_REQUIRE_REFLINK", ""))
+# FIEMAP's answer for an unshared tree, the default in HarnessTests: the
+# tests' temporary directory may have no FIEMAP (tmpfs). OI-1003-Q165.
+UNSHARED = {"files": 1, "extents": 1, "shared": 0, "shared_files": []}
+# FICLONE, _IOW(0x94, 9, int): the tests' own clone.
+FICLONE = 0x40049409
+
+
+def clone_file(source: Path, target: Path) -> None:
+    """A reflink of `source` at the new file `target` (a cloning copy)."""
+    with open(source, "rb") as inp, open(target, "xb") as out:
+        fcntl.ioctl(out.fileno(), FICLONE, inp.fileno())
+
+
+def can_clone(directory: Path) -> str | None:
+    """None when `directory` can clone and FIEMAP sees it; else why not."""
+    if sys.platform != "linux":
+        return "not Linux"
+    probe, twin = directory / "clone-probe", directory / "clone-probe-twin"
+    probe.write_bytes(b"p" * 65536)
+    try:
+        clone_file(probe, twin)
+    except OSError as error:
+        return f"{directory} cannot clone ({errno.errorcode.get(error.errno)})"
+    finally:
+        probe.unlink()
+        if twin.exists():
+            twin.unlink()
+    return None
+
+
 def stub(path: Path) -> Path:
     path.write_text(BENCH_STUB)
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -142,6 +182,19 @@ class ParseTests(unittest.TestCase):
             {"initial": {"native_ms": 100.0, "rclone_synced_ms": 110.0}},
         )
         self.assertEqual(summary["bench_medians"]["initial"]["rclone_ms"], 80.0)
+        # The timeline and its drain and ramp (OI-1003-Q143 step 1a) are known
+        # keys, and setup + stream + tail cover 96 of the 100 ms; the drain
+        # and ramp lie inside the stream and are never added to the cover.
+        for key in ("recv_drain_ns", "recv_first_data_ns"):
+            self.assertNotIn(key, summary["new_timing_keys"])
+        self.assertEqual(summary["new_timing_keys"], ["walk_ahead_wait_ns"])
+        timeline = summary["receive_timeline"]["initial"]
+        self.assertAlmostEqual(timeline["recv_drain_ms_median"], 30.0)
+        self.assertAlmostEqual(timeline["recv_first_data_ms_median"], 4.0)
+        self.assertAlmostEqual(timeline["recv_setup_ms_median"], 10.0)
+        self.assertAlmostEqual(timeline["cover_share_of_wall_median"], 0.96)
+        self.assertEqual(timeline["samples"], 1)
+        self.assertNotIn("delta", summary["receive_timeline"])
 
 
 MAINS_ON = {"name": "ADP1", "type": "Mains", "online": "1"}
@@ -423,6 +476,9 @@ class HarnessTests(unittest.TestCase):
             "system": mock.patch.object(ab.platform, "system", return_value="Darwin"),
             "host_identity": mock.patch.object(
                 ab, "host_identity", side_effect=lambda _parent: fake_identity()
+            ),
+            "sharing": mock.patch.object(
+                ab.r23_corpus, "tree_sharing", return_value=UNSHARED, create=True
             ),
         }
         for name, value in patches.items():
@@ -991,6 +1047,82 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("R-N81", rulings)
         self.assertIn("not required under load", md)
         self.assertNotIn("(R-N91).", md)
+
+    def test_an_inherited_bulkload_variable_is_refused(self) -> None:
+        # OI-1003-Q154 review: a variable the harness inherits would reach
+        # every revision's reps unrecorded; a lever arm is --b-env only.
+        with mock.patch.dict(os.environ, {"BULKLOAD_LOOPBACK_HANDOFF": "0"}):
+            self.assertEqual(self.main(self.under_load()), 2)
+            self.assertIn("BULKLOAD_LOOPBACK_HANDOFF", self.out.getvalue())
+            self.assertEqual(self.main(self.gated()), 2)
+            self.assertEqual(self.main(["--build-only"]), 2)
+        self.assertFalse((self.tmp / "work").exists())
+
+    def test_b_env_reaches_the_b_reps_only_and_is_recorded(self) -> None:
+        knob = "BULKLOAD_LOOPBACK_HANDOFF=0"
+        self.assertEqual(self.main([*self.under_load(), "--b-env", knob]), 0)
+        report = self.report()
+        self.assertEqual(report["b_env"], {"BULKLOAD_LOOPBACK_HANDOFF": "0"})
+        seen = (self.tmp / "bench.env").read_text().split()
+        labels = [r["label"] for r in report["reps"]]
+        self.assertEqual(labels, ["B", "A", "B", "A", "B", "V4"])
+        self.assertEqual(seen, ["0", "unset", "0", "unset", "0", "unset"])
+        for rep in report["reps"]:
+            expected = {"BULKLOAD_LOOPBACK_HANDOFF": "0"} if rep["label"] == "B" else {}
+            self.assertEqual(rep["env"], expected, rep["label"])
+        md = self.evidence_md()
+        self.assertIn(f"`{knob}`", md)
+        self.assertIn(f"| 0 | B ({knob}) |", md)
+        self.assertIn("| 1 | A |", md)
+
+    def test_the_loopback_hand_off_is_recorded_per_label(self) -> None:
+        # S1 stack review (2026-10-15), finding 8: whether a rep's chunks
+        # crossed the loopback by the in-process hand-off is recorded from
+        # its own counter, beside the open R-N57 wording.
+        with mock.patch.dict(os.environ, {"STUB_HANDED": "900"}):
+            self.assertEqual(self.main(self.under_load()), 0)
+        report = self.report()
+        for rep in report["reps"]:
+            self.assertEqual(rep["summary"]["wire_handed_bytes_total"], 900, rep["label"])
+        self.assertEqual(report["loopback_handoff"], {"A": "on", "B": "on", "V4": "on"})
+        md = self.evidence_md()
+        self.assertIn("LOOPBACK HAND-OFF: A on, B on, V4 on", md)
+        self.assertIn("R-N57", md)
+        self.assertIn("not ruled", md)
+
+    def test_the_directory_fold_is_recorded_per_rep(self) -> None:
+        # OI-1003-Q154 lever 3: the directories each rep's native copies
+        # finished in their last output group, from the build's own counter
+        # (None from a build without it: the test below).
+        with mock.patch.dict(os.environ, {"STUB_FOLDED": "4"}):
+            self.assertEqual(self.main(self.under_load()), 0)
+        for rep in self.report()["reps"]:
+            self.assertEqual(rep["summary"]["directories_folded_total"], 4, rep["label"])
+
+    def test_a_build_without_the_hand_off_counter_is_not_reported(self) -> None:
+        self.assertEqual(self.main(self.under_load()), 0)
+        report = self.report()
+        for rep in report["reps"]:
+            self.assertIsNone(rep["summary"]["wire_handed_bytes_total"], rep["label"])
+            # Nor the directory fold's (OI-1003-Q154 lever 3).
+            self.assertIsNone(rep["summary"]["directories_folded_total"], rep["label"])
+        self.assertEqual(
+            report["loopback_handoff"],
+            {"A": "not reported", "B": "not reported", "V4": "not reported"},
+        )
+        self.assertIn("LOOPBACK HAND-OFF: A not reported", self.evidence_md())
+
+    def test_b_env_refusals(self) -> None:
+        knob = "BULKLOAD_LOOPBACK_HANDOFF=0"
+        # A gated sample runs B as built; a lever arm is informational.
+        self.assertEqual(self.main([*self.gated(), "--b-env", knob]), 2)
+        self.assertEqual(self.main(["--build-only", "--b-env", knob]), 2)
+        for bad in ("FOO=1", "BULKLOAD_X", "=0", "bulkload_x=1"):
+            self.assertEqual(self.main([*self.under_load(), "--b-env", bad]), 2, bad)
+        self.assertEqual(
+            self.main([*self.under_load(), "--b-env", knob, "--b-env", knob]), 2
+        )
+        self.assertFalse((self.tmp / "work").exists())
 
     def test_under_load_records_coordinator_quiet_as_acknowledged_only(self) -> None:
         self.assertEqual(self.main([*self.under_load(), "--coordinator-quiet"]), 0)
@@ -1563,6 +1695,9 @@ class HarnessTests(unittest.TestCase):
         self.assertEqual(ab.DEFAULT_A, "7c3ecc7")
         self.assertIn("OI-1003-Q103", ab.RULINGS)
         self.assertIn("OI-1003-Q105", ab.RULINGS)
+        # OI-1003-Q165 (b): every sample enforces the no-clone copy rule.
+        self.assertIn("OI-1003-Q165", ab.RULINGS)
+        self.assertIn("OI-1003-Q165", ab.RULINGS_UNDER_LOAD)
         self.assertIn("never decides the gate", ab.A_PURPOSE)
 
     def built_revs(self, argv: list[str], **patches: object) -> tuple[int, list[str]]:
@@ -1642,6 +1777,170 @@ class HarnessTests(unittest.TestCase):
         self.setUp()
         self.assertEqual(self.main(self.no_a()), 0)
         self.assertIsNone(self.report()["baseline_a"])
+
+    # --- OI-1003-Q165 (b): the working copy is never a clone
+
+    def test_the_working_copy_is_a_read_and_write_never_shutil(self) -> None:
+        def refused(*_a: object, **_k: object) -> None:
+            raise AssertionError("a cloning copy path was used (OI-1003-Q165)")
+
+        (self.corpus / "d").mkdir()
+        (self.corpus / "d" / "g").write_bytes(b"y" * 70000)
+        (self.corpus / "f").chmod(0o444)
+        cloning = [
+            mock.patch.object(shutil, name, side_effect=refused)
+            for name in ("copytree", "copy2", "copyfile", "copy", "copyfileobj")
+        ]
+        cloning += [
+            mock.patch.object(os, name, side_effect=refused, create=True)
+            for name in ("copy_file_range", "sendfile", "splice")
+        ]
+        with contextlib.ExitStack() as stack:
+            for patcher in cloning:
+                stack.enter_context(patcher)
+            with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+                self.assertEqual(self.main(self.gated()), 0)
+        copy = self.tmp / "work" / "corpus"
+        self.assertEqual((copy / "d" / "g").read_bytes(), b"y" * 70000)
+        self.assertEqual(stat.S_IMODE((copy / "f").stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE((copy / "d").stat().st_mode), 0o755)
+        self.assertEqual(
+            (copy / "f").stat().st_mtime_ns, (self.corpus / "f").stat().st_mtime_ns
+        )
+        report = self.report()
+        self.assertEqual(report["working_copy_shared_extents"], "0")
+        self.assertIn("read-write", report["copy_method"])
+        self.assertEqual(
+            report["reps"][0]["shared_extents_after"],
+            {"working_copy": "0", "fixture": "absent"},
+        )
+        self.assertIn("No clone (S2, OI-1003-Q165)", (self.tmp / EV).read_text())
+
+    def test_a_shared_working_copy_refuses_the_sample(self) -> None:
+        shared = {"files": 1, "extents": 1, "shared": 1, "shared_files": ["f"]}
+        sharing = mock.patch.object(
+            ab.r23_corpus, "tree_sharing", return_value=shared, create=True
+        )
+        for mode in (self.gated(), self.under_load(), ["--dry-run"]):
+            self.setUp()
+            self.assertEqual(self.main(mode, sharing=sharing), 2, mode)
+            self.assertIn(
+                "shares 1 extent(s) with another file (f)", self.out.getvalue()
+            )
+            self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+
+    def test_no_fiemap_refuses_a_gated_sample_and_is_recorded_otherwise(self) -> None:
+        none = mock.patch.object(
+            ab.r23_corpus, "tree_sharing", return_value=None, create=True
+        )
+        linux = mock.patch.object(ab.r23_corpus.sys, "platform", "linux")
+        self.assertEqual(self.main(self.gated(), sharing=none, sys_platform=linux), 2)
+        self.assertIn("cannot be verified unshared", self.out.getvalue())
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(self.under_load(), sharing=none, sys_platform=linux)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.report()["working_copy_shared_extents"], "unsupported")
+        self.setUp()
+        darwin = mock.patch.object(ab.r23_corpus.sys, "platform", "darwin")
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(self.gated(), sharing=none, sys_platform=darwin)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.report()["working_copy_shared_extents"], "n/a")
+
+    def test_a_shared_sealed_corpus_refuses_a_gated_sample(self) -> None:
+        """OI-1003-Q166 re-sealed the corpus unshared: a shared one now refuses."""
+
+        def sharing(root: Path) -> dict[str, object]:
+            if Path(root).name == "sealed":
+                return {"files": 1, "extents": 1, "shared": 1, "shared_files": ["f"]}
+            return UNSHARED
+
+        patched = mock.patch.object(
+            ab.r23_corpus, "tree_sharing", side_effect=sharing, create=True
+        )
+        self.assertEqual(self.main(self.gated(), sharing=patched), 2)
+        self.assertIn("the sealed corpus shares 1 extent(s)", self.out.getvalue())
+        self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+        self.setUp()
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            code = self.main(self.under_load(), sharing=patched)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.report()["sealed_corpus_shared_extents"], "1")
+
+    def test_a_clone_during_a_rep_aborts_the_sample(self) -> None:
+        calls = []
+
+        def sharing(root: Path) -> dict[str, object]:
+            calls.append(Path(root).name)
+            # The sealed corpus and the copy before the builds, then rep0.
+            if len(calls) > 2:
+                return {"files": 1, "extents": 1, "shared": 1, "shared_files": ["f"]}
+            return UNSHARED
+
+        patched = mock.patch.object(
+            ab.r23_corpus, "tree_sharing", side_effect=sharing, create=True
+        )
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated(), sharing=patched), 3)
+        report = self.report()
+        self.assertEqual(report["status"], "aborted")
+        self.assertIn(
+            "the working copy after rep0 shares 1 extent(s)", report["reason"]
+        )
+        self.assertEqual(calls[:3], ["sealed", "corpus", "corpus"])
+
+    def test_a_cloning_copy_is_refused_by_fiemap_on_a_reflink_file_system(self) -> None:
+        """Real FIEMAP, a real clone: the scratch directory must be able to clone.
+
+        A copy that clones (as `shutil` does on Python 3.14 through
+        `copy_file_range`, and `cp` by default) stands in for the copy
+        function; the harness must refuse before any build. The default
+        `TMPDIR` may be tmpfs: set it to a reflink file system (xfs reflink=1)
+        for this test to run.
+        """
+        why = can_clone(self.tmp)
+        if why:
+            if REQUIRE_REFLINK:
+                self.fail(f"required by BULKLOAD_P84_REQUIRE_REFLINK: {why}")
+            self.skipTest(f"{why}: set TMPDIR to a reflink file system")
+        (self.corpus / "big").write_bytes(os.urandom(1 << 20))
+
+        def cloning_copy(
+            source: Path, target: Path, *rest: object, **_k: object
+        ) -> object:
+            clone_file(Path(source), Path(target))
+            if rest and isinstance(rest[0], int):
+                os.chmod(target, rest[0])
+            return target
+
+        cloning = [
+            mock.patch.object(shutil, "copyfile", side_effect=cloning_copy),
+            mock.patch.object(
+                ab.r23_corpus, "plain_copy_file", side_effect=cloning_copy, create=True
+            ),
+        ]
+        real = contextlib.nullcontext()
+        # A clone shares both sides: gated, the shared sealed corpus refuses
+        # first (OI-1003-Q166); informational, the working copy does.
+        for mode, which in (
+            (self.gated(), "the sealed corpus shares"),
+            (self.under_load(), "the working copy shares"),
+        ):
+            self.setUp()
+            (self.corpus / "big").write_bytes(os.urandom(1 << 20))
+            with contextlib.ExitStack() as stack:
+                for patcher in cloning:
+                    stack.enter_context(patcher)
+                self.assertEqual(self.main(mode, sharing=real), 2, mode)
+            self.assertIn(which, self.out.getvalue())
+            self.assertFalse((self.tmp / "work" / "r23-ab.json").exists())
+        # The same tree copied by the harness's own copy shares nothing.
+        self.setUp()
+        (self.corpus / "big").write_bytes(os.urandom(1 << 20))
+        with mock.patch.dict(os.environ, {"STUB_VERDICT": "pass"}):
+            self.assertEqual(self.main(self.gated(), sharing=real), 0)
+        self.assertEqual(self.report()["working_copy_shared_extents"], "0")
 
 
 if __name__ == "__main__":

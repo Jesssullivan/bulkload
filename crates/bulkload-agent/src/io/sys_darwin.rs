@@ -88,6 +88,24 @@ pub fn barrier(file: impl AsFd) -> io::Result<()> {
     Ok(())
 }
 
+/// [`barrier`] without a trace event, for a file the R-N88 trace never
+/// sees written: a new store's WAL template
+/// (`io::durable::init_wal_database`, OI-1003-Q154 lever 3a), whose write
+/// is `SQLite`'s file's own I/O. A file system that rejects
+/// `F_BARRIERFSYNC` gets `F_FULLFSYNC`, which is strictly stronger.
+///
+/// # Errors
+/// Returns the `fcntl` failure.
+pub fn barrier_untraced(file: impl AsFd) -> io::Result<()> {
+    let fd = file.as_fd();
+    match fcntl_flush(fd, libc::F_BARRIERFSYNC) {
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOTSUP | libc::EINVAL)) => {
+            fcntl_flush(fd, libc::F_FULLFSYNC)
+        }
+        other => other,
+    }
+}
+
 /// A directory barrier. A file system that rejects `F_BARRIERFSYNC` on a
 /// directory gets `F_FULLFSYNC`, which is strictly stronger.
 ///

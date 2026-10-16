@@ -8,7 +8,7 @@
 //! is neither durable nor ordered (it is never used alone; plan D3 "Linux");
 //! `fdatasync` makes a file's data durable, cache flush included;
 //! `fsync` also makes its metadata durable, and on a directory makes its
-//! entries durable.
+//! entries durable; `syncfs` makes every file of the file system durable.
 
 use std::ffi::CStr;
 use std::io;
@@ -116,6 +116,322 @@ pub fn full_flush(file: impl AsFd) -> io::Result<()> {
         })
     );
     Ok(())
+}
+
+/// `syncfs` through `through`, then `fsync` of `file`: the group seal of the batched
+/// protocol (S1, OI-1003-Q107), one call pair per device in place of a
+/// flush per file and per directory. The engine calls it only on the file
+/// systems `io::durable::syncfs_seals` allows; elsewhere `syncfs` can be
+/// weaker than `fsync`.
+///
+/// `syncfs` writes back every file of the file system and runs its
+/// `->sync_fs` (the ext4 journal commit, the xfs log force, the btrfs
+/// transaction commit). That alone does not always flush the device cache
+/// or report a failure:
+///
+/// - xfs: with an idle log `xfs_log_force` returns 0 without any I/O, so
+///   data written back in place (no log write after it) can stay in the
+///   drive's volatile cache. `xfs_file_fsync` then calls
+///   `blkdev_issue_flush` itself (v6.12 `xfs_file.c`; not for a realtime
+///   file, which the engine never batches).
+/// - ext4: on a forced shutdown `ext4_sync_fs` returns 0 (v5.17, v6.12),
+///   while `ext4_sync_file` returns `EIO`.
+///
+/// The `fsync` that follows covers both. Write-back errors are reported by
+/// `syncfs` (Linux 5.8, errseq) only against the cursor of `through`, which
+/// the kernel sampled when `through` was opened, so an error another
+/// `syncfs` already reported is not reported again ([`wait_writeback`]
+/// checks each file's own), and one raised before `through` was opened is
+/// not reported at all. The caller opens `through` for the seal (S1 stack
+/// review, 2026-10-15, finding 1). The file system's own `->sync_fs`
+/// failure is returned directly, from 5.17 (5679897eb104, and for xfs
+/// 2d86293c7075), whatever the cursor.
+///
+/// `through` and `file` must be on one file system. Traced as the `fsync`
+/// of `file`, then one `FsSync` naming `file`, recorded only once both
+/// returned: the device seal is complete at the `FsSync`.
+///
+/// # Errors
+/// Returns the first failure.
+pub fn sync_fs(through: impl AsFd, file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
+    let through = through.as_fd();
+    let fd = file.as_fd();
+    // SAFETY: the descriptor is live for every call of the closure; `syncfs`
+    // takes no pointers.
+    retry_eintr(|| unsafe { libc::syncfs(through.as_raw_fd()) })?;
+    full_flush(fd)?;
+    trace_event!(
+        "syncfs",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::FsSync,
+        })
+    );
+    Ok(())
+}
+
+/// `sync_file_range(SYNC_FILE_RANGE_WRITE)` over the whole file: start
+/// write-back of its dirty pages now, so a later [`sync_fs`] finds less to
+/// write. Neither durable nor ordered; traced as a kick.
+///
+/// # Errors
+/// Returns the failed call.
+pub fn start_writeback(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
+    let fd = file.as_fd();
+    // SAFETY: the descriptor is live for every call of the closure;
+    // `sync_file_range` takes no pointers.
+    retry_eintr(|| unsafe {
+        libc::sync_file_range(fd.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE)
+    })?;
+    trace_event!(
+        "sync_file_range",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::Kick,
+        })
+    );
+    Ok(())
+}
+
+/// `sync_file_range(WAIT_BEFORE | WRITE | WAIT_AFTER)` over the whole file:
+/// write any dirty page and wait for its write-back, then return the file's
+/// own write-back error, checked against this descriptor's errseq cursor
+/// (`file_fdatawait_range` returns `file_check_and_advance_wb_err`; errseq
+/// since Linux 4.14). It flushes no device cache. Traced as a kick: it makes
+/// nothing durable.
+///
+/// # Errors
+/// Returns the file's write-back error.
+pub fn wait_writeback(file: impl AsFd) -> io::Result<()> {
+    trace_serial!();
+    let fd = file.as_fd();
+    // SAFETY: the descriptor is live for every call of the closure;
+    // `sync_file_range` takes no pointers.
+    retry_eintr(|| unsafe {
+        libc::sync_file_range(
+            fd.as_raw_fd(),
+            0,
+            0,
+            libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                | libc::SYNC_FILE_RANGE_WRITE
+                | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+        )
+    })?;
+    trace_event!(
+        "sync_file_range",
+        Ok(super::trace::Event::Sync {
+            node: fstat(fd)?.node,
+            kind: super::trace::SyncKind::Kick,
+        })
+    );
+    Ok(())
+}
+
+/// `fstatfs`: the type (`f_type`, a file system magic) of the file system
+/// holding `file`, as its low 32 bits (every magic fits in them).
+///
+/// # Errors
+/// Returns the failed call.
+#[allow(
+    clippy::useless_conversion,
+    reason = "f_type is i64 on x86_64 and aarch64 but u32 on s390x Linux"
+)]
+pub fn fs_type(file: impl AsFd) -> io::Result<u32> {
+    let fd = file.as_fd();
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the descriptor is live; `stats` is a writable `statfs` that
+    // outlives the call.
+    retry_eintr(|| unsafe { libc::fstatfs(fd.as_raw_fd(), stats.as_mut_ptr()) })?;
+    // SAFETY: a successful fstatfs initialized the whole structure.
+    let stats = unsafe { stats.assume_init() };
+    u32::try_from(i64::from(stats.f_type) & 0xFFFF_FFFF)
+        .map_err(|_| io::ErrorKind::InvalidData.into())
+}
+
+/// `struct fsxattr` of `<linux/fs.h>`, the argument of `FS_IOC_FSGETXATTR`.
+#[repr(C)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the field names of the kernel's struct fsxattr"
+)]
+struct FsXattr {
+    fsx_xflags: u32,
+    fsx_extsize: u32,
+    fsx_nextents: u32,
+    fsx_projid: u32,
+    fsx_cowextsize: u32,
+    fsx_pad: [u8; 8],
+}
+
+/// `FS_IOC_FSGETXATTR`, `_IOR('X', 31, struct fsxattr)`.
+const FS_IOC_FSGETXATTR: libc::Ioctl = libc::_IOR::<FsXattr>(b'X' as u32, 31);
+
+/// `FS_IOC_FSGETXATTR`: the inode flags (`fsx_xflags`, such as
+/// `FS_XFLAG_REALTIME`) of `file`.
+///
+/// # Errors
+/// Returns the failed call (`ENOTTY` where the file system has no such
+/// flags).
+pub fn fs_xflags(file: impl AsFd) -> io::Result<u32> {
+    let fd = file.as_fd();
+    let mut attributes = FsXattr {
+        fsx_xflags: 0,
+        fsx_extsize: 0,
+        fsx_nextents: 0,
+        fsx_projid: 0,
+        fsx_cowextsize: 0,
+        fsx_pad: [0; 8],
+    };
+    // SAFETY: the descriptor is live; `attributes` is a writable
+    // `struct fsxattr` that outlives the call.
+    retry_eintr(|| unsafe {
+        libc::ioctl(
+            fd.as_raw_fd(),
+            FS_IOC_FSGETXATTR,
+            std::ptr::addr_of_mut!(attributes),
+        )
+    })?;
+    Ok(attributes.fsx_xflags)
+}
+
+/// `struct fiemap` of `<linux/fiemap.h>` without its trailing extent array:
+/// the size `FS_IOC_FIEMAP` encodes.
+#[repr(C)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the field names of the kernel's struct fiemap"
+)]
+struct FiemapHeader {
+    fm_start: u64,
+    fm_length: u64,
+    fm_flags: u32,
+    fm_mapped_extents: u32,
+    fm_extent_count: u32,
+    fm_reserved: u32,
+}
+
+/// `struct fiemap_extent` of `<linux/fiemap.h>`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+#[allow(
+    clippy::struct_field_names,
+    reason = "the field names of the kernel's struct fiemap_extent"
+)]
+struct FiemapExtent {
+    fe_logical: u64,
+    fe_physical: u64,
+    fe_length: u64,
+    fe_reserved64: [u64; 2],
+    fe_flags: u32,
+    fe_reserved: [u32; 3],
+}
+
+/// How many extents one `FS_IOC_FIEMAP` call asks for, as the array length
+/// and as `fm_extent_count` (the same number).
+const FIEMAP_BATCH: usize = 64;
+const FIEMAP_BATCH_COUNT: u32 = 64;
+
+/// One `FS_IOC_FIEMAP` argument: the header, then room for
+/// [`FIEMAP_BATCH`] extents, as the kernel lays it out.
+#[repr(C)]
+struct FiemapRequest {
+    header: FiemapHeader,
+    extents: [FiemapExtent; FIEMAP_BATCH],
+}
+
+/// `FS_IOC_FIEMAP`, `_IOWR('f', 11, struct fiemap)`.
+const FS_IOC_FIEMAP: libc::Ioctl = libc::_IOWR::<FiemapHeader>(b'f' as u32, 11);
+/// `FIEMAP_EXTENT_LAST`: the file's last extent.
+const FIEMAP_EXTENT_LAST: u32 = 0x1;
+/// `FIEMAP_EXTENT_SHARED`: the extent's blocks also belong to another file.
+const FIEMAP_EXTENT_SHARED: u32 = 0x2000;
+
+/// A file's mapped extents, and how many of them share their blocks with
+/// another file (a reflink or clone, OI-1003-Q165).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ExtentSharing {
+    /// Mapped extents, delayed allocations included.
+    pub extents: u64,
+    /// Extents flagged `FIEMAP_EXTENT_SHARED`.
+    pub shared: u64,
+}
+
+/// `FS_IOC_FIEMAP` over the whole of `file`: how many extents it maps and how
+/// many of them are shared with another file (OI-1003-Q165). Read-only: no
+/// `FIEMAP_FLAG_SYNC`, so the probe never starts write-back of the file it
+/// looks at, and it moves no timestamp.
+///
+/// # Errors
+/// Returns the failed call (`EOPNOTSUPP` where the file system has no
+/// extent map, such as tmpfs).
+pub fn extent_sharing(file: impl AsFd) -> io::Result<ExtentSharing> {
+    let fd = file.as_fd();
+    let mut sharing = ExtentSharing::default();
+    let mut start = 0_u64;
+    loop {
+        let mut request = FiemapRequest {
+            header: FiemapHeader {
+                fm_start: start,
+                fm_length: u64::MAX,
+                fm_flags: 0,
+                fm_mapped_extents: 0,
+                fm_extent_count: FIEMAP_BATCH_COUNT,
+                fm_reserved: 0,
+            },
+            extents: [FiemapExtent {
+                fe_logical: 0,
+                fe_physical: 0,
+                fe_length: 0,
+                fe_reserved64: [0; 2],
+                fe_flags: 0,
+                fe_reserved: [0; 3],
+            }; FIEMAP_BATCH],
+        };
+        // SAFETY: the descriptor is live; `request` is a writable `struct
+        // fiemap` followed by room for `fm_extent_count` extents, and it
+        // outlives the call.
+        retry_eintr(|| unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                FS_IOC_FIEMAP,
+                std::ptr::addr_of_mut!(request),
+            )
+        })?;
+        let mapped = usize::try_from(request.header.fm_mapped_extents).unwrap_or(FIEMAP_BATCH);
+        let mut last = mapped == 0;
+        let mut next = start;
+        for extent in request.extents.iter().take(mapped) {
+            sharing.extents += 1;
+            if extent.fe_flags & FIEMAP_EXTENT_SHARED != 0 {
+                sharing.shared += 1;
+            }
+            last |= extent.fe_flags & FIEMAP_EXTENT_LAST != 0;
+            next = extent.fe_logical.saturating_add(extent.fe_length);
+        }
+        // A batch that ends short of the last extent continues after it; a
+        // map that does not advance ends, so the walk always terminates.
+        if last || mapped < FIEMAP_BATCH || next <= start {
+            return Ok(sharing);
+        }
+        start = next;
+    }
+}
+
+/// The running kernel's release string (`uname -r`), if it can be read.
+#[must_use]
+pub fn kernel_release() -> Option<String> {
+    // SAFETY: `utsname` is plain old data; all-zero bytes are a valid value.
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: `name` is a writable `utsname` that outlives the call.
+    if unsafe { libc::uname(&raw mut name) } != 0 {
+        return None;
+    }
+    // SAFETY: on success `release` holds a NUL-terminated string within the
+    // array, which lives as long as `name`.
+    let release = unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) };
+    release.to_str().ok().map(str::to_owned)
 }
 
 /// `fsync` on a directory descriptor, making its entries durable.

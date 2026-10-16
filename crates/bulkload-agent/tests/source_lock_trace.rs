@@ -58,6 +58,24 @@
 //! ([`sqlite_source_read_is_refused_as_root`]). Neither run proves the
 //! other's half; no privilege is dropped or gained here.
 //!
+//! **P84 SOURCE-NO-CLONE's kernel leg (OI-1003-Q165)** lives here too, at the
+//! end of the file. A clone of a source file (`FICLONE`, or a
+//! `copy_file_range` that a reflink file system serves as one) writes the
+//! source inode but moves no `lstat` field, so neither the census nor the
+//! write watch sees it. `FIEMAP` does: the source's extents come back
+//! shared. A self-test proves that on this host (a `FICLONE` and a
+//! `std::fs::copy` of a fixture file), then a `copy` and a `serve` in its own
+//! process must leave every source extent unshared, and so must a v1 Git
+//! capture (its raw-tree pass reads every seat) and a `SQLite` snapshot. The
+//! leg needs a directory on a reflink file system (xfs `reflink=1`, btrfs):
+//! `TMPDIR`, or else cargo's `CARGO_TARGET_TMPDIR`. Where neither can clone
+//! it says so on stderr and returns, which cargo still reports as `ok`;
+//! `BULKLOAD_P84_REQUIRE_REFLINK` makes that a failure, and `just
+//! p84-reflink` sets it and checks that each leg printed its own line
+//! (R-N122). `FIEMAP` sees sharing that exists when it looks, not a clone
+//! that was later undone ([`bulkload_agent::extents`]). The static half is
+//! P84 in `source_command_registry.rs`.
+//!
 //! **Not covered here**, and so still open for S2's lock property:
 //! `estate::apply`, `git-carry-estimate` over ssh (the far host's probe),
 //! `export_repository_with_policy` and the prerequisite and drift paths,
@@ -155,8 +173,12 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(name: &str) -> Self {
+        Self::new_in(&std::env::temp_dir(), name)
+    }
+
+    fn new_in(base: &Path, name: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
-        let root = std::env::temp_dir().join(format!(
+        let root = base.join(format!(
             "bulkload-p77-{name}-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
@@ -2724,5 +2746,268 @@ fn a_sqlite_snapshot_does_not_hold_up_a_committing_writer() {
         accounting.shm_mark,
         observed.samples,
         observed.period_us()
+    );
+}
+
+// ------------------------------- P84: no clone of a source (OI-1003-Q165)
+
+/// Set to make P84's kernel leg fail where the temporary directory cannot
+/// clone, instead of saying so on stderr and returning.
+const REQUIRE_REFLINK_ENV: &str = "BULKLOAD_P84_REQUIRE_REFLINK";
+
+/// `ioctl(FICLONE)` of `from` into a new file `to`: this test's own clone,
+/// to prove the observation sees one. `FICLONE` is `_IOW(0x94, 9, int)`.
+fn reflink(from: &Path, to: &Path) -> std::io::Result<()> {
+    const FICLONE: libc::Ioctl = libc::_IOW::<libc::c_int>(0x94, 9);
+    let input = File::open(from)?;
+    let output = File::create(to)?;
+    // SAFETY: both descriptors are live for the call; FICLONE takes the
+    // source descriptor by value and no pointer.
+    if unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, input.as_raw_fd()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Whether `scratch` can hold P84's kernel leg: `FIEMAP` maps a file there
+/// and `FICLONE` clones it. The error says why not.
+fn reflink_probe(scratch: &Scratch) -> std::io::Result<()> {
+    let probe = scratch.path("reflink-probe");
+    fs::write(&probe, noise(7, 64 * 1024)).unwrap();
+    File::open(&probe).unwrap().sync_all().unwrap();
+    let clone = scratch.path("reflink-probe-clone");
+    let outcome =
+        bulkload_agent::extents::file_sharing(&probe).and_then(|_| reflink(&probe, &clone));
+    let _ = fs::remove_file(&clone);
+    let _ = fs::remove_file(&probe);
+    outcome
+}
+
+/// A scratch directory where P84's kernel leg can run: under the temporary
+/// directory, or else under cargo's per-target temporary directory (the
+/// build's own file system, often a reflink one when `TMPDIR` is a tmpfs).
+/// Where neither can clone, say so on stderr and return `None`, or fail if
+/// [`REQUIRE_REFLINK_ENV`] is set. A leg that returns early still reports
+/// `ok` to cargo, so `just p84-reflink` sets the variable and checks each
+/// leg's own line (R-N122).
+fn reflink_scratch(name: &str, leg: &str) -> Option<Scratch> {
+    let mut tried = Vec::new();
+    for base in [
+        std::env::temp_dir(),
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")),
+    ] {
+        let scratch = Scratch::new_in(&base, name);
+        match reflink_probe(&scratch) {
+            Ok(()) => return Some(scratch),
+            Err(error) => tried.push(format!("{} ({error})", base.display())),
+        }
+    }
+    let message = format!(
+        "p84 {leg}: not run: cannot clone under {}; run with TMPDIR on a reflink \
+         file system (xfs reflink=1, btrfs), or `just p84-reflink`",
+        tried.join(" or ")
+    );
+    assert!(std::env::var_os(REQUIRE_REFLINK_ENV).is_none(), "{message}");
+    eprintln!("{message}");
+    None
+}
+
+/// `fsync` every regular file under `root`, so its extents are allocated
+/// before the census.
+fn sync_files(root: &Path) {
+    for (relative, meta) in nodes(root) {
+        if meta.is_file() {
+            File::open(root.join(relative)).unwrap().sync_all().unwrap();
+        }
+    }
+}
+
+/// P84's observation works on this host: a clone of a source file leaves
+/// every `lstat` field of the source as it was (so P77's census cannot see
+/// it) and shows only as `FIEMAP_EXTENT_SHARED` on the source's extents.
+/// `std::fs::copy` is such a clone here (`copy_file_range`), which is why
+/// P84's registry holds every `fs::copy` to a non-source input.
+#[test]
+fn p84_fiemap_sees_a_clone_that_the_census_cannot() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(scratch) = reflink_scratch("p84-self", "self-test") else {
+        return;
+    };
+    let source = scratch.path("source");
+    let elsewhere = scratch.path("elsewhere");
+    fs::create_dir(&source).unwrap();
+    fs::create_dir(&elsewhere).unwrap();
+    let file = source.join("seat");
+    let other = source.join("other");
+    fs::write(&file, noise(11, 2 * 1024 * 1024 + 5)).unwrap();
+    fs::write(&other, noise(12, 1024 * 1024 + 9)).unwrap();
+    File::open(&file).unwrap().sync_all().unwrap();
+    File::open(&other).unwrap().sync_all().unwrap();
+    let census = lstat_census(&source);
+    let before = bulkload_agent::extents::tree_sharing(&source).unwrap();
+    assert_eq!(before.shared_extents, 0, "{before:?}");
+    assert!(before.extents >= 2, "{before:?}");
+
+    reflink(&file, &elsewhere.join("ficlone")).unwrap();
+    let cloned = bulkload_agent::extents::tree_sharing(&source).unwrap();
+    assert!(
+        cloned.shared_extents > 0,
+        "FIEMAP missed a FICLONE: {cloned:?}"
+    );
+    assert_eq!(cloned.shared_files, std::slice::from_ref(&file));
+    assert_eq!(lstat_census(&source), census, "the census saw the clone");
+
+    std::fs::copy(&other, elsewhere.join("std-fs-copy")).unwrap();
+    let copied = bulkload_agent::extents::tree_sharing(&source).unwrap();
+    assert!(
+        copied.shared_files.contains(&other),
+        "std::fs::copy did not clone here: {copied:?}"
+    );
+    assert_eq!(lstat_census(&source), census, "the census saw fs::copy");
+    eprintln!(
+        "p84 self-test: FICLONE shared {} extent(s), std::fs::copy {} more; lstat census unchanged",
+        cloned.shared_extents,
+        copied.shared_extents - cloned.shared_extents
+    );
+}
+
+/// P84 SOURCE-NO-CLONE, kernel leg (S2, OI-1003-Q165): on a file system
+/// that can clone, a `copy` and a `serve` in its own process leave no
+/// extent of the source shared, and the destinations they write share
+/// nothing either: every byte was read and written, none remapped.
+#[test]
+fn p84_a_copy_and_a_serve_leave_no_source_extent_shared() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(scratch) = reflink_scratch("p84-copy", "copy and serve") else {
+        return;
+    };
+    let source = scratch.path("source");
+    fs::create_dir(&source).unwrap();
+    populate(&source);
+    sync_files(&source);
+    settle_racy_window(&source).unwrap();
+    let before = bulkload_agent::extents::tree_sharing(&source).unwrap();
+    assert_eq!(before.shared_extents, 0, "the fixture shares: {before:?}");
+    assert_eq!(before.no_reflink_files, 0, "{before:?}");
+
+    let copied = scratch.path("copied");
+    fs::create_dir(&copied).unwrap();
+    let stats = copy(
+        &source,
+        &copied,
+        &scratch.path("copy-source-state"),
+        &scratch.path("copy-destination-state"),
+    )
+    .unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_carried(&source, &copied);
+    let after_copy = bulkload_agent::extents::tree_sharing(&source).unwrap();
+    assert_eq!(
+        after_copy.shared_extents, 0,
+        "a copy cloned the source: {after_copy:?}"
+    );
+
+    let served = scratch.path("served");
+    fs::create_dir(&served).unwrap();
+    let stderr = scratch.path("serve.stderr");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut output = child.stdin.take().unwrap();
+    let mut input = child.stdout.take().unwrap();
+    let stats = receive(
+        &mut input,
+        &mut output,
+        &source,
+        &scratch.path("serve-source-state"),
+        &served,
+        &scratch.path("serve-destination-state"),
+    );
+    drop(output);
+    let exit = child.wait().unwrap();
+    let said = fs::read_to_string(&stderr).unwrap_or_default();
+    let stats = stats.unwrap_or_else(|refusal| panic!("receive refused: {refusal}; serve: {said}"));
+    assert!(exit.success(), "serve failed: {said}");
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_carried(&source, &served);
+    let after_serve = bulkload_agent::extents::tree_sharing(&source).unwrap();
+    assert_eq!(
+        after_serve.shared_extents, 0,
+        "a served transfer cloned the source: {after_serve:?}"
+    );
+    for destination in [&copied, &served] {
+        let shared = bulkload_agent::extents::tree_sharing(destination).unwrap();
+        assert_eq!(shared.shared_extents, 0, "{shared:?}");
+    }
+    eprintln!(
+        "p84 copy and serve: source {} files, {} extents, 0 shared after both",
+        after_serve.files, after_serve.extents
+    );
+}
+
+/// P84 SOURCE-NO-CLONE, kernel leg for the paths that are not `copy`
+/// (review, 2026-10-15): a v1 Git capture (`export_repository`, whose
+/// raw-tree pass is the one registered `io::copy` that reads a source file)
+/// and a `SQLite` provider snapshot (the backup API) leave no extent of
+/// their sources shared. As root the provider refuses to read a source at
+/// all (OI-1003-Q76), so that half says so and is not run.
+#[test]
+fn p84_a_git_capture_and_a_sqlite_snapshot_leave_no_source_extent_shared() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(scratch) = reflink_scratch("p84-git", "git and sqlite") else {
+        return;
+    };
+    let repo = scratch.path("repo");
+    stale_index_repository(&repo);
+    sync_files(&repo);
+    let before = bulkload_agent::extents::tree_sharing(&repo).unwrap();
+    assert_eq!(
+        before.shared_extents, 0,
+        "the repository shares: {before:?}"
+    );
+    assert_eq!(before.no_reflink_files, 0, "{before:?}");
+    let bundle =
+        bulkload_agent::git_carry::export_repository(&repo, &scratch.path("capture")).unwrap();
+    assert!(bundle.is_file());
+    let after = bulkload_agent::extents::tree_sharing(&repo).unwrap();
+    assert_eq!(
+        after.shared_extents, 0,
+        "a Git capture cloned the source: {after:?}"
+    );
+
+    let sqlite = if is_root() {
+        eprintln!(
+            "p84 git and sqlite: ROOT: the provider refuses to read a source \
+             (OI-1003-Q76); the SQLite half is not run"
+        );
+        "not run as root".to_owned()
+    } else {
+        let source = scratch.path("sqlite");
+        fs::create_dir(&source).unwrap();
+        let db = source.join("state.db");
+        closed_wal_database(&db, 2000);
+        sync_files(&source);
+        let before = bulkload_agent::extents::tree_sharing(&source).unwrap();
+        assert_eq!(before.shared_extents, 0, "{before:?}");
+        let output_dir = scratch.path("snapshot");
+        fs::create_dir(&output_dir).unwrap();
+        fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        provider_sqlite::snapshot(&db, &output_dir.join("state.db"), 10_000).unwrap();
+        let after = bulkload_agent::extents::tree_sharing(&source).unwrap();
+        assert_eq!(
+            after.shared_extents, 0,
+            "a SQLite snapshot cloned the source: {after:?}"
+        );
+        let snapshot = bulkload_agent::extents::tree_sharing(&output_dir).unwrap();
+        assert_eq!(snapshot.shared_extents, 0, "{snapshot:?}");
+        format!("{} files, {} extents, 0 shared", after.files, after.extents)
+    };
+    eprintln!(
+        "p84 git and sqlite: repository {} files, {} extents, 0 shared after the capture; sqlite {sqlite}",
+        after.files, after.extents
     );
 }

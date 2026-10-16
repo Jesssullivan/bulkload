@@ -145,6 +145,82 @@ fn correct_publish_passes_under_every_durable_sync_pair() {
     }
 }
 
+/// create tmp, write, [`FsSync` on `first`], rename tmp -> data, `FsSync`
+/// on `second`: the batched group seal (S1, OI-1003-Q107), whose syncs name
+/// whichever node of the drive the group holds, not the files they cover.
+fn fs_sync_trace(first: Option<NodeId>, second: NodeId) -> Vec<Event> {
+    let mut events = vec![
+        Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"tmp".to_vec()),
+            node: TMP,
+            mode: 0o600,
+        },
+        write(TMP, NEW),
+    ];
+    if let Some(node) = first {
+        events.push(Event::Sync {
+            node,
+            kind: SyncKind::FsSync,
+        });
+    }
+    events.push(Event::Rename {
+        node: TMP,
+        from_dir: ROOT,
+        from: b"tmp".to_vec(),
+        to_dir: ROOT,
+        to: b"data".to_vec(),
+    });
+    events.push(Event::Sync {
+        node: second,
+        kind: SyncKind::FsSync,
+    });
+    events
+}
+
+#[test]
+fn a_file_system_sync_on_any_node_of_the_drive_seals_every_object() {
+    for scope in [BarrierScope::Object, BarrierScope::Device] {
+        let options = Options {
+            barrier_scope: scope,
+            ..Options::default()
+        };
+        let report = run(&fs_sync_trace(Some(LEDGER), KEEP_NODE), &options);
+        assert!(
+            report.passed(),
+            "syncfs before and after the rename must pass"
+        );
+        assert!(report.bounded.is_empty());
+    }
+}
+
+#[test]
+fn a_file_system_sync_only_after_the_rename_fails() {
+    let report = run(&fs_sync_trace(None, KEEP_NODE), &Options::default());
+    assert!(
+        !report.passed(),
+        "the rename can persist ahead of the data it names"
+    );
+    assert!(report
+        .violations
+        .iter()
+        .any(|violation| violation.message.contains("wrong bytes")));
+}
+
+#[test]
+fn a_file_system_sync_of_another_drive_makes_nothing_durable() {
+    const ELSEWHERE: NodeId = NodeId { dev: 2, ino: 9 };
+    let report = run(
+        &fs_sync_trace(Some(ELSEWHERE), ELSEWHERE),
+        &Options::default(),
+    );
+    assert!(!report.passed());
+    assert!(report
+        .violations
+        .iter()
+        .any(|violation| violation.message.contains("not durable")));
+}
+
 #[test]
 fn publish_without_the_file_sync_fails() {
     for dir in [SyncKind::Fsync, SyncKind::FullFlush] {
@@ -519,6 +595,7 @@ fn group_commit_trace(store: NodeId) -> Vec<Event> {
                 mode: 0o755,
             },
             CommitRecord::DirectoryComplete { key: b"d".to_vec() },
+            CommitRecord::DirectoryCleared { key: b"c".to_vec() },
             CommitRecord::RootSealed,
             CommitRecord::RefusedSeat { key: b"r".to_vec() },
         ],
@@ -1534,4 +1611,27 @@ fn a_file_the_exchange_displaced_survives_every_crash_state() {
         !unsealed.violations.is_empty(),
         "the unlink must not outlive the exchange back"
     );
+}
+
+/// `View::node_at` and `View::paths_of` (#217 review): the inode at a path,
+/// and every path naming an inode, as the directory-record proofs read them.
+#[test]
+fn a_view_finds_an_inode_by_path_and_its_paths() {
+    let root = NodeId { dev: 1, ino: 1 };
+    let file = NodeId { dev: 1, ino: 2 };
+    let image = Image::empty(root).with_file(b"data", file, b"bytes");
+    let report = check_view(&image, &[], &Options::default(), |view, _| {
+        if view.node_at(b"data") != Some(file) || view.node_at(b"") != Some(root) {
+            return Err("node_at".to_owned());
+        }
+        if view.node_at(b"missing").is_some() {
+            return Err("node_at missing".to_owned());
+        }
+        if view.paths_of(file) != [b"data".to_vec()] || !view.paths_of(root).is_empty() {
+            return Err("paths_of".to_owned());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(report.passed(), "{report:?}");
 }

@@ -22,6 +22,9 @@
 //!   `F_FULLFSYNC` on Darwin).
 //! - `flush_dir_barrier`: a group-commit directory seal (`F_BARRIERFSYNC` on
 //!   Darwin, `fsync` elsewhere).
+//! - `flush_fs`: a batched group's device seal, `syncfs` (Linux; S1,
+//!   OI-1003-Q107). It replaces a group's per-file and per-directory seals,
+//!   so, like them, it is not counted in `full_flushes_total`.
 //!
 //! Every file-backed bulkload `SQLite` store runs in WAL mode with
 //! `synchronous=FULL` and `fullfsync=ON` (`io::durable::configure_sqlite`
@@ -174,6 +177,12 @@ counters! {
     WireBytesSent => "wire_bytes_sent",
     WireFramesReceived => "wire_frames_received",
     WireBytesReceived => "wire_bytes_received",
+    // Chunk payload bytes a local `copy`'s destination took from its
+    // in-process source by hand-off instead of reading them from the socket
+    // (OI-1003-Q154 levers 1 and 2). The source hashed exactly these bytes,
+    // so they are not in `blake3_dest_wire_verify_bytes`: every received
+    // byte is in exactly one of the two. Always 0 for `pull` and `serve`.
+    WireHandedBytes => "wire_handed_bytes",
     // BLAKE3 bytes hashed, by purpose.
     HashCaptureChunk => "blake3_capture_chunk_bytes",
     HashWireVerify => "blake3_dest_wire_verify_bytes",
@@ -193,6 +202,13 @@ counters! {
     FlushDirNs => "flush_dir_ns",
     FlushDirBarrier => "flush_dir_barrier_count",
     FlushDirBarrierNs => "flush_dir_barrier_ns",
+    // A batched group seal: one `syncfs` per touched device (S1, Q107).
+    FlushFs => "flush_fs_count",
+    FlushFsNs => "flush_fs_ns",
+    // Write-back kicks of a staged file while its data still streams, one
+    // per 8 MiB placed (`sync_file_range(WRITE)`; S1, OI-1003-Q143 item
+    // 1a). Not a flush: nothing is durable by it.
+    WritebackKicks => "writeback_kicks",
     // Group commit (io::durable) and transport tuning.
     DurableGroups => "durable_groups",
     TransportTuned => "transport_buffers_raised",
@@ -204,6 +220,10 @@ counters! {
     SqliteRecordCapture => "sqlite_record_capture_commits",
     SqliteDirectoryPending => "sqlite_directory_pending_commits",
     SqliteDirectoryComplete => "sqlite_directory_complete_commits",
+    // Directory records cleared without completing their directory: a
+    // creation undone, a record of a swept temporary, a stale record
+    // (#217 review).
+    SqliteDirectoryCleared => "sqlite_directory_cleared_commits",
     // A superseding publish's record, written before its exchange, and a
     // record a crash left, settled by the next sweep (WP0(d), #187).
     SqliteSupersede => "sqlite_supersede_commits",
@@ -211,9 +231,18 @@ counters! {
     // remembered so a rerun refuses it without a source read (#187 review).
     SqliteRefusedOutput => "sqlite_refused_output_commits",
     SqliteCommitNs => "sqlite_commit_ns",
+    // New stores created directly in WAL mode from the template, with no
+    // rollback-journal switch (OI-1003-Q154 lever 3a); 0 under
+    // `BULKLOAD_STORE_WAL_TEMPLATE=0`, the lever's A/B arm.
+    StoreWalTemplates => "store_wal_templates",
     // Destination publication events.
     FilesMaterialized => "files_materialized",
     DirectoriesFinished => "directories_finished",
+    // Of those, directories completed in the session's last output group
+    // commit instead of a completion commit of their own (OI-1003-Q154
+    // lever 3, the SOTA study's lever 2); 0 under
+    // `BULKLOAD_DIRECTORY_FOLD=0`, the lever's A/B arm.
+    DirectoriesFolded => "directories_folded",
     // Source captures sent but never recorded: stamped within one timestamp
     // tick of their capture (#86).
     TransferRacyCaptures => "transfer_racy_captures",
@@ -542,6 +571,7 @@ impl Counters {
             Counter::SqliteRecordCapture,
             Counter::SqliteDirectoryPending,
             Counter::SqliteDirectoryComplete,
+            Counter::SqliteDirectoryCleared,
             Counter::SqliteSupersede,
             Counter::SqliteRefusedOutput,
         ])
