@@ -1021,7 +1021,10 @@ median (R-N57):
   in memory and hashed once, by the source (Wire v6, "Loopback hand-off").
   Whether "its full protocol over a local socket" (R-N57) covers that is the
   operator's to word; OI-1003-Q154 authorized the change. `BULKLOAD_LOOPBACK_HANDOFF=0` runs the
-  plain protocol for A/B. Gate (b) is unchanged: `pull` and `serve` never
+  plain protocol for A/B. `BULKLOAD_LOCAL_NEW_PATH_STREAM=1` adds the
+  delta lever: with the hand-off, a seat new to the destination is
+  streamed rather than asked for by manifest even when the destination
+  holds other outputs (Wire v6, "WantManifest"; off by default). Gate (b) is unchanged: `pull` and `serve` never
   hand anything over and the destination hashes every byte.
 - **(b) Cross-host:** a pull between two hosts beats rclone over sftp on the
   same corpus.
@@ -1192,7 +1195,45 @@ miss (#87).
   bytes. `BULKLOAD_LOOPBACK_HANDOFF=0` turns all of it off.
 - **WantManifest.** Chosen only when the destination could fill chunks
   itself: the output path already exists (adopt, supersede or refuse; see
-  Durability), or published outputs hold chunks (resume, incremental). The source sends `Manifest`, from
+  Durability), the sweep salvaged a temporary, or published outputs hold
+  chunks (resume, incremental). The last is cross-file dedup. With the
+  delta lever on (`BULKLOAD_LOCAL_NEW_PATH_STREAM=1`, OI-1003-Q154; off by
+  default, below), a local `copy` with the hand-off does not use it for a
+  seat new to both stores: no file at its path, no reuse row under its
+  key here, no capture of it in the source's ledger, and no temporary
+  salvaged in the session. Such an entry is answered `Send` there, so its
+  first byte is placed while the rest is still being hashed, not after
+  the whole file is read and hashed for a manifest. Both halves are in
+  one process, so a local fill would save no wire byte: it re-reads and
+  re-hashes destination bytes in place of the handed buffer, and with no
+  ledger row the source reads the seat once either way. The destination
+  reads the source's ledger directly (read-only, the store the source
+  half opened), so a seat the source captured for another destination
+  from the same source state keeps its manifest, which the source answers
+  from its ledger without a read; so does a seat whose reuse row is here
+  and whose output a third party removed (P79). A ledger the destination
+  cannot open, or a lookup that fails, keeps the manifest.
+  `transfer_new_paths_streamed` counts the streamed entries and
+  `transfer_manifests_asked` every `WantManifest`. `pull`, `serve` and
+  `receive`, and a `copy` with the hand-off off, keep the rule above, so
+  across hosts a new file whose chunks the destination holds still
+  crosses the wire as only the chunks it lacks. A file that appears at a
+  streamed seat's path during the session is refused at its publish, not
+  adopted, as into an empty destination; the next run asks for its
+  manifest and adopts it if its bytes verify, the source reading the seat
+  once more (R25 holds: no committed row vouched for it). The
+  lever is off by default because a new seat's handed bytes count in
+  `bytes_received`, which the tests hold to S3's inequality 2 on `copy`
+  (WP0(c)): an added copy of a carried file would count whole. With it on,
+  P18 and the P21 added-seat cases in `tests/s3_transfer_resume.rs`,
+  `w3_engine_properties` (W3's cross-file prefix fill) and
+  `a_lost_output_does_not_lose_reuse_of_its_chunks` (#59's older-holder
+  fallback) fail on that bound alone. Whether handed bytes are wire bytes
+  for that inequality is unruled. `just fault-harness` runs the crash,
+  power-loss and resume suites with the lever on too (`delta-lever`).
+  `BulkloadTransfer.tla` already lets `RecvEntry` choose `Send` for any
+  absent output, so the lever is inside the model (docs/slo.md, the
+  2026-10-16 amendment). The source sends `Manifest`, from
   its ledger without reading when the stat identity is recorded; the
   destination fills what it can from verified local chunks and asks for the
   rest by index (`NeedChunks`); the source sends only those, then `End`. A

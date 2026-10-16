@@ -2585,3 +2585,33 @@ fn q148_the_backup_code_crosses_the_wire_and_only_with_its_refusal() {
         }
     }
 }
+
+/// The delta lever (OI-1003-Q154 review) looks a database seat up under its
+/// snapshot key as well as its row key: a store's reuse row is kept under
+/// its snapshot key only, so a store whose output a third party removed is
+/// no new seat and keeps its manifest. A database new to the destination
+/// is streamed as a snapshot, and both arrive whole.
+#[test]
+fn the_delta_lever_finds_a_snapshot_seats_row_under_its_snapshot_key() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    build(&sqlite.source().join("kept.db"), Journal::Delete, 1024, 5);
+    std::fs::write(sqlite.source().join("plain"), noise(6, 9000)).unwrap();
+    let first = sqlite.snapshot();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    std::fs::remove_file(sqlite.destination().join("kept.db")).unwrap();
+    build(&sqlite.source().join("fresh.db"), Journal::Wal, 1024, 7);
+    let root = std::fs::canonicalize(sqlite.destination()).unwrap();
+    set_local_new_path_stream(&root, Some(true));
+    let (again, decided) = decisions(|| sqlite.run(SqliteMode::Snapshot));
+    set_local_new_path_stream(&root, None);
+    let again = again.unwrap();
+    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
+    assert_eq!(
+        decided,
+        (1, 1),
+        "kept.db asked by manifest, fresh.db streamed"
+    );
+    assert_eq!(published(&sqlite.destination().join("kept.db")).len(), 5);
+    assert_eq!(published(&sqlite.destination().join("fresh.db")).len(), 7);
+}

@@ -1257,6 +1257,118 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
   ref step left), T0 is reached, and four mutation rows bite
   (`docs/formal/README.md`, "#226").
 
+## Amendment 2026-10-16: the delta lever, opt-in pending a reading of S3 inequality 2 (OI-1003-Q154)
+
+A lever under OI-1003-Q154 (authorized S1 levers where R25 holds), built to
+OI-1003-Q155's quality and merged only on an independent review
+(OI-1003-Q173). It changes no number and no ruling, and it is **off by
+default**. Diagnosis: `docs/agent-notes/2026-10-16-delta-regression.md`
+(PR #234).
+
+- **What it does.** Since wire v5 (`c2f8b663`) the destination asks for a
+  manifest first for every entry it cannot reuse once its store holds any
+  output hint: any earlier non-empty output. So a new file copied into a
+  populated destination is read and hashed whole by the source before its
+  first byte is placed. With `BULKLOAD_LOCAL_NEW_PATH_STREAM=1`, a local
+  `copy` with the loopback hand-off answers `Send` for a seat new to both
+  stores: no file at its path, no reuse row under its key, no capture of
+  it in the source's ledger, and no temporary salvaged in the session
+  (`Inbound::wants_manifest`). It keeps `WantManifest` for an existing
+  path (adoption, the superseding publish's local fill, #187), for a seat
+  whose reuse row is here and whose output a third party removed (its
+  source ledger row still gives the manifest without a read: P79), for a
+  seat the source's ledger captured for another destination from the same
+  source state (one source fanned out: the same zero-read manifest; the
+  destination reads that ledger read-only, both halves being one
+  process), and whenever the sweep salvaged a temporary (a temporary's
+  name does not say which path it was staged for). A source ledger the
+  destination cannot read keeps the manifest. `pull`, `serve`, `receive`
+  and a `copy` with the hand-off off decide as before, lever or not.
+- **Why it is off by default: S3 inequality 2.** WP0(c)'s inequality 2
+  (wire content bytes ≤ the changed seats' chunks the destination holds no
+  verified copy of, OI-1003-Q18) is proven on `copy` with `bytes_received`
+  (`tests/s3_transfer_resume.rs`, P18 and P21 over added seats). With the
+  lever on, an added seat that copies or slices a carried file is streamed,
+  and its handed bytes count in `bytes_received` whole. Ten tests fail,
+  each on that bound alone (lane note): P18 and the P21 added-seat cases
+  in `tests/s3_transfer_resume.rs` (eight), `w3_engine_properties` in
+  `tests/w3_engine.rs` (W3's cross-file prefix fill, `bytes_received`
+  below the grown file's length), and the lib test
+  `a_lost_output_does_not_lose_reuse_of_its_chunks` (#59: when a chunk's
+  newest holder is gone an older one serves it). In a local `copy` with
+  the hand-off those bytes never cross the socket (only 64-byte headers
+  do), and the source reads the seat once either way, so whether handed
+  bytes are "wire content bytes" is a reading of inequality 2 that no
+  ruling gives. Until the operator rules it, the lever is for A/B only and
+  every ruled proof runs as before. If handed bytes are ruled not to be
+  wire bytes, turning the lever on by default is the default's change in
+  `local_new_path_stream` plus moving each of those clauses to an arm
+  where a new path still asks for its manifest: inequality 2's added-seat
+  clauses and W3's prefix fill to the transport arm (`serve` against
+  `receive`, which the harness already has, or the hand-off off), and
+  #59's older-holder fallback likewise, since on `copy` it would then run
+  only through a removed output's manifest.
+- **R25 and S3's other clauses hold with it on.** The source reads a new
+  seat exactly once either way (a manifest's chunks are kept and served
+  from memory). An unchanged rerun is answered `Reuse` before this decision
+  and reads 0 bytes. A changed seat has a file at its path and keeps its
+  manifest. A seat streamed by the lever has no capture in the source's
+  ledger under its key, checked at the decision, so the lever never turns
+  a ledger manifest into a read: not for this destination's own rows (a
+  source row follows `Held`, which follows the reuse row here) and not for
+  rows recorded for another destination from the same source state. One
+  residual, shared with an empty destination: a file a third party places
+  at a streamed seat's path during the session is refused at its publish
+  (`DESTINATION_OCCUPIED`, not remembered), not adopted; the next run asks
+  for that path's manifest and adopts the file if it verifies, the source
+  reading the seat once more across the two runs (`ReadOnce` holds per
+  session; no committed row vouched for those bytes, so
+  `R25_NoDurableReread` holds). Passing adoption to a streamed seat would
+  close it, but the snapshot path refuses an adopting stream
+  (`sqlite_snapshot`), so it is left as it is for an empty destination.
+- **Model.** `BulkloadTransfer.tla`'s `RecvEntry` already chooses freely
+  between `send` and `manifest` for an absent output. The lever narrows
+  that choice, so no step and no row changes. The rows that check the
+  choice under R25 were re-run (lane note). The model abstracts chunks, so
+  inequality 2 is not a model property either way.
+- **Proof on the code.** `tests/loopback_handoff.rs`, with the lever on for
+  the test's own destination: a new path in a populated local destination
+  is streamed (`transfer_manifests_asked` 0, `transfer_new_paths_streamed`
+  1 per seat, `source_ledger_miss_reads` 0, `read_dest_local_reuse_bytes`
+  0) and its unchanged rerun reads 0 bytes; the same assertion fails on the
+  code before (`source_ledger_miss_reads` 1). A removed output whose reuse
+  row is here is asked for by manifest and filled with 0 source bytes. A
+  seat the source's ledger captured for a second destination keeps its
+  manifest and is filled with 0 source bytes and 0 received, lever on or
+  off (on the first build, without the ledger check, it was read whole).
+  An existing path still asks for its manifest and is filled locally. The
+  default, the lever turned off, and the hand-off off each ask for a new
+  path's manifest as before (the default arm follows the variable, so the
+  suite passes with it exported). A cross-process session with the lever
+  on for its destination still asks for one, fills a duplicate file
+  entirely from the destination's own output, and hashes every received
+  byte. Lib tests with the lever on: a session that salvaged a temporary
+  asks for a new seat's manifest and fills it from the temporary (0
+  received), and a database whose output was removed is found under its
+  snapshot key (manifest) while a new database is streamed. Each of these
+  fails under the mutation it guards (lever reaching `pull`, salvage
+  skipped, snapshot key dropped, ledger check dropped). The crash,
+  power-loss and resume suites run in both hand-off arms with the lever
+  off, and again with it on (`just delta-lever`, in `just fault-harness`:
+  `loopback_handoff` first to prove the variable took, then
+  `fault_harness`, `power_loss`, `estate_converge`, `sqlite_carry` and
+  `resume-power-loss`; `s3_transfer_resume` and `w3_engine` are left out
+  for the bound above).
+- **Measured, informational** (mbp-13, not a sample, OI-1003-Q39): one new
+  33.5 MB file into a destination seeded with one 1 MiB output, 10 reps
+  per arm, ABBA, load1 0.0: lever on 107.6 ms median against off
+  153.4 ms, first data 0.9 ms against 51.5 ms, the same bytes read
+  (33,555,209) and identical output (lane note). The off arm sits above
+  the diagnosis's manifest arm (136.9 ms) on the same rig; read the
+  difference, not the levels. An informational series
+  on the bench comes before any gated sample (Q143); the diagnosis expects
+  about 0.89x rclone on the bench delta, at Q143's 0.90x margin.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

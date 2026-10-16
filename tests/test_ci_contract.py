@@ -270,6 +270,7 @@ PINNED_JUST_RECIPES = {
             "cd {{ root }} && {{ just_executable() }} io-partial-write-alone",
             "cd {{ root }} && {{ just_executable() }} resume-power-loss",
             "cd {{ root }} && {{ just_executable() }} handoff-off",
+            "cd {{ root }} && {{ just_executable() }} delta-lever",
         ),
     ),
     # The loopback hand-off's off arm (OI-1003-Q154 review): the copy-based
@@ -281,6 +282,17 @@ PINNED_JUST_RECIPES = {
             "cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine",
             "cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test s3_transfer_resume --test sqlite_carry",
             "cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 {{ just_executable() }} resume-power-loss",
+        ),
+    ),
+    # The delta lever's on arm (OI-1003-Q154 review): the copy-based crash,
+    # power-loss and resume suites again with a new path streamed, with
+    # `loopback_handoff` first to prove the variable reached the engine.
+    "delta-lever": (
+        "delta-lever:",
+        (
+            "cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test loopback_handoff",
+            "cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test estate_converge --test sqlite_carry",
+            "cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 {{ just_executable() }} resume-power-loss",
         ),
     ),
     "resume-power-loss": (
@@ -4011,6 +4023,15 @@ class CiContractTest(unittest.TestCase):
             justfile.replace(
                 "    cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine\n",
                 "    cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine\n",
+                1,
+            ),
+            # The delta lever's on arm dropped, or run with the lever off.
+            justfile.replace(
+                "    cd {{ root }} && {{ just_executable() }} delta-lever\n", "", 1
+            ),
+            justfile.replace(
+                "    cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test loopback_handoff\n",
+                "    cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test loopback_handoff\n",
                 1,
             ),
             # A dropped or narrowed test group, a name class that no longer

@@ -12,7 +12,9 @@
 //!   every chunk as a binary `Data` frame (header and payload with `writev`),
 //!   then [`Control::End`] with the `manifest_root`;
 //! - `WantManifest`: the destination may fill chunks locally (an existing
-//!   output to adopt, or chunks held by published outputs). The source sends
+//!   output to adopt, or chunks held by published outputs; with the delta
+//!   lever of OI-1003-Q154 on, a local `copy` with the hand-off streams a
+//!   seat new to the destination instead). The source sends
 //!   [`Control::Manifest`] (from its digest-only ledger without reading, when
 //!   the stat identity is recorded), the destination answers
 //!   [`Control::NeedChunks`] by index, and the source sends only those.
@@ -767,6 +769,55 @@ pub fn set_loopback_handoff(root: &Path, on: Option<bool>) {
     if let Some(on) = on {
         overrides.push((root.to_path_buf(), on));
     }
+}
+
+/// Turns on the delta lever of a local `copy` when `1` (OI-1003-Q154).
+///
+/// A seat new to a destination whose published outputs hold chunks is then
+/// streamed instead of asked for by manifest first, as `pull` asks for it
+/// (`Inbound::wants_manifest`). Unset, or anything else, keeps it off.
+///
+/// Off by default: with it on, a new seat's bytes are handed over whole in
+/// place of a local fill, so `bytes_received` no longer meets S3's
+/// inequality 2 (WP0(c), OI-1003-Q18) for added seats as
+/// `tests/s3_transfer_resume.rs` proves it on `copy`. Whether handed bytes
+/// are wire bytes there is the operator's to rule (docs/slo.md, the
+/// 2026-10-16 amendment); until then the lever is for the bench's A/B. It
+/// acts only with the loopback hand-off ([`LOOPBACK_HANDOFF_ENV`]): with
+/// the hand-off off, a `copy` decides every entry as `pull` does. Either
+/// way the source reads each seat at most once and every byte placed is
+/// verified (handed chunks by the source's own digest).
+pub const LOCAL_NEW_PATH_STREAM_ENV: &str = "BULKLOAD_LOCAL_NEW_PATH_STREAM";
+
+/// The delta lever by canonical destination root, for tests that compare
+/// both arms in one process.
+static LOCAL_NEW_PATH_STREAM_OVERRIDE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+
+/// Run `copy`s into the canonical destination `root` with the delta lever
+/// on or off (`None`: the default again). Test and bench hook.
+#[doc(hidden)]
+pub fn set_local_new_path_stream(root: &Path, on: Option<bool>) {
+    let mut overrides = LOCAL_NEW_PATH_STREAM_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(on) = on {
+        overrides.push((root.to_path_buf(), on));
+    }
+}
+
+/// Whether a `copy` with the hand-off into the canonical destination
+/// `root` streams seats new to it: off, unless [`LOCAL_NEW_PATH_STREAM_ENV`]
+/// is `1` or a test turned it on for `root`.
+fn local_new_path_stream(root: &Path) -> bool {
+    let found = LOCAL_NEW_PATH_STREAM_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, on)| *on);
+    found
+        .unwrap_or_else(|| std::env::var(LOCAL_NEW_PATH_STREAM_ENV).is_ok_and(|value| value == "1"))
 }
 
 /// Raise one transfer stream's kernel buffers, best effort. A stream that
@@ -2649,6 +2700,14 @@ fn ledger_read<T>(mode: LedgerSync, read: Result<Option<T>>) -> Result<Option<T>
     }
 }
 
+/// Whether a source ledger row's manifest can be offered for `row` without
+/// a read: it covers exactly the row's size within the chunk bound. The
+/// source offers it ([`manifest_capture`]), and the delta lever keeps such
+/// a seat on its manifest (`Inbound::wants_manifest`).
+fn ledger_manifest_fits(manifest: &Manifest, row: &RowSchema) -> bool {
+    manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS
+}
+
 /// One entry's manifest: from the ledger when this exact stat identity is
 /// recorded (no source read), otherwise from one read of the file, whose
 /// chunks are all kept in memory for the requests that follow.
@@ -2671,7 +2730,7 @@ fn manifest_capture(
     // A database seat is never recorded, so a ledger row names a file that
     // was carried raw under this exact identity.
     if let Some(manifest) = ledger_read(work.ledger, store.capture(&key))? {
-        if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
+        if ledger_manifest_fits(&manifest, row) {
             return Ok(Offered::Offer((None, manifest, None, false)));
         }
     }
@@ -4399,6 +4458,64 @@ struct Filling {
     outstanding: usize,
 }
 
+/// How a session asks for a new path: a regular entry with no file at its
+/// path, in a session that has salvaged no temporary
+/// ([`Inbound::wants_manifest`]). Decided once, at the session's start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NewPath {
+    /// No published output holds a chunk: nothing here could fill it, so
+    /// `Send`.
+    Stream,
+    /// Published outputs hold chunks: `WantManifest`, to fill it across
+    /// files (`pull`, `receive`, and `copy` with the hand-off off or without
+    /// the delta lever, its default).
+    Manifest,
+    /// Published outputs hold chunks, but a local `copy` with the hand-off
+    /// streams a seat this store holds no reuse row for and the source's
+    /// ledger holds no capture of: `Send` (the delta lever, OI-1003-Q154;
+    /// [`LOCAL_NEW_PATH_STREAM_ENV`]). A seat whose row is here, its output
+    /// removed since, or whose capture the source recorded for another
+    /// destination, still asks for its manifest.
+    StreamLocal,
+}
+
+/// Count one `WantManifest` (`transfer_manifests_asked`) or one new path the
+/// delta lever streamed (`transfer_new_paths_streamed`), and, in lib tests,
+/// in this thread's `NEW_PATH_DECISIONS` too.
+fn count_new_path(counter: Counter) {
+    counters::bump(counter);
+    #[cfg(test)]
+    NEW_PATH_DECISIONS.with(|decided| {
+        let (asked, streamed) = decided.get();
+        decided.set(if counter == Counter::TransferManifestsAsked {
+            (asked + 1, streamed)
+        } else {
+            (asked, streamed + 1)
+        });
+    });
+}
+
+/// The source half's ledger, read-only, as the delta lever consults it
+/// (`Inbound::wants_manifest`). Only in a local `copy` with the hand-off and
+/// the lever on: both halves are this process, and `source_state` names the
+/// store the source half opened before it sent `Start`.
+struct SourceLedger {
+    store: Store,
+    /// The source's authority from `Start`, which its ledger keys are made
+    /// with ([`row_key`]).
+    authority: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's entries asked for by manifest first, and new paths
+    /// the delta lever streamed, for lib tests: the process counters
+    /// (`transfer_manifests_asked`, `transfer_new_paths_streamed`) are
+    /// shared with the tests running beside them. A `copy` decides on its
+    /// caller's thread.
+    static NEW_PATH_DECISIONS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
 /// An entry the destination expects content for.
 enum Incoming {
     Streaming(Streaming),
@@ -4426,7 +4543,10 @@ struct Inbound<'a, W> {
     stats: TransferStats,
     incoming: HashMap<u64, Incoming>,
     open: usize,
-    fill_locally: bool,
+    /// How a new path is asked for ([`Inbound::wants_manifest`]).
+    new_path: NewPath,
+    /// The source's ledger, for [`NewPath::StreamLocal`] only.
+    source_ledger: Option<SourceLedger>,
     salvage: Salvage,
     /// Salvaged temporaries each entry staged chunks from, by relative path
     /// (#124): kept past the session only if that entry is refused.
@@ -4642,11 +4762,33 @@ fn receive_session<R: Read, W: Write>(
     // The committer holds the exclusive publisher, so no temporary of this
     // store is in flight while the root is swept.
     target.sweep_root(&store)?;
-    let fill_locally = store.has_output_hints()?;
+    let mut new_path = match (
+        store.has_output_hints()?,
+        hand.is_some() && local_new_path_stream(target.path()),
+    ) {
+        (false, _) => NewPath::Stream,
+        (true, false) => NewPath::Manifest,
+        (true, true) => NewPath::StreamLocal,
+    };
     let Wire::Frame(Frame::Control(Control::Start { authority })) =
         read_wire(input, hand.as_ref())?
     else {
         return Err(BulkloadRefusal::ProtocolStateViolation);
+    };
+    // The delta lever reads the source's ledger, which the source half
+    // opened before `Start`. A ledger this side cannot open leaves the
+    // session on the store-wide rule, as with the lever off.
+    let source_ledger = if new_path == NewPath::StreamLocal {
+        let opened = Store::open_reader(source_state).ok();
+        if opened.is_none() {
+            new_path = NewPath::Manifest;
+        }
+        opened.map(|ledger| SourceLedger {
+            store: ledger,
+            authority: authority.clone(),
+        })
+    } else {
+        None
     };
     let target_meta = std::fs::metadata(target.path()).refuse_at("transfer::receive")?;
     let output_authority = postcard::to_stdvec(&(
@@ -4695,7 +4837,8 @@ fn receive_session<R: Read, W: Write>(
             },
             incoming: HashMap::new(),
             open: 0,
-            fill_locally,
+            new_path,
+            source_ledger,
             salvage: Salvage::default(),
             salvage_staged: HashMap::new(),
             pending_held: HashMap::new(),
@@ -5091,16 +5234,16 @@ impl<W: Write> Inbound<'_, W> {
                 if snapshot_mode && self.target.sqlite_sidecars_present(&row.rel_path)? {
                     return Err(BulkloadRefusal::DestinationOccupied);
                 }
-                // A manifest first only when something here could fill it:
-                // an existing output to adopt, or chunks held by published
-                // outputs. Otherwise the source reads the file exactly once.
-                Ok(
-                    if identity.is_some() || self.fill_locally || self.target.salvaged() > 0 {
-                        Decision::WantManifest
-                    } else {
-                        Decision::Send
-                    },
-                )
+                let keys = std::iter::once(key.as_slice()).chain(
+                    snapshot
+                        .as_ref()
+                        .map(|(snapshot_key, _)| snapshot_key.as_slice()),
+                );
+                Ok(if self.wants_manifest(&row, identity.is_some(), keys)? {
+                    Decision::WantManifest
+                } else {
+                    Decision::Send
+                })
             }),
             _ => Err(BulkloadRefusal::FieldDomainViolation),
         };
@@ -5135,6 +5278,7 @@ impl<W: Write> Inbound<'_, W> {
                 );
             }
             Decision::WantManifest => {
+                count_new_path(Counter::TransferManifestsAsked);
                 self.incoming
                     .insert(entry, Incoming::AwaitManifest(Seat::file(row, key)?));
             }
@@ -5143,6 +5287,92 @@ impl<W: Write> Inbound<'_, W> {
         write_control(self.output, &Control::Decide { entry, decision })?;
         fault_point!(ReceiveAfterDecide);
         Ok(())
+    }
+
+    /// Whether a regular entry that is not reused or refused is asked for by
+    /// manifest first (`WantManifest`) rather than streamed (`Send`).
+    /// `occupied`: a file exists at its path; `keys`: the entry's row key,
+    /// and its snapshot key in `snapshot` mode.
+    ///
+    /// A manifest first only when something here could fill it: an
+    /// existing output to adopt or supersede, a salvaged temporary, or
+    /// chunks held by published outputs. Otherwise the source reads the
+    /// file exactly once and streams it.
+    ///
+    /// The delta lever (OI-1003-Q154; off unless
+    /// [`LOCAL_NEW_PATH_STREAM_ENV`] is `1`): in a local `copy` with the
+    /// hand-off, a seat new to this destination is streamed even when
+    /// published outputs hold chunks: no file at its path, no temporary
+    /// salvaged in this session, no reuse row under its key here, and no
+    /// capture of it in the source's ledger. Both halves are in this
+    /// process, so a local fill saves no wire byte: it re-reads and
+    /// re-hashes destination bytes in place of the source's handed buffer.
+    /// Such a seat has no ledger row to give its manifest, so a manifest
+    /// first would make the source read and hash the whole file before the
+    /// first byte is placed; streamed, it reads it once, as it is placed.
+    ///
+    /// Every other entry keeps the manifest: an occupied path (adoption,
+    /// the superseding publish's local fill), any salvage (a temporary's
+    /// name does not say which path it was staged for), a seat whose reuse
+    /// row is here but whose output a third party removed (P79), and a
+    /// seat the source's ledger holds a capture of, recorded when it was
+    /// carried to another destination from the same source state (one
+    /// source fanned out). For the last two the source gives the manifest
+    /// from its ledger without a read, and this destination's outputs may
+    /// fill it. A source ledger this side cannot read keeps the manifest
+    /// too: the lever then decides as the lever off does. `pull`,
+    /// `receive`, and a `copy` with the hand-off off keep the store-wide
+    /// rule, so a new path is filled across files and only the chunks
+    /// nothing here holds cross the wire. The lever's cost is that
+    /// cross-file fill for a seat new to both stores in a local `copy`:
+    /// its bytes are handed over whole, which S3's inequality 2 as proven
+    /// on `copy` counts as received. `BulkloadTransfer.tla`'s `RecvEntry`
+    /// chooses freely between `Send` and `WantManifest` for an absent
+    /// output, so the lever is inside the model.
+    ///
+    /// # Errors
+    /// Refuses database failures of this side's store.
+    fn wants_manifest<'k>(
+        &self,
+        row: &RowSchema,
+        occupied: bool,
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<bool> {
+        if occupied || self.target.salvaged() > 0 {
+            return Ok(true);
+        }
+        match self.new_path {
+            NewPath::Stream => Ok(false),
+            NewPath::Manifest => Ok(true),
+            NewPath::StreamLocal => {
+                for key in keys {
+                    if self.store.holds_output_row(key)? {
+                        return Ok(true);
+                    }
+                }
+                if self.source_ledger_holds(row) {
+                    return Ok(true);
+                }
+                count_new_path(Counter::TransferNewPathsStreamed);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Whether the source's ledger holds a capture of `row` it would offer
+    /// as the manifest without a read ([`ledger_manifest_fits`]). A ledger
+    /// read that fails counts as holding it: the entry then keeps the
+    /// manifest the lever off asks for. A database seat in `snapshot` mode
+    /// is never recorded there, so it is never held.
+    fn source_ledger_holds(&self, row: &RowSchema) -> bool {
+        let Some(ledger) = &self.source_ledger else {
+            return true;
+        };
+        row_key(&ledger.authority, row)
+            .and_then(|key| ledger.store.capture(&key))
+            .map_or(true, |capture| {
+                capture.is_some_and(|manifest| ledger_manifest_fits(&manifest, row))
+            })
     }
 
     /// A database at `rel_path` is held here as a snapshot: published from

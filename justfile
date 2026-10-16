@@ -167,7 +167,8 @@ io-partial-write-alone:
 # N1). Both features are inert until a test arms them: a fault point fires
 # only under `BULKLOAD_FAULT`, and a traced call records only while a
 # recorder is attached. Then the same suites in the hand-off's off arm
-# (`handoff-off`). CI runs this as the separate `fault-harness`
+# (`handoff-off`) and in the delta lever's on arm (`delta-lever`). CI runs
+# this as the separate `fault-harness`
 # terminal gate, in parallel with the source gate (R-N122). The harness
 # builds go to their own target dir, so `target/debug/bulkload-agent` is
 # never replaced by a fault-enabled binary. The feature clippy pass stays in
@@ -180,6 +181,7 @@ fault-harness:
     cd {{ root }} && {{ just_executable() }} io-partial-write-alone
     cd {{ root }} && {{ just_executable() }} resume-power-loss
     cd {{ root }} && {{ just_executable() }} handoff-off
+    cd {{ root }} && {{ just_executable() }} delta-lever
 
 # The loopback hand-off's off arm (OI-1003-Q154 review). A local `copy`
 # takes the hand-off by default (levers 1 and 2: handed chunks, not
@@ -196,6 +198,23 @@ handoff-off:
     cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine
     cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test s3_transfer_resume --test sqlite_carry
     cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 {{ just_executable() }} resume-power-loss
+
+# The delta lever's on arm (OI-1003-Q154 review). The lever is off by
+# default, so every copy-based crash, power-loss and resume suite decides a
+# new path in a populated destination manifest-first only. This arm runs
+# them again with `BULKLOAD_LOCAL_NEW_PATH_STREAM=1`: such a seat streamed,
+# unless a reuse row, a salvaged temporary or the source's ledger keeps it
+# on its manifest. Crash children inherit the variable. `loopback_handoff`
+# runs first in the same environment and proves the arm took: its default
+# arm asserts the new path streamed when the variable is `1`.
+# `s3_transfer_resume` and `w3_engine` are left out: with the lever on they
+# fail only S3's inequality 2 as they prove it on `copy` (handed bytes
+# counted as received), the operator's question in the 2026-10-16
+# amendment of docs/slo.md.
+delta-lever:
+    cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test loopback_handoff
+    cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test estate_converge --test sqlite_carry
+    cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 {{ just_executable() }} resume-power-loss
 
 # Resume power-loss proofs, lib tests that need `io-trace`, run in the fault
 # gate's feature-union build (OI-1003-Q81): the directory
