@@ -16,6 +16,7 @@ fn side(kind: Kind, blob: char) -> Side {
         },
         blob: (kind != Kind::Directory).then(|| blob.to_string().repeat(40)),
         link: (kind == Kind::Symlink).then(|| vec![b'x']),
+        prefix: Vec::new(),
     }
 }
 

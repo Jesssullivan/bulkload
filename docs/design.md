@@ -649,6 +649,140 @@ that note) before merge.**
   - `estate-diff` reports all of this beforehand, read-only.
   - Not built: `--protect` (land the source's state beside a destination
     adopt refuses).
+- **Hand-off block (TIN-6569, OI-1003-Q183, 2026-10-16;
+  `docs/agent-notes/2026-10-16-estate-handoff-design.md`).**
+  `estate-handoff PLAN CORPUS PRIVATE_STATE SOURCE` writes a dated,
+  delimited block at byte 0 of `AGENTS.md` and `CLAUDE.md` in each landed
+  workspace, of an existing `AGENTS.override.md` (Codex reads it instead of
+  `AGENTS.md`), and of an existing `README.md` only with `--readme` (neither
+  is ever created). The block names this landing, its source path on SOURCE and a
+  live sibling (`--sibling LANDED_PREFIX=LIVE_PREFIX`) by absolute path;
+  the capture, landing and build; each worktree of the repository at
+  capture and now; `estate-diff`'s ref classes against the landed capture,
+  destination-only worktrees and recorded refusals; and the instruction to
+  converge and consolidate with the user before any other work, with the
+  exact `estate-diff`, `--check` and `--clear` commands.
+  - **Owned by a record, never by inference.** The block is recorded in
+    `handoff.landed` beside `workspace.landed` (its length and blake3),
+    with `handoff.intent` durable before any target is written. Each
+    target goes through a temporary, fsync, `RENAME_EXCHANGE` and a
+    check of the displaced file against the print read (a created file
+    by a no-replace rename); a writer that raced it is put back and the
+    run refuses. A rerun of either verb settles a crash forward: a
+    pending render's record is made to name exactly the blocks in place,
+    and a pending clear is finished, never undone (the H step included).
+  - **Owned by identity.** The BEGIN line names the landing it was
+    rendered for (`for=`, a digest of the destination host, the
+    workspace path and SOURCE). A block that names another landing came
+    with the source's bytes (a re-carried, handed-off tree), and so did a
+    block of this landing's identity that the target's landed blob itself
+    starts with (a round trip: carried back to the source and landed
+    again at the same path, after the record is gone or while it stands,
+    and whatever the user has written below it since; re-review 3 of
+    2026-10-16): it is content (OI-1003-Q185, nothing is dropped from a
+    carry), kept byte for byte below this landing's block, named in it as
+    carried, and cleared only by the opt-in `--clear --clear-carried`
+    (below). Any other block of this landing's identity that its record
+    does not name (edited inside, cut, or its record lost) is never
+    presented as carried: the hand-off refuses `HANDOFF_BLOCK_MODIFIED`. A block a
+    person removed by hand (retired in the record with its digest) and
+    then put back byte for byte, by an editor's undo or a `git stash
+    pop`, is this landing's again: converge accepts it, the next render
+    takes it back into the record (`restored`) and renders it current,
+    and `--clear` removes it.
+  - **Converge keeps an intact block.** A landed seat holds landed
+    content when its bytes are the landed blob, or a recorded block
+    followed by it (`holds`, through `landed_sides`). An edit inside the
+    block or below it is the user's: converge refuses
+    `GIT_DESTINATION_MODIFIED` as for any edit. The record's print of a
+    target lets converge skip the read only when it is out of the racy
+    window and its `base` is the landed blob; every write of that print
+    (a rerun over a kept block, a settle, a re-dating) checks the bytes
+    under the block against the landed blob again first, so it never
+    vouches for an edit below the block. A file the hand-off created is
+    lifted (removed, when it is exactly its block) before the source adds
+    the same path; it stays `created` when a later render replaces its
+    block, so the lift and `--clear` still remove it.
+  - **The H step.** After the last level of an `estate-apply`, each
+    workspace of a repository the run changed that holds a record (or a
+    pending intent) has its block re-rendered from the estate as it now
+    stands, under the record's options; a refused item's own workspace is
+    left alone. Its result is a line of its own (`item=<id>
+    handoff=written|unchanged|<CODE>`), never an item's outcome.
+  - **Removal** is `estate-handoff --clear`, a recorded step that restores
+    the bytes and `git status` exactly. Carried blocks stay hands-off by
+    default; `--clear --clear-carried` (OI-1003-Q190, only with `--clear`)
+    also removes the carried blocks at the head of a target's landed
+    content, under this landing's block or alone, by the same intent,
+    temporary, exchange with the displaced file checked, and a record,
+    `handoff.stripped`, which outlives `handoff.landed`: converge and
+    `estate-diff` accept the landed blob without those bytes (alone or
+    under a later block) while that blob stands, and the landing's objects
+    still hold them. Above content that is not the landed blob (a user's
+    edit) a carried block is kept (`carried-kept`). A crashed clear that
+    the next run finishes records each removal whose target no longer
+    starts with the removed blocks, a user's later edit included. A
+    converge that lands a new blob of the target lands what the source
+    has, carried block included.
+  - **Commit detection** (`--check`, read-only; OI-1003-Q191): a token
+    line is one holding the `BULKLOAD-HANDOFF-DO-NOT-COMMIT` token that the
+    source's history (the commits the carried capture, `refs/carry/`,
+    reaches) never added; every BEGIN line names its block's id and
+    landing, so a block of this landing's always has one. `staged` when a
+    target's index blob holds a token line that its HEAD blob lacks;
+    `committed` when a commit that the carried capture does not reach, in
+    the history of any branch, tag, remote-tracking ref, stash entry or a
+    detached HEAD, adds one (a block committed and removed again is still
+    published by a push; the block says to stash nothing that holds it).
+    Both exit `HANDOFF_MARKER_COMMITTED`. A block the source committed,
+    also when cherry-picked or rebased here, is reported once per
+    workspace as information (`"source_history":true`), never as
+    committed. Every name
+    a hand-off may write (`AGENTS.md`, `CLAUDE.md`, `AGENTS.override.md`,
+    `README.md`) is read, whether or not it is a target now. No hook is
+    installed.
+  - **Open rows and `ready`.** Diverged and source-ahead refs, a live
+    sibling whose HEAD the landing does not hold (on a branch or in its
+    HEAD's history; a sibling strictly ahead is open), destination-only
+    worktrees whose HEAD no other
+    branch holds, recorded refusals, and a newer capture not applied.
+    A destination commit, a dest-ahead ref or a seat edited since landing
+    is consolidation, not an open row, so `ready` is reachable by
+    consolidating. `ready` also needs a clean working tree in the live
+    sibling and in every destination-only worktree (OI-1003-Q189): a
+    read-only `git status` (`--no-optional-locks`, untracked files
+    counted, ignored ones not) of each, on every run, with every filter
+    driver the checkout configures switched off (no clean filter or
+    long-running process such as git-lfs runs there, and a required one
+    cannot fail the read; a filtered file whose index stat is stale reads
+    as modified until the checkout's own `git status` refreshes it); one
+    that lists an entry or cannot be read is an open row.
+  - **Options persist.** A rerun, the H step and the `--check` a block
+    prints keep the `--sibling` and `--readme` the record was rendered
+    with unless they are given again.
+  - **Always written (OI-1003-Q188).** The privacy guard is removed ("an
+    erroneous overreach; such a block is irrelevant to bulkload"): the
+    block is written into every landed workspace whatever its remotes,
+    and no remote URL is read for it, rendered or printed. Absolute paths
+    and host names are written only into the targets, `.git/bulkload/`
+    and PRIVATE_STATE, and printed on stdout (the rows, and `--dry-run`'s
+    blocks); commit detection reports a block committed here.
+  - **Typed refusals,** each with nothing written: `HANDOFF_NOT_LANDED`,
+    `HANDOFF_TARGET_UNSUPPORTED` (a symlink other
+    than `CLAUDE.md -> AGENTS.md` in the same worktree, which is covered by
+    `AGENTS.md`'s block, or any other non-regular target),
+    `HANDOFF_BLOCK_MODIFIED` (a block of this landing's identity that is
+    not the record's and that the landed blob does not start with: edited
+    inside, cut, or its record lost), and `HANDOFF_MARKER_COMMITTED`.
+  - **S3.** Rendering is a pure function of metadata and an `as_of`
+    instant kept while its inputs digest holds. An unchanged rerun reads 0
+    destination bytes and writes nothing once a rerun has re-dated a
+    record whose prints were racy, as Git re-dates a racily clean index.
+  - Not built: the estate-wide `INDEX.md` under PRIVATE_STATE, a
+    `handoff` field in `estate-diff` rows and the opt-in `--commit-guard`
+    hook. A capture never strips a block (OI-1003-Q185: nothing is
+    excluded from a carry); the next landing's identity check handles a
+    carried one.
 - One plan lands a main and its linked worktrees: an item whose repository
   is a planned standalone workspace applies a level after it, and a
   standalone item's plan base is imported into its stage. A first linked

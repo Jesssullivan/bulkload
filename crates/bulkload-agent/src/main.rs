@@ -92,6 +92,44 @@ SUBCOMMANDS:
                 plus worktrees of planned repositories no item plans and, with
                 --scan, Git directories under DIR in no planned family
                 (dest-only). One bulkload.estate-diff.v1 JSON line per row
+    estate-handoff [--check | --clear [--clear-carried] | --dry-run] [--item ID]...
+                [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
+                [--readme] [--renew] [--as-of NS] PLAN CORPUS PRIVATE_STATE SOURCE
+                TIN-6569, OI-1003-Q183: write a dated hand-off block at byte 0 of
+                AGENTS.md and CLAUDE.md in each landed workspace (absolute paths,
+                capture and landing facts, estate-diff's ref classes, the commands
+                to converge and consolidate before any other work), recorded in
+                its own ledger beside workspace.landed so estate-apply keeps an
+                intact block instead of refusing the seat (and re-renders it
+                after a converge). A missing target is
+                created untracked; an existing AGENTS.override.md is prefixed too;
+                README.md only with --readme; neither is ever created. The block
+                is written whatever the repository's remotes (OI-1003-Q188); no
+                URL is read for it or printed. A symlink other than one target
+                to another refuses HANDOFF_TARGET_UNSUPPORTED; an edited block of
+                this landing's HANDOFF_BLOCK_MODIFIED; an unlanded item
+                HANDOFF_NOT_LANDED; all with nothing written. A block another
+                landing rendered, or one of this landing's that the target's
+                landed blob itself starts with (a round trip; each carried with
+                the source's bytes, whatever is written below it since) is
+                content: kept below this one, never cleared unless --clear
+                --clear-carried asks (OI-1003-Q190: a recorded edit of landed
+                content that converge accepts); a block of this landing's that
+                its record does not name and the landed blob does not start
+                with is an edited block. --check is read-only (state, open
+                rows, ready: the commit rules and a clean working tree, read
+                with no filter driver run, in the live sibling and in each
+                destination-only worktree) and exits HANDOFF_MARKER_COMMITTED
+                when a token line the source's history never added is staged
+                or added by a commit the carried capture does not reach (any
+                branch, tag, remote-tracking ref, stash entry or HEAD; a token
+                already in the source's history is reported as
+                source_history, OI-1003-Q191); --clear restores the bytes and
+                finishes a crashed clear; --dry-run prints the blocks. A rerun
+                keeps the options the record was rendered with unless they are
+                given again; an unchanged rerun reads and writes nothing. One
+                JSON line per workspace (schema bulkload.estate-handoff.v1, the
+                verb's own name)
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
@@ -419,7 +457,7 @@ fn main() -> ExitCode {
         }
         Some(
             name @ ("estate-add" | "estate-add-batch" | "estate-show" | "estate-capture"
-            | "estate-apply" | "estate-diff"),
+            | "estate-apply" | "estate-diff" | "estate-handoff"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
@@ -1123,17 +1161,25 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                 .get(3)
                 .and_then(|arg| arg.to_str())
                 .ok_or(BulkloadRefusal::FieldDomainViolation)?;
-            estate::apply_with(
+            estate::apply_reporting(
                 path(0)?,
                 path(1)?,
                 path(2)?,
                 source,
-                jobs()?,
-                &estate::ApplyOptions {
-                    adopt: options.adopt,
-                    activate_origin: options.activate_origin,
-                },
+                (
+                    jobs()?,
+                    &estate::ApplyOptions {
+                        adopt: options.adopt,
+                        activate_origin: options.activate_origin,
+                    },
+                ),
                 &receipt,
+                // TIN-6569: the H step's line, after every item's receipt.
+                &mut |line| {
+                    let mut output = std::io::stdout().lock();
+                    writeln!(output, "{line}").refuse_at("main::estate_command")?;
+                    output.flush().refuse_at("main::estate_command")
+                },
             )
         }
         "estate-diff" => {
@@ -1162,8 +1208,120 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             .map(drop)?;
             output.flush().refuse_at("main::estate_command")
         }
+        "estate-handoff" => {
+            let (options, rest) = handoff_options(args)?;
+            if rest.len() != 4 {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            }
+            let path = |i: usize| -> Result<&Path> {
+                rest.get(i)
+                    .map(Path::new)
+                    .ok_or(BulkloadRefusal::RequiredFieldMissing)
+            };
+            let source = rest
+                .get(3)
+                .and_then(|arg| arg.to_str())
+                .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+            let mut output = std::io::stdout().lock();
+            let outcome = estate::handoff(
+                path(0)?,
+                path(1)?,
+                path(2)?,
+                source,
+                &options,
+                &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
+            );
+            output.flush().refuse_at("main::estate_command")?;
+            outcome.map(drop)
+        }
         _ => Err(BulkloadRefusal::RequiredFieldMissing),
     }
+}
+
+/// `estate-handoff`'s options, before its positional arguments
+/// (TIN-6569, OI-1003-Q183).
+fn handoff_options(
+    args: &[std::ffi::OsString],
+) -> Result<(
+    bulkload_agent::estate::HandoffOptions,
+    &[std::ffi::OsString],
+)> {
+    let mut options = bulkload_agent::estate::HandoffOptions::default();
+    let mut at = 0;
+    let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        let flag = |set: &mut bool| {
+            if *set {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            *set = true;
+            Ok(())
+        };
+        let mut mode = |to: bulkload_agent::estate::HandoffMode| {
+            if options.mode != bulkload_agent::estate::HandoffMode::Render {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            options.mode = to;
+            Ok(())
+        };
+        match arg {
+            "--check" => mode(bulkload_agent::estate::HandoffMode::Check)?,
+            "--clear" => mode(bulkload_agent::estate::HandoffMode::Clear)?,
+            "--dry-run" => mode(bulkload_agent::estate::HandoffMode::DryRun)?,
+            "--renew" => flag(&mut options.renew)?,
+            "--readme" => flag(&mut options.readme)?,
+            "--clear-carried" => flag(&mut options.clear_carried)?,
+            "--item" => {
+                options.items.push(
+                    value(at + 1)?
+                        .to_str()
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                at += 1;
+            }
+            "--workspace" => {
+                options.workspaces.push(PathBuf::from(value(at + 1)?));
+                at += 1;
+            }
+            "--sibling" => {
+                let pair = value(at + 1)?;
+                let (landed, live) = pair
+                    .as_encoded_bytes()
+                    .iter()
+                    .position(|byte| *byte == b'=')
+                    .map(|split| {
+                        let bytes = pair.as_encoded_bytes();
+                        (
+                            bytes.get(..split).unwrap_or_default(),
+                            bytes.get(split + 1..).unwrap_or_default(),
+                        )
+                    })
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                let path = |bytes: &[u8]| {
+                    PathBuf::from(
+                        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes),
+                    )
+                };
+                options.siblings.push((path(landed), path(live)));
+                at += 1;
+            }
+            "--as-of" if options.as_of.is_none() => {
+                options.as_of = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .and_then(|ns| ns.parse::<i128>().ok())
+                        .filter(|ns| *ns >= 0)
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+                );
+                at += 1;
+            }
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+        at += 1;
+    }
+    Ok((options, args.get(at..).unwrap_or_default()))
 }
 
 /// The options `estate-apply` and `estate-diff` take before their
