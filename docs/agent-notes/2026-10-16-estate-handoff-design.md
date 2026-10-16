@@ -9,7 +9,8 @@ commit, on main `5beb031`).
 records what differs from the design below and why; section 18 is the
 review of 2026-10-16 against `9ec8d36` and what changed for each
 finding; section 19 is the two re-reviews against `7c5407f` and the
-operator's rulings OI-1003-Q188 to Q191). Sections 0 to 16 are the
+operator's rulings OI-1003-Q188 to Q191; section 20 is re-review 3
+against `2b18a03`). Sections 0 to 16 are the
 design as written before the build; code citations there are to
 `3fe1f07`. Where a later section contradicts an earlier one, the later
 one is current.
@@ -1472,10 +1473,141 @@ amendment keeps it). `just check-fast` was not run here (coordinator).
    owner; the code's behaviour was not checked in this lane.
 6. The refuters' own lists (18.6.6) and a re-review of this section.
 
+## 20. Re-review 3 (against `2b18a03`) and its fixes
+
+Rulings: OI-1003-Q183, Q185 (nothing is dropped from a carry), Q188, Q189
+(ready = commits and clean trees, read-only status), Q190 (the opt-in
+`--clear-carried`, recorded), Q191 (only new commits are flagged; the
+source's history is information), Q173, TIN-6569, R-N13. The reviewer's
+probes (`/dev/shm/handoff-rereview3`, scratch: `tests/estate_handoff.rs`
+`rr3_*`, fault rows `rr3_*`, logs `rr3_*.log`) were ported into the suite
+as rows that failed on `2b18a03` first (20.2), then fixed. None was
+rejected.
+
+### 20.1 Per-finding table
+
+| # | Severity | Finding | Row (failed first on `2b18a03`) | Fix | Outcome |
+|---|---|---|---|---|---|
+| 1 | MAJOR | Q185 residual: a round trip of the recorded block (landed blob `B1 + v2`) that the H step did not re-render (it refused for the workspace: an edit inside a created `CLAUDE.md`'s block, or a directory at `AGENTS.override.md`) was read as this landing's `Intact` block once the user wrote below it, because the rule asked whether the whole file was the landed blob. `--clear` then removed `B1`, and a render replaced it (`Plan::Replace`) | H50 (`--check` said `present`, not `carried`; the natural trigger, probe `rr3_a4`), H51 (the render dropped `B1`; probes `rr3_a`, `rr3_a2`) | `classify_head`'s and `unrecorded`'s question is now `lead_is_landed`: does the target's landed blob itself start with the block at byte 0 (a well-formed block's bytes; a broken one's as far as `marker` looks), from its start or after a recorded `--clear-carried` removal. Bulkload's block is never part of what the source landed, so a block the blob starts with came back with the source's bytes whatever is below it now. `landed_compare` (with `SameBytes.whole`) is `landed_match` with a prefix mode. A lost record (H49: the blob does not start with the block) stays `Modified`; H55 and H56 pin the rule's edges (a long landed body; a broken block) | Fixed |
+| 2 | minor | The same root cause with no record: a round-tripped block of this landing refused render and `--clear` (`HANDOFF_BLOCK_MODIFIED`) after any edit below it | H52 (probe `rr3_c`; `--check` said `modified`) | The same rule (`unrecorded`) | Fixed |
+| 3 | minor | Q190: a crashed `--clear-carried` finished after a user's edit left the removal unrecorded (the prior step counted as done only when the whole file's digest was the step's `after`), so converge, after the user reverted the edit, blamed the user for bulkload's removal (`GIT_DESTINATION_MODIFIED`) | fault row `estate_handoff_clear_carried_edit_revert` (probe `rr3_clear_carried_edit_revert`: `handoff.stripped` missing) | A prior step is done when the target no longer starts with the carried blocks it removed, under the step's old block or alone (`still_carries`); a missing file holds none. The model's `HandoffSettle` records `sp` by the same rule (20.4) | Fixed |
+| 4 | minor | Q191: cherry-picking or rebasing a source commit that carries a block flagged `HANDOFF_MARKER_COMMITTED` (the pick adds the lines again, outside the carried capture's reach) | H53 (probe `rr3_e`; also the staged pick, `cherry-pick --no-commit`) | Commit detection compares token lines: `token_history` collects the token lines a `git log -p --cc -G TOKEN` adds (a `+` against every parent); a line is flagged only when the carried capture's history (`carried_token_lines`) never added it. Every BEGIN line names its block's id and `for=`, so this landing's block always has a new line. `staged` uses the same exemption (a staged pick is not flagged either); `source_history` is now "the carried history added a token line" | Fixed |
+| 5 | minor | Q189: `dirty` ran `git status` with the repository's configured filters in the live sibling (a clean filter, git-lfs writing `.git/lfs/objects`), and a required filter that fails made the status fail, so `ready` could never hold | H54 (probe `rr3_b`: the filter's mark file written; then a required failing filter) | `dirty` runs `git_carry::unfiltered_status`: every `filter.<name>` driver the checkout's configuration (and its populated submodules') names gets empty `clean`, `smudge`, `process` and `required=false` as command-scope configuration (`GIT_CONFIG_COUNT`), the nest status's existing mechanism, split out as `unfiltered` (the registered injector; `nest_status` still refuses a nest with a filter command). The status compares raw bytes, so a filtered file whose index stat is stale reads as modified (an open row, never a false clean) until the checkout's own `git status` refreshes the index | Fixed |
+| 6 | minor | Stale docs said an unrecorded block of this landing is content | review | `main.rs` usage, `render::owner`, `carried_of`, `classify_head`/`unrecorded`/`held` docs, `docs/design.md` (identity, removal, commit detection, `ready`, refusals), `docs/slo.md` (a re-review 3 bullet) | Fixed |
+| 19.10.4 | open item | Commit detection did not read remote-tracking refs or the stash | H53 (a block pushed on a branch deleted here; a block in a stash entry below the newest) | The history scan adds `--remotes` and every stash entry (`refs/stash` and its reflog, `stashes`); the block's own step 4 says to stash nothing that holds it | Fixed (cheap) |
+
+Not ported: probe `rr3_a3` (the user rewrote `AGENTS.md` as `B1 + v2 +
+note` while the landed blob was still `v1`: `B1` is this landing's block
+there and clearing it is right) and the crash probes
+`rr3_round_trip_crash_after_landed`/`_after_head` (after the rerun apply
+the H step had prepended a new block over the carried one; `--clear`
+removed only that block and kept `B1 + v2 + note`, which is the intended
+outcome; the probes compared with the pre-render file).
+
+A case the rule leaves: a render that put a block byte-identical to the
+carried one above it (`B1 + B1 + v2`) would read its own top copy as
+carried after an edit below. A new capture changes the block's text (the
+capture and ref facts it lists), so the H step cannot produce it; not
+built.
+
+### 20.2 Failing first
+
+On `2b18a03` with only the new rows copied in (`/dev/shm/handoff-lane/base`,
+scratch, rebuilt from its own sources): H50 (`--check` `present`), H51
+(the remainder lost `B1`), H52 (`--check` `modified`), H53
+(`HANDOFF_MARKER_COMMITTED` for the staged pick), H54 (the sibling's
+clean filter wrote its mark) and the fault row
+`estate_handoff_clear_carried_edit_revert` (`handoff.stripped` missing):
+6 failed. H55 and H56 (added for the mutation run, 20.3) pass there.
+After the fix all 8 pass.
+
+### 20.3 Mutation table
+
+Runner: one edit at a time in a scratch copy (`/dev/shm/handoff-lane/mut6`,
+target `cargo-target/handoff-mut`), each run against `cargo test -p
+bulkload-agent --lib handoff`, `--test estate_handoff` and the
+`estate_handoff` fault-harness rows, stopping at the first failing suite.
+
+| Mutant | Edit | Result | Killed by |
+|---|---|---|---|
+| M56_lead_whole_file | `lead_is_landed` asks whether the whole file is the landed blob (`2b18a03`'s rule) | KILLED | H50, H51, H52 |
+| M57_prefix_compare_length_only | the prefix comparison checks lengths, not bytes | SURVIVED, then KILLED | H55 (added), H56 |
+| M58_malformed_lead_empty | a broken block's lead is empty (never landed content) | SURVIVED, then KILLED | H56 (added) |
+| M59_prior_strip_whole_digest | a prior clear step is done only when the whole file is its `after` (finding 3 as found) | KILLED | fault row `estate_handoff_clear_carried_edit_revert` |
+| M61_history_carried_exempt_off | any added token line counts as committed (finding 4 as found) | KILLED | H53 |
+| M62_staged_carried_exempt_off | any index token line HEAD lacks counts as staged | KILLED | H53 |
+| M63_history_no_remotes | the history scan leaves out `--remotes` | KILLED | H53 |
+| M64_history_newest_stash_only | only `refs/stash`, not its reflog | KILLED | H53 |
+| M65_history_no_stash | no stash entry read | KILLED | H53 |
+| M66_status_runs_filters | `dirty` runs plain `git status` (finding 5 as found) | KILLED | H54 |
+| M67_status_required_kept | `required` is not overridden to false | KILLED | H54 |
+| M33r_record_block_never_landed | the record's block is never landed content (re-run of M33 under the new rule) | KILLED | H40, H50, H51 |
+| M34r_own_block_never_landed | an unrecorded own-identity block is never landed content (M34 re-run) | KILLED | H37, H41, H52, H56 |
+| M55r_own_block_always_carried | an unrecorded own-identity block is always carried (M55 re-run) | KILLED | unit `a_racy_record_print_is_proved_by_reading` |
+
+First run: 12 of 14 killed. M57 and M58 survived (every landed body in the
+suite was shorter than a block, and no round trip carried a broken block):
+H55 and H56 were added, both pass on `2b18a03` (rows for the new rule's
+edges, not for a finding), and both mutants were then killed. 14 of 14
+killed. Not run: `still_carries` checking only the bare carried blocks
+(equivalent here: a step not done still starts with its old block and
+the carried blocks, and the rerun's own clear removes and records them).
+
+A measurement hazard found on the way: two source trees sharing one
+`CARGO_TARGET_DIR` (`handoff-mut`) share fingerprints (paths relative to
+the package root, compared by mtime), so a tree whose files are older
+than the last build's outputs is not rebuilt. One base run of H55/H56 had
+silently used the last mutant's library. Every base run in 20.2 was
+redone after touching the base tree's sources (`Compiling bulkload-proto`
+and `bulkload-agent` from the base path); each mutant's edit rewrote both
+mutated files, so its build was fresh.
+
+### 20.4 TLA (EstateConverge)
+
+`HandoffSettle` records a pending clear's removal (`sp`) when the seat no
+longer starts with the carried block (`~IsCb(Strip(cur.v))`), mirroring
+`still_carries`; it was "the seat is exactly `UnCb(ps)`". The model cannot
+show finding 3 itself: `OpSeat` writes a fresh value, so an operator's
+edit is never reverted to the stripped value; no mutation row is added.
+Findings 1, 2, 4 and 5 are in parts the model does not represent (a round
+trip of this landing's own block; commit detection and `ready` are
+read-only). `just tla-check` of the 17 hand-off rows with `MC_ec_refs`,
+`MC_ec_seats` and `MC_ec_adopt`: 21 rows matched (the budget self-test
+first), 417 s wall, `rc=0`; only `MC_ec_handoff_carried` (97864, was
+97851) and `MC_ec_handoff_carried_op` (50313, was 50226) changed count
+(`docs/formal/README.md`, "TIN-6569", re-review 3).
+
+### 20.5 Checks for this commit
+
+In this worktree (`CARGO_TARGET_DIR` `cargo-target/handoff`, `nix develop
+.#default`, nice 10, TMPDIR `/dev/shm/handoff-lane`), on the tree
+committed: `cargo fmt --check`; the three clippy passes (workspace;
+`io-trace`; `fault-injection,io-trace`) clean; `cargo test -p
+bulkload-agent --locked --no-fail-fast` 945 passed, 0 failed, 7 ignored
+(29 binaries), with `estate_handoff` 52 (H0 to H25, H28 to H35, H37 to
+H56), `estate_adopt` 13, `estate_converge` 23, `source_command_registry`
+16 (the injector entry is now `git_carry::unfiltered`; `unfiltered` and
+`unfiltered_status` are registered builders), `refusal_taxonomy` 5,
+`no_credential_tools` 2 and 16 hand-off unit rows; `fault_harness` 116
+(19 `estate_handoff` rows); `just contract-test` (24); `just tla-render
+--check` (251 files); `just tla-check` as in 20.4. `just check-fast` was
+not run here (coordinator).
+
+### 20.6 Open
+
+1. 19.10 items 1, 2, 3, 5 and 6 stand; item 4 is closed (20.1).
+2. A filtered file in the sibling whose index stat is stale reads as not
+   clean until the sibling's own `git status` refreshes it (20.1, finding
+   5): conservative; say if `ready` should instead apply the filters it
+   would refuse to run.
+3. A stash holding this landing's block now exits
+   `HANDOFF_MARKER_COMMITTED` (the block says to stash nothing that holds
+   it); say if a stash should be information only.
+
 ## Workstreams (restated, R-N13; verified this session unless marked)
 
 | Stream | Owner | Repo / branch | State and evidence | Next |
 |---|---|---|---|---|
-| TIN-6569 hand-off | this lane | bulkload `feat/estate-handoff-20261016` off `3fe1f07` | Built (17), reviewed (18), two re-reviews closed and OI-1003-Q188 to Q191 built (19), committed signed: `7c5407f`, then `752c8ec` (round 2) and the rulings commit; not pushed, no PR, no Linear write (this lane's task) | Coordinator: `just check-fast`, a re-review of section 19, PR; open items 19.10 |
+| TIN-6569 hand-off | this lane | bulkload `feat/estate-handoff-20261016` off `3fe1f07` | Built (17), reviewed (18), two re-reviews closed and OI-1003-Q188 to Q191 built (19), committed signed: `7c5407f`, then `752c8ec` (round 2), `2b18a03` (the rulings) and the re-review 3 commit (20); not pushed, no PR, no Linear write (this lane's task) | Coordinator: `just check-fast`, a re-review of section 20, PR; open items 19.10 and 20.6 |
 | #226 adopt F1/F2 fixes | other lane | `feat/estate-adopt-20261015` at `c6ccd52` (seen, read-only) | Committed there; touches `converge.rs`, `converge/diff.rs`, `estate.rs`, `git_carry.rs` | Merge; conflicts with this branch checked by `git merge-tree` (lane return) |
 | GF beside-landing | coordinator | production trees | Untouched by this lane | Hand-off after the operator answers 19.10.1 |

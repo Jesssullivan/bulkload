@@ -109,17 +109,22 @@ SUBCOMMANDS:
                 to another refuses HANDOFF_TARGET_UNSUPPORTED; an edited block of
                 this landing's HANDOFF_BLOCK_MODIFIED; an unlanded item
                 HANDOFF_NOT_LANDED; all with nothing written. A block another
-                landing rendered, one of this landing's that no record names, or
-                one whose whole file is the landed blob (each carried with the
-                source's bytes) is content: kept below this one, never cleared
-                unless --clear --clear-carried asks (OI-1003-Q190: a recorded
-                edit of landed content that converge accepts). --check is
-                read-only (state, open rows, ready: the commit rules and a clean
-                working tree in the live sibling and in each destination-only
-                worktree) and exits HANDOFF_MARKER_COMMITTED when this landing's
-                token is staged or added by a commit the carried capture does
-                not reach (a token already in the source's history is reported
-                as source_history, OI-1003-Q191); --clear restores the bytes and
+                landing rendered, or one of this landing's that the target's
+                landed blob itself starts with (a round trip; each carried with
+                the source's bytes, whatever is written below it since) is
+                content: kept below this one, never cleared unless --clear
+                --clear-carried asks (OI-1003-Q190: a recorded edit of landed
+                content that converge accepts); a block of this landing's that
+                its record does not name and the landed blob does not start
+                with is an edited block. --check is read-only (state, open
+                rows, ready: the commit rules and a clean working tree, read
+                with no filter driver run, in the live sibling and in each
+                destination-only worktree) and exits HANDOFF_MARKER_COMMITTED
+                when a token line the source's history never added is staged
+                or added by a commit the carried capture does not reach (any
+                branch, tag, remote-tracking ref, stash entry or HEAD; a token
+                already in the source's history is reported as
+                source_history, OI-1003-Q191); --clear restores the bytes and
                 finishes a crashed clear; --dry-run prints the blocks. A rerun
                 keeps the options the record was rendered with unless they are
                 given again; an unchanged rerun reads and writes nothing. One

@@ -706,8 +706,10 @@ const EXTRA_CONFIG: &[(&str, &str)] = &[
 /// `GIT_CONFIG_KEY_n`, each argued. The dynamic oracle accepts only
 /// `filter.*` keys from them.
 const CONFIG_INJECTORS: &[(&str, &str)] = &[(
-    "agent::git_carry::nest_status",
-    "A nested repository's status must not run its filter drivers: every \
+    "agent::git_carry::unfiltered",
+    "A status of a checkout bulkload does not own (a nested repository; an \
+     estate hand-off's live sibling or destination-only worktree, re-review \
+     3 of TIN-6569) must not run its filter drivers: every \
      `filter.<name>.clean|smudge|process` it can see is overridden to empty \
      and `required` to false, which a `-c` list cannot do for names read at \
      run time. It disables programs; it enables none.",
@@ -742,6 +744,8 @@ const BUILDERS: &[&str] = &[
     "agent::git_carry::git_writer",
     "agent::git_carry::nest_status",
     "agent::git_carry::snapshot_command",
+    "agent::git_carry::unfiltered",
+    "agent::git_carry::unfiltered_status",
     "agent::git_carry::writing_privately",
 ];
 
@@ -3016,7 +3020,7 @@ fn an_entry_that_outlives_its_code_is_refused() {
             &[
                 "EXTRA_CONFIG \"core.bare=false\"",
                 "OPEN_FORMS agent::git_carry::partial_clone \"config\"",
-                "CONFIG_INJECTORS agent::git_carry::nest_status",
+                "CONFIG_INJECTORS agent::git_carry::unfiltered",
                 "BUILDERS agent::git_carry::git:",
                 "WRITERS \"write-tree\": registered as 1, the tree holds 0",
             ][..],
@@ -3281,7 +3285,7 @@ fn breaches(call: &Recorded, protected: &[&Path]) -> Vec<String> {
             "GIT_CONFIG_PARAMETERS={value:?} injects configuration"
         ));
     }
-    // `GIT_CONFIG_COUNT` may only switch filter drivers off (`nest_status`).
+    // `GIT_CONFIG_COUNT` may only switch filter drivers off (`unfiltered`).
     if recorded(call, "GIT_CONFIG_COUNT").is_some() {
         let keys = recorded(call, "GIT_CONFIG_KEYS").unwrap_or_default();
         if let Some(key) = keys

@@ -3148,6 +3148,37 @@ written as before.
   A failing or reach row's count is where TLC's workers stopped, so it
   varies a little between runs; the pass rows' counts are exact.
 
+- **Re-review 3 of 2026-10-16** (design note section 20). `HandoffSettle`
+  records a pending clear's removal of a carried block (`sp`) when the
+  seat no longer starts with the carried block (`~IsCb(Strip(cur.v))`;
+  C `clear`'s `still_carries`), not only when it holds exactly
+  `UnCb(ps)`: a crashed `--clear-carried` finished after an operator's
+  edit still records the removal (finding 3). The model cannot show the
+  finding's trace (`OpSeat` writes a fresh value, so an edit is never
+  reverted to the stripped value), so no mutation row is added. The
+  other findings are in parts the model does not represent: which
+  blocks are this landing's (C `lead_is_landed`: a block the landed
+  blob starts with is content), and commit detection and `ready`, which
+  are read-only.
+
+  `just tla-check` of the 17 hand-off rows with `MC_ec_refs`,
+  `MC_ec_seats` and `MC_ec_adopt` on this spec, 2026-10-16, sting,
+  `-workers 3`, nice 10, beside the lane's cargo runs: 21 rows matched
+  (the budget self-test first), 417 s wall, peak RSS 2064 MiB, `rc=0`.
+  Grounding: 96 operators, 17 constants, 62 mutations, 3 label sets, 82
+  code symbols; 251 files current. Every row matched its expectation;
+  the pass rows' counts are unchanged except the two whose clears
+  record a removal in more states: `MC_ec_handoff_carried` 97864 (was
+  97851) and `MC_ec_handoff_carried_op` 50313 (was 50226). Unchanged:
+  `MC_ec_refs` 54141, `MC_ec_seats` 64478, `MC_ec_adopt` 30652,
+  `MC_ec_handoff` 26952, `MC_ec_handoff_op` 19425, `MC_ec_handoff_live`
+  2023. Reach rows: `converged` 4172, `cleared` 8758, `carried_cleared`
+  73781; fail rows each on their named property (`no_overlay`
+  TypedRefusal, `overlay_any_block`, `clear_unchecked`,
+  `exchange_unchecked`, `retake_unchecked`, `keep_racy_unchecked` and
+  `strip_unchecked` NoLocalWorkLost, `no_intent`
+  HandoffOwnsOnlyItsBlock, `strip_no_overlay` TypedRefusal).
+
 `just tla-check` of the hand-off rows, 2026-10-16, sting, `-workers 3`,
 nice 10: 11 rows matched (the budget self-test first), 338 s wall, `rc=0`.
 

@@ -212,8 +212,11 @@ impl Inputs {
 /// workspace's absolute path and the SOURCE label. A block whose BEGIN line
 /// names another identity was rendered for another landing and carried
 /// here with the source's bytes: it is content (OI-1003-Q185), never this
-/// landing's block. So is a block of this identity on a target no record
-/// entry names (a round trip).
+/// landing's block. So is a block of this identity that the target's landed
+/// blob itself starts with (a round trip, with or without a record, and
+/// whatever is written below it since); any other block of this identity
+/// that the record does not name is this landing's own edited or stale
+/// block.
 #[must_use]
 pub fn owner(host: &str, workspace: &[u8], source: &str) -> String {
     let mut hasher = blake3::Hasher::new();

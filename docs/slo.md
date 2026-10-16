@@ -1163,6 +1163,16 @@ user. No SLO number changes. The design note is
   rules); OI-1003-Q191, commit detection flags the token only in commits
   the carried capture does not reach, and a token in the source's history
   is information. No SLO number changes.
+- **Re-review 3 of 2026-10-16** (design note section 20): a block of this
+  landing's identity that the target's landed blob itself starts with is
+  carried content whatever the user wrote below it since (a round trip
+  the H step missed is never dropped by a render or `--clear`, S5 and
+  OI-1003-Q185); a crashed `--clear-carried` finished after a user's edit
+  still records its removal; commit detection flags only token lines the
+  source's history never added (a cherry-picked source block is
+  information) and reads remote-tracking refs and every stash entry; the
+  `git status` of the sibling and destination-only worktrees runs no
+  filter driver. No SLO number changes.
 - **Proof.** `tests/estate_handoff.rs` H0 to H19 (H0 is the control: a
   naive prepend refuses MODIFIED), the hand-off unit rows and the
   `render_then_clear_is_identity` property, the `estate.handoff.*`

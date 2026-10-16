@@ -649,15 +649,16 @@ that note) before merge.**
     rendered for (`for=`, a digest of the destination host, the
     workspace path and SOURCE). A block that names another landing came
     with the source's bytes (a re-carried, handed-off tree), and so did a
-    block of this landing's identity whose whole file is the target's
-    landed blob (a round trip: carried back to the source and landed
-    again at the same path, after the record is gone or while it stands):
-    it is content (OI-1003-Q185, nothing is dropped from a carry), kept
-    byte for byte below this landing's block, named in it as carried,
-    and cleared only by the opt-in `--clear --clear-carried` (below). Any
-    other block of this landing's identity that its record does not name
-    (edited inside, cut, or its record lost) is never presented as
-    carried: the hand-off refuses `HANDOFF_BLOCK_MODIFIED`. A block a
+    block of this landing's identity that the target's landed blob itself
+    starts with (a round trip: carried back to the source and landed
+    again at the same path, after the record is gone or while it stands,
+    and whatever the user has written below it since; re-review 3 of
+    2026-10-16): it is content (OI-1003-Q185, nothing is dropped from a
+    carry), kept byte for byte below this landing's block, named in it as
+    carried, and cleared only by the opt-in `--clear --clear-carried`
+    (below). Any other block of this landing's identity that its record
+    does not name (edited inside, cut, or its record lost) is never
+    presented as carried: the hand-off refuses `HANDOFF_BLOCK_MODIFIED`. A block a
     person removed by hand (retired in the record with its digest) and
     then put back byte for byte, by an editor's undo or a `git stash
     pop`, is this landing's again: converge accepts it, the next render
@@ -692,18 +693,25 @@ that note) before merge.**
     `estate-diff` accept the landed blob without those bytes (alone or
     under a later block) while that blob stands, and the landing's objects
     still hold them. Above content that is not the landed blob (a user's
-    edit) a carried block is kept (`carried-kept`). A converge that lands
-    a new blob of the target lands what the source has, carried block
-    included.
-  - **Commit detection** (`--check`, read-only; OI-1003-Q191): `staged`
-    when a target's index blob holds a line with the
-    `BULKLOAD-HANDOFF-DO-NOT-COMMIT` token that its HEAD blob lacks;
-    `committed` when a commit of any branch's or tag's history (or a
-    detached HEAD's) that the carried capture (`refs/carry/`) does not
-    reach adds such a line (a block committed and removed again is still
-    published by a push). Both exit `HANDOFF_MARKER_COMMITTED`. A token
-    already in the source's history is reported once per workspace as
-    information (`"source_history":true`), never as committed. Every name
+    edit) a carried block is kept (`carried-kept`). A crashed clear that
+    the next run finishes records each removal whose target no longer
+    starts with the removed blocks, a user's later edit included. A
+    converge that lands a new blob of the target lands what the source
+    has, carried block included.
+  - **Commit detection** (`--check`, read-only; OI-1003-Q191): a token
+    line is one holding the `BULKLOAD-HANDOFF-DO-NOT-COMMIT` token that the
+    source's history (the commits the carried capture, `refs/carry/`,
+    reaches) never added; every BEGIN line names its block's id and
+    landing, so a block of this landing's always has one. `staged` when a
+    target's index blob holds a token line that its HEAD blob lacks;
+    `committed` when a commit that the carried capture does not reach, in
+    the history of any branch, tag, remote-tracking ref, stash entry or a
+    detached HEAD, adds one (a block committed and removed again is still
+    published by a push; the block says to stash nothing that holds it).
+    Both exit `HANDOFF_MARKER_COMMITTED`. A block the source committed,
+    also when cherry-picked or rebased here, is reported once per
+    workspace as information (`"source_history":true`), never as
+    committed. Every name
     a hand-off may write (`AGENTS.md`, `CLAUDE.md`, `AGENTS.override.md`,
     `README.md`) is read, whether or not it is a target now. No hook is
     installed.
@@ -717,8 +725,12 @@ that note) before merge.**
     consolidating. `ready` also needs a clean working tree in the live
     sibling and in every destination-only worktree (OI-1003-Q189): a
     read-only `git status` (`--no-optional-locks`, untracked files
-    counted, ignored ones not) of each, on every run; one that lists an
-    entry or cannot be read is an open row.
+    counted, ignored ones not) of each, on every run, with every filter
+    driver the checkout configures switched off (no clean filter or
+    long-running process such as git-lfs runs there, and a required one
+    cannot fail the read; a filtered file whose index stat is stale reads
+    as modified until the checkout's own `git status` refreshes it); one
+    that lists an entry or cannot be read is an open row.
   - **Options persist.** A rerun, the H step and the `--check` a block
     prints keep the `--sibling` and `--readme` the record was rendered
     with unless they are given again.
@@ -734,7 +746,7 @@ that note) before merge.**
     than `CLAUDE.md -> AGENTS.md` in the same worktree, which is covered by
     `AGENTS.md`'s block, or any other non-regular target),
     `HANDOFF_BLOCK_MODIFIED` (a block of this landing's identity that is
-    not the record's and whose file is not the landed blob: edited
+    not the record's and that the landed blob does not start with: edited
     inside, cut, or its record lost), and `HANDOFF_MARKER_COMMITTED`.
   - **S3.** Rendering is a pure function of metadata and an `as_of`
     instant kept while its inputs digest holds. An unchanged rerun reads 0

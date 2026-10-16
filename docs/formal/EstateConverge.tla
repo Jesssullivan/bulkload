@@ -2295,11 +2295,14 @@ HandoffSettle ==
                   THEN [hand EXCEPT !.tmp = t]
                   ELSE LET r == HRetake(cur.v, cur.st) IN
                        \* A clear whose removal of a carried block is done
-                       \* (the target holds what it left) records it.
+                       \* records it: the target no longer starts with the
+                       \* carried block, whatever the operator wrote since
+                       \* (re-review 3 of 2026-10-16, finding 3; C clear,
+                       \* still_carries; it was "holds exactly what it left").
                        [hand EXCEPT !.tmp = t, !.int = "none", !.has = IsBlk(cur.v),
                                     !.pst = r.pst, !.prac = r.prac, !.base = r.base,
                                     !.sp = IF hand.int = "clear" /\ hand.ps # 0
-                                              /\ cur.v = UnCb(hand.ps)
+                                              /\ ~IsCb(Strip(cur.v))
                                            THEN hand.ps ELSE hand.sp,
                                     !.ps = 0]
     /\ HKeep

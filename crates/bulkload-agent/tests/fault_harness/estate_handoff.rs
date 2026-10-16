@@ -32,7 +32,8 @@
 //! finished, not reversed, by a no-op `estate-apply`'s H step.
 //! `ClearCarried`: a `--clear --clear-carried` crashed; converge is not
 //! wedged by the half-removed carried block, and the H step finishes it
-//! (OI-1003-Q190).
+//! (OI-1003-Q190). `ClearCarriedEditRevert`: the same crash, then a user
+//! edit before the rerun that finishes it: the removal is still recorded.
 //!
 //! `_exit` models a process crash only (see the harness header).
 
@@ -79,6 +80,11 @@ pub enum EstateHandoff {
     /// (OI-1003-Q190): converge accepts what the crash left, and the next
     /// apply's H step finishes the removal and records it.
     ClearCarried,
+    /// `--clear --clear-carried` crashed after its exchange; the user edits
+    /// the stripped file before the rerun finishes the clear, then reverts
+    /// the edit (re-review 3 of 2026-10-16, finding 3): the removal is
+    /// recorded, so converge never blames the user for bulkload's edit.
+    ClearCarriedEditRevert,
 }
 
 impl Scenario for EstateHandoff {
@@ -582,6 +588,50 @@ fn scenario(point: Point, nth: u64, kind: EstateHandoff) {
             assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
             assert_eq!(fs::read(&agents).unwrap(), AGENTS, "{label}");
         }
+        EstateHandoff::ClearCarriedEditRevert => {
+            let mut carried = b"<!-- bulkload-handoff:v1 BEGIN id=0123456789abcdef for=fedcba9876543210 BULKLOAD-HANDOFF-DO-NOT-COMMIT -->\n> another landing's block\n<!-- bulkload-handoff:v1 END id=0123456789abcdef -->\n\n".to_vec();
+            carried.extend_from_slice(AGENTS);
+            fs::write(world.src().join("AGENTS.md"), &carried).unwrap();
+            git(
+                &world.src(),
+                &["commit", "--quiet", "-am", "a carried block"],
+            );
+            tick();
+            world.capture();
+            assert_eq!(world.apply()[0].0, "workspace-restored");
+            world.handoff(HandoffMode::Render).unwrap();
+            crash(&world, "clear-carried", &fault);
+            let agents = world.dst().join("AGENTS.md");
+            assert_eq!(fs::read(&agents).unwrap(), AGENTS, "{label}: not stripped");
+            let mut edited = AGENTS.to_vec();
+            edited.extend_from_slice(b"A local note.\n");
+            fs::write(&agents, &edited).unwrap();
+            let ran = world.handoff(HandoffMode::Clear);
+            assert!(ran.is_ok(), "{label}: {ran:?}");
+            assert_eq!(fs::read(&agents).unwrap(), edited, "{label}");
+            assert!(
+                world
+                    .dst()
+                    .join(".git/bulkload/v1/neo/handoff.stripped")
+                    .exists(),
+                "{label}: the finished removal was not recorded"
+            );
+            // Converge blames the user for the user's edit only.
+            world.source_change(b"alpha 2\n");
+            let rows = world.apply();
+            assert!(
+                rows[0]
+                    .1
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("GIT_DESTINATION_MODIFIED")),
+                "{label}: {rows:?}"
+            );
+            assert_eq!(fs::read(&agents).unwrap(), edited, "{label}");
+            fs::write(&agents, AGENTS).unwrap();
+            let rows = world.apply();
+            assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
+            assert_eq!(fs::read(&agents).unwrap(), AGENTS, "{label}");
+        }
         EstateHandoff::ClearNoOpApply => {
             world.handoff(HandoffMode::Render).unwrap();
             tick();
@@ -604,7 +654,10 @@ fn scenario(point: Point, nth: u64, kind: EstateHandoff) {
     tick();
     let mode = if matches!(
         kind,
-        EstateHandoff::Clear | EstateHandoff::ClearNoOpApply | EstateHandoff::ClearCarried
+        EstateHandoff::Clear
+            | EstateHandoff::ClearNoOpApply
+            | EstateHandoff::ClearCarried
+            | EstateHandoff::ClearCarriedEditRevert
     ) {
         HandoffMode::Clear
     } else {

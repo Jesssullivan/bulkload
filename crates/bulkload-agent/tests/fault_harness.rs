@@ -1388,6 +1388,9 @@ scenarios! {
     estate_handoff_clear_noop_apply => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearNoOpApply;
     estate_handoff_clear_carried_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::ClearCarried;
     estate_handoff_clear_carried_after_exchange => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearCarried;
+    // Re-review 3 of 2026-10-16, finding 3: a crashed clear-carried
+    // finished after a user's edit still records its removal.
+    estate_handoff_clear_carried_edit_revert => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearCarriedEditRevert;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

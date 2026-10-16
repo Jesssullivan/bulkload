@@ -591,11 +591,14 @@ fn entry_of(record: Option<&HandoffLanded>, name: &str) -> Option<HandoffFile> {
 }
 
 /// What `bytes` (a target's head, or all of it) hold against its record
-/// entry `entry` (see [`entry_of`]). `landed` says whether the whole file
-/// is the target's landed blob; it is asked only when a block that could
-/// be this landing's stands at byte 0, and a yes makes that block the
-/// file's content (`Foreign`): bulkload's block is never part of what the
-/// source landed (re-review 2 of 2026-10-16, finding 2; OI-1003-Q185).
+/// entry `entry` (see [`entry_of`]). `landed` says whether the target's
+/// landed blob itself starts with the block at byte 0 ([`lead_is_landed`]);
+/// it is asked only when a block that could be this landing's stands
+/// there, and a yes makes that block the file's content (`Foreign`):
+/// bulkload's block is never part of what the source landed, so a block
+/// the landed blob starts with came back with the source's bytes, whatever
+/// a user has written below it since (re-review 2 of 2026-10-16, finding
+/// 2; re-review 3, findings 1 and 2; OI-1003-Q185).
 fn classify_head(
     bytes: &[u8],
     entry: Option<&HandoffFile>,
@@ -619,10 +622,10 @@ fn classify_head(
 /// What the head of a file holds that its record entry does not vouch
 /// for: nothing; a block (or a broken one) of this landing's identity
 /// (`ours`), which is this landing's own edited or stale block unless the
-/// whole file is the landed blob (then it came back with the source's
-/// bytes: a round trip, with or without a record; re-reviews of
-/// 2026-10-16, finding 4 and finding 2); or another landing's block,
-/// carried content.
+/// landed blob itself starts with it (then it came back with the source's
+/// bytes: a round trip, with or without a record, and edits below it are
+/// the user's; re-reviews of 2026-10-16, finding 4, finding 2 and
+/// re-review 3, finding 2); or another landing's block, carried content.
 fn unrecorded(head: &[u8], ours: &str, landed: &mut dyn FnMut() -> Result<bool>) -> Result<Held> {
     Ok(match render::marker(head) {
         render::Marker::None => Held::Plain,
@@ -651,17 +654,49 @@ fn trusted(record: &HandoffLanded, file: &HandoffFile, now: Option<&SeatPrint>, 
             .is_some_and(|print| now == Some(print) && print.mtime_ns < racy_from)
 }
 
-/// Whether target `name`'s whole file is its landed blob (read whole,
-/// counted).
-fn whole_is_landed(worktree: &Path, landed: &mut Landed<'_>, name: &str) -> Result<bool> {
+/// The bytes of the block at byte 0 of `bytes`: a well-formed block's, or,
+/// for a broken one (a BEGIN line with no END line), as far as
+/// [`render::marker`] looks; none without a marker.
+fn lead(bytes: &[u8]) -> &[u8] {
+    let len = match render::marker(bytes) {
+        render::Marker::None => 0,
+        render::Marker::Block(len) => len,
+        render::Marker::Malformed => MAX_BLOCK,
+    };
+    bytes.get(..len.min(bytes.len())).unwrap_or_default()
+}
+
+/// Whether the block at byte 0 of `bytes` (target `name` read whole) is
+/// landed content: the target's landed blob itself starts with it (or
+/// does once carried blocks a recorded `--clear-carried` removed are
+/// skipped). Bulkload's own block is never part of what the source
+/// landed, so such a block came back with the source's bytes (a round
+/// trip), and an edit below it never makes it bulkload's (re-review 3 of
+/// 2026-10-16, findings 1 and 2; OI-1003-Q185). A block of this landing's
+/// that the blob does not start with (a lost record, H49) is not.
+fn lead_is_landed(
+    worktree: &Path,
+    landed: &mut Landed<'_>,
+    name: &str,
+    bytes: &[u8],
+) -> Result<bool> {
+    let head = lead(bytes);
+    if head.is_empty() {
+        return Ok(false);
+    }
+    Ok(landed_compare(worktree, landed, name, head, true, false)?.is_some())
+}
+
+/// [`lead_is_landed`] of target `name` (read whole, counted).
+fn lead_is_landed_at(worktree: &Path, landed: &mut Landed<'_>, name: &str) -> Result<bool> {
     let read = read_whole(&worktree.join(name), name)?;
-    Ok(landed_base(worktree, landed, name, &read.bytes)?.is_some())
+    lead_is_landed(worktree, landed, name, &read.bytes)
 }
 
 /// What target `name` of `worktree` holds against `record`: by print when
 /// the record's print is unchanged and not racy (no read), else by its
 /// head (and, for a block that could be this landing's, by whether the
-/// whole file is landed content). `ours` is this landing's identity
+/// landed blob starts with it). `ours` is this landing's identity
 /// ([`render::owner`]).
 fn held(
     worktree: &Path,
@@ -681,7 +716,7 @@ fn held(
     }
     let head = head_of_file(&worktree.join(name))?;
     classify_head(&head, entry.as_ref(), ours, &mut || {
-        whole_is_landed(worktree, landed, name)
+        lead_is_landed_at(worktree, landed, name)
     })
 }
 
@@ -762,7 +797,7 @@ fn read_unowned(
     let read = read_whole(&worktree.join(name), name)?;
     let bytes = &read.bytes;
     let state = classify_head(bytes, entry, ours, &mut || {
-        Ok(landed_base(worktree, landed, name, bytes)?.is_some())
+        lead_is_landed(worktree, landed, name, bytes)
     })?;
     if matches!(state, Held::Plain | Held::Foreign) {
         Ok(read)
@@ -901,6 +936,33 @@ fn starts_with(path: &Path, len: u64, block: &[u8; 32]) -> Result<bool> {
         .refuse_at("git_carry::converge::handoff::starts_with")?;
     crate::counters::add_len(crate::counters::Counter::DestVerifyRead, head.len());
     Ok(len64(&head) == len && digest(&head) == *block)
+}
+
+/// Whether the file at `path` still starts with the carried blocks `strip`
+/// names, under `old` (the block of this landing's the same clear step
+/// removes with them) or alone: the step that removes them has not run, or
+/// was undone. A missing or non-regular file holds none.
+fn still_carries(path: &Path, old: Option<&[u8]>, strip: &Stripped) -> Result<bool> {
+    let Some(meta) = lstat(path)? else {
+        return Ok(false);
+    };
+    if !meta.is_file() {
+        return Ok(false);
+    }
+    let old = old.unwrap_or_default();
+    let len = usize::try_from(strip.len).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+    let mut head = Vec::new();
+    open_target(path)?
+        .take(len64(old).saturating_add(strip.len))
+        .read_to_end(&mut head)
+        .refuse_at("git_carry::converge::handoff::still_carries")?;
+    crate::counters::add_len(crate::counters::Counter::DestVerifyRead, head.len());
+    let carries = |at: usize| {
+        at.checked_add(len)
+            .and_then(|end| head.get(at..end))
+            .is_some_and(|bytes| digest(bytes) == strip.digest)
+    };
+    Ok(carries(0) || (!old.is_empty() && head.starts_with(old) && carries(old.len())))
 }
 
 fn whole_digest(path: &Path) -> Result<Option<[u8; 32]>> {
@@ -1438,11 +1500,17 @@ fn census(common: &Path, worktree: &Path, source: &str, items: &[Planned]) -> Re
 
 /// Whether the checkout at `path` has uncommitted changes, as a read-only
 /// `git status` lists them (untracked files included, ignored ones not;
-/// `--no-optional-locks`, so the index is never refreshed on disk). A
-/// status that cannot be read counts as dirty: `ready` never vouches for a
-/// tree it could not read (OI-1003-Q189).
+/// `--no-optional-locks`, so the index is never refreshed on disk), with
+/// every filter driver the checkout configures switched off: the read runs
+/// no program of the repository's and a required driver cannot fail it
+/// (re-review 3 of 2026-10-16, finding 5). A status that cannot be read
+/// counts as dirty: `ready` never vouches for a tree it could not read
+/// (OI-1003-Q189).
 fn dirty(path: &Path) -> bool {
-    !git(path)
+    let Ok(mut status) = super::super::unfiltered_status(path) else {
+        return true;
+    };
+    !status
         .args([
             "status",
             "--porcelain=v1",
@@ -1877,6 +1945,21 @@ fn landed_match(
     remainder: &[u8],
     stripped: bool,
 ) -> Result<Option<String>> {
+    landed_compare(worktree, landed, name, remainder, stripped, true)
+}
+
+/// The landed blob of target `name` when it is `bytes` (`whole`), or
+/// starts with them (not `whole`), from its start or after the carried
+/// blocks a recorded removal took from its head (only with `stripped`).
+fn landed_compare(
+    worktree: &Path,
+    landed: &mut Landed<'_>,
+    name: &str,
+    bytes: &[u8],
+    stripped: bool,
+    whole: bool,
+) -> Result<Option<String>> {
+    let remainder = bytes;
     if landed.instance.is_empty() {
         return Ok(None);
     }
@@ -1914,9 +1997,15 @@ fn landed_match(
             at: 0,
             equal: true,
             skip,
+            whole,
         };
         objects.copy_into(&blob, &mut same, None)?;
-        if same.equal && same.skip == 0 && same.at == remainder.len() {
+        let long_enough = if whole {
+            same.at == remainder.len()
+        } else {
+            same.at >= remainder.len()
+        };
+        if same.equal && same.skip == 0 && long_enough {
             found = true;
             break;
         }
@@ -1925,13 +2014,15 @@ fn landed_match(
     Ok(found.then_some(blob))
 }
 
-/// A writer that checks it is handed exactly `expected`, in order, after
-/// its first `skip` bytes.
+/// A writer that checks it is handed exactly `expected` (`whole`), or
+/// bytes that start with it (not `whole`), in order, after its first `skip`
+/// bytes.
 struct SameBytes<'a> {
     expected: &'a [u8],
     at: usize,
     equal: bool,
     skip: u64,
+    whole: bool,
 }
 
 impl std::io::Write for SameBytes<'_> {
@@ -1944,7 +2035,16 @@ impl std::io::Write for SameBytes<'_> {
             .saturating_sub(u64::try_from(skipped).unwrap_or(u64::MAX));
         let bytes = given.get(skipped..).unwrap_or_default();
         let end = self.at.saturating_add(bytes.len());
-        self.equal &= self.expected.get(self.at..end) == Some(bytes);
+        if self.whole {
+            self.equal &= self.expected.get(self.at..end) == Some(bytes);
+        } else {
+            // Only the bytes `expected` covers are compared.
+            let (from, to) = (
+                self.at.min(self.expected.len()),
+                end.min(self.expected.len()),
+            );
+            self.equal &= self.expected.get(from..to) == bytes.get(..to - from);
+        }
         self.at = end;
         Ok(given.len())
     }
@@ -2120,7 +2220,10 @@ enum Plan {
 }
 
 /// Whether a target's bytes (under this landing's block, when it has one)
-/// start with a carried block (another landing's, or one no record names).
+/// start with a carried block: another landing's, or one of this landing's
+/// identity that the target's landed blob itself starts with (a round
+/// trip). A block of this landing's that no record names and that the
+/// landed blob does not start with is never carried (`Modified`, H49).
 const fn carried_of(state: Option<&Held>) -> bool {
     match state {
         Some(Held::Foreign) => true,
@@ -2823,7 +2926,9 @@ fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str, carried: bool) -
         });
     }
     // The removals recorded: the ones already recorded, a finished prior
-    // clear's (its steps done), and this run's (OI-1003-Q190).
+    // clear's (its step done: the target no longer starts with the carried
+    // blocks it removed, whatever a user has written since; re-review 3 of
+    // 2026-10-16, finding 3), and this run's (OI-1003-Q190).
     let mut recorded = landed.stripped.clone();
     if let Some(prior) = &prior {
         for strip in &prior.stripped {
@@ -2832,8 +2937,12 @@ fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str, carried: bool) -
                 .iter()
                 .find(|step| step.path == strip.path)
                 .is_some_and(|step| {
-                    whole_digest(&worktree.join(OsStr::from_bytes(&strip.path)))
-                        .is_ok_and(|now| now == step.after)
+                    still_carries(
+                        &worktree.join(OsStr::from_bytes(&strip.path)),
+                        step.old_block.as_deref(),
+                        strip,
+                    )
+                    .is_ok_and(|still| !still)
                 });
             if done {
                 recorded.push(strip.clone());
@@ -2890,12 +2999,12 @@ fn holds_token(bytes: &[u8]) -> bool {
 /// history, not a commit made here (OI-1003-Q191).
 const CARRIED: &str = "--glob=refs/carry/";
 
-/// Whether a patch (`git log -p` output, a plain or a combined diff) adds a
-/// line holding the token: a hunk line marked `+` against every parent (a
-/// line removed, or one a merge took unchanged from a parent, adds
-/// nothing).
-fn adds_token(patch: &[u8]) -> bool {
+/// The token lines a patch (`git log -p` output, plain or combined diffs)
+/// adds: hunk lines marked `+` against every parent (a line removed, or one
+/// a merge took unchanged from a parent, adds nothing), without the marks.
+fn added_token_lines(patch: &[u8]) -> BTreeSet<Vec<u8>> {
     let mut columns = 0;
+    let mut added = BTreeSet::new();
     for line in patch.split(|byte| *byte == b'\n') {
         if line.starts_with(b"diff ") {
             columns = 0;
@@ -2910,77 +3019,108 @@ fn adds_token(patch: &[u8]) -> bool {
             && line
                 .get(..columns)
                 .is_some_and(|marks| marks.iter().all(|mark| *mark == b'+'))
-            && holds_token(line.get(columns..).unwrap_or_default())
         {
-            return true;
+            let text = line.get(columns..).unwrap_or_default();
+            if holds_token(text) {
+                added.insert(text.to_vec());
+            }
         }
     }
-    false
+    added
 }
 
-/// Whether a commit of a branch's or tag's history (or a detached HEAD's)
-/// that the carried capture does not reach adds a line holding the token
-/// to a name a hand-off may write ([`ALL_NAMES`], whatever this run's
-/// targets are: re-review of 2026-10-16, finding 5). A block committed
-/// here and removed again is still published by a push (review of
-/// 2026-10-16); a block the source committed is the source's history,
-/// reported by [`in_source_history`] and never flagged (OI-1003-Q191).
-fn history_adds_token(worktree: &Path) -> Result<bool> {
-    let mut command = git(worktree);
-    command.args([
-        "log",
-        "--branches",
-        "--tags",
-        "--no-ext-diff",
-        "--no-textconv",
-        "--no-color",
-        "--format=",
-        "--patch",
-        "--cc",
-        "--unified=0",
-        "-G",
-        TOKEN,
-    ]);
-    if now_of(worktree)?.is_some() {
-        command.arg("HEAD");
-    }
-    command.args(["--not", CARRIED]);
-    command.arg("--").args(ALL_NAMES);
-    let out = command
+/// `git log` of the token lines added to a name a hand-off may write
+/// ([`ALL_NAMES`]) by the commits `revs` select, as patches.
+fn token_history(worktree: &Path, revs: &[&OsStr]) -> Result<BTreeSet<Vec<u8>>> {
+    let out = git(worktree)
+        .args([
+            "log",
+            "--no-ext-diff",
+            "--no-textconv",
+            "--no-color",
+            "--format=",
+            "--patch",
+            "--cc",
+            "--unified=0",
+            "-G",
+            TOKEN,
+        ])
+        .args(revs)
+        .arg("--")
+        .args(ALL_NAMES)
         .output()
         .refuse_at("git_carry::converge::handoff::history")?;
     if !out.status.success() {
         return Err(super::super::estimate::child_failed(&out.stderr));
     }
-    Ok(adds_token(&out.stdout))
+    Ok(added_token_lines(&out.stdout))
 }
 
-/// Whether the carried capture's history holds a commit that put the token
-/// into a name a hand-off may write: a block the source committed,
-/// reported once per workspace as information (OI-1003-Q191).
-fn in_source_history(worktree: &Path) -> Result<bool> {
-    let out = git(worktree)
-        .args([
-            "log",
-            CARRIED,
-            "--no-ext-diff",
-            "--no-textconv",
-            "--format=%H",
-            "-1",
-            "-S",
-            TOKEN,
-            "--",
-        ])
-        .args(ALL_NAMES)
-        .output()
-        .refuse_at("git_carry::converge::handoff::history")?;
-    Ok(out.status.success() && out.stdout.iter().any(|byte| !byte.is_ascii_whitespace()))
+/// The token lines the carried capture's history (the source's) added to a
+/// name a hand-off may write: blocks the source committed. Non-empty is
+/// `"source_history":true`, information only (OI-1003-Q191).
+fn carried_token_lines(worktree: &Path) -> Result<BTreeSet<Vec<u8>>> {
+    token_history(worktree, &[OsStr::new(CARRIED)])
+}
+
+/// Every stash entry (`refs/stash` and its reflog), or none.
+fn stashes(worktree: &Path) -> Result<Vec<std::ffi::OsString>> {
+    let listed = super::super::output(git(worktree).args([
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/stash",
+    ]))?;
+    if listed.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    let entries = super::super::output(git(worktree).args([
+        "reflog",
+        "show",
+        "--format=%H",
+        "refs/stash",
+        "--",
+    ]))?;
+    let mut oids: Vec<std::ffi::OsString> = entries
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| OsStr::from_bytes(line).to_owned())
+        .collect();
+    oids.push("refs/stash".into());
+    Ok(oids)
+}
+
+/// Whether a commit the carried capture does not reach, in the history of
+/// a branch, a tag, a remote-tracking ref, a stash entry or a detached
+/// HEAD, adds a token line to a name a hand-off may write ([`ALL_NAMES`],
+/// whatever this run's targets are: re-review of 2026-10-16, finding 5)
+/// that the source's history (`carried`, [`carried_token_lines`]) never
+/// added. A block committed here and removed again is still published by
+/// a push (review of 2026-10-16); a block the source committed, also
+/// cherry-picked or rebased here, is the source's history, never flagged
+/// (OI-1003-Q191; re-review 3 of 2026-10-16, finding 4): every BEGIN line
+/// names its block's id and landing, so a block of this landing's is never
+/// one of the source's lines. A pushed branch deleted here is still in its
+/// remote-tracking ref, and the block says to stash nothing that holds it
+/// (open item 19.10.4).
+fn history_adds_token(worktree: &Path, carried: &BTreeSet<Vec<u8>>) -> Result<bool> {
+    let stashes = stashes(worktree)?;
+    let mut revs: Vec<&OsStr> = ["--branches", "--tags", "--remotes"]
+        .into_iter()
+        .map(OsStr::new)
+        .collect();
+    revs.extend(stashes.iter().map(std::ffi::OsString::as_os_str));
+    if now_of(worktree)?.is_some() {
+        revs.push(OsStr::new("HEAD"));
+    }
+    revs.extend([OsStr::new("--not"), OsStr::new(CARRIED)]);
+    Ok(!token_history(worktree, &revs)?.is_subset(carried))
 }
 
 /// `--check` (read-only at the destination and in STATE): the hand-off's
-/// state, its open rows, and whether its token is staged or committed
-/// (the index, HEAD, every listed tip, and the history of every branch and
-/// tag).
+/// state, its open rows, and whether a token line the source's history
+/// never added is staged or committed (the index against HEAD, and the
+/// history of every branch, tag, remote-tracking ref, stash entry and
+/// HEAD).
 #[allow(clippy::too_many_lines)]
 fn check(
     workspace: &Workspace<'_>,
@@ -3088,18 +3228,23 @@ fn check(
     )?;
     let open = facts.open();
     // Commit detection (OI-1003-Q191): staged, a line holding the token in
-    // a target's index blob that its HEAD blob lacks (a block the source
-    // committed is in HEAD already); committed, a commit the carried
-    // capture does not reach that adds one, in any branch's or tag's
-    // history or HEAD's, for every name a hand-off may write. A token the
-    // source's history holds is information only.
+    // a target's index blob that its HEAD blob lacks and the source's
+    // history never added (a block the source committed is in HEAD
+    // already, or comes back by a cherry-pick); committed, a commit the
+    // carried capture does not reach that adds such a line, in the history
+    // of any branch, tag, remote-tracking ref, stash entry or HEAD, for
+    // every name a hand-off may write. A token the source's history holds
+    // is information only (re-review 3 of 2026-10-16, finding 4).
+    let carried_lines = carried_token_lines(worktree)?;
     let mut staged = false;
     for name in ALL_NAMES {
         let head = token_lines(worktree, "HEAD", name)?;
-        staged |= !token_lines(worktree, "", name)?.is_subset(&head);
+        staged |= token_lines(worktree, "", name)?
+            .iter()
+            .any(|line| !head.contains(line) && !carried_lines.contains(line));
     }
-    let committed = history_adds_token(worktree)?;
-    let source_history = in_source_history(worktree)?;
+    let committed = history_adds_token(worktree, &carried_lines)?;
+    let source_history = !carried_lines.is_empty();
     let state = if committed {
         "committed"
     } else if staged {
