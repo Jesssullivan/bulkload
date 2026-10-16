@@ -1139,6 +1139,23 @@ impl Store {
         Ok(())
     }
 
+    /// Whether this store holds a reuse row under `key`, whatever file is at
+    /// its path now: an output of exactly that seat was published here and
+    /// recorded (the delta lever's test, `Inbound::wants_manifest`). One
+    /// read of the primary key.
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub(crate) fn holds_output_row(&self, key: &[u8]) -> Result<bool> {
+        if !self.rows_trusted {
+            return Ok(false);
+        }
+        self.conn
+            .prepare_cached("SELECT EXISTS(SELECT 1 FROM outputs WHERE key = ?1)")
+            .and_then(|mut statement| statement.query_row([key], |row| row.get(0)))
+            .map_err(sqlite_error)
+    }
+
     /// Whether a current output is the same object recorded on successful apply.
     ///
     /// # Errors

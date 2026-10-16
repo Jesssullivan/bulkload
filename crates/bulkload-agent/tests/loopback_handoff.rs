@@ -9,6 +9,17 @@
 //!   decodes, the destination hashes every received byte, and a chunk
 //!   corrupted between the processes is refused `DIGEST_MISMATCH`.
 //!
+//! - The delta lever (OI-1003-Q154, off by default,
+//!   `BULKLOAD_LOCAL_NEW_PATH_STREAM=1`): a local `copy` streams a new path
+//!   into a destination whose published outputs hold chunks
+//!   (`transfer_new_paths_streamed`), where it asked for its manifest
+//!   first before; an existing path, and a seat whose output a third party
+//!   removed, still ask for their manifest, and so does every new path with
+//!   the lever off, with the hand-off off, and in a cross-process session,
+//!   which still fills a new path from the destination's own outputs and
+//!   verifies every byte it receives. The lever's tests turn it on for their
+//!   own destination root only.
+//!
 //! The tests share the process's counters, so they run one at a time.
 
 #![allow(
@@ -26,7 +37,8 @@ use std::sync::{Mutex, PoisonError};
 
 use bulkload_agent::counters::{Counter, Counters};
 use bulkload_agent::transfer::{
-    copy, read_frame, receive, set_loopback_handoff, settle_racy_window, TransferStats,
+    copy, read_frame, receive, set_local_new_path_stream, set_loopback_handoff, settle_racy_window,
+    TransferStats,
 };
 use bulkload_proto::frame::{
     Frame, DATA_HEADER_BYTES, FRAME_HEADER_BYTES, LENGTH_PREFIX_BYTES, TAG_CONTROL, TAG_DATA,
@@ -354,4 +366,239 @@ fn a_handed_frame_is_no_wire_v6_frame() {
     // The same bytes under the data tag are a (zero-length) v6 data frame.
     handed[LENGTH_PREFIX_BYTES] = TAG_DATA;
     assert!(Frame::decode(&handed).is_ok());
+}
+
+/// Add `name` to the source with `data`, past the racy allowance.
+fn add_source_file(scratch: &Scratch, name: &str, data: &[u8]) {
+    std::fs::write(scratch.path("source").join(name), data).unwrap();
+    settle_racy_window(&scratch.path("source")).unwrap();
+}
+
+/// A local `copy` with every decision counter, checked to leave no refusal.
+fn clean_local_copy(scratch: &Scratch) -> (TransferStats, Counters) {
+    let (stats, counted) = local_copy(scratch);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    (stats, counted)
+}
+
+/// Turn the delta lever on (`Some(true)`), off, or back to its default
+/// (`None`: off) for `scratch`'s destination.
+fn lever(scratch: &Scratch, on: Option<bool>) -> PathBuf {
+    let root = std::fs::canonicalize(scratch.path("destination")).unwrap();
+    set_local_new_path_stream(&root, on);
+    root
+}
+
+/// The delta lever (OI-1003-Q154): a new path copied into a destination
+/// that already holds outputs is streamed, as into an empty one. The source
+/// reads it once, with no manifest capture first
+/// (`source_ledger_miss_reads` 0), and no destination byte is read to fill
+/// it. A new file whose bytes the destination already holds (`twin`) is
+/// streamed too: a local fill would save no wire byte here. An unchanged
+/// rerun then reads 0 source bytes (S3, R25).
+#[test]
+fn a_new_path_in_a_populated_local_destination_is_streamed() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("new-path");
+    let (mut names, _) = populate(&scratch);
+    lever(&scratch, Some(true));
+    let (first, counted) = clean_local_copy(&scratch);
+    assert_eq!(first.completed, names.len() as u64);
+    assert_eq!(
+        counted.get(Counter::TransferManifestsAsked),
+        0,
+        "an empty store streams every entry: {}",
+        counted.render()
+    );
+    let fresh = noise(5, 2 << 20);
+    add_source_file(&scratch, "fresh", &fresh);
+    let twin = std::fs::read(scratch.path("source").join("big")).unwrap();
+    add_source_file(&scratch, "twin", &twin);
+    names.extend(["fresh", "twin"]);
+    let added = (fresh.len() + twin.len()) as u64;
+
+    let (stats, counted) = clean_local_copy(&scratch);
+    same_files(&scratch, &names);
+    assert_eq!(
+        counted.get(Counter::SourceLedgerMissReads),
+        0,
+        "no manifest capture before the first byte is placed: {}",
+        counted.render()
+    );
+    assert_eq!(counted.get(Counter::TransferManifestsAsked), 0);
+    assert_eq!(counted.get(Counter::TransferNewPathsStreamed), 2);
+    assert_eq!((stats.completed, stats.reused), (2, 3), "{stats:?}");
+    // R25: each new seat read exactly once, and nothing else read.
+    assert_eq!(stats.source_bytes_read, added, "{stats:?}");
+    assert_eq!(counted.get(Counter::SourceFileRead), added);
+    assert_eq!(stats.bytes_received, added);
+    assert_eq!(counted.get(Counter::WireHandedBytes), added);
+    assert_eq!(counted.get(Counter::HashWireVerify), 0);
+    assert_eq!(
+        counted.get(Counter::DestLocalReuseRead),
+        0,
+        "no destination byte read to fill a new path: {}",
+        counted.render()
+    );
+
+    // S3: the unchanged rerun reads nothing.
+    let (rerun, counted) = clean_local_copy(&scratch);
+    assert_eq!(
+        (rerun.source_bytes_read, rerun.reused, rerun.completed),
+        (0, names.len() as u64, 0),
+        "{rerun:?}"
+    );
+    assert_eq!(counted.get(Counter::SourceFileRead), 0);
+    assert_eq!(counted.get(Counter::TransferNewPathsStreamed), 0);
+
+    // A third party removes `twin`'s output. Its reuse row is still here, so
+    // it is no new seat: it is asked for by manifest, which the source
+    // answers from its ledger without a read, and filled from `big`'s output
+    // (P79): 0 source bytes, 0 received.
+    std::fs::remove_file(scratch.path("destination").join("twin")).unwrap();
+    let (lost, counted) = clean_local_copy(&scratch);
+    same_files(&scratch, &names);
+    assert_eq!(
+        counted.get(Counter::TransferManifestsAsked),
+        1,
+        "{}",
+        counted.render()
+    );
+    assert_eq!(counted.get(Counter::TransferNewPathsStreamed), 0);
+    assert_eq!(counted.get(Counter::SourceLedgerMissReads), 0);
+    assert_eq!(
+        (lost.source_bytes_read, lost.bytes_received, lost.completed),
+        (0, 0, 1),
+        "{lost:?}"
+    );
+    lever(&scratch, None);
+}
+
+/// The lever leaves an existing path alone: a changed file whose old output
+/// is this store's own still asks for its manifest, is filled from that
+/// output, and takes only the changed chunks from the source (the
+/// superseding publish, #187), reading the seat once.
+#[test]
+fn an_existing_path_in_a_local_copy_still_asks_for_its_manifest() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("existing-path");
+    let (names, _) = populate(&scratch);
+    lever(&scratch, Some(true));
+    clean_local_copy(&scratch);
+    let big = scratch.path("source").join("big");
+    let mut changed = std::fs::read(&big).unwrap();
+    changed[1_500_000..1_600_000].copy_from_slice(&noise(6, 100_000));
+    add_source_file(&scratch, "big", &changed);
+
+    let (delta, counted) = clean_local_copy(&scratch);
+    same_files(&scratch, &names);
+    assert_eq!(
+        counted.get(Counter::TransferManifestsAsked),
+        1,
+        "{}",
+        counted.render()
+    );
+    assert_eq!(counted.get(Counter::TransferNewPathsStreamed), 0);
+    assert_eq!(counted.get(Counter::SourceLedgerMissReads), 1);
+    assert_eq!(delta.source_bytes_read, changed.len() as u64, "{delta:?}");
+    assert!(
+        delta.bytes_received > 0 && delta.bytes_received < changed.len() as u64 / 2,
+        "filled from the old output, the rest requested: {delta:?}"
+    );
+    assert!(counted.get(Counter::DestLocalReuseRead) > 0);
+    assert_eq!(counted.get(Counter::OutputsSuperseded), 1);
+
+    let (rerun, _) = clean_local_copy(&scratch);
+    lever(&scratch, None);
+    assert_eq!(
+        (rerun.source_bytes_read, rerun.reused),
+        (0, names.len() as u64)
+    );
+}
+
+/// The A/B arms: by default (the lever off), with the lever turned off, and
+/// with the lever on but the hand-off off, a new path in a populated
+/// destination is asked for by manifest first, as before the lever. The
+/// source still reads it once: the manifest's chunks are kept and served
+/// from memory.
+#[test]
+fn a_new_path_asks_for_its_manifest_with_the_lever_or_the_hand_off_off() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("new-path-off");
+    let (mut names, _) = populate(&scratch);
+    clean_local_copy(&scratch);
+    let root = std::fs::canonicalize(scratch.path("destination")).unwrap();
+    for (name, seed, stream, handoff) in [
+        ("default", 10, None, None),
+        ("lever-off", 7, Some(false), None),
+        ("handoff-off", 8, Some(true), Some(false)),
+    ] {
+        let data = noise(seed, 1 << 20);
+        add_source_file(&scratch, name, &data);
+        names.push(name);
+        set_local_new_path_stream(&root, stream);
+        set_loopback_handoff(&root, handoff);
+        let (stats, counted) = local_copy(&scratch);
+        set_local_new_path_stream(&root, None);
+        set_loopback_handoff(&root, None);
+        assert!(stats.refusals.is_empty(), "{name}: {:?}", stats.refusals);
+        same_files(&scratch, &names);
+        assert_eq!(
+            counted.get(Counter::TransferManifestsAsked),
+            1,
+            "{name}: {}",
+            counted.render()
+        );
+        assert_eq!(counted.get(Counter::TransferNewPathsStreamed), 0, "{name}");
+        assert_eq!(counted.get(Counter::SourceLedgerMissReads), 1, "{name}");
+        assert_eq!(
+            stats.source_bytes_read,
+            data.len() as u64,
+            "{name}: {stats:?}"
+        );
+        assert_eq!(stats.bytes_received, data.len() as u64, "{name}");
+    }
+}
+
+/// `pull` keeps manifest-first for a new path: across processes the
+/// destination fills a new file from its own outputs (`twin`, whose bytes
+/// it holds, crosses the wire as nothing), asks only for what it lacks,
+/// and hashes every byte it receives.
+#[test]
+fn a_cross_process_new_path_keeps_its_manifest_and_verifies_every_byte() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("cross-new-path");
+    let (mut names, _) = populate(&scratch);
+    let (first, _, _) = cross_process(&scratch, None);
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    let fresh = noise(9, 2 << 20);
+    add_source_file(&scratch, "fresh", &fresh);
+    let twin = std::fs::read(scratch.path("source").join("big")).unwrap();
+    add_source_file(&scratch, "twin", &twin);
+    names.extend(["fresh", "twin"]);
+
+    let (stats, counted, seen) = cross_process(&scratch, None);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    same_files(&scratch, &names);
+    assert_eq!(
+        counted.get(Counter::TransferManifestsAsked),
+        2,
+        "{}",
+        counted.render()
+    );
+    assert_eq!(counted.get(Counter::TransferNewPathsStreamed), 0);
+    assert_eq!(
+        stats.bytes_received,
+        fresh.len() as u64,
+        "the twin is filled from the destination's own output: {stats:?}"
+    );
+    assert!(counted.get(Counter::DestLocalReuseRead) >= twin.len() as u64);
+    assert_eq!(seen.data_bytes, stats.bytes_received, "{seen:?}");
+    assert_eq!(counted.get(Counter::WireHandedBytes), 0);
+    assert_eq!(
+        counted.get(Counter::HashWireVerify),
+        stats.bytes_received,
+        "every received byte verified: {}",
+        counted.render()
+    );
 }

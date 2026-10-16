@@ -1144,7 +1144,7 @@ Code at adb9c66, re-checked at `origin/main` 6268175. `A` is
 | Model | Code |
 |---|---|
 | `Walk` | `A/transfer.rs` `walk_source`, `Outbound::walked`, `Outbound::offer` (`Control::Entry`); `A/walk.rs` `Walker` |
-| `RecvEntry` (Reuse / Send / WantManifest / Refuse; #169's adoption) | `A/transfer.rs` `Inbound::entry`, `Inbound::admit`, `Inbound::adopt_unrowed`; `A/transfer/unrowed.rs` `prove`, `record_key`; `A/materialize.rs` `Destination::identity`; `A/transfer_store.rs` `Store::output_matches` |
+| `RecvEntry` (Reuse / Send / WantManifest / Refuse; #169's adoption) | `A/transfer.rs` `Inbound::entry`, `Inbound::wants_manifest`, `Inbound::admit`, `Inbound::adopt_unrowed`; `A/transfer/unrowed.rs` `prove`, `record_key`; `A/materialize.rs` `Destination::identity`; `A/transfer_store.rs` `Store::output_matches` |
 | `RecvDecide` (capture) | `A/transfer.rs` `Outbound::decide`, `run_job`, `send_capture`, `manifest_capture`, `capture_file`, `capture_clock`; `A/git_carry.rs` `racy`; `A/transfer_store.rs` `Store::capture` |
 | `RecvManifest` | `A/transfer.rs` `Inbound::manifest`, `plan_file` |
 | `RecvNeed` | `A/transfer.rs` `Outbound::need_chunks`, `serve_chunks` |
@@ -1678,9 +1678,16 @@ What the model still does not hold, or abstracts:
 
 The model follows the code where the code and docs/design.md differ:
 
-- **WantManifest.** design.md says it is chosen when the output exists or
-  published outputs hold chunks. `Inbound::entry` also chooses it when the
-  sweep salvaged any temporary (`self.target.salvaged() > 0`).
+- **WantManifest.** design.md says it is chosen when the output exists,
+  the sweep salvaged a temporary, or published outputs hold chunks
+  (`Inbound::wants_manifest`). With the delta lever on (2026-10-16,
+  OI-1003-Q154, `BULKLOAD_LOCAL_NEW_PATH_STREAM=1`; off by default) a
+  local `copy` with the hand-off answers `Send` for an
+  absent output with no reuse row under its key when only published
+  outputs' chunks would justify a manifest. The model's `RecvEntry` already chooses freely between `send`
+  and `manifest` for an absent output, so the lever narrows a choice the
+  model leaves open and adds no step: every row's invariants hold for the
+  code with and without it.
 - **Superseding publish (WP0(d)).** Implemented by #187 (2026-10-07) as the
   exchange design. `SupersedeMode = "exchange"` models the code, its
   intent, ownership row and remembered refusal included ([#187's
