@@ -8,11 +8,14 @@
 # It reads the diff a PR shows (BASE...HEAD, from their merge base), renames
 # split into delete and add, and counts a file when:
 #   - its path names Darwin (darwin, macos or apple; e.g. io/sys_darwin.rs);
-#   - it is Rust and either side carries a Darwin cfg: target_os = "macos" or
-#     "ios", target_vendor = "apple", or not(target_os = "linux"), which is
-#     compiled everywhere but Linux;
-#   - it fixes what Darwin compiles: a Cargo.toml, Cargo.lock,
-#     rust-toolchain.toml, flake.nix or flake.lock.
+#   - it is under crates/bulkload-agent/src/io/, the platform layer
+#     sys_darwin.rs implements;
+#   - it is Rust and either side mentions target_os, target_vendor,
+#     target_family, cfg!( or a unix/windows cfg: a Linux-only branch has a
+#     Darwin else, and a Linux-gated item called from shared code breaks
+#     the Darwin build;
+#   - it fixes how Darwin compiles: build.rs, anything under .cargo/,
+#     Cargo.*, rust-toolchain(.toml) or flake.*.
 # It prints one `darwin: <path> (<reason>)` line per such file, then a
 # verdict. Exit 0: touched; 1: not touched; 2: error.
 set -euo pipefail
@@ -30,12 +33,14 @@ for rev in "$base" "$head"; do
   fi
 done
 merge_base=$(git merge-base "$base" "$head")
-marker='target_os *= *"(macos|ios)"|target_vendor *= *"apple"|not\( *target_os *= *"linux" *\)'
+marker='target_(os|vendor|family)|cfg!\(|cfg(_attr)?\([^]]*(unix|windows)'
 
 carries_marker() {
   local rev=$1 path=$2
+  # grep reads a process substitution, not a pipe: under pipefail, a
+  # large file's `git show` dies of SIGPIPE when grep -q stops early.
   git cat-file -e "$rev:$path" 2>/dev/null &&
-    git show "$rev:$path" | grep -Eq "$marker"
+    grep -Eq "$marker" <(git show "$rev:$path")
 }
 
 touched=0
@@ -46,14 +51,18 @@ while IFS= read -r -d '' path; do
     reason="Darwin path"
   fi
   shopt -u nocasematch
+  case "$path" in
+    crates/bulkload-agent/src/io/*) reason=${reason:-platform io layer} ;;
+    .cargo/* | */.cargo/*) reason=${reason:-cargo config} ;;
+  esac
   case "${path##*/}" in
-    Cargo.toml | Cargo.lock | rust-toolchain.toml | flake.nix | flake.lock)
+    build.rs | Cargo.* | rust-toolchain | rust-toolchain.toml | flake.*)
       reason=${reason:-build inputs}
       ;;
   esac
   if [[ -z "$reason" && "$path" == *.rs ]]; then
     if carries_marker "$merge_base" "$path" || carries_marker "$head" "$path"; then
-      reason="Darwin cfg"
+      reason="platform cfg"
     fi
   fi
   if [[ -n "$reason" ]]; then

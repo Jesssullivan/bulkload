@@ -1387,13 +1387,29 @@ proof obligation above stands.
   `just darwin-check` on pzm only when `just darwin-touched` flags the PR,
   never on neo (OI-1003-Q196); while pzm is on hold that check is deferred
   and the deferral recorded.
-- **Attestation.** `scripts/local-gate-receipt.sh` writes one receipt line
-  per run: host, PR, head sha, tree, main, the flake.lock and log sha256,
-  exit code and times, citing OI-1003-Q199 and R-N13. Every PR carries the
+- **Attestation.** `scripts/local-gate-receipt.sh` runs CI's gate exactly
+  (`nix flake check --no-build --no-write-lock-file`, then
+  `nix develop --ignore-environment` with CI's `--keep` list only, running
+  `just local-gate`), so neither the caller's shell nor ambient
+  `BULKLOAD_*`/`RUSTFLAGS` settings reach it, and refuses a dirty tree or an
+  overlay (ignored or excluded files other than build output, skip-worktree
+  or assume-unchanged files, outside cargo configs) unless
+  `--allow-overlay` is given and recorded. It writes one receipt line per
+  run, led by PASS or FAIL: host, PR, head sha, tree, main, the flake.lock
+  and log sha256, exit code, times, kind and overlay, citing OI-1003-Q199
+  and R-N13. A FAIL is posted only as "Local gate FAILED", never as a
+  receipt. The kind is derived from the diff (docs only when every changed
+  path is Markdown) and may be raised, never lowered. Every PR carries the
   receipt; code PRs also need the lanes' adversarial review (OI-1003-Q173);
   docs PRs need the receipt only. The receipt is self-attested: the exact
-  sha, the clean-tree and up-to-date checks, the log digest and tag-time CI
-  are its mitigations.
+  sha, the clean-tree, overlay and up-to-date checks, the log digest and
+  tag-time CI are its mitigations.
+- **Staleness.** A receipt is valid only while receipt.head equals the PR
+  head and receipt.main equals main's current tip; a push to the PR or a
+  merge to main voids it, so two PRs gated on the same main cannot both
+  merge on those receipts. `just local-gate-verify --pr N` checks both
+  against GitHub (and the receipt's tree against the head's) and is run
+  right before `gh pr merge --match-head-commit`.
 - **Retirement.** The local gate retires when GloriousFlywheel v4 fabric
   check runs land (TIN-5946). Sting RBE is later, not part of this ruling.
 

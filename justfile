@@ -25,7 +25,7 @@ python-lint:
     cd {{ root }} && ruff format --check scripts tests
 
 shell-lint:
-    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh scripts/local-gate-receipt.sh scripts/darwin-touched.sh
+    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh scripts/local-gate-receipt.sh scripts/local-gate-verify.sh scripts/darwin-touched.sh
 
 workflow-lint:
     cd {{ root }} && actionlint .github/workflows/*.yml
@@ -378,21 +378,29 @@ bazel-graph:
     cd {{ root }} && bazelisk --max_idle_secs=60 query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null
     @echo "bazel-graph: //:bulkload and //:tests loaded"
 
-# The merge gate (OI-1003-Q199, 2026-10-16). Run it on sting inside
-# `nix develop .#default`, on the exact PR head brought up to date with
-# main; `scripts/local-gate-receipt.sh` (`just local-gate-receipt`) runs it
-# and writes the receipt the merge needs. It runs everything CI's `ci-source`
-# and `ci-fault-harness` run (the contract test holds the sets equal), with
-# the history scan limited to HEAD's ancestry (`secrets-scan-head`), plus
-# the Bazel graph load. CI runs only on `v*` tags and workflow_dispatch, as
-# the backstop. It retires when GloriousFlywheel v4 fabric check runs land
-# (TIN-5946).
+# The merge gate (OI-1003-Q199, 2026-10-16), on sting, on the exact PR head
+# brought up to date with main. Run it through `just local-gate-receipt`
+# (`scripts/local-gate-receipt.sh`), which runs CI's `nix flake check` and
+# then this recipe in a clean `nix develop --ignore-environment .#default`,
+# as the action does, and writes the receipt the merge needs. It runs
+# everything CI's `ci-source` and `ci-fault-harness` run (the contract test
+# holds the sets equal), with the history scan limited to HEAD's ancestry
+# (`secrets-scan-head`), plus the Bazel graph load. CI runs only on `v*`
+# tags and workflow_dispatch, as the backstop. It retires when
+# GloriousFlywheel v4 fabric check runs land (TIN-5946).
 local-gate: check-fast secrets-scan-head bazel-graph
 
-# Run `local-gate` on HEAD and print its receipt line; `--pr N --post` also
-# comments it on PR N. See the script's header for the checks it makes.
+# Run `local-gate` on HEAD and print its receipt line, led by PASS or FAIL;
+# `--pr N --post` also comments it on PR N. See the script's header for the
+# checks it makes.
 local-gate-receipt *args:
     cd {{ root }} && scripts/local-gate-receipt.sh {{ args }}
+
+# Is PR N's receipt still valid? A receipt holds only while its head is the
+# PR head and its main is main's current tip. Run right before
+# `gh pr merge --match-head-commit` (OI-1003-Q199).
+local-gate-verify *args:
+    cd {{ root }} && scripts/local-gate-verify.sh {{ args }}
 
 # Does a diff touch Darwin code? Prints the reasons and a yes/no verdict. A
 # yes means the PR needs `darwin-check` on pzm before it merges

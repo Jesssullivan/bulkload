@@ -211,14 +211,35 @@ no longer true (R-N55).
 
 Merge gate (OI-1003-Q199, 2026-10-16, Linear TIN-4543 comment `b208cbae`):
 a PR merges on a local receipt from sting, not on runner CI.
-`just local-gate-receipt` (`scripts/local-gate-receipt.sh`) runs
-`just local-gate` (`check-fast`, the history secret scan limited to HEAD's
-ancestry `secrets-scan-head`, and the Bazel graph load `bazel-graph`; the
-contract test holds it to CI's gate set) inside
-`nix develop` on the exact PR head brought up to date with main, and records
-head, tree, main, the flake.lock and log digests and the exit code. Docs PRs
-need the receipt only; code PRs also need the lanes' adversarial review
-(OI-1003-Q173). A PR that `just darwin-touched` flags also needs
+`just local-gate-receipt --pr N --post` (`scripts/local-gate-receipt.sh`)
+runs, from the repository root, exactly what the CI action runs:
+`nix flake check --no-build --no-write-lock-file`, then
+`nix develop --no-write-lock-file --ignore-environment` keeping only CI's
+`HOME`, `NIX_*_HOME` and `XDG_*_HOME`, running `just local-gate`
+(`check-fast`, the history secret scan limited to HEAD's ancestry
+`secrets-scan-head`, and the Bazel graph load `bazel-graph`; the contract
+test holds it to CI's gate set and derives the `nix develop` line from the
+action). Ambient `BULKLOAD_*`, `RUSTFLAGS`, `CARGO_*` and `PATH` never reach
+the gate. It refuses a dirty tree and an overlay (an ignored or excluded
+file other than build output, such as `.envrc.local` or `.env.local`; a
+skip-worktree or assume-unchanged file; a cargo config above the checkout
+or in `~/.cargo`) unless `--allow-overlay` is given, which the receipt
+records. The receipt line leads with PASS or FAIL and records head, tree,
+main, the flake.lock and log digests, the exit code, the kind and the
+overlay; `--post` comments a PASS as "Local gate receipt" and a FAIL only
+as "Local gate FAILED", never as a receipt. The kind comes from the diff:
+docs when every changed path is Markdown, else code; `--kind` may raise
+docs to code, never lower it. Docs PRs need the receipt only; code PRs also
+need the lanes' adversarial review (OI-1003-Q173).
+A receipt is valid only while receipt.head is the PR head and receipt.main
+is main's current tip: a push to the PR or any merge to main voids it.
+Right before `gh pr merge --match-head-commit`, the merge runs
+`just local-gate-verify --pr N`, which checks both against GitHub, the
+receipt's tree against the head's, and that the newest gate comment from a
+writer for that head and main is a PASS. A PR that `just darwin-touched`
+flags (a Darwin path, the io layer, a Rust file with any `target_os`,
+`target_vendor`, `target_family`, `cfg!(` or unix/windows cfg, `build.rs`,
+`.cargo/`, `Cargo.*`, the toolchain or `flake.*`) also needs
 `just darwin-check` on pzm, never neo (OI-1003-Q196); while pzm is on hold
 that check is deferred and recorded with the receipt. CI runs only on `v*`
 tags and `workflow_dispatch`, as the backstop. The local gate retires when

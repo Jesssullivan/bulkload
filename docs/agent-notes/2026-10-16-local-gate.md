@@ -25,9 +25,9 @@ requires status checks) was made before this lane and is not in the repo.
   runs `just local-gate`, logs under `$BULKLOAD_LOCAL_GATE_DIR` (default
   `~/.local/state/bulkload/local-gate`), prints and appends the receipt
   line; `--post` comments it after re-checking the PR head.
-- `scripts/darwin-touched.sh`: exit 0 when a diff touches a Darwin path, a
-  Rust file carrying a Darwin cfg (`macos`/`ios`, `apple`,
-  `not(target_os = "linux")`), or a Cargo/toolchain/flake input; else 1.
+- `scripts/darwin-touched.sh`: exit 0 when a diff touches a Darwin path,
+  the io layer, a Rust file with any platform cfg, or a build input; else
+  1 (widened after review; see below).
 - `.github/workflows/ci.yml`: triggers are `push: tags v*` and
   `workflow_dispatch` only; the PR-only job condition and PR/merge-queue
   sha and repository expressions are gone (`github.sha`,
@@ -46,11 +46,57 @@ requires status checks) was made before this lane and is not in the repo.
 - `AGENTS.md` (Agent lanes bullet and Validation only) and `docs/slo.md`
   (amendment 2026-10-16) record Q199 and Q196.
 
+## Review fixes (2026-10-16, second commit set)
+
+Two adversarial reviews of head `930a40d` (one FIX-FIRST, one MERGEABLE
+with minors). The branch was rebased onto main `d7d2ba35` (#236) first.
+Contract tests were written first and failed (12 failures, 3 errors) before
+the scripts changed.
+
+- MAJOR, gate environment: the receipt script now runs, from the repo root,
+  `nix flake check --no-build --no-write-lock-file || exit` then
+  `exec nix develop --no-write-lock-file --ignore-environment` with CI's
+  keeps only (HOME, NIX_*_HOME, XDG_*_HOME) running `just local-gate`, in a
+  subshell whose status is the gate's. `local_gate_run_block` derives that
+  block from the action's two `exec nix develop` steps, so a keep added on
+  either side or a dropped flake check fails the contract. The script also
+  refuses overlays (ignored/excluded files other than `target/`, `bazel-*`
+  and Python caches; skip-worktree and assume-unchanged files; cargo
+  configs above the checkout or in `~/.cargo`) unless `--allow-overlay`,
+  recorded as the receipt's `overlay` field. Admitted residual: HOME is the
+  operator's, so `~/.bazelrc` (on sting: output root, repository and disk
+  cache paths only) applies to `bazel-graph`; inside the shell TMPDIR is
+  nix's own, and cargo builds in the checkout's `target/`.
+- MEDIUM, staleness: AGENTS.md and slo.md state receipt.head == PR head and
+  receipt.main == main's tip; `just local-gate-verify --pr N`
+  (`scripts/local-gate-verify.sh`) checks both, the tree, and that the
+  newest writer-authored gate comment for that head and main is a PASS.
+  Comments from non-writers (author_association other than OWNER, MEMBER,
+  COLLABORATOR) are ignored.
+- MEDIUM, darwin-touched: any `.rs` mentioning `target_os`,
+  `target_vendor`, `target_family`, `cfg!(` or a unix/windows cfg on either
+  side; `crates/bulkload-agent/src/io/**`; `build.rs`, `.cargo/`,
+  `Cargo.*`, `rust-toolchain(.toml)`, `flake.*`. The marker grep no longer
+  reads a pipe (under pipefail a large file's `git show` could die of
+  SIGPIPE and hide a match). The reviewer's examples are fixtures in
+  `test_darwin_touched_flags_what_darwin_compiles`.
+- MINOR: the receipt leads with PASS/FAIL; `--post` posts a FAIL only as
+  "Local gate FAILED ...; not a receipt". The kind is derived (docs only
+  when every changed path is `*.md`); `--kind docs` on a code diff is
+  refused. The contract pins the exit-code capture (and allows exactly two
+  `gate=` assignments), the origin/main lookup, the PR-head pre-check, the
+  post-gate HEAD/tree re-check and the post-time PR-head re-check;
+  `test_local_gate_receipt_executes_its_refusals_and_verdicts` runs the
+  script against a fixture origin with `nix` and `gh` stubbed.
+
 ## Open
 
 - The coordinator's merge train (`bulkload.worktrees/local-gate-merge.sh`,
   outside the repo) should call `just local-gate-receipt --pr N --post`
-  instead of its inline gate, and run `just darwin-touched` to decide on
-  pzm.
+  instead of its inline gate, run `just darwin-touched` to decide on pzm,
+  and call `just local-gate-verify --pr N` right before
+  `gh pr merge --match-head-commit`. Running both scripts from main's
+  checkout (not the PR's copy) closes the self-attestation gap the second
+  review noted.
 - #240 and #241 also edit the AGENTS.md lines this PR edits (the R-N69
   bullet and Validation); whichever lands second resolves the conflict.

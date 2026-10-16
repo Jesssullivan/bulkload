@@ -20,6 +20,8 @@ LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
 LOCAL_GATE_RECEIPT_PATH = "scripts/local-gate-receipt.sh"
+LOCAL_GATE_VERIFY_PATH = "scripts/local-gate-verify.sh"
+DARWIN_TOUCHED_PATH = "scripts/darwin-touched.sh"
 PUBLIC_KEY = "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
 NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
@@ -737,26 +739,131 @@ def validate_local_gate(justfile: str) -> None:
 
 
 # The receipt (OI-1003-Q199): what `scripts/local-gate-receipt.sh` must run
-# and record. Each line must appear exactly once.
+# and record. Each snippet must appear exactly once.
 LOCAL_GATE_RECEIPT_REQUIRED = (
-    'just --justfile "$root/justfile" --working-directory "$root" local-gate >"$log" 2>&1 ||',
-    'if [[ -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then',
-    'git merge-base --is-ancestor "$main" "$head" ||',
     'if [[ "$(uname -s)" == Darwin || "$host" == neo* ]]; then',
-    'receipt="local terminal gate ($host) | PR #${pr:-none} | head $head | tree $tree"',
-    'receipt+=" | main $main | flake.lock sha256 $flake_lock | log sha256 $log_sha"',
-    'receipt+=" | exit $gate | $started..$finished | kind $kind | just local-gate"',
+    'if [[ -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then',
+    # Ignored or excluded files and index flags that could steer the build
+    # while `tree` attests HEAD; refused unless --allow-overlay is recorded.
+    "done < <(git ls-files -z --others --ignored --exclude-standard --directory)",
+    "done < <(git ls-files -v -z)",
+    'if [[ -n "$overlay" && "$allow_overlay" != true ]]; then',
+    "main=$(git rev-parse --verify origin/main)",
+    'git merge-base --is-ancestor "$main" "$head" ||',
+    # The kind comes from the diff; --kind may raise docs to code only.
+    'done < <(git diff --no-renames --name-only -z "$main" "$head")',
+    'if [[ "$kind_flag" == docs && "$kind" == code ]]; then',
+    # The PR-head pre-check.
+    'if [[ -n "$pr" ]]; then\n'
+    '  [[ "$(pr_head)" == "OPEN main $head" ]] ||\n'
+    '    die "PR #$pr is not open against main with head $head"\n'
+    "fi\n",
+    # The post-gate HEAD and tree re-check.
+    '[[ "$(git rev-parse HEAD)" == "$head" &&\n'
+    '  -z "$(git status --porcelain=v1 --untracked-files=normal)" ]] ||\n'
+    '  die "HEAD or the tree changed while the gate ran; no receipt"\n',
+    'if [[ "$gate" -eq 0 ]]; then\n  verdict=PASS\nelse\n  verdict=FAIL\nfi\n',
+    'receipt="$verdict | local terminal gate ($host) | PR #${pr:-none} | head $head"',
+    'receipt+=" | tree $tree | main $main | flake.lock sha256 $flake_lock"',
+    'receipt+=" | log sha256 $log_sha | exit $gate | $started..$finished"',
+    'receipt+=" | kind $kind | overlay $overlay_field"',
+    'receipt+=" | nix flake check, nix develop --ignore-environment: just local-gate"',
     'receipt+=" | OI-1003-Q199 R-N13"',
+    # The post re-checks the PR head; a FAIL is never posted as a receipt.
+    '  [[ "$(pr_head)" == "OPEN main $head" ]] ||\n'
+    '    die "PR #$pr head moved off $head during the gate; not posted"\n',
+    '  if [[ "$verdict" == PASS ]]; then\n'
+    '    heading="Local gate receipt (OI-1003-Q199)"\n'
+    "  else\n"
+    '    heading="Local gate FAILED (OI-1003-Q199); not a receipt"\n'
+    "  fi\n",
     'exit "$gate"',
+)
+NIX_FLAKE_CHECK = "nix flake check --no-build --no-write-lock-file"
+
+
+def nix_develop_blocks(source: str) -> list[tuple[str, ...]]:
+    """Every `exec nix develop` command, one stripped line per continuation."""
+    lines = source.splitlines()
+    blocks = []
+    for index, line in enumerate(lines):
+        if not line.strip().startswith("exec nix develop "):
+            continue
+        block = [lines[index - 1].strip()]
+        while True:
+            block.append(lines[index].strip())
+            if not lines[index].endswith(" \\"):
+                break
+            index += 1
+        blocks.append(tuple(block))
+    return blocks
+
+
+def local_gate_run_block(action: str) -> str:
+    """The receipt's gate run, derived from CI's source gate: the same
+    `nix flake check` and the same clean `nix develop` (the same `--keep`
+    list and nothing else), run from the repository root with `local-gate`
+    in place of `ci-source`, in a subshell whose status the receipt records."""
+    blocks = nix_develop_blocks(action)
+    if len(blocks) != 2 or {block[-1] for block in blocks} != {
+        ".#default --command just ci-fault-harness",
+        ".#default --command just ci-source",
+    }:
+        raise ContractError("CI must run exactly its two gates through nix develop")
+    if blocks[0][:-1] != blocks[1][:-1] or blocks[0][0] != NIX_FLAKE_CHECK:
+        raise ContractError("CI's two gates must share one flake check and env")
+    flake_check, exec_line, *keeps, _ = blocks[0]
+    if "--ignore-environment" not in exec_line.split():
+        raise ContractError("CI's nix develop must ignore the environment")
+    body = [f"  {NIX_FLAKE_CHECK} || exit", f"  {exec_line}"]
+    body += [f"    {keep}" for keep in keeps]
+    body.append("    .#default --command just local-gate")
+    return "\n".join(
+        ['cd "$root"', "gate=0", "(", *body, ') >"$log" 2>&1 || gate=$?', ""]
+    )
+
+
+def validate_local_gate_receipt(script: str, action: str) -> None:
+    for snippet in LOCAL_GATE_RECEIPT_REQUIRED:
+        if script.count(snippet) != 1:
+            raise ContractError(f"local-gate receipt drifted: {snippet}")
+    if script.count(local_gate_run_block(action)) != 1:
+        raise ContractError("local-gate receipt must run the gate as CI does")
+    if len(nix_develop_blocks(script)) != 1:
+        raise ContractError("local-gate receipt must run nix develop once")
+    if len(re.findall(r"(?<![A-Za-z0-9_])gate=", script)) != 2:
+        raise ContractError("local-gate receipt must set the exit code only once")
+    if script.count("gh pr comment") != 1:
+        raise ContractError("local-gate receipt must post from one place")
+    validate_no_token_handling(script)
+
+
+def validate_no_token_handling(script: str) -> None:
+    if "set -x" in script or re.search(r"\$\{?[A-Za-z_]*TOKEN|gh auth token", script):
+        raise ContractError("local-gate scripts must not trace or handle a token")
+
+
+# `just local-gate-verify --pr N` (OI-1003-Q199): run right before
+# `gh pr merge --match-head-commit`, it passes only when the newest gate
+# comment from a writer for the PR's current head and main tip is a PASS
+# receipt whose tree is that head's tree.
+LOCAL_GATE_VERIFY_REQUIRED = (
+    'pr_state=$(gh pr view "$pr" --json state,baseRefName,headRefOid \\\n'
+    "  -q '[.state, .baseRefName, .headRefOid] | join(\" \")')\n",
+    'main=$(gh api "repos/{owner}/{repo}/git/ref/heads/main" -q .object.sha)',
+    'tree=$(gh api "repos/{owner}/{repo}/commits/$head" -q .commit.tree.sha)',
+    "OWNER | MEMBER | COLLABORATOR) ;;",
+    '[[ "$receipt_head" == "$head" && "$receipt_main" == "$main" ]] || continue',
+    '[[ "$found" == PASS ]] ||',
+    '[[ "$found_tree" == "$tree" && "$found_exit" == 0 ]] ||',
 )
 
 
-def validate_local_gate_receipt(script: str) -> None:
-    for line in LOCAL_GATE_RECEIPT_REQUIRED:
-        if script.count(line) != 1:
-            raise ContractError(f"local-gate receipt drifted: {line}")
-    if "set -x" in script or re.search(r"\$\{?[A-Za-z_]*TOKEN|gh auth token", script):
-        raise ContractError("local-gate receipt must not trace or handle a token")
+def validate_local_gate_verify(script: str) -> None:
+    for snippet in LOCAL_GATE_VERIFY_REQUIRED:
+        if script.count(snippet) != 1:
+            raise ContractError(f"local-gate verify drifted: {snippet}")
+    validate_no_token_handling(script)
 
 
 def sha256(source: str) -> str:
@@ -2667,6 +2774,181 @@ def validate_flake_topology(
         raise ContractError("original nixpkgs source authority drifted")
 
 
+def write_executable(path: Path, text: str) -> None:
+    path.write_text(text, encoding="utf-8")
+    path.chmod(0o755)
+
+
+STUB_NIX = """#!/bin/bash
+printf '%s\\n' "$*" >>"$STUB_NIX_LOG"
+case "$1" in
+  flake) exit "${STUB_FLAKE_EXIT:-0}" ;;
+  develop) exit "${STUB_DEVELOP_EXIT:-0}" ;;
+esac
+exit 9
+"""
+STUB_GH = """#!/bin/bash
+case "$1 $2" in
+  "pr view") printf 'OPEN main %s\\n' "$STUB_PR_HEAD" ;;
+  "pr comment")
+    while [[ $# -gt 0 ]]; do
+      [[ "$1" == --body ]] && printf '%s\\n' "$2" >>"$STUB_COMMENTS"
+      shift
+    done
+    ;;
+  *) exit 9 ;;
+esac
+"""
+
+
+class GateFixture:
+    """A throwaway origin and PR checkout for the local-gate scripts, with
+    `nix` and `gh` stubbed so nothing builds and nothing reaches GitHub. The
+    scripts run with a private HOME, so no global git config or excludes
+    leak in; hooks are off only in these fixture repos (R-N98)."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def __enter__(self) -> GateFixture:
+        git = shutil.which("git") or "/usr/bin/git"
+        if not Path(git).is_file():
+            raise unittest.SkipTest("git is not available")
+        self.git_path = git
+        self._temporary = tempfile.TemporaryDirectory()
+        base = Path(self._temporary.name)
+        self.work = base / "work"
+        self.stub = base / "bin"
+        self.nix_log = base / "nix.log"
+        self.comments_path = base / "comments"
+        home = base / "home"
+        for path in (self.stub, home, base / "state"):
+            path.mkdir()
+        write_executable(self.stub / "nix", STUB_NIX)
+        write_executable(self.stub / "gh", STUB_GH)
+        self.env = {
+            "PATH": os.pathsep.join(
+                [
+                    str(self.stub),
+                    str(Path(git).parent),
+                    os.environ.get("PATH", "/usr/bin:/bin"),
+                ]
+            ),
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_AUTHOR_NAME": "Bulkload CI contract",
+            "GIT_AUTHOR_EMAIL": "bulkload-ci@example.invalid",
+            "GIT_COMMITTER_NAME": "Bulkload CI contract",
+            "GIT_COMMITTER_EMAIL": "bulkload-ci@example.invalid",
+            "BULKLOAD_LOCAL_GATE_DIR": str(base / "state"),
+            "STUB_NIX_LOG": str(self.nix_log),
+            "STUB_COMMENTS": str(self.comments_path),
+        }
+        subprocess.run(
+            [git, "init", "-q", "--bare", "-b", "main", str(base / "origin.git")],
+            check=True,
+            env=self.env,
+        )
+        subprocess.run(
+            [git, "init", "-q", "-b", "main", str(self.work)], check=True, env=self.env
+        )
+        self.git("remote", "add", "origin", str(base / "origin.git"))
+        self.commit(
+            {
+                "README.md": "bulkload\n",
+                "flake.lock": "{}\n",
+                ".gitignore": "/target/\n",
+            }
+        )
+        self.write(".git/info/exclude", ".envrc.local\n")
+        self.git("push", "-q", "origin", "main")
+        self.git("fetch", "-q", "origin")
+        self.git("checkout", "-q", "-b", "pr")
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self._temporary.cleanup()
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            [
+                self.git_path,
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                *args,
+            ],
+            cwd=self.work,
+            env=self.env,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    def write(self, path: str, text: str) -> None:
+        target = self.work / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(text, encoding="utf-8")
+
+    def remove(self, path: str) -> None:
+        (self.work / path).unlink()
+
+    def commit(self, files: dict[str, str]) -> str:
+        for path, text in files.items():
+            self.write(path, text)
+        self.git("add", "-A")
+        self.git("commit", "-qm", "fixture")
+        return self.git("rev-parse", "HEAD")
+
+    def branch_commit(self, files: dict[str, str]) -> str:
+        return self.commit(files)
+
+    def commit_on_main(self, files: dict[str, str]) -> str:
+        self.git("checkout", "-q", "main")
+        head = self.commit(files)
+        self.git("push", "-q", "origin", "main")
+        self.git("checkout", "-q", "pr")
+        return head
+
+    def advance_main(self) -> None:
+        tip = self.git(
+            "commit-tree", "origin/main^{tree}", "-p", "origin/main", "-m", "moved"
+        )
+        self.git("push", "-q", "origin", f"{tip}:refs/heads/main")
+
+    def receipt(
+        self,
+        *args: str,
+        pr_head: str = "",
+        develop_exit: int = 0,
+        flake_exit: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        for path in (self.nix_log, self.comments_path):
+            path.write_text("")
+        env = dict(
+            self.env,
+            STUB_PR_HEAD=pr_head,
+            STUB_DEVELOP_EXIT=str(develop_exit),
+            STUB_FLAKE_EXIT=str(flake_exit),
+        )
+        return subprocess.run(
+            ["/bin/bash", str(self.root / LOCAL_GATE_RECEIPT_PATH), *args],
+            cwd=self.work,
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def nix_calls(self) -> list[str]:
+        return self.nix_log.read_text().splitlines()
+
+    def comments(self) -> list[str]:
+        return self.comments_path.read_text().splitlines()
+
+
 class CiContractTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -4555,20 +4837,105 @@ class CiContractTest(unittest.TestCase):
 
     def test_local_gate_receipt_runs_the_gate_and_records_the_receipt(self) -> None:
         script = (self.root / LOCAL_GATE_RECEIPT_PATH).read_text(encoding="utf-8")
-        validate_local_gate_receipt(script)
+        validate_local_gate_receipt(script, self.action)
         mode = (self.root / LOCAL_GATE_RECEIPT_PATH).stat().st_mode
         self.assertNotEqual(mode & stat.S_IXUSR, 0)
+        # The gate runs exactly CI's clean environment: HOME and the Nix and
+        # XDG homes, nothing ambient (no BULKLOAD_*, RUSTFLAGS or PATH).
+        (block,) = nix_develop_blocks(script)
+        self.assertEqual(block[0], f"{NIX_FLAKE_CHECK} || exit")
+        self.assertIn("--ignore-environment", block[1].split())
+        self.assertEqual(block[-1], ".#default --command just local-gate")
+        self.assertEqual(
+            [line.split()[1] for line in block[2:-1]],
+            [
+                "HOME",
+                "NIX_CACHE_HOME",
+                "NIX_CONFIG_HOME",
+                "NIX_DATA_HOME",
+                "NIX_STATE_HOME",
+                "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+            ],
+        )
+        keep_home = "    --keep HOME \\\n"
         variants = [
             script.replace(
-                ' local-gate >"$log" 2>&1 ||', ' check-fast >"$log" 2>&1 ||'
+                ".#default --command just local-gate",
+                ".#default --command just check-fast",
+                1,
+            ),
+            script.replace(" --ignore-environment \\\n", " \\\n", 1),
+            script.replace(keep_home, keep_home + "    --keep RUSTFLAGS \\\n", 1),
+            script.replace(keep_home, keep_home + "    --keep BULKLOAD_FAULT \\\n", 1),
+            script.replace(f"  {NIX_FLAKE_CHECK} || exit\n", "", 1),
+            script.replace(
+                f"  {NIX_FLAKE_CHECK} || exit\n", f"  {NIX_FLAKE_CHECK} || true\n", 1
+            ),
+            script.replace("  exec nix develop", "  nix develop", 1),
+            script.replace('cd "$root"\ngate=0\n', "gate=0\n", 1),
+            # Exit-code capture (review: `gate=$?` -> `gate=0` survived).
+            script.replace(') >"$log" 2>&1 || gate=$?', ') >"$log" 2>&1 || gate=0', 1),
+            script.replace('exit "$gate"', "exit 0", 1),
+            script.replace(
+                "verdict=PASS\nelse\n  verdict=FAIL",
+                "verdict=PASS\nelse\n  verdict=PASS",
+                1,
+            ),
+            script.replace('exit "$gate"', 'gate=0\nexit "$gate"', 1),
+            # origin/main read from HEAD fakes the up-to-date check.
+            script.replace(
+                "main=$(git rev-parse --verify origin/main)",
+                "main=$(git rev-parse --verify HEAD)",
+                1,
             ),
             script.replace(
                 'git merge-base --is-ancestor "$main" "$head" ||', "true ||", 1
             ),
+            # The PR-head pre-check and the post-gate HEAD/tree re-check.
+            script.replace(
+                '  [[ "$(pr_head)" == "OPEN main $head" ]] ||\n    die "PR #$pr is not open',
+                '  true ||\n    die "PR #$pr is not open',
+                1,
+            ),
+            script.replace(
+                '  die "HEAD or the tree changed while the gate ran; no receipt"',
+                "  true",
+                1,
+            ),
+            script.replace(
+                '[[ "$(git rev-parse HEAD)" == "$head" &&',
+                '[[ "$head" == "$head" &&',
+                1,
+            ),
+            script.replace(
+                '  [[ "$(pr_head)" == "OPEN main $head" ]] ||\n    die "PR #$pr head moved',
+                '  true ||\n    die "PR #$pr head moved',
+                1,
+            ),
+            # A FAIL posted under the receipt heading.
+            script.replace(
+                'heading="Local gate FAILED (OI-1003-Q199); not a receipt"',
+                'heading="Local gate receipt (OI-1003-Q199)"',
+                1,
+            ),
+            # Overlay and kind.
+            script.replace(
+                'if [[ -n "$overlay" && "$allow_overlay" != true ]]; then',
+                "if false; then",
+                1,
+            ),
+            script.replace("done < <(git ls-files -v -z)", "done < /dev/null", 1),
+            script.replace(
+                'if [[ "$kind_flag" == docs && "$kind" == code ]]; then',
+                "if false; then",
+                1,
+            ),
             script.replace(" | log sha256 $log_sha", "", 1),
             script.replace(' || "$host" == neo* ]]', " ]]", 1),
-            script.replace('exit "$gate"', "exit 0", 1),
-            script.replace("set -euo pipefail\n", "set -euxo pipefail\nset -x\n", 1),
+            script.replace("set -euo pipefail\n", "set -euo pipefail\nset -x\n", 1),
             script.replace(
                 "pr_head() {\n", 'pr_head() {\n  printf "%s" "$GH_TOKEN" >&2\n', 1
             ),
@@ -4577,7 +4944,329 @@ class CiContractTest(unittest.TestCase):
             with self.subTest(index=index):
                 self.assertNotEqual(unsafe, script)
                 with self.assertRaises(ContractError):
-                    validate_local_gate_receipt(unsafe)
+                    validate_local_gate_receipt(unsafe, self.action)
+        # CI and the receipt cannot drift apart: a keep added to CI only, or a
+        # CI gate that drops the flake check, breaks the derived block.
+        for unsafe_action in (
+            self.action.replace(
+                "          --keep HOME \\\n",
+                "          --keep HOME \\\n          --keep CARGO_HOME \\\n",
+            ),
+            self.action.replace(
+                f"        {NIX_FLAKE_CHECK}\n        exec nix develop",
+                "        exec nix develop",
+                1,
+            ),
+        ):
+            self.assertNotEqual(unsafe_action, self.action)
+            with self.assertRaises(ContractError):
+                validate_local_gate_receipt(script, unsafe_action)
+
+    @unittest.skipIf(
+        sys.platform == "darwin" or os.uname().nodename.startswith("neo"),
+        "the receipt script refuses Darwin and neo (OI-1003-Q196)",
+    )
+    def test_local_gate_receipt_executes_its_refusals_and_verdicts(self) -> None:
+        with GateFixture(self.root) as fixture:
+            head = fixture.branch_commit({"crates/x/src/lib.rs": "pub fn x() {}\n"})
+
+            # PASS: the gate is CI's flake check then clean nix develop.
+            result = fixture.receipt("--pr", "7", "--post", pr_head=head)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            line = result.stdout.strip()
+            self.assertTrue(line.startswith("PASS | local terminal gate ("), line)
+            self.assertIn(f" | head {head} | tree ", line)
+            self.assertIn(" | exit 0 | ", line)
+            self.assertIn(" | kind code | overlay none | ", line)
+            self.assertEqual(
+                fixture.nix_calls(),
+                [
+                    "flake check --no-build --no-write-lock-file",
+                    "develop --no-write-lock-file --ignore-environment"
+                    " --keep HOME --keep NIX_CACHE_HOME --keep NIX_CONFIG_HOME"
+                    " --keep NIX_DATA_HOME --keep NIX_STATE_HOME"
+                    " --keep XDG_CACHE_HOME --keep XDG_CONFIG_HOME"
+                    " --keep XDG_DATA_HOME --keep XDG_STATE_HOME"
+                    " .#default --command just local-gate",
+                ],
+            )
+            self.assertEqual(
+                fixture.comments(), [f"Local gate receipt (OI-1003-Q199): `{line}`"]
+            )
+
+            # FAIL leads the line, keeps the gate's exit, and is posted only as
+            # a failure, never under the receipt heading.
+            result = fixture.receipt(
+                "--pr", "7", "--post", pr_head=head, develop_exit=5
+            )
+            self.assertEqual(result.returncode, 5, result.stderr)
+            line = result.stdout.strip()
+            self.assertTrue(line.startswith("FAIL | "), line)
+            self.assertIn(" | exit 5 | ", line)
+            self.assertEqual(
+                fixture.comments(),
+                [f"Local gate FAILED (OI-1003-Q199); not a receipt: `{line}`"],
+            )
+            # A failing flake check is a failing gate; nix develop never runs.
+            result = fixture.receipt(flake_exit=3)
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertTrue(result.stdout.startswith("FAIL | "))
+            self.assertEqual(len(fixture.nix_calls()), 1)
+
+            # The kind is derived; --kind may raise docs to code, never lower.
+            result = fixture.receipt("--kind", "docs")
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("kind", result.stderr)
+            self.assertEqual(fixture.nix_calls(), [])
+
+            # A PR head other than HEAD is refused before the gate runs.
+            result = fixture.receipt("--pr", "7", pr_head="0" * 40)
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(fixture.nix_calls(), [])
+
+            # Ignored overlays and index flags are refused unless allowed, and
+            # an allowed overlay is recorded in the receipt.
+            fixture.write(".envrc.local", "export RUSTFLAGS=-Cdebug-assertions=off\n")
+            result = fixture.receipt()
+            self.assertEqual(result.returncode, 3)
+            self.assertIn(".envrc.local", result.stderr)
+            self.assertEqual(fixture.nix_calls(), [])
+            result = fixture.receipt("--allow-overlay")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(" | overlay ignored:.envrc.local | ", result.stdout)
+            fixture.remove(".envrc.local")
+            # Build outputs are not overlays.
+            fixture.write("target/debug/x", "")
+            self.assertEqual(fixture.receipt().returncode, 0)
+            for flag, label in (
+                ("--skip-worktree", "skip-worktree:README.md"),
+                ("--assume-unchanged", "assume-unchanged:README.md"),
+            ):
+                fixture.git("update-index", flag, "README.md")
+                result = fixture.receipt()
+                self.assertEqual(result.returncode, 3, label)
+                self.assertIn(label, result.stderr)
+                fixture.git("update-index", flag.replace("--", "--no-"), "README.md")
+
+            # A HEAD behind origin/main is refused.
+            fixture.advance_main()
+            result = fixture.receipt()
+            self.assertEqual(result.returncode, 3)
+            self.assertIn("does not contain origin/main", result.stderr)
+
+        with GateFixture(self.root) as fixture:
+            fixture.branch_commit({"docs/note.md": "words\n", "README.md": "more\n"})
+            result = fixture.receipt()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(" | kind docs | ", result.stdout)
+            result = fixture.receipt("--kind", "code")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(" | kind code | ", result.stdout)
+
+    def test_local_gate_verify_checks_the_receipt_against_github(self) -> None:
+        script = (self.root / LOCAL_GATE_VERIFY_PATH).read_text(encoding="utf-8")
+        validate_local_gate_verify(script)
+        mode = (self.root / LOCAL_GATE_VERIFY_PATH).stat().st_mode
+        self.assertNotEqual(mode & stat.S_IXUSR, 0)
+        for unsafe in (
+            script.replace("OWNER | MEMBER | COLLABORATOR) ;;", "*) ;;", 1),
+            script.replace(
+                '[[ "$receipt_head" == "$head" && "$receipt_main" == "$main" ]] || continue',
+                '[[ "$receipt_head" == "$head" ]] || continue',
+                1,
+            ),
+            script.replace('[[ "$found" == PASS ]] ||', "true ||", 1),
+            script.replace(
+                '[[ "$found_tree" == "$tree" && "$found_exit" == 0 ]] ||',
+                '[[ "$found_exit" == 0 ]] ||',
+                1,
+            ),
+            script.replace("set -euo pipefail\n", "set -euo pipefail\nset -x\n", 1),
+        ):
+            self.assertNotEqual(unsafe, script)
+            with self.assertRaises(ContractError):
+                validate_local_gate_verify(unsafe)
+
+        head, tree, main = "a" * 40, "b" * 40, "c" * 40
+
+        def receipt(
+            verdict: str, *, h: str = head, m: str = main, t: str = tree
+        ) -> str:
+            code = 0 if verdict == "PASS" else 1
+            return (
+                f"{verdict} | local terminal gate (sting) | PR #7 | head {h}"
+                f" | tree {t} | main {m} | flake.lock sha256 {'d' * 64}"
+                f" | log sha256 {'e' * 64} | exit {code} | x..y | kind code"
+                " | overlay none | nix flake check, nix develop"
+                " --ignore-environment: just local-gate | OI-1003-Q199 R-N13"
+            )
+
+        passed = f"OWNER\tLocal gate receipt (OI-1003-Q199): `{receipt('PASS')}`"
+        failed = (
+            "OWNER\tLocal gate FAILED (OI-1003-Q199); not a receipt:"
+            f" `{receipt('FAIL')}`"
+        )
+        cases = [
+            ("current PASS", [passed], {}, 0, "ok"),
+            ("no receipt", ["OWNER\tlooks good to me"], {}, 3, "no gate result"),
+            ("stranger", [passed.replace("OWNER", "NONE", 1)], {}, 3, "no gate result"),
+            ("head moved", [passed], {"head": "f" * 40}, 3, "no gate result"),
+            ("main moved", [passed], {"main": "f" * 40}, 3, "no gate result"),
+            ("tree differs", [passed], {"tree": "f" * 40}, 3, "tree"),
+            ("newer FAIL", [passed, failed], {}, 3, "FAIL"),
+            ("older FAIL", [failed, passed], {}, 0, "ok"),
+            (
+                "stale then current",
+                [
+                    "OWNER\tLocal gate receipt (OI-1003-Q199):"
+                    f" `{receipt('PASS', m='9' * 40)}`",
+                    passed,
+                ],
+                {},
+                0,
+                "ok",
+            ),
+            ("closed", [passed], {"state": "CLOSED main"}, 3, "not open"),
+            ("other base", [passed], {"state": "OPEN release"}, 3, "not open"),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            stub = Path(temporary) / "bin"
+            stub.mkdir()
+            write_executable(
+                stub / "gh",
+                "#!/bin/bash\n"
+                'case "$1 $2" in\n'
+                '  "pr view") printf \'%s %s\\n\' "$STUB_STATE" "$STUB_HEAD" ;;\n'
+                '  "api repos/{owner}/{repo}/git/ref/heads/main") echo "$STUB_MAIN" ;;\n'
+                '  "api repos/{owner}/{repo}/commits/$STUB_HEAD") echo "$STUB_TREE" ;;\n'
+                '  "api --paginate") cat "$STUB_COMMENTS" ;;\n'
+                "  *) exit 9 ;;\n"
+                "esac\n",
+            )
+            comments = Path(temporary) / "comments"
+            for name, rows, change, code, needle in cases:
+                with self.subTest(case=name):
+                    comments.write_text("".join(row + "\n" for row in rows))
+                    env = {
+                        "PATH": f"{stub}:{os.environ.get('PATH', '/usr/bin:/bin')}",
+                        "STUB_STATE": change.get("state", "OPEN main"),
+                        "STUB_HEAD": change.get("head", head),
+                        "STUB_MAIN": change.get("main", main),
+                        "STUB_TREE": change.get("tree", tree),
+                        "STUB_COMMENTS": str(comments),
+                    }
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            str(self.root / LOCAL_GATE_VERIFY_PATH),
+                            "--pr",
+                            "7",
+                        ],
+                        env=env,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, code, result.stderr)
+                    self.assertIn(needle, result.stdout + result.stderr)
+            result = subprocess.run(
+                ["/bin/bash", str(self.root / LOCAL_GATE_VERIFY_PATH)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+
+    def test_darwin_touched_flags_what_darwin_compiles(self) -> None:
+        linux_branch = (
+            "pub fn f() {\n"
+            '    if cfg!(target_os = "linux") {\n'
+            "        linux();\n"
+            "    }\n"
+            "}\n"
+        )
+        base = {
+            "crates/bulkload-agent/src/materialize.rs": linux_branch,
+            "crates/bulkload-agent/src/plain.rs": "pub fn plain() {}\n",
+            "crates/bulkload-agent/src/io/mod.rs": "pub mod buf;\n",
+            "crates/bulkload-agent/src/transfer/tests/throughput.rs": (
+                'fn t() { if !cfg!(target_os = "linux") { return; } }\n'
+            ),
+            "crates/bulkload-agent/src/gated.rs": (
+                '#[cfg(not(any(target_os = "linux", target_os = "android")))]\n'
+                "fn other() {}\n"
+            ),
+            "crates/bulkload-agent/src/unix.rs": "#[cfg(unix)]\nfn u() {}\n",
+            "crates/bulkload-agent/src/family.rs": (
+                '#[cfg(target_family = "unix")]\nfn u() {}\n'
+            ),
+            "docs/notes.md": "words\n",
+        }
+        cases = [
+            # The reviewer's verified miss: the implicit else runs on Darwin.
+            (
+                {
+                    "crates/bulkload-agent/src/materialize.rs": linux_branch.replace(
+                        "linux();", "linux(1);"
+                    )
+                },
+                True,
+            ),
+            (
+                {
+                    "crates/bulkload-agent/src/transfer/tests/throughput.rs": "fn t() {}\n"
+                },
+                True,
+            ),
+            ({"crates/bulkload-agent/src/gated.rs": "fn other() {}\n"}, True),
+            ({"crates/bulkload-agent/src/unix.rs": "#[cfg(unix)]\nfn u2() {}\n"}, True),
+            ({"crates/bulkload-agent/src/family.rs": "fn u() {}\n"}, True),
+            # A cfg added on the head side only.
+            (
+                {
+                    "crates/bulkload-agent/src/plain.rs": '#[cfg(target_vendor = "apple")]\nfn a() {}\n'
+                },
+                True,
+            ),
+            ({"crates/bulkload-agent/src/io/mod.rs": "pub mod buf2;\n"}, True),
+            ({"crates/bulkload-agent/src/io/deep/buf.rs": "pub fn b() {}\n"}, True),
+            ({"crates/bulkload-agent/build.rs": "fn main() {}\n"}, True),
+            ({".cargo/config.toml": "[build]\n"}, True),
+            ({"Cargo.lock": "# lock\n"}, True),
+            ({"crates/bulkload-agent/Cargo.toml": "[package]\n"}, True),
+            ({"rust-toolchain.toml": "[toolchain]\n"}, True),
+            ({"rust-toolchain": "stable\n"}, True),
+            ({"flake.nix": "{ }\n"}, True),
+            ({"flake.lock": '{"v": 1}\n'}, True),
+            ({"crates/bulkload-agent/src/io/sys_darwin.rs": "fn d() {}\n"}, True),
+            # Shared code with no cfg and prose are not Darwin-touched.
+            ({"crates/bulkload-agent/src/plain.rs": "pub fn plain2() {}\n"}, False),
+            ({"docs/notes.md": "more words\n"}, False),
+        ]
+        with GateFixture(self.root) as fixture:
+            base_commit = fixture.commit_on_main(base)
+            for index, (change, touched) in enumerate(cases):
+                with self.subTest(case=index, change=sorted(change)):
+                    fixture.git("checkout", "-q", "-B", f"case-{index}", base_commit)
+                    head = fixture.commit(change)
+                    result = subprocess.run(
+                        [
+                            "/bin/bash",
+                            str(self.root / DARWIN_TOUCHED_PATH),
+                            base_commit,
+                            head,
+                        ],
+                        cwd=fixture.work,
+                        env=fixture.env,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0 if touched else 1,
+                        result.stdout + result.stderr,
+                    )
 
     def test_actionlint_knows_only_the_sanctioned_custom_label(self) -> None:
         config = (self.root / ".github/actionlint.yaml").read_text(encoding="utf-8")
