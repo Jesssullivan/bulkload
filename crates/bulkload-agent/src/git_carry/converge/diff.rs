@@ -25,7 +25,7 @@ use super::super::{git, text};
 use super::adopt::{
     ancestor, foreign_shape, objects_of, prove_adoptable, rekey_refusal, Found, Scratch,
 };
-use super::{head_of, lstat, prove, sides, Landing, Meta, Target};
+use super::{head_of, lstat, prove, Landing, Meta, Target};
 use crate::{BulkloadRefusal, Result};
 
 /// One ref of an item's repository, as `estate-diff` reports it.
@@ -223,7 +223,7 @@ fn ledgered(
         "ledgered-other-item"
     };
     let meta0 = Meta::read(workspace, target.source, &ledger.instance)?;
-    let old = sides(workspace, &meta0)?;
+    let old = super::handoff::landed_sides(workspace, git_dir, target.source, &meta0)?;
     let proved = match prove(workspace, common, ledger, standalone, &old) {
         Ok(_) => true,
         Err(BulkloadRefusal::GitDestinationModified) => false,
@@ -419,20 +419,8 @@ fn ref_rows(
             continue;
         }
         let (here, there) = (native.get(name), carried.get(name));
-        let class = match (here, there) {
-            (Some(here), Some(there)) if here == there => "same",
-            (None, Some(_)) => "source-only",
-            (Some(_), None) => "dest-only",
-            (Some(here), Some(there)) => {
-                if ancestor(&scratch.repo, here, there)? {
-                    "source-ahead"
-                } else if ancestor(&scratch.repo, there, here)? {
-                    "dest-ahead"
-                } else {
-                    "diverged"
-                }
-            }
-            (None, None) => continue,
+        let Some(class) = ref_class(&scratch.repo, here, there)? else {
+            continue;
         };
         let decision = native_refs::decide(Input {
             native: here.map(String::as_str),
@@ -449,6 +437,33 @@ fn ref_rows(
         });
     }
     Ok(rows)
+}
+
+/// One ref's class, by ancestry in `repo` (which holds both values):
+/// `same`, `source-only`, `dest-only`, `source-ahead` (the destination's
+/// tip is an ancestor of the carried one), `dest-ahead` or `diverged`;
+/// `None` when neither side has it. `estate-diff`'s ref rows and the
+/// hand-off block (TIN-6569) share it.
+pub(super) fn ref_class(
+    repo: &Path,
+    here: Option<&String>,
+    there: Option<&String>,
+) -> Result<Option<&'static str>> {
+    Ok(Some(match (here, there) {
+        (Some(here), Some(there)) if here == there => "same",
+        (None, Some(_)) => "source-only",
+        (Some(_), None) => "dest-only",
+        (Some(here), Some(there)) => {
+            if ancestor(repo, here, there)? {
+                "source-ahead"
+            } else if ancestor(repo, there, here)? {
+                "dest-ahead"
+            } else {
+                "diverged"
+            }
+        }
+        (None, None) => return Ok(None),
+    }))
 }
 
 // A two-way hint from the HEADs alone.

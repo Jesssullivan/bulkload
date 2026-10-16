@@ -1244,6 +1244,12 @@ use estate_converge::EstateConverge;
 mod estate_adopt;
 use estate_adopt::EstateAdopt;
 
+// The `estate.handoff.*` points (TIN-6569, OI-1003-Q183): a hand-off
+// render, clear or converge lift crashed, and the rerun finishing it.
+#[path = "fault_harness/estate_handoff.rs"]
+mod estate_handoff;
+use estate_handoff::EstateHandoff;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
@@ -1361,6 +1367,21 @@ scenarios! {
     estate_adopt_after_refs => EstateAdoptAfterRefs: 1, EstateAdopt::Workspace;
     estate_adopt_after_ledger => EstateAdoptAfterLedger: 1, EstateAdopt::Workspace;
     estate_adopt_bare_staged => EstateAdoptBareStaged: 1, EstateAdopt::Bare;
+    // The hand-off block (TIN-6569): every point of a render, a clear and
+    // converge's lift, each finished by the rerun.
+    estate_handoff_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::Render;
+    estate_handoff_after_temp => EstateHandoffAfterTemp: 1, EstateHandoff::Render;
+    estate_handoff_after_exchange => EstateHandoffAfterExchange: 1, EstateHandoff::Render;
+    estate_handoff_after_exchange_second => EstateHandoffAfterExchange: 2, EstateHandoff::Render;
+    estate_handoff_after_record => EstateHandoffAfterRecord: 1, EstateHandoff::Render;
+    estate_handoff_clear_after_exchange => EstateHandoffClearAfterExchange: 1, EstateHandoff::Clear;
+    estate_handoff_lift_after_unlink => EstateHandoffLiftAfterUnlink: 1, EstateHandoff::Lift;
+    estate_handoff_converge_after_intent => EstateConvergeAfterIntent: 1, EstateHandoff::Converge;
+    estate_handoff_converge_seat_after_exchange => EstateConvergeSeatAfterExchange: 1, EstateHandoff::Converge;
+    estate_handoff_h_step_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_temp => EstateHandoffAfterTemp: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_exchange => EstateHandoffAfterExchange: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_record => EstateHandoffAfterRecord: 1, EstateHandoff::HStep;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

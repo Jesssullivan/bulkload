@@ -126,6 +126,33 @@ pub enum BulkloadRefusal {
     /// item's proof failed before anything but an additive object import
     /// was written; the operator's change is never overwritten.
     GitDestinationModified,
+    /// `estate-handoff` (TIN-6569, OI-1003-Q183): the workspace has no
+    /// workspace ledger for the SOURCE label (never applied, refused, or
+    /// its journal missing), so there is no landing to hand off. Nothing is
+    /// written.
+    HandoffNotLanded,
+    /// `estate-handoff`: the workspace's repository has a remote whose
+    /// URL is under no `--private-remote` prefix, and the workspace is not
+    /// named by `--allow-workspace`. bulkload cannot tell a public
+    /// repository from a private one, so it writes no absolute path or
+    /// host name into it. Nothing is written; no URL is printed.
+    HandoffNotPrivate,
+    /// `estate-handoff`: a target (`AGENTS.md`, `CLAUDE.md`, an opted-in
+    /// `README.md`) is a directory, a FIFO or another file that is not
+    /// regular, or a symbolic link that is not `CLAUDE.md -> AGENTS.md`
+    /// (or the other way round) inside the worktree. Nothing is written for
+    /// the whole workspace.
+    HandoffTargetUnsupported,
+    /// `estate-handoff`: a hand-off marker at byte 0 that is not the block
+    /// bulkload recorded (an edit inside the block, a block with no record,
+    /// a BEGIN with no END), or a writer that changed the file while the
+    /// hand-off exchanged it. The file is the user's: nothing is written,
+    /// an exchange is undone.
+    HandoffBlockModified,
+    /// `estate-handoff --check`: the hand-off block's do-not-commit token
+    /// is in a target's index blob, its HEAD blob or a destination-ahead
+    /// tip's blob. Read-only; nothing is written.
+    HandoffMarkerCommitted,
     /// `estate-apply --adopt` (#226, OI-1003-Q171/Q172): a destination
     /// bulkload never landed holds the item's path, its repository is the
     /// capture's (related), and it differs from the current capture in a
@@ -356,6 +383,11 @@ impl BulkloadRefusal {
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitDestinationModified => "GIT_DESTINATION_MODIFIED",
             Self::GitDestinationDiverged => "GIT_DESTINATION_DIVERGED",
+            Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
+            Self::HandoffNotPrivate => "HANDOFF_NOT_PRIVATE",
+            Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
+            Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
+            Self::HandoffMarkerCommitted => "HANDOFF_MARKER_COMMITTED",
             Self::GitConvergeShapeChanged => "GIT_CONVERGE_SHAPE_CHANGED",
             Self::GitConvergeStaleCapture => "GIT_CONVERGE_STALE_CAPTURE",
             Self::GitConvergeInterrupted => "GIT_CONVERGE_INTERRUPTED",
@@ -427,6 +459,11 @@ impl BulkloadRefusal {
         "GIT_DESTINATION_OCCUPIED",
         "GIT_DESTINATION_MODIFIED",
         "GIT_DESTINATION_DIVERGED",
+        "HANDOFF_NOT_LANDED",
+        "HANDOFF_NOT_PRIVATE",
+        "HANDOFF_TARGET_UNSUPPORTED",
+        "HANDOFF_BLOCK_MODIFIED",
+        "HANDOFF_MARKER_COMMITTED",
         "GIT_CONVERGE_SHAPE_CHANGED",
         "GIT_CONVERGE_STALE_CAPTURE",
         "GIT_CONVERGE_INTERRUPTED",
@@ -657,6 +694,11 @@ mod tests {
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitDestinationModified,
             BulkloadRefusal::GitDestinationDiverged,
+            BulkloadRefusal::HandoffNotLanded,
+            BulkloadRefusal::HandoffNotPrivate,
+            BulkloadRefusal::HandoffTargetUnsupported,
+            BulkloadRefusal::HandoffBlockModified,
+            BulkloadRefusal::HandoffMarkerCommitted,
             BulkloadRefusal::GitConvergeShapeChanged,
             BulkloadRefusal::GitConvergeStaleCapture,
             BulkloadRefusal::GitConvergeInterrupted,

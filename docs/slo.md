@@ -1104,6 +1104,47 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
   ref step left), T0 is reached, and four mutation rows bite
   (`docs/formal/README.md`, "#226").
 
+## Amendment 2026-10-16: the hand-off block (OI-1003-Q183, TIN-6569)
+
+The ruling is OI-1003-Q183 (Linear TIN-6569, quoted from the workflow's
+task text; the relayed operator request was cut off and the quote was not
+checked against Linear in this lane): a beside-landing carries a builtin
+addendum at the top of `AGENTS.md` and `CLAUDE.md` with the landing's
+absolute paths, dated details and high-level differences, and tells agents
+to converge and consolidate completely before any other work with the
+user. No SLO number changes. The design note is
+`docs/agent-notes/2026-10-16-estate-handoff-design.md`; the contract is
+`docs/design.md`, "Hand-off block".
+
+- **S5:** a block that is intact and recorded is bulkload's bytes, never
+  a local change: converge proves the seat as the block followed by the
+  landed blob and keeps it. Any edit inside the block or below it is a
+  local change: `GIT_DESTINATION_MODIFIED`, as for any edit, and the
+  hand-off itself refuses `HANDOFF_BLOCK_MODIFIED` with nothing written.
+  `NoLocalWorkLost` is amended in one place: an operator value a render
+  left under an intact block is kept.
+- **S4:** the hand-off is an annotation outside closure's gate. Its five
+  refusals are typed per workspace and never change an item's outcome;
+  the H step's result is a line of its own after the apply's receipts.
+- **S3:** an unchanged `estate-handoff` rerun reads 0 destination bytes
+  and writes nothing once its record's prints are past the racy window
+  (one settling rerun re-dates them); a no-op `estate-apply` does no H
+  step. A converge reads a handed-off target once, as it reads any seat
+  whose print moved.
+- **S2:** the source is never read.
+- **Proof.** `tests/estate_handoff.rs` H0 to H19 (H0 is the control: a
+  naive prepend refuses MODIFIED), the hand-off unit rows and the
+  `render_then_clear_is_identity` property, the `estate.handoff.*`
+  fault-harness rows (render, clear, lift, converge and H step), and
+  EstateConverge's `Handoff` rows with the invariant
+  `HandoffOwnsOnlyItsBlock` and five mutation rows
+  (`docs/formal/README.md`, "TIN-6569").
+- **Open for the operator:** which repositories count as private (bulkload
+  cannot tell a public repository; it refuses unless told), and what
+  "converged and consolidated completely" means for a landing beside a
+  live copy (which copy carries the work forward; agents never delete
+  either).
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

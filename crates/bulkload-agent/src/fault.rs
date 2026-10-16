@@ -121,6 +121,18 @@
 //! | `estate.converge.after_head` | HEAD and its branch new; the workspace ledger old, its intent pending |
 //! | `estate.converge.after_landed` | the new workspace ledger, no intent; no journal or outcome record |
 //!
+//! The hand-off block (TIN-6569, OI-1003-Q183), in
+//! `git_carry::converge::handoff`:
+//!
+//! | Name | Crash leaves (at the destination) |
+//! |------|------------------------------------|
+//! | `estate.handoff.after_intent` | `handoff.intent` durable; every target old |
+//! | `estate.handoff.after_temp` | a target's new bytes at its `.bulkload-handoff-<tag>-<n>` temporary; the target old |
+//! | `estate.handoff.after_exchange` | a target new, the old file displaced at the temporary (a created file: new, no temporary) |
+//! | `estate.handoff.after_record` | the new `handoff.landed`, the intent still pending |
+//! | `estate.handoff.clear_after_exchange` | a clear's target stripped (or a created file renamed away), the displaced file at the temporary |
+//! | `estate.handoff.lift_after_unlink` | converge's lift unlinked a created block; the record still names it |
+//!
 //! # Group size
 //!
 //! Group commit closes a group by count, size or idle time, so how many
@@ -300,11 +312,29 @@ pub enum Point {
     /// `estate.adopt.bare_staged`: a bare first landing complete in its
     /// private stage, not published (#226 item 4).
     EstateAdoptBareStaged,
+    /// `estate.handoff.after_intent`: the hand-off intent durable; no
+    /// target written (TIN-6569, OI-1003-Q183).
+    EstateHandoffAfterIntent,
+    /// `estate.handoff.after_temp`: a target's new bytes fsynced at its
+    /// `.bulkload-handoff-<tag>-<n>` temporary, not exchanged.
+    EstateHandoffAfterTemp,
+    /// `estate.handoff.after_exchange`: a target exchanged (or created):
+    /// the new file at the path, the old one displaced at the temporary.
+    EstateHandoffAfterExchange,
+    /// `estate.handoff.after_record`: the new hand-off record written, the
+    /// intent pending.
+    EstateHandoffAfterRecord,
+    /// `estate.handoff.clear_after_exchange`: a clear's target exchanged
+    /// (or a created file renamed away), the displaced file not checked.
+    EstateHandoffClearAfterExchange,
+    /// `estate.handoff.lift_after_unlink`: converge lifted a created
+    /// hand-off file before its add; the hand-off record not updated.
+    EstateHandoffLiftAfterUnlink,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 49] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -348,6 +378,12 @@ impl Point {
         Self::EstateAdoptAfterRefs,
         Self::EstateAdoptAfterLedger,
         Self::EstateAdoptBareStaged,
+        Self::EstateHandoffAfterIntent,
+        Self::EstateHandoffAfterTemp,
+        Self::EstateHandoffAfterExchange,
+        Self::EstateHandoffAfterRecord,
+        Self::EstateHandoffClearAfterExchange,
+        Self::EstateHandoffLiftAfterUnlink,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -397,6 +433,12 @@ impl Point {
             Self::EstateAdoptAfterRefs => "estate.adopt.after_refs",
             Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
             Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
+            Self::EstateHandoffAfterIntent => "estate.handoff.after_intent",
+            Self::EstateHandoffAfterTemp => "estate.handoff.after_temp",
+            Self::EstateHandoffAfterExchange => "estate.handoff.after_exchange",
+            Self::EstateHandoffAfterRecord => "estate.handoff.after_record",
+            Self::EstateHandoffClearAfterExchange => "estate.handoff.clear_after_exchange",
+            Self::EstateHandoffLiftAfterUnlink => "estate.handoff.lift_after_unlink",
         }
     }
 

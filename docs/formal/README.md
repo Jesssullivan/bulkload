@@ -2916,6 +2916,109 @@ sets, 67 code symbols; `just tla-render --check` current (234 files).
 | `MC_ec_neg_adopt_no_recheck` | fail | FAIL | AdoptClaimsOnlyEqual | 1175 | 5 | 13s |
 | `MC_ec_neg_adopt_t0_no_row` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 1519 | - | 17s |
 
+### TIN-6569: the hand-off block (2026-10-16, OI-1003-Q183)
+
+`estate-handoff` writes bulkload's block at byte 0 of `AGENTS.md` and
+`CLAUDE.md`, recorded in `handoff.landed` (design:
+`docs/agent-notes/2026-10-16-estate-handoff-design.md`, sections 6 to 8,
+13 and 17). The model gains the constant `Handoff` (with
+`Handoff => Landed /\ "d" \in Paths`); every earlier row renders it
+`FALSE`, and its eight new actions are appended to each earlier pass
+row's never-enabled set by the catalogue's `row`, so those rows are
+written as before.
+
+- **Values.** One target seat `HP` (`"d/f"` when planned, else `"d"`;
+  `CLAUDE.md` is `AGENTS.md`'s twin and not modelled). `Blk(v)` is the
+  block over the bytes `v` (`Blk(ABSENT)`: a created file); `Blk2(v)` the
+  block after the operator edited inside it, which only the operator
+  writes. The block's content is not modelled: one block value, so a
+  re-render of an intact block is a no-op.
+- **The ghost-free state** `hand`: `has` (the record names the block),
+  `int` (the durable intent: none, render, clear), the bytes and print the
+  run read, its temporary, the run in flight (volatile), a run count
+  (`HMAX` 2) and `cl` (a clear completed, for the witness).
+- **Actions.** `HandoffStart` (the intent, durable first, naming what was
+  read; an edited block is refused with nothing written),
+  `HandoffExchange` (temporary and `RENAME_EXCHANGE`; a created file by a
+  no-replace rename), `HandoffCheck` (the displaced file against the
+  print read, put back otherwise), `HandoffRecord`, `HandoffFinish`,
+  `HandoffSettle` (a rerun after a crash), `HandoffCrash`, and the
+  operator's `OpBlock` (`"block"` in `OpKinds`: inside the block, below
+  it, or removed by hand; the removal only between applies, as it writes
+  the landed value back, which, as for a touch, this model does not count
+  as an edit). A hand-off runs only while no apply is in flight and
+  `Begin` waits for it (the estate lock). The H step is a hand-off run
+  after the apply's journal, so it needs no action of its own.
+- **Changed steps.** `SeatProved` and the engine's settle and sweep
+  classifications accept `Blk(v)` for `v` (`Holds`) while a record or
+  intent names the block (`landed_sides`). `Import` lifts a created block
+  before the clash check (`handoff::lift`). `CrashAtomicity` and
+  `Converged` accept a component under the block (`WithBlk`).
+  `LiveSpec` adds `WF_vars(HandoffRun)`: a run that started finishes or
+  crashes (it holds the estate lock); starting one stays the
+  environment's choice. It is vacuous without `Handoff`.
+- **Invariants.** `NoLocalWorkLost` is amended in one place: an
+  operator value kept under an intact block, or at the hand-off's
+  temporary (bare or under the block) while its exchange is checked, is
+  kept. New `HandoffOwnsOnlyItsBlock`: bulkload's block stands at `HP`
+  only while the record or a pending intent names it, so converge accepts
+  it and a rerun settles it.
+- **Mutations**, each failing its named property:
+  - `handoff_no_overlay` (the issue's bug: the proof ignores the record)
+    fails `TypedRefusal`: a quiet estate's converge refuses MODIFIED for
+    bulkload's own block, with no operator edit to justify it;
+  - `handoff_overlay_any_block` (an edited block accepted) and
+    `handoff_clear_unchecked` (a clear of an edited block) fail
+    `NoLocalWorkLost`;
+  - `handoff_exchange_unchecked` (no check of the displaced file) fails
+    `NoLocalWorkLost`;
+  - `handoff_no_intent` (the block before any intent) fails
+    `HandoffOwnsOnlyItsBlock`.
+
+  The design's `handoff_record_before_write` and `handoff_untyped` were
+  replaced by the last two: a record written first is the same broken
+  ownership `handoff_no_intent` shows, and the hand-off's refusals are
+  outside closure's outcome, which `TypedRefusal` judges.
+- **Found while building the rows** (each fixed in the spec, not the
+  code): `RefStep` left the new variable unassigned; `NoLocalWorkLost`
+  needed the operator's value under a block at the hand-off temporary
+  (a clear raced by an edit below the block, which the check puts back);
+  `ConvergesWhenQuiet` needed the hand-off fairness above.
+- **Not modelled:** the render's content and inputs digest (a pure
+  function: unit and property rows), the privacy guard (a precondition),
+  commit detection (read-only), the second target, the lift's own crash
+  point (one step with the import; the Rust fault row
+  `estate.handoff.lift_after_unlink`), and the racy re-dating of the
+  record (S3 only).
+
+`just tla-check` of the hand-off rows, 2026-10-16, sting, `-workers 3`,
+nice 10: 11 rows matched (the budget self-test first), 338 s wall, `rc=0`.
+
+| config | expect | outcome | violated | distinct | depth | wall |
+|---|---|---|---|---:|---:|---:|
+| `MC_ec_handoff` | pass | PASS | - | 21919 | 52 | 41s |
+| `MC_ec_handoff_op` | pass | PASS | - | 14048 | 37 | 36s |
+| `MC_ec_handoff_live` (LiveSpec) | pass | PASS | - | 1710 | 36 | 31s |
+| `MC_ec_reach_handoff_converged` | reach | REACHED | Witness_HandoffConverged | 4233 | 19 | 32s |
+| `MC_ec_reach_handoff_cleared` | reach | REACHED | Witness_HandoffCleared | 7753 | 24 | 34s |
+| `MC_ec_neg_handoff_no_overlay` | fail | FAIL | TypedRefusal | 328 | 9 | 29s |
+| `MC_ec_neg_handoff_overlay_any_block` | fail | FAIL | NoLocalWorkLost | 4651 | 15 | 34s |
+| `MC_ec_neg_handoff_clear_unchecked` | fail | FAIL | NoLocalWorkLost | 2028 | 11 | 30s |
+| `MC_ec_neg_handoff_exchange_unchecked` | fail | FAIL | NoLocalWorkLost | 286 | 7 | 22s |
+| `MC_ec_neg_handoff_no_intent` | fail | FAIL | HandoffOwnsOnlyItsBlock | 32 | 5 | 24s |
+
+Then one invocation of every `MC_ec_` row on the final spec, 2026-10-16,
+sting, `-workers 3`, nice 10, beside this lane's cargo runs: 118 rows
+matched (the budget self-test, 43 PASS with their never-enabled sets
+exact, 1 SIMULATION, 9 REACHED, 64 FAIL each on exactly its named
+property), 4170 s wall, `rc=0`. Every pre-existing pass row explores its
+recorded count (for example `MC_ec_refs` 54141, `MC_ec_live_linked`
+223978, `MC_ec_one_checkout_crash` 1061046, `MC_ec_adopt` 30652): with
+`Handoff = FALSE` the new variable stays at its initial value and the new
+actions are never enabled. Grounding: 95 operators, 17 constants, 58
+mutations, 3 label sets, 77 code symbols; `just tla-render --check`
+current (244 files).
+
 ### Findings (EstateConverge)
 
 Every finding below was a row that failed on the code on

@@ -623,6 +623,63 @@ that note) before merge.**
   - `estate-diff` reports all of this beforehand, read-only.
   - Not built: `--protect` (land the source's state beside a destination
     adopt refuses).
+- **Hand-off block (TIN-6569, OI-1003-Q183, 2026-10-16;
+  `docs/agent-notes/2026-10-16-estate-handoff-design.md`).**
+  `estate-handoff PLAN CORPUS PRIVATE_STATE SOURCE` writes a dated,
+  delimited block at byte 0 of `AGENTS.md` and `CLAUDE.md` in each landed
+  workspace, and of an existing `README.md` only with `--readme` (never
+  created). The block names this landing, its source path on SOURCE and a
+  live sibling (`--sibling LANDED_PREFIX=LIVE_PREFIX`) by absolute path;
+  the capture, landing and build; each worktree of the repository at
+  capture and now; `estate-diff`'s ref classes against the landed capture,
+  destination-only worktrees and recorded refusals; and the instruction to
+  converge and consolidate with the user before any other work, with the
+  exact `estate-diff`, `--check` and `--clear` commands.
+  - **Owned by a record, never by inference.** The block is recorded in
+    `handoff.landed` beside `workspace.landed` (its length and blake3),
+    with `handoff.intent` durable before any target is written. Each
+    target goes through a temporary, fsync, `RENAME_EXCHANGE` and a
+    check of the displaced file against the print read (a created file
+    by a no-replace rename); a writer that raced it is put back and the
+    run refuses. A rerun of either verb settles a crash forward.
+  - **Converge keeps an intact block.** A landed seat holds landed
+    content when its bytes are the landed blob, or a recorded block
+    followed by it (`holds`, through `landed_sides`). An edit inside the
+    block or below it is the user's: converge refuses
+    `GIT_DESTINATION_MODIFIED` as for any edit. A file the hand-off
+    created is lifted (removed, when it is exactly its block) before the
+    source adds the same path.
+  - **The H step.** After the last level of an `estate-apply`, each
+    workspace of a repository the run changed that holds a record (or a
+    pending intent) has its block re-rendered from the estate as it now
+    stands, under the record's options; a refused item's own workspace is
+    left alone. Its result is a line of its own (`item=<id>
+    handoff=written|unchanged|<CODE>`), never an item's outcome.
+  - **Removal** is `estate-handoff --clear`, a recorded step that restores
+    the bytes and `git status` exactly. `--check` is read-only: the
+    block's state, its open rows, `ready` at 0, and commit detection: the
+    `BULKLOAD-HANDOFF-DO-NOT-COMMIT` token in a target's index blob, HEAD
+    blob or a destination-ahead tip's blob exits
+    `HANDOFF_MARKER_COMMITTED`. No hook is installed.
+  - **Privacy is deny by default.** A workspace is written only when its
+    repository has no remote, every remote and push URL is under a
+    `--private-remote PREFIX`, or `--allow-workspace` names it; otherwise
+    `HANDOFF_NOT_PRIVATE` with nothing written. No URL is ever rendered or
+    printed. Absolute paths and host names go only into eligible targets,
+    `.git/bulkload/` and PRIVATE_STATE.
+  - **Typed refusals,** each with nothing written: `HANDOFF_NOT_LANDED`,
+    `HANDOFF_NOT_PRIVATE`, `HANDOFF_TARGET_UNSUPPORTED` (a symlink other
+    than `CLAUDE.md -> AGENTS.md` in the same worktree, which is covered by
+    `AGENTS.md`'s block, or any other non-regular target),
+    `HANDOFF_BLOCK_MODIFIED` (an edited or foreign block), and
+    `HANDOFF_MARKER_COMMITTED`.
+  - **S3.** Rendering is a pure function of metadata and an `as_of`
+    instant kept while its inputs digest holds. An unchanged rerun reads 0
+    destination bytes and writes nothing once a rerun has re-dated a
+    record whose prints were racy, as Git re-dates a racily clean index.
+  - Not built: the estate-wide `INDEX.md` under PRIVATE_STATE, a
+    `handoff` field in `estate-diff` rows, the opt-in `--commit-guard`
+    hook and bulkload's own capture stripping an intact block.
 - One plan lands a main and its linked worktrees: an item whose repository
   is a planned standalone workspace applies a level after it, and a
   standalone item's plan base is imported into its stage. A first linked
