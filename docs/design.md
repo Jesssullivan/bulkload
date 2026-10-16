@@ -1638,7 +1638,19 @@ publication is no-replace, with one ruled exception (superseding publish,
 below). A directory the engine creates is made under a tagged temporary
 name, its record is bound to the new inode, and it is then renamed into place
 with no-replace. The engine never adopts a directory it did not create
-(R-N78, R-N102).
+(R-N78, R-N102). An existing directory with no owning record is entered
+as a container only, its mode never changed and no record bound to it:
+when its mode equals the source's, as before; when it differs, only if it
+is this user's, gives its owner read, write and search, and grants
+nothing the source's mode does not (M2 item 2, 2026-10-16: a copy of an
+unfinished landing, 0700 directories under a 0755 source, was refused
+directory by directory, 160 of them, and nothing below them was decided).
+Such a directory is counted (`dest_directory_mode_kept`) and reported
+(`directory-mode-kept <path> found=<mode> source=<mode>`); its entries are
+decided as in any existing directory, so a file there is adopted only when
+its bytes verify against the source's and is otherwise refused
+`DESTINATION_OCCUPIED` and never replaced. Any other divergent mode (wider
+than the source's, another owner, no owner access) still fails closed.
 
 Records commit in groups. Each file is sealed (`F_BARRIERFSYNC` on Darwin,
 `fsync` elsewhere, so its mode is durable too) and renamed into place without

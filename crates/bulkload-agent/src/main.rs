@@ -1980,6 +1980,12 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
             path.escape_ascii()
         );
     }
+    for (path, found, source) in &stats.directories_mode_kept {
+        eprintln!(
+            "directory-mode-kept {} found={found:04o} source={source:04o}",
+            path.escape_ascii()
+        );
+    }
     if stats.refusals.is_empty() {
         Ok(())
     } else {
