@@ -31,9 +31,23 @@ How the 2026-10-07 pass was made:
 The per-entry log is in
 [`docs/agent-notes/2026-10-07-whitepaper-refresh.md`](../agent-notes/2026-10-07-whitepaper-refresh.md).
 
+**2026-10-16 pass** (the OI-1003-Q155 refresh). Fifteen entries were added
+for the mechanisms and measurements the refresh describes: [APFSRef],
+[CopyFileRange], [Coreutils90], [CPythonShutil], [Ficlone], [Fiemap],
+[GitStash], [GitUpdateRef], [Rename2], [RenTrivedi23], [SQLitePragma],
+[Syncfs], [SyncFileRange], [XfsReflink] and [ZhangQUIC24]. [Rclone] was
+re-verified for its clone behaviour on Linux and the version now pinned.
+Each new entry was checked with the research tools available to the lane:
+DOIs through the Crossref metadata service (`paper-search`
+`get_crossref_paper_by_doi`) with the abstract read from the OpenAlex
+record; web pages through the `fetch` tool or a direct download, searched
+for the sentence the paper relies on. Each entry says what was read. The
+entries not named here were not re-fetched in this pass; they stand as
+verified on 2026-10-07.
+
 Software documentation has no fixed publication year. It is cited as
-"accessed 2026-10-07", the date of the last fetch. Nothing here is quoted at
-length; the paper paraphrases.
+"accessed" on the date of the last fetch. Nothing here is quoted at length;
+the paper paraphrases.
 
 ## Papers, reports and books
 
@@ -168,6 +182,21 @@ ACM, 2000, pp. 268–279. DOI
 - Verified via: Crossref, DOI 10.1145/351240.351266. The title and subtitle
   come from the Crossref API record.
 
+**[RenTrivedi23]** Zebin Ren and Animesh Trivedi. "Performance
+Characterization of Modern Storage Stacks: POSIX I/O, libaio, SPDK, and
+io_uring." *Proceedings of the 3rd Workshop on Challenges and Opportunities
+of Efficient and Performant Storage Systems (CHEOPS '23)*, ACM, 2023,
+pp. 35–45. DOI
+[10.1145/3578353.3589545](https://doi.org/10.1145/3578353.3589545).
+- Verified via: Crossref, DOI 10.1145/3578353.3589545 (authors, title,
+  container title, pages 35–45, 2023). Added 2026-10-16.
+- Abstract read on 2026-10-16 from the OpenAlex record for this DOI (work
+  W4368408236). The full text was not read. The paper relies on one finding
+  of the abstract: at low I/O loads all the APIs studied perform
+  competitively with each other. Their hardware was Intel Optane SSDs, not
+  the rig's SATA SSD, so the paper uses it as context for an unmeasured
+  lever, not as a measurement of the rig.
+
 **[Rsync96]** Andrew Tridgell and Paul Mackerras. "The rsync algorithm."
 Technical Report TR-CS-96-05, Department of Computer Science, Australian
 National University, 1996. Handle
@@ -218,7 +247,28 @@ Science, University of Pennsylvania, 24 February 2004.
   <https://www.cis.upenn.edu/~bcpierce/papers/unison_bib.html> (authors,
   title, institution, report number, 2004).
 
+**[ZhangQUIC24]** Xumiao Zhang, Shuowei Jin, Yi He, Ahmad Hassan, Z.
+Morley Mao, Feng Qian and Zhi-Li Zhang. "QUIC is not Quick Enough over Fast
+Internet." *Proceedings of the ACM Web Conference 2024 (WWW '24)*, ACM,
+2024, pp. 2713–2722. DOI
+[10.1145/3589334.3645323](https://doi.org/10.1145/3589334.3645323).
+- Verified via: Crossref, DOI 10.1145/3589334.3645323 (authors, title,
+  container title, pages, 2024). Added 2026-10-16.
+- Abstract read on 2026-10-16 from the OpenAlex record (work W4396759398).
+  The full text was not read. The paper relies on the abstract's finding
+  that over fast Internet the UDP+QUIC+HTTP/3 stack suffers a data-rate
+  reduction of up to 45.2 % against TCP+TLS+HTTP/2, and that the gap grows
+  with bandwidth.
+
 ## Specifications and official documentation
+
+**[APFSRef]** Apple Inc. *Apple File System Reference.* Developer
+documentation (PDF). Accessed 2026-10-16.
+<https://developer.apple.com/support/downloads/Apple-File-System-Reference.pdf>
+- Verified via: downloaded the PDF and extracted its text. The `j_inode_flags`
+  entry `INODE_WAS_EVER_CLONED = 0x00000400` reads "The inode has been
+  cloned at least once", and says that when it is set the blocks storing
+  the inode might also be in use with another inode. Added 2026-10-16.
 
 **[AppleDiskWrites]** Apple Inc. "Reducing disk writes." Apple Developer
 Documentation (Xcode). Accessed 2026-10-07.
@@ -265,6 +315,33 @@ Reference implementation: <https://github.com/BLAKE3-team/BLAKE3>.
   derive_key) come from section 2.
 - Also fetched the BLAKE3 repository README (designers, modes).
 
+**[CopyFileRange]** The Linux man-pages project. "copy_file_range(2)."
+Accessed 2026-10-16.
+<https://man7.org/linux/man-pages/man2/copy_file_range.2.html>
+- Verified via: fetched (page title and NAME line). Its NOTES say the call
+  gives filesystems an opportunity to use copy acceleration such as
+  reflinks; its ERRORS give `EXDEV` across filesystems (since 5.19, unless
+  both are of one type that supports it). Added 2026-10-16.
+- That a same-filesystem call on reflink XFS *is* a clone comes from the
+  kernel source the clone study read (`fs/read_write.c`,
+  `vfs_copy_file_range`), cited there, not from this page.
+
+**[Coreutils90]** GNU coreutils. NEWS, "Noteworthy changes in release 9.0
+(2021-09-24)." Accessed 2026-10-16.
+<https://git.savannah.gnu.org/cgit/coreutils.git/tree/NEWS>
+- Verified via: downloaded the plain NEWS file and read the 9.0 section:
+  "cp and install now default to copy-on-write (COW) if available. I.e.,
+  cp now uses --reflink=auto mode by default", and cp, install and mv now
+  use `copy_file_range` if available. Added 2026-10-16.
+
+**[CPythonShutil]** The Python project. CPython, `Lib/shutil.py`, tag
+`v3.14.0`. Accessed 2026-10-16.
+<https://github.com/python/cpython/blob/v3.14.0/Lib/shutil.py>
+- Verified via: downloaded the raw file at that tag: `_USE_CP_COPY_FILE_RANGE`
+  is set when `os.copy_file_range` exists, and `_fastcopy_copy_file_range`
+  copies with it. Added 2026-10-16. The clone study cites the same code at
+  3.14.7.
+
 **[Dhall]** The Dhall authors. "The Dhall configuration language."
 Project site and language standard repository. Accessed 2026-10-07.
 <https://dhall-lang.org/> Repository:
@@ -275,6 +352,20 @@ Project site and language standard repository. Accessed 2026-10-07.
   configuration files", BSD-3-Clause, not archived). Added 2026-10-07.
 - bulkload's catalogue is `docs/formal/catalogue/`; its README names Dhall
   1.42 from the flake's pinned nixpkgs.
+
+**[Ficlone]** The Linux man-pages project. "ioctl_ficlonerange(2),
+ioctl_ficlone(2): share some the data of one file with another file."
+Accessed 2026-10-16.
+<https://man7.org/linux/man-pages/man2/ioctl_ficlone.2.html>
+- Verified via: fetched (page title and NAME line; both files must be on
+  one filesystem, `EXDEV` otherwise; a write to a shared region must stay
+  private to the file written, "copy on write"). Added 2026-10-16.
+
+**[Fiemap]** The Linux kernel. "Fiemap Ioctl," `Documentation/filesystems/fiemap.rst`,
+tag `v6.19`. Accessed 2026-10-16.
+<https://github.com/torvalds/linux/blob/v6.19/Documentation/filesystems/fiemap.rst>
+- Verified via: downloaded the raw file at that tag and read the
+  `FIEMAP_EXTENT_SHARED` flag. Added 2026-10-16.
 
 **[GitBundle]** The Git project. "git-bundle: Move objects and refs by
 archive." Git documentation. Accessed 2026-10-07.
@@ -294,6 +385,22 @@ transferred over-the-wire." Git documentation. Accessed 2026-10-07.
 - Verified via: fetched (page title and NAME line; want and have
   negotiation; the `thin-pack` capability).
 
+**[GitStash]** The Git project. "git-stash: Stash the changes in a dirty
+working directory away." Git documentation. Accessed 2026-10-16.
+<https://git-scm.com/docs/git-stash>
+- Verified via: fetched; the latest stash is stored in `refs/stash` and
+  older stashes "are found in the reflog of this reference". Added
+  2026-10-16.
+
+**[GitUpdateRef]** The Git project. "git-update-ref: Update the object name
+stored in a ref safely." Git documentation. Accessed 2026-10-16.
+<https://git-scm.com/docs/git-update-ref>
+- Verified via: fetched; with an old value given, the ref is updated only
+  after verifying that its current value matches it; with `--stdin` all
+  modifications are performed together, with `start`, `prepare`, `commit`
+  and `abort` for an explicit transaction, and `symref-verify` among the
+  commands. Added 2026-10-16.
+
 **[IoprioSet]** The Linux man-pages project. "ioprio_get(2),
 ioprio_set(2): get/set I/O scheduling class and priority." Accessed
 2026-10-07. <https://man7.org/linux/man-pages/man2/ioprio_set.2.html>
@@ -310,17 +417,65 @@ Accessed 2026-10-07.
   the index file's own timestamp. Git then re-checks the entry's content
   against the recorded object.
 
+**[Rename2]** The Linux man-pages project. "rename(2): change the name or
+location of a file" (`renameat2` and its flags). Accessed 2026-10-16.
+<https://man7.org/linux/man-pages/man2/rename.2.html>
+- Verified via: fetched; `RENAME_EXCHANGE` atomically exchanges the two
+  paths, `RENAME_NOREPLACE` returns an error if the new path exists, and
+  both need filesystem support. Added 2026-10-16.
+
 **[SQLiteBackup]** SQLite. "SQLite Backup API." Accessed 2026-10-07.
 <https://www.sqlite.org/backup.html>
 - Verified via: fetched (incremental `sqlite3_backup_step`; the read lock is
   held only while a step reads; the backup restarts on a write from another
   connection).
 
+**[SQLitePragma]** SQLite. "Pragma statements supported by SQLite"
+(`PRAGMA synchronous`). Accessed 2026-10-16.
+<https://www.sqlite.org/pragma.html>
+- Verified via: downloaded and read the `synchronous` entry: in WAL mode
+  `FULL` adds a sync of the WAL file after each transaction commit; WAL
+  mode with `NORMAL` is always consistent but loses durability, and a
+  committed transaction might roll back after a power loss. Added
+  2026-10-16.
+
 **[SQLiteWAL]** SQLite. "Write-Ahead Logging." Accessed 2026-10-07.
 <https://www.sqlite.org/wal.html>
 - Verified via: fetched (separating a database from its WAL can lose
   committed transactions; the role of `-shm`; the conditions for read-only
   WAL access).
+
+**[SyncFileRange]** The Linux man-pages project. "sync_file_range(2): sync
+a file segment with disk." Accessed 2026-10-16.
+<https://man7.org/linux/man-pages/man2/sync_file_range.2.html>
+- Verified via: fetched; `SYNC_FILE_RANGE_WRITE` alone starts write-back
+  and "is not suitable for data integrity operations"; none of the
+  operations writes the file's metadata, and the page calls the call
+  "extremely dangerous" for portable programs. Added 2026-10-16.
+
+**[Syncfs]** The Linux man-pages project. "sync(2), syncfs(2): commit
+filesystem caches to disk." Accessed 2026-10-16.
+<https://man7.org/linux/man-pages/man2/syncfs.2.html>
+- Verified via: fetched; on Linux `syncfs()` provides the same guarantees
+  as `fsync()` called on every file of the filesystem, and since Linux 5.8
+  it also reports an error if inodes failed to be written back since the
+  last `syncfs()` call. Added 2026-10-16.
+- The later 5.17 floor the paper names comes from
+  `crates/bulkload-agent/src/io/durable.rs`, which cites the two kernel
+  commits; it was not re-checked against the kernel tree in this pass.
+
+**[XfsReflink]** The Linux kernel. `fs/xfs/xfs_reflink.c`, function
+`xfs_reflink_set_inode_flag`, tag `v6.19`. Accessed 2026-10-16.
+<https://github.com/torvalds/linux/blob/v6.19/fs/xfs/xfs_reflink.c>
+- Verified via: downloaded the raw file at that tag and read the function
+  (lines 1175 to 1229 at access): when the source is not yet a reflink
+  inode it joins the source to the transaction, sets
+  `src->i_diflags2 |= XFS_DIFLAG2_REFLINK` and logs the source inode's core
+  (`xfs_trans_log_inode(tp, src, XFS_ILOG_CORE)`). Added 2026-10-16.
+- The writer stall, the `i_version` bump and the extent sharing the paper
+  mentions come from the clone study
+  ([note](../agent-notes/2026-10-15-s1-clone-lever.md), section 3.1, with
+  its own kernel citations), not from this entry.
 
 **[ZfsSend]** OpenZFS. "zfs-send(8)." OpenZFS documentation, manual pages.
 Accessed 2026-10-07.
@@ -389,8 +544,15 @@ Filesystem" and "Frequently Asked Questions." Accessed 2026-10-07.
   - local-to-local copies clone on APFS unless `--local-no-clone` is given;
   - the FAQ entry on why rclone does not do partial transfers or binary
     diffs.
-- The version measured in bulkload's evidence is rclone v1.75.0
-  ([r23-2026-09-18](../evidence/r23-2026-09-18.md)).
+- Re-verified on 2026-10-16 for the clone claim: the "Local Filesystem"
+  page says "Currently, cloning is only supported when using APFS on
+  macOS", and at tag `v1.74.4` the backend's clone code is
+  `backend/local/clone_darwin.go`, built only under `darwin && cgo` (raw
+  file downloaded and its build line read).
+- Versions: the 2026-09-18 evidence measured rclone v1.75.0
+  ([r23-2026-09-18](../evidence/r23-2026-09-18.md)). Every rig sample since
+  2026-10-07 runs the flake-pinned v1.74.4 (OI-1003-Q105;
+  [`docs/slo.md`](../slo.md), "Amendment 2026-10-07 (third)").
 
 **[Restic]** The restic authors. "References" (the repository design
 chapter). restic documentation, version 0.19.1 at access. Accessed
