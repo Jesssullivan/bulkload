@@ -17,7 +17,7 @@ administration. SQLite needs backup-API capture and explicit composition,
 never a raw WAL/SHM copy or replacement of unique rows. Preserve Home Manager
 links and credential privacy.
 
-Estate operations are not frozen: R-N56's freeze is superseded by
-OI-1003-Q142 and OI-1003-Q194 C6 (`docs/slo.md`, amendment 2026-10-16).
+Estate operations are not frozen: R-N56's freeze is superseded on order
+(OI-1003-Q194 C6, RUL-06; `docs/slo.md`, amendment 2026-10-16).
 Engine work is tracked in Linear project "Bulkload M2: SLO engine". Every
 performance claim must come from `bulkload-bench` evidence.

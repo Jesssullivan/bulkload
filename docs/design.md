@@ -236,9 +236,9 @@ Source safety (S2, WP1):
   no hooks, fsmonitor, automatic gc or maintenance, optional locks, lazy
   fetch, system or global config, or replace objects; the C locale; and a
   discovery ceiling at the given path's parent. The estimate's remote probe
-  is tested against the same table. Exceptions: the four child builders the
-  P76 registry tolerates and argues (`BYPASSES` in
-  `tests/source_command_registry.rs`, #188), among them the estimate's local
+  is tested against the same table. Exceptions: the agent's four child builders
+  the P76 registry tolerates and argues (`BYPASSES` in
+  `crates/bulkload-agent/tests/source_command_registry.rs`, #188), among them the estimate's local
   probe `bash` (its scrubbed environment is a hand copy of 9 of the table's
   11 cleared keys) and its remote probe over ssh.
 - A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
@@ -1091,7 +1091,9 @@ Linear TIN-4543.
 
 Gated benchmark samples require AC power and a 1-minute load below 2.5,
 and each sample row records both (R-N81). (R-N91's quiet lanes are
-superseded by OI-1003-Q194 C18; `docs/slo.md`, amendment 2026-10-16.) The clone fast path never
+read as superseded by OI-1003-Q194 C18 together with SPEC R3, "Samples run
+on live hosts"; RUL-18 does not name R-N91, and how R-N81 fits SPEC R3 is
+open: `docs/slo.md`, amendment 2026-10-16.) The clone fast path never
 counts toward a gate (R-N57, R-N63). The clone lever is excluded
 (OI-1003-Q164, Q165): the engine has no clone path, and S2 forbids one on a
 source file (Live union, "No clone of a source file"). Every copy of the

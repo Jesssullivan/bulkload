@@ -58,7 +58,9 @@ Four rules keep the paper honest:
 - **Every result carries one of four labels.**
   - *Gated*: enforced on every pull request by `just check-fast` and the two
     CI gates, or a benchmark sample taken under the R-N81 gate conditions
-    (R-N91 is superseded by OI-1003-Q194 C18 [2026-10-16]).
+    (R-N91 is read as superseded by OI-1003-Q194 C18 together with SPEC R3,
+    "Samples run on live hosts"; RUL-18 does not name R-N91, and how R-N81
+    fits SPEC R3 is open [2026-10-16]; `docs/slo.md`, amendment 2026-10-16).
   - *Informational*: measured or checked on record, but enforced by no
     gate. Every TLC run is in this class, because no tier starts TLC. A
     benchmark sample taken with the load gate set aside is
@@ -1288,7 +1290,9 @@ All of these are *gated*: they are in the mandatory `check-fast` tier
   A and runs B/A/B/A/B; B passes only if every B rep passes, and A is
   informational (OI-1002-Q30). A sample is gated only on AC power with the
   1-minute load under the R-N81 limit. (Holding other lanes quiet, R-N91,
-  is superseded by OI-1003-Q194 C18 [2026-10-16].)
+  is read as superseded by OI-1003-Q194 C18 together with SPEC R3; RUL-18
+  does not name R-N91, and how R-N81 fits SPEC R3's samples on live hosts
+  is open [2026-10-16].)
   `--under-load` lifts only the load gate and never produces a verdict
   (OI-1003-Q39, Q50).
 - **The hermetic rig is the gate of record** (OI-1003-Q96, Q97): mbp-13, a
@@ -1851,11 +1855,25 @@ capturing host's clock. Capture records and sidecars are not
 authenticated; the capture record's hash check against the output's own
 bytes is what guards it.
 
-**Documentation drift in this tree.** [2026-10-16: the items this list
-named were fixed at their source by the truthing pass (`docs/SOURCES.md`):
-design.md's converge "held" and salvage "unruled", the formal README's
-opening pin. GitHub issues closed by merged fixes are listed in that pass's
-pull request; issue state is GitHub's.]
+**Documentation drift in this tree.** [2026-10-16: status of each item
+below. Fixed at source by the truthing pass (`docs/SOURCES.md`):
+design.md's converge "held" and salvage "unruled". Labelled historical:
+the formal README's opening pin and "wire v5". Still open: `docs/slo.md`
+has no amendment text for OI-1003-Q143 (it is only cited in the delta-lever
+amendment) or OI-1003-Q35, and still words S3's unchanged-estate bound on
+wall-clock. Not drift at `0d96dbd`: Q154 already had its amendment
+("Amendment 2026-10-16: the delta lever"). #181 and #187 were closed on
+GitHub at 2026-10-16T17:39Z; issue state is GitHub's.]
+
+- `docs/design.md` still says the converge half is "held for an operator
+  ruling" (section "Live union"), although `docs/slo.md` records
+  OI-1003-Q144 as ruled; it still calls the salvage bounds unruled.
+- `docs/slo.md` carries no amendment text for OI-1003-Q143 or Q154; their
+  text is in the agent notes and on Linear TIN-4543 only. It still words
+  S3's unchanged-estate bound on wall-clock and has no text for OI-1003-Q35.
+- `docs/formal/README.md`'s opening still pins the transfer model to
+  `adb9c66` and calls itself a model of "wire v5".
+- GitHub issues #181 and #187 are open although their fixes are on `main`.
 
 **The sample is narrow.** Two hosts, one operator, one estate, one field
 carry.

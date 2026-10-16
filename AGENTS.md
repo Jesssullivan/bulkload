@@ -6,19 +6,14 @@ Process rulings are lab's, and lab's text is canonical: lab `AGENTS.md`
 "Ratified rulings", **R-HOOK-CONVERGENCE-20261004** (Linear TIN-3692 comment
 `98cf680c-7299-4949-bfb2-60079053ad43`). It supersedes the former R-N11
 blanket process ban and the R-N12 hook-stop mechanics that this file used to
-summarise (the 2026-09-20/24 text, last synced from lab#1913 by #78). In
-short:
+summarise (the 2026-09-20/24 text, last synced from lab#1913 by #78). Read
+R-N11, R-N12 and R-N13 there; they are not copied here
+([docs/SOURCES.md](docs/SOURCES.md), "Lab process rulings").
 
-- **R-N11:** own recorded tasks and named services are permitted after
-  checking ownership and live sessions. Cross-session actions require
-  explicit operator authorization; the receipt names the target and the
-  authorization.
-- **R-N12:** every Lab hook is advisory. Findings, scanner errors and dark
-  hooks may warn but never deny. Use a receipted alternative within existing
-  authorization; ask only when the action itself needs a new decision.
-- **R-N13:** cite the ruling in mutation receipts. Preserve durable working
-  notes in `docs/agent-notes/` and facts in Linear. Explicit operator answers
-  and instructions are authority; a reminder is advisory.
+Repo-specific delta: this file's former R-N13 text (2026-09-20) also said
+"Ticket descriptions are never rewritten, only superseded by dated
+comments." Lab's current R-N13 does not restate that clause and no ruling
+has withdrawn it, so it still applies here.
 
 ## Repository
 
@@ -46,10 +41,12 @@ kind of fact. Point to it; do not copy its content into agent files or notes.
 
 ## Live workstreams
 
-The live workstream ledger is the Linear SSOT document named in
-[docs/SOURCES.md](docs/SOURCES.md). Reconcile it when a stream changes state;
-restate it in chat as lab R-HOOK-CONVERGENCE-20261004 describes (brief,
-changes only, no whole-board recital).
+The entry point is the Linear document named in
+[docs/SOURCES.md](docs/SOURCES.md) (rewritten 2026-10-16T17:34Z): priority
+order, live board and pointers. When a stream changes state, update its
+P-TIN-177 milestone and live issue; edit the document's table only when a
+live issue is added or retired (the document's own rule). In chat, follow lab
+R-HOOK-CONVERGENCE-20261004 (brief, changes only, no whole-board recital).
 
 ## Engine rules
 
@@ -84,8 +81,9 @@ changes only, no whole-board recital).
   replace a database with unique rows. Preserve conflicts for explicit
   resolution.
 - Reclaim only proven redundant data after preserving unique content.
-- Estate operations are not frozen. R-N56's freeze is superseded by
-  OI-1003-Q142 and OI-1003-Q194 C6 (docs/slo.md, amendment 2026-10-16).
+- Estate operations are not frozen. R-N56's freeze is superseded on order
+  (OI-1003-Q194 C6, RUL-06), after OI-1003-Q142 relaxed OI-1002-Q24
+  (docs/slo.md, amendment 2026-10-16).
 
 ## Agent lanes
 
@@ -98,13 +96,19 @@ changes only, no whole-board recital).
   repos they create and destroy (R-N98).
 - Each lane builds with its own `CARGO_TARGET_DIR`. A shared target
   directory lets one lane test another lane's binaries.
-- Do not build, test or run heavy checks on neo (operator, FOOT-03 and FOOT-10
-  in the intent ledger; SPEC R4). The older R-N69 allowance (an inline
-  `TINYLAND_ALLOW_LOCAL_BUILD` prefix) conflicts with it and is not used
-  without a new operator ruling.
+- Builds and tests on neo: **open for the operator**. FOOT-03 (2026-08-26,
+  "we CANNOT EVER build on neo, EVER") and FOOT-10 (2026-09-01: tests,
+  checks and lints on the teletype "WILL crash the machine") say no; SPEC
+  R4 cites both. R-N69 (about 2026-09-23, newer) allowed local cargo builds
+  on neo behind an inline `TINYLAND_ALLOW_LOCAL_BUILD="<lane> (R-N69)"`
+  prefix as the first token. Neither is recorded as superseding the other
+  ([docs/SOURCES.md](docs/SOURCES.md), "Open for the operator").
 - Benchmark and S2 sampling conditions (R-N81, OI-1003-Q39, Q152, Q160,
   Q168) are in docs/slo.md S1 and S2. R-N91 (holding other lanes quiet for a
-  sample) is superseded by OI-1003-Q194 C18 (never-halt).
+  sample) is read as superseded by OI-1003-Q194 C18 (never-halt) together
+  with SPEC R3 ("Samples run on live hosts"); RUL-18 itself names CONF-01,
+  06, 07 and 08, not R-N91. How R-N81's load gate fits SPEC R3 is open
+  (docs/slo.md, amendment 2026-10-16).
 
 ## Durable notes
 
@@ -141,6 +145,6 @@ Rules the recipes do not enforce on their own:
   `tests/test_ci_contract.py`. Changing the workflow updates
   `WORKFLOW_SHA256` in `tests/test_ci_contract.py`.
 - No PR loads the Bazel graph. `just test` and `just test-local` run
-  `//:tests`; only `just ci` also builds `//:bulkload`.
+  `//:tests`; `just build` and `just ci` build `//:bulkload`.
 
 Stage explicit paths.

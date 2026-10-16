@@ -9,30 +9,57 @@ ruling, never by editing a number in place.
 **Scope (2026-10-16, editorial under R-N13; no new ruling).** This charter is
 the canonical source for the SLO definitions, their proof obligations and the
 rulings that amend them ([SOURCES.md](SOURCES.md)). What bulkload must achieve
-and when it is done is [SPEC.md](SPEC.md) (bulkload#236); its conflict
-readings C1–C20 are standing rulings (OI-1003-Q194, Linear TIN-4543 comment
-`14484c4a`). A superseded line below keeps its text and carries a bracketed
-`[2026-10-16: …]` pointer to what replaced it. The 2026-10-16 amendment at the
-end lists the rulings since OI-1003-Q173 that bear on this charter.
+is [SPEC.md](SPEC.md) (bulkload#236); its conflict readings C1–C20 are
+standing rulings (OI-1003-Q194, Linear TIN-4543 comment `14484c4a`). SPEC
+does not supersede the Completion bar below: it keeps it as OI-1003-Q4's
+record (intent ledger SEAT-10; RUL-06 "Unchanged: SEAT-10") and adds when
+bulkload is done (C20). A superseded line below keeps its text and carries a
+bracketed `[2026-10-16: …]` pointer to what replaced it. The 2026-10-16
+amendment at the end indexes rulings not yet indexed here.
 
 ## Completion bar (OI-1003-Q4)
 
-[2026-10-16: replaced by a pointer.] When bulkload is done is SPEC.md's
-(OI-1003-Q194 C20: the full run meets SPEC R0 and R3 is proven). The order of
-the full run against the proofs is C6 (the full run does not wait for the
-proofs). OI-1003-Q4's own bar is the operator's free text (intent ledger
-SEAT-10, SEAT-11 for Q13); the parts of it this charter owns are the SLOs
-below and the proof package. The status of OI-1002-Q24 and R-N56 is in the
-2026-10-16 amendment. This section's earlier text is in git history at
-`0d96dbd`; its phrase "not when a migration happens to succeed" was agent
-wording, not the operator's.
+[2026-10-16: SPEC.md keeps this bar as OI-1003-Q4's record (SEAT-10) and
+adds when bulkload is done: OI-1003-Q194 C20, the full run meets SPEC R0
+and R3 is proven. The intent ledger cites the second paragraph as the
+ruling record of OI-1003-Q13 (ONCE-08).]
+
+Bulkload is complete when its SLOs are **definable and provable**, not when a
+migration happens to succeed [2026-10-16: agent wording, not in OI-1003-Q4
+(SPEC.md, "Not superseded, and what is corrected"); it must not be read as
+"the migration does not count". The migration in full is part of the bar,
+below]. Three bodies of work make up the bar:
+
+- **Proofs**
+  - A whitepaper with a bibliography of prior art.
+  - Runtime proofs that can be demonstrated.
+  - A formal model of the protocol.
+- **Engineering**
+  - Simplifications and refactors.
+  - An adversarial architecture review.
+  - State-of-the-art parallelisation.
+  - Performance-seeking structural examination.
+  - Reduction of code and feature sprawl.
+- **Migration in full.** The lab shape (neo → sting) and the migration
+  relationship are defined well enough to run with confidence.
+
+**Completion means confidence in the code and the product (OI-1003-Q13).** The
+full neo→sting migration is not a major scheduled event. It is one more run of
+a tool that is already trusted, no different from any other sync. Because S3
+and S5 hold, it can be started whenever convenient and repeated as neo's work
+lanes finish, and every rerun converges without re-reading anything. OI-1002-Q24
+(no full migration before bulkload is complete) still stands [2026-10-16:
+relaxed for S1 by OI-1003-Q142, and superseded on order by OI-1003-Q194 C6
+(RUL-06): the full run does not wait for the proofs. SPEC also corrects the
+reading of Q24 as a *single* run. See the 2026-10-16 amendment]. What
+OI-1003-Q13 removes is the framing of that run as a one-off milestone.
 
 ## Core SLOs
 
 | SLO | Definition | Proof obligation |
 |---|---|---|
-| **S1 Faster than rclone** | Gate (a): local copy beats rclone, B/A/B/A/B order, B passes only if all 3 B reps pass (OI-1002-Q30). Gate (b): a neo→sting pull beats rclone over sftp. No hard wall-clock SLA for the migration run itself (OI-1003-Q3). [2026-10-16: both gates are decided on the hermetic rig and a neo→sting run is a field confirmation (OI-1003-Q97, amendment 2026-10-07). OI-1003-Q194 C2 makes cross-host gate (b) on an estate-shaped many-file corpus S1's headline and the rig's gate (a) a regression guard, and C3 reads the 1 % delta as a real in-place change to about 1 % of files; see the 2026-10-16 amendment.] | Gated samples under R-N81/R-N91 on the sealed corpus, then evidence in `docs/evidence/`. [2026-10-16: R-N91 is superseded by OI-1003-Q194 C18; R-N81 stands.] |
-| **S2 Never interrupt the source** (OI-1003-Q5, Q9) | **Proven properties:** bulkload never takes a git lock or any flock or lease on source repositories, never writes to the source, and never signals a process. [2026-10-16: with the counted exceptions OI-1003-Q16 (the SQLite backup's shared read lock), Q36 (`-shm`) and Q72 (empty `-wal`), and Q76's root refusal, below.] It runs at background IO and CPU priority. **Measured budget:** with bulkload running, a reference agent workload on the source shows at most **+25 % p95 latency**, and bulkload adds at most **+2.0 to load1**. | The properties are covered by property tests plus the formal model. The budget is measured and recorded in every gated run. |
+| **S1 Faster than rclone** | Gate (a): local copy beats rclone, B/A/B/A/B order, B passes only if all 3 B reps pass (OI-1002-Q30). Gate (b): a neo→sting pull beats rclone over sftp. No hard wall-clock SLA for the migration run itself (OI-1003-Q3). [2026-10-16: both gates are decided on the hermetic rig and a neo→sting run is a field confirmation (OI-1003-Q97, amendment 2026-10-07). OI-1003-Q194 C2 makes cross-host gate (b) on an estate-shaped many-file corpus S1's headline and the rig's gate (a) a regression guard, and C3 reads the 1 % delta as a real in-place change to about 1 % of files; see the 2026-10-16 amendment.] | Gated samples under R-N81/R-N91 on the sealed corpus, then evidence in `docs/evidence/`. [2026-10-16: R-N91 is read as superseded by OI-1003-Q194 C18 together with SPEC R3 ("Samples run on live hosts"); RUL-18 itself names CONF-01/06/07/08, not R-N91. R-N81 stands; how its load gate fits SPEC R3 is open, see the 2026-10-16 amendment.] |
+| **S2 Never interrupt the source** (OI-1003-Q5, Q9) | **Proven properties:** bulkload never takes a git lock or any flock or lease on source repositories, never writes to the source, and never signals a process. [2026-10-16: with the counted exceptions OI-1003-Q16 (the SQLite backup's shared read lock), Q36 (`-shm`) and Q72 (empty `-wal`), below.] It runs at background IO and CPU priority. **Measured budget:** with bulkload running, a reference agent workload on the source shows at most **+25 % p95 latency**, and bulkload adds at most **+2.0 to load1**. | The properties are covered by property tests plus the formal model. The budget is measured and recorded in every gated run. |
 | **S3 Idempotent incremental completion** (OI-1003-Q6, Q10) | A rerun reads **0 content bytes** for unchanged seats (R25 / R-N58), and its walk is metadata only. On an unchanged estate a rerun finishes in **≤ 10 % of the first pass's wall-clock**. After N changed files, a rerun reads only those files' changed chunks. As neo's work lanes complete, re-running sync brings them over with nothing re-walked for content and nothing re-read. | Counters `source_bytes_read` and `transferred_content_bytes`, plus the rerun/first-pass ratio, recorded per run. R25 is also covered by the formal model. |
 | **S4 Complete and accounted** (OI-1003-Q1) | The closure report shows **0 unaccounted**: every planned item is `applied`, `referenced-only`, or a typed refusal. Every typed refusal carries an operator-reviewed disposition (accept, re-carry, or abandon) before the run counts as complete. A bare `IO` or `FRAME_CODEC` never counts. A daily-work verdict on sting (#40) is required. [2026-10-16: OI-1003-Q194 C14 adds a carried-as-files outcome, marked corrupt in closure, for trees and rescue copies bulkload cannot capture natively; no code records it yet. #40 tracks the handoff-verify probe verdict, not SPEC R0's resume check.] | The native closure report plus a bound attestation ledger (#119, #133), and the disposition ledger. |
 | **S5 Source stays live** (OI-1003-Q2) | Agents keep working on neo during the run. Bulkload tolerates movement as drift custody (R-N30, extended by OI-1003-Q11), and a final delta pass (#103) catches up. There is no freeze window. | Drift custody recorded per item; the delta pass is under S3. |
@@ -408,13 +435,13 @@ names the fact its site knows, so a disposition reviews the real cause.
 
   | Host | Platform | Role |
   |---|---|---|
-  | mbp-13 | Linux x86_64, 2 cores and 4 threads, 16 GB, XFS | Gate (a), local copy. Destination of both gate (b) runs. |
-  | yoga | Linux x86_64, 8 logical CPUs (cores not probed), 16 GB | Gate (b) source, Linux to Linux. |
-
-  [2026-10-16: the core counts were corrected in place; the table first
-  said "4 cores" and "8 cores", counting logical CPUs (see the corrections
-  amendment below).]
+  | mbp-13 | Linux x86_64, 4 cores, 16 GB, XFS | Gate (a), local copy. Destination of both gate (b) runs. |
+  | yoga | Linux x86_64, 8 cores, 16 GB | Gate (b) source, Linux to Linux. |
   | PZM | macOS arm64 | Gate (b) source, macOS to Linux, mirroring neo to sting. |
+
+  [2026-10-16: the core counts in this table count logical CPUs; the
+  2026-10-07 corrections amendment below corrects them (mbp-13 is 2 cores
+  and 4 threads; yoga's cores were not probed).]
 
   Every rig file lives under one bounded directory, `~/git-bulkload/`, on
   each host: the clone, the builds, the sealed corpus and all run output.
@@ -460,9 +487,11 @@ names the fact its site knows, so a disposition reviews the real cause.
   - macOS code paths on gate (a). Gate (a) on the rig is Linux only until
     PZM has room for the corpus and five destination copies (it has about
     13 GB free). Until then, macOS local-copy performance is covered only by
-    a field confirmation on neo. [2026-10-16: no build, test or heavy work
-    runs on neo (operator, intent ledger FOOT-03, FOOT-10; SPEC R4); whether
-    a field confirmation runs there at all is SPEC's.]
+    a field confirmation on neo. [2026-10-16: SPEC R4 says builds, tests
+    and heavy work do not run on neo (FOOT-03, 2026-08-26; FOOT-10,
+    2026-09-01); the newer R-N69 (about 2026-09-23) allowed prefixed local
+    builds there. Which governs is open for the operator (`AGENTS.md`,
+    "Agent lanes"); SPEC R3 leaves gate (b)'s hosts to a new question.]
   - APFS and the TinylandState volume. The rig's work root is XFS on
     mbp-13's internal SSD.
   - Tailscale link variance. The rig's hosts are quiet and close; the
@@ -1198,14 +1227,16 @@ Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
 
 ## Amendment 2026-10-15 (#226): bulkload lands into the live tree (OI-1003-Q171, Q172)
 
-The rulings are OI-1003-Q171 (run three sprints in parallel; sprint 1 is
-"bulkload as the everyday mover") and Q172 (move GloriousFlywheel neo→sting
-the way GFTB moved), Linear TIN-4543 comment `aff765a8` (2026-10-15).
-[2026-10-16: corrected. This line first said, quoting a workflow's task
-text, that the ruling makes bulkload "the interim flagship data mover, ahead
-of tcfs"; no operator record says that. The nearest record is OI-1003-Q155
-(TIN-4543 `b6c52dd2`): bulkload is publishable work if it beats rclone on
-agent-heavy dev preseeding, and tcfs is the long-run product.] #226 lists what the GFTB resume needed a hand script for. No SLO
+The ruling is OI-1003-Q171/Q172 (Linear TIN-4543, quoted from the
+workflow's task text): bulkload is the interim flagship data mover, ahead
+of tcfs. [2026-10-16: corrected attribution. "Interim flagship data mover"
+is the operator's own statement, intent ledger PUR-20 (operator,
+2026-10-15T17:04:18Z, about #226): "bulkloads bread and butter, interim
+flagfip data mover as a precursion to the solutions we want TCFS to
+provide". It is not OI-1003-Q171/Q172: per TIN-4543 comment `aff765a8`
+(2026-10-15), Q171 runs three sprints in parallel (sprint 1 is "bulkload as
+the everyday mover") and Q172 moves GloriousFlywheel neo→sting the way GFTB
+moved.] #226 lists what the GFTB resume needed a hand script for. No SLO
 number changes. These are proof-status lines and the contract's new
 surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`.
 
@@ -1390,18 +1421,37 @@ default**. Diagnosis: `docs/agent-notes/2026-10-16-delta-regression.md`
   on the bench comes before any gated sample (Q143); the diagnosis expects
   about 0.89x rclone on the bench delta, at Q143's 0.90x margin.
 
-## Amendment 2026-10-16: rulings since OI-1003-Q173, and status lines (editorial, R-N13)
+## Priority (OI-1003-Q4)
+
+[2026-10-16: what bulkload must achieve, and the order that rules now, is
+SPEC.md (OI-1003-Q194). Item 4's order is superseded by C6 (RUL-06): the
+full run does not wait for the proofs, and R-N56's lift is no longer a
+precondition. "A routine, repeatable sync run" stands (SPEC corrects the
+*single*-run reading of OI-1002-Q24).]
+
+1. Make S1–S5 provable: proof package, property-test decomposition, and
+   SLO-recording runs.
+2. Simplification, refactoring and the adversarial architecture review, along
+   with the pre-migration correctness fixes.
+3. Gates (a) and (b), measured against these SLOs.
+4. Coverage inventory (#102, #103) and the operator's lift of R-N56. From then
+   on, migrating neo to sting is a routine, repeatable sync run (OI-1003-Q13):
+   rerun as neo's work lanes complete, each run reaching closure with 0
+   unaccounted.
+
+## Amendment 2026-10-16: rulings not yet indexed here, and status lines (editorial, R-N13)
 
 No new ruling and no SLO number changes. This indexes operator rulings that
-bear on this charter and were not yet recorded here, each with its record,
+bear on this charter and had no index entry here, each with its record,
 and states what they leave standing. The operative text is the record cited.
 
 - **OI-1003-Q142** (2026-10-08; TIN-4543 comment `7734678e`; intent ledger
   SEAT-31): the full neo→sting run happens once estate reruns converge and
   refusals are fully typed, even with S1 still failing, as an S3/S4/S5 proof
   run. It relaxes OI-1002-Q24 for S1.
-- **OI-1003-Q150, Q152, Q154** (2026-10-15; TIN-4543 `b6c52dd2`): S1 stays
-  gated against plain rclone; no freeze window; three S1 levers authorized.
+- **OI-1003-Q150** (2026-10-15; TIN-4543 `b6c52dd2`): S1 stays gated
+  against plain rclone. (Q152, no freeze window, and Q154, three S1 levers,
+  from the same record, already have their amendments above.)
 - **OI-1003-Q170** (2026-10-15; TIN-4543 `8062b656`): the full-run landing
   gets its own XFS project on sting's fast-local.
 - **OI-1003-Q185, Q192** (2026-10-16; TIN-4543 `a92634c1`, `68248cf1`):
@@ -1426,15 +1476,21 @@ and states what they leave standing. The operative text is the record cited.
 - **Status of OI-1002-Q24 and R-N56.** Q142 relaxed Q24 for S1, and Q194 C6
   rules that the full run does not wait for the proofs. R-N56's freeze of
   estate operations until the M2 gates pass (2026-09-23) is therefore
-  superseded; estate carries have run since (the GFTB carry, OI-1003-Q163,
+  superseded on order (C6, RUL-06; SPEC.md, "Not superseded, and what is
+  corrected"); estate carries have run since (the GFTB carry, OI-1003-Q163,
   `docs/evidence/field-2026-10-15-gftb-carry.md`).
-- **R-N91.** Holding other lanes quiet while a gated sample runs is
-  superseded by C18. R-N81 (AC power, load1 below 2.5 before every rep and
-  every arm) stands for gated samples on the rig.
+- **R-N91.** Holding other lanes quiet while a gated sample runs is read
+  as superseded by C18 together with SPEC R3 ("Samples run on live hosts";
+  intent ledger LIVE-40 to LIVE-42, L2). RUL-18 itself names CONF-01, 06,
+  07 and 08, not R-N91, so this is a reading, not the ruling's text. R-N81
+  (AC power, load1 below 2.5 before every rep and every arm) stands for
+  gated samples on the rig. Open for the operator: how R-N81's load gate
+  fits SPEC R3's samples on live hosts ("a sample taken under load is
+  recorded as such").
 - **Still open here.** S1's core-table text is not rewritten for C2 and C3:
   that waits for the gate (b) protocol on the estate-shaped corpus and a
   bench delta that matches C3.
-- **What this pass replaced.** The "Completion bar" section's body and the
-  "Priority (OI-1003-Q4)" section, which held purpose and ordering, now point
-  to SPEC.md; their text is in git history at `0d96dbd`. Priority item 4
-  ("the operator's lift of R-N56", then the migration) is superseded by C6.
+- **What this pass labelled.** The "Completion bar" section and the
+  "Priority (OI-1003-Q4)" section keep their text, with dated pointers to
+  SPEC.md: the Completion bar stays OI-1003-Q4's record (SEAT-10; ONCE-08
+  cites it for Q13), and Priority item 4's order is superseded by C6.

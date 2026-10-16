@@ -353,7 +353,8 @@ contract-test:
     cd {{ root }} && python3 scripts/validate_repo_manifest.py --self-test tinyland.repo.json
     cd {{ root }} && python3 tests/test_ci_contract.py
 
-# Mandatory tier, local-first: what PR CI runs (OI-1001-Q2).
+# Mandatory tier, local-first (OI-1001-Q2): run before pushing. PR CI runs
+# `ci-source` and `ci-fault-harness` instead (R-N122, OI-1003-Q65).
 check-fast: check-source fault-harness contract-test
 
 # Optional tier: on demand, never a PR gate (OI-1001-Q2).

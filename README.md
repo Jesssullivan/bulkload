@@ -12,8 +12,9 @@ resumable state on both ends, Git capture, import, convergence and adoption,
 typed refusals) and has moved real estate between hosts. It does not yet
 meet its performance bar (S1, faster than rclone): the status and the latest
 sample of record are in [docs/slo.md](docs/slo.md) S1, and every sample is
-in [docs/evidence/](docs/evidence/). Live workstreams are on the Linear
-document named in [docs/SOURCES.md](docs/SOURCES.md).
+in [docs/evidence/](docs/evidence/). Live status is on the P-TIN-177
+milestones and their live issues; the Linear entry-point document is named
+in [docs/SOURCES.md](docs/SOURCES.md).
 
 ## Build and test
 
