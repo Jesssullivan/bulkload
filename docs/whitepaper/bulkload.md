@@ -315,8 +315,13 @@ source                                   destination
   chunk against its digest, writes it at its offset, and checks coverage
   and the manifest root before the output joins a group commit.
 - **WantManifest and NeedChunks.** The destination chooses this for a
-  regular file it cannot `Reuse` when the output path already exists or
-  published outputs hold chunks. The source sends its manifest, from its
+  regular file it cannot `Reuse` when the output path already exists, a
+  crashed session's temporary was salvaged, or published outputs hold
+  chunks. An opt-in lever (OI-1003-Q154) lets a local `copy`, whose two
+  halves share one process, stream a seat that neither its destination
+  nor its source's ledger has carried instead of filling it from other
+  outputs: there is no wire to save, and
+  streaming places the first byte before the whole file is hashed. The source sends its manifest, from its
   ledger without reading when the stat identity is recorded. The
   destination fills what it can from verified local chunks, then asks only
   for the missing indices. A fresh manifest is built from one read kept in

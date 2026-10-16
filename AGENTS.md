@@ -214,7 +214,9 @@ and the P5 partial-write proof, which the source gate no longer builds
 (OI-1003-Q81), and runs its copy-based suites a second time with the
 loopback hand-off off (`just handoff-off`, `BULKLOAD_LOOPBACK_HANDOFF=0`,
 OI-1003-Q154 review), so the transport path `pull` takes keeps its crash
-coverage. CI remains on GloriousFlywheel tinyland-nix; keep
+coverage, and a third time with the delta lever on (`just delta-lever`,
+`BULKLOAD_LOCAL_NEW_PATH_STREAM=1`, OI-1003-Q154 review), so the opt-in
+streamed new path keeps it too. CI remains on GloriousFlywheel tinyland-nix; keep
 `.bazelrc.flywheel` endpoint-free. Changing `flake.nix`, the public-read guard
 or its composite action requires updating the pinned digests in
 `scripts/ci-public-read-guard.sh`, the action and `tests/test_ci_contract.py`.

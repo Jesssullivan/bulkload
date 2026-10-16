@@ -295,3 +295,37 @@ fn the_hand_off_and_the_plain_protocol_carry_the_same_tree() {
     );
     assert_eq!(handed, run(false));
 }
+
+/// The delta lever (OI-1003-Q154 review) keeps the manifest in a session
+/// that salvaged a temporary: a temporary's name does not say which path
+/// it was staged for. A crashed session staged and sealed a new seat
+/// whole, but neither its rename nor its reuse row committed; the resume,
+/// with the lever on, asks for that seat's manifest and fills it from the
+/// salvaged temporary: nothing received, the source read once for the
+/// manifest. Streamed, it would have been received whole.
+#[test]
+fn the_delta_lever_keeps_the_manifest_when_a_temporary_was_salvaged() {
+    let corpus = Corpus::new();
+    std::fs::write(corpus.base.join("source/other"), noise(41, 300_000)).unwrap();
+    assert!(corpus.run().unwrap().refusals.is_empty());
+    let held = noise(42, 2 << 20);
+    std::fs::write(corpus.base.join("source/held"), &held).unwrap();
+    std::fs::write(own_temporary(&corpus, 1, 1), &held).unwrap();
+    let root = canonical(&corpus.base.join("destination"));
+    set_local_new_path_stream(&root, Some(true));
+    let (resumed, decided) = decisions(|| corpus.run());
+    set_local_new_path_stream(&root, None);
+    let resumed = resumed.unwrap();
+    assert!(resumed.refusals.is_empty(), "{:?}", resumed.refusals);
+    assert_eq!(decided, (1, 0), "asked by manifest, none streamed");
+    assert_eq!((resumed.reused, resumed.completed), (1, 1), "{resumed:?}");
+    assert_eq!(
+        resumed.bytes_received, 0,
+        "filled from the salvaged temporary: {resumed:?}"
+    );
+    assert_eq!(resumed.source_bytes_read, held.len() as u64, "{resumed:?}");
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/held")).unwrap(),
+        held
+    );
+}
