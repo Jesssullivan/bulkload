@@ -102,7 +102,8 @@ CREATE TABLE IF NOT EXISTS regularized(
     k_dev INTEGER NOT NULL, k_ino INTEGER NOT NULL, k_size INTEGER NOT NULL, k_mtime INTEGER NOT NULL,
     t_dev INTEGER NOT NULL, t_ino INTEGER NOT NULL, t_size INTEGER NOT NULL, t_mtime INTEGER NOT NULL,
     r_dev INTEGER NOT NULL, r_ino INTEGER NOT NULL, r_size INTEGER NOT NULL, r_mtime INTEGER NOT NULL,
-    state TEXT NOT NULL, pass INTEGER NOT NULL
+    state TEXT NOT NULL, pass INTEGER NOT NULL,
+    digest BLOB
 );
 ";
 /// A file's identity: what a pass compares instead of reading it.
@@ -299,6 +300,10 @@ pub struct Regular {
     pub target_identity: Identity,
     /// The regular copy's identity (staged, then at the path).
     pub regular: Identity,
+    /// BLAKE3 of the bytes copied (the target's then, the copy's as made);
+    /// `--undo` puts the link back only over a target that holds them.
+    /// `None` on a row written before it was recorded: never undone.
+    pub digest: Option<[u8; 32]>,
     pub state: RegularState,
 }
 
@@ -369,16 +374,18 @@ impl Ledger {
         }
         sql(conn.execute_batch(SCHEMA))?;
         sql(conn.execute_batch(SCHEMA_V3))?;
-        for column in ["l_size", "l_mtime"] {
+        for (table, column, kind) in [
+            ("session", "l_size", "INTEGER"),
+            ("session", "l_mtime", "INTEGER"),
+            ("regularized", "digest", "BLOB"),
+        ] {
             let present: i64 = sql(conn.query_row(
-                "SELECT count(*) FROM pragma_table_info('session') WHERE name = ?1",
-                params![column],
+                "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
                 |row| row.get(0),
             ))?;
             if present == 0 {
-                sql(
-                    conn.execute_batch(&format!("ALTER TABLE session ADD COLUMN {column} INTEGER"))
-                )?;
+                sql(conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}")))?;
             }
         }
         let token: Option<String> = sql(conn
@@ -909,8 +916,9 @@ impl Ledger {
         sql(self.conn.execute(
             "INSERT OR REPLACE INTO regularized(link, target, resolved,
                 k_dev, k_ino, k_size, k_mtime, t_dev, t_ino, t_size, t_mtime,
-                r_dev, r_ino, r_size, r_mtime, state, pass)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+                r_dev, r_ino, r_size, r_mtime, state, pass, digest)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18)",
             params![
                 blob(&row.link),
                 blob(&row.target),
@@ -929,6 +937,7 @@ impl Ledger {
                 r_mtime,
                 row.state.word(),
                 self.pass,
+                row.digest.as_ref().map(<[u8; 32]>::as_slice),
             ],
         ))
         .map(drop)
@@ -940,7 +949,7 @@ impl Ledger {
         }
         let mut statement = sql(self.conn.prepare(
             "SELECT link, target, resolved, k_dev, k_ino, k_size, k_mtime,
-                    t_dev, t_ino, t_size, t_mtime, r_dev, r_ino, r_size, r_mtime, state
+                    t_dev, t_ino, t_size, t_mtime, r_dev, r_ino, r_size, r_mtime, state, digest
              FROM regularized WHERE ?1 IS NULL OR link = ?1 ORDER BY link",
         ))?;
         let identity = |row: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Identity> {
@@ -960,11 +969,12 @@ impl Ledger {
                 identity(row, 7)?,
                 identity(row, 11)?,
                 row.get::<_, String>(15)?,
+                row.get::<_, Option<Vec<u8>>>(16)?,
             ))
         }))?;
         let mut out = Vec::new();
         for row in rows {
-            let (link, target, resolved, link_identity, target_identity, regular, state) =
+            let (link, target, resolved, link_identity, target_identity, regular, state, hash) =
                 sql(row)?;
             out.push(Regular {
                 link,
@@ -973,6 +983,7 @@ impl Ledger {
                 link_identity,
                 target_identity,
                 regular,
+                digest: digest(hash),
                 state: RegularState::parse(&state)?,
             });
         }

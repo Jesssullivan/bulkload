@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use rusqlite::{params, Connection};
 
 use super::{check_lines, rel, rollout_bytes, World, T1};
+use crate::reseat::regularize::{set_hook, Step};
 use crate::reseat::tests::{append, r0, run, set_mtime, transcript, SERIAL, SID, SID2};
 use crate::reseat::{ledger, undo};
 
@@ -306,6 +307,251 @@ fn q198_2_undo_keeps_a_copy_written_since() {
     assert_eq!(put_back, 0, "{lines:?}");
     assert!(fs::symlink_metadata(&link).unwrap().is_file());
     assert_eq!(fs::read(&target).unwrap(), bytes);
+}
+
+/// One symlinked transcript in the lab key, into an archive file outside
+/// the destination: `(link, target, bytes)`.
+fn archived_link(world: &World, sid: &str) -> (PathBuf, PathBuf, Vec<u8>) {
+    let key_dir = world.dest(&format!("projects/{}", world.lab_key()));
+    fs::create_dir_all(&key_dir).unwrap();
+    let archive = world.base.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+    let target = archive.join(format!("{sid}.jsonl"));
+    let bytes = transcript(sid, &world.real_lab(), "s", 3);
+    fs::write(&target, &bytes).unwrap();
+    let link = key_dir.join(format!("{sid}.jsonl"));
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    (link, target, bytes)
+}
+
+/// The kept copies beside `link` (`.<name>.<token>.kept-<inode>.bulkload-reseat`).
+fn kept_beside(link: &Path) -> Vec<PathBuf> {
+    let name = link.file_name().unwrap().to_string_lossy().into_owned();
+    let mut kept: Vec<PathBuf> = fs::read_dir(link.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            let file = path.file_name().unwrap().to_string_lossy().into_owned();
+            file.starts_with(&format!(".{name}."))
+                && file.contains(".kept-")
+                && file.ends_with(".bulkload-reseat")
+        })
+        .collect();
+    kept.sort();
+    kept
+}
+
+/// Run one claude-only pass with `hook` acting as a live session at each
+/// regularization step.
+fn run_hooked(
+    options: &crate::reseat::Options,
+    hook: impl FnMut(Step, &Path) + 'static,
+) -> Vec<String> {
+    set_hook(Some(Box::new(hook)));
+    let (_, lines, _) = run(options);
+    set_hook(None);
+    lines
+}
+
+/// Q198 (2) re-review, MEDIUM 1: a live session appends through the link
+/// after the target was read and before the swap. The append is never
+/// orphaned or deleted: the transcript is refused
+/// (`RESEAT_REGULARIZE_RACED`), the link and the archive (with the append)
+/// are untouched, the staged copy is kept aside (named on the line), and
+/// no row is written, so the next pass regularizes it whole while the kept
+/// copy stays.
+#[test]
+fn q198_2_rr_append_between_read_and_swap_keeps_both_copies() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let world = World::new();
+    let (link, target, bytes) = archived_link(&world, SID2);
+    let mut options = world.options();
+    options.codex = false;
+    let appended = b"{\"type\":\"live-append-before-swap\"}\n";
+    let lines = run_hooked(&options, move |step, at| {
+        if step == Step::Staged {
+            append(at, appended);
+        }
+    });
+    let report = lines
+        .iter()
+        .find(|line| line.contains("\"kind\":\"regularize\""))
+        .unwrap();
+    assert!(
+        report.contains("\"outcome\":\"raced-skipped\""),
+        "{lines:?}"
+    );
+    assert!(report.contains("RESEAT_REGULARIZE_RACED"), "{report}");
+    assert!(
+        fs::symlink_metadata(&link).unwrap().is_symlink(),
+        "{report}"
+    );
+    assert_eq!(fs::read_link(&link).unwrap(), target);
+    let mut whole = bytes.clone();
+    whole.extend_from_slice(appended);
+    assert_eq!(fs::read(&target).unwrap(), whole, "the append kept");
+    let kept = kept_beside(&link);
+    assert_eq!(kept.len(), 1, "{kept:?} {report}");
+    assert_eq!(fs::read(&kept[0]).unwrap(), bytes, "the staged copy kept");
+    assert!(report.contains(&*kept[0].to_string_lossy()), "{report}");
+    let ledger = ledger::Ledger::open_read_only(&options.state)
+        .unwrap()
+        .unwrap();
+    assert!(ledger.regular(&link).unwrap().is_none());
+    drop(ledger);
+    // The next pass, with the session quiet: the whole transcript.
+    let (_, lines, _) = run(&options);
+    assert!(fs::symlink_metadata(&link).unwrap().is_file(), "{lines:?}");
+    assert_eq!(fs::read(&link).unwrap(), whole);
+    assert_eq!(fs::read(&target).unwrap(), whole, "archive kept");
+    assert_eq!(kept_beside(&link), kept, "a kept copy is never removed");
+}
+
+/// Q198 (2) re-review, MEDIUM 1, under the swap: the target is written
+/// just after the exchange. With the copy unchanged, the link goes back
+/// over it and the copy is kept aside; with the copy written too (a
+/// session opened the path after the swap), both stay: the copy at the
+/// path, the archive untouched, and `--undo` refuses the row.
+#[test]
+fn q198_2_rr_append_under_the_swap_keeps_both_copies() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let world = World::new();
+    let (link, target, bytes) = archived_link(&world, SID2);
+    let mut options = world.options();
+    options.codex = false;
+    let archived = b"{\"type\":\"archive-append-under-swap\"}\n";
+    let hook_target = target.clone();
+    let lines = run_hooked(&options, move |step, _| {
+        if step == Step::Exchanged {
+            append(&hook_target, archived);
+        }
+    });
+    let report = lines
+        .iter()
+        .find(|line| line.contains("\"kind\":\"regularize\""))
+        .unwrap();
+    assert!(
+        report.contains("\"outcome\":\"raced-restored\""),
+        "{lines:?}"
+    );
+    assert!(report.contains("RESEAT_REGULARIZE_RACED"), "{report}");
+    assert_eq!(fs::read_link(&link).unwrap(), target, "the link back");
+    let mut whole = bytes.clone();
+    whole.extend_from_slice(archived);
+    assert_eq!(fs::read(&target).unwrap(), whole);
+    let kept = kept_beside(&link);
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(fs::read(&kept[0]).unwrap(), bytes);
+
+    // Both written under the swap.
+    let world = World::new();
+    let (link, target, bytes) = archived_link(&world, SID);
+    let mut options = world.options();
+    options.codex = false;
+    let resumed = b"{\"type\":\"resumed-through-the-path\"}\n";
+    let hook_target = target.clone();
+    let lines = run_hooked(&options, move |step, at| {
+        if step == Step::Exchanged {
+            append(&hook_target, archived);
+            append(at, resumed);
+        }
+    });
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("\"outcome\":\"raced-kept\"")
+                && line.contains("RESEAT_REGULARIZE_RACED")),
+        "{lines:?}"
+    );
+    let mut at_path = bytes.clone();
+    at_path.extend_from_slice(resumed);
+    let mut in_archive = bytes;
+    in_archive.extend_from_slice(archived);
+    assert!(fs::symlink_metadata(&link).unwrap().is_file());
+    assert_eq!(fs::read(&link).unwrap(), at_path);
+    assert_eq!(fs::read(&target).unwrap(), in_archive);
+    let ((put_back, _), lines) = undo_lines(&options);
+    assert_eq!(put_back, 0, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("RESEAT_UNDO_TARGET_CHANGED")),
+        "{lines:?}"
+    );
+    assert_eq!(fs::read(&link).unwrap(), at_path);
+    assert_eq!(fs::read(&target).unwrap(), in_archive);
+}
+
+/// Q198 (2) re-review, MEDIUM 2: `--undo` puts a link back (and removes
+/// the regular file) only over an archive target that exists and holds the
+/// recorded bytes. A target rewritten in place (same size) or removed is
+/// refused (`RESEAT_UNDO_TARGET_CHANGED`) and nothing changes for that
+/// row: the regular file stays, the row stays `done`; once the target is
+/// back as recorded, the same row is undone.
+#[test]
+fn q198_2_rr_undo_verifies_the_archive_target() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let world = World::new();
+    let (good, good_target, good_bytes) = archived_link(&world, SID);
+    let (edited, edited_target, edited_bytes) = archived_link(&world, SID2);
+    let gone_sid = "0e0e0e0e-1111-4222-8333-444444444444";
+    let (gone, gone_target, gone_bytes) = archived_link(&world, gone_sid);
+    let mut options = world.options();
+    options.codex = false;
+    run(&options);
+    for link in [&good, &edited, &gone] {
+        assert!(fs::symlink_metadata(link).unwrap().is_file());
+    }
+    // Rewritten in place, same length; and removed.
+    let mut other = edited_bytes.clone();
+    let last = other.len() - 2;
+    other[last] = b'X';
+    fs::write(&edited_target, &other).unwrap();
+    fs::rename(&gone_target, world.base.join("moved.jsonl")).unwrap();
+    let ((put_back, _), lines) = undo_lines(&options);
+    assert_eq!(put_back, 1, "{lines:?}");
+    assert_eq!(fs::read_link(&good).unwrap(), good_target);
+    assert_eq!(fs::read(&good_target).unwrap(), good_bytes);
+    for (link, sid, bytes) in [
+        (&edited, SID2, &edited_bytes),
+        (&gone, gone_sid, &gone_bytes),
+    ] {
+        assert!(
+            lines.iter().any(|line| line.contains(sid)
+                && line.contains("\"outcome\":\"undo-refused\"")
+                && line.contains("RESEAT_UNDO_TARGET_CHANGED")),
+            "{sid}: {lines:?}"
+        );
+        assert!(fs::symlink_metadata(link).unwrap().is_file(), "{sid}");
+        assert_eq!(
+            &fs::read(link).unwrap(),
+            bytes,
+            "{sid}: the regular file kept"
+        );
+    }
+    assert_eq!(fs::read(&edited_target).unwrap(), other, "never written");
+    let ledger = ledger::Ledger::open_read_only(&options.state)
+        .unwrap()
+        .unwrap();
+    for link in [&edited, &gone] {
+        assert_eq!(
+            ledger.regular(link).unwrap().unwrap().state,
+            ledger::RegularState::Done
+        );
+    }
+    drop(ledger);
+    // The target back as recorded: the row is undone.
+    fs::rename(world.base.join("moved.jsonl"), &gone_target).unwrap();
+    let ((put_back, _), lines) = undo_lines(&options);
+    assert_eq!(put_back, 1, "{lines:?}");
+    assert_eq!(fs::read_link(&gone).unwrap(), gone_target);
+    assert!(fs::symlink_metadata(&edited).unwrap().is_file());
 }
 
 /// Q198 C: home and `/private/tmp` sessions (and threads) are placed

@@ -2005,11 +2005,24 @@ picker never lists. Before placing anything, a pass replaces each
 regular-file copy of its target: a byte copy (no reflink: P84
 SOURCE-NO-CLONE, OI-1003-Q165, forbids every remap call) with the target's
 mode and modification time, sealed, ledgered (`regularized`: link text,
-link, target and copy identities) and exchanged in atomically; the archive
-copy stays. A target that changes while it is copied is left this pass;
-one that changes between the copy and the exchange gets its link back
-(`RESEAT_REGULARIZE_RACED`), unless the copy was written since too, when
-both are kept. A dangling link or one to a non-file is kept
+link, target and copy identities, and the BLAKE3 of the bytes copied) and
+exchanged in atomically; the archive copy stays. It is race-safe against a
+live session appending through the link (re-review of OI-1003-Q198): before
+the swap the copy is read back from its name and must be the bytes read
+(length and BLAKE3), and the target's identity (inode, size, modification
+time, by descriptor and by path), the link's and the copy's must be the
+ones read; the target is checked again right after the exchange. Nothing
+that holds a session's bytes is removed or replaced unless its bytes are
+known to be held elsewhere. On any mismatch that transcript is refused
+(`RESEAT_REGULARIZE_RACED`) and both copies stay intact: written before the
+swap, the link and the archive are untouched and the staged copy is kept
+aside as `.<name>.<token>.kept-<inode>.bulkload-reseat` (no row: a later
+pass tries again); written under the swap, an unchanged copy gets the link
+put back over it and is kept aside the same way, and a copy written too
+stays at the path with the archive untouched (`raced`). The line's `kept`
+field names a kept copy; no pass removes one. One window stays: a session
+that opened the link before the swap and writes after the last check
+appends to the archive. A dangling link or one to a non-file is kept
 (`DESTINATION_OCCUPIED`). A regularized copy that is a byte prefix of a
 landed neo session is then extended like any other. `--no-regularize`
 skips it.
@@ -2122,7 +2135,13 @@ one `BEGIN IMMEDIATE` transaction, only while the row holds the value
 re-seat wrote), each only where the destination still holds exactly what
 re-seat wrote; one changed since (a resume appended to the copy, a pass
 extended it, Codex rewrote the row) is kept, `undo-kept`,
-`RESEAT_DEST_CONTINUED`. An undone row or link is not changed again by a
+`RESEAT_DEST_CONTINUED`. Before it puts a link back or removes a regular
+file, it verifies the archive target the row's link names: the link text
+must still resolve to the recorded target, which must be a regular file
+holding the recorded bytes (size and BLAKE3), unchanged up to the swap;
+otherwise that row is `undo-refused`, `RESEAT_UNDO_TARGET_CHANGED`, and
+nothing changes for it (a row written before the digest was recorded is
+refused the same way). An undone row or link is not changed again by a
 later pass. Placed sessions are not removed.
 
 **Crash safety.** Twelve fault points (`reseat.*`, `src/fault.rs`) with

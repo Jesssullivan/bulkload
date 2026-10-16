@@ -364,9 +364,17 @@ pub enum BulkloadRefusal {
     /// two runs never write one destination at once (OI-1003-Q198 review).
     ReseatLocked,
     /// `estate-reseat`: a symlinked destination transcript's target changed
-    /// while it was being regularized into a regular file (OI-1003-Q198):
-    /// the symlink is put back, or, when both changed, the two are kept.
+    /// while it was being regularized into a regular file (OI-1003-Q198
+    /// and its re-review): nothing that holds a session's bytes is removed
+    /// or replaced; the archive and the copy are both kept (the link left
+    /// or put back and the copy kept aside, or the copy at the path when
+    /// both were written).
     ReseatRegularizeRaced,
+    /// `estate-reseat --undo`: the archive target a regularization row's
+    /// link names is absent, not a regular file, or no longer holds the
+    /// bytes the regular copy was made from (OI-1003-Q198 re-review): the
+    /// link is not put back, the regular file is kept, nothing changes.
+    ReseatUndoTargetChanged,
     /// `estate-reseat --check`: at least one lane failed the R0 acceptance
     /// check (its sessions are not listable and byte-identical in its
     /// destination working directory, its Git state is not equal, or its
@@ -480,6 +488,7 @@ impl BulkloadRefusal {
             Self::ReseatExtendRaced => "RESEAT_EXTEND_RACED",
             Self::ReseatLocked => "RESEAT_LOCKED",
             Self::ReseatRegularizeRaced => "RESEAT_REGULARIZE_RACED",
+            Self::ReseatUndoTargetChanged => "RESEAT_UNDO_TARGET_CHANGED",
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
@@ -567,6 +576,7 @@ impl BulkloadRefusal {
         "RESEAT_EXTEND_RACED",
         "RESEAT_LOCKED",
         "RESEAT_REGULARIZE_RACED",
+        "RESEAT_UNDO_TARGET_CHANGED",
         "RESEAT_R0_FAILED",
         "PROBE_FAILED",
         "IO",
@@ -813,6 +823,7 @@ mod tests {
             BulkloadRefusal::ReseatExtendRaced,
             BulkloadRefusal::ReseatLocked,
             BulkloadRefusal::ReseatRegularizeRaced,
+            BulkloadRefusal::ReseatUndoTargetChanged,
             BulkloadRefusal::ReseatR0Failed,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),

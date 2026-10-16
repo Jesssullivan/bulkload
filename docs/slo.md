@@ -1440,7 +1440,9 @@ session re-seat", and the receipt
   unresolved) or unreadable is ledgered by its landed identity and not
   read again, so an unchanged rerun reads 0 landed bytes with them too.
 - **S4** gains `RESEAT_LOCKED` (another run holds a destination root or
-  STATE), `RESEAT_REGULARIZE_RACED` and, before writing,
+  STATE), `RESEAT_REGULARIZE_RACED` (both copies kept),
+  `RESEAT_UNDO_TARGET_CHANGED` (`--undo` over an archive target that is
+  gone or no longer the recorded bytes: nothing changed) and, before writing,
   `DESTINATION_SPACE_INSUFFICIENT` (the engine's `--min-free-percent` rule
   over the bytes a pass would write). Everything under a project key that
   is no session's is carried with its key or named by a `key` line

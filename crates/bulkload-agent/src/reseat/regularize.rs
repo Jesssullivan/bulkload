@@ -10,28 +10,43 @@
 //! hold is unaffected), ledgered and reversible.
 //!
 //! Per symlink `projects/<key>/<name>.jsonl` (a real key directory; a
-//! symlinked key directory is never written through):
+//! symlinked key directory is never written through), race-safe against a
+//! live session appending through the link (OI-1003-Q198 re-review):
 //!
 //! 1. The target (its real path, a regular file) is copied byte for byte
 //!    into `.<name>.<token>.bulkload-reseat` beside the link, with the
-//!    target's mode and modification time, and sealed. No remap call is
-//!    made (no reflink: P84 SOURCE-NO-CLONE, OI-1003-Q165, holds every
-//!    crate to a byte copy). A target that changed while it was copied is
-//!    left alone this pass (`RESEAT_REGULARIZE_RACED`).
-//! 2. The ledger row (`intent`) records the link text, the link's and the
-//!    target's identities and the copy's.
-//! 3. The copy and the link are exchanged atomically (`RENAME_EXCHANGE`),
-//!    then settled: the link (now under the temporary name) is removed when
-//!    the target is unchanged (`done`). When the target changed in the
-//!    meantime (a session appended through the link), the link is put back
-//!    if the copy is unchanged; when both changed, both are kept and the
-//!    copy stays at the path (`raced`). A crash anywhere settles forward
-//!    from the ledger and the two names.
+//!    target's mode and modification time, sealed, and the BLAKE3 of the
+//!    bytes read kept. No remap call is made (no reflink: P84
+//!    SOURCE-NO-CLONE, OI-1003-Q165, holds every crate to a byte copy).
+//! 2. Before the swap the copy is read back from its name and must be the
+//!    bytes read (same length, same BLAKE3), and the target's identity
+//!    (inode, size, modification time) must be the one read, by the open
+//!    descriptor and by its path; the link's and the copy's too.
+//! 3. The ledger row (`intent`) records the link text, the link's, the
+//!    target's and the copy's identities and the digest.
+//! 4. The copy and the link are exchanged atomically (`RENAME_EXCHANGE`),
+//!    and the target's identity is checked again under the swap: unchanged,
+//!    the link (now under the temporary name) is removed (`done`).
 //!
-//! `--undo` puts each link back (a new symlink with the recorded text,
-//! exchanged in), only while the regular file is exactly the copy this
-//! ledger made; one changed since (a resume appended, or a re-seat pass
-//! extended it) is kept, `RESEAT_DEST_CONTINUED`.
+//! Nothing that holds a session's bytes is removed or replaced unless its
+//! bytes are known to be held elsewhere. On any mismatch the transcript is
+//! refused (`RESEAT_REGULARIZE_RACED`) and both copies stay intact: before
+//! the swap, the archive is untouched and the staged copy is kept aside as
+//! `.<name>.<token>.kept-<inode>.bulkload-reseat`; under the swap, an
+//! unchanged copy gets the link put back over it and is kept aside the
+//! same way, and a copy written since stays at the path with the archive
+//! untouched (`raced`). A kept copy is never removed by any pass; the
+//! report line names it. A crash anywhere settles forward from the ledger
+//! and the two names.
+//!
+//! `--undo` first verifies the archive target the row's link names: it
+//! must exist, be a regular file, and hold the recorded bytes (the size and
+//! BLAKE3 of the copy). Otherwise the row is refused
+//! (`RESEAT_UNDO_TARGET_CHANGED`) and nothing is changed for it. Then it
+//! puts the link back (a new symlink with the recorded text, exchanged in),
+//! only while the regular file is exactly the copy this ledger made; one
+//! changed since (a resume appended, or a re-seat pass extended it) is
+//! kept, `RESEAT_DEST_CONTINUED`.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
@@ -117,12 +132,138 @@ pub fn planned(root: &Path, ledger: Option<&Ledger>) -> Result<u64> {
     Ok(total)
 }
 
-fn line(link: &Path, outcome: &str, refusal: Option<&BulkloadRefusal>) -> String {
+/// Where a test acts as a live session between two steps of a
+/// regularization (the hook runs only in unit tests).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Step {
+    /// The copy is staged and read back; the swap has not happened.
+    Staged,
+    /// The copy and the link were just exchanged.
+    Exchanged,
+}
+
+/// The unit tests' live-session hook.
+#[cfg(test)]
+type Hook = Box<dyn FnMut(Step, &Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `hook` at every [`Step`] of the regularizations on this thread
+/// (`None` clears it).
+#[cfg(test)]
+pub fn set_hook(hook: Option<Hook>) {
+    HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn hook(step: Step, link: &Path) {
+    HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(step, link);
+        }
+    });
+}
+
+#[cfg(not(test))]
+const fn hook(_step: Step, _link: &Path) {}
+
+/// One link's outcome: its report word, its refusal, and where a kept
+/// copy is.
+struct Outcome {
+    word: &'static str,
+    refusal: Option<BulkloadRefusal>,
+    kept: Option<PathBuf>,
+}
+
+impl Outcome {
+    const fn new(word: &'static str, refusal: Option<BulkloadRefusal>) -> Self {
+        Self {
+            word,
+            refusal,
+            kept: None,
+        }
+    }
+
+    const fn raced(word: &'static str, kept: Option<PathBuf>) -> Self {
+        Self {
+            word,
+            refusal: Some(BulkloadRefusal::ReseatRegularizeRaced),
+            kept,
+        }
+    }
+}
+
+fn line(link: &Path, outcome: &Outcome) -> String {
     format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"regularize\",\"tool\":\"{TOOL}\",\"link\":{},\"outcome\":\"{outcome}\",\"refused\":{}}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"regularize\",\"tool\":\"{TOOL}\",\"link\":{},\"outcome\":\"{}\",\"refused\":{},\"kept\":{}}}",
         json_string(&link.to_string_lossy()),
-        refusal.map_or_else(|| "null".to_owned(), |refusal| json_string(refusal.code())),
+        outcome.word,
+        outcome
+            .refusal
+            .as_ref()
+            .map_or_else(|| "null".to_owned(), |refusal| json_string(refusal.code())),
+        outcome.kept.as_ref().map_or_else(
+            || "null".to_owned(),
+            |kept| json_string(&kept.to_string_lossy())
+        ),
     )
+}
+
+/// The lstat identity at `path`, `None` when absent or unreadable.
+fn lstat_identity(path: &Path) -> Option<Identity> {
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| Identity::of(&meta))
+}
+
+/// The identity and BLAKE3 of the regular file at `path` (not following a
+/// terminal symlink), read whole; `None` when it is absent, not a regular
+/// file, cannot be opened, or changed while it was read.
+fn read_digest(path: &Path) -> Result<Option<(Identity, [u8; 32])>> {
+    let Ok(mut file) = crate::hash::open_nofollow(path) else {
+        return Ok(None);
+    };
+    let meta = file.metadata().refuse_at("reseat::regularize::digest")?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let identity = Identity::of(&meta);
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut total = 0_u64;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .refuse_at("reseat::regularize::digest")?;
+        if read == 0 {
+            break;
+        }
+        counters::add_len(Counter::ReseatDestRead, read);
+        let bytes = buffer.get(..read).unwrap_or_default();
+        counters::update(&mut hasher, Counter::HashOther, bytes);
+        total = total.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+    }
+    let after = Identity::of(&file.metadata().refuse_at("reseat::regularize::digest")?);
+    if after != identity || total != identity.size {
+        return Ok(None);
+    }
+    Ok(Some((identity, *hasher.finalize().as_bytes())))
+}
+
+/// A staged copy.
+struct Staged {
+    /// The copy's identity once sealed.
+    copy: Identity,
+    /// The target's identity when it was opened.
+    source: Identity,
+    /// BLAKE3 of the bytes read from the target.
+    digest: [u8; 32],
+    /// The target held still while it was read (by its descriptor and its
+    /// path), and the copy read back from its name is those bytes.
+    verified: bool,
 }
 
 /// One link's names.
@@ -130,6 +271,7 @@ struct Site<'a> {
     ledger: &'a Ledger,
     link: &'a Path,
     directory: File,
+    file_name: std::ffi::OsString,
     name: std::ffi::CString,
     temp: PathBuf,
     temp_c: std::ffi::CString,
@@ -148,6 +290,7 @@ impl<'a> Site<'a> {
             ledger,
             link,
             directory: open_dir(parent)?,
+            file_name: name.to_os_string(),
             name: c_name(name)?,
             temp: parent.join(&temp_os),
             temp_c: c_name(&temp_os)?,
@@ -176,15 +319,55 @@ impl<'a> Site<'a> {
             && std::fs::read_link(path).is_ok_and(|now| now == text)
     }
 
+    /// Move the regular file under the temporary name aside, never
+    /// replacing anything, as `.<name>.<token>.kept-<inode>.bulkload-reseat`
+    /// (an inode names one file while it exists, and a kept copy is never
+    /// removed by a pass). `None` when the temporary holds no regular file.
+    fn keep(&self) -> Result<Option<PathBuf>> {
+        let Some(meta) = lstat(&self.temp)? else {
+            return Ok(None);
+        };
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        let ino = std::os::unix::fs::MetadataExt::ino(&meta);
+        let token = self.ledger.temp_token();
+        let tag = if token.is_empty() {
+            format!("kept-{ino}")
+        } else {
+            format!("{token}.kept-{ino}")
+        };
+        let kept_os = temp_name(&self.file_name, &tag);
+        crate::io::publish_noreplace(&self.directory, &self.temp_c, &c_name(&kept_os)?)
+            .map_err(|error| crate::refuse::io_in(&error, self.link, "reseat::regularize::keep"))?;
+        self.seal()?;
+        Ok(Some(self.link.with_file_name(kept_os)))
+    }
+
+    /// The staged copy under the temporary name: removed when it is
+    /// unchanged and the target still holds the bytes it was copied from
+    /// (nothing is lost), else kept aside.
+    fn retire_staged(&self, row: &Regular) -> Result<Option<PathBuf>> {
+        if identity_at(&self.temp)? == Some(row.regular)
+            && lstat_identity(&row.resolved) == Some(row.target_identity)
+        {
+            self.unlink_temp()?;
+            self.seal()?;
+            return Ok(None);
+        }
+        self.keep()
+    }
+
     /// Copy the target into the temporary: its bytes, mode and mtime,
-    /// sealed. Returns the copy's identity and the target's identity before
-    /// and after the copy.
-    fn stage(&self, resolved: &Path) -> Result<(Identity, Identity, Identity)> {
+    /// sealed; then read the copy back from its name and check the target
+    /// held still.
+    fn stage(&self, resolved: &Path) -> Result<Staged> {
         let mut target = crate::hash::open_nofollow(resolved)?;
         let meta = target.metadata().refuse_at("reseat::regularize::target")?;
-        let before = Identity::of(&meta);
+        let source = Identity::of(&meta);
         if lstat(&self.temp)?.is_some_and(|meta| meta.is_file()) {
-            self.unlink_temp()?;
+            // Left by an interrupted pass: kept aside, never removed.
+            self.keep()?;
         }
         let mut copy = OpenOptions::new()
             .write(true)
@@ -196,7 +379,9 @@ impl<'a> Site<'a> {
             .map_err(|error| {
                 crate::refuse::io_in(&error, self.link, "reseat::regularize::stage")
             })?;
-        let copied = (|| -> Result<()> {
+        let mut hasher = blake3::Hasher::new();
+        let mut copied = 0_u64;
+        let written = (|| -> Result<()> {
             let mut buffer = vec![0_u8; CHUNK];
             loop {
                 let read = target
@@ -207,10 +392,12 @@ impl<'a> Site<'a> {
                 }
                 counters::add_len(Counter::ReseatDestRead, read);
                 let bytes = buffer.get(..read).unwrap_or_default();
+                counters::update(&mut hasher, Counter::HashOther, bytes);
                 copy.write_all(bytes).map_err(|error| {
                     crate::refuse::io_in(&error, self.link, "reseat::regularize::write")
                 })?;
                 counters::add_len(Counter::ReseatDestWrite, read);
+                copied = copied.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
             }
             copy.set_permissions(std::fs::Permissions::from_mode(
                 meta.permissions().mode() & 0o777,
@@ -220,151 +407,200 @@ impl<'a> Site<'a> {
                 .refuse_at("reseat::regularize::mtime")?;
             crate::io::durable::seal_file(&copy).refuse_at("reseat::regularize::seal_copy")
         })();
-        if let Err(refusal) = copied {
+        if let Err(refusal) = written {
+            // Never published, and the archive holds every byte of it.
             let _ = self.unlink_temp();
             return Err(refusal);
         }
-        let after = Identity::of(&target.metadata().refuse_at("reseat::regularize::target")?);
+        let digest = *hasher.finalize().as_bytes();
         let staged = Identity::of(&copy.metadata().refuse_at("reseat::regularize::staged")?);
-        Ok((staged, before, after))
+        drop(copy);
+        let after = Identity::of(&target.metadata().refuse_at("reseat::regularize::target")?);
+        let back = read_digest(&self.temp)?;
+        // The target held still (its descriptor and its path), every byte
+        // was read, and the copy on disk is those bytes.
+        let held = [Some(after), lstat_identity(resolved)] == [Some(source); 2];
+        let whole = copied == source.size;
+        let same = back == Some((staged, digest));
+        let verified = held && whole && same;
+        Ok(Staged {
+            copy: staged,
+            source,
+            digest,
+            verified,
+        })
+    }
+
+    /// Under the swap, before it: the target, the link and the copy are
+    /// each still what was read.
+    fn unchanged(&self, row: &Regular) -> bool {
+        lstat_identity(&row.resolved) == Some(row.target_identity)
+            && lstat_identity(self.link) == Some(row.link_identity)
+            && Self::is_link_to(self.link, &row.target)
+            && lstat_identity(&self.temp) == Some(row.regular)
     }
 
     /// After the exchange (or a crash after it): the copy at the path, the
     /// link under the temporary name. Settle by the target's and the
     /// copy's identities.
-    fn settle(&self, mut row: Regular) -> Result<(&'static str, Option<BulkloadRefusal>)> {
-        let target_now = std::fs::metadata(&row.resolved)
-            .ok()
-            .map(|meta| Identity::of(&meta));
-        let copy_now = identity_at(self.link)?;
+    fn settle(&self, mut row: Regular) -> Result<Outcome> {
         let link_at_temp = Self::is_link_to(&self.temp, &row.target);
-        let target_same = target_now == Some(row.target_identity);
-        if target_same || copy_now != Some(row.regular) {
-            // The target held still (the copy is it), or the copy has been
-            // written since (it is the destination's now): the copy stays.
+        if lstat_identity(&row.resolved) == Some(row.target_identity) {
+            // The target held still under the swap: the copy is it.
             if link_at_temp {
                 self.unlink_temp()?;
             }
             self.seal()?;
-            let (state, word, refusal) = if target_same {
-                (RegularState::Done, "regularized", None)
-            } else {
-                (
-                    RegularState::Raced,
-                    "raced-kept",
-                    Some(BulkloadRefusal::ReseatRegularizeRaced),
-                )
-            };
-            // The row keeps the staged identity: `--undo` removes only the
-            // copy exactly as it was made.
-            row.state = state;
+            row.state = RegularState::Done;
             self.ledger.put_regular(&row)?;
-            return Ok((word, refusal));
+            return Ok(Outcome::new("regularized", None));
         }
-        // The target changed and the copy did not: put the link back.
-        if link_at_temp {
+        if link_at_temp && identity_at(self.link)? == Some(row.regular) {
+            // The target was written under the swap and the copy was not:
+            // the link back over it, the copy kept aside.
             self.exchange()
                 .refuse_at("reseat::regularize::exchange_back")?;
-            if identity_at(&self.temp)? == Some(row.regular) {
-                self.unlink_temp()?;
-            }
+            self.seal()?;
+            let kept = self.keep()?;
+            self.ledger.delete_regular(self.link)?;
+            return Ok(Outcome::raced("raced-restored", kept));
+        }
+        // Both written (or the link gone): the copy stays at the path, the
+        // archive is untouched. The row keeps the staged identity: `--undo`
+        // removes only the copy exactly as it was made, over a verified
+        // target.
+        if link_at_temp {
+            self.unlink_temp()?;
         }
         self.seal()?;
-        self.ledger.delete_regular(self.link)?;
-        Ok((
-            "raced-restored",
-            Some(BulkloadRefusal::ReseatRegularizeRaced),
-        ))
+        row.state = RegularState::Raced;
+        self.ledger.put_regular(&row)?;
+        Ok(Outcome::raced("raced-kept", None))
     }
 
     /// Finish what a crash left under an `intent` row; `None` when the
     /// link is as it was (the pass decides again).
-    fn settle_intent(
-        &self,
-        row: Regular,
-    ) -> Result<Option<(&'static str, Option<BulkloadRefusal>)>> {
+    fn settle_intent(&self, row: Regular) -> Result<Option<Outcome>> {
         let at_path = identity_at(self.link)?;
         let exchanged =
             at_path.is_some_and(|now| now.dev == row.regular.dev && now.ino == row.regular.ino);
         if exchanged {
             return self.settle(row).map(Some);
         }
-        // Not exchanged: the temporary, if any, is the staged copy.
-        if identity_at(&self.temp)? == Some(row.regular) {
-            self.unlink_temp()?;
-            self.seal()?;
-        }
+        // Not exchanged (or exchanged back): the temporary, if any, is the
+        // staged copy.
+        self.retire_staged(&row)?;
         self.ledger.delete_regular(self.link)?;
         Ok(None)
     }
 
-    fn regularize(&self) -> Result<(&'static str, Option<BulkloadRefusal>)> {
+    fn regularize(&self) -> Result<Outcome> {
         let Some(link_meta) = lstat(self.link)? else {
-            return Ok(("absent", None));
+            return Ok(Outcome::new("absent", None));
         };
         if !link_meta.is_symlink() {
-            return Ok(("not-a-link", None));
+            return Ok(Outcome::new("not-a-link", None));
         }
         let text = std::fs::read_link(self.link).refuse_at("reseat::regularize::readlink")?;
         let Ok(resolved) = std::fs::canonicalize(self.link) else {
-            return Ok(("dangling", Some(BulkloadRefusal::DestinationOccupied)));
+            return Ok(Outcome::new(
+                "dangling",
+                Some(BulkloadRefusal::DestinationOccupied),
+            ));
         };
         if !lstat(&resolved)?.is_some_and(|meta| meta.is_file()) {
-            return Ok((
+            return Ok(Outcome::new(
                 "target-not-regular",
                 Some(BulkloadRefusal::DestinationOccupied),
             ));
         }
-        let (staged, before, after) = self.stage(&resolved)?;
-        if before != after {
-            self.unlink_temp()?;
-            return Ok((
-                "raced-skipped",
-                Some(BulkloadRefusal::ReseatRegularizeRaced),
-            ));
-        }
+        let staged = self.stage(&resolved)?;
+        hook(Step::Staged, self.link);
         let row = Regular {
             link: self.link.to_path_buf(),
             target: text,
             resolved,
             link_identity: Identity::of(&link_meta),
-            target_identity: before,
-            regular: staged,
+            target_identity: staged.source,
+            regular: staged.copy,
+            digest: Some(staged.digest),
             state: RegularState::Intent,
         };
+        if !staged.verified || !self.unchanged(&row) {
+            // Written while it was copied or before the swap: the archive
+            // and the link untouched, the copy kept aside.
+            let kept = self.keep()?;
+            return Ok(Outcome::raced("raced-skipped", kept));
+        }
         self.ledger.put_regular(&row)?;
         if let Err(error) = self.exchange() {
-            self.unlink_temp()?;
+            self.retire_staged(&row)?;
             self.ledger.delete_regular(self.link)?;
             if crate::io::rename_unsupported(&error) {
-                return Ok((
+                return Ok(Outcome::new(
                     "exchange-unsupported",
                     Some(BulkloadRefusal::DestinationExchangeUnsupported),
                 ));
             }
             return Err(error).refuse_at("reseat::regularize::exchange");
         }
+        hook(Step::Exchanged, self.link);
         fault_point!(ReseatAfterRegularizeExchange);
         if !Self::is_link_to(&self.temp, &row.target)
-            || lstat(&self.temp)?.map(|meta| Identity::of(&meta)) != Some(row.link_identity)
+            || lstat_identity(&self.temp) != Some(row.link_identity)
         {
             // Something other than the link was displaced (the path changed
-            // between the read and the exchange): put it back.
+            // between the check and the exchange): put it back, the copy
+            // kept aside.
             self.exchange()
                 .refuse_at("reseat::regularize::exchange_back")?;
-            self.unlink_temp()?;
             self.seal()?;
+            let kept = self.keep()?;
             self.ledger.delete_regular(self.link)?;
-            return Ok((
-                "raced-restored",
-                Some(BulkloadRefusal::ReseatRegularizeRaced),
-            ));
+            return Ok(Outcome::raced("raced-restored", kept));
         }
         self.settle(row)
     }
 
-    /// Put the link back over an unchanged copy (`--undo`).
-    fn undo(&self, mut row: Regular) -> Result<(&'static str, Option<BulkloadRefusal>)> {
+    /// The identity of the archive target the row's link names, when it
+    /// exists, is a regular file and holds the recorded bytes (the size
+    /// and BLAKE3 of the copy this ledger made); `None` otherwise.
+    fn verify_target(&self, row: &Regular) -> Result<Option<Identity>> {
+        let Some(digest) = row.digest else {
+            return Ok(None);
+        };
+        let Some(parent) = self.link.parent() else {
+            return Ok(None);
+        };
+        // The link text, read from the link's directory, must still name
+        // the recorded target.
+        if std::fs::canonicalize(parent.join(&row.target))
+            .ok()
+            .as_deref()
+            != Some(row.resolved.as_path())
+        {
+            return Ok(None);
+        }
+        Ok(match read_digest(&row.resolved)? {
+            Some((identity, now)) if identity.size == row.target_identity.size && now == digest => {
+                Some(identity)
+            }
+            _ => None,
+        })
+    }
+
+    /// Put the link back over an unchanged copy (`--undo`), only over a
+    /// verified target.
+    fn undo(&self, mut row: Regular) -> Result<Outcome> {
+        let target_changed = || {
+            Outcome::new(
+                "undo-refused",
+                Some(BulkloadRefusal::ReseatUndoTargetChanged),
+            )
+        };
+        let Some(verified) = self.verify_target(&row)? else {
+            return Ok(target_changed());
+        };
         // A crash inside an earlier undo: the link already back.
         if Self::is_link_to(self.link, &row.target) {
             if identity_at(&self.temp)? == Some(row.regular) {
@@ -373,18 +609,34 @@ impl<'a> Site<'a> {
             }
             row.state = RegularState::Undone;
             self.ledger.put_regular(&row)?;
-            return Ok(("undone", None));
+            return Ok(Outcome::new("undone", None));
         }
         if identity_at(self.link)? != Some(row.regular) {
-            return Ok(("undo-kept", Some(BulkloadRefusal::ReseatDestContinued)));
+            return Ok(Outcome::new(
+                "undo-kept",
+                Some(BulkloadRefusal::ReseatDestContinued),
+            ));
         }
-        if lstat(&self.temp)?.is_some() {
-            self.unlink_temp()?;
+        match lstat(&self.temp)? {
+            None => {}
+            // An interrupted undo's own link.
+            Some(meta) if meta.is_symlink() => self.unlink_temp()?,
+            Some(_) => {
+                return Ok(Outcome::new(
+                    "undo-kept",
+                    Some(BulkloadRefusal::DestinationOccupied),
+                ))
+            }
         }
         let text = std::ffi::CString::new(row.target.as_os_str().as_bytes())
             .map_err(|_| BulkloadRefusal::PathNotPortable)?;
         crate::io::sys::symlinkat(&text, &self.directory, &self.temp_c)
             .refuse_at("reseat::regularize::undo_link")?;
+        if lstat_identity(&row.resolved) != Some(verified) {
+            // Written since it was verified: nothing changed.
+            self.unlink_temp()?;
+            return Ok(target_changed());
+        }
         self.exchange()
             .refuse_at("reseat::regularize::undo_exchange")?;
         fault_point!(ReseatAfterUndoExchange);
@@ -393,14 +645,19 @@ impl<'a> Site<'a> {
             self.seal()?;
             row.state = RegularState::Undone;
             self.ledger.put_regular(&row)?;
-            Ok(("undone", None))
+            Ok(Outcome::new("undone", None))
         } else {
             // Written between the check and the exchange: the copy back.
             self.exchange()
                 .refuse_at("reseat::regularize::undo_exchange_back")?;
-            self.unlink_temp()?;
+            if Self::is_link_to(&self.temp, &row.target) {
+                self.unlink_temp()?;
+            }
             self.seal()?;
-            Ok(("undo-kept", Some(BulkloadRefusal::ReseatDestContinued)))
+            Ok(Outcome::new(
+                "undo-kept",
+                Some(BulkloadRefusal::ReseatDestContinued),
+            ))
         }
     }
 }
@@ -420,9 +677,12 @@ pub fn regularize(
     for row in ledger.regulars()? {
         if row.state == RegularState::Intent && row.link.starts_with(root) {
             if let Some(site) = Site::new(ledger, &row.link)? {
-                if let Some((word, refusal)) = site.settle_intent(row.clone())? {
-                    *summary.rows.entry(format!("link-{word}")).or_default() += 1;
-                    emit(&line(&row.link, word, refusal.as_ref()))?;
+                if let Some(outcome) = site.settle_intent(row.clone())? {
+                    *summary
+                        .rows
+                        .entry(format!("link-{}", outcome.word))
+                        .or_default() += 1;
+                    emit(&line(&row.link, &outcome))?;
                 }
             }
         }
@@ -435,9 +695,12 @@ pub fn regularize(
         let Some(site) = Site::new(ledger, &link)? else {
             continue;
         };
-        let (word, refusal) = site.regularize()?;
-        *summary.rows.entry(format!("link-{word}")).or_default() += 1;
-        emit(&line(&link, word, refusal.as_ref()))?;
+        let outcome = site.regularize()?;
+        *summary
+            .rows
+            .entry(format!("link-{}", outcome.word))
+            .or_default() += 1;
+        emit(&line(&link, &outcome))?;
     }
     Ok(())
 }
@@ -452,12 +715,11 @@ pub fn undo(ledger: &Ledger, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result
         let Some(site) = Site::new(ledger, &row.link)? else {
             emit(&line(
                 &row.link,
-                "undo-kept",
-                Some(&BulkloadRefusal::DestinationOccupied),
+                &Outcome::new("undo-kept", Some(BulkloadRefusal::DestinationOccupied)),
             ))?;
             continue;
         };
-        let (word, refusal) = match row.state {
+        let outcome = match row.state {
             RegularState::Undone => continue,
             RegularState::Intent => match site.settle_intent(row.clone())? {
                 None => continue,
@@ -468,12 +730,16 @@ pub fn undo(ledger: &Ledger, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result
             },
             RegularState::Done | RegularState::Raced => site.undo(row.clone())?,
         };
-        undone += u64::from(word == "undone");
+        undone += u64::from(outcome.word == "undone");
         emit(&format!(
-            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo\",\"tool\":\"{TOOL}\",\"link\":{},\"target\":{},\"outcome\":\"{word}\",\"refused\":{}}}",
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo\",\"tool\":\"{TOOL}\",\"link\":{},\"target\":{},\"outcome\":\"{}\",\"refused\":{}}}",
             json_string(&row.link.to_string_lossy()),
             json_string(&row.target.to_string_lossy()),
-            refusal.map_or_else(|| "null".to_owned(), |refusal| json_string(refusal.code())),
+            outcome.word,
+            outcome
+                .refusal
+                .as_ref()
+                .map_or_else(|| "null".to_owned(), |refusal| json_string(refusal.code())),
         ))?;
     }
     Ok(undone)

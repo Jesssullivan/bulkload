@@ -197,9 +197,13 @@ SUBCOMMANDS:
                 --no-respell). Symlinked destination transcripts
                 (projects/*/*.jsonl) are first regularized into regular-file
                 copies of their targets with the targets' mtime, the targets
-                kept, ledgered (OI-1003-Q198 (2); --no-regularize). --undo
+                kept, ledgered (OI-1003-Q198 (2); --no-regularize); a target
+                written during it is RESEAT_REGULARIZE_RACED with both copies
+                kept (the line's kept field names a copy kept aside). --undo
                 puts back every symlink and old cwd this STATE changed, where
-                the destination still holds exactly what re-seat wrote. Home
+                the destination still holds exactly what re-seat wrote and
+                the archive target holds the recorded bytes (else
+                RESEAT_UNDO_TARGET_CHANGED, nothing changed). Home
                 and /private/tmp (and /tmp) sessions are placed resumable by
                 ID (OI-1003-Q198 C; --by-id DIR adds a prefix,
                 --no-default-by-id drops the defaults). One run at a time:

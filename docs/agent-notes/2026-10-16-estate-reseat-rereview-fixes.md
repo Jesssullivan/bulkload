@@ -146,6 +146,41 @@ fault-harness reseat rows 16 (11 before), `tests/estate_reseat.rs` 6 (3
 before: the CLI rows and four real-binary canaries, all run, none skipped:
 Claude Code 2.1.299, codex-cli 0.163.0-alpha.11).
 
+## Re-review of fix round 2: two MEDIUM (finishing the PR)
+
+A re-review called round 2 mergeable with two MEDIUM findings; both fixed,
+each with rows in `reseat/tests/findings/q198.rs` (`q198_2_rr_*`).
+
+- **MEDIUM 1, regularize race. Fixed.** Regularizing could orphan or
+  delete a copy a live session appended to during it. Now: the copy is
+  read back from its name before the swap and must be the bytes read
+  (length and BLAKE3); the target's identity (inode, size, mtime, by
+  descriptor and path), the link's and the copy's are re-checked just
+  before the exchange and the target again just after it. Nothing holding
+  a session's bytes is removed or replaced unless its bytes are held
+  elsewhere: on a mismatch the transcript is `RESEAT_REGULARIZE_RACED`
+  and both copies stay (the staged copy kept aside as
+  `.<name>.<token>.kept-<inode>.bulkload-reseat`, named by the line's
+  `kept` field, never removed by a pass; a copy written under the swap
+  stays at the path). A test-only hook (`regularize::set_hook`) acts as
+  the live session: an append between the read and the swap
+  (`q198_2_rr_append_between_read_and_swap_keeps_both_copies`), and
+  appends under the swap, target only and target plus copy
+  (`q198_2_rr_append_under_the_swap_keeps_both_copies`).
+- **MEDIUM 2, undo safety. Fixed.** `--undo` verifies, before it puts a
+  link back or removes the regular file, that the link text still resolves
+  to the recorded target and that it is a regular file holding the
+  recorded bytes (the ledger now keeps the BLAKE3 of the copy: column
+  `regularized.digest`, added in place to an existing version 3 ledger),
+  unchanged up to the swap. Otherwise the row is `undo-refused`,
+  `RESEAT_UNDO_TARGET_CHANGED` (new code), and nothing changes for it
+  (`q198_2_rr_undo_verifies_the_archive_target`: a target rewritten in
+  place at the same length, and one moved away, are refused with the
+  regular file and the `done` row kept; moved back, it is undone).
+
+Residual window, documented in design.md: a session that opened the link
+before the swap and writes after the last check appends to the archive.
+
 ## Open
 
 - The live run: sting's floor under `--min-free-percent` 25 needs an
