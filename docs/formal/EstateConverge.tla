@@ -136,6 +136,31 @@
 (*     proceeded past the recheck with the destination unequal. With       *)
 (*     "stash" in SrcKinds the source holds a stash at the copy, so T0     *)
 (*     (stash-adopted) is reached.                                        *)
+(*   - The hand-off block (TIN-6569, OI-1003-Q183, 2026-10-16; Handoff,   *)
+(*     the main only): estate-handoff writes a bulkload-owned block on top *)
+(*     of one target seat HP, recorded in handoff.landed with an intent    *)
+(*     durable first, by exchange and a check of the displaced file; a     *)
+(*     clear strips it; converge accepts the seat as the record's block on *)
+(*     the landed bytes (SeatProved, the settle and sweep classifications)*)
+(*     and lifts a created block before an add. A block value is Blk(v),   *)
+(*     the block on v; Blk2(v) is a block the operator edited, which only  *)
+(*     the operator writes. The record's print of the target vouches for  *)
+(*     it without a read when it is not racy and its base is the landed    *)
+(*     value (HTrusted); every re-take of that print (a rerun over an      *)
+(*     intact block, HandoffKeep; a settle) checks the base against the    *)
+(*     bytes under the block again, and a settle finishes a pending clear  *)
+(*     (review of 2026-10-16). A source value may start with a carried     *)
+(*     block (Cb(v), "carried" in SrcKinds); --clear --clear-carried       *)
+(*     removes it from the landed value only, as a recorded edit converge *)
+(*     accepts (OI-1003-Q190). Not modelled: the block's content (one      *)
+(*     block value, so a rerun over an intact block writes nothing), the   *)
+(*     inputs digest, commit detection and the open rows (read-only), the *)
+(*     block's owner identity (a carried block is source content),         *)
+(*     the H step's choice to re-render, the second target (CLAUDE.md is   *)
+(*     AGENTS.md's twin), the lift's own crash points (one step with the   *)
+(*     import), and a third party's file a settle cannot put back (the     *)
+(*     next run's temporaries have their own names in the code; here one   *)
+(*     slot, so the hand-off waits).                                        *)
 (*   - Symbolic refs and per-worktree refs are not modelled (never        *)
 (*     restored natively). Tombstone retention (90 days) is not modelled.*)
 (*   - Each atomic durable write (landed::write: temporary, fsync, rename,*)
@@ -187,6 +212,9 @@
 (*   BranchRow      C Place::branch_row                                    *)
 (*   WriteLanded    C next_ledger, landed::write, landed::remove           *)
 (*   Journal        E apply_item's journal write                           *)
+(*   Handoff*       C handoff::settle, run, exchange, create, remove,     *)
+(*                  render_workspace, retaken, clear (TIN-6569); the lift *)
+(*                  is handoff::lift in Import                            *)
 (*   Src*, Op*, Crash, ChildCrashTxn, ChildCrashHead, Tick   the          *)
 (*                  environment                                            *)
 (*                                                                         *)
@@ -211,6 +239,7 @@ CONSTANTS
     Landed,       \* the run starts from a landed destination
     Adopt,        \* --adopt: the run starts from a destination bulkload
                   \* never landed, and the apply adopts the main (#226)
+    Handoff,      \* estate-handoff runs on the landed main (TIN-6569)
     Mutation,     \* "none", or one deliberate rule break
     BudgetSeconds \* wall-clock budget, checked by WithinBudget
 
@@ -235,7 +264,12 @@ Mutations == {"none", "proof_stat_only", "proof_stat_strict",
               "drift_key_reused", "drift_applied",
               "adopt_without_proof", "adopt_ref_unequal", "adopt_untyped",
               "adopt_ledger_before_refs", "adopt_r1_no_row",
-              "adopt_r2_not_adopted", "adopt_no_recheck", "adopt_t0_no_row"}
+              "adopt_r2_not_adopted", "adopt_no_recheck", "adopt_t0_no_row",
+              "handoff_no_overlay", "handoff_overlay_any_block",
+              "handoff_clear_unchecked", "handoff_exchange_unchecked",
+              "handoff_no_intent", "handoff_retake_unchecked",
+              "handoff_keep_racy_unchecked", "handoff_strip_no_overlay",
+              "handoff_strip_unchecked"}
 
 (* The closed unions the catalogue types (tla-check requires these sets   *)
 (* to equal the catalogue's labels).                                      *)
@@ -249,9 +283,10 @@ AllRefs  == {"main", "dev", "foo", "foo/bar", "o/x", "o/x/y", "t"}
 AllPaths == {"d", "d/f"}
 SrcKindSet == {"move", "create", "delete", "rename", "switch", "stash",
                "seat", "dirfile", "filedir", "index", "worktree", "race",
-               "stashrace"}
+               "stashrace", "carried"}
 OpKindSet == {"seat", "racy", "touch", "untracked", "index", "ref", "stash",
-              "stashdrop", "head", "restore", "rebase", "dir", "lock", "wtwork"}
+              "stashdrop", "head", "restore", "rebase", "dir", "lock", "wtwork",
+              "block"}
 
 ASSUME /\ Items \subseteq AllItems /\ "main" \in Items
        /\ Refs \subseteq AllRefs /\ "main" \in Refs
@@ -263,6 +298,7 @@ ASSUME /\ Items \subseteq AllItems /\ "main" \in Items
        /\ OpConcurrent \in BOOLEAN /\ RacyEdits \in BOOLEAN
        /\ ChildCrash \in BOOLEAN /\ Landed \in BOOLEAN
        /\ Adopt \in BOOLEAN /\ (Adopt => ~Landed)
+       /\ Handoff \in BOOLEAN /\ (Handoff => Landed /\ "d" \in Paths)
        /\ Mutation \in Mutations /\ BudgetSeconds \in Nat
 
 Mut(m) == Mutation = m
@@ -284,6 +320,29 @@ RenamePairs == {<<"foo", "foo/bar">>, <<"foo/bar", "foo">>,
 ABSENT == 0
 DIR == 1
 IsFile(v) == v >= 2
+
+\* TIN-6569: a seat value under the hand-off block. Blk(v) is bulkload's
+\* block on top of the bytes v (Blk(ABSENT): a created file, the block
+\* alone); Blk2(v) the same block after the operator edited inside it,
+\* which makes the file the operator's. BLK is above every other value.
+BLK == 1000
+BLK2 == 2000
+Blk(v) == BLK + v
+Blk2(v) == BLK2 + v
+IsBlk(x) == x >= BLK /\ x < BLK2
+IsBlk2(x) == x >= BLK2
+Strip(x) == IF IsBlk(x) THEN x - BLK ELSE IF IsBlk2(x) THEN x - BLK2 ELSE x
+\* OI-1003-Q190: Cb(v) is the bytes v under a carried block (another
+\* landing's, which came with the source's bytes: "carried" in SrcKinds).
+\* CB is above every plain value and below BLK, so Blk(Cb(v)) is a block.
+CB == 500
+Cb(v) == CB + v
+IsCb(x) == x >= CB /\ x < BLK
+UnCb(x) == IF IsCb(x) THEN x - CB ELSE x
+\* The one target the model hands off (AGENTS.md; CLAUDE.md is its twin).
+HP == IF "d/f" \in Paths THEN "d/f" ELSE "d"
+\* At most this many hand-off runs per behaviour.
+HMAX == 2
 
 -----------------------------------------------------------------------------
 (* Initial source: every ref but the conflicting partners exists at value  *)
@@ -373,16 +432,27 @@ VARIABLES
     wtw,       \* the linked worktree's own content (its seats and index as
                \* one component): 0 none (worktree add --no-checkout),
                \* WTLANDED the landing's, anything else the operator's
-    adoptG     \* #226 (ghost): kept, the refs an adoption's ref step left to
+    adoptG,    \* #226 (ghost): kept, the refs an adoption's ref step left to
                \* the destination (R3, R10); stash, its stash step kept the
                \* destination's reflog (T2); unequal, an adoption's import
                \* proceeded with the destination no longer the capture's
+    hand       \* TIN-6569: has, handoff.landed names the block; int, the
+               \* durable handoff.intent (none, render or clear); v and st,
+               \* the target's bytes and print the run read; tmp, its
+               \* .bulkload-handoff temporary; op and ph, the run in flight
+               \* (volatile); n, runs so far; cl, a clear completed (ghost);
+               \* pst, prac and base, the record's print of HP, whether that
+               \* print is racy against the record, and the landed value it
+               \* vouches is under the block (0: none) (review of 2026-10-16);
+               \* u, what a clear leaves; cc, --clear-carried; ps, the landed
+               \* value a pending clear removes a carried block from, and sp,
+               \* the one handoff.stripped records (0: none; OI-1003-Q190)
 
 vars == <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
           dindex, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
           outcome, why, pc, crashes, opN, fresh, opLive, opStash, opHead,
           reread, badLine, bkSet, everImported, dur, edSince, probe,
-          opLock, wtw, adoptG>>
+          opLock, wtw, adoptG, hand>>
 
 
 OpComps == Refs \cup Paths \cup {"index"} \cup (IF "wt" \in Items THEN {"wtw"} ELSE {})
@@ -402,6 +472,44 @@ Unproven == locks \cap EmptyLocks # {}
 
 Live(row) == row.has /\ row.oid # 0
 LiveNames == {r \in Refs : nat[r] # 0}
+
+\* TIN-6569 (C handoff::landed_sides): the blocks converge accepts on HP,
+\* the record's and a pending intent's. Ov: one is there to accept.
+Ov == /\ Handoff /\ ~Mut("handoff_no_overlay")
+      /\ (hand.has \/ hand.int # "none")
+\* OI-1003-Q190 (C handoff::landed_sides, handoff.stripped): the landed
+\* value v a recorded or pending --clear-carried removed the carried block
+\* from; converge accepts v without it, alone or under the block.
+SOv(v) == /\ Handoff /\ ~Mut("handoff_strip_no_overlay")
+          /\ IsCb(v) /\ v \in {hand.sp, hand.ps}
+\* C holds: a seat holds the landed value v when it is v, or bulkload's
+\* block on v (handoff_overlay_any_block: an edited block too).
+Holds(p, cur, v) ==
+    \/ cur = v
+    \/ /\ p = HP /\ Ov /\ IsFile(v)
+       /\ (cur = Blk(v) \/ (Mut("handoff_overlay_any_block") /\ cur = Blk2(v)))
+    \/ /\ p = HP /\ SOv(v)
+       /\ (cur = UnCb(v) \/ (Ov /\ cur = Blk(UnCb(v))))
+\* Review of 2026-10-16 (C handoff::landed_sides, Prefix.trusted): the
+\* record's print of HP vouches for the seat without a read when it is not
+\* racy and its base is the landed value being proved. Every write of the
+\* record's print checks the base against the bytes under the block at that
+\* print (C retaken); handoff_retake_unchecked keeps the old base, the
+\* BLOCKER: a print re-taken over an operator's edit below the block then
+\* vouches for the edit and a converge replaces it.
+HLanded == wsLed["main"].seats[HP].v
+HBase(x) == IF IsBlk(x) /\ IsFile(Strip(x)) /\ Strip(x) = HLanded THEN Strip(x) ELSE 0
+HRetake(x, st) == [pst |-> st, prac |-> FALSE,
+                   base |-> IF Mut("handoff_retake_unchecked") THEN hand.base ELSE HBase(x)]
+HTrusted(p, s) ==
+    /\ p = HP /\ Ov /\ hand.has /\ ~hand.prac
+    /\ hand.base # 0 /\ hand.base = s.v /\ dseat[p].st = hand.pst
+\* A set of values, each also under the block (an intact block is
+\* bulkload's own bytes, never work).
+WithBlk(S) == S \cup (IF Handoff THEN {Blk(x) : x \in S} ELSE {})
+\* OI-1003-Q190: each also without the carried block a recorded or pending
+\* --clear-carried removed from it (under the block too).
+WithHand(S) == WithBlk(S \cup {UnCb(x) : x \in {y \in S : SOv(y)}})
 
 \* A worktree's HEAD as converge::head_of reads it: a branch resolves to
 \* its native value (0: unborn).
@@ -759,7 +867,7 @@ SeatProved(p, s) ==
     ELSE IF Mut("proof_stat_strict") THEN dseat[p].st = s.st /\ IsFile(dseat[p].v)
     ELSE IF dseat[p].st = s.st /\ IsFile(dseat[p].v) /\ (~s.racy \/ Mut("proof_stat_only"))
          THEN TRUE
-    ELSE dseat[p].v = s.v
+    ELSE HTrusted(p, s) \/ Holds(p, dseat[p].v, s.v)
 Proved(i) ==
     \/ Mut("overwrite_modified")
     \/ /\ HeadOf(i) = wsLed[i].head
@@ -771,15 +879,23 @@ Prints == [p \in Paths |-> dseat[p].st]
 \* party's seat where the source adds one, and (review 2 findings 2, 4) a
 \* landed directory the source turns into a file that holds an entry that
 \* is not a landed seat.
-Clash(ops, F) == \E k \in 1..Len(ops) :
+Clash(ops, F, ds) == \E k \in 1..Len(ops) :
     LET op == ops[k] IN
     \/ /\ op.a \in {"Add", "MkDir"} /\ F[op.p] = ABSENT
-       /\ dseat[op.p].v # ABSENT /\ (op.a = "Add" \/ dseat[op.p].v # DIR)
+       /\ ds[op.p].v # ABSENT /\ (op.a = "Add" \/ ds[op.p].v # DIR)
     \/ /\ op.a = "Add" /\ op.p = "d/f" /\ F["d/f"] = ABSENT
-       /\ IsFile(dseat["d"].v) /\ F["d"] = ABSENT
+       /\ IsFile(ds["d"].v) /\ F["d"] = ABSENT
     \/ /\ ~Mut("dir_replace_unchecked")
        /\ op.a = "Add" /\ op.p = "d" /\ F["d"] = DIR /\ "d/f" \in Paths
-       /\ dseat["d"].v = DIR /\ dseat["d/f"].v # ABSENT /\ F["d/f"] = ABSENT
+       /\ ds["d"].v = DIR /\ ds["d/f"].v # ABSENT /\ F["d/f"] = ABSENT
+
+\* TIN-6569 (C handoff::lift): before the clash check, a file the hand-off
+\* created (the block alone) where the source adds HP is bulkload's and is
+\* removed, and the record drops it.
+LiftDue(ops, F) ==
+    /\ Handoff /\ (hand.has \/ hand.int # "none")
+    /\ F[HP] = ABSENT /\ dseat[HP].v = Blk(ABSENT)
+    /\ \E k \in 1..Len(ops) : ops[k].a = "Add" /\ ops[k].p = HP
 
 \* C head_plan (findings 11, 17; review 2 finding 3): the source's branch
 \* when bulkload may put HEAD on it, otherwise detached at the captured head.
@@ -979,7 +1095,7 @@ Capture(i) ==
     /\ UNCHANGED <<nat, locks, opLock, dstash, dseat, temp, dindex, wtw, dhead,
                    prov, refLed, stashLed, refInt, wsLed, wsInt, jour, outcome, why,
                    pc, crashes, opN, fresh, opLive, opStash, opHead, reread,
-                   badLine, bkSet, everImported, dur, probe, edSince, adoptG>>
+                   badLine, bkSet, everImported, dur, probe, edSince, adoptG, hand>>
 
 RefIntLocks == {op.name : op \in refInt.ops} \cup (IF refInt.sop.on THEN {"stash"} ELSE {})
 RefIntDeletes == (\E op \in refInt.ops : op.new = 0) \/ refInt.sop.on
@@ -1005,6 +1121,8 @@ RefSettle(i, ret) == [Idle EXCEPT !.st = "r_fin", !.i = i, !.c = capt[i], !.cur 
 Begin(i) ==
     /\ pc.st = "idle"
     /\ i \in Items
+    \* TIN-6569: estate-handoff holds the estate lock for its whole run.
+    /\ hand.ph = "idle"
     \* #38: an in-band drifted capture is refused CAPTURE_DRIFTED before
     \* the apply reads or writes anything (no workspace is laid down from
     \* it; drift_applied: the code before the marker was read). A key-drift
@@ -1083,7 +1201,7 @@ Begin(i) ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
                    jour, crashes, opN, fresh, opLive, opStash, opHead, badLine,
-                   bkSet, everImported, dur, opLock, adoptG>>
+                   bkSet, everImported, dur, opLock, adoptG, hand>>
 
 \* git_carry.rs restore_staged_landed: a standalone first landing in its
 \* private stage (native refs, stash, HEAD, both ledgers), published with
@@ -1112,7 +1230,7 @@ FirstLandMain ==
           /\ pc' = [pc EXCEPT !.st = "w_journal"]
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, temp, refInt, wsInt, jour,
                    outcome, why, crashes, opN, opLive, opStash, opHead, reread,
-                   badLine, probe, edSince, wtw, adoptG>>
+                   badLine, probe, edSince, wtw, adoptG, hand>>
     /\ dur' = DurNow
 
 \* Start a native ref step (C Place::refs, N step and commit): with writes,
@@ -1142,7 +1260,7 @@ FirstStepWt ==
     /\ StartStep(pc.c, Checked \cup IntentBr(pc.i), "f_plan")
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, wsLed, wsInt, jour, outcome, why, crashes, opN,
-                   fresh, opLive, opStash, opHead, reread, bkSet, dur, probe, edSince, adoptG>>
+                   fresh, opLive, opStash, opHead, reread, bkSet, dur, probe, edSince, adoptG, hand>>
 
 \* C plan_linked: the HEAD plan; its branch line goes through
 \* native_refs::commit (the ref intent, the compare-and-swap transaction,
@@ -1168,7 +1286,7 @@ FirstPlanWt ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, stashLed, wsLed, wsInt, jour, outcome, why,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
-                   bkSet, everImported, dur, probe, edSince, adoptG>>
+                   bkSet, everImported, dur, probe, edSince, adoptG, hand>>
 
 \* `git worktree add --no-checkout` and the checkout: the worktree exists.
 \* The fix of #216's residual: a landing intent (C LandingIntent, in the
@@ -1190,7 +1308,7 @@ FirstAddWt ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, prov, refLed, stashLed, refInt, wsLed, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
-                   reread, badLine, bkSet, everImported, probe, edSince, adoptG>>
+                   reread, badLine, bkSet, everImported, probe, edSince, adoptG, hand>>
     /\ dur' = DurNow
 
 \* C finish_landing: the linked worktree's ledger, then the landing intent
@@ -1209,7 +1327,7 @@ FirstLedgerWt ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, dhead, prov, refLed, stashLed, refInt, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
-                   reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG>>
+                   reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG, hand>>
 
 \* C head_of reads HEAD with `rev-parse --verify HEAD`, which fails on an
 \* unborn branch (an orphan switch, `update-ref -d` of the checked-out
@@ -1294,7 +1412,7 @@ Decide_ ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
                    jour, crashes, opN, fresh, opLive, opStash, opHead, reread,
-                   badLine, bkSet, everImported, dur, probe, edSince, opLock, adoptG>>
+                   badLine, bkSet, everImported, dur, probe, edSince, opLock, adoptG, hand>>
 
 \* C converge: import the capture (additive), then refuse a third party's
 \* seat where the source adds one; with a replacement to make, the probe
@@ -1311,6 +1429,10 @@ Import ==
     /\ adoptG' = IF /\ pc.st = "a_import" /\ ~AdoptEqual(pc.c)
                     /\ (Mut("adopt_without_proof") \/ Mut("adopt_no_recheck"))
                  THEN [adoptG EXCEPT !.unequal = TRUE] ELSE adoptG
+    /\ IF pc.st = "w_import" /\ LiftDue(pc.ops, pc.F)
+       THEN /\ dseat' = [dseat EXCEPT ![HP] = [v |-> ABSENT, st |-> dseat[HP].st + 1]]
+            /\ hand' = [hand EXCEPT !.has = FALSE]
+       ELSE UNCHANGED <<dseat, hand>>
     /\ IF pc.st = "a_import"
        THEN LET b == pc.hnew.sym IN
             \* C adopt::still, under the lock and before the import: the
@@ -1330,7 +1452,7 @@ Import ==
        ELSE /\ prov' = prov \cup {pc.c}
             /\ everImported' = everImported \cup {pc.c}
             /\ UNCHANGED refLed
-            /\ IF Clash(pc.ops, pc.F)
+            /\ IF Clash(pc.ops, pc.F, dseat')
                THEN Refuse(pc.i, "MODIFIED") /\ UNCHANGED probe
                ELSE IF HasReplace(pc.ops)
                THEN /\ probe' = probe + 1
@@ -1338,7 +1460,7 @@ Import ==
                     /\ UNCHANGED <<outcome, why>>
                ELSE /\ pc' = [pc EXCEPT !.st = "w_intent", !.plan = HeadPlan(pc.i, pc.c)]
                     /\ UNCHANGED <<outcome, why, probe>>
-    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, temp,
                    dindex, wtw, dhead, stashLed, refInt, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
                    bkSet, dur, edSince>>
@@ -1353,7 +1475,7 @@ ProbeExchange ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
-                   reread, badLine, bkSet, everImported, dur, edSince, adoptG>>
+                   reread, badLine, bkSet, everImported, dur, edSince, adoptG, hand>>
 
 \* C converge: the workspace intent, durable before any destination write.
 WriteIntent ==
@@ -1367,7 +1489,7 @@ WriteIntent ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
-                   reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG>>
+                   reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG, hand>>
 
 \* C Place::refs inside a converge (w_refs) or a settle (s_refs), and
 \* again after set_head (w_refs2): the branch HEAD left is no longer
@@ -1390,7 +1512,7 @@ RefStep ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, wsLed, wsInt, jour, outcome, why, crashes,
                    opN, fresh, opLive, opStash, opHead, reread, bkSet, everImported,
-                   dur, probe, edSince>>
+                   dur, probe, edSince, hand>>
 
 \* N finish: each op whose ref holds its new value is done, one at its old
 \* value is redone, a create Git can never make is dropped (review 2
@@ -1424,7 +1546,7 @@ RefFinish ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
                    jour, outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
-                   reread, bkSet, everImported, dur, probe, edSince, adoptG>>
+                   reread, bkSet, everImported, dur, probe, edSince, adoptG, hand>>
 
 \* The step for the branch HEAD left runs after set_head: when its
 \* transaction fails (the branch checked out again, a concurrent writer),
@@ -1455,7 +1577,7 @@ RefTxnDeletes ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, dstash, dseat, temp, dindex, wtw,
                    dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
-                   everImported, probe, edSince, adoptG>>
+                   everImported, probe, edSince, adoptG, hand>>
     /\ GitSync
 
 RefTxnWrites ==
@@ -1472,7 +1594,7 @@ RefTxnWrites ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, dstash, dseat, temp, dindex, wtw,
                    dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
-                   everImported, probe, edSince, adoptG>>
+                   everImported, probe, edSince, adoptG, hand>>
     /\ GitSync
 
 \* N stash_apply: each store is a compare-and-swap on the stash tip, and the
@@ -1525,7 +1647,7 @@ RefStash ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dseat, temp, dindex, wtw,
                    dhead, prov, refLed, stashLed, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead,
-                   reread, bkSet, everImported, probe, edSince, adoptG>>
+                   reread, bkSet, everImported, probe, edSince, adoptG, hand>>
     /\ GitSync
 
 \* N commit and settle's end: refs.landed written, refs.intent removed.
@@ -1543,7 +1665,7 @@ RefLedger ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, wsLed, wsInt, jour, crashes, opN, fresh,
                    opLive, opStash, opHead, reread, badLine, bkSet, everImported,
-                   dur, probe, edSince, adoptG>>
+                   dur, probe, edSince, adoptG, hand>>
 
 -----------------------------------------------------------------------------
 (* The seat engine (C Engine): fresh, each seat checked against the        *)
@@ -1586,7 +1708,7 @@ SeatOp ==
             CASE op.a = "Remove" ->
                    IF orphan
                    THEN IF settle THEN skip({}) ELSE stop
-                   ELSE IF settle /\ tp.v # ABSENT /\ tp.v # op.o
+                   ELSE IF settle /\ tp.v # ABSENT /\ ~Holds(p, tp.v, op.o)
                    THEN \* sweep: a displaced file goes back when the seat is free
                         /\ temp' = IF cur.v = ABSENT THEN [temp EXCEPT ![p] = NoSeat] ELSE temp
                         /\ dseat' = IF cur.v = ABSENT THEN [dseat EXCEPT ![p] = tp] ELSE dseat
@@ -1602,14 +1724,14 @@ SeatOp ==
                    \* the fix it refused on every rerun (settle_remove_dir).
                    ELSE IF settle /\ cur.v = DIR /\ op.n = DIR /\ ~Mut("settle_remove_dir")
                    THEN skip({})
-                   ELSE IF (settle /\ cur.v = op.o) \/ (~settle /\ checked)
+                   ELSE IF (settle /\ Holds(p, cur.v, op.o)) \/ (~settle /\ checked)
                    THEN /\ dseat' = Write(p, ABSENT)
                         /\ temp' = [temp EXCEPT ![p] = NoSeat]
                         /\ SeatNext({}) /\ UNCHANGED <<fresh, outcome, why>>
                    ELSE stop
               [] op.a = "Replace" ->
                    IF orphan THEN stop
-                   ELSE IF settle /\ tp.v # ABSENT /\ tp.v \notin {op.o, op.n}
+                   ELSE IF settle /\ tp.v # ABSENT /\ ~Holds(p, tp.v, op.o) /\ tp.v # op.n
                    THEN \* sweep: the displaced third-party file goes back
                         /\ dseat' = IF cur.v = op.n \/ cur.v = ABSENT
                                     THEN [dseat EXCEPT ![p] = tp] ELSE dseat
@@ -1619,7 +1741,7 @@ SeatOp ==
                    ELSE IF settle /\ cur.v = op.n
                    THEN SeatNextAt(p, cur.st) /\ temp' = [temp EXCEPT ![p] = NoSeat]
                         /\ UNCHANGED <<dseat, fresh, outcome, why>>
-                   ELSE IF (settle /\ cur.v = op.o) \/ (~settle /\ checked /\ cur.v # ABSENT)
+                   ELSE IF (settle /\ Holds(p, cur.v, op.o)) \/ (~settle /\ checked /\ cur.v # ABSENT)
                    THEN \* write the temporary, RENAME_EXCHANGE it with the seat
                         /\ temp' = [temp EXCEPT ![p] = cur]
                         /\ dseat' = [dseat EXCEPT ![p] = [v |-> op.n, st |-> cur.st + 1]]
@@ -1652,7 +1774,7 @@ SeatOp ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dindex, wtw, dhead,
                    prov, refLed, stashLed, refInt, wsLed, wsInt, jour, crashes, opN,
                    opLive, opStash, opHead, reread, badLine, bkSet, everImported,
-                   dur, probe, edSince, adoptG>>
+                   dur, probe, edSince, adoptG, hand>>
 
 \* C Engine::replace after the exchange: the displaced file must be the
 \* landed seat (the inode checked, its size and mtime); it is unlinked.
@@ -1670,7 +1792,7 @@ SeatVerify ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dindex, wtw, dhead,
                    prov, refLed, stashLed, refInt, wsLed, wsInt, jour, crashes, opN,
                    fresh, opLive, opStash, opHead, reread, badLine, bkSet,
-                   everImported, dur, probe, edSince, adoptG>>
+                   everImported, dur, probe, edSince, adoptG, hand>>
 
 \* C publish_index: under index.lock, compare-and-swap on the entries
 \* (finding 3).
@@ -1689,7 +1811,7 @@ IndexPublish ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
-                   bkSet, everImported, dur, probe, edSince, wtw, adoptG>>
+                   bkSet, everImported, dur, probe, edSince, wtw, adoptG, hand>>
 
 \* C set_head (fresh), or settle's check: HEAD at its new value is done,
 \* at its old value is redone (re-planned first when the intent's branch
@@ -1745,7 +1867,7 @@ HeadSet ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, dstash, dseat, temp, dindex, wtw,
                    prov, refLed, stashLed, refInt, wsLed, jour, crashes, opN,
                    fresh, opLive, opStash, opHead, reread, badLine, everImported,
-                   probe, edSince, adoptG>>
+                   probe, edSince, adoptG, hand>>
     /\ GitSync
 
 \* C Place::branch_row: the HEAD branch's ref ledger row.
@@ -1764,7 +1886,7 @@ BranchRow ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, stashLed, refInt, wsLed, wsInt, jour,
                    outcome, why, crashes, opN, fresh, opLive, opStash, opHead,
-                   reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG>>
+                   reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG, hand>>
 
 \* C next_ledger: workspace.landed for the capture landed, then the intent
 \* removed. A settle goes on to decide the item's current capture. An
@@ -1813,7 +1935,7 @@ WriteLanded ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, prov, refLed, stashLed, refInt, jour, outcome,
                    why, crashes, opN, fresh, opStash, reread, badLine, bkSet,
-                   everImported, dur, probe, edSince, adoptG>>
+                   everImported, dur, probe, edSince, adoptG, hand>>
 
 \* E apply_item: the journal, then the outcome.
 Journal ==
@@ -1826,7 +1948,7 @@ Journal ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
                    dindex, wtw, dhead, refLed, stashLed, refInt, wsLed, wsInt, crashes,
                    opN, fresh, opLive, opStash, opHead, reread, badLine, bkSet,
-                   everImported, dur, probe, edSince, adoptG>>
+                   everImported, dur, probe, edSince, adoptG, hand>>
 
 -----------------------------------------------------------------------------
 (* Environment: the source, the operator, crashes, time                    *)
@@ -1839,7 +1961,7 @@ SrcStep(s2) ==
     /\ UNCHANGED <<caps, capt, nat, locks, opLock, dstash, dseat, temp, dindex, wtw, dhead, prov,
                    refLed, stashLed, refInt, wsLed, wsInt, jour, outcome, why, pc,
                    crashes, opN, fresh, opLive, opStash, opHead, reread, badLine,
-                   bkSet, everImported, dur, probe, edSince, adoptG>>
+                   bkSet, everImported, dur, probe, edSince, adoptG, hand>>
 
 SrcLive == {r \in Refs : src.refs[r] # 0}
 
@@ -1874,6 +1996,10 @@ SrcSeat(p) ==
        IN \/ /\ IsFile(v) /\ SrcStep([src EXCEPT !.seats[p] = nextV])
           \/ /\ v = ABSENT /\ parentOK /\ SrcStep([src EXCEPT !.seats[p] = nextV])
           \/ /\ IsFile(v) /\ SrcStep([src EXCEPT !.seats[p] = ABSENT])
+          \* OI-1003-Q190: the source's target starts with a carried block
+          \* (the source was itself a handed-off checkout).
+          \/ /\ "carried" \in SrcKinds /\ p = HP /\ IsFile(v)
+             /\ SrcStep([src EXCEPT !.seats[p] = Cb(nextV)])
 SrcTypeChange ==
     /\ "d/f" \in Paths
     /\ \/ /\ "dirfile" \in SrcKinds /\ src.seats["d"] = DIR
@@ -1908,7 +2034,7 @@ OpStep(cs) == /\ opN' = opN + 1
               /\ edSince' = [i \in Items |-> edSince[i] \cup cs]
 OpKeep == UNCHANGED <<src, srcN, caps, capt, locks, opLock, dhead, prov, refLed,
                       stashLed, refInt, wsLed, wsInt, jour, outcome, why, pc,
-                      crashes, reread, badLine, bkSet, everImported, dur, probe, adoptG>>
+                      crashes, reread, badLine, bkSet, everImported, dur, probe, adoptG, hand>>
 
 \* A landed file's content edited or the file removed; with "dir", the
 \* landed directory removed (`rm -r`) or replaced by a file (review 3
@@ -1944,7 +2070,7 @@ OpTouch(p) ==
     /\ dseat' = [dseat EXCEPT ![p].st = dseat[p].st + 1]
     /\ opN' = opN + 1
     /\ OpKeep /\ UNCHANGED <<nat, temp, nextV, dstash, dindex, wtw, fresh, opLive, opStash, opHead,
-                             edSince, adoptG>>
+                             edSince, adoptG, hand>>
 \* An untracked file the operator adds in a landed directory.
 OpUntracked(p) ==
     /\ OpGate("untracked") /\ dseat[p].v = ABSENT
@@ -1961,7 +2087,7 @@ OpIndex == /\ OpGate("index") /\ IndexOn
 OpGitKeep == UNCHANGED <<src, srcN, caps, capt, locks, opLock, temp, prov, refLed,
                          stashLed, refInt, wsLed, wsInt, jour, outcome, why, pc,
                          crashes, reread, badLine, bkSet, everImported, probe,
-                         dseat, dindex, wtw, fresh, adoptG>>
+                         dseat, dindex, wtw, fresh, adoptG, hand>>
 \* A commit, `branch -f`, `update-ref -d`, a fetch, a tag: any native ref.
 \* `update-ref -d` deletes a checked-out branch too: its worktree's HEAD is
 \* then unborn (review 3 finding 4).
@@ -2054,7 +2180,7 @@ OpRestore ==
     /\ UNCHANGED <<src, srcN, caps, capt, locks, opLock, temp, prov, refLed, stashLed,
                    refInt, wsLed, wsInt, jour, outcome, why, pc, crashes, reread,
                    badLine, bkSet, everImported, nextV, dstash, dhead, fresh,
-                   opStash, probe, wtw, adoptG>>
+                   opStash, probe, wtw, adoptG, hand>>
     /\ OpDur
 
 \* Review 4, "lock": a live Git writer of the operator's (an `update-ref
@@ -2074,7 +2200,7 @@ OpLock ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, dstash, dseat, temp, dindex, wtw,
                    dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
                    outcome, why, pc, crashes, fresh, opLive, opStash, opHead,
-                   reread, badLine, bkSet, everImported, dur, edSince, probe, adoptG>>
+                   reread, badLine, bkSet, everImported, dur, edSince, probe, adoptG, hand>>
 \* Review 4, "wtwork": the operator's work in the linked worktree (a file
 \* written, `git add`, `git rm --cached`, a write over a seat), between
 \* applies.
@@ -2085,9 +2211,223 @@ OpWtWork ==
     /\ OpStep({"wtw"}) /\ OpKeep
     /\ UNCHANGED <<nat, temp, dstash, dindex, dseat, fresh, opStash, opHead, opLock>>
 
+\* TIN-6569, "block": the operator edits a handed-off target: inside the
+\* block (the file becomes theirs: Blk2), below it (their bytes under an
+\* intact block), or removes the block by hand.
+OpBlock ==
+    /\ OpGate("block") /\ Handoff /\ IsBlk(dseat[HP].v)
+    /\ LET cur == dseat[HP] IN
+       \/ /\ dseat' = [dseat EXCEPT ![HP] = [v |-> Blk2(Strip(cur.v)), st |-> cur.st + 1]]
+          /\ Mark(HP, Blk2(Strip(cur.v))) /\ UNCHANGED nextV
+       \/ /\ dseat' = [dseat EXCEPT ![HP] = [v |-> Blk(nextV), st |-> cur.st + 1]]
+          /\ Mark(HP, nextV) /\ nextV' = nextV + 1
+       \* OI-1003-Q190: their bytes below the block start with a carried
+       \* block (pasted from another landing): theirs, never the landing's.
+       \/ /\ "carried" \in SrcKinds
+          /\ dseat' = [dseat EXCEPT ![HP] = [v |-> Blk(Cb(nextV)), st |-> cur.st + 1]]
+          /\ Mark(HP, Cb(nextV)) /\ nextV' = nextV + 1
+       \* A removal by hand writes the landed value back, which (as for a
+       \* touch) is no edit, so it is modelled between applies only: in
+       \* flight, the code refuses GIT_CONVERGE_INTERRUPTED (typed; the
+       \* rerun settles), which this model's justification does not cover.
+       \/ /\ pc.st = "idle"
+          /\ dseat' = [dseat EXCEPT ![HP] = [v |-> Strip(cur.v), st |-> cur.st + 1]]
+          /\ Mark(HP, Strip(cur.v)) /\ UNCHANGED nextV
+    /\ OpStep({HP}) /\ OpKeep
+    /\ UNCHANGED <<nat, temp, dstash, dindex, wtw, fresh, opStash, opHead>>
+
 Operator == \/ \E p \in Paths : OpSeat(p) \/ OpRacy(p) \/ OpTouch(p) \/ OpUntracked(p)
             \/ OpIndex \/ (\E r \in Refs : OpRef(r)) \/ OpStash \/ OpHead \/ OpRestore
-            \/ OpLock \/ OpWtWork
+            \/ OpLock \/ OpWtWork \/ OpBlock
+
+-----------------------------------------------------------------------------
+(* The hand-off (TIN-6569, OI-1003-Q183; C converge::handoff): one run on   *)
+(* the landed main at a time, under the estate lock (no apply in flight), *)
+(* never over a pending workspace intent.                                  *)
+
+HKeep == UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, temp,
+                     dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
+                     jour, outcome, why, pc, crashes, opN, fresh, opLive, opStash,
+                     opHead, reread, badLine, bkSet, everImported, dur, probe,
+                     edSince, adoptG>>
+HandoffGate == /\ Handoff /\ pc.st = "idle" /\ dhead["main"].on
+               /\ wsLed["main"].has /\ ~wsInt["main"].on
+\* What the step in flight (or pending) writes at HP: a clear leaves u,
+\* the bytes under the block (without a carried block it removed).
+HNew == IF hand.op = "clear" \/ hand.int = "clear" THEN hand.u ELSE Blk(hand.v)
+\* OI-1003-Q190 (C clear, carried_len and landed_match): what a clear
+\* leaves of x, the bytes under this landing's block (or the whole file):
+\* with --clear-carried (cc) a carried block on top of the landed value is
+\* removed too, never from any other value (handoff_strip_unchecked: from
+\* any, an operator's included).
+CarriedCut(x, cc) ==
+    IF cc /\ IsCb(x) /\ (x = HLanded \/ Mut("handoff_strip_unchecked")) THEN UnCb(x) ELSE x
+HParentOK == HP = "d" \/ dseat["d"].v = DIR
+
+\* C handoff::settle, at the start of a run: the temporary a crash left
+\* (bulkload's own: the target's old or new bytes) is removed; a third
+\* party's file a crash displaced goes back when HP holds this run's
+\* file, and is kept otherwise. A pending clear is then finished, never
+\* undone (review of 2026-10-16): an intact block still on HP is cleared
+\* by the same exchange and check; an edited one refuses and keeps the
+\* intent. A pending render leaves the record naming exactly the block
+\* HP holds, its print re-taken and its base checked again (C retaken),
+\* and the intent removed.
+HandoffSettle ==
+    /\ HandoffGate /\ hand.ph = "idle" /\ (hand.int # "none" \/ hand.tmp.v # ABSENT)
+    /\ LET tp == hand.tmp
+           ours == tp.v \in {hand.v, Blk(hand.v), hand.u}
+           back == tp.v # ABSENT /\ ~ours /\ dseat[HP].v = HNew
+           keep == tp.v # ABSENT /\ ~ours /\ ~back
+           ds == IF back THEN [dseat EXCEPT ![HP] = tp] ELSE dseat
+           cur == ds[HP]
+           t == IF keep THEN tp ELSE NoSeat
+       IN /\ dseat' = ds
+          /\ LET under == Strip(cur.v)
+                 left == CarriedCut(under, hand.cc)
+             IN hand' =
+                  IF hand.int = "clear" /\ ~keep /\ ~IsBlk2(cur.v)
+                     /\ (IsBlk(cur.v) \/ left # under)
+                  THEN [hand EXCEPT !.tmp = NoSeat, !.op = "clear", !.v = under, !.u = left,
+                                    !.ps = IF left # under THEN under ELSE hand.ps,
+                                    !.st = cur.st, !.ph = "exch"]
+                  ELSE IF hand.int = "clear" /\ IsBlk2(cur.v)
+                  THEN [hand EXCEPT !.tmp = t]
+                  ELSE LET r == HRetake(cur.v, cur.st) IN
+                       \* A clear whose removal of a carried block is done
+                       \* records it: the target no longer starts with the
+                       \* carried block, whatever the operator wrote since
+                       \* (re-review 3 of 2026-10-16, finding 3; C clear,
+                       \* still_carries; it was "holds exactly what it left").
+                       [hand EXCEPT !.tmp = t, !.int = "none", !.has = IsBlk(cur.v),
+                                    !.pst = r.pst, !.prac = r.prac, !.base = r.base,
+                                    !.sp = IF hand.int = "clear" /\ hand.ps # 0
+                                              /\ ~IsCb(Strip(cur.v))
+                                           THEN hand.ps ELSE hand.sp,
+                                    !.ps = 0]
+    /\ HKeep
+
+\* C handoff::render_workspace over an intact block whose bytes are
+\* unchanged (one block value here, so every rerun over it): nothing is
+\* written; the record's print is re-taken (the file moved: an edit below
+\* the block) or re-dated (racy), its base checked again first (C retaken;
+\* handoff_retake_unchecked: the old base kept). The code keeps a print
+\* unchecked only when it is trusted (HTrusted's print conditions), which
+\* changes nothing here. handoff_keep_racy_unchecked (re-review of
+\* 2026-10-16, finding 1): a racy print equal to the seat's is re-dated
+\* with its old base unchecked; it may have caught an operator's edit
+\* below the block made between the exchange and the record.
+HandoffKeep ==
+    /\ hand.has /\ IsBlk(dseat[HP].v)
+    /\ LET r == HRetake(dseat[HP].v, dseat[HP].st)
+           kept == Mut("handoff_keep_racy_unchecked") /\ dseat[HP].st = hand.pst
+       IN hand' = [hand EXCEPT !.pst = r.pst, !.prac = r.prac,
+                                !.base = IF kept THEN hand.base ELSE r.base,
+                                !.n = hand.n + 1]
+
+\* A render of a plain or missing HP, or a clear of an intact block; with
+\* --clear-carried (cc, OI-1003-Q190) the clear also removes a carried
+\* block on top of the landed value, under the block or alone, and the
+\* intent names the landed value it removes it from (ps).
+HandoffWrite ==
+    /\ LET cur == dseat[HP] IN
+       \E op \in {"render", "clear"},
+         cc \in (IF "carried" \in SrcKinds THEN BOOLEAN ELSE {FALSE}) :
+          LET under == Strip(cur.v)
+              left == IF op = "clear" THEN CarriedCut(under, cc) ELSE under
+          IN /\ op = "render" => ~cc
+             /\ IF op = "render"
+                THEN /\ cur.v # DIR /\ ~IsBlk(cur.v) /\ ~IsBlk2(cur.v)
+                     /\ cur.v = ABSENT => HParentOK
+                ELSE \/ IsBlk(cur.v) \/ (Mut("handoff_clear_unchecked") /\ IsBlk2(cur.v))
+                     \/ (~IsBlk(cur.v) /\ ~IsBlk2(cur.v) /\ left # under)
+             /\ hand' = [hand EXCEPT !.op = op,
+                                      !.int = IF Mut("handoff_no_intent") THEN "none" ELSE op,
+                                      !.v = under, !.u = left, !.cc = cc,
+                                      !.ps = IF left # under THEN under ELSE 0,
+                                      !.st = cur.st, !.ph = "exch",
+                                      !.n = hand.n + 1]
+    /\ UNCHANGED dseat /\ HKeep
+
+\* C handoff::run: a render of a plain or missing HP, or a rerun over an
+\* intact block (HandoffKeep; an edited one refuses HANDOFF_BLOCK_MODIFIED
+\* with nothing written), or a clear of an intact block; the intent,
+\* durable first, names the bytes and print read (handoff_no_intent: none
+\* written; handoff_clear_unchecked: a clear of an edited block too).
+HandoffStart ==
+    /\ HandoffGate /\ hand.ph = "idle" /\ hand.int = "none" /\ hand.tmp.v = ABSENT
+    /\ hand.n < HMAX
+    /\ \/ HandoffKeep /\ UNCHANGED dseat /\ HKeep
+       \/ HandoffWrite
+
+\* C handoff::exchange, create, remove: the new bytes through a temporary;
+\* a render's created file by a rename that never replaces (EEXIST:
+\* refused, nothing written); a clear's created file renamed away.
+HandoffExchange ==
+    /\ hand.ph = "exch"
+    /\ LET cur == dseat[HP]
+           new == IF hand.op = "render" THEN Blk(hand.v) ELSE hand.u
+           create == hand.op = "render" /\ hand.v = ABSENT
+       IN IF create
+          THEN IF cur.v = ABSENT /\ HParentOK
+               THEN /\ dseat' = [dseat EXCEPT ![HP] = [v |-> new, st |-> cur.st + 1]]
+                    /\ hand' = [hand EXCEPT !.ph = "rec"]
+               ELSE /\ hand' = [hand EXCEPT !.ph = "idle", !.op = "none"]
+                    /\ UNCHANGED dseat
+          ELSE IF cur.v = ABSENT
+          THEN /\ hand' = [hand EXCEPT !.ph = "idle", !.op = "none"]
+               /\ UNCHANGED dseat
+          ELSE /\ dseat' = [dseat EXCEPT ![HP] = [v |-> new, st |-> cur.st + 1]]
+               /\ hand' = [hand EXCEPT !.tmp = cur, !.ph = "check"]
+    /\ HKeep
+
+\* The displaced file is the one the run read (its print), and is
+\* unlinked; anything else goes back and the run refuses, its intent
+\* settled at once (handoff_exchange_unchecked: no check).
+HandoffCheck ==
+    /\ hand.ph = "check"
+    /\ IF hand.tmp.st = hand.st \/ Mut("handoff_exchange_unchecked")
+       THEN /\ hand' = [hand EXCEPT !.tmp = NoSeat, !.ph = "rec"]
+            /\ UNCHANGED dseat
+       ELSE /\ dseat' = [dseat EXCEPT ![HP] = hand.tmp]
+            /\ LET r == HRetake(hand.tmp.v, hand.tmp.st)
+               IN hand' = [hand EXCEPT !.tmp = NoSeat, !.ph = "idle", !.op = "none",
+                                        !.int = "none", !.has = IsBlk(hand.tmp.v),
+                                        !.pst = r.pst, !.prac = r.prac, !.base = r.base,
+                                        !.ps = 0]
+    /\ HKeep
+
+\* The record (a render's names the block; a clear's is removed). A
+\* render's print is of the file it wrote, racy against its own record,
+\* and its base is the landed value when the bytes the run read (under
+\* the block now) were exactly it (C landed_base).
+HandoffRecord ==
+    /\ hand.ph = "rec"
+    /\ hand' = [hand EXCEPT !.has = hand.op = "render", !.ph = "fin",
+                             !.pst = dseat[HP].st, !.prac = TRUE,
+                             !.base = HBase(Blk(hand.v)),
+                             !.sp = IF hand.op = "clear" /\ hand.ps # 0 THEN hand.ps ELSE hand.sp]
+    /\ UNCHANGED dseat /\ HKeep
+
+\* The intent removed: the run is done.
+HandoffFinish ==
+    /\ hand.ph = "fin"
+    /\ hand' = [hand EXCEPT !.int = "none", !.op = "none", !.ph = "idle", !.ps = 0,
+                             !.cl = hand.cl \/ hand.op = "clear"]
+    /\ UNCHANGED dseat /\ HKeep
+
+\* The host crashes in a hand-off run: what is durable stays.
+HandoffCrash ==
+    /\ Handoff /\ hand.ph # "idle" /\ crashes < MaxCrashes
+    /\ hand' = [hand EXCEPT !.ph = "idle", !.op = "none"]
+    /\ crashes' = crashes + 1
+    /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat, temp,
+                   dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt,
+                   jour, outcome, why, pc, opN, fresh, opLive, opStash, opHead,
+                   reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG>>
+
+Handing == \/ HandoffSettle \/ HandoffStart \/ HandoffExchange \/ HandoffCheck
+           \/ HandoffRecord \/ HandoffFinish \/ HandoffCrash
 
 \* The apply host crashes between two steps: the volatile pc is lost. A
 \* power loss also loses what of Git's writes is not durable (dur); under
@@ -2106,7 +2446,7 @@ Crash ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, locks, opLock, dseat, temp, dindex, wtw, prov,
                    refLed, stashLed, refInt, wsLed, wsInt, jour, why, opN, fresh,
                    opLive, opStash, opHead, reread, badLine, bkSet, everImported,
-                   dur, probe, edSince, adoptG>>
+                   dur, probe, edSince, adoptG, hand>>
 
 \* stash_apply's next store would run (RefStash's go).
 StashStores ==
@@ -2160,7 +2500,7 @@ ChildCrashTxn ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, dstash, dseat, temp, dindex, wtw, dhead,
                    prov, refLed, stashLed, refInt, wsLed, wsInt, jour, opN,
                    fresh, opLive, opStash, opHead, reread, badLine, bkSet,
-                   everImported, probe, edSince, opLock, adoptG>>
+                   everImported, probe, edSince, opLock, adoptG, hand>>
     /\ GitSync
 
 \* The same inside set_head. Its branch transaction killed before the
@@ -2201,7 +2541,7 @@ ChildCrashHead ==
     /\ UNCHANGED <<src, srcN, nextV, caps, capt, dstash, dseat, temp, dindex, wtw, prov,
                    refLed, stashLed, refInt, wsLed, wsInt, jour, opN, fresh,
                    opLive, opStash, opHead, reread, badLine, bkSet, everImported,
-                   probe, edSince, opLock, adoptG>>
+                   probe, edSince, opLock, adoptG, hand>>
     /\ GitSync
 
 \* The timestamp tick passes: no later write can keep a seat's stat.
@@ -2210,7 +2550,7 @@ Tick == /\ fresh # {}
         /\ UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, dseat,
                        temp, dindex, wtw, dhead, prov, refLed, stashLed, refInt, wsLed,
                        wsInt, jour, outcome, why, pc, crashes, opN, opLive, opStash,
-                       opHead, reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG>>
+                       opHead, reread, badLine, bkSet, everImported, dur, probe, edSince, adoptG, hand>>
 
 \* Nothing in flight: the run may end here (a stutter, so a quiet state is
 \* not a deadlock).
@@ -2284,6 +2624,10 @@ Init ==
     /\ nextV = 5
     /\ caps = << CapOf(SI, FALSE, FALSE) >>
     /\ adoptG = [kept |-> {}, stash |-> FALSE, unequal |-> FALSE]
+    /\ hand = [has |-> FALSE, int |-> "none", op |-> "none", v |-> 0, st |-> 0,
+               tmp |-> NoSeat, ph |-> "idle", n |-> 0, cl |-> FALSE,
+               pst |-> 0, prac |-> FALSE, base |-> 0,
+               u |-> 0, cc |-> FALSE, ps |-> 0, sp |-> 0]
     /\ capt = [i \in Items |-> 1]
     /\ locks = {}
     /\ temp = [p \in Paths |-> NoSeat]
@@ -2358,15 +2702,21 @@ Protocol == \/ \E i \in Items : Capture(i)
             \/ InFlight
 
 Environment == Source \/ Operator \/ Crash \/ ChildCrashTxn \/ ChildCrashHead \/ Tick \/ Quiet
+               \/ Handing
 
 Next == Protocol \/ Environment
 
 Spec == Init /\ [][Next]_vars
 
 \* Fair captures and applies (strong fairness per item: a refusing item
-\* must not starve the other), unfair environment and faults.
+\* must not starve the other), unfair environment and faults. TIN-6569: a
+\* hand-off run that has started finishes or crashes (it holds the estate
+\* lock, so a run that stopped forever would starve every apply); starting
+\* one stays the environment's choice. Vacuous without Handoff.
+HandoffRun == HandoffExchange \/ HandoffCheck \/ HandoffRecord \/ HandoffFinish
 LiveSpec == /\ Spec
             /\ \A i \in Items : WF_vars(Capture(i)) /\ SF_vars(Run(i))
+            /\ WF_vars(HandoffRun)
 
 -----------------------------------------------------------------------------
 (* PROPERTIES                                                              *)
@@ -2402,16 +2752,28 @@ TypeOK ==
                   "a_import", "a_refs", "a_refs2", "a_landed"}
     /\ crashes \in 0..MaxCrashes /\ opN \in 0..MaxOp /\ srcN \in 0..MaxSrc
     /\ adoptG \in [kept : SUBSET Refs, stash : BOOLEAN, unequal : BOOLEAN]
+    /\ hand \in [has : BOOLEAN, int : {"none", "render", "clear"},
+                 op : {"none", "render", "clear"}, v : Nat, st : Nat,
+                 tmp : [v : Nat, st : Nat], ph : {"idle", "exch", "check", "rec", "fin"},
+                 n : 0..HMAX, cl : BOOLEAN, pst : Nat, prac : BOOLEAN, base : Nat,
+                 u : Nat, cc : BOOLEAN, ps : Nat, sp : Nat]
 
 \* Q144: an operator edit is never overwritten or removed. Every value the
 \* operator wrote that is not a landed value (or deleted) is still where
 \* they put it, or at its seat's temporary name, displaced and kept.
+\* TIN-6569: or under bulkload's intact block (a render over the
+\* operator's bytes keeps them byte for byte below it), or at the
+\* hand-off's temporary while its exchange is checked.
 NoLocalWorkLost ==
     /\ \A c \in OpComps : opLive[c].on =>
           IF c \in Refs THEN nat[c] = opLive[c].v
           ELSE IF c = "index" THEN dindex = opLive[c].v
           ELSE IF c = "wtw" THEN wtw = opLive[c].v
-          ELSE dseat[c].v = opLive[c].v \/ (opLive[c].v # ABSENT /\ temp[c].v = opLive[c].v)
+          ELSE \/ dseat[c].v = opLive[c].v
+               \/ (Handoff /\ c = HP /\ dseat[c].v = Blk(opLive[c].v))
+               \/ (opLive[c].v # ABSENT /\ temp[c].v = opLive[c].v)
+               \/ (Handoff /\ c = HP /\ opLive[c].v # ABSENT
+                   /\ hand.tmp.v \in {opLive[c].v, Blk(opLive[c].v)})
     /\ opStash.on => dstash = opStash.v
     /\ \A i \in Items : opHead[i].on => HeadOf(i) = opHead[i].v
     \* Review 4: a lock an operator's live Git writer holds is never taken
@@ -2471,8 +2833,8 @@ CrashAtomicity ==
                 IF I.on
                 THEN LET F == caps[I.from].seats[p]
                          T == caps[I.to].seats[p]
-                     IN dseat[p].v \in {F, T} \cup (IF TypeChange(F, T) THEN {ABSENT} ELSE {})
-                ELSE L.has => dseat[p].v = L.seats[p].v
+                     IN dseat[p].v \in WithHand({F, T} \cup (IF TypeChange(F, T) THEN {ABSENT} ELSE {}))
+                ELSE L.has => dseat[p].v \in WithHand({L.seats[p].v})
           /\ (IndexOn /\ L.has /\ ~opLive["index"].on) =>
                 IF I.on THEN dindex \in {I.iold, caps[I.to].index} ELSE dindex = L.index
     /\ \A i \in Items :
@@ -2495,6 +2857,13 @@ CrashAtomicity ==
                \/ nat[r] = refLed[r].oid
                \/ \E i \in Items : wsInt[i].on /\ wsInt[i].br.on /\ wsInt[i].br.name = r
                                    /\ nat[r] \in {wsInt[i].br.old, wsInt[i].br.new}
+
+\* TIN-6569: bulkload's block stands at HP only while handoff.landed or a
+\* pending handoff.intent names it, so converge accepts it and a rerun
+\* settles it; a block no record names would be refused as the
+\* operator's (handoff_no_intent breaks it).
+HandoffOwnsOnlyItsBlock ==
+    Handoff => ((IsBlk(dseat[HP].v) /\ ~opLive[HP].on) => (hand.has \/ hand.int # "none"))
 
 \* #38 (S5): no capture its export saw drift (in-band, CAPTURE_DRIFTED) is
 \* ever laid down: never the capture an apply in flight works from, never
@@ -2562,6 +2931,25 @@ Witness_KeyDriftLanded ==
 Witness_AdoptedConverged ==
     ~(Adopt /\ \E c1, c2 \in jour["main"] : c1 < c2 /\ wsLed["main"].t = c2)
 
+\* TIN-6569: a converge journaled a later capture while bulkload's block
+\* stood on HP, and the block stayed.
+Witness_HandoffConverged ==
+    ~(Handoff /\ hand.has /\ IsBlk(dseat[HP].v)
+      /\ \E c \in jour["main"] : c > 1 /\ wsLed["main"].t = c)
+
+\* TIN-6569: a hand-off was cleared, and a converge journaled a later
+\* capture.
+Witness_HandoffCleared ==
+    ~(hand.cl /\ \E c \in jour["main"] : c > 1 /\ wsLed["main"].t = c)
+
+\* OI-1003-Q190: a recorded --clear-carried removed a carried block from
+\* the landed target, and a converge then replaced the stripped seat with
+\* the source's next value (under the block, or bare).
+Witness_HandoffCarriedCleared ==
+    ~(/\ Handoff /\ hand.sp # 0 /\ IsFile(HLanded) /\ HLanded # hand.sp
+      /\ Strip(dseat[HP].v) = HLanded
+      /\ \E c \in jour["main"] : c > 2 /\ wsLed["main"].t = c)
+
 \* A captured ref tip that never reached the destination: superseded
 \* before any apply, it is neither native nor at provenance (CORPUS keeps
 \* it as a chain link: GitCarry.tla's custody, not the destination's).
@@ -2612,7 +3000,7 @@ Converged ==
          /\ HeadConverged(i, IF i = "main" THEN src.head ELSE src.wt)
     /\ \A r \in Refs : RefConverged(r)
     /\ dstash = src.stash \/ AdoptStashKept
-    /\ \A p \in Paths : dseat[p].v = src.seats[p]
+    /\ \A p \in Paths : dseat[p].v \in WithHand({src.seats[p]})
     /\ IndexOn => dindex = src.index
 
 \* #226 (the operator's decision 5): an adoption proves against the main's

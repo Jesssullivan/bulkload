@@ -1309,6 +1309,87 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
   ref step left), T0 is reached, and four mutation rows bite
   (`docs/formal/README.md`, "#226").
 
+## Amendment 2026-10-16: the hand-off block (OI-1003-Q183, TIN-6569)
+
+The ruling is OI-1003-Q183 (Linear TIN-6569, quoted from the workflow's
+task text; the relayed operator request was cut off and the quote was not
+checked against Linear in this lane): a beside-landing carries a builtin
+addendum at the top of `AGENTS.md` and `CLAUDE.md` with the landing's
+absolute paths, dated details and high-level differences, and tells agents
+to converge and consolidate completely before any other work with the
+user. No SLO number changes. The design note is
+`docs/agent-notes/2026-10-16-estate-handoff-design.md`; the contract is
+`docs/design.md`, "Hand-off block".
+
+- **S5:** a block that is intact and recorded is bulkload's bytes, never
+  a local change: converge proves the seat as the block followed by the
+  landed blob and keeps it. Any edit inside the block or below it is a
+  local change: `GIT_DESTINATION_MODIFIED`, as for any edit. An edit
+  inside the block also makes the hand-off refuse
+  `HANDOFF_BLOCK_MODIFIED` with nothing written; under an edit below it,
+  a rerun re-renders the block alone and keeps the user's bytes, and the
+  record's print never vouches for them (review of 2026-10-16).
+  `NoLocalWorkLost` is amended in one place: an operator value a render
+  left under an intact block is kept. A block carried from another
+  landing is content and is never dropped (OI-1003-Q185).
+- **S4:** the hand-off is an annotation outside closure's gate. Its four
+  refusals (five until OI-1003-Q188 removed `HANDOFF_NOT_PRIVATE`) are
+  typed per workspace and never change an item's outcome;
+  the H step's result is a line of its own after the apply's receipts.
+- **S3:** an unchanged `estate-handoff` rerun reads 0 destination bytes
+  and writes nothing once its record's prints are past the racy window
+  (one settling rerun re-dates them); a no-op `estate-apply` does no H
+  step. A converge reads a handed-off target once, as it reads any seat
+  whose print moved.
+- **S2:** the source is never read.
+- **Review of 2026-10-16** (two refuters against `9ec8d36`; the design
+  note's section 18 has the per-finding table): the record's print is
+  re-checked at every write; a crashed clear is finished; a carried block
+  is kept as content (OI-1003-Q185); the privacy guard counts a preserved
+  inert origin and URL rewrites (the guard is since removed,
+  OI-1003-Q188); commit detection reads branch and tag
+  history; `ready` is reachable by consolidating; options persist across
+  reruns; `AGENTS.override.md` is covered. No SLO number changes.
+- **Re-reviews of 2026-10-16** (design note section 19): a block of this
+  landing's identity whose whole file is the target's landed blob (a round
+  trip, with or without the record) is carried content, kept below the new
+  block and never dropped or refused (S5, OI-1003-Q185); a block removed by
+  hand and put back byte for byte is bulkload's again, never presented as
+  carried; a created file stays `created` across re-renders. No SLO number
+  changes.
+- **Operator rulings of 2026-10-16** (Linear TIN-6569; design note
+  section 19): OI-1003-Q188, the privacy guard is removed and the block is
+  always written; OI-1003-Q189, `ready` also needs a clean working tree in
+  the live sibling and in every destination-only worktree; OI-1003-Q190,
+  `--clear --clear-carried` removes carried blocks from landed content as a
+  recorded edit converge accepts (S5: never from bytes that are not the
+  landed blob; S3 unchanged, no read on an unchanged rerun beyond the
+  `git status` of the sibling and destination-only worktrees that Q189
+  rules); OI-1003-Q191, commit detection flags the token only in commits
+  the carried capture does not reach, and a token in the source's history
+  is information. No SLO number changes.
+- **Re-review 3 of 2026-10-16** (design note section 20): a block of this
+  landing's identity that the target's landed blob itself starts with is
+  carried content whatever the user wrote below it since (a round trip
+  the H step missed is never dropped by a render or `--clear`, S5 and
+  OI-1003-Q185); a crashed `--clear-carried` finished after a user's edit
+  still records its removal; commit detection flags only token lines the
+  source's history never added (a cherry-picked source block is
+  information) and reads remote-tracking refs and every stash entry; the
+  `git status` of the sibling and destination-only worktrees runs no
+  filter driver. No SLO number changes.
+- **Proof.** `tests/estate_handoff.rs` H0 to H19 (H0 is the control: a
+  naive prepend refuses MODIFIED), the hand-off unit rows and the
+  `render_then_clear_is_identity` property, the `estate.handoff.*`
+  fault-harness rows (render, clear, lift, converge and H step), and
+  EstateConverge's `Handoff` rows with the invariant
+  `HandoffOwnsOnlyItsBlock` and five mutation rows
+  (`docs/formal/README.md`, "TIN-6569").
+- **Open for the operator:** which copy carries the work forward for a
+  landing beside a live copy (agents never delete either). Answered: which
+  repositories count as private (none is asked: OI-1003-Q188) and what
+  `ready` reads (commits and clean trees: OI-1003-Q189).
+
 ## Amendment 2026-10-16: the delta lever, opt-in pending a reading of S3 inequality 2 (OI-1003-Q154)
 
 A lever under OI-1003-Q154 (authorized S1 levers where R25 holds), built to

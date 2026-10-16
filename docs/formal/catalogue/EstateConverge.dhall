@@ -97,6 +97,7 @@ let SrcKind =
       | worktree
       | race
       | stashrace
+      | carried
       >
 
 let srcKindTable =
@@ -113,6 +114,7 @@ let srcKindTable =
       , worktree = SrcKind.worktree
       , race = SrcKind.race
       , stashrace = SrcKind.stashrace
+      , carried = SrcKind.carried
       }
 
 let OpKind =
@@ -130,6 +132,7 @@ let OpKind =
       | dir
       | lock
       | wtwork
+      | block
       >
 
 let opKindTable =
@@ -147,6 +150,7 @@ let opKindTable =
       , dir = OpKind.dir
       , lock = OpKind.lock
       , wtwork = OpKind.wtwork
+      , block = OpKind.block
       }
 
 let Refusal = < MODIFIED | OCCUPIED | STALE | INTERRUPTED | UNTYPED | DIVERGED >
@@ -225,6 +229,15 @@ let Mutation =
       | adopt_r2_not_adopted
       | adopt_no_recheck
       | adopt_t0_no_row
+      | handoff_no_overlay
+      | handoff_overlay_any_block
+      | handoff_clear_unchecked
+      | handoff_exchange_unchecked
+      | handoff_no_intent
+      | handoff_retake_unchecked
+      | handoff_keep_racy_unchecked
+      | handoff_strip_no_overlay
+      | handoff_strip_unchecked
       >
 
 let mutationIndex =
@@ -283,6 +296,15 @@ let mutationIndex =
           , adopt_r2_not_adopted = 50
           , adopt_no_recheck = 51
           , adopt_t0_no_row = 52
+          , handoff_no_overlay = 53
+          , handoff_overlay_any_block = 54
+          , handoff_clear_unchecked = 55
+          , handoff_exchange_unchecked = 56
+          , handoff_no_intent = 57
+          , handoff_retake_unchecked = 58
+          , handoff_keep_racy_unchecked = 59
+          , handoff_strip_no_overlay = 60
+          , handoff_strip_unchecked = 61
           }
           m
 
@@ -298,6 +320,7 @@ let Property =
       | NoDriftedLanding
       | AdoptClaimsOnlyEqual
       | ForeignRefsUnowned
+      | HandoffOwnsOnlyItsBlock
       | WithinBudget
       | ConvergesWhenQuiet
       | NoWedge
@@ -350,18 +373,23 @@ let propertyTable =
         , index = 9
         , class = T.PropertyClass.safety
         }
+      , HandoffOwnsOnlyItsBlock =
+        { property = Property.HandoffOwnsOnlyItsBlock
+        , index = 10
+        , class = T.PropertyClass.safety
+        }
       , WithinBudget =
         { property = Property.WithinBudget
-        , index = 10
+        , index = 11
         , class = T.PropertyClass.budget
         }
       , ConvergesWhenQuiet =
         { property = Property.ConvergesWhenQuiet
-        , index = 11
+        , index = 12
         , class = T.PropertyClass.temporal
         }
       , NoWedge =
-        { property = Property.NoWedge, index = 12, class = T.PropertyClass.temporal }
+        { property = Property.NoWedge, index = 13, class = T.PropertyClass.temporal }
       }
 
 let propertyIndex = \(p : Property) -> (merge propertyTable p).index
@@ -393,6 +421,9 @@ let Witness =
       | Witness_DriftCarried
       | Witness_KeyDriftLanded
       | Witness_AdoptedConverged
+      | Witness_HandoffConverged
+      | Witness_HandoffCleared
+      | Witness_HandoffCarriedCleared
       >
 
 let witnessTable =
@@ -402,9 +433,12 @@ let witnessTable =
       , Witness_DriftCarried = Witness.Witness_DriftCarried
       , Witness_KeyDriftLanded = Witness.Witness_KeyDriftLanded
       , Witness_AdoptedConverged = Witness.Witness_AdoptedConverged
+      , Witness_HandoffConverged = Witness.Witness_HandoffConverged
+      , Witness_HandoffCleared = Witness.Witness_HandoffCleared
+      , Witness_HandoffCarriedCleared = Witness.Witness_HandoffCarriedCleared
       }
 
--- The 51 actions of EstateConverge.tla's Next, in the sorted order of the never column.
+-- The 59 actions of EstateConverge.tla's Next, in the sorted order of the never column.
 let Action =
       < Begin
       | BranchRow
@@ -418,10 +452,18 @@ let Action =
       | FirstLedgerWt
       | FirstPlanWt
       | FirstStepWt
+      | HandoffCheck
+      | HandoffCrash
+      | HandoffExchange
+      | HandoffFinish
+      | HandoffRecord
+      | HandoffSettle
+      | HandoffStart
       | HeadSet
       | Import
       | IndexPublish
       | Journal
+      | OpBlock
       | OpHead
       | OpIndex
       | OpLock
@@ -474,45 +516,53 @@ let actionIndex =
           , FirstLedgerWt = 9
           , FirstPlanWt = 10
           , FirstStepWt = 11
-          , HeadSet = 12
-          , Import = 13
-          , IndexPublish = 14
-          , Journal = 15
-          , OpHead = 16
-          , OpIndex = 17
-          , OpLock = 18
-          , OpRacy = 19
-          , OpRef = 20
-          , OpRestore = 21
-          , OpSeat = 22
-          , OpStash = 23
-          , OpTouch = 24
-          , OpUntracked = 25
-          , OpWtWork = 26
-          , ProbeExchange = 27
-          , Quiet = 28
-          , RefFinish = 29
-          , RefLedger = 30
-          , RefStash = 31
-          , RefStep = 32
-          , RefTxnDeletes = 33
-          , RefTxnWrites = 34
-          , SeatOp = 35
-          , SeatVerify = 36
-          , SrcCreate = 37
-          , SrcDelete = 38
-          , SrcMove = 39
-          , SrcRename = 40
-          , SrcSeat = 41
-          , SrcStage = 42
-          , SrcStashDrop = 43
-          , SrcStashPush = 44
-          , SrcSwitch = 45
-          , SrcTypeChange = 46
-          , SrcWorktree = 47
-          , Tick = 48
-          , WriteIntent = 49
-          , WriteLanded = 50
+          , HandoffCheck = 12
+          , HandoffCrash = 13
+          , HandoffExchange = 14
+          , HandoffFinish = 15
+          , HandoffRecord = 16
+          , HandoffSettle = 17
+          , HandoffStart = 18
+          , HeadSet = 19
+          , Import = 20
+          , IndexPublish = 21
+          , Journal = 22
+          , OpBlock = 23
+          , OpHead = 24
+          , OpIndex = 25
+          , OpLock = 26
+          , OpRacy = 27
+          , OpRef = 28
+          , OpRestore = 29
+          , OpSeat = 30
+          , OpStash = 31
+          , OpTouch = 32
+          , OpUntracked = 33
+          , OpWtWork = 34
+          , ProbeExchange = 35
+          , Quiet = 36
+          , RefFinish = 37
+          , RefLedger = 38
+          , RefStash = 39
+          , RefStep = 40
+          , RefTxnDeletes = 41
+          , RefTxnWrites = 42
+          , SeatOp = 43
+          , SeatVerify = 44
+          , SrcCreate = 45
+          , SrcDelete = 46
+          , SrcMove = 47
+          , SrcRename = 48
+          , SrcSeat = 49
+          , SrcStage = 50
+          , SrcStashDrop = 51
+          , SrcStashPush = 52
+          , SrcSwitch = 53
+          , SrcTypeChange = 54
+          , SrcWorktree = 55
+          , Tick = 56
+          , WriteIntent = 57
+          , WriteLanded = 58
           }
           a
 
@@ -529,10 +579,18 @@ let actionTable =
       , FirstLedgerWt = Action.FirstLedgerWt
       , FirstPlanWt = Action.FirstPlanWt
       , FirstStepWt = Action.FirstStepWt
+      , HandoffCheck = Action.HandoffCheck
+      , HandoffCrash = Action.HandoffCrash
+      , HandoffExchange = Action.HandoffExchange
+      , HandoffFinish = Action.HandoffFinish
+      , HandoffRecord = Action.HandoffRecord
+      , HandoffSettle = Action.HandoffSettle
+      , HandoffStart = Action.HandoffStart
       , HeadSet = Action.HeadSet
       , Import = Action.Import
       , IndexPublish = Action.IndexPublish
       , Journal = Action.Journal
+      , OpBlock = Action.OpBlock
       , OpHead = Action.OpHead
       , OpIndex = Action.OpIndex
       , OpLock = Action.OpLock
@@ -709,6 +767,7 @@ let Constants =
       , ChildCrash : Bool
       , Landed : Bool
       , Adopt : Bool
+      , Handoff : Bool
       , Mutation : Optional Mutation
       , BudgetSeconds : Natural
       }
@@ -753,6 +812,7 @@ let constantLines =
             , { name = "ChildCrash", pad = "   ", value = showBool c.ChildCrash }
             , { name = "Landed", pad = "       ", value = showBool c.Landed }
             , { name = "Adopt", pad = "        ", value = showBool c.Adopt }
+            , { name = "Handoff", pad = "      ", value = showBool c.Handoff }
             , { name = "Mutation", pad = "     ", value = "\"${mutation}\"" }
             , { name = "BudgetSeconds", pad = "", value = Natural/show c.BudgetSeconds }
             ]
@@ -777,6 +837,7 @@ let defaults
       , ChildCrash = False
       , Landed = True
       , Adopt = False
+      , Handoff = False
       , Mutation = None Mutation
       , BudgetSeconds = 1800
       }
@@ -1298,6 +1359,51 @@ let adoptStash =
           , Adopt = True
           }
 
+{- TIN-6569 (OI-1003-Q183, 2026-10-16): estate-handoff on the landed main.
+   Its target seat HP (here "d") carries bulkload's block over the landed
+   bytes, recorded in handoff.landed with its intent durable first; the
+   source edits, removes or re-adds the target, so a converge replaces it
+   under the block, removes it, or lifts a created block before its add;
+   a render or a clear, and a crash at any step of either or of the apply.
+-}
+let handoff =
+          defaults
+      //  { Paths = [ Path.d ]
+          , SrcKinds = [ SrcKind.seat ]
+          , MaxSrc = 2
+          , MaxCrashes = 1
+          , Handoff = True
+          }
+
+{- TIN-6569: the operator edits the handed-off target (inside the block,
+   which makes the file theirs; below it; or removes the block by hand) or
+   the seat, between applies or while one is in flight; a source edit; a
+   crash.
+-}
+let handoffOp =
+          handoff
+      //  { OpKinds = [ OpKind.block, OpKind.seat ]
+          , MaxSrc = 1
+          , MaxOp = 1
+          , OpConcurrent = True
+          }
+
+{- OI-1003-Q190 (2026-10-16): the source's target starts with a carried
+   block (another landing's, Cb(v)); --clear --clear-carried removes it
+   from the landed value as a recorded edit (handoff.stripped) that converge
+   accepts, alone or under this landing's block; the source then edits the
+   target again, so a converge replaces the stripped seat; a crash at any
+   step.
+-}
+let handoffCarried = handoff // { SrcKinds = [ SrcKind.seat, SrcKind.carried ] }
+
+{- OI-1003-Q190: as handoffCarried, with the operator's edits of the
+   target (inside the block, below it with or without a carried block of
+   their own, the block removed by hand) and of the seat, also while an
+   apply is in flight.
+-}
+let handoffCarriedOp = handoffOp // { SrcKinds = [ SrcKind.seat, SrcKind.carried ] }
+
 -- Properties -------------------------------------------------------------------------
 
 let safety = filter Property isSafety allProperties
@@ -1364,6 +1470,15 @@ let verdict
           , adopt_r2_not_adopted = Property.ConvergesWhenQuiet
           , adopt_no_recheck = Property.AdoptClaimsOnlyEqual
           , adopt_t0_no_row = Property.ConvergesWhenQuiet
+          , handoff_no_overlay = Property.TypedRefusal
+          , handoff_overlay_any_block = Property.NoLocalWorkLost
+          , handoff_clear_unchecked = Property.NoLocalWorkLost
+          , handoff_exchange_unchecked = Property.NoLocalWorkLost
+          , handoff_no_intent = Property.HandoffOwnsOnlyItsBlock
+          , handoff_retake_unchecked = Property.NoLocalWorkLost
+          , handoff_keep_racy_unchecked = Property.NoLocalWorkLost
+          , handoff_strip_no_overlay = Property.TypedRefusal
+          , handoff_strip_unchecked = Property.NoLocalWorkLost
           }
           m
 
@@ -1401,13 +1516,41 @@ let NegRow =
       , comment : { head : Text, tail : List Text }
       }
 
+{- TIN-6569: the hand-off's actions, never enabled in a row whose
+   constants leave Handoff FALSE (every row before it): appended to each
+   such pass row's never set, so those rows are written as before.
+-}
+let handoffActions =
+      [ Action.HandoffCheck
+      , Action.HandoffCrash
+      , Action.HandoffExchange
+      , Action.HandoffFinish
+      , Action.HandoffRecord
+      , Action.HandoffSettle
+      , Action.HandoffStart
+      , Action.OpBlock
+      ]
+
 let row =
       \(name : Text) ->
       \(expect : Expect) ->
       \(comment : List Text) ->
       \(constants : Constants) ->
-          { name, expect, comment, constants, spec = T.Specification.Spec, flags = None Text }
-        : Row
+        let expect =
+              if    constants.Handoff
+              then  expect
+              else  merge
+                      { pass =
+                          \(p : Pass) -> Expect.pass (p // { never = p.never # handoffActions })
+                      , fail = Expect.fail
+                      , reach = Expect.reach
+                      , simulate = Expect.simulate
+                      , inconclusive = Expect.inconclusive
+                      }
+                      expect
+
+        in    { name, expect, comment, constants, spec = T.Specification.Spec, flags = None Text }
+            : Row
 
 let liveRow = \(r : Row) -> r // { spec = T.Specification.LiveSpec }
 
@@ -1900,6 +2043,60 @@ let positives =
               ]
               adoptStash
           )
+      , row
+          "MC_ec_handoff"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpBlock, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          [ "TIN-6569 (OI-1003-Q183): estate-handoff writes bulkload's block over"
+          , "the landed target, recorded with its intent durable first; the"
+          , "source edits, removes and re-adds the target, so a converge"
+          , "replaces it under the block (the displaced block goes with it),"
+          , "removes it, or lifts a created block before the add; a render or a"
+          , "clear, and a crash at any step: no seat is refused for an intact"
+          , "block (TypedRefusal), and the block stands only while a record or"
+          , "intent names it (HandoffOwnsOnlyItsBlock)."
+          ]
+          handoff
+      , row
+          "MC_ec_handoff_op"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          [ "TIN-6569: the operator edits inside the block (the file becomes"
+          , "theirs: converge refuses MODIFIED, the hand-off never writes it),"
+          , "below it, or removes it by hand, or edits the seat, while an apply"
+          , "or a hand-off is in flight; a crash: the operator's bytes are kept"
+          , "under or without the block (NoLocalWorkLost)."
+          ]
+          handoffOp
+      , row
+          "MC_ec_handoff_carried"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpBlock, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          [ "OI-1003-Q190: the source's target starts with a carried block;"
+          , "--clear --clear-carried removes it from the landed value only, as a"
+          , "recorded edit converge accepts (alone or under the block), and the"
+          , "source then edits the target again; a crash at any step: no seat"
+          , "is refused for bulkload's own edit (TypedRefusal), and every"
+          , "component is old or new (CrashAtomicity)."
+          ]
+          handoffCarried
+      , row
+          "MC_ec_handoff_carried_op"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          [ "OI-1003-Q190: as MC_ec_handoff_carried, with the operator's edits"
+          , "(below the block, with or without a carried block of their own,"
+          , "inside it, removed by hand) also while an apply is in flight:"
+          , "--clear-carried never removes a carried block from the operator's"
+          , "bytes (NoLocalWorkLost)."
+          ]
+          handoffCarriedOp
+      , liveRow
+          ( row
+              "MC_ec_handoff_live"
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpBlock, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+              [ "TIN-6569: liveness with the hand-off on: a quiet estate converges"
+              , "with bulkload's block standing over the landed target"
+              , "(Converged accepts the block on the source's value)."
+              ]
+              (handoff // { MaxSrc = 1 })
+          )
       ]
 
 -- Reachability witnesses: expected REACHED.
@@ -1957,6 +2154,29 @@ let witnesses =
           , "converge's."
           ]
           adopt
+      , row
+          "MC_ec_reach_handoff_converged"
+          (Expect.reach Witness.Witness_HandoffConverged)
+          [ "REACH (expected REACHED): TIN-6569: a converge journals a later"
+          , "capture while bulkload's recorded block stands on the target, and"
+          , "the block is still there."
+          ]
+          handoff
+      , row
+          "MC_ec_reach_handoff_cleared"
+          (Expect.reach Witness.Witness_HandoffCleared)
+          [ "REACH (expected REACHED): TIN-6569: a hand-off is cleared, and a"
+          , "converge journals a later capture."
+          ]
+          handoff
+      , row
+          "MC_ec_reach_handoff_carried_cleared"
+          (Expect.reach Witness.Witness_HandoffCarriedCleared)
+          [ "REACH (expected REACHED): OI-1003-Q190: a recorded --clear-carried"
+          , "removed a carried block from the landed target, and a converge"
+          , "replaced the stripped seat with the source's next value."
+          ]
+          handoffCarried
       ]
 
 {- Documented limits of the code on feat/estate-converge-20261008 (the
@@ -2617,6 +2837,109 @@ let primary =
             ]
           }
         }
+      , handoff_no_overlay =
+        { mutation = Mutation.handoff_no_overlay
+        , constants = handoff
+        , comment =
+          { head = "TIN-6569: converge's proof ignores the hand-off record (the issue's"
+          , tail =
+            [ "bug: a naive prepend), so a quiet estate's converge refuses"
+            , "GIT_DESTINATION_MODIFIED for bulkload's own block, an operator"
+            , "edit nobody made."
+            ]
+          }
+        }
+      , handoff_overlay_any_block =
+        { mutation = Mutation.handoff_overlay_any_block
+        , constants = handoffOp
+        , comment =
+          { head = "TIN-6569: the overlay accepts a block the operator edited as"
+          , tail =
+            [ "bulkload's, so a converge replaces the target and drops the"
+            , "operator's edit inside the block."
+            ]
+          }
+        }
+      , handoff_clear_unchecked =
+        { mutation = Mutation.handoff_clear_unchecked
+        , constants = handoffOp
+        , comment =
+          { head = "TIN-6569: --clear strips a block the operator edited, dropping"
+          , tail = [ "their edit inside it." ]
+          }
+        }
+      , handoff_exchange_unchecked =
+        { mutation = Mutation.handoff_exchange_unchecked
+        , constants = handoffOp // { OpKinds = [ OpKind.seat ] }
+        , comment =
+          { head = "TIN-6569: the hand-off's exchange never checks the displaced"
+          , tail =
+            [ "file against the print it read, so an operator save between the"
+            , "read and the exchange is unlinked."
+            ]
+          }
+        }
+      , handoff_retake_unchecked =
+        { mutation = Mutation.handoff_retake_unchecked
+        , constants = handoffOp
+        , comment =
+          { head = "TIN-6569, review of 2026-10-16 (BLOCKER): a rerun over an intact"
+          , tail =
+            [ "block re-takes the record's print and keeps its old base, so the"
+            , "print vouches for an operator's edit below the block and a"
+            , "converge that replaces the target drops the edit."
+            ]
+          }
+        }
+      , handoff_keep_racy_unchecked =
+        { mutation = Mutation.handoff_keep_racy_unchecked
+        , constants = handoffOp
+        , comment =
+          { head = "TIN-6569, re-review of 2026-10-16 (finding 1): a rerun over an"
+          , tail =
+            [ "intact block keeps a racy record print equal to the seat's"
+            , "unchecked and re-dates it; the print caught an operator's edit"
+            , "below the block made between the exchange and the record, so it"
+            , "vouches for the edit and a converge that replaces the target"
+            , "drops it."
+            ]
+          }
+        }
+      , handoff_strip_no_overlay =
+        { mutation = Mutation.handoff_strip_no_overlay
+        , constants = handoffCarried
+        , comment =
+          { head = "OI-1003-Q190: converge's proof ignores handoff.stripped, so"
+          , tail =
+            [ "after a recorded --clear-carried a quiet estate's converge"
+            , "refuses GIT_DESTINATION_MODIFIED for bulkload's own edit, an"
+            , "operator edit nobody made."
+            ]
+          }
+        }
+      , handoff_strip_unchecked =
+        { mutation = Mutation.handoff_strip_unchecked
+        , constants = handoffCarriedOp
+        , comment =
+          { head = "OI-1003-Q190: --clear-carried removes a carried block from any"
+          , tail =
+            [ "bytes under the block, not only from the landed value, so an"
+            , "operator's bytes below the block that start with a carried block"
+            , "lose it."
+            ]
+          }
+        }
+      , handoff_no_intent =
+        { mutation = Mutation.handoff_no_intent
+        , constants = handoff
+        , comment =
+          { head = "TIN-6569: the hand-off writes its block before any intent, so"
+          , tail =
+            [ "a crash leaves a block no record or intent names: converge"
+            , "would refuse it as the operator's."
+            ]
+          }
+        }
       , recovery_overwrites =
         { mutation = Mutation.recovery_overwrites
         , constants = firstLinkedCrashOp
@@ -2756,6 +3079,15 @@ let negRows
       , primaryOf Mutation.adopt_r2_not_adopted
       , primaryOf Mutation.adopt_no_recheck
       , primaryOf Mutation.adopt_t0_no_row
+      , primaryOf Mutation.handoff_no_overlay
+      , primaryOf Mutation.handoff_overlay_any_block
+      , primaryOf Mutation.handoff_clear_unchecked
+      , primaryOf Mutation.handoff_exchange_unchecked
+      , primaryOf Mutation.handoff_no_intent
+      , primaryOf Mutation.handoff_retake_unchecked
+      , primaryOf Mutation.handoff_keep_racy_unchecked
+      , primaryOf Mutation.handoff_strip_no_overlay
+      , primaryOf Mutation.handoff_strip_unchecked
       ]
 
 let primaryPositions =
@@ -3101,6 +3433,58 @@ let invariants
           , "P84"
           , "P101"
           , "the_stash_table_adopts_an_equal_destination_reflog"
+          ]
+        }
+      , { tla = Property.HandoffOwnsOnlyItsBlock
+        , slo = [ S.S5, S.S4, S.Durability ]
+        , ruling = [ "OI-1003-Q183", "OI-1003-Q185", "OI-1003-Q190", "OI-1003-Q144", "OI-1003-Q149" ]
+        , codeSymbol =
+          [ "landed_sides"
+          , "matching"
+          , "holds"
+          , "prove"
+          , "HandoffLanded"
+          , "HandoffIntent"
+          , "render_workspace"
+          , "exchange"
+          , "lift"
+          , "clear"
+          , "after_apply"
+          , "retaken"
+          , "settle"
+          , "HandoffStripped"
+          , "carried_len"
+          , "landed_match"
+          , "classify_head"
+          ]
+        , pending = none
+        , ptest =
+          [ "H0"
+          , "H3"
+          , "H4"
+          , "H5"
+          , "H6"
+          , "H7"
+          , "H8"
+          , "H17"
+          , "holds_accepts_the_recorded_block_then_the_landed_blob_only"
+          , "a_racy_record_print_is_proved_by_reading"
+          , "the_exchange_is_undone_when_the_target_moved_after_the_read"
+          , "render_then_clear_is_identity"
+          , "H20"
+          , "H21"
+          , "H24"
+          , "H25"
+          , "H32"
+          , "the estate_handoff fault-harness rows (rerender_over_edit, clear_noop_apply)"
+          , "H40"
+          , "H41"
+          , "H42"
+          , "H46"
+          , "H47"
+          , "H49"
+          , "holds_accepts_a_recorded_removal_of_carried_blocks_only"
+          , "the estate_handoff fault-harness rows (clear_carried_after_intent, clear_carried_after_exchange)"
           ]
         }
       , { tla = Property.ConvergesWhenQuiet

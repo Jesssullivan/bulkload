@@ -670,7 +670,7 @@ pub(super) fn rekey(
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     let meta0 = Meta::read(place.worktree, place.source, &ledger.instance)?;
-    let old = sides(place.worktree, &meta0)?;
+    let old = super::handoff::landed_sides(place.worktree, &place.git_dir, place.source, &meta0)?;
     super::prove(
         place.worktree,
         &place.common,
