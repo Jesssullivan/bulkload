@@ -16,6 +16,7 @@ administration. SQLite needs backup-API capture and explicit composition,
 never a raw WAL/SHM copy or replacement of unique rows. Preserve Home Manager
 links and credential privacy.
 
-Estate operations are frozen until the M2 performance gates pass (R-N56);
-engine work is tracked in Linear project "Bulkload M2: SLO engine". Every
-performance claim must come from `bulkload-bench` evidence.
+R-N56 (estate operations frozen until the M2 gates pass) is superseded by
+SPEC C6: the full run does not wait for the proofs. Engine work is tracked
+in Linear project "Bulkload M2: SLO engine". Every performance claim must
+come from `bulkload-bench` evidence.

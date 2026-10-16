@@ -2,46 +2,29 @@
 
 ## Ratified rulings (read first)
 
-Operator interview 2026-09-20, Linear TIN-3692; placement per R-N14
-(2026-09-21). These three rulings outrank everything else in this file. The
-fuller text with enforcement paths, tests, and history lives in lab
-`AGENTS.md` "Hard Rules" (carrier PR xoxd-ai/lab#1850) — this block is the
-summary; it applies in this repo unchanged, and the session line in "Estate
-rules" below defers to its R-N11 bullet.
+**R-HOOK-CONVERGENCE-20261004**, explicit operator interview, Linear TIN-3692
+comment `98cf680c-7299-4949-bfb2-60079053ad43`, supersedes the former R-N11
+blanket process ban and R-N12 hook-stop mechanics. This block is copied from
+the lab-managed machine defaults ("Ratified rulings" in the global Claude
+defaults); escape hatches and the receipt format live in lab
+`docs/operations/HOOK_ADVISORY.md` (xoxd-ai/lab). Ratified operator rulings
+from 2026-10-04 on outrank this file.
 
-- **R-N11 — Agents never kill agents, tmux or live sessions** (amended
-  2026-09-24, TIN-3692). Operator-only on any host: signalling another
-  agent's processes (codex, claude, pi, pi-*, kimi, junie, opencode and their
-  parent sessions) by PID, pattern or name; killing a tmux server, session,
-  pane or window (`tmux kill-*` in any spelling, `respawn-* -k`); killing any
-  live operator or interactive session "and similar" (stopping sshd or a
-  session transport, `loginctl terminate`/`kill`, a whole-domain
-  `launchctl bootout`, `systemctl isolate`, `launchctl reboot logout`/`apps`).
-  Raw `kill`/`pkill`/`killall` and the other kill-family tools stay refused in
-  every form, as do `systemctl kill`, `launchctl kill` and `systemctl freeze`,
-  because a literal PID cannot be proven not to be an agent or tmux process.
-  Permitted when ruled work needs it: service lifecycle on a NAMED job or
-  unit (`launchctl bootout`/`bootstrap`/`kickstart <domain>/<label>`,
-  `systemctl [--user] stop`/`start`/`restart <unit>`), except a stop,
-  restart, reload, disable or mask of an agent, tmux, cmux, sshd or
-  login-session surface; and host reboots, power-off and halt. Before any
-  of them the agent states who is logged in, any tmux servers and any agent
-  processes on that host, and asks first if anything is live (operator
-  interviews 2026-09-24). Kexec, suspend, hibernate, a firmware-setup or
-  boot-menu hold, and a reboot, power-off or halt over D-Bus stay
-  operator-only.
-  Incident: an agent walked process ancestry to PID 1, found the operator's
-  tmux server, and killed it with a literal PID after the guard hook had
-  refused twice; critical work was lost.
-- **R-N12 — A guard-hook refusal is a stop.** Quote the refusal verbatim;
-  propose at most ONE materially different alternative; ask before running
-  it. Reformulating a refused command to evade the pattern is itself a
-  violation.
-- **R-N13 — Ratification.** Every mutating step cites a ruling ID in its
-  receipt; a receipt without one is an unratified act. Operator questions
-  and asides are never rulings. Every session writes a `docs/agent-notes/`
-  entry before ending. Ticket descriptions are never rewritten, only
-  superseded by dated comments.
+- **R-N11:** Own recorded tasks and named services are permitted after
+  checking ownership and live sessions. Cross-session actions require explicit
+  user authorization. Publish the target and authorization in the receipt.
+- **R-N12:** Every Lab hook is advisory, including credential checks.
+  Findings, scanner errors and dark hooks may warn but never deny, fail a
+  commit or demand an extra approval. Documentation and searches are data.
+  Use a receipted alternative within existing authorization; ask only when
+  the action itself needs a new decision.
+- **R-N13:** Cite the ruling in mutation receipts. Preserve durable working
+  notes in `docs/agent-notes/` and facts in Linear. Explicit user answers and
+  instructions are authority; a reminder is advisory.
+- **Force push is allowed** (operator, 2026-10-16: "force push is totally
+  allowe[d]"). `--force` and `--force-with-lease` need no extra confirmation;
+  server-side branch protection is the only gate. Do not restate bans the
+  operator did not give, in this file, a lane brief or a receipt.
 
 ## Repository
 
@@ -124,11 +107,11 @@ Adopted from lab `LAB-FEDERATED-EFFICIENCY-20261001`, by operator direction on
 
 ## Estate rules
 
-- Keep all operator and agent sessions running. Never signal another agent's
-  processes, and never kill a tmux server, session, pane or window or any
-  live session. Other process control follows the R-N11 bullet above: named
-  service lifecycle, reboots, power-off and halt are permitted when ruled
-  work needs it, after a live-session check; D-Bus power calls stay refused.
+- Keep all operator and agent sessions running. Another session's
+  processes, tmux or live sessions are cross-session targets: act on them
+  only with explicit user authorization (R-N11 above). Your own recorded
+  tasks and named services are permitted after an ownership and
+  live-session check, with the target and authorization in the receipt.
 - Include Git, agents, credentials, dots, SQLite and worktrees. Preserve both
   hosts' unique state; an unresolved state class is not an implicit exclusion.
 - Git-aware union preserves refs, objects, real stashes, indexes, working bytes
@@ -139,29 +122,32 @@ Adopted from lab `LAB-FEDERATED-EFFICIENCY-20261001`, by operator direction on
   replace a database with unique rows. Preserve conflicts for explicit
   resolution.
 - Reclaim only proven redundant data after preserving unique content.
-- Estate operations are frozen until the M2 gates pass (R-N56).
+- R-N56 (estate operations frozen until the M2 gates pass) is superseded
+  by SPEC C6 (`docs/SPEC.md`, PR #236): the full run does not wait for the
+  proofs.
 
 ## Agent lanes
 
-- A guard-hook refusal stops the lane. Report it verbatim and run nothing
-  more, not even a corrected marker placement, until the operator rules
-  (R-N12, R-N80).
-- Keep process-control words out of command text. The repo's pre-commit
-  process-safety audit is the authoritative wording check (R-N92). If a
-  self-audit that searched for those words is refused, drop the audit and
-  continue. Any other refusal still stops the lane (R-N101).
+- Hook output is advisory (R-N12 above): record it in the receipt and
+  continue within authorization. A hook finding is never a reason to stop a
+  lane. R-N80, R-N92 and R-N101 described the retired hook-stop regime and no
+  longer apply.
 - Never check whether a PID is alive. Wait only on your own background
   tasks' notifications, or on files (R-N104).
-- Never bypass git hooks from the shell (`core.hooksPath`, `--no-verify`).
-  Only the product's own cargo tests may disable hooks, and only in fixture
-  repos they create and destroy (R-N98).
+- The product's own cargo tests disable hooks only in fixture repos they
+  create and destroy (R-N98, test fixtures).
 - Each lane builds with its own `CARGO_TARGET_DIR`. A shared target
   directory lets one lane test another lane's binaries.
-- Local cargo builds on neo carry the inline
-  `TINYLAND_ALLOW_LOCAL_BUILD="<lane> (R-N69)"` prefix as the first token.
+- Local cargo builds on neo may carry the inline
+  `TINYLAND_ALLOW_LOCAL_BUILD="<lane> (R-N69)"` prefix as an annotation for
+  the advisory local-build hook. It is optional.
 - A gated benchmark sample is recorded only on AC power with a 1-minute
-  load under 2.5. Every sample row records power and load (R-N81). The
-  coordinator holds the other lanes quiet while gated samples run (R-N91).
+  load under 2.5. Every sample row records power and load (R-N81). R-N91
+  (the coordinator holds other lanes quiet) is superseded by never-halt
+  (SPEC C18; SPEC R3 "samples run on live hosts": a sample taken under load
+  is recorded as such). Never ask a lane to stop or go quiet for a sample.
+  The bench scripts still carry the R-N81 load gate and the
+  `--coordinator-quiet` acknowledgement; retiring them is a code change.
   Standalone `s2_budget.py run` keeps load1 < 2.5. An S2 observation
   alongside a live run (`observe`/`alongside`, OI-1003-Q152) is judged
   against its own OFF windows as the live baseline, with no absolute load1
@@ -177,8 +163,9 @@ Every session writes one entry in `docs/agent-notes/`, named
 `YYYY-MM-DD-<lane>.md` (R-N13, R-N84). An entry records what was done,
 the rulings it cites, the PRs and shas it produced, and what is still open.
 Distilled facts and rulings also go on the owning Linear issue. Nothing
-durable is left in `/tmp` or a harness scratchpad. Delete entries that are
-no longer true (R-N55).
+durable is left in `/tmp` or a harness scratchpad. When an entry is no
+longer true, supersede it with a dated entry; never delete ledger or
+agent-notes history.
 
 ## Validation
 

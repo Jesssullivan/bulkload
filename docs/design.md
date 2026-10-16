@@ -1077,8 +1077,10 @@ updated.
 | W7 proofs | I1 (a record implies its bytes), I2 (no partial leaves) and I3 (a committed file means 0 source reads on resume) hold at every process-crash fault point. Power-loss ordering is proven by a syscall-trace crash-state checker. Darwin barriers are modelled device-wide, with the per-fd model available as a strict option. | R-N86, R-N88, R-N103 |
 
 Gated benchmark samples require AC power and a 1-minute load below 2.5,
-and each sample row records both. The coordinator keeps the other lanes
-quiet while gated samples run (R-N81, R-N91). The clone fast path never
+and each sample row records both (R-N81). R-N91 (the coordinator keeps the
+other lanes quiet while gated samples run) is superseded by never-halt
+(SPEC C18): samples run on live hosts, and a sample taken under load is
+recorded as such (SPEC R3). The clone fast path never
 counts toward a gate (R-N57, R-N63). The clone lever is excluded
 (OI-1003-Q164, Q165): the engine has no clone path, and S2 forbids one on a
 source file (Live union, "No clone of a source file"). Every copy of the
