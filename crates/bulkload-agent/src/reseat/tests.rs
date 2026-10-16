@@ -14,6 +14,8 @@ use super::{reseat, Options, Summary, Unmapped};
 use crate::counters::{Counter, Counters};
 use crate::BulkloadRefusal;
 
+mod findings;
+
 /// The landed-read counter is process-wide: the rows that measure it run
 /// one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -67,6 +69,12 @@ impl World {
         let base = fs::canonicalize(temp.path()).unwrap();
         fs::create_dir_all(base.join("real-git/lab")).unwrap();
         fs::create_dir_all(base.join("dest/.claude")).unwrap();
+        // Both hosts keep transcripts ten years (investigation 1.4).
+        fs::write(
+            base.join("dest/.claude/settings.json"),
+            b"{\n  \"cleanupPeriodDays\": 3650\n}\n",
+        )
+        .unwrap();
         fs::create_dir_all(base.join("dest/.codex")).unwrap();
         std::os::unix::fs::symlink(base.join("real-git"), base.join("dest/git")).unwrap();
         fs::create_dir_all(base.join("landing/.claude/projects")).unwrap();
@@ -82,6 +90,8 @@ impl World {
             &self.base.join("state"),
         );
         options.sessions_only = true;
+        // Never the host's own managed settings.
+        options.managed_settings = vec![self.base.join("managed-settings.json")];
         options
     }
 
@@ -275,9 +285,10 @@ fn an_unchanged_rerun_reads_zero_landed_bytes() {
     );
 }
 
-/// A live lane: the landing grows between passes; the next pass reads the
-/// two windows and the new tail only, and leaves the destination
-/// byte-identical.
+/// A live lane: the landing grows between passes; the next pass proves
+/// every placed byte against the landing (its BLAKE3, review 1 finding 8),
+/// appends the new tail only, and leaves the destination byte-identical.
+/// It reads the landing once, never the source (R25).
 #[test]
 fn a_grown_transcript_is_extended_by_its_tail() {
     let _serial = SERIAL
@@ -302,10 +313,10 @@ fn a_grown_transcript_is_extended_by_its_tail() {
         inode,
         "appended in place"
     );
-    assert!(
-        read <= tail.len() as u64 + 2 * super::place::WINDOW,
-        "read {read} bytes of a {} byte file",
-        bytes.len() + tail.len()
+    assert_eq!(
+        read,
+        (bytes.len() + tail.len()) as u64,
+        "the landing read once: the placed bytes proven, the tail appended"
     );
     assert!(r0(&options).verdict().is_ok());
 }
@@ -474,6 +485,7 @@ fn retention_is_refused_before_anything_is_written() {
         &transcript(SID, "/Users/jess/git/lab", "s", 3),
     );
     set_mtime(&landed, 40 * 86_400);
+    fs::remove_file(world.dest("settings.json")).unwrap();
     let options = world.options();
     let refused = reseat(&options, &mut |_| Ok(()));
     assert_eq!(refused.err(), Some(BulkloadRefusal::ReseatRetentionUnsafe));

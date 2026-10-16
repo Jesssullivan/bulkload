@@ -1,5 +1,15 @@
 # 2026-10-16: `estate-reseat`, the R0 verb (TIN-6587)
 
+**Superseded in part (same day):** two adversarial reviews refuted this
+build as safe for the live run; the fixes and what changed are in
+`2026-10-16-estate-reseat-review-fixes.md`. No longer true below: the
+two-window extension proof (now the BLAKE3 of every placed byte), rollouts
+placed "in the landed form" (now plain `.jsonl`, decompressed), the
+retention rule (now a margin over every settings source), nine refusals and
+nine harness rows (now fourteen and eleven), and the dry run's "tummycrypt
+lane pass" (an empty `projects/`; on a mirror of live sting the lane fails,
+its sessions `occupied`).
+
 Lane: estate-reseat build, worktree `bulkload.worktrees/estate-reseat-20261016`,
 branch `feat/estate-reseat-20261016` off `origin/main` `0d96dbd`, on top of
 the investigation note `35408b0`

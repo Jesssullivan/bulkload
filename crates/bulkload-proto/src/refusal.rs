@@ -307,8 +307,8 @@ pub enum BulkloadRefusal {
     /// extended again, and newer landed bytes stay in the landing.
     ReseatDestContinued,
     /// `estate-reseat`: the landed file no longer extends the bytes placed
-    /// from it (it shrank, or a window the ledger keeps hashes differently).
-    /// Nothing is written; the placed file is kept.
+    /// from it (it shrank, or the BLAKE3 of the placed bytes no longer
+    /// matches its prefix). Nothing is written; the placed file is kept.
     ReseatSourceRewritten,
     /// `estate-reseat`: a session's recorded working directory has no lane
     /// on the destination (no `--map`, not under the source home's `git`).
@@ -328,9 +328,37 @@ pub enum BulkloadRefusal {
     /// The row is never updated (insert only); the thread is reported.
     ReseatIndexConflict,
     /// `estate-reseat`: a landed rollout is in a form the destination's
-    /// Codex cannot read (`.jsonl.gz`). It stays in the landing as a file
+    /// Codex cannot read (`.jsonl.gz`), or a landed file cannot be read as
+    /// its form (a corrupt `.jsonl.zst`). It stays in the landing as a file
     /// and is not registered.
     ReseatUnreadableForm,
+    /// `estate-reseat`: a landed agent tree the run was asked to re-seat
+    /// (`.claude` or `.codex` under the landed home) is absent or not a
+    /// directory (a symlink to a source-only volume). Nothing is written;
+    /// `--no-claude` / `--no-codex` leave a tool out explicitly.
+    ReseatLandingAbsent,
+    /// `estate-reseat`: the destination has no Codex thread index
+    /// (`state_5.sqlite`) to register landed threads in. Placing rollouts
+    /// without rows would let the destination's first Codex start backfill
+    /// them under the source's working directory, out of every lane's
+    /// picker for good, so nothing is written until Codex has run there
+    /// once (or `--no-codex`).
+    ReseatIndexAbsent,
+    /// `estate-reseat`: a landed rollout has no row in the landed Codex
+    /// snapshot. Its file is placed (resumable by ID) but no row is made up
+    /// for it, so no picker lists it; it is reported for explicit
+    /// resolution.
+    ReseatIndexRowAbsent,
+    /// `estate-reseat`: two landed files map to one destination path (two
+    /// source project keys mapped onto one destination key). The first
+    /// keeps the path; the other stays in the landing and is reported,
+    /// never superseding it.
+    ReseatLaneCollision,
+    /// `estate-reseat`: a destination writer (a session resumed there)
+    /// appended to a transcript while a pass was extending it. The pass
+    /// stopped between whole lines; the file is the destination's from
+    /// then on and the rest of the landed bytes stay in the landing.
+    ReseatExtendRaced,
     /// `estate-reseat --check`: at least one lane failed the R0 acceptance
     /// check (its sessions are not listable and byte-identical in its
     /// destination working directory, its Git state is not equal, or its
@@ -437,6 +465,11 @@ impl BulkloadRefusal {
             Self::ReseatRetentionUnsafe => "RESEAT_RETENTION_UNSAFE",
             Self::ReseatIndexConflict => "RESEAT_INDEX_CONFLICT",
             Self::ReseatUnreadableForm => "RESEAT_UNREADABLE_FORM",
+            Self::ReseatLandingAbsent => "RESEAT_LANDING_ABSENT",
+            Self::ReseatIndexAbsent => "RESEAT_INDEX_ABSENT",
+            Self::ReseatIndexRowAbsent => "RESEAT_INDEX_ROW_ABSENT",
+            Self::ReseatLaneCollision => "RESEAT_LANE_COLLISION",
+            Self::ReseatExtendRaced => "RESEAT_EXTEND_RACED",
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
@@ -517,6 +550,11 @@ impl BulkloadRefusal {
         "RESEAT_RETENTION_UNSAFE",
         "RESEAT_INDEX_CONFLICT",
         "RESEAT_UNREADABLE_FORM",
+        "RESEAT_LANDING_ABSENT",
+        "RESEAT_INDEX_ABSENT",
+        "RESEAT_INDEX_ROW_ABSENT",
+        "RESEAT_LANE_COLLISION",
+        "RESEAT_EXTEND_RACED",
         "RESEAT_R0_FAILED",
         "PROBE_FAILED",
         "IO",
@@ -756,6 +794,11 @@ mod tests {
             BulkloadRefusal::ReseatRetentionUnsafe,
             BulkloadRefusal::ReseatIndexConflict,
             BulkloadRefusal::ReseatUnreadableForm,
+            BulkloadRefusal::ReseatLandingAbsent,
+            BulkloadRefusal::ReseatIndexAbsent,
+            BulkloadRefusal::ReseatIndexRowAbsent,
+            BulkloadRefusal::ReseatLaneCollision,
+            BulkloadRefusal::ReseatExtendRaced,
             BulkloadRefusal::ReseatR0Failed,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),

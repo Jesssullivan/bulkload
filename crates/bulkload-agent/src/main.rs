@@ -167,6 +167,8 @@ SUBCOMMANDS:
                   [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
                   [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
+                  [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
+                  [--managed-settings FILE]...
                   [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
                 R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
                 .claude and .codex, the run's copy of SOURCE_HOME's) into
@@ -179,25 +181,40 @@ SUBCOMMANDS:
                 transcripts go to projects/<key of the real destination cwd>/
                 as regular files with their source mtime, with their sidecar
                 directory, per-session state and plans; Codex rollouts go to
-                the same place under .codex and their thread rows are inserted
-                into its state_5.sqlite with the destination cwd (insert only).
-                Never overwrites: a copy already there is adopted when equal,
-                extended when a byte prefix (append-only files), and otherwise
-                kept and reported (RESEAT_DEST_DIVERGED); a placed file changed
-                at the destination is the destination's from then on
-                (RESEAT_DEST_CONTINUED). Every placement is ledgered in
+                the same place under .codex as plain .jsonl (a .jsonl.zst is
+                decompressed: Codex resumes a paginated thread only from the
+                plain file) and their thread rows are inserted into its
+                state_5.sqlite with the destination cwd (insert only; a row
+                the destination already holds is never changed). A rollout
+                with no snapshot row is placed and reported
+                (RESEAT_INDEX_ROW_ABSENT). JSON Lines are placed and extended
+                in whole lines only. Never overwrites: a copy already there is
+                adopted when equal, extended when a byte prefix (append-only
+                files), and otherwise kept and reported (RESEAT_DEST_DIVERGED);
+                a placed file changed at the destination is the destination's
+                from then on (RESEAT_DEST_CONTINUED, RESEAT_EXTEND_RACED);
+                two landed files for one destination path are
+                RESEAT_LANE_COLLISION. Every placement is ledgered in
                 STATE/reseat.sqlite: an unchanged rerun reads 0 landed bytes
-                (read_reseat_landing_bytes) and a later pass appends only what
-                grew. Refuses RESEAT_RETENTION_UNSAFE, before writing, when the
-                destination's cleanupPeriodDays would delete a transcript.
-                --unmapped=by-id places sessions with no lane under their
-                source key / cwd, resumable by ID only (default: report).
-                --check is the read-only R0 acceptance check: per lane, the
-                transcripts and rollouts the pickers read there hash-equal
-                the landed ones, Git is estate-diff identical (--plan, or
-                --sessions-only to waive), the hand-off note holds the marker
-                (--note-marker); exits RESEAT_R0_FAILED unless every lane
-                passes. One bulkload.estate-reseat.v1 JSON line per row
+                (read_reseat_landing_bytes) and a later pass proves the placed
+                bytes and appends only what grew. Refuses before writing:
+                RESEAT_LANDING_ABSENT (a landed .claude or .codex missing; use
+                --no-claude / --no-codex), RESEAT_RETENTION_UNSAFE (the
+                smallest cleanupPeriodDays of the destination's managed, user
+                and lane settings would delete a re-seated file within
+                --retention-margin-days, default 365), RESEAT_INDEX_ABSENT (no
+                destination Codex index to register in). --unmapped=by-id
+                places sessions with no lane under their source key / cwd,
+                resumable by ID only (default: report). --check is the
+                read-only R0 acceptance check: per lane, the transcripts and
+                rollouts the pickers read there hold the landed ones (exactly,
+                or continued at the destination), Git is estate-diff identical
+                (--plan, or --sessions-only to waive), the hand-off note holds
+                the marker (--note-marker); every session or thread without a
+                lane, or failed by ID, fails it unless --waive (or
+                --waive-from, one ID per line) names it; exits RESEAT_R0_FAILED
+                unless all of that holds and something was checked. One
+                bulkload.estate-reseat.v1 JSON line per row
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -1216,6 +1233,9 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut unmapped = Unmapped::Report;
     let mut marker = None;
     let mut sessions_only = false;
+    let mut waived = std::collections::BTreeSet::new();
+    let mut margin = None;
+    let mut managed = Vec::new();
     let (mut claude, mut codex) = (true, true);
     let mut at = 0;
     let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
@@ -1246,7 +1266,9 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             | "--private-state"
             | "--codex-source-root"
             | "--landing-claude"
-            | "--landing-codex" => {
+            | "--landing-codex"
+            | "--managed-settings"
+            | "--waive-from" => {
                 let path = PathBuf::from(value(at + 1)?);
                 match arg {
                     "--plan" => plan = Some(path),
@@ -1254,8 +1276,39 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
                     "--private-state" => states.push(path),
                     "--codex-source-root" => roots.push(path),
                     "--landing-claude" => landing_claude = Some(path),
+                    "--managed-settings" => managed.push(path),
+                    "--waive-from" => {
+                        let text = std::fs::read_to_string(&path)
+                            .refuse_at("main::reseat_command::waive_from")?;
+                        for line in text.lines() {
+                            let id = line.split('#').next().unwrap_or_default().trim();
+                            if !id.is_empty() {
+                                waived.insert(id.to_owned());
+                            }
+                        }
+                    }
                     _ => landing_codex = Some(path),
                 }
+                step = 2;
+            }
+            "--waive" => {
+                waived.insert(
+                    value(at + 1)?
+                        .to_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            "--retention-margin-days" => {
+                margin = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .and_then(|days| days.parse::<i64>().ok())
+                        .filter(|days| *days >= 0)
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+                );
                 step = 2;
             }
             "--source" => {
@@ -1318,6 +1371,13 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     options.codex = codex;
     options.handoff_marker = marker;
     options.sessions_only = sessions_only;
+    options.waived = waived;
+    if let Some(margin) = margin {
+        options.retention_margin_days = margin;
+    }
+    if !managed.is_empty() {
+        options.managed_settings = managed;
+    }
     options.git = match (plan, corpus, source) {
         (Some(plan), Some(corpus), Some(source)) => Some(GitCheck {
             plan,

@@ -1382,37 +1382,50 @@ contract is `docs/design.md`, "Agent session re-seat".
 
 - **R0 acceptance is `estate-reseat --check`**, read-only: per lane, the
   transcripts and rollouts the two pickers read in the destination
-  directory hash-equal the landed ones, the Git state is `estate-diff`
+  directory hold the landed ones (exactly, or continued by a resume there;
+  never ending inside a line), the Git state is `estate-diff`
   `identical`, and the hand-off note is present when TIN-6569's marker is
   given. It replaces the undefined "daily-work verdict" (#40) as the
   per-lane record. A lane without its Git input is `incomplete`, never a
-  pass.
+  pass. R0 also fails when nothing was checked, when retention is unsafe,
+  and for every session or thread with no lane (unmapped, unresolved) or
+  failed by ID, unless the operator names it (`--waive`, `--waive-from`).
 - **S3:** an unchanged `estate-reseat` reads 0 landed bytes
-  (`read_reseat_landing_bytes=0`) and writes 0. A grown transcript reads
-  its two 64 KiB window digests' bytes and its new tail only (R25).
-- **S4:** every session or thread that is not re-seated is a typed row:
-  `RESEAT_DEST_DIVERGED`, `RESEAT_DEST_CONTINUED`,
-  `RESEAT_SOURCE_REWRITTEN`, `RESEAT_LANE_UNMAPPED`,
-  `RESEAT_LANE_UNRESOLVED`, `RESEAT_INDEX_CONFLICT`,
-  `RESEAT_UNREADABLE_FORM`, `DESTINATION_OCCUPIED`; a run refuses
-  `RESEAT_RETENTION_UNSAFE` before writing and `--check`
-  `RESEAT_R0_FAILED`. They are report rows, not closure items: the closure
-  report does not join them yet.
+  (`read_reseat_landing_bytes=0`), the landed Codex snapshot included, and
+  writes 0. A grown transcript is read once from the landing: every placed
+  byte proven by its BLAKE3, then the new tail (the source is never read,
+  R25).
+- **S4:** every session, thread or file that is not re-seated is a typed
+  row: `RESEAT_DEST_DIVERGED`, `RESEAT_DEST_CONTINUED`,
+  `RESEAT_EXTEND_RACED`, `RESEAT_SOURCE_REWRITTEN`,
+  `RESEAT_LANE_UNMAPPED`, `RESEAT_LANE_UNRESOLVED`,
+  `RESEAT_LANE_COLLISION`, `RESEAT_INDEX_CONFLICT`,
+  `RESEAT_INDEX_ROW_ABSENT`, `RESEAT_UNREADABLE_FORM`,
+  `DESTINATION_OCCUPIED`; a run refuses `RESEAT_LANDING_ABSENT`,
+  `RESEAT_RETENTION_UNSAFE` and `RESEAT_INDEX_ABSENT` before writing, and
+  `--check` `RESEAT_R0_FAILED`. They are report rows, not closure items:
+  the closure report does not join them yet.
 - **S5 and never overwrite:** a destination copy is adopted only when equal,
-  extended only when a verified byte prefix, and otherwise kept beside the
-  landed one; a placed file changed at the destination is the destination's
-  from then on. Codex rows are inserted only, never updated.
-- **Proof:** `reseat::tests` (synthetic transcripts and Codex stores in
-  throwaway homes), `tests/estate_reseat.rs` (the CLI, and a canary on the
-  installed Claude Code picker in a throwaway home with no network), and
-  nine fault-harness rows over the seven `reseat.*` points.
-- **Open, for the operator** (the investigation note's section 6): which
-  destination directory a lane keys to when the run lands Git beside the
-  live tree; the gftb and GloriousFlywheel sessions (D4b); sting's own 388
-  symlinked transcripts and ~9,242 Codex rows spelled through the `~/git`
+  extended only when a verified byte prefix (whole lines, the destination's
+  size checked before every write), and otherwise kept beside the landed
+  one; a placed file changed at the destination is the destination's from
+  then on. Codex rows are inserted only, never updated; a row the
+  destination already holds gets no second rollout beside it.
+- **Proof:** `reseat::tests` and `reseat::tests::findings` (synthetic
+  transcripts and Codex stores in throwaway homes, one row per review
+  finding, each seen failing against the first build), `tests/estate_reseat.rs`
+  (the CLI, and canaries on the installed Claude Code picker and the
+  installed Codex resume in throwaway homes with no network), and eleven
+  fault-harness rows over the seven `reseat.*` points.
+- **Open, for the operator** (the investigation note's section 6, as
+  restated in `docs/agent-notes/2026-10-16-estate-reseat-review-fixes.md`):
+  which destination directory a lane keys to when the run lands Git beside
+  the live tree; the gftb and GloriousFlywheel sessions (D4b); neo's own
+  sessions (and sting's) blocked at their destination key by sting's
+  symlinked transcripts, and ~9,242 Codex rows spelled through the `~/git`
   symlink (TIN-5268's hold); whether existing Codex rows may be updated;
-  and home and `/private/tmp` sessions (`--unmapped`). The verb takes no
-  decision on any of them: its defaults are the conservative ones.
+  and home and `/private/tmp` sessions (`--unmapped`, `--waive`). The verb
+  takes no decision on any of them: its defaults are the conservative ones.
 
 ## Priority (OI-1003-Q4)
 

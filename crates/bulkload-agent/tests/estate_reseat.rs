@@ -72,8 +72,15 @@ impl World {
         let base = fs::canonicalize(temp.path()).unwrap();
         fs::create_dir_all(base.join("real-git/lab")).unwrap();
         fs::create_dir_all(base.join("dest/.claude")).unwrap();
+        fs::write(
+            base.join("dest/.claude/settings.json"),
+            b"{\"cleanupPeriodDays\": 3650}",
+        )
+        .unwrap();
         fs::create_dir_all(base.join("dest/.codex")).unwrap();
         std::os::unix::fs::symlink(base.join("real-git"), base.join("dest/git")).unwrap();
+        // The source used no Codex: its landed .codex is there and empty.
+        fs::create_dir_all(base.join("landing/.codex")).unwrap();
         let projects = base.join("landing/.claude/projects/-Users-jess-git-lab");
         fs::create_dir_all(&projects).unwrap();
         fs::write(
@@ -96,6 +103,8 @@ impl World {
     fn reseat(&self, extra: &[&str]) -> (bool, String, String) {
         let out = Command::new(agent())
             .arg("estate-reseat")
+            .arg("--managed-settings")
+            .arg(self.base.join("managed-settings.json"))
             .args(extra)
             .args(self.args())
             .output()
@@ -166,6 +175,19 @@ fn cli_check_fails_first_then_passes_and_rerun_reads_nothing() {
     let (ok, _, stderr) = world.reseat(&["--map", "relative=/x"]);
     assert!(!ok);
     assert!(stderr.contains("PATH_NOT_ABSOLUTE"), "{stderr}");
+
+    // A landed tree that is not there refuses, run and check alike
+    // (review 0, finding 2): never an empty pass.
+    fs::remove_dir(world.base.join("landing/.codex")).unwrap();
+    let (ok, stdout, stderr) = world.reseat(&[]);
+    assert!(!ok, "{stdout}");
+    assert!(stderr.contains("RESEAT_LANDING_ABSENT"), "{stderr}");
+    let (ok, stdout, stderr) = world.reseat(&["--check", "--sessions-only"]);
+    assert!(!ok, "{stdout}");
+    assert!(stderr.contains("RESEAT_LANDING_ABSENT"), "{stderr}");
+    let (ok, stdout, stderr) = world.reseat(&["--check", "--sessions-only", "--no-codex"]);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("\"state\":\"skipped\""), "{stdout}");
 }
 
 fn on_path(name: &str) -> Option<PathBuf> {
@@ -335,4 +357,228 @@ fn canary_real_claude_picker_lists_the_reseated_session() {
         exited,
         "the picker did not leave on Escape; left running, not signalled"
     );
+}
+
+/// Terminal queries a TUI waits on before it draws, and the answers a
+/// terminal gives.
+const TERMINAL_ANSWERS: &[(&[u8], &[u8])] = &[
+    (b"\x1b[6n", b"\x1b[1;1R"),
+    (b"\x1b[c", b"\x1b[?62;22c"),
+    (b"\x1b[?u", b"\x1b[?0u"),
+    (b"\x1b]10;?\x1b\\", b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\"),
+    (b"\x1b]11;?\x1b\\", b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
+];
+
+/// Run `command` (a shell line) on a `script` pseudo-terminal: answer the
+/// terminal queries it sends, read its screen until `done` holds or
+/// `seconds` pass, then leave with Escape and Ctrl+C keystrokes. Returns
+/// the plain screen and whether it exited. Nothing here sends a signal
+/// (R-N11): one that does not leave is reported and left running.
+fn drive(
+    script: &Path,
+    command: &str,
+    seconds: u64,
+    done: &dyn Fn(&str) -> bool,
+) -> (String, bool) {
+    let mut child = Command::new(script)
+        .args(["-qfec", command, "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let (reaped, exit) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = reaped.send(child.wait());
+    });
+    let screen = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&screen);
+    std::thread::spawn(move || {
+        let mut buffer = [0_u8; 8192];
+        while let Ok(read) = stdout.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            sink.lock().unwrap().extend_from_slice(&buffer[..read]);
+        }
+    });
+    let mut answered = 0;
+    let deadline = Instant::now() + Duration::from_secs(seconds);
+    let mut exited = false;
+    while Instant::now() < deadline && !exited {
+        let raw = screen.lock().unwrap().clone();
+        let fresh = raw.get(answered..).unwrap_or_default().to_vec();
+        for (query, answer) in TERMINAL_ANSWERS {
+            for _ in 0..fresh.windows(query.len()).filter(|w| w == query).count() {
+                let _ = stdin.write_all(answer);
+            }
+        }
+        let _ = stdin.flush();
+        answered = raw.len();
+        if done(&plain(&raw)) {
+            break;
+        }
+        exited = exit.recv_timeout(Duration::from_millis(200)).is_ok();
+    }
+    for key in [&b"\x1b"[..], b"\x03", b"\x03", b"\x04"] {
+        if exited {
+            break;
+        }
+        let _ = stdin.write_all(key);
+        let _ = stdin.flush();
+        exited = exit.recv_timeout(Duration::from_secs(2)).is_ok();
+    }
+    drop(stdin);
+    std::thread::sleep(Duration::from_millis(200));
+    let text = plain(&screen.lock().unwrap());
+    (text, exited)
+}
+
+/// The real Codex resumes a re-seated **paginated** thread whose rollout
+/// landed as `.jsonl.zst` (review 0, finding 1): Codex reads such a thread
+/// only from the plain `.jsonl`, so a `.zst` placed as landed fails with
+/// "failed to scan paginated model context lineage". The thread is opened
+/// (not only listed): Codex appends to the placed rollout, which keeps the
+/// placed bytes as its prefix, and the R0 check still passes (continued).
+/// The destination index is the one the installed Codex creates in the
+/// throwaway home. Skipped, and says so, where `codex`, `bwrap` or
+/// `script` is missing.
+#[test]
+fn canary_real_codex_resumes_a_reseated_paginated_thread() {
+    const THREAD: &str = "019a1111-2222-7333-8444-555555555555";
+    let (Some(codex), Some(bwrap), Some(script)) = (
+        std::env::var_os("BULKLOAD_RESEAT_CANARY_CODEX")
+            .map(PathBuf::from)
+            .or_else(|| on_path("codex")),
+        on_path("bwrap"),
+        on_path("script"),
+    ) else {
+        eprintln!("codex canary skipped: codex, bwrap or script is not on PATH");
+        return;
+    };
+    let probe = Command::new(&bwrap)
+        .args(["--dev-bind", "/", "/", "--unshare-net", "--", "true"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    if !probe.status.success() {
+        eprintln!("codex canary skipped: bwrap --unshare-net cannot start here");
+        return;
+    }
+    let codex = fs::canonicalize(codex).unwrap();
+    let world = World::new();
+    let home = world.base.join("dest");
+    let lane = world.lane();
+    fs::write(
+        home.join(".codex/config.toml"),
+        format!(
+            "[projects.\"{}\"]\ntrust_level = \"trusted\"\n\n[tui]\nscreen_reader_detection_done = true\n",
+            lane.display()
+        ),
+    )
+    .unwrap();
+    // Not a credential: a placeholder that only skips the login screen;
+    // the sandbox has no network.
+    let placeholder = ["sk", "placeholder", "reseat", "canary"].join("-");
+    fs::write(
+        home.join(".codex/auth.json"),
+        format!("{{\"auth_mode\":\"apikey\",\"OPENAI_API_KEY\":\"{placeholder}\"}}"),
+    )
+    .unwrap();
+    let run = |args: &str| {
+        format!(
+            "{} --dev-bind / / --unshare-net --die-with-parent --chdir {} -- env -i HOME={} PATH=/usr/bin:/bin TERM=xterm-256color LANG=C.UTF-8 USER=reseat SHELL=/bin/sh OPENAI_API_KEY={placeholder} {} {args}",
+            bwrap.display(),
+            home.join("git/lab").display(),
+            home.display(),
+            codex.display(),
+        )
+    };
+    // The installed Codex makes the destination's index.
+    let index = home.join(".codex/state_5.sqlite");
+    let (_, exited) = drive(&script, &run("resume --no-daemon --all"), 30, &|_| {
+        index.is_file()
+    });
+    assert!(index.is_file(), "codex made no index (exited: {exited})");
+    // The landing: a paginated thread of ~/git/lab, its rollout as .zst,
+    // and a snapshot with the destination Codex's own schema.
+    let rel = format!("sessions/2026/10/16/rollout-2026-10-16T10-00-00-{THREAD}.jsonl");
+    let ts = "2026-10-16T10:00:00.000Z";
+    let turn = "019a1111-2222-7333-8444-777777777777";
+    let lines = [
+        format!("{{\"timestamp\":\"{ts}\",\"ordinal\":0,\"type\":\"session_meta\",\"payload\":{{\"session_id\":\"{THREAD}\",\"id\":\"{THREAD}\",\"timestamp\":\"{ts}\",\"cwd\":\"/Users/jess/git/lab\",\"originator\":\"codex-tui\",\"cli_version\":\"0.163.0-alpha.11\",\"source\":\"cli\",\"thread_source\":\"user\",\"model_provider\":\"openai\",\"base_instructions\":{{\"text\":\"canary\"}},\"history_mode\":\"paginated\",\"context_window\":{{\"window_id\":\"019a1111-2222-7333-8444-666666666666\"}}}}}}"),
+        format!("{{\"timestamp\":\"{ts}\",\"ordinal\":1,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\",\"turn_id\":\"{turn}\",\"started_at\":1792144800,\"model_context_window\":258400,\"collaboration_mode_kind\":\"default\"}}}}"),
+        format!("{{\"timestamp\":\"{ts}\",\"ordinal\":2,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"RESEATCODEXCANARY prompt\"}}]}}}}"),
+        format!("{{\"timestamp\":\"{ts}\",\"ordinal\":3,\"type\":\"response_item\",\"payload\":{{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{{\"type\":\"output_text\",\"text\":\"RESEATCODEXREPLY\"}}],\"phase\":\"final_answer\"}}}}"),
+        format!("{{\"timestamp\":\"{ts}\",\"ordinal\":4,\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_complete\",\"turn_id\":\"{turn}\",\"last_agent_message\":\"RESEATCODEXREPLY\"}}}}"),
+    ];
+    let plain_rollout = lines.join("\n") + "\n";
+    let landed = world.base.join("landing/.codex").join(format!("{rel}.zst"));
+    fs::create_dir_all(landed.parent().unwrap()).unwrap();
+    fs::write(
+        &landed,
+        zstd::encode_all(plain_rollout.as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+    {
+        let source = rusqlite::Connection::open(&index).unwrap();
+        let mut snapshot =
+            rusqlite::Connection::open(world.base.join("landing/.codex/state_5.sqlite")).unwrap();
+        rusqlite::backup::Backup::new(&source, &mut snapshot)
+            .unwrap()
+            .run_to_completion(64, Duration::from_millis(0), None)
+            .unwrap();
+        snapshot
+            .execute(
+                "INSERT INTO threads(id, rollout_path, created_at, updated_at, source,
+                    model_provider, cwd, title, sandbox_policy, approval_mode, history_mode,
+                    first_user_message, preview, has_user_event)
+                 VALUES (?1, ?2, 1792144800, 1792144800, 'cli', 'openai', '/Users/jess/git/lab',
+                    'RESEATCODEXCANARY prompt', '{\"type\":\"disabled\"}', 'never', 'paginated',
+                    'RESEATCODEXCANARY prompt', 'RESEATCODEXCANARY prompt', 1)",
+                rusqlite::params![THREAD, format!("/Users/jess/.codex/{rel}.zst")],
+            )
+            .unwrap();
+    }
+    let (ok, stdout, stderr) = world.reseat(&["--no-claude"]);
+    assert!(ok, "{stdout}{stderr}");
+    assert!(stdout.contains("\"row\":\"registered\""), "{stdout}");
+    let placed = home.join(".codex").join(&rel);
+    assert_eq!(
+        fs::read_to_string(&placed).unwrap(),
+        plain_rollout,
+        "placed decompressed"
+    );
+    let (ok, stdout, _) = world.reseat(&["--check", "--sessions-only", "--no-claude"]);
+    assert!(ok, "{stdout}");
+    let placed_len = plain_rollout.len() as u64;
+    let (text, exited) = drive(
+        &script,
+        &run(&format!("resume --no-daemon {THREAD}")),
+        40,
+        &|text| {
+            text.contains("ailed to resume")
+                || fs::metadata(&placed).is_ok_and(|meta| meta.len() > placed_len)
+        },
+    );
+    eprintln!(
+        "codex canary: {} resumed {THREAD}: {}",
+        codex.display(),
+        text.lines().last().unwrap_or_default().trim()
+    );
+    assert!(
+        !text.contains("ailed to resume") && !text.contains("paginated model context"),
+        "the re-seated paginated thread did not resume:\n{text}"
+    );
+    let after = fs::read(&placed).unwrap();
+    assert!(
+        after.len() > plain_rollout.len() && after.starts_with(plain_rollout.as_bytes()),
+        "Codex did not open the thread (no append to its rollout):\n{text}"
+    );
+    let (ok, stdout, _) = world.reseat(&["--check", "--sessions-only", "--no-claude"]);
+    assert!(ok, "{stdout}");
+    assert!(stdout.contains("\"continued\":1"), "{stdout}");
+    assert!(exited, "codex did not leave; left running, not signalled");
 }

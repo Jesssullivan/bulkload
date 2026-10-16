@@ -195,6 +195,69 @@ impl FieldScanner {
     }
 }
 
+/// The string value at the object key path `path` (`["payload", "cwd"]`)
+/// in one JSON line, or `None` when there is none (or it is not a
+/// string). Keys are compared as written, unescaped values returned.
+#[must_use]
+pub fn nested_string(line: &[u8], path: &[&str]) -> Option<String> {
+    // One entry per open container: (is an object, its current key, a key
+    // is expected next).
+    let mut stack: Vec<(bool, Vec<u8>, bool)> = Vec::new();
+    let mut at = 0;
+    while let Some(&byte) = line.get(at) {
+        match byte {
+            b'{' => stack.push((true, Vec::new(), true)),
+            b'[' => stack.push((false, Vec::new(), false)),
+            b'}' | b']' => {
+                stack.pop();
+            }
+            b',' => {
+                if let Some(top) = stack.last_mut().filter(|top| top.0) {
+                    top.2 = true;
+                }
+            }
+            b':' => {
+                if let Some(top) = stack.last_mut().filter(|top| top.0) {
+                    top.2 = false;
+                }
+            }
+            b'"' => {
+                let start = at + 1;
+                let mut end = start;
+                let mut escape = false;
+                while let Some(&inner) = line.get(end) {
+                    if escape {
+                        escape = false;
+                    } else if inner == b'\\' {
+                        escape = true;
+                    } else if inner == b'"' {
+                        break;
+                    }
+                    end += 1;
+                }
+                let raw = line.get(start..end)?;
+                let at_key = stack.last().is_some_and(|top| top.0 && top.2);
+                if at_key {
+                    if let Some(top) = stack.last_mut() {
+                        top.1 = raw.to_vec();
+                    }
+                } else if stack.len() == path.len()
+                    && stack
+                        .iter()
+                        .zip(path)
+                        .all(|((object, key, _), want)| *object && key == want.as_bytes())
+                {
+                    return unescape(raw);
+                }
+                at = end;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
 /// A JSON string's raw bytes (between the quotes) decoded, or `None` for a
 /// malformed escape or invalid UTF-8.
 fn unescape(raw: &[u8]) -> Option<String> {
@@ -273,6 +336,20 @@ mod tests {
         assert_eq!(scanner.get(0), Some("/Users/jess/git/lab"));
         assert_eq!(scanner.get(1), Some("quiet-\u{e9}-seal\u{1f600}"));
         assert!(scanner.complete());
+    }
+
+    #[test]
+    fn nested_string_finds_a_key_path() {
+        let line = br#"{"type":"session_meta","payload":{"base":{"text":"x \"cwd\":\"/no\""},"list":[{"cwd":"/no"}],"cwd":"/Users/jess/git/lab","id":"t"}}"#;
+        assert_eq!(
+            super::nested_string(line, &["payload", "cwd"]).as_deref(),
+            Some("/Users/jess/git/lab")
+        );
+        assert_eq!(super::nested_string(line, &["cwd"]), None);
+        assert_eq!(
+            super::nested_string(b"{\"payload\":{\"cwd\":1}}", &["payload", "cwd"]),
+            None
+        );
     }
 
     #[test]

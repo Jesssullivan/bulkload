@@ -3,17 +3,22 @@
 //! `synchronous=FULL`, `io::durable::configure_sqlite`).
 //!
 //! - `placement`: one row per destination file a pass placed, adopted or
-//!   kept, keyed by its destination path. It holds the landed file's
-//!   identity at the last pass (so an unchanged landed file is never read
-//!   again, S3), the destination file's identity after bulkload's last
-//!   write (so a destination resume is seen without reading it), the bytes
-//!   placed and two window digests over them (so a grown transcript is
-//!   proven to extend them by reading only the windows, R25), and an
-//!   intent while an extension or a supersede is in flight.
+//!   kept, keyed by its destination path, naming the one landed file it
+//!   belongs to. It holds the landed file's identity at the last pass (so
+//!   an unchanged landed file is never read again, S3), the destination
+//!   file's identity after bulkload's last write (so a destination resume
+//!   is seen without reading it), the bytes placed and the BLAKE3 of all of
+//!   them (so a grown landed file is proven to extend them, byte for byte,
+//!   before its tail is appended), and an intent while an extension or a
+//!   supersede is in flight (a supersede's intent holds the staged file's
+//!   whole identity).
 //! - `session`: one row per session or thread: its recorded working
 //!   directory, its lane, its destination key and its plan slug.
 //! - `thread_row`: one row per Codex thread row this ledger registered or
 //!   adopted in a destination index.
+//! - `snapshot`, `snapshot_thread`: the landed Codex snapshot's identity
+//!   and its threads' identity columns, so a pass over an unchanged
+//!   snapshot does not open it (S3).
 //! - `pass`: one row per pass.
 //!
 //! A row is committed only after the bytes it describes are durable at the
@@ -28,6 +33,10 @@ use crate::{BulkloadRefusal, Result};
 
 /// The ledger file inside STATE.
 pub const FILE: &str = "reseat.sqlite";
+/// The ledger's schema version (`PRAGMA user_version`). Version 1 (the
+/// first build, `550396c`: window digests, inode-only supersede intents)
+/// is refused, never read as this one.
+const VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS placement(
@@ -41,8 +50,8 @@ CREATE TABLE IF NOT EXISTS placement(
     d_dev INTEGER NOT NULL, d_ino INTEGER NOT NULL,
     d_size INTEGER NOT NULL, d_mtime INTEGER NOT NULL,
     placed INTEGER NOT NULL,
-    head BLOB, tail BLOB, digest BLOB,
-    intent TEXT, intent_size INTEGER, intent_ino INTEGER,
+    digest BLOB,
+    intent TEXT, i_dev INTEGER, i_ino INTEGER, i_size INTEGER, i_mtime INTEGER,
     pass INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS session(
@@ -56,11 +65,17 @@ CREATE TABLE IF NOT EXISTS thread_row(
     id TEXT PRIMARY KEY, db BLOB NOT NULL, cwd TEXT NOT NULL,
     rollout BLOB NOT NULL, state TEXT NOT NULL, pass INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS snapshot(
+    path BLOB PRIMARY KEY,
+    dev INTEGER NOT NULL, ino INTEGER NOT NULL, size INTEGER NOT NULL, mtime INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS snapshot_thread(
+    ord INTEGER NOT NULL, id TEXT PRIMARY KEY, rollout TEXT NOT NULL, cwd TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pass(
     pass INTEGER PRIMARY KEY, started_ns INTEGER NOT NULL, mode TEXT NOT NULL
 );
 ";
-
 /// A file's identity: what a pass compares instead of reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Identity {
@@ -141,11 +156,13 @@ impl State {
 /// An extension or supersede in flight.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Intent {
-    /// Appending landed bytes to the destination file from `placed` up to
-    /// this size.
-    Extend(u64),
-    /// Exchanging in a staged file with this inode.
-    Supersede(u64),
+    /// Appending landed bytes, whole lines, to the destination file after
+    /// `placed`.
+    Extend,
+    /// Exchanging in a staged file with this identity (device, inode, size
+    /// and modification time: a staged file edited in place after the
+    /// exchange is not the staged file any more).
+    Supersede(Identity),
 }
 
 /// One placement row.
@@ -160,8 +177,7 @@ pub struct Placement {
     pub placed_identity: Identity,
     /// Landed bytes the destination file holds (for an owned row).
     pub placed: u64,
-    pub head: Option<[u8; 32]>,
-    pub tail: Option<[u8; 32]>,
+    /// BLAKE3 of those `placed` bytes (for an owned row).
     pub digest: Option<[u8; 32]>,
     pub intent: Option<Intent>,
 }
@@ -216,7 +232,8 @@ impl Ledger {
     ///
     /// # Errors
     /// The I/O refusal of creating `state`; `SQLITE_STATE_CHANGED` when the
-    /// store cannot be opened or configured.
+    /// store cannot be opened or configured; `SCHEMA_MISMATCH` for a ledger
+    /// of another version (the first build's is not read as this one).
     pub fn open(state: &Path, now_ns: i64, mode: &str) -> Result<Self> {
         use crate::refuse::RefuseAt as _;
         use std::os::unix::fs::DirBuilderExt as _;
@@ -228,7 +245,17 @@ impl Ledger {
         let conn = sql(Connection::open(state.join(FILE)))?;
         crate::io::durable::configure_sqlite(&conn)?;
         sql(conn.busy_timeout(std::time::Duration::from_secs(30)))?;
+        let version: i64 = sql(conn.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
+        let tables: i64 = sql(conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+            [],
+            |row| row.get(0),
+        ))?;
+        if version != VERSION && (version != 0 || tables != 0) {
+            return Err(BulkloadRefusal::SchemaMismatch);
+        }
         sql(conn.execute_batch(SCHEMA))?;
+        sql(conn.execute_batch(&format!("PRAGMA user_version = {VERSION}")))?;
         sql(conn.execute(
             "INSERT INTO pass(started_ns, mode) VALUES (?1, ?2)",
             params![now_ns, mode],
@@ -245,7 +272,8 @@ impl Ledger {
     /// is none.
     ///
     /// # Errors
-    /// `SQLITE_STATE_CHANGED` when it exists and cannot be read.
+    /// `SQLITE_STATE_CHANGED` when it exists and cannot be read;
+    /// `SCHEMA_MISMATCH` for a ledger of another version.
     pub fn open_read_only(state: &Path) -> Result<Option<Self>> {
         let path = state.join(FILE);
         if !path.is_file() {
@@ -255,6 +283,10 @@ impl Ledger {
             &path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ))?;
+        let version: i64 = sql(conn.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
+        if version != VERSION {
+            return Err(BulkloadRefusal::SchemaMismatch);
+        }
         Ok(Some(Self {
             conn,
             pass: 0,
@@ -278,8 +310,8 @@ impl Ledger {
             .conn
             .query_row(
                 "SELECT landing, kind, session, state, l_dev, l_ino, l_size, l_mtime,
-                        d_dev, d_ino, d_size, d_mtime, placed, head, tail, digest,
-                        intent, intent_size, intent_ino
+                        d_dev, d_ino, d_size, d_mtime, placed, digest,
+                        intent, i_dev, i_ino, i_size, i_mtime
                  FROM placement WHERE dest = ?1",
                 params![blob(dest)],
                 |row| {
@@ -299,28 +331,37 @@ impl Ledger {
                             row.get::<_, i64>(11)?,
                             row.get::<_, i64>(12)?,
                         ],
+                        row.get::<_, Option<Vec<u8>>>(13)?,
                         (
-                            row.get::<_, Option<Vec<u8>>>(13)?,
-                            row.get::<_, Option<Vec<u8>>>(14)?,
-                            row.get::<_, Option<Vec<u8>>>(15)?,
-                        ),
-                        (
-                            row.get::<_, Option<String>>(16)?,
-                            row.get::<_, Option<i64>>(17)?,
-                            row.get::<_, Option<i64>>(18)?,
+                            row.get::<_, Option<String>>(14)?,
+                            [
+                                row.get::<_, Option<i64>>(15)?,
+                                row.get::<_, Option<i64>>(16)?,
+                                row.get::<_, Option<i64>>(17)?,
+                                row.get::<_, Option<i64>>(18)?,
+                            ],
                         ),
                     ))
                 },
             )
             .optional())?;
-        let Some((landing, kind, session, state, numbers, digests, intent)) = row else {
+        let Some((landing, kind, session, state, numbers, stored_digest, intent)) = row else {
             return Ok(None);
         };
         let [l_dev, l_ino, l_size, l_mtime, d_dev, d_ino, d_size, d_mtime, placed] = numbers;
         let intent = match intent {
-            (Some(word), Some(size), _) if word == "extend" => Some(Intent::Extend(uint(size))),
-            (Some(word), _, Some(ino)) if word == "supersede" => Some(Intent::Supersede(uint(ino))),
-            (None, _, _) => None,
+            (Some(word), _) if word == "extend" => Some(Intent::Extend),
+            (Some(word), [Some(dev), Some(ino), Some(size), Some(mtime)])
+                if word == "supersede" =>
+            {
+                Some(Intent::Supersede(Identity {
+                    dev: uint(dev),
+                    ino: uint(ino),
+                    size: uint(size),
+                    mtime,
+                }))
+            }
+            (None, _) => None,
             _ => return Err(BulkloadRefusal::SchemaMismatch),
         };
         Ok(Some(Placement {
@@ -342,9 +383,7 @@ impl Ledger {
                 mtime: d_mtime,
             },
             placed: uint(placed),
-            head: digest(digests.0),
-            tail: digest(digests.1),
-            digest: digest(digests.2),
+            digest: digest(stored_digest),
             intent,
         }))
     }
@@ -354,16 +393,16 @@ impl Ledger {
     /// # Errors
     /// `SQLITE_STATE_CHANGED` on a failed commit.
     pub fn put(&self, row: &Placement) -> Result<()> {
-        let (intent, size, ino) = match row.intent {
-            None => (None, None, None),
-            Some(Intent::Extend(size)) => (Some("extend"), Some(int(size)), None),
-            Some(Intent::Supersede(ino)) => (Some("supersede"), None, Some(int(ino))),
+        let (intent, staged) = match row.intent {
+            None => (None, None),
+            Some(Intent::Extend) => (Some("extend"), None),
+            Some(Intent::Supersede(staged)) => (Some("supersede"), Some(staged)),
         };
         let started = std::time::Instant::now();
         let outcome = self.conn.execute(
             "INSERT OR REPLACE INTO placement(dest, landing, kind, session, state,
                 l_dev, l_ino, l_size, l_mtime, d_dev, d_ino, d_size, d_mtime, placed,
-                head, tail, digest, intent, intent_size, intent_ino, pass)
+                digest, intent, i_dev, i_ino, i_size, i_mtime, pass)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
                      ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
@@ -381,12 +420,12 @@ impl Ledger {
                 int(row.placed_identity.size),
                 row.placed_identity.mtime,
                 int(row.placed),
-                row.head.as_ref().map(<[u8; 32]>::as_slice),
-                row.tail.as_ref().map(<[u8; 32]>::as_slice),
                 row.digest.as_ref().map(<[u8; 32]>::as_slice),
                 intent,
-                size,
-                ino,
+                staged.map(|staged| int(staged.dev)),
+                staged.map(|staged| int(staged.ino)),
+                staged.map(|staged| int(staged.size)),
+                staged.map(|staged| staged.mtime),
                 self.pass,
             ],
         );
@@ -487,6 +526,82 @@ impl Ledger {
                     params![id, blob(db), cwd, blob(rollout), state, self.pass],
                 )?;
             }
+            transaction.commit()
+        })();
+        crate::counters::sqlite_commit(
+            crate::counters::Counter::SqliteGroupDest,
+            started,
+            &outcome,
+        );
+        sql(outcome)
+    }
+
+    /// The threads cached for the landed snapshot at `path` when its
+    /// identity is still `identity`: `(id, rollout, cwd)`, oldest first.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn snapshot_threads(
+        &self,
+        path: &Path,
+        identity: Identity,
+    ) -> Result<Option<Vec<(String, String, String)>>> {
+        let cached: Option<[i64; 4]> = sql(self
+            .conn
+            .query_row(
+                "SELECT dev, ino, size, mtime FROM snapshot WHERE path = ?1",
+                params![blob(path)],
+                |row| Ok([row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?]),
+            )
+            .optional())?;
+        let Some([dev, ino, size, mtime]) = cached else {
+            return Ok(None);
+        };
+        if (uint(dev), uint(ino), uint(size), mtime)
+            != (identity.dev, identity.ino, identity.size, identity.mtime)
+        {
+            return Ok(None);
+        }
+        let mut statement = sql(self
+            .conn
+            .prepare("SELECT id, rollout, cwd FROM snapshot_thread ORDER BY ord"))?;
+        let rows = sql(statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))))?;
+        sql(rows.collect::<rusqlite::Result<Vec<_>>>()).map(Some)
+    }
+
+    /// Replace the cached threads of the landed snapshot (one snapshot per
+    /// ledger), in one commit.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn put_snapshot_threads(
+        &mut self,
+        path: &Path,
+        identity: Identity,
+        threads: &[(String, String, String)],
+    ) -> Result<()> {
+        let started = std::time::Instant::now();
+        let outcome = (|| {
+            let transaction = self.conn.transaction()?;
+            transaction.execute("DELETE FROM snapshot", [])?;
+            transaction.execute("DELETE FROM snapshot_thread", [])?;
+            for (ord, (id, rollout, cwd)) in threads.iter().enumerate() {
+                transaction.execute(
+                    "INSERT OR REPLACE INTO snapshot_thread(ord, id, rollout, cwd)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![i64::try_from(ord).unwrap_or(i64::MAX), id, rollout, cwd],
+                )?;
+            }
+            transaction.execute(
+                "INSERT INTO snapshot(path, dev, ino, size, mtime) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    blob(path),
+                    int(identity.dev),
+                    int(identity.ino),
+                    int(identity.size),
+                    identity.mtime
+                ],
+            )?;
             transaction.commit()
         })();
         crate::counters::sqlite_commit(

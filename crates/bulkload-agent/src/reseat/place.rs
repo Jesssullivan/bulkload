@@ -1,8 +1,20 @@
 //! One file's placement into the destination's live agent state (R0,
 //! TIN-6587): the never-overwrite rules, the ledger and the crash points.
 //!
-//! For a destination path `D` and its landed file `L`:
+//! For a destination path `D` and its landed file `L` (a `.jsonl.zst`
+//! rollout is read as its decompressed stream, and `D` is then the plain
+//! `.jsonl`):
 //!
+//! - **One landed file per destination path.** A row names the landed
+//!   file it belongs to; another landed file for the same `D` (two source
+//!   keys mapped onto one destination key) is a collision
+//!   (`RESEAT_LANE_COLLISION`), never a supersede. A rollout whose landed
+//!   form changed (`.jsonl` ↔ `.jsonl.zst`) is the same stream.
+//! - **Whole lines.** A `.jsonl` file is placed and extended only up to the
+//!   last newline of the landed bytes: a line the source was still writing
+//!   is held back until it is whole, so the destination never ends inside
+//!   a record that a destination resume would append to. Every write of an
+//!   extension is whole lines.
 //! - **`D` absent**: copy `L` into a temporary beside `D`
 //!   (`.<name>.bulkload-reseat`), give it `L`'s mode and modification time
 //!   (Claude Code's `--continue` takes the newest file), seal it, publish it
@@ -18,20 +30,25 @@
 //!   (`DESTINATION_OCCUPIED`).
 //! - **`D` holds this ledger's bytes**: unchanged identities read nothing
 //!   (S3). A grown append-only `L` is proven to extend the placed bytes by
-//!   the two window digests the row keeps (the first and last 64 KiB of
-//!   them, R25), and only its new tail is read and appended
-//!   (`O_APPEND`, so a concurrent destination writer is never overwritten),
-//!   under an intent row a crash resumes from. A changed file that is not
-//!   append-only (a plan, a memory note) supersedes the placement through an
-//!   atomic exchange, checked afterwards: a displaced file that is not this
-//!   ledger's placement is exchanged back.
+//!   the BLAKE3 of all of them (a change anywhere in them is
+//!   `RESEAT_SOURCE_REWRITTEN`, never a hybrid), and its new tail is
+//!   appended (`O_APPEND`) under an intent row a crash resumes from. Before
+//!   every write the destination's size is checked against what this pass
+//!   wrote: a destination writer appending beside it (a session resumed
+//!   there) stops the extension (`RESEAT_EXTEND_RACED`), its lines whole,
+//!   the file the destination's from then on, its modification time not
+//!   reset. A changed file that is not append-only (a plan, a memory note)
+//!   supersedes the placement through an atomic exchange, checked
+//!   afterwards against the staged file's whole identity: a displaced file
+//!   that is not this ledger's placement is exchanged back, and a staged
+//!   file edited in place since is the destination's.
 //! - **`D` changed since bulkload's last write** (a session resumed there):
 //!   the destination owns it from then on (`RESEAT_DEST_CONTINUED`); it is
 //!   never extended again, and newer landed bytes stay in the landing.
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::{Read, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
@@ -43,12 +60,10 @@ use crate::counters::{self, Counter};
 use crate::refuse::RefuseAt as _;
 use crate::{BulkloadRefusal, Result};
 
-/// Bytes per read and write.
+/// Bytes per read.
 const CHUNK: usize = 1024 * 1024;
-/// [`CHUNK`] as a file offset.
-const CHUNK_BYTES: u64 = 1024 * 1024;
-/// The window a row keeps a digest of at each end of the placed bytes.
-pub const WINDOW: u64 = 64 * 1024;
+/// The longest line held in memory to be written whole.
+const LINE_LIMIT: usize = 512 * 1024 * 1024;
 /// The temporary's suffix; nothing else names a file this way.
 const TEMP_SUFFIX: &str = ".bulkload-reseat";
 
@@ -63,7 +78,7 @@ pub enum Outcome {
     Extended,
     /// A changed file that is not append-only: exchanged in.
     Superseded,
-    /// This ledger's placement, with nothing new: nothing read.
+    /// This ledger's placement, with nothing new: nothing written.
     Unchanged,
     /// The destination holds different bytes: kept.
     Diverged,
@@ -81,9 +96,18 @@ pub enum Outcome {
     Rewritten,
     /// The landed file is not a regular file.
     LandingNotRegular,
+    /// The landed file cannot be read as its form (a corrupt `.zst`).
+    Unreadable,
     /// The destination file system has no atomic exchange for a
     /// supersede.
     ExchangeUnsupported,
+    /// Another landed file already owns this destination path.
+    Collision,
+    /// A destination writer appended while this pass extended the file:
+    /// stopped, lines whole, the destination's from then on.
+    Raced,
+    /// A `.jsonl` with no complete line yet: nothing placed.
+    Held,
 }
 
 impl Outcome {
@@ -104,7 +128,11 @@ impl Outcome {
             Self::Occupied => "occupied",
             Self::Rewritten => "source-rewritten",
             Self::LandingNotRegular => "landing-not-regular",
+            Self::Unreadable => "unreadable-form",
             Self::ExchangeUnsupported => "exchange-unsupported",
+            Self::Collision => "collision",
+            Self::Raced => "extend-raced",
+            Self::Held => "held",
         }
     }
 
@@ -121,34 +149,71 @@ impl Outcome {
     #[must_use]
     pub const fn refusal(self) -> Option<BulkloadRefusal> {
         match self {
-            Self::Placed | Self::Adopted | Self::Extended | Self::Superseded | Self::Unchanged => {
-                None
-            }
+            Self::Placed
+            | Self::Adopted
+            | Self::Extended
+            | Self::Superseded
+            | Self::Unchanged
+            | Self::Held => None,
             Self::Diverged => Some(BulkloadRefusal::ReseatDestDiverged),
             Self::DestAhead | Self::Continued { .. } | Self::Removed => {
                 Some(BulkloadRefusal::ReseatDestContinued)
             }
             Self::Occupied => Some(BulkloadRefusal::DestinationOccupied),
             Self::Rewritten => Some(BulkloadRefusal::ReseatSourceRewritten),
-            Self::LandingNotRegular => Some(BulkloadRefusal::ReseatUnreadableForm),
+            Self::LandingNotRegular | Self::Unreadable => {
+                Some(BulkloadRefusal::ReseatUnreadableForm)
+            }
             Self::ExchangeUnsupported => Some(BulkloadRefusal::DestinationExchangeUnsupported),
+            Self::Collision => Some(BulkloadRefusal::ReseatLaneCollision),
+            Self::Raced => Some(BulkloadRefusal::ReseatExtendRaced),
         }
     }
 }
 
 /// A placement's result: its outcome and, when asked, what the scanner saw
-/// in the landed bytes this pass read.
+/// in the landed bytes this pass placed or proved.
 pub struct Placed {
     pub outcome: Outcome,
     pub scanner: Option<FieldScanner>,
 }
 
 /// Whether a file at `path` is append-only: a transcript, a subagent
-/// transcript, a debug log or a tool result.
+/// transcript, a rollout, a debug log or a tool result.
 #[must_use]
 pub fn appendable(path: &Path) -> bool {
     path.extension()
         .is_some_and(|extension| extension == "jsonl" || extension == "txt")
+}
+
+/// Whether a file at `path` is JSON Lines: placed and extended in whole
+/// lines only.
+#[must_use]
+pub fn line_ruled(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|extension| extension == "jsonl")
+}
+
+/// Whether a landed path is a zstd-compressed stream.
+#[must_use]
+pub fn compressed(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "zst")
+}
+
+/// `path` without a `.zst` suffix.
+#[must_use]
+pub fn plain(path: &Path) -> PathBuf {
+    if compressed(path) {
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// Whether two landed paths name one stream (equal, or one form of the
+/// other).
+fn same_stream(a: &Path, b: &Path) -> bool {
+    a == b || plain(a) == plain(b)
 }
 
 /// Places files under one canonical destination root.
@@ -157,103 +222,225 @@ pub struct Placer<'a> {
     pub root: &'a Path,
 }
 
+/// The landed file's bytes, from offset 0 to its identity's size, through
+/// `pread` (so the landing is never read past what it was when opened).
+struct Raw<'a> {
+    file: &'a File,
+    at: u64,
+    end: u64,
+}
+
+impl Read for Raw<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.end.saturating_sub(self.at);
+        let want = usize::try_from(left.min(buffer.len() as u64)).unwrap_or(0);
+        let Some(target) = buffer.get_mut(..want) else {
+            return Ok(0);
+        };
+        if target.is_empty() {
+            return Ok(0);
+        }
+        let read = self.file.read_at(target, self.at)?;
+        if read == 0 {
+            // The landed file shrank since it was opened.
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        counters::add_len(Counter::ReseatLandingRead, read);
+        self.at += read as u64;
+        Ok(read)
+    }
+}
+
 /// A landed file opened for this pass, with its identity.
-struct Landing {
+pub struct Landing {
     file: File,
     meta: std::fs::Metadata,
     identity: Identity,
+    compressed: bool,
 }
 
 impl Landing {
-    fn open(path: &Path) -> Result<Self> {
+    /// Open the landed file at `path`.
+    ///
+    /// # Errors
+    /// The I/O refusal of opening it.
+    pub fn open(path: &Path) -> Result<Self> {
         let file = crate::hash::open_nofollow(path)?;
         let meta = file.metadata().refuse_at("reseat::place::landing")?;
         Ok(Self {
             identity: Identity::of(&meta),
             file,
             meta,
+            compressed: compressed(path),
         })
     }
 
-    fn read_at(&self, offset: u64, length: u64) -> Result<Vec<u8>> {
-        let mut bytes =
-            vec![0_u8; usize::try_from(length).map_err(|_| BulkloadRefusal::BudgetExceeded)?];
-        self.file
-            .read_exact_at(&mut bytes, offset)
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::UnexpectedEof => BulkloadRefusal::SourceChangedAfterSnapshot,
-                _ => crate::refuse::io(&error, "reseat::place::read_at"),
-            })?;
-        counters::add_len(Counter::ReseatLandingRead, bytes.len());
-        Ok(bytes)
-    }
-}
-
-/// The digests of the first and last [`WINDOW`] bytes of `size` bytes,
-/// and the last window's bytes.
-fn windows(
-    read: &dyn Fn(u64, u64) -> Result<Vec<u8>>,
-    size: u64,
-) -> Result<([u8; 32], [u8; 32], Vec<u8>)> {
-    let span = size.min(WINDOW);
-    let head = read(0, span)?;
-    let tail = if size <= WINDOW {
-        head.clone()
-    } else {
-        read(size - span, span)?
-    };
-    Ok((
-        counters::hash(Counter::HashOther, &head),
-        counters::hash(Counter::HashOther, &tail),
-        tail,
-    ))
-}
-
-/// The running digests of bytes streamed into a placement.
-struct Stream {
-    full: Option<blake3::Hasher>,
-    head: Vec<u8>,
-    tail: Vec<u8>,
-    window: usize,
-}
-
-impl Stream {
-    fn new(full: bool, head: Vec<u8>, tail: Vec<u8>) -> Self {
-        Self {
-            full: full.then(blake3::Hasher::new),
-            head,
-            tail,
-            window: usize::try_from(WINDOW).unwrap_or(usize::MAX),
-        }
+    /// Its identity.
+    #[must_use]
+    pub const fn identity(&self) -> Identity {
+        self.identity
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
-        if let Some(full) = self.full.as_mut() {
-            counters::update(full, Counter::HashOther, bytes);
-        }
-        if self.head.len() < self.window {
-            let take = (self.window - self.head.len()).min(bytes.len());
-            self.head
-                .extend_from_slice(bytes.get(..take).unwrap_or_default());
-        }
-        if bytes.len() >= self.window {
-            self.tail.clear();
-            self.tail
-                .extend_from_slice(bytes.get(bytes.len() - self.window..).unwrap_or_default());
+    /// A sequential reader of its content (decompressed for a `.zst`),
+    /// from the start.
+    ///
+    /// # Errors
+    /// The refusal of starting the decoder.
+    pub fn reader(&self) -> Result<Box<dyn Read + '_>> {
+        let raw = Raw {
+            file: &self.file,
+            at: 0,
+            end: self.identity.size,
+        };
+        if self.compressed {
+            let decoder = zstd::stream::read::Decoder::new(raw)
+                .map_err(|_| BulkloadRefusal::ReseatUnreadableForm)?;
+            Ok(Box::new(decoder))
         } else {
-            self.tail.extend_from_slice(bytes);
-            let excess = self.tail.len().saturating_sub(self.window);
-            self.tail.drain(..excess);
+            Ok(Box::new(raw))
         }
     }
 
-    fn finish(self) -> (Option<[u8; 32]>, [u8; 32], [u8; 32]) {
-        (
-            self.full.map(|full| *full.finalize().as_bytes()),
-            counters::hash(Counter::HashOther, &self.head),
-            counters::hash(Counter::HashOther, &self.tail),
-        )
+    fn read_error(&self, error: &std::io::Error, at: &'static str) -> BulkloadRefusal {
+        if self.compressed && error.kind() != std::io::ErrorKind::UnexpectedEof {
+            return BulkloadRefusal::ReseatUnreadableForm;
+        }
+        match error.kind() {
+            std::io::ErrorKind::UnexpectedEof => BulkloadRefusal::SourceChangedAfterSnapshot,
+            _ => crate::refuse::io(error, at),
+        }
     }
+}
+
+/// Read up to `buffer.len()` bytes, retrying interruptions.
+fn fill(
+    landing: &Landing,
+    reader: &mut dyn Read,
+    buffer: &mut [u8],
+    at: &'static str,
+) -> Result<usize> {
+    loop {
+        match reader.read(buffer) {
+            Ok(read) => return Ok(read),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(landing.read_error(&error, at)),
+        }
+    }
+}
+
+/// What [`read_exact_hash`] found.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prefixed {
+    /// The content has the bytes; the last of them (none for 0 bytes).
+    Read(Option<u8>),
+    /// The content is shorter.
+    Short,
+}
+
+/// Read exactly `length` content bytes into `hasher` (and `scanner`).
+fn read_exact_hash(
+    landing: &Landing,
+    reader: &mut dyn Read,
+    length: u64,
+    hasher: &mut blake3::Hasher,
+    mut scanner: Option<&mut FieldScanner>,
+) -> Result<Prefixed> {
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut left = length;
+    let mut last = None;
+    while left > 0 {
+        let want = usize::try_from(left.min(CHUNK as u64)).unwrap_or(CHUNK);
+        let chunk = buffer
+            .get_mut(..want)
+            .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+        let read = fill(landing, reader, chunk, "reseat::place::prove")?;
+        if read == 0 {
+            return Ok(Prefixed::Short);
+        }
+        let bytes = chunk.get(..read).unwrap_or_default();
+        counters::update(hasher, Counter::HashOther, bytes);
+        if let Some(scanner) = scanner.as_deref_mut() {
+            if !scanner.complete() {
+                scanner.feed(bytes);
+            }
+        }
+        last = bytes.last().copied();
+        left -= read as u64;
+    }
+    Ok(Prefixed::Read(last))
+}
+
+/// Whether the reader has another byte; it is handed back as the first of
+/// the rest.
+fn peek(landing: &Landing, reader: &mut dyn Read) -> Result<Option<u8>> {
+    let mut one = [0_u8; 1];
+    Ok((fill(landing, reader, &mut one, "reseat::place::peek")? == 1).then_some(one[0]))
+}
+
+/// What [`pump`] did.
+struct Pumped {
+    /// Bytes handed to the writer.
+    written: u64,
+    /// Bytes read and held back: a line not yet whole.
+    held: u64,
+    /// The writer asked to stop.
+    stopped: bool,
+}
+
+/// Read `reader` to its end, handing `write` whole lines (every byte when
+/// not `lines`), hashing and scanning what it hands. `write` returns
+/// `false` to stop.
+fn pump(
+    landing: &Landing,
+    reader: &mut dyn Read,
+    lines: bool,
+    hasher: &mut blake3::Hasher,
+    mut scanner: Option<&mut FieldScanner>,
+    write: &mut dyn FnMut(&[u8]) -> Result<bool>,
+) -> Result<Pumped> {
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut carry: Vec<u8> = Vec::new();
+    let mut pumped = Pumped {
+        written: 0,
+        held: 0,
+        stopped: false,
+    };
+    loop {
+        let read = fill(landing, reader, &mut buffer, "reseat::place::pump")?;
+        if read == 0 {
+            break;
+        }
+        let chunk = buffer.get(..read).unwrap_or_default();
+        let ready: &[u8] = if lines {
+            carry.extend_from_slice(chunk);
+            let Some(end) = carry.iter().rposition(|byte| *byte == b'\n') else {
+                if carry.len() > LINE_LIMIT {
+                    return Err(BulkloadRefusal::BudgetExceeded);
+                }
+                continue;
+            };
+            carry.get(..=end).unwrap_or_default()
+        } else {
+            chunk
+        };
+        if !write(ready)? {
+            pumped.stopped = true;
+            break;
+        }
+        counters::update(hasher, Counter::HashOther, ready);
+        if let Some(scanner) = scanner.as_deref_mut() {
+            if !scanner.complete() {
+                scanner.feed(ready);
+            }
+        }
+        pumped.written += ready.len() as u64;
+        if lines {
+            let done = ready.len();
+            carry.drain(..done);
+        }
+    }
+    pumped.held = carry.len() as u64;
+    Ok(pumped)
 }
 
 fn lstat(path: &Path) -> Result<Option<std::fs::Metadata>> {
@@ -262,6 +449,10 @@ fn lstat(path: &Path) -> Result<Option<std::fs::Metadata>> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).refuse_at("reseat::place::lstat"),
     }
+}
+
+fn identity_at(path: &Path) -> Result<Option<Identity>> {
+    Ok(lstat(path)?.map(|meta| Identity::of(&meta)))
 }
 
 fn open_dir(path: &Path) -> Result<File> {
@@ -283,89 +474,58 @@ fn temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
     temp
 }
 
-/// Copy `length` bytes of `from` (from its current offset) to `to`,
-/// through `stream` and `scanner`.
-fn copy(
-    from: &File,
-    to: &mut File,
-    length: u64,
-    stream: &mut Stream,
-    scanner: Option<&mut FieldScanner>,
-    mid: bool,
-) -> Result<()> {
-    let mut scanner = scanner;
-    let mut reader = from;
-    let mut left = length;
-    let mut buffer = vec![0_u8; CHUNK];
-    let mut first = true;
-    while left > 0 {
-        let want = usize::try_from(left.min(CHUNK_BYTES)).unwrap_or(CHUNK);
-        let chunk = buffer
-            .get_mut(..want)
-            .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
-        reader
-            .read_exact(chunk)
-            .map_err(|error| match error.kind() {
-                std::io::ErrorKind::UnexpectedEof => BulkloadRefusal::SourceChangedAfterSnapshot,
-                _ => crate::refuse::io(&error, "reseat::place::copy_read"),
-            })?;
-        counters::add_len(Counter::ReseatLandingRead, want);
-        stream.feed(chunk);
-        if let Some(scanner) = scanner.as_deref_mut() {
-            if !scanner.complete() {
-                scanner.feed(chunk);
-            }
-        }
-        to.write_all(chunk).refuse_at("reseat::place::copy_write")?;
-        counters::add_len(Counter::ReseatDestWrite, want);
-        left = left.saturating_sub(u64::try_from(want).unwrap_or(CHUNK_BYTES));
-        if mid && first {
-            fault_point!(ReseatMidExtend);
-        }
-        first = false;
-    }
-    Ok(())
+/// Compare the next `length` content bytes with `dest`'s bytes from
+/// offset 0, hashing (and scanning) the landed ones.
+enum Prefix {
+    /// Equal for all `length` bytes.
+    Equal,
+    /// Different within them.
+    Diverged,
+    /// The landed content ended first, equal so far: the destination holds
+    /// it and more.
+    LandingShorter,
 }
 
-/// Whether the first `length` bytes of `a` and `b` are equal, read from
-/// offset 0 (`a` landed, `b` destination), and the digest of them.
-fn same_prefix(
-    landing: &File,
+fn compare_prefix(
+    landing: &Landing,
+    reader: &mut dyn Read,
     dest: &File,
     length: u64,
+    hasher: &mut blake3::Hasher,
     mut scanner: Option<&mut FieldScanner>,
-) -> Result<Option<Stream>> {
-    let mut stream = Stream::new(true, Vec::new(), Vec::new());
+) -> Result<Prefix> {
     let mut a = vec![0_u8; CHUNK];
     let mut b = vec![0_u8; CHUNK];
     let mut at = 0_u64;
     while at < length {
-        let want = usize::try_from((length - at).min(CHUNK_BYTES)).unwrap_or(CHUNK);
+        let want = usize::try_from((length - at).min(CHUNK as u64)).unwrap_or(CHUNK);
+        let left = a
+            .get_mut(..want)
+            .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+        let read = fill(landing, reader, left, "reseat::place::compare")?;
+        if read == 0 {
+            return Ok(Prefix::LandingShorter);
+        }
         let (left, right) = (
-            a.get_mut(..want)
-                .ok_or(BulkloadRefusal::ContractSelfInconsistent)?,
-            b.get_mut(..want)
+            left.get(..read).unwrap_or_default(),
+            b.get_mut(..read)
                 .ok_or(BulkloadRefusal::ContractSelfInconsistent)?,
         );
-        landing
-            .read_exact_at(left, at)
-            .refuse_at("reseat::place::same_prefix_landing")?;
-        counters::add_len(Counter::ReseatLandingRead, want);
         dest.read_exact_at(right, at)
-            .refuse_at("reseat::place::same_prefix_dest")?;
-        counters::add_len(Counter::ReseatDestRead, want);
+            .refuse_at("reseat::place::compare_dest")?;
+        counters::add_len(Counter::ReseatDestRead, read);
         if let Some(scanner) = scanner.as_deref_mut() {
             if !scanner.complete() {
                 scanner.feed(left);
             }
         }
         if left != right {
-            return Ok(None);
+            return Ok(Prefix::Diverged);
         }
-        stream.feed(left);
-        at = at.saturating_add(u64::try_from(want).unwrap_or(CHUNK_BYTES));
+        counters::update(hasher, Counter::HashOther, left);
+        at += read as u64;
     }
-    Ok(Some(stream))
+    Ok(Prefix::Equal)
 }
 
 impl Placer<'_> {
@@ -406,12 +566,29 @@ impl Placer<'_> {
     /// Place the landed file `landing` at `rel` under the root.
     ///
     /// `want`: top-level fields to scan for in the landed bytes this pass
-    /// reads (a transcript's `slug`).
+    /// places or proves (a transcript's `slug`).
     ///
     /// # Errors
     /// I/O and ledger refusals; every kept or refused file is an
     /// [`Outcome`], never an error.
     pub fn place(
+        &self,
+        landing: &Path,
+        rel: &Path,
+        kind: Kind,
+        session: &str,
+        want: Option<&'static [&'static str]>,
+    ) -> Result<Placed> {
+        match self.place_inner(landing, rel, kind, session, want) {
+            Err(BulkloadRefusal::ReseatUnreadableForm) => Ok(Placed {
+                outcome: Outcome::Unreadable,
+                scanner: None,
+            }),
+            other => other,
+        }
+    }
+
+    fn place_inner(
         &self,
         landing: &Path,
         rel: &Path,
@@ -439,6 +616,14 @@ impl Placer<'_> {
             Some(meta) if meta.is_file() => {}
             _ => return done(Outcome::LandingNotRegular),
         }
+        let mut row = self.ledger.placement(&dest)?;
+        if row
+            .as_ref()
+            .is_some_and(|row| !same_stream(&row.landing, landing))
+        {
+            // Another landed file owns this destination path.
+            return done(Outcome::Collision);
+        }
         let Some(directory) = self.parent(rel)? else {
             return done(Outcome::Occupied);
         };
@@ -451,8 +636,8 @@ impl Placer<'_> {
             kind,
             session,
             want,
+            lines: line_ruled(&dest),
         };
-        let mut row = self.ledger.placement(&dest)?;
         if let Some(current) = row.as_ref().filter(|row| row.intent.is_some()) {
             row = site.settle_intent(current.clone())?;
         }
@@ -495,6 +680,26 @@ struct Site<'a> {
     kind: Kind,
     session: &'a str,
     want: Option<&'static [&'static str]>,
+    /// JSON Lines: whole lines only.
+    lines: bool,
+}
+
+/// A staged full copy of the landed content.
+struct Staged {
+    file: File,
+    digest: [u8; 32],
+    written: u64,
+    held: u64,
+    scanner: Option<FieldScanner>,
+}
+
+/// How an exchange settled.
+enum Exchanged {
+    /// The staged file is at the destination path and the displaced one
+    /// was this ledger's placement (removed).
+    Ours,
+    /// The destination's file is at the path: handed over.
+    HandedOver,
 }
 
 impl Site<'_> {
@@ -514,8 +719,6 @@ impl Site<'_> {
             landed,
             placed_identity,
             placed,
-            head: None,
-            tail: None,
             digest: None,
             intent: None,
         }
@@ -525,24 +728,24 @@ impl Site<'_> {
         self.dest.with_file_name(temp_name(self.name))
     }
 
+    fn temp_c(&self) -> Result<CString> {
+        c_name(temp_name(self.name).as_os_str())
+    }
+
     /// Remove a temporary a crashed pass left before it published (no
     /// intent names it, so it is a staged copy of a landed file).
     fn clear_temp(&self) -> Result<()> {
-        let temp = self.temp();
-        if lstat(&temp)?.is_some_and(|meta| meta.is_file()) {
-            crate::io::sys::unlinkat(
-                self.directory,
-                &c_name(temp_name(self.name).as_os_str())?,
-                false,
-            )
-            .refuse_at("reseat::place::clear_temp")?;
+        if lstat(&self.temp())?.is_some_and(|meta| meta.is_file()) {
+            crate::io::sys::unlinkat(self.directory, &self.temp_c()?, false)
+                .refuse_at("reseat::place::clear_temp")?;
         }
         Ok(())
     }
 
-    /// Stage a full copy of the landed file in the temporary: written, its
-    /// mode and modification time set, sealed.
-    fn stage(&self, landing: &Landing) -> Result<(File, Stream, Option<FieldScanner>)> {
+    /// Stage a full copy of the landed content (whole lines for JSON
+    /// Lines) in the temporary: written, its mode and modification time
+    /// set, sealed.
+    fn stage(&self, landing: &Landing) -> Result<Staged> {
         self.clear_temp()?;
         let mut temp = OpenOptions::new()
             .write(true)
@@ -552,15 +755,21 @@ impl Site<'_> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(self.temp())
             .map_err(|error| crate::refuse::io_in(&error, self.dest, "reseat::place::stage"))?;
-        let mut stream = Stream::new(true, Vec::new(), Vec::new());
+        let mut hasher = blake3::Hasher::new();
         let mut scanner = self.want.map(FieldScanner::new);
-        copy(
-            &landing.file,
-            &mut temp,
-            landing.identity.size,
-            &mut stream,
+        let mut reader = landing.reader()?;
+        let pumped = pump(
+            landing,
+            &mut reader,
+            self.lines,
+            &mut hasher,
             scanner.as_mut(),
-            false,
+            &mut |bytes| {
+                temp.write_all(bytes)
+                    .refuse_at("reseat::place::stage_write")?;
+                counters::add_len(Counter::ReseatDestWrite, bytes.len());
+                Ok(true)
+            },
         )?;
         temp.set_permissions(std::fs::Permissions::from_mode(
             landing.meta.permissions().mode() & 0o777,
@@ -574,18 +783,45 @@ impl Site<'_> {
         )
         .refuse_at("reseat::place::stage_mtime")?;
         crate::io::durable::seal_file(&temp).refuse_at("reseat::place::stage_seal")?;
-        Ok((temp, stream, scanner))
+        Ok(Staged {
+            file: temp,
+            digest: *hasher.finalize().as_bytes(),
+            written: pumped.written,
+            held: pumped.held,
+            scanner,
+        })
+    }
+
+    /// [`Self::stage`], with an unreadable landing's temporary removed.
+    fn stage_or_clear(&self, landing: &Landing) -> Result<Option<Staged>> {
+        match self.stage(landing) {
+            Ok(staged) => Ok(Some(staged)),
+            Err(BulkloadRefusal::ReseatUnreadableForm) => {
+                self.clear_temp()?;
+                Ok(None)
+            }
+            Err(refusal) => Err(refusal),
+        }
     }
 
     /// `D` absent: stage, publish without replacing, commit.
     fn fresh(&self, landing: &Landing) -> Result<Placed> {
-        let (temp, stream, scanner) = self.stage(landing)?;
+        let Some(staged) = self.stage_or_clear(landing)? else {
+            return Ok(Placed {
+                outcome: Outcome::Unreadable,
+                scanner: None,
+            });
+        };
+        if self.lines && staged.written == 0 && staged.held > 0 {
+            // Not one whole line yet: nothing to place.
+            self.clear_temp()?;
+            return Ok(Placed {
+                outcome: Outcome::Held,
+                scanner: None,
+            });
+        }
         fault_point!(ReseatAfterTempSeal);
-        match crate::io::publish_noreplace(
-            self.directory,
-            &c_name(temp_name(self.name).as_os_str())?,
-            &c_name(self.name)?,
-        ) {
+        match crate::io::publish_noreplace(self.directory, &self.temp_c()?, &c_name(self.name)?) {
             Ok(_) => {}
             Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
                 // Something appeared at the path: leave it, decide again.
@@ -597,23 +833,24 @@ impl Site<'_> {
         }
         crate::io::durable::seal_dir(self.directory).refuse_at("reseat::place::publish_seal")?;
         fault_point!(ReseatAfterPublish);
-        let placed = Identity::of(&temp.metadata().refuse_at("reseat::place::published")?);
-        let (digest, head, tail) = stream.finish();
-        let mut row = self.row(State::Ours, landing.identity, placed, landing.identity.size);
-        row.digest = digest;
-        row.head = Some(head);
-        row.tail = Some(tail);
+        let placed = Identity::of(
+            &staged
+                .file
+                .metadata()
+                .refuse_at("reseat::place::published")?,
+        );
+        let mut row = self.row(State::Ours, landing.identity, placed, staged.written);
+        row.digest = Some(staged.digest);
         self.placer.ledger.put(&row)?;
         Ok(Placed {
             outcome: Outcome::Placed,
-            scanner,
+            scanner: staged.scanner,
         })
     }
 
     /// `D` present with no owned row: adopt, extend a prefix, or keep.
     fn existing(&self, landing: &Landing, meta: &std::fs::Metadata) -> Result<Placed> {
         let observed = Identity::of(meta);
-        let mut scanner = self.want.map(FieldScanner::new);
         let keep = |state: State, outcome: Outcome, scanner| -> Result<Placed> {
             self.placer
                 .ledger
@@ -624,42 +861,49 @@ impl Site<'_> {
             return keep(State::Occupied, Outcome::Occupied, None);
         }
         let dest = crate::hash::open_nofollow(self.dest)?;
-        if observed.size > landing.identity.size {
-            return match same_prefix(
-                &landing.file,
-                &dest,
-                landing.identity.size,
-                scanner.as_mut(),
-            )? {
-                Some(_) => keep(State::Continued, Outcome::DestAhead, scanner),
-                None => keep(State::Diverged, Outcome::Diverged, scanner),
-            };
+        let mut scanner = self.want.map(FieldScanner::new);
+        let mut hasher = blake3::Hasher::new();
+        let mut reader = landing.reader()?;
+        match compare_prefix(
+            landing,
+            &mut reader,
+            &dest,
+            observed.size,
+            &mut hasher,
+            scanner.as_mut(),
+        )? {
+            Prefix::Diverged => return keep(State::Diverged, Outcome::Diverged, scanner),
+            Prefix::LandingShorter => return keep(State::Continued, Outcome::DestAhead, scanner),
+            Prefix::Equal => {}
         }
-        let Some(stream) = same_prefix(&landing.file, &dest, observed.size, scanner.as_mut())?
-        else {
-            return keep(State::Diverged, Outcome::Diverged, scanner);
-        };
-        if observed.size < landing.identity.size && !appendable(self.dest) {
-            return keep(State::Diverged, Outcome::Diverged, scanner);
-        }
-        let (digest, head, tail) = stream.finish();
         let mut row = self.row(State::Adopted, landing.identity, observed, observed.size);
-        row.head = Some(head);
-        row.tail = Some(tail);
-        if observed.size == landing.identity.size {
-            row.digest = digest;
+        row.digest = Some(*hasher.finalize().as_bytes());
+        let Some(first) = peek(landing, &mut reader)? else {
+            // Equal.
             self.placer.ledger.put(&row)?;
             return Ok(Placed {
                 outcome: Outcome::Adopted,
                 scanner,
             });
+        };
+        if !appendable(self.dest) {
+            return keep(State::Diverged, Outcome::Diverged, scanner);
         }
         // A strict prefix: adopted at its size, then extended.
         row.landed = Identity::default();
         self.placer.ledger.put(&row)?;
-        let read = |offset, length| landing.read_at(offset, length);
-        let tail_bytes = windows(&read, observed.size)?.2;
-        self.extend(row, landing, tail_bytes, scanner)
+        let mut rest = std::io::Cursor::new([first]).chain(reader);
+        let mid_line =
+            observed.size > 0 && last_byte(&dest, observed.size)? != Some(b'\n') && self.lines;
+        let placed = self.extend(row, landing, &mut rest, hasher, scanner, mid_line)?;
+        Ok(match placed.outcome {
+            // Nothing whole to append: adopted as it is.
+            Outcome::Unchanged => Placed {
+                outcome: Outcome::Adopted,
+                scanner: placed.scanner,
+            },
+            _ => placed,
+        })
     }
 
     /// `D` is this ledger's: unchanged, extend, supersede, or hand over.
@@ -694,38 +938,52 @@ impl Site<'_> {
         if landing.identity == row.landed {
             return done(Outcome::Unchanged);
         }
-        if !appendable(self.dest) {
-            return self.supersede(row, landing);
-        }
-        let size = landing.identity.size;
-        if size < row.placed {
-            return self.rewritten(row, landing);
-        }
-        let read = |offset, length| landing.read_at(offset, length);
-        let (head, tail, tail_bytes) = windows(&read, row.placed)?;
-        if row.placed > 0 && (Some(head) != row.head || Some(tail) != row.tail) {
-            return self.rewritten(row, landing);
-        }
-        if size == row.placed {
-            // Same length, new stamp: equal bytes keep the row, others are
-            // a rewrite (never overwritten).
-            let dest = crate::hash::open_nofollow(self.dest)?;
-            if same_prefix(&landing.file, &dest, size, None)?.is_none() {
-                return self.rewritten(row, landing);
-            }
+        let unchanged = |row: Placement| -> Result<Placed> {
             self.placer.ledger.put(&Placement {
                 landed: landing.identity,
+                landing: self.landing_path.to_path_buf(),
                 ..row
             })?;
-            return done(Outcome::Unchanged);
+            done(Outcome::Unchanged)
+        };
+        let mut reader = landing.reader()?;
+        let mut hasher = blake3::Hasher::new();
+        if !appendable(self.dest) {
+            // A plan or a memory note: equal bytes keep the row; any change
+            // supersedes it.
+            let whole = read_exact_hash(landing, &mut reader, row.placed, &mut hasher, None)?;
+            if whole != Prefixed::Short
+                && peek(landing, &mut reader)?.is_none()
+                && Some(*hasher.finalize().as_bytes()) == row.digest
+            {
+                return unchanged(row);
+            }
+            return self.supersede(row, landing);
         }
-        self.extend(row, landing, tail_bytes, None)
+        // Every placed byte must still be the landing's, before anything
+        // is appended after them.
+        let Prefixed::Read(last) =
+            read_exact_hash(landing, &mut reader, row.placed, &mut hasher, None)?
+        else {
+            return self.rewritten(row, landing);
+        };
+        if row.digest.is_none() || Some(*hasher.finalize().as_bytes()) != row.digest {
+            return self.rewritten(row, landing);
+        }
+        let Some(first) = peek(landing, &mut reader)? else {
+            return unchanged(row);
+        };
+        let mut rest = std::io::Cursor::new([first]).chain(reader);
+        let mid_line = self.lines && row.placed > 0 && last != Some(b'\n');
+        let scanner = None;
+        self.extend(row, landing, &mut rest, hasher, scanner, mid_line)
     }
 
     fn rewritten(&self, row: Placement, landing: &Landing) -> Result<Placed> {
         self.placer.ledger.put(&Placement {
             state: State::Rewritten,
             landed: landing.identity,
+            landing: self.landing_path.to_path_buf(),
             ..row
         })?;
         Ok(Placed {
@@ -734,19 +992,21 @@ impl Site<'_> {
         })
     }
 
-    /// Append the landed bytes past `row.placed` (an owned row whose
-    /// destination identity was just checked), under an intent.
-    /// `tail_bytes`: the last window of the placed bytes, already proven.
+    /// Append the rest of `reader` (the landed content after `row.placed`,
+    /// proven by `hasher`) in whole lines, under an intent, checking the
+    /// destination's size before every write.
     fn extend(
         &self,
         row: Placement,
         landing: &Landing,
-        tail_bytes: Vec<u8>,
+        reader: &mut dyn Read,
+        mut hasher: blake3::Hasher,
         scanner: Option<FieldScanner>,
+        mid_line: bool,
     ) -> Result<Placed> {
-        let target = landing.identity.size;
         let mut intent = row.clone();
-        intent.intent = Some(Intent::Extend(target));
+        intent.intent = Some(Intent::Extend);
+        intent.landing = self.landing_path.to_path_buf();
         self.placer.ledger.put(&intent)?;
         fault_point!(ReseatAfterExtendIntent);
         let mut dest = OpenOptions::new()
@@ -754,34 +1014,63 @@ impl Site<'_> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(self.dest)
             .refuse_at("reseat::place::extend_open")?;
-        if Identity::of(&dest.metadata().refuse_at("reseat::place::extend_stat")?)
-            != row.placed_identity
-        {
-            return self.hand_over(row, landing);
+        let size_now = |dest: &File| -> Result<Identity> {
+            Ok(Identity::of(
+                &dest.metadata().refuse_at("reseat::place::extend_stat")?,
+            ))
+        };
+        if size_now(&dest)? != row.placed_identity {
+            return self.hand_over(row, landing, Outcome::Continued { both: true });
         }
-        let head = if row.placed < WINDOW {
-            landing.read_at(0, row.placed)?
-        } else {
-            Vec::new()
+        let mut scanner = match (scanner, self.want) {
+            (Some(scanner), _) => Some(scanner),
+            (None, Some(want)) if mid_line => Some(FieldScanner::mid_line(want)),
+            (None, Some(want)) => Some(FieldScanner::new(want)),
+            (None, None) => None,
         };
-        let full_head = row.placed >= WINDOW;
-        let mut stream = Stream::new(false, head, tail_bytes);
-        let mut scanner = match (scanner, self.want, stream.tail.last()) {
-            (Some(scanner), _, _) => Some(scanner),
-            (None, Some(want), Some(b'\n') | None) => Some(FieldScanner::new(want)),
-            (None, Some(want), Some(_)) => Some(FieldScanner::mid_line(want)),
-            (None, None, _) => None,
-        };
-        std::io::Seek::seek(&mut &landing.file, std::io::SeekFrom::Start(row.placed))
-            .refuse_at("reseat::place::extend_seek")?;
-        copy(
-            &landing.file,
-            &mut dest,
-            target - row.placed,
-            &mut stream,
+        let mut expected = row.placed;
+        let mut raced = false;
+        let mut first = true;
+        let pumped = pump(
+            landing,
+            reader,
+            self.lines,
+            &mut hasher,
             scanner.as_mut(),
-            true,
+            &mut |bytes| {
+                // A destination writer appended since this pass's last
+                // write: stop, with every line whole.
+                if size_now(&dest)?.size != expected {
+                    raced = true;
+                    return Ok(false);
+                }
+                dest.write_all(bytes)
+                    .refuse_at("reseat::place::extend_write")?;
+                counters::add_len(Counter::ReseatDestWrite, bytes.len());
+                expected += bytes.len() as u64;
+                if first {
+                    fault_point!(ReseatMidExtend);
+                }
+                first = false;
+                Ok(true)
+            },
         )?;
+        if raced || size_now(&dest)?.size != expected {
+            return self.hand_over(row, landing, Outcome::Raced);
+        }
+        if pumped.written == 0 {
+            // Only a line not yet whole: nothing appended.
+            self.placer.ledger.put(&Placement {
+                landed: landing.identity,
+                landing: self.landing_path.to_path_buf(),
+                intent: None,
+                ..row
+            })?;
+            return Ok(Placed {
+                outcome: Outcome::Unchanged,
+                scanner,
+            });
+        }
         dest.set_modified(
             landing
                 .meta
@@ -791,20 +1080,12 @@ impl Site<'_> {
         .refuse_at("reseat::place::extend_mtime")?;
         crate::io::durable::seal_file(&dest).refuse_at("reseat::place::extend_seal")?;
         fault_point!(ReseatAfterExtend);
-        let placed = Identity::of(&dest.metadata().refuse_at("reseat::place::extended")?);
-        if placed.size != target {
-            // Another writer appended beside this pass: nothing of theirs
-            // was overwritten (O_APPEND); the destination owns the file.
-            return self.hand_over(row, landing);
+        let placed = size_now(&dest)?;
+        if placed.size != expected {
+            return self.hand_over(row, landing, Outcome::Raced);
         }
-        let (_, head_digest, tail_digest) = stream.finish();
-        let mut done = self.row(State::Ours, landing.identity, placed, target);
-        done.head = if full_head {
-            row.head
-        } else {
-            Some(head_digest)
-        };
-        done.tail = Some(tail_digest);
+        let mut done = self.row(State::Ours, landing.identity, placed, expected);
+        done.digest = Some(*hasher.finalize().as_bytes());
         self.placer.ledger.put(&done)?;
         Ok(Placed {
             outcome: Outcome::Extended,
@@ -812,8 +1093,9 @@ impl Site<'_> {
         })
     }
 
-    fn hand_over(&self, row: Placement, landing: &Landing) -> Result<Placed> {
-        let observed = lstat(self.dest)?.map_or(row.placed_identity, |meta| Identity::of(&meta));
+    /// The destination owns the file from now on.
+    fn hand_over(&self, row: Placement, landing: &Landing, outcome: Outcome) -> Result<Placed> {
+        let observed = identity_at(self.dest)?.unwrap_or(row.placed_identity);
         let both = landing.identity != row.landed;
         self.placer.ledger.put(&Placement {
             state: State::Continued,
@@ -822,7 +1104,10 @@ impl Site<'_> {
             ..row
         })?;
         Ok(Placed {
-            outcome: Outcome::Continued { both },
+            outcome: match outcome {
+                Outcome::Continued { .. } => Outcome::Continued { both },
+                other => other,
+            },
             scanner: None,
         })
     }
@@ -830,15 +1115,18 @@ impl Site<'_> {
     /// Exchange a changed non-append landed file in for this ledger's
     /// placement, under an intent, and check what it displaced.
     fn supersede(&self, row: Placement, landing: &Landing) -> Result<Placed> {
-        let (temp, stream, scanner) = self.stage(landing)?;
-        let staged = Identity::of(&temp.metadata().refuse_at("reseat::place::staged")?);
+        let Some(staged) = self.stage_or_clear(landing)? else {
+            return Ok(Placed {
+                outcome: Outcome::Unreadable,
+                scanner: None,
+            });
+        };
+        let staged_identity =
+            Identity::of(&staged.file.metadata().refuse_at("reseat::place::staged")?);
         let mut intent = row.clone();
-        intent.intent = Some(Intent::Supersede(staged.ino));
+        intent.intent = Some(Intent::Supersede(staged_identity));
         self.placer.ledger.put(&intent)?;
-        let (temp_c, name_c) = (
-            c_name(temp_name(self.name).as_os_str())?,
-            c_name(self.name)?,
-        );
+        let (temp_c, name_c) = (self.temp_c()?, c_name(self.name)?);
         if let Err(error) = crate::io::exchange(self.directory, &temp_c, &name_c) {
             if !crate::io::rename_unsupported(&error) {
                 return Err(error).refuse_at("reseat::place::exchange");
@@ -852,138 +1140,123 @@ impl Site<'_> {
             });
         }
         fault_point!(ReseatAfterSupersedeExchange);
-        if !self.settle_displaced(&row, &temp_c, &name_c)? {
-            return self.hand_over(row, landing);
+        match self.settle_exchange(&row, staged_identity)? {
+            Exchanged::HandedOver => {
+                self.hand_over(row, landing, Outcome::Continued { both: true })
+            }
+            Exchanged::Ours => {
+                let mut done = self.row(
+                    State::Ours,
+                    landing.identity,
+                    staged_identity,
+                    staged.written,
+                );
+                done.digest = Some(staged.digest);
+                self.placer.ledger.put(&done)?;
+                Ok(Placed {
+                    outcome: Outcome::Superseded,
+                    scanner: staged.scanner,
+                })
+            }
         }
-        let (digest, head, tail) = stream.finish();
-        let mut done = self.row(State::Ours, landing.identity, staged, landing.identity.size);
-        done.placed_identity =
-            Identity::of(&lstat(self.dest)?.ok_or(BulkloadRefusal::SourceChangedAfterSnapshot)?);
-        done.digest = digest;
-        done.head = Some(head);
-        done.tail = Some(tail);
-        self.placer.ledger.put(&done)?;
-        Ok(Placed {
-            outcome: Outcome::Superseded,
-            scanner,
-        })
     }
 
-    /// After an exchange: the file displaced to the temporary name is this
-    /// ledger's placement (remove it and return `true`), or not (exchange
-    /// it back, remove the staged copy, return `false`).
-    fn settle_displaced(
-        &self,
-        row: &Placement,
-        temp_c: &CString,
-        name_c: &CString,
-    ) -> Result<bool> {
-        let displaced = lstat(&self.temp())?;
-        let ours = displaced
-            .as_ref()
-            .is_some_and(|meta| Identity::of(meta) == row.placed_identity);
-        if displaced.is_some() && !ours {
-            crate::io::exchange(self.directory, temp_c, name_c)
-                .refuse_at("reseat::place::exchange_back")?;
-        }
-        if displaced.is_some() {
-            crate::io::sys::unlinkat(self.directory, temp_c, false)
-                .refuse_at("reseat::place::displaced")?;
-        }
+    /// After an exchange: the staged file (identity `staged`) should be at
+    /// the path and this ledger's placement under the temporary name.
+    ///
+    /// - Both so: the placement is removed; ours.
+    /// - The staged file at the path, something else displaced (the
+    ///   destination changed it before the exchange): exchanged back, the
+    ///   staged copy removed; handed over.
+    /// - The staged file at the path changed since (edited in place after
+    ///   a crash): the destination's; this ledger's displaced placement is
+    ///   removed, anything else displaced is left; handed over.
+    fn settle_exchange(&self, row: &Placement, staged: Identity) -> Result<Exchanged> {
+        let (temp_c, name_c) = (self.temp_c()?, c_name(self.name)?);
+        let at_path = identity_at(self.dest)?;
+        let displaced = identity_at(&self.temp())?;
+        let displaced_ours = displaced == Some(row.placed_identity);
+        let settled = if at_path == Some(staged) {
+            match displaced {
+                None => Exchanged::Ours,
+                Some(_) if displaced_ours => {
+                    crate::io::sys::unlinkat(self.directory, &temp_c, false)
+                        .refuse_at("reseat::place::displaced")?;
+                    Exchanged::Ours
+                }
+                Some(_) => {
+                    crate::io::exchange(self.directory, &temp_c, &name_c)
+                        .refuse_at("reseat::place::exchange_back")?;
+                    if identity_at(&self.temp())? == Some(staged) {
+                        crate::io::sys::unlinkat(self.directory, &temp_c, false)
+                            .refuse_at("reseat::place::exchange_back_staged")?;
+                    }
+                    Exchanged::HandedOver
+                }
+            }
+        } else {
+            if displaced_ours {
+                crate::io::sys::unlinkat(self.directory, &temp_c, false)
+                    .refuse_at("reseat::place::displaced")?;
+            }
+            Exchanged::HandedOver
+        };
         crate::io::durable::seal_dir(self.directory).refuse_at("reseat::place::supersede_seal")?;
-        Ok(ours || displaced.is_none())
+        Ok(settled)
     }
 
     /// Finish or undo what a crash left under an intent; returns the row
     /// the pass continues from.
     fn settle_intent(&self, row: Placement) -> Result<Option<Placement>> {
-        let observed = lstat(self.dest)?;
         match row.intent {
             None => Ok(Some(row)),
-            Some(Intent::Supersede(staged)) => {
-                let (temp_c, name_c) = (
-                    c_name(temp_name(self.name).as_os_str())?,
-                    c_name(self.name)?,
-                );
-                let exchanged = observed.as_ref().is_some_and(|meta| meta.ino() == staged);
-                if exchanged {
-                    if !self.settle_displaced(&row, &temp_c, &name_c)? {
-                        let landing = Landing::open(self.landing_path)?;
-                        self.hand_over(row, &landing)?;
-                        return self.placer.ledger.placement(self.dest);
-                    }
-                    // The staged bytes are placed; the landing may have
-                    // moved since, so the pass decides again from them.
-                    let placed = Identity::of(
-                        &lstat(self.dest)?.ok_or(BulkloadRefusal::SourceChangedAfterSnapshot)?,
-                    );
-                    let next = Placement {
-                        landed: Identity::default(),
-                        placed_identity: placed,
-                        intent: None,
-                        ..row
-                    };
-                    self.placer.ledger.put(&next)?;
-                    return Ok(Some(next));
-                }
-                // Not exchanged: the temporary is the staged copy.
-                self.clear_temp()?;
-                let next = Placement {
-                    intent: None,
-                    ..row
-                };
-                self.placer.ledger.put(&next)?;
-                Ok(Some(next))
-            }
-            Some(Intent::Extend(target)) => {
+            Some(Intent::Supersede(staged)) => self.settle_supersede(row, staged),
+            Some(Intent::Extend) => self.settle_extend(row),
+        }
+    }
+
+    fn settle_supersede(&self, row: Placement, staged: Identity) -> Result<Option<Placement>> {
+        let cleared = Placement {
+            intent: None,
+            ..row.clone()
+        };
+        if identity_at(&self.temp())? == Some(staged) {
+            // Not exchanged: the temporary is the staged copy.
+            self.clear_temp()?;
+            self.placer.ledger.put(&cleared)?;
+            return Ok(Some(cleared));
+        }
+        let exchanged = identity_at(self.dest)?
+            .is_some_and(|now| now.dev == staged.dev && now.ino == staged.ino);
+        if !exchanged {
+            // The staged file is at neither name: decide from the
+            // destination's file as it is.
+            self.placer.ledger.put(&cleared)?;
+            return Ok(Some(cleared));
+        }
+        match self.settle_exchange(&row, staged)? {
+            Exchanged::HandedOver => {
                 let landing = Landing::open(self.landing_path)?;
-                let Some(meta) = observed else {
-                    let next = Placement {
-                        intent: None,
-                        ..row
-                    };
-                    self.placer.ledger.put(&next)?;
-                    return Ok(Some(next));
-                };
-                let size = meta.size();
-                let same_file = meta.is_file()
-                    && meta.ino() == row.placed_identity.ino
-                    && meta.dev() == row.placed_identity.dev;
-                let read = |offset, length| landing.read_at(offset, length);
-                let proven = same_file
-                    && (row.placed..=target).contains(&size)
-                    && size <= landing.identity.size
-                    && (row.placed == 0 || {
-                        let (head, tail, _) = windows(&read, row.placed)?;
-                        Some(head) == row.head && Some(tail) == row.tail
-                    })
-                    && {
-                        let dest = crate::hash::open_nofollow(self.dest)?;
-                        let mut a = vec![0_u8; usize::try_from(size - row.placed).unwrap_or(0)];
-                        dest.read_exact_at(&mut a, row.placed)
-                            .refuse_at("reseat::place::settle_dest")?;
-                        counters::add_len(Counter::ReseatDestRead, a.len());
-                        a == landing.read_at(row.placed, size - row.placed)?
-                    };
-                if !proven {
-                    self.hand_over(row, &landing)?;
-                    return self.placer.ledger.placement(self.dest);
-                }
-                // The appended part is the landing's: continue from it.
-                let (head, tail, _) = windows(&read, size)?;
+                self.hand_over(row, &landing, Outcome::Continued { both: true })?;
+                self.placer.ledger.placement(self.dest)
+            }
+            Exchanged::Ours => {
+                // The staged bytes are placed; the landing may have moved
+                // since, so the pass decides again from them.
+                let mut hasher = blake3::Hasher::new();
+                let mut file = crate::hash::open_nofollow(self.dest)?;
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)
+                    .refuse_at("reseat::place::settle_supersede")?;
+                counters::add_len(Counter::ReseatDestRead, bytes.len());
+                counters::update(&mut hasher, Counter::HashOther, &bytes);
                 let next = Placement {
-                    placed: size,
-                    placed_identity: Identity::of(&meta),
-                    landed: if size == landing.identity.size {
-                        landing.identity
-                    } else {
-                        Identity::default()
-                    },
-                    head: Some(head),
-                    tail: Some(tail),
-                    digest: None,
-                    intent: None,
                     state: State::Ours,
+                    landed: Identity::default(),
+                    placed_identity: staged,
+                    placed: bytes.len() as u64,
+                    digest: Some(*hasher.finalize().as_bytes()),
+                    intent: None,
                     ..row
                 };
                 self.placer.ledger.put(&next)?;
@@ -991,4 +1264,82 @@ impl Site<'_> {
             }
         }
     }
+
+    /// After a crash inside an extension: the destination's bytes past
+    /// `placed` are adopted when they are exactly the landing's next bytes
+    /// (this pass's own writes); otherwise the file is handed over.
+    fn settle_extend(&self, row: Placement) -> Result<Option<Placement>> {
+        let landing = Landing::open(self.landing_path)?;
+        let Some(meta) = lstat(self.dest)? else {
+            let next = Placement {
+                intent: None,
+                ..row
+            };
+            self.placer.ledger.put(&next)?;
+            return Ok(Some(next));
+        };
+        let size = meta.size();
+        let same_file = meta.is_file()
+            && meta.ino() == row.placed_identity.ino
+            && meta.dev() == row.placed_identity.dev
+            && size >= row.placed;
+        let mut hasher = blake3::Hasher::new();
+        let proven = same_file && {
+            let mut reader = landing.reader()?;
+            read_exact_hash(&landing, &mut reader, row.placed, &mut hasher, None)?
+                != Prefixed::Short
+                && Some(*hasher.clone().finalize().as_bytes()) == row.digest
+                && {
+                    let dest = crate::hash::open_nofollow(self.dest)?;
+                    let mut appended = vec![0_u8; usize::try_from(size - row.placed).unwrap_or(0)];
+                    dest.read_exact_at(&mut appended, row.placed)
+                        .refuse_at("reseat::place::settle_dest")?;
+                    counters::add_len(Counter::ReseatDestRead, appended.len());
+                    let mut landed = vec![0_u8; appended.len()];
+                    let mut at = 0;
+                    while at < landed.len() {
+                        let read = fill(
+                            &landing,
+                            &mut reader,
+                            landed.get_mut(at..).unwrap_or_default(),
+                            "reseat::place::settle_landing",
+                        )?;
+                        if read == 0 {
+                            break;
+                        }
+                        at += read;
+                    }
+                    counters::update(&mut hasher, Counter::HashOther, &appended);
+                    at == landed.len() && landed == appended
+                }
+        };
+        if !proven {
+            self.hand_over(row, &landing, Outcome::Continued { both: true })?;
+            return self.placer.ledger.placement(self.dest);
+        }
+        // The appended part is the landing's: continue from it.
+        let next = Placement {
+            placed: size,
+            placed_identity: Identity::of(&meta),
+            landed: Identity::default(),
+            digest: Some(*hasher.finalize().as_bytes()),
+            intent: None,
+            state: State::Ours,
+            ..row
+        };
+        self.placer.ledger.put(&next)?;
+        Ok(Some(next))
+    }
+}
+
+/// The byte before offset `size` of `file`.
+fn last_byte(file: &File, size: u64) -> Result<Option<u8>> {
+    if size == 0 {
+        return Ok(None);
+    }
+    let mut one = [0_u8; 1];
+    file.read_exact_at(&mut one, size - 1)
+        .refuse_at("reseat::place::last_byte")?;
+    counters::add_len(Counter::ReseatDestRead, 1);
+    Ok(Some(one[0]))
 }

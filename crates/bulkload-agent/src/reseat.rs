@@ -34,7 +34,7 @@
 //! later pass extends what grew. `--check` is the read-only R0 acceptance
 //! check ([`check`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::closure::json_string;
@@ -165,8 +165,32 @@ pub struct Options {
     pub handoff_marker: Option<String>,
     /// `--check` only: Git and the hand-off are out of this check's scope.
     pub sessions_only: bool,
+    /// `--check` only: session and thread IDs whose missing lane (or
+    /// failed by-ID placement) is accepted by name (`--waive`).
+    pub waived: BTreeSet<String>,
+    /// Days a re-seated file must still be kept past now under the
+    /// destination's `cleanupPeriodDays` (`--retention-margin-days`).
+    pub retention_margin_days: i64,
+    /// Claude Code's managed settings files on the destination (their
+    /// `.d` drop-ins are read too).
+    pub managed_settings: Vec<PathBuf>,
     /// Now, nanoseconds since the epoch (retention).
     pub now_ns: i64,
+}
+
+/// The default `--retention-margin-days`.
+pub const RETENTION_MARGIN_DAYS: i64 = 365;
+
+/// Claude Code's managed settings files on this platform.
+#[must_use]
+pub fn managed_settings() -> Vec<PathBuf> {
+    if cfg!(target_os = "macos") {
+        vec![PathBuf::from(
+            "/Library/Application Support/ClaudeCode/managed-settings.json",
+        )]
+    } else {
+        vec![PathBuf::from("/etc/claude-code/managed-settings.json")]
+    }
 }
 
 impl Options {
@@ -190,6 +214,9 @@ impl Options {
             git: None,
             handoff_marker: None,
             sessions_only: false,
+            waived: BTreeSet::new(),
+            retention_margin_days: RETENTION_MARGIN_DAYS,
+            managed_settings: managed_settings(),
             now_ns: now_ns(),
         }
     }
@@ -368,30 +395,64 @@ fn root(path: &Path) -> Result<PathBuf> {
 }
 
 /// Re-seat the landed sessions into the destination's live agent state:
-/// one JSON line per session or thread, handed to `line`, then the summary
-/// line.
+/// one JSON line per tool, per session and per thread, handed to `line`,
+/// then the summary line.
 ///
 /// # Errors
-/// `RESEAT_RETENTION_UNSAFE` before anything is written when the
-/// destination's Claude Code would delete a re-seated transcript; ledger,
-/// I/O and schema refusals. A session's own refusal is its line's
-/// `refused` code, never the run's.
+/// Before anything is written: `RESEAT_LANDING_ABSENT` when a landed tree
+/// the run covers is absent, `RESEAT_RETENTION_UNSAFE` when the
+/// destination's Claude Code would delete a re-seated file within the
+/// margin, `RESEAT_INDEX_ABSENT` when there is a Codex thread to register
+/// and no destination index. Then ledger, I/O and schema refusals. A
+/// session's own refusal is its line's `refused` code, never the run's.
 pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<Summary> {
     let lanes = Lanes::new(options);
     let mut summary = Summary::default();
-    let claude = if options.claude && options.landing_claude.join("projects").is_dir() {
+    let claude = if options.claude {
         Some(claude::Sessions::scan(options)?)
     } else {
         None
     };
+    let codex = if options.codex {
+        Some(codex::landed_anything(options)?)
+    } else {
+        None
+    };
     if let Some(sessions) = &claude {
-        claude::retention(options, sessions)?;
+        claude::retention(options, &lanes, sessions)?;
+    }
+    if codex == Some(true) {
+        codex::preflight(options)?;
     }
     let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "reseat")?;
+    for (tool, state) in [
+        (
+            claude::TOOL,
+            claude.as_ref().map_or("skipped", |sessions| {
+                if sessions.list.is_empty() {
+                    "empty"
+                } else {
+                    "present"
+                }
+            }),
+        ),
+        (
+            codex::TOOL,
+            match codex {
+                None => "skipped",
+                Some(false) => "empty",
+                Some(true) => "present",
+            },
+        ),
+    ] {
+        emit(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"tool\",\"tool\":\"{tool}\",\"state\":\"{state}\"}}"
+        ))?;
+    }
     if let Some(sessions) = &claude {
         claude::reseat(options, &lanes, &ledger, sessions, &mut summary, emit)?;
     }
-    if options.codex && options.landing_codex.join(codex::STATE_DB).is_file() {
+    if codex == Some(true) {
         codex::reseat(options, &lanes, &mut ledger, &mut summary, emit)?;
     }
     emit(&summary.line())?;

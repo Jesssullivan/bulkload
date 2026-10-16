@@ -51,6 +51,9 @@ pub enum Reseat {
     Grow,
     /// The pass after the plan changed.
     Plan,
+    /// The first pass, with the rollout landed as `.jsonl.zst` (placed
+    /// decompressed, review 0 finding 1).
+    Zst,
 }
 
 impl Scenario for Reseat {
@@ -90,6 +93,11 @@ impl World {
         let base = &world.base;
         fs::create_dir_all(base.join("real-git/lab")).unwrap();
         fs::create_dir_all(base.join("dest/.claude")).unwrap();
+        fs::write(
+            base.join("dest/.claude/settings.json"),
+            b"{\"cleanupPeriodDays\": 3650}",
+        )
+        .unwrap();
         fs::create_dir_all(base.join("dest/.codex")).unwrap();
         std::os::unix::fs::symlink(base.join("real-git"), base.join("dest/git")).unwrap();
         let project = base.join("landing/.claude/projects/-Users-jess-git-lab");
@@ -142,6 +150,7 @@ impl World {
             &base.join("state"),
         );
         options.sessions_only = true;
+        options.managed_settings = vec![base.join("managed-settings.json")];
         options
     }
 
@@ -209,6 +218,22 @@ impl World {
         }
         found
     }
+}
+
+/// `path` with `.zst` appended.
+fn compressed(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".zst");
+    PathBuf::from(name)
+}
+
+/// A landed file's content: as is, or decompressed from its `.zst` form.
+fn landed_bytes(path: &Path) -> Option<Vec<u8>> {
+    fs::read(path).ok().or_else(|| {
+        fs::read(compressed(path))
+            .ok()
+            .map(|bytes| zstd::decode_all(bytes.as_slice()).unwrap())
+    })
 }
 
 /// Run this test binary as a child that re-seats with `fault` armed: it
@@ -305,6 +330,22 @@ fn scenario(point: Point, nth: u64, kind: Reseat) {
             world.reseat();
             fs::write(&pairs[2].0, b"# plan v2, longer\n").unwrap();
         }
+        Reseat::Zst => {
+            let plain = fs::read(&pairs[3].0).unwrap();
+            fs::write(
+                compressed(&pairs[3].0),
+                zstd::encode_all(plain.as_slice(), 3).unwrap(),
+            )
+            .unwrap();
+            fs::remove_file(&pairs[3].0).unwrap();
+            rusqlite::Connection::open(world.base.join("landing/.codex/state_5.sqlite"))
+                .unwrap()
+                .execute(
+                    "UPDATE threads SET rollout_path = ?1 WHERE id = ?2",
+                    rusqlite::params![format!("/Users/jess/.codex/{ROLLOUT}.zst"), THREAD],
+                )
+                .unwrap();
+        }
     }
     let landed = fs::read(world.landed_transcript()).unwrap();
 
@@ -389,7 +430,7 @@ fn settled(world: &World, pairs: &[(PathBuf, PathBuf)], label: &str) {
     for (landed, dest) in pairs {
         assert_eq!(
             fs::read(dest).ok(),
-            fs::read(landed).ok(),
+            landed_bytes(landed),
             "{label}: {dest:?}"
         );
         assert!(

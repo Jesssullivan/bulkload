@@ -353,8 +353,9 @@ counters! {
     DestSqliteSidecarRefused => "dest_sqlite_sidecar_refused",
     // `estate-reseat` (R0, TIN-6587). Bytes read from the landed agent
     // state (the run's copy of the source's `~/.claude` and `~/.codex`):
-    // 0 on a pass whose landed files are unchanged (S3), and on a grown
-    // transcript only the two ledger windows plus its new tail (R25).
+    // 0 on a pass whose landed files and Codex snapshot are unchanged (S3);
+    // a grown transcript once (its placed bytes proven, its tail appended);
+    // a `.zst` counts its compressed bytes; a re-read snapshot its size.
     ReseatLandingRead => "read_reseat_landing_bytes",
     // Bytes read from the destination's live agent state to prove a copy
     // already there identical to, or a prefix of, the landed one.

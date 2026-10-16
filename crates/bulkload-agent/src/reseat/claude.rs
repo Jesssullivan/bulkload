@@ -40,6 +40,8 @@ const SLUG: &[&str] = &["slug"];
 const DEPTH_LIMIT: usize = 64;
 /// Claude Code's default `cleanupPeriodDays`.
 const DEFAULT_RETENTION_DAYS: i64 = 30;
+/// How far into a transcript the retention check looks for its `slug`.
+const HEAD_BYTES: u64 = 4 * 1024 * 1024;
 const DAY_NS: i64 = 86_400 * 1_000_000_000;
 
 /// One landed transcript.
@@ -80,8 +82,13 @@ impl Sessions {
     /// Every `projects/*/*.jsonl` of the landed `.claude`.
     ///
     /// # Errors
-    /// The I/O refusal of a listing.
+    /// `RESEAT_LANDING_ABSENT` when the landed `.claude` is not a directory
+    /// (absent, or a symlink to a source-only volume); the I/O refusal of a
+    /// listing.
     pub fn scan(options: &Options) -> Result<Self> {
+        if !std::fs::metadata(&options.landing_claude).is_ok_and(|meta| meta.is_dir()) {
+            return Err(BulkloadRefusal::ReseatLandingAbsent);
+        }
         let projects = options.landing_claude.join("projects");
         let mut list = Vec::new();
         for key in names(&projects)? {
@@ -118,50 +125,154 @@ impl Sessions {
     }
 }
 
-/// The destination's `cleanupPeriodDays` (`settings.json`, top level;
-/// Claude Code's default 30 when absent).
-fn retention_days(dest_claude: &Path) -> Result<i64> {
-    let path = dest_claude.join("settings.json");
-    let text = match std::fs::read(&path) {
+/// The `cleanupPeriodDays` values `path` sets (every occurrence; a
+/// settings file is small), none when it does not exist. A value that is
+/// not a positive whole number counts as 0 (unsafe).
+fn retention_values(path: &Path) -> Result<Vec<i64>> {
+    let text = match std::fs::read(path) {
         Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DEFAULT_RETENTION_DAYS)
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(Vec::new())
         }
         Err(error) => return Err(error).refuse_at("reseat::claude::retention"),
     };
     let text = String::from_utf8_lossy(&text);
-    let Some(at) = text.find("\"cleanupPeriodDays\"") else {
-        return Ok(DEFAULT_RETENTION_DAYS);
-    };
-    let rest = text
-        .get(at + "\"cleanupPeriodDays\"".len()..)
-        .unwrap_or_default()
-        .trim_start()
-        .strip_prefix(':')
-        .unwrap_or_default()
-        .trim_start();
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    Ok(digits.parse().unwrap_or(DEFAULT_RETENTION_DAYS))
+    let key = "\"cleanupPeriodDays\"";
+    let mut values = Vec::new();
+    let mut rest = text.as_ref();
+    while let Some(at) = rest.find(key) {
+        rest = rest.get(at + key.len()..).unwrap_or_default();
+        let value = rest
+            .trim_start()
+            .strip_prefix(':')
+            .unwrap_or_default()
+            .trim_start();
+        let digits: String = value.chars().take_while(char::is_ascii_digit).collect();
+        // Anything but a positive whole number is no retention Claude Code
+        // can be trusted to keep.
+        values.push(digits.parse().unwrap_or(0));
+    }
+    Ok(values)
 }
 
-/// Whether a transcript with modification time `mtime` survives the
-/// destination's retention at `now`.
-const fn retained(days: i64, mtime: i64, now: i64) -> bool {
-    days > 0 && now.saturating_sub(mtime) < days.saturating_mul(DAY_NS)
+/// The settings files Claude Code merges `cleanupPeriodDays` from, as seen
+/// from the destination: managed (and its drop-ins), the user's, and each
+/// lane's project and local settings.
+fn settings_files(options: &Options, lanes: &[PathBuf]) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for managed in &options.managed_settings {
+        files.push(managed.clone());
+        let drop_ins = managed.with_extension("d");
+        for name in names(&drop_ins)? {
+            if Path::new(&name)
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                files.push(drop_ins.join(name));
+            }
+        }
+    }
+    files.push(options.dest_claude.join("settings.json"));
+    files.push(options.dest_claude.join("settings.local.json"));
+    for lane in lanes {
+        files.push(lane.join(".claude/settings.json"));
+        files.push(lane.join(".claude/settings.local.json"));
+    }
+    Ok(files)
+}
+
+/// The smallest `cleanupPeriodDays` any of those files sets (Claude Code's
+/// effective value is one of them; the smallest is the one that is safe to
+/// assume), Claude Code's default 30 when none does.
+fn retention_days(options: &Options, lanes: &[PathBuf]) -> Result<i64> {
+    let mut days = None;
+    for file in settings_files(options, lanes)? {
+        for value in retention_values(&file)? {
+            days = Some(days.map_or(value, |days: i64| days.min(value)));
+        }
+    }
+    Ok(days.unwrap_or(DEFAULT_RETENTION_DAYS))
+}
+
+/// Whether a file with modification time `mtime` is still kept `margin`
+/// days after `now` under a retention of `days`.
+const fn retained(days: i64, margin: i64, mtime: i64, now: i64) -> bool {
+    days > 0
+        && now
+            .saturating_sub(mtime)
+            .saturating_add(margin.saturating_mul(DAY_NS))
+            < days.saturating_mul(DAY_NS)
+}
+
+/// The modification times of everything a re-seat would place for
+/// `candidate` that Claude Code's cleanup ages out: the transcript, its
+/// sidecar tree and its per-session state (and its plans when its slug is
+/// known).
+fn session_mtimes(
+    options: &Options,
+    sessions: &Sessions,
+    candidate: &Candidate,
+    slug: Option<&str>,
+) -> Result<Vec<i64>> {
+    let mut out = vec![candidate.mtime];
+    for (landed, _, _) in companions(options, sessions, candidate, &candidate.key, slug)? {
+        if let Ok(meta) = std::fs::symlink_metadata(&landed) {
+            out.push(Identity::of(&meta).mtime);
+        }
+    }
+    Ok(out)
 }
 
 /// Refuse before anything is written when the destination's Claude Code
-/// would delete a re-seated transcript at its next start: they keep their
-/// source modification times.
+/// would delete a re-seated file within the margin
+/// (`--retention-margin-days`, default 365): they keep their source
+/// modification times. The retention is the smallest any settings source
+/// sets (managed, user, each lane's project and local), and every file of
+/// a session counts, not only its transcript.
 ///
 /// # Errors
-/// `RESEAT_RETENTION_UNSAFE`; the I/O refusal of reading the settings.
-pub fn retention(options: &Options, sessions: &Sessions) -> Result<()> {
-    let days = retention_days(&options.dest_claude)?;
-    if sessions
-        .list
+/// `RESEAT_RETENTION_UNSAFE`; the I/O refusal of reading the settings or
+/// a transcript's head (its lane and slug, once, then from the ledger).
+pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Result<()> {
+    let ledger = Ledger::open_read_only(&options.state)?;
+    let mut lane_dirs = Vec::new();
+    let mut mtimes = Vec::new();
+    for candidate in &sessions.list {
+        let cached = match &ledger {
+            Some(ledger) => ledger
+                .session(TOOL, &candidate.sid)?
+                .filter(|row| row.landing == candidate.path),
+            None => None,
+        };
+        if let Resolved::Lane(_, lane) =
+            resolve(candidate, cached.as_ref(), lanes, options.unmapped)?
+        {
+            if !lane_dirs.contains(&lane.dest_cwd) {
+                lane_dirs.push(lane.dest_cwd);
+            }
+        }
+        // A session a pass already decided is not read again (S3): its
+        // slug is the one it found, or none.
+        let slug = match cached {
+            Some(row) => row.slug,
+            None => head_field(&candidate.path, SLUG)?,
+        };
+        mtimes.extend(session_mtimes(
+            options,
+            sessions,
+            candidate,
+            slug.as_deref(),
+        )?);
+    }
+    let days = retention_days(options, &lane_dirs)?;
+    if mtimes
         .iter()
-        .all(|candidate| retained(days, candidate.mtime, options.now_ns))
+        .all(|mtime| retained(days, options.retention_margin_days, *mtime, options.now_ns))
     {
         Ok(())
     } else {
@@ -181,20 +292,28 @@ pub enum Resolved {
 
 /// The transcript's first top-level `cwd`, reading only until it is found.
 fn first_cwd(path: &Path) -> Result<Option<String>> {
-    let mut file = crate::hash::open_nofollow(path)?;
-    let mut scanner = FieldScanner::new(CWD);
+    field(path, CWD, u64::MAX)
+}
+
+/// The first top-level `field` in the transcript's first [`HEAD_BYTES`].
+fn head_field(path: &Path, wanted: &'static [&'static str]) -> Result<Option<String>> {
+    field(path, wanted, HEAD_BYTES)
+}
+
+fn field(path: &Path, wanted: &'static [&'static str], limit: u64) -> Result<Option<String>> {
+    let file = crate::hash::open_nofollow(path)?;
+    let mut file = file.take(limit);
+    let mut scanner = FieldScanner::new(wanted);
     let mut buffer = vec![0_u8; 64 * 1024];
     loop {
-        let read = file
-            .read(&mut buffer)
-            .refuse_at("reseat::claude::first_cwd")?;
+        let read = file.read(&mut buffer).refuse_at("reseat::claude::field")?;
         if read == 0 {
             return Ok(None);
         }
         counters::add_len(Counter::ReseatLandingRead, read);
         scanner.feed(buffer.get(..read).unwrap_or_default());
-        if let Some(cwd) = scanner.get(0) {
-            return Ok(Some(cwd.to_owned()));
+        if let Some(value) = scanner.get(0) {
+            return Ok(Some(value.to_owned()));
         }
     }
 }
@@ -336,6 +455,7 @@ pub fn companions(
 ///
 /// # Errors
 /// Ledger and I/O refusals; a session's own refusal is reported.
+#[allow(clippy::too_many_lines)]
 pub fn reseat(
     options: &Options,
     lanes: &Lanes,
@@ -399,16 +519,33 @@ pub fn reseat(
         });
         summary.file(TOOL, transcript.outcome);
         let mut files: BTreeMap<&'static str, u64> = BTreeMap::new();
+        // A transcript kept out (occupied, diverged, handed over) takes
+        // none of its companions: they stay in the landing with it.
+        let companions_too = transcript.outcome.landed();
         let mut place = |landed: &Path, dest: &Path, kind: Kind, session: &str| -> Result<()> {
             let outcome = placer.place(landed, dest, kind, session, None)?.outcome;
             summary.file(TOOL, outcome);
             *files.entry(outcome.word()).or_default() += 1;
+            if let Some(refusal) = outcome.refusal() {
+                // A kept companion or memory note is named, with its code.
+                emit(&format!(
+                    "{{\"schema\":\"{SCHEMA}\",\"kind\":\"file\",\"tool\":\"{TOOL}\",\"session\":{},\"kind_of\":\"{}\",\"landed\":{},\"dest\":{},\"outcome\":\"{}\",\"refused\":{}}}",
+                    json_string(session),
+                    kind.word(),
+                    shown(landed),
+                    shown(dest),
+                    outcome.word(),
+                    json_string(refusal.code()),
+                ))?;
+            }
             Ok(())
         };
-        for (landed, dest, kind) in
-            companions(options, sessions, candidate, &dest_key, slug.as_deref())?
-        {
-            place(&landed, &dest, kind, &candidate.sid)?;
+        if companions_too {
+            for (landed, dest, kind) in
+                companions(options, sessions, candidate, &dest_key, slug.as_deref())?
+            {
+                place(&landed, &dest, kind, &candidate.sid)?;
+            }
         }
         if memories.insert((candidate.key.clone(), dest_key.clone())) {
             let base = options

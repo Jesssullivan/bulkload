@@ -1885,19 +1885,23 @@ starts.
 SPEC R0 (draft `docs/SPEC.md`, PR #236) is the user outcome: after a run,
 `claude --resume` / `--continue` and `codex resume` started in each lane's
 destination working directory list and resume its sessions, and every
-transcript is byte-identical to the source's last pass. A run lands the
+transcript holds the source's last pass byte for byte. A run lands the
 source's `~/.claude` and `~/.codex` in its landing on the destination host,
 where neither agent looks; `estate-reseat` re-seats them into the
 destination's **live** agent state. The facts it rests on were measured
 against the real binaries (Claude Code 2.1.299, codex-cli
 0.163.0-alpha.11) in throwaway homes:
-`docs/agent-notes/2026-10-16-reseat-investigation.md`.
+`docs/agent-notes/2026-10-16-reseat-investigation.md`; the two adversarial
+reviews of the first build and their fixes:
+`docs/agent-notes/2026-10-16-estate-reseat-review-fixes.md`.
 
 ```
 bulkload-agent estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
     [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
     [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
     [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
+    [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
+    [--managed-settings FILE]...
     [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
 ```
 
@@ -1907,6 +1911,17 @@ the lane map; `LANDING_HOME` holds the run's landed `.claude` and `.codex`
 holds the live `.claude` and `.codex`; `STATE/reseat.sqlite` is the ledger.
 The source is never read (R25).
 
+**Refused before anything is written.** `RESEAT_LANDING_ABSENT`: a landed
+`.claude` or `.codex` the run covers is not a directory (absent, or a
+symlink to a source-only volume such as neo's `/Volumes/...` codex link);
+`--no-claude` / `--no-codex` leave a tool out explicitly, never silently.
+`RESEAT_RETENTION_UNSAFE`: see Claude. `RESEAT_INDEX_ABSENT`: the landing
+has Codex threads and the destination has no `state_5.sqlite`; Codex's
+first start would backfill the placed rollouts once, under their source
+`cwd`, archived, and every later insert would then conflict. Every run and
+check prints one `tool` line per tool (`present`/`checked`, `empty`,
+`skipped`).
+
 **Lanes.** A lane maps a source working directory to a destination one:
 `--map SRC=DST` (longest prefix first), then the plan's items
 (`--lanes-from-plan`), then the default, the same path under the home's
@@ -1915,58 +1930,93 @@ its deepest existing ancestor when it does not exist yet), because both
 agents key by `realpath(cwd)`: on sting `~/git/lab` is
 `/srv/fast-local/jess/git/lab`. A Claude session's lane comes from its
 transcript's first top-level `cwd`, checked against `project_key(cwd) ==`
-the directory it was landed under; a Codex thread's from its row's `cwd`.
-A session with no lane is reported `RESEAT_LANE_UNMAPPED` (or, with
-`--unmapped=by-id`, placed under its source key or `cwd`: resumable by ID
-only); one whose `cwd` is missing or keys elsewhere is
-`RESEAT_LANE_UNRESOLVED`.
+the directory it was landed under; a Codex thread's from its row's `cwd`
+(from its rollout's `session_meta` when it has no row). A session with no
+lane is reported `RESEAT_LANE_UNMAPPED` (or, with `--unmapped=by-id`,
+placed under its source key or `cwd`: resumable by ID only); one whose
+`cwd` is missing or keys elsewhere is `RESEAT_LANE_UNRESOLVED`. Two landed
+files for one destination path (two source keys mapped onto one destination
+key, as `--map` of a worktree onto its checkout does) are a collision: the
+first keeps the path, the other stays in the landing,
+`RESEAT_LANE_COLLISION`, and later passes read neither.
 
 **Claude.** `projects/<project_key(real dest cwd)>/<sid>.jsonl`, with the
 key function read from the binary (every UTF-16 unit outside `[A-Za-z0-9]`
 becomes `-`; over 200 units, cut and suffixed with a base-36 hash). The
 transcript is placed as a regular file (the picker lists regular files
 only; never a symlink, never a hardlink to the landing) with the landed
-mode and modification time (`--continue` takes the newest). Its sidecar
+mode and modification time (`--continue` takes the newest). Only when the
+transcript itself is placed, adopted, extended or unchanged do its sidecar
 directory `<sid>/`, `file-history/<sid>/`, `tasks/<sid>/`,
 `session-env/<sid>/`, `debug/<sid>.txt`, `todos/<sid>-*` and its plans
 (`plans/<slug>.md`, `plans/<slug>-agent-*.md`, by the transcript's `slug`)
-go with it; the source key's `memory/` merges into the destination key's.
-`sessions/` and `shell-snapshots/` are host-local and never carried;
-`history.jsonl` and `~/.claude.json` stay in the landing (the picker reads
-neither). Before anything is written, the pass refuses
-`RESEAT_RETENTION_UNSAFE` when the destination's `cleanupPeriodDays`
-(`settings.json`, default 30) would delete a transcript that keeps its
-source mtime.
+go with it; a transcript kept out (occupied by a symlink, diverged, handed
+over) keeps its companions in the landing too. The source key's `memory/`
+merges into the destination key's. A companion or memory note kept for any
+reason is a `file` line with its code. `sessions/` and `shell-snapshots/`
+are host-local and never carried; `history.jsonl` and `~/.claude.json`
+stay in the landing (the picker reads neither). **Retention:** before
+anything is written, the pass refuses `RESEAT_RETENTION_UNSAFE` unless
+every file it would place (each transcript, sidecar and per-session file,
+and the plans of a known slug) keeps its source mtime past now plus the
+margin (`--retention-margin-days`, default 365) under the smallest
+`cleanupPeriodDays` any source Claude Code merges sets: managed settings
+(`/etc/claude-code/managed-settings.json` and its `.d/` drop-ins;
+`/Library/Application Support/ClaudeCode/` on macOS), the user's
+`settings.json` and `settings.local.json`, and each lane's
+`.claude/settings.json` and `.claude/settings.local.json` (default 30 when
+none sets it). Both hosts set 3650.
 
 **Codex.** Each thread of the landed snapshot, oldest first (so a fork's or
-spawned thread's parent is registered before it): its rollout is placed
-byte-identical at the same path under the live `.codex`, in its landed form
-(`.jsonl` or `.jsonl.zst`; a `.jsonl.gz` stays in the landing,
-`RESEAT_UNREADABLE_FORM`). Its row is inserted into the live
-`state_5.sqlite` (`BEGIN IMMEDIATE`, busy timeout, batches of 256, beside a
-running app-server) with `cwd` the lane's real destination directory (the
-picker matches it exactly) and `rollout_path` the real destination path; the
-source's project and section links are cleared; its `thread_dynamic_tools`
-and `thread_spawn_edges` rows go with it. **Insert only**: a row already
-there is adopted when it names the same `cwd` and rollout, and otherwise
-reported `RESEAT_INDEX_CONFLICT` and never updated. A destination column the
-snapshot cannot fill refuses `SCHEMA_MISMATCH`. Rows commit only after their
-rollouts are durable. `thread_history_1.sqlite` is a projection Codex
-rebuilds and is not carried; `session_index.jsonl` stays in the landing.
+spawned thread's parent is registered before it). A row the destination's
+index already holds for the thread that this ledger did not register is
+never changed: the same `cwd` and rollout path is adopted, anything else is
+`RESEAT_INDEX_CONFLICT`, and no second rollout is placed beside the
+destination's own. Its rollout is placed at the same path under the live
+`.codex` **as plain `.jsonl`**: a landed `.jsonl.zst` is decompressed. Codex
+0.163 resumes a paginated thread only from the plain file (it stats
+`<name>.jsonl` and never opens the `.zst`: "failed to scan paginated model
+context lineage"; reproduced on real sting threads and by the canary), and
+one destination form keeps a thread one file when the source compresses a
+rollout between passes (the same stream; the ledger follows the landed
+form). The identity of a rollout is its decompressed stream. A `.jsonl.gz`
+stays in the landing, `RESEAT_UNREADABLE_FORM`. Its row is inserted into
+the live `state_5.sqlite` (`BEGIN IMMEDIATE`, busy timeout, batches of 256,
+beside a running app-server) with `cwd` the lane's real destination
+directory (the picker matches it exactly) and `rollout_path` the real
+destination path; the source's project and section links are cleared; its
+`thread_dynamic_tools` and `thread_spawn_edges` rows go with it. A
+destination column the snapshot cannot fill refuses `SCHEMA_MISMATCH`.
+Rows commit only after their rollouts are durable. A landed rollout no
+snapshot row names (a thread created after the snapshot, or one Codex never
+indexed) is placed, so `codex resume <id>` finds it, and reported
+`RESEAT_INDEX_ROW_ABSENT`: no row is made up for it. Another landed form of
+a thread the snapshot names is an `extra-form` line. The snapshot's
+threads (identity columns) are cached in the ledger with its identity: a
+pass over an unchanged snapshot does not open it.
+`thread_history_1.sqlite` is a projection Codex rebuilds and is not
+carried; `session_index.jsonl` stays in the landing.
 
-**Never overwrite.** Per destination file `D` and landed file `L`:
+**Never overwrite.** Per destination file `D` and landed file `L` (the
+decompressed stream of a `.zst`). JSON Lines (`.jsonl`) are placed and
+extended only up to the last newline of `L`: a line the source was still
+writing is held back until it is whole, so `D` never ends inside a record a
+destination resume would append to (a `.jsonl` with no whole line yet is
+`held`, nothing placed).
 
 | `D` | What the pass does | Report |
 |---|---|---|
+| a row for another landed file | nothing | `collision`, `RESEAT_LANE_COLLISION` |
 | absent | copy into `.<name>.bulkload-reseat`, mode and mtime set, sealed, published with a no-replace rename, directory sealed, then the ledger row | `placed` |
 | present, no row, equal to `L` | adopt | `adopted` |
 | present, no row, a strict byte prefix of an append-only `L` (`.jsonl`, `.txt`) | adopt, then append the rest | `extended` |
 | present, no row, anything else | keep; `L` stays beside it in the landing | `diverged`, `RESEAT_DEST_DIVERGED` (`dest-ahead`, `RESEAT_DEST_CONTINUED`, when `L` is a prefix of `D`) |
 | a symlink or other node, or a symlinked directory above it | never written through | `occupied`, `DESTINATION_OCCUPIED` |
 | this ledger's, both identities unchanged | nothing read | `unchanged` |
-| this ledger's, `L` grew (append-only) | prove `L` extends the placed bytes by the row's two 64 KiB window digests, append only the new tail with `O_APPEND`, under an intent row | `extended` |
-| this ledger's, `L` changed (not append-only: a plan, a memory note) | stage, atomic exchange, check the displaced file is this ledger's placement (else exchange back), under an intent row | `superseded` |
-| this ledger's, `L` stopped extending the placed bytes | keep | `source-rewritten`, `RESEAT_SOURCE_REWRITTEN` |
+| this ledger's, `L` grew (append-only) | prove every placed byte by the BLAKE3 of all of them, then append the new whole lines with `O_APPEND` under an intent row, checking `D`'s size before every write | `extended` |
+| this ledger's, a destination writer appended during that extension | stop between whole lines; the destination's from then on; mtime not reset | `extend-raced`, `RESEAT_EXTEND_RACED` |
+| this ledger's, `L` changed (not append-only: a plan, a memory note) | stage, atomic exchange, then settle by the staged file's whole identity (device, inode, size, mtime): a displaced file that is not this ledger's placement is exchanged back; a staged file edited in place since is the destination's | `superseded` |
+| this ledger's, `L` no longer extends the placed bytes (anywhere in them) | keep | `source-rewritten`, `RESEAT_SOURCE_REWRITTEN` |
 | this ledger's, changed at the destination (a resume appends) | the destination owns it from now on, never extended again | `dest-continued` / `both-continued` / `dest-removed`, `RESEAT_DEST_CONTINUED` |
 
 A destination resume appends to a session on either agent, so the first one
@@ -1974,38 +2024,54 @@ ends sync for that session; newer landed bytes stay in the landing. A
 destination checkout that moves or becomes a symlink changes its key: the
 earlier placement stays and the line names `previous_key`.
 
-**Ledger and S3.** Every placement is a row keyed by its destination path:
-the landed file's identity at the last pass, the destination file's identity
-after bulkload's last write, the bytes placed and their window digests, and
-an intent while an extension or supersede is in flight. An unchanged rerun
-reads 0 landed bytes (`read_reseat_landing_bytes`, also
-`write_reseat_dest_bytes` 0); a grown transcript costs its two windows and
-its new tail (R25). A live lane is caught up by repeated passes; the pass
-after its session stops on the source leaves it byte-identical.
+**Ledger and S3.** Every placement is a row keyed by its destination path,
+naming its landed file: the landed file's identity at the last pass, the
+destination file's identity after bulkload's last write, the bytes placed
+and their BLAKE3, and an intent while an extension or supersede is in
+flight. The ledger carries its schema version (`user_version` 2); the first
+build's ledger is refused `SCHEMA_MISMATCH`. An unchanged rerun reads 0
+landed bytes, the Codex snapshot included (`read_reseat_landing_bytes`,
+also `write_reseat_dest_bytes` 0); a grown transcript is read once from the
+landing, its placed bytes proven and its tail appended (the landing is the
+destination's own copy; the source is never read, R25). A live lane is
+caught up by repeated passes; the pass after its session stops on the
+source leaves it equal to the landing.
 
-**Crash safety.** Seven fault points (`reseat.*`, `src/fault.rs`) each with
-a fault-harness row: a rerun settles every crash forward from the ledger and
-the destination's own bytes. A temporary with no intent is a staged copy
-and is removed; an extend intent is resumed after proving the bytes already
-appended are the landing's; a supersede intent finishes or undoes the
-exchange by the staged inode.
+**Crash safety.** Seven fault points (`reseat.*`, `src/fault.rs`) with
+eleven fault-harness rows (two of them a `.jsonl.zst` rollout decompressed
+into its temporary): a rerun settles every crash forward from the ledger
+and the destination's own bytes. A temporary with no intent is a staged
+copy and is removed; an extend intent is resumed after proving the placed
+bytes still hash to the row and the bytes already appended are the
+landing's next ones; a supersede intent finishes or undoes the exchange by
+the staged file's whole identity.
 
 **The R0 check** (`--check`) is read-only everywhere and runs from the
-landing, not the ledger, so a session no pass placed fails. Per lane: every
-transcript is a regular file under the key of the real destination directory
-whose BLAKE3 equals the landed one, its sidecar, per-session and plan files
-are there at the same size; every Codex row has the exact `cwd` and a
-`rollout_path` whose BLAKE3 equals the landed rollout; the lane's planned
-workspace is `estate-diff` `identical` (`--plan`; `--sessions-only` waives
-Git and the hand-off, and without either the lane is `incomplete`, never a
-pass); with `--note-marker` (TIN-6569) its `AGENTS.md` or `CLAUDE.md`
-holds the marker. It exits `RESEAT_R0_FAILED` unless every lane passes and
-retention keeps every transcript. It never opens a session in the live
-destination state, because opening appends; the real-binary canary
-(`tests/estate_reseat.rs`) drives the installed Claude Code picker in a
-throwaway home under `bwrap --unshare-net` and checks that it lists the
-re-seated session, does not list a symlinked transcript, and leaves the
-transcript unchanged.
+landing, not the ledger, so a session no pass placed fails. Per lane:
+every transcript is a regular file under the key of the real destination
+directory that holds the landed transcript's whole lines, exactly (a pass)
+or followed by what the destination wrote after them (`continued`: a
+session resumed there, also a pass); one that ends inside a line fails
+(`ends-mid-line`). Its sidecar, per-session and plan files are there (of
+the same size unless the session continued). Every Codex row has the exact
+`cwd` and a `rollout_path` (the placed `.jsonl`, or the `.jsonl.zst` Codex
+compressed it into there) whose decompressed stream holds the landed one
+the same way; a rollout with no snapshot row fails `row-absent` unless a
+row is there. The lane's planned workspace is `estate-diff` `identical`
+(`--plan`; `--sessions-only` waives Git and the hand-off, and without
+either the lane is `incomplete`, never a pass); with `--note-marker`
+(TIN-6569) its `AGENTS.md` or `CLAUDE.md` holds the marker. Every session
+or thread without a lane (unmapped, unresolved, unreadable) or kept by ID
+and not holding is an `unlaned` line. It exits `RESEAT_R0_FAILED` unless
+something was checked, every lane passes, retention holds, and every
+`unlaned` one is named by `--waive` / `--waive-from`. It never opens a
+session in the live destination state, because opening appends; two
+real-binary canaries (`tests/estate_reseat.rs`) run in throwaway homes
+under `bwrap --unshare-net`: the installed Claude Code picker lists the
+re-seated session, not a symlinked transcript, and leaves the transcript
+unchanged; the installed Codex resumes (opens, and appends to) a re-seated
+paginated thread whose rollout landed as `.jsonl.zst`, in an index the
+same Codex made, and the check still passes (`continued`).
 
 ## Reclaim
 

@@ -1481,6 +1481,10 @@ scenarios! {
     reseat_mid_extend => ReseatMidExtend: 1, Reseat::Grow;
     reseat_after_extend => ReseatAfterExtend: 1, Reseat::Grow;
     reseat_after_supersede_exchange => ReseatAfterSupersedeExchange: 1, Reseat::Plan;
+    // A rollout landed as `.jsonl.zst`, decompressed into its temporary and
+    // published as plain `.jsonl` (review 0, finding 1).
+    reseat_zst_after_temp_seal_rollout => ReseatAfterTempSeal: 4, Reseat::Zst;
+    reseat_zst_after_publish_rollout => ReseatAfterPublish: 4, Reseat::Zst;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

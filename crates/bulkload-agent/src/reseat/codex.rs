@@ -1,40 +1,59 @@
 //! Codex's half of the re-seat (R0, TIN-6587).
 //!
 //! The landed `state_5.sqlite` is the run's backup-API snapshot of the
-//! source's thread index; it is opened read-only and immutable. Per thread
-//! row, oldest first (a fork's parent and a spawned thread's parent are
-//! older than it, so they are registered first):
+//! source's thread index; it is opened read-only and immutable, and only
+//! when its identity changed since the ledger last read it (its threads'
+//! identity columns are cached in the ledger, S3). Per thread row, oldest
+//! first (a fork's parent and a spawned thread's parent are older than it,
+//! so they are registered first):
 //!
-//! 1. Its rollout goes, byte-identical, to the same place under the live
-//!    destination `.codex` (`sessions/YYYY/MM/DD/…` or
-//!    `archived_sessions/…`), in the form landed (`.jsonl` or
-//!    `.jsonl.zst`). A `.jsonl.gz` is kept in the landing as a file
-//!    (`RESEAT_UNREADABLE_FORM`): Codex cannot read it.
-//! 2. Its row is inserted into the destination's `state_5.sqlite`
+//! 1. A row the destination's index already holds for the thread that this
+//!    ledger did not register is never touched: the same `cwd` and rollout
+//!    path is adopted, anything else is `RESEAT_INDEX_CONFLICT`, and no
+//!    second rollout is placed beside the destination's own.
+//! 2. Its rollout goes to the same place under the live destination
+//!    `.codex` (`sessions/YYYY/MM/DD/…` or `archived_sessions/…`) **as plain
+//!    `.jsonl`**: a landed `.jsonl.zst` is decompressed. Codex resumes a
+//!    paginated thread only from the plain file (it stats `<name>.jsonl`
+//!    and never opens the `.zst`), and one destination form keeps a thread
+//!    one file when the source compresses a rollout between passes. The
+//!    identity is the decompressed stream. A `.jsonl.gz` is kept in the
+//!    landing (`RESEAT_UNREADABLE_FORM`): Codex cannot read it.
+//! 3. Its row is inserted into the destination's `state_5.sqlite`
 //!    (`BEGIN IMMEDIATE`, a 30 s busy timeout, beside a running app-server)
 //!    with two changes: `cwd` is the lane's destination working directory
 //!    (the picker matches it exactly) and `rollout_path` the rollout's real
 //!    destination path; the source's project and section links are cleared
 //!    (they name rows of the source's own tables). Its `thread_dynamic_tools`
-//!    and `thread_spawn_edges` rows go with it. Insert only: a row already
-//!    there for the thread is adopted when it names the same `cwd` and
-//!    rollout, and otherwise reported (`RESEAT_INDEX_CONFLICT`) and never
-//!    updated. Rows commit only after their rollouts are durable.
+//!    and `thread_spawn_edges` rows go with it. Rows commit only after their
+//!    rollouts are durable.
+//!
+//! A landed rollout with no row in the snapshot (a thread created between
+//! the snapshot and the rollout copy, or one Codex never indexed) is placed
+//! so `codex resume <id>` finds it, and reported `RESEAT_INDEX_ROW_ABSENT`:
+//! no row is made up for it. Its lane is its `session_meta` `cwd`.
+//!
+//! The destination must already have an index (`RESEAT_INDEX_ABSENT`
+//! otherwise, before anything is written): Codex's first start backfills a
+//! fresh index from the rollouts it finds once, under their recorded
+//! source `cwd`, archived, and never again.
 //!
 //! `thread_history_1.sqlite` is a projection Codex rebuilds from rollouts and
 //! is not carried; `session_index.jsonl` and `history.jsonl` stay in the
 //! landing (the picker reads neither).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 use rusqlite::types::Value;
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension as _};
 
-use super::ledger::Ledger;
-use super::place::{Outcome, Placer};
+use super::ledger::{Identity, Ledger, Session};
+use super::place::{self, Outcome, Placer};
 use super::{Kind, Lanes, Options, Summary, Unmapped, SCHEMA};
 use crate::closure::json_string;
+use crate::counters::{self, Counter};
 use crate::{BulkloadRefusal, Result};
 
 /// The thread index file.
@@ -50,13 +69,17 @@ const SOURCE_LINKS: &[&str] = &[
     "section_position",
     "section_entered_at_ms",
 ];
+/// The rollout trees under `.codex`.
+pub const TREES: [&str; 2] = ["sessions", "archived_sessions"];
+/// The longest `session_meta` line read for an unindexed rollout's `cwd`.
+const META_LIMIT: u64 = 8 * 1024 * 1024;
 
 fn sql<T>(outcome: rusqlite::Result<T>) -> Result<T> {
     outcome.map_err(|_| BulkloadRefusal::SqliteStateChanged)
 }
 
 /// Open the landed snapshot read-only and immutable: nothing is written
-/// beside it, not even a `-shm`.
+/// beside it, not even a `-shm`. Its size counts as landed bytes read.
 ///
 /// # Errors
 /// `PATH_NOT_PORTABLE` for a non-UTF-8 path; `SQLITE_STATE_CHANGED` when
@@ -73,12 +96,22 @@ pub fn open_snapshot(path: &Path) -> Result<Connection> {
         }
     }
     uri.push_str("?mode=ro&immutable=1");
-    sql(Connection::open_with_flags(
+    let conn = sql(Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ))
+    ))?;
+    // Reading it: its pages are landed bytes (S3 counts them).
+    sql(
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |row| {
+            row.get::<_, i64>(0)
+        }),
+    )?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        counters::add(Counter::ReseatLandingRead, meta.len());
+    }
+    Ok(conn)
 }
 
 /// A table's columns: `(name, not null without a default)`.
@@ -121,45 +154,85 @@ fn quoted(names: &[String]) -> String {
         .join(",")
 }
 
-/// One landed thread row.
+/// One landed thread: its identity columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Thread {
     pub id: String,
     pub rollout: String,
     pub cwd: String,
-    values: Vec<Value>,
 }
 
-/// Every thread row of the landed snapshot, oldest first, with the values
-/// of `names`.
-fn threads(source: &Connection, names: &[String]) -> Result<Vec<Thread>> {
-    let mut wanted = vec!["id".to_owned(), "rollout_path".to_owned(), "cwd".to_owned()];
-    wanted.extend(names.iter().cloned());
-    let mut statement = sql(source.prepare(&format!(
-        "SELECT {} FROM threads ORDER BY created_at, id",
-        quoted(&wanted)
-    )))?;
+/// Every thread row of the landed snapshot, oldest first (identity
+/// columns only).
+fn read_threads(source: &Connection) -> Result<Vec<Thread>> {
+    let mut statement =
+        sql(source.prepare("SELECT id, rollout_path, cwd FROM threads ORDER BY created_at, id"))?;
     let rows = sql(statement.query_map([], |row| {
-        let mut values = Vec::with_capacity(names.len());
-        for index in 0..names.len() {
-            values.push(row.get::<_, Value>(index + 3)?);
-        }
         Ok(Thread {
             id: row.get(0)?,
             rollout: row.get(1)?,
             cwd: row.get(2)?,
-            values,
         })
     }))?;
     sql(rows.collect::<rusqlite::Result<Vec<_>>>())
 }
 
-/// Every landed thread row, oldest first (identity columns only), for
-/// `--check`.
+/// Every landed thread row, oldest first, for `--check` (read-only: no
+/// cache is written). An absent snapshot has none.
 ///
 /// # Errors
 /// `SQLITE_STATE_CHANGED` when the snapshot cannot be read.
 pub fn landed_threads(path: &Path) -> Result<Vec<Thread>> {
-    threads(&open_snapshot(path)?, &[])
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    read_threads(&open_snapshot(path)?)
+}
+
+/// The landed snapshot, opened only when a pass needs it.
+struct Snapshot {
+    path: PathBuf,
+    conn: Option<Connection>,
+}
+
+impl Snapshot {
+    fn conn(&mut self) -> Result<&Connection> {
+        if self.conn.is_none() {
+            self.conn = Some(open_snapshot(&self.path)?);
+        }
+        self.conn
+            .as_ref()
+            .ok_or(BulkloadRefusal::ContractSelfInconsistent)
+    }
+
+    /// The snapshot's threads: from the ledger's cache while the
+    /// snapshot's identity is unchanged (nothing read, S3), else read and
+    /// cached.
+    fn threads(&mut self, ledger: &mut Ledger) -> Result<Vec<Thread>> {
+        let Ok(meta) = std::fs::symlink_metadata(&self.path) else {
+            return Ok(Vec::new());
+        };
+        let identity = Identity::of(&meta);
+        if let Some(cached) = ledger.snapshot_threads(&self.path, identity)? {
+            return Ok(cached
+                .into_iter()
+                .map(|(id, rollout, cwd)| Thread { id, rollout, cwd })
+                .collect());
+        }
+        let threads = read_threads(self.conn()?)?;
+        let rows: Vec<(String, String, String)> = threads
+            .iter()
+            .map(|thread| {
+                (
+                    thread.id.clone(),
+                    thread.rollout.clone(),
+                    thread.cwd.clone(),
+                )
+            })
+            .collect();
+        ledger.put_snapshot_threads(&self.path, identity, &rows)?;
+        Ok(threads)
+    }
 }
 
 /// Where a recorded rollout path lands: the path relative to `.codex`,
@@ -171,7 +244,7 @@ pub fn rollout_rel(options: &Options, rollout: &str) -> Option<PathBuf> {
         rollout
             .strip_prefix(root)
             .ok()
-            .filter(|rel| rel.starts_with("sessions") || rel.starts_with("archived_sessions"))
+            .filter(|rel| TREES.iter().any(|tree| rel.starts_with(tree)))
             .map(Path::to_path_buf)
     })
 }
@@ -198,6 +271,41 @@ pub fn landed_form(landing_codex: &Path, rel: &Path) -> Option<PathBuf> {
         .find(|form| landing_codex.join(form).symlink_metadata().is_ok())
 }
 
+/// The destination form of a landed rollout: plain `.jsonl`.
+#[must_use]
+pub fn dest_form(landed: &Path) -> PathBuf {
+    place::plain(landed)
+}
+
+/// Whether the landed `.codex` holds anything to re-seat (a snapshot or a
+/// rollout tree).
+///
+/// # Errors
+/// `RESEAT_LANDING_ABSENT` when the landed `.codex` is not a directory.
+pub fn landed_anything(options: &Options) -> Result<bool> {
+    if !std::fs::metadata(&options.landing_codex).is_ok_and(|meta| meta.is_dir()) {
+        return Err(BulkloadRefusal::ReseatLandingAbsent);
+    }
+    Ok(options.landing_codex.join(STATE_DB).is_file()
+        || TREES.iter().any(|tree| {
+            std::fs::read_dir(options.landing_codex.join(tree))
+                .is_ok_and(|mut entries| entries.next().is_some())
+        }))
+}
+
+/// Refuse before anything is written when the destination has no index to
+/// register landed threads in.
+///
+/// # Errors
+/// `RESEAT_INDEX_ABSENT`.
+pub fn preflight(options: &Options) -> Result<()> {
+    if options.dest_codex.join(STATE_DB).is_file() {
+        Ok(())
+    } else {
+        Err(BulkloadRefusal::ReseatIndexAbsent)
+    }
+}
+
 /// A thread waiting for its row.
 struct Pending {
     thread: usize,
@@ -206,12 +314,86 @@ struct Pending {
     outcome: Outcome,
 }
 
+/// One landed rollout file under a rollout tree, relative to `.codex`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unindexed {
+    pub rel: PathBuf,
+    pub id: Option<String>,
+}
+
+/// The thread ID in a rollout file name (`rollout-<ts>-<uuid>.jsonl…`).
+#[must_use]
+pub fn rollout_id(name: &str) -> Option<String> {
+    let stem = name
+        .strip_suffix(".jsonl.zst")
+        .or_else(|| name.strip_suffix(".jsonl.gz"))
+        .or_else(|| name.strip_suffix(".jsonl"))?;
+    let id = stem.get(stem.len().checked_sub(36)?..)?;
+    let shape = id.char_indices().all(|(at, character)| {
+        if matches!(at, 8 | 13 | 18 | 23) {
+            character == '-'
+        } else {
+            character.is_ascii_hexdigit()
+        }
+    });
+    shape.then(|| id.to_owned())
+}
+
+/// Every landed rollout-tree file no snapshot row's landed form names.
+///
+/// # Errors
+/// The I/O refusal of a listing.
+pub fn unindexed(options: &Options, named: &BTreeSet<PathBuf>) -> Result<Vec<Unindexed>> {
+    let mut out = Vec::new();
+    for tree in TREES {
+        let base = options.landing_codex.join(tree);
+        for rel in super::claude::walk(&base)? {
+            let rel = Path::new(tree).join(rel);
+            if named.contains(&rel) {
+                continue;
+            }
+            let id = rel
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(rollout_id);
+            out.push(Unindexed { rel, id });
+        }
+    }
+    Ok(out)
+}
+
+/// The `cwd` in a landed rollout's `session_meta` line (its first line).
+///
+/// # Errors
+/// I/O refusals; `RESEAT_UNREADABLE_FORM` for a stream that cannot be
+/// decompressed.
+pub fn meta_cwd(path: &Path) -> Result<Option<String>> {
+    let landing = place::Landing::open(path)?;
+    let reader = landing.reader()?;
+    let mut line = Vec::new();
+    for byte in std::io::BufReader::new(reader.take(META_LIMIT)).bytes() {
+        let byte = byte.map_err(|error| {
+            if place::compressed(path) {
+                BulkloadRefusal::ReseatUnreadableForm
+            } else {
+                crate::refuse::io(&error, "reseat::codex::meta_cwd")
+            }
+        })?;
+        if byte == b'\n' {
+            break;
+        }
+        line.push(byte);
+    }
+    Ok(super::json::nested_string(&line, &["payload", "cwd"]))
+}
+
 /// Re-seat every landed Codex thread.
 ///
 /// # Errors
 /// `SCHEMA_MISMATCH` when the destination's index has a required column
 /// the snapshot lacks; ledger, `SQLite` and I/O refusals. A thread's own
 /// refusal is reported.
+#[allow(clippy::too_many_lines)]
 pub fn reseat(
     options: &Options,
     lanes: &Lanes,
@@ -220,51 +402,82 @@ pub fn reseat(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let root = super::root(&options.dest_codex)?;
-    let source = open_snapshot(&options.landing_codex.join(STATE_DB))?;
+    let mut snapshot = Snapshot {
+        path: options.landing_codex.join(STATE_DB),
+        conn: None,
+    };
     let dest_db = root.join(STATE_DB);
-    let mut dest = if dest_db.is_file() {
-        let conn = sql(Connection::open_with_flags(
-            &dest_db,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        ))?;
-        sql(conn.busy_timeout(std::time::Duration::from_secs(30)))?;
-        Some(conn)
-    } else {
-        None
-    };
-    let names = match &dest {
-        Some(conn) => shared(&columns(&source, "threads")?, &columns(conn, "threads")?)?,
-        None => Vec::new(),
-    };
-    let all = threads(&source, &names)?;
+    let mut dest = sql(Connection::open_with_flags(
+        &dest_db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ))?;
+    sql(dest.busy_timeout(std::time::Duration::from_secs(30)))?;
+    let all = snapshot.threads(ledger)?;
+    let mut named = BTreeSet::new();
     let mut pending: Vec<Pending> = Vec::new();
+    let mut columns_shared: Option<Vec<String>> = None;
     for (index, thread) in all.iter().enumerate() {
         let (rel, dest_cwd) = match locate(options, lanes, thread)? {
             Ok(located) => located,
-            Err((word, refusal)) => {
+            Err((word, refusal, rel)) => {
+                if let Some(rel) = rel {
+                    named.insert(rel);
+                }
                 let counted = if word == "refused" {
                     refusal.code()
                 } else {
                     word
                 };
                 summary.session(TOOL, counted);
-                emit(&thread_line(thread, None, word, Some(&refusal), None))?;
+                emit(&thread_line(
+                    (&thread.id, &thread.cwd),
+                    None,
+                    word,
+                    Some(&refusal),
+                    None,
+                ))?;
                 continue;
             }
         };
+        named.insert(rel.clone());
+        let dest_rel = dest_form(&rel);
+        let rollout = root.join(&dest_rel);
+        let known = ledger.thread_row(&thread.id)?;
+        let ours = known
+            .as_ref()
+            .is_some_and(|(db, cwd, path)| *db == dest_db && *cwd == dest_cwd && *path == rollout);
+        if !ours {
+            // A row the destination holds that this ledger did not
+            // register: adopted when it already names this placement,
+            // never changed, and nothing placed beside it otherwise.
+            if let Some((cwd, path)) = row_of(&dest, &thread.id)? {
+                if cwd != dest_cwd || Path::new(&path) != rollout {
+                    summary.session(TOOL, "index-conflict");
+                    *summary.rows.entry("conflict".to_owned()).or_default() += 1;
+                    emit(&thread_line(
+                        (&thread.id, &thread.cwd),
+                        Some(&dest_cwd),
+                        "kept",
+                        Some(&BulkloadRefusal::ReseatIndexConflict),
+                        Some("conflict"),
+                    ))?;
+                    continue;
+                }
+            }
+        }
         let landed = options.landing_codex.join(&rel);
         let placer = Placer {
             ledger,
             root: &root,
         };
         let outcome = placer
-            .place(&landed, &rel, Kind::Rollout, &thread.id, None)?
+            .place(&landed, &dest_rel, Kind::Rollout, &thread.id, None)?
             .outcome;
         summary.file(TOOL, outcome);
         summary.session(TOOL, outcome.word());
         if !outcome.landed() {
             emit(&thread_line(
-                thread,
+                (&thread.id, &thread.cwd),
                 Some(&dest_cwd),
                 outcome.word(),
                 outcome.refusal().as_ref(),
@@ -272,15 +485,10 @@ pub fn reseat(
             ))?;
             continue;
         }
-        let rollout = root.join(&rel);
-        let known = ledger.thread_row(&thread.id)?;
-        if known
-            .as_ref()
-            .is_some_and(|(db, cwd, path)| *db == dest_db && *cwd == dest_cwd && *path == rollout)
-        {
+        if ours {
             *summary.rows.entry("unchanged".to_owned()).or_default() += 1;
             emit(&thread_line(
-                thread,
+                (&thread.id, &thread.cwd),
                 Some(&dest_cwd),
                 outcome.word(),
                 None,
@@ -296,52 +504,199 @@ pub fn reseat(
         });
         if pending.len() >= BATCH {
             let index = Index {
-                source: &source,
-                dest: dest.as_mut(),
+                snapshot: &mut snapshot,
+                dest: &mut dest,
                 db: &dest_db,
-                names: &names,
+                names: &mut columns_shared,
             };
             register(index, &all, &mut pending, ledger, summary, emit)?;
         }
     }
     let index = Index {
-        source: &source,
-        dest: dest.as_mut(),
+        snapshot: &mut snapshot,
+        dest: &mut dest,
         db: &dest_db,
-        names: &names,
+        names: &mut columns_shared,
     };
-    register(index, &all, &mut pending, ledger, summary, emit)
+    register(index, &all, &mut pending, ledger, summary, emit)?;
+    let ids: BTreeSet<&str> = all.iter().map(|thread| thread.id.as_str()).collect();
+    reseat_unindexed(options, lanes, ledger, &root, (&named, &ids), summary, emit)
+}
+
+/// The destination row of thread `id`: `(cwd, rollout_path)`.
+fn row_of(dest: &Connection, id: &str) -> Result<Option<(String, String)>> {
+    sql(dest
+        .query_row(
+            "SELECT cwd, rollout_path FROM threads WHERE id = ?1",
+            params![id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional())
+}
+
+/// Place every landed rollout no snapshot row names, and report it.
+#[allow(clippy::too_many_lines)]
+fn reseat_unindexed(
+    options: &Options,
+    lanes: &Lanes,
+    ledger: &Ledger,
+    root: &Path,
+    (named, ids): (&BTreeSet<PathBuf>, &BTreeSet<&str>),
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for file in unindexed(options, named)? {
+        let landed = options.landing_codex.join(&file.rel);
+        let shown_id = file
+            .id
+            .clone()
+            .unwrap_or_else(|| file.rel.to_string_lossy().into_owned());
+        let Some(id) = file.id.clone() else {
+            summary.session(TOOL, "unreadable-form");
+            emit(&thread_line(
+                (&shown_id, ""),
+                None,
+                "unreadable-form",
+                Some(&BulkloadRefusal::ReseatUnreadableForm),
+                Some("absent"),
+            ))?;
+            continue;
+        };
+        if ids.contains(id.as_str()) {
+            // Another form of a thread the snapshot names: it stays in the
+            // landing beside the form placed.
+            summary.session(TOOL, "extra-form");
+            emit(&thread_line((&id, ""), None, "extra-form", None, None))?;
+            continue;
+        }
+        if file
+            .rel
+            .extension()
+            .is_some_and(|extension| extension == "gz")
+        {
+            summary.session(TOOL, "unreadable-form");
+            emit(&thread_line(
+                (&id, ""),
+                None,
+                "unreadable-form",
+                Some(&BulkloadRefusal::ReseatUnreadableForm),
+                Some("absent"),
+            ))?;
+            continue;
+        }
+        let cached = ledger
+            .session(TOOL, &id)?
+            .filter(|row| row.landing == landed)
+            .and_then(|row| row.source_cwd);
+        let cwd = match cached {
+            Some(cwd) => Some(cwd),
+            None => match meta_cwd(&landed) {
+                Ok(cwd) => cwd,
+                Err(BulkloadRefusal::ReseatUnreadableForm) => None,
+                Err(refusal) => return Err(refusal),
+            },
+        };
+        let Some(cwd) = cwd else {
+            summary.session(TOOL, BulkloadRefusal::ReseatLaneUnresolved.code());
+            emit(&thread_line(
+                (&id, ""),
+                None,
+                "refused",
+                Some(&BulkloadRefusal::ReseatLaneUnresolved),
+                Some("absent"),
+            ))?;
+            continue;
+        };
+        let dest_cwd = match lanes.lane(Path::new(&cwd))? {
+            Some(lane) => super::key::utf8(&lane.dest_cwd)?.to_owned(),
+            None if options.unmapped == Unmapped::ById => cwd.clone(),
+            None => {
+                summary.session(TOOL, BulkloadRefusal::ReseatLaneUnmapped.code());
+                emit(&thread_line(
+                    (&id, &cwd),
+                    None,
+                    "refused",
+                    Some(&BulkloadRefusal::ReseatLaneUnmapped),
+                    Some("absent"),
+                ))?;
+                continue;
+            }
+        };
+        let placer = Placer { ledger, root };
+        let outcome = placer
+            .place(&landed, &dest_form(&file.rel), Kind::Rollout, &id, None)?
+            .outcome;
+        summary.file(TOOL, outcome);
+        summary.session(TOOL, outcome.word());
+        ledger.put_session(&Session {
+            tool: TOOL.to_owned(),
+            id: id.clone(),
+            landing: landed.clone(),
+            source_cwd: Some(cwd.clone()),
+            dest_cwd: Some(PathBuf::from(&dest_cwd)),
+            dest_key: None,
+            slug: None,
+            outcome: outcome.word().to_owned(),
+        })?;
+        *summary.rows.entry("absent".to_owned()).or_default() += 1;
+        let refusal = if outcome.landed() {
+            Some(BulkloadRefusal::ReseatIndexRowAbsent)
+        } else {
+            outcome.refusal()
+        };
+        emit(&thread_line(
+            (&id, &cwd),
+            Some(&dest_cwd),
+            outcome.word(),
+            refusal.as_ref(),
+            Some("absent"),
+        ))?;
+    }
+    Ok(())
 }
 
 /// The two thread indexes a batch is registered between.
 struct Index<'a> {
-    source: &'a Connection,
-    dest: Option<&'a mut Connection>,
+    snapshot: &'a mut Snapshot,
+    dest: &'a mut Connection,
     db: &'a Path,
-    names: &'a [String],
+    /// The columns both `threads` tables hold, once read.
+    names: &'a mut Option<Vec<String>>,
 }
 
 /// Where a thread's rollout lands and the `cwd` its row gets, or why it
-/// is not re-seated: `(report word, refusal)`.
-type Located = std::result::Result<(PathBuf, String), (&'static str, BulkloadRefusal)>;
+/// is not re-seated: `(report word, refusal, the landed form it named)`.
+type Located =
+    std::result::Result<(PathBuf, String), (&'static str, BulkloadRefusal, Option<PathBuf>)>;
 
 fn locate(options: &Options, lanes: &Lanes, thread: &Thread) -> Result<Located> {
     let Some(rel) = rollout_rel(options, &thread.rollout) else {
-        return Ok(Err(("refused", BulkloadRefusal::ReseatLaneUnmapped)));
+        return Ok(Err(("refused", BulkloadRefusal::ReseatLaneUnmapped, None)));
     };
     let Some(rel) = landed_form(&options.landing_codex, &rel) else {
-        return Ok(Err(("landing-absent", BulkloadRefusal::CaptureAbsent)));
+        return Ok(Err((
+            "landing-absent",
+            BulkloadRefusal::CaptureAbsent,
+            None,
+        )));
     };
     if rel.extension().is_some_and(|extension| extension == "gz") {
         return Ok(Err((
             "unreadable-form",
             BulkloadRefusal::ReseatUnreadableForm,
+            Some(rel),
         )));
     }
     let dest_cwd = match lanes.lane(Path::new(&thread.cwd))? {
         Some(lane) => super::key::utf8(&lane.dest_cwd)?.to_owned(),
         None if options.unmapped == Unmapped::ById => thread.cwd.clone(),
-        None => return Ok(Err(("refused", BulkloadRefusal::ReseatLaneUnmapped))),
+        None => {
+            return Ok(Err((
+                "refused",
+                BulkloadRefusal::ReseatLaneUnmapped,
+                Some(rel),
+            )))
+        }
     };
     Ok(Ok((rel, dest_cwd)))
 }
@@ -356,7 +711,7 @@ fn register(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let Index {
-        source,
+        snapshot,
         dest,
         db: dest_db,
         names,
@@ -365,21 +720,16 @@ fn register(
         return Ok(());
     }
     let batch = core::mem::take(pending);
-    let Some(dest) = dest else {
-        for item in &batch {
-            *summary.rows.entry("index-absent".to_owned()).or_default() += 1;
-            if let Some(thread) = all.get(item.thread) {
-                emit(&thread_line(
-                    thread,
-                    Some(&item.cwd),
-                    item.outcome.word(),
-                    None,
-                    Some("index-absent"),
-                ))?;
-            }
-        }
-        return Ok(());
-    };
+    let source = snapshot.conn()?;
+    if names.is_none() {
+        *names = Some(shared(
+            &columns(source, "threads")?,
+            &columns(dest, "threads")?,
+        )?);
+    }
+    let names = names
+        .as_deref()
+        .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
     let mut rows: Vec<&'static str> = Vec::with_capacity(batch.len());
     {
         let transaction =
@@ -430,7 +780,7 @@ fn register(
             .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
         let refusal = (*row == "conflict").then_some(BulkloadRefusal::ReseatIndexConflict);
         emit(&thread_line(
-            thread,
+            (&thread.id, &thread.cwd),
             Some(&item.cwd),
             item.outcome.word(),
             refusal.as_ref(),
@@ -450,14 +800,23 @@ fn insert(
     cwd: &str,
     rollout: &str,
 ) -> Result<()> {
+    let landed: Vec<Value> = sql(source.query_row(
+        &format!("SELECT {} FROM threads WHERE id = ?1", quoted(names)),
+        params![thread.id],
+        |row| {
+            (0..names.len())
+                .map(|index| row.get::<_, Value>(index))
+                .collect::<rusqlite::Result<Vec<Value>>>()
+        },
+    ))?;
     let values: Vec<Value> = names
         .iter()
-        .zip(&thread.values)
+        .zip(landed)
         .map(|(name, value)| match name.as_str() {
             "cwd" => Value::Text(cwd.to_owned()),
             "rollout_path" => Value::Text(rollout.to_owned()),
             link if SOURCE_LINKS.contains(&link) => Value::Null,
-            _ => value.clone(),
+            _ => value,
         })
         .collect();
     let placeholders = (1..=names.len())
@@ -530,8 +889,31 @@ fn copy_rows(
     Ok(())
 }
 
+/// The landed `session_meta` `cwd`s of unindexed rollouts the ledger has
+/// cached, for `--check`.
+#[must_use]
+pub fn cached_cwds(
+    ledger: Option<&Ledger>,
+    items: &[(String, PathBuf)],
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Some(ledger) = ledger else {
+        return out;
+    };
+    for (id, landed) in items {
+        if let Ok(Some(row)) = ledger.session(TOOL, id) {
+            if row.landing == *landed {
+                if let Some(cwd) = row.source_cwd {
+                    out.insert(id.clone(), cwd);
+                }
+            }
+        }
+    }
+    out
+}
+
 fn thread_line(
-    thread: &Thread,
+    (id, source_cwd): (&str, &str),
     dest_cwd: Option<&str>,
     outcome: &str,
     refusal: Option<&BulkloadRefusal>,
@@ -539,8 +921,8 @@ fn thread_line(
 ) -> String {
     format!(
         "{{\"schema\":\"{SCHEMA}\",\"kind\":\"thread\",\"tool\":\"{TOOL}\",\"id\":{},\"source_cwd\":{},\"dest_cwd\":{},\"outcome\":{},\"row\":{},\"refused\":{}}}",
-        json_string(&thread.id),
-        json_string(&thread.cwd),
+        json_string(id),
+        json_string(source_cwd),
         dest_cwd.map_or_else(|| "null".to_owned(), json_string),
         json_string(outcome),
         row.map_or_else(|| "null".to_owned(), json_string),
