@@ -19,11 +19,10 @@
 //!   `RENAME_EXCHANGE`d with it and the displaced file checked against the
 //!   print the plan read (a no-replace rename for a created file), each
 //!   step settled by the next run ([`settle`]);
-//! - **private by default**: written only into a repository with no remote
-//!   (active, or preserved inert from the source in `carry-config`), or
-//!   whose every remote URL and push URL, as written and as Git rewrites it
-//!   (`insteadOf`, `pushInsteadOf`), is under an operator-given prefix, or a
-//!   workspace the operator names; no URL is ever printed;
+//! - **always written** into each landed workspace, whatever its remotes
+//!   (OI-1003-Q188 removed the privacy guard); no remote URL is ever read
+//!   for it, rendered or printed, and commit detection reports a block
+//!   committed at the destination (`--check`);
 //! - **removed** by a recorded clear that restores the bytes exactly;
 //! - **owned by identity**: a block's BEGIN line names the landing it was
 //!   rendered for (`for=`); a block that names another landing was carried
@@ -35,7 +34,7 @@
 pub mod render;
 
 use crate::refuse::RefuseAt as _;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
 use std::fs::{self, OpenOptions};
 use std::io::{Read as _, Write as _};
@@ -61,6 +60,12 @@ pub const SCHEMA: &str = "bulkload.estate-handoff.v1";
 pub const HANDOFF_LANDED: &str = "handoff.landed";
 /// The hand-off intent's file name.
 pub const HANDOFF_INTENT: &str = "handoff.intent";
+/// The record of carried blocks removed from landed content.
+///
+/// `--clear --clear-carried` writes it (OI-1003-Q190), beside
+/// `workspace.landed`. It outlives `handoff.landed`: converge needs it
+/// while the landed blob stands.
+pub const HANDOFF_STRIPPED: &str = "handoff.stripped";
 /// The targets, at the worktree root: Codex reads `AGENTS.md`, Claude
 /// `CLAUDE.md`.
 pub const TARGETS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
@@ -75,6 +80,7 @@ const TEMP_PREFIX: &str = ".bulkload-handoff-";
 const ALL_NAMES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", OVERRIDE, README];
 const LANDED_MAGIC: &[u8; 16] = b"bulkload-hoff-v1";
 const INTENT_MAGIC: &[u8; 16] = b"bulkload-hoffi-1";
+const STRIPPED_MAGIC: &[u8; 16] = b"bulkload-hofs-v1";
 
 // ---- records -----------------------------------------------------------------
 
@@ -131,8 +137,6 @@ pub struct Stored {
     pub corpus: Vec<u8>,
     pub state: Vec<u8>,
     pub siblings: Vec<(Vec<u8>, Vec<u8>)>,
-    pub private_remotes: Vec<String>,
-    pub allowed: bool,
     pub readme: bool,
 }
 
@@ -202,6 +206,33 @@ pub struct HandoffIntent {
     pub steps: Vec<Step>,
     /// The record a render writes when every step is done.
     pub next: Option<HandoffLanded>,
+    /// A clear with `--clear-carried` (OI-1003-Q190): the carried blocks it
+    /// removes from landed content, recorded in `handoff.stripped` when
+    /// its steps are done (converge accepts them while the intent is
+    /// pending), and whether a settle finishing it removes carried blocks.
+    pub stripped: Vec<Stripped>,
+    pub carried: bool,
+}
+
+/// Carried blocks bulkload removed from the head of a target's landed blob.
+///
+/// `--clear --clear-carried` (OI-1003-Q190): the file holds the landed
+/// blob `base` without its first `len` bytes (whose blake3 is `digest`),
+/// under this landing's block when one is rendered. Converge accepts that
+/// as the landed content while `base` is the seat's landed blob; a
+/// converge that lands a new blob makes the entry stale.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Stripped {
+    pub path: Vec<u8>,
+    pub base: String,
+    pub len: u64,
+    pub digest: [u8; 32],
+}
+
+/// `handoff.stripped`: every recorded removal of carried blocks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffStripped {
+    pub files: Vec<Stripped>,
 }
 
 impl landed::Record for HandoffLanded {
@@ -210,6 +241,22 @@ impl landed::Record for HandoffLanded {
 
 impl landed::Record for HandoffIntent {
     const MAGIC: &'static [u8; 16] = INTENT_MAGIC;
+}
+
+impl landed::Record for HandoffStripped {
+    const MAGIC: &'static [u8; 16] = STRIPPED_MAGIC;
+}
+
+/// The recorded removals of carried blocks in the ledger directory `dir`.
+///
+/// # Errors
+/// An unreadable `handoff.stripped`.
+fn stripped_of(dir: &Path) -> Result<Vec<Stripped>> {
+    Ok(
+        landed::read::<HandoffStripped>(&dir.join(HANDOFF_STRIPPED))?
+            .map(|record| record.files)
+            .unwrap_or_default(),
+    )
 }
 
 fn digest(bytes: &[u8]) -> [u8; 32] {
@@ -231,6 +278,10 @@ pub(super) struct Prefix {
     pub(super) len: u64,
     pub(super) digest: [u8; 32],
     pub(super) trusted: Option<SeatPrint>,
+    /// The bytes of the landed blob's head the file lacks under the block:
+    /// carried blocks `--clear --clear-carried` removed (OI-1003-Q190); 0
+    /// for none. A prefix of length 0 with a strip is the removal alone.
+    pub(super) strip: u64,
 }
 
 /// The old side of every landed seat, as [`sides`] reads it, with each
@@ -250,7 +301,8 @@ pub(super) fn landed_sides(
     let dir = landed::ledger_dir(git_dir, source);
     let record = landed::read::<HandoffLanded>(&dir.join(HANDOFF_LANDED))?;
     let intent = landed::read::<HandoffIntent>(&dir.join(HANDOFF_INTENT))?;
-    if record.is_none() && intent.is_none() {
+    let mut stripped = stripped_of(&dir)?;
+    if record.is_none() && intent.is_none() && stripped.is_empty() {
         return Ok(sides);
     }
     let mut attach = |path: &[u8], mut prefix: Prefix, base: Option<&String>| {
@@ -284,6 +336,7 @@ pub(super) fn landed_sides(
                         .print
                         .clone()
                         .filter(|print| same_fs && print.mtime_ns < racy_from),
+                    strip: 0,
                 },
                 file.base.as_ref(),
             );
@@ -298,6 +351,7 @@ pub(super) fn landed_sides(
                     len: retired.block_len,
                     digest: retired.block,
                     trusted: None,
+                    strip: 0,
                 },
                 None,
             );
@@ -311,35 +365,68 @@ pub(super) fn landed_sides(
                     len: len64(block),
                     digest: digest(block),
                     trusted: None,
+                    strip: 0,
                 },
                 None,
             );
         }
     }
+    // Carried blocks removed from a landed blob (OI-1003-Q190), recorded
+    // or a pending clear's: the seat holds that blob without them, alone
+    // or under any block accepted above. Only over the blob they were
+    // removed from.
+    stripped.extend(intent.iter().flat_map(|intent| intent.stripped.clone()));
+    for strip in &stripped {
+        if let Some(side) = sides.get_mut(&strip.path).filter(|side| {
+            side.kind == Kind::Regular && side.blob.as_deref() == Some(strip.base.as_str())
+        }) {
+            let mut variants: Vec<Prefix> = side
+                .prefix
+                .iter()
+                .filter(|prefix| prefix.strip == 0)
+                .map(|prefix| Prefix {
+                    strip: strip.len,
+                    ..prefix.clone()
+                })
+                .collect();
+            variants.push(Prefix {
+                len: 0,
+                digest: digest(b""),
+                trusted: None,
+                strip: strip.len,
+            });
+            for variant in variants {
+                if !side.prefix.contains(&variant) {
+                    side.prefix.push(variant);
+                }
+            }
+        }
+    }
     Ok(sides)
 }
 
-/// The length of the prefix of `prefixes` that `file` starts with (0 for
-/// none), its position left at that length. Reads at most the longest
-/// prefix.
-pub(super) fn skip_prefix(file: &mut fs::File, prefixes: &[Prefix]) -> Result<u64> {
-    const SITE: &str = "git_carry::converge::handoff::skip_prefix";
+/// The prefixes of `prefixes` that `file` starts with (by length and
+/// digest), longest first: a prefix of length 0 always matches. Reads at
+/// most the longest prefix.
+pub(super) fn matching(file: &mut fs::File, prefixes: &[Prefix]) -> Result<Vec<Prefix>> {
+    const SITE: &str = "git_carry::converge::handoff::matching";
     let longest = prefixes.iter().map(|prefix| prefix.len).max().unwrap_or(0);
     let mut head = Vec::new();
     std::io::Read::by_ref(file)
         .take(longest)
         .read_to_end(&mut head)
         .refuse_at(SITE)?;
-    let found = prefixes
+    let mut found: Vec<Prefix> = prefixes
         .iter()
-        .find(|prefix| {
+        .filter(|prefix| {
             usize::try_from(prefix.len)
                 .ok()
                 .and_then(|len| head.get(..len))
                 .is_some_and(|bytes| digest(bytes) == prefix.digest)
         })
-        .map_or(0, |prefix| prefix.len);
-    std::io::Seek::seek(file, std::io::SeekFrom::Start(found)).refuse_at(SITE)?;
+        .cloned()
+        .collect();
+    found.sort_by(|a, b| b.len.cmp(&a.len).then(a.strip.cmp(&b.strip)));
     Ok(found)
 }
 
@@ -462,17 +549,16 @@ enum Held {
     Plain,
     /// A block at byte 0 that is the file's content, not bulkload's:
     /// rendered for another landing (its `for=` is not this landing's, or
-    /// it names none), on a target no record entry names, or one whose
-    /// whole file is the target's landed blob (a round trip: the block
-    /// carried back to the source and landed again with the source's
-    /// bytes, while the record stands or after it is gone). Carried with
-    /// the source's bytes, so it is content, handled as `Plain` with the
-    /// block kept below (OI-1003-Q185; re-review 2 of 2026-10-16, finding
-    /// 2).
+    /// it names none), or one whose whole file is the target's landed blob
+    /// (a round trip: the block carried back to the source and landed
+    /// again with the source's bytes, while the record stands or after it
+    /// is gone). Carried with the source's bytes, so it is content,
+    /// handled as `Plain` with the block kept below (OI-1003-Q185;
+    /// re-review 2 of 2026-10-16, finding 2).
     Foreign,
-    /// A marker at byte 0 for this landing, on a target the record names
-    /// (or retired), that is not the record's block and not landed
-    /// content: an edit inside the block, a BEGIN with no END.
+    /// A marker at byte 0 for this landing that is not the record's block
+    /// and not landed content: an edit inside the block, a BEGIN with no
+    /// END, or a block whose record is lost (never presented as carried).
     Modified,
 }
 
@@ -527,23 +613,20 @@ fn classify_head(
             });
         }
     }
-    unrecorded(bytes, entry.map(|_| ours), landed)
+    unrecorded(bytes, ours, landed)
 }
 
 /// What the head of a file holds that its record entry does not vouch
-/// for: nothing; a block (or a broken one) of this landing's identity on a
-/// target a record entry names (`recorded`: `Some(ours)`), an edit of this
-/// landing's block unless the whole file is landed content; or a carried
-/// one (another landing's, or any block on a target no record entry names:
-/// re-review of 2026-10-16, finding 4).
-fn unrecorded(
-    head: &[u8],
-    recorded: Option<&str>,
-    landed: &mut dyn FnMut() -> Result<bool>,
-) -> Result<Held> {
+/// for: nothing; a block (or a broken one) of this landing's identity
+/// (`ours`), which is this landing's own edited or stale block unless the
+/// whole file is the landed blob (then it came back with the source's
+/// bytes: a round trip, with or without a record; re-reviews of
+/// 2026-10-16, finding 4 and finding 2); or another landing's block,
+/// carried content.
+fn unrecorded(head: &[u8], ours: &str, landed: &mut dyn FnMut() -> Result<bool>) -> Result<Held> {
     Ok(match render::marker(head) {
         render::Marker::None => Held::Plain,
-        _ if recorded.is_some_and(|ours| render::owner_of(head) == Some(ours.as_bytes())) => {
+        _ if render::owner_of(head) == Some(ours.as_bytes()) => {
             if landed()? {
                 Held::Foreign
             } else {
@@ -1004,7 +1087,7 @@ fn settle(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Settl
         // The operator asked for the block to go: finish that, never put
         // it back (review of 2026-10-16, a crashed clear re-rendered by
         // the next apply's H step).
-        clear(worktree, dir, source, ours)?;
+        clear(worktree, dir, source, ours, intent.carried)?;
         return Ok(Settled {
             swept: swept + 1,
             cleared: true,
@@ -1015,6 +1098,7 @@ fn settle(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Settl
         source,
         instance: instance.as_deref().unwrap_or_default(),
         sides: None,
+        stripped: stripped_of(dir)?,
     };
     // The record names exactly the blocks the targets hold: the intent's
     // new one where it is in place, else the record's own.
@@ -1165,204 +1249,6 @@ pub(super) fn lift(worktree: &Path, git_dir: &Path, source: &str, adds: &[&[u8]]
     Ok(lifted)
 }
 
-// ---- privacy -------------------------------------------------------------------
-
-/// Whether `value` starts with `prefix` at a boundary: the prefix ends in
-/// `/` or `:`, or the value's next byte is one, or nothing follows.
-fn under(value: &str, prefix: &str) -> bool {
-    !prefix.is_empty()
-        && value.strip_prefix(prefix).is_some_and(|rest| {
-            prefix.ends_with(['/', ':']) || rest.is_empty() || rest.starts_with(['/', ':'])
-        })
-}
-
-/// What one configuration source says that the guard reads: remote URL
-/// and push URL values, and URL rewrite rules (`(base, prefix, push)`).
-#[derive(Debug, Default)]
-struct Remotes {
-    urls: Vec<String>,
-    rules: Vec<(String, String, bool)>,
-}
-
-/// Read one configuration source: the repository's own (local and worktree,
-/// `file` `None`) or one file by path, with its includes.
-fn remotes_in(worktree: &Path, file: Option<&Path>, into: &mut Remotes) -> Result<()> {
-    const KEYS: &str = r"^(remote\..*\.(url|pushurl)|url\..*\.(insteadof|pushinsteadof))$";
-    let listed = file
-        .map_or_else(
-            || {
-                git(worktree)
-                    .args(["config", "--null", "--get-regexp", KEYS])
-                    .output()
-            },
-            |file| {
-                git(worktree)
-                    .args(["config", "--null", "--includes", "--file"])
-                    .arg(file)
-                    .args(["--get-regexp", KEYS])
-                    .output()
-            },
-        )
-        .refuse_at("git_carry::converge::handoff::remotes_in")?;
-    match listed.status.code() {
-        Some(1) => return Ok(()),
-        Some(0) => {}
-        _ => return Err(super::super::estimate::child_failed(&listed.stderr)),
-    }
-    for entry in listed
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|e| !e.is_empty())
-    {
-        let (key, value) =
-            entry
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or((entry, &b""[..]), |at| {
-                    (
-                        entry.get(..at).unwrap_or_default(),
-                        entry.get(at + 1..).unwrap_or_default(),
-                    )
-                });
-        let key = String::from_utf8_lossy(key);
-        let value = String::from_utf8_lossy(value).into_owned();
-        if key.starts_with("remote.") {
-            into.urls.push(value);
-        } else if let Some(base) = key.strip_prefix("url.") {
-            if let Some(base) = base.strip_suffix(".pushinsteadof") {
-                into.rules.push((base.to_owned(), value, true));
-            } else if let Some(base) = base.strip_suffix(".insteadof") {
-                into.rules.push((base.to_owned(), value, false));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The configuration files a `git push` from the destination reads beyond
-/// the repository's own, located as Git locates them: the user's global
-/// file(s) and the system file. Bulkload's own Git children never read
-/// them (`git_env`), so the guard names them by path.
-fn user_config_files() -> Vec<PathBuf> {
-    let [global, global_sys, no_global_sys] = super::super::git_env::USER_CONFIG;
-    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
-    let mut files = Vec::new();
-    if let Some(global) = var(global) {
-        files.push(PathBuf::from(global));
-    } else {
-        let home = var("HOME").map(PathBuf::from);
-        let xdg = var("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .or_else(|| home.as_ref().map(|home| home.join(".config")));
-        files.extend(xdg.map(|xdg| xdg.join("git/config")));
-        files.extend(home.map(|home| home.join(".gitconfig")));
-    }
-    let skip = var(no_global_sys).is_some_and(|value| value != "0" && value != "false");
-    if !skip {
-        files.push(var(global_sys).map_or_else(|| PathBuf::from("/etc/gitconfig"), PathBuf::from));
-    }
-    files
-}
-
-/// Whether the user's or the system's configuration file `path` is one Git
-/// reads: followed through symlinks (a home-manager `~/.config/git/config`
-/// is a link into the store; re-review of 2026-10-16, finding 3), a
-/// regular file. A path that does not resolve, or that Git may not read
-/// (`ENOENT`, `ENOTDIR`, `EACCES`), is skipped, as Git skips it.
-///
-/// # Errors
-/// Any other error resolving `path`.
-fn user_config_is_file(path: &Path) -> Result<bool> {
-    match fs::metadata(path) {
-        Ok(meta) => Ok(meta.is_file()),
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::NotFound
-                    | std::io::ErrorKind::NotADirectory
-                    | std::io::ErrorKind::PermissionDenied
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(error) => Err(crate::refuse::io(
-            &error,
-            "git_carry::converge::handoff::user_config",
-        )),
-    }
-}
-
-/// `url` as Git rewrites it with the longest matching rule of one kind
-/// (`push`: `pushInsteadOf`, else `insteadOf`), or `None` when none
-/// matches.
-fn rewritten(url: &str, rules: &[(String, String, bool)], push: bool) -> Option<String> {
-    rules
-        .iter()
-        .filter(|(_, prefix, kind)| {
-            *kind == push && !prefix.is_empty() && url.starts_with(prefix.as_str())
-        })
-        .max_by_key(|(_, prefix, _)| prefix.len())
-        .map(|(base, prefix, _)| format!("{base}{}", url.get(prefix.len()..).unwrap_or_default()))
-}
-
-/// The privacy guard (design 9.1, as amended by the review of 2026-10-16):
-/// `allowed` (the operator named the workspace), `no-remote`, or
-/// `private-remote`. The repository's remotes are every `remote.*.url` and
-/// `remote.*.pushurl` value in its own configuration and in the source's
-/// configuration a landing preserved inert (`carry-config/source-config*`
-/// in the common directory: an origin kept out of the active configuration
-/// is still the repository's remote, and a later `--activate-origin` or a
-/// hand-added remote restores it). Each value is checked as written and as
-/// Git rewrites it (`url.<base>.insteadOf` and `pushInsteadOf`, from the
-/// repository's, the preserved, the user's global and the system
-/// configuration): every form must start with a `--private-remote`
-/// prefix. No URL is ever returned or printed.
-///
-/// # Errors
-/// `HANDOFF_NOT_PRIVATE`; a Git child failure.
-fn privacy(
-    worktree: &Path,
-    common: &Path,
-    prefixes: &[String],
-    allowed: bool,
-) -> Result<&'static str> {
-    if allowed {
-        return Ok("allowed");
-    }
-    let mut found = Remotes::default();
-    remotes_in(worktree, None, &mut found)?;
-    let preserved = common.join("carry-config");
-    for name in ["source-config", "source-config.worktree"] {
-        let file = preserved.join(name);
-        if lstat(&file)?.is_some_and(|meta| meta.is_file()) {
-            remotes_in(worktree, Some(&file), &mut found)?;
-        }
-    }
-    let mut rules = Remotes::default();
-    for file in user_config_files() {
-        if user_config_is_file(&file)? {
-            remotes_in(worktree, Some(&file), &mut rules)?;
-        }
-    }
-    found.rules.extend(rules.rules);
-    if found.urls.is_empty() {
-        return Ok("no-remote");
-    }
-    for url in &found.urls {
-        let forms = [
-            Some(url.clone()),
-            rewritten(url, &found.rules, false),
-            rewritten(url, &found.rules, true),
-        ];
-        for form in forms.iter().flatten() {
-            if !prefixes.iter().any(|prefix| under(form, prefix)) {
-                return Err(BulkloadRefusal::HandoffNotPrivate);
-            }
-        }
-    }
-    Ok("private-remote")
-}
-
 // ---- the census: what a block says, read as metadata -----------------------------
 
 /// One planned item, as the estate side knows it.
@@ -1409,15 +1295,16 @@ pub enum Mode {
     Check,
 }
 
-/// The run's options.
+/// The run's options. Each flag is an independent switch of the verb.
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct Request<'a> {
     pub mode: Mode,
     pub readme: bool,
     pub renew: bool,
-    pub private_remotes: &'a [String],
-    /// Canonical workspaces the operator vouches for (`--allow-workspace`).
-    pub allow: &'a [PathBuf],
+    /// `--clear --clear-carried`: also remove carried blocks, as a recorded
+    /// edit (OI-1003-Q190).
+    pub clear_carried: bool,
     /// `(landed prefix, live prefix)` pairs (`--sibling`).
     pub siblings: &'a [(PathBuf, PathBuf)],
     pub as_of: Option<i128>,
@@ -1439,7 +1326,6 @@ pub struct FileRow {
 pub struct Row {
     pub outcome: &'static str,
     pub state: Option<&'static str>,
-    pub private: Option<&'static str>,
     pub files: Vec<FileRow>,
     pub inputs: Option<[u8; 32]>,
     pub open: Option<u64>,
@@ -1447,6 +1333,10 @@ pub struct Row {
     /// `--check`: `HANDOFF_MARKER_COMMITTED` when the token is staged or
     /// committed.
     pub refusal: Option<BulkloadRefusal>,
+    /// `--check`: whether the token is in the source's history (a commit
+    /// the carried capture reaches): information, never a refusal
+    /// (OI-1003-Q191).
+    pub source_history: Option<bool>,
 }
 
 /// One worktree of the family, read as metadata.
@@ -1458,6 +1348,9 @@ struct Member {
     ledger: Option<(LandedWorkspace, [u8; 32])>,
     now: Option<(Option<String>, String)>,
     changed: u64,
+    /// A destination-only worktree (no plan item names it): whether its
+    /// working tree has uncommitted changes (OI-1003-Q189).
+    dirty: bool,
 }
 
 /// The family of the repository a workspace belongs to.
@@ -1526,6 +1419,7 @@ fn census(common: &Path, worktree: &Path, source: &str, items: &[Planned]) -> Re
         } else {
             None
         };
+        let dirty = item.is_none() && git_dir.is_some() && dirty(&path);
         members.push(Member {
             path,
             main: index == 0,
@@ -1533,12 +1427,31 @@ fn census(common: &Path, worktree: &Path, source: &str, items: &[Planned]) -> Re
             ledger,
             now,
             changed,
+            dirty,
         });
     }
     let refs = super::super::output(
         git(common).args(["for-each-ref", "--format=%(objectname) %(refname)"]),
     )?;
     Ok(Census { members, refs })
+}
+
+/// Whether the checkout at `path` has uncommitted changes, as a read-only
+/// `git status` lists them (untracked files included, ignored ones not;
+/// `--no-optional-locks`, so the index is never refreshed on disk). A
+/// status that cannot be read counts as dirty: `ready` never vouches for a
+/// tree it could not read (OI-1003-Q189).
+fn dirty(path: &Path) -> bool {
+    !git(path)
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=none",
+        ])
+        .output()
+        .is_ok_and(|out| out.status.success() && out.stdout.is_empty())
 }
 
 /// Whether `oid` is a commit some branch of `repo` holds (`except` left
@@ -1605,10 +1518,12 @@ fn sibling_of(worktree: &Path, siblings: &[(PathBuf, PathBuf)]) -> Result<Option
             }
             _ => false,
         };
+        let dirty = matches!(state, SiblingState::Head { .. }) && dirty(&path);
         return Ok(Some(Sibling {
             path: path.into_os_string().into_vec(),
             state,
             consolidated,
+            dirty,
         }));
     }
     Ok(None)
@@ -1646,18 +1561,15 @@ fn host() -> String {
 /// The options a run renders or checks under: what the request gives,
 /// and for what it leaves out, what the record was rendered with (review
 /// of 2026-10-16: a plain rerun, the H step and the `--check` a block
-/// prints all keep a render's `--sibling`, `--private-remote`,
-/// `--allow-workspace` and `--readme`). To drop one, clear and render
-/// again.
+/// prints all keep a render's `--sibling` and `--readme`). To drop one,
+/// clear and render again.
 #[derive(Debug, Clone)]
 struct Effective {
     siblings: Vec<(PathBuf, PathBuf)>,
-    private_remotes: Vec<String>,
-    allowed: bool,
     readme: bool,
 }
 
-fn effective(request: &Request<'_>, record: Option<&HandoffLanded>, this: &Path) -> Effective {
+fn effective(request: &Request<'_>, record: Option<&HandoffLanded>) -> Effective {
     let kept = record.map(|record| &record.options);
     let path = |bytes: &[u8]| PathBuf::from(OsStr::from_bytes(bytes));
     Effective {
@@ -1672,14 +1584,6 @@ fn effective(request: &Request<'_>, record: Option<&HandoffLanded>, this: &Path)
         } else {
             request.siblings.to_vec()
         },
-        private_remotes: if request.private_remotes.is_empty() {
-            kept.map(|kept| kept.private_remotes.clone())
-                .unwrap_or_default()
-        } else {
-            request.private_remotes.to_vec()
-        },
-        allowed: request.allow.iter().any(|allowed| allowed == this)
-            || kept.is_some_and(|kept| kept.allowed),
         readme: request.readme
             || record.is_some_and(|record| {
                 record
@@ -1705,8 +1609,6 @@ fn stored(estate: &Estate<'_>, options: &Effective) -> Stored {
                 )
             })
             .collect(),
-        private_remotes: options.private_remotes.clone(),
-        allowed: options.allowed,
         readme: options.readme,
     }
 }
@@ -1755,6 +1657,7 @@ fn inputs_digest(
             .map_or([0; 32], |(_, digest)| *digest));
         put(&encode(&member.now)?);
         put(&member.changed.to_le_bytes());
+        put(&[u8::from(member.dirty)]);
         let planned = member
             .item
             .as_ref()
@@ -1878,6 +1781,7 @@ fn gather(
             dest_only.push(DestOnly {
                 path: member.path.as_os_str().as_bytes().to_vec(),
                 consolidated,
+                dirty: member.dirty,
             });
         }
         if let Some(code) = planned.and_then(|item| item.refused.clone()) {
@@ -1943,20 +1847,35 @@ fn block_for(inputs: &Inputs) -> Result<Vec<u8>> {
 }
 
 /// The landed sides of a workspace, read once and only when a render
-/// writes over a target.
+/// writes over a target, and the carried blocks recorded as removed from
+/// them (`handoff.stripped`, OI-1003-Q190).
 struct Landed<'a> {
     source: &'a str,
     instance: &'a str,
     sides: Option<BTreeMap<Vec<u8>, Side>>,
+    stripped: Vec<Stripped>,
 }
 
 /// The landed blob of target `name` when `remainder` (the bytes a render
-/// keeps under its block) is exactly it, else `None`.
+/// keeps under its block) is exactly it, or it without carried blocks a
+/// recorded `--clear --clear-carried` removed from its head (OI-1003-Q190),
+/// else `None`.
 fn landed_base(
     worktree: &Path,
     landed: &mut Landed<'_>,
     name: &str,
     remainder: &[u8],
+) -> Result<Option<String>> {
+    landed_match(worktree, landed, name, remainder, true)
+}
+
+/// [`landed_base`], counting the recorded removals only with `stripped`.
+fn landed_match(
+    worktree: &Path,
+    landed: &mut Landed<'_>,
+    name: &str,
+    remainder: &[u8],
+    stripped: bool,
 ) -> Result<Option<String>> {
     if landed.instance.is_empty() {
         return Ok(None);
@@ -1974,34 +1893,60 @@ fn landed_base(
     else {
         return Ok(None);
     };
+    let mut skips = vec![0];
+    if stripped {
+        skips.extend(
+            landed
+                .stripped
+                .iter()
+                .filter(|strip| strip.path == name.as_bytes() && strip.base == blob)
+                .map(|strip| strip.len),
+        );
+    }
     // The landed blob's bytes, as the object store holds them, compared
     // with the remainder (a read through the existing batch reader; no
     // object is written).
     let mut objects = super::super::batch_objects::BatchObjects::new(worktree)?;
-    let mut same = SameBytes {
-        expected: remainder,
-        at: 0,
-        equal: true,
-    };
-    let length = objects.copy_into(&blob, &mut same, None);
+    let mut found = false;
+    for skip in skips {
+        let mut same = SameBytes {
+            expected: remainder,
+            at: 0,
+            equal: true,
+            skip,
+        };
+        objects.copy_into(&blob, &mut same, None)?;
+        if same.equal && same.skip == 0 && same.at == remainder.len() {
+            found = true;
+            break;
+        }
+    }
     objects.finish()?;
-    length?;
-    Ok((same.equal && same.at == remainder.len()).then_some(blob))
+    Ok(found.then_some(blob))
 }
 
-/// A writer that checks it is handed exactly `expected`, in order.
+/// A writer that checks it is handed exactly `expected`, in order, after
+/// its first `skip` bytes.
 struct SameBytes<'a> {
     expected: &'a [u8],
     at: usize,
     equal: bool,
+    skip: u64,
 }
 
 impl std::io::Write for SameBytes<'_> {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, given: &[u8]) -> std::io::Result<usize> {
+        let skipped = usize::try_from(self.skip)
+            .unwrap_or(usize::MAX)
+            .min(given.len());
+        self.skip = self
+            .skip
+            .saturating_sub(u64::try_from(skipped).unwrap_or(u64::MAX));
+        let bytes = given.get(skipped..).unwrap_or_default();
         let end = self.at.saturating_add(bytes.len());
         self.equal &= self.expected.get(self.at..end) == Some(bytes);
         self.at = end;
-        Ok(bytes.len())
+        Ok(given.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -2072,7 +2017,7 @@ pub fn intent_pending(worktree: &Path, source: &str) -> bool {
 /// Hand off one workspace (render, dry run, clear or check).
 ///
 /// # Errors
-/// `HANDOFF_NOT_LANDED`, `HANDOFF_NOT_PRIVATE`, `HANDOFF_TARGET_UNSUPPORTED`,
+/// `HANDOFF_NOT_LANDED`, `HANDOFF_TARGET_UNSUPPORTED`,
 /// `HANDOFF_BLOCK_MODIFIED`, `GIT_CONVERGE_INTERRUPTED` (a converge of the
 /// workspace is pending), `DESTINATION_EXCHANGE_UNSUPPORTED`,
 /// `BUDGET_EXCEEDED`, or a file-system or Git failure.
@@ -2091,13 +2036,26 @@ pub fn run(
         Mode::Check => check(workspace, request, estate, session, &place, &ours),
         Mode::Clear => {
             let _lock = landed::lock(&place.common, estate.source)?;
-            if settle(workspace.worktree, &place.dir, estate.source, &ours)?.cleared {
+            let settled = settle(workspace.worktree, &place.dir, estate.source, &ours)?;
+            if settled.cleared && !request.clear_carried {
                 return Ok(Row {
                     outcome: "cleared",
                     ..Row::default()
                 });
             }
-            clear(workspace.worktree, &place.dir, estate.source, &ours)
+            // A pending clear finished, then `--clear-carried` asked for
+            // more: a clear of what is left.
+            let mut row = clear(
+                workspace.worktree,
+                &place.dir,
+                estate.source,
+                &ours,
+                request.clear_carried,
+            )?;
+            if settled.cleared {
+                row.outcome = "cleared";
+            }
+            Ok(row)
         }
         Mode::Render | Mode::DryRun => {
             let _lock = if request.mode == Mode::Render {
@@ -2184,13 +2142,7 @@ fn render_workspace(
     let this = canonical(worktree);
     let record_path = place.dir.join(HANDOFF_LANDED);
     let record = landed::read::<HandoffLanded>(&record_path)?;
-    let options = effective(request, record.as_ref(), &this);
-    let private = privacy(
-        worktree,
-        &place.common,
-        &options.private_remotes,
-        options.allowed,
-    )?;
+    let options = effective(request, record.as_ref());
     let names = names_for(worktree, options.readme, record.as_ref())?;
     let found = classify(worktree, &names)?;
     let fsid = landed::fsid(worktree)?;
@@ -2202,6 +2154,7 @@ fn render_workspace(
         source: estate.source,
         instance: &place.ledger.instance,
         sides: None,
+        stripped: stripped_of(&place.dir)?,
     };
     // What each target holds (read only when its print moved).
     let mut held_by: Vec<(&'static str, Option<Held>)> = Vec::new();
@@ -2304,7 +2257,6 @@ fn render_workspace(
         return Ok(Row {
             outcome: "unchanged",
             open: record.as_ref().map(|record| record.open),
-            private: Some(private),
             files: record
                 .iter()
                 .flat_map(|record| &record.files)
@@ -2552,7 +2504,6 @@ fn render_workspace(
     if request.mode == Mode::DryRun {
         return Ok(Row {
             outcome: "planned",
-            private: Some(private),
             files: rows,
             inputs: Some(inputs),
             open: Some(open),
@@ -2589,6 +2540,8 @@ fn render_workspace(
             tag: tag.clone(),
             steps: steps.clone(),
             next: Some(next.clone()),
+            stripped: Vec::new(),
+            carried: false,
         };
         landed::write(&place.dir.join(HANDOFF_INTENT), &intent)?;
         fault_point!(EstateHandoffAfterIntent);
@@ -2645,7 +2598,6 @@ fn render_workspace(
     }
     Ok(Row {
         outcome: if wrote { "written" } else { "unchanged" },
-        private: Some(private),
         files: rows,
         inputs: Some(inputs),
         open: Some(open),
@@ -2653,27 +2605,59 @@ fn render_workspace(
     })
 }
 
+/// The length of the carried blocks at the head of `bytes`: every
+/// well-formed block there, one after another (a broken one ends them).
+fn carried_len(bytes: &[u8]) -> usize {
+    let mut at = 0;
+    while let render::Marker::Block(len) = render::marker(bytes.get(at..).unwrap_or_default()) {
+        at += len;
+    }
+    at
+}
+
+/// One target a clear rewrites: the bytes read, this landing's block's
+/// length (0: none), the carried blocks' length removed under it (0: none,
+/// OI-1003-Q190) and the record's entry for the block.
+struct Clearing {
+    name: &'static str,
+    read: Whole,
+    cut: usize,
+    drop: usize,
+    file: Option<HandoffFile>,
+}
+
 /// Clear one workspace (design 7): each intact recorded block stripped (a
 /// created file that is the block alone removed), then the record and the
 /// intent removed. A marker of this landing's that is not the record's
-/// refuses `HANDOFF_BLOCK_MODIFIED` with nothing written; a block carried
-/// from another landing is content and stays (OI-1003-Q185). A refusal
-/// after the intent keeps it, so the next run of either verb finishes the
-/// clear ([`settle`]).
+/// refuses `HANDOFF_BLOCK_MODIFIED` with nothing written; a carried block is
+/// content and stays (OI-1003-Q185) unless `carried` (`--clear-carried`,
+/// OI-1003-Q190) asks: then the carried blocks at the head of a target's
+/// landed content (under this landing's block, or alone) are removed by
+/// the same intent and exchange, and recorded in `handoff.stripped`, which
+/// converge reads (the landing's objects still hold the bytes). A carried
+/// block above content that is not the landed blob (a user's edit) is
+/// kept, row `carried-kept`. A refusal after the intent keeps it, so the
+/// next run of either verb finishes the clear ([`settle`]).
 #[allow(clippy::too_many_lines)]
-fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Row> {
+fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str, carried: bool) -> Result<Row> {
     let record_path = dir.join(HANDOFF_LANDED);
     let intent_path = dir.join(HANDOFF_INTENT);
+    let stripped_path = dir.join(HANDOFF_STRIPPED);
     let record = landed::read::<HandoffLanded>(&record_path)?;
-    let pending = landed::exists(&intent_path)?;
+    // A pending clear this call finishes (from `settle`): its choice and
+    // the removals of the steps it completed are kept.
+    let prior = landed::read::<HandoffIntent>(&intent_path)?;
+    let carried = carried || prior.as_ref().is_some_and(|prior| prior.carried);
     let fsid = landed::fsid(worktree)?;
     let instance = landed_of(dir)?;
     let mut landed = Landed {
         source,
         instance: instance.as_deref().unwrap_or_default(),
         sides: None,
+        stripped: stripped_of(dir)?,
     };
-    let mut work: Vec<(&'static str, Whole, HandoffFile)> = Vec::new();
+    let mut work: Vec<Clearing> = Vec::new();
+    let mut strips: Vec<Stripped> = Vec::new();
     let mut rows = Vec::new();
     for name in ALL_NAMES {
         let path = worktree.join(name);
@@ -2695,7 +2679,7 @@ fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Row> {
             }
             continue;
         }
-        match held(
+        let file = match held(
             worktree,
             name,
             &meta,
@@ -2704,32 +2688,90 @@ fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Row> {
             ours,
             &mut landed,
         )? {
-            Held::Plain | Held::Foreign => {}
+            Held::Plain | Held::Foreign => None,
             Held::Modified => return Err(BulkloadRefusal::HandoffBlockModified),
-            Held::Intact(file) => {
-                let read = read_block(&path, name, &file)?;
-                work.push((name, read, file));
+            Held::Intact(file) => Some(file),
+        };
+        if file.is_none() && !carried {
+            continue;
+        }
+        let read = match &file {
+            Some(file) => read_block(&path, name, file)?,
+            None => read_whole(&path, name)?,
+        };
+        let cut = match &file {
+            Some(file) => {
+                usize::try_from(file.block_len).map_err(|_| BulkloadRefusal::BudgetExceeded)?
+            }
+            None => 0,
+        };
+        let rest = read.bytes.get(cut..).unwrap_or_default();
+        let mut drop = 0;
+        if carried {
+            let blocks = carried_len(rest);
+            if blocks > 0 {
+                // Only from the landed content itself: its bytes stay in the
+                // landing's objects, and converge can account for them.
+                match landed_match(worktree, &mut landed, name, rest, false)? {
+                    Some(base) => {
+                        drop = blocks;
+                        let removed = rest.get(..blocks).unwrap_or_default();
+                        strips.push(Stripped {
+                            path: name.as_bytes().to_vec(),
+                            base,
+                            len: len64(removed),
+                            digest: digest(removed),
+                        });
+                    }
+                    None => rows.push(FileRow {
+                        path: name.as_bytes().to_vec(),
+                        kind: file.as_ref().map_or("absent", |file| file.kind.name()),
+                        action: "carried-kept",
+                    }),
+                }
             }
         }
+        if cut == 0 && drop == 0 {
+            continue;
+        }
+        work.push(Clearing {
+            name,
+            read,
+            cut,
+            drop,
+            file,
+        });
     }
-    if work.is_empty() && record.is_none() && !pending {
+    if work.is_empty() && record.is_none() && prior.is_none() {
+        rows.sort_by(|a, b| a.path.cmp(&b.path));
         return Ok(Row {
             outcome: "unchanged",
+            files: rows,
             ..Row::default()
         });
     }
     let tag = tag();
     let mut steps = Vec::new();
-    for (name, read, file) in &work {
-        let cut = usize::try_from(file.block_len).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
-        let rest = read.bytes.get(cut..).unwrap_or_default();
-        let gone = file.kind == FileKind::Created && rest.is_empty();
+    for clearing in &work {
+        let rest = clearing.read.bytes.get(clearing.cut..).unwrap_or_default();
+        let gone = clearing
+            .file
+            .as_ref()
+            .is_some_and(|file| file.kind == FileKind::Created)
+            && rest.is_empty();
+        let after = clearing
+            .read
+            .bytes
+            .get(clearing.cut + clearing.drop..)
+            .unwrap_or_default();
         steps.push(Step {
-            path: name.as_bytes().to_vec(),
-            old_block: read.bytes.get(..cut).map(<[u8]>::to_vec),
+            path: clearing.name.as_bytes().to_vec(),
+            old_block: (clearing.cut > 0)
+                .then(|| clearing.read.bytes.get(..clearing.cut).map(<[u8]>::to_vec))
+                .flatten(),
             new_block: None,
-            before: Some(digest(&read.bytes)),
-            after: (!gone).then(|| digest(rest)),
+            before: Some(digest(&clearing.read.bytes)),
+            after: (!gone).then(|| digest(after)),
         });
     }
     let intent = HandoffIntent {
@@ -2737,22 +2779,27 @@ fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Row> {
         tag: tag.clone(),
         steps: steps.clone(),
         next: None,
+        stripped: strips.clone(),
+        carried,
     };
     if !steps.is_empty() {
         landed::write(&intent_path, &intent)?;
         fault_point!(EstateHandoffAfterIntent);
     }
-    for (n, ((name, read, file), step)) in work.iter().zip(&steps).enumerate() {
+    for (n, (clearing, step)) in work.iter().zip(&steps).enumerate() {
         let temp = temp_name(&tag, n);
-        let cut = usize::try_from(file.block_len).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
         let outcome = if step.after.is_none() {
-            remove(worktree, name, read, &temp)
+            remove(worktree, clearing.name, &clearing.read, &temp)
         } else {
             exchange(
                 worktree,
-                name,
-                read,
-                read.bytes.get(cut..).unwrap_or_default(),
+                clearing.name,
+                &clearing.read,
+                clearing
+                    .read
+                    .bytes
+                    .get(clearing.cut + clearing.drop..)
+                    .unwrap_or_default(),
                 &temp,
                 Op::Clear,
             )
@@ -2763,10 +2810,41 @@ fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Row> {
             return Err(refusal);
         }
         rows.push(FileRow {
-            path: name.as_bytes().to_vec(),
-            kind: file.kind.name(),
-            action: "cleared",
+            path: clearing.name.as_bytes().to_vec(),
+            kind: clearing
+                .file
+                .as_ref()
+                .map_or("absent", |file| file.kind.name()),
+            action: if clearing.drop > 0 {
+                "carried-cleared"
+            } else {
+                "cleared"
+            },
         });
+    }
+    // The removals recorded: the ones already recorded, a finished prior
+    // clear's (its steps done), and this run's (OI-1003-Q190).
+    let mut recorded = landed.stripped.clone();
+    if let Some(prior) = &prior {
+        for strip in &prior.stripped {
+            let done = prior
+                .steps
+                .iter()
+                .find(|step| step.path == strip.path)
+                .is_some_and(|step| {
+                    whole_digest(&worktree.join(OsStr::from_bytes(&strip.path)))
+                        .is_ok_and(|now| now == step.after)
+                });
+            if done {
+                recorded.push(strip.clone());
+            }
+        }
+    }
+    recorded.extend(strips);
+    recorded.sort();
+    recorded.dedup();
+    if recorded != landed.stripped {
+        landed::write(&stripped_path, &HandoffStripped { files: recorded })?;
     }
     landed::remove(&record_path)?;
     landed::remove(&intent_path)?;
@@ -2778,8 +2856,9 @@ fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Row> {
     })
 }
 
-/// Whether the blob of `name` at `rev` (`:` for the index) holds the token.
-fn blob_has_token(worktree: &Path, rev: &str, name: &str) -> Result<bool> {
+/// The lines of the blob of `name` at `rev` (`""`: the index) that hold
+/// the token (none when there is no such blob).
+fn token_lines(worktree: &Path, rev: &str, name: &str) -> Result<BTreeSet<Vec<u8>>> {
     let spec = if rev.is_empty() {
         format!(":{name}")
     } else {
@@ -2789,22 +2868,64 @@ fn blob_has_token(worktree: &Path, rev: &str, name: &str) -> Result<bool> {
         .args(["cat-file", "blob", &spec])
         .output()
         .refuse_at("git_carry::converge::handoff::blob")?;
-    Ok(out.status.success()
-        && out
-            .stdout
-            .windows(TOKEN.len())
-            .any(|window| window == TOKEN.as_bytes()))
+    if !out.status.success() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(out
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| holds_token(line))
+        .map(<[u8]>::to_vec)
+        .collect())
 }
 
-/// Whether a branch's or tag's history (or a detached HEAD's) holds a
-/// commit that put the token into one of the target names: a block
-/// committed and removed again is still published by a push (review of
-/// 2026-10-16). Every name a hand-off may ever write is read ([`ALL_NAMES`]),
-/// not this run's targets: a README or override block committed while it
-/// was a target stays in history after `--clear` drops the record
-/// (re-review, finding 5). The carried capture refs (`refs/carry/`) are
-/// not pushed and are not read.
-fn history_has_token(worktree: &Path) -> Result<bool> {
+fn holds_token(bytes: &[u8]) -> bool {
+    bytes
+        .windows(TOKEN.len())
+        .any(|window| window == TOKEN.as_bytes())
+}
+
+/// The carried capture: every ref under `refs/carry/` (the source's
+/// history as captured, never pushed). What it reaches is the source's
+/// history, not a commit made here (OI-1003-Q191).
+const CARRIED: &str = "--glob=refs/carry/";
+
+/// Whether a patch (`git log -p` output, a plain or a combined diff) adds a
+/// line holding the token: a hunk line marked `+` against every parent (a
+/// line removed, or one a merge took unchanged from a parent, adds
+/// nothing).
+fn adds_token(patch: &[u8]) -> bool {
+    let mut columns = 0;
+    for line in patch.split(|byte| *byte == b'\n') {
+        if line.starts_with(b"diff ") {
+            columns = 0;
+        } else if line.starts_with(b"@@") {
+            columns = line
+                .iter()
+                .take_while(|byte| **byte == b'@')
+                .count()
+                .saturating_sub(1)
+                .max(1);
+        } else if columns > 0
+            && line
+                .get(..columns)
+                .is_some_and(|marks| marks.iter().all(|mark| *mark == b'+'))
+            && holds_token(line.get(columns..).unwrap_or_default())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether a commit of a branch's or tag's history (or a detached HEAD's)
+/// that the carried capture does not reach adds a line holding the token
+/// to a name a hand-off may write ([`ALL_NAMES`], whatever this run's
+/// targets are: re-review of 2026-10-16, finding 5). A block committed
+/// here and removed again is still published by a push (review of
+/// 2026-10-16); a block the source committed is the source's history,
+/// reported by [`in_source_history`] and never flagged (OI-1003-Q191).
+fn history_adds_token(worktree: &Path) -> Result<bool> {
     let mut command = git(worktree);
     command.args([
         "log",
@@ -2812,16 +2933,45 @@ fn history_has_token(worktree: &Path) -> Result<bool> {
         "--tags",
         "--no-ext-diff",
         "--no-textconv",
-        "--format=%H",
-        "-1",
-        "-S",
+        "--no-color",
+        "--format=",
+        "--patch",
+        "--cc",
+        "--unified=0",
+        "-G",
         TOKEN,
     ]);
     if now_of(worktree)?.is_some() {
         command.arg("HEAD");
     }
+    command.args(["--not", CARRIED]);
     command.arg("--").args(ALL_NAMES);
     let out = command
+        .output()
+        .refuse_at("git_carry::converge::handoff::history")?;
+    if !out.status.success() {
+        return Err(super::super::estimate::child_failed(&out.stderr));
+    }
+    Ok(adds_token(&out.stdout))
+}
+
+/// Whether the carried capture's history holds a commit that put the token
+/// into a name a hand-off may write: a block the source committed,
+/// reported once per workspace as information (OI-1003-Q191).
+fn in_source_history(worktree: &Path) -> Result<bool> {
+    let out = git(worktree)
+        .args([
+            "log",
+            CARRIED,
+            "--no-ext-diff",
+            "--no-textconv",
+            "--format=%H",
+            "-1",
+            "-S",
+            TOKEN,
+            "--",
+        ])
+        .args(ALL_NAMES)
         .output()
         .refuse_at("git_carry::converge::handoff::history")?;
     Ok(out.status.success() && out.stdout.iter().any(|byte| !byte.is_ascii_whitespace()))
@@ -2844,13 +2994,14 @@ fn check(
     let this = canonical(worktree);
     let record = landed::read::<HandoffLanded>(&place.dir.join(HANDOFF_LANDED))?;
     let fsid = landed::fsid(worktree)?;
-    let options = effective(request, record.as_ref(), &this);
+    let options = effective(request, record.as_ref());
     let names = names_for(worktree, options.readme, record.as_ref())?;
     let found = classify(worktree, &names)?;
     let mut landed = Landed {
         source: estate.source,
         instance: &place.ledger.instance,
         sides: None,
+        stripped: stripped_of(&place.dir)?,
     };
     let mut modified = false;
     let mut missing = false;
@@ -2936,24 +3087,19 @@ fn check(
         as_of,
     )?;
     let open = facts.open();
-    // Commit detection: the index blob, the HEAD blob, each destination-
-    // ahead, destination-only or diverged tip's blob, and the history of
-    // every branch and tag, of every name a hand-off may write (not only
-    // this run's targets: re-review of 2026-10-16, finding 5).
+    // Commit detection (OI-1003-Q191): staged, a line holding the token in
+    // a target's index blob that its HEAD blob lacks (a block the source
+    // committed is in HEAD already); committed, a commit the carried
+    // capture does not reach that adds one, in any branch's or tag's
+    // history or HEAD's, for every name a hand-off may write. A token the
+    // source's history holds is information only.
     let mut staged = false;
-    let mut committed = false;
     for name in ALL_NAMES {
-        staged |= blob_has_token(worktree, "", name)?;
-        committed |= blob_has_token(worktree, "HEAD", name)?;
-        for row in facts
-            .refs
-            .iter()
-            .filter(|row| matches!(row.class.as_str(), "dest-ahead" | "dest-only" | "diverged"))
-        {
-            committed |= blob_has_token(worktree, &row.name, name)?;
-        }
+        let head = token_lines(worktree, "HEAD", name)?;
+        staged |= !token_lines(worktree, "", name)?.is_subset(&head);
     }
-    committed = committed || history_has_token(worktree)?;
+    let committed = history_adds_token(worktree)?;
+    let source_history = in_source_history(worktree)?;
     let state = if committed {
         "committed"
     } else if staged {
@@ -2985,6 +3131,7 @@ fn check(
         inputs: Some(inputs),
         open: Some(open),
         refusal: (staged || committed).then_some(BulkloadRefusal::HandoffMarkerCommitted),
+        source_history: Some(source_history),
         ..Row::default()
     })
 }

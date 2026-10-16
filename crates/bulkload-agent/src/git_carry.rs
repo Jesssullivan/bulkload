@@ -98,19 +98,6 @@ pub(crate) mod git_env {
         ("LANGUAGE", ""),
     ];
 
-    /// The variables Git reads to locate the user's global and system
-    /// configuration files, in Git's order: the global file's override, the
-    /// system file's override, and the switch that skips the system file.
-    /// Bulkload's own children never read those files (`SET`); the
-    /// hand-off's privacy guard reads the URL rewrite rules in them by path
-    /// (`--file`), as a push from the destination would apply them
-    /// (TIN-6569, review of 2026-10-16).
-    pub const USER_CONFIG: [&str; 3] = [
-        "GIT_CONFIG_GLOBAL",
-        "GIT_CONFIG_SYSTEM",
-        "GIT_CONFIG_NOSYSTEM",
-    ];
-
     /// `-c` overrides every Git child runs with: no hooks, no fsmonitor, no
     /// automatic gc or maintenance, and bounded pack resources.
     ///

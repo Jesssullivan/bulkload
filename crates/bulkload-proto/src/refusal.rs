@@ -131,12 +131,6 @@ pub enum BulkloadRefusal {
     /// its journal missing), so there is no landing to hand off. Nothing is
     /// written.
     HandoffNotLanded,
-    /// `estate-handoff`: the workspace's repository has a remote whose
-    /// URL is under no `--private-remote` prefix, and the workspace is not
-    /// named by `--allow-workspace`. bulkload cannot tell a public
-    /// repository from a private one, so it writes no absolute path or
-    /// host name into it. Nothing is written; no URL is printed.
-    HandoffNotPrivate,
     /// `estate-handoff`: a target (`AGENTS.md`, `CLAUDE.md`, an opted-in
     /// `README.md`) is a directory, a FIFO or another file that is not
     /// regular, or a symbolic link that is not `CLAUDE.md -> AGENTS.md`
@@ -384,7 +378,6 @@ impl BulkloadRefusal {
             Self::GitDestinationModified => "GIT_DESTINATION_MODIFIED",
             Self::GitDestinationDiverged => "GIT_DESTINATION_DIVERGED",
             Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
-            Self::HandoffNotPrivate => "HANDOFF_NOT_PRIVATE",
             Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
             Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
             Self::HandoffMarkerCommitted => "HANDOFF_MARKER_COMMITTED",
@@ -460,7 +453,6 @@ impl BulkloadRefusal {
         "GIT_DESTINATION_MODIFIED",
         "GIT_DESTINATION_DIVERGED",
         "HANDOFF_NOT_LANDED",
-        "HANDOFF_NOT_PRIVATE",
         "HANDOFF_TARGET_UNSUPPORTED",
         "HANDOFF_BLOCK_MODIFIED",
         "HANDOFF_MARKER_COMMITTED",
@@ -695,7 +687,6 @@ mod tests {
             BulkloadRefusal::GitDestinationModified,
             BulkloadRefusal::GitDestinationDiverged,
             BulkloadRefusal::HandoffNotLanded,
-            BulkloadRefusal::HandoffNotPrivate,
             BulkloadRefusal::HandoffTargetUnsupported,
             BulkloadRefusal::HandoffBlockModified,
             BulkloadRefusal::HandoffMarkerCommitted,

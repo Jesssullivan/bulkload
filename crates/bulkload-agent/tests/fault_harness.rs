@@ -1386,6 +1386,8 @@ scenarios! {
     // by a run that refuses; a crashed clear finished by a no-op apply.
     estate_handoff_rerender_over_edit => EstateHandoffAfterIntent: 1, EstateHandoff::RerenderOverEdit;
     estate_handoff_clear_noop_apply => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearNoOpApply;
+    estate_handoff_clear_carried_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::ClearCarried;
+    estate_handoff_clear_carried_after_exchange => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearCarried;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

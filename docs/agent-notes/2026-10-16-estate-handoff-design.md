@@ -1302,10 +1302,180 @@ empty untracked file and converge would not lift it before an add).
   re-reviews). The mutation rows for this commit ran after it; their
   table is in 19.8.
 
+### 19.4 The rulings (Linear TIN-6569 comment `9c7121b5`, as relayed)
+
+| Ruling | Text (relayed) | Built |
+|---|---|---|
+| OI-1003-Q188 | Remove the privacy guard entirely ("an erroneous overreach; such a block is irrelevant to bulkload"). The block is always written; commit detection stays as a report. | `privacy`, `under`, `Remotes`, `remotes_in`, `user_config_files`, `user_config_is_file`, `rewritten`, `git_env::USER_CONFIG`, `HANDOFF_NOT_PRIVATE` (proto code, taxonomy row), `--private-remote`, `--allow-workspace`, `Stored.private_remotes`/`allowed` and the rows' `private` field are gone. H26, H27 and H36 (the guard's rows) are removed; H11 now pins the opposite: a landed clone with a public remote and the source's inert origin gets its block, no URL appears anywhere, and the old flags are unknown. The fault row `rerender_over_edit` refuses on a target it cannot write (a directory at `AGENTS.override.md`) instead. |
+| OI-1003-Q189 | `ready` = the commit rules AND a clean working tree in the live sibling and in every destination-only worktree (a read-only `git status` each). | `dirty`: `git status --porcelain=v1 -z --untracked-files=normal --ignore-submodules=none` through `git_carry::git` (`--no-optional-locks`, hooks and fsmonitor off), read on every run for the sibling (`Sibling.dirty`) and each destination-only worktree (`DestOnly.dirty`, in the inputs digest); a status that lists an entry or cannot be read is an open row. The block says which tree is not clean. H44, H45; H29 and H38 now settle the source's untracked `notes.txt` the sibling copy carries. |
+| OI-1003-Q190 | Carried blocks are kept as content (Q185); opt-in `--clear-carried` removes them as a recorded, ledgered bulkload edit (intent, temp + fsync + exchange with displaced check, record), default hands-off. | `--clear-carried`, valid only with `--clear` (`FIELD_DOMAIN_VIOLATION` otherwise). `clear` removes the consecutive well-formed blocks at the head of a target's bytes under this landing's block (or alone) only when those bytes are exactly the landed blob (`landed_match`), so the removed bytes stay in the landing's objects; above anything else it keeps them (`carried-kept`). The intent names the removals (`HandoffIntent.stripped`, `carried`); after the exchanges they go to `handoff.stripped` (`HandoffStripped`), which `--clear` never removes. Converge: `landed_sides` adds a strip variant of every accepted prefix and the removal alone (`Prefix.strip`), only over the blob it was made from; `holds` compares the file with the blob after `strip` bytes; `landed_base` is strip-aware, so a later render over the stripped file vouches for it. A settle finishing a crashed clear keeps its flag and records the removals of the steps it finds done. H46, H47, unit `holds_accepts_a_recorded_removal_of_carried_blocks_only`, fault rows `estate_handoff_clear_carried_after_intent` and `_after_exchange`. |
+| OI-1003-Q191 | Commit detection flags the token only in commits not reachable from the carried capture; a token already in source history is reported once as info, never as `HANDOFF_MARKER_COMMITTED`. | `history_adds_token`: `git log --branches --tags [HEAD] --not --glob=refs/carry/ -G TOKEN --patch --cc --unified=0 -- <every target name>`, flagged only when a hunk line marked `+` against every parent holds the token (a removal, or a line a merge took from a parent, adds nothing). `staged`: a token line in the index blob that the HEAD blob lacks. `in_source_history`: `git log --glob=refs/carry/ -S TOKEN`, reported as `"source_history":true` in the check row. The tip-blob and HEAD-blob scans are gone (the history scan covers them). H48. |
+| OI-1003-Q185 | Nothing is ever dropped from a carry. | Held: Q190's removal is opt-in, only of landed content, recorded, and the source's bytes land again at the next converge of the target. |
+
+### 19.5 Found by the mutation run of the round-2 commit
+
+M31 (a block of this landing's identity on a target no record entry
+names read as `Modified`) survived: with the whole-file rule of 19.2,
+the round trip with no record is already carried content, so the
+record-entry condition decided only the case of a lost record over
+bytes that are not landed. There it presented this landing's own stale
+block as carried, which finding 3 rules out. The rule is now one: a
+block of this landing's identity that its record does not name is
+`Modified` unless the whole file is the landed blob. H49 (record lost:
+render and `--clear` refuse with nothing written, `--check` says
+`modified`; removed by hand, the next render writes a current block)
+failed first. M38 (a restored target kept in `retired` as well as in
+`files`) survived H42 as written: the H step re-adopted the block after
+a converge, whose new capture drops every retired entry anyway. It is
+observable when the capture stays: a put-back block taken back by a
+plain rerun, then replaced by a render (a new ref), then removed and put
+back again, is recognised only if the record retired the new block, not
+the old one. H42 now runs that round twice with a ref between them, and
+M38 is killed.
+
+### 19.6 TLA (EstateConverge)
+
+The model gains carried values and Q190's write; Q188, Q189 and Q191
+change nothing modelled (the guard was a precondition; `ready` and
+commit detection are read-only). `docs/formal/README.md`, "TIN-6569",
+has the details and the row table.
+
+- `Cb(v)` (`CB` = 500, below `BLK`) is the bytes `v` under a carried
+  block. With `"carried"` in `SrcKinds` the source may write `Cb(nextV)`
+  at `HP`, and the operator's `OpBlock` may put `Blk(Cb(nextV))` (their
+  bytes below the block starting with a pasted carried block).
+- `hand` gains `u` (what a clear leaves), `cc` (`--clear-carried`), `ps`
+  (the landed value a pending clear removes a carried block from) and
+  `sp` (the one `handoff.stripped` records). `HandoffWrite` may clear
+  with `cc` (`CarriedCut`: only from the landed value); `HandoffRecord`
+  records `sp`; `HandoffSettle` finishes a pending clear with its flag
+  and records a removal it finds done.
+- `Holds` accepts `UnCb(v)` and `Blk(UnCb(v))` for a landed `v` the
+  record or a pending intent stripped (`SOv`); `CrashAtomicity` and
+  `Converged` use `WithHand`.
+- Rows: `MC_ec_handoff_carried`, `MC_ec_handoff_carried_op` (pass),
+  `MC_ec_reach_handoff_carried_cleared` (reach), and mutations
+  `handoff_strip_no_overlay` (fails `TypedRefusal`) and
+  `handoff_strip_unchecked` (fails `NoLocalWorkLost`).
+- **Found while building the rows (not a hand-off finding):** with the
+  operator's seat edits concurrent and `MaxSrc = 2`, the unmutated model
+  violates `NoLocalWorkLost` with no hand-off step at all: the source
+  removes `d` and adds it back; the converge's `Add` writes it; the
+  operator deletes it in flight; the host crashes; the rerun's settle
+  reads the absent seat as the `Add`'s old side and writes it again.
+  The trace is the converge engine's settle classification, outside this
+  lane; `MC_ec_handoff_carried_op` uses `MaxSrc = 1`, as
+  `MC_ec_handoff_op` does. Open for the converge owner (19.10).
+
+### 19.7 Failing first, for the rulings
+
+On the round-2 commit (`752c8ec`), before any code change: H11 (the
+render refused `HANDOFF_NOT_PRIVATE`), H44 and H45 (`ready` with an
+untracked file in the sibling or in a destination-only worktree), H46 and
+H47 (`--clear-carried` an unknown flag: `FIELD_DOMAIN_VIOLATION`) and H48
+(`--check` exited `HANDOFF_MARKER_COMMITTED` for the source's committed
+block): 6 failed. H49 failed on the same code (the render prepended over
+the lost-record block). After the code: `estate_handoff` 45 passed, the 16
+hand-off unit rows and the 18 `estate_handoff` fault rows passed.
+
+### 19.8 Mutation tables
+
+Runner: one edit at a time in a scratch copy of the tree
+(`/dev/shm/handoff-lane/mut4`, `mut5`, with its own target directory),
+each run against `cargo test -p bulkload-agent --lib handoff`, `--test
+estate_handoff` and the `estate_handoff` fault-harness rows, stopping at
+the first failing suite.
+
+Round-2 commit (`752c8ec`):
+
+| Mutant | Edit | Result | Killed by |
+|---|---|---|---|
+| M13_own_marker_read_as_foreign | the owner arm reads `Foreign` (re-review 2's BLOCKER) | KILLED | unit `a_racy_record_print_is_proved_by_reading` |
+| M28_keep_equal_racy_print_unchecked | the keep path keeps a print equal to the seat's unchecked (re-review 1, finding 1) | KILLED | unit `a_kept_block_never_redates_a_racy_print_unchecked_on_a_retire`, `..._on_a_renew` |
+| M29_sibling_ahead_consolidated | the history check reversed (finding 2) | KILLED | H38 |
+| M30_user_config_lstat | the global configuration by `lstat` (finding 3) | KILLED | H36 |
+| M31_round_trip_block_modified | an own-identity block with no record entry is `Modified` (finding 4) | SURVIVED | became the rule (19.5); H49 |
+| M32_history_scans_targets_only | history of this run's targets only (finding 5) | KILLED | H39 |
+| M33_whole_landed_ignored_intact | the record's block never landed content | KILLED | H40 |
+| M34_whole_landed_ignored_modified | an own-identity block never landed content | KILLED | H41 |
+| M35_retired_not_recognised | a retired block put back is not this landing's | KILLED | H42 |
+| M36_retired_not_attached | converge ignores retired blocks | KILLED | H42 |
+| M37_replace_kind_prefixed | a re-rendered created file becomes `prefixed` | KILLED | H43 |
+| M38_retired_kept_after_restore | a restored target stays in `retired` too | SURVIVED, then KILLED in the rulings commit | H42 extended (19.5) |
+
+Rulings commit:
+
+| Mutant | Edit | Result | Killed by |
+|---|---|---|---|
+| M40_sibling_dirty_ignored | the sibling's status never read | KILLED | H44 |
+| M41_dest_only_dirty_ignored | a destination-only worktree's status never read | KILLED | H45 |
+| M42_open_ignores_dest_only_dirty | `open` ignores a dirty destination-only worktree | KILLED | H45 |
+| M43_status_ignores_untracked | `--untracked-files=no` | KILLED | H44, H45 |
+| M44_strip_overlay_off | converge ignores `handoff.stripped` | KILLED | H46 |
+| M45_strip_any_content | a carried block removed above any bytes | KILLED | H47 |
+| M46_strip_skip_ignored | `holds` compares from the blob's start | KILLED | unit `holds_accepts_a_recorded_removal_of_carried_blocks_only` |
+| M47_strip_not_recorded | `handoff.stripped` never written | KILLED | H46 |
+| M48_strip_base_unguarded | a removal accepted over any blob | KILLED | H46 |
+| M49_finished_clear_drops_its_strips | a settle finishing a crashed clear drops its removals | KILLED | fault row `estate_handoff_clear_carried_after_exchange` |
+| M50_carried_cleared_by_default | `--clear` always removes carried blocks | KILLED | H24, H25, H37, H40, H41, H46 |
+| M51_history_includes_carried | the history scan reads the carried capture too | KILLED | H48 |
+| M52_staged_ignores_head | any token in the index blob is `staged` | KILLED | H48 |
+| M53_removed_lines_count | a removed token line counts as added | KILLED | H48 |
+| M54_source_history_never | `source_history` never reported | KILLED | H48 |
+| M55_lost_record_block_carried | an own-identity block not landed is carried (round 2's rule) | KILLED | unit `a_racy_record_print_is_proved_by_reading` (and H49) |
+
+Round-2 commit: 10 of 12 killed; M31 became the rule and M38 was killed
+by H42's extension in the rulings commit. Rulings commit: 16 of 16
+killed, plus M38.
+
+### 19.9 Checks for the rulings commit
+
+In this worktree (`CARGO_TARGET_DIR` `cargo-target/handoff`, `nix develop
+.#default`, nice 10), on the tree committed as the rulings commit: `cargo
+fmt --check`; the three clippy passes (workspace; `io-trace`;
+`fault-injection,io-trace`); `cargo test -p bulkload-agent --locked
+--no-fail-fast` 938 passed, 0 failed, 7 ignored (29 binaries), with
+`estate_handoff` 45 (H0 to H25, H28 to H35, H37 to H49; H26, H27 and H36
+removed with the guard), `estate_adopt` 13, `estate_converge` 23,
+`source_command_registry` 16, `refusal_taxonomy` 5, `no_credential_tools`
+2 and 16 hand-off unit rows; `fault_harness` 115 (18 `estate_handoff`
+rows); `just contract-test` (24); `just tla-render --check` (251 files);
+`just tla-check` of the 17 hand-off rows with `MC_ec_refs`,
+`MC_ec_seats` and `MC_ec_adopt`, 21 rows matched (`docs/formal/README.md`).
+H42's second round was added after that run (the M38 row): `estate_handoff`
+45 passed again, `cargo fmt --check` and the workspace clippy pass clean.
+`docs/slo.md`: a copy of the hand-off's "Review of 2026-10-16" bullet that
+`7c5407f` put inside the #226 adopt amendment is removed (the hand-off
+amendment keeps it). `just check-fast` was not run here (coordinator).
+
+### 19.10 Open
+
+1. (16.2 and 17.5) Which copy carries the work forward for a landing
+   beside a live copy; the WP10 usage guard exception versus a verb
+   rename; whether the H step should re-render a refused item's own
+   workspace. Answered since: 16.1 and 18.6.1 (Q188: no privacy
+   question), 18.6.2 (Q189), 18.6.3 (Q190), 18.6.4 (Q191).
+2. Q191's "reported once": built as one `source_history` field per
+   workspace row of every `--check`, never a refusal. If "once" means
+   only the first check ever, that needs state the read-only check does
+   not keep; say so.
+3. Q190: a converge that lands a new blob of the target lands the
+   source's bytes, carried block included (the record speaks only for
+   the blob it was made over). Re-applying `--clear-carried`
+   automatically in the H step was not built: it would be a bulkload
+   edit the operator did not ask for at that capture.
+4. Commit detection reads `--branches`, `--tags` and HEAD, not
+   remote-tracking refs or the stash (re-review 2 probed a block pushed
+   on a branch then deleted locally). Unchanged here.
+5. The model finding of 19.6 (the converge settle's `Add` over an
+   operator's deletion in flight, at `MaxSrc` 2): for the converge
+   owner; the code's behaviour was not checked in this lane.
+6. The refuters' own lists (18.6.6) and a re-review of this section.
+
 ## Workstreams (restated, R-N13; verified this session unless marked)
 
 | Stream | Owner | Repo / branch | State and evidence | Next |
 |---|---|---|---|---|
-| TIN-6569 hand-off | this lane | bulkload `feat/estate-handoff-20261016` off `3fe1f07` | Built (section 17), reviewed by two refuters, every finding fixed and committed signed on top of `9ec8d36` (section 18); not pushed | Coordinator: `just check-fast`, re-review, PR; operator questions 18.6 |
+| TIN-6569 hand-off | this lane | bulkload `feat/estate-handoff-20261016` off `3fe1f07` | Built (17), reviewed (18), two re-reviews closed and OI-1003-Q188 to Q191 built (19), committed signed: `7c5407f`, then `752c8ec` (round 2) and the rulings commit; not pushed, no PR, no Linear write (this lane's task) | Coordinator: `just check-fast`, a re-review of section 19, PR; open items 19.10 |
 | #226 adopt F1/F2 fixes | other lane | `feat/estate-adopt-20261015` at `c6ccd52` (seen, read-only) | Committed there; touches `converge.rs`, `converge/diff.rs`, `estate.rs`, `git_carry.rs` | Merge; conflicts with this branch checked by `git merge-tree` (lane return) |
-| GF beside-landing | coordinator | production trees | Untouched by this lane | Hand-off after the operator answers 16 and 17.5 |
+| GF beside-landing | coordinator | production trees | Untouched by this lane | Hand-off after the operator answers 19.10.1 |

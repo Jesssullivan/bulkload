@@ -149,10 +149,13 @@
 (*     value (HTrusted); every re-take of that print (a rerun over an      *)
 (*     intact block, HandoffKeep; a settle) checks the base against the    *)
 (*     bytes under the block again, and a settle finishes a pending clear  *)
-(*     (review of 2026-10-16). Not modelled: the block's content (one      *)
+(*     (review of 2026-10-16). A source value may start with a carried     *)
+(*     block (Cb(v), "carried" in SrcKinds); --clear --clear-carried       *)
+(*     removes it from the landed value only, as a recorded edit converge *)
+(*     accepts (OI-1003-Q190). Not modelled: the block's content (one      *)
 (*     block value, so a rerun over an intact block writes nothing), the   *)
-(*     inputs digest, the privacy guard, commit detection, the block's     *)
-(*     owner identity (a carried block is plain content: a source value),  *)
+(*     inputs digest, commit detection and the open rows (read-only), the *)
+(*     block's owner identity (a carried block is source content),         *)
 (*     the H step's choice to re-render, the second target (CLAUDE.md is   *)
 (*     AGENTS.md's twin), the lift's own crash points (one step with the   *)
 (*     import), and a third party's file a settle cannot put back (the     *)
@@ -265,7 +268,8 @@ Mutations == {"none", "proof_stat_only", "proof_stat_strict",
               "handoff_no_overlay", "handoff_overlay_any_block",
               "handoff_clear_unchecked", "handoff_exchange_unchecked",
               "handoff_no_intent", "handoff_retake_unchecked",
-              "handoff_keep_racy_unchecked"}
+              "handoff_keep_racy_unchecked", "handoff_strip_no_overlay",
+              "handoff_strip_unchecked"}
 
 (* The closed unions the catalogue types (tla-check requires these sets   *)
 (* to equal the catalogue's labels).                                      *)
@@ -279,7 +283,7 @@ AllRefs  == {"main", "dev", "foo", "foo/bar", "o/x", "o/x/y", "t"}
 AllPaths == {"d", "d/f"}
 SrcKindSet == {"move", "create", "delete", "rename", "switch", "stash",
                "seat", "dirfile", "filedir", "index", "worktree", "race",
-               "stashrace"}
+               "stashrace", "carried"}
 OpKindSet == {"seat", "racy", "touch", "untracked", "index", "ref", "stash",
               "stashdrop", "head", "restore", "rebase", "dir", "lock", "wtwork",
               "block"}
@@ -328,6 +332,13 @@ Blk2(v) == BLK2 + v
 IsBlk(x) == x >= BLK /\ x < BLK2
 IsBlk2(x) == x >= BLK2
 Strip(x) == IF IsBlk(x) THEN x - BLK ELSE IF IsBlk2(x) THEN x - BLK2 ELSE x
+\* OI-1003-Q190: Cb(v) is the bytes v under a carried block (another
+\* landing's, which came with the source's bytes: "carried" in SrcKinds).
+\* CB is above every plain value and below BLK, so Blk(Cb(v)) is a block.
+CB == 500
+Cb(v) == CB + v
+IsCb(x) == x >= CB /\ x < BLK
+UnCb(x) == IF IsCb(x) THEN x - CB ELSE x
 \* The one target the model hands off (AGENTS.md; CLAUDE.md is its twin).
 HP == IF "d/f" \in Paths THEN "d/f" ELSE "d"
 \* At most this many hand-off runs per behaviour.
@@ -432,7 +443,10 @@ VARIABLES
                \* (volatile); n, runs so far; cl, a clear completed (ghost);
                \* pst, prac and base, the record's print of HP, whether that
                \* print is racy against the record, and the landed value it
-               \* vouches is under the block (0: none) (review of 2026-10-16)
+               \* vouches is under the block (0: none) (review of 2026-10-16);
+               \* u, what a clear leaves; cc, --clear-carried; ps, the landed
+               \* value a pending clear removes a carried block from, and sp,
+               \* the one handoff.stripped records (0: none; OI-1003-Q190)
 
 vars == <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
           dindex, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
@@ -463,12 +477,19 @@ LiveNames == {r \in Refs : nat[r] # 0}
 \* the record's and a pending intent's. Ov: one is there to accept.
 Ov == /\ Handoff /\ ~Mut("handoff_no_overlay")
       /\ (hand.has \/ hand.int # "none")
+\* OI-1003-Q190 (C handoff::landed_sides, handoff.stripped): the landed
+\* value v a recorded or pending --clear-carried removed the carried block
+\* from; converge accepts v without it, alone or under the block.
+SOv(v) == /\ Handoff /\ ~Mut("handoff_strip_no_overlay")
+          /\ IsCb(v) /\ v \in {hand.sp, hand.ps}
 \* C holds: a seat holds the landed value v when it is v, or bulkload's
 \* block on v (handoff_overlay_any_block: an edited block too).
 Holds(p, cur, v) ==
     \/ cur = v
     \/ /\ p = HP /\ Ov /\ IsFile(v)
        /\ (cur = Blk(v) \/ (Mut("handoff_overlay_any_block") /\ cur = Blk2(v)))
+    \/ /\ p = HP /\ SOv(v)
+       /\ (cur = UnCb(v) \/ (Ov /\ cur = Blk(UnCb(v))))
 \* Review of 2026-10-16 (C handoff::landed_sides, Prefix.trusted): the
 \* record's print of HP vouches for the seat without a read when it is not
 \* racy and its base is the landed value being proved. Every write of the
@@ -486,6 +507,9 @@ HTrusted(p, s) ==
 \* A set of values, each also under the block (an intact block is
 \* bulkload's own bytes, never work).
 WithBlk(S) == S \cup (IF Handoff THEN {Blk(x) : x \in S} ELSE {})
+\* OI-1003-Q190: each also without the carried block a recorded or pending
+\* --clear-carried removed from it (under the block too).
+WithHand(S) == WithBlk(S \cup {UnCb(x) : x \in {y \in S : SOv(y)}})
 
 \* A worktree's HEAD as converge::head_of reads it: a branch resolves to
 \* its native value (0: unborn).
@@ -1972,6 +1996,10 @@ SrcSeat(p) ==
        IN \/ /\ IsFile(v) /\ SrcStep([src EXCEPT !.seats[p] = nextV])
           \/ /\ v = ABSENT /\ parentOK /\ SrcStep([src EXCEPT !.seats[p] = nextV])
           \/ /\ IsFile(v) /\ SrcStep([src EXCEPT !.seats[p] = ABSENT])
+          \* OI-1003-Q190: the source's target starts with a carried block
+          \* (the source was itself a handed-off checkout).
+          \/ /\ "carried" \in SrcKinds /\ p = HP /\ IsFile(v)
+             /\ SrcStep([src EXCEPT !.seats[p] = Cb(nextV)])
 SrcTypeChange ==
     /\ "d/f" \in Paths
     /\ \/ /\ "dirfile" \in SrcKinds /\ src.seats["d"] = DIR
@@ -2193,6 +2221,11 @@ OpBlock ==
           /\ Mark(HP, Blk2(Strip(cur.v))) /\ UNCHANGED nextV
        \/ /\ dseat' = [dseat EXCEPT ![HP] = [v |-> Blk(nextV), st |-> cur.st + 1]]
           /\ Mark(HP, nextV) /\ nextV' = nextV + 1
+       \* OI-1003-Q190: their bytes below the block start with a carried
+       \* block (pasted from another landing): theirs, never the landing's.
+       \/ /\ "carried" \in SrcKinds
+          /\ dseat' = [dseat EXCEPT ![HP] = [v |-> Blk(Cb(nextV)), st |-> cur.st + 1]]
+          /\ Mark(HP, Cb(nextV)) /\ nextV' = nextV + 1
        \* A removal by hand writes the landed value back, which (as for a
        \* touch) is no edit, so it is modelled between applies only: in
        \* flight, the code refuses GIT_CONVERGE_INTERRUPTED (typed; the
@@ -2219,8 +2252,16 @@ HKeep == UNCHANGED <<src, srcN, nextV, caps, capt, nat, locks, opLock, dstash, t
                      edSince, adoptG>>
 HandoffGate == /\ Handoff /\ pc.st = "idle" /\ dhead["main"].on
                /\ wsLed["main"].has /\ ~wsInt["main"].on
-\* What the step in flight (or pending) writes at HP.
-HNew == IF hand.op = "clear" \/ hand.int = "clear" THEN hand.v ELSE Blk(hand.v)
+\* What the step in flight (or pending) writes at HP: a clear leaves u,
+\* the bytes under the block (without a carried block it removed).
+HNew == IF hand.op = "clear" \/ hand.int = "clear" THEN hand.u ELSE Blk(hand.v)
+\* OI-1003-Q190 (C clear, carried_len and landed_match): what a clear
+\* leaves of x, the bytes under this landing's block (or the whole file):
+\* with --clear-carried (cc) a carried block on top of the landed value is
+\* removed too, never from any other value (handoff_strip_unchecked: from
+\* any, an operator's included).
+CarriedCut(x, cc) ==
+    IF cc /\ IsCb(x) /\ (x = HLanded \/ Mut("handoff_strip_unchecked")) THEN UnCb(x) ELSE x
 HParentOK == HP = "d" \/ dseat["d"].v = DIR
 
 \* C handoff::settle, at the start of a run: the temporary a crash left
@@ -2235,21 +2276,32 @@ HParentOK == HP = "d" \/ dseat["d"].v = DIR
 HandoffSettle ==
     /\ HandoffGate /\ hand.ph = "idle" /\ (hand.int # "none" \/ hand.tmp.v # ABSENT)
     /\ LET tp == hand.tmp
-           ours == tp.v \in {hand.v, Blk(hand.v)}
+           ours == tp.v \in {hand.v, Blk(hand.v), hand.u}
            back == tp.v # ABSENT /\ ~ours /\ dseat[HP].v = HNew
            keep == tp.v # ABSENT /\ ~ours /\ ~back
            ds == IF back THEN [dseat EXCEPT ![HP] = tp] ELSE dseat
            cur == ds[HP]
            t == IF keep THEN tp ELSE NoSeat
        IN /\ dseat' = ds
-          /\ hand' = IF hand.int = "clear" /\ IsBlk(cur.v) /\ ~keep
-                     THEN [hand EXCEPT !.tmp = NoSeat, !.op = "clear", !.v = Strip(cur.v),
-                                       !.st = cur.st, !.ph = "exch"]
-                     ELSE IF hand.int = "clear" /\ IsBlk2(cur.v)
-                     THEN [hand EXCEPT !.tmp = t]
-                     ELSE LET r == HRetake(cur.v, cur.st) IN
-                          [hand EXCEPT !.tmp = t, !.int = "none", !.has = IsBlk(cur.v),
-                                       !.pst = r.pst, !.prac = r.prac, !.base = r.base]
+          /\ LET under == Strip(cur.v)
+                 left == CarriedCut(under, hand.cc)
+             IN hand' =
+                  IF hand.int = "clear" /\ ~keep /\ ~IsBlk2(cur.v)
+                     /\ (IsBlk(cur.v) \/ left # under)
+                  THEN [hand EXCEPT !.tmp = NoSeat, !.op = "clear", !.v = under, !.u = left,
+                                    !.ps = IF left # under THEN under ELSE hand.ps,
+                                    !.st = cur.st, !.ph = "exch"]
+                  ELSE IF hand.int = "clear" /\ IsBlk2(cur.v)
+                  THEN [hand EXCEPT !.tmp = t]
+                  ELSE LET r == HRetake(cur.v, cur.st) IN
+                       \* A clear whose removal of a carried block is done
+                       \* (the target holds what it left) records it.
+                       [hand EXCEPT !.tmp = t, !.int = "none", !.has = IsBlk(cur.v),
+                                    !.pst = r.pst, !.prac = r.prac, !.base = r.base,
+                                    !.sp = IF hand.int = "clear" /\ hand.ps # 0
+                                              /\ cur.v = UnCb(hand.ps)
+                                           THEN hand.ps ELSE hand.sp,
+                                    !.ps = 0]
     /\ HKeep
 
 \* C handoff::render_workspace over an intact block whose bytes are
@@ -2270,18 +2322,28 @@ HandoffKeep ==
                                 !.base = IF kept THEN hand.base ELSE r.base,
                                 !.n = hand.n + 1]
 
-\* A render of a plain or missing HP, or a clear of an intact block.
+\* A render of a plain or missing HP, or a clear of an intact block; with
+\* --clear-carried (cc, OI-1003-Q190) the clear also removes a carried
+\* block on top of the landed value, under the block or alone, and the
+\* intent names the landed value it removes it from (ps).
 HandoffWrite ==
     /\ LET cur == dseat[HP] IN
-       \E op \in {"render", "clear"} :
-          /\ IF op = "render"
-             THEN /\ cur.v # DIR /\ ~IsBlk(cur.v) /\ ~IsBlk2(cur.v)
-                  /\ cur.v = ABSENT => HParentOK
-             ELSE IsBlk(cur.v) \/ (Mut("handoff_clear_unchecked") /\ IsBlk2(cur.v))
-          /\ hand' = [hand EXCEPT !.op = op,
-                                   !.int = IF Mut("handoff_no_intent") THEN "none" ELSE op,
-                                   !.v = Strip(cur.v), !.st = cur.st, !.ph = "exch",
-                                   !.n = hand.n + 1]
+       \E op \in {"render", "clear"},
+         cc \in (IF "carried" \in SrcKinds THEN BOOLEAN ELSE {FALSE}) :
+          LET under == Strip(cur.v)
+              left == IF op = "clear" THEN CarriedCut(under, cc) ELSE under
+          IN /\ op = "render" => ~cc
+             /\ IF op = "render"
+                THEN /\ cur.v # DIR /\ ~IsBlk(cur.v) /\ ~IsBlk2(cur.v)
+                     /\ cur.v = ABSENT => HParentOK
+                ELSE \/ IsBlk(cur.v) \/ (Mut("handoff_clear_unchecked") /\ IsBlk2(cur.v))
+                     \/ (~IsBlk(cur.v) /\ ~IsBlk2(cur.v) /\ left # under)
+             /\ hand' = [hand EXCEPT !.op = op,
+                                      !.int = IF Mut("handoff_no_intent") THEN "none" ELSE op,
+                                      !.v = under, !.u = left, !.cc = cc,
+                                      !.ps = IF left # under THEN under ELSE 0,
+                                      !.st = cur.st, !.ph = "exch",
+                                      !.n = hand.n + 1]
     /\ UNCHANGED dseat /\ HKeep
 
 \* C handoff::run: a render of a plain or missing HP, or a rerun over an
@@ -2301,7 +2363,7 @@ HandoffStart ==
 HandoffExchange ==
     /\ hand.ph = "exch"
     /\ LET cur == dseat[HP]
-           new == IF hand.op = "render" THEN Blk(hand.v) ELSE hand.v
+           new == IF hand.op = "render" THEN Blk(hand.v) ELSE hand.u
            create == hand.op = "render" /\ hand.v = ABSENT
        IN IF create
           THEN IF cur.v = ABSENT /\ HParentOK
@@ -2328,7 +2390,8 @@ HandoffCheck ==
             /\ LET r == HRetake(hand.tmp.v, hand.tmp.st)
                IN hand' = [hand EXCEPT !.tmp = NoSeat, !.ph = "idle", !.op = "none",
                                         !.int = "none", !.has = IsBlk(hand.tmp.v),
-                                        !.pst = r.pst, !.prac = r.prac, !.base = r.base]
+                                        !.pst = r.pst, !.prac = r.prac, !.base = r.base,
+                                        !.ps = 0]
     /\ HKeep
 
 \* The record (a render's names the block; a clear's is removed). A
@@ -2339,13 +2402,14 @@ HandoffRecord ==
     /\ hand.ph = "rec"
     /\ hand' = [hand EXCEPT !.has = hand.op = "render", !.ph = "fin",
                              !.pst = dseat[HP].st, !.prac = TRUE,
-                             !.base = HBase(Blk(hand.v))]
+                             !.base = HBase(Blk(hand.v)),
+                             !.sp = IF hand.op = "clear" /\ hand.ps # 0 THEN hand.ps ELSE hand.sp]
     /\ UNCHANGED dseat /\ HKeep
 
 \* The intent removed: the run is done.
 HandoffFinish ==
     /\ hand.ph = "fin"
-    /\ hand' = [hand EXCEPT !.int = "none", !.op = "none", !.ph = "idle",
+    /\ hand' = [hand EXCEPT !.int = "none", !.op = "none", !.ph = "idle", !.ps = 0,
                              !.cl = hand.cl \/ hand.op = "clear"]
     /\ UNCHANGED dseat /\ HKeep
 
@@ -2559,7 +2623,8 @@ Init ==
     /\ adoptG = [kept |-> {}, stash |-> FALSE, unequal |-> FALSE]
     /\ hand = [has |-> FALSE, int |-> "none", op |-> "none", v |-> 0, st |-> 0,
                tmp |-> NoSeat, ph |-> "idle", n |-> 0, cl |-> FALSE,
-               pst |-> 0, prac |-> FALSE, base |-> 0]
+               pst |-> 0, prac |-> FALSE, base |-> 0,
+               u |-> 0, cc |-> FALSE, ps |-> 0, sp |-> 0]
     /\ capt = [i \in Items |-> 1]
     /\ locks = {}
     /\ temp = [p \in Paths |-> NoSeat]
@@ -2687,7 +2752,8 @@ TypeOK ==
     /\ hand \in [has : BOOLEAN, int : {"none", "render", "clear"},
                  op : {"none", "render", "clear"}, v : Nat, st : Nat,
                  tmp : [v : Nat, st : Nat], ph : {"idle", "exch", "check", "rec", "fin"},
-                 n : 0..HMAX, cl : BOOLEAN, pst : Nat, prac : BOOLEAN, base : Nat]
+                 n : 0..HMAX, cl : BOOLEAN, pst : Nat, prac : BOOLEAN, base : Nat,
+                 u : Nat, cc : BOOLEAN, ps : Nat, sp : Nat]
 
 \* Q144: an operator edit is never overwritten or removed. Every value the
 \* operator wrote that is not a landed value (or deleted) is still where
@@ -2764,8 +2830,8 @@ CrashAtomicity ==
                 IF I.on
                 THEN LET F == caps[I.from].seats[p]
                          T == caps[I.to].seats[p]
-                     IN dseat[p].v \in WithBlk({F, T} \cup (IF TypeChange(F, T) THEN {ABSENT} ELSE {}))
-                ELSE L.has => dseat[p].v \in WithBlk({L.seats[p].v})
+                     IN dseat[p].v \in WithHand({F, T} \cup (IF TypeChange(F, T) THEN {ABSENT} ELSE {}))
+                ELSE L.has => dseat[p].v \in WithHand({L.seats[p].v})
           /\ (IndexOn /\ L.has /\ ~opLive["index"].on) =>
                 IF I.on THEN dindex \in {I.iold, caps[I.to].index} ELSE dindex = L.index
     /\ \A i \in Items :
@@ -2873,6 +2939,14 @@ Witness_HandoffConverged ==
 Witness_HandoffCleared ==
     ~(hand.cl /\ \E c \in jour["main"] : c > 1 /\ wsLed["main"].t = c)
 
+\* OI-1003-Q190: a recorded --clear-carried removed a carried block from
+\* the landed target, and a converge then replaced the stripped seat with
+\* the source's next value (under the block, or bare).
+Witness_HandoffCarriedCleared ==
+    ~(/\ Handoff /\ hand.sp # 0 /\ IsFile(HLanded) /\ HLanded # hand.sp
+      /\ Strip(dseat[HP].v) = HLanded
+      /\ \E c \in jour["main"] : c > 2 /\ wsLed["main"].t = c)
+
 \* A captured ref tip that never reached the destination: superseded
 \* before any apply, it is neither native nor at provenance (CORPUS keeps
 \* it as a chain link: GitCarry.tla's custody, not the destination's).
@@ -2923,7 +2997,7 @@ Converged ==
          /\ HeadConverged(i, IF i = "main" THEN src.head ELSE src.wt)
     /\ \A r \in Refs : RefConverged(r)
     /\ dstash = src.stash \/ AdoptStashKept
-    /\ \A p \in Paths : dseat[p].v \in WithBlk({src.seats[p]})
+    /\ \A p \in Paths : dseat[p].v \in WithHand({src.seats[p]})
     /\ IndexOn => dindex = src.index
 
 \* #226 (the operator's decision 5): an adoption proves against the main's

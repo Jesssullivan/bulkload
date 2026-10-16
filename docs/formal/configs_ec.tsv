@@ -56,6 +56,8 @@ MC_ec_adopt_live	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,
 MC_ec_adopt_stash	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,HandoffCheck,HandoffCrash,HandoffExchange,HandoffFinish,HandoffRecord,HandoffSettle,HandoffStart,IndexPublish,OpBlock,OpHead,OpIndex,OpLock,OpRef,OpRestore,OpStash,OpWtWork,ProbeExchange,SeatVerify,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcSwitch,SrcTypeChange,SrcWorktree,Tick	-
 MC_ec_handoff	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpBlock,OpHead,OpIndex,OpLock,OpRacy,OpRef,OpRestore,OpSeat,OpStash,OpTouch,OpUntracked,OpWtWork,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
 MC_ec_handoff_op	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpLock,OpRacy,OpRef,OpRestore,OpStash,OpTouch,OpUntracked,OpWtWork,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
+MC_ec_handoff_carried	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpBlock,OpHead,OpIndex,OpLock,OpRacy,OpRef,OpRestore,OpSeat,OpStash,OpTouch,OpUntracked,OpWtWork,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
+MC_ec_handoff_carried_op	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpHead,OpIndex,OpLock,OpRacy,OpRef,OpRestore,OpStash,OpTouch,OpUntracked,OpWtWork,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
 MC_ec_handoff_live	pass	all	ChildCrashHead,ChildCrashTxn,FirstAddWt,FirstLandMain,FirstLedgerWt,FirstPlanWt,FirstStepWt,IndexPublish,OpBlock,OpHead,OpIndex,OpLock,OpRacy,OpRef,OpRestore,OpSeat,OpStash,OpTouch,OpUntracked,OpWtWork,RefFinish,RefLedger,RefStash,RefTxnDeletes,RefTxnWrites,SrcCreate,SrcDelete,SrcMove,SrcRename,SrcStage,SrcStashDrop,SrcStashPush,SrcSwitch,SrcTypeChange,SrcWorktree	-
 MC_ec_reach_converged	reach	Witness_Converged	*	-
 MC_ec_reach_settled	reach	Witness_SettledAfterCrash	*	-
@@ -66,6 +68,7 @@ MC_ec_reach_stash_drift_carried	reach	Witness_DriftCarried	*	-
 MC_ec_reach_adopted_converged	reach	Witness_AdoptedConverged	*	-
 MC_ec_reach_handoff_converged	reach	Witness_HandoffConverged	*	-
 MC_ec_reach_handoff_cleared	reach	Witness_HandoffCleared	*	-
+MC_ec_reach_handoff_carried_cleared	reach	Witness_HandoffCarriedCleared	*	-
 MC_ec_finding_detached_reattach	fail	ConvergesWhenQuiet	*	-
 MC_ec_finding_restored_ref	fail	ConvergesWhenQuiet	*	-
 MC_ec_neg_live_unfair	fail	ConvergesWhenQuiet	*	-
@@ -132,3 +135,5 @@ MC_ec_neg_handoff_exchange_unchecked	fail	NoLocalWorkLost	*	-
 MC_ec_neg_handoff_no_intent	fail	HandoffOwnsOnlyItsBlock	*	-
 MC_ec_neg_handoff_retake_unchecked	fail	NoLocalWorkLost	*	-
 MC_ec_neg_handoff_keep_racy_unchecked	fail	NoLocalWorkLost	*	-
+MC_ec_neg_handoff_strip_no_overlay	fail	TypedRefusal	*	-
+MC_ec_neg_handoff_strip_unchecked	fail	NoLocalWorkLost	*	-

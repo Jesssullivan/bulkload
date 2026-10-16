@@ -1058,7 +1058,9 @@ fn write_temp(seat: &Seat, side: &Side, objects: &mut BatchObjects) -> Result<Op
 /// target; not the mode). Reads destination bytes only, counted, compared
 /// with the blob as the object store holds it. A regular seat whose side
 /// carries hand-off prefixes also holds it as one of those blocks followed
-/// by the blob (TIN-6569: the block is bulkload's, never work).
+/// by the blob (TIN-6569: the block is bulkload's, never work), or by the
+/// blob without the carried blocks a recorded `--clear --clear-carried`
+/// removed from its head (OI-1003-Q190).
 fn holds(objects: &mut BatchObjects, path: &Path, side: &Side) -> Result<bool> {
     let Some(meta) = lstat(path)? else {
         return Ok(false);
@@ -1086,27 +1088,38 @@ fn holds(objects: &mut BatchObjects, path: &Path, side: &Side) -> Result<bool> {
                     .open(path)
                     .refuse_at("git_carry::converge::holds")
             };
-            let mut file = open()?;
-            let skipped = if side.prefix.is_empty() {
-                0
+            let candidates = if side.prefix.is_empty() {
+                Vec::new()
             } else {
-                handoff::skip_prefix(&mut file, &side.prefix)?
+                handoff::matching(&mut open()?, &side.prefix)?
             };
-            let equal = holds_blob(objects, file, blob, meta.len())?;
-            if equal || skipped == 0 {
-                return Ok(equal);
+            for prefix in candidates {
+                let mut file = open()?;
+                std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(prefix.len))
+                    .refuse_at("git_carry::converge::holds")?;
+                if holds_blob(objects, file, blob, prefix.strip, meta.len())? {
+                    return Ok(true);
+                }
             }
-            holds_blob(objects, open()?, blob, meta.len())
+            holds_blob(objects, open()?, blob, 0, meta.len())
         }
     }
 }
 
-// Whether `file`, from its position on, is `blob`'s bytes and nothing more.
-fn holds_blob(objects: &mut BatchObjects, file: fs::File, blob: &str, len: u64) -> Result<bool> {
+// Whether `file`, from its position on, is `blob`'s bytes after its first
+// `skip` and nothing more.
+fn holds_blob(
+    objects: &mut BatchObjects,
+    file: fs::File,
+    blob: &str,
+    skip: u64,
+    len: u64,
+) -> Result<bool> {
     let mut compare = Compare {
         file: std::io::BufReader::new(file),
         equal: true,
         scratch: Vec::new(),
+        skip,
     };
     let length = objects.copy_into(blob, &mut compare, None);
     let mut rest = [0u8; 1];
@@ -1117,19 +1130,28 @@ fn holds_blob(objects: &mut BatchObjects, file: fs::File, blob: &str, len: u64) 
         crate::counters::Counter::DestVerifyRead,
         usize::try_from(len).unwrap_or(usize::MAX),
     );
-    length.map(|_| compare.equal && ended)
+    length.map(|_| compare.equal && ended && compare.skip == 0)
 }
 
-/// A writer that compares what it is given with a file's next bytes.
+/// A writer that compares what it is given, after its first `skip` bytes,
+/// with a file's next bytes.
 struct Compare {
     file: std::io::BufReader<fs::File>,
     equal: bool,
     scratch: Vec<u8>,
+    skip: u64,
 }
 
 impl std::io::Write for Compare {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.equal {
+    fn write(&mut self, given: &[u8]) -> std::io::Result<usize> {
+        let skipped = usize::try_from(self.skip)
+            .unwrap_or(usize::MAX)
+            .min(given.len());
+        self.skip = self
+            .skip
+            .saturating_sub(u64::try_from(skipped).unwrap_or(u64::MAX));
+        let bytes = given.get(skipped..).unwrap_or_default();
+        if self.equal && !bytes.is_empty() {
             self.scratch.resize(bytes.len(), 0);
             let mut filled = 0;
             while filled < bytes.len() {
@@ -1144,7 +1166,7 @@ impl std::io::Write for Compare {
             }
             self.equal = filled == bytes.len() && self.scratch.get(..filled) == Some(bytes);
         }
-        Ok(bytes.len())
+        Ok(given.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {

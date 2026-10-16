@@ -84,6 +84,7 @@ fn prefix_of(block: &[u8]) -> Prefix {
         len: len64(block),
         digest: digest(block),
         trusted: None,
+        strip: 0,
     }
 }
 
@@ -93,6 +94,7 @@ fn unlanded() -> Landed<'static> {
         source: "neo",
         instance: "",
         sides: None,
+        stripped: Vec::new(),
     }
 }
 
@@ -143,6 +145,97 @@ fn holds_accepts_the_recorded_block_then_the_landed_blob_only() {
         assert_eq!(
             holds(&mut objects, &path, &with).unwrap(),
             overlaid,
+            "{why}"
+        );
+        assert_eq!(
+            holds(&mut objects, &path, &without).unwrap(),
+            plain,
+            "{why}"
+        );
+    }
+    objects.finish().unwrap();
+}
+
+/// OI-1003-Q190: a landed blob whose head is a carried block, and a side
+/// that records its removal (`handoff.stripped`): the seat holds the blob
+/// without it, alone or under this landing's block, and still the whole
+/// blob; any other bytes do not hold it. Without the record only the whole
+/// blob holds.
+#[test]
+fn holds_accepts_a_recorded_removal_of_carried_blocks_only() {
+    let (_dir, repo, _) = repo();
+    let carried = b"<!-- bulkload-handoff:v1 BEGIN id=0123456789abcdef for=fedcba9876543210 -->\n> carried\n<!-- bulkload-handoff:v1 END id=0123456789abcdef -->\n\n".to_vec();
+    assert_eq!(
+        render::marker(&carried),
+        render::Marker::Block(carried.len())
+    );
+    let path = repo.join("AGENTS.md");
+    fs::write(&path, cat(&[&carried, LANDED])).unwrap();
+    git_run(&repo, &["commit", "--quiet", "-am", "a carried block"]);
+    let blob = git_run(&repo, &["rev-parse", "HEAD:AGENTS.md"]);
+    let block = block();
+    let strip = len64(&carried);
+    let with = side(
+        &blob,
+        vec![
+            prefix_of(&block),
+            Prefix {
+                strip,
+                ..prefix_of(&block)
+            },
+            Prefix {
+                len: 0,
+                digest: digest(b""),
+                trusted: None,
+                strip,
+            },
+        ],
+    );
+    let without = side(&blob, vec![prefix_of(&block)]);
+    let mut objects = BatchObjects::new(&repo).unwrap();
+    for (bytes, stripped, plain, why) in [
+        (
+            cat(&[&carried, LANDED]),
+            true,
+            true,
+            "the whole landed blob",
+        ),
+        (
+            LANDED.to_vec(),
+            true,
+            false,
+            "the blob without the carried block",
+        ),
+        (
+            cat(&[&block, LANDED]),
+            true,
+            false,
+            "this landing's block on the blob without it",
+        ),
+        (
+            cat(&[&block, &carried, LANDED]),
+            true,
+            true,
+            "this landing's block on the whole blob",
+        ),
+        (
+            cat(&[&carried[1..], LANDED]),
+            false,
+            false,
+            "a part of the carried block removed",
+        ),
+        (
+            cat(&[LANDED, b"x"]),
+            false,
+            false,
+            "the blob without it, and more",
+        ),
+        (Vec::new(), false, false, "nothing"),
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        assert_eq!(
+            holds(&mut objects, &path, &with).unwrap(),
+            stripped,
             "{why}"
         );
         assert_eq!(
@@ -216,6 +309,8 @@ fn settle_removes_its_own_displaced_file_and_records_the_block() {
                 after: Some(digest(&new)),
             }],
             next: Some(record(&block)),
+            stripped: Vec::new(),
+            carried: false,
         },
     )
     .unwrap();
@@ -258,6 +353,8 @@ fn settle_puts_back_a_third_partys_file_a_crash_displaced() {
                 after: Some(digest(&new)),
             }],
             next: Some(record(&block)),
+            stripped: Vec::new(),
+            carried: false,
         },
     )
     .unwrap();

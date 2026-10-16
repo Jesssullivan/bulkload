@@ -92,10 +92,9 @@ SUBCOMMANDS:
                 plus worktrees of planned repositories no item plans and, with
                 --scan, Git directories under DIR in no planned family
                 (dest-only). One bulkload.estate-diff.v1 JSON line per row
-    estate-handoff [--check | --clear | --dry-run] [--item ID]... [--workspace PATH]...
-                [--sibling LANDED_PREFIX=LIVE_PREFIX]... [--private-remote PREFIX]...
-                [--allow-workspace PATH]... [--readme] [--renew] [--as-of NS]
-                PLAN CORPUS PRIVATE_STATE SOURCE
+    estate-handoff [--check | --clear [--clear-carried] | --dry-run] [--item ID]...
+                [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
+                [--readme] [--renew] [--as-of NS] PLAN CORPUS PRIVATE_STATE SOURCE
                 TIN-6569, OI-1003-Q183: write a dated hand-off block at byte 0 of
                 AGENTS.md and CLAUDE.md in each landed workspace (absolute paths,
                 capture and landing facts, estate-diff's ref classes, the commands
@@ -104,26 +103,28 @@ SUBCOMMANDS:
                 intact block instead of refusing the seat (and re-renders it
                 after a converge). A missing target is
                 created untracked; an existing AGENTS.override.md is prefixed too;
-                README.md only with --readme; neither is ever created. Written
-                only where the repository has no remote (active, or the source's
-                origin a landing kept inert), every remote and push URL, as
-                written and as insteadOf/pushInsteadOf rewrite it, is under a
-                --private-remote PREFIX, or --allow-workspace names it
-                (HANDOFF_NOT_PRIVATE otherwise; no URL is printed). A symlink
-                other than one target to another refuses
-                HANDOFF_TARGET_UNSUPPORTED; an edited block of this landing's
-                HANDOFF_BLOCK_MODIFIED; an unlanded item HANDOFF_NOT_LANDED; all
-                with nothing written. A block another landing rendered, or one
-                of this landing's that no record names (both carried with the
-                source's bytes), is content: kept below this one, never
-                cleared. --check is read-only (state, open rows, ready) and exits
-                HANDOFF_MARKER_COMMITTED when a token is staged, at HEAD or a
-                listed tip, or in any branch's or tag's history; --clear restores
-                the bytes and finishes a crashed clear; --dry-run prints the
-                blocks. A rerun keeps the options the record was rendered with
-                unless they are given again; an unchanged rerun reads and writes
-                nothing. One JSON line per workspace (schema
-                bulkload.estate-handoff.v1, the verb's own name)
+                README.md only with --readme; neither is ever created. The block
+                is written whatever the repository's remotes (OI-1003-Q188); no
+                URL is read for it or printed. A symlink other than one target
+                to another refuses HANDOFF_TARGET_UNSUPPORTED; an edited block of
+                this landing's HANDOFF_BLOCK_MODIFIED; an unlanded item
+                HANDOFF_NOT_LANDED; all with nothing written. A block another
+                landing rendered, one of this landing's that no record names, or
+                one whose whole file is the landed blob (each carried with the
+                source's bytes) is content: kept below this one, never cleared
+                unless --clear --clear-carried asks (OI-1003-Q190: a recorded
+                edit of landed content that converge accepts). --check is
+                read-only (state, open rows, ready: the commit rules and a clean
+                working tree in the live sibling and in each destination-only
+                worktree) and exits HANDOFF_MARKER_COMMITTED when this landing's
+                token is staged or added by a commit the carried capture does
+                not reach (a token already in the source's history is reported
+                as source_history, OI-1003-Q191); --clear restores the bytes and
+                finishes a crashed clear; --dry-run prints the blocks. A rerun
+                keeps the options the record was rendered with unless they are
+                given again; an unchanged rerun reads and writes nothing. One
+                JSON line per workspace (schema bulkload.estate-handoff.v1, the
+                verb's own name)
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
@@ -1264,6 +1265,7 @@ fn handoff_options(
             "--dry-run" => mode(bulkload_agent::estate::HandoffMode::DryRun)?,
             "--renew" => flag(&mut options.renew)?,
             "--readme" => flag(&mut options.readme)?,
+            "--clear-carried" => flag(&mut options.clear_carried)?,
             "--item" => {
                 options.items.push(
                     value(at + 1)?
@@ -1275,19 +1277,6 @@ fn handoff_options(
             }
             "--workspace" => {
                 options.workspaces.push(PathBuf::from(value(at + 1)?));
-                at += 1;
-            }
-            "--allow-workspace" => {
-                options.allow.push(PathBuf::from(value(at + 1)?));
-                at += 1;
-            }
-            "--private-remote" => {
-                options.private_remotes.push(
-                    value(at + 1)?
-                        .to_str()
-                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
-                        .to_owned(),
-                );
                 at += 1;
             }
             "--sibling" => {

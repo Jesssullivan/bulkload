@@ -53,9 +53,12 @@ pub struct Sibling {
     /// For a checkout: whether its HEAD commit and this landing's HEAD
     /// commit are reconciled (one is in the other's history: the sibling's
     /// HEAD reachable from a branch of this landing, or this landing's HEAD
-    /// reachable from the sibling's). Read-only, from commits alone; work
-    /// the sibling has not committed is not seen.
+    /// reachable from the sibling's). Read-only, from commits alone.
     pub consolidated: bool,
+    /// For a checkout: its working tree has uncommitted changes (a
+    /// read-only `git status` lists an entry, untracked files included,
+    /// or cannot be read): an open row (OI-1003-Q189).
+    pub dirty: bool,
 }
 
 /// What a capture held for one checkout (from its provenance instance).
@@ -117,6 +120,9 @@ pub struct DestOnly {
     /// Its HEAD commit is in another branch of the repository (merged or
     /// picked into the copy that carries the work forward).
     pub consolidated: bool,
+    /// Its working tree has uncommitted changes, as for [`Sibling`]
+    /// (OI-1003-Q189).
+    pub dirty: bool,
 }
 
 /// Everything one block says.
@@ -164,13 +170,14 @@ pub const OPEN_CLASSES: [&str; 2] = ["diverged", "source-ahead"];
 
 impl Inputs {
     /// The rows still to be dealt with (design 4.4, as amended by the
-    /// review of 2026-10-16): diverged and source-ahead refs, destination-
-    /// only worktrees whose HEAD commit no other branch holds, a live
-    /// sibling not reconciled with this landing, recorded refusals, and a
-    /// newer capture not applied yet. Each closes by consolidating (a
-    /// merge, a cherry-pick, an apply, a disposal), never only by deleting
-    /// a copy; a destination commit or a seat edited since landing is
-    /// consolidation, never an open row.
+    /// review of 2026-10-16 and OI-1003-Q189): diverged and source-ahead
+    /// refs, destination-only worktrees whose HEAD commit no other branch
+    /// holds or whose working tree is not clean, a live sibling not
+    /// reconciled with this landing or with uncommitted changes, recorded
+    /// refusals, and a newer capture not applied yet. Each closes by
+    /// consolidating (a merge, a cherry-pick, a commit, an apply, a
+    /// disposal), never only by deleting a copy; a destination commit or a
+    /// seat edited since landing is consolidation, never an open row.
     #[must_use]
     pub fn open(&self) -> u64 {
         let refs = self
@@ -181,10 +188,11 @@ impl Inputs {
         let dest_only = self
             .dest_only
             .iter()
-            .filter(|row| !row.consolidated)
+            .filter(|row| !row.consolidated || row.dirty)
             .count();
         let sibling = usize::from(self.sibling.as_ref().is_some_and(|sibling| {
-            matches!(sibling.state, SiblingState::Head { .. }) && !sibling.consolidated
+            matches!(sibling.state, SiblingState::Head { .. })
+                && (!sibling.consolidated || sibling.dirty)
         }));
         let behind = usize::from(self.current.is_some_and(|current| current != self.capture));
         u64::try_from(refs + dest_only + sibling + self.refused.len() + behind).unwrap_or(u64::MAX)
@@ -393,13 +401,18 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
                 SiblingState::Absent => format!("`{path}`: absent"),
                 SiblingState::NotACheckout => format!("`{path}`: exists, not a Git checkout"),
                 SiblingState::Head { branch: name, oid } => format!(
-                    "`{path}`: exists, HEAD `{}` at `{}`; {}",
+                    "`{path}`: exists, HEAD `{}` at `{}`; {}; {}",
                     branch(name.as_deref()),
                     short(oid),
                     if sibling.consolidated {
-                        "its HEAD and this landing's HEAD are in one history (reconciled)"
+                        "this landing holds its HEAD (reconciled)"
                     } else {
-                        "not reconciled: neither HEAD is in the other's history (an open row)"
+                        "not reconciled: this landing does not hold its HEAD (an open row)"
+                    },
+                    if sibling.dirty {
+                        "its working tree has uncommitted changes (an open row)"
+                    } else {
+                        "its working tree is clean"
                     }
                 ),
             }
@@ -548,12 +561,17 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
                 .take(REF_NAMES)
                 .map(|row| {
                     format!(
-                        "`{}`{}",
+                        "`{}` ({}{})",
                         shown(&row.path),
                         if row.consolidated {
-                            " (its HEAD is in another branch)"
+                            "its HEAD is in another branch"
                         } else {
-                            " (open)"
+                            "open: its HEAD is in no other branch"
+                        },
+                        if row.dirty {
+                            "; open: uncommitted changes"
+                        } else {
+                            ""
                         }
                     )
                 })
@@ -600,13 +618,13 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
             .collect();
         let _ = writeln!(
             out,
-            "- Carried hand-off blocks: {} also hold, below this block, a hand-off block that came with the source's bytes (rendered for another landing, or for this one by a run whose record is gone). It is not this block and may be out of date: do not act on its paths or commands. bulkload keeps it as the file's content (OI-1003-Q185); removing it is the user's call.",
+            "- Carried hand-off blocks: {} also hold, below this block, a hand-off block that came with the source's bytes (rendered for another landing, or for this one by a run whose record is gone). It is not this block and may be out of date: do not act on its paths or commands. bulkload keeps it as the file's content (OI-1003-Q185); removing it is the user's call (`--clear --clear-carried` does it as a recorded edit, OI-1003-Q190).",
             names.join(", ")
         );
     }
     let _ = writeln!(
         out,
-        "- Open rows: {} (the hand-off is ready to clear at 0). A commit at this landing or a file edited since landing is consolidation, not an open row. `ready` reads commits only: ask the user about work not yet committed here, in the sibling or in a destination-only worktree.",
+        "- Open rows: {} (the hand-off is ready to clear at 0). A commit at this landing or a file edited since landing is consolidation, not an open row. `ready` also needs a clean working tree in the live sibling and in each destination-only worktree (OI-1003-Q189); ask the user about work not yet committed at this landing.",
         inputs.open()
     );
     out.push_str("\n**Do this first** (converge and consolidate before any other work)\n\n");
@@ -616,7 +634,7 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
         "2. See what differs, read-only:\n   `{}`",
         command(inputs, Verb::Differences)
     );
-    out.push_str("3. For each diverged or source-ahead ref, each destination-only worktree and the live sibling, decide with the user which copy carries the work forward, and bring the other side's commits into it (merge or cherry-pick). Never reset, force-push, delete a branch, or delete either copy: removing a copy is the operator's call.\n");
+    out.push_str("3. For each diverged or source-ahead ref, each destination-only worktree and the live sibling, decide with the user which copy carries the work forward, and bring the other side's commits into it (merge or cherry-pick). Settle uncommitted changes in the sibling and in destination-only worktrees with the user (commit them where the work goes on). Never reset, force-push, delete a branch, or delete either copy: removing a copy is the operator's call.\n");
     let _ = writeln!(
         out,
         "4. Commit or stash nothing that contains this block. Before any commit, check that `git diff --cached` shows no `{TOKEN}`."
@@ -735,6 +753,7 @@ pub(super) fn sample() -> Inputs {
             },
         ],
         dest_only: vec![DestOnly {
+            dirty: false,
             path: b"/estate/gf/wt".to_vec(),
             consolidated: false,
         }],

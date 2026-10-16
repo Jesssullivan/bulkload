@@ -25,10 +25,14 @@
 //! (design 6.4) crashed after the converge's journal, so the rerun apply is
 //! a journal no-op that must still settle the pending hand-off intent.
 //! `RerenderOverEdit`: a re-render over a user's edit below the block
-//! crashed, the next run settled it and refused: the settled record never
+//! crashed, the next run settled it and refused (a target it cannot
+//! write): the settled record never
 //! vouches for the edit, and a converge that replaces the target refuses
 //! MODIFIED with the edit kept (S5). `ClearNoOpApply`: a crashed clear is
 //! finished, not reversed, by a no-op `estate-apply`'s H step.
+//! `ClearCarried`: a `--clear --clear-carried` crashed; converge is not
+//! wedged by the half-removed carried block, and the H step finishes it
+//! (OI-1003-Q190).
 //!
 //! `_exit` models a process crash only (see the harness header).
 
@@ -71,6 +75,10 @@ pub enum EstateHandoff {
     /// A clear crashed, then a no-op `estate-apply` (review of 2026-10-16,
     /// converge safety finding 3).
     ClearNoOpApply,
+    /// `--clear --clear-carried` over a carried block crashed
+    /// (OI-1003-Q190): converge accepts what the crash left, and the next
+    /// apply's H step finishes the removal and records it.
+    ClearCarried,
 }
 
 impl Scenario for EstateHandoff {
@@ -217,16 +225,23 @@ impl World {
 }
 
 fn handoff_at(base: &Path, mode: HandoffMode) -> Result<Vec<String>, String> {
+    handoff_with(
+        base,
+        &HandoffOptions {
+            mode,
+            ..HandoffOptions::default()
+        },
+    )
+}
+
+fn handoff_with(base: &Path, options: &HandoffOptions) -> Result<Vec<String>, String> {
     let mut lines = Vec::new();
     estate::handoff(
         &base.join("plan"),
         &base.join("corpus"),
         &base.join("applied"),
         "neo",
-        &HandoffOptions {
-            mode,
-            ..HandoffOptions::default()
-        },
+        options,
         &mut |line| {
             lines.push(line.to_owned());
             Ok(())
@@ -336,6 +351,15 @@ fn handoff_child_entry() {
     let outcome = match mode.as_str() {
         "render" => handoff_at(&base, HandoffMode::Render).map(drop),
         "clear" => handoff_at(&base, HandoffMode::Clear).map(drop),
+        "clear-carried" => handoff_with(
+            &base,
+            &HandoffOptions {
+                mode: HandoffMode::Clear,
+                clear_carried: true,
+                ..HandoffOptions::default()
+            },
+        )
+        .map(drop),
         _ => estate::apply(
             &base.join("plan"),
             &base.join("corpus"),
@@ -489,18 +513,19 @@ fn scenario(point: Point, nth: u64, kind: EstateHandoff) {
             // rerun re-renders over the user's bytes.
             world.source_change(b"alpha 2\n");
             crash(&world, "render", &fault);
-            git(
-                &world.dst(),
-                &["remote", "add", "live", "https://example.invalid/x.git"],
-            );
+            // The next run settles the crash, then refuses on a target it
+            // cannot write (a directory where `AGENTS.override.md` would
+            // be), as the privacy guard did before OI-1003-Q188 removed it.
+            let override_dir = world.dst().join("AGENTS.override.md");
+            fs::create_dir(&override_dir).unwrap();
             let refused = world.handoff(HandoffMode::Render);
             assert!(
                 refused
                     .as_ref()
-                    .is_err_and(|refusal| refusal.contains("HANDOFF_NOT_PRIVATE")),
+                    .is_err_and(|refusal| refusal.contains("HANDOFF_TARGET_UNSUPPORTED")),
                 "{label}: {refused:?}"
             );
-            git(&world.dst(), &["remote", "remove", "live"]);
+            fs::remove_dir(&override_dir).unwrap();
             tick();
             let mut kept = AGENTS.to_vec();
             kept.extend_from_slice(b"A local note.\n");
@@ -523,6 +548,40 @@ fn scenario(point: Point, nth: u64, kind: EstateHandoff) {
                 "{label}: the user's edit was landed over"
             );
         }
+        EstateHandoff::ClearCarried => {
+            let mut carried = b"<!-- bulkload-handoff:v1 BEGIN id=0123456789abcdef for=fedcba9876543210 BULKLOAD-HANDOFF-DO-NOT-COMMIT -->\n> another landing's block\n<!-- bulkload-handoff:v1 END id=0123456789abcdef -->\n\n".to_vec();
+            carried.extend_from_slice(AGENTS);
+            fs::write(world.src().join("AGENTS.md"), &carried).unwrap();
+            git(
+                &world.src(),
+                &["commit", "--quiet", "-am", "a carried block"],
+            );
+            tick();
+            world.capture();
+            assert_eq!(world.apply()[0].0, "workspace-restored");
+            world.handoff(HandoffMode::Render).unwrap();
+            crash(&world, "clear-carried", &fault);
+            let agents = world.dst().join("AGENTS.md");
+            let bytes = fs::read(&agents).unwrap();
+            assert!(
+                bytes == AGENTS || remainder(&bytes).as_deref() == Some(carried.as_slice()),
+                "{label}: AGENTS.md is neither before nor after the clear"
+            );
+            // Converge is not wedged by what the crash left, and the H step
+            // finishes the clear with its carried blocks.
+            world.source_change(b"alpha 2\n");
+            let rows = world.apply();
+            assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
+            assert_eq!(fs::read(&agents).unwrap(), AGENTS, "{label}");
+            assert!(world
+                .dst()
+                .join(".git/bulkload/v1/neo/handoff.stripped")
+                .exists());
+            world.source_change(b"alpha 3\n");
+            let rows = world.apply();
+            assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
+            assert_eq!(fs::read(&agents).unwrap(), AGENTS, "{label}");
+        }
         EstateHandoff::ClearNoOpApply => {
             world.handoff(HandoffMode::Render).unwrap();
             tick();
@@ -543,7 +602,10 @@ fn scenario(point: Point, nth: u64, kind: EstateHandoff) {
     // A second rerun writes nothing (after one that may re-date a record
     // whose prints were racy).
     tick();
-    let mode = if matches!(kind, EstateHandoff::Clear | EstateHandoff::ClearNoOpApply) {
+    let mode = if matches!(
+        kind,
+        EstateHandoff::Clear | EstateHandoff::ClearNoOpApply | EstateHandoff::ClearCarried
+    ) {
         HandoffMode::Clear
     } else {
         HandoffMode::Render

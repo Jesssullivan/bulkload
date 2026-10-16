@@ -1054,13 +1054,6 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
     no-op and reads 0 bytes. The adopted prints then prove later converges
     by print.
   - **S2:** the source is never read.
-- **Review of 2026-10-16** (two refuters against `9ec8d36`; the design
-  note's section 18 has the per-finding table): the record's print is
-  re-checked at every write; a crashed clear is finished; a carried block
-  is kept as content (OI-1003-Q185); the privacy guard counts a preserved
-  inert origin and URL rewrites; commit detection reads branch and tag
-  history; `ready` is reachable by consolidating; options persist across
-  reruns; `AGENTS.override.md` is covered. No SLO number changes.
 - **`estate-diff`** reports a plan against the destination, read-only, in
   the apply's own terms (P94).
 - **A bare capture into an absent path lands natively** (#226 item 4).
@@ -1134,8 +1127,9 @@ user. No SLO number changes. The design note is
   `NoLocalWorkLost` is amended in one place: an operator value a render
   left under an intact block is kept. A block carried from another
   landing is content and is never dropped (OI-1003-Q185).
-- **S4:** the hand-off is an annotation outside closure's gate. Its five
-  refusals are typed per workspace and never change an item's outcome;
+- **S4:** the hand-off is an annotation outside closure's gate. Its four
+  refusals (five until OI-1003-Q188 removed `HANDOFF_NOT_PRIVATE`) are
+  typed per workspace and never change an item's outcome;
   the H step's result is a line of its own after the apply's receipts.
 - **S3:** an unchanged `estate-handoff` rerun reads 0 destination bytes
   and writes nothing once its record's prints are past the racy window
@@ -1147,7 +1141,8 @@ user. No SLO number changes. The design note is
   note's section 18 has the per-finding table): the record's print is
   re-checked at every write; a crashed clear is finished; a carried block
   is kept as content (OI-1003-Q185); the privacy guard counts a preserved
-  inert origin and URL rewrites; commit detection reads branch and tag
+  inert origin and URL rewrites (the guard is since removed,
+  OI-1003-Q188); commit detection reads branch and tag
   history; `ready` is reachable by consolidating; options persist across
   reruns; `AGENTS.override.md` is covered. No SLO number changes.
 - **Re-reviews of 2026-10-16** (design note section 19): a block of this
@@ -1157,6 +1152,17 @@ user. No SLO number changes. The design note is
   hand and put back byte for byte is bulkload's again, never presented as
   carried; a created file stays `created` across re-renders. No SLO number
   changes.
+- **Operator rulings of 2026-10-16** (Linear TIN-6569; design note
+  section 19): OI-1003-Q188, the privacy guard is removed and the block is
+  always written; OI-1003-Q189, `ready` also needs a clean working tree in
+  the live sibling and in every destination-only worktree; OI-1003-Q190,
+  `--clear --clear-carried` removes carried blocks from landed content as a
+  recorded edit converge accepts (S5: never from bytes that are not the
+  landed blob; S3 unchanged, no read on an unchanged rerun beyond the
+  `git status` of the sibling and destination-only worktrees that Q189
+  rules); OI-1003-Q191, commit detection flags the token only in commits
+  the carried capture does not reach, and a token in the source's history
+  is information. No SLO number changes.
 - **Proof.** `tests/estate_handoff.rs` H0 to H19 (H0 is the control: a
   naive prepend refuses MODIFIED), the hand-off unit rows and the
   `render_then_clear_is_identity` property, the `estate.handoff.*`
@@ -1164,11 +1170,10 @@ user. No SLO number changes. The design note is
   EstateConverge's `Handoff` rows with the invariant
   `HandoffOwnsOnlyItsBlock` and five mutation rows
   (`docs/formal/README.md`, "TIN-6569").
-- **Open for the operator:** which repositories count as private (bulkload
-  cannot tell a public repository; it refuses unless told), and what
-  "converged and consolidated completely" means for a landing beside a
-  live copy (which copy carries the work forward; agents never delete
-  either).
+- **Open for the operator:** which copy carries the work forward for a
+  landing beside a live copy (agents never delete either). Answered: which
+  repositories count as private (none is asked: OI-1003-Q188) and what
+  `ready` reads (commits and clean trees: OI-1003-Q189).
 
 ## Priority (OI-1003-Q4)
 

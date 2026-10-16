@@ -2985,9 +2985,11 @@ written as before.
   (a clear raced by an edit below the block, which the check puts back);
   `ConvergesWhenQuiet` needed the hand-off fairness above.
 - **Not modelled:** the render's content and inputs digest (a pure
-  function: unit and property rows), the privacy guard (a precondition),
-  commit detection (read-only), the block's owner identity (a carried
-  block is source content, one more source value), the H step's choice to
+  function: unit and property rows), the privacy guard (a precondition;
+  removed by OI-1003-Q188), commit detection and the open rows
+  (read-only; OI-1003-Q189 and Q191 change only them), the block's owner
+  identity (a carried block is source content, one more source value),
+  the H step's choice to
   re-render, the second target, and the lift's own crash point (one step
   with the import; the Rust fault row `estate.handoff.lift_after_unlink`).
 - **Review of 2026-10-16** (design note section 18). The record's print
@@ -3067,6 +3069,84 @@ written as before.
   | `MC_ec_neg_handoff_no_intent` | fail | FAIL | HandoffOwnsOnlyItsBlock | 32 | 5 | 13s |
   | `MC_ec_neg_handoff_retake_unchecked` | fail | FAIL | NoLocalWorkLost | 9057 | 16 | 17s |
   | `MC_ec_neg_handoff_keep_racy_unchecked` | fail | FAIL | NoLocalWorkLost | 8266 | 16 | 15s |
+
+- **Operator rulings of 2026-10-16** (Linear TIN-6569; design note
+  section 19). OI-1003-Q190 adds a write, so the model gains it:
+  - **Values.** `Cb(v)` (`CB` = 500, below `BLK`, so `Blk(Cb(v))` is a
+    block) is the bytes `v` under a carried block. With `"carried"` in
+    `SrcKinds` (a new label) `SrcSeat` may write `Cb(nextV)` at `HP`,
+    and `OpBlock` may put `Blk(Cb(nextV))` (the operator's bytes below
+    the block, starting with a pasted carried block).
+  - **State.** `hand` gains `u` (what a clear leaves), `cc`
+    (`--clear-carried`), `ps` (the landed value a pending clear removes a
+    carried block from: part of the durable intent) and `sp` (the one
+    `handoff.stripped` records). Rows without `"carried"` keep `cc`,
+    `ps` and `sp` at their initial values and `u` equal to `v`, so their
+    state spaces are unchanged (`MC_ec_handoff` 26952, `MC_ec_handoff_op`
+    19425, `MC_ec_handoff_live` 2023, `MC_ec_refs` 54141, `MC_ec_seats`
+    64478, `MC_ec_adopt` 30652 below).
+  - **Actions.** No new action: `HandoffWrite` may clear with `cc`,
+    removing a carried block only from the landed value (`CarriedCut`; C
+    `clear` with `landed_match`), with or without this landing's block
+    over it; `HandoffRecord` records `sp`; `HandoffSettle` finishes a
+    pending clear with its flag and records a removal it finds done;
+    `HandoffCheck`'s undo and `HandoffFinish` drop `ps`.
+  - **Changed steps.** `Holds` also accepts `UnCb(v)` and `Blk(UnCb(v))`
+    for a landed `v` that `sp` or `ps` names (`SOv`; C `landed_sides`
+    with `handoff.stripped`, `Prefix.strip`); `CrashAtomicity` and
+    `Converged` use `WithHand`.
+  - **Rows.** `MC_ec_handoff_carried` (the source writes a carried block
+    and edits the target again, crashes), `MC_ec_handoff_carried_op` (the
+    operator's edits too, `MaxSrc` 1), the witness row
+    `MC_ec_reach_handoff_carried_cleared` (a recorded removal, then a
+    converge replaces the stripped seat), and two mutations:
+    `handoff_strip_no_overlay` (the proof ignores `handoff.stripped`)
+    fails `TypedRefusal`; `handoff_strip_unchecked` (a carried block
+    removed from any bytes, the operator's included) fails
+    `NoLocalWorkLost`.
+  - **Found while building the rows**, not a hand-off finding: with
+    `MaxSrc` 2 and the operator's seat edits concurrent
+    (`handoffOp // { MaxSrc = 2 }`), the unmutated spec violates
+    `NoLocalWorkLost` with no hand-off step: the source removes `d` and
+    adds it back, the converge's `Add` writes it, the operator deletes it
+    in flight, the host crashes, and the rerun's settle reads the absent
+    seat as the `Add`'s old side and writes it again (`SeatOp`'s settle
+    classification). The rows keep `MaxSrc` 1 as `MC_ec_handoff_op`
+    does; whether the code's settle does the same was not checked in
+    this lane (design note 19.10).
+
+  `just tla-check` of the 17 hand-off rows with `MC_ec_refs`,
+  `MC_ec_seats` and `MC_ec_adopt` on this spec, 2026-10-16, sting,
+  `-workers 3`, nice 10, beside the lane's cargo runs: 21 rows matched
+  (the budget self-test first), 384 s wall, peak RSS 2055 MiB, `rc=0`.
+  Grounding: 96 operators, 17 constants, 62 mutations, 3 label sets, 82
+  code symbols; `just tla-render --check` current (251 files).
+
+  | config | expect | outcome | violated | distinct | depth | wall |
+  |---|---|---|---|---:|---:|---:|
+  | `MC_ec_refs` | pass | PASS | - | 54141 | 48 | 26s |
+  | `MC_ec_seats` | pass | PASS | - | 64478 | 51 | 22s |
+  | `MC_ec_adopt` | pass | PASS | - | 30652 | 36 | 20s |
+  | `MC_ec_handoff` | pass | PASS | - | 26952 | 52 | 30s |
+  | `MC_ec_handoff_op` | pass | PASS | - | 19425 | 37 | 17s |
+  | `MC_ec_handoff_carried` | pass | PASS | - | 97851 | 52 | 23s |
+  | `MC_ec_handoff_carried_op` | pass | PASS | - | 50226 | 37 | 29s |
+  | `MC_ec_handoff_live` (LiveSpec) | pass | PASS | - | 2023 | 36 | 16s |
+  | `MC_ec_reach_handoff_converged` | reach | REACHED | Witness_HandoffConverged | 4005 | 18 | 16s |
+  | `MC_ec_reach_handoff_cleared` | reach | REACHED | Witness_HandoffCleared | 8948 | 24 | 15s |
+  | `MC_ec_reach_handoff_carried_cleared` | reach | REACHED | Witness_HandoffCarriedCleared | 75584 | 37 | 20s |
+  | `MC_ec_neg_handoff_no_overlay` | fail | FAIL | TypedRefusal | 364 | 9 | 16s |
+  | `MC_ec_neg_handoff_overlay_any_block` | fail | FAIL | NoLocalWorkLost | 5377 | 13 | 16s |
+  | `MC_ec_neg_handoff_clear_unchecked` | fail | FAIL | NoLocalWorkLost | 2508 | 11 | 16s |
+  | `MC_ec_neg_handoff_exchange_unchecked` | fail | FAIL | NoLocalWorkLost | 203 | 6 | 13s |
+  | `MC_ec_neg_handoff_no_intent` | fail | FAIL | HandoffOwnsOnlyItsBlock | 28 | 5 | 13s |
+  | `MC_ec_neg_handoff_retake_unchecked` | fail | FAIL | NoLocalWorkLost | 8864 | 16 | 17s |
+  | `MC_ec_neg_handoff_keep_racy_unchecked` | fail | FAIL | NoLocalWorkLost | 8204 | 16 | 16s |
+  | `MC_ec_neg_handoff_strip_no_overlay` | fail | FAIL | TypedRefusal | 25018 | 24 | 16s |
+  | `MC_ec_neg_handoff_strip_unchecked` | fail | FAIL | NoLocalWorkLost | 3905 | 10 | 14s |
+
+  A failing or reach row's count is where TLC's workers stopped, so it
+  varies a little between runs; the pass rows' counts are exact.
 
 `just tla-check` of the hand-off rows, 2026-10-16, sting, `-workers 3`,
 nice 10: 11 rows matched (the budget self-test first), 338 s wall, `rc=0`.

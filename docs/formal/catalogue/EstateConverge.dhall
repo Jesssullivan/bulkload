@@ -97,6 +97,7 @@ let SrcKind =
       | worktree
       | race
       | stashrace
+      | carried
       >
 
 let srcKindTable =
@@ -113,6 +114,7 @@ let srcKindTable =
       , worktree = SrcKind.worktree
       , race = SrcKind.race
       , stashrace = SrcKind.stashrace
+      , carried = SrcKind.carried
       }
 
 let OpKind =
@@ -234,6 +236,8 @@ let Mutation =
       | handoff_no_intent
       | handoff_retake_unchecked
       | handoff_keep_racy_unchecked
+      | handoff_strip_no_overlay
+      | handoff_strip_unchecked
       >
 
 let mutationIndex =
@@ -299,6 +303,8 @@ let mutationIndex =
           , handoff_no_intent = 57
           , handoff_retake_unchecked = 58
           , handoff_keep_racy_unchecked = 59
+          , handoff_strip_no_overlay = 60
+          , handoff_strip_unchecked = 61
           }
           m
 
@@ -417,6 +423,7 @@ let Witness =
       | Witness_AdoptedConverged
       | Witness_HandoffConverged
       | Witness_HandoffCleared
+      | Witness_HandoffCarriedCleared
       >
 
 let witnessTable =
@@ -428,6 +435,7 @@ let witnessTable =
       , Witness_AdoptedConverged = Witness.Witness_AdoptedConverged
       , Witness_HandoffConverged = Witness.Witness_HandoffConverged
       , Witness_HandoffCleared = Witness.Witness_HandoffCleared
+      , Witness_HandoffCarriedCleared = Witness.Witness_HandoffCarriedCleared
       }
 
 -- The 59 actions of EstateConverge.tla's Next, in the sorted order of the never column.
@@ -1380,6 +1388,22 @@ let handoffOp =
           , OpConcurrent = True
           }
 
+{- OI-1003-Q190 (2026-10-16): the source's target starts with a carried
+   block (another landing's, Cb(v)); --clear --clear-carried removes it
+   from the landed value as a recorded edit (handoff.stripped) that converge
+   accepts, alone or under this landing's block; the source then edits the
+   target again, so a converge replaces the stripped seat; a crash at any
+   step.
+-}
+let handoffCarried = handoff // { SrcKinds = [ SrcKind.seat, SrcKind.carried ] }
+
+{- OI-1003-Q190: as handoffCarried, with the operator's edits of the
+   target (inside the block, below it with or without a carried block of
+   their own, the block removed by hand) and of the seat, also while an
+   apply is in flight.
+-}
+let handoffCarriedOp = handoffOp // { SrcKinds = [ SrcKind.seat, SrcKind.carried ] }
+
 -- Properties -------------------------------------------------------------------------
 
 let safety = filter Property isSafety allProperties
@@ -1453,6 +1477,8 @@ let verdict
           , handoff_no_intent = Property.HandoffOwnsOnlyItsBlock
           , handoff_retake_unchecked = Property.NoLocalWorkLost
           , handoff_keep_racy_unchecked = Property.NoLocalWorkLost
+          , handoff_strip_no_overlay = Property.TypedRefusal
+          , handoff_strip_unchecked = Property.NoLocalWorkLost
           }
           m
 
@@ -2040,6 +2066,27 @@ let positives =
           , "under or without the block (NoLocalWorkLost)."
           ]
           handoffOp
+      , row
+          "MC_ec_handoff_carried"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpBlock, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          [ "OI-1003-Q190: the source's target starts with a carried block;"
+          , "--clear --clear-carried removes it from the landed value only, as a"
+          , "recorded edit converge accepts (alone or under the block), and the"
+          , "source then edits the target again; a crash at any step: no seat"
+          , "is refused for bulkload's own edit (TypedRefusal), and every"
+          , "component is old or new (CrashAtomicity)."
+          ]
+          handoffCarried
+      , row
+          "MC_ec_handoff_carried_op"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          [ "OI-1003-Q190: as MC_ec_handoff_carried, with the operator's edits"
+          , "(below the block, with or without a carried block of their own,"
+          , "inside it, removed by hand) also while an apply is in flight:"
+          , "--clear-carried never removes a carried block from the operator's"
+          , "bytes (NoLocalWorkLost)."
+          ]
+          handoffCarriedOp
       , liveRow
           ( row
               "MC_ec_handoff_live"
@@ -2122,6 +2169,14 @@ let witnesses =
           , "converge journals a later capture."
           ]
           handoff
+      , row
+          "MC_ec_reach_handoff_carried_cleared"
+          (Expect.reach Witness.Witness_HandoffCarriedCleared)
+          [ "REACH (expected REACHED): OI-1003-Q190: a recorded --clear-carried"
+          , "removed a carried block from the landed target, and a converge"
+          , "replaced the stripped seat with the source's next value."
+          ]
+          handoffCarried
       ]
 
 {- Documented limits of the code on feat/estate-converge-20261008 (the
@@ -2850,6 +2905,30 @@ let primary =
             ]
           }
         }
+      , handoff_strip_no_overlay =
+        { mutation = Mutation.handoff_strip_no_overlay
+        , constants = handoffCarried
+        , comment =
+          { head = "OI-1003-Q190: converge's proof ignores handoff.stripped, so"
+          , tail =
+            [ "after a recorded --clear-carried a quiet estate's converge"
+            , "refuses GIT_DESTINATION_MODIFIED for bulkload's own edit, an"
+            , "operator edit nobody made."
+            ]
+          }
+        }
+      , handoff_strip_unchecked =
+        { mutation = Mutation.handoff_strip_unchecked
+        , constants = handoffCarriedOp
+        , comment =
+          { head = "OI-1003-Q190: --clear-carried removes a carried block from any"
+          , tail =
+            [ "bytes under the block, not only from the landed value, so an"
+            , "operator's bytes below the block that start with a carried block"
+            , "lose it."
+            ]
+          }
+        }
       , handoff_no_intent =
         { mutation = Mutation.handoff_no_intent
         , constants = handoff
@@ -3007,6 +3086,8 @@ let negRows
       , primaryOf Mutation.handoff_no_intent
       , primaryOf Mutation.handoff_retake_unchecked
       , primaryOf Mutation.handoff_keep_racy_unchecked
+      , primaryOf Mutation.handoff_strip_no_overlay
+      , primaryOf Mutation.handoff_strip_unchecked
       ]
 
 let primaryPositions =
@@ -3356,10 +3437,10 @@ let invariants
         }
       , { tla = Property.HandoffOwnsOnlyItsBlock
         , slo = [ S.S5, S.S4, S.Durability ]
-        , ruling = [ "OI-1003-Q183", "OI-1003-Q144", "OI-1003-Q149" ]
+        , ruling = [ "OI-1003-Q183", "OI-1003-Q185", "OI-1003-Q190", "OI-1003-Q144", "OI-1003-Q149" ]
         , codeSymbol =
           [ "landed_sides"
-          , "skip_prefix"
+          , "matching"
           , "holds"
           , "prove"
           , "HandoffLanded"
@@ -3371,6 +3452,10 @@ let invariants
           , "after_apply"
           , "retaken"
           , "settle"
+          , "HandoffStripped"
+          , "carried_len"
+          , "landed_match"
+          , "classify_head"
           ]
         , pending = none
         , ptest =
@@ -3392,6 +3477,14 @@ let invariants
           , "H25"
           , "H32"
           , "the estate_handoff fault-harness rows (rerender_over_edit, clear_noop_apply)"
+          , "H40"
+          , "H41"
+          , "H42"
+          , "H46"
+          , "H47"
+          , "H49"
+          , "holds_accepts_a_recorded_removal_of_carried_blocks_only"
+          , "the estate_handoff fault-harness rows (clear_carried_after_intent, clear_carried_after_exchange)"
           ]
         }
       , { tla = Property.ConvergesWhenQuiet

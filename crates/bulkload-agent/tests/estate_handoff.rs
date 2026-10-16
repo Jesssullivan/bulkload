@@ -32,8 +32,8 @@
 //!   and a directory refuse `HANDOFF_TARGET_UNSUPPORTED` with nothing
 //!   written.
 //! - H10: missing files are created untracked (0644) and cleared away.
-//! - H11: privacy: a remote not under `--private-remote` refuses
-//!   `HANDOFF_NOT_PRIVATE`; a token in a URL never appears anywhere.
+//! - H11: the block is written whatever the remotes (OI-1003-Q188 removed
+//!   the privacy guard); a URL, or a token in one, never appears anywhere.
 //! - H12: `--check` reports `staged` and `committed` and exits with
 //!   `HANDOFF_MARKER_COMMITTED`.
 //! - H13: `--check` and `--dry-run` write nothing.
@@ -55,13 +55,12 @@
 //!   to writing nothing.
 //! - H24, H25: a block another landing rendered is carried content
 //!   (OI-1003-Q185), kept below this landing's block.
-//! - H26, H27: the privacy guard counts a preserved inert origin and URL
-//!   rewrites. H28: commit detection reads branch history.
+//! - H28: commit detection reads branch history. (H26, H27 and H36, the
+//!   privacy guard's rows, were removed with the guard, OI-1003-Q188.)
 //! - H29: `ready` follows consolidation. H30: options persist.
 //! - H31, H34: `AGENTS.override.md`. H32: an edited created file is never
 //!   lifted. H35: a new destination ref makes the block stale.
-//! - Re-review of 2026-10-16: H36, a symlinked global configuration's
-//!   rewrite rules are read; H37, a block of this landing's identity that
+//! - Re-review of 2026-10-16: H37, a block of this landing's identity that
 //!   no record names (a round trip) is carried content; H38, a live sibling
 //!   strictly ahead of the landing keeps the hand-off open; H39, commit
 //!   detection reads every target name's history, whatever this run's
@@ -71,6 +70,12 @@
 //!   carried content (the whole file is the landed blob); H42, a retired
 //!   block put back byte for byte is this landing's again; H43, a created
 //!   file stays created across re-renders.
+//! - Operator rulings of 2026-10-16 (Linear TIN-6569): H44 and H45, `ready`
+//!   needs clean working trees in the live sibling and destination-only
+//!   worktrees (OI-1003-Q189); H46 and H47, `--clear --clear-carried` is an
+//!   opt-in recorded edit of landed content only (OI-1003-Q190); H48, a
+//!   token in the source's history is information, never committed
+//!   (OI-1003-Q191).
 //!
 //! Fixture repositories are created and destroyed here; their Git runs with
 //! no global configuration and no hooks (R-N98).
@@ -792,44 +797,40 @@ fn h10_missing_targets_are_created_untracked_and_cleared_away() {
     assert_eq!(status(&world.dst()), before);
 }
 
+/// H11 (OI-1003-Q188: the privacy guard is removed, "an erroneous
+/// overreach; such a block is irrelevant to bulkload"): the block is
+/// written whatever the repository's remotes are (the source's origin a
+/// landing kept inert, an https remote with a token in its user
+/// information). The rows carry no `private` field, the guard's flags are
+/// gone, and no URL is rendered or printed.
 #[test]
-fn h11_privacy_is_deny_by_default_and_urls_are_never_printed() {
-    let world = World::new();
+fn h11_the_block_is_written_whatever_the_remotes() {
+    let url = "git@github.com:Jesssullivan/public-repo.git";
+    let world = World::with(|src| {
+        git(src, &["remote", "add", "origin", url]);
+    });
     let secret = "s3cr3t-t0ken-value";
     git(
         &world.dst(),
         &[
             "remote",
             "add",
-            "origin",
+            "pub",
             &format!("https://user:{secret}@forge.example/team/repo.git"),
         ],
     );
-    let frozen = freeze_all(&world.root.join("dst"));
-    let refused = world.handoff(&[]);
-    assert!(!refused.ok);
-    assert!(
-        row(&refused.stdout, &world.dst()).contains("HANDOFF_NOT_PRIVATE"),
-        "{}",
-        refused.stdout
-    );
-    assert_eq!(freeze_all(&world.root.join("dst")), frozen);
-    let ran = world.handoff(&["--private-remote", "https://user:"]);
+    let ran = world.handoff(&[]);
     assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
-    assert!(row(&ran.stdout, &world.dst()).contains("\"private\":\"private-remote\""));
-    assert!(world.handoff(&["--clear"]).ok);
-    // The remote is the repository's: the linked worktree needs it too.
-    let ran = world.handoff(&[
-        "--allow-workspace",
-        world.dst().to_str().unwrap(),
-        "--allow-workspace",
-        world.dst_wt().to_str().unwrap(),
-    ]);
-    assert!(ran.ok, "{}", ran.stderr);
-    assert!(row(&ran.stdout, &world.dst()).contains("\"private\":\"allowed\""));
-    // The token is in no output and no byte the hand-off wrote.
-    for text in [&refused.stdout, &refused.stderr, &ran.stdout, &ran.stderr] {
-        assert!(!text.contains(secret), "{text}");
+    for root in [world.dst(), world.dst_wt()] {
+        assert!(split(&fs::read(root.join("AGENTS.md")).unwrap()).is_some());
+    }
+    assert!(
+        !row(&ran.stdout, &world.dst()).contains("\"private\""),
+        "{}",
+        ran.stdout
+    );
+    for text in [&ran.stdout, &ran.stderr] {
+        assert!(!text.contains(secret) && !text.contains(url), "{text}");
     }
     for path in [
         world.dst().join("AGENTS.md"),
@@ -837,11 +838,20 @@ fn h11_privacy_is_deny_by_default_and_urls_are_never_printed() {
         world.dst().join(".git/bulkload/v1/neo/handoff.landed"),
     ] {
         let bytes = fs::read(&path).unwrap();
-        assert!(
-            !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
-            "{}",
-            path.display()
-        );
+        for needle in [secret, url] {
+            assert!(
+                !bytes.windows(needle.len()).any(|w| w == needle.as_bytes()),
+                "{}",
+                path.display()
+            );
+        }
+    }
+    for flag in [
+        &["--private-remote", "https://user:"][..],
+        &["--allow-workspace", world.dst().to_str().unwrap()][..],
+    ] {
+        let gone = world.handoff(flag);
+        assert!(!gone.ok, "{flag:?}: {}", gone.stdout);
     }
 }
 
@@ -1433,70 +1443,6 @@ fn h25_a_recarried_landing_keeps_the_earlier_block_below_its_own() {
     assert_eq!(fs::read(&agents).unwrap(), first);
 }
 
-/// H26 (privacy and claims, BLOCKER): a landing keeps the source's origin
-/// inert (preserved in `.git/carry-config`, no remote configured). That is
-/// still the repository's remote: the guard refuses `HANDOFF_NOT_PRIVATE`
-/// unless the operator names its prefix, and never prints the URL.
-#[test]
-fn h26_a_preserved_inert_origin_is_still_a_remote() {
-    let url = "git@github.com:Jesssullivan/public-repo.git";
-    let world = World::with(|src| {
-        git(src, &["remote", "add", "origin", url]);
-    });
-    assert_eq!(git(&world.dst(), &["remote"]), "", "the origin is inert");
-    let frozen = freeze_all(&world.root.join("dst"));
-    let refused = world.handoff(&[]);
-    assert!(!refused.ok, "{}", refused.stdout);
-    assert!(
-        row(&refused.stdout, &world.dst()).contains("HANDOFF_NOT_PRIVATE"),
-        "{}",
-        refused.stdout
-    );
-    assert_eq!(freeze_all(&world.root.join("dst")), frozen);
-    let ran = world.handoff(&["--private-remote", "git@github.com:Jesssullivan/"]);
-    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
-    assert!(row(&ran.stdout, &world.dst()).contains("\"private\":\"private-remote\""));
-    for text in [&refused.stdout, &refused.stderr, &ran.stdout, &ran.stderr] {
-        assert!(!text.contains(url), "{text}");
-    }
-}
-
-/// H27 (privacy and claims, minor): the prefix check reads the URLs Git
-/// would use: a remote under a private prefix that `url.<base>.insteadOf`
-/// or `pushInsteadOf` rewrites to a public one is not private.
-#[test]
-fn h27_insteadof_rewrites_are_checked() {
-    let world = World::new();
-    git(
-        &world.dst(),
-        &["remote", "add", "origin", "priv:team/repo.git"],
-    );
-    let private = ["--private-remote", "priv:"];
-    let baseline = world.handoff(&private);
-    assert!(baseline.ok, "{}\n{}", baseline.stdout, baseline.stderr);
-    assert!(world.handoff(&["--clear"]).ok);
-    for key in ["insteadOf", "pushInsteadOf"] {
-        let name = format!("url.https://github.com/.{key}");
-        git(&world.dst(), &["config", &name, "priv:"]);
-        let refused = world.handoff(&private);
-        assert!(!refused.ok, "{key}: {}", refused.stdout);
-        assert!(
-            row(&refused.stdout, &world.dst()).contains("HANDOFF_NOT_PRIVATE"),
-            "{key}: {}",
-            refused.stdout
-        );
-        let both = world.handoff(&[
-            "--private-remote",
-            "priv:",
-            "--private-remote",
-            "https://github.com/",
-        ]);
-        assert!(both.ok, "{key}: {}\n{}", both.stdout, both.stderr);
-        assert!(world.handoff(&["--clear"]).ok);
-        git(&world.dst(), &["config", "--unset", &name]);
-    }
-}
-
 /// H28 (privacy and claims, MAJOR): a block committed and removed again by a
 /// later commit is still in the branch's history, and a push would publish
 /// it: `--check` reports `committed`.
@@ -1560,6 +1506,9 @@ fn h29_ready_follows_consolidation() {
         .output()
         .unwrap();
     assert!(out.status.success());
+    // The source's untracked file came with the copy: uncommitted work in
+    // the sibling, an open row of its own (OI-1003-Q189); settled here.
+    fs::remove_file(live.join("main/notes.txt")).unwrap();
     fs::write(live.join("main/live.txt"), b"live work\n").unwrap();
     git(&live.join("main"), &["add", "live.txt"]);
     git(
@@ -1802,57 +1751,6 @@ fn handoff_args(world: &World, extra: &[&str]) -> Vec<OsString> {
     list
 }
 
-/// H36 (re-review of 2026-10-16, finding 3): the user's global
-/// configuration is read as Git reads it, through a symlink (a
-/// home-manager `~/.config/git/config`): its `insteadOf` rule that rewrites
-/// a private remote to a public one refuses `HANDOFF_NOT_PRIVATE`. A
-/// dangling link is no file, as for Git.
-#[test]
-fn h36_a_symlinked_global_configuration_is_read() {
-    let world = World::new();
-    git(
-        &world.dst(),
-        &["remote", "add", "origin", "priv:team/repo.git"],
-    );
-    let home = world.root.join("home");
-    let xdg = home.join(".config");
-    fs::create_dir_all(xdg.join("git")).unwrap();
-    let store = world.root.join("store-config");
-    fs::write(
-        &store,
-        "[url \"https://github.com/\"]\n\tinsteadOf = priv:\n",
-    )
-    .unwrap();
-    let args = handoff_args(&world, &["--private-remote", "priv:"]);
-    let run = |args: &[OsString]| {
-        agent_with(args, |command| {
-            command
-                .env_remove("GIT_CONFIG_GLOBAL")
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("HOME", &home)
-                .env("XDG_CONFIG_HOME", &xdg);
-        })
-    };
-    let link = xdg.join("git/config");
-    // A dangling link: no rule, the remote is under the prefix.
-    std::os::unix::fs::symlink(world.root.join("no-such-config"), &link).unwrap();
-    let dangling = run(&args);
-    assert!(dangling.ok, "{}\n{}", dangling.stdout, dangling.stderr);
-    assert!(run(&handoff_args(&world, &["--clear"])).ok);
-    // The rule through the link.
-    fs::remove_file(&link).unwrap();
-    std::os::unix::fs::symlink(&store, &link).unwrap();
-    let frozen = freeze_all(&world.root.join("dst"));
-    let linked = run(&args);
-    assert!(!linked.ok, "{}", linked.stdout);
-    assert!(
-        row(&linked.stdout, &world.dst()).contains("HANDOFF_NOT_PRIVATE"),
-        "{}",
-        linked.stdout
-    );
-    assert_eq!(freeze_all(&world.root.join("dst")), frozen, "wrote");
-}
-
 /// H37 (re-review of 2026-10-16, finding 4; OI-1003-Q185): a block this
 /// landing rendered, carried back to the source and landed again at the
 /// same path with no record (a round trip) names this landing's identity,
@@ -1918,6 +1816,9 @@ fn h38_a_sibling_ahead_of_the_landing_keeps_it_open() {
         .output()
         .unwrap();
     assert!(out.status.success());
+    // The source's untracked file came with the copy: uncommitted work in
+    // the sibling, an open row of its own (OI-1003-Q189); settled here.
+    fs::remove_file(live.join("main/notes.txt")).unwrap();
     fs::write(live.join("main/live.txt"), b"live work\n").unwrap();
     git(&live.join("main"), &["add", "live.txt"]);
     git(
@@ -2108,6 +2009,34 @@ fn h42_a_retired_block_put_back_is_this_landings_again() {
         "{}",
         check.stdout
     );
+    // Rounds with no converge between them (the record's capture stays):
+    // a rerun takes a put-back block into the record and out of the
+    // retired list, so when a later render replaces it (a new ref) and a
+    // person removes and puts back the new block, that block is the one
+    // retired and recognised (the mutation run's M38).
+    let removed_and_put_back = |world: &World| {
+        let current = fs::read(&agents).unwrap();
+        fs::write(&agents, AGENTS).unwrap();
+        let retired = world.handoff(&[]);
+        assert!(retired.ok, "{}\n{}", retired.stdout, retired.stderr);
+        fs::write(&agents, &current).unwrap();
+        let restored = world.handoff(&[]);
+        assert!(restored.ok, "{}\n{}", restored.stdout, restored.stderr);
+        assert!(
+            row(&restored.stdout, &world.dst()).contains("\"action\":\"restored\""),
+            "{}",
+            restored.stdout
+        );
+    };
+    removed_and_put_back(&world);
+    git(&world.dst(), &["branch", "extra"]);
+    let ran = world.handoff(&[]);
+    assert!(
+        row(&ran.stdout, &world.dst()).contains("\"outcome\":\"written\""),
+        "{}",
+        ran.stdout
+    );
+    removed_and_put_back(&world);
     let cleared = world.handoff(&["--clear"]);
     assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
     assert_eq!(fs::read(&agents).unwrap(), AGENTS);
@@ -2163,4 +2092,309 @@ fn h43_a_created_file_stays_created_across_re_renders() {
         applied.stdout
     );
     assert_eq!(remainder_of(&claude), b"Back again.\n");
+}
+
+/// H44 (OI-1003-Q189): `ready` needs, besides the commit rules, a clean
+/// working tree in the live sibling (a read-only `git status`): an
+/// untracked or a modified file there is uncommitted work, an open row,
+/// until it is committed or settled with the user.
+#[test]
+fn h44_ready_needs_a_clean_live_sibling() {
+    let world = World::new();
+    let live = world.root.join("live");
+    fs::create_dir(&live).unwrap();
+    let out = Command::new("cp")
+        .arg("-a")
+        .arg(world.src())
+        .arg(live.join("main"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    // The source's own untracked file came with the copy: work there.
+    fs::remove_file(live.join("main/notes.txt")).unwrap();
+    let sibling = format!("{}={}", world.root.join("dst").display(), live.display());
+    assert!(world.handoff(&["--sibling", &sibling]).ok);
+    settle();
+    let ready_now = |world: &World| {
+        let check = world.handoff(&["--check"]);
+        assert!(check.ok, "{}\n{}", check.stdout, check.stderr);
+        ready(&check.stdout, &world.dst())
+    };
+    assert!(ready_now(&world), "a clean sibling at the landing's HEAD");
+    fs::write(live.join("main/scratch.txt"), b"not committed\n").unwrap();
+    assert!(!ready_now(&world), "an untracked file in the sibling");
+    let ran = world.handoff(&[]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let block = String::from_utf8(block_of(&world.dst().join("AGENTS.md"))).unwrap();
+    assert!(block.contains("uncommitted changes"), "{block}");
+    fs::remove_file(live.join("main/scratch.txt")).unwrap();
+    assert!(ready_now(&world));
+    fs::write(live.join("main/a.txt"), b"alpha, edited live\n").unwrap();
+    assert!(!ready_now(&world), "a modified file in the sibling");
+    fs::write(live.join("main/a.txt"), b"alpha\n").unwrap();
+    assert!(ready_now(&world));
+}
+
+/// H45 (OI-1003-Q189): `ready` needs a clean working tree in every
+/// destination-only worktree (a worktree of the landed repository no plan
+/// item names), read-only.
+#[test]
+fn h45_ready_needs_clean_destination_only_worktrees() {
+    let world = World::new();
+    let extra = world.root.join("dst/extra");
+    git(
+        &world.dst(),
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "extra",
+            extra.to_str().unwrap(),
+        ],
+    );
+    assert!(world.handoff(&[]).ok);
+    settle();
+    let ready_now = |world: &World| {
+        let check = world.handoff(&["--check"]);
+        assert!(check.ok, "{}\n{}", check.stdout, check.stderr);
+        ready(&check.stdout, &world.dst())
+    };
+    assert!(
+        ready_now(&world),
+        "its HEAD is the landing's, its tree clean"
+    );
+    fs::write(extra.join("scratch.txt"), b"not committed\n").unwrap();
+    assert!(
+        !ready_now(&world),
+        "an untracked file in a destination-only worktree"
+    );
+    let frozen = freeze_all(&extra);
+    assert!(!ready_now(&world));
+    assert_eq!(freeze_all(&extra), frozen, "the status wrote");
+    fs::remove_file(extra.join("scratch.txt")).unwrap();
+    assert!(ready_now(&world));
+}
+
+/// H46 (OI-1003-Q190): carried blocks stay hands-off by default; the
+/// opt-in `--clear --clear-carried` removes them as a recorded bulkload
+/// edit (intent, temporary, exchange with the displaced file checked,
+/// `handoff.stripped`), which converge and `estate-diff` accept as landed
+/// content, with or without this landing's block on top. The source still
+/// carries the block: a source edit of the file lands it again.
+#[test]
+fn h46_clear_carried_is_an_opt_in_recorded_edit() {
+    let world = World::new();
+    let mut carried = foreign_block();
+    carried.extend_from_slice(AGENTS);
+    fs::write(world.src().join("AGENTS.md"), &carried).unwrap();
+    git(
+        &world.src(),
+        &["commit", "--quiet", "-am", "a carried block"],
+    );
+    settle();
+    world.capture();
+    let landed = world.apply();
+    assert!(landed.ok, "{}\n{}", landed.stdout, landed.stderr);
+    let agents = world.dst().join("AGENTS.md");
+    // Hands-off by default.
+    assert!(world.handoff(&[]).ok);
+    assert!(world.handoff(&["--clear"]).ok);
+    assert_eq!(fs::read(&agents).unwrap(), carried);
+    // Only with --clear.
+    let refused = world.handoff(&["--clear-carried"]);
+    assert!(!refused.ok, "{}", refused.stdout);
+    assert_eq!(fs::read(&agents).unwrap(), carried);
+    assert!(world.handoff(&[]).ok);
+    let cleared = world.handoff(&["--clear", "--clear-carried"]);
+    assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
+    assert!(
+        row(&cleared.stdout, &world.dst()).contains("\"action\":\"carried-cleared\""),
+        "{}",
+        cleared.stdout
+    );
+    assert_eq!(fs::read(&agents).unwrap(), AGENTS);
+    assert!(world
+        .dst()
+        .join(".git/bulkload/v1/neo/handoff.stripped")
+        .exists());
+    let line = world.diff_main();
+    assert!(line.contains("\"class\":\"identical\""), "{line}");
+    world.source_change(b"alpha 2\n");
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    assert_eq!(fs::read(&agents).unwrap(), AGENTS);
+    // This landing's block on top of the edit: converge proves both.
+    assert!(world.handoff(&[]).ok);
+    assert_eq!(remainder_of(&agents), AGENTS);
+    world.source_change(b"alpha 3\n");
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    assert_eq!(remainder_of(&agents), AGENTS);
+    assert!(world.handoff(&["--clear"]).ok);
+    assert_eq!(fs::read(&agents).unwrap(), AGENTS);
+    // The source edits the file, still carrying the block: it lands again.
+    let mut v2 = foreign_block();
+    v2.extend_from_slice(b"# Agents, v2\n");
+    fs::write(world.src().join("AGENTS.md"), &v2).unwrap();
+    git(&world.src(), &["commit", "--quiet", "-am", "agents v2"]);
+    settle();
+    world.capture();
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    assert_eq!(fs::read(&agents).unwrap(), v2);
+    // The record speaks only for the blob it was made over: the same
+    // removal by hand on the new blob is the user's edit.
+    fs::write(&agents, split(&v2).unwrap().1).unwrap();
+    world.source_change(b"alpha 4\n");
+    let applied = world.apply();
+    assert!(
+        applied.stdout.contains("GIT_DESTINATION_MODIFIED"),
+        "{}",
+        applied.stdout
+    );
+}
+
+/// H47 (OI-1003-Q190, Q185): `--clear-carried` removes a carried block
+/// only from the landed content, whose bytes the landing's objects still
+/// hold; above a user's edit it keeps the block and says so.
+#[test]
+fn h47_clear_carried_keeps_a_block_above_a_users_edit() {
+    let world = World::new();
+    let mut carried = foreign_block();
+    carried.extend_from_slice(AGENTS);
+    fs::write(world.src().join("AGENTS.md"), &carried).unwrap();
+    git(
+        &world.src(),
+        &["commit", "--quiet", "-am", "a carried block"],
+    );
+    settle();
+    world.capture();
+    assert!(world.apply().ok);
+    let agents = world.dst().join("AGENTS.md");
+    let mut edited = carried.clone();
+    edited.extend_from_slice(b"A local note.\n");
+    fs::write(&agents, &edited).unwrap();
+    let cleared = world.handoff(&["--clear", "--clear-carried"]);
+    assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
+    assert!(
+        row(&cleared.stdout, &world.dst()).contains("\"action\":\"carried-kept\""),
+        "{}",
+        cleared.stdout
+    );
+    assert_eq!(fs::read(&agents).unwrap(), edited);
+}
+
+/// H48 (OI-1003-Q191): commit detection flags the token only in commits
+/// the carried capture does not reach. A block already in the source's
+/// history is reported once as information (`source_history`), never as
+/// `HANDOFF_MARKER_COMMITTED`, also after destination commits that keep or
+/// remove it; this landing's block staged or committed is still flagged.
+#[test]
+fn h48_a_token_in_source_history_is_information() {
+    let world = World::new();
+    let mut carried = foreign_block();
+    carried.extend_from_slice(AGENTS);
+    fs::write(world.src().join("AGENTS.md"), &carried).unwrap();
+    git(
+        &world.src(),
+        &[
+            "commit",
+            "--quiet",
+            "-am",
+            "a block committed at the source",
+        ],
+    );
+    settle();
+    world.capture();
+    assert!(world.apply().ok);
+    let quiet = |world: &World| {
+        let check = world.handoff(&["--check"]);
+        assert!(check.ok, "{}\n{}", check.stdout, check.stderr);
+        let line = row(&check.stdout, &world.dst());
+        assert!(line.contains("\"source_history\":true"), "{line}");
+        assert!(line.contains("\"refusal\":null"), "{line}");
+    };
+    quiet(&world);
+    fs::write(world.dst().join("a.txt"), b"alpha, destination\n").unwrap();
+    git(
+        &world.dst(),
+        &["commit", "--quiet", "-m", "elsewhere", "--", "a.txt"],
+    );
+    quiet(&world);
+    fs::write(world.dst().join("AGENTS.md"), AGENTS).unwrap();
+    git(
+        &world.dst(),
+        &[
+            "commit",
+            "--quiet",
+            "-m",
+            "drop the carried block",
+            "--",
+            "AGENTS.md",
+        ],
+    );
+    quiet(&world);
+    assert!(world.handoff(&[]).ok);
+    git(&world.dst(), &["add", "AGENTS.md"]);
+    let staged = world.handoff(&["--check"]);
+    assert!(!staged.ok);
+    assert!(
+        row(&staged.stdout, &world.dst()).contains("\"state\":\"staged\""),
+        "{}",
+        staged.stdout
+    );
+    git(&world.dst(), &["commit", "--quiet", "-m", "oops"]);
+    let committed = world.handoff(&["--check"]);
+    assert!(!committed.ok);
+    assert!(
+        row(&committed.stdout, &world.dst()).contains("\"state\":\"committed\""),
+        "{}",
+        committed.stdout
+    );
+}
+
+/// H49 (the mutation run of the re-review 2 commit: M31 survived): a block
+/// of this landing's identity that no record names and whose file is not
+/// the landed blob (here the record was lost) is this landing's own stale
+/// block, never presented as carried content: render and `--clear` refuse
+/// `HANDOFF_BLOCK_MODIFIED` with nothing written and `--check` says
+/// `modified`. Removed by hand (from both targets), the next render writes
+/// a current block.
+#[test]
+fn h49_a_block_of_this_landing_with_its_record_lost_is_never_carried() {
+    let world = World::new();
+    assert!(world.handoff(&[]).ok);
+    let agents = world.dst().join("AGENTS.md");
+    let with_block = fs::read(&agents).unwrap();
+    fs::remove_file(world.dst().join(".git/bulkload/v1/neo/handoff.landed")).unwrap();
+    let frozen = freeze_all(&world.root.join("dst"));
+    let main = world.dst().display().to_string();
+    for extra in [
+        &["--workspace", &main][..],
+        &["--clear", "--workspace", &main][..],
+    ] {
+        let ran = world.handoff(extra);
+        assert!(!ran.ok, "{extra:?}: {}", ran.stdout);
+        assert!(
+            row(&ran.stdout, &world.dst()).contains("HANDOFF_BLOCK_MODIFIED"),
+            "{}",
+            ran.stdout
+        );
+        assert_eq!(freeze_all(&world.root.join("dst")), frozen, "{extra:?}");
+    }
+    let check = world.handoff(&["--check", "--workspace", &main]);
+    assert!(
+        row(&check.stdout, &world.dst()).contains("\"state\":\"modified\""),
+        "{}",
+        check.stdout
+    );
+    fs::write(&agents, split(&with_block).unwrap().1).unwrap();
+    let claude = world.dst().join("CLAUDE.md");
+    fs::write(&claude, remainder_of(&claude)).unwrap();
+    let ran = world.handoff(&["--workspace", &main]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    assert_eq!(remainder_of(&agents), AGENTS);
+    let block = String::from_utf8(block_of(&agents)).unwrap();
+    assert!(!block.contains("Carried hand-off blocks"), "{block}");
 }

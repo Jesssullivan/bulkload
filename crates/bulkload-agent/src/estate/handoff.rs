@@ -33,7 +33,8 @@ pub enum HandoffMode {
     Render,
     /// `--check`: read-only; the state, open rows and commit detection.
     Check,
-    /// `--clear`: remove every intact block and the record.
+    /// `--clear`: remove every intact block and the record (with
+    /// `--clear-carried`, carried blocks too).
     Clear,
     /// `--dry-run`: print the rows and the blocks, write nothing.
     DryRun,
@@ -53,10 +54,9 @@ pub struct HandoffOptions {
     pub workspaces: Vec<PathBuf>,
     /// `--sibling LANDED_PREFIX=LIVE_PREFIX` (repeatable).
     pub siblings: Vec<(PathBuf, PathBuf)>,
-    /// `--private-remote PREFIX` (repeatable).
-    pub private_remotes: Vec<String>,
-    /// `--allow-workspace PATH` (repeatable).
-    pub allow: Vec<PathBuf>,
+    /// `--clear-carried` (with `--clear` only): also remove the carried
+    /// blocks under this landing's, as a recorded edit (OI-1003-Q190).
+    pub clear_carried: bool,
     /// `--as-of NS`: the block's instant, for a reproducible render.
     pub as_of: Option<i128>,
 }
@@ -91,6 +91,7 @@ fn hex(bytes: &[u8]) -> String {
 
 fn validate(options: &HandoffOptions, source: &str) -> Result<()> {
     if (options.renew && matches!(options.mode, HandoffMode::Check | HandoffMode::Clear))
+        || (options.clear_carried && options.mode != HandoffMode::Clear)
         || !filename(source)
     {
         return Err(BulkloadRefusal::FieldDomainViolation);
@@ -100,20 +101,7 @@ fn validate(options: &HandoffOptions, source: &str) -> Result<()> {
             return Err(BulkloadRefusal::PathNotAbsolute);
         }
     }
-    if options.private_remotes.iter().any(|prefix| {
-        prefix.is_empty()
-            || prefix
-                .bytes()
-                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
-    }) {
-        return Err(BulkloadRefusal::FieldDomainViolation);
-    }
-    if options
-        .allow
-        .iter()
-        .chain(&options.workspaces)
-        .any(|path| !path.is_absolute())
-    {
+    if options.workspaces.iter().any(|path| !path.is_absolute()) {
         return Err(BulkloadRefusal::PathNotAbsolute);
     }
     Ok(())
@@ -197,13 +185,13 @@ fn line_of(item: &str, workspace: &Path, mode: &str, result: &Result<Row>) -> St
         Ok(row) => {
             let _ = write!(
                 text,
-                ",\"outcome\":\"{}\",\"refusal\":{},\"state\":{},\"private\":{},\"inputs\":{},\"open\":{},\"ready\":{}",
+                ",\"outcome\":\"{}\",\"refusal\":{},\"state\":{},\"source_history\":{},\"inputs\":{},\"open\":{},\"ready\":{}",
                 row.outcome,
                 row.refusal
                     .as_ref()
                     .map_or_else(null, |refusal| json_string(refusal.code())),
                 row.state.map_or_else(null, json_string),
-                row.private.map_or_else(null, json_string),
+                row.source_history.map_or_else(null, |seen| seen.to_string()),
                 row.inputs.map_or_else(null, |inputs| json_string(
                     &hex(inputs.get(..8).unwrap_or_default())
                 )),
@@ -277,7 +265,6 @@ pub fn handoff(
         .iter()
         .map(|(landed, live)| (canonical(landed), live.clone()))
         .collect();
-    let allow: Vec<PathBuf> = options.allow.iter().map(|path| canonical(path)).collect();
     let wanted: Vec<PathBuf> = options
         .workspaces
         .iter()
@@ -295,8 +282,7 @@ pub fn handoff(
         mode,
         readme: options.readme,
         renew: options.renew,
-        private_remotes: &options.private_remotes,
-        allow: &allow,
+        clear_carried: options.clear_carried,
         siblings: &siblings,
         as_of: options.as_of,
         h_step: false,
@@ -396,11 +382,6 @@ pub(super) fn after_apply(
             .iter()
             .map(|(landed, live)| (path(landed), path(live)))
             .collect();
-        let allow: Vec<PathBuf> = if stored.allowed {
-            vec![canonical(workspace)]
-        } else {
-            Vec::new()
-        };
         let row = handoff::run(
             &Workspace {
                 item: &identity,
@@ -411,8 +392,7 @@ pub(super) fn after_apply(
                 mode: Mode::Render,
                 readme: stored.readme,
                 renew: false,
-                private_remotes: &stored.private_remotes,
-                allow: &allow,
+                clear_carried: false,
                 siblings: &siblings,
                 as_of: None,
                 h_step: true,
