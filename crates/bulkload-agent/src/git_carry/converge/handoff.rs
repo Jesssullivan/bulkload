@@ -3035,6 +3035,9 @@ fn token_history(worktree: &Path, revs: &[&OsStr]) -> Result<BTreeSet<Vec<u8>>> 
     let out = git(worktree)
         .args([
             "log",
+            // A destination config's log.showSignature would run its
+            // gpg.program on every signed commit read (H57).
+            "--no-show-signature",
             "--no-ext-diff",
             "--no-textconv",
             "--no-color",

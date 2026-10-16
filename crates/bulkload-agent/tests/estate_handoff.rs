@@ -2797,3 +2797,50 @@ fn h56_a_round_trip_of_a_cut_block_is_carried_content() {
     kept.extend_from_slice(b"A local note.\n");
     assert_eq!(fs::read(&agents).unwrap(), kept);
 }
+
+/// H57 (TIN-6569 re-review 4): `--check` scans history with `git log`, and a
+/// destination repository whose own config sets `log.showSignature` and a
+/// `gpg.program` must not get that program run on a signed commit it reads.
+#[test]
+fn h57_check_never_runs_a_destination_gpg_program() {
+    let world = World::new();
+    assert!(world.handoff(&[]).ok);
+    let mark = world.root.join("gpg-ran");
+    let script = world.root.join("gpg.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\necho ran >> {}\nexit 1\n", mark.display()),
+    )
+    .unwrap();
+    Command::new("chmod")
+        .arg("755")
+        .arg(&script)
+        .status()
+        .unwrap();
+    git(&world.dst(), &["checkout", "--quiet", "-b", "feat"]);
+    git(&world.dst(), &["add", "AGENTS.md"]);
+    git(&world.dst(), &["commit", "--quiet", "-m", "oops"]);
+    let raw = git(&world.dst(), &["cat-file", "commit", "HEAD"]);
+    let signed = raw.replacen(
+        "\n\n",
+        "\ngpgsig -----BEGIN PGP SIGNATURE-----\n -----END PGP SIGNATURE-----\n\n",
+        1,
+    );
+    let path = world.root.join("signed.txt");
+    fs::write(&path, signed).unwrap();
+    let oid = git(
+        &world.dst(),
+        &["hash-object", "-t", "commit", "-w", path.to_str().unwrap()],
+    )
+    .trim()
+    .to_owned();
+    git(&world.dst(), &["update-ref", "refs/heads/feat", &oid]);
+    git(&world.dst(), &["checkout", "--quiet", "main"]);
+    git(&world.dst(), &["config", "log.showSignature", "true"]);
+    git(
+        &world.dst(),
+        &["config", "gpg.program", script.to_str().unwrap()],
+    );
+    let _check = world.handoff(&["--check"]);
+    assert!(!mark.exists(), "--check ran the destination's gpg.program");
+}
