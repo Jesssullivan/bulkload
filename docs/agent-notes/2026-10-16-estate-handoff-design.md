@@ -8,9 +8,11 @@ commit, on main `5beb031`).
 **Status: built, then reviewed and fixed** (section 17, "As built",
 records what differs from the design below and why; section 18 is the
 review of 2026-10-16 against `9ec8d36` and what changed for each
-finding). Sections 0 to 16 are the design as written before the build;
-code citations there are to `3fe1f07`. Where section 18 contradicts an
-earlier section, section 18 is current.
+finding; section 19 is the two re-reviews against `7c5407f` and the
+operator's rulings OI-1003-Q188 to Q191). Sections 0 to 16 are the
+design as written before the build; code citations there are to
+`3fe1f07`. Where a later section contradicts an earlier one, the later
+one is current.
 
 Rulings this serves:
 
@@ -1219,6 +1221,86 @@ all killed. 28 of 28 killed.
 6. The refuters' own lists (their six surviving mutations and the doc
    claims) were not handed over; P4 and P7 were answered from this
    lane's audit. Confirm against their lists.
+
+## 19. Re-reviews of 2026-10-16, and the operator's rulings Q188 to Q191
+
+Rulings: OI-1003-Q183 and Q185 (TIN-6569), Q188 to Q191 (Linear TIN-6569
+comment `9c7121b5`, 2026-10-16, relayed in this lane's task text and not
+read from Linear here), Q173, R-N13. Two re-reviews read `7c5407f`: the
+first (findings 1 to 5) against the commit, the second against this
+lane's uncommitted round-2 tree, which closed findings 1, 2, 3 and 5 and
+part of 4 and regressed H7. Section 19.1 to 19.3 is the first commit on
+top of `7c5407f` (round 2 finished); 19.4 onwards is the second (the
+rulings).
+
+### 19.1 Re-review 1 (against `7c5407f`), as closed by round 2
+
+| # | Finding | Row (failed first) | Fix | Re-review 2 |
+|---|---|---|---|---|
+| 1 | The keep path re-dated a racy record print equal to the target's without checking the bytes under the block (a rerun that retires another target, or `--renew`) | unit `a_kept_block_never_redates_a_racy_print_unchecked_on_a_retire`, `..._on_a_renew` | The keep path keeps a print unchecked only when `trusted`; otherwise `retaken` | Verified closed |
+| 2 | A live sibling strictly ahead of the landing counted as reconciled | H38 | Reconciled only when the landing holds the sibling's HEAD (a branch, or its own HEAD's history) | Verified closed |
+| 3 | A symlinked global configuration (home-manager) was skipped by the privacy guard | H36 | `user_config_is_file` follows links as Git does | Verified closed; the guard is removed by Q188 (19.4) |
+| 4 | A round-tripped block of this landing's identity with no record refused render and clear | H37 | No record entry names the target: carried | Closed only with no record (19.2, finding 2) |
+| 5 | Commit detection read only this run's targets' history | H39 | Every name a hand-off may write | Verified closed |
+
+### 19.2 Re-review 2 (against the round-2 tree) and its fixes
+
+1. **BLOCKER: H7 regressed.** Round 2 dropped `unrecorded`'s
+   `owner_of == ours => Modified` arm, so an edit inside the recorded
+   block was read as a carried block (H7 and the unit row
+   `a_racy_record_print_is_proved_by_reading` failed; `recorded` unused,
+   clippy failed). Restored, then narrowed by finding 2 below: a block of
+   this landing's identity on a target the record names (or retired) is
+   `Modified` unless the whole file is the target's landed blob. Mutant
+   M13 (the arm reads `Foreign`) is the regression's shape.
+2. **Minor: a round trip while the record stands lost content or
+   wedged.** The source carried back this landing's current block (H40)
+   or an older one (H41) above an edited body. With H40 the block matched
+   the record, so the H step replaced it (`B1` dropped, Q185 violated)
+   and the next converge refused `GIT_DESTINATION_MODIFIED`; with H41 the
+   block was read as an edit (`HANDOFF_BLOCK_MODIFIED` in the H step,
+   render and `--clear`). The rule now (`classify_head`): a block at byte
+   0 that could be this landing's (the record's block, a retired one, or
+   this identity on a recorded target) is the file's content when the
+   whole file is the target's landed blob, because bulkload's own block is
+   never part of what the source landed. The check reads the file and the
+   landed blob only on the read path (never for a trusted print). Both
+   rows failed first (H40: the carried block dropped; H41:
+   `handoff=HANDOFF_BLOCK_MODIFIED`).
+3. **Minor: a retired block put back survived `--clear` as if live.** A
+   block a person removed by hand and then restored by an undo or a
+   `git stash pop` was read as carried (round 2) where `7c5407f` refused.
+   The record's `retired` entries now keep the block's kind, length and
+   digest (`Retired`); a block that matches one is this landing's again
+   (`entry_of`): converge accepts it (`landed_sides` attaches retired
+   blocks as untrusted prefixes), the next render takes it back into the
+   record (`restored`, or `written` when it re-renders) and `--clear`
+   removes it. A different block of this identity on a retired target is
+   `Modified`, as at `7c5407f`, unless the whole file is landed. H42
+   failed first (`--check` said `carried`).
+
+Found while porting: **a created file became `prefixed` when re-rendered**
+(H43, failed first: `--check` said `prefixed`, so `--clear` would leave an
+empty untracked file and converge would not lift it before an add).
+`Plan::Replace` keeps the target's kind.
+
+### 19.3 Proof for the round-2 commit
+
+- Failing first, on the round-2 tree with the `Modified` arm restored:
+  H40, H41, H42 and H43 (4 failed; H7 and the 15 hand-off unit rows
+  passed). After the fix: `estate_handoff` 42 passed.
+- Checks at this commit, in this worktree (`CARGO_TARGET_DIR`
+  `cargo-target/handoff`, `nix develop .#default`, nice 10): `cargo fmt
+  --check`; the three clippy passes (workspace; `io-trace`;
+  `fault-injection,io-trace`); `cargo test -p bulkload-agent --locked
+  --no-fail-fast` 934 passed, 0 failed, 7 ignored (29 binaries), with
+  `estate_handoff` 42, `estate_adopt` 13, `estate_converge` 23,
+  `source_command_registry` 16 and 15 hand-off unit rows;
+  `fault_harness` 113; `just contract-test` (24); `just tla-render
+  --check` (246 files); `just tla-check` of the 12 hand-off rows and
+  `MC_ec_refs`, 14 rows matched (`docs/formal/README.md`, "TIN-6569",
+  re-reviews). The mutation rows for this commit ran after it; their
+  table is in 19.8.
 
 ## Workstreams (restated, R-N13; verified this session unless marked)
 

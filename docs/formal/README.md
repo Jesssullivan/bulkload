@@ -3032,6 +3032,42 @@ written as before.
   with the new variables and `HandoffKeep`; the earlier rows (`Handoff =
   FALSE`) keep `hand` at its initial value and `HTrusted` false.
 
+- **Re-reviews of 2026-10-16** (design note section 19). New mutation
+  `handoff_keep_racy_unchecked` (re-review 1, finding 1: a rerun over an
+  intact block keeps a racy record print equal to the seat's with its
+  old base unchecked and re-dates it) fails `NoLocalWorkLost`; the code
+  keeps a print unchecked only when `HTrusted`'s conditions hold, which
+  the model's `HandoffKeep` already re-takes. The other findings are in
+  parts this model does not represent, and changed no action: the
+  block's owner identity and a round trip of this landing's block (a
+  carried block is source content, one more source value; the code
+  reads a block whose whole file is the landed blob as content), the
+  `retired` list (a block removed by hand and put back is bulkload's
+  block again: `Holds` accepts `Blk(v)` while the record names it), and
+  a created file's kind across re-renders (the lift is one step with the
+  import).
+
+  `just tla-check` of the 12 hand-off rows and `MC_ec_refs` on the
+  re-reviewed spec, 2026-10-16, sting, `-workers 3`, nice 10, beside the
+  lane's cargo runs: 14 rows matched (the budget self-test first), 251 s
+  wall, peak RSS 2052 MiB, `rc=0`.
+
+  | config | expect | outcome | violated | distinct | depth | wall |
+  |---|---|---|---|---:|---:|---:|
+  | `MC_ec_refs` | pass | PASS | - | 54141 | 48 | 25s |
+  | `MC_ec_handoff` | pass | PASS | - | 26952 | 52 | 19s |
+  | `MC_ec_handoff_op` | pass | PASS | - | 19425 | 37 | 22s |
+  | `MC_ec_handoff_live` (LiveSpec) | pass | PASS | - | 2023 | 36 | 22s |
+  | `MC_ec_reach_handoff_converged` | reach | REACHED | Witness_HandoffConverged | 3815 | 18 | 16s |
+  | `MC_ec_reach_handoff_cleared` | reach | REACHED | Witness_HandoffCleared | 9178 | 24 | 20s |
+  | `MC_ec_neg_handoff_no_overlay` | fail | FAIL | TypedRefusal | 380 | 9 | 16s |
+  | `MC_ec_neg_handoff_overlay_any_block` | fail | FAIL | NoLocalWorkLost | 5135 | 13 | 19s |
+  | `MC_ec_neg_handoff_clear_unchecked` | fail | FAIL | NoLocalWorkLost | 2374 | 10 | 17s |
+  | `MC_ec_neg_handoff_exchange_unchecked` | fail | FAIL | NoLocalWorkLost | 239 | 7 | 16s |
+  | `MC_ec_neg_handoff_no_intent` | fail | FAIL | HandoffOwnsOnlyItsBlock | 32 | 5 | 13s |
+  | `MC_ec_neg_handoff_retake_unchecked` | fail | FAIL | NoLocalWorkLost | 9057 | 16 | 17s |
+  | `MC_ec_neg_handoff_keep_racy_unchecked` | fail | FAIL | NoLocalWorkLost | 8266 | 16 | 15s |
+
 `just tla-check` of the hand-off rows, 2026-10-16, sting, `-workers 3`,
 nice 10: 11 rows matched (the budget self-test first), 338 s wall, `rc=0`.
 

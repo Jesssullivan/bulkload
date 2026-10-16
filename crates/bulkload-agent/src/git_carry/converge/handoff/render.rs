@@ -144,8 +144,9 @@ pub struct Inputs {
     pub refs: Vec<RefDiff>,
     pub dest_only: Vec<DestOnly>,
     /// Targets whose bytes under this block start with a hand-off block
-    /// another landing rendered (carried with the source's bytes,
-    /// OI-1003-Q185): kept as content, never this landing's.
+    /// carried with the source's bytes (another landing's, or this
+    /// landing's from a render whose record is gone; OI-1003-Q185): kept
+    /// as content, never this landing's block.
     pub carried: Vec<Vec<u8>>,
     /// `(item, code)`: the family's items whose last outcome is a refusal.
     pub refused: Vec<(String, String)>,
@@ -203,7 +204,8 @@ impl Inputs {
 /// workspace's absolute path and the SOURCE label. A block whose BEGIN line
 /// names another identity was rendered for another landing and carried
 /// here with the source's bytes: it is content (OI-1003-Q185), never this
-/// landing's block.
+/// landing's block. So is a block of this identity on a target no record
+/// entry names (a round trip).
 #[must_use]
 pub fn owner(host: &str, workspace: &[u8], source: &str) -> String {
     let mut hasher = blake3::Hasher::new();
@@ -598,7 +600,7 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
             .collect();
         let _ = writeln!(
             out,
-            "- Carried hand-off blocks: {} also hold, below this block, a hand-off block another landing rendered. It came with the source's bytes and describes that landing, not this one: do not act on its paths or commands. bulkload keeps it as the file's content (OI-1003-Q185); removing it is the user's call.",
+            "- Carried hand-off blocks: {} also hold, below this block, a hand-off block that came with the source's bytes (rendered for another landing, or for this one by a run whose record is gone). It is not this block and may be out of date: do not act on its paths or commands. bulkload keeps it as the file's content (OI-1003-Q185); removing it is the user's call.",
             names.join(", ")
         );
     }

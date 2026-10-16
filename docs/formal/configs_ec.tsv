@@ -131,3 +131,4 @@ MC_ec_neg_handoff_clear_unchecked	fail	NoLocalWorkLost	*	-
 MC_ec_neg_handoff_exchange_unchecked	fail	NoLocalWorkLost	*	-
 MC_ec_neg_handoff_no_intent	fail	HandoffOwnsOnlyItsBlock	*	-
 MC_ec_neg_handoff_retake_unchecked	fail	NoLocalWorkLost	*	-
+MC_ec_neg_handoff_keep_racy_unchecked	fail	NoLocalWorkLost	*	-

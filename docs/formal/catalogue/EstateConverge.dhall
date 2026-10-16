@@ -233,6 +233,7 @@ let Mutation =
       | handoff_exchange_unchecked
       | handoff_no_intent
       | handoff_retake_unchecked
+      | handoff_keep_racy_unchecked
       >
 
 let mutationIndex =
@@ -297,6 +298,7 @@ let mutationIndex =
           , handoff_exchange_unchecked = 56
           , handoff_no_intent = 57
           , handoff_retake_unchecked = 58
+          , handoff_keep_racy_unchecked = 59
           }
           m
 
@@ -1450,6 +1452,7 @@ let verdict
           , handoff_exchange_unchecked = Property.NoLocalWorkLost
           , handoff_no_intent = Property.HandoffOwnsOnlyItsBlock
           , handoff_retake_unchecked = Property.NoLocalWorkLost
+          , handoff_keep_racy_unchecked = Property.NoLocalWorkLost
           }
           m
 
@@ -2833,6 +2836,20 @@ let primary =
             ]
           }
         }
+      , handoff_keep_racy_unchecked =
+        { mutation = Mutation.handoff_keep_racy_unchecked
+        , constants = handoffOp
+        , comment =
+          { head = "TIN-6569, re-review of 2026-10-16 (finding 1): a rerun over an"
+          , tail =
+            [ "intact block keeps a racy record print equal to the seat's"
+            , "unchecked and re-dates it; the print caught an operator's edit"
+            , "below the block made between the exchange and the record, so it"
+            , "vouches for the edit and a converge that replaces the target"
+            , "drops it."
+            ]
+          }
+        }
       , handoff_no_intent =
         { mutation = Mutation.handoff_no_intent
         , constants = handoff
@@ -2989,6 +3006,7 @@ let negRows
       , primaryOf Mutation.handoff_exchange_unchecked
       , primaryOf Mutation.handoff_no_intent
       , primaryOf Mutation.handoff_retake_unchecked
+      , primaryOf Mutation.handoff_keep_racy_unchecked
       ]
 
 let primaryPositions =

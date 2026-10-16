@@ -60,6 +60,17 @@
 //! - H29: `ready` follows consolidation. H30: options persist.
 //! - H31, H34: `AGENTS.override.md`. H32: an edited created file is never
 //!   lifted. H35: a new destination ref makes the block stale.
+//! - Re-review of 2026-10-16: H36, a symlinked global configuration's
+//!   rewrite rules are read; H37, a block of this landing's identity that
+//!   no record names (a round trip) is carried content; H38, a live sibling
+//!   strictly ahead of the landing keeps the hand-off open; H39, commit
+//!   detection reads every target name's history, whatever this run's
+//!   targets are.
+//! - Re-review 2 of 2026-10-16: H40 and H41, a round trip of this
+//!   landing's current or an older block while the record stands is
+//!   carried content (the whole file is the landed blob); H42, a retired
+//!   block put back byte for byte is this landing's again; H43, a created
+//!   file stays created across re-renders.
 //!
 //! Fixture repositories are created and destroyed here; their Git runs with
 //! no global configuration and no hooks (R-N98).
@@ -102,11 +113,17 @@ struct Ran {
 }
 
 fn agent(args: &[OsString]) -> Ran {
-    let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .unwrap();
+    agent_with(args, |command| {
+        command.env("GIT_CONFIG_GLOBAL", "/dev/null");
+    })
+}
+
+/// [`agent`] with the child's environment set by `environ`.
+fn agent_with(args: &[OsString], environ: impl FnOnce(&mut Command)) -> Ran {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+    command.args(args);
+    environ(&mut command);
+    let out = command.output().unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     let counters = stderr
         .lines()
@@ -244,10 +261,7 @@ impl World {
     }
 
     fn handoff(&self, extra: &[&str]) -> Ran {
-        let mut list: Vec<OsString> = vec!["estate-handoff".into()];
-        list.extend(extra.iter().map(OsString::from));
-        list.extend(os(&[&self.plan(), &self.corpus(), &self.state(), &SOURCE]));
-        agent(&list)
+        agent(&handoff_args(self, extra))
     }
 
     fn diff(&self) -> Ran {
@@ -1773,4 +1787,380 @@ fn h35_a_new_destination_ref_makes_the_block_stale() {
     assert!(String::from_utf8(block_of(&world.dst().join("AGENTS.md")))
         .unwrap()
         .contains("`refs/heads/extra`"));
+}
+
+/// The arguments of an `estate-handoff` run of `world` with `extra` flags.
+fn handoff_args(world: &World, extra: &[&str]) -> Vec<OsString> {
+    let mut list: Vec<OsString> = vec!["estate-handoff".into()];
+    list.extend(extra.iter().map(OsString::from));
+    list.extend(os(&[
+        &world.plan(),
+        &world.corpus(),
+        &world.state(),
+        &SOURCE,
+    ]));
+    list
+}
+
+/// H36 (re-review of 2026-10-16, finding 3): the user's global
+/// configuration is read as Git reads it, through a symlink (a
+/// home-manager `~/.config/git/config`): its `insteadOf` rule that rewrites
+/// a private remote to a public one refuses `HANDOFF_NOT_PRIVATE`. A
+/// dangling link is no file, as for Git.
+#[test]
+fn h36_a_symlinked_global_configuration_is_read() {
+    let world = World::new();
+    git(
+        &world.dst(),
+        &["remote", "add", "origin", "priv:team/repo.git"],
+    );
+    let home = world.root.join("home");
+    let xdg = home.join(".config");
+    fs::create_dir_all(xdg.join("git")).unwrap();
+    let store = world.root.join("store-config");
+    fs::write(
+        &store,
+        "[url \"https://github.com/\"]\n\tinsteadOf = priv:\n",
+    )
+    .unwrap();
+    let args = handoff_args(&world, &["--private-remote", "priv:"]);
+    let run = |args: &[OsString]| {
+        agent_with(args, |command| {
+            command
+                .env_remove("GIT_CONFIG_GLOBAL")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &xdg);
+        })
+    };
+    let link = xdg.join("git/config");
+    // A dangling link: no rule, the remote is under the prefix.
+    std::os::unix::fs::symlink(world.root.join("no-such-config"), &link).unwrap();
+    let dangling = run(&args);
+    assert!(dangling.ok, "{}\n{}", dangling.stdout, dangling.stderr);
+    assert!(run(&handoff_args(&world, &["--clear"])).ok);
+    // The rule through the link.
+    fs::remove_file(&link).unwrap();
+    std::os::unix::fs::symlink(&store, &link).unwrap();
+    let frozen = freeze_all(&world.root.join("dst"));
+    let linked = run(&args);
+    assert!(!linked.ok, "{}", linked.stdout);
+    assert!(
+        row(&linked.stdout, &world.dst()).contains("HANDOFF_NOT_PRIVATE"),
+        "{}",
+        linked.stdout
+    );
+    assert_eq!(freeze_all(&world.root.join("dst")), frozen, "wrote");
+}
+
+/// H37 (re-review of 2026-10-16, finding 4; OI-1003-Q185): a block this
+/// landing rendered, carried back to the source and landed again at the
+/// same path with no record (a round trip) names this landing's identity,
+/// but no record vouches for it: it is the file's content. A render keeps
+/// it below the new block and names it as carried; `--clear` removes the
+/// new block only, leaving the landed bytes.
+#[test]
+fn h37_a_round_tripped_block_of_this_landing_is_carried_content() {
+    let world = World::new();
+    assert!(world.handoff(&[]).ok);
+    let with_block = fs::read(world.dst().join("AGENTS.md")).unwrap();
+    fs::write(world.src().join("AGENTS.md"), &with_block).unwrap();
+    git(
+        &world.src(),
+        &[
+            "commit",
+            "--quiet",
+            "-am",
+            "round trip carried the block back",
+        ],
+    );
+    fs::remove_dir_all(world.root.join("dst")).unwrap();
+    fs::create_dir_all(world.root.join("dst")).unwrap();
+    fs::remove_dir_all(world.state()).unwrap();
+    settle();
+    world.capture();
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    let agents = world.dst().join("AGENTS.md");
+    assert_eq!(fs::read(&agents).unwrap(), with_block);
+    let check = world.handoff(&["--check"]);
+    assert!(
+        row(&check.stdout, &world.dst()).contains("\"action\":\"carried\""),
+        "{}",
+        check.stdout
+    );
+    let ran = world.handoff(&[]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    assert_eq!(
+        remainder_of(&agents),
+        with_block,
+        "the carried block was dropped"
+    );
+    let block = String::from_utf8(block_of(&agents)).unwrap();
+    assert!(block.contains("Carried hand-off blocks"), "{block}");
+    let cleared = world.handoff(&["--clear"]);
+    assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
+    assert_eq!(fs::read(&agents).unwrap(), with_block);
+}
+
+/// H38 (re-review of 2026-10-16, finding 2): a live sibling strictly ahead
+/// of the landing (a commit the landing lacks, the landing unchanged)
+/// keeps the hand-off open; bringing the commit in closes it.
+#[test]
+fn h38_a_sibling_ahead_of_the_landing_keeps_it_open() {
+    let world = World::new();
+    let live = world.root.join("live");
+    fs::create_dir(&live).unwrap();
+    let out = Command::new("cp")
+        .arg("-a")
+        .arg(world.src())
+        .arg(live.join("main"))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    fs::write(live.join("main/live.txt"), b"live work\n").unwrap();
+    git(&live.join("main"), &["add", "live.txt"]);
+    git(
+        &live.join("main"),
+        &["commit", "--quiet", "-m", "live work"],
+    );
+    let sibling = format!("{}={}", world.root.join("dst").display(), live.display());
+    assert!(world.handoff(&["--sibling", &sibling]).ok);
+    settle();
+    let check = world.handoff(&["--check"]);
+    assert!(check.ok, "{}\n{}", check.stdout, check.stderr);
+    assert!(!ready(&check.stdout, &world.dst()), "{}", check.stdout);
+    git(
+        &world.dst(),
+        &[
+            "fetch",
+            "--quiet",
+            live.join("main").to_str().unwrap(),
+            "main",
+        ],
+    );
+    git(
+        &world.dst(),
+        &["merge", "--quiet", "--ff-only", "FETCH_HEAD"],
+    );
+    settle();
+    let check = world.handoff(&["--check"]);
+    assert!(check.ok, "{}\n{}", check.stdout, check.stderr);
+    assert!(ready(&check.stdout, &world.dst()), "{}", check.stdout);
+}
+
+/// H39 (re-review of 2026-10-16, finding 5): a README block committed while
+/// `--readme` was on and fixed by a later commit is still in the branch's
+/// history after `--clear` drops the record (and with it the README as a
+/// target): `--check` reports `committed`.
+#[test]
+fn h39_commit_detection_reads_every_target_names_history() {
+    let world = World::new();
+    assert!(world.handoff(&["--readme"]).ok);
+    let readme = world.dst().join("README.md");
+    assert!(fs::read(&readme).unwrap().starts_with(BEGIN));
+    git(&world.dst(), &["add", "README.md"]);
+    git(&world.dst(), &["commit", "--quiet", "-m", "oops"]);
+    let rest = remainder_of(&readme);
+    fs::write(&readme, &rest).unwrap();
+    git(
+        &world.dst(),
+        &["commit", "--quiet", "-m", "fix", "--", "README.md"],
+    );
+    assert!(world.handoff(&["--clear"]).ok);
+    let check = world.handoff(&["--check"]);
+    assert!(!check.ok, "{}", check.stdout);
+    assert!(
+        row(&check.stdout, &world.dst()).contains("\"state\":\"committed\""),
+        "{}",
+        check.stdout
+    );
+}
+
+/// H40 (re-review 2 of 2026-10-16, finding 2; OI-1003-Q185): the source
+/// carries this landing's current block back (byte-identical to the
+/// record's, above an edited body) while the record stands. The landed blob
+/// now starts with that block, so the block is the file's content, not
+/// bulkload's overlay: the H step keeps it below a new block, a later
+/// converge proves the seat, and `--clear` leaves the landed bytes.
+#[test]
+fn h40_a_round_trip_of_the_recorded_block_is_carried_content() {
+    let world = World::new();
+    assert!(world.handoff(&[]).ok);
+    settle();
+    let agents = world.dst().join("AGENTS.md");
+    let mut carried = block_of(&agents);
+    carried.extend_from_slice(b"# Agents v2\n");
+    fs::write(world.src().join("AGENTS.md"), &carried).unwrap();
+    git(
+        &world.src(),
+        &["commit", "--quiet", "-am", "round trip, the same block"],
+    );
+    settle();
+    world.capture();
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    assert!(
+        applied.stdout.contains("handoff=written"),
+        "{}",
+        applied.stdout
+    );
+    assert_eq!(
+        remainder_of(&agents),
+        carried,
+        "the carried block was dropped"
+    );
+    let block = String::from_utf8(block_of(&agents)).unwrap();
+    assert!(block.contains("Carried hand-off blocks"), "{block}");
+    world.source_change(b"alpha after the round trip\n");
+    let again = world.apply();
+    assert!(again.ok, "{}\n{}", again.stdout, again.stderr);
+    assert_eq!(remainder_of(&agents), carried);
+    let cleared = world.handoff(&["--clear"]);
+    assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
+    assert_eq!(fs::read(&agents).unwrap(), carried);
+}
+
+/// H41 (re-review 2 of 2026-10-16, finding 2): the source carries back an
+/// older block of this landing's identity (not the record's) while the
+/// record stands. The whole file is the landed blob, so the block is
+/// carried content, never an edit of this landing's block: the H step,
+/// a rerun and `--clear` neither refuse nor drop it.
+#[test]
+fn h41_a_round_trip_of_an_older_block_is_carried_content() {
+    let world = World::new();
+    assert!(world.handoff(&["--as-of", "1790000000000000000"]).ok);
+    let agents = world.dst().join("AGENTS.md");
+    let older = block_of(&agents);
+    assert!(
+        world
+            .handoff(&["--renew", "--as-of", "1790000001000000000"])
+            .ok
+    );
+    assert_ne!(block_of(&agents), older, "no newer block");
+    settle();
+    let mut carried = older;
+    carried.extend_from_slice(b"# Agents v2\n");
+    fs::write(world.src().join("AGENTS.md"), &carried).unwrap();
+    git(
+        &world.src(),
+        &["commit", "--quiet", "-am", "round trip, an older block"],
+    );
+    settle();
+    world.capture();
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    assert!(
+        !applied.stdout.contains("HANDOFF_BLOCK_MODIFIED"),
+        "{}",
+        applied.stdout
+    );
+    assert_eq!(remainder_of(&agents), carried);
+    let ran = world.handoff(&[]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let cleared = world.handoff(&["--clear"]);
+    assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
+    assert_eq!(fs::read(&agents).unwrap(), carried);
+}
+
+/// H42 (re-review 2 of 2026-10-16, finding 3): a block removed by hand
+/// (retired) and then put back byte for byte (an editor's undo, a `git
+/// stash pop`) is this landing's block again, never carried content: a
+/// converge proves the seat, the H step takes it back into the record and
+/// renders it current, `--check` reads it as this landing's, and
+/// `--clear` removes it.
+#[test]
+fn h42_a_retired_block_put_back_is_this_landings_again() {
+    let world = World::new();
+    assert!(world.handoff(&[]).ok);
+    let agents = world.dst().join("AGENTS.md");
+    let with_block = fs::read(&agents).unwrap();
+    fs::write(&agents, AGENTS).unwrap();
+    let retired = world.handoff(&[]);
+    assert!(retired.ok, "{}\n{}", retired.stdout, retired.stderr);
+    assert!(
+        row(&retired.stdout, &world.dst()).contains("\"action\":\"removed-by-hand\""),
+        "{}",
+        retired.stdout
+    );
+    fs::write(&agents, &with_block).unwrap();
+    let check = world.handoff(&["--check"]);
+    assert!(check.ok, "{}\n{}", check.stdout, check.stderr);
+    assert!(
+        !row(&check.stdout, &world.dst()).contains("carried"),
+        "{}",
+        check.stdout
+    );
+    world.source_change(b"alpha 2\n");
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    assert!(
+        applied.stdout.contains("handoff=written"),
+        "{}",
+        applied.stdout
+    );
+    assert_eq!(remainder_of(&agents), AGENTS);
+    let block = String::from_utf8(block_of(&agents)).unwrap();
+    assert!(!block.contains("Carried hand-off blocks"), "{block}");
+    let check = world.handoff(&["--check"]);
+    assert!(
+        row(&check.stdout, &world.dst()).contains("\"state\":\"present\""),
+        "{}",
+        check.stdout
+    );
+    let cleared = world.handoff(&["--clear"]);
+    assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
+    assert_eq!(fs::read(&agents).unwrap(), AGENTS);
+}
+
+/// H43 (found while porting the re-review 2 probes): a file the hand-off
+/// created stays `created` when a later render replaces its block, so
+/// `--clear` removes it (never leaves an empty file) and converge lifts it
+/// before the source adds the path.
+#[test]
+fn h43_a_created_file_stays_created_across_re_renders() {
+    let world = World::new();
+    git(&world.src(), &["rm", "--quiet", "CLAUDE.md"]);
+    git(&world.src(), &["commit", "--quiet", "-m", "no claude"]);
+    settle();
+    world.capture();
+    assert!(world.apply().ok);
+    let claude = world.dst().join("CLAUDE.md");
+    let rerendered = |world: &World, content: &[u8]| {
+        world.source_change(content);
+        let applied = world.apply();
+        assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+        assert!(
+            applied.stdout.contains("handoff=written"),
+            "{}",
+            applied.stdout
+        );
+        let check = world.handoff(&["--check"]);
+        assert!(
+            row(&check.stdout, &world.dst())
+                .contains("{\"path\":\"CLAUDE.md\",\"kind\":\"created\""),
+            "{}",
+            check.stdout
+        );
+    };
+    assert!(world.handoff(&[]).ok);
+    rerendered(&world, b"alpha 2\n");
+    let cleared = world.handoff(&["--clear"]);
+    assert!(cleared.ok, "{}\n{}", cleared.stdout, cleared.stderr);
+    assert!(!claude.exists(), "--clear left a created file behind");
+    assert!(world.handoff(&[]).ok);
+    rerendered(&world, b"alpha 3\n");
+    fs::write(world.src().join("CLAUDE.md"), b"Back again.\n").unwrap();
+    git(&world.src(), &["add", "CLAUDE.md"]);
+    git(&world.src(), &["commit", "--quiet", "-m", "claude back"]);
+    settle();
+    world.capture();
+    let applied = world.apply();
+    assert!(applied.ok, "{}\n{}", applied.stdout, applied.stderr);
+    assert!(
+        applied.stdout.contains("handoff-lifted=1"),
+        "{}",
+        applied.stdout
+    );
+    assert_eq!(remainder_of(&claude), b"Back again.\n");
 }

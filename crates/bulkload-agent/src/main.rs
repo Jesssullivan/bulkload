@@ -113,8 +113,9 @@ SUBCOMMANDS:
                 other than one target to another refuses
                 HANDOFF_TARGET_UNSUPPORTED; an edited block of this landing's
                 HANDOFF_BLOCK_MODIFIED; an unlanded item HANDOFF_NOT_LANDED; all
-                with nothing written. A block another landing rendered (carried
-                with the source's bytes) is content: kept below this one, never
+                with nothing written. A block another landing rendered, or one
+                of this landing's that no record names (both carried with the
+                source's bytes), is content: kept below this one, never
                 cleared. --check is read-only (state, open rows, ready) and exits
                 HANDOFF_MARKER_COMMITTED when a token is staged, at HEAD or a
                 listed tip, or in any branch's or tag's history; --clear restores

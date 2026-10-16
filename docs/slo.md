@@ -1150,6 +1150,13 @@ user. No SLO number changes. The design note is
   inert origin and URL rewrites; commit detection reads branch and tag
   history; `ready` is reachable by consolidating; options persist across
   reruns; `AGENTS.override.md` is covered. No SLO number changes.
+- **Re-reviews of 2026-10-16** (design note section 19): a block of this
+  landing's identity whose whole file is the target's landed blob (a round
+  trip, with or without the record) is carried content, kept below the new
+  block and never dropped or refused (S5, OI-1003-Q185); a block removed by
+  hand and put back byte for byte is bulkload's again, never presented as
+  carried; a created file stays `created` across re-renders. No SLO number
+  changes.
 - **Proof.** `tests/estate_handoff.rs` H0 to H19 (H0 is the control: a
   naive prepend refuses MODIFIED), the hand-off unit rows and the
   `render_then_clear_is_identity` property, the `estate.handoff.*`

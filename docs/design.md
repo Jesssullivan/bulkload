@@ -648,10 +648,18 @@ that note) before merge.**
   - **Owned by identity.** The BEGIN line names the landing it was
     rendered for (`for=`, a digest of the destination host, the
     workspace path and SOURCE). A block that names another landing came
-    with the source's bytes (a re-carried, handed-off tree): it is content
-    (OI-1003-Q185, nothing is dropped from a carry), kept byte for byte
-    below this landing's block, named in it as carried, and never cleared
-    by bulkload.
+    with the source's bytes (a re-carried, handed-off tree), and so did a
+    block of this landing's identity on a target no record entry names,
+    or one whose whole file is the target's landed blob (a round trip:
+    carried back to the source and landed again at the same path, after
+    the record is gone or while it stands): it is content (OI-1003-Q185,
+    nothing is dropped from a carry), kept byte for byte below this
+    landing's block, named in it as carried, and never cleared by
+    bulkload. A block a person removed by hand (retired in the record
+    with its digest) and then put back byte for byte, by an editor's
+    undo or a `git stash pop`, is this landing's again: converge accepts
+    it, the next render takes it back into the record (`restored`) and
+    renders it current, and `--clear` removes it.
   - **Converge keeps an intact block.** A landed seat holds landed
     content when its bytes are the landed blob, or a recorded block
     followed by it (`holds`, through `landed_sides`). An edit inside the
@@ -663,7 +671,8 @@ that note) before merge.**
     under the block against the landed blob again first, so it never
     vouches for an edit below the block. A file the hand-off created is
     lifted (removed, when it is exactly its block) before the source adds
-    the same path.
+    the same path; it stays `created` when a later render replaces its
+    block, so the lift and `--clear` still remove it.
   - **The H step.** After the last level of an `estate-apply`, each
     workspace of a repository the run changed that holds a record (or a
     pending intent) has its block re-rendered from the estate as it now
@@ -676,10 +685,13 @@ that note) before merge.**
     `BULKLOAD-HANDOFF-DO-NOT-COMMIT` token in a target's index blob, HEAD
     blob, a listed tip's blob, or any commit in a branch's or tag's
     history (a block committed and removed again is still published by a
-    push) exits `HANDOFF_MARKER_COMMITTED`. No hook is installed.
+    push) exits `HANDOFF_MARKER_COMMITTED`. Every name a hand-off may write
+    (`AGENTS.md`, `CLAUDE.md`, `AGENTS.override.md`, `README.md`) is read,
+    whether or not it is a target now. No hook is installed.
   - **Open rows and `ready`.** Diverged and source-ahead refs, a live
-    sibling whose HEAD is not in the landing's history (nor the landing's
-    in the sibling's), destination-only worktrees whose HEAD no other
+    sibling whose HEAD the landing does not hold (on a branch or in its
+    HEAD's history; a sibling strictly ahead is open), destination-only
+    worktrees whose HEAD no other
     branch holds, recorded refusals, and a newer capture not applied.
     A destination commit, a dest-ahead ref or a seat edited since landing
     is consolidation, not an open row, so `ready` is reachable by
@@ -693,7 +705,8 @@ that note) before merge.**
     repository has no remote (counting the source's origin a landing
     preserved inert in `carry-config`), every remote and push URL, as
     written and as Git's `insteadOf`/`pushInsteadOf` rules (repository,
-    preserved, global and system configuration) rewrite it, is under a
+    preserved, global and system configuration, the last two followed
+    through symlinks as Git reads them) rewrite it, is under a
     `--private-remote PREFIX`, or `--allow-workspace` names it; otherwise
     `HANDOFF_NOT_PRIVATE` with nothing written. No URL is ever rendered or
     printed. Absolute paths and host names are written only into eligible
@@ -703,8 +716,9 @@ that note) before merge.**
     `HANDOFF_NOT_PRIVATE`, `HANDOFF_TARGET_UNSUPPORTED` (a symlink other
     than `CLAUDE.md -> AGENTS.md` in the same worktree, which is covered by
     `AGENTS.md`'s block, or any other non-regular target),
-    `HANDOFF_BLOCK_MODIFIED` (a block of this landing's that its record
-    does not name: edited inside, cut, or with no record), and
+    `HANDOFF_BLOCK_MODIFIED` (a block of this landing's on a target its
+    record names or retired that is not the record's and is not the
+    landed content: edited inside, or cut), and
     `HANDOFF_MARKER_COMMITTED`.
   - **S3.** Rendering is a pure function of metadata and an `as_of`
     instant kept while its inputs digest holds. An unchanged rerun reads 0

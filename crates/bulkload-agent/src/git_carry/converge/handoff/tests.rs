@@ -87,6 +87,15 @@ fn prefix_of(block: &[u8]) -> Prefix {
     }
 }
 
+/// No workspace ledger: nothing is landed content.
+fn unlanded() -> Landed<'static> {
+    Landed {
+        source: "neo",
+        instance: "",
+        sides: None,
+    }
+}
+
 fn cat(parts: &[&[u8]]) -> Vec<u8> {
     parts.concat()
 }
@@ -309,25 +318,58 @@ fn a_racy_record_print_is_proved_by_reading() {
     // Recorded in the same tick as the file's stamp: racy, so read.
     record.recorded_ns = record.files[0].print.as_ref().unwrap().mtime_ns + 1;
     assert_eq!(
-        held(&target, "AGENTS.md", &meta, Some(&record), fsid, &ours()).unwrap(),
+        held(
+            &worktree,
+            "AGENTS.md",
+            &meta,
+            Some(&record),
+            fsid,
+            &ours(),
+            &mut unlanded()
+        )
+        .unwrap(),
         Held::Modified
     );
     // Recorded well after the stamp: the print is trusted, nothing read.
     record.recorded_ns += 3 * super::super::super::RACY_GRANULARITY_NS;
     assert!(matches!(
-        held(&target, "AGENTS.md", &meta, Some(&record), fsid, &ours()).unwrap(),
+        held(
+            &worktree,
+            "AGENTS.md",
+            &meta,
+            Some(&record),
+            fsid,
+            &ours(),
+            &mut unlanded()
+        )
+        .unwrap(),
         Held::Intact(_)
     ));
 }
 
-/// Review of 2026-10-16 (mutation row for the re-dating path): a user edit
-/// made after the render's exchange and before its print is taken (the
-/// test hook) leaves a racy record print of the user's bytes over a `base`
-/// the render read. The rerun that re-dates that print checks the bytes
-/// under the block first, so the print never vouches for the edit and a
+/// How the rerun after a render whose print caught a same-tick edit
+/// reaches the record (review of 2026-10-16 and its re-review).
+#[derive(Clone, Copy)]
+enum Rerun {
+    /// An unchanged rerun: the record is current and its racy print is
+    /// re-dated (the re-dating path).
+    Unchanged,
+    /// The created `CLAUDE.md` removed by hand first: the rerun retires it
+    /// and keeps the intact `AGENTS.md` block whose print is unchanged (the
+    /// keep path).
+    Retire,
+    /// `--renew` over a current record: the same block, kept (the keep
+    /// path).
+    Renew,
+}
+
+/// A user edit made after the render's exchange and before its print is
+/// taken (the test hook) leaves a racy record print of the user's bytes
+/// over a `base` the render read. Whatever path the rerun takes past the
+/// racy window (`rerun`), it checks the bytes under the block before the
+/// print is re-dated, so the print never vouches for the edit, and a
 /// converge that replaces the target refuses MODIFIED with the edit kept.
-#[test]
-fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
+fn an_edit_after_the_exchange_survives(rerun: Rerun) {
     use crate::estate::{self, HandoffMode, HandoffOptions};
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
@@ -355,7 +397,7 @@ fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
         });
         rows.into_inner().unwrap()
     };
-    let handoff = || {
+    let handoff = |renew: bool| {
         estate::handoff(
             &plan,
             &corpus,
@@ -363,6 +405,7 @@ fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
             "neo",
             &HandoffOptions {
                 mode: HandoffMode::Render,
+                renew,
                 ..HandoffOptions::default()
             },
             &mut |_| Ok(()),
@@ -383,11 +426,17 @@ fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
             fs::write(&edited, bytes).unwrap();
         },
     );
-    handoff();
+    handoff(false);
     assert!(fs::read(&agents).unwrap().ends_with(b"A local note.\n"));
     tick();
-    // The rerun finds the record current and re-dates its racy print.
-    handoff();
+    match rerun {
+        Rerun::Unchanged => handoff(false),
+        Rerun::Retire => {
+            fs::remove_file(target.join("CLAUDE.md")).unwrap();
+            handoff(false);
+        }
+        Rerun::Renew => handoff(true),
+    }
     fs::write(source.join("AGENTS.md"), b"# Agents, v2\n").unwrap();
     git_run(&source, &["commit", "--quiet", "-am", "agents v2"]);
     tick();
@@ -402,6 +451,26 @@ fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
         fs::read(&agents).unwrap().ends_with(b"A local note.\n"),
         "the user's edit was landed over"
     );
+}
+
+/// Review of 2026-10-16 (mutation row for the re-dating path).
+#[test]
+fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
+    an_edit_after_the_exchange_survives(Rerun::Unchanged);
+}
+
+/// Re-review of 2026-10-16, finding 1: the keep path re-dated a racy
+/// record print equal to the target's without checking the bytes under
+/// the block (a rerun that retires another target).
+#[test]
+fn a_kept_block_never_redates_a_racy_print_unchecked_on_a_retire() {
+    an_edit_after_the_exchange_survives(Rerun::Retire);
+}
+
+/// Re-review of 2026-10-16, finding 1: the same through `--renew`.
+#[test]
+fn a_kept_block_never_redates_a_racy_print_unchecked_on_a_renew() {
+    an_edit_after_the_exchange_survives(Rerun::Renew);
 }
 
 /// Mutation row (review of 2026-10-16): `--clear` of a created file that a

@@ -79,7 +79,7 @@ const INTENT_MAGIC: &[u8; 16] = b"bulkload-hoffi-1";
 // ---- records -----------------------------------------------------------------
 
 /// What a target holds of the hand-off.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum FileKind {
     /// The block on top of the file's own bytes.
     Prefixed,
@@ -155,9 +155,23 @@ pub struct HandoffLanded {
     pub options: Stored,
     /// Sorted by path.
     pub files: Vec<HandoffFile>,
-    /// Targets whose block a person removed by hand, with the workspace
-    /// ledger's capture then: not re-added while it stays (design 6.5).
-    pub retired: Vec<(Vec<u8>, [u8; 32])>,
+    /// Targets whose block a person removed by hand: not re-added while
+    /// the workspace ledger's capture stays (design 6.5).
+    pub retired: Vec<Retired>,
+}
+
+/// A target whose block a person removed by hand.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct Retired {
+    pub path: Vec<u8>,
+    /// The workspace ledger's capture when the block was removed.
+    pub capture: [u8; 32],
+    /// The block it held then: put back byte for byte (an editor's undo, a
+    /// `git stash pop`), it is this landing's block again, never carried
+    /// content (re-review 2 of 2026-10-16, finding 3).
+    pub kind: FileKind,
+    pub block_len: u64,
+    pub block: [u8; 32],
 }
 
 /// What an intent does.
@@ -272,6 +286,20 @@ pub(super) fn landed_sides(
                         .filter(|print| same_fs && print.mtime_ns < racy_from),
                 },
                 file.base.as_ref(),
+            );
+        }
+        // A retired block put back byte for byte is bulkload's own bytes
+        // again (re-review 2 of 2026-10-16, finding 3): accepted, never
+        // trusted by print.
+        for retired in &record.retired {
+            attach(
+                &retired.path,
+                Prefix {
+                    len: retired.block_len,
+                    digest: retired.block,
+                    trusted: None,
+                },
+                None,
             );
         }
     }
@@ -432,24 +460,98 @@ enum Held {
     Intact(HandoffFile),
     /// No marker at byte 0.
     Plain,
-    /// A block at byte 0 rendered for another landing (its `for=` is not
-    /// this landing's, or it names none): carried with the source's bytes,
-    /// so it is content, handled as `Plain` with the block kept below
-    /// (OI-1003-Q185).
+    /// A block at byte 0 that is the file's content, not bulkload's:
+    /// rendered for another landing (its `for=` is not this landing's, or
+    /// it names none), on a target no record entry names, or one whose
+    /// whole file is the target's landed blob (a round trip: the block
+    /// carried back to the source and landed again with the source's
+    /// bytes, while the record stands or after it is gone). Carried with
+    /// the source's bytes, so it is content, handled as `Plain` with the
+    /// block kept below (OI-1003-Q185; re-review 2 of 2026-10-16, finding
+    /// 2).
     Foreign,
-    /// A marker at byte 0 for this landing that is not the record's: an
-    /// edit inside the block, a BEGIN with no END, a block with no record.
+    /// A marker at byte 0 for this landing, on a target the record names
+    /// (or retired), that is not the record's block and not landed
+    /// content: an edit inside the block, a BEGIN with no END.
     Modified,
 }
 
-/// What the head of a file holds that no record vouches for: nothing, a
-/// block (or a broken one) this landing's identity names, or another's.
-fn unrecorded(head: &[u8], ours: &str) -> Held {
-    match render::marker(head) {
-        render::Marker::None => Held::Plain,
-        _ if render::owner_of(head) == Some(ours.as_bytes()) => Held::Modified,
-        _ => Held::Foreign,
+/// The record's entry for target `name` (never a link's), or, for a target
+/// whose block a person removed by hand, that block as an entry with no
+/// print: put back byte for byte, it is this landing's block again
+/// (re-review 2 of 2026-10-16, finding 3).
+fn entry_of(record: Option<&HandoffLanded>, name: &str) -> Option<HandoffFile> {
+    let record = record?;
+    record
+        .files
+        .iter()
+        .find(|file| file.path == name.as_bytes() && !matches!(file.kind, FileKind::ViaSymlink(_)))
+        .cloned()
+        .or_else(|| {
+            record
+                .retired
+                .iter()
+                .find(|retired| retired.path == name.as_bytes())
+                .map(|retired| HandoffFile {
+                    path: retired.path.clone(),
+                    kind: retired.kind.clone(),
+                    block_len: retired.block_len,
+                    block: retired.block,
+                    print: None,
+                    base: None,
+                    carried: false,
+                })
+        })
+}
+
+/// What `bytes` (a target's head, or all of it) hold against its record
+/// entry `entry` (see [`entry_of`]). `landed` says whether the whole file
+/// is the target's landed blob; it is asked only when a block that could
+/// be this landing's stands at byte 0, and a yes makes that block the
+/// file's content (`Foreign`): bulkload's block is never part of what the
+/// source landed (re-review 2 of 2026-10-16, finding 2; OI-1003-Q185).
+fn classify_head(
+    bytes: &[u8],
+    entry: Option<&HandoffFile>,
+    ours: &str,
+    landed: &mut dyn FnMut() -> Result<bool>,
+) -> Result<Held> {
+    let marker = render::marker(bytes);
+    if let (render::Marker::Block(len), Some(file)) = (marker, entry) {
+        let block = bytes.get(..len).unwrap_or_default();
+        if file.block_len == len64(block) && digest(block) == file.block {
+            return Ok(if landed()? {
+                Held::Foreign
+            } else {
+                Held::Intact(file.clone())
+            });
+        }
     }
+    unrecorded(bytes, entry.map(|_| ours), landed)
+}
+
+/// What the head of a file holds that its record entry does not vouch
+/// for: nothing; a block (or a broken one) of this landing's identity on a
+/// target a record entry names (`recorded`: `Some(ours)`), an edit of this
+/// landing's block unless the whole file is landed content; or a carried
+/// one (another landing's, or any block on a target no record entry names:
+/// re-review of 2026-10-16, finding 4).
+fn unrecorded(
+    head: &[u8],
+    recorded: Option<&str>,
+    landed: &mut dyn FnMut() -> Result<bool>,
+) -> Result<Held> {
+    Ok(match render::marker(head) {
+        render::Marker::None => Held::Plain,
+        _ if recorded.is_some_and(|ours| render::owner_of(head) == Some(ours.as_bytes())) => {
+            if landed()? {
+                Held::Foreign
+            } else {
+                Held::Modified
+            }
+        }
+        _ => Held::Foreign,
+    })
 }
 
 /// Whether `record`'s print of `file` vouches for its bytes now: the same
@@ -466,41 +568,37 @@ fn trusted(record: &HandoffLanded, file: &HandoffFile, now: Option<&SeatPrint>, 
             .is_some_and(|print| now == Some(print) && print.mtime_ns < racy_from)
 }
 
-/// What `path` (named `name`) holds against `record`: by print when the
-/// record's print is unchanged and not racy (no read), else by its head.
-/// `ours` is this landing's identity ([`render::owner`]).
+/// Whether target `name`'s whole file is its landed blob (read whole,
+/// counted).
+fn whole_is_landed(worktree: &Path, landed: &mut Landed<'_>, name: &str) -> Result<bool> {
+    let read = read_whole(&worktree.join(name), name)?;
+    Ok(landed_base(worktree, landed, name, &read.bytes)?.is_some())
+}
+
+/// What target `name` of `worktree` holds against `record`: by print when
+/// the record's print is unchanged and not racy (no read), else by its
+/// head (and, for a block that could be this landing's, by whether the
+/// whole file is landed content). `ours` is this landing's identity
+/// ([`render::owner`]).
 fn held(
-    path: &Path,
+    worktree: &Path,
     name: &str,
     meta: &fs::Metadata,
     record: Option<&HandoffLanded>,
     fsid: u64,
     ours: &str,
+    landed: &mut Landed<'_>,
 ) -> Result<Held> {
-    let entry = record.and_then(|record| {
-        record
-            .files
-            .iter()
-            .find(|file| {
-                file.path == name.as_bytes() && !matches!(file.kind, FileKind::ViaSymlink(_))
-            })
-            .map(|file| (record, file))
-    });
+    let entry = entry_of(record, name);
     let now = SeatPrint::of(name.as_bytes(), meta);
-    if let Some((record, file)) = entry {
+    if let (Some(record), Some(file)) = (record, &entry) {
         if trusted(record, file, now.as_ref(), fsid) {
             return Ok(Held::Intact(file.clone()));
         }
     }
-    let head = head_of_file(path)?;
-    Ok(match (render::marker(&head), entry) {
-        (render::Marker::Block(len), Some((_, file)))
-            if file.block_len == len64(head.get(..len).unwrap_or_default())
-                && digest(head.get(..len).unwrap_or_default()) == file.block =>
-        {
-            Held::Intact(file.clone())
-        }
-        _ => unrecorded(&head, ours),
+    let head = head_of_file(&worktree.join(name))?;
+    classify_head(&head, entry.as_ref(), ours, &mut || {
+        whole_is_landed(worktree, landed, name)
     })
 }
 
@@ -550,30 +648,40 @@ fn read_whole(path: &Path, name: &str) -> Result<Whole> {
     Ok(Whole { held, bytes, print })
 }
 
-/// What a step expects a target to start with.
-#[derive(Debug, Clone, Copy)]
-enum Expect<'a> {
-    /// The record's block.
-    Block(&'a HandoffFile),
-    /// No block of this landing's (`ours`): nothing, or a carried one.
-    Unowned(&'a str),
+/// `path` read whole, still starting with `file`'s block (what the
+/// classification found), held still to the read the exchange is checked
+/// against. Anything else is a writer between the two reads:
+/// `HANDOFF_BLOCK_MODIFIED`.
+fn read_block(path: &Path, name: &str, file: &HandoffFile) -> Result<Whole> {
+    let read = read_whole(path, name)?;
+    let still = usize::try_from(file.block_len)
+        .ok()
+        .and_then(|len| read.bytes.get(..len))
+        .is_some_and(|block| digest(block) == file.block);
+    if still {
+        Ok(read)
+    } else {
+        Err(BulkloadRefusal::HandoffBlockModified)
+    }
 }
 
-/// `path` read whole, starting as `expect` says: what the classification
-/// found, held still to the read the exchange is checked against. Anything
-/// else is a writer between the two reads: `HANDOFF_BLOCK_MODIFIED`.
-fn read_as(path: &Path, name: &str, expect: Expect<'_>) -> Result<Whole> {
-    let read = read_whole(path, name)?;
-    let still = match expect {
-        Expect::Block(file) => usize::try_from(file.block_len)
-            .ok()
-            .and_then(|len| read.bytes.get(..len))
-            .is_some_and(|block| digest(block) == file.block),
-        Expect::Unowned(ours) => {
-            matches!(unrecorded(&read.bytes, ours), Held::Plain | Held::Foreign)
-        }
-    };
-    if still {
+/// Target `name` read whole, still holding no block of this landing's
+/// (nothing at byte 0, or a carried block: [`classify_head`] over the
+/// whole file, against `entry`). Anything else is a writer between the
+/// classification and this read: `HANDOFF_BLOCK_MODIFIED`.
+fn read_unowned(
+    worktree: &Path,
+    name: &str,
+    entry: Option<&HandoffFile>,
+    ours: &str,
+    landed: &mut Landed<'_>,
+) -> Result<Whole> {
+    let read = read_whole(&worktree.join(name), name)?;
+    let bytes = &read.bytes;
+    let state = classify_head(bytes, entry, ours, &mut || {
+        Ok(landed_base(worktree, landed, name, bytes)?.is_some())
+    })?;
+    if matches!(state, Held::Plain | Held::Foreign) {
         Ok(read)
     } else {
         Err(BulkloadRefusal::HandoffBlockModified)
@@ -848,7 +956,7 @@ fn retaken(
     file: &HandoffFile,
 ) -> Result<Option<HandoffFile>> {
     let name = std::str::from_utf8(&file.path).map_err(|_| BulkloadRefusal::PathNotPortable)?;
-    let read = match read_as(&worktree.join(name), name, Expect::Block(file)) {
+    let read = match read_block(&worktree.join(name), name, file) {
         Ok(read) => read,
         Err(BulkloadRefusal::HandoffBlockModified) => return Ok(None),
         Err(refusal) => return Err(refusal),
@@ -896,7 +1004,7 @@ fn settle(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Settl
         // The operator asked for the block to go: finish that, never put
         // it back (review of 2026-10-16, a crashed clear re-rendered by
         // the next apply's H step).
-        clear(worktree, dir, ours)?;
+        clear(worktree, dir, source, ours)?;
         return Ok(Settled {
             swept: swept + 1,
             cleared: true,
@@ -1156,6 +1264,34 @@ fn user_config_files() -> Vec<PathBuf> {
     files
 }
 
+/// Whether the user's or the system's configuration file `path` is one Git
+/// reads: followed through symlinks (a home-manager `~/.config/git/config`
+/// is a link into the store; re-review of 2026-10-16, finding 3), a
+/// regular file. A path that does not resolve, or that Git may not read
+/// (`ENOENT`, `ENOTDIR`, `EACCES`), is skipped, as Git skips it.
+///
+/// # Errors
+/// Any other error resolving `path`.
+fn user_config_is_file(path: &Path) -> Result<bool> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.is_file()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound
+                    | std::io::ErrorKind::NotADirectory
+                    | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(crate::refuse::io(
+            &error,
+            "git_carry::converge::handoff::user_config",
+        )),
+    }
+}
+
 /// `url` as Git rewrites it with the longest matching rule of one kind
 /// (`push`: `pushInsteadOf`, else `insteadOf`), or `None` when none
 /// matches.
@@ -1204,7 +1340,7 @@ fn privacy(
     }
     let mut rules = Remotes::default();
     for file in user_config_files() {
-        if lstat(&file)?.is_some_and(|meta| meta.is_file()) {
+        if user_config_is_file(&file)? {
             remotes_in(worktree, Some(&file), &mut rules)?;
         }
     }
@@ -1455,13 +1591,17 @@ fn sibling_of(worktree: &Path, siblings: &[(PathBuf, PathBuf)]) -> Result<Option
                 }
             }
         };
+        // Reconciled when the landing holds the sibling's HEAD: on a branch,
+        // or in its own HEAD's history (a detached landing). A sibling
+        // strictly ahead holds a commit the landing lacks: open (re-review
+        // of 2026-10-16, finding 2).
         let consolidated = match &state {
             SiblingState::Head { oid, .. } => {
                 held_by_branch(worktree, oid, None)
                     || now_of(worktree)
                         .ok()
                         .flatten()
-                        .is_some_and(|(_, here)| in_history(&path, &here, oid))
+                        .is_some_and(|(_, here)| in_history(worktree, oid, &here))
             }
             _ => false,
         };
@@ -1818,6 +1958,9 @@ fn landed_base(
     name: &str,
     remainder: &[u8],
 ) -> Result<Option<String>> {
+    if landed.instance.is_empty() {
+        return Ok(None);
+    }
     if landed.sides.is_none() {
         let meta = Meta::read(worktree, landed.source, landed.instance)?;
         landed.sides = Some(sides(worktree, &meta)?);
@@ -1954,7 +2097,7 @@ pub fn run(
                     ..Row::default()
                 });
             }
-            clear(workspace.worktree, &place.dir, &ours)
+            clear(workspace.worktree, &place.dir, estate.source, &ours)
         }
         Mode::Render | Mode::DryRun => {
             let _lock = if request.mode == Mode::Render {
@@ -2013,12 +2156,13 @@ enum Plan {
     /// Retired: removed by hand while the capture stayed.
     Retire(&'static str),
     Prepend(Whole),
-    Replace(Whole, u64),
+    /// The bytes read, the old block's length, and the target's kind.
+    Replace(Whole, u64, FileKind),
     Create,
 }
 
 /// Whether a target's bytes (under this landing's block, when it has one)
-/// start with a block another landing rendered.
+/// start with a carried block (another landing's, or one no record names).
 const fn carried_of(state: Option<&Held>) -> bool {
     match state {
         Some(Held::Foreign) => true,
@@ -2054,18 +2198,24 @@ fn render_workspace(
     let census = census_of(session, place, workspace, estate)?.clone();
     let sibling = sibling_of(&this, &options.siblings)?;
     let inputs = inputs_digest(workspace, estate, &stored, &census, sibling.as_ref())?;
+    let mut landed = Landed {
+        source: estate.source,
+        instance: &place.ledger.instance,
+        sides: None,
+    };
     // What each target holds (read only when its print moved).
     let mut held_by: Vec<(&'static str, Option<Held>)> = Vec::new();
     for (name, entry) in &found {
         let state = match entry {
             Found::Regular(meta) => {
                 let state = held(
-                    &worktree.join(name),
+                    worktree,
                     name,
                     meta,
                     record.as_ref(),
                     fsid,
                     ours,
+                    &mut landed,
                 )?;
                 if state == Held::Modified {
                     return Err(BulkloadRefusal::HandoffBlockModified);
@@ -2078,10 +2228,9 @@ fn render_workspace(
     }
     let retired = |name: &str| {
         record.as_ref().is_some_and(|record| {
-            record
-                .retired
-                .iter()
-                .any(|(path, capture)| path == name.as_bytes() && *capture == place.ledger.capture)
+            record.retired.iter().any(|retired| {
+                retired.path == name.as_bytes() && retired.capture == place.ledger.capture
+            })
         })
     };
     let recorded = |name: &str| {
@@ -2110,11 +2259,6 @@ fn render_workspace(
                 (Found::Missing, _) if never_created(name) => true,
                 (Found::Missing | Found::Regular(_), _) => retired(name),
             });
-    let mut landed = Landed {
-        source: estate.source,
-        instance: &place.ledger.instance,
-        sides: None,
-    };
     if unchanged && request.mode == Mode::Render {
         // A print the record could not vouch for (racy against its
         // `recorded_ns`) was proved by reading the block; once the clock is
@@ -2212,24 +2356,56 @@ fn render_workspace(
             (Found::Via(_), _) => Plan::Keep(None, "none"),
             (Found::Regular(meta), Some(Held::Intact(file))) => {
                 if file.block != block_digest {
-                    Plan::Replace(read_as(&path, name, Expect::Block(file))?, file.block_len)
-                } else if file.print == SeatPrint::of(name.as_bytes(), meta) {
+                    // The kind stays: a created file re-rendered is still
+                    // the hand-off's to remove and to lift (H43).
+                    Plan::Replace(
+                        read_block(&path, name, file)?,
+                        file.block_len,
+                        file.kind.clone(),
+                    )
+                } else if record.as_ref().is_some_and(|record| {
+                    trusted(
+                        record,
+                        file,
+                        SeatPrint::of(name.as_bytes(), meta).as_ref(),
+                        fsid,
+                    )
+                }) {
                     Plan::Keep(Some(file.clone()), "unchanged")
                 } else {
-                    // The block is kept but the file moved (an edit below
-                    // it, a touch): what the record says of the bytes under
-                    // the block is checked again before its print is
-                    // re-taken (review of 2026-10-16, the BLOCKER).
+                    // The block is kept but the record's print cannot vouch
+                    // for the bytes: the file moved (an edit below it, a
+                    // touch), or the print is racy (it may have caught an
+                    // edit made in the tick of the render's exchange, and
+                    // this run re-dates the record). What the record says
+                    // of the bytes under the block is checked again before
+                    // its print is kept or re-taken (review of 2026-10-16,
+                    // the BLOCKER; re-review, finding 1).
                     let checked = retaken(worktree, &mut landed, file)?
                         .ok_or(BulkloadRefusal::HandoffBlockModified)?;
-                    Plan::Keep(Some(checked), "unchanged")
+                    // A retired block put back is recorded again.
+                    let action = if recorded(name).is_some() {
+                        "unchanged"
+                    } else {
+                        "restored"
+                    };
+                    Plan::Keep(Some(checked), action)
                 }
             }
             (Found::Regular(_), _) => {
                 if renewable(name) {
                     Plan::Retire("removed-by-hand")
                 } else {
-                    Plan::Prepend(read_as(&path, name, Expect::Unowned(ours))?)
+                    // Read whole and classified again as `held` did: no
+                    // block of this landing's at byte 0 (a carried one is
+                    // content, kept below the new block).
+                    Plan::Prepend(read_unowned(
+                        worktree,
+                        name,
+                        entry_of(record.as_ref(), name).as_ref(),
+                        ours,
+                        &mut landed,
+                    )?)
                 }
             }
             (Found::Missing, _) if never_created(name) => Plan::Keep(None, "none"),
@@ -2263,7 +2439,7 @@ fn render_workspace(
                 new.extend_from_slice(&read.bytes);
                 (None, Some(digest(&read.bytes)), new)
             }
-            Plan::Replace(read, old_len) => {
+            Plan::Replace(read, old_len, _) => {
                 let cut = usize::try_from(*old_len).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
                 let mut new = block.clone();
                 new.extend_from_slice(read.bytes.get(cut..).unwrap_or_default());
@@ -2290,10 +2466,10 @@ fn render_workspace(
     }
     let mut files = Vec::new();
     let mut rows = Vec::new();
-    let mut retired_now: Vec<(Vec<u8>, [u8; 32])> = record
+    let mut retired_now: Vec<Retired> = record
         .iter()
         .flat_map(|record| record.retired.clone())
-        .filter(|(_, capture)| *capture == place.ledger.capture && !request.renew)
+        .filter(|retired| retired.capture == place.ledger.capture && !request.renew)
         .collect();
     for ((name, plan), (_, entry)) in plans.iter().zip(&found) {
         let (kind, action) = match plan {
@@ -2313,8 +2489,16 @@ fn render_workspace(
             },
             Plan::Retire(action) => {
                 let path = name.as_bytes().to_vec();
-                if !retired_now.iter().any(|(retired, _)| *retired == path) {
-                    retired_now.push((path.clone(), place.ledger.capture));
+                if !retired_now.iter().any(|retired| retired.path == path) {
+                    if let Some(file) = recorded(name) {
+                        retired_now.push(Retired {
+                            path: path.clone(),
+                            capture: place.ledger.capture,
+                            kind: file.kind.clone(),
+                            block_len: file.block_len,
+                            block: file.block,
+                        });
+                    }
                 }
                 rows.push(FileRow {
                     path,
@@ -2323,7 +2507,8 @@ fn render_workspace(
                 });
                 continue;
             }
-            Plan::Prepend(_) | Plan::Replace(..) => (FileKind::Prefixed, "written"),
+            Plan::Prepend(_) => (FileKind::Prefixed, "written"),
+            Plan::Replace(.., kind) => (kind.clone(), "written"),
             Plan::Create => (FileKind::Created, "created"),
         };
         rows.push(FileRow {
@@ -2341,7 +2526,7 @@ fn render_workspace(
                 render::marker(&read.bytes) != render::Marker::None,
                 None,
             ),
-            Plan::Replace(read, old_len) => {
+            Plan::Replace(read, old_len, _) => {
                 let rest = under(
                     read,
                     usize::try_from(*old_len).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
@@ -2375,6 +2560,13 @@ fn render_workspace(
             ..Row::default()
         });
     }
+    // A retired target whose block is back (put back by hand, or renewed)
+    // is a recorded entry again.
+    retired_now.retain(|retired| {
+        !files
+            .iter()
+            .any(|file: &HandoffFile| file.path == retired.path)
+    });
     retired_now.sort();
     retired_now.dedup();
     let mut next = HandoffLanded {
@@ -2409,7 +2601,7 @@ fn render_workspace(
             let temp = temp_name(&tag, n);
             n += 1;
             outcome = match plan {
-                Plan::Prepend(read) | Plan::Replace(read, _) => {
+                Plan::Prepend(read) | Plan::Replace(read, ..) => {
                     exchange(worktree, name, read, content, &temp, Op::Render)
                 }
                 Plan::Create => create(worktree, name, content, &temp),
@@ -2469,12 +2661,18 @@ fn render_workspace(
 /// after the intent keeps it, so the next run of either verb finishes the
 /// clear ([`settle`]).
 #[allow(clippy::too_many_lines)]
-fn clear(worktree: &Path, dir: &Path, ours: &str) -> Result<Row> {
+fn clear(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Row> {
     let record_path = dir.join(HANDOFF_LANDED);
     let intent_path = dir.join(HANDOFF_INTENT);
     let record = landed::read::<HandoffLanded>(&record_path)?;
     let pending = landed::exists(&intent_path)?;
     let fsid = landed::fsid(worktree)?;
+    let instance = landed_of(dir)?;
+    let mut landed = Landed {
+        source,
+        instance: instance.as_deref().unwrap_or_default(),
+        sides: None,
+    };
     let mut work: Vec<(&'static str, Whole, HandoffFile)> = Vec::new();
     let mut rows = Vec::new();
     for name in ALL_NAMES {
@@ -2497,11 +2695,19 @@ fn clear(worktree: &Path, dir: &Path, ours: &str) -> Result<Row> {
             }
             continue;
         }
-        match held(&path, name, &meta, record.as_ref(), fsid, ours)? {
+        match held(
+            worktree,
+            name,
+            &meta,
+            record.as_ref(),
+            fsid,
+            ours,
+            &mut landed,
+        )? {
             Held::Plain | Held::Foreign => {}
             Held::Modified => return Err(BulkloadRefusal::HandoffBlockModified),
             Held::Intact(file) => {
-                let read = read_as(&path, name, Expect::Block(&file))?;
+                let read = read_block(&path, name, &file)?;
                 work.push((name, read, file));
             }
         }
@@ -2591,10 +2797,14 @@ fn blob_has_token(worktree: &Path, rev: &str, name: &str) -> Result<bool> {
 }
 
 /// Whether a branch's or tag's history (or a detached HEAD's) holds a
-/// commit that put the token into one of `names`: a block committed and
-/// removed again is still published by a push (review of 2026-10-16). The
-/// carried capture refs (`refs/carry/`) are not pushed and are not read.
-fn history_has_token(worktree: &Path, names: &[&str]) -> Result<bool> {
+/// commit that put the token into one of the target names: a block
+/// committed and removed again is still published by a push (review of
+/// 2026-10-16). Every name a hand-off may ever write is read ([`ALL_NAMES`]),
+/// not this run's targets: a README or override block committed while it
+/// was a target stays in history after `--clear` drops the record
+/// (re-review, finding 5). The carried capture refs (`refs/carry/`) are
+/// not pushed and are not read.
+fn history_has_token(worktree: &Path) -> Result<bool> {
     let mut command = git(worktree);
     command.args([
         "log",
@@ -2610,7 +2820,7 @@ fn history_has_token(worktree: &Path, names: &[&str]) -> Result<bool> {
     if now_of(worktree)?.is_some() {
         command.arg("HEAD");
     }
-    command.arg("--").args(names);
+    command.arg("--").args(ALL_NAMES);
     let out = command
         .output()
         .refuse_at("git_carry::converge::handoff::history")?;
@@ -2637,6 +2847,11 @@ fn check(
     let options = effective(request, record.as_ref(), &this);
     let names = names_for(worktree, options.readme, record.as_ref())?;
     let found = classify(worktree, &names)?;
+    let mut landed = Landed {
+        source: estate.source,
+        instance: &place.ledger.instance,
+        sides: None,
+    };
     let mut modified = false;
     let mut missing = false;
     let mut present = false;
@@ -2652,12 +2867,13 @@ fn check(
         let action = match entry {
             Found::Regular(meta) => {
                 let state = held(
-                    &worktree.join(name),
+                    worktree,
                     name,
                     meta,
                     record.as_ref(),
                     fsid,
                     ours,
+                    &mut landed,
                 )?;
                 if carried_of(Some(&state)) {
                     carried.push(name.as_bytes().to_vec());
@@ -2689,7 +2905,10 @@ fn check(
         };
         rows.push(FileRow {
             path: name.as_bytes().to_vec(),
-            kind: recorded.map_or("absent", |file| file.kind.name()),
+            kind: recorded
+                .map(|file| file.kind.name())
+                .or_else(|| entry_of(record.as_ref(), name).map(|file| file.kind.name()))
+                .unwrap_or("absent"),
             action,
         });
     }
@@ -2719,10 +2938,11 @@ fn check(
     let open = facts.open();
     // Commit detection: the index blob, the HEAD blob, each destination-
     // ahead, destination-only or diverged tip's blob, and the history of
-    // every branch and tag.
+    // every branch and tag, of every name a hand-off may write (not only
+    // this run's targets: re-review of 2026-10-16, finding 5).
     let mut staged = false;
     let mut committed = false;
-    for name in &names {
+    for name in ALL_NAMES {
         staged |= blob_has_token(worktree, "", name)?;
         committed |= blob_has_token(worktree, "HEAD", name)?;
         for row in facts
@@ -2733,7 +2953,7 @@ fn check(
             committed |= blob_has_token(worktree, &row.name, name)?;
         }
     }
-    committed = committed || history_has_token(worktree, &names)?;
+    committed = committed || history_has_token(worktree)?;
     let state = if committed {
         "committed"
     } else if staged {

@@ -264,7 +264,8 @@ Mutations == {"none", "proof_stat_only", "proof_stat_strict",
               "adopt_r2_not_adopted", "adopt_no_recheck", "adopt_t0_no_row",
               "handoff_no_overlay", "handoff_overlay_any_block",
               "handoff_clear_unchecked", "handoff_exchange_unchecked",
-              "handoff_no_intent", "handoff_retake_unchecked"}
+              "handoff_no_intent", "handoff_retake_unchecked",
+              "handoff_keep_racy_unchecked"}
 
 (* The closed unions the catalogue types (tla-check requires these sets   *)
 (* to equal the catalogue's labels).                                      *)
@@ -2255,11 +2256,18 @@ HandoffSettle ==
 \* unchanged (one block value here, so every rerun over it): nothing is
 \* written; the record's print is re-taken (the file moved: an edit below
 \* the block) or re-dated (racy), its base checked again first (C retaken;
-\* handoff_retake_unchecked: the old base kept).
+\* handoff_retake_unchecked: the old base kept). The code keeps a print
+\* unchecked only when it is trusted (HTrusted's print conditions), which
+\* changes nothing here. handoff_keep_racy_unchecked (re-review of
+\* 2026-10-16, finding 1): a racy print equal to the seat's is re-dated
+\* with its old base unchecked; it may have caught an operator's edit
+\* below the block made between the exchange and the record.
 HandoffKeep ==
     /\ hand.has /\ IsBlk(dseat[HP].v)
     /\ LET r == HRetake(dseat[HP].v, dseat[HP].st)
-       IN hand' = [hand EXCEPT !.pst = r.pst, !.prac = r.prac, !.base = r.base,
+           kept == Mut("handoff_keep_racy_unchecked") /\ dseat[HP].st = hand.pst
+       IN hand' = [hand EXCEPT !.pst = r.pst, !.prac = r.prac,
+                                !.base = IF kept THEN hand.base ELSE r.base,
                                 !.n = hand.n + 1]
 
 \* A render of a plain or missing HP, or a clear of an intact block.
