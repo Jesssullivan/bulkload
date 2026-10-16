@@ -1,5 +1,7 @@
 # Git carry engine decision packet (OI-1003-Q15), 2026-10-04
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** Decided: v1 is the Git carry engine and carry_v2 is deleted (OI-1003-Q44, Q54, Q56; `docs/slo.md`, amendment 2026-10-05).
+
 Rulings: OI-1003-Q15 (measure S3 on the estate corpus first, then choose v1,
 hybrid or v2 on the numbers; carry_v2 stays frozen until then), OI-1003-Q18
 (the S3 delta inequalities), OI-1003-Q35 (byte counters, `census_walks`,

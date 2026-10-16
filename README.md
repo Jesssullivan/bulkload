@@ -8,19 +8,19 @@ content and without re-reading what the destination already holds.
 ## Status
 
 The Rust engine works end to end (walk, framed chunk transport over ssh,
-resumable state on both ends, Git capture and import, typed refusals) and has
-moved real estate between hosts. It does not yet meet its performance bar:
-on the R23 corpus (242.6 MB, 23 files) the native initial copy took
-3,015 ms against rclone's 601 ms
-([evidence](docs/evidence/r23-2026-09-18.md)). The M2 engine work that
-addresses this is tracked in Linear project "Bulkload M2: SLO engine" and
-issues #42–#49.
+resumable state on both ends, Git capture, import, convergence and adoption,
+typed refusals) and has moved real estate between hosts. It does not yet
+meet its performance bar (S1, faster than rclone): the status and the latest
+sample of record are in [docs/slo.md](docs/slo.md) S1, and every sample is
+in [docs/evidence/](docs/evidence/). Live status is on the P-TIN-177
+milestones and their live issues; the Linear entry-point document is named
+in [docs/SOURCES.md](docs/SOURCES.md).
 
 ## Build and test
 
 ```bash
 nix develop            # toolchain, linters
-just check-fast        # mandatory tier (what PR CI runs); run before pushing
+just check-fast        # mandatory tier; run before pushing (PR CI: ci-source + ci-fault-harness)
 just check-full        # mandatory + optional tier (bench stubs, history scan, Nix/Bazel)
 just rust-check        # fmt, clippy -D warnings, tests
 cargo build --release -p bulkload-agent -p bulkload-bench
@@ -30,6 +30,8 @@ target/release/bulkload-bench --help
 
 ## Documents
 
-- [Product contract](docs/design.md)
-- [Product bar, R25](https://github.com/Jesssullivan/bulkload/issues/34)
+- [Where each fact lives](docs/SOURCES.md)
+- [What bulkload must achieve](docs/SPEC.md) (#236)
+- [SLOs and proofs](docs/slo.md)
+- [Design](docs/design.md)
 - [Measured evidence](docs/evidence/)

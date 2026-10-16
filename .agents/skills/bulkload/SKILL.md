@@ -7,7 +7,8 @@ description: Move a live development estate (Git, worktrees, agent state, dots, 
 
 The engine is this repository's Rust workspace: `bulkload-agent` (verbs:
 run it with no arguments for the list) and `bulkload-bench`. Read
-`AGENTS.md` and `docs/design.md` before acting.
+`AGENTS.md` and `docs/SOURCES.md` (which file holds which fact) before
+acting.
 
 Keep writers running. Include Git, agents, credentials, dots, worktrees and
 SQLite; preserve unique content on both hosts and destination machine
@@ -16,6 +17,7 @@ administration. SQLite needs backup-API capture and explicit composition,
 never a raw WAL/SHM copy or replacement of unique rows. Preserve Home Manager
 links and credential privacy.
 
-Estate operations are frozen until the M2 performance gates pass (R-N56);
-engine work is tracked in Linear project "Bulkload M2: SLO engine". Every
+Estate operations are not frozen: R-N56's freeze is superseded on order
+(OI-1003-Q194 C6, RUL-06; `docs/slo.md`, amendment 2026-10-16).
+Engine work is tracked in Linear project "Bulkload M2: SLO engine". Every
 performance claim must come from `bulkload-bench` evidence.
