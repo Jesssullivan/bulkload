@@ -38,26 +38,27 @@ and design disagreements](#code-and-design-disagreements)).
 | File | What it is |
 |---|---|
 | [`BulkloadTransfer.tla`](BulkloadTransfer.tla) | The specification. Its header states the scope, the abstractions and the code map. Every action cites the function it models. |
-| [`catalogue/Catalogue.dhall`](catalogue/Catalogue.dhall) | The typed catalogue: every config's constants and expectation, every mutation's verdict, and every property's traceability row. `just tla-render` renders every `MC_*.cfg`, `configs.tsv`, `configs_gc.tsv` and `configs_sq.tsv` from it (GitCarry's part is [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall), SqliteCarry's [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall)). Edit the catalogue, never the outputs. It replaced `gen_cfgs.py` (OI-1003-Q32). |
+| [`catalogue/Catalogue.dhall`](catalogue/Catalogue.dhall) | The typed catalogue: every config's constants and expectation, every mutation's verdict, and every property's traceability row. `just tla-render` renders every `MC_*.cfg`, `configs.tsv`, `configs_gc.tsv`, `configs_sq.tsv`, `configs_ec.tsv` and `configs_dir.tsv` from it (GitCarry's part is [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall), SqliteCarry's [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall), EstateConverge's [`catalogue/EstateConverge.dhall`](catalogue/EstateConverge.dhall), DirectoryRecords' [`catalogue/Directories.dhall`](catalogue/Directories.dhall)). Edit the catalogue, never the outputs. It replaced `gen_cfgs.py` (OI-1003-Q32). |
 | [`catalogue/Types.dhall`](catalogue/Types.dhall) | The catalogue's types. Union labels are the TLA+ names themselves. |
 | `MC_*.cfg` | TLC configurations, rendered from the catalogue. |
 | [`configs.tsv`](configs.tsv) | The run order. Columns: `name`, `expect`, `named-property` (the one property a fail or reach row must violate), `never` (a pass row's exact never-enabled actions), `flags` (extra TLC arguments, one argv element per word). |
 | [`GitCarry.tla`](GitCarry.tla) | The git carry custody module (OI-1003-Q43): chain links, the plan base, depth, Q46's re-root and GC, crash order and restore-or-recapture ([GitCarry](#gitcarry-chain-and-base-custody-oi-1003-q43-oi-1003-q46)). |
 | [`configs_gc.tsv`](configs_gc.tsv), `MC_gc_*.cfg` | GitCarry.tla's run order and configs, in the same format, rendered from [`catalogue/GitCarry.dhall`](catalogue/GitCarry.dhall). |
-| [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by both modules. |
 | [`SqliteCarry.tla`](SqliteCarry.tla) | The SQLite snapshot seat module (#218): the stepped backup, the settled key, sidecars, root and owner refusals, and OI-1003-Q146's superseding publish of a changed store's snapshot ([SqliteCarry](#sqlitecarry-the-sqlite-snapshot-seat-218-oi-1003-q146)). |
 | [`configs_sq.tsv`](configs_sq.tsv), `MC_sq_*.cfg` | SqliteCarry.tla's run order and configs, rendered from [`catalogue/SqliteCarry.dhall`](catalogue/SqliteCarry.dhall). |
 | [`EstateConverge.tla`](EstateConverge.tla) | The estate convergence module (OI-1003-Q144): destination custody of a re-apply that brings a checkout bulkload landed to a newer capture ([EstateConverge](#estateconverge-destination-custody-of-estate-convergence-oi-1003-q144)). |
 | [`configs_ec.tsv`](configs_ec.tsv), `MC_ec_*.cfg` | EstateConverge.tla's run order and configs, rendered from [`catalogue/EstateConverge.dhall`](catalogue/EstateConverge.dhall). |
 | [`catalogue/Lib.dhall`](catalogue/Lib.dhall) | The catalogue's list and text helpers, shared by every module. |
 | [`hs/GitCarryCore.hs`](hs/GitCarryCore.hs) | The reference decision core `decide`, its pinned rows ([`decide_rows.tsv`](../../crates/bulkload-agent/tests/data/decide_rows.tsv)), and an explorer of GitCarry.tla. |
+| [`DirectoryRecords.tla`](DirectoryRecords.tla) | Directory records (R-N102, R-N119) and their batching (OI-1003-Q143 item 2), under per-name power loss and reused inode numbers ([Directory records](#directory-records-r-n102-oi-1003-q143)). |
+| [`configs_dir.tsv`](configs_dir.tsv), `MC_dir_*.cfg` | DirectoryRecords.tla's run order and configs, rendered from [`catalogue/Directories.dhall`](catalogue/Directories.dhall). |
 
 ## Running it
 
 ```sh
-just tla-render             # re-render configs.tsv, configs_gc.tsv and MC_*.cfg from the catalogue
+just tla-render             # re-render configs*.tsv and MC_*.cfg from the catalogue
 just tla-render --check     # fail unless the committed files are the catalogue's rendering
-just tla-check              # every row of configs.tsv, then of configs_gc.tsv
+just tla-check              # every row of configs.tsv, configs_gc.tsv, configs_sq.tsv, configs_ec.tsv, configs_dir.tsv
 just tla-check MC_nv_core   # that module's budget self-test, then the named configs
 just tla-check MC_gc_core   # the same for GitCarry.tla
 just tla-check MC_ec_refs   # the same for EstateConverge.tla
@@ -271,6 +272,7 @@ the counts are copied here.
 | `MC_r25_unrowed_bytes` | {a} R2 C1 E0 strict-held budget 300 s | pass | **PASS** | – | 448 | 974 | 30 | 2s | 297 |
 | `MC_r25_strict_deep` | {a} R3 C2 E1 F1 X1 space strict-held budget 600 s | pass | **PASS** | – | 461,893 | 1,801,788 | 49 | 44s | 1774 |
 | `MC_r25_strict_main` | {a,b} R2 C1 E1 strict-held sym budget 600 s | pass | **PASS** | – | 963,928 | 3,081,821 | 51 | 98s | 1964 |
+| `MC_r25_strict_three` (added 2026-10-15, after the run above; its own run's counts) | {a,b,c} R2 C1 E0 strict-held sym budget 600 s | pass | **PASS** | – | 636,976 | 2,409,822 | 66 | 112s | 2032 |
 | `MC_r25_strict_unsealed` | {a} R2 C1 E0 unsealed-root strict-held budget 300 s | pass | **PASS** | – | 1,050 | 2,035 | 30 | 3s | 367 |
 | `MC_r25_strict_authority` | {a} R2 C1 E0 relaxed relaxed-auth strict-held budget 300 s | pass | **PASS** | – | 1,188 | 2,303 | 30 | 2s | 369 |
 | `MC_main_sim` | {a,b} R3 C1 E1 F1 X1 space budget 600 s | simulate | **SIMULATION** | – | 1,144,601 | – | – | 40s | 1541 |
@@ -431,6 +433,7 @@ violation, and a simulation only samples.
 | `MC_r25_unrowed_bytes`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority` | `Edit`, `SilentRewrite`, `RecvRefused`, `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
 | `MC_r25_strict_deep` | – | WP0(d), estate |
 | `MC_r25_strict_main` | `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
+| `MC_r25_strict_three` | `Edit`, `SilentRewrite`, `RecvRefused`, `ForeignWrite`, `ForeignDelete`, `CommitFail` | WP0(d), estate |
 
 Each action is off because of that config's own constants, and every one is
 enabled in another config:
@@ -518,7 +521,7 @@ What the catalogue guarantees, at the type level or by an `assert`, every
 time it is evaluated (a catalogue that breaks one renders nothing):
 
 - **Typed constants.** Each config's constants are a `Constants` record:
-  `Seats` is a list of `< a | b >`, `SupersedeMode` is
+  `Seats` is a list of `< a | b | c >`, `SupersedeMode` is
   `< off | check_rename | exchange >`, and `Mutation` is an optional
   `Mutation`. A misspelt value does not type-check.
 - **An expectation carries only what its kind needs.** A pass row carries
@@ -1147,8 +1150,8 @@ Code at adb9c66, re-checked at `origin/main` 6268175. `A` is
 | `RecvNeed` | `A/transfer.rs` `Outbound::need_chunks`, `serve_chunks` |
 | `RecvEnd` | `A/transfer.rs` `Inbound::end`, `end_streaming`, `end_filling`, `Inbound::publish`, `Inbound::adopt`; `A/materialize.rs` `verify_existing`; `A/transfer/unrowed.rs` `write_record`, `refresh` |
 | `RecvRefused` | `A/transfer.rs` `Inbound::refused` |
-| `SealTemp`, `Publish` | `A/materialize.rs` `StagedFile::seal`, `StagedFile::publish`; `A/io/durable.rs` `seal_file`; `A/io/mod.rs` `publish_noreplace` |
-| `DirSeal`, `SealAdopted` | `A/materialize.rs` `TouchedDevices::seal`, `PublishSink::commit` (`Publication::Adopted`); `A/io/durable.rs` `seal_dir` |
+| `SealTemp`, `Publish` | `A/materialize.rs` `StagedFile::seal`, `seal_group_data` (a batched group), `StagedFile::publish`; `A/io/durable.rs` `seal_file`, `seal_device`; `A/io/mod.rs` `publish_noreplace` |
+| `DirSeal`, `SealAdopted` | `A/materialize.rs` `TouchedDevices::seal`, `seal_group_data`, `PublishSink::commit` (`Publication::Adopted`); `A/io/durable.rs` `seal_dir`, `seal_device` |
 | `Commit`, `CommitFail` | `A/transfer_store.rs` `StorePublisher::commit_outputs`; `A/materialize.rs` `PublishSink::commit`, `space_refusal`; `A/io/durable.rs` `configure_sqlite`, `Committer` |
 | `AnswerHeld` | `A/transfer.rs` `Inbound::answer_held`, `Inbound::settle_held` |
 | `RecvHeld`, `LedgerCommit` | `A/transfer.rs` `Outbound::handle` (`Event::Held`); `A/transfer_store.rs` `LedgerSink::publish`, `StorePublisher::commit_captures` |
@@ -1181,6 +1184,31 @@ What the abstractions are:
   ordering barrier, and the group's full flush is the real durability point.
   That difference only removes crash states that come before the commit,
   where no row exists yet.
+- **The batched group seal (Linux, S1, OI-1003-Q107) is a refinement, not a
+  new action.** It runs every `SealTemp` of a group, then every `Publish`,
+  then the group's `DirSeal`s: one interleaving the model already allows,
+  since each `Publish(s)` needs only `s`'s own seal. A superseding output
+  (WP0(d)) is sealed in that first step too, and its `BeginSupersede(s)`,
+  which needs only `dPub[s] = "sealed"`, then `Exchange(s)` and
+  `VerifyDisp(s)` take the place of its `Publish`. Its `syncfs` also makes
+  other pending state durable early (another output's rename, a third
+  party's write, a displaced file). In the model that is a crash taking the
+  `persist` choice, which `CrashChoice` always offers, so the batched
+  protocol's behaviours are a subset of the model's. What the refinement
+  needs from the code, that no rename precedes its own data's seal, is
+  checked on the real trace by
+  `a_batched_group_names_no_output_before_its_data_is_durable`
+  (`A/materialize/adoption_power_loss.rs`), which fails when both `syncfs`
+  calls follow the renames. The refinement assumes a successful device
+  seal means the group's own data is durable. `syncfs` alone does not earn
+  that even on the allowlist (an idle xfs log sends no cache flush; a
+  shut-down ext4's `syncfs` returns 0). The code earns it with the seal's
+  `fsync` of the same descriptor after each `syncfs`, only on Linux
+  5.17-rc3 or later, on an allowlisted file system with no xfs realtime
+  file (`io::durable::syncfs_seals_handle`), and with each file's own
+  write-back error checked after the seal (`io::durable::check_writeback`);
+  anywhere else the group keeps the per-file `SealTemp` (OI-1003-Q107
+  review; the 5.17 floor is OI-1003-Q141).
 - **Relaxed source store.** A power loss drops any subset of committed ledger
   rows, or, under `RelaxedAuthority` before its creation is synced, the
   whole store. Under `StoreRootSealed = FALSE` (the code today) a strict
@@ -1225,7 +1253,7 @@ Not frozen, and not the SLO's obligation (OI-1003-Q40):
 
 | Property | What it is for |
 |---|---|
-| `R25_StrictNoDurableReread` | R25 under the strict reading of "held durably" (OI-1002-Q33): bulkload's own output from a non-racy capture, published or adopted and sealed, durable at the final path with the seat's current bytes, counts as held whether or not a row records it. Meaningful only under `TrackStrictHeld`. The transfer before #169 fails it (`MC_r25_unrowed_no_adopt`), and so does a manifest adoption that writes no record (`MC_neg_adopt_unrecorded`). With the capture record's adoption (`AdoptUnrowed`) it holds beside every safety invariant, within [stated limits](#r25s-strict-reading-169) (`MC_r25_unrowed_bytes`, `MC_r25_strict_deep`, `MC_r25_strict_main`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority`). |
+| `R25_StrictNoDurableReread` | R25 under the strict reading of "held durably" (OI-1002-Q33): bulkload's own output from a non-racy capture, published or adopted and sealed, durable at the final path with the seat's current bytes, counts as held whether or not a row records it. Meaningful only under `TrackStrictHeld`. The transfer before #169 fails it (`MC_r25_unrowed_no_adopt`), and so does a manifest adoption that writes no record (`MC_neg_adopt_unrecorded`). With the capture record's adoption (`AdoptUnrowed`) it holds beside every safety invariant, within [stated limits](#r25s-strict-reading-169) (`MC_r25_unrowed_bytes`, `MC_r25_strict_deep`, `MC_r25_strict_main`, `MC_r25_strict_three`, `MC_r25_strict_unsealed`, `MC_r25_strict_authority`). |
 | `AdoptOnlyUnrowed` | #169's adoption is for outputs with no row: an entry queued as an unrowed adoption never has a committed row for its key and its output's identity. A rowed output is answered `Reuse` from its row. Checked by every pass row with `AdoptUnrowed` on; `MC_neg_reuse_ignores_row` fails it. It exists because a regression of `Store::output_matches` would otherwise be invisible: the adoption takes over, hashes and re-rows every output on every run, and reads 0 source bytes, so no R25 or S3 property fires. Rust: `transfer::tests::a_clean_rerun_reuses_rowed_outputs_and_adopts_none`. |
 | `SupersedeAtomic` | #187, OI-1003-Q18, OI-1003-Q102: a superseding publish is atomic across any crash. Once it is settled (no intent recorded, no stage of its group pending), while the new file is at the leaf this store holds a row for it (its reuse row, or the ownership row the sweep gives it) and none for the old output; while the old output is at the leaf this store still holds a row for it and none for the new file. Never one file beside the other's rows. A leaf a third party wrote since is neither file. Checked by every pass row with `SupersedeMode = "exchange"`; `MC_neg_sweep_drops_ownership` and `MC_neg_exchange_before_intent` fail it. Rust: P78, `tests/power_loss.rs` (the superseding rerun), `tests/fault_harness.rs` (the `SUPERSEDING` rows). |
 | `OwnershipNeverReuse` | OI-1003-Q101, R25, #86: `Reuse` is answered only from a reuse row for the entry's key and the output's identity. An ownership row (a racy publish, an interrupted supersede) names no seat and is never a reuse source. `MC_neg_own_is_reuse` fails it. Rust: `transfer_store::tests::a_racy_output_has_an_ownership_row_and_no_reuse_row`, P19. |
@@ -1340,8 +1368,10 @@ The model proves the protocol, within its bounds. It does not prove:
   are deleted (OI-1003-Q44, OI-1003-Q56; tag `carry-v2-final`), so there is
   nothing of them to model. The reserved git sub-stream frames and estate
   apply's `.done` journals are modelled nowhere.
-- **The tree.** Directories and their records (R-N102), symlinks, `Skip`,
-  engine temporaries, walk caps and devices other than the store's.
+- **The tree.** Symlinks, `Skip`, engine temporaries, walk caps and
+  devices other than the store's. Directories and their records (R-N102)
+  are [DirectoryRecords.tla](#directory-records-r-n102-oi-1003-q143)'s,
+  not BulkloadTransfer.tla's.
 - **Storage below the store.** The Darwin barrier model belongs to
   `crash_check` (R-N88: P13, P14). SQLite corruption, torn pages and
   reordered writes under `fullfsync=OFF` are outside the model (see the
@@ -1444,6 +1474,7 @@ has no record or one that does not verify. A record that names another row
 | `MC_r25_unrowed_bytes` (one seat, a crash between runs) | pass | **PASS** | – | 448 | 974 | 30 |
 | `MC_r25_strict_deep` (`MC_main_deep`'s bound) | pass | **PASS** | – | 461,893 | 1,801,788 | 49 |
 | `MC_r25_strict_main` (`MC_main`'s bound, two seats) | pass | **PASS** | – | 963,928 | 3,081,821 | 51 |
+| `MC_r25_strict_three` (three seats, no edit: groups of one to three) | pass | **PASS** | – | 636,976 | 2,409,822 | 66 |
 | `MC_r25_strict_unsealed` (a lost source store) | pass | **PASS** | – | 1,050 | 2,035 | 30 |
 | `MC_r25_strict_authority` (a relaxed creation commit) | pass | **PASS** | – | 1,069 | 2,084 | 30 |
 | `MC_r25_unrowed_no_adopt` (the transfer before #169) | fail | **FAIL** | `R25_StrictNoDurableReread` | 302 | 624 | 17 |
@@ -1466,6 +1497,22 @@ same claims:
 - `a_recreated_source_store_adopts_from_capture_records`;
 - `a_clean_rerun_reuses_rowed_outputs_and_adopts_none`
   (`AdoptOnlyUnrowed`).
+
+**Group size (OI-1003-Q154 lever 3b, review 2026-10-15).** The engine's
+destination groups grew (a 250 ms idle and a 1 s age bound in place of a
+20 ms idle). `Commit` takes any nonempty set of ready seats at any step,
+so every close rule (idle, age, file and byte bounds, the stream's drain)
+picks one of the model's choices; timing is outside the model. Every other
+row has at most two seats, so `MC_r25_strict_three` checks groups of one,
+two and three under the strict reading with a crash between two runs (no
+source edit: with one per seat the search outgrew the budget, more than
+6.3 million distinct states after 7 minutes). An ad hoc action property,
+"no step moves all three seats from `ready` to `committed`", fails at that
+bound, so a three-seat group commit is reachable there (scratch module
+`Witness3.tla`, not a row; 622,609 distinct states when it fails). The
+code's side is the power-loss checker over the copy of
+`tests/power_loss.rs` at every destination group size of its tree, 1 to 7
+files (`BULKLOAD_FAULT_GROUP_DESTINATION`).
 
 ### What the #169 review changed
 
@@ -2964,6 +3011,135 @@ Git's killed child. Stated limit: a `git switch` reads its branch before
   bytes, no prefix; an index with no entries or the installed one) are
   the Rust rows'. An operator write while the first landing itself runs
   is not modelled.
+
+## Directory records (R-N102, OI-1003-Q143)
+
+`DirectoryRecords.tla` is a module of its own (as GitCarry is): the
+directory records' only coupling to the transfer is "an output commits
+inside a directory only after its rename is sealed", which it models as
+`ChildCommit`. Composing per-directory state into `BulkloadTransfer.tla`
+would multiply a state space already at its budget.
+
+**What it models.** Two siblings under the root and, with `Deep`, a child
+under each (a level with two parents). Each directory is created as
+`Destination::directory` and `Destination::create_directories` create one:
+a tagged `mkdirat`, its parent sealed, its record bound to the inode
+(`Record(S)`: one commit for a set under `BatchCreate`), an exclusive
+rename (a taken name: `EEXIST`, discarded record first, then the
+temporary), its parent sealed again; or, with `NoReplaceRename = FALSE`,
+R-N119's intent, a plain `mkdirat` at the final name, its parent sealed,
+the record bound. A directory is decided only after its parent
+(`CanDecide`: the root, a created or adopted directory, or a third party's
+directory at a refused name); deciding an existing directory sweeps it
+(records bound to a temporary cleared first, then the empty temporary
+removed and the directory sealed) and adopts it only when its record names
+its inode, sealing its parent first. Finishing is deepest first, mode then
+seal, then the completion (`Complete(S)`: every finished directory in one
+commit under `BatchFinish`). With `FoldFinish` (OI-1003-Q154 lever 3, the
+code since 2026-10-16) the finish rides the session's last output group:
+`Place(d)` is an output renamed into `d` whose group has not committed
+(`owed`), allowed while `d` is decided or already has its final mode set
+(the drain sets every final mode before that group's renames);
+`ChildCommit` commits what is owed, also inside a directory being
+finished (an earlier group still committing); and `GroupFinish(S)` is the
+last group's one commit, which commits every owed output and completes
+every directory being finished, each sealed (`SealDir`) after its mode was
+set. A finish that rides no group is `Complete`, after every output
+committed. The environment: `Stop` (the process dies;
+names stay), `PowerLoss` (each unsealed name kept or lost on its own, as a
+prefix of its mkdir and rename; each unsealed mode kept or lost; nothing
+inside a directory whose creation was lost), `EnvSeal(p)` (any other seal
+of `p`, or a journal force), `Foreign` and `ForeignReplace` (a third
+party's directory at a free name, taking any free inode number,
+`SYMMETRY InoSymmetry`).
+
+**Properties.** `RecordNamesDirectory` (a record bound to an inode names
+its directory under a durable name), `NoStrandedDirectory` (R-N102: a
+directory of ours durable at its final name, never completed, is bound by
+its record or an intent), `CompleteImpliesFinal`, `ChildImpliesNamed`,
+`NeverAdoptForeign`, `NoDirectoryUnderTemporary` (#217 review, finding 1:
+nothing of ours is durable inside a directory of ours whose final name is
+not), `CompletionAfterChildren` (OI-1003-Q154 lever 3: a completed
+directory owes no output of its run, so a completion never leaves an
+output inside its directory uncommitted). Witnesses: `Witness_PartialLevel` (one power loss keeps one sibling's
+rename and loses the other's, under one parent) and `Witness_AdoptBatched`
+(a directory bound in a shared commit is adopted after a crash).
+
+**Mutations** (each `MC_dir_neg_<mutation>`, which must violate its
+property): `record_before_seal` (`RecordNamesDirectory`),
+`rename_before_record` (`NoStrandedDirectory`), `child_before_dirseal`
+(`ChildImpliesNamed`), `complete_before_seal` (`CompleteImpliesFinal`),
+`level_seals_one_parent` (`RecordNamesDirectory`),
+`level_rename_seals_one_parent` (`ChildImpliesNamed`), `adopt_unbound`
+(`NeverAdoptForeign`), `discard_unlink_before_clear` (`NeverAdoptForeign`:
+the N3 hazard, a record bound to a freed inode number a third party's
+directory takes), `admit_under_held` (`NoDirectoryUnderTemporary`: the
+batch rule the #217 review refuted), `fold_leaves_owed`
+(`CompletionAfterChildren`: the last group's commit completes the
+directories and leaves the outputs placed inside them out of it),
+`fold_unsealed` (`CompleteImpliesFinal`: it completes a directory whose
+final mode the group's seal did not cover).
+
+**Abstraction map.** Files are `ChildCommit` only (and, with `FoldFinish`,
+`Place`: an output's own durability before its commit is
+`BulkloadTransfer`'s, and a crashed run's owed outputs are its adoption's). Store commits are
+atomic and durable on return. One device (the code fully flushes a parent
+off the store's device). A fallback directory may revert to a temporary
+name in `PowerLoss` (an over-approximation). On a file system with no
+exclusive rename the code first makes a temporary and fails its rename;
+that discard is the `EEXIST` one, so the fallback is modelled from its
+intent. A third party's directory never has mode 0700 (R-N119's accepted
+limit: a same-user empty 0700 directory made between an intent and its
+`mkdirat`). `Record(S)` commits any set of sealed directories, a superset
+of the code's one level. Liveness is not modelled.
+
+**Results** (`just tla-check` with every `MC_dir_` config; TLC 1.7.4,
+3 workers; sting, shared and loaded, so wall times are not of record;
+2026-10-16, after OI-1003-Q154 lever 3 added `FoldFinish`):
+
+| Config | Expect | Outcome | Violated | Distinct | Generated | Depth | Wall | RSS MiB |
+|---|---|---|---|---:|---:|---:|---:|---:|
+| `MC_dir_budget_selftest` | inconclusive | **INCONCLUSIVE** | WithinBudget | 6852 | 21238 | 12 | 6s | 1132 |
+| `MC_dir_per_dir` | pass | **PASS** | - | 306150 | 871198 | 47 | 138s | 1810 |
+| `MC_dir_batched` | pass | **PASS** | - | 581639 | 1692991 | 42 | 242s | 1834 |
+| `MC_dir_batched_crashes` | pass | **PASS** | - | 41224 | 125290 | 29 | 6s | 941 |
+| `MC_dir_foreign_replace` | pass | **PASS** | - | 26533 | 91040 | 25 | 5s | 810 |
+| `MC_dir_fallback` | pass | **PASS** | - | 91044 | 258046 | 39 | 33s | 1593 |
+| `MC_dir_fold` | pass | **PASS** | - | 1140105 | 5106949 | 50 | 358s | 1998 |
+| `MC_dir_fold_crashes` | pass | **PASS** | - | 77336 | 246204 | 32 | 9s | 1195 |
+| `MC_dir_reach_partial_level` | reach | **REACHED** | Witness_PartialLevel | 216 | 493 | 10 | 1s | 254 |
+| `MC_dir_reach_adopt_batched` | reach | **REACHED** | Witness_AdoptBatched | 504 | 1113 | 11 | 2s | 270 |
+| `MC_dir_neg_record_before_seal` | fail | **FAIL** | RecordNamesDirectory | 22 | 39 | 6 | 1s | 208 |
+| `MC_dir_neg_rename_before_record` | fail | **FAIL** | NoStrandedDirectory | 102 | 204 | 7 | 1s | 221 |
+| `MC_dir_neg_child_before_dirseal` | fail | **FAIL** | ChildImpliesNamed | 134 | 288 | 8 | 2s | 231 |
+| `MC_dir_neg_complete_before_seal` | fail | **FAIL** | CompleteImpliesFinal | 599 | 1505 | 13 | 1s | 325 |
+| `MC_dir_neg_level_seals_one_parent` | fail | **FAIL** | RecordNamesDirectory | 500 | 1199 | 11 | 2s | 339 |
+| `MC_dir_neg_level_rename_seals_one_parent` | fail | **FAIL** | ChildImpliesNamed | 703 | 1762 | 12 | 3s | 347 |
+| `MC_dir_neg_adopt_unbound` | fail | **FAIL** | NeverAdoptForeign | 86 | 201 | 6 | 1s | 224 |
+| `MC_dir_neg_discard_unlink_before_clear` | fail | **FAIL** | NeverAdoptForeign | 6895 | 19000 | 13 | 3s | 432 |
+| `MC_dir_neg_admit_under_held` | fail | **FAIL** | NoDirectoryUnderTemporary | 475 | 1171 | 11 | 2s | 379 |
+| `MC_dir_neg_fold_leaves_owed` | fail | **FAIL** | CompletionAfterChildren | 1080 | 2568 | 15 | 2s | 388 |
+| `MC_dir_neg_fold_unsealed` | fail | **FAIL** | CompleteImpliesFinal | 642 | 1551 | 13 | 1s | 325 |
+
+Total wall 1041 s for these rows with `MC_main`, `MC_r25_strict_three`,
+`MC_sq_rollback` and `MC_ec_refs` and each module's budget self-test
+(every row as expected), peak RSS 2027 MiB (sting, 2026-10-16). Every pass
+row's never-enabled set matched its `never` column. The exhaustive pass
+rows without `FoldFinish` explore the same distinct and generated states as
+before it (`MC_dir_per_dir` 306,150, `MC_dir_batched` 581,639,
+`MC_dir_batched_crashes` 41,224, `MC_dir_foreign_replace` 26,533,
+`MC_dir_fallback` 91,044). The reach and negative rows' counts are not
+comparable between runs: each stops at its first witness or violation with
+3 workers, so what it explores before then depends on the search order
+(`MC_dir_reach_partial_level` 304 then 216, `MC_dir_neg_rename_before_record`
+66 then 102). Grounding: 39 operators, 11 constants,
+11 mutations, 25 code symbols, all found. Extra, uncatalogued runs: of
+`MC_dir_batched`'s bound with two crashes (Deep, two runs,
+`MaxCrashes = 2`), 2026-10-08/09, without `FoldFinish`: PASS at 1,191,551
+distinct states in 4787 s; and of `MC_dir_batched`'s bound with `FoldFinish`
+(one third party, so `MC_dir_fold` plus `Foreign`), 2026-10-16: PASS at
+3,771,591 distinct states, depth 50, in 1784 s, every invariant but
+`WithinBudget`. Both are too long for the run order.
 
 ## Frozen names
 

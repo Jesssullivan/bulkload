@@ -5,6 +5,10 @@
 //!   default soft limit of 256 open files.
 //! - PR #59 round-2 review (N1): finishing more new directories than the soft
 //!   open-file limit must not run out of descriptors.
+//! - #217 review (OI-1003-Q143 item 2): a batch of new directories holds one
+//!   descriptor per distinct parent of a level; 64 siblings, each with a
+//!   child directory (so a second level with 64 parents) and files, copy
+//!   at the 256 limit, the batch cap sized from the descriptor budget.
 //!
 //! Its own test binary, because both rows lower the process-wide limit. They
 //! were one binary each (`fd_limit.rs`, `fd_limit_directories.rs`) until
@@ -101,4 +105,54 @@ fn more_new_directories_than_the_descriptor_limit_all_finish() {
         "{} directories left unfinished",
         modes.iter().filter(|mode| **mode != 0o755).count()
     );
+}
+
+#[test]
+fn sixty_four_sibling_directories_with_children_batch_under_a_256_limit() {
+    const SIBLINGS: usize = 64;
+    let _alone = LIMIT.lock().unwrap_or_else(PoisonError::into_inner);
+    let base = std::env::temp_dir().join(format!("bulkload-fd-batch-{}", std::process::id()));
+    let source = base.join("source");
+    let destination = base.join("destination");
+    std::fs::create_dir_all(&destination).unwrap();
+    for index in 0..SIBLINGS {
+        let directory = source.join(format!("s{index:02}"));
+        std::fs::create_dir_all(directory.join("child")).unwrap();
+        std::fs::write(directory.join("f"), [u8::try_from(index).unwrap(); 64]).unwrap();
+        std::fs::write(
+            directory.join("child/g"),
+            [u8::try_from(index).unwrap(); 96],
+        )
+        .unwrap();
+        std::fs::set_permissions(
+            directory.join("child"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let (_, hard) = descriptor_limit().unwrap();
+    set_soft_descriptor_limit(hard.min(256)).unwrap();
+    assert!(descriptor_limit().unwrap().0 <= 256);
+    let stats = copy(
+        &source,
+        &destination,
+        &base.join("source-state"),
+        &base.join("destination-state"),
+    )
+    .unwrap();
+    let finished = (0..SIBLINGS)
+        .filter(|index| {
+            let mode = |path: std::path::PathBuf| {
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            };
+            let directory = destination.join(format!("s{index:02}"));
+            mode(directory.clone()) == 0o755 && mode(directory.join("child")) == 0o750
+        })
+        .count();
+    let _ = std::fs::remove_dir_all(&base);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals.first());
+    assert_eq!(stats.completed, 2 * SIBLINGS as u64);
+    assert_eq!(stats.directories_renamed, 2 * SIBLINGS as u64);
+    assert_eq!(finished, SIBLINGS, "every directory finished");
 }

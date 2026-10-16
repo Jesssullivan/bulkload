@@ -1230,8 +1230,15 @@ fn a_stream_past_the_chunk_bound_ends_the_session() {
     let mut open = 0;
     assert_eq!(
         streaming
-            .accept(&target, &mut open, &header, b"x", false)
-            .unwrap_err(),
+            .accept(
+                &target,
+                &mut open,
+                &header,
+                (Payload::Wire(b"x".to_vec()), false),
+                |_| false,
+            )
+            .err()
+            .unwrap(),
         BulkloadRefusal::BudgetExceeded
     );
     assert_eq!(streaming.specs.len(), MAX_MANIFEST_CHUNKS);
@@ -1862,14 +1869,9 @@ fn a_source_read_never_follows_a_swapped_directory() {
         slot_budget: Arc::new(SlotBudget::new(0)),
     };
     let mut bytes_read = 0;
-    let refused = capture_file(
-        &work,
-        &row,
-        None,
-        &mut bytes_read,
-        &mut None,
-        |_, _, _, _| panic!("no chunk may be read through the symlink"),
-    )
+    let refused = capture_file(&work, &row, None, &mut bytes_read, &mut None, |_, _, _| {
+        panic!("no chunk may be read through the symlink")
+    })
     .map(|_| ())
     .unwrap_err();
     assert!(
@@ -1967,33 +1969,103 @@ fn walk_ahead_wait_is_accounted_apart_from_walk_work() {
 }
 
 /// S1 hand-offs (OI-1003-Q115): a copy that sends data moves the sending
-/// thread's handling timer and the receiving thread's read and verify
-/// timers, and the rendering names every hand-off timer. The counters are
+/// thread's handling timer and the receiving thread's read timer, and the
+/// rendering names every hand-off timer. Where the received bytes are
+/// verified depends on the arm (OI-1003-Q154 lever 1): with the loopback
+/// hand-off the destination takes the source's own BLAKE3, so the bytes are
+/// handed (`wire_handed_bytes`) and the verify timer need not move; with it
+/// off every byte is hashed again (`blake3_dest_wire_verify_bytes`) under a
+/// verify timer, inline or on a receive worker. The counters are
 /// process-wide and only grow, so other tests running at once cannot hide a
-/// timer this copy did not move.
+/// counter this copy did not move; for the same reason no arm asserts that
+/// the other arm's counter stayed still.
 #[test]
 fn a_copy_moves_the_hand_off_timers() {
+    use crate::counters::{Counter, Counters};
+    const SIZE: usize = 3 << 20;
+    for handoff in [true, false] {
+        let corpus = Corpus::new();
+        std::fs::write(corpus.base.join("source/f"), noise(7, SIZE)).unwrap();
+        let root = std::fs::canonicalize(corpus.base.join("destination")).unwrap();
+        set_loopback_handoff(&root, Some(handoff));
+        let before = TransferTiming::snapshot();
+        let counted_before = Counters::snapshot();
+        let stats = corpus.run();
+        set_loopback_handoff(&root, None);
+        let stats = stats.unwrap();
+        let counted = Counters::snapshot().since(counted_before);
+        let moved = TransferTiming::snapshot().since(before);
+        assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+        assert!(stats.bytes_received > 0);
+        assert!(moved.send_handle_ns > 0, "{}", moved.render());
+        assert!(moved.recv_read_ns > 0, "{}", moved.render());
+        assert!(
+            moved.recv_verify_ns <= moved.transfer_ns,
+            "{}",
+            moved.render()
+        );
+        let size = SIZE as u64;
+        if handoff {
+            assert!(
+                counted.get(Counter::WireHandedBytes) >= size,
+                "hand-off: {}",
+                counted.render()
+            );
+        } else {
+            assert!(
+                counted.get(Counter::HashWireVerify) >= size,
+                "plain: {}",
+                counted.render()
+            );
+            assert!(
+                moved.recv_verify_ns + moved.recv_worker_verify_ns > 0,
+                "plain: {}",
+                moved.render()
+            );
+        }
+        let rendered = moved.render();
+        for key in [
+            "send_wait_ns=",
+            "send_handle_ns=",
+            "recv_read_ns=",
+            "recv_settle_ns=",
+            "recv_verify_ns=",
+            "recv_worker_verify_ns=",
+        ] {
+            assert!(rendered.contains(key), "{rendered}");
+        }
+    }
+}
+
+/// S1 receiving-side timeline (OI-1003-Q119) and its drain and ramp
+/// (OI-1003-Q143 step 1a): a two-file copy moves setup, stream and tail, the
+/// final drain (the open group's commit, waited for in `settle_held`) and
+/// the first-data offset, and the rendering names each. The counters are
+/// process-wide and only grow, so other tests running at once cannot hide a
+/// timer this copy did not move; for the same reason no cross-timer bound is
+/// asserted here.
+#[test]
+fn a_copy_moves_the_timeline_timers() {
     let corpus = Corpus::new();
-    std::fs::write(corpus.base.join("source/f"), noise(7, 3 << 20)).unwrap();
+    std::fs::write(corpus.base.join("source/a"), noise(11, 2 << 20)).unwrap();
+    std::fs::write(corpus.base.join("source/b"), noise(12, 1 << 20)).unwrap();
     let before = TransferTiming::snapshot();
     let stats = corpus.run().unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
     assert!(stats.bytes_received > 0);
     let moved = TransferTiming::snapshot().since(before);
-    assert!(moved.send_handle_ns > 0, "{}", moved.render());
-    assert!(moved.recv_read_ns > 0, "{}", moved.render());
-    assert!(moved.recv_verify_ns > 0, "{}", moved.render());
-    assert!(
-        moved.recv_verify_ns <= moved.transfer_ns,
-        "{}",
-        moved.render()
-    );
+    assert!(moved.recv_setup_ns > 0, "{}", moved.render());
+    assert!(moved.recv_stream_ns > 0, "{}", moved.render());
+    assert!(moved.recv_tail_ns > 0, "{}", moved.render());
+    assert!(moved.recv_drain_ns > 0, "{}", moved.render());
+    assert!(moved.recv_first_data_ns > 0, "{}", moved.render());
     let rendered = moved.render();
     for key in [
-        "send_wait_ns=",
-        "send_handle_ns=",
-        "recv_read_ns=",
-        "recv_settle_ns=",
-        "recv_verify_ns=",
+        "recv_setup_ns=",
+        "recv_stream_ns=",
+        "recv_tail_ns=",
+        "recv_drain_ns=",
+        "recv_first_data_ns=",
     ] {
         assert!(rendered.contains(key), "{rendered}");
     }
@@ -2944,3 +3016,12 @@ fn a_recreated_source_store_adopts_from_capture_records() {
 // ---- WP0(g) (OI-1003-Q20, Q37, Q104): P79 RELAXED-LEDGER-LOSS --------------
 mod sqlite_carry;
 mod wp0g;
+
+// ---- S1 throughput (OI-1003-Q143 items 1 to 3, #217 review) ----------------
+mod throughput;
+
+// ---- S1 levers (OI-1003-Q154): verify once, the loosened loopback wire ------
+mod levers;
+
+// ---- S1 lever 3 (OI-1003-Q154): the directory finish in the last group ------
+mod fold;

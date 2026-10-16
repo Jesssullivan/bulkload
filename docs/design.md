@@ -244,6 +244,32 @@ Source safety (S2, WP1):
   counters line and the bench header record the class.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
+- No clone of a source file (OI-1003-Q165).
+  - A source file is read by `pread`, or by `read`/`splice` into a pipe.
+    It is never the input of a remap: `FICLONE`, `FICLONERANGE`,
+    `FIDEDUPERANGE`, `copy_file_range`, `clonefile` or `copyfile`.
+  - `std::fs::copy`, and `std::io::copy` between two regular files, are
+    remaps on Linux, because both use `copy_file_range`.
+  - A clone writes the source inode, with its reflink flag and extent
+    reference counts, and moves no `stat` field. Only `FIEMAP`'s
+    `SHARED` flag shows it.
+  - P84 SOURCE-NO-CLONE enforces the rule in two halves:
+    - a registry scan refuses every remap call in non-test code, and pins
+      each `fs::copy` and `io::copy` site with the reason its input is not a
+      source file;
+    - a kernel leg runs a real `copy`, `serve`, v1 Git capture and
+      `SQLite` snapshot on a reflink file system and requires every source
+      extent to stay unshared (`just p84-reflink` proves that it ran).
+  - `FIEMAP` shows sharing that exists when it looks, not a clone later
+    undone, and is trusted only on file systems that report it (xfs,
+    btrfs, bcachefs, ocfs2); the static half rules the call out.
+  - Three `std::fs::copy` calls are left, all on the destination side and
+    none with a source file as input. Two copy bulkload's own staged
+    capture bundle into its receipts. The third, estate converge's
+    `publish_index` (OI-1003-Q144), copies the landed checkout's
+    `.git/index`, which the operator's Git may have rewritten since
+    landing, to converge's private merged index beside it.
+  - `bulkload_agent::extents` is the read-only `FIEMAP` probe.
 - SQLite provider snapshots are S2's stated exceptions: one lock and two
   writes. Every source is read through the backup API from a read-only,
   WAL-aware connection; none is read `immutable=1`. All three are bounded
@@ -883,7 +909,16 @@ median (R-N57):
 
 - **(a) Loopback:** the native engine, running its full protocol over a local
   socket with no clone fast path, beats `rclone copy` as shipped on the same
-  corpus and volume.
+  corpus and volume. Since OI-1003-Q154 (levers 1 and 2) the loopback's two
+  halves are joined by an in-process hand-off: every control frame still
+  crosses the socket as a wire v6 frame, and every chunk's 64-byte data
+  header crosses it in v6's layout and stream order, but inside a handed
+  frame (tag 0xB1), which is no v6 frame; the chunk's bytes are handed over
+  in memory and hashed once, by the source (Wire v6, "Loopback hand-off").
+  Whether "its full protocol over a local socket" (R-N57) covers that is the
+  operator's to word; OI-1003-Q154 authorized the change. `BULKLOAD_LOOPBACK_HANDOFF=0` runs the
+  plain protocol for A/B. Gate (b) is unchanged: `pull` and `serve` never
+  hand anything over and the destination hashes every byte.
 - **(b) Cross-host:** a pull between two hosts beats rclone over sftp on the
   same corpus.
 
@@ -937,7 +972,13 @@ updated.
 Gated benchmark samples require AC power and a 1-minute load below 2.5,
 and each sample row records both. The coordinator keeps the other lanes
 quiet while gated samples run (R-N81, R-N91). The clone fast path never
-counts toward a gate (R-N57, R-N63).
+counts toward a gate (R-N57, R-N63). The clone lever is excluded
+(OI-1003-Q164, Q165): the engine has no clone path, and S2 forbids one on a
+source file (Live union, "No clone of a source file"). Every copy of the
+sealed corpus a sample reads is an explicit read and write, checked with
+`FIEMAP` before the sample. The bench rechecks its fixture after every arm,
+and a shared extent refuses the sample (docs/slo.md, the 2026-10-15
+amendment).
 
 S2's budget measured alongside a real run (#165, `s2_budget.py observe` and
 `alongside`; OI-1003-Q152 keeps the source live) is judged against the
@@ -1021,6 +1062,30 @@ miss (#87).
   capture was racy. The destination
   verifies every chunk against its digest, writes it at its offset, and checks
   coverage and the root before the output is queued for its group commit.
+  A local `copy`'s handed chunks are the one exception: the source's digest
+  of those very bytes is their verify ("Loopback hand-off" below).
+- **Loopback hand-off (local `copy` only, OI-1003-Q154 levers 1 and 2).**
+  `copy` runs both halves in one process, from one build, over a socket pair
+  it makes, and joins them with a hand-off queue (`transfer/handoff.rs`)
+  that only it can make: `serve`, `receive` and `pull` take none, and
+  neither half can be serialised, so nothing that arrives over a transport
+  can stand for one. The source moves each chunk's allocation into the
+  queue, then writes only its 64-byte data header on the socket under a
+  tag outside v6's (0xB1), so the frame keeps a data frame's place among
+  the control frames; the destination takes the chunk when it reads that
+  frame. A chunk can only be made by hashing its bytes, and its bytes sit
+  behind an immutable `Arc`, so a handed chunk whose digest is its frame's
+  is the very buffer the source hashed to it: the destination writes it
+  without hashing it again (verify once; `wire_handed_bytes` counts these
+  bytes, `blake3_dest_wire_verify_bytes` every other received byte, and
+  every received byte is in exactly one). Bytes read from any transport
+  are always hashed. A reader without the hand-off, and the proto codec,
+  refuse a handed frame `FRAME_CODEC`. The source also batches its frames
+  until it is about to wait for an event, and both halves read the socket
+  through a 64 KiB buffer. Credit, the windows, every check of a frame's
+  index, offset, size and manifest, and every durable step are unchanged;
+  crash adoption (#169) and local reuse still hash the destination's own
+  bytes. `BULKLOAD_LOOPBACK_HANDOFF=0` turns all of it off.
 - **WantManifest.** Chosen only when the destination could fill chunks
   itself: the output path already exists (adopt, supersede or refuse; see
   Durability), or published outputs hold chunks (resume, incremental). The source sends `Manifest`, from
@@ -1289,6 +1354,232 @@ than the state store's is fully flushed. Then one `SQLite` WAL commit
 flush drains the store's own device. A group whose files share the store's
 device therefore needs no other device-cache flush. `--durability=strict`
 fully flushes every file instead, for comparison.
+
+A destination group closes at its file or byte bound, when the stream
+drains, after 250 ms with no new output, or 1 s after its first output
+(OI-1003-Q154 lever 3, fewer synced commits; the idle was 20 ms, and
+`BULKLOAD_DEST_GROUP_IDLE_MS` sets it for A/B). With the 20 ms idle a local
+copy of corpus v1 committed 10 to 18 destination groups on the rig; with
+250 ms it is expected to commit once or twice there, as it did in sting's
+informational census (1 destination group commit against 3 to 5,
+2026-10-15, not of record), until the rig series measures it. Each group still
+seals before its one FULL commit and every `Held` still follows that commit
+(R25: `BulkloadTransfer.tla`'s `Commit` takes any nonempty set of ready
+seats, so a larger group is a behaviour the model already checks), and the
+most a crash leaves unrecorded is still one group within the same bounds;
+#169's adoption recovers it without a source read. No commit is relaxed:
+WP0(g) relaxes only the source ledger's rows, as before.
+
+A new store is created directly in WAL mode (OI-1003-Q154 lever 3): before
+`SQLite` opens the new file, the engine writes page 1 of an empty WAL-mode
+database (byte for byte `SQLite`'s own) and seals it, so no
+rollback-journal commit switches it to WAL. Before, that commit synced a
+`-journal` twice and the database once per store: plain `fsync`s on every
+platform, since `fullfsync` is set only after the switch. The seal is one
+`fsync` on Linux and one `F_BARRIERFSYNC` on Darwin (never `F_FULLFSYNC`,
+which would add a device-cache flush the old path never paid); the store's
+root seal and its first commit drain the device after it, so the page is on
+stable media no later than the store's first WAL frame, which a WAL needs.
+That ordering rests on this argument alone: the template's write and seal
+are the database file's own I/O, outside the R-N88 trace, so no power-loss
+proof explores them on either platform, and the Darwin seal is compiled
+and tested (`just darwin-check`) but not measured on APFS.
+`BULKLOAD_STORE_WAL_TEMPLATE=0` restores `SQLite`'s own switch for A/B
+(`store_wal_templates` counts the stores made from the template). A crash
+inside that write leaves at most one page of zeros and template bytes with
+no `-wal`; the next open writes it again. A short or torn main file beside
+a `-wal` is a store, never touched.
+
+On Linux in group mode, a group of two or more outputs is sealed
+device-wide instead (S1, OI-1003-Q107; `io::durable::batched`). Each output
+starts write-back as it is queued (`sync_file_range(WRITE)`, not a
+durability step). The group then runs one device seal per device number its
+files live on (`syncfs` through that file's parent directory, opened again
+for the seal, then `fsync` of one of those files), which makes
+every temporary's data durable under its temporary name; renames each into
+place; runs one device seal per touched device number again (`syncfs`, then
+`fsync` of one touched directory), which makes the new entries durable; and
+only then commits its records. No rename precedes the first seal, so no
+power loss can keep a name whose data it lost. `syncfs` also flushes
+whatever else is dirty on that file system, which is why a single-file group
+keeps the per-file path.
+
+Device numbers are `st_dev`, and each btrfs subvolume has its own, though
+one `syncfs` commits the transaction of the whole file system. A group
+spread over N subvolumes of one btrfs therefore runs N seals per step, each
+a full transaction commit. Durability is unaffected, but the S1 gain is
+unmeasured there and may be lost or reversed; no gain is claimed for a
+multi-subvolume btrfs destination (#210 review; deduplication by the
+file system's UUID is a follow-up).
+
+`syncfs` is not in general as strong as the flushes it replaces, so four
+conditions bound the batched path (OI-1003-Q107 review, 2026-10-08):
+
+- **File system allowlist** (`io::durable::syncfs_seals`). A group is batched
+  only when every device its files and their directories live on is ext4
+  (or ext3, which the ext4 driver serves), xfs, btrfs or tmpfs, read with
+  `fstatfs` on every file and directory for every group (nothing is cached
+  by device number, which an unmount can hand to another file system); the
+  ext magic also needs the mount's type in `/proc/self/mountinfo` to be
+  `ext4` or `ext3`, because the ext2 driver shares it and its `syncfs` sends
+  no device-cache flush. An xfs file flagged `FS_XFLAG_REALTIME` keeps its
+  group on the per-file path: its data is on the realtime device, which the
+  log force never flushes.
+  Any other file system keeps the per-file path: on FUSE other than
+  virtiofs `syncfs` never reaches the daemon, CIFS/SMB and NFS do not flush
+  at the server, vfat and exFAT send no device-cache flush, overlayfs does
+  not report the upper layer's write-back errors, and f2fs's `syncfs` returns
+  0 without a checkpoint when checkpointing is disabled. On the allowlisted
+  file systems `syncfs` writes every file's data and entries (tmpfs has
+  nothing to make durable; its `fsync` is a no-op too), but even there it
+  is not as strong as `fsync` on its own: see the next condition.
+- **The seal's own `fsync`.** On xfs, `xfs_fs_sync_fs` only forces the log,
+  and with an idle log that force returns 0 without any I/O
+  (`xfs_log_force`, v6.12), so data written back in place with no log
+  write after it, typical of a group of adopted outputs only, can stay in
+  the drive's volatile cache; `xfs_file_fsync` sends the flush itself when
+  its log force was a no-op. On ext4 after a forced shutdown, `ext4_sync_fs`
+  returns 0 (v5.17 and v6.12) where `ext4_sync_file` returns `EIO`. Each
+  device seal therefore ends with an `fsync` of one member file (or, in the
+  second step, the touched directory), which covers both, at the cost of one
+  extra (usually empty) cache flush per device per step.
+- **Each file's own write-back error.** `syncfs` reports a write-back error
+  against the cursor of the one descriptor it is called on, so an error an
+  earlier `syncfs` elsewhere already consumed is not reported again. After
+  the first `syncfs`, every file of the group is checked with
+  `sync_file_range(WAIT_BEFORE | WRITE | WAIT_AFTER)`, which returns that
+  file's own write-back error against its own descriptor's cursor, as its
+  `fsync` would, and flushes no cache. One failure refuses the whole group
+  before any rename. The `syncfs` itself runs on a directory descriptor the
+  seal opens for it, whose cursor starts at the superblock's current
+  error: a long-lived descriptor (a staged temporary, a destination
+  directory) would report an error raised since its open, by one bad file
+  or another process on a shared file system, again for every later group
+  whose seal ran on another such descriptor, refusing healthy groups (S1
+  stack review, 2026-10-15). The file system's own `->sync_fs` failure is
+  returned whatever the cursor.
+- **Kernel floor: Linux 5.17-rc3** (OI-1003-Q113 set 5.8; OI-1003-Q141, ruled
+  2026-10-08, moved it to 5.17, on the two commits below). 5.8 made `syncfs` report data write-back errors, but
+  until torvalds/linux commit 5679897eb104 ("vfs: make sync_filesystem
+  return errors from ->sync_fs") `sync_filesystem` discarded the file
+  system's own `->sync_fs` failure (journal commit, cache flush), and until
+  2d86293c7075 ("xfs: return errors in xfs_fs_sync_fs") xfs ignored its own
+  log force's failure. Both are first in v5.17-rc3, neither is in rc2, and
+  both are in v5.17 (checked against the upstream tree 2026-10-08). An older
+  kernel, a 5.17 rc1 or rc2, or one whose release cannot be read, keeps the
+  per-file path; a backport in a distribution kernel below 5.17 is not
+  detected.
+
+A touched directory whose `fstat` fails has no device to seal device-wide;
+a batched group seals it with its own directory flush. Darwin is unchanged.
+A superseding
+output (WP0(d), below) joins the first `syncfs` like any staged file, so its
+data is durable before its intent is recorded and before its
+`RENAME_EXCHANGE`, and the second `syncfs` makes the exchanged entry durable
+before the commit that settles the intent.
+
+Write-back while the data streams (S1, OI-1003-Q143 item 1a, extending
+OI-1003-Q107). On Linux in group mode, an entry's staged file is kicked into
+write-back (`sync_file_range(WRITE)`, `io::durable::kick_writeback`) each
+time its placed bytes cross a multiple of 8 MiB: in the stream, and once
+right after a manifest's local fill, before `NeedChunks` goes out, so a
+delta's locally filled bytes are written back while the source captures the
+rest. A kick makes nothing durable, never moves a descriptor's errseq cursor
+(no `WAIT_AFTER`), and leaves every seal above unchanged; an error a kick
+returns refuses its entry (a full device as `DESTINATION_SPACE_INSUFFICIENT`).
+Each is counted (`writeback_kicks`). Strict mode and Darwin do not kick.
+
+Receive workers (S1, OI-1003-Q143 item 3). The destination verifies each
+data frame against its digest and writes it on a small pool of worker
+threads (`BULKLOAD_RECV_WORKERS`, default 2, at most the spare cores; 0 is
+the inline path). Every protocol decision stays on the receiving thread, in
+stream order: the credit check, the index, offset, size and manifest checks,
+the stage, `End`, `publish` and `Held`. Within one chunk the refusal order is
+fixed (its verify or size, then the stage, then the write, then the kick),
+the least chunk index wins, and the chunk that stages a streamed file is
+verified on the receiving thread first, so a corrupt first chunk stages
+nothing: the refusal is the inline path's. An entry's `End` waits for all
+its writes before the file is checked, published or discarded, so every
+write precedes its file's seal. The workers hold at most 8 MiB, each job
+charged at least 4 KiB; a worker that panics answers its job as lost and the
+session ends `WORKER_LOST`.
+
+Directory batching (S1, OI-1003-Q143 item 2, R-N102). New directories are
+created a level at a time: a tagged `mkdirat` each, one seal per distinct
+parent, one store commit binding every record of the level, an exclusive
+rename each, one seal per distinct parent again; finishing applies and seals
+every final mode deepest first, then completes them all in one commit. Each
+directory keeps its own order (entry sealed before its record, record
+before its name, name sealed before anything inside it is decided, mode
+sealed before its completion), so each recovers on its own, whatever the
+others' state. The walk is depth-first, so batching siblings defers their
+decisions: from the first new directory on, every walk frame is held, in
+stream order, until `WalkDone`, 64 members (fewer under a small descriptor
+budget: a level holds one descriptor per distinct parent) or 256 held
+frames, then the batch is created and every held frame decided as it would
+have been. A directory joins only when its parent is the root, a member or
+a directory decided before; one under a held, undecided directory (an
+existing one, whose sweep and adoption seal must come first) closes the
+batch before it is looked at, and so does a directory whose path the batch
+already holds (a source offering it twice), so no two members share a
+record's key. A member refused at its rename (a third party's directory
+appeared there) leaves its children to be decided against the file system,
+as without batching. A discarded creation clears its record before its
+temporary goes (#74 N3), a level whose shared seal or commit failed
+included (its commit may have reached the log although it reported a
+failure), and every clear is traced apart from a completion
+(`DirectoryCleared`). `docs/formal/DirectoryRecords.tla` checks
+the records under per-name power loss, journal seals and reused inode
+numbers (README, "Directory records").
+
+The finish rides the session's last output group (OI-1003-Q154 lever 3;
+the SOTA study's lever 2, R-N102's finish commit unit; built 2026-10-16).
+When the stream drains (every entry offered and ended), the receiving side
+sets every final mode, deepest first, checking each directory's identity
+as the finish does, and hands the directories to the committer with that
+last group. The group renames its outputs, seals them together with the
+directories (the device seal of a batched group covers every directory's
+mode on its device; otherwise each directory joins the touched set and is
+sealed, and fully flushed off the store's device, as the finish seals it),
+and its one FULL commit records the outputs and completes the directories:
+no seal of each directory and no completion commit of its own. On corpus v1
+that removes four directory seals and one FULL commit from the tail
+(expected on the rig, not measured there: `sqlite_directory_complete_commits`
+1 to 0, `flush_dir_barrier_count` 8 to 4, `directories_folded` 0 to 4). The
+order per directory is the finish's: final mode set, then sealed, then
+completed. It folds only when nothing after that group can refuse: nothing
+refused so far on either side (the committer checks every outcome it has
+reported), no `SQLite` sidecar without its snapshot base, no salvaged
+temporary left to retire, batching on and at most a batch of directories
+(each held open into the group), and no final mode that takes away this
+user's read, write or search permission (the group's renames need write and
+search; the separate finish after a group that carried nothing, and the
+next run's adoption after a group that refused, open each directory
+read-only and the adoption lists it, which needs read). A group that
+refused an output, or whose seal or commit fails, completes nothing, and
+the session leaves every directory unfinished, as a session that refuses
+does; the final modes it set stay (owner read, write and search by
+construction), and the next run adopts each directory by its record,
+which names that mode. A drain whose group is
+already empty (the last output closed it at a file or byte bound, or an
+idle or age bound closed it first) drops the finish, which then runs as
+before over the modes already set. `BULKLOAD_DIRECTORY_FOLD=0`
+restores the separate finish for A/B; `directories_folded` counts the
+directories finished in a group. The model is `DirectoryRecords.tla`'s
+`Place` and `GroupFinish` with `CompletionAfterChildren` (a completed
+directory owes no output of its run); the power-loss proof is
+`every_power_loss_state_of_a_folded_finish_is_explored`, in group and
+strict mode, with the final modes moved after the seals as its teeth.
+The pending side cannot fold: a directory's record must be durable before
+its name (R-N102), and its name before anything inside it is decided, so
+that commit is the session's first durable step and has no output group to
+ride.
+
+The two stores are opened at once (S1, OI-1003-Q143 item 1b): the
+destination sends `Open`, with its whole credit window, before it opens its
+own store, so the source opens its store meanwhile. Every overlap of a state
+root with the other state root or either root is refused before either store
+exists.
 
 The source ledger's rows are the one exception (WP0(g): OI-1003-Q20,
 adopted with conditions by OI-1003-Q37, built 2026-10-07 on OI-1003-Q104).

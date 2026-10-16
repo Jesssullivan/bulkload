@@ -65,6 +65,7 @@ pub mod closure;
 pub mod counters;
 pub mod disposition;
 pub mod estate;
+pub mod extents;
 #[cfg(feature = "fault-injection")]
 pub mod fault;
 pub mod freshness;

@@ -12,13 +12,40 @@
 //!   signature), and the background `IOPOL_THROTTLE` policy and `QoS` class;
 //! - `sys_linux.rs`: `fdatasync`, `fsync`, `renameat2(RENAME_NOREPLACE)` and
 //!   `(RENAME_EXCHANGE)`,
-//!   `fsetxattr`/`fgetxattr` and the idle `ioprio_set` class;
+//!   `fsetxattr`/`fgetxattr`, the idle `ioprio_set` class and the read-only
+//!   `FS_IOC_FIEMAP` probe (`extent_sharing`, OI-1003-Q165);
 //! - `buf.rs`: the aligned slab allocation.
 //!
 //! The platform file is mounted as [`sys`]; `sys_posix` is re-exported through
 //! it, so callers name one module on both platforms. There is no `mmap`
 //! anywhere: a live writer truncating a source file would turn a mapped read
 //! into `SIGBUS`, where `pread` returns a short count.
+//!
+//! # Source access never clones (S2, OI-1003-Q165)
+//!
+//! A source file is read with `pread` (`sys::pread_full`), or by `read` and
+//! `splice` into a pipe (the raw-tree capture streams a seat into `git
+//! fast-import`'s stdin with `std::io::copy`, whose Linux fast path for a
+//! pipe writer is `splice`). It is never the input of a remap call:
+//! `FICLONE`, `FICLONERANGE`, `FIDEDUPERANGE`, `copy_file_range`,
+//! `clonefile`/`fclonefileat` or `copyfile`/`fcopyfile`. A remap of a source
+//! writes the source inode (its reflink flag and its extents' reference
+//! counts) while every `stat` field stays the same, so no `lstat` census sees
+//! it. `std::fs::copy` is a remap on Linux (it uses `copy_file_range`, which
+//! a reflink file system serves as a clone), and so is `std::io::copy`
+//! between two regular files. `sendfile` and `splice` only read the source,
+//! and are allowed.
+//!
+//! P84 SOURCE-NO-CLONE (`tests/source_command_registry.rs`) holds every crate
+//! to this: no non-test code names a remap call, and every `std::fs::copy`
+//! and `std::io::copy` is a registered site whose input is argued not to be a
+//! source file. The three `std::fs::copy` sites are all on the destination
+//! side: two copy bulkload's own staged capture bundle into its own receipt,
+//! and estate converge copies the landed checkout's `.git/index` (which the
+//! operator's Git may have rewritten since landing) to its private merged
+//! index beside it. `sys::extent_sharing` (`FIEMAP`, read-only)
+//! is the observation: [`crate::extents`] and P84's kernel leg in
+//! `tests/source_lock_trace.rs`.
 //!
 //! The destination's materializer (`materialize.rs`), the source pack writes
 //! and the counted syncs (`counters.rs`) all go through `sys`, so the R-N88
