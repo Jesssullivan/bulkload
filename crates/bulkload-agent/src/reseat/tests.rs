@@ -426,7 +426,8 @@ fn a_destination_resume_hands_the_session_over() {
 }
 
 /// A symlink at the transcript's place, or a symlinked key directory, is
-/// never written through.
+/// never written through (with regularization off: OI-1003-Q198 (2)
+/// replaces a symlinked transcript first, `findings::q198`).
 #[test]
 fn symlinks_at_the_destination_are_occupied() {
     let _serial = SERIAL
@@ -455,7 +456,9 @@ fn symlinks_at_the_destination_are_occupied() {
         world.dest(&format!("projects/{other_key}")),
     )
     .unwrap();
-    let (summary, lines, _) = run(&world.options());
+    let mut options = world.options();
+    options.regularize = false;
+    let (summary, lines, _) = run(&options);
     assert_eq!(summary.sessions_of("claude", "occupied"), 2, "{lines:?}");
     assert_eq!(
         fs::read(world.base.join("archived.jsonl")).unwrap(),
@@ -516,8 +519,8 @@ fn lanes_map_report_and_hash() {
     let world = World::new();
     world.land(
         SID,
-        "/private/tmp/scratch",
-        &transcript(SID, "/private/tmp/scratch", "s", 2),
+        "/opt/scratch",
+        &transcript(SID, "/opt/scratch", "s", 2),
     );
     let path =
         world.landed("projects/-Users-jess-git-wrong/88888888-8888-4888-8888-888888888888.jsonl");
@@ -574,7 +577,7 @@ fn lanes_map_report_and_hash() {
     let (summary, _, _) = run(&options);
     assert_eq!(summary.sessions_of("claude", "placed"), 1);
     assert!(world
-        .dest(&format!("projects/-private-tmp-scratch/{SID}.jsonl"))
+        .dest(&format!("projects/-opt-scratch/{SID}.jsonl"))
         .is_file());
 }
 

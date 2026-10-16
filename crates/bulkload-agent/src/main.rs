@@ -168,7 +168,8 @@ SUBCOMMANDS:
                   [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
-                  [--managed-settings FILE]...
+                  [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
+                  [--no-respell] [--no-regularize] [--undo]
                   [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
                 R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
                 .claude and .codex, the run's copy of SOURCE_HOME's) into
@@ -186,8 +187,25 @@ SUBCOMMANDS:
                 plain file) and their thread rows are inserted into its
                 state_5.sqlite with the destination cwd (insert only; a row
                 the destination already holds is never changed). A rollout
-                with no snapshot row is placed and reported
-                (RESEAT_INDEX_ROW_ABSENT). JSON Lines are placed and extended
+                with no snapshot row is placed with a row built from its
+                header (OI-1003-Q198 D; RESEAT_INDEX_ROW_ABSENT when it cannot
+                fill one); a destination row or rollout form for a thread is
+                the destination's (RESEAT_INDEX_CONFLICT, nothing placed),
+                except that an existing row whose cwd only spells the lane
+                differently (through the ~/git symlink) gets its cwd column
+                re-spelled to the canonical path, ledgered (OI-1003-Q198 (1);
+                --no-respell). Symlinked destination transcripts
+                (projects/*/*.jsonl) are first regularized into regular-file
+                copies of their targets with the targets' mtime, the targets
+                kept, ledgered (OI-1003-Q198 (2); --no-regularize). --undo
+                puts back every symlink and old cwd this STATE changed, where
+                the destination still holds exactly what re-seat wrote. Home
+                and /private/tmp (and /tmp) sessions are placed resumable by
+                ID (OI-1003-Q198 C; --by-id DIR adds a prefix,
+                --no-default-by-id drops the defaults). One run at a time:
+                each destination root and STATE are flocked (RESEAT_LOCKED);
+                the engine's --min-free-percent floor holds for the bytes a
+                pass would write (DESTINATION_SPACE_INSUFFICIENT). JSON Lines are placed and extended
                 in whole lines only. Never overwrites: a copy already there is
                 adopted when equal, extended when a byte prefix (append-only
                 files), and otherwise kept and reported (RESEAT_DEST_DIVERGED);
@@ -1237,6 +1255,8 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut margin = None;
     let mut managed = Vec::new();
     let (mut claude, mut codex) = (true, true);
+    let (mut undo, mut respell, mut regularize, mut default_by_id) = (false, true, true, true);
+    let mut by_id = Vec::new();
     let mut at = 0;
     let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
     while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
@@ -1247,6 +1267,10 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             "--sessions-only" => sessions_only = true,
             "--no-claude" => claude = false,
             "--no-codex" => codex = false,
+            "--undo" => undo = true,
+            "--no-respell" => respell = false,
+            "--no-regularize" => regularize = false,
+            "--no-default-by-id" => default_by_id = false,
             "--unmapped=report" => unmapped = Unmapped::Report,
             "--unmapped=by-id" => unmapped = Unmapped::ById,
             "--map" => {
@@ -1268,6 +1292,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             | "--landing-claude"
             | "--landing-codex"
             | "--managed-settings"
+            | "--by-id"
             | "--waive-from" => {
                 let path = PathBuf::from(value(at + 1)?);
                 match arg {
@@ -1277,6 +1302,12 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
                     "--codex-source-root" => roots.push(path),
                     "--landing-claude" => landing_claude = Some(path),
                     "--managed-settings" => managed.push(path),
+                    "--by-id" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        by_id.push(path);
+                    }
                     "--waive-from" => {
                         let text = std::fs::read_to_string(&path)
                             .refuse_at("main::reseat_command::waive_from")?;
@@ -1378,6 +1409,13 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     if !managed.is_empty() {
         options.managed_settings = managed;
     }
+    if !default_by_id {
+        options.by_id_exact.clear();
+        options.by_id_prefixes.clear();
+    }
+    options.by_id_prefixes.extend(by_id);
+    options.respell_cwd = respell;
+    options.regularize = regularize;
     options.git = match (plan, corpus, source) {
         (Some(plan), Some(corpus), Some(source)) => Some(GitCheck {
             plan,
@@ -1390,7 +1428,12 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     };
     let mut output = std::io::stdout().lock();
     let mut emit = |line: &str| writeln!(output, "{line}").refuse_at("main::reseat_command");
-    if check {
+    if check && undo {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    if undo {
+        reseat::undo(&options, &mut emit).map(drop)?;
+    } else if check {
         reseat::check(&options, &mut emit)?.verdict()?;
     } else {
         reseat::reseat(&options, &mut emit).map(drop)?;

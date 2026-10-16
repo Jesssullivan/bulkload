@@ -33,6 +33,26 @@
 //! ([`ledger`]), so an unchanged rerun reads 0 landed bytes (S3) and a
 //! later pass extends what grew. `--check` is the read-only R0 acceptance
 //! check ([`check`]).
+//!
+//! One run at a time: a pass holds an exclusive `flock` on each
+//! destination agent root it writes (the `.claude` and `.codex`
+//! directories themselves, so nothing is added to them) and on
+//! `STATE/reseat.lock`; another run refuses `RESEAT_LOCKED` before writing
+//! (re-review of `8a89f9a`). Before anything is written it checks the
+//! engine's free-space floor (`--min-free-percent`,
+//! `DESTINATION_SPACE_INSUFFICIENT`) against the bytes it would write on
+//! each destination file system (decompressed `.zst` sizes included).
+//!
+//! The operator's rulings of 2026-10-16 (OI-1003-Q198, Linear TIN-6587):
+//! sessions resume at the lane's `~/git/<name>` (A, the default lane);
+//! gftb and `GloriousFlywheel` lanes follow sting's existing `~/git` links to
+//! their estate paths (B, `realpath`); home and `/private/tmp` sessions are
+//! placed resumable by ID and waived from the per-lane check (C); rowless
+//! rollouts get a row from their header (D, [`codex`]); `.zst` rollouts are
+//! placed decompressed (E). Existing Codex rows spelled through `~/git` get
+//! only their `cwd` re-spelled ([`codex`]), and sting's symlinked
+//! transcripts are regularized into regular files ([`regularize`]); both
+//! are ledgered and reversed by `--undo` ([`undo`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -47,6 +67,7 @@ pub mod json;
 pub mod key;
 pub mod ledger;
 pub mod place;
+pub mod regularize;
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -79,6 +100,9 @@ pub enum Kind {
     Memory,
     /// A Codex rollout.
     Rollout,
+    /// Anything else under a project key that is no session's (`drafts/`,
+    /// `vercel-plugin/`, an orphaned sidecar directory).
+    Extra,
 }
 
 impl Kind {
@@ -92,6 +116,7 @@ impl Kind {
             Self::Plan => "plan",
             Self::Memory => "memory",
             Self::Rollout => "rollout",
+            Self::Extra => "extra",
         }
     }
 
@@ -107,6 +132,7 @@ impl Kind {
             "plan" => Self::Plan,
             "memory" => Self::Memory,
             "rollout" => Self::Rollout,
+            "extra" => Self::Extra,
             _ => return Err(BulkloadRefusal::SchemaMismatch),
         })
     }
@@ -135,6 +161,7 @@ pub struct GitCheck {
 
 /// One `estate-reseat` run's inputs.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // one per CLI switch
 pub struct Options {
     /// The source host's home (`/Users/jess`): lanes map from paths under it.
     pub source_home: PathBuf,
@@ -176,6 +203,21 @@ pub struct Options {
     pub managed_settings: Vec<PathBuf>,
     /// Now, nanoseconds since the epoch (retention).
     pub now_ns: i64,
+    /// Working directories whose sessions are placed resumable by ID and
+    /// waived from the per-lane check (OI-1003-Q198 C): exactly these.
+    pub by_id_exact: Vec<PathBuf>,
+    /// … and anything under these.
+    pub by_id_prefixes: Vec<PathBuf>,
+    /// Re-spell existing destination Codex rows whose `cwd` is a
+    /// non-canonical spelling of their lane (OI-1003-Q198 (1);
+    /// `--no-respell` turns it off).
+    pub respell_cwd: bool,
+    /// Regularize the destination's symlinked transcripts (OI-1003-Q198
+    /// (2); `--no-regularize` turns it off).
+    pub regularize: bool,
+    /// The free-space floor, percent of each destination file system
+    /// (`--min-free-percent`; the engine's rule).
+    pub min_free_percent: u8,
 }
 
 /// The default `--retention-margin-days`.
@@ -218,9 +260,43 @@ impl Options {
             retention_margin_days: RETENTION_MARGIN_DAYS,
             managed_settings: managed_settings(),
             now_ns: now_ns(),
+            by_id_exact: vec![source_home.to_path_buf()],
+            by_id_prefixes: BY_ID_PREFIXES.iter().map(PathBuf::from).collect(),
+            respell_cwd: true,
+            regularize: true,
+            min_free_percent: crate::space::min_free_percent(),
         }
     }
+
+    /// Whether a session recorded in `cwd` that has no lane is placed
+    /// resumable by ID: `--unmapped=by-id`, the source home itself, or a
+    /// path under a by-ID prefix (`/private/tmp`, `/tmp`; OI-1003-Q198 C).
+    #[must_use]
+    pub fn by_id(&self, cwd: &str) -> bool {
+        let cwd = Path::new(cwd);
+        self.unmapped == Unmapped::ById
+            || self.by_id_exact.iter().any(|exact| exact == cwd)
+            || self
+                .by_id_prefixes
+                .iter()
+                .any(|prefix| cwd.starts_with(prefix))
+    }
+
+    /// Whether `cwd` is one the rulings place by ID and waive from the
+    /// per-lane check (not `--unmapped=by-id` alone).
+    #[must_use]
+    pub fn waived_by_rule(&self, cwd: &str) -> bool {
+        let cwd = Path::new(cwd);
+        self.by_id_exact.iter().any(|exact| exact == cwd)
+            || self
+                .by_id_prefixes
+                .iter()
+                .any(|prefix| cwd.starts_with(prefix))
+    }
 }
+
+/// The default by-ID prefixes (OI-1003-Q198 C): neo's scratch directories.
+pub const BY_ID_PREFIXES: [&str; 2] = ["/private/tmp", "/tmp"];
 
 /// Now, nanoseconds since the epoch.
 #[must_use]
@@ -394,20 +470,110 @@ fn root(path: &Path) -> Result<PathBuf> {
     std::fs::canonicalize(path).refuse_at("reseat::root")
 }
 
+/// Exclusive `flock`s held for one run; released when dropped.
+struct Held(Vec<std::fs::File>);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for file in &self.0 {
+            let _ = crate::io::sys::flock_unlock(file);
+        }
+    }
+}
+
+fn locked(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
+    if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        BulkloadRefusal::ReseatLocked
+    } else {
+        crate::refuse::io(error, site)
+    }
+}
+
+/// Take an exclusive `flock` on the destination agent root `path` (the
+/// directory itself, through its real path), when it exists.
+fn lock_root(held: &mut Held, path: &Path) -> Result<()> {
+    let Ok(real) = std::fs::canonicalize(path) else {
+        return Ok(());
+    };
+    let directory = place::open_dir(&real)?;
+    crate::io::sys::flock_exclusive(&directory)
+        .map_err(|error| locked(&error, "reseat::lock_root"))?;
+    held.0.push(directory);
+    Ok(())
+}
+
+/// Take an exclusive `flock` on `STATE/reseat.lock`, creating STATE.
+fn lock_state(held: &mut Held, state: &Path) -> Result<()> {
+    use crate::refuse::RefuseAt as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    match std::fs::DirBuilder::new().mode(0o700).create(state) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).refuse_at("reseat::lock_state"),
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(state.join(LOCK))
+        .refuse_at("reseat::lock_state")?;
+    crate::io::sys::flock_exclusive(&file).map_err(|error| locked(&error, "reseat::lock_state"))?;
+    held.0.push(file);
+    Ok(())
+}
+
+/// The lock file in STATE.
+pub const LOCK: &str = "reseat.lock";
+
+/// Refuse `DESTINATION_SPACE_INSUFFICIENT` unless each destination file
+/// system keeps the floor after the bytes planned for it (the engine's
+/// rule, `--min-free-percent`).
+fn space(options: &Options, wants: &[(&Path, u64)]) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut by_device: BTreeMap<u64, (PathBuf, u64)> = BTreeMap::new();
+    for (path, bytes) in wants {
+        if *bytes == 0 {
+            continue;
+        }
+        let existing = crate::space::existing_ancestor(path)?;
+        let device = std::fs::metadata(&existing)
+            .map_err(|error| crate::refuse::io(&error, "reseat::space"))?
+            .dev();
+        let entry = by_device.entry(device).or_insert((existing, 0));
+        entry.1 = entry.1.saturating_add(*bytes);
+    }
+    for (path, bytes) in by_device.values() {
+        crate::space::check(*bytes, crate::space::probe(path)?, options.min_free_percent)?;
+    }
+    Ok(())
+}
+
 /// Re-seat the landed sessions into the destination's live agent state:
 /// one JSON line per tool, per session and per thread, handed to `line`,
 /// then the summary line.
 ///
 /// # Errors
-/// Before anything is written: `RESEAT_LANDING_ABSENT` when a landed tree
+/// Before anything is written: `RESEAT_LOCKED` when another run holds a
+/// destination root or STATE, `RESEAT_LANDING_ABSENT` when a landed tree
 /// the run covers is absent, `RESEAT_RETENTION_UNSAFE` when the
 /// destination's Claude Code would delete a re-seated file within the
 /// margin, `RESEAT_INDEX_ABSENT` when there is a Codex thread to register
-/// and no destination index. Then ledger, I/O and schema refusals. A
-/// session's own refusal is its line's `refused` code, never the run's.
+/// and no destination index, `DESTINATION_SPACE_INSUFFICIENT` below the
+/// free-space floor. Then ledger, I/O and schema refusals. A session's own
+/// refusal is its line's `refused` code, never the run's.
 pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<Summary> {
     let lanes = Lanes::new(options);
     let mut summary = Summary::default();
+    let mut held = Held(Vec::new());
+    if options.claude {
+        lock_root(&mut held, &options.dest_claude)?;
+    }
+    if options.codex {
+        lock_root(&mut held, &options.dest_codex)?;
+    }
     let claude = if options.claude {
         Some(claude::Sessions::scan(options)?)
     } else {
@@ -418,12 +584,35 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     } else {
         None
     };
-    if let Some(sessions) = &claude {
-        claude::retention(options, &lanes, sessions)?;
-    }
+    let mut planned_claude = match &claude {
+        Some(sessions) => claude::retention(options, &lanes, sessions)?,
+        None => 0,
+    };
     if codex == Some(true) {
         codex::preflight(options)?;
     }
+    {
+        let ledger = ledger::Ledger::open_read_only(&options.state)?;
+        let planned_codex = if codex == Some(true) {
+            codex::planned(options, &lanes, ledger.as_ref())?
+        } else {
+            0
+        };
+        if options.claude && options.regularize {
+            if let Ok(real) = std::fs::canonicalize(&options.dest_claude) {
+                planned_claude =
+                    planned_claude.saturating_add(regularize::planned(&real, ledger.as_ref())?);
+            }
+        }
+        space(
+            options,
+            &[
+                (&options.dest_claude, planned_claude),
+                (&options.dest_codex, planned_codex),
+            ],
+        )?;
+    }
+    lock_state(&mut held, &options.state)?;
     let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "reseat")?;
     for (tool, state) in [
         (
@@ -449,6 +638,11 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
             "{{\"schema\":\"{SCHEMA}\",\"kind\":\"tool\",\"tool\":\"{tool}\",\"state\":\"{state}\"}}"
         ))?;
     }
+    if options.claude && options.regularize {
+        // Before placement: a regularized copy that is a prefix of a landed
+        // transcript is then extended like any other.
+        regularize::regularize(&root(&options.dest_claude)?, &ledger, &mut summary, emit)?;
+    }
     if let Some(sessions) = &claude {
         claude::reseat(options, &lanes, &ledger, sessions, &mut summary, emit)?;
     }
@@ -456,5 +650,32 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
         codex::reseat(options, &lanes, &mut ledger, &mut summary, emit)?;
     }
     emit(&summary.line())?;
+    drop(held);
     Ok(summary)
+}
+
+/// Reverse what this STATE's ledger changed in the destination's own
+/// state under the 2026-10-16 rulings (OI-1003-Q198).
+///
+/// It puts each regularized
+/// transcript's symlink back and each re-spelled Codex row's old `cwd`,
+/// only where the destination still holds exactly what re-seat wrote; one
+/// changed since is kept (`undo-kept`, `RESEAT_DEST_CONTINUED`). Placed
+/// sessions are not removed. Returns `(links, rows)` put back.
+///
+/// # Errors
+/// `RESEAT_LOCKED`; ledger, `SQLite` and I/O refusals.
+pub fn undo(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<(u64, u64)> {
+    let mut held = Held(Vec::new());
+    lock_root(&mut held, &options.dest_claude)?;
+    lock_root(&mut held, &options.dest_codex)?;
+    lock_state(&mut held, &options.state)?;
+    let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "undo")?;
+    let links = regularize::undo(&ledger, emit)?;
+    let rows = codex::undo(&mut ledger, emit)?;
+    emit(&format!(
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows}}}"
+    ))?;
+    drop(held);
+    Ok((links, rows))
 }

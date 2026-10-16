@@ -20,6 +20,17 @@
 //!   and its threads' identity columns, so a pass over an unchanged
 //!   snapshot does not open it (S3).
 //! - `pass`: one row per pass.
+//! - `meta`: this ledger's temporary-name token (`temp_token`): a staged
+//!   file is `.<name>.<token>.bulkload-reseat`, so two ledgers never share
+//!   one temporary (OI-1003-Q198 review). A ledger migrated from version 2
+//!   keeps the old shared name (an empty token) for what it left in flight.
+//! - `cwd_update`: one row per existing destination Codex row whose `cwd`
+//!   column this ledger re-spelled to the lane's canonical path
+//!   (OI-1003-Q198 (1)), with the old value, so `--undo` puts it back.
+//! - `regularized`: one row per symlinked destination transcript this
+//!   ledger replaced with a regular-file copy of its target
+//!   (OI-1003-Q198 (2)), with the link text and both identities, so
+//!   `--undo` puts the symlink back.
 //!
 //! A row is committed only after the bytes it describes are durable at the
 //! destination (the engine rule).
@@ -35,8 +46,11 @@ use crate::{BulkloadRefusal, Result};
 pub const FILE: &str = "reseat.sqlite";
 /// The ledger's schema version (`PRAGMA user_version`). Version 1 (the
 /// first build, `550396c`: window digests, inode-only supersede intents)
-/// is refused, never read as this one.
-const VERSION: i64 = 2;
+/// is refused, never read as this one; version 2 (`8a89f9a`) is migrated
+/// in place (new tables and session columns only).
+const VERSION: i64 = 3;
+/// Version 2's tables are a subset of version 3's.
+const MIGRATE_FROM: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS placement(
@@ -74,6 +88,21 @@ CREATE TABLE IF NOT EXISTS snapshot_thread(
 );
 CREATE TABLE IF NOT EXISTS pass(
     pass INTEGER PRIMARY KEY, started_ns INTEGER NOT NULL, mode TEXT NOT NULL
+);
+";
+/// Version 3's additions, applied to a new ledger and to a version 2 one.
+const SCHEMA_V3: &str = "
+CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS cwd_update(
+    id TEXT PRIMARY KEY, db BLOB NOT NULL, old_cwd TEXT NOT NULL, new_cwd TEXT NOT NULL,
+    state TEXT NOT NULL, pass INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS regularized(
+    link BLOB PRIMARY KEY, target BLOB NOT NULL, resolved BLOB NOT NULL,
+    k_dev INTEGER NOT NULL, k_ino INTEGER NOT NULL, k_size INTEGER NOT NULL, k_mtime INTEGER NOT NULL,
+    t_dev INTEGER NOT NULL, t_ino INTEGER NOT NULL, t_size INTEGER NOT NULL, t_mtime INTEGER NOT NULL,
+    r_dev INTEGER NOT NULL, r_ino INTEGER NOT NULL, r_size INTEGER NOT NULL, r_mtime INTEGER NOT NULL,
+    state TEXT NOT NULL, pass INTEGER NOT NULL
 );
 ";
 /// A file's identity: what a pass compares instead of reading it.
@@ -119,6 +148,9 @@ pub enum State {
     Occupied,
     /// The landed file stopped extending the bytes placed from it.
     Rewritten,
+    /// The landed file cannot be read as its form (a truncated `.zst`):
+    /// nothing placed, and not read again while its identity holds.
+    Unreadable,
 }
 
 impl State {
@@ -130,6 +162,7 @@ impl State {
             Self::Continued => "continued",
             Self::Occupied => "occupied",
             Self::Rewritten => "rewritten",
+            Self::Unreadable => "unreadable",
         }
     }
 
@@ -141,6 +174,7 @@ impl State {
             "continued" => Self::Continued,
             "occupied" => Self::Occupied,
             "rewritten" => Self::Rewritten,
+            "unreadable" => Self::Unreadable,
             _ => return Err(BulkloadRefusal::SchemaMismatch),
         })
     }
@@ -188,11 +222,84 @@ pub struct Session {
     pub tool: String,
     pub id: String,
     pub landing: PathBuf,
+    /// The recorded working directory; `Some("")` when the landed file
+    /// records none (cached so a rerun does not scan it again, S3).
     pub source_cwd: Option<String>,
     pub dest_cwd: Option<PathBuf>,
     pub dest_key: Option<String>,
     pub slug: Option<String>,
     pub outcome: String,
+    /// The landed file's size and modification time when the row was
+    /// written: a session that recorded no `cwd` is scanned again only
+    /// when its landed file changed.
+    pub landed_size: Option<u64>,
+    pub landed_mtime: Option<i64>,
+}
+
+/// One re-spelled destination Codex row (OI-1003-Q198 (1)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CwdUpdate {
+    pub id: String,
+    pub db: PathBuf,
+    pub old_cwd: String,
+    pub new_cwd: String,
+    /// `intent` (recorded before the destination's transaction),
+    /// `applied`, `undone` or `undo-kept`.
+    pub state: String,
+}
+
+/// What a regularization row says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegularState {
+    /// Staged (the regular copy at its temporary name), not yet exchanged
+    /// or settled.
+    Intent,
+    /// The regular copy is at the transcript's path; the symlink removed.
+    Done,
+    /// The target changed during the exchange and so did the copy: both
+    /// kept, the copy at the path.
+    Raced,
+    /// `--undo` put the symlink back.
+    Undone,
+}
+
+impl RegularState {
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Intent => "intent",
+            Self::Done => "done",
+            Self::Raced => "raced",
+            Self::Undone => "undone",
+        }
+    }
+
+    fn parse(word: &str) -> Result<Self> {
+        Ok(match word {
+            "intent" => Self::Intent,
+            "done" => Self::Done,
+            "raced" => Self::Raced,
+            "undone" => Self::Undone,
+            _ => return Err(BulkloadRefusal::SchemaMismatch),
+        })
+    }
+}
+
+/// One regularized destination transcript (OI-1003-Q198 (2)).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Regular {
+    /// The transcript's path (where the symlink was).
+    pub link: PathBuf,
+    /// The symlink's text, as `readlink` returned it.
+    pub target: PathBuf,
+    /// The target's real path when it was copied.
+    pub resolved: PathBuf,
+    /// The symlink's own identity (`lstat`).
+    pub link_identity: Identity,
+    /// The target's identity when it was copied.
+    pub target_identity: Identity,
+    /// The regular copy's identity (staged, then at the path).
+    pub regular: Identity,
+    pub state: RegularState,
 }
 
 /// The open ledger.
@@ -200,6 +307,11 @@ pub struct Ledger {
     conn: Connection,
     pass: i64,
     read_only: bool,
+    /// Whether the version 3 tables are there (a version 2 ledger opened
+    /// read-only has none).
+    v3: bool,
+    /// The temporary-name token (empty: the shared name of version 2).
+    token: String,
 }
 
 fn sql<T>(outcome: rusqlite::Result<T>) -> Result<T> {
@@ -251,10 +363,47 @@ impl Ledger {
             [],
             |row| row.get(0),
         ))?;
-        if version != VERSION && (version != 0 || tables != 0) {
+        let fresh = version == 0 && tables == 0;
+        if !fresh && version != VERSION && version != MIGRATE_FROM {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         sql(conn.execute_batch(SCHEMA))?;
+        sql(conn.execute_batch(SCHEMA_V3))?;
+        for column in ["l_size", "l_mtime"] {
+            let present: i64 = sql(conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('session') WHERE name = ?1",
+                params![column],
+                |row| row.get(0),
+            ))?;
+            if present == 0 {
+                sql(
+                    conn.execute_batch(&format!("ALTER TABLE session ADD COLUMN {column} INTEGER"))
+                )?;
+            }
+        }
+        let token: Option<String> = sql(conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'temp_token'",
+                [],
+                |row| row.get(0),
+            )
+            .optional())?;
+        let token = if let Some(token) = token {
+            token
+        } else {
+            // A migrated version 2 ledger keeps the shared name for what it
+            // may have left in flight.
+            let token = if version == MIGRATE_FROM {
+                String::new()
+            } else {
+                new_token(state, now_ns)
+            };
+            sql(conn.execute(
+                "INSERT INTO meta(key, value) VALUES ('temp_token', ?1)",
+                params![token],
+            ))?;
+            token
+        };
         sql(conn.execute_batch(&format!("PRAGMA user_version = {VERSION}")))?;
         sql(conn.execute(
             "INSERT INTO pass(started_ns, mode) VALUES (?1, ?2)",
@@ -265,11 +414,14 @@ impl Ledger {
             conn,
             pass,
             read_only: false,
+            v3: true,
+            token,
         })
     }
 
-    /// Open an existing ledger read-only (`--check`), or `None` when there
-    /// is none.
+    /// Open an existing ledger read-only (`--check`, and the checks a run
+    /// makes before it writes anything), or `None` when there is none. A
+    /// version 2 ledger is read as it is (no version 3 rows yet).
     ///
     /// # Errors
     /// `SQLITE_STATE_CHANGED` when it exists and cannot be read;
@@ -284,14 +436,22 @@ impl Ledger {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ))?;
         let version: i64 = sql(conn.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
-        if version != VERSION {
+        if version != VERSION && version != MIGRATE_FROM {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         Ok(Some(Self {
             conn,
             pass: 0,
             read_only: true,
+            v3: version == VERSION,
+            token: String::new(),
         }))
+    }
+
+    /// The token in this ledger's temporary names.
+    #[must_use]
+    pub fn temp_token(&self) -> &str {
+        &self.token
     }
 
     /// This pass's number.
@@ -445,8 +605,13 @@ impl Ledger {
         sql(self
             .conn
             .query_row(
-                "SELECT landing, source_cwd, dest_cwd, dest_key, slug, outcome
-                 FROM session WHERE tool = ?1 AND id = ?2",
+                if self.v3 {
+                    "SELECT landing, source_cwd, dest_cwd, dest_key, slug, outcome, l_size, l_mtime
+                     FROM session WHERE tool = ?1 AND id = ?2"
+                } else {
+                    "SELECT landing, source_cwd, dest_cwd, dest_key, slug, outcome, NULL, NULL
+                     FROM session WHERE tool = ?1 AND id = ?2"
+                },
                 params![tool, id],
                 |row| {
                     Ok(Session {
@@ -458,6 +623,8 @@ impl Ledger {
                         dest_key: row.get(3)?,
                         slug: row.get(4)?,
                         outcome: row.get(5)?,
+                        landed_size: row.get::<_, Option<i64>>(6)?.map(uint),
+                        landed_mtime: row.get(7)?,
                     })
                 },
             )
@@ -475,8 +642,8 @@ impl Ledger {
         }
         sql(self.conn.execute(
             "INSERT OR REPLACE INTO session(tool, id, landing, source_cwd, dest_cwd,
-                dest_key, slug, outcome, pass)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                dest_key, slug, outcome, pass, l_size, l_mtime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 row.tool,
                 row.id,
@@ -487,6 +654,8 @@ impl Ledger {
                 row.slug,
                 row.outcome,
                 self.pass,
+                row.landed_size.map(int),
+                row.landed_mtime,
             ],
         ))
         .map(drop)
@@ -611,4 +780,256 @@ impl Ledger {
         );
         sql(outcome)
     }
+    /// Record re-spellings about to be made in `db` (state `intent`), in
+    /// one commit, before the destination's transaction: a crash after it
+    /// leaves rows `--undo` can put back.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn put_cwd_intents(&mut self, db: &Path, rows: &[(String, String, String)]) -> Result<()> {
+        if !self.v3 || self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        let pass = self.pass;
+        let outcome = (|| {
+            let transaction = self.conn.transaction()?;
+            for (id, old, new) in rows {
+                // A row this ledger already re-spelled keeps its first old
+                // value (the destination's own spelling); any other takes
+                // the value it holds now. Either way it is in flight again
+                // (`intent`), so a crash before it is marked stays
+                // undoable.
+                transaction.execute(
+                    "INSERT INTO cwd_update(id, db, old_cwd, new_cwd, state, pass)
+                     VALUES (?1, ?2, ?3, ?4, 'intent', ?5)
+                     ON CONFLICT(id) DO UPDATE SET
+                        old_cwd = CASE WHEN cwd_update.state = 'applied'
+                            THEN cwd_update.old_cwd ELSE excluded.old_cwd END,
+                        db = excluded.db, new_cwd = excluded.new_cwd,
+                        state = 'intent', pass = excluded.pass",
+                    params![id, blob(db), old, new, pass],
+                )?;
+            }
+            transaction.commit()
+        })();
+        sql(outcome)
+    }
+
+    /// Set the state of re-spelling rows, in one commit.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn mark_cwd(&mut self, ids: &[(String, &str)]) -> Result<()> {
+        if !self.v3 || self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        let pass = self.pass;
+        let outcome = (|| {
+            let transaction = self.conn.transaction()?;
+            for (id, state) in ids {
+                transaction.execute(
+                    "UPDATE cwd_update SET state = ?2, pass = ?3 WHERE id = ?1",
+                    params![id, state, pass],
+                )?;
+            }
+            transaction.commit()
+        })();
+        sql(outcome)
+    }
+
+    /// The re-spelling row of thread `id`.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn cwd_update(&self, id: &str) -> Result<Option<CwdUpdate>> {
+        if !self.v3 {
+            return Ok(None);
+        }
+        sql(self
+            .conn
+            .query_row(
+                "SELECT db, old_cwd, new_cwd, state FROM cwd_update WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok(CwdUpdate {
+                        id: id.to_owned(),
+                        db: path_of(row.get(0)?),
+                        old_cwd: row.get(1)?,
+                        new_cwd: row.get(2)?,
+                        state: row.get(3)?,
+                    })
+                },
+            )
+            .optional())
+    }
+
+    /// Every re-spelling row, by thread ID.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn cwd_updates(&self) -> Result<Vec<CwdUpdate>> {
+        if !self.v3 {
+            return Ok(Vec::new());
+        }
+        let mut statement = sql(self
+            .conn
+            .prepare("SELECT id, db, old_cwd, new_cwd, state FROM cwd_update ORDER BY id"))?;
+        let rows = sql(statement.query_map([], |row| {
+            Ok(CwdUpdate {
+                id: row.get(0)?,
+                db: path_of(row.get(1)?),
+                old_cwd: row.get(2)?,
+                new_cwd: row.get(3)?,
+                state: row.get(4)?,
+            })
+        }))?;
+        sql(rows.collect::<rusqlite::Result<Vec<_>>>())
+    }
+
+    /// Write a regularization row (insert or replace), committed before
+    /// this returns.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn put_regular(&self, row: &Regular) -> Result<()> {
+        if !self.v3 || self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        let identity = |identity: Identity| {
+            [
+                int(identity.dev),
+                int(identity.ino),
+                int(identity.size),
+                identity.mtime,
+            ]
+        };
+        let [k_dev, k_ino, k_size, k_mtime] = identity(row.link_identity);
+        let [t_dev, t_ino, t_size, t_mtime] = identity(row.target_identity);
+        let [r_dev, r_ino, r_size, r_mtime] = identity(row.regular);
+        sql(self.conn.execute(
+            "INSERT OR REPLACE INTO regularized(link, target, resolved,
+                k_dev, k_ino, k_size, k_mtime, t_dev, t_ino, t_size, t_mtime,
+                r_dev, r_ino, r_size, r_mtime, state, pass)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            params![
+                blob(&row.link),
+                blob(&row.target),
+                blob(&row.resolved),
+                k_dev,
+                k_ino,
+                k_size,
+                k_mtime,
+                t_dev,
+                t_ino,
+                t_size,
+                t_mtime,
+                r_dev,
+                r_ino,
+                r_size,
+                r_mtime,
+                row.state.word(),
+                self.pass,
+            ],
+        ))
+        .map(drop)
+    }
+
+    fn regular_rows(&self, filter: Option<&Path>) -> Result<Vec<Regular>> {
+        if !self.v3 {
+            return Ok(Vec::new());
+        }
+        let mut statement = sql(self.conn.prepare(
+            "SELECT link, target, resolved, k_dev, k_ino, k_size, k_mtime,
+                    t_dev, t_ino, t_size, t_mtime, r_dev, r_ino, r_size, r_mtime, state
+             FROM regularized WHERE ?1 IS NULL OR link = ?1 ORDER BY link",
+        ))?;
+        let identity = |row: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Identity> {
+            Ok(Identity {
+                dev: uint(row.get(at)?),
+                ino: uint(row.get(at + 1)?),
+                size: uint(row.get(at + 2)?),
+                mtime: row.get(at + 3)?,
+            })
+        };
+        let rows = sql(statement.query_map(params![filter.map(blob)], |row| {
+            Ok((
+                path_of(row.get(0)?),
+                path_of(row.get(1)?),
+                path_of(row.get(2)?),
+                identity(row, 3)?,
+                identity(row, 7)?,
+                identity(row, 11)?,
+                row.get::<_, String>(15)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (link, target, resolved, link_identity, target_identity, regular, state) =
+                sql(row)?;
+            out.push(Regular {
+                link,
+                target,
+                resolved,
+                link_identity,
+                target_identity,
+                regular,
+                state: RegularState::parse(&state)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The regularization row of the transcript at `link`.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read; `SCHEMA_MISMATCH` on a row
+    /// this build cannot read.
+    pub fn regular(&self, link: &Path) -> Result<Option<Regular>> {
+        Ok(self.regular_rows(Some(link))?.into_iter().next())
+    }
+
+    /// Remove the regularization row of `link` (a regularization that put
+    /// the symlink back: a later pass decides again).
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn delete_regular(&self, link: &Path) -> Result<()> {
+        if !self.v3 || self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute(
+            "DELETE FROM regularized WHERE link = ?1",
+            params![blob(link)],
+        ))
+        .map(drop)
+    }
+
+    /// Every regularization row.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read; `SCHEMA_MISMATCH` on a row
+    /// this build cannot read.
+    pub fn regulars(&self) -> Result<Vec<Regular>> {
+        self.regular_rows(None)
+    }
+}
+
+/// A token for this ledger's temporary names: twelve hex digits of the
+/// BLAKE3 of the state path, the time and this process.
+fn new_token(state: &Path, now_ns: i64) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(blob(state));
+    hasher.update(&now_ns.to_le_bytes());
+    hasher.update(&std::process::id().to_le_bytes());
+    hasher.update(&crate::reseat::now_ns().to_le_bytes());
+    let digest = hasher.finalize();
+    digest
+        .as_bytes()
+        .iter()
+        .take(6)
+        .fold(String::new(), |mut out, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }

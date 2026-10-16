@@ -141,6 +141,11 @@
 //! | `reseat.after_extend` | the whole tail written, the landed mtime set and sealed; the intent still recorded |
 //! | `reseat.after_supersede_exchange` | a changed non-append file exchanged in: the new bytes at the path, this ledger's old placement under the temporary name; the intent still recorded |
 //! | `reseat.after_row_insert` | a batch of Codex thread rows committed in the destination's `state_5.sqlite`; no ledger row for them |
+//! | `reseat.after_synth_row_insert` | a row built from a rowless rollout's header committed in the destination's index; no ledger row for it (OI-1003-Q198 D) |
+//! | `reseat.after_cwd_update` | existing destination rows' `cwd` re-spelled to the lane's canonical path and committed; the ledger still holds them as `intent` (OI-1003-Q198 (1)) |
+//! | `reseat.after_regularize_exchange` | a symlinked destination transcript exchanged for its regular copy: the copy at the path, the symlink under the temporary name; the ledger row still `intent` (OI-1003-Q198 (2)) |
+//! | `reseat.after_undo_cwd` | `--undo` put re-spelled rows' old `cwd` back and committed; the ledger rows not yet `undone` |
+//! | `reseat.after_undo_exchange` | `--undo` exchanged a regularized transcript back to its symlink: the symlink at the path, the regular copy under the temporary name; the ledger row not yet `undone` |
 //!
 //! # Group size
 //!
@@ -335,11 +340,21 @@ pub enum Point {
     ReseatAfterSupersedeExchange,
     /// `reseat.after_row_insert`
     ReseatAfterRowInsert,
+    /// `reseat.after_synth_row_insert`
+    ReseatAfterSynthRowInsert,
+    /// `reseat.after_cwd_update`
+    ReseatAfterCwdUpdate,
+    /// `reseat.after_regularize_exchange`
+    ReseatAfterRegularizeExchange,
+    /// `reseat.after_undo_cwd`
+    ReseatAfterUndoCwd,
+    /// `reseat.after_undo_exchange`
+    ReseatAfterUndoExchange,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 50] = [
+    pub const ALL: [Self; 55] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -390,6 +405,11 @@ impl Point {
         Self::ReseatAfterExtend,
         Self::ReseatAfterSupersedeExchange,
         Self::ReseatAfterRowInsert,
+        Self::ReseatAfterSynthRowInsert,
+        Self::ReseatAfterCwdUpdate,
+        Self::ReseatAfterRegularizeExchange,
+        Self::ReseatAfterUndoCwd,
+        Self::ReseatAfterUndoExchange,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -446,6 +466,11 @@ impl Point {
             Self::ReseatAfterExtend => "reseat.after_extend",
             Self::ReseatAfterSupersedeExchange => "reseat.after_supersede_exchange",
             Self::ReseatAfterRowInsert => "reseat.after_row_insert",
+            Self::ReseatAfterSynthRowInsert => "reseat.after_synth_row_insert",
+            Self::ReseatAfterCwdUpdate => "reseat.after_cwd_update",
+            Self::ReseatAfterRegularizeExchange => "reseat.after_regularize_exchange",
+            Self::ReseatAfterUndoCwd => "reseat.after_undo_cwd",
+            Self::ReseatAfterUndoExchange => "reseat.after_undo_exchange",
         }
     }
 

@@ -1,5 +1,11 @@
 # 2026-10-16: `estate-reseat` review fixes (TIN-6587, R0)
 
+> Superseded in part (2026-10-16, later): rollouts with no snapshot row now
+> get a row from their header (OI-1003-Q198 D, not `RESEAT_INDEX_ROW_ABSENT`
+> and `row-absent` as below), the ledger is version 3, and the re-reviews
+> of `8a89f9a` are closed in
+> `2026-10-16-estate-reseat-rereview-fixes.md`.
+
 Lane: estate-reseat review fixes, worktree
 `bulkload.worktrees/estate-reseat-20261016`, branch
 `feat/estate-reseat-20261016`, on top of the build `550396c` and the

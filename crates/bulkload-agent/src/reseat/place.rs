@@ -16,7 +16,8 @@
 //!   a record that a destination resume would append to. Every write of an
 //!   extension is whole lines.
 //! - **`D` absent**: copy `L` into a temporary beside `D`
-//!   (`.<name>.bulkload-reseat`), give it `L`'s mode and modification time
+//!   (`.<name>.<token>.bulkload-reseat`, the token this ledger's own, so two
+//!   ledgers never share a temporary), give it `L`'s mode and modification time
 //!   (Claude Code's `--continue` takes the newest file), seal it, publish it
 //!   with a no-replace rename, seal the directory, then commit the row. A
 //!   regular file, never a symlink (Claude Code lists only regular files)
@@ -26,7 +27,9 @@
 //!   strict prefix of `L` is adopted and extended when the file is
 //!   append-only (`.jsonl`, `.txt`); anything else is kept as it is and
 //!   reported (`RESEAT_DEST_DIVERGED`, or `RESEAT_DEST_CONTINUED` when `L`
-//!   is a prefix of `D`). A symlink or other node is never written
+//!   is a prefix of `D`). A symlink or other node, or a regular file with
+//!   more than one link (an archive copy, or the landing itself: extending
+//!   it would change the other name), is never written
 //!   (`DESTINATION_OCCUPIED`).
 //! - **`D` holds this ledger's bytes**: unchanged identities read nothing
 //!   (S3). A grown append-only `L` is proven to extend the placed bytes by
@@ -37,7 +40,13 @@
 //!   wrote: a destination writer appending beside it (a session resumed
 //!   there) stops the extension (`RESEAT_EXTEND_RACED`), its lines whole,
 //!   the file the destination's from then on, its modification time not
-//!   reset. A changed file that is not append-only (a plan, a memory note)
+//!   reset. One window stays: a destination append landing between the size
+//!   check and the `write` of the same chunk. POSIX has no conditional
+//!   append, so it is detected (the size after the write is not this pass's)
+//!   rather than prevented: the lines stay whole, the file is handed over
+//!   (`RESEAT_EXTEND_RACED`) and `--check` fails it (`hash-differs`), with
+//!   nothing lost. The window is two system calls wide, once per 1 MiB
+//!   chunk. A changed file that is not append-only (a plan, a memory note)
 //!   supersedes the placement through an atomic exchange, checked
 //!   afterwards against the staged file's whole identity: a displaced file
 //!   that is not this ledger's placement is exchanged back, and a staged
@@ -45,6 +54,10 @@
 //! - **`D` changed since bulkload's last write** (a session resumed there):
 //!   the destination owns it from then on (`RESEAT_DEST_CONTINUED`); it is
 //!   never extended again, and newer landed bytes stay in the landing.
+//! - **An unreadable landed form** (a truncated or corrupt `.jsonl.zst`) is
+//!   that file's `unreadable-form` (`RESEAT_UNREADABLE_FORM`), never the
+//!   run's refusal; its temporary is removed, and an extension it cut short
+//!   keeps the whole lines it appended, proven, as this ledger's.
 
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
@@ -216,10 +229,87 @@ fn same_stream(a: &Path, b: &Path) -> bool {
     a == b || plain(a) == plain(b)
 }
 
+/// The bytes a placement of `landed` at `dest` would write at most, for
+/// the free-space check.
+///
+/// Nothing for a landed file the ledger already holds
+/// unchanged or a destination file the destination owns, the new tail of
+/// this ledger's own placement, else the whole content (decompressed for a
+/// `.zst`: its frame's declared size, or the stream counted).
+///
+/// # Errors
+/// Ledger and I/O refusals.
+pub fn planned(ledger: Option<&Ledger>, dest: &Path, landed: &Path) -> Result<u64> {
+    let Some(meta) = lstat(landed)? else {
+        return Ok(0);
+    };
+    if !meta.is_file() {
+        return Ok(0);
+    }
+    let row = match ledger {
+        Some(ledger) => ledger.placement(dest)?,
+        None => None,
+    };
+    if row
+        .as_ref()
+        .is_some_and(|row| row.landed == Identity::of(&meta) || row.state == State::Continued)
+    {
+        return Ok(0);
+    }
+    let size = content_size(landed, &meta)?;
+    Ok(match row {
+        Some(row) if row.state.owned() => size.saturating_sub(row.placed),
+        _ => size,
+    })
+}
+
+/// The content size of a landed file: its size, or a `.zst`'s
+/// decompressed size.
+fn content_size(landed: &Path, meta: &std::fs::Metadata) -> Result<u64> {
+    if !compressed(landed) {
+        return Ok(meta.len());
+    }
+    let file = crate::hash::open_nofollow(landed)?;
+    let mut head = [0_u8; 18];
+    let read = file
+        .read_at(&mut head, 0)
+        .refuse_at("reseat::place::content_size")?;
+    counters::add_len(Counter::ReseatLandingRead, read);
+    if let Ok(Some(size)) =
+        zstd::zstd_safe::get_frame_content_size(head.get(..read).unwrap_or_default())
+    {
+        return Ok(size);
+    }
+    // No declared size: count the stream (an unreadable one places
+    // nothing).
+    let landing = Landing::open(landed)?;
+    let Ok(mut reader) = landing.reader() else {
+        return Ok(0);
+    };
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut total = 0_u64;
+    loop {
+        match reader.read(&mut buffer) {
+            Ok(0) => return Ok(total),
+            Ok(read) => total += read as u64,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return Ok(0),
+        }
+    }
+}
+
 /// Places files under one canonical destination root.
 pub struct Placer<'a> {
     pub ledger: &'a Ledger,
     pub root: &'a Path,
+}
+
+impl<'a> Placer<'a> {
+    /// A placer for `root` ledgered in `ledger`.
+    #[must_use]
+    pub const fn new(ledger: &'a Ledger, root: &'a Path) -> Self {
+        Self { ledger, root }
+    }
 }
 
 /// The landed file's bytes, from offset 0 to its identity's size, through
@@ -302,7 +392,9 @@ impl Landing {
     }
 
     fn read_error(&self, error: &std::io::Error, at: &'static str) -> BulkloadRefusal {
-        if self.compressed && error.kind() != std::io::ErrorKind::UnexpectedEof {
+        if self.compressed {
+            // A corrupt frame, or a truncated one (the decoder's
+            // `UnexpectedEof`): this file cannot be read as its form.
             return BulkloadRefusal::ReseatUnreadableForm;
         }
         match error.kind() {
@@ -443,7 +535,7 @@ fn pump(
     Ok(pumped)
 }
 
-fn lstat(path: &Path) -> Result<Option<std::fs::Metadata>> {
+pub(super) fn lstat(path: &Path) -> Result<Option<std::fs::Metadata>> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some(meta)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -451,11 +543,11 @@ fn lstat(path: &Path) -> Result<Option<std::fs::Metadata>> {
     }
 }
 
-fn identity_at(path: &Path) -> Result<Option<Identity>> {
+pub(super) fn identity_at(path: &Path) -> Result<Option<Identity>> {
     Ok(lstat(path)?.map(|meta| Identity::of(&meta)))
 }
 
-fn open_dir(path: &Path) -> Result<File> {
+pub(super) fn open_dir(path: &Path) -> Result<File> {
     OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -463,13 +555,20 @@ fn open_dir(path: &Path) -> Result<File> {
         .refuse_at("reseat::place::open_dir")
 }
 
-fn c_name(name: &std::ffi::OsStr) -> Result<CString> {
+pub(super) fn c_name(name: &std::ffi::OsStr) -> Result<CString> {
     crate::io::c_name(name.as_bytes()).map_err(|_| BulkloadRefusal::PathNotPortable)
 }
 
-fn temp_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
+/// The temporary beside `name`: `.<name>.<token>.bulkload-reseat`, or the
+/// shared `.<name>.bulkload-reseat` of a version 2 ledger (empty token).
+#[must_use]
+pub fn temp_name(name: &std::ffi::OsStr, token: &str) -> std::ffi::OsString {
     let mut temp = std::ffi::OsString::from(".");
     temp.push(name);
+    if !token.is_empty() {
+        temp.push(".");
+        temp.push(token);
+    }
     temp.push(TEMP_SUFFIX);
     temp
 }
@@ -579,13 +678,51 @@ impl Placer<'_> {
         session: &str,
         want: Option<&'static [&'static str]>,
     ) -> Result<Placed> {
-        match self.place_inner(landing, rel, kind, session, want) {
-            Err(BulkloadRefusal::ReseatUnreadableForm) => Ok(Placed {
+        let placed = match self.place_inner(landing, rel, kind, session, want) {
+            Err(BulkloadRefusal::ReseatUnreadableForm) => Placed {
                 outcome: Outcome::Unreadable,
                 scanner: None,
-            }),
-            other => other,
+            },
+            other => other?,
+        };
+        if placed.outcome == Outcome::Unreadable {
+            self.remember_unreadable(landing, rel, kind, session)?;
         }
+        Ok(placed)
+    }
+
+    /// Ledger an unreadable landed file that holds no placement, so a pass
+    /// over the same landed identity does not read it again (S3).
+    fn remember_unreadable(
+        &self,
+        landing: &Path,
+        rel: &Path,
+        kind: Kind,
+        session: &str,
+    ) -> Result<()> {
+        let dest = self.root.join(rel);
+        if self
+            .ledger
+            .placement(&dest)?
+            .is_some_and(|row| row.state.owned() || row.state == State::Continued)
+        {
+            return Ok(());
+        }
+        let Some(landed) = identity_at(landing)? else {
+            return Ok(());
+        };
+        self.ledger.put(&Placement {
+            dest: dest.clone(),
+            landing: landing.to_path_buf(),
+            kind: kind.word(),
+            session: session.to_owned(),
+            state: State::Unreadable,
+            landed,
+            placed_identity: identity_at(&dest)?.unwrap_or_default(),
+            placed: 0,
+            digest: None,
+            intent: None,
+        })
     }
 
     fn place_inner(
@@ -612,11 +749,18 @@ impl Placer<'_> {
         let Some(name) = rel.file_name() else {
             return Err(BulkloadRefusal::PathEscapesRoot);
         };
-        match lstat(landing)? {
-            Some(meta) if meta.is_file() => {}
+        let landed_now = match lstat(landing)? {
+            Some(meta) if meta.is_file() => Identity::of(&meta),
             _ => return done(Outcome::LandingNotRegular),
-        }
+        };
         let mut row = self.ledger.placement(&dest)?;
+        if row
+            .as_ref()
+            .is_some_and(|row| row.state == State::Unreadable && row.landed == landed_now)
+        {
+            // Unreadable as it was last pass: not read again.
+            return done(Outcome::Unreadable);
+        }
         if row
             .as_ref()
             .is_some_and(|row| !same_stream(&row.landing, landing))
@@ -657,6 +801,7 @@ impl Placer<'_> {
                     State::Diverged => Outcome::Diverged,
                     State::Occupied => Outcome::Occupied,
                     State::Rewritten => Outcome::Rewritten,
+                    State::Unreadable => Outcome::Unreadable,
                     // Owned and continued rows are matched above.
                     State::Ours | State::Adopted | State::Continued => Outcome::Unchanged,
                 })
@@ -725,11 +870,12 @@ impl Site<'_> {
     }
 
     fn temp(&self) -> PathBuf {
-        self.dest.with_file_name(temp_name(self.name))
+        self.dest
+            .with_file_name(temp_name(self.name, self.placer.ledger.temp_token()))
     }
 
     fn temp_c(&self) -> Result<CString> {
-        c_name(temp_name(self.name).as_os_str())
+        c_name(temp_name(self.name, self.placer.ledger.temp_token()).as_os_str())
     }
 
     /// Remove a temporary a crashed pass left before it published (no
@@ -792,7 +938,9 @@ impl Site<'_> {
         })
     }
 
-    /// [`Self::stage`], with an unreadable landing's temporary removed.
+    /// [`Self::stage`], with the temporary removed when staging fails: an
+    /// unreadable landing is `None`; any other refusal (a full file system)
+    /// is the run's, and no staged temporary is left in the live tree.
     fn stage_or_clear(&self, landing: &Landing) -> Result<Option<Staged>> {
         match self.stage(landing) {
             Ok(staged) => Ok(Some(staged)),
@@ -800,7 +948,10 @@ impl Site<'_> {
                 self.clear_temp()?;
                 Ok(None)
             }
-            Err(refusal) => Err(refusal),
+            Err(refusal) => {
+                let _ = self.clear_temp();
+                Err(refusal)
+            }
         }
     }
 
@@ -857,7 +1008,9 @@ impl Site<'_> {
                 .put(&self.row(state, landing.identity, observed, 0))?;
             Ok(Placed { outcome, scanner })
         };
-        if !meta.is_file() {
+        if !meta.is_file() || meta.nlink() > 1 {
+            // Another name for these bytes (an archive copy, the landing
+            // itself) would change with them.
             return keep(State::Occupied, Outcome::Occupied, None);
         }
         let dest = crate::hash::open_nofollow(self.dest)?;
@@ -938,6 +1091,15 @@ impl Site<'_> {
         if landing.identity == row.landed {
             return done(Outcome::Unchanged);
         }
+        if meta.nlink() > 1 {
+            // Linked elsewhere since it was placed: never written again.
+            self.placer.ledger.put(&Placement {
+                state: State::Occupied,
+                landed: landing.identity,
+                ..row
+            })?;
+            return done(Outcome::Occupied);
+        }
         let unchanged = |row: Placement| -> Result<Placed> {
             self.placer.ledger.put(&Placement {
                 landed: landing.identity,
@@ -995,6 +1157,7 @@ impl Site<'_> {
     /// Append the rest of `reader` (the landed content after `row.placed`,
     /// proven by `hasher`) in whole lines, under an intent, checking the
     /// destination's size before every write.
+    #[allow(clippy::too_many_lines)]
     fn extend(
         &self,
         row: Placement,
@@ -1039,7 +1202,8 @@ impl Site<'_> {
             scanner.as_mut(),
             &mut |bytes| {
                 // A destination writer appended since this pass's last
-                // write: stop, with every line whole.
+                // write: stop, with every line whole. (The window between
+                // this check and the write is detected after it, below.)
                 if size_now(&dest)?.size != expected {
                     raced = true;
                     return Ok(false);
@@ -1054,7 +1218,29 @@ impl Site<'_> {
                 first = false;
                 Ok(true)
             },
-        )?;
+        );
+        let pumped = match pumped {
+            Ok(pumped) => pumped,
+            Err(BulkloadRefusal::ReseatUnreadableForm) => {
+                // The landed form broke off mid-stream (a truncated
+                // `.zst`): what was appended is whole lines of it, proven by
+                // the hash of every byte placed. Keep them as this
+                // ledger's; the landing is decided again next pass.
+                let placed = size_now(&dest)?;
+                if placed.size != expected {
+                    return self.hand_over(row, landing, Outcome::Raced);
+                }
+                crate::io::durable::seal_file(&dest).refuse_at("reseat::place::extend_seal")?;
+                let mut kept = self.row(State::Ours, Identity::default(), placed, expected);
+                kept.digest = Some(*hasher.finalize().as_bytes());
+                self.placer.ledger.put(&kept)?;
+                return Ok(Placed {
+                    outcome: Outcome::Unreadable,
+                    scanner: None,
+                });
+            }
+            Err(refusal) => return Err(refusal),
+        };
         if raced || size_now(&dest)?.size != expected {
             return self.hand_over(row, landing, Outcome::Raced);
         }

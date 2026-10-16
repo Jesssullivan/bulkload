@@ -359,6 +359,14 @@ pub enum BulkloadRefusal {
     /// stopped between whole lines; the file is the destination's from
     /// then on and the rest of the landed bytes stay in the landing.
     ReseatExtendRaced,
+    /// `estate-reseat`: another `estate-reseat` holds this run's private
+    /// state or a destination agent root (an exclusive `flock` on each):
+    /// two runs never write one destination at once (OI-1003-Q198 review).
+    ReseatLocked,
+    /// `estate-reseat`: a symlinked destination transcript's target changed
+    /// while it was being regularized into a regular file (OI-1003-Q198):
+    /// the symlink is put back, or, when both changed, the two are kept.
+    ReseatRegularizeRaced,
     /// `estate-reseat --check`: at least one lane failed the R0 acceptance
     /// check (its sessions are not listable and byte-identical in its
     /// destination working directory, its Git state is not equal, or its
@@ -470,6 +478,8 @@ impl BulkloadRefusal {
             Self::ReseatIndexRowAbsent => "RESEAT_INDEX_ROW_ABSENT",
             Self::ReseatLaneCollision => "RESEAT_LANE_COLLISION",
             Self::ReseatExtendRaced => "RESEAT_EXTEND_RACED",
+            Self::ReseatLocked => "RESEAT_LOCKED",
+            Self::ReseatRegularizeRaced => "RESEAT_REGULARIZE_RACED",
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
@@ -555,6 +565,8 @@ impl BulkloadRefusal {
         "RESEAT_INDEX_ROW_ABSENT",
         "RESEAT_LANE_COLLISION",
         "RESEAT_EXTEND_RACED",
+        "RESEAT_LOCKED",
+        "RESEAT_REGULARIZE_RACED",
         "RESEAT_R0_FAILED",
         "PROBE_FAILED",
         "IO",
@@ -799,6 +811,8 @@ mod tests {
             BulkloadRefusal::ReseatIndexRowAbsent,
             BulkloadRefusal::ReseatLaneCollision,
             BulkloadRefusal::ReseatExtendRaced,
+            BulkloadRefusal::ReseatLocked,
+            BulkloadRefusal::ReseatRegularizeRaced,
             BulkloadRefusal::ReseatR0Failed,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),

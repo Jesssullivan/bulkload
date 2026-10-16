@@ -15,6 +15,9 @@ use rusqlite::{params, Connection};
 use super::{append, r0, run, set_mtime, transcript, World, SERIAL, SID, SID2, SOURCE_HOME};
 use crate::reseat::{check, reseat, Options, Unmapped};
 
+mod q198;
+mod rereview;
+
 const T1: &str = "019a0000-0000-7000-8000-0000000000f1";
 const T9: &str = "019a0000-0000-7000-8000-0000000000f9";
 
@@ -270,7 +273,10 @@ fn r0_3_a_kept_transcript_places_no_companions() {
     fs::create_dir_all(dest.parent().unwrap()).unwrap();
     fs::write(world.base.join("archived.jsonl"), b"{}\n").unwrap();
     std::os::unix::fs::symlink(world.base.join("archived.jsonl"), &dest).unwrap();
-    let (summary, lines, _) = run(&world.options());
+    // The placement rule, with OI-1003-Q198 (2)'s regularization off.
+    let mut options = world.options();
+    options.regularize = false;
+    let (summary, lines, _) = run(&options);
     assert_eq!(summary.sessions_of("claude", "occupied"), 1, "{lines:?}");
     assert!(
         !world
@@ -518,7 +524,14 @@ fn r1_2_an_edit_after_a_supersede_crash_is_kept() {
     // The state supersede() leaves at its exchange point.
     let root = fs::canonicalize(world.base.join("dest/.claude")).unwrap();
     let dest = root.join("plans/own-plan.md");
-    let temp = root.join("plans/.own-plan.md.bulkload-reseat");
+    // This ledger's temporary name (its token, re-review of `8a89f9a`).
+    let temp_name = {
+        let ledger =
+            crate::reseat::ledger::Ledger::open(&options.state, crate::reseat::now_ns(), "test")
+                .unwrap();
+        crate::reseat::place::temp_name(std::ffi::OsStr::new("own-plan.md"), ledger.temp_token())
+    };
+    let temp = root.join("plans").join(&temp_name);
     fs::write(&temp, b"v2 from neo").unwrap();
     let staged = crate::reseat::ledger::Identity::of(&fs::metadata(&temp).unwrap());
     {
@@ -532,7 +545,7 @@ fn r1_2_an_edit_after_a_supersede_crash_is_kept() {
     let directory = fs::File::open(root.join("plans")).unwrap();
     crate::io::exchange(
         &directory,
-        &std::ffi::CString::new(".own-plan.md.bulkload-reseat").unwrap(),
+        &std::ffi::CString::new(temp_name.as_encoded_bytes()).unwrap(),
         &std::ffi::CString::new("own-plan.md").unwrap(),
     )
     .unwrap();
@@ -635,7 +648,9 @@ fn r1_4_two_source_keys_on_one_destination_key_collide_once() {
 }
 
 /// Review 1, finding 6: a landed rollout with no row in the landed
-/// snapshot is placed (resumable by ID), reported, and fails R0.
+/// snapshot is placed (resumable by ID) and reported. Superseded in part by
+/// OI-1003-Q198 D: it now gets a row built from its header, so the lane's
+/// picker lists it and R0 holds; it is reported `synthesized`.
 #[test]
 fn r1_6_a_rollout_with_no_snapshot_row_is_reported() {
     let _serial = SERIAL
@@ -650,13 +665,22 @@ fn r1_6_a_rollout_with_no_snapshot_row_is_reported() {
     assert!(
         lines
             .iter()
-            .any(|line| line.contains(T9) && line.contains("RESEAT_INDEX_ROW_ABSENT")),
+            .any(|line| line.contains(T9) && line.contains("\"row\":\"synthesized\"")),
         "{lines:?}"
     );
-    assert!(world.codex_dest(&rel(T9)).is_file(), "kept resumable by ID");
+    assert!(world.codex_dest(&rel(T9)).is_file(), "placed");
+    assert_eq!(
+        world.dest_row(T9),
+        Some((
+            world.real_lab(),
+            world.codex_dest(&rel(T9)).to_str().unwrap().to_owned()
+        ))
+    );
     let (summary, lines) = check_lines(&options);
-    assert!(summary.verdict().is_err(), "{lines:?}");
-    assert!(lines.iter().any(|line| line.contains(T9)), "{lines:?}");
+    assert!(summary.verdict().is_ok(), "{lines:?}");
+    let (summary, _, read) = run(&options);
+    assert_eq!(read, 0, "S3: {summary:?}");
+    assert_eq!(summary.rows.get("unchanged"), Some(&2), "{summary:?}");
 }
 
 /// Review 1, finding 7: retention keeps a margin, and reads every settings

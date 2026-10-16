@@ -19,7 +19,13 @@
 //!   (the plain `.jsonl` re-seat placed, or the `.jsonl.zst` Codex
 //!   compressed it into there) whose decompressed stream holds the landed
 //!   one the same way. A landed rollout with no snapshot row fails
-//!   (`row-absent`) unless a row is there.
+//!   (`row-absent`) unless a row is there; a row Codex wrote with the
+//!   source's `cwd` (a by-ID resume that chose the session directory) is
+//!   `row-cwd-is-source`. Another landed form of a thread's rollout that
+//!   the destination does not hold (a longer `.jsonl.zst` beside the plain
+//!   form the snapshot names) fails it (`extra-form-unplaced`). A thread
+//!   whose rollout is recorded outside every `--codex-source-root` is
+//!   unlaned `RESEAT_LANE_UNMAPPED:rollout-root`, the flag that fixes it.
 //! - **Git**: `estate-diff` classes the lane's planned workspace
 //!   `identical` (`--plan`), or Git is out of this check's scope
 //!   (`--sessions-only`); with neither the lane is `incomplete`.
@@ -49,7 +55,7 @@ use super::codex;
 use super::json::FieldScanner;
 use super::ledger::Ledger;
 use super::place::{self, Landing};
-use super::{key, shown, Lanes, Options, Unmapped, SCHEMA};
+use super::{key, shown, Lanes, Options, SCHEMA};
 use crate::closure::json_string;
 use crate::counters::{self, Counter};
 use crate::refuse::RefuseAt as _;
@@ -453,24 +459,23 @@ fn check_claude(
                 .filter(|row| row.landing == candidate.path),
             None => None,
         };
-        let (lane, key) =
-            match claude::resolve(candidate, cached.as_ref(), lanes, options.unmapped)? {
-                Resolved::Lane(_, lane) => {
-                    let key = lane.key.clone();
-                    (Some(lane), key)
-                }
-                Resolved::ById(_) => (None, candidate.key.clone()),
-                Resolved::Refused(_, refusal) => {
-                    unlaned(
-                        summary,
-                        options,
-                        claude::TOOL,
-                        &candidate.sid,
-                        refusal.code(),
-                    );
-                    continue;
-                }
-            };
+        let (lane, key) = match claude::resolve(candidate, cached.as_ref(), lanes, options)? {
+            Resolved::Lane(_, lane) => {
+                let key = lane.key.clone();
+                (Some(lane), key)
+            }
+            Resolved::ById(_) => (None, candidate.key.clone()),
+            Resolved::Refused(_, refusal) => {
+                unlaned(
+                    summary,
+                    options,
+                    claude::TOOL,
+                    &candidate.sid,
+                    refusal.code(),
+                );
+                continue;
+            }
+        };
         let dest = root
             .join("projects")
             .join(&key)
@@ -558,16 +563,32 @@ fn check_codex(
     let threads = codex::landed_threads(&options.landing_codex.join(codex::STATE_DB))?;
     let ids: BTreeSet<String> = threads.iter().map(|thread| thread.id.clone()).collect();
     let mut named = BTreeSet::new();
+    // Each tallied thread: its lane (or none, by ID), expected cwd, source
+    // cwd and whether it held, for the extra-form rule below.
+    let mut tallied: BTreeMap<String, (Option<super::Lane>, String, String, bool)> =
+        BTreeMap::new();
     for thread in &threads {
-        let rel = codex::rollout_rel(options, &thread.rollout)
-            .and_then(|rel| codex::landed_form(&options.landing_codex, &rel));
+        let Some(recorded) = codex::rollout_rel(options, &thread.rollout) else {
+            unlaned(
+                summary,
+                options,
+                codex::TOOL,
+                &thread.id,
+                &format!(
+                    "{}:rollout-root",
+                    BulkloadRefusal::ReseatLaneUnmapped.code()
+                ),
+            );
+            continue;
+        };
+        let rel = codex::landed_form(&options.landing_codex, &recorded);
         if let Some(rel) = &rel {
             named.insert(rel.clone());
         }
         let lane = lanes.lane(Path::new(&thread.cwd))?;
         let expected_cwd = match &lane {
             Some(lane) => key::utf8(&lane.dest_cwd)?.to_owned(),
-            None if options.unmapped == Unmapped::ById => thread.cwd.clone(),
+            None if options.by_id(&thread.cwd) => thread.cwd.clone(),
             None => {
                 unlaned(
                     summary,
@@ -583,13 +604,21 @@ fn check_codex(
             None => Holds::Not("landing-absent"),
             Some(rel) => thread_holds(
                 options,
-                &root,
-                dest.as_ref(),
+                (&root, dest.as_ref()),
                 &thread.id,
                 &rel,
-                &expected_cwd,
+                (&expected_cwd, &thread.cwd),
             )?,
         };
+        tallied.insert(
+            thread.id.clone(),
+            (
+                lane.clone(),
+                expected_cwd.clone(),
+                thread.cwd.clone(),
+                !matches!(held, Holds::Not(_)),
+            ),
+        );
         tally(
             summary,
             options,
@@ -611,7 +640,29 @@ fn check_codex(
             continue;
         };
         if ids.contains(&id) {
-            // Another form of a snapshot thread, checked through it.
+            // Another landed form of a snapshot thread: the destination must
+            // hold it too (a longer form never placed fails the thread).
+            if let Some((lane, expected_cwd, source_cwd, true)) = tallied.get(&id).cloned() {
+                if let Holds::Not(_) = thread_holds(
+                    options,
+                    (&root, dest.as_ref()),
+                    &id,
+                    &file.rel,
+                    (&expected_cwd, &source_cwd),
+                )? {
+                    demote(
+                        summary,
+                        options,
+                        table,
+                        lane.as_ref(),
+                        &id,
+                        "extra-form-unplaced",
+                    );
+                    if let Some(entry) = tallied.get_mut(&id) {
+                        entry.3 = false;
+                    }
+                }
+            }
             continue;
         }
         let landed = options.landing_codex.join(&file.rel);
@@ -638,7 +689,7 @@ fn check_codex(
                 Err(refusal) => return Err(refusal),
             },
         };
-        let Some(cwd) = cwd else {
+        let Some(cwd) = cwd.filter(|cwd| !cwd.is_empty()) else {
             unlaned(
                 summary,
                 options,
@@ -651,7 +702,7 @@ fn check_codex(
         let lane = lanes.lane(Path::new(&cwd))?;
         let expected_cwd = match &lane {
             Some(lane) => key::utf8(&lane.dest_cwd)?.to_owned(),
-            None if options.unmapped == Unmapped::ById => cwd.clone(),
+            None if options.by_id(&cwd) => cwd.clone(),
             None => {
                 unlaned(
                     summary,
@@ -663,7 +714,13 @@ fn check_codex(
                 continue;
             }
         };
-        let held = thread_holds(options, &root, dest.as_ref(), &id, &file.rel, &expected_cwd)?;
+        let held = thread_holds(
+            options,
+            (&root, dest.as_ref()),
+            &id,
+            &file.rel,
+            (&expected_cwd, &cwd),
+        )?;
         tally(
             summary,
             options,
@@ -674,6 +731,34 @@ fn check_codex(
         );
     }
     Ok(())
+}
+
+/// Turn a thread already tallied as holding into a failure (`reason`).
+fn demote(
+    summary: &mut CheckSummary,
+    options: &Options,
+    table: &mut BTreeMap<PathBuf, LaneCheck>,
+    lane: Option<&super::Lane>,
+    id: &str,
+    reason: &str,
+) {
+    let Some(lane) = lane else {
+        summary.by_id_ok = summary.by_id_ok.saturating_sub(1);
+        summary.unlaned.push(Unlaned {
+            tool: codex::TOOL,
+            id: id.to_owned(),
+            reason: format!("by-id:{reason}"),
+            waived: options.waived.contains(id),
+        });
+        return;
+    };
+    let entry = table.entry(lane.dest_cwd.clone()).or_default();
+    entry.threads_ok = entry.threads_ok.saturating_sub(1);
+    if entry.failures.len() < NAMED_FAILURES {
+        entry
+            .failures
+            .push(format!("{}:{id}:{reason}", codex::TOOL));
+    }
 }
 
 /// A lane's Git, hand-off and verdict.
@@ -730,11 +815,10 @@ pub(crate) fn judge(
 /// How a thread holds at the destination.
 fn thread_holds(
     options: &Options,
-    root: &Path,
-    dest: Option<&Connection>,
+    (root, dest): (&Path, Option<&Connection>),
     id: &str,
     rel: &Path,
-    expected_cwd: &str,
+    (expected_cwd, source_cwd): (&str, &str),
 ) -> Result<Holds> {
     if rel.extension().is_some_and(|extension| extension == "gz") {
         return Ok(Holds::Not("unreadable-form"));
@@ -754,7 +838,13 @@ fn thread_holds(
         return Ok(Holds::Not("row-absent"));
     };
     if cwd != expected_cwd {
-        return Ok(Holds::Not("row-cwd-differs"));
+        // A resume by ID that kept the session directory writes the
+        // source's own cwd: say so, it is the fix's name.
+        return Ok(Holds::Not(if cwd == source_cwd {
+            "row-cwd-is-source"
+        } else {
+            "row-cwd-differs"
+        }));
     }
     let placed = root.join(codex::dest_form(rel));
     let rollout = PathBuf::from(rollout);

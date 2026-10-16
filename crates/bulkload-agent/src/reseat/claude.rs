@@ -14,7 +14,15 @@
 //!    plans (`plans/<slug>.md`, `plans/<slug>-agent-*.md`, by the
 //!    transcript's `slug`), and the source key's `memory/` merges into the
 //!    destination key's.
-//! 3. Never carried: `sessions/` (the host's live-process registry) and
+//! 3. Everything else under a project key that is no session's (neo's
+//!    `drafts/` and `vercel-plugin/`, orphaned sidecar directories) goes to
+//!    the destination key with its memory (S4, Q185: nothing is dropped);
+//!    a key none of whose sessions has a lane stays in the landing, named
+//!    by a `key` line with its file count.
+//! 4. A session refused (no lane, unresolved) is ledgered with its recorded
+//!    `cwd` (or none) and its landed identity, so a rerun does not read it
+//!    again (S3).
+//! 5. Never carried: `sessions/` (the host's live-process registry) and
 //!    `shell-snapshots/`, which are host-local. `history.jsonl` (prompt
 //!    history) and `~/.claude.json` are not read by the picker and stay in
 //!    the landing.
@@ -25,8 +33,8 @@ use std::path::{Path, PathBuf};
 
 use super::json::FieldScanner;
 use super::ledger::{Identity, Ledger, Session};
-use super::place::Placer;
-use super::{key, shown, Kind, Lane, Lanes, Options, Summary, Unmapped, SCHEMA};
+use super::place::{self, Placer};
+use super::{key, shown, Kind, Lane, Lanes, Options, Summary, SCHEMA};
 use crate::closure::json_string;
 use crate::counters::{self, Counter};
 use crate::refuse::RefuseAt as _;
@@ -52,11 +60,14 @@ pub struct Candidate {
     pub sid: String,
     pub path: PathBuf,
     pub mtime: i64,
+    pub size: u64,
 }
 
 /// The landed sessions, found by `lstat` alone.
 pub struct Sessions {
     pub list: Vec<Candidate>,
+    /// Every landed key directory.
+    pub keys: Vec<String>,
     todos: Vec<String>,
     plans: Vec<String>,
 }
@@ -91,6 +102,7 @@ impl Sessions {
         }
         let projects = options.landing_claude.join("projects");
         let mut list = Vec::new();
+        let mut keys = Vec::new();
         for key in names(&projects)? {
             let directory = projects.join(&key);
             // A key directory the landing holds as a symlink is listed
@@ -98,6 +110,7 @@ impl Sessions {
             if !std::fs::metadata(&directory).is_ok_and(|meta| meta.is_dir()) {
                 continue;
             }
+            keys.push(key.clone());
             for name in names(&directory)? {
                 let Some(sid) = name.strip_suffix(".jsonl") else {
                     continue;
@@ -114,11 +127,13 @@ impl Sessions {
                     sid: sid.to_owned(),
                     path,
                     mtime: Identity::of(&meta).mtime,
+                    size: meta.len(),
                 });
             }
         }
         Ok(Self {
             list,
+            keys,
             todos: names(&options.landing_claude.join("todos"))?,
             plans: names(&options.landing_claude.join("plans"))?,
         })
@@ -233,15 +248,19 @@ fn session_mtimes(
 /// (`--retention-margin-days`, default 365): they keep their source
 /// modification times. The retention is the smallest any settings source
 /// sets (managed, user, each lane's project and local), and every file of
-/// a session counts, not only its transcript.
+/// a session counts, not only its transcript. Returns the bytes the pass
+/// would write (an upper bound, for the free-space check).
 ///
 /// # Errors
 /// `RESEAT_RETENTION_UNSAFE`; the I/O refusal of reading the settings or
 /// a transcript's head (its lane and slug, once, then from the ledger).
-pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Result<()> {
+pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Result<u64> {
     let ledger = Ledger::open_read_only(&options.state)?;
+    let root = std::fs::canonicalize(&options.dest_claude).ok();
     let mut lane_dirs = Vec::new();
     let mut mtimes = Vec::new();
+    let mut planned = 0_u64;
+    let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
     for candidate in &sessions.list {
         let cached = match &ledger {
             Some(ledger) => ledger
@@ -249,32 +268,64 @@ pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Resul
                 .filter(|row| row.landing == candidate.path),
             None => None,
         };
-        if let Resolved::Lane(_, lane) =
-            resolve(candidate, cached.as_ref(), lanes, options.unmapped)?
-        {
-            if !lane_dirs.contains(&lane.dest_cwd) {
-                lane_dirs.push(lane.dest_cwd);
+        let dest_key = match resolve(candidate, cached.as_ref(), lanes, options)? {
+            Resolved::Lane(_, lane) => {
+                if !lane_dirs.contains(&lane.dest_cwd) {
+                    lane_dirs.push(lane.dest_cwd.clone());
+                }
+                Some(lane.key)
             }
-        }
+            Resolved::ById(_) => Some(candidate.key.clone()),
+            Resolved::Refused(..) => None,
+        };
         // A session a pass already decided is not read again (S3): its
         // slug is the one it found, or none.
-        let slug = match cached {
-            Some(row) => row.slug,
-            None => head_field(&candidate.path, SLUG)?,
+        let slug = match &cached {
+            Some(row) => row.slug.clone(),
+            None if dest_key.is_some() => head_field(&candidate.path, SLUG)?,
+            None => None,
         };
-        mtimes.extend(session_mtimes(
-            options,
-            sessions,
-            candidate,
-            slug.as_deref(),
-        )?);
+        if dest_key.is_some() {
+            // Only what a pass places is aged by the destination's cleanup.
+            mtimes.extend(session_mtimes(
+                options,
+                sessions,
+                candidate,
+                slug.as_deref(),
+            )?);
+        }
+        if let (Some(dest_key), Some(root)) = (dest_key, root.as_ref()) {
+            let rel = Path::new("projects")
+                .join(&dest_key)
+                .join(format!("{}.jsonl", candidate.sid));
+            let mut files = vec![(candidate.path.clone(), rel)];
+            files.extend(
+                companions(options, sessions, candidate, &dest_key, slug.as_deref())?
+                    .into_iter()
+                    .map(|(landed, rel, _)| (landed, rel)),
+            );
+            if keys_done.insert((candidate.key.clone(), dest_key.clone())) {
+                files.extend(
+                    key_files(options, sessions, &candidate.key, &dest_key)?
+                        .into_iter()
+                        .map(|(landed, rel, _)| (landed, rel)),
+                );
+            }
+            for (landed, rel) in files {
+                planned = planned.saturating_add(place::planned(
+                    ledger.as_ref(),
+                    &root.join(rel),
+                    &landed,
+                )?);
+            }
+        }
     }
     let days = retention_days(options, &lane_dirs)?;
     if mtimes
         .iter()
         .all(|mtime| retained(days, options.retention_margin_days, *mtime, options.now_ns))
     {
-        Ok(())
+        Ok(planned)
     } else {
         Err(BulkloadRefusal::ReseatRetentionUnsafe)
     }
@@ -318,7 +369,9 @@ fn field(path: &Path, wanted: &'static [&'static str], limit: u64) -> Result<Opt
     }
 }
 
-/// Resolve `candidate`'s lane, from its session row when it has one.
+/// Resolve `candidate`'s lane, from its session row when it has one (a
+/// found `cwd` always; "none recorded" while the landed transcript is
+/// unchanged).
 ///
 /// # Errors
 /// I/O refusals of the scan; a destination path that cannot resolve.
@@ -326,11 +379,17 @@ pub fn resolve(
     candidate: &Candidate,
     cached: Option<&Session>,
     lanes: &Lanes,
-    unmapped: Unmapped,
+    options: &Options,
 ) -> Result<Resolved> {
-    let cwd = match cached.and_then(|row| row.source_cwd.clone()) {
-        Some(cwd) => Some(cwd),
-        None => first_cwd(&candidate.path)?,
+    let cwd = match cached.map(|row| (row.source_cwd.clone(), row)) {
+        Some((Some(cwd), _)) if !cwd.is_empty() => Some(cwd),
+        Some((Some(_), row))
+            if row.landed_size == Some(candidate.size)
+                && row.landed_mtime == Some(candidate.mtime) =>
+        {
+            None
+        }
+        _ => first_cwd(&candidate.path)?,
     };
     let Some(cwd) = cwd else {
         return Ok(Resolved::Refused(
@@ -346,7 +405,7 @@ pub fn resolve(
     }
     match lanes.lane(Path::new(&cwd))? {
         Some(lane) => Ok(Resolved::Lane(cwd, lane)),
-        None if unmapped == Unmapped::ById => Ok(Resolved::ById(cwd)),
+        None if options.by_id(&cwd) => Ok(Resolved::ById(cwd)),
         None => Ok(Resolved::Refused(cwd, BulkloadRefusal::ReseatLaneUnmapped)),
     }
 }
@@ -451,6 +510,57 @@ pub fn companions(
     Ok(out)
 }
 
+/// The landed files under project key `key` that belong to no session
+/// (its `memory/`, and anything else: `drafts/`, `vercel-plugin/`, an
+/// orphaned sidecar directory), as `(landed path, destination path
+/// relative to the destination .claude, kind)` under `dest_key`.
+///
+/// # Errors
+/// The I/O refusal of a listing.
+pub fn key_files(
+    options: &Options,
+    sessions: &Sessions,
+    key: &str,
+    dest_key: &str,
+) -> Result<Vec<(PathBuf, PathBuf, Kind)>> {
+    let base = options.landing_claude.join("projects").join(key);
+    let sids: BTreeSet<&str> = sessions
+        .list
+        .iter()
+        .filter(|candidate| candidate.key == key)
+        .map(|candidate| candidate.sid.as_str())
+        .collect();
+    let mut out = Vec::new();
+    for rel in walk(&base)? {
+        let mut parts = rel.components();
+        let first = parts
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let top_level = parts.next().is_none();
+        let transcript = top_level
+            && first
+                .strip_suffix(".jsonl")
+                .is_some_and(|sid| sids.contains(sid));
+        let sidecar = !top_level && sids.contains(first.as_str());
+        if transcript || sidecar {
+            continue;
+        }
+        let kind = if first == "memory" && !top_level {
+            Kind::Memory
+        } else {
+            Kind::Extra
+        };
+        out.push((
+            base.join(&rel),
+            Path::new("projects").join(dest_key).join(&rel),
+            kind,
+        ));
+    }
+    Ok(out)
+}
+
 /// Re-seat every landed Claude session.
 ///
 /// # Errors
@@ -465,35 +575,46 @@ pub fn reseat(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let root = super::root(&options.dest_claude)?;
-    let placer = Placer {
-        ledger,
-        root: &root,
-    };
-    let mut memories: BTreeSet<(String, String)> = BTreeSet::new();
+    let placer = Placer::new(ledger, &root);
+    let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut refused_keys: BTreeMap<String, BulkloadRefusal> = BTreeMap::new();
     for candidate in &sessions.list {
         let cached = ledger
             .session(TOOL, &candidate.sid)?
             .filter(|row| row.landing == candidate.path);
-        let (cwd, lane, dest_key) =
-            match resolve(candidate, cached.as_ref(), lanes, options.unmapped)? {
-                Resolved::Lane(cwd, lane) => {
-                    let key = lane.key.clone();
-                    (cwd, Some(lane), key)
-                }
-                Resolved::ById(cwd) => (cwd, None, candidate.key.clone()),
-                Resolved::Refused(cwd, refusal) => {
-                    summary.session(TOOL, refusal.code());
-                    emit(&session_line(
-                        candidate,
-                        &cwd,
-                        (None, None, None),
-                        "refused",
-                        Some(&refusal),
-                        &BTreeMap::new(),
-                    ))?;
-                    continue;
-                }
-            };
+        let (cwd, lane, dest_key) = match resolve(candidate, cached.as_ref(), lanes, options)? {
+            Resolved::Lane(cwd, lane) => {
+                let key = lane.key.clone();
+                (cwd, Some(lane), key)
+            }
+            Resolved::ById(cwd) => (cwd, None, candidate.key.clone()),
+            Resolved::Refused(cwd, refusal) => {
+                // Cached, so a rerun does not scan it again (S3).
+                ledger.put_session(&Session {
+                    tool: TOOL.to_owned(),
+                    id: candidate.sid.clone(),
+                    landing: candidate.path.clone(),
+                    source_cwd: Some(cwd.clone()),
+                    outcome: refusal.code().to_owned(),
+                    landed_size: Some(candidate.size),
+                    landed_mtime: Some(candidate.mtime),
+                    ..Session::default()
+                })?;
+                refused_keys
+                    .entry(candidate.key.clone())
+                    .or_insert_with(|| refusal.clone());
+                summary.session(TOOL, refusal.code());
+                emit(&session_line(
+                    candidate,
+                    &cwd,
+                    (None, None, None),
+                    "refused",
+                    Some(&refusal),
+                    &BTreeMap::new(),
+                ))?;
+                continue;
+            }
+        };
         let rel = Path::new("projects")
             .join(&dest_key)
             .join(format!("{}.jsonl", candidate.sid));
@@ -547,18 +668,11 @@ pub fn reseat(
                 place(&landed, &dest, kind, &candidate.sid)?;
             }
         }
-        if memories.insert((candidate.key.clone(), dest_key.clone())) {
-            let base = options
-                .landing_claude
-                .join("projects")
-                .join(&candidate.key)
-                .join("memory");
-            for rel in walk(&base)? {
-                let dest = Path::new("projects")
-                    .join(&dest_key)
-                    .join("memory")
-                    .join(&rel);
-                place(&base.join(&rel), &dest, Kind::Memory, "")?;
+        if keys_done.insert((candidate.key.clone(), dest_key.clone())) {
+            // The key's memory and everything else under it that is no
+            // session's (S4, Q185).
+            for (landed, dest, kind) in key_files(options, sessions, &candidate.key, &dest_key)? {
+                place(&landed, &dest, kind, "")?;
             }
         }
         let word = transcript.outcome.word();
@@ -572,6 +686,8 @@ pub fn reseat(
             dest_key: Some(dest_key.clone()),
             slug,
             outcome: word.to_owned(),
+            landed_size: Some(candidate.size),
+            landed_mtime: Some(candidate.mtime),
         })?;
         emit(&session_line(
             candidate,
@@ -580,6 +696,37 @@ pub fn reseat(
             word,
             transcript.outcome.refusal().as_ref(),
             &files,
+        ))?;
+    }
+    // A key none of whose sessions has a lane keeps what is under it that
+    // is no session's in the landing, named (S4).
+    let carried: BTreeSet<&str> = keys_done.iter().map(|(key, _)| key.as_str()).collect();
+    for key in &sessions.keys {
+        if carried.contains(key.as_str()) {
+            continue;
+        }
+        let kept = key_files(options, sessions, key, key)?;
+        if kept.is_empty() {
+            continue;
+        }
+        let refusal = refused_keys
+            .get(key)
+            .cloned()
+            .unwrap_or(BulkloadRefusal::ReseatLaneUnresolved);
+        *summary
+            .files
+            .entry((TOOL.to_owned(), "kept".to_owned()))
+            .or_default() += kept.len() as u64;
+        let first = kept
+            .first()
+            .map(|(landed, _, _)| landed.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        emit(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"key\",\"tool\":\"{TOOL}\",\"key\":{},\"files\":{},\"first\":{},\"outcome\":\"kept\",\"refused\":{}}}",
+            json_string(key),
+            kept.len(),
+            json_string(&first),
+            json_string(refusal.code()),
         ))?;
     }
     Ok(())

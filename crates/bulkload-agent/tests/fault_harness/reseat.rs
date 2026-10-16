@@ -17,7 +17,12 @@
 //!
 //! `Fresh` crashes the first pass; `Grow` the pass after the transcript
 //! grew by 1.5 MiB (so the tail is written in two chunks); `Plan` the pass
-//! after the plan changed. `_exit` models a process crash only (see the
+//! after the plan changed. `Q198` crashes a first pass over the operator's
+//! 2026-10-16 rulings' mutation points (OI-1003-Q198): a symlinked
+//! destination transcript regularized, an existing Codex row spelled
+//! through the `git` symlink re-spelled, a row built from a rowless
+//! rollout's header; `Undo` crashes the `--undo` that reverses the first
+//! two after a full pass. `_exit` models a process crash only (see the
 //! harness header).
 
 use std::fs;
@@ -34,6 +39,14 @@ use super::{Scenario, CHILD_DEADLINE, CHILD_WATCHDOG, CHILD_WATCHDOG_EXIT_CODE, 
 
 /// Set only in a child: the world it re-seats.
 const CHILD_ENV: &str = "BULKLOAD_W7_RESEAT_CHILD_BASE";
+/// Set only in a child that runs `--undo` instead of a pass.
+const CHILD_UNDO_ENV: &str = "BULKLOAD_W7_RESEAT_CHILD_UNDO";
+/// The OI-1003-Q198 world's threads: one the destination already holds,
+/// spelled through the `git` symlink, and one with no snapshot row.
+const SPELLED: &str = "019a0000-0000-7000-8000-00000000c0c2";
+const ROWLESS: &str = "019a0000-0000-7000-8000-00000000c0c3";
+/// The OI-1003-Q198 world's own (sting's) symlinked session.
+const OWN: &str = "c0c0c0c0-9999-4999-8999-999999999999";
 const SID: &str = "c0c0c0c0-1111-4222-8333-444444444444";
 const THREAD: &str = "019a0000-0000-7000-8000-00000000c0c0";
 const ROLLOUT: &str =
@@ -54,6 +67,10 @@ pub enum Reseat {
     /// The first pass, with the rollout landed as `.jsonl.zst` (placed
     /// decompressed, review 0 finding 1).
     Zst,
+    /// The first pass over the OI-1003-Q198 world.
+    Q198,
+    /// The `--undo` after a full pass over the OI-1003-Q198 world.
+    Undo,
 }
 
 impl Scenario for Reseat {
@@ -220,6 +237,97 @@ impl World {
     }
 }
 
+impl World {
+    fn rollout_rel(thread: &str) -> String {
+        format!("sessions/2026/10/16/rollout-2026-10-16T10-00-00-{thread}.jsonl")
+    }
+
+    fn real_lab(&self) -> String {
+        self.base
+            .join("real-git/lab")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn spelled_lab(&self) -> String {
+        self.base
+            .join("dest/git/lab")
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn own_link(&self) -> PathBuf {
+        self.base
+            .join("dest/.claude/projects")
+            .join(self.key())
+            .join(format!("{OWN}.jsonl"))
+    }
+
+    fn own_target(&self) -> PathBuf {
+        self.base
+            .join("archive/claude")
+            .join(format!("{OWN}.jsonl"))
+    }
+
+    fn own_bytes() -> Vec<u8> {
+        (0..40).map(line).collect::<String>().into_bytes()
+    }
+
+    /// The OI-1003-Q198 additions: a symlinked destination transcript
+    /// (sting's own), a destination row spelled through `dest/git`
+    /// naming the destination's own rollout, and a rowless rollout.
+    fn q198(&self) {
+        let target = self.own_target();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, Self::own_bytes()).unwrap();
+        fs::create_dir_all(self.own_link().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, self.own_link()).unwrap();
+        let landed = self.base.join("landing/.codex");
+        for thread in [SPELLED, ROWLESS] {
+            let path = landed.join(Self::rollout_rel(thread));
+            fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{thread}\",\"cwd\":\"/Users/jess/git/lab\"}}}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        rusqlite::Connection::open(landed.join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "INSERT INTO threads VALUES (?1, ?2, 2, 2, 'cli', '/Users/jess/git/lab', 't')",
+                rusqlite::params![
+                    SPELLED,
+                    format!("/Users/jess/.codex/{}", Self::rollout_rel(SPELLED))
+                ],
+            )
+            .unwrap();
+        rusqlite::Connection::open(self.base.join("dest/.codex/state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "INSERT INTO threads VALUES (?1, '/srv/archive/own.jsonl', 2, 2, 'cli', ?2, 'sting')",
+                rusqlite::params![SPELLED, self.spelled_lab()],
+            )
+            .unwrap();
+    }
+
+    fn row(&self, id: &str) -> Option<(String, String, String)> {
+        rusqlite::Connection::open(self.base.join("dest/.codex/state_5.sqlite"))
+            .unwrap()
+            .query_row(
+                "SELECT cwd, rollout_path, title FROM threads WHERE id = ?1",
+                rusqlite::params![id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok()
+    }
+
+    fn undo(&self) -> (u64, u64) {
+        reseat::undo(&Self::options(&self.base), &mut |_| Ok(())).unwrap()
+    }
+}
+
 /// `path` with `.zst` appended.
 fn compressed(path: &Path) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
@@ -236,9 +344,9 @@ fn landed_bytes(path: &Path) -> Option<Vec<u8>> {
     })
 }
 
-/// Run this test binary as a child that re-seats with `fault` armed: it
-/// must end itself at that point.
-fn crash(world: &World, fault: &str) {
+/// Run this test binary as a child that re-seats (or, with `undo`, runs
+/// `--undo`) with `fault` armed: it must end itself at that point.
+fn crash_mode(world: &World, fault: &str, undo: bool) {
     assert!(
         std::env::var_os(FAULT_ENV).is_none(),
         "the harness process itself must not be armed"
@@ -252,6 +360,7 @@ fn crash(world: &World, fault: &str) {
             "--nocapture",
         ])
         .env(CHILD_ENV, &world.base)
+        .env(CHILD_UNDO_ENV, if undo { "1" } else { "0" })
         .env(FAULT_ENV, fault)
         .env_remove(super::CHILD_ENV)
         .stdin(Stdio::null())
@@ -298,6 +407,10 @@ fn reseat_child_entry() {
         // ends only itself.
         unsafe { libc::_exit(CHILD_WATCHDOG_EXIT_CODE) }
     });
+    if std::env::var_os(CHILD_UNDO_ENV).is_some_and(|mode| mode == "1") {
+        let outcome = reseat::undo(&World::options(&base), &mut |_| Ok(()));
+        panic!("the armed point was not reached: undo returned {outcome:?}");
+    }
     let outcome = reseat::reseat(&World::options(&base), &mut |_| Ok(()));
     panic!("the armed point was not reached: reseat returned {outcome:?}");
 }
@@ -346,10 +459,24 @@ fn scenario(point: Point, nth: u64, kind: Reseat) {
                 )
                 .unwrap();
         }
+        Reseat::Q198 => world.q198(),
+        Reseat::Undo => {
+            world.q198();
+            world.reseat();
+        }
     }
     let landed = fs::read(world.landed_transcript()).unwrap();
 
-    crash(&world, &format!("{}:{nth}", point.name()));
+    crash_mode(
+        &world,
+        &format!("{}:{nth}", point.name()),
+        kind == Reseat::Undo,
+    );
+    match kind {
+        Reseat::Q198 => return settled_q198(&world, &pairs, &label),
+        Reseat::Undo => return settled_undo(&world, &label),
+        Reseat::Fresh | Reseat::Grow | Reseat::Plan | Reseat::Zst => {}
+    }
 
     // Never overwritten: a prefix of the landed transcript, or absent; the
     // plan old or new. A crash inside an extension leaves a strict, longer
@@ -465,4 +592,148 @@ fn settled(world: &World, pairs: &[(PathBuf, PathBuf)], label: &str) {
     );
     let checked = reseat::check(&World::options(&world.base), &mut |_| Ok(())).unwrap();
     assert!(checked.verdict().is_ok(), "{label}: {checked:?}");
+}
+
+/// The rerun after a crash in a first pass over the OI-1003-Q198 world:
+/// the symlinked transcript a regular copy of its target (the archive
+/// kept), the spelled row re-spelled in `cwd` only (its rollout and title
+/// the destination's, the ledger `applied`, nothing placed beside it), the
+/// rowless rollout placed with a row from its header, no temporary; then
+/// an unchanged rerun reads 0 landed bytes.
+fn settled_q198(world: &World, pairs: &[(PathBuf, PathBuf)], label: &str) {
+    let summary = world.reseat();
+    assert_eq!(
+        fs::read(world.own_link()).unwrap(),
+        World::own_bytes(),
+        "{label}: {summary:?}"
+    );
+    assert!(
+        fs::symlink_metadata(world.own_link()).unwrap().is_file(),
+        "{label}"
+    );
+    assert_eq!(
+        fs::read(world.own_target()).unwrap(),
+        World::own_bytes(),
+        "{label}"
+    );
+    for (landed, dest) in pairs {
+        assert_eq!(
+            fs::read(dest).ok(),
+            landed_bytes(landed),
+            "{label}: {dest:?}"
+        );
+    }
+    assert_eq!(
+        world.temporaries(),
+        Vec::<PathBuf>::new(),
+        "{label}: a temporary left"
+    );
+    assert_eq!(
+        world.row(SPELLED),
+        Some((
+            world.real_lab(),
+            "/srv/archive/own.jsonl".to_owned(),
+            "sting".to_owned()
+        )),
+        "{label}"
+    );
+    let rowless = world
+        .base
+        .join("dest/.codex")
+        .join(World::rollout_rel(ROWLESS));
+    assert!(rowless.is_file(), "{label}");
+    assert_eq!(
+        world.row(ROWLESS).map(|row| (row.0, row.1)),
+        Some((world.real_lab(), rowless.to_string_lossy().into_owned())),
+        "{label}"
+    );
+    assert!(
+        !world
+            .base
+            .join("dest/.codex")
+            .join(World::rollout_rel(SPELLED))
+            .exists(),
+        "{label}: placed beside the destination's own row"
+    );
+    {
+        let ledger = reseat::ledger::Ledger::open_read_only(&world.base.join("state"))
+            .unwrap()
+            .unwrap();
+        let rows = ledger.cwd_updates().unwrap();
+        assert_eq!(rows.len(), 1, "{label}");
+        assert_eq!(rows[0].state, "applied", "{label}");
+        assert_eq!(rows[0].old_cwd, world.spelled_lab(), "{label}");
+        let regulars = ledger.regulars().unwrap();
+        assert_eq!(regulars.len(), 1, "{label}");
+        assert_eq!(
+            regulars[0].state,
+            reseat::ledger::RegularState::Done,
+            "{label}"
+        );
+    }
+    let before = Counters::snapshot();
+    let summary = world.reseat();
+    assert_eq!(
+        Counters::snapshot()
+            .since(before)
+            .get(Counter::ReseatLandingRead),
+        0,
+        "{label}: {summary:?}"
+    );
+    assert_eq!(
+        summary.rows.get("unchanged"),
+        Some(&2),
+        "{label}: {summary:?}"
+    );
+}
+
+/// The rerun of an `--undo` crashed after a full pass over the
+/// OI-1003-Q198 world: the symlink back with its text, the copy gone, the
+/// archive kept, the spelled row's old `cwd` back, the ledger `undone`, no
+/// temporary; a second undo has nothing left to do.
+fn settled_undo(world: &World, label: &str) {
+    let (links, rows) = world.undo();
+    assert!(links <= 1 && rows <= 1, "{label}");
+    assert_eq!(
+        fs::read_link(world.own_link()).ok(),
+        Some(world.own_target()),
+        "{label}"
+    );
+    assert_eq!(
+        fs::read(world.own_target()).unwrap(),
+        World::own_bytes(),
+        "{label}"
+    );
+    assert_eq!(
+        world.temporaries(),
+        Vec::<PathBuf>::new(),
+        "{label}: a temporary left"
+    );
+    assert_eq!(
+        world.row(SPELLED).map(|row| row.0),
+        Some(world.spelled_lab()),
+        "{label}"
+    );
+    {
+        let ledger = reseat::ledger::Ledger::open_read_only(&world.base.join("state"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            ledger
+                .cwd_updates()
+                .unwrap()
+                .iter()
+                .all(|row| row.state == "undone"),
+            "{label}"
+        );
+        assert!(
+            ledger
+                .regulars()
+                .unwrap()
+                .iter()
+                .all(|row| row.state == reseat::ledger::RegularState::Undone),
+            "{label}"
+        );
+    }
+    assert_eq!(world.undo(), (0, 0), "{label}");
 }

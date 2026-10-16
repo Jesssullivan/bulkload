@@ -1427,6 +1427,49 @@ contract is `docs/design.md`, "Agent session re-seat".
   and home and `/private/tmp` sessions (`--unmapped`, `--waive`). The verb
   takes no decision on any of them: its defaults are the conservative ones.
 
+### Addendum 2026-10-16: the re-reviews of `8a89f9a` and OI-1003-Q198 (TIN-6587)
+
+No SLO number changes. The two re-reviews of `8a89f9a` (data safety:
+fix first, one MAJOR; user outcome: mergeable, four minors) and the
+operator's rulings OI-1003-Q198 (Linear TIN-6587, comment `fbccc49b`)
+amend the R0 amendment above; the contract is `docs/design.md`, "Agent
+session re-seat", and the receipt
+`docs/agent-notes/2026-10-16-estate-reseat-rereview-fixes.md`.
+
+- **S3** now holds on neo's real shape: a session refused (unmapped,
+  unresolved) or unreadable is ledgered by its landed identity and not
+  read again, so an unchanged rerun reads 0 landed bytes with them too.
+- **S4** gains `RESEAT_LOCKED` (another run holds a destination root or
+  STATE), `RESEAT_REGULARIZE_RACED` and, before writing,
+  `DESTINATION_SPACE_INSUFFICIENT` (the engine's `--min-free-percent` rule
+  over the bytes a pass would write). Everything under a project key that
+  is no session's is carried with its key or named by a `key` line
+  (Q185). A rollout recorded outside every `--codex-source-root` is
+  `RESEAT_LANE_UNMAPPED:rollout-root` in `--check` too.
+- **S5, as ruled:** the destination's own Codex row or rollout form for a
+  thread is never replaced and nothing is placed beside it, for rollouts
+  with no snapshot row too (the MAJOR); a destination file with more than
+  one link is never written. Two destination changes are ruled
+  (OI-1003-Q198): an existing row whose `cwd` only spells the lane through
+  a symlink gets that column re-spelled, and a symlinked transcript is
+  replaced by a regular copy of its target (the archive kept); both are
+  ledgered with their old values and reversed by `--undo` wherever the
+  destination still holds exactly what re-seat wrote.
+- **R0 acceptance** also fails a longer landed form of a rollout that was
+  never placed (`extra-form-unplaced`), and names a row carrying the
+  source's `cwd` (`row-cwd-is-source`). Rollouts with no snapshot row get a
+  row from their header (Q198 D), so their lane's picker lists them; home
+  and `/private/tmp` sessions are placed by ID and are in no lane (Q198 C).
+- **Proof:** `reseat::tests::findings::rereview` (nine rows, each failing
+  against `8a89f9a` first) and `reseat::tests::findings::q198` (seven
+  rows), the CLI space row and two more real-binary canaries in
+  `tests/estate_reseat.rs`, and sixteen fault-harness rows over twelve
+  `reseat.*` points.
+- **Resolved by OI-1003-Q198** (the open items above): where lanes key
+  (A), gftb and GloriousFlywheel (B), home and `/private/tmp` sessions (C),
+  rowless rollouts (D), `.zst` rollouts (E), sting's symlinked transcripts
+  and the ~9,242 `~/git`-spelled Codex rows.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

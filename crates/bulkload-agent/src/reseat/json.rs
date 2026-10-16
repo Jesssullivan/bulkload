@@ -258,6 +258,149 @@ pub fn nested_string(line: &[u8], path: &[&str]) -> Option<String> {
     None
 }
 
+/// The raw bytes of the value at the object key path `path` in one JSON
+/// line (a string with its quotes, an object or array with its brackets,
+/// or a scalar), or `None` when there is none.
+#[must_use]
+pub fn nested_raw<'a>(line: &'a [u8], path: &[&str]) -> Option<&'a [u8]> {
+    // One entry per open container: (is an object, its current key, a key
+    // is expected next).
+    let mut stack: Vec<(bool, Vec<u8>, bool)> = Vec::new();
+    let mut at = 0;
+    let matches = |stack: &[(bool, Vec<u8>, bool)]| {
+        stack.len() == path.len()
+            && stack
+                .iter()
+                .zip(path)
+                .all(|((object, key, _), want)| *object && key == want.as_bytes())
+    };
+    while let Some(&byte) = line.get(at) {
+        let at_value = stack.last().is_some_and(|top| top.0 && !top.2) && matches(&stack);
+        if at_value && !byte.is_ascii_whitespace() && byte != b':' {
+            let end = value_end(line, at)?;
+            return line.get(at..end);
+        }
+        match byte {
+            b'{' => stack.push((true, Vec::new(), true)),
+            b'[' => stack.push((false, Vec::new(), false)),
+            b'}' | b']' => {
+                stack.pop();
+            }
+            b',' => {
+                if let Some(top) = stack.last_mut().filter(|top| top.0) {
+                    top.2 = true;
+                }
+            }
+            b':' => {
+                if let Some(top) = stack.last_mut().filter(|top| top.0) {
+                    top.2 = false;
+                }
+            }
+            b'"' => {
+                let end = string_end(line, at)?;
+                let raw = line.get(at + 1..end - 1)?;
+                if let Some(top) = stack.last_mut().filter(|top| top.0 && top.2) {
+                    top.1 = raw.to_vec();
+                }
+                at = end;
+                continue;
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The end (exclusive) of the string starting with the quote at `at`.
+fn string_end(line: &[u8], at: usize) -> Option<usize> {
+    let mut end = at + 1;
+    let mut escape = false;
+    loop {
+        let inner = *line.get(end)?;
+        if escape {
+            escape = false;
+        } else if inner == b'\\' {
+            escape = true;
+        } else if inner == b'"' {
+            return Some(end + 1);
+        }
+        end += 1;
+    }
+}
+
+/// The end (exclusive) of the value starting at `at`.
+fn value_end(line: &[u8], at: usize) -> Option<usize> {
+    match *line.get(at)? {
+        b'"' => string_end(line, at),
+        b'{' | b'[' => {
+            let mut depth = 0_usize;
+            let mut end = at;
+            loop {
+                match *line.get(end)? {
+                    b'"' => {
+                        end = string_end(line, end)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(end + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                end += 1;
+            }
+        }
+        _ => {
+            let mut end = at;
+            while let Some(&byte) = line.get(end) {
+                if matches!(byte, b',' | b'}' | b']') || byte.is_ascii_whitespace() {
+                    break;
+                }
+                end += 1;
+            }
+            Some(end)
+        }
+    }
+}
+
+/// The top-level elements of a raw JSON array, raw.
+#[must_use]
+pub fn elements(raw: &[u8]) -> Vec<&[u8]> {
+    let mut out = Vec::new();
+    if raw.first() != Some(&b'[') {
+        return out;
+    }
+    let mut at = 1;
+    while let Some(&byte) = raw.get(at) {
+        if byte == b']' {
+            break;
+        }
+        if byte == b',' || byte.is_ascii_whitespace() {
+            at += 1;
+            continue;
+        }
+        let Some(end) = value_end(raw, at) else {
+            break;
+        };
+        if let Some(element) = raw.get(at..end) {
+            out.push(element);
+        }
+        at = end;
+    }
+    out
+}
+
+/// A raw JSON string value decoded, or `None` when it is not a string.
+#[must_use]
+pub fn raw_string(raw: &[u8]) -> Option<String> {
+    let inner = raw.strip_prefix(b"\"")?.strip_suffix(b"\"")?;
+    unescape(inner)
+}
+
 /// A JSON string's raw bytes (between the quotes) decoded, or `None` for a
 /// malformed escape or invalid UTF-8.
 fn unescape(raw: &[u8]) -> Option<String> {
@@ -366,5 +509,29 @@ mod tests {
         scanner.feed(br#"tail of a line","cwd":"/wrong"}"#);
         scanner.feed(b"\n{\"cwd\":\"/right\"}\n");
         assert_eq!(scanner.get(0), Some("/right"));
+    }
+
+    #[test]
+    fn nested_raw_finds_values_of_any_kind() {
+        let line = br#"{"type":"session_meta","payload":{"base":{"text":"x \"source\":1"},"source":{"subagent":{"thread_spawn":{"parent_thread_id":"p","depth":2}}},"cwd":"/a","n": 42 ,"content":[{"type":"input_text","text":"hi"},{"text":"b\"c"}]}}"#;
+        assert_eq!(
+            super::nested_raw(line, &["payload", "source"]),
+            Some(&br#"{"subagent":{"thread_spawn":{"parent_thread_id":"p","depth":2}}}"#[..])
+        );
+        assert_eq!(
+            super::nested_raw(line, &["payload", "cwd"]),
+            Some(&br#""/a""#[..])
+        );
+        assert_eq!(super::nested_raw(line, &["payload", "n"]), Some(&b"42"[..]));
+        assert_eq!(super::nested_raw(line, &["payload", "missing"]), None);
+        let content = super::nested_raw(line, &["payload", "content"]).unwrap();
+        let elements = super::elements(content);
+        assert_eq!(elements.len(), 2);
+        assert_eq!(
+            super::nested_string(elements.get(1).unwrap(), &["text"]).as_deref(),
+            Some("b\"c")
+        );
+        assert_eq!(super::raw_string(br#""x\ny""#).as_deref(), Some("x\ny"));
+        assert_eq!(super::raw_string(b"42"), None);
     }
 }

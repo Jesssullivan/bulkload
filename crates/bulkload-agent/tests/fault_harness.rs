@@ -1485,6 +1485,16 @@ scenarios! {
     // published as plain `.jsonl` (review 0, finding 1).
     reseat_zst_after_temp_seal_rollout => ReseatAfterTempSeal: 4, Reseat::Zst;
     reseat_zst_after_publish_rollout => ReseatAfterPublish: 4, Reseat::Zst;
+    // The operator's 2026-10-16 rulings (OI-1003-Q198): a symlinked
+    // destination transcript regularized, an existing Codex row's `cwd`
+    // re-spelled, a row built from a rowless rollout's header; and the
+    // `--undo` that reverses the first two. Each settled forward by the
+    // rerun.
+    reseat_q198_after_regularize_exchange => ReseatAfterRegularizeExchange: 1, Reseat::Q198;
+    reseat_q198_after_cwd_update => ReseatAfterCwdUpdate: 1, Reseat::Q198;
+    reseat_q198_after_synth_row_insert => ReseatAfterSynthRowInsert: 1, Reseat::Q198;
+    reseat_q198_undo_after_exchange => ReseatAfterUndoExchange: 1, Reseat::Undo;
+    reseat_q198_undo_after_cwd => ReseatAfterUndoCwd: 1, Reseat::Undo;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.
