@@ -5,9 +5,12 @@ Lane: estate-handoff-20261016. Worktree
 `feat/estate-handoff-20261016`, off `3fe1f07` (the signed #226 adopt
 commit, on main `5beb031`).
 
-**Status: built** (section 17, "As built", records what differs from the
-design below and why). Sections 0 to 16 are the design as written before
-the build; code citations there are to `3fe1f07`.
+**Status: built, then reviewed and fixed** (section 17, "As built",
+records what differs from the design below and why; section 18 is the
+review of 2026-10-16 against `9ec8d36` and what changed for each
+finding). Sections 0 to 16 are the design as written before the build;
+code citations there are to `3fe1f07`. Where section 18 contradicts an
+earlier section, section 18 is current.
 
 Rulings this serves:
 
@@ -30,6 +33,11 @@ Rulings this serves:
 - R-N98: only the product's own tests disable hooks, and only in fixture
   repositories.
 - R-N13.
+- **OI-1003-Q185 (2026-10-16)**, relayed in the review task: nothing is
+  ever excluded from a carry. The hand-off never strips or drops user
+  content; the privacy concern is only that the block (absolute paths,
+  host names) is never committed or pushed upstream. It withdraws the
+  capture strip of section 9.6 (see 18.3).
 
 ## 0. Key decisions
 
@@ -967,6 +975,10 @@ above; R-N13 for this note.
    the block was written over, checked with `git hash-object` of the
    remainder) equals the seat's landed blob. With the guard disabled, H20
    shows converge replacing the seat and losing the user's line.
+   **Corrected by section 18 (C1, C2):** as built in `9ec8d36` the guard
+   held only for a print the render itself took; the keep path and the
+   settle re-took prints under the old `base` and did vouch for an edit
+   below the block. Every re-take now goes through `retaken`.
 5. **Racy prints (S3).** `held` trusts the record's print only before the
    racy window of the record's `recorded_ns`, as `prove` does for the
    ledger (unit row `a_racy_record_print_is_proved_by_reading`, failing
@@ -1017,7 +1029,8 @@ above; R-N13 for this note.
 
 The estate-wide `INDEX.md`/`index.json` under PRIVATE_STATE (section
 3.3), the `handoff` field in `estate-diff` rows, `--commit-guard` and the
-capture strip (section 9.5 and 9.6, PR 3). A block holds its own
+capture strip (section 9.5 and 9.6, PR 3; the strip is withdrawn under
+OI-1003-Q185, section 18.3). A block holds its own
 repository family only, capped at 40 rows.
 
 ### 17.4 Proof (failing first)
@@ -1051,10 +1064,166 @@ conservative default built:
 2. Whether the H step should also re-render a refused item's own
    workspace (it now leaves it alone).
 
+## 18. Review of 2026-10-16 and fixes
+
+Two refuters reproduced findings against `9ec8d36` (converge safety;
+privacy and claims). This section is the lane's answer, built on top of
+`9ec8d36` in this worktree. Rulings: OI-1003-Q183 (TIN-6569), OI-1003-Q185
+(nothing is excluded from a carry), OI-1003-Q173, OI-1003-Q144/Q149 (S5),
+R-N13. Each finding was reproduced first by a row that failed on
+`9ec8d36`, then fixed; none was rejected.
+
+### 18.1 Per-finding table
+
+| # | Refuter, severity | Finding | Reproduced (failed on `9ec8d36`) | Fix | Outcome |
+|---|---|---|---|---|---|
+| C1 | converge safety, BLOCKER | A plain rerun over an intact block after a user edit below it re-took the record's print and kept the old `base`; the next converge trusted the print and landed over the edit; `estate-diff` said `identical` | H21: `estate-diff` `identical`, then the user's line overwritten | `render_workspace`'s keep path re-takes a moved print only through `retaken`, which re-reads the file and checks the bytes under the block against the landed blob at that print; a kept target keeps the print its bytes were checked at | Fixed. H21 passes; M04a (the original shape) killed |
+| C2 | converge safety, MAJOR | `settle` re-took prints with the old `base`: a crashed re-render settled by a run that then refused (privacy) vouched for the edit | fault row `estate_handoff_rerender_over_edit`: `seats-replaced=2`, the edit lost | `settle` re-takes every print through `retaken` | Fixed; M05 killed |
+| C3 | converge safety, minor | A crashed `--clear` was undone by the next `estate-apply` (even a no-op): the H step re-rendered | fault row `estate_handoff_clear_noop_apply`: the block back on `AGENTS.md` | `settle` finishes a pending clear (roll forward; a refusal keeps the intent); the H step (`Request.h_step`) never starts a render and reports `handoff=cleared`; `recorded_options` also opts in on a pending clear intent; `clear` keeps its intent on a refusal | Fixed; M16, M17 killed |
+| C4 | converge safety, minor | A block carried in from the source refused render and `--clear` forever (`HANDOFF_BLOCK_MODIFIED`, "foreign") | H24: render refused | Owner identity (18.2): a block naming another landing is content (`Held::Foreign`), kept below this landing's block, named as carried, never cleared | Fixed; M13, M14 killed |
+| P1 | privacy, BLOCKER | The guard read a landing's preserved inert ssh origin as `no-remote` and wrote into landed clones of public repositories by default | H26: `"private":"no-remote"`, block written | `privacy` reads `remote.*.url`/`pushurl` in the common directory's `carry-config/source-config` and `source-config.worktree` as well | Fixed; M07 killed |
+| P2 | privacy, MAJOR | `ready` was true at birth beside a live sibling, and unreachable after consolidating (dest-ahead and changed seats counted open) | H29: `open 2`, `ready:false` after a consolidating commit | Open rows are now diverged and source-ahead refs, a sibling whose HEAD and the landing's HEAD are in neither one's history, destination-only worktrees whose HEAD no other branch holds, refusals and a newer capture; a destination commit, dest-ahead or a changed seat is consolidation | Fixed for committed work; H29 passes; M18, M19 killed. `ready` still reads commits only (operator question 2) |
+| P3 | privacy, MAJOR | Commit detection read branch tips only; a block committed and removed later went unreported | H28: `--check` ok | `history_has_token`: `git log --branches --tags [HEAD] -S TOKEN -- <targets>` (carried `refs/carry/` refs are not read) | Fixed; M10 killed |
+| P4 | privacy, MAJOR | Six mutations survived the H suite and unit rows | The refuter did not list them; this lane ran its own 28 (18.4) | Rows H20 to H35, two unit rows and two fault rows added until each mutant died | Fixed: 28 of 28 killed |
+| P5 | privacy, MAJOR | Re-carrying a handed-off landing copied the block to the next host, naming wrong paths; bulkload could neither render nor clear it | H25: render refused on the third landing | Owner identity (18.2); Q185: the carried block is kept, byte for byte, below the new block, which names it as carried and tells agents not to act on its paths | Fixed; M13, M14 killed |
+| P6 | privacy, minor | A plain rerun dropped `--sibling`; the block's printed `--check` said `stale` for any render made with flags | H30: sibling gone, `stale` | `effective`: options not given are the record's (siblings, private prefixes, allowed, readme), for render, check and the H step | Fixed; M20 killed |
+| P7 | privacy, minor | Doc claims went further than the code | The refuter's list was not handed over; this lane audited every hand-off claim | Corrected: `docs/design.md` (privacy "no remote", "foreign block" refusal, "settles a crash forward", where paths go, commit detection), `docs/slo.md` S5 (the hand-off refuses only an edit inside the block), 17.2 item 4 here ("never vouches" was false on the keep and settle paths), `docs/formal/README.md` ("racy re-dating S3 only"), the usage text | Fixed as far as found; operator question 6 |
+| P8 | privacy, minor | The prefix check used raw URLs and ignored `insteadOf`/`pushInsteadOf` | H27: refusal missing for both | Each URL is checked as written and as rewritten by the longest `insteadOf` and `pushInsteadOf` rule from the repository's, the preserved, the user's global and the system configuration (located as Git does; read by `--file`, so bulkload's own children stay off global config) | Fixed; M08 killed |
+| P9 | privacy, minor | Codex never reads `AGENTS.md` when `AGENTS.override.md` exists | H31: no block in the override | An existing `AGENTS.override.md` is a target (prefixed, never created; a symlink to `AGENTS.md` or `CLAUDE.md` is covered) | Fixed; M26 killed (H34) |
+
+### 18.2 Owner identity and carried blocks (C4, P5; OI-1003-Q185)
+
+The BEGIN line now carries `for=<16 hex>`, the blake3 of the destination
+host, the workspace path as planned and the SOURCE label
+(`render::owner`). A block at byte 0 that no record vouches for is:
+
+- this landing's when its `for=` is this landing's identity: an edit
+  inside, a cut END line, or a block with no record: `Modified`, refused
+  as before (H7);
+- otherwise **carried**: it came with the source's bytes (the source was
+  itself a handed-off checkout, or a re-carry to another host or path).
+  It is content. A render prepends this landing's block above it and keeps
+  it byte for byte; the block lists it under "Carried hand-off blocks";
+  `--check` reports `carried` until this landing's block is on; `--clear`
+  removes only this landing's block; converge proves it as landed
+  content, and the record's `carried` flag keeps the note on later
+  renders. Bulkload never strips it; removing it is the user's call.
+
+Commit detection still flags the token wherever it is (a carried block
+committed at the source is still a block in pushable history).
+
+### 18.3 Other changes
+
+- **Capture strip withdrawn.** Section 9.6's plan (a capture strips an
+  intact block) contradicts OI-1003-Q185 and is withdrawn; 18.2 handles a
+  carried block at the next landing instead.
+- **`retaken` is the one way a record's print is written after a read**
+  (keep, settle, re-dating). The re-dating path (an unchanged rerun past
+  the racy window) also checks the bytes first: a user edit made between a
+  render's exchange and its `lstat` is caught there (unit row
+  `a_redated_print_never_vouches_for_an_edit_made_after_the_exchange`,
+  through a new `cfg(test)` hook `mid_pass::Stage::HandoffWritten`).
+- **`git_env::USER_CONFIG`** names the variables Git uses to find the
+  global and system files, so the privacy guard reads their rewrite rules
+  by path without a new `Command` site (the S2 source-command registry
+  passes unchanged).
+- **Model.** `EstateConverge` models the record's print, its racy flag and
+  its base (`HTrusted`, `HRetake`, `HandoffKeep` as a disjunct of
+  `HandoffStart`), a settle that finishes a clear, and the new mutation
+  `handoff_retake_unchecked` (fails `NoLocalWorkLost`). Details and the
+  row table: `docs/formal/README.md`, "TIN-6569".
+
+### 18.4 Mutation table
+
+Each mutant is one edit of `handoff.rs` or `render.rs`, run against
+`cargo test -p bulkload-agent --lib handoff`, `--test estate_handoff`
+and the `estate_handoff` fault-harness rows (stopping at the first
+failing suite). Runner and sites: `/dev/shm/handoff-lane/mut/` (scratch).
+
+| Mutant | Edit | First run | Killed by |
+|---|---|---|---|
+| M01_overlay_base_guard_off | converge trusts a record print whatever its `base` | KILLED | `h20_a_block_over_a_users_edit_never_vouches_for_it`, `h21_a_plain_rerun_never_vouches_for_an_edit_below_the_block` |
+| M02_held_trusts_racy_print | the hand-off trusts a racy record print | KILLED | `unit a_racy_record_print_is_proved_by_reading` |
+| M03_overlay_trusts_racy_print | converge trusts a racy record print | KILLED | `h14_estate_diff_reads_a_handed_off_item_as_identical` |
+| M04_keep_retakes_print_unchecked | keep path skips `retaken` (keeps the old print) | SURVIVED | `h33_a_rerun_after_an_edit_below_settles_to_writing_nothing` |
+| M05_settle_retakes_print_unchecked | settle re-takes prints with the old base (C2 as found) | KILLED | `fault row estate_handoff_rerender_over_edit` |
+| M06_redate_unchecked | re-dating a racy print skips `retaken` | SURVIVED | `unit a_redated_print_never_vouches_for_an_edit_made_after_the_exchange` |
+| M07_privacy_ignores_preserved_origin | guard ignores `carry-config/source-config*` | KILLED | `h26_a_preserved_inert_origin_is_still_a_remote` |
+| M08_privacy_ignores_rewrites | guard ignores `insteadOf`/`pushInsteadOf` | KILLED | `h27_insteadof_rewrites_are_checked` |
+| M09_privacy_always_private | guard accepts every URL | KILLED | `h26_a_preserved_inert_origin_is_still_a_remote`, `h11_privacy_is_deny_by_default_and_urls_are_never_printed`, `h27_insteadof_rewrites_are_checked` |
+| M10_no_history_scan | no branch/tag history scan | KILLED | `h28_a_block_in_branch_history_is_reported` |
+| M11_no_index_scan | no index blob scan | KILLED | `h12_check_detects_a_staged_or_committed_block` |
+| M12_exchange_unchecked | exchange never checks the displaced file | KILLED | `unit the_exchange_is_undone_when_the_target_moved_after_the_read` |
+| M13_own_marker_read_as_foreign | an unrecorded block of this landing is read as carried | KILLED | `unit a_racy_record_print_is_proved_by_reading` |
+| M14_foreign_block_read_as_modified | a carried block is read as an edited one | KILLED | `h24_a_block_carried_from_the_source_is_kept_as_content`, `h25_a_recarried_landing_keeps_the_earlier_block_below_its_own` |
+| M15_overlay_any_prefix | `skip_prefix` accepts any bytes of the recorded length | KILLED | `unit holds_accepts_the_recorded_block_then_the_landed_blob_only` |
+| M16_crashed_clear_not_rolled_forward | settle re-records instead of finishing a clear | KILLED | `fault row estate_handoff_clear_noop_apply` |
+| M17_h_step_starts_a_render | the H step renders after a settle that cleared | KILLED | `fault row estate_handoff_clear_noop_apply` |
+| M18_dest_ahead_is_open | dest-ahead counts as open | KILLED | `h29_ready_follows_consolidation` |
+| M19_sibling_always_consolidated | the sibling always counts as reconciled | KILLED | `h29_ready_follows_consolidation` |
+| M20_rerun_drops_options | a rerun drops the recorded siblings | KILLED | `h30_a_plain_rerun_and_the_printed_check_keep_the_records_options`, `h29_ready_follows_consolidation` |
+| M21_lift_unchecked | lift removes a created file without its digest check | KILLED | `h32_an_edited_created_file_is_never_lifted` |
+| M22_removed_by_hand_re_added | a block removed by hand is re-added | KILLED | `h7_an_edit_inside_the_block_makes_the_file_the_users` |
+| M23_clear_remove_unchecked | clear removes a created file without checking it | SURVIVED | `unit the_removal_is_undone_when_the_target_moved_after_the_read` |
+| M24_sweep_deletes_any_temp | sweep deletes a third party's temporary | KILLED | `unit settle_puts_back_a_third_partys_file_a_crash_displaced` |
+| M25_held_ignores_block_digest | a marker of the right length counts as intact | KILLED | `unit a_racy_record_print_is_proved_by_reading` |
+| M26_override_created | `AGENTS.override.md` may be created | SURVIVED | `h34_an_override_the_source_deletes_is_never_created` |
+| M27_inputs_ignore_refs | the inputs digest leaves refs out | SURVIVED | `h35_a_new_destination_ref_makes_the_block_stale` |
+| M04a_keep_relstat_old_base | keep path re-takes the print by `lstat` with the old base (the BLOCKER as found) | added in round 2 | `h21_a_plain_rerun_never_vouches_for_an_edit_below_the_block`, `h33_a_rerun_after_an_edit_below_settles_to_writing_nothing` |
+
+First run: 22 of 27 killed. The five survivors (M04, M06, M23, M26, M27) and the
+BLOCKER's own shape (M04a) were run again after H33, H34, H35 and the unit rows
+`a_redated_print_never_vouches_for_an_edit_made_after_the_exchange` and
+`the_removal_is_undone_when_the_target_moved_after_the_read` were added:
+all killed. 28 of 28 killed.
+
+### 18.5 Proof and counts
+
+- Failing first, on `9ec8d36` (this worktree before the fix): H21, H24
+  to H31 (`estate_handoff`, 9 rows) and the fault rows
+  `estate_handoff_rerender_over_edit` and `estate_handoff_clear_noop_apply`
+  failed; H20 (the old guard row) passed. H32 to H35 and the two new unit
+  rows were added for the mutation table and fail under their mutants.
+- After the fix, in this worktree: `cargo test -p bulkload-agent
+  --no-fail-fast` 924 passed, 0 failed, 7 ignored (29 binaries), with
+  `estate_handoff` 34 (H0 to H21, H24 to H35), `estate_adopt` 13,
+  `estate_converge` 23, 13 hand-off unit and property rows;
+  `fault_harness` 113 (16 `estate_handoff` rows with its child entry);
+  `cargo fmt --check`, the three clippy passes (workspace; `io-trace`;
+  `fault-injection,io-trace`) and `just contract-test` (24) clean;
+  `source_command_registry` 16 passed; `just tla-render --check` current
+  (245 files); `just tla-check` of all 11 hand-off rows matched (233 s,
+  `docs/formal/README.md`), plus `MC_ec_refs` 54141, `MC_ec_adopt` 30652,
+  `MC_ec_seats` 64478 and `MC_ec_neg_overwrite_modified` matched on the
+  reviewed spec (`refs` and `adopt` equal their recorded counts).
+  `just check-fast` was not run here (coordinator).
+
+### 18.6 Open for the operator
+
+1. (Section 16.1, still open.) Which repositories count as private. Also:
+   should a remote whose URL is a local path count as private without a
+   `--private-remote` (an agent consolidating may add the sibling as a
+   remote, which now refuses the next render)?
+2. `ready` reads commits only. Should it also require a clean working tree
+   in the sibling and in destination-only worktrees (a read-only
+   `git status` of the sibling on every run, which an unchanged rerun now
+   avoids)?
+3. Carried blocks are kept as content (Q185). Should `--clear` offer an
+   opt-in to remove a carried block, or stay hands-off?
+4. Commit detection flags the token anywhere in branch or tag history,
+   including commits made at the source; a repository whose published
+   history already holds a block reports `committed` for good. Accept, or
+   count only commits not reachable from the carried capture?
+5. (17.5) The WP10 guard exception versus a verb rename; whether the H
+   step should re-render a refused item's own workspace.
+6. The refuters' own lists (their six surviving mutations and the doc
+   claims) were not handed over; P4 and P7 were answered from this
+   lane's audit. Confirm against their lists.
+
 ## Workstreams (restated, R-N13; verified this session unless marked)
 
 | Stream | Owner | Repo / branch | State and evidence | Next |
 |---|---|---|---|---|
-| TIN-6569 hand-off | this lane | bulkload `feat/estate-handoff-20261016` off `3fe1f07` | Built and committed signed (section 17); not pushed | Coordinator: `just check-fast`, review, PR |
+| TIN-6569 hand-off | this lane | bulkload `feat/estate-handoff-20261016` off `3fe1f07` | Built (section 17), reviewed by two refuters, every finding fixed and committed signed on top of `9ec8d36` (section 18); not pushed | Coordinator: `just check-fast`, re-review, PR; operator questions 18.6 |
 | #226 adopt F1/F2 fixes | other lane | `feat/estate-adopt-20261015` at `c6ccd52` (seen, read-only) | Committed there; touches `converge.rs`, `converge/diff.rs`, `estate.rs`, `git_carry.rs` | Merge; conflicts with this branch checked by `git merge-tree` (lane return) |
 | GF beside-landing | coordinator | production trees | Untouched by this lane | Hand-off after the operator answers 16 and 17.5 |

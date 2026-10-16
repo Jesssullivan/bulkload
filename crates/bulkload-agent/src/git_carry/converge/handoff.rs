@@ -19,10 +19,16 @@
 //!   `RENAME_EXCHANGE`d with it and the displaced file checked against the
 //!   print the plan read (a no-replace rename for a created file), each
 //!   step settled by the next run ([`settle`]);
-//! - **private by default**: written only into a repository with no remote,
-//!   or whose every remote URL is under an operator-given prefix, or a
+//! - **private by default**: written only into a repository with no remote
+//!   (active, or preserved inert from the source in `carry-config`), or
+//!   whose every remote URL and push URL, as written and as Git rewrites it
+//!   (`insteadOf`, `pushInsteadOf`), is under an operator-given prefix, or a
 //!   workspace the operator names; no URL is ever printed;
-//! - **removed** by a recorded clear that restores the bytes exactly.
+//! - **removed** by a recorded clear that restores the bytes exactly;
+//! - **owned by identity**: a block's BEGIN line names the landing it was
+//!   rendered for (`for=`); a block that names another landing was carried
+//!   here with the source's bytes and is content, kept byte for byte below
+//!   this landing's block (OI-1003-Q185: nothing is dropped from a carry).
 //!
 //! The source is never read (S2).
 
@@ -45,7 +51,7 @@ use super::{head_of, lstat, sides, Meta, Side};
 use crate::{BulkloadRefusal, Result};
 
 pub use render::{
-    rfc3339, Build, CaptureFacts, FamilyRow, Inputs, Landing, Omitted, RefDiff, Sibling,
+    rfc3339, Build, CaptureFacts, DestOnly, FamilyRow, Inputs, Landing, Omitted, RefDiff, Sibling,
     SiblingState, MAX_BLOCK, TOKEN,
 };
 
@@ -60,9 +66,13 @@ pub const HANDOFF_INTENT: &str = "handoff.intent";
 pub const TARGETS: [&str; 2] = ["AGENTS.md", "CLAUDE.md"];
 /// The opt-in target (`--readme`), never created.
 pub const README: &str = "README.md";
+/// Codex reads `AGENTS.override.md` instead of `AGENTS.md` in a directory
+/// that holds one: an existing override carries the block too; it is never
+/// created.
+pub const OVERRIDE: &str = "AGENTS.override.md";
 /// The name every hand-off temporary starts with, beside its target.
 const TEMP_PREFIX: &str = ".bulkload-handoff-";
-const ALL_NAMES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", README];
+const ALL_NAMES: [&str; 4] = ["AGENTS.md", "CLAUDE.md", OVERRIDE, README];
 const LANDED_MAGIC: &[u8; 16] = b"bulkload-hoff-v1";
 const INTENT_MAGIC: &[u8; 16] = b"bulkload-hoffi-1";
 
@@ -102,10 +112,16 @@ pub struct HandoffFile {
     /// The file's print when the hand-off last wrote or proved it.
     pub print: Option<SeatPrint>,
     /// The landed blob the block was written over, when the bytes under it
-    /// were exactly that landed seat's: only then may converge trust the
-    /// record's print of the file without reading it (a block re-rendered
-    /// over a user's edit below it never vouches for that edit).
+    /// were exactly that landed seat's at `print`: only then may converge
+    /// trust the record's print of the file without reading it (a block
+    /// re-rendered over a user's edit below it never vouches for that
+    /// edit). Every write of a new `print` re-checks it against the bytes
+    /// (review of 2026-10-16: a kept block's re-taken print, a settled
+    /// crash's and a re-dated racy one's).
     pub base: Option<String>,
+    /// The bytes under the block start with another landing's block (one
+    /// carried with the source's bytes).
+    pub carried: bool,
 }
 
 /// The options a record was rendered under: a re-render needs no flag.
@@ -310,12 +326,41 @@ enum Found {
     Via(Vec<u8>),
 }
 
-fn other(name: &str) -> Option<&'static str> {
+/// Whether a symbolic link named `name` to `to` (in the same worktree) is
+/// covered by the block of the target it names.
+fn covered_link(name: &str, to: &[u8]) -> bool {
     match name {
-        "AGENTS.md" => Some("CLAUDE.md"),
-        "CLAUDE.md" => Some("AGENTS.md"),
-        _ => None,
+        "AGENTS.md" => to == b"CLAUDE.md",
+        "CLAUDE.md" => to == b"AGENTS.md",
+        OVERRIDE => to == b"AGENTS.md" || to == b"CLAUDE.md",
+        _ => false,
     }
+}
+
+/// The targets of a run: `AGENTS.md` and `CLAUDE.md`; `AGENTS.override.md`
+/// when something is at that name or the record names it; `README.md`
+/// with `readme`.
+fn names_for(
+    worktree: &Path,
+    readme: bool,
+    record: Option<&HandoffLanded>,
+) -> Result<Vec<&'static str>> {
+    let mut names: Vec<&'static str> = TARGETS.to_vec();
+    let recorded = |name: &str| {
+        record.is_some_and(|record| record.files.iter().any(|file| file.path == name.as_bytes()))
+    };
+    if lstat(&worktree.join(OVERRIDE))?.is_some() || recorded(OVERRIDE) {
+        names.push(OVERRIDE);
+    }
+    if readme || recorded(README) {
+        names.push(README);
+    }
+    Ok(names)
+}
+
+/// A target bulkload never creates.
+fn never_created(name: &str) -> bool {
+    name == README || name == OVERRIDE
 }
 
 /// Classify every target (design 10): a missing file, a regular one, or a
@@ -333,9 +378,10 @@ fn classify(worktree: &Path, names: &[&'static str]) -> Result<Vec<(&'static str
                     .refuse_at("git_carry::converge::handoff::classify")?
                     .into_os_string()
                     .into_vec();
-                match other(name) {
-                    Some(to) if link == to.as_bytes() => Found::Via(link),
-                    _ => return Err(BulkloadRefusal::HandoffTargetUnsupported),
+                if covered_link(name, &link) {
+                    Found::Via(link)
+                } else {
+                    return Err(BulkloadRefusal::HandoffTargetUnsupported);
                 }
             }
             Some(_) => return Err(BulkloadRefusal::HandoffTargetUnsupported),
@@ -377,16 +423,33 @@ fn head_of_file(path: &Path) -> Result<Vec<u8>> {
     Ok(head)
 }
 
-/// What a regular target holds of the hand-off.
+/// What a regular target holds of the hand-off. A run holds one per
+/// target (at most four), so the record entry is kept inline.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 enum Held {
     /// The recorded block, intact (by print, or read).
     Intact(HandoffFile),
     /// No marker at byte 0.
     Plain,
-    /// A marker at byte 0 that is not the record's: an edit inside the
-    /// block, a foreign block, a BEGIN with no END.
+    /// A block at byte 0 rendered for another landing (its `for=` is not
+    /// this landing's, or it names none): carried with the source's bytes,
+    /// so it is content, handled as `Plain` with the block kept below
+    /// (OI-1003-Q185).
+    Foreign,
+    /// A marker at byte 0 for this landing that is not the record's: an
+    /// edit inside the block, a BEGIN with no END, a block with no record.
     Modified,
+}
+
+/// What the head of a file holds that no record vouches for: nothing, a
+/// block (or a broken one) this landing's identity names, or another's.
+fn unrecorded(head: &[u8], ours: &str) -> Held {
+    match render::marker(head) {
+        render::Marker::None => Held::Plain,
+        _ if render::owner_of(head) == Some(ours.as_bytes()) => Held::Modified,
+        _ => Held::Foreign,
+    }
 }
 
 /// Whether `record`'s print of `file` vouches for its bytes now: the same
@@ -405,12 +468,14 @@ fn trusted(record: &HandoffLanded, file: &HandoffFile, now: Option<&SeatPrint>, 
 
 /// What `path` (named `name`) holds against `record`: by print when the
 /// record's print is unchanged and not racy (no read), else by its head.
+/// `ours` is this landing's identity ([`render::owner`]).
 fn held(
     path: &Path,
     name: &str,
     meta: &fs::Metadata,
     record: Option<&HandoffLanded>,
     fsid: u64,
+    ours: &str,
 ) -> Result<Held> {
     let entry = record.and_then(|record| {
         record
@@ -428,18 +493,14 @@ fn held(
         }
     }
     let head = head_of_file(path)?;
-    Ok(match render::marker(&head) {
-        render::Marker::None => Held::Plain,
-        render::Marker::Malformed => Held::Modified,
-        render::Marker::Block(len) => match entry {
-            Some((_, file))
-                if file.block_len == len64(head.get(..len).unwrap_or_default())
-                    && digest(head.get(..len).unwrap_or_default()) == file.block =>
-            {
-                Held::Intact(file.clone())
-            }
-            _ => Held::Modified,
-        },
+    Ok(match (render::marker(&head), entry) {
+        (render::Marker::Block(len), Some((_, file)))
+            if file.block_len == len64(head.get(..len).unwrap_or_default())
+                && digest(head.get(..len).unwrap_or_default()) == file.block =>
+        {
+            Held::Intact(file.clone())
+        }
+        _ => unrecorded(&head, ours),
     })
 }
 
@@ -489,18 +550,28 @@ fn read_whole(path: &Path, name: &str) -> Result<Whole> {
     Ok(Whole { held, bytes, print })
 }
 
-/// `path` read whole, starting with `file`'s recorded block (`Some`), or
-/// with no marker at byte 0 (`None`): what the classification found, held
-/// still to the read the exchange is checked against. Anything else is a
-/// writer between the two reads: `HANDOFF_BLOCK_MODIFIED`.
-fn read_as(path: &Path, name: &str, file: Option<&HandoffFile>) -> Result<Whole> {
+/// What a step expects a target to start with.
+#[derive(Debug, Clone, Copy)]
+enum Expect<'a> {
+    /// The record's block.
+    Block(&'a HandoffFile),
+    /// No block of this landing's (`ours`): nothing, or a carried one.
+    Unowned(&'a str),
+}
+
+/// `path` read whole, starting as `expect` says: what the classification
+/// found, held still to the read the exchange is checked against. Anything
+/// else is a writer between the two reads: `HANDOFF_BLOCK_MODIFIED`.
+fn read_as(path: &Path, name: &str, expect: Expect<'_>) -> Result<Whole> {
     let read = read_whole(path, name)?;
-    let still = match file {
-        Some(file) => usize::try_from(file.block_len)
+    let still = match expect {
+        Expect::Block(file) => usize::try_from(file.block_len)
             .ok()
             .and_then(|len| read.bytes.get(..len))
             .is_some_and(|block| digest(block) == file.block),
-        None => render::marker(&read.bytes) == render::Marker::None,
+        Expect::Unowned(ours) => {
+            matches!(unrecorded(&read.bytes, ours), Held::Plain | Held::Foreign)
+        }
     };
     if still {
         Ok(read)
@@ -656,21 +727,24 @@ fn whole_digest(path: &Path) -> Result<Option<[u8; 32]>> {
     Ok(Some(digest(&bytes)))
 }
 
-/// Settle what a crashed hand-off left in `worktree` (design 8), under the
-/// destination lock: its temporaries (ours removed; a third party's file a
-/// crash displaced put back when the target holds ours), then the record
-/// made to name exactly the blocks the targets hold, then the intent
-/// removed. Returns how many temporaries were removed or put back.
-///
-/// # Errors
-/// An unreadable record or intent; a file-system error.
-#[allow(clippy::too_many_lines)]
-fn settle(worktree: &Path, dir: &Path) -> Result<u64> {
-    const SITE: &str = "git_carry::converge::handoff::settle";
-    let intent_path = dir.join(HANDOFF_INTENT);
-    let record_path = dir.join(HANDOFF_LANDED);
-    let intent = landed::read::<HandoffIntent>(&intent_path)?;
-    let record = landed::read::<HandoffLanded>(&record_path)?;
+/// What a settle did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Settled {
+    /// Temporaries removed or put back, and intents settled.
+    swept: u64,
+    /// A pending clear was finished (its intent rolled forward).
+    cleared: bool,
+}
+
+/// Remove what a crashed hand-off left at its temporaries' names in
+/// `worktree`: ours removed; a third party's file a crash displaced put
+/// back when the target holds this run's file. Returns how many.
+fn sweep(
+    worktree: &Path,
+    intent: Option<&HandoffIntent>,
+    record: Option<&HandoffLanded>,
+) -> Result<u64> {
+    const SITE: &str = "git_carry::converge::handoff::sweep";
     let mut swept = 0;
     let mut temps: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(worktree).refuse_at(SITE)? {
@@ -694,7 +768,7 @@ fn settle(worktree: &Path, dir: &Path) -> Result<u64> {
             .map(OsStr::as_bytes)
             .unwrap_or_default()
             .to_vec();
-        let step = intent.as_ref().and_then(|intent| {
+        let step = intent.and_then(|intent| {
             let index = std::str::from_utf8(&name)
                 .ok()?
                 .strip_prefix(&format!("{TEMP_PREFIX}{}-", intent.tag))?
@@ -748,8 +822,91 @@ fn settle(worktree: &Path, dir: &Path) -> Result<u64> {
             }
         }
     }
+    Ok(swept)
+}
+
+/// The landed sides of the workspace whose ledger directory is `dir`, for
+/// [`landed_base`]: `None` without a workspace ledger.
+fn landed_of(dir: &Path) -> Result<Option<String>> {
+    Ok(
+        landed::read::<LandedWorkspace>(&dir.join(landed::WORKSPACE_LANDED))?
+            .map(|ledger| ledger.instance),
+    )
+}
+
+/// `file`, a recorded entry whose block stands at its target's byte 0, with
+/// its print re-taken now and everything the record says of the bytes under
+/// the block re-checked at that print: `base` (the landed blob, when the
+/// bytes under the block are exactly it) and `carried`. A record's print
+/// is never re-taken without this (review of 2026-10-16: a re-taken print
+/// with an old `base` vouched for a user's edit below the block, and
+/// converge landed over it). `None`: the target no longer starts with the
+/// block, or moved while it was read.
+fn retaken(
+    worktree: &Path,
+    landed: &mut Landed<'_>,
+    file: &HandoffFile,
+) -> Result<Option<HandoffFile>> {
+    let name = std::str::from_utf8(&file.path).map_err(|_| BulkloadRefusal::PathNotPortable)?;
+    let read = match read_as(&worktree.join(name), name, Expect::Block(file)) {
+        Ok(read) => read,
+        Err(BulkloadRefusal::HandoffBlockModified) => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    if !read
+        .held
+        .metadata()
+        .is_ok_and(|meta| same_file(&read.print, &meta))
+    {
+        return Ok(None);
+    }
+    let cut = usize::try_from(file.block_len).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+    let rest = read.bytes.get(cut..).unwrap_or_default();
+    let mut file = file.clone();
+    file.base = landed_base(worktree, landed, name, rest)?;
+    file.carried = render::marker(rest) != render::Marker::None;
+    file.print = Some(read.print);
+    Ok(Some(file))
+}
+
+/// Settle what a crashed hand-off left in `worktree` (design 8), under the
+/// destination lock: its temporaries ([`sweep`]); then a pending clear is
+/// finished (rolled forward: every recorded block still intact stripped,
+/// the record and the intent removed), and a pending render leaves the
+/// record naming exactly the blocks the targets hold, each re-checked at
+/// its print ([`retaken`]), and the intent removed. `ours` is this
+/// landing's identity.
+///
+/// # Errors
+/// An unreadable record or intent; a file-system error; a clear the
+/// settle finishes refuses as [`clear`] does (its intent kept).
+fn settle(worktree: &Path, dir: &Path, source: &str, ours: &str) -> Result<Settled> {
+    let intent_path = dir.join(HANDOFF_INTENT);
+    let record_path = dir.join(HANDOFF_LANDED);
+    let intent = landed::read::<HandoffIntent>(&intent_path)?;
+    let record = landed::read::<HandoffLanded>(&record_path)?;
+    let swept = sweep(worktree, intent.as_ref(), record.as_ref())?;
     let Some(intent) = intent else {
-        return Ok(swept);
+        return Ok(Settled {
+            swept,
+            cleared: false,
+        });
+    };
+    if intent.op == Op::Clear {
+        // The operator asked for the block to go: finish that, never put
+        // it back (review of 2026-10-16, a crashed clear re-rendered by
+        // the next apply's H step).
+        clear(worktree, dir, ours)?;
+        return Ok(Settled {
+            swept: swept + 1,
+            cleared: true,
+        });
+    }
+    let instance = landed_of(dir)?;
+    let mut landed = Landed {
+        source,
+        instance: instance.as_deref().unwrap_or_default(),
+        sides: None,
     };
     // The record names exactly the blocks the targets hold: the intent's
     // new one where it is in place, else the record's own.
@@ -768,7 +925,6 @@ fn settle(worktree: &Path, dir: &Path) -> Result<u64> {
             let candidates = intent
                 .next
                 .iter()
-                .filter(|_| intent.op == Op::Render)
                 .chain(record.iter())
                 .filter_map(|record| record.files.iter().find(|file| file.path == name));
             for file in candidates {
@@ -778,9 +934,19 @@ fn settle(worktree: &Path, dir: &Path) -> Result<u64> {
                         .is_ok_and(|link| link.as_os_str().as_bytes() == to.as_slice()),
                     _ => starts_with(&target, file.block_len, &file.block)?,
                 };
-                if present {
-                    let mut file = file.clone();
-                    file.print = lstat(&target)?.and_then(|meta| SeatPrint::of(&file.path, &meta));
+                if !present {
+                    continue;
+                }
+                let file = match &file.kind {
+                    FileKind::ViaSymlink(_) => Some(file.clone()),
+                    _ if instance.is_some() => retaken(worktree, &mut landed, file)?,
+                    _ => Some(HandoffFile {
+                        base: None,
+                        print: None,
+                        ..file.clone()
+                    }),
+                };
+                if let Some(file) = file {
                     files.push(file);
                     break;
                 }
@@ -807,7 +973,10 @@ fn settle(worktree: &Path, dir: &Path) -> Result<u64> {
         }
     }
     landed::remove(&intent_path)?;
-    Ok(swept + 1)
+    Ok(Settled {
+        swept: swept + 1,
+        cleared: false,
+    })
 }
 
 // ---- lifting a created file before converge adds the path -----------------------
@@ -899,48 +1068,163 @@ fn under(value: &str, prefix: &str) -> bool {
         })
 }
 
-/// The privacy guard (design 9.1): `allowed` (the operator named the
-/// workspace), `no-remote`, or `private-remote` (every remote URL and push
-/// URL under a prefix). No URL is ever returned or printed.
-///
-/// # Errors
-/// `HANDOFF_NOT_PRIVATE`; a Git child failure.
-fn privacy(worktree: &Path, prefixes: &[String], allowed: bool) -> Result<&'static str> {
-    if allowed {
-        return Ok("allowed");
-    }
-    let listed = git(worktree)
-        .args([
-            "config",
-            "--null",
-            "--get-regexp",
-            r"^remote\..*\.(url|pushurl)$",
-        ])
-        .output()
-        .refuse_at("git_carry::converge::handoff::privacy")?;
+/// What one configuration source says that the guard reads: remote URL
+/// and push URL values, and URL rewrite rules (`(base, prefix, push)`).
+#[derive(Debug, Default)]
+struct Remotes {
+    urls: Vec<String>,
+    rules: Vec<(String, String, bool)>,
+}
+
+/// Read one configuration source: the repository's own (local and worktree,
+/// `file` `None`) or one file by path, with its includes.
+fn remotes_in(worktree: &Path, file: Option<&Path>, into: &mut Remotes) -> Result<()> {
+    const KEYS: &str = r"^(remote\..*\.(url|pushurl)|url\..*\.(insteadof|pushinsteadof))$";
+    let listed = file
+        .map_or_else(
+            || {
+                git(worktree)
+                    .args(["config", "--null", "--get-regexp", KEYS])
+                    .output()
+            },
+            |file| {
+                git(worktree)
+                    .args(["config", "--null", "--includes", "--file"])
+                    .arg(file)
+                    .args(["--get-regexp", KEYS])
+                    .output()
+            },
+        )
+        .refuse_at("git_carry::converge::handoff::remotes_in")?;
     match listed.status.code() {
-        Some(1) => return Ok("no-remote"),
+        Some(1) => return Ok(()),
         Some(0) => {}
         _ => return Err(super::super::estimate::child_failed(&listed.stderr)),
     }
-    let mut any = false;
     for entry in listed
         .stdout
         .split(|byte| *byte == 0)
         .filter(|e| !e.is_empty())
     {
-        any = true;
-        let value = entry
-            .iter()
-            .position(|byte| *byte == b'\n')
-            .and_then(|at| entry.get(at + 1..))
-            .unwrap_or_default();
-        let value = std::str::from_utf8(value).unwrap_or_default();
-        if !prefixes.iter().any(|prefix| under(value, prefix)) {
-            return Err(BulkloadRefusal::HandoffNotPrivate);
+        let (key, value) =
+            entry
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or((entry, &b""[..]), |at| {
+                    (
+                        entry.get(..at).unwrap_or_default(),
+                        entry.get(at + 1..).unwrap_or_default(),
+                    )
+                });
+        let key = String::from_utf8_lossy(key);
+        let value = String::from_utf8_lossy(value).into_owned();
+        if key.starts_with("remote.") {
+            into.urls.push(value);
+        } else if let Some(base) = key.strip_prefix("url.") {
+            if let Some(base) = base.strip_suffix(".pushinsteadof") {
+                into.rules.push((base.to_owned(), value, true));
+            } else if let Some(base) = base.strip_suffix(".insteadof") {
+                into.rules.push((base.to_owned(), value, false));
+            }
         }
     }
-    Ok(if any { "private-remote" } else { "no-remote" })
+    Ok(())
+}
+
+/// The configuration files a `git push` from the destination reads beyond
+/// the repository's own, located as Git locates them: the user's global
+/// file(s) and the system file. Bulkload's own Git children never read
+/// them (`git_env`), so the guard names them by path.
+fn user_config_files() -> Vec<PathBuf> {
+    let [global, global_sys, no_global_sys] = super::super::git_env::USER_CONFIG;
+    let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    let mut files = Vec::new();
+    if let Some(global) = var(global) {
+        files.push(PathBuf::from(global));
+    } else {
+        let home = var("HOME").map(PathBuf::from);
+        let xdg = var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".config")));
+        files.extend(xdg.map(|xdg| xdg.join("git/config")));
+        files.extend(home.map(|home| home.join(".gitconfig")));
+    }
+    let skip = var(no_global_sys).is_some_and(|value| value != "0" && value != "false");
+    if !skip {
+        files.push(var(global_sys).map_or_else(|| PathBuf::from("/etc/gitconfig"), PathBuf::from));
+    }
+    files
+}
+
+/// `url` as Git rewrites it with the longest matching rule of one kind
+/// (`push`: `pushInsteadOf`, else `insteadOf`), or `None` when none
+/// matches.
+fn rewritten(url: &str, rules: &[(String, String, bool)], push: bool) -> Option<String> {
+    rules
+        .iter()
+        .filter(|(_, prefix, kind)| {
+            *kind == push && !prefix.is_empty() && url.starts_with(prefix.as_str())
+        })
+        .max_by_key(|(_, prefix, _)| prefix.len())
+        .map(|(base, prefix, _)| format!("{base}{}", url.get(prefix.len()..).unwrap_or_default()))
+}
+
+/// The privacy guard (design 9.1, as amended by the review of 2026-10-16):
+/// `allowed` (the operator named the workspace), `no-remote`, or
+/// `private-remote`. The repository's remotes are every `remote.*.url` and
+/// `remote.*.pushurl` value in its own configuration and in the source's
+/// configuration a landing preserved inert (`carry-config/source-config*`
+/// in the common directory: an origin kept out of the active configuration
+/// is still the repository's remote, and a later `--activate-origin` or a
+/// hand-added remote restores it). Each value is checked as written and as
+/// Git rewrites it (`url.<base>.insteadOf` and `pushInsteadOf`, from the
+/// repository's, the preserved, the user's global and the system
+/// configuration): every form must start with a `--private-remote`
+/// prefix. No URL is ever returned or printed.
+///
+/// # Errors
+/// `HANDOFF_NOT_PRIVATE`; a Git child failure.
+fn privacy(
+    worktree: &Path,
+    common: &Path,
+    prefixes: &[String],
+    allowed: bool,
+) -> Result<&'static str> {
+    if allowed {
+        return Ok("allowed");
+    }
+    let mut found = Remotes::default();
+    remotes_in(worktree, None, &mut found)?;
+    let preserved = common.join("carry-config");
+    for name in ["source-config", "source-config.worktree"] {
+        let file = preserved.join(name);
+        if lstat(&file)?.is_some_and(|meta| meta.is_file()) {
+            remotes_in(worktree, Some(&file), &mut found)?;
+        }
+    }
+    let mut rules = Remotes::default();
+    for file in user_config_files() {
+        if lstat(&file)?.is_some_and(|meta| meta.is_file()) {
+            remotes_in(worktree, Some(&file), &mut rules)?;
+        }
+    }
+    found.rules.extend(rules.rules);
+    if found.urls.is_empty() {
+        return Ok("no-remote");
+    }
+    for url in &found.urls {
+        let forms = [
+            Some(url.clone()),
+            rewritten(url, &found.rules, false),
+            rewritten(url, &found.rules, true),
+        ];
+        for form in forms.iter().flatten() {
+            if !prefixes.iter().any(|prefix| under(form, prefix)) {
+                return Err(BulkloadRefusal::HandoffNotPrivate);
+            }
+        }
+    }
+    Ok("private-remote")
 }
 
 // ---- the census: what a block says, read as metadata -----------------------------
@@ -1001,6 +1285,9 @@ pub struct Request<'a> {
     /// `(landed prefix, live prefix)` pairs (`--sibling`).
     pub siblings: &'a [(PathBuf, PathBuf)],
     pub as_of: Option<i128>,
+    /// `estate-apply`'s H step: re-render an existing record only (never
+    /// start one), after settling what a crash left.
+    pub h_step: bool,
 }
 
 /// One target in a row.
@@ -1055,7 +1342,7 @@ fn canonical(path: &Path) -> PathBuf {
 }
 
 fn is_target(path: &[u8]) -> bool {
-    TARGETS.iter().any(|name| name.as_bytes() == path) || path == README.as_bytes()
+    ALL_NAMES.iter().any(|name| name.as_bytes() == path)
 }
 
 fn now_of(worktree: &Path) -> Result<Option<(Option<String>, String)>> {
@@ -1118,6 +1405,37 @@ fn census(common: &Path, worktree: &Path, source: &str, items: &[Planned]) -> Re
     Ok(Census { members, refs })
 }
 
+/// Whether `oid` is a commit some branch of `repo` holds (`except` left
+/// out). A commit `repo` does not have is held by none. Read-only.
+fn held_by_branch(repo: &Path, oid: &str, except: Option<&str>) -> bool {
+    let Ok(listed) = super::super::output(git(repo).args([
+        "for-each-ref",
+        "--format=%(refname)",
+        "--contains",
+        oid,
+        "refs/heads/",
+    ])) else {
+        return false;
+    };
+    listed
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .any(|line| except.is_none_or(|except| line != except.as_bytes()))
+}
+
+/// Whether `ancestor` is in `tip`'s history in `repo` (read-only; a commit
+/// `repo` does not have is in no history).
+fn in_history(repo: &Path, ancestor: &str, tip: &str) -> bool {
+    git(repo)
+        .args(["merge-base", "--is-ancestor", ancestor, tip])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// The live sibling of `worktree` (the landing), if `siblings` names one:
+/// what is at its path and, for a checkout, whether its HEAD and the
+/// landing's HEAD are reconciled. Every read of the sibling is read-only
+/// (`--no-optional-locks`, no hooks).
 fn sibling_of(worktree: &Path, siblings: &[(PathBuf, PathBuf)]) -> Result<Option<Sibling>> {
     for (landed, live) in siblings {
         let Ok(rest) = worktree.strip_prefix(landed) else {
@@ -1137,9 +1455,20 @@ fn sibling_of(worktree: &Path, siblings: &[(PathBuf, PathBuf)]) -> Result<Option
                 }
             }
         };
+        let consolidated = match &state {
+            SiblingState::Head { oid, .. } => {
+                held_by_branch(worktree, oid, None)
+                    || now_of(worktree)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|(_, here)| in_history(&path, &here, oid))
+            }
+            _ => false,
+        };
         return Ok(Some(Sibling {
             path: path.into_os_string().into_vec(),
             state,
+            consolidated,
         }));
     }
     Ok(None)
@@ -1174,12 +1503,59 @@ fn host() -> String {
         .into_owned()
 }
 
-fn stored(estate: &Estate<'_>, request: &Request<'_>, allowed: bool, readme: bool) -> Stored {
+/// The options a run renders or checks under: what the request gives,
+/// and for what it leaves out, what the record was rendered with (review
+/// of 2026-10-16: a plain rerun, the H step and the `--check` a block
+/// prints all keep a render's `--sibling`, `--private-remote`,
+/// `--allow-workspace` and `--readme`). To drop one, clear and render
+/// again.
+#[derive(Debug, Clone)]
+struct Effective {
+    siblings: Vec<(PathBuf, PathBuf)>,
+    private_remotes: Vec<String>,
+    allowed: bool,
+    readme: bool,
+}
+
+fn effective(request: &Request<'_>, record: Option<&HandoffLanded>, this: &Path) -> Effective {
+    let kept = record.map(|record| &record.options);
+    let path = |bytes: &[u8]| PathBuf::from(OsStr::from_bytes(bytes));
+    Effective {
+        siblings: if request.siblings.is_empty() {
+            kept.map(|kept| {
+                kept.siblings
+                    .iter()
+                    .map(|(landed, live)| (path(landed), path(live)))
+                    .collect()
+            })
+            .unwrap_or_default()
+        } else {
+            request.siblings.to_vec()
+        },
+        private_remotes: if request.private_remotes.is_empty() {
+            kept.map(|kept| kept.private_remotes.clone())
+                .unwrap_or_default()
+        } else {
+            request.private_remotes.to_vec()
+        },
+        allowed: request.allow.iter().any(|allowed| allowed == this)
+            || kept.is_some_and(|kept| kept.allowed),
+        readme: request.readme
+            || record.is_some_and(|record| {
+                record
+                    .files
+                    .iter()
+                    .any(|file| file.path == README.as_bytes())
+            }),
+    }
+}
+
+fn stored(estate: &Estate<'_>, options: &Effective) -> Stored {
     Stored {
         plan: estate.plan.as_os_str().as_bytes().to_vec(),
         corpus: estate.corpus.as_os_str().as_bytes().to_vec(),
         state: estate.state.as_os_str().as_bytes().to_vec(),
-        siblings: request
+        siblings: options
             .siblings
             .iter()
             .map(|(a, b)| {
@@ -1189,10 +1565,19 @@ fn stored(estate: &Estate<'_>, request: &Request<'_>, allowed: bool, readme: boo
                 )
             })
             .collect(),
-        private_remotes: request.private_remotes.to_vec(),
-        allowed,
-        readme,
+        private_remotes: options.private_remotes.clone(),
+        allowed: options.allowed,
+        readme: options.readme,
     }
+}
+
+/// This landing's hand-off identity (the `for=` its blocks carry).
+fn ours(workspace: &Workspace<'_>, estate: &Estate<'_>) -> String {
+    render::owner(
+        &host(),
+        workspace.worktree.as_os_str().as_bytes(),
+        estate.source,
+    )
 }
 
 /// The metadata digest of everything a block says (design 3.2), its
@@ -1331,6 +1716,7 @@ fn gather(
     census: &Census,
     ledger: &LandedWorkspace,
     sibling: Option<Sibling>,
+    carried: Vec<Vec<u8>>,
     as_of_ns: i128,
 ) -> Result<Inputs> {
     let this = canonical(workspace.worktree);
@@ -1343,7 +1729,16 @@ fn gather(
             .as_ref()
             .and_then(|id| estate.items.iter().find(|item| &item.id == id));
         if member.item.is_none() {
-            dest_only.push(member.path.as_os_str().as_bytes().to_vec());
+            // A destination-only worktree is reconciled once another branch
+            // holds its HEAD commit (merged or picked into the copy that
+            // carries the work forward).
+            let consolidated = member.now.as_ref().is_some_and(|(branch, oid)| {
+                held_by_branch(workspace.worktree, oid, branch.as_deref())
+            });
+            dest_only.push(DestOnly {
+                path: member.path.as_os_str().as_bytes().to_vec(),
+                consolidated,
+            });
         }
         if let Some(code) = planned.and_then(|item| item.refused.clone()) {
             refused.push((
@@ -1389,6 +1784,7 @@ fn gather(
         family,
         refs: ref_diffs(workspace.worktree, estate.source, &ledger.instance)?,
         dest_only,
+        carried,
         refused,
         omitted: planned.and_then(|item| item.omitted.clone()),
     })
@@ -1494,9 +1890,12 @@ fn place(worktree: &Path, source: &str) -> Result<Place> {
     })
 }
 
-/// The options `worktree`'s hand-off record was rendered under (or, with
-/// no record yet, the pending intent's record), or `None` when it holds
-/// neither for `source`: the H step's opt-in (design 6.4).
+/// The options `worktree`'s hand-off record was rendered under: the H
+/// step's opt-in (design 6.4).
+///
+/// With no record yet, a pending intent's: a render's next record, or the
+/// defaults for a clear, which the H step only finishes. `None` when the
+/// worktree holds neither for `source`.
 ///
 /// # Errors
 /// An unreadable record or intent.
@@ -1509,8 +1908,7 @@ pub fn recorded_options(worktree: &Path, source: &str) -> Result<Option<Stored>>
         return Ok(Some(record.options));
     }
     Ok(landed::read::<HandoffIntent>(&dir.join(HANDOFF_INTENT))?
-        .and_then(|intent| intent.next)
-        .map(|next| next.options))
+        .map(|intent| intent.next.map(|next| next.options).unwrap_or_default()))
 }
 
 /// Whether `worktree` holds a pending hand-off intent for `source` (one
@@ -1545,22 +1943,42 @@ pub fn run(
     if landed::exists(&place.dir.join(landed::WORKSPACE_INTENT))? {
         return Err(BulkloadRefusal::GitConvergeInterrupted);
     }
+    let ours = ours(workspace, estate);
     match request.mode {
-        Mode::Check => check(workspace, request, estate, session, &place),
+        Mode::Check => check(workspace, request, estate, session, &place, &ours),
         Mode::Clear => {
             let _lock = landed::lock(&place.common, estate.source)?;
-            settle(workspace.worktree, &place.dir)?;
-            clear(workspace.worktree, &place.dir)
+            if settle(workspace.worktree, &place.dir, estate.source, &ours)?.cleared {
+                return Ok(Row {
+                    outcome: "cleared",
+                    ..Row::default()
+                });
+            }
+            clear(workspace.worktree, &place.dir, &ours)
         }
         Mode::Render | Mode::DryRun => {
             let _lock = if request.mode == Mode::Render {
                 let lock = landed::lock(&place.common, estate.source)?;
-                settle(workspace.worktree, &place.dir)?;
+                let settled = settle(workspace.worktree, &place.dir, estate.source, &ours)?;
+                // The H step re-renders a record; it never starts one, and
+                // never undoes a clear it just finished.
+                if request.h_step
+                    && (settled.cleared || !landed::exists(&place.dir.join(HANDOFF_LANDED))?)
+                {
+                    return Ok(Row {
+                        outcome: if settled.cleared {
+                            "cleared"
+                        } else {
+                            "unchanged"
+                        },
+                        ..Row::default()
+                    });
+                }
                 Some(lock)
             } else {
                 None
             };
-            render_workspace(workspace, request, estate, session, &place)
+            render_workspace(workspace, request, estate, session, &place, &ours)
         }
     }
 }
@@ -1589,13 +2007,24 @@ fn census_of<'s>(
 
 /// What a render plans for one target.
 enum Plan {
-    /// Nothing to write; the entry the record keeps (if any) and the action.
+    /// Nothing to write; the entry the record keeps (if any, its print and
+    /// base re-checked when the print moved) and the action.
     Keep(Option<HandoffFile>, &'static str),
     /// Retired: removed by hand while the capture stayed.
     Retire(&'static str),
     Prepend(Whole),
     Replace(Whole, u64),
     Create,
+}
+
+/// Whether a target's bytes (under this landing's block, when it has one)
+/// start with a block another landing rendered.
+const fn carried_of(state: Option<&Held>) -> bool {
+    match state {
+        Some(Held::Foreign) => true,
+        Some(Held::Intact(file)) => file.carried,
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1605,36 +2034,39 @@ fn render_workspace(
     estate: &Estate<'_>,
     session: &mut Session,
     place: &Place,
+    ours: &str,
 ) -> Result<Row> {
     let worktree = workspace.worktree;
     let this = canonical(worktree);
-    let allowed = request.allow.contains(&this);
-    let private = privacy(worktree, request.private_remotes, allowed)?;
     let record_path = place.dir.join(HANDOFF_LANDED);
     let record = landed::read::<HandoffLanded>(&record_path)?;
-    let readme = request.readme
-        || record.as_ref().is_some_and(|record| {
-            record
-                .files
-                .iter()
-                .any(|file| file.path == README.as_bytes())
-        });
-    let mut names: Vec<&'static str> = TARGETS.to_vec();
-    if readme {
-        names.push(README);
-    }
+    let options = effective(request, record.as_ref(), &this);
+    let private = privacy(
+        worktree,
+        &place.common,
+        &options.private_remotes,
+        options.allowed,
+    )?;
+    let names = names_for(worktree, options.readme, record.as_ref())?;
     let found = classify(worktree, &names)?;
     let fsid = landed::fsid(worktree)?;
-    let stored = stored(estate, request, allowed, readme);
+    let stored = stored(estate, &options);
     let census = census_of(session, place, workspace, estate)?.clone();
-    let sibling = sibling_of(&this, request.siblings)?;
+    let sibling = sibling_of(&this, &options.siblings)?;
     let inputs = inputs_digest(workspace, estate, &stored, &census, sibling.as_ref())?;
     // What each target holds (read only when its print moved).
     let mut held_by: Vec<(&'static str, Option<Held>)> = Vec::new();
     for (name, entry) in &found {
         let state = match entry {
             Found::Regular(meta) => {
-                let state = held(&worktree.join(name), name, meta, record.as_ref(), fsid)?;
+                let state = held(
+                    &worktree.join(name),
+                    name,
+                    meta,
+                    record.as_ref(),
+                    fsid,
+                    ours,
+                )?;
                 if state == Held::Modified {
                     return Err(BulkloadRefusal::HandoffBlockModified);
                 }
@@ -1675,29 +2107,52 @@ fn render_workspace(
                 (Found::Via(to), _) => {
                     recorded(name).is_some_and(|file| file.kind == FileKind::ViaSymlink(to.clone()))
                 }
-                (Found::Missing, _) if *name == README => true,
+                (Found::Missing, _) if never_created(name) => true,
                 (Found::Missing | Found::Regular(_), _) => retired(name),
             });
+    let mut landed = Landed {
+        source: estate.source,
+        instance: &place.ledger.instance,
+        sides: None,
+    };
     if unchanged && request.mode == Mode::Render {
         // A print the record could not vouch for (racy against its
         // `recorded_ns`) was proved by reading the block; once the clock is
         // past its stamp, the record is re-dated so the next rerun trusts
-        // it and reads nothing (as Git re-dates a racily clean index).
+        // it and reads nothing (as Git re-dates a racily clean index). The
+        // bytes under each such block are checked again first (`retaken`),
+        // so a re-dated print never vouches for an edit below the block
+        // made inside the racy window (review of 2026-10-16).
         if let Some(record) = &record {
             let now_ns = super::super::pass_start_ns();
-            let settled = found.iter().all(|(name, entry)| match entry {
-                Found::Regular(meta) => recorded(name).is_none_or(|file| {
-                    let now = SeatPrint::of(name.as_bytes(), meta);
-                    trusted(record, file, now.as_ref(), fsid)
-                        || file.print.as_ref().is_some_and(|print| {
-                            print.mtime_ns
-                                >= now_ns.saturating_sub(super::super::RACY_GRANULARITY_NS)
-                        })
-                }),
-                _ => true,
-            });
-            if !settled {
-                let mut redated = record.clone();
+            let racy_from = now_ns.saturating_sub(super::super::RACY_GRANULARITY_NS);
+            let mut redated = record.clone();
+            let mut due = false;
+            let mut held_still = true;
+            for file in &mut redated.files {
+                let Some(Found::Regular(meta)) = found
+                    .iter()
+                    .find(|(name, _)| name.as_bytes() == file.path.as_slice())
+                    .map(|(_, entry)| entry)
+                else {
+                    continue;
+                };
+                let now = SeatPrint::of(&file.path, meta);
+                if trusted(record, file, now.as_ref(), fsid)
+                    || file
+                        .print
+                        .as_ref()
+                        .is_none_or(|print| print.mtime_ns >= racy_from)
+                {
+                    continue;
+                }
+                due = true;
+                match retaken(worktree, &mut landed, file)? {
+                    Some(checked) if checked.print == file.print => *file = checked,
+                    _ => held_still = false,
+                }
+            }
+            if due && held_still {
                 redated.recorded_ns = now_ns;
                 landed::write(&record_path, &redated)?;
             }
@@ -1723,7 +2178,20 @@ fn render_workspace(
         Some(record) if current => record.as_of_ns,
         _ => super::super::pass_start_ns(),
     });
-    let facts = gather(workspace, estate, &census, &place.ledger, sibling, as_of_ns)?;
+    let carried: Vec<Vec<u8>> = held_by
+        .iter()
+        .filter(|(_, state)| carried_of(state.as_ref()))
+        .map(|(name, _)| name.as_bytes().to_vec())
+        .collect();
+    let facts = gather(
+        workspace,
+        estate,
+        &census,
+        &place.ledger,
+        sibling,
+        carried,
+        as_of_ns,
+    )?;
     let open = facts.open();
     let block = block_for(&facts)?;
     let block_digest = digest(&block);
@@ -1742,21 +2210,29 @@ fn render_workspace(
         let path = worktree.join(name);
         let plan = match (entry, state) {
             (Found::Via(_), _) => Plan::Keep(None, "none"),
-            (Found::Regular(_), Some(Held::Intact(file))) => {
-                if file.block == block_digest {
+            (Found::Regular(meta), Some(Held::Intact(file))) => {
+                if file.block != block_digest {
+                    Plan::Replace(read_as(&path, name, Expect::Block(file))?, file.block_len)
+                } else if file.print == SeatPrint::of(name.as_bytes(), meta) {
                     Plan::Keep(Some(file.clone()), "unchanged")
                 } else {
-                    Plan::Replace(read_as(&path, name, Some(file))?, file.block_len)
+                    // The block is kept but the file moved (an edit below
+                    // it, a touch): what the record says of the bytes under
+                    // the block is checked again before its print is
+                    // re-taken (review of 2026-10-16, the BLOCKER).
+                    let checked = retaken(worktree, &mut landed, file)?
+                        .ok_or(BulkloadRefusal::HandoffBlockModified)?;
+                    Plan::Keep(Some(checked), "unchanged")
                 }
             }
             (Found::Regular(_), _) => {
                 if renewable(name) {
                     Plan::Retire("removed-by-hand")
                 } else {
-                    Plan::Prepend(read_as(&path, name, None)?)
+                    Plan::Prepend(read_as(&path, name, Expect::Unowned(ours))?)
                 }
             }
-            (Found::Missing, _) if *name == README => Plan::Keep(None, "none"),
+            (Found::Missing, _) if never_created(name) => Plan::Keep(None, "none"),
             (Found::Missing, _) => {
                 if renewable(name) {
                     Plan::Retire("removed-by-hand")
@@ -1814,11 +2290,6 @@ fn render_workspace(
     }
     let mut files = Vec::new();
     let mut rows = Vec::new();
-    let mut landed = Landed {
-        source: estate.source,
-        instance: &place.ledger.instance,
-        sides: None,
-    };
     let mut retired_now: Vec<(Vec<u8>, [u8; 32])> = record
         .iter()
         .flat_map(|record| record.retired.clone())
@@ -1860,27 +2331,37 @@ fn render_workspace(
             kind: kind.name(),
             action,
         });
-        let base = match plan {
-            Plan::Keep(Some(file), _) => file.base.clone(),
-            Plan::Prepend(read) => landed_base(worktree, &mut landed, name, &read.bytes)?,
-            Plan::Replace(read, old_len) => landed_base(
-                worktree,
-                &mut landed,
-                name,
-                usize::try_from(*old_len)
-                    .ok()
-                    .and_then(|cut| read.bytes.get(cut..))
-                    .unwrap_or_default(),
-            )?,
-            _ => None,
+        let under = |read: &'_ Whole, cut: usize| -> Vec<u8> {
+            read.bytes.get(cut..).unwrap_or_default().to_vec()
+        };
+        let (base, carried, print) = match plan {
+            Plan::Keep(Some(file), _) => (file.base.clone(), file.carried, file.print.clone()),
+            Plan::Prepend(read) => (
+                landed_base(worktree, &mut landed, name, &read.bytes)?,
+                render::marker(&read.bytes) != render::Marker::None,
+                None,
+            ),
+            Plan::Replace(read, old_len) => {
+                let rest = under(
+                    read,
+                    usize::try_from(*old_len).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+                );
+                (
+                    landed_base(worktree, &mut landed, name, &rest)?,
+                    render::marker(&rest) != render::Marker::None,
+                    None,
+                )
+            }
+            _ => (None, false, None),
         };
         files.push(HandoffFile {
             path: name.as_bytes().to_vec(),
             kind,
             block_len: len64(&block),
             block: block_digest,
-            print: None,
+            print,
             base,
+            carried,
         });
     }
     if request.mode == Mode::DryRun {
@@ -1940,15 +2421,22 @@ fn render_workspace(
         }
         if let Err(refusal) = outcome {
             // What was written stays recorded; the next run renders again.
-            settle(worktree, &place.dir)?;
+            settle(worktree, &place.dir, estate.source, ours)?;
             return Err(refusal);
         }
     }
+    #[cfg(test)]
+    super::super::mid_pass::fire(&this, super::super::mid_pass::Stage::HandoffWritten);
+    // The prints of what this run wrote (a kept target's is the one its
+    // bytes were checked at). Each is racy against `recorded_ns` (the
+    // pass's start), so converge trusts none until a rerun re-dates it
+    // after checking the bytes again.
     for file in &mut next.files {
-        if !matches!(file.kind, FileKind::ViaSymlink(_)) {
-            file.print = lstat(&worktree.join(OsStr::from_bytes(&file.path)))?
-                .and_then(|meta| SeatPrint::of(&file.path, &meta));
+        if matches!(file.kind, FileKind::ViaSymlink(_)) || file.print.is_some() {
+            continue;
         }
+        file.print = lstat(&worktree.join(OsStr::from_bytes(&file.path)))?
+            .and_then(|meta| SeatPrint::of(&file.path, &meta));
     }
     next.recorded_ns = super::super::pass_start_ns();
     let rewrite = wrote || record.as_ref() != Some(&next);
@@ -1975,12 +2463,17 @@ fn render_workspace(
 
 /// Clear one workspace (design 7): each intact recorded block stripped (a
 /// created file that is the block alone removed), then the record and the
-/// intent removed. A marker that is not the record's refuses
-/// `HANDOFF_BLOCK_MODIFIED` with nothing written.
+/// intent removed. A marker of this landing's that is not the record's
+/// refuses `HANDOFF_BLOCK_MODIFIED` with nothing written; a block carried
+/// from another landing is content and stays (OI-1003-Q185). A refusal
+/// after the intent keeps it, so the next run of either verb finishes the
+/// clear ([`settle`]).
 #[allow(clippy::too_many_lines)]
-fn clear(worktree: &Path, dir: &Path) -> Result<Row> {
+fn clear(worktree: &Path, dir: &Path, ours: &str) -> Result<Row> {
     let record_path = dir.join(HANDOFF_LANDED);
+    let intent_path = dir.join(HANDOFF_INTENT);
     let record = landed::read::<HandoffLanded>(&record_path)?;
+    let pending = landed::exists(&intent_path)?;
     let fsid = landed::fsid(worktree)?;
     let mut work: Vec<(&'static str, Whole, HandoffFile)> = Vec::new();
     let mut rows = Vec::new();
@@ -2004,16 +2497,16 @@ fn clear(worktree: &Path, dir: &Path) -> Result<Row> {
             }
             continue;
         }
-        match held(&path, name, &meta, record.as_ref(), fsid)? {
-            Held::Plain => {}
+        match held(&path, name, &meta, record.as_ref(), fsid, ours)? {
+            Held::Plain | Held::Foreign => {}
             Held::Modified => return Err(BulkloadRefusal::HandoffBlockModified),
             Held::Intact(file) => {
-                let read = read_as(&path, name, Some(&file))?;
+                let read = read_as(&path, name, Expect::Block(&file))?;
                 work.push((name, read, file));
             }
         }
     }
-    if work.is_empty() && record.is_none() {
+    if work.is_empty() && record.is_none() && !pending {
         return Ok(Row {
             outcome: "unchanged",
             ..Row::default()
@@ -2033,16 +2526,14 @@ fn clear(worktree: &Path, dir: &Path) -> Result<Row> {
             after: (!gone).then(|| digest(rest)),
         });
     }
+    let intent = HandoffIntent {
+        op: Op::Clear,
+        tag: tag.clone(),
+        steps: steps.clone(),
+        next: None,
+    };
     if !steps.is_empty() {
-        landed::write(
-            &dir.join(HANDOFF_INTENT),
-            &HandoffIntent {
-                op: Op::Clear,
-                tag: tag.clone(),
-                steps: steps.clone(),
-                next: None,
-            },
-        )?;
+        landed::write(&intent_path, &intent)?;
         fault_point!(EstateHandoffAfterIntent);
     }
     for (n, ((name, read, file), step)) in work.iter().zip(&steps).enumerate() {
@@ -2061,7 +2552,8 @@ fn clear(worktree: &Path, dir: &Path) -> Result<Row> {
             )
         };
         if let Err(refusal) = outcome {
-            settle(worktree, dir)?;
+            // The intent stays: the next run finishes the clear.
+            sweep(worktree, Some(&intent), record.as_ref())?;
             return Err(refusal);
         }
         rows.push(FileRow {
@@ -2071,9 +2563,7 @@ fn clear(worktree: &Path, dir: &Path) -> Result<Row> {
         });
     }
     landed::remove(&record_path)?;
-    if !steps.is_empty() {
-        landed::remove(&dir.join(HANDOFF_INTENT))?;
-    }
+    landed::remove(&intent_path)?;
     rows.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Row {
         outcome: "cleared",
@@ -2100,8 +2590,37 @@ fn blob_has_token(worktree: &Path, rev: &str, name: &str) -> Result<bool> {
             .any(|window| window == TOKEN.as_bytes()))
 }
 
+/// Whether a branch's or tag's history (or a detached HEAD's) holds a
+/// commit that put the token into one of `names`: a block committed and
+/// removed again is still published by a push (review of 2026-10-16). The
+/// carried capture refs (`refs/carry/`) are not pushed and are not read.
+fn history_has_token(worktree: &Path, names: &[&str]) -> Result<bool> {
+    let mut command = git(worktree);
+    command.args([
+        "log",
+        "--branches",
+        "--tags",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--format=%H",
+        "-1",
+        "-S",
+        TOKEN,
+    ]);
+    if now_of(worktree)?.is_some() {
+        command.arg("HEAD");
+    }
+    command.arg("--").args(names);
+    let out = command
+        .output()
+        .refuse_at("git_carry::converge::handoff::history")?;
+    Ok(out.status.success() && out.stdout.iter().any(|byte| !byte.is_ascii_whitespace()))
+}
+
 /// `--check` (read-only at the destination and in STATE): the hand-off's
-/// state, its open rows, and whether its token is staged or committed.
+/// state, its open rows, and whether its token is staged or committed
+/// (the index, HEAD, every listed tip, and the history of every branch and
+/// tag).
 #[allow(clippy::too_many_lines)]
 fn check(
     workspace: &Workspace<'_>,
@@ -2109,27 +2628,20 @@ fn check(
     estate: &Estate<'_>,
     session: &mut Session,
     place: &Place,
+    ours: &str,
 ) -> Result<Row> {
     let worktree = workspace.worktree;
     let this = canonical(worktree);
     let record = landed::read::<HandoffLanded>(&place.dir.join(HANDOFF_LANDED))?;
     let fsid = landed::fsid(worktree)?;
-    let readme = request.readme
-        || record.as_ref().is_some_and(|record| {
-            record
-                .files
-                .iter()
-                .any(|file| file.path == README.as_bytes())
-        });
-    let mut names: Vec<&'static str> = TARGETS.to_vec();
-    if readme {
-        names.push(README);
-    }
+    let options = effective(request, record.as_ref(), &this);
+    let names = names_for(worktree, options.readme, record.as_ref())?;
     let found = classify(worktree, &names)?;
     let mut modified = false;
     let mut missing = false;
     let mut present = false;
     let mut rows = Vec::new();
+    let mut carried = Vec::new();
     for (name, entry) in &found {
         let recorded = record.as_ref().and_then(|record| {
             record
@@ -2139,7 +2651,18 @@ fn check(
         });
         let action = match entry {
             Found::Regular(meta) => {
-                match held(&worktree.join(name), name, meta, record.as_ref(), fsid)? {
+                let state = held(
+                    &worktree.join(name),
+                    name,
+                    meta,
+                    record.as_ref(),
+                    fsid,
+                    ours,
+                )?;
+                if carried_of(Some(&state)) {
+                    carried.push(name.as_bytes().to_vec());
+                }
+                match state {
                     Held::Intact(_) => {
                         present = true;
                         "present"
@@ -2147,6 +2670,10 @@ fn check(
                     Held::Modified => {
                         modified = true;
                         "modified"
+                    }
+                    Held::Foreign => {
+                        missing |= recorded.is_some();
+                        "carried"
                     }
                     Held::Plain => {
                         missing |= recorded.is_some();
@@ -2156,7 +2683,7 @@ fn check(
             }
             Found::Via(_) => "none",
             Found::Missing => {
-                missing |= recorded.is_some();
+                missing |= recorded.is_some() && !never_created(name);
                 "none"
             }
         };
@@ -2174,16 +2701,25 @@ fn check(
             .as_bytes()
             .starts_with(TEMP_PREFIX.as_bytes());
     }
-    let allowed = request.allow.contains(&this);
-    let stored = stored(estate, request, allowed, readme);
+    let stored = stored(estate, &options);
     let census = census_of(session, place, workspace, estate)?.clone();
-    let sibling = sibling_of(&this, request.siblings)?;
+    let sibling = sibling_of(&this, &options.siblings)?;
     let inputs = inputs_digest(workspace, estate, &stored, &census, sibling.as_ref())?;
     let as_of = request.as_of.unwrap_or_else(super::super::pass_start_ns);
-    let facts = gather(workspace, estate, &census, &place.ledger, sibling, as_of)?;
+    let any_carried = !carried.is_empty();
+    let facts = gather(
+        workspace,
+        estate,
+        &census,
+        &place.ledger,
+        sibling,
+        carried,
+        as_of,
+    )?;
     let open = facts.open();
-    // Commit detection: the index blob, the HEAD blob, and each
-    // destination-ahead, destination-only or diverged tip's blob.
+    // Commit detection: the index blob, the HEAD blob, each destination-
+    // ahead, destination-only or diverged tip's blob, and the history of
+    // every branch and tag.
     let mut staged = false;
     let mut committed = false;
     for name in &names {
@@ -2197,6 +2733,7 @@ fn check(
             committed |= blob_has_token(worktree, &row.name, name)?;
         }
     }
+    committed = committed || history_has_token(worktree, &names)?;
     let state = if committed {
         "committed"
     } else if staged {
@@ -2208,7 +2745,11 @@ fn check(
     } else if missing {
         "removed-by-hand"
     } else if !present {
-        "absent"
+        if any_carried {
+            "carried"
+        } else {
+            "absent"
+        }
     } else if record
         .as_ref()
         .is_some_and(|record| record.inputs != inputs)

@@ -50,6 +50,12 @@ pub enum SiblingState {
 pub struct Sibling {
     pub path: Vec<u8>,
     pub state: SiblingState,
+    /// For a checkout: whether its HEAD commit and this landing's HEAD
+    /// commit are reconciled (one is in the other's history: the sibling's
+    /// HEAD reachable from a branch of this landing, or this landing's HEAD
+    /// reachable from the sibling's). Read-only, from commits alone; work
+    /// the sibling has not committed is not seen.
+    pub consolidated: bool,
 }
 
 /// What a capture held for one checkout (from its provenance instance).
@@ -104,6 +110,15 @@ pub struct Omitted {
     pub entries: u64,
 }
 
+/// A worktree of the repository that no plan item names.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct DestOnly {
+    pub path: Vec<u8>,
+    /// Its HEAD commit is in another branch of the repository (merged or
+    /// picked into the copy that carries the work forward).
+    pub consolidated: bool,
+}
+
 /// Everything one block says.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inputs {
@@ -127,37 +142,95 @@ pub struct Inputs {
     pub sibling: Option<Sibling>,
     pub family: Vec<FamilyRow>,
     pub refs: Vec<RefDiff>,
-    pub dest_only: Vec<Vec<u8>>,
+    pub dest_only: Vec<DestOnly>,
+    /// Targets whose bytes under this block start with a hand-off block
+    /// another landing rendered (carried with the source's bytes,
+    /// OI-1003-Q185): kept as content, never this landing's.
+    pub carried: Vec<Vec<u8>>,
     /// `(item, code)`: the family's items whose last outcome is a refusal.
     pub refused: Vec<(String, String)>,
     pub omitted: Option<Vec<Omitted>>,
 }
 
+/// The ref classes that are open rows.
+///
+/// The landing holds commits the destination's ref does not
+/// (`source-ahead`), or each side holds commits the other lacks
+/// (`diverged`). `dest-ahead` is not open: the destination already holds
+/// every landed commit, which is what consolidating at the destination
+/// leaves.
+pub const OPEN_CLASSES: [&str; 2] = ["diverged", "source-ahead"];
+
 impl Inputs {
-    /// The rows still to be dealt with (design 4.4): differing refs,
-    /// destination-only worktrees, recorded refusals, landings changed
-    /// since they landed, and a newer capture not applied yet.
+    /// The rows still to be dealt with (design 4.4, as amended by the
+    /// review of 2026-10-16): diverged and source-ahead refs, destination-
+    /// only worktrees whose HEAD commit no other branch holds, a live
+    /// sibling not reconciled with this landing, recorded refusals, and a
+    /// newer capture not applied yet. Each closes by consolidating (a
+    /// merge, a cherry-pick, an apply, a disposal), never only by deleting
+    /// a copy; a destination commit or a seat edited since landing is
+    /// consolidation, never an open row.
     #[must_use]
     pub fn open(&self) -> u64 {
         let refs = self
             .refs
             .iter()
-            .filter(|row| {
-                matches!(
-                    row.class.as_str(),
-                    "diverged" | "dest-ahead" | "source-ahead"
-                )
-            })
+            .filter(|row| OPEN_CLASSES.contains(&row.class.as_str()))
             .count();
-        let changed = self
-            .family
+        let dest_only = self
+            .dest_only
             .iter()
-            .filter(|row| matches!(row.landing, Landing::Applied { changed } if changed > 0))
+            .filter(|row| !row.consolidated)
             .count();
+        let sibling = usize::from(self.sibling.as_ref().is_some_and(|sibling| {
+            matches!(sibling.state, SiblingState::Head { .. }) && !sibling.consolidated
+        }));
         let behind = usize::from(self.current.is_some_and(|current| current != self.capture));
-        u64::try_from(refs + self.dest_only.len() + self.refused.len() + changed + behind)
-            .unwrap_or(u64::MAX)
+        u64::try_from(refs + dest_only + sibling + self.refused.len() + behind).unwrap_or(u64::MAX)
     }
+
+    /// The identity of the landing this block is rendered for: what its
+    /// BEGIN line carries as `for=` ([`owner`]).
+    #[must_use]
+    pub fn owner(&self) -> String {
+        owner(&self.dest_host, &self.workspace, &self.source)
+    }
+}
+
+/// A landing's hand-off identity, the `for=` of its blocks.
+///
+/// The first 16 hex digits of the blake3 of the destination host, the
+/// workspace's absolute path and the SOURCE label. A block whose BEGIN line
+/// names another identity was rendered for another landing and carried
+/// here with the source's bytes: it is content (OI-1003-Q185), never this
+/// landing's block.
+#[must_use]
+pub fn owner(host: &str, workspace: &[u8], source: &str) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"bulkload-handoff-owner-v1\0");
+    for part in [host.as_bytes(), workspace, source.as_bytes()] {
+        hasher.update(&u64::try_from(part.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(part);
+    }
+    hasher
+        .finalize()
+        .to_hex()
+        .get(..16)
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// The `for=` identity a BEGIN line at byte 0 of `bytes` names, if any.
+#[must_use]
+pub fn owner_of(bytes: &[u8]) -> Option<&[u8]> {
+    if !bytes.starts_with(BEGIN) {
+        return None;
+    }
+    let at = BEGIN.len() + 16;
+    let tag = b" for=";
+    (bytes.get(at..at + tag.len()) == Some(tag.as_slice()))
+        .then(|| bytes.get(at + tag.len()..at + tag.len() + 16))
+        .flatten()
 }
 
 /// Bytes as a block prints them: UTF-8 as it is, anything else escaped.
@@ -269,6 +342,9 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
     let mut dest_only = inputs.dest_only.clone();
     dest_only.sort();
     dest_only.dedup();
+    let mut carried = inputs.carried.clone();
+    carried.sort();
+    carried.dedup();
     let mut refused = inputs.refused.clone();
     refused.sort();
     refused.dedup();
@@ -277,7 +353,8 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "<!-- bulkload-handoff:v1 BEGIN id={BLANK_ID} {TOKEN} · bulkload owns this block: do not edit inside it, do not commit it -->"
+        "<!-- bulkload-handoff:v1 BEGIN id={BLANK_ID} for={} {TOKEN} · bulkload owns this block: do not edit inside it, do not commit it -->",
+        inputs.owner()
     );
     out.push_str(
         "> **bulkload hand-off: converge and consolidate this workspace before any other work.**\n",
@@ -314,9 +391,14 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
                 SiblingState::Absent => format!("`{path}`: absent"),
                 SiblingState::NotACheckout => format!("`{path}`: exists, not a Git checkout"),
                 SiblingState::Head { branch: name, oid } => format!(
-                    "`{path}`: exists, HEAD `{}` at `{}`",
+                    "`{path}`: exists, HEAD `{}` at `{}`; {}",
                     branch(name.as_deref()),
-                    short(oid)
+                    short(oid),
+                    if sibling.consolidated {
+                        "its HEAD and this landing's HEAD are in one history (reconciled)"
+                    } else {
+                        "not reconciled: neither HEAD is in the other's history (an open row)"
+                    }
                 ),
             }
         },
@@ -410,7 +492,7 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
             );
         }
     }
-    out.push_str("\n**Differences** (estate-diff's ref classes, against the landed capture)\n\n");
+    out.push_str("\n**Differences** (estate-diff's ref classes, against the landed capture; open rows: diverged and source-ahead)\n\n");
     let classes = [
         "diverged",
         "dest-ahead",
@@ -462,7 +544,17 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
             let mut listed: Vec<String> = dest_only
                 .iter()
                 .take(REF_NAMES)
-                .map(|path| format!("`{}`", shown(path)))
+                .map(|row| {
+                    format!(
+                        "`{}`{}",
+                        shown(&row.path),
+                        if row.consolidated {
+                            " (its HEAD is in another branch)"
+                        } else {
+                            " (open)"
+                        }
+                    )
+                })
                 .collect();
             if dest_only.len() > REF_NAMES {
                 listed.push(format!("and {} more", dest_only.len() - REF_NAMES));
@@ -499,9 +591,20 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
         }
     };
     let _ = writeln!(out, "- Rebuildable roots omitted at capture: {omitted}.");
+    if !carried.is_empty() {
+        let names: Vec<String> = carried
+            .iter()
+            .map(|name| format!("`{}`", shown(name)))
+            .collect();
+        let _ = writeln!(
+            out,
+            "- Carried hand-off blocks: {} also hold, below this block, a hand-off block another landing rendered. It came with the source's bytes and describes that landing, not this one: do not act on its paths or commands. bulkload keeps it as the file's content (OI-1003-Q185); removing it is the user's call.",
+            names.join(", ")
+        );
+    }
     let _ = writeln!(
         out,
-        "- Open rows: {} (the hand-off is ready to clear at 0).",
+        "- Open rows: {} (the hand-off is ready to clear at 0). A commit at this landing or a file edited since landing is consolidation, not an open row. `ready` reads commits only: ask the user about work not yet committed here, in the sibling or in a destination-only worktree.",
         inputs.open()
     );
     out.push_str("\n**Do this first** (converge and consolidate before any other work)\n\n");
@@ -511,7 +614,7 @@ pub fn render(inputs: &Inputs, compact: bool) -> Vec<u8> {
         "2. See what differs, read-only:\n   `{}`",
         command(inputs, Verb::Differences)
     );
-    out.push_str("3. For each diverged, dest-ahead or source-ahead ref, each destination-only worktree and the live sibling, decide with the user which copy carries the work forward, and bring the other side's commits into it (merge or cherry-pick). Never reset, force-push, delete a branch, or delete either copy: removing a copy is the operator's call.\n");
+    out.push_str("3. For each diverged or source-ahead ref, each destination-only worktree and the live sibling, decide with the user which copy carries the work forward, and bring the other side's commits into it (merge or cherry-pick). Never reset, force-push, delete a branch, or delete either copy: removing a copy is the operator's call.\n");
     let _ = writeln!(
         out,
         "4. Commit or stash nothing that contains this block. Before any commit, check that `git diff --cached` shows no `{TOKEN}`."
@@ -629,7 +732,11 @@ pub(super) fn sample() -> Inputs {
                 name: "refs/heads/y".to_owned(),
             },
         ],
-        dest_only: vec![b"/estate/gf/wt".to_vec()],
+        dest_only: vec![DestOnly {
+            path: b"/estate/gf/wt".to_vec(),
+            consolidated: false,
+        }],
+        carried: Vec::new(),
         refused: Vec::new(),
         omitted: Some(Vec::new()),
     }

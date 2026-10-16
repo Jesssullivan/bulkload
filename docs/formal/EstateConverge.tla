@@ -144,13 +144,20 @@
 (*     the landed bytes (SeatProved, the settle and sweep classifications)*)
 (*     and lifts a created block before an add. A block value is Blk(v),   *)
 (*     the block on v; Blk2(v) is a block the operator edited, which only  *)
-(*     the operator writes. Not modelled: the block's content (one block   *)
-(*     value, so a re-render of an intact block is a no-op), the inputs    *)
-(*     digest, the privacy guard, commit detection, the second target      *)
-(*     (CLAUDE.md is AGENTS.md's twin), the lift's own crash points (one   *)
-(*     step with the import), and a third party's file a settle cannot     *)
-(*     put back (the next run's temporaries have their own names in the    *)
-(*     code; here one slot, so the hand-off waits).                         *)
+(*     the operator writes. The record's print of the target vouches for  *)
+(*     it without a read when it is not racy and its base is the landed    *)
+(*     value (HTrusted); every re-take of that print (a rerun over an      *)
+(*     intact block, HandoffKeep; a settle) checks the base against the    *)
+(*     bytes under the block again, and a settle finishes a pending clear  *)
+(*     (review of 2026-10-16). Not modelled: the block's content (one      *)
+(*     block value, so a rerun over an intact block writes nothing), the   *)
+(*     inputs digest, the privacy guard, commit detection, the block's     *)
+(*     owner identity (a carried block is plain content: a source value),  *)
+(*     the H step's choice to re-render, the second target (CLAUDE.md is   *)
+(*     AGENTS.md's twin), the lift's own crash points (one step with the   *)
+(*     import), and a third party's file a settle cannot put back (the     *)
+(*     next run's temporaries have their own names in the code; here one   *)
+(*     slot, so the hand-off waits).                                        *)
 (*   - Symbolic refs and per-worktree refs are not modelled (never        *)
 (*     restored natively). Tombstone retention (90 days) is not modelled.*)
 (*   - Each atomic durable write (landed::write: temporary, fsync, rename,*)
@@ -203,8 +210,8 @@
 (*   WriteLanded    C next_ledger, landed::write, landed::remove           *)
 (*   Journal        E apply_item's journal write                           *)
 (*   Handoff*       C handoff::settle, run, exchange, create, remove,     *)
-(*                  render_workspace, clear (TIN-6569); the lift is       *)
-(*                  handoff::lift in Import                               *)
+(*                  render_workspace, retaken, clear (TIN-6569); the lift *)
+(*                  is handoff::lift in Import                            *)
 (*   Src*, Op*, Crash, ChildCrashTxn, ChildCrashHead, Tick   the          *)
 (*                  environment                                            *)
 (*                                                                         *)
@@ -257,7 +264,7 @@ Mutations == {"none", "proof_stat_only", "proof_stat_strict",
               "adopt_r2_not_adopted", "adopt_no_recheck", "adopt_t0_no_row",
               "handoff_no_overlay", "handoff_overlay_any_block",
               "handoff_clear_unchecked", "handoff_exchange_unchecked",
-              "handoff_no_intent"}
+              "handoff_no_intent", "handoff_retake_unchecked"}
 
 (* The closed unions the catalogue types (tla-check requires these sets   *)
 (* to equal the catalogue's labels).                                      *)
@@ -421,7 +428,10 @@ VARIABLES
                \* durable handoff.intent (none, render or clear); v and st,
                \* the target's bytes and print the run read; tmp, its
                \* .bulkload-handoff temporary; op and ph, the run in flight
-               \* (volatile); n, runs so far; cl, a clear completed (ghost)
+               \* (volatile); n, runs so far; cl, a clear completed (ghost);
+               \* pst, prac and base, the record's print of HP, whether that
+               \* print is racy against the record, and the landed value it
+               \* vouches is under the block (0: none) (review of 2026-10-16)
 
 vars == <<src, srcN, nextV, caps, capt, nat, locks, dstash, dseat, temp,
           dindex, dhead, prov, refLed, stashLed, refInt, wsLed, wsInt, jour,
@@ -458,6 +468,20 @@ Holds(p, cur, v) ==
     \/ cur = v
     \/ /\ p = HP /\ Ov /\ IsFile(v)
        /\ (cur = Blk(v) \/ (Mut("handoff_overlay_any_block") /\ cur = Blk2(v)))
+\* Review of 2026-10-16 (C handoff::landed_sides, Prefix.trusted): the
+\* record's print of HP vouches for the seat without a read when it is not
+\* racy and its base is the landed value being proved. Every write of the
+\* record's print checks the base against the bytes under the block at that
+\* print (C retaken); handoff_retake_unchecked keeps the old base, the
+\* BLOCKER: a print re-taken over an operator's edit below the block then
+\* vouches for the edit and a converge replaces it.
+HLanded == wsLed["main"].seats[HP].v
+HBase(x) == IF IsBlk(x) /\ IsFile(Strip(x)) /\ Strip(x) = HLanded THEN Strip(x) ELSE 0
+HRetake(x, st) == [pst |-> st, prac |-> FALSE,
+                   base |-> IF Mut("handoff_retake_unchecked") THEN hand.base ELSE HBase(x)]
+HTrusted(p, s) ==
+    /\ p = HP /\ Ov /\ hand.has /\ ~hand.prac
+    /\ hand.base # 0 /\ hand.base = s.v /\ dseat[p].st = hand.pst
 \* A set of values, each also under the block (an intact block is
 \* bulkload's own bytes, never work).
 WithBlk(S) == S \cup (IF Handoff THEN {Blk(x) : x \in S} ELSE {})
@@ -818,7 +842,7 @@ SeatProved(p, s) ==
     ELSE IF Mut("proof_stat_strict") THEN dseat[p].st = s.st /\ IsFile(dseat[p].v)
     ELSE IF dseat[p].st = s.st /\ IsFile(dseat[p].v) /\ (~s.racy \/ Mut("proof_stat_only"))
          THEN TRUE
-    ELSE Holds(p, dseat[p].v, s.v)
+    ELSE HTrusted(p, s) \/ Holds(p, dseat[p].v, s.v)
 Proved(i) ==
     \/ Mut("overwrite_modified")
     \/ /\ HeadOf(i) = wsLed[i].head
@@ -2201,8 +2225,12 @@ HParentOK == HP = "d" \/ dseat["d"].v = DIR
 \* C handoff::settle, at the start of a run: the temporary a crash left
 \* (bulkload's own: the target's old or new bytes) is removed; a third
 \* party's file a crash displaced goes back when HP holds this run's
-\* file, and is kept otherwise; the record then names exactly the block HP
-\* holds, and the intent is removed.
+\* file, and is kept otherwise. A pending clear is then finished, never
+\* undone (review of 2026-10-16): an intact block still on HP is cleared
+\* by the same exchange and check; an edited one refuses and keeps the
+\* intent. A pending render leaves the record naming exactly the block
+\* HP holds, its print re-taken and its base checked again (C retaken),
+\* and the intent removed.
 HandoffSettle ==
     /\ HandoffGate /\ hand.ph = "idle" /\ (hand.int # "none" \/ hand.tmp.v # ABSENT)
     /\ LET tp == hand.tmp
@@ -2210,19 +2238,32 @@ HandoffSettle ==
            back == tp.v # ABSENT /\ ~ours /\ dseat[HP].v = HNew
            keep == tp.v # ABSENT /\ ~ours /\ ~back
            ds == IF back THEN [dseat EXCEPT ![HP] = tp] ELSE dseat
+           cur == ds[HP]
+           t == IF keep THEN tp ELSE NoSeat
        IN /\ dseat' = ds
-          /\ hand' = [hand EXCEPT !.tmp = IF keep THEN tp ELSE NoSeat, !.int = "none",
-                                   !.has = IsBlk(ds[HP].v)]
+          /\ hand' = IF hand.int = "clear" /\ IsBlk(cur.v) /\ ~keep
+                     THEN [hand EXCEPT !.tmp = NoSeat, !.op = "clear", !.v = Strip(cur.v),
+                                       !.st = cur.st, !.ph = "exch"]
+                     ELSE IF hand.int = "clear" /\ IsBlk2(cur.v)
+                     THEN [hand EXCEPT !.tmp = t]
+                     ELSE LET r == HRetake(cur.v, cur.st) IN
+                          [hand EXCEPT !.tmp = t, !.int = "none", !.has = IsBlk(cur.v),
+                                       !.pst = r.pst, !.prac = r.prac, !.base = r.base]
     /\ HKeep
 
-\* C handoff::run: a render of a plain or missing HP (an intact block is a
-\* no-op; an edited one refuses HANDOFF_BLOCK_MODIFIED with nothing
-\* written), or a clear of an intact block; the intent, durable first,
-\* names the bytes and print read (handoff_no_intent: none written;
-\* handoff_clear_unchecked: a clear of an edited block too).
-HandoffStart ==
-    /\ HandoffGate /\ hand.ph = "idle" /\ hand.int = "none" /\ hand.tmp.v = ABSENT
-    /\ hand.n < HMAX
+\* C handoff::render_workspace over an intact block whose bytes are
+\* unchanged (one block value here, so every rerun over it): nothing is
+\* written; the record's print is re-taken (the file moved: an edit below
+\* the block) or re-dated (racy), its base checked again first (C retaken;
+\* handoff_retake_unchecked: the old base kept).
+HandoffKeep ==
+    /\ hand.has /\ IsBlk(dseat[HP].v)
+    /\ LET r == HRetake(dseat[HP].v, dseat[HP].st)
+       IN hand' = [hand EXCEPT !.pst = r.pst, !.prac = r.prac, !.base = r.base,
+                                !.n = hand.n + 1]
+
+\* A render of a plain or missing HP, or a clear of an intact block.
+HandoffWrite ==
     /\ LET cur == dseat[HP] IN
        \E op \in {"render", "clear"} :
           /\ IF op = "render"
@@ -2234,6 +2275,17 @@ HandoffStart ==
                                    !.v = Strip(cur.v), !.st = cur.st, !.ph = "exch",
                                    !.n = hand.n + 1]
     /\ UNCHANGED dseat /\ HKeep
+
+\* C handoff::run: a render of a plain or missing HP, or a rerun over an
+\* intact block (HandoffKeep; an edited one refuses HANDOFF_BLOCK_MODIFIED
+\* with nothing written), or a clear of an intact block; the intent,
+\* durable first, names the bytes and print read (handoff_no_intent: none
+\* written; handoff_clear_unchecked: a clear of an edited block too).
+HandoffStart ==
+    /\ HandoffGate /\ hand.ph = "idle" /\ hand.int = "none" /\ hand.tmp.v = ABSENT
+    /\ hand.n < HMAX
+    /\ \/ HandoffKeep /\ UNCHANGED dseat /\ HKeep
+       \/ HandoffWrite
 
 \* C handoff::exchange, create, remove: the new bytes through a temporary;
 \* a render's created file by a rename that never replaces (EEXIST:
@@ -2265,14 +2317,21 @@ HandoffCheck ==
        THEN /\ hand' = [hand EXCEPT !.tmp = NoSeat, !.ph = "rec"]
             /\ UNCHANGED dseat
        ELSE /\ dseat' = [dseat EXCEPT ![HP] = hand.tmp]
-            /\ hand' = [hand EXCEPT !.tmp = NoSeat, !.ph = "idle", !.op = "none",
-                                     !.int = "none", !.has = IsBlk(hand.tmp.v)]
+            /\ LET r == HRetake(hand.tmp.v, hand.tmp.st)
+               IN hand' = [hand EXCEPT !.tmp = NoSeat, !.ph = "idle", !.op = "none",
+                                        !.int = "none", !.has = IsBlk(hand.tmp.v),
+                                        !.pst = r.pst, !.prac = r.prac, !.base = r.base]
     /\ HKeep
 
-\* The record (a render's names the block; a clear's is removed).
+\* The record (a render's names the block; a clear's is removed). A
+\* render's print is of the file it wrote, racy against its own record,
+\* and its base is the landed value when the bytes the run read (under
+\* the block now) were exactly it (C landed_base).
 HandoffRecord ==
     /\ hand.ph = "rec"
-    /\ hand' = [hand EXCEPT !.has = hand.op = "render", !.ph = "fin"]
+    /\ hand' = [hand EXCEPT !.has = hand.op = "render", !.ph = "fin",
+                             !.pst = dseat[HP].st, !.prac = TRUE,
+                             !.base = HBase(Blk(hand.v))]
     /\ UNCHANGED dseat /\ HKeep
 
 \* The intent removed: the run is done.
@@ -2491,7 +2550,8 @@ Init ==
     /\ caps = << CapOf(SI, FALSE, FALSE) >>
     /\ adoptG = [kept |-> {}, stash |-> FALSE, unequal |-> FALSE]
     /\ hand = [has |-> FALSE, int |-> "none", op |-> "none", v |-> 0, st |-> 0,
-               tmp |-> NoSeat, ph |-> "idle", n |-> 0, cl |-> FALSE]
+               tmp |-> NoSeat, ph |-> "idle", n |-> 0, cl |-> FALSE,
+               pst |-> 0, prac |-> FALSE, base |-> 0]
     /\ capt = [i \in Items |-> 1]
     /\ locks = {}
     /\ temp = [p \in Paths |-> NoSeat]
@@ -2619,7 +2679,7 @@ TypeOK ==
     /\ hand \in [has : BOOLEAN, int : {"none", "render", "clear"},
                  op : {"none", "render", "clear"}, v : Nat, st : Nat,
                  tmp : [v : Nat, st : Nat], ph : {"idle", "exch", "check", "rec", "fin"},
-                 n : 0..HMAX, cl : BOOLEAN]
+                 n : 0..HMAX, cl : BOOLEAN, pst : Nat, prac : BOOLEAN, base : Nat]
 
 \* Q144: an operator edit is never overwritten or removed. Every value the
 \* operator wrote that is not a landed value (or deleted) is still where

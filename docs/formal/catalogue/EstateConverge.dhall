@@ -232,6 +232,7 @@ let Mutation =
       | handoff_clear_unchecked
       | handoff_exchange_unchecked
       | handoff_no_intent
+      | handoff_retake_unchecked
       >
 
 let mutationIndex =
@@ -295,6 +296,7 @@ let mutationIndex =
           , handoff_clear_unchecked = 55
           , handoff_exchange_unchecked = 56
           , handoff_no_intent = 57
+          , handoff_retake_unchecked = 58
           }
           m
 
@@ -1447,6 +1449,7 @@ let verdict
           , handoff_clear_unchecked = Property.NoLocalWorkLost
           , handoff_exchange_unchecked = Property.NoLocalWorkLost
           , handoff_no_intent = Property.HandoffOwnsOnlyItsBlock
+          , handoff_retake_unchecked = Property.NoLocalWorkLost
           }
           m
 
@@ -2818,6 +2821,18 @@ let primary =
             ]
           }
         }
+      , handoff_retake_unchecked =
+        { mutation = Mutation.handoff_retake_unchecked
+        , constants = handoffOp
+        , comment =
+          { head = "TIN-6569, review of 2026-10-16 (BLOCKER): a rerun over an intact"
+          , tail =
+            [ "block re-takes the record's print and keeps its old base, so the"
+            , "print vouches for an operator's edit below the block and a"
+            , "converge that replaces the target drops the edit."
+            ]
+          }
+        }
       , handoff_no_intent =
         { mutation = Mutation.handoff_no_intent
         , constants = handoff
@@ -2973,6 +2988,7 @@ let negRows
       , primaryOf Mutation.handoff_clear_unchecked
       , primaryOf Mutation.handoff_exchange_unchecked
       , primaryOf Mutation.handoff_no_intent
+      , primaryOf Mutation.handoff_retake_unchecked
       ]
 
 let primaryPositions =
@@ -3335,6 +3351,8 @@ let invariants
           , "lift"
           , "clear"
           , "after_apply"
+          , "retaken"
+          , "settle"
           ]
         , pending = none
         , ptest =
@@ -3350,7 +3368,12 @@ let invariants
           , "a_racy_record_print_is_proved_by_reading"
           , "the_exchange_is_undone_when_the_target_moved_after_the_read"
           , "render_then_clear_is_identity"
-          , "the estate_handoff fault-harness rows"
+          , "H20"
+          , "H21"
+          , "H24"
+          , "H25"
+          , "H32"
+          , "the estate_handoff fault-harness rows (rerender_over_edit, clear_noop_apply)"
           ]
         }
       , { tla = Property.ConvergesWhenQuiet

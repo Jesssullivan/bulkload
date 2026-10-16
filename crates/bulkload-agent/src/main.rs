@@ -103,17 +103,25 @@ SUBCOMMANDS:
                 its own ledger beside workspace.landed so estate-apply keeps an
                 intact block instead of refusing the seat (and re-renders it
                 after a converge). A missing target is
-                created untracked; README.md only with --readme, never created.
-                Written only where the repository has no remote, every remote URL
-                is under a --private-remote PREFIX, or --allow-workspace names it
-                (HANDOFF_NOT_PRIVATE otherwise; no URL is printed). A symlink other
-                than CLAUDE.md <-> AGENTS.md refuses HANDOFF_TARGET_UNSUPPORTED; an
-                edited block HANDOFF_BLOCK_MODIFIED; an unlanded item
-                HANDOFF_NOT_LANDED; all with nothing written. --check is read-only
-                (state, open rows, ready) and exits HANDOFF_MARKER_COMMITTED when
-                the block's token is staged or committed; --clear restores the
-                bytes; --dry-run prints the blocks. An unchanged rerun reads and
-                writes nothing. One JSON line per workspace (schema
+                created untracked; an existing AGENTS.override.md is prefixed too;
+                README.md only with --readme; neither is ever created. Written
+                only where the repository has no remote (active, or the source's
+                origin a landing kept inert), every remote and push URL, as
+                written and as insteadOf/pushInsteadOf rewrite it, is under a
+                --private-remote PREFIX, or --allow-workspace names it
+                (HANDOFF_NOT_PRIVATE otherwise; no URL is printed). A symlink
+                other than one target to another refuses
+                HANDOFF_TARGET_UNSUPPORTED; an edited block of this landing's
+                HANDOFF_BLOCK_MODIFIED; an unlanded item HANDOFF_NOT_LANDED; all
+                with nothing written. A block another landing rendered (carried
+                with the source's bytes) is content: kept below this one, never
+                cleared. --check is read-only (state, open rows, ready) and exits
+                HANDOFF_MARKER_COMMITTED when a token is staged, at HEAD or a
+                listed tip, or in any branch's or tag's history; --clear restores
+                the bytes and finishes a crashed clear; --dry-run prints the
+                blocks. A rerun keeps the options the record was rendered with
+                unless they are given again; an unchanged rerun reads and writes
+                nothing. One JSON line per workspace (schema
                 bulkload.estate-handoff.v1, the verb's own name)
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each

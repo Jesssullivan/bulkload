@@ -1054,6 +1054,13 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
     no-op and reads 0 bytes. The adopted prints then prove later converges
     by print.
   - **S2:** the source is never read.
+- **Review of 2026-10-16** (two refuters against `9ec8d36`; the design
+  note's section 18 has the per-finding table): the record's print is
+  re-checked at every write; a crashed clear is finished; a carried block
+  is kept as content (OI-1003-Q185); the privacy guard counts a preserved
+  inert origin and URL rewrites; commit detection reads branch and tag
+  history; `ready` is reachable by consolidating; options persist across
+  reruns; `AGENTS.override.md` is covered. No SLO number changes.
 - **`estate-diff`** reports a plan against the destination, read-only, in
   the apply's own terms (P94).
 - **A bare capture into an absent path lands natively** (#226 item 4).
@@ -1119,10 +1126,14 @@ user. No SLO number changes. The design note is
 - **S5:** a block that is intact and recorded is bulkload's bytes, never
   a local change: converge proves the seat as the block followed by the
   landed blob and keeps it. Any edit inside the block or below it is a
-  local change: `GIT_DESTINATION_MODIFIED`, as for any edit, and the
-  hand-off itself refuses `HANDOFF_BLOCK_MODIFIED` with nothing written.
+  local change: `GIT_DESTINATION_MODIFIED`, as for any edit. An edit
+  inside the block also makes the hand-off refuse
+  `HANDOFF_BLOCK_MODIFIED` with nothing written; under an edit below it,
+  a rerun re-renders the block alone and keeps the user's bytes, and the
+  record's print never vouches for them (review of 2026-10-16).
   `NoLocalWorkLost` is amended in one place: an operator value a render
-  left under an intact block is kept.
+  left under an intact block is kept. A block carried from another
+  landing is content and is never dropped (OI-1003-Q185).
 - **S4:** the hand-off is an annotation outside closure's gate. Its five
   refusals are typed per workspace and never change an item's outcome;
   the H step's result is a line of its own after the apply's receipts.
@@ -1132,6 +1143,13 @@ user. No SLO number changes. The design note is
   step. A converge reads a handed-off target once, as it reads any seat
   whose print moved.
 - **S2:** the source is never read.
+- **Review of 2026-10-16** (two refuters against `9ec8d36`; the design
+  note's section 18 has the per-finding table): the record's print is
+  re-checked at every write; a crashed clear is finished; a carried block
+  is kept as content (OI-1003-Q185); the privacy guard counts a preserved
+  inert origin and URL rewrites; commit detection reads branch and tag
+  history; `ready` is reachable by consolidating; options persist across
+  reruns; `AGENTS.override.md` is covered. No SLO number changes.
 - **Proof.** `tests/estate_handoff.rs` H0 to H19 (H0 is the control: a
   naive prepend refuses MODIFIED), the hand-off unit rows and the
   `render_then_clear_is_identity` property, the `estate.handoff.*`

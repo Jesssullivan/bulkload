@@ -24,6 +24,11 @@
 //! the overlaid `estate.converge.*` row). `HStep`: `estate-apply`'s H step
 //! (design 6.4) crashed after the converge's journal, so the rerun apply is
 //! a journal no-op that must still settle the pending hand-off intent.
+//! `RerenderOverEdit`: a re-render over a user's edit below the block
+//! crashed, the next run settled it and refused: the settled record never
+//! vouches for the edit, and a converge that replaces the target refuses
+//! MODIFIED with the edit kept (S5). `ClearNoOpApply`: a crashed clear is
+//! finished, not reversed, by a no-op `estate-apply`'s H step.
 //!
 //! `_exit` models a process crash only (see the harness header).
 
@@ -59,6 +64,13 @@ pub enum EstateHandoff {
     Converge,
     /// `estate-apply`'s H step after a converge, crashed at a hand-off point.
     HStep,
+    /// A re-render over a user's edit below the block, crashed; the next
+    /// run settles it and then refuses (review of 2026-10-16, converge
+    /// safety finding 2).
+    RerenderOverEdit,
+    /// A clear crashed, then a no-op `estate-apply` (review of 2026-10-16,
+    /// converge safety finding 3).
+    ClearNoOpApply,
 }
 
 impl Scenario for EstateHandoff {
@@ -466,13 +478,72 @@ fn scenario(point: Point, nth: u64, kind: EstateHandoff) {
                 assert_eq!(remainder(&bytes).as_deref(), body, "{label}: {name}");
             }
         }
+        EstateHandoff::RerenderOverEdit => {
+            world.handoff(HandoffMode::Render).unwrap();
+            tick();
+            let agents = world.dst().join("AGENTS.md");
+            let mut bytes = fs::read(&agents).unwrap();
+            bytes.extend_from_slice(b"A local note.\n");
+            fs::write(&agents, &bytes).unwrap();
+            // A newer capture, not applied: the block's text moves, so the
+            // rerun re-renders over the user's bytes.
+            world.source_change(b"alpha 2\n");
+            crash(&world, "render", &fault);
+            git(
+                &world.dst(),
+                &["remote", "add", "live", "https://example.invalid/x.git"],
+            );
+            let refused = world.handoff(HandoffMode::Render);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|refusal| refusal.contains("HANDOFF_NOT_PRIVATE")),
+                "{label}: {refused:?}"
+            );
+            git(&world.dst(), &["remote", "remove", "live"]);
+            tick();
+            let mut kept = AGENTS.to_vec();
+            kept.extend_from_slice(b"A local note.\n");
+            assert_eq!(remainder(&fs::read(&agents).unwrap()), Some(kept.clone()));
+            fs::write(world.src().join("AGENTS.md"), b"# Agents, v2\n").unwrap();
+            git(&world.src(), &["commit", "--quiet", "-am", "agents v2"]);
+            tick();
+            world.capture();
+            let rows = world.apply();
+            assert!(
+                rows[0]
+                    .1
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("GIT_DESTINATION_MODIFIED")),
+                "{label}: {rows:?}"
+            );
+            assert_eq!(
+                remainder(&fs::read(&agents).unwrap()),
+                Some(kept),
+                "{label}: the user's edit was landed over"
+            );
+        }
+        EstateHandoff::ClearNoOpApply => {
+            world.handoff(HandoffMode::Render).unwrap();
+            tick();
+            crash(&world, "clear", &fault);
+            assert!(world.intent(), "{label}: no intent after the crash");
+            let rows = world.apply();
+            assert!(rows[0].0.starts_with("previous-"), "{label}: {rows:?}");
+            assert_eq!(fs::read(world.dst().join("AGENTS.md")).unwrap(), AGENTS);
+            assert_eq!(fs::read(world.dst().join("CLAUDE.md")).unwrap(), CLAUDE);
+            assert!(!world
+                .dst()
+                .join(".git/bulkload/v1/neo/handoff.landed")
+                .exists());
+        }
     }
     assert!(world.temps().is_empty(), "{label}: {:?}", world.temps());
     assert!(!world.intent(), "{label}: an intent is left");
     // A second rerun writes nothing (after one that may re-date a record
     // whose prints were racy).
     tick();
-    let mode = if kind == EstateHandoff::Clear {
+    let mode = if matches!(kind, EstateHandoff::Clear | EstateHandoff::ClearNoOpApply) {
         HandoffMode::Clear
     } else {
         HandoffMode::Render

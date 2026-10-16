@@ -98,6 +98,19 @@ pub(crate) mod git_env {
         ("LANGUAGE", ""),
     ];
 
+    /// The variables Git reads to locate the user's global and system
+    /// configuration files, in Git's order: the global file's override, the
+    /// system file's override, and the switch that skips the system file.
+    /// Bulkload's own children never read those files (`SET`); the
+    /// hand-off's privacy guard reads the URL rewrite rules in them by path
+    /// (`--file`), as a push from the destination would apply them
+    /// (TIN-6569, review of 2026-10-16).
+    pub const USER_CONFIG: [&str; 3] = [
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_CONFIG_NOSYSTEM",
+    ];
+
     /// `-c` overrides every Git child runs with: no hooks, no fsmonitor, no
     /// automatic gc or maintenance, and bounded pack resources.
     ///
@@ -2864,6 +2877,10 @@ pub(crate) mod mid_pass {
         /// Keyed by a destination checkout: inside the adopt proof, after a
         /// seat's bytes were read equal and before its print is taken again.
         AdoptSeatRead,
+        /// Keyed by a destination checkout: a hand-off render after its
+        /// targets were written and before their prints are taken (TIN-6569,
+        /// review of 2026-10-16).
+        HandoffWritten,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;

@@ -299,6 +299,7 @@ pub fn handoff(
         allow: &allow,
         siblings: &siblings,
         as_of: options.as_of,
+        h_step: false,
     };
     let mut session = Session::default();
     let mut summary = HandoffSummary::default();
@@ -414,6 +415,7 @@ pub(super) fn after_apply(
                 allow: &allow,
                 siblings: &siblings,
                 as_of: None,
+                h_step: true,
             },
             &Estate {
                 plan,

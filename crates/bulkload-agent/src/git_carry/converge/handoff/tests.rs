@@ -54,10 +54,19 @@ fn repo() -> (tempfile::TempDir, PathBuf, String) {
     (dir, repo, blob)
 }
 
-fn block() -> Vec<u8> {
+fn inputs() -> render::Inputs {
     let mut inputs = render::sample();
     inputs.workspace = b"/estate/main".to_vec();
-    render::render(&inputs, false)
+    inputs
+}
+
+fn block() -> Vec<u8> {
+    render::render(&inputs(), false)
+}
+
+/// The identity of the landing [`block`] is rendered for.
+fn ours() -> String {
+    inputs().owner()
 }
 
 fn side(blob: &str, prefix: Vec<Prefix>) -> Side {
@@ -168,6 +177,7 @@ fn record(block: &[u8]) -> HandoffLanded {
             block: digest(block),
             print: None,
             base: None,
+            carried: false,
         }],
         retired: Vec::new(),
     }
@@ -200,7 +210,7 @@ fn settle_removes_its_own_displaced_file_and_records_the_block() {
         },
     )
     .unwrap();
-    settle(&worktree, &ledgers).unwrap();
+    settle(&worktree, &ledgers, "neo", &ours()).unwrap();
     assert!(
         !worktree.join(temp_name("t", 0)).exists(),
         "ours is removed"
@@ -242,7 +252,7 @@ fn settle_puts_back_a_third_partys_file_a_crash_displaced() {
         },
     )
     .unwrap();
-    settle(&worktree, &ledgers).unwrap();
+    settle(&worktree, &ledgers, "neo", &ours()).unwrap();
     assert_eq!(fs::read(worktree.join("AGENTS.md")).unwrap(), theirs);
     assert!(!worktree.join(temp_name("t", 0)).exists());
     assert!(!ledgers.join(HANDOFF_INTENT).exists());
@@ -299,15 +309,117 @@ fn a_racy_record_print_is_proved_by_reading() {
     // Recorded in the same tick as the file's stamp: racy, so read.
     record.recorded_ns = record.files[0].print.as_ref().unwrap().mtime_ns + 1;
     assert_eq!(
-        held(&target, "AGENTS.md", &meta, Some(&record), fsid).unwrap(),
+        held(&target, "AGENTS.md", &meta, Some(&record), fsid, &ours()).unwrap(),
         Held::Modified
     );
     // Recorded well after the stamp: the print is trusted, nothing read.
     record.recorded_ns += 3 * super::super::super::RACY_GRANULARITY_NS;
     assert!(matches!(
-        held(&target, "AGENTS.md", &meta, Some(&record), fsid).unwrap(),
+        held(&target, "AGENTS.md", &meta, Some(&record), fsid, &ours()).unwrap(),
         Held::Intact(_)
     ));
+}
+
+/// Review of 2026-10-16 (mutation row for the re-dating path): a user edit
+/// made after the render's exchange and before its print is taken (the
+/// test hook) leaves a racy record print of the user's bytes over a `base`
+/// the render read. The rerun that re-dates that print checks the bytes
+/// under the block first, so the print never vouches for the edit and a
+/// converge that replaces the target refuses MODIFIED with the edit kept.
+#[test]
+fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
+    use crate::estate::{self, HandoffMode, HandoffOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("src");
+    fs::create_dir(&source).unwrap();
+    git_run(&source, &["init", "--quiet", "--template=", "-b", "main"]);
+    fs::write(source.join("AGENTS.md"), LANDED).unwrap();
+    fs::write(source.join("a.txt"), b"alpha\n").unwrap();
+    git_run(&source, &["add", "-A"]);
+    git_run(&source, &["commit", "--quiet", "-m", "c0"]);
+    let target = root.join("dst");
+    let (plan, corpus, state) = (root.join("plan"), root.join("corpus"), root.join("state"));
+    estate::add(&plan, &source, &target, Some(&target)).unwrap();
+    let tick = || std::thread::sleep(std::time::Duration::from_millis(3_100));
+    let capture = || {
+        estate::capture(&plan, &root.join("private"), &corpus, 1, &|_| Ok(())).unwrap();
+    };
+    let apply = || {
+        let rows = std::sync::Mutex::new(Vec::new());
+        let _ = estate::apply(&plan, &corpus, &state, "neo", 1, &|row| {
+            rows.lock()
+                .unwrap()
+                .push(row.reason.clone().unwrap_or_default());
+            Ok(())
+        });
+        rows.into_inner().unwrap()
+    };
+    let handoff = || {
+        estate::handoff(
+            &plan,
+            &corpus,
+            &state,
+            "neo",
+            &HandoffOptions {
+                mode: HandoffMode::Render,
+                ..HandoffOptions::default()
+            },
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    };
+    tick();
+    capture();
+    apply();
+    let agents = target.join("AGENTS.md");
+    let edited = agents.clone();
+    super::super::super::mid_pass::arm_at(
+        &target,
+        super::super::super::mid_pass::Stage::HandoffWritten,
+        move || {
+            let mut bytes = fs::read(&edited).unwrap();
+            bytes.extend_from_slice(b"A local note.\n");
+            fs::write(&edited, bytes).unwrap();
+        },
+    );
+    handoff();
+    assert!(fs::read(&agents).unwrap().ends_with(b"A local note.\n"));
+    tick();
+    // The rerun finds the record current and re-dates its racy print.
+    handoff();
+    fs::write(source.join("AGENTS.md"), b"# Agents, v2\n").unwrap();
+    git_run(&source, &["commit", "--quiet", "-am", "agents v2"]);
+    tick();
+    capture();
+    let rows = apply();
+    assert!(
+        rows.iter()
+            .any(|reason| reason.contains("GIT_DESTINATION_MODIFIED")),
+        "{rows:?}"
+    );
+    assert!(
+        fs::read(&agents).unwrap().ends_with(b"A local note.\n"),
+        "the user's edit was landed over"
+    );
+}
+
+/// Mutation row (review of 2026-10-16): `--clear` of a created file that a
+/// writer replaced after the read puts the writer's file back and refuses.
+#[test]
+fn the_removal_is_undone_when_the_target_moved_after_the_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let worktree = fs::canonicalize(dir.path()).unwrap();
+    let target = worktree.join("CLAUDE.md");
+    fs::write(&target, block()).unwrap();
+    let read = read_whole(&target, "CLAUDE.md").unwrap();
+    let theirs = cat(&[&block(), b"theirs\n"]);
+    fs::write(worktree.join("other"), &theirs).unwrap();
+    fs::rename(worktree.join("other"), &target).unwrap();
+    let refused = remove(&worktree, "CLAUDE.md", &read, &temp_name("t", 0));
+    assert_eq!(refused, Err(BulkloadRefusal::HandoffBlockModified));
+    assert_eq!(fs::read(&target).unwrap(), theirs);
+    assert!(!worktree.join(temp_name("t", 0)).exists());
 }
 
 fn body() -> impl Strategy<Value = Vec<u8>> {

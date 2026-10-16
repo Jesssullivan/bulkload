@@ -2986,10 +2986,51 @@ written as before.
   `ConvergesWhenQuiet` needed the hand-off fairness above.
 - **Not modelled:** the render's content and inputs digest (a pure
   function: unit and property rows), the privacy guard (a precondition),
-  commit detection (read-only), the second target, the lift's own crash
-  point (one step with the import; the Rust fault row
-  `estate.handoff.lift_after_unlink`), and the racy re-dating of the
-  record (S3 only).
+  commit detection (read-only), the block's owner identity (a carried
+  block is source content, one more source value), the H step's choice to
+  re-render, the second target, and the lift's own crash point (one step
+  with the import; the Rust fault row `estate.handoff.lift_after_unlink`).
+- **Review of 2026-10-16** (design note section 18). The record's print
+  of `HP` is now modelled, because the review's BLOCKER was in it: `hand`
+  gains `pst` (the record's print), `prac` (racy against the record) and
+  `base` (the landed value it vouches is under the block, 0 for none).
+  `SeatProved` also accepts `HTrusted` (C `landed_sides`: the print
+  unchanged, not racy, and `base` the landed value being proved).
+  `HandoffRecord` takes a render's print racy, with `base` from the bytes
+  the run read (C `landed_base`); `HandoffStart` gains `HandoffKeep` (a
+  rerun over an intact block re-takes or re-dates the print), and
+  `HandoffSettle` and the undo path of `HandoffCheck` re-take it too, each
+  through `HRetake`, which checks `base` against the bytes under the block
+  again (C `retaken`). `HandoffSettle` now finishes a pending clear
+  instead of re-recording the block. New mutation
+  `handoff_retake_unchecked` (the old base kept on a re-take, the BLOCKER's
+  shape) fails `NoLocalWorkLost`: render, the operator writes below the
+  block, a rerun re-takes the print, the source edits the target, and the
+  converge proves the seat by the print and replaces it. No action was
+  added (`HandoffKeep` is a disjunct of `HandoffStart`), so every earlier
+  row's never set is unchanged.
+
+  `just tla-check` of the hand-off rows on the reviewed spec, 2026-10-16,
+  sting, `-workers 3`, nice 10, beside the lane's cargo runs: 12 rows
+  matched (the budget self-test first), 233 s wall, peak RSS 2436 MiB.
+
+  | config | expect | outcome | violated | distinct | depth | wall |
+  |---|---|---|---|---:|---:|---:|
+  | `MC_ec_handoff` | pass | PASS | - | 26952 | 52 | 23s |
+  | `MC_ec_handoff_op` | pass | PASS | - | 19425 | 37 | 22s |
+  | `MC_ec_handoff_live` (LiveSpec) | pass | PASS | - | 2023 | 36 | 18s |
+  | `MC_ec_reach_handoff_converged` | reach | REACHED | Witness_HandoffConverged | 4004 | 18 | 18s |
+  | `MC_ec_reach_handoff_cleared` | reach | REACHED | Witness_HandoffCleared | 9057 | 24 | 25s |
+  | `MC_ec_neg_handoff_no_overlay` | fail | FAIL | TypedRefusal | 360 | 9 | 15s |
+  | `MC_ec_neg_handoff_overlay_any_block` | fail | FAIL | NoLocalWorkLost | 5385 | 13 | 19s |
+  | `MC_ec_neg_handoff_clear_unchecked` | fail | FAIL | NoLocalWorkLost | 2502 | 10 | 21s |
+  | `MC_ec_neg_handoff_exchange_unchecked` | fail | FAIL | NoLocalWorkLost | 239 | 7 | 20s |
+  | `MC_ec_neg_handoff_no_intent` | fail | FAIL | HandoffOwnsOnlyItsBlock | 28 | 5 | 15s |
+  | `MC_ec_neg_handoff_retake_unchecked` | fail | FAIL | NoLocalWorkLost | 8947 | 16 | 21s |
+
+  The pass rows' counts grew from the first build's (21919, 14048, 1710)
+  with the new variables and `HandoffKeep`; the earlier rows (`Handoff =
+  FALSE`) keep `hand` at its initial value and `HTrusted` false.
 
 `just tla-check` of the hand-off rows, 2026-10-16, sting, `-workers 3`,
 nice 10: 11 rows matched (the budget self-test first), 338 s wall, `rc=0`.

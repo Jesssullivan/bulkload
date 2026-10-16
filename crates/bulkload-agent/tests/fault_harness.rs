@@ -1382,6 +1382,10 @@ scenarios! {
     estate_handoff_h_step_after_temp => EstateHandoffAfterTemp: 1, EstateHandoff::HStep;
     estate_handoff_h_step_after_exchange => EstateHandoffAfterExchange: 1, EstateHandoff::HStep;
     estate_handoff_h_step_after_record => EstateHandoffAfterRecord: 1, EstateHandoff::HStep;
+    // Review of 2026-10-16: a crashed re-render over a user's edit, settled
+    // by a run that refuses; a crashed clear finished by a no-op apply.
+    estate_handoff_rerender_over_edit => EstateHandoffAfterIntent: 1, EstateHandoff::RerenderOverEdit;
+    estate_handoff_clear_noop_apply => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearNoOpApply;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.
