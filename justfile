@@ -25,7 +25,7 @@ python-lint:
     cd {{ root }} && ruff format --check scripts tests
 
 shell-lint:
-    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh
+    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh scripts/local-gate-receipt.sh scripts/darwin-touched.sh
 
 workflow-lint:
     cd {{ root }} && actionlint .github/workflows/*.yml
@@ -257,12 +257,14 @@ resume-power-loss:
         fi
     done
 
-# Darwin check (S1 stack review, 2026-10-15, finding 3). CI runs on Linux
-# only (tinyland-nix), so the Darwin code (`io/sys_darwin.rs`, the `apple`
-# and `not(linux)` branches) is compiled and tested nowhere else. Run it on
-# a Darwin host (neo with the R-N69 prefix, or pzm) before merging a change
-# that touches that code: the rust-check passes (fmt, both clippy passes,
-# the workspace tests) and the whole fault harness, as on Linux.
+# Darwin check (S1 stack review, 2026-10-15, finding 3). The gates run on
+# Linux only, so the Darwin code (`io/sys_darwin.rs`, the `apple` and
+# `not(linux)` branches) is compiled and tested nowhere else. Run it on pzm,
+# never on neo (OI-1003-Q196), before merging a change that touches that
+# code (`just darwin-touched` says which do; OI-1003-Q199): the rust-check
+# passes (fmt, both clippy passes, the workspace tests) and the whole fault
+# harness, as on Linux. If pzm is on hold, the check is deferred and the
+# deferral recorded with the PR's receipt.
 darwin-check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -353,8 +355,41 @@ contract-test:
     cd {{ root }} && python3 scripts/validate_repo_manifest.py --self-test tinyland.repo.json
     cd {{ root }} && python3 tests/test_ci_contract.py
 
-# Mandatory tier, local-first: what PR CI runs (OI-1001-Q2).
+# Mandatory tier, local-first (OI-1001-Q2); the core of `local-gate`.
 check-fast: check-source fault-harness contract-test
+
+# Bazel graph load (OI-1003-Q199, closing the OI-1003-Q65 residual gap):
+# resolve the bzlmod graph against MODULE.bazel.lock and load rules_python,
+# the //:bulkload globs and the //:tests suite. A query, not a build: nothing
+# is compiled, run or uploaded, and the Bazel
+# server exits after 60 idle seconds. The Flywheel wrapper
+# (`gloriousflywheel-bazel`) is not on the sting seat's PATH, so this runs
+# the flake's bazelisk, as `test-local` does.
+bazel-graph:
+    cd {{ root }} && bazelisk --max_idle_secs=60 query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null
+    @echo "bazel-graph: //:bulkload and //:tests loaded"
+
+# The merge gate (OI-1003-Q199, 2026-10-16). Run it on sting inside
+# `nix develop .#default`, on the exact PR head brought up to date with
+# main; `scripts/local-gate-receipt.sh` (`just local-gate-receipt`) runs it
+# and writes the receipt the merge needs. It runs everything CI's `ci-source`
+# and `ci-fault-harness` run (the contract test holds the sets equal) plus
+# the Bazel graph load. CI runs only on `v*` tags and workflow_dispatch, as
+# the backstop. It retires when GloriousFlywheel v4 fabric check runs land
+# (TIN-5946).
+local-gate: check-fast secrets-scan-history bazel-graph
+
+# Run `local-gate` on HEAD and print its receipt line; `--pr N --post` also
+# comments it on PR N. See the script's header for the checks it makes.
+local-gate-receipt *args:
+    cd {{ root }} && scripts/local-gate-receipt.sh {{ args }}
+
+# Does a diff touch Darwin code? Prints the reasons and a yes/no verdict. A
+# yes means the PR needs `darwin-check` on pzm before it merges
+# (OI-1003-Q199, OI-1003-Q196). The script exits 0 for yes, 1 for no and 2
+# on error; this recipe fails only on error.
+darwin-touched base="origin/main" head="HEAD":
+    cd {{ root }} && { scripts/darwin-touched.sh "{{ base }}" "{{ head }}" || [[ $? -eq 1 ]]; }
 
 # Optional tier: on demand, never a PR gate (OI-1001-Q2).
 check-optional:

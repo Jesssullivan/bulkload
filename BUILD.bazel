@@ -38,6 +38,7 @@ py_test(
         "justfile",
         "justfile.flywheel",
         "scripts/ci-public-read-guard.sh",
+        "scripts/local-gate-receipt.sh",
         "tinyland.repo.json",
     ],
 )

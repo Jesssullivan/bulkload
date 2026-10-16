@@ -1369,6 +1369,32 @@ default**. Diagnosis: `docs/agent-notes/2026-10-16-delta-regression.md`
   on the bench comes before any gated sample (Q143); the diagnosis expects
   about 0.89x rclone on the bench delta, at Q143's 0.90x margin.
 
+## Amendment 2026-10-16: the merge gate is a local receipt on sting (OI-1003-Q199)
+
+Operator ruling OI-1003-Q199 (Linear TIN-4543 comment `b208cbae`). It
+changes where the existing gates run, not what they prove; every SLO and
+proof obligation above stands.
+
+- **Gate location.** A PR merges on `just local-gate` run on sting inside
+  `nix develop`, on the exact PR head brought up to date with main. The gate
+  is `check-fast` plus `secrets-scan-history` plus a Bazel graph load
+  (`bazel-graph`, a query that closes the OI-1003-Q65 gap, not a build); the
+  CI contract test holds it to CI's gate set. GitHub CI runs only on `v*`
+  tags and `workflow_dispatch`, as the backstop, and the "Protect main"
+  ruleset no longer requires status checks. Darwin code runs
+  `just darwin-check` on pzm only when `just darwin-touched` flags the PR,
+  never on neo (OI-1003-Q196); while pzm is on hold that check is deferred
+  and the deferral recorded.
+- **Attestation.** `scripts/local-gate-receipt.sh` writes one receipt line
+  per run: host, PR, head sha, tree, main, the flake.lock and log sha256,
+  exit code and times, citing OI-1003-Q199 and R-N13. Every PR carries the
+  receipt; code PRs also need the lanes' adversarial review (OI-1003-Q173);
+  docs PRs need the receipt only. The receipt is self-attested: the exact
+  sha, the clean-tree and up-to-date checks, the log digest and tag-time CI
+  are its mitigations.
+- **Retirement.** The local gate retires when GloriousFlywheel v4 fabric
+  check runs land (TIN-5946). Sting RBE is later, not part of this ruling.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

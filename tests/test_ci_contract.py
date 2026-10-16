@@ -15,17 +15,18 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "7b8d63cc2b6075bfef24abcb99bf899e090e01a95e7d8f2c7bc79c1e4c63120f"
+WORKFLOW_SHA256 = "c4a938478b57be54eca4a427541c1887285bfc6e20479275e46fd09e3358b0a8"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
+LOCAL_GATE_RECEIPT_PATH = "scripts/local-gate-receipt.sh"
 PUBLIC_KEY = "main:eaUydxuDu7xBoy5cCo3MdknYAkVyTIASQ7DGuwxa+XA="
 NIXOS_CACHE = "https://cache.nixos.org/"
 NIXOS_PUBLIC_KEY = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 REVIEWED_PATH = "/nix/var/nix/profiles/default/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 REVIEWED_STEP_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
-ACTION_SHA256 = "2cd1796c907f46d55af04b66d0f2f1c53211c78e80a092787a23edc06aa39ee1"
-GUARD_SHA256 = "825d154fb96d8795185420e3b5049f1504bb5aaf29cd521a64f8fb5d500b8e6f"
+ACTION_SHA256 = "22ee18ceb8260b2e44a6b5ac0cfb6ee1d919e259313265ce454106dd91fc7876"
+GUARD_SHA256 = "752df5abcd7c07d9ffbe18bac6f5ddad7309f52266b4349e5a38306f4b408bc4"
 FAULT_HARNESS_STEP_SHA256 = (
     "fc226b95e6553343298eb65a434df43ec6a07fdda7821b47a66e0ecff06a1bbe"
 )
@@ -52,28 +53,22 @@ MODULE_BAZEL_SHA256 = "8182bbe9cf04ddb0743bd1e68a9653a851b8dbf104234ab367bc13868
 CONTRACT_TEST_TARGET = "ci_contract_test"
 FLAKE_SHA256 = "4c16e5b2f9f03342ba66592800f44ed2cfafd95c1ca0315789868495326438bf"
 FLAKE_LOCK_SHA256 = "ccd790af791b173623983382a78bd9476760b9fa9e9e617108e2ae3d1040d19d"
-EXPECTED_SHA_EXPRESSION = (
-    "${{ github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.sha || "
-    "github.event_name == 'merge_group' && "
-    "github.event.merge_group.head_sha || github.sha }}"
-)
-# The audited trigger inventory (R-N124): release tags, pull requests, and
-# the main merge queue. Nothing else may start CI. OI-1003-Q111 (2026-10-07)
-# dropped main pushes: the ruleset's strict status-check policy merges a PR
-# only when it is up to date with main, so the merged tree is the tree its
-# own run tested, and a main run repeated it on the two shared runners.
+# Both remaining triggers test the commit they name: the tagged commit, or the
+# head of the dispatched branch or tag.
+EXPECTED_SHA_EXPRESSION = "${{ github.sha }}"
+# The audited trigger inventory: release tags and a manual dispatch, nothing
+# else. OI-1003-Q199 (2026-10-16) moved the merge gate to a local receipt on
+# sting (`just local-gate`), so pull requests and the merge queue no longer
+# start CI; a `v*` tag and `workflow_dispatch` keep it as the backstop. It
+# superseded the R-N124 inventory (tags, pull requests, merge queue) and
+# OI-1003-Q111, which had already dropped main pushes.
 WORKFLOW_TRIGGERS = (
-    "on:\n"
-    "  push:\n"
-    '    tags: ["v*"]\n'
-    "  pull_request:\n"
-    "    types: [opened, synchronize, reopened, ready_for_review]\n"
-    "  merge_group:\n"
-    "    types: [checks_requested]\n"
-    "\n"
-    "permissions:\n"
+    'on:\n  push:\n    tags: ["v*"]\n  workflow_dispatch:\n\npermissions:\n'
 )
+WORKFLOW_TRIGGER_INVENTORY = {
+    "push": ('tags: ["v*"]',),
+    "workflow_dispatch": (),
+}
 # Every guard invocation runs the digest-checked bytes as a `-c` argument. A
 # stdin pipe (`printf | bash -s`) raced the guard's early `exit` and failed with
 # a broken pipe when the reader closed before the writer finished.
@@ -81,17 +76,9 @@ GUARD_INVOCATION = (
     '/bin/bash --noprofile --norc -p -c "$guard_source" bulkload-public-read-guard'
 )
 
-HEAD_REPOSITORY_EXPRESSION = (
-    "${{ github.event_name == 'pull_request' && "
-    "github.event.pull_request.head.repo.full_name || github.repository }}"
-)
-# A draft pull request runs no gate (OI-1003-Q111); marking it ready for
-# review (ready_for_review) starts its run.
-SAME_REPOSITORY_GUARD = (
-    "${{ github.event_name != 'pull_request' || "
-    "github.event.pull_request.head.repo.full_name == github.repository "
-    "&& !github.event.pull_request.draft }}"
-)
+# A tag push or a dispatch always tests a commit of this repository; no fork
+# can start either (OI-1003-Q199).
+HEAD_REPOSITORY_EXPRESSION = "${{ github.repository }}"
 UPLOAD_EXPRESSION = (
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' "
     "&& 'true' || 'false' }}"
@@ -333,6 +320,23 @@ PINNED_JUST_RECIPES = {
     "ci-source": (
         "ci-source: check-source secrets-scan-history contract-test",
         (),
+    ),
+    # The merge gate (OI-1003-Q199): CI's two gates plus the Bazel graph
+    # load. `validate_local_gate` also holds its recipe closure to CI's.
+    "check-fast": (
+        "check-fast: check-source fault-harness contract-test",
+        (),
+    ),
+    "local-gate": (
+        "local-gate: check-fast secrets-scan-history bazel-graph",
+        (),
+    ),
+    "bazel-graph": (
+        "bazel-graph:",
+        (
+            "cd {{ root }} && bazelisk --max_idle_secs=60 query --lockfile_mode=error 'deps(//:bulkload + //:tests)' --output=label >/dev/null",
+            '@echo "bazel-graph: //:bulkload and //:tests loaded"',
+        ),
     ),
     "ci-fault-harness": (
         "ci-fault-harness:",
@@ -657,6 +661,75 @@ def validate_just_recipes(justfile: str, imported: str | None = None) -> None:
     validate_p5_alone(justfile)
     validate_rust_test_groups(justfile)
     validate_deep_recipes(justfile)
+    validate_local_gate(justfile)
+
+
+JUST_CALL_PATTERN = re.compile(
+    r"\{\{ just_executable\(\) \}\} ([a-z][a-z0-9-]*)$|"
+    r"^cd \{\{ root \}\} && just ([a-z][a-z0-9-]*)$|"
+    r"--command just ([a-z][a-z0-9-]*)$"
+)
+
+
+def just_closure(justfile: str, name: str) -> set[str]:
+    """Every recipe `name` runs: its dependencies and the recipes its body
+    calls through just, transitively. `name` itself is not included."""
+    seen: set[str] = set()
+    pending = [name]
+    while pending:
+        header, body = just_recipe(justfile, pending.pop())
+        called = header.partition(":")[2].split()
+        for line in body:
+            match = JUST_CALL_PATTERN.search(line)
+            if match:
+                called.append(next(group for group in match.groups() if group))
+        for recipe in called:
+            if recipe not in seen:
+                seen.add(recipe)
+                pending.append(recipe)
+    return seen
+
+
+# OI-1003-Q199: the local merge gate must run every recipe CI's two gates
+# run, plus the history secret scan and the Bazel graph load, so the merge
+# gate and the tag backstop cannot drift apart.
+LOCAL_GATE_EXTRA = {"check-fast", "bazel-graph"}
+
+
+def validate_local_gate(justfile: str) -> None:
+    ci = just_closure(justfile, "ci-source") | just_closure(
+        justfile, "ci-fault-harness"
+    )
+    local = just_closure(justfile, "local-gate")
+    if "fault-harness" not in ci or "secrets-scan-history" not in ci:
+        raise ContractError("CI gate closure lost the fault harness or history scan")
+    if local - LOCAL_GATE_EXTRA != ci:
+        raise ContractError("local-gate must run exactly the CI gate set")
+    if not LOCAL_GATE_EXTRA <= local:
+        raise ContractError("local-gate must run check-fast and the Bazel graph load")
+
+
+# The receipt (OI-1003-Q199): what `scripts/local-gate-receipt.sh` must run
+# and record. Each line must appear exactly once.
+LOCAL_GATE_RECEIPT_REQUIRED = (
+    'just --justfile "$root/justfile" --working-directory "$root" local-gate >"$log" 2>&1 ||',
+    'if [[ -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then',
+    'git merge-base --is-ancestor "$main" "$head" ||',
+    'if [[ "$(uname -s)" == Darwin || "$host" == neo* ]]; then',
+    'receipt="local terminal gate ($host) | PR #${pr:-none} | head $head | tree $tree"',
+    'receipt+=" | main $main | flake.lock sha256 $flake_lock | log sha256 $log_sha"',
+    'receipt+=" | exit $gate | $started..$finished | kind $kind | just local-gate"',
+    'receipt+=" | OI-1003-Q199 R-N13"',
+    'exit "$gate"',
+)
+
+
+def validate_local_gate_receipt(script: str) -> None:
+    for line in LOCAL_GATE_RECEIPT_REQUIRED:
+        if script.count(line) != 1:
+            raise ContractError(f"local-gate receipt drifted: {line}")
+    if "set -x" in script or re.search(r"\$\{?[A-Za-z_]*TOKEN|gh auth token", script):
+        raise ContractError("local-gate receipt must not trace or handle a token")
 
 
 def sha256(source: str) -> str:
@@ -751,6 +824,31 @@ def parse_job_contract(workflow: str) -> dict[str, dict[str, list[str]]]:
     return jobs
 
 
+def workflow_trigger_inventory(workflow: str) -> dict[str, tuple[str, ...]]:
+    """The `on:` block as {event: (filter lines,)}, read line by line."""
+    lines = workflow.splitlines()
+    if lines.count("on:") != 1:
+        raise ContractError("CI must declare exactly one block-style `on:` mapping")
+    inventory: dict[str, list[str]] = {}
+    event: str | None = None
+    for line in lines[lines.index("on:") + 1 :]:
+        if line and not line.startswith(" "):
+            break
+        if not line.strip():
+            continue
+        event_match = re.fullmatch(r"  ([a-z_]+):\s*", line)
+        if event_match:
+            event = event_match.group(1)
+            if event in inventory:
+                raise ContractError(f"duplicate workflow trigger: {event}")
+            inventory[event] = []
+            continue
+        if event is None or not line.startswith("    "):
+            raise ContractError("workflow triggers must use the audited block form")
+        inventory[event].append(line.strip())
+    return {name: tuple(filters) for name, filters in inventory.items()}
+
+
 def validate_job_routing(workflow: str) -> None:
     jobs = parse_job_contract(workflow)
     if set(jobs) != set(AUDITED_JOB_RUNNERS):
@@ -761,8 +859,10 @@ def validate_job_routing(workflow: str) -> None:
             raise ContractError(f"job-level reusable workflow is forbidden: {job}")
         if properties.get("runs-on") != [expected_runner]:
             raise ContractError(f"job {job} must use literal {expected_runner}")
-        if properties.get("if") != [SAME_REPOSITORY_GUARD]:
-            raise ContractError(f"job {job} must reject fork pull requests")
+        # No job condition: with only tag and dispatch triggers there is no
+        # fork to reject, and a condition could only skip a gate.
+        if "if" in properties:
+            raise ContractError(f"job {job} must not carry a skip condition")
 
     matrix = (
         "    strategy:\n"
@@ -779,8 +879,12 @@ def validate_job_routing(workflow: str) -> None:
         "name: CI\n\n" + WORKFLOW_TRIGGERS
     ):
         raise ContractError("workflow trigger inventory drifted")
+    if workflow_trigger_inventory(workflow) != WORKFLOW_TRIGGER_INVENTORY:
+        raise ContractError("CI must start only on v* tags and workflow_dispatch")
     if re.search(
-        r"(?m)^\s*(?:pull_request_target|workflow_run|workflow_dispatch)\s*:", workflow
+        r"(?m)^\s*(?:pull_request|pull_request_target|merge_group|workflow_run"
+        r"|workflow_call|repository_dispatch|schedule)\s*:",
+        workflow,
     ):
         raise ContractError("workflow must not add an unaudited trigger")
 
@@ -2143,9 +2247,24 @@ def validate_local_action(action: str, *, exact_digest: bool = True) -> None:
         raise ContractError("both Bazel invocations must be cache-only Flywheel calls")
 
 
+def guard_event_arms(guard: str) -> list[str]:
+    """The arm labels of the guard's one event `case`, in order."""
+    start = 'case "${BULKLOAD_EVENT_NAME:-}" in\n'
+    if guard.count(start) != 1:
+        raise ContractError("guard must switch on the event exactly once")
+    body = guard[guard.index(start) + len(start) :]
+    if "\nesac\n" not in body:
+        raise ContractError("guard event switch is not closed")
+    body = body[: body.index("\nesac\n")]
+    return re.findall(r"(?m)^  ([^ \n][^)\n]*)\)", body)
+
+
 def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
     if exact_digest and sha256(guard) != GUARD_SHA256:
         raise ContractError("public-read guard digest drifted")
+    # OI-1003-Q199: the guard admits exactly the workflow's two triggers.
+    if guard_event_arms(guard) != ["push", "workflow_dispatch", "*"]:
+        raise ContractError("guard event inventory must be push and workflow_dispatch")
     guard_without_reviewed_cache = guard.replace(NIXOS_CACHE, "")
     if re.search(r"(?:https?|grpcs?)://[A-Za-z0-9]", guard_without_reviewed_cache):
         raise ContractError("guard must not bake a deployment endpoint")
@@ -2178,12 +2297,13 @@ def validate_guard(guard: str, *, exact_digest: bool = True) -> None:
         "^bulkload-nix-[a-z0-9]+-runner-[a-z0-9]+$",
         'require_equal "event" "${BULKLOAD_EVENT_NAME:-}" "${GITHUB_EVENT_NAME:-}"',
         'require_equal "ref" "${BULKLOAD_REF:-}" "${GITHUB_REF:-}"',
-        '"pull-request head repository"',
-        "  merge_group)\n",
-        '"merge-group repository"',
-        '[[ "${BULKLOAD_REF:-}" == refs/heads/gh-readonly-queue/main/* ]] ||',
-        'die "merge-group ref is outside the main merge queue"',
-        '*) die "event is outside the reviewed push/pull_request/merge_group inventory" ;;',
+        "  push)\n",
+        '"push repository"',
+        "  workflow_dispatch)\n",
+        '"dispatch repository"',
+        '[[ "${BULKLOAD_REF:-}" == refs/heads/* || "${BULKLOAD_REF:-}" == refs/tags/v* ]] ||',
+        'die "dispatch ref is outside this repository\'s branches and release tags"',
+        '*) die "event is outside the reviewed push/workflow_dispatch inventory" ;;',
         '"$(git -C "${GITHUB_WORKSPACE:?}" rev-parse HEAD)"',
         'if [[ "$BULKLOAD_EVENT_NAME" == push && "$BULKLOAD_REF" == refs/heads/main ]]; then',
         'case "$mode" in',
@@ -2679,26 +2799,44 @@ class CiContractTest(unittest.TestCase):
         self,
     ) -> None:
         cap = "    timeout-minutes: 25\n"
-        queue = "  merge_group:\n    types: [checks_requested]\n"
+        dispatch = "  workflow_dispatch:\n"
+        tags = '    tags: ["v*"]\n'
+        runner = "    runs-on: tinyland-nix\n"
         variants = [
-            self.workflow.replace(queue, "", 1),
+            # The PR and merge-queue triggers OI-1003-Q199 dropped come back.
             self.workflow.replace(
-                queue, "  merge_group:\n    types: [checks_requested, destroyed]\n", 1
-            ),
-            self.workflow.replace(queue, queue + "  workflow_dispatch:\n", 1),
-            self.workflow.replace(queue, queue + "  pull_request_target:\n", 1),
-            self.workflow.replace(
-                '    tags: ["v*"]\n', '    branches: [main]\n    tags: ["v*"]\n', 1
-            ),
-            self.workflow.replace(
-                "    types: [opened, synchronize, reopened, ready_for_review]\n", "", 1
-            ),
-            self.workflow.replace(" && !github.event.pull_request.draft }}", " }}", 1),
-            self.workflow.replace(
-                "github.event_name == 'merge_group' && "
-                "github.event.merge_group.head_sha || ",
-                "",
+                dispatch,
+                dispatch
+                + "  pull_request:\n"
+                + "    types: [opened, synchronize, reopened, ready_for_review]\n",
                 1,
+            ),
+            self.workflow.replace(
+                dispatch,
+                dispatch + "  merge_group:\n    types: [checks_requested]\n",
+                1,
+            ),
+            self.workflow.replace(dispatch, "  pull_request:\n", 1),
+            # The backstop loses a trigger, or a trigger widens.
+            self.workflow.replace(dispatch, "", 1),
+            self.workflow.replace("  push:\n" + tags, "", 1),
+            self.workflow.replace(tags, '    tags: ["*"]\n', 1),
+            self.workflow.replace(tags, "    branches: [main]\n" + tags, 1),
+            self.workflow.replace(
+                dispatch,
+                dispatch + "    inputs:\n      gate:\n        type: string\n",
+                1,
+            ),
+            # Any other starting event.
+            self.workflow.replace(dispatch, dispatch + "  pull_request_target:\n", 1),
+            self.workflow.replace(dispatch, dispatch + "  schedule:\n", 1),
+            self.workflow.replace(dispatch, dispatch + "  workflow_run:\n", 1),
+            # A job condition that could skip the gate on either trigger.
+            self.workflow.replace(
+                runner, "    if: ${{ github.event_name == 'push' }}\n" + runner, 1
+            ),
+            self.workflow.replace(
+                "github.sha }}", "github.event.pull_request.head.sha }}", 1
             ),
             self.workflow.replace(cap, "    timeout-minutes: 30\n", 1),
             self.workflow.replace(cap, "", 1),
@@ -2953,7 +3091,10 @@ class CiContractTest(unittest.TestCase):
             self.workflow.replace(
                 "runs-on: tinyland-nix", "runs-on: [self-hosted, tinyland-nix]"
             ),
-            self.workflow.replace(f"    if: {SAME_REPOSITORY_GUARD}\n", ""),
+            self.workflow.replace(
+                "    runs-on: tinyland-nix\n",
+                "    if: false\n    runs-on: tinyland-nix\n",
+            ),
             self.workflow
             + "\n  unaudited:\n    runs-on: tinyland-nix\n    steps: []\n",
         ]
@@ -3129,7 +3270,9 @@ class CiContractTest(unittest.TestCase):
                 "",
                 1,
             ),
-            self.workflow.replace(EXPECTED_SHA_EXPRESSION, "${{ github.sha }}", 1),
+            self.workflow.replace(
+                EXPECTED_SHA_EXPRESSION, "${{ github.event.pull_request.head.sha }}", 1
+            ),
             self.workflow
             + "\n      - run: /bin/true\n        shell: /bin/bash --noprofile --norc -p {0}\n",
         ]
@@ -3176,7 +3319,7 @@ class CiContractTest(unittest.TestCase):
     def test_permission_upload_and_endpoint_regressions_fail_closed(self) -> None:
         unsafe_variants = [
             self.workflow.replace("contents: read", "contents: write"),
-            self.workflow.replace(EXPECTED_SHA_EXPRESSION, "${{ github.sha }}"),
+            self.workflow.replace(EXPECTED_SHA_EXPRESSION, "${{ github.ref }}"),
             self.workflow.replace(UPLOAD_EXPRESSION, "true"),
             self.workflow.replace('ATTIC_TOKEN: ""', "ATTIC_TOKEN: inherited"),
             self.workflow.replace(
@@ -3387,14 +3530,20 @@ class CiContractTest(unittest.TestCase):
             ),
             self.guard.replace("refs/heads/main", "refs/heads/*"),
             self.guard.replace(
-                "refs/heads/gh-readonly-queue/main/*", "refs/heads/gh-readonly-queue/*"
+                '"${BULKLOAD_REF:-}" == refs/tags/v* ]]', '"${BULKLOAD_REF:-}" == * ]]'
             ),
-            self.guard.replace('"merge-group repository"', '"merge-group source"'),
+            self.guard.replace('"dispatch repository"', '"dispatch source"'),
             self.guard.replace(
-                'die "merge-group ref is outside the main merge queue"', "true"
+                'die "dispatch ref is outside this repository\'s branches and release tags"',
+                "true",
             ),
             self.guard.replace(
-                "  merge_group)\n", "  merge_group | workflow_dispatch)\n"
+                "  workflow_dispatch)\n", "  workflow_dispatch | pull_request)\n"
+            ),
+            self.guard.replace("  push)\n", "  push | merge_group)\n"),
+            self.guard.replace(
+                '  *) die "event is outside',
+                '  pull_request) ;;\n  *) die "event is outside',
             ),
             self.guard.replace('NIX_REMOTE:-}" local', 'NIX_REMOTE:-}" daemon'),
             self.guard.replace(REVIEWED_PATH, "/tmp/unaudited:/usr/bin:/bin"),
@@ -3423,7 +3572,7 @@ class CiContractTest(unittest.TestCase):
             with self.assertRaises(ContractError):
                 validate_guard(unsafe, exact_digest=False)
 
-    def test_guard_executes_pr_and_main_upload_policy(self) -> None:
+    def test_guard_executes_dispatch_tag_and_main_upload_policy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             temporary_path = Path(temporary)
             workspace = temporary_path / "workspace"
@@ -3522,14 +3671,14 @@ class CiContractTest(unittest.TestCase):
                 "GITHUB_ENV": str(github_env),
                 "GITHUB_OUTPUT": str(github_output),
                 "RUNNER_TEMP": temporary,
-                "GITHUB_EVENT_NAME": "pull_request",
-                "GITHUB_REF": "refs/pull/9/merge",
+                "GITHUB_EVENT_NAME": "workflow_dispatch",
+                "GITHUB_REF": "refs/heads/main",
                 "GITHUB_WORKSPACE": str(workspace),
                 "GITHUB_REPOSITORY": "Jesssullivan/bulkload",
                 "BULKLOAD_RUNTIME_HOME": str(runtime_home),
-                "BULKLOAD_EVENT_NAME": "pull_request",
+                "BULKLOAD_EVENT_NAME": "workflow_dispatch",
                 "BULKLOAD_EXPECTED_SHA": head,
-                "BULKLOAD_REF": "refs/pull/9/merge",
+                "BULKLOAD_REF": "refs/heads/main",
                 "BULKLOAD_REPOSITORY": "Jesssullivan/bulkload",
                 "BULKLOAD_HEAD_REPOSITORY": "Jesssullivan/bulkload",
                 "BULKLOAD_UPLOAD_BAZEL_RESULTS": "false",
@@ -3754,29 +3903,59 @@ class CiContractTest(unittest.TestCase):
             run_guard("preflight", main_env)
             run_guard("enforce", main_env)
 
-            queue_ref = "refs/heads/gh-readonly-queue/main/pr-67-" + "a" * 40
-            queue_env = dict(base_env)
-            queue_env.update(
+            # OI-1003-Q199: a release tag push and a dispatch on a branch or
+            # release tag pass; a pull request, the merge queue, and a dispatch
+            # on any other ref or with an upload are refused.
+            tag_env = dict(base_env)
+            tag_env.update(
                 {
-                    "BULKLOAD_EVENT_NAME": "merge_group",
-                    "BULKLOAD_REF": queue_ref,
-                    "GITHUB_EVENT_NAME": "merge_group",
-                    "GITHUB_REF": queue_ref,
+                    "BULKLOAD_EVENT_NAME": "push",
+                    "BULKLOAD_REF": "refs/tags/v0.1.0",
+                    "GITHUB_EVENT_NAME": "push",
+                    "GITHUB_REF": "refs/tags/v0.1.0",
                 }
             )
-            run_guard("preflight", queue_env)
-            run_guard("enforce", queue_env)
-            for key, value in (
-                ("BULKLOAD_UPLOAD_BAZEL_RESULTS", "true"),
-                ("BULKLOAD_HEAD_REPOSITORY", "fork/bulkload"),
-                ("BULKLOAD_REF", "refs/heads/gh-readonly-queue/other/pr-1-x"),
-                ("BULKLOAD_REF", "refs/heads/main"),
+            run_guard("preflight", tag_env)
+            run_guard("enforce", tag_env)
+            for ref in ("refs/tags/v0.1.0", "refs/heads/ci/local-gate"):
+                dispatch_env = dict(base_env)
+                dispatch_env.update({"BULKLOAD_REF": ref, "GITHUB_REF": ref})
+                with self.subTest(dispatch_ref=ref):
+                    run_guard("enforce", dispatch_env)
+            for overrides in (
+                {"event": "pull_request", "ref": "refs/pull/9/merge"},
+                {
+                    "event": "merge_group",
+                    "ref": "refs/heads/gh-readonly-queue/main/pr-67-" + "a" * 40,
+                },
+                {"event": "pull_request_target", "ref": "refs/heads/main"},
+                {"event": "workflow_dispatch", "ref": "refs/pull/9/merge"},
+                {"event": "workflow_dispatch", "ref": "refs/tags/release-1"},
+                {
+                    "event": "workflow_dispatch",
+                    "ref": "refs/heads/main",
+                    "upload": "true",
+                },
+                {
+                    "event": "workflow_dispatch",
+                    "ref": "refs/heads/main",
+                    "head": "fork/bulkload",
+                },
             ):
-                unsafe_env = dict(queue_env)
-                unsafe_env[key] = value
-                if key == "BULKLOAD_REF":
-                    unsafe_env["GITHUB_REF"] = value
-                with self.subTest(merge_group=key, value=value):
+                unsafe_env = dict(base_env)
+                unsafe_env.update(
+                    {
+                        "BULKLOAD_EVENT_NAME": overrides["event"],
+                        "GITHUB_EVENT_NAME": overrides["event"],
+                        "BULKLOAD_REF": overrides["ref"],
+                        "GITHUB_REF": overrides["ref"],
+                    }
+                )
+                if "upload" in overrides:
+                    unsafe_env["BULKLOAD_UPLOAD_BAZEL_RESULTS"] = overrides["upload"]
+                if "head" in overrides:
+                    unsafe_env["BULKLOAD_HEAD_REPOSITORY"] = overrides["head"]
+                with self.subTest(refused=overrides):
                     self.assertNotEqual(
                         run_guard("enforce", unsafe_env, check=False).returncode, 0
                     )
@@ -4260,6 +4439,80 @@ class CiContractTest(unittest.TestCase):
             with self.subTest(imported=index):
                 with self.assertRaises(ContractError):
                     validate_just_recipes(justfile, unsafe_import)
+
+    def test_local_gate_runs_the_ci_gate_set_and_mutations_fail_closed(self) -> None:
+        justfile = (self.root / "justfile").read_text(encoding="utf-8")
+        validate_local_gate(justfile)
+        self.assertEqual(
+            just_closure(justfile, "local-gate") - LOCAL_GATE_EXTRA,
+            just_closure(justfile, "ci-source")
+            | just_closure(justfile, "ci-fault-harness"),
+        )
+        self.assertIn("secrets-scan-history", just_closure(justfile, "local-gate"))
+        self.assertIn("fault-harness", just_closure(justfile, "local-gate"))
+        variants = [
+            justfile.replace(
+                "local-gate: check-fast secrets-scan-history bazel-graph",
+                "local-gate: check-fast bazel-graph",
+                1,
+            ),
+            justfile.replace(
+                "local-gate: check-fast secrets-scan-history bazel-graph",
+                "local-gate: check-fast secrets-scan-history",
+                1,
+            ),
+            justfile.replace(
+                "check-fast: check-source fault-harness contract-test",
+                "check-fast: check-source contract-test",
+                1,
+            ),
+            # A gate added to CI only, so the merge gate would skip it.
+            justfile.replace(
+                "ci-source: check-source secrets-scan-history contract-test",
+                "ci-source: check-source secrets-scan-history contract-test flake-check",
+                1,
+            ),
+            justfile.replace(
+                "--lockfile_mode=error 'deps(//:bulkload + //:tests)'",
+                "--lockfile_mode=off 'deps(//:bulkload)'",
+                1,
+            ),
+            justfile.replace("bazelisk --max_idle_secs=60 query", "bazelisk build", 1),
+        ]
+        for index, unsafe in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(unsafe, justfile)
+                with self.assertRaises(ContractError):
+                    validate_just_recipes(unsafe)
+        # The closure check alone catches a CI-only gate even if the pins move.
+        with self.assertRaises(ContractError):
+            validate_local_gate(variants[3])
+
+    def test_local_gate_receipt_runs_the_gate_and_records_the_receipt(self) -> None:
+        script = (self.root / LOCAL_GATE_RECEIPT_PATH).read_text(encoding="utf-8")
+        validate_local_gate_receipt(script)
+        mode = (self.root / LOCAL_GATE_RECEIPT_PATH).stat().st_mode
+        self.assertNotEqual(mode & stat.S_IXUSR, 0)
+        variants = [
+            script.replace(
+                ' local-gate >"$log" 2>&1 ||', ' check-fast >"$log" 2>&1 ||'
+            ),
+            script.replace(
+                'git merge-base --is-ancestor "$main" "$head" ||', "true ||", 1
+            ),
+            script.replace(" | log sha256 $log_sha", "", 1),
+            script.replace(' || "$host" == neo* ]]', " ]]", 1),
+            script.replace('exit "$gate"', "exit 0", 1),
+            script.replace("set -euo pipefail\n", "set -euxo pipefail\nset -x\n", 1),
+            script.replace(
+                "pr_head() {\n", 'pr_head() {\n  printf "%s" "$GH_TOKEN" >&2\n', 1
+            ),
+        ]
+        for index, unsafe in enumerate(variants):
+            with self.subTest(index=index):
+                self.assertNotEqual(unsafe, script)
+                with self.assertRaises(ContractError):
+                    validate_local_gate_receipt(unsafe)
 
     def test_actionlint_knows_only_the_sanctioned_custom_label(self) -> None:
         config = (self.root / ".github/actionlint.yaml").read_text(encoding="utf-8")
