@@ -1369,6 +1369,51 @@ default**. Diagnosis: `docs/agent-notes/2026-10-16-delta-regression.md`
   on the bench comes before any gated sample (Q143); the diagnosis expects
   about 0.89x rclone on the bench delta, at Q143's 0.90x margin.
 
+## Amendment 2026-10-16: R0, every agent lane continues on the destination (TIN-6587)
+
+The operator's core user expectation (2026-10-16, Linear TIN-6587; R0 of the
+draft `docs/SPEC.md`, PR #236): after a run, `claude --resume` and `codex
+resume` in each lane's destination working directory list and resume its
+sessions, transcripts byte-identical. Until now no SLO measured it, and the
+2026-10-16 investigation found it holds for no neo lane on sting
+(`docs/agent-notes/2026-10-16-reseat-investigation.md`). No SLO number
+changes. This adds a verb, its acceptance check and its proof rows; the
+contract is `docs/design.md`, "Agent session re-seat".
+
+- **R0 acceptance is `estate-reseat --check`**, read-only: per lane, the
+  transcripts and rollouts the two pickers read in the destination
+  directory hash-equal the landed ones, the Git state is `estate-diff`
+  `identical`, and the hand-off note is present when TIN-6569's marker is
+  given. It replaces the undefined "daily-work verdict" (#40) as the
+  per-lane record. A lane without its Git input is `incomplete`, never a
+  pass.
+- **S3:** an unchanged `estate-reseat` reads 0 landed bytes
+  (`read_reseat_landing_bytes=0`) and writes 0. A grown transcript reads
+  its two 64 KiB window digests' bytes and its new tail only (R25).
+- **S4:** every session or thread that is not re-seated is a typed row:
+  `RESEAT_DEST_DIVERGED`, `RESEAT_DEST_CONTINUED`,
+  `RESEAT_SOURCE_REWRITTEN`, `RESEAT_LANE_UNMAPPED`,
+  `RESEAT_LANE_UNRESOLVED`, `RESEAT_INDEX_CONFLICT`,
+  `RESEAT_UNREADABLE_FORM`, `DESTINATION_OCCUPIED`; a run refuses
+  `RESEAT_RETENTION_UNSAFE` before writing and `--check`
+  `RESEAT_R0_FAILED`. They are report rows, not closure items: the closure
+  report does not join them yet.
+- **S5 and never overwrite:** a destination copy is adopted only when equal,
+  extended only when a verified byte prefix, and otherwise kept beside the
+  landed one; a placed file changed at the destination is the destination's
+  from then on. Codex rows are inserted only, never updated.
+- **Proof:** `reseat::tests` (synthetic transcripts and Codex stores in
+  throwaway homes), `tests/estate_reseat.rs` (the CLI, and a canary on the
+  installed Claude Code picker in a throwaway home with no network), and
+  nine fault-harness rows over the seven `reseat.*` points.
+- **Open, for the operator** (the investigation note's section 6): which
+  destination directory a lane keys to when the run lands Git beside the
+  live tree; the gftb and GloriousFlywheel sessions (D4b); sting's own 388
+  symlinked transcripts and ~9,242 Codex rows spelled through the `~/git`
+  symlink (TIN-5268's hold); whether existing Codex rows may be updated;
+  and home and `/private/tmp` sessions (`--unmapped`). The verb takes no
+  decision on any of them: its defaults are the conservative ones.
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

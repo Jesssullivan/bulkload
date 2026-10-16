@@ -163,6 +163,41 @@ SUBCOMMANDS:
                 since = now when absent (create it when the run, or its
                 closing pass, starts). Paths are named as copy and pull
                 record them
+    estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
+                  [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
+                  [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
+                  [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
+                  [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
+                R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
+                .claude and .codex, the run's copy of SOURCE_HOME's) into
+                DEST_HOME's live .claude and .codex, so claude --resume and
+                codex resume in each lane's destination directory list and
+                resume them, byte-identical. A lane maps a source working
+                directory to a destination one: --map SRC=DST (longest prefix
+                first), the plan's items with --lanes-from-plan, else the same
+                path under the home's git directory, at its real path. Claude
+                transcripts go to projects/<key of the real destination cwd>/
+                as regular files with their source mtime, with their sidecar
+                directory, per-session state and plans; Codex rollouts go to
+                the same place under .codex and their thread rows are inserted
+                into its state_5.sqlite with the destination cwd (insert only).
+                Never overwrites: a copy already there is adopted when equal,
+                extended when a byte prefix (append-only files), and otherwise
+                kept and reported (RESEAT_DEST_DIVERGED); a placed file changed
+                at the destination is the destination's from then on
+                (RESEAT_DEST_CONTINUED). Every placement is ledgered in
+                STATE/reseat.sqlite: an unchanged rerun reads 0 landed bytes
+                (read_reseat_landing_bytes) and a later pass appends only what
+                grew. Refuses RESEAT_RETENTION_UNSAFE, before writing, when the
+                destination's cleanupPeriodDays would delete a transcript.
+                --unmapped=by-id places sessions with no lane under their
+                source key / cwd, resumable by ID only (default: report).
+                --check is the read-only R0 acceptance check: per lane, the
+                transcripts and rollouts the pickers read there hash-equal
+                the landed ones, Git is estate-diff identical (--plan, or
+                --sessions-only to waive), the hand-off note holds the marker
+                (--note-marker); exits RESEAT_R0_FAILED unless every lane
+                passes. One bulkload.estate-reseat.v1 JSON line per row
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -425,6 +460,7 @@ fn main() -> ExitCode {
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
+        Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
         Some("serve") => {
             let (input, output) = (std::io::stdin(), std::io::stdout());
             bulkload_agent::transfer::tune_stream(&input);
@@ -1164,6 +1200,142 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         _ => Err(BulkloadRefusal::RequiredFieldMissing),
     }
+}
+
+// R0 (TIN-6587): re-seat landed agent sessions, or check that they hold.
+#[allow(clippy::too_many_lines)]
+fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::reseat::{self, GitCheck, Unmapped};
+    let mut check = false;
+    let mut maps = Vec::new();
+    let mut from_plan = false;
+    let (mut plan, mut corpus, mut source) = (None, None, None);
+    let mut states = Vec::new();
+    let mut roots = Vec::new();
+    let (mut landing_claude, mut landing_codex) = (None, None);
+    let mut unmapped = Unmapped::Report;
+    let mut marker = None;
+    let mut sessions_only = false;
+    let (mut claude, mut codex) = (true, true);
+    let mut at = 0;
+    let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        let mut step = 1;
+        match arg {
+            "--check" => check = true,
+            "--lanes-from-plan" => from_plan = true,
+            "--sessions-only" => sessions_only = true,
+            "--no-claude" => claude = false,
+            "--no-codex" => codex = false,
+            "--unmapped=report" => unmapped = Unmapped::Report,
+            "--unmapped=by-id" => unmapped = Unmapped::ById,
+            "--map" => {
+                let (from, to) = value(at + 1)?
+                    .to_str()
+                    .ok_or(BulkloadRefusal::PathNotPortable)?
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                if !Path::new(from).is_absolute() || !Path::new(to).is_absolute() {
+                    return Err(BulkloadRefusal::PathNotAbsolute);
+                }
+                maps.push((PathBuf::from(from), PathBuf::from(to)));
+                step = 2;
+            }
+            "--plan"
+            | "--corpus"
+            | "--private-state"
+            | "--codex-source-root"
+            | "--landing-claude"
+            | "--landing-codex" => {
+                let path = PathBuf::from(value(at + 1)?);
+                match arg {
+                    "--plan" => plan = Some(path),
+                    "--corpus" => corpus = Some(path),
+                    "--private-state" => states.push(path),
+                    "--codex-source-root" => roots.push(path),
+                    "--landing-claude" => landing_claude = Some(path),
+                    _ => landing_codex = Some(path),
+                }
+                step = 2;
+            }
+            "--source" => {
+                source = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            "--note-marker" => {
+                marker = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .filter(|marker| !marker.is_empty())
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+        at += step;
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let [source_home, landing_home, dest_home, state] = rest else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let mut options = reseat::Options::new(
+        Path::new(source_home),
+        Path::new(landing_home),
+        Path::new(dest_home),
+        Path::new(state),
+    );
+    if !options.source_home.is_absolute() || !options.dest_home.is_absolute() {
+        return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    if let Some(path) = landing_claude {
+        options.landing_claude = path;
+    }
+    if let Some(path) = landing_codex {
+        options.landing_codex = path;
+    }
+    if !roots.is_empty() {
+        options.codex_source_roots = roots;
+    }
+    if from_plan {
+        let plan = plan.as_ref().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        for item in bulkload_agent::estate::inspect(plan)? {
+            if let Some(workspace) = item.workspace {
+                maps.push((item.source, workspace));
+            }
+        }
+    }
+    options.maps = maps;
+    options.unmapped = unmapped;
+    options.claude = claude;
+    options.codex = codex;
+    options.handoff_marker = marker;
+    options.sessions_only = sessions_only;
+    options.git = match (plan, corpus, source) {
+        (Some(plan), Some(corpus), Some(source)) => Some(GitCheck {
+            plan,
+            corpus,
+            source,
+            states,
+        }),
+        (_, None, None) if states.is_empty() => None,
+        _ => return Err(BulkloadRefusal::RequiredFieldMissing),
+    };
+    let mut output = std::io::stdout().lock();
+    let mut emit = |line: &str| writeln!(output, "{line}").refuse_at("main::reseat_command");
+    if check {
+        reseat::check(&options, &mut emit)?.verdict()?;
+    } else {
+        reseat::reseat(&options, &mut emit).map(drop)?;
+    }
+    output.flush().refuse_at("main::reseat_command")
 }
 
 /// The options `estate-apply` and `estate-diff` take before their

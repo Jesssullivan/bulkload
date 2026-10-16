@@ -2,7 +2,7 @@
 //!
 //! Each variant has a stable machine-readable code, and variants are grouped
 //! into families by prefix: `Snapshot*`, `Capture*`, `Digest*`, `Git*`,
-//! `Sqlite*`, `Path*`, `Protocol*` and `Budget*`.
+//! `Sqlite*`, `Path*`, `Protocol*`, `Budget*` and `Reseat*`.
 //!
 //! Every variant has at least one constructor outside test code
 //! (`crates/bulkload-agent/tests/refusal_taxonomy.rs`, WP3): a code nothing
@@ -295,6 +295,48 @@ pub enum BulkloadRefusal {
     /// work it owned was done (WP3).
     WorkerLost,
 
+    // ---- agent session re-seat (R0, TIN-6587) -------------------------------
+    /// `estate-reseat`: the destination already holds a file at a session's
+    /// place that is neither the landed copy nor a byte prefix of it. It is
+    /// kept as it is; the landed copy stays beside it in the landing, and
+    /// both are reported for explicit resolution (never overwritten).
+    ReseatDestDiverged,
+    /// `estate-reseat`: a file this ledger placed changed at the destination
+    /// since its last pass (a session resumed there appends to its
+    /// transcript). The destination owns it from now on; it is never
+    /// extended again, and newer landed bytes stay in the landing.
+    ReseatDestContinued,
+    /// `estate-reseat`: the landed file no longer extends the bytes placed
+    /// from it (it shrank, or a window the ledger keeps hashes differently).
+    /// Nothing is written; the placed file is kept.
+    ReseatSourceRewritten,
+    /// `estate-reseat`: a session's recorded working directory has no lane
+    /// on the destination (no `--map`, not under the source home's `git`).
+    /// The session stays in the landing and is reported.
+    ReseatLaneUnmapped,
+    /// `estate-reseat`: a landed transcript records no working directory, or
+    /// one whose project key is not the directory it was landed under, so
+    /// its lane cannot be derived. Nothing is placed for it.
+    ReseatLaneUnresolved,
+    /// `estate-reseat`: the destination's Claude Code `cleanupPeriodDays`
+    /// (default 30) would delete a re-seated transcript at its next start,
+    /// because the transcript keeps its source modification time. Nothing
+    /// of Claude's is placed.
+    ReseatRetentionUnsafe,
+    /// `estate-reseat`: the destination's Codex thread index already holds
+    /// a row for a thread under another working directory or rollout path.
+    /// The row is never updated (insert only); the thread is reported.
+    ReseatIndexConflict,
+    /// `estate-reseat`: a landed rollout is in a form the destination's
+    /// Codex cannot read (`.jsonl.gz`). It stays in the landing as a file
+    /// and is not registered.
+    ReseatUnreadableForm,
+    /// `estate-reseat --check`: at least one lane failed the R0 acceptance
+    /// check (its sessions are not listable and byte-identical in its
+    /// destination working directory, its Git state is not equal, or its
+    /// hand-off note is missing), or a check component was not given.
+    ReseatR0Failed,
+
     // ---- handoff proof ------------------------------------------------------
     /// A credential-class probe did not prove what it set out to prove.
     ///
@@ -387,6 +429,15 @@ impl BulkloadRefusal {
             Self::FrameCodec => "FRAME_CODEC",
             Self::ProtocolStateViolation => "PROTOCOL_STATE_VIOLATION",
             Self::WorkerLost => "WORKER_LOST",
+            Self::ReseatDestDiverged => "RESEAT_DEST_DIVERGED",
+            Self::ReseatDestContinued => "RESEAT_DEST_CONTINUED",
+            Self::ReseatSourceRewritten => "RESEAT_SOURCE_REWRITTEN",
+            Self::ReseatLaneUnmapped => "RESEAT_LANE_UNMAPPED",
+            Self::ReseatLaneUnresolved => "RESEAT_LANE_UNRESOLVED",
+            Self::ReseatRetentionUnsafe => "RESEAT_RETENTION_UNSAFE",
+            Self::ReseatIndexConflict => "RESEAT_INDEX_CONFLICT",
+            Self::ReseatUnreadableForm => "RESEAT_UNREADABLE_FORM",
+            Self::ReseatR0Failed => "RESEAT_R0_FAILED",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
         }
@@ -458,6 +509,15 @@ impl BulkloadRefusal {
         "FRAME_CODEC",
         "PROTOCOL_STATE_VIOLATION",
         "WORKER_LOST",
+        "RESEAT_DEST_DIVERGED",
+        "RESEAT_DEST_CONTINUED",
+        "RESEAT_SOURCE_REWRITTEN",
+        "RESEAT_LANE_UNMAPPED",
+        "RESEAT_LANE_UNRESOLVED",
+        "RESEAT_RETENTION_UNSAFE",
+        "RESEAT_INDEX_CONFLICT",
+        "RESEAT_UNREADABLE_FORM",
+        "RESEAT_R0_FAILED",
         "PROBE_FAILED",
         "IO",
     ];
@@ -688,6 +748,15 @@ mod tests {
             BulkloadRefusal::FrameCodec,
             BulkloadRefusal::ProtocolStateViolation,
             BulkloadRefusal::WorkerLost,
+            BulkloadRefusal::ReseatDestDiverged,
+            BulkloadRefusal::ReseatDestContinued,
+            BulkloadRefusal::ReseatSourceRewritten,
+            BulkloadRefusal::ReseatLaneUnmapped,
+            BulkloadRefusal::ReseatLaneUnresolved,
+            BulkloadRefusal::ReseatRetentionUnsafe,
+            BulkloadRefusal::ReseatIndexConflict,
+            BulkloadRefusal::ReseatUnreadableForm,
+            BulkloadRefusal::ReseatR0Failed,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),
         ];

@@ -1327,6 +1327,12 @@ use estate_converge::EstateConverge;
 mod estate_adopt;
 use estate_adopt::EstateAdopt;
 
+// The `reseat.*` points (R0, TIN-6587): a re-seat of landed agent sessions
+// crashed, and the rerun settling it forward.
+#[path = "fault_harness/reseat.rs"]
+mod reseat;
+use reseat::Reseat;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
@@ -1462,6 +1468,19 @@ scenarios! {
     estate_adopt_after_refs => EstateAdoptAfterRefs: 1, EstateAdopt::Workspace;
     estate_adopt_after_ledger => EstateAdoptAfterLedger: 1, EstateAdopt::Workspace;
     estate_adopt_bare_staged => EstateAdoptBareStaged: 1, EstateAdopt::Bare;
+    // Re-seat (R0, TIN-6587): a first pass crashed at its first and its last
+    // placement (the transcript, then the Codex rollout) and at its row
+    // commit; a pass extending a grown transcript; a pass superseding a
+    // changed plan. Each settled forward by the rerun, then read-free.
+    reseat_after_temp_seal_first => ReseatAfterTempSeal: 1, Reseat::Fresh;
+    reseat_after_temp_seal_rollout => ReseatAfterTempSeal: 4, Reseat::Fresh;
+    reseat_after_publish_first => ReseatAfterPublish: 1, Reseat::Fresh;
+    reseat_after_publish_plan => ReseatAfterPublish: 3, Reseat::Fresh;
+    reseat_after_row_insert => ReseatAfterRowInsert: 1, Reseat::Fresh;
+    reseat_after_extend_intent => ReseatAfterExtendIntent: 1, Reseat::Grow;
+    reseat_mid_extend => ReseatMidExtend: 1, Reseat::Grow;
+    reseat_after_extend => ReseatAfterExtend: 1, Reseat::Grow;
+    reseat_after_supersede_exchange => ReseatAfterSupersedeExchange: 1, Reseat::Plan;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

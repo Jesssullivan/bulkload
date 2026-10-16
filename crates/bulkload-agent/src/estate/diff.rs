@@ -52,6 +52,10 @@ pub struct DiffOptions {
 pub struct Summary {
     pub classes: BTreeMap<String, u64>,
     pub adopt: BTreeMap<String, u64>,
+    /// Each planned workspace's class, keyed by its canonical path
+    /// (`refused` for an item whose read refused): what `estate-reseat
+    /// --check` reads as a lane's Git state (R0, TIN-6587).
+    pub workspaces: BTreeMap<PathBuf, String>,
 }
 
 /// Report PLAN against the destination it names: one line per row,
@@ -113,11 +117,21 @@ pub fn diff(
         );
         match item_row(item, (&identity, &items), corpus, source, states, options) {
             Ok((row, journaled, omitted)) => {
+                if let Some(workspace) = &item.workspace {
+                    summary
+                        .workspaces
+                        .insert(canonical(workspace), row.class.to_owned());
+                }
                 *summary.classes.entry(row.class.to_owned()).or_default() += 1;
                 *summary.adopt.entry(row.adopt.to_owned()).or_default() += 1;
                 write_row(&mut text, &row, journaled, omitted.as_deref());
             }
             Err(refusal) => {
+                if let Some(workspace) = &item.workspace {
+                    summary
+                        .workspaces
+                        .insert(canonical(workspace), "refused".to_owned());
+                }
                 *summary.classes.entry("refused".to_owned()).or_default() += 1;
                 text.push_str(",\"class\":\"refused\",\"refused\":");
                 text.push_str(&json_string(refusal.code()));
