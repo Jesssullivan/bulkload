@@ -1,5 +1,31 @@
 # bulkload Development Context
 
+> **Read [docs/SPEC.md](docs/SPEC.md) first.** It states what bulkload is for,
+> traced to the operator's own words in
+> [docs/intent-ledger.md](docs/intent-ledger.md). R0: every work lane carries
+> on at the destination (conversations resume and can be carried on,
+> transcripts intact, repos and worktrees intact, nothing dropped but truly
+> recreatable content; transcripts byte for byte under their original
+> session IDs, SPEC C8/C9). R3: proven faster than rclone on complex networks and many-file estates,
+> staging work data before tcfs launches. Where this file, `docs/slo.md` or a
+> Linear document disagrees with SPEC on what bulkload must achieve, SPEC
+> wins.
+>
+> - **Quote the requirement you serve.** Every lane plan and every audit
+>   quotes, verbatim, the SPEC requirement it serves (R0–R4), with the ledger
+>   IDs SPEC cites for it. A plan or audit that cannot quote one is out of
+>   scope. "Done", "ready" or "verified" is reported only with SPEC's
+>   acceptance receipts.
+> - **Never re-ask a standing ruling.** The rulings in SPEC's "Standing
+>   operator rulings" table are never re-asked, and no interview offers an
+>   option that contradicts them. SPEC's 2026-10-16 rulings on C1–C20
+>   (OI-1003-Q194) are standing too. A new conflict may be asked once, as a
+>   dated question. When the operator restates a standing ruling, even
+>   phrased as a question, that is confirmation, not an open question.
+> - **The ledger is append-only.** `docs/intent-ledger.md` is never trimmed or
+>   paraphrased, R-N55 included. New operator statements are added as new
+>   entries.
+
 ## Ratified rulings (read first)
 
 Operator interview 2026-09-20, Linear TIN-3692; placement per R-N14
