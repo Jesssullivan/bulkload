@@ -351,6 +351,17 @@ counters! {
     // their last look because a `-wal`, `-journal` or `-shm` had appeared
     // beside the path since the entry was decided (OI-1003-Q146).
     DestSqliteSidecarRefused => "dest_sqlite_sidecar_refused",
+    // `estate-reseat` (R0, TIN-6587). Bytes read from the landed agent
+    // state (the run's copy of the source's `~/.claude` and `~/.codex`):
+    // 0 on a pass whose landed files and Codex snapshot are unchanged (S3);
+    // a grown transcript once (its placed bytes proven, its tail appended);
+    // a `.zst` counts its compressed bytes; a re-read snapshot its size.
+    ReseatLandingRead => "read_reseat_landing_bytes",
+    // Bytes read from the destination's live agent state to prove a copy
+    // already there identical to, or a prefix of, the landed one.
+    ReseatDestRead => "read_reseat_dest_bytes",
+    // Bytes written into the destination's live agent state.
+    ReseatDestWrite => "write_reseat_dest_bytes",
 }
 
 const COUNT: usize = Counter::ALL.len();

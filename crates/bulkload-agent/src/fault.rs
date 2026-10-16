@@ -128,6 +128,25 @@
 //! | `estate.converge.after_head` | HEAD and its branch new; the workspace ledger old, its intent pending |
 //! | `estate.converge.after_landed` | the new workspace ledger, no intent; no journal or outcome record |
 //!
+//! Agent session re-seat, in `reseat` (R0, TIN-6587). Each rerun settles
+//! what a crash left forward from the ledger and the destination's own
+//! bytes, never by re-reading what it already placed:
+//!
+//! | Name | Crash leaves (in the destination's live agent state) |
+//! |------|------------------------------------------------------|
+//! | `reseat.after_temp_seal` | a new placement's `.<name>.bulkload-reseat` temporary written, its mode and mtime set and sealed; not published |
+//! | `reseat.after_publish` | the file published under its final name and its directory sealed; no ledger row |
+//! | `reseat.after_extend_intent` | the extend intent committed in the ledger; no tail byte written |
+//! | `reseat.mid_extend` | the first chunk of a grown transcript's tail written in place, the rest not |
+//! | `reseat.after_extend` | the whole tail written, the landed mtime set and sealed; the intent still recorded |
+//! | `reseat.after_supersede_exchange` | a changed non-append file exchanged in: the new bytes at the path, this ledger's old placement under the temporary name; the intent still recorded |
+//! | `reseat.after_row_insert` | a batch of Codex thread rows committed in the destination's `state_5.sqlite`; no ledger row for them |
+//! | `reseat.after_synth_row_insert` | a row built from a rowless rollout's header committed in the destination's index; no ledger row for it (OI-1003-Q198 D) |
+//! | `reseat.after_cwd_update` | existing destination rows' `cwd` re-spelled to the lane's canonical path and committed; the ledger still holds them as `intent` (OI-1003-Q198 (1)) |
+//! | `reseat.after_regularize_exchange` | a symlinked destination transcript exchanged for its regular copy: the copy at the path, the symlink under the temporary name; the ledger row still `intent` (OI-1003-Q198 (2)) |
+//! | `reseat.after_undo_cwd` | `--undo` put re-spelled rows' old `cwd` back and committed; the ledger rows not yet `undone` |
+//! | `reseat.after_undo_exchange` | `--undo` exchanged a regularized transcript back to its symlink: the symlink at the path, the regular copy under the temporary name; the ledger row not yet `undone` |
+//!
 //! The hand-off block (TIN-6569, OI-1003-Q183), in
 //! `git_carry::converge::handoff`:
 //!
@@ -319,6 +338,30 @@ pub enum Point {
     /// `estate.adopt.bare_staged`: a bare first landing complete in its
     /// private stage, not published (#226 item 4).
     EstateAdoptBareStaged,
+    /// `reseat.after_temp_seal`
+    ReseatAfterTempSeal,
+    /// `reseat.after_publish`
+    ReseatAfterPublish,
+    /// `reseat.after_extend_intent`
+    ReseatAfterExtendIntent,
+    /// `reseat.mid_extend`
+    ReseatMidExtend,
+    /// `reseat.after_extend`
+    ReseatAfterExtend,
+    /// `reseat.after_supersede_exchange`
+    ReseatAfterSupersedeExchange,
+    /// `reseat.after_row_insert`
+    ReseatAfterRowInsert,
+    /// `reseat.after_synth_row_insert`
+    ReseatAfterSynthRowInsert,
+    /// `reseat.after_cwd_update`
+    ReseatAfterCwdUpdate,
+    /// `reseat.after_regularize_exchange`
+    ReseatAfterRegularizeExchange,
+    /// `reseat.after_undo_cwd`
+    ReseatAfterUndoCwd,
+    /// `reseat.after_undo_exchange`
+    ReseatAfterUndoExchange,
     /// `estate.handoff.after_intent`: the hand-off intent durable; no
     /// target written (TIN-6569, OI-1003-Q183).
     EstateHandoffAfterIntent,
@@ -341,7 +384,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 49] = [
+    pub const ALL: [Self; 61] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -385,6 +428,18 @@ impl Point {
         Self::EstateAdoptAfterRefs,
         Self::EstateAdoptAfterLedger,
         Self::EstateAdoptBareStaged,
+        Self::ReseatAfterTempSeal,
+        Self::ReseatAfterPublish,
+        Self::ReseatAfterExtendIntent,
+        Self::ReseatMidExtend,
+        Self::ReseatAfterExtend,
+        Self::ReseatAfterSupersedeExchange,
+        Self::ReseatAfterRowInsert,
+        Self::ReseatAfterSynthRowInsert,
+        Self::ReseatAfterCwdUpdate,
+        Self::ReseatAfterRegularizeExchange,
+        Self::ReseatAfterUndoCwd,
+        Self::ReseatAfterUndoExchange,
         Self::EstateHandoffAfterIntent,
         Self::EstateHandoffAfterTemp,
         Self::EstateHandoffAfterExchange,
@@ -440,6 +495,18 @@ impl Point {
             Self::EstateAdoptAfterRefs => "estate.adopt.after_refs",
             Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
             Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
+            Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
+            Self::ReseatAfterPublish => "reseat.after_publish",
+            Self::ReseatAfterExtendIntent => "reseat.after_extend_intent",
+            Self::ReseatMidExtend => "reseat.mid_extend",
+            Self::ReseatAfterExtend => "reseat.after_extend",
+            Self::ReseatAfterSupersedeExchange => "reseat.after_supersede_exchange",
+            Self::ReseatAfterRowInsert => "reseat.after_row_insert",
+            Self::ReseatAfterSynthRowInsert => "reseat.after_synth_row_insert",
+            Self::ReseatAfterCwdUpdate => "reseat.after_cwd_update",
+            Self::ReseatAfterRegularizeExchange => "reseat.after_regularize_exchange",
+            Self::ReseatAfterUndoCwd => "reseat.after_undo_cwd",
+            Self::ReseatAfterUndoExchange => "reseat.after_undo_exchange",
             Self::EstateHandoffAfterIntent => "estate.handoff.after_intent",
             Self::EstateHandoffAfterTemp => "estate.handoff.after_temp",
             Self::EstateHandoffAfterExchange => "estate.handoff.after_exchange",

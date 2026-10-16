@@ -1502,6 +1502,109 @@ default**. Diagnosis: `docs/agent-notes/2026-10-16-delta-regression.md`
   on the bench comes before any gated sample (Q143); the diagnosis expects
   about 0.89x rclone on the bench delta, at Q143's 0.90x margin.
 
+## Amendment 2026-10-16: R0, every agent lane continues on the destination (TIN-6587)
+
+The operator's core user expectation (2026-10-16, Linear TIN-6587; R0 of the
+draft `docs/SPEC.md`, PR #236): after a run, `claude --resume` and `codex
+resume` in each lane's destination working directory list and resume its
+sessions, transcripts byte-identical. Until now no SLO measured it, and the
+2026-10-16 investigation found it holds for no neo lane on sting
+(`docs/agent-notes/2026-10-16-reseat-investigation.md`). No SLO number
+changes. This adds a verb, its acceptance check and its proof rows; the
+contract is `docs/design.md`, "Agent session re-seat".
+
+- **R0 acceptance is `estate-reseat --check`**, read-only: per lane, the
+  transcripts and rollouts the two pickers read in the destination
+  directory hold the landed ones (exactly, or continued by a resume there;
+  never ending inside a line), the Git state is `estate-diff`
+  `identical`, and the hand-off note is present when TIN-6569's marker is
+  given. It replaces the undefined "daily-work verdict" (#40) as the
+  per-lane record. A lane without its Git input is `incomplete`, never a
+  pass. R0 also fails when nothing was checked, when retention is unsafe,
+  and for every session or thread with no lane (unmapped, unresolved) or
+  failed by ID, unless the operator names it (`--waive`, `--waive-from`).
+- **S3:** an unchanged `estate-reseat` reads 0 landed bytes
+  (`read_reseat_landing_bytes=0`), the landed Codex snapshot included, and
+  writes 0. A grown transcript is read once from the landing: every placed
+  byte proven by its BLAKE3, then the new tail (the source is never read,
+  R25).
+- **S4:** every session, thread or file that is not re-seated is a typed
+  row: `RESEAT_DEST_DIVERGED`, `RESEAT_DEST_CONTINUED`,
+  `RESEAT_EXTEND_RACED`, `RESEAT_SOURCE_REWRITTEN`,
+  `RESEAT_LANE_UNMAPPED`, `RESEAT_LANE_UNRESOLVED`,
+  `RESEAT_LANE_COLLISION`, `RESEAT_INDEX_CONFLICT`,
+  `RESEAT_INDEX_ROW_ABSENT`, `RESEAT_UNREADABLE_FORM`,
+  `DESTINATION_OCCUPIED`; a run refuses `RESEAT_LANDING_ABSENT`,
+  `RESEAT_RETENTION_UNSAFE` and `RESEAT_INDEX_ABSENT` before writing, and
+  `--check` `RESEAT_R0_FAILED`. They are report rows, not closure items:
+  the closure report does not join them yet.
+- **S5 and never overwrite:** a destination copy is adopted only when equal,
+  extended only when a verified byte prefix (whole lines, the destination's
+  size checked before every write), and otherwise kept beside the landed
+  one; a placed file changed at the destination is the destination's from
+  then on. Codex rows are inserted only, never updated; a row the
+  destination already holds gets no second rollout beside it.
+- **Proof:** `reseat::tests` and `reseat::tests::findings` (synthetic
+  transcripts and Codex stores in throwaway homes, one row per review
+  finding, each seen failing against the first build), `tests/estate_reseat.rs`
+  (the CLI, and canaries on the installed Claude Code picker and the
+  installed Codex resume in throwaway homes with no network), and eleven
+  fault-harness rows over the seven `reseat.*` points.
+- **Open, for the operator** (the investigation note's section 6, as
+  restated in `docs/agent-notes/2026-10-16-estate-reseat-review-fixes.md`):
+  which destination directory a lane keys to when the run lands Git beside
+  the live tree; the gftb and GloriousFlywheel sessions (D4b); neo's own
+  sessions (and sting's) blocked at their destination key by sting's
+  symlinked transcripts, and ~9,242 Codex rows spelled through the `~/git`
+  symlink (TIN-5268's hold); whether existing Codex rows may be updated;
+  and home and `/private/tmp` sessions (`--unmapped`, `--waive`). The verb
+  takes no decision on any of them: its defaults are the conservative ones.
+
+### Addendum 2026-10-16: the re-reviews of `8a89f9a` and OI-1003-Q198 (TIN-6587)
+
+No SLO number changes. The two re-reviews of `8a89f9a` (data safety:
+fix first, one MAJOR; user outcome: mergeable, four minors) and the
+operator's rulings OI-1003-Q198 (Linear TIN-6587, comment `fbccc49b`)
+amend the R0 amendment above; the contract is `docs/design.md`, "Agent
+session re-seat", and the receipt
+`docs/agent-notes/2026-10-16-estate-reseat-rereview-fixes.md`.
+
+- **S3** now holds on neo's real shape: a session refused (unmapped,
+  unresolved) or unreadable is ledgered by its landed identity and not
+  read again, so an unchanged rerun reads 0 landed bytes with them too.
+- **S4** gains `RESEAT_LOCKED` (another run holds a destination root or
+  STATE), `RESEAT_REGULARIZE_RACED` (both copies kept),
+  `RESEAT_UNDO_TARGET_CHANGED` (`--undo` over an archive target that is
+  gone or no longer the recorded bytes: nothing changed) and, before writing,
+  `DESTINATION_SPACE_INSUFFICIENT` (the engine's `--min-free-percent` rule
+  over the bytes a pass would write). Everything under a project key that
+  is no session's is carried with its key or named by a `key` line
+  (Q185). A rollout recorded outside every `--codex-source-root` is
+  `RESEAT_LANE_UNMAPPED:rollout-root` in `--check` too.
+- **S5, as ruled:** the destination's own Codex row or rollout form for a
+  thread is never replaced and nothing is placed beside it, for rollouts
+  with no snapshot row too (the MAJOR); a destination file with more than
+  one link is never written. Two destination changes are ruled
+  (OI-1003-Q198): an existing row whose `cwd` only spells the lane through
+  a symlink gets that column re-spelled, and a symlinked transcript is
+  replaced by a regular copy of its target (the archive kept); both are
+  ledgered with their old values and reversed by `--undo` wherever the
+  destination still holds exactly what re-seat wrote.
+- **R0 acceptance** also fails a longer landed form of a rollout that was
+  never placed (`extra-form-unplaced`), and names a row carrying the
+  source's `cwd` (`row-cwd-is-source`). Rollouts with no snapshot row get a
+  row from their header (Q198 D), so their lane's picker lists them; home
+  and `/private/tmp` sessions are placed by ID and are in no lane (Q198 C).
+- **Proof:** `reseat::tests::findings::rereview` (nine rows, each failing
+  against `8a89f9a` first) and `reseat::tests::findings::q198` (seven
+  rows), the CLI space row and two more real-binary canaries in
+  `tests/estate_reseat.rs`, and sixteen fault-harness rows over twelve
+  `reseat.*` points.
+- **Resolved by OI-1003-Q198** (the open items above): where lanes key
+  (A), gftb and GloriousFlywheel (B), home and `/private/tmp` sessions (C),
+  rowless rollouts (D), `.zst` rollouts (E), sting's symlinked transcripts
+  and the ~9,242 `~/git`-spelled Codex rows.
+
 ## Priority (OI-1003-Q4)
 
 [2026-10-16: what bulkload must achieve, and the order that rules now, is

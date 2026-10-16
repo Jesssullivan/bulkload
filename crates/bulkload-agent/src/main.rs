@@ -201,6 +201,80 @@ SUBCOMMANDS:
                 since = now when absent (create it when the run, or its
                 closing pass, starts). Paths are named as copy and pull
                 record them
+    estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
+                  [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
+                  [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
+                  [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
+                  [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
+                  [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
+                  [--no-respell] [--no-regularize] [--undo]
+                  [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
+                R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
+                .claude and .codex, the run's copy of SOURCE_HOME's) into
+                DEST_HOME's live .claude and .codex, so claude --resume and
+                codex resume in each lane's destination directory list and
+                resume them, byte-identical. A lane maps a source working
+                directory to a destination one: --map SRC=DST (longest prefix
+                first), the plan's items with --lanes-from-plan, else the same
+                path under the home's git directory, at its real path. Claude
+                transcripts go to projects/<key of the real destination cwd>/
+                as regular files with their source mtime, with their sidecar
+                directory, per-session state and plans; Codex rollouts go to
+                the same place under .codex as plain .jsonl (a .jsonl.zst is
+                decompressed: Codex resumes a paginated thread only from the
+                plain file) and their thread rows are inserted into its
+                state_5.sqlite with the destination cwd (insert only; a row
+                the destination already holds is never changed). A rollout
+                with no snapshot row is placed with a row built from its
+                header (OI-1003-Q198 D; RESEAT_INDEX_ROW_ABSENT when it cannot
+                fill one); a destination row or rollout form for a thread is
+                the destination's (RESEAT_INDEX_CONFLICT, nothing placed),
+                except that an existing row whose cwd only spells the lane
+                differently (through the ~/git symlink) gets its cwd column
+                re-spelled to the canonical path, ledgered (OI-1003-Q198 (1);
+                --no-respell). Symlinked destination transcripts
+                (projects/*/*.jsonl) are first regularized into regular-file
+                copies of their targets with the targets' mtime, the targets
+                kept, ledgered (OI-1003-Q198 (2); --no-regularize); a target
+                written during it is RESEAT_REGULARIZE_RACED with both copies
+                kept (the line's kept field names a copy kept aside). --undo
+                puts back every symlink and old cwd this STATE changed, where
+                the destination still holds exactly what re-seat wrote and
+                the archive target holds the recorded bytes (else
+                RESEAT_UNDO_TARGET_CHANGED, nothing changed). Home
+                and /private/tmp (and /tmp) sessions are placed resumable by
+                ID (OI-1003-Q198 C; --by-id DIR adds a prefix,
+                --no-default-by-id drops the defaults). One run at a time:
+                each destination root and STATE are flocked (RESEAT_LOCKED);
+                the engine's --min-free-percent floor holds for the bytes a
+                pass would write (DESTINATION_SPACE_INSUFFICIENT). JSON Lines are placed and extended
+                in whole lines only. Never overwrites: a copy already there is
+                adopted when equal, extended when a byte prefix (append-only
+                files), and otherwise kept and reported (RESEAT_DEST_DIVERGED);
+                a placed file changed at the destination is the destination's
+                from then on (RESEAT_DEST_CONTINUED, RESEAT_EXTEND_RACED);
+                two landed files for one destination path are
+                RESEAT_LANE_COLLISION. Every placement is ledgered in
+                STATE/reseat.sqlite: an unchanged rerun reads 0 landed bytes
+                (read_reseat_landing_bytes) and a later pass proves the placed
+                bytes and appends only what grew. Refuses before writing:
+                RESEAT_LANDING_ABSENT (a landed .claude or .codex missing; use
+                --no-claude / --no-codex), RESEAT_RETENTION_UNSAFE (the
+                smallest cleanupPeriodDays of the destination's managed, user
+                and lane settings would delete a re-seated file within
+                --retention-margin-days, default 365), RESEAT_INDEX_ABSENT (no
+                destination Codex index to register in). --unmapped=by-id
+                places sessions with no lane under their source key / cwd,
+                resumable by ID only (default: report). --check is the
+                read-only R0 acceptance check: per lane, the transcripts and
+                rollouts the pickers read there hold the landed ones (exactly,
+                or continued at the destination), Git is estate-diff identical
+                (--plan, or --sessions-only to waive), the hand-off note holds
+                the marker (--note-marker); every session or thread without a
+                lane, or failed by ID, fails it unless --waive (or
+                --waive-from, one ID per line) names it; exits RESEAT_R0_FAILED
+                unless all of that holds and something was checked. One
+                bulkload.estate-reseat.v1 JSON line per row
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -463,6 +537,7 @@ fn main() -> ExitCode {
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
+        Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
         Some("serve") => {
             let (input, output) = (std::io::stdin(), std::io::stdout());
             bulkload_agent::transfer::tune_stream(&input);
@@ -1236,6 +1311,210 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         _ => Err(BulkloadRefusal::RequiredFieldMissing),
     }
+}
+
+// R0 (TIN-6587): re-seat landed agent sessions, or check that they hold.
+#[allow(clippy::too_many_lines)]
+fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::reseat::{self, GitCheck, Unmapped};
+    let mut check = false;
+    let mut maps = Vec::new();
+    let mut from_plan = false;
+    let (mut plan, mut corpus, mut source) = (None, None, None);
+    let mut states = Vec::new();
+    let mut roots = Vec::new();
+    let (mut landing_claude, mut landing_codex) = (None, None);
+    let mut unmapped = Unmapped::Report;
+    let mut marker = None;
+    let mut sessions_only = false;
+    let mut waived = std::collections::BTreeSet::new();
+    let mut margin = None;
+    let mut managed = Vec::new();
+    let (mut claude, mut codex) = (true, true);
+    let (mut undo, mut respell, mut regularize, mut default_by_id) = (false, true, true, true);
+    let mut by_id = Vec::new();
+    let mut at = 0;
+    let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        let mut step = 1;
+        match arg {
+            "--check" => check = true,
+            "--lanes-from-plan" => from_plan = true,
+            "--sessions-only" => sessions_only = true,
+            "--no-claude" => claude = false,
+            "--no-codex" => codex = false,
+            "--undo" => undo = true,
+            "--no-respell" => respell = false,
+            "--no-regularize" => regularize = false,
+            "--no-default-by-id" => default_by_id = false,
+            "--unmapped=report" => unmapped = Unmapped::Report,
+            "--unmapped=by-id" => unmapped = Unmapped::ById,
+            "--map" => {
+                let (from, to) = value(at + 1)?
+                    .to_str()
+                    .ok_or(BulkloadRefusal::PathNotPortable)?
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                if !Path::new(from).is_absolute() || !Path::new(to).is_absolute() {
+                    return Err(BulkloadRefusal::PathNotAbsolute);
+                }
+                maps.push((PathBuf::from(from), PathBuf::from(to)));
+                step = 2;
+            }
+            "--plan"
+            | "--corpus"
+            | "--private-state"
+            | "--codex-source-root"
+            | "--landing-claude"
+            | "--landing-codex"
+            | "--managed-settings"
+            | "--by-id"
+            | "--waive-from" => {
+                let path = PathBuf::from(value(at + 1)?);
+                match arg {
+                    "--plan" => plan = Some(path),
+                    "--corpus" => corpus = Some(path),
+                    "--private-state" => states.push(path),
+                    "--codex-source-root" => roots.push(path),
+                    "--landing-claude" => landing_claude = Some(path),
+                    "--managed-settings" => managed.push(path),
+                    "--by-id" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        by_id.push(path);
+                    }
+                    "--waive-from" => {
+                        let text = std::fs::read_to_string(&path)
+                            .refuse_at("main::reseat_command::waive_from")?;
+                        for line in text.lines() {
+                            let id = line.split('#').next().unwrap_or_default().trim();
+                            if !id.is_empty() {
+                                waived.insert(id.to_owned());
+                            }
+                        }
+                    }
+                    _ => landing_codex = Some(path),
+                }
+                step = 2;
+            }
+            "--waive" => {
+                waived.insert(
+                    value(at + 1)?
+                        .to_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            "--retention-margin-days" => {
+                margin = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .and_then(|days| days.parse::<i64>().ok())
+                        .filter(|days| *days >= 0)
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+                );
+                step = 2;
+            }
+            "--source" => {
+                source = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            "--note-marker" => {
+                marker = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .filter(|marker| !marker.is_empty())
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+        at += step;
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let [source_home, landing_home, dest_home, state] = rest else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let mut options = reseat::Options::new(
+        Path::new(source_home),
+        Path::new(landing_home),
+        Path::new(dest_home),
+        Path::new(state),
+    );
+    if !options.source_home.is_absolute() || !options.dest_home.is_absolute() {
+        return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    if let Some(path) = landing_claude {
+        options.landing_claude = path;
+    }
+    if let Some(path) = landing_codex {
+        options.landing_codex = path;
+    }
+    if !roots.is_empty() {
+        options.codex_source_roots = roots;
+    }
+    if from_plan {
+        let plan = plan.as_ref().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        for item in bulkload_agent::estate::inspect(plan)? {
+            if let Some(workspace) = item.workspace {
+                maps.push((item.source, workspace));
+            }
+        }
+    }
+    options.maps = maps;
+    options.unmapped = unmapped;
+    options.claude = claude;
+    options.codex = codex;
+    options.handoff_marker = marker;
+    options.sessions_only = sessions_only;
+    options.waived = waived;
+    if let Some(margin) = margin {
+        options.retention_margin_days = margin;
+    }
+    if !managed.is_empty() {
+        options.managed_settings = managed;
+    }
+    if !default_by_id {
+        options.by_id_exact.clear();
+        options.by_id_prefixes.clear();
+    }
+    options.by_id_prefixes.extend(by_id);
+    options.respell_cwd = respell;
+    options.regularize = regularize;
+    options.git = match (plan, corpus, source) {
+        (Some(plan), Some(corpus), Some(source)) => Some(GitCheck {
+            plan,
+            corpus,
+            source,
+            states,
+        }),
+        (_, None, None) if states.is_empty() => None,
+        _ => return Err(BulkloadRefusal::RequiredFieldMissing),
+    };
+    let mut output = std::io::stdout().lock();
+    let mut emit = |line: &str| writeln!(output, "{line}").refuse_at("main::reseat_command");
+    if check && undo {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    if undo {
+        reseat::undo(&options, &mut emit).map(drop)?;
+    } else if check {
+        reseat::check(&options, &mut emit)?.verdict()?;
+    } else {
+        reseat::reseat(&options, &mut emit).map(drop)?;
+    }
+    output.flush().refuse_at("main::reseat_command")
 }
 
 /// `estate-handoff`'s options, before its positional arguments

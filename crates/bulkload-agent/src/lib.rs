@@ -131,6 +131,7 @@ pub mod materialize;
 pub mod outcome;
 pub mod provider_sqlite;
 pub mod refuse;
+pub mod reseat;
 pub mod space;
 #[cfg(test)]
 pub(crate) mod test_support;

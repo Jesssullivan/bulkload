@@ -1327,6 +1327,12 @@ use estate_converge::EstateConverge;
 mod estate_adopt;
 use estate_adopt::EstateAdopt;
 
+// The `reseat.*` points (R0, TIN-6587): a re-seat of landed agent sessions
+// crashed, and the rerun settling it forward.
+#[path = "fault_harness/reseat.rs"]
+mod reseat;
+use reseat::Reseat;
+
 // The `estate.handoff.*` points (TIN-6569, OI-1003-Q183): a hand-off
 // render, clear or converge lift crashed, and the rerun finishing it.
 #[path = "fault_harness/estate_handoff.rs"]
@@ -1468,6 +1474,33 @@ scenarios! {
     estate_adopt_after_refs => EstateAdoptAfterRefs: 1, EstateAdopt::Workspace;
     estate_adopt_after_ledger => EstateAdoptAfterLedger: 1, EstateAdopt::Workspace;
     estate_adopt_bare_staged => EstateAdoptBareStaged: 1, EstateAdopt::Bare;
+    // Re-seat (R0, TIN-6587): a first pass crashed at its first and its last
+    // placement (the transcript, then the Codex rollout) and at its row
+    // commit; a pass extending a grown transcript; a pass superseding a
+    // changed plan. Each settled forward by the rerun, then read-free.
+    reseat_after_temp_seal_first => ReseatAfterTempSeal: 1, Reseat::Fresh;
+    reseat_after_temp_seal_rollout => ReseatAfterTempSeal: 4, Reseat::Fresh;
+    reseat_after_publish_first => ReseatAfterPublish: 1, Reseat::Fresh;
+    reseat_after_publish_plan => ReseatAfterPublish: 3, Reseat::Fresh;
+    reseat_after_row_insert => ReseatAfterRowInsert: 1, Reseat::Fresh;
+    reseat_after_extend_intent => ReseatAfterExtendIntent: 1, Reseat::Grow;
+    reseat_mid_extend => ReseatMidExtend: 1, Reseat::Grow;
+    reseat_after_extend => ReseatAfterExtend: 1, Reseat::Grow;
+    reseat_after_supersede_exchange => ReseatAfterSupersedeExchange: 1, Reseat::Plan;
+    // A rollout landed as `.jsonl.zst`, decompressed into its temporary and
+    // published as plain `.jsonl` (review 0, finding 1).
+    reseat_zst_after_temp_seal_rollout => ReseatAfterTempSeal: 4, Reseat::Zst;
+    reseat_zst_after_publish_rollout => ReseatAfterPublish: 4, Reseat::Zst;
+    // The operator's 2026-10-16 rulings (OI-1003-Q198): a symlinked
+    // destination transcript regularized, an existing Codex row's `cwd`
+    // re-spelled, a row built from a rowless rollout's header; and the
+    // `--undo` that reverses the first two. Each settled forward by the
+    // rerun.
+    reseat_q198_after_regularize_exchange => ReseatAfterRegularizeExchange: 1, Reseat::Q198;
+    reseat_q198_after_cwd_update => ReseatAfterCwdUpdate: 1, Reseat::Q198;
+    reseat_q198_after_synth_row_insert => ReseatAfterSynthRowInsert: 1, Reseat::Q198;
+    reseat_q198_undo_after_exchange => ReseatAfterUndoExchange: 1, Reseat::Undo;
+    reseat_q198_undo_after_cwd => ReseatAfterUndoCwd: 1, Reseat::Undo;
     // The hand-off block (TIN-6569): every point of a render, a clear and
     // converge's lift, each finished by the rerun.
     estate_handoff_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::Render;

@@ -26,6 +26,10 @@ fastcdc = { version = "3" }
 libc = { version = "0.2" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 crc32c = { version = "0.6" }
+# `estate-reseat` reads Codex's `.jsonl.zst` rollouts (R0, TIN-6587). No
+# default features: the decoder only (no legacy formats, no dictionary
+# builder).
+zstd = { version = "0.13", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = { version = "3" }
 # Dev-only property testing (plan D3 "Borrow"). No default features: no fork,
