@@ -25,7 +25,9 @@ use super::super::{git, text};
 use super::adopt::{
     ancestor, foreign_shape, objects_of, prove_adoptable, rekey_refusal, Found, Scratch,
 };
-use super::{check_linked, first_landing_target, head_of, lstat, prove, Landing, Meta, Target};
+use super::{
+    check_linked, first_landing_target, head_of, lstat, planned, prove, Landing, Meta, Target,
+};
 use crate::{BulkloadRefusal, Result};
 
 /// One ref of an item's repository, as `estate-diff` reports it.
@@ -59,7 +61,9 @@ pub struct ItemRow {
     /// What `estate-apply` does here: `landing` (A5), and where A5's own
     /// checks refuse it, `ignore-policy-conflict`
     /// (`GIT_IGNORE_POLICY_CONFLICT`) or `parent-missing`
-    /// (`GIT_DESTINATION_PARENT_MISSING`); `bare-landing`
+    /// (`GIT_DESTINATION_PARENT_MISSING`: absent parents under a symlink or
+    /// a non-directory, which the apply never makes; M2 finding 1);
+    /// `bare-landing`
     /// (A11c), `adoptable` (A11a, A11d), `diverged`, `occupied-foreign`,
     /// `symlinked-path` and `occupied-shape` (`GIT_DESTINATION_OCCUPIED`
     /// before any proof, `adopt::foreign_shape`), `ledgered`,
@@ -67,7 +71,9 @@ pub struct ItemRow {
     /// `not-a-repository`, `not-at-path`.
     pub adopt: &'static str,
     /// The components that differ: `head`, `index`, `exclude`,
-    /// `seats=<n>`, `seat=<path>`, `unrelated`; `repository-absent` for a
+    /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
+    /// landing that makes `n` absent parents (M2 finding 1);
+    /// `repository-absent` for a
     /// first linked landing whose repository the apply's main item lands
     /// first (its exclude policy is not checked); or, for an occupied shape
     /// or a re-key `--adopt` refuses, its reason (`symlinked-path`,
@@ -108,17 +114,18 @@ fn occupied(row: &mut ItemRow, reason: &'static str) {
 // apply's main item lands it first: only the path is checked, and the row
 // says `repository-absent`). `GIT_IGNORE_POLICY_CONFLICT` is
 // `ignore-policy-conflict`, `GIT_DESTINATION_PARENT_MISSING`
-// `parent-missing`; any other refusal is the row's refusal.
+// `parent-missing`; any other refusal is the row's refusal. With the
+// verdict, how many absent parents the apply makes (M2 finding 1).
 fn first_landing(
     staged: &super::super::StagedBundle,
     target: &Target<'_>,
     landing: &Landing<'_>,
-) -> Result<&'static str> {
+) -> Result<(&'static str, usize)> {
     let workspace = target
         .workspace
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-    let checked = if workspace == target.repository || lstat(target.repository)?.is_none() {
-        first_landing_target(staged, workspace).map(drop)
+    let checked = if workspace == target.repository || planned(target.repository)?.is_none() {
+        first_landing_target(staged, workspace)
     } else {
         check_linked(
             staged,
@@ -127,13 +134,20 @@ fn first_landing(
             target.source,
             landing.observed_ns,
         )
-        .map(drop)
+        .map(|checked| checked.destination)
     };
     match checked {
-        Ok(()) => Ok("landing"),
-        Err(BulkloadRefusal::GitIgnorePolicyConflict) => Ok("ignore-policy-conflict"),
-        Err(BulkloadRefusal::GitDestinationParentMissing) => Ok("parent-missing"),
+        Ok(first) => Ok(("landing", first.absent())),
+        Err(BulkloadRefusal::GitIgnorePolicyConflict) => Ok(("ignore-policy-conflict", 0)),
+        Err(BulkloadRefusal::GitDestinationParentMissing) => Ok(("parent-missing", 0)),
         Err(other) => Err(other),
+    }
+}
+
+// The component a first landing that makes `absent` parents carries.
+fn parents_component(row: &mut ItemRow, absent: usize) {
+    if absent > 0 {
+        row.components.push(format!("parents={absent}"));
     }
 }
 
@@ -158,14 +172,16 @@ pub fn workspace(
         origin: "none",
         ..ItemRow::default()
     };
-    if lstat(workspace)?.is_none() {
+    if planned(workspace)?.is_none() {
         row.class = "source-only";
-        row.adopt = first_landing(staged, target, landing)?;
+        let (adopt, absent) = first_landing(staged, target, landing)?;
+        row.adopt = adopt;
+        parents_component(&mut row, absent);
         if standalone && row.adopt == "landing" {
             let scratch = Scratch::new(staged, None, target.base, target.source)?;
             row.origin = origin(&scratch, target.source, origins)?;
         }
-        if !standalone && lstat(target.repository)?.is_none() {
+        if !standalone && planned(target.repository)?.is_none() {
             row.components.push("repository-absent".to_owned());
         }
         return Ok(row);
@@ -318,9 +334,18 @@ pub fn refs_only(
         origin: "none",
         ..ItemRow::default()
     };
-    if lstat(repo)?.is_none() {
+    if planned(repo)?.is_none() {
         row.class = "source-only";
         if staged.is_bare() {
+            // M2 finding 1: the bare landing's own parent check.
+            match super::super::parents::FirstTarget::of(repo) {
+                Ok(first) => parents_component(&mut row, first.absent()),
+                Err(BulkloadRefusal::GitDestinationParentMissing) => {
+                    row.adopt = "parent-missing";
+                    return Ok(row);
+                }
+                Err(other) => return Err(other),
+            }
             row.adopt = "bare-landing";
             let scratch = Scratch::new(staged, None, target.base, target.source)?;
             row.origin = origin(&scratch, target.source, origins)?;

@@ -41,6 +41,7 @@ pub mod estimate;
 mod inert_origin_tests;
 pub(crate) mod landed;
 pub(crate) mod native_refs;
+pub mod parents;
 mod raw_tree;
 mod ref_table;
 #[cfg(test)]
@@ -6768,6 +6769,7 @@ pub fn restore_staged(
             item: "",
             observed_ns: 0,
             capture: staged.digest(),
+            parents: None,
         },
         &[],
     )
@@ -6796,8 +6798,11 @@ pub(crate) fn restore_staged_landed(
     // R-N114: a destination already there is a collision, refused by type,
     // never as a bare errno; round 4 N4: so is a parent never laid down.
     // `estate-diff` reports the same checks (dogfood of 2026-10-16, F1).
-    let target = converge::first_landing_target(staged, destination)?;
+    let first = converge::first_landing_target(staged, destination)?;
     let mapping = checked_mapping(mapping)?;
+    // M2 finding 1: an estate apply makes the absent parents here, after
+    // the checks above and before the stage (its first write).
+    let (target, parents_made) = first.place(landing.parents_record())?;
     // #216 (OI-1003-Q129, OI-1003-Q135): the whole checkout is built in a
     // private stage beside the destination: the repository imported, every
     // configuration and authority decision made, the worktree, index and
@@ -6846,6 +6851,7 @@ pub(crate) fn restore_staged_landed(
     // `carry/*` branch.
     let (head, meta, mut custody) =
         converge::land_standalone_refs(&work, source, &instance, landing)?;
+    custody.add("parent-created", parents_made);
     let exclude = output(git(&work).args(["show", &format!("{}:value", find("exclude")?)]))?;
     fs::create_dir_all(work.join(".git/info")).refuse_at(SITE)?;
     fs::write(work.join(".git/info/exclude"), exclude).refuse_at(SITE)?;
@@ -7091,7 +7097,8 @@ pub(crate) fn related_repository(repo: &Path, history: &Path, tips: &[String]) -
 ///
 /// # Errors
 /// `GIT_DESTINATION_OCCUPIED` when the destination exists,
-/// `GIT_DESTINATION_PARENT_MISSING` without its parent; whatever the
+/// `GIT_DESTINATION_PARENT_MISSING` without its parent where
+/// [`parents`] may not make it; whatever the
 /// import, the ref step or the configuration refuses.
 pub(crate) fn land_bare_staged(
     staged: &StagedBundle,
@@ -7109,7 +7116,9 @@ pub(crate) fn land_bare_staged(
     if destination.symlink_metadata().is_ok() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
-    let target = linked_destination(destination)?;
+    // M2 finding 1: absent parents are made here, before the stage.
+    let (target, parents_made) =
+        parents::FirstTarget::of(destination)?.place(landing.parents_record())?;
     let stage =
         PrivateDir::create_beside(target.parent().ok_or(BulkloadRefusal::PathNotAbsolute)?)?;
     let work = stage.path().join("repository.git");
@@ -7143,6 +7152,7 @@ pub(crate) fn land_bare_staged(
         None,
         false,
     )?;
+    custody.add("parent-created", parents_made);
     if settle_bare_head(
         &work,
         carried_symbolic(&work, source, &instance)?.as_deref(),
@@ -7241,6 +7251,7 @@ pub fn restore_linked_staged(
             item: "",
             observed_ns: 0,
             capture: staged.digest(),
+            parents: None,
         },
     )
     .map(drop)
@@ -7277,7 +7288,9 @@ pub(crate) fn restore_linked_staged_landed(
         source,
         landing.observed_ns,
     )?;
-    let destination = checked.destination.clone();
+    // M2 finding 1: after every write-free refusal, the absent parents
+    // are the landing's first write.
+    let (destination, parents_made) = checked.destination.place(landing.parents_record())?;
     let repository = checked.repository.clone();
     let heads = checked.heads.clone();
     let find = |suffix: &str| capture_revision(&heads, suffix);
@@ -7374,11 +7387,12 @@ pub(crate) fn restore_linked_staged_landed(
     let converge::LinkedPlan {
         head: head_plan,
         meta,
-        custody,
+        mut custody,
         common,
         lock,
         ..
     } = plan;
+    custody.add("parent-created", parents_made);
     // Review 3 finding 3: the index this landing installed, built from the
     // capture, never read back from the worktree an operator can change.
     let git_dir =
@@ -7541,6 +7555,7 @@ pub(crate) fn recover_linked_landing(
             item: &intent.item,
             observed_ns: intent.observed_ns,
             capture: intent.capture,
+            parents: None,
         },
         &meta,
         (&intent.head, intent.intended_branch.as_ref()),

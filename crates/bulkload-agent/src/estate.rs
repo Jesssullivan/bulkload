@@ -2180,8 +2180,12 @@ fn import_base(
     // stage.
     let fresh_bare = item.workspace.is_none()
         && bare_capture
-        && fs::symlink_metadata(&item.repository)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        && fs::symlink_metadata(&item.repository).is_err_and(|error| {
+            // M2 finding 1: under a file nothing can be; the landing's
+            // parent check types it.
+            error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOTDIR)
+        });
     if fresh_bare
         || item
             .workspace
@@ -2327,10 +2331,14 @@ fn apply_item(
     // Estate converge: a first landing restores native refs and records
     // ledgers; a landed checkout whose capture changed converges when its
     // ledger proves it unchanged (`git_carry::converge`).
+    // M2 finding 1: a first landing makes its absent parents (0755) and
+    // records them here.
+    let parents = parents_path(state, &identity, source);
     let landing = git_carry::converge::Landing {
         item: &identity,
         observed_ns: retained_parts(corpus, &captured.bundle)?.map_or(0, |parts| parts.started_ns),
         capture: captured.digest,
+        parents: Some(&parents),
     };
     let target = git_carry::converge::Target {
         repository: &item.repository,
@@ -2681,6 +2689,19 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
         .filter(|name| !matched.contains(name))
         .collect();
     Ok(ledger)
+}
+
+/// Where an item's first landing records the parents it made (M2 finding 1).
+///
+/// `{item}-{blake3(source)}.parents` in STATE, a
+/// [`git_carry::parents::CreatedParents`]. Per item and source, never per
+/// capture: a parent made once is not made again.
+#[must_use]
+pub fn parents_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.parents",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
 }
 
 // The apply journal for one item, source and capture digest. Its presence

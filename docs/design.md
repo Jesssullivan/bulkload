@@ -807,6 +807,24 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   were; the import then runs under the destination lock. `estate-diff`
   runs the same checks and says `ignore-policy-conflict` or
   `parent-missing` (dogfood of 2026-10-16, F1 and F2).
+- **Absent parents are made (M2 finding 1, 2026-10-16).** A first
+  landing (standalone, linked or bare) whose parent does not exist no
+  longer refuses: `estate-apply` makes each absent level, mode 0755
+  exactly, as its first write (after every refusal it can decide without
+  one), syncs it with its parent, and only then appends it to the item's
+  `{item}-{blake3(SOURCE)}.parents` record in STATE and counts it in the
+  receipt (`parent-created=<n>`). Levels are made only inside a real
+  directory: the nearest existing ancestor is opened `O_NOFOLLOW` and each
+  level is made with `mkdirat` and opened the same way, so a symlink there
+  (or one swapped in meanwhile) or a non-directory keeps
+  `GIT_DESTINATION_PARENT_MISSING`, and nothing is made where a link
+  points; symlinks above that ancestor are the operator's layout and
+  resolve as an existing parent does. A crash after the levels are made
+  and before the record leaves empty 0755 directories no record names
+  (`estate.apply.parents_made`); the rerun lands into them. The CLI
+  restore verbs keep the refusal. `estate-diff` says `landing` (or
+  `bare-landing`) with the component `parents=<n>`, and `parent-missing`
+  only where the policy refuses.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads
