@@ -183,8 +183,9 @@ Adopted from lab `LAB-FEDERATED-EFFICIENCY-20261001`, by operator direction on
   repos they create and destroy (R-N98).
 - Each lane builds with its own `CARGO_TARGET_DIR`. A shared target
   directory lets one lane test another lane's binaries.
-- Local cargo builds on neo carry the inline
-  `TINYLAND_ALLOW_LOCAL_BUILD="<lane> (R-N69)"` prefix as the first token.
+- No builds or tests on neo (OI-1003-Q196, 2026-10-16; it retires R-N69
+  and upholds FOOT-03 and FOOT-10). Linux gates run on sting; Darwin checks
+  (`just darwin-check`) run on pzm.
 - A gated benchmark sample is recorded only on AC power with a 1-minute
   load under 2.5. Every sample row records power and load (R-N81). The
   coordinator holds the other lanes quiet while gated samples run (R-N91).
@@ -208,8 +209,44 @@ no longer true (R-N55).
 
 ## Validation
 
+Merge gate (OI-1003-Q199, 2026-10-16, Linear TIN-4543 comment `b208cbae`):
+a PR merges on a local receipt from sting, not on runner CI.
+`just local-gate-receipt --pr N --post` (`scripts/local-gate-receipt.sh`)
+runs, from the repository root, exactly what the CI action runs:
+`nix flake check --no-build --no-write-lock-file`, then
+`nix develop --no-write-lock-file --ignore-environment` keeping only CI's
+`HOME`, `NIX_*_HOME` and `XDG_*_HOME`, running `just local-gate`
+(`check-fast`, the history secret scan limited to HEAD's ancestry
+`secrets-scan-head`, and the Bazel graph load `bazel-graph`; the contract
+test holds it to CI's gate set and derives the `nix develop` line from the
+action). Ambient `BULKLOAD_*`, `RUSTFLAGS`, `CARGO_*` and `PATH` never reach
+the gate. It refuses a dirty tree and an overlay (an ignored or excluded
+file other than build output, such as `.envrc.local` or `.env.local`; a
+skip-worktree or assume-unchanged file; a cargo config above the checkout
+or in `~/.cargo`) unless `--allow-overlay` is given, which the receipt
+records. The receipt line leads with PASS or FAIL and records head, tree,
+main, the flake.lock and log digests, the exit code, the kind and the
+overlay; `--post` comments a PASS as "Local gate receipt" and a FAIL only
+as "Local gate FAILED", never as a receipt. The kind comes from the diff:
+docs when every changed path is Markdown, else code; `--kind` may raise
+docs to code, never lower it. Docs PRs need the receipt only; code PRs also
+need the lanes' adversarial review (OI-1003-Q173).
+A receipt is valid only while receipt.head is the PR head and receipt.main
+is main's current tip: a push to the PR or any merge to main voids it.
+Right before `gh pr merge --match-head-commit`, the merge runs
+`just local-gate-verify --pr N`, which checks both against GitHub, the
+receipt's tree against the head's, and that the newest gate comment from a
+writer for that head and main is a PASS. A PR that `just darwin-touched`
+flags (a Darwin path, the io layer, a Rust file with any `target_os`,
+`target_vendor`, `target_family`, `cfg!(` or unix/windows cfg, `build.rs`,
+`.cargo/`, `Cargo.*`, the toolchain or `flake.*`) also needs
+`just darwin-check` on pzm, never neo (OI-1003-Q196); while pzm is on hold
+that check is deferred and recorded with the receipt. CI runs only on `v*`
+tags and `workflow_dispatch`, as the backstop. The local gate retires when
+GloriousFlywheel v4 fabric check runs land (TIN-5946).
+
 Local first (OI-1001-Q2, 2026-10-01): run `just check-fast` (the mandatory
-tier: every ratified-contract guard, and what PR CI runs) inside
+tier: every ratified-contract guard, and the core of the merge gate) inside
 `nix develop` before pushing; GloriousFlywheel CI is a contended backstop,
 not the first signal. `just check-optional` runs the optional tier
 (bench-script stubs, the estate corpus self-test, the history secret scan,
@@ -247,14 +284,17 @@ streamed new path keeps it too. CI remains on GloriousFlywheel tinyland-nix; kee
 or its composite action requires updating the pinned digests in
 `scripts/ci-public-read-guard.sh`, the action and `tests/test_ci_contract.py`.
 CI note (R-N122): the W7 fault harness (`just fault-harness`) runs as its own
-`fault-harness` terminal gate, parallel to `source`. PR CI runs exactly
+`fault-harness` terminal gate, parallel to `source`. CI runs exactly
 those two gates: OI-1003-Q65 (2026-10-06) dropped the Bazel `build` and
 `test` gates. They built the docs filegroup `//:bulkload` and ran the two
 Python contract tests (`//:tests`); neither compiled Rust. `ci-source` now
-runs those tests directly (`contract-test`). Residual gap: no PR loads the
-Bazel graph (bzlmod and `rules_python` resolution, the `//:bulkload` globs,
-the `//:tests` sandbox). `just test-local` (in `check-optional`) runs only
-`//:tests`; `just check` and `just ci` run both targets; none is a PR gate.
+runs those tests directly (`contract-test`). The Q65 residual gap (no PR
+loaded the Bazel graph) is closed by `bazel-graph` in `local-gate`
+(OI-1003-Q199): a query that resolves bzlmod against `MODULE.bazel.lock` and
+loads `rules_python`, the `//:bulkload` globs and `//:tests`; nothing is
+built, so the `//:tests` sandbox is not exercised. `just test-local` (in
+`check-optional`) runs `//:tests`; `just check` and `just ci` run both
+targets.
 The contract test pins `MODULE.bazel` and checks that `ci_contract_test`
 data lists every file it reads. Changing the workflow updates
 `WORKFLOW_SHA256` in `tests/test_ci_contract.py`.

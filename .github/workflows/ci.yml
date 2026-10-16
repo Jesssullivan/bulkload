@@ -3,10 +3,7 @@ name: CI
 on:
   push:
     tags: ["v*"]
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-  merge_group:
-    types: [checks_requested]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -18,7 +15,6 @@ concurrency:
 jobs:
   test:
     name: ${{ matrix.gate }} terminal gate
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}
     runs-on: tinyland-nix
     timeout-minutes: 25
     strategy:
@@ -69,7 +65,7 @@ jobs:
           SSL_CERT_DIR: ""
           SSLKEYLOGFILE: ""
           BULKLOAD_CHECKOUT_TOKEN: ${{ github.token }}
-          BULKLOAD_EXPECTED_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+          BULKLOAD_EXPECTED_SHA: ${{ github.sha }}
           BULKLOAD_REPOSITORY: ${{ github.repository }}
           BULKLOAD_SERVER_URL: ${{ github.server_url }}
         run: |
@@ -234,8 +230,8 @@ jobs:
         with:
           gate: ${{ matrix.gate }}
           event-name: ${{ github.event_name }}
-          expected-sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+          expected-sha: ${{ github.sha }}
           ref: ${{ github.ref }}
           repository: ${{ github.repository }}
-          head-repository: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name || github.repository }}
+          head-repository: ${{ github.repository }}
           upload-bazel-results: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
