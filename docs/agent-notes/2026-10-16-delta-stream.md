@@ -227,8 +227,17 @@ Two independent reviews of the first build (`80f03d8`, rebased onto
 
 - Operator: rule whether handed bytes count as wire bytes for WP0(c)
   inequality 2 (section 2). Until then the lever is A/B only.
-- Coordinator: an informational `r23_ab.py --under-load` series with
-  `BULKLOAD_LOCAL_NEW_PATH_STREAM=1` for B (Q143), then carry this to
-  TIN-4543. The bench's per-sample counters carry the two new counters.
+- Coordinator: carry the informational series to TIN-4543. The series
+  ran on 2026-10-16 (`docs/evidence/r23-2026-10-16-mbp-13-s1delta-underload.md`):
+  B `19e4b36`, five rounds, with the arm order alternating each round.
+  - Delta copy: the median of the round medians is 0.802x plain rclone
+    with stream on, against 1.179x with it off. That is at Q143's 0.90x
+    margin. Stream on was faster in every paired round, by 34 to 48 ms,
+    and first data fell from 52.4 ms to 1.1 ms.
+  - Initial copy (fold on, stream on): 1.231x, not at the margin. The
+    lever does not act on it.
+  - Counters, per delta copy: with the lever on, `transfer_manifests_asked`
+    is 0 and `transfer_new_paths_streamed` is 1. With it off, they are 1
+    and 0.
 - Independent review before merge (OI-1003-Q173). Darwin: no Darwin code
   changed; `just darwin-check` was not run.
