@@ -1027,6 +1027,83 @@ Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
   `a_stash_message_is_part_of_the_key_and_the_capture`, and the stash
   table, decode and store rows in `native_refs/tests.rs`.
 
+## Amendment 2026-10-15 (#226): bulkload lands into the live tree (OI-1003-Q171, Q172)
+
+The ruling is OI-1003-Q171/Q172 (Linear TIN-4543, quoted from the
+workflow's task text): bulkload is the interim flagship data mover, ahead
+of tcfs. #226 lists what the GFTB resume needed a hand script for. No SLO
+number changes. These are proof-status lines and the contract's new
+surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`.
+
+- **`--adopt` is built** (it supersedes the last line of the
+  OI-1003-Q144/Q149 amendment above: "`--adopt` is not built,
+  OI-1003-Q145"). It is explicit per run and never inferred.
+  - An existing checkout bulkload never landed becomes bulkload's when it
+    proves equal to its capture, by content: HEAD, the index entries, the
+    exclude and every carried seat. Nothing is moved. Ledgers are written
+    in place, absent carried refs are created and equal ones adopted, and
+    differing and destination-only refs and worktrees stay native.
+  - A checkout that differs refuses the new typed code
+    `GIT_DESTINATION_DIVERGED` with nothing written. An unrelated
+    repository refuses `GIT_DESTINATION_OCCUPIED`.
+  - **S4:** both are typed and pending review. `closure-dispose --policy
+    GIT_DESTINATION_DIVERGED accept` is the standing accept. A crashed
+    adoption is `journal-missing` until its rerun finishes it.
+  - **S3:** the adopt proof reads each carried destination seat once
+    (`read_dest_verify_existing_bytes`). An unchanged rerun is the journal
+    no-op and reads 0 bytes. The adopted prints then prove later converges
+    by print.
+  - **S2:** the source is never read.
+- **`estate-diff`** reports a plan against the destination, read-only, in
+  the apply's own terms (P94).
+- **A bare capture into an absent path lands natively** (#226 item 4).
+- **`--activate-origin PREFIX`** activates a named scp-style or `ssh://`
+  origin at a first landing (#226 item 6). The #216 default is unchanged:
+  only HTTPS origins are active, and a local path never.
+- **Rebuildable omissions are counted** (#226 item 5). Closure is
+  `bulkload.closure.v4`: an `omissions` block names every omitted root
+  with its entries and bytes, and a capture from before the sidecar shows
+  `unknown`, never zero. "Equals the source" is exact except for those
+  counted roots.
+- **Proof.** The GFTB acceptance row P90 (`tests/estate_adopt.rs`) goes
+  from a live tree and a source to a converged live tree with bulkload
+  verbs only. Then an unchanged rerun reads 0 bytes, and a source change
+  converges in place. The other rows:
+  - P91 to P95;
+  - the `estate.adopt.*` fault-harness rows;
+  - EstateConverge's `Adopt` rows, with the invariants
+    `AdoptClaimsOnlyEqual` and `ForeignRefsUnowned` and four mutation
+    rows (`docs/formal/README.md`, "#226").
+- **Decisions this lane took on the design's open questions** are in the
+  note's section 11. They are not operator rulings. Each is conservative
+  and reversible:
+  - adopt without asides meets #226;
+  - adopt recreates refs the destination deleted, shown first by
+    `estate-diff`;
+  - no older-capture baseline;
+  - a bare landing takes the standalone origin rule;
+  - the origin prefix is a run flag;
+  - the existing `--policy` is the standing accept.
+- **Not built:** `--protect TAG` (rename-aside for items adopt refuses)
+  and `EstateProtect.tla`.
+- **Review of 2026-10-16** (twelve findings; the design note's section
+  13). No SLO number changes. S4: what `--adopt` now refuses
+  `GIT_DESTINATION_OCCUPIED`, typed and pending review, with nothing
+  written:
+  - a destination spelled through a symlink, a checkout of another
+    repository than the plan's, a linked worktree whose admin directory
+    names another path (P97, P98, P100, P102);
+  - a re-key whose capture is not the landed tree's or whose ledger names
+    an item of the same plan (P99);
+  - a refs-only item into an unrelated repository, after the provenance
+    import (P101; it was counted applied);
+  - a ledger another apply wrote while the adoption waited for the lock.
+
+  The adopt proof's racy instant is taken before its first read. The
+  model's adoption decisions are ghosts (`AdoptKept` excuses only what the
+  ref step left), T0 is reached, and four mutation rows bite
+  (`docs/formal/README.md`, "#226").
+
 ## Priority (OI-1003-Q4)
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and

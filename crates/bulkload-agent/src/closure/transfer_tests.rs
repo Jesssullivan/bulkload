@@ -123,7 +123,7 @@ fn a_transfer_session_joins_the_gate_row_by_row() {
     );
     let json = report.to_json();
     assert!(
-        json.contains("\"schema\":\"bulkload.closure.v3\"")
+        json.contains("\"schema\":\"bulkload.closure.v4\"")
             && json.contains("\"transfer_rows\":7")
             && json.contains("\"ruled_default\":2"),
         "{json}"

@@ -149,7 +149,7 @@ let opKindTable =
       , wtwork = OpKind.wtwork
       }
 
-let Refusal = < MODIFIED | OCCUPIED | STALE | INTERRUPTED | UNTYPED >
+let Refusal = < MODIFIED | OCCUPIED | STALE | INTERRUPTED | UNTYPED | DIVERGED >
 
 let refusalTable =
       { MODIFIED = Refusal.MODIFIED
@@ -157,6 +157,7 @@ let refusalTable =
       , STALE = Refusal.STALE
       , INTERRUPTED = Refusal.INTERRUPTED
       , UNTYPED = Refusal.UNTYPED
+      , DIVERGED = Refusal.DIVERGED
       }
 
 -- Each table holds exactly its union's labels (a total merge).
@@ -216,6 +217,14 @@ let Mutation =
       | recovery_overwrites
       | drift_key_reused
       | drift_applied
+      | adopt_without_proof
+      | adopt_ref_unequal
+      | adopt_untyped
+      | adopt_ledger_before_refs
+      | adopt_r1_no_row
+      | adopt_r2_not_adopted
+      | adopt_no_recheck
+      | adopt_t0_no_row
       >
 
 let mutationIndex =
@@ -266,6 +275,14 @@ let mutationIndex =
           , recovery_overwrites = 42
           , drift_key_reused = 43
           , drift_applied = 44
+          , adopt_without_proof = 45
+          , adopt_ref_unequal = 46
+          , adopt_untyped = 47
+          , adopt_ledger_before_refs = 48
+          , adopt_r1_no_row = 49
+          , adopt_r2_not_adopted = 50
+          , adopt_no_recheck = 51
+          , adopt_t0_no_row = 52
           }
           m
 
@@ -279,6 +296,8 @@ let Property =
       | CrashAtomicity
       | OneCheckout
       | NoDriftedLanding
+      | AdoptClaimsOnlyEqual
+      | ForeignRefsUnowned
       | WithinBudget
       | ConvergesWhenQuiet
       | NoWedge
@@ -321,18 +340,28 @@ let propertyTable =
         , index = 7
         , class = T.PropertyClass.safety
         }
+      , AdoptClaimsOnlyEqual =
+        { property = Property.AdoptClaimsOnlyEqual
+        , index = 8
+        , class = T.PropertyClass.safety
+        }
+      , ForeignRefsUnowned =
+        { property = Property.ForeignRefsUnowned
+        , index = 9
+        , class = T.PropertyClass.safety
+        }
       , WithinBudget =
         { property = Property.WithinBudget
-        , index = 8
+        , index = 10
         , class = T.PropertyClass.budget
         }
       , ConvergesWhenQuiet =
         { property = Property.ConvergesWhenQuiet
-        , index = 9
+        , index = 11
         , class = T.PropertyClass.temporal
         }
       , NoWedge =
-        { property = Property.NoWedge, index = 10, class = T.PropertyClass.temporal }
+        { property = Property.NoWedge, index = 12, class = T.PropertyClass.temporal }
       }
 
 let propertyIndex = \(p : Property) -> (merge propertyTable p).index
@@ -363,6 +392,7 @@ let Witness =
       | Witness_CapturedNotLanded
       | Witness_DriftCarried
       | Witness_KeyDriftLanded
+      | Witness_AdoptedConverged
       >
 
 let witnessTable =
@@ -371,6 +401,7 @@ let witnessTable =
       , Witness_CapturedNotLanded = Witness.Witness_CapturedNotLanded
       , Witness_DriftCarried = Witness.Witness_DriftCarried
       , Witness_KeyDriftLanded = Witness.Witness_KeyDriftLanded
+      , Witness_AdoptedConverged = Witness.Witness_AdoptedConverged
       }
 
 -- The 51 actions of EstateConverge.tla's Next, in the sorted order of the never column.
@@ -677,6 +708,7 @@ let Constants =
       , RacyEdits : Bool
       , ChildCrash : Bool
       , Landed : Bool
+      , Adopt : Bool
       , Mutation : Optional Mutation
       , BudgetSeconds : Natural
       }
@@ -720,6 +752,7 @@ let constantLines =
             , { name = "RacyEdits", pad = "    ", value = showBool c.RacyEdits }
             , { name = "ChildCrash", pad = "   ", value = showBool c.ChildCrash }
             , { name = "Landed", pad = "       ", value = showBool c.Landed }
+            , { name = "Adopt", pad = "        ", value = showBool c.Adopt }
             , { name = "Mutation", pad = "     ", value = "\"${mutation}\"" }
             , { name = "BudgetSeconds", pad = "", value = Natural/show c.BudgetSeconds }
             ]
@@ -743,6 +776,7 @@ let defaults
       , RacyEdits = False
       , ChildCrash = False
       , Landed = True
+      , Adopt = False
       , Mutation = None Mutation
       , BudgetSeconds = 1800
       }
@@ -1182,6 +1216,88 @@ let racedStashBack =
 let stashCrash =
       defaults // { SrcKinds = [ SrcKind.stash ], MaxSrc = 1, MaxCrashes = 1 }
 
+{- #226 (estate adopt, OI-1003-Q171/Q172, 2026-10-15): the run starts from
+   a destination bulkload never landed (Adopt), its main checkout present,
+   every component the first capture's or the operator's, and the main is
+   adopted in place by proof. Refs of every class the R1, R2, R3 and R10
+   rows meet, a seat and the index; the source moves after the copy (a
+   capture the destination no longer equals refuses DIVERGED) or after the
+   adoption (a converge in place); a crash at any step.
+-}
+let adopt =
+          defaults
+      //  { Refs = [ Ref.main, Ref.foo, Ref.t ]
+          , Paths = [ Path.d ]
+          , IndexOn = True
+          , SrcKinds = [ SrcKind.move, SrcKind.seat ]
+          , MaxSrc = 1
+          , MaxCrashes = 1
+          , Landed = False
+          , Adopt = True
+          }
+
+{- #226: the GFTB shape of a neo-only worktree: the main adopted, its
+   linked worktree (absent at the destination) first-landed into the
+   adopted repository; the destination's HEAD on dev makes it land
+   detached.
+-}
+let adoptLinked =
+          defaults
+      //  { Items = [ Item.main, Item.wt ]
+          , Refs = [ Ref.main, Ref.dev ]
+          , SrcKinds = [ SrcKind.move ]
+          , MaxSrc = 1
+          , MaxCrashes = 1
+          , Landed = False
+          , Adopt = True
+          }
+
+{- #226: operator edits of a seat, the HEAD branch and the index while the
+   adoption is in flight, and a crash. One ref: a create in flight under a
+   concurrent ref edit is the stated limit of the in-flight ghost for refs
+   (README, "What EstateConverge does not prove").
+-}
+let adoptOp =
+          defaults
+      //  { Refs = [ Ref.main ]
+          , Paths = [ Path.d ]
+          , IndexOn = True
+          , SrcKinds = [ SrcKind.seat ]
+          , OpKinds = [ OpKind.seat, OpKind.ref, OpKind.index ]
+          , MaxSrc = 1
+          , MaxOp = 1
+          , MaxCrashes = 1
+          , OpConcurrent = True
+          , Landed = False
+          , Adopt = True
+          }
+
+-- #226: liveness of an adoption and the converge after it.
+let adoptLive =
+          defaults
+      //  { Refs = [ Ref.main, Ref.foo ]
+          , Paths = [ Path.d ]
+          , SrcKinds = [ SrcKind.move, SrcKind.seat ]
+          , MaxSrc = 1
+          , MaxCrashes = 1
+          , Landed = False
+          , Adopt = True
+          }
+
+{- #226 (review of 2026-10-16, finding 10): the source holds a stash at
+   the copy (with "stash" in SrcKinds under Adopt), the destination's
+   reflog empty (T1), the operator's (T2) or equal to it (T0, adopted with
+   no write); the source then pushes or drops one; a crash.
+-}
+let adoptStash =
+          defaults
+      //  { SrcKinds = [ SrcKind.stash ]
+          , MaxSrc = 1
+          , MaxCrashes = 1
+          , Landed = False
+          , Adopt = True
+          }
+
 -- Properties -------------------------------------------------------------------------
 
 let safety = filter Property isSafety allProperties
@@ -1240,6 +1356,14 @@ let verdict
           , recovery_overwrites = Property.NoLocalWorkLost
           , drift_key_reused = Property.ConvergesWhenQuiet
           , drift_applied = Property.NoDriftedLanding
+          , adopt_without_proof = Property.AdoptClaimsOnlyEqual
+          , adopt_ref_unequal = Property.ForeignRefsUnowned
+          , adopt_untyped = Property.TypedRefusal
+          , adopt_ledger_before_refs = Property.ConvergesWhenQuiet
+          , adopt_r1_no_row = Property.ConvergesWhenQuiet
+          , adopt_r2_not_adopted = Property.ConvergesWhenQuiet
+          , adopt_no_recheck = Property.AdoptClaimsOnlyEqual
+          , adopt_t0_no_row = Property.ConvergesWhenQuiet
           }
           m
 
@@ -1721,6 +1845,61 @@ let positives =
               ]
               racedStash
           )
+      , row
+          "MC_ec_adopt"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          [ "#226 (estate adopt, OI-1003-Q171/Q172): a destination bulkload never"
+          , "landed, each component the first capture's or the operator's: the"
+          , "main adopted in place by content (DIVERGED with nothing written when"
+          , "it differs, AdoptClaimsOnlyEqual), R1 creates, R2 adopts, R3 and R10"
+          , "keep (ForeignRefsUnowned); the source moves before or after the"
+          , "adoption, and a crash at any step."
+          ]
+          adopt
+      , row
+          "MC_ec_adopt_linked"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstLandMain, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpWtWork, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+          [ "#226: the main adopted, its linked worktree (absent at the"
+          , "destination: neo-only) first-landed into the adopted repository;"
+          , "the destination's HEAD on dev lands it detached; a crash."
+          ]
+          adoptLinked
+      , row
+          "MC_ec_adopt_op"
+          (pass [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.OpHead, Action.OpLock, Action.OpRacy, Action.OpRestore, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.RefFinish, Action.RefLedger, Action.RefStash, Action.RefTxnDeletes, Action.RefTxnWrites, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+          [ "#226: operator edits of a seat, the HEAD branch and the index while"
+          , "the adoption is in flight, and a crash: the proof is rechecked under"
+          , "the lock, the ledger records the proof's prints, so an edit after"
+          , "them refuses MODIFIED at the next converge, and the operator's ref"
+          , "is never owned."
+          ]
+          adoptOp
+      , liveRow
+          ( row
+              "MC_ec_adopt_live"
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRacy, Action.OpRef, Action.OpRestore, Action.OpSeat, Action.OpStash, Action.OpTouch, Action.OpUntracked, Action.OpWtWork, Action.SrcCreate, Action.SrcDelete, Action.SrcRename, Action.SrcStage, Action.SrcStashDrop, Action.SrcStashPush, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree ])
+              [ "#226: liveness of an adoption and the converge after it, with the"
+              , "stated exceptions AdoptBehind (no older-capture baseline) and"
+              , "AdoptKept (a ref R3 or R10 left at adoption stays the"
+              , "destination's: the ghost of what its ref step left, review of"
+              , "2026-10-16)."
+              ]
+              adoptLive
+          )
+      , liveRow
+          ( row
+              "MC_ec_adopt_stash"
+              (passLive [ Action.ChildCrashHead, Action.ChildCrashTxn, Action.FirstAddWt, Action.FirstLandMain, Action.FirstLedgerWt, Action.FirstPlanWt, Action.FirstStepWt, Action.IndexPublish, Action.OpHead, Action.OpIndex, Action.OpLock, Action.OpRef, Action.OpRestore, Action.OpStash, Action.OpWtWork, Action.ProbeExchange, Action.SeatVerify, Action.SrcCreate, Action.SrcDelete, Action.SrcMove, Action.SrcRename, Action.SrcStage, Action.SrcSwitch, Action.SrcTypeChange, Action.SrcWorktree, Action.Tick ])
+              [ "#226 (review of 2026-10-16, finding 10): the source holds a stash at"
+              , "the copy; the destination's reflog is empty (T1), the operator's"
+              , "(T2) or equal to it (T0, adopted with no write); the source pushes"
+              , "or drops one before or after the adoption; a crash. Liveness with"
+              , "the stated exception AdoptStashKept (a reflog T2 kept, or one a"
+              , "capture carrying none left, stays the destination's, as AdoptKept"
+              , "for refs)."
+              ]
+              adoptStash
+          )
       ]
 
 -- Reachability witnesses: expected REACHED.
@@ -1770,6 +1949,14 @@ let witnesses =
           , "converge that journals a later capture."
           ]
           racedStashBack
+      , row
+          "MC_ec_reach_adopted_converged"
+          (Expect.reach Witness.Witness_AdoptedConverged)
+          [ "REACH (expected REACHED): #226: an adopted main converges in place to"
+          , "a later capture: its journal holds the adoption's capture and the"
+          , "converge's."
+          ]
+          adopt
       ]
 
 {- Documented limits of the code on feat/estate-converge-20261008 (the
@@ -2338,6 +2525,98 @@ let primary =
             ]
           }
         }
+      , adopt_without_proof =
+        { mutation = Mutation.adopt_without_proof
+        , constants =
+                defaults
+            //  { Paths = [ Path.d ], IndexOn = True, Landed = False, Adopt = True }
+        , comment =
+          { head = "#226: the adoption writes its ledger from the destination as"
+          , tail =
+            [ "found, with no proof, so the ledger claims the operator's seat,"
+            , "index or HEAD as bulkload's."
+            ]
+          }
+        }
+      , adopt_ref_unequal =
+        { mutation = Mutation.adopt_ref_unequal
+        , constants =
+                defaults
+            //  { Refs = [ Ref.main, Ref.foo ], Landed = False, Adopt = True }
+        , comment =
+            line "#226: R2 adopts a destination ref whose value is not the carried one."
+        }
+      , adopt_untyped =
+        { mutation = Mutation.adopt_untyped
+        , constants =
+            defaults // { Paths = [ Path.d ], Landed = False, Adopt = True }
+        , comment =
+            line "#226: a destination that differs refuses with no converge code."
+        }
+      , adopt_ledger_before_refs =
+        { mutation = Mutation.adopt_ledger_before_refs
+        , constants =
+                defaults
+            //  { Refs = [ Ref.main, Ref.foo ]
+                , MaxCrashes = 1
+                , Landed = False
+                , Adopt = True
+                }
+        , comment =
+          { head = "#226: the adoption writes the workspace ledger before its ref"
+          , tail =
+            [ "step; a crash between leaves a ledger whose rerun is A6, so the"
+            , "carried refs the destination lacks are never created while the"
+            , "source holds still."
+            ]
+          }
+        }
+      , adopt_r1_no_row =
+        { mutation = Mutation.adopt_r1_no_row
+        , constants = adoptLive
+        , comment =
+          { head = "#226 (review of 2026-10-16, finding 6): R1 creates a carried ref"
+          , tail =
+            [ "the destination lacks and writes no ledger row, so the ref never"
+            , "follows the source; AdoptKept excuses only the refs the adoption"
+            , "left (R3, R10), never this one."
+            ]
+          }
+        }
+      , adopt_r2_not_adopted =
+        { mutation = Mutation.adopt_r2_not_adopted
+        , constants = adoptLive
+        , comment =
+          { head = "#226 (review of 2026-10-16, finding 6): a destination ref equal to"
+          , tail =
+            [ "the carried one gets no ledger row (R2 lost), so it never follows"
+            , "the source."
+            ]
+          }
+        }
+      , adopt_no_recheck =
+        { mutation = Mutation.adopt_no_recheck
+        , constants = adoptOp
+        , comment =
+          { head = "#226 (review of 2026-10-16, finding 9): no recheck under the lock"
+          , tail =
+            [ "(C adopt::still): an operator edit between the proof and the"
+            , "import is claimed. NoLocalWorkLost still holds (the next"
+            , "converge refuses MODIFIED), so the claim is the property."
+            ]
+          }
+        }
+      , adopt_t0_no_row =
+        { mutation = Mutation.adopt_t0_no_row
+        , constants = adoptStash
+        , comment =
+          { head = "#226 (review of 2026-10-16, finding 10): T0 adopts an equal"
+          , tail =
+            [ "destination stash reflog and writes no stash row, so the stash"
+            , "never follows the source."
+            ]
+          }
+        }
       , recovery_overwrites =
         { mutation = Mutation.recovery_overwrites
         , constants = firstLinkedCrashOp
@@ -2469,6 +2748,14 @@ let negRows
             ]
           }
         }
+      , primaryOf Mutation.adopt_without_proof
+      , primaryOf Mutation.adopt_ref_unequal
+      , primaryOf Mutation.adopt_untyped
+      , primaryOf Mutation.adopt_ledger_before_refs
+      , primaryOf Mutation.adopt_r1_no_row
+      , primaryOf Mutation.adopt_r2_not_adopted
+      , primaryOf Mutation.adopt_no_recheck
+      , primaryOf Mutation.adopt_t0_no_row
       ]
 
 let primaryPositions =
@@ -2772,6 +3059,48 @@ let invariants
           , "stash_pushed_during_capture_is_drift_custody"
           , "deleting_the_drift_sidecar_never_makes_a_drifted_capture_a_hit"
           , "a_key_only_drifted_capture_is_a_coherent_snapshot_and_applies"
+          ]
+        }
+      , { tla = Property.AdoptClaimsOnlyEqual
+        , slo = [ S.S4, S.Durability ]
+        , ruling = [ "OI-1003-Q171", "OI-1003-Q172", "OI-1003-Q144", "OI-1003-Q145" ]
+        , codeSymbol =
+          [ "prove_adoptable"
+          , "Scratch"
+          , "still"
+          , "workspace"
+          , "related_repository"
+          , "foreign_shape"
+          , "rekey_refusal"
+          ]
+        , pending = none
+        , ptest =
+          [ "P90"
+          , "P91"
+          , "P92"
+          , "P97"
+          , "P98"
+          , "P99"
+          , "P100"
+          , "the_adopt_proof_names_each_differing_component"
+          , "the_adopt_scratch_builds_the_index_a_landing_installs"
+          , "adopt_rechecks_the_proof_under_the_lock"
+          , "the_adopt_proof_refuses_a_seat_that_moved_while_it_was_read"
+          , "adopt_rechecks_under_the_lock_that_no_ledger_appeared"
+          , "a_rekey_never_takes_a_tree_from_an_item_of_the_same_plan"
+          , "the estate_adopt fault-harness rows"
+          ]
+        }
+      , { tla = Property.ForeignRefsUnowned
+        , slo = [ S.S4 ]
+        , ruling = [ "OI-1003-Q171", "OI-1003-Q172", "OI-1003-Q144" ]
+        , codeSymbol = [ "decide", "mark", "Adopted", "stash_decision", "STASH_ADOPTED" ]
+        , pending = none
+        , ptest =
+          [ "P90"
+          , "P84"
+          , "P101"
+          , "the_stash_table_adopts_an_equal_destination_reflog"
           ]
         }
       , { tla = Property.ConvergesWhenQuiet

@@ -126,6 +126,14 @@ pub enum BulkloadRefusal {
     /// item's proof failed before anything but an additive object import
     /// was written; the operator's change is never overwritten.
     GitDestinationModified,
+    /// `estate-apply --adopt` (#226, OI-1003-Q171/Q172): a destination
+    /// bulkload never landed holds the item's path, its repository is the
+    /// capture's (related), and it differs from the current capture in a
+    /// component the adopt proof covers: HEAD, the index entries, a
+    /// standalone item's `info/exclude`, or a carried seat's kind, mode or
+    /// content. Nothing is imported or written; the destination's work is
+    /// never claimed (accept keeps it, re-carry lands it elsewhere).
+    GitDestinationDiverged,
     /// Between the capture a checkout holds and the current one, the source
     /// changed what converge does not carry: the shallow frontier, nested
     /// repository custody, the omitted rebuildable roots or bareness.
@@ -347,6 +355,7 @@ impl BulkloadRefusal {
             Self::GitBareCaptureWorkspace => "GIT_BARE_CAPTURE_WORKSPACE",
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitDestinationModified => "GIT_DESTINATION_MODIFIED",
+            Self::GitDestinationDiverged => "GIT_DESTINATION_DIVERGED",
             Self::GitConvergeShapeChanged => "GIT_CONVERGE_SHAPE_CHANGED",
             Self::GitConvergeStaleCapture => "GIT_CONVERGE_STALE_CAPTURE",
             Self::GitConvergeInterrupted => "GIT_CONVERGE_INTERRUPTED",
@@ -417,6 +426,7 @@ impl BulkloadRefusal {
         "GIT_BARE_CAPTURE_WORKSPACE",
         "GIT_DESTINATION_OCCUPIED",
         "GIT_DESTINATION_MODIFIED",
+        "GIT_DESTINATION_DIVERGED",
         "GIT_CONVERGE_SHAPE_CHANGED",
         "GIT_CONVERGE_STALE_CAPTURE",
         "GIT_CONVERGE_INTERRUPTED",
@@ -646,6 +656,7 @@ mod tests {
             BulkloadRefusal::GitBareCaptureWorkspace,
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitDestinationModified,
+            BulkloadRefusal::GitDestinationDiverged,
             BulkloadRefusal::GitConvergeShapeChanged,
             BulkloadRefusal::GitConvergeStaleCapture,
             BulkloadRefusal::GitConvergeInterrupted,

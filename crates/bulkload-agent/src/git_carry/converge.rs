@@ -45,7 +45,7 @@ use super::landed::{
     self, Head, Kind, LandedRef, LandedWorkspace, RefLedger, SeatPrint, WorkspaceIntent,
 };
 use super::native_refs::{self, Custody};
-use super::{durable, git, oid, output, safe_destination, text};
+use super::{git, oid, output, safe_destination, text};
 use crate::{BulkloadRefusal, Result};
 
 /// What an item's apply knows about the capture it applies.
@@ -86,6 +86,20 @@ const ROUTINE: &[&str] = &[
 ];
 
 impl Applied {
+    /// A first landing's: its exceptional custody words only.
+    pub(super) fn first(custody: &Custody) -> Self {
+        Self::of(false, custody)
+    }
+
+    /// An adoption's (#226): every custody word, the routine ones too, so
+    /// the receipt says what adopt created and kept.
+    pub(super) fn adopted(custody: &Custody) -> Self {
+        Self {
+            converged: false,
+            custody: custody.words(),
+        }
+    }
+
     fn of(converged: bool, custody: &Custody) -> Self {
         let mut shown = custody.clone();
         if !converged {
@@ -96,6 +110,24 @@ impl Applied {
             custody: shown.words(),
         }
     }
+}
+
+/// What one apply run may do beyond the default (estate adopt, #226,
+/// OI-1003-Q171/Q172). Per run and explicit, recorded in every receipt it
+/// changes: never inferred.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Policy<'a> {
+    /// `--adopt`: an existing checkout or repository bulkload did not land
+    /// becomes bulkload's by proof (A11a, A11d), and a ledger naming
+    /// another plan's item is re-keyed after its proof when the checkout is
+    /// spelled as it is and the capture is the landed tree's (A11b).
+    pub adopt: bool,
+    /// `--activate-origin PREFIX`: a first landing activates an scp-style
+    /// or `ssh://` origin that starts with one of these (#226 item 6).
+    pub origins: &'a [String],
+    /// Every item id of the run's plan: A11b never re-keys a ledger that
+    /// names one of them (review of 2026-10-16, finding 2).
+    pub items: &'a [String],
 }
 
 /// Where an item lands.
@@ -1962,6 +1994,7 @@ pub fn apply_workspace(
     target: &Target<'_>,
     landing: &Landing<'_>,
     landed_before: bool,
+    policy: &Policy<'_>,
 ) -> Result<Applied> {
     super::destination_git_ready()?;
     let workspace = target
@@ -1981,6 +2014,7 @@ pub fn apply_workspace(
                 target.source,
                 (None, target.base),
                 landing,
+                policy.origins,
             )
         } else {
             super::restore_linked_staged_landed(
@@ -2010,6 +2044,11 @@ pub fn apply_workspace(
     let landing_intent = landed::landing_intent_path(&place.ref_dir(), &destination);
     let recovering = !landed::exists(&ledger_path)?;
     if recovering && (standalone || !landed::exists(&landing_intent)?) {
+        // A11a (#226): with `--adopt`, an existing checkout bulkload never
+        // landed becomes bulkload's when it proves equal to the capture.
+        if policy.adopt {
+            return adopt::workspace(staged, target, landing, &place);
+        }
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
     let _lock = landed::lock(&place.common, place.source)?;
@@ -2028,9 +2067,20 @@ pub fn apply_workspace(
     }
     let mut ledger: LandedWorkspace =
         landed::read(&ledger_path)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
-    // Finding 15(b): a plan edit is not a destination edit.
+    // Finding 15(b): a plan edit is not a destination edit. A11b (#226):
+    // only with `--adopt`, a ledger naming another plan's item for the same
+    // tree, spelled as it is, is re-keyed after its normal proof
+    // ([`adopt::rekey`]; review of 2026-10-16, findings 1, 2 and 8).
     if ledger.item != landing.item {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
+        adopt::rekey(
+            staged,
+            target,
+            &place,
+            (&ledger_path, &mut ledger),
+            landing,
+            policy,
+        )?;
+        custody.count("rekeyed");
     }
     let converged = landed::exists(&place.workspace_dir().join(landed::WORKSPACE_INTENT))?;
     if converged {
@@ -2465,9 +2515,22 @@ pub fn apply_refs(
     staged: &super::StagedBundle,
     target: &Target<'_>,
     landing: &Landing<'_>,
+    policy: &Policy<'_>,
 ) -> Result<Applied> {
     super::destination_git_ready()?;
     let repo = target.repository;
+    // A11c (#226 item 4): a bare capture into a path that does not exist
+    // lands a bare repository bulkload makes itself, native refs and all.
+    if staged.is_bare() && lstat(repo)?.is_none() {
+        return super::land_bare_staged(
+            staged,
+            repo,
+            target.source,
+            target.base,
+            landing,
+            policy.origins,
+        );
+    }
     // S4 (#183): a destination that is missing, or a directory Git finds no
     // repository in, refuses `GIT_REPOSITORY_NOT_AT_PATH` before the ledger
     // lookup asks Git for its common directory.
@@ -2477,7 +2540,12 @@ pub fn apply_refs(
     let created = landed::read::<RefLedger>(&ref_dir.join(landed::REFS_LANDED))?
         .is_some_and(|ledger| ledger.created);
     if !created {
-        super::import_verified(repo, staged.path(), target.source)?;
+        let (_, instance) = super::import_verified_instance(repo, staged.path(), target.source)?;
+        // A11d (#226): with `--adopt`, a repository bulkload did not create
+        // takes native refs when it is the capture's (or empty).
+        if policy.adopt {
+            return adopt::repository(repo, &common, target.source, &instance, landing);
+        }
         return Ok(Applied::default());
     }
     let _lock = landed::lock(&common, target.source)?;
@@ -2628,11 +2696,7 @@ pub(super) fn land_standalone_refs(
         )?;
     }
     match &plan.head.symbolic {
-        Some(branch) => {
-            let mut command = git(work);
-            durable(&mut command);
-            output(command.args(["symbolic-ref", "HEAD", branch])).map(drop)?;
-        }
+        Some(branch) => super::set_symbolic_head(work, branch)?,
         None => native_refs::update_refs(
             work,
             None,
@@ -2799,6 +2863,9 @@ pub(super) fn finish_landing(
     }
     Ok(Applied::of(false, &custody))
 }
+
+mod adopt;
+pub mod diff;
 
 #[cfg(test)]
 mod tests;

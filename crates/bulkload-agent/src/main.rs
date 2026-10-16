@@ -60,14 +60,44 @@ SUBCOMMANDS:
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply PLAN CORPUS PRIVATE_STATE SOURCE JOBS
-                Import refs and restore only explicitly selected absent workspaces
+    estate-apply [--adopt] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+                Import refs and restore only explicitly selected absent workspaces.
+                A landed checkout bulkload proves unchanged converges to the
+                current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
+                checkout bulkload never landed becomes bulkload's when it proves
+                equal to the capture (HEAD, index entries, a standalone item's
+                exclude, every carried seat's kind, mode and bytes), with nothing
+                moved: ledgers written in place, absent carried refs created,
+                equal ones adopted, differing and destination-only ones kept; a
+                checkout that differs refuses GIT_DESTINATION_DIVERGED; one in
+                an unrelated or another repository, spelled through a symlink,
+                or a linked worktree whose admin directory names another path
+                refuses GIT_DESTINATION_OCCUPIED, all with nothing written. A
+                refs-only item's related or empty repository is adopted the same
+                way (an unrelated one refuses GIT_DESTINATION_OCCUPIED after the
+                provenance import), and a ledger naming another plan's item is
+                re-keyed after its proof when the capture is the landed tree's
+                (equal, or its HEAD descends from the ledger's). A bare capture into an absent path
+                lands a bare repository bulkload makes (with or without
+                --adopt). --activate-origin PREFIX (repeatable): a first landing
+                activates an scp-style or ssh:// origin starting with PREFIX
+                (never a local path); otherwise only HTTPS origins are active
+    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+                Read-only: classify each plan item against the destination now
+                (identical, source-only, source-ahead, dest-ahead, diverged with a
+                ledger; differs with a hint without one), with what estate-apply
+                and --adopt do there, the components that differ, per-ref rows,
+                destination work since NS (ns since the epoch), counted
+                rebuildable omissions and the origin a first landing activates;
+                plus worktrees of planned repositories no item plans and, with
+                --scan, Git directories under DIR in no planned family
+                (dest-only). One bulkload.estate-diff.v1 JSON line per row
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
                 are mapped) and journals (later directories override earlier
                 outcome records), with SOURCE the label estate-apply was
-                given. Prints a bulkload.closure.v3 JSON ledger: every planned
+                given. Prints a bulkload.closure.v4 JSON ledger: every planned
                 item is applied (workspace, exact current-capture journal),
                 refused-pending-review (typed code; a bare IO or FRAME_CODEC
                 is not typed, nor is a code retired from the taxonomy),
@@ -389,7 +419,7 @@ fn main() -> ExitCode {
         }
         Some(
             name @ ("estate-add" | "estate-add-batch" | "estate-show" | "estate-capture"
-            | "estate-apply"),
+            | "estate-apply" | "estate-diff"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
@@ -993,7 +1023,7 @@ fn attach_payload_command(args: &[std::ffi::OsString]) -> Result<()> {
 }
 
 // Escaped paths are intentional: receipts must not permit embedded newlines.
-#[allow(clippy::unnecessary_debug_formatting)]
+#[allow(clippy::unnecessary_debug_formatting, clippy::too_many_lines)]
 fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
     use bulkload_agent::estate;
     let path = |i| {
@@ -1079,15 +1109,112 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                 .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
             estate::capture_with_policy(path(0)?, path(1)?, path(2)?, jobs, policy, &receipt)
         }
-        "estate-apply" if args.len() == 5 => {
-            let source = args
+        "estate-apply" => {
+            let (options, rest) = estate_options(args)?;
+            if rest.len() != 5 || options.since.is_some() || !options.scan.is_empty() {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            }
+            let path = |i: usize| -> Result<&Path> {
+                rest.get(i)
+                    .map(Path::new)
+                    .ok_or(BulkloadRefusal::RequiredFieldMissing)
+            };
+            let source = rest
                 .get(3)
                 .and_then(|arg| arg.to_str())
                 .ok_or(BulkloadRefusal::FieldDomainViolation)?;
-            estate::apply(path(0)?, path(1)?, path(2)?, source, jobs()?, &receipt)
+            estate::apply_with(
+                path(0)?,
+                path(1)?,
+                path(2)?,
+                source,
+                jobs()?,
+                &estate::ApplyOptions {
+                    adopt: options.adopt,
+                    activate_origin: options.activate_origin,
+                },
+                &receipt,
+            )
+        }
+        "estate-diff" => {
+            let (options, rest) = estate_options(args)?;
+            if rest.len() < 4 || options.adopt {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            }
+            let source = rest
+                .get(2)
+                .and_then(|arg| arg.to_str())
+                .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+            let states: Vec<PathBuf> = rest.iter().skip(3).map(PathBuf::from).collect();
+            let mut output = std::io::stdout().lock();
+            estate::diff(
+                Path::new(rest.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?),
+                Path::new(rest.get(1).ok_or(BulkloadRefusal::RequiredFieldMissing)?),
+                source,
+                &states,
+                &estate::DiffOptions {
+                    since: options.since,
+                    scan: options.scan,
+                    activate_origin: options.activate_origin,
+                },
+                &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
+            )
+            .map(drop)?;
+            output.flush().refuse_at("main::estate_command")
         }
         _ => Err(BulkloadRefusal::RequiredFieldMissing),
     }
+}
+
+/// The options `estate-apply` and `estate-diff` take before their
+/// positional arguments (#226).
+#[derive(Default)]
+struct EstateOptions {
+    adopt: bool,
+    activate_origin: Vec<String>,
+    since: Option<i128>,
+    scan: Vec<PathBuf>,
+}
+
+fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::ffi::OsString])> {
+    let mut options = EstateOptions::default();
+    let mut at = 0;
+    let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        match arg {
+            "--adopt" if !options.adopt => {
+                options.adopt = true;
+                at += 1;
+            }
+            "--activate-origin" => {
+                let prefix = value(at + 1)?
+                    .to_str()
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                if !bulkload_agent::git_carry::origin_prefix_allowed(prefix) {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
+                options.activate_origin.push(prefix.to_owned());
+                at += 2;
+            }
+            "--since" if options.since.is_none() => {
+                options.since = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .and_then(|since| since.parse::<i128>().ok())
+                        .filter(|since| *since >= 0)
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+                );
+                at += 2;
+            }
+            "--scan" => {
+                options.scan.push(PathBuf::from(value(at + 1)?));
+                at += 2;
+            }
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+    }
+    Ok((options, args.get(at..).unwrap_or_default()))
 }
 
 fn apply_state_command(args: &[std::ffi::OsString]) -> Result<()> {

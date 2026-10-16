@@ -2737,6 +2737,185 @@ order to the new order's tail and settles forward (finding 6,
 `a_stash_order_v1_append_intent_one_store_past_its_record_settles_forward`),
 the code-level recovery the model's settle rows already assume.
 
+### #226: `--adopt` (2026-10-15, OI-1003-Q171/Q172)
+
+`estate-apply --adopt` lands into the live tree. An existing checkout
+bulkload never landed becomes bulkload's when it proves equal to its
+capture, and nothing is moved (design:
+`docs/agent-notes/2026-10-15-estate-adopt-design.md`, sections 5 to 8
+and 12). The model gains the constant `Adopt` (with `Adopt => ~Landed`);
+every earlier row renders it `FALSE`.
+
+- **The start.** Under `Adopt`, `Init` is `AdoptInit`: the main checkout
+  is present and the linked worktree absent. Each ref, the seat, the index,
+  the stash and HEAD is either the first capture's value or the operator's
+  (`OPV`, recorded in `opLive`, `opStash` and `opHead` from the start). A
+  ref the source has may be absent; adopt's R1 recreates it, which is
+  decision 4 of the note, so the absence is no operator value. This
+  replaces the note's `PreDest` constant: one row covers every
+  pre-existing destination.
+- **The steps**, folded into existing actions so no earlier row's
+  never-enabled set changes:
+  - `Begin` takes the main to the adoption instead of A12;
+  - `Decide_` holds the proof (`AdoptHead`, the index and every carried
+    seat by content; an extra destination seat is left alone), and either
+    goes on or refuses `DIVERGED`;
+  - `Import` (`a_import`) holds the import, the marker and the HEAD
+    branch's R2 row;
+  - `RefStep` (`a_refs`) is the ref step, R1, R2, R3 and R10 through
+    `Decide`;
+  - `WriteLanded` (`a_landed`) writes the adoption's ledger, under the
+    proof's prints and racy. A destination seat the capture lacks becomes
+    the destination's own from here.
+  - `StashDecide` gains T0 (an equal reflog adopted with no write).
+  - The linked worktree waits for the main's adoption and then
+    first-lands into the adopted repository.
+- **The ghost.** Before the main's ledger exists, the values the apply
+  may claim are the adopted capture's (`PreAdopt`, `AdoptVals`,
+  `AdoptHead`), so an operator's write of one of them is no edit. A ref's
+  absence is no edit either: adopt's R1 recreates a ref deleted before
+  its ref step, as it recreates one absent at the start (decision 4). The
+  model found this while an adoption was in flight.
+- **Invariants.** `AdoptClaimsOnlyEqual`: no workspace ledger names a
+  seat, index or HEAD value the operator holds. `ForeignRefsUnowned`: a
+  ref holding the operator's value never gets a ledger row naming it.
+  Both are checked in every row and scoped to `Adopt` (true without it).
+  In a landed run the ghost may mark a landed value as the operator's (a
+  switch back to the old HEAD after `set_head`, a rebase holding its
+  branch), which `NoLocalWorkLost` already keeps; unscoped, they failed
+  `MC_ec_rebase`, `MC_ec_head_concurrent(_crash)` and
+  `MC_ec_one_checkout(_crash)` on exactly that. `CrashAtomicity` excepts the
+  main under `Adopt` from "a worktree has a ledger" until it is adopted.
+- **Two stated exceptions**, both `FALSE` without `Adopt`.
+  - `AdoptBehind`: a destination that is not the main's current capture,
+    because the source moved after the copy, refuses `DIVERGED` until it
+    is landed otherwise (decision 5: no older-capture baseline).
+    `ConvergesWhenQuiet` and `NoWedge` take it as their stated exception.
+  - `AdoptKept(r)`: a ref the adoption found holding another value (R3),
+    or not carried (R10), stays the destination's and unowned (since the
+    review of 2026-10-16, only the refs the adoption's ref step left:
+    the ghost `adoptG.kept`, below). It never
+    follows the source, even when it is only behind
+    (`ConvergesWhenQuiet`'s `RefConverged`). This is the design's "never
+    adopts a ref whose value differs"; `estate-diff` reports such a ref
+    `source-ahead`.
+- **Mutations.**
+  - `adopt_without_proof` (the ledger from the destination as found)
+    fails `AdoptClaimsOnlyEqual`.
+  - `adopt_ref_unequal` (R2 for a value that is not the carried one)
+    fails `ForeignRefsUnowned`.
+  - `adopt_untyped` fails `TypedRefusal`.
+  - `adopt_ledger_before_refs` (the workspace ledger before the ref step)
+    fails `ConvergesWhenQuiet`: a crash between makes the rerun A6, and
+    the refs the destination lacks are never created while the source
+    holds still.
+
+  The note's `adopt_r1_over_existing` is `txn_no_cas`'s row already.
+- **Not modelled:**
+  - a linked worktree's own adoption;
+  - the re-key (A11b: a relabelling after `Proved`);
+  - the bare first landing (A11c: one atomic publish, as `FirstLandMain`);
+  - refs-only adoption (A11d);
+  - `estate-diff` (read-only; the Rust row P94);
+  - origins (configuration).
+
+`just tla-check` of every `MC_ec_` row, 2026-10-15, sting, `-workers 3`,
+nice 10, two concurrent invocations (39 pass rows; 64 reach, finding,
+simulate and negative rows; each after its budget self-test), load
+average 60 to 125 on 32 CPUs, on origin/main `5beb031` (#228 merged) plus
+this lane. Every pre-existing pass row explores exactly its recorded
+distinct states (for example `MC_ec_refs` 54141, `MC_ec_live_linked`
+223978, `MC_ec_one_checkout_crash` 1061046), so `Adopt = FALSE` leaves
+their state spaces unchanged. Five pass rows failed the first run of the
+unscoped invariants (above); after scoping, those five and every adopt
+row were run again, and all matched. Then one invocation of every
+`MC_ec_` row on the final spec (after the in-flight adopt recheck in
+`Import` and the ref-absence ghost): 103 rows matched, 3963 s wall,
+`rc=0`. Grounding: 84 operators, 16
+constants, 49 mutations, 3 label sets, 65 code symbols; `just tla-render
+--check` current (229 files).
+
+| config | expect | outcome | violated | distinct | depth | wall |
+|---|---|---|---|---:|---:|---:|
+| `MC_ec_adopt` | pass | PASS | - | 30486 | 36 | 24s |
+| `MC_ec_adopt_linked` | pass | PASS | - | 23340 | 52 | 23s |
+| `MC_ec_adopt_op` | pass | PASS | - | 14702 | 37 | 19s |
+| `MC_ec_adopt_live` (LiveSpec) | pass | PASS | - | 6174 | 34 | 24s |
+| `MC_ec_reach_adopted_converged` | reach | REACHED | Witness_AdoptedConverged | 27973 | 21 | 23s |
+| `MC_ec_neg_adopt_without_proof` | fail | FAIL | AdoptClaimsOnlyEqual | 85 | 6 | 19s |
+| `MC_ec_neg_adopt_ref_unequal` | fail | FAIL | ForeignRefsUnowned | 74 | 13 | 18s |
+| `MC_ec_neg_adopt_untyped` | fail | FAIL | TypedRefusal | 21 | 3 | 18s |
+| `MC_ec_neg_adopt_ledger_before_refs` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 234 | - | 19s |
+| `MC_ec_rebase` (rerun) | pass | PASS | - | 11841 | 41 | 18s |
+| `MC_ec_head_concurrent` (rerun) | pass | PASS | - | 12252 | 45 | 23s |
+| `MC_ec_head_concurrent_crash` (rerun) | pass | PASS | - | 81421 | 49 | 31s |
+| `MC_ec_one_checkout` (rerun) | pass | PASS | - | 110 | 22 | 17s |
+| `MC_ec_one_checkout_crash` (rerun) | pass | PASS | - | 1061046 | 74 | 174s |
+
+#### Review of 2026-10-16
+
+Three findings were about the model (design note section 13, findings
+6, 9 and 10). Each was reproduced on the spec before this change first:
+the reviewer's mutations m2 (R2 writes no row) and m4 (R1 writes no row)
+pass `MC_ec_adopt_live`, m3 (no recheck in `Import`) passes
+`MC_ec_adopt_op`, and m5 (`Assert(FALSE)` at T0) passes all four adopt
+rows with their recorded state counts.
+
+- **A ghost of what the adoption decided** (`adoptG`, a new variable;
+  `FALSE`/empty in every non-adopt row):
+  - `kept`: the refs the adoption's ref step left to the destination
+    (R3 `kept-destination`, and R10: a native ref the capture lacks).
+    `AdoptKept(r)` is now `r \in adoptG.kept /\ ~Live(refLed[r])`; a ref
+    R1 created or R2 adopted with no row is no longer excused.
+  - `unequal`: an adoption's import proceeded while the destination was
+    no longer the capture's (`~AdoptEqual`). `AdoptClaimsOnlyEqual`
+    requires it false. Without the recheck, `NoLocalWorkLost` still
+    holds (the next converge refuses the edit MODIFIED); the claim is the
+    property.
+  - `stash`: the adoption's stash step left the destination's reflog
+    (T2, or any reflog when the capture carries none). `AdoptStashKept`
+    is the stash's `AdoptKept`, an exception in `Converged`. The model
+    found both cases once T0 was reachable; the code does the same
+    (`stash_decision`).
+- **T0 is reached.** Under `Adopt` with `"stash"` in `SrcKinds` the
+  source holds a stash at the copy (`SI`, `STASHV`), and `AdoptInit`
+  lets the destination's reflog equal it. No earlier row has both, so
+  their state spaces are unchanged.
+- **Rows.** New pass row `MC_ec_adopt_stash` (LiveSpec). Four mutation
+  rows: `adopt_r1_no_row` and `adopt_r2_not_adopted` (`adoptLive`'s
+  constants) and `adopt_t0_no_row` (`adoptStash`'s) fail
+  `ConvergesWhenQuiet`; `adopt_no_recheck` (`adoptOp`'s) fails
+  `AdoptClaimsOnlyEqual`.
+
+`just tla-check` of the adopt rows, 2026-10-16, sting, `-workers 3`,
+nice 10: 14 rows matched, 236 s wall, `rc=0`. The adopt pass rows' counts
+moved by the ghost (it splits states the old spec merged). Then one
+invocation of every `MC_ec_` row on the final spec: 108 rows matched (the
+budget self-test, 40 PASS with their never-enabled sets exact, 1
+SIMULATION, 7 REACHED, 59 FAIL each on exactly its named property),
+3961 s wall, `rc=0`. Every pre-existing pass row explores its recorded
+count (for example `MC_ec_refs` 54141, `MC_ec_live_linked` 223978,
+`MC_ec_one_checkout_crash` 1061046): the ghost stays empty without
+`Adopt`. Grounding: 84 operators, 16 constants, 53 mutations, 3 label
+sets, 67 code symbols; `just tla-render --check` current (234 files).
+
+| config | expect | outcome | violated | distinct | depth | wall |
+|---|---|---|---|---:|---:|---:|
+| `MC_ec_adopt` | pass | PASS | - | 30652 | 36 | 18s |
+| `MC_ec_adopt_linked` | pass | PASS | - | 23556 | 52 | 15s |
+| `MC_ec_adopt_op` | pass | PASS | - | 15190 | 37 | 18s |
+| `MC_ec_adopt_live` (LiveSpec) | pass | PASS | - | 6302 | 34 | 19s |
+| `MC_ec_adopt_stash` (LiveSpec) | pass | PASS | - | 1332 | 35 | 15s |
+| `MC_ec_reach_adopted_converged` | reach | REACHED | Witness_AdoptedConverged | 28141 | 21 | 17s |
+| `MC_ec_neg_adopt_without_proof` | fail | FAIL | AdoptClaimsOnlyEqual | 53 | 4 | 13s |
+| `MC_ec_neg_adopt_ref_unequal` | fail | FAIL | ForeignRefsUnowned | 74 | 13 | 13s |
+| `MC_ec_neg_adopt_untyped` | fail | FAIL | TypedRefusal | 21 | 3 | 12s |
+| `MC_ec_neg_adopt_ledger_before_refs` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 242 | - | 16s |
+| `MC_ec_neg_adopt_r1_no_row` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 6786 | - | 20s |
+| `MC_ec_neg_adopt_r2_not_adopted` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 7386 | - | 18s |
+| `MC_ec_neg_adopt_no_recheck` | fail | FAIL | AdoptClaimsOnlyEqual | 1175 | 5 | 13s |
+| `MC_ec_neg_adopt_t0_no_row` (LiveSpec) | fail | FAIL | ConvergesWhenQuiet | 1519 | - | 17s |
+
 ### Findings (EstateConverge)
 
 Every finding below was a row that failed on the code on
@@ -2906,8 +3085,9 @@ Git's killed child. Stated limit: a `git switch` reads its branch before
   compare inode, size and mtime; a same-size write in the same timestamp
   tick as a seat's last write, between the settle's content check and its
   rename, would pass them. The model does not explore it.
-- **Refs-only items, foreign repositories, `--adopt`, symbolic refs,
-  per-worktree refs, tombstone retention.** None is modelled; the ref
+- **Refs-only items, foreign repositories, symbolic refs, per-worktree
+  refs, tombstone retention.** None is modelled (`--adopt` is, for the
+  main: "#226" above); the ref
   decision is P84's (Rust, exhaustive over its domain). A create beside an
   operator's symbolic ref is review 4's Rust rows'
   (`a_create_beside_a_symbolic_ref_is_dropped`).
