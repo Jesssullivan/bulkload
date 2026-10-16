@@ -269,6 +269,30 @@ PINNED_JUST_RECIPES = {
             "cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::",
             "cd {{ root }} && {{ just_executable() }} io-partial-write-alone",
             "cd {{ root }} && {{ just_executable() }} resume-power-loss",
+            "cd {{ root }} && {{ just_executable() }} handoff-off",
+            "cd {{ root }} && {{ just_executable() }} delta-lever",
+        ),
+    ),
+    # The loopback hand-off's off arm (OI-1003-Q154 review): the copy-based
+    # crash, power-loss and resume suites again on the transport path, with
+    # `w3_engine` first to prove the variable reached the engine.
+    "handoff-off": (
+        "handoff-off:",
+        (
+            "cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine",
+            "cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test s3_transfer_resume --test sqlite_carry",
+            "cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 {{ just_executable() }} resume-power-loss",
+        ),
+    ),
+    # The delta lever's on arm (OI-1003-Q154 review): the copy-based crash,
+    # power-loss and resume suites again with a new path streamed, with
+    # `loopback_handoff` first to prove the variable reached the engine.
+    "delta-lever": (
+        "delta-lever:",
+        (
+            "cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test loopback_handoff",
+            "cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test estate_converge --test sqlite_carry",
+            "cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 {{ just_executable() }} resume-power-loss",
         ),
     ),
     "resume-power-loss": (
@@ -284,13 +308,17 @@ PINNED_JUST_RECIPES = {
             '    echo "resume-power-loss: cargo test failed with status $status" >&2',
             '    exit "$status"',
             "fi",
+            "proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads a_level_crashed_after_its_commit_is_swept_and_its_records_cleared a_level_crashed_after_some_renames_adopts_the_renamed_and_makes_the_rest a_finish_crashed_after_some_seals_completes_every_directory_in_one_commit a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it)",
+            "if [[ $(uname -s) == Linux ]]; then",
+            "    proofs+=(a_batched_group_names_no_output_before_its_data_is_durable)",
+            "fi",
             "results=$(grep -c '^test result: ' <<<\"$output\" || true)",
-            "passed=$(grep -c '^test result: ok\\. 3 passed; 0 failed;' <<<\"$output\" || true)",
+            'passed=$(grep -c "^test result: ok\\. ${#proofs[@]} passed; 0 failed;" <<<"$output" || true)',
             "if [[ $results -ne 1 || $passed -ne 1 ]]; then",
-            "    echo \"resume-power-loss: expected exactly one '3 passed; 0 failed' result\" >&2",
+            "    echo \"resume-power-loss: expected exactly one '${#proofs[@]} passed; 0 failed' result\" >&2",
             "    exit 1",
             "fi",
-            "for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads; do",
+            'for proof in "${proofs[@]}"; do',
             '    if [[ $(grep -c "^test materialize::adoption_power_loss::$proof \\.\\.\\. ok$" <<<"$output" || true) -ne 1 ]]; then',
             '        echo "resume-power-loss: $proof was not among the passing tests" >&2',
             "        exit 1",
@@ -307,8 +335,10 @@ PINNED_JUST_RECIPES = {
         (),
     ),
     "ci-fault-harness": (
-        "ci-fault-harness: fault-harness",
-        (),
+        "ci-fault-harness:",
+        (
+            "cd {{ root }} && CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-tables-only {{ just_executable() }} fault-harness",
+        ),
     ),
     # The deep tier (OI-1003-Q78, OI-1003-Q81): on demand, never a gate.
     "props-deep": (
@@ -547,12 +577,30 @@ CRASH_SWEEP_REQUIRED = (
 )
 
 
+P84_REFLINK_REQUIRED = (
+    "export TMPDIR BULKLOAD_P84_REQUIRE_REFLINK=1",
+    "cargo test -p bulkload-agent --locked --test source_lock_trace p84_ "
+    '-- --nocapture 2>&1 | tee "$log"',
+    "if [[ $(grep -c '^test result: ok\\. 3 passed; 0 failed;' \"$log\" || true) -ne 1 ]]; then",
+    "for marker in 'p84 self-test: FICLONE shared ' 'p84 copy and serve: source ' "
+    "'p84 git and sqlite: repository '; do",
+    '    if [[ $(grep -c "^$marker" "$log" || true) -ne 1 ]]; then',
+    "cargo test -p bulkload-bench --locked "
+    "tests::a_fixture_that_shares_an_extent_refuses_the_sample "
+    '-- --exact --nocapture 2>&1 | tee "$log"',
+    "if [[ $(grep -c '^bench no-clone: reflinked fixture and sealed corpus refused$' "
+    '"$log" || true) -ne 1 ]]; then',
+    "python3 crates/bulkload-bench/scripts/test_r23_corpus.py NoCloneTests",
+)
+
+
 def validate_deep_recipes(justfile: str) -> None:
-    """`props-deep` and `crash-sweep` must fail unless the tests that left
-    the PR gate really ran."""
+    """`props-deep`, `crash-sweep` and `p84-reflink` must fail unless the
+    tests that skip themselves elsewhere really ran."""
     for name, required, runs in (
         ("props-deep", PROPS_DEEP_REQUIRED, 2),
         ("crash-sweep", CRASH_SWEEP_REQUIRED, 1),
+        ("p84-reflink", P84_REFLINK_REQUIRED, 2),
     ):
         _, body = just_recipe(justfile, name)
         for line in required:
@@ -3968,6 +4016,24 @@ class CiContractTest(unittest.TestCase):
             justfile.replace(
                 "    cd {{ root }} && {{ just_executable() }} rust-test\n", "", 1
             ),
+            # The hand-off's off arm dropped, or run with the hand-off on.
+            justfile.replace(
+                "    cd {{ root }} && {{ just_executable() }} handoff-off\n", "", 1
+            ),
+            justfile.replace(
+                "    cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine\n",
+                "    cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine\n",
+                1,
+            ),
+            # The delta lever's on arm dropped, or run with the lever off.
+            justfile.replace(
+                "    cd {{ root }} && {{ just_executable() }} delta-lever\n", "", 1
+            ),
+            justfile.replace(
+                "    cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test loopback_handoff\n",
+                "    cd {{ root }} && cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test loopback_handoff\n",
+                1,
+            ),
             # A dropped or narrowed test group, a name class that no longer
             # takes the rest, and a group whose failure or absence no longer
             # fails the recipe (OI-1003-Q81).
@@ -4092,7 +4158,11 @@ class CiContractTest(unittest.TestCase):
                 1,
             ),
             justfile.replace("    " + harness_test + "\n", "", 1),
-            justfile.replace("ci-fault-harness: fault-harness", "ci-fault-harness:", 1),
+            justfile.replace(
+                "line-tables-only {{ just_executable() }} fault-harness\n",
+                "line-tables-only true\n",
+                1,
+            ),
             justfile.replace(
                 "ci-source: check-source secrets-scan-history",
                 "ci-source: secrets-scan-history",

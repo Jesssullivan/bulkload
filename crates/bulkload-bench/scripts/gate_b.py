@@ -24,7 +24,14 @@ never signals a process on either host.
 
 Workload: the estate corpus (estate_corpus.py, #159), sealed, at scale estate
 in gated mode. The helper copies it once into a new private working copy
-(--source-work), which both arms read. The comparable set is that copy minus
+(--source-work), which both arms read. The copy is an explicit read and
+write, never `shutil` or `cp`, and FIEMAP must show it sharing no extent
+with any other file (S2, OI-1003-Q165 (b)): a shared extent refuses the
+sample (SOURCE), a Linux source whose sharing cannot be known there (a file
+system other than xfs, btrfs, bcachefs or ocfs2, which report it, and ext4
+or tmpfs, which cannot reflink) refuses a gated one, and a macOS source
+records `n/a`. FIEMAP sees sharing that exists at the check, not a clone
+that was later undone. The comparable set is that copy minus
 the seats the agent's pull refuses by design: SQLite databases (by magic) and
 `-wal`/`-shm`/`-journal` companions (by name), SQLITE_STATE_CHANGED. rclone
 gets the same seats as an anchored `--exclude-from` list; the native arm must
@@ -416,6 +423,130 @@ def op_probe(args):
     return out
 
 
+FIEMAP_IOC = 0xC020660B  # FS_IOC_FIEMAP, _IOWR('f', 11, struct fiemap)
+# fstatfs f_type: FIEMAP's SHARED flag is trusted on xfs, btrfs, bcachefs and
+# ocfs2; ext2/3/4 and tmpfs cannot reflink (0 by construction); anything else
+# (CIFS/SMB3 clones but never flags sharing, NFS, overlayfs) is unsupported.
+FIEMAP_TRUSTED = (0x58465342, 0x9123683E, 0xCA451A4E, 0x7461636F)
+CANNOT_REFLINK = (0xEF53, 0x01021994)
+
+
+def _raise(error):
+    """os.walk's onerror: an unreadable directory fails the walk."""
+    raise error
+
+
+def fs_magic(fd):
+    """fstatfs(fd).f_type (low 32 bits) through libc, or None."""
+    import ctypes
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:
+        return None
+    buffer = ctypes.create_string_buffer(256)
+    if libc.fstatfs(fd, buffer) != 0:
+        return None
+    return ctypes.c_long.from_buffer(buffer).value & 0xFFFFFFFF
+
+
+def shared_extents(path):
+    """Shared extents of one regular file now, or None where that cannot be known.
+
+    OI-1003-Q165: by FIEMAP on a file system that reports sharing, 0 on one
+    that cannot reflink, None elsewhere and off Linux.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    import errno, fcntl, struct
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    try:
+        magic = fs_magic(fd)
+        if magic not in FIEMAP_TRUSTED and magic not in CANNOT_REFLINK:
+            return None
+        start, shared = 0, 0
+        while True:
+            request = bytearray(struct.pack("=QQIIII", start, 2 ** 64 - 1, 0, 0, 64, 0)
+                                + bytes(56 * 64))
+            try:
+                fcntl.ioctl(fd, FIEMAP_IOC, request, True)
+            except OSError as err:
+                if err.errno in (errno.EOPNOTSUPP, errno.ENOTTY):
+                    return 0 if magic in CANNOT_REFLINK else None
+                raise
+            mapped = struct.unpack_from("=I", request, 20)[0]
+            last, following = mapped == 0, start
+            for index in range(min(mapped, 64)):
+                logical, _physical, length = struct.unpack_from("=QQQ", request, 32 + 56 * index)
+                flags = struct.unpack_from("=I", request, 72 + 56 * index)[0]
+                shared += 1 if flags & 0x2000 else 0
+                last = last or bool(flags & 0x1)
+                following = logical + length
+            if last or mapped < 64 or following <= start:
+                return shared
+            start = following
+    finally:
+        os.close(fd)
+
+
+def tree_shared(root):
+    """Shared extents under `root`: an int, "unsupported" (Linux) or "n/a"."""
+    total = 0
+    for dirpath, _dirs, files in os.walk(root, onerror=_raise):
+        for name in files:
+            path = os.path.join(dirpath, name)
+            if not stat.S_ISREG(os.lstat(path).st_mode):
+                continue
+            count = shared_extents(path)
+            if count is None:
+                return "unsupported" if sys.platform.startswith("linux") else "n/a"
+            total += count
+    return total
+
+
+def plain_copy(source, target):
+    """Copy a tree by os.read/os.write, never a clone (OI-1003-Q165).
+
+    Symlinks are recreated, mtimes kept; any other node is refused.
+    """
+    os.mkdir(target, 0o700)
+    for dirpath, dirs, files in os.walk(source, onerror=_raise):
+        here = os.path.join(target, os.path.relpath(dirpath, source))
+        for name in sorted(dirs) + sorted(files):
+            path, dest = os.path.join(dirpath, name), os.path.join(here, name)
+            info = os.lstat(path)
+            if stat.S_ISLNK(info.st_mode):
+                os.symlink(os.readlink(path), dest)
+            elif stat.S_ISDIR(info.st_mode):
+                os.mkdir(dest, 0o700)
+            elif stat.S_ISREG(info.st_mode):
+                inp = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                try:
+                    out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                                  | os.O_CLOEXEC, 0o600)
+                    try:
+                        while True:
+                            block = os.read(inp, 1 << 20)
+                            if not block:
+                                break
+                            view = memoryview(block)
+                            while view:
+                                view = view[os.write(out, view):]
+                    finally:
+                        os.close(out)
+                finally:
+                    os.close(inp)
+                os.chmod(dest, stat.S_IMODE(info.st_mode) | 0o600)
+                os.utime(dest, ns=(info.st_atime_ns, info.st_mtime_ns))
+            else:
+                raise RuntimeError("not a file, directory or symlink: " + path)
+        dirs[:] = [name for name in dirs
+                   if not stat.S_ISLNK(os.lstat(os.path.join(dirpath, name)).st_mode)]
+    for dirpath, _dirs, _files in os.walk(source, topdown=False, onerror=_raise):
+        info = os.lstat(dirpath)
+        os.utime(os.path.join(target, os.path.relpath(dirpath, source)),
+                 ns=(info.st_atime_ns, info.st_mtime_ns))
+
+
 def op_prepare(args):
     sealed = os.path.join(args["corpus"], "corpus")
     work = args["work"]
@@ -425,7 +556,11 @@ def op_prepare(args):
         raise RuntimeError("sealed corpus/ is missing")
     os.mkdir(work, 0o700)
     corpus = os.path.join(work, "corpus")
-    shutil.copytree(sealed, corpus, symlinks=True)
+    plain_copy(sealed, corpus)
+    shared = tree_shared(corpus)
+    if isinstance(shared, int) and shared:
+        raise RuntimeError("the working copy shares %d extent(s) with another file: a clone,"
+                           " refused (S2, OI-1003-Q165)" % shared)
     for dirpath, dirs, files in os.walk(corpus):
         os.chmod(dirpath, 0o755)
         for name in files:
@@ -440,7 +575,8 @@ def op_prepare(args):
         handle.write(WRAPPER.format(python=args["python"], agent=args["agent"],
                                     flags=list(args.get("flags") or [])))
     os.chmod(wrapper, 0o700)
-    return {"corpus": corpus, "wrapper": wrapper, "states": os.path.join(work, "states")}
+    return {"corpus": corpus, "wrapper": wrapper, "states": os.path.join(work, "states"),
+            "shared_extents": shared}
 
 
 def op_measure(args):
@@ -1725,7 +1861,8 @@ def evidence(report: dict[str, object]) -> str:
         f"- Source: `{src.get('host')}` ({src.get('system')}, {src.get('node')});"
         f" working copy `{src.get('corpus')}`; agent `{src.get('agent')}`"
         f" sha256 `{str(src.get('agent_sha256'))[:16]}`; serve priority"
-        f" `{src.get('priority')}`.",
+        f" `{src.get('priority')}`; working copy by read and write, FIEMAP-shared"
+        f" extents `{src.get('working_copy_shared_extents', 'n/a')}` (OI-1003-Q165).",
         f"- Destination: `{dst.get('node')}` ({dst.get('system')}); work root"
         f" `{dst.get('work_root')}`; agent sha256 `{str(dst.get('agent_sha256'))[:16]}`;"
         f" load limit {dst.get('load_limit')} (samples are gated at {LOAD_LIMIT}).",
@@ -2174,6 +2311,11 @@ def main(argv: list[str] | None = None) -> int:
             },
         )
         report["source"]["corpus"] = prepared["corpus"]
+        shared = prepared.get("shared_extents")
+        report["source"]["working_copy_shared_extents"] = shared
+        if mode == "gated" and shared not in (0, "n/a"):
+            # OI-1003-Q165 (b): a gated sample needs FIEMAP to say unshared.
+            raise Abort(f"the working copy cannot be verified unshared: {shared}")
         manifest = transport.helper("manifest", {"root": prepared["corpus"]})
     except Abort as abort:
         return refuse(Refusal("SOURCE", str(abort)), report, work)

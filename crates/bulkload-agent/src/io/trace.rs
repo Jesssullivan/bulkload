@@ -38,6 +38,14 @@ pub enum SyncKind {
     /// durable, and the device cache is drained, so every operation already
     /// sent to the device by an earlier sync of any object is durable too.
     FullFlush,
+    /// Linux device seal, `syncfs` then `fsync` of the same object, recorded
+    /// after both: every pending operation on every object of the file
+    /// system holding the object is durable, data, metadata and entries, and
+    /// the device cache is flushed (S1, OI-1003-Q107). True of the file
+    /// systems `io::durable::syncfs_seals` allows, the only ones it is
+    /// issued on, and only with the `fsync` (an idle xfs log's `syncfs`
+    /// sends no cache flush).
+    FsSync,
 }
 
 /// One mutating syscall.
@@ -150,6 +158,11 @@ pub enum CommitRecord {
     },
     /// A directory's final mode is durable and its record retired.
     DirectoryComplete { key: Vec<u8> },
+    /// A directory record cleared without completing its directory: a
+    /// creation undone before it published, a record bound to a temporary
+    /// the sweep removes, or a stale record (#217 review). It vouches for
+    /// nothing.
+    DirectoryCleared { key: Vec<u8> },
     /// The store's `root_sealed` setting (#161): `Store::open` sealed the
     /// state root's entry and its database's entry before this commit, and
     /// every later open trusts the marker without sealing again.

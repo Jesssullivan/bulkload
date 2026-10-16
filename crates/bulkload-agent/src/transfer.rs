@@ -12,7 +12,9 @@
 //!   every chunk as a binary `Data` frame (header and payload with `writev`),
 //!   then [`Control::End`] with the `manifest_root`;
 //! - `WantManifest`: the destination may fill chunks locally (an existing
-//!   output to adopt, or chunks held by published outputs). The source sends
+//!   output to adopt, or chunks held by published outputs; with the delta
+//!   lever of OI-1003-Q154 on, a local `copy` with the hand-off streams a
+//!   seat new to the destination instead). The source sends
 //!   [`Control::Manifest`] (from its digest-only ledger without reading, when
 //!   the stat identity is recorded), the destination answers
 //!   [`Control::NeedChunks`] by index, and the source sends only those.
@@ -101,6 +103,7 @@ use crate::transfer_store::{
 };
 use crate::walk::{WalkItem, Walker};
 use crate::{BulkloadRefusal, Result, RowSchema};
+use handoff::{HandIn, HandOut, Payload, SourceChunk};
 
 /// Capture threads on the source.
 const CAPTURE_WORKERS: usize = 4;
@@ -133,6 +136,29 @@ const MAX_MANIFEST_CHUNKS: usize = 131_072;
 /// Header bytes a capture reads before it can refuse a `SQLite` database or
 /// WAL by its magic (#186).
 const SNIFF_BYTES: u64 = 16;
+/// An entry's staged file is kicked into write-back each time its placed
+/// bytes cross a multiple of this, while the data still streams
+/// (OI-1003-Q143 item 1a, extending OI-1003-Q107). Group mode on Linux only.
+const WRITEBACK_KICK_BYTES: u64 = 8 * 1024 * 1024;
+/// Receive workers verifying and writing data frames beside the receiving
+/// thread, by default (OI-1003-Q143 item 3). Zero is the inline path.
+const RECV_WORKERS: usize = 2;
+/// The most receive workers [`RECV_WORKERS_ENV`] may ask for.
+const RECV_WORKERS_MAX: usize = 16;
+/// Sets the receive workers for a process (`0` to [`RECV_WORKERS_MAX`]), for
+/// the bench's A/B (OI-1003-Q143 item 3). Unset or malformed keeps the
+/// default.
+pub const RECV_WORKERS_ENV: &str = "BULKLOAD_RECV_WORKERS";
+/// Payload bytes the receive workers may hold queued or in progress. Each
+/// job is charged at least [`RECV_JOB_MIN_BYTES`], so empty or tiny frames
+/// are bounded too (#217 review).
+const RECV_POOL_BYTES: u64 = 8 * 1024 * 1024;
+/// The least a job is charged against [`RECV_POOL_BYTES`].
+const RECV_JOB_MIN_BYTES: u64 = 4096;
+/// Walk frames a batch of new directories may hold back, every kind
+/// counted (#217 review); well below [`ENTRY_WINDOW`], so the source always
+/// has window to keep offering (OI-1003-Q143 item 2).
+const DIRECTORY_BATCH_FRAMES: usize = 256;
 /// Bytes of `SQLite` snapshot slots the source keeps at once, streamed or
 /// kept for chunk requests (#218, design D9: the salvage bound's figure;
 /// unruled). Every slot is reserved before its backup and holds its
@@ -224,6 +250,18 @@ static RECV_VERIFY_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_SETUP_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_STREAM_NS: AtomicU64 = AtomicU64::new(0);
 static RECV_TAIL_NS: AtomicU64 = AtomicU64::new(0);
+// Inside the stream (S1, OI-1003-Q143 step 1a): the wait for the open
+// group's commit once nothing more can arrive, and the frame loop's ramp to
+// its first data frame.
+static RECV_DRAIN_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_FIRST_DATA_NS: AtomicU64 = AtomicU64::new(0);
+// The receive workers (OI-1003-Q143 item 3, #217 review): their verify and
+// their writes, summed over workers; the receiving thread's wait on them;
+// and the sending thread's writes to the wire.
+static RECV_WORKER_VERIFY_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_WORKER_PLACE_NS: AtomicU64 = AtomicU64::new(0);
+static RECV_POOL_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static SEND_WRITE_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Receiver accounting; any refusal means the requested carry is incomplete.
 #[derive(Debug, Default)]
@@ -255,6 +293,11 @@ pub struct TransferStats {
     /// Directories created by the plain `mkdirat` fallback, on a filesystem
     /// without a no-replace rename (R-N119), by relative path.
     pub directories_fallback: Vec<Vec<u8>>,
+    /// Directories this session finished in its last output group's commit
+    /// rather than in a completion commit of their own (OI-1003-Q154 lever
+    /// 3; `directories_folded`). 0 when the fold is off
+    /// ([`DIRECTORY_FOLD_ENV`]) or could not ride a group.
+    pub directories_folded: u64,
     /// Outputs a crash left durable with no row, adopted from their capture
     /// record without a source read (#169; `transfer_unrowed_adopted`).
     pub unrowed_adopted: u64,
@@ -344,6 +387,27 @@ pub struct TransferTiming {
     /// `receive` after its frame loop: the last group commits, directory
     /// records and the session's flushes (`finish_receive`).
     pub recv_tail_ns: u64,
+    /// The receiving thread waiting in `settle_held` for the open group's
+    /// commit (`committer.sync()`: its file and directory seals and its
+    /// store commit) once every entry is offered and none has content
+    /// outstanding: the final drain. Part of [`Self::recv_stream_ns`], and
+    /// of [`Self::recv_settle_ns`] when the loop's own settle call drains.
+    pub recv_drain_ns: u64,
+    /// The frame loop's start to its first data frame: the stream's ramp,
+    /// part of [`Self::recv_stream_ns`]. Zero for a copy with no data frame.
+    pub recv_first_data_ns: u64,
+    /// The receive workers' wire verify, summed over workers (item 3). The
+    /// receiving thread's own verify stays in [`Self::recv_verify_ns`].
+    pub recv_worker_verify_ns: u64,
+    /// The receive workers' writes and write-back kicks, summed over
+    /// workers (items 1a and 3).
+    pub recv_worker_place_ns: u64,
+    /// The receiving thread blocked on the receive workers: their byte
+    /// budget, or an entry's last writes before its `End` (item 3).
+    pub recv_pool_wait_ns: u64,
+    /// The sending thread writing frames to the wire, blocked there when
+    /// the wire is full; part of [`Self::send_handle_ns`].
+    pub send_write_ns: u64,
 }
 
 impl TransferTiming {
@@ -365,6 +429,12 @@ impl TransferTiming {
             recv_setup_ns: RECV_SETUP_NS.load(Ordering::Relaxed),
             recv_stream_ns: RECV_STREAM_NS.load(Ordering::Relaxed),
             recv_tail_ns: RECV_TAIL_NS.load(Ordering::Relaxed),
+            recv_drain_ns: RECV_DRAIN_NS.load(Ordering::Relaxed),
+            recv_first_data_ns: RECV_FIRST_DATA_NS.load(Ordering::Relaxed),
+            recv_worker_verify_ns: RECV_WORKER_VERIFY_NS.load(Ordering::Relaxed),
+            recv_worker_place_ns: RECV_WORKER_PLACE_NS.load(Ordering::Relaxed),
+            recv_pool_wait_ns: RECV_POOL_WAIT_NS.load(Ordering::Relaxed),
+            send_write_ns: SEND_WRITE_NS.load(Ordering::Relaxed),
         }
     }
 
@@ -372,7 +442,7 @@ impl TransferTiming {
     #[must_use]
     pub fn render(&self) -> String {
         format!(
-            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={} recv_setup_ns={} recv_stream_ns={} recv_tail_ns={}",
+            "walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={} recv_setup_ns={} recv_stream_ns={} recv_tail_ns={} recv_drain_ns={} recv_first_data_ns={} recv_worker_verify_ns={} recv_worker_place_ns={} recv_pool_wait_ns={} send_write_ns={}",
             self.walk_ns,
             self.walk_wait_ns,
             self.reuse_census_ns,
@@ -388,6 +458,12 @@ impl TransferTiming {
             self.recv_setup_ns,
             self.recv_stream_ns,
             self.recv_tail_ns,
+            self.recv_drain_ns,
+            self.recv_first_data_ns,
+            self.recv_worker_verify_ns,
+            self.recv_worker_place_ns,
+            self.recv_pool_wait_ns,
+            self.send_write_ns,
         )
     }
 
@@ -409,6 +485,20 @@ impl TransferTiming {
             recv_setup_ns: self.recv_setup_ns.saturating_sub(before.recv_setup_ns),
             recv_stream_ns: self.recv_stream_ns.saturating_sub(before.recv_stream_ns),
             recv_tail_ns: self.recv_tail_ns.saturating_sub(before.recv_tail_ns),
+            recv_drain_ns: self.recv_drain_ns.saturating_sub(before.recv_drain_ns),
+            recv_first_data_ns: self
+                .recv_first_data_ns
+                .saturating_sub(before.recv_first_data_ns),
+            recv_worker_verify_ns: self
+                .recv_worker_verify_ns
+                .saturating_sub(before.recv_worker_verify_ns),
+            recv_worker_place_ns: self
+                .recv_worker_place_ns
+                .saturating_sub(before.recv_worker_place_ns),
+            recv_pool_wait_ns: self
+                .recv_pool_wait_ns
+                .saturating_sub(before.recv_pool_wait_ns),
+            send_write_ns: self.send_write_ns.saturating_sub(before.send_write_ns),
         }
     }
 }
@@ -454,7 +544,9 @@ fn canonical_state(state: &Path) -> Result<PathBuf> {
 /// `copy`'s S2 overlap decision, read-only.
 ///
 /// The source and the destination apart, neither state root inside the
-/// source, and each apart from its own root (WP1 PR 3). [`copy_with`] makes it before either store exists, and
+/// source, each apart from its own root (WP1 PR 3), and the two state roots
+/// apart from each other and from the destination (OI-1003-Q143 item 1b).
+/// [`copy_with`] makes it before either store exists, and
 /// [`crate::transfer_outcome::record_session`] before its first record
 /// write, so a refused overlap writes nothing anywhere (review finding 1).
 ///
@@ -466,6 +558,17 @@ pub fn copy_roots_apart(
     source_state: &Path,
     destination_state: &Path,
 ) -> Result<()> {
+    copy_roots(source, destination, source_state, destination_state).map(|_| ())
+}
+
+/// [`copy_roots_apart`], returning the canonical destination root that
+/// [`copy_with`] keys the loopback hand-off by.
+fn copy_roots(
+    source: &Path,
+    destination: &Path,
+    source_state: &Path,
+    destination_state: &Path,
+) -> Result<PathBuf> {
     let source_root = std::fs::canonicalize(source).refuse_at("transfer::copy")?;
     let destination_root = std::fs::canonicalize(destination).refuse_at("transfer::copy")?;
     if overlaps(&source_root, &destination_root) {
@@ -476,13 +579,18 @@ pub fn copy_roots_apart(
     // all decided before either store exists.
     let source_state_root = canonical_state(source_state)?;
     let destination_state_root = canonical_state(destination_state)?;
+    // The two stores are opened at once (OI-1003-Q143 item 1b), so neither
+    // state root may hold or lie inside the other, or inside the
+    // destination root that the destination's setup sweeps (#217 review).
     if overlaps(&source_state_root, &source_root)
         || overlaps(&destination_state_root, &source_root)
         || overlaps(&destination_state_root, &destination_root)
+        || overlaps(&source_state_root, &destination_root)
+        || overlaps(&source_state_root, &destination_state_root)
     {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
-    Ok(())
+    Ok(destination_root)
 }
 
 /// `pull`'s local half of the same decision, read-only.
@@ -526,6 +634,14 @@ pub fn copy(
 /// [`serve`], in this process, so every source rule `serve` applies holds
 /// here too, the root refusal of `snapshot` mode included.
 ///
+/// Both halves run in this process, from this build, over a socket pair
+/// made here, so they are joined by the loopback hand-off
+/// (OI-1003-Q154 levers 1 and 2; `transfer/handoff.rs`): a chunk's bytes
+/// are handed over, not written to the socket, and the destination takes
+/// the source's own BLAKE3 of them for its verify; frames are batched and
+/// read through a buffer. With [`LOOPBACK_HANDOFF_ENV`] set to `0` it runs
+/// the plain protocol instead, every byte over the socket and hashed twice.
+///
 /// # Errors
 /// As [`copy`].
 pub fn copy_with(
@@ -535,7 +651,13 @@ pub fn copy_with(
     destination_state: &Path,
     sqlite: SqliteMode,
 ) -> Result<TransferStats> {
-    copy_roots_apart(source, destination, source_state, destination_state)?;
+    let destination_root = copy_roots(source, destination, source_state, destination_state)?;
+    let (hand_out, hand_in) = if loopback_handoff(&destination_root) {
+        let (out, into) = handoff::pair();
+        (Some(out), Some(into))
+    } else {
+        (None, None)
+    };
     let (mut sender, mut receiver) =
         std::os::unix::net::UnixStream::pair().refuse_at("transfer::copy")?;
     for stream in [&sender, &receiver] {
@@ -556,7 +678,15 @@ pub fn copy_with(
         let producer = std::thread::Builder::new()
             .spawn_scoped(scope, move || {
                 let input = sender.try_clone().refuse_at("transfer::copy")?;
-                let served = serve(input, &mut sender);
+                let served = match hand_out {
+                    // Lever 2: the destination's frames read in batches.
+                    Some(hand) => serve_session(
+                        std::io::BufReader::with_capacity(LOOPBACK_READ_BYTES, input),
+                        &mut sender,
+                        Some(hand),
+                    ),
+                    None => serve_session(input, &mut sender, None),
+                };
                 // The source's reader thread holds a clone of this end; shutting
                 // it down ends that thread and tells the destination the source
                 // is gone, whatever `serve` returned.
@@ -566,21 +696,128 @@ pub fn copy_with(
             .refuse_at("transfer::copy")?;
         let result = {
             let mut output = receiver.try_clone().refuse_at("transfer::copy")?;
-            receive_with(
-                &mut receiver,
-                &mut output,
-                source,
-                source_state,
-                destination,
-                destination_state,
-                sqlite,
-            )
+            let sides = ((source, source_state), (destination, destination_state));
+            match hand_in {
+                // Lever 2: the source's frames read in batches.
+                Some(hand) => receive_session(
+                    &mut std::io::BufReader::with_capacity(
+                        LOOPBACK_READ_BYTES,
+                        receiver.try_clone().refuse_at("transfer::copy")?,
+                    ),
+                    &mut output,
+                    sides.0,
+                    sides.1,
+                    sqlite,
+                    Some(hand),
+                ),
+                None => receive_session(&mut receiver, &mut output, sides.0, sides.1, sqlite, None),
+            }
         };
         let _ = receiver.shutdown(std::net::Shutdown::Both);
         drop(receiver);
-        producer.join().map_err(|_| BulkloadRefusal::WorkerLost)??;
-        result
+        let served = producer.join().map_err(|_| BulkloadRefusal::WorkerLost)?;
+        match (result, served) {
+            // The destination refused for a reason of its own (its setup,
+            // which now runs while the source opens its store, item 1b): the
+            // source's broken stream is only the echo of it.
+            (Err(refusal), Err(_)) if !matches!(refusal, BulkloadRefusal::Io(_)) => Err(refusal),
+            (result, served) => {
+                served?;
+                result
+            }
+        }
     })
+}
+
+/// Turns off the loopback hand-off of a local `copy` when `0`.
+///
+/// For the bench's A/B (OI-1003-Q154 levers 1 and 2): every chunk then
+/// crosses the socket and is hashed by both halves. Unset, or anything
+/// else, keeps it on. It never turns verification off anywhere: a session
+/// without the hand-off verifies every byte.
+pub const LOOPBACK_HANDOFF_ENV: &str = "BULKLOAD_LOOPBACK_HANDOFF";
+
+/// Bytes a loopback half reads from the socket at once (lever 2).
+const LOOPBACK_READ_BYTES: usize = 64 * 1024;
+
+/// Whether a `copy` into the canonical destination `root` joins its halves
+/// by the hand-off: on, unless [`LOOPBACK_HANDOFF_ENV`] is `0` or a test
+/// turned it off for `root`.
+fn loopback_handoff(root: &Path) -> bool {
+    let found = LOOPBACK_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, on)| *on);
+    found.unwrap_or_else(|| std::env::var(LOOPBACK_HANDOFF_ENV).map_or(true, |value| value != "0"))
+}
+
+/// The loopback hand-off by canonical destination root, for tests and
+/// benches that compare both paths in one process.
+static LOOPBACK_OVERRIDE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+
+/// Run `copy`s into the canonical destination `root` with the loopback
+/// hand-off on or off (`None`: the default again). Test and bench hook;
+/// off only ever adds verification.
+#[doc(hidden)]
+pub fn set_loopback_handoff(root: &Path, on: Option<bool>) {
+    let mut overrides = LOOPBACK_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(on) = on {
+        overrides.push((root.to_path_buf(), on));
+    }
+}
+
+/// Turns on the delta lever of a local `copy` when `1` (OI-1003-Q154).
+///
+/// A seat new to a destination whose published outputs hold chunks is then
+/// streamed instead of asked for by manifest first, as `pull` asks for it
+/// (`Inbound::wants_manifest`). Unset, or anything else, keeps it off.
+///
+/// Off by default: with it on, a new seat's bytes are handed over whole in
+/// place of a local fill, so `bytes_received` no longer meets S3's
+/// inequality 2 (WP0(c), OI-1003-Q18) for added seats as
+/// `tests/s3_transfer_resume.rs` proves it on `copy`. Whether handed bytes
+/// are wire bytes there is the operator's to rule (docs/slo.md, the
+/// 2026-10-16 amendment); until then the lever is for the bench's A/B. It
+/// acts only with the loopback hand-off ([`LOOPBACK_HANDOFF_ENV`]): with
+/// the hand-off off, a `copy` decides every entry as `pull` does. Either
+/// way the source reads each seat at most once and every byte placed is
+/// verified (handed chunks by the source's own digest).
+pub const LOCAL_NEW_PATH_STREAM_ENV: &str = "BULKLOAD_LOCAL_NEW_PATH_STREAM";
+
+/// The delta lever by canonical destination root, for tests that compare
+/// both arms in one process.
+static LOCAL_NEW_PATH_STREAM_OVERRIDE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+
+/// Run `copy`s into the canonical destination `root` with the delta lever
+/// on or off (`None`: the default again). Test and bench hook.
+#[doc(hidden)]
+pub fn set_local_new_path_stream(root: &Path, on: Option<bool>) {
+    let mut overrides = LOCAL_NEW_PATH_STREAM_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(on) = on {
+        overrides.push((root.to_path_buf(), on));
+    }
+}
+
+/// Whether a `copy` with the hand-off into the canonical destination
+/// `root` streams seats new to it: off, unless [`LOCAL_NEW_PATH_STREAM_ENV`]
+/// is `1` or a test turned it on for `root`.
+fn local_new_path_stream(root: &Path) -> bool {
+    let found = LOCAL_NEW_PATH_STREAM_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, on)| *on);
+    found
+        .unwrap_or_else(|| std::env::var(LOCAL_NEW_PATH_STREAM_ENV).is_ok_and(|value| value == "1"))
 }
 
 /// Raise one transfer stream's kernel buffers, best effort. A stream that
@@ -660,7 +897,7 @@ impl Credit {
 /// reservation against [`SLOT_BYTES`] (#218): the chunks are read from it
 /// again.
 struct Retained {
-    chunks: Vec<Arc<Vec<u8>>>,
+    chunks: Vec<SourceChunk>,
     slot: Option<SlotFile>,
     reserved: u64,
     budget: Arc<AtomicU64>,
@@ -860,10 +1097,11 @@ enum Event {
     Walked(WalkItem),
     /// The streaming walk has yielded its last item.
     WalkEnded,
-    /// One chunk, its credit already taken.
+    /// One chunk, its credit already taken. Its header's digest is the
+    /// chunk's own ([`SourceChunk::digest`]).
     Chunk {
         header: DataHeader,
-        data: Arc<Vec<u8>>,
+        chunk: SourceChunk,
     },
     /// An entry's content is a `SQLite` snapshot (#218): sent before its
     /// first chunk or its manifest.
@@ -1420,10 +1658,25 @@ fn walk_source<I: IntoIterator<Item = WalkItem>>(
 /// call; the caller closes the transport after `serve` returns (a process
 /// exit does).
 ///
+/// Every chunk goes out as a wire v6 data frame and every frame is flushed
+/// as it is written: `serve` never holds the loopback hand-off, which only
+/// a local `copy` makes for its own in-process source half.
+///
 /// # Errors
 /// Refuses malformed frames, a peer on another wire, unsafe state roots,
 /// source failures and broken I/O.
-pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -> Result<()> {
+pub fn serve<R: Read + Send + 'static, W: Write>(input: R, output: &mut W) -> Result<()> {
+    serve_session(input, output, None)
+}
+
+/// [`serve`], with the loopback hand-off when `copy` runs it
+/// (OI-1003-Q154 levers 1 and 2): chunks are handed over, not written.
+#[allow(clippy::too_many_lines)] // Open, the stores, the threads' scope, SourceDone.
+fn serve_session<R: Read + Send + 'static, W: Write>(
+    mut input: R,
+    output: &mut W,
+    hand: Option<HandOut>,
+) -> Result<()> {
     let (root, state, sqlite, as_root) = read_open(&mut input)?;
     // S2 (WP1 PR 3): refuse before `Store::open` creates the state root, so
     // an overlapping state never writes a byte inside the source.
@@ -1502,7 +1755,25 @@ pub fn serve<R: Read + Send + 'static, W: Write>(mut input: R, output: &mut W) -
                 .spawn_scoped(scope, move || capture_worker(work, job_queue, &events))
                 .refuse_at("transfer::serve")?;
         }
-        let sent = send_entries(output, &committer, &events, jobs, &gate);
+        let sent = match hand {
+            // Lever 2: frames batched until the sending thread waits.
+            Some(hand) => send_entries(
+                &mut Corked::new(&mut *output),
+                Some(hand),
+                &committer,
+                &events,
+                jobs,
+                &gate,
+            ),
+            None => send_entries(
+                &mut Plain(&mut *output),
+                None,
+                &committer,
+                &events,
+                jobs,
+                &gate,
+            ),
+        };
         // Wake any capture thread waiting on credit, and the walk thread
         // waiting on a walk-ahead slot; their work is moot now.
         credit.close();
@@ -1627,9 +1898,118 @@ fn spawn_reader<R: Read + Send + 'static>(
     Ok(())
 }
 
+/// A writer the sending thread empties before it blocks.
+///
+/// Over a transport every frame is flushed as it is written ([`Plain`]), as
+/// before. In a loopback `copy` with the hand-off (OI-1003-Q154 lever 2)
+/// the frames are batched ([`Corked`]): written to the socket only when the
+/// sending thread is about to wait for its next event, or a buffer fills.
+/// The sending thread waits on nothing but its events (the destination's
+/// frames among them), so every frame the destination could wait for is on
+/// the socket before the source waits.
+trait Uncork: Write {
+    /// Write out every frame held back.
+    ///
+    /// # Errors
+    /// The transport's failure.
+    fn uncork(&mut self) -> Result<()>;
+}
+
+impl<W: Uncork + ?Sized> Uncork for &mut W {
+    fn uncork(&mut self) -> Result<()> {
+        (**self).uncork()
+    }
+}
+
+/// Frames written, and flushed, one at a time: every transport's writer.
+struct Plain<'a, W>(&'a mut W);
+
+impl<W: Write> Write for Plain<'_, W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.write(data)
+    }
+
+    fn write_vectored(&mut self, data: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        self.0.write_vectored(data)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<W: Write> Uncork for Plain<'_, W> {
+    fn uncork(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Bytes a loopback sending thread batches before it writes them.
+const CORK_BYTES: usize = 64 * 1024;
+
+/// A loopback `copy`'s batched sending side (lever 2): a frame's own
+/// `flush` holds it back; [`Uncork::uncork`] writes them all out.
+struct Corked<'a, W: Write>(std::io::BufWriter<&'a mut W>);
+
+impl<'a, W: Write> Corked<'a, W> {
+    fn new(output: &'a mut W) -> Self {
+        Self(std::io::BufWriter::with_capacity(CORK_BYTES, output))
+    }
+}
+
+impl<W: Write> Write for Corked<'_, W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        self.0.write(data)
+    }
+
+    fn write_vectored(&mut self, data: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        self.0.write_vectored(data)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<W: Write> Uncork for Corked<'_, W> {
+    fn uncork(&mut self) -> Result<()> {
+        self.0.flush().refuse_at("transfer::uncork")
+    }
+}
+
+/// The sending thread's writes to the wire, timed (`send_write_ns`, #217
+/// review): where the source's one serial sending stage blocks on the wire.
+struct TimedWrite<W>(W);
+
+impl<W: Uncork> Uncork for TimedWrite<W> {
+    fn uncork(&mut self) -> Result<()> {
+        let _timer = PhaseTimer(&SEND_WRITE_NS, Instant::now());
+        self.0.uncork()
+    }
+}
+
+impl<W: Write> Write for TimedWrite<W> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let _timer = PhaseTimer(&SEND_WRITE_NS, Instant::now());
+        self.0.write(data)
+    }
+
+    fn write_vectored(&mut self, data: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let _timer = PhaseTimer(&SEND_WRITE_NS, Instant::now());
+        self.0.write_vectored(data)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let _timer = PhaseTimer(&SEND_WRITE_NS, Instant::now());
+        self.0.flush()
+    }
+}
+
 /// The sending thread's view of the session.
 struct Outbound<'a, W> {
     output: &'a mut W,
+    /// The loopback hand-off, in a local `copy` only (OI-1003-Q154).
+    hand: Option<HandOut>,
     committer: &'a Committer<LedgerSink>,
     jobs: Sender<Job>,
     gate: &'a WalkGate,
@@ -1658,15 +2038,18 @@ struct Outbound<'a, W> {
 /// The sending thread: offer walked entries, act on decisions and chunk
 /// requests, and write capture output as it arrives. Returns the source
 /// bytes read and the entries offered.
-fn send_entries<W: Write>(
+fn send_entries<W: Uncork>(
     output: &mut W,
+    hand: Option<HandOut>,
     committer: &Committer<LedgerSink>,
     events: &Receiver<Event>,
     jobs: Sender<Job>,
     gate: &WalkGate,
 ) -> Result<(u64, u64)> {
+    let mut output = TimedWrite(output);
     let mut outbound = Outbound {
-        output,
+        output: &mut output,
+        hand,
         committer,
         jobs,
         gate,
@@ -1685,11 +2068,24 @@ fn send_entries<W: Write>(
     loop {
         outbound.offer()?;
         if outbound.finished() {
+            outbound.output.uncork()?;
             return Ok((outbound.bytes_read, outbound.entries.len() as u64));
         }
-        let waited = Instant::now();
-        let event = events.recv().map_err(|_| BulkloadRefusal::WorkerLost)?;
-        SEND_WAIT_NS.fetch_add(elapsed_ns(waited), Ordering::Relaxed);
+        let event = match events.try_recv() {
+            Ok(event) => event,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                // About to wait: nothing the destination may need stays
+                // held back (lever 2's batching; a no-op over a transport).
+                outbound.output.uncork()?;
+                let waited = Instant::now();
+                let event = events.recv().map_err(|_| BulkloadRefusal::WorkerLost)?;
+                SEND_WAIT_NS.fetch_add(elapsed_ns(waited), Ordering::Relaxed);
+                event
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                return Err(BulkloadRefusal::WorkerLost);
+            }
+        };
         let _handle_timer = PhaseTimer(&SEND_HANDLE_NS, Instant::now());
         outbound.handle(event)?;
     }
@@ -1816,7 +2212,7 @@ impl<W: Write> Outbound<'_, W> {
             Event::WalkEnded => self.walked = true,
             Event::Decide { entry, decision } => self.decide(entry, &decision)?,
             Event::NeedChunks { entry, indices } => self.need_chunks(entry, indices)?,
-            Event::Chunk { header, data } => write_data(self.output, &header, &data)?,
+            Event::Chunk { header, chunk } => self.chunk(&header, chunk)?,
             Event::Snapshot { entry, size, wal } => self.snapshot(entry, size, wal)?,
             Event::Manifest {
                 entry,
@@ -1915,6 +2311,25 @@ impl<W: Write> Outbound<'_, W> {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Send one chunk: as a data frame over a transport, or, in a loopback
+    /// `copy`, handed over with only its header on the socket (OI-1003-Q154
+    /// lever 2). The chunk is in the hand-off queue before its frame is
+    /// written, so the destination finds it when it reads the frame.
+    fn chunk(&mut self, header: &DataHeader, chunk: SourceChunk) -> Result<()> {
+        let Some(hand) = &self.hand else {
+            return write_data(self.output, header, chunk.bytes());
+        };
+        let prefix = handoff::handed_prefix(header)?;
+        hand.give(chunk)?;
+        self.output
+            .write_all(&prefix)
+            .refuse_at("transfer::handed_frame")?;
+        self.output.flush().refuse_at("transfer::handed_frame")?;
+        counters::bump(Counter::WireFramesSent);
+        counters::add_len(Counter::WireBytesSent, prefix.len());
         Ok(())
     }
 
@@ -2196,9 +2611,7 @@ fn send_capture(
     sniffed: &mut Option<(Vec<u8>, RefusedSeat)>,
 ) -> Result<Event> {
     let key = row_key(work.authority, row)?;
-    let sink = |index, offset, digest, data: Vec<u8>| {
-        send_chunk(work, events, entry, index, offset, digest, data)
-    };
+    let sink = |index, offset, chunk| send_chunk(work, events, entry, index, offset, chunk);
     let (chunks, racy) = match capture_file(work, row, wal, bytes_read, sniffed, sink)? {
         Captured::Raw(chunks, racy) => (chunks, racy),
         Captured::Database(opened) => {
@@ -2236,10 +2649,9 @@ fn send_chunk(
     entry: u64,
     index: u32,
     offset: u64,
-    digest: [u8; 32],
-    data: Vec<u8>,
+    chunk: SourceChunk,
 ) -> Result<()> {
-    let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+    let size = u32::try_from(chunk.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
     work.credit.acquire(u64::from(size))?;
     events
         .send(Event::Chunk {
@@ -2248,9 +2660,9 @@ fn send_chunk(
                 index,
                 size,
                 offset,
-                digest,
+                digest: *chunk.digest(),
             },
-            data: Arc::new(data),
+            chunk,
         })
         .map_err(|_| BulkloadRefusal::WorkerLost)
 }
@@ -2288,6 +2700,14 @@ fn ledger_read<T>(mode: LedgerSync, read: Result<Option<T>>) -> Result<Option<T>
     }
 }
 
+/// Whether a source ledger row's manifest can be offered for `row` without
+/// a read: it covers exactly the row's size within the chunk bound. The
+/// source offers it ([`manifest_capture`]), and the delta lever keeps such
+/// a seat on its manifest (`Inbound::wants_manifest`).
+fn ledger_manifest_fits(manifest: &Manifest, row: &RowSchema) -> bool {
+    manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS
+}
+
 /// One entry's manifest: from the ledger when this exact stat identity is
 /// recorded (no source read), otherwise from one read of the file, whose
 /// chunks are all kept in memory for the requests that follow.
@@ -2310,7 +2730,7 @@ fn manifest_capture(
     // A database seat is never recorded, so a ledger row names a file that
     // was carried raw under this exact identity.
     if let Some(manifest) = ledger_read(work.ledger, store.capture(&key))? {
-        if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
+        if ledger_manifest_fits(&manifest, row) {
             return Ok(Offered::Offer((None, manifest, None, false)));
         }
     }
@@ -2323,8 +2743,8 @@ fn manifest_capture(
     let Some(mut retained) = Retained::reserve(&work.retain, row.size) else {
         return Ok(Offered::NoRoom);
     };
-    let captured = capture_file(work, row, wal, bytes_read, sniffed, |_, _, _, data| {
-        retained.chunks.push(Arc::new(data));
+    let captured = capture_file(work, row, wal, bytes_read, sniffed, |_, _, chunk| {
+        retained.chunks.push(chunk);
         Ok(())
     })?;
     match captured {
@@ -2391,12 +2811,12 @@ fn serve_chunks(
         let offset = *offsets
             .get(at)
             .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
-        let data = if let Some(held) = held {
-            Arc::clone(
-                held.chunks
-                    .get(at)
-                    .ok_or(BulkloadRefusal::ProtocolStateViolation)?,
-            )
+        let chunk = if let Some(held) = held {
+            held.chunks
+                .get(at)
+                .filter(|chunk| *chunk.digest() == spec.digest)
+                .ok_or(BulkloadRefusal::ProtocolStateViolation)?
+                .clone()
         } else if let Some(slot) = slot {
             slot_chunk(slot, spec, offset)?
         } else {
@@ -2416,25 +2836,10 @@ fn serve_chunks(
             }
             *bytes_read = bytes_read.saturating_add(spec.size);
             counters::add_len(Counter::SourceFileRead, data.len());
-            if counters::hash(Counter::HashCaptureChunk, &data) != spec.digest {
-                return Err(BulkloadRefusal::SourceChangedAfterSnapshot);
-            }
-            Arc::new(data)
+            SourceChunk::checked(data, &spec.digest)
+                .ok_or(BulkloadRefusal::SourceChangedAfterSnapshot)?
         };
-        let size = u32::try_from(data.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
-        work.credit.acquire(u64::from(size))?;
-        events
-            .send(Event::Chunk {
-                header: DataHeader {
-                    entry,
-                    index: *index,
-                    size,
-                    offset,
-                    digest: spec.digest,
-                },
-                data,
-            })
-            .map_err(|_| BulkloadRefusal::WorkerLost)?;
+        send_chunk(work, events, entry, *index, offset, chunk)?;
     }
     if let Some(file) = &opened {
         if StatIdentity::from_metadata(&file.metadata().refuse_at("transfer::serve_chunks")?)
@@ -2460,16 +2865,16 @@ fn serve_chunks(
 /// One chunk of the snapshot a manifest was built from, read again from its
 /// slot and checked against its digest: private state, not a source read
 /// (#218).
-fn slot_chunk(slot: &SlotFile, spec: &ChunkSpec, offset: u64) -> Result<Arc<Vec<u8>>> {
+fn slot_chunk(slot: &SlotFile, spec: &ChunkSpec, offset: u64) -> Result<SourceChunk> {
     let mut data =
         vec![0_u8; usize::try_from(spec.size).map_err(|_| BulkloadRefusal::BudgetExceeded)?];
     let read = crate::io::sys::pread_full(&slot.file, &mut data, offset)
         .refuse_at("transfer::slot_chunk")?;
     counters::add_len(Counter::SourceSnapshotRead, read);
-    if read != data.len() || counters::hash(Counter::HashCaptureChunk, &data) != spec.digest {
+    if read != data.len() {
         return Err(BulkloadRefusal::DigestMismatch);
     }
-    Ok(Arc::new(data))
+    SourceChunk::checked(data, &spec.digest).ok_or(BulkloadRefusal::DigestMismatch)
 }
 
 /// What [`capture_file`] did with a seat.
@@ -2578,7 +2983,7 @@ fn capture_file<'w>(
     beside: Option<&SidecarId>,
     bytes_read: &mut u64,
     sniffed: &mut Option<(Vec<u8>, RefusedSeat)>,
-    mut sink: impl FnMut(u32, u64, [u8; 32], Vec<u8>) -> Result<()>,
+    mut sink: impl FnMut(u32, u64, SourceChunk) -> Result<()>,
 ) -> Result<Captured<'w>> {
     if row.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
         return Err(BulkloadRefusal::BudgetExceeded);
@@ -2691,11 +3096,14 @@ fn capture_file<'w>(
         if chunks.len() >= MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
-        let digest = counters::hash(Counter::HashCaptureChunk, &chunk.data);
-        let size = chunk.data.len() as u64;
+        let chunk = SourceChunk::hashed(chunk.data);
+        let size = chunk.len() as u64;
         let index = u32::try_from(chunks.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
-        chunks.push(ChunkSpec { digest, size });
-        sink(index, offset, digest, chunk.data)?;
+        chunks.push(ChunkSpec {
+            digest: *chunk.digest(),
+            size,
+        });
+        sink(index, offset, chunk)?;
         offset = offset
             .checked_add(size)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
@@ -2813,7 +3221,7 @@ fn snapshot_seat(
         let chunks = chunk_slot(
             retained.slot.as_ref().ok_or(BulkloadRefusal::WorkerLost)?,
             taken.size,
-            |_, _, _, _| Ok(()),
+            |_, _, _| Ok(()),
         )?;
         return Ok(Event::Manifest {
             entry,
@@ -2825,8 +3233,8 @@ fn snapshot_seat(
         });
     }
     let slot = taken.slot;
-    let chunks = chunk_slot(&slot, taken.size, |index, offset, digest, data| {
-        send_chunk(work, events, entry, index, offset, digest, data)
+    let chunks = chunk_slot(&slot, taken.size, |index, offset, chunk| {
+        send_chunk(work, events, entry, index, offset, chunk)
     })?;
     drop(slot);
     let manifest = Manifest::new(chunks);
@@ -2847,7 +3255,7 @@ fn snapshot_seat(
 fn chunk_slot(
     slot: &SlotFile,
     size: u64,
-    mut sink: impl FnMut(u32, u64, [u8; 32], Vec<u8>) -> Result<()>,
+    mut sink: impl FnMut(u32, u64, SourceChunk) -> Result<()>,
 ) -> Result<Vec<ChunkSpec>> {
     let mut chunks = Vec::new();
     let mut offset = 0_u64;
@@ -2872,14 +3280,14 @@ fn chunk_slot(
         if chunks.len() >= MAX_MANIFEST_CHUNKS {
             return Err(BulkloadRefusal::BudgetExceeded);
         }
-        let digest = counters::hash(Counter::HashCaptureChunk, &chunk.data);
-        let length = chunk.data.len() as u64;
+        let chunk = SourceChunk::hashed(chunk.data);
+        let length = chunk.len() as u64;
         let index = u32::try_from(chunks.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
         chunks.push(ChunkSpec {
-            digest,
+            digest: *chunk.digest(),
             size: length,
         });
-        sink(index, offset, digest, chunk.data)?;
+        sink(index, offset, chunk)?;
         offset = offset
             .checked_add(length)
             .ok_or(BulkloadRefusal::BudgetExceeded)?;
@@ -3315,6 +3723,7 @@ fn finish_receive(
     stats
         .directories_fallback
         .clone_from(&target.created().fallback);
+    stats.directories_folded = target.folded();
     if stats.refusals.is_empty() {
         target.finish_directories(store)?;
     }
@@ -3444,6 +3853,15 @@ fn bound_salvage(
 /// for session reuse, a quarter for staged files queued or grouped for
 /// commit, which hold one descriptor each, and an eighth for the outputs
 /// its superseding publishes displace ([`Displaced`]).
+///
+/// Its groups wait [`DEST_GROUP_IDLE`] for the next output and commit at
+/// least every [`DEST_GROUP_AGE`] (OI-1003-Q154 lever 3: fewer synced
+/// commits). Every group still seals its files and directories before its
+/// one FULL commit, and every `Held` still follows that commit, so a larger
+/// group changes when outputs become durable, never the order (R25,
+/// `BulkloadTransfer.tla` `Commit` over any nonempty set of ready seats).
+/// The most a crash can leave unrecorded is still one group: at most its
+/// file and byte bounds, which are unchanged.
 fn publication_committer(
     state: &Path,
     budget: u64,
@@ -3458,9 +3876,398 @@ fn publication_committer(
         crate::io::durable::Limits {
             group_files: staged,
             queue_depth: usize::try_from(staged).unwrap_or(1),
+            group_idle: dest_group_idle(),
+            group_age: Some(DEST_GROUP_AGE),
             ..crate::io::durable::Limits::default()
         },
     )
+}
+
+/// How long a destination group waits for its next output before it
+/// commits.
+///
+/// OI-1003-Q154 lever 3. A session's last group commits when its stream
+/// drains (`Inbound::settle_held`), whatever is left of this.
+/// With the 20 ms [`crate::io::durable::GROUP_IDLE`] before it, a local copy
+/// of corpus v1 committed 10 to 18 destination groups on the rig. Expected
+/// with this idle, not yet measured there: once or twice, if the rig lands
+/// its outputs less than this apart, as sting's informational census did
+/// (1 destination group commit against 3 to 5 at 20 ms, 2026-10-15, not of
+/// record). The rig series decides it.
+const DEST_GROUP_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The longest a destination group stays open (OI-1003-Q154 lever 3): a
+/// steady trickle of outputs, each within [`DEST_GROUP_IDLE`] of the last,
+/// still commits, and is answered `Held`, at least this often.
+const DEST_GROUP_AGE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Sets [`DEST_GROUP_IDLE`] in milliseconds for a process.
+///
+/// For the bench's A/B (OI-1003-Q154 lever 3): `20` is the idle before the
+/// lever. Unset or malformed keeps the default. Any value is safe: it only
+/// moves where groups end.
+pub const DEST_GROUP_IDLE_ENV: &str = "BULKLOAD_DEST_GROUP_IDLE_MS";
+
+fn dest_group_idle() -> std::time::Duration {
+    std::env::var(DEST_GROUP_IDLE_ENV)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map_or(DEST_GROUP_IDLE, std::time::Duration::from_millis)
+}
+
+/// Turns off the directory finish's fold into the session's last output
+/// group when `0` (OI-1003-Q154 lever 3; the SOTA study's lever 2).
+///
+/// For the bench's A/B: off, every directory this session created is
+/// finished after the last group as before, each sealed on its own and all
+/// completed in a commit of their own (`directories_folded` stays 0). Unset,
+/// or anything else, keeps the fold. Either way every completion follows
+/// its directory's sealed final mode (`DirectoryRecords.tla`: `Complete`
+/// or `GroupFinish`).
+pub const DIRECTORY_FOLD_ENV: &str = "BULKLOAD_DIRECTORY_FOLD";
+
+/// The directory fold by canonical destination root, for tests that compare
+/// both paths in one process.
+static DIRECTORY_FOLD_OVERRIDE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+
+/// Run sessions into the canonical destination `root` with the directory
+/// fold on or off (`None`: the default again). Test hook.
+#[doc(hidden)]
+pub fn set_directory_fold(root: &Path, on: Option<bool>) {
+    let mut overrides = DIRECTORY_FOLD_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(on) = on {
+        overrides.push((root.to_path_buf(), on));
+    }
+}
+
+/// Whether a session into the canonical destination `root` may fold its
+/// directory finish into its last group: on, unless [`DIRECTORY_FOLD_ENV`]
+/// is `0` or a test turned it off for `root`.
+fn directory_fold(root: &Path) -> bool {
+    let found = DIRECTORY_FOLD_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, on)| *on);
+    found.unwrap_or_else(|| std::env::var(DIRECTORY_FOLD_ENV).map_or(true, |value| value != "0"))
+}
+
+/// Where in handling one chunk an entry's content failed. Within one chunk
+/// index the order is fixed: its verify (or its size), then the stage of the
+/// entry's file, then its write, then its write-back kick (#217 review), so
+/// the refusal is the same whichever thread found which failure first.
+/// [`Step::Seat`] precedes them all: a refusal decided before any content
+/// arrived (a `SQLite` snapshot past the free-space floor or the chunk
+/// bound, #218 R7) stands whatever its content then does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Step {
+    Seat,
+    Verify,
+    Stage,
+    Place,
+    Kick,
+}
+
+/// An entry's first content failure, by chunk index and [`Step`]. Today's
+/// inline path refused with the failure it met first, and it met them in
+/// index order; the receive workers keep that answer by keeping the least.
+#[derive(Clone, Debug)]
+struct Failure {
+    index: u32,
+    step: Step,
+    refusal: BulkloadRefusal,
+}
+
+/// Keep the earlier of an entry's failure and `found`.
+fn fold_failure(failure: &mut Option<Failure>, found: Failure) {
+    if failure
+        .as_ref()
+        .is_none_or(|kept| (found.index, found.step) < (kept.index, kept.step))
+    {
+        *failure = Some(found);
+    }
+}
+
+/// An entry's staged file as its chunk writes see it, shared by the jobs
+/// that write it: the bytes placed so far, which time its write-back kicks
+/// (item 1a), and whether a write has failed, after which none is tried.
+struct WriteTarget {
+    file: Arc<std::fs::File>,
+    placed: AtomicU64,
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl WriteTarget {
+    fn new(file: &Arc<std::fs::File>, placed: u64) -> Arc<Self> {
+        Arc::new(Self {
+            file: Arc::clone(file),
+            placed: AtomicU64::new(placed),
+            failed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+}
+
+/// The bytes after which an entry's file is kicked into write-back.
+#[cfg(not(any(test, feature = "io-trace")))]
+const fn kick_bytes() -> u64 {
+    WRITEBACK_KICK_BYTES
+}
+
+/// The kick interval; a traced or test build may set a smaller one.
+#[cfg(any(test, feature = "io-trace"))]
+fn kick_bytes() -> u64 {
+    match KICK_BYTES_OVERRIDE.load(Ordering::Relaxed) {
+        0 => WRITEBACK_KICK_BYTES,
+        bytes => bytes,
+    }
+}
+
+/// Kick interval in bytes for a traced or test build (0: the default).
+#[cfg(any(test, feature = "io-trace"))]
+static KICK_BYTES_OVERRIDE: AtomicU64 = AtomicU64::new(0);
+
+/// Milliseconds each receive worker waits before its job, for a traced or
+/// test build (0: none).
+#[cfg(any(test, feature = "io-trace"))]
+static RECV_WORKER_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Make every receive worker wait `millis` before each job (`0`: none),
+/// process-wide, so a trace shows whether `End` waits for its entry's
+/// writes (S1 throughput review, 2026-10-09). Only in a traced or test
+/// build.
+#[cfg(any(test, feature = "io-trace"))]
+#[doc(hidden)]
+pub fn set_recv_worker_delay(millis: u64) {
+    RECV_WORKER_DELAY_MS.store(millis, Ordering::Relaxed);
+}
+
+/// Kick every staged file into write-back each `bytes` placed (`0`: the
+/// default, [`WRITEBACK_KICK_BYTES`]), process-wide, so a power-loss trace
+/// of small files holds kicks (S1 throughput review, 2026-10-09). Only in a
+/// traced or test build.
+#[cfg(any(test, feature = "io-trace"))]
+#[doc(hidden)]
+pub fn set_writeback_kick_bytes(bytes: u64) {
+    KICK_BYTES_OVERRIDE.store(bytes, Ordering::Relaxed);
+}
+
+/// Kick `file` into write-back when `placed` bytes, after `before`, crossed
+/// a multiple of the kick interval (OI-1003-Q143 item 1a). An error the
+/// kick returns is the entry's refusal, a full device its typed space
+/// refusal; write-back errors it does not return are still reported by the
+/// file's seal.
+fn kick_after(file: &std::fs::File, before: u64, placed: u64) -> Result<()> {
+    if !crosses(before, placed, kick_bytes()) {
+        return Ok(());
+    }
+    crate::io::durable::kick_writeback(file).map_err(|error| {
+        crate::materialize::space_refusal(crate::refuse::io(&error, "transfer::kick_after"))
+    })
+}
+
+/// Whether `placed` bytes after `before` cross a multiple of `interval`.
+const fn crosses(before: u64, placed: u64, interval: u64) -> bool {
+    placed > 0 && interval > 0 && before / interval != before.saturating_add(placed) / interval
+}
+
+/// Write `data` at `offsets` of an entry's staged file and kick its
+/// write-back when that crosses the interval.
+fn place_counted(
+    target: &WriteTarget,
+    data: &[u8],
+    offsets: &[u64],
+) -> std::result::Result<(), (Step, BulkloadRefusal)> {
+    if target.failed.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    place(&target.file, data, offsets).map_err(|refusal| (Step::Place, refusal))?;
+    let placed = (data.len() as u64).saturating_mul(offsets.len() as u64);
+    let before = target.placed.fetch_add(placed, Ordering::Relaxed);
+    kick_after(&target.file, before, placed).map_err(|refusal| (Step::Kick, refusal))
+}
+
+/// One data frame's verify and write, for a receive worker or inline.
+struct RecvJob {
+    entry: u64,
+    index: u32,
+    digest: [u8; 32],
+    payload: Payload,
+    /// False when the receiving thread already verified it (the chunk that
+    /// staged its entry's file, #217 review), or when the in-process source
+    /// vouches for it (a handed chunk, [`Payload::vouched`]: OI-1003-Q154
+    /// lever 1).
+    verify: bool,
+    /// Where it is written, or `None` once its entry has failed or when it
+    /// fills no offset.
+    write: Option<(Arc<WriteTarget>, Vec<u64>)>,
+    /// What it holds of [`RECV_POOL_BYTES`].
+    charge: u64,
+}
+
+/// A finished [`RecvJob`]: its failure, if any, or a worker that panicked.
+struct RecvDone {
+    entry: u64,
+    failure: Option<Failure>,
+    charge: u64,
+    lost: bool,
+}
+
+/// Verify one data frame against its digest (the one integrity check on
+/// received bytes; a handed chunk's is the source's own, see
+/// [`Payload::vouched`]), then write it. `on_worker` picks the timers.
+fn run_recv_job(job: RecvJob, on_worker: bool) -> RecvDone {
+    let RecvJob {
+        entry,
+        index,
+        digest,
+        payload,
+        verify,
+        write,
+        charge,
+    } = job;
+    #[cfg(test)]
+    #[allow(clippy::panic)]
+    if on_worker
+        && PANIC_DIGESTS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&digest)
+    {
+        panic!("test: a receive worker panics on its job");
+    }
+    #[cfg(any(test, feature = "io-trace"))]
+    if on_worker {
+        let delay = RECV_WORKER_DELAY_MS.load(Ordering::Relaxed);
+        if delay > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay));
+        }
+    }
+    let mut failure = None;
+    if verify {
+        let started = Instant::now();
+        let verified = verify_wire(&payload, &digest);
+        let timer = if on_worker {
+            &RECV_WORKER_VERIFY_NS
+        } else {
+            &RECV_VERIFY_NS
+        };
+        timer.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        if !verified {
+            failure = Some(Failure {
+                index,
+                step: Step::Verify,
+                refusal: BulkloadRefusal::DigestMismatch,
+            });
+        }
+    }
+    if let Some((target, offsets)) = &write {
+        if failure.is_none() {
+            let started = Instant::now();
+            if let Err((step, refusal)) = place_counted(target, payload.bytes(), offsets) {
+                failure = Some(Failure {
+                    index,
+                    step,
+                    refusal,
+                });
+            }
+            if on_worker {
+                RECV_WORKER_PLACE_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+            }
+        }
+        if failure.is_some() {
+            target.failed.store(true, Ordering::Relaxed);
+        }
+    }
+    RecvDone {
+        entry,
+        failure,
+        charge,
+        lost: false,
+    }
+}
+
+/// The destination's own check of received bytes: within the chunk bound
+/// and hashing to `digest` (`blake3_dest_wire_verify_bytes`).
+fn verify_wire(payload: &Payload, digest: &[u8; 32]) -> bool {
+    payload.len() <= crate::hash::CDC_MAX_BYTES as usize
+        && counters::hash(Counter::HashWireVerify, payload.bytes()) == *digest
+}
+
+/// One receive worker: run jobs until the queue closes. A job that panics
+/// is answered as lost, so the receiving thread ends the session with
+/// `WORKER_LOST` instead of waiting on it (#217 review).
+fn recv_worker(jobs: &Mutex<Receiver<RecvJob>>, done: &Sender<RecvDone>) {
+    loop {
+        let job = jobs.lock().unwrap_or_else(PoisonError::into_inner).recv();
+        let Ok(job) = job else {
+            return;
+        };
+        let (entry, charge) = (job.entry, job.charge);
+        let finished =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_recv_job(job, true)))
+                .unwrap_or(RecvDone {
+                    entry,
+                    failure: None,
+                    charge,
+                    lost: true,
+                });
+        if done.send(finished).is_err() {
+            return;
+        }
+    }
+}
+
+/// The receiving thread's side of the receive workers.
+struct RecvPool {
+    jobs: Sender<RecvJob>,
+    done: Receiver<RecvDone>,
+    /// Charged bytes and jobs queued or in progress.
+    bytes: u64,
+    queued: usize,
+}
+
+/// How many receive workers a session at `root` runs.
+fn recv_workers(root: &Path) -> usize {
+    let found = RECV_WORKERS_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, workers)| *workers);
+    if let Some(workers) = found {
+        return workers.min(RECV_WORKERS_MAX);
+    }
+    if let Some(workers) = std::env::var(RECV_WORKERS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|workers| *workers <= RECV_WORKERS_MAX)
+    {
+        return workers;
+    }
+    let spare =
+        std::thread::available_parallelism().map_or(1, |cores| cores.get().saturating_sub(1));
+    RECV_WORKERS.min(spare)
+}
+
+/// Receive workers by canonical destination root, for tests and benches
+/// that compare worker counts in one process (OI-1003-Q143 item 3).
+static RECV_WORKERS_OVERRIDE: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(Vec::new());
+
+/// Run sessions into the canonical destination `root` with `workers`
+/// receive workers (`None`: the default again). Test and bench hook.
+#[doc(hidden)]
+pub fn set_recv_workers(root: &Path, workers: Option<usize>) {
+    let mut overrides = RECV_WORKERS_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(workers) = workers {
+        overrides.push((root.to_path_buf(), workers));
+    }
 }
 
 /// What the destination knows of an entry before its content arrives.
@@ -3500,11 +4307,15 @@ struct Streaming {
     record: [u8; 32],
     snapshot: bool,
     staged: Option<StagedFile>,
+    /// The staged file as its chunk writes see it.
+    target: Option<Arc<WriteTarget>>,
     specs: Vec<ChunkSpec>,
     offset: u64,
     hints: Vec<ChunkHint>,
     seen: HashSet<[u8; 32]>,
-    failure: Option<BulkloadRefusal>,
+    failure: Option<Failure>,
+    /// Chunk jobs not yet finished.
+    outstanding: usize,
     /// Streamed in answer to `WantManifest` (the source could not keep the
     /// chunks for a manifest): an existing output at the path is adopted
     /// against the streamed chunks instead of refused.
@@ -3513,16 +4324,22 @@ struct Streaming {
 
 impl Streaming {
     /// One streamed chunk: it must be the next index at the next offset.
-    /// It is written once verified; a content fault becomes the entry's
-    /// refusal and the stream stays in step.
+    /// Returns the job that verifies it and writes it once verified; a
+    /// content fault becomes the entry's refusal and the stream stays in
+    /// step.
+    ///
+    /// The chunk that would stage the entry's file is verified here first,
+    /// with `verify`, so a corrupt first chunk stages nothing, as before
+    /// the receive workers. A chunk the in-process source `vouched` for is
+    /// not hashed again (OI-1003-Q154 lever 1).
     fn accept(
         &mut self,
         target: &Destination,
         open: &mut usize,
         header: &DataHeader,
-        payload: &[u8],
-        verified: bool,
-    ) -> Result<()> {
+        (payload, vouched): (Payload, bool),
+        verify: impl FnOnce(&Payload) -> bool,
+    ) -> Result<Option<RecvJob>> {
         if header.index as usize != self.specs.len() || header.offset != self.offset {
             return Err(BulkloadRefusal::ProtocolStateViolation);
         }
@@ -3533,28 +4350,46 @@ impl Streaming {
         }
         let size = payload.len() as u64;
         let end = self.offset.saturating_add(size);
-        if self.failure.is_none() && (!verified || end > self.row.size) {
-            self.failure = Some(BulkloadRefusal::DigestMismatch);
+        let failed = |step, refusal| Failure {
+            index: header.index,
+            step,
+            refusal,
+        };
+        if end > self.row.size {
+            fold_failure(
+                &mut self.failure,
+                failed(Step::Verify, BulkloadRefusal::DigestMismatch),
+            );
         }
+        let mut job_verifies = !vouched;
         if self.failure.is_none() && self.staged.is_none() {
-            if *open >= MAX_OPEN_ENTRIES {
-                return Err(BulkloadRefusal::ProtocolStateViolation);
-            }
-            match target.stage(&self.row) {
-                Ok(staged) => {
-                    *open += 1;
-                    self.staged = Some(staged);
+            job_verifies = false;
+            if vouched || verify(&payload) {
+                if *open >= MAX_OPEN_ENTRIES {
+                    return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
-                Err(refusal) => self.failure = Some(refusal),
+                match target.stage(&self.row) {
+                    Ok(staged) => {
+                        *open += 1;
+                        self.target = Some(WriteTarget::new(staged.file(), 0));
+                        self.staged = Some(staged);
+                    }
+                    Err(refusal) => fold_failure(&mut self.failure, failed(Step::Stage, refusal)),
+                }
+            } else {
+                fold_failure(
+                    &mut self.failure,
+                    failed(Step::Verify, BulkloadRefusal::DigestMismatch),
+                );
             }
         }
-        if self.failure.is_none() {
-            if let Some(staged) = &self.staged {
-                if let Err(refusal) = place(staged.file(), payload, &[self.offset]) {
-                    self.failure = Some(refusal);
-                }
-            }
-        }
+        let write = if self.failure.is_none() {
+            self.target
+                .as_ref()
+                .map(|target| (Arc::clone(target), vec![self.offset]))
+        } else {
+            None
+        };
         self.specs.push(ChunkSpec {
             digest: header.digest,
             size,
@@ -3567,7 +4402,19 @@ impl Streaming {
             });
         }
         self.offset = end;
-        Ok(())
+        if !job_verifies && write.is_none() {
+            return Ok(None);
+        }
+        self.outstanding += 1;
+        Ok(Some(RecvJob {
+            entry: header.entry,
+            index: header.index,
+            digest: header.digest,
+            charge: size.max(RECV_JOB_MIN_BYTES),
+            payload,
+            verify: job_verifies,
+            write,
+        }))
     }
 
     fn new(seat: Seat, adopt: bool) -> Self {
@@ -3577,11 +4424,17 @@ impl Streaming {
             record: seat.record,
             snapshot: seat.snapshot,
             staged: None,
+            target: None,
             specs: Vec::new(),
             offset: 0,
             hints: Vec::new(),
             seen: HashSet::new(),
-            failure: seat.failure,
+            failure: seat.failure.map(|refusal| Failure {
+                index: 0,
+                step: Step::Seat,
+                refusal,
+            }),
+            outstanding: 0,
             adopt,
         }
     }
@@ -3597,8 +4450,70 @@ struct Filling {
     manifest: Manifest,
     offsets: Vec<u64>,
     plan: Plan,
+    /// The staged file of a [`Plan::Write`] as its chunk writes see it.
+    target: Option<Arc<WriteTarget>>,
     expected: VecDeque<u32>,
-    failure: Option<BulkloadRefusal>,
+    failure: Option<Failure>,
+    /// Chunk jobs not yet finished.
+    outstanding: usize,
+}
+
+/// How a session asks for a new path: a regular entry with no file at its
+/// path, in a session that has salvaged no temporary
+/// ([`Inbound::wants_manifest`]). Decided once, at the session's start.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NewPath {
+    /// No published output holds a chunk: nothing here could fill it, so
+    /// `Send`.
+    Stream,
+    /// Published outputs hold chunks: `WantManifest`, to fill it across
+    /// files (`pull`, `receive`, and `copy` with the hand-off off or without
+    /// the delta lever, its default).
+    Manifest,
+    /// Published outputs hold chunks, but a local `copy` with the hand-off
+    /// streams a seat this store holds no reuse row for and the source's
+    /// ledger holds no capture of: `Send` (the delta lever, OI-1003-Q154;
+    /// [`LOCAL_NEW_PATH_STREAM_ENV`]). A seat whose row is here, its output
+    /// removed since, or whose capture the source recorded for another
+    /// destination, still asks for its manifest.
+    StreamLocal,
+}
+
+/// Count one `WantManifest` (`transfer_manifests_asked`) or one new path the
+/// delta lever streamed (`transfer_new_paths_streamed`), and, in lib tests,
+/// in this thread's `NEW_PATH_DECISIONS` too.
+fn count_new_path(counter: Counter) {
+    counters::bump(counter);
+    #[cfg(test)]
+    NEW_PATH_DECISIONS.with(|decided| {
+        let (asked, streamed) = decided.get();
+        decided.set(if counter == Counter::TransferManifestsAsked {
+            (asked + 1, streamed)
+        } else {
+            (asked, streamed + 1)
+        });
+    });
+}
+
+/// The source half's ledger, read-only, as the delta lever consults it
+/// (`Inbound::wants_manifest`). Only in a local `copy` with the hand-off and
+/// the lever on: both halves are this process, and `source_state` names the
+/// store the source half opened before it sent `Start`.
+struct SourceLedger {
+    store: Store,
+    /// The source's authority from `Start`, which its ledger keys are made
+    /// with ([`row_key`]).
+    authority: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's entries asked for by manifest first, and new paths
+    /// the delta lever streamed, for lib tests: the process counters
+    /// (`transfer_manifests_asked`, `transfer_new_paths_streamed`) are
+    /// shared with the tests running beside them. A `copy` decides on its
+    /// caller's thread.
+    static NEW_PATH_DECISIONS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// An entry the destination expects content for.
@@ -3611,6 +4526,13 @@ enum Incoming {
 /// The destination's side of one session.
 struct Inbound<'a, W> {
     output: &'a mut W,
+    /// The loopback hand-off, in a local `copy` only (OI-1003-Q154).
+    hand: Option<HandIn>,
+    /// Test-only mutation: bytes read from the transport are taken as
+    /// vouched for, as if a cross-host session skipped its verify. The
+    /// proof that it does not must fail under it.
+    #[cfg(test)]
+    trust_wire: bool,
     target: &'a mut Destination,
     store: &'a Store,
     authority: Vec<u8>,
@@ -3621,7 +4543,10 @@ struct Inbound<'a, W> {
     stats: TransferStats,
     incoming: HashMap<u64, Incoming>,
     open: usize,
-    fill_locally: bool,
+    /// How a new path is asked for ([`Inbound::wants_manifest`]).
+    new_path: NewPath,
+    /// The source's ledger, for [`NewPath::StreamLocal`] only.
+    source_ledger: Option<SourceLedger>,
     salvage: Salvage,
     /// Salvaged temporaries each entry staged chunks from, by relative path
     /// (#124): kept past the session only if that entry is refused.
@@ -3645,6 +4570,14 @@ struct Inbound<'a, W> {
     space: Option<crate::space::Space>,
     /// Bytes admitted since the last probe.
     since_probe: u64,
+    /// The receive workers, or `None` to verify and write inline.
+    pool: Option<RecvPool>,
+    /// New directories waiting to be created together, and the walk frames
+    /// held back behind them (OI-1003-Q143 item 2).
+    batch: DirectoryBatch,
+    /// A created batch's outcome for each of its directories, taken when
+    /// the directory's held entry is decided.
+    batched: HashMap<Vec<u8>, Result<()>>,
     /// The session's `SQLite` mode, which this side chose (#218).
     sqlite: SqliteMode,
     /// The source's `SqliteSidecar` reports, as (sidecar, base), resolved
@@ -3652,6 +4585,66 @@ struct Inbound<'a, W> {
     sidecars: Vec<SidecarReport>,
     /// Bases published from a snapshot, or reused or adopted as one.
     snapshot_bases: HashSet<Vec<u8>>,
+}
+
+/// A walk frame: what a batch of new directories holds back.
+enum Walked {
+    Entry {
+        entry: u64,
+        row: RowSchema,
+        wal: Option<SidecarId>,
+    },
+    Refused {
+        rel_path: Vec<u8>,
+        code: String,
+        sqlite_code: Option<i32>,
+    },
+    EngineTemporary {
+        rel_path: Vec<u8>,
+    },
+}
+
+/// A batch of new directories (OI-1003-Q143 item 2, R-N102).
+///
+/// The walk is depth-first, so sibling directories are not adjacent in the
+/// stream: batching them defers decisions. A batch opens at a directory
+/// whose leaf is free; from then on every walk frame is held back, in
+/// stream order, and a directory joins the batch as a member when its leaf
+/// is free and its parent is the root, a member, or a directory decided
+/// before the batch opened. A directory whose parent is held but is no
+/// member (an existing directory, whose sweep and adoption seal must come
+/// first, #74 N1) closes the batch before it is looked at (#217 review), and
+/// so does a directory whose path the batch already holds (a source that
+/// offers it twice), so no two members share a key. The batch also closes
+/// at `WalkDone`, at [`Destination::batch`] members
+/// and at [`DIRECTORY_BATCH_FRAMES`] held frames: walk frames only, so its
+/// bounds never depend on timing.
+///
+/// Closing creates the members level by level, shallowest first
+/// ([`Destination::create_directories`]), then decides every held frame in
+/// stream order as it would have been decided at once, a member by its
+/// creation's outcome. A member whose parent member was not created is
+/// decided alone then, against the file system, as without batching.
+#[derive(Default)]
+struct DirectoryBatch {
+    held: Vec<Walked>,
+    /// The held directory entries by path: a member, or held only.
+    directories: HashMap<Vec<u8>, bool>,
+    members: usize,
+}
+
+/// Test-only: destination roots whose batches admit a directory under a
+/// held, undecided parent, the design the #217 review refuted (finding 1),
+/// so a proof can show it fails.
+#[cfg(test)]
+pub(crate) static ADMIT_UNDER_HELD: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// `path`'s parent directory: everything before its last `/`.
+fn parent_of(path: &[u8]) -> &[u8] {
+    path.iter()
+        .rposition(|byte| *byte == b'/')
+        .and_then(|end| path.get(..end))
+        .unwrap_or_default()
 }
 
 /// Re-probe the destination filesystem after admitting this many bytes,
@@ -3688,6 +4681,10 @@ pub fn receive<R: Read, W: Write>(
 /// [`receive`] in the given [`SqliteMode`], which the session's `Open`
 /// carries to the source (#218).
 ///
+/// Every received byte is hashed here (`blake3_dest_wire_verify_bytes`):
+/// `receive_with` never holds the loopback hand-off, and refuses a handed
+/// frame `FRAME_CODEC`, as any wire v6 reader does.
+///
 /// # Errors
 /// As [`receive`].
 pub fn receive_with<R: Read, W: Write>(
@@ -3699,7 +4696,59 @@ pub fn receive_with<R: Read, W: Write>(
     destination_state: &Path,
     sqlite: SqliteMode,
 ) -> Result<TransferStats> {
+    receive_session(
+        input,
+        output,
+        (source, source_state),
+        (destination, destination_state),
+        sqlite,
+        None,
+    )
+}
+
+/// [`receive_with`], with the loopback hand-off when `copy` runs it
+/// (OI-1003-Q154 levers 1 and 2): handed chunks are taken from `hand`, and
+/// the source's own digest of them stands for this side's verify.
+#[allow(clippy::too_many_lines)] // Setup, the workers' scope, the frame loop, the tail.
+fn receive_session<R: Read, W: Write>(
+    input: &mut R,
+    output: &mut W,
+    (source, source_state): (&Path, &Path),
+    (destination, destination_state): (&Path, &Path),
+    sqlite: SqliteMode,
+    hand: Option<HandIn>,
+) -> Result<TransferStats> {
     let setup_timer = PhaseTimer(&RECV_SETUP_NS, Instant::now());
+    // S2: the overlap of the destination's state and root is refused before
+    // either store exists, so `Open` can go out first and the source opens
+    // its store while this side opens its own (OI-1003-Q143 item 1b). The
+    // check on the store's own canonical root below still guards a state
+    // swapped for a symlink in between.
+    let destination_root = std::fs::canonicalize(destination).refuse_at("transfer::receive")?;
+    if overlaps(&canonical_state(destination_state)?, &destination_root) {
+        return Err(BulkloadRefusal::SnapshotRootsOverlap);
+    }
+    write_control(
+        output,
+        &Control::Open {
+            proto: PROTO_VERSION,
+            wire_id: wire_id(),
+            root: source.as_os_str().as_bytes().to_vec(),
+            state: source_state.as_os_str().as_bytes().to_vec(),
+            sqlite,
+        },
+    )?;
+    // The whole window is granted with `Open`, not after this side's setup:
+    // a source with nothing to send may finish, and close the stream, while
+    // this side still opens its store, so nothing may be written to it after
+    // the source's last need (item 1b). The source's reader takes the grant
+    // once its store is open.
+    write_control(
+        output,
+        &Control::Credit {
+            bytes: CREDIT_WINDOW,
+        },
+    )?;
     let store = Store::open(destination_state)?;
     let mut target = Destination::open(destination, &store)?;
     if store.root().starts_with(target.path()) || target.path().starts_with(store.root()) {
@@ -3713,19 +4762,33 @@ pub fn receive_with<R: Read, W: Write>(
     // The committer holds the exclusive publisher, so no temporary of this
     // store is in flight while the root is swept.
     target.sweep_root(&store)?;
-    let fill_locally = store.has_output_hints()?;
-    write_control(
-        output,
-        &Control::Open {
-            proto: PROTO_VERSION,
-            wire_id: wire_id(),
-            root: source.as_os_str().as_bytes().to_vec(),
-            state: source_state.as_os_str().as_bytes().to_vec(),
-            sqlite,
-        },
-    )?;
-    let Frame::Control(Control::Start { authority }) = read_frame(input)? else {
+    let mut new_path = match (
+        store.has_output_hints()?,
+        hand.is_some() && local_new_path_stream(target.path()),
+    ) {
+        (false, _) => NewPath::Stream,
+        (true, false) => NewPath::Manifest,
+        (true, true) => NewPath::StreamLocal,
+    };
+    let Wire::Frame(Frame::Control(Control::Start { authority })) =
+        read_wire(input, hand.as_ref())?
+    else {
         return Err(BulkloadRefusal::ProtocolStateViolation);
+    };
+    // The delta lever reads the source's ledger, which the source half
+    // opened before `Start`. A ledger this side cannot open leaves the
+    // session on the store-wide rule, as with the lever off.
+    let source_ledger = if new_path == NewPath::StreamLocal {
+        let opened = Store::open_reader(source_state).ok();
+        if opened.is_none() {
+            new_path = NewPath::Manifest;
+        }
+        opened.map(|ledger| SourceLedger {
+            store: ledger,
+            authority: authority.clone(),
+        })
+    } else {
+        None
     };
     let target_meta = std::fs::metadata(target.path()).refuse_at("transfer::receive")?;
     let output_authority = postcard::to_stdvec(&(
@@ -3735,56 +4798,97 @@ pub fn receive_with<R: Read, W: Write>(
         target_meta.ino(),
     ))
     .refuse_at("transfer::receive")?;
-    write_control(
-        output,
-        &Control::Credit {
-            bytes: CREDIT_WINDOW,
-        },
-    )?;
-    let mut receiver = Inbound {
-        output,
-        target: &mut target,
-        store: &store,
-        authority: output_authority,
-        committer: &committer,
-        session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
-        displaced,
-        stats: TransferStats {
-            sqlite_mode: sqlite,
-            ..TransferStats::default()
-        },
-        incoming: HashMap::new(),
-        open: 0,
-        fill_locally,
-        salvage: Salvage::default(),
-        salvage_staged: HashMap::new(),
-        pending_held: HashMap::new(),
-        committed: group_outcomes,
-        walk_done: false,
-        granted: CREDIT_WINDOW,
-        consumed: 0,
-        reserved: HashMap::new(),
-        reserved_bytes: 0,
-        space: None,
-        since_probe: 0,
-        sqlite,
-        sidecars: Vec::new(),
-        snapshot_bases: HashSet::new(),
-    };
-    drop(setup_timer);
-    let source_bytes_read = {
-        let _stream_timer = PhaseTimer(&RECV_STREAM_NS, Instant::now());
-        receiver.run(input)?
-    };
+    // The receive workers (item 3) live in this scope: a session that ends,
+    // by `SourceDone` or by a refusal, closes their queue, and the scope
+    // joins them before anything below runs.
+    let workers = recv_workers(target.path());
+    let (job_queue, jobs) = std::sync::mpsc::channel();
+    let jobs = Mutex::new(jobs);
+    let (done, finished) = std::sync::mpsc::channel();
+    let streamed = std::thread::scope(|scope| -> Result<_> {
+        for _ in 0..workers {
+            let (jobs, done) = (&jobs, done.clone());
+            std::thread::Builder::new()
+                .name("bulkload-recv-worker".to_owned())
+                .spawn_scoped(scope, move || recv_worker(jobs, &done))
+                .refuse_at("transfer::receive")?;
+        }
+        drop(done);
+        #[cfg(test)]
+        let trust_wire = TRUST_WIRE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|root| root == target.path());
+        let mut receiver = Inbound {
+            output,
+            hand,
+            #[cfg(test)]
+            trust_wire,
+            target: &mut target,
+            store: &store,
+            authority: output_authority,
+            committer: &committer,
+            session: SessionChunks::with_capacity((budget / 4).clamp(1, SESSION_FILES)),
+            displaced,
+            stats: TransferStats {
+                sqlite_mode: sqlite,
+                ..TransferStats::default()
+            },
+            incoming: HashMap::new(),
+            open: 0,
+            new_path,
+            source_ledger,
+            salvage: Salvage::default(),
+            salvage_staged: HashMap::new(),
+            pending_held: HashMap::new(),
+            committed: group_outcomes,
+            walk_done: false,
+            granted: CREDIT_WINDOW,
+            consumed: 0,
+            reserved: HashMap::new(),
+            reserved_bytes: 0,
+            space: None,
+            since_probe: 0,
+            pool: (workers > 0).then_some(RecvPool {
+                jobs: job_queue,
+                done: finished,
+                bytes: 0,
+                queued: 0,
+            }),
+            batch: DirectoryBatch::default(),
+            batched: HashMap::new(),
+            sqlite,
+            sidecars: Vec::new(),
+            snapshot_bases: HashSet::new(),
+        };
+        drop(setup_timer);
+        let source_bytes_read = {
+            let _stream_timer = PhaseTimer(&RECV_STREAM_NS, Instant::now());
+            receiver.run(input)
+        };
+        let Inbound {
+            stats,
+            session,
+            salvage_staged,
+            pool,
+            sidecars,
+            snapshot_bases,
+            ..
+        } = receiver;
+        drop(pool);
+        Ok((
+            source_bytes_read?,
+            stats,
+            session,
+            salvage_staged,
+            sidecars,
+            snapshot_bases,
+        ))
+    });
+    let (source_bytes_read, mut stats, session, salvage_staged, sidecars, snapshot_bases) =
+        streamed?;
     let _tail_timer = PhaseTimer(&RECV_TAIL_NS, Instant::now());
-    let Inbound {
-        mut stats,
-        session,
-        salvage_staged,
-        sidecars,
-        snapshot_bases,
-        ..
-    } = receiver;
     stats.source_bytes_read = source_bytes_read;
     drop(session);
     finish_receive(
@@ -3804,9 +4908,12 @@ impl<W: Write> Inbound<'_, W> {
     /// bytes it reports. Entries are numbered in stream order, and the
     /// session ends only once every entry the destination expected content
     /// for has ended or been refused.
+    #[allow(clippy::too_many_lines)] // One arm per frame kind.
     fn run<R: Read>(&mut self, input: &mut R) -> Result<u64> {
         let mut offered = 0_u64;
         let mut walk_done = None;
+        // The stream's ramp: from here to the first data frame.
+        let mut first_data = Some(Instant::now());
         loop {
             // Before blocking on the next frame: answer what has committed,
             // and once the stream is drained, commit and answer the rest
@@ -3817,7 +4924,18 @@ impl<W: Write> Inbound<'_, W> {
             }
             let frame = {
                 let _read_timer = PhaseTimer(&RECV_READ_NS, Instant::now());
-                read_frame(input)?
+                read_wire(input, self.hand.as_ref())?
+            };
+            let frame = match frame {
+                Wire::Frame(frame) => frame,
+                // A chunk the in-process source handed over (lever 2).
+                Wire::Handed { header, chunk } => {
+                    if let Some(started) = first_data.take() {
+                        RECV_FIRST_DATA_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+                    }
+                    self.data(&header, Payload::Handed(chunk))?;
+                    continue;
+                }
             };
             match frame {
                 Frame::Control(Control::Entry { entry, row, wal }) => {
@@ -3825,7 +4943,7 @@ impl<W: Write> Inbound<'_, W> {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
                     offered += 1;
-                    self.entry(entry, row, wal)?;
+                    self.walked(Walked::Entry { entry, row, wal })?;
                 }
                 Frame::Control(Control::SqliteSidecar { rel_path, database })
                     if self.sqlite == SqliteMode::Snapshot =>
@@ -3850,7 +4968,11 @@ impl<W: Write> Inbound<'_, W> {
                     rel_path,
                     code,
                     sqlite_code,
-                }) => self.stats.refuse(rel_path, code, sqlite_code),
+                }) => self.walked(Walked::Refused {
+                    rel_path,
+                    code,
+                    sqlite_code,
+                })?,
                 Frame::Control(Control::Refused {
                     entry: Some(entry),
                     rel_path,
@@ -3858,12 +4980,13 @@ impl<W: Write> Inbound<'_, W> {
                     sqlite_code,
                 }) => self.refused(entry, &rel_path, code, sqlite_code)?,
                 Frame::Control(Control::EngineTemporary { rel_path }) => {
-                    self.stats.source_engine_temporaries.push(rel_path);
+                    self.walked(Walked::EngineTemporary { rel_path })?;
                 }
                 Frame::Control(Control::WalkDone { entries }) => {
                     if entries != offered || walk_done.is_some() {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
+                    self.close_batch()?;
                     walk_done = Some(entries);
                     self.walk_done = true;
                     self.settle_held()?;
@@ -3880,7 +5003,12 @@ impl<W: Write> Inbound<'_, W> {
                     size,
                     racy,
                 }) => self.end(entry, root, chunks, size, racy)?,
-                Frame::Data { header, payload } => self.data(&header, &payload)?,
+                Frame::Data { header, payload } => {
+                    if let Some(started) = first_data.take() {
+                        RECV_FIRST_DATA_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+                    }
+                    self.data(&header, Payload::Wire(payload))?;
+                }
                 Frame::Control(Control::SourceDone {
                     entries,
                     source_bytes_read,
@@ -3894,6 +5022,143 @@ impl<W: Write> Inbound<'_, W> {
 }
 
 impl<W: Write> Inbound<'_, W> {
+    /// One walk frame: handled now, or held back by a batch of new
+    /// directories (see [`DirectoryBatch`]).
+    fn walked(&mut self, frame: Walked) -> Result<()> {
+        let cap = self.target.batch();
+        if cap <= 1 {
+            return self.handle_walked(frame);
+        }
+        let directory = match &frame {
+            Walked::Entry { row, .. } if row.kind == FileKind::Directory => {
+                Some(row.rel_path.clone())
+            }
+            _ => None,
+        };
+        #[cfg(test)]
+        let admit_under_held = ADMIT_UNDER_HELD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|root| root == self.target.path());
+        #[cfg(not(test))]
+        let admit_under_held = false;
+        if let Some(path) = &directory {
+            // Its parent is held and is no member: that parent's decision
+            // (its sweep, its adoption's seal) must come before anything is
+            // made inside it. A path the batch already holds (a source that
+            // offers one directory twice) is decided after the first offer,
+            // as one at a time decides it: it adopts what the first made,
+            // never a second member at the same key.
+            if (self.batch.directories.get(parent_of(path)) == Some(&false) && !admit_under_held)
+                || self.batch.directories.contains_key(path)
+            {
+                self.close_batch()?;
+            }
+        }
+        let member = match (&frame, &directory) {
+            (Walked::Entry { row, .. }, Some(path)) => {
+                match self.batch.directories.get(parent_of(path)) {
+                    Some(true) => true,
+                    Some(false) if !admit_under_held => false,
+                    _ => self.target.directory_is_new(row),
+                }
+            }
+            _ => false,
+        };
+        if !member && self.batch.held.is_empty() {
+            return self.handle_walked(frame);
+        }
+        if let Some(path) = directory {
+            self.batch.directories.insert(path, member);
+        }
+        if member {
+            self.batch.members += 1;
+        }
+        self.batch.held.push(frame);
+        if self.batch.members >= cap || self.batch.held.len() >= DIRECTORY_BATCH_FRAMES {
+            self.close_batch()?;
+        }
+        Ok(())
+    }
+
+    /// A walk frame's own handling.
+    fn handle_walked(&mut self, frame: Walked) -> Result<()> {
+        match frame {
+            Walked::Entry { entry, row, wal } => self.entry(entry, row, wal),
+            Walked::Refused {
+                rel_path,
+                code,
+                sqlite_code,
+            } => {
+                self.stats.refuse(rel_path, code, sqlite_code);
+                Ok(())
+            }
+            Walked::EngineTemporary { rel_path } => {
+                self.stats.source_engine_temporaries.push(rel_path);
+                Ok(())
+            }
+        }
+    }
+
+    /// Create the batch's new directories, level by level, then handle
+    /// every frame it held, in stream order.
+    fn close_batch(&mut self) -> Result<()> {
+        let batch = std::mem::take(&mut self.batch);
+        if batch.held.is_empty() {
+            return Ok(());
+        }
+        let started = Instant::now();
+        let mut members: Vec<(usize, &RowSchema)> = batch
+            .held
+            .iter()
+            .filter_map(|frame| match frame {
+                Walked::Entry { row, .. }
+                    if batch.directories.get(&row.rel_path) == Some(&true) =>
+                {
+                    let depth = row.rel_path.split(|byte| *byte == b'/').count();
+                    Some((depth, row))
+                }
+                _ => None,
+            })
+            .collect();
+        members.sort_by_key(|(depth, _)| *depth);
+        let mut level_start = 0;
+        while let Some((depth, _)) = members.get(level_start) {
+            let depth = *depth;
+            let level_end = members
+                .iter()
+                .skip(level_start)
+                .position(|(at, _)| *at != depth)
+                .map_or(members.len(), |offset| level_start + offset);
+            // A member whose parent member was not created is left to be
+            // decided alone, as it would be without batching.
+            let level: Vec<&RowSchema> = members
+                .get(level_start..level_end)
+                .unwrap_or_default()
+                .iter()
+                .map(|(_, row)| *row)
+                .filter(|row| {
+                    let parent = parent_of(&row.rel_path);
+                    batch.directories.get(parent) != Some(&true)
+                        || matches!(self.batched.get(parent), Some(Ok(())))
+                })
+                .collect();
+            let created = self
+                .target
+                .create_directories(&level, self.store, &self.authority);
+            for (row, outcome) in level.iter().zip(created) {
+                self.batched.insert(row.rel_path.clone(), outcome);
+            }
+            level_start = level_end;
+        }
+        REUSE_CENSUS_NS.fetch_add(elapsed_ns(started), Ordering::Relaxed);
+        for frame in batch.held {
+            self.handle_walked(frame)?;
+        }
+        Ok(())
+    }
+
     fn refuse(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
         self.stats
             .refusals
@@ -3927,10 +5192,13 @@ impl<W: Write> Inbound<'_, W> {
             None
         };
         let decided = match row.kind {
-            FileKind::Directory => self
-                .target
-                .directory(&row, self.store, &self.authority)
-                .map(|()| Decision::Skip),
+            FileKind::Directory => match self.batched.remove(&row.rel_path) {
+                Some(created) => created.map(|()| Decision::Skip),
+                None => self
+                    .target
+                    .directory(&row, self.store, &self.authority)
+                    .map(|()| Decision::Skip),
+            },
             FileKind::Symlink => self.target.symlink(&row).map(|()| Decision::Skip),
             FileKind::Regular => self.target.identity(&row).and_then(|identity| {
                 if let Some(identity) = &identity {
@@ -3966,16 +5234,16 @@ impl<W: Write> Inbound<'_, W> {
                 if snapshot_mode && self.target.sqlite_sidecars_present(&row.rel_path)? {
                     return Err(BulkloadRefusal::DestinationOccupied);
                 }
-                // A manifest first only when something here could fill it:
-                // an existing output to adopt, or chunks held by published
-                // outputs. Otherwise the source reads the file exactly once.
-                Ok(
-                    if identity.is_some() || self.fill_locally || self.target.salvaged() > 0 {
-                        Decision::WantManifest
-                    } else {
-                        Decision::Send
-                    },
-                )
+                let keys = std::iter::once(key.as_slice()).chain(
+                    snapshot
+                        .as_ref()
+                        .map(|(snapshot_key, _)| snapshot_key.as_slice()),
+                );
+                Ok(if self.wants_manifest(&row, identity.is_some(), keys)? {
+                    Decision::WantManifest
+                } else {
+                    Decision::Send
+                })
             }),
             _ => Err(BulkloadRefusal::FieldDomainViolation),
         };
@@ -4010,6 +5278,7 @@ impl<W: Write> Inbound<'_, W> {
                 );
             }
             Decision::WantManifest => {
+                count_new_path(Counter::TransferManifestsAsked);
                 self.incoming
                     .insert(entry, Incoming::AwaitManifest(Seat::file(row, key)?));
             }
@@ -4018,6 +5287,92 @@ impl<W: Write> Inbound<'_, W> {
         write_control(self.output, &Control::Decide { entry, decision })?;
         fault_point!(ReceiveAfterDecide);
         Ok(())
+    }
+
+    /// Whether a regular entry that is not reused or refused is asked for by
+    /// manifest first (`WantManifest`) rather than streamed (`Send`).
+    /// `occupied`: a file exists at its path; `keys`: the entry's row key,
+    /// and its snapshot key in `snapshot` mode.
+    ///
+    /// A manifest first only when something here could fill it: an
+    /// existing output to adopt or supersede, a salvaged temporary, or
+    /// chunks held by published outputs. Otherwise the source reads the
+    /// file exactly once and streams it.
+    ///
+    /// The delta lever (OI-1003-Q154; off unless
+    /// [`LOCAL_NEW_PATH_STREAM_ENV`] is `1`): in a local `copy` with the
+    /// hand-off, a seat new to this destination is streamed even when
+    /// published outputs hold chunks: no file at its path, no temporary
+    /// salvaged in this session, no reuse row under its key here, and no
+    /// capture of it in the source's ledger. Both halves are in this
+    /// process, so a local fill saves no wire byte: it re-reads and
+    /// re-hashes destination bytes in place of the source's handed buffer.
+    /// Such a seat has no ledger row to give its manifest, so a manifest
+    /// first would make the source read and hash the whole file before the
+    /// first byte is placed; streamed, it reads it once, as it is placed.
+    ///
+    /// Every other entry keeps the manifest: an occupied path (adoption,
+    /// the superseding publish's local fill), any salvage (a temporary's
+    /// name does not say which path it was staged for), a seat whose reuse
+    /// row is here but whose output a third party removed (P79), and a
+    /// seat the source's ledger holds a capture of, recorded when it was
+    /// carried to another destination from the same source state (one
+    /// source fanned out). For the last two the source gives the manifest
+    /// from its ledger without a read, and this destination's outputs may
+    /// fill it. A source ledger this side cannot read keeps the manifest
+    /// too: the lever then decides as the lever off does. `pull`,
+    /// `receive`, and a `copy` with the hand-off off keep the store-wide
+    /// rule, so a new path is filled across files and only the chunks
+    /// nothing here holds cross the wire. The lever's cost is that
+    /// cross-file fill for a seat new to both stores in a local `copy`:
+    /// its bytes are handed over whole, which S3's inequality 2 as proven
+    /// on `copy` counts as received. `BulkloadTransfer.tla`'s `RecvEntry`
+    /// chooses freely between `Send` and `WantManifest` for an absent
+    /// output, so the lever is inside the model.
+    ///
+    /// # Errors
+    /// Refuses database failures of this side's store.
+    fn wants_manifest<'k>(
+        &self,
+        row: &RowSchema,
+        occupied: bool,
+        keys: impl Iterator<Item = &'k [u8]>,
+    ) -> Result<bool> {
+        if occupied || self.target.salvaged() > 0 {
+            return Ok(true);
+        }
+        match self.new_path {
+            NewPath::Stream => Ok(false),
+            NewPath::Manifest => Ok(true),
+            NewPath::StreamLocal => {
+                for key in keys {
+                    if self.store.holds_output_row(key)? {
+                        return Ok(true);
+                    }
+                }
+                if self.source_ledger_holds(row) {
+                    return Ok(true);
+                }
+                count_new_path(Counter::TransferNewPathsStreamed);
+                Ok(false)
+            }
+        }
+    }
+
+    /// Whether the source's ledger holds a capture of `row` it would offer
+    /// as the manifest without a read ([`ledger_manifest_fits`]). A ledger
+    /// read that fails counts as holding it: the entry then keeps the
+    /// manifest the lever off asks for. A database seat in `snapshot` mode
+    /// is never recorded there, so it is never held.
+    fn source_ledger_holds(&self, row: &RowSchema) -> bool {
+        let Some(ledger) = &self.source_ledger else {
+            return true;
+        };
+        row_key(&ledger.authority, row)
+            .and_then(|key| ledger.store.capture(&key))
+            .map_or(true, |capture| {
+                capture.is_some_and(|manifest| ledger_manifest_fits(&manifest, row))
+            })
     }
 
     /// A database at `rel_path` is held here as a snapshot: published from
@@ -4048,7 +5403,8 @@ impl<W: Write> Inbound<'_, W> {
                     key: streaming.key,
                     record: streaming.record,
                     snapshot: false,
-                    failure: streaming.failure,
+                    // Before any chunk the only failure is the seat's own.
+                    failure: streaming.failure.map(|failure| failure.refusal),
                 };
                 (seat, true)
             }
@@ -4214,6 +5570,7 @@ impl<W: Write> Inbound<'_, W> {
         sqlite_code: Option<i32>,
     ) -> Result<()> {
         self.release(entry);
+        self.settle_entry(entry)?;
         let incoming = self
             .incoming
             .remove(&entry)
@@ -4296,12 +5653,15 @@ impl<W: Write> Inbound<'_, W> {
                 .insert(row.rel_path.clone(), salvaged_from);
         }
         MATERIALIZE_NS.fetch_add(elapsed_ns(materialize_started), Ordering::Relaxed);
-        let indices = match &plan {
+        let (indices, target) = match &plan {
             Plan::Write(staging) => {
                 self.open += 1;
-                staging.missing.clone()
+                (
+                    staging.missing.clone(),
+                    Some(WriteTarget::new(staging.staged.file(), staging.placed)),
+                )
             }
-            Plan::Refuse(_) | Plan::Adopt(..) | Plan::NoExchange(_) => Vec::new(),
+            Plan::Refuse(_) | Plan::Adopt(..) | Plan::NoExchange(_) => (Vec::new(), None),
         };
         write_control(
             self.output,
@@ -4320,30 +5680,34 @@ impl<W: Write> Inbound<'_, W> {
                 manifest,
                 offsets,
                 plan,
+                target,
                 expected: indices.into(),
                 failure: None,
+                outstanding: 0,
             }),
         );
         Ok(())
     }
 
-    /// One data frame: account its credit, verify it against its digest (the
-    /// one integrity check on received bytes) and write it where it belongs.
-    /// Content faults become the entry's refusal and the stream stays in
-    /// step; protocol faults end the session.
-    fn data(&mut self, header: &DataHeader, payload: &[u8]) -> Result<()> {
+    /// One data frame: account its credit, then hand it to the receive
+    /// workers (or run it inline), which verify it against its digest (the
+    /// one integrity check on received bytes) and write it where it
+    /// belongs. Content faults become the entry's refusal and the stream
+    /// stays in step; protocol faults end the session, decided here, in
+    /// stream order.
+    fn data(&mut self, header: &DataHeader, payload: Payload) -> Result<()> {
         let _transfer_timer = PhaseTimer(&TRANSFER_NS, Instant::now());
         let size = payload.len() as u64;
+        // Verify once (OI-1003-Q154 lever 1): only a chunk handed over by
+        // this process's own source, whose digest is the frame's.
+        let vouched = payload.vouched(&header.digest);
+        #[cfg(test)]
+        let vouched = vouched || self.trust_wire;
         self.granted = self
             .granted
             .checked_sub(size)
             .ok_or(BulkloadRefusal::ProtocolStateViolation)?;
         self.stats.bytes_received = self.stats.bytes_received.saturating_add(size);
-        let verified = {
-            let _verify_timer = PhaseTimer(&RECV_VERIFY_NS, Instant::now());
-            payload.len() <= crate::hash::CDC_MAX_BYTES as usize
-                && counters::hash(Counter::HashWireVerify, payload) == header.digest
-        };
         // A source that could not keep a manifest's chunks streams the entry
         // in place of the manifest (#77 review F1).
         if let Some(Incoming::AwaitManifest(_)) = self.incoming.get(&header.entry) {
@@ -4354,10 +5718,17 @@ impl<W: Write> Inbound<'_, W> {
                 );
             }
         }
-        match self.incoming.get_mut(&header.entry) {
-            Some(Incoming::Streaming(streaming)) => {
-                streaming.accept(self.target, &mut self.open, header, payload, verified)?;
-            }
+        let job = match self.incoming.get_mut(&header.entry) {
+            Some(Incoming::Streaming(streaming)) => streaming.accept(
+                self.target,
+                &mut self.open,
+                header,
+                (payload, vouched),
+                |payload| {
+                    let _verify_timer = PhaseTimer(&RECV_VERIFY_NS, Instant::now());
+                    verify_wire(payload, &header.digest)
+                },
+            )?,
             Some(Incoming::Filling(filling)) => {
                 if filling.expected.pop_front() != Some(header.index) {
                     return Err(BulkloadRefusal::ProtocolStateViolation);
@@ -4374,28 +5745,113 @@ impl<W: Write> Inbound<'_, W> {
                 {
                     return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
-                if filling.failure.is_none() {
-                    if verified {
-                        if let Plan::Write(staging) = &filling.plan {
-                            if let Some((_, offsets)) = staging.placements.get(&header.digest) {
-                                if let Err(refusal) = place(staging.staged.file(), payload, offsets)
-                                {
-                                    filling.failure = Some(refusal);
-                                }
-                            }
-                        }
-                    } else {
-                        filling.failure = Some(BulkloadRefusal::DigestMismatch);
-                    }
-                }
+                let write = match (&filling.failure, &filling.plan, &filling.target) {
+                    (None, Plan::Write(staging), Some(target)) => staging
+                        .placements
+                        .get(&header.digest)
+                        .map(|(_, offsets)| (Arc::clone(target), offsets.clone())),
+                    _ => None,
+                };
+                filling.outstanding += 1;
+                Some(RecvJob {
+                    entry: header.entry,
+                    index: header.index,
+                    digest: header.digest,
+                    charge: size.max(RECV_JOB_MIN_BYTES),
+                    payload,
+                    verify: !vouched,
+                    write,
+                })
             }
             _ => return Err(BulkloadRefusal::ProtocolStateViolation),
+        };
+        if let Some(job) = job {
+            self.dispatch(job)?;
         }
         self.consumed = self.consumed.saturating_add(size);
         if self.consumed >= CREDIT_RETURN {
             let bytes = std::mem::take(&mut self.consumed);
             self.granted = self.granted.saturating_add(bytes);
             write_control(self.output, &Control::Credit { bytes })?;
+        }
+        Ok(())
+    }
+
+    /// Run one chunk job inline, or queue it for the receive workers once
+    /// their byte budget has room (OI-1003-Q143 item 3).
+    fn dispatch(&mut self, job: RecvJob) -> Result<()> {
+        let Some(pool) = &self.pool else {
+            let done = run_recv_job(job, false);
+            return self.finished(done);
+        };
+        let charge = job.charge;
+        if pool.queued > 0 && pool.bytes.saturating_add(charge) > RECV_POOL_BYTES {
+            let _wait_timer = PhaseTimer(&RECV_POOL_WAIT_NS, Instant::now());
+            while self.pool.as_ref().is_some_and(|pool| {
+                pool.queued > 0 && pool.bytes.saturating_add(charge) > RECV_POOL_BYTES
+            }) {
+                self.reap()?;
+            }
+        }
+        let pool = self.pool.as_mut().ok_or(BulkloadRefusal::WorkerLost)?;
+        pool.jobs
+            .send(job)
+            .map_err(|_| BulkloadRefusal::WorkerLost)?;
+        pool.bytes = pool.bytes.saturating_add(charge);
+        pool.queued += 1;
+        #[cfg(test)]
+        POOL_HIGH_WATER.fetch_max(pool.bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Wait for one receive job to finish and fold its outcome.
+    fn reap(&mut self) -> Result<()> {
+        let done = self
+            .pool
+            .as_ref()
+            .ok_or(BulkloadRefusal::WorkerLost)?
+            .done
+            .recv()
+            .map_err(|_| BulkloadRefusal::WorkerLost)?;
+        if let Some(pool) = self.pool.as_mut() {
+            pool.bytes = pool.bytes.saturating_sub(done.charge);
+            pool.queued = pool.queued.saturating_sub(1);
+        }
+        self.finished(done)
+    }
+
+    /// Fold a finished chunk job into its entry.
+    fn finished(&mut self, done: RecvDone) -> Result<()> {
+        if done.lost {
+            return Err(BulkloadRefusal::WorkerLost);
+        }
+        let (outstanding, failure) = match self.incoming.get_mut(&done.entry) {
+            Some(Incoming::Streaming(streaming)) => {
+                (&mut streaming.outstanding, &mut streaming.failure)
+            }
+            Some(Incoming::Filling(filling)) => (&mut filling.outstanding, &mut filling.failure),
+            _ => return Err(BulkloadRefusal::WorkerLost),
+        };
+        *outstanding = outstanding.saturating_sub(1);
+        if let Some(found) = done.failure {
+            fold_failure(failure, found);
+        }
+        Ok(())
+    }
+
+    /// Wait until every chunk job of `entry` has finished, so its file holds
+    /// all its writes before it is published or discarded.
+    fn settle_entry(&mut self, entry: u64) -> Result<()> {
+        let pending = |incoming: &HashMap<u64, Incoming>| match incoming.get(&entry) {
+            Some(Incoming::Streaming(streaming)) => streaming.outstanding > 0,
+            Some(Incoming::Filling(filling)) => filling.outstanding > 0,
+            _ => false,
+        };
+        if pending(&self.incoming) {
+            let _wait_timer = PhaseTimer(&RECV_POOL_WAIT_NS, Instant::now());
+            while pending(&self.incoming) {
+                self.reap()?;
+            }
         }
         Ok(())
     }
@@ -4412,6 +5868,9 @@ impl<W: Write> Inbound<'_, W> {
         size: u64,
         racy: bool,
     ) -> Result<()> {
+        // Every write of the entry lands before its file is checked,
+        // published or discarded (item 3): its submit, so its seal, follows.
+        self.settle_entry(entry)?;
         let incoming = self
             .incoming
             .remove(&entry)
@@ -4489,13 +5948,42 @@ impl<W: Write> Inbound<'_, W> {
         if self.pending_held.is_empty() || !self.walk_done || !self.incoming.is_empty() {
             return self.answer_held();
         }
-        self.committer.sync()?;
+        {
+            let _drain_timer = PhaseTimer(&RECV_DRAIN_NS, Instant::now());
+            if let Some(finish) = self.fold_finish() {
+                let outcome = finish.outcome();
+                self.committer.sync_last(finish)?;
+                self.target.folded_finish(&outcome);
+            } else {
+                self.committer.sync()?;
+            }
+        }
         self.answer_held()?;
         if self.pending_held.is_empty() {
             Ok(())
         } else {
             Err(BulkloadRefusal::ProtocolStateViolation)
         }
+    }
+
+    /// The directory finish the drain's group may carry (OI-1003-Q154 lever
+    /// 3; [`Destination::fold_finish`] sets the final modes): only when
+    /// nothing after that group can refuse. Every entry has ended, nothing
+    /// is refused so far on this side (the sink checks its own groups'
+    /// outcomes), and every `SQLite` sidecar the source reported has a
+    /// snapshot base here, so `resolve_sidecars` refuses none. A session
+    /// that refuses keeps every directory unfinished (`finish_receive`).
+    fn fold_finish(&self) -> Option<crate::materialize::FoldedFinish> {
+        if !directory_fold(self.target.path())
+            || !self.stats.refusals.is_empty()
+            || self
+                .sidecars
+                .iter()
+                .any(|(_, database)| !self.snapshot_bases.contains(database))
+        {
+            return None;
+        }
+        self.target.fold_finish()
     }
 
     fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32], racy: bool) -> Result<()> {
@@ -4515,13 +6003,15 @@ impl<W: Write> Inbound<'_, W> {
         if staged.is_some() {
             self.open -= 1;
         }
-        let checked = failure.map_or(Ok(()), Err).and_then(|()| {
-            if offset != row.size || manifest_root(&specs) != root {
-                Err(BulkloadRefusal::DigestMismatch)
-            } else {
-                Ok(())
-            }
-        });
+        let checked = failure
+            .map_or(Ok(()), |failure| Err(failure.refusal))
+            .and_then(|()| {
+                if offset != row.size || manifest_root(&specs) != root {
+                    Err(BulkloadRefusal::DigestMismatch)
+                } else {
+                    Ok(())
+                }
+            });
         let mut supersede = None;
         if checked.is_ok() && adopt {
             // Streamed in place of a manifest: an existing output at the
@@ -4657,9 +6147,9 @@ impl<W: Write> Inbound<'_, W> {
             }
             Plan::Write(mut staging) => {
                 self.open -= 1;
-                if let Some(refusal) = failure {
+                if let Some(failure) = failure {
                     let _ = staging.staged.discard();
-                    return Err(refusal);
+                    return Err(failure.refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
                 if snapshot {
@@ -4757,6 +6247,7 @@ impl<W: Write> Inbound<'_, W> {
             return Err(refusal);
         }
         fault_point!(MaterializeAfterTempWrite);
+        crate::io::durable::start_writeback(staged.file());
         self.session.insert(Arc::clone(staged.file()), &hints);
         let record = PendingOutput {
             key,
@@ -4894,6 +6385,8 @@ struct Staging {
     /// Every offset each distinct chunk occupies, with its size.
     placements: HashMap<[u8; 32], (u64, Vec<u64>)>,
     hints: Vec<ChunkHint>,
+    /// Bytes filled locally, every offset counted (item 1a).
+    placed: u64,
 }
 
 /// Validate a manifest against its row, adopt an existing output, or stage a
@@ -4911,6 +6404,7 @@ struct Staging {
 /// ends, and refused `DESTINATION_OCCUPIED` if they do not: it is never
 /// replaced. A `SQLite` snapshot's output follows the same rule (#218,
 /// OI-1003-Q146).
+#[allow(clippy::too_many_lines)] // Validate, adopt or supersede, stage, fill, kick.
 fn plan_file(
     context: &ReceiveContext<'_>,
     row: &RowSchema,
@@ -4988,6 +6482,7 @@ fn plan_file(
     let mut missing = Vec::new();
     let mut hints = Vec::with_capacity(order.len());
     let mut outputs = HashMap::new();
+    let mut placed = 0_u64;
     for (digest, index) in order {
         let Some((size, offsets)) = placements.get(&digest) else {
             continue;
@@ -5005,7 +6500,9 @@ fn plan_file(
                     .transpose()
             });
         match filled {
-            Ok(Some(())) => (),
+            Ok(Some(())) => {
+                placed = placed.saturating_add(size.saturating_mul(offsets.len() as u64));
+            }
             Ok(None) => missing.push(index),
             Err(refusal) => {
                 let _ = staged.discard();
@@ -5013,12 +6510,20 @@ fn plan_file(
             }
         }
     }
+    // What was filled here is written back while the source captures the
+    // rest, before `NeedChunks` goes out (item 1a, #217 review): a delta's
+    // changed file is mostly local bytes, and no wire chunk would kick them.
+    if let Err(refusal) = kick_after(staged.file(), 0, placed) {
+        let _ = staged.discard();
+        return Plan::Refuse(refusal);
+    }
     Plan::Write(Staging {
         staged,
         supersede,
         missing,
         placements,
         hints,
+        placed,
     })
 }
 
@@ -5119,6 +6624,28 @@ fn place(file: &std::fs::File, data: &[u8], offsets: &[u64]) -> Result<()> {
 /// # Errors
 /// Refuses truncated, oversized or invalid frames.
 pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
+    match read_wire(input, None)? {
+        Wire::Frame(frame) => Ok(frame),
+        Wire::Handed { .. } => Err(BulkloadRefusal::FrameCodec),
+    }
+}
+
+/// What [`read_wire`] read.
+enum Wire {
+    /// A wire v6 frame.
+    Frame(Frame),
+    /// A handed frame: a data header whose chunk the in-process source
+    /// handed over (OI-1003-Q154 lever 2).
+    Handed {
+        header: DataHeader,
+        chunk: SourceChunk,
+    },
+}
+
+/// Read one frame, as [`read_frame`]; with `hand`, a handed frame too,
+/// with the chunk it names. Without `hand` a handed frame is refused
+/// `FRAME_CODEC` before its header is read: it is no wire v6 frame.
+fn read_wire<R: Read>(input: &mut R, hand: Option<&HandIn>) -> Result<Wire> {
     let mut prefix = [0_u8; FRAME_HEADER_BYTES];
     input
         .read_exact(&mut prefix)
@@ -5129,6 +6656,23 @@ pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
     let body = length.checked_sub(1).ok_or(BulkloadRefusal::FrameCodec)?;
+    if tag == handoff::TAG_HANDED {
+        let (Some(hand), handoff::HANDED_BODY_BYTES) = (hand, length) else {
+            return Err(BulkloadRefusal::FrameCodec);
+        };
+        let mut header = [0_u8; DATA_HEADER_BYTES];
+        input
+            .read_exact(&mut header)
+            .refuse_at("transfer::read_frame")?;
+        let header = DataHeader::from_bytes(&header)?;
+        if header.size as usize > MAX_DATA_PAYLOAD {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        let chunk = hand.take(&header)?;
+        counters::bump(Counter::WireFramesReceived);
+        counters::add_len(Counter::WireBytesReceived, FRAME_HEADER_BYTES + body);
+        return Ok(Wire::Handed { header, chunk });
+    }
     let frame = if tag == TAG_DATA {
         // Bound the frame before reading any of it, so a short frame can
         // never pull the next frame's bytes in as its header.
@@ -5160,7 +6704,7 @@ pub fn read_frame<R: Read>(input: &mut R) -> Result<Frame> {
     };
     counters::bump(Counter::WireFramesReceived);
     counters::add_len(Counter::WireBytesReceived, FRAME_HEADER_BYTES + body);
-    Ok(frame)
+    Ok(Wire::Frame(frame))
 }
 
 /// Write one data frame: its fixed header and the payload with one gathered
@@ -5169,6 +6713,25 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
     if header.size as usize != payload.len() {
         return Err(BulkloadRefusal::FrameCodec);
     }
+    // Test-only: a chunk sent with one byte flipped, so the destination's
+    // verify refuses it (#217 review: a bad chunk mid-stream).
+    #[cfg(test)]
+    let corrupted;
+    #[cfg(test)]
+    let payload = if CORRUPT_DIGESTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains(&header.digest)
+    {
+        corrupted = payload
+            .iter()
+            .enumerate()
+            .map(|(at, byte)| if at == 0 { !byte } else { *byte })
+            .collect::<Vec<u8>>();
+        corrupted.as_slice()
+    } else {
+        payload
+    };
     let prefix = data_prefix(header)?;
     let mut slices = [IoSlice::new(&prefix), IoSlice::new(payload)];
     let mut remaining: &mut [IoSlice<'_>] = &mut slices;
@@ -5191,6 +6754,25 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
     Ok(())
 }
 
+/// Test-only: data frames of these digests are sent corrupted.
+#[cfg(test)]
+pub(crate) static CORRUPT_DIGESTS: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+
+/// Test-only: a receive job of one of these digests panics on its worker.
+#[cfg(test)]
+pub(crate) static PANIC_DIGESTS: Mutex<Vec<[u8; 32]>> = Mutex::new(Vec::new());
+
+/// Test-only mutation (OI-1003-Q154 lever 1's proof): sessions into these
+/// canonical destination roots take bytes read from the transport as
+/// vouched for, as a broken verify-once would. The cross-host proof must
+/// catch it.
+#[cfg(test)]
+pub(crate) static TRUST_WIRE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Test-only: the most bytes any receive pool held queued or in progress.
+#[cfg(test)]
+pub(crate) static POOL_HIGH_WATER: AtomicU64 = AtomicU64::new(0);
+
 /// Write one control frame and flush it.
 ///
 /// # Errors
@@ -5210,6 +6792,7 @@ fn path(bytes: Vec<u8>) -> PathBuf {
     std::ffi::OsString::from_vec(bytes).into()
 }
 
+mod handoff;
 #[cfg(test)]
 mod tests;
 pub(crate) mod unrowed;

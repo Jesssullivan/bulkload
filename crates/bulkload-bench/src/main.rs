@@ -13,6 +13,20 @@
 //! other platform reports `unknown`, which refuses. `bulkload-bench preflight`
 //! prints the reading and the probe that made it, and runs nothing.
 //!
+//! No clone in a sample (S2, OI-1003-Q165 (b)): on Linux the private fixture
+//! is checked with `FIEMAP` after the seed and after every arm, and a shared
+//! extent refuses the sample, in every mode. A file system whose sharing
+//! `FIEMAP` cannot show (anything but xfs, btrfs, bcachefs and ocfs2, which
+//! report it, and ext4 and tmpfs, which cannot reflink) refuses a gated
+//! sample and is recorded `unsupported` in an informational one; off Linux
+//! the check is `n/a` (the fixture is a native copy, a read and a write).
+//! The sealed corpus is checked once: since OI-1003-Q166 re-sealed the rig's
+//! corpus unshared, a shared one refuses a gated sample, and is recorded in
+//! an informational one. `FIEMAP` sees sharing that exists when it looks: a
+//! clone undone before the check (its target overwritten or freed) is not
+//! seen; P84's static scan is what rules the call out
+//! (`bulkload_agent::extents`). See [`require_unshared`].
+//!
 //! `bulkload-bench micro <name>` runs the M0 micro-benchmarks instead; see
 //! [`micro`].
 
@@ -308,6 +322,9 @@ struct Sample {
     /// medians, and leaves the next arm no dirty pages of rclone's to flush.
     /// `None` off Linux and on the native arm.
     sync_after_ms: Option<f64>,
+    /// The fixture's `FIEMAP`-shared extents after the arm (OI-1003-Q165):
+    /// `0`, `unsupported` (informational only) or `n/a` off Linux.
+    source_shared: String,
 }
 
 struct SampleRun<'a> {
@@ -330,6 +347,10 @@ struct Fixture {
     private_identity: String,
     seed_source_read: u64,
     seed_received: u64,
+    /// The fixture's shared extents after the seed (OI-1003-Q165).
+    private_shared: String,
+    /// The sealed corpus's shared extents: recorded, never refused.
+    sealed_shared: String,
 }
 
 fn main() -> ExitCode {
@@ -746,7 +767,7 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
         Arm::Rclone => "cumulative-children-peak",
     };
     println!(
-        "sample sequence={} arm={:?} phase={} elapsed_ms={:.3} throughput_bytes_s={} workload_bytes={} transferred_content_bytes={} source_bytes_read={} max_rss_kib={} rss_scope={} verification=full-blake3-outside-timing verification_rows={verification_rows} {} gated={}",
+        "sample sequence={} arm={:?} phase={} elapsed_ms={:.3} throughput_bytes_s={} workload_bytes={} transferred_content_bytes={} source_bytes_read={} max_rss_kib={} rss_scope={} verification=full-blake3-outside-timing verification_rows={verification_rows} source_shared_extents={} {} gated={}",
         sample.sequence,
         sample.arm,
         sample.phase,
@@ -757,6 +778,7 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
         metric(sample.source_read),
         sample.rss_kib,
         rss_scope,
+        sample.source_shared,
         sample.preflight.render(),
         sample.gated,
     );
@@ -768,7 +790,7 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
     }
     if let (Some(chunk), Some(transfer)) = (sample.chunk_timing, sample.transfer_timing) {
         println!(
-            "native_timing sequence={} phase={} scope=cumulative-process-worker-sums walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={} recv_setup_ns={} recv_stream_ns={} recv_tail_ns={} {}",
+            "native_timing sequence={} phase={} scope=cumulative-process-worker-sums walk_ns={} walk_wait_ns={} reuse_census_ns={} cdc_hash_ns={} queue_wait_ns={} transfer_ns={} materialize_ns={} send_wait_ns={} send_handle_ns={} recv_read_ns={} recv_settle_ns={} recv_verify_ns={} recv_setup_ns={} recv_stream_ns={} recv_tail_ns={} recv_drain_ns={} recv_first_data_ns={} recv_worker_verify_ns={} recv_worker_place_ns={} recv_pool_wait_ns={} send_write_ns={} {}",
             sample.sequence,
             sample.phase,
             transfer.walk_ns,
@@ -786,6 +808,12 @@ fn print_sample(sample: &Sample, verification_rows: usize) {
             transfer.recv_setup_ns,
             transfer.recv_stream_ns,
             transfer.recv_tail_ns,
+            transfer.recv_drain_ns,
+            transfer.recv_first_data_ns,
+            transfer.recv_worker_verify_ns,
+            transfer.recv_worker_place_ns,
+            transfer.recv_pool_wait_ns,
+            transfer.send_write_ns,
             chunk.render(),
         );
     }
@@ -872,6 +900,16 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
             "source mutation or destination content/mode mismatch",
         ));
     }
+    // S2's no-clone rule (OI-1003-Q165): a clone of the source moves no row
+    // field above, so look at its extents. Outside the timed window.
+    let source_shared = require_unshared(
+        cli.informational,
+        run.source,
+        &format!(
+            "the source fixture after the {:?} {} arm",
+            run.arm, run.phase
+        ),
+    )?;
     let sample = Sample {
         sequence: run.sequence,
         arm: run.arm,
@@ -888,6 +926,7 @@ fn run_sample(cli: &Cli, run: &SampleRun<'_>) -> io::Result<Sample> {
         preflight,
         gated: blocker.is_none(),
         sync_after_ms,
+        source_shared,
     };
     print_sample(&sample, run.expected.len());
     Ok(sample)
@@ -911,12 +950,85 @@ fn sync_destination(destination: &Path) -> io::Result<Option<f64>> {
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::unnecessary_wraps, reason = "the signature matches Linux's")]
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::missing_const_for_fn,
+    reason = "the signature matches Linux's"
+)]
 fn sync_destination(_destination: &Path) -> io::Result<Option<f64>> {
     Ok(None)
 }
 
-fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
+/// The extents shared with another file under `root`, by `FIEMAP`: `None`
+/// where that cannot be known (off Linux, or a file system whose sharing
+/// `FIEMAP` does not show: `bulkload_agent::extents::basis`). A file system
+/// that cannot reflink counts 0.
+///
+/// # Errors
+/// Returns any other failed listing, open or probe.
+fn shared_extents(root: &Path) -> io::Result<Option<u64>> {
+    match bulkload_agent::extents::tree_sharing(root) {
+        Ok(census) => Ok(Some(census.shared_extents)),
+        Err(error)
+            if error.kind() == io::ErrorKind::Unsupported
+                || error.raw_os_error() == Some(libc::EOPNOTSUPP)
+                || error.raw_os_error() == Some(libc::ENOTTY) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// S2's no-clone rule for a corpus copy (OI-1003-Q165 (b)): `what` under
+/// `root` shares no extent with any other file. A shared extent refuses, in
+/// every mode: the copy was cloned, or something cloned it. On Linux a file
+/// system without `FIEMAP` cannot be verified, so it refuses a gated sample
+/// and is recorded `unsupported` in an informational one. Off Linux there is
+/// no `FIEMAP`; the fixture is the native engine's copy (a read and a
+/// write, never a clone), so the check is `n/a`.
+///
+/// # Errors
+/// The refusal, or a failed probe.
+fn require_unshared(informational: bool, root: &Path, what: &str) -> io::Result<String> {
+    match shared_extents(root)? {
+        Some(0) => Ok("0".to_owned()),
+        Some(shared) => Err(io::Error::other(format!(
+            "{what} shares {shared} extent(s) with another file: a clone, refused \
+             (S2, OI-1003-Q165)"
+        ))),
+        None if !cfg!(target_os = "linux") => Ok("n/a".to_owned()),
+        None if informational => Ok("unsupported".to_owned()),
+        None => Err(io::Error::other(format!(
+            "{what} cannot be verified unshared: no FIEMAP on this file system \
+             (OI-1003-Q165); a gated sample needs one"
+        ))),
+    }
+}
+
+/// The sealed corpus's shared extents (OI-1003-Q165 (b)). OI-1003-Q166
+/// re-sealed the rig's corpus as an unshared copy, so a shared one now
+/// refuses a gated sample; an informational one records the count.
+///
+/// # Errors
+/// The refusal, or a failed probe.
+fn sealed_sharing(informational: bool, root: &Path) -> io::Result<String> {
+    Ok(match shared_extents(root)? {
+        Some(0) => "0".to_owned(),
+        Some(shared) if informational => shared.to_string(),
+        Some(shared) => {
+            return Err(io::Error::other(format!(
+                "the sealed corpus shares {shared} extent(s) with another file: a \
+                 clone of it, refused for a gated sample (OI-1003-Q165 (b), \
+                 OI-1003-Q166)"
+            )))
+        }
+        None if cfg!(target_os = "linux") => "unsupported".to_owned(),
+        None => "n/a".to_owned(),
+    })
+}
+
+fn seed_fixture(sealed_source: &Path, work: &Path, informational: bool) -> io::Result<Fixture> {
     let sealed_expected = rows(sealed_source)?;
     let sealed_identity = corpus_identity(&sealed_expected)?;
     let source = work.join("native-sealed-fixture");
@@ -950,9 +1062,12 @@ fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
     // outside timing, so the initial runs record every capture and the warm
     // resume measures R25, not the racy guard.
     transfer::settle_racy_window(&source).map_err(io::Error::other)?;
+    let private_shared = require_unshared(informational, &source, "the private fixture")?;
     Ok(Fixture {
-        source,
         private_identity: corpus_identity(&expected)?,
+        private_shared,
+        sealed_shared: sealed_sharing(informational, sealed_source)?,
+        source,
         expected,
         sealed_expected,
         sealed_identity,
@@ -963,7 +1078,7 @@ fn seed_fixture(sealed_source: &Path, work: &Path) -> io::Result<Fixture> {
 
 fn print_header(cli: &Cli, fixture: &Fixture, rclone_identity: &str) {
     println!(
-        "benchmark revision={} durability={} priority={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={} power_probe={POWER_PROBE} os={} arch={} seal_primitive={}",
+        "benchmark revision={} durability={} priority={} informational={} gate=power:ac,load1<{MAX_GATED_LOAD1} rclone_version={:?} scope=local-ordinary-file-copy verification=full-blake3-outside-timing cache=not-flushed outputs=retained delta_target=one-percent-regular-file-bytes delta_target_preconditioning=remove-mutated-private-targets-outside-timing sealed_corpus_blake3={} fixture_corpus_blake3={} source_rows={} fixture_seed_source_bytes_read={} fixture_seed_bytes_received={} fixture_shared_extents={} sealed_corpus_shared_extents={} power_probe={POWER_PROBE} os={} arch={} seal_primitive={}",
         cli.revision,
         cli.durability,
         cli.priority.label(),
@@ -974,6 +1089,8 @@ fn print_header(cli: &Cli, fixture: &Fixture, rclone_identity: &str) {
         fixture.expected.len(),
         fixture.seed_source_read,
         fixture.seed_received,
+        fixture.private_shared,
+        fixture.sealed_shared,
         std::env::consts::OS,
         std::env::consts::ARCH,
         seal_primitive(cli.durability),
@@ -1206,7 +1323,7 @@ fn run(cli: &Cli) -> io::Result<()> {
     bulkload_agent::durable::set_ledger_sync(cli.source_ledger_sync);
     let _ = bulkload_agent::limits::raise_descriptor_limit();
     let (sealed_source, work) = prepare(cli)?;
-    let mut fixture = seed_fixture(&sealed_source, &work)?;
+    let mut fixture = seed_fixture(&sealed_source, &work, cli.informational)?;
     let rclone_identity = cli
         .rclone
         .as_deref()
@@ -1416,6 +1533,142 @@ mod tests {
             .get(..100)
             .is_some_and(|bytes| bytes.iter().all(|byte| *byte == 0xb4)));
         assert_eq!(changed.get(100), Some(&0x11));
+        Ok(())
+    }
+
+    /// `ioctl(FICLONE)` of `from` into a new file `to`: a reflinked fixture
+    /// for the no-clone tests (OI-1003-Q165). `FICLONE` is
+    /// `_IOW(0x94, 9, int)`.
+    #[cfg(target_os = "linux")]
+    fn reflink(from: &Path, to: &Path) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        const FICLONE: libc::Ioctl = libc::_IOW::<libc::c_int>(0x94, 9);
+        let input = fs::File::open(from)?;
+        let output = fs::File::create(to)?;
+        // SAFETY: both descriptors are live for the call; FICLONE takes the
+        // source descriptor by value and no pointer.
+        if unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, input.as_raw_fd()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn reflink(_from: &Path, _to: &Path) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    /// The refusal `result` carries, or an error when it succeeded.
+    fn refusal<T>(result: io::Result<T>) -> io::Result<String> {
+        match result {
+            Ok(_) => Err(io::Error::other("expected a refusal")),
+            Err(error) => Ok(error.to_string()),
+        }
+    }
+
+    /// A half of the no-clone test that cannot run here: say so on stderr,
+    /// or fail where `BULKLOAD_P84_REQUIRE_REFLINK` is set (`just
+    /// p84-reflink`), because a test that returns early still reports `ok`
+    /// (R-N122).
+    fn not_run(message: &str) {
+        assert!(
+            std::env::var_os("BULKLOAD_P84_REQUIRE_REFLINK").is_none(),
+            "{message}"
+        );
+        eprintln!("{message}");
+    }
+
+    /// OI-1003-Q165 (b): a fixture that shares an extent with another file
+    /// is refused, after the seed and after an arm, whatever the mode; a
+    /// shared sealed corpus refuses a gated sample and is recorded in an
+    /// informational one (OI-1003-Q166). Where the temporary directory's
+    /// sharing cannot be known, a gated sample is refused and an
+    /// informational one records `unsupported`; where it cannot clone, the
+    /// reflinked half says so and returns.
+    #[test]
+    fn a_fixture_that_shares_an_extent_refuses_the_sample() -> io::Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let sealed = fixture.path().join("sealed");
+        private_dir(&sealed)?;
+        fs::write(sealed.join("raw"), vec![0x5a; 256 * 1024 + 3])?;
+        fs::write(sealed.join("small"), b"small")?;
+        fs::File::open(sealed.join("raw"))?.sync_all()?;
+        if shared_extents(&sealed)?.is_none() {
+            let gated = require_unshared(false, &sealed, "the fixture");
+            if cfg!(target_os = "linux") {
+                assert!(refusal(gated)?.contains("cannot be verified unshared"));
+                assert_eq!(require_unshared(true, &sealed, "x")?, "unsupported");
+            } else {
+                assert_eq!(gated?, "n/a");
+            }
+            not_run(&format!(
+                "no FIEMAP under {}: the reflinked half did not run",
+                fixture.path().display()
+            ));
+            return Ok(());
+        }
+        let work = fixture.path().join("work");
+        private_dir(&work)?;
+        let seeded = seed_fixture(&sealed, &work, false)?;
+        assert_eq!(seeded.private_shared, "0");
+        assert_eq!(seeded.sealed_shared, "0");
+        if let Err(error) = reflink(&seeded.source.join("raw"), &work.join("side")) {
+            not_run(&format!(
+                "{} cannot clone ({error}): the reflinked half did not run",
+                fixture.path().display()
+            ));
+            return Ok(());
+        }
+        for informational in [false, true] {
+            let refused = refusal(require_unshared(
+                informational,
+                &seeded.source,
+                "the fixture",
+            ))?;
+            assert!(refused.contains("shares 1 extent(s)"), "{refused}");
+        }
+        let cli = Cli {
+            corpus_root: sealed.clone(),
+            work_root: work.clone(),
+            rclone: None,
+            reps: 1,
+            only: Some(Arm::Native),
+            revision: "test-revision".to_owned(),
+            durability: Durability::Group,
+            informational: true,
+            priority: PriorityClass::Normal,
+            source_ledger_sync: LedgerSync::Relaxed,
+        };
+        let refused = refusal(run_sample(
+            &cli,
+            &SampleRun {
+                source: &seeded.source,
+                expected: &seeded.expected,
+                root: work.join("0-Native"),
+                source_state: None,
+                sequence: 0,
+                arm: Arm::Native,
+                phase: "initial",
+                workload_bytes: regular_bytes(&seeded.expected),
+                initialize: true,
+            },
+        ))?;
+        assert!(
+            refused.contains("after the Native initial arm shares"),
+            "{refused}"
+        );
+        reflink(&sealed.join("raw"), &fixture.path().join("sealed-side"))?;
+        assert_eq!(sealed_sharing(true, &sealed)?, "1");
+        let refused = refusal(sealed_sharing(false, &sealed))?;
+        assert!(refused.contains("the sealed corpus shares 1"), "{refused}");
+        let reseeded = work.join("again");
+        private_dir(&reseeded)?;
+        assert_eq!(seed_fixture(&sealed, &reseeded, true)?.sealed_shared, "1");
+        let gated = work.join("gated");
+        private_dir(&gated)?;
+        let refused = refusal(seed_fixture(&sealed, &gated, false))?;
+        assert!(refused.contains("refused for a gated sample"), "{refused}");
+        eprintln!("bench no-clone: reflinked fixture and sealed corpus refused");
         Ok(())
     }
 

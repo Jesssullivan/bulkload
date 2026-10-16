@@ -141,6 +141,9 @@ pub struct Target<'a> {
     pub source: &'a str,
     /// A standalone item's plan base (a based capture), imported where the
     /// capture lands: the private stage, or the checkout before a converge.
+    /// A linked item's, when its apply has not imported it into the
+    /// repository yet: imported with the capture, after every refusal
+    /// decidable without a write (dogfood of 2026-10-16, F2).
     pub base: Option<&'a super::StagedBundle>,
 }
 
@@ -2087,7 +2090,7 @@ pub fn apply_workspace(
         } else {
             super::restore_linked_staged_landed(
                 staged,
-                target.repository,
+                (target.repository, target.base),
                 workspace,
                 target.source,
                 landing,
@@ -2098,7 +2101,10 @@ pub fn apply_workspace(
         landed::worktree_git_dir(workspace)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
     let place = Place {
         worktree: workspace,
-        base: target.base.filter(|_| standalone),
+        // A standalone item's plan base, or a linked item's that the
+        // apply deferred (dogfood F2): imported before the capture, after
+        // every proof.
+        base: target.base,
         common: landed::common_dir(&git_dir)?,
         git_dir,
         source: target.source,
@@ -2795,35 +2801,201 @@ pub(super) fn land_standalone_refs(
     Ok((plan, meta, custody))
 }
 
+/// A first landing's own path (estate-apply A5, and `estate-diff`'s
+/// report of it): the checks it makes before anything is read from the
+/// capture or written anywhere. A bare capture is
+/// `GIT_BARE_CAPTURE_WORKSPACE`, a path already there
+/// `GIT_DESTINATION_OCCUPIED`, a parent that does not exist
+/// `GIT_DESTINATION_PARENT_MISSING`. Returns the path with its parent
+/// canonical.
+///
+/// # Errors
+/// As above.
+pub(super) fn first_landing_target(
+    staged: &super::StagedBundle,
+    destination: &Path,
+) -> Result<PathBuf> {
+    super::refuse_bare_capture(staged)?;
+    if destination.symlink_metadata().is_ok() {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    super::linked_destination(destination)
+}
+
+/// What a first linked landing decided before its first write to the
+/// destination repository ([`check_linked`]).
+pub(super) struct LinkedChecked {
+    /// The new worktree's path, its parent canonical.
+    pub destination: PathBuf,
+    /// The plan's repository, canonical.
+    pub repository: PathBuf,
+    /// The capture's ref lines (`shallow::headers`'s form).
+    pub heads: String,
+    /// The capture's provenance instance (the name the import gives it).
+    pub instance: String,
+    /// The repository's common `info/exclude`.
+    pub exclude_path: PathBuf,
+    /// The capture's exclude bytes.
+    pub captured_exclude: Vec<u8>,
+    /// The worktree tree's `ls-tree -r -z` listing.
+    pub entries: Vec<u8>,
+}
+
+/// The checks of a first linked landing that need no write, run before
+/// the first write to the destination repository (dogfood of 2026-10-16,
+/// findings F1 and F2; OI-1003-Q171, Q172, Q173): its path
+/// ([`first_landing_target`]); then, the capture read from a scratch
+/// repository beside the staged bundle that borrows the destination's
+/// objects read-only (`adopt::Scratch`, as the adopt proof reads it), its
+/// metadata, the common exclude policy ([`linked_exclude`]:
+/// `GIT_IGNORE_POLICY_CONFLICT`) and its intent-to-add custody. A refusal
+/// here leaves the destination repository's refs, objects and files as
+/// they were. `estate-diff` reports a first linked landing through this
+/// same function, so the report and the apply cannot disagree.
+///
+/// # Errors
+/// As above; whatever reading the capture refuses.
+pub(super) fn check_linked(
+    staged: &super::StagedBundle,
+    (repository, base): (&Path, Option<&super::StagedBundle>),
+    destination: &Path,
+    source: &str,
+    observed_ns: i128,
+) -> Result<LinkedChecked> {
+    const SITE: &str = "git_carry::converge::check_linked";
+    let destination = first_landing_target(staged, destination)?;
+    let repository = fs::canonicalize(repository).refuse_at(SITE)?;
+    let scratch =
+        adopt::Scratch::new(staged, Some(&adopt::objects_of(&repository)?), base, source)?;
+    // The metadata the landing reads after its import: a malformed capture
+    // refuses here, before it.
+    scratch.meta(source)?;
+    let heads = super::shallow::headers(&scratch.repo, staged.path())?;
+    let captured_exclude = output(git(&scratch.repo).args([
+        "show",
+        &format!("{}:value", super::capture_revision(&heads, "exclude")?),
+    ]))?;
+    let exclude_path = PathBuf::from(text(git(&repository).args([
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-path",
+        "info/exclude",
+    ]))?);
+    let common = super::common_repository(&repository)?;
+    linked_exclude(
+        &common,
+        &exclude_path,
+        &captured_exclude,
+        source,
+        observed_ns,
+    )?;
+    // #131: a capture whose intent-to-add custody cannot be restored
+    // refuses with nothing laid down.
+    let entries = output(git(&scratch.repo).args([
+        "ls-tree",
+        "-r",
+        "-z",
+        &super::capture_revision(&heads, "worktree")?,
+    ]))?;
+    super::intent_to_add_restorable(
+        &super::carried_intent_to_add(&scratch.repo, &heads)?,
+        &entries,
+    )?;
+    Ok(LinkedChecked {
+        destination,
+        repository,
+        heads,
+        instance: scratch.instance,
+        exclude_path,
+        captured_exclude,
+        entries,
+    })
+}
+
+/// The common `info/exclude` (at `path`) a first linked landing keeps: the
+/// capture's (`captured`), or a newer one the main item set (finding 12).
+/// Anything else is `GIT_IGNORE_POLICY_CONFLICT`: it is never overwritten.
+///
+/// # Errors
+/// As above; IO reading it.
+pub(super) fn linked_exclude(
+    common: &Path,
+    path: &Path,
+    captured: &[u8],
+    source: &str,
+    t: i128,
+) -> Result<Vec<u8>> {
+    let existing = match fs::read(path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => {
+            return Err(crate::refuse::io(
+                &error,
+                "git_carry::converge::linked_exclude",
+            ))
+        }
+    };
+    if existing == captured || exclude_newer(common, source, &existing, t)? {
+        Ok(existing)
+    } else {
+        Err(BulkloadRefusal::GitIgnorePolicyConflict)
+    }
+}
+
 /// What a first linked landing decided before `worktree add`.
 pub(super) struct LinkedPlan {
     pub head: HeadPlan,
     pub meta: Meta,
     pub custody: Custody,
     pub common: PathBuf,
+    /// The capture's provenance instance, imported.
+    pub instance: String,
+    /// The common `info/exclude` the landing keeps, read under the lock.
+    pub exclude: Vec<u8>,
     /// The HEAD branch `worktree add -b` creates (a foreign repository).
     pub create: Option<String>,
     /// Held until the landing's ledger is written.
     pub lock: landed::DestinationLock,
 }
 
-/// A first linked landing's native refs and HEAD, before `worktree add`:
-/// settle any pending ref intent, the native ref step into a repository
-/// bulkload created, then where the new worktree's HEAD goes, its branch
-/// created or moved first by compare-and-swap. A branch that cannot be
-/// attached is never a refusal: the worktree lands detached at the
-/// captured head (finding 11). A foreign repository keeps provenance only.
+/// A first linked landing's native refs and HEAD, before `worktree add`,
+/// after [`check_linked`]: under the destination lock, settle any pending
+/// ref intent, check the exclude policy again (a settled intent may have
+/// changed it), and only then import the plan `base` a linked item's apply
+/// deferred and the capture (`bundle`; dogfood F2:
+/// no refusal decidable without a write follows the import); then the
+/// native ref step into a repository bulkload created, then where the new
+/// worktree's HEAD goes, its branch created or moved first by
+/// compare-and-swap. A branch that cannot be attached is never a refusal:
+/// the worktree lands detached at the captured head (finding 11). A
+/// foreign repository keeps provenance only.
 pub(super) fn plan_linked(
-    repository: &Path,
+    checked: &LinkedChecked,
+    (bundle, base): (&Path, Option<&super::StagedBundle>),
     source: &str,
-    instance: &str,
     landing: &Landing<'_>,
 ) -> Result<LinkedPlan> {
     let t = landing.observed_ns;
+    let repository = checked.repository.as_path();
     let common = super::common_repository(repository)?;
     let lock = landed::lock(&common, source)?;
     let directory = landed::ledger_dir(&common, source);
     let mut custody = settle_repository(repository, &common, source)?;
+    let exclude = linked_exclude(
+        &common,
+        &checked.exclude_path,
+        &checked.captured_exclude,
+        source,
+        t,
+    )?;
+    if let Some(base) = base {
+        super::import_verified(repository, base.path(), source)?;
+    }
+    let (_, instance) = super::import_verified_instance(repository, bundle, source)?;
+    if instance != checked.instance {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let instance = instance.as_str();
     let meta = Meta::read(repository, source, instance)?;
     let mut ledger = landed::read::<RefLedger>(&directory.join(landed::REFS_LANDED))?
         .filter(|ledger| ledger.created);
@@ -2891,6 +3063,8 @@ pub(super) fn plan_linked(
         meta,
         custody,
         common,
+        instance: instance.to_owned(),
+        exclude,
         create,
         lock,
     })

@@ -1073,3 +1073,109 @@ fn p102_estate_diff_reports_the_shape_the_apply_refuses() {
         "{line}"
     );
 }
+
+/// The `GloriousFlywheel` shape of the 2026-10-16 dogfood (findings F1 and
+/// F2): the destination's main checkout carries an `info/exclude` the
+/// source lacks, so its adoption refuses `GIT_DESTINATION_DIVERGED`; a
+/// source-only linked worktree then meets a common exclude that is not the
+/// capture's (`GIT_IGNORE_POLICY_CONFLICT`), and another is planned under
+/// a parent the destination lacks (`GIT_DESTINATION_PARENT_MISSING`).
+fn linked_refusals(world: &Gftb) -> (Run<'_>, PathBuf, PathBuf) {
+    let infra = world.sting("infra");
+    fs::create_dir_all(infra.join(".git/info")).unwrap();
+    fs::write(infra.join(".git/info/exclude"), b"sting-only/\n").unwrap();
+    let conflict = world.neo("infra.worktrees/only-src");
+    let orphan = world.neo("infra/.worktrees/nest");
+    let main = world.neo("infra");
+    let run = named_run(
+        world,
+        "linked",
+        &[
+            (&main, &infra, Some(&infra)),
+            (
+                &conflict,
+                &infra,
+                Some(&world.sting("infra.worktrees/only-src")),
+            ),
+            (&orphan, &infra, Some(&world.sting("missing/nest"))),
+        ],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    (run, conflict, orphan)
+}
+
+/// Every ref of `repo`, bulkload's namespaces included.
+fn all_refs(repo: &Path) -> String {
+    git(repo, &["for-each-ref", "--format=%(refname) %(objectname)"])
+}
+
+/// P103 LINKED-REFUSAL-WRITES-NOTHING (dogfood F2): a first linked landing
+/// that refuses `GIT_IGNORE_POLICY_CONFLICT` or
+/// `GIT_DESTINATION_PARENT_MISSING` decides it before any write: the
+/// destination repository's refs (provenance included) are unchanged, and
+/// so is every entry of its `.git`. Before the fix the provenance import
+/// ran before the exclude check and left `refs/carry/v1/neo/...` behind.
+#[test]
+fn p103_a_refused_linked_landing_leaves_the_repository_untouched() {
+    let world = Gftb::new();
+    let (run, conflict, orphan) = linked_refusals(&world);
+    let infra = world.sting("infra");
+    let refs_before = all_refs(&infra);
+    let frozen = freeze_all(&infra.join(".git"));
+    let ran = run.apply(&["--adopt"]);
+    assert!(!ran.ok, "{}", ran.stdout);
+    let rows = receipts(&ran.stdout);
+    let main = receipt(&rows, &world.neo("infra"));
+    assert!(main.2.contains("GIT_DESTINATION_DIVERGED"), "{main:?}");
+    let row = receipt(&rows, &conflict);
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(row.2.contains("GIT_IGNORE_POLICY_CONFLICT"), "{row:?}");
+    let row = receipt(&rows, &orphan);
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(row.2.contains("GIT_DESTINATION_PARENT_MISSING"), "{row:?}");
+    assert_eq!(
+        all_refs(&infra),
+        refs_before,
+        "a refused linked landing left refs in the destination repository"
+    );
+    assert_eq!(
+        freeze_all(&infra.join(".git")),
+        frozen,
+        "a refused linked landing wrote"
+    );
+    assert!(!world.sting("infra.worktrees/only-src").exists());
+    assert!(!world.sting("missing").exists());
+}
+
+/// P104 DIFF-LINKED (dogfood F1): `estate-diff` runs a first linked
+/// landing's pre-landing checks (the apply's own function) and reports
+/// `ignore-policy-conflict` and `parent-missing`, never `landing`, where
+/// the apply then refuses `GIT_IGNORE_POLICY_CONFLICT` and
+/// `GIT_DESTINATION_PARENT_MISSING`.
+#[test]
+fn p104_estate_diff_reports_the_linked_refusals_the_apply_makes() {
+    let world = Gftb::new();
+    let (run, conflict, orphan) = linked_refusals(&world);
+    let diff = run.diff(&[]);
+    let line = diff_line(&diff.stdout, &conflict);
+    assert!(
+        line.contains("\"class\":\"source-only\"")
+            && line.contains("\"adopt\":\"ignore-policy-conflict\""),
+        "{line}"
+    );
+    let line = diff_line(&diff.stdout, &orphan);
+    assert!(
+        line.contains("\"class\":\"source-only\"") && line.contains("\"adopt\":\"parent-missing\""),
+        "{line}"
+    );
+    let ran = run.apply(&["--adopt"]);
+    let rows = receipts(&ran.stdout);
+    assert!(receipt(&rows, &conflict)
+        .2
+        .contains("GIT_IGNORE_POLICY_CONFLICT"));
+    assert!(receipt(&rows, &orphan)
+        .2
+        .contains("GIT_DESTINATION_PARENT_MISSING"));
+}

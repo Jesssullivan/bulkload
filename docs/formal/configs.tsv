@@ -34,6 +34,7 @@ MC_live	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupe
 MC_r25_unrowed_bytes	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_r25_strict_deep	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,Exchange,GitRead,RenameReplace,VerifyDisp	-
 MC_r25_strict_main	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,CommitFail,Exchange,ForeignDelete,ForeignWrite,GitRead,RenameReplace,VerifyDisp	-
+MC_r25_strict_three	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_r25_strict_unsealed	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_r25_strict_authority	pass	all	BackupBegin,BackupEnd,BackupStepLock,BackupStepUnlock,BeginSupersede,CheckOwn,CommitFail,Edit,Exchange,ForeignDelete,ForeignWrite,GitRead,RecvRefused,RenameReplace,SilentRewrite,VerifyDisp	-
 MC_main_sim	simulate	all	*	-simulate num=3000 -depth 120 -seed 20261003

@@ -166,7 +166,9 @@ io-partial-write-alone:
 # alone; and the in-crate directory resume proofs (#74 review B1 and round 2
 # N1). Both features are inert until a test arms them: a fault point fires
 # only under `BULKLOAD_FAULT`, and a traced call records only while a
-# recorder is attached. CI runs this as the separate `fault-harness`
+# recorder is attached. Then the same suites in the hand-off's off arm
+# (`handoff-off`) and in the delta lever's on arm (`delta-lever`). CI runs
+# this as the separate `fault-harness`
 # terminal gate, in parallel with the source gate (R-N122). The harness
 # builds go to their own target dir, so `target/debug/bulkload-agent` is
 # never replaced by a fault-enabled binary. The feature clippy pass stays in
@@ -178,15 +180,55 @@ fault-harness:
     cd {{ root }} && cargo test -p bulkload-agent --lib --locked --features fault-injection,io-trace --target-dir target/fault io::
     cd {{ root }} && {{ just_executable() }} io-partial-write-alone
     cd {{ root }} && {{ just_executable() }} resume-power-loss
+    cd {{ root }} && {{ just_executable() }} handoff-off
+    cd {{ root }} && {{ just_executable() }} delta-lever
+
+# The loopback hand-off's off arm (OI-1003-Q154 review). A local `copy`
+# takes the hand-off by default (levers 1 and 2: handed chunks, not
+# hashed again on the destination, no per-frame flush), so every
+# copy-based crash, power-loss and resume suite exercises that path only.
+# This arm runs them again with `BULKLOAD_LOOPBACK_HANDOFF=0`: the plain
+# protocol that `pull` runs across hosts, with the destination's
+# worker-side verify, the inline verify before a stage, and every frame
+# flushed as written. Crash children inherit the variable. `w3_engine`
+# runs first in the same environment and proves the arm took: it asserts
+# `blake3_dest_wire_verify_bytes == bytes_received` and
+# `wire_handed_bytes == 0` when the variable is `0`.
+handoff-off:
+    cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test w3_engine
+    cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test s3_transfer_resume --test sqlite_carry
+    cd {{ root }} && BULKLOAD_LOOPBACK_HANDOFF=0 {{ just_executable() }} resume-power-loss
+
+# The delta lever's on arm (OI-1003-Q154 review). The lever is off by
+# default, so every copy-based crash, power-loss and resume suite decides a
+# new path in a populated destination manifest-first only. This arm runs
+# them again with `BULKLOAD_LOCAL_NEW_PATH_STREAM=1`: such a seat streamed,
+# unless a reuse row, a salvaged temporary or the source's ledger keeps it
+# on its manifest. Crash children inherit the variable. `loopback_handoff`
+# runs first in the same environment and proves the arm took: its default
+# arm asserts the new path streamed when the variable is `1`.
+# `s3_transfer_resume` and `w3_engine` are left out: with the lever on they
+# fail only S3's inequality 2 as they prove it on `copy` (handed bytes
+# counted as received), the operator's question in the 2026-10-16
+# amendment of docs/slo.md.
+delta-lever:
+    cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test loopback_handoff
+    cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 cargo test -p bulkload-agent --locked --features fault-injection,io-trace --target-dir target/fault --test fault_harness --test power_loss --test estate_converge --test sqlite_carry
+    cd {{ root }} && BULKLOAD_LOCAL_NEW_PATH_STREAM=1 {{ just_executable() }} resume-power-loss
 
 # Resume power-loss proofs, lib tests that need `io-trace`, run in the fault
 # gate's feature-union build (OI-1003-Q81): the directory
 # resume paths (#74 review B1 and round 2 N1) and the adoption of a durable
 # unrowed output from its capture record with 0 source bytes read (#169,
-# R-N58). A name filter that matches nothing still reports `0 passed`, so this
-# recipe fails unless all three proofs ran: on a cargo failure, on anything
-# but one `3 passed; 0 failed` result, or when a proof is not among the
-# passing tests (#74 round 2 N2, R-N122).
+# R-N58), the batched directory levels (OI-1003-Q143 item 2: a level
+# crashed after its commit, after some renames, in its finish, and a batch
+# that must wait for a held adoptable parent, #217 review), and on Linux the
+# batched group seal (S1, OI-1003-Q107; compiled for Linux only, where it
+# fails rather than skips). A name filter that matches nothing still reports
+# `0 passed`, so this recipe fails unless every proof for this platform ran:
+# on a cargo failure, on anything but one `N passed; 0 failed` result (N = 8
+# on Linux, 7 elsewhere), or when a proof
+# is not among the passing tests (#74 round 2 N2, R-N122).
 resume-power-loss:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -198,18 +240,39 @@ resume-power-loss:
         echo "resume-power-loss: cargo test failed with status $status" >&2
         exit "$status"
     fi
+    proofs=(an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads a_level_crashed_after_its_commit_is_swept_and_its_records_cleared a_level_crashed_after_some_renames_adopts_the_renamed_and_makes_the_rest a_finish_crashed_after_some_seals_completes_every_directory_in_one_commit a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it)
+    if [[ $(uname -s) == Linux ]]; then
+        proofs+=(a_batched_group_names_no_output_before_its_data_is_durable)
+    fi
     results=$(grep -c '^test result: ' <<<"$output" || true)
-    passed=$(grep -c '^test result: ok\. 3 passed; 0 failed;' <<<"$output" || true)
+    passed=$(grep -c "^test result: ok\. ${#proofs[@]} passed; 0 failed;" <<<"$output" || true)
     if [[ $results -ne 1 || $passed -ne 1 ]]; then
-        echo "resume-power-loss: expected exactly one '3 passed; 0 failed' result" >&2
+        echo "resume-power-loss: expected exactly one '${#proofs[@]} passed; 0 failed' result" >&2
         exit 1
     fi
-    for proof in an_adopted_fallback_directory_is_sealed_before_its_record_binds a_directory_adopted_by_its_bound_record_is_sealed_before_outputs_commit an_unrowed_output_is_adopted_without_source_reads; do
+    for proof in "${proofs[@]}"; do
         if [[ $(grep -c "^test materialize::adoption_power_loss::$proof \.\.\. ok$" <<<"$output" || true) -ne 1 ]]; then
             echo "resume-power-loss: $proof was not among the passing tests" >&2
             exit 1
         fi
     done
+
+# Darwin check (S1 stack review, 2026-10-15, finding 3). CI runs on Linux
+# only (tinyland-nix), so the Darwin code (`io/sys_darwin.rs`, the `apple`
+# and `not(linux)` branches) is compiled and tested nowhere else. Run it on
+# a Darwin host (neo with the R-N69 prefix, or pzm) before merging a change
+# that touches that code: the rust-check passes (fmt, both clippy passes,
+# the workspace tests) and the whole fault harness, as on Linux.
+darwin-check:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [[ "$(uname -s)" != Darwin ]]; then
+        echo "darwin-check: run this on a Darwin host" >&2
+        exit 2
+    fi
+    cd {{ root }}
+    {{ just_executable() }} rust-check
+    {{ just_executable() }} fault-harness
 
 # Chunker micro-bench (M2 W4): fused slice-FastCDC + BLAKE3 against the
 # current hash.rs path. Release build; size via BULKLOAD_CHUNKER_BENCH_MIB.
@@ -406,6 +469,46 @@ crash-sweep:
     fi
     echo "crash-sweep: all $points points were swept"
 
+# On demand, never a PR gate (OI-1003-Q165 review, R-N122): P84
+# SOURCE-NO-CLONE's kernel leg and the reflink halves of the bench and
+# harness no-clone tests, required to run. Each returns early where its
+# directory cannot clone, and cargo and unittest still report that as `ok`
+# or a skip, so the PR gate's counts are no proof that they ran. Here
+# BULKLOAD_P84_REQUIRE_REFLINK turns that early return into a failure,
+# TMPDIR is P84_REFLINK_DIR (default `target/p84-reflink`, the build's own
+# file system), and each leg must print its own line. It needs Linux with
+# that directory on xfs `reflink=1`, btrfs or bcachefs; elsewhere it fails.
+p84-reflink:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    dir=${P84_REFLINK_DIR:-${CARGO_TARGET_DIR:-target}/p84-reflink}
+    mkdir -p "$dir"
+    TMPDIR=$(cd "$dir" && pwd)
+    export TMPDIR BULKLOAD_P84_REQUIRE_REFLINK=1
+    log=$(mktemp "$TMPDIR/p84-reflink.XXXXXX")
+    trap 'rm -f "$log"' EXIT
+    cargo test -p bulkload-agent --locked --test source_lock_trace p84_ -- --nocapture 2>&1 | tee "$log"
+    if [[ $(grep -c '^test result: ok\. 3 passed; 0 failed;' "$log" || true) -ne 1 ]]; then
+        echo "p84-reflink: expected one '3 passed; 0 failed' result, the kernel leg's own" >&2
+        exit 1
+    fi
+    for marker in 'p84 self-test: FICLONE shared ' 'p84 copy and serve: source ' 'p84 git and sqlite: repository '; do
+        if [[ $(grep -c "^$marker" "$log" || true) -ne 1 ]]; then
+            echo "p84-reflink: no '$marker' line: that leg did not run" >&2
+            exit 1
+        fi
+    done
+    cargo test -p bulkload-bench --locked tests::a_fixture_that_shares_an_extent_refuses_the_sample -- --exact --nocapture 2>&1 | tee "$log"
+    if [[ $(grep -c '^bench no-clone: reflinked fixture and sealed corpus refused$' "$log" || true) -ne 1 ]]; then
+        echo "p84-reflink: the bench's reflinked half did not run" >&2
+        exit 1
+    fi
+    python3 crates/bulkload-bench/scripts/test_r23_corpus.py NoCloneTests
+    python3 crates/bulkload-bench/scripts/test_r23_ab.py HarnessTests.test_a_cloning_copy_is_refused_by_fiemap_on_a_reflink_file_system
+    python3 crates/bulkload-bench/scripts/test_gate_b.py HelperTests.test_prepare_copies_by_read_and_write_and_refuses_a_shared_copy
+    echo "p84-reflink: the kernel leg, the bench and the harness reflink halves ran under $TMPDIR"
+
 # Normal attached gate: materialize the repo tools, then use the Flywheel
 # wrapper for the Bazel graph.
 check:
@@ -422,8 +525,13 @@ check-local: check-source test-local
 ci-source: check-source secrets-scan-history contract-test
 
 # The CI `fault-harness` terminal gate (R-N122); the composite action execs it
-# inside the repo flake, like `ci-source`.
-ci-fault-harness: fault-harness
+# inside the repo flake, like `ci-source`. The tinyland-nix runner pod is
+# capped at 2 GiB: the fault-feature build OOM-killed it on #230 and #233
+# (2026-10-16, rustc at 1.5 GiB RSS beside a linker), so CI builds this
+# gate two jobs wide with line-tables-only debug info. Local runs of
+# `fault-harness` are unchanged.
+ci-fault-harness:
+    cd {{ root }} && CARGO_BUILD_JOBS=2 CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_PROFILE_TEST_DEBUG=line-tables-only {{ just_executable() }} fault-harness
 
 # CI is fail-closed on the fleet-managed GloriousFlywheel profile and drives
 # every Bazel target through the canonical cache-backed wrapper.
@@ -439,7 +547,8 @@ import? "justfile.flywheel"
 
 # docs/formal's typed catalogue (OI-1003-Q32, OI-1003-Q43): render each
 # module's run order (configs.tsv for BulkloadTransfer.tla, configs_gc.tsv
-# for GitCarry.tla) and every MC_*.cfg from docs/formal/catalogue/
+# for GitCarry.tla, configs_sq.tsv for SqliteCarry.tla, configs_dir.tsv for
+# DirectoryRecords.tla) and every MC_*.cfg from docs/formal/catalogue/
 # Catalogue.dhall into OUT (default docs/formal). Every MC_*.cfg already in
 # OUT is removed first, so a config dropped from the catalogue leaves no
 # stale file. dhall-to-json evaluates the catalogue, which also checks its
@@ -506,8 +615,11 @@ tla-render out="" json="":
     echo "tla-render: all $count committed files equal the catalogue's rendering"
 
 # TLA+ models of the proof package (OI-1003-Q7; docs/formal/README.md):
-# BulkloadTransfer.tla (wire v5, Held, the group commits and resume) and
-# GitCarry.tla (git carry's chain and base custody, OI-1003-Q43).
+# BulkloadTransfer.tla (wire v5, Held, the group commits and resume),
+# GitCarry.tla (git carry's chain and base custody, OI-1003-Q43),
+# SqliteCarry.tla (the SQLite snapshot seat of wire v6, #218, OI-1003-Q146)
+# and DirectoryRecords.tla (directory records and their batching, R-N102,
+# OI-1003-Q143).
 # Standalone and on demand: no tier depends on it, so check-fast,
 # check-optional, check-full and CI never start TLC. TLC comes from the
 # flake's pinned nixpkgs (no flake change). Before any TLC run, two

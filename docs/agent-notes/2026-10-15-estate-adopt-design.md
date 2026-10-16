@@ -980,3 +980,68 @@ demand), and the read-only sting acceptance of section 9.
 | #226 open questions | operator | - | Section 11's decisions stand; the stash rule of finding 10 added (section 13). | Operator answers |
 | #226 `--protect` (PR 3) | unassigned | - | Not built. | Only if asked |
 | GFTB live | coordinator | `/srv/fast-local/jess/git` | Untouched by this lane. The live symlink paths now refuse under `--adopt` (P98), as section 2 required. | Decision 1, then the sting acceptance |
+
+### Dogfood of 2026-10-16: F1 and F2 (fixed 2026-10-16)
+
+Rulings cited: OI-1003-Q171, Q172 and Q173 (from the coordinator's task
+text), R-N13. Source: the GloriousFlywheel neo->sting dry run,
+`/srv/fast-local/jess/bulkload/gf-move-20261015/gf-move-plan.md` section
+6, and its synthetic repro `fixture/run-*`. F3
+(`CONTRACT_SELF_INCONSISTENT` naming) and F4 (`pull` of a single file or
+into a missing directory) are left alone, as directed.
+
+| # | Finding | Fix | Proof |
+|---|---|---|---|
+| F2 | A first linked landing imported provenance before its refusals: `restore_linked_staged_landed` ran `import_verified_instance` before the exclude check, and `estate::import_base` imported the plan base into the repository before `apply_workspace` was called at all. A linked item refused `GIT_IGNORE_POLICY_CONFLICT` or `GIT_DESTINATION_PARENT_MISSING` left `refs/carry/v1/<source>/...` refs and their objects behind. | `converge::check_linked` decides every refusal that needs no write before any write to the destination repository: the path (`first_landing_target`: bare capture, occupied, parent missing), then, from an `adopt::Scratch` beside the staged bundle that borrows the destination's objects read-only (the base imported into the scratch only), the capture's metadata, the common exclude policy (`linked_exclude`, finding 12's newer-exclude rule kept) and intent-to-add custody. `plan_linked` then takes the lock, settles, checks the exclude again (a settled intent may have changed it), and only then imports the base and the capture. `estate::import_base` no longer imports a linked item's base: it hands it to the apply as `Target::base` (`Place::base` is no longer standalone-only), and the base is recorded in `ImportedBases` only after that item's apply succeeds. So a linked adopt or converge also imports its base after its proof, as the standalone path already did. Nothing is rolled back: no import precedes a refusal that can be decided without a write. | P103: the GF shape (main adopt `GIT_DESTINATION_DIVERGED` on an exclude the source lacks, a source-only linked worktree `GIT_IGNORE_POLICY_CONFLICT`, a linked worktree under a missing parent `GIT_DESTINATION_PARENT_MISSING`): `for-each-ref` of the repository, `refs/carry` included, is unchanged, and so is the `lstat` identity of every entry of its `.git`. |
+| F1 | `estate-diff` said `landing` for a source-only item the apply refuses. | `diff::first_landing` calls the apply's own `first_landing_target` (standalone) and `check_linked` (linked, when the repository exists): `ignore-policy-conflict` and `parent-missing` are new `adopt` values; any other refusal is the row's `refused` code. A linked item whose repository does not exist yet (the plan's main lands it first) is checked for its path only and carries the component `repository-absent`. | P104: the same shape; the diff says `ignore-policy-conflict` and `parent-missing`, and the apply then refuses `GIT_IGNORE_POLICY_CONFLICT` and `GIT_DESTINATION_PARENT_MISSING`. |
+
+**Failing first, on `3fe1f07` with only the tests added:** P103 failed
+at its refs assertion: 27 refs added to the destination repository, 17
+of the capture's instance (`4ce01491...`) and 10 of the plan base's
+(`5ac2a71a...`, `shared-base-head`). P104 failed on the only-src row
+`"adopt":"landing"`. A first fix that moved only the capture's import
+still failed P103 with the 10 base refs; that is how the base import in
+`estate::import_base` was found.
+
+**Crash safety.** A first linked landing is now: checks (scratch only;
+the destination unchanged), the lock and `settle_repository` (as
+before), the exclude re-read, the base and capture import (additive,
+idempotent), the ref step, the landing intent, `worktree add`, the
+ledger. A crash anywhere before the import leaves the destination as it
+was; a crash after it leaves provenance only, as before, and the rerun
+checks again before writing more. Provenance a crashed run imported is
+not removed by a later refusal (no rollback: nothing deletes what this
+run did not create).
+
+**Model.** `EstateConverge.tla` is unchanged and no row was rerun. Its
+`Begin` already takes the lock and settles (`RefSettle`) before
+`FirstStepWt`'s import and ref step; the code imported before the lock,
+a deviation the model did not show (the import is additive). The new
+order matches the model. The pre-landing refusals change no modelled
+variable: they are refusals before any write, and the model does not
+carry the exclude policy for the linked worktree.
+
+**Open (not fixed here).** `estate-diff` reads the destination as it
+is. When a main item of the same plan converges first in the apply and
+sets a newer exclude (finding 12's rule), the diff can say
+`ignore-policy-conflict` for a linked item the apply then lands; when
+the main lands the repository first, the diff says `landing` with
+`repository-absent` and the exclude is checked only by the apply. The
+scratch import costs a linked first landing a second `index-pack` of
+its (thin) bundle, and the base's connectivity walk in the scratch.
+
+**Validation (2026-10-16, sting, on `3fe1f07` plus this fix).** `nix
+develop .#default`, `nice -n 10`,
+`CARGO_TARGET_DIR=/srv/fast-local/jess/cache/cargo-target/adopt`
+(`CARGO_BUILD_BUILD_DIR` its `build-dir`; the fault build in `fault/`),
+`TMPDIR=/dev/shm/adopt-fix/tmp`. `cargo fmt --all -- --check` clean;
+clippy `-D warnings` clean in all three passes (workspace; `io-trace`;
+`fault-injection,io-trace`); `estate_adopt` 15 of 15 (P90 to P104);
+`estate_converge` 23 of 23; the lib's `converge` unit tests 24 of 24;
+`fault_harness` 97 of 97. `just tla-check`: not run, no row touched
+(above). `just check-fast` is the coordinator's.
+
+| Stream | Owner | Repo / branch | State and evidence | Next |
+|---|---|---|---|---|
+| #226 dogfood F1, F2 | this lane | bulkload `feat/estate-adopt-20261015` | Fixed and validated above; committed signed on top of `3fe1f07`, not pushed. | Coordinator: `just check-fast`, review |
+| #226 dogfood F3, F4 | unassigned | - | Not touched, as directed. | Coordinator decides |

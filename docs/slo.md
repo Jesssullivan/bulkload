@@ -953,6 +953,159 @@ Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
   `stash_dropped_during_capture_is_drift_custody`, and
   `r3_stash_reflog_round_trip_across_unguarded_windows_is_drift_custody`.
 
+## Amendment 2026-10-15: S2 forbids a clone of a source file (OI-1003-Q164, Q165, Q166)
+
+The clone-lever study (OI-1003-Q164,
+[agent note](agent-notes/2026-10-15-s1-clone-lever.md)) measured that a
+clone writes the source while every `stat` field stays the same. The
+operator ruled the clone **excluded** (OI-1003-Q165), and S2 gains a typed
+rule. No SLO number changes.
+
+- **Why it is a source write.** `FICLONE`, `FICLONERANGE` and a
+  same-file-system `copy_file_range` (which reflink XFS and btrfs serve as
+  a clone) set the source inode's reflink flag in a logged transaction, bump
+  its `i_version` and add references to its extents. Writers to the source
+  stall for the whole remap, and every later write to a shared block is
+  copy-on-write. Only `FIEMAP`'s `SHARED` flag shows it outside the kernel;
+  the stat rows, the bench's source-row check and P34/P77's `lstat` census
+  do not.
+- **(a) No clone call on a source file (S2 property, OI-1003-Q165).** A
+  source file is read by `pread`, or by `read`/`splice` into a pipe. It is
+  never the input of `FICLONE`, `FICLONERANGE`, `FIDEDUPERANGE`,
+  `copy_file_range`, `clonefile`/`fclonefileat` or
+  `copyfile`/`fcopyfile` (remap). `sendfile` is allowed: it only reads.
+  - Rust's `std::fs::copy` uses `copy_file_range` on Linux, and
+    `std::io::copy` does when both ends are regular files. So both count as
+    remaps for this rule.
+  - **Enforced in the typed source access layer.** The rule is stated on
+    the io layer (`io/mod.rs`, "Source access never clones"). P84
+    SOURCE-NO-CLONE (`tests/source_command_registry.rs`) scans every crate's
+    non-test code.
+    - No remap call is named.
+    - No clone ioctl number is written, matched by value in any radix,
+      with `_` separators or a type suffix (`0x4004_9409`, `148`).
+    - No `use` hides a copy: an import of `copy`, `fs` or `io` renamed
+      (`self as` too), or a glob import of either.
+    - Every raw `syscall` is a registered site named by its `libc::SYS_*`
+      constant, so no number can reach `copy_file_range`.
+    - Every `fs::copy` and `io::copy` must be a registered site whose input
+      is argued not to be a source file. A registered site with generic
+      parameters has its callers pinned too: the raw-tree capture's
+      `io::copy` reads a source file, and its writer is pinned to `git
+      fast-import`'s stdin, a pipe, for which std uses `splice`.
+      `batch_objects::read_body`'s one caller passes `git cat-file`'s stdout.
+  - **Proven on the kernel.** P84's kernel leg (`tests/source_lock_trace.rs`)
+    proves on the host that `FIEMAP` sees a `FICLONE` and a `std::fs::copy`
+    that the `lstat` census misses. Then three verbs must leave every source
+    extent unshared: a real `copy`, a `serve` in its own process, and a v1
+    Git capture, whose raw-tree pass reads every seat. A `SQLite` provider
+    snapshot must too, as an ordinary user; as root the provider refuses
+    to read a source at all (OI-1003-Q76).
+    - The leg needs a directory on a reflink file system: `TMPDIR`, or else
+      cargo's `CARGO_TARGET_TMPDIR`.
+    - Where neither can clone, the leg says so on stderr and returns, and
+      cargo still reports `ok`. The same holds for the bench's and the
+      harness scripts' reflinked halves. So a pass count from the PR gate
+      or `cargo test` is not proof that these legs ran.
+    - `just p84-reflink` is that proof. It sets
+      `BULKLOAD_P84_REQUIRE_REFLINK`, which turns each early return into a
+      failure, and it requires each leg's own output line. It is on
+      demand, like `props-deep`, and is not a PR gate.
+  - **What `FIEMAP` can say.** It shows sharing that exists when it looks.
+    A clone whose target is then overwritten in full, or unlinked and
+    freed, leaves the source unshared again, although the clone call wrote
+    the source inode. So a `0` means "shares nothing now", not "was never
+    cloned"; the static half is what rules the call out.
+    - `FIEMAP_EXTENT_SHARED` is trusted only on xfs, btrfs, bcachefs and
+      ocfs2.
+    - ext2/3/4 and tmpfs cannot reflink, so a file there counts as 0 by
+      construction.
+    - Any other file system (CIFS/SMB3, which clones but never sets the
+      flag, NFS, overlayfs, ZFS) counts as `unsupported`, never `0`.
+    - An unreadable directory fails the check instead of being skipped.
+  - **The two destination-side `std::fs::copy` calls stay.**
+    `git_carry::prepare_attachment` and `git_carry::registered::restore`
+    copy bulkload's own private staged capture bundle into a receipt it has
+    just created. Neither file is a source file, so S2 does not govern them.
+    On a reflink file system the receipt may share extents with the staged
+    copy; that is the study's Q-d, answered by Q165 for these two: they may
+    stay.
+  - **A third destination-side copy arrived with estate converge
+    (OI-1003-Q144), after Q165.** `git_carry::converge::publish_index`
+    copies the landed checkout's `.git/index` (on the destination; the
+    operator's Git may have rewritten it since landing) to converge's
+    private merged index beside it, under the `index.lock` it holds. Its
+    input is never a source file, so S2 does not govern it, and P84 pins it
+    with that reason. Q165 named only the two receipt copies; whether Q-d's
+    answer extends to this one (the merged index may share extents with the
+    live index until Git rewrites it) is not ruled.
+- **(b) Rig corpus copies are read and write, verified unshared
+  (OI-1003-Q165).** Every copy of the sealed corpus a sample reads is an
+  explicit `read`/`write` copy. It is never `cp`, whose default is
+  `--reflink=auto`, and never `shutil`, which uses `copy_file_range` on
+  Linux from Python 3.14. The copy is checked with `FIEMAP`
+  (`FIEMAP_EXTENT_SHARED` never set) before the sample runs, and a shared
+  extent refuses the sample.
+  - `r23_ab.py`'s working copy is `r23_corpus.plain_copy_tree`. It is
+    checked before any build, and a shared extent refuses with exit 2 in
+    every mode.
+  - On Linux, a work root whose sharing cannot be known (above) refuses a
+    gated sample, and an informational one records `unsupported`. Off
+    Linux the check is `n/a`.
+  - After every rep, the working copy and the rep's private fixture are
+    checked again. A shared extent aborts the sample with exit 3.
+  - The bench (`bulkload-bench`) checks its seeded fixture after the seed
+    and after every arm, and refuses on a shared extent in every mode. Its
+    header records `fixture_shared_extents` and
+    `sealed_corpus_shared_extents`, and every sample row records
+    `source_shared_extents`.
+  - `gate_b.py`'s source working copy follows the same rule: a read/write
+    copy, and a shared extent refuses SOURCE.
+  - `r23_corpus.py copy` makes a read/write, verified, unshared copy of a
+    corpus. `seal` refuses a copy that shares an extent, and `fiemap`
+    prints a tree's count.
+  - The sealed corpus is checked once per sample. Since Q166 re-sealed the
+    rig's corpus unshared, a shared sealed corpus refuses a gated sample in
+    both the bench and `r23_ab.py`; an informational one records the count.
+  - The rig's own tooling, outside the repository, follows the rule
+    (receipt `~/git-bulkload/logs/q165b-rig-tooling-20261015.receipt`,
+    sha256 `5cc030df4a6ae8b1…`):
+    - The sota driver's working copy is `~/git-bulkload/sota/src-unshared`,
+      a read and write copy with 0 shared extents. The old `sota/src`, a
+      `cp -a` reflink, is kept and no longer used.
+    - The driver checks the copy before and after every sample, and refuses
+      its clone configurations.
+    - `diag.sh` and `pin-diag.sh` copy with `rigcopy.py`, not `cp -R`.
+    - Every run script refuses a checkout whose `r23_ab.py` lacks this
+      gate.
+- **(c) Re-seal (OI-1003-Q166), done 2026-10-15 on mbp-13.** Corpus v1
+  shared all 23 of its files' extents with `~/git-bulkload/sota/src` (the
+  study's §1).
+  - **Old path (kept, not deleted):** `~/git-bulkload/r23-corpus-v1/corpus`.
+  - **New path (the rig default):**
+    `~/git-bulkload/r23-corpus-v1-unshared/corpus`.
+  - **Made** by an explicit `os.read`/`os.write` copy:
+    - The tool was `~/git-bulkload/reseal-20261015/reseal_copy.py` (sha256
+      `523a06458c47cbfa…`), a rig script; the repository's
+      `r23_corpus.py copy` was not on the rig's checkout yet.
+    - `strace` showed no `copy_file_range`, `sendfile`, `splice` or clone
+      ioctl.
+    - It was then sealed 0444/0555, as the original was.
+  - **Verified** to the same content identity
+    (`f4a7619f7b88f2e0e1eeadb5995c79a809eafa8b4a8cf3f82d1ff6f29b5b07c7`,
+    `r23_corpus.py verify` at 59e5e60).
+  - **Unshared:** 0 of its 25 extents are shared, by
+    `~/git-bulkload/reseal-20261015/fiemap_check.py` (sha256
+    `0ff568b6d8203bae…`).
+  - **Receipt:** `~/git-bulkload/logs/reseal-corpus-v1-20261015.receipt`,
+    sha256 `5e716ee5988a7107…`.
+  - **The default** is the runbook's `--corpus`
+    (`docs/plans/2026-10-07-s1-hermetic-rig.md` §2 and §5). The rig's dated
+    run scripts are records of past runs, not defaults.
+
+  A re-seal changes inode and ctime, so the stat-based fixture identity
+  (`sealed_corpus_blake3`) starts a new series.
+
 ## Amendment 2026-10-15 (ruled, later): S2 passes on a schedule recorded in advance, stash-order-v2 (OI-1003-Q168, Q169)
 
 Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
@@ -1184,6 +1337,118 @@ user. No SLO number changes. The design note is
   landing beside a live copy (agents never delete either). Answered: which
   repositories count as private (none is asked: OI-1003-Q188) and what
   `ready` reads (commits and clean trees: OI-1003-Q189).
+
+## Amendment 2026-10-16: the delta lever, opt-in pending a reading of S3 inequality 2 (OI-1003-Q154)
+
+A lever under OI-1003-Q154 (authorized S1 levers where R25 holds), built to
+OI-1003-Q155's quality and merged only on an independent review
+(OI-1003-Q173). It changes no number and no ruling, and it is **off by
+default**. Diagnosis: `docs/agent-notes/2026-10-16-delta-regression.md`
+(PR #234).
+
+- **What it does.** Since wire v5 (`c2f8b663`) the destination asks for a
+  manifest first for every entry it cannot reuse once its store holds any
+  output hint: any earlier non-empty output. So a new file copied into a
+  populated destination is read and hashed whole by the source before its
+  first byte is placed. With `BULKLOAD_LOCAL_NEW_PATH_STREAM=1`, a local
+  `copy` with the loopback hand-off answers `Send` for a seat new to both
+  stores: no file at its path, no reuse row under its key, no capture of
+  it in the source's ledger, and no temporary salvaged in the session
+  (`Inbound::wants_manifest`). It keeps `WantManifest` for an existing
+  path (adoption, the superseding publish's local fill, #187), for a seat
+  whose reuse row is here and whose output a third party removed (its
+  source ledger row still gives the manifest without a read: P79), for a
+  seat the source's ledger captured for another destination from the same
+  source state (one source fanned out: the same zero-read manifest; the
+  destination reads that ledger read-only, both halves being one
+  process), and whenever the sweep salvaged a temporary (a temporary's
+  name does not say which path it was staged for). A source ledger the
+  destination cannot read keeps the manifest. `pull`, `serve`, `receive`
+  and a `copy` with the hand-off off decide as before, lever or not.
+- **Why it is off by default: S3 inequality 2.** WP0(c)'s inequality 2
+  (wire content bytes ≤ the changed seats' chunks the destination holds no
+  verified copy of, OI-1003-Q18) is proven on `copy` with `bytes_received`
+  (`tests/s3_transfer_resume.rs`, P18 and P21 over added seats). With the
+  lever on, an added seat that copies or slices a carried file is streamed,
+  and its handed bytes count in `bytes_received` whole. Ten tests fail,
+  each on that bound alone (lane note): P18 and the P21 added-seat cases
+  in `tests/s3_transfer_resume.rs` (eight), `w3_engine_properties` in
+  `tests/w3_engine.rs` (W3's cross-file prefix fill, `bytes_received`
+  below the grown file's length), and the lib test
+  `a_lost_output_does_not_lose_reuse_of_its_chunks` (#59: when a chunk's
+  newest holder is gone an older one serves it). In a local `copy` with
+  the hand-off those bytes never cross the socket (only 64-byte headers
+  do), and the source reads the seat once either way, so whether handed
+  bytes are "wire content bytes" is a reading of inequality 2 that no
+  ruling gives. Until the operator rules it, the lever is for A/B only and
+  every ruled proof runs as before. If handed bytes are ruled not to be
+  wire bytes, turning the lever on by default is the default's change in
+  `local_new_path_stream` plus moving each of those clauses to an arm
+  where a new path still asks for its manifest: inequality 2's added-seat
+  clauses and W3's prefix fill to the transport arm (`serve` against
+  `receive`, which the harness already has, or the hand-off off), and
+  #59's older-holder fallback likewise, since on `copy` it would then run
+  only through a removed output's manifest.
+- **R25 and S3's other clauses hold with it on.** The source reads a new
+  seat exactly once either way (a manifest's chunks are kept and served
+  from memory). An unchanged rerun is answered `Reuse` before this decision
+  and reads 0 bytes. A changed seat has a file at its path and keeps its
+  manifest. A seat streamed by the lever has no capture in the source's
+  ledger under its key, checked at the decision, so the lever never turns
+  a ledger manifest into a read: not for this destination's own rows (a
+  source row follows `Held`, which follows the reuse row here) and not for
+  rows recorded for another destination from the same source state. One
+  residual, shared with an empty destination: a file a third party places
+  at a streamed seat's path during the session is refused at its publish
+  (`DESTINATION_OCCUPIED`, not remembered), not adopted; the next run asks
+  for that path's manifest and adopts the file if it verifies, the source
+  reading the seat once more across the two runs (`ReadOnce` holds per
+  session; no committed row vouched for those bytes, so
+  `R25_NoDurableReread` holds). Passing adoption to a streamed seat would
+  close it, but the snapshot path refuses an adopting stream
+  (`sqlite_snapshot`), so it is left as it is for an empty destination.
+- **Model.** `BulkloadTransfer.tla`'s `RecvEntry` already chooses freely
+  between `send` and `manifest` for an absent output. The lever narrows
+  that choice, so no step and no row changes. The rows that check the
+  choice under R25 were re-run (lane note). The model abstracts chunks, so
+  inequality 2 is not a model property either way.
+- **Proof on the code.** `tests/loopback_handoff.rs`, with the lever on for
+  the test's own destination: a new path in a populated local destination
+  is streamed (`transfer_manifests_asked` 0, `transfer_new_paths_streamed`
+  1 per seat, `source_ledger_miss_reads` 0, `read_dest_local_reuse_bytes`
+  0) and its unchanged rerun reads 0 bytes; the same assertion fails on the
+  code before (`source_ledger_miss_reads` 1). A removed output whose reuse
+  row is here is asked for by manifest and filled with 0 source bytes. A
+  seat the source's ledger captured for a second destination keeps its
+  manifest and is filled with 0 source bytes and 0 received, lever on or
+  off (on the first build, without the ledger check, it was read whole).
+  An existing path still asks for its manifest and is filled locally. The
+  default, the lever turned off, and the hand-off off each ask for a new
+  path's manifest as before (the default arm follows the variable, so the
+  suite passes with it exported). A cross-process session with the lever
+  on for its destination still asks for one, fills a duplicate file
+  entirely from the destination's own output, and hashes every received
+  byte. Lib tests with the lever on: a session that salvaged a temporary
+  asks for a new seat's manifest and fills it from the temporary (0
+  received), and a database whose output was removed is found under its
+  snapshot key (manifest) while a new database is streamed. Each of these
+  fails under the mutation it guards (lever reaching `pull`, salvage
+  skipped, snapshot key dropped, ledger check dropped). The crash,
+  power-loss and resume suites run in both hand-off arms with the lever
+  off, and again with it on (`just delta-lever`, in `just fault-harness`:
+  `loopback_handoff` first to prove the variable took, then
+  `fault_harness`, `power_loss`, `estate_converge`, `sqlite_carry` and
+  `resume-power-loss`; `s3_transfer_resume` and `w3_engine` are left out
+  for the bound above).
+- **Measured, informational** (mbp-13, not a sample, OI-1003-Q39): one new
+  33.5 MB file into a destination seeded with one 1 MiB output, 10 reps
+  per arm, ABBA, load1 0.0: lever on 107.6 ms median against off
+  153.4 ms, first data 0.9 ms against 51.5 ms, the same bytes read
+  (33,555,209) and identical output (lane note). The off arm sits above
+  the diagnosis's manifest arm (136.9 ms) on the same rig; read the
+  difference, not the levels. An informational series
+  on the bench comes before any gated sample (Q143); the diagnosis expects
+  about 0.89x rclone on the bench delta, at Q143's 0.90x margin.
 
 ## Priority (OI-1003-Q4)
 
