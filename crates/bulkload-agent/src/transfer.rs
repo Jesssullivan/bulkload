@@ -2700,6 +2700,14 @@ fn ledger_read<T>(mode: LedgerSync, read: Result<Option<T>>) -> Result<Option<T>
     }
 }
 
+/// Whether a source ledger row's manifest can be offered for `row` without
+/// a read: it covers exactly the row's size within the chunk bound. The
+/// source offers it ([`manifest_capture`]), and the delta lever keeps such
+/// a seat on its manifest (`Inbound::wants_manifest`).
+fn ledger_manifest_fits(manifest: &Manifest, row: &RowSchema) -> bool {
+    manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS
+}
+
 /// One entry's manifest: from the ledger when this exact stat identity is
 /// recorded (no source read), otherwise from one read of the file, whose
 /// chunks are all kept in memory for the requests that follow.
@@ -2722,7 +2730,7 @@ fn manifest_capture(
     // A database seat is never recorded, so a ledger row names a file that
     // was carried raw under this exact identity.
     if let Some(manifest) = ledger_read(work.ledger, store.capture(&key))? {
-        if manifest.size() == Some(row.size) && manifest.chunks.len() <= MAX_MANIFEST_CHUNKS {
+        if ledger_manifest_fits(&manifest, row) {
             return Ok(Offered::Offer((None, manifest, None, false)));
         }
     }
@@ -4463,10 +4471,49 @@ enum NewPath {
     /// the delta lever, its default).
     Manifest,
     /// Published outputs hold chunks, but a local `copy` with the hand-off
-    /// streams a seat this store holds no reuse row for: `Send` (the delta
-    /// lever, OI-1003-Q154; [`LOCAL_NEW_PATH_STREAM_ENV`]). A seat whose
-    /// row is here, its output removed since, still asks for its manifest.
+    /// streams a seat this store holds no reuse row for and the source's
+    /// ledger holds no capture of: `Send` (the delta lever, OI-1003-Q154;
+    /// [`LOCAL_NEW_PATH_STREAM_ENV`]). A seat whose row is here, its output
+    /// removed since, or whose capture the source recorded for another
+    /// destination, still asks for its manifest.
     StreamLocal,
+}
+
+/// Count one `WantManifest` (`transfer_manifests_asked`) or one new path the
+/// delta lever streamed (`transfer_new_paths_streamed`), and, in lib tests,
+/// in this thread's `NEW_PATH_DECISIONS` too.
+fn count_new_path(counter: Counter) {
+    counters::bump(counter);
+    #[cfg(test)]
+    NEW_PATH_DECISIONS.with(|decided| {
+        let (asked, streamed) = decided.get();
+        decided.set(if counter == Counter::TransferManifestsAsked {
+            (asked + 1, streamed)
+        } else {
+            (asked, streamed + 1)
+        });
+    });
+}
+
+/// The source half's ledger, read-only, as the delta lever consults it
+/// (`Inbound::wants_manifest`). Only in a local `copy` with the hand-off and
+/// the lever on: both halves are this process, and `source_state` names the
+/// store the source half opened before it sent `Start`.
+struct SourceLedger {
+    store: Store,
+    /// The source's authority from `Start`, which its ledger keys are made
+    /// with ([`row_key`]).
+    authority: Vec<u8>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's entries asked for by manifest first, and new paths
+    /// the delta lever streamed, for lib tests: the process counters
+    /// (`transfer_manifests_asked`, `transfer_new_paths_streamed`) are
+    /// shared with the tests running beside them. A `copy` decides on its
+    /// caller's thread.
+    static NEW_PATH_DECISIONS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// An entry the destination expects content for.
@@ -4498,6 +4545,8 @@ struct Inbound<'a, W> {
     open: usize,
     /// How a new path is asked for ([`Inbound::wants_manifest`]).
     new_path: NewPath,
+    /// The source's ledger, for [`NewPath::StreamLocal`] only.
+    source_ledger: Option<SourceLedger>,
     salvage: Salvage,
     /// Salvaged temporaries each entry staged chunks from, by relative path
     /// (#124): kept past the session only if that entry is refused.
@@ -4713,7 +4762,7 @@ fn receive_session<R: Read, W: Write>(
     // The committer holds the exclusive publisher, so no temporary of this
     // store is in flight while the root is swept.
     target.sweep_root(&store)?;
-    let new_path = match (
+    let mut new_path = match (
         store.has_output_hints()?,
         hand.is_some() && local_new_path_stream(target.path()),
     ) {
@@ -4725,6 +4774,21 @@ fn receive_session<R: Read, W: Write>(
         read_wire(input, hand.as_ref())?
     else {
         return Err(BulkloadRefusal::ProtocolStateViolation);
+    };
+    // The delta lever reads the source's ledger, which the source half
+    // opened before `Start`. A ledger this side cannot open leaves the
+    // session on the store-wide rule, as with the lever off.
+    let source_ledger = if new_path == NewPath::StreamLocal {
+        let opened = Store::open_reader(source_state).ok();
+        if opened.is_none() {
+            new_path = NewPath::Manifest;
+        }
+        opened.map(|ledger| SourceLedger {
+            store: ledger,
+            authority: authority.clone(),
+        })
+    } else {
+        None
     };
     let target_meta = std::fs::metadata(target.path()).refuse_at("transfer::receive")?;
     let output_authority = postcard::to_stdvec(&(
@@ -4774,6 +4838,7 @@ fn receive_session<R: Read, W: Write>(
             incoming: HashMap::new(),
             open: 0,
             new_path,
+            source_ledger,
             salvage: Salvage::default(),
             salvage_staged: HashMap::new(),
             pending_held: HashMap::new(),
@@ -5174,7 +5239,7 @@ impl<W: Write> Inbound<'_, W> {
                         .as_ref()
                         .map(|(snapshot_key, _)| snapshot_key.as_slice()),
                 );
-                Ok(if self.wants_manifest(identity.is_some(), keys)? {
+                Ok(if self.wants_manifest(&row, identity.is_some(), keys)? {
                     Decision::WantManifest
                 } else {
                     Decision::Send
@@ -5213,7 +5278,7 @@ impl<W: Write> Inbound<'_, W> {
                 );
             }
             Decision::WantManifest => {
-                counters::bump(Counter::TransferManifestsAsked);
+                count_new_path(Counter::TransferManifestsAsked);
                 self.incoming
                     .insert(entry, Incoming::AwaitManifest(Seat::file(row, key)?));
             }
@@ -5236,34 +5301,40 @@ impl<W: Write> Inbound<'_, W> {
     ///
     /// The delta lever (OI-1003-Q154; off unless
     /// [`LOCAL_NEW_PATH_STREAM_ENV`] is `1`): in a local `copy` with the
-    /// hand-off, a seat new to this destination is streamed even when published
-    /// outputs hold chunks: no file at its path, no temporary salvaged in
-    /// this session, and no reuse row under its key. Both halves are in
-    /// this process, so a local fill saves no wire byte: it re-reads and
+    /// hand-off, a seat new to this destination is streamed even when
+    /// published outputs hold chunks: no file at its path, no temporary
+    /// salvaged in this session, no reuse row under its key here, and no
+    /// capture of it in the source's ledger. Both halves are in this
+    /// process, so a local fill saves no wire byte: it re-reads and
     /// re-hashes destination bytes in place of the source's handed buffer.
-    /// The source reads such a seat exactly once either way (it can have no
-    /// ledger row from this destination, whose `Held` would have left a
-    /// reuse row here), but a manifest first makes it read and hash the
-    /// whole file before the first byte is placed.
+    /// Such a seat has no ledger row to give its manifest, so a manifest
+    /// first would make the source read and hash the whole file before the
+    /// first byte is placed; streamed, it reads it once, as it is placed.
     ///
     /// Every other entry keeps the manifest: an occupied path (adoption,
     /// the superseding publish's local fill), any salvage (a temporary's
-    /// name does not say which path it was staged for), and a seat whose
-    /// reuse row is here but whose output a third party removed (its
-    /// source ledger row may give the manifest without a read, and the
-    /// destination's other outputs may fill it: P79). `pull`, `receive`,
-    /// and a `copy` with the hand-off off keep the store-wide rule, so a
-    /// new path is filled across files and only the chunks nothing here
-    /// holds cross the wire. The lever's cost is that cross-file fill for
-    /// a new seat in a local `copy`: its bytes are handed over whole, which
-    /// S3's inequality 2 as proven on `copy` counts as received. `BulkloadTransfer.tla`'s `RecvEntry` chooses
-    /// freely between `Send` and `WantManifest` for an absent output, so
-    /// the lever is inside the model.
+    /// name does not say which path it was staged for), a seat whose reuse
+    /// row is here but whose output a third party removed (P79), and a
+    /// seat the source's ledger holds a capture of, recorded when it was
+    /// carried to another destination from the same source state (one
+    /// source fanned out). For the last two the source gives the manifest
+    /// from its ledger without a read, and this destination's outputs may
+    /// fill it. A source ledger this side cannot read keeps the manifest
+    /// too: the lever then decides as the lever off does. `pull`,
+    /// `receive`, and a `copy` with the hand-off off keep the store-wide
+    /// rule, so a new path is filled across files and only the chunks
+    /// nothing here holds cross the wire. The lever's cost is that
+    /// cross-file fill for a seat new to both stores in a local `copy`:
+    /// its bytes are handed over whole, which S3's inequality 2 as proven
+    /// on `copy` counts as received. `BulkloadTransfer.tla`'s `RecvEntry`
+    /// chooses freely between `Send` and `WantManifest` for an absent
+    /// output, so the lever is inside the model.
     ///
     /// # Errors
-    /// Refuses database failures.
+    /// Refuses database failures of this side's store.
     fn wants_manifest<'k>(
         &self,
+        row: &RowSchema,
         occupied: bool,
         keys: impl Iterator<Item = &'k [u8]>,
     ) -> Result<bool> {
@@ -5279,10 +5350,29 @@ impl<W: Write> Inbound<'_, W> {
                         return Ok(true);
                     }
                 }
-                counters::bump(Counter::TransferNewPathsStreamed);
+                if self.source_ledger_holds(row) {
+                    return Ok(true);
+                }
+                count_new_path(Counter::TransferNewPathsStreamed);
                 Ok(false)
             }
         }
+    }
+
+    /// Whether the source's ledger holds a capture of `row` it would offer
+    /// as the manifest without a read ([`ledger_manifest_fits`]). A ledger
+    /// read that fails counts as holding it: the entry then keeps the
+    /// manifest the lever off asks for. A database seat in `snapshot` mode
+    /// is never recorded there, so it is never held.
+    fn source_ledger_holds(&self, row: &RowSchema) -> bool {
+        let Some(ledger) = &self.source_ledger else {
+            return true;
+        };
+        row_key(&ledger.authority, row)
+            .and_then(|key| ledger.store.capture(&key))
+            .map_or(true, |capture| {
+                capture.is_some_and(|manifest| ledger_manifest_fits(&manifest, row))
+            })
     }
 
     /// A database at `rel_path` is held here as a snapshot: published from

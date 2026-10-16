@@ -13,12 +13,16 @@
 //!   `BULKLOAD_LOCAL_NEW_PATH_STREAM=1`): a local `copy` streams a new path
 //!   into a destination whose published outputs hold chunks
 //!   (`transfer_new_paths_streamed`), where it asked for its manifest
-//!   first before; an existing path, and a seat whose output a third party
-//!   removed, still ask for their manifest, and so does every new path with
-//!   the lever off, with the hand-off off, and in a cross-process session,
-//!   which still fills a new path from the destination's own outputs and
-//!   verifies every byte it receives. The lever's tests turn it on for their
-//!   own destination root only.
+//!   first before; an existing path, a seat whose output a third party
+//!   removed, and a seat the source's ledger captured for another
+//!   destination still ask for their manifest, and so does every new path
+//!   with the lever off, with the hand-off off, and in a cross-process
+//!   session, even with the lever on for its destination, which still
+//!   fills a new path from the destination's own outputs and verifies every
+//!   byte it receives. The lever's tests turn it on for their own
+//!   destination root only; the default arm follows the variable, so the
+//!   suite also passes with `BULKLOAD_LOCAL_NEW_PATH_STREAM=1` exported
+//!   (the `delta-lever` arm of `just fault-harness` runs it so first).
 //!
 //! The tests share the process's counters, so they run one at a time.
 
@@ -38,7 +42,7 @@ use std::sync::{Mutex, PoisonError};
 use bulkload_agent::counters::{Counter, Counters};
 use bulkload_agent::transfer::{
     copy, read_frame, receive, set_local_new_path_stream, set_loopback_handoff, settle_racy_window,
-    TransferStats,
+    TransferStats, LOCAL_NEW_PATH_STREAM_ENV,
 };
 use bulkload_proto::frame::{
     Frame, DATA_HEADER_BYTES, FRAME_HEADER_BYTES, LENGTH_PREFIX_BYTES, TAG_CONTROL, TAG_DATA,
@@ -516,11 +520,21 @@ fn an_existing_path_in_a_local_copy_still_asks_for_its_manifest() {
     );
 }
 
+/// Whether this process runs with the delta lever on by default:
+/// `BULKLOAD_LOCAL_NEW_PATH_STREAM=1` exported, as the `delta-lever` arm of
+/// `just fault-harness` and an informational bench series run it.
+fn lever_on_by_default() -> bool {
+    std::env::var(LOCAL_NEW_PATH_STREAM_ENV).is_ok_and(|value| value == "1")
+}
+
 /// The A/B arms: by default (the lever off), with the lever turned off, and
 /// with the lever on but the hand-off off, a new path in a populated
 /// destination is asked for by manifest first, as before the lever. The
 /// source still reads it once: the manifest's chunks are kept and served
-/// from memory.
+/// from memory. The default arm follows the variable: with
+/// `BULKLOAD_LOCAL_NEW_PATH_STREAM=1` exported it streams the new path,
+/// which is how the `delta-lever` arm proves the variable reached the
+/// engine.
 #[test]
 fn a_new_path_asks_for_its_manifest_with_the_lever_or_the_hand_off_off() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
@@ -533,6 +547,7 @@ fn a_new_path_asks_for_its_manifest_with_the_lever_or_the_hand_off_off() {
         ("lever-off", 7, Some(false), None),
         ("handoff-off", 8, Some(true), Some(false)),
     ] {
+        let streams = name == "default" && lever_on_by_default();
         let data = noise(seed, 1 << 20);
         add_source_file(&scratch, name, &data);
         names.push(name);
@@ -545,12 +560,20 @@ fn a_new_path_asks_for_its_manifest_with_the_lever_or_the_hand_off_off() {
         same_files(&scratch, &names);
         assert_eq!(
             counted.get(Counter::TransferManifestsAsked),
-            1,
+            u64::from(!streams),
             "{name}: {}",
             counted.render()
         );
-        assert_eq!(counted.get(Counter::TransferNewPathsStreamed), 0, "{name}");
-        assert_eq!(counted.get(Counter::SourceLedgerMissReads), 1, "{name}");
+        assert_eq!(
+            counted.get(Counter::TransferNewPathsStreamed),
+            u64::from(streams),
+            "{name}"
+        );
+        assert_eq!(
+            counted.get(Counter::SourceLedgerMissReads),
+            u64::from(!streams),
+            "{name}"
+        );
         assert_eq!(
             stats.source_bytes_read,
             data.len() as u64,
@@ -560,10 +583,11 @@ fn a_new_path_asks_for_its_manifest_with_the_lever_or_the_hand_off_off() {
     }
 }
 
-/// `pull` keeps manifest-first for a new path: across processes the
-/// destination fills a new file from its own outputs (`twin`, whose bytes
-/// it holds, crosses the wire as nothing), asks only for what it lacks,
-/// and hashes every byte it receives.
+/// `pull` keeps manifest-first for a new path, with the delta lever on for
+/// its destination: across processes the destination holds no hand-off,
+/// so the lever never acts. It fills a new file from its own outputs
+/// (`twin`, whose bytes it holds, crosses the wire as nothing), asks only
+/// for what it lacks, and hashes every byte it receives.
 #[test]
 fn a_cross_process_new_path_keeps_its_manifest_and_verifies_every_byte() {
     let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
@@ -577,7 +601,9 @@ fn a_cross_process_new_path_keeps_its_manifest_and_verifies_every_byte() {
     add_source_file(&scratch, "twin", &twin);
     names.extend(["fresh", "twin"]);
 
+    lever(&scratch, Some(true));
     let (stats, counted, seen) = cross_process(&scratch, None);
+    lever(&scratch, None);
     assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
     same_files(&scratch, &names);
     assert_eq!(
@@ -601,4 +627,73 @@ fn a_cross_process_new_path_keeps_its_manifest_and_verifies_every_byte() {
         "every received byte verified: {}",
         counted.render()
     );
+}
+
+/// The delta lever keeps a ledger manifest when one source state is fanned
+/// out (OI-1003-Q154 review): `copy` S into this destination, then carry a
+/// new file `twin` (the bytes of `big`) from the same source state into a
+/// second destination, which records `twin`'s capture in the source's
+/// ledger. Copied here again with the lever on, `twin` is new to this
+/// destination but held by the source's ledger: it is asked for by
+/// manifest, which the source gives from its ledger without a read, and
+/// filled from `big`'s output: 0 source bytes, 0 received. `fresh`, new to
+/// both stores, is still streamed and read once. The lever off decides the
+/// same for `twin`.
+#[test]
+fn a_new_path_the_source_ledger_holds_keeps_its_ledger_manifest() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    for on in [true, false] {
+        let scratch = Scratch::new(if on { "fan-out-on" } else { "fan-out-off" });
+        let (mut names, _) = populate(&scratch);
+        clean_local_copy(&scratch);
+        let twin = std::fs::read(scratch.path("source").join("big")).unwrap();
+        add_source_file(&scratch, "twin", &twin);
+        std::fs::create_dir(scratch.path("elsewhere")).unwrap();
+        let elsewhere = copy(
+            &scratch.path("source"),
+            &scratch.path("elsewhere"),
+            &scratch.path("source-state"),
+            &scratch.path("elsewhere-state"),
+        )
+        .unwrap();
+        assert!(elsewhere.refusals.is_empty(), "{:?}", elsewhere.refusals);
+        let fresh = noise(11, 1 << 20);
+        add_source_file(&scratch, "fresh", &fresh);
+        names.extend(["twin", "fresh"]);
+
+        lever(&scratch, Some(on));
+        let (stats, counted) = clean_local_copy(&scratch);
+        lever(&scratch, None);
+        same_files(&scratch, &names);
+        assert_eq!((stats.completed, stats.reused), (2, 3), "{on}: {stats:?}");
+        assert_eq!(
+            counted.get(Counter::TransferManifestsAsked),
+            if on { 1 } else { 2 },
+            "{on}: twin keeps its manifest: {}",
+            counted.render()
+        );
+        assert_eq!(
+            counted.get(Counter::TransferNewPathsStreamed),
+            u64::from(on),
+            "{on}: only fresh is streamed"
+        );
+        // `twin` from the ledger, not read; `fresh` read once.
+        assert_eq!(
+            stats.source_bytes_read,
+            fresh.len() as u64,
+            "{on}: {stats:?}"
+        );
+        assert_eq!(
+            counted.get(Counter::SourceLedgerMissReads),
+            u64::from(!on),
+            "{on}: {}",
+            counted.render()
+        );
+        assert_eq!(
+            stats.bytes_received,
+            fresh.len() as u64,
+            "{on}: twin filled from big's output: {stats:?}"
+        );
+        assert!(counted.get(Counter::DestLocalReuseRead) >= twin.len() as u64);
+    }
 }

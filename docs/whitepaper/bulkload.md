@@ -318,8 +318,9 @@ source                                   destination
   regular file it cannot `Reuse` when the output path already exists, a
   crashed session's temporary was salvaged, or published outputs hold
   chunks. An opt-in lever (OI-1003-Q154) lets a local `copy`, whose two
-  halves share one process, stream a seat new to the destination instead
-  of filling it from other outputs: there is no wire to save, and
+  halves share one process, stream a seat that neither its destination
+  nor its source's ledger has carried instead of filling it from other
+  outputs: there is no wire to save, and
   streaming places the first byte before the whole file is hashed. The source sends its manifest, from its
   ledger without reading when the stat identity is recorded. The
   destination fills what it can from verified local chunks, then asks only

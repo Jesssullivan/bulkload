@@ -170,6 +170,16 @@ fn interrupted_transport_resumes_completed_captures_without_source_reads() {
     }
 }
 
+/// `run`, with this thread's new-path decisions in it: entries asked for by
+/// manifest first, and new paths the delta lever streamed (OI-1003-Q154).
+/// The process counters are shared with the tests running beside this one;
+/// a `copy` decides on its caller's thread.
+fn decisions<T>(run: impl FnOnce() -> T) -> (T, (u64, u64)) {
+    NEW_PATH_DECISIONS.with(|decided| decided.set((0, 0)));
+    let out = run();
+    (out, NEW_PATH_DECISIONS.with(std::cell::Cell::get))
+}
+
 /// This store's temporary name `<tag>-<pid>-<serial>`.
 fn own_temporary(corpus: &Corpus, pid: u32, serial: u64) -> PathBuf {
     let tag = {

@@ -266,10 +266,11 @@ counters! {
     // at the path: the source reads nothing for them (#187 review, R25).
     TransferRefusedOutputsRemembered => "transfer_refused_outputs_remembered",
     // Entries the destination asked for by manifest first (`WantManifest`),
-    // and, of the entries it streamed (`Send`), the seats new to it that
-    // its published outputs could have filled: a local `copy` with the
-    // hand-off streams those when `BULKLOAD_LOCAL_NEW_PATH_STREAM=1`
-    // (OI-1003-Q154, the delta lever, off by default; always 0 for `pull`).
+    // and seats new to the destination that the delta lever streamed
+    // (`Send`) while its store held output hints, whether or not any of
+    // their chunks is held here: a local `copy` with the hand-off and
+    // `BULKLOAD_LOCAL_NEW_PATH_STREAM=1` (OI-1003-Q154, off by default;
+    // always 0 for `pull`, `receive` and a `copy` with the hand-off off).
     TransferManifestsAsked => "transfer_manifests_asked",
     TransferNewPathsStreamed => "transfer_new_paths_streamed",
     // Outputs of this store replaced by a changed seat's new bytes (WP0(d),
