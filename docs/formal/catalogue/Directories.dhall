@@ -63,6 +63,8 @@ let M =
       | adopt_unbound
       | discard_unlink_before_clear
       | admit_under_held
+      | fold_leaves_owed
+      | fold_unsealed
       >
 
 let mutationIndex =
@@ -77,6 +79,8 @@ let mutationIndex =
           , adopt_unbound = 6
           , discard_unlink_before_clear = 7
           , admit_under_held = 8
+          , fold_leaves_owed = 9
+          , fold_unsealed = 10
           }
           m
 
@@ -89,6 +93,7 @@ let P =
       | ChildImpliesNamed
       | NeverAdoptForeign
       | NoDirectoryUnderTemporary
+      | CompletionAfterChildren
       | WithinBudget
       >
 
@@ -127,8 +132,13 @@ let propertyTable =
         , index = 6
         , class = T.PropertyClass.safety
         }
+      , CompletionAfterChildren =
+        { property = P.CompletionAfterChildren
+        , index = 7
+        , class = T.PropertyClass.safety
+        }
       , WithinBudget =
-        { property = P.WithinBudget, index = 7, class = T.PropertyClass.budget }
+        { property = P.WithinBudget, index = 8, class = T.PropertyClass.budget }
       }
 
 let propertyIndex = \(p : P) -> (merge propertyTable p).index
@@ -149,7 +159,7 @@ let witnessTable =
 
 let witnessSelf = \(w : W) -> merge witnessTable w
 
--- The 22 actions of Next, in the sorted order of the never column.
+-- The 24 actions of Next, in the sorted order of the never column.
 let A =
       < Bind
       | ChildCommit
@@ -163,8 +173,10 @@ let A =
       | FallbackMkdir
       | Foreign
       | ForeignReplace
+      | GroupFinish
       | Intent
       | Mkdir
+      | Place
       | PowerLoss
       | Record
       | Rename
@@ -188,16 +200,18 @@ let actionTable =
       , FallbackMkdir = { action = A.FallbackMkdir, index = 9 }
       , Foreign = { action = A.Foreign, index = 10 }
       , ForeignReplace = { action = A.ForeignReplace, index = 11 }
-      , Intent = { action = A.Intent, index = 12 }
-      , Mkdir = { action = A.Mkdir, index = 13 }
-      , PowerLoss = { action = A.PowerLoss, index = 14 }
-      , Record = { action = A.Record, index = 15 }
-      , Rename = { action = A.Rename, index = 16 }
-      , SealDir = { action = A.SealDir, index = 17 }
-      , SealParent = { action = A.SealParent, index = 18 }
-      , StartRun = { action = A.StartRun, index = 19 }
-      , Stop = { action = A.Stop, index = 20 }
-      , Terminated = { action = A.Terminated, index = 21 }
+      , GroupFinish = { action = A.GroupFinish, index = 12 }
+      , Intent = { action = A.Intent, index = 13 }
+      , Mkdir = { action = A.Mkdir, index = 14 }
+      , Place = { action = A.Place, index = 15 }
+      , PowerLoss = { action = A.PowerLoss, index = 16 }
+      , Record = { action = A.Record, index = 17 }
+      , Rename = { action = A.Rename, index = 18 }
+      , SealDir = { action = A.SealDir, index = 19 }
+      , SealParent = { action = A.SealParent, index = 20 }
+      , StartRun = { action = A.StartRun, index = 21 }
+      , Stop = { action = A.Stop, index = 22 }
+      , Terminated = { action = A.Terminated, index = 23 }
       }
 
 let actionIndex = \(a : A) -> (merge actionTable a).index
@@ -215,6 +229,7 @@ let Constants =
       , MaxRuns : Natural
       , MaxCrashes : Natural
       , MaxForeign : Natural
+      , FoldFinish : Bool
       , Mutation : Optional M
       , BudgetSeconds : Natural
       }
@@ -340,6 +355,10 @@ let constantLines =
               , pad = "     "
               , value = Natural/show c.MaxForeign
               }
+            , { name = "FoldFinish"
+              , pad = "     "
+              , value = showBool c.FoldFinish
+              }
             , { name = "Mutation", pad = "       ", value = "\"${mutation}\"" }
             , { name = "BudgetSeconds"
               , pad = "  "
@@ -362,6 +381,7 @@ let perDir
       , MaxRuns = 2
       , MaxCrashes = 1
       , MaxForeign = 1
+      , FoldFinish = False
       , Mutation = None M
       , BudgetSeconds = 3600
       }
@@ -403,6 +423,8 @@ let verdict
           , adopt_unbound = P.NeverAdoptForeign
           , discard_unlink_before_clear = P.NeverAdoptForeign
           , admit_under_held = P.NoDirectoryUnderTemporary
+          , fold_leaves_owed = P.CompletionAfterChildren
+          , fold_unsealed = P.CompleteImpliesFinal
           }
           m
 
@@ -410,6 +432,15 @@ let pass = \(never : List A) -> Expect.pass { invariants = safety, never }
 
 -- Never enabled with an exclusive rename: R-N119's fallback.
 let noFallback = [ A.Bind, A.FallbackMkdir, A.Intent ]
+
+-- Never enabled without FoldFinish: the finish riding the last group.
+let noFold = [ A.GroupFinish, A.Place ]
+
+{- OI-1003-Q154 lever 3, the code: the directory finish rides the session's
+   last output group. One level of two siblings over three runs and two
+   crashes, so a fold, a crash inside it and its resume are all reached.
+-}
+let folded = shallow // { FoldFinish = True }
 
 let budgetSelftest =
       row
@@ -426,7 +457,7 @@ let budgetSelftest =
 let positives =
       [ row
           "MC_dir_per_dir"
-          (pass (noFallback # [ A.ForeignReplace ]))
+          (pass (noFallback # [ A.ForeignReplace ] # noFold))
           [ "Directory records one at a time (R-N102), the code with batching off:"
           , "two levels of two siblings, two runs, one Stop or power loss (each"
           , "unsealed name kept or lost on its own), EnvSeal, one third-party"
@@ -435,7 +466,7 @@ let positives =
           perDir
       , row
           "MC_dir_batched"
-          (pass (noFallback # [ A.ForeignReplace ]))
+          (pass (noFallback # [ A.ForeignReplace ] # noFold))
           [ "OI-1003-Q143 item 2, the code: a level's records bound in one commit,"
           , "one seal per distinct parent, every finished directory completed in"
           , "one commit; MC_dir_per_dir's bound."
@@ -443,7 +474,7 @@ let positives =
           batched
       , row
           "MC_dir_batched_crashes"
-          (pass (noFallback # [ A.ForeignReplace ]))
+          (pass (noFallback # [ A.ForeignReplace ] # noFold))
           [ "Batching over three runs and two crashes (a Stop then a power loss,"
           , "or two power losses), one level of two siblings: what a crashed"
           , "level leaves is swept, adopted or completed by the runs after it."
@@ -457,7 +488,7 @@ let positives =
           )
       , row
           "MC_dir_foreign_replace"
-          (pass noFallback)
+          (pass (noFallback # noFold))
           [ "A third party makes its directory at a free name and then replaces"
           , "it with a new inode, any free number (#74 N3): batching, one level of"
           , "two siblings, two runs, one crash, four inode numbers, so"
@@ -473,13 +504,15 @@ let positives =
       , row
           "MC_dir_fallback"
           ( pass
-              [ A.DiscardClear
-              , A.DiscardUnlink
-              , A.ForeignReplace
-              , A.Mkdir
-              , A.Record
-              , A.Rename
-              ]
+              (   [ A.DiscardClear
+                  , A.DiscardUnlink
+                  , A.ForeignReplace
+                  , A.Mkdir
+                  , A.Record
+                  , A.Rename
+                  ]
+                # noFold
+              )
           )
           [ "R-N119's fallback, batched: no exclusive rename, so each directory's"
           , "intent commits before a plain mkdirat at its final name, and a resume"
@@ -487,6 +520,37 @@ let positives =
           , "makes first and discards is the EEXIST discard's (MC_dir_batched)."
           ]
           (batched // { NoReplaceRename = False })
+      , row
+          "MC_dir_fold"
+          ( pass
+              (   noFallback
+                # [ A.DiscardClear, A.DiscardUnlink, A.Foreign, A.ForeignReplace ]
+              )
+          )
+          [ "OI-1003-Q154 lever 3, the code: the directory finish rides the"
+          , "session's last output group. Each final mode is set before that"
+          , "group's renames (Place may follow a Chmod), sealed by its seal"
+          , "(SealDir) and completed in its one commit with every output it"
+          , "owes (GroupFinish); a finish with no group left is Complete, as"
+          , "before. MC_dir_batched's two levels, two runs and one crash; no"
+          , "third party, so no rename is refused (MC_dir_fold_crashes has one)."
+          ]
+          (batched // { FoldFinish = True, MaxForeign = 0 })
+      , row
+          "MC_dir_fold_crashes"
+          (pass (noFallback # [ A.ForeignReplace ]))
+          [ "The fold over three runs and two crashes, one level of two"
+          , "siblings and one third-party directory: a crash between the"
+          , "drain's final modes and the last group's commit leaves every"
+          , "record pending, which the next run adopts and completes."
+          ]
+          (     folded
+            //  { MaxRuns = 3
+                , MaxCrashes = 2
+                , MaxForeign = 1
+                , BudgetSeconds = 1800
+                }
+          )
       ]
 
 let witnesses =
@@ -603,6 +667,22 @@ let primary =
           , "(#217 review, finding 1)."
           ]
         }
+      , fold_leaves_owed =
+        { mutation = M.fold_leaves_owed
+        , constants = folded // { MaxRuns = 1 }
+        , comment =
+          [ "the last group's commit completes the directories but leaves"
+          , "the outputs placed inside them out of it (OI-1003-Q154 lever 3)."
+          ]
+        }
+      , fold_unsealed =
+        { mutation = M.fold_unsealed
+        , constants = folded // { MaxRuns = 1 }
+        , comment =
+          [ "the last group's commit completes a directory whose final mode"
+          , "the group's seal did not cover (OI-1003-Q154 lever 3)."
+          ]
+        }
       }
 
 let primaryOf =
@@ -645,6 +725,8 @@ let negOrder =
       , M.adopt_unbound
       , M.discard_unlink_before_clear
       , M.admit_under_held
+      , M.fold_leaves_owed
+      , M.fold_unsealed
       ]
 
 let _ =
@@ -811,9 +893,16 @@ let invariants
       , { tla = P.CompleteImpliesFinal
         , slo = [ S.Durability ]
         , ruling = [ "R-N102", "OI-1003-Q143" ]
-        , codeSymbol = [ "finish_directories", "complete_directories", "fchmod" ]
+        , codeSymbol =
+          [ "finish_directories"
+          , "complete_directories"
+          , "fchmod"
+          , "fold_finish"
+          , "commit_outputs_finishing"
+          ]
         , ptest =
           [ "adoption_power_loss::a_finish_crashed_after_some_seals_completes_every_directory_in_one_commit"
+          , "power_loss::every_power_loss_state_of_a_folded_finish_is_explored"
           ]
         }
       , { tla = P.ChildImpliesNamed
@@ -846,6 +935,22 @@ let invariants
           [ "DirectoryBatch", "close_batch", "directory_is_new", "parent_of" ]
         , ptest =
           [ "adoption_power_loss::a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it"
+          ]
+        }
+      , { tla = P.CompletionAfterChildren
+        , slo = [ S.Durability, S.S3 ]
+        , ruling = [ "R-N102", "OI-1003-Q154" ]
+        , codeSymbol =
+          [ "fold_finish"
+          , "FoldedFinish"
+          , "commit_last"
+          , "commit_outputs_finishing"
+          , "folded_finish"
+          ]
+        , ptest =
+          [ "transfer::tests::fold::a_refusal_in_an_earlier_group_folds_no_finish"
+          , "transfer::tests::fold::a_failed_last_group_completes_no_directory"
+          , "power_loss::every_power_loss_state_of_a_folded_finish_is_explored"
           ]
         }
       ]

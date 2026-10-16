@@ -291,6 +291,11 @@ pub struct TransferStats {
     /// Directories created by the plain `mkdirat` fallback, on a filesystem
     /// without a no-replace rename (R-N119), by relative path.
     pub directories_fallback: Vec<Vec<u8>>,
+    /// Directories this session finished in its last output group's commit
+    /// rather than in a completion commit of their own (OI-1003-Q154 lever
+    /// 3; `directories_folded`). 0 when the fold is off
+    /// ([`DIRECTORY_FOLD_ENV`]) or could not ride a group.
+    pub directories_folded: u64,
     /// Outputs a crash left durable with no row, adopted from their capture
     /// record without a source read (#169; `transfer_unrowed_adopted`).
     pub unrowed_adopted: u64,
@@ -3659,6 +3664,7 @@ fn finish_receive(
     stats
         .directories_fallback
         .clone_from(&target.created().fallback);
+    stats.directories_folded = target.folded();
     if stats.refusals.is_empty() {
         target.finish_directories(store)?;
     }
@@ -3848,6 +3854,47 @@ fn dest_group_idle() -> std::time::Duration {
         .ok()
         .and_then(|value| value.parse().ok())
         .map_or(DEST_GROUP_IDLE, std::time::Duration::from_millis)
+}
+
+/// Turns off the directory finish's fold into the session's last output
+/// group when `0` (OI-1003-Q154 lever 3; the SOTA study's lever 2).
+///
+/// For the bench's A/B: off, every directory this session created is
+/// finished after the last group as before, each sealed on its own and all
+/// completed in a commit of their own (`directories_folded` stays 0). Unset,
+/// or anything else, keeps the fold. Either way every completion follows
+/// its directory's sealed final mode (`DirectoryRecords.tla`: `Complete`
+/// or `GroupFinish`).
+pub const DIRECTORY_FOLD_ENV: &str = "BULKLOAD_DIRECTORY_FOLD";
+
+/// The directory fold by canonical destination root, for tests that compare
+/// both paths in one process.
+static DIRECTORY_FOLD_OVERRIDE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+
+/// Run sessions into the canonical destination `root` with the directory
+/// fold on or off (`None`: the default again). Test hook.
+#[doc(hidden)]
+pub fn set_directory_fold(root: &Path, on: Option<bool>) {
+    let mut overrides = DIRECTORY_FOLD_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(on) = on {
+        overrides.push((root.to_path_buf(), on));
+    }
+}
+
+/// Whether a session into the canonical destination `root` may fold its
+/// directory finish into its last group: on, unless [`DIRECTORY_FOLD_ENV`]
+/// is `0` or a test turned it off for `root`.
+fn directory_fold(root: &Path) -> bool {
+    let found = DIRECTORY_FOLD_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, on)| *on);
+    found.unwrap_or_else(|| std::env::var(DIRECTORY_FOLD_ENV).map_or(true, |value| value != "0"))
 }
 
 /// Where in handling one chunk an entry's content failed. Within one chunk
@@ -5673,7 +5720,13 @@ impl<W: Write> Inbound<'_, W> {
         }
         {
             let _drain_timer = PhaseTimer(&RECV_DRAIN_NS, Instant::now());
-            self.committer.sync()?;
+            if let Some(finish) = self.fold_finish() {
+                let outcome = finish.outcome();
+                self.committer.sync_last(finish)?;
+                self.target.folded_finish(&outcome);
+            } else {
+                self.committer.sync()?;
+            }
         }
         self.answer_held()?;
         if self.pending_held.is_empty() {
@@ -5681,6 +5734,26 @@ impl<W: Write> Inbound<'_, W> {
         } else {
             Err(BulkloadRefusal::ProtocolStateViolation)
         }
+    }
+
+    /// The directory finish the drain's group may carry (OI-1003-Q154 lever
+    /// 3; [`Destination::fold_finish`] sets the final modes): only when
+    /// nothing after that group can refuse. Every entry has ended, nothing
+    /// is refused so far on this side (the sink checks its own groups'
+    /// outcomes), and every `SQLite` sidecar the source reported has a
+    /// snapshot base here, so `resolve_sidecars` refuses none. A session
+    /// that refuses keeps every directory unfinished (`finish_receive`).
+    fn fold_finish(&self) -> Option<crate::materialize::FoldedFinish> {
+        if !directory_fold(self.target.path())
+            || !self.stats.refusals.is_empty()
+            || self
+                .sidecars
+                .iter()
+                .any(|(_, database)| !self.snapshot_bases.contains(database))
+        {
+            return None;
+        }
+        self.target.fold_finish()
     }
 
     fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32], racy: bool) -> Result<()> {

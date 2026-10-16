@@ -1157,6 +1157,15 @@ def summarize(parsed: dict[str, object]) -> dict[str, object]:
             if any("wire_handed_bytes" in s.get("counters", {}) for s in natives)
             else None
         ),
+        # The directory finish folded into the last output group
+        # (OI-1003-Q154 lever 3): directories completed by that group's
+        # commit, 0 with BULKLOAD_DIRECTORY_FOLD=0, or None from a build
+        # that does not count them.
+        "directories_folded_total": (
+            total("directories_folded")
+            if any("directories_folded" in s.get("counters", {}) for s in natives)
+            else None
+        ),
         "bytes_received_median": median(
             [
                 float(s["transferred_content_bytes"])

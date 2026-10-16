@@ -952,12 +952,24 @@ pub trait GroupSink: Send + 'static {
     type Item: Send + 'static;
     /// What [`Committer::finish`] hands back.
     type Report: Send + 'static;
+    /// Work the session's last group carries beside its items
+    /// ([`Committer::sync_last`]); `()` for a sink that has none.
+    type Last: Send + 'static;
 
     /// `(files, bytes)` this item adds to the open group.
     fn weight(item: &Self::Item) -> (u64, u64);
 
     /// Seal, publish and commit one closed group, in that order.
     fn commit(&mut self, items: Vec<Self::Item>);
+
+    /// Commit `items` as the session's last group, with `last`. Called only
+    /// for a group that holds items: a [`Committer::sync_last`] that finds
+    /// the group empty drops `last` unused. By default `last` is dropped
+    /// and the group commits as any other.
+    fn commit_last(&mut self, items: Vec<Self::Item>, last: Self::Last) {
+        drop(last);
+        self.commit(items);
+    }
 
     /// The failure that stops this sink, once one group has failed.
     fn failure(&self) -> Option<BulkloadRefusal>;
@@ -997,14 +1009,16 @@ impl Default for Limits {
 
 type Failure = std::sync::Arc<std::sync::Mutex<Option<BulkloadRefusal>>>;
 
-enum Message<T> {
+enum Message<T, L> {
     Item(T),
     Sync(SyncSender<()>),
+    /// [`Committer::sync_last`]: behind every item submitted before it.
+    SyncLast(SyncSender<()>, L),
 }
 
 /// A running committer thread. Dropping it commits pending work and joins.
 pub struct Committer<S: GroupSink> {
-    sender: Option<SyncSender<Message<S::Item>>>,
+    sender: Option<SyncSender<Message<S::Item, S::Last>>>,
     handle: Option<JoinHandle<S::Report>>,
     failure: Failure,
 }
@@ -1081,12 +1095,33 @@ impl<S: GroupSink> Committer<S> {
     /// Returns the sink's failure if this or an earlier group failed, or
     /// refuses if the committer thread has stopped.
     pub fn sync(&self) -> Result<()> {
+        self.round_trip(Message::Sync)
+    }
+
+    /// [`Committer::sync`] for the session's last group: the open group,
+    /// which holds every item submitted before this call, commits through
+    /// [`GroupSink::commit_last`] with `last`. When that group is empty
+    /// (an idle or a bound already closed it) nothing commits and `last` is
+    /// dropped unused; the caller learns which from `last` itself.
+    ///
+    /// # Errors
+    /// As [`Committer::sync`].
+    pub fn sync_last(&self, last: S::Last) -> Result<()> {
+        self.round_trip(|ack| Message::SyncLast(ack, last))
+    }
+
+    /// Send `message` behind every item submitted so far and wait for the
+    /// committer to answer it.
+    fn round_trip(
+        &self,
+        message: impl FnOnce(SyncSender<()>) -> Message<S::Item, S::Last>,
+    ) -> Result<()> {
         self.failed()?;
         let (ack, done) = std::sync::mpsc::sync_channel(1);
         self.sender
             .as_ref()
             .ok_or(BulkloadRefusal::Io(None))?
-            .send(Message::Sync(ack))
+            .send(message(ack))
             .map_err(|_| BulkloadRefusal::Io(None))?;
         done.recv().map_err(|_| BulkloadRefusal::Io(None))?;
         self.failed()
@@ -1154,14 +1189,39 @@ impl<T> OpenGroup<T> {
     }
 
     fn close<S: GroupSink<Item = T>>(&mut self, sink: &mut S, failure: &Failure) {
+        if let Some(items) = self.take() {
+            sink.commit(items);
+            Self::note_failure(sink, failure);
+        }
+    }
+
+    /// [`OpenGroup::close`] through [`GroupSink::commit_last`]; an empty
+    /// group drops `last`.
+    fn close_last<S: GroupSink<Item = T>>(
+        &mut self,
+        sink: &mut S,
+        failure: &Failure,
+        last: S::Last,
+    ) {
+        if let Some(items) = self.take() {
+            sink.commit_last(items, last);
+            Self::note_failure(sink, failure);
+        }
+    }
+
+    /// The group's items, emptied for the next group; `None` when empty.
+    fn take(&mut self) -> Option<Vec<T>> {
         if self.items.is_empty() {
-            return;
+            return None;
         }
         counters::bump(Counter::DurableGroups);
         self.files = 0;
         self.bytes = 0;
         self.opened = None;
-        sink.commit(std::mem::take(&mut self.items));
+        Some(std::mem::take(&mut self.items))
+    }
+
+    fn note_failure<S: GroupSink<Item = T>>(sink: &S, failure: &Failure) {
         if let Some(refusal) = sink.failure() {
             if let Ok(mut shared) = failure.lock() {
                 shared.get_or_insert(refusal);
@@ -1172,7 +1232,7 @@ impl<T> OpenGroup<T> {
 
 fn run<S: GroupSink>(
     mut sink: S,
-    receiver: &Receiver<Message<S::Item>>,
+    receiver: &Receiver<Message<S::Item, S::Last>>,
     limits: Limits,
     failure: &Failure,
 ) -> S::Report {
@@ -1209,6 +1269,10 @@ fn run<S: GroupSink>(
             }
             Message::Sync(ack) => {
                 group.close(&mut sink, failure);
+                let _ = ack.send(());
+            }
+            Message::SyncLast(ack, last) => {
+                group.close_last(&mut sink, failure, last);
                 let _ = ack.send(());
             }
         }
@@ -1280,6 +1344,7 @@ mod tests {
     impl GroupSink for Recorder {
         type Item = u64;
         type Report = usize;
+        type Last = ();
 
         fn weight(item: &u64) -> (u64, u64) {
             (1, *item)

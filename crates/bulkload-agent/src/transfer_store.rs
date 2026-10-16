@@ -123,6 +123,20 @@ pub(crate) fn fail_group_commits(root: &Path, on: bool) {
     }
 }
 
+/// Destination store roots whose next output group commit alone fails.
+#[cfg(test)]
+static FAIL_NEXT_GROUP_COMMIT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Test hook: the next `commit_outputs` of the store at `root` (canonical)
+/// fails with `ENOSPC` before `COMMIT`, and rolls back; later ones commit.
+#[cfg(test)]
+pub(crate) fn fail_next_group_commit(root: &Path) {
+    FAIL_NEXT_GROUP_COMMIT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(root.to_path_buf());
+}
+
 #[cfg(test)]
 fn group_commit_fault(root: &Path) -> Result<()> {
     let failing = FAIL_GROUP_COMMITS
@@ -130,7 +144,16 @@ fn group_commit_fault(root: &Path) -> Result<()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
         .any(|failing| failing == root);
-    if failing {
+    let next = {
+        let mut next = FAIL_NEXT_GROUP_COMMIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let found = next.iter().position(|failing| failing == root);
+        let taken = found.map(|at| next.remove(at)).is_some();
+        drop(next);
+        taken
+    };
+    if failing || next {
         return Err(BulkloadRefusal::Io(Some(libc::ENOSPC)));
     }
     output_commit_fault(root)
@@ -1426,6 +1449,14 @@ impl Store {
             .transpose()
     }
 
+    /// How many directory records (pending or intents) the store holds.
+    #[cfg(test)]
+    pub(crate) fn directory_records(&self) -> Result<u64> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM directories", [], |row| row.get(0))
+            .map_err(sqlite_error)
+    }
+
     /// Clear every pending record bound to `(dev, ino)`, once that inode is
     /// gone, so a recycled inode number can never inherit its ownership.
     ///
@@ -1596,10 +1627,32 @@ impl StorePublisher {
     ///
     /// # Errors
     /// Refuses serialization or database failures; nothing is committed then.
+    #[cfg(test)]
     pub(crate) fn commit_outputs(
         &self,
         outputs: &[OutputRecord],
         settled: &[SupersedeSettle<'_>],
+    ) -> Result<()> {
+        self.commit_outputs_finishing(outputs, settled, &[])
+    }
+
+    /// [`StorePublisher::commit_outputs`] that also completes the
+    /// directories `completed` names, in the same transaction: the
+    /// session's last group carrying the directory finish (OI-1003-Q154
+    /// lever 3, `DirectoryRecords.tla` `GroupFinish`). Each key's pending
+    /// record is deleted as [`Store::complete_directories`] deletes it, and
+    /// traced as a `DirectoryComplete` in the group's one commit. The caller
+    /// set each directory's final mode before the group's renames and
+    /// sealed it with the group's seal, so every completion follows its
+    /// seal, as a completion of its own does.
+    ///
+    /// # Errors
+    /// As [`StorePublisher::commit_outputs`]; no directory completes then.
+    pub(crate) fn commit_outputs_finishing(
+        &self,
+        outputs: &[OutputRecord],
+        settled: &[SupersedeSettle<'_>],
+        completed: &[&[u8]],
     ) -> Result<()> {
         // The trace's serial lock is taken before SQLite's write lock, the
         // order every traced store write uses (#74 review, D5).
@@ -1634,6 +1687,12 @@ impl StorePublisher {
             }
             for settle in settled {
                 settle_in(&self.store.conn, settle)?;
+            }
+            for key in completed {
+                self.store
+                    .conn
+                    .execute("DELETE FROM directories WHERE key = ?1", [key])
+                    .map_err(sqlite_error)?;
             }
             Ok(())
         })();
@@ -1674,6 +1733,9 @@ impl StorePublisher {
                             rel_path: settle.intent.rel_path(),
                             restored: settle.restore,
                         }
+                    }))
+                    .chain(completed.iter().map(|key| {
+                        crate::io::trace::CommitRecord::DirectoryComplete { key: key.to_vec() }
                     }))
                     .collect()
             });
@@ -1967,6 +2029,7 @@ impl crate::io::durable::GroupSink for LedgerSink {
     const SIDE: crate::io::durable::GroupSide = crate::io::durable::GroupSide::Source;
     type Item = LedgerItem;
     type Report = Result<()>;
+    type Last = ();
 
     fn weight(_: &LedgerItem) -> (u64, u64) {
         (1, 0)

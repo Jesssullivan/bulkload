@@ -242,6 +242,9 @@ pub struct Destination {
     /// The most new directories one batch creates together; 1 creates and
     /// finishes each alone (OI-1003-Q143 item 2).
     batch: usize,
+    /// Directories finished by the session's last output group
+    /// ([`Destination::folded_finish`]).
+    folded: u64,
     /// This store's orphaned file temporaries, kept for their chunks: bytes
     /// the destination already holds are not sent again within the session.
     /// Every one is indexed, however many: a session can leave up to a whole
@@ -305,6 +308,7 @@ impl Destination {
             unflushed: std::collections::HashMap::new(),
             swept: Sweep::default(),
             created: Creation::default(),
+            folded: 0,
             salvage: Vec::new(),
         })
     }
@@ -396,6 +400,13 @@ impl Destination {
     #[must_use]
     pub const fn created(&self) -> &Creation {
         &self.created
+    }
+
+    /// Directories this session finished in its last output group's commit
+    /// ([`Destination::fold_finish`], OI-1003-Q154 lever 3).
+    #[must_use]
+    pub const fn folded(&self) -> u64 {
+        self.folded
     }
 
     /// The most new directories one batch into this root creates together
@@ -1120,6 +1131,10 @@ impl Destination {
     /// One descriptor is open at a time, so any number of new directories
     /// finish within the descriptor limit.
     ///
+    /// A finish the session's last output group already committed
+    /// ([`Destination::fold_finish`], OI-1003-Q154 lever 3) left nothing
+    /// here to finish.
+    ///
     /// # Errors
     /// Refuses changed/removed directories and failed durable metadata writes.
     pub fn finish_directories(&mut self, store: &Store) -> Result<()> {
@@ -1173,6 +1188,86 @@ impl Destination {
         // on other devices still wait for `flush_session`.
         self.unflushed.remove(&self.store_device);
         Ok(())
+    }
+
+    /// Set the final mode of every directory this invocation owns, deepest
+    /// first, for the session's last output group to seal and complete
+    /// (OI-1003-Q154 lever 3; the SOTA study's lever 2): the
+    /// [`FoldedFinish`] it returns rides [`crate::io::durable::Committer::sync_last`],
+    /// whose group seals each directory with its own seal after its renames
+    /// and completes them all in its one store commit
+    /// (`DirectoryRecords.tla` `GroupFinish`). A finish folded this way
+    /// costs no seal per directory and no completion commit.
+    ///
+    /// `None` when the finish cannot ride a group, before any mode is set:
+    /// no directory to finish, batching off (`batch` 1: one at a time, as
+    /// `Complete` alone), more directories than a batch holds (one
+    /// descriptor each, held into the group), a final mode that takes away
+    /// this user's read, write or search permission (the group's renames
+    /// need write and search; a finish that rides no commit, because the
+    /// drain's group is empty or refuses, is finished after it, or adopted
+    /// by the next run, through `open_dir`, which opens `O_RDONLY` and so
+    /// needs read, and the adoption's sweep lists the directory), or a
+    /// salvaged temporary still waiting to be retired (`retire_salvaged`
+    /// removes it after the group, and its unlink would land in a finished
+    /// directory). Also `None`, with the modes set so far left in place,
+    /// when a directory cannot be opened or has changed:
+    /// [`Destination::finish_directories`] then runs as before, sets the
+    /// same modes again and refuses what it refused.
+    ///
+    /// The caller checks the session's side: nothing refused, every entry
+    /// ended, no sidecar left uncovered.
+    pub(crate) fn fold_finish(&self) -> Option<FoldedFinish> {
+        if self.directories.is_empty()
+            || self.batch <= 1
+            || self.directories.len() > self.batch
+            || !self.salvage.is_empty()
+            || self
+                .directories
+                .iter()
+                .any(|pending| pending.mode & 0o700 != 0o700)
+        {
+            return None;
+        }
+        let mut directories = Vec::with_capacity(self.directories.len());
+        for pending in self.directories.iter().rev() {
+            let handle = (|| -> Result<File> {
+                let (parent, leaf) = self.parent(&pending.path)?;
+                let directory = open_dir(&parent, &leaf)?;
+                let metadata = directory.metadata().refuse_at("materialize::fold_finish")?;
+                if metadata.dev() != pending.dev || metadata.ino() != pending.ino {
+                    return Err(BulkloadRefusal::DestinationOccupied);
+                }
+                crate::io::sys::fchmod(&directory, pending.mode)
+                    .refuse_at("materialize::fold_finish")?;
+                Ok(directory)
+            })()
+            .ok()?;
+            directories.push((Arc::new(handle), pending.key.clone()));
+        }
+        Some(FoldedFinish {
+            directories,
+            folded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    /// Once the session's last group committed its [`FoldedFinish`]
+    /// (`outcome`): every directory is complete, and that commit drained the
+    /// store's device. Returns how many were finished (0 when the finish
+    /// rode no commit; [`Destination::finish_directories`] then finishes
+    /// them as before).
+    pub(crate) fn folded_finish(&mut self, outcome: &FoldOutcome) -> usize {
+        if !outcome.folded() {
+            return 0;
+        }
+        let finished = std::mem::take(&mut self.directories).len();
+        counters::add(Counter::DirectoriesFinished, finished as u64);
+        counters::add(Counter::DirectoriesFolded, finished as u64);
+        self.folded = self.folded.saturating_add(finished as u64);
+        // As after `finish_directories`' completion commit: entries sealed
+        // on other devices still wait for `flush_session`.
+        self.unflushed.remove(&self.store_device);
+        finished
     }
 
     fn note_unflushed(&mut self, directory: File) {
@@ -2096,6 +2191,43 @@ pub(crate) struct PendingOutput {
     pub hints: Vec<ChunkHint>,
 }
 
+/// The directory finish the session's last output group carries
+/// ([`Destination::fold_finish`]): each directory with its final mode set,
+/// held open for the group's seal, and its record's key.
+pub(crate) struct FoldedFinish {
+    directories: Vec<(Arc<File>, Vec<u8>)>,
+    /// Set by the group's sink once its commit completed every directory.
+    folded: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl FoldedFinish {
+    /// A handle on the outcome that outlives the finish itself, which the
+    /// committer drops with its group.
+    pub(crate) fn outcome(&self) -> FoldOutcome {
+        FoldOutcome(Arc::clone(&self.folded))
+    }
+
+    /// Whether a batched group's device seal covers every directory, as
+    /// [`PublishSink::devices_batch`] asks of each output and its parent;
+    /// one that it does not keeps the finish out of the group.
+    fn device_sealable(&self) -> bool {
+        let mountinfo = std::cell::OnceCell::new();
+        self.directories
+            .iter()
+            .all(|(directory, _)| crate::io::durable::syncfs_seals_handle(directory, &mountinfo))
+    }
+}
+
+/// Whether a [`FoldedFinish`] was committed by its group.
+pub(crate) struct FoldOutcome(Arc<std::sync::atomic::AtomicBool>);
+
+impl FoldOutcome {
+    /// `true` once the last group's commit completed the directories.
+    pub(crate) fn folded(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
 /// Group-commit sink for a destination: seal each file, rename it into
 /// place, seal each touched directory once, then commit every record of the
 /// group in one transaction.
@@ -2345,6 +2477,8 @@ impl crate::io::durable::GroupSink for PublishSink {
     type Item = Publication;
     /// `(relative path, outcome)` for every submitted output, in commit order.
     type Report = Vec<(Vec<u8>, Result<()>)>;
+    /// The directory finish the session's last group carries.
+    type Last = FoldedFinish;
 
     fn weight(item: &Publication) -> (u64, u64) {
         match item {
@@ -2355,7 +2489,36 @@ impl crate::io::durable::GroupSink for PublishSink {
         }
     }
 
-    fn commit(&mut self, mut items: Vec<Publication>) {
+    fn commit(&mut self, items: Vec<Publication>) {
+        self.commit_with(items, None);
+    }
+
+    /// The session's last group, carrying the directory finish
+    /// ([`Destination::fold_finish`]).
+    fn commit_last(&mut self, items: Vec<Publication>, last: FoldedFinish) {
+        self.commit_with(items, Some(last));
+    }
+
+    fn failure(&self) -> Option<BulkloadRefusal> {
+        None
+    }
+
+    fn finish(self) -> Self::Report {
+        self.outcomes
+    }
+}
+
+impl PublishSink {
+    /// One group: steps 1 to 5 of the module docs. With `finish` (the
+    /// session's last group), once every output of the group is renamed or
+    /// exchanged with none refused, each finished directory joins the
+    /// touched set, so the group's seal covers its final mode (and the
+    /// renames inside it), and its completion joins the group's commit
+    /// (`DirectoryRecords.tla` `GroupFinish`). A group that refused an
+    /// output completes nothing: the session refuses, and
+    /// `finish_receive` leaves every directory unfinished, as before.
+    #[allow(clippy::too_many_lines)] // The group's steps, each per publication kind.
+    fn commit_with(&mut self, mut items: Vec<Publication>, finish: Option<FoldedFinish>) {
         let reported = self.outcomes.len();
         #[cfg(feature = "fault-injection")]
         let _note = {
@@ -2440,17 +2603,49 @@ impl crate::io::durable::GroupSink for PublishSink {
             }
         }
         let settled = self.supersede(superseding, &mut records, &mut touched);
+        // The finish rides only a group that refused nothing, in a session
+        // whose earlier groups refused nothing either, and only under a seal
+        // that covers each directory (a batched group seals device-wide).
+        let finish = finish.filter(|finish| {
+            self.outcomes.iter().all(|(_, outcome)| outcome.is_ok())
+                && (!batched || finish.device_sealable())
+        });
+        if let Some(finish) = &finish {
+            for (directory, _) in &finish.directories {
+                touched.directory(Arc::clone(directory));
+            }
+        }
+        let completed: Vec<&[u8]> = finish.as_ref().map_or_else(Vec::new, |finish| {
+            finish
+                .directories
+                .iter()
+                .map(|(_, key)| key.as_slice())
+                .collect()
+        });
         let committed = touched.seal(self.store_device, batched).and_then(|_| {
             fault_point_in!(
                 PublishDestinationAfterDirSeal,
                 self.publisher.store().root()
             );
+            // Each directory's final mode is sealed, its completion still to
+            // commit: the point a finish of its own crashes at.
+            for _ in &completed {
+                fault_point!(DirectoryBeforeComplete);
+            }
             let settled: Vec<SupersedeSettle<'_>> = settled
                 .iter()
                 .map(|(intent, restore)| SupersedeSettle::of(intent, *restore))
                 .collect();
-            self.publisher.commit_outputs(&records, &settled)
+            self.publisher
+                .commit_outputs_finishing(&records, &settled, &completed)
         });
+        if committed.is_ok() {
+            if let Some(finish) = &finish {
+                finish
+                    .folded
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
         // A full disk under the group (a seal or the store commit) is the
         // typed space refusal, not a bare IO (#100).
         let committed = committed.map_err(space_refusal);
@@ -2460,16 +2655,6 @@ impl crate::io::durable::GroupSink for PublishSink {
         self.notify_group(reported);
     }
 
-    fn failure(&self) -> Option<BulkloadRefusal> {
-        None
-    }
-
-    fn finish(self) -> Self::Report {
-        self.outcomes
-    }
-}
-
-impl PublishSink {
     /// A batched group whose device seal failed: nothing was renamed or
     /// exchanged, and no intent was recorded. Each temporary, a superseding
     /// publish's included, is removed and each output of the group carries
@@ -3595,3 +3780,6 @@ mod adoption_power_loss;
 
 #[cfg(test)]
 mod supersede_tests;
+
+#[cfg(test)]
+mod fold_tests;

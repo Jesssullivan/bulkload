@@ -29,6 +29,12 @@
 (*   - Finishing: deepest first, each directory's final mode applied and   *)
 (*     sealed before the commit that completes it; only in a run that     *)
 (*     refused nothing.                                                    *)
+(*   - Folding (FoldFinish, OI-1003-Q154 lever 3, the finish's half of     *)
+(*     the SOTA study's lever 2): the final modes are set before the       *)
+(*     session's last output group renames its outputs (Place), that       *)
+(*     group's seal seals them (SealDir), and its one store commit         *)
+(*     commits every output it owes and completes the directories          *)
+(*     (GroupFinish). A finish that rides no group is Complete, as before. *)
 (*   - Two kinds of crash. Stop: the process dies, the page cache keeps    *)
 (*     every name. PowerLoss: every name change and mode change not yet    *)
 (*     sealed is kept or lost on its own (a directory's mkdir and rename   *)
@@ -81,6 +87,9 @@
 (*       (complete_directories)                                          *)
 (*   ChildCommit                         A/transfer.rs publish (an output's*)
 (*       group commit inside the directory)                              *)
+(*   Place, GroupFinish                  A/materialize.rs fold_finish,    *)
+(*       PublishSink::commit_last; A/transfer_store.rs                    *)
+(*       commit_outputs_finishing (completions in the group's commit)    *)
 (*   Stop, PowerLoss, EnvSeal, Foreign, ForeignReplace   the environment  *)
 (*                                                                         *)
 (* NEGATIVE CONFIGS set Mutation to break exactly one rule; each MUST      *)
@@ -97,6 +106,7 @@ CONSTANTS
     MaxRuns,         \* receive sessions
     MaxCrashes,      \* Stop and PowerLoss crashes
     MaxForeign,      \* third-party directory creations and replacements
+    FoldFinish,      \* the finish rides the session's last output group
     Mutation,        \* "none", or one deliberate rule break
     BudgetSeconds    \* wall-clock budget, checked by WithinBudget
 
@@ -104,11 +114,12 @@ Mutations == {"none", "record_before_seal", "rename_before_record",
               "child_before_dirseal", "complete_before_seal",
               "level_seals_one_parent", "level_rename_seals_one_parent",
               "adopt_unbound", "discard_unlink_before_clear",
-              "admit_under_held"}
+              "admit_under_held", "fold_leaves_owed", "fold_unsealed"}
 
 ASSUME /\ IsFiniteSet(Inos) /\ Inos # {} /\ Deep \in BOOLEAN
        /\ BatchCreate \in BOOLEAN /\ BatchFinish \in BOOLEAN
        /\ NoReplaceRename \in BOOLEAN
+       /\ FoldFinish \in BOOLEAN /\ (FoldFinish => BatchFinish)
        /\ MaxRuns \in Nat /\ MaxCrashes \in Nat /\ MaxForeign \in Nat
        /\ Mutation \in Mutations /\ BudgetSeconds \in Nat
 
@@ -144,6 +155,7 @@ VARIABLES
     rec,      \* d -> the committed record: NoIno, IntentIno or an inode
     ph,       \* d -> this session's phase
     child,    \* d -> an output committed inside d (ghost)
+    owed,     \* d -> an output renamed into d whose group has not committed
     everDone, \* d -> a completion of d committed (ghost)
     multiRec, \* d -> d's record was committed with another's (ghost)
     adoptedForeign, \* a third party's directory was adopted (ghost)
@@ -151,7 +163,7 @@ VARIABLES
     partial   \* a power loss kept one sibling's rename and lost another's (ghost)
 
 vars == <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode, fino,
-          fmode, rec, ph, child, everDone, multiRec, adoptedForeign,
+          fmode, rec, ph, child, owed, everDone, multiRec, adoptedForeign,
           adoptedMulti, partial>>
 
 InoSymmetry == Permutations(Inos)
@@ -216,6 +228,7 @@ Init ==
     /\ rec = [d \in Dirs |-> NoIno]
     /\ ph = [d \in Dirs |-> "todo"]
     /\ child = [d \in Dirs |-> FALSE] /\ everDone = [d \in Dirs |-> FALSE]
+    /\ owed = [d \in Dirs |-> FALSE]
     /\ multiRec = [d \in Dirs |-> FALSE]
     /\ adoptedForeign = FALSE /\ adoptedMulti = FALSE /\ partial = FALSE
 
@@ -235,6 +248,8 @@ StartRun ==
           /\ ino' = [x \in Dirs |-> IF x \in empty THEN NoIno ELSE ino[x]]
     /\ run' = run + 1 /\ live' = TRUE
     /\ ph' = [d \in Dirs |-> "todo"]
+    \* A crashed run's uncommitted outputs are BulkloadTransfer's to adopt.
+    /\ owed' = [d \in Dirs |-> FALSE]
     /\ UNCHANGED <<crashes, foreign, mode, dmode, fino, fmode, child, everDone,
                    multiRec, adoptedForeign, adoptedMulti, partial>>
 
@@ -273,7 +288,7 @@ DecideExisting(d) ==
                   /\ UNCHANGED <<adoptedForeign, adoptedMulti>>
     /\ multiRec' = [x \in Dirs |-> multiRec[x] /\ rec'[x] # NoIno]
     /\ UNCHANGED <<run, live, crashes, foreign, mode, dmode, fino, fmode,
-                   child, everDone, partial>>
+                   child, owed, everDone, partial>>
 
 (* A new directory: a tagged mkdirat in its parent. *)
 Mkdir(d) ==
@@ -285,7 +300,7 @@ Mkdir(d) ==
          /\ mode' = [mode EXCEPT ![d] = "0700"]
          /\ dmode' = [dmode EXCEPT ![d] = "0700"]
     /\ ph' = [ph EXCEPT ![d] = "mkdir"]
-    /\ UNCHANGED <<run, live, crashes, foreign, dloc, fino, fmode, rec, child,
+    /\ UNCHANGED <<run, live, crashes, foreign, dloc, fino, fmode, rec, child, owed,
                    everDone, multiRec, adoptedForeign, adoptedMulti, partial>>
 
 (* One seal of p: every name in p is durable. The temporaries made in p    *)
@@ -306,7 +321,7 @@ SealParent(p) ==
                   [] ph[x] = "fbmkdir" /\ Parent(x) = p -> "fbsealed"
                   [] OTHER -> ph[x]]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, ino, mode, dmode, fino,
-                   fmode, rec, child, everDone, multiRec, adoptedForeign,
+                   fmode, rec, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
 (* One store commit binds the records of S, each to its directory's inode. *)
@@ -320,7 +335,7 @@ Record(S) ==
                                    ELSE multiRec[d]]
     /\ ph' = [d \in Dirs |-> IF d \in S THEN "recorded" ELSE ph[d]]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode,
-                   fino, fmode, child, everDone, adoptedForeign, adoptedMulti,
+                   fino, fmode, child, owed, everDone, adoptedForeign, adoptedMulti,
                    partial>>
 
 (* The exclusive rename into place; a taken name refuses it (EEXIST). *)
@@ -334,7 +349,7 @@ Rename(d) ==
        ELSE /\ loc' = [loc EXCEPT ![d] = "final"]
             /\ ph' = [ph EXCEPT ![d] = "renamed"]
     /\ UNCHANGED <<run, live, crashes, foreign, dloc, ino, mode, dmode, fino,
-                   fmode, rec, child, everDone, multiRec, adoptedForeign,
+                   fmode, rec, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
 (* A refused rename's temporary is discarded: its record cleared, then the *)
@@ -347,7 +362,7 @@ DiscardClear(d) ==
     /\ multiRec' = [multiRec EXCEPT ![d] = FALSE]
     /\ ph' = [ph EXCEPT ![d] = IF ph[d] = "eexist" THEN "eexistC" ELSE "refused"]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode,
-                   fino, fmode, child, everDone, adoptedForeign, adoptedMulti,
+                   fino, fmode, child, owed, everDone, adoptedForeign, adoptedMulti,
                    partial>>
 
 DiscardUnlink(d) ==
@@ -358,7 +373,7 @@ DiscardUnlink(d) ==
     /\ ino' = [ino EXCEPT ![d] = IF dloc[d] = "none" THEN NoIno ELSE ino[d]]
     /\ ph' = [ph EXCEPT ![d] = IF ph[d] = "eexistC" THEN "refused" ELSE "eexistU"]
     /\ UNCHANGED <<run, live, crashes, foreign, dloc, mode, dmode, fino, fmode,
-                   rec, child, everDone, multiRec, adoptedForeign,
+                   rec, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
 (* R-N119's fallback: an intent first, then a plain mkdirat at the final   *)
@@ -370,7 +385,7 @@ Intent(d) ==
     /\ multiRec' = [multiRec EXCEPT ![d] = FALSE]
     /\ ph' = [ph EXCEPT ![d] = "intent"]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode,
-                   fino, fmode, child, everDone, adoptedForeign, adoptedMulti,
+                   fino, fmode, child, owed, everDone, adoptedForeign, adoptedMulti,
                    partial>>
 
 FallbackMkdir(d) ==
@@ -388,7 +403,7 @@ FallbackMkdir(d) ==
                  /\ dmode' = [dmode EXCEPT ![d] = "0700"]
             /\ ph' = [ph EXCEPT ![d] = "fbmkdir"]
             /\ UNCHANGED rec
-    /\ UNCHANGED <<run, live, crashes, foreign, dloc, fino, fmode, child,
+    /\ UNCHANGED <<run, live, crashes, foreign, dloc, fino, fmode, child, owed,
                    everDone, multiRec, adoptedForeign, adoptedMulti, partial>>
 
 Bind(d) ==
@@ -396,18 +411,36 @@ Bind(d) ==
     /\ rec' = [rec EXCEPT ![d] = ino[d]]
     /\ ph' = [ph EXCEPT ![d] = "ready"]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode,
-                   fino, fmode, child, everDone, multiRec, adoptedForeign,
+                   fino, fmode, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
-(* An output's group commit inside a decided directory. *)
+(* An output's group commit inside a decided directory. With FoldFinish   *)
+(* it commits what Place left owed; a group still committing after the    *)
+(* drain's final modes were set (an earlier group, closed by its idle)    *)
+(* may commit inside a directory already finishing.                       *)
 ChildCommit(d) ==
-    /\ live /\ ~child[d]
+    /\ live
+    /\ IF FoldFinish THEN owed[d] ELSE ~child[d]
     /\ \/ ph[d] \in {"ready", "existing"}
+       \/ FoldFinish /\ ph[d] \in Finishing
        \/ Mutation = "child_before_dirseal" /\ ph[d] = "renamed"
     /\ child' = [child EXCEPT ![d] = TRUE]
+    /\ owed' = [owed EXCEPT ![d] = FALSE]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode,
                    fino, fmode, rec, ph, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
+
+(* FoldFinish: an output renamed into place inside d, its group's commit   *)
+(* still to come. The last group renames after the drain set the final    *)
+(* modes, so a directory may already be in "chmod"; never once sealed:    *)
+(* the group's seal follows every rename of the group.                     *)
+Place(d) ==
+    /\ live /\ FoldFinish /\ ~owed[d]
+    /\ ph[d] \in {"ready", "existing", "chmod"}
+    /\ owed' = [owed EXCEPT ![d] = TRUE]
+    /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode,
+                   fino, fmode, rec, ph, child, everDone, multiRec,
+                   adoptedForeign, adoptedMulti, partial>>
 
 \* finish_receive runs finish_directories only once every directory was
 \* decided and nothing was refused.
@@ -420,7 +453,7 @@ Chmod(d) ==
     /\ mode' = [mode EXCEPT ![d] = "final"]
     /\ ph' = [ph EXCEPT ![d] = "chmod"]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, dmode, fino,
-                   fmode, rec, child, everDone, multiRec, adoptedForeign,
+                   fmode, rec, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
 SealDir(d) ==
@@ -429,12 +462,15 @@ SealDir(d) ==
     /\ dloc' = SealNames(d)
     /\ ph' = [ph EXCEPT ![d] = "fsealed"]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, ino, mode, fino, fmode,
-                   rec, child, everDone, multiRec, adoptedForeign,
+                   rec, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
-(* One commit completes S: alone, or (BatchFinish) every finished one. *)
+(* One commit completes S: alone, or (BatchFinish) every finished one.    *)
+(* finish_receive runs it after the committer's last group, so no output   *)
+(* is owed (vacuous without FoldFinish, where nothing is ever owed).       *)
 Complete(S) ==
     /\ live /\ S # {}
+    /\ \A x \in Dirs : ~owed[x]
     /\ \A d \in S : \/ ph[d] = "fsealed"
                     \/ Mutation = "complete_before_seal" /\ ph[d] = "chmod"
     /\ IF BatchFinish
@@ -446,15 +482,41 @@ Complete(S) ==
     /\ everDone' = [d \in Dirs |-> everDone[d] \/ d \in S]
     /\ ph' = [d \in Dirs |-> IF d \in S THEN "done" ELSE ph[d]]
     /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode,
-                   fino, fmode, child, adoptedForeign, adoptedMulti, partial>>
+                   fino, fmode, child, owed, adoptedForeign, adoptedMulti, partial>>
 
-(* The session ends, with nothing half made. *)
+(* FoldFinish: the session's last output group commits every output it    *)
+(* owes and, in the same store commit, completes S: every directory being  *)
+(* finished, each with its final mode set before the group's renames and  *)
+(* sealed by the group's seal after them (OI-1003-Q154 lever 3; the SOTA   *)
+(* study's lever 2, R-N102's finish commit unit). It rides only a group    *)
+(* that has outputs; a finish with none left is Complete. The mutations:   *)
+(* the commit leaves the completed directories' outputs out of it, or     *)
+(* completes a directory whose final mode the group's seal did not cover. *)
+GroupFinish(S) ==
+    /\ live /\ FoldFinish /\ S # {}
+    /\ \E x \in Dirs : owed[x]
+    /\ \A d \in S : \/ ph[d] = "fsealed"
+                    \/ Mutation = "fold_unsealed" /\ ph[d] = "chmod"
+    /\ \A d \in Dirs : ph[d] \notin {"ready", "chmod"} \/ d \in S
+    /\ \A d \in Dirs : ph[d] = "fsealed" => d \in S
+    /\ LET kept == IF Mutation = "fold_leaves_owed" THEN S ELSE {}
+       IN /\ owed' = [d \in Dirs |-> owed[d] /\ d \in kept]
+          /\ child' = [d \in Dirs |-> child[d] \/ (owed[d] /\ d \notin kept)]
+    /\ rec' = [d \in Dirs |-> IF d \in S THEN NoIno ELSE rec[d]]
+    /\ multiRec' = [d \in Dirs |-> IF d \in S THEN FALSE ELSE multiRec[d]]
+    /\ everDone' = [d \in Dirs |-> everDone[d] \/ d \in S]
+    /\ ph' = [d \in Dirs |-> IF d \in S THEN "done" ELSE ph[d]]
+    /\ UNCHANGED <<run, live, crashes, foreign, loc, dloc, ino, mode, dmode,
+                   fino, fmode, adoptedForeign, adoptedMulti, partial>>
+
+(* The session ends, with nothing half made and no output owed. *)
 Exit ==
     /\ live
     /\ \A d \in Dirs : ph[d] \in {"todo", "ready", "existing", "refused", "done"}
+    /\ \A d \in Dirs : ~owed[d]
     /\ live' = FALSE
     /\ UNCHANGED <<run, crashes, foreign, loc, dloc, ino, mode, dmode, fino,
-                   fmode, rec, ph, child, everDone, multiRec, adoptedForeign,
+                   fmode, rec, ph, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
 -----------------------------------------------------------------------------
@@ -465,7 +527,7 @@ Stop ==
     /\ live /\ crashes < MaxCrashes
     /\ live' = FALSE /\ crashes' = crashes + 1
     /\ UNCHANGED <<run, foreign, loc, dloc, ino, mode, dmode, fino, fmode, rec,
-                   ph, child, everDone, multiRec, adoptedForeign,
+                   ph, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
 (* Power is lost: each unsealed name and mode change is kept or lost on   *)
@@ -488,7 +550,7 @@ PowerLoss ==
                   /\ loc[y] = "final" /\ dloc[y] # "final"
                   /\ f[x] = "final" /\ f[y] # "final")
     /\ live' = FALSE /\ crashes' = crashes + 1
-    /\ UNCHANGED <<run, foreign, fino, fmode, rec, ph, child, everDone,
+    /\ UNCHANGED <<run, foreign, fino, fmode, rec, ph, child, owed, everDone,
                    multiRec, adoptedForeign, adoptedMulti>>
 
 (* Any other seal of p, or a journal force: p's names become durable. *)
@@ -496,7 +558,7 @@ EnvSeal(p) ==
     /\ \E d \in Children(p) : loc[d] # dloc[d]
     /\ dloc' = SealNames(p)
     /\ UNCHANGED <<run, live, crashes, foreign, loc, ino, mode, dmode, fino,
-                   fmode, rec, ph, child, everDone, multiRec, adoptedForeign,
+                   fmode, rec, ph, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
 (* A third party makes a directory at d's free final name. *)
@@ -507,7 +569,7 @@ Foreign(d) ==
          /\ fmode' = [fmode EXCEPT ![d] = m]
     /\ foreign' = foreign + 1
     /\ UNCHANGED <<run, live, crashes, loc, dloc, ino, mode, dmode, rec, ph,
-                   child, everDone, multiRec, adoptedForeign, adoptedMulti,
+                   child, owed, everDone, multiRec, adoptedForeign, adoptedMulti,
                    partial>>
 
 (* It replaces its own directory there: a new inode, any free number. *)
@@ -517,7 +579,7 @@ ForeignReplace(d) ==
     /\ \E i \in Free : fino' = [fino EXCEPT ![d] = i]
     /\ foreign' = foreign + 1
     /\ UNCHANGED <<run, live, crashes, loc, dloc, ino, mode, dmode, fmode,
-                   rec, ph, child, everDone, multiRec, adoptedForeign,
+                   rec, ph, child, owed, everDone, multiRec, adoptedForeign,
                    adoptedMulti, partial>>
 
 \* Every run has been made: the behaviour may stop here.
@@ -530,9 +592,9 @@ Protocol ==
     \/ \E d \in Dirs :
          \/ DecideExisting(d) \/ Mkdir(d) \/ Rename(d) \/ DiscardClear(d)
          \/ DiscardUnlink(d) \/ Intent(d) \/ FallbackMkdir(d) \/ Bind(d)
-         \/ ChildCommit(d) \/ Chmod(d) \/ SealDir(d)
+         \/ ChildCommit(d) \/ Place(d) \/ Chmod(d) \/ SealDir(d)
     \/ \E p \in Dirs \cup {Root} : SealParent(p)
-    \/ \E S \in SUBSET Dirs : Record(S) \/ Complete(S)
+    \/ \E S \in SUBSET Dirs : Record(S) \/ Complete(S) \/ GroupFinish(S)
 
 Environment ==
     \/ Stop \/ PowerLoss
@@ -557,6 +619,7 @@ TypeOK ==
     /\ rec \in [Dirs -> Inos \cup {NoIno, IntentIno}]
     /\ ph \in [Dirs -> Phases]
     /\ child \in [Dirs -> BOOLEAN] /\ everDone \in [Dirs -> BOOLEAN]
+    /\ owed \in [Dirs -> BOOLEAN]
     /\ multiRec \in [Dirs -> BOOLEAN]
     /\ adoptedForeign \in BOOLEAN /\ adoptedMulti \in BOOLEAN
     /\ partial \in BOOLEAN
@@ -595,6 +658,11 @@ NoDirectoryUnderTemporary ==
     \A d \in Dirs :
         (Parent(d) # Root /\ dloc[d] # "none")
             => (dloc[Parent(d)] = "final" \/ fino[Parent(d)] # NoIno)
+
+(* A directory is completed only with or after every output this run     *)
+(* placed inside it: a completion never leaves an output of its own       *)
+(* directory uncommitted (R-N102's finish; OI-1003-Q154's fold).           *)
+CompletionAfterChildren == \A d \in Dirs : ph[d] = "done" => ~owed[d]
 
 WithinBudget == run \in 0..MaxRuns => TLCGet("duration") < BudgetSeconds
 

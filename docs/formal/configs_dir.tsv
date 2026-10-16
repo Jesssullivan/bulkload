@@ -13,11 +13,13 @@
 #                   space-separated word (- for none)
 name	expect	named-property	never	flags
 MC_dir_budget_selftest	inconclusive	WithinBudget	*	-
-MC_dir_per_dir	pass	all	Bind,FallbackMkdir,ForeignReplace,Intent	-
-MC_dir_batched	pass	all	Bind,FallbackMkdir,ForeignReplace,Intent	-
-MC_dir_batched_crashes	pass	all	Bind,FallbackMkdir,ForeignReplace,Intent	-
-MC_dir_foreign_replace	pass	all	Bind,FallbackMkdir,Intent	-
-MC_dir_fallback	pass	all	DiscardClear,DiscardUnlink,ForeignReplace,Mkdir,Record,Rename	-
+MC_dir_per_dir	pass	all	Bind,FallbackMkdir,ForeignReplace,GroupFinish,Intent,Place	-
+MC_dir_batched	pass	all	Bind,FallbackMkdir,ForeignReplace,GroupFinish,Intent,Place	-
+MC_dir_batched_crashes	pass	all	Bind,FallbackMkdir,ForeignReplace,GroupFinish,Intent,Place	-
+MC_dir_foreign_replace	pass	all	Bind,FallbackMkdir,GroupFinish,Intent,Place	-
+MC_dir_fallback	pass	all	DiscardClear,DiscardUnlink,ForeignReplace,GroupFinish,Mkdir,Place,Record,Rename	-
+MC_dir_fold	pass	all	Bind,DiscardClear,DiscardUnlink,FallbackMkdir,Foreign,ForeignReplace,Intent	-
+MC_dir_fold_crashes	pass	all	Bind,FallbackMkdir,ForeignReplace,Intent	-
 MC_dir_reach_partial_level	reach	Witness_PartialLevel	*	-
 MC_dir_reach_adopt_batched	reach	Witness_AdoptBatched	*	-
 MC_dir_neg_record_before_seal	fail	RecordNamesDirectory	*	-
@@ -29,3 +31,5 @@ MC_dir_neg_level_rename_seals_one_parent	fail	ChildImpliesNamed	*	-
 MC_dir_neg_adopt_unbound	fail	NeverAdoptForeign	*	-
 MC_dir_neg_discard_unlink_before_clear	fail	NeverAdoptForeign	*	-
 MC_dir_neg_admit_under_held	fail	NoDirectoryUnderTemporary	*	-
+MC_dir_neg_fold_leaves_owed	fail	CompletionAfterChildren	*	-
+MC_dir_neg_fold_unsealed	fail	CompleteImpliesFinal	*	-

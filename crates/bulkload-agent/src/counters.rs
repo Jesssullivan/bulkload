@@ -238,6 +238,11 @@ counters! {
     // Destination publication events.
     FilesMaterialized => "files_materialized",
     DirectoriesFinished => "directories_finished",
+    // Of those, directories completed in the session's last output group
+    // commit instead of a completion commit of their own (OI-1003-Q154
+    // lever 3, the SOTA study's lever 2); 0 under
+    // `BULKLOAD_DIRECTORY_FOLD=0`, the lever's A/B arm.
+    DirectoriesFolded => "directories_folded",
     // Source captures sent but never recorded: stamped within one timestamp
     // tick of their capture (#86).
     TransferRacyCaptures => "transfer_racy_captures",

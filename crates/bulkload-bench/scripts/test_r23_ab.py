@@ -64,7 +64,7 @@ sealed=$(cat "$2"/* 2>/dev/null | cksum | cut -d' ' -f1)
 echo "benchmark revision=r durability=group seal_primitive=${STUB_SEAL:-fsync} rclone_version=\\"${STUB_RCLONE:-rclone v1.74.4}\\" sealed_corpus_blake3=s$sealed"
 echo "sample sequence=0 arm=Native phase=initial elapsed_ms=100.0 workload_bytes=1000 transferred_content_bytes=900 source_bytes_read=1000 power=$power load1=1.00 gated=$gated"
 echo "native_timing sequence=0 phase=initial scope=s walk_ns=50 walk_ahead_wait_ns=20 queue_wait_ns=1 recv_setup_ns=10000000 recv_stream_ns=80000000 recv_tail_ns=6000000 recv_drain_ns=30000000 recv_first_data_ns=4000000"
-echo "native_counters sequence=0 phase=initial scope=s flush_barrier_ns=10000000 flush_full_ns=5000000 flush_dir_ns=0 files_materialized=10${STUB_HANDED:+ wire_handed_bytes=$STUB_HANDED}"
+echo "native_counters sequence=0 phase=initial scope=s flush_barrier_ns=10000000 flush_full_ns=5000000 flush_dir_ns=0 files_materialized=10${STUB_HANDED:+ wire_handed_bytes=$STUB_HANDED}${STUB_FOLDED:+ directories_folded=$STUB_FOLDED}"
 echo "sample sequence=1 arm=Rclone phase=initial elapsed_ms=80.0 workload_bytes=1000 transferred_content_bytes=unknown source_bytes_read=unknown power=$power load1=1.00 gated=$gated"
 echo "rclone_sync sequence=1 phase=initial sync_ms=30.000 timed=false"
 if [ "$only" = 1 ]; then
@@ -1090,11 +1090,22 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("R-N57", md)
         self.assertIn("not ruled", md)
 
+    def test_the_directory_fold_is_recorded_per_rep(self) -> None:
+        # OI-1003-Q154 lever 3: the directories each rep's native copies
+        # finished in their last output group, from the build's own counter
+        # (None from a build without it: the test below).
+        with mock.patch.dict(os.environ, {"STUB_FOLDED": "4"}):
+            self.assertEqual(self.main(self.under_load()), 0)
+        for rep in self.report()["reps"]:
+            self.assertEqual(rep["summary"]["directories_folded_total"], 4, rep["label"])
+
     def test_a_build_without_the_hand_off_counter_is_not_reported(self) -> None:
         self.assertEqual(self.main(self.under_load()), 0)
         report = self.report()
         for rep in report["reps"]:
             self.assertIsNone(rep["summary"]["wire_handed_bytes_total"], rep["label"])
+            # Nor the directory fold's (OI-1003-Q154 lever 3).
+            self.assertIsNone(rep["summary"]["directories_folded_total"], rep["label"])
         self.assertEqual(
             report["loopback_handoff"],
             {"A": "not reported", "B": "not reported", "V4": "not reported"},

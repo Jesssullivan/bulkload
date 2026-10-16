@@ -3002,7 +3002,17 @@ directory at a refused name); deciding an existing directory sweeps it
 removed and the directory sealed) and adopts it only when its record names
 its inode, sealing its parent first. Finishing is deepest first, mode then
 seal, then the completion (`Complete(S)`: every finished directory in one
-commit under `BatchFinish`). The environment: `Stop` (the process dies;
+commit under `BatchFinish`). With `FoldFinish` (OI-1003-Q154 lever 3, the
+code since 2026-10-16) the finish rides the session's last output group:
+`Place(d)` is an output renamed into `d` whose group has not committed
+(`owed`), allowed while `d` is decided or already has its final mode set
+(the drain sets every final mode before that group's renames);
+`ChildCommit` commits what is owed, also inside a directory being
+finished (an earlier group still committing); and `GroupFinish(S)` is the
+last group's one commit, which commits every owed output and completes
+every directory being finished, each sealed (`SealDir`) after its mode was
+set. A finish that rides no group is `Complete`, after every output
+committed. The environment: `Stop` (the process dies;
 names stay), `PowerLoss` (each unsealed name kept or lost on its own, as a
 prefix of its mkdir and rename; each unsealed mode kept or lost; nothing
 inside a directory whose creation was lost), `EnvSeal(p)` (any other seal
@@ -3016,7 +3026,9 @@ directory of ours durable at its final name, never completed, is bound by
 its record or an intent), `CompleteImpliesFinal`, `ChildImpliesNamed`,
 `NeverAdoptForeign`, `NoDirectoryUnderTemporary` (#217 review, finding 1:
 nothing of ours is durable inside a directory of ours whose final name is
-not). Witnesses: `Witness_PartialLevel` (one power loss keeps one sibling's
+not), `CompletionAfterChildren` (OI-1003-Q154 lever 3: a completed
+directory owes no output of its run, so a completion never leaves an
+output inside its directory uncommitted). Witnesses: `Witness_PartialLevel` (one power loss keeps one sibling's
 rename and loses the other's, under one parent) and `Witness_AdoptBatched`
 (a directory bound in a shared commit is adopted after a crash).
 
@@ -3029,9 +3041,15 @@ property): `record_before_seal` (`RecordNamesDirectory`),
 (`NeverAdoptForeign`), `discard_unlink_before_clear` (`NeverAdoptForeign`:
 the N3 hazard, a record bound to a freed inode number a third party's
 directory takes), `admit_under_held` (`NoDirectoryUnderTemporary`: the
-batch rule the #217 review refuted).
+batch rule the #217 review refuted), `fold_leaves_owed`
+(`CompletionAfterChildren`: the last group's commit completes the
+directories and leaves the outputs placed inside them out of it),
+`fold_unsealed` (`CompleteImpliesFinal`: it completes a directory whose
+final mode the group's seal did not cover).
 
-**Abstraction map.** Files are `ChildCommit` only. Store commits are
+**Abstraction map.** Files are `ChildCommit` only (and, with `FoldFinish`,
+`Place`: an output's own durability before its commit is
+`BulkloadTransfer`'s, and a crashed run's owed outputs are its adoption's). Store commits are
 atomic and durable on return. One device (the code fully flushes a parent
 off the store's device). A fallback directory may revert to a temporary
 name in `PowerLoss` (an over-approximation). On a file system with no
@@ -3043,29 +3061,52 @@ limit: a same-user empty 0700 directory made between an intent and its
 of the code's one level. Liveness is not modelled.
 
 **Results** (`just tla-check` with every `MC_dir_` config; TLC 1.7.4,
-3 workers; sting, shared and loaded, so wall times are not of record):
+3 workers; sting, shared and loaded, so wall times are not of record;
+2026-10-16, after OI-1003-Q154 lever 3 added `FoldFinish`):
 
 | Config | Expect | Outcome | Violated | Distinct | Generated | Depth | Wall | RSS MiB |
 |---|---|---|---|---:|---:|---:|---:|---:|
-| `MC_dir_budget_selftest` | inconclusive | **INCONCLUSIVE** | WithinBudget | ? | ? | - | 23s | 159 |
-| `MC_dir_per_dir` | pass | **PASS** | - | 306150 | 871198 | 47 | 750s | 1818 |
-| `MC_dir_batched` | pass | **PASS** | - | 581639 | 1692991 | 42 | 1181s | 1836 |
-| `MC_dir_batched_crashes` | pass | **PASS** | - | 41224 | 125290 | 29 | 41s | 765 |
-| `MC_dir_foreign_replace` | pass | **PASS** | - | 26533 | 91040 | 25 | 40s | 727 |
-| `MC_dir_fallback` | pass | **PASS** | - | 91044 | 258046 | 39 | 224s | 1574 |
-| `MC_dir_reach_partial_level` | reach | **REACHED** | Witness_PartialLevel | 304 | 714 | 11 | 118s | 293 |
-| `MC_dir_reach_adopt_batched` | reach | **REACHED** | Witness_AdoptBatched | 676 | 1497 | 12 | 69s | 305 |
-| `MC_dir_neg_record_before_seal` | fail | **FAIL** | RecordNamesDirectory | 21 | 36 | 5 | 24s | 200 |
-| `MC_dir_neg_rename_before_record` | fail | **FAIL** | NoStrandedDirectory | 66 | 126 | 6 | 22s | 204 |
-| `MC_dir_neg_child_before_dirseal` | fail | **FAIL** | ChildImpliesNamed | 108 | 224 | 8 | 21s | 233 |
-| `MC_dir_neg_complete_before_seal` | fail | **FAIL** | CompleteImpliesFinal | 585 | 1453 | 12 | 32s | 361 |
-| `MC_dir_neg_level_seals_one_parent` | fail | **FAIL** | RecordNamesDirectory | 487 | 1183 | 12 | 55s | 397 |
-| `MC_dir_neg_level_rename_seals_one_parent` | fail | **FAIL** | ChildImpliesNamed | 669 | 1673 | 12 | 58s | 357 |
-| `MC_dir_neg_adopt_unbound` | fail | **FAIL** | NeverAdoptForeign | 82 | 187 | 5 | 76s | 183 |
-| `MC_dir_neg_discard_unlink_before_clear` | fail | **FAIL** | NeverAdoptForeign | 7177 | 19725 | 13 | 44s | 382 |
-| `MC_dir_neg_admit_under_held` | fail | **FAIL** | NoDirectoryUnderTemporary | 490 | 1212 | 11 | 38s | 418 |
+| `MC_dir_budget_selftest` | inconclusive | **INCONCLUSIVE** | WithinBudget | 6852 | 21238 | 12 | 6s | 1132 |
+| `MC_dir_per_dir` | pass | **PASS** | - | 306150 | 871198 | 47 | 138s | 1810 |
+| `MC_dir_batched` | pass | **PASS** | - | 581639 | 1692991 | 42 | 242s | 1834 |
+| `MC_dir_batched_crashes` | pass | **PASS** | - | 41224 | 125290 | 29 | 6s | 941 |
+| `MC_dir_foreign_replace` | pass | **PASS** | - | 26533 | 91040 | 25 | 5s | 810 |
+| `MC_dir_fallback` | pass | **PASS** | - | 91044 | 258046 | 39 | 33s | 1593 |
+| `MC_dir_fold` | pass | **PASS** | - | 1140105 | 5106949 | 50 | 358s | 1998 |
+| `MC_dir_fold_crashes` | pass | **PASS** | - | 77336 | 246204 | 32 | 9s | 1195 |
+| `MC_dir_reach_partial_level` | reach | **REACHED** | Witness_PartialLevel | 216 | 493 | 10 | 1s | 254 |
+| `MC_dir_reach_adopt_batched` | reach | **REACHED** | Witness_AdoptBatched | 504 | 1113 | 11 | 2s | 270 |
+| `MC_dir_neg_record_before_seal` | fail | **FAIL** | RecordNamesDirectory | 22 | 39 | 6 | 1s | 208 |
+| `MC_dir_neg_rename_before_record` | fail | **FAIL** | NoStrandedDirectory | 102 | 204 | 7 | 1s | 221 |
+| `MC_dir_neg_child_before_dirseal` | fail | **FAIL** | ChildImpliesNamed | 134 | 288 | 8 | 2s | 231 |
+| `MC_dir_neg_complete_before_seal` | fail | **FAIL** | CompleteImpliesFinal | 599 | 1505 | 13 | 1s | 325 |
+| `MC_dir_neg_level_seals_one_parent` | fail | **FAIL** | RecordNamesDirectory | 500 | 1199 | 11 | 2s | 339 |
+| `MC_dir_neg_level_rename_seals_one_parent` | fail | **FAIL** | ChildImpliesNamed | 703 | 1762 | 12 | 3s | 347 |
+| `MC_dir_neg_adopt_unbound` | fail | **FAIL** | NeverAdoptForeign | 86 | 201 | 6 | 1s | 224 |
+| `MC_dir_neg_discard_unlink_before_clear` | fail | **FAIL** | NeverAdoptForeign | 6895 | 19000 | 13 | 3s | 432 |
+| `MC_dir_neg_admit_under_held` | fail | **FAIL** | NoDirectoryUnderTemporary | 475 | 1171 | 11 | 2s | 379 |
+| `MC_dir_neg_fold_leaves_owed` | fail | **FAIL** | CompletionAfterChildren | 1080 | 2568 | 15 | 2s | 388 |
+| `MC_dir_neg_fold_unsealed` | fail | **FAIL** | CompleteImpliesFinal | 642 | 1551 | 13 | 1s | 325 |
 
-Total wall 2807 s, peak RSS 1836 MiB (sting, load 150 to 250, 2026-10-08/09). Every pass row's never-enabled set matched its `never` column. Grounding: 36 operators, 10 constants, 9 mutations, 20 code symbols, all found. An extra, uncatalogued run of `MC_dir_batched`'s bound with two crashes (Deep, two runs, `MaxCrashes = 2`) passed at 1,191,551 distinct states in 4787 s with every invariant but `WithinBudget`; it is too long for the run order. `MC_dir_foreign_replace` was added after that run (S1 throughput review, 2026-10-09, finding 5: no pass row enabled `ForeignReplace`, which needs `MaxForeign = 2`, so only the negative `MC_dir_neg_discard_unlink_before_clear` exercised it) and checked on its own, `just tla-check MC_dir_foreign_replace`, 2026-10-09: PASS, `ForeignReplace` enabled (its never-enabled set is `Bind`, `FallbackMkdir`, `Intent` only).
+Total wall 1041 s for these rows with `MC_main`, `MC_r25_strict_three`,
+`MC_sq_rollback` and `MC_ec_refs` and each module's budget self-test
+(every row as expected), peak RSS 2027 MiB (sting, 2026-10-16). Every pass
+row's never-enabled set matched its `never` column. The exhaustive pass
+rows without `FoldFinish` explore the same distinct and generated states as
+before it (`MC_dir_per_dir` 306,150, `MC_dir_batched` 581,639,
+`MC_dir_batched_crashes` 41,224, `MC_dir_foreign_replace` 26,533,
+`MC_dir_fallback` 91,044). The reach and negative rows' counts are not
+comparable between runs: each stops at its first witness or violation with
+3 workers, so what it explores before then depends on the search order
+(`MC_dir_reach_partial_level` 304 then 216, `MC_dir_neg_rename_before_record`
+66 then 102). Grounding: 39 operators, 11 constants,
+11 mutations, 25 code symbols, all found. Extra, uncatalogued runs: of
+`MC_dir_batched`'s bound with two crashes (Deep, two runs,
+`MaxCrashes = 2`), 2026-10-08/09, without `FoldFinish`: PASS at 1,191,551
+distinct states in 4787 s; and of `MC_dir_batched`'s bound with `FoldFinish`
+(one third party, so `MC_dir_fold` plus `Foreign`), 2026-10-16: PASS at
+3,771,591 distinct states, depth 50, in 1784 s, every invariant but
+`WithinBudget`. Both are too long for the run order.
 
 ## Frozen names
 

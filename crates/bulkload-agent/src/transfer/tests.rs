@@ -3022,3 +3022,6 @@ mod throughput;
 
 // ---- S1 levers (OI-1003-Q154): verify once, the loosened loopback wire ------
 mod levers;
+
+// ---- S1 lever 3 (OI-1003-Q154): the directory finish in the last group ------
+mod fold;

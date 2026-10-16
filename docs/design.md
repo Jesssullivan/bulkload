@@ -1508,6 +1508,49 @@ failure), and every clear is traced apart from a completion
 the records under per-name power loss, journal seals and reused inode
 numbers (README, "Directory records").
 
+The finish rides the session's last output group (OI-1003-Q154 lever 3;
+the SOTA study's lever 2, R-N102's finish commit unit; built 2026-10-16).
+When the stream drains (every entry offered and ended), the receiving side
+sets every final mode, deepest first, checking each directory's identity
+as the finish does, and hands the directories to the committer with that
+last group. The group renames its outputs, seals them together with the
+directories (the device seal of a batched group covers every directory's
+mode on its device; otherwise each directory joins the touched set and is
+sealed, and fully flushed off the store's device, as the finish seals it),
+and its one FULL commit records the outputs and completes the directories:
+no seal of each directory and no completion commit of its own. On corpus v1
+that removes four directory seals and one FULL commit from the tail
+(expected on the rig, not measured there: `sqlite_directory_complete_commits`
+1 to 0, `flush_dir_barrier_count` 8 to 4, `directories_folded` 0 to 4). The
+order per directory is the finish's: final mode set, then sealed, then
+completed. It folds only when nothing after that group can refuse: nothing
+refused so far on either side (the committer checks every outcome it has
+reported), no `SQLite` sidecar without its snapshot base, no salvaged
+temporary left to retire, batching on and at most a batch of directories
+(each held open into the group), and no final mode that takes away this
+user's read, write or search permission (the group's renames need write and
+search; the separate finish after a group that carried nothing, and the
+next run's adoption after a group that refused, open each directory
+read-only and the adoption lists it, which needs read). A group that
+refused an output, or whose seal or commit fails, completes nothing, and
+the session leaves every directory unfinished, as a session that refuses
+does; the final modes it set stay (owner read, write and search by
+construction), and the next run adopts each directory by its record,
+which names that mode. A drain whose group is
+already empty (the last output closed it at a file or byte bound, or an
+idle or age bound closed it first) drops the finish, which then runs as
+before over the modes already set. `BULKLOAD_DIRECTORY_FOLD=0`
+restores the separate finish for A/B; `directories_folded` counts the
+directories finished in a group. The model is `DirectoryRecords.tla`'s
+`Place` and `GroupFinish` with `CompletionAfterChildren` (a completed
+directory owes no output of its run); the power-loss proof is
+`every_power_loss_state_of_a_folded_finish_is_explored`, in group and
+strict mode, with the final modes moved after the seals as its teeth.
+The pending side cannot fold: a directory's record must be durable before
+its name (R-N102), and its name before anything inside it is decided, so
+that commit is the session's first durable step and has no output group to
+ride.
+
 The two stores are opened at once (S1, OI-1003-Q143 item 1b): the
 destination sends `Open`, with its whole credit window, before it opens its
 own store, so the source opens its store meanwhile. Every overlap of a state

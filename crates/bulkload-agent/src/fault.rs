@@ -83,7 +83,7 @@
 //! | `directory.after_pending_record` | the temporary, its parent sealed, and a record bound to its inode; not renamed |
 //! | `directory.after_rename` | the 0700 directory under its final name, bound record; parent sealed, not flushed |
 //! | `directory.after_fallback_mkdir` | with no no-replace rename (R-N119): a 0700 directory under its final name, no record |
-//! | `directory.before_complete` | one directory's final mode applied and sealed; its pending record still present (batched: every directory before it in the finish too, one commit to come) |
+//! | `directory.before_complete` | one directory's final mode applied and sealed; its pending record still present (batched: every directory before it in the finish too, one commit to come; folded into the last output group, OI-1003-Q154 lever 3: every directory's mode sealed by that group's seal, and its outputs renamed and sealed, their commit and the completions to come) |
 //!
 //! With [`crate::materialize::DIRECTORY_BATCH_ENV`] set to `N`, every batch of
 //! new directories holds at most `N` (`1`: one at a time, as before
