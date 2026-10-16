@@ -448,3 +448,315 @@ Validation (review round, sting, inside `nix develop`, target dir
 | `python3 -m unittest crates/bulkload-bench/scripts/test_s2_budget.py` | 116 tests OK; `ruff check` and `ruff format --check` clean |
 | `just tla-render --check` | exit 0 |
 | `just tla-check` the 9 raced rows | exit 0: 2 PASS, 3 REACHED, 4 FAIL as expected, self-test INCONCLUSIVE; 484 s; `MC_ec_capture_raced` 135185 and `MC_ec_capture_raced_stash` 82086 states (unchanged; no model change this round) |
+
+## Q168 and Q169 (2026-10-15, lane `q168-q169`)
+
+Worktree `bulkload.worktrees/q168-q169-20261015`, branch
+`feat/q168-q169-20261015`, stacked on `feat/q160-q161-20261015` (`454ea9d`,
+which merged main `399344c`, #225 included). Changes are staged, not
+committed: the coordinator commits signed. Rulings: OI-1003-Q168 and
+OI-1003-Q169 (Linear TIN-4543, 2026-10-15), under OI-1003-Q152 and
+OI-1003-Q160; R-N11, R-N104, R-N13. They answer this note's open items
+"finding 4" and "finding 9" of the Q160/Q161 review round.
+
+### Q168: S2 passes start on a schedule recorded in advance
+
+- `s2_budget.py schedule` records a pass schedule before the run:
+  `fixed` (`--at` slot times) or `seeded` (`--first` time or `+SECONDS`,
+  `--every`, `--passes`, `--jitter` under the period drawn from `--seed`;
+  the starts re-derive from those parameters alone). Schema
+  `bulkload.s2-schedule.v1`, sealed by a SHA-256 digest; every slot must
+  lie after the moment it was made, so it is recorded in advance.
+- `observe --schedule F` records the schedule in `observe.json` at the
+  observation's start (refuses an invalid one).
+- `drive --schedule F --intervals MARKS [--stop-file] [--log-dir] --
+  COMMAND...` is the driver for the full run: slot k's pass starts at its
+  time (never earlier; the host's load is never read), is marked `on`/`off`
+  with `slot=k schedule=<digest12>` (`exit=` on the `off` line), and is
+  waited for until it exits (`Popen` + `wait`, never `subprocess.run`, whose
+  interrupt path ends the child: R-N11). A pass still running at the next
+  slot's time makes that pass late; a slot already past when the drive
+  began is recorded by a `skip` record (a `# skipped` comment before the
+  review round), never run late. Placeholders `{slot}`, `{scheduled}`.
+- `alongside --evidence` adds `schedule_problems`: no recorded schedule,
+  a defective one (digest, ordering, re-derivation, not in advance), one
+  made after the observation began, a pass naming no slot of it (or
+  another schedule's digest), a slot with two passes, a slot inside the
+  observation with no pass, or a pass more than `SCHEDULE_SLACK_S` = 5 s
+  from its slot (early or late) is not evidence. `read_marks` keeps each
+  pass's labels (`parse_intervals` is built on it, unchanged). The report
+  (`config.schedule`, `verdict.schedule`: per pass slot, scheduled and
+  actual start, deviation; max deviation; late, missing, unscheduled,
+  duplicate, defects) goes to the emit line, `summary.md` and an
+  `evidence.tsv` `schedule` row.
+- Tests: `ScheduleTests` (12; two live drives and a live observe).
+  Existing alongside helpers now record a fixed schedule and slot labels
+  (`scheduled_passes`), so every evidence-asserting alongside test still
+  asserts evidence. Red first: against the pre-change `s2_budget.py` the
+  suite gave 49 errors (the 12 new tests and the 37 tests whose helpers
+  need `fixed_schedule`/`slot_label`).
+
+### Q169: stash-order-v2, a stash entry is its commit and its message
+
+- `landed.rs`: `StashEntry { oid, message: Vec<u8> }` (any bytes but NUL
+  and newline), `STASH_LIST_FORMAT` (`--format=%H%x00%gs`, used by the
+  source capture and the destination read alike), `parse_stash_list`
+  (strict), `reflog_message` (Git's `copy_reflog_msg` folding: space, tab,
+  CR, LF; `\v`/`\f` kept, checked against git 2.52). `LandedStash` gains
+  entries and `StashIdentity` (`Commit` for a v1 row, `CommitAndMessage`),
+  `names` and `upgraded`; `StashOp` and `RefIntent.stash_at` carry entries.
+  Records are typed by a `Record` trait: the ref ledger and ref intent are
+  written under `bulkload-refs-v2`; under `bulkload-land-v1` a ledger
+  decodes through `RefLedgerV1` (its stash row `Commit`), an intent
+  through `RefIntentV1` (`read_ref_intent`, resolved against the
+  destination's stash by `settle`: the new order's messages are what a v1
+  store wrote, `bulkload stash` for an empty one; the old order is the
+  destination's when it names the same commits; a progress state no v1
+  path holds, or messages that do not pair, refuse `FRAME_CODEC`). The
+  plain `read` refuses a v1 intent `FRAME_CODEC`. Workspace records keep
+  `bulkload-land-v1` unchanged.
+- `git_carry.rs`: the source reads the stash list with
+  `STASH_LIST_FORMAT`, so the key hashes messages (deliberate one-time
+  invalidation for checkouts with a stash; none for checkouts without);
+  the capture writes `stash-order-v2` (those bytes); `exported_refs` reads
+  the commit before the NUL. A message-only change is `StashMoved` drift.
+- `native_refs.rs`: `stash_reflog` reads entries; `carried_stash` returns
+  entries and a `StashProvenance` (`Exact` from v2; `MessagesInferred`
+  from v1, subjects folded, custody `stash-messages-inferred`;
+  `OrderInferred`); `stash_decision` compares entries (T6 by
+  `LandedStash::names`); `stash_apply` stores each entry under its own
+  message, an empty one by `update-ref --create-reflog` with no `-m` (Git
+  refuses `-m ""`); `step` upgrades a v1 row that names the destination's
+  stash (`stash-ledger-upgraded`) before deciding.
+- Tests: `p85_the_stash_list_is_the_sources_exactly_messages_and_order`
+  (`tests/estate_converge.rs`: first landing with a `stash store -m`
+  entry; then two pushes, a pop, a drop below the tip and a stored entry
+  with odd whitespace; then a message-only change; each converged so the
+  destination's `git stash list` and `%H %gs` equal the source's;
+  `stash-rewritten` on the last; closure 0 unaccounted). Red first on the
+  unchanged code: the first landing's list showed the subject
+  (`On main: a subject of its own` for `a message that is not the
+  subject`). Lib rows: `a_stash_message_is_part_of_the_key_and_the_capture`
+  (git_carry), and in `native_refs/tests.rs`
+  `a_stash_message_is_part_of_each_entrys_identity`,
+  `a_stash_order_v1_row_is_upgraded_only_when_it_names_the_destination`,
+  `stash_order_v1_records_decode_or_refuse_typed`,
+  `a_stash_list_parses_strictly_and_messages_fold_as_git_folds_them`,
+  `a_stash_store_writes_each_entrys_own_message` (non-UTF-8, empty, `\v`),
+  `a_stash_order_v1_capture_applies_with_folded_subjects`. Updated:
+  `the_stash_table` (entries), the two settle rows (entries; the crash
+  row's simulated store carries its message),
+  `stash_dropped_during_capture_is_drift_custody` (v2 metadata bytes),
+  `r3_stash_reflog_round_trip_...` (stores back under the original
+  messages, so it stays a true round trip).
+- Model: no change to any action, config or catalogue row: the model's
+  stash values are opaque ids, one per entry, which is the identity the
+  code now has. Header bullet in `EstateConverge.tla` and a README
+  section say so.
+
+### Mutation evidence (Q168/Q169)
+
+Python: each mutant a copy of the scripts directory under
+`/dev/shm/q168-tmp/pymut` (sources untouched), `ScheduleTests` run against
+it; the unmutated copy passes. All 15 KILLED:
+
+| mutant | killed by |
+|---|---|
+| a schedule problems not added to alongside evidence | late, off-schedule, invalid, missing-slot and no-schedule tests |
+| b slack bound not checked | `test_a_late_pass_...`, `test_drive_records_a_pass_that_overran_its_next_slot` |
+| c signed deviation (an early start accepted) | `test_a_late_pass_...` |
+| d missing slots not reported | `test_a_slot_with_no_pass_is_not_evidence` |
+| e a slot after the observation counted missing | same |
+| f marks of another schedule accepted | `test_a_pass_off_the_schedule_is_not_evidence` |
+| g two passes in a slot accepted | same |
+| h digest not checked | `test_a_seeded_schedule_...`, `test_drive_refusals_...` |
+| i seeded starts not re-derived | `test_a_seeded_schedule_...` |
+| j "recorded in advance" not checked | `test_a_seeded_schedule_...`, `test_the_schedule_command_...` |
+| k schedule made after the observation began accepted | `test_a_schedule_that_is_not_valid_is_not_evidence` |
+| l drive does not wait for the slot | both drive timing tests |
+| m drive runs a slot already past at launch | `test_drive_refusals_and_a_slot_already_past_at_launch` |
+| n observe does not record the schedule | `test_observe_records_its_schedule_at_its_start` |
+| o drive reads the host's load | `test_drive_starts_each_pass_...` (load readers patched to raise) |
+
+Rust: each mutant applied in place, the stash/`native_refs`/`landed`/
+`r3_stash` lib rows and `estate_converge` P85 run, and the file restored
+byte-identical (byte compare after each; all identical). All 9 KILLED:
+
+| mutant | killed by |
+|---|---|
+| R1 stash identity by commit only (row naming and T3) | `a_stash_message_is_part_of_each_entrys_identity`, `a_stash_order_v1_row_is_upgraded_...`, P85 |
+| R2 source reads commits only (the v1 key) | `a_stash_message_is_part_of_the_key_and_the_capture`, `stash_dropped_during_capture_...`, `union_preserves_...`, P87 stash row, P85 |
+| R3 an empty message stored as `bulkload stash` (v1) | `a_stash_store_writes_each_entrys_own_message` |
+| R4 a v1 ledger refused, not decoded | `stash_order_v1_records_decode_or_refuse_typed` |
+| R5 a v1 row never upgraded | `a_stash_order_v1_row_is_upgraded_...` |
+| R6 a v1 intent's old order not resolved from the destination | `stash_order_v1_records_decode_or_refuse_typed` |
+| R7 `stash-order-v2` metadata ignored (subjects used) | P85 |
+| R8 v1 subjects not folded | `a_stash_order_v1_capture_applies_with_folded_subjects` |
+| R9 a v1 progress state guessed, not refused | `stash_order_v1_records_decode_or_refuse_typed` |
+
+### Validation (2026-10-15, sting, inside `nix develop`, target dir `cargo-target/q168`)
+
+Host shared, load average 110 to 180 on 32 CPUs. Final pass after the last
+code edit (this note edited after it):
+
+| step | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+| `cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings` | exit 0 |
+| `cargo test -p bulkload-agent --locked --no-fail-fast` | exit 0: lib 680 passed, 5 ignored; every integration binary ok, among them `estate_converge` 22, `source_command_registry` 16, `space_closure_cli` 10, `refusal_taxonomy` 5 |
+| `cargo test ... --features fault-injection,io-trace --test fault_harness` | 91 passed |
+| `cargo test ... --features fault-injection,io-trace --test power_loss` | 12 passed |
+| `python3 tests/test_ci_contract.py` | 24 tests OK |
+| `python3 -m unittest crates/bulkload-bench/scripts/test_s2_budget.py` | 128 tests OK; `ruff check` and `ruff format --check` clean on both files |
+| `just tla-render --check` | all 220 committed files equal the catalogue's rendering |
+| `just tla-check` the 11 stash rows (no config changed; the module's header changed) | exit 0, grounding passed: `MC_ec_stash` 7685, `MC_ec_stash_lock` 129, `MC_ec_stash_settle_revert` 2246, `MC_ec_capture_raced_stash` 82086 distinct states (all as recorded), `MC_ec_reach_stash_drift_carried` REACHED, the six negative rows FAIL as expected; 522 s, peak 2099 MiB |
+
+### Open (Q168/Q169)
+
+- No scheduled alongside observation has been run on neo: `drive` is
+  proven by local live tests on sting only.
+- `SCHEDULE_SLACK_S` = 5 s is this lane's bound, not a ruled number. A
+  pass that overruns the next slot makes that pass late and the run not
+  evidence, so a schedule needs a period with headroom over the longest
+  pass plus 300 s of OFF window and the settle.
+- v1 to v2 limits: a ledger written before Q169 recorded commits only, so
+  a message changed at the destination before the upgrade is adopted as
+  bulkload's and a later rewrite (T5) can replace that message (the
+  commit stays at provenance). A pending v1 intent whose old order the
+  destination no longer names keeps a message-less old order unless the
+  op is an append (then the new order's tail, review finding 6); if its
+  settle cannot finish, the row it records never names the destination,
+  which keeps the destination's stash (T6), the conservative direction.
+- A plan base (`shared.rs`) still reads stash commits only: it carries
+  objects; order and messages come from each item's capture.
+- No Linear or GitHub comment posted by this lane; the coordinator owns them.
+
+### Review round (Q168/Q169, 2026-10-15)
+
+Seven findings; all verified and fixed, each red first on the code before
+its fix (one reviewer suggestion conflicts with another and is resolved
+as finding 1 asks; see 7).
+
+1. **Major, fixed: the observation is bound to the whole schedule.**
+   `schedule_report` now reports `outside` (a slot before the origin, or
+   with under `SCHEDULE_SLACK_S` before the end) and `skipped` (the
+   drive's `skip` records, no longer `#` comments), and evidence refuses
+   either, beside `missing`. A pass that ended before the origin is no pass
+   of the observed run (OI-1003-Q160's pre-origin rule judges it, as
+   before). Not adopted: a minimum lead between making the schedule and
+   its first slot. With the whole schedule inside the observation, the run
+   is placed once by the operator, and each pass is judged against the
+   live OFF windows beside it (OI-1003-Q160), so a quiet start gives no
+   credit; a lead rule is the operator's to add. Tests:
+   `test_a_schedule_longer_than_the_observation_is_not_evidence`
+   (the reviewer's 24-slot case), `test_a_slot_before_the_origin_is_outside_not_missing`,
+   `test_a_slot_the_drive_skipped_is_reported_and_refused`; the old
+   assertion that a slot after the end is "not missing" now also asserts
+   it outside and refused; the drive refusal test reads the `skip` record.
+2. **Minor, fixed:** one late message per offending pass, with its own
+   deviation (`test_a_duplicate_slot_reports_each_offending_pass_deviation`:
+   -30.0 s reported, the on-time +0.2 s not).
+3. **Minor, fixed: exit status.** `read_records` takes `exit=` from the
+   `off` line (and an interval line's label); the report's `failed`
+   (`[slot, exit]`) goes to the emit line, `summary.md` and the
+   `evidence.tsv` row. Evidence refuses a pass that exited nonzero or
+   recorded no exit status. This lane chose refusal over a stated
+   deviation (a failure under load would correlate with neo's activity);
+   `docs/slo.md` says so and that the operator may relax it.
+   `test_a_pass_that_failed_is_reported_and_not_evidence`.
+4. **Minor, fixed: the observer's clock.** `drive` writes a first record
+   `drive T host=H mono=M schedule=D` and `mono=` on each `on` mark;
+   `observe` records `origin_monotonic`. Each start's deviation is judged
+   on the observed host's monotonic clock against the observation's origin
+   (`deviation_s`; the drive's own wall reading is `drive_deviation_s`),
+   and evidence refuses: no drive record, a drive host other than the
+   observed host, no monotonic origin or start, or a wall/monotonic skew
+   over `CLOCK_SLACK_S` (2 s). `drive` runs on the observed host (slo.md).
+   Tests: `test_a_drive_on_another_host_is_not_evidence`,
+   `test_a_pass_start_is_judged_on_the_observers_clock`,
+   `test_passes_with_no_clock_or_drive_record_are_not_evidence`,
+   `test_drive_records_its_host_and_clocks` (live drive). Assumes both
+   processes read one system-wide monotonic clock (CLOCK_MONOTONIC on
+   Linux, mach_absolute_time on macOS).
+5. **Major, fixed: messages Git would fold.** Reproduced with git 2.52
+   (`update-ref -m $'On main: libgit2  style\ttab'` reads back
+   `On main: libgit2 style tab`). `step` folds each carried message with
+   `landed::folded` (Git's `copy_reflog_msg`) before the stash table reads
+   it, so `op.new`, the path states and the ledger row hold what Git
+   writes; custody `stash-message-folded=N` says the list equals the
+   source's up to Git's normalization. The capture keeps the source's
+   exact bytes. Test (`tests/estate_converge.rs`):
+   `p85_a_source_message_git_would_fold_lands_folded_and_later_pushes_land`
+   (red before: `stash-modified-at-destination=1` on the first landing).
+6. **Minor, fixed: v1 append recovery.** `RefIntentV1::resolve` takes an
+   append's old order from the new order's tail (messages included) when
+   the destination no longer names the old commits, so a destination one
+   store past `stash_at = None` is `stash_path(op)[1]` again and settles
+   forward, as v1 did. Test:
+   `a_stash_order_v1_append_intent_one_store_past_its_record_settles_forward`
+   (unit row on `resolve` plus a real settle; red before: old resolved to
+   `[a:""]`).
+7. **Minor, fixed: the four surviving mutants.** Tests added for M2
+   (`test_a_schedule_with_a_repeated_slot_is_refused`: `--at T T` and a
+   resealed non-increasing fixed doc), M5
+   (`test_drive_runs_a_slot_it_reaches_within_the_slack`), M6
+   (`test_a_slot_at_the_moment_it_was_made_is_not_in_advance`). M1's
+   suggested test ("an observation whose origin lies after slot 0 and no
+   pass for slot 0 is still evidence") contradicts finding 1's fix, which
+   refuses that observation; M1 is killed instead by asserting that such a
+   slot is `outside`, not `missing`.
+
+Mutation evidence (round): Python mutants on copies under
+`/dev/shm/q168-tmp/pymut2`, run against `ScheduleTests`,
+`ScheduleReviewTests` and `LiveBaselineReviewTests`; all 19 KILLED:
+
+| mutant | killed by |
+|---|---|
+| M1 slot before origin not outside | longer-schedule, before-origin tests |
+| M2 slots not checked increasing | `test_a_schedule_with_a_repeated_slot_is_refused` |
+| M5 drive skips any past slot | `test_drive_runs_a_slot_it_reaches_within_the_slack` |
+| M6 slot at creation accepted | `test_a_slot_at_the_moment_it_was_made_is_not_in_advance` |
+| N1 outside slots not refused | no-pass, longer-schedule, before-origin tests |
+| N2 skip written as a comment | `test_drive_refusals_and_a_slot_already_past_at_launch` |
+| N3 skipped slots not refused | same, and the skipped-slot test |
+| N4 late message per slot (dict) | duplicate-slot test |
+| N5 exit not read from the off line | failed-pass test, live drive record test |
+| N6 failed passes not refused | failed-pass test |
+| N7 drive host not compared | other-host test |
+| N8 deviation on the drive's wall clock | observer's-clock test |
+| N9 clock skew not refused | observer's-clock test |
+| N10 no drive record accepted | no-clock-or-drive test |
+| N11 untimed passes accepted | no-clock-or-drive test |
+| N12 drive marks no monotonic start | live drive record test |
+| N13 observe records no monotonic origin | `test_observe_records_its_schedule_at_its_start` |
+| N14 passes before the origin judged unscheduled | `test_a_pass_ending_just_before_the_observation_is_not_evidence` |
+| N15 no drive record written | live drive record test |
+
+Rust, in place and restored byte-identical (cmp): R10 carried messages
+not folded, KILLED by the P85 fold test; R11 a v1 append's old order not
+the new tail, KILLED by the v1 append settle test.
+
+EstateConverge: no model change (finding 5 maps each source entry to the
+one value the destination can hold, as the model's opaque values are;
+finding 6 is code-level recovery the settle rows assume); README section
+amended. No `.tla` or `.cfg` changed this round, so `tla-check` was not
+re-run; `tla-render --check` was.
+
+Validation (review round, sting, inside `nix develop`, target dir
+`cargo-target/q168`), after the last code edit:
+
+| step | result |
+|---|---|
+| `cargo fmt --all -- --check` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0 |
+| `cargo clippy -p bulkload-agent --all-targets --locked --features io-trace -- -D warnings` | exit 0 |
+| `cargo clippy --workspace --all-targets --locked --features bulkload-agent/fault-injection,bulkload-agent/io-trace -- -D warnings` | exit 0 |
+| `cargo test -p bulkload-agent --locked --no-fail-fast` | exit 0: lib 681 passed, 5 ignored; `estate_converge` 23; all binaries 853 passed, 0 failed |
+| `cargo test ... --features fault-injection,io-trace --test fault_harness` | 91 passed |
+| `cargo test ... --features fault-injection,io-trace --test power_loss` | 12 passed |
+| `python3 tests/test_ci_contract.py` | 24 tests OK |
+| `python3 -m unittest crates/bulkload-bench/scripts/test_s2_budget.py` | 140 tests OK; `ruff check` and `ruff format --check` clean |
+| `just tla-render --check` | all 220 committed files equal the catalogue's rendering |
+

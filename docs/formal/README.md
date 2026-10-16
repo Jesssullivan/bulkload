@@ -2751,6 +2751,39 @@ The other EstateConverge rows were not re-run: without `"race"` or
 `"stashrace"` in `SrcKinds`, `RacedMoves(i)` is the empty set exactly as
 before, so their state spaces are unchanged by construction.
 
+### OI-1003-Q169: a stash entry is its commit and its message (2026-10-15)
+
+Operator ruling OI-1003-Q169 (Linear TIN-4543, stash-order-v2): each stash
+entry's reflog message is part of its identity, in the capture key (the
+source's stash list is read as commit and message, `STASH_LIST_FORMAT`),
+in the ledger's stash row (`LandedStash` entries) and in the stash table
+(`stash_decision`, `stash_path`, `stash_apply` compare entries by both).
+The model needs no change: its stash values are opaque ids, one per entry,
+which is the identity the code now has (before Q169 the code's was coarser:
+two entries with one commit and different messages were one value). A
+message-only change at the source (an entry dropped and stored again under
+another message) is, in the model, a drop and a push of a new value, which
+every stash row already explores; `NoSourceWorkLost`,
+`NoLocalWorkLost` and `ConvergesWhenQuiet` read the stash as these values.
+No config or catalogue row changed. Rust rows:
+`p85_the_stash_list_is_the_sources_exactly_messages_and_order`
+(`tests/estate_converge.rs`), `a_stash_message_is_part_of_each_entrys_identity`,
+`a_stash_order_v1_row_is_upgraded_only_when_it_names_the_destination`,
+`stash_order_v1_records_decode_or_refuse_typed`,
+`a_stash_store_writes_each_entrys_own_message` (`native_refs/tests.rs`) and
+`a_stash_message_is_part_of_the_key_and_the_capture` (`git_carry.rs`).
+What the model does not see: the v1-to-v2 record upgrade (a v1 ledger row
+names entries by commit and is upgraded to the destination's entries the
+first time it names them), which the Rust rows check. Review round
+(2026-10-15), no model change either: a carried message is folded as Git
+folds a reflog message before it becomes a target (finding 5), which maps
+each source entry to the one value the destination can hold, as the model's
+opaque values already are (`p85_a_source_message_git_would_fold_lands_folded_and_later_pushes_land`);
+and a pending v1 append intent one store past its record resolves its old
+order to the new order's tail and settles forward (finding 6,
+`a_stash_order_v1_append_intent_one_store_past_its_record_settles_forward`),
+the code-level recovery the model's settle rows already assume.
+
 ### Findings (EstateConverge)
 
 Every finding below was a row that failed on the code on

@@ -300,6 +300,25 @@ fn stash(repo: &Path) -> Vec<String> {
         .collect()
 }
 
+/// `git stash list` as an operator reads it: `stash@{n}: <reflog message>`.
+fn stash_list(repo: &Path) -> String {
+    git(repo, &["stash", "list"])
+}
+
+/// Store an edit of `file` as a stash entry whose reflog message is
+/// `message`, not its commit's subject (`git stash store -m`), and leave
+/// the worktree and the index as they were. Returns the stash commit.
+fn store_stash(repo: &Path, file: &str, content: &[u8], message: &str) -> String {
+    let before = fs::read(repo.join(file)).unwrap();
+    fs::write(repo.join(file), content).unwrap();
+    let commit = git(repo, &["stash", "create", "a subject of its own"])
+        .trim()
+        .to_owned();
+    fs::write(repo.join(file), before).unwrap();
+    git(repo, &["stash", "store", "-m", message, &commit]);
+    commit
+}
+
 fn head(worktree: &Path) -> (String, String) {
     let symbolic = git_command(worktree)
         .args(["symbolic-ref", "-q", "HEAD"])
@@ -403,6 +422,131 @@ fn p80_a_first_landing_restores_native_refs_stash_and_heads() {
     assert!(dst
         .join(".git/worktrees/feat/bulkload/v1/neo/workspace.landed")
         .is_file());
+    assert_eq!(world.unaccounted(&plan, "corpus", "applied"), 0);
+}
+
+// P85 under OI-1003-Q169 (stash-order-v2): each stash entry's reflog
+// message is part of its identity, so `git stash list` on the destination
+// is the source's exactly, messages and order, after the first landing and
+// after converging pushes, a pop, a drop below the tip and an entry stored
+// under a message of its own; a message-only change at the source (the
+// same commits in the same order) is carried too. Before Q169 the messages
+// were the commits' subjects and a message-only change moved no key.
+#[test]
+fn p85_the_stash_list_is_the_sources_exactly_messages_and_order() {
+    let world = World::new();
+    let src = world.src();
+    store_stash(
+        &src,
+        "a.txt",
+        b"alpha, stored by hand\n",
+        "a message that is not the subject",
+    );
+    assert_eq!(stash_list(&src).lines().count(), 3);
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let dst = world.dst("dst");
+    assert_eq!(stash_list(&dst), stash_list(&src));
+    assert_eq!(stash(&dst), stash(&src));
+
+    // A day of stashing: two pushes, a pop, a drop below the tip, and an
+    // entry stored under its own message.
+    settle();
+    fs::write(src.join("a.txt"), b"alpha, third\n").unwrap();
+    git(&src, &["stash", "push", "--quiet", "-m", "third"]);
+    fs::write(src.join("dir/b.txt"), b"beta, fourth\n").unwrap();
+    git(&src, &["stash", "push", "--quiet", "-m", "fourth"]);
+    git(&src, &["stash", "pop", "--quiet"]);
+    git(&src, &["stash", "drop", "--quiet", "stash@{2}"]);
+    store_stash(
+        &src,
+        "exec.sh",
+        b"#!/bin/sh\necho fifth\n",
+        "fifth,   stored\tby hand  ",
+    );
+    settle();
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    assert_eq!(stash_list(&dst), stash_list(&src));
+    assert_eq!(stash(&dst), stash(&src));
+    assert_eq!(stash_list(&src).lines().count(), 4);
+
+    // A message-only change: the tip dropped and stored again under a new
+    // message. The commits and their order are unchanged.
+    settle();
+    let commits = |repo: &Path| -> Vec<String> {
+        stash(repo)
+            .iter()
+            .map(|line| line.split(' ').next().unwrap().to_owned())
+            .collect()
+    };
+    let before = commits(&src);
+    let tip = git(&src, &["rev-parse", "refs/stash"]).trim().to_owned();
+    git(&src, &["stash", "drop", "--quiet"]);
+    git(&src, &["stash", "store", "-m", "fifth, renamed", &tip]);
+    assert_eq!(commits(&src), before);
+    assert_ne!(stash_list(&dst), stash_list(&src));
+    settle();
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let reason = outcome_of(&rows, &src).2.clone().unwrap_or_default();
+    assert!(reason.contains("stash-rewritten"), "{rows:?}");
+    assert_eq!(stash_list(&dst), stash_list(&src));
+    assert_eq!(stash(&dst), stash(&src));
+    assert_eq!(world.unaccounted(&plan, "corpus", "applied"), 0);
+}
+
+// OI-1003-Q169 review finding 5: a source reflog message Git would fold
+// (written by a libgit2 tool, which folds no tabs or runs of spaces, or a
+// hand-edited `logs/refs/stash`) is stored folded at the destination,
+// since Git folds every message it writes. The carried entry is folded
+// before it becomes the op's target, so the op completes, the receipt says
+// so (`stash-message-folded`), and a later push at the source still lands.
+// Before the fix the store never read back equal to the unfolded target,
+// the row named a reflog the destination never held, and every later pass
+// kept the destination's stash (T6): the push never landed.
+#[test]
+fn p85_a_source_message_git_would_fold_lands_folded_and_later_pushes_land() {
+    let world = World::new();
+    let src = world.src();
+    let log = src.join(".git/logs/refs/stash");
+    let text = fs::read_to_string(&log).unwrap();
+    let edited = text.replace("\tOn main: second\n", "\tOn main: libgit2  style\ttab\n");
+    assert_ne!(edited, text);
+    fs::write(&log, edited).unwrap();
+    assert!(stash_list(&src).contains("libgit2  style\ttab"));
+    let folded = |list: String| list.replace("libgit2  style\ttab", "libgit2 style tab");
+    let plan = world.plan("dst", false);
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let dst = world.dst("dst");
+    let reason = outcome_of(&rows, &src).2.clone().unwrap_or_default();
+    assert!(reason.contains("stash-message-folded=1"), "{rows:?}");
+    assert!(
+        !reason.contains("stash-modified-at-destination"),
+        "{rows:?}"
+    );
+    assert_eq!(stash_list(&dst), folded(stash_list(&src)));
+
+    settle();
+    fs::write(src.join("a.txt"), b"alpha, third\n").unwrap();
+    git(&src, &["stash", "push", "--quiet", "-m", "third"]);
+    settle();
+    world.capture(&plan, "corpus");
+    let (ok, rows) = world.apply(&plan, "corpus", "applied");
+    assert!(ok, "{rows:?}");
+    let reason = outcome_of(&rows, &src).2.clone().unwrap_or_default();
+    assert!(
+        !reason.contains("stash-modified-at-destination"),
+        "{rows:?}"
+    );
+    assert_eq!(stash_list(&dst), folded(stash_list(&src)));
+    assert_eq!(stash_list(&dst).lines().count(), 3);
     assert_eq!(world.unaccounted(&plan, "corpus", "applied"), 0);
 }
 

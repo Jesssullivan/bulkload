@@ -479,54 +479,333 @@ fn p84_a_create_above_or_below_a_ref_that_stays_is_kept_back() {
     );
 }
 
+/// A stash entry of `value` whose message is `On main: <first char>`.
+fn entry(value: &str) -> StashEntry {
+    StashEntry::new(value, format!("On main: {}", &value[..1]))
+}
+
+fn entries(values: &[&String]) -> Vec<StashEntry> {
+    values.iter().map(|value| entry(value)).collect()
+}
+
 #[test]
 fn the_stash_table() {
     let (a, b, c) = (oid('a'), oid('b'), oid('c'));
-    let carried = |values: &[&String]| -> Vec<(String, String)> {
-        values
-            .iter()
-            .map(|value| ((*value).clone(), format!("On main: {value}")))
-            .collect()
-    };
-    let landed = |order: &[&String], t| LandedStash {
-        order: order.iter().map(|value| (*value).clone()).collect(),
-        observed_ns: t,
-    };
+    let carried = entries;
+    let landed = |order: &[&String], t| LandedStash::of(entries(order), t);
     // T1: restored into an empty destination.
     let (op, word) = stash_decision(&[], None, &carried(&[&b, &a]), 5);
     assert_eq!(word, Some("stash-restored"));
-    assert_eq!(op.unwrap().new, vec![b.clone(), a.clone()]);
+    assert_eq!(op.unwrap().new, entries(&[&b, &a]));
     // T2: the destination's own stash is kept.
     assert_eq!(
-        stash_decision(std::slice::from_ref(&c), None, &carried(&[&a]), 5),
+        stash_decision(&entries(&[&c]), None, &carried(&[&a]), 5),
         (None, Some("stash-kept-destination"))
     );
     let s0 = landed(&[&a], 5);
     // T3: nothing moved.
     assert_eq!(
-        stash_decision(std::slice::from_ref(&a), Some(&s0), &carried(&[&a]), 9),
+        stash_decision(&entries(&[&a]), Some(&s0), &carried(&[&a]), 9),
         (None, None)
     );
     // T4: pushed at the source.
-    let (op, word) = stash_decision(std::slice::from_ref(&a), Some(&s0), &carried(&[&b, &a]), 9);
+    let (op, word) = stash_decision(&entries(&[&a]), Some(&s0), &carried(&[&b, &a]), 9);
     assert_eq!(word, Some("stash-appended"));
-    assert_eq!(op.unwrap().old, vec![a.clone()]);
+    assert_eq!(op.unwrap().old, entries(&[&a]));
     // T5: dropped or rewritten at the source.
     assert_eq!(
-        stash_decision(std::slice::from_ref(&a), Some(&s0), &carried(&[&b]), 9).1,
+        stash_decision(&entries(&[&a]), Some(&s0), &carried(&[&b]), 9).1,
         Some("stash-rewritten")
     );
     // T6: changed at the destination: kept.
     assert_eq!(
-        stash_decision(&[c, a.clone()], Some(&s0), &carried(&[&b, &a]), 9),
+        stash_decision(&entries(&[&c, &a]), Some(&s0), &carried(&[&b, &a]), 9),
         (None, Some("stash-modified-at-destination"))
     );
     // Finding 4: an older capture never regresses a newer stash.
     let newer = landed(&[&b, &a], 9);
     assert_eq!(
-        stash_decision(&[b, a.clone()], Some(&newer), &carried(&[&a]), 5),
+        stash_decision(&entries(&[&b, &a]), Some(&newer), &carried(&[&a]), 5),
         (None, Some("stash-stale"))
     );
+}
+
+/// OI-1003-Q169 (stash-order-v2): the reflog message is part of each
+/// entry's identity in every row of the table. The same commits in the same
+/// order under another message are a rewrite when the source changed it
+/// (T5, never T3 or T4) and the destination's own when the destination did
+/// (T6). Mutation `stash_identity_commit_only` (rows compared by commit)
+/// turns the first into T3 and the second into a rewrite.
+#[test]
+fn a_stash_message_is_part_of_each_entrys_identity() {
+    let (a, b) = (oid('a'), oid('b'));
+    let s0 = LandedStash::of(entries(&[&b, &a]), 5);
+    let renamed = vec![
+        StashEntry::new(b.clone(), "renamed at the source"),
+        entry(&a),
+    ];
+    // The source renamed its tip: rewrite, the new messages carried.
+    let (op, word) = stash_decision(&entries(&[&b, &a]), Some(&s0), &renamed, 9);
+    assert_eq!(word, Some("stash-rewritten"));
+    let op = op.unwrap();
+    assert_eq!(op.new, renamed);
+    assert_eq!(
+        stash_path(&op),
+        vec![
+            entries(&[&b, &a]),
+            Vec::new(),
+            vec![entry(&a)],
+            renamed.clone()
+        ]
+    );
+    // A rename below an append is no append either.
+    let pushed = vec![
+        entry(&oid('c')),
+        StashEntry::new(b.clone(), "renamed"),
+        entry(&a),
+    ];
+    assert_eq!(
+        stash_decision(&entries(&[&b, &a]), Some(&s0), &pushed, 9).1,
+        Some("stash-rewritten")
+    );
+    // The destination renamed it: kept, whatever the source carries.
+    let local = vec![StashEntry::new(b.clone(), "renamed here"), entry(&a)];
+    assert_eq!(
+        stash_decision(&local, Some(&s0), &entries(&[&b, &a]), 9),
+        (None, Some("stash-modified-at-destination"))
+    );
+    // An empty message is a message like any other.
+    let empty = vec![StashEntry::new(b.clone(), ""), entry(&a)];
+    assert_eq!(
+        stash_decision(&entries(&[&b, &a]), Some(&s0), &empty, 9).1,
+        Some("stash-rewritten")
+    );
+}
+
+/// OI-1003-Q169: a ledger row recorded before stash-order-v2 names entries
+/// by commit. It decodes as such ([`StashIdentity::Commit`]), names the
+/// destination's stash by commit alone, and is upgraded to that stash,
+/// messages included, only when it names it; a v1 row that does not name
+/// it stays v1 and the destination's stash is kept (T6).
+#[test]
+fn a_stash_order_v1_row_is_upgraded_only_when_it_names_the_destination() {
+    use super::super::landed::StashIdentity;
+    let (a, b) = (oid('a'), oid('b'));
+    let v1 = LandedStash {
+        order: vec![
+            StashEntry::new(b.clone(), ""),
+            StashEntry::new(a.clone(), ""),
+        ],
+        observed_ns: 5,
+        identity: StashIdentity::Commit,
+    };
+    let dst = vec![StashEntry::new(b.clone(), "WIP on main: b"), entry(&a)];
+    assert!(v1.names(&dst));
+    let upgraded = v1.upgraded(&dst);
+    assert_eq!(upgraded, LandedStash::of(dst.clone(), 5));
+    // Once upgraded, the source's own messages decide: a message the v1
+    // landing stored as the subject is rewritten once.
+    let source = vec![StashEntry::new(b, "stored by hand"), entry(&a)];
+    assert_eq!(
+        stash_decision(&dst, Some(&upgraded), &source, 9).1,
+        Some("stash-rewritten")
+    );
+    assert_eq!(stash_decision(&dst, Some(&upgraded), &dst, 9), (None, None));
+    // A v1 row the destination moved away from stays v1, and is T6.
+    let moved = vec![entry(&a)];
+    assert!(!v1.names(&moved));
+    assert_eq!(v1.upgraded(&moved), v1);
+    assert_eq!(
+        stash_decision(&moved, Some(&v1), &dst, 9),
+        (None, Some("stash-modified-at-destination"))
+    );
+}
+
+/// OI-1003-Q169: ledgers and intents written before stash-order-v2 still
+/// decode, through their own layout, never misread as the new one; the new
+/// layout carries its own prefix; anything else refuses typed.
+#[test]
+fn stash_order_v1_records_decode_or_refuse_typed() {
+    use super::super::landed::{
+        self as landed, LandedStashV1, RefIntentV1, RefLedgerV1, StashIdentity, StashOpV1,
+    };
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join(landed::REFS_LANDED);
+    let (a, b, c) = (oid('a'), oid('b'), oid('c'));
+    let v1_bytes = |value: &dyn erased::Encode| {
+        let mut bytes = b"bulkload-land-v1".to_vec();
+        bytes.extend(value.encode());
+        bytes
+    };
+    let v1 = RefLedgerV1 {
+        created: true,
+        refs: [("refs/heads/main".to_owned(), live(&a, 3))].into(),
+        stash: Some(LandedStashV1 {
+            order: vec![b.clone(), a.clone()],
+            observed_ns: 4,
+        }),
+        exclude: Some(super::super::landed::LandedExclude {
+            digest: [7; 32],
+            observed_ns: 4,
+        }),
+    };
+    std::fs::write(&path, v1_bytes(&v1)).unwrap();
+    let ledger = landed::read::<RefLedger>(&path).unwrap().unwrap();
+    assert!(ledger.created);
+    assert_eq!(ledger.refs, v1.refs);
+    assert_eq!(ledger.exclude, v1.exclude);
+    let row = ledger.stash.clone().unwrap();
+    assert_eq!(row.identity, StashIdentity::Commit);
+    assert_eq!(
+        row.order
+            .iter()
+            .map(|entry| entry.oid.clone())
+            .collect::<Vec<_>>(),
+        vec![b.clone(), a.clone()]
+    );
+    // Written again it is v2, and reads back equal.
+    landed::write(&path, &ledger).unwrap();
+    assert!(std::fs::read(&path)
+        .unwrap()
+        .starts_with(b"bulkload-refs-v2"));
+    assert_eq!(landed::read::<RefLedger>(&path).unwrap(), Some(ledger));
+    // A v2 body under the v1 prefix, or a v1 body under the v2 prefix, is
+    // never read as the other layout: it refuses typed.
+    let current = landed::encode(&RefLedger {
+        stash: Some(LandedStash::of(entries(&[&b]), 4)),
+        ..RefLedger::default()
+    })
+    .unwrap();
+    let mut swapped = b"bulkload-land-v1".to_vec();
+    swapped.extend(current.get(16..).unwrap());
+    std::fs::write(&path, &swapped).unwrap();
+    assert_eq!(
+        landed::read::<RefLedger>(&path).unwrap_err(),
+        BulkloadRefusal::FrameCodec
+    );
+    let mut swapped = b"bulkload-refs-v2".to_vec();
+    swapped.extend(v1_bytes(&v1).get(16..).unwrap());
+    std::fs::write(&path, &swapped).unwrap();
+    assert_eq!(
+        landed::read::<RefLedger>(&path).unwrap_err(),
+        BulkloadRefusal::FrameCodec
+    );
+    std::fs::write(&path, b"bulkload-refs-v3rest").unwrap();
+    assert_eq!(
+        landed::read::<RefLedger>(&path).unwrap_err(),
+        BulkloadRefusal::FrameCodec
+    );
+
+    // A v1 intent: read as pending v1, resolved against the destination.
+    let intent_path = directory.path().join(landed::REFS_INTENT);
+    let v1_intent = RefIntentV1 {
+        ops: Vec::new(),
+        stash: Some(StashOpV1 {
+            old: vec![a.clone()],
+            new: vec![c.clone(), b.clone(), a.clone()],
+            messages: vec![
+                "On main:  c  ".to_owned(),
+                String::new(),
+                "On main: a".to_owned(),
+            ],
+            observed_ns: 6,
+        }),
+        ledger: RefLedgerV1 {
+            stash: Some(LandedStashV1 {
+                order: vec![c.clone(), b.clone(), a.clone()],
+                observed_ns: 6,
+            }),
+            ..RefLedgerV1::default()
+        },
+        stash_at: Some(vec![b.clone(), a.clone()]),
+    };
+    std::fs::write(&intent_path, v1_bytes(&v1_intent)).unwrap();
+    // The plain read refuses it: a v1 intent is settled only resolved.
+    assert_eq!(
+        landed::read::<RefIntent>(&intent_path).unwrap_err(),
+        BulkloadRefusal::FrameCodec
+    );
+    let Some(PendingRefIntent::V1(pending)) = landed::read_ref_intent(&intent_path).unwrap() else {
+        panic!("a v1 intent reads as pending v1");
+    };
+    assert_eq!(pending, v1_intent);
+    let dst = vec![StashEntry::new(a.clone(), "On main: a")];
+    let resolved = pending.clone().resolve(&dst).unwrap();
+    let op = resolved.stash.clone().unwrap();
+    // The new order's messages are what a v1 store wrote: folded, and
+    // `bulkload stash` for an empty one; the old order is the destination's.
+    let new = vec![
+        StashEntry::new(c.clone(), "On main: c"),
+        StashEntry::new(b, "bulkload stash"),
+        StashEntry::new(a, "On main: a"),
+    ];
+    assert_eq!(op.new, new);
+    assert_eq!(op.old, dst);
+    assert_eq!(resolved.stash_at, Some(new.get(1..).unwrap().to_vec()));
+    assert_eq!(resolved.ledger.stash, Some(LandedStash::of(new, 6)));
+    // A progress state no v1 path holds refuses typed, never a guess.
+    let mut torn = pending.clone();
+    torn.stash_at = Some(vec![c]);
+    assert_eq!(torn.resolve(&dst).unwrap_err(), BulkloadRefusal::FrameCodec);
+    let mut unpaired = pending;
+    unpaired.stash.as_mut().unwrap().messages.pop();
+    assert_eq!(
+        unpaired.resolve(&dst).unwrap_err(),
+        BulkloadRefusal::FrameCodec
+    );
+}
+
+/// A v1 record's body, for the decode test: postcard as the v1 code wrote it.
+mod erased {
+    pub trait Encode {
+        fn encode(&self) -> Vec<u8>;
+    }
+    impl<T: serde::Serialize> Encode for T {
+        fn encode(&self) -> Vec<u8> {
+            postcard::to_allocvec(self).unwrap()
+        }
+    }
+}
+
+/// OI-1003-Q169: a stash list reads strictly; Git's reflog message folding
+/// is mirrored for the subjects a v1 capture carries.
+#[test]
+fn a_stash_list_parses_strictly_and_messages_fold_as_git_folds_them() {
+    use super::super::landed::{parse_stash_list, reflog_message};
+    let (a, b) = (oid('a'), oid('b'));
+    let bytes = format!("{b}\0stash@ one: x\n{a}\0\n");
+    assert_eq!(
+        parse_stash_list(bytes.as_bytes()).unwrap(),
+        vec![
+            StashEntry::new(b, "stash@ one: x"),
+            StashEntry::new(a.clone(), "")
+        ]
+    );
+    let mut raw = format!("{a}\0caf").into_bytes();
+    raw.extend([0xe9, b'\n']);
+    assert_eq!(
+        parse_stash_list(&raw).unwrap(),
+        vec![StashEntry::new(a.clone(), b"caf\xe9".to_vec())]
+    );
+    assert_eq!(parse_stash_list(b"").unwrap(), Vec::new());
+    for bad in [
+        format!("{a}\n"),
+        format!("{}\0x\n", &a[..39]),
+        format!("{a}\0x\0y\n"),
+        "zz\0x\n".to_owned(),
+    ] {
+        assert_eq!(
+            parse_stash_list(bad.as_bytes()).unwrap_err(),
+            BulkloadRefusal::GitInventoryMalformed,
+            "{bad:?}"
+        );
+    }
+    assert_eq!(
+        reflog_message(b"  two   spaces\ttab\nnewline \r "),
+        b"two spaces tab newline"
+    );
+    assert_eq!(reflog_message(b"\x0bkept\x0c"), b"\x0bkept\x0c");
+    assert_eq!(reflog_message(b"   "), b"");
 }
 
 // ---- the ref step against a real repository (the convergence lane's fixes,
@@ -606,7 +885,7 @@ impl Repo {
     }
 
     /// A pending ref intent of `ops` (and `stash`), as a crash leaves it.
-    fn intent(&self, ops: Vec<RefOp>, stash: Option<StashOp>, stash_at: Option<Vec<String>>) {
+    fn intent(&self, ops: Vec<RefOp>, stash: Option<StashOp>, stash_at: Option<Vec<StashEntry>>) {
         let ledger = RefLedger {
             created: true,
             ..RefLedger::default()
@@ -774,20 +1053,19 @@ fn a_settle_removes_a_killed_childs_lock_and_keeps_anyone_elses() {
     // A killed stash store: refs/stash.lock holding the entry it stored.
     std::fs::write(repo.path.join("f"), b"stashed\n").unwrap();
     run(&repo.path, &["stash", "push", "--quiet", "-m", "s"]);
-    let entry = repo.value("refs/stash").unwrap();
+    let entry = StashEntry::new(repo.value("refs/stash").unwrap(), "On main: s");
     run(&repo.path, &["stash", "drop", "--quiet"]);
     repo.intent(
         Vec::new(),
         Some(StashOp {
             old: Vec::new(),
             new: vec![entry.clone()],
-            messages: vec!["On main: s".to_owned()],
             observed_ns: 2,
         }),
         None,
     );
     let stash_lock = repo.path.join(".git/refs/stash.lock");
-    std::fs::write(&stash_lock, format!("{entry}\n")).unwrap();
+    std::fs::write(&stash_lock, format!("{}\n", entry.oid)).unwrap();
     let custody = settle(&repo.path, &repo.ledgers).unwrap();
     assert!(!stash_lock.exists());
     assert_eq!(stash_reflog(&repo.path).unwrap(), vec![entry]);
@@ -807,7 +1085,13 @@ fn a_stash_settle_never_undoes_an_operators_drop() {
     for message in ["one", "two"] {
         std::fs::write(repo.path.join("f"), message).unwrap();
         run(&repo.path, &["stash", "push", "--quiet", "-m", message]);
-        entries.insert(0, repo.value("refs/stash").unwrap());
+        entries.insert(
+            0,
+            StashEntry::new(
+                repo.value("refs/stash").unwrap(),
+                format!("On main: {message}"),
+            ),
+        );
     }
     // The destination holds [one]; the capture appends two: [two, one].
     run(&repo.path, &["stash", "drop", "--quiet", "stash@{0}"]);
@@ -815,7 +1099,6 @@ fn a_stash_settle_never_undoes_an_operators_drop() {
     let stash = StashOp {
         old: vec![one.clone()],
         new: vec![two.clone(), one.clone()],
-        messages: vec!["On main: two".to_owned(), "On main: one".to_owned()],
         observed_ns: 2,
     };
     assert_eq!(
@@ -826,7 +1109,7 @@ fn a_stash_settle_never_undoes_an_operators_drop() {
     // The operator drops `one` after the crash: the reflog is empty.
     run(&repo.path, &["stash", "drop", "--quiet"]);
     let custody = settle(&repo.path, &repo.ledgers).unwrap();
-    assert_eq!(stash_reflog(&repo.path).unwrap(), Vec::<String>::new());
+    assert_eq!(stash_reflog(&repo.path).unwrap(), Vec::<StashEntry>::new());
     assert_eq!(custody.0.get("stash-modified-at-destination"), Some(&1));
     // The row names what bulkload last landed, so the next capture's
     // decision keeps the operator's empty stash too (with no row, an empty
@@ -841,10 +1124,7 @@ fn a_stash_settle_never_undoes_an_operators_drop() {
         row.as_ref().map(|row| row.order.clone()),
         Some(vec![one.clone()])
     );
-    let carried = [
-        (two.clone(), "On main: two".to_owned()),
-        (one.clone(), "On main: one".to_owned()),
-    ];
+    let carried = [two.clone(), one.clone()];
     assert_eq!(
         stash_decision(&[], row.as_ref(), &carried, 3),
         (None, Some("stash-modified-at-destination"))
@@ -854,12 +1134,19 @@ fn a_stash_settle_never_undoes_an_operators_drop() {
     let rewrite = StashOp {
         old: Vec::new(),
         new: vec![two.clone(), one.clone()],
-        messages: vec!["On main: two".to_owned(), "On main: one".to_owned()],
         observed_ns: 2,
     };
+    // The store bulkload made, with its entry's message (stash-order-v2).
     run(
         &repo.path,
-        &["update-ref", "--create-reflog", "refs/stash", &one],
+        &[
+            "update-ref",
+            "--create-reflog",
+            "-m",
+            "On main: one",
+            "refs/stash",
+            &one.oid,
+        ],
     );
     repo.intent(Vec::new(), Some(rewrite.clone()), None);
     let custody = settle(&repo.path, &repo.ledgers).unwrap();
@@ -874,6 +1161,225 @@ fn a_stash_settle_never_undoes_an_operators_drop() {
     repo.intent(Vec::new(), Some(rewrite), Some(vec![one.clone()]));
     settle(&repo.path, &repo.ledgers).unwrap();
     assert_eq!(stash_reflog(&repo.path).unwrap(), vec![two, one]);
+}
+
+/// OI-1003-Q169: a stash rebuild stores each entry under its own reflog
+/// message, byte for byte (an empty one, one that is not UTF-8, one with
+/// characters Git does not fold), and the destination reads back exactly
+/// the new order, so the op ends at `new` and nothing reads as the
+/// destination's edit. Before Q169 every store wrote the subject, and an
+/// empty one `bulkload stash`.
+#[test]
+fn a_stash_store_writes_each_entrys_own_message() {
+    let repo = Repo::new();
+    let mut commits = Vec::new();
+    for content in ["x", "y", "z"] {
+        std::fs::write(repo.path.join("f"), content).unwrap();
+        commits.push(run(&repo.path, &["stash", "create"]));
+    }
+    run(&repo.path, &["checkout", "--quiet", "--", "f"]);
+    let new = vec![
+        StashEntry::new(commits[2].clone(), b"caf\xe9, not UTF-8".to_vec()),
+        StashEntry::new(commits[1].clone(), ""),
+        StashEntry::new(commits[0].clone(), "On main: \x0bkept\x0c"),
+    ];
+    let op = StashOp {
+        old: Vec::new(),
+        new: new.clone(),
+        observed_ns: 2,
+    };
+    let mut reached = Vec::new();
+    let done = stash_apply(&repo.path, &op, None, &mut |at| {
+        reached.push(at.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    assert!(done);
+    assert_eq!(stash_reflog(&repo.path).unwrap(), new);
+    assert_eq!(reached.last(), Some(&new));
+    // Git's own view of the UTF-8 entries agrees.
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo.path)
+        .args(["stash", "list"])
+        .output()
+        .unwrap()
+        .stdout;
+    assert!(listed.ends_with(b"stash@{1}: \nstash@{2}: On main: \x0bkept\x0c\n"));
+}
+
+/// `git` in `repo` with `stdin`, its trimmed stdout.
+fn piped(repo: &Path, args: &[&str], stdin: &[u8]) -> String {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "git {args:?}");
+    String::from_utf8(out.stdout).unwrap().trim_end().to_owned()
+}
+
+/// OI-1003-Q169: a capture taken before stash-order-v2 carries only
+/// `stash-order-v1` (commits). Its stash still applies, in its order, each
+/// message its commit's subject folded as Git folds a reflog message, so
+/// the stored stash reads back as carried and the op completes
+/// (`stash-messages-inferred`). Unfolded, Git's folding of the stored
+/// message read back as the destination's edit.
+#[test]
+fn a_stash_order_v1_capture_applies_with_folded_subjects() {
+    let repo = Repo::new();
+    let prefix = "refs/carry/v1/neo/i1";
+    let tree = run(&repo.path, &["rev-parse", "HEAD:"]);
+    let mut commits = Vec::new();
+    for subject in ["WIP  on main:\tone  ", "On main: two"] {
+        let commit = piped(
+            &repo.path,
+            &[
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@l",
+                "commit-tree",
+                &tree,
+            ],
+            format!("{subject}\n").as_bytes(),
+        );
+        run(
+            &repo.path,
+            &["update-ref", &format!("{prefix}/stashes/{commit}"), &commit],
+        );
+        commits.push(commit);
+    }
+    // stash-order-v1: newest first, commits only.
+    let order = format!("{}\n{}", commits[1], commits[0]);
+    let blob = piped(
+        &repo.path,
+        &["hash-object", "-w", "--stdin"],
+        order.as_bytes(),
+    );
+    let value = piped(
+        &repo.path,
+        &["mktree"],
+        format!("100644 blob {blob}\tvalue\n").as_bytes(),
+    );
+    let metadata = piped(
+        &repo.path,
+        &[
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@l",
+            "commit-tree",
+            &value,
+        ],
+        b"stash-order-v1\n",
+    );
+    run(
+        &repo.path,
+        &["update-ref", &format!("{prefix}/stash-order-v1"), &metadata],
+    );
+    let (carried, provenance) = carried_stash(&repo.path, "neo", "i1").unwrap();
+    assert_eq!(provenance, StashProvenance::MessagesInferred);
+    assert_eq!(
+        carried,
+        vec![
+            StashEntry::new(commits[1].clone(), "On main: two"),
+            StashEntry::new(commits[0].clone(), "WIP on main: one"),
+        ]
+    );
+    let (op, word) = stash_decision(&[], None, &carried, 3);
+    assert_eq!(word, Some("stash-restored"));
+    let op = op.unwrap();
+    assert!(stash_apply(&repo.path, &op, None, &mut |_| Ok(())).unwrap());
+    assert_eq!(stash_reflog(&repo.path).unwrap(), carried);
+}
+
+/// OI-1003-Q169 review finding 6: a stash-order-v1 append intent whose
+/// step crashed after storing an entry on top of the old order and before
+/// recording it (`stash_at` none, the destination one store past) is
+/// settled forward, as the v1 code settled it. Its old order is the new
+/// order's tail, messages included: resolved with empty messages, the op
+/// read as a rewrite, no path state named the destination, the carried
+/// entry above never landed and the row never named the stash again.
+#[test]
+fn a_stash_order_v1_append_intent_one_store_past_its_record_settles_forward() {
+    use super::super::landed::{
+        self as landed, LandedStashV1, RefIntentV1, RefLedgerV1, StashOpV1,
+    };
+    let repo = Repo::new();
+    let mut commits = Vec::new();
+    for content in ["x", "y", "z"] {
+        std::fs::write(repo.path.join("f"), content).unwrap();
+        commits.push(run(&repo.path, &["stash", "create"]));
+    }
+    run(&repo.path, &["checkout", "--quiet", "--", "f"]);
+    let (a, b, c) = (commits[0].clone(), commits[1].clone(), commits[2].clone());
+    // The destination held [a]; the v1 step stored b on top, then crashed.
+    for (commit, message) in [(&a, "On main: a"), (&b, "On main: b")] {
+        run(
+            &repo.path,
+            &[
+                "update-ref",
+                "--create-reflog",
+                "-m",
+                message,
+                "refs/stash",
+                commit,
+            ],
+        );
+    }
+    let v1_intent = RefIntentV1 {
+        ops: Vec::new(),
+        stash: Some(StashOpV1 {
+            old: vec![a.clone()],
+            new: vec![c.clone(), b.clone(), a.clone()],
+            messages: vec![
+                "On main: c".to_owned(),
+                "On main: b".to_owned(),
+                "On main: a".to_owned(),
+            ],
+            observed_ns: 6,
+        }),
+        ledger: RefLedgerV1 {
+            stash: Some(LandedStashV1 {
+                order: vec![c.clone(), b.clone(), a.clone()],
+                observed_ns: 6,
+            }),
+            ..RefLedgerV1::default()
+        },
+        stash_at: None,
+    };
+    let new = vec![
+        StashEntry::new(c, "On main: c"),
+        StashEntry::new(b, "On main: b"),
+        StashEntry::new(a, "On main: a"),
+    ];
+    // The unit row: the old order resolves to the new order's tail.
+    let dst = stash_reflog(&repo.path).unwrap();
+    let resolved = v1_intent.clone().resolve(&dst).unwrap();
+    let op = resolved.stash.unwrap();
+    assert_eq!(op.old, new.get(2..).unwrap().to_vec());
+    assert_eq!(stash_path(&op).get(1), Some(&dst));
+    // And the settle, end to end.
+    let mut bytes = b"bulkload-land-v1".to_vec();
+    bytes.extend(postcard::to_allocvec(&v1_intent).unwrap());
+    std::fs::write(repo.ledgers.join(landed::REFS_INTENT), bytes).unwrap();
+    let custody = settle(&repo.path, &repo.ledgers).unwrap();
+    assert_eq!(stash_reflog(&repo.path).unwrap(), new);
+    assert_eq!(custody.0.get("stash-modified-at-destination"), None);
+    let row = landed::read::<RefLedger>(&repo.ledgers.join(landed::REFS_LANDED))
+        .unwrap()
+        .unwrap()
+        .stash;
+    assert_eq!(row, Some(LandedStash::of(new, 6)));
 }
 
 /// Review 3 finding 7 (mutation `refs_unsynced`): the directories a ref

@@ -194,6 +194,32 @@ began (passes before it are recorded, never dropped silently). The pair
 rule removes linear drift only: host load that rises and falls with the
 passes themselves (an agent quiet while bulkload runs) is not separable,
 and the instrument never lists processes to separate it (R-N11, R-N104).
+Pass schedule (OI-1003-Q168): during an S2-measured run the passes start
+at times fixed (or seeded-random) and recorded in advance, never chosen by
+the host's load, so their placement cannot follow the source's own
+activity. `schedule` records one: fixed slot times (--at), or --passes
+slots --every seconds apart from --first, each moved by a uniform offset
+under --jitter drawn from --seed, which re-derives from the recorded
+parameters alone; a digest seals it, and every slot must lie after the
+moment it was made. `observe --schedule` records it in the observation at
+its start. `drive --schedule F --intervals MARKS -- COMMAND...` starts the
+passes (any command: a converge pass, or a script of several): slot k's
+pass starts at its time, is marked `on`/`off` with `slot=k
+schedule=DIGEST` (`mono=` its monotonic start, `exit=` its status), and is
+waited for until it exits (never ended early, R-N11); one still running at
+the next slot's time makes that pass late, and a slot already past when
+the drive began is recorded by a `skip` record, never run late. Its first
+record (`drive TIME host=H mono=M schedule=D`) names its host and clock:
+`drive` runs on the observed host. Placeholders {slot} and {scheduled}.
+`alongside --evidence` then also needs the observation's schedule valid
+and made before it began, the whole schedule inside the observation (no
+slot before its origin or within SCHEDULE_SLACK_S of its end), every pass
+on a slot of it, no slot with two passes, none skipped, every slot with a
+pass, every pass exited 0, the passes driven on the observed host, and
+every pass started within SCHEDULE_SLACK_S (5 s) of its slot on the
+observed host's monotonic clock, its wall-clock marks within
+CLOCK_SLACK_S of that clock; the deviations are reported
+(`verdict.schedule`, the summary, an `evidence.tsv` `schedule` row).
 
 Output: OUT/trace.json (config, host, every sample, windows, verdict),
 OUT/summary.md, and OUT/on-runs/ (a log and a run_dir per ON run). The work
@@ -203,7 +229,11 @@ directory is removed at the end unless --keep-workdir.
   run --source SRC --out OUT --aa [options]
   analyze TRACE.json [gate options]   re-derive the verdict from a trace
   observe --source SRC --out OUT [--stop-file F] [--max-seconds N]
-                                      sample alongside a real run (#165)
+          [--schedule F]              sample alongside a real run (#165)
+  schedule --out F (--at T... | --first T|+S --every S --passes N
+           [--jitter S --seed N])     record a pass schedule (OI-1003-Q168)
+  drive --schedule F --intervals FILE [--stop-file F] [--log-dir D]
+        -- COMMAND...                 start the passes on their schedule
   mark FILE on|off [--label L]        append a run-interval mark
   alongside OBSERVE_DIR --intervals FILE [--evidence] [gate options]
                                       the verdict of an observation
@@ -219,6 +249,7 @@ from __future__ import annotations
 import argparse
 import bisect
 import datetime as dt
+import hashlib
 import itertools
 import json
 import math
@@ -740,6 +771,9 @@ def alongside_problems(config: dict, gate: dict) -> list[str]:
                 f"(OI-1003-Q160): a recorded pass ended {-end:.0f} s before the "
                 f"observation began (under {clear:.0f} s)"
             )
+    # OI-1003-Q168: pass placement must come from the schedule recorded in
+    # advance, so it cannot follow the source's own activity.
+    out += schedule_problems(config.get("schedule"))
     return out + pinned_gate_problems(gate)
 
 
@@ -1691,6 +1725,7 @@ def analyze(trace: dict, overrides: dict | None = None) -> dict:
         "evidence_problems": evidence_problems,
         "live_baseline": baseline,
         "dropped_on": dropped_on,
+        "schedule": config.get("schedule") if alongside else None,
         "reasons": reasons,
         "raw_comparison": raw,
         "gate": gate,
@@ -2172,7 +2207,8 @@ def render_summary(trace: dict, verdict: dict) -> str:
             f"{passes_dropped(verdict.get('dropped_on'))} dropped with them, "
             "never compared; "
             f"{len(config.get('pre_origin_intervals') or [])} pass(es) ended "
-            "before the observation began; nothing was started"
+            "before the observation began; nothing was started\n"
+            + schedule_summary(config.get("schedule"))
             if config.get("alongside")
             else f"- ON command: `{' '.join(config['on_command']) or '(none, A/A)'}` at "
             f"priority `{config['priority']}`, repeat={config['repeat']}"
@@ -2263,6 +2299,33 @@ def render_summary(trace: dict, verdict: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def schedule_summary(report: dict | None) -> str:
+    """The summary line of how the passes followed their schedule."""
+    if report is None:
+        return (
+            "- Schedule (OI-1003-Q168): none recorded; pass placement is not "
+            "known to be independent of the host's load"
+        )
+    deviation = report["max_deviation_s"]
+    skew = report.get("max_clock_skew_s")
+    span = report.get("span_s") or 0.0
+    return (
+        f"- Schedule (OI-1003-Q168): {report['kind']} `{report['digest'][:12]}`, "
+        f"{report['slots']} slot(s); {len(report['passes'])} pass(es) on a slot, "
+        f"largest start deviation on the observer's clock "
+        f"{'n/a' if deviation is None else f'{deviation:.1f} s'} (bound "
+        f"{report['slack_s']:.0f} s), largest drive clock skew "
+        f"{'n/a' if skew is None else f'{skew:.1f} s'}; off their slot "
+        f"{report['late'] or 'none'}; slots outside the observation [0, "
+        f"{span:.0f} s] {report.get('outside') or 'none'}; slots with no pass "
+        f"{report['missing'] or 'none'}; skipped by the drive "
+        f"{report.get('skipped') or 'none'}; failed {report.get('failed') or 'none'}; "
+        f"passes on no slot {len(report['unscheduled'])}; driven on "
+        f"{', '.join(report.get('drive_hosts') or []) or 'no drive record'} "
+        f"(observed {report.get('observed_host')}); defects {len(report['defects'])}"
+    )
+
+
 def passes_dropped(dropped: dict | None) -> str:
     """`N pass(es) (S s)` of pass time dropped as short ON windows."""
     if not dropped:
@@ -2302,6 +2365,19 @@ def emit(verdict: dict) -> None:
         f"runs_reported={wal_created['runs_reported']} "
         f"runs_unreported={wal_created['runs_unreported']}"
     )
+    report = verdict.get("schedule")
+    if report is not None:
+        say(
+            f"schedule digest={report['digest'][:12]} kind={report['kind']} "
+            f"passes={len(report['passes'])} "
+            f"max_deviation_s={report['max_deviation_s']} "
+            f"late={report['late']} outside={report.get('outside', [])} "
+            f"missing={report['missing']} skipped={report.get('skipped', [])} "
+            f"failed={report.get('failed', [])} "
+            f"unscheduled={len(report['unscheduled'])} "
+            f"max_clock_skew_s={report.get('max_clock_skew_s')} "
+            f"drive_hosts={report.get('drive_hosts', [])}"
+        )
     for reason in verdict["reasons"]:
         say(f"reason {reason}")
     if not verdict["evidence"]:
@@ -2431,6 +2507,14 @@ def observe_refusals(args: argparse.Namespace) -> list[str]:
     out = []
     if args.max_seconds <= 0:
         out.append("--max-seconds must be positive")
+    # OI-1003-Q168: the pass schedule is recorded in the observation at its
+    # start, so it is fixed before any pass this observation measures.
+    args.schedule_doc = None
+    if getattr(args, "schedule", None) is not None:
+        doc, defects = load_schedule(args.schedule)
+        if defects:
+            out.append("--schedule is not a valid schedule: " + "; ".join(defects))
+        args.schedule_doc = doc
     source = args.source.resolve()
     if not source.is_dir():
         out.append(f"source {source} is not a directory")
@@ -2475,6 +2559,7 @@ def observe_session(args: argparse.Namespace, workdir: Path, out_dir: Path) -> d
             "git status+diff, search",
         },
         "host": host_record(git, search, source_name, workload.git_env),
+        "schedule": args.schedule_doc,
         "start_utc": utc_now(),
         "end_utc": None,
         "end_reason": None,
@@ -2485,6 +2570,9 @@ def observe_session(args: argparse.Namespace, workdir: Path, out_dir: Path) -> d
     stop = threading.Event()
     origin = time.monotonic()
     header["origin_epoch"] = time.time()
+    # OI-1003-Q168 review: the drive's pass starts are placed on this
+    # clock (the observed host's monotonic clock), not on its wall clock.
+    header["origin_monotonic"] = round(origin, 6)
     (out_dir / "observe.json").write_text(json.dumps(header, indent=1) + "\n")
     until = origin + args.max_seconds
     errors = header["errors"]
@@ -2649,15 +2737,53 @@ def parse_time(text: str) -> float:
     return value
 
 
-def parse_intervals(text: str) -> tuple[list[tuple[float, float]], bool, list[str]]:
-    """The run's ON intervals, in epoch seconds, merged; whether one was
-    still open (an `on` with no `off`); and the lines that did not parse.
-    Lines: `START END [LABEL]`, or `on TIME [LABEL]` / `off TIME [LABEL]`;
-    `#` starts a comment."""
-    intervals: list[tuple[float, float]] = []
+def read_records(text: str) -> dict:
+    """An intervals file as recorded, in file order: `passes`, each
+    `{"start", "end", "slot", "schedule", "exit", "mono", "label"}` (epoch
+    seconds, `end` inf while still open; `slot`, `schedule`, `exit` and
+    `mono` from `slot=K schedule=DIGEST exit=CODE mono=SECONDS` label words,
+    which `drive` writes (OI-1003-Q168), None when absent; `exit` from the
+    `off` line); `open`, whether one was still open (an `on` with no
+    `off`); `skipped`, the `skip TIME slot=K schedule=DIGEST` records of
+    slots the drive did not run; `drives`, the `drive TIME host=H
+    mono=SECONDS schedule=DIGEST` records of each drive's start (its host
+    and its monotonic clock); and `problems`, the lines that did not parse.
+    Pass lines: `START END [LABEL]`, or `on TIME [LABEL]` / `off TIME
+    [LABEL]` (the `on` line's label names the pass); `#` starts a comment."""
+    passes: list[dict] = []
+    skipped: list[dict] = []
+    drives: list[dict] = []
     problems: list[str] = []
-    opened: float | None = None
-    for number, raw in enumerate(text.splitlines(), 1):
+    opened: dict | None = None
+
+    def tagged(words: list[str]) -> dict:
+        return dict(word.split("=", 1) for word in words if "=" in word)
+
+    def number(value: str | None) -> float | None:
+        if value is None:
+            return None
+        out = float(value)
+        if not math.isfinite(out):
+            raise ValueError(f"not a number: {value!r}")
+        return out
+
+    def slot_of(tags: dict) -> int | None:
+        slot = tags.get("slot")
+        return int(slot) if slot is not None and slot.isdigit() else None
+
+    def labelled(start: float, end: float, words: list[str]) -> dict:
+        tags = tagged(words)
+        return {
+            "start": start,
+            "end": end,
+            "slot": slot_of(tags),
+            "schedule": tags.get("schedule"),
+            "exit": tags.get("exit"),
+            "mono": number(tags.get("mono")),
+            "label": " ".join(words),
+        }
+
+    for line_number, raw in enumerate(text.splitlines(), 1):
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
@@ -2668,23 +2794,64 @@ def parse_intervals(text: str) -> tuple[list[tuple[float, float]], bool, list[st
                 if parts[0] == "on":
                     if opened is not None:
                         raise ValueError("on after on")
-                    opened = at
+                    opened = labelled(at, math.inf, parts[2:])
                 else:
-                    if opened is None or at < opened:
+                    if opened is None or at < opened["start"]:
                         raise ValueError("off without an earlier on")
-                    intervals.append((opened, at))
+                    ended = tagged(parts[2:])
+                    passes.append({**opened, "end": at, "exit": ended.get("exit")})
                     opened = None
+            elif parts[0] == "skip":
+                tags = tagged(parts[2:])
+                skipped.append(
+                    {
+                        "at": parse_time(parts[1]),
+                        "slot": slot_of(tags),
+                        "schedule": tags.get("schedule"),
+                    }
+                )
+            elif parts[0] == "drive":
+                tags = tagged(parts[2:])
+                drives.append(
+                    {
+                        "at": parse_time(parts[1]),
+                        "host": tags.get("host"),
+                        "mono": number(tags.get("mono")),
+                        "schedule": tags.get("schedule"),
+                    }
+                )
             else:
                 start, end = parse_time(parts[0]), parse_time(parts[1])
                 if end < start:
                     raise ValueError("ends before it starts")
-                intervals.append((start, end))
+                passes.append(labelled(start, end, parts[2:]))
         except (IndexError, ValueError) as exc:
-            problems.append(f"line {number}: {exc}: {raw.strip()!r}")
+            problems.append(f"line {line_number}: {exc}: {raw.strip()!r}")
     open_interval = opened is not None
-    if open_interval:
-        intervals.append((opened, math.inf))
-    intervals.sort()
+    if opened is not None:
+        passes.append(opened)
+    return {
+        "passes": passes,
+        "open": open_interval,
+        "skipped": skipped,
+        "drives": drives,
+        "problems": problems,
+    }
+
+
+def read_marks(text: str) -> tuple[list[dict], bool, list[str]]:
+    """The run's passes as recorded (`read_records`), whether one was still
+    open, and the lines that did not parse."""
+    marks = read_records(text)
+    return marks["passes"], marks["open"], marks["problems"]
+
+
+def parse_intervals(text: str) -> tuple[list[tuple[float, float]], bool, list[str]]:
+    """The run's ON intervals, in epoch seconds, merged; whether one was
+    still open (an `on` with no `off`); and the lines that did not parse
+    (`read_marks`)."""
+    passes, open_interval, problems = read_marks(text)
+    intervals = sorted((p["start"], p["end"]) for p in passes)
     merged: list[tuple[float, float]] = []
     for start, end in intervals:
         if merged and start <= merged[-1][1]:
@@ -2692,6 +2859,344 @@ def parse_intervals(text: str) -> tuple[list[tuple[float, float]], bool, list[st
         else:
             merged.append((start, end))
     return merged, open_interval, problems
+
+
+# --- the pass schedule (OI-1003-Q168) ------------------------------------------
+
+SCHEDULE_SCHEMA = "bulkload.s2-schedule.v1"
+SCHEDULE_RULINGS = (
+    "OI-1003-Q168 (pass start times from a schedule fixed or seeded-random and "
+    "recorded in advance, never from host load)"
+)
+# A pass whose start parts from its slot's time by more than this is off its
+# schedule: evidence refuses it. It covers starting a child, not a wait.
+SCHEDULE_SLACK_S = 5.0
+SCHEDULE_KINDS = ("fixed", "seeded")
+DIGEST_LABEL = 12
+
+
+def schedule_body(doc: dict) -> dict:
+    """The part of a schedule its digest seals."""
+    return {
+        key: doc.get(key)
+        for key in ("schema", "kind", "created_epoch", "params", "starts")
+    }
+
+
+def schedule_digest(doc: dict) -> str:
+    canonical = json.dumps(schedule_body(doc), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def seeded_starts(params: dict) -> list[float]:
+    """Slot k at first + k x every, plus (with jitter) a uniform offset in
+    [0, jitter) drawn from `random.Random(seed)`: re-derivable from the
+    recorded parameters alone, and nothing on the host feeds it."""
+    rng = random.Random(params["seed"])
+    starts = []
+    for k in range(params["passes"]):
+        offset = rng.uniform(0.0, params["jitter"]) if params["jitter"] else 0.0
+        starts.append(round(params["first"] + k * params["every"] + offset, 3))
+    return starts
+
+
+def sealed(doc: dict) -> dict:
+    doc["digest"] = schedule_digest(doc)
+    return doc
+
+
+def make_schedule(
+    first: float,
+    every: float,
+    passes: int,
+    jitter: float = 0.0,
+    seed: int | None = None,
+    created: float | None = None,
+) -> dict:
+    """A seeded schedule: `passes` slots `every` seconds apart from `first`
+    (epoch seconds), each moved by a seeded uniform offset under `jitter`."""
+    params = {
+        "first": round(first, 3),
+        "every": every,
+        "passes": passes,
+        "jitter": jitter,
+        "seed": 0 if seed is None else seed,
+    }
+    return sealed(
+        {
+            "schema": SCHEDULE_SCHEMA,
+            "rulings": SCHEDULE_RULINGS,
+            "kind": "seeded",
+            "created_epoch": round(time.time() if created is None else created, 3),
+            "params": params,
+            "starts": seeded_starts(params),
+        }
+    )
+
+
+def fixed_schedule(starts: list[float], created: float | None = None) -> dict:
+    """A fixed schedule: the slots' start times, listed in advance."""
+    return sealed(
+        {
+            "schema": SCHEDULE_SCHEMA,
+            "rulings": SCHEDULE_RULINGS,
+            "kind": "fixed",
+            "created_epoch": round(time.time() if created is None else created, 3),
+            "params": {"at": [round(start, 3) for start in starts]},
+            "starts": [round(start, 3) for start in starts],
+        }
+    )
+
+
+def schedule_defects(doc: dict) -> list[str]:
+    """Why `doc` is not a valid schedule recorded in advance, or []: its
+    schema and digest, slots strictly increasing, a seeded schedule's starts
+    re-deriving from its seed and parameters (a fixed one's from its list),
+    and every slot after the moment it was made."""
+    out = []
+    if not isinstance(doc, dict) or doc.get("schema") != SCHEDULE_SCHEMA:
+        return [f"not a {SCHEDULE_SCHEMA} schedule"]
+    if doc.get("digest") != schedule_digest(doc):
+        out.append("its digest does not match its body")
+    starts = doc.get("starts")
+    params = doc.get("params")
+    if (
+        not isinstance(starts, list)
+        or not starts
+        or not all(isinstance(t, (int, float)) and math.isfinite(t) for t in starts)
+    ):
+        return out + ["it lists no slot start times"]
+    if any(b <= a for a, b in itertools.pairwise(starts)):
+        out.append("its slots are not strictly increasing")
+    kind = doc.get("kind")
+    try:
+        if kind == "seeded":
+            derived = seeded_starts(params)
+        elif kind == "fixed":
+            derived = [round(t, 3) for t in params["at"]]
+        else:
+            raise ValueError(f"kind {kind!r}")
+    except (KeyError, TypeError, ValueError) as exc:
+        return out + [f"its parameters do not parse ({exc})"]
+    if derived != starts:
+        out.append(f"its starts do not re-derive from its {kind} parameters")
+    created = doc.get("created_epoch")
+    if not isinstance(created, (int, float)) or starts[0] <= created:
+        out.append(
+            "it was not recorded in advance: a slot starts at or before the "
+            "moment it was made"
+        )
+    return out
+
+
+def slot_label(slot: int, doc: dict) -> str:
+    """The label `drive` gives a pass: its slot and its schedule."""
+    return f"slot={slot} schedule={doc['digest'][:DIGEST_LABEL]}"
+
+
+def schedule_report(
+    doc: dict,
+    passes: list[dict],
+    origin: float,
+    span: float,
+    marks: dict | None = None,
+    observer: dict | None = None,
+) -> dict:
+    """How the run's recorded passes followed the schedule `doc`
+    (OI-1003-Q168), in seconds from the observation's origin. Per pass: its
+    slot, scheduled and actual start, exit status, the deviation on the
+    observer's clock (`deviation_s`: its monotonic start on the observed
+    host against the slot, when both clocks are recorded; else the drive's
+    wall reading) and on the drive's own (`drive_deviation_s`), and the
+    skew between the two. Then: the passes that name no slot of this
+    schedule; the slots with more than one pass; the slots outside the
+    observation (before its origin, or with less than SCHEDULE_SLACK_S
+    before its end: the observation covers the whole schedule, so which
+    slots are measured is never chosen by when it ran); the slots inside
+    it with no pass; the slots the drive skipped (`marks`' skip records);
+    the passes off their slot by more than SCHEDULE_SLACK_S; the passes
+    that exited nonzero or recorded no exit status; the passes whose start
+    was not on the observer's monotonic clock; the drives' hosts against
+    the observed host (`observer`: `hostname` and `origin_monotonic`); and
+    the schedule's own defects. A pass that ended before the origin is no
+    pass of the observed run (OI-1003-Q160's pre-origin rule judges it)."""
+    marks = marks or {}
+    observer = observer or {}
+    digest = doc.get("digest") or ""
+    label = digest[:DIGEST_LABEL]
+    starts = doc.get("starts") or []
+    origin_mono = observer.get("origin_monotonic")
+    rows, unscheduled = [], []
+    counts: dict[int, int] = {}
+    for passed in passes:
+        if passed["end"] <= origin:
+            continue
+        slot = passed.get("slot")
+        if (
+            slot is None
+            or not 0 <= slot < len(starts)
+            or passed.get("schedule") != label
+        ):
+            unscheduled.append(rounded(passed["start"] - origin, 3))
+            continue
+        counts[slot] = counts.get(slot, 0) + 1
+        wall = passed["start"] - starts[slot]
+        mono = passed.get("mono")
+        observed = (
+            None
+            if mono is None or origin_mono is None
+            else (mono - origin_mono) - (starts[slot] - origin)
+        )
+        rows.append(
+            {
+                "slot": slot,
+                "scheduled_s": rounded(starts[slot] - origin, 3),
+                "started_s": rounded(passed["start"] - origin, 3),
+                "deviation_s": rounded(wall if observed is None else observed, 3),
+                "drive_deviation_s": rounded(wall, 3),
+                "clock_skew_s": None
+                if observed is None
+                else rounded(wall - observed, 3),
+                "timed": observed is not None,
+                "exit": passed.get("exit"),
+            }
+        )
+    rows.sort(key=lambda row: (row["slot"], row["started_s"]))
+    outside = [
+        slot
+        for slot, start in enumerate(starts)
+        if start - origin < 0.0 or start - origin + SCHEDULE_SLACK_S > span
+    ]
+    missing = [
+        slot
+        for slot in range(len(starts))
+        if slot not in outside and slot not in counts
+    ]
+    skipped = sorted(
+        {
+            mark["slot"]
+            for mark in marks.get("skipped") or []
+            if mark.get("schedule") == label and mark.get("slot") is not None
+        }
+    )
+    created = doc.get("created_epoch")
+    skews = [
+        abs(row["clock_skew_s"]) for row in rows if row["clock_skew_s"] is not None
+    ]
+    return {
+        "digest": digest,
+        "kind": doc.get("kind"),
+        "slots": len(starts),
+        "slack_s": SCHEDULE_SLACK_S,
+        "span_s": rounded(span, 3),
+        "created_s": None if created is None else rounded(created - origin, 3),
+        "passes": rows,
+        "max_deviation_s": max((abs(row["deviation_s"]) for row in rows), default=None),
+        "max_clock_skew_s": max(skews, default=None),
+        "late": sorted(
+            {row["slot"] for row in rows if abs(row["deviation_s"]) > SCHEDULE_SLACK_S}
+        ),
+        "outside": outside,
+        "missing": missing,
+        "skipped": skipped,
+        "failed": [[row["slot"], row["exit"]] for row in rows if row["exit"] != "0"],
+        "untimed": [row["slot"] for row in rows if not row["timed"]],
+        "unscheduled": unscheduled,
+        "duplicate": sorted(slot for slot, n in counts.items() if n > 1),
+        "drive_hosts": sorted(
+            {
+                str(d.get("host"))
+                for d in marks.get("drives") or []
+                if d.get("schedule") == label
+            }
+        ),
+        "observed_host": observer.get("hostname"),
+        "observer_clock": origin_mono is not None,
+        "defects": schedule_defects(doc),
+    }
+
+
+def schedule_problems(report: dict | None) -> list[str]:
+    """Why the run's pass placement is not evidence (OI-1003-Q168), or []."""
+    if report is None:
+        return [
+            "evidence needs passes started on a schedule recorded in advance "
+            "(OI-1003-Q168): the observation recorded none (observe --schedule)"
+        ]
+    q168 = "(OI-1003-Q168)"
+    out = [
+        f"the recorded schedule is not valid {q168}: {defect}"
+        for defect in report["defects"]
+    ]
+    if report["created_s"] is not None and report["created_s"] > 0.0:
+        out.append(f"the recorded schedule was made after the observation began {q168}")
+    # Each offending pass with its own deviation (review finding 2: a slot
+    # with two passes reports both, never one for the other).
+    for row in report["passes"]:
+        if abs(row["deviation_s"]) > report["slack_s"]:
+            out.append(
+                f"slot {row['slot']}'s pass started {row['deviation_s']:+.1f} s "
+                f"from its scheduled time, over the {report['slack_s']:.0f} s "
+                f"bound {q168}"
+            )
+    for slot in report.get("outside", []):
+        out.append(
+            f"slot {slot} lies outside the observation [0, "
+            f"{report.get('span_s') or 0:.0f} s]: the observation must cover the "
+            f"whole schedule, so no slot is left out by when it ran {q168}"
+        )
+    for slot in report["missing"]:
+        out.append(f"slot {slot}, scheduled inside the observation, has no pass {q168}")
+    for slot in report.get("skipped", []):
+        out.append(f"slot {slot} was skipped by the drive (past when it began) {q168}")
+    for slot, code in report.get("failed", []):
+        out.append(
+            f"slot {slot}'s pass recorded no exit status, so it is not known "
+            f"to have completed {q168}"
+            if code is None
+            else f"slot {slot}'s pass exited {code}, so it did not complete {q168}"
+        )
+    for start in report["unscheduled"]:
+        out.append(
+            f"a pass at {start:.0f} s names no slot of the recorded schedule {q168}"
+        )
+    for slot in report["duplicate"]:
+        n = sum(1 for row in report["passes"] if row["slot"] == slot)
+        out.append(f"slot {slot} has {n} passes {q168}")
+    # Review finding 4: the starts are judged on the observed host's clock,
+    # so the drive runs there and records that clock.
+    hosts = report.get("drive_hosts", [])
+    observed = report.get("observed_host")
+    if report["passes"] and not hosts:
+        out.append(
+            "the run's intervals hold no drive record of this schedule: the "
+            f"passes were not started by `drive` {q168}"
+        )
+    for host in hosts:
+        if host != observed:
+            out.append(
+                f"the passes were driven on {host}, not on the observed host "
+                f"{observed}: `drive` runs on the observed host {q168}"
+            )
+    if report["passes"] and not report.get("observer_clock"):
+        out.append(
+            "the observation recorded no monotonic origin, so no pass start "
+            f"can be placed on its clock {q168}"
+        )
+    elif report.get("untimed"):
+        for slot in report["untimed"]:
+            out.append(
+                f"slot {slot}'s pass recorded no monotonic start on the observed "
+                f"host {q168}"
+            )
+    for row in report["passes"]:
+        skew = row.get("clock_skew_s")
+        if skew is not None and abs(skew) > CLOCK_SLACK_S:
+            out.append(
+                f"slot {row['slot']}'s wall-clock marks parted from the observer's "
+                f"clock by {skew:+.1f} s (over {CLOCK_SLACK_S:.0f} s) {q168}"
+            )
+    return out
 
 
 def derive_windows(
@@ -2772,6 +3277,25 @@ def alongside_trace(
     origin = header["origin_epoch"]
     last = max((row["t"] for row in rows if "t" in row), default=0.0)
     span = header.get("span_s") or last
+    # OI-1003-Q168: how the passes followed the schedule the observation
+    # recorded at its start (None: it recorded none).
+    marks = read_records(intervals_text)
+    schedule = header.get("schedule")
+    schedule = (
+        schedule_report(
+            schedule,
+            marks["passes"],
+            origin,
+            span,
+            marks=marks,
+            observer={
+                "hostname": (header.get("host") or {}).get("hostname"),
+                "origin_monotonic": header.get("origin_monotonic"),
+            },
+        )
+        if isinstance(schedule, dict)
+        else None
+    )
     settle = gate["settle_seconds"]
     relative = [(start - origin, end - origin) for start, end in intervals]
     kept, dropped = derive_windows(relative, span, min_window, lead=settle)
@@ -2835,6 +3359,7 @@ def alongside_trace(
             "min_window_seconds": min_window,
             "dropped_windows": dropped,
             "pre_origin_intervals": pre_origin,
+            "schedule": schedule,
             "source": header["config"]["source"],
             "workdir": header["config"]["workdir"],
             "out": header["config"]["out"],
@@ -2974,6 +3499,30 @@ def evidence_rows(trace: dict, verdict: dict) -> list[list[str]]:
                 label,
             ]
         )
+    if trace["config"].get("alongside"):
+        # OI-1003-Q168: the pass schedule and how the passes followed it.
+        report = trace["config"].get("schedule")
+        out.append(
+            [
+                "schedule",
+                "start_deviation_s",
+                cell(None if report is None else report["max_deviation_s"]),
+                "-",
+                "-",
+                cell(SCHEDULE_SLACK_S),
+                "no schedule recorded"
+                if report is None
+                else f"{report['kind']} {report['digest'][:12]}; passes "
+                f"{len(report['passes'])}; off slot {len(report['late'])}; "
+                f"outside {len(report.get('outside', []))}; "
+                f"missing {len(report['missing'])}; "
+                f"skipped {len(report.get('skipped', []))}; "
+                f"failed {len(report.get('failed', []))}; unscheduled "
+                f"{len(report['unscheduled'])}; max clock skew "
+                f"{cell(report.get('max_clock_skew_s'))}",
+                label,
+            ]
+        )
     baseline = verdict.get("live_baseline")
     if baseline is not None:
         recovery = baseline.get("recovery") or {"d_p95": {}, "d_load1": None}
@@ -3074,13 +3623,192 @@ def command_alongside(args: argparse.Namespace) -> int:
     return 0
 
 
+def append_mark(path: Path, line: str) -> None:
+    """Append one line to an intervals file, fsynced."""
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 def command_mark(args: argparse.Namespace) -> int:
     """Append `on|off EPOCH [LABEL]` to the intervals file, fsynced."""
     label = f" {args.label}" if args.label else ""
-    with args.file.open("a", encoding="utf-8") as handle:
-        handle.write(f"{args.state} {time.time():.3f}{label}\n")
+    append_mark(args.file, f"{args.state} {time.time():.3f}{label}")
+    return 0
+
+
+def parse_first(text: str, now: float) -> float:
+    """`+SECONDS` from now, or an absolute time (`parse_time`)."""
+    if text.startswith("+"):
+        return now + float(text[1:])
+    return parse_time(text)
+
+
+def write_schedule(path: Path, doc: dict) -> None:
+    with path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(doc, indent=1) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+def command_schedule(args: argparse.Namespace) -> int:
+    """Record a pass schedule in advance (OI-1003-Q168): fixed start times
+    (--at), or --passes slots --every seconds apart from --first, each
+    moved by a uniform offset under --jitter drawn from --seed."""
+    now = time.time()
+    refusals = []
+    if args.out.exists():
+        refusals.append(f"out {args.out} already exists")
+    doc = None
+    try:
+        if args.at:
+            if args.first or args.every or args.passes or args.jitter:
+                raise ValueError("--at takes no --first, --every, --passes or --jitter")
+            doc = fixed_schedule([parse_time(t) for t in args.at], created=now)
+        else:
+            if args.first is None or not args.every or not args.passes:
+                raise ValueError("give --at, or --first, --every and --passes")
+            if args.every <= 0 or args.passes < 1:
+                raise ValueError("--every and --passes must be positive")
+            if not 0 <= args.jitter < args.every:
+                raise ValueError("--jitter must be at least 0 and under --every")
+            doc = make_schedule(
+                parse_first(args.first, now),
+                args.every,
+                args.passes,
+                jitter=args.jitter,
+                seed=args.seed,
+                created=now,
+            )
+    except ValueError as exc:
+        refusals.append(str(exc))
+    if doc is not None:
+        refusals += schedule_defects(doc)
+    if refusals:
+        for refusal in refusals:
+            say(f"refused reason={refusal!r}")
+        return 2
+    write_schedule(args.out, doc)
+    say(
+        f"schedule out={args.out} kind={doc['kind']} digest={doc['digest'][:12]} "
+        f"slots={len(doc['starts'])} first={doc['starts'][0]:.3f} "
+        f"last={doc['starts'][-1]:.3f}"
+    )
+    return 0
+
+
+def load_schedule(path: Path) -> tuple[dict | None, list[str]]:
+    """A schedule file and its defects (or why it could not be read)."""
+    try:
+        doc = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        return None, [f"{type(exc).__name__}: {exc}"]
+    return doc, schedule_defects(doc)
+
+
+def command_drive(args: argparse.Namespace) -> int:
+    """Start the run's repeated passes on their recorded schedule
+    (OI-1003-Q168). Slot k's pass starts at the schedule's time for it and
+    at no other: the host's load is never read. Each pass is marked `on`
+    and `off` with its slot and the schedule's digest, and waited for until
+    it exits (never ended early, R-N11); a pass that is still running at the
+    next slot's time makes that pass start late, which the marks record and
+    `alongside --evidence` refuses past SCHEDULE_SLACK_S. A slot already
+    past when the drive begins is never run late: a `skip` record names
+    it. The drive's first record names its host and its monotonic clock,
+    and each `on` mark carries that clock, so `alongside` judges each start
+    on the observed host's clock (run the drive there). --stop-file ends
+    the drive between passes; the slots it never reached are then missing
+    or outside the observation, and the run is not evidence."""
+    command = list(args.command)
+    if command[:1] == ["--"]:
+        command = command[1:]
+    doc, refusals = load_schedule(args.schedule)
+    if refusals:
+        refusals = [f"--schedule: {problem}" for problem in refusals]
+    if not command:
+        refusals.append("no pass command after --")
+    if not args.intervals.parent.is_dir():
+        refusals.append(f"intervals parent {args.intervals.parent} is not a directory")
+    if refusals:
+        for refusal in refusals:
+            say(f"refused reason={refusal!r}")
+        return 2
+    if args.log_dir:
+        args.log_dir.mkdir(parents=True, exist_ok=True)
+    began = time.time()
+    digest = doc["digest"][:DIGEST_LABEL]
+    say(
+        f"drive schedule={digest} slots={len(doc['starts'])} intervals={args.intervals}"
+    )
+    # The drive's record: its host and its monotonic clock beside the wall
+    # clock, so `alongside` judges each start on the observed host's clock
+    # and refuses a drive on any other host (OI-1003-Q168 review finding 4).
+    append_mark(
+        args.intervals,
+        f"drive {began:.3f} host={platform.node()} mono={time.monotonic():.6f} "
+        f"schedule={digest}",
+    )
+    ran = skipped = late = 0
+    for slot, start in enumerate(doc["starts"]):
+        if start + SCHEDULE_SLACK_S < began:
+            skipped += 1
+            # A record, not a comment: `alongside` counts and refuses it.
+            append_mark(
+                args.intervals,
+                f"skip {time.time():.3f} slot={slot} schedule={digest}",
+            )
+            continue
+        while True:
+            if args.stop_file and args.stop_file.exists():
+                say(f"drive stopped by {args.stop_file} before slot {slot}")
+                say(f"drive ran={ran} skipped={skipped} late={late}")
+                return 0
+            wait = start - time.time()
+            if wait <= 0:
+                break
+            time.sleep(min(wait, 1.0))
+        argv = [
+            part.replace("{slot}", str(slot)).replace("{scheduled}", f"{start:.3f}")
+            for part in command
+        ]
+        log = (args.log_dir / f"slot-{slot}.log").open("ab") if args.log_dir else None
+        started = time.time()
+        append_mark(
+            args.intervals,
+            f"on {started:.3f} {slot_label(slot, doc)} mono={time.monotonic():.6f}",
+        )
+        try:
+            # Popen and wait, as run_once: `subprocess.run` would end the
+            # child on an interrupt; this waits for it whatever happens
+            # (R-N11: the driver never signals a process).
+            child = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log
+            )
+            code = child.wait()
+        except OSError as exc:
+            append_mark(
+                args.intervals,
+                f"off {time.time():.3f} {slot_label(slot, doc)} exit=spawn-failed",
+            )
+            say(f"aborted reason={f'{type(exc).__name__}: {exc}'!r}")
+            return 3
+        finally:
+            if log is not None:
+                log.close()
+        ended = time.time()
+        append_mark(
+            args.intervals, f"off {ended:.3f} {slot_label(slot, doc)} exit={code}"
+        )
+        ran += 1
+        deviation = started - start
+        late += abs(deviation) > SCHEDULE_SLACK_S
+        say(
+            f"pass slot={slot} scheduled={start:.3f} started={started:.3f} "
+            f"deviation_s={deviation:+.3f} seconds={ended - started:.3f} exit={code}"
+        )
+    say(f"drive ran={ran} skipped={skipped} late={late}")
     return 0
 
 
@@ -3150,7 +3878,28 @@ def parser() -> argparse.ArgumentParser:
     observe.add_argument("--stop-file", type=Path)
     observe.add_argument("--max-seconds", type=float, default=DEFAULT_OBSERVE_SECONDS)
     observe.add_argument("--label", default="")
+    observe.add_argument("--schedule", type=Path)
     observe.set_defaults(handler=command_observe)
+    schedule = sub.add_parser(
+        "schedule", help="record a pass schedule in advance (OI-1003-Q168)"
+    )
+    schedule.add_argument("--out", type=Path, required=True)
+    schedule.add_argument("--at", nargs="+")
+    schedule.add_argument("--first")
+    schedule.add_argument("--every", type=float)
+    schedule.add_argument("--passes", type=int)
+    schedule.add_argument("--jitter", type=float, default=0.0)
+    schedule.add_argument("--seed", type=int, default=0)
+    schedule.set_defaults(handler=command_schedule)
+    drive = sub.add_parser(
+        "drive", help="start the run's passes on their schedule (OI-1003-Q168)"
+    )
+    drive.add_argument("--schedule", type=Path, required=True)
+    drive.add_argument("--intervals", type=Path, required=True)
+    drive.add_argument("--stop-file", type=Path)
+    drive.add_argument("--log-dir", type=Path)
+    drive.add_argument("command", nargs=argparse.REMAINDER)
+    drive.set_defaults(handler=command_drive)
     mark = sub.add_parser("mark", help="append a run-interval mark")
     mark.add_argument("file", type=Path)
     mark.add_argument("state", choices=("on", "off"))

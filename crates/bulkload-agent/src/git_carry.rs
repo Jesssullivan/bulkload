@@ -204,9 +204,16 @@ fn read_tree(command: &mut Command, trees: &[&str]) -> Result<()> {
     output(command.args(trees)).map(drop)
 }
 
-/// The metadata ref carrying a capture's stash reflog order (estate
-/// converge, design 3.1), newest first.
-const STASH_ORDER_METADATA: &str = "stash-order-v1";
+/// The metadata ref carrying a capture's stash list (estate converge,
+/// design 3.1; OI-1003-Q169), newest first: each entry's commit and reflog
+/// message in [`landed::STASH_LIST_FORMAT`], exactly the bytes the
+/// snapshot read and the key hashes.
+const STASH_ORDER_METADATA: &str = "stash-order-v2";
+
+/// The same for captures taken before OI-1003-Q169: commits only, newest
+/// first. Read, never written; the messages are then the commits'
+/// subjects (`stash-messages-inferred`).
+const STASH_ORDER_V1_METADATA: &str = "stash-order-v1";
 
 /// The metadata revision naming a capture's worktree tree.
 const WORKTREE_REVISION: &str = "worktree";
@@ -757,8 +764,15 @@ fn exported_refs(
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
     }
-    let stash = std::str::from_utf8(stash).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    for value in stash.lines() {
+    // A stash list line is its commit, then (stash-order-v2) a NUL and its
+    // reflog message; a plan base's stash history names commits alone.
+    for line in stash
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let value = line.split(|byte| *byte == 0).next().unwrap_or_default();
+        let value =
+            std::str::from_utf8(value).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
         if !oid(value) {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
@@ -860,7 +874,9 @@ impl KeyParts {
     /// The domain tag, the input order, the u64-length framing and the
     /// present-only sidecar domains are exactly what they were before drift
     /// tolerance existed, so retained captures of unchanged checkouts keep their
-    /// keys bit-for-bit and are never re-done.
+    /// keys bit-for-bit and are never re-done. One deliberate exception: the
+    /// stash bytes carry each entry's reflog message since stash-order-v2
+    /// (OI-1003-Q169), so a checkout with a stash has a new key once.
     ///
     /// # Errors
     /// Refuses inputs too large to frame or encode.
@@ -1206,7 +1222,12 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
     })
 }
 
-// The stash reflog, newest first, for an inventory that listed refs/stash.
+// The stash list, newest first, for an inventory that listed refs/stash:
+// each entry's commit and reflog message (stash-order-v2, OI-1003-Q169), so
+// a message-only change (an entry dropped and stored again under another
+// message) moves the key and is drift like any other stash move. The
+// format changed the key of every checkout with a stash, once, on purpose:
+// its retained capture is re-captured at the next pass.
 // OI-1003-Q161 review: a `git stash pop` or `drop` of the last stash after
 // that inventory was read deletes refs/stash and its reflog, and the read
 // fails. When refs/stash no longer resolves, that is the stash as it is now
@@ -1215,7 +1236,7 @@ fn read_authority(repo: &Path, inventory: &str) -> Result<CarriedAuthority> {
 // `RefRemoved`; a torn key no consistent key equals), never
 // GIT_CHILD_FAILED. Any other failure still refuses as the child failed.
 fn source_stash_reflog(repo: &Path) -> Result<Vec<u8>> {
-    match output(git(repo).args(["reflog", "show", "--format=%H", "refs/stash"])) {
+    match output(git(repo).args(["reflog", "show", landed::STASH_LIST_FORMAT, "refs/stash"])) {
         Err(refusal @ BulkloadRefusal::GitChildFailed(_)) => {
             let resolved = git(repo)
                 .args(["rev-parse", "--verify", "-q", "refs/stash"])
@@ -2035,11 +2056,11 @@ fn capture_administration(private: &Path, authority: &CarriedAuthority) -> Resul
         .trim_end();
     metadata(private, "head-symbolic", symbolic.as_bytes())?;
     metadata(private, "exclude", &authority.exclude)?;
-    // Estate converge (design 3.1): the stash reflog's order, exactly the
-    // bytes the snapshot read (newest first), so a restore rebuilds the
-    // stash in the source's order. Only when there is a stash, so every
-    // other capture's bundle is unchanged; no key change (the key already
-    // hashes these bytes).
+    // Estate converge (design 3.1; OI-1003-Q169): the stash list, exactly
+    // the bytes the snapshot read (newest first, each commit and reflog
+    // message), so a restore rebuilds the stash in the source's order with
+    // the source's messages. Only when there is a stash, so every other
+    // capture's bundle is unchanged (the key hashes these bytes).
     if !authority.stash.is_empty() {
         metadata(private, STASH_ORDER_METADATA, &authority.stash)?;
     }
@@ -10404,6 +10425,10 @@ mod tests {
             output(git(&source).args(["stash", "push", "-q"])).unwrap();
             stashes.push(text(git(&source).args(["rev-parse", "refs/stash"])).unwrap());
         }
+        // The snapshot's stash list (stash-order-v2): commits and messages.
+        let snapshot =
+            output(git(&source).args(["reflog", "show", landed::STASH_LIST_FORMAT, "refs/stash"]))
+                .unwrap();
         let inside = source.clone();
         mid_pass::arm(&source, move || {
             output(git(&inside).args(["stash", "drop", "-q", "stash@{1}"])).unwrap();
@@ -10423,15 +10448,80 @@ mod tests {
                 "{heads}"
             );
         }
+        let carried = output(git(&private).args([
+            "show",
+            &format!("refs/carry-export/{STASH_ORDER_METADATA}:value"),
+        ]))
+        .unwrap();
+        assert_eq!(carried, snapshot);
         assert_eq!(
-            text(git(&private).args([
-                "show",
-                &format!("refs/carry-export/{STASH_ORDER_METADATA}:value")
-            ]))
-            .unwrap(),
-            stashes.iter().rev().cloned().collect::<Vec<_>>().join("\n")
+            landed::parse_stash_list(&carried)
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.oid)
+                .collect::<Vec<_>>(),
+            stashes.iter().rev().cloned().collect::<Vec<_>>()
         );
         assert!(drift_ref_present(&private));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // OI-1003-Q169 (stash-order-v2): each stash entry's reflog message is
+    // part of its identity in the key. An entry dropped and stored again
+    // under another message (the same commits in the same order) moves the
+    // key, and the drift names it `StashMoved`; a capture carries the
+    // source's `git stash list` exactly in `stash-order-v2`. The v1 key
+    // hashed the commits alone, so every checkout with a stash has a new
+    // key, once: its retained capture is re-captured at the next pass. A
+    // checkout with no stash reads no stash bytes and keeps its key.
+    #[test]
+    fn a_stash_message_is_part_of_the_key_and_the_capture() {
+        let (root, source) = drift_fixture("stash-message");
+        let quiet = capture_key_parts(&source).unwrap();
+        assert!(quiet.stash.is_empty());
+        fs::write(source.join("tracked"), b"stashed edit").unwrap();
+        output(git(&source).args(["stash", "push", "-q", "-m", "first name"])).unwrap();
+        let tip = text(git(&source).args(["rev-parse", "refs/stash"])).unwrap();
+        let before = capture_key_parts(&source).unwrap();
+        let listed = landed::parse_stash_list(&before.stash).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed.first().unwrap().oid, tip);
+        assert!(listed.first().unwrap().message.ends_with(b": first name"));
+        // The key stash-order-v1 computed over the same checkout.
+        let v1 = KeyParts {
+            stash: format!("{tip}\n").into_bytes(),
+            ..before.clone()
+        };
+        assert_ne!(v1.digest().unwrap(), before.digest().unwrap());
+        assert_ne!(v1.authority().unwrap(), before.authority().unwrap());
+        // A message-only change.
+        output(git(&source).args(["stash", "drop", "-q"])).unwrap();
+        output(git(&source).args(["stash", "store", "-m", "renamed", &tip])).unwrap();
+        let after = capture_key_parts(&source).unwrap();
+        assert_ne!(before.digest().unwrap(), after.digest().unwrap());
+        assert_eq!(
+            before.drift_to(&after).unwrap().rows,
+            vec![row(DriftKind::StashMoved, b"refs/stash")]
+        );
+        let capture = root.join("capture");
+        let export =
+            export_repository_with_drift(&source, &capture, &ExportOptions::default()).unwrap();
+        assert!(export.drift.rows.is_empty(), "{:?}", export.drift);
+        let private = capture.join("repository.git");
+        assert_eq!(
+            output(git(&private).args([
+                "show",
+                &format!("refs/carry-export/{STASH_ORDER_METADATA}:value"),
+            ]))
+            .unwrap(),
+            format!("{tip}\0renamed\n").into_bytes()
+        );
+        // No v1 order is written beside it.
+        assert!(
+            !text(git(&private).args(["for-each-ref", "--format=%(refname)"]))
+                .unwrap()
+                .contains(STASH_ORDER_V1_METADATA)
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

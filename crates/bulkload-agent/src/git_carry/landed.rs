@@ -50,6 +50,12 @@ const LOCK: &str = "lock";
 pub const LEDGER_CAP: usize = 256 * 1024 * 1024;
 /// Each record starts with this prefix, so a foreign file is never decoded.
 const MAGIC: &[u8; 16] = b"bulkload-land-v1";
+/// The ref ledger's and the ref intent's prefix since stash-order-v2
+/// (OI-1003-Q169): their stash rows and ops carry each entry's message.
+/// The same records under [`MAGIC`] are the stash-order-v1 layout and
+/// decode only through their v1 types, never as these (postcard is not
+/// self-describing: one layout read as the other would be misread).
+const REFS_MAGIC: &[u8; 16] = b"bulkload-refs-v2";
 /// A tombstone older than this, relative to the newest capture the ledger
 /// holds, is forgotten (finding 8: retention is bounded by age).
 pub const TOMBSTONE_RETENTION_NS: i128 = 90 * 24 * 3600 * 1_000_000_000;
@@ -64,11 +70,168 @@ pub struct LandedRef {
     pub observed_ns: i128,
 }
 
+/// One stash reflog entry, the line `git stash list` shows
+/// (`stash@{n}: <message>`): the stash commit and the entry's reflog
+/// message, as Git stored it (any bytes but NUL and newline; Git folds
+/// whitespace when it writes one). Since stash-order-v2 (OI-1003-Q169)
+/// both are the entry's identity: in the capture key, in the ledger's
+/// stash row and in the stash table.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StashEntry {
+    pub oid: String,
+    pub message: Vec<u8>,
+}
+
+impl StashEntry {
+    /// An entry of `oid` with `message`.
+    pub fn new(oid: impl Into<String>, message: impl Into<Vec<u8>>) -> Self {
+        Self {
+            oid: oid.into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// `git reflog show` format of a stash list in stash-order-v2: one line
+/// per entry, newest first, its commit, a NUL and its reflog message. The
+/// source's capture and the destination's read use it alike.
+pub const STASH_LIST_FORMAT: &str = "--format=%H%x00%gs";
+
+/// Parse a stash list in [`STASH_LIST_FORMAT`] (or a stash-order-v2
+/// metadata value, the same bytes). Strict: every line is a full object
+/// name, one NUL and a message without NUL; nothing else.
+///
+/// # Errors
+/// `GIT_INVENTORY_MALFORMED` for any other line.
+pub fn parse_stash_list(bytes: &[u8]) -> Result<Vec<StashEntry>> {
+    let mut entries = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let (oid, message) = line
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|at| line.split_at(at))
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let message = message.get(1..).unwrap_or_default();
+        let oid = std::str::from_utf8(oid).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+        if !matches!(oid.len(), 40 | 64)
+            || !oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || message.contains(&0)
+        {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        entries.push(StashEntry::new(oid, message));
+    }
+    Ok(entries)
+}
+
+/// A reflog message as Git stores it (`refs.c` `copy_reflog_msg`): leading
+/// whitespace dropped, each run of spaces, tabs, CRs and LFs folded to one
+/// space, trailing whitespace dropped. A message read from a reflog is
+/// already folded; a commit subject a stash-order-v1 capture names may not
+/// be, and the destination's reflog would not read back equal to it.
+#[must_use]
+pub fn reflog_message(bytes: &[u8]) -> Vec<u8> {
+    let space = |byte: u8| matches!(byte, b' ' | b'\t' | b'\n' | b'\r');
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut was_space = true;
+    for &byte in bytes {
+        if was_space && space(byte) {
+            continue;
+        }
+        was_space = space(byte);
+        out.push(if was_space { b' ' } else { byte });
+    }
+    while out.last().is_some_and(|byte| space(*byte)) {
+        out.pop();
+    }
+    out
+}
+
+/// `entries` with each message folded as Git folds a reflog message it
+/// writes ([`reflog_message`]), and how many folding changed: the stash
+/// bulkload can land. A source message Git would fold (written by a
+/// libgit2 tool, or a hand-edited log) is stored folded whatever bulkload
+/// asks, so it is folded before it becomes a target (review finding 5).
+#[must_use]
+pub fn folded(entries: Vec<StashEntry>) -> (Vec<StashEntry>, u64) {
+    let mut changed = 0;
+    let entries = entries
+        .into_iter()
+        .map(|entry| {
+            let message = reflog_message(&entry.message);
+            if message != entry.message {
+                changed += 1;
+            }
+            StashEntry::new(entry.oid, message)
+        })
+        .collect();
+    (entries, changed)
+}
+
+/// What a ledger's stash row identifies its entries by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StashIdentity {
+    /// stash-order-v1: the commit alone. A row a ledger recorded before
+    /// OI-1003-Q169 decodes so; its messages are unknown and left empty.
+    Commit,
+    /// stash-order-v2 (OI-1003-Q169): the commit and its reflog message.
+    CommitAndMessage,
+}
+
 /// The stash reflog bulkload built, newest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LandedStash {
-    pub order: Vec<String>,
+    pub order: Vec<StashEntry>,
     pub observed_ns: i128,
+    pub identity: StashIdentity,
+}
+
+impl LandedStash {
+    /// A stash-order-v2 row of `order` at `observed_ns`.
+    #[must_use]
+    pub const fn of(order: Vec<StashEntry>, observed_ns: i128) -> Self {
+        Self {
+            order,
+            observed_ns,
+            identity: StashIdentity::CommitAndMessage,
+        }
+    }
+
+    /// Whether the destination's reflog `dst` is the one this row names:
+    /// entry for entry, by commit and message; by commit alone for a
+    /// stash-order-v1 row, the only identity it recorded.
+    #[must_use]
+    pub fn names(&self, dst: &[StashEntry]) -> bool {
+        match self.identity {
+            StashIdentity::CommitAndMessage => self.order == dst,
+            StashIdentity::Commit => {
+                self.order.len() == dst.len()
+                    && self
+                        .order
+                        .iter()
+                        .zip(dst)
+                        .all(|(row, now)| row.oid == now.oid)
+            }
+        }
+    }
+
+    /// This row as stash-order-v2 against the destination's reflog `dst`
+    /// (OI-1003-Q169's one-time upgrade): a v1 row that names `dst` by
+    /// commit names exactly the entries bulkload stored, so it becomes
+    /// `dst` itself, messages included. Any other row is returned as it is
+    /// (a v1 row that does not name `dst` stays v1: the destination's
+    /// stash moved since, and is kept).
+    #[must_use]
+    pub fn upgraded(&self, dst: &[StashEntry]) -> Self {
+        if self.identity == StashIdentity::Commit && self.names(dst) {
+            Self::of(dst.to_vec(), self.observed_ns)
+        } else {
+            self.clone()
+        }
+    }
 }
 
 /// The common `info/exclude` a standalone item set.
@@ -119,12 +282,12 @@ pub struct RefOp {
     pub after: Option<LandedRef>,
 }
 
-/// A planned stash rebuild: the reflog before and after, newest first.
+/// A planned stash rebuild: the reflog before and after, newest first,
+/// each entry with its message (stash-order-v2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StashOp {
-    pub old: Vec<String>,
-    pub new: Vec<String>,
-    pub messages: Vec<String>,
+    pub old: Vec<StashEntry>,
+    pub new: Vec<StashEntry>,
     pub observed_ns: i128,
 }
 
@@ -141,7 +304,7 @@ pub struct RefIntent {
     /// store (`None`: its old order, no store made). A settle continues the
     /// stash only from here, or from one store past it (the earlier
     /// report's finding 4: an operator's drop or clear is never undone).
-    pub stash_at: Option<Vec<String>>,
+    pub stash_at: Option<Vec<StashEntry>>,
 }
 
 /// A first linked landing, durable before `git worktree add` and removed
@@ -309,8 +472,251 @@ pub fn ensure_dir(git_dir: &Path, label: &str) -> Result<PathBuf> {
     Ok(directory)
 }
 
+/// A record type and the prefix it is written under.
+pub trait Record: Serialize + serde::de::DeserializeOwned {
+    /// The prefix [`write`] puts before the record.
+    const MAGIC: &'static [u8; 16];
+
+    /// The record from one written under an earlier prefix `magic`, decoded
+    /// strictly through that layout's own type; `None` when `magic` is not
+    /// one of this record's earlier prefixes (the read refuses
+    /// `FRAME_CODEC`).
+    fn earlier(_magic: &[u8], _body: &[u8]) -> Option<Result<Self>> {
+        None
+    }
+}
+
+impl Record for LandedWorkspace {
+    const MAGIC: &'static [u8; 16] = MAGIC;
+}
+
+impl Record for WorkspaceIntent {
+    const MAGIC: &'static [u8; 16] = MAGIC;
+}
+
+impl Record for LandingIntent {
+    const MAGIC: &'static [u8; 16] = MAGIC;
+}
+
+impl Record for RefLedger {
+    const MAGIC: &'static [u8; 16] = REFS_MAGIC;
+
+    // A stash-order-v1 ledger: its stash row identifies entries by commit.
+    fn earlier(magic: &[u8], body: &[u8]) -> Option<Result<Self>> {
+        (magic == MAGIC.as_slice()).then(|| decode::<RefLedgerV1>(body).map(Self::from))
+    }
+}
+
+/// A ref intent is settled from the destination as it stands, so a
+/// stash-order-v1 intent is read with [`read_ref_intent`], which leaves it
+/// to be resolved against the destination's stash; the plain [`read`]
+/// refuses it `FRAME_CODEC`.
+impl Record for RefIntent {
+    const MAGIC: &'static [u8; 16] = REFS_MAGIC;
+}
+
+/// The stash-order-v1 layouts (before OI-1003-Q169), field for field as
+/// they were encoded: a stash row and a stash op named commits only, the op
+/// with the messages it would store beside them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandedStashV1 {
+    pub order: Vec<String>,
+    pub observed_ns: i128,
+}
+
+/// The stash-order-v1 ref ledger.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefLedgerV1 {
+    pub created: bool,
+    pub refs: BTreeMap<String, LandedRef>,
+    pub stash: Option<LandedStashV1>,
+    pub exclude: Option<LandedExclude>,
+}
+
+/// The stash-order-v1 stash op.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StashOpV1 {
+    pub old: Vec<String>,
+    pub new: Vec<String>,
+    pub messages: Vec<String>,
+    pub observed_ns: i128,
+}
+
+/// The stash-order-v1 ref intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefIntentV1 {
+    pub ops: Vec<RefOp>,
+    pub stash: Option<StashOpV1>,
+    pub ledger: RefLedgerV1,
+    pub stash_at: Option<Vec<String>>,
+}
+
+impl From<RefLedgerV1> for RefLedger {
+    fn from(v1: RefLedgerV1) -> Self {
+        Self {
+            created: v1.created,
+            refs: v1.refs,
+            stash: v1.stash.map(|row| LandedStash {
+                order: row
+                    .order
+                    .into_iter()
+                    .map(|oid| StashEntry::new(oid, Vec::new()))
+                    .collect(),
+                observed_ns: row.observed_ns,
+                identity: StashIdentity::Commit,
+            }),
+            exclude: v1.exclude,
+        }
+    }
+}
+
+impl RefIntentV1 {
+    /// This intent in stash-order-v2 terms, against the destination's stash
+    /// reflog `dst` as it stands under the lock. The new order is exact: a
+    /// v1 store wrote each message it carried (`bulkload stash` for an
+    /// empty one). The old order named commits only; when `dst` names the
+    /// same commits it is `dst` (the stash the op found, nothing stored
+    /// yet); for an append it is the new order's tail (the entries the
+    /// append kept); otherwise its messages are unknown and it can match no
+    /// state `dst` is in. Each recorded progress state is the old order, the
+    /// empty reflog, or a suffix of the new order, as `stash_path` made
+    /// them.
+    ///
+    /// # Errors
+    /// `FRAME_CODEC` when the op's messages do not pair with its new order
+    /// or a progress state is none of those: never a guess.
+    pub fn resolve(self, dst: &[StashEntry]) -> Result<RefIntent> {
+        let Some(op) = self.stash else {
+            if self.stash_at.is_some() {
+                return Err(BulkloadRefusal::FrameCodec);
+            }
+            return Ok(RefIntent {
+                ops: self.ops,
+                stash: None,
+                ledger: self.ledger.into(),
+                stash_at: None,
+            });
+        };
+        if op.messages.len() != op.new.len() {
+            return Err(BulkloadRefusal::FrameCodec);
+        }
+        let new: Vec<StashEntry> = op
+            .new
+            .iter()
+            .zip(&op.messages)
+            .map(|(oid, message)| {
+                let stored = if message.is_empty() {
+                    "bulkload stash"
+                } else {
+                    message.as_str()
+                };
+                StashEntry::new(oid.clone(), reflog_message(stored.as_bytes()))
+            })
+            .collect();
+        let commits = |entries: &[StashEntry]| -> Vec<String> {
+            entries.iter().map(|entry| entry.oid.clone()).collect()
+        };
+        // An append (the new order ends with the old one, by commit) kept
+        // the old entries as they were, so their messages are the new
+        // order's tail: with them, a destination one store past the old
+        // order (a crash between a store and its record) is a state of the
+        // op's path again and is settled forward, as the v1 code settled
+        // it (review finding 6).
+        let old: Vec<StashEntry> = if commits(dst) == op.old {
+            dst.to_vec()
+        } else if op.new.ends_with(&op.old) {
+            new.get(new.len() - op.old.len()..)
+                .unwrap_or_default()
+                .to_vec()
+        } else {
+            op.old
+                .iter()
+                .map(|oid| StashEntry::new(oid.clone(), Vec::new()))
+                .collect()
+        };
+        let state = |at: Vec<String>| -> Result<Vec<StashEntry>> {
+            if at == op.old {
+                Ok(old.clone())
+            } else if at.is_empty() {
+                Ok(Vec::new())
+            } else if op.new.ends_with(&at) {
+                Ok(new.get(new.len() - at.len()..).unwrap_or_default().to_vec())
+            } else {
+                Err(BulkloadRefusal::FrameCodec)
+            }
+        };
+        let stash_at = self.stash_at.map(state).transpose()?;
+        let mut ledger = RefLedger::from(self.ledger);
+        // The ledger the v1 step planned names the op's new order.
+        if let Some(row) = &mut ledger.stash {
+            if commits(&row.order) == op.new {
+                *row = LandedStash::of(new.clone(), row.observed_ns);
+            }
+        }
+        Ok(RefIntent {
+            ops: self.ops,
+            stash: Some(StashOp {
+                old,
+                new,
+                observed_ns: op.observed_ns,
+            }),
+            ledger,
+            stash_at,
+        })
+    }
+}
+
+/// A pending ref intent as read: current, or stash-order-v1 to be resolved
+/// against the destination ([`RefIntentV1::resolve`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingRefIntent {
+    Current(RefIntent),
+    V1(RefIntentV1),
+}
+
+/// Read a pending ref intent of either layout, `None` when there is none.
+///
+/// # Errors
+/// As [`read`].
+pub fn read_ref_intent(path: &Path) -> Result<Option<PendingRefIntent>> {
+    let Some(bytes) = read_bytes(path)? else {
+        return Ok(None);
+    };
+    if let Some(body) = bytes.strip_prefix(REFS_MAGIC.as_slice()) {
+        return decode(body).map(|intent| Some(PendingRefIntent::Current(intent)));
+    }
+    let body = bytes
+        .strip_prefix(MAGIC.as_slice())
+        .ok_or(BulkloadRefusal::FrameCodec)?;
+    decode(body).map(|intent| Some(PendingRefIntent::V1(intent)))
+}
+
+// A record's body, strictly: the whole of it, nothing after.
+fn decode<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T> {
+    let (value, rest) = postcard::take_from_bytes(body).refuse_at("git_carry::landed::decode")?;
+    if !rest.is_empty() {
+        return Err(BulkloadRefusal::FrameCodec);
+    }
+    Ok(value)
+}
+
 /// Read a record, `None` when there is none.
-pub fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+pub fn read<T: Record>(path: &Path) -> Result<Option<T>> {
+    let Some(bytes) = read_bytes(path)? else {
+        return Ok(None);
+    };
+    if let Some(body) = bytes.strip_prefix(T::MAGIC.as_slice()) {
+        return decode(body).map(Some);
+    }
+    let (magic, body) = bytes.split_at(bytes.len().min(MAGIC.len()));
+    T::earlier(magic, body).map_or_else(
+        || Err(BulkloadRefusal::FrameCodec),
+        |record| record.map(Some),
+    )
+}
+
+// A record file's bytes under the size cap, `None` when there is none.
+fn read_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
     const SITE: &str = "git_carry::landed::read";
     let file = match OpenOptions::new()
         .read(true)
@@ -332,19 +738,12 @@ pub fn read<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     if bytes.len() > LEDGER_CAP {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
-    let body = bytes
-        .strip_prefix(MAGIC.as_slice())
-        .ok_or(BulkloadRefusal::FrameCodec)?;
-    let (value, rest) = postcard::take_from_bytes(body).refuse_at(SITE)?;
-    if !rest.is_empty() {
-        return Err(BulkloadRefusal::FrameCodec);
-    }
-    Ok(Some(value))
+    Ok(Some(bytes))
 }
 
 /// The encoded bytes of a record; `BUDGET_EXCEEDED` over [`LEDGER_CAP`].
-pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let mut bytes = MAGIC.to_vec();
+pub fn encode<T: Record>(value: &T) -> Result<Vec<u8>> {
+    let mut bytes = T::MAGIC.to_vec();
     bytes.extend(postcard::to_allocvec(value).refuse_at("git_carry::landed::encode")?);
     if bytes.len() > LEDGER_CAP {
         return Err(BulkloadRefusal::BudgetExceeded);
@@ -353,7 +752,7 @@ pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 /// Write a record atomically: temporary, fsync, rename, directory fsync.
-pub fn write<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub fn write<T: Record>(path: &Path, value: &T) -> Result<()> {
     write_bytes(path, &encode(value)?)
 }
 
