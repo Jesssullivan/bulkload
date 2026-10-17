@@ -4819,7 +4819,8 @@ fn nested_administration(
     // Git reads it right-trimmed of whitespace and, when relative (`worktree
     // add --relative-paths`, `worktree.useRelativePaths`), against the
     // administration directory itself; `join` keeps an absolute one.
-    let registered = fs::read(admin.join("gitdir")).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let registered =
+        fs::read(admin.join("gitdir")).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
     let registered = registered.trim_ascii_end();
     if registered.is_empty() || registered.contains(&0) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
@@ -4834,11 +4835,8 @@ fn nested_administration(
             let back = read_pointer_file(&theirs)
                 .ok()
                 .and_then(|bytes| {
-                    pointer_target(&bytes).map(|target| {
-                        theirs
-                            .parent()
-                            .map(|parent| parent.join(target))
-                    })
+                    pointer_target(&bytes)
+                        .map(|target| theirs.parent().map(|parent| parent.join(target)))
                 })
                 .flatten()
                 .map(|target| resolve_admin(&target))
@@ -10041,7 +10039,11 @@ mod tests {
                 .arg(&nested),
         )
         .unwrap();
-        fs::write(source.join(".git/worktrees/rel/gitdir"), b"../../../wt/rel/.git\n").unwrap();
+        fs::write(
+            source.join(".git/worktrees/rel/gitdir"),
+            b"../../../wt/rel/.git\n",
+        )
+        .unwrap();
         fs::write(nested.join(".git"), b"gitdir: ../../.git/worktrees/rel\r\n").unwrap();
         let head = text(git(&nested).args(["rev-parse", "--verify", "HEAD"])).unwrap();
         let custody = nested_worktrees(&source);
