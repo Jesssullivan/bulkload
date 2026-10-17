@@ -4743,9 +4743,12 @@ fn repository_census(root: &Path, common: &Path) -> Result<Census> {
 // file resolving to a worktree administration directory of `common`,
 // registered back to this checkout, is a nested worktree of the same
 // repository; a pointer resolving to administration of a different repository
-// is a foreign nested repository. A symlink, an unreadable `.git`, an
-// unresolvable pointer, or a pointer into `common` that is not a registered
-// worktree keeps the refusal: that is malformed inventory, not custody.
+// is a foreign nested repository. A symlink or an unreadable `.git` keeps
+// the refusal: that is malformed inventory, not custody. A pointer naming no
+// existing administration, or a worktree administration of `common`
+// registered to another checkout, refuses `GIT_NEST_POINTER_STALE` with the
+// directory's path (M2r2 item 6): a leftover copy of a worktree, which Git
+// does not read as a repository and the capture cannot carry as seats.
 fn nested_administration(
     root: &Path,
     directory: &Path,
@@ -4798,11 +4801,25 @@ fn nested_administration(
         .map(str::trim_end)
         .filter(|value| !value.is_empty())
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-    // Any unresolvable pointer is malformed inventory, never a transient IO fault.
-    let admin = fs::canonicalize(directory.join(target))
-        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    // M2r2 item 6: a pointer naming an administration that does not exist
+    // (a copy of a pruned or moved linked worktree, or one carried from
+    // another host) is stale, named by its directory; Git does not read the
+    // directory as a repository either. Any other unresolvable pointer is
+    // malformed inventory, never a transient IO fault.
+    let stale =
+        || -> Result<BulkloadRefusal> { Ok(BulkloadRefusal::GitNestPointerStale(rel_path()?)) };
+    let admin = match fs::canonicalize(directory.join(target)) {
+        Ok(admin) => admin,
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ENOTDIR) =>
+        {
+            return Err(stale()?);
+        }
+        Err(_) => return Err(BulkloadRefusal::GitInventoryMalformed),
+    };
     if !admin.is_dir() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        return Err(stale()?);
     }
     let worktrees = common.join("worktrees");
     if admin.parent() != Some(worktrees.as_path()) {
@@ -4824,7 +4841,9 @@ fn nested_administration(
     if fs::canonicalize(registered.trim_end()).ok()
         != Some(fs::canonicalize(&pointer).refuse_at("git_carry::nested_administration")?)
     {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
+        // A worktree administration of this repository registered to another
+        // checkout: this directory is a copy of that worktree (M2r2 item 6).
+        return Err(stale()?);
     }
     // Git itself must agree that this is a linked worktree of the same repository.
     let seen =
@@ -9780,9 +9799,10 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // Custody is for repositories Git can read. A symlink named .git, an
-    // unresolvable pointer, and a directory named .git that is not a
-    // repository are malformed inventory, exactly as before R-N32.
+    // Custody is for repositories Git can read. A symlink named .git and a
+    // directory named .git that is not a repository are malformed inventory,
+    // exactly as before R-N32; a pointer that resolves to nothing is a stale
+    // worktree copy, named by its directory (M2r2 item 6).
     #[test]
     fn a_symlinked_dot_git_still_refuses() {
         let root =
@@ -9819,7 +9839,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reusable_capture_key(&source),
-            Err(BulkloadRefusal::GitInventoryMalformed)
+            Err(BulkloadRefusal::GitNestPointerStale(b"stray".to_vec()))
         );
         fs::remove_dir_all(&stray).unwrap();
         // A directory named .git that Git cannot read as a repository: the
@@ -9835,6 +9855,114 @@ mod tests {
         fs::remove_dir_all(&hollow).unwrap();
         assert!(nested_repositories(&source).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // M2r2 item 6 (the telefreeze GIT_INVENTORY_MALFORMED): an ignored
+    // archive in the checkout holds copies of linked worktrees whose `.git`
+    // pointer files name administrations that were pruned, or that exist
+    // only on the host the repository was carried from. Git reads none of
+    // them as a repository. The capture refuses with a typed code naming
+    // the first such directory instead of a bare GIT_INVENTORY_MALFORMED,
+    // before any byte is read and without writing to the source. A copy of
+    // a live linked worktree (its pointer names an administration
+    // registered to another checkout) is stale the same way.
+    #[test]
+    fn a_stale_worktree_pointer_copy_refuses_typed_with_its_path() {
+        let root = fresh("bulkload-stale-pointer");
+        let source = root.join("main");
+        committed_repository(&source, b"main");
+        fs::create_dir_all(source.join(".git/info")).unwrap();
+        fs::write(source.join(".git/info/exclude"), b"archive/\n").unwrap();
+        // A pruned worktree's administration, spelled as another host would.
+        let pruned = source.join("archive/pruned-20261006/tree");
+        fs::create_dir_all(&pruned).unwrap();
+        fs::write(pruned.join("kept.txt"), b"evidence").unwrap();
+        fs::write(
+            pruned.join(".git"),
+            b"gitdir: /Users/nobody/git/main/.git/worktrees/pruned-20261006\n",
+        )
+        .unwrap();
+        let ignored =
+            output(git(&source).args(["status", "--porcelain", "--ignored", "-uall"])).unwrap();
+        // Git itself descends into the copy: it is no repository to Git.
+        assert!(
+            String::from_utf8_lossy(&ignored).contains("!! archive/pruned-20261006/tree/kept.txt"),
+            "{}",
+            String::from_utf8_lossy(&ignored)
+        );
+        let stamps = walk_stamps(&source.join(".git"));
+        let expected =
+            BulkloadRefusal::GitNestPointerStale(b"archive/pruned-20261006/tree".to_vec());
+        assert_eq!(reusable_capture_key(&source), Err(expected.clone()));
+        assert_eq!(
+            export_repository(&source, &root.join("capture-pruned")),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            expected.to_string(),
+            "GIT_NEST_POINTER_STALE path=\"archive/pruned-20261006/tree\""
+        );
+        // A pointer through a regular file (ENOTDIR) is stale too.
+        fs::write(
+            pruned.join(".git"),
+            format!("gitdir: {}\n", source.join("tracked/worktrees/x").display()),
+        )
+        .unwrap();
+        assert_eq!(reusable_capture_key(&source), Err(expected.clone()));
+        // A pointer to a regular file names no administration either.
+        fs::write(
+            pruned.join(".git"),
+            format!("gitdir: {}\n", source.join("tracked").display()),
+        )
+        .unwrap();
+        assert_eq!(reusable_capture_key(&source), Err(expected));
+        // The refused passes wrote nothing under the source's administration.
+        assert_eq!(walk_stamps(&source.join(".git")), stamps);
+        fs::remove_dir_all(source.join("archive")).unwrap();
+        // A copy of a live linked worktree: its pointer resolves to an
+        // administration registered back to the real worktree, not to it.
+        let live = root.join("live");
+        output(
+            git(&source)
+                .args(["worktree", "add", "-q", "-b", "live"])
+                .arg(&live),
+        )
+        .unwrap();
+        let copy = source.join("archive/live-copy");
+        fs::create_dir_all(&copy).unwrap();
+        fs::copy(live.join(".git"), copy.join(".git")).unwrap();
+        fs::copy(live.join("tracked"), copy.join("tracked")).unwrap();
+        let stamps = walk_stamps(&source.join(".git"));
+        assert_eq!(
+            reusable_capture_key(&source),
+            Err(BulkloadRefusal::GitNestPointerStale(
+                b"archive/live-copy".to_vec()
+            ))
+        );
+        assert_eq!(walk_stamps(&source.join(".git")), stamps);
+        // Removing the copy restores the capture: nothing else was refused.
+        fs::remove_dir_all(source.join("archive")).unwrap();
+        let captured = reusable_capture_key(&source);
+        fs::remove_dir_all(root).unwrap();
+        assert!(captured.is_ok(), "{captured:?}");
+    }
+
+    // Path, size and modification time of every entry under `dir`, sorted.
+    fn walk_stamps(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut out = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).unwrap() {
+                let entry = entry.unwrap();
+                let meta = fs::symlink_metadata(entry.path()).unwrap();
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                }
+                out.push((entry.path(), meta.len(), meta.modified().unwrap()));
+            }
+        }
+        out.sort();
+        out
     }
 
     // A repository with no foreign nest and no gitlink hashes and encodes

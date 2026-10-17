@@ -967,6 +967,16 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   `git-export` and the other strict exports still refuse any drift.
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
+- A `.git` gitdir-pointer file below the checkout that names no
+  administration of its own (the directory it names is absent or not a
+  directory, as for a copy of a pruned, moved or other-host linked
+  worktree, or it is a worktree administration of this repository
+  registered to another checkout, a copy of a live worktree) refuses
+  `GIT_NEST_POINTER_STALE` with that directory's path, before any byte is
+  read (M2r2 item 6; it was a bare `GIT_INVENTORY_MALFORMED`). Git does not
+  read such a directory as a repository; the capture neither calls it a
+  nest nor carries the pointer as a seat. Removing or renaming the stale
+  pointer in the source is the operator's call.
 - An object-store rewrite is drift too (WP1, S5). The export reads the
   source's pack listing with its authority; when a Git child of the pass
   fails and that listing has changed (a `gc`, `repack` or `prune` racing
