@@ -280,7 +280,9 @@ fn open(path: &Path, create: bool) -> Result<Option<Opened>> {
     if name != "exclude" || info.file_name().is_none_or(|info| info != "info") {
         return Err(BulkloadRefusal::GitIgnorePolicyConflict);
     }
-    let common = info.parent().ok_or(BulkloadRefusal::GitIgnorePolicyConflict)?;
+    let common = info
+        .parent()
+        .ok_or(BulkloadRefusal::GitIgnorePolicyConflict)?;
     let common = fs::File::from(
         crate::io::sys::open_dir_path_nofollow(common).map_err(|e| conflict_or_io(&e, SITE))?,
     );
@@ -492,7 +494,8 @@ pub fn apply(
 ) -> Result<Vec<u8>> {
     const SITE: &str = "git_carry::exclude_union::apply";
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let Opened { info, file } = open(path, true)?.ok_or(BulkloadRefusal::GitIgnorePolicyConflict)?;
+    let Opened { info, file } =
+        open(path, true)?.ok_or(BulkloadRefusal::GitIgnorePolicyConflict)?;
     let (before, mode) = match &file {
         Some((stat, _)) => (Some(stat.node), stat.mode & 0o7777),
         None => (None, 0o644),
@@ -507,8 +510,8 @@ pub fn apply(
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     );
     let temporary_name = c_name(temporary.as_bytes())?;
-    let written = crate::io::sys::create_excl_at(info.as_fd(), &temporary_name, 0o600)
-        .and_then(|fd| {
+    let written =
+        crate::io::sys::create_excl_at(info.as_fd(), &temporary_name, 0o600).and_then(|fd| {
             let mut file = fs::File::from(fd);
             file.write_all(&bytes)?;
             // The old file's mode exactly, whatever the umask removed.
@@ -594,10 +597,8 @@ mod tests {
     }
 
     fn scratch(line: u32) -> std::path::PathBuf {
-        let base = std::env::temp_dir().join(format!(
-            "bulkload-exunion-{}-{line}",
-            std::process::id()
-        ));
+        let base =
+            std::env::temp_dir().join(format!("bulkload-exunion-{}-{line}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("repo.git/info")).unwrap();
         fs::canonicalize(&base).unwrap()
@@ -834,7 +835,10 @@ mod tests {
                 item: "item".to_owned(),
                 appends: vec![
                     intent(".bulkload-exclude-t0", identity(&path)),
-                    intent(".bulkload-exclude-t1", identity(&info.join(".bulkload-exclude-t1"))),
+                    intent(
+                        ".bulkload-exclude-t1",
+                        identity(&info.join(".bulkload-exclude-t1")),
+                    ),
                     intent(".bulkload-exclude-t2", (0, 0)),
                 ],
             },

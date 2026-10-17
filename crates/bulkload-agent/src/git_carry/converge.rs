@@ -3033,14 +3033,7 @@ pub(super) fn plan_linked(
     // `--exclude-union`: under the repository-wide exclude lock, an append
     // a crash cut short is settled first.
     let exclude_path = checked.exclude_path.as_path();
-    let exclude_lock = match landing.exclude_union {
-        Some(record) => {
-            let held = super::exclude_union::lock(&common)?;
-            super::exclude_union::settle(record, exclude_path)?;
-            Some(held)
-        }
-        None => None,
-    };
+    let exclude_lock = union_settle(landing, &common, exclude_path)?;
     let (exclude, append) = linked_exclude(
         &common,
         &checked.exclude_path,
@@ -3132,6 +3125,18 @@ pub(super) fn plan_linked(
         create,
         lock,
     })
+}
+
+/// `--exclude-union`: the repository-wide exclude lock, taken and held by
+/// the caller, and the item's intents settled under it; `None` without
+/// the flag.
+fn union_settle(landing: &Landing<'_>, common: &Path, path: &Path) -> Result<Option<fs::File>> {
+    let Some(record) = landing.exclude_union else {
+        return Ok(None);
+    };
+    let held = super::exclude_union::lock(common)?;
+    super::exclude_union::settle(record, path)?;
+    Ok(Some(held))
 }
 
 /// `--exclude-union`'s append of `append` to the exclude at `path` (which
