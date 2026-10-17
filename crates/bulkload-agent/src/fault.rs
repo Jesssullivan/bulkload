@@ -338,6 +338,10 @@ pub enum Point {
     /// `estate.adopt.bare_staged`: a bare first landing complete in its
     /// private stage, not published (#226 item 4).
     EstateAdoptBareStaged,
+    /// `estate.apply.parents_made`: a first landing's absent parents made
+    /// (0755, synced), not yet recorded in STATE; nothing landed (M2
+    /// finding 1).
+    EstateApplyParentsMade,
     /// `reseat.after_temp_seal`
     ReseatAfterTempSeal,
     /// `reseat.after_publish`
@@ -384,7 +388,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 61] = [
+    pub const ALL: [Self; 62] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -428,6 +432,7 @@ impl Point {
         Self::EstateAdoptAfterRefs,
         Self::EstateAdoptAfterLedger,
         Self::EstateAdoptBareStaged,
+        Self::EstateApplyParentsMade,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
         Self::ReseatAfterExtendIntent,
@@ -495,6 +500,7 @@ impl Point {
             Self::EstateAdoptAfterRefs => "estate.adopt.after_refs",
             Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
             Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
+            Self::EstateApplyParentsMade => "estate.apply.parents_made",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",
             Self::ReseatAfterExtendIntent => "reseat.after_extend_intent",

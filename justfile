@@ -25,7 +25,15 @@ python-lint:
     cd {{ root }} && ruff format --check scripts tests
 
 shell-lint:
-    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh
+    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh scripts/install-agent.sh
+
+# Build a release bulkload-agent and install it as DEST_DIR/NAME with a GC
+# root for every /nix/store path it names, so a Nix garbage collection cannot
+# delete its interpreter or libraries (M2 item 4). The selftest it runs last
+# reports whether its interpreter is present and rooted. Never replaces NAME.
+install-agent DEST_DIR NAME:
+    cd {{ root }} && cargo build --release --locked -p bulkload-agent
+    cd {{ root }} && scripts/install-agent.sh "${CARGO_TARGET_DIR:-target}/release/bulkload-agent" "{{ DEST_DIR }}" "{{ NAME }}"
 
 workflow-lint:
     cd {{ root }} && actionlint .github/workflows/*.yml
@@ -363,6 +371,7 @@ check-optional:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_ab.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_r23_corpus.py
     cd {{ root }} && python3 crates/bulkload-bench/scripts/test_s3_estate.py
+    cd {{ root }} && python3 crates/bulkload-bench/scripts/test_m3_link.py
     cd {{ root }} && {{ just_executable() }} bench-estate-corpus-selftest
     cd {{ root }} && {{ just_executable() }} secrets-scan-history
     cd {{ root }} && {{ just_executable() }} flake-check
@@ -1155,3 +1164,41 @@ bench-s2-budget *args:
 # S1 gate (b) neo->sting pull harness (OI-1003-Q3, OI-1003-Q66)
 bench-gate-b *args:
     cd {{ root }} && python3 crates/bulkload-bench/scripts/gate_b.py {{ args }}
+
+# `census ROOT --label L [--kind state|git] [--ssh-host H]` (read-only, lstat
+# only), `generate DEST --profile CENSUS.json ... --bytes N`, `verify DEST`,
+# `fixture DEST` and `run`: bulkload `pull` (B) against plain rclone over sftp
+# (P, the gate comparator), tuned rclone (R), rclone + `sync -f` (S, equal
+# durability) and `rsync -a` (Y, reference only), B/A/B/A/B per phase
+# (initial, unchanged rerun, the C3 1 % in-place delta), plus with
+# --git the estate arm (estate-capture, pull, estate-apply) against rclone of
+# the same checkouts; iperf3 and ssh ceilings and both hosts' load per arm.
+# rclone, iperf3 and rsync come from the flake-pinned nixpkgs, never a system
+# package. A neo->sting run is informational until a ruling says which hosts
+# carry gate (b)'s gated samples (SPEC R3); --dry-run is a one-host loopback,
+# NOT A SAMPLE. Plan: docs/agent-notes/2026-10-16-m3-real-link-proof-plan.md.
+# M3 real-link proof harness (axiom 7, OI-1003-Q194 C2)
+[positional-arguments]
+bench-m3-link *args:
+    cd {{ root }} && nix shell --inputs-from . nixpkgs#rclone nixpkgs#iperf3 nixpkgs#rsync --command nice -n 10 python3 crates/bulkload-bench/scripts/m3_link.py "$@"
+
+# The harness's loopback self-test on this host (NOT A SAMPLE): a 128 MiB
+# corpus generated from the committed 2026-10-16 census profiles through every
+# file arm, then the Git arm on a tiny fixture. WORK must be new; it is removed
+# afterwards unless KEEP=1. AGENT is a local bulkload-agent build.
+# M3 harness dry run (loopback, NOT A SAMPLE)
+bench-m3-dry-run agent work="/dev/shm/m3-dry-run":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cd {{ root }}
+    w={{ work }}
+    if [[ -e $w ]]; then echo "bench-m3-dry-run: $w must be new" >&2; exit 2; fi
+    mkdir -p "$w"
+    p=docs/evidence/m3-census-2026-10-16
+    m3() { nix shell --inputs-from . nixpkgs#rclone nixpkgs#iperf3 nixpkgs#rsync --command nice -n 10 python3 crates/bulkload-bench/scripts/m3_link.py "$@"; }
+    m3 generate "$w/corpus" --profile "$p/claude.json" --profile "$p/codex.json" --profile "$p/git.json" --bytes 134217728
+    m3 run --dry-run --work-root "$w/files" --agent "{{ agent }}" --source-corpus "$w/corpus" --reps 1 --rclone-tune 4,16
+    m3 fixture "$w/fixture"
+    m3 run --dry-run --work-root "$w/git" --agent "{{ agent }}" --source-subset "git=$w/fixture/git" --git --order BPBRBSY --reps 1 --iperf3 ''
+    cat "$w/files/m3-link.md" "$w/git/m3-link.md"
+    if [[ ${KEEP:-0} != 1 ]]; then chmod -R u+w "$w" && rm -rf "$w"; fi

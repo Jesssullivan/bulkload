@@ -273,6 +273,10 @@ pub struct Creation {
     /// Directories created by the plain `mkdirat` fallback because the
     /// filesystem has no atomic no-replace rename, by relative path.
     pub fallback: Vec<Vec<u8>>,
+    /// Existing directories this store does not own, entered with their
+    /// mode kept although it differs from the source's (M2 item 2): by
+    /// relative path, with the mode found and the source's.
+    pub mode_kept: Vec<(Vec<u8>, u32, u32)>,
 }
 
 struct OwnedDirectory {
@@ -451,8 +455,20 @@ impl Destination {
     ///
     /// An existing directory is adopted only when its record names its inode
     /// and mode. Any other record is cleared, so it can never adopt later. A
-    /// directory with no owning record fails closed on a divergent mode. An
-    /// existing directory is swept of this store's orphaned temporaries.
+    /// directory with no owning record is never adopted: its mode is never
+    /// changed and no record binds it. One whose mode equals the source's is
+    /// entered as before. One whose mode differs is accepted too, its mode
+    /// kept and reported ([`Creation::mode_kept`], `dest_directory_mode_kept`),
+    /// when it is this user's, gives its owner read, write and search, and
+    /// grants nobody else anything the source's mode does not (M2 item 2: a
+    /// copy of an unfinished landing, 0700 under a 0755 source, refused every
+    /// directory of the copy, 160 of them, and the pull exited 1; the files
+    /// below were decided all the same). Such a directory never converges to
+    /// the source's mode: that would adopt it. Any other divergent mode
+    /// (wider than the source's, another owner, no owner access) is refused
+    /// `DESTINATION_OCCUPIED`, and only its own row: the entries below it are
+    /// decided as before (a stated gap, #248). An existing
+    /// directory is swept of this store's orphaned temporaries.
     ///
     /// # Errors
     /// Refuses non-directory conflicts, divergent existing modes and foreign
@@ -904,7 +920,14 @@ impl Destination {
                 key: key.to_vec(),
             });
         } else if metadata.mode() & 0o7777 != mode {
-            return Err(BulkloadRefusal::DestinationOccupied);
+            let found = metadata.mode() & 0o7777;
+            if !kept_mode(found, mode, metadata.uid()) {
+                return Err(BulkloadRefusal::DestinationOccupied);
+            }
+            counters::bump(Counter::DestDirectoryModeKept);
+            self.created
+                .mode_kept
+                .push((row.rel_path.clone(), found, mode));
         }
         Ok(())
     }
@@ -2817,6 +2840,19 @@ pub(crate) fn verify_existing(
 /// The `(dev, ino)` of a directory record committed before its `mkdirat`
 /// (R-N119). No inode on Darwin or Linux has number 0.
 const INTENT: (u64, u64) = (0, 0);
+
+/// Whether an existing directory this store does not own, with mode `found`
+/// where the source's is `source`, is entered with its mode kept (M2 item
+/// 2): it is this user's (`uid`), its owner can read, write and search it,
+/// and it grants nobody else anything `source` does not (no group, other or
+/// special bit the source lacks). The owner's own bits are not compared:
+/// an unfinished landing's 0700 directory under a read-only 0555 or 0500
+/// source exposes nothing.
+fn kept_mode(found: u32, source: u32, uid: u32) -> bool {
+    uid == crate::io::sys::effective_uid()
+        && found & 0o700 == 0o700
+        && found & !source & 0o7077 == 0
+}
 
 /// Whether `directory` is still exactly what the fallback `mkdirat` made: an
 /// empty directory with mode 0700, owned by this user.

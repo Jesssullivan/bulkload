@@ -351,6 +351,11 @@ counters! {
     // their last look because a `-wal`, `-journal` or `-shm` had appeared
     // beside the path since the entry was decided (OI-1003-Q146).
     DestSqliteSidecarRefused => "dest_sqlite_sidecar_refused",
+    // Existing directories this destination store does not own, entered
+    // with their mode kept although it differs from the source's (M2 item
+    // 2): this user's, owner read, write and search, and nothing wider than
+    // the source's mode. Each is also reported `directory-mode-kept`.
+    DestDirectoryModeKept => "dest_directory_mode_kept",
     // `estate-reseat` (R0, TIN-6587). Bytes read from the landed agent
     // state (the run's copy of the source's `~/.claude` and `~/.codex`):
     // 0 on a pass whose landed files and Codex snapshot are unchanged (S3);
@@ -362,6 +367,18 @@ counters! {
     ReseatDestRead => "read_reseat_dest_bytes",
     // Bytes written into the destination's live agent state.
     ReseatDestWrite => "write_reseat_dest_bytes",
+    // Bounded starvation (M2 item 3): a process at background priority
+    // whose counters did not move for `--escalate-after` seconds moved its
+    // IO back to the normal class once (`priority::escalate`): how many
+    // times it was tried (0 or 1), when (nanoseconds from start), and how
+    // many threads moved (its own and its descendants' on Linux; 1, the
+    // process, on Darwin).
+    PriorityEscalations => "priority_escalations",
+    PriorityEscalatedNs => "priority_escalated_ns",
+    PriorityEscalatedThreads => "priority_escalated_threads",
+    // Threads (Linux) an escalation could not move, or 1 when it failed
+    // for the process itself.
+    PriorityEscalationFailures => "priority_escalation_failures",
 }
 
 const COUNT: usize = Counter::ALL.len();

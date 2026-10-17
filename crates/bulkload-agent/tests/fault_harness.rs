@@ -1474,6 +1474,8 @@ scenarios! {
     estate_adopt_after_refs => EstateAdoptAfterRefs: 1, EstateAdopt::Workspace;
     estate_adopt_after_ledger => EstateAdoptAfterLedger: 1, EstateAdopt::Workspace;
     estate_adopt_bare_staged => EstateAdoptBareStaged: 1, EstateAdopt::Bare;
+    // M2 finding 1: a first landing's absent parents made, not recorded.
+    estate_apply_parents_made => EstateApplyParentsMade: 1, EstateAdopt::Parents;
     // Re-seat (R0, TIN-6587): a first pass crashed at its first and its last
     // placement (the transcript, then the Codex rollout) and at its row
     // commit; a pass extending a grown transcript; a pass superseding a

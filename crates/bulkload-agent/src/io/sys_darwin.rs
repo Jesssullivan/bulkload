@@ -271,6 +271,35 @@ pub fn enter_background() -> io::Result<()> {
     super::sys_posix::nice_background()
 }
 
+/// `IOPOL_DEFAULT`: the disk IO policy an unprioritised process has.
+const IOPOL_DEFAULT: libc::c_int = 0;
+
+/// Bounded starvation (M2 item 3): set the process-wide disk IO policy back
+/// to `IOPOL_DEFAULT`. Unverified on Darwin and likely limited: a thread's
+/// effective IO tier is also bounded by its `QoS` class, which stays
+/// `QOS_CLASS_BACKGROUND` (only the thread itself can change it), and no
+/// call changes a running child's policy, so this mainly helps children
+/// started afterwards. The `auto` class is Darwin's remedy. Nice stays 19.
+/// Returns `(1, 0)`: the process policy moved, nothing failed.
+///
+/// # Errors
+/// Returns the `setiopolicy_np` failure.
+pub fn escalate_io() -> io::Result<(u64, u64)> {
+    // SAFETY: `setiopolicy_np` takes three integers and no pointers.
+    if unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_DEFAULT) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((1, 0))
+}
+
+/// The bytes this process's descendants have moved, for the starvation
+/// watcher. Darwin has no `/proc`: always 0, so only the agent's own
+/// counters count as progress there (M2 item 3).
+#[must_use]
+pub const fn descendant_io() -> u64 {
+    0
+}
+
 /// Whether the process runs at background priority: the `IOPOL_THROTTLE`
 /// disk policy, the calling thread at `QOS_CLASS_BACKGROUND`, and nice 19.
 ///
