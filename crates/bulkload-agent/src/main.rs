@@ -2039,57 +2039,165 @@ fn selftest() -> Result<()> {
     println!("  frame decoded {decoded:?}");
     println!("  round trip    exact (ok)");
     // M2 item 4: whether this binary survives a Nix garbage collection.
-    println!("  interpreter   {}", interpreter_report());
+    let image = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::read(exe).ok());
+    println!("  interpreter   {}", interpreter_report(image.as_deref()));
+    println!("  gc roots      {}", gc_roots_report(image.as_deref()));
     println!("selftest: ok");
     Ok(())
 }
 
 /// The selftest's interpreter line (M2 item 4, 2026-10-16: a GC deleted the
-/// glibc an installed agent was linked against). Names this binary's ELF
-/// interpreter (`PT_INTERP`), whether it exists, whether it lives in
-/// `/nix/store` (so a GC can delete it), and whether a GC root under
-/// `$BULKLOAD_GCROOTS` (default `${XDG_STATE_HOME:-~/.local/state}/bulkload/
-/// gcroots`, where `scripts/install-agent.sh` puts them) names its store
-/// path. A binary whose interpreter is gone cannot start, so this line is
-/// the warning before a GC, not after: `rooted=no` with `nix-store=yes`.
-fn interpreter_report() -> String {
-    let Some(interpreter) = std::fs::read("/proc/self/exe")
-        .ok()
-        .and_then(|image| elf_interpreter(&image))
-    else {
-        return "none (not a dynamically linked ELF binary)".to_owned();
+/// glibc an installed agent was linked against): this binary's ELF
+/// interpreter (`PT_INTERP`), whether it exists, and whether it lives in
+/// `/nix/store`, where a GC can delete it. A binary whose interpreter is
+/// already gone cannot start, so this and [`gc_roots_report`] are the
+/// warning before a GC, not after.
+fn interpreter_report(image: Option<&[u8]>) -> String {
+    let Some(interpreter) = image.and_then(elf_interpreter) else {
+        return "none (no PT_INTERP: not a 64-bit little-endian dynamic ELF image)".to_owned();
     };
-    let exists = Path::new(&interpreter).exists();
-    let store = interpreter
-        .strip_prefix("/nix/store/")
-        .and_then(|rest| rest.split('/').next())
-        .map(|entry| format!("/nix/store/{entry}"));
-    let rooted = store.as_deref().map_or("n/a", |store| {
-        if gc_rooted(Path::new(store)) {
+    format!(
+        "{interpreter} exists={} nix-store={}",
+        if Path::new(&interpreter).exists() {
             "yes"
         } else {
             "no"
-        }
-    });
-    format!(
-        "{interpreter} exists={} nix-store={} rooted={rooted}",
-        if exists { "yes" } else { "no" },
-        if store.is_some() { "yes" } else { "no" },
+        },
+        if interpreter.starts_with("/nix/store/") {
+            "yes"
+        } else {
+            "no"
+        },
     )
 }
 
+/// The selftest's GC-root line: every `/nix/store` path this binary names
+/// (interpreter, `RUNPATH`, dylibs: the paths `scripts/install-agent.sh`
+/// roots), and how many have a GC root that Nix registered: a symlink in
+/// `$BULKLOAD_GCROOTS` (default `${XDG_STATE_HOME:-~/.local/state}/
+/// bulkload/gcroots`) resolving into the path, itself named by an entry of
+/// `/nix/var/nix/gcroots/auto`. A symlink Nix does not know of (copied, or
+/// made by hand) is `unregistered`, not rooted.
+fn gc_roots_report(image: Option<&[u8]>) -> String {
+    let Some(image) = image else {
+        return "unknown (this binary could not be read)".to_owned();
+    };
+    let paths = store_paths(image);
+    let directory = std::env::var_os("BULKLOAD_GCROOTS")
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || {
+                std::env::var_os("XDG_STATE_HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/state"))
+                    })
+                    .unwrap_or_default()
+                    .join("bulkload/gcroots")
+            },
+            PathBuf::from,
+        );
+    let roots: Vec<(PathBuf, PathBuf)> = std::fs::read_dir(&directory)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let link = entry.path();
+                    let target = std::fs::read_link(&link).ok()?;
+                    Some((link, target))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let registered: Option<std::collections::BTreeSet<PathBuf>> =
+        std::fs::read_dir("/nix/var/nix/gcroots/auto")
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                    .collect()
+            });
+    let (mut rooted, mut unregistered, mut unrooted) = (0, 0, Vec::new());
+    for path in &paths {
+        let links: Vec<&PathBuf> = roots
+            .iter()
+            .filter(|(_, target)| target.starts_with(path))
+            .map(|(link, _)| link)
+            .collect();
+        if links.is_empty() {
+            unrooted.push(path.display().to_string());
+        } else if registered
+            .as_ref()
+            .is_none_or(|known| links.iter().any(|link| known.contains(*link)))
+        {
+            rooted += 1;
+        } else {
+            unregistered += 1;
+            unrooted.push(path.display().to_string());
+        }
+    }
+    format!(
+        "store-paths={} rooted={rooted} unregistered={unregistered} registry={} unrooted={}",
+        paths.len(),
+        if registered.is_some() {
+            "read"
+        } else {
+            "unreadable"
+        },
+        if unrooted.is_empty() {
+            "-".to_owned()
+        } else {
+            unrooted.join(",")
+        }
+    )
+}
+
+/// Every `/nix/store/<hash>-<name>` the image names, top-level entries only,
+/// sorted and unique (the store's hash alphabet, then its name characters).
+fn store_paths(image: &[u8]) -> Vec<PathBuf> {
+    const PREFIX: &[u8] = b"/nix/store/";
+    let hash = |byte: &u8| matches!(byte, b'0'..=b'9' | b'a'..=b'd' | b'f'..=b'n' | b'p'..=b's' | b'v'..=b'z');
+    let name = |byte: &u8| byte.is_ascii_alphanumeric() || b"+._?=-".contains(byte);
+    let mut found = std::collections::BTreeSet::new();
+    let mut at = 0;
+    while let Some(offset) = image.get(at..).and_then(|rest| {
+        rest.windows(PREFIX.len())
+            .position(|window| window == PREFIX)
+    }) {
+        let start = at + offset;
+        let body = start + PREFIX.len();
+        at = body;
+        let Some(digest) = image.get(body..body + 32) else {
+            break;
+        };
+        if !digest.iter().all(hash) || image.get(body + 32) != Some(&b'-') {
+            continue;
+        }
+        let end = image.get(body + 33..).map_or(body + 33, |rest| {
+            body + 33 + rest.iter().take_while(|byte| name(byte)).count()
+        });
+        if end > body + 33 {
+            if let Some(bytes) = image.get(start..end) {
+                found.insert(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()));
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
 /// The `PT_INTERP` path of a 64-bit little-endian ELF image, if it has one.
+/// Every offset is checked: a malformed image yields `None`, never a panic.
 fn elf_interpreter(image: &[u8]) -> Option<String> {
     const PT_INTERP: u32 = 3;
-    let u16_at = |at: usize| -> Option<u16> {
-        Some(u16::from_le_bytes(image.get(at..at + 2)?.try_into().ok()?))
-    };
-    let u32_at = |at: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(image.get(at..at + 4)?.try_into().ok()?))
-    };
-    let u64_at = |at: usize| -> Option<usize> {
-        usize::try_from(u64::from_le_bytes(image.get(at..at + 8)?.try_into().ok()?)).ok()
-    };
+    let bytes = |at: usize, len: usize| image.get(at..at.checked_add(len)?);
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes(at, 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes(at, 4)?.try_into().ok()?));
+    let u64_at =
+        |at: usize| usize::try_from(u64::from_le_bytes(bytes(at, 8)?.try_into().ok()?)).ok();
     // ELFCLASS64, ELFDATA2LSB.
     if image.get(..4)? != b"\x7fELF" || image.get(4)? != &2 || image.get(5)? != &1 {
         return None;
@@ -2100,31 +2208,13 @@ fn elf_interpreter(image: &[u8]) -> Option<String> {
         if u32_at(header)? != PT_INTERP {
             return None;
         }
-        let (offset, size) = (u64_at(header + 8)?, u64_at(header + 32)?);
-        let bytes = image.get(offset..offset.checked_add(size)?)?;
-        let bytes = bytes.split(|byte| *byte == 0).next()?;
-        String::from_utf8(bytes.to_vec()).ok()
-    })
-}
-
-/// Whether a symlink in the GC root directory resolves into `store`.
-fn gc_rooted(store: &Path) -> bool {
-    let directory = std::env::var_os("BULKLOAD_GCROOTS").map_or_else(
-        || {
-            std::env::var_os("XDG_STATE_HOME")
-                .map(PathBuf::from)
-                .or_else(|| {
-                    std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/state"))
-                })
-                .unwrap_or_default()
-                .join("bulkload/gcroots")
-        },
-        PathBuf::from,
-    );
-    std::fs::read_dir(directory).is_ok_and(|entries| {
-        entries.flatten().any(|entry| {
-            std::fs::read_link(entry.path()).is_ok_and(|target| target.starts_with(store))
-        })
+        let (offset, size) = (
+            u64_at(header.checked_add(8)?)?,
+            u64_at(header.checked_add(32)?)?,
+        );
+        let found = bytes(offset, size)?;
+        let found = found.split(|byte| *byte == 0).next()?;
+        String::from_utf8(found.to_vec()).ok()
     })
 }
 
