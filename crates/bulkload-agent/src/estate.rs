@@ -1377,7 +1377,7 @@ fn estimated_bundle(parts: &git_carry::KeyParts, retained: Option<&Path>) -> Res
 struct CorpusSpace<'a> {
     corpus: &'a Path,
     floor: u8,
-    probe: fn(&Path) -> Result<crate::space::Space>,
+    probe: fn(&Path) -> Result<crate::space::Limits>,
     reserved: Mutex<u64>,
 }
 
@@ -1386,7 +1386,7 @@ impl<'a> CorpusSpace<'a> {
         Self {
             corpus,
             floor: crate::space::min_free_percent(),
-            probe: crate::space::probe,
+            probe: crate::space::probe_limits,
             reserved: Mutex::new(0),
         }
     }
@@ -1402,8 +1402,9 @@ impl<'a> CorpusSpace<'a> {
             .lock()
             .map_err(|_| BulkloadRefusal::ContractSelfInconsistent)?;
         if bytes > 0 {
-            let space = (self.probe)(self.corpus)?;
-            crate::space::check(reserved.saturating_add(bytes), space, self.floor)?;
+            let limits = (self.probe)(self.corpus)?;
+            let planned = reserved.saturating_add(bytes);
+            crate::space::check_at(self.corpus, (planned, planned), limits, self.floor)?;
             *reserved = reserved.saturating_add(bytes);
         }
         drop(reserved);
@@ -2105,7 +2106,11 @@ type ImportedBases = Mutex<std::collections::BTreeSet<(PathBuf, [u8; 32])>>;
 // `DESTINATION_SPACE_INSUFFICIENT`.
 fn charged_space(refusal: BulkloadRefusal) -> BulkloadRefusal {
     match refusal {
-        BulkloadRefusal::SpaceExhausted(None) => BulkloadRefusal::DestinationSpaceInsufficient,
+        BulkloadRefusal::SpaceExhausted(None) => {
+            // Judged by no limit: no earlier check's numbers belong to it.
+            crate::space::forget_refusal();
+            BulkloadRefusal::DestinationSpaceInsufficient
+        }
         other => other,
     }
 }
@@ -2717,9 +2722,66 @@ fn journal_path(state: &Path, identity: &str, source: &str, digest: &[u8; 32]) -
 /// One pending item's planned writes and its bundle size.
 type ItemSpace = (Vec<(PathBuf, u64)>, u64);
 
+/// What a space plan already charged or found held, so one bundle is
+/// charged to one repository once (M2 round 2, item 1).
+#[derive(Default)]
+struct Charged {
+    /// `(repository, bundle)` pairs charged or proven held.
+    seen: std::collections::BTreeSet<(PathBuf, PathBuf)>,
+    /// Whether each `(repository, bundle)` pair's repository holds it
+    /// whole, held or not (review B6: one test per pair).
+    held: std::collections::BTreeMap<(PathBuf, PathBuf), bool>,
+}
+
+impl Charged {
+    /// Whether the destination `repository` already holds every object
+    /// `bundle` brings (the test its import makes before it takes
+    /// anything); `false` when it does not exist or cannot be read.
+    fn held(&mut self, repository: &Path, bundle: &Path) -> bool {
+        let key = (repository.to_path_buf(), bundle.to_path_buf());
+        if let Some(held) = self.held.get(&key) {
+            return *held;
+        }
+        let held = repository.try_exists().unwrap_or(false)
+            && git_carry::bundle_held(repository, bundle).unwrap_or(false);
+        self.held.insert(key, held);
+        held
+    }
+}
+
+/// What the workspace ledger at `workspace` says it holds for `source`:
+/// `Some(capture digest)` when it records a landed checkout, `None` when
+/// there is none or it cannot be read.
+fn landed_capture(workspace: &Path, source: &str) -> Option<[u8; 32]> {
+    use git_carry::landed;
+    let git_dir = landed::worktree_git_dir(workspace).ok()??;
+    let ledger = landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_LANDED);
+    landed::read::<landed::LandedWorkspace>(&ledger)
+        .ok()?
+        .map(|landed| landed.capture)
+}
+
 /// One pending item's planned writes: `(path, bytes)` per destination, and
 /// its bundle size for the staging peak. `None` when it is not pending.
-fn item_space(item: &Item, corpus: &Path, state: &Path, source: &str) -> Result<Option<ItemSpace>> {
+///
+/// Objects (the capture's bundle, its chain links and plan bases) are
+/// charged to the repository only for a bundle the destination repository
+/// does not already hold whole, and only once per repository across the
+/// plan (M2 round 2, item 1). The checkout is charged apart from the
+/// objects (review B3), to the workspace (a standalone's is its
+/// repository): nothing when its workspace ledger records this capture;
+/// the capture's own bundle (the bytes it brings beyond its chain) when the
+/// ledger records an earlier one, which a converge moves forward; the
+/// whole chain when no checkout was recorded (a first landing, or one a
+/// crash interrupted after its objects or its `worktree add`). Bundle bytes
+/// are compressed: a lower bound on a checkout.
+fn item_space(
+    item: &Item,
+    corpus: &Path,
+    state: &Path,
+    source: &str,
+    charged: &mut Charged,
+) -> Result<Option<ItemSpace>> {
     let identity = id(item)?;
     let record = corpus.join(format!("{identity}.capture"));
     if !record.try_exists().refuse_at("estate::item_space")? {
@@ -2736,67 +2798,80 @@ fn item_space(item: &Item, corpus: &Path, state: &Path, source: &str) -> Result<
     // A chained capture lands its whole chain's objects (WP2), and the
     // objects of every plan base the chain is bound to (L6b's fix 2).
     let chain = chain_links(corpus, &captured.bundle, LinkBinding::Digest)?;
-    let bundle = chain.links.iter().chain(&chain.bases).try_fold(
-        fs::metadata(corpus.join(&captured.bundle))
-            .refuse_at("estate::item_space")?
-            .len(),
-        |total, (link, _)| {
-            Ok::<_, BulkloadRefusal>(
-                total.saturating_add(fs::metadata(link).refuse_at("estate::item_space")?.len()),
-            )
-        },
-    )?;
+    let head = corpus.join(&captured.bundle);
+    let mut bundles = vec![head.clone()];
+    bundles.extend(
+        chain
+            .links
+            .iter()
+            .chain(&chain.bases)
+            .map(|(link, _)| link.clone()),
+    );
+    let mut bundle = 0_u64;
+    let mut objects = 0_u64;
+    for path in &bundles {
+        let size = fs::metadata(path).refuse_at("estate::item_space")?.len();
+        bundle = bundle.saturating_add(size);
+        if charged.held(&item.repository, path) {
+            continue;
+        }
+        if charged.seen.insert((item.repository.clone(), path.clone())) {
+            objects = objects.saturating_add(size);
+        }
+    }
     // Objects land in the repository; a checkout lands in the workspace.
     // For a linked worktree those are two places, possibly two filesystems.
-    let mut writes = vec![(item.repository.clone(), bundle)];
-    if let Some(workspace) = item.workspace.as_ref().filter(|w| **w != item.repository) {
-        writes.push((workspace.clone(), bundle));
+    let mut writes = vec![(item.repository.clone(), objects)];
+    if let Some(workspace) = item.workspace.as_ref() {
+        let checkout = match landed_capture(workspace, source) {
+            Some(landed) if landed == captured.digest => 0,
+            Some(_) => fs::metadata(&head).refuse_at("estate::item_space")?.len(),
+            None => bundle,
+        };
+        writes.push((workspace.clone(), checkout));
     }
     Ok(Some((writes, bundle)))
 }
 
-/// OI-1001-Q2: the bytes an apply would write, per destination filesystem,
-/// before it writes any of them.
+/// OI-1001-Q2: the bytes an apply would write, per existing destination
+/// path, probed, before it writes any of them; [`crate::space::check_planned`]
+/// sums them per filesystem and per project quota.
 ///
 /// Each pending item (a capture record and bundle present, no journal yet)
-/// charges its bundle size to its repository's filesystem (objects) and,
-/// for a linked worktree, to its workspace's too (checkout): a lower bound,
-/// since a checkout expands past its pack. Staging copies a bundle and its
-/// base next to the corpus, at most `jobs` items at once, so the corpus
-/// filesystem is charged twice the `jobs` largest bundles. An item whose
-/// record, bundle or target cannot be read is skipped here and refuses on its
-/// own, by type, in apply (R33): one bad item never aborts the others.
+/// charges what [`item_space`] finds missing at its destination. Staging
+/// copies a bundle and its base next to the corpus, at most `jobs` items at
+/// once, so the corpus is charged twice the `jobs` largest pending bundles.
+/// Stated margins, not charged: a pack's index files and a thin pack's
+/// completion beside the objects, a linked worktree's index, a chain's
+/// links staged beside its head (up to three copies of a chain at once),
+/// and a checkout's expansion past its compressed bundle. An item whose
+/// record, bundle or target cannot be read or probed is skipped here and
+/// refuses on its own, by type, in apply (R33): one bad item never aborts
+/// the others.
 fn space_plan(
     plan: &Plan,
     corpus: &Path,
     state: &Path,
     source: &str,
     jobs: usize,
-) -> Vec<(PathBuf, u64)> {
-    let mut by_device = std::collections::BTreeMap::<u64, (PathBuf, u64)>::new();
-    let locate = |path: &Path| -> Result<(u64, PathBuf)> {
-        let probe = crate::space::existing_ancestor(path)?;
-        Ok((
-            fs::metadata(&probe).refuse_at("estate::space_plan")?.dev(),
-            probe,
-        ))
-    };
+) -> Vec<crate::space::Planned> {
+    let mut planned = Vec::new();
+    let mut charged = Charged::default();
     let mut staged = Vec::new();
     for item in &plan.items {
-        let Ok(Some((writes, bundle))) = item_space(item, corpus, state, source) else {
+        let Ok(Some((writes, bundle))) = item_space(item, corpus, state, source, &mut charged)
+        else {
             continue;
         };
         let Ok(located) = writes
             .iter()
-            .map(|(path, bytes)| locate(path).map(|found| (found, *bytes)))
+            .filter(|(_, bytes)| *bytes > 0)
+            .map(|(path, bytes)| crate::space::locate(path, *bytes))
             .collect::<Result<Vec<_>>>()
         else {
             continue;
         };
-        for ((device, probe), bytes) in located {
-            let entry = by_device.entry(device).or_insert((probe, 0));
-            entry.1 = entry.1.saturating_add(bytes);
-        }
+        planned.extend(located);
         staged.push(bundle);
     }
     staged.sort_unstable_by(|left, right| right.cmp(left));
@@ -2806,12 +2881,11 @@ fn space_plan(
         .fold(0u64, |total, bytes| total.saturating_add(*bytes))
         .saturating_mul(2);
     if peak > 0 {
-        if let Ok((device, probe)) = locate(corpus) {
-            let entry = by_device.entry(device).or_insert((probe, 0));
-            entry.1 = entry.1.saturating_add(peak);
+        if let Ok(corpus) = crate::space::locate(corpus, peak) {
+            planned.push(corpus);
         }
     }
-    by_device.into_values().collect()
+    planned
 }
 
 /// What one `estate-apply` run may do beyond the default (#226,
@@ -2910,9 +2984,10 @@ pub fn apply_reporting(
     let contents: Plan = read(plan)?;
     // OI-1001-Q2: refuse before any item writes when the planned bytes would
     // take a destination filesystem under its free-space floor.
-    for (probe, planned) in space_plan(&contents, corpus, state, source, jobs) {
-        crate::space::preflight(&probe, planned)?;
-    }
+    crate::space::check_planned(
+        &space_plan(&contents, corpus, state, source, jobs),
+        crate::space::min_free_percent(),
+    )?;
     let mut locks = std::collections::BTreeMap::new();
     let mut groups = std::collections::BTreeMap::new();
     let imported = ImportedBases::default();
@@ -3374,6 +3449,7 @@ mod tests {
     // and the closure report reads apply's own ledger back, failing closed on
     // a planned item apply never recorded.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn space_plan_and_closure_report_read_the_durable_ledger() {
         use crate::closure::{Disposition, Report};
         let root = std::env::temp_dir().join(format!("tcfs-estate-closure-{}", std::process::id()));
@@ -3397,22 +3473,26 @@ mod tests {
         };
 
         // Before apply: one pending bundle, charged to the target's
-        // filesystem and twice (bundle and base staging) to the corpus's;
-        // same device here.
+        // filesystem for its objects and again for its checkout (review B4),
+        // and twice (bundle and base staging) to the corpus's; same device
+        // here.
         let contents: Plan = read(&plan).unwrap();
         let identity = id(contents.items.first().unwrap()).unwrap();
         let record: Capture = read(&corpus.join(format!("{identity}.capture"))).unwrap();
         let bundle = fs::metadata(corpus.join(&record.bundle)).unwrap().len();
         let planned = space_plan(&contents, &corpus, &applied, "neo", 1);
-        assert_eq!(planned.len(), 1);
-        let (probe, bytes) = planned.first().unwrap();
-        assert_eq!(*bytes, 3 * bundle);
+        // Objects and checkout at the target's nearest existing ancestor,
+        // and the corpus.
+        assert_eq!(planned.len(), 3);
+        let bytes: u64 = planned.iter().map(|want| want.bytes).sum();
+        assert_eq!(bytes, 4 * bundle);
+        let probe = &planned.first().unwrap().path;
         let space = crate::space::probe(probe).unwrap();
         assert_eq!(
-            crate::space::check(*bytes, space, 100),
+            crate::space::check(bytes, space, 100),
             Err(BulkloadRefusal::DestinationSpaceInsufficient)
         );
-        assert_eq!(crate::space::check(*bytes, space, 0), Ok(()));
+        assert_eq!(crate::space::check(bytes, space, 0), Ok(()));
 
         // Before apply the ledger holds nothing: unaccounted, fail.
         let before = report(std::slice::from_ref(&applied));
@@ -3451,8 +3531,51 @@ mod tests {
             Disposition::Unaccounted("journal-missing")
         );
         assert_eq!(recaptured.unmatched_journals.len(), 1);
+        // M2 round 2, item 1: the re-captured item is pending again, but its
+        // landed repository already holds every object of its bundle, so
+        // its objects are charged nothing; its checkout, which records an
+        // earlier capture, is charged the capture's own bundle (a converge
+        // moves it forward, review B3), and the corpus its staging.
+        let charged = |plan: Vec<crate::space::Planned>| -> Vec<(PathBuf, u64)> {
+            plan.into_iter()
+                .map(|want| (want.path, want.bytes))
+                .collect()
+        };
+        assert_eq!(
+            charged(space_plan(&contents, &corpus, &applied, "neo", 1)),
+            vec![(target.clone(), bundle), (corpus.clone(), 2 * bundle)]
+        );
         fs::remove_file(&record_path).unwrap();
         fs::write(&record_path, original).unwrap();
+        // The workspace ledger records the landed capture under the label.
+        assert_eq!(landed_capture(&target, "neo"), Some(record.digest));
+        assert_eq!(landed_capture(&target, "sting"), None);
+
+        // Review B3 (probe C): every object held is not "nothing left to
+        // write". An apply a crash cut after its import, before its
+        // checkout was recorded (no journal, no workspace ledger), charges
+        // its whole checkout again, though the repository charges nothing.
+        let journal = journal_path(&applied, &identity, "neo", &record.digest);
+        let done = fs::read(&journal).unwrap();
+        fs::remove_file(&journal).unwrap();
+        let git_dir = git_carry::landed::worktree_git_dir(&target)
+            .unwrap()
+            .unwrap();
+        let ledger_file = git_carry::landed::ledger_dir(&git_dir, "neo")
+            .join(git_carry::landed::WORKSPACE_LANDED);
+        let landed_bytes = fs::read(&ledger_file).unwrap();
+        fs::remove_file(&ledger_file).unwrap();
+        assert_eq!(
+            charged(space_plan(&contents, &corpus, &applied, "neo", 1)),
+            vec![(target, bundle), (corpus.clone(), 2 * bundle)]
+        );
+        // With the ledger back the checkout is this capture's: only staging.
+        fs::write(&ledger_file, landed_bytes).unwrap();
+        assert_eq!(
+            charged(space_plan(&contents, &corpus, &applied, "neo", 1)),
+            vec![(corpus.clone(), 2 * bundle)]
+        );
+        fs::write(&journal, done).unwrap();
 
         // A newly planned item apply has not run yet is unaccounted, and the
         // capture state's records are not apply outcomes.
@@ -3518,8 +3641,13 @@ mod tests {
         // Linked worktree: repository (objects) + workspace (checkout), plus
         // the doubled staging peak; the unreadable item adds nothing.
         let planned = space_plan(&contents, &corpus, &applied, "neo", 2);
-        assert_eq!(planned.len(), 1);
-        assert_eq!(planned.first().unwrap().1, 4 * bundle);
+        // Objects and checkout at the root (the targets' nearest existing
+        // ancestor), and the corpus.
+        assert_eq!(planned.len(), 3);
+        assert_eq!(
+            planned.iter().map(|want| want.bytes).sum::<u64>(),
+            4 * bundle
+        );
 
         // The unreadable item refuses by itself in apply, as a value.
         let outcomes = Mutex::new(Vec::new());
@@ -6000,11 +6128,11 @@ mod closure_lane_20261002 {
     // 1 TiB filesystem with 32 KiB available: a small checkout fits, a
     // 64 KiB one does not.
     #[allow(clippy::unnecessary_wraps)]
-    fn tight(_: &Path) -> Result<crate::space::Space> {
-        Ok(crate::space::Space {
+    fn tight(_: &Path) -> Result<crate::space::Limits> {
+        Ok(crate::space::Limits::filesystem(crate::space::Space {
             total: 1 << 40,
             available: 32 * 1024,
-        })
+        }))
     }
 
     #[test]
@@ -6667,9 +6795,15 @@ mod wp2_chain {
         );
         // The space preflight charges the whole chain from the copy, too.
         let item = inspect(&fixture.plan).unwrap().remove(0);
-        let (_, charged) = item_space(&item, &pulled, &fixture.root.join("applied"), "neo")
-            .unwrap()
-            .expect("the pulled chained capture is pending");
+        let (_, charged) = item_space(
+            &item,
+            &pulled,
+            &fixture.root.join("applied"),
+            "neo",
+            &mut Charged::default(),
+        )
+        .unwrap()
+        .expect("the pulled chained capture is pending");
         assert!(charged > fs::metadata(pulled.join(&chained)).unwrap().len());
         let reasons = Mutex::new(Vec::new());
         apply(
@@ -7003,9 +7137,15 @@ mod l6b_grouped_chain {
             );
             // The space preflight charges the head, its link and its base.
             let item = inspect(&fixture.plan).unwrap().remove(index);
-            let (_, bytes) = item_space(&item, &fixture.corpus, &fixture.root.join("none"), "neo")
-                .unwrap()
-                .unwrap();
+            let (_, bytes) = item_space(
+                &item,
+                &fixture.corpus,
+                &fixture.root.join("none"),
+                "neo",
+                &mut Charged::default(),
+            )
+            .unwrap()
+            .unwrap();
             let size = |name: &str| fs::metadata(fixture.corpus.join(name)).unwrap().len();
             assert_eq!(
                 bytes,

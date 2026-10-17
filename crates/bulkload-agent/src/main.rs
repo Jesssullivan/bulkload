@@ -321,11 +321,16 @@ BOUNDARIES:
     pull passes full to serve.
     --min-free-percent=N (0-100, default 25): DESTINATION_SPACE_INSUFFICIENT
     when planned bytes would leave the destination filesystem (statvfs) with
-    less than N% free. copy/pull refuse each entry that does not fit, as a
+    less than N% free, or, inside a project-quota tree (where statvfs
+    reports the quota; Linux), the quota with less than N% of its limit
+    free. The refusal says which limit bound and both numbers (a
+    space_refusal line; counters space_refused_filesystem and
+    space_refused_quota). copy/pull refuse each entry that does not fit, as a
     value, before requesting its content: the bytes of every entry decided
     and not yet Held count against a probe refreshed on each group commit,
     so the session continues and stays resumable. estate-apply refuses before
-    any item, planning bundle sizes (a lower bound).
+    any item, planning the bundle bytes each destination repository does not
+    already hold (a lower bound).
     --priority=background|normal|auto (WP0(f)): serve, snapshot,
     git-carry-estimate, git-export and copy read a live source, so they enter
     background CPU and IO priority before anything else (Linux nice 19 and the
@@ -608,6 +613,13 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}");
+            // M2 round 2, item 1: which limit refused, and both numbers;
+            // only for this verb's own space refusal, and once (review A3).
+            if refusal == BulkloadRefusal::DestinationSpaceInsufficient {
+                if let Some(space) = bulkload_agent::space::take_refusal() {
+                    eprintln!("bulkload-agent: space: {}", space.fields());
+                }
+            }
             ExitCode::FAILURE
         }
     }
@@ -2042,6 +2054,11 @@ fn report_counters(verb: &str, started: std::time::Instant, priority: Priority) 
         elapsed_ns(started),
         Counters::snapshot().render()
     ));
+    // The last refused free-space check: which limit bound (the filesystem
+    // or a project quota) and both limits' numbers (M2 round 2, item 1).
+    if let Some(space) = bulkload_agent::space::last_refusal() {
+        lines.push(format!("space_refusal {prefix} {}", space.fields()));
+    }
     if matches!(verb, "copy" | "pull") {
         let mut output = std::io::stdout().lock();
         for line in &lines {

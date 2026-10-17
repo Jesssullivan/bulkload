@@ -379,6 +379,14 @@ counters! {
     // Threads (Linux) an escalation could not move, or 1 when it failed
     // for the process itself.
     PriorityEscalationFailures => "priority_escalation_failures",
+    // Free-space checks (OI-1001-Q2) this process ran, and those refused,
+    // by the limit that bound (M2 round 2, item 1): the filesystem's, or a
+    // project quota's (`statvfs` inside a project-quota tree reports the
+    // quota). A refusal both limits bind counts in both. The last refusal's
+    // numbers are the `space_refusal` line.
+    SpaceChecks => "space_checks",
+    SpaceRefusedFilesystem => "space_refused_filesystem",
+    SpaceRefusedQuota => "space_refused_quota",
 }
 
 const COUNT: usize = Counter::ALL.len();

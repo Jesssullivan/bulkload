@@ -3572,12 +3572,15 @@ fn room_for_slot(work: &SourceWork<'_>, reserved: &mut SlotReservation, bound: u
     if !reserved.true_up(bound) {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
-    crate::space::check(
+    match crate::space::bound(
         bound,
-        crate::space::probe(work.slots)?,
+        bound,
+        crate::space::probe_limits(work.slots)?,
         crate::space::min_free_percent(),
-    )
-    .map_err(|_| BulkloadRefusal::BudgetExceeded)
+    ) {
+        None => Ok(()),
+        Some(_) => Err(BulkloadRefusal::BudgetExceeded),
+    }
 }
 
 /// Open a source seat for reading, component by component beneath the
@@ -4574,7 +4577,7 @@ struct Inbound<'a, W> {
     reserved_bytes: u64,
     /// The destination filesystem as last probed; `None` after a group
     /// commit, so the next admission sees the committed bytes.
-    space: Option<crate::space::Space>,
+    space: Option<crate::space::Limits>,
     /// Bytes admitted since the last probe.
     since_probe: u64,
     /// The receive workers, or `None` to verify and write inline.
@@ -5540,18 +5543,20 @@ impl<W: Write> Inbound<'_, W> {
         if size == 0 {
             return Ok(());
         }
-        let space = match self.space {
-            Some(space) if self.since_probe < SPACE_REPROBE_BYTES => space,
+        let limits = match self.space {
+            Some(limits) if self.since_probe < SPACE_REPROBE_BYTES => limits,
             _ => {
-                let space = crate::space::probe(self.target.path())?;
-                self.space = Some(space);
+                let limits = crate::space::probe_limits(self.target.path())?;
+                self.space = Some(limits);
                 self.since_probe = 0;
-                space
+                limits
             }
         };
-        crate::space::check(
-            self.reserved_bytes.saturating_add(size),
-            space,
+        let planned = self.reserved_bytes.saturating_add(size);
+        crate::space::check_at(
+            self.target.path(),
+            (planned, planned),
+            limits,
             crate::space::min_free_percent(),
         )?;
         self.reserved.insert(entry, size);
