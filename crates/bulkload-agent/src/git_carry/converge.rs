@@ -57,6 +57,20 @@ pub struct Landing<'a> {
     pub observed_ns: i128,
     /// The capture's bundle digest.
     pub capture: [u8; 32],
+    /// Where an estate apply records the parents a first landing creates
+    /// (`{item}-{source}.parents` in STATE; M2 finding 1). `None` (a CLI
+    /// restore) keeps `GIT_DESTINATION_PARENT_MISSING` for an absent
+    /// parent.
+    pub parents: Option<&'a Path>,
+}
+
+impl<'a> Landing<'a> {
+    /// The record [`super::parents::FirstTarget::place`] appends to, with
+    /// the item it names.
+    #[must_use]
+    pub fn parents_record(&self) -> Option<(&'a Path, &'a str)> {
+        self.parents.map(|record| (record, self.item))
+    }
 }
 
 /// What an apply did, for its receipt.
@@ -1008,6 +1022,17 @@ impl Seat {
 
     fn directory(&self) -> Result<fs::File> {
         fs::File::open(&self.parent).refuse_at("git_carry::converge::seat")
+    }
+}
+
+/// A planned destination's `lstat`: also absent (`None`) when a path above
+/// it is not a directory (`ENOTDIR`), where nothing can be: its first
+/// landing's parent check then types it `GIT_DESTINATION_PARENT_MISSING`
+/// (M2 finding 1), never a bare IO errno.
+fn planned(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => Ok(None),
+        _ => lstat(path),
     }
 }
 
@@ -2072,7 +2097,7 @@ pub fn apply_workspace(
         .workspace
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
     let standalone = workspace == target.repository;
-    if lstat(workspace)?.is_none() {
+    if planned(workspace)?.is_none() {
         // Finding 13: a checkout this item landed before and the operator
         // removed is not laid down again.
         if landed_before {
@@ -2608,7 +2633,7 @@ pub fn apply_refs(
     let repo = target.repository;
     // A11c (#226 item 4): a bare capture into a path that does not exist
     // lands a bare repository bulkload makes itself, native refs and all.
-    if staged.is_bare() && lstat(repo)?.is_none() {
+    if staged.is_bare() && planned(repo)?.is_none() {
         return super::land_bare_staged(
             staged,
             repo,
@@ -2805,28 +2830,31 @@ pub(super) fn land_standalone_refs(
 /// report of it): the checks it makes before anything is read from the
 /// capture or written anywhere. A bare capture is
 /// `GIT_BARE_CAPTURE_WORKSPACE`, a path already there
-/// `GIT_DESTINATION_OCCUPIED`, a parent that does not exist
-/// `GIT_DESTINATION_PARENT_MISSING`. Returns the path with its parent
-/// canonical.
+/// `GIT_DESTINATION_OCCUPIED`, absent parents an estate apply may not make
+/// (a symlink or a non-directory where they would start, M2 finding 1)
+/// `GIT_DESTINATION_PARENT_MISSING`. Returns the path, with its parent
+/// canonical or the absent parents the landing makes before its first
+/// write ([`super::parents::FirstTarget::place`]).
 ///
 /// # Errors
 /// As above.
 pub(super) fn first_landing_target(
     staged: &super::StagedBundle,
     destination: &Path,
-) -> Result<PathBuf> {
+) -> Result<super::parents::FirstTarget> {
     super::refuse_bare_capture(staged)?;
     if destination.symlink_metadata().is_ok() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
-    super::linked_destination(destination)
+    super::parents::FirstTarget::of(destination)
 }
 
 /// What a first linked landing decided before its first write to the
 /// destination repository ([`check_linked`]).
 pub(super) struct LinkedChecked {
-    /// The new worktree's path, its parent canonical.
-    pub destination: PathBuf,
+    /// The new worktree's path: its parent canonical, or its absent
+    /// parents, made by the landing after these checks (M2 finding 1).
+    pub destination: super::parents::FirstTarget,
     /// The plan's repository, canonical.
     pub repository: PathBuf,
     /// The capture's ref lines (`shallow::headers`'s form).
