@@ -2029,6 +2029,44 @@ starts.
   reported as the destination's. Any other I/O error a store meets is `IO`
   with its errno (`EIO` where the errno cannot be read).
 
+## estate-move (M2 item 7, design; not built)
+
+Design: `docs/agent-notes/2026-10-16-estate-move-design.md`. One verb on
+the destination, `estate-move [--plan-only] [--date YYYYMMDD] [--map
+SRC=LIVE]... SOURCE_HOST SOURCE_ROOT... MOVE_STATE`, that does what the
+2026-10-16 in-place lane scripts did by hand, each phase resumable and
+recorded in `MOVE_STATE/move.ledger` only after what it describes is
+durable:
+
+1. inventory of the source roots (the remote estimate probe, read-only);
+2. a presence probe of every live path (absent, git main/linked/bare,
+   symlink resolved to its real path, nongit, parent shape);
+3. capture on the source at `--priority=auto` and a native pull of the
+   corpus;
+4. per-checkout classification from `estate-diff`: `absent`, `match`
+   (identical, or extra source refs only), `diverged`, `nongit`;
+5. a pure plan: land absent; adopt a match in place; a diverged main is
+   adopted refs-only with the source checkout beside at
+   `<path>.neo-YYYYMMDD`; absent worktrees land as new worktrees of the
+   live repository, present diverged ones beside; a nongit live path puts
+   the whole group beside; refused items are carried as files
+   (`--plan-only` stops here);
+6. `estate-apply --adopt` in levels;
+7. refs-in: create-only `refs/heads/neo-YYYYMMDD/<name>` (and tags) for
+   each source tip the live repository lacks or holds at another value,
+   recorded in the ref ledger so no converge moves them;
+8. carried-as-files for the refusals Git carry cannot take (never into a
+   non-empty path);
+9. session pulls, `estate-reseat`, `estate-handoff`;
+10. a converge loop until a pass changes nothing, ending in closure with 0
+    unaccounted.
+
+The date suffix is fixed at the first plan, no live ref is moved or
+deleted, no live checkout is switched, and nothing is deleted. Open
+questions for the operator are in the design note (suffix naming for a
+second source, beside worktrees linked or standalone, tags in refs-in, one
+command over SSH or two halves).
+
 ## Agent session re-seat (R0, TIN-6587)
 
 SPEC R0 (draft `docs/SPEC.md`, PR #236) is the user outcome: after a run,
