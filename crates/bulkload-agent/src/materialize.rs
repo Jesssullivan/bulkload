@@ -2780,6 +2780,8 @@ fn seal_group_data(items: &mut [Publication]) -> Result<()> {
 pub(crate) fn space_refusal(refusal: BulkloadRefusal) -> BulkloadRefusal {
     match refusal {
         BulkloadRefusal::Io(Some(libc::ENOSPC)) | BulkloadRefusal::SpaceExhausted(None) => {
+            // Judged by no limit: no earlier check's numbers belong to it.
+            crate::space::forget_refusal();
             BulkloadRefusal::DestinationSpaceInsufficient
         }
         other => other,

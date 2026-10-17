@@ -9,7 +9,7 @@ use std::fs;
 use std::os::unix::fs::MetadataExt as _;
 
 use super::{run, transcript, World, SERIAL, SID, SID2};
-use crate::reseat::place;
+use crate::reseat::{ledger, place, regularize, Summary};
 use crate::BulkloadRefusal;
 
 /// What is at the destination decides the bytes of a placement with no
@@ -84,7 +84,6 @@ fn a_pass_over_what_the_destination_holds_plans_nothing() {
     fs::create_dir_all(held.parent().unwrap()).unwrap();
     fs::write(&held, &other).unwrap();
     let mut options = world.options();
-    options.codex = false;
     // A floor no write can meet: only a pass that writes nothing passes.
     options.min_free_percent = 100;
     let outcome = crate::reseat::reseat(&options, &mut |_| Ok(()));
@@ -148,4 +147,155 @@ fn a_regularization_is_judged_per_link_and_never_holds_the_pass() {
     options.min_free_percent = 0;
     let (_, lines, _) = run(&options);
     assert!(fs::symlink_metadata(&link).unwrap().is_file(), "{lines:?}");
+}
+
+/// Review B2, probe A: a `Diverged` row keeps its file only while it is
+/// there. The destination's file deleted, the placement writes the whole
+/// landed file, so the plan charges it.
+#[test]
+fn a_kept_row_whose_destination_is_gone_charges_the_whole_file() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let world = World::new();
+    let bytes = transcript(SID, "/Users/jess/git/lab", "gone", 5);
+    let landed = world.land(SID, "/Users/jess/git/lab", &bytes);
+    let dest = world.dest_transcript(SID);
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    fs::write(&dest, b"{\"type\":\"someone else's\"}\n").unwrap();
+    let mut options = world.options();
+    options.codex = false;
+    let (_, lines, _) = run(&options);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("RESEAT_DEST_DIVERGED")),
+        "{lines:?}"
+    );
+    let open = || ledger::Ledger::open_read_only(&options.state).unwrap();
+    assert_eq!(place::planned(open().as_ref(), &dest, &landed).unwrap(), 0);
+    fs::remove_file(&dest).unwrap();
+    assert_eq!(
+        place::planned(open().as_ref(), &dest, &landed).unwrap(),
+        bytes.len() as u64
+    );
+    // And the pass that writes it is held to the floor.
+    options.min_free_percent = 100;
+    let outcome = crate::reseat::reseat(&options, &mut |_| Ok(()));
+    assert_eq!(
+        outcome.err(),
+        Some(BulkloadRefusal::DestinationSpaceInsufficient)
+    );
+    assert!(!dest.exists(), "nothing written past the floor");
+}
+
+/// Review B2, probe B: a symlinked transcript kept `Occupied` (no
+/// regularization) that becomes a regular copy of a prefix is extended by
+/// the placement, so the plan charges the tail.
+#[test]
+fn an_occupied_link_that_became_a_regular_prefix_charges_its_tail() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let world = World::new();
+    let bytes = transcript(SID, "/Users/jess/git/lab", "occupied", 6);
+    let landed = world.land(SID, "/Users/jess/git/lab", &bytes);
+    let dest = world.dest_transcript(SID);
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let target = world.base.join("archive.jsonl");
+    let cut = bytes.iter().position(|byte| *byte == b'\n').unwrap() + 1;
+    fs::write(&target, &bytes[..cut]).unwrap();
+    std::os::unix::fs::symlink(&target, &dest).unwrap();
+    let mut options = world.options();
+    options.codex = false;
+    options.regularize = false;
+    let (_, lines, _) = run(&options);
+    assert!(
+        fs::symlink_metadata(&dest).unwrap().is_symlink(),
+        "{lines:?}"
+    );
+    let open = || ledger::Ledger::open_read_only(&options.state).unwrap();
+    let tail = (bytes.len() - cut) as u64;
+    // Still the link: a regularization earlier in a pass would copy it.
+    assert_eq!(
+        place::planned(open().as_ref(), &dest, &landed).unwrap(),
+        tail
+    );
+    fs::remove_file(&dest).unwrap();
+    fs::write(&dest, &bytes[..cut]).unwrap();
+    assert_eq!(
+        place::planned(open().as_ref(), &dest, &landed).unwrap(),
+        tail
+    );
+    let (_, lines, _) = run(&options);
+    assert_eq!(fs::read(&dest).unwrap(), bytes, "{lines:?}");
+}
+
+/// Review B1 and B7: a regularization is judged with the bytes the pass's
+/// placements were admitted for still reserved. Reserved so that the link
+/// does not fit, it is `space-refused` and stays a link; a later pass with
+/// room regularizes it and extends the copy to the landed session.
+#[test]
+fn a_regularization_keeps_the_placements_bytes_reserved_then_retries() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let world = World::new();
+    let line = format!(
+        "{{\"type\":\"user\",\"sessionId\":\"{SID}\",\"cwd\":\"/Users/jess/git/lab\",\"pad\":\"{}\"}}\n",
+        "x".repeat(1024)
+    );
+    let mut bytes = transcript(SID, "/Users/jess/git/lab", "big", 2);
+    let head = bytes.len();
+    for _ in 0..(64 * 1024) {
+        bytes.extend_from_slice(line.as_bytes());
+    }
+    world.land(SID, "/Users/jess/git/lab", &bytes);
+    let dest = world.dest_transcript(SID);
+    fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    let target = world.base.join("archive.jsonl");
+    fs::write(&target, &bytes[..bytes.len() - line.len()]).unwrap();
+    std::os::unix::fs::symlink(&target, &dest).unwrap();
+    assert!(bytes.len() - head > 32 * 1024 * 1024);
+    let options = world.options();
+    let root = fs::canonicalize(&options.dest_claude).unwrap();
+    // Reserve all but half the link's size: the reservation alone fits, the
+    // link beside it does not.
+    let limits = crate::space::probe_limits(&root).unwrap();
+    let free = limits.quota.map_or(limits.filesystem.available, |quota| {
+        quota.available.min(limits.filesystem.available)
+    });
+    let reserved_bytes = free.saturating_sub((bytes.len() as u64) / 2);
+    let reserved = [(root.as_path(), reserved_bytes)];
+    {
+        let ledger = ledger::Ledger::open(&options.state, options.now_ns, "test").unwrap();
+        let mut summary = Summary::default();
+        let mut lines = Vec::new();
+        regularize::regularize(
+            &root,
+            &ledger,
+            regularize::Space {
+                min_free_percent: 0,
+                reserved: &reserved,
+            },
+            &mut summary,
+            &mut |line| {
+                lines.push(line.to_owned());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            summary.rows.get("link-space-refused"),
+            Some(&1),
+            "{lines:?}"
+        );
+    }
+    assert!(fs::symlink_metadata(&dest).unwrap().is_symlink());
+    // A pass with room: regularized, then extended by the last line.
+    let (summary, lines, _) = run(&options);
+    assert!(fs::symlink_metadata(&dest).unwrap().is_file(), "{lines:?}");
+    assert_eq!(fs::read(&dest).unwrap(), bytes);
+    assert_eq!(summary.sessions_of("claude", "extended"), 1, "{lines:?}");
+    assert_eq!(fs::read(&target).unwrap().len(), bytes.len() - line.len());
 }

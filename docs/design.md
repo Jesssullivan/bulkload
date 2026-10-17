@@ -2092,11 +2092,22 @@ and both limits' numbers: the verb's `space_refusal` line beside its
 counters (`planned_bytes`, `filesystem_planned_bytes`, `min_free_percent`,
 `filesystem_total_bytes`, `filesystem_available_bytes`, `quota=none` or
 `quota=project` with `quota_total_bytes` and `quota_available_bytes`, then
-`path`), repeated after the refusal as `bulkload-agent: space: ...`; the
+`path`; the process's last refused check), repeated once after a verb that
+ends `DESTINATION_SPACE_INSUFFICIENT` as `bulkload-agent: space: ...`; the
 counters `space_checks`, `space_refused_filesystem` and
-`space_refused_quota` count every check and every refusal by limit. Where
-the root cannot be found or read (no mountinfo, a device mounted only below
-its root, Darwin), the path's view is the filesystem's, as before.
+`space_refused_quota` count every check and every refusal by limit. A
+`DESTINATION_SPACE_INSUFFICIENT` converted from a write's `ENOSPC` or
+`EDQUOT` (a Git child, a store's `SQLITE_FULL`) was judged by no limit and
+prints no `space:` line. Only a smaller size at the path is a quota, and
+the root must still resolve to the path's device when it is read (a mount
+stacked on it hides it). Where the root cannot be found or read (no
+mountinfo, a device mounted only below its root or hidden, Darwin), the
+path's view is the filesystem's, as before. Quotas of one size on one
+device are summed together and judged by the least room any of them
+reported. Known limits of the labels: XFS reports a quota's free space as
+the lesser of the quota's and the filesystem's, so a full filesystem can
+also read as its quota binding (`both`); a quota with only a soft limit,
+or a realtime-inherit directory, reads as XFS reports it.
 
 - `copy` and `pull` decide it per entry on wire v6. An entry decided
   `Send` or `WantManifest` reserves its size until its `Held`. Each
@@ -2111,12 +2122,19 @@ its root, Darwin), the path's view is the filesystem's, as before.
   the import makes before it takes anything, and each bundle once per
   repository across the plan (M2 round 2, item 1: a re-captured item over
   a landed one, an adopted repository and a repository's other worktrees
-  charged their whole chains again). A linked worktree charges its
-  workspace the whole bundle when the workspace does not exist yet, else
-  the bytes the repository still lacks. The corpus is charged twice the
-  `jobs` largest pending bundles, for bundle and base staging. Bundle size
-  is a lower bound on a checkout. An item the plan cannot read is skipped
-  and refuses on its own.
+  charged their whole chains again). The checkout is charged apart from
+  the objects, to the workspace (a standalone's is its repository):
+  nothing when the workspace ledger records this capture landed; the
+  capture's own bundle when it records an earlier capture (a converge
+  moves the checkout forward); the whole chain when no checkout is
+  recorded (a first landing, or one a crash cut after its import or its
+  `worktree add`). The corpus is charged twice the `jobs` largest pending
+  bundles, for bundle and base staging. Bundle bytes are compressed, so
+  the charge is a lower bound, with stated margins it does not cover: a
+  checkout's expansion past its bundle, a pack's index files and a thin
+  pack's completion, a linked worktree's index, and a chain's links staged
+  beside its head. An item the plan cannot read, or whose destination
+  cannot be stat'ed or probed, is skipped and refuses on its own.
 - `estate-capture` checks per item (#101, OI-1002-Q11). Before an item's
   export writes, its estimated bundle (the larger of its census's
   regular-file bytes and the retained bundle it extends) plus every byte
@@ -2225,18 +2243,25 @@ published each other's half-written file).
 
 **Refused before anything is written.** `DESTINATION_SPACE_INSUFFICIENT`:
 the engine's free-space rule (`--min-free-percent`, default 25; a project
-quota judged as well, see the space preflight) for the bytes a pass would
-write on each destination file system (an upper bound, decided as the
-placement decides: nothing for a landed file the ledger holds unchanged,
-an owned append-only placement's new tail, an owned other file's whole
-content; without a row, the whole content where nothing is, the bytes past
-an append-only regular copy or a symlinked transcript's target, and
-nothing over any other file or node; a `.zst` at its frame's declared
-size). A symlinked transcript's regularization is not in it (M2 round 2,
-item 1: every link's target at once held whole passes back): each link is
-judged as it is copied, and one that does not fit is its own
+quota judged as well, see the space preflight) for the bytes the pass's
+placements would write on each destination file system. It is meant as an
+upper bound and is decided as the placement decides (M2 round 2, item 1):
+nothing for a collision, a `Continued` row, or a kept row (`Diverged`,
+`Occupied`, `Rewritten`, `Unreadable`) whose landed file and destination
+are both as recorded; for an owned placement, nothing when its file is gone
+or changed since (the destination's) or the landed file is unchanged, else
+the new tail of an append-only file or the whole of any other; otherwise
+the whole content where nothing is, the bytes past an append-only regular
+copy or a symlinked transcript's target, and nothing over any other file
+or node; a `.zst` at its frame's declared size.
+
+**Refused mid-pass, per link.** A symlinked transcript's regularization is
+not in that check (every link's target at once held whole passes back):
+each link is judged as it is copied, with the bytes the placements were
+admitted for still reserved beside it, so a regularization never takes
+what the placements after it write. One that does not fit is its own
 `space-refused` line (`DESTINATION_SPACE_INSUFFICIENT`), kept a link, and
-retried by a later pass. Sting's live state is on a file system under the 25%
+retried by a later pass; the links before it stay regularized. Sting's live state is on a file system under the 25%
 floor, so the live run names its floor explicitly. `RESEAT_LANDING_ABSENT`: a landed
 `.claude` or `.codex` the run covers is not a directory (absent, or a
 symlink to a source-only volume such as neo's `/Volumes/...` codex link);

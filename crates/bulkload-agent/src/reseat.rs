@@ -576,6 +576,7 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     if codex == Some(true) {
         codex::preflight(options)?;
     }
+    let admitted;
     {
         let ledger = ledger::Ledger::open_read_only(&options.state)?;
         let planned_codex = if codex == Some(true) {
@@ -594,6 +595,7 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
                 (&options.dest_codex, planned_codex),
             ],
         )?;
+        admitted = (planned_claude, planned_codex);
     }
     lock_state(&mut held, &options.state)?;
     let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "reseat")?;
@@ -624,10 +626,17 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     if options.claude && options.regularize {
         // Before placement: a regularized copy that is a prefix of a landed
         // transcript is then extended like any other.
+        let reserved = [
+            (options.dest_claude.as_path(), admitted.0),
+            (options.dest_codex.as_path(), admitted.1),
+        ];
         regularize::regularize(
             &root(&options.dest_claude)?,
             &ledger,
-            options.min_free_percent,
+            regularize::Space {
+                min_free_percent: options.min_free_percent,
+                reserved: &reserved,
+            },
             &mut summary,
             emit,
         )?;

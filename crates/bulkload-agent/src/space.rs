@@ -200,12 +200,12 @@ pub struct Limits {
 
 impl Limits {
     /// Limits from the path's own view and, when it could be read, the view
-    /// at its filesystem's root. Different sizes mean the path's view is a
-    /// project quota.
+    /// at its filesystem's root. A smaller size at the path means its view is
+    /// a project quota; any other difference is not a quota (review A1).
     #[must_use]
     pub const fn from_views(path: Space, root: Option<Space>) -> Self {
         match root {
-            Some(root) if root.total != path.total => Self {
+            Some(root) if path.total < root.total => Self {
                 filesystem: root,
                 quota: Some(path),
             },
@@ -327,6 +327,24 @@ pub fn last_refusal() -> Option<Refused> {
     LAST_REFUSAL.lock().ok().and_then(|last| last.clone())
 }
 
+/// [`last_refusal`], cleared: the binary prints it once, after a verb
+/// that ended `DESTINATION_SPACE_INSUFFICIENT` (review A3).
+#[must_use]
+pub fn take_refusal() -> Option<Refused> {
+    LAST_REFUSAL.lock().ok().and_then(|mut last| last.take())
+}
+
+/// Forget the recorded refusal (review A3).
+///
+/// A later `DESTINATION_SPACE_INSUFFICIENT` converted from a write's
+/// `ENOSPC` or `EDQUOT` (or a store's `SQLITE_FULL`) was judged by no
+/// limit, so no earlier check's numbers are printed for it.
+pub fn forget_refusal() {
+    if let Ok(mut last) = LAST_REFUSAL.lock() {
+        *last = None;
+    }
+}
+
 /// Judge `planned` bytes (quota) and `filesystem_planned` bytes
 /// (filesystem) at `path` under `limits`: count the check, and on a refusal
 /// count which limit bound and record it for [`last_refusal`].
@@ -364,8 +382,9 @@ pub fn check_at(
 
 /// The view at the root of the filesystem holding `path` (an existing
 /// path), when it can be found and read: Linux only, from
-/// `/proc/self/mountinfo`. Any failure is `None` (the path's own view is
-/// then the filesystem's).
+/// `/proc/self/mountinfo`. The root must still resolve to the path's device
+/// when it is read (a mount stacked on it hides it, review A1). Any failure
+/// is `None` (the path's own view is then the filesystem's).
 #[cfg(target_os = "linux")]
 fn root_view(path: &Path) -> Option<Space> {
     use std::os::unix::fs::MetadataExt as _;
@@ -379,42 +398,53 @@ fn root_view(_path: &Path) -> Option<Space> {
     None
 }
 
-/// The mount point of device `dev`'s filesystem root, cached per device.
+/// The mount point of device `dev`'s filesystem root that resolves to
+/// `dev` now. A root found is cached for the process and checked again on
+/// every use; a device with none is looked up again each time.
 #[cfg(target_os = "linux")]
 fn filesystem_root(dev: u64) -> Option<PathBuf> {
-    static ROOTS: Mutex<BTreeMap<u64, Option<PathBuf>>> = Mutex::new(BTreeMap::new());
-    if let Some(found) = ROOTS.lock().ok()?.get(&dev) {
-        return found.clone();
+    use std::os::unix::fs::MetadataExt as _;
+    static ROOTS: Mutex<BTreeMap<u64, PathBuf>> = Mutex::new(BTreeMap::new());
+    let resolves = |root: &Path| std::fs::metadata(root).is_ok_and(|meta| meta.dev() == dev);
+    let cached = ROOTS.lock().ok()?.get(&dev).cloned();
+    if let Some(root) = cached.filter(|root| resolves(root)) {
+        return Some(root);
     }
-    let found = std::fs::read("/proc/self/mountinfo")
-        .ok()
-        .and_then(|table| mount_of_root(&table, libc::major(dev), libc::minor(dev)));
+    let table = std::fs::read("/proc/self/mountinfo").ok()?;
+    let found = mounts_of_root(&table, libc::major(dev), libc::minor(dev))
+        .into_iter()
+        .find(|root| resolves(root))?;
     ROOTS.lock().ok()?.insert(dev, found.clone());
-    found
+    Some(found)
 }
 
-/// The mount point of device `major:minor`'s filesystem root.
+/// The mount points of device `major:minor`'s filesystem root, in table
+/// order.
 ///
-/// Read from a `/proc/self/mountinfo` table: the mount whose root is the
+/// Read from a `/proc/self/mountinfo` table: the mounts whose root is the
 /// filesystem's own root (`/`). A device mounted only below its root (a
-/// bind of a subtree) has none.
+/// bind of a subtree) has none. Whether each still resolves to the device
+/// (nothing stacked on it) is the caller's check.
 #[must_use]
-pub fn mount_of_root(table: &[u8], major: u32, minor: u32) -> Option<PathBuf> {
+pub fn mounts_of_root(table: &[u8], major: u32, minor: u32) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
     let device = format!("{major}:{minor}");
-    table.split(|byte| *byte == b'\n').find_map(|line| {
-        // id parent major:minor root mount-point ...
-        let mut fields = line.split(|byte| *byte == b' ');
-        let (_, _, dev, root, point) = (
-            fields.next()?,
-            fields.next()?,
-            fields.next()?,
-            fields.next()?,
-            fields.next()?,
-        );
-        (dev == device.as_bytes() && root == b"/")
-            .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&unescape_mountinfo(point))))
-    })
+    table
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| {
+            // id parent major:minor root mount-point ...
+            let mut fields = line.split(|byte| *byte == b' ');
+            let (_, _, dev, root, point) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            (dev == device.as_bytes() && root == b"/")
+                .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&unescape_mountinfo(point))))
+        })
+        .collect()
 }
 
 /// Undo mountinfo's octal escapes (`\040` for a space, `\011`, `\012`,
@@ -480,7 +510,8 @@ pub struct Planned {
 pub fn check_planned(planned: &[Planned], min_free_percent: u8) -> Result<()> {
     let mut devices: BTreeMap<u64, u64> = BTreeMap::new();
     // A quota is told apart by its limit as probed: two trees on one
-    // device under quotas of the same size are summed together, which errs
+    // device under quotas of the same size are summed together and judged
+    // by the least room any of them reported (review A2), which errs
     // towards refusing.
     let mut groups: BTreeMap<(u64, Option<u64>), (PathBuf, Limits, u64)> = BTreeMap::new();
     for want in planned.iter().filter(|want| want.bytes > 0) {
@@ -491,6 +522,15 @@ pub fn check_planned(planned: &[Planned], min_free_percent: u8) -> Result<()> {
             .entry(key)
             .or_insert_with(|| (want.path.clone(), want.limits, 0));
         group.2 = group.2.saturating_add(want.bytes);
+        if want.limits.filesystem.available < group.1.filesystem.available {
+            group.1.filesystem = want.limits.filesystem;
+        }
+        if let (Some(least), Some(quota)) = (group.1.quota.as_mut(), want.limits.quota) {
+            if quota.available < least.available {
+                *least = quota;
+                group.0.clone_from(&want.path);
+            }
+        }
     }
     for ((device, _), (path, limits, bytes)) in &groups {
         let on_device = devices.get(device).copied().unwrap_or(*bytes);
@@ -499,28 +539,37 @@ pub fn check_planned(planned: &[Planned], min_free_percent: u8) -> Result<()> {
     Ok(())
 }
 
-/// Probe each of `wants`' destinations (the nearest existing ancestor of a
-/// path that does not exist yet) and [`check_planned`] them. Zero planned
-/// bytes are never probed.
+/// Probe one destination for [`check_planned`]: its nearest existing
+/// ancestor, that ancestor's device (followed) and limits.
+///
+/// # Errors
+/// A path with no existing ancestor, a stat or probe failure.
+pub fn locate(path: &Path, bytes: u64) -> Result<Planned> {
+    use std::os::unix::fs::MetadataExt as _;
+    let existing = existing_ancestor(path)?;
+    let device = std::fs::metadata(&existing)
+        .map_err(|error| crate::refuse::io(&error, "space::locate"))?
+        .dev();
+    let limits = probe_limits(&existing)?;
+    Ok(Planned {
+        path: existing,
+        device,
+        limits,
+        bytes,
+    })
+}
+
+/// Probe each of `wants`' destinations ([`locate`]) and [`check_planned`]
+/// them. Zero planned bytes are never probed.
 ///
 /// # Errors
 /// `DESTINATION_SPACE_INSUFFICIENT`, or a probe's refusal.
 pub fn preflight_many(wants: &[(&Path, u64)], min_free_percent: u8) -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut planned = Vec::new();
-    for (path, bytes) in wants.iter().filter(|(_, bytes)| *bytes > 0) {
-        let existing = existing_ancestor(path)?;
-        let device = std::fs::metadata(&existing)
-            .map_err(|error| crate::refuse::io(&error, "space::preflight_many"))?
-            .dev();
-        let limits = probe_limits(&existing)?;
-        planned.push(Planned {
-            path: existing,
-            device,
-            limits,
-            bytes: *bytes,
-        });
-    }
+    let planned = wants
+        .iter()
+        .filter(|(_, bytes)| *bytes > 0)
+        .map(|(path, bytes)| locate(path, *bytes))
+        .collect::<Result<Vec<_>>>()?;
     check_planned(&planned, min_free_percent)
 }
 
@@ -653,6 +702,12 @@ mod tests {
         for root in [Some(QUOTA), None] {
             assert_eq!(Limits::from_views(QUOTA, root), Limits::filesystem(QUOTA));
         }
+        // A larger view at the path is no quota (review A1: a root that
+        // reads another, smaller filesystem).
+        assert_eq!(
+            Limits::from_views(FILESYSTEM, Some(QUOTA)),
+            Limits::filesystem(FILESYSTEM)
+        );
     }
 
     #[test]
@@ -751,14 +806,22 @@ mod tests {
             98 22 253:5 / /srv/fast\\040local rw,relatime shared:3 - xfs /dev/mapper/fast rw,prjquota\n\
             99 22 253:7 /sub /mnt/sub rw - xfs /dev/mapper/other rw\n";
         assert_eq!(
-            mount_of_root(table, 253, 5),
-            Some(PathBuf::from("/srv/fast local"))
+            mounts_of_root(table, 253, 5),
+            vec![PathBuf::from("/srv/fast local")]
         );
-        assert_eq!(mount_of_root(table, 253, 0), Some(PathBuf::from("/")));
+        assert_eq!(mounts_of_root(table, 253, 0), vec![PathBuf::from("/")]);
         // Only a subtree of 253:7 is mounted: no root view.
-        assert_eq!(mount_of_root(table, 253, 7), None);
-        assert_eq!(mount_of_root(table, 8, 1), None);
-        assert_eq!(mount_of_root(b"", 253, 5), None);
+        assert!(mounts_of_root(table, 253, 7).is_empty());
+        assert!(mounts_of_root(table, 8, 1).is_empty());
+        assert!(mounts_of_root(b"", 253, 5).is_empty());
+        // Two mounts of one root (one may be hidden under a stacked mount):
+        // both are candidates, in table order; the caller keeps the first
+        // that still resolves to the device.
+        let twice = b"1 0 253:5 / /a rw - xfs x rw\n2 0 253:5 / /b rw - xfs x rw\n";
+        assert_eq!(
+            mounts_of_root(twice, 253, 5),
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
         assert_eq!(unescape_mountinfo(br"a\011b\134c\012"), b"a\tb\\c\n");
         // Not an escape: kept as it is.
         assert_eq!(unescape_mountinfo(br"a\9b\0"), br"a\9b\0");
@@ -820,6 +883,26 @@ mod tests {
         );
         // Zero bytes are never judged.
         assert_eq!(check_planned(&[at("/a", quota_a, 0)], 100), Ok(()));
+        // Review A2: two trees under quotas of one size are judged by the
+        // least room either reported, whichever path came first.
+        let roomy = Space {
+            total: 100 * GIB,
+            available: 90 * GIB,
+        };
+        let tight = Space {
+            total: 100 * GIB,
+            available: 5 * GIB,
+        };
+        let alike = [at("/a", roomy, 1), at("/b", tight, 10 * GIB)];
+        assert_eq!(
+            check_planned(&alike, 0),
+            Err(BulkloadRefusal::DestinationSpaceInsufficient)
+        );
+        let reversed = [at("/b", tight, 10 * GIB), at("/a", roomy, 1)];
+        assert_eq!(
+            check_planned(&reversed, 0),
+            Err(BulkloadRefusal::DestinationSpaceInsufficient)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -836,8 +919,8 @@ mod tests {
 
     /// A live reading of a real project-quota tree, read-only: set
     /// `BULKLOAD_QUOTA_PROBE` to a directory inside one (on sting,
-    /// `/srv/cache/jess`, whose `statvfs` reports its 360 GB quota while
-    /// `/srv/cache` reports the 400 GB filesystem) and run it ignored.
+    /// `/srv/cache/jess`, read as a 386.5 GB (360 GiB) quota on a 429.3 GB
+    /// filesystem, 2026-10-17) and run it ignored.
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "needs BULKLOAD_QUOTA_PROBE: a directory inside a project quota"]
@@ -851,5 +934,18 @@ mod tests {
             "{limits:?}"
         );
         println!("{limits:?}");
+    }
+
+    /// Review A4: a destination under a dangling symlink cannot be located;
+    /// the caller decides (the apply's space plan skips that item, as it
+    /// did, and lets it refuse on its own).
+    #[test]
+    fn a_destination_under_a_dangling_link_is_not_located() {
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("dangling");
+        std::os::unix::fs::symlink(root.path().join("gone"), &link).unwrap();
+        assert!(locate(&link.join("repository"), 1).is_err());
+        let found = locate(&root.path().join("absent/repository"), 7).unwrap();
+        assert_eq!((found.path.as_path(), found.bytes), (root.path(), 7));
     }
 }

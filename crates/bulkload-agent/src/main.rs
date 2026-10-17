@@ -613,9 +613,12 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}");
-            // M2 round 2, item 1: which limit refused, and both numbers.
-            if let Some(space) = bulkload_agent::space::last_refusal() {
-                eprintln!("bulkload-agent: space: {}", space.fields());
+            // M2 round 2, item 1: which limit refused, and both numbers;
+            // only for this verb's own space refusal, and once (review A3).
+            if refusal == BulkloadRefusal::DestinationSpaceInsufficient {
+                if let Some(space) = bulkload_agent::space::take_refusal() {
+                    eprintln!("bulkload-agent: space: {}", space.fields());
+                }
             }
             ExitCode::FAILURE
         }

@@ -232,17 +232,32 @@ fn same_stream(a: &Path, b: &Path) -> bool {
 /// The bytes a placement of `landed` at `dest` would write at most, for
 /// the free-space check.
 ///
-/// Nothing for a landed file the ledger already holds unchanged (or one the
-/// destination continued); the new tail of this ledger's own append-only
-/// placement, the whole content of its changed other file (a supersede).
-/// Without a row that decides it (M2 round 2, item 1), what is at `dest`
-/// decides, as the placement does: the whole content where nothing is; at
-/// most the bytes past it where an append-only regular file with one link
-/// is (equal is adopted, a prefix extended, anything else kept), or where
-/// an append-only symlink to a regular file is (a regularization copies its
-/// target first); nothing where another regular file (adopted or kept),
-/// another symlink or any other node is (never written). The content is decompressed for a `.zst`: its
-/// frame's declared size, or the stream counted.
+/// It mirrors the placement's own decision (`Placer::place_inner`), so it
+/// never charges nothing where the placement writes (M2 round 2, item 1,
+/// review B2):
+///
+/// - a row of another landed file (a collision), a `Continued` row, and an
+///   `Unreadable` row of this landed file: nothing;
+/// - this ledger's own placement (`Ours`, `Adopted`): nothing when the
+///   destination is gone or changed since (the destination's from then
+///   on), the landed file is unchanged, or the file gained another link;
+///   else the new tail of an append-only file, the whole content of any
+///   other (a supersede);
+/// - a kept row (`Diverged`, `Occupied`, `Rewritten`): nothing while the
+///   landed file and the destination are both as the row recorded them
+///   (a symlink excepted: a regularization earlier in the pass may make it
+///   a regular file);
+/// - otherwise, as with no row, what is at `dest` decides: the whole content
+///   where nothing is; the bytes past it where an append-only regular file
+///   with one link is (equal is adopted, a prefix extended, anything else
+///   kept), or where an append-only symlink to a regular file is (a
+///   regularization may copy its target first); nothing where another
+///   regular file (adopted or kept), another symlink or any other node is
+///   (never written).
+///
+/// The content is decompressed for a `.zst`: its frame's declared size, or
+/// the stream counted. Partial lines held back make the placement write
+/// less, never more.
 ///
 /// # Errors
 /// Ledger and I/O refusals.
@@ -253,39 +268,58 @@ pub fn planned(ledger: Option<&Ledger>, dest: &Path, landed: &Path) -> Result<u6
     if !meta.is_file() {
         return Ok(0);
     }
+    let landed_now = Identity::of(&meta);
     let row = match ledger {
         Some(ledger) => ledger.placement(dest)?,
         None => None,
     };
-    if row
-        .as_ref()
-        .is_some_and(|row| row.landed == Identity::of(&meta) || row.state == State::Continued)
-    {
-        return Ok(0);
-    }
-    if let Some(row) = row.as_ref().filter(|row| row.state.owned()) {
-        let size = content_size(landed, &meta)?;
-        return Ok(if appendable(dest) {
-            size.saturating_sub(row.placed)
-        } else {
-            size
-        });
-    }
-    match lstat(dest)? {
-        None => content_size(landed, &meta),
-        Some(found) if found.is_file() && found.nlink() == 1 && appendable(dest) => {
-            Ok(content_size(landed, &meta)?.saturating_sub(found.len()))
-        }
-        // A symlinked transcript a regularization turns into a regular copy
-        // of its target first (charged per link as it copies): at most the
-        // bytes past that copy are then appended.
-        Some(found) if found.is_symlink() && appendable(dest) => match std::fs::metadata(dest) {
-            Ok(target) if target.is_file() => {
-                Ok(content_size(landed, &meta)?.saturating_sub(target.len()))
+    let observed = lstat(dest)?;
+    match row {
+        Some(row) if row.state == State::Unreadable && row.landed == landed_now => Ok(0),
+        Some(row) if !same_stream(&row.landing, landed) => Ok(0),
+        Some(row) if row.state.owned() => {
+            let Some(found) = observed else {
+                return Ok(0);
+            };
+            if Identity::of(&found) != row.placed_identity
+                || row.landed == landed_now
+                || found.nlink() > 1
+            {
+                return Ok(0);
             }
-            _ => Ok(0),
+            let size = content_size(landed, &meta)?;
+            Ok(if appendable(dest) {
+                size.saturating_sub(row.placed)
+            } else {
+                size
+            })
+        }
+        Some(row) if row.state == State::Continued => Ok(0),
+        // A symlink kept `Occupied` may be regularized earlier in the same
+        // pass and then extended: charged below like any symlinked
+        // transcript.
+        Some(row)
+            if row.landed == landed_now
+                && observed.as_ref().map(Identity::of) == Some(row.placed_identity)
+                && !observed.as_ref().is_some_and(std::fs::Metadata::is_symlink) =>
+        {
+            Ok(0)
+        }
+        Some(_) | None => match observed {
+            None => content_size(landed, &meta),
+            Some(found) if found.is_file() && found.nlink() == 1 && appendable(dest) => {
+                Ok(content_size(landed, &meta)?.saturating_sub(found.len()))
+            }
+            Some(found) if found.is_symlink() && appendable(dest) => {
+                match std::fs::metadata(dest) {
+                    Ok(target) if target.is_file() => {
+                        Ok(content_size(landed, &meta)?.saturating_sub(target.len()))
+                    }
+                    _ => Ok(0),
+                }
+            }
+            Some(_) => Ok(0),
         },
-        Some(_) => Ok(0),
     }
 }
 
