@@ -8,7 +8,7 @@ i01-refused.tsv`: ten `GIT_SOURCE_PARTIAL_CLONE`, one
 Q185/Q192 (nothing excluded), Q194 C14 (carry non-recreatable leftovers as
 files), S2 / WP1 (never interrupt or lazily fetch on the source), R-N13.
 
-Status: the malformed half is a regression row plus the evidence still
+Status: the malformed half is a regression row (not a reproduction) plus the evidence still
 needed; the partial-clone half is a design with experiments, not built.
 Both say why below.
 
@@ -32,16 +32,22 @@ Where the refusal can come from: the code returns it in about 350 places
   short body; a missing terminator; bytes left when the reader closes). A
   restore-side reader: it would refuse at apply, not at capture.
 - `chain.rs`: a bundle header that is not `# v2`/`# v3`, a line without
-  `<oid> <name>`, a non-oid value (`advertised`, read for a chained
-  capture's prior); a `cat-file --batch-check` answer with a bad oid
-  (`source_held_tips`); a flattened chain whose heads differ from the
-  head link's (`flatten`, restore side).
+  `<oid> <name>`, a non-oid value (`advertised`); a `cat-file
+  --batch-check` answer with a bad oid (`source_held_tips`); a flattened
+  chain whose heads differ from the head link's (`flatten`, restore side).
 
-Of those, only `advertised` and `source_held_tips` run at capture, and
-only for a chained capture (a retained prior). The first night's i01 pass
-was a first capture, so neither ran. The refusal more likely came from the
-census or the export in `git_carry.rs` or `ref_table.rs` (worktree and ref
-inventories, which a 28-worktree repository exercises hardest).
+`advertised` runs at capture, on a first capture too (a review of this
+note corrected it): items that share one common Git directory form a
+plan-base group (`capture_groups`), telefreeze's main and its 28
+worktrees among them, so the group's base is exported once
+(`prepare_base`, `shared::export_base`) and each item's capture declares
+its prerequisites from it (`shared::write_capture`,
+`prerequisite_commits`, which itself refuses `GIT_INVENTORY_MALFORMED` for
+a base ref outside `refs/carry-export/`, an answer with extra lines, or no
+commits). So the suspects are the shared-base path (the base export runs
+from whichever group member arrives first, which may be a linked
+worktree) beside the census and export in `git_carry.rs` and
+`ref_table.rs`. That only the main refused points to a per-item cause.
 
 Reproduction attempted on sting with the current main (git 2.52.0): a main
 with 28 linked worktrees, each on its own branch with its own commit, plus
@@ -50,8 +56,14 @@ removed, per-worktree refs (`refs/bisect/*`, `refs/worktree/*`), a stash
 and a staged file, `extensions.worktreeConfig` with a per-worktree key,
 worktrees nested in the checkout (`.claude/worktrees/*`, `.worktrees/*`),
 two worktrees whose administration names collide, an orphan branch in a
-worktree, packed annotated tags. Every item captures and lands. That shape
-is now a regression row: `tests/estate_many_worktrees.rs`.
+worktree, packed annotated tags. Every item captures and lands. The same
+row run against the night's binary 5beb0314900f also captures every item
+(it then refuses at apply only for the absent parents item 1 fixed), so
+it does **not** reproduce telefreeze: it is a regression row for these
+shapes, not a pin of that defect (`tests/estate_many_worktrees.rs`).
+Known gaps of the row: the per-worktree refs land as provenance only (as
+designed), and a lock reason and `config.worktree` are not carried; the
+test asserts HEADs, the stash and the staged entry.
 
 Evidence still needed (read-only, from neo):
 
@@ -97,6 +109,20 @@ So `--filter` alone is not a carry: it drops every blob of the filtered
 kind, including blobs the source holds locally and the promisor does not
 (a new commit's files, the capture's own worktree and index trees). The
 native carry needs the present-objects pack.
+
+Two gaps a review of this design found (git 2.52.0):
+
+- The capture packs in bulkload's private repository, which borrows the
+  source's objects through `alternates`. There, `rev-list --objects --all
+  --missing=allow-promisor` fails (`fatal: unexpected missing blob
+  object`) unless the private repository itself has
+  `remote.<r>.promisor=true` and a URL, which arms lazy fetch inside it.
+  Promisor mode must configure that and set `GIT_NO_LAZY_FETCH=1` on every
+  child there.
+- A sparse checkout's index can name a blob the clone never fetched (an
+  `S` entry outside the cone). The index needs it, not the worktree, so
+  the apply's completeness check and the converge proofs (which read index
+  blobs) must refuse that shape, or carry such entries by name only.
 
 Proposed design ("promisor mode"; not built):
 

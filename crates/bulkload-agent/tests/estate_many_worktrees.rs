@@ -11,8 +11,10 @@
 //! nested in the main checkout (`.claude/worktrees`, `.worktrees`), two
 //! worktrees whose administration names collide, an orphan branch in a
 //! worktree, and packed annotated tags. Planned as telefreeze was (the main
-//! and every linked worktree as items), every item captures and lands. The
-//! evidence still needed to reproduce telefreeze itself is listed in
+//! and every linked worktree as items), every item captures and lands. Run
+//! against the night's binary it also captures, so this does not
+//! reproduce telefreeze: it is a regression row for these shapes. The
+//! evidence still needed is listed in
 //! `docs/agent-notes/2026-10-16-partial-clone-carry-design.md`.
 //!
 //! Fixture repositories are created and destroyed here; their Git runs with
@@ -72,9 +74,8 @@ fn outcomes(stdout: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The source repository and its linked worktrees, as `(worktree, None)`
-/// for the main and `(worktree, Some(main))` for each linked one that still
-/// exists.
+/// Build the source repository at `root/src/tele` and return its linked
+/// worktrees that still exist (the main is not in the list).
 fn telefreeze_like(root: &Path) -> Vec<PathBuf> {
     let main = root.join("src/tele");
     fs::create_dir_all(&main).unwrap();
@@ -291,4 +292,33 @@ fn a_main_with_many_linked_worktrees_captures_and_lands() {
             path.display()
         );
     }
+    // The stash and the staged entry of wt-2 land with it.
+    let landed = dest(&root.join("src/tele.worktrees/wt-2"));
+    assert_eq!(
+        git(&landed, &["rev-parse", "refs/stash"]),
+        git(
+            &root.join("src/tele.worktrees/wt-2"),
+            &["rev-parse", "refs/stash"]
+        )
+    );
+    assert!(git(&landed, &["diff", "--cached", "--name-only"]).contains("staged"));
+    // Every branch of the source is a native branch of the landing.
+    assert_eq!(
+        git(
+            &dest(&main),
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads"
+            ]
+        ),
+        git(
+            &main,
+            &[
+                "for-each-ref",
+                "--format=%(refname) %(objectname)",
+                "refs/heads"
+            ]
+        )
+    );
 }
