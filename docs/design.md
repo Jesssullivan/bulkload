@@ -1448,7 +1448,7 @@ miss (#87).
   fallback) fail on that bound alone. Whether handed bytes are wire bytes
   for that inequality is unruled. `just fault-harness` runs the crash,
   power-loss and resume suites with the lever on too (`delta-lever`).
-  `BulkloadTransfer.tla` already lets `RecvEntry` choose `Send` for any
+  `BulkloadTransfer.tla` (deleted 2026-10-17, R-C843) already lets `RecvEntry` choose `Send` for any
   absent output, so the lever is inside the model (docs/slo.md, the
   2026-10-16 amendment). The source sends `Manifest`, from
   its ledger without reading when the stat identity is recorded; the
@@ -1747,7 +1747,7 @@ copy of corpus v1 committed 10 to 18 destination groups on the rig; with
 informational census (1 destination group commit against 3 to 5,
 2026-10-15, not of record), until the rig series measures it. Each group still
 seals before its one FULL commit and every `Held` still follows that commit
-(R25: `BulkloadTransfer.tla`'s `Commit` takes any nonempty set of ready
+(R25: `BulkloadTransfer.tla`'s (deleted 2026-10-17, R-C843) `Commit` takes any nonempty set of ready
 seats, so a larger group is a behaviour the model already checks), and the
 most a crash leaves unrecorded is still one group within the same bounds;
 #169's adoption recovers it without a source read. No commit is relaxed:
@@ -1911,7 +1911,7 @@ as without batching. A discarded creation clears its record before its
 temporary goes (#74 N3), a level whose shared seal or commit failed
 included (its commit may have reached the log although it reported a
 failure), and every clear is traced apart from a completion
-(`DirectoryCleared`). `docs/formal/DirectoryRecords.tla` checks
+(`DirectoryCleared`). `docs/formal/DirectoryRecords.tla` (deleted 2026-10-17, R-C843) checks
 the records under per-name power loss, journal seals and reused inode
 numbers (README, "Directory records").
 
@@ -1948,7 +1948,7 @@ already empty (the last output closed it at a file or byte bound, or an
 idle or age bound closed it first) drops the finish, which then runs as
 before over the modes already set. `BULKLOAD_DIRECTORY_FOLD=0`
 restores the separate finish for A/B; `directories_folded` counts the
-directories finished in a group. The model is `DirectoryRecords.tla`'s
+directories finished in a group. The model is `DirectoryRecords.tla`'s (deleted 2026-10-17, R-C843)
 `Place` and `GroupFinish` with `CompletionAfterChildren` (a completed
 directory owes no output of its run); the power-loss proof is
 `every_power_loss_state_of_a_folded_finish_is_explored`, in group and
@@ -1982,7 +1982,7 @@ state-root seals (#161) are fully synced on both sides, every destination
 commit is `synchronous=FULL`, `fullfsync=ON`, and a checkpoint on the
 relaxed connection is still a full flush. `--source-ledger-sync=full` syncs
 every row commit and fails the session on the first failed one, for
-comparison. `docs/formal` checks the relaxed ledger (`MC_wp0g`,
+comparison. `docs/formal` (deleted 2026-10-17, R-C843) checks the relaxed ledger (`MC_wp0g`,
 `MC_wp0g_deep`, `MC_wp0g_strict`) and shows a relaxed authority breaking R25
 (`MC_wp0g_authority`); P79 and `tests/power_loss.rs` take the real store
 through every loss.
@@ -2009,7 +2009,7 @@ the old output's own chunks, so only absent chunks cross the wire (WP0(c),
 inequality 2). A `SQLite` snapshot output (#218) is superseded the same
 way (OI-1003-Q146), with one more look: no `-wal`, `-journal` or `-shm`
 beside it at Decide and immediately before the exchange ("SQLite
-snapshot seats", Wire v6); `docs/formal/SqliteCarry.tla` checks it
+snapshot seats", Wire v6); `docs/formal/SqliteCarry.tla` (deleted 2026-10-17, R-C843) checks it
 (`SqliteNoClobber`, `SqliteOldOrNewWhole`, `SqliteNoForeignSidecar`).
 
 What "this store's own" covers (#187 review, 2026-10-07). An output has a
@@ -2058,7 +2058,7 @@ first, then merge): the intent and its sweep, the ownership row, the
 remembered refusal and the refusal without an exchange, with the
 invariants `NoClobber`, `SupersedeAtomic`, `OwnershipNeverReuse`,
 `RememberedRefusalSound` and `ExchangeRefusedUpFront`
-(`docs/formal/README.md`, "#187's records in the model").
+(`docs/formal/README.md`, "#187's records in the model" (deleted 2026-10-17, R-C843)).
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a

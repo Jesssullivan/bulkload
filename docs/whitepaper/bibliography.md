@@ -1,6 +1,8 @@
 # Bibliography for the bulkload whitepaper
 
-Companion to [bulkload.md](bulkload.md) (OI-1003-Q7). There is one entry per
+[2026-10-17: the whitepaper this bibliography served was deleted under R-C843 (TIN-4543 ace8649c); kept as prior-art salvage.]
+
+Companion to `bulkload.md` (OI-1003-Q7). There is one entry per
 reference, keyed as the paper cites it. Every entry was first checked on
 2026-10-03 and **re-verified on 2026-10-07** for the whitepaper refresh
 (OI-1003-Q51), against a DOI record, an ISBN, or the stable official page or
@@ -29,7 +31,7 @@ How the 2026-10-07 pass was made:
   read.
 
 The per-entry log is in
-[`docs/agent-notes/2026-10-07-whitepaper-refresh.md`](../agent-notes/2026-10-07-whitepaper-refresh.md).
+`docs/agent-notes/2026-10-07-whitepaper-refresh.md`.
 
 **2026-10-16 pass** (the OI-1003-Q155 refresh). Fifteen entries were added
 for the mechanisms and measurements the refresh describes: [APFSRef],
