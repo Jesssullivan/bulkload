@@ -14,6 +14,13 @@ use bulkload_agent::transfer::copy;
 
 #[test]
 fn four_sibling_directories_take_one_pending_commit_and_ride_the_last_group() {
+    // The group counts below assume each run's four outputs share one
+    // destination group. Under heavy host load the default 250 ms idle can
+    // close a group between two of them (seen at load ~90: batched
+    // `DurableGroups` 2, folded 1). A long idle keeps the count about the
+    // fold, not the scheduler; the 1 s group age still bounds it. This test
+    // is its own binary, so the variable reaches no other test.
+    std::env::set_var(bulkload_agent::transfer::DEST_GROUP_IDLE_ENV, "60000");
     let base = std::env::temp_dir().join(format!("bulkload-dir-batch-{}", std::process::id()));
     let source = base.join("source");
     let destination = base.join("destination");
