@@ -25,7 +25,15 @@ python-lint:
     cd {{ root }} && ruff format --check scripts tests
 
 shell-lint:
-    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh
+    cd {{ root }} && shellcheck scripts/ci-public-read-guard.sh scripts/install-agent.sh
+
+# Build a release bulkload-agent and install it as DEST_DIR/NAME with a GC
+# root for every /nix/store path it names, so a Nix garbage collection cannot
+# delete its interpreter or libraries (M2 item 4). The selftest it runs last
+# reports whether its interpreter is present and rooted. Never replaces NAME.
+install-agent DEST_DIR NAME:
+    cd {{ root }} && cargo build --release --locked -p bulkload-agent
+    cd {{ root }} && scripts/install-agent.sh "${CARGO_TARGET_DIR:-target}/release/bulkload-agent" "{{ DEST_DIR }}" "{{ NAME }}"
 
 workflow-lint:
     cd {{ root }} && actionlint .github/workflows/*.yml
