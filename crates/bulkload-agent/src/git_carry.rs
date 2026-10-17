@@ -31,6 +31,7 @@ pub mod decide;
 )]
 mod decide_tests;
 pub mod estimate;
+pub mod in_band;
 #[cfg(test)]
 #[allow(
     clippy::expect_used,

@@ -191,11 +191,32 @@ current captures omitted (`node_modules`, `.direnv`, `__pycache__`,
 `.terraform` and the rest of `REBUILDABLE_DIRECTORIES`), from each
 capture's `{bundle}.omissions` sidecar: `items_known`, `items_unknown`,
 `roots`, `entries`, `bytes`, one row per root (`item`, `path`, `entries`,
-`bytes`) and the `unknown` items, whose capture predates the sidecar and
-is never counted as zero. Rows, totals, dispositions and the gate are
-v3's: an omitted root is accounted custody outside `planned` and every
-disposition. "Equals the source" reads exactly: equal except these
-counted roots.
+`bytes`) and the `unknown` items, never counted as zero. Rows, totals,
+dispositions and the gate are v3's: an omitted root is accounted custody
+outside `planned` and every disposition. "Equals the source" reads
+exactly: equal except these counted roots.
+
+A capture without the sidecar (M2 round 2, d, 2026-10-17). Every capture
+since `bf10700c` (2026-09-23) names what it omitted in its own bundle, as
+the metadata ref `refs/carry-export/rebuildable-omissions-v1`, present only
+when it omitted something; the sidecar arrived with `3fe1f075`
+(2026-10-16). The 2026-10-16 in-place batches were captured on neo by
+`5beb0314`, between the two, so `closure-report` on i02 listed all 900
+items `unknown`. Without a sidecar the report now reads the bundle's
+header (never its pack): no omission ref means the capture omitted
+nothing (known, zero roots). With `--omissions-from-destination` (opt-in:
+it reads the live destination repositories), the ref's list is read by
+the oid the header names from the item's destination repository, which
+holds it once the item's import ran, and a shallow custody envelope's
+inventory is read from the same repository first. Reads only (`rev-parse`,
+`cat-file --batch`, `--no-optional-locks`); nothing is fetched or written.
+What stays unknown says why on stderr, outside the v4 JSON:
+`omissions-unknown <reason>=<items> ...`, the reasons `no-capture`,
+`capture-unreadable`, `sidecar-unreadable`, `header-unreadable`,
+`value-not-read` and `envelope-not-read` (named in the bundle, destination
+not read), `value-not-held` and `envelope-not-held` (read, but the
+destination does not hold it, for example before the apply). `estate-diff` and `estate-handoff` still read the
+sidecar only.
 
 The report schema was `bulkload.closure.v3` from WP3 PR 4. What changed for
 a v2 reader: a transfer row names its `kind` and adds `transfer` (the

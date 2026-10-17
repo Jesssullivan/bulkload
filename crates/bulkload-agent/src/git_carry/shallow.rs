@@ -15,7 +15,7 @@ use std::process::Stdio;
 use super::{git, input, oid, output, refs, text};
 use crate::{BulkloadRefusal, Result};
 
-const CUSTODY: &str = "refs/carry-export/shallow-custody-v1";
+pub(super) const CUSTODY: &str = "refs/carry-export/shallow-custody-v1";
 /// Set on a shallow envelope whose capture drifted under its export. It names
 /// the custody commit, so `bundle list-heads` shows the drift without the
 /// pack ever being fetched; `unpack` refuses any envelope carrying it.
@@ -181,7 +181,10 @@ pub(super) fn headers(repository: &Path, bundle: &Path) -> Result<String> {
     Ok(inventory)
 }
 
-fn custody_manifest(repository: &Path, value: &str) -> Result<(Vec<u8>, String, String)> {
+pub(super) fn custody_manifest(
+    repository: &Path,
+    value: &str,
+) -> Result<(Vec<u8>, String, String)> {
     let object = text(git(repository).args(["rev-parse", &format!("{value}:value")]))?;
     let mut reader = super::batch_objects::BatchObjects::new(repository)?;
     let mut bytes = Vec::new();
