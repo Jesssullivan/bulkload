@@ -62,6 +62,13 @@ pub struct Landing<'a> {
     /// restore) keeps `GIT_DESTINATION_PARENT_MISSING` for an absent
     /// parent.
     pub parents: Option<&'a Path>,
+    /// `--exclude-union` (M2 round 2, item 2): where an estate apply
+    /// records the lines a first linked landing appends to the common
+    /// `info/exclude` (`{item}-{source}.exclude-union` in STATE,
+    /// [`super::exclude_union`]). `None` keeps
+    /// `GIT_IGNORE_POLICY_CONFLICT` for any exclude that is not the
+    /// capture's.
+    pub exclude_union: Option<&'a Path>,
 }
 
 impl<'a> Landing<'a> {
@@ -2865,6 +2872,9 @@ pub(super) struct LinkedChecked {
     pub exclude_path: PathBuf,
     /// The capture's exclude bytes.
     pub captured_exclude: Vec<u8>,
+    /// The lines `--exclude-union` appends (empty when the exclude is kept
+    /// as it is).
+    pub exclude_union: Vec<Vec<u8>>,
     /// The worktree tree's `ls-tree -r -z` listing.
     pub entries: Vec<u8>,
 }
@@ -2879,7 +2889,9 @@ pub(super) struct LinkedChecked {
 /// `GIT_IGNORE_POLICY_CONFLICT`) and its intent-to-add custody. A refusal
 /// here leaves the destination repository's refs, objects and files as
 /// they were. `estate-diff` reports a first linked landing through this
-/// same function, so the report and the apply cannot disagree.
+/// same function, so the report and the apply cannot disagree. `union`
+/// (`--exclude-union`) decides the exclude by [`linked_exclude`]'s union
+/// rule; nothing is written here.
 ///
 /// # Errors
 /// As above; whatever reading the capture refuses.
@@ -2888,7 +2900,7 @@ pub(super) fn check_linked(
     (repository, base): (&Path, Option<&super::StagedBundle>),
     destination: &Path,
     source: &str,
-    observed_ns: i128,
+    (observed_ns, union): (i128, bool),
 ) -> Result<LinkedChecked> {
     const SITE: &str = "git_carry::converge::check_linked";
     let destination = first_landing_target(staged, destination)?;
@@ -2910,12 +2922,12 @@ pub(super) fn check_linked(
         "info/exclude",
     ]))?);
     let common = super::common_repository(&repository)?;
-    linked_exclude(
+    let (_, exclude_union) = linked_exclude(
         &common,
         &exclude_path,
         &captured_exclude,
         source,
-        observed_ns,
+        (observed_ns, union),
     )?;
     // #131: a capture whose intent-to-add custody cannot be restored
     // refuses with nothing laid down.
@@ -2936,13 +2948,19 @@ pub(super) fn check_linked(
         instance: scratch.instance,
         exclude_path,
         captured_exclude,
+        exclude_union,
         entries,
     })
 }
 
 /// The common `info/exclude` (at `path`) a first linked landing keeps: the
-/// capture's (`captured`), or a newer one the main item set (finding 12).
-/// Anything else is `GIT_IGNORE_POLICY_CONFLICT`: it is never overwritten.
+/// capture's (`captured`), or a newer one the main item set (finding 12),
+/// with no lines to append. Anything else is `GIT_IGNORE_POLICY_CONFLICT`:
+/// it is never overwritten. With `union` (`--exclude-union`, M2 round 2
+/// item 2) the existing bytes are kept with the captured lines they lack,
+/// to be appended, where [`super::exclude_union::plan`] allows it (no
+/// negation on either side, not a ledgered exclude, a regular file or
+/// absent); otherwise the refusal stands.
 ///
 /// # Errors
 /// As above; IO reading it.
@@ -2951,8 +2969,8 @@ pub(super) fn linked_exclude(
     path: &Path,
     captured: &[u8],
     source: &str,
-    t: i128,
-) -> Result<Vec<u8>> {
+    (t, union): (i128, bool),
+) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
     let existing = match fs::read(path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -2964,7 +2982,10 @@ pub(super) fn linked_exclude(
         }
     };
     if existing == captured || exclude_newer(common, source, &existing, t)? {
-        Ok(existing)
+        Ok((existing, Vec::new()))
+    } else if union {
+        let append = super::exclude_union::plan(common, path, &existing, captured)?;
+        Ok((existing, append))
     } else {
         Err(BulkloadRefusal::GitIgnorePolicyConflict)
     }
@@ -3009,12 +3030,16 @@ pub(super) fn plan_linked(
     let lock = landed::lock(&common, source)?;
     let directory = landed::ledger_dir(&common, source);
     let mut custody = settle_repository(repository, &common, source)?;
-    let exclude = linked_exclude(
+    // `--exclude-union`: under the repository-wide exclude lock, an append
+    // a crash cut short is settled first.
+    let exclude_path = checked.exclude_path.as_path();
+    let exclude_lock = union_settle(landing, &common, exclude_path)?;
+    let (exclude, append) = linked_exclude(
         &common,
         &checked.exclude_path,
         &checked.captured_exclude,
         source,
-        t,
+        (t, landing.exclude_union.is_some()),
     )?;
     if let Some(base) = base {
         super::import_verified(repository, base.path(), source)?;
@@ -3086,6 +3111,10 @@ pub(super) fn plan_linked(
     if let Some(line) = head.line {
         custody.count(line);
     }
+    // `--exclude-union`: the append is the plan's last write, after every
+    // refusal it can decide, under the lock.
+    let exclude = union_append(landing, exclude_path, exclude, &append, &mut custody)?;
+    drop(exclude_lock);
     Ok(LinkedPlan {
         head,
         meta,
@@ -3096,6 +3125,45 @@ pub(super) fn plan_linked(
         create,
         lock,
     })
+}
+
+/// `--exclude-union`: the repository-wide exclude lock, taken and held by
+/// the caller, and the item's intents settled under it; `None` without
+/// the flag.
+fn union_settle(landing: &Landing<'_>, common: &Path, path: &Path) -> Result<Option<fs::File>> {
+    let Some(record) = landing.exclude_union else {
+        return Ok(None);
+    };
+    let held = super::exclude_union::lock(common)?;
+    super::exclude_union::settle(record, path)?;
+    Ok(Some(held))
+}
+
+/// `--exclude-union`'s append of `append` to the exclude at `path` (which
+/// holds `exclude`), recorded; the exclude the landing keeps. Counts
+/// `exclude-appended=<lines>`: every appended line of the item's record no
+/// finished landing reported yet (this append's, and one a later refusal
+/// or a crash kept from its receipt).
+fn union_append(
+    landing: &Landing<'_>,
+    path: &Path,
+    exclude: Vec<u8>,
+    append: &[Vec<u8>],
+    custody: &mut Custody,
+) -> Result<Vec<u8>> {
+    let Some(record) = landing.exclude_union else {
+        return Ok(exclude);
+    };
+    let kept = if append.is_empty() {
+        exclude
+    } else {
+        super::exclude_union::apply((record, landing.item), path, &exclude, append)?
+    };
+    let lines = super::exclude_union::unreported(record, path)?;
+    if lines > 0 {
+        custody.add("exclude-appended", lines);
+    }
+    Ok(kept)
 }
 
 /// Whether a first linked landing may keep a common `info/exclude` that is
