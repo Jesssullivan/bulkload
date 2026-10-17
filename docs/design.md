@@ -2118,6 +2118,37 @@ starts.
   reported as the destination's. Any other I/O error a store meets is `IO`
   with its errno (`EIO` where the errno cannot be read).
 
+## Installing the agent (M2 item 4, 2026-10-16)
+
+A `bulkload-agent` built inside `nix develop` is dynamically linked
+against store paths: on Linux its ELF interpreter and `RUNPATH` name the
+devShell's glibc and gcc-lib in `/nix/store` (and, first, the devShell's
+own `outputs/out/lib`), on Darwin its dylibs may. None of those is a GC
+root, so `nix-collect-garbage` can delete them and the installed binary
+then fails to start (2026-10-16: a GC deleted the glibc of
+`~/.local/bin/bulkload-agent-5beb…` mid-run). `just install-agent DEST_DIR
+NAME` builds a release binary and runs `scripts/install-agent.sh`, which
+copies it beside `DEST_DIR/NAME`, drops `RUNPATH` entries outside
+`/nix/store` (patchelf, where present), adds one indirect GC root per store
+path the copy names under `${XDG_STATE_HOME:-~/.local/state}/bulkload/
+gcroots` (`nix-store --add-root`, registered in
+`/nix/var/nix/gcroots/auto`), publishes `NAME` with `link(2)` (never
+replacing anything), writes `NAME.sha256` and `NAME.gcroots` (never over
+existing ones), and runs the selftest. A failure before the publish removes
+the roots it made. The roots outlive a deleted binary: remove its
+`gcroots/NAME-*` with it.
+
+The selftest says `interpreter <path> exists= nix-store=` and `gc roots
+store-paths=N rooted=R unregistered=U registry=read|unreadable
+unrooted=...`: a store path counts as rooted only when a symlink in
+`$BULKLOAD_GCROOTS` (default that directory) resolves into it and Nix's
+registry names that symlink, so a copied or hand-made symlink is
+`unregistered`. `rooted` below `store-paths` is the warning before a GC; a
+binary whose interpreter is already gone cannot run its selftest: rebuild
+it. Not built: a fully static musl build (a flake output with a musl
+toolchain; changing `flake.nix` moves the pinned digests of the
+public-read guard), which would need no roots at all.
+
 ## Agent session re-seat (R0, TIN-6587)
 
 SPEC R0 (draft `docs/SPEC.md`, PR #236) is the user outcome: after a run,
