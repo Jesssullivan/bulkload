@@ -2029,6 +2029,28 @@ starts.
   reported as the destination's. Any other I/O error a store meets is `IO`
   with its errno (`EIO` where the errno cannot be read).
 
+## Installing the agent (M2 item 4, 2026-10-16)
+
+A `bulkload-agent` built inside `nix develop` is dynamically linked
+against store paths: on Linux its ELF interpreter and `RUNPATH` name the
+devShell's glibc and gcc-lib in `/nix/store`, on Darwin its dylibs may.
+None of those is a GC root, so `nix-collect-garbage` can delete them and the
+installed binary then fails to start (2026-10-16: a GC deleted the glibc of
+`~/.local/bin/bulkload-agent-5beb…` mid-run). `just install-agent DEST_DIR
+NAME` builds a release binary and runs `scripts/install-agent.sh`, which
+copies it to `DEST_DIR/NAME` (never replacing an existing one), adds one
+indirect GC root per store path the binary names under
+`${XDG_STATE_HOME:-~/.local/state}/bulkload/gcroots` (`nix-store
+--add-root`), writes `NAME.sha256` and `NAME.gcroots`, and runs the
+selftest. The selftest's `interpreter` line names the ELF interpreter and
+says `exists=`, `nix-store=` and `rooted=` (a symlink in
+`$BULKLOAD_GCROOTS`, default that directory, resolving into its store
+path): `nix-store=yes rooted=no` is the warning before a GC. A binary whose
+interpreter is already gone cannot run its selftest; rebuild it. Not built:
+a fully static musl build (a flake output with a musl toolchain; changing
+`flake.nix` moves the pinned digests of the public-read guard), which would
+need no roots at all.
+
 ## Agent session re-seat (R0, TIN-6587)
 
 SPEC R0 (draft `docs/SPEC.md`, PR #236) is the user outcome: after a run,
