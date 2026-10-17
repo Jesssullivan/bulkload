@@ -254,9 +254,10 @@ Source safety (S2, WP1):
   - Readers see the write store, then the source, through `alternates`.
   - The P34 property holds every `lstat` field of the source fixed across a
     capture and its chained reruns.
-- Source-side verbs (`serve`, `estate-capture`, `snapshot`,
-  `git-carry-estimate`, `git-export`, `copy`) enter background CPU and IO
-  priority before anything else (WP0(f)), inherited by every thread and
+- Source-side verbs (`serve`, `snapshot`, `git-carry-estimate`,
+  `git-export`, `copy`; `estate-capture` by `auto`, below) enter background
+  CPU and IO priority before anything else (WP0(f)), inherited by every
+  thread and
   child. The remote estimate probe's `bash` runs at default priority on the
   remote host (WP0(f) covers only the local verb; #188). `--priority=normal`
   is the explicit, recorded opt-out; every
@@ -266,33 +267,40 @@ Source safety (S2, WP1):
   uninterruptible IO for 25 minutes while a normal-priority `serve` read
   the same disk: a throttled (Darwin) or idle-class (Linux) reader is
   served only when no other IO is pending, so a busy disk starves it
-  without bound. Two rules bound it, by the operator's M2 instruction
-  (the WP0(f) default stands for every other source-side verb):
+  without bound. By the operator's M2 instruction (`docs/slo.md`,
+  amendment of 2026-10-16), `estate-capture` changes; every other
+  source-side verb keeps the WP0(f) default above:
   - `estate-capture` defaults to `--priority=auto`: background when a
-    terminal was read within 300 s (a person at the host: the access time
-    of `/dev/pts/*` and `/dev/tty*` on Linux, `/dev/ttys*` and
-    `/dev/console` on Darwin, as `w` reports idle), normal otherwise; an
-    unreadable `/dev` counts as a person present. The counters line says
-    `priority_from=auto priority_auto=idle|interactive|unknown`. Activity
-    in a graphical session alone is not seen (a residual; the HID idle
-    time is the follow-up). `--priority=auto` works for any verb.
-  - Every process that starts at background runs a watcher thread that
-    samples its counters each second. After `--escalate-after=SECONDS`
-    (default 300; 0 turns it off) with no counter movement, it moves the
-    process's IO back to the normal class once: on Linux every thread of
-    the process and of each live descendant (its Git children and theirs,
-    found through `/proc/<pid>/task/<tid>/children`) leaves the idle class
-    for best effort; on Darwin the process disk policy goes back to
-    `IOPOL_DEFAULT`, for the process and every later child. Darwin cannot
-    change a running child's policy or another thread's `QoS` from outside
-    (a residual: the child that is starving keeps its throttle until it
-    exits), and nice stays 19 everywhere (an unprivileged process cannot
-    raise it back). Recorded as `priority_escalations` (0 or 1),
-    `priority_escalated_ns` (from start) and `priority_escalated_threads`.
-    No signal is sent to anything (R-N11).
-  - Not built: escalation for the remote `serve` of a `pull` (it is the
-    same binary, so it has the watcher, but the destination cannot see
-    it), and a de-escalation when a person returns.
+    terminal device was read or written within 300 s (access or
+    modification time of `/dev/pts/*` and `/dev/tty*` on Linux,
+    `/dev/ttys*` and `/dev/console` on Darwin; output counts, so the test
+    errs toward background), normal otherwise; an unreadable `/dev` counts
+    as a person present. The counters line says `priority_from=auto
+    priority_auto=idle|interactive|unknown`. Activity in a graphical
+    session alone is not seen (a residual; HID idle time is the
+    follow-up). `--priority=auto` works for any verb.
+  - A background `estate-capture` (or any background verb given
+    `--escalate-after=SECONDS`) runs a watcher thread that samples, each
+    second, its counters and, on Linux, its live descendants' read and
+    write bytes (`/proc/<pid>/io`, so a long healthy Git child is progress).
+    After the threshold (default 300 s for `estate-capture`; 0 turns it
+    off) with no movement it escalates once: on Linux every thread of the
+    process and of each live descendant (found through
+    `/proc/<pid>/task/<tid>/children`, each checked to name its parent)
+    leaves the idle class for the class its nice value implies (best
+    effort, level 7 at nice 19); on Darwin the process disk policy goes
+    back to `IOPOL_DEFAULT`, unverified there and likely helping only later
+    children (a thread's `QoS` also bounds its IO tier; `auto` is Darwin's
+    remedy). Nice stays 19. The watcher cannot tell idle from starved, so
+    a capture blocked on nothing but a quiet source also escalates; the
+    escalation is one-shot. Recorded as `priority_escalate_after=` on the
+    counters line, and `priority_escalations`, `priority_escalated_ns`,
+    `priority_escalated_threads`, `priority_escalation_failures`;
+    `priority=` stays the class the process started at. No signal is sent
+    (R-N11).
+  - Not built: de-escalation when a person returns, and passing `--priority`
+    or `--escalate-after` from `pull` to its remote `serve` (only
+    `--durability` is forwarded).
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
 - No clone of a source file (OI-1003-Q165).

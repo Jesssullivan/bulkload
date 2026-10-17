@@ -11,26 +11,38 @@
 //! disk starves it without bound. Two rules bound it:
 //!
 //! - **`auto`** (the default of `estate-capture`; `--priority=auto` for any
-//!   verb): background when a person is at the host, normal otherwise. A
-//!   person is "at the host" when a terminal device was read within
-//!   [`AUTO_IDLE_SECS`] (its access time, as `w` reports idle): Linux
+//!   verb): background when a person may be at the host, normal otherwise.
+//!   That is when a terminal device was read or written within
+//!   [`AUTO_IDLE_SECS`] (its access or modification time): Linux
 //!   `/dev/pts/*` and `/dev/tty*`, Darwin `/dev/ttys*` and `/dev/console`.
-//!   Activity in a graphical session alone is not seen (a stated residual;
-//!   the HID idle time is the follow-up). An unreadable `/dev` counts as a
-//!   person present: the default never gets less careful than WP0(f).
-//! - **Escalation** (every verb that starts at background): a watcher
-//!   thread samples the process's counters each second. When none has moved
-//!   for the escalation threshold (`--escalate-after=SECONDS`, default
-//!   [`DEFAULT_ESCALATE_SECS`], `0` turns it off), the IO class of the
+//!   Output counts, so a terminal an agent writes to also reads as a
+//!   person: the test errs toward background, the WP0(f) side. Activity in
+//!   a graphical session alone is not seen (a stated residual; the HID idle
+//!   time is the follow-up). An unreadable `/dev` counts as a person
+//!   present.
+//! - **Escalation** (on by default for the `auto` verbs, `estate-capture`;
+//!   for any other verb that starts at background only with an explicit
+//!   `--escalate-after`, so `serve`, `copy` and the S2 runs keep WP0(f) as
+//!   ratified): a watcher thread samples the process's counters each
+//!   second. When none has moved for the threshold (`--escalate-after=
+//!   SECONDS`, default [`DEFAULT_ESCALATE_SECS`], `0` turns it off; the
+//!   watcher cannot tell a starved process from an idle one, so an idle
+//!   `serve` given the flag escalates too), the IO class of the
 //!   process goes back to normal ([`escalate`]): on Linux every thread of
-//!   the process and of each live descendant leaves the idle class for best
-//!   effort; on Darwin the process disk policy goes back to `IOPOL_DEFAULT`
-//!   for the process and every later child (a running child, and the
-//!   threads' `QoS`, cannot be changed from outside: a residual). Nice stays
-//!   19 everywhere: an unprivileged process cannot raise it back. The
+//!   the process and of each live descendant leaves the idle class for the
+//!   class its nice value implies (best effort, level 7 at nice 19); on
+//!   Darwin the process disk policy goes back to `IOPOL_DEFAULT`, which is
+//!   unverified there and likely helps only children started afterwards
+//!   (a thread's `QoS` class also bounds its IO tier and only that thread
+//!   can change it). On Linux the descendants' own read and write byte
+//!   counts (`/proc/<pid>/io`) also count as progress, so a long healthy
+//!   Git child is not taken for a starved one. Nice stays 19 everywhere:
+//!   an unprivileged process cannot raise it back. The
 //!   escalation happens at most once per process and is recorded in
-//!   `priority_escalations`, `priority_escalated_ns` (from start) and
-//!   `priority_escalated_threads`.
+//!   `priority_escalations`, `priority_escalated_ns` (from start),
+//!   `priority_escalated_threads` and `priority_escalation_failures`; the
+//!   counters line names the threshold (`priority_escalate_after=`) when a
+//!   watcher ran, and `priority=` stays the class the process started at.
 
 use crate::counters::{self, Counter};
 use crate::refuse::RefuseAt as _;
@@ -58,15 +70,6 @@ pub fn enter_background() -> crate::Result<()> {
 /// Refuses with the errno of the scheduling query that failed.
 pub fn in_background() -> crate::Result<bool> {
     crate::io::sys::in_background().refuse_at("priority::in_background")
-}
-
-/// Whether the calling thread's IO is still in the background class (the
-/// idle class on Linux, `IOPOL_THROTTLE` on Darwin).
-///
-/// # Errors
-/// Refuses with the errno of the query that failed.
-pub fn io_idle() -> crate::Result<bool> {
-    crate::io::sys::io_idle().refuse_at("priority::io_idle")
 }
 
 /// What `auto` found at start.
@@ -124,9 +127,11 @@ pub fn presence() -> Presence {
             if let Ok(meta) = std::fs::metadata(entry.path()) {
                 use std::os::unix::fs::FileTypeExt as _;
                 if meta.file_type().is_char_device() {
-                    if let Ok(accessed) = meta.accessed() {
-                        times.push(accessed);
-                    }
+                    // Input moves the access time, output the modification
+                    // time: either counts, so a person watching an attached
+                    // terminal without typing is seen too.
+                    times.extend(meta.accessed().ok());
+                    times.extend(meta.modified().ok());
                 }
             }
         }
@@ -155,19 +160,22 @@ pub fn recent(times: &[std::time::SystemTime], now: std::time::SystemTime, windo
 }
 
 /// Move the process's IO back to the normal class (see the module docs).
-/// Returns how many threads moved.
+/// Returns how many threads moved and how many could not be.
 ///
 /// # Errors
-/// Refuses with the errno of the call that failed.
-pub fn escalate() -> crate::Result<u64> {
+/// Refuses with the errno of the call that failed for this process itself.
+pub fn escalate() -> crate::Result<(u64, u64)> {
     crate::io::sys::escalate_io().refuse_at("priority::escalate")
 }
 
-/// Every counter but the escalation's own, summed (wrapping, so movement
-/// is seen even at saturation): what "progress" is.
+/// Every counter but the escalation's own, plus the bytes the process's
+/// live descendants have read and written (Linux), summed wrapping so
+/// movement is seen even at saturation: what "progress" is. A healthy Git
+/// child that is busy but writes nothing the agent counts still moves its
+/// own IO; one stuck in uninterruptible IO does not.
 fn progress() -> u64 {
     let now = counters::Counters::snapshot();
-    Counter::ALL
+    let own = Counter::ALL
         .iter()
         .filter(|counter| {
             !matches!(
@@ -175,11 +183,13 @@ fn progress() -> u64 {
                 Counter::PriorityEscalations
                     | Counter::PriorityEscalatedNs
                     | Counter::PriorityEscalatedThreads
+                    | Counter::PriorityEscalationFailures
             )
         })
         .fold(0_u64, |total, counter| {
             total.wrapping_add(now.get(*counter))
-        })
+        });
+    own.wrapping_add(crate::io::sys::descendant_io())
 }
 
 /// One step of the watcher: given the last progress seen and when it
@@ -218,11 +228,14 @@ pub fn watch_starvation(after: std::time::Duration, started: std::time::Instant)
                     starving(state, progress(), std::time::Instant::now(), after);
                 state = next;
                 if escalate_now {
-                    if let Ok(moved) = escalate() {
-                        counters::bump(Counter::PriorityEscalations);
-                        counters::add(Counter::PriorityEscalatedNs, counters::elapsed_ns(started));
-                        counters::add(Counter::PriorityEscalatedThreads, moved);
-                    }
+                    // Recorded whatever came of it: an escalation that
+                    // failed for the process itself, or for some threads,
+                    // still says when it was tried.
+                    let (moved, failed) = escalate().unwrap_or((0, 1));
+                    counters::bump(Counter::PriorityEscalations);
+                    counters::add(Counter::PriorityEscalatedNs, counters::elapsed_ns(started));
+                    counters::add(Counter::PriorityEscalatedThreads, moved);
+                    counters::add(Counter::PriorityEscalationFailures, failed);
                     return;
                 }
             }

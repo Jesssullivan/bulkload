@@ -4257,12 +4257,6 @@ const SYSCALL_SITES: &[SyscallSite] = &[
               or of its own descendants from the idle IO class to best \
               effort; three integers, no descriptor, no file, no signal.",
     },
-    SyscallSite {
-        id: "agent::io::sys_linux::io_idle",
-        number: "libc::SYS_ioprio_get",
-        why: "Reads the calling thread's IO priority class; two integers, \
-              no descriptor, no file.",
-    },
 ];
 
 /// Every `syscall` token in `source`'s non-test code, as (function, first

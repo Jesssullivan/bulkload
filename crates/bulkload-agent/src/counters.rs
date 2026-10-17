@@ -365,11 +365,15 @@ counters! {
     // Bounded starvation (M2 item 3): a process at background priority
     // whose counters did not move for `--escalate-after` seconds moved its
     // IO back to the normal class once (`priority::escalate`): how many
-    // times (0 or 1), when (nanoseconds from start), and how many threads
-    // (its own and its descendants' on Linux; 1, the process, on Darwin).
+    // times it was tried (0 or 1), when (nanoseconds from start), and how
+    // many threads moved (its own and its descendants' on Linux; 1, the
+    // process, on Darwin).
     PriorityEscalations => "priority_escalations",
     PriorityEscalatedNs => "priority_escalated_ns",
     PriorityEscalatedThreads => "priority_escalated_threads",
+    // Threads (Linux) an escalation could not move, or 1 when it failed
+    // for the process itself.
+    PriorityEscalationFailures => "priority_escalation_failures",
 }
 
 const COUNT: usize = Counter::ALL.len();

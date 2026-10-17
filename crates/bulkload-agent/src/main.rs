@@ -326,21 +326,24 @@ BOUNDARIES:
     and not yet Held count against a probe refreshed on each group commit,
     so the session continues and stays resumable. estate-apply refuses before
     any item, planning bundle sizes (a lower bound).
-    --priority=background|normal (WP0(f)): serve, estate-capture, snapshot,
+    --priority=background|normal|auto (WP0(f)): serve, snapshot,
     git-carry-estimate, git-export and copy read a live source, so they enter
     background CPU and IO priority before anything else (Linux nice 19 and the
     idle IO class; Darwin IOPOL_THROTTLE, QOS_CLASS_BACKGROUND and nice 19),
     inherited by every thread and child; other verbs run at normal priority.
-    --priority=normal is the explicit opt-out (gate (a)); every counters line
-    records priority= and priority_from=default|flag|auto.
-    --priority=auto (estate-capture's default, M2 item 3): background when a
-    terminal was read within 300 s (a person is at the host), normal
-    otherwise; recorded priority_from=auto priority_auto=idle|interactive|
-    unknown.
-    --escalate-after=SECONDS (default 300, 0 off; M2 item 3): a process at
-    background priority whose counters do not move for SECONDS moves its IO
-    (Linux: and its descendants') back to the normal class once; counted in
-    priority_escalations, priority_escalated_ns, priority_escalated_threads.
+    estate-capture defaults to auto (M2 item 3): background when a terminal
+    was read or written within 300 s, normal otherwise. --priority=normal is
+    the explicit opt-out (gate (a)); every counters line records priority=
+    and priority_from=default|flag|auto (and priority_auto=idle|interactive|
+    unknown).
+    --escalate-after=SECONDS (M2 item 3; estate-capture's default 300, any
+    other verb only when given; 0 off): a process at background priority
+    whose counters (and, on Linux, its descendants' IO) do not move for
+    SECONDS moves its IO (Linux: and its descendants') back to the class its
+    nice value implies, once; the counters line then says
+    priority_escalate_after=SECONDS, and priority_escalations,
+    priority_escalated_ns, priority_escalated_threads and
+    priority_escalation_failures record it.
     copy/pull require an existing destination directory.
     copy/pull replace only their own untouched outputs, when the source seat
     changed (superseding publish, WP0(d)); any other divergent destination
@@ -441,7 +444,8 @@ COUNTERS:
 /// Verbs that read a live source on the host they run on. Each enters
 /// background CPU and IO priority before anything else unless
 /// `--priority=normal` opts out, and the opt-out is recorded (WP0(f),
-/// OI-1003-Q17). `copy` is here because it reads the source in-process (it is
+/// OI-1003-Q17), except the [`AUTO_VERBS`], whose default is `auto` (M2
+/// item 3). `copy` is here because it reads the source in-process (it is
 /// gate (a)'s verb); `pull` is not, since its source half is the remote
 /// `serve`.
 const SOURCE_SIDE_VERBS: &[&str] = &[
@@ -484,6 +488,8 @@ struct Priority {
     explicit: bool,
     /// What `auto` found, when the class came from it.
     auto: Option<bulkload_agent::priority::Presence>,
+    /// The starvation watcher's threshold in seconds, when one runs.
+    escalate_after: Option<u64>,
 }
 
 impl Priority {
@@ -498,6 +504,10 @@ impl Priority {
             line.push_str(" priority_auto=");
             line.push_str(presence.label());
         }
+        if let Some(after) = self.escalate_after {
+            use std::fmt::Write as _;
+            let _ = write!(line, " priority_escalate_after={after}");
+        }
         line
     }
 }
@@ -507,7 +517,7 @@ fn main() -> ExitCode {
     // OI-1001-Q2: the binary keeps a 25% free-space floor unless told otherwise.
     bulkload_agent::space::set_min_free_percent(bulkload_agent::space::DEFAULT_MIN_FREE_PERCENT);
     let mut requested = None;
-    let mut escalate_after = bulkload_agent::priority::DEFAULT_ESCALATE_SECS;
+    let mut escalate_after = None;
     let mut args = match global_flags(
         std::env::args_os().skip(1).collect(),
         (&mut requested, &mut escalate_after),
@@ -606,12 +616,12 @@ fn main() -> ExitCode {
 /// The verb's class: `requested`, or its default; entered before any
 /// thread or child exists, so all of them inherit it (WP0(f)). M2 item 3:
 /// `auto` (estate-capture's default) is background only when a person is at
-/// the host, and a background process starts the bounded-starvation
-/// watcher (`escalate_after` seconds; 0 starts none).
+/// the host, and a background process of an `auto` verb, or of any verb
+/// given `--escalate-after`, starts the bounded-starvation watcher.
 fn enter_priority(
     verb: &str,
     requested: Option<Requested>,
-    escalate_after: u64,
+    escalate_after: Option<u64>,
     started: std::time::Instant,
 ) -> Result<Priority> {
     use bulkload_agent::priority::PriorityClass;
@@ -629,6 +639,7 @@ fn enter_priority(
             class,
             explicit: requested.is_some(),
             auto: None,
+            escalate_after: None,
         },
         Requested::Auto => {
             let presence = bulkload_agent::priority::presence();
@@ -636,17 +647,29 @@ fn enter_priority(
                 class: presence.class(),
                 explicit: requested.is_some(),
                 auto: Some(presence),
+                escalate_after: None,
             }
         }
     };
+    let mut priority = priority;
     if priority.class == PriorityClass::Background {
         bulkload_agent::priority::enter_background()?;
-        // After the class is set, so the watcher inherits it like any other
-        // thread.
-        bulkload_agent::priority::watch_starvation(
-            std::time::Duration::from_secs(escalate_after),
-            started,
-        );
+        // Escalation is on by default only for the `auto` verbs; any other
+        // verb keeps WP0(f) as ratified unless the flag asks for it.
+        let after = escalate_after.or_else(|| {
+            AUTO_VERBS
+                .contains(&verb)
+                .then_some(bulkload_agent::priority::DEFAULT_ESCALATE_SECS)
+        });
+        if let Some(after) = after.filter(|after| *after > 0) {
+            // After the class is set, so the watcher inherits it like any
+            // other thread.
+            bulkload_agent::priority::watch_starvation(
+                std::time::Duration::from_secs(after),
+                started,
+            );
+            priority.escalate_after = Some(after);
+        }
     }
     Ok(priority)
 }
@@ -657,7 +680,7 @@ fn enter_priority(
 /// into `escalate_after`.
 fn global_flags(
     args: Vec<std::ffi::OsString>,
-    (priority, escalate_after): (&mut Option<Requested>, &mut u64),
+    (priority, escalate_after): (&mut Option<Requested>, &mut Option<u64>),
 ) -> Result<Vec<std::ffi::OsString>> {
     let mut rest = Vec::with_capacity(args.len());
     for arg in args {
@@ -672,9 +695,11 @@ fn global_flags(
             .to_str()
             .and_then(|value| value.strip_prefix("--escalate-after="))
         {
-            *escalate_after = seconds
-                .parse()
-                .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
+            *escalate_after = Some(
+                seconds
+                    .parse()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?,
+            );
             continue;
         }
         if let Some(mode) = arg

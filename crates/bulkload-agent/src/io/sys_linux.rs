@@ -570,46 +570,87 @@ pub fn enter_background() -> io::Result<()> {
     Ok(())
 }
 
-/// The best-effort IO class: what an unprioritised Linux thread gets.
-const IOPRIO_CLASS_BE: libc::c_int = 2;
-/// Its middle level, the default for nice 0 (`linux/ioprio.h`).
-const IOPRIO_BE_NORMAL: libc::c_int = 4;
+/// `IOPRIO_CLASS_NONE`: no class of its own, so the thread's IO priority is
+/// derived from its nice value (best effort, level 7 at nice 19): what a
+/// process that never called `ioprio_set` has.
+const IOPRIO_CLASS_NONE: libc::c_int = 0;
 
-/// Bounded starvation (M2 item 3): move every thread of this process, and
-/// every thread of each live descendant (its Git children and theirs), from
-/// the idle IO class to best effort, the class an unprioritised thread
-/// has. Nice stays 19: an unprivileged process cannot raise it back, and
-/// the idle IO class, not the CPU share, is what starves a reader behind a
-/// busy disk. A thread or process that ended meanwhile is skipped. Touches
-/// only this process's own descendants, found through
-/// `/proc/<pid>/task/<tid>/children`; it sends no signal (R-N11).
+/// A process directory under `/proc`: this process's own through
+/// `/proc/self` (right in any PID namespace), a descendant's by PID.
+fn proc_dir(pid: Option<u32>) -> String {
+    pid.map_or_else(|| "/proc/self".to_owned(), |pid| format!("/proc/{pid}"))
+}
+
+/// The thread IDs of a process, or `None` when it is gone.
+fn tasks(pid: Option<u32>) -> Option<Vec<libc::c_int>> {
+    Some(
+        std::fs::read_dir(format!("{}/task", proc_dir(pid)))
+            .ok()?
+            .filter_map(|task| {
+                task.ok()?
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse::<libc::c_int>().ok())
+            })
+            .collect(),
+    )
+}
+
+/// The children of thread `tid` of process `pid` whose parent is still
+/// `parent` (the process's own PID as its children see it): a PID reused
+/// since the `children` file was read names another parent and is left
+/// out, so the walk never leaves this process's descendants.
+fn children(pid: Option<u32>, tid: libc::c_int, parent: u32) -> Vec<u32> {
+    let Ok(listed) = std::fs::read_to_string(format!("{}/task/{tid}/children", proc_dir(pid)))
+    else {
+        return Vec::new();
+    };
+    listed
+        .split_ascii_whitespace()
+        .filter_map(|child| child.parse::<u32>().ok())
+        .filter(|child| {
+            std::fs::read_to_string(format!("/proc/{child}/stat"))
+                .ok()
+                .and_then(|stat| {
+                    // `pid (comm) state ppid ...`; comm may hold anything.
+                    let after = stat.get(stat.rfind(')')? + 1..)?;
+                    after.split_ascii_whitespace().nth(1)?.parse::<u32>().ok()
+                })
+                == Some(parent)
+        })
+        .collect()
+}
+
+/// Bounded starvation (M2 item 3): give every thread of this process, and
+/// every thread of each live descendant (its Git children and theirs), the
+/// IO priority its nice value implies (`IOPRIO_CLASS_NONE`: best effort,
+/// level 7 at nice 19) in place of the idle class. Nice stays 19: an
+/// unprivileged process cannot raise it back, and the idle class, not the
+/// CPU share, is what starves a reader behind a busy disk. Touches only
+/// this process's own descendants: found through
+/// `/proc/<pid>/task/<tid>/children`, each checked to name its parent; it
+/// sends no signal (R-N11). A descendant that ended meanwhile is skipped; a
+/// thread that cannot be moved is counted and the walk goes on.
 ///
 /// # Errors
-/// Returns a failure to list this process's own threads, or an
-/// `ioprio_set` failure other than `ESRCH`. Returns the number of threads
-/// moved.
-pub fn escalate_io() -> io::Result<u64> {
-    let mut moved = 0;
-    let mut pending = vec![std::process::id()];
+/// Returns a failure to list this process's own threads. Otherwise returns
+/// the number of threads moved and the number that could not be.
+pub fn escalate_io() -> io::Result<(u64, u64)> {
+    let own = std::process::id();
+    let (mut moved, mut failed) = (0, 0);
+    let mut pending: Vec<(Option<u32>, u32)> = vec![(None, own)];
     let mut seen = std::collections::BTreeSet::new();
-    while let Some(pid) = pending.pop() {
-        if !seen.insert(pid) {
+    while let Some((pid, as_parent)) = pending.pop() {
+        if !seen.insert(as_parent) {
             continue;
         }
-        let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
-            Ok(tasks) => tasks,
-            // A descendant that ended meanwhile.
-            Err(_) if pid != std::process::id() => continue,
-            Err(error) => return Err(error),
+        let Some(threads) = tasks(pid) else {
+            if pid.is_none() {
+                return Err(io::Error::from(io::ErrorKind::NotFound));
+            }
+            continue;
         };
-        for task in tasks {
-            let Some(tid) = task?
-                .file_name()
-                .to_str()
-                .and_then(|name| name.parse::<libc::c_int>().ok())
-            else {
-                continue;
-            };
+        for tid in threads {
             // SAFETY: `ioprio_set` takes three integers and no pointers;
             // `tid` names one thread of this process or of a descendant.
             let ret = unsafe {
@@ -617,43 +658,58 @@ pub fn escalate_io() -> io::Result<u64> {
                     libc::SYS_ioprio_set,
                     IOPRIO_WHO_PROCESS,
                     tid,
-                    (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORMAL,
+                    IOPRIO_CLASS_NONE << IOPRIO_CLASS_SHIFT,
                 )
             };
             if ret == -1 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) {
-                    return Err(error);
+                if io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                    failed += 1;
                 }
                 continue;
             }
             moved += 1;
-            if let Ok(children) =
-                std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/children"))
-            {
-                pending.extend(
-                    children
-                        .split_ascii_whitespace()
-                        .filter_map(|child| child.parse::<u32>().ok()),
-                );
+            // Read after the move, so a child forked since inherits it.
+            for child in children(pid, tid, as_parent) {
+                pending.push((Some(child), child));
             }
         }
     }
-    Ok(moved)
+    Ok((moved, failed))
 }
 
-/// Whether the calling thread is in the idle IO class.
-///
-/// # Errors
-/// Returns the `ioprio_get` failure.
-pub fn io_idle() -> io::Result<bool> {
-    // SAFETY: `ioprio_get` takes two integers and no pointers; `who` 0
-    // names the calling thread.
-    let ioprio = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
-    if ioprio == -1 {
-        return Err(io::Error::last_os_error());
+/// The bytes this process's live descendants have read and written so far
+/// (`rchar` plus `wchar` of each `/proc/<pid>/io`, summed, wrapping): the
+/// starvation watcher's measure of a child's progress, so a long but
+/// healthy Git child is not taken for a starved one. 0 with none.
+#[must_use]
+pub fn descendant_io() -> u64 {
+    let own = std::process::id();
+    let mut total = 0_u64;
+    let mut pending: Vec<(Option<u32>, u32)> = vec![(None, own)];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((pid, as_parent)) = pending.pop() {
+        if !seen.insert(as_parent) {
+            continue;
+        }
+        if let Some(pid) = pid {
+            if let Ok(io) = std::fs::read_to_string(format!("/proc/{pid}/io")) {
+                for line in io.lines() {
+                    if let Some(value) = line
+                        .strip_prefix("rchar: ")
+                        .or_else(|| line.strip_prefix("wchar: "))
+                    {
+                        total = total.wrapping_add(value.trim().parse::<u64>().unwrap_or(0));
+                    }
+                }
+            }
+        }
+        for tid in tasks(pid).unwrap_or_default() {
+            for child in children(pid, tid, as_parent) {
+                pending.push((Some(child), child));
+            }
+        }
     }
-    Ok(ioprio >> IOPRIO_CLASS_SHIFT == libc::c_long::from(IOPRIO_CLASS_IDLE))
+    total
 }
 
 /// Whether the calling thread runs at background priority: nice 19 and the
