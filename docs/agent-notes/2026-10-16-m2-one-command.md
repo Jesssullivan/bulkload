@@ -60,3 +60,27 @@ case-sensitive branch now lands both items).
 Open: a crash between the levels and the record leaves unrecorded empty
 directories or an empty `.bulkload-parent-*` temporary (documented; the
 rerun lands into them).
+
+## Item 2: an unowned narrower directory is accepted, its files proved by content
+
+Finding: a pull into a copy of a staging dir refused 160 entries
+`DESTINATION_OCCUPIED`. The logs (read-only) show all 160 were
+directories (0700 copies of an earlier landing's unfinished directories
+under a 0755 source; `finish_directories` runs only after a session with
+no refusal). Two refuters established that a refused directory refuses
+only its own row: the files below were decided all the same, so the file
+rule the operator asked for (equal adopted, differing refused, never
+overwritten) already held. The change (PR #247): an existing directory
+with no owning record whose mode differs is accepted as a container, mode
+kept and never adopted, when it is this user's, gives its owner rwx, and
+grants group/other nothing the source's mode does not (owner bits not
+compared, so a 0700 copy of a read-only source directory passes).
+Counter `dest_directory_mode_kept`, stderr `directory-mode-kept`. Tests
+that encoded the old refusal now force it with a wider mode and keep
+their hazard assertions; `three_runs` covers a kept directory at batch
+sizes 1/2/3/64.
+
+Open (operator): kept directories never converge to the source's mode and
+are not in the closure row; an equal file whose mode differs is still
+refused; the pre-existing gap that a refused (wider) directory still has
+its entries published inside it is #248.

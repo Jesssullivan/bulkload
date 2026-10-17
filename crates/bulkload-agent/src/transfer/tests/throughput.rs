@@ -72,8 +72,11 @@ fn outcome(stats: &TransferStats) -> String {
     left.sort();
     let mut fallback = stats.directories_fallback.clone();
     fallback.sort();
+    let mut kept = stats.directories_mode_kept.clone();
+    kept.sort();
     format!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={refusals:?} \
+         kept={kept:?} \
          temporaries_removed={} left={} directories_renamed={} fallback={fallback:?} \
          unrowed_adopted={} unrowed_unproven={} engine={:?}",
         stats.completed,
@@ -683,7 +686,7 @@ proptest::proptest! {
 /// A directory tree for the batching checks: `(path, mode)` of each
 /// directory, a file in some, and directories already at the destination:
 /// one this store made and finished in an earlier copy (`old`), a third
-/// party's with the source's mode, and one with another mode (refused).
+/// party's with the source's mode, and one with a wider mode (refused).
 fn batch_tree(corpus: &Corpus, directories: &[(String, u32)], files: &[String]) {
     let source = corpus.base.join("source");
     for (path, _) in directories {
@@ -712,7 +715,7 @@ fn batched_run(cap: usize, build: &dyn Fn(&Corpus)) -> (String, Tree) {
 }
 
 /// Three copies at batch cap `cap`. The first refuses `other` (a third
-/// party's directory with another mode), so it finishes no directory and
+/// party's directory with a wider mode), so it finishes no directory and
 /// leaves `old` and `old/inner` owned and unfinished; the second, with new
 /// directories below them and beside them, adopts them (each an existing
 /// directory held while a batch is open, so a batch closes before anything
@@ -725,12 +728,17 @@ fn three_runs(cap: usize) -> Vec<(String, Tree)> {
         ("old/inner", 0o751),
         ("other", 0o755),
         ("same", 0o755),
+        ("kept", 0o755),
     ]
     .into_iter()
     .map(|(path, mode)| (path.to_owned(), mode))
     .collect();
     batch_tree(&corpus, &first, &["old/five".to_owned()]);
-    for (path, mode) in [("same", 0o755), ("other", 0o700)] {
+    // `other` is wider than the source's 0755 (M2 item 2: a narrower one
+    // is entered with its mode kept), so it is refused.
+    // `kept` is narrower (M2 item 2): accepted with its mode kept, at every
+    // batch size.
+    for (path, mode) in [("same", 0o755), ("other", 0o775), ("kept", 0o700)] {
         let at = corpus.base.join("destination").join(path);
         std::fs::create_dir(&at).unwrap();
         std::fs::set_permissions(&at, std::fs::Permissions::from_mode(mode)).unwrap();

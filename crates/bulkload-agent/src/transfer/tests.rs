@@ -1483,9 +1483,11 @@ fn round_trip_resumes_without_source_reads_and_preserves_divergence() {
     assert_eq!(second.reused, 2);
     assert_eq!(second.source_bytes_read, 0);
     assert_eq!(second.bytes_received, 0);
+    // A mode wider than the source's is a metadata conflict, refused and
+    // kept (M2 item 2: a narrower one is entered with its mode kept).
     std::fs::set_permissions(
         destination.join("nested"),
-        std::fs::Permissions::from_mode(0o700),
+        std::fs::Permissions::from_mode(0o777),
     )
     .unwrap();
     let metadata_conflict = corpus.run().unwrap();
@@ -1495,7 +1497,27 @@ fn round_trip_resumes_without_source_reads_and_preserves_divergence() {
             .unwrap()
             .mode()
             & 0o777,
-        0o700
+        0o777
+    );
+    std::fs::set_permissions(
+        destination.join("nested"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let narrower = corpus.run().unwrap();
+    assert!(narrower.refusals.is_empty(), "{:?}", narrower.refusals);
+    let source_mode = std::fs::metadata(source.join("nested")).unwrap().mode() & 0o7777;
+    assert_eq!(
+        narrower.directories_mode_kept,
+        vec![(b"nested".to_vec(), 0o700, source_mode)]
+    );
+    assert_eq!(
+        std::fs::metadata(destination.join("nested"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o700,
+        "a narrower mode is kept, never reverted"
     );
     std::fs::set_permissions(
         destination.join("nested"),

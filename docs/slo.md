@@ -1678,3 +1678,26 @@ and states what they leave standing. The operative text is the record cited.
   "Priority (OI-1003-Q4)" section keep their text, with dated pointers to
   SPEC.md: the Completion bar stays OI-1003-Q4's record (SEAT-10; ONCE-08
   cites it for Q13), and Priority item 4's order is superseded by C6.
+
+## Amendment 2026-10-16 (M2 item 3): estate-capture priority and bounded starvation
+
+Source: the operator's M2 lane instruction of 2026-10-16 ("bulkload is one
+command", item 3: on macOS background priority starved `estate-capture`, a
+Git child in uninterruptible IO for 25 minutes behind a normal-priority
+`serve`; "propose and implement a bounded-starvation rule: escalate to
+normal after N seconds without progress, recorded in counters. At minimum,
+document it and default `estate-capture` to normal when no interactive
+load is detected"), the plan of record's M2 fix 5 ("adaptive priority").
+To be entered in the ruling ledger (TIN-4543); until it is, this amendment
+records the instruction, not a ruling.
+
+- **(f) for `estate-capture`.** Its default class is `auto`: background
+  when a terminal was read or written within 300 s, normal otherwise,
+  recorded `priority_from=auto priority_auto=...`. The other source-side
+  verbs of (f) and OI-1003-Q25 are unchanged; gate (a)'s rule (opt out only
+  with an explicit, recorded flag) is unchanged for `copy`.
+- **Bounded starvation.** A background `estate-capture`, or any background
+  verb given `--escalate-after`, escalates its IO class once after the
+  threshold (default 300 s) with no counter or descendant-IO movement,
+  recorded on its counters line. An S2 sample's process (`serve`, `copy`)
+  runs no watcher unless asked, so its class is what (f) says.
