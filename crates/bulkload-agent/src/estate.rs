@@ -2458,32 +2458,57 @@ fn beside_item(
         beside: true,
         ..*landing
     };
-    // The beside path is never adopted, re-keyed or converged: it is this
-    // item's own landing of this capture, finished forward, or new.
+    // A standalone checkout someone already put at the beside path (the
+    // in-place lane made `<path>.neo-20261016` by hand) is adopted under
+    // `--adopt` when it proves equal to the capture (A11a, its own
+    // repository); otherwise the beside path is never adopted, re-keyed or
+    // converged: it is this item's own landing of this capture, finished
+    // forward, or new.
+    let standalone = beside.join(".git").is_dir();
     let beside_policy = git_carry::converge::Policy {
-        adopt: false,
+        adopt: standalone && policy.adopt,
         ..*policy
+    };
+    let standalone_target = git_carry::converge::Target {
+        repository: &beside,
+        workspace: Some(&beside),
+        ..*target
     };
     let mut applied = match beside_landed(&beside, landing, target.source)? {
         Some(true) => git_carry::converge::Applied::default(),
         Some(false) => return Err(BulkloadRefusal::GitDestinationOccupied),
         None => git_carry::converge::apply_workspace(
             staged,
-            &beside_target,
+            if standalone {
+                &standalone_target
+            } else {
+                &beside_target
+            },
             &beside_landing,
             false,
             &beside_policy,
         )?,
     };
-    let git_dir = git_carry::landed::worktree_git_dir(&beside)?
+    // The capture's provenance instance in the planned repository: a
+    // linked beside landing imported it there; an adopted standalone one
+    // holds it in its own repository, so it is imported here (with its plan
+    // base), as a refs-only item would.
+    let instance = if standalone {
+        if let Some(base) = target.base {
+            git_carry::import_staged(target.repository, base, target.source)?;
+        }
+        git_carry::beside::import_instance(target.repository, staged, target.source)?
+    } else {
+        let git_dir = git_carry::landed::worktree_git_dir(&beside)?
+            .ok_or(BulkloadRefusal::GitDestinationOccupied)?;
+        let ledger: git_carry::landed::LandedWorkspace = git_carry::landed::read(
+            &git_carry::landed::ledger_dir(&git_dir, target.source)
+                .join(git_carry::landed::WORKSPACE_LANDED),
+        )?
         .ok_or(BulkloadRefusal::GitDestinationOccupied)?;
-    let ledger: git_carry::landed::LandedWorkspace = git_carry::landed::read(
-        &git_carry::landed::ledger_dir(&git_dir, target.source)
-            .join(git_carry::landed::WORKSPACE_LANDED),
-    )?
-    .ok_or(BulkloadRefusal::GitDestinationOccupied)?;
-    let wanted =
-        git_carry::beside::wanted(target.repository, target.source, &ledger.instance, &suffix)?;
+        ledger.instance
+    };
+    let wanted = git_carry::beside::wanted(target.repository, target.source, &instance, &suffix)?;
     let refs = git_carry::beside::refs_in(target.repository, &wanted, &suffix)?;
     fault_point!(EstateApplyBesideRefs);
     // Recorded after the refs and the landing it describes are durable;
@@ -2497,13 +2522,14 @@ fn beside_item(
     }
     record.suffix.clone_from(&suffix);
     record.capture = landing.capture;
-    record.instance.clone_from(&ledger.instance);
+    record.instance = instance;
     record.created.extend(refs.created.iter().cloned());
     record.kept.clone_from(&refs.kept);
     git_carry::beside::write_record(&record_path, &record)?;
     let words = format!(
-        "beside-landed=1 beside-after={} beside-ref-created={} beside-ref-present={} beside-ref-kept={}",
+        "beside-landed=1 beside-after={} beside-{} beside-ref-created={} beside-ref-present={} beside-ref-kept={}",
         refusal.code(),
+        if standalone { "standalone=1" } else { "linked=1" },
         refs.created.len(),
         refs.present,
         refs.kept.len()

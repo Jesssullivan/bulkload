@@ -957,7 +957,12 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   is finished forward, never converged. The exclude policy is a linked
   landing's (`--exclude-union` applies). A beside path that exists refuses
   `GIT_DESTINATION_OCCUPIED` unless it is this item's own landing of this
-  capture (then nothing is landed again). Then every captured ref
+  capture (then nothing is landed again) or, under `--adopt`, a standalone
+  checkout no ledger names (the lane's hand-made `<path>.neo-20261016`)
+  that proves equal to the capture: it is adopted in place in its own
+  repository (A11a), and the capture is imported into the planned
+  repository for the refs (one that differs refuses
+  `GIT_DESTINATION_DIVERGED`). Then every captured ref
   `refs/<name>` is created as `refs/<suffix>/<name>`, and stash entry `n`
   (newest first) as `refs/<suffix>/stashes/<n>`, in one `update-ref`
   transaction of `create` lines: create-only. A name already holding the
@@ -966,14 +971,16 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   This is a recorded write: STATE records `{item}-{blake3(SOURCE)}.beside`
   (path, suffix, capture, instance, refs created and kept) after the refs
   and the landing's own ledgers; the receipt counts `beside-landed`,
-  `beside-after=<CODE>`, `beside-ref-created`, `beside-ref-present` and
+  `beside-after=<CODE>`, `beside-linked` or `beside-standalone`,
+  `beside-ref-created`, `beside-ref-present` and
   `beside-ref-kept`; the outcome and journal are `workspace-beside` (a rerun
   `previous-workspace-beside-not-revalidated`), and closure v5 classifies
   the item `applied-beside`. A crash after the worktree is added
   (`estate.converge.linked_added`) or after the refs
   (`estate.apply.beside_refs`) leaves the live checkout untouched and the
   item `journal-missing`; the rerun finishes it. `estate-diff` adds the
-  component `beside=<landing|landed|occupied>:<path>` to a `diverged` row
+  component `beside=<landing|landed|existing|occupied>:<path>` to a
+  `diverged` row
   (an authority change is decided only by the apply). The beside checkout
   is a worktree of the live repository: `git worktree list` there shows it.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked

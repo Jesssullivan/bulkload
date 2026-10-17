@@ -1791,3 +1791,68 @@ fn p111_an_occupied_beside_path_refuses_and_nothing_is_written() {
         frozen
     );
 }
+
+/// P112 BESIDE-EXISTING (M2 round 2 item c: the in-place lane made
+/// `<path>.neo-20261016` by hand for 9 of the 10 diverged i02 items): a
+/// standalone checkout already at the beside path, equal to the capture,
+/// is adopted in place under `--adopt --beside` (`estate-diff` says
+/// `beside=existing`); the capture's refs go in under `refs/neo-*/` of the
+/// destination repository; the rerun is a journal no-op. One that differs
+/// refuses `GIT_DESTINATION_DIVERGED` with nothing written to either.
+#[test]
+fn p112_an_existing_standalone_beside_is_adopted_when_equal() {
+    for equal in [true, false] {
+        let (world, source, dest) = small();
+        fs::write(dest.join("README"), b"edited on sting\n").unwrap();
+        let run = Run::new(
+            &world,
+            &[(source.clone(), dest.clone(), Some(dest.clone()))],
+        );
+        settle();
+        run.capture();
+        private_dir(&run.applied);
+        let diff = run.diff(&[]);
+        let line = diff_line(&diff.stdout, &source).to_owned();
+        let start = line.find("\"beside=landing:").unwrap() + "\"beside=landing:".len();
+        let beside = PathBuf::from(&line[start..start + line[start..].find('"').unwrap()]);
+        copy_tree(&source, &beside);
+        if !equal {
+            fs::write(beside.join("README"), b"not the capture\n").unwrap();
+        }
+        let diff = run.diff(&[]);
+        assert!(
+            diff_line(&diff.stdout, &source).contains("\"beside=existing:"),
+            "{}",
+            diff.stdout
+        );
+        let frozen = (freeze_all(&dest), all_refs(&dest));
+        let ran = run.apply(&["--adopt", "--beside"]);
+        let row = receipt(&receipts(&ran.stdout), &source).clone();
+        if !equal {
+            assert_eq!(row.1, "refused", "{row:?}");
+            assert!(row.2.contains("GIT_DESTINATION_DIVERGED"), "{row:?}");
+            assert_eq!((freeze_all(&dest), all_refs(&dest)), frozen);
+            continue;
+        }
+        assert_eq!(row.1, "workspace-beside", "{row:?}");
+        assert!(
+            row.2.contains("beside-standalone=1") && row.2.contains("beside-ref-created=4"),
+            "{row:?}"
+        );
+        assert!(beside
+            .join(".git/bulkload/v1/neo/workspace.landed")
+            .is_file());
+        let now = named_refs(&dest);
+        let created = now
+            .keys()
+            .filter(|name| name.starts_with("refs/neo-"))
+            .count();
+        assert_eq!(created, 4, "{now:?}");
+        assert_eq!(fs::read(dest.join("README")).unwrap(), b"edited on sting\n");
+        let ran = run.apply(&["--adopt", "--beside"]);
+        assert_eq!(
+            receipt(&receipts(&ran.stdout), &source).1,
+            "previous-workspace-beside-not-revalidated"
+        );
+    }
+}

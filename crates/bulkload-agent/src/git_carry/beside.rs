@@ -22,9 +22,14 @@
 //!   (its provenance instance, as any landing imports it). The exclude
 //!   policy is a linked landing's (`--exclude-union` applies). A beside path
 //!   that exists refuses `GIT_DESTINATION_OCCUPIED` unless it is this
-//!   item's own landing of this capture (its workspace ledger says so), or
-//!   a landing of it a crash cut short (its landing intent), which is
-//!   finished forward.
+//!   item's own landing of this capture (its workspace ledger says so), a
+//!   landing of it a crash cut short (its landing intent), which is
+//!   finished forward, or, under `--adopt`, a standalone checkout (its own
+//!   `.git` directory, no ledger; the in-place lane made
+//!   `<path>.neo-20261016` by hand) that proves equal to the capture: it is
+//!   adopted in place in its own repository (A11a), and the capture is
+//!   imported into the planned repository for the refs below. One that
+//!   differs refuses `GIT_DESTINATION_DIVERGED`.
 //! - **Refs in.** Every captured ref `refs/<name>` is created as
 //!   `refs/<suffix>/<name>`, and stash entry `n` (newest first) as
 //!   `refs/<suffix>/stashes/<n>`, in one `update-ref` transaction of
@@ -162,6 +167,16 @@ pub fn path(workspace: &Path, suffix: &str) -> Result<PathBuf> {
     beside.push(".");
     beside.push(suffix);
     Ok(workspace.with_file_name(beside))
+}
+
+/// Import `staged` into `repo` (provenance only, as a refs-only item does)
+/// and name the instance it wrote: for a beside checkout adopted in its own
+/// repository, whose refs go in under `refs/<suffix>/` of the planned one.
+///
+/// # Errors
+/// Whatever the import refuses.
+pub fn import_instance(repo: &Path, staged: &super::StagedBundle, source: &str) -> Result<String> {
+    super::import_verified_instance(repo, staged.path(), source).map(|(_, instance)| instance)
 }
 
 /// What [`refs_in`] did.

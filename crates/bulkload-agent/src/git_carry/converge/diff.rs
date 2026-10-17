@@ -73,7 +73,7 @@ pub struct ItemRow {
     /// The components that differ: `head`, `index`, `exclude`,
     /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
     /// landing that makes `n` absent parents (M2 finding 1);
-    /// `beside=<landing|landed|occupied>:<path>` for a `diverged` item
+    /// `beside=<landing|landed|existing|occupied>:<path>` for a `diverged` item
     /// (what `estate-apply --beside` does; M2 round 2 item c);
     /// `exclude-union=<n>` for an `ignore-policy-conflict` that
     /// `estate-apply --exclude-union` lands by appending `n` lines (items
@@ -173,7 +173,9 @@ fn first_landing(
 // What `estate-apply --beside` does with a diverged item (M2 round 2 item
 // c): `beside=<verdict>:<path>`, the verdict `landing` (absent: the capture
 // lands there), `landed` (this item's own landing of this capture: nothing
-// to land) or `occupied` (`GIT_DESTINATION_OCCUPIED`); or
+// to land), `existing` (a standalone checkout no ledger names: `--adopt
+// --beside` adopts it if it proves equal, else refuses diverged) or
+// `occupied` (`GIT_DESTINATION_OCCUPIED`); or
 // `beside-refused=<CODE>` when no beside path can be named.
 fn beside_component(workspace: &Path, landing: &Landing<'_>, source: &str) -> Result<String> {
     let suffix = match super::super::beside::suffix(source, landing.observed_ns) {
@@ -191,9 +193,14 @@ fn beside_component(workspace: &Path, landing: &Landing<'_>, source: &str) -> Re
             None => None,
         };
         if ledger
+            .as_ref()
             .is_some_and(|ledger| ledger.item == landing.item && ledger.capture == landing.capture)
         {
             "landed"
+        } else if ledger.is_none() && beside.join(".git").is_dir() {
+            // A standalone checkout without a ledger: `--adopt --beside`
+            // adopts it when it proves equal to the capture.
+            "existing"
         } else {
             "occupied"
         }
