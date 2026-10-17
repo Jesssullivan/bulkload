@@ -259,13 +259,53 @@ Source safety (S2, WP1):
   - Readers see the write store, then the source, through `alternates`.
   - The P34 property holds every `lstat` field of the source fixed across a
     capture and its chained reruns.
-- Source-side verbs (`serve`, `estate-capture`, `snapshot`,
-  `git-carry-estimate`, `git-export`, `copy`) enter background CPU and IO
-  priority before anything else (WP0(f)), inherited by every thread and
+- Source-side verbs (`serve`, `snapshot`, `git-carry-estimate`,
+  `git-export`, `copy`; `estate-capture` by `auto`, below) enter background
+  CPU and IO priority before anything else (WP0(f)), inherited by every
+  thread and
   child. The remote estimate probe's `bash` runs at default priority on the
   remote host (WP0(f) covers only the local verb; #188). `--priority=normal`
   is the explicit, recorded opt-out; every
   counters line and the bench header record the class.
+- **Bounded starvation (M2 item 3, 2026-10-16; `priority.rs`).** On neo
+  an `estate-capture` at background priority had a Git child in
+  uninterruptible IO for 25 minutes while a normal-priority `serve` read
+  the same disk: a throttled (Darwin) or idle-class (Linux) reader is
+  served only when no other IO is pending, so a busy disk starves it
+  without bound. By the operator's M2 instruction (`docs/slo.md`,
+  amendment of 2026-10-16), `estate-capture` changes; every other
+  source-side verb keeps the WP0(f) default above:
+  - `estate-capture` defaults to `--priority=auto`: background when a
+    terminal device was read or written within 300 s (access or
+    modification time of `/dev/pts/*` and `/dev/tty*` on Linux,
+    `/dev/ttys*` and `/dev/console` on Darwin; output counts, so the test
+    errs toward background), normal otherwise; an unreadable `/dev` counts
+    as a person present. The counters line says `priority_from=auto
+    priority_auto=idle|interactive|unknown`. Activity in a graphical
+    session alone is not seen (a residual; HID idle time is the
+    follow-up). `--priority=auto` works for any verb.
+  - A background `estate-capture` (or any background verb given
+    `--escalate-after=SECONDS`) runs a watcher thread that samples, each
+    second, its counters and, on Linux, its live descendants' read and
+    write bytes (`/proc/<pid>/io`, so a long healthy Git child is progress).
+    After the threshold (default 300 s for `estate-capture`; 0 turns it
+    off) with no movement it escalates once: on Linux every thread of the
+    process and of each live descendant (found through
+    `/proc/<pid>/task/<tid>/children`, each checked to name its parent)
+    leaves the idle class for the class its nice value implies (best
+    effort, level 7 at nice 19); on Darwin the process disk policy goes
+    back to `IOPOL_DEFAULT`, unverified there and likely helping only later
+    children (a thread's `QoS` also bounds its IO tier; `auto` is Darwin's
+    remedy). Nice stays 19. The watcher cannot tell idle from starved, so
+    a capture blocked on nothing but a quiet source also escalates; the
+    escalation is one-shot. Recorded as `priority_escalate_after=` on the
+    counters line, and `priority_escalations`, `priority_escalated_ns`,
+    `priority_escalated_threads`, `priority_escalation_failures`;
+    `priority=` stays the class the process started at. No signal is sent
+    (R-N11).
+  - Not built: de-escalation when a person returns, and passing `--priority`
+    or `--escalate-after` from `pull` to its remote `serve` (only
+    `--durability` is forwarded).
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
 - No clone of a source file (OI-1003-Q165).
@@ -1671,7 +1711,28 @@ publication is no-replace, with one ruled exception (superseding publish,
 below). A directory the engine creates is made under a tagged temporary
 name, its record is bound to the new inode, and it is then renamed into place
 with no-replace. The engine never adopts a directory it did not create
-(R-N78, R-N102).
+(R-N78, R-N102). An existing directory with no owning record is a
+container only, its mode never changed and no record bound to it: when its
+mode equals the source's it is accepted as before; when it differs it is
+accepted with its mode kept only if it is this user's, gives its owner
+read, write and search, and grants nobody else anything the source's mode
+does not (the owner's own bits are not compared, so an unfinished 0700
+directory under a read-only 0555 source is accepted). M2 item 2
+(2026-10-16): a pull into a copy of an unfinished landing, 0700 directories
+under a 0755 source, refused every directory of the copy, 160 of them, and
+exited 1; the files below were decided all the same (a refused directory
+refuses its own row only), so equal files were adopted and differing ones
+refused. Such a directory is now counted (`dest_directory_mode_kept`) and
+reported on stderr (`directory-mode-kept <path> found=<mode>
+source=<mode>`); it is not in the transfer's closure row, and it never
+converges to the source's mode, which would adopt it (residuals for the
+operator). Any other divergent mode (wider than the source's, another
+owner, no owner access) is refused `DESTINATION_OCCUPIED` as before.
+Known gap, not changed here (#248): that refusal covers the directory's
+own row, and its entries are still decided and published inside it, so a
+private source tree can land inside a wider existing directory. An existing file
+is adopted only when its bytes and its mode verify; an equal file whose
+mode differs is refused.
 
 Records commit in groups. Each file is sealed (`F_BARRIERFSYNC` on Darwin,
 `fsync` elsewhere, so its mode is durable too) and renamed into place without
@@ -2061,6 +2122,37 @@ starts.
   directory: no preflight charges it, and a source-side full disk is never
   reported as the destination's. Any other I/O error a store meets is `IO`
   with its errno (`EIO` where the errno cannot be read).
+
+## Installing the agent (M2 item 4, 2026-10-16)
+
+A `bulkload-agent` built inside `nix develop` is dynamically linked
+against store paths: on Linux its ELF interpreter and `RUNPATH` name the
+devShell's glibc and gcc-lib in `/nix/store` (and, first, the devShell's
+own `outputs/out/lib`), on Darwin its dylibs may. None of those is a GC
+root, so `nix-collect-garbage` can delete them and the installed binary
+then fails to start (2026-10-16: a GC deleted the glibc of
+`~/.local/bin/bulkload-agent-5beb…` mid-run). `just install-agent DEST_DIR
+NAME` builds a release binary and runs `scripts/install-agent.sh`, which
+copies it beside `DEST_DIR/NAME`, drops `RUNPATH` entries outside
+`/nix/store` (patchelf, where present), adds one indirect GC root per store
+path the copy names under `${XDG_STATE_HOME:-~/.local/state}/bulkload/
+gcroots` (`nix-store --add-root`, registered in
+`/nix/var/nix/gcroots/auto`), publishes `NAME` with `link(2)` (never
+replacing anything), writes `NAME.sha256` and `NAME.gcroots` (never over
+existing ones), and runs the selftest. A failure before the publish removes
+the roots it made. The roots outlive a deleted binary: remove its
+`gcroots/NAME-*` with it.
+
+The selftest says `interpreter <path> exists= nix-store=` and `gc roots
+store-paths=N rooted=R unregistered=U registry=read|unreadable
+unrooted=...`: a store path counts as rooted only when a symlink in
+`$BULKLOAD_GCROOTS` (default that directory) resolves into it and Nix's
+registry names that symlink, so a copied or hand-made symlink is
+`unregistered`. `rooted` below `store-paths` is the warning before a GC; a
+binary whose interpreter is already gone cannot run its selftest: rebuild
+it. Not built: a fully static musl build (a flake output with a musl
+toolchain; changing `flake.nix` moves the pinned digests of the
+public-read guard), which would need no roots at all.
 
 ## Agent session re-seat (R0, TIN-6587)
 
