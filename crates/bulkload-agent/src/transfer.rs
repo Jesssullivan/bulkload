@@ -293,6 +293,10 @@ pub struct TransferStats {
     /// Directories created by the plain `mkdirat` fallback, on a filesystem
     /// without a no-replace rename (R-N119), by relative path.
     pub directories_fallback: Vec<Vec<u8>>,
+    /// Existing directories this store does not own, entered with their
+    /// mode kept although it differs from the source's (M2 item 2): by
+    /// relative path, with the mode found and the source's.
+    pub directories_mode_kept: Vec<(Vec<u8>, u32, u32)>,
     /// Directories this session finished in its last output group's commit
     /// rather than in a completion commit of their own (OI-1003-Q154 lever
     /// 3; `directories_folded`). 0 when the fold is off
@@ -3723,6 +3727,9 @@ fn finish_receive(
     stats
         .directories_fallback
         .clone_from(&target.created().fallback);
+    stats
+        .directories_mode_kept
+        .clone_from(&target.created().mode_kept);
     stats.directories_folded = target.folded();
     if stats.refusals.is_empty() {
         target.finish_directories(store)?;
