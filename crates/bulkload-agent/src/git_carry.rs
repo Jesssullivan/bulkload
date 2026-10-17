@@ -2317,6 +2317,44 @@ pub struct StagedBundle {
     digest: [u8; 32],
     // Whether its headers mark a capture of a bare repository (S4, #162).
     bare: bool,
+    // `estate-diff` (M2r2 item 3): set on a plan base the run shares
+    // between its items. Every scratch repository built over this base
+    // borrows one import of it per destination object store, made in this
+    // stage's private directory, instead of indexing the whole base again.
+    // `None` (every other verb): each scratch imports the base itself.
+    shared: Option<std::sync::Mutex<Vec<SharedBase>>>,
+}
+
+/// One import of a shared plan base into a scratch repository of its own
+/// (`estate-diff`, M2r2 item 3), keyed by what the import depends on: the
+/// destination object store the scratch borrows, the object format and the
+/// source name its provenance refs carry.
+#[derive(Debug)]
+struct SharedBase {
+    objects: Option<PathBuf>,
+    format: &'static str,
+    source: String,
+    // What a scratch borrows; `None` when a borrower cannot take the base
+    // by alternates and refs alone (a custody envelope, whose import
+    // writes a shallow frontier, or a stage path an alternates line cannot
+    // name): such a scratch imports the base itself, as before. Only a
+    // made import is kept: a refusal is never replayed to a later item,
+    // which tries again as it did before the share.
+    seed: Option<BaseSeed>,
+}
+
+/// What a scratch repository takes from a shared base import: its object
+/// store, as one more alternate (whose refs Git also reads as negative
+/// tips, `--alternate-refs`, so a borrower's connectivity checks stop at
+/// the base), and, as one create transaction (`update-ref --stdin -z`),
+/// the refs the import made outside its own provenance instance (the
+/// `union/v1` carry refs, which a borrower's import compares its own
+/// against). The instance's refs are not copied: every scratch read is
+/// scoped to the item's own instance.
+#[derive(Debug, Clone)]
+struct BaseSeed {
+    objects: PathBuf,
+    refs: Vec<u8>,
 }
 
 impl StagedBundle {
@@ -2343,6 +2381,12 @@ impl StagedBundle {
     /// `estate-diff`, #226), never at the destination.
     pub(crate) fn private_dir(&self) -> &Path {
         self.directory.path()
+    }
+
+    /// Share this plan base's scratch import between every scratch
+    /// repository built over it (`estate-diff`, M2r2 item 3).
+    pub(crate) fn share_imports(&mut self) {
+        self.shared = Some(std::sync::Mutex::new(Vec::new()));
     }
 }
 
@@ -2429,6 +2473,7 @@ pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
         bundle: path,
         digest,
         bare: bare_marked(&heads),
+        shared: None,
     })
 }
 

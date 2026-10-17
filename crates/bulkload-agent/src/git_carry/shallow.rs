@@ -159,7 +159,7 @@ fn over_manifest_cap(length: usize) -> Result<()> {
     Ok(())
 }
 
-fn custody_oid(heads: &str) -> Option<&str> {
+pub(super) fn custody_oid(heads: &str) -> Option<&str> {
     heads.lines().find_map(|line| {
         line.split_once(' ')
             .filter(|(_, name)| *name == CUSTODY)

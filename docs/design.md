@@ -693,6 +693,42 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
     An unrelated one keeps the provenance import and refuses
     `GIT_DESTINATION_OCCUPIED` (pending review, never counted applied).
   - `estate-diff` reports all of this beforehand, read-only.
+  - `estate-diff` imports a repository's plan base once (M2r2 item 3,
+    the 10-16 in-place finding: it indexed the whole base again for every
+    worktree item, O(items x repository), 11 rows an hour on a large
+    repository under load). A base is staged once per run and imported
+    once per destination object store into a scratch repository in its
+    stage; every item's scratch borrows that import and imports only its
+    own capture. A borrower takes the import's objects as one more
+    alternate after the destination's (Git reads that repository's refs
+    as negative tips, `--alternate-refs`, so a borrower's connectivity
+    checks stop at the base) and the refs the import made outside its own
+    provenance instance (the `union/v1` carry refs, which the borrower's
+    import compares its own against; usually none). The instance's own
+    refs are not copied: every scratch read is scoped to the item's
+    instance. A custody envelope (whose import writes a shallow frontier;
+    `estate-capture` does not make one as a plan base) and a stage whose
+    path no alternates line can name (a newline or a leading quote) are
+    imported per scratch, as before; a path that is not UTF-8 is lent, its
+    line written as bytes. A refusal while staging or importing a base is
+    not kept: the next item naming it tries again, so a transient failure
+    refuses one row, as before. The stage, with every import in it, is
+    removed after the last item naming its base, so its disk is one copy
+    of the base plus one import per destination store from the first such
+    item to the last. `estate-reseat --check` reads Git state through
+    `estate-diff` and shares the same way. Counted on the counters line:
+    `git_scratch_base_imports` (whole-base imports into a scratch
+    repository, by `estate-diff` and by the apply's adopt and
+    first-landing scratches) and `git_scratch_base_borrowed` (scratches
+    that borrowed a shared import). `BULKLOAD_DIFF_SHARED_IMPORT=0`
+    (exactly `0`; unset or any other value shares) is the A/B arm, an
+    import per scratch as before; its rows are byte-identical (P108-P111).
+    `estate-apply` is unchanged: each item still stages and imports its
+    own base. Not built: a chained (re-captured) item is still flattened
+    per item (`chain::flatten` fetches its bases and links into a private
+    repository and writes the whole history as one bundle, which the
+    scratch then indexes), a whole-repository cost per chained item in
+    every verb, counted `git_chain_flattens`.
   - Not built: `--protect` (land the source's state beside a destination
     adopt refuses).
 - **Hand-off block (TIN-6569, OI-1003-Q183, 2026-10-16;
