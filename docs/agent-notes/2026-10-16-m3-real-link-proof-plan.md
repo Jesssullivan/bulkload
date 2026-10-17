@@ -107,8 +107,8 @@ Bytes by class:
   - `sessions`: 10,838 files, 31.8 GiB;
   - `db-backups`: 591 files, 6.9 GiB.
 - **`~/git`:**
-  - 1,021 checkouts, 849 linked worktrees, 12 bare repositories and 41 nested
-    repositories;
+  - 1,021 checkouts, 840 linked worktrees, 9 submodules, 12 bare repositories
+    and 41 nested repositories (see the note below on the committed profile);
   - packs: 4,192 files, 74.5 GB;
   - loose objects: 396,009 files, 2.5 GB;
   - checkout files: 6.09 M files, 241 GB;
@@ -119,6 +119,12 @@ Caveats, all of them reasons to take the census again after the move:
 - **The stage was being filled.** The `.claude` stage held 25.4 GiB, against
   the roughly 64 GB reported for neo. Its mtimes are the landing time (every
   file is younger than a day), so the age histogram says nothing about neo.
+- **The committed `git.json` counts 849 linked worktrees.** Its census read
+  every `.git` file as a worktree. A second walk, after the review, tells
+  submodules apart: 840 linked worktrees and 9 submodules, with every other
+  number within 0.03 %. The profile is kept as committed because the corpus
+  identity below is generated from it, and the generator does not read the
+  repository counts.
 - **`~/git` on sting is a proxy.** It is sting's own tree, into which the move
   is landing. Its age histogram:
   - under 1 day: 709 k files;
@@ -151,8 +157,9 @@ How it scales:
 - Each census profile becomes an area: `.claude`, `.codex` and `git`.
 - Every class and size bucket keeps its census mean size.
 - The class's file count is scaled by `bytes / census bytes`, with a bounded
-  largest-remainder rule: counts are exact, bytes are close, and a rare
-  >1 GiB bucket is kept only when the scale has room for it.
+  largest-remainder rule. Counts land within a few files of the target and
+  bytes stay close. A rare >1 GiB bucket is kept only when the scale has room
+  for it; when it has none, its files are dropped and the count falls short.
 - Directories follow the census directory-depth shape, with a heavy-tailed
   fan-out.
 - Symlinks follow the census rate.
@@ -194,7 +201,14 @@ into the harness's private working copy on neo.
   FIEMAP checks that nothing is shared (Q165). Sockets, FIFOs and files that
   vanish mid-copy are skipped and counted.
 - **Linked worktrees.** Their absolute `.git`/`gitdir` links are rewritten
-  inside the copy only.
+  inside the copy only, matched against every source by its given and its
+  real path. A link that still names a path outside the copy refuses the
+  subset, for example a worktree whose main repository was not selected.
+  Submodules (`gitdir` under `.git/modules/`) belong to their outer
+  checkout's item.
+- **Refusals before any copy.** The subset refuses a work root that overlaps
+  a source, sources that overlap each other, duplicate labels, and a source
+  volume without room for the copy and the Git arm's captures plus 1 GiB.
 - **What it never does.** It never writes the originals.
 - **What evidence records.** Labels and a digest of the path list, never the
   paths.
@@ -241,7 +255,9 @@ system package (rclone is not installed on sting).
   The working copy is then restored by a second XOR and must hash back to its
   initial manifest.
 - **Order.** The default per phase is `BPBPBRBRBSY`:
-  - B/P/B/P/B is exactly the gate's B/A/B/A/B;
+  - B/P/B/P/B is exactly the gate's B/A/B/A/B. Each comparator's ratio uses
+    only the B slots beside that comparator's slots: B against P uses
+    sequences 0, 2 and 4;
   - the alternation then continues against tuned rclone;
   - one S slot and one Y slot close the phase.
 - **Git stage.** G/R/G, initial and rerun. A 2 s settle sits outside the
@@ -259,7 +275,16 @@ system package (rclone is not installed on sting).
 
   A `--reps 1` smoke goes first.
 - **Destination.** About 11 × 2.1 GB is held at once; each rep's destinations
-  are released after it.
+  are released after it, and a failed release aborts the sample.
+  - The harness refuses DEST_SPACE before copying anything on either path
+    (corpus or subset). The budget counts every slot, five copies for the Git
+    stage, and every rep with `--keep-destinations`. That also guards the
+    rclone and rsync arms, which have no floor of their own.
+  - On neo, the harness refuses SOURCE_SPACE when the working copy and the
+    captures would not fit. The Git arm's captures on neo are released after
+    each rep verifies, and only under `--source-work`.
+  - A field run refuses a corpus that is not sealed, or whose working copy's
+    identity, rebuilt from its manifest, is not the seal's.
   - sting's fast-local is 80 % used, so the agent's default 25 % floor would
     refuse. The run passes `--min-free-percent 10`, as the live move does, and
     the evidence records it.
@@ -268,9 +293,12 @@ system package (rclone is not installed on sting).
 
 ## 5. Method
 
-- **Link baseline per rep.** iperf3 in both directions:
+- **Link baseline per rep.** iperf3 in both directions, each on its own port:
   - the server on neo is `-s -1 --idle-timeout 30`, so it ends itself and the
     harness never signals it;
+  - the client retries a refused connection until the server listens,
+    bounded by `--iperf3-ready-seconds` (default 120). That covers a slow
+    `nix shell` start on neo;
   - the HostName comes from `ssh -G` and is used, never recorded.
 
   The ssh ceiling is also measured each rep: `dd` over one and over four
@@ -303,17 +331,17 @@ system package (rclone is not installed on sting).
 
 ### 6.1 Dry run on sting
 
-Run 2026-10-16, agent `b7787bbf0028`, `/dev/shm`, sting load1 15–43, NOT A
-SAMPLE. The loopback ssh shim runs no real ssh and no crypto, so these numbers
+Final run 2026-10-16 on the reviewed head, agent `b7787bbf0028`, `/dev/shm`,
+sting load1 15–43, NOT A SAMPLE. The loopback ssh shim runs no real ssh and no crypto, so these numbers
 say nothing about the link.
 
 | Run | Phase | B | P | R | S | Y |
 |---|---|---:|---:|---:|---:|---:|
-| 135 MB, 2,405 files | initial | 508 | 1,031 | 1,194 | 1,197 | 347 |
-| | rerun | 247 | 400 | 786 | 795 | 65 |
-| | delta (24 files) | 340 | 789 | 1,100 | 1,224 | 145 |
-| Git fixture (G/R) | initial | G 1,104 | – | R 2,707 | – | – |
-| | rerun | G 246 | – | R 2,291 | – | – |
+| 135 MB, 2,405 files | initial | 544 | 1,155 | 1,193 | 1,210 | 364 |
+| | rerun | 237 | 412 | 803 | 794 | 81 |
+| | delta (24 files) | 344 | 744 | 1,104 | 1,197 | 158 |
+| Git fixture (G/R) | initial | G 1,155 | – | R 2,509 | – | – |
+| | rerun | G 265 | – | R 1,798 | – | – |
 
 All times are medians in ms.
 
@@ -321,12 +349,12 @@ What the 135 MB run showed:
 - Every arm verified.
 - The native rerun received 0 and read 0, and the delta reads stayed under
   the changed-seat bound.
-- The rerun/initial ratio was 0.49, above the 0.10 bound. Fixed per-session
+- The rerun/initial ratio was 0.44, above the 0.10 bound. Fixed per-session
   costs dominate at this size; the 2 GiB corpus will show whether it holds.
 
 What it means for the field run:
-- **rsync beat B on the rerun and the delta**, 65 ms against 247 ms and 145 ms
-  against 340 ms. That is the risk to watch on the real link. bulkload's
+- **rsync beat B on the rerun and the delta**, 81 ms against 237 ms and 158 ms
+  against 344 ms. That is the risk to watch on the real link. bulkload's
   rerun cost on 38 k files is the question S3's 10 % clause will answer.
 - **Tuned rclone (16/32) was slower than 4/8 on loopback.** The sweep picks
   per link, so the tuned R may differ on the WAN.
@@ -387,7 +415,7 @@ first.
 | 3 | Rendered formal configs: 269 `docs/formal/MC_*.cfg` and the `configs*.tsv` | 8,472 | Generated from the Dhall catalogue ("edit the catalogue, never the outputs"). Committing them duplicates the source. | Render in `just tla-check`/`tla-render` and stop committing the outputs, with a CI drift check instead. No semantic loss. |
 | 4 | `git-carry-estimate`: `src/git_carry/estimate.rs` (3,494), `estimate/stderr_store.rs` (567), `tests/git_estimate_shapes.rs` (1,354), `tests/git_estimate_dag.rs` (1,103), plus `s3_estate.py` `v2_half` and `git_wire` (~117) | 6,635 | It projects a negotiated thin-pack carry (v2) that was deleted (OI-1003-Q56). Nothing moves data through it. | **Ruling:** P66 keeps the verb. Retire it with its tests and the v2 half of s3_estate. |
 | 5 | Agent notes for deleted or closed work (W6 M1 spike and sender, ingest journal, the Q42 lanes, carry_v2): 19 files | 4,519 | They describe code that no longer exists. R-N55 says to delete entries that are no longer true. | Distil the facts that still stand onto TIN-4543 or TIN-3692, then delete. The same sweep applies to the other pre-10-08 notes: 74 files, 14,521 lines. |
-| 6 | `gate_b.py` (2,422) and `test_gate_b.py` (1,098) | 3,520 | Its run path calls `ab.resolve_rclone`, which no longer exists in `r23_ab.py`, so gate (b) cannot run past rclone resolution. No test covers that call. Its delta is C3-superseded. `m3_link.py run` is a superset of its arms. | Move the transport, helper, rclone config, redaction and verify pieces (about 900 lines) into a shared module. Delete gate_b's main, verdict and evidence code (about 1,500) and their tests. Until then, fix the one call. |
+| 6 | `gate_b.py` (2,422) and `test_gate_b.py` (1,098) | 3,520 | Its run path calls `ab.resolve_rclone`, which no longer exists in `r23_ab.py`, so gate (b) cannot run past rclone resolution. No test covers that call. Its delta is C3-superseded. `m3_link.py run` is a superset of its arms. Its serve wrapper needs Python 3.9 (`os.waitstatus_to_exitcode`); m3 writes its own. | Move the transport, helper, rclone config, redaction and verify pieces (about 900 lines) into a shared module. Delete gate_b's main, verdict and evidence code (about 1,500) and their tests. Until then, fix the one call. |
 | 7 | Evidence for deleted code: `docs/evidence/w6-m1-*.md`, `2026-10-05-blahaj-v1-carry{.json,-harness.py,.md}`, `pr59-review/` | 3,251 | Proofs of the carry_v2 / W6 path, deleted under Q56. | Archive them out of the tree under tag `carry-v2-final`, which already holds that code. |
 | 8 | The Haskell N-version explorer, `docs/formal/hs/` (`Explorer.hs` 1,564, `GitCarryCore.hs` 1,536) | 3,100 | A second encoding of models TLC already checks: a duplicated proof. `GitCarryCore.hs` also pins `decide_rows.tsv`. | **Ruling:** keep `GitCarryCore`'s decide reference only if the Rust `decide` tests need a second oracle. Retire `Explorer.hs` and `just formal-nv`. |
 | 9 | `m0_gate_a.py` (383) and its test (525) | 908 | The M0 gate of 2026-09-23, superseded by `r23_ab.py` and the rig. It runs only in `check-optional`. | Delete them and their `check-optional` line. |
@@ -414,6 +442,39 @@ Kept on purpose:
 - **A pull within 2 s of an `estate-capture` re-reads the whole carry.** The
   capture's files are racy (R-N76), so the pull reads them again; this is by
   design. The live move's capture-then-pull scripts should leave that gap.
+
+## Adversarial review (2026-10-16, before the gate)
+
+An independent review of the first head (`26faed2`) found 15 defects: 2
+blockers, 7 should-fix and 6 nits. All 15 are fixed in the second commit:
+
+- **Disk budget.** The budget was skipped for the subset path and inverted
+  under `--keep-destinations`.
+- **Git links.** Links could escape the copy: symlinked sources, worktrees
+  whose main repository was outside the subset, and submodules read as
+  linked worktrees.
+- **Subset into itself.** A work root inside a source made the subset copy
+  into itself.
+- **iperf3.** The server start raced the client.
+- **Medians.** B-against-P medians mixed in the B slots beside tuned R.
+- **Restore.** The restore bookkeeping could report a partly XORed copy as
+  restored.
+- **Release.** A failed release of destinations was reported as success.
+- **Identity.** A field run never checked the corpus identity.
+- **Source space.** Space on neo went unchecked, and captures piled up there.
+- **Git R excludes.** The Git R slot's excludes were anchored at the wrong
+  root.
+- **Wrapper.** The serve wrapper needed Python 3.9.
+- **Evidence file.** Its name could carry an FQDN, and an existing file could
+  be overwritten.
+- **Profile labels.** Duplicate labels overwrote each other.
+- **Unreadable entries.** Unreadable files and directories were handled
+  unevenly.
+- **Census and plan wording.** The census and this plan's wording were
+  inaccurate.
+
+`test_m3_link.py` grew to 13 tests, which cover the subset guards, relinking,
+identity, labels and adjacent medians.
 
 ## Done in this session
 

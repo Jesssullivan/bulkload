@@ -206,6 +206,7 @@ def op_census(args):
            "classes": {}, "top": {}}
     repos = {}
     worktrees = 0
+    submodules = 0
     bare = 0
     # stack rows: (path, depth, top name, repo key or None, git-dir parts or None)
     stack = [(root, 0, None, None, None)]
@@ -233,7 +234,17 @@ def op_census(args):
                                             "checkout_bytes": 0, "worktree_admins": 0,
                                             "nested_in": repo is not None})
                 else:
-                    worktrees += 1
+                    # A `.git` file is a linked worktree, or a submodule when
+                    # its gitdir is under a `.git/modules/` (a 1-line read).
+                    try:
+                        with open(dot) as handle:
+                            pointer = handle.read(4096)
+                    except OSError:
+                        pointer = ""
+                    if "/modules/" in pointer:
+                        submodules += 1
+                    else:
+                        worktrees += 1
                     here_repo = path
                     repos.setdefault(path, {"files": 0, "bytes": 0, "git_files": 0,
                                             "git_bytes": 0, "loose": 0, "loose_bytes": 0,
@@ -325,7 +336,8 @@ def op_census(args):
     if kind == "git":
         mains = [r for r in repos.values() if not r.get("linked") and not r.get("bare")]
         out["repos"] = {"checkouts": len(mains), "linked_worktrees": worktrees,
-                        "bare": bare, "nested": sum(1 for r in mains if r["nested_in"])}
+                        "submodules": submodules, "bare": bare,
+                        "nested": sum(1 for r in mains if r["nested_in"])}
         dist = {}
         for key in ("files", "bytes", "git_files", "git_bytes", "loose", "loose_bytes",
                     "packs", "pack_bytes", "checkout_files", "checkout_bytes",
@@ -340,24 +352,93 @@ def op_census(args):
     return out
 
 
+# The serve wrapper: gate_b's, with an exit status any Python 3.8 decodes.
+M3_WRAPPER = """#!{python} -I
+import os, subprocess, sys
+child = subprocess.Popen([{agent!r}] + {flags!r} + sys.argv[1:])
+_pid, status, usage = os.wait4(child.pid, 0)
+code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -os.WTERMSIG(status)
+scale = 1 if sys.platform == "darwin" else 1024
+sys.stderr.write("gate_b_serve max_rss_bytes=%d exit=%d\\n" % (usage.ru_maxrss * scale, code))
+sys.stderr.flush()
+sys.exit(code if code >= 0 else 128 - code)
+"""
+GIB = 1 << 30
+
+
+def inside(path, root):
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def op_space(args):
+    """Free and total bytes of the file system holding PATH (its parent if new)."""
+    path = args["path"]
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    st = os.statvfs(path)
+    return {"available": st.f_bavail * st.f_frsize, "total": st.f_blocks * st.f_frsize}
+
+
+def tree_size(source, onerror):
+    total = 0
+    for dirpath, dirs, files in os.walk(source, onerror=onerror):
+        for name in files:
+            try:
+                info = os.lstat(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    return total
+
+
 def op_subset(args):
     """A private working copy of real source directories (read-only on them).
 
     Each SOURCE is copied by plain read/write into WORK/corpus/LABEL; nodes
-    other than files, directories and symlinks, and files that vanish under
-    the copy, are skipped and counted. The originals are only read.
+    other than files, directories and symlinks, files that vanish under the
+    copy, and unreadable files or directories are skipped and counted. The
+    originals are only read. WORK must not overlap any SOURCE, the sources
+    must not overlap each other, and WORK's volume must hold the copy times
+    `copies` plus 1 GiB.
     """
-    work = args["work"]
+    work = os.path.abspath(args["work"])
     if os.path.lexists(work) or not os.path.isdir(os.path.dirname(work)):
         raise RuntimeError("source work root must be new under an existing parent")
+    real_work = os.path.join(os.path.realpath(os.path.dirname(work)),
+                             os.path.basename(work))
+    sources = []
+    for label, source in args["sources"]:
+        if not label or "/" in label or label in (".", ".."):
+            raise RuntimeError("subset label must be one plain name: %r" % label)
+        real = os.path.realpath(source)
+        if not os.path.isdir(real):
+            raise RuntimeError("subset source is not a directory: %s" % label)
+        if inside(real_work, real) or inside(real, real_work):
+            raise RuntimeError("source work root overlaps subset source %s" % label)
+        for other_label, other in sources:
+            if inside(real, other[1]) or inside(other[1], real):
+                raise RuntimeError("subset sources %s and %s overlap" % (label, other_label))
+        sources.append((label, (os.path.abspath(source), real)))
+    skipped = {"others": 0, "vanished": 0, "unreadable_files": 0, "unreadable_dirs": 0}
+
+    def unreadable(_error):
+        skipped["unreadable_dirs"] += 1
+
+    size = sum(tree_size(real, unreadable) for _l, (_a, real) in sources)
+    skipped["unreadable_dirs"] = 0
+    space = op_space({"path": work})
+    need = size * int(args.get("copies") or 1) + GIB
+    if space["available"] < need:
+        raise RuntimeError("source volume has %d bytes free, the subset needs %d"
+                           % (space["available"], need))
     os.mkdir(work, 0o700)
     corpus = os.path.join(work, "corpus")
     os.mkdir(corpus, 0o700)
-    skipped = {"others": 0, "vanished": 0}
-    for label, source in args["sources"]:
+    for label, (_abs, source) in sources:
         target = os.path.join(corpus, label)
         os.mkdir(target, 0o700)
-        for dirpath, dirs, files in os.walk(source):
+        for dirpath, dirs, files in os.walk(source, onerror=unreadable):
             here = os.path.join(target, os.path.relpath(dirpath, source))
             keep = []
             for name in sorted(dirs) + sorted(files):
@@ -392,39 +473,39 @@ def op_subset(args):
                         skipped["others"] += 1
                 except FileNotFoundError:
                     skipped["vanished"] += 1
+                except PermissionError:
+                    skipped["unreadable_files"] += 1
             dirs[:] = [d for d in dirs if d in keep]
-    relinked = 0
-    for label, source in args["sources"]:
-        relinked += relink_worktrees(os.path.abspath(source),
-                                     os.path.join(corpus, label))
-    skipped["worktree_links_rewritten"] = relinked
+    mapping = []
+    for label, (absolute, real) in sources:
+        target = os.path.join(corpus, label)
+        mapping += [(real, target), (absolute, target)]
+    skipped["worktree_links_rewritten"] = relink_worktrees(corpus, mapping)
+    escaped = links_escaping(corpus)
+    if escaped:
+        raise RuntimeError("%d git link(s) in the copy still name a path outside it,"
+                           " e.g. a worktree whose main repository is not in the subset"
+                           % escaped)
     for dirpath, dirs, files in os.walk(corpus):
         os.chmod(dirpath, 0o755)
     for sub in ("states", "bin"):
         os.mkdir(os.path.join(work, sub), 0o700)
     wrapper = os.path.join(work, "bin", "gate-b-serve")
     with open(wrapper, "w") as handle:
-        handle.write(WRAPPER.format(python=args["python"], agent=args["agent"],
-                                    flags=list(args.get("flags") or [])))
+        handle.write(M3_WRAPPER.format(python=args["python"], agent=args["agent"],
+                                       flags=list(args.get("flags") or [])))
     os.chmod(wrapper, 0o700)
     shared = tree_shared(corpus)
     if isinstance(shared, int) and shared:
         raise RuntimeError("the working copy shares %d extent(s): a clone (OI-1003-Q165)"
                            % shared)
     return {"corpus": corpus, "wrapper": wrapper, "states": os.path.join(work, "states"),
-            "shared_extents": shared, "skipped": skipped}
+            "shared_extents": shared, "skipped": skipped, "bytes": size}
 
 
-def relink_worktrees(source, target):
-    """Point the copy's linked-worktree links at the copy, not the original.
-
-    A linked worktree's `.git` file and its admin directory's `gitdir` name
-    absolute paths; inside the private working copy, those that name a path
-    under SOURCE are rewritten to the same path under TARGET. Only the copy
-    is written.
-    """
-    count = 0
-    for dirpath, dirs, files in os.walk(target):
+def git_links(root):
+    """(path, kind, body) of every `.git` file and worktree `gitdir` under ROOT."""
+    for dirpath, dirs, files in os.walk(root):
         for name in files:
             path = os.path.join(dirpath, name)
             linked = name == ".git"
@@ -433,19 +514,50 @@ def relink_worktrees(source, target):
                 continue
             with open(path) as handle:
                 text = handle.read()
-            body = text[len("gitdir:"):].strip() if linked else text.strip()
             if linked and not text.startswith("gitdir:"):
                 continue
-            if body == source or body.startswith(source + os.sep):
+            body = text[len("gitdir:"):].strip() if linked else text.strip()
+            yield path, linked, body
+
+
+def relink_worktrees(corpus, mapping):
+    """Point the copy's Git links at the copy, never at the originals.
+
+    A linked worktree's `.git` file and its admin directory's `gitdir` name
+    absolute paths, which Git writes as real paths. One that names a path
+    under any subset source (by real or given path) is rewritten to the same
+    path under that source's copy. Only the copy is written.
+    """
+    count = 0
+    for path, linked, body in list(git_links(corpus)):
+        for source, target in mapping:
+            if os.path.isabs(body) and inside(body, source):
                 new = target + body[len(source):]
                 with open(path, "w") as handle:
                     handle.write(("gitdir: " + new if linked else new) + "\n")
                 count += 1
+                break
+    return count
+
+
+def links_escaping(corpus):
+    """Git links in the copy that resolve outside it (relative ones included)."""
+    root = os.path.realpath(corpus)
+    count = 0
+    for path, _linked, body in git_links(corpus):
+        target = body if os.path.isabs(body) else os.path.join(os.path.dirname(path), body)
+        if not inside(os.path.normpath(target), root):
+            count += 1
     return count
 
 
 def op_repos(args):
-    """Git checkouts under ROOT: [rel, kind, main rel or None, HEAD]."""
+    """Git checkouts under ROOT: [rel, kind, main rel or None, HEAD].
+
+    kind is main, linked (a linked worktree whose main checkout is under
+    ROOT) or submodule (its admin directory is under a `.git/modules/`).
+    A linked worktree whose main checkout is not under ROOT is refused.
+    """
     root = os.path.abspath(args["root"])
     rows = []
     for dirpath, dirs, files in os.walk(root):
@@ -462,10 +574,62 @@ def op_repos(args):
             else:
                 with open(dot) as handle:
                     admin = handle.read().split("gitdir:", 1)[-1].strip()
-                main = os.path.dirname(os.path.dirname(os.path.dirname(admin)))
-                rows.append([rel, "linked", os.path.relpath(main, root), head])
+                if not os.path.isabs(admin):
+                    admin = os.path.join(dirpath, admin)
+                admin = os.path.normpath(admin)
+                if os.sep + "modules" + os.sep in admin:
+                    rows.append([rel, "submodule", None, head])
+                else:
+                    main = os.path.relpath(
+                        os.path.dirname(os.path.dirname(os.path.dirname(admin))), root)
+                    if os.path.isabs(main) or main == ".." or main.startswith(".." + os.sep):
+                        raise RuntimeError("linked worktree %s belongs to a repository"
+                                           " outside the root" % rel)
+                    rows.append([rel, "linked", main, head])
             dirs[:] = [d for d in dirs if d != ".git"]
     return {"rows": rows}
+
+
+def op_size(args):
+    """Bytes and entries of real directories, by lstat (read-only)."""
+    total = entries = 0
+    for _label, source in args["sources"]:
+        for dirpath, dirs, files in os.walk(os.path.realpath(source)):
+            entries += len(dirs) + len(files)
+            for name in files:
+                try:
+                    info = os.lstat(os.path.join(dirpath, name))
+                except OSError:
+                    continue
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+    return {"bytes": total, "entries": entries}
+
+
+def op_wrapper(args):
+    """Rewrite the serve wrapper under WORK with the 3.8-safe one."""
+    path = os.path.realpath(args["path"])
+    if not inside(path, os.path.realpath(args["work"])):
+        raise RuntimeError("wrapper outside the working root")
+    with open(path, "w") as handle:
+        handle.write(M3_WRAPPER.format(python=args["python"], agent=args["agent"],
+                                       flags=list(args.get("flags") or [])))
+    os.chmod(path, 0o700)
+    return {"path": path}
+
+
+def op_release(args):
+    """Remove the harness's own paths, only under its own working root."""
+    work = os.path.realpath(args["work"])
+    removed = 0
+    for path in args["paths"]:
+        real = os.path.realpath(path)
+        if real == work or not inside(real, work):
+            raise RuntimeError("release refused outside the working root")
+        if os.path.lexists(real):
+            shutil.rmtree(real)
+            removed += 1
+    return {"removed": removed}
 
 
 def op_run(args):
@@ -490,7 +654,8 @@ def op_mkdirs(args):
 
 
 OPS.update({"census": op_census, "subset": op_subset, "repos": op_repos,
-            "run": op_run, "mkdirs": op_mkdirs})
+            "run": op_run, "mkdirs": op_mkdirs, "space": op_space,
+            "release": op_release, "size": op_size, "wrapper": op_wrapper})
 '''
 
 PROGRAM = gb.REMOTE_HELPER + M3_HELPER
@@ -723,6 +888,12 @@ def cmd_generate(args: argparse.Namespace) -> int:
         print(f"m3-link: DEST must be new under an existing parent: {dest}")
         return 2
     profiles = [json.loads(Path(p).read_text()) for p in args.profile]
+    labels = [str(p.get("label", "")) for p in profiles]
+    if len(set(labels)) != len(labels) or any(
+        not label or "/" in label or label in (".", "..") for label in labels
+    ):
+        print(f"m3-link: profile labels must be unique plain names: {labels}")
+        return 2
     total = sum(p["bytes"] for p in profiles)
     factor = args.bytes / total
     corpus = dest / "corpus"
@@ -929,7 +1100,11 @@ def conditions_pair(ctx: Ctx) -> dict[str, object]:
 
 
 def rclone_tuned_argv(
-    ctx: Ctx, source: str, dest: Path, tuning: list[str]
+    ctx: Ctx,
+    source: str,
+    dest: Path,
+    tuning: list[str],
+    excludes: Path | None = None,
 ) -> list[str]:
     return [
         ctx.rclone,
@@ -939,7 +1114,7 @@ def rclone_tuned_argv(
         "--config",
         str(ctx.rclone_conf),
         "--exclude-from",
-        str(ctx.rclone_excludes),
+        str(excludes or ctx.rclone_excludes),
         "--create-empty-src-dirs",
         "--links",
         "--metadata",
@@ -991,6 +1166,7 @@ def arm_argv(
     state: str,
     dest_state: Path,
     source: str | None = None,
+    excludes: Path | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     source = source or ctx.corpus
     t = ctx.transport
@@ -1001,7 +1177,7 @@ def arm_argv(
         return [argv[0], *ctx.native_flags, *argv[1:]], ctx.native_env
     if letter in ("P", "R", "S"):
         tuning = list(PLAIN_TUNING) if letter == "P" else ctx.rclone_tuning
-        argv = rclone_tuned_argv(ctx, source, dest, tuning)
+        argv = rclone_tuned_argv(ctx, source, dest, tuning, excludes)
         if letter == "S":
             # Equal durability: pull seals every output before it exits.
             argv = [
@@ -1117,6 +1293,10 @@ def link_baseline(ctx: Ctx) -> dict[str, object]:
 
 
 def iperf3_baseline(ctx: Ctx) -> dict[str, object]:
+    """iperf3 both ways. The one-off server (`-s -1 --idle-timeout 30`) ends
+    itself. The client retries a refused connection until the server listens
+    (bounded by --iperf3-ready-seconds), each direction uses its own port, and
+    nothing is ever signalled."""
     a = ctx.args
     if not a.iperf3 or not a.remote_iperf3:
         return {"skipped": "no iperf3 on one of the hosts (--iperf3/--remote-iperf3)"}
@@ -1124,56 +1304,54 @@ def iperf3_baseline(ctx: Ctx) -> dict[str, object]:
     if host is None:
         return {"skipped": "no HostName from ssh -G"}
     out: dict[str, object] = {}
-    for name, flags in (("source_to_dest", ["-R"]), ("dest_to_source", [])):
+    for offset, (name, flags) in enumerate(
+        (("source_to_dest", ["-R"]), ("dest_to_source", []))
+    ):
+        port = str(a.iperf3_port + offset)
         server = subprocess.Popen(
             ctx.transport.argv(
-                [
-                    *shlex.split(a.remote_iperf3),
-                    "-s",
-                    "-1",
-                    "-p",
-                    str(a.iperf3_port),
-                    "--idle-timeout",
-                    "30",
-                ]
+                [*shlex.split(a.remote_iperf3), "-s", "-1", "-p", port]
+                + ["--idle-timeout", "30"]
             ),
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        time.sleep(2)
-        client = subprocess.run(
-            [
-                a.iperf3,
-                "-c",
-                host,
-                "-p",
-                str(a.iperf3_port),
-                "-t",
-                str(a.iperf3_seconds),
-                "-J",
-                *flags,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        deadline = time.monotonic() + a.iperf3_ready_seconds
+        attempts = 0
+        while True:
+            attempts += 1
+            client = subprocess.run(
+                [a.iperf3, "-c", host, "-p", port, "-t", str(a.iperf3_seconds), "-J"]
+                + flags,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            try:
+                end = json.loads(client.stdout)["end"]
+                out[name] = {
+                    "bits_per_second": round(end["sum_received"]["bits_per_second"]),
+                    "bytes_per_s": round(end["sum_received"]["bits_per_second"] / 8),
+                    "retransmits": end.get("sum_sent", {}).get("retransmits"),
+                    "attempts": attempts,
+                }
+                break
+            except (ValueError, KeyError, TypeError):
+                text = (client.stdout + client.stderr).lower()
+                if "refused" in text and time.monotonic() < deadline:
+                    time.sleep(1)
+                    continue
+                out[name] = {
+                    "error": gb.redact(client.stderr.strip() or client.stdout)[-200:]
+                    or f"exit {client.returncode}",
+                    "attempts": attempts,
+                }
+                break
         try:
             server.wait(timeout=60)
         except subprocess.TimeoutExpired:
             out[f"{name}_server"] = "still running; left to its --idle-timeout"
-        try:
-            end = json.loads(client.stdout)["end"]
-            out[name] = {
-                "bits_per_second": round(end["sum_received"]["bits_per_second"]),
-                "bytes_per_s": round(end["sum_received"]["bits_per_second"] / 8),
-                "retransmits": end.get("sum_sent", {}).get("retransmits"),
-            }
-        except (ValueError, KeyError, TypeError):
-            out[name] = {
-                "error": gb.redact(client.stderr.strip())[-200:]
-                or f"exit {client.returncode}"
-            }
     return out
 
 
@@ -1209,8 +1387,9 @@ def run_rep(ctx: Ctx, rep: int, report: dict[str, object]) -> dict[str, object]:
                     )
                 )
         plan_bytes = sum(int(p[1]) for p in ctx.plan)
-        ctx.transport.helper("xor", {"root": ctx.corpus, "plan": ctx.plan})
+        # Set before the call: a partial XOR must still be restored and checked.
         out["delta_applied"] = True
+        ctx.transport.helper("xor", {"root": ctx.corpus, "plan": ctx.plan})
         after = ctx.transport.helper("manifest", {"root": ctx.corpus})
         rows_after = after["rows"]
         changed = gb.changed_paths(ctx.rows, rows_after)
@@ -1242,13 +1421,15 @@ def run_rep(ctx: Ctx, rep: int, report: dict[str, object]) -> dict[str, object]:
                     calib,
                 )
             )
-    except gb.Abort as abort:
-        if abort.sample is not None:
-            samples.append(abort.sample)
-        out["aborted"] = str(abort)
-        restore(ctx, out)
-        raise Abort(str(abort), out) from abort
-    restore(ctx, out)
+    except (Exception, KeyboardInterrupt) as error:
+        if isinstance(error, gb.Abort) and error.sample is not None:
+            samples.append(error.sample)
+        out["aborted"] = f"{type(error).__name__}: {error}"
+        restore(ctx, out, raising=False)
+        if isinstance(error, KeyboardInterrupt):
+            raise
+        raise Abort(str(error), out) from error
+    restore(ctx, out, raising=True)
     time.sleep(SETTLE_S)
     if ctx.git_items:
         try:
@@ -1259,19 +1440,32 @@ def run_rep(ctx: Ctx, rep: int, report: dict[str, object]) -> dict[str, object]:
             raise Abort(str(abort), out) from abort
     out["verdict"] = rep_verdict(out)
     if not ctx.args.keep_destinations:
-        shutil.rmtree(rep_dir, ignore_errors=True)
+        try:
+            shutil.rmtree(rep_dir)
+        except OSError as error:
+            out["destinations_released"] = False
+            raise Abort(f"rep{rep}: destinations not released: {error}", out) from error
         out["destinations_released"] = True
     return out
 
 
-def restore(ctx: Ctx, rep: dict[str, object]) -> None:
+def restore(ctx: Ctx, rep: dict[str, object], raising: bool) -> None:
+    """Undo the delta's XOR and prove it by the working copy's manifest.
+
+    `restored` is true only when the digest matches the initial one; a
+    helper failure records `unknown`. With `raising`, anything else aborts.
+    """
     if not rep.get("delta_applied"):
         rep["restored"] = True
         return
-    ctx.transport.helper("xor", {"root": ctx.corpus, "plan": ctx.plan})
-    final = ctx.transport.helper("manifest", {"root": ctx.corpus})
-    rep["restored"] = final["digest"] == ctx.digest
-    if not rep["restored"]:
+    try:
+        ctx.transport.helper("xor", {"root": ctx.corpus, "plan": ctx.plan})
+        final = ctx.transport.helper("manifest", {"root": ctx.corpus})
+        rep["restored"] = final["digest"] == ctx.digest
+    except gb.Abort as error:
+        rep["restored"] = "unknown"
+        rep["restore_error"] = str(error)
+    if raising and rep["restored"] is not True:
         raise Abort("the source working copy did not restore after the delta", rep)
 
 
@@ -1282,6 +1476,8 @@ def git_items(ctx: Ctx, rows: list[list[object]], dest_root: Path) -> list[str]:
     """estate-add-batch triples: one item per checkout (R-N114)."""
     words: list[str] = []
     for rel, kind, main, _head in rows:
+        if kind not in ("main", "linked"):
+            continue  # a submodule is content of its outer checkout's item
         src = f"{ctx.corpus}/{ctx.args.git_subtree}/{rel}"
         dest = str(dest_root / str(rel))
         if kind == "main":
@@ -1299,6 +1495,11 @@ def run_git(ctx: Ctx, rep_dir: Path, rep: int, link: dict) -> dict[str, object]:
     subtree = f"{ctx.corpus}/{ctx.args.git_subtree}"
     expected = ctx.transport.helper("manifest", {"root": subtree})
     gbytes = gb.comparable_bytes(expected["rows"], expected["exclusions"])
+    excludes = ctx.work / f"rclone-excludes-git-rep{rep}.txt"
+    gb.write_private(
+        excludes,
+        "".join(gb.rclone_glob(p) + "\n" for p in sorted(expected["exclusions"])),
+    )
     swork = f"{ctx.states}/git-rep{rep}"
     for phase in ("initial", "rerun"):
         for seq, letter in enumerate(GIT_ORDER):
@@ -1310,7 +1511,9 @@ def run_git(ctx: Ctx, rep_dir: Path, rep: int, link: dict) -> dict[str, object]:
             before = conditions_pair(ctx)
             stem = f"rep{rep}-git-{seq}-{letter}-{phase}"
             if letter == "R":
-                argv, env = arm_argv(ctx, "R", dest, "", slot / "s", source=subtree)
+                argv, env = arm_argv(
+                    ctx, "R", dest, "", slot / "s", source=subtree, excludes=excludes
+                )
                 run = gb.run_measured(
                     argv,
                     env,
@@ -1347,6 +1550,14 @@ def run_git(ctx: Ctx, rep_dir: Path, rep: int, link: dict) -> dict[str, object]:
                     f"{json.dumps(sample.get('problems') or sample)[:600]}",
                     {"git": out},
                 )
+    # The harness's own captures on the source, once this rep verified.
+    out["source_released"] = ctx.transport.helper(
+        "release",
+        {
+            "work": ctx.args.source_work,
+            "paths": [f"{swork}-{seq}" for seq, x in enumerate(GIT_ORDER) if x == "G"],
+        },
+    )["removed"]
     return out
 
 
@@ -1432,7 +1643,7 @@ def git_slot(
         logs / f"{stem}-apply.stdout",
         logs / f"{stem}-apply.stderr",
     )
-    src_heads = {r[0]: r[3] for r in ctx.git_items}
+    src_heads = {r[0]: r[3] for r in ctx.git_items if r[1] in ("main", "linked")}
     got = {r[0]: r[3] for r in local("repos", {"root": str(dest)})["rows"]}
     missing = sorted(k for k in src_heads if got.get(k) != src_heads[k])
     problems = []
@@ -1491,6 +1702,29 @@ def med(samples: list[dict], arm: str, phase: str) -> float | None:
     )
 
 
+def med_beside(samples: list[dict], base: str, phase: str) -> float | None:
+    """The B median over the B slots adjacent to BASE's slots only.
+
+    With BPBPBRBRBSY, B against P uses sequences 0, 2 and 4 (the gate's
+    B/A/B/A/B), not the B slots that bracket the tuned R.
+    """
+    seqs = {
+        int(s["sequence"]) + d
+        for s in samples
+        if s.get("arm") == base and s.get("phase") == phase and "sequence" in s
+        for d in (-1, 1)
+    }
+    return gb.median(
+        [
+            float(s["elapsed_ms"])
+            for s in samples
+            if s.get("arm") == "B"
+            and s.get("phase") == phase
+            and s.get("sequence") in seqs
+        ]
+    )
+
+
 def rep_verdict(rep: dict[str, object]) -> dict[str, object]:
     samples = rep["samples"]  # type: ignore[assignment]
     out: dict[str, object] = {"medians_ms": {}}
@@ -1502,7 +1736,8 @@ def rep_verdict(rep: dict[str, object]) -> dict[str, object]:
     m = out["medians_ms"]
     for base in ("P", "R", "S", "Y"):
         for phase in ("initial", "rerun", "delta"):
-            b, x = m[phase].get("B"), m[phase].get(base)  # type: ignore[index]
+            b = med_beside(samples, base, phase)  # type: ignore[arg-type]
+            x = m[phase].get(base)  # type: ignore[index]
             if b is not None and x is not None:
                 out[f"B_vs_{base}_{phase}"] = round(b / x, 4)
     reruns = [s for s in samples if s["arm"] == "B" and s["phase"] == "rerun"]  # type: ignore[index]
@@ -1738,9 +1973,56 @@ def tune_rclone(ctx: Ctx, values: list[int]) -> tuple[list[str], dict[str, objec
         trials[str(value)] = {"exit": run["exit"], "elapsed_ms": run["elapsed_ms"]}
         if run["exit"] == 0 and (best is None or run["elapsed_ms"] < best[0]):
             best = (float(run["elapsed_ms"]), value)
-        shutil.rmtree(dest, ignore_errors=True)
+        try:
+            shutil.rmtree(dest)
+        except OSError as error:
+            trials[str(value)]["release_error"] = str(error)  # type: ignore[index]
     chosen = best[1] if best else values[0]
     return ["--transfers", str(chosen), "--checkers", str(2 * chosen)], trials
+
+
+def dest_budget(
+    args: argparse.Namespace,
+    mode: str,
+    work: Path,
+    comparable: int,
+    entries: int,
+    report: dict[str, object],
+) -> int | None:
+    """Refuse unless every destination held at once fits above the floor.
+
+    Each file-arm slot is one copy; the Git stage holds five (two G slots of
+    carry plus checkouts, one R); --keep-destinations keeps every rep's.
+    rclone and rsync have no floor of their own, so this is their guard too.
+    """
+    per_rep = len(args.order) + (5 if args.git else 0)
+    copies = per_rep * (args.reps if args.keep_destinations else 1)
+    copies += 1 if mode == "dry-run" else 0
+    budget = gb.disk_budget(
+        *gb.volume_space(work),
+        copies,
+        comparable,
+        entries,
+        floor_percent=args.min_free_percent,
+    )
+    report["destination"]["disk"] = budget  # type: ignore[index]
+    if not budget["ok"]:
+        return refuse("DEST_SPACE", json.dumps(budget), report, work)
+    return None
+
+
+def rows_identity(rows: list[list[object]]) -> str:
+    """corpus_identity's digest, from gate_b manifest rows of a working copy."""
+    digest = hashlib.sha256()
+    for rel, kind, _mode, size, value in rows:
+        if kind == "f":
+            row = [rel, "f", size, value]
+        elif kind == "l":
+            row = [rel, "l", 0, value]
+        else:
+            row = [rel, kind, 0, ""]
+        digest.update(json.dumps(row).encode() + b"\n")
+    return digest.hexdigest()
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1854,24 +2136,36 @@ def cmd_run(args: argparse.Namespace) -> int:
             )
         if probe.get("work_exists") or not probe.get("work_parent_is_dir"):
             return refuse("SOURCE_WORK", "--source-work must be new", report, work)
+        python = args.source_python if mode != "dry-run" else sys.executable
         if args.source_subset:
             sources = [s.split("=", 1) for s in args.source_subset]
+            if any(len(pair) != 2 for pair in sources):
+                return refuse("SUBSET", "--source-subset is LABEL=PATH", report, work)
+            labels = [pair[0] for pair in sources]
+            if len(set(labels)) != len(labels):
+                return refuse("SUBSET", "subset labels must be unique", report, work)
+            size = transport.helper("size", {"sources": sources})
+            refusal = dest_budget(
+                args, mode, work, size["bytes"], size["entries"], report
+            )
+            if refusal:
+                return refusal
             prepared = transport.helper(
                 "subset",
                 {
                     "sources": sources,
                     "work": args.source_work,
-                    "python": args.source_python
-                    if mode != "dry-run"
-                    else sys.executable,
+                    "python": python,
                     "agent": args.remote_agent,
                     "flags": flags,
+                    # the copy itself, plus the Git arm's captures
+                    "copies": 1 + (2 if args.git else 0),
                 },
             )
             report["workload"].update(
                 {
                     "kind": "real-subset",
-                    "labels": [s[0] for s in sources],
+                    "labels": labels,
                     "subset_digest": hashlib.sha256(
                         json.dumps(sources).encode()
                     ).hexdigest()[:16],
@@ -1887,42 +2181,69 @@ def cmd_run(args: argparse.Namespace) -> int:
                     "sealed": seal.get("sealed"),
                 }
             )
-            if mode == "field" and seal.get("format") not in (
-                CORPUS_FORMAT,
-                "bulkload-estate-corpus-v1",
+            if mode == "field" and (
+                seal.get("format") not in (CORPUS_FORMAT, "bulkload-estate-corpus-v1")
+                or not seal.get("sealed")
             ):
                 return refuse(
-                    "CORPUS", f"not an M3 or estate corpus: {seal}", report, work
+                    "CORPUS", f"not a sealed M3 or estate corpus: {seal}", report, work
                 )
             measured = transport.helper("measure", {"corpus": args.source_corpus})
-            copies = (
-                len(args.order)
-                + (2 if args.git else 0)
-                + (1 if mode == "dry-run" else 0)
-            )
-            budget = gb.disk_budget(
-                *gb.volume_space(work),
-                copies,
+            refusal = dest_budget(
+                args,
+                mode,
+                work,
                 int(measured["comparable_bytes"]),
                 int(measured["comparable_files"]) + int(measured["directories"]),
-                floor_percent=args.min_free_percent,
+                report,
             )
-            report["destination"]["disk"] = budget
-            if not budget["ok"] and not args.keep_destinations:
-                return refuse("DEST_SPACE", json.dumps(budget), report, work)
+            if refusal:
+                return refusal
+            space = transport.helper("space", {"path": args.source_work})
+            need = (
+                int(measured["comparable_bytes"]) * (3 if args.git else 1)
+                + gb.MIB * 1024
+            )
+            if space["available"] < need:
+                return refuse(
+                    "SOURCE_SPACE",
+                    f"source volume has {space['available']} bytes free, needs {need}",
+                    report,
+                    work,
+                )
             prepared = transport.helper(
                 "prepare",
                 {
                     "corpus": args.source_corpus,
                     "work": args.source_work,
-                    "python": args.source_python
-                    if mode != "dry-run"
-                    else sys.executable,
+                    "python": python,
+                    "agent": args.remote_agent,
+                    "flags": flags,
+                },
+            )
+            transport.helper(
+                "wrapper",
+                {
+                    "path": prepared["wrapper"],
+                    "work": args.source_work,
+                    "python": python,
                     "agent": args.remote_agent,
                     "flags": flags,
                 },
             )
         manifest = transport.helper("manifest", {"root": prepared["corpus"]})
+        if report["workload"].get("kind") == CORPUS_FORMAT:
+            got = rows_identity(manifest["rows"])
+            report["workload"]["identity_verified"] = (
+                got == report["workload"]["identity"]
+            )
+            if mode == "field" and not report["workload"]["identity_verified"]:
+                return refuse(
+                    "CORPUS",
+                    f"working copy identity {got} is not the seal's",
+                    report,
+                    work,
+                )
         git_rows: list[list[object]] = []
         if args.git:
             git_rows = transport.helper(
@@ -2022,8 +2343,10 @@ def cmd_run(args: argparse.Namespace) -> int:
             repo
             / "docs"
             / "evidence"
-            / f"m3-link-{report['stamp']}-{args.source_host}-{platform.node()}.md"
+            / f"m3-link-{report['stamp']}-{args.source_host}-{args.dest_label}.md"
         )
+        if evidence_md.exists() or evidence_md.with_suffix(".json").exists():
+            return refuse("EVIDENCE", f"{evidence_md} exists", report, work)
     try:
         time.sleep(SETTLE_S)
         for index in range(args.reps):
@@ -2073,6 +2396,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("--work-root", required=True, help="new local directory")
     r.add_argument("--agent", required=True, help="local bulkload-agent")
     r.add_argument("--source-host", default="neo")
+    r.add_argument("--dest-label", default="sting", help="names the evidence file")
     r.add_argument("--ssh", default="ssh")
     r.add_argument("--ssh-config", help="absolute ssh config, used by every arm")
     r.add_argument("--source-python", default="/usr/bin/python3")
@@ -2112,6 +2436,7 @@ def parser() -> argparse.ArgumentParser:
     r.add_argument("--remote-iperf3", help="source iperf3 command (shell words)")
     r.add_argument("--iperf3-port", type=int, default=5299)
     r.add_argument("--iperf3-seconds", type=int, default=10)
+    r.add_argument("--iperf3-ready-seconds", type=int, default=120)
     r.add_argument("--calibrate-mib", type=int, default=64)
     r.add_argument("--calibrate-streams", type=int, default=4)
     r.add_argument("--git", action="store_true", help="add the Git arm (G/R/G)")

@@ -156,13 +156,13 @@ class VerdictTests(unittest.TestCase):
     def test_gate_b_rule_needs_wins_over_plain_rclone_s3_and_rss(self) -> None:
         zero = {"bytes_received": 0, "source_bytes_read": 0}
         samples = [
-            self.sample("B", "initial", 100.0),
-            self.sample("P", "initial", 200.0),
-            self.sample("R", "initial", 90.0),
-            self.sample("B", "rerun", 5.0, **zero),
-            self.sample("P", "rerun", 50.0),
-            self.sample("B", "delta", 10.0, source_bytes_read=40),
-            self.sample("P", "delta", 20.0),
+            self.sample("B", "initial", 100.0, sequence=0),
+            self.sample("P", "initial", 200.0, sequence=1),
+            self.sample("R", "initial", 90.0, sequence=3),
+            self.sample("B", "rerun", 5.0, sequence=0, **zero),
+            self.sample("P", "rerun", 50.0, sequence=1),
+            self.sample("B", "delta", 10.0, sequence=0, source_bytes_read=40),
+            self.sample("P", "delta", 20.0, sequence=1),
         ]
         rep = {"samples": samples, "delta": {"changed_seat_bytes": 40}}
         v = m3.rep_verdict(rep)
@@ -179,6 +179,18 @@ class VerdictTests(unittest.TestCase):
         self.assertFalse(m3.rep_verdict(rep)["s3_rerun_zero"])
 
 
+class BesideTests(unittest.TestCase):
+    def test_b_against_p_uses_only_the_b_slots_beside_p(self) -> None:
+        times = {0: 100.0, 1: 300.0, 2: 110.0, 3: 300.0, 4: 120.0, 5: 50.0, 6: 10.0}
+        order = "BPBPBRB"
+        samples = [
+            {"arm": order[q], "phase": "initial", "elapsed_ms": t, "sequence": q}
+            for q, t in times.items()
+        ]
+        self.assertEqual(m3.med_beside(samples, "P", "initial"), 110.0)
+        self.assertEqual(m3.med_beside(samples, "R", "initial"), 65.0)
+
+
 class DeltaTests(unittest.TestCase):
     def test_delta_changes_about_one_percent_of_files_in_place(self) -> None:
         rows = [
@@ -192,6 +204,96 @@ class DeltaTests(unittest.TestCase):
         for rel, length in plan:
             self.assertEqual(length, min(sizes[rel], 64 << 10))
         self.assertEqual(plan, m3.delta_plan_files(rows, {"db": "sqlite-magic"}))
+
+
+class SubsetTests(unittest.TestCase):
+    def test_work_root_inside_a_source_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src"
+            src.mkdir()
+            (src / "f").write_text("x")
+            with self.assertRaisesRegex(RuntimeError, "overlaps"):
+                m3.local(
+                    "subset",
+                    {
+                        "sources": [["a", str(src)]],
+                        "work": str(src / "work"),
+                        "python": sys.executable,
+                        "agent": "/bin/true",
+                    },
+                )
+            self.assertFalse((src / "work").exists())
+
+    def test_linked_worktrees_are_relinked_and_escapes_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            gitdir = root / "real" / "git"
+            repo = gitdir / "r1"
+            repo.mkdir(parents=True)
+            git(repo, "init", "-q", "-b", "main")
+            (repo / "f.txt").write_text("hello\n")
+            git(repo, "add", ".")
+            git(repo, "commit", "-qm", "c")
+            git(repo, "worktree", "add", "-q", str(gitdir / "r1.worktrees" / "w"))
+            alias = root / "alias"
+            alias.symlink_to(gitdir)  # a source named through a symlink
+            out = m3.local(
+                "subset",
+                {
+                    "sources": [["git", str(alias)]],
+                    "work": str(root / "work"),
+                    "python": sys.executable,
+                    "agent": "/bin/true",
+                },
+            )
+            self.assertEqual(out["skipped"]["worktree_links_rewritten"], 2)
+            rows = m3.local("repos", {"root": out["corpus"] + "/git"})["rows"]
+            self.assertEqual(
+                sorted((r[0], r[1], r[2]) for r in rows),
+                [("r1", "main", None), ("r1.worktrees/w", "linked", "r1")],
+            )
+            lone = root / "lone"
+            lone.mkdir()
+            (lone / "w").mkdir()
+            (lone / "w" / ".git").write_text(f"gitdir: {repo}/.git/worktrees/w\n")
+            with self.assertRaisesRegex(RuntimeError, "outside"):
+                m3.local(
+                    "subset",
+                    {
+                        "sources": [["lone", str(lone)]],
+                        "work": str(root / "work2"),
+                        "python": sys.executable,
+                        "agent": "/bin/true",
+                    },
+                )
+
+
+class IdentityTests(unittest.TestCase):
+    def test_working_copy_manifest_reproduces_the_seal_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = Path(tmp) / "p.json"
+            prof.write_text(json.dumps({**profile(), "symlinks": 300}))
+            dest = Path(tmp) / "c"
+            args = m3.parser().parse_args(
+                ["generate", str(dest), "--profile", str(prof), "--bytes", "400000"]
+            )
+            self.assertEqual(m3.cmd_generate(args), 0)
+            seal = json.loads((dest / "SEAL.json").read_text())
+            rows = m3.local("manifest", {"root": str(dest / "corpus")})["rows"]
+            self.assertEqual(m3.rows_identity(rows), seal["identity"])
+            for path in dest.rglob("*"):
+                if path.is_dir() and not path.is_symlink():
+                    path.chmod(0o755)
+
+    def test_duplicate_profile_labels_are_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            prof = Path(tmp) / "p.json"
+            prof.write_text(json.dumps(profile()))
+            args = m3.parser().parse_args(
+                ["generate", str(Path(tmp) / "c"), "--profile", str(prof)]
+                + ["--profile", str(prof), "--bytes", "1000"]
+            )
+            self.assertEqual(m3.cmd_generate(args), 2)
 
 
 if __name__ == "__main__":
