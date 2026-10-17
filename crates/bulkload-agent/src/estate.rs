@@ -2237,6 +2237,24 @@ fn apply_item(
     // typed refusal, never a bare IO errno; and it names the absent capture
     // (S4, #219), never a sealed object a capture recorded and lost.
     if !record.try_exists().refuse_at("estate::apply_item")? {
+        // M2r2 b: an item `estate-carry-files` carried as files, with its
+        // carry still proved, keeps that outcome; a re-apply never turns it
+        // back into CAPTURE_ABSENT.
+        let carried_now = matches!(
+            crate::outcome::read_record(&state.join(format!("{identity}.outcome"))),
+            Ok(crate::outcome::OutcomeRecord {
+                outcome: crate::outcome::Outcome::CarriedAsFiles,
+                ..
+            })
+        );
+        if carried_now
+            && matches!(
+                carried::prove(&[state.to_path_buf()], &identity, source),
+                Some(Ok(_))
+            )
+        {
+            return Ok(Completion::clean(carried::CARRIED_OUTCOME));
+        }
         return Err(BulkloadRefusal::CaptureAbsent);
     }
     let captured: Capture = read(&record)?;
@@ -2577,6 +2595,12 @@ pub struct LedgerEntry {
     /// from its `.omissions` sidecar; `None` when that is unknown (a
     /// capture from before the sidecar, or no readable capture).
     pub omitted: Option<Vec<git_carry::RebuildableOmission>>,
+    /// The item's proved carry as files (M2r2 b): its
+    /// `{item}-{blake3(SOURCE)}.carried` record from the last state
+    /// directory holding one, with the transfer record it names checked
+    /// ([`carried::prove`]), or why it proves nothing. `None` when no state
+    /// directory holds one.
+    pub carried: Option<std::result::Result<carried::CarriedProof, &'static str>>,
 }
 
 /// A plan's items joined with their outcome records and apply journals.
@@ -2670,6 +2694,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             JournalState::CaptureUnreadable
         };
         let record = records.get(&identity);
+        let carried = carried::prove(states, &identity, source);
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
@@ -2677,6 +2702,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             journal,
             capture,
             omitted,
+            carried,
             item: identity,
         });
     }
@@ -3136,6 +3162,7 @@ pub mod custody_probe {
 }
 
 // `estate-diff` (#226 item 1).
+pub mod carried;
 mod diff;
 pub use diff::{diff, DiffOptions, Summary as DiffSummary, SCHEMA as DIFF_SCHEMA};
 

@@ -342,6 +342,10 @@ pub enum Point {
     /// (0755, synced), not yet recorded in STATE; nothing landed (M2
     /// finding 1).
     EstateApplyParentsMade,
+    /// `estate.carry.recorded`: `estate-carry-files` landed an item's
+    /// bytes and wrote its carry record; the outcome record still says
+    /// `CAPTURE_ABSENT` (M2r2 b).
+    EstateCarryRecorded,
     /// `reseat.after_temp_seal`
     ReseatAfterTempSeal,
     /// `reseat.after_publish`
@@ -388,7 +392,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 63] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -433,6 +437,7 @@ impl Point {
         Self::EstateAdoptAfterLedger,
         Self::EstateAdoptBareStaged,
         Self::EstateApplyParentsMade,
+        Self::EstateCarryRecorded,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
         Self::ReseatAfterExtendIntent,
@@ -501,6 +506,7 @@ impl Point {
             Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
             Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
             Self::EstateApplyParentsMade => "estate.apply.parents_made",
+            Self::EstateCarryRecorded => "estate.carry.recorded",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",
             Self::ReseatAfterExtendIntent => "reseat.after_extend_intent",

@@ -130,12 +130,32 @@ SUBCOMMANDS:
                 given again; an unchanged rerun reads and writes nothing. One
                 JSON line per workspace (schema bulkload.estate-handoff.v1, the
                 verb's own name)
+    estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]...
+                [--host HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
+                PLAN CORPUS PRIVATE_STATE SOURCE CARRY_STATE
+                M2r2 b: carry each planned workspace item whose capture
+                refused (no capture record; its outcome CAPTURE_ABSENT) as
+                files, byte-exact, by one recorded transfer session (`copy`,
+                or `pull` from HOST with the remote source state under DIR)
+                into its workspace, or beside it (the workspace path with
+                SUFFIX appended), the session recorded in
+                CARRY_STATE/<item>/dest. An equal destination file is
+                adopted; a differing one is refused and never overwritten,
+                and the item is then not carried. Each landed `.git` pointer
+                file or symlink is resolved where it landed: one naming
+                nothing on this host or the carried tree itself is recorded;
+                one naming an existing directory outside the tree refuses
+                GIT_CARRY_POINTER_ATTACHED (the bytes stay for review). A
+                carried item gets a `{item}-{blake3(SOURCE)}.carried` record
+                and the outcome carried-as-files, which closure-report counts
+                `carried` once the transfer record proves it. --dry-run reads
+                only and prints what each item would do. One line per item
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
                 are mapped) and journals (later directories override earlier
                 outcome records), with SOURCE the label estate-apply was
-                given. Prints a bulkload.closure.v4 JSON ledger: every planned
+                given. Prints a bulkload.closure.v5 JSON ledger: every planned
                 item is applied (workspace, exact current-capture journal),
                 refused-pending-review (typed code; a bare IO or FRAME_CODEC
                 is not typed, nor is a code retired from the taxonomy),
@@ -576,6 +596,7 @@ fn main() -> ExitCode {
             name @ ("estate-add" | "estate-add-batch" | "estate-show" | "estate-capture"
             | "estate-apply" | "estate-diff" | "estate-handoff"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
+        Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
@@ -1897,6 +1918,112 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
         || pull_command(args),
     )
     .and_then(|stats| report_transfer(&stats))
+}
+
+// M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,
+// the remote source state per item under --source-state-root.
+fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::estate::carried::{self, CarryJob, CarryOptions, Transport};
+    struct Pull {
+        host: std::ffi::OsString,
+        source_state_root: PathBuf,
+        remote: Option<std::ffi::OsString>,
+        config: Option<std::ffi::OsString>,
+    }
+    impl Transport for Pull {
+        fn verb(&self) -> &'static str {
+            "pull"
+        }
+        fn source_key(&self, source: &Path) -> String {
+            bulkload_agent::transfer_outcome::pull_source(&self.host, source)
+        }
+        fn roots_apart(&self, job: &CarryJob) -> Result<()> {
+            bulkload_agent::transfer::receive_roots_apart(&job.destination, &job.destination_state)
+        }
+        fn run(&self, job: &CarryJob) -> Result<bulkload_agent::transfer::TransferStats> {
+            let mut args: Vec<std::ffi::OsString> = vec![
+                self.host.clone(),
+                job.source.clone().into_os_string(),
+                job.destination.clone().into_os_string(),
+                self.source_state_root.join(&job.item).into_os_string(),
+                job.destination_state.clone().into_os_string(),
+            ];
+            // `pull` takes SSH_CONFIG only after REMOTE_EXECUTABLE; the
+            // parser requires the one with the other.
+            args.extend(self.remote.iter().cloned());
+            args.extend(self.config.iter().cloned());
+            pull_command(&args)
+        }
+    }
+    let mut options = CarryOptions::default();
+    let (mut host, mut root, mut remote, mut config) = (None, None, None, None);
+    let mut at = 0;
+    let value = |at: usize| {
+        args.get(at)
+            .cloned()
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)
+    };
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        match arg {
+            "--dry-run" if !options.dry_run => {
+                options.dry_run = true;
+                at += 1;
+                continue;
+            }
+            "--beside" if options.beside.is_none() => options.beside = Some(value(at + 1)?),
+            "--item" => options.items.push(
+                value(at + 1)?
+                    .into_string()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?,
+            ),
+            "--host" if host.is_none() => host = Some(value(at + 1)?),
+            "--source-state-root" if root.is_none() => root = Some(PathBuf::from(value(at + 1)?)),
+            "--remote-executable" if remote.is_none() => remote = Some(value(at + 1)?),
+            "--ssh-config" if config.is_none() => config = Some(value(at + 1)?),
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+        at += 2;
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let [plan, corpus, state, source, carry_state] = rest else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let source = source
+        .to_str()
+        .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+    if config.is_some() && remote.is_none() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    let local = carried::LocalCopy;
+    let pull;
+    let transport: &dyn Transport = match (host, root) {
+        (Some(host), Some(source_state_root)) => {
+            pull = Pull {
+                host,
+                source_state_root,
+                remote,
+                config,
+            };
+            &pull
+        }
+        (None, None) if remote.is_none() && config.is_none() => &local,
+        _ => return Err(BulkloadRefusal::RequiredFieldMissing),
+    };
+    let mut output = std::io::stdout().lock();
+    carried::carry_files(
+        Path::new(plan),
+        Path::new(corpus),
+        Path::new(state),
+        source,
+        Path::new(carry_state),
+        &options,
+        transport,
+        &mut |line| {
+            writeln!(output, "{line}").refuse_at("main::carry_files_command")?;
+            output.flush().refuse_at("main::carry_files_command")
+        },
+    )
 }
 
 // Review finding 3 (S4): list one transfer a run expects in its manifest,

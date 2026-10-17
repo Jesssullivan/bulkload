@@ -120,6 +120,95 @@ recorded under another source (`record-source-mismatch`) is still refused
   does. A review row naming such a code disposes nothing and is listed under
   `reviewed.unmatched`; the rest of the ledger keeps working.
 
+**Capture-refused items carried as files (M2r2 b, 2026-10-17).** An item
+whose capture refused has no capture record; `estate-apply` records it
+`CAPTURE_ABSENT`, and closure holds it `refused-pending-review`. The cases
+are a partial clone, a malformed inventory, a missing index, a nest
+conversion attribute and a failed Git child. The in-place run carried 14
+such items with hand-run `pull` sessions, which closure could not bind to
+the plan.
+
+`estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--host
+HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
+PLAN CORPUS PRIVATE_STATE SOURCE CARRY_STATE` carries them with bulkload's
+own transfer and records the result in the estate ledger.
+
+- **Eligible.** An item is eligible when the corpus holds no capture
+  record for it, and its outcome record is
+  `CAPTURE_ABSENT`, or an earlier `carried-as-files`, which is re-proved.
+  Every other item is printed `skipped=<why>` and left alone.
+- **Destination.** The destination is the planned workspace, or with
+  `--beside` the workspace path with SUFFIX appended (a suffix holding `/`
+  or NUL refuses `FIELD_DOMAIN_VIOLATION`). An absent destination is made
+  one level deep, 0755, under an existing parent; otherwise the item
+  refuses `GIT_DESTINATION_PARENT_MISSING`.
+- **One transfer session.** Each item gets one `copy` or `pull` (from
+  HOST, with the remote source state under DIR) recorded in
+  `CARRY_STATE/<item>/dest`, like any session. The transfer's rules hold:
+  - bytes are carried exactly, `.git` included;
+  - an equal destination file is adopted with nothing written;
+  - a differing one is refused and never overwritten;
+  - the transfer's own durability order applies.
+
+  A session that ends refused, or completes with a refused path, does not
+  carry the item. It prints `carried=incomplete` with the first refused
+  path, keeps its outcome, and the verb exits nonzero. The transfer's own
+  rows, joined with `--transfer`, name every refused path.
+- **Pointer audit (#261).** Each `.git` entry below the landed tree that
+  is not a directory (a gitdir pointer file or a symlink) is resolved
+  where it landed:
+  - a target absent on this host is inert;
+  - a target inside the carried tree is the carried copy's own
+    administration;
+  - both of those are recorded in the carry record with their targets.
+
+  A target that is an existing directory outside the tree refuses
+  `GIT_CARRY_POINTER_ATTACHED path=<entry>`, recorded as the item's
+  outcome, because Git would act on that repository through the carried
+  copy. The landed bytes are left for review; nothing is rewritten. The
+  pointer is not withheld before landing, because the source walk (local,
+  or the remote `serve`) has no per-path exclusion; that remains an open
+  question.
+- **Records, in order.** The carry record
+  `{item}-{blake3(SOURCE)}.carried` is written first, durably (temporary,
+  fsync, rename, directory fsync). It holds the item, source, destination,
+  `beside`, whether the carry made the destination, the transfer state, the
+  session's row identity and the blake3 of its record bytes, and the
+  pointers. Then the outcome becomes `carried-as-files` (a new `Outcome`
+  variant, appended after `Refused`).
+  - A crash between the two leaves `CAPTURE_ABSENT`, and closure never
+    reads such an item `carried`; the rerun's transfer adopts what landed
+    and finishes it (fault point `estate.carry.recorded`, harness row
+    `estate_carry_recorded`).
+  - `estate-apply` keeps a carried item's outcome while its carry still
+    proves, so a re-apply never returns it to `CAPTURE_ABSENT`.
+- **Closure (v5).** Closure counts the item `carried` (accounted, like
+  `applied`) only when all of these hold:
+  - the outcome is `carried-as-files`;
+  - the carry record decodes and names the item and its source;
+  - the transfer record it names still has the recorded bytes, is a
+    completed session into the recorded destination, and holds no refused
+    path.
+
+  Otherwise it is unaccounted, with a reason such as
+  `carried-record-missing`, `carried-transfer-changed`,
+  `carried-transfer-mismatch` or `carried-transfer-refused-paths`. The
+  report is `bulkload.closure.v5`: the `carried` disposition, the
+  `totals.carried` count, and a `carried` block on the row (destination,
+  `beside`, transfer state, pointers).
+- **Refs-only items.** A refs-only item whose capture refused (the plan's
+  `repository` only) has its custody, the source's `.git`, inside a carried
+  workspace item of the same source. After the workspace items, it gets a
+  carry record naming that item (`via`) and binding the same transfer
+  record, and the outcome `carried-as-files`. Nothing is written at its
+  repository. Without a carried sibling it keeps `CAPTURE_ABSENT`. Closure
+  requires `via` exactly for a refs-only item
+  (`carried-shape-mismatch` otherwise).
+- **`--dry-run`.** It reads only and prints, per item, the destination,
+  what is there now (`absent`, `empty`, `nonempty`), whether its parent
+  exists, the prior transfer records in its state, and the session it would
+  run.
+
 **Transfers in the same report (WP3 PR 4, 2026-10-15, S4).** Every `copy`
 and `pull` session leaves a durable record in its DEST_STATE, one per
 transfer under `transfer.closure.d/<item>.closure` (`<item>` is the
