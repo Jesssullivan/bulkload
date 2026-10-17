@@ -529,26 +529,11 @@ fn lock_state(held: &mut Held, state: &Path) -> Result<()> {
 pub const LOCK: &str = "reseat.lock";
 
 /// Refuse `DESTINATION_SPACE_INSUFFICIENT` unless each destination file
-/// system keeps the floor after the bytes planned for it (the engine's
-/// rule, `--min-free-percent`).
+/// system, and each project quota a destination is under, keeps the floor
+/// after the bytes planned for it (the engine's rule, `--min-free-percent`;
+/// [`crate::space::preflight_many`]).
 fn space(options: &Options, wants: &[(&Path, u64)]) -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut by_device: BTreeMap<u64, (PathBuf, u64)> = BTreeMap::new();
-    for (path, bytes) in wants {
-        if *bytes == 0 {
-            continue;
-        }
-        let existing = crate::space::existing_ancestor(path)?;
-        let device = std::fs::metadata(&existing)
-            .map_err(|error| crate::refuse::io(&error, "reseat::space"))?
-            .dev();
-        let entry = by_device.entry(device).or_insert((existing, 0));
-        entry.1 = entry.1.saturating_add(*bytes);
-    }
-    for (path, bytes) in by_device.values() {
-        crate::space::check(*bytes, crate::space::probe(path)?, options.min_free_percent)?;
-    }
-    Ok(())
+    crate::space::preflight_many(wants, options.min_free_percent)
 }
 
 /// Re-seat the landed sessions into the destination's live agent state:
@@ -584,7 +569,7 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     } else {
         None
     };
-    let mut planned_claude = match &claude {
+    let planned_claude = match &claude {
         Some(sessions) => claude::retention(options, &lanes, sessions)?,
         None => 0,
     };
@@ -598,12 +583,10 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
         } else {
             0
         };
-        if options.claude && options.regularize {
-            if let Ok(real) = std::fs::canonicalize(&options.dest_claude) {
-                planned_claude =
-                    planned_claude.saturating_add(regularize::planned(&real, ledger.as_ref())?);
-            }
-        }
+        // Regularization is checked per link as it copies
+        // (`regularize::regularize`), never here: every symlinked
+        // transcript's bytes at once held whole passes back (M2 round 2,
+        // item 1).
         space(
             options,
             &[
@@ -641,7 +624,13 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     if options.claude && options.regularize {
         // Before placement: a regularized copy that is a prefix of a landed
         // transcript is then extended like any other.
-        regularize::regularize(&root(&options.dest_claude)?, &ledger, &mut summary, emit)?;
+        regularize::regularize(
+            &root(&options.dest_claude)?,
+            &ledger,
+            options.min_free_percent,
+            &mut summary,
+            emit,
+        )?;
     }
     if let Some(sessions) = &claude {
         claude::reseat(options, &lanes, &ledger, sessions, &mut summary, emit)?;

@@ -2074,6 +2074,30 @@ filesystem (`statvfs`; `statfs` on Darwin) with less than
 the space available) refuses `DESTINATION_SPACE_INSUFFICIENT` before it
 starts.
 
+Two limits (M2 round 2, item 1, 2026-10-17). On XFS (and ext4) with project
+quotas, `statvfs` of a directory inside a project-quota tree reports the
+project's limit and use, not the filesystem's: on sting, `/srv/fast-local/jess`
+read 74 GB free under its quota against 174 GB on the filesystem, and every
+check refused with no hint why. The probe now reads the path's view and, on
+Linux, the view at the root of the same filesystem (the mount of the path's
+device whose root is `/`, from `/proc/self/mountinfo`). When the two report
+different sizes, the path's view is a project quota and the root's is the
+filesystem. **The floor is a percent of each limit's own size, applied to
+each:** the write must leave `--min-free-percent` of the quota's limit free
+under the quota, and the same percent of the filesystem's size free on the
+filesystem. Where several destinations share a filesystem, the filesystem
+is judged on all their bytes and each quota on its own tree's. A refusal
+names the limit that bound (`bound=filesystem`, `project-quota` or `both`)
+and both limits' numbers: the verb's `space_refusal` line beside its
+counters (`planned_bytes`, `filesystem_planned_bytes`, `min_free_percent`,
+`filesystem_total_bytes`, `filesystem_available_bytes`, `quota=none` or
+`quota=project` with `quota_total_bytes` and `quota_available_bytes`, then
+`path`), repeated after the refusal as `bulkload-agent: space: ...`; the
+counters `space_checks`, `space_refused_filesystem` and
+`space_refused_quota` count every check and every refusal by limit. Where
+the root cannot be found or read (no mountinfo, a device mounted only below
+its root, Darwin), the path's view is the filesystem's, as before.
+
 - `copy` and `pull` decide it per entry on wire v6. An entry decided
   `Send` or `WantManifest` reserves its size until its `Held`. Each
   admission checks every reserved byte against a probe that is refreshed on
@@ -2081,12 +2105,18 @@ starts.
   is answered `Decision::Refuse` with that code: no new frame, the session
   continues, and a later run resumes it without re-reading durable bytes
   (R25).
-- `estate-apply` checks before any item runs. Each pending item's bundle
-  size is charged to its repository's filesystem and, for a linked worktree,
-  to its workspace's. The corpus's filesystem is charged twice the `jobs`
-  largest bundles, for bundle and base staging. Bundle size is a lower
-  bound on a checkout. An item the plan cannot read is skipped and refuses
-  on its own.
+- `estate-apply` checks before any item runs. Each pending item charges
+  its repository the bundles (the capture, its chain links and plan bases)
+  the destination repository does not already hold whole, by the same test
+  the import makes before it takes anything, and each bundle once per
+  repository across the plan (M2 round 2, item 1: a re-captured item over
+  a landed one, an adopted repository and a repository's other worktrees
+  charged their whole chains again). A linked worktree charges its
+  workspace the whole bundle when the workspace does not exist yet, else
+  the bytes the repository still lacks. The corpus is charged twice the
+  `jobs` largest pending bundles, for bundle and base staging. Bundle size
+  is a lower bound on a checkout. An item the plan cannot read is skipped
+  and refuses on its own.
 - `estate-capture` checks per item (#101, OI-1002-Q11). Before an item's
   export writes, its estimated bundle (the larger of its census's
   regular-file bytes and the retained bundle it extends) plus every byte
@@ -2194,11 +2224,19 @@ temporary even outside the lock (re-review of `8a89f9a`: two unlocked runs
 published each other's half-written file).
 
 **Refused before anything is written.** `DESTINATION_SPACE_INSUFFICIENT`:
-the engine's free-space rule (`--min-free-percent`, default 25) for the
-bytes a pass would write on each destination file system (an upper bound:
-every landed file the ledger does not hold unchanged, a `.zst` at its
-frame's declared size, an owned placement's new tail only, every symlinked
-transcript's target). Sting's live state is on a file system under the 25%
+the engine's free-space rule (`--min-free-percent`, default 25; a project
+quota judged as well, see the space preflight) for the bytes a pass would
+write on each destination file system (an upper bound, decided as the
+placement decides: nothing for a landed file the ledger holds unchanged,
+an owned append-only placement's new tail, an owned other file's whole
+content; without a row, the whole content where nothing is, the bytes past
+an append-only regular copy or a symlinked transcript's target, and
+nothing over any other file or node; a `.zst` at its frame's declared
+size). A symlinked transcript's regularization is not in it (M2 round 2,
+item 1: every link's target at once held whole passes back): each link is
+judged as it is copied, and one that does not fit is its own
+`space-refused` line (`DESTINATION_SPACE_INSUFFICIENT`), kept a link, and
+retried by a later pass. Sting's live state is on a file system under the 25%
 floor, so the live run names its floor explicitly. `RESEAT_LANDING_ABSENT`: a landed
 `.claude` or `.codex` the run covers is not a directory (absent, or a
 symlink to a source-only volume such as neo's `/Volumes/...` codex link);

@@ -1,20 +1,39 @@
 //! Destination space preflight (OI-1001-Q2).
 //!
 //! Before the engine commits to writing planned bytes it asks the destination
-//! filesystem (`statvfs`) how much room is left, and refuses
+//! how much room is left, and refuses
 //! [`BulkloadRefusal::DestinationSpaceInsufficient`] when the write would
-//! leave less than the configured share of the filesystem free. The floor is
-//! process-wide: the binary sets it from `--min-free-percent` (default
+//! leave less than the configured share free. The floor is process-wide: the
+//! binary sets it from `--min-free-percent` (default
 //! [`DEFAULT_MIN_FREE_PERCENT`]); a library caller that never sets it gets 0,
 //! which still refuses a write larger than the space available.
+//!
+//! Two limits can bind (M2 round 2, item 1). On XFS (and ext4) with project
+//! quotas, `statvfs` of a directory inside a project-quota tree reports the
+//! PROJECT's limit and use, not the filesystem's. [`probe_limits`] reads the
+//! path's view and, on Linux, the view at the root of the same filesystem
+//! (the mount of the path's device whose root is the filesystem's own root,
+//! from `/proc/self/mountinfo`); when the two report different sizes, the
+//! path's view is a quota and the root's is the filesystem. The floor applies
+//! to each limit on its own: the write must leave `--min-free-percent` of the
+//! quota's limit free under the quota, and the same percent of the
+//! filesystem's size free on the filesystem. A refusal records which limit
+//! bound (`filesystem`, `project-quota` or `both`) and both limits' numbers
+//! ([`last_refusal`]), counted as `space_refused_filesystem` /
+//! `space_refused_quota` and printed by the binary as a `space_refusal` line.
+//! Where the root cannot be found or read (no mountinfo, a device with no
+//! mount of its root, Darwin), the path's view is the filesystem, as before.
 //!
 //! The check is advisory against concurrent writers: another process can fill
 //! the filesystem between the probe and the write. It exists so a planned
 //! cohort cannot, by itself, run a destination out of space.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Mutex;
 
+use crate::counters::{self, Counter};
 use crate::{BulkloadRefusal, Result};
 
 /// The binary's floor when `--min-free-percent` is not given.
@@ -153,8 +172,8 @@ pub fn probe(path: &Path) -> Result<Space> {
     })
 }
 
-/// Probe the filesystem that will hold `destination` and [`check`] `planned`
-/// bytes against the process-wide floor. Zero planned bytes always pass
+/// Probe the limits that will hold `destination` and [`check_at`] `planned`
+/// bytes against the process-wide floor on each. Zero planned bytes always pass
 /// without a probe.
 ///
 /// # Errors
@@ -163,8 +182,346 @@ pub fn preflight(destination: &Path, planned: u64) -> Result<()> {
     if planned == 0 {
         return Ok(());
     }
-    let space = probe(&existing_ancestor(destination)?)?;
-    check(planned, space, min_free_percent())
+    let existing = existing_ancestor(destination)?;
+    let limits = probe_limits(&existing)?;
+    check_at(&existing, (planned, planned), limits, min_free_percent())
+}
+
+/// The limits that bind writes under one path: the filesystem's, and a
+/// project quota's when `statvfs` of the path reports one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// The filesystem holding the path.
+    pub filesystem: Space,
+    /// The project quota the path is under, when its view differs from the
+    /// filesystem's.
+    pub quota: Option<Space>,
+}
+
+impl Limits {
+    /// Limits from the path's own view and, when it could be read, the view
+    /// at its filesystem's root. Different sizes mean the path's view is a
+    /// project quota.
+    #[must_use]
+    pub const fn from_views(path: Space, root: Option<Space>) -> Self {
+        match root {
+            Some(root) if root.total != path.total => Self {
+                filesystem: root,
+                quota: Some(path),
+            },
+            _ => Self {
+                filesystem: path,
+                quota: None,
+            },
+        }
+    }
+
+    /// One limit only: a filesystem with no quota.
+    #[must_use]
+    pub const fn filesystem(space: Space) -> Self {
+        Self {
+            filesystem: space,
+            quota: None,
+        }
+    }
+}
+
+/// Which limit refused a write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    /// The filesystem's free space under the floor.
+    Filesystem,
+    /// The project quota's free space under the floor.
+    ProjectQuota,
+    /// Both.
+    Both,
+}
+
+impl Bound {
+    /// The word printed for it.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Filesystem => "filesystem",
+            Self::ProjectQuota => "project-quota",
+            Self::Both => "both",
+        }
+    }
+}
+
+/// Which limit, if any, refuses the write. `None`: it fits.
+///
+/// `planned` bytes go under the quota and `filesystem_planned` bytes on the
+/// filesystem (they differ when several quota trees share one filesystem),
+/// each judged under `min_free_percent` of that limit's own size.
+#[must_use]
+pub fn bound(
+    planned: u64,
+    filesystem_planned: u64,
+    limits: Limits,
+    min_free_percent: u8,
+) -> Option<Bound> {
+    let filesystem = check(filesystem_planned, limits.filesystem, min_free_percent).is_err();
+    let quota = limits
+        .quota
+        .is_some_and(|quota| check(planned, quota, min_free_percent).is_err());
+    match (filesystem, quota) {
+        (false, false) => None,
+        (true, false) => Some(Bound::Filesystem),
+        (false, true) => Some(Bound::ProjectQuota),
+        (true, true) => Some(Bound::Both),
+    }
+}
+
+/// A refused space check: where, which limit bound, what was planned and
+/// both limits' numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Refused {
+    /// The existing path that was probed.
+    pub path: PathBuf,
+    /// The limit that refused.
+    pub bound: Bound,
+    /// Bytes planned under the quota (or the filesystem, without one).
+    pub planned: u64,
+    /// Bytes planned on the whole filesystem.
+    pub filesystem_planned: u64,
+    /// The floor, in percent of each limit's size.
+    pub min_free_percent: u8,
+    /// The limits read.
+    pub limits: Limits,
+}
+
+impl Refused {
+    /// `key=value` fields (the path last, escaped), as the binary's
+    /// `space_refusal` line prints them.
+    #[must_use]
+    pub fn fields(&self) -> String {
+        let quota = self.limits.quota.map_or_else(
+            || "quota=none".to_owned(),
+            |quota| {
+                format!(
+                    "quota=project quota_total_bytes={} quota_available_bytes={}",
+                    quota.total, quota.available
+                )
+            },
+        );
+        format!(
+            "bound={} planned_bytes={} filesystem_planned_bytes={} min_free_percent={} \
+             filesystem_total_bytes={} filesystem_available_bytes={} {quota} path={}",
+            self.bound.word(),
+            self.planned,
+            self.filesystem_planned,
+            self.min_free_percent,
+            self.limits.filesystem.total,
+            self.limits.filesystem.available,
+            self.path.as_os_str().as_encoded_bytes().escape_ascii(),
+        )
+    }
+}
+
+static LAST_REFUSAL: Mutex<Option<Refused>> = Mutex::new(None);
+
+/// The process's most recent refused space check, if any.
+#[must_use]
+pub fn last_refusal() -> Option<Refused> {
+    LAST_REFUSAL.lock().ok().and_then(|last| last.clone())
+}
+
+/// Judge `planned` bytes (quota) and `filesystem_planned` bytes
+/// (filesystem) at `path` under `limits`: count the check, and on a refusal
+/// count which limit bound and record it for [`last_refusal`].
+///
+/// # Errors
+/// `DESTINATION_SPACE_INSUFFICIENT`.
+pub fn check_at(
+    path: &Path,
+    (planned, filesystem_planned): (u64, u64),
+    limits: Limits,
+    min_free_percent: u8,
+) -> Result<()> {
+    counters::bump(Counter::SpaceChecks);
+    let Some(bound) = bound(planned, filesystem_planned, limits, min_free_percent) else {
+        return Ok(());
+    };
+    if matches!(bound, Bound::Filesystem | Bound::Both) {
+        counters::bump(Counter::SpaceRefusedFilesystem);
+    }
+    if matches!(bound, Bound::ProjectQuota | Bound::Both) {
+        counters::bump(Counter::SpaceRefusedQuota);
+    }
+    if let Ok(mut last) = LAST_REFUSAL.lock() {
+        *last = Some(Refused {
+            path: path.to_owned(),
+            bound,
+            planned,
+            filesystem_planned,
+            min_free_percent,
+            limits,
+        });
+    }
+    Err(BulkloadRefusal::DestinationSpaceInsufficient)
+}
+
+/// The view at the root of the filesystem holding `path` (an existing
+/// path), when it can be found and read: Linux only, from
+/// `/proc/self/mountinfo`. Any failure is `None` (the path's own view is
+/// then the filesystem's).
+#[cfg(target_os = "linux")]
+fn root_view(path: &Path) -> Option<Space> {
+    use std::os::unix::fs::MetadataExt as _;
+    let dev = std::fs::metadata(path).ok()?.dev();
+    let root = filesystem_root(dev)?;
+    probe(&root).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn root_view(_path: &Path) -> Option<Space> {
+    None
+}
+
+/// The mount point of device `dev`'s filesystem root, cached per device.
+#[cfg(target_os = "linux")]
+fn filesystem_root(dev: u64) -> Option<PathBuf> {
+    static ROOTS: Mutex<BTreeMap<u64, Option<PathBuf>>> = Mutex::new(BTreeMap::new());
+    if let Some(found) = ROOTS.lock().ok()?.get(&dev) {
+        return found.clone();
+    }
+    let found = std::fs::read("/proc/self/mountinfo")
+        .ok()
+        .and_then(|table| mount_of_root(&table, libc::major(dev), libc::minor(dev)));
+    ROOTS.lock().ok()?.insert(dev, found.clone());
+    found
+}
+
+/// The mount point of device `major:minor`'s filesystem root.
+///
+/// Read from a `/proc/self/mountinfo` table: the mount whose root is the
+/// filesystem's own root (`/`). A device mounted only below its root (a
+/// bind of a subtree) has none.
+#[must_use]
+pub fn mount_of_root(table: &[u8], major: u32, minor: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let device = format!("{major}:{minor}");
+    table.split(|byte| *byte == b'\n').find_map(|line| {
+        // id parent major:minor root mount-point ...
+        let mut fields = line.split(|byte| *byte == b' ');
+        let (_, _, dev, root, point) = (
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+            fields.next()?,
+        );
+        (dev == device.as_bytes() && root == b"/")
+            .then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&unescape_mountinfo(point))))
+    })
+}
+
+/// Undo mountinfo's octal escapes (`\040` for a space, `\011`, `\012`,
+/// `\134`).
+fn unescape_mountinfo(field: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(field.len());
+    let mut index = 0;
+    while let Some(&byte) = field.get(index) {
+        let octal = field.get(index + 1..index + 4).and_then(|digits| {
+            digits
+                .iter()
+                .all(|digit| (b'0'..=b'7').contains(digit))
+                .then(|| {
+                    digits
+                        .iter()
+                        .fold(0_u32, |value, digit| value * 8 + u32::from(digit - b'0'))
+                })
+                .and_then(|value| u8::try_from(value).ok())
+        });
+        if let (b'\\', Some(value)) = (byte, octal) {
+            out.push(value);
+            index += 4;
+        } else {
+            out.push(byte);
+            index += 1;
+        }
+    }
+    out
+}
+
+/// Probe the limits that bind writes under `path`, which must exist: the
+/// path's view, and the filesystem root's view where it differs (a project
+/// quota).
+///
+/// # Errors
+/// As [`probe`] of `path`; failing to read the root's view is not an error.
+pub fn probe_limits(path: &Path) -> Result<Limits> {
+    let view = probe(path)?;
+    Ok(Limits::from_views(view, root_view(path)))
+}
+
+/// One destination's planned bytes, grouped for a multi-path preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Planned {
+    /// The existing path probed.
+    pub path: PathBuf,
+    /// Its device.
+    pub device: u64,
+    /// Its limits.
+    pub limits: Limits,
+    /// Bytes planned under it.
+    pub bytes: u64,
+}
+
+/// Check bytes planned at several existing paths, probed already.
+///
+/// Paths on one device and under one limit (the same quota, or none) are
+/// summed against that limit, and every path on one device is summed
+/// against its filesystem. The first group that does not fit refuses.
+///
+/// # Errors
+/// `DESTINATION_SPACE_INSUFFICIENT` (recorded, see [`check_at`]).
+pub fn check_planned(planned: &[Planned], min_free_percent: u8) -> Result<()> {
+    let mut devices: BTreeMap<u64, u64> = BTreeMap::new();
+    // A quota is told apart by its limit as probed: two trees on one
+    // device under quotas of the same size are summed together, which errs
+    // towards refusing.
+    let mut groups: BTreeMap<(u64, Option<u64>), (PathBuf, Limits, u64)> = BTreeMap::new();
+    for want in planned.iter().filter(|want| want.bytes > 0) {
+        let device = devices.entry(want.device).or_insert(0);
+        *device = device.saturating_add(want.bytes);
+        let key = (want.device, want.limits.quota.map(|quota| quota.total));
+        let group = groups
+            .entry(key)
+            .or_insert_with(|| (want.path.clone(), want.limits, 0));
+        group.2 = group.2.saturating_add(want.bytes);
+    }
+    for ((device, _), (path, limits, bytes)) in &groups {
+        let on_device = devices.get(device).copied().unwrap_or(*bytes);
+        check_at(path, (*bytes, on_device), *limits, min_free_percent)?;
+    }
+    Ok(())
+}
+
+/// Probe each of `wants`' destinations (the nearest existing ancestor of a
+/// path that does not exist yet) and [`check_planned`] them. Zero planned
+/// bytes are never probed.
+///
+/// # Errors
+/// `DESTINATION_SPACE_INSUFFICIENT`, or a probe's refusal.
+pub fn preflight_many(wants: &[(&Path, u64)], min_free_percent: u8) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut planned = Vec::new();
+    for (path, bytes) in wants.iter().filter(|(_, bytes)| *bytes > 0) {
+        let existing = existing_ancestor(path)?;
+        let device = std::fs::metadata(&existing)
+            .map_err(|error| crate::refuse::io(&error, "space::preflight_many"))?
+            .dev();
+        let limits = probe_limits(&existing)?;
+        planned.push(Planned {
+            path: existing,
+            device,
+            limits,
+            bytes: *bytes,
+        });
+    }
+    check_planned(&planned, min_free_percent)
 }
 
 #[cfg(test)]
@@ -275,5 +632,224 @@ mod tests {
             Err(BulkloadRefusal::DestinationSpaceInsufficient)
         );
         assert_eq!(preflight(&missing, 0), Ok(()));
+    }
+
+    const QUOTA: Space = Space {
+        total: 1_400 * GIB,
+        available: 74 * GIB,
+    };
+    const FILESYSTEM: Space = Space {
+        total: 1_600 * GIB,
+        available: 174 * GIB,
+    };
+
+    #[test]
+    fn a_root_view_of_another_size_makes_the_path_view_a_quota() {
+        let limits = Limits::from_views(QUOTA, Some(FILESYSTEM));
+        assert_eq!(limits.filesystem, FILESYSTEM);
+        assert_eq!(limits.quota, Some(QUOTA));
+        // The same size (no quota, or the path is the root) or no root view:
+        // the path's view is the filesystem's.
+        for root in [Some(QUOTA), None] {
+            assert_eq!(Limits::from_views(QUOTA, root), Limits::filesystem(QUOTA));
+        }
+    }
+
+    #[test]
+    fn each_limit_keeps_the_floor_of_its_own_size_and_the_bound_is_named() {
+        let limits = Limits::from_views(QUOTA, Some(FILESYSTEM));
+        // 5%: the quota keeps 70 of 1400 (5%) after 4 GiB; the filesystem
+        // 170 of 1600.
+        assert_eq!(bound(4 * GIB, 4 * GIB, limits, 5), None);
+        // The quota binds first: 69 left of 1400 is under 5%.
+        assert_eq!(
+            bound(5 * GIB, 5 * GIB, limits, 5),
+            Some(Bound::ProjectQuota)
+        );
+        // 10%: the filesystem (174 - 15 = 159 < 160) binds while the quota
+        // (floor 140, 74 free) already did.
+        assert_eq!(bound(15 * GIB, 15 * GIB, limits, 10), Some(Bound::Both));
+        // Bytes planned elsewhere on the filesystem count there only.
+        let roomy = Limits {
+            filesystem: FILESYSTEM,
+            quota: Some(Space {
+                total: 100 * GIB,
+                available: 90 * GIB,
+            }),
+        };
+        assert_eq!(bound(GIB, 20 * GIB, roomy, 10), Some(Bound::Filesystem));
+        assert_eq!(bound(GIB, GIB, roomy, 10), None);
+        // Without a quota only the filesystem is judged, as before.
+        assert_eq!(
+            bound(15 * GIB, 15 * GIB, Limits::filesystem(FILESYSTEM), 10),
+            Some(Bound::Filesystem)
+        );
+    }
+
+    #[test]
+    fn a_refusal_records_the_bound_and_both_numbers() {
+        let path = Path::new("/srv/fast-local/jess/git");
+        let limits = Limits::from_views(QUOTA, Some(FILESYSTEM));
+        let refused_quota = crate::counters::Counters::snapshot();
+        assert_eq!(check_at(path, (GIB, GIB), limits, 5), Ok(()));
+        assert_eq!(
+            check_at(path, (5 * GIB, 5 * GIB), limits, 5),
+            Err(BulkloadRefusal::DestinationSpaceInsufficient)
+        );
+        let after = crate::counters::Counters::snapshot();
+        assert!(
+            after.get(Counter::SpaceRefusedQuota) > refused_quota.get(Counter::SpaceRefusedQuota)
+        );
+        assert!(after.get(Counter::SpaceChecks) >= refused_quota.get(Counter::SpaceChecks) + 2);
+        // Other tests in this process may record a refusal too; this one's
+        // fields are checked directly.
+        let refused = Refused {
+            path: path.to_owned(),
+            bound: Bound::ProjectQuota,
+            planned: 5 * GIB,
+            filesystem_planned: 5 * GIB,
+            min_free_percent: 5,
+            limits,
+        };
+        assert_eq!(
+            refused.fields(),
+            format!(
+                "bound=project-quota planned_bytes={} filesystem_planned_bytes={} \
+                 min_free_percent=5 filesystem_total_bytes={} filesystem_available_bytes={} \
+                 quota=project quota_total_bytes={} quota_available_bytes={} \
+                 path=/srv/fast-local/jess/git",
+                5 * GIB,
+                5 * GIB,
+                1_600 * GIB,
+                174 * GIB,
+                1_400 * GIB,
+                74 * GIB
+            )
+        );
+        assert!(last_refusal().is_some());
+        let plain = Refused {
+            limits: Limits::filesystem(FILESYSTEM),
+            bound: Bound::Filesystem,
+            ..refused
+        };
+        assert!(
+            plain.fields().contains("bound=filesystem "),
+            "{}",
+            plain.fields()
+        );
+        assert!(
+            plain.fields().contains(" quota=none "),
+            "{}",
+            plain.fields()
+        );
+    }
+
+    #[test]
+    fn the_root_mount_of_a_device_is_found_and_a_subtree_bind_is_not_it() {
+        let table = b"22 1 253:0 / / rw,relatime shared:1 - xfs /dev/mapper/rl-root rw\n\
+            97 22 253:5 /jess/git /home/jess/git rw,relatime shared:2 - xfs /dev/mapper/fast rw,prjquota\n\
+            98 22 253:5 / /srv/fast\\040local rw,relatime shared:3 - xfs /dev/mapper/fast rw,prjquota\n\
+            99 22 253:7 /sub /mnt/sub rw - xfs /dev/mapper/other rw\n";
+        assert_eq!(
+            mount_of_root(table, 253, 5),
+            Some(PathBuf::from("/srv/fast local"))
+        );
+        assert_eq!(mount_of_root(table, 253, 0), Some(PathBuf::from("/")));
+        // Only a subtree of 253:7 is mounted: no root view.
+        assert_eq!(mount_of_root(table, 253, 7), None);
+        assert_eq!(mount_of_root(table, 8, 1), None);
+        assert_eq!(mount_of_root(b"", 253, 5), None);
+        assert_eq!(unescape_mountinfo(br"a\011b\134c\012"), b"a\tb\\c\n");
+        // Not an escape: kept as it is.
+        assert_eq!(unescape_mountinfo(br"a\9b\0"), br"a\9b\0");
+    }
+
+    #[test]
+    fn planned_bytes_sum_per_quota_and_per_filesystem() {
+        let quota_a = Space {
+            total: 100 * GIB,
+            available: 30 * GIB,
+        };
+        let quota_b = Space {
+            total: 200 * GIB,
+            available: 150 * GIB,
+        };
+        let filesystem = Space {
+            total: 1_000 * GIB,
+            available: 300 * GIB,
+        };
+        let at = |path: &str, quota, bytes| Planned {
+            path: PathBuf::from(path),
+            device: 5,
+            limits: Limits::from_views(quota, Some(filesystem)),
+            bytes,
+        };
+        // Two paths under quota A share its 30 GiB: 10 + 10 leaves 10 of
+        // 100 (10%) free.
+        let fits = [
+            at("/a/one", quota_a, 10 * GIB),
+            at("/a/two", quota_a, 10 * GIB),
+            at("/b", quota_b, 40 * GIB),
+        ];
+        assert_eq!(check_planned(&fits, 10), Ok(()));
+        let over = [
+            at("/a/one", quota_a, 10 * GIB),
+            at("/a/two", quota_a, 10 * GIB + 1),
+        ];
+        assert_eq!(
+            check_planned(&over, 10),
+            Err(BulkloadRefusal::DestinationSpaceInsufficient)
+        );
+        // Each quota fits on its own, but together they take the filesystem
+        // (300 free, floor 100) under its floor.
+        let together = [
+            at("/a", quota_a, 20 * GIB),
+            at("/b", quota_b, 130 * GIB),
+            at(
+                "/c",
+                Space {
+                    total: 500 * GIB,
+                    available: 400 * GIB,
+                },
+                60 * GIB,
+            ),
+        ];
+        assert_eq!(
+            check_planned(&together, 10),
+            Err(BulkloadRefusal::DestinationSpaceInsufficient)
+        );
+        // Zero bytes are never judged.
+        assert_eq!(check_planned(&[at("/a", quota_a, 0)], 100), Ok(()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn this_hosts_limits_read_through_mountinfo() {
+        let root = tempfile::tempdir().unwrap();
+        let limits = probe_limits(root.path()).unwrap();
+        assert!(limits.filesystem.total > 0);
+        if let Some(quota) = limits.quota {
+            // Only a project quota reads differently from its filesystem.
+            assert_ne!(quota.total, limits.filesystem.total);
+        }
+    }
+
+    /// A live reading of a real project-quota tree, read-only: set
+    /// `BULKLOAD_QUOTA_PROBE` to a directory inside one (on sting,
+    /// `/srv/cache/jess`, whose `statvfs` reports its 360 GB quota while
+    /// `/srv/cache` reports the 400 GB filesystem) and run it ignored.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "needs BULKLOAD_QUOTA_PROBE: a directory inside a project quota"]
+    fn a_real_project_quota_is_told_from_its_filesystem() {
+        let path = PathBuf::from(std::env::var_os("BULKLOAD_QUOTA_PROBE").unwrap());
+        let limits = probe_limits(&path).unwrap();
+        assert!(
+            limits
+                .quota
+                .is_some_and(|quota| quota.total < limits.filesystem.total),
+            "{limits:?}"
+        );
+        println!("{limits:?}");
     }
 }

@@ -232,10 +232,17 @@ fn same_stream(a: &Path, b: &Path) -> bool {
 /// The bytes a placement of `landed` at `dest` would write at most, for
 /// the free-space check.
 ///
-/// Nothing for a landed file the ledger already holds
-/// unchanged or a destination file the destination owns, the new tail of
-/// this ledger's own placement, else the whole content (decompressed for a
-/// `.zst`: its frame's declared size, or the stream counted).
+/// Nothing for a landed file the ledger already holds unchanged (or one the
+/// destination continued); the new tail of this ledger's own append-only
+/// placement, the whole content of its changed other file (a supersede).
+/// Without a row that decides it (M2 round 2, item 1), what is at `dest`
+/// decides, as the placement does: the whole content where nothing is; at
+/// most the bytes past it where an append-only regular file with one link
+/// is (equal is adopted, a prefix extended, anything else kept), or where
+/// an append-only symlink to a regular file is (a regularization copies its
+/// target first); nothing where another regular file (adopted or kept),
+/// another symlink or any other node is (never written). The content is decompressed for a `.zst`: its
+/// frame's declared size, or the stream counted.
 ///
 /// # Errors
 /// Ledger and I/O refusals.
@@ -256,11 +263,30 @@ pub fn planned(ledger: Option<&Ledger>, dest: &Path, landed: &Path) -> Result<u6
     {
         return Ok(0);
     }
-    let size = content_size(landed, &meta)?;
-    Ok(match row {
-        Some(row) if row.state.owned() => size.saturating_sub(row.placed),
-        _ => size,
-    })
+    if let Some(row) = row.as_ref().filter(|row| row.state.owned()) {
+        let size = content_size(landed, &meta)?;
+        return Ok(if appendable(dest) {
+            size.saturating_sub(row.placed)
+        } else {
+            size
+        });
+    }
+    match lstat(dest)? {
+        None => content_size(landed, &meta),
+        Some(found) if found.is_file() && found.nlink() == 1 && appendable(dest) => {
+            Ok(content_size(landed, &meta)?.saturating_sub(found.len()))
+        }
+        // A symlinked transcript a regularization turns into a regular copy
+        // of its target first (charged per link as it copies): at most the
+        // bytes past that copy are then appended.
+        Some(found) if found.is_symlink() && appendable(dest) => match std::fs::metadata(dest) {
+            Ok(target) if target.is_file() => {
+                Ok(content_size(landed, &meta)?.saturating_sub(target.len()))
+            }
+            _ => Ok(0),
+        },
+        Some(_) => Ok(0),
+    }
 }
 
 /// The content size of a landed file: its size, or a `.zst`'s
