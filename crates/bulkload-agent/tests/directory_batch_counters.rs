@@ -14,12 +14,13 @@ use bulkload_agent::transfer::copy;
 
 #[test]
 fn four_sibling_directories_take_one_pending_commit_and_ride_the_last_group() {
-    // The group counts below assume each run's four outputs share one
-    // destination group. Under heavy host load the default 250 ms idle can
-    // close a group between two of them (seen at load ~90: batched
-    // `DurableGroups` 2, folded 1). A long idle keeps the count about the
-    // fold, not the scheduler; the 1 s group age still bounds it. This test
-    // is its own binary, so the variable reaches no other test.
+    // The counts below are about the fold, and assume each run's four
+    // outputs share one destination group. Under heavy host load the group
+    // idle (250 ms) or age (1 s) can close a group between two of them (seen
+    // at load ~90: batched `DurableGroups` 2, folded 1), which moves the
+    // seal count by a group's seals. Pin a long idle, and take the first of
+    // a few attempts in which every run kept one group. This test is its
+    // own binary, so the variable reaches no other test.
     std::env::set_var(bulkload_agent::transfer::DEST_GROUP_IDLE_ENV, "60000");
     let base = std::env::temp_dir().join(format!("bulkload-dir-batch-{}", std::process::id()));
     let source = base.join("source");
@@ -72,9 +73,16 @@ fn four_sibling_directories_take_one_pending_commit_and_ride_the_last_group() {
             ),
         )
     };
-    let (folded, folded_seals) = run("folded", Some(64), true);
-    let (batched, batched_seals) = run("batched", Some(64), false);
-    let (alone, _) = run("alone", Some(1), true);
+    let mut attempt = 0;
+    let (folded, folded_seals, batched, batched_seals, alone) = loop {
+        attempt += 1;
+        let (folded, folded_seals) = run(&format!("folded-{attempt}"), Some(64), true);
+        let (batched, batched_seals) = run(&format!("batched-{attempt}"), Some(64), false);
+        let (alone, _) = run(&format!("alone-{attempt}"), Some(1), true);
+        if (folded_seals.2 == 1 && batched_seals.2 == 1) || attempt == 5 {
+            break (folded, folded_seals, batched, batched_seals, alone);
+        }
+    };
     let _ = std::fs::remove_dir_all(&base);
     let _ = destination;
     assert_eq!(
