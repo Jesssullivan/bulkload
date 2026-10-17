@@ -148,8 +148,8 @@ PR #251, design only: `2026-10-16-estate-move-design.md`.
 | --- | --- | --- |
 | 1 parents | #245 | merged a283db5 |
 | 2 kept directories | #247 | merged 6ab67e0 |
-| 3 priority | #249 | merged (head 4f503b3) |
-| 4 install | #250 | merged (head 4cc2af8) |
+| 3 priority | #249 | merged 780db1e |
+| 4 install | #250 | merged e352200 |
 | 5 retarget | #252 | refuted and fixed; gate pending (resume) |
 | 6 partial / inventory | #253 | refuted and fixed; gate pending |
 | 7 estate-move design | #251 | docs; gate pending |
