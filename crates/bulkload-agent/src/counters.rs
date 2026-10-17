@@ -362,6 +362,14 @@ counters! {
     ReseatDestRead => "read_reseat_dest_bytes",
     // Bytes written into the destination's live agent state.
     ReseatDestWrite => "write_reseat_dest_bytes",
+    // Bounded starvation (M2 item 3): a process at background priority
+    // whose counters did not move for `--escalate-after` seconds moved its
+    // IO back to the normal class once (`priority::escalate`): how many
+    // times (0 or 1), when (nanoseconds from start), and how many threads
+    // (its own and its descendants' on Linux; 1, the process, on Darwin).
+    PriorityEscalations => "priority_escalations",
+    PriorityEscalatedNs => "priority_escalated_ns",
+    PriorityEscalatedThreads => "priority_escalated_threads",
 }
 
 const COUNT: usize = Counter::ALL.len();

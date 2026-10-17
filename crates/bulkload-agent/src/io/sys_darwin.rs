@@ -271,6 +271,40 @@ pub fn enter_background() -> io::Result<()> {
     super::sys_posix::nice_background()
 }
 
+/// `IOPOL_DEFAULT`: the disk IO policy an unprioritised process has.
+const IOPOL_DEFAULT: libc::c_int = 0;
+
+/// Bounded starvation (M2 item 3): set the process-wide disk IO policy back
+/// to `IOPOL_DEFAULT`, so this process's own IO and every child it starts
+/// from now on are no longer throttled behind other IO. Darwin offers no
+/// call that changes a running child's policy, and a thread's `QoS` class
+/// can only be changed by that thread, so a child already running and the
+/// threads' background `QoS` stay as they were (a stated residual). Nice
+/// stays 19. Returns 1, the process.
+///
+/// # Errors
+/// Returns the `setiopolicy_np` failure.
+pub fn escalate_io() -> io::Result<u64> {
+    // SAFETY: `setiopolicy_np` takes three integers and no pointers.
+    if unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_DEFAULT) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(1)
+}
+
+/// Whether the process-wide disk IO policy is `IOPOL_THROTTLE`.
+///
+/// # Errors
+/// Returns the `getiopolicy_np` failure.
+pub fn io_idle() -> io::Result<bool> {
+    // SAFETY: `getiopolicy_np` takes two integers and no pointers.
+    let policy = unsafe { getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS) };
+    if policy == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(policy == IOPOL_THROTTLE)
+}
+
 /// Whether the process runs at background priority: the `IOPOL_THROTTLE`
 /// disk policy, the calling thread at `QOS_CLASS_BACKGROUND`, and nice 19.
 ///

@@ -570,6 +570,92 @@ pub fn enter_background() -> io::Result<()> {
     Ok(())
 }
 
+/// The best-effort IO class: what an unprioritised Linux thread gets.
+const IOPRIO_CLASS_BE: libc::c_int = 2;
+/// Its middle level, the default for nice 0 (`linux/ioprio.h`).
+const IOPRIO_BE_NORMAL: libc::c_int = 4;
+
+/// Bounded starvation (M2 item 3): move every thread of this process, and
+/// every thread of each live descendant (its Git children and theirs), from
+/// the idle IO class to best effort, the class an unprioritised thread
+/// has. Nice stays 19: an unprivileged process cannot raise it back, and
+/// the idle IO class, not the CPU share, is what starves a reader behind a
+/// busy disk. A thread or process that ended meanwhile is skipped. Touches
+/// only this process's own descendants, found through
+/// `/proc/<pid>/task/<tid>/children`; it sends no signal (R-N11).
+///
+/// # Errors
+/// Returns a failure to list this process's own threads, or an
+/// `ioprio_set` failure other than `ESRCH`. Returns the number of threads
+/// moved.
+pub fn escalate_io() -> io::Result<u64> {
+    let mut moved = 0;
+    let mut pending = vec![std::process::id()];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(pid) = pending.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        let tasks = match std::fs::read_dir(format!("/proc/{pid}/task")) {
+            Ok(tasks) => tasks,
+            // A descendant that ended meanwhile.
+            Err(_) if pid != std::process::id() => continue,
+            Err(error) => return Err(error),
+        };
+        for task in tasks {
+            let Some(tid) = task?
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<libc::c_int>().ok())
+            else {
+                continue;
+            };
+            // SAFETY: `ioprio_set` takes three integers and no pointers;
+            // `tid` names one thread of this process or of a descendant.
+            let ret = unsafe {
+                libc::syscall(
+                    libc::SYS_ioprio_set,
+                    IOPRIO_WHO_PROCESS,
+                    tid,
+                    (IOPRIO_CLASS_BE << IOPRIO_CLASS_SHIFT) | IOPRIO_BE_NORMAL,
+                )
+            };
+            if ret == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
+                continue;
+            }
+            moved += 1;
+            if let Ok(children) =
+                std::fs::read_to_string(format!("/proc/{pid}/task/{tid}/children"))
+            {
+                pending.extend(
+                    children
+                        .split_ascii_whitespace()
+                        .filter_map(|child| child.parse::<u32>().ok()),
+                );
+            }
+        }
+    }
+    Ok(moved)
+}
+
+/// Whether the calling thread is in the idle IO class.
+///
+/// # Errors
+/// Returns the `ioprio_get` failure.
+pub fn io_idle() -> io::Result<bool> {
+    // SAFETY: `ioprio_get` takes two integers and no pointers; `who` 0
+    // names the calling thread.
+    let ioprio = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
+    if ioprio == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ioprio >> IOPRIO_CLASS_SHIFT == libc::c_long::from(IOPRIO_CLASS_IDLE))
+}
+
 /// Whether the calling thread runs at background priority: nice 19 and the
 /// idle IO class, exactly as [`enter_background`] leaves it.
 ///

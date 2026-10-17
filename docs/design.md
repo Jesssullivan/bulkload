@@ -261,6 +261,38 @@ Source safety (S2, WP1):
   remote host (WP0(f) covers only the local verb; #188). `--priority=normal`
   is the explicit, recorded opt-out; every
   counters line and the bench header record the class.
+- **Bounded starvation (M2 item 3, 2026-10-16; `priority.rs`).** On neo
+  an `estate-capture` at background priority had a Git child in
+  uninterruptible IO for 25 minutes while a normal-priority `serve` read
+  the same disk: a throttled (Darwin) or idle-class (Linux) reader is
+  served only when no other IO is pending, so a busy disk starves it
+  without bound. Two rules bound it, by the operator's M2 instruction
+  (the WP0(f) default stands for every other source-side verb):
+  - `estate-capture` defaults to `--priority=auto`: background when a
+    terminal was read within 300 s (a person at the host: the access time
+    of `/dev/pts/*` and `/dev/tty*` on Linux, `/dev/ttys*` and
+    `/dev/console` on Darwin, as `w` reports idle), normal otherwise; an
+    unreadable `/dev` counts as a person present. The counters line says
+    `priority_from=auto priority_auto=idle|interactive|unknown`. Activity
+    in a graphical session alone is not seen (a residual; the HID idle
+    time is the follow-up). `--priority=auto` works for any verb.
+  - Every process that starts at background runs a watcher thread that
+    samples its counters each second. After `--escalate-after=SECONDS`
+    (default 300; 0 turns it off) with no counter movement, it moves the
+    process's IO back to the normal class once: on Linux every thread of
+    the process and of each live descendant (its Git children and theirs,
+    found through `/proc/<pid>/task/<tid>/children`) leaves the idle class
+    for best effort; on Darwin the process disk policy goes back to
+    `IOPOL_DEFAULT`, for the process and every later child. Darwin cannot
+    change a running child's policy or another thread's `QoS` from outside
+    (a residual: the child that is starving keeps its throttle until it
+    exits), and nice stays 19 everywhere (an unprivileged process cannot
+    raise it back). Recorded as `priority_escalations` (0 or 1),
+    `priority_escalated_ns` (from start) and `priority_escalated_threads`.
+    No signal is sent to anything (R-N11).
+  - Not built: escalation for the remote `serve` of a `pull` (it is the
+    same binary, so it has the watcher, but the destination cannot see
+    it), and a de-escalation when a person returns.
 - `serve` and `copy` refuse a private state root that overlaps the source
   (`SNAPSHOT_ROOTS_OVERLAP`) before any store is created.
 - No clone of a source file (OI-1003-Q165).
