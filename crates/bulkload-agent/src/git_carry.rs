@@ -10103,30 +10103,28 @@ mod tests {
     }
 
     // M2r2 item 6 review: a pointer is raw bytes, as Git reads it. A
-    // non-UTF-8 gitdir naming another repository is a foreign nest, not
-    // malformed inventory; a pointer without the `gitdir: ` prefix still is.
+    // non-UTF-8 gitdir naming an administration absent on this host is
+    // stale and named, no longer an unreadable bare GIT_INVENTORY_MALFORMED;
+    // a pointer without the `gitdir: ` prefix still is malformed. (A
+    // non-UTF-8 path to a readable foreign repository still refuses
+    // malformed in the nest's own Git reads, whose output is text.)
     #[test]
-    fn a_non_utf8_pointer_to_a_foreign_repository_is_custody() {
-        use std::os::unix::ffi::OsStrExt;
+    fn a_non_utf8_stale_pointer_is_named() {
         let root = fresh("bulkload-non-utf8-pointer");
         let source = root.join("main");
         committed_repository(&source, b"main");
-        let elsewhere = root.join(std::ffi::OsStr::from_bytes(b"else\xffwhere"));
-        committed_repository(&elsewhere, b"inner");
-        let inner = source.join("vendor/inner");
-        fs::create_dir_all(&inner).unwrap();
-        fs::write(inner.join("tracked"), b"inner").unwrap();
-        let mut pointer = b"gitdir: ".to_vec();
-        pointer.extend_from_slice(elsewhere.join(".git").as_os_str().as_bytes());
-        pointer.push(b'\n');
-        fs::write(inner.join(".git"), &pointer).unwrap();
-        fs::write(source.join(".gitignore"), b"vendor/\n").unwrap();
-        let nests = nested_repositories(&source);
-        fs::write(inner.join(".git"), b"gitdir:no-space\n").unwrap();
+        fs::write(source.join(".gitignore"), b"archive/\n").unwrap();
+        let copy = source.join("archive/copy");
+        fs::create_dir_all(&copy).unwrap();
+        fs::write(copy.join(".git"), b"gitdir: /nowhere/\xff/.git/worktrees/x\n").unwrap();
+        let stale = reusable_capture_key(&source);
+        fs::write(copy.join(".git"), b"gitdir:no-space\n").unwrap();
         let malformed = reusable_capture_key(&source);
         fs::remove_dir_all(root).unwrap();
-        let nests = nests.unwrap();
-        assert_eq!(nests.len(), 1, "{nests:?}");
+        assert_eq!(
+            stale,
+            Err(BulkloadRefusal::GitNestPointerStale(b"archive/copy".to_vec()))
+        );
         assert_eq!(malformed, Err(BulkloadRefusal::GitInventoryMalformed));
     }
 

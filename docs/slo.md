@@ -1721,12 +1721,13 @@ the cause.
 - **Existing codes at fewer sites.** A live nested worktree registered by a
   relative path (`--relative-paths`, Git 2.48) is custody. It no longer
   refuses: the registered path is read against the administration
-  directory. A non-UTF-8 pointer naming a readable repository is a nest,
-  not `GIT_INVENTORY_MALFORMED`.
+  directory. A pointer is read as raw bytes, so a non-UTF-8 pointer naming
+  an absent administration is `GIT_NEST_POINTER_STALE` with its path.
 - **Old records.** No code left the taxonomy. A record written before this
   change keeps `GIT_INVENTORY_MALFORMED`; a rerun records the new code, and
   only that record can be dispositioned under it.
 - **Still open.** The census reports the first such directory per item, not
   all of them. Other malformed pointers (a symlinked, empty, oversized or
   prefix-less `.git`) still refuse `GIT_INVENTORY_MALFORMED` without a
-  path.
+  path, and so does a non-UTF-8 path to a readable foreign repository (the
+  nest's own Git reads are text).
