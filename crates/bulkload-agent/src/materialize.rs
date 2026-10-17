@@ -457,16 +457,17 @@ impl Destination {
     /// and mode. Any other record is cleared, so it can never adopt later. A
     /// directory with no owning record is never adopted: its mode is never
     /// changed and no record binds it. One whose mode equals the source's is
-    /// entered as before. One whose mode differs is entered too, its mode
+    /// entered as before. One whose mode differs is accepted too, its mode
     /// kept and reported ([`Creation::mode_kept`], `dest_directory_mode_kept`),
     /// when it is this user's, gives its owner read, write and search, and
-    /// grants nothing the source's mode does not (M2 item 2: a copy of an
-    /// unfinished landing, 0700 under a 0755 source, refused every directory
-    /// and so every file below it). Each entry inside is then decided as in
-    /// any existing directory: a file is adopted only when its bytes verify
-    /// against the source's, and refused `DESTINATION_OCCUPIED`, never
-    /// replaced, when they do not. Any other divergent mode (wider than the
-    /// source's, another owner, no owner access) fails closed. An existing
+    /// grants nobody else anything the source's mode does not (M2 item 2: a
+    /// copy of an unfinished landing, 0700 under a 0755 source, refused every
+    /// directory of the copy, 160 of them, and the pull exited 1; the files
+    /// below were decided all the same). Such a directory never converges to
+    /// the source's mode: that would adopt it. Any other divergent mode
+    /// (wider than the source's, another owner, no owner access) is refused
+    /// `DESTINATION_OCCUPIED`, and only its own row: the entries below it are
+    /// decided as before (a stated gap, #248). An existing
     /// directory is swept of this store's orphaned temporaries.
     ///
     /// # Errors
@@ -2843,9 +2844,14 @@ const INTENT: (u64, u64) = (0, 0);
 /// Whether an existing directory this store does not own, with mode `found`
 /// where the source's is `source`, is entered with its mode kept (M2 item
 /// 2): it is this user's (`uid`), its owner can read, write and search it,
-/// and it grants nothing `source` does not (no wider bit, no special bit).
+/// and it grants nobody else anything `source` does not (no group, other or
+/// special bit the source lacks). The owner's own bits are not compared:
+/// an unfinished landing's 0700 directory under a read-only 0555 or 0500
+/// source exposes nothing.
 fn kept_mode(found: u32, source: u32, uid: u32) -> bool {
-    uid == crate::io::sys::effective_uid() && found & 0o700 == 0o700 && found & !source == 0
+    uid == crate::io::sys::effective_uid()
+        && found & 0o700 == 0o700
+        && found & !source & 0o7077 == 0
 }
 
 /// Whether `directory` is still exactly what the fallback `mkdirat` made: an

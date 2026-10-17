@@ -72,8 +72,11 @@ fn outcome(stats: &TransferStats) -> String {
     left.sort();
     let mut fallback = stats.directories_fallback.clone();
     fallback.sort();
+    let mut kept = stats.directories_mode_kept.clone();
+    kept.sort();
     format!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={refusals:?} \
+         kept={kept:?} \
          temporaries_removed={} left={} directories_renamed={} fallback={fallback:?} \
          unrowed_adopted={} unrowed_unproven={} engine={:?}",
         stats.completed,
@@ -725,6 +728,7 @@ fn three_runs(cap: usize) -> Vec<(String, Tree)> {
         ("old/inner", 0o751),
         ("other", 0o755),
         ("same", 0o755),
+        ("kept", 0o755),
     ]
     .into_iter()
     .map(|(path, mode)| (path.to_owned(), mode))
@@ -732,7 +736,9 @@ fn three_runs(cap: usize) -> Vec<(String, Tree)> {
     batch_tree(&corpus, &first, &["old/five".to_owned()]);
     // `other` is wider than the source's 0755 (M2 item 2: a narrower one
     // is entered with its mode kept), so it is refused.
-    for (path, mode) in [("same", 0o755), ("other", 0o775)] {
+    // `kept` is narrower (M2 item 2): accepted with its mode kept, at every
+    // batch size.
+    for (path, mode) in [("same", 0o755), ("other", 0o775), ("kept", 0o700)] {
         let at = corpus.base.join("destination").join(path);
         std::fs::create_dir(&at).unwrap();
         std::fs::set_permissions(&at, std::fs::Permissions::from_mode(mode)).unwrap();

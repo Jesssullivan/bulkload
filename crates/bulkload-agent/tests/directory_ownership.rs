@@ -187,9 +187,9 @@ fn stale_record_is_cleared_and_never_adopts_later() {
 
 /// A source mode change between a crash and the resume: the record names
 /// the old mode, so it is cleared and never adopts. Since M2 item 2 the
-/// unfinished 0700 directory grants nothing the new mode does not, so it is
-/// entered with its mode kept and reported, not refused; a new mode that
-/// does not give the owner read, write and search still fails closed.
+/// unfinished 0700 directory grants nobody else anything the new mode does
+/// not, so it is accepted with its mode kept and reported, not refused,
+/// read-only new modes included; one wider than the new mode is refused.
 #[test]
 fn mode_change_between_crash_and_resume_keeps_the_directory_unadopted() {
     let scratch = Scratch::new("wedge");
@@ -212,39 +212,68 @@ fn mode_change_between_crash_and_resume_keeps_the_directory_unadopted() {
     resumed.finish_directories(&store).unwrap();
     assert_eq!(mode(&destination.join("nested")), 0o700);
     assert_eq!(store.directory_record(&key(&row)).unwrap(), None);
-    // 0700 grants the owner what 0500 does not: fails closed.
+    // A read-only new mode: the owner's own bits are not compared.
     changed.mode = 0o40_500;
-    let mut narrower = Destination::open(&destination, &store).unwrap();
+    let mut read_only = Destination::open(&destination, &store).unwrap();
+    read_only.directory(&changed, &store, b"authority").unwrap();
+    assert_eq!(
+        read_only.created().mode_kept,
+        vec![(b"nested".to_vec(), 0o700, 0o500)]
+    );
+    // Wider than the new mode for others: refused.
+    std::fs::set_permissions(
+        destination.join("nested"),
+        std::fs::Permissions::from_mode(0o705),
+    )
+    .unwrap();
+    let mut wider = Destination::open(&destination, &store).unwrap();
     assert!(matches!(
-        narrower.directory(&changed, &store, b"authority"),
+        wider.directory(&changed, &store, b"authority"),
         Err(BulkloadRefusal::DestinationOccupied)
     ));
-    assert_eq!(mode(&destination.join("nested")), 0o700);
+    assert_eq!(mode(&destination.join("nested")), 0o705);
 }
 
 /// M2 item 2 (2026-10-16): the in-place run pulled into a copy of an
 /// unfinished landing (directories 0700 under a 0755 source) with a store
-/// that owned none of them, and every directory refused
-/// `DESTINATION_OCCUPIED`, so nothing below them was decided. Now each such
-/// directory is entered with its mode kept and reported, and every file in
-/// it is proved by content: one equal to the source's is adopted in place
-/// (same inode, no byte sent), one that differs is refused and left byte
-/// for byte, and an absent one is published.
+/// that owned none of them, and every directory of the copy refused
+/// `DESTINATION_OCCUPIED`. Now each such directory is accepted with its mode
+/// kept and reported, so the only refusal left is the file whose bytes
+/// differ: one equal to the source's is adopted in place (same inode), one
+/// that differs is refused and left byte for byte, an absent one is
+/// published, and a read-only (0555) source directory copied as 0700 is
+/// accepted too.
 #[test]
-fn a_copied_unfinished_tree_is_entered_and_its_files_proved_by_content() {
+fn a_copied_unfinished_tree_is_accepted_and_its_files_proved_by_content() {
     let scratch = Scratch::new("copied");
     let source = scratch.0.join("source");
     let destination = scratch.0.join("destination");
-    for dir in ["a", "a/b"] {
+    for dir in ["a", "a/b", "ro"] {
         std::fs::create_dir(source.join(dir)).unwrap();
-        std::fs::set_permissions(source.join(dir), std::fs::Permissions::from_mode(0o755)).unwrap();
         private_directory(&destination.join(dir));
     }
     std::fs::write(source.join("a/b/equal"), b"the same bytes\n").unwrap();
     std::fs::write(source.join("a/b/differs"), b"the source's bytes\n").unwrap();
     std::fs::write(source.join("a/absent"), b"only at the source\n").unwrap();
+    std::fs::write(source.join("ro/kept"), b"read-only tree\n").unwrap();
     std::fs::write(destination.join("a/b/equal"), b"the same bytes\n").unwrap();
     std::fs::write(destination.join("a/b/differs"), b"the destination's\n").unwrap();
+    std::fs::write(destination.join("ro/kept"), b"read-only tree\n").unwrap();
+    for (path, file_mode) in [
+        ("a/b/equal", 0o644),
+        ("a/b/differs", 0o644),
+        ("a/absent", 0o644),
+        ("ro/kept", 0o644),
+    ] {
+        for root in [&source, &destination] {
+            std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(file_mode))
+                .ok();
+        }
+    }
+    for (dir, dir_mode) in [("a", 0o755), ("a/b", 0o755), ("ro", 0o555)] {
+        std::fs::set_permissions(source.join(dir), std::fs::Permissions::from_mode(dir_mode))
+            .unwrap();
+    }
     let equal_ino = std::fs::metadata(destination.join("a/b/equal"))
         .unwrap()
         .ino();
@@ -252,6 +281,7 @@ fn a_copied_unfinished_tree_is_entered_and_its_files_proved_by_content() {
     std::thread::sleep(std::time::Duration::from_millis(2_100));
 
     let stats = scratch.copy();
+    std::fs::set_permissions(source.join("ro"), std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
         stats.refusals,
         vec![(b"a/b/differs".to_vec(), "DESTINATION_OCCUPIED".to_owned())],
@@ -263,7 +293,8 @@ fn a_copied_unfinished_tree_is_entered_and_its_files_proved_by_content() {
         kept,
         vec![
             (b"a".to_vec(), 0o700, 0o755),
-            (b"a/b".to_vec(), 0o700, 0o755)
+            (b"a/b".to_vec(), 0o700, 0o755),
+            (b"ro".to_vec(), 0o700, 0o555),
         ]
     );
     assert_eq!(
@@ -282,8 +313,8 @@ fn a_copied_unfinished_tree_is_entered_and_its_files_proved_by_content() {
         std::fs::read(destination.join("a/absent")).unwrap(),
         b"only at the source\n"
     );
-    for dir in ["a", "a/b"] {
-        assert_eq!(mode(&destination.join(dir)), 0o700, "{dir} widened");
+    for dir in ["a", "a/b", "ro"] {
+        assert_eq!(mode(&destination.join(dir)), 0o700, "{dir} changed");
     }
 }
 
