@@ -2164,8 +2164,6 @@ to the old destination; a tree moved there by hand is re-keyed by
 `estate-apply --adopt`, A11b) and the capture's private STATE (per-export
 attempt directories; the next capture writes the new outcome records).
 
-||||||| 6ab67e0
-
 ## Installing the agent (M2 item 4, 2026-10-16)
 
 A `bulkload-agent` built inside `nix develop` is dynamically linked
