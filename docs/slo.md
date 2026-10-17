@@ -1583,7 +1583,11 @@ session re-seat", and the receipt
   `RESEAT_LANE_UNMAPPED:rollout-root` in `--check` too.
 - **S5, as ruled:** the destination's own Codex row or rollout form for a
   thread is never replaced and nothing is placed beside it, for rollouts
-  with no snapshot row too (the MAJOR); a destination file with more than
+  with no snapshot row too (the MAJOR); since the operator's M2 round 2
+  (2026-10-17) such a thread is `adopted` (the row's file holds the landed
+  lines) or `destination-holds`, not a refusal, and every destination row
+  spelled through the home's `git` or a `--map` symlink is re-spelled,
+  lane or not; a destination file with more than
   one link is never written. Two destination changes are ruled
   (OI-1003-Q198): an existing row whose `cwd` only spells the lane through
   a symlink gets that column re-spelled, and a symlinked transcript is

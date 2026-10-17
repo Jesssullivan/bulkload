@@ -65,7 +65,9 @@ fn files_ending(root: &Path, suffix: &str) -> Vec<PathBuf> {
 /// thread (a `.jsonl.zst` the destination continued); a real `codex resume`
 /// then opened the older plain file and cut the destination's continued
 /// lines off the thread, and `--check` passed. The destination's row or
-/// form is the destination's: `RESEAT_INDEX_CONFLICT`, nothing placed.
+/// form is the destination's: nothing placed (since the operator's M2
+/// round 2, a form the destination holds is `adopted` or
+/// `destination-holds`, not a refusal; another file stays a conflict).
 #[test]
 fn ds_1_a_rowless_rollout_never_lands_beside_a_destination_row() {
     let _serial = SERIAL
@@ -109,19 +111,43 @@ fn ds_1_a_rowless_rollout_never_lands_beside_a_destination_row() {
     let orphan_zst = PathBuf::from(format!("{}.zst", world.codex_dest(&rel(T3)).display()));
     fs::write(&orphan_zst, zst(&rollout_bytes(T3, "legacy", 5))).unwrap();
     let options = world.options();
-    let (_, lines, _) = run(&options);
+    let (summary, lines, _) = run(&options);
     for id in [T9, T2, T3] {
         assert!(
             !world.codex_dest(&rel(id)).exists(),
             "{id}: placed beside the destination's own: {lines:?}"
         );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains(id) && line.contains("RESEAT_INDEX_CONFLICT")),
-            "{id}: {lines:?}"
-        );
     }
+    // Operator M2 round 2 (2026-10-17): the destination holding the thread
+    // in another form is not a refusal. T9's row names the `.zst` that
+    // holds the landed lines and more: adopted as it is. T3's form has no
+    // row: destination-holds. T2's row names another file: a conflict.
+    let line_of = |id: &str| {
+        lines
+            .iter()
+            .find(|line| line.contains(id) && line.contains("\"kind\":\"thread\""))
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert!(
+        line_of(T9).contains("\"outcome\":\"adopted\"")
+            && line_of(T9).contains("\"proof\":\"continued\"")
+            && line_of(T9).contains("\"refused\":null"),
+        "{lines:?}"
+    );
+    assert!(
+        line_of(T3).contains("\"outcome\":\"destination-holds\"")
+            && line_of(T3).contains("\"proof\":\"rowless\"")
+            && line_of(T3).contains("\"refused\":null"),
+        "{lines:?}"
+    );
+    assert!(line_of(T2).contains("RESEAT_INDEX_CONFLICT"), "{lines:?}");
+    assert_eq!(summary.sessions_of("codex", "adopted"), 1, "{lines:?}");
+    assert_eq!(
+        summary.sessions_of("codex", "destination-holds"),
+        1,
+        "{lines:?}"
+    );
     assert_eq!(
         world.dest_row(T9),
         Some((world.real_lab(), dest_zst.to_str().unwrap().to_owned())),

@@ -115,6 +115,10 @@ pub struct CheckSummary {
     pub checked: u64,
     /// Whether the destination's retention keeps every landed file.
     pub retention_ok: bool,
+    /// Destination Codex rows a pass would re-spell (their `cwd` spelled
+    /// through the home's `git` or a `--map` symlink): reported, never
+    /// judged (operator M2 round 2, 2026-10-17).
+    pub respell_pending: u64,
 }
 
 impl CheckSummary {
@@ -194,6 +198,24 @@ fn holds(landed: &Path, dest: &Path, lines: bool) -> Result<Holds> {
         Err(BulkloadRefusal::ReseatUnreadableForm) => Ok(Holds::Not("unreadable-form")),
         other => other,
     }
+}
+
+/// Whether the destination file `dest` holds the landed rollout's whole
+/// lines (the rule of [`holds`] for JSON Lines): `Ok("exactly")` or
+/// `Ok("continued")`, else `Err(reason)`. Used by a pass to prove a
+/// thread the destination already holds in another form.
+///
+/// # Errors
+/// I/O refusals.
+pub(super) fn holds_lines(
+    landed: &Path,
+    dest: &Path,
+) -> Result<std::result::Result<&'static str, &'static str>> {
+    Ok(match holds(landed, dest, true)? {
+        Holds::Exactly => Ok("exactly"),
+        Holds::Continued => Ok("continued"),
+        Holds::Not(reason) => Err(reason),
+    })
 }
 
 /// Read up to `buffer.len()` bytes: fewer only at the end.
@@ -362,7 +384,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     summary.lanes = table;
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"r0\":\"{}\"}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"r0\":\"{}\"}}",
         summary.checked,
         summary.lanes.len(),
         summary.count("pass"),
@@ -374,6 +396,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         summary.unlaned.len(),
         summary.unlaned.iter().filter(|item| item.waived).count(),
         if summary.retention_ok { "ok" } else { "unsafe" },
+        summary.respell_pending,
         if summary.verdict().is_ok() { "pass" } else { "fail" },
     ))?;
     Ok(summary)
@@ -560,6 +583,9 @@ fn check_codex(
     } else {
         None
     };
+    if let (Some(dest), true) = (dest.as_ref(), options.respell_cwd) {
+        summary.respell_pending = codex::spelled_rows(options, dest, ledger)?.len() as u64;
+    }
     let threads = codex::landed_threads(&options.landing_codex.join(codex::STATE_DB))?;
     let ids: BTreeSet<String> = threads.iter().map(|thread| thread.id.clone()).collect();
     let mut named = BTreeSet::new();
@@ -847,15 +873,15 @@ fn thread_holds(
         }));
     }
     let placed = root.join(codex::dest_form(rel));
-    let rollout = PathBuf::from(rollout);
     // The plain file re-seat placed, or the `.zst` Codex compressed it
-    // into at the destination.
-    let compressed_there = {
-        let mut name = placed.clone().into_os_string();
-        name.push(".zst");
-        PathBuf::from(name)
-    };
-    if rollout != placed && rollout != compressed_there {
+    // into at the destination, its directory spelled any way that
+    // resolves to the same one.
+    let named = codex::names(&rollout, &placed);
+    let rollout = PathBuf::from(rollout);
+    let zst = rollout
+        .extension()
+        .is_some_and(|extension| extension == "zst");
+    if !(named == codex::Names::Plain || (named == codex::Names::Form && zst)) {
         return Ok(Holds::Not("row-rollout-differs"));
     }
     holds(&options.landing_codex.join(rel), &rollout, true)

@@ -17,6 +17,15 @@
 //!    `cwd` column** re-spelled to the canonical path, in a `BEGIN
 //!    IMMEDIATE` transaction, only while it still holds the old value, with
 //!    the old value ledgered first; `--undo` puts it back the same way.
+//!    A row that names this thread's rollout in another form or place
+//!    (Codex's `.jsonl.zst`, a `.jsonl.gz`, the same file name in another
+//!    directory, or the plain file while a compressed form sits beside it)
+//!    is the destination holding the thread: nothing is placed, and it is
+//!    `adopted` when the file the row names holds the landed stream's whole
+//!    lines (exactly or continued, the R0 check's rule), else
+//!    `destination-holds` with the proof's reason; neither is a refusal
+//!    (operator M2 round 2, 2026-10-17). A compressed form with no row is
+//!    `destination-holds` (`rowless`).
 //! 2. Its rollout goes to the same place under the live destination
 //!    `.codex` (`sessions/YYYY/MM/DD/…` or `archived_sessions/…`) **as plain
 //!    `.jsonl`**: a landed `.jsonl.zst` is decompressed. Codex resumes a
@@ -46,6 +55,20 @@
 //! preview, which the picker needs), with the lane's `cwd`. A header that
 //! cannot fill a column the destination requires leaves it row-less,
 //! `RESEAT_INDEX_ROW_ABSENT`. Its lane is its `session_meta` `cwd`.
+//!
+//! Before any thread, every destination row whose `cwd` is spelled through
+//! the destination home's `git` symlink or a `--map` destination that is a
+//! symlink (sting's `/home/jess/git/…`) gets its `cwd` re-spelled to the
+//! real path the same ledgered, reversible way, whether or not a landed
+//! thread maps to it: only when the nearest existing level of the old
+//! spelling resolves to the same level of the new one, so a row that
+//! reaches a different directory through another link is never touched
+//! (operator M2 round 2, 2026-10-17, extending OI-1003-Q198 (1)).
+//!
+//! A thread whose rollout is recorded outside every `--codex-source-root`
+//! (or whose landed rollout is absent) is `destination-holds` when the
+//! destination's index has a row for it, else `RESEAT_LANE_UNMAPPED`
+//! (`rollout-root`) as before.
 //!
 //! The destination must already have an index (`RESEAT_INDEX_ABSENT`
 //! otherwise, before anything is written): Codex's first start backfills a
@@ -498,6 +521,7 @@ pub fn reseat(
     sql(conn.busy_timeout(std::time::Duration::from_secs(30)))?;
     let mut dest = Dest { root, db, conn };
     settle_cwd_intents(&dest, ledger)?;
+    sweep_spellings(options, ledger, &mut dest, summary, emit)?;
     let all = snapshot.threads(ledger)?;
     let mut named = BTreeSet::new();
     let mut pending: Vec<Pending> = Vec::new();
@@ -507,21 +531,45 @@ pub fn reseat(
         let (rel, dest_cwd, in_lane) = match locate(options, lanes, thread)? {
             Ok(located) => located,
             Err((word, refusal, rel)) => {
-                if let Some(rel) = rel {
-                    named.insert(rel);
+                if let Some(rel) = &rel {
+                    named.insert(rel.clone());
                 }
-                let counted = if word == "refused" {
-                    refusal.code()
+                let unrooted = rel.is_none() && refusal == BulkloadRefusal::ReseatLaneUnmapped;
+                if (unrooted || word == "landing-absent")
+                    && row_of(&dest.conn, &thread.id)?.is_some()
+                {
+                    // The destination's index holds the thread; nothing of
+                    // the landing ties to it here (operator M2 round 2).
+                    let proof = if unrooted {
+                        "rollout-root"
+                    } else {
+                        "landing-absent"
+                    };
+                    let dest_cwd = lane_cwd(options, lanes, &thread.cwd)?;
+                    held(
+                        summary,
+                        emit,
+                        (&thread.id, &thread.cwd),
+                        dest_cwd.as_deref(),
+                        Proved::Held(proof),
+                        None,
+                    )?;
+                    continue;
+                }
+                let counted = if unrooted {
+                    format!("{}:rollout-root", refusal.code())
+                } else if word == "refused" {
+                    refusal.code().to_owned()
                 } else {
-                    word
+                    word.to_owned()
                 };
-                summary.session(TOOL, counted);
+                summary.session(TOOL, &counted);
                 emit(&thread_line(
                     (&thread.id, &thread.cwd),
                     None,
                     word,
                     Some(&refusal),
-                    None,
+                    unrooted.then_some("rollout-root"),
                 ))?;
                 continue;
             }
@@ -545,6 +593,25 @@ pub fn reseat(
             )?;
             if let Some(old) = claim.respell {
                 respells.push((thread.id.clone(), old, dest_cwd.clone()));
+            }
+            if let Some(holding) = &claim.holds {
+                let landed = options.landing_codex.join(&rel);
+                let proved = prove(
+                    ledger,
+                    holding,
+                    (&thread.id, &thread.cwd),
+                    &landed,
+                    &dest_cwd,
+                )?;
+                held(
+                    summary,
+                    emit,
+                    (&thread.id, &thread.cwd),
+                    Some(&dest_cwd),
+                    proved,
+                    holding.row(),
+                )?;
+                continue;
             }
             if !claim.placeable {
                 summary.session(TOOL, "index-conflict");
@@ -650,13 +717,93 @@ struct Claim {
     placeable: bool,
     /// The row's `cwd`, a non-canonical spelling of the lane, to re-spell.
     respell: Option<String>,
+    /// The destination holds the thread in another form or place: nothing
+    /// is placed, the holding is proved or reported.
+    holds: Option<Holding>,
 }
 
-/// `path` with `.zst` appended: the form Codex compresses a rollout into.
-fn zst_form(path: &Path) -> PathBuf {
+/// How the destination holds a thread this ledger did not register.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Holding {
+    /// Its row (with the lane's `cwd`) names this file: the thread's
+    /// rollout in another form, spelling or directory.
+    Row(PathBuf),
+    /// No row, but a compressed form of the rollout at its place.
+    Rowless,
+}
+
+impl Holding {
+    fn row(&self) -> Option<&Path> {
+        match self {
+            Self::Row(path) => Some(path),
+            Self::Rowless => None,
+        }
+    }
+}
+
+/// `path` with `suffix` appended to its file name.
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
-    name.push(".zst");
+    name.push(suffix);
     PathBuf::from(name)
+}
+
+/// The compressed forms Codex and the archive keep beside a plain rollout.
+const FORMS: [&str; 2] = [".zst", ".gz"];
+
+/// Whether a compressed form of the plain rollout `rollout` is at its
+/// place (any node: a symlink into an archive counts).
+fn form_beside(rollout: &Path) -> bool {
+    FORMS
+        .iter()
+        .any(|suffix| std::fs::symlink_metadata(with_suffix(rollout, suffix)).is_ok())
+}
+
+/// How a destination row's `rollout_path` names the plain rollout this
+/// pass would place at `rollout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Names {
+    /// That plain file, its directory spelled any way that resolves to the
+    /// same directory.
+    Plain,
+    /// A compressed form of it there (`.zst`, `.gz`).
+    Form,
+    /// The same rollout file name (any form) in another directory.
+    Elsewhere,
+    /// Another file.
+    Other,
+}
+
+pub(super) fn names(recorded: &str, rollout: &Path) -> Names {
+    let recorded = Path::new(recorded);
+    if recorded == rollout {
+        return Names::Plain;
+    }
+    let (Some(name), Some(want)) = (recorded.file_name(), rollout.file_name()) else {
+        return Names::Other;
+    };
+    let name_text = name.to_string_lossy();
+    let stem = FORMS
+        .iter()
+        .find_map(|suffix| name_text.strip_suffix(suffix))
+        .unwrap_or(&name_text);
+    if std::ffi::OsStr::new(stem) != want {
+        return Names::Other;
+    }
+    let here = recorded.parent() == rollout.parent()
+        || match (recorded.parent(), rollout.parent()) {
+            (Some(a), Some(b)) => {
+                matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+            }
+            _ => false,
+        };
+    if !here {
+        Names::Elsewhere
+    } else if name == want {
+        Names::Plain
+    } else {
+        Names::Form
+    }
 }
 
 /// Whether `cwd` is another spelling of the canonical directory `canonical`
@@ -669,14 +816,20 @@ fn same_directory(cwd: &str, canonical: &str) -> bool {
 /// The destination's claim on thread `id`, whose rollout this pass would
 /// place at `rollout` with `cwd` `dest_cwd` (a lane's when `in_lane`).
 ///
-/// - A row naming this `cwd` and rollout: placeable (adopted).
+/// - A row naming this `cwd` and the plain rollout here (its directory
+///   spelled any way that resolves to this one): placeable (adopted),
+///   unless the plain file is absent and a compressed form sits beside it.
 /// - A row whose `cwd` only spells the lane differently: re-spelled
 ///   (OI-1003-Q198 (1), unless `--undo` put it back or re-spelling is off),
-///   placeable when its rollout is this one.
+///   then judged as above.
+/// - A row with the lane's `cwd` naming this rollout in another form or
+///   directory (or the plain file with a form beside and none of its
+///   own): held ([`Holding::Row`]); nothing placed.
 /// - Any other row: not placeable (`RESEAT_INDEX_CONFLICT`).
 /// - No row, but another form of the rollout at the destination (Codex's
-///   `.jsonl.zst` of it): not placeable; the destination's form is the
-///   destination's (re-review of `8a89f9a`, MAJOR).
+///   `.jsonl.zst`, an archive's `.jsonl.gz`): held ([`Holding::Rowless`]),
+///   nothing placed; the destination's form is the destination's
+///   (re-review of `8a89f9a`, MAJOR).
 fn claim(
     options: &Options,
     ledger: &Ledger,
@@ -685,6 +838,7 @@ fn claim(
     (dest_cwd, in_lane): (&str, bool),
     rollout: &Path,
 ) -> Result<Claim> {
+    let beside = form_beside(rollout);
     match row_of(&dest.conn, id)? {
         Some((cwd, path)) => {
             let undone = ledger
@@ -697,16 +851,291 @@ fn claim(
                 && same_directory(&cwd, dest_cwd))
             .then_some(cwd.clone());
             let cwd_holds = cwd == dest_cwd || respell.is_some();
+            let named = names(&path, rollout);
+            let placeable = cwd_holds
+                && named == Names::Plain
+                && (!beside || std::fs::symlink_metadata(rollout).is_ok());
+            let holds = (cwd_holds && !placeable && named != Names::Other)
+                .then(|| Holding::Row(PathBuf::from(&path)));
             Ok(Claim {
-                placeable: cwd_holds && Path::new(&path) == rollout,
+                placeable,
                 respell,
+                holds,
             })
         }
         None => Ok(Claim {
-            placeable: std::fs::symlink_metadata(zst_form(rollout)).is_err(),
+            placeable: !beside,
             respell: None,
+            holds: beside.then_some(Holding::Rowless),
         }),
     }
+}
+
+/// What a holding's proof found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proved {
+    /// The file the destination's row names holds the landed stream's
+    /// whole lines: exactly, or followed by what the destination wrote.
+    Adopted(&'static str),
+    /// Not proved: the reason (`rowless`, `rollout-root`, `landing-absent`,
+    /// or the check's own: `absent`, `not-regular`, `unreadable-form`,
+    /// `size-differs`, `hash-differs`, `ends-mid-line`,
+    /// `landing-not-regular`).
+    Held(&'static str),
+}
+
+/// The ledger outcome words of a proved holding (the session cache).
+const ADOPTED_FORM: &str = "adopted-form";
+const DESTINATION_HOLDS: &str = "destination-holds";
+
+/// A file's identity as cached text, or `absent`.
+fn identity_text(path: &Path) -> String {
+    std::fs::symlink_metadata(path).map_or_else(
+        |_| "absent".to_owned(),
+        |meta| {
+            let identity = Identity::of(&meta);
+            format!(
+                "{}:{}:{}:{}",
+                identity.dev, identity.ino, identity.size, identity.mtime
+            )
+        },
+    )
+}
+
+/// The proof's reason words, as `'static` (the cache stores the text).
+const REASONS: [&str; 9] = [
+    "exactly",
+    "continued",
+    "absent",
+    "not-regular",
+    "unreadable-form",
+    "size-differs",
+    "hash-differs",
+    "ends-mid-line",
+    "landing-not-regular",
+];
+
+fn reason(word: &str) -> Option<&'static str> {
+    REASONS.iter().copied().find(|known| *known == word)
+}
+
+/// Prove a holding: does the file the destination's row names hold the
+/// landed stream's whole lines (the R0 check's rule)? Cached in the
+/// session row by both files' identities, so an unchanged rerun reads
+/// nothing (S3).
+fn prove(
+    ledger: &Ledger,
+    holding: &Holding,
+    (id, source_cwd): (&str, &str),
+    landed: &Path,
+    dest_cwd: &str,
+) -> Result<Proved> {
+    let Holding::Row(path) = holding else {
+        return Ok(Proved::Held("rowless"));
+    };
+    let landed_identity = std::fs::symlink_metadata(landed)
+        .ok()
+        .map(|meta| Identity::of(&meta));
+    let dest_identity = identity_text(path);
+    let cached = ledger.session(TOOL, id)?.filter(|row| {
+        row.landing == landed
+            && landed_identity.is_some_and(|now| {
+                Some(now.size) == row.landed_size && Some(now.mtime) == row.landed_mtime
+            })
+            && row.dest_key.as_deref() == Some(dest_identity.as_str())
+    });
+    if let Some(row) = cached {
+        if let Some(word) = row.slug.as_deref().and_then(reason) {
+            if row.outcome == ADOPTED_FORM {
+                return Ok(Proved::Adopted(word));
+            }
+            if row.outcome == DESTINATION_HOLDS {
+                return Ok(Proved::Held(word));
+            }
+        }
+    }
+    let gz = path.extension().is_some_and(|extension| extension == "gz");
+    let proved = if gz {
+        Proved::Held("unreadable-form")
+    } else {
+        match super::check::holds_lines(landed, path)? {
+            Ok(word) => Proved::Adopted(word),
+            Err(word) => Proved::Held(word),
+        }
+    };
+    let (outcome, word) = match proved {
+        Proved::Adopted(word) => (ADOPTED_FORM, word),
+        Proved::Held(word) => (DESTINATION_HOLDS, word),
+    };
+    ledger.put_session(&Session {
+        tool: TOOL.to_owned(),
+        id: id.to_owned(),
+        landing: landed.to_path_buf(),
+        source_cwd: Some(source_cwd.to_owned()),
+        dest_cwd: Some(PathBuf::from(dest_cwd)),
+        dest_key: Some(dest_identity),
+        slug: Some(word.to_owned()),
+        outcome: outcome.to_owned(),
+        landed_size: landed_identity.map(|identity| identity.size),
+        landed_mtime: landed_identity.map(|identity| identity.mtime),
+    })?;
+    Ok(proved)
+}
+
+/// Report a thread the destination holds: `adopted` (proved) or
+/// `destination-holds`, neither a refusal.
+fn held(
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+    (id, source_cwd): (&str, &str),
+    dest_cwd: Option<&str>,
+    proved: Proved,
+    rollout: Option<&Path>,
+) -> Result<()> {
+    let (outcome, row, proof) = match proved {
+        Proved::Adopted(word) => ("adopted", "adopted", word),
+        Proved::Held(word) => (DESTINATION_HOLDS, "held", word),
+    };
+    summary.session(TOOL, outcome);
+    *summary.rows.entry(row.to_owned()).or_default() += 1;
+    emit(&format!(
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"thread\",\"tool\":\"{TOOL}\",\"id\":{},\"source_cwd\":{},\"dest_cwd\":{},\"outcome\":\"{outcome}\",\"row\":\"{row}\",\"refused\":null,\"proof\":\"{proof}\",\"dest_rollout\":{}}}",
+        json_string(id),
+        json_string(source_cwd),
+        dest_cwd.map_or_else(|| "null".to_owned(), json_string),
+        rollout.map_or_else(|| "null".to_owned(), |path| json_string(&path.to_string_lossy())),
+    ))
+}
+
+/// The destination `cwd` a thread recorded in `cwd` gets: its lane's, or
+/// its own when placed by ID; `None` when it has neither.
+fn lane_cwd(options: &Options, lanes: &Lanes, cwd: &str) -> Result<Option<String>> {
+    Ok(match lanes.lane(Path::new(cwd))? {
+        Some(lane) => Some(super::key::utf8(&lane.dest_cwd)?.to_owned()),
+        None if options.by_id(cwd) => Some(cwd.to_owned()),
+        None => None,
+    })
+}
+
+/// The symlinks a destination row's `cwd` may be spelled through: the
+/// destination home's `git` and each `--map` destination, each only when
+/// it is a symlink, with its real path; longest first.
+#[must_use]
+pub fn spelling_links(options: &Options) -> Vec<(PathBuf, PathBuf)> {
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let candidates = std::iter::once(options.dest_home.join("git"))
+        .chain(options.maps.iter().map(|(_, dest)| dest.clone()));
+    for link in candidates {
+        if !std::fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            continue;
+        }
+        let Ok(real) = std::fs::canonicalize(&link) else {
+            continue;
+        };
+        if real != link && !out.iter().any(|(known, _)| *known == link) {
+            out.push((link, real));
+        }
+    }
+    out.sort_by_key(|(link, _)| std::cmp::Reverse(link.components().count()));
+    out
+}
+
+/// The real spelling of `cwd` when it differs from it only through one of
+/// `links` (the longest that prefixes it): the link's real path joined
+/// with the rest, and only when the nearest existing level of `cwd`
+/// resolves to the same level of that spelling (nothing else on the way
+/// is a link elsewhere). `None` otherwise.
+#[must_use]
+pub fn respelled(cwd: &str, links: &[(PathBuf, PathBuf)]) -> Option<String> {
+    let path = Path::new(cwd);
+    if !path.is_absolute() {
+        return None;
+    }
+    let (link, real) = links.iter().find(|(link, _)| path.starts_with(link))?;
+    let rest = path.strip_prefix(link).ok()?;
+    if rest
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let new = if rest.as_os_str().is_empty() {
+        real.clone()
+    } else {
+        real.join(rest)
+    };
+    let text = new.to_str()?;
+    if text == cwd {
+        return None;
+    }
+    let existing = crate::space::existing_ancestor(path).ok()?;
+    let tail = existing.strip_prefix(link).ok()?;
+    let expected = if tail.as_os_str().is_empty() {
+        real.clone()
+    } else {
+        real.join(tail)
+    };
+    (std::fs::canonicalize(&existing).ok()? == expected).then(|| text.to_owned())
+}
+
+/// The destination rows [`respelled`] would re-spell, as `(id, old, new)`:
+/// every row, mapped lane or not, except one this ledger's `--undo` put
+/// back (operator M2 round 2, 2026-10-17).
+///
+/// # Errors
+/// `SQLite` and ledger refusals.
+pub fn spelled_rows(
+    options: &Options,
+    dest: &Connection,
+    ledger: Option<&Ledger>,
+) -> Result<Vec<(String, String, String)>> {
+    let links = spelling_links(options);
+    if links.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut statement = sql(dest.prepare("SELECT id, cwd FROM threads ORDER BY id"))?;
+    let rows = sql(statement.query_map([], |row| {
+        Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+    }))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (Value::Text(id), Value::Text(cwd)) = sql(row)? else {
+            continue;
+        };
+        let Some(new) = respelled(&cwd, &links) else {
+            continue;
+        };
+        if let Some(ledger) = ledger {
+            if ledger
+                .cwd_update(&id)?
+                .is_some_and(|row| row.state == "undone" || row.state == "undo-kept")
+            {
+                continue;
+            }
+        }
+        out.push((id, cwd, new));
+    }
+    Ok(out)
+}
+
+/// Re-spell every symlink-spelled destination row ([`spelled_rows`]), in
+/// batches, the ledgered way [`respell`] does.
+fn sweep_spellings(
+    options: &Options,
+    ledger: &mut Ledger,
+    dest: &mut Dest,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if !options.respell_cwd {
+        return Ok(());
+    }
+    let rows = spelled_rows(options, &dest.conn, Some(ledger))?;
+    for batch in rows.chunks(BATCH) {
+        let mut queued = batch.to_vec();
+        respell(dest, ledger, &mut queued, summary, emit)?;
+    }
+    Ok(())
 }
 
 /// Re-spell the queued rows' `cwd` (only that column) in one destination
@@ -1013,6 +1442,18 @@ fn reseat_unindexed(
                 let mut queued = vec![(id.clone(), old, dest_cwd.clone())];
                 respell(dest, ledger, &mut queued, summary, emit)?;
             }
+            if let Some(holding) = &claim.holds {
+                let proved = prove(ledger, holding, (&id, &cwd), &landed, &dest_cwd)?;
+                held(
+                    summary,
+                    emit,
+                    (&id, &cwd),
+                    Some(&dest_cwd),
+                    proved,
+                    holding.row(),
+                )?;
+                continue;
+            }
             if !claim.placeable {
                 summary.session(TOOL, "index-conflict");
                 *summary.rows.entry("conflict".to_owned()).or_default() += 1;
@@ -1070,7 +1511,9 @@ fn reseat_unindexed(
         }
         let row = match row_of(&dest.conn, &id)? {
             // A crash after the row's commit, or a row already naming it.
-            Some((row_cwd, path)) if row_cwd == dest_cwd && Path::new(&path) == rollout => {
+            Some((row_cwd, path))
+                if row_cwd == dest_cwd && names(&path, &rollout) == Names::Plain =>
+            {
                 "adopted"
             }
             Some(_) => "conflict",
@@ -1439,7 +1882,11 @@ fn synthesize(
             )
             .optional())?;
         let word = match existing {
-            Some((found_cwd, path)) if found_cwd == cwd && Path::new(&path) == rollout => "adopted",
+            Some((found_cwd, path))
+                if found_cwd == cwd && self::names(&path, rollout) == Names::Plain =>
+            {
+                "adopted"
+            }
             Some(_) => "conflict",
             None => {
                 sql(transaction.execute(
@@ -1554,7 +2001,11 @@ fn register(
                 )
                 .optional())?;
             rows.push(match existing {
-                Some((cwd, path)) if cwd == item.cwd && path == rollout => "adopted",
+                Some((cwd, path))
+                    if cwd == item.cwd && self::names(&path, &item.rollout) == Names::Plain =>
+                {
+                    "adopted"
+                }
                 Some(_) => "conflict",
                 None => {
                     insert(&transaction, source, names, thread, &item.cwd, rollout)?;
