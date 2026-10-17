@@ -16,6 +16,14 @@
 //! (`git_carry::converge::diff`), against a scratch repository in each
 //! staged bundle's private directory, removed with it. The source is never
 //! read.
+//!
+//! One import per repository (M2r2 item 3): a plan base (a repository's
+//! shared capture, which every linked worktree item of it requires) is
+//! staged once per run and imported once per destination object store;
+//! every item's scratch borrows that import. Before, each item staged and
+//! indexed the whole base again, O(items x repository). A base's stage is
+//! dropped after the last item that names it. `BULKLOAD_DIFF_SHARED_IMPORT=0`
+//! is the A/B arm: each item stages and imports its base itself, as before.
 
 use crate::refuse::RefuseAt as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,7 +32,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     bound, chain_links, filename, id, journal_path, prior_sidecar, read, retained_omissions,
-    retained_parts, sealed, stage_base, Capture, LinkBinding, Plan,
+    retained_parts, sealed, stage_base, Base, Capture, LinkBinding, Plan,
 };
 use crate::closure::json_string;
 use crate::git_carry::{self, converge};
@@ -100,8 +108,9 @@ pub fn diff(
         .iter()
         .map(id)
         .collect::<Result<Vec<String>>>()?;
+    let mut bases = Bases::new(&contents.items, corpus)?;
     let mut seen = BTreeSet::new();
-    for item in &contents.items {
+    for (index, item) in contents.items.iter().enumerate() {
         let identity = id(item)?;
         if !seen.insert(identity.clone()) {
             continue;
@@ -115,7 +124,16 @@ pub fn diff(
                 .as_ref()
                 .map_or_else(|| "null".to_owned(), |path| json_string(&converge::diff::shown(path))),
         );
-        match item_row(item, (&identity, &items), corpus, source, states, options) {
+        let answered = item_row(
+            item,
+            (&identity, &items),
+            (corpus, &mut bases),
+            source,
+            states,
+            options,
+        );
+        bases.done(index);
+        match answered {
             Ok((row, journaled, omitted)) => {
                 if let Some(workspace) = &item.workspace {
                     summary
@@ -200,13 +218,95 @@ pub fn diff(
 
 type Omitted = Option<Vec<git_carry::RebuildableOmission>>;
 
+// A plan base, as the corpus names it.
+type BaseKey = (String, [u8; 32]);
+
+// The run's staged plan bases (M2r2 item 3), each kept from its first use
+// to the last item whose capture names it, then dropped (its stage, and the
+// scratch import in it, removed).
+struct Bases {
+    shared: bool,
+    staged: BTreeMap<BaseKey, Result<git_carry::StagedBundle>>,
+    last: BTreeMap<BaseKey, usize>,
+}
+
+impl Bases {
+    // The last item index naming each base, read from the capture records
+    // and their `.base` sidecars; an item whose records do not read names
+    // none (its own read then refuses as it did).
+    fn new(items: &[super::Item], corpus: &Path) -> Result<Self> {
+        let shared =
+            std::env::var_os("BULKLOAD_DIFF_SHARED_IMPORT").is_none_or(|value| value != "0");
+        let mut last = BTreeMap::new();
+        if shared {
+            for (index, item) in items.iter().enumerate() {
+                let Ok(captured) = read::<Capture>(&corpus.join(format!("{}.capture", id(item)?)))
+                else {
+                    continue;
+                };
+                if !filename(&captured.bundle) {
+                    continue;
+                }
+                if let Ok(Some(base)) = bound(corpus, &captured.bundle) {
+                    last.insert((base.bundle, base.digest), index);
+                }
+            }
+        }
+        Ok(Self {
+            shared,
+            staged: BTreeMap::new(),
+            last,
+        })
+    }
+
+    // `base` staged: once per run when shared, else afresh.
+    fn stage(&mut self, corpus: &Path, base: &Base) -> Result<Staged<'_>> {
+        let key = (base.bundle.clone(), base.digest);
+        if !self.shared || !self.last.contains_key(&key) {
+            return stage_base(corpus, base).map(Staged::Own);
+        }
+        let entry = self.staged.entry(key).or_insert_with(|| {
+            stage_base(corpus, base).map(|mut staged| {
+                staged.share_imports();
+                staged
+            })
+        });
+        match entry {
+            Ok(staged) => Ok(Staged::Shared(staged)),
+            Err(refusal) => Err(refusal.clone()),
+        }
+    }
+
+    // Item `index` is answered: drop every base no later item names.
+    fn done(&mut self, index: usize) {
+        let last = &self.last;
+        self.staged
+            .retain(|key, _| last.get(key).is_some_and(|at| *at > index));
+    }
+}
+
+// A staged base: the run's shared one, or one staged for this item only.
+enum Staged<'a> {
+    Shared(&'a git_carry::StagedBundle),
+    Own(git_carry::StagedBundle),
+}
+
+impl Staged<'_> {
+    const fn get(&self) -> &git_carry::StagedBundle {
+        match self {
+            Staged::Shared(staged) => staged,
+            Staged::Own(staged) => staged,
+        }
+    }
+}
+
 // One item: its capture staged (a chain flattened, a plan base staged),
 // then the converge's report function. Nothing is imported at the
 // destination: a base goes into the scratch repository only.
 fn item_row(
     item: &super::Item,
     (identity, items): (&str, &[String]),
-    corpus: &Path,
+    (corpus, bases): (&Path, &mut Bases),
     source: &str,
     states: &[PathBuf],
     options: &DiffOptions,
@@ -238,8 +338,7 @@ fn item_row(
         )
     } else if git_carry::shared::requires_base(staged.path())? {
         let base = bound(corpus, &captured.bundle)?.ok_or(BulkloadRefusal::SealedObjectMissing)?;
-        let base = stage_base(corpus, &base)?;
-        (staged, Some(base))
+        (staged, Some(bases.stage(corpus, &base)?))
     } else {
         (staged, None)
     };
@@ -253,7 +352,7 @@ fn item_row(
         repository: &item.repository,
         workspace: item.workspace.as_deref(),
         source,
-        base: base.as_ref(),
+        base: base.as_ref().map(Staged::get),
     };
     let row = if item.workspace.is_some() {
         converge::diff::workspace(

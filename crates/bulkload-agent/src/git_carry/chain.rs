@@ -327,6 +327,7 @@ pub fn flatten(
         bundle: flat,
         digest,
         bare,
+        shared: None,
     })
 }
 

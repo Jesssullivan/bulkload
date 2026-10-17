@@ -693,6 +693,24 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
     An unrelated one keeps the provenance import and refuses
     `GIT_DESTINATION_OCCUPIED` (pending review, never counted applied).
   - `estate-diff` reports all of this beforehand, read-only.
+  - `estate-diff` imports a repository's plan base once (M2r2 item 3,
+    the 10-16 in-place finding: it indexed the whole base again for every
+    worktree item, O(items x repository), 11 rows an hour on a large
+    repository under load). A base is staged once per run and imported
+    once per destination object store into a scratch repository in its
+    stage; every item's scratch borrows that import (its objects as one
+    more alternate, its refs created as the import made them) and imports
+    only its own capture. A base whose import leaves a shallow frontier is
+    still imported per scratch. The stage is removed after the last item
+    that names its base. Counted on the counters line:
+    `git_scratch_base_imports` (whole-base imports into a scratch
+    repository, by `estate-diff` and by the apply's adopt and first-landing
+    scratches) and `git_scratch_base_borrowed` (scratches that borrowed a
+    shared import). `BULKLOAD_DIFF_SHARED_IMPORT=0` is the A/B arm (an
+    import per scratch, as before); its rows are byte-identical (P108,
+    P109). `estate-apply` is unchanged: each item still stages and imports
+    its own base. Not built: a chained (re-captured) item still flattens
+    its chain per item.
   - Not built: `--protect` (land the source's state beside a destination
     adopt refuses).
 - **Hand-off block (TIN-6569, OI-1003-Q183, 2026-10-16;

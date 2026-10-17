@@ -2317,6 +2317,37 @@ pub struct StagedBundle {
     digest: [u8; 32],
     // Whether its headers mark a capture of a bare repository (S4, #162).
     bare: bool,
+    // `estate-diff` (M2r2 item 3): set on a plan base the run shares
+    // between its items. Every scratch repository built over this base
+    // borrows one import of it per destination object store, made in this
+    // stage's private directory, instead of indexing the whole base again.
+    // `None` (every other verb): each scratch imports the base itself.
+    shared: Option<std::sync::Mutex<Vec<SharedBase>>>,
+}
+
+/// One import of a shared plan base into a scratch repository of its own
+/// (`estate-diff`, M2r2 item 3), keyed by what the import depends on: the
+/// destination object store the scratch borrows, the object format and the
+/// source name its provenance refs carry.
+#[derive(Debug)]
+struct SharedBase {
+    objects: Option<PathBuf>,
+    format: &'static str,
+    source: String,
+    // What a scratch borrows, or the import's refusal, which every scratch
+    // over the same key would have met; `Ok(None)` when the import left
+    // state a borrower cannot take by alternates and refs alone (a shallow
+    // frontier): such a scratch imports the base itself, as before.
+    seed: Result<Option<BaseSeed>>,
+}
+
+/// What a scratch repository takes from a shared base import: its object
+/// store, as one more alternate, and every ref the import made, as one
+/// create transaction (`update-ref --stdin -z`).
+#[derive(Debug, Clone)]
+struct BaseSeed {
+    objects: PathBuf,
+    refs: Vec<u8>,
 }
 
 impl StagedBundle {
@@ -2343,6 +2374,12 @@ impl StagedBundle {
     /// `estate-diff`, #226), never at the destination.
     pub(crate) fn private_dir(&self) -> &Path {
         self.directory.path()
+    }
+
+    /// Share this plan base's scratch import between every scratch
+    /// repository built over it (`estate-diff`, M2r2 item 3).
+    pub(crate) fn share_imports(&mut self) {
+        self.shared = Some(std::sync::Mutex::new(Vec::new()));
     }
 }
 
@@ -2429,6 +2466,7 @@ pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
         bundle: path,
         digest,
         bare: bare_marked(&heads),
+        shared: None,
     })
 }
 

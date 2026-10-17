@@ -78,6 +78,13 @@ impl Scratch {
     /// Build a scratch repository for `staged` (and its plan `base`),
     /// borrowing `objects` (a destination's object directory) when given.
     ///
+    /// A base shared by its stage (`estate-diff`, M2r2 item 3) is imported
+    /// once per destination object store into a scratch repository of its
+    /// own, and this one borrows that import (its objects as one more
+    /// alternate, its refs created here as the import made them) instead
+    /// of indexing the whole base again; every other base is imported
+    /// here.
+    ///
     /// # Errors
     /// Whatever the import refuses.
     pub(in crate::git_carry) fn new(
@@ -87,38 +94,40 @@ impl Scratch {
         source: &str,
     ) -> Result<Self> {
         const SITE: &str = "git_carry::converge::adopt::scratch";
-        let mut n = 0u32;
-        let dir = loop {
-            let candidate = staged.private_dir().join(format!("adopt-{n}"));
-            match fs::create_dir(&candidate) {
-                Ok(()) => break candidate,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    n = n
-                        .checked_add(1)
-                        .ok_or(BulkloadRefusal::FieldDomainViolation)?;
-                }
-                Err(error) => return Err(crate::refuse::io(&error, SITE)),
-            }
-        };
+        let dir = fresh_dir(staged.private_dir(), "adopt")?;
         let repo = dir.join("repo");
         let listed = text(git(&dir).args(["bundle", "list-heads"]).arg(staged.path()))?;
         let format = super::super::bundle_object_format(&listed)?;
+        let objects = objects
+            .map(|objects| fs::canonicalize(objects).refuse_at(SITE))
+            .transpose()?;
+        let seed = match base {
+            Some(base) => borrowed_base(base, objects.as_deref(), format, source)?,
+            None => None,
+        };
         fs::create_dir(&repo).refuse_at(SITE)?;
         super::super::init_repository(&repo, format, false)?;
-        if let Some(objects) = objects {
-            let objects = fs::canonicalize(objects).refuse_at(SITE)?;
-            let line = objects
-                .to_str()
-                .filter(|line| !line.contains(['\n', '\r']) && !line.starts_with('"'))
-                .ok_or(BulkloadRefusal::PathNotPortable)?;
-            fs::write(
-                repo.join(".git/objects/info/alternates"),
-                format!("{line}\n"),
-            )
-            .refuse_at(SITE)?;
-        }
-        if let Some(base) = base {
-            super::super::import_verified(&repo, base.path(), source)?;
+        let lenders: Vec<&Path> = objects
+            .as_deref()
+            .into_iter()
+            .chain(seed.as_ref().map(|seed| seed.objects.as_path()))
+            .collect();
+        alternates(&repo, &lenders)?;
+        match (base, &seed) {
+            (Some(_), Some(seed)) => {
+                if !seed.refs.is_empty() {
+                    super::super::input(
+                        git(&repo).args(["update-ref", "--no-deref", "--stdin", "-z"]),
+                        &seed.refs,
+                    )?;
+                }
+                crate::counters::bump(crate::counters::Counter::GitScratchBaseBorrowed);
+            }
+            (Some(base), None) => {
+                super::super::import_verified(&repo, base.path(), source)?;
+                crate::counters::bump(crate::counters::Counter::GitScratchBaseImports);
+            }
+            (None, _) => {}
         }
         let (_, instance) = super::super::import_verified_instance(&repo, staged.path(), source)?;
         Ok(Self { repo, instance })
@@ -195,6 +204,132 @@ impl Scratch {
 }
 
 /// The object directory of the repository at `repo`, absolute.
+// A new directory `{prefix}-{n}` in `parent`, the first `n` free.
+fn fresh_dir(parent: &Path, prefix: &str) -> Result<PathBuf> {
+    let mut n = 0u32;
+    loop {
+        let candidate = parent.join(format!("{prefix}-{n}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                n = n
+                    .checked_add(1)
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+            }
+            Err(error) => {
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::converge::adopt::fresh_dir",
+                ))
+            }
+        }
+    }
+}
+
+// Write `repo`'s `objects/info/alternates`: one line per lender, in order
+// (none, no file). A lender is a canonical object directory.
+fn alternates(repo: &Path, lenders: &[&Path]) -> Result<()> {
+    if lenders.is_empty() {
+        return Ok(());
+    }
+    let mut lines = String::new();
+    for lender in lenders {
+        let line = lender
+            .to_str()
+            .filter(|line| !line.contains(['\n', '\r']) && !line.starts_with('"'))
+            .ok_or(BulkloadRefusal::PathNotPortable)?;
+        lines.push_str(line);
+        lines.push('\n');
+    }
+    fs::write(repo.join(".git/objects/info/alternates"), lines)
+        .refuse_at("git_carry::converge::adopt::alternates")
+}
+
+// What a scratch over the shared `base` borrows for this object store,
+// format and source (M2r2 item 3): the import made at the first ask and
+// kept in the base's stage, or its refusal. `None` for a base its stage
+// does not share, or whose import a borrower cannot take (a shallow
+// frontier): the caller imports the base itself.
+fn borrowed_base(
+    base: &super::super::StagedBundle,
+    objects: Option<&Path>,
+    format: &'static str,
+    source: &str,
+) -> Result<Option<super::super::BaseSeed>> {
+    let Some(shared) = &base.shared else {
+        return Ok(None);
+    };
+    let mut imports = shared
+        .lock()
+        .map_err(|_| BulkloadRefusal::ContractSelfInconsistent)?;
+    if let Some(found) = imports.iter().find(|import| {
+        import.objects.as_deref() == objects && import.format == format && import.source == source
+    }) {
+        return found.seed.clone();
+    }
+    let seed = import_shared(base, objects, format, source);
+    imports.push(super::super::SharedBase {
+        objects: objects.map(Path::to_path_buf),
+        format,
+        source: source.to_owned(),
+        seed: seed.clone(),
+    });
+    seed
+}
+
+// The shared import itself: a scratch repository in the base's private
+// directory, built as an unshared scratch builds its own (same format,
+// same lender, the same `import_verified`), whose objects and refs a
+// borrower then takes.
+fn import_shared(
+    base: &super::super::StagedBundle,
+    objects: Option<&Path>,
+    format: &'static str,
+    source: &str,
+) -> Result<Option<super::super::BaseSeed>> {
+    const SITE: &str = "git_carry::converge::adopt::import_shared";
+    let dir = fresh_dir(base.private_dir(), "shared-base")?;
+    let repo = dir.join("repo");
+    fs::create_dir(&repo).refuse_at(SITE)?;
+    super::super::init_repository(&repo, format, false)?;
+    alternates(&repo, &objects.into_iter().collect::<Vec<_>>())?;
+    super::super::import_verified(&repo, base.path(), source)?;
+    crate::counters::bump(crate::counters::Counter::GitScratchBaseImports);
+    // A shallow frontier is repository state alternates do not carry.
+    if fs::symlink_metadata(repo.join(".git/shallow")).is_ok() {
+        return Ok(None);
+    }
+    let listed = super::super::output(
+        git(&repo).args(["for-each-ref", "--format=%(objectname) %(refname)"]),
+    )?;
+    let mut refs = Vec::new();
+    for line in listed
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let space = line
+            .iter()
+            .position(|byte| *byte == b' ')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let (value, name) = line.split_at(space);
+        let name = name
+            .get(1..)
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        if name.contains(&0) {
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        refs.extend_from_slice(b"create ");
+        refs.extend_from_slice(name);
+        refs.push(0);
+        refs.extend_from_slice(value);
+        refs.push(0);
+    }
+    Ok(Some(super::super::BaseSeed {
+        objects: fs::canonicalize(repo.join(".git/objects")).refuse_at(SITE)?,
+        refs,
+    }))
+}
+
 pub(super) fn objects_of(repo: &Path) -> Result<PathBuf> {
     let objects = text(git(repo).args([
         "rev-parse",

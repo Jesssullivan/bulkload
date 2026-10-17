@@ -379,6 +379,15 @@ counters! {
     // Threads (Linux) an escalation could not move, or 1 when it failed
     // for the process itself.
     PriorityEscalationFailures => "priority_escalation_failures",
+    // Estate adopt and `estate-diff` scratch repositories (#226; M2r2 item
+    // 3). Plan bases imported into a scratch repository (one whole-base
+    // `index-pack`, or a connectivity walk where the borrowed destination
+    // store already holds the base): in `estate-diff`, one per base and
+    // destination object store, however many items borrow it; and scratch
+    // repositories that borrowed such an import instead of indexing the
+    // base again.
+    GitScratchBaseImports => "git_scratch_base_imports",
+    GitScratchBaseBorrowed => "git_scratch_base_borrowed",
 }
 
 const COUNT: usize = Counter::ALL.len();
