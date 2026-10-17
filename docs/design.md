@@ -243,6 +243,11 @@ Source safety (S2, WP1):
   11 cleared keys) and its remote probe over ssh.
 - A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
   read, in `git-export` and `estate-capture`.
+  A native carry ("promisor mode": the present objects only, packed with
+  `--missing=allow-promisor`, the promisor configuration carried as-is,
+  the landed repository a partial clone) is designed, with experiments,
+  in `docs/agent-notes/2026-10-16-partial-clone-carry-design.md` (M2 item
+  6); not built. Until it is, such a repository is carried as files.
 - The source's object store is read-only to a capture (#162).
   - Git freshens (re-stamps the mtime of) any existing copy of an object it
     writes, alternates included.
