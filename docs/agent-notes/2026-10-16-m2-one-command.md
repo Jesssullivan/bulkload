@@ -84,3 +84,77 @@ Open (operator): kept directories never converge to the source's mode and
 are not in the closure row; an equal file whose mode differs is still
 refused; the pre-existing gap that a refused (wider) directory still has
 its entries published inside it is #248.
+
+## Item 3: `estate-capture` priority and bounded starvation
+
+PR #249. `estate-capture` defaults to `--priority=auto` (background when a
+terminal was read or written within 300 s, normal otherwise); a background
+`estate-capture`, or any background verb given `--escalate-after`, runs a
+watcher that escalates the IO class once after the threshold (default
+300 s) with no counter or descendant-IO movement (Linux: every thread of
+the process and its descendants to the nice-derived class, children
+checked against PID reuse; Darwin: `IOPOL_DEFAULT`, not compiled here and
+likely limited to later children). Recorded on the counters line. The
+change to estate-capture's WP0(f) default is recorded in `docs/slo.md` as
+the operator's M2 instruction, pending its ledger entry (TIN-4543).
+Refuters found 7 defects (contract unamended, escalation on every verb,
+silent partial failure, unrecorded threshold, stale docs, fixed-sleep
+tests, atime-only presence); all fixed or stated.
+
+## Item 4: GC-rooted install
+
+PR #250. `just install-agent DEST_DIR NAME` / `scripts/install-agent.sh`:
+copy, drop non-store RUNPATH entries (patchelf), one registered indirect GC
+root per store path the binary names, `link(2)` publish, `.sha256` and
+`.gcroots`, selftest. Selftest reports the ELF interpreter and how many of
+the binary's store paths have a root Nix registered (a copied or hand-made
+symlink is `unregistered`). Verified on sting (4 store paths rooted,
+`rooted=4`). Static musl: not built (flake change moves the guard's pinned
+digests).
+
+## Item 6: malformed inventory and partial clones
+
+PR #253. Telefreeze's `GIT_INVENTORY_MALFORMED` not reproduced from sting;
+a 28-worktree-plus-odd-states regression row lands every item; the neo
+evidence still needed is in
+`2026-10-16-partial-clone-carry-design.md`. Partial clones: "promisor mode"
+designed with experiments, not built.
+
+## Item 7: `estate-move`
+
+PR #251, design only: `2026-10-16-estate-move-design.md`.
+
+## Receipts
+
+- Own background task `bel96bj33` (a waiter that checked process liveness
+  against R-N104) was stopped by its task id (R-N11, own task); waits after
+  that read files only.
+- 2026-10-17 ~05:14Z: the coordinator paused all builds (sting at load
+  ~100-190, swap full, agents.slice at its MemoryHigh; M0 starving). The
+  lane's own gate-queue task `bj2tjiyyh` was stopped by its task id (R-N11,
+  own task; coordinator direction): the #252 gate ended mid fault-harness
+  (`handoff-off` terminated), nothing merged, no receipt of record. No
+  gate or cargo run was started after.
+- The first #249 gate failed clippy `collapsible_match` in
+  `reseat/codex.rs` (code #249 does not touch); a fresh-target clippy in
+  the gate environment did not reproduce it, and the rerun passed and
+  merged.
+- Issue #248 filed (a refused directory still has entries published inside
+  it; pre-existing).
+
+## State at the pause (2026-10-17)
+
+| Item | PR | State |
+| --- | --- | --- |
+| 1 parents | #245 | merged a283db5 |
+| 2 kept directories | #247 | merged 6ab67e0 |
+| 3 priority | #249 | merged (head 4f503b3) |
+| 4 install | #250 | merged (head 4cc2af8) |
+| 5 retarget | #252 | refuted and fixed; gate pending (resume) |
+| 6 partial / inventory | #253 | refuted and fixed; gate pending |
+| 7 estate-move design | #251 | docs; gate pending |
+
+Open for the operator: confirm the `docs/slo.md` amendment (item 3); the
+kept-directory residuals and #248 (item 2); the four estate-move questions
+(item 7); the neo evidence for telefreeze and whether to build promisor
+mode (item 6).
