@@ -7411,6 +7411,11 @@ pub(crate) fn restore_linked_staged_landed(
         Some(index),
         custody,
     )?;
+    // `--exclude-union`: the receipt of this finished landing counted the
+    // item's appends.
+    if let Some(record) = landing.exclude_union {
+        exclude_union::reported(record, &exclude_path)?;
+    }
     landed::remove(&landing_intent)?;
     drop(lock);
     Ok(applied)

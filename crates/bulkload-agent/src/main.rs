@@ -84,11 +84,14 @@ SUBCOMMANDS:
                 (never a local path); otherwise only HTTPS origins are active.
                 --exclude-union (M2 round 2): a first linked landing whose
                 repository's common info/exclude is not the capture's appends
-                the captured lines it lacks (a recorded write: never removes or
-                reorders a line; STATE ITEM-SOURCE.exclude-union; receipt
-                exclude-appended=N) instead of refusing GIT_IGNORE_POLICY_CONFLICT,
-                unless either side holds a negation (!pattern), a bulkload
-                ledger owns the exclude, or it is not a regular file
+                the captured lines it lacks instead of refusing
+                GIT_IGNORE_POLICY_CONFLICT: a recorded write (STATE
+                ITEM-SOURCE.exclude-union; receipt exclude-appended=N) that never
+                removes or reorders a line and changes what EVERY worktree of the
+                repository ignores. Where a line would be appended it still
+                refuses for a negation (!pattern) on either side, an exclude a
+                bulkload ledger owns, a symlinked info or an exclude that is not
+                a regular file with one link this user owns
     estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a

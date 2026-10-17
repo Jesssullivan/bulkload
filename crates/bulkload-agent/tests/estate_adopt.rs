@@ -1545,7 +1545,8 @@ fn p108_exclude_union_appends_the_missing_captured_lines_and_lands() {
 /// union order-sensitive (the last matching pattern decides), so a
 /// captured exclude holding `!pattern` keeps `GIT_IGNORE_POLICY_CONFLICT`
 /// under `--exclude-union` too, with nothing written or recorded, and
-/// `estate-diff` names no union.
+/// `estate-diff` says the flag refuses too
+/// (`exclude-union-refused=GIT_IGNORE_POLICY_CONFLICT`).
 #[test]
 fn p109_exclude_union_refuses_a_negation() {
     let world = Gftb::new();
@@ -1560,7 +1561,7 @@ fn p109_exclude_union_refuses_a_negation() {
         let line = diff_line(&diff.stdout, source);
         assert!(
             line.contains("\"adopt\":\"ignore-policy-conflict\"")
-                && !line.contains("exclude-union"),
+                && line.contains("\"exclude-union-refused=GIT_IGNORE_POLICY_CONFLICT\""),
             "{line}"
         );
     }

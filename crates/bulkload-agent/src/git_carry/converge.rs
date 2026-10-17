@@ -3030,11 +3030,17 @@ pub(super) fn plan_linked(
     let lock = landed::lock(&common, source)?;
     let directory = landed::ledger_dir(&common, source);
     let mut custody = settle_repository(repository, &common, source)?;
-    // `--exclude-union`: an append a crash cut short is settled first.
+    // `--exclude-union`: under the repository-wide exclude lock, an append
+    // a crash cut short is settled first.
     let exclude_path = checked.exclude_path.as_path();
-    if let Some(record) = landing.exclude_union {
-        super::exclude_union::settle(record, exclude_path)?;
-    }
+    let exclude_lock = match landing.exclude_union {
+        Some(record) => {
+            let held = super::exclude_union::lock(&common)?;
+            super::exclude_union::settle(record, exclude_path)?;
+            Some(held)
+        }
+        None => None,
+    };
     let (exclude, append) = linked_exclude(
         &common,
         &checked.exclude_path,
@@ -3115,6 +3121,7 @@ pub(super) fn plan_linked(
     // `--exclude-union`: the append is the plan's last write, after every
     // refusal it can decide, under the lock.
     let exclude = union_append(landing, exclude_path, exclude, &append, &mut custody)?;
+    drop(exclude_lock);
     Ok(LinkedPlan {
         head,
         meta,
@@ -3128,8 +3135,10 @@ pub(super) fn plan_linked(
 }
 
 /// `--exclude-union`'s append of `append` to the exclude at `path` (which
-/// holds `exclude`), recorded and counted (`exclude-appended=<lines>`);
-/// the exclude the landing keeps.
+/// holds `exclude`), recorded; the exclude the landing keeps. Counts
+/// `exclude-appended=<lines>`: every appended line of the item's record no
+/// finished landing reported yet (this append's, and one a later refusal
+/// or a crash kept from its receipt).
 fn union_append(
     landing: &Landing<'_>,
     path: &Path,
@@ -3137,14 +3146,18 @@ fn union_append(
     append: &[Vec<u8>],
     custody: &mut Custody,
 ) -> Result<Vec<u8>> {
-    let Some(record) = landing.exclude_union.filter(|_| !append.is_empty()) else {
+    let Some(record) = landing.exclude_union else {
         return Ok(exclude);
     };
-    let kept = super::exclude_union::apply((record, landing.item), path, &exclude, append)?;
-    custody.add(
-        "exclude-appended",
-        u64::try_from(append.len()).unwrap_or(u64::MAX),
-    );
+    let kept = if append.is_empty() {
+        exclude
+    } else {
+        super::exclude_union::apply((record, landing.item), path, &exclude, append)?
+    };
+    let lines = super::exclude_union::unreported(record, path)?;
+    if lines > 0 {
+        custody.add("exclude-appended", lines);
+    }
     Ok(kept)
 }
 

@@ -35,14 +35,14 @@
 //!
 //! `ExcludeUnion` (M2 round 2, item 2): a source linked worktree whose
 //! common exclude is a superset of the destination repository's, applied
-//! with `--exclude-union` (every child here applies with it; it changes
-//! nothing where no exclude conflicts), crashed after the append's intent
-//! is recorded (the exclude untouched) or after the exclude is written
-//! (the record still an intent): the worktree is absent and the item
-//! `journal-missing`; the rerun settles the intent (`not-written`, then a
-//! fresh append counted `exclude-appended=1`; or `appended`, with nothing
-//! left to append), lands the worktree, and a second rerun is a journal
-//! no-op.
+//! with `--exclude-union` (this row only: the others run without it),
+//! crashed after the append's intent is recorded (the exclude untouched,
+//! its temporary written) or after the rename (the record still an
+//! intent): the worktree is absent and the item `journal-missing`; the
+//! rerun settles the intent by identity (`not-written`, its temporary
+//! removed, then a fresh append; or `appended`, with nothing left to
+//! append), counts the unreported append `exclude-appended=1` either way,
+//! lands the worktree, and a second rerun is a journal no-op.
 //!
 //! `_exit` models a process crash only (see the harness header).
 
@@ -59,6 +59,8 @@ use super::{Scenario, CHILD_DEADLINE, CHILD_WATCHDOG, CHILD_WATCHDOG_EXIT_CODE, 
 
 /// Set only in a child: the scratch base it applies in.
 const CHILD_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_BASE";
+/// Set only in an `ExcludeUnion` child: it applies with `--exclude-union`.
+const CHILD_UNION_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_UNION";
 
 /// What is crashed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,6 +113,9 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 struct World {
     base: PathBuf,
+    /// `--exclude-union` on every apply: the `ExcludeUnion` row only, so the
+    /// other rows keep their crash coverage without the flag.
+    union: bool,
 }
 
 impl Drop for World {
@@ -129,6 +134,7 @@ impl World {
         fs::create_dir(&base).unwrap();
         let world = Self {
             base: fs::canonicalize(&base).unwrap(),
+            union: kind == EstateAdopt::ExcludeUnion,
         };
         let src = world.base.join("src");
         fs::create_dir(&src).unwrap();
@@ -266,7 +272,7 @@ impl World {
             &ApplyOptions {
                 adopt,
                 activate_origin: Vec::new(),
-                exclude_union: true,
+                exclude_union: self.union,
             },
             &|row| {
                 rows.lock().unwrap().push((row.outcome, row.reason.clone()));
@@ -352,6 +358,7 @@ fn crash(world: &World, fault: &str) {
         ])
         .env(CHILD_ENV, &world.base)
         .env(FAULT_ENV, fault)
+        .env(CHILD_UNION_ENV, if world.union { "1" } else { "" })
         .env_remove(super::CHILD_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -406,7 +413,7 @@ fn adopt_child_entry() {
         &ApplyOptions {
             adopt: true,
             activate_origin: Vec::new(),
-            exclude_union: true,
+            exclude_union: std::env::var_os(CHILD_UNION_ENV).is_some_and(|value| value == "1"),
         },
         &|_| Ok(()),
     );
@@ -603,14 +610,18 @@ fn exclude_union(world: &World, label: &str, point: Point, nth: u64) {
     let rows = world.apply(false);
     assert_eq!(rows.len(), 1, "{label}");
     assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
-    assert_eq!(
+    assert!(
         rows[0]
             .1
             .as_deref()
             .is_some_and(|reason| reason.contains("exclude-appended=1")),
-        !written,
-        "{label}: {rows:?}"
+        "{label}: the append reaches a receipt either way: {rows:?}"
     );
+    let leftovers: Vec<_> = fs::read_dir(world.dst().join(".git/info"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(leftovers, ["exclude"], "{label}: a temporary was left");
     assert_eq!(fs::read(&exclude).unwrap(), b"*.log\nbuild/\n", "{label}");
     let states: Vec<AppendState> = record().appends.iter().map(|append| append.state).collect();
     if written {
