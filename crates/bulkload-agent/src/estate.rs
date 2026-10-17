@@ -2492,7 +2492,7 @@ fn beside_item(
     let mut record = git_carry::beside::read_record(&record_path)?.unwrap_or_default();
     {
         use std::os::unix::ffi::OsStrExt as _;
-        record.item = landing.item.to_owned();
+        landing.item.clone_into(&mut record.item);
         record.path = beside.as_os_str().as_bytes().to_vec();
     }
     record.suffix.clone_from(&suffix);

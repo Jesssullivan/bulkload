@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::{durable, git, input, landed, native_refs, oid, text};
+use super::{git, landed, native_refs, oid, text};
 use crate::{BulkloadRefusal, Result};
 
 /// What STATE records of one item's beside landing.
@@ -241,10 +241,11 @@ pub fn refs_in(repo: &Path, wanted: &BTreeMap<String, String>, suffix: &str) -> 
         }
     }
     if !transaction.is_empty() {
-        let mut command = git(repo);
-        durable(&mut command);
-        command.args(["update-ref", "--stdin", "-z"]);
-        input(&mut command, &transaction)?;
+        // The converge's one destination ref writer: the lines are
+        // compare-and-swap creates, and the refs and their directories are
+        // synced before any record names them.
+        let names: Vec<&str> = done.created.iter().map(|(name, _)| name.as_str()).collect();
+        native_refs::update_refs(repo, None, &transaction, &names)?;
     }
     Ok(done)
 }

@@ -2097,6 +2097,7 @@ impl Place<'_> {
 /// item was removed), `GIT_DESTINATION_OCCUPIED` (not bulkload's, or
 /// another item's), `GIT_CONVERGE_STALE_CAPTURE`, `GIT_CONVERGE_SHAPE_CHANGED`,
 /// `GIT_CONVERGE_INTERRUPTED`, or whatever the restore or import refuses.
+#[allow(clippy::too_many_lines)]
 pub fn apply_workspace(
     staged: &super::StagedBundle,
     target: &Target<'_>,
