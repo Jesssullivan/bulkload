@@ -18,9 +18,10 @@ The in-place run carried these nests by hand. A lane script read each
 capture's `nested-repository` receipt lines and planned one file pull per
 nest into the outer's landed workspace. It also planned one pull of the
 outer's `.git/modules` for every nest whose `.git` is a pointer file into
-it. Tonight that was 31 rows: 27 nests and 4 admin directories. Several
-nests held commits no remote has (`unpushed` from 29 to 703), so they were
-unique state, not rebuildable state. The script skipped:
+it. Tonight that was 31 rows: 27 nests and 4 admin directories. In the
+second batch's nest plan, 8 of 32 nests held commits no remote-tracking ref
+reaches (`unpushed` from 4 to 703), so they were unique state, not
+rebuildable state. The script skipped:
 
 - gitlink-only rows (an unpopulated submodule, landed by the outer as an
   empty directory, B2/N7);
