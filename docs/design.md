@@ -2132,6 +2132,69 @@ starts.
   reported as the destination's. Any other I/O error a store meets is `IO`
   with its errno (`EIO` where the errno cannot be read).
 
+## A symlinked live path into a side root: `--side-root` (M2r2 item e, 2026-10-17)
+
+The 10-16 in-place move met live checkout paths that were symlinks into a
+side root: `~/git/<name> -> estate/gftb-20261015/git/<name>`, the trees an
+earlier estate landing made. `estate-apply --adopt` refuses a checkout
+spelled through a symlink (`GIT_DESTINATION_OCCUPIED`, `estate-diff`
+`symlinked-path`; P97, P98), so the lane replaced each link with a `cp -a`
+of its target and ran `git worktree repair` by hand
+(`gftb-unlink-run.sh`, 29 links). `--side-root ROOT` (repeatable) on
+`estate-apply` and `estate-diff` does it natively:
+
+- **Which links.** For each planned repository and workspace path, the
+  first symlink at or above it (from the root down). It is this verb's only
+  when its target is strictly inside a side root; a link elsewhere is left
+  alone (its items refuse as before). It is seated only when its single hop
+  names a real directory: the link's text, joined to the link's directory,
+  is already in lexical form (no `.` or `..`) and is exactly the path the
+  system resolves (no other link on the way); the link's own parent is a
+  real path; the target is not a planned path, inside one, or above one;
+  and both are on one file system. Otherwise the link is refused
+  (`PATH_ESCAPES_ROOT`, `GIT_DESTINATION_OCCUPIED`, or `IO` with `EXDEV`)
+  and nothing is written.
+- **The seat.** Before any item lands, under the STATE lock: a record
+  `seat-<blake3(LIVE)>.seat` in STATE (live path, target, link text, the
+  directory's device and inode), durable first; one
+  `renameat2(RENAME_EXCHANGE)` (`renameatx_np(RENAME_SWAP)` on Darwin) of
+  the two names, so the live path holds the directory itself (the same
+  inode: no byte copied, read or written, every `lstat` field below it
+  kept) and the target the old link; then the target's link is replaced by
+  one naming the live path, so every path that still names the side root
+  (a linked worktree's `gitdir` file, its admin directory's backlink,
+  another tool's configuration) resolves to the same tree. Both parents
+  are synced. The apply prints `seat live= target=
+  outcome=seated|seat-resumed|previous-seated|refused reason=`.
+- **Then the items.** They land, adopt (A11a) or re-key (A11b) at the live
+  path, as at any real directory: the adopt proofs compare canonical
+  paths, so worktree links that name the side root still prove. No
+  `git worktree repair` is run: the admin files keep the side-root
+  spelling, which the link back resolves (residual: `git worktree list`
+  shows it, and removing the side root breaks those worktrees; repairing
+  them is an operator choice).
+- **Crash.** The record names every intermediate state (recorded only,
+  exchanged, link replaced); the next `estate-apply` finishes any record
+  in STATE before it plans, and a record whose paths hold none of its
+  states refuses `RECEIPT_BINDING_INVALID`, writing nothing.
+- **Undo.** `estate-unseat PRIVATE_STATE [LIVE ...]` exchanges back,
+  restores the live link with its own text and removes the record, under
+  the same lock; a tree replaced or a link rewritten since refuses
+  `RECEIPT_BINDING_INVALID` with nothing written. An undo after the items
+  re-keyed leaves their ledgers keyed to the live plan.
+- **Dry run.** `estate-diff --side-root ROOT` prints one `kind:"seat"` row
+  per link (`seatable` or `refused` with its code) and answers each item
+  spelled through a seatable link at the directory it names (the tree the
+  live path holds once seated), with the component `side-root-seat`.
+  Read-only.
+- **Against the copy cp -a made.** No second tree, no disk, no byte to
+  re-prove, atomic for every reader; the side root changes (each target
+  becomes a link back), which `cp -a` left untouched. Tests: P108 (a main
+  and a linked worktree directory, landed into a side root, seated and
+  re-keyed, closure passing, unseated), P109 (single hop only),
+  `estate::seat` unit tests (exact undo, every crash step, moved paths,
+  hop rules, a target another item plans).
+
 ## Installing the agent (M2 item 4, 2026-10-16)
 
 A `bulkload-agent` built inside `nix develop` is dynamically linked
