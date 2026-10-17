@@ -60,3 +60,21 @@ case-sensitive branch now lands both items).
 Open: a crash between the levels and the record leaves unrecorded empty
 directories or an empty `.bulkload-parent-*` temporary (documented; the
 rerun lands into them).
+
+## Item 5: `estate-retarget`, re-pointable captures
+
+Design: `docs/design.md`, "Re-pointable captures". Finding: item IDs hash
+the destination, so re-pointing a plan forced a full re-capture. The
+capture does not depend on the destination (source key, opaque bundle
+name, sidecars keyed by the bundle name, base groups by the source's
+common directory), so the verb rewrites the plan under its lock and writes
+one new `{item}.capture` per moved item with the old record's bytes, after
+checking the new plan as `estate-add-batch` would; the old plan is kept as
+`PLAN.before-retarget-<digest>`. Built because it was clean (PR on
+`feat/estate-retarget-20261016`). Tests: `retarget::tests` (component
+prefix), `estate_retarget` P108 (re-point, then the capture is a reuse hit
+with `read_source_file_bytes=0`, the apply lands at the new paths and none
+at the old, the rerun is a no-op, re-pointing back finds the records
+`present`) and P109 (an overlapping target refuses with plan and corpus
+unchanged). Not re-keyed by design: apply STATE and the capture's private
+STATE.
