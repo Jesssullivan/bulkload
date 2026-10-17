@@ -202,6 +202,30 @@ pub enum BulkloadRefusal {
     /// Carries the nest's path relative to the enclosing checkout;
     /// [`fmt::Display`] prints it escaped.
     GitNestCarrierRefused(Vec<u8>),
+    /// A `.git` gitdir-pointer file below the captured checkout names an
+    /// administration that is not its own (M2r2 item 6), either:
+    /// - one absent on this host: the directory it names does not exist or
+    ///   is not a directory (a copy of a pruned linked worktree, one carried
+    ///   from another host, a submodule whose `.git/modules` entry was
+    ///   removed, a pointer through a dangling symlink or an absent mount).
+    ///   Git does not read the directory as a repository; or
+    /// - a worktree administration of this repository whose registered
+    ///   checkout exists and points back to it: a copy of that live
+    ///   worktree, through which Git would act on the live worktree's HEAD
+    ///   and index.
+    ///
+    /// Neither is a nest the capture can carry, nor bytes it can claim as
+    /// seats. Carries the directory's path relative to the captured
+    /// checkout; [`fmt::Display`] prints it escaped.
+    GitNestPointerStale(Vec<u8>),
+    /// A `.git` gitdir-pointer file below the captured checkout names a
+    /// worktree administration of this repository whose registered checkout
+    /// is absent: a linked worktree moved (or copied) without `git worktree
+    /// repair`. Git still works there; `git worktree repair <dir>` run in the
+    /// moved worktree re-registers it (M2r2 item 6). Carries the directory's
+    /// path relative to the captured checkout; [`fmt::Display`] prints it
+    /// escaped.
+    GitNestWorktreeMoved(Vec<u8>),
     /// A path given as a repository is not that repository's root: Git would
     /// resolve it to an enclosing repository, or to none at all.
     GitRepositoryNotAtPath,
@@ -478,6 +502,8 @@ impl BulkloadRefusal {
             Self::GitNestConversionAttribute(_) => "GIT_NEST_CONVERSION_ATTRIBUTE",
             Self::GitNestPopulatedSubmodule(_) => "GIT_NEST_POPULATED_SUBMODULE",
             Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
+            Self::GitNestPointerStale(_) => "GIT_NEST_POINTER_STALE",
+            Self::GitNestWorktreeMoved(_) => "GIT_NEST_WORKTREE_MOVED",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
@@ -570,6 +596,8 @@ impl BulkloadRefusal {
         "GIT_NEST_CONVERSION_ATTRIBUTE",
         "GIT_NEST_POPULATED_SUBMODULE",
         "GIT_NEST_CARRIER_REFUSED",
+        "GIT_NEST_POINTER_STALE",
+        "GIT_NEST_WORKTREE_MOVED",
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_SOURCE_PARTIAL_CLONE",
@@ -633,6 +661,8 @@ impl fmt::Display for BulkloadRefusal {
             | Self::GitNestConversionAttribute(ref path)
             | Self::GitNestPopulatedSubmodule(ref path)
             | Self::GitNestCarrierRefused(ref path)
+            | Self::GitNestPointerStale(ref path)
+            | Self::GitNestWorktreeMoved(ref path)
             | Self::GitSourceAlternates(ref path)
             | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
@@ -823,6 +853,8 @@ mod tests {
             BulkloadRefusal::GitNestConversionAttribute(Vec::new()),
             BulkloadRefusal::GitNestPopulatedSubmodule(Vec::new()),
             BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
+            BulkloadRefusal::GitNestPointerStale(Vec::new()),
+            BulkloadRefusal::GitNestWorktreeMoved(Vec::new()),
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitSourcePartialClone,
@@ -900,6 +932,14 @@ mod tests {
             BulkloadRefusal::GitSourceAlternates(b"/s/objects/info/alternates".to_vec())
                 .to_string(),
             "GIT_SOURCE_ALTERNATES path=\"/s/objects/info/alternates\""
+        );
+        assert_eq!(
+            BulkloadRefusal::GitNestPointerStale(b"build/old \"tree\"".to_vec()).to_string(),
+            "GIT_NEST_POINTER_STALE path=\"build/old \\\"tree\\\"\""
+        );
+        assert_eq!(
+            BulkloadRefusal::GitNestWorktreeMoved(b"wt/after".to_vec()).to_string(),
+            "GIT_NEST_WORKTREE_MOVED path=\"wt/after\""
         );
     }
 
