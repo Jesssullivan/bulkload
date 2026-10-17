@@ -269,8 +269,8 @@ fn p108_a_retargeted_capture_lands_at_the_new_path_without_a_source_read() {
 }
 
 /// P109 RETARGET-REFUSES: a map that would make two workspace targets
-/// overlap, or a new identity that already holds another capture record,
-/// refuses with the plan and the corpus as they were.
+/// overlap, a map a rerun would apply again, and a CORPUS that is not
+/// there each refuse with the plan and the corpus as they were.
 #[test]
 fn p109_a_retarget_that_would_collide_changes_nothing() {
     let world = World::new();
@@ -292,4 +292,60 @@ fn p109_a_retarget_that_would_collide_changes_nothing() {
     assert!(!listing(&world.root)
         .iter()
         .any(|name| name.contains("before-retarget")));
+    // A NEW under its OLD would move the items again on every rerun.
+    let nested = world.retarget(&[("dest-old", "dest-old/v2")]);
+    assert!(!nested.ok);
+    assert!(
+        nested.stderr.contains("FIELD_DOMAIN_VIOLATION"),
+        "{}",
+        nested.stderr
+    );
+    // A CORPUS that is not there.
+    let mut list: Vec<OsString> = vec![
+        "estate-retarget".into(),
+        world.plan().into(),
+        world.path("no-corpus").into(),
+        "--map".into(),
+    ];
+    list.push(
+        format!(
+            "{}={}",
+            world.path("dest-old").display(),
+            world.path("dest-x").display()
+        )
+        .into(),
+    );
+    let refs: Vec<&dyn AsRef<std::ffi::OsStr>> = list
+        .iter()
+        .map(|arg| arg as &dyn AsRef<std::ffi::OsStr>)
+        .collect();
+    let missing = agent(&refs);
+    assert!(!missing.ok, "{}", missing.stdout);
+    assert_eq!(fs::read(world.plan()).unwrap(), plan);
+}
+
+/// P109b: re-pointing back after a re-capture under the new destination
+/// finds the old identity's record differing, and refuses
+/// `RECEIPT_BINDING_INVALID` with nothing written.
+#[test]
+fn p109b_retargeting_back_after_a_recapture_refuses() {
+    let world = World::new();
+    world.add(&[("src/one", "dest-old/one")]);
+    settle();
+    world.capture();
+    assert!(world.retarget(&[("dest-old", "dest-new")]).ok);
+    let source = world.path("src/one");
+    fs::write(source.join("file"), b"changed\n").unwrap();
+    git(&source, &["commit", "--quiet", "-am", "change"]);
+    settle();
+    world.capture();
+    let plan = fs::read(world.plan()).unwrap();
+    let back = world.retarget(&[("dest-new", "dest-old")]);
+    assert!(!back.ok, "{}", back.stdout);
+    assert!(
+        back.stderr.contains("RECEIPT_BINDING_INVALID"),
+        "{}",
+        back.stderr
+    );
+    assert_eq!(fs::read(world.plan()).unwrap(), plan);
 }

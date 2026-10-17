@@ -22,7 +22,24 @@
 //!    old record's bytes (temporary, fsync, rename, directory fsync). A
 //!    `{new}.capture` already there with the same bytes is kept (a rerun);
 //!    one with other bytes refuses the whole retarget
-//!    (`RECEIPT_BINDING_INVALID`): it is another capture of that item.
+//!    (`RECEIPT_BINDING_INVALID`): the new identity already has a capture
+//!    of its own, typically an older or newer capture of the same source
+//!    made under that destination before (a plan re-pointed back after a
+//!    re-capture). The operator chooses: capture again under the current
+//!    plan first, or set the other record aside by hand.
+//!
+//! Refused before anything is read: a CORPUS that is not a directory, two
+//! maps with the same `OLD`, and any `NEW` at or under any `OLD` (a rerun
+//! would move the items again). The plan lock serialises plan writers only:
+//! do not run it beside an `estate-capture` or `estate-apply` of the plan.
+//!
+//! On a plan already applied: the moved items are new items, so closure
+//! counts them unaccounted until they are applied at their new paths, and
+//! an apply lands a new checkout there (or, for a tree moved there by
+//! hand, re-keys it under `--adopt`); the old landing and its records stay
+//! as they were. Like any plan edit, it changes the plan's digest, so a
+//! dispositions ledger or transfer manifest bound to it refuses
+//! `RECEIPT_BINDING_INVALID`.
 //! 4. The plan as it was is kept beside it
 //!    (`{plan}.before-retarget-{digest}`), then the new plan replaces it.
 //!
@@ -79,6 +96,33 @@ pub fn mapped(path: &Path, maps: &[(PathBuf, PathBuf)]) -> Option<PathBuf> {
         })
 }
 
+/// Refuse maps a rerun would apply again, or that are ambiguous: two maps
+/// with the same `OLD` (component-wise), and any `NEW` at or under any
+/// `OLD` (`--map /d=/d/v2`, or a chain `/a=/b`, `/b=/c`), which would move
+/// the items once more on every rerun.
+///
+/// # Errors
+/// `FIELD_DOMAIN_VIOLATION` for either.
+pub fn check_maps(maps: &[(PathBuf, PathBuf)]) -> Result<()> {
+    let normal = |path: &Path| path.components().collect::<PathBuf>();
+    for (index, (old, _)) in maps.iter().enumerate() {
+        if maps
+            .iter()
+            .skip(index + 1)
+            .any(|(other, _)| normal(other) == normal(old))
+        {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+        if maps
+            .iter()
+            .any(|(_, new)| normal(new).starts_with(normal(old)))
+        {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+    }
+    Ok(())
+}
+
 // The capture record of `identity`, raw, or `None`.
 fn record_bytes(corpus: &Path, identity: &str) -> Result<Option<Vec<u8>>> {
     const SITE: &str = "estate::retarget::record";
@@ -120,6 +164,15 @@ pub fn retarget(plan: &Path, corpus: &Path, maps: &[(PathBuf, PathBuf)]) -> Resu
             .any(|(old, new)| !old.is_absolute() || !new.is_absolute())
     {
         return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    check_maps(maps)?;
+    // A CORPUS that is not there would re-key nothing and still rewrite the
+    // plan, after which no rerun could find the old records.
+    if !fs::metadata(corpus)
+        .refuse_at("estate::retarget::corpus")?
+        .is_dir()
+    {
+        return Err(BulkloadRefusal::FieldDomainViolation);
     }
     let _lock = exclusive(&plan.with_extension("lock"))?;
     let before: Plan = read(plan)?;
@@ -207,6 +260,24 @@ mod tests {
             .iter()
             .map(|(old, new)| (PathBuf::from(old), PathBuf::from(new)))
             .collect()
+    }
+
+    #[test]
+    fn maps_a_rerun_would_apply_again_are_refused() {
+        assert_eq!(
+            check_maps(&maps(&[("/d", "/d/v2")])),
+            Err(BulkloadRefusal::FieldDomainViolation)
+        );
+        assert_eq!(
+            check_maps(&maps(&[("/a", "/b"), ("/b", "/c")])),
+            Err(BulkloadRefusal::FieldDomainViolation)
+        );
+        assert_eq!(
+            check_maps(&maps(&[("/d", "/x"), ("/d/", "/y")])),
+            Err(BulkloadRefusal::FieldDomainViolation)
+        );
+        assert_eq!(check_maps(&maps(&[("/a", "/b"), ("/c", "/d")])), Ok(()));
+        assert_eq!(check_maps(&maps(&[("/d/v2", "/d")])), Ok(()));
     }
 
     #[test]

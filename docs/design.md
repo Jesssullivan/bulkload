@@ -2077,14 +2077,25 @@ are keyed by the source's common directory. `estate-retarget PLAN CORPUS
    `GIT_DESTINATION_OCCUPIED`), before anything is written;
 3. each moved item's record is written under its new identity with the
    old record's bytes (temporary, fsync, rename, directory fsync); one
-   already there with the same bytes is kept, one with other bytes refuses
-   the whole retarget `RECEIPT_BINDING_INVALID`;
+   already there with the same bytes is kept, one with other bytes (that
+   identity's own capture, e.g. a plan re-pointed back after a re-capture)
+   refuses the whole retarget `RECEIPT_BINDING_INVALID`: capture again
+   first, or set that record aside by hand;
 4. the plan as it was is kept as `PLAN.before-retarget-<digest>`, then the
    new plan replaces it.
 
 It prints one line per moved item (`item= was= ... capture=rekeyed|present|
-absent`). A crash before step 4 leaves new records nothing reads; the
-rerun finishes, and a rerun after it changes nothing. Nothing is deleted.
+absent`). Refused before anything is read: a CORPUS that is not a
+directory, two maps with the same `OLD`, and any `NEW` at or under any
+`OLD` (a rerun would move the items again). A crash before step 4 leaves
+new records nothing reads; the rerun finishes, and a rerun after it
+changes nothing. The plan lock serialises plan writers only: not to be run
+beside a capture or apply of the plan. On a plan already applied, the
+moved items are new: closure counts them unaccounted until applied at the
+new paths (a new landing, or an `--adopt` re-key of a tree moved there by
+hand), and the old landing stays; like any plan edit, it changes the
+plan's digest, so a dispositions ledger or transfer manifest bound to it
+refuses `RECEIPT_BINDING_INVALID`. Nothing is deleted.
 The next `estate-capture` of the new plan is a reuse hit
 (`capture-reused-after-census`, 0 source bytes) and the apply lands at the
 new paths. Not re-keyed: apply STATE (journals and outcome records belong
