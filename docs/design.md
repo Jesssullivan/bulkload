@@ -1666,7 +1666,28 @@ publication is no-replace, with one ruled exception (superseding publish,
 below). A directory the engine creates is made under a tagged temporary
 name, its record is bound to the new inode, and it is then renamed into place
 with no-replace. The engine never adopts a directory it did not create
-(R-N78, R-N102).
+(R-N78, R-N102). An existing directory with no owning record is a
+container only, its mode never changed and no record bound to it: when its
+mode equals the source's it is accepted as before; when it differs it is
+accepted with its mode kept only if it is this user's, gives its owner
+read, write and search, and grants nobody else anything the source's mode
+does not (the owner's own bits are not compared, so an unfinished 0700
+directory under a read-only 0555 source is accepted). M2 item 2
+(2026-10-16): a pull into a copy of an unfinished landing, 0700 directories
+under a 0755 source, refused every directory of the copy, 160 of them, and
+exited 1; the files below were decided all the same (a refused directory
+refuses its own row only), so equal files were adopted and differing ones
+refused. Such a directory is now counted (`dest_directory_mode_kept`) and
+reported on stderr (`directory-mode-kept <path> found=<mode>
+source=<mode>`); it is not in the transfer's closure row, and it never
+converges to the source's mode, which would adopt it (residuals for the
+operator). Any other divergent mode (wider than the source's, another
+owner, no owner access) is refused `DESTINATION_OCCUPIED` as before.
+Known gap, not changed here (#248): that refusal covers the directory's
+own row, and its entries are still decided and published inside it, so a
+private source tree can land inside a wider existing directory. An existing file
+is adopted only when its bytes and its mode verify; an equal file whose
+mode differs is refused.
 
 Records commit in groups. Each file is sealed (`F_BARRIERFSYNC` on Darwin,
 `fsync` elsewhere, so its mode is durable too) and renamed into place without
