@@ -41,18 +41,20 @@ salvage.]
   no document decides it: both are stated with their dates and the conflict
   is listed below for the operator.
 
-## Open for the operator
+## Settled 2026-10-16 (formerly open for the operator)
 
-- **Builds and tests on neo.** FOOT-03 (2026-08-26): "we CANNOT EVER build
-  on neo, EVER"; FOOT-10 (2026-09-01) restates it for tests, checks and
-  lints; SPEC R4 cites both. R-N69 (about 2026-09-23, newer) allowed local
-  cargo builds on neo behind an inline `TINYLAND_ALLOW_LOCAL_BUILD="<lane>
-  (R-N69)"` prefix. Neither is recorded as superseding the other, and
-  OI-1003-Q194 (C1–C20) does not address it. `AGENTS.md`, "Agent lanes",
-  carries the same entry.
-- **R-N81 and SPEC R3.** R-N81's load gate (load1 below 2.5 for a gated
-  sample) against SPEC R3's "Samples run on live hosts" (`docs/slo.md`,
-  amendment 2026-10-16, R-N91).
+Both items were ruled at 17:45:55Z (Linear TIN-4543 `34c2a101`); this
+section was corrected 2026-10-17 (Bulkload Reset Review row C11).
+
+- **Builds and tests on neo: never (OI-1003-Q196).** FOOT-03 and FOOT-10
+  are upheld and R-N69 is retired. Darwin checks run on PZM or a CI macOS
+  runner, never on neo. `AGENTS.md`, "Agent lanes", carries the same entry.
+- **R-N81 and SPEC R3: rig controls, no quiet windows (OI-1003-Q197).** A
+  rep of record passes R-N81 (load1 < 2.5, AC power) plus the rig's thermal
+  and slot controls; other work is never quiesced for a sample, and
+  under-load reps stay informational (Q39). Since R-C842 (`ace8649c`) the
+  gate of record is end-to-end seat time; the corpus race is a regression
+  guard only.
 
 ## Labels
 
