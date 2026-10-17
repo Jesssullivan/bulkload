@@ -60,7 +60,7 @@ SUBCOMMANDS:
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply [--adopt] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+    estate-apply [--adopt] [--exclude-union] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces.
                 A landed checkout bulkload proves unchanged converges to the
                 current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
@@ -81,7 +81,14 @@ SUBCOMMANDS:
                 lands a bare repository bulkload makes (with or without
                 --adopt). --activate-origin PREFIX (repeatable): a first landing
                 activates an scp-style or ssh:// origin starting with PREFIX
-                (never a local path); otherwise only HTTPS origins are active
+                (never a local path); otherwise only HTTPS origins are active.
+                --exclude-union (M2 round 2): a first linked landing whose
+                repository's common info/exclude is not the capture's appends
+                the captured lines it lacks (a recorded write: never removes or
+                reorders a line; STATE ITEM-SOURCE.exclude-union; receipt
+                exclude-appended=N) instead of refusing GIT_IGNORE_POLICY_CONFLICT,
+                unless either side holds a negation (!pattern), a bulkload
+                ledger owns the exclude, or it is not a regular file
     estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
@@ -1362,6 +1369,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     &estate::ApplyOptions {
                         adopt: options.adopt,
                         activate_origin: options.activate_origin,
+                        exclude_union: options.exclude_union,
                     },
                 ),
                 &receipt,
@@ -1375,7 +1383,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         "estate-diff" => {
             let (options, rest) = estate_options(args)?;
-            if rest.len() < 4 || options.adopt {
+            if rest.len() < 4 || options.adopt || options.exclude_union {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let source = rest
@@ -1724,6 +1732,7 @@ fn handoff_options(
 #[derive(Default)]
 struct EstateOptions {
     adopt: bool,
+    exclude_union: bool,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
@@ -1737,6 +1746,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
         match arg {
             "--adopt" if !options.adopt => {
                 options.adopt = true;
+                at += 1;
+            }
+            "--exclude-union" if !options.exclude_union => {
+                options.exclude_union = true;
                 at += 1;
             }
             "--activate-origin" => {

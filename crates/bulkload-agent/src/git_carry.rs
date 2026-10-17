@@ -31,6 +31,7 @@ pub mod decide;
 )]
 mod decide_tests;
 pub mod estimate;
+pub mod exclude_union;
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -6770,6 +6771,7 @@ pub fn restore_staged(
             observed_ns: 0,
             capture: staged.digest(),
             parents: None,
+            exclude_union: None,
         },
         &[],
     )
@@ -7252,6 +7254,7 @@ pub fn restore_linked_staged(
             observed_ns: 0,
             capture: staged.digest(),
             parents: None,
+            exclude_union: None,
         },
     )
     .map(drop)
@@ -7286,7 +7289,7 @@ pub(crate) fn restore_linked_staged_landed(
         (repository, base),
         destination,
         source,
-        landing.observed_ns,
+        (landing.observed_ns, landing.exclude_union.is_some()),
     )?;
     // M2 finding 1: after every write-free refusal, the absent parents
     // are the landing's first write.
@@ -7556,6 +7559,7 @@ pub(crate) fn recover_linked_landing(
             observed_ns: intent.observed_ns,
             capture: intent.capture,
             parents: None,
+            exclude_union: None,
         },
         &meta,
         (&intent.head, intent.intended_branch.as_ref()),

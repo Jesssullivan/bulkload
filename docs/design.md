@@ -875,6 +875,40 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   `bare-landing`) with the component `parents=<n>` (the levels absent
   now; items sharing them each count them), and `parent-missing` only
   where the policy refuses.
+- **`--exclude-union` is a recorded write (M2 round 2, item 2,
+  2026-10-17).** The in-place run refused 250 new linked worktrees
+  `GIT_IGNORE_POLICY_CONFLICT` in repositories whose captured common
+  exclude was a pure superset of the destination's. Without the flag
+  nothing changes. With `estate-apply --exclude-union`, a first linked
+  landing whose common `info/exclude` is neither the capture's nor a newer
+  one the main item set appends the captured lines it lacks (exact bytes,
+  blank lines skipped, each once, in captured order) after its last line,
+  and lands. No existing byte is removed, changed or reordered (the old
+  file is a byte prefix of the new one); when nothing is missing nothing is
+  written, so a rerun, and every later linked item of the same
+  repository, writes nothing. The union is taken only where order cannot
+  matter: Git decides by the last matching pattern, so a negation
+  (`!pattern`; `\!` is a literal) on either side keeps the refusal. So
+  does an exclude a bulkload ledger at the repository records (any
+  label's main workspace ledger, or a ref ledger's exclude row: that main
+  item's converge owns it, and an append would fail its proof), one that
+  is not a regular file (never written through a symlink), and one that
+  changed between the decision and the write. The decision is made by the
+  write-free checks and again under the destination lock; the append is
+  the plan's last write before `git worktree add`. It is recorded
+  write-ahead in STATE (`{item}-{blake3(SOURCE)}.exclude-union`: the path,
+  the digests before and after, the lines) as an intent, then the file is
+  replaced (temporary, fsync, rename, directory fsync, its mode kept) and
+  the entry marked `appended`; the receipt counts `exclude-appended=<n>`.
+  A crash between (`estate.apply.exclude_intent`,
+  `estate.apply.exclude_appended`) leaves an intent the next run under the
+  flag settles by the file's digest: `appended` at the after digest,
+  `not-written` at the before digest, otherwise left an intent (the file
+  changed since; the record never guesses). The landed worktree's ignore
+  set is the union of both policies: a destination-only line can classify
+  a captured untracked file as ignored there (its bytes are carried all
+  the same). `estate-diff` still says `ignore-policy-conflict` and, where
+  the flag would land the item, the component `exclude-union=<n>`.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads

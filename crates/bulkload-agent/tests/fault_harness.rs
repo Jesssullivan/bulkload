@@ -1476,6 +1476,11 @@ scenarios! {
     estate_adopt_bare_staged => EstateAdoptBareStaged: 1, EstateAdopt::Bare;
     // M2 finding 1: a first landing's absent parents made, not recorded.
     estate_apply_parents_made => EstateApplyParentsMade: 1, EstateAdopt::Parents;
+    // M2 round 2, item 2: an --exclude-union append, recorded as an intent
+    // before the exclude is written, and the exclude written before the
+    // record is settled.
+    estate_apply_exclude_intent => EstateApplyExcludeIntent: 1, EstateAdopt::ExcludeUnion;
+    estate_apply_exclude_appended => EstateApplyExcludeAppended: 1, EstateAdopt::ExcludeUnion;
     // Re-seat (R0, TIN-6587): a first pass crashed at its first and its last
     // placement (the transcript, then the Codex rollout) and at its row
     // commit; a pass extending a grown transcript; a pass superseding a

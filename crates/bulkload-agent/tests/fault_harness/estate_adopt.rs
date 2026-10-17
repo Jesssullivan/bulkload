@@ -33,6 +33,17 @@
 //! (nothing left to make, so nothing recorded), and a second rerun is a
 //! journal no-op.
 //!
+//! `ExcludeUnion` (M2 round 2, item 2): a source linked worktree whose
+//! common exclude is a superset of the destination repository's, applied
+//! with `--exclude-union` (every child here applies with it; it changes
+//! nothing where no exclude conflicts), crashed after the append's intent
+//! is recorded (the exclude untouched) or after the exclude is written
+//! (the record still an intent): the worktree is absent and the item
+//! `journal-missing`; the rerun settles the intent (`not-written`, then a
+//! fresh append counted `exclude-appended=1`; or `appended`, with nothing
+//! left to append), lands the worktree, and a second rerun is a journal
+//! no-op.
+//!
 //! `_exit` models a process crash only (see the harness header).
 
 use std::fs;
@@ -58,6 +69,8 @@ pub enum EstateAdopt {
     Bare,
     /// A first landing under absent parents (M2 finding 1).
     Parents,
+    /// A first linked landing under `--exclude-union` (M2 round 2, item 2).
+    ExcludeUnion,
 }
 
 impl Scenario for EstateAdopt {
@@ -129,7 +142,9 @@ impl World {
         git(&src, &["branch", "side"]);
         git(&src, &["branch", "neo-only"]);
         git(&src, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        let (item, dest) = if kind == EstateAdopt::Parents {
+        let (item, dest) = if kind == EstateAdopt::ExcludeUnion {
+            (world.exclude_union_item(&src), None)
+        } else if kind == EstateAdopt::Parents {
             (
                 Item {
                     source: src.clone(),
@@ -186,6 +201,41 @@ impl World {
         world
     }
 
+    /// The `ExcludeUnion` item: a linked worktree of `src` whose common
+    /// exclude is a superset of the destination's, a `cp -a` of `src`
+    /// without its worktree administration.
+    fn exclude_union_item(&self, src: &Path) -> Item {
+        let tree = self.base.join("src-wt");
+        git(
+            src,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                tree.to_str().unwrap(),
+            ],
+        );
+        fs::write(tree.join("wt.txt"), b"wt\n").unwrap();
+        fs::create_dir_all(src.join(".git/info")).unwrap();
+        fs::write(src.join(".git/info/exclude"), b"*.log\nbuild/\n").unwrap();
+        let out = Command::new("cp")
+            .arg("-a")
+            .arg(src)
+            .arg(self.dst())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        fs::remove_dir_all(self.dst().join(".git/worktrees")).unwrap();
+        fs::write(self.dst().join(".git/info/exclude"), b"*.log\n").unwrap();
+        Item {
+            source: tree,
+            repository: self.dst(),
+            workspace: Some(self.base.join("dst-wt")),
+        }
+    }
+
     fn dst(&self) -> PathBuf {
         self.base.join("dst")
     }
@@ -216,6 +266,7 @@ impl World {
             &ApplyOptions {
                 adopt,
                 activate_origin: Vec::new(),
+                exclude_union: true,
             },
             &|row| {
                 rows.lock().unwrap().push((row.outcome, row.reason.clone()));
@@ -355,6 +406,7 @@ fn adopt_child_entry() {
         &ApplyOptions {
             adopt: true,
             activate_origin: Vec::new(),
+            exclude_union: true,
         },
         &|_| Ok(()),
     );
@@ -368,6 +420,10 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
     world.capture();
     if kind == EstateAdopt::Parents {
         parents(&world, &label, point, nth);
+        return;
+    }
+    if kind == EstateAdopt::ExcludeUnion {
+        exclude_union(&world, &label, point, nth);
         return;
     }
     if kind == EstateAdopt::Bare {
@@ -498,6 +554,79 @@ fn parents(world: &World, label: &str, point: Point, nth: u64) {
         "{label}"
     );
     assert_eq!(records(world), 0, "{label}");
+    assert_eq!(world.unaccounted(), 0, "{label}");
+    let rows = world.apply(false);
+    assert_eq!(
+        rows[0].0, "previous-workspace-restoration-not-revalidated",
+        "{label}"
+    );
+}
+
+/// The `ExcludeUnion` row: see the module docs.
+fn exclude_union(world: &World, label: &str, point: Point, nth: u64) {
+    use bulkload_agent::git_carry::exclude_union::{read_record, AppendState};
+    let exclude = world.dst().join(".git/info/exclude");
+    let record = || {
+        let found: Vec<PathBuf> = fs::read_dir(world.base.join("applied"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "exclude-union"))
+            .collect();
+        assert_eq!(found.len(), 1, "{label}: one record");
+        read_record(&found[0]).unwrap().unwrap()
+    };
+    let written = point == Point::EstateApplyExcludeAppended;
+    crash(world, &format!("{}:{nth}", point.name()));
+    assert_eq!(
+        fs::read(&exclude).unwrap(),
+        if written {
+            b"*.log\nbuild/\n".as_slice()
+        } else {
+            b"*.log\n"
+        },
+        "{label}"
+    );
+    assert_eq!(
+        record()
+            .appends
+            .iter()
+            .map(|append| append.state)
+            .collect::<Vec<_>>(),
+        [AppendState::Intent],
+        "{label}: recorded ahead of the write, settled after it"
+    );
+    assert!(
+        fs::symlink_metadata(world.base.join("dst-wt")).is_err(),
+        "{label}: nothing landed"
+    );
+    assert_eq!(world.unaccounted(), 1, "{label}: journal-missing");
+    let rows = world.apply(false);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
+    assert_eq!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("exclude-appended=1")),
+        !written,
+        "{label}: {rows:?}"
+    );
+    assert_eq!(fs::read(&exclude).unwrap(), b"*.log\nbuild/\n", "{label}");
+    let states: Vec<AppendState> = record().appends.iter().map(|append| append.state).collect();
+    if written {
+        assert_eq!(states, [AppendState::Appended], "{label}");
+    } else {
+        assert_eq!(
+            states,
+            [AppendState::NotWritten, AppendState::Appended],
+            "{label}"
+        );
+    }
+    assert_eq!(
+        fs::read(world.base.join("dst-wt/wt.txt")).unwrap(),
+        b"wt\n",
+        "{label}"
+    );
     assert_eq!(world.unaccounted(), 0, "{label}");
     let rows = world.apply(false);
     assert_eq!(

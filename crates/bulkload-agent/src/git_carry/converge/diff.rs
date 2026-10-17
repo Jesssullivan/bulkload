@@ -73,6 +73,9 @@ pub struct ItemRow {
     /// The components that differ: `head`, `index`, `exclude`,
     /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
     /// landing that makes `n` absent parents (M2 finding 1);
+    /// `exclude-union=<n>` for an `ignore-policy-conflict` that
+    /// `estate-apply --exclude-union` lands by appending `n` lines (M2
+    /// round 2, item 2);
     /// `repository-absent` for a
     /// first linked landing whose repository the apply's main item lands
     /// first (its exclude policy is not checked); or, for an occupied shape
@@ -115,12 +118,14 @@ fn occupied(row: &mut ItemRow, reason: &'static str) {
 // says `repository-absent`). `GIT_IGNORE_POLICY_CONFLICT` is
 // `ignore-policy-conflict`, `GIT_DESTINATION_PARENT_MISSING`
 // `parent-missing`; any other refusal is the row's refusal. With the
-// verdict, how many absent parents the apply makes (M2 finding 1).
+// verdict, how many absent parents the apply makes (M2 finding 1), and for
+// `ignore-policy-conflict` how many lines `--exclude-union` would append
+// to land it (`None` where the union refuses too; M2 round 2, item 2).
 fn first_landing(
     staged: &super::super::StagedBundle,
     target: &Target<'_>,
     landing: &Landing<'_>,
-) -> Result<(&'static str, usize)> {
+) -> Result<(&'static str, usize, Option<usize>)> {
     let workspace = target
         .workspace
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
@@ -132,14 +137,27 @@ fn first_landing(
             (target.repository, target.base),
             workspace,
             target.source,
-            landing.observed_ns,
+            (landing.observed_ns, false),
         )
         .map(|checked| checked.destination)
     };
     match checked {
-        Ok(first) => Ok(("landing", first.absent())),
-        Err(BulkloadRefusal::GitIgnorePolicyConflict) => Ok(("ignore-policy-conflict", 0)),
-        Err(BulkloadRefusal::GitDestinationParentMissing) => Ok(("parent-missing", 0)),
+        Ok(first) => Ok(("landing", first.absent(), None)),
+        Err(BulkloadRefusal::GitIgnorePolicyConflict) => {
+            // M2 round 2, item 2: what `--exclude-union` would do, decided
+            // by the same check under its union rule (read-only).
+            let union = check_linked(
+                staged,
+                (target.repository, target.base),
+                workspace,
+                target.source,
+                (landing.observed_ns, true),
+            )
+            .ok()
+            .map(|checked| checked.exclude_union.len());
+            Ok(("ignore-policy-conflict", 0, union))
+        }
+        Err(BulkloadRefusal::GitDestinationParentMissing) => Ok(("parent-missing", 0, None)),
         Err(other) => Err(other),
     }
 }
@@ -174,9 +192,12 @@ pub fn workspace(
     };
     if planned(workspace)?.is_none() {
         row.class = "source-only";
-        let (adopt, absent) = first_landing(staged, target, landing)?;
+        let (adopt, absent, union) = first_landing(staged, target, landing)?;
         row.adopt = adopt;
         parents_component(&mut row, absent);
+        if let Some(lines) = union {
+            row.components.push(format!("exclude-union={lines}"));
+        }
         if standalone && row.adopt == "landing" {
             let scratch = Scratch::new(staged, None, target.base, target.source)?;
             row.origin = origin(&scratch, target.source, origins)?;
