@@ -1218,6 +1218,15 @@ writers never pause for a capture. What moved is recorded, never absorbed:
 
 ## Performance
 
+[Label 2026-10-17 (R-N13), Bulkload Reset Review row E05: the two-gate
+corpus race below is retired as the performance bar. Since R-C842 (Linear
+TIN-4543 `ace8649c`) the gate of record is end-to-end wall-clock time to a
+verified working seat, compared against an rclone sync of the same home
+([SPEC](SPEC.md) R3); gate (a) stays only as a regression guard, and the
+gate (b) harness `gate_b.py` is retired (N03; `m3_link.py` carries the
+rclone arm). The gate text is kept as a dated record. The resume and
+adoption rules after it describe the running engine and stand.]
+
 Performance is the product bar (R23, R25). Two gates (R-N57); their order,
 verdict rule, hosts and corpus are S1 in [slo.md](slo.md) (OI-1002-Q30's
 B/A/B/A/B; OI-1003-Q97; OI-1003-Q194 C2):
@@ -1272,6 +1281,11 @@ source bytes read.
   (the seat moved since that capture) is read again and not counted.
 
 ## M2 gates (historical)
+
+[Label 2026-10-17 (R-N13), Bulkload Reset Review row E05: the W4 and W5
+corpus-race gates in this table are retired by R-C842 (Linear TIN-4543
+`ace8649c`); they are not gates of record. The S2 budget rules after the
+table stand (`s2_budget.py` is kept).]
 
 [Historical, labelled 2026-10-16 (R-N13).] The M2 workstream acceptance
 table as of 2026-10-05. S1–S5 in [slo.md](slo.md) replaced this framing;

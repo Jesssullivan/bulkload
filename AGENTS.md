@@ -122,19 +122,23 @@ R-HOOK-CONVERGENCE-20261004 (brief, changes only, no whole-board recital).
   repos they create and destroy (R-N98).
 - Each lane builds with its own `CARGO_TARGET_DIR`. A shared target
   directory lets one lane test another lane's binaries.
-- Builds and tests on neo: **open for the operator**. FOOT-03 (2026-08-26,
-  "we CANNOT EVER build on neo, EVER") and FOOT-10 (2026-09-01: tests,
-  checks and lints on the teletype "WILL crash the machine") say no; SPEC
-  R4 cites both. R-N69 (about 2026-09-23, newer) allowed local cargo builds
-  on neo behind an inline `TINYLAND_ALLOW_LOCAL_BUILD="<lane> (R-N69)"`
-  prefix as the first token. Neither is recorded as superseding the other
-  ([docs/SOURCES.md](docs/SOURCES.md), "Open for the operator").
+- Builds and tests on neo: **never** (OI-1003-Q196, operator 2026-10-16,
+  Linear TIN-4543 `34c2a101`). This upholds FOOT-03 (2026-08-26, "we CANNOT
+  EVER build on neo, EVER") and FOOT-10 (2026-09-01); R-N69 and its
+  `TINYLAND_ALLOW_LOCAL_BUILD` prefix are retired. Darwin checks run on PZM
+  or a CI macOS runner. A newer neo agent is built elsewhere and shipped to
+  neo with its sha256 checked.
 - Benchmark and S2 sampling conditions (R-N81, OI-1003-Q39, Q152, Q160,
-  Q168) are in docs/slo.md S1 and S2. R-N91 (holding other lanes quiet for a
-  sample) is read as superseded by OI-1003-Q194 C18 (never-halt) together
-  with SPEC R3 ("Samples run on live hosts"); RUL-18 itself names CONF-01,
-  06, 07 and 08, not R-N91. How R-N81's load gate fits SPEC R3 is open
-  (docs/slo.md, amendment 2026-10-16).
+  Q168) are in docs/slo.md S1 and S2. Samples of record use rig controls,
+  never quiet windows (OI-1003-Q197, `34c2a101`): a rep of record passes
+  R-N81 (load1 < 2.5, AC power) and the rig's thermal and slot controls
+  (per-rep CPU package temperature and throttle count recorded, a refusal
+  threshold, balanced A/B slots, a cool-down between reps). Other work is
+  never quiesced for a sample, so R-N91 is superseded; under-load reps stay
+  informational (Q39). This settles "R-N81 vs SPEC R3". Since R-C842
+  (2026-10-16, TIN-4543 `ace8649c`) the gate of record is end-to-end time
+  to a verified working seat against an rclone sync of the same home; the
+  corpus race (gate a) stays only as a regression guard.
 
 ## Durable notes
 
@@ -145,7 +149,10 @@ Distilled facts and rulings also go on the owning Linear issue. Nothing
 durable is left in `/tmp` or a harness scratchpad. Notes are dated records:
 one that is no longer true gets a dated label at its top naming what
 superseded it, and is not rewritten or deleted (lab R-N13; this replaces the
-earlier R-N55 deletion rule).
+earlier R-N55 deletion rule). One exception is ruled: R-C843
+(2026-10-16, TIN-4543 `ace8649c`) deletes the condemned whitepaper, formal
+model and clone-race lever notes in a signed commit citing docs/SPEC.md; the
+intent ledger and ruling records are never deleted.
 
 ## Validation
 
