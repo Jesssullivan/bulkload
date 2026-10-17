@@ -20,7 +20,7 @@ bulkload-agent -- ordinary-file transport and offline SQLite composition
 
 USAGE:
     bulkload-agent [--durability=group|strict] [--min-free-percent=N]
-                   [--priority=background|normal]
+                   [--priority=background|normal|auto] [--escalate-after=SECONDS]
                    [--source-ledger-sync=relaxed|full]
                    [--sqlite=refuse|snapshot] <SUBCOMMAND>
 
@@ -326,13 +326,24 @@ BOUNDARIES:
     and not yet Held count against a probe refreshed on each group commit,
     so the session continues and stays resumable. estate-apply refuses before
     any item, planning bundle sizes (a lower bound).
-    --priority=background|normal (WP0(f)): serve, estate-capture, snapshot,
+    --priority=background|normal|auto (WP0(f)): serve, snapshot,
     git-carry-estimate, git-export and copy read a live source, so they enter
     background CPU and IO priority before anything else (Linux nice 19 and the
     idle IO class; Darwin IOPOL_THROTTLE, QOS_CLASS_BACKGROUND and nice 19),
     inherited by every thread and child; other verbs run at normal priority.
-    --priority=normal is the explicit opt-out (gate (a)); every counters line
-    records priority= and priority_from=default|flag.
+    estate-capture defaults to auto (M2 item 3): background when a terminal
+    was read or written within 300 s, normal otherwise. --priority=normal is
+    the explicit opt-out (gate (a)); every counters line records priority=
+    and priority_from=default|flag|auto (and priority_auto=idle|interactive|
+    unknown).
+    --escalate-after=SECONDS (M2 item 3; estate-capture's default 300, any
+    other verb only when given; 0 off): a process at background priority
+    whose counters (and, on Linux, its descendants' IO) do not move for
+    SECONDS moves its IO (Linux: and its descendants') back to the class its
+    nice value implies, once; the counters line then says
+    priority_escalate_after=SECONDS, and priority_escalations,
+    priority_escalated_ns, priority_escalated_threads and
+    priority_escalation_failures record it.
     copy/pull require an existing destination directory.
     copy/pull replace only their own untouched outputs, when the source seat
     changed (superseding publish, WP0(d)); any other divergent destination
@@ -433,7 +444,8 @@ COUNTERS:
 /// Verbs that read a live source on the host they run on. Each enters
 /// background CPU and IO priority before anything else unless
 /// `--priority=normal` opts out, and the opt-out is recorded (WP0(f),
-/// OI-1003-Q17). `copy` is here because it reads the source in-process (it is
+/// OI-1003-Q17), except the [`AUTO_VERBS`], whose default is `auto` (M2
+/// item 3). `copy` is here because it reads the source in-process (it is
 /// gate (a)'s verb); `pull` is not, since its source half is the remote
 /// `serve`.
 const SOURCE_SIDE_VERBS: &[&str] = &[
@@ -445,31 +457,71 @@ const SOURCE_SIDE_VERBS: &[&str] = &[
     "copy",
 ];
 
+/// Verbs whose default class is `auto` (M2 item 3): background when a
+/// person is at the host, normal otherwise (`priority::presence`).
+const AUTO_VERBS: &[&str] = &["estate-capture"];
+
+/// A `--priority=` value: a class, or `auto`.
+#[derive(Clone, Copy)]
+enum Requested {
+    Class(bulkload_agent::priority::PriorityClass),
+    Auto,
+}
+
+impl std::str::FromStr for Requested {
+    type Err = BulkloadRefusal;
+
+    fn from_str(value: &str) -> Result<Self> {
+        if value == "auto" {
+            Ok(Self::Auto)
+        } else {
+            value.parse().map(Self::Class)
+        }
+    }
+}
+
 /// Where a verb's priority class came from, as its counters line records it.
 #[derive(Clone, Copy)]
 struct Priority {
     class: bulkload_agent::priority::PriorityClass,
     /// `true` when `--priority=` chose it, `false` for the verb's default.
     explicit: bool,
+    /// What `auto` found, when the class came from it.
+    auto: Option<bulkload_agent::priority::Presence>,
+    /// The starvation watcher's threshold in seconds, when one runs.
+    escalate_after: Option<u64>,
 }
 
 impl Priority {
     fn render(self) -> String {
-        format!(
-            "priority={} priority_from={}",
-            self.class.label(),
-            if self.explicit { "flag" } else { "default" }
-        )
+        let from = match (self.auto, self.explicit) {
+            (Some(_), _) => "auto",
+            (None, true) => "flag",
+            (None, false) => "default",
+        };
+        let mut line = format!("priority={} priority_from={from}", self.class.label());
+        if let Some(presence) = self.auto {
+            line.push_str(" priority_auto=");
+            line.push_str(presence.label());
+        }
+        if let Some(after) = self.escalate_after {
+            use std::fmt::Write as _;
+            let _ = write!(line, " priority_escalate_after={after}");
+        }
+        line
     }
 }
 
 fn main() -> ExitCode {
-    use bulkload_agent::priority::PriorityClass;
     let started = std::time::Instant::now();
     // OI-1001-Q2: the binary keeps a 25% free-space floor unless told otherwise.
     bulkload_agent::space::set_min_free_percent(bulkload_agent::space::DEFAULT_MIN_FREE_PERCENT);
     let mut requested = None;
-    let mut args = match global_flags(std::env::args_os().skip(1).collect(), &mut requested) {
+    let mut escalate_after = None;
+    let mut args = match global_flags(
+        std::env::args_os().skip(1).collect(),
+        (&mut requested, &mut escalate_after),
+    ) {
         Ok(args) => args.into_iter(),
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}\n\n{USAGE}");
@@ -483,22 +535,13 @@ fn main() -> ExitCode {
         .unwrap_or("")
         .to_owned();
     // WP0(f): before any thread or child exists, so all of them inherit it.
-    let priority = Priority {
-        class: requested.unwrap_or_else(|| {
-            if SOURCE_SIDE_VERBS.contains(&verb.as_str()) {
-                PriorityClass::Background
-            } else {
-                PriorityClass::Normal
-            }
-        }),
-        explicit: requested.is_some(),
-    };
-    if priority.class == PriorityClass::Background {
-        if let Err(refusal) = bulkload_agent::priority::enter_background() {
+    let priority = match enter_priority(&verb, requested, escalate_after, started) {
+        Ok(priority) => priority,
+        Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}");
             return ExitCode::FAILURE;
         }
-    }
+    };
     // macOS starts at 256 open files; take the hard limit the host allows.
     let _ = bulkload_agent::limits::raise_descriptor_limit();
     let outcome = match command.as_ref().and_then(|value| value.to_str()) {
@@ -570,12 +613,74 @@ fn main() -> ExitCode {
     }
 }
 
+/// The verb's class: `requested`, or its default; entered before any
+/// thread or child exists, so all of them inherit it (WP0(f)). M2 item 3:
+/// `auto` (estate-capture's default) is background only when a person is at
+/// the host, and a background process of an `auto` verb, or of any verb
+/// given `--escalate-after`, starts the bounded-starvation watcher.
+fn enter_priority(
+    verb: &str,
+    requested: Option<Requested>,
+    escalate_after: Option<u64>,
+    started: std::time::Instant,
+) -> Result<Priority> {
+    use bulkload_agent::priority::PriorityClass;
+    let wanted = requested.unwrap_or_else(|| {
+        if AUTO_VERBS.contains(&verb) {
+            Requested::Auto
+        } else if SOURCE_SIDE_VERBS.contains(&verb) {
+            Requested::Class(PriorityClass::Background)
+        } else {
+            Requested::Class(PriorityClass::Normal)
+        }
+    });
+    let priority = match wanted {
+        Requested::Class(class) => Priority {
+            class,
+            explicit: requested.is_some(),
+            auto: None,
+            escalate_after: None,
+        },
+        Requested::Auto => {
+            let presence = bulkload_agent::priority::presence();
+            Priority {
+                class: presence.class(),
+                explicit: requested.is_some(),
+                auto: Some(presence),
+                escalate_after: None,
+            }
+        }
+    };
+    let mut priority = priority;
+    if priority.class == PriorityClass::Background {
+        bulkload_agent::priority::enter_background()?;
+        // Escalation is on by default only for the `auto` verbs; any other
+        // verb keeps WP0(f) as ratified unless the flag asks for it.
+        let after = escalate_after.or_else(|| {
+            AUTO_VERBS
+                .contains(&verb)
+                .then_some(bulkload_agent::priority::DEFAULT_ESCALATE_SECS)
+        });
+        if let Some(after) = after.filter(|after| *after > 0) {
+            // After the class is set, so the watcher inherits it like any
+            // other thread.
+            bulkload_agent::priority::watch_starvation(
+                std::time::Duration::from_secs(after),
+                started,
+            );
+            priority.escalate_after = Some(after);
+        }
+    }
+    Ok(priority)
+}
+
 /// Remove `--durability=MODE`, `--source-ledger-sync=MODE` and
 /// `--min-free-percent=N` from the arguments and apply them process-wide,
-/// and `--priority=CLASS` into `priority`.
+/// `--priority=CLASS|auto` into `priority` and `--escalate-after=SECONDS`
+/// into `escalate_after`.
 fn global_flags(
     args: Vec<std::ffi::OsString>,
-    priority: &mut Option<bulkload_agent::priority::PriorityClass>,
+    (priority, escalate_after): (&mut Option<Requested>, &mut Option<u64>),
 ) -> Result<Vec<std::ffi::OsString>> {
     let mut rest = Vec::with_capacity(args.len());
     for arg in args {
@@ -584,6 +689,17 @@ fn global_flags(
             .and_then(|value| value.strip_prefix("--priority="))
         {
             *priority = Some(class.parse()?);
+            continue;
+        }
+        if let Some(seconds) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--escalate-after="))
+        {
+            *escalate_after = Some(
+                seconds
+                    .parse()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?,
+            );
             continue;
         }
         if let Some(mode) = arg
