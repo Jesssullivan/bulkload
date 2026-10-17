@@ -84,6 +84,12 @@ pub struct CarryOptions {
     pub dry_run: bool,
     /// Only these item identities (all eligible items when empty).
     pub items: Vec<String>,
+    /// Bind an item to a session already recorded in this destination
+    /// state (`ITEM=DEST_STATE`) instead of running one: an earlier `copy`
+    /// or `pull` of the item's source into its destination by this same
+    /// transport, completed with no refused path. Nothing is transferred
+    /// and nothing is written under the destination.
+    pub bind: std::collections::BTreeMap<String, PathBuf>,
 }
 
 /// One item's carry, as the transport runs it.
@@ -340,25 +346,24 @@ pub fn carry_files(
                 PathBuf::from(name)
             },
         );
+        let bound = options.bind.get(&identity);
         let job = CarryJob {
             item: identity.clone(),
             source: item.source.clone(),
             destination,
-            destination_state: carry_state.join(&identity).join("dest"),
+            destination_state: bound
+                .cloned()
+                .unwrap_or_else(|| carry_state.join(&identity).join("dest")),
         };
         if options.dry_run {
-            line(&format!("{prefix} {}", dry_run(&job, transport)))?;
+            line(&format!(
+                "{prefix} {}",
+                dry_run(&job, transport, bound.is_some())
+            ))?;
             continue;
         }
-        match carry_one(
-            &job,
-            item,
-            &identity,
-            state,
-            source_label,
-            transport,
-            options,
-        ) {
+        let run = (item, identity.as_str(), state, source_label);
+        match carry_one(&job, run, transport, options, bound.is_some()) {
             Ok((true, summary)) => line(&format!("{prefix} {summary}"))?,
             Ok((false, summary)) => {
                 failed = true;
@@ -467,7 +472,7 @@ fn eligibility(item: &Item, identity: &str, corpus: &Path, state: &Path) -> Resu
     })
 }
 
-fn dry_run(job: &CarryJob, transport: &dyn Transport) -> String {
+fn dry_run(job: &CarryJob, transport: &dyn Transport, bound: bool) -> String {
     let destination = format!("{:?}", job.destination);
     let now = match fs::symlink_metadata(&job.destination) {
         Err(_) => "absent",
@@ -484,27 +489,69 @@ fn dry_run(job: &CarryJob, transport: &dyn Transport) -> String {
     };
     let parent = job.destination.parent().is_some_and(Path::is_dir);
     let prior = transfer_outcome::records(&job.destination_state).len();
+    let source_key = transport.source_key(&job.source);
+    if bound {
+        // What a bind would find, read only: the session record and its end.
+        let item = TransferRecord::running(
+            transport.verb(),
+            &source_key,
+            &transfer_outcome::stable(&job.destination),
+        )
+        .session_item();
+        let found = match transfer_outcome::read(&job.destination_state, &item) {
+            None => "no-record".to_owned(),
+            Some(Err(_)) => "unreadable".to_owned(),
+            Some(Ok(record)) => format!(
+                "{} refused_paths={} completed={} reused={} started={}",
+                match record.session {
+                    Session::Completed => "completed",
+                    Session::Running => "running",
+                    Session::Refused(_) => "refused",
+                },
+                refused_entries(&record).len(),
+                record.completed,
+                record.reused,
+                record.started,
+            ),
+        };
+        return format!(
+            "destination={destination} now={now} would=bind {} {source_key:?} -> {destination} session={found}",
+            transport.verb()
+        );
+    }
     format!(
-        "destination={destination} now={now} parent={} prior_transfer_records={prior} would={} {:?} -> {destination}",
+        "destination={destination} now={now} parent={} prior_transfer_records={prior} would={} {source_key:?} -> {destination}",
         if parent { "present" } else { "missing" },
         transport.verb(),
-        transport.source_key(&job.source),
     )
+}
+
+fn refused_entries(record: &TransferRecord) -> Vec<&transfer_outcome::Entry> {
+    record
+        .entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                entry.outcome,
+                transfer_outcome::EntryOutcome::Refused { .. }
+            )
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_lines)] // One item's ordered steps, read top to bottom.
 fn carry_one(
     job: &CarryJob,
-    item: &Item,
-    identity: &str,
-    state: &Path,
-    source_label: &str,
+    (item, identity, state, source_label): (&Item, &str, &Path, &str),
     transport: &dyn Transport,
     options: &CarryOptions,
+    bound: bool,
 ) -> Result<(bool, String)> {
-    // 1. The destination: made one level, under an existing parent.
+    // 1. The destination: made one level, under an existing parent. A bind
+    // transfers nothing, so its destination must already be there.
     let created = match fs::symlink_metadata(&job.destination) {
         Ok(meta) if meta.is_dir() => false,
+        Err(_) if bound => return Err(BulkloadRefusal::ClosureUnaccounted),
         Ok(_) => return Err(BulkloadRefusal::DestinationOccupied),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let parent = job
@@ -526,40 +573,37 @@ fn carry_one(
         }
         Err(error) => return Err(crate::refuse::io(&error, SITE)),
     };
-    if let Some(parent) = job.destination_state.parent() {
-        private_directory(parent)?;
-    }
-    // 2. The transfer session, recorded in its destination state.
+    // 2. The transfer session, recorded in its destination state; or, for
+    // a bind, the session already recorded there.
     let source_key = transport.source_key(&job.source);
     let destination_key = transfer_outcome::stable(&job.destination);
-    transfer_outcome::record_session(
-        &job.destination_state,
-        transport.verb(),
-        &source_key,
-        &destination_key,
-        "transfer::carry_files",
-        || transport.roots_apart(job),
-        || transport.run(job),
-    )?;
+    if !bound {
+        if let Some(parent) = job.destination_state.parent() {
+            private_directory(parent)?;
+        }
+        transfer_outcome::record_session(
+            &job.destination_state,
+            transport.verb(),
+            &source_key,
+            &destination_key,
+            "transfer::carry_files",
+            || transport.roots_apart(job),
+            || transport.run(job),
+        )?;
+    }
     let session_item =
         TransferRecord::running(transport.verb(), &source_key, &destination_key).session_item();
-    let record_bytes = fs::read(transfer_outcome::record_path(
+    let record_bytes = match fs::read(transfer_outcome::record_path(
         &job.destination_state,
         &session_item,
-    ))
-    .refuse_at(SITE)?;
+    )) {
+        Ok(bytes) => bytes,
+        Err(_) if bound => return Err(BulkloadRefusal::ClosureUnaccounted),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
     let transfer =
         transfer_outcome::decode(&record_bytes).map_err(|_| BulkloadRefusal::FrameCodec)?;
-    let refused: Vec<&transfer_outcome::Entry> = transfer
-        .entries
-        .iter()
-        .filter(|entry| {
-            matches!(
-                entry.outcome,
-                transfer_outcome::EntryOutcome::Refused { .. }
-            )
-        })
-        .collect();
+    let refused = refused_entries(&transfer);
     if transfer.session != Session::Completed {
         return Err(BulkloadRefusal::ClosureUnaccounted);
     }
@@ -609,7 +653,7 @@ fn carry_one(
     Ok((
         true,
         format!(
-            "destination={:?} outcome={CARRIED_OUTCOME} beside={} created={} completed={} reused={} pointers={}",
+            "destination={:?} outcome={CARRIED_OUTCOME} bound={bound} beside={} created={} completed={} reused={} pointers={}",
             record.destination,
             record.beside,
             record.created,

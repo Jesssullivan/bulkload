@@ -130,7 +130,7 @@ SUBCOMMANDS:
                 given again; an unchanged rerun reads and writes nothing. One
                 JSON line per workspace (schema bulkload.estate-handoff.v1, the
                 verb's own name)
-    estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]...
+    estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--bind ID=DEST_STATE]...
                 [--host HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
                 PLAN CORPUS PRIVATE_STATE SOURCE CARRY_STATE
                 M2r2 b: carry each planned workspace item whose capture
@@ -148,8 +148,14 @@ SUBCOMMANDS:
                 GIT_CARRY_POINTER_ATTACHED (the bytes stay for review). A
                 carried item gets a `{item}-{blake3(SOURCE)}.carried` record
                 and the outcome carried-as-files, which closure-report counts
-                `carried` once the transfer record proves it. --dry-run reads
-                only and prints what each item would do. One line per item
+                `carried` once the transfer record proves it. --bind
+                ID=DEST_STATE binds an item to a session this transport
+                already recorded in DEST_STATE (same source, same
+                destination, completed, no refused path) instead of running
+                one: nothing is transferred or written under the
+                destination. A refs-only item rides on a carried workspace
+                item of the same source (via=). --dry-run reads only and
+                prints what each item would do. One line per item
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
@@ -1922,6 +1928,7 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
 
 // M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,
 // the remote source state per item under --source-state-root.
+#[allow(clippy::too_many_lines)] // Argument parsing, then one call.
 fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
     use bulkload_agent::estate::carried::{self, CarryJob, CarryOptions, Transport};
     struct Pull {
@@ -1976,6 +1983,22 @@ fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
                     .into_string()
                     .map_err(|_| BulkloadRefusal::FieldDomainViolation)?,
             ),
+            "--bind" => {
+                let pair = value(at + 1)?
+                    .into_string()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
+                let (item, state) = pair
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                if !Path::new(state).is_absolute()
+                    || options
+                        .bind
+                        .insert(item.to_owned(), PathBuf::from(state))
+                        .is_some()
+                {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
+            }
             "--host" if host.is_none() => host = Some(value(at + 1)?),
             "--source-state-root" if root.is_none() => root = Some(PathBuf::from(value(at + 1)?)),
             "--remote-executable" if remote.is_none() => remote = Some(value(at + 1)?),

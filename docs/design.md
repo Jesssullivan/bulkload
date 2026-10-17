@@ -154,6 +154,16 @@ own transfer and records the result in the estate ledger.
   carry the item. It prints `carried=incomplete` with the first refused
   path, keeps its outcome, and the verb exits nonzero. The transfer's own
   rows, joined with `--transfer`, name every refused path.
+- **Binding an earlier session (`--bind ITEM=DEST_STATE`).** The item is
+  bound to a session the same transport already recorded in that state:
+  same source key, same destination, completed, with no refused path. No
+  session runs and nothing is written under the destination; the pointer
+  audit and the records below are the same. This is how bulkload proves a
+  carry made earlier by its own `pull` (the in-place run's hand-run
+  sessions). Without such a record the item refuses
+  `CLOSURE_UNACCOUNTED` and keeps its outcome. A later session rewriting
+  that record unproves the carry (`carried-transfer-changed`) until it is
+  bound again.
 - **Pointer audit (#261).** Each `.git` entry below the landed tree that
   is not a directory (a gitdir pointer file or a symlink) is resolved
   where it landed:

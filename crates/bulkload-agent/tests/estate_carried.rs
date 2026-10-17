@@ -526,3 +526,57 @@ fn a_refs_only_item_rides_on_its_carried_sibling() {
     assert!(report.contains("\"gate\":\"pass\""), "{report}");
     assert!(report.contains("\"via\":\""), "{report}");
 }
+
+#[test]
+fn bind_proves_an_earlier_recorded_session_without_writing() {
+    let world = World::new("bind", |_, _| {});
+    // The lane's way: a plain recorded `copy` into the destination.
+    fs::create_dir(&world.workspace).unwrap();
+    let lane_state = world.path("lane-state");
+    let copied = agent(&os(&[
+        &"copy",
+        &world.source,
+        &world.workspace,
+        &world.path("lane-source-state"),
+        &lane_state,
+    ]));
+    assert!(copied.ok, "{}{}", copied.stdout, copied.stderr);
+    let item = fs::read_dir(world.path("state"))
+        .unwrap()
+        .find_map(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .strip_suffix(".outcome")
+                .map(str::to_owned)
+        })
+        .unwrap();
+    // No record in an empty state: refused, nothing recorded.
+    let empty = world.path("empty-state");
+    fs::create_dir(&empty).unwrap();
+    let missing = world.carry(&["--bind", &format!("{item}={}", empty.display())]);
+    assert!(!missing.ok, "{}", missing.stdout);
+    assert!(world.closure().contains("\"refusal\":\"CAPTURE_ABSENT\""));
+    let bind = format!("{item}={}", lane_state.display());
+    let dry = world.carry(&["--dry-run", "--bind", &bind]);
+    assert!(
+        dry.stdout.contains(" would=bind copy ")
+            && dry.stdout.contains(" session=completed refused_paths=0"),
+        "{}",
+        dry.stdout
+    );
+    let landed = stamps(&world.workspace);
+    let ran = world.carry(&["--bind", &bind]);
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert!(ran.stdout.contains(" bound=true "), "{}", ran.stdout);
+    assert_eq!(
+        stamps(&world.workspace),
+        landed,
+        "a bind wrote under the destination"
+    );
+    assert!(!world.path("carry").join(&item).exists());
+    let report = world.closure();
+    assert!(report.contains("\"disposition\":\"carried\""), "{report}");
+    assert!(report.contains("lane-state"), "{report}");
+}
