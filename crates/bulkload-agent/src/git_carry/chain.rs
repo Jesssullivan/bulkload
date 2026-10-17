@@ -322,6 +322,7 @@ pub fn flatten(
     let bare = head.bare;
     // The head's own stage is no longer read; remove it now.
     drop(head);
+    crate::counters::bump(crate::counters::Counter::GitChainFlattens);
     Ok(StagedBundle {
         directory,
         bundle: flat,

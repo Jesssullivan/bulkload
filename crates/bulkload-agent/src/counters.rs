@@ -388,6 +388,12 @@ counters! {
     // base again.
     GitScratchBaseImports => "git_scratch_base_imports",
     GitScratchBaseBorrowed => "git_scratch_base_borrowed",
+    // Chained (re-captured) captures flattened into one self-contained
+    // bundle (`chain::flatten`): each fetches its bases and links into a
+    // private repository and writes the whole history as one bundle, a
+    // whole-repository cost per chained item in `estate-diff`, the apply and
+    // the restore verbs alike, never shared (M2r2 item 3 review).
+    GitChainFlattens => "git_chain_flattens",
 }
 
 const COUNT: usize = Counter::ALL.len();

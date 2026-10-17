@@ -1479,47 +1479,67 @@ fn p108_estate_diff_shares_one_base_import_and_answers_the_same_bytes() {
     }
 }
 
-// Each `git index-pack` a GIT_TRACE2_EVENT file records, as the repository
-// (worktree) it ran in.
-fn index_packs(trace: &Path) -> Vec<String> {
+// One GIT_TRACE2_EVENT file's processes: each one's command name, the
+// repository (worktree) it ran in, and its argv as traced.
+struct Traced {
+    name: String,
+    worktree: String,
+    argv: String,
+}
+
+fn traced(trace: &Path) -> Vec<Traced> {
     let text = fs::read_to_string(trace).unwrap();
     let field = |line: &str, key: &str| -> Option<String> {
         let start = line.find(&format!("\"{key}\":\""))? + key.len() + 4;
         let end = line[start..].find('"')? + start;
         Some(line[start..end].to_owned())
     };
-    let mut worktrees = BTreeMap::new();
-    let mut packs = Vec::new();
+    let mut processes: BTreeMap<String, Traced> = BTreeMap::new();
     for line in text.lines() {
         let Some(sid) = field(line, "sid") else {
             continue;
         };
-        if line.contains("\"event\":\"def_repo\"") {
-            worktrees.insert(sid.clone(), field(line, "worktree").unwrap_or_default());
+        let process = processes.entry(sid).or_insert_with(|| Traced {
+            name: String::new(),
+            worktree: String::new(),
+            argv: String::new(),
+        });
+        if line.contains("\"event\":\"start\"") {
+            let start = line.find("\"argv\":[").unwrap();
+            let end = line[start..].find(']').unwrap() + start;
+            line[start..=end].clone_into(&mut process.argv);
         }
-        if line.contains("\"event\":\"cmd_name\"") && line.contains("\"name\":\"index-pack\"") {
-            packs.push(sid);
+        if line.contains("\"event\":\"def_repo\"") {
+            process.worktree = field(line, "worktree").unwrap_or_default();
+        }
+        if line.contains("\"event\":\"cmd_name\"") {
+            process.name = field(line, "name").unwrap_or_default();
         }
     }
-    packs
+    processes.into_values().collect()
+}
+
+// The repository each `git index-pack` ran in.
+fn index_packs(processes: &[Traced]) -> Vec<String> {
+    processes
         .iter()
-        .map(|sid| worktrees.get(sid).cloned().unwrap_or_default())
+        .filter(|process| process.name == "index-pack")
+        .map(|process| process.worktree.clone())
         .collect()
 }
 
-/// P109 DIFF-ONE-INDEX-PACK (M2r2 item 3, the 10-16 in-place finding:
-/// estate-diff indexed a repository's whole bundle once per worktree
-/// item): two repositories of a main and four linked worktrees each,
-/// against destination repositories that hold none of their objects, so
-/// every base import is a real `index-pack`. With the shared import Git
-/// runs exactly one index-pack of each base (in its shared scratch), and
-/// no item's scratch indexes more than its own capture; the
-/// import-per-item arm indexes a base in every one of them.
-#[test]
-fn p109_estate_diff_runs_one_index_pack_per_repository() {
+// Repositories `names` at neo, each a main checkout of 20 commits and
+// `worktrees` linked worktrees, and at sting an unrelated repository of
+// the same name (it holds none of their objects). The rows plan each main
+// at `main(name)` and each worktree into the sting repository.
+fn worktree_world(
+    names: &[&str],
+    worktrees: usize,
+    main: &dyn Fn(&Gftb, &str) -> PathBuf,
+) -> (Gftb, Vec<(PathBuf, PathBuf, Option<PathBuf>)>) {
     let world = Gftb::new();
     let mut rows = Vec::new();
-    for name in ["one", "two"] {
+    for name in names {
         let repo = world.neo(name);
         fs::create_dir(&repo).unwrap();
         git(&repo, &["init", "--quiet", "--template=", "-b", "main"]);
@@ -1528,8 +1548,9 @@ fn p109_estate_diff_runs_one_index_pack_per_repository() {
             git(&repo, &["add", "."]);
             git(&repo, &["commit", "--quiet", "-m", &format!("c{n}")]);
         }
-        rows.push((repo.clone(), world.sting(name), Some(world.sting(name))));
-        for n in 0..4 {
+        let landing = main(&world, name);
+        rows.push((repo.clone(), landing.clone(), Some(landing)));
+        for n in 0..worktrees {
             let path = world.neo(&format!("{name}.worktrees/w{n}"));
             git(
                 &repo,
@@ -1549,7 +1570,6 @@ fn p109_estate_diff_runs_one_index_pack_per_repository() {
                 Some(world.sting(&format!("{name}.worktrees/w{n}"))),
             ));
         }
-        // The destination's own, unrelated repository at the same path.
         let dest = world.sting(name);
         fs::create_dir(&dest).unwrap();
         git(&dest, &["init", "--quiet", "--template=", "-b", "main"]);
@@ -1557,26 +1577,47 @@ fn p109_estate_diff_runs_one_index_pack_per_repository() {
         git(&dest, &["add", "."]);
         git(&dest, &["commit", "--quiet", "-m", "own"]);
     }
+    (world, rows)
+}
+
+/// P109 DIFF-ONE-INDEX-PACK (M2r2 item 3, the 10-16 in-place finding:
+/// estate-diff indexed a repository's whole bundle once per worktree
+/// item): two repositories of a main and four linked worktrees each,
+/// against destination repositories that hold none of their objects, so
+/// every base import is a real `index-pack`. With the shared import Git
+/// runs exactly one index-pack of each base (in its shared scratch), no
+/// item's scratch indexes more than its own capture, and no Git process in
+/// an item's scratch names a base's bundle (an import of it there, even
+/// one that `index-pack` would skip as connected, walks the whole base);
+/// the import-per-item arm indexes a base in every one of them.
+#[test]
+fn p109_estate_diff_runs_one_index_pack_per_repository() {
+    let (world, rows) = worktree_world(&["one", "two"], 4, &|world, name| world.sting(name));
     let run = Run::new(&world, &rows);
     settle();
     run.capture();
     private_dir(&run.applied);
-    let traced = |name: &str, off: bool| {
+    let diff = |name: &str, off: bool| {
         let trace = world.path(name);
         let mut envs: Vec<(&str, &std::ffi::OsStr)> = vec![("GIT_TRACE2_EVENT", trace.as_os_str())];
         if off {
             envs.push((SHARED_OFF.0, SHARED_OFF.1.as_ref()));
         }
         let ran = run.diff_with(&[], &envs);
-        let packs = index_packs(&trace);
-        (ran, packs)
+        (ran, traced(&trace))
     };
-    let (shared, packs) = traced("shared.trace", false);
-    let (off, off_packs) = traced("off.trace", true);
+    let (shared, processes) = diff("shared.trace", false);
+    let (off, off_processes) = diff("off.trace", true);
     assert_eq!(shared.stdout, off.stdout, "the shared import changed a row");
     assert_eq!(
         counter(&shared, "git_scratch_base_imports"),
         2,
+        "{}",
+        shared.stderr
+    );
+    assert_eq!(
+        counter(&shared, "git_scratch_base_borrowed"),
+        10,
         "{}",
         shared.stderr
     );
@@ -1587,17 +1628,46 @@ fn p109_estate_diff_runs_one_index_pack_per_repository() {
         }
         counts
     };
-    let counts = per_repo(&packs);
+    let counts = per_repo(&index_packs(&processes));
     let bases: Vec<_> = counts
         .iter()
         .filter(|(worktree, _)| worktree.contains("/shared-base-"))
         .collect();
     assert_eq!(bases.len(), 2, "{counts:#?}");
-    assert!(bases.iter().all(|(_, count)| **count == 1), "{counts:#?}");
     assert!(counts.values().all(|count| *count == 1), "{counts:#?}");
+    // Each base's staged bundle (`<stage>/capture.bundle`, its shared
+    // scratch at `<stage>/shared-base-<n>/repo`): read in its shared
+    // scratch only.
+    let bundles: Vec<String> = bases
+        .iter()
+        .map(|(worktree, _)| {
+            let stage = &worktree[..worktree.find("/shared-base-").unwrap()];
+            format!("{stage}/capture.bundle")
+        })
+        .collect();
+    for bundle in &bundles {
+        assert!(
+            processes
+                .iter()
+                .any(|process| process.worktree.contains("/shared-base-")
+                    && process.argv.contains(bundle.as_str())),
+            "{bundle} never read"
+        );
+        let elsewhere: Vec<_> = processes
+            .iter()
+            .filter(|process| {
+                process.worktree.contains("/adopt-") && process.argv.contains(bundle.as_str())
+            })
+            .map(|process| (&process.worktree, &process.argv))
+            .collect();
+        assert!(
+            elsewhere.is_empty(),
+            "{bundle} read by an item's scratch: {elsewhere:#?}"
+        );
+    }
     // The other arm indexes a base in every scratch that needs one: two
     // index-packs in a scratch (the base, then the item's own capture).
-    let off_counts = per_repo(&off_packs);
+    let off_counts = per_repo(&index_packs(&off_processes));
     assert!(
         off_counts
             .keys()
@@ -1605,10 +1675,87 @@ fn p109_estate_diff_runs_one_index_pack_per_repository() {
         "{off_counts:#?}"
     );
     let doubled = off_counts.values().filter(|count| **count == 2).count();
-    assert!(doubled >= 8, "{off_counts:#?}");
+    assert_eq!(doubled, 10, "{off_counts:#?}");
     assert_eq!(
-        u64::try_from(doubled).unwrap(),
         counter(&off, "git_scratch_base_imports"),
-        "{off_counts:#?}"
+        10,
+        "{}",
+        off.stderr
     );
+}
+
+/// P110 DIFF-ONE-IMPORT-PER-STORE (M2r2 item 3 review): one base read
+/// against two destination object stores. The main checkout is a first
+/// landing at an absent path (its origin is read in a scratch that
+/// borrows no store) and its worktrees land into an existing, unrelated
+/// repository (their scratches borrow its store): one import per store,
+/// never one store's import lent to the other's scratches, and rows
+/// byte-identical to the import-per-item arm.
+#[test]
+fn p110_estate_diff_imports_a_base_once_per_destination_store() {
+    let (world, rows) = worktree_world(&["one"], 3, &|world, _| world.sting("fresh"));
+    let run = Run::new(&world, &rows);
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    let shared = run.diff(&[]);
+    let off = run.diff_with(&[], &[(SHARED_OFF.0, SHARED_OFF.1.as_ref())]);
+    assert_eq!(shared.stdout, off.stdout, "the shared import changed a row");
+    let main = diff_line(&shared.stdout, &world.neo("one"));
+    assert!(main.contains("\"adopt\":\"landing\""), "{main}");
+    assert_eq!(
+        counter(&shared, "git_scratch_base_imports"),
+        2,
+        "{}",
+        shared.stderr
+    );
+    assert_eq!(
+        counter(&shared, "git_scratch_base_borrowed"),
+        4,
+        "{}",
+        shared.stderr
+    );
+    assert_eq!(
+        counter(&off, "git_scratch_base_imports"),
+        4,
+        "{}",
+        off.stderr
+    );
+}
+
+/// P111 DIFF-SHARED-CORPUS-PATH (M2r2 item 3 review, finding 1): a corpus
+/// whose path is not UTF-8 lends its shared import (the alternates line is
+/// written as bytes), and one whose path holds a newline, which no
+/// alternates line can name, imports the base per scratch as before; in
+/// both, the rows are the import-per-item arm's.
+#[test]
+fn p111_estate_diff_shares_under_any_corpus_path_it_can_name() {
+    use std::os::unix::ffi::OsStrExt as _;
+    for (name, imports, borrowed) in [(&b"corpus-\xff"[..], 1, 4), (&b"corpus-\nline"[..], 4, 0)] {
+        let (world, rows) = worktree_world(&["one"], 3, &|world, name| world.sting(name));
+        let mut run = Run::new(&world, &rows);
+        run.corpus = world.root.join(std::ffi::OsStr::from_bytes(name));
+        settle();
+        run.capture();
+        private_dir(&run.applied);
+        let shared = run.diff(&[]);
+        let off = run.diff_with(&[], &[(SHARED_OFF.0, SHARED_OFF.1.as_ref())]);
+        assert_eq!(
+            shared.stdout, off.stdout,
+            "{name:?}: the shared import changed a row"
+        );
+        assert!(!shared.stdout.contains("\"refused\""), "{}", shared.stdout);
+        assert_eq!(
+            counter(&shared, "git_scratch_base_imports"),
+            imports,
+            "{name:?}: {}",
+            shared.stderr
+        );
+        assert_eq!(
+            counter(&shared, "git_scratch_base_borrowed"),
+            borrowed,
+            "{name:?}"
+        );
+        assert_eq!(counter(&off, "git_scratch_base_imports"), 4, "{name:?}");
+    }
 }

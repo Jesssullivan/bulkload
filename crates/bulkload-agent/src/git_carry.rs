@@ -2334,16 +2334,23 @@ struct SharedBase {
     objects: Option<PathBuf>,
     format: &'static str,
     source: String,
-    // What a scratch borrows, or the import's refusal, which every scratch
-    // over the same key would have met; `Ok(None)` when the import left
-    // state a borrower cannot take by alternates and refs alone (a shallow
-    // frontier): such a scratch imports the base itself, as before.
-    seed: Result<Option<BaseSeed>>,
+    // What a scratch borrows; `None` when a borrower cannot take the base
+    // by alternates and refs alone (a custody envelope, whose import
+    // writes a shallow frontier, or a stage path an alternates line cannot
+    // name): such a scratch imports the base itself, as before. Only a
+    // made import is kept: a refusal is never replayed to a later item,
+    // which tries again as it did before the share.
+    seed: Option<BaseSeed>,
 }
 
 /// What a scratch repository takes from a shared base import: its object
-/// store, as one more alternate, and every ref the import made, as one
-/// create transaction (`update-ref --stdin -z`).
+/// store, as one more alternate (whose refs Git also reads as negative
+/// tips, `--alternate-refs`, so a borrower's connectivity checks stop at
+/// the base), and, as one create transaction (`update-ref --stdin -z`),
+/// the refs the import made outside its own provenance instance (the
+/// `union/v1` carry refs, which a borrower's import compares its own
+/// against). The instance's refs are not copied: every scratch read is
+/// scoped to the item's own instance.
 #[derive(Debug, Clone)]
 struct BaseSeed {
     objects: PathBuf,

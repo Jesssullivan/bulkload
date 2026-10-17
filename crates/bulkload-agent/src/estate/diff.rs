@@ -23,7 +23,9 @@
 //! every item's scratch borrows that import. Before, each item staged and
 //! indexed the whole base again, O(items x repository). A base's stage is
 //! dropped after the last item that names it. `BULKLOAD_DIFF_SHARED_IMPORT=0`
-//! is the A/B arm: each item stages and imports its base itself, as before.
+//! (exactly `0`; any other value shares) is the A/B arm: each item stages
+//! and imports its base itself, as before. `estate-reseat --check` reads
+//! the Git state through this function and shares the same way.
 
 use crate::refuse::RefuseAt as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -226,7 +228,7 @@ type BaseKey = (String, [u8; 32]);
 // scratch import in it, removed).
 struct Bases {
     shared: bool,
-    staged: BTreeMap<BaseKey, Result<git_carry::StagedBundle>>,
+    staged: BTreeMap<BaseKey, git_carry::StagedBundle>,
     last: BTreeMap<BaseKey, usize>,
 }
 
@@ -235,6 +237,7 @@ impl Bases {
     // and their `.base` sidecars; an item whose records do not read names
     // none (its own read then refuses as it did).
     fn new(items: &[super::Item], corpus: &Path) -> Result<Self> {
+        // Exactly `0` turns the share off; unset or any other value keeps it.
         let shared =
             std::env::var_os("BULKLOAD_DIFF_SHARED_IMPORT").is_none_or(|value| value != "0");
         let mut last = BTreeMap::new();
@@ -259,22 +262,23 @@ impl Bases {
         })
     }
 
-    // `base` staged: once per run when shared, else afresh.
+    // `base` staged: once per run when shared, else afresh. A refusal is
+    // never kept: the next item naming the base stages it again, as every
+    // item did before the share (a transient failure refuses one row).
     fn stage(&mut self, corpus: &Path, base: &Base) -> Result<Staged<'_>> {
         let key = (base.bundle.clone(), base.digest);
         if !self.shared || !self.last.contains_key(&key) {
             return stage_base(corpus, base).map(Staged::Own);
         }
-        let entry = self.staged.entry(key).or_insert_with(|| {
-            stage_base(corpus, base).map(|mut staged| {
-                staged.share_imports();
-                staged
-            })
-        });
-        match entry {
-            Ok(staged) => Ok(Staged::Shared(staged)),
-            Err(refusal) => Err(refusal.clone()),
+        if !self.staged.contains_key(&key) {
+            let mut staged = stage_base(corpus, base)?;
+            staged.share_imports();
+            self.staged.insert(key.clone(), staged);
         }
+        self.staged
+            .get(&key)
+            .map(Staged::Shared)
+            .ok_or(BulkloadRefusal::ContractSelfInconsistent)
     }
 
     // Item `index` is answered: drop every base no later item names.
