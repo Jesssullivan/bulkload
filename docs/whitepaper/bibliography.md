@@ -352,8 +352,8 @@ Project site and language standard repository. Accessed 2026-10-07.
   programmable configuration language) and the repository's README, plus
   the GitHub API repository record (`dhall-lang/dhall-lang`, "Maintainable
   configuration files", BSD-3-Clause, not archived). Added 2026-10-07.
-- bulkload's catalogue is `docs/formal/catalogue/`; its README names Dhall
-  1.42 from the flake's pinned nixpkgs.
+- bulkload's catalogue was `docs/formal/catalogue/` (deleted 2026-10-17,
+  R-C843); its README named Dhall 1.42 from the flake's pinned nixpkgs.
 
 **[Ficlone]** The Linux man-pages project. "ioctl_ficlonerange(2),
 ioctl_ficlone(2): share some the data of one file with another file."

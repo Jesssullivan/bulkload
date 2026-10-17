@@ -1,6 +1,6 @@
 # EstateConverge.tla's TLC configs, checked by `just tla-check` in this order (README.md, "EstateConverge").
 # [2026-10-17: the catalogue and `just tla-render` were deleted under R-C843; this file is now edited by hand (README.md).]
-# Tab-separated columns, as configs.tsv's:
+# Tab-separated columns:
 #   name            the config, MC_<name>.cfg
 #   expect          pass | fail | reach | simulate | inconclusive
 #   named-property  fail: the one property it must violate;

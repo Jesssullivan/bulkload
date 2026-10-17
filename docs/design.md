@@ -1187,7 +1187,7 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   the flattened restore advertises exactly the head's refs: none of the
   link's drift markers. The drifted bundle itself still never applies.
   Since Q42 L6a (OI-1003-Q43) these choices are one pure, total function,
-  `git_carry::decide::decide`, which P67 pins to the Haskell reference's rows.
+  `git_carry::decide::decide`, which P67 pins to frozen rows (`tests/data/decide_rows.tsv`, rendered by the Haskell reference until R-C843 deleted it on 2026-10-17).
 - A whole capture is reused (`capture-reused-after-census`) only when its key
   is unchanged and no seat is racy against its recorded pass start. A capture with a racy seat, or with no recorded pass start
   (records from before the start was recorded), takes the per-seat path
@@ -1911,9 +1911,10 @@ as without batching. A discarded creation clears its record before its
 temporary goes (#74 N3), a level whose shared seal or commit failed
 included (its commit may have reached the log although it reported a
 failure), and every clear is traced apart from a completion
-(`DirectoryCleared`). `docs/formal/DirectoryRecords.tla` (deleted 2026-10-17, R-C843) checks
-the records under per-name power loss, journal seals and reused inode
-numbers (README, "Directory records").
+(`DirectoryCleared`). Until R-C843 deleted it on 2026-10-17,
+`docs/formal/DirectoryRecords.tla` checked the records under per-name
+power loss, journal seals and reused inode numbers (`git show e3522007:docs/formal/README.md`,
+"Directory records").
 
 The finish rides the session's last output group (OI-1003-Q154 lever 3;
 the SOTA study's lever 2, R-N102's finish commit unit; built 2026-10-16).
@@ -1982,8 +1983,9 @@ state-root seals (#161) are fully synced on both sides, every destination
 commit is `synchronous=FULL`, `fullfsync=ON`, and a checkpoint on the
 relaxed connection is still a full flush. `--source-ledger-sync=full` syncs
 every row commit and fails the session on the first failed one, for
-comparison. `docs/formal` (deleted 2026-10-17, R-C843) checks the relaxed ledger (`MC_wp0g`,
-`MC_wp0g_deep`, `MC_wp0g_strict`) and shows a relaxed authority breaking R25
+comparison. Until R-C843 deleted them on 2026-10-17, the `BulkloadTransfer.tla`
+configs checked the relaxed ledger (`MC_wp0g`, `MC_wp0g_deep`,
+`MC_wp0g_strict`) and showed a relaxed authority breaking R25
 (`MC_wp0g_authority`); P79 and `tests/power_loss.rs` take the real store
 through every loss.
 
@@ -1992,7 +1994,7 @@ replace the output at its path only when that output is this store's own,
 untouched: its `(dev, ino, size, mtime, ctime)` equals a row this store
 committed for the path. Any other file there is refused
 `DESTINATION_OCCUPIED` and left as it is. The replacement is the exchange
-design the formal model checks (`MC_wp0d_exchange`): the group's commit seals
+design the formal model checked until R-C843 deleted it (`MC_wp0d_exchange`): the group's commit seals
 the staged file, records an intent that takes the output's rows out of the
 store, trades the staged name and the leaf in one `RENAME_EXCHANGE`
 (`RENAME_SWAP` on Darwin), checks the displaced file, removes it when it is
@@ -2038,7 +2040,7 @@ holds other bytes: nothing is staged, no chunk is asked of the source, and
 the old output keeps its row. Such a seat does not converge there. That is
 the ruled behaviour (OI-1003-Q100): the refusal stands, and there is no
 fallback to a rename over the output, which is the check-then-rename shape
-the formal model refutes.
+the formal model refuted (deleted 2026-10-17, R-C843).
 
 Refusals the destination remembers (#187 review, R25). A seat refused
 `DESTINATION_OCCUPIED` or `DESTINATION_EXCHANGE_UNSUPPORTED` after its
@@ -2053,7 +2055,7 @@ the racy window of the read. A changed seat, a changed file, or a file
 system that has gained the exchange makes the record a miss. The record
 is a memo about no durable bytes; losing it costs one more source read.
 
-The formal model holds all of this since 2026-10-07 (OI-1003-Q102: model
+The formal model held all of this from 2026-10-07 until R-C843 deleted it on 2026-10-17 (OI-1003-Q102: model
 first, then merge): the intent and its sweep, the ownership row, the
 remembered refusal and the refusal without an exchange, with the
 invariants `NoClobber`, `SupersedeAtomic`, `OwnershipNeverReuse`,

@@ -83,7 +83,7 @@ property tests stay as tests.]
   - casync/desync; restic/borg; bup; Unison; ZFS send/receive;
   - content-defined chunking (FastCDC); BLAKE3;
   - crash-consistency literature (ALICE, CrashMonkey).
-- **Formal model.** A TLA+ (or equivalent) specification of wire v5 [2026-10-16: the wire is v6 since #218; `docs/formal/README.md` lists the modules], `Held`,
+- **Formal model.** A TLA+ (or equivalent) specification of wire v5 [2026-10-16: the wire is v6 since #218; `docs/formal/README.md` lists the modules; 2026-10-17: deleted under R-C843/R-C844 except `EstateConverge.tla`], `Held`,
   ledger commit and resume. It is model-checked for R25 (no committed capture is
   re-read), durability ordering and S2's no-write/no-lock properties.
 - **Property tests, not fuzzing.** Decompose existing tests and checks into
