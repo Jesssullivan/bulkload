@@ -4744,19 +4744,25 @@ fn repository_census(root: &Path, common: &Path) -> Result<Census> {
 // registered back to this checkout, is a nested worktree of the same
 // repository; a pointer resolving to administration of a different repository
 // is a foreign nested repository. A symlink or an unreadable `.git` keeps
-// the refusal: that is malformed inventory, not custody. A pointer naming no
-// existing administration, or a worktree administration of `common`
-// registered to another checkout, refuses `GIT_NEST_POINTER_STALE` with the
-// directory's path (M2r2 item 6): a leftover copy of a worktree, which Git
-// does not read as a repository and the capture cannot carry as seats.
+// the refusal: that is malformed inventory, not custody. M2r2 item 6 types
+// three pointer states by the directory's path:
+// - a pointer naming an administration absent on this host (a copy of a
+//   pruned worktree, one carried from another host, a submodule whose
+//   `.git/modules` entry is gone, a dangling symlink or an absent mount):
+//   `GIT_NEST_POINTER_STALE`; Git does not read the directory as a
+//   repository;
+// - a pointer into a worktree administration of `common` whose registered
+//   checkout exists and points back to it: a copy of that live worktree,
+//   `GIT_NEST_POINTER_STALE` too; Git would act on the live worktree's HEAD
+//   and index through it;
+// - a pointer into one whose registered checkout is absent: a worktree
+//   moved without `git worktree repair`, `GIT_NEST_WORKTREE_MOVED`.
 fn nested_administration(
     root: &Path,
     directory: &Path,
     scope: NestScope<'_>,
 ) -> Result<Option<NestedCustody>> {
-    use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
     let common = scope.common;
     let pointer = directory.join(".git");
     let meta = match fs::symlink_metadata(&pointer) {
@@ -4785,42 +4791,16 @@ fn nested_administration(
     if !meta.is_file() || meta.len() > GITDIR_POINTER_LIMIT {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    let mut contents = String::new();
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&pointer)
-        .refuse_at("git_carry::nested_administration")?
-        .take(GITDIR_POINTER_LIMIT)
-        .read_to_string(&mut contents)
-        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    let target = contents
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("gitdir: "))
-        .map(str::trim_end)
-        .filter(|value| !value.is_empty())
-        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-    // M2r2 item 6: a pointer naming an administration that does not exist
-    // (a copy of a pruned or moved linked worktree, or one carried from
-    // another host) is stale, named by its directory; Git does not read the
-    // directory as a repository either. Any other unresolvable pointer is
-    // malformed inventory, never a transient IO fault.
+    let contents = read_pointer_file(&pointer)?;
+    let target = pointer_target(&contents).ok_or(BulkloadRefusal::GitInventoryMalformed)?;
     let stale =
         || -> Result<BulkloadRefusal> { Ok(BulkloadRefusal::GitNestPointerStale(rel_path()?)) };
-    let admin = match fs::canonicalize(directory.join(target)) {
-        Ok(admin) => admin,
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound
-                || error.raw_os_error() == Some(libc::ENOTDIR) =>
-        {
-            return Err(stale()?);
-        }
-        Err(_) => return Err(BulkloadRefusal::GitInventoryMalformed),
-    };
-    if !admin.is_dir() {
+    // An administration absent on this host is stale, named by its
+    // directory. Any other unresolvable pointer is malformed inventory,
+    // never a transient IO fault.
+    let Some(admin) = resolve_admin(&directory.join(target))? else {
         return Err(stale()?);
-    }
+    };
     let worktrees = common.join("worktrees");
     if admin.parent() != Some(worktrees.as_path()) {
         // Not our administration at all: a worktree of another repository, or
@@ -4836,14 +4816,45 @@ fn nested_administration(
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?
         .to_owned();
     // Registration is the administration's back-pointer to this very checkout.
-    let registered = fs::read_to_string(admin.join("gitdir"))
-        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    if fs::canonicalize(registered.trim_end()).ok()
-        != Some(fs::canonicalize(&pointer).refuse_at("git_carry::nested_administration")?)
-    {
-        // A worktree administration of this repository registered to another
-        // checkout: this directory is a copy of that worktree (M2r2 item 6).
-        return Err(stale()?);
+    // Git reads it right-trimmed of whitespace and, when relative (`worktree
+    // add --relative-paths`, `worktree.useRelativePaths`), against the
+    // administration directory itself; `join` keeps an absolute one.
+    let registered = fs::read(admin.join("gitdir")).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let registered = registered.trim_ascii_end();
+    if registered.is_empty() || registered.contains(&0) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let ours = fs::canonicalize(&pointer).refuse_at("git_carry::nested_administration")?;
+    match fs::canonicalize(admin.join(std::ffi::OsStr::from_bytes(registered))) {
+        Ok(theirs) if theirs == ours => {}
+        Ok(theirs) => {
+            // Registered to another checkout. A copy of a live worktree only
+            // when that checkout's own pointer leads back to this
+            // administration; anything else is malformed inventory.
+            let back = read_pointer_file(&theirs)
+                .ok()
+                .and_then(|bytes| {
+                    pointer_target(&bytes).map(|target| {
+                        theirs
+                            .parent()
+                            .map(|parent| parent.join(target))
+                    })
+                })
+                .flatten()
+                .map(|target| resolve_admin(&target))
+                .transpose()?
+                .flatten();
+            if back.as_deref() == Some(admin.as_path()) {
+                return Err(stale()?);
+            }
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        Err(error) if absent(&error) => {
+            // The registered checkout is gone: this worktree moved (or was
+            // copied) without `git worktree repair`.
+            return Err(BulkloadRefusal::GitNestWorktreeMoved(rel_path()?));
+        }
+        Err(_) => return Err(BulkloadRefusal::GitInventoryMalformed),
     }
     // Git itself must agree that this is a linked worktree of the same repository.
     let seen =
@@ -4860,6 +4871,56 @@ fn nested_administration(
         worktree_name,
         head_oid,
     })))
+}
+
+// Whether a path lookup failed because something along it is absent on this
+// host (a missing entry, a regular file where a directory was expected).
+fn absent(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
+}
+
+// The bytes of a gitdir-pointer file, read without following a symlink and
+// bounded by GITDIR_POINTER_LIMIT.
+fn read_pointer_file(pointer: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut contents = Vec::new();
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(pointer)
+        .refuse_at("git_carry::nested_administration")?
+        .take(GITDIR_POINTER_LIMIT)
+        .read_to_end(&mut contents)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    Ok(contents)
+}
+
+// The path a gitdir-pointer file names, as Git reads it
+// (`read_gitfile_gently`): the bytes after a leading `gitdir: `, with
+// trailing CR and LF stripped, as raw OS bytes (a non-UTF-8 path is a path).
+// None for an empty value, a missing prefix, or an interior NUL or newline.
+fn pointer_target(contents: &[u8]) -> Option<&Path> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut value = contents.strip_prefix(b"gitdir: ")?;
+    while let [rest @ .., b'\n' | b'\r'] = value {
+        value = rest;
+    }
+    if value.is_empty() || value.contains(&0) || value.contains(&b'\n') {
+        return None;
+    }
+    Some(Path::new(std::ffi::OsStr::from_bytes(value)))
+}
+
+// The canonical administration directory `target` names: None when it is
+// absent on this host (missing, through a regular file, or not a directory).
+fn resolve_admin(target: &Path) -> Result<Option<PathBuf>> {
+    match fs::canonicalize(target) {
+        Ok(admin) if admin.is_dir() => Ok(Some(admin)),
+        Ok(_) => Ok(None),
+        Err(error) if absent(&error) => Ok(None),
+        Err(_) => Err(BulkloadRefusal::GitInventoryMalformed),
+    }
 }
 
 // One typed filesystem seat from its lstat metadata. Sockets, FIFOs and
@@ -9885,6 +9946,12 @@ mod tests {
         let ignored =
             output(git(&source).args(["status", "--porcelain", "--ignored", "-uall"])).unwrap();
         // Git itself descends into the copy: it is no repository to Git.
+        assert!(!git(&pruned)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap()
+            .status
+            .success());
         assert!(
             String::from_utf8_lossy(&ignored).contains("!! archive/pruned-20261006/tree/kept.txt"),
             "{}",
@@ -9932,6 +9999,13 @@ mod tests {
         fs::create_dir_all(&copy).unwrap();
         fs::copy(live.join(".git"), copy.join(".git")).unwrap();
         fs::copy(live.join("tracked"), copy.join("tracked")).unwrap();
+        // Git reads the copy through the live worktree's administration: its
+        // HEAD and index are the live worktree's, not a repository of its own.
+        let seen = text(git(&copy).args(["rev-parse", "--absolute-git-dir"])).unwrap();
+        assert_eq!(
+            fs::canonicalize(seen).unwrap(),
+            fs::canonicalize(source.join(".git/worktrees/live")).unwrap()
+        );
         let stamps = walk_stamps(&source.join(".git"));
         assert_eq!(
             reusable_capture_key(&source),
@@ -9945,6 +10019,126 @@ mod tests {
         let captured = reusable_capture_key(&source);
         fs::remove_dir_all(root).unwrap();
         assert!(captured.is_ok(), "{captured:?}");
+    }
+
+    // M2r2 item 6 review: a live nested worktree whose administration
+    // registers it by a relative path (`git worktree add --relative-paths`,
+    // `worktree.useRelativePaths`, Git 2.48) is custody, not stale. Git reads
+    // the registered path against the administration directory, never the
+    // process's working directory. Written by hand here so the test does not
+    // depend on the Git version; a CRLF-terminated pointer reads as Git
+    // reads it.
+    #[test]
+    fn a_relative_registered_nested_worktree_is_custody() {
+        let root = fresh("bulkload-relative-worktree");
+        let source = root.join("main");
+        committed_repository(&source, b"main");
+        let nested = source.join("wt/rel");
+        fs::create_dir_all(source.join("wt")).unwrap();
+        output(
+            git(&source)
+                .args(["worktree", "add", "-q", "-b", "rel"])
+                .arg(&nested),
+        )
+        .unwrap();
+        fs::write(source.join(".git/worktrees/rel/gitdir"), b"../../../wt/rel/.git\n").unwrap();
+        fs::write(nested.join(".git"), b"gitdir: ../../.git/worktrees/rel\r\n").unwrap();
+        let head = text(git(&nested).args(["rev-parse", "--verify", "HEAD"])).unwrap();
+        let custody = nested_worktrees(&source);
+        let key = reusable_capture_key(&source);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            custody.unwrap(),
+            vec![NestedWorktree {
+                rel_path: b"wt/rel".to_vec(),
+                worktree_name: "rel".to_owned(),
+                head_oid: head,
+            }]
+        );
+        assert!(key.is_ok(), "{key:?}");
+    }
+
+    // M2r2 item 6 review: a nested worktree moved without `git worktree
+    // repair` still works for Git, and repair fixes it; it is not a copy and
+    // its pointer is not stale. It refuses GIT_NEST_WORKTREE_MOVED by its
+    // path, and captures as custody once repaired.
+    #[test]
+    fn a_moved_nested_worktree_refuses_moved_until_repaired() {
+        let root = fresh("bulkload-moved-worktree");
+        let source = root.join("main");
+        committed_repository(&source, b"main");
+        fs::create_dir_all(source.join("wt")).unwrap();
+        let before = source.join("wt/before");
+        let after = source.join("wt/after");
+        output(
+            git(&source)
+                .args(["worktree", "add", "-q", "-b", "moved"])
+                .arg(&before),
+        )
+        .unwrap();
+        fs::rename(&before, &after).unwrap();
+        // Git still works there.
+        let head = text(git(&after).args(["rev-parse", "--verify", "HEAD"])).unwrap();
+        let stamps = walk_stamps(&source.join(".git"));
+        let refused = reusable_capture_key(&source);
+        let unchanged = walk_stamps(&source.join(".git")) == stamps;
+        output(git(&after).args(["worktree", "repair"])).unwrap();
+        let custody = nested_worktrees(&source);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            refused,
+            Err(BulkloadRefusal::GitNestWorktreeMoved(b"wt/after".to_vec()))
+        );
+        assert!(unchanged, "the refused pass wrote under the source's .git");
+        assert_eq!(
+            custody.unwrap(),
+            vec![NestedWorktree {
+                rel_path: b"wt/after".to_vec(),
+                worktree_name: "before".to_owned(),
+                head_oid: head,
+            }]
+        );
+    }
+
+    // M2r2 item 6 review: a pointer is raw bytes, as Git reads it. A
+    // non-UTF-8 gitdir naming another repository is a foreign nest, not
+    // malformed inventory; a pointer without the `gitdir: ` prefix still is.
+    #[test]
+    fn a_non_utf8_pointer_to_a_foreign_repository_is_custody() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = fresh("bulkload-non-utf8-pointer");
+        let source = root.join("main");
+        committed_repository(&source, b"main");
+        let elsewhere = root.join(std::ffi::OsStr::from_bytes(b"else\xffwhere"));
+        committed_repository(&elsewhere, b"inner");
+        let inner = source.join("vendor/inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("tracked"), b"inner").unwrap();
+        let mut pointer = b"gitdir: ".to_vec();
+        pointer.extend_from_slice(elsewhere.join(".git").as_os_str().as_bytes());
+        pointer.push(b'\n');
+        fs::write(inner.join(".git"), &pointer).unwrap();
+        fs::write(source.join(".gitignore"), b"vendor/\n").unwrap();
+        let nests = nested_repositories(&source);
+        fs::write(inner.join(".git"), b"gitdir:no-space\n").unwrap();
+        let malformed = reusable_capture_key(&source);
+        fs::remove_dir_all(root).unwrap();
+        let nests = nests.unwrap();
+        assert_eq!(nests.len(), 1, "{nests:?}");
+        assert_eq!(malformed, Err(BulkloadRefusal::GitInventoryMalformed));
+    }
+
+    // The pointer reader follows Git's `read_gitfile_gently`: trailing CR and
+    // LF only are stripped; spaces are part of the path.
+    #[test]
+    fn pointer_target_reads_as_git_reads() {
+        assert_eq!(pointer_target(b"gitdir: a/b\r\n"), Some(Path::new("a/b")));
+        assert_eq!(pointer_target(b"gitdir: a/b \n"), Some(Path::new("a/b ")));
+        assert_eq!(pointer_target(b"gitdir: a\nb\n"), None);
+        assert_eq!(pointer_target(b"gitdir: \n"), None);
+        assert_eq!(pointer_target(b"gitdir:a\n"), None);
+        assert_eq!(pointer_target(b"\xef\xbb\xbfgitdir: a\n"), None);
+        assert_eq!(pointer_target(b"gitdir: a\0b\n"), None);
     }
 
     // Path, size and modification time of every entry under `dir`, sorted.
