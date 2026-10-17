@@ -10116,14 +10116,20 @@ mod tests {
         fs::write(source.join(".gitignore"), b"archive/\n").unwrap();
         let copy = source.join("archive/copy");
         fs::create_dir_all(&copy).unwrap();
-        fs::write(copy.join(".git"), b"gitdir: /nowhere/\xff/.git/worktrees/x\n").unwrap();
+        fs::write(
+            copy.join(".git"),
+            b"gitdir: /nowhere/\xff/.git/worktrees/x\n",
+        )
+        .unwrap();
         let stale = reusable_capture_key(&source);
         fs::write(copy.join(".git"), b"gitdir:no-space\n").unwrap();
         let malformed = reusable_capture_key(&source);
         fs::remove_dir_all(root).unwrap();
         assert_eq!(
             stale,
-            Err(BulkloadRefusal::GitNestPointerStale(b"archive/copy".to_vec()))
+            Err(BulkloadRefusal::GitNestPointerStale(
+                b"archive/copy".to_vec()
+            ))
         );
         assert_eq!(malformed, Err(BulkloadRefusal::GitInventoryMalformed));
     }
