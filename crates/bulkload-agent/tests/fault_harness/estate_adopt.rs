@@ -26,6 +26,13 @@
 //! (A11c), crashed with the repository complete in its private stage: the
 //! destination does not exist, and the rerun lands it.
 //!
+//! `Parents` (M2 finding 1): a standalone checkout planned under two absent
+//! parents, crashed after they are made and synced and before STATE
+//! records them: both are 0755 directories, the destination and the record
+//! are absent, the item is `journal-missing`; the rerun lands the checkout
+//! (nothing left to make, so nothing recorded), and a second rerun is a
+//! journal no-op.
+//!
 //! `_exit` models a process crash only (see the harness header).
 
 use std::fs;
@@ -49,6 +56,8 @@ pub enum EstateAdopt {
     Workspace,
     /// A bare first landing (A11c).
     Bare,
+    /// A first landing under absent parents (M2 finding 1).
+    Parents,
 }
 
 impl Scenario for EstateAdopt {
@@ -120,7 +129,16 @@ impl World {
         git(&src, &["branch", "side"]);
         git(&src, &["branch", "neo-only"]);
         git(&src, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        let (item, dest) = if kind == EstateAdopt::Bare {
+        let (item, dest) = if kind == EstateAdopt::Parents {
+            (
+                Item {
+                    source: src.clone(),
+                    repository: world.parents_dst(),
+                    workspace: Some(world.parents_dst()),
+                },
+                None,
+            )
+        } else if kind == EstateAdopt::Bare {
             let mirror = world.base.join("src.git");
             git(
                 &world.base,
@@ -170,6 +188,10 @@ impl World {
 
     fn dst(&self) -> PathBuf {
         self.base.join("dst")
+    }
+
+    fn parents_dst(&self) -> PathBuf {
+        self.base.join("made/deep/dst")
     }
 
     fn capture(&self) {
@@ -344,6 +366,10 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
     let world = World::new(&point.name().replace('.', "-"), kind);
     std::thread::sleep(std::time::Duration::from_millis(2_100));
     world.capture();
+    if kind == EstateAdopt::Parents {
+        parents(&world, &label, point, nth);
+        return;
+    }
     if kind == EstateAdopt::Bare {
         crash(&world, &format!("{}:{nth}", point.name()));
         assert!(
@@ -425,5 +451,57 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
     assert_eq!(
         rows[0].0, "previous-workspace-restoration-not-revalidated",
         "{label}: a second rerun is a no-op"
+    );
+}
+
+/// The `Parents` row: see the module docs.
+fn parents(world: &World, label: &str, point: Point, nth: u64) {
+    use std::os::unix::fs::PermissionsExt as _;
+    crash(world, &format!("{}:{nth}", point.name()));
+    for level in ["made", "made/deep"] {
+        let meta = fs::symlink_metadata(world.base.join(level)).unwrap();
+        assert!(meta.is_dir(), "{label}: {level}");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o755, "{label}");
+    }
+    assert!(
+        fs::symlink_metadata(world.parents_dst()).is_err(),
+        "{label}: nothing landed before the record"
+    );
+    let records = |world: &World| {
+        fs::read_dir(world.base.join("applied")).map_or(0, |dir| {
+            dir.filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "parents")
+            })
+            .count()
+        })
+    };
+    assert_eq!(records(world), 0, "{label}: no record before the sync");
+    assert_eq!(world.unaccounted(), 1, "{label}: journal-missing");
+    let rows = world.apply(false);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
+    assert!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_none_or(|reason| !reason.contains("parent-created")),
+        "{label}: the rerun made nothing: {rows:?}"
+    );
+    assert_eq!(
+        git(&world.parents_dst(), &["rev-parse", "HEAD"]),
+        git(&world.base.join("src"), &["rev-parse", "HEAD"]),
+        "{label}"
+    );
+    assert_eq!(records(world), 0, "{label}");
+    assert_eq!(world.unaccounted(), 0, "{label}");
+    let rows = world.apply(false);
+    assert_eq!(
+        rows[0].0, "previous-workspace-restoration-not-revalidated",
+        "{label}"
     );
 }

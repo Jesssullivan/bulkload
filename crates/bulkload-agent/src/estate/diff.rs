@@ -247,6 +247,7 @@ fn item_row(
         item: identity,
         observed_ns: retained_parts(corpus, &captured.bundle)?.map_or(0, |parts| parts.started_ns),
         capture: captured.digest,
+        parents: None,
     };
     let target = converge::Target {
         repository: &item.repository,

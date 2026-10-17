@@ -1079,11 +1079,14 @@ fn p102_estate_diff_reports_the_shape_the_apply_refuses() {
 /// source lacks, so its adoption refuses `GIT_DESTINATION_DIVERGED`; a
 /// source-only linked worktree then meets a common exclude that is not the
 /// capture's (`GIT_IGNORE_POLICY_CONFLICT`), and another is planned under
-/// a parent the destination lacks (`GIT_DESTINATION_PARENT_MISSING`).
+/// a parent the destination cannot have (`GIT_DESTINATION_PARENT_MISSING`:
+/// since M2 finding 1 an absent parent is made, so the path runs through a
+/// regular file, which never is).
 fn linked_refusals(world: &Gftb) -> (Run<'_>, PathBuf, PathBuf) {
     let infra = world.sting("infra");
     fs::create_dir_all(infra.join(".git/info")).unwrap();
     fs::write(infra.join(".git/info/exclude"), b"sting-only/\n").unwrap();
+    fs::write(world.sting("missing"), b"a file, not a directory\n").unwrap();
     let conflict = world.neo("infra.worktrees/only-src");
     let orphan = world.neo("infra/.worktrees/nest");
     let main = world.neo("infra");
@@ -1097,7 +1100,7 @@ fn linked_refusals(world: &Gftb) -> (Run<'_>, PathBuf, PathBuf) {
                 &infra,
                 Some(&world.sting("infra.worktrees/only-src")),
             ),
-            (&orphan, &infra, Some(&world.sting("missing/nest"))),
+            (&orphan, &infra, Some(&world.sting("missing/deeper/nest"))),
         ],
     );
     settle();
@@ -1146,7 +1149,10 @@ fn p103_a_refused_linked_landing_leaves_the_repository_untouched() {
         "a refused linked landing wrote"
     );
     assert!(!world.sting("infra.worktrees/only-src").exists());
-    assert!(!world.sting("missing").exists());
+    assert_eq!(
+        fs::read(world.sting("missing")).unwrap(),
+        b"a file, not a directory\n"
+    );
 }
 
 /// P104 DIFF-LINKED (dogfood F1): `estate-diff` runs a first linked
@@ -1178,4 +1184,198 @@ fn p104_estate_diff_reports_the_linked_refusals_the_apply_makes() {
     assert!(receipt(&rows, &orphan)
         .2
         .contains("GIT_DESTINATION_PARENT_MISSING"));
+}
+
+/// Every `*.parents` record in `state`, as raw bytes.
+fn parents_records(state: &Path) -> Vec<Vec<u8>> {
+    let mut found: Vec<Vec<u8>> = fs::read_dir(state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "parents"))
+        .map(|path| fs::read(path).unwrap())
+        .collect();
+    found.sort();
+    found
+}
+
+fn contains(haystack: &[u8], needle: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let needle = needle.as_os_str().as_bytes();
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// P105 PARENTS-MADE (M2 finding 1, 2026-10-16: 42 of 104 in-place items
+/// refused `GIT_DESTINATION_PARENT_MISSING`): a standalone workspace, a
+/// linked worktree and a bare repository planned under absent parents
+/// land. `estate-diff` says `landing` (`bare-landing`) with `parents=2`
+/// and writes nothing; the apply makes each absent level 0755, counts it
+/// in the receipt (`parent-created=2`) and records it in STATE
+/// (`{item}-{source}.parents`); the rerun is a journal no-op that makes
+/// nothing.
+#[test]
+fn p105_a_first_landing_makes_its_absent_parents() {
+    let world = Gftb::new();
+    let infra = world.sting("infra");
+    let standalone = world.sting("made/deep/lamesh");
+    let linked = world.sting("infra.made/deep/only-src");
+    let bare = world.sting("bare-made/x/preservation.git");
+    let run = named_run(
+        &world,
+        "parents",
+        &[
+            (&world.neo("infra"), &infra, Some(&infra)),
+            (
+                &world.neo("infra.worktrees/only-src"),
+                &infra,
+                Some(&linked),
+            ),
+            (&world.neo("lamesh"), &standalone, Some(&standalone)),
+            (&world.neo("preservation.git"), &bare, None),
+        ],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    let frozen = freeze_all(&world.sting(""));
+    let diff = run.diff(&[]);
+    assert_eq!(freeze_all(&world.sting("")), frozen, "estate-diff wrote");
+    for (source, adopt) in [
+        ("lamesh", "landing"),
+        ("infra.worktrees/only-src", "landing"),
+        ("preservation.git", "bare-landing"),
+    ] {
+        let line = diff_line(&diff.stdout, &world.neo(source));
+        assert!(
+            line.contains("\"class\":\"source-only\"")
+                && line.contains(&format!("\"adopt\":\"{adopt}\""))
+                && line.contains("\"parents=2\""),
+            "{line}"
+        );
+    }
+    let ran = run.apply(&["--adopt"]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let rows = receipts(&ran.stdout);
+    for (source, outcome) in [
+        ("lamesh", "workspace-restored"),
+        ("infra.worktrees/only-src", "workspace-restored"),
+        ("preservation.git", "refs-imported"),
+    ] {
+        let row = receipt(&rows, &world.neo(source));
+        assert_eq!(row.1, outcome, "{row:?}");
+        assert!(row.2.contains("parent-created=2"), "{row:?}");
+    }
+    assert_eq!(
+        git(&standalone, &["rev-parse", "HEAD"]),
+        git(&world.neo("lamesh"), &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&linked, &["rev-parse", "--git-common-dir"]).trim(),
+        infra.join(".git").to_str().unwrap()
+    );
+    assert_eq!(
+        git(&bare, &["rev-parse", "--is-bare-repository"]).trim(),
+        "true"
+    );
+    let made = [
+        "made",
+        "made/deep",
+        "infra.made",
+        "infra.made/deep",
+        "bare-made",
+        "bare-made/x",
+    ];
+    for level in made {
+        use std::os::unix::fs::PermissionsExt as _;
+        let meta = fs::symlink_metadata(world.sting(level)).unwrap();
+        assert!(meta.is_dir(), "{level}");
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o755, "{level}");
+    }
+    let records = parents_records(&run.applied);
+    assert_eq!(records.len(), 3, "one record per item that made parents");
+    for made in made {
+        assert!(
+            records
+                .iter()
+                .filter(|record| contains(record, &world.sting(made)))
+                .count()
+                >= 1,
+            "{made} is recorded"
+        );
+    }
+    let again = run.apply(&["--adopt"]);
+    assert!(again.ok, "{}\n{}", again.stdout, again.stderr);
+    assert!(!again.stdout.contains("parent-created"), "{}", again.stdout);
+    assert_eq!(parents_records(&run.applied), records);
+}
+
+/// P106 PARENTS-POLICY (M2 finding 1): absent parents are never made
+/// through a symlink. A workspace planned below a link to a directory
+/// outside the plan, under a level that does not exist there, stays
+/// `parent-missing` in `estate-diff` and `GIT_DESTINATION_PARENT_MISSING`
+/// in the apply, and nothing is made where the link points.
+#[test]
+fn p106_absent_parents_are_never_made_through_a_link() {
+    let world = Gftb::new();
+    let elsewhere = world.path("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, world.sting("via-link")).unwrap();
+    let dest = world.sting("via-link/new/lamesh");
+    let run = named_run(
+        &world,
+        "policy",
+        &[(&world.neo("lamesh"), &dest, Some(&dest))],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    let line = run.diff(&[]).stdout;
+    let line = diff_line(&line, &world.neo("lamesh"));
+    assert!(line.contains("\"adopt\":\"parent-missing\""), "{line}");
+    let ran = run.apply(&[]);
+    assert!(!ran.ok, "{}", ran.stdout);
+    let row = receipt(&receipts(&ran.stdout), &world.neo("lamesh")).clone();
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(row.2.contains("GIT_DESTINATION_PARENT_MISSING"), "{row:?}");
+    assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+    assert!(parents_records(&run.applied).is_empty());
+}
+
+/// P107 PARENTS-ORDER (M2 item 1 review): a bare repository planned below
+/// a standalone workspace of the same plan lands after it, whatever the
+/// plan's order: the bare landing never makes the workspace's own
+/// directory as its parent (which would leave the workspace
+/// `GIT_DESTINATION_OCCUPIED` for good).
+#[test]
+fn p107_a_bare_landing_below_a_planned_workspace_lands_after_it() {
+    let world = Gftb::new();
+    let outer = world.sting("outer");
+    let bare = world.sting("outer/sub/preservation.git");
+    let run = named_run(
+        &world,
+        "order",
+        &[
+            (&world.neo("preservation.git"), &bare, None),
+            (&world.neo("lamesh"), &outer, Some(&outer)),
+        ],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    let ran = run.apply(&[]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let rows = receipts(&ran.stdout);
+    assert_eq!(
+        receipt(&rows, &world.neo("lamesh")).1,
+        "workspace-restored",
+        "{rows:?}"
+    );
+    let row = receipt(&rows, &world.neo("preservation.git"));
+    assert_eq!(row.1, "refs-imported", "{row:?}");
+    assert!(row.2.contains("parent-created=1"), "{row:?}");
+    assert_eq!(
+        git(&bare, &["rev-parse", "--is-bare-repository"]).trim(),
+        "true"
+    );
 }
