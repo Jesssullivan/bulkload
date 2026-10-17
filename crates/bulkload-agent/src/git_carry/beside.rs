@@ -169,9 +169,11 @@ pub fn path(workspace: &Path, suffix: &str) -> Result<PathBuf> {
     Ok(workspace.with_file_name(beside))
 }
 
-/// Import `staged` into `repo` (provenance only, as a refs-only item does)
-/// and name the instance it wrote: for a beside checkout adopted in its own
-/// repository, whose refs go in under `refs/<suffix>/` of the planned one.
+/// Import `staged` into `repo` and name the instance it wrote.
+///
+/// Provenance only, as a refs-only item imports: for a beside checkout
+/// adopted in its own repository, whose refs go in under `refs/<suffix>/`
+/// of the planned one.
 ///
 /// # Errors
 /// Whatever the import refuses.
