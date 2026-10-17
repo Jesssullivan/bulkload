@@ -17,6 +17,14 @@
 //!   ([`crate::disposition`]): accept, re-carry or abandon. An item row
 //!   disposes only the refusal instance it was made against ([`instance`]);
 //!   a standing policy disposes every refusal with its code.
+//! - `applied-beside` (closure v5, M2 round 2 item c): the item plans a
+//!   workspace, its outcome is `WorkspaceBeside` (or a re-apply's
+//!   `PreviousWorkspaceBesideNotRevalidated`), and the exact journal for its
+//!   current capture says `workspace-beside`: the planned checkout differed
+//!   (`GIT_DESTINATION_DIVERGED`, `GIT_AUTHORITY_CHANGED`) and was left as
+//!   it was, and `estate-apply --beside` landed the captured checkout beside
+//!   it (`<workspace>.<suffix>`) with create-only refs in. Closed: every
+//!   captured byte and ref is at the destination, beside the live tree.
 //! - `referenced-only`: the item plans no workspace, its outcome is
 //!   `RefsImported` (or `PreviousRefCustodyNotWorkspaceParity`, or
 //!   `IndexRepaired` from `git-repair-missing-index` with a state directory,
@@ -68,7 +76,9 @@
 //! the report covers the transfers the operator named (`--transfer`) and
 //! says so (no `transfer_manifest` block).
 //!
-//! The report is `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
+//! The report is `bulkload.closure.v5` (M2 round 2 item c: the
+//! disposition `applied-beside` and its total `applied_beside`, after
+//! `applied`; nothing else changes from v4). v4 was #226 item 5 (v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
 //! `unmatched_journals`, `omissions`: the rebuildable roots the planned
 //! items' current captures omitted, from each capture's `.omissions`
@@ -102,6 +112,9 @@ use crate::{BulkloadRefusal, Result};
 pub enum Disposition {
     /// Workspace restored, journal present.
     Applied,
+    /// The captured checkout landed beside a differing planned one, journal
+    /// present (closure v5).
+    AppliedBeside,
     /// A typed refusal with this code that an operator review disposes (S4).
     Refused(String),
     /// A typed refusal with this code that no review disposes yet (S4).
@@ -121,6 +134,7 @@ impl Disposition {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Applied => "applied",
+            Self::AppliedBeside => "applied-beside",
             Self::Refused(_) => "refused",
             Self::RefusedPendingReview(_) => "refused-pending-review",
             Self::ReferencedOnly => "referenced-only",
@@ -203,6 +217,13 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
     };
     match &record.outcome {
         Outcome::Refused(refusal) => refusal_disposition(refusal),
+        Outcome::WorkspaceBeside | Outcome::PreviousWorkspaceBesideNotRevalidated => {
+            if entry.has_workspace {
+                journal("workspace-beside", Disposition::AppliedBeside)
+            } else {
+                Disposition::Unaccounted("outcome-workspace-mismatch")
+            }
+        }
         Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
             if entry.has_workspace {
                 journal("workspace-restored", Disposition::Applied)
@@ -355,6 +376,8 @@ pub struct Row {
 pub struct Report {
     pub rows: Vec<Row>,
     pub applied: u64,
+    /// Landed beside a differing planned checkout (closure v5).
+    pub applied_beside: u64,
     /// Typed refusals a review disposes.
     pub refused: u64,
     /// Typed refusals no review disposes yet.
@@ -491,13 +514,14 @@ impl Report {
         let mut decisions = std::collections::BTreeMap::<&'static str, u64>::new();
         (
             self.applied,
+            self.applied_beside,
             self.refused,
             self.refused_pending_review,
             self.referenced_only,
             self.covered,
             self.unaccounted,
             self.ruled_default,
-        ) = (0, 0, 0, 0, 0, 0, 0);
+        ) = (0, 0, 0, 0, 0, 0, 0, 0);
         self.refusals.clear();
         for row in &mut self.rows {
             if let Some(code) = row.disposition.refusal().map(str::to_owned) {
@@ -521,6 +545,7 @@ impl Report {
             }
             match &row.disposition {
                 Disposition::Applied => self.applied += 1,
+                Disposition::AppliedBeside => self.applied_beside += 1,
                 Disposition::Refused(_) => self.refused += 1,
                 Disposition::RefusedPendingReview(_) => self.refused_pending_review += 1,
                 Disposition::ReferencedOnly => self.referenced_only += 1,
@@ -815,19 +840,20 @@ impl Report {
         }
     }
 
-    /// The report as one JSON document ([`SCHEMA`], `bulkload.closure.v4`).
+    /// The report as one JSON document ([`SCHEMA`], `bulkload.closure.v5`).
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn to_json(&self) -> String {
         let mut out = String::new();
         let _ = write!(
             out,
-            "{{\"schema\":\"{SCHEMA}\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"transfer_rows\":{},\"applied\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"covered\":{},\"unaccounted\":{},\"pending_review\":{},\"ruled_default\":{}}},\"refusals\":{{",
+            "{{\"schema\":\"{SCHEMA}\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"transfer_rows\":{},\"applied\":{},\"applied_beside\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"covered\":{},\"unaccounted\":{},\"pending_review\":{},\"ruled_default\":{}}},\"refusals\":{{",
             if self.native_passes() { "pass" } else { "fail" },
             if self.passes() { "pass" } else { "fail" },
             self.planned(),
             self.transfer_rows(),
             self.applied,
+            self.applied_beside,
             self.refused,
             self.refused_pending_review,
             self.referenced_only,
@@ -972,7 +998,7 @@ impl Report {
 }
 
 /// The report's schema name.
-pub const SCHEMA: &str = "bulkload.closure.v4";
+pub const SCHEMA: &str = "bulkload.closure.v5";
 
 // A transfer row's own fields as JSON: its DEST_STATE, path, outcome and
 // recorded refusal (typed or not, as an estate row prints it).
@@ -2313,7 +2339,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v4\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
+            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
         ), "{json}");
         // A typed refusal row names its code, recording site and errno.
         assert!(json.contains(
@@ -2500,7 +2526,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v4\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
+            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
         ), "{json}");
         // The attested refusal of c is a typed refusal: it needs a review.
         assert!(json.contains(
@@ -2565,7 +2591,7 @@ mod tests {
         assert_eq!(report.gate(), Ok(()));
         let json = report.to_json();
         assert!(
-            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":0,\"ruled_default\":0}"),
+            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":0,\"ruled_default\":0}"),
             "{json}"
         );
         assert!(json.contains(
@@ -2958,7 +2984,7 @@ mod tests {
         assert!(report.native_passes());
         let json = report.to_json();
         assert!(
-            json.starts_with("{\"schema\":\"bulkload.closure.v4\""),
+            json.starts_with("{\"schema\":\"bulkload.closure.v5\""),
             "{json}"
         );
         assert!(

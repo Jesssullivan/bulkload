@@ -249,6 +249,7 @@ fn item_row(
         capture: captured.digest,
         parents: None,
         exclude_union: None,
+        beside: false,
     };
     let target = converge::Target {
         repository: &item.repository,

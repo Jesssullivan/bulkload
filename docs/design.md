@@ -184,7 +184,15 @@ Not joined: `snapshot` and the offline compose verbs, which belong to no
 run; a source's tagged engine temporaries a walk skipped are listed by the
 transfer, not rows.
 
-The report schema is `bulkload.closure.v4` from #226 (OI-1003-Q171/Q172,
+The report schema is `bulkload.closure.v5` from M2 round 2 item c
+(2026-10-17). What changed for a v4 reader: the disposition
+`applied-beside` (a workspace item whose planned checkout differed,
+`GIT_DESTINATION_DIVERGED` or `GIT_AUTHORITY_CHANGED`, landed beside it by
+`estate-apply --beside`, with the exact current-capture journal
+`workspace-beside`; accounted and closed) and its total `applied_beside`,
+right after `applied`. Nothing else changes.
+
+The report schema was `bulkload.closure.v4` from #226 (OI-1003-Q171/Q172,
 2026-10-15). What changed for a v3 reader: one top-level block after
 `unmatched_journals`, `omissions`: the rebuildable roots the planned items'
 current captures omitted (`node_modules`, `.direnv`, `__pycache__`,
@@ -930,6 +938,44 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   would land the item, the component `exclude-union=<n>` (items of one
   repository each count the lines; the apply appends them once), or
   `exclude-union-refused=<CODE>` where it would not.
+- **`--beside` lands a diverged checkout beside it (M2 round 2 item c,
+  2026-10-17).** The in-place i02 batch ended 10 workspace items
+  `GIT_DESTINATION_DIVERGED` (a live checkout that differs from the capture,
+  which `--adopt` cannot prove) and 2 `GIT_AUTHORITY_CHANGED`; each was
+  carried by hand as a refs-only item plus a standalone item at
+  `<path>.neo-20261016`. With `estate-apply --beside`, a workspace item whose
+  planned checkout's apply refuses either code leaves that checkout exactly
+  as it is and lands the capture beside it, at `<workspace>.<suffix>`:
+  `suffix` is `<prefix>-<YYYYMMDD>`, `prefix` the SOURCE label up to its
+  first `-`, the date the label's first dash-separated calendar date, else
+  the capture's own instant (UTC); neither refuses
+  `REQUIRED_FIELD_MISSING`. The landing is a first linked landing into the
+  planned repository (its objects imported as any landing imports them),
+  detached at the captured head with the branch recorded
+  (`head-detached-beside`): no branch of the live repository is created or
+  moved, its native refs are never stepped, and a landing a crash cut short
+  is finished forward, never converged. The exclude policy is a linked
+  landing's (`--exclude-union` applies). A beside path that exists refuses
+  `GIT_DESTINATION_OCCUPIED` unless it is this item's own landing of this
+  capture (then nothing is landed again). Then every captured ref
+  `refs/<name>` is created as `refs/<suffix>/<name>`, and stash entry `n`
+  (newest first) as `refs/<suffix>/stashes/<n>`, in one `update-ref`
+  transaction of `create` lines: create-only. A name already holding the
+  same value is counted present; one holding another value is kept, never
+  moved or deleted, and counted. Nothing outside `refs/<suffix>/` is written.
+  This is a recorded write: STATE records `{item}-{blake3(SOURCE)}.beside`
+  (path, suffix, capture, instance, refs created and kept) after the refs
+  and the landing's own ledgers; the receipt counts `beside-landed`,
+  `beside-after=<CODE>`, `beside-ref-created`, `beside-ref-present` and
+  `beside-ref-kept`; the outcome and journal are `workspace-beside` (a rerun
+  `previous-workspace-beside-not-revalidated`), and closure v5 classifies
+  the item `applied-beside`. A crash after the worktree is added
+  (`estate.converge.linked_added`) or after the refs
+  (`estate.apply.beside_refs`) leaves the live checkout untouched and the
+  item `journal-missing`; the rerun finishes it. `estate-diff` adds the
+  component `beside=<landing|landed|occupied>:<path>` to a `diverged` row
+  (an authority change is decided only by the apply). The beside checkout
+  is a worktree of the live repository: `git worktree list` there shows it.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads

@@ -2267,6 +2267,7 @@ fn apply_item(
             let done: String = read(&journal)?;
             let outcome = match done.as_str() {
                 "workspace-restored" => "previous-workspace-restoration-not-revalidated",
+                "workspace-beside" => "previous-workspace-beside-not-revalidated",
                 "refs-imported" => "previous-ref-custody-not-workspace-parity",
                 _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
             };
@@ -2342,6 +2343,7 @@ fn apply_item(
         capture: captured.digest,
         parents: Some(&parents),
         exclude_union: options.exclude_union.then_some(union.as_path()),
+        beside: false,
     };
     let target = git_carry::converge::Target {
         repository: &item.repository,
@@ -2356,20 +2358,32 @@ fn apply_item(
     };
     let (outcome, applied) = if item.workspace.is_some() {
         let landed_before = landed_before(state, &identity, source, &journal)?;
-        let applied = git_carry::converge::apply_workspace(
+        let (outcome, applied) = match git_carry::converge::apply_workspace(
             &staged,
             &target,
             &landing,
             landed_before,
             &policy,
-        )?;
+        ) {
+            Ok(applied) => ("workspace-restored", applied),
+            // M2 round 2 item c: the planned checkout differs and stays as
+            // it is; the capture lands beside it.
+            Err(
+                refusal @ (BulkloadRefusal::GitDestinationDiverged
+                | BulkloadRefusal::GitAuthorityChanged),
+            ) if options.beside => (
+                "workspace-beside",
+                beside_item(&staged, &target, &landing, (state, &policy), &refusal)?,
+            ),
+            Err(refusal) => return Err(refusal),
+        };
         if let Some(key) = deferred {
             imported
                 .lock()
                 .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
                 .insert(key);
         }
-        ("workspace-restored", applied)
+        (outcome, applied)
     } else {
         (
             "refs-imported",
@@ -2389,6 +2403,116 @@ fn apply_item(
         })
         .or_else(|| applied.converged.then(|| "converged".to_owned()));
     Ok(done)
+}
+
+/// Where an item's beside landing is recorded (M2 round 2 item c):
+/// `{item}-{blake3(source)}.beside` in STATE, a
+/// [`git_carry::beside::BesideRecord`].
+#[must_use]
+pub fn beside_record_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.beside",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
+/// Whether the checkout at `beside` is this item's own landing of this
+/// capture (its workspace ledger names both); `None` when it has no ledger.
+fn beside_landed(
+    beside: &Path,
+    landing: &git_carry::converge::Landing<'_>,
+    source: &str,
+) -> Result<Option<bool>> {
+    let Some(git_dir) = git_carry::landed::worktree_git_dir(beside)? else {
+        return Ok(None);
+    };
+    let ledger: Option<git_carry::landed::LandedWorkspace> = git_carry::landed::read(
+        &git_carry::landed::ledger_dir(&git_dir, source).join(git_carry::landed::WORKSPACE_LANDED),
+    )?;
+    Ok(ledger.map(|ledger| ledger.item == landing.item && ledger.capture == landing.capture))
+}
+
+/// `estate-apply --beside` (M2 round 2 item c, [`git_carry::beside`]): the
+/// captured checkout lands at `<workspace>.<suffix>` as a first linked
+/// landing into the planned repository, detached, its native refs never
+/// stepped; then the captured refs go in create-only under
+/// `refs/<suffix>/`, and STATE records it. `refusal` is what the planned
+/// workspace's apply refused (it is on the receipt).
+fn beside_item(
+    staged: &git_carry::StagedBundle,
+    target: &git_carry::converge::Target<'_>,
+    landing: &git_carry::converge::Landing<'_>,
+    (state, policy): (&Path, &git_carry::converge::Policy<'_>),
+    refusal: &BulkloadRefusal,
+) -> Result<git_carry::converge::Applied> {
+    let workspace = target
+        .workspace
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let suffix = git_carry::beside::suffix(target.source, landing.observed_ns)?;
+    let beside = git_carry::beside::path(workspace, &suffix)?;
+    let beside_target = git_carry::converge::Target {
+        workspace: Some(&beside),
+        ..*target
+    };
+    let beside_landing = git_carry::converge::Landing {
+        beside: true,
+        ..*landing
+    };
+    // The beside path is never adopted, re-keyed or converged: it is this
+    // item's own landing of this capture, finished forward, or new.
+    let beside_policy = git_carry::converge::Policy {
+        adopt: false,
+        ..*policy
+    };
+    let mut applied = match beside_landed(&beside, landing, target.source)? {
+        Some(true) => git_carry::converge::Applied::default(),
+        Some(false) => return Err(BulkloadRefusal::GitDestinationOccupied),
+        None => git_carry::converge::apply_workspace(
+            staged,
+            &beside_target,
+            &beside_landing,
+            false,
+            &beside_policy,
+        )?,
+    };
+    let git_dir = git_carry::landed::worktree_git_dir(&beside)?
+        .ok_or(BulkloadRefusal::GitDestinationOccupied)?;
+    let ledger: git_carry::landed::LandedWorkspace = git_carry::landed::read(
+        &git_carry::landed::ledger_dir(&git_dir, target.source)
+            .join(git_carry::landed::WORKSPACE_LANDED),
+    )?
+    .ok_or(BulkloadRefusal::GitDestinationOccupied)?;
+    let wanted =
+        git_carry::beside::wanted(target.repository, target.source, &ledger.instance, &suffix)?;
+    let refs = git_carry::beside::refs_in(target.repository, &wanted, &suffix)?;
+    fault_point!(EstateApplyBesideRefs);
+    // Recorded after the refs and the landing it describes are durable;
+    // the refs a rerun finds present are named from the record it extends.
+    let record_path = beside_record_path(state, landing.item, target.source);
+    let mut record = git_carry::beside::read_record(&record_path)?.unwrap_or_default();
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        record.item = landing.item.to_owned();
+        record.path = beside.as_os_str().as_bytes().to_vec();
+    }
+    record.suffix.clone_from(&suffix);
+    record.capture = landing.capture;
+    record.instance.clone_from(&ledger.instance);
+    record.created.extend(refs.created.iter().cloned());
+    record.kept.clone_from(&refs.kept);
+    git_carry::beside::write_record(&record_path, &record)?;
+    let words = format!(
+        "beside-landed=1 beside-after={} beside-ref-created={} beside-ref-present={} beside-ref-kept={}",
+        refusal.code(),
+        refs.created.len(),
+        refs.present,
+        refs.kept.len()
+    );
+    applied.custody = Some(match applied.custody.take() {
+        Some(more) => format!("{words} {more}"),
+        None => words,
+    });
+    Ok(applied)
 }
 
 // Finding 13: whether STATE holds a journal of this item for a capture
@@ -2852,6 +2976,12 @@ pub struct ApplyOptions {
     /// what either policy means (no negation on either side) and no
     /// bulkload ledger owns the exclude ([`git_carry::exclude_union`]).
     pub exclude_union: bool,
+    /// `--beside` (M2 round 2 item c): a workspace item whose planned
+    /// checkout refuses `GIT_DESTINATION_DIVERGED` or `GIT_AUTHORITY_CHANGED`
+    /// lands beside it instead, at `<workspace>.<suffix>`, with the
+    /// captured refs created under `refs/<suffix>/`; the planned checkout is
+    /// left as it was ([`git_carry::beside`]).
+    pub beside: bool,
 }
 
 /// Apply explicit restores only; common Git administration is serialized.

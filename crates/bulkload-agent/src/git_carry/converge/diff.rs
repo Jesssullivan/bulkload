@@ -73,6 +73,8 @@ pub struct ItemRow {
     /// The components that differ: `head`, `index`, `exclude`,
     /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
     /// landing that makes `n` absent parents (M2 finding 1);
+    /// `beside=<landing|landed|occupied>:<path>` for a `diverged` item
+    /// (what `estate-apply --beside` does; M2 round 2 item c);
     /// `exclude-union=<n>` for an `ignore-policy-conflict` that
     /// `estate-apply --exclude-union` lands by appending `n` lines (items
     /// of one repository each count them; the apply appends them once), or
@@ -166,6 +168,37 @@ fn first_landing(
         Err(BulkloadRefusal::GitDestinationParentMissing) => Ok(("parent-missing", 0, None)),
         Err(other) => Err(other),
     }
+}
+
+// What `estate-apply --beside` does with a diverged item (M2 round 2 item
+// c): `beside=<verdict>:<path>`, the verdict `landing` (absent: the capture
+// lands there), `landed` (this item's own landing of this capture: nothing
+// to land) or `occupied` (`GIT_DESTINATION_OCCUPIED`); or
+// `beside-refused=<CODE>` when no beside path can be named.
+fn beside_component(workspace: &Path, landing: &Landing<'_>, source: &str) -> Result<String> {
+    let suffix = match super::super::beside::suffix(source, landing.observed_ns) {
+        Ok(suffix) => suffix,
+        Err(refusal) => return Ok(format!("beside-refused={}", refusal.code())),
+    };
+    let beside = super::super::beside::path(workspace, &suffix)?;
+    let verdict = if planned(&beside)?.is_none() {
+        "landing"
+    } else {
+        let ledger = match landed::worktree_git_dir(&beside)? {
+            Some(git_dir) => landed::read::<LandedWorkspace>(
+                &landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_LANDED),
+            )?,
+            None => None,
+        };
+        if ledger
+            .is_some_and(|ledger| ledger.item == landing.item && ledger.capture == landing.capture)
+        {
+            "landed"
+        } else {
+            "occupied"
+        }
+    };
+    Ok(format!("beside={verdict}:{}", beside.display()))
 }
 
 // The component a first landing that makes `absent` parents carries.
@@ -276,6 +309,8 @@ pub fn workspace(
             row.class = "differs";
             row.adopt = "diverged";
             row.components = components;
+            row.components
+                .push(beside_component(workspace, landing, target.source)?);
             row.hint = Some(hint(
                 &scratch.repo,
                 &head_of(workspace)?.oid,

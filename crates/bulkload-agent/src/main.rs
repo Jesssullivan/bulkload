@@ -60,7 +60,7 @@ SUBCOMMANDS:
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply [--adopt] [--exclude-union] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+    estate-apply [--adopt] [--exclude-union] [--beside] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces.
                 A landed checkout bulkload proves unchanged converges to the
                 current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
@@ -91,7 +91,19 @@ SUBCOMMANDS:
                 repository ignores. Where a line would be appended it still
                 refuses for a negation (!pattern) on either side, an exclude a
                 bulkload ledger owns, a symlinked info or an exclude that is not
-                a regular file with one link this user owns
+                a regular file with one link this user owns.
+                --beside (M2 round 2): a workspace item whose planned checkout
+                refuses GIT_DESTINATION_DIVERGED or GIT_AUTHORITY_CHANGED leaves
+                it as it is and lands the capture at WORKSPACE.SUFFIX (SUFFIX
+                PREFIX-YYYYMMDD: the SOURCE label up to its first '-', and the
+                label's date, else the capture's UTC date) as a detached linked
+                worktree of the planned repository, then creates every captured
+                ref as refs/SUFFIX/NAME and each stash entry as
+                refs/SUFFIX/stashes/N, create-only (an existing one is kept and
+                counted); recorded in STATE ITEM-SOURCE.beside; outcome and
+                journal workspace-beside, closure applied-beside. An existing
+                beside path that is not this item's landing of this capture
+                refuses GIT_DESTINATION_OCCUPIED
     estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
@@ -145,8 +157,10 @@ SUBCOMMANDS:
                 PRIVATE_STATE's typed outcome records (legacy string records
                 are mapped) and journals (later directories override earlier
                 outcome records), with SOURCE the label estate-apply was
-                given. Prints a bulkload.closure.v4 JSON ledger: every planned
+                given. Prints a bulkload.closure.v5 JSON ledger: every planned
                 item is applied (workspace, exact current-capture journal),
+                applied-beside (estate-apply --beside landed the capture beside
+                a differing workspace; exact workspace-beside journal),
                 refused-pending-review (typed code; a bare IO or FRAME_CODEC
                 is not typed, nor is a code retired from the taxonomy),
                 refused (a typed code a review disposes), or referenced-only
@@ -1373,6 +1387,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                         adopt: options.adopt,
                         activate_origin: options.activate_origin,
                         exclude_union: options.exclude_union,
+                        beside: options.beside,
                     },
                 ),
                 &receipt,
@@ -1386,7 +1401,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         "estate-diff" => {
             let (options, rest) = estate_options(args)?;
-            if rest.len() < 4 || options.adopt || options.exclude_union {
+            if rest.len() < 4 || options.adopt || options.exclude_union || options.beside {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let source = rest
@@ -1736,6 +1751,7 @@ fn handoff_options(
 struct EstateOptions {
     adopt: bool,
     exclude_union: bool,
+    beside: bool,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
@@ -1753,6 +1769,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             }
             "--exclude-union" if !options.exclude_union => {
                 options.exclude_union = true;
+                at += 1;
+            }
+            "--beside" if !options.beside => {
+                options.beside = true;
                 at += 1;
             }
             "--activate-origin" => {

@@ -349,6 +349,10 @@ pub enum Point {
     /// `estate.apply.exclude_appended`: the common exclude replaced by its
     /// union (synced); the record still says intent.
     EstateApplyExcludeAppended,
+    /// `estate.apply.beside_refs`: a beside landing (M2 round 2 item c)
+    /// landed and its refs created under `refs/<suffix>/`; its STATE record
+    /// and the item's journal not yet written.
+    EstateApplyBesideRefs,
     /// `reseat.after_temp_seal`
     ReseatAfterTempSeal,
     /// `reseat.after_publish`
@@ -395,7 +399,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 64] = [
+    pub const ALL: [Self; 65] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -442,6 +446,7 @@ impl Point {
         Self::EstateApplyParentsMade,
         Self::EstateApplyExcludeIntent,
         Self::EstateApplyExcludeAppended,
+        Self::EstateApplyBesideRefs,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
         Self::ReseatAfterExtendIntent,
@@ -512,6 +517,7 @@ impl Point {
             Self::EstateApplyParentsMade => "estate.apply.parents_made",
             Self::EstateApplyExcludeIntent => "estate.apply.exclude_intent",
             Self::EstateApplyExcludeAppended => "estate.apply.exclude_appended",
+            Self::EstateApplyBesideRefs => "estate.apply.beside_refs",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",
             Self::ReseatAfterExtendIntent => "reseat.after_extend_intent",

@@ -44,6 +44,18 @@
 //! append), counts the unreported append `exclude-appended=1` either way,
 //! lands the worktree, and a second rerun is a journal no-op.
 //!
+//! `Beside` (M2 round 2 item c): the `Workspace` shape with one seat the
+//! destination changed, so `--adopt` refuses `GIT_DESTINATION_DIVERGED`,
+//! applied with `--adopt --beside` (this row only), crashed after the
+//! beside worktree is added and before its ledger (`linked_added`: the
+//! rerun finishes it forward from its landing intent), or after the refs
+//! are created and before the STATE record and the journal (`beside_refs`):
+//! the destination checkout is untouched either way, the item
+//! `journal-missing`; the rerun lands (or finds landed) the beside checkout,
+//! every `refs/<suffix>/` ref holds the capture's value and none moved,
+//! the record is written and the journal says `workspace-beside`; a second
+//! rerun is a journal no-op.
+//!
 //! `_exit` models a process crash only (see the harness header).
 
 use std::fs;
@@ -61,6 +73,8 @@ use super::{Scenario, CHILD_DEADLINE, CHILD_WATCHDOG, CHILD_WATCHDOG_EXIT_CODE, 
 const CHILD_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_BASE";
 /// Set only in an `ExcludeUnion` child: it applies with `--exclude-union`.
 const CHILD_UNION_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_UNION";
+/// Set only in a `Beside` child: it applies with `--beside`.
+const CHILD_BESIDE_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_BESIDE";
 
 /// What is crashed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +87,9 @@ pub enum EstateAdopt {
     Parents,
     /// A first linked landing under `--exclude-union` (M2 round 2, item 2).
     ExcludeUnion,
+    /// A diverged checkout landed beside under `--beside` (M2 round 2,
+    /// item c).
+    Beside,
 }
 
 impl Scenario for EstateAdopt {
@@ -116,6 +133,8 @@ struct World {
     /// `--exclude-union` on every apply: the `ExcludeUnion` row only, so the
     /// other rows keep their crash coverage without the flag.
     union: bool,
+    /// `--beside` on every apply: the `Beside` row only.
+    beside: bool,
 }
 
 impl Drop for World {
@@ -135,6 +154,7 @@ impl World {
         let world = Self {
             base: fs::canonicalize(&base).unwrap(),
             union: kind == EstateAdopt::ExcludeUnion,
+            beside: kind == EstateAdopt::Beside,
         };
         let src = world.base.join("src");
         fs::create_dir(&src).unwrap();
@@ -202,6 +222,9 @@ impl World {
             assert!(out.status.success());
             git(&dest, &["branch", "-D", "neo-only"]);
             git(&dest, &["branch", "sting-only", "v0"]);
+            if kind == EstateAdopt::Beside {
+                fs::write(dest.join("d/b.txt"), b"beta, edited at the destination\n").unwrap();
+            }
         }
         estate::add_batch(&world.base.join("plan"), &[item]).unwrap();
         world
@@ -273,6 +296,7 @@ impl World {
                 adopt,
                 activate_origin: Vec::new(),
                 exclude_union: self.union,
+                beside: self.beside,
             },
             &|row| {
                 rows.lock().unwrap().push((row.outcome, row.reason.clone()));
@@ -359,6 +383,7 @@ fn crash(world: &World, fault: &str) {
         .env(CHILD_ENV, &world.base)
         .env(FAULT_ENV, fault)
         .env(CHILD_UNION_ENV, if world.union { "1" } else { "" })
+        .env(CHILD_BESIDE_ENV, if world.beside { "1" } else { "" })
         .env_remove(super::CHILD_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -414,6 +439,7 @@ fn adopt_child_entry() {
             adopt: true,
             activate_origin: Vec::new(),
             exclude_union: std::env::var_os(CHILD_UNION_ENV).is_some_and(|value| value == "1"),
+            beside: std::env::var_os(CHILD_BESIDE_ENV).is_some_and(|value| value == "1"),
         },
         &|_| Ok(()),
     );
@@ -431,6 +457,10 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
     }
     if kind == EstateAdopt::ExcludeUnion {
         exclude_union(&world, &label, point, nth);
+        return;
+    }
+    if kind == EstateAdopt::Beside {
+        beside(&world, &label, point, nth);
         return;
     }
     if kind == EstateAdopt::Bare {
@@ -642,6 +672,114 @@ fn exclude_union(world: &World, label: &str, point: Point, nth: u64) {
     let rows = world.apply(false);
     assert_eq!(
         rows[0].0, "previous-workspace-restoration-not-revalidated",
+        "{label}"
+    );
+}
+
+/// The beside checkout of the `Beside` row (`dst.neo-YYYYMMDD`), if any.
+fn beside_path(world: &World) -> Option<PathBuf> {
+    fs::read_dir(&world.base)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("dst.neo-"))
+        })
+}
+
+/// Every ref under `refs/<suffix>/` of `repo`.
+fn beside_refs(repo: &Path) -> std::collections::BTreeMap<String, String> {
+    refs(repo)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("refs/neo-"))
+        .collect()
+}
+
+/// The `Beside` row: see the module docs.
+fn beside(world: &World, label: &str, point: Point, nth: u64) {
+    let dst = world.dst();
+    let before = checkout(&dst);
+    let native: std::collections::BTreeMap<String, String> = refs(&dst)
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("refs/neo-"))
+        .collect();
+    crash(world, &format!("{}:{nth}", point.name()));
+    assert_eq!(checkout(&dst), before, "{label}: the destination moved");
+    let crashed_refs = beside_refs(&dst);
+    let records = |world: &World| {
+        fs::read_dir(world.base.join("applied")).map_or(0, |dir| {
+            dir.filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|ext| ext == "beside")
+            })
+            .count()
+        })
+    };
+    assert_eq!(records(world), 0, "{label}: no record before the refs");
+    assert_eq!(world.unaccounted(), 1, "{label}: journal-missing");
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-beside", "{label}: {rows:?}");
+    let reason = rows[0].1.clone().unwrap_or_default();
+    assert!(
+        reason.contains("beside-landed=1")
+            && reason.contains("beside-after=GIT_DESTINATION_DIVERGED"),
+        "{label}: {reason}"
+    );
+    assert_eq!(
+        checkout(&dst),
+        before,
+        "{label}: the rerun moved the destination"
+    );
+    let now: std::collections::BTreeMap<String, String> = refs(&dst)
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("refs/neo-"))
+        .collect();
+    assert_eq!(now, native, "{label}: a native ref moved");
+    let landed = beside_refs(&dst);
+    for (name, value) in &crashed_refs {
+        assert_eq!(landed.get(name), Some(value), "{label}: {name} moved");
+    }
+    let source = refs(&world.base.join("src"));
+    let suffix = landed
+        .keys()
+        .next()
+        .and_then(|name| name.split('/').nth(1))
+        .unwrap()
+        .to_owned();
+    for (name, value) in &source {
+        let rest = name.strip_prefix("refs/").unwrap();
+        assert_eq!(
+            landed.get(&format!("refs/{suffix}/{rest}")),
+            Some(value),
+            "{label}: {name} not in"
+        );
+    }
+    let beside = beside_path(world).unwrap();
+    assert_eq!(
+        beside.file_name().unwrap().to_str().unwrap(),
+        format!("dst.{suffix}")
+    );
+    assert_eq!(
+        fs::read(beside.join("d/b.txt")).unwrap(),
+        b"beta\n",
+        "{label}: the beside holds the capture"
+    );
+    assert_eq!(
+        git(&beside, &["rev-parse", "HEAD"]),
+        git(&world.base.join("src"), &["rev-parse", "HEAD"]),
+        "{label}"
+    );
+    assert_eq!(records(world), 1, "{label}");
+    assert_eq!(world.unaccounted(), 0, "{label}");
+    let rows = world.apply(true);
+    assert_eq!(
+        rows[0].0, "previous-workspace-beside-not-revalidated",
         "{label}"
     );
 }

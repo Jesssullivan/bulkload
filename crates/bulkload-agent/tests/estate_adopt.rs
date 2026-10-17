@@ -1578,3 +1578,216 @@ fn p109_exclude_union_refuses_a_negation() {
     assert!(union_records(&run.applied).is_empty());
     assert!(!world.sting("infra.worktrees/only-src").exists());
 }
+
+/// The beside checkout of `dest` (`<dest>.neo-YYYYMMDD`), if one exists.
+fn beside_of(dest: &Path) -> Option<PathBuf> {
+    let name = format!("{}.neo-", dest.file_name().unwrap().to_str().unwrap());
+    fs::read_dir(dest.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|found| found.to_str())
+                .is_some_and(|found| found.starts_with(&name))
+        })
+}
+
+/// Every ref of `repo` by name, provenance (`refs/carry`) left out.
+fn named_refs(repo: &Path) -> BTreeMap<String, String> {
+    all_refs(repo)
+        .lines()
+        .filter(|line| !line.starts_with("refs/carry"))
+        .map(|line| {
+            let (name, value) = line.split_once(' ').unwrap();
+            (name.to_owned(), value.to_owned())
+        })
+        .collect()
+}
+
+/// P110 BESIDE (M2 round 2 item c: 10 i02 items refused
+/// `GIT_DESTINATION_DIVERGED`): a destination checkout that differs from
+/// the capture (a seat edited, one commit of its own) refuses diverged
+/// under `--adopt` with nothing written; `estate-diff` names the beside
+/// landing (`beside=landing:<dest>.neo-YYYYMMDD`). With `--beside` the
+/// destination checkout keeps every byte, HEAD, index and native ref; the
+/// capture lands at `<dest>.neo-YYYYMMDD`, a linked worktree of the
+/// destination repository detached at the captured head; every captured
+/// ref is created as `refs/neo-YYYYMMDD/<name>`; STATE records it; the
+/// receipt counts it; `closure-report` says `applied-beside`; a rerun is a
+/// journal no-op and the diff then says `beside=landed`.
+#[test]
+fn p110_a_diverged_checkout_lands_beside_and_the_live_one_stays() {
+    let (world, source, dest) = small();
+    fs::write(dest.join("README"), b"edited on sting\n").unwrap();
+    git(&dest, &["commit", "--quiet", "-am", "sting's own"]);
+    let run = Run::new(
+        &world,
+        &[(source.clone(), dest.clone(), Some(dest.clone()))],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    let frozen = freeze_all(&dest);
+    let native = named_refs(&dest);
+    let ran = run.apply(&["--adopt"]);
+    assert!(
+        receipt(&receipts(&ran.stdout), &source)
+            .2
+            .contains("GIT_DESTINATION_DIVERGED"),
+        "{}",
+        ran.stdout
+    );
+    assert!(beside_of(&dest).is_none());
+    let diff = run.diff(&[]);
+    let line = diff_line(&diff.stdout, &source).to_owned();
+    assert!(
+        line.contains("\"adopt\":\"diverged\"")
+            && line.contains(&format!("\"beside=landing:{}.neo-", dest.display())),
+        "{line}"
+    );
+
+    let ran = run.apply(&["--adopt", "--beside"]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let row = receipt(&receipts(&ran.stdout), &source).clone();
+    assert_eq!(row.1, "workspace-beside", "{row:?}");
+    assert!(
+        row.2.contains("beside-landed=1")
+            && row.2.contains("beside-after=GIT_DESTINATION_DIVERGED")
+            && row.2.contains("beside-ref-created=4")
+            && row.2.contains("beside-ref-kept=0"),
+        "{row:?}"
+    );
+    // The destination checkout: every seat and its whole .git but the new
+    // worktree administration and refs are as they were.
+    let moved: Vec<_> = freeze_all(&dest)
+        .into_iter()
+        .filter(|row| !frozen.contains(row))
+        .map(|row| row.0)
+        .filter(|path| {
+            let path = path.strip_prefix(&dest).unwrap();
+            !(path.starts_with(".git/worktrees")
+                || path.starts_with(".git/refs")
+                || path.starts_with(".git/objects")
+                || path.starts_with(".git/bulkload")
+                || path.starts_with(".git/logs/refs")
+                || path == Path::new(".git/packed-refs")
+                || path == Path::new(".git")
+                || path == Path::new(".git/logs")
+                || path == Path::new(".git/worktrees"))
+        })
+        .collect();
+    assert!(moved.is_empty(), "the beside landing moved {moved:?}");
+    let now = named_refs(&dest);
+    let suffix = {
+        let beside = beside_of(&dest).unwrap();
+        let name = beside.file_name().unwrap().to_str().unwrap().to_owned();
+        name.rsplit_once(".neo-")
+            .map(|(_, date)| format!("neo-{date}"))
+            .unwrap()
+    };
+    for (name, value) in &native {
+        assert_eq!(now.get(name), Some(value), "{name} moved");
+    }
+    let carried = named_refs(&source);
+    for (name, value) in &carried {
+        let rest = name.strip_prefix("refs/").unwrap();
+        assert_eq!(
+            now.get(&format!("refs/{suffix}/{rest}")),
+            Some(value),
+            "{name}"
+        );
+    }
+    assert_eq!(
+        now.len(),
+        native.len() + carried.len(),
+        "only refs/{suffix}/ was written: {now:?}"
+    );
+    let beside = beside_of(&dest).unwrap();
+    assert_eq!(fs::read(beside.join("README")).unwrap(), b"LA-Mesh\n");
+    assert_eq!(fs::read(dest.join("README")).unwrap(), b"edited on sting\n");
+    assert_eq!(
+        git(&beside, &["rev-parse", "HEAD"]),
+        git(&source, &["rev-parse", "HEAD"])
+    );
+    // Detached: no branch of the destination repository is checked out.
+    assert_eq!(
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "HEAD"
+    );
+    assert_eq!(
+        fs::canonicalize(git(&beside, &["rev-parse", "--git-common-dir"]).trim()).unwrap(),
+        fs::canonicalize(dest.join(".git")).unwrap()
+    );
+    let records = fs::read_dir(&run.applied)
+        .unwrap()
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "beside")
+        })
+        .count();
+    assert_eq!(records, 1);
+    let closure = run.closure();
+    assert!(
+        closure.stdout.contains("\"applied_beside\":1")
+            && closure
+                .stdout
+                .contains("\"disposition\":\"applied-beside\""),
+        "{}",
+        closure.stdout
+    );
+    let ran = run.apply(&["--adopt", "--beside"]);
+    assert_eq!(
+        receipt(&receipts(&ran.stdout), &source).1,
+        "previous-workspace-beside-not-revalidated"
+    );
+    assert_eq!(named_refs(&dest), now);
+    let diff = run.diff(&[]);
+    assert!(
+        diff_line(&diff.stdout, &source).contains("\"beside=landed:"),
+        "{}",
+        diff.stdout
+    );
+}
+
+/// P111 BESIDE-OCCUPIED (M2 round 2 item c): a beside path that exists and
+/// is not this item's landing of this capture refuses
+/// `GIT_DESTINATION_OCCUPIED` with nothing written to the destination
+/// repository or the beside path; `estate-diff` says `beside=occupied`.
+#[test]
+fn p111_an_occupied_beside_path_refuses_and_nothing_is_written() {
+    let (world, source, dest) = small();
+    fs::write(dest.join("README"), b"edited on sting\n").unwrap();
+    let run = Run::new(
+        &world,
+        &[(source.clone(), dest.clone(), Some(dest.clone()))],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    // Where --beside would land: the path the diff names.
+    let diff = run.diff(&[]);
+    let line = diff_line(&diff.stdout, &source).to_owned();
+    let start = line.find("\"beside=landing:").unwrap() + "\"beside=landing:".len();
+    let beside = PathBuf::from(&line[start..start + line[start..].find('"').unwrap()]);
+    fs::create_dir(&beside).unwrap();
+    fs::write(beside.join("operator.txt"), b"mine\n").unwrap();
+    let frozen = (freeze_all(&dest), freeze_all(&beside), all_refs(&dest));
+    let diff = run.diff(&[]);
+    assert!(
+        diff_line(&diff.stdout, &source).contains("\"beside=occupied:"),
+        "{}",
+        diff.stdout
+    );
+    let ran = run.apply(&["--adopt", "--beside"]);
+    let row = receipt(&receipts(&ran.stdout), &source).clone();
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(row.2.contains("GIT_DESTINATION_OCCUPIED"), "{row:?}");
+    assert_eq!(
+        (freeze_all(&dest), freeze_all(&beside), all_refs(&dest)),
+        frozen
+    );
+}

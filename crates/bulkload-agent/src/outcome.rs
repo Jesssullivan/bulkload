@@ -82,6 +82,12 @@ pub enum Outcome {
     IndexRepaired,
     /// The verb refused the item.
     Refused(Refusal),
+    /// Apply refused the planned workspace (`GIT_DESTINATION_DIVERGED` or
+    /// `GIT_AUTHORITY_CHANGED`) and, under `--beside`, landed the captured
+    /// checkout beside it with create-only refs in (M2 round 2, item c).
+    WorkspaceBeside,
+    /// A re-apply found the beside journal and did not revalidate it.
+    PreviousWorkspaceBesideNotRevalidated,
 }
 
 /// Every non-refusal outcome and its legacy string, in variant order.
@@ -110,6 +116,16 @@ pub const NAMED: [(Outcome, &str); 10] = [
     (Outcome::IndexRepaired, "index-repaired"),
 ];
 
+/// Outcomes only a typed record holds (no legacy writer produced them),
+/// with their names, in variant order after [`Outcome::Refused`].
+pub const NAMED_TYPED: [(Outcome, &str); 2] = [
+    (Outcome::WorkspaceBeside, "workspace-beside"),
+    (
+        Outcome::PreviousWorkspaceBesideNotRevalidated,
+        "previous-workspace-beside-not-revalidated",
+    ),
+];
+
 /// The legacy string of a refusal outcome.
 pub const REFUSED: &str = "refused";
 
@@ -121,12 +137,25 @@ impl Outcome {
             Self::Refused(_) => REFUSED,
             named => NAMED
                 .iter()
+                .chain(&NAMED_TYPED)
                 .find(|(outcome, _)| outcome == named)
                 .map_or(REFUSED, |(_, name)| name),
         }
     }
 
-    /// The non-refusal outcome named `name`.
+    /// The non-refusal outcome named `name`, including the typed-only ones
+    /// ([`NAMED_TYPED`]): what a receipt may name.
+    #[must_use]
+    pub fn named_typed(name: &str) -> Option<Self> {
+        Self::named(name).or_else(|| {
+            NAMED_TYPED
+                .iter()
+                .find(|(_, known)| *known == name)
+                .map(|(outcome, _)| outcome.clone())
+        })
+    }
+
+    /// The non-refusal outcome a legacy record named `name`.
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
         NAMED
@@ -352,7 +381,7 @@ impl OutcomeRecord {
         let outcome = match (outcome, refusal) {
             (REFUSED, Some(refusal)) => Outcome::Refused(Refusal::of(refusal, site)),
             (name, None) => {
-                Outcome::named(name).ok_or(BulkloadRefusal::ContractSelfInconsistent)?
+                Outcome::named_typed(name).ok_or(BulkloadRefusal::ContractSelfInconsistent)?
             }
             (_, Some(_)) => return Err(BulkloadRefusal::ContractSelfInconsistent),
         };
@@ -752,6 +781,17 @@ mod tests {
                 postcard::to_allocvec(outcome).unwrap(),
                 vec![u8::try_from(index).unwrap()]
             );
+        }
+        // The typed-only outcomes follow `Refused` (index 10).
+        for (index, (outcome, name)) in NAMED_TYPED.iter().enumerate() {
+            assert_eq!(
+                postcard::to_allocvec(outcome).unwrap(),
+                vec![u8::try_from(NAMED.len() + 1 + index).unwrap()]
+            );
+            assert_eq!(outcome.name(), *name);
+            assert_eq!(Outcome::named_typed(name).as_ref(), Some(outcome));
+            // No legacy writer produced them: a legacy record never maps.
+            assert_eq!(Outcome::named(name), None);
         }
         let record = OutcomeRecord {
             source: PathBuf::from("/s"),
