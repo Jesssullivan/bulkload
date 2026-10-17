@@ -228,9 +228,10 @@ SUBCOMMANDS:
                 with no snapshot row is placed with a row built from its
                 header (OI-1003-Q198 D; RESEAT_INDEX_ROW_ABSENT when it cannot
                 fill one); a destination row or rollout form for a thread is
-                the destination's, nothing placed: adopted when the file its
-                row names holds the landed lines, else destination-holds
-                (proof named; a compressed form with no row too), and
+                the destination's, nothing placed: destination-adopted when
+                the file its row names holds the landed lines, else
+                destination-holds (a file there, unproved) or
+                destination-row-only (a row only), proof named, and
                 RESEAT_INDEX_CONFLICT for a row naming another file. Every
                 existing row whose cwd is spelled through the home's git or a
                 --map symlink gets its cwd column re-spelled to the canonical

@@ -2313,36 +2313,61 @@ names this placement (its directory spelled any way that resolves to the
 same one, as sting's `~/.codex` link does), and stays a conflict (nothing
 placed beside it) when it names another file. `--no-respell` skips it.
 Re-spelling is not limited to mapped lanes (operator M2 round 2,
-2026-10-17): before any thread, every destination row whose `cwd` is
-spelled through the destination home's `git` symlink or a `--map`
-destination that is a symlink gets the same ledgered, reversible
-re-spelling to the real path, whether or not a landed thread maps to it
-and whether or not the directory still exists, but only when the nearest
-existing level of the old spelling resolves to the same level of the new
-one (a row that reaches another directory through a further link, or
-holds `..`, is never touched). `--check` reports how many rows a pass
-would re-spell (`respell_pending` on its summary line); an undone row
-is neither re-spelled nor counted.
+2026-10-17): before any thread, and whenever the destination index exists
+(landed threads or not), every destination row whose `cwd` is spelled
+through the destination home's `git` symlink or a `--map` destination
+that is a symlink gets the same ledgered, reversible re-spelling to the
+real path (rebuilt from its components, so `//` and `./` drop), whether or
+not a landed thread maps to it and whether or not the directory still
+exists, but only when the nearest existing level of the old spelling
+resolves to the same level of the new one (a row that reaches another
+directory through a further link, or holds `..`, is never touched). A row
+whose `id` or `cwd` is not UTF-8 text is skipped and counted
+(`respell-not-text`). The links are read again before each batch of 256;
+one retargeted meanwhile stops the sweep (`respell-stopped`,
+`respell-link-moved`). The ledger keeps the value a row held when it was
+last re-spelled, so `--undo` puts back the destination's latest spelling.
+`--check` reports how many rows the sweep would re-spell
+(`respell_pending` on its summary line); in-lane rows spelled through
+another link that resolves to the lane are re-spelled per thread and not
+counted there. An undone row is neither re-spelled nor counted, ever:
+`--undo` is final for this STATE (a fresh STATE re-spells it). An
+in-flight re-spelling a crash left uncommitted that `--undo` then finds at
+its old value is marked `undone` too (the ledger cannot tell it from one
+undone before a crash).
 
 A thread the destination already holds is not a refusal (operator M2
 round 2): when its row (with the lane's `cwd`) names this thread's rollout
 in another form or place (Codex's `.jsonl.zst`, an archive's `.jsonl.gz`,
 the same file name in another directory, or the plain file while a
 compressed form sits beside it and the plain file is absent), nothing is
-placed. It is `adopted` (row `adopted`) when the file the row names holds
-the landed stream's whole lines, exactly or followed by what the
-destination wrote (`proof` `exactly` / `continued`, the R0 check's rule;
-the row is then what `--check` accepts), else `destination-holds` (row
-`held`) with the proof's reason (`unreadable-form` for a `.gz`,
-`not-regular` for a symlink into an archive, `absent`, `size-differs`,
-`hash-differs`, `ends-mid-line`). A compressed form with no row is
-`destination-holds` (`rowless`). The proof is cached in the session row by
-the identities of both files, so an unchanged rerun reads no landed byte.
-A thread whose rollout is recorded outside every `--codex-source-root`, or
-whose landed rollout is absent, is `destination-holds` (`rollout-root`,
-`landing-absent`) when the destination's index has a row for it; without
-one it stays `RESEAT_LANE_UNMAPPED` (line `row` and summary key
-`rollout-root`), which `--codex-source-root` fixes. Its rollout is placed at the same path under the live
+placed, and the thread line says `"proved"` true or false:
+
+- `destination-adopted` (`exactly`, `continued`): the file the row names
+  holds the landed stream's whole lines, exactly or followed by what the
+  destination wrote, the R0 check's rule, and `--check` accepts that row
+  (also in another directory). A landing with no whole line yet is held
+  by any file, as in the check.
+- `destination-holds`: a destination file of the thread is there but does
+  not prove it: `unreadable-form` (a `.gz`), `not-regular` (the row names
+  a symlink), `unreadable` (it cannot be opened or read: that thread's
+  outcome, never the pass's), `row-file-absent` (the row's file is absent
+  with a form of it beside, such as a `.zst` symlink into an archive),
+  `size-differs`, `hash-differs`, `ends-mid-line`; and `rowless` (a
+  compressed form with no row).
+- `destination-row-only`: only a row: `absent` (the row's file is not
+  there and no form of it is), `rollout-root` (the rollout is recorded
+  outside every `--codex-source-root`) and `landing-absent` (its landed
+  rollout is absent). Nothing landed is tied to it; it is reported, not
+  held, and `--check` fails it.
+
+Without a destination row, a thread recorded outside every root stays
+`RESEAT_LANE_UNMAPPED` (line `row` and summary key `rollout-root`), which
+`--codex-source-root` fixes. The proof is cached in the session row by the
+landed file's identity (device, inode, size, mtime) and the destination
+file's, so an unchanged rerun reads no landed byte. These words are
+distinct from the placement words (`adopted` is a row or file this pass
+placed or found equal). Its rollout is placed at the same path under the live
 `.codex` **as plain `.jsonl`**: a landed `.jsonl.zst` is decompressed. Codex
 0.163 resumes a paginated thread only from the plain file (it stats
 `<name>.jsonl` and never opens the `.zst`: "failed to scan paginated model
@@ -2361,7 +2386,8 @@ Rows commit only after their rollouts are durable. A landed rollout no
 snapshot row names (a thread created after the snapshot, or one Codex never
 indexed) follows the same destination rule: a destination row or another
 form of its rollout there (Codex's `.jsonl.zst`, a `.jsonl.gz`) is the
-destination's, nothing placed (`adopted` or `destination-holds` as above,
+destination's, nothing placed (`destination-adopted` or
+`destination-holds` as above,
 `RESEAT_INDEX_CONFLICT` for a row naming another file; re-review of
 `8a89f9a`, MAJOR: a
 plain rollout placed beside the destination's continued `.zst` made a real
@@ -2467,7 +2493,9 @@ session resumed there, also a pass); one that ends inside a line fails
 the same size unless the session continued). Every Codex row has the exact
 `cwd` and a `rollout_path` (the placed `.jsonl`, or the `.jsonl.zst` Codex
 compressed it into there, its directory spelled any way that resolves to
-the same one) whose decompressed stream holds the landed one
+the same one, or the same rollout file in another directory, never a
+`.gz`) whose decompressed stream holds the landed one (a file that cannot
+be read fails that thread, `unreadable`)
 the same way; a rollout with no snapshot row fails `row-absent` unless a
 row is there, and a row carrying the source's own `cwd` (a by-ID resume
 that kept the session directory) fails `row-cwd-is-source`. A longer

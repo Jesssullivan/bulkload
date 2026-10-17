@@ -21,9 +21,10 @@
 //!    (Codex's `.jsonl.zst`, a `.jsonl.gz`, the same file name in another
 //!    directory, or the plain file while a compressed form sits beside it)
 //!    is the destination holding the thread: nothing is placed, and it is
-//!    `adopted` when the file the row names holds the landed stream's whole
-//!    lines (exactly or continued, the R0 check's rule), else
-//!    `destination-holds` with the proof's reason; neither is a refusal
+//!    `destination-adopted` when the file the row names holds the landed
+//!    stream's whole lines (exactly or continued, the R0 check's rule),
+//!    `destination-holds` when a destination file is there unproved, and
+//!    `destination-row-only` when only the row is; none is a refusal
 //!    (operator M2 round 2, 2026-10-17). A compressed form with no row is
 //!    `destination-holds` (`rowless`).
 //! 2. Its rollout goes to the same place under the live destination
@@ -60,13 +61,13 @@
 //! the destination home's `git` symlink or a `--map` destination that is a
 //! symlink (sting's `/home/jess/git/…`) gets its `cwd` re-spelled to the
 //! real path the same ledgered, reversible way, whether or not a landed
-//! thread maps to it: only when the nearest existing level of the old
+//! thread maps to it (and with nothing landed, [`sweep_alone`]): only when the nearest existing level of the old
 //! spelling resolves to the same level of the new one, so a row that
 //! reaches a different directory through another link is never touched
 //! (operator M2 round 2, 2026-10-17, extending OI-1003-Q198 (1)).
 //!
 //! A thread whose rollout is recorded outside every `--codex-source-root`
-//! (or whose landed rollout is absent) is `destination-holds` when the
+//! (or whose landed rollout is absent) is `destination-row-only` when the
 //! destination's index has a row for it, else `RESEAT_LANE_UNMAPPED`
 //! (`rollout-root`) as before.
 //!
@@ -535,9 +536,12 @@ pub fn reseat(
                     named.insert(rel.clone());
                 }
                 let unrooted = rel.is_none() && refusal == BulkloadRefusal::ReseatLaneUnmapped;
-                if (unrooted || word == "landing-absent")
-                    && row_of(&dest.conn, &thread.id)?.is_some()
-                {
+                let row = if unrooted || word == "landing-absent" {
+                    row_of(&dest.conn, &thread.id)?.map(|(_, path)| path)
+                } else {
+                    None
+                };
+                if row.is_some() {
                     // The destination's index holds the thread; nothing of
                     // the landing ties to it here (operator M2 round 2).
                     let proof = if unrooted {
@@ -551,8 +555,8 @@ pub fn reseat(
                         emit,
                         (&thread.id, &thread.cwd),
                         dest_cwd.as_deref(),
-                        Proved::Held(proof),
-                        None,
+                        Proved::RowOnly(proof),
+                        row.as_deref().map(Path::new),
                     )?;
                     continue;
                 }
@@ -793,7 +797,7 @@ pub(super) fn names(recorded: &str, rollout: &Path) -> Names {
     let here = recorded.parent() == rollout.parent()
         || match (recorded.parent(), rollout.parent()) {
             (Some(a), Some(b)) => {
-                matches!((std::fs::canonicalize(a), std::fs::canonicalize(b)), (Ok(a), Ok(b)) if a == b)
+                matches!((resolved(a), resolved(b)), (Some(a), Some(b)) if a == b)
             }
             _ => false,
         };
@@ -804,6 +808,22 @@ pub(super) fn names(recorded: &str, rollout: &Path) -> Names {
     } else {
         Names::Form
     }
+}
+
+/// Where `path` resolves: its nearest existing ancestor's real path with
+/// the missing levels after it (each a plain name), so two spellings of a
+/// directory not made yet still compare equal through the link above it.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let existing = crate::space::existing_ancestor(path).ok()?;
+    let tail = path.strip_prefix(&existing).ok()?;
+    if tail
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let real = std::fs::canonicalize(&existing).ok()?;
+    Some(tail.components().fold(real, |at, part| at.join(part)))
 }
 
 /// Whether `cwd` is another spelling of the canonical directory `canonical`
@@ -874,19 +894,30 @@ fn claim(
 /// What a holding's proof found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Proved {
-    /// The file the destination's row names holds the landed stream's
-    /// whole lines: exactly, or followed by what the destination wrote.
+    /// `destination-adopted`: the file the destination's row names holds
+    /// the landed stream's whole lines, exactly or followed by what the
+    /// destination wrote (`exactly`, `continued`). A landing with no whole
+    /// line yet is held by any file (the R0 check's rule).
     Adopted(&'static str),
-    /// Not proved: the reason (`rowless`, `rollout-root`, `landing-absent`,
-    /// or the check's own: `absent`, `not-regular`, `unreadable-form`,
-    /// `size-differs`, `hash-differs`, `ends-mid-line`,
-    /// `landing-not-regular`).
+    /// `destination-holds`: a destination file of the thread is there but
+    /// does not prove it (`rowless`: a compressed form with no row;
+    /// `row-file-absent`: the row's file is absent with a form of it
+    /// beside; `unreadable`: it could not be opened or read; or the
+    /// check's own `not-regular`, `unreadable-form`, `size-differs`,
+    /// `hash-differs`, `ends-mid-line`, `landing-not-regular`).
     Held(&'static str),
+    /// `destination-row-only`: only a row, no destination file tied to the
+    /// landing (`absent`: the row's file is not there; `rollout-root`,
+    /// `landing-absent`: nothing landed ties to it). Unproved: the R0
+    /// check fails it.
+    RowOnly(&'static str),
 }
 
-/// The ledger outcome words of a proved holding (the session cache).
-const ADOPTED_FORM: &str = "adopted-form";
+/// The outcome words (thread lines, `Summary` sessions and rows, and the
+/// ledger's session cache): distinct from the placement words.
+const DESTINATION_ADOPTED: &str = "destination-adopted";
 const DESTINATION_HOLDS: &str = "destination-holds";
+const DESTINATION_ROW_ONLY: &str = "destination-row-only";
 
 /// A file's identity as cached text, or `absent`.
 fn identity_text(path: &Path) -> String {
@@ -903,7 +934,9 @@ fn identity_text(path: &Path) -> String {
 }
 
 /// The proof's reason words, as `'static` (the cache stores the text).
-const REASONS: [&str; 9] = [
+const REASONS: [&str; 11] = [
+    "row-file-absent",
+    "rowless",
     "exactly",
     "continued",
     "absent",
@@ -936,7 +969,16 @@ fn prove(
     let landed_identity = std::fs::symlink_metadata(landed)
         .ok()
         .map(|meta| Identity::of(&meta));
-    let dest_identity = identity_text(path);
+    // Both files' identities: the landing's device and inode with the
+    // destination file's whole identity (the size and mtime are columns).
+    let dest_identity = format!(
+        "{}|{}",
+        landed_identity.map_or_else(
+            || "absent".to_owned(),
+            |identity| format!("{}:{}", identity.dev, identity.ino)
+        ),
+        identity_text(path)
+    );
     let cached = ledger.session(TOOL, id)?.filter(|row| {
         row.landing == landed
             && landed_identity.is_some_and(|now| {
@@ -946,11 +988,11 @@ fn prove(
     });
     if let Some(row) = cached {
         if let Some(word) = row.slug.as_deref().and_then(reason) {
-            if row.outcome == ADOPTED_FORM {
-                return Ok(Proved::Adopted(word));
-            }
-            if row.outcome == DESTINATION_HOLDS {
-                return Ok(Proved::Held(word));
+            match row.outcome.as_str() {
+                DESTINATION_ADOPTED => return Ok(Proved::Adopted(word)),
+                DESTINATION_HOLDS => return Ok(Proved::Held(word)),
+                DESTINATION_ROW_ONLY => return Ok(Proved::RowOnly(word)),
+                _ => {}
             }
         }
     }
@@ -958,15 +1000,23 @@ fn prove(
     let proved = if gz {
         Proved::Held("unreadable-form")
     } else {
-        match super::check::holds_lines(landed, path)? {
-            Ok(word) => Proved::Adopted(word),
-            Err(word) => Proved::Held(word),
+        // A destination file that cannot be opened or read (a mode-000
+        // `.zst`) is this thread's outcome, never the pass's refusal.
+        match super::check::holds_lines(landed, path) {
+            Ok(Ok(word)) => Proved::Adopted(word),
+            Ok(Err("absent")) => {
+                let plain = plain_name(path);
+                if std::fs::symlink_metadata(&plain).is_ok() || form_beside(&plain) {
+                    Proved::Held("row-file-absent")
+                } else {
+                    Proved::RowOnly("absent")
+                }
+            }
+            Ok(Err(word)) => Proved::Held(word),
+            Err(_) => return Ok(Proved::Held("unreadable")),
         }
     };
-    let (outcome, word) = match proved {
-        Proved::Adopted(word) => (ADOPTED_FORM, word),
-        Proved::Held(word) => (DESTINATION_HOLDS, word),
-    };
+    let (outcome, word) = proved.words();
     ledger.put_session(&Session {
         tool: TOOL.to_owned(),
         id: id.to_owned(),
@@ -982,8 +1032,29 @@ fn prove(
     Ok(proved)
 }
 
-/// Report a thread the destination holds: `adopted` (proved) or
-/// `destination-holds`, neither a refusal.
+impl Proved {
+    /// `(outcome word, proof word)`.
+    const fn words(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Adopted(word) => (DESTINATION_ADOPTED, word),
+            Self::Held(word) => (DESTINATION_HOLDS, word),
+            Self::RowOnly(word) => (DESTINATION_ROW_ONLY, word),
+        }
+    }
+}
+
+/// `path` without a `.zst` or `.gz` suffix.
+fn plain_name(path: &Path) -> PathBuf {
+    let text = path.as_os_str().to_string_lossy();
+    FORMS
+        .iter()
+        .find_map(|suffix| text.strip_suffix(suffix))
+        .map_or_else(|| path.to_path_buf(), PathBuf::from)
+}
+
+/// Report a thread the destination holds: `destination-adopted` (proved),
+/// `destination-holds` or `destination-row-only` (unproved, `"proved":
+/// false`); none is a refusal, and only the first passes the R0 check.
 fn held(
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
@@ -992,14 +1063,12 @@ fn held(
     proved: Proved,
     rollout: Option<&Path>,
 ) -> Result<()> {
-    let (outcome, row, proof) = match proved {
-        Proved::Adopted(word) => ("adopted", "adopted", word),
-        Proved::Held(word) => (DESTINATION_HOLDS, "held", word),
-    };
+    let (outcome, proof) = proved.words();
+    let is_adopted = matches!(proved, Proved::Adopted(_));
     summary.session(TOOL, outcome);
-    *summary.rows.entry(row.to_owned()).or_default() += 1;
+    *summary.rows.entry(outcome.to_owned()).or_default() += 1;
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"thread\",\"tool\":\"{TOOL}\",\"id\":{},\"source_cwd\":{},\"dest_cwd\":{},\"outcome\":\"{outcome}\",\"row\":\"{row}\",\"refused\":null,\"proof\":\"{proof}\",\"dest_rollout\":{}}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"thread\",\"tool\":\"{TOOL}\",\"id\":{},\"source_cwd\":{},\"dest_cwd\":{},\"outcome\":\"{outcome}\",\"row\":\"{outcome}\",\"refused\":null,\"proved\":{is_adopted},\"proof\":\"{proof}\",\"dest_rollout\":{}}}",
         json_string(id),
         json_string(source_cwd),
         dest_cwd.map_or_else(|| "null".to_owned(), json_string),
@@ -1059,50 +1128,56 @@ pub fn respelled(cwd: &str, links: &[(PathBuf, PathBuf)]) -> Option<String> {
     {
         return None;
     }
-    let new = if rest.as_os_str().is_empty() {
-        real.clone()
-    } else {
-        real.join(rest)
-    };
+    let new = rest
+        .components()
+        .fold(real.clone(), |at, part| at.join(part));
     let text = new.to_str()?;
     if text == cwd {
         return None;
     }
     let existing = crate::space::existing_ancestor(path).ok()?;
     let tail = existing.strip_prefix(link).ok()?;
-    let expected = if tail.as_os_str().is_empty() {
-        real.clone()
-    } else {
-        real.join(tail)
-    };
+    let expected = tail
+        .components()
+        .fold(real.clone(), |at, part| at.join(part));
     (std::fs::canonicalize(&existing).ok()? == expected).then(|| text.to_owned())
 }
 
-/// The destination rows [`respelled`] would re-spell, as `(id, old, new)`:
-/// every row, mapped lane or not, except one this ledger's `--undo` put
-/// back (operator M2 round 2, 2026-10-17).
+/// Rows to re-spell, `(id, old cwd, new cwd)`, and the count skipped.
+type Spelled = (Vec<(String, String, String)>, u64);
+
+/// The destination rows [`respelled`] would re-spell through `links`, as
+/// `(id, old, new)`: every row, mapped lane or not, except one this
+/// ledger's `--undo` put back (operator M2 round 2, 2026-10-17); and how
+/// many rows were skipped because their `id` or `cwd` is not UTF-8 text.
+/// In-lane rows spelled through another link (resolving to the lane) are
+/// re-spelled per thread instead and are not in this list.
 ///
 /// # Errors
 /// `SQLite` and ledger refusals.
 pub fn spelled_rows(
-    options: &Options,
+    links: &[(PathBuf, PathBuf)],
     dest: &Connection,
     ledger: Option<&Ledger>,
-) -> Result<Vec<(String, String, String)>> {
-    let links = spelling_links(options);
+) -> Result<Spelled> {
     if links.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), 0));
     }
     let mut statement = sql(dest.prepare("SELECT id, cwd FROM threads ORDER BY id"))?;
     let rows = sql(statement.query_map([], |row| {
-        Ok((row.get::<_, Value>(0)?, row.get::<_, Value>(1)?))
+        let text = |at: usize| -> rusqlite::Result<Option<String>> {
+            Ok(row.get_ref(at)?.as_str().ok().map(str::to_owned))
+        };
+        Ok((text(0)?, text(1)?))
     }))?;
     let mut out = Vec::new();
+    let mut skipped = 0_u64;
     for row in rows {
-        let (Value::Text(id), Value::Text(cwd)) = sql(row)? else {
+        let (Some(id), Some(cwd)) = sql(row)? else {
+            skipped += 1;
             continue;
         };
-        let Some(new) = respelled(&cwd, &links) else {
+        let Some(new) = respelled(&cwd, links) else {
             continue;
         };
         if let Some(ledger) = ledger {
@@ -1115,7 +1190,7 @@ pub fn spelled_rows(
         }
         out.push((id, cwd, new));
     }
-    Ok(out)
+    Ok((out, skipped))
 }
 
 /// Re-spell every symlink-spelled destination row ([`spelled_rows`]), in
@@ -1130,12 +1205,82 @@ fn sweep_spellings(
     if !options.respell_cwd {
         return Ok(());
     }
-    let rows = spelled_rows(options, &dest.conn, Some(ledger))?;
+    let links = spelling_links(options);
+    let (rows, skipped) = spelled_rows(&links, &dest.conn, Some(ledger))?;
+    if skipped > 0 {
+        *summary
+            .rows
+            .entry("respell-not-text".to_owned())
+            .or_default() += skipped;
+    }
     for batch in rows.chunks(BATCH) {
+        // A link retargeted since the rows were read: stop, re-spell
+        // nothing more against the old target.
+        if spelling_links(options) != links {
+            *summary
+                .rows
+                .entry("respell-link-moved".to_owned())
+                .or_default() += batch.len() as u64;
+            emit(&format!(
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"respell-stopped\",\"tool\":\"{TOOL}\",\"reason\":\"link-moved\"}}"
+            ))?;
+            break;
+        }
         let mut queued = batch.to_vec();
         respell(dest, ledger, &mut queued, summary, emit)?;
     }
     Ok(())
+}
+
+/// Re-spell every symlink-spelled row of the destination index when there
+/// is no landed thread to re-seat (the sweep runs whenever the index
+/// exists, operator M2 round 2 review).
+///
+/// # Errors
+/// Ledger, `SQLite` and I/O refusals.
+pub fn sweep_alone(
+    options: &Options,
+    ledger: &mut Ledger,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if !options.respell_cwd || !options.dest_codex.join(STATE_DB).is_file() {
+        return Ok(());
+    }
+    let root = super::root(&options.dest_codex)?;
+    let db = root.join(STATE_DB);
+    let conn = sql(Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ))?;
+    sql(conn.busy_timeout(std::time::Duration::from_secs(30)))?;
+    let mut dest = Dest { root, db, conn };
+    settle_cwd_intents(&dest, ledger)?;
+    sweep_spellings(options, ledger, &mut dest, summary, emit)
+}
+
+/// The rows a pass would re-spell, read-only (`--check`): 0 without a
+/// destination index or with re-spelling off.
+///
+/// # Errors
+/// `SQLite` and ledger refusals.
+pub fn respell_pending(options: &Options, ledger: Option<&Ledger>) -> Result<u64> {
+    if !options.respell_cwd {
+        return Ok(0);
+    }
+    let Ok(root) = std::fs::canonicalize(&options.dest_codex) else {
+        return Ok(0);
+    };
+    let db = root.join(STATE_DB);
+    if !db.is_file() {
+        return Ok(0);
+    }
+    let conn = sql(Connection::open_with_flags(
+        &db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ))?;
+    let (rows, _) = spelled_rows(&spelling_links(options), &conn, ledger)?;
+    Ok(rows.len() as u64)
 }
 
 /// Re-spell the queued rows' `cwd` (only that column) in one destination

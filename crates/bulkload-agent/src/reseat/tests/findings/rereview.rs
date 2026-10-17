@@ -66,7 +66,7 @@ fn files_ending(root: &Path, suffix: &str) -> Vec<PathBuf> {
 /// then opened the older plain file and cut the destination's continued
 /// lines off the thread, and `--check` passed. The destination's row or
 /// form is the destination's: nothing placed (since the operator's M2
-/// round 2, a form the destination holds is `adopted` or
+/// round 2, a form the destination holds is `destination-adopted` or
 /// `destination-holds`, not a refusal; another file stays a conflict).
 #[test]
 fn ds_1_a_rowless_rollout_never_lands_beside_a_destination_row() {
@@ -120,8 +120,9 @@ fn ds_1_a_rowless_rollout_never_lands_beside_a_destination_row() {
     }
     // Operator M2 round 2 (2026-10-17): the destination holding the thread
     // in another form is not a refusal. T9's row names the `.zst` that
-    // holds the landed lines and more: adopted as it is. T3's form has no
-    // row: destination-holds. T2's row names another file: a conflict.
+    // holds the landed lines and more: destination-adopted as it is. T3's
+    // form has no row: destination-holds. T2's row names another file: a
+    // conflict.
     let line_of = |id: &str| {
         lines
             .iter()
@@ -130,7 +131,7 @@ fn ds_1_a_rowless_rollout_never_lands_beside_a_destination_row() {
             .unwrap_or_default()
     };
     assert!(
-        line_of(T9).contains("\"outcome\":\"adopted\"")
+        line_of(T9).contains("\"outcome\":\"destination-adopted\"")
             && line_of(T9).contains("\"proof\":\"continued\"")
             && line_of(T9).contains("\"refused\":null"),
         "{lines:?}"
@@ -142,7 +143,11 @@ fn ds_1_a_rowless_rollout_never_lands_beside_a_destination_row() {
         "{lines:?}"
     );
     assert!(line_of(T2).contains("RESEAT_INDEX_CONFLICT"), "{lines:?}");
-    assert_eq!(summary.sessions_of("codex", "adopted"), 1, "{lines:?}");
+    assert_eq!(
+        summary.sessions_of("codex", "destination-adopted"),
+        1,
+        "{lines:?}"
+    );
     assert_eq!(
         summary.sessions_of("codex", "destination-holds"),
         1,

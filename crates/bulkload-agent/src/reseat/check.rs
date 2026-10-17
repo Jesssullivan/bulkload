@@ -344,6 +344,10 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     if codex_landed == Some(true) {
         check_codex(options, &lanes, ledger.as_ref(), &mut summary, &mut table)?;
     }
+    if options.codex {
+        // Whenever the destination index exists, landed threads or not.
+        summary.respell_pending = codex::respell_pending(options, ledger.as_ref())?;
+    }
     for (tool, state) in [
         (
             claude::TOOL,
@@ -583,9 +587,6 @@ fn check_codex(
     } else {
         None
     };
-    if let (Some(dest), true) = (dest.as_ref(), options.respell_cwd) {
-        summary.respell_pending = codex::spelled_rows(options, dest, ledger)?.len() as u64;
-    }
     let threads = codex::landed_threads(&options.landing_codex.join(codex::STATE_DB))?;
     let ids: BTreeSet<String> = threads.iter().map(|thread| thread.id.clone()).collect();
     let mut named = BTreeSet::new();
@@ -881,10 +882,24 @@ fn thread_holds(
     let zst = rollout
         .extension()
         .is_some_and(|extension| extension == "zst");
-    if !(named == codex::Names::Plain || (named == codex::Names::Form && zst)) {
+    let gz = rollout
+        .extension()
+        .is_some_and(|extension| extension == "gz");
+    // The plain file or Codex's `.zst` at this place, or the same rollout
+    // file in another directory (a pass adopts one that holds the landed
+    // lines: `destination-adopted`); never a `.gz`.
+    let accepted = match named {
+        codex::Names::Plain => true,
+        codex::Names::Form => zst,
+        codex::Names::Elsewhere => !gz,
+        codex::Names::Other => false,
+    };
+    if !accepted {
         return Ok(Holds::Not("row-rollout-differs"));
     }
-    holds(&options.landing_codex.join(rel), &rollout, true)
+    // A destination file that cannot be read fails this thread, not the
+    // check.
+    Ok(holds(&options.landing_codex.join(rel), &rollout, true).unwrap_or(Holds::Not("unreadable")))
 }
 
 /// Each planned workspace's `estate-diff` class, when `--plan` was given.
