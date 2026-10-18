@@ -78,7 +78,8 @@ fn git(repo: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(
         out.status.success(),
-        "git {args:?} in {repo:?}: {}",
+        "git {args:?} in {}: {}",
+        repo.display(),
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
@@ -219,6 +220,8 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
             "main",
         ],
     );
+    // A plain file in a root is no repository: noted, not moved.
+    fs::write(src.join("README.txt"), b"not in any repository\n").unwrap();
     let same_refs = refs(&same);
     let diverged_refs = refs(&dst.join("diverged"));
 
@@ -243,10 +246,12 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
     assert!(
         sourced
             .stdout
-            .contains("phase=capture outcome=items-refused captured=6 refused=2"),
+            .contains("phase=capture outcome=items-refused")
+            && sourced.stdout.contains("captured=6 refused=2"),
         "{}",
         sourced.stdout
     );
+    assert!(source_state.join("carry/move-source.done").is_file());
 
     let move_args = |extra: &[&str], label: &str| {
         let mut args = os(&[&"estate-move", &"--label", &label, &"--source", &"neo"]);
@@ -283,6 +288,12 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
     assert_eq!(first["applied_beside"], "1", "{}", moved.stdout);
     assert_eq!(first["carried"], "2", "{}", moved.stdout);
     assert_eq!(first["refused_pending_review"], "1", "{}", moved.stdout);
+    assert_eq!(first["not_moved"], "1", "{}", moved.stdout);
+    assert!(
+        moved.stdout.contains("estate-move gate=fail"),
+        "{}",
+        moved.stdout
+    );
 
     // Landed.
     assert_eq!(
@@ -349,12 +360,69 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
     assert_eq!(kept, 2, "{}", again.stdout);
     assert!(!dst.join(format!("broken.{LABEL}")).exists());
 
-    // Another label for the same state refuses before anything runs.
+    // A converge pass after the source moved `topic` again: refs-in keeps
+    // the ref it made (never moves it), counts it kept, and the item stays
+    // applied; nothing native moves.
+    git(&src.join("same"), &["checkout", "--quiet", "topic"]);
+    git(
+        &src.join("same"),
+        &["commit", "--quiet", "--allow-empty", "-m", "src topic 2"],
+    );
+    git(&src.join("same"), &["checkout", "--quiet", "main"]);
+    let resourced = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src,
+    ]));
+    assert!(resourced.ok, "{}\n{}", resourced.stdout, resourced.stderr);
+    let converged = agent(&move_args(&[], LABEL));
+    assert!(
+        converged.stdout.contains("refs-in-kept=1"),
+        "{}",
+        converged.stdout
+    );
+    // The new pass recaptured `diverged` too, and a beside landing never
+    // converges to a newer capture (#266): it is refused pending review,
+    // its beside checkout and the live one left as they were. Everything
+    // else accounts as before.
+    let mut want = first;
+    want.insert("applied_beside".to_owned(), "0".to_owned());
+    want.insert("refused_pending_review".to_owned(), "2".to_owned());
+    let mut got = closure(&converged.stdout);
+    assert!(
+        got.remove("refusals")
+            .is_some_and(|codes| codes.contains("GIT_DESTINATION_OCCUPIED:2")),
+        "{}",
+        converged.stdout
+    );
+    want.remove("refusals");
+    assert_eq!(got, want, "{}", converged.stdout);
+    assert_eq!(
+        git(&dst.join("diverged"), &["rev-parse", "HEAD"]),
+        diverged_head
+    );
+    assert!(dst.join(format!("diverged.{LABEL}/d.txt")).is_file());
+    assert_eq!(
+        git(&same, &["rev-parse", &format!("refs/{LABEL}/heads/topic")]),
+        src_topic
+    );
+    assert_eq!(git(&same, &["rev-parse", "topic"]), dst_topic);
+
+    // Another label for the same state refuses before anything runs; a
+    // label naming one of Git's namespaces is refused outright.
     let rebound = agent(&move_args(&[], "neo-20261019"));
     assert!(!rebound.ok);
     assert!(
         rebound.stderr.contains("RECEIPT_BINDING_INVALID"),
         "{}",
         rebound.stderr
+    );
+    let reserved = agent(&move_args(&[], "heads"));
+    assert!(
+        reserved.stderr.contains("FIELD_DOMAIN_VIOLATION"),
+        "{}",
+        reserved.stderr
     );
 }

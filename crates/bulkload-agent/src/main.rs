@@ -122,9 +122,11 @@ SUBCOMMANDS:
                 or holds at another value goes in create-only as
                 refs/NS/heads/NAME (refs/NS/tags/NAME), recorded write-ahead
                 in STATE ITEM-SOURCE.refs-in; receipt refs-in-created=N
-                refs-in-present=N. No native ref moves. A ref of that name
-                held at another value is kept and the item refuses
-                GIT_DESTINATION_OCCUPIED (pending review), as --beside does.
+                refs-in-present=N refs-in-kept=N. No ref moves: a ref of that
+                name held at another value (an earlier pass's) is kept and
+                counted, the source's value staying in its provenance refs. A
+                ref named refs/NS itself refuses the item
+                GIT_DESTINATION_OCCUPIED before it writes anything.
                 --side-root ROOT (repeatable; M2r2 item e; needs --adopt):
                 after the preflights and before any item, each planned path
                 spelled through a symlink whose one hop names a directory
@@ -146,53 +148,82 @@ SUBCOMMANDS:
                 bare repository refs-only. Each path's live path is the
                 longest --map prefix's, else the same path. One line per item
                 (estate-move-source item=ID kind=main|linked|bare) and per
-                note (symlink, not-git files, prunable worktree, unreadable
-                repository: printed and counted, never planned silently).
-                New items are appended to MOVE_STATE/carry/plan.postcard
-                (estate-add-batch; existing ones never change), then the plan
-                is captured (estate-capture, jobs N, default 2) into
-                MOVE_STATE/carry/corpus with private state in
-                MOVE_STATE/private. An item's capture refusal is its line's
-                (the destination carries it as files); only a refusal of the
-                whole capture fails the verb. MOVE_STATE is 0700 and flocked
-    estate-move --label LABEL --source SOURCE [--plan-only] [--exclude-union] [--no-handoff]
-                [--activate-origin PREFIX]... [--side-root ROOT]... [--jobs N]
-                [--sessions SOURCE_HOME [--codex-source-root DIR] [--dest-home DIR] [--map SRC=DST]...]
+                note: what is not planned (a symlink, plain files, a prunable
+                worktree, an unreadable repository or entry, a directory its
+                repository does not list, and each nested repository a
+                capture holds as custody only) is printed, counted and
+                written to MOVE_STATE/carry/move-source.notes; estate-move
+                reports it not moved. New items are appended to
+                MOVE_STATE/carry/plan.postcard (estate-add-batch; existing
+                ones never change, and a source planned at another live path
+                refuses RECEIPT_BINDING_INVALID), then the plan is captured
+                (estate-capture, jobs N, default 2) into
+                MOVE_STATE/carry/corpus, private state in MOVE_STATE/private.
+                Item refusals are written to move-source.refusals and do not
+                fail the verb; a refusal before every item answered does.
+                Each pass writes its mark to move-source.started first and,
+                once every item answered, to move-source.done. MOVE_STATE is
+                0700 and flocked
+    estate-move --label LABEL --source SOURCE [--plan-only] [--exclude-union] [--no-hand-off]
+                [--activate-origin PREFIX]... [--side-root ROOT]... [--jobs N] [--dispositions LEDGER]
+                [--sessions SOURCE_HOME [--codex-source-root DIR] [--dest-home DIR]
+                 [--map SRC=DST]... [--reseat-arg ARG]...]
                 [--remote-executable PATH [--ssh-config FILE]]
                 HOST|- SOURCE_MOVE_STATE MOVE_STATE
                 M2 item 7 (design 2026-10-16-estate-move-design.md), the
                 destination half: one pass of the move, composed of the verbs
-                above, each phase's end recorded in MOVE_STATE/move.ledger
-                (LABEL, SOURCE, HOST and SOURCE_MOVE_STATE are bound at the
-                first run; a rerun naming others refuses
-                RECEIPT_BINDING_INVALID). HOST - is this host (copy), else
-                pull over SSH; serve's state is SOURCE_MOVE_STATE/serve/NAME.
-                1 pull: SOURCE_MOVE_STATE/carry into MOVE_STATE/carry. 2 plan:
-                per item the live path's presence (absent, empty, git,
-                not-git, symlinked, unreadable) and whether the corpus holds
-                its capture give one action: land, adopt (apply proves it or
-                lands it beside), refs-only, carry-live, carry-beside, or
-                refuse (left to the apply's typed refusal, pending review); one
-                estate-move item= line each and a histogram line. A carry
-                decision is kept while the item stays uncaptured. --plan-only
-                stops here after an estate-diff preview (MOVE_STATE/diff.jsonl).
-                3 apply: estate-apply --adopt --beside .LABEL --refs-in
-                (and --exclude-union, --activate-origin, --side-root as given)
-                into MOVE_STATE/private; item refusals are recorded and the
-                pass goes on, any other refusal stops it. 4 carry:
-                estate-carry-files for the carry items, at the live path or
-                with --beside .LABEL. 5 handoff: estate-handoff (unless
-                --no-handoff). 6 with --sessions: SOURCE_HOME/.claude and the
-                Codex root (--codex-source-root, default SOURCE_HOME/.codex)
-                into MOVE_STATE/landing, then estate-reseat --lanes-from-plan
-                (--map passed on) into DEST_HOME (--dest-home, default $HOME),
-                state MOVE_STATE/reseat. 7 closure: closure-report over the
-                plan, written to MOVE_STATE/closure.json and summarised on an
-                estate-move closure line; the verb exits with its gate
-                (CLOSURE_UNACCOUNTED while anything is unaccounted or pending
-                review). Files and agent state carry SQLite as snapshots. A
-                rerun is the next converge pass. Nothing is deleted, no live
-                ref moves, no live checkout is switched
+                above. LABEL (1-64 of A-Z a-z 0-9 - _, not a Git or bulkload
+                ref namespace) names the beside suffix .LABEL and the ref
+                namespace refs/LABEL/; SOURCE is the provenance label every
+                apply, carry and closure is given. LABEL, SOURCE, HOST and
+                SOURCE_MOVE_STATE are bound in MOVE_STATE/move.ledger at the
+                first run (another refuses RECEIPT_BINDING_INVALID). HOST - is
+                this host (copy; the two states must not nest), else pull over
+                SSH; serve's state is SOURCE_MOVE_STATE/serve/NAME. Global
+                flags (--min-free-percent=N, --priority=, --durability=) apply
+                to every phase; --sqlite is always snapshot here.
+                1 pull: SOURCE_MOVE_STATE/carry into MOVE_STATE/carry;
+                SOURCE_CHANGED_AFTER_SNAPSHOT when its marks show a source
+                pass that has not finished (rerun once it has). 2 plan: per
+                item, the live path's presence (absent, empty, git, not-git,
+                symlinked: the path or an ancestor, so map to real paths;
+                unreadable) and its capture (held; refused, carried as files;
+                transient or pending, left for the next source pass) give one
+                action: land, adopt (the apply proves it or lands it beside),
+                refs-only, carry-live, carry-beside or refuse (the apply's
+                typed refusal, pending review). One estate-move item= line
+                each, a histogram line and the source notes' counts. A carry
+                once started stays where it went while the item is not
+                captured. --plan-only stops here, recording nothing, after an
+                estate-diff preview (MOVE_STATE/diff.jsonl). 3 apply:
+                estate-apply --adopt --beside .LABEL --refs-in (with
+                --exclude-union, --activate-origin, --side-root as given)
+                into MOVE_STATE/private, --jobs N (default 2); when every
+                item answered, item
+                refusals are each item's and the pass goes on, else it stops.
+                A beside landing does not converge to a newer capture: it is
+                then refused pending review. 4 carry: estate-carry-files for
+                the carry items, at the live path while it is still absent or
+                empty, else with --beside .LABEL. 5 hand-off: estate-handoff
+                for the items whose workspace this pass landed or adopted
+                (unless --no-hand-off). 6 with --sessions: SOURCE_HOME/.claude
+                and the Codex root (--codex-source-root, default
+                SOURCE_HOME/.codex) into MOVE_STATE/landing, then, when both
+                pulls completed, estate-reseat --lanes-from-plan with each
+                --map and --reseat-arg (one estate-reseat option per flag,
+                e.g. --no-regularize, --unmapped=by-id) into DEST_HOME
+                (--dest-home, default $HOME), state MOVE_STATE/reseat. 7
+                closure: closure-report over the plan (with --dispositions, the
+                closure-dispose ledger joined), written to
+                MOVE_STATE/closure.json, summarised on an estate-move closure
+                line with not_moved= (the source notes). The gate passes only
+                when every item is accounted and reviewed and nothing is noted
+                not moved; an estate-move gate= line names the next step. The
+                verb exits with the first phase's refusal, else
+                CLOSURE_UNACCOUNTED while the gate fails. The next converge
+                pass is estate-move-source again on the source, then
+                estate-move. Nothing is deleted, no live ref moves, no live
+                checkout is switched
     estate-unseat PRIVATE_STATE [LIVE ...]
                 M2r2 item e: undo each seat estate-apply --side-root recorded in
                 PRIVATE_STATE (or only those of the LIVE paths given): the
@@ -785,9 +816,7 @@ fn main() -> ExitCode {
             | "estate-unseat"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
-        Some(name @ ("estate-move-source" | "estate-move")) => {
-            estate_move::command(name, &args.collect::<Vec<_>>())
-        }
+        Some(name @ ("estate-move-source" | "estate-move")) => estate_move::command(name, args),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),

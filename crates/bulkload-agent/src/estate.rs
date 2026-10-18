@@ -2410,6 +2410,22 @@ fn apply_item(
         source,
         base: base.as_ref(),
     };
+    // M2 item 7: a ref named `refs/<ns>` itself would take the refs-in
+    // namespace; refused before the item writes anything. A path Git cannot
+    // read as a repository is left to the landing's own refusal.
+    if options.refs_in && item.repository.exists() {
+        let suffix = options
+            .beside
+            .as_deref()
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let ns = git_carry::beside::namespace(suffix)?;
+        if matches!(
+            git_carry::beside::namespace_taken(&item.repository, &ns),
+            Ok(true)
+        ) {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
+    }
     let policy = git_carry::converge::Policy {
         adopt: options.adopt,
         origins: &options.activate_origin,
@@ -2692,11 +2708,13 @@ pub fn refs_in_record_path(state: &Path, identity: &str, source: &str) -> PathBu
 /// captured branch and tag the repository lacks or holds at another value
 /// goes in create-only as `refs/<ns>/heads/<name>` (`refs/<ns>/tags/<name>`),
 /// `ns` the `--beside` suffix's namespace. Recorded write-ahead in STATE
-/// like a beside landing's refs; no native ref is moved or deleted. A ref
-/// of that name held at another value is kept, recorded, and refuses the
-/// item `GIT_DESTINATION_OCCUPIED` (pending review), as a beside landing's
-/// kept ref does; a ref named `refs/<ns>` itself refuses it before any
-/// write. Returns the receipt's custody words.
+/// like a beside landing's refs; no ref is moved or deleted. A ref of that
+/// name already held at another value (an earlier pass's, the source has
+/// moved since) is kept, never moved, recorded and counted
+/// (`refs-in-kept=N`), as the design's step 7 reports `exists`: the
+/// source's value stays in the capture's provenance refs. A ref named
+/// `refs/<ns>` itself refuses the item before it writes anything
+/// (`apply_item`). Returns the receipt's custody words.
 fn refs_in(
     item: &Item,
     staged: &git_carry::StagedBundle,
@@ -2741,13 +2759,11 @@ fn refs_in(
     git_carry::beside::create(repository, &planned.create)?;
     record.created.extend(std::mem::take(&mut record.pending));
     git_carry::beside::write_refs_in(&record_path, &record)?;
-    if !planned.kept.is_empty() {
-        return Err(BulkloadRefusal::GitDestinationOccupied);
-    }
     Ok(format!(
-        "refs-in-created={} refs-in-present={}",
+        "refs-in-created={} refs-in-present={} refs-in-kept={}",
         planned.create.len(),
-        planned.present.len()
+        planned.present.len(),
+        planned.kept.len()
     ))
 }
 

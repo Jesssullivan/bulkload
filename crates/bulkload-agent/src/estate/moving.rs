@@ -24,8 +24,9 @@
 //! - [`Ledger`] (`MOVE_STATE/move.ledger`): the beside label and the source
 //!   label fixed at the first run (a rerun naming others is
 //!   `RECEIPT_BINDING_INVALID`), each item's decision, and each phase
-//!   reached. A carry decision is sticky while the item stays uncaptured: a
-//!   rerun never moves an item carried at its live path beside, or back.
+//!   reached. A carry decision stays, once a carry was started for it, while
+//!   the item stays uncaptured: a rerun never moves an item carried at its
+//!   live path beside, or back.
 
 use crate::refuse::RefuseAt as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -117,16 +118,33 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
                 found.push(directory);
                 continue;
             }
-            let mut entries: Vec<PathBuf> = fs::read_dir(&directory)
-                .refuse_at(SITE)?
-                .map(|entry| entry.map(|entry| entry.path()))
-                .collect::<std::io::Result<_>>()
-                .refuse_at(SITE)?;
+            // A directory or entry the walk cannot read (a protected folder,
+            // a name removed under the live source) is a note, never the
+            // whole inventory's refusal.
+            let listed: std::io::Result<Vec<PathBuf>> =
+                fs::read_dir(&directory).and_then(|entries| {
+                    entries
+                        .map(|entry| entry.map(|entry| entry.path()))
+                        .collect()
+                });
+            let mut entries = match listed {
+                Ok(entries) => entries,
+                Err(error) => {
+                    notes.push(unreadable(directory, &crate::refuse::io(&error, SITE)));
+                    continue;
+                }
+            };
             entries.sort();
             let mut plain = 0u64;
             // Pushed in reverse so the walk visits names in order.
             for path in entries.into_iter().rev() {
-                let meta = fs::symlink_metadata(&path).refuse_at(SITE)?;
+                let meta = match fs::symlink_metadata(&path) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        notes.push(unreadable(path, &crate::refuse::io(&error, SITE)));
+                        continue;
+                    }
+                };
                 if meta.is_symlink() {
                     notes.push(Note {
                         path,
@@ -153,6 +171,15 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
     Ok((found, notes))
 }
 
+const fn unreadable(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
+    Note {
+        path,
+        what: "unreadable",
+        count: 1,
+        code: Some(refusal.code()),
+    }
+}
+
 // The group of the repository at `directory`, once per repository however
 // many of its worktrees the walk met (a linked worktree under a root brings
 // its main along).
@@ -164,24 +191,29 @@ fn group(
     let listed = match converge::worktree_census(&directory) {
         Ok(listed) => listed,
         Err(refusal) => {
-            notes.push(Note {
-                path: directory,
-                what: "unreadable",
-                count: 1,
-                code: Some(refusal.code()),
-            });
+            notes.push(unreadable(directory, &refusal));
             return;
         }
     };
     let Some(main) = listed.first() else {
-        notes.push(Note {
-            path: directory,
-            what: "unreadable",
-            count: 1,
-            code: Some(BulkloadRefusal::GitInventoryMalformed.code()),
-        });
+        notes.push(unreadable(
+            directory,
+            &BulkloadRefusal::GitInventoryMalformed,
+        ));
         return;
     };
+    // A directory its repository does not list (a copied worktree whose
+    // `.git` names another's administration) is no item of that group.
+    let real = |path: &Path| fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+    let here = real(&directory);
+    if !listed.iter().any(|entry| real(&entry.path) == here) {
+        notes.push(Note {
+            path: directory,
+            what: "not-in-census",
+            count: 1,
+            code: None,
+        });
+    }
     let key = fs::canonicalize(&main.path).unwrap_or_else(|_| main.path.clone());
     if !seen.insert(key) {
         return;
@@ -321,34 +353,85 @@ impl Action {
     }
 }
 
+/// What the source half's latest finished pass says of an item's capture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Capture {
+    /// The corpus holds its capture record.
+    Held,
+    /// The pass refused it with a code Git carry cannot take on a rerun:
+    /// carried as files.
+    Refused,
+    /// The pass refused it with a code a rerun of the source half may clear
+    /// ([`TRANSIENT`]): left pending, never carried as files.
+    Transient,
+    /// No record and no recorded refusal: the pass never reached it.
+    Pending,
+}
+
+/// Capture refusals a rerun of the source half may clear (drift under the
+/// pass, space, budget, a lost worker or a bare IO): the item is left
+/// pending, never carried as files.
+pub const TRANSIENT: &[&str] = &[
+    "CAPTURE_DRIFTED",
+    "GIT_AUTHORITY_CHANGED",
+    "DESTINATION_SPACE_INSUFFICIENT",
+    "SPACE_EXHAUSTED",
+    "BUDGET_EXCEEDED",
+    "WORKER_LOST",
+    "IO",
+];
+
+/// What the corpus and the source half's refusals say of `identity`.
+#[must_use]
+pub fn capture_of(held: bool, refusal: Option<&str>) -> Capture {
+    match (held, refusal) {
+        (true, _) => Capture::Held,
+        (false, Some(code)) if TRANSIENT.contains(&code) || code.starts_with("IO") => {
+            Capture::Transient
+        }
+        (false, Some(_)) => Capture::Refused,
+        (false, None) => Capture::Pending,
+    }
+}
+
 /// The action for an item, and the table row's name as its reason.
 ///
-/// Its inputs: a workspace item or a refs-only one, whether the corpus
-/// holds its capture, what its live path (the workspace, or a refs-only
-/// item's repository) holds, and whether `--side-root` seats symlinked
-/// paths. Pure.
+/// Its inputs: a workspace item or a refs-only one, its [`Capture`], what
+/// its live path (the workspace, or a refs-only item's repository) holds,
+/// and whether `--side-root` seats symlinked paths. Pure.
 #[must_use]
 pub const fn action(
     workspace: bool,
-    captured: bool,
+    capture: Capture,
     presence: Presence,
     seats: bool,
 ) -> (Action, &'static str) {
-    match (workspace, captured, presence) {
+    let held = matches!(capture, Capture::Held);
+    match (workspace, capture, presence) {
+        (_, Capture::Pending, _) => (Action::Refuse, "capture-pending"),
+        (_, Capture::Transient, _) => (Action::Refuse, "capture-transient"),
         (_, _, Presence::Unreadable) => (Action::Refuse, "unreadable"),
-        (_, _, Presence::Symlinked) if !(seats && captured) => (Action::Refuse, "symlinked-path"),
-        (true, true, Presence::Absent | Presence::Empty) => (Action::Land, "absent"),
-        (true, true, Presence::Git | Presence::Symlinked) => (Action::Adopt, "adopt-or-beside"),
-        (_, true, Presence::NotGit) => (Action::Refuse, "not-git"),
-        (true, false, Presence::Absent | Presence::Empty) => (Action::CarryLive, "capture-refused"),
-        (true, false, Presence::Git | Presence::NotGit) => {
+        // A live path spelled through a symlink (the path, or an ancestor:
+        // map to the real path) is never acted on through it.
+        (_, _, Presence::Symlinked) if !(seats && held) => (Action::Refuse, "symlinked-path"),
+        (true, Capture::Held, Presence::Absent | Presence::Empty) => (Action::Land, "absent"),
+        (true, Capture::Held, Presence::Git | Presence::Symlinked) => {
+            (Action::Adopt, "adopt-or-beside")
+        }
+        (_, Capture::Held, Presence::NotGit) => (Action::Refuse, "not-git"),
+        (true, Capture::Refused, Presence::Absent | Presence::Empty) => {
+            (Action::CarryLive, "capture-refused")
+        }
+        (true, Capture::Refused, Presence::Git | Presence::NotGit | Presence::Symlinked) => {
             (Action::CarryBeside, "capture-refused-occupied")
         }
-        (false, true, Presence::Absent | Presence::Empty) => (Action::Land, "bare-landing"),
-        (false, true, Presence::Git | Presence::Symlinked) => (Action::RefsOnly, "refs-only-adopt"),
-        (false, false, _) => (Action::Refuse, "capture-refused-refs-only"),
-        // Unreachable: a symlinked uncaptured path is refused above.
-        (true, false, Presence::Symlinked) => (Action::Refuse, "symlinked-path"),
+        (false, Capture::Held, Presence::Absent | Presence::Empty) => {
+            (Action::Land, "bare-landing")
+        }
+        (false, Capture::Held, Presence::Git | Presence::Symlinked) => {
+            (Action::RefsOnly, "refs-only-adopt")
+        }
+        (false, Capture::Refused, _) => (Action::Refuse, "capture-refused-refs-only"),
     }
 }
 
@@ -358,9 +441,12 @@ pub struct Decision {
     pub action: Action,
     pub reason: String,
     pub presence: Presence,
-    pub captured: bool,
+    pub capture: Capture,
     /// When this action was first decided (ns since the epoch).
     pub decided_ns: i128,
+    /// A carry was started for it (recorded before the carry runs): from
+    /// then on the decision stays while the item is not captured.
+    pub attempted: bool,
 }
 
 /// One phase a run reached.
@@ -459,34 +545,57 @@ pub struct Row {
     pub kept: bool,
 }
 
+/// What [`decide`] reads besides the plan.
+#[derive(Debug, Clone, Copy)]
+pub struct Inputs<'a> {
+    /// The pulled corpus (capture records).
+    pub corpus: &'a Path,
+    /// The source half's latest finished pass's refusals, by item.
+    pub refusals: &'a BTreeMap<String, String>,
+    /// The apply's private state and source label (carry records).
+    pub state: &'a Path,
+    pub source: &'a str,
+    /// `--side-root` was given.
+    pub seats: bool,
+}
+
 /// Decide every item of `items` (the pulled plan) against the destination.
 ///
-/// The decisions are recorded in `ledger` (see the module docs). Reads the
-/// corpus for capture records and each live path's presence; writes
+/// The decisions go into `ledger` (see the module docs). A carry decision
+/// stays while the item is not captured, once a carry was started for it
+/// or a carry record names it; every other decision is taken again. Reads
+/// the corpus, the carry records and each live path's presence; writes
 /// nothing.
 ///
 /// # Errors
 /// An item that does not encode; IO probing the corpus.
 pub fn decide(
     items: &[Item],
-    corpus: &Path,
+    inputs: &Inputs<'_>,
     ledger: &mut Ledger,
-    seats: bool,
     now_ns: i128,
 ) -> Result<Vec<Row>> {
+    const SITE: &str = "estate::moving::decide";
     let mut rows = Vec::with_capacity(items.len());
     for item in items {
         let identity = id(item)?;
-        let captured = corpus
+        let held = inputs
+            .corpus
             .join(format!("{identity}.capture"))
             .try_exists()
-            .refuse_at("estate::moving::decide")?;
+            .refuse_at(SITE)?;
+        let capture = capture_of(held, inputs.refusals.get(&identity).map(String::as_str));
         let place = item.workspace.as_ref().unwrap_or(&item.repository);
         let now = presence(place);
-        let (action, reason) = action(item.workspace.is_some(), captured, now, seats);
+        let (action, reason) = action(item.workspace.is_some(), capture, now, inputs.seats);
         let previous = ledger.items.get(&identity);
-        // A carry stays where it went while the item is still uncaptured.
-        let keep = previous.is_some_and(|previous| previous.action.carries() && !captured);
+        let carried = super::carried::carried_path(inputs.state, &identity, inputs.source)
+            .try_exists()
+            .refuse_at(SITE)?;
+        let keep = capture != Capture::Held
+            && previous.is_some_and(|previous| {
+                previous.action.carries() && (previous.attempted || carried)
+            });
         let decision = if keep {
             previous
                 .cloned()
@@ -496,11 +605,12 @@ pub fn decide(
                 action,
                 reason: reason.to_owned(),
                 presence: now,
-                captured,
+                capture,
                 decided_ns: match previous {
                     Some(previous) if previous.action == action => previous.decided_ns,
                     _ => now_ns,
                 },
+                attempted: false,
             }
         };
         ledger.items.insert(identity.clone(), decision.clone());
@@ -531,6 +641,59 @@ pub fn histogram(rows: &[Row]) -> BTreeMap<Action, u64> {
 /// directory; IO.
 pub fn private_dir(path: &Path) -> Result<()> {
     super::private_directory(path)
+}
+
+/// The source half's refusals file: one `ITEM CODE` line per item its pass
+/// refused.
+#[must_use]
+pub fn render_refusals(refusals: &BTreeMap<String, String>) -> String {
+    use std::fmt::Write as _;
+    refusals
+        .iter()
+        .fold(String::new(), |mut text, (item, code)| {
+            let _ = writeln!(text, "{item} {code}");
+            text
+        })
+}
+
+/// [`render_refusals`] read back; a malformed line is skipped.
+#[must_use]
+pub fn parse_refusals(text: &str) -> BTreeMap<String, String> {
+    text.lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(item, code)| (item.to_owned(), code.to_owned()))
+        .collect()
+}
+
+/// The source half's notes file: one `WHAT COUNT CODE PATH` line per note
+/// (the path escaped, last).
+#[must_use]
+pub fn render_notes(notes: &[Note]) -> String {
+    use std::fmt::Write as _;
+    notes.iter().fold(String::new(), |mut text, note| {
+        let _ = writeln!(
+            text,
+            "{} {} {} {}",
+            note.what,
+            note.count,
+            note.code.unwrap_or("none"),
+            note.path.display().to_string().escape_debug()
+        );
+        text
+    })
+}
+
+/// The count of each kind of note in a notes file.
+#[must_use]
+pub fn note_counts(text: &str) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    for line in text.lines() {
+        let mut words = line.splitn(3, ' ');
+        if let (Some(what), Some(count)) = (words.next(), words.next()) {
+            *counts.entry(what.to_owned()).or_default() += count.parse::<u64>().unwrap_or(1);
+        }
+    }
+    counts
 }
 
 /// Write `bytes` at `path`, replacing it whole (temporary, fsync, rename,
@@ -600,15 +763,23 @@ mod tests {
         fs::canonicalize(&base).unwrap()
     }
 
+    const CAPTURES: [Capture; 4] = [
+        Capture::Held,
+        Capture::Refused,
+        Capture::Transient,
+        Capture::Pending,
+    ];
+
     #[test]
     fn the_table_never_lands_an_uncaptured_item_or_writes_through_a_link() {
         for workspace in [true, false] {
-            for captured in [true, false] {
+            for capture in CAPTURES {
                 for seen in PRESENCES {
                     for seats in [true, false] {
-                        let (action, reason) = action(workspace, captured, seen, seats);
+                        let (action, reason) = action(workspace, capture, seen, seats);
                         assert!(!reason.is_empty());
-                        if !captured {
+                        let held = capture == Capture::Held;
+                        if !held {
                             assert!(
                                 matches!(
                                     action,
@@ -617,16 +788,20 @@ mod tests {
                                 "{workspace} {seen:?} {action:?}"
                             );
                         }
+                        // Only a recorded, lasting refusal is carried as files.
+                        if action.carries() {
+                            assert_eq!(capture, Capture::Refused);
+                        }
                         if action == Action::CarryLive {
                             assert!(matches!(seen, Presence::Absent | Presence::Empty));
                         }
                         if !workspace {
                             assert!(!action.carries(), "a refs-only item has no files");
                         }
-                        if seen == Presence::Symlinked && !(seats && captured) {
+                        if seen == Presence::Symlinked && !(seats && held) {
                             assert_eq!(action, Action::Refuse);
                         }
-                        if seen == Presence::NotGit && captured {
+                        if seen == Presence::NotGit && held {
                             assert_eq!(action, Action::Refuse, "never adopt a non-Git tree");
                         }
                         if seen == Presence::Unreadable {
@@ -636,6 +811,16 @@ mod tests {
                 }
             }
         }
+        assert_eq!(capture_of(true, Some("IO")), Capture::Held);
+        assert_eq!(
+            capture_of(false, Some("CAPTURE_DRIFTED")),
+            Capture::Transient
+        );
+        assert_eq!(
+            capture_of(false, Some("GIT_SOURCE_PARTIAL_CLONE")),
+            Capture::Refused
+        );
+        assert_eq!(capture_of(false, None), Capture::Pending);
     }
 
     #[test]
@@ -660,6 +845,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One fixture, every shape.
     fn the_inventory_groups_every_worktree_and_notes_the_rest() {
         let base = base("inventory");
         let root = base.join("git");
@@ -813,12 +999,13 @@ mod tests {
     }
 
     // P-MOVE (plan): every item gets exactly one recorded decision, the
-    // ledger holds one per item, and a carry decided once stays while the
-    // item is uncaptured, whatever its path holds on a rerun.
+    // ledger holds one per item, and a carry once started stays while the
+    // item is uncaptured, whatever its path holds on a rerun; a carry never
+    // started is decided again.
     proptest! {
         #![proptest_config(prop_config(64))]
         #[test]
-        fn decisions_are_total_and_carries_are_sticky(
+        fn decisions_are_total_and_started_carries_are_sticky(
             shapes in proptest::collection::vec(any::<bool>(), 1..12),
             stale in proptest::collection::vec(0usize..4, 1..12),
         ) {
@@ -826,34 +1013,42 @@ mod tests {
             let corpus = base.join("corpus");
             fs::create_dir(&corpus).unwrap();
             let items: Vec<Item> = shapes.iter().enumerate().map(|(n, w)| item(u8::try_from(n).unwrap(), *w)).collect();
+            // Every item's capture refused for good in the source pass.
+            let refusals: BTreeMap<String, String> = items.iter().map(|item| (id(item).unwrap(), "GIT_INVENTORY_INDEX_ABSENT".to_owned())).collect();
             let mut ledger = Ledger::default();
-            // A first run carried some uncaptured workspace items beside.
+            // An earlier run decided some workspace items beside; choice 0
+            // started their carry, choice 1 did not.
             for (n, choice) in stale.iter().enumerate() {
                 if let Some(item) = items.get(n).filter(|item| item.workspace.is_some()) {
-                    if *choice == 0 {
+                    if *choice < 2 {
                         ledger.items.insert(id(item).unwrap(), Decision {
                             action: Action::CarryBeside,
                             reason: "capture-refused-occupied".to_owned(),
                             presence: Presence::Git,
-                            captured: false,
+                            capture: Capture::Refused,
                             decided_ns: 1,
+                            attempted: *choice == 0,
                         });
                     }
                 }
             }
             let before = ledger.clone();
-            let rows = decide(&items, &corpus, &mut ledger, false, 9).unwrap();
+            let inputs = Inputs { corpus: &corpus, refusals: &refusals, state: &base, source: "neo", seats: false };
+            let rows = decide(&items, &inputs, &mut ledger, 9).unwrap();
             prop_assert_eq!(rows.len(), items.len());
             prop_assert_eq!(ledger.items.len(), items.iter().map(|item| id(item).unwrap()).collect::<BTreeSet<_>>().len());
             for row in &rows {
-                if let Some(was) = before.items.get(&row.id) {
-                    prop_assert!(row.kept);
-                    prop_assert_eq!(&row.decision, was);
-                } else {
-                    // Absent paths, nothing captured: workspace items carry
-                    // live, refs-only items are refused.
-                    prop_assert_eq!(row.decision.action, if row.item.workspace.is_some() { Action::CarryLive } else { Action::Refuse });
-                    prop_assert_eq!(row.decision.decided_ns, 9);
+                match before.items.get(&row.id) {
+                    Some(was) if was.attempted => {
+                        prop_assert!(row.kept);
+                        prop_assert_eq!(&row.decision, was);
+                    }
+                    _ => {
+                        // Absent paths: workspace items carry live, refs-only
+                        // items are refused.
+                        prop_assert!(!row.kept);
+                        prop_assert_eq!(row.decision.action, if row.item.workspace.is_some() { Action::CarryLive } else { Action::Refuse });
+                    }
                 }
             }
             let total: u64 = histogram(&rows).values().sum();

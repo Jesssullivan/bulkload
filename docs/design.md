@@ -2842,6 +2842,11 @@ of its target and ran `git worktree repair` by hand
 
 ## estate-move (M2 item 7, design; not built)
 
+> 2026-10-18: built as `estate-move-source` (source half) and `estate-move`
+> (destination half) plus `estate-apply --refs-in`, superseding "not
+> built" above; what was built and where it differs from this sketch is in
+> `docs/agent-notes/2026-10-18-estate-move.md` (A-20261018-110, R-N13).
+
 Design: `docs/agent-notes/2026-10-16-estate-move-design.md`. One verb on
 the destination, `estate-move [--plan-only] [--date YYYYMMDD] [--map
 SRC=LIVE]... SOURCE_HOST SOURCE_ROOT... MOVE_STATE`, that does what the
