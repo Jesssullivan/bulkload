@@ -1678,8 +1678,34 @@ fn a_receive_whose_peer_is_gone_is_transport_lost() {
         &corpus.base.join("destination"),
         &corpus.base.join("destination-state"),
     );
+    // Closed before the join: a regression that refuses before the open
+    // fails here instead of leaving the peer waiting.
+    drop((input, output));
     peer.join().unwrap();
     assert_eq!(received.unwrap_err(), BulkloadRefusal::TransportLost);
+}
+
+/// S4 (TIN-6592): a refusal this side raises keeps a bare `IO`'s errno for
+/// the transfer record, and nothing else gains one.
+#[test]
+fn a_refusal_raised_here_keeps_a_bare_ios_errno() {
+    let mut stats = TransferStats::default();
+    stats.refuse_here(b"a".to_vec(), &BulkloadRefusal::Io(Some(libc::EACCES)));
+    stats.refuse_here(b"b".to_vec(), &BulkloadRefusal::Io(None));
+    stats.refuse_here(b"c".to_vec(), &BulkloadRefusal::DestinationOccupied);
+    stats.keep_errno(b"d", &BulkloadRefusal::Io(Some(libc::EIO)));
+    assert_eq!(
+        stats.refusals,
+        [
+            (b"a".to_vec(), "IO".to_owned()),
+            (b"b".to_vec(), "IO".to_owned()),
+            (b"c".to_vec(), "DESTINATION_OCCUPIED".to_owned()),
+        ]
+    );
+    assert_eq!(
+        stats.refusal_errnos,
+        BTreeMap::from([(b"a".to_vec(), libc::EACCES), (b"d".to_vec(), libc::EIO)])
+    );
 }
 
 /// S4 (TIN-6592): a walked seat removed before its capture opens it is

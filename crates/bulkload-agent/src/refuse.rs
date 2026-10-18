@@ -73,23 +73,16 @@ pub fn io_in(
 /// source walk listed, at `site` (S4, TIN-6592).
 ///
 /// `ENOENT` is `SOURCE_VANISHED`: the seat, or a directory above it, was
-/// removed after the listing. `ELOOP` and `ENOTDIR` are
-/// `SOURCE_CHANGED_AFTER_SNAPSHOT`: a component was swapped for a symlink
-/// or a non-directory, which a no-follow open beneath the root refuses.
-/// Anything else is [`io`], with its errno.
+/// removed after the listing. Anything else is [`io`], with its errno: a
+/// component swapped for a symlink or a non-directory (`ELOOP`, `ENOTDIR`)
+/// keeps the refusal its site gave it before.
 #[must_use]
 pub fn source_seat(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
-    match error.raw_os_error() {
-        Some(libc::ENOENT) => {
-            debug_assert!(is_site(site), "refusal site {site:?} is not a path");
-            BulkloadRefusal::SourceVanished
-        }
-        Some(libc::ELOOP | libc::ENOTDIR) => {
-            debug_assert!(is_site(site), "refusal site {site:?} is not a path");
-            BulkloadRefusal::SourceChangedAfterSnapshot
-        }
-        _ => io(error, site),
+    if error.raw_os_error() == Some(libc::ENOENT) {
+        debug_assert!(is_site(site), "refusal site {site:?} is not a path");
+        return BulkloadRefusal::SourceVanished;
     }
+    io(error, site)
 }
 
 /// The refusal for an I/O error reading or writing a session's frame
@@ -167,18 +160,19 @@ mod tests {
         }
     }
 
-    // S4 (TIN-6592): a listed seat that is gone is typed, a swapped
-    // component is a change, and any other errno stays IO with its errno.
+    // S4 (TIN-6592): a listed seat that is gone is typed; any other errno
+    // stays IO with its errno.
     #[test]
     fn a_vanished_seat_is_typed_and_other_errnos_keep_theirs() {
         let at = |errno| super::source_seat(&std::io::Error::from_raw_os_error(errno), "t::s");
         assert_eq!(at(libc::ENOENT), BulkloadRefusal::SourceVanished);
-        assert_eq!(at(libc::ELOOP), BulkloadRefusal::SourceChangedAfterSnapshot);
-        assert_eq!(
-            at(libc::ENOTDIR),
-            BulkloadRefusal::SourceChangedAfterSnapshot
-        );
-        for errno in [libc::EACCES, libc::EIO, libc::EPERM] {
+        for errno in [
+            libc::EACCES,
+            libc::EIO,
+            libc::EPERM,
+            libc::ELOOP,
+            libc::ENOTDIR,
+        ] {
             assert_eq!(at(errno), BulkloadRefusal::Io(Some(errno)));
         }
     }

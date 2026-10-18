@@ -347,13 +347,20 @@ impl TransferStats {
         self.refusals.push((rel_path, code));
     }
 
-    /// Record a refusal of `rel_path` that this side raised, keeping a bare
-    /// `IO`'s errno (S4, TIN-6592).
+    /// Record a refusal of `rel_path` that this side raised, with the
+    /// `SQLite` code it carries, keeping a bare `IO`'s errno (S4,
+    /// TIN-6592).
     fn refuse_here(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
-        if let BulkloadRefusal::Io(Some(errno)) = refusal {
-            self.refusal_errnos.insert(rel_path.clone(), *errno);
-        }
+        self.keep_errno(&rel_path, refusal);
         self.refuse(rel_path, refusal.code().to_owned(), refusal.sqlite_code());
+    }
+
+    /// Keep the errno of a bare `IO` this side raised for `rel_path` (S4,
+    /// TIN-6592).
+    fn keep_errno(&mut self, rel_path: &[u8], refusal: &BulkloadRefusal) {
+        if let BulkloadRefusal::Io(Some(errno)) = refusal {
+            self.refusal_errnos.insert(rel_path.to_vec(), *errno);
+        }
     }
 
     /// The default S4 disposition of the refusal of `rel_path` with `code`
@@ -748,8 +755,11 @@ pub fn copy_with(
         match (result, served) {
             // The destination refused for a reason of its own (its setup,
             // which now runs while the source opens its store, item 1b): the
-            // source's broken stream is only the echo of it. A destination
-            // that lost its stream is the echo of the source's refusal.
+            // source's broken stream is only the echo of it, whatever the
+            // destination's code (an IO with its errno included). A
+            // destination that lost its stream is the echo of the source's
+            // refusal.
+            (Err(refusal), Err(BulkloadRefusal::TransportLost)) => Err(refusal),
             (Err(refusal), Err(_))
                 if !matches!(
                     refusal,
@@ -3559,7 +3569,8 @@ fn seat_directory<'r>(
                     crate::walk::rel_path(row.rel_path.get(..at).unwrap_or_default()),
                     crate::io::OpenMode::Directory,
                 )
-                .refuse_at("transfer::seat_directory")?,
+                // S4 (TIN-6592): a directory removed since the walk.
+                .map_err(|error| crate::refuse::source_seat(&error, "transfer::seat_directory"))?,
             ),
             row.rel_path.get(at + 1..).unwrap_or_default(),
         ),
@@ -3736,9 +3747,8 @@ fn room_for_slot(work: &SourceWork<'_>, reserved: &mut SlotReservation, bound: u
 /// Open a source seat for reading, component by component beneath the
 /// source root descriptor (W4 PR 3): a symlink at any component is refused.
 // S4 (TIN-6592): a walked seat gone before its capture opens it is
-// `SOURCE_VANISHED` (a component swapped since is a change), never a bare
-// IO: on the wire a refusal is its code alone, so an errno never reaches
-// the destination's record.
+// `SOURCE_VANISHED`, never a bare IO: on the wire a refusal is its code
+// alone, so an errno never reaches the destination's record.
 fn open_source(work: &SourceWork<'_>, row: &RowSchema) -> Result<std::fs::File> {
     #[cfg(test)]
     before_open(work.root, &row.rel_path);
@@ -5338,8 +5348,12 @@ impl<W: Write> Inbound<'_, W> {
         Ok(())
     }
 
+    // The code alone, as before, and a bare `IO`'s errno (TIN-6592).
     fn refuse(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
-        self.stats.refuse_here(rel_path, refusal);
+        self.stats.keep_errno(&rel_path, refusal);
+        self.stats
+            .refusals
+            .push((rel_path, refusal.code().to_owned()));
     }
 
     /// Decide one offered entry.

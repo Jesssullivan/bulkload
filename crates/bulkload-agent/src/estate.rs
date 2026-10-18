@@ -2119,10 +2119,19 @@ fn capture_in(
         if let Err(error) = execute(level, jobs, &operation, &|row| {
             emit(state, "estate::capture", row, receipt)
         }) {
-            outcome = Err(error);
+            outcome = first_fault(outcome, error);
         }
     }
     outcome
+}
+
+// The verb's refusal across its levels (S4, #231): the first that is not
+// the run-level `ITEMS_REFUSED`, which never hides a level that aborted.
+fn first_fault(outcome: Result<()>, error: BulkloadRefusal) -> Result<()> {
+    match outcome {
+        Ok(()) | Err(BulkloadRefusal::ItemsRefused) => Err(error),
+        fault => fault,
+    }
 }
 
 type ImportedBases = Mutex<std::collections::BTreeSet<(PathBuf, [u8; 32])>>;
@@ -3562,7 +3571,7 @@ pub fn apply_reporting(
         if let Err(error) = execute(level, jobs, &operation, &|row| {
             emit(state, "estate::apply", row, receipt)
         }) {
-            outcome = Err(error);
+            outcome = first_fault(outcome, error);
         }
     }
     // TIN-6569 (OI-1003-Q183), the H step (design 6.4): after every level,
