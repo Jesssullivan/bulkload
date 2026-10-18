@@ -92,20 +92,26 @@ SUBCOMMANDS:
                 refuses for a negation (!pattern) on either side, an exclude a
                 bulkload ledger owns, a symlinked info or an exclude that is not
                 a regular file with one link this user owns.
-                --side-root ROOT (repeatable; M2r2 item e): before any item,
-                each planned path spelled through a symlink whose one hop names
-                a directory inside ROOT is seated: one exchange gives the live
-                path the directory (same inode, no byte copied) and leaves a
-                link back at the side-root path, recorded in PRIVATE_STATE
-                (`seat live= target= outcome=seated|previous-seated|refused`);
-                the items then land, adopt or re-key at the live path
+                --side-root ROOT (repeatable; M2r2 item e; needs --adopt):
+                after the preflights and before any item, each planned path
+                spelled through a symlink whose one hop names a directory
+                inside ROOT (not nested with another seat's target or a
+                planned path) is seated: one exchange gives the live path the
+                directory (same inode, no byte copied) and a link back
+                replaces the side-root path, recorded in PRIVATE_STATE
+                (`seat live= target= outcome=seated|seat-resumed|unseated|refused
+                reason=`; an interrupted seat or undo is finished first); the
+                items then adopt or re-key at the live path, and a seat stays
+                if they refuse
     estate-unseat PRIVATE_STATE [LIVE ...]
                 M2r2 item e: undo each seat estate-apply --side-root recorded in
                 PRIVATE_STATE (or only those of the LIVE paths given): the
                 directory back at its side-root path (the same inode), the
                 link back at the live path with its own text, the record
-                removed. Refuses RECEIPT_BINDING_INVALID, writing nothing, when
-                either path no longer holds what the seat left.
+                removed (the record is marked unseating first, so an
+                interrupted undo is finished, never re-seated). Refuses
+                RECEIPT_BINDING_INVALID, changing no path, when either path no
+                longer holds what the seat left.
     estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a

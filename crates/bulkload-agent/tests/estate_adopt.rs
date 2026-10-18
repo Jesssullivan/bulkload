@@ -1573,6 +1573,15 @@ fn p121_only_a_single_hop_into_a_side_root_is_seated() {
     run.capture();
     private_dir(&run.applied);
     let before = freeze_all(&world.sting(""));
+    // Without --adopt a seated tree could only refuse: refused up front.
+    let unadopted = run.apply(&["--side-root", side.to_str().unwrap()]);
+    assert!(!unadopted.ok);
+    assert!(
+        unadopted.stderr.contains("FIELD_DOMAIN_VIOLATION"),
+        "{}",
+        unadopted.stderr
+    );
+    assert!(seat_lines(&unadopted.stdout).is_empty());
     let ran = run.apply(&["--adopt", "--side-root", side.to_str().unwrap()]);
     let lines = seat_lines(&ran.stdout);
     assert_eq!(lines.len(), 1, "{}", ran.stdout);

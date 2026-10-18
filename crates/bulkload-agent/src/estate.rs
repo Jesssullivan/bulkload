@@ -2845,12 +2845,12 @@ pub struct ApplyOptions {
     /// an scp-style or `ssh://` origin starting with one of these; a local
     /// path never ([`git_carry::origin_prefix_allowed`]).
     pub activate_origin: Vec<String>,
-    /// `--side-root ROOT` (repeatable; M2r2 item e): before any item
-    /// lands, each planned path spelled through a symlink whose single hop
-    /// names a directory inside ROOT is seated there ([`seat`]): the
-    /// directory takes the live path by one exchange (same inode, no byte
-    /// copied) and the side-root path becomes a link back, recorded in
-    /// STATE for `estate-unseat`.
+    /// `--side-root ROOT` (repeatable; M2r2 item e; needs `adopt`): after
+    /// the preflights and before any item lands, each planned path spelled
+    /// through a symlink whose single hop names a directory inside ROOT is
+    /// seated there ([`seat`]): the directory takes the live path by one
+    /// exchange (same inode, no byte copied) and the side-root path becomes
+    /// a link back, recorded in STATE for `estate-unseat`.
     pub side_roots: Vec<PathBuf>,
     /// `--exclude-union` (M2 round 2, item 2): a first linked landing whose
     /// repository's common `info/exclude` is not the capture's appends the
@@ -2935,7 +2935,11 @@ pub fn unseat(
             continue;
         }
         seat::unseat(&path, &record)?;
-        line(&seat_line(&record.live, &record.target, "unseated", None))?;
+        line(&format!(
+            "{} plan=\"{}\"",
+            seat_line(&record.live, &record.target, "unseated", None),
+            record.plan.display().to_string().escape_debug()
+        ))?;
     }
     Ok(())
 }
@@ -2978,21 +2982,41 @@ pub fn apply_reporting(
     {
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
+    // A seated tree is an existing checkout: only `--adopt` lands into it.
+    if !options.side_roots.is_empty() && !options.adopt {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
     private_directory(state)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let contents: Plan = read(plan)?;
-    // M2r2 item e: finish any seat a crash interrupted, then seat the
-    // plan's symlinked live paths into the side roots, before any item.
+    // OI-1001-Q2: refuse before any item writes when the planned bytes would
+    // take a destination filesystem under its free-space floor.
+    for (probe, planned) in space_plan(&contents, corpus, state, source, jobs) {
+        crate::space::preflight(&probe, planned)?;
+    }
+    // M2r2 item e, after the preflights and before any item: finish every
+    // seat or undo a crash interrupted (a record that cannot be finished is
+    // a refused line, never the apply's refusal), then seat the plan's
+    // symlinked live paths into the side roots. A seat stays when its items
+    // then refuse (`estate-unseat` undoes it).
     let roots = seat::roots(&options.side_roots)?;
     for (record, done) in seat::resume(state)? {
-        if done != seat::Seated::Present {
-            handoff_line(&seat_line(&record.live, &record.target, done.word(), None))?;
+        match done {
+            Ok(seat::Seated::Present) => {}
+            Ok(done) => handoff_line(&seat_line(&record.live, &record.target, done.word(), None))?,
+            Err(refusal) => handoff_line(&seat_line(
+                &record.live,
+                &record.target,
+                "refused",
+                Some(&refusal),
+            ))?,
         }
     }
+    let owner = std::path::absolute(plan).refuse_at("estate::apply")?;
     for candidate in seat::candidates(&contents.items, &roots) {
         let line = match &candidate.found {
-            seat::Found::Seatable { target, text } => {
-                match seat::seat(state, &candidate.live, target, text) {
+            seat::Found::Seatable { target, .. } => {
+                match seat::seat(state, &owner, &contents.items, &roots, &candidate.live) {
                     Ok(done) => seat_line(&candidate.live, target, done.word(), None),
                     Err(refusal) => seat_line(&candidate.live, target, "refused", Some(&refusal)),
                 }
@@ -3002,11 +3026,6 @@ pub fn apply_reporting(
             }
         };
         handoff_line(&line)?;
-    }
-    // OI-1001-Q2: refuse before any item writes when the planned bytes would
-    // take a destination filesystem under its free-space floor.
-    for (probe, planned) in space_plan(&contents, corpus, state, source, jobs) {
-        crate::space::preflight(&probe, planned)?;
     }
     let mut locks = std::collections::BTreeMap::new();
     let mut groups = std::collections::BTreeMap::new();
