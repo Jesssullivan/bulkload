@@ -56,6 +56,12 @@ SUBCOMMANDS:
                 Append an explicit reviewed item; no automatic worktree proliferation
     estate-show PLAN
                 Print the exact selected sources, repositories and restore targets
+    estate-retarget PLAN CORPUS --map OLD=NEW [--map OLD=NEW]...
+                Re-point the plan's repositories and workspaces (longest
+                component prefix OLD becomes NEW; sources never change) and
+                re-key each moved item's capture record in CORPUS, so the next
+                capture reuses it and reads no source byte (M2 item 5). The
+                plan as it was is kept as PLAN.before-retarget-<digest>
     estate-add-batch PLAN SOURCE DEST WORKSPACE_OR_DASH [SOURCE DEST WORKSPACE_OR_DASH ...]
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
@@ -665,7 +671,8 @@ fn main() -> ExitCode {
         }
         Some(
             name @ ("estate-add" | "estate-add-batch" | "estate-show" | "estate-capture"
-            | "estate-apply" | "estate-diff" | "estate-handoff" | "estate-unseat"),
+            | "estate-apply" | "estate-diff" | "estate-handoff" | "estate-retarget"
+            | "estate-unseat"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
@@ -1414,6 +1421,46 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         Ok(())
     };
     match command {
+        "estate-retarget" => {
+            let mut positional = Vec::new();
+            let mut maps = Vec::new();
+            let mut rest = args.iter();
+            while let Some(arg) = rest.next() {
+                if arg.to_str() == Some("--map") {
+                    let value = rest
+                        .next()
+                        .and_then(|value| value.to_str())
+                        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+                    let (old, new) = value
+                        .split_once('=')
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                    maps.push((PathBuf::from(old), PathBuf::from(new)));
+                } else {
+                    positional.push(Path::new(arg));
+                }
+            }
+            let [plan, corpus] = positional[..] else {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            };
+            if maps.is_empty() {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            }
+            let mut output = std::io::stdout().lock();
+            for row in estate::retarget(plan, corpus, &maps)? {
+                writeln!(
+                    output,
+                    "item={} was={} source={:?} repository={:?} workspace={:?} capture={}",
+                    row.now_id,
+                    row.was_id,
+                    row.now.source,
+                    row.now.repository,
+                    row.now.workspace,
+                    row.capture
+                )
+                .refuse_at("main::estate_command")?;
+            }
+            output.flush().refuse_at("main::estate_command")
+        }
         "estate-show" if args.len() == 1 => {
             let mut output = std::io::stdout().lock();
             for item in estate::inspect(path(0)?)? {
