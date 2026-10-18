@@ -283,7 +283,7 @@ class ArmTests(unittest.TestCase):
             "counters verb=serve side=source scope=process priority=background priority_from=default\n"
             "gate_b_serve max_rss_bytes=4096 exit=0\n"
             "refused state/odd\\x20\\xff.db: SQLITE_STATE_CHANGED\n"
-            "bulkload-agent: refused: CONTRACT_SELF_INCONSISTENT\n"
+            "bulkload-agent: refused: ITEMS_REFUSED\n"
         )
         parsed = gb.parse_native(stdout, stderr)
         odd = os.fsdecode(b"state/odd \xff.db")
@@ -291,7 +291,7 @@ class ArmTests(unittest.TestCase):
         self.assertEqual(parsed["serve_max_rss_bytes"], 4096)
         self.assertEqual(parsed["serve"]["priority"], "background")
         self.assertEqual(parsed["transfer"]["bytes_received"], 100)
-        self.assertEqual(parsed["final_refusal"], "CONTRACT_SELF_INCONSISTENT")
+        self.assertEqual(parsed["final_refusal"], "ITEMS_REFUSED")
         run = {"exit": 1}
         self.assertEqual(gb.native_problems(run, parsed, {odd: "sqlite-magic"}), [])
         problems = gb.native_problems(run, parsed, {})

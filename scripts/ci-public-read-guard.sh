@@ -228,30 +228,27 @@ require_equal "runner environment" "${BULKLOAD_RUNNER_ENVIRONMENT:-}" self-hoste
 require_equal "repository" "${BULKLOAD_REPOSITORY:-}" "${GITHUB_REPOSITORY:-}"
 require_equal "event" "${BULKLOAD_EVENT_NAME:-}" "${GITHUB_EVENT_NAME:-}"
 require_equal "ref" "${BULKLOAD_REF:-}" "${GITHUB_REF:-}"
+# OI-1003-Q199 (2026-10-16): the merge gate is a local receipt on sting, so CI
+# runs only for release tags and as a manual backstop. Pull requests and the
+# merge queue no longer start it, and the guard refuses them.
 case "${BULKLOAD_EVENT_NAME:-}" in
-  pull_request)
-    require_equal \
-      "pull-request head repository" \
-      "${BULKLOAD_HEAD_REPOSITORY:-}" \
-      "${BULKLOAD_REPOSITORY:-}"
-    ;;
   push)
     require_equal \
       "push repository" \
       "${BULKLOAD_HEAD_REPOSITORY:-}" \
       "${BULKLOAD_REPOSITORY:-}"
     ;;
-  merge_group)
-    # Merge queue (R-N124): the queued commit lives in this repository on a
-    # gh-readonly-queue ref for main, and it never uploads Bazel results.
+  workflow_dispatch)
+    # A manual backstop run on a branch or release tag of this repository; it
+    # never uploads Bazel results.
     require_equal \
-      "merge-group repository" \
+      "dispatch repository" \
       "${BULKLOAD_HEAD_REPOSITORY:-}" \
       "${BULKLOAD_REPOSITORY:-}"
-    [[ "${BULKLOAD_REF:-}" == refs/heads/gh-readonly-queue/main/* ]] ||
-      die "merge-group ref is outside the main merge queue"
+    [[ "${BULKLOAD_REF:-}" == refs/heads/* || "${BULKLOAD_REF:-}" == refs/tags/v* ]] ||
+      die "dispatch ref is outside this repository's branches and release tags"
     ;;
-  *) die "event is outside the reviewed push/pull_request/merge_group inventory" ;;
+  *) die "event is outside the reviewed push/workflow_dispatch inventory" ;;
 esac
 
 [[ "${BULKLOAD_EXPECTED_SHA:-}" =~ ^[0-9a-f]{40}$ ]] || die "expected SHA is not canonical"

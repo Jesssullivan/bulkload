@@ -180,7 +180,11 @@ impl TransferRecord {
                     record.entries.push(Entry {
                         rel_path: path.clone(),
                         outcome: EntryOutcome::Refused {
-                            refusal: entry_refusal(code, site),
+                            refusal: entry_refusal(
+                                code,
+                                site,
+                                stats.refusal_errnos.get(path).copied(),
+                            ),
                             sqlite_code: stats.refusal_sqlite_codes.get(path).copied(),
                         },
                     });
@@ -250,9 +254,12 @@ fn entry_key(outcome: &EntryOutcome) -> String {
 // well-formed retired one as read (it fails closed in the report), and
 // anything else, which no writer of this taxonomy sent, as `FRAME_CODEC`:
 // untyped, so it never counts (S4).
-fn entry_refusal(code: &str, site: &'static str) -> Refusal {
-    Refusal::new(code, site, None)
-        .or_else(|| Refusal::decoded(code, site, None))
+// S4 (TIN-6592): an `IO` this side raised keeps its errno (`errno` is
+// `None` for any other code, and for every refusal the peer sent).
+fn entry_refusal(code: &str, site: &'static str, errno: Option<i32>) -> Refusal {
+    let errno = errno.filter(|_| code == "IO");
+    Refusal::new(code, site, errno)
+        .or_else(|| Refusal::decoded(code, site, errno))
         .unwrap_or_else(|| Refusal::of(&BulkloadRefusal::FrameCodec, site))
 }
 
@@ -768,6 +775,43 @@ mod tests {
         stats.sqlite_snapshots.push(b"state.db".to_vec());
         stats.sqlite_sidecars_covered.push(b"state.db-wal".to_vec());
         stats
+    }
+
+    /// S4 (TIN-6592): an `IO` this side raised keeps its errno in the
+    /// record; a refusal the peer sent (no errno on the wire) and any
+    /// other code record none. Still untyped: the row stays unaccounted.
+    #[test]
+    fn a_local_io_entry_keeps_its_errno_and_nothing_else_gains_one() {
+        let mut stats = stats();
+        stats.refusals.push((b"local".to_vec(), "IO".to_owned()));
+        stats.refusal_errnos.insert(b"local".to_vec(), libc::EACCES);
+        stats.refusals.push((b"peer".to_vec(), "IO".to_owned()));
+        // A stray errno beside a typed code is never recorded.
+        stats.refusal_errnos.insert(b"kept".to_vec(), libc::EACCES);
+        let record = TransferRecord::ended(
+            "pull",
+            "neo:/Users/jess",
+            Path::new("/srv/dest"),
+            &Ok(stats),
+            "transfer::pull",
+        );
+        let errno = |path: &[u8]| {
+            record
+                .entries
+                .iter()
+                .find_map(|entry| match &entry.outcome {
+                    EntryOutcome::Refused { refusal, .. } if entry.rel_path == path => {
+                        Some(refusal.errno())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(errno(b"local"), Some(libc::EACCES));
+        assert_eq!(errno(b"peer"), None);
+        assert_eq!(errno(b"kept"), None);
+        let bytes = record.encode().unwrap();
+        assert_eq!(decode(&bytes).unwrap(), record);
     }
 
     #[test]

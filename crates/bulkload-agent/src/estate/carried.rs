@@ -441,7 +441,7 @@ fn selection_errors(
 /// write) for an `--item` or `--bind` that names no planned eligible item
 /// or, under `--bind-only`, a selected workspace item with no bind.
 /// Per-item refusals are reported and recorded and the verb ends
-/// `CONTRACT_SELF_INCONSISTENT` when any item was not carried.
+/// `ITEMS_REFUSED` when any item was not carried (#231).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub fn carry_files(
     plan: &Path,
@@ -638,7 +638,7 @@ pub fn carry_files(
         }
     }
     if failed {
-        Err(BulkloadRefusal::ContractSelfInconsistent)
+        Err(BulkloadRefusal::ItemsRefused)
     } else {
         Ok(())
     }

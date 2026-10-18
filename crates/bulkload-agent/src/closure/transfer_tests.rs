@@ -645,7 +645,7 @@ proptest! {
         // The model, from the draws alone.
         let closes = |code: &str, sqlite: Option<i32>, how: u8| {
             crate::outcome::is_typed_code(code)
-                && code != "GIT_CONVERGE_INTERRUPTED"
+                && crate::closure::rerun_only(code).is_none()
                 && (how == 1 || policies.contains(code) || ruled(code, sqlite))
         };
         let session_ok = match kind {
@@ -670,7 +670,7 @@ proptest! {
         );
         let typed = entries.iter().filter(|drawn| matches!(drawn,
             Drawn::Refused(code, _, _) if crate::outcome::is_typed_code(codes[*code])
-                && codes[*code] != "GIT_CONVERGE_INTERRUPTED")).count() as u64
+                && crate::closure::rerun_only(codes[*code]).is_none())).count() as u64
             + u64::from(kind == 2);
         prop_assert_eq!(report.refused + report.refused_pending_review, typed);
         // A ruled default disposes only what no review row disposes.
