@@ -15,7 +15,7 @@ use std::process::Stdio;
 use super::{git, input, oid, output, refs, text};
 use crate::{BulkloadRefusal, Result};
 
-const CUSTODY: &str = "refs/carry-export/shallow-custody-v1";
+pub(super) const CUSTODY: &str = "refs/carry-export/shallow-custody-v1";
 /// Set on a shallow envelope whose capture drifted under its export. It names
 /// the custody commit, so `bundle list-heads` shows the drift without the
 /// pack ever being fetched; `unpack` refuses any envelope carrying it.
@@ -159,7 +159,7 @@ fn over_manifest_cap(length: usize) -> Result<()> {
     Ok(())
 }
 
-fn custody_oid(heads: &str) -> Option<&str> {
+pub(super) fn custody_oid(heads: &str) -> Option<&str> {
     heads.lines().find_map(|line| {
         line.split_once(' ')
             .filter(|(_, name)| *name == CUSTODY)

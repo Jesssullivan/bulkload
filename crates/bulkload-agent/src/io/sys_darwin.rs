@@ -194,6 +194,40 @@ pub fn rename_exclusive_at(
     Ok(())
 }
 
+/// `renameatx_np(RENAME_SWAP)` between two directories: `a` in `a_dir` and `b` in
+/// `b_dir`, both of which must exist, atomically trade the files they name
+/// (`estate-apply --side-root`, M2r2 item e: a live symlink and the
+/// side-root directory it names). Nothing is replaced or removed. Not
+/// traced: no transfer publish uses it. A file system without it reports
+/// `EINVAL`, `ENOTSUP` or `ENOSYS` ([`super::rename_unsupported`]); two
+/// file systems, `EXDEV`.
+///
+/// # Errors
+/// Returns the rename failure; a missing name is `ENOENT`.
+pub fn exchange_at(a_dir: impl AsFd, a: &CStr, b_dir: impl AsFd, b: &CStr) -> io::Result<()> {
+    trace_serial!();
+    let (a_dir, b_dir) = (a_dir.as_fd(), b_dir.as_fd());
+    #[cfg(any(test, feature = "fault-injection"))]
+    if super::sys_posix::rename_forced_unsupported() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    // SAFETY: both descriptors are live for the call and both names are
+    // NUL-terminated and outlive it.
+    let exchanged = unsafe {
+        libc::renameatx_np(
+            a_dir.as_raw_fd(),
+            a.as_ptr(),
+            b_dir.as_raw_fd(),
+            b.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if exchanged != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `renameatx_np(RENAME_SWAP)` within one directory: `a` and `b`, both of
 /// which must exist, atomically trade the files they name (WP0(d), #187).
 /// Nothing is replaced or removed. A file system without it reports
@@ -269,6 +303,35 @@ pub fn enter_background() -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(ret));
     }
     super::sys_posix::nice_background()
+}
+
+/// `IOPOL_DEFAULT`: the disk IO policy an unprioritised process has.
+const IOPOL_DEFAULT: libc::c_int = 0;
+
+/// Bounded starvation (M2 item 3): set the process-wide disk IO policy back
+/// to `IOPOL_DEFAULT`. Unverified on Darwin and likely limited: a thread's
+/// effective IO tier is also bounded by its `QoS` class, which stays
+/// `QOS_CLASS_BACKGROUND` (only the thread itself can change it), and no
+/// call changes a running child's policy, so this mainly helps children
+/// started afterwards. The `auto` class is Darwin's remedy. Nice stays 19.
+/// Returns `(1, 0)`: the process policy moved, nothing failed.
+///
+/// # Errors
+/// Returns the `setiopolicy_np` failure.
+pub fn escalate_io() -> io::Result<(u64, u64)> {
+    // SAFETY: `setiopolicy_np` takes three integers and no pointers.
+    if unsafe { setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, IOPOL_DEFAULT) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((1, 0))
+}
+
+/// The bytes this process's descendants have moved, for the starvation
+/// watcher. Darwin has no `/proc`: always 0, so only the agent's own
+/// counters count as progress there (M2 item 3).
+#[must_use]
+pub const fn descendant_io() -> u64 {
+    0
 }
 
 /// Whether the process runs at background priority: the `IOPOL_THROTTLE`

@@ -26,7 +26,7 @@ use super::adopt::{
     ancestor, foreign_shape, objects_of, prove_adoptable, rekey_refusal, Found, Scratch,
 };
 use super::{
-    check_linked, first_landing_target, head_of, lstat, prove, sides, Landing, Meta, Target,
+    check_linked, first_landing_target, head_of, lstat, planned, prove, Landing, Meta, Target,
 };
 use crate::{BulkloadRefusal, Result};
 
@@ -61,7 +61,9 @@ pub struct ItemRow {
     /// What `estate-apply` does here: `landing` (A5), and where A5's own
     /// checks refuse it, `ignore-policy-conflict`
     /// (`GIT_IGNORE_POLICY_CONFLICT`) or `parent-missing`
-    /// (`GIT_DESTINATION_PARENT_MISSING`); `bare-landing`
+    /// (`GIT_DESTINATION_PARENT_MISSING`: absent parents under a symlink or
+    /// a non-directory, which the apply never makes; M2 finding 1);
+    /// `bare-landing`
     /// (A11c), `adoptable` (A11a, A11d), `diverged`, `occupied-foreign`,
     /// `symlinked-path` and `occupied-shape` (`GIT_DESTINATION_OCCUPIED`
     /// before any proof, `adopt::foreign_shape`), `ledgered`,
@@ -69,7 +71,17 @@ pub struct ItemRow {
     /// `not-a-repository`, `not-at-path`.
     pub adopt: &'static str,
     /// The components that differ: `head`, `index`, `exclude`,
-    /// `seats=<n>`, `seat=<path>`, `unrelated`; `repository-absent` for a
+    /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
+    /// landing that makes `n` absent parents (M2 finding 1);
+    /// with `--beside SUFFIX`, `beside=<landing|ignore-policy-conflict|
+    /// landed|existing|occupied>:<path>` for a `diverged` item (what
+    /// `estate-apply --adopt --beside SUFFIX` does; M2 round 2 item c);
+    /// `exclude-union=<n>` for an `ignore-policy-conflict` that
+    /// `estate-apply --exclude-union` lands by appending `n` lines (items
+    /// of one repository each count them; the apply appends them once), or
+    /// `exclude-union-refused=<CODE>` where the flag refuses too (M2
+    /// round 2, item 2);
+    /// `repository-absent` for a
     /// first linked landing whose repository the apply's main item lands
     /// first (its exclude policy is not checked); or, for an occupied shape
     /// or a re-key `--adopt` refuses, its reason (`symlinked-path`,
@@ -110,32 +122,123 @@ fn occupied(row: &mut ItemRow, reason: &'static str) {
 // apply's main item lands it first: only the path is checked, and the row
 // says `repository-absent`). `GIT_IGNORE_POLICY_CONFLICT` is
 // `ignore-policy-conflict`, `GIT_DESTINATION_PARENT_MISSING`
-// `parent-missing`; any other refusal is the row's refusal.
+// `parent-missing`; any other refusal is the row's refusal. With the
+// verdict, how many absent parents the apply makes (M2 finding 1), and for
+// `ignore-policy-conflict` what `--exclude-union` would do: the component
+// `exclude-union=<lines>` it appends to land it (items of one repository
+// each count them; the apply appends them once), or
+// `exclude-union-refused=<CODE>` (M2 round 2, item 2).
 fn first_landing(
     staged: &super::super::StagedBundle,
     target: &Target<'_>,
     landing: &Landing<'_>,
-) -> Result<&'static str> {
+) -> Result<(&'static str, usize, Option<String>)> {
     let workspace = target
         .workspace
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-    let checked = if workspace == target.repository || lstat(target.repository)?.is_none() {
-        first_landing_target(staged, workspace).map(drop)
+    let checked = if workspace == target.repository || planned(target.repository)?.is_none() {
+        first_landing_target(staged, workspace)
     } else {
         check_linked(
             staged,
             (target.repository, target.base),
             workspace,
             target.source,
-            landing.observed_ns,
+            (landing.observed_ns, false),
         )
-        .map(drop)
+        .map(|checked| checked.destination)
     };
     match checked {
-        Ok(()) => Ok("landing"),
-        Err(BulkloadRefusal::GitIgnorePolicyConflict) => Ok("ignore-policy-conflict"),
-        Err(BulkloadRefusal::GitDestinationParentMissing) => Ok("parent-missing"),
+        Ok(first) => Ok(("landing", first.absent(), None)),
+        Err(BulkloadRefusal::GitIgnorePolicyConflict) => {
+            // M2 round 2, item 2: what `--exclude-union` would do, decided
+            // by the same check under its union rule (read-only).
+            let union = match check_linked(
+                staged,
+                (target.repository, target.base),
+                workspace,
+                target.source,
+                (landing.observed_ns, true),
+            ) {
+                Ok(checked) => format!("exclude-union={}", checked.exclude_union.len()),
+                // What the flag would refuse instead, by its code.
+                Err(refusal) => format!("exclude-union-refused={}", refusal.code()),
+            };
+            Ok(("ignore-policy-conflict", 0, Some(union)))
+        }
+        Err(BulkloadRefusal::GitDestinationParentMissing) => Ok(("parent-missing", 0, None)),
         Err(other) => Err(other),
+    }
+}
+
+// What `estate-apply --adopt --beside SUFFIX` does with a diverged item
+// (M2 round 2 item c): `beside=<verdict>:<path>`, the verdict `landing`
+// (absent: a linked landing; the shared exclude must already hold every
+// captured line), `ignore-policy-conflict` (absent, but the linked landing
+// would refuse `GIT_IGNORE_POLICY_CONFLICT`: a beside landing never appends
+// to the live repository's exclude), `landed` (this item's own landing of
+// this capture: nothing to land), `existing` (a standalone checkout no
+// ledger names: adopted if it proves equal, else refused occupied) or
+// `occupied` (`GIT_DESTINATION_OCCUPIED`, the ref namespace included); or
+// `beside-refused=<CODE>` for a suffix that names no namespace.
+fn beside_component(
+    workspace: &Path,
+    (common, captured_exclude): (&Path, &[u8]),
+    landing: &Landing<'_>,
+    (source, suffix): (&str, &str),
+    repository: &Path,
+) -> Result<String> {
+    let ns = match super::super::beside::namespace(suffix) {
+        Ok(ns) => ns,
+        Err(refusal) => return Ok(format!("beside-refused={}", refusal.code())),
+    };
+    let beside = super::super::beside::path(workspace, suffix);
+    let verdict = if super::super::beside::namespace_taken(repository, &ns)? {
+        "occupied"
+    } else if planned(&beside)?.is_none() {
+        let existing = match fs::read(common.join("info/exclude")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::converge::diff::beside",
+                ))
+            }
+        };
+        let fits = existing == captured_exclude
+            || super::super::exclude_union::missing(&existing, captured_exclude)
+                .is_ok_and(|missing| missing.is_empty());
+        if fits {
+            "landing"
+        } else {
+            "ignore-policy-conflict"
+        }
+    } else {
+        let ledger = match landed::worktree_git_dir(&beside)? {
+            Some(git_dir) => landed::read::<LandedWorkspace>(
+                &landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_LANDED),
+            )?,
+            None => None,
+        };
+        if ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.item == landing.item && ledger.capture == landing.capture)
+        {
+            "landed"
+        } else if ledger.is_none() && beside.join(".git").is_dir() {
+            "existing"
+        } else {
+            "occupied"
+        }
+    };
+    Ok(format!("beside={verdict}:{}", beside.display()))
+}
+
+// The component a first landing that makes `absent` parents carries.
+fn parents_component(row: &mut ItemRow, absent: usize) {
+    if absent > 0 {
+        row.components.push(format!("parents={absent}"));
     }
 }
 
@@ -144,12 +247,13 @@ fn first_landing(
 ///
 /// # Errors
 /// Whatever reading the destination or the capture refuses.
+#[allow(clippy::too_many_lines)]
 pub fn workspace(
     staged: &super::super::StagedBundle,
     target: &Target<'_>,
     landing: &Landing<'_>,
     since: Option<i128>,
-    (origins, items): (&[String], &[String]),
+    (origins, items, beside): (&[String], &[String], Option<&str>),
 ) -> Result<ItemRow> {
     let workspace = target
         .workspace
@@ -160,14 +264,19 @@ pub fn workspace(
         origin: "none",
         ..ItemRow::default()
     };
-    if lstat(workspace)?.is_none() {
+    if planned(workspace)?.is_none() {
         row.class = "source-only";
-        row.adopt = first_landing(staged, target, landing)?;
+        let (adopt, absent, union) = first_landing(staged, target, landing)?;
+        row.adopt = adopt;
+        parents_component(&mut row, absent);
+        if let Some(union) = union {
+            row.components.push(union);
+        }
         if standalone && row.adopt == "landing" {
             let scratch = Scratch::new(staged, None, target.base, target.source)?;
             row.origin = origin(&scratch, target.source, origins)?;
         }
-        if !standalone && lstat(target.repository)?.is_none() {
+        if !standalone && planned(target.repository)?.is_none() {
             row.components.push("repository-absent".to_owned());
         }
         return Ok(row);
@@ -235,6 +344,15 @@ pub fn workspace(
             row.class = "differs";
             row.adopt = "diverged";
             row.components = components;
+            if let Some(suffix) = beside {
+                row.components.push(beside_component(
+                    workspace,
+                    (&common, &meta.exclude(&scratch.repo)?),
+                    landing,
+                    (target.source, suffix),
+                    target.repository,
+                )?);
+            }
             row.hint = Some(hint(
                 &scratch.repo,
                 &head_of(workspace)?.oid,
@@ -268,7 +386,7 @@ fn ledgered(
         "ledgered-other-item"
     };
     let meta0 = Meta::read(workspace, target.source, &ledger.instance)?;
-    let old = sides(workspace, &meta0)?;
+    let old = super::handoff::landed_sides(workspace, git_dir, target.source, &meta0)?;
     let proved = match prove(workspace, common, ledger, standalone, &old) {
         Ok(_) => true,
         Err(BulkloadRefusal::GitDestinationModified) => false,
@@ -320,9 +438,18 @@ pub fn refs_only(
         origin: "none",
         ..ItemRow::default()
     };
-    if lstat(repo)?.is_none() {
+    if planned(repo)?.is_none() {
         row.class = "source-only";
         if staged.is_bare() {
+            // M2 finding 1: the bare landing's own parent check.
+            match super::super::parents::FirstTarget::of(repo) {
+                Ok(first) => parents_component(&mut row, first.absent()),
+                Err(BulkloadRefusal::GitDestinationParentMissing) => {
+                    row.adopt = "parent-missing";
+                    return Ok(row);
+                }
+                Err(other) => return Err(other),
+            }
             row.adopt = "bare-landing";
             let scratch = Scratch::new(staged, None, target.base, target.source)?;
             row.origin = origin(&scratch, target.source, origins)?;
@@ -464,20 +591,8 @@ fn ref_rows(
             continue;
         }
         let (here, there) = (native.get(name), carried.get(name));
-        let class = match (here, there) {
-            (Some(here), Some(there)) if here == there => "same",
-            (None, Some(_)) => "source-only",
-            (Some(_), None) => "dest-only",
-            (Some(here), Some(there)) => {
-                if ancestor(&scratch.repo, here, there)? {
-                    "source-ahead"
-                } else if ancestor(&scratch.repo, there, here)? {
-                    "dest-ahead"
-                } else {
-                    "diverged"
-                }
-            }
-            (None, None) => continue,
+        let Some(class) = ref_class(&scratch.repo, here, there)? else {
+            continue;
         };
         let decision = native_refs::decide(Input {
             native: here.map(String::as_str),
@@ -494,6 +609,33 @@ fn ref_rows(
         });
     }
     Ok(rows)
+}
+
+/// One ref's class, by ancestry in `repo` (which holds both values):
+/// `same`, `source-only`, `dest-only`, `source-ahead` (the destination's
+/// tip is an ancestor of the carried one), `dest-ahead` or `diverged`;
+/// `None` when neither side has it. `estate-diff`'s ref rows and the
+/// hand-off block (TIN-6569) share it.
+pub(super) fn ref_class(
+    repo: &Path,
+    here: Option<&String>,
+    there: Option<&String>,
+) -> Result<Option<&'static str>> {
+    Ok(Some(match (here, there) {
+        (Some(here), Some(there)) if here == there => "same",
+        (None, Some(_)) => "source-only",
+        (Some(_), None) => "dest-only",
+        (Some(here), Some(there)) => {
+            if ancestor(repo, here, there)? {
+                "source-ahead"
+            } else if ancestor(repo, there, here)? {
+                "dest-ahead"
+            } else {
+                "diverged"
+            }
+        }
+        (None, None) => return Ok(None),
+    }))
 }
 
 // A two-way hint from the HEADs alone.

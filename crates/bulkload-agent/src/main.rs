@@ -20,7 +20,7 @@ bulkload-agent -- ordinary-file transport and offline SQLite composition
 
 USAGE:
     bulkload-agent [--durability=group|strict] [--min-free-percent=N]
-                   [--priority=background|normal]
+                   [--priority=background|normal|auto] [--escalate-after=SECONDS]
                    [--source-ledger-sync=relaxed|full]
                    [--sqlite=refuse|snapshot] <SUBCOMMAND>
 
@@ -56,11 +56,17 @@ SUBCOMMANDS:
                 Append an explicit reviewed item; no automatic worktree proliferation
     estate-show PLAN
                 Print the exact selected sources, repositories and restore targets
+    estate-retarget PLAN CORPUS --map OLD=NEW [--map OLD=NEW]...
+                Re-point the plan's repositories and workspaces (longest
+                component prefix OLD becomes NEW; sources never change) and
+                re-key each moved item's capture record in CORPUS, so the next
+                capture reuses it and reads no source byte (M2 item 5). The
+                plan as it was is kept as PLAN.before-retarget-<digest>
     estate-add-batch PLAN SOURCE DEST WORKSPACE_OR_DASH [SOURCE DEST WORKSPACE_OR_DASH ...]
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply [--adopt] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+    estate-apply [--adopt] [--exclude-union] [--beside SUFFIX] [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces.
                 A landed checkout bulkload proves unchanged converges to the
                 current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
@@ -81,8 +87,52 @@ SUBCOMMANDS:
                 lands a bare repository bulkload makes (with or without
                 --adopt). --activate-origin PREFIX (repeatable): a first landing
                 activates an scp-style or ssh:// origin starting with PREFIX
-                (never a local path); otherwise only HTTPS origins are active
-    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+                (never a local path); otherwise only HTTPS origins are active.
+                --exclude-union (M2 round 2): a first linked landing whose
+                repository's common info/exclude is not the capture's appends
+                the captured lines it lacks instead of refusing
+                GIT_IGNORE_POLICY_CONFLICT: a recorded write (STATE
+                ITEM-SOURCE.exclude-union; receipt exclude-appended=N) that never
+                removes or reorders a line and changes what EVERY worktree of the
+                repository ignores. Where a line would be appended it still
+                refuses for a negation (!pattern) on either side, an exclude a
+                bulkload ledger owns, a symlinked info or an exclude that is not
+                a regular file with one link this user owns.
+                --beside SUFFIX (M2 round 2; requires --adopt): a workspace
+                item whose existing checkout the adopt proof refuses
+                GIT_DESTINATION_DIVERGED is left as it is and the capture lands
+                at the workspace path with SUFFIX appended (as estate-carry-files
+                --beside SUFFIX), a detached linked worktree of the planned
+                repository (never appending to its shared info/exclude), or an
+                equal standalone checkout already there is adopted in place.
+                Every captured ref goes in as refs/NS/NAME and each stash entry
+                as refs/NS-stash/N (NS: SUFFIX without its leading '.', one
+                plain ref component), create-only, recorded write-ahead in STATE
+                ITEM-SOURCE.beside; outcome and journal workspace-beside, closure
+                applied-beside. A beside path or ref namespace holding anything
+                else, or a captured ref kept at another value, refuses
+                GIT_DESTINATION_OCCUPIED.
+                --side-root ROOT (repeatable; M2r2 item e; needs --adopt):
+                after the preflights and before any item, each planned path
+                spelled through a symlink whose one hop names a directory
+                inside ROOT (not nested with another seat's target or a
+                planned path) is seated: one exchange gives the live path the
+                directory (same inode, no byte copied) and a link back
+                replaces the side-root path, recorded in PRIVATE_STATE
+                (`seat live= target= outcome=seated|seat-resumed|unseated|refused
+                reason=`; an interrupted seat or undo is finished first); the
+                items then adopt or re-key at the live path, and a seat stays
+                if they refuse
+    estate-unseat PRIVATE_STATE [LIVE ...]
+                M2r2 item e: undo each seat estate-apply --side-root recorded in
+                PRIVATE_STATE (or only those of the LIVE paths given): the
+                directory back at its side-root path (the same inode), the
+                link back at the live path with its own text, the record
+                removed (the record is marked unseating first, so an
+                interrupted undo is finished, never re-seated). Refuses
+                RECEIPT_BINDING_INVALID, changing no path, when either path no
+                longer holds what the seat left.
+    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... [--beside SUFFIX] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
                 ledger; differs with a hint without one), with what estate-apply
@@ -92,13 +142,88 @@ SUBCOMMANDS:
                 plus worktrees of planned repositories no item plans and, with
                 --scan, Git directories under DIR in no planned family
                 (dest-only). One bulkload.estate-diff.v1 JSON line per row
-    closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+    estate-handoff [--check | --clear [--clear-carried] | --dry-run] [--item ID]...
+                [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
+                [--readme] [--renew] [--as-of NS] PLAN CORPUS PRIVATE_STATE SOURCE
+                TIN-6569, OI-1003-Q183: write a dated hand-off block at byte 0 of
+                AGENTS.md and CLAUDE.md in each landed workspace (absolute paths,
+                capture and landing facts, estate-diff's ref classes, the commands
+                to converge and consolidate before any other work), recorded in
+                its own ledger beside workspace.landed so estate-apply keeps an
+                intact block instead of refusing the seat (and re-renders it
+                after a converge). A missing target is
+                created untracked; an existing AGENTS.override.md is prefixed too;
+                README.md only with --readme; neither is ever created. The block
+                is written whatever the repository's remotes (OI-1003-Q188); no
+                URL is read for it or printed. A symlink other than one target
+                to another refuses HANDOFF_TARGET_UNSUPPORTED; an edited block of
+                this landing's HANDOFF_BLOCK_MODIFIED; an unlanded item
+                HANDOFF_NOT_LANDED; all with nothing written. A block another
+                landing rendered, or one of this landing's that the target's
+                landed blob itself starts with (a round trip; each carried with
+                the source's bytes, whatever is written below it since) is
+                content: kept below this one, never cleared unless --clear
+                --clear-carried asks (OI-1003-Q190: a recorded edit of landed
+                content that converge accepts); a block of this landing's that
+                its record does not name and the landed blob does not start
+                with is an edited block. --check is read-only (state, open
+                rows, ready: the commit rules and a clean working tree, read
+                with no filter driver run, in the live sibling and in each
+                destination-only worktree) and exits HANDOFF_MARKER_COMMITTED
+                when a token line the source's history never added is staged
+                or added by a commit the carried capture does not reach (any
+                branch, tag, remote-tracking ref, stash entry or HEAD; a token
+                already in the source's history is reported as
+                source_history, OI-1003-Q191); --clear restores the bytes and
+                finishes a crashed clear; --dry-run prints the blocks. A rerun
+                keeps the options the record was rendered with unless they are
+                given again; an unchanged rerun reads and writes nothing. One
+                JSON line per workspace (schema bulkload.estate-handoff.v1, the
+                verb's own name)
+    estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--bind ID=DEST_STATE]...
+                [--bind-only] [--recarry]
+                [--host HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
+                PLAN CORPUS PRIVATE_STATE SOURCE CARRY_STATE
+                M2r2 b: carry each planned item whose capture refused (no
+                capture record; its outcome CAPTURE_ABSENT) as files,
+                byte-exact, by one recorded transfer session (`copy`, or
+                `pull` from HOST with the remote source state under DIR) into
+                its workspace, or beside it (the workspace path with SUFFIX
+                appended), the session recorded in CARRY_STATE/<item>/dest.
+                An equal destination file is adopted; a differing one is
+                refused and never overwritten, and the item is then not
+                carried. --bind ID=DEST_STATE binds an item to a session
+                this transport already recorded in DEST_STATE (same source,
+                same destination, completed, no refused path) instead of
+                running one: nothing is transferred or written under the
+                destination. Whatever landed, each directory below the
+                destination holding a `.git` entry is resolved as Git
+                resolves it (rev-parse, object alternates, symlinks in its
+                administration); anything outside the carried tree refuses
+                GIT_CARRY_POINTER_ATTACHED (the bytes stay for review). A
+                carried item gets a `{item}-{blake3(SOURCE)}.carried` record
+                and the outcome carried-as-files, which closure-report counts
+                `carried` while the transfer record and the `.git`
+                resolutions prove it. A refs-only item rides on a carried
+                workspace item of the same source (via=). Every --item and
+                --bind must name a planned eligible item (a bind, a workspace
+                item), or the run refuses FIELD_DOMAIN_VIOLATION before any
+                write; --bind-only refuses a selected workspace item with no
+                bind. An item already carried whose carry still proves is
+                kept with no session unless --recarry or a bind for it asks;
+                a rerun that does not carry an item that was carried writes
+                CAPTURE_ABSENT back (and for refs-only items riding on it).
+                --dry-run reads only and prints what each item would do.
+                One line per item
+    closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] [--omissions-from-destination] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
                 are mapped) and journals (later directories override earlier
                 outcome records), with SOURCE the label estate-apply was
-                given. Prints a bulkload.closure.v4 JSON ledger: every planned
+                given. Prints a bulkload.closure.v5 JSON ledger: every planned
                 item is applied (workspace, exact current-capture journal),
+                applied-beside (estate-apply --beside landed the capture beside
+                a differing workspace; exact workspace-beside journal),
                 refused-pending-review (typed code; a bare IO or FRAME_CODEC
                 is not typed, nor is a code retired from the taxonomy),
                 refused (a typed code a review disposes), or referenced-only
@@ -107,8 +232,15 @@ SUBCOMMANDS:
                 the native one. `gate` is S4: every item accounted and every
                 typed refusal reviewed, so it can fail while `verdict`
                 passes and `unaccounted` is 0; it exits nonzero with
-                CLOSURE_UNACCOUNTED when it fails.
+                CLOSURE_UNACCOUNTED when it fails. The omissions block
+                reads each capture's .omissions sidecar; a capture from
+                before it is read from its bundle's header (no omission ref:
+                zero roots), and why an item stays unknown is printed on
+                stderr (omissions-unknown REASON=N ...).
                 Options, only before PLAN, each at most once:
+                --omissions-from-destination: for a capture from before the
+                sidecar whose bundle names an omission list, read that list
+                by oid from the item's destination repository (reads only).
                 --attest LEDGER.json: join a bulkload.closure-ledger.v1
                 attestation ledger for items closed by audit, not by a verb.
                 The ledger must name this PLAN and SOURCE (plan,
@@ -163,6 +295,115 @@ SUBCOMMANDS:
                 since = now when absent (create it when the run, or its
                 closing pass, starts). Paths are named as copy and pull
                 record them
+    estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
+                  [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
+                  [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
+                  [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
+                  [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
+                  [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
+                  [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
+                  [--rebind-landing OLD=NEW]... [--undo]
+                  [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
+                R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
+                .claude and .codex, the run's copy of SOURCE_HOME's) into
+                DEST_HOME's live .claude and .codex, so claude --resume and
+                codex resume in each lane's destination directory list and
+                resume them, byte-identical. A lane maps a source working
+                directory to a destination one: --map SRC=DST (longest prefix
+                first), the plan's items with --lanes-from-plan, else the same
+                path under the home's git directory, at its real path. Claude
+                transcripts go to projects/<key of the real destination cwd>/
+                as regular files with their source mtime, with their sidecar
+                directory, per-session state and plans; Codex rollouts go to
+                the same place under .codex as plain .jsonl (a .jsonl.zst is
+                decompressed: Codex resumes a paginated thread only from the
+                plain file) and their thread rows are inserted into its
+                state_5.sqlite with the destination cwd (insert only; a row
+                the destination already holds is never changed). A rollout
+                with no snapshot row is placed with a row built from its
+                header (OI-1003-Q198 D; RESEAT_INDEX_ROW_ABSENT when it cannot
+                fill one); a destination row or rollout form for a thread is
+                the destination's, nothing placed: destination-adopted when
+                the file its row names holds the landed lines, else
+                destination-holds (a file there, unproved) or
+                destination-row-only (a row only), proof named, and
+                RESEAT_INDEX_CONFLICT for a row naming another file. Every
+                existing row whose cwd is spelled through the home's git or a
+                --map symlink gets its cwd column re-spelled to the canonical
+                path, lane or not, ledgered (OI-1003-Q198 (1); --no-respell;
+                --check counts them). Symlinked destination transcripts
+                (projects/*/*.jsonl) are first regularized into regular-file
+                copies of their targets with the targets' mtime, the targets
+                kept, ledgered (OI-1003-Q198 (2); --no-regularize); a target
+                written during it is RESEAT_REGULARIZE_RACED with both copies
+                kept (the line's kept field names a copy kept aside).
+                --rebind-landing OLD=NEW (repeatable; A-106 follow-up): a
+                placement row naming a landed file under OLD (as the rows
+                spell it; OLD may be gone) is re-bound to the same file under
+                NEW (must exist) instead of a collision, only when the row is
+                this STATE's own (placed, adopted or continued), the
+                destination is the single-link regular file it last wrote,
+                and the bytes it placed are proved NEW's file's first bytes
+                (BLAKE3 against the row's digest, or the destination's own
+                read by descriptor): exactly them, rebound (nothing written);
+                longer, re-bound then extended as usual; never inferred from
+                size. --undo puts each rebind back (ledger only).
+                --replace-archived-dest ROOT (repeatable; A-106: the landed
+                version wins, the fork stays in the archive): a destination
+                transcript, subagent sidecar or rollout that is a symlink
+                whose fully resolved target is a regular file under ROOT's
+                real path, and whose landed file is a fork of that target,
+                is replaced by the landed file (staged beside it with its
+                mtime, sealed, exchanged atomically, directory sealed),
+                outcome replaced-archived; the link text, the target's real
+                path, identity and BLAKE3 are ledgered first, the target is
+                verified unchanged before and after the exchange and never
+                written or removed; an equal landing leaves the link
+                (occupied), a landing that is a prefix of the target too
+                (dest-ahead), and a target a process holds open stays
+                (occupied); a ROOT overlapping the live .claude or .codex
+                (or containing DEST_HOME) is refused FIELD_DOMAIN_VIOLATION;
+                links into ROOT are not regularized; --check counts
+                replaced_archived, replace_pending, replace_equal_size and
+                replace_proved. Run it, and its --undo, with no live session
+                on the destination. --undo
+                puts back every symlink and old cwd this STATE changed, where
+                the destination still holds exactly what re-seat wrote and
+                the archive target holds the recorded bytes (else
+                RESEAT_UNDO_TARGET_CHANGED, nothing changed). Home
+                and /private/tmp (and /tmp) sessions are placed resumable by
+                ID (OI-1003-Q198 C; --by-id DIR adds a prefix,
+                --no-default-by-id drops the defaults). One run at a time:
+                each destination root and STATE are flocked (RESEAT_LOCKED);
+                the engine's --min-free-percent floor holds for the bytes a
+                pass would write (DESTINATION_SPACE_INSUFFICIENT). JSON Lines are placed and extended
+                in whole lines only. Never overwrites: a copy already there is
+                adopted when equal, extended when a byte prefix (append-only
+                files), and otherwise kept and reported (RESEAT_DEST_DIVERGED);
+                a placed file changed at the destination is the destination's
+                from then on (RESEAT_DEST_CONTINUED, RESEAT_EXTEND_RACED);
+                two landed files for one destination path are
+                RESEAT_LANE_COLLISION. Every placement is ledgered in
+                STATE/reseat.sqlite: an unchanged rerun reads 0 landed bytes
+                (read_reseat_landing_bytes) and a later pass proves the placed
+                bytes and appends only what grew. Refuses before writing:
+                RESEAT_LANDING_ABSENT (a landed .claude or .codex missing; use
+                --no-claude / --no-codex), RESEAT_RETENTION_UNSAFE (the
+                smallest cleanupPeriodDays of the destination's managed, user
+                and lane settings would delete a re-seated file within
+                --retention-margin-days, default 365), RESEAT_INDEX_ABSENT (no
+                destination Codex index to register in). --unmapped=by-id
+                places sessions with no lane under their source key / cwd,
+                resumable by ID only (default: report). --check is the
+                read-only R0 acceptance check: per lane, the transcripts and
+                rollouts the pickers read there hold the landed ones (exactly,
+                or continued at the destination), Git is estate-diff identical
+                (--plan, or --sessions-only to waive), the hand-off note holds
+                the marker (--note-marker); every session or thread without a
+                lane, or failed by ID, fails it unless --waive (or
+                --waive-from, one ID per line) names it; exits RESEAT_R0_FAILED
+                unless all of that holds and something was checked. One
+                bulkload.estate-reseat.v1 JSON line per row
     git-import REPO BUNDLE SOURCE
                 Preserve bundle refs in a content-addressed carry namespace
     git-restore BUNDLE ABSENT_DEST SOURCE
@@ -209,18 +450,34 @@ BOUNDARIES:
     pull passes full to serve.
     --min-free-percent=N (0-100, default 25): DESTINATION_SPACE_INSUFFICIENT
     when planned bytes would leave the destination filesystem (statvfs) with
-    less than N% free. copy/pull refuse each entry that does not fit, as a
+    less than N% free, or, inside a project-quota tree (where statvfs
+    reports the quota; Linux), the quota with less than N% of its limit
+    free. The refusal says which limit bound and both numbers (a
+    space_refusal line; counters space_refused_filesystem and
+    space_refused_quota). copy/pull refuse each entry that does not fit, as a
     value, before requesting its content: the bytes of every entry decided
     and not yet Held count against a probe refreshed on each group commit,
     so the session continues and stays resumable. estate-apply refuses before
-    any item, planning bundle sizes (a lower bound).
-    --priority=background|normal (WP0(f)): serve, estate-capture, snapshot,
+    any item, planning the bundle bytes each destination repository does not
+    already hold (a lower bound).
+    --priority=background|normal|auto (WP0(f)): serve, snapshot,
     git-carry-estimate, git-export and copy read a live source, so they enter
     background CPU and IO priority before anything else (Linux nice 19 and the
     idle IO class; Darwin IOPOL_THROTTLE, QOS_CLASS_BACKGROUND and nice 19),
     inherited by every thread and child; other verbs run at normal priority.
-    --priority=normal is the explicit opt-out (gate (a)); every counters line
-    records priority= and priority_from=default|flag.
+    estate-capture defaults to auto (M2 item 3): background when a terminal
+    was read or written within 300 s, normal otherwise. --priority=normal is
+    the explicit opt-out (gate (a)); every counters line records priority=
+    and priority_from=default|flag|auto (and priority_auto=idle|interactive|
+    unknown).
+    --escalate-after=SECONDS (M2 item 3; estate-capture's default 300, any
+    other verb only when given; 0 off): a process at background priority
+    whose counters (and, on Linux, its descendants' IO) do not move for
+    SECONDS moves its IO (Linux: and its descendants') back to the class its
+    nice value implies, once; the counters line then says
+    priority_escalate_after=SECONDS, and priority_escalations,
+    priority_escalated_ns, priority_escalated_threads and
+    priority_escalation_failures record it.
     copy/pull require an existing destination directory.
     copy/pull replace only their own untouched outputs, when the source seat
     changed (superseding publish, WP0(d)); any other divergent destination
@@ -230,7 +487,9 @@ BOUNDARIES:
     DESTINATION_EXCHANGE_UNSUPPORTED before it is staged. With
     --sqlite=refuse (the default) they refuse live SQLite files, sniffing
     each once (source_sniff_bytes on the counters line) and remembering the
-    refusal, and every -wal, -shm and -journal by name.
+    refusal, and every -wal, -shm and -journal by name, except a Git ref or
+    reflog so named: below a directory named refs or logs, reading as a ref
+    or a reflog line, beside no SQLite database (M2r2).
     --sqlite=snapshot (#218; copy and pull, carried to serve in its Open):
     a database is carried as a backup-API snapshot the source takes into its
     private state (SOURCE_STATE/sqlite-snapshots, at most 4 GiB of slots
@@ -241,7 +500,7 @@ BOUNDARIES:
     magic beside a -wal that holds frames (an encrypted store) is refused
     SQLITE_STATE_CHANGED, never carried raw. An unchanged store is reused with nothing opened: its key is its
     row and its -wal's identity. A -wal, -shm or -journal beside a database
-    is never carried: it is covered when its database was carried as a
+    (a Git ref or reflog so named aside) is never carried: it is covered when its database was carried as a
     snapshot, and refused SQLITE_STATE_CHANGED otherwise. A changed store
     supersedes its own older snapshot output through the same exchange
     (OI-1003-Q146) only when no -wal, -journal or -shm sits beside the
@@ -321,7 +580,8 @@ COUNTERS:
 /// Verbs that read a live source on the host they run on. Each enters
 /// background CPU and IO priority before anything else unless
 /// `--priority=normal` opts out, and the opt-out is recorded (WP0(f),
-/// OI-1003-Q17). `copy` is here because it reads the source in-process (it is
+/// OI-1003-Q17), except the [`AUTO_VERBS`], whose default is `auto` (M2
+/// item 3). `copy` is here because it reads the source in-process (it is
 /// gate (a)'s verb); `pull` is not, since its source half is the remote
 /// `serve`.
 const SOURCE_SIDE_VERBS: &[&str] = &[
@@ -333,31 +593,71 @@ const SOURCE_SIDE_VERBS: &[&str] = &[
     "copy",
 ];
 
+/// Verbs whose default class is `auto` (M2 item 3): background when a
+/// person is at the host, normal otherwise (`priority::presence`).
+const AUTO_VERBS: &[&str] = &["estate-capture"];
+
+/// A `--priority=` value: a class, or `auto`.
+#[derive(Clone, Copy)]
+enum Requested {
+    Class(bulkload_agent::priority::PriorityClass),
+    Auto,
+}
+
+impl std::str::FromStr for Requested {
+    type Err = BulkloadRefusal;
+
+    fn from_str(value: &str) -> Result<Self> {
+        if value == "auto" {
+            Ok(Self::Auto)
+        } else {
+            value.parse().map(Self::Class)
+        }
+    }
+}
+
 /// Where a verb's priority class came from, as its counters line records it.
 #[derive(Clone, Copy)]
 struct Priority {
     class: bulkload_agent::priority::PriorityClass,
     /// `true` when `--priority=` chose it, `false` for the verb's default.
     explicit: bool,
+    /// What `auto` found, when the class came from it.
+    auto: Option<bulkload_agent::priority::Presence>,
+    /// The starvation watcher's threshold in seconds, when one runs.
+    escalate_after: Option<u64>,
 }
 
 impl Priority {
     fn render(self) -> String {
-        format!(
-            "priority={} priority_from={}",
-            self.class.label(),
-            if self.explicit { "flag" } else { "default" }
-        )
+        let from = match (self.auto, self.explicit) {
+            (Some(_), _) => "auto",
+            (None, true) => "flag",
+            (None, false) => "default",
+        };
+        let mut line = format!("priority={} priority_from={from}", self.class.label());
+        if let Some(presence) = self.auto {
+            line.push_str(" priority_auto=");
+            line.push_str(presence.label());
+        }
+        if let Some(after) = self.escalate_after {
+            use std::fmt::Write as _;
+            let _ = write!(line, " priority_escalate_after={after}");
+        }
+        line
     }
 }
 
 fn main() -> ExitCode {
-    use bulkload_agent::priority::PriorityClass;
     let started = std::time::Instant::now();
     // OI-1001-Q2: the binary keeps a 25% free-space floor unless told otherwise.
     bulkload_agent::space::set_min_free_percent(bulkload_agent::space::DEFAULT_MIN_FREE_PERCENT);
     let mut requested = None;
-    let mut args = match global_flags(std::env::args_os().skip(1).collect(), &mut requested) {
+    let mut escalate_after = None;
+    let mut args = match global_flags(
+        std::env::args_os().skip(1).collect(),
+        (&mut requested, &mut escalate_after),
+    ) {
         Ok(args) => args.into_iter(),
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}\n\n{USAGE}");
@@ -371,22 +671,13 @@ fn main() -> ExitCode {
         .unwrap_or("")
         .to_owned();
     // WP0(f): before any thread or child exists, so all of them inherit it.
-    let priority = Priority {
-        class: requested.unwrap_or_else(|| {
-            if SOURCE_SIDE_VERBS.contains(&verb.as_str()) {
-                PriorityClass::Background
-            } else {
-                PriorityClass::Normal
-            }
-        }),
-        explicit: requested.is_some(),
-    };
-    if priority.class == PriorityClass::Background {
-        if let Err(refusal) = bulkload_agent::priority::enter_background() {
+    let priority = match enter_priority(&verb, requested, escalate_after, started) {
+        Ok(priority) => priority,
+        Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}");
             return ExitCode::FAILURE;
         }
-    }
+    };
     // macOS starts at 256 open files; take the hard limit the host allows.
     let _ = bulkload_agent::limits::raise_descriptor_limit();
     let outcome = match command.as_ref().and_then(|value| value.to_str()) {
@@ -419,12 +710,15 @@ fn main() -> ExitCode {
         }
         Some(
             name @ ("estate-add" | "estate-add-batch" | "estate-show" | "estate-capture"
-            | "estate-apply" | "estate-diff"),
+            | "estate-apply" | "estate-diff" | "estate-handoff" | "estate-retarget"
+            | "estate-unseat"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
+        Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
+        Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
         Some("serve") => {
             let (input, output) = (std::io::stdin(), std::io::stdout());
             bulkload_agent::transfer::tune_stream(&input);
@@ -452,17 +746,86 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}");
+            // M2 round 2, item 1: which limit refused, and both numbers;
+            // only for this verb's own space refusal, and once (review A3).
+            if refusal == BulkloadRefusal::DestinationSpaceInsufficient {
+                if let Some(space) = bulkload_agent::space::take_refusal() {
+                    eprintln!("bulkload-agent: space: {}", space.fields());
+                }
+            }
             ExitCode::FAILURE
         }
     }
 }
 
+/// The verb's class: `requested`, or its default; entered before any
+/// thread or child exists, so all of them inherit it (WP0(f)). M2 item 3:
+/// `auto` (estate-capture's default) is background only when a person is at
+/// the host, and a background process of an `auto` verb, or of any verb
+/// given `--escalate-after`, starts the bounded-starvation watcher.
+fn enter_priority(
+    verb: &str,
+    requested: Option<Requested>,
+    escalate_after: Option<u64>,
+    started: std::time::Instant,
+) -> Result<Priority> {
+    use bulkload_agent::priority::PriorityClass;
+    let wanted = requested.unwrap_or_else(|| {
+        if AUTO_VERBS.contains(&verb) {
+            Requested::Auto
+        } else if SOURCE_SIDE_VERBS.contains(&verb) {
+            Requested::Class(PriorityClass::Background)
+        } else {
+            Requested::Class(PriorityClass::Normal)
+        }
+    });
+    let priority = match wanted {
+        Requested::Class(class) => Priority {
+            class,
+            explicit: requested.is_some(),
+            auto: None,
+            escalate_after: None,
+        },
+        Requested::Auto => {
+            let presence = bulkload_agent::priority::presence();
+            Priority {
+                class: presence.class(),
+                explicit: requested.is_some(),
+                auto: Some(presence),
+                escalate_after: None,
+            }
+        }
+    };
+    let mut priority = priority;
+    if priority.class == PriorityClass::Background {
+        bulkload_agent::priority::enter_background()?;
+        // Escalation is on by default only for the `auto` verbs; any other
+        // verb keeps WP0(f) as ratified unless the flag asks for it.
+        let after = escalate_after.or_else(|| {
+            AUTO_VERBS
+                .contains(&verb)
+                .then_some(bulkload_agent::priority::DEFAULT_ESCALATE_SECS)
+        });
+        if let Some(after) = after.filter(|after| *after > 0) {
+            // After the class is set, so the watcher inherits it like any
+            // other thread.
+            bulkload_agent::priority::watch_starvation(
+                std::time::Duration::from_secs(after),
+                started,
+            );
+            priority.escalate_after = Some(after);
+        }
+    }
+    Ok(priority)
+}
+
 /// Remove `--durability=MODE`, `--source-ledger-sync=MODE` and
 /// `--min-free-percent=N` from the arguments and apply them process-wide,
-/// and `--priority=CLASS` into `priority`.
+/// `--priority=CLASS|auto` into `priority` and `--escalate-after=SECONDS`
+/// into `escalate_after`.
 fn global_flags(
     args: Vec<std::ffi::OsString>,
-    priority: &mut Option<bulkload_agent::priority::PriorityClass>,
+    (priority, escalate_after): (&mut Option<Requested>, &mut Option<u64>),
 ) -> Result<Vec<std::ffi::OsString>> {
     let mut rest = Vec::with_capacity(args.len());
     for arg in args {
@@ -471,6 +834,17 @@ fn global_flags(
             .and_then(|value| value.strip_prefix("--priority="))
         {
             *priority = Some(class.parse()?);
+            continue;
+        }
+        if let Some(seconds) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--escalate-after="))
+        {
+            *escalate_after = Some(
+                seconds
+                    .parse()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?,
+            );
             continue;
         }
         if let Some(mode) = arg
@@ -519,8 +893,21 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut dispositions = None;
     let mut manifest = None;
     let mut transfers = Vec::new();
+    let mut read_destinations = false;
     let mut positional = args;
     loop {
+        // M2 round 2, d: read a pre-sidecar capture's omission list from its
+        // destination repository's objects; only before PLAN.
+        if let [flag, rest @ ..] = positional {
+            if flag == "--omissions-from-destination" {
+                if read_destinations {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
+                read_destinations = true;
+                positional = rest;
+                continue;
+            }
+        }
         // WP3 PR 4: `--transfer DEST_STATE`, repeatable, also only before PLAN.
         if let [flag, state, rest @ ..] = positional {
             if flag == "--transfer" {
@@ -559,8 +946,13 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     }
     let source = source.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
     let states: Vec<PathBuf> = states.iter().map(PathBuf::from).collect();
-    let ledger =
-        bulkload_agent::estate::ledger(Path::new(plan), Path::new(corpus), source, &states)?;
+    let ledger = bulkload_agent::estate::ledger_with(
+        Path::new(plan),
+        Path::new(corpus),
+        source,
+        &states,
+        read_destinations,
+    )?;
     let mut report = bulkload_agent::closure::Report::from_ledger(&ledger);
     join_transfer_inputs(
         &mut report,
@@ -585,6 +977,17 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{}", report.to_json()).refuse_at("main::closure_command")?;
     stdout.flush().refuse_at("main::closure_command")?;
+    // M2 round 2, d: why each unknown item's omissions are unknown.
+    if !report.omissions.unknown_because.is_empty() {
+        let reasons = report
+            .omissions
+            .unknown_because
+            .iter()
+            .map(|(reason, items)| format!("{reason}={items}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("omissions-unknown {reasons}");
+    }
     report.gate()
 }
 
@@ -1064,6 +1467,46 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         Ok(())
     };
     match command {
+        "estate-retarget" => {
+            let mut positional = Vec::new();
+            let mut maps = Vec::new();
+            let mut rest = args.iter();
+            while let Some(arg) = rest.next() {
+                if arg.to_str() == Some("--map") {
+                    let value = rest
+                        .next()
+                        .and_then(|value| value.to_str())
+                        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+                    let (old, new) = value
+                        .split_once('=')
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                    maps.push((PathBuf::from(old), PathBuf::from(new)));
+                } else {
+                    positional.push(Path::new(arg));
+                }
+            }
+            let [plan, corpus] = positional[..] else {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            };
+            if maps.is_empty() {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            }
+            let mut output = std::io::stdout().lock();
+            for row in estate::retarget(plan, corpus, &maps)? {
+                writeln!(
+                    output,
+                    "item={} was={} source={:?} repository={:?} workspace={:?} capture={}",
+                    row.now_id,
+                    row.was_id,
+                    row.now.source,
+                    row.now.repository,
+                    row.now.workspace,
+                    row.capture
+                )
+                .refuse_at("main::estate_command")?;
+            }
+            output.flush().refuse_at("main::estate_command")
+        }
         "estate-show" if args.len() == 1 => {
             let mut output = std::io::stdout().lock();
             for item in estate::inspect(path(0)?)? {
@@ -1123,22 +1566,33 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                 .get(3)
                 .and_then(|arg| arg.to_str())
                 .ok_or(BulkloadRefusal::FieldDomainViolation)?;
-            estate::apply_with(
+            estate::apply_reporting(
                 path(0)?,
                 path(1)?,
                 path(2)?,
                 source,
-                jobs()?,
-                &estate::ApplyOptions {
-                    adopt: options.adopt,
-                    activate_origin: options.activate_origin,
-                },
+                (
+                    jobs()?,
+                    &estate::ApplyOptions {
+                        adopt: options.adopt,
+                        activate_origin: options.activate_origin,
+                        side_roots: options.side_roots,
+                        exclude_union: options.exclude_union,
+                        beside: options.beside,
+                    },
+                ),
                 &receipt,
+                // TIN-6569: the H step's line, after every item's receipt.
+                &mut |line| {
+                    let mut output = std::io::stdout().lock();
+                    writeln!(output, "{line}").refuse_at("main::estate_command")?;
+                    output.flush().refuse_at("main::estate_command")
+                },
             )
         }
         "estate-diff" => {
             let (options, rest) = estate_options(args)?;
-            if rest.len() < 4 || options.adopt {
+            if rest.len() < 4 || options.adopt || options.exclude_union {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let source = rest
@@ -1156,14 +1610,373 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     since: options.since,
                     scan: options.scan,
                     activate_origin: options.activate_origin,
+                    beside: options.beside,
+                    side_roots: options.side_roots,
                 },
                 &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
             )
             .map(drop)?;
             output.flush().refuse_at("main::estate_command")
         }
+        "estate-unseat" if !args.is_empty() => {
+            let lives: Vec<PathBuf> = args.iter().skip(1).map(PathBuf::from).collect();
+            let mut output = std::io::stdout().lock();
+            estate::unseat(path(0)?, &lives, &mut |line| {
+                writeln!(output, "{line}").refuse_at("main::estate_command")
+            })?;
+            output.flush().refuse_at("main::estate_command")
+        }
+        "estate-handoff" => {
+            let (options, rest) = handoff_options(args)?;
+            if rest.len() != 4 {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            }
+            let path = |i: usize| -> Result<&Path> {
+                rest.get(i)
+                    .map(Path::new)
+                    .ok_or(BulkloadRefusal::RequiredFieldMissing)
+            };
+            let source = rest
+                .get(3)
+                .and_then(|arg| arg.to_str())
+                .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+            let mut output = std::io::stdout().lock();
+            let outcome = estate::handoff(
+                path(0)?,
+                path(1)?,
+                path(2)?,
+                source,
+                &options,
+                &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
+            );
+            output.flush().refuse_at("main::estate_command")?;
+            outcome.map(drop)
+        }
         _ => Err(BulkloadRefusal::RequiredFieldMissing),
     }
+}
+
+// R0 (TIN-6587): re-seat landed agent sessions, or check that they hold.
+#[allow(clippy::too_many_lines)]
+fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::reseat::{self, GitCheck, Unmapped};
+    let mut check = false;
+    let mut maps = Vec::new();
+    let mut from_plan = false;
+    let (mut plan, mut corpus, mut source) = (None, None, None);
+    let mut states = Vec::new();
+    let mut roots = Vec::new();
+    let (mut landing_claude, mut landing_codex) = (None, None);
+    let mut unmapped = Unmapped::Report;
+    let mut marker = None;
+    let mut sessions_only = false;
+    let mut waived = std::collections::BTreeSet::new();
+    let mut margin = None;
+    let mut managed = Vec::new();
+    let (mut claude, mut codex) = (true, true);
+    let (mut undo, mut respell, mut regularize, mut default_by_id) = (false, true, true, true);
+    let mut by_id = Vec::new();
+    let mut rebind = Vec::new();
+    let mut archived = Vec::new();
+    let mut at = 0;
+    let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        let mut step = 1;
+        match arg {
+            "--check" => check = true,
+            "--lanes-from-plan" => from_plan = true,
+            "--sessions-only" => sessions_only = true,
+            "--no-claude" => claude = false,
+            "--no-codex" => codex = false,
+            "--undo" => undo = true,
+            "--no-respell" => respell = false,
+            "--no-regularize" => regularize = false,
+            "--no-default-by-id" => default_by_id = false,
+            "--unmapped=report" => unmapped = Unmapped::Report,
+            "--unmapped=by-id" => unmapped = Unmapped::ById,
+            "--rebind-landing" => {
+                let (from, to) = value(at + 1)?
+                    .to_str()
+                    .ok_or(BulkloadRefusal::PathNotPortable)?
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                let (from, to) = (Path::new(from), Path::new(to));
+                if !from.is_absolute() || !to.is_absolute() {
+                    return Err(BulkloadRefusal::PathNotAbsolute);
+                }
+                // The new root must exist (judged by its real path); the
+                // old one may be gone and is taken as the rows recorded it.
+                let to =
+                    std::fs::canonicalize(to).refuse_at("main::reseat_command::rebind_landing")?;
+                rebind.push((from.to_path_buf(), to));
+                step = 2;
+            }
+            "--map" => {
+                let (from, to) = value(at + 1)?
+                    .to_str()
+                    .ok_or(BulkloadRefusal::PathNotPortable)?
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                if !Path::new(from).is_absolute() || !Path::new(to).is_absolute() {
+                    return Err(BulkloadRefusal::PathNotAbsolute);
+                }
+                maps.push((PathBuf::from(from), PathBuf::from(to)));
+                step = 2;
+            }
+            "--plan"
+            | "--corpus"
+            | "--private-state"
+            | "--codex-source-root"
+            | "--landing-claude"
+            | "--landing-codex"
+            | "--managed-settings"
+            | "--by-id"
+            | "--replace-archived-dest"
+            | "--waive-from" => {
+                let path = PathBuf::from(value(at + 1)?);
+                match arg {
+                    "--plan" => plan = Some(path),
+                    "--corpus" => corpus = Some(path),
+                    "--private-state" => states.push(path),
+                    "--codex-source-root" => roots.push(path),
+                    "--landing-claude" => landing_claude = Some(path),
+                    "--managed-settings" => managed.push(path),
+                    "--by-id" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        by_id.push(path);
+                    }
+                    "--replace-archived-dest" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        // Judged by its real path: a root that does not
+                        // exist names nothing to replace and is refused.
+                        archived.push(
+                            std::fs::canonicalize(&path)
+                                .refuse_at("main::reseat_command::replace_archived_dest")?,
+                        );
+                    }
+                    "--waive-from" => {
+                        let text = std::fs::read_to_string(&path)
+                            .refuse_at("main::reseat_command::waive_from")?;
+                        for line in text.lines() {
+                            let id = line.split('#').next().unwrap_or_default().trim();
+                            if !id.is_empty() {
+                                waived.insert(id.to_owned());
+                            }
+                        }
+                    }
+                    _ => landing_codex = Some(path),
+                }
+                step = 2;
+            }
+            "--waive" => {
+                waived.insert(
+                    value(at + 1)?
+                        .to_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            "--retention-margin-days" => {
+                margin = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .and_then(|days| days.parse::<i64>().ok())
+                        .filter(|days| *days >= 0)
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+                );
+                step = 2;
+            }
+            "--source" => {
+                source = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            "--note-marker" => {
+                marker = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .filter(|marker| !marker.is_empty())
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                step = 2;
+            }
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+        at += step;
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let [source_home, landing_home, dest_home, state] = rest else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let mut options = reseat::Options::new(
+        Path::new(source_home),
+        Path::new(landing_home),
+        Path::new(dest_home),
+        Path::new(state),
+    );
+    if !options.source_home.is_absolute() || !options.dest_home.is_absolute() {
+        return Err(BulkloadRefusal::PathNotAbsolute);
+    }
+    if let Some(path) = landing_claude {
+        options.landing_claude = path;
+    }
+    if let Some(path) = landing_codex {
+        options.landing_codex = path;
+    }
+    if !roots.is_empty() {
+        options.codex_source_roots = roots;
+    }
+    options.replace_archived = archived;
+    if from_plan {
+        let plan = plan.as_ref().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        for item in bulkload_agent::estate::inspect(plan)? {
+            if let Some(workspace) = item.workspace {
+                maps.push((item.source, workspace));
+            }
+        }
+    }
+    options.maps = maps;
+    options.rebind = rebind;
+    options.unmapped = unmapped;
+    options.claude = claude;
+    options.codex = codex;
+    options.handoff_marker = marker;
+    options.sessions_only = sessions_only;
+    options.waived = waived;
+    if let Some(margin) = margin {
+        options.retention_margin_days = margin;
+    }
+    if !managed.is_empty() {
+        options.managed_settings = managed;
+    }
+    if !default_by_id {
+        options.by_id_exact.clear();
+        options.by_id_prefixes.clear();
+    }
+    options.by_id_prefixes.extend(by_id);
+    options.respell_cwd = respell;
+    options.regularize = regularize;
+    options.git = match (plan, corpus, source) {
+        (Some(plan), Some(corpus), Some(source)) => Some(GitCheck {
+            plan,
+            corpus,
+            source,
+            states,
+        }),
+        (_, None, None) if states.is_empty() => None,
+        _ => return Err(BulkloadRefusal::RequiredFieldMissing),
+    };
+    let mut output = std::io::stdout().lock();
+    let mut emit = |line: &str| writeln!(output, "{line}").refuse_at("main::reseat_command");
+    if check && undo {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    if undo {
+        reseat::undo(&options, &mut emit).map(drop)?;
+    } else if check {
+        reseat::check(&options, &mut emit)?.verdict()?;
+    } else {
+        reseat::reseat(&options, &mut emit).map(drop)?;
+    }
+    output.flush().refuse_at("main::reseat_command")
+}
+
+/// `estate-handoff`'s options, before its positional arguments
+/// (TIN-6569, OI-1003-Q183).
+fn handoff_options(
+    args: &[std::ffi::OsString],
+) -> Result<(
+    bulkload_agent::estate::HandoffOptions,
+    &[std::ffi::OsString],
+)> {
+    let mut options = bulkload_agent::estate::HandoffOptions::default();
+    let mut at = 0;
+    let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        let flag = |set: &mut bool| {
+            if *set {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            *set = true;
+            Ok(())
+        };
+        let mut mode = |to: bulkload_agent::estate::HandoffMode| {
+            if options.mode != bulkload_agent::estate::HandoffMode::Render {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            options.mode = to;
+            Ok(())
+        };
+        match arg {
+            "--check" => mode(bulkload_agent::estate::HandoffMode::Check)?,
+            "--clear" => mode(bulkload_agent::estate::HandoffMode::Clear)?,
+            "--dry-run" => mode(bulkload_agent::estate::HandoffMode::DryRun)?,
+            "--renew" => flag(&mut options.renew)?,
+            "--readme" => flag(&mut options.readme)?,
+            "--clear-carried" => flag(&mut options.clear_carried)?,
+            "--item" => {
+                options.items.push(
+                    value(at + 1)?
+                        .to_str()
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                at += 1;
+            }
+            "--workspace" => {
+                options.workspaces.push(PathBuf::from(value(at + 1)?));
+                at += 1;
+            }
+            "--sibling" => {
+                let pair = value(at + 1)?;
+                let (landed, live) = pair
+                    .as_encoded_bytes()
+                    .iter()
+                    .position(|byte| *byte == b'=')
+                    .map(|split| {
+                        let bytes = pair.as_encoded_bytes();
+                        (
+                            bytes.get(..split).unwrap_or_default(),
+                            bytes.get(split + 1..).unwrap_or_default(),
+                        )
+                    })
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                let path = |bytes: &[u8]| {
+                    PathBuf::from(
+                        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(bytes),
+                    )
+                };
+                options.siblings.push((path(landed), path(live)));
+                at += 1;
+            }
+            "--as-of" if options.as_of.is_none() => {
+                options.as_of = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .and_then(|ns| ns.parse::<i128>().ok())
+                        .filter(|ns| *ns >= 0)
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+                );
+                at += 1;
+            }
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+        at += 1;
+    }
+    Ok((options, args.get(at..).unwrap_or_default()))
 }
 
 /// The options `estate-apply` and `estate-diff` take before their
@@ -1171,9 +1984,12 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
 #[derive(Default)]
 struct EstateOptions {
     adopt: bool,
+    exclude_union: bool,
+    beside: Option<String>,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
+    side_roots: Vec<PathBuf>,
 }
 
 fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::ffi::OsString])> {
@@ -1185,6 +2001,19 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             "--adopt" if !options.adopt => {
                 options.adopt = true;
                 at += 1;
+            }
+            "--exclude-union" if !options.exclude_union => {
+                options.exclude_union = true;
+                at += 1;
+            }
+            "--beside" if options.beside.is_none() => {
+                options.beside = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                at += 2;
             }
             "--activate-origin" => {
                 let prefix = value(at + 1)?
@@ -1208,6 +2037,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             }
             "--scan" => {
                 options.scan.push(PathBuf::from(value(at + 1)?));
+                at += 2;
+            }
+            "--side-root" => {
+                options.side_roots.push(PathBuf::from(value(at + 1)?));
                 at += 2;
             }
             other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
@@ -1344,6 +2177,139 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
         || pull_command(args),
     )
     .and_then(|stats| report_transfer(&stats))
+}
+
+// M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,
+// the remote source state per item under --source-state-root.
+#[allow(clippy::too_many_lines)] // Argument parsing, then one call.
+fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::estate::carried::{self, CarryJob, CarryOptions, Transport};
+    struct Pull {
+        host: std::ffi::OsString,
+        source_state_root: PathBuf,
+        remote: Option<std::ffi::OsString>,
+        config: Option<std::ffi::OsString>,
+    }
+    impl Transport for Pull {
+        fn verb(&self) -> &'static str {
+            "pull"
+        }
+        fn source_key(&self, source: &Path) -> String {
+            bulkload_agent::transfer_outcome::pull_source(&self.host, source)
+        }
+        fn roots_apart(&self, job: &CarryJob) -> Result<()> {
+            bulkload_agent::transfer::receive_roots_apart(&job.destination, &job.destination_state)
+        }
+        fn run(&self, job: &CarryJob) -> Result<bulkload_agent::transfer::TransferStats> {
+            let mut args: Vec<std::ffi::OsString> = vec![
+                self.host.clone(),
+                job.source.clone().into_os_string(),
+                job.destination.clone().into_os_string(),
+                self.source_state_root.join(&job.item).into_os_string(),
+                job.destination_state.clone().into_os_string(),
+            ];
+            // `pull` takes SSH_CONFIG only after REMOTE_EXECUTABLE; the
+            // parser requires the one with the other.
+            args.extend(self.remote.iter().cloned());
+            args.extend(self.config.iter().cloned());
+            pull_command(&args)
+        }
+    }
+    let mut options = CarryOptions::default();
+    let (mut host, mut root, mut remote, mut config) = (None, None, None, None);
+    let mut at = 0;
+    let value = |at: usize| {
+        args.get(at)
+            .cloned()
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)
+    };
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        match arg {
+            "--dry-run" if !options.dry_run => {
+                options.dry_run = true;
+                at += 1;
+                continue;
+            }
+            "--bind-only" if !options.bind_only => {
+                options.bind_only = true;
+                at += 1;
+                continue;
+            }
+            "--recarry" if !options.recarry => {
+                options.recarry = true;
+                at += 1;
+                continue;
+            }
+            "--beside" if options.beside.is_none() => options.beside = Some(value(at + 1)?),
+            "--item" => options.items.push(
+                value(at + 1)?
+                    .into_string()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?,
+            ),
+            "--bind" => {
+                let pair = value(at + 1)?
+                    .into_string()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
+                let (item, state) = pair
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                if !Path::new(state).is_absolute()
+                    || options
+                        .bind
+                        .insert(item.to_owned(), PathBuf::from(state))
+                        .is_some()
+                {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
+            }
+            "--host" if host.is_none() => host = Some(value(at + 1)?),
+            "--source-state-root" if root.is_none() => root = Some(PathBuf::from(value(at + 1)?)),
+            "--remote-executable" if remote.is_none() => remote = Some(value(at + 1)?),
+            "--ssh-config" if config.is_none() => config = Some(value(at + 1)?),
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+        at += 2;
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let [plan, corpus, state, source, carry_state] = rest else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let source = source
+        .to_str()
+        .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+    if config.is_some() && remote.is_none() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    let local = carried::LocalCopy;
+    let pull;
+    let transport: &dyn Transport = match (host, root) {
+        (Some(host), Some(source_state_root)) => {
+            pull = Pull {
+                host,
+                source_state_root,
+                remote,
+                config,
+            };
+            &pull
+        }
+        (None, None) if remote.is_none() && config.is_none() => &local,
+        _ => return Err(BulkloadRefusal::RequiredFieldMissing),
+    };
+    let mut output = std::io::stdout().lock();
+    carried::carry_files(
+        Path::new(plan),
+        Path::new(corpus),
+        Path::new(state),
+        source,
+        Path::new(carry_state),
+        &options,
+        transport,
+        &mut |line| {
+            writeln!(output, "{line}").refuse_at("main::carry_files_command")?;
+            output.flush().refuse_at("main::carry_files_command")
+        },
+    )
 }
 
 // Review finding 3 (S4): list one transfer a run expects in its manifest,
@@ -1489,6 +2455,11 @@ fn report_counters(verb: &str, started: std::time::Instant, priority: Priority) 
         elapsed_ns(started),
         Counters::snapshot().render()
     ));
+    // The last refused free-space check: which limit bound (the filesystem
+    // or a project quota) and both limits' numbers (M2 round 2, item 1).
+    if let Some(space) = bulkload_agent::space::last_refusal() {
+        lines.push(format!("space_refusal {prefix} {}", space.fields()));
+    }
     if matches!(verb, "copy" | "pull") {
         let mut output = std::io::stdout().lock();
         for line in &lines {
@@ -1540,6 +2511,25 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     for path in &stats.directories_fallback {
         eprintln!(
             "directory-created-by-mkdir-fallback {}",
+            path.escape_ascii()
+        );
+    }
+    for (path, prior, prefix, size) in &stats.prefix_extended {
+        eprintln!(
+            "prefix-extended {} from={prior} to={size} prefix_blake3={}",
+            path.escape_ascii(),
+            blake3::Hash::from_bytes(*prefix).to_hex()
+        );
+    }
+    for (path, prior) in &stats.prefix_interrupted {
+        eprintln!(
+            "prefix-extension-interrupted {} prior={prior} (a crashed extension proved the first {prior} bytes; what follows was appended since)",
+            path.escape_ascii()
+        );
+    }
+    for (path, found, source) in &stats.directories_mode_kept {
+        eprintln!(
+            "directory-mode-kept {} found={found:04o} source={source:04o}",
             path.escape_ascii()
         );
     }
@@ -1601,8 +2591,184 @@ fn selftest() -> Result<()> {
     println!("  frame bytes   {}", encoded.len());
     println!("  frame decoded {decoded:?}");
     println!("  round trip    exact (ok)");
+    // M2 item 4: whether this binary survives a Nix garbage collection.
+    let image = std::env::current_exe()
+        .ok()
+        .and_then(|exe| std::fs::read(exe).ok());
+    println!("  interpreter   {}", interpreter_report(image.as_deref()));
+    println!("  gc roots      {}", gc_roots_report(image.as_deref()));
     println!("selftest: ok");
     Ok(())
+}
+
+/// The selftest's interpreter line (M2 item 4, 2026-10-16: a GC deleted the
+/// glibc an installed agent was linked against): this binary's ELF
+/// interpreter (`PT_INTERP`), whether it exists, and whether it lives in
+/// `/nix/store`, where a GC can delete it. A binary whose interpreter is
+/// already gone cannot start, so this and [`gc_roots_report`] are the
+/// warning before a GC, not after.
+fn interpreter_report(image: Option<&[u8]>) -> String {
+    let Some(interpreter) = image.and_then(elf_interpreter) else {
+        return "none (no PT_INTERP: not a 64-bit little-endian dynamic ELF image)".to_owned();
+    };
+    format!(
+        "{interpreter} exists={} nix-store={}",
+        if Path::new(&interpreter).exists() {
+            "yes"
+        } else {
+            "no"
+        },
+        if interpreter.starts_with("/nix/store/") {
+            "yes"
+        } else {
+            "no"
+        },
+    )
+}
+
+/// The selftest's GC-root line: every `/nix/store` path this binary names
+/// (interpreter, `RUNPATH`, dylibs: the paths `scripts/install-agent.sh`
+/// roots), and how many have a GC root that Nix registered: a symlink in
+/// `$BULKLOAD_GCROOTS` (default `${XDG_STATE_HOME:-~/.local/state}/
+/// bulkload/gcroots`) resolving into the path, itself named by an entry of
+/// `/nix/var/nix/gcroots/auto`. A symlink Nix does not know of (copied, or
+/// made by hand) is `unregistered`, not rooted.
+fn gc_roots_report(image: Option<&[u8]>) -> String {
+    let Some(image) = image else {
+        return "unknown (this binary could not be read)".to_owned();
+    };
+    let paths = store_paths(image);
+    let directory = std::env::var_os("BULKLOAD_GCROOTS")
+        .filter(|value| !value.is_empty())
+        .map_or_else(
+            || {
+                std::env::var_os("XDG_STATE_HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+                    .or_else(|| {
+                        std::env::var_os("HOME").map(|home| Path::new(&home).join(".local/state"))
+                    })
+                    .unwrap_or_default()
+                    .join("bulkload/gcroots")
+            },
+            PathBuf::from,
+        );
+    let roots: Vec<(PathBuf, PathBuf)> = std::fs::read_dir(&directory)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| {
+                    let link = entry.path();
+                    let target = std::fs::read_link(&link).ok()?;
+                    Some((link, target))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let registered: Option<std::collections::BTreeSet<PathBuf>> =
+        std::fs::read_dir("/nix/var/nix/gcroots/auto")
+            .ok()
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+                    .collect()
+            });
+    let (mut rooted, mut unregistered, mut unrooted) = (0, 0, Vec::new());
+    for path in &paths {
+        let links: Vec<&PathBuf> = roots
+            .iter()
+            .filter(|(_, target)| target.starts_with(path))
+            .map(|(link, _)| link)
+            .collect();
+        if links.is_empty() {
+            unrooted.push(path.display().to_string());
+        } else if registered
+            .as_ref()
+            .is_none_or(|known| links.iter().any(|link| known.contains(*link)))
+        {
+            rooted += 1;
+        } else {
+            unregistered += 1;
+            unrooted.push(path.display().to_string());
+        }
+    }
+    format!(
+        "store-paths={} rooted={rooted} unregistered={unregistered} registry={} unrooted={}",
+        paths.len(),
+        if registered.is_some() {
+            "read"
+        } else {
+            "unreadable"
+        },
+        if unrooted.is_empty() {
+            "-".to_owned()
+        } else {
+            unrooted.join(",")
+        }
+    )
+}
+
+/// Every `/nix/store/<hash>-<name>` the image names, top-level entries only,
+/// sorted and unique (the store's hash alphabet, then its name characters).
+fn store_paths(image: &[u8]) -> Vec<PathBuf> {
+    const PREFIX: &[u8] = b"/nix/store/";
+    let hash = |byte: &u8| matches!(byte, b'0'..=b'9' | b'a'..=b'd' | b'f'..=b'n' | b'p'..=b's' | b'v'..=b'z');
+    let name = |byte: &u8| byte.is_ascii_alphanumeric() || b"+._?=-".contains(byte);
+    let mut found = std::collections::BTreeSet::new();
+    let mut at = 0;
+    while let Some(offset) = image.get(at..).and_then(|rest| {
+        rest.windows(PREFIX.len())
+            .position(|window| window == PREFIX)
+    }) {
+        let start = at + offset;
+        let body = start + PREFIX.len();
+        at = body;
+        let Some(digest) = image.get(body..body + 32) else {
+            break;
+        };
+        if !digest.iter().all(hash) || image.get(body + 32) != Some(&b'-') {
+            continue;
+        }
+        let end = image.get(body + 33..).map_or(body + 33, |rest| {
+            body + 33 + rest.iter().take_while(|byte| name(byte)).count()
+        });
+        if end > body + 33 {
+            if let Some(bytes) = image.get(start..end) {
+                found.insert(PathBuf::from(String::from_utf8_lossy(bytes).into_owned()));
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// The `PT_INTERP` path of a 64-bit little-endian ELF image, if it has one.
+/// Every offset is checked: a malformed image yields `None`, never a panic.
+fn elf_interpreter(image: &[u8]) -> Option<String> {
+    const PT_INTERP: u32 = 3;
+    let bytes = |at: usize, len: usize| image.get(at..at.checked_add(len)?);
+    let u16_at = |at: usize| Some(u16::from_le_bytes(bytes(at, 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(bytes(at, 4)?.try_into().ok()?));
+    let u64_at =
+        |at: usize| usize::try_from(u64::from_le_bytes(bytes(at, 8)?.try_into().ok()?)).ok();
+    // ELFCLASS64, ELFDATA2LSB.
+    if image.get(..4)? != b"\x7fELF" || image.get(4)? != &2 || image.get(5)? != &1 {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (u64_at(0x20)?, usize::from(u16_at(0x36)?), u16_at(0x38)?);
+    (0..usize::from(phnum)).find_map(|index| {
+        let header = phoff.checked_add(index.checked_mul(phentsize)?)?;
+        if u32_at(header)? != PT_INTERP {
+            return None;
+        }
+        let (offset, size) = (
+            u64_at(header.checked_add(8)?)?,
+            u64_at(header.checked_add(32)?)?,
+        );
+        let found = bytes(offset, size)?;
+        let found = found.split(|byte| *byte == 0).next()?;
+        String::from_utf8(found.to_vec()).ok()
+    })
 }
 
 fn walk_command(root: &Path) -> Result<()> {

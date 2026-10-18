@@ -100,3 +100,32 @@ the scripts changed.
   review noted.
 - #240 and #241 also edit the AGENTS.md lines this PR edits (the R-N69
   bullet and Validation); whichever lands second resolves the conflict.
+
+## Merge of main, 2026-10-18 (operator ruling A-20261018-110, "Rebase, gate, merge")
+
+Merged `origin/main` `74ede7c` into the branch. None of this PR's intent was
+in main (main's `ci.yml` still ran on `pull_request` and `merge_group`, and
+no `local-gate` recipe or script existed). Conflicts and their resolution:
+
+- `AGENTS.md`: main's OI-1003-Q196 neo bullet and sampling bullet kept
+  (they supersede this PR's versions). Validation: this PR's merge-gate
+  paragraph kept above main's restructured text; main's long `just check`
+  paragraph deletion kept. Main's now-false lines corrected: "PR CI runs
+  two gates" (CI runs on `v*` tags and dispatch only) and "No PR loads the
+  Bazel graph" (`local-gate` runs `bazel-graph`).
+- `docs/slo.md`: both sides' 2026-10-16 amendments kept; the Q199
+  amendment gains a dated "Gate host" bullet: since the operator's
+  2026-10-17 ruling the gate's build and test half runs on honey on the
+  exact head, with merge, signing, receipt and merge on sting.
+- `justfile`: `shell-lint` checks main's `scripts/install-agent.sh` and this
+  PR's three scripts; main's `install-agent` recipe kept; the `check-fast`
+  comment is this PR's.
+- `tests/test_ci_contract.py`: `WORKFLOW_SHA256` re-pinned to the merged
+  `ci.yml` (`cd23a47e…`); the trigger-mutation test uses main's 45-minute
+  cap (mutation to 50).
+
+The `/dev/shm/m2r2-gate-honey.sh` gate (check-fast plus the HEAD-scoped
+secret scan on honey) is the receipt for this merge. It does not run
+`bazel-graph`.
+
+Rulings: A-20261018-110, OI-1003-Q199, OI-1003-Q195, R-N13.

@@ -1,5 +1,9 @@
 # bulkload: property-test decomposition plan (2026-10-03)
 
+> **Label (2026-10-17, R-N13; body unchanged).** Retired under R-C843 (Linear TIN-4543 `ace8649c`): it refines the staged copy pipeline and does not start from [SPEC](../SPEC.md) R1–R8, which supersedes it. Its properties that landed stay as runnable tests (R-C844); this plan defines the S2 properties P76 (`tests/source_command_registry.rs`) and P77 (`tests/source_lock_trace.rs`), whose numbering the tests keep.
+
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** Planned at `727493a`; the charter PR #137 it calls unmerged is merged. Its "R34 (dependency wall)" and "R33 (lint wall)" are not those rulings in the R1–R43 ledger (see that file's header). Current property status: `docs/slo.md` amendments and the tests they cite.
+
 Rulings cited: OI-1003-Q7 (local property tests instead of example tests, no fuzzing, slim CI, bounded tested corpus), OI-1003-Q14 (as the task gives it; the charter text on PR #137 lists only Q1–Q13, so Q14's wording should be confirmed), OI-1003-Q11 (#38 drift extension), OI-1001-Q2 (check-fast / check-optional / check-full tiers), R-N122 (CI contract), R-N13 (receipts), R34 (dependency wall), R33 (lint wall), R-N88/R-N119 (power-loss proofs).
 Base: `origin/main` @ 727493a. Charter: `docs/slo.md` on `docs/slo-charter-20261003` (PR #137, not merged).
 Status: analysis only. Nothing was edited, committed, pushed or commented.

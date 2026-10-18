@@ -48,6 +48,7 @@ postcard = { workspace = true }
 libc = { workspace = true }
 rusqlite = { workspace = true, features = ["backup"] }
 crc32c = { workspace = true }
+zstd = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

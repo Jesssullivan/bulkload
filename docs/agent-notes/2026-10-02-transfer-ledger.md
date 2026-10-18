@@ -1,5 +1,7 @@
 # 2026-10-02 — transfer-ledger lane (#86, #87, #97, #100)
 
+> **Historical record (labelled 2026-10-16, R-N13; body unchanged).** "The single migration run" (OI-1002-Q24) is superseded by OI-1003-Q13 (a repeatable run) and OI-1003-Q142 / Q194 C6 (`docs/slo.md`, amendment 2026-10-16).
+
 Rulings cited: OI-1002-Q24 (bulkload completes before the single migration
 run), OI-1002-Q25 (gate plan: these four are pre-migration fixes),
 OI-1002-Q29 (operator "ultracode, full steam ahead", 2026-10-02), R-N13.

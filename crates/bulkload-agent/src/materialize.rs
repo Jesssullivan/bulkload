@@ -46,9 +46,10 @@
 //! ([`owned_output`]). Anything else stays no-clobber and refuses
 //! `DESTINATION_OCCUPIED`.
 //!
-//! The replacement is the exchange design the formal model checks
-//! (`docs/formal`, `MC_wp0d_exchange`), not check-then-rename, which leaves
-//! a window a third party's write falls into (`MC_wp0d_check_rename`). In
+//! The replacement is the exchange design the formal model checked
+//! (`docs/formal`, `MC_wp0d_exchange`; deleted 2026-10-17, R-C843), not
+//! check-then-rename, which leaves a window a third party's write falls
+//! into (`MC_wp0d_check_rename`). In
 //! the group's commit ([`PublishSink`]):
 //!
 //! 1. the staged file is sealed (in a [`crate::io::durable::batched`]
@@ -273,6 +274,10 @@ pub struct Creation {
     /// Directories created by the plain `mkdirat` fallback because the
     /// filesystem has no atomic no-replace rename, by relative path.
     pub fallback: Vec<Vec<u8>>,
+    /// Existing directories this store does not own, entered with their
+    /// mode kept although it differs from the source's (M2 item 2): by
+    /// relative path, with the mode found and the source's.
+    pub mode_kept: Vec<(Vec<u8>, u32, u32)>,
 }
 
 struct OwnedDirectory {
@@ -451,8 +456,20 @@ impl Destination {
     ///
     /// An existing directory is adopted only when its record names its inode
     /// and mode. Any other record is cleared, so it can never adopt later. A
-    /// directory with no owning record fails closed on a divergent mode. An
-    /// existing directory is swept of this store's orphaned temporaries.
+    /// directory with no owning record is never adopted: its mode is never
+    /// changed and no record binds it. One whose mode equals the source's is
+    /// entered as before. One whose mode differs is accepted too, its mode
+    /// kept and reported ([`Creation::mode_kept`], `dest_directory_mode_kept`),
+    /// when it is this user's, gives its owner read, write and search, and
+    /// grants nobody else anything the source's mode does not (M2 item 2: a
+    /// copy of an unfinished landing, 0700 under a 0755 source, refused every
+    /// directory of the copy, 160 of them, and the pull exited 1; the files
+    /// below were decided all the same). Such a directory never converges to
+    /// the source's mode: that would adopt it. Any other divergent mode
+    /// (wider than the source's, another owner, no owner access) is refused
+    /// `DESTINATION_OCCUPIED`, and only its own row: the entries below it are
+    /// decided as before (a stated gap, #248). An existing
+    /// directory is swept of this store's orphaned temporaries.
     ///
     /// # Errors
     /// Refuses non-directory conflicts, divergent existing modes and foreign
@@ -904,7 +921,14 @@ impl Destination {
                 key: key.to_vec(),
             });
         } else if metadata.mode() & 0o7777 != mode {
-            return Err(BulkloadRefusal::DestinationOccupied);
+            let found = metadata.mode() & 0o7777;
+            if !kept_mode(found, mode, metadata.uid()) {
+                return Err(BulkloadRefusal::DestinationOccupied);
+            }
+            counters::bump(Counter::DestDirectoryModeKept);
+            self.created
+                .mode_kept
+                .push((row.rel_path.clone(), found, mode));
         }
         Ok(())
     }
@@ -1456,6 +1480,30 @@ impl Destination {
     pub(crate) fn open_output(&self, rel_path: &[u8]) -> Result<File> {
         let (parent, leaf) = self.parent(rel_path)?;
         open_regular(&parent, &leaf)
+    }
+
+    /// Open an existing output for appending by relative path, component by
+    /// component, following no link (M2r2 A-103: a verified byte prefix of
+    /// its source is extended in place). The caller proves it is the file
+    /// it read, by identity.
+    ///
+    /// # Errors
+    /// Refuses a missing output, a non-regular node, a file this user may
+    /// not write, or an unsafe ancestor.
+    pub(crate) fn open_output_append(&self, rel_path: &[u8]) -> Result<File> {
+        let (parent, leaf) = self.parent(rel_path)?;
+        let file = File::from(
+            crate::io::sys::open_append_at(&parent, &leaf)
+                .refuse_at("materialize::open_output_append")?,
+        );
+        if !file
+            .metadata()
+            .refuse_at("materialize::open_output_append")?
+            .is_file()
+        {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        Ok(file)
     }
 
     fn shared_parent(&self, path: &[u8]) -> Result<(Arc<File>, CString)> {
@@ -2326,6 +2374,7 @@ impl PublishSink {
                         rel_path: record.rel_path,
                         identity,
                         racy: record.racy,
+                        extended: None,
                         hints: record.hints,
                     });
                     settled.push((intent, false));
@@ -2572,6 +2621,7 @@ impl PublishSink {
                             rel_path: record.rel_path,
                             identity,
                             racy: record.racy,
+                            extended: None,
                             hints: record.hints,
                         });
                     }
@@ -2757,6 +2807,8 @@ fn seal_group_data(items: &mut [Publication]) -> Result<()> {
 pub(crate) fn space_refusal(refusal: BulkloadRefusal) -> BulkloadRefusal {
     match refusal {
         BulkloadRefusal::Io(Some(libc::ENOSPC)) | BulkloadRefusal::SpaceExhausted(None) => {
+            // Judged by no limit: no earlier check's numbers belong to it.
+            crate::space::forget_refusal();
             BulkloadRefusal::DestinationSpaceInsufficient
         }
         other => other,
@@ -2817,6 +2869,19 @@ pub(crate) fn verify_existing(
 /// The `(dev, ino)` of a directory record committed before its `mkdirat`
 /// (R-N119). No inode on Darwin or Linux has number 0.
 const INTENT: (u64, u64) = (0, 0);
+
+/// Whether an existing directory this store does not own, with mode `found`
+/// where the source's is `source`, is entered with its mode kept (M2 item
+/// 2): it is this user's (`uid`), its owner can read, write and search it,
+/// and it grants nobody else anything `source` does not (no group, other or
+/// special bit the source lacks). The owner's own bits are not compared:
+/// an unfinished landing's 0700 directory under a read-only 0555 or 0500
+/// source exposes nothing.
+fn kept_mode(found: u32, source: u32, uid: u32) -> bool {
+    uid == crate::io::sys::effective_uid()
+        && found & 0o700 == 0o700
+        && found & !source & 0o7077 == 0
+}
 
 /// Whether `directory` is still exactly what the fallback `mkdirat` made: an
 /// empty directory with mode 0700, owned by this user.
@@ -3604,6 +3669,7 @@ mod tests {
                     rel_path: name.as_bytes().to_vec(),
                     identity: crate::freshness::StatIdentity::from_metadata(&metadata),
                     racy: false,
+                    extended: None,
                     hints: Vec::new(),
                 },
                 file,

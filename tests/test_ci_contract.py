@@ -15,7 +15,7 @@ import unittest
 sys.dont_write_bytecode = True
 
 CI_TEMPLATES_REV = "139bd4c7deabbe07c918dc764a3b9f054066431d"
-WORKFLOW_SHA256 = "c4a938478b57be54eca4a427541c1887285bfc6e20479275e46fd09e3358b0a8"
+WORKFLOW_SHA256 = "cd23a47e2971d3fc068ac4e377bc69e46d84e8c24b2613c086913b53ba50db88"
 LOCAL_ACTION = "./.github/actions/bulkload-public-read-ci"
 LOCAL_ACTION_PATH = ".github/actions/bulkload-public-read-ci/action.yml"
 GUARD_PATH = "scripts/ci-public-read-guard.sh"
@@ -1030,12 +1030,15 @@ def validate_job_routing(workflow: str) -> None:
     # The single job-level cap applies to every matrix gate (R-N122). It was 15
     # minutes until OI-1003-Q71 raised it to 25: the source gate ran 432-690 s on
     # a quiet host and was cancelled at 900 s twice under shared-runner load.
+    # 2026-10-16: raised to 45. The fault-harness gate, built two jobs wide to
+    # fit the 2 GiB runner (the OOM fix) and carrying the hand-off rows, ran
+    # past 25 minutes and was cancelled on #239 (R-N13).
     timeouts = re.findall(
         r"(?mi)^\s*(?:timeout-minutes|\"timeout-minutes\"|'timeout-minutes')\s*:.*$",
         workflow,
     )
-    if timeouts != ["    timeout-minutes: 25"]:
-        raise ContractError("every terminal gate must keep the audited 25-minute cap")
+    if timeouts != ["    timeout-minutes: 45"]:
+        raise ContractError("every terminal gate must keep the audited 45-minute cap")
 
     declarations = [
         line
@@ -3107,7 +3110,7 @@ class CiContractTest(unittest.TestCase):
     def test_workflow_triggers_cap_and_failure_suppression_mutations_fail_closed(
         self,
     ) -> None:
-        cap = "    timeout-minutes: 25\n"
+        cap = "    timeout-minutes: 45\n"
         dispatch = "  workflow_dispatch:\n"
         tags = '    tags: ["v*"]\n'
         runner = "    runs-on: tinyland-nix\n"
@@ -3147,7 +3150,7 @@ class CiContractTest(unittest.TestCase):
             self.workflow.replace(
                 "github.sha }}", "github.event.pull_request.head.sha }}", 1
             ),
-            self.workflow.replace(cap, "    timeout-minutes: 30\n", 1),
+            self.workflow.replace(cap, "    timeout-minutes: 50\n", 1),
             self.workflow.replace(cap, "", 1),
             self.workflow.replace(cap, cap + "    continue-on-error: true\n", 1),
             self.workflow.replace(cap, cap + '    "continue-on-error": true\n', 1),

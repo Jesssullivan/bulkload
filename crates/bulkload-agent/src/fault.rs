@@ -98,6 +98,9 @@
 //! | `receive.after_decide` | one entry decided, no content received for it |
 //! | `receive.after_chunks` | one file's chunks verified, covering it, and written to its temporary |
 //! | `receive.after_end` | an entry's `End` handled; its output may still be waiting on its group |
+//! | `receive.prefix_before_append` | a grown destination file's prefix proven and its tail received into a temporary; the file untouched (M2r2 A-103) |
+//! | `receive.prefix_after_append` | the tail written into the destination file, not yet flushed; no record |
+//! | `receive.prefix_after_flush` | the extended file flushed; its record not yet queued |
 //!
 //! Git estate capture publication, in `estate::capture_item` (Q42 lane L7,
 //! P70). The `{bundle}.reuse` manifest is published after the bundle and its
@@ -127,6 +130,37 @@
 //! | `estate.converge.after_index` | every seat and the index new; HEAD old |
 //! | `estate.converge.after_head` | HEAD and its branch new; the workspace ledger old, its intent pending |
 //! | `estate.converge.after_landed` | the new workspace ledger, no intent; no journal or outcome record |
+//!
+//! Agent session re-seat, in `reseat` (R0, TIN-6587). Each rerun settles
+//! what a crash left forward from the ledger and the destination's own
+//! bytes, never by re-reading what it already placed:
+//!
+//! | Name | Crash leaves (in the destination's live agent state) |
+//! |------|------------------------------------------------------|
+//! | `reseat.after_temp_seal` | a new placement's `.<name>.bulkload-reseat` temporary written, its mode and mtime set and sealed; not published |
+//! | `reseat.after_publish` | the file published under its final name and its directory sealed; no ledger row |
+//! | `reseat.after_extend_intent` | the extend intent committed in the ledger; no tail byte written |
+//! | `reseat.mid_extend` | the first chunk of a grown transcript's tail written in place, the rest not |
+//! | `reseat.after_extend` | the whole tail written, the landed mtime set and sealed; the intent still recorded |
+//! | `reseat.after_supersede_exchange` | a changed non-append file exchanged in: the new bytes at the path, this ledger's old placement under the temporary name; the intent still recorded |
+//! | `reseat.after_row_insert` | a batch of Codex thread rows committed in the destination's `state_5.sqlite`; no ledger row for them |
+//! | `reseat.after_synth_row_insert` | a row built from a rowless rollout's header committed in the destination's index; no ledger row for it (OI-1003-Q198 D) |
+//! | `reseat.after_cwd_update` | existing destination rows' `cwd` re-spelled to the lane's canonical path and committed; the ledger still holds them as `intent` (OI-1003-Q198 (1)) |
+//! | `reseat.after_regularize_exchange` | a symlinked destination transcript exchanged for its regular copy: the copy at the path, the symlink under the temporary name; the ledger row still `intent` (OI-1003-Q198 (2)) |
+//! | `reseat.after_undo_cwd` | `--undo` put re-spelled rows' old `cwd` back and committed; the ledger rows not yet `undone` |
+//! | `reseat.after_undo_exchange` | `--undo` exchanged a regularized transcript back to its symlink: the symlink at the path, the regular copy under the temporary name; the ledger row not yet `undone` |
+//!
+//! The hand-off block (TIN-6569, OI-1003-Q183), in
+//! `git_carry::converge::handoff`:
+//!
+//! | Name | Crash leaves (at the destination) |
+//! |------|------------------------------------|
+//! | `estate.handoff.after_intent` | `handoff.intent` durable; every target old |
+//! | `estate.handoff.after_temp` | a target's new bytes at its `.bulkload-handoff-<tag>-<n>` temporary; the target old |
+//! | `estate.handoff.after_exchange` | a target new, the old file displaced at the temporary (a created file: new, no temporary) |
+//! | `estate.handoff.after_record` | the new `handoff.landed`, the intent still pending |
+//! | `estate.handoff.clear_after_exchange` | a clear's target stripped (or a created file renamed away), the displaced file at the temporary |
+//! | `estate.handoff.lift_after_unlink` | converge's lift unlinked a created block; the record still names it |
 //!
 //! # Group size
 //!
@@ -256,6 +290,12 @@ pub enum Point {
     ReceiveAfterChunks,
     /// `receive.after_end`
     ReceiveAfterEnd,
+    /// `receive.prefix_before_append`
+    ReceivePrefixBeforeAppend,
+    /// `receive.prefix_after_append`
+    ReceivePrefixAfterAppend,
+    /// `receive.prefix_after_flush`
+    ReceivePrefixAfterFlush,
     /// `estate.after_bundle_publish`
     EstateAfterBundlePublish,
     /// `estate.before_reuse_sidecar`
@@ -307,11 +347,82 @@ pub enum Point {
     /// `estate.adopt.bare_staged`: a bare first landing complete in its
     /// private stage, not published (#226 item 4).
     EstateAdoptBareStaged,
+    /// `estate.apply.parents_made`: a first landing's absent parents made
+    /// (0755, synced), not yet recorded in STATE; nothing landed (M2
+    /// finding 1).
+    EstateApplyParentsMade,
+    /// `estate.apply.exclude_intent`: an `--exclude-union` append recorded
+    /// in STATE as an intent; the common exclude not yet written (M2
+    /// round 2, item 2).
+    EstateApplyExcludeIntent,
+    /// `estate.apply.exclude_appended`: the common exclude replaced by its
+    /// union (synced); the record still says intent.
+    EstateApplyExcludeAppended,
+    /// `estate.apply.beside_refs`: a beside landing (M2 round 2 item c)
+    /// landed and its refs created under `refs/<ns>/`; its STATE record
+    /// still names them pending and the item's journal is not written.
+    EstateApplyBesideRefs,
+    /// `estate.carry.recorded`: `estate-carry-files` landed an item's
+    /// bytes and wrote its carry record; the outcome record still says
+    /// `CAPTURE_ABSENT` (M2r2 b).
+    EstateCarryRecorded,
+    /// `reseat.after_temp_seal`
+    ReseatAfterTempSeal,
+    /// `reseat.after_publish`
+    ReseatAfterPublish,
+    /// `reseat.after_extend_intent`
+    ReseatAfterExtendIntent,
+    /// `reseat.mid_extend`
+    ReseatMidExtend,
+    /// `reseat.after_extend`
+    ReseatAfterExtend,
+    /// `reseat.after_supersede_exchange`
+    ReseatAfterSupersedeExchange,
+    /// `reseat.after_row_insert`
+    ReseatAfterRowInsert,
+    /// `reseat.after_synth_row_insert`
+    ReseatAfterSynthRowInsert,
+    /// `reseat.after_cwd_update`
+    ReseatAfterCwdUpdate,
+    /// `reseat.after_regularize_exchange`
+    ReseatAfterRegularizeExchange,
+    /// `reseat.after_undo_cwd`
+    ReseatAfterUndoCwd,
+    /// `reseat.after_undo_exchange`
+    ReseatAfterUndoExchange,
+    /// `reseat.after_replace_intent`: a `--replace-archived-dest`
+    /// replacement's intent row durable (no placement row yet), the landed
+    /// copy staged and sealed, nothing exchanged (A-106).
+    ReseatAfterReplaceIntent,
+    /// `reseat.after_replace_exchange`: the landed copy at the path, the
+    /// destination's link under the temporary name.
+    ReseatAfterReplaceExchange,
+    /// `reseat.before_replace_done`: the link removed and the directory
+    /// sealed; the row not yet `done`, no placement row written.
+    ReseatBeforeReplaceDone,
+    /// `estate.handoff.after_intent`: the hand-off intent durable; no
+    /// target written (TIN-6569, OI-1003-Q183).
+    EstateHandoffAfterIntent,
+    /// `estate.handoff.after_temp`: a target's new bytes fsynced at its
+    /// `.bulkload-handoff-<tag>-<n>` temporary, not exchanged.
+    EstateHandoffAfterTemp,
+    /// `estate.handoff.after_exchange`: a target exchanged (or created):
+    /// the new file at the path, the old one displaced at the temporary.
+    EstateHandoffAfterExchange,
+    /// `estate.handoff.after_record`: the new hand-off record written, the
+    /// intent pending.
+    EstateHandoffAfterRecord,
+    /// `estate.handoff.clear_after_exchange`: a clear's target exchanged
+    /// (or a created file renamed away), the displaced file not checked.
+    EstateHandoffClearAfterExchange,
+    /// `estate.handoff.lift_after_unlink`: converge lifted a created
+    /// hand-off file before its add; the hand-off record not updated.
+    EstateHandoffLiftAfterUnlink,
 }
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 43] = [
+    pub const ALL: [Self; 72] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -333,6 +444,9 @@ impl Point {
         Self::ReceiveAfterDecide,
         Self::ReceiveAfterChunks,
         Self::ReceiveAfterEnd,
+        Self::ReceivePrefixBeforeAppend,
+        Self::ReceivePrefixAfterAppend,
+        Self::ReceivePrefixAfterFlush,
         Self::EstateAfterBundlePublish,
         Self::EstateBeforeReuseSidecar,
         Self::EstateAfterReuseSidecar,
@@ -355,6 +469,32 @@ impl Point {
         Self::EstateAdoptAfterRefs,
         Self::EstateAdoptAfterLedger,
         Self::EstateAdoptBareStaged,
+        Self::EstateApplyParentsMade,
+        Self::EstateApplyExcludeIntent,
+        Self::EstateApplyExcludeAppended,
+        Self::EstateApplyBesideRefs,
+        Self::EstateCarryRecorded,
+        Self::ReseatAfterTempSeal,
+        Self::ReseatAfterPublish,
+        Self::ReseatAfterExtendIntent,
+        Self::ReseatMidExtend,
+        Self::ReseatAfterExtend,
+        Self::ReseatAfterSupersedeExchange,
+        Self::ReseatAfterRowInsert,
+        Self::ReseatAfterSynthRowInsert,
+        Self::ReseatAfterCwdUpdate,
+        Self::ReseatAfterRegularizeExchange,
+        Self::ReseatAfterUndoCwd,
+        Self::ReseatAfterUndoExchange,
+        Self::ReseatAfterReplaceIntent,
+        Self::ReseatAfterReplaceExchange,
+        Self::ReseatBeforeReplaceDone,
+        Self::EstateHandoffAfterIntent,
+        Self::EstateHandoffAfterTemp,
+        Self::EstateHandoffAfterExchange,
+        Self::EstateHandoffAfterRecord,
+        Self::EstateHandoffClearAfterExchange,
+        Self::EstateHandoffLiftAfterUnlink,
     ];
 
     /// The name `BULKLOAD_FAULT` uses for this point.
@@ -382,6 +522,9 @@ impl Point {
             Self::ReceiveAfterDecide => "receive.after_decide",
             Self::ReceiveAfterChunks => "receive.after_chunks",
             Self::ReceiveAfterEnd => "receive.after_end",
+            Self::ReceivePrefixBeforeAppend => "receive.prefix_before_append",
+            Self::ReceivePrefixAfterAppend => "receive.prefix_after_append",
+            Self::ReceivePrefixAfterFlush => "receive.prefix_after_flush",
             Self::EstateAfterBundlePublish => "estate.after_bundle_publish",
             Self::EstateBeforeReuseSidecar => "estate.before_reuse_sidecar",
             Self::EstateAfterReuseSidecar => "estate.after_reuse_sidecar",
@@ -404,6 +547,32 @@ impl Point {
             Self::EstateAdoptAfterRefs => "estate.adopt.after_refs",
             Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
             Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
+            Self::EstateApplyParentsMade => "estate.apply.parents_made",
+            Self::EstateApplyExcludeIntent => "estate.apply.exclude_intent",
+            Self::EstateApplyExcludeAppended => "estate.apply.exclude_appended",
+            Self::EstateApplyBesideRefs => "estate.apply.beside_refs",
+            Self::EstateCarryRecorded => "estate.carry.recorded",
+            Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
+            Self::ReseatAfterPublish => "reseat.after_publish",
+            Self::ReseatAfterExtendIntent => "reseat.after_extend_intent",
+            Self::ReseatMidExtend => "reseat.mid_extend",
+            Self::ReseatAfterExtend => "reseat.after_extend",
+            Self::ReseatAfterSupersedeExchange => "reseat.after_supersede_exchange",
+            Self::ReseatAfterRowInsert => "reseat.after_row_insert",
+            Self::ReseatAfterSynthRowInsert => "reseat.after_synth_row_insert",
+            Self::ReseatAfterCwdUpdate => "reseat.after_cwd_update",
+            Self::ReseatAfterRegularizeExchange => "reseat.after_regularize_exchange",
+            Self::ReseatAfterUndoCwd => "reseat.after_undo_cwd",
+            Self::ReseatAfterUndoExchange => "reseat.after_undo_exchange",
+            Self::ReseatAfterReplaceIntent => "reseat.after_replace_intent",
+            Self::ReseatAfterReplaceExchange => "reseat.after_replace_exchange",
+            Self::ReseatBeforeReplaceDone => "reseat.before_replace_done",
+            Self::EstateHandoffAfterIntent => "estate.handoff.after_intent",
+            Self::EstateHandoffAfterTemp => "estate.handoff.after_temp",
+            Self::EstateHandoffAfterExchange => "estate.handoff.after_exchange",
+            Self::EstateHandoffAfterRecord => "estate.handoff.after_record",
+            Self::EstateHandoffClearAfterExchange => "estate.handoff.clear_after_exchange",
+            Self::EstateHandoffLiftAfterUnlink => "estate.handoff.lift_after_unlink",
         }
     }
 

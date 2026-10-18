@@ -2,7 +2,7 @@
 //!
 //! Each variant has a stable machine-readable code, and variants are grouped
 //! into families by prefix: `Snapshot*`, `Capture*`, `Digest*`, `Git*`,
-//! `Sqlite*`, `Path*`, `Protocol*` and `Budget*`.
+//! `Sqlite*`, `Path*`, `Protocol*`, `Budget*` and `Reseat*`.
 //!
 //! Every variant has at least one constructor outside test code
 //! (`crates/bulkload-agent/tests/refusal_taxonomy.rs`, WP3): a code nothing
@@ -126,6 +126,27 @@ pub enum BulkloadRefusal {
     /// item's proof failed before anything but an additive object import
     /// was written; the operator's change is never overwritten.
     GitDestinationModified,
+    /// `estate-handoff` (TIN-6569, OI-1003-Q183): the workspace has no
+    /// workspace ledger for the SOURCE label (never applied, refused, or
+    /// its journal missing), so there is no landing to hand off. Nothing is
+    /// written.
+    HandoffNotLanded,
+    /// `estate-handoff`: a target (`AGENTS.md`, `CLAUDE.md`, an opted-in
+    /// `README.md`) is a directory, a FIFO or another file that is not
+    /// regular, or a symbolic link that is not `CLAUDE.md -> AGENTS.md`
+    /// (or the other way round) inside the worktree. Nothing is written for
+    /// the whole workspace.
+    HandoffTargetUnsupported,
+    /// `estate-handoff`: a hand-off marker at byte 0 that is not the block
+    /// bulkload recorded (an edit inside the block, a block with no record,
+    /// a BEGIN with no END), or a writer that changed the file while the
+    /// hand-off exchanged it. The file is the user's: nothing is written,
+    /// an exchange is undone.
+    HandoffBlockModified,
+    /// `estate-handoff --check`: the hand-off block's do-not-commit token
+    /// is in a target's index blob, its HEAD blob or a destination-ahead
+    /// tip's blob. Read-only; nothing is written.
+    HandoffMarkerCommitted,
     /// `estate-apply --adopt` (#226, OI-1003-Q171/Q172): a destination
     /// bulkload never landed holds the item's path, its repository is the
     /// capture's (related), and it differs from the current capture in a
@@ -181,6 +202,37 @@ pub enum BulkloadRefusal {
     /// Carries the nest's path relative to the enclosing checkout;
     /// [`fmt::Display`] prints it escaped.
     GitNestCarrierRefused(Vec<u8>),
+    /// `estate-carry-files` (M2r2 b) landed a `.git` pointer file or symlink
+    /// that resolves, where it landed, to an existing directory outside the
+    /// carried tree: Git would act on that repository through the carried
+    /// copy. The item is not recorded as carried; the landed bytes are left
+    /// for the operator. Carries the entry's path relative to the
+    /// destination; [`fmt::Display`] prints it escaped.
+    GitCarryPointerAttached(Vec<u8>),
+    /// A `.git` gitdir-pointer file below the captured checkout names an
+    /// administration that is not its own (M2r2 item 6), either:
+    /// - one absent on this host: the directory it names does not exist or
+    ///   is not a directory (a copy of a pruned linked worktree, one carried
+    ///   from another host, a submodule whose `.git/modules` entry was
+    ///   removed, a pointer through a dangling symlink or an absent mount).
+    ///   Git does not read the directory as a repository; or
+    /// - a worktree administration of this repository whose registered
+    ///   checkout exists and points back to it: a copy of that live
+    ///   worktree, through which Git would act on the live worktree's HEAD
+    ///   and index.
+    ///
+    /// Neither is a nest the capture can carry, nor bytes it can claim as
+    /// seats. Carries the directory's path relative to the captured
+    /// checkout; [`fmt::Display`] prints it escaped.
+    GitNestPointerStale(Vec<u8>),
+    /// A `.git` gitdir-pointer file below the captured checkout names a
+    /// worktree administration of this repository whose registered checkout
+    /// is absent: a linked worktree moved (or copied) without `git worktree
+    /// repair`. Git still works there; `git worktree repair <dir>` run in the
+    /// moved worktree re-registers it (M2r2 item 6). Carries the directory's
+    /// path relative to the captured checkout; [`fmt::Display`] prints it
+    /// escaped.
+    GitNestWorktreeMoved(Vec<u8>),
     /// A path given as a repository is not that repository's root: Git would
     /// resolve it to an enclosing repository, or to none at all.
     GitRepositoryNotAtPath,
@@ -252,7 +304,10 @@ pub enum BulkloadRefusal {
     BudgetExceeded,
     /// Writing the planned bytes would leave the destination filesystem with
     /// less free space than the configured floor (`--min-free-percent`,
-    /// default 25%), or with no room at all (OI-1001-Q2).
+    /// default 25%), or with no room at all (OI-1001-Q2). Inside a
+    /// project-quota tree the quota is a second limit, its floor that
+    /// percent of the quota's own limit; the binary names the limit that
+    /// bound and both limits' numbers (`space_refusal`).
     DestinationSpaceInsufficient,
     /// A write met `ENOSPC` or `EDQUOT` (S4, #220, #126), named by the site
     /// that knows where it wrote: one of bulkload's own temporaries (under
@@ -294,6 +349,92 @@ pub enum BulkloadRefusal {
     /// A worker thread, or the peer of one of its channels, ended before the
     /// work it owned was done (WP3).
     WorkerLost,
+
+    // ---- agent session re-seat (R0, TIN-6587) -------------------------------
+    /// `estate-reseat`: the destination already holds a file at a session's
+    /// place that is neither the landed copy nor a byte prefix of it. It is
+    /// kept as it is; the landed copy stays beside it in the landing, and
+    /// both are reported for explicit resolution (never overwritten).
+    ReseatDestDiverged,
+    /// `estate-reseat`: a file this ledger placed changed at the destination
+    /// since its last pass (a session resumed there appends to its
+    /// transcript). The destination owns it from now on; it is never
+    /// extended again, and newer landed bytes stay in the landing.
+    ReseatDestContinued,
+    /// `estate-reseat`: the landed file no longer extends the bytes placed
+    /// from it (it shrank, or the BLAKE3 of the placed bytes no longer
+    /// matches its prefix). Nothing is written; the placed file is kept.
+    ReseatSourceRewritten,
+    /// `estate-reseat`: a session's recorded working directory has no lane
+    /// on the destination (no `--map`, not under the source home's `git`).
+    /// The session stays in the landing and is reported.
+    ReseatLaneUnmapped,
+    /// `estate-reseat`: a landed transcript records no working directory, or
+    /// one whose project key is not the directory it was landed under, so
+    /// its lane cannot be derived. Nothing is placed for it.
+    ReseatLaneUnresolved,
+    /// `estate-reseat`: the destination's Claude Code `cleanupPeriodDays`
+    /// (default 30) would delete a re-seated transcript at its next start,
+    /// because the transcript keeps its source modification time. Nothing
+    /// of Claude's is placed.
+    ReseatRetentionUnsafe,
+    /// `estate-reseat`: the destination's Codex thread index already holds
+    /// a row for a thread under another working directory or rollout path.
+    /// The row is never updated (insert only); the thread is reported.
+    ReseatIndexConflict,
+    /// `estate-reseat`: a landed rollout is in a form the destination's
+    /// Codex cannot read (`.jsonl.gz`), or a landed file cannot be read as
+    /// its form (a corrupt `.jsonl.zst`). It stays in the landing as a file
+    /// and is not registered.
+    ReseatUnreadableForm,
+    /// `estate-reseat`: a landed agent tree the run was asked to re-seat
+    /// (`.claude` or `.codex` under the landed home) is absent or not a
+    /// directory (a symlink to a source-only volume). Nothing is written;
+    /// `--no-claude` / `--no-codex` leave a tool out explicitly.
+    ReseatLandingAbsent,
+    /// `estate-reseat`: the destination has no Codex thread index
+    /// (`state_5.sqlite`) to register landed threads in. Placing rollouts
+    /// without rows would let the destination's first Codex start backfill
+    /// them under the source's working directory, out of every lane's
+    /// picker for good, so nothing is written until Codex has run there
+    /// once (or `--no-codex`).
+    ReseatIndexAbsent,
+    /// `estate-reseat`: a landed rollout has no row in the landed Codex
+    /// snapshot. Its file is placed (resumable by ID) but no row is made up
+    /// for it, so no picker lists it; it is reported for explicit
+    /// resolution.
+    ReseatIndexRowAbsent,
+    /// `estate-reseat`: two landed files map to one destination path (two
+    /// source project keys mapped onto one destination key). The first
+    /// keeps the path; the other stays in the landing and is reported,
+    /// never superseding it.
+    ReseatLaneCollision,
+    /// `estate-reseat`: a destination writer (a session resumed there)
+    /// appended to a transcript while a pass was extending it. The pass
+    /// stopped between whole lines; the file is the destination's from
+    /// then on and the rest of the landed bytes stay in the landing.
+    ReseatExtendRaced,
+    /// `estate-reseat`: another `estate-reseat` holds this run's private
+    /// state or a destination agent root (an exclusive `flock` on each):
+    /// two runs never write one destination at once (OI-1003-Q198 review).
+    ReseatLocked,
+    /// `estate-reseat`: a symlinked destination transcript's target changed
+    /// while it was being regularized into a regular file (OI-1003-Q198
+    /// and its re-review): nothing that holds a session's bytes is removed
+    /// or replaced; the archive and the copy are both kept (the link left
+    /// or put back and the copy kept aside, or the copy at the path when
+    /// both were written).
+    ReseatRegularizeRaced,
+    /// `estate-reseat --undo`: the archive target a regularization row's
+    /// link names is absent, not a regular file, or no longer holds the
+    /// bytes the regular copy was made from (OI-1003-Q198 re-review): the
+    /// link is not put back, the regular file is kept, nothing changes.
+    ReseatUndoTargetChanged,
+    /// `estate-reseat --check`: at least one lane failed the R0 acceptance
+    /// check (its sessions are not listable and byte-identical in its
+    /// destination working directory, its Git state is not equal, or its
+    /// hand-off note is missing), or a check component was not given.
+    ReseatR0Failed,
 
     // ---- handoff proof ------------------------------------------------------
     /// A credential-class probe did not prove what it set out to prove.
@@ -356,6 +497,10 @@ impl BulkloadRefusal {
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitDestinationModified => "GIT_DESTINATION_MODIFIED",
             Self::GitDestinationDiverged => "GIT_DESTINATION_DIVERGED",
+            Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
+            Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
+            Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
+            Self::HandoffMarkerCommitted => "HANDOFF_MARKER_COMMITTED",
             Self::GitConvergeShapeChanged => "GIT_CONVERGE_SHAPE_CHANGED",
             Self::GitConvergeStaleCapture => "GIT_CONVERGE_STALE_CAPTURE",
             Self::GitConvergeInterrupted => "GIT_CONVERGE_INTERRUPTED",
@@ -367,6 +512,9 @@ impl BulkloadRefusal {
             Self::GitNestConversionAttribute(_) => "GIT_NEST_CONVERSION_ATTRIBUTE",
             Self::GitNestPopulatedSubmodule(_) => "GIT_NEST_POPULATED_SUBMODULE",
             Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
+            Self::GitCarryPointerAttached(_) => "GIT_CARRY_POINTER_ATTACHED",
+            Self::GitNestPointerStale(_) => "GIT_NEST_POINTER_STALE",
+            Self::GitNestWorktreeMoved(_) => "GIT_NEST_WORKTREE_MOVED",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
@@ -387,6 +535,23 @@ impl BulkloadRefusal {
             Self::FrameCodec => "FRAME_CODEC",
             Self::ProtocolStateViolation => "PROTOCOL_STATE_VIOLATION",
             Self::WorkerLost => "WORKER_LOST",
+            Self::ReseatDestDiverged => "RESEAT_DEST_DIVERGED",
+            Self::ReseatDestContinued => "RESEAT_DEST_CONTINUED",
+            Self::ReseatSourceRewritten => "RESEAT_SOURCE_REWRITTEN",
+            Self::ReseatLaneUnmapped => "RESEAT_LANE_UNMAPPED",
+            Self::ReseatLaneUnresolved => "RESEAT_LANE_UNRESOLVED",
+            Self::ReseatRetentionUnsafe => "RESEAT_RETENTION_UNSAFE",
+            Self::ReseatIndexConflict => "RESEAT_INDEX_CONFLICT",
+            Self::ReseatUnreadableForm => "RESEAT_UNREADABLE_FORM",
+            Self::ReseatLandingAbsent => "RESEAT_LANDING_ABSENT",
+            Self::ReseatIndexAbsent => "RESEAT_INDEX_ABSENT",
+            Self::ReseatIndexRowAbsent => "RESEAT_INDEX_ROW_ABSENT",
+            Self::ReseatLaneCollision => "RESEAT_LANE_COLLISION",
+            Self::ReseatExtendRaced => "RESEAT_EXTEND_RACED",
+            Self::ReseatLocked => "RESEAT_LOCKED",
+            Self::ReseatRegularizeRaced => "RESEAT_REGULARIZE_RACED",
+            Self::ReseatUndoTargetChanged => "RESEAT_UNDO_TARGET_CHANGED",
+            Self::ReseatR0Failed => "RESEAT_R0_FAILED",
             Self::ProbeFailed => "PROBE_FAILED",
             Self::Io(_) => "IO",
         }
@@ -427,6 +592,10 @@ impl BulkloadRefusal {
         "GIT_DESTINATION_OCCUPIED",
         "GIT_DESTINATION_MODIFIED",
         "GIT_DESTINATION_DIVERGED",
+        "HANDOFF_NOT_LANDED",
+        "HANDOFF_TARGET_UNSUPPORTED",
+        "HANDOFF_BLOCK_MODIFIED",
+        "HANDOFF_MARKER_COMMITTED",
         "GIT_CONVERGE_SHAPE_CHANGED",
         "GIT_CONVERGE_STALE_CAPTURE",
         "GIT_CONVERGE_INTERRUPTED",
@@ -438,6 +607,9 @@ impl BulkloadRefusal {
         "GIT_NEST_CONVERSION_ATTRIBUTE",
         "GIT_NEST_POPULATED_SUBMODULE",
         "GIT_NEST_CARRIER_REFUSED",
+        "GIT_CARRY_POINTER_ATTACHED",
+        "GIT_NEST_POINTER_STALE",
+        "GIT_NEST_WORKTREE_MOVED",
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_SOURCE_PARTIAL_CLONE",
@@ -458,6 +630,23 @@ impl BulkloadRefusal {
         "FRAME_CODEC",
         "PROTOCOL_STATE_VIOLATION",
         "WORKER_LOST",
+        "RESEAT_DEST_DIVERGED",
+        "RESEAT_DEST_CONTINUED",
+        "RESEAT_SOURCE_REWRITTEN",
+        "RESEAT_LANE_UNMAPPED",
+        "RESEAT_LANE_UNRESOLVED",
+        "RESEAT_RETENTION_UNSAFE",
+        "RESEAT_INDEX_CONFLICT",
+        "RESEAT_UNREADABLE_FORM",
+        "RESEAT_LANDING_ABSENT",
+        "RESEAT_INDEX_ABSENT",
+        "RESEAT_INDEX_ROW_ABSENT",
+        "RESEAT_LANE_COLLISION",
+        "RESEAT_EXTEND_RACED",
+        "RESEAT_LOCKED",
+        "RESEAT_REGULARIZE_RACED",
+        "RESEAT_UNDO_TARGET_CHANGED",
+        "RESEAT_R0_FAILED",
         "PROBE_FAILED",
         "IO",
     ];
@@ -484,6 +673,9 @@ impl fmt::Display for BulkloadRefusal {
             | Self::GitNestConversionAttribute(ref path)
             | Self::GitNestPopulatedSubmodule(ref path)
             | Self::GitNestCarrierRefused(ref path)
+            | Self::GitCarryPointerAttached(ref path)
+            | Self::GitNestPointerStale(ref path)
+            | Self::GitNestWorktreeMoved(ref path)
             | Self::GitSourceAlternates(ref path)
             | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
@@ -626,6 +818,8 @@ mod tests {
     /// Codes are the wire identity of a refusal: they must be unique and
     /// `SCREAMING_SNAKE_CASE`.
     #[test]
+    // One row per refusal: the list grows with the taxonomy.
+    #[allow(clippy::too_many_lines)]
     fn codes_are_unique_and_well_formed() {
         let all = [
             BulkloadRefusal::SnapshotRootsOverlap,
@@ -657,6 +851,10 @@ mod tests {
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitDestinationModified,
             BulkloadRefusal::GitDestinationDiverged,
+            BulkloadRefusal::HandoffNotLanded,
+            BulkloadRefusal::HandoffTargetUnsupported,
+            BulkloadRefusal::HandoffBlockModified,
+            BulkloadRefusal::HandoffMarkerCommitted,
             BulkloadRefusal::GitConvergeShapeChanged,
             BulkloadRefusal::GitConvergeStaleCapture,
             BulkloadRefusal::GitConvergeInterrupted,
@@ -668,6 +866,9 @@ mod tests {
             BulkloadRefusal::GitNestConversionAttribute(Vec::new()),
             BulkloadRefusal::GitNestPopulatedSubmodule(Vec::new()),
             BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
+            BulkloadRefusal::GitCarryPointerAttached(Vec::new()),
+            BulkloadRefusal::GitNestPointerStale(Vec::new()),
+            BulkloadRefusal::GitNestWorktreeMoved(Vec::new()),
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitSourcePartialClone,
@@ -688,6 +889,23 @@ mod tests {
             BulkloadRefusal::FrameCodec,
             BulkloadRefusal::ProtocolStateViolation,
             BulkloadRefusal::WorkerLost,
+            BulkloadRefusal::ReseatDestDiverged,
+            BulkloadRefusal::ReseatDestContinued,
+            BulkloadRefusal::ReseatSourceRewritten,
+            BulkloadRefusal::ReseatLaneUnmapped,
+            BulkloadRefusal::ReseatLaneUnresolved,
+            BulkloadRefusal::ReseatRetentionUnsafe,
+            BulkloadRefusal::ReseatIndexConflict,
+            BulkloadRefusal::ReseatUnreadableForm,
+            BulkloadRefusal::ReseatLandingAbsent,
+            BulkloadRefusal::ReseatIndexAbsent,
+            BulkloadRefusal::ReseatIndexRowAbsent,
+            BulkloadRefusal::ReseatLaneCollision,
+            BulkloadRefusal::ReseatExtendRaced,
+            BulkloadRefusal::ReseatLocked,
+            BulkloadRefusal::ReseatRegularizeRaced,
+            BulkloadRefusal::ReseatUndoTargetChanged,
+            BulkloadRefusal::ReseatR0Failed,
             BulkloadRefusal::ProbeFailed,
             BulkloadRefusal::Io(None),
         ];
@@ -728,6 +946,14 @@ mod tests {
             BulkloadRefusal::GitSourceAlternates(b"/s/objects/info/alternates".to_vec())
                 .to_string(),
             "GIT_SOURCE_ALTERNATES path=\"/s/objects/info/alternates\""
+        );
+        assert_eq!(
+            BulkloadRefusal::GitNestPointerStale(b"build/old \"tree\"".to_vec()).to_string(),
+            "GIT_NEST_POINTER_STALE path=\"build/old \\\"tree\\\"\""
+        );
+        assert_eq!(
+            BulkloadRefusal::GitNestWorktreeMoved(b"wt/after".to_vec()).to_string(),
+            "GIT_NEST_WORKTREE_MOVED path=\"wt/after\""
         );
     }
 

@@ -57,6 +57,32 @@ pub struct Landing<'a> {
     pub observed_ns: i128,
     /// The capture's bundle digest.
     pub capture: [u8; 32],
+    /// Where an estate apply records the parents a first landing creates
+    /// (`{item}-{source}.parents` in STATE; M2 finding 1). `None` (a CLI
+    /// restore) keeps `GIT_DESTINATION_PARENT_MISSING` for an absent
+    /// parent.
+    pub parents: Option<&'a Path>,
+    /// `--exclude-union` (M2 round 2, item 2): where an estate apply
+    /// records the lines a first linked landing appends to the common
+    /// `info/exclude` (`{item}-{source}.exclude-union` in STATE,
+    /// [`super::exclude_union`]). `None` keeps
+    /// `GIT_IGNORE_POLICY_CONFLICT` for any exclude that is not the
+    /// capture's.
+    pub exclude_union: Option<&'a Path>,
+    /// A beside landing (`estate-apply --beside`, M2 round 2 item c): a
+    /// first linked landing into the planned repository at the beside path,
+    /// detached at the captured head, that never steps the repository's
+    /// native refs.
+    pub beside: bool,
+}
+
+impl<'a> Landing<'a> {
+    /// The record [`super::parents::FirstTarget::place`] appends to, with
+    /// the item it names.
+    #[must_use]
+    pub fn parents_record(&self) -> Option<(&'a Path, &'a str)> {
+        self.parents.map(|record| (record, self.item))
+    }
 }
 
 /// What an apply did, for its receipt.
@@ -792,14 +818,29 @@ pub(super) fn settle_repository(repo: &Path, common: &Path, source: &str) -> Res
 
 // ---- the seat delta ----------------------------------------------------------
 
-/// One side of a seat: what the capture holds at a path.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One side of a seat: what the capture holds at a path. `prefix` (the old
+/// side only, [`handoff::landed_sides`]) lists the hand-off blocks the seat
+/// may carry above its landed bytes (TIN-6569, OI-1003-Q183); it is not
+/// part of the side's identity, so the delta never plans a write for it.
+#[derive(Debug, Clone)]
 struct Side {
     kind: Kind,
     mode: u32,
     blob: Option<String>,
     link: Option<Vec<u8>>,
+    prefix: Vec<handoff::Prefix>,
 }
+
+impl PartialEq for Side {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind
+            && self.mode == other.mode
+            && self.blob == other.blob
+            && self.link == other.link
+    }
+}
+
+impl Eq for Side {}
 
 fn sides(repo: &Path, meta: &Meta) -> Result<BTreeMap<Vec<u8>, Side>> {
     let rows = meta.rows(repo)?;
@@ -845,6 +886,7 @@ fn sides(repo: &Path, meta: &Meta) -> Result<BTreeMap<Vec<u8>, Side>> {
                 mode: row.mode & 0o777,
                 blob,
                 link: row.link_target.clone(),
+                prefix: Vec::new(),
             },
         );
     }
@@ -995,6 +1037,17 @@ impl Seat {
     }
 }
 
+/// A planned destination's `lstat`: also absent (`None`) when a path above
+/// it is not a directory (`ENOTDIR`), where nothing can be: its first
+/// landing's parent check then types it `GIT_DESTINATION_PARENT_MISSING`
+/// (M2 finding 1), never a bare IO errno.
+fn planned(path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.raw_os_error() == Some(libc::ENOTDIR) => Ok(None),
+        _ => lstat(path),
+    }
+}
+
 fn lstat(path: &Path) -> Result<Option<fs::Metadata>> {
     match fs::symlink_metadata(path) {
         Ok(meta) => Ok(Some(meta)),
@@ -1043,7 +1096,11 @@ fn write_temp(seat: &Seat, side: &Side, objects: &mut BatchObjects) -> Result<Op
 
 /// Whether the seat at `path` holds `side`'s content (kind, bytes or link
 /// target; not the mode). Reads destination bytes only, counted, compared
-/// with the blob as the object store holds it.
+/// with the blob as the object store holds it. A regular seat whose side
+/// carries hand-off prefixes also holds it as one of those blocks followed
+/// by the blob (TIN-6569: the block is bulkload's, never work), or by the
+/// blob without the carried blocks a recorded `--clear --clear-carried`
+/// removed from its head (OI-1003-Q190).
 fn holds(objects: &mut BatchObjects, path: &Path, side: &Side) -> Result<bool> {
     let Some(meta) = lstat(path)? else {
         return Ok(false);
@@ -1064,40 +1121,77 @@ fn holds(objects: &mut BatchObjects, path: &Path, side: &Side) -> Result<bool> {
                 .blob
                 .as_deref()
                 .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-            let file = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-                .refuse_at("git_carry::converge::holds")?;
-            let mut compare = Compare {
-                file: std::io::BufReader::new(file),
-                equal: true,
-                scratch: Vec::new(),
+            let open = || {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                    .open(path)
+                    .refuse_at("git_carry::converge::holds")
             };
-            let length = objects.copy_into(blob, &mut compare, None);
-            let mut rest = [0u8; 1];
-            let ended = std::io::Read::read(&mut compare.file, &mut rest)
-                .refuse_at("git_carry::converge::holds")?
-                == 0;
-            crate::counters::add_len(
-                crate::counters::Counter::DestVerifyRead,
-                usize::try_from(meta.len()).unwrap_or(usize::MAX),
-            );
-            length.map(|_| compare.equal && ended)
+            let candidates = if side.prefix.is_empty() {
+                Vec::new()
+            } else {
+                handoff::matching(&mut open()?, &side.prefix)?
+            };
+            for prefix in candidates {
+                let mut file = open()?;
+                std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(prefix.len))
+                    .refuse_at("git_carry::converge::holds")?;
+                if holds_blob(objects, file, blob, prefix.strip, meta.len())? {
+                    return Ok(true);
+                }
+            }
+            holds_blob(objects, open()?, blob, 0, meta.len())
         }
     }
 }
 
-/// A writer that compares what it is given with a file's next bytes.
+// Whether `file`, from its position on, is `blob`'s bytes after its first
+// `skip` and nothing more.
+fn holds_blob(
+    objects: &mut BatchObjects,
+    file: fs::File,
+    blob: &str,
+    skip: u64,
+    len: u64,
+) -> Result<bool> {
+    let mut compare = Compare {
+        file: std::io::BufReader::new(file),
+        equal: true,
+        scratch: Vec::new(),
+        skip,
+    };
+    let length = objects.copy_into(blob, &mut compare, None);
+    let mut rest = [0u8; 1];
+    let ended = std::io::Read::read(&mut compare.file, &mut rest)
+        .refuse_at("git_carry::converge::holds")?
+        == 0;
+    crate::counters::add_len(
+        crate::counters::Counter::DestVerifyRead,
+        usize::try_from(len).unwrap_or(usize::MAX),
+    );
+    length.map(|_| compare.equal && ended && compare.skip == 0)
+}
+
+/// A writer that compares what it is given, after its first `skip` bytes,
+/// with a file's next bytes.
 struct Compare {
     file: std::io::BufReader<fs::File>,
     equal: bool,
     scratch: Vec<u8>,
+    skip: u64,
 }
 
 impl std::io::Write for Compare {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self.equal {
+    fn write(&mut self, given: &[u8]) -> std::io::Result<usize> {
+        let skipped = usize::try_from(self.skip)
+            .unwrap_or(usize::MAX)
+            .min(given.len());
+        self.skip = self
+            .skip
+            .saturating_sub(u64::try_from(skipped).unwrap_or(u64::MAX));
+        let bytes = given.get(skipped..).unwrap_or_default();
+        if self.equal && !bytes.is_empty() {
             self.scratch.resize(bytes.len(), 0);
             let mut filled = 0;
             while filled < bytes.len() {
@@ -1112,7 +1206,7 @@ impl std::io::Write for Compare {
             }
             self.equal = filled == bytes.len() && self.scratch.get(..filled) == Some(bytes);
         }
-        Ok(bytes.len())
+        Ok(given.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1170,9 +1264,20 @@ fn prove(
             prints.insert(seat.path.clone(), seat.clone());
             continue;
         }
+        let side = old.get(&seat.path).ok_or_else(|| modified.clone())?;
+        // A hand-off record's print of the seat (its block on the landed
+        // bytes), unchanged and not racy, is trusted as the ledger's is
+        // (TIN-6569).
+        if side
+            .prefix
+            .iter()
+            .any(|prefix| prefix.trusted.as_ref().is_some_and(|print| now.same(print)))
+        {
+            prints.insert(seat.path.clone(), now);
+            continue;
+        }
         // The content fallback: the landed bytes, under a print that held
         // still while they were read, are adopted under that print.
-        let side = old.get(&seat.path).ok_or_else(|| modified.clone())?;
         if !holds(&mut objects, &path, side)? {
             return Err(modified);
         }
@@ -1992,6 +2097,7 @@ impl Place<'_> {
 /// item was removed), `GIT_DESTINATION_OCCUPIED` (not bulkload's, or
 /// another item's), `GIT_CONVERGE_STALE_CAPTURE`, `GIT_CONVERGE_SHAPE_CHANGED`,
 /// `GIT_CONVERGE_INTERRUPTED`, or whatever the restore or import refuses.
+#[allow(clippy::too_many_lines)]
 pub fn apply_workspace(
     staged: &super::StagedBundle,
     target: &Target<'_>,
@@ -2004,7 +2110,7 @@ pub fn apply_workspace(
         .workspace
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
     let standalone = workspace == target.repository;
-    if lstat(workspace)?.is_none() {
+    if planned(workspace)?.is_none() {
         // Finding 13: a checkout this item landed before and the operator
         // removed is not laid down again.
         if landed_before {
@@ -2070,6 +2176,12 @@ pub fn apply_workspace(
         super::recover_linked_landing(&destination, &place.common, target.source, &intent)?;
         landed::remove(&landing_intent)?;
         custody.count("landing-recovered");
+        // A beside landing (M2 round 2 item c) is finished forward and
+        // never converged: a converge could attach a branch of the
+        // operator's repository.
+        if landing.beside {
+            return Ok(Applied::of(false, &custody));
+        }
     }
     let mut ledger: LandedWorkspace =
         landed::read(&ledger_path)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
@@ -2094,7 +2206,7 @@ pub fn apply_workspace(
         ledger = landed::read(&ledger_path)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
     }
     let meta0 = Meta::read(workspace, place.source, &ledger.instance)?;
-    let old = sides(workspace, &meta0)?;
+    let old = handoff::landed_sides(workspace, &place.git_dir, place.source, &meta0)?;
     if ledger.capture == landing.capture {
         // A6 (finding 15a): the ledger is ahead of the journal; prove it.
         prove(workspace, &place.common, &ledger, standalone, &old)?;
@@ -2136,6 +2248,15 @@ fn converge(
     shape(meta0, &meta1)?;
     let new = sides(worktree, &meta1)?;
     let ops = delta(old, &new);
+    // TIN-6569: a file the hand-off created where the source now adds one
+    // is bulkload's own when it is exactly its recorded block: lifted
+    // before the clash check (design 6.3).
+    let adds: Vec<&[u8]> = ops
+        .iter()
+        .filter(|op| op.action == Action::Add && !old.contains_key(&op.path))
+        .map(|op| op.path.as_slice())
+        .collect();
+    let lifted = handoff::lift(worktree, &place.git_dir, place.source, &adds)?;
     // A seat a third party put where the source added one (after an
     // additive import; nothing else written).
     // A path the converge removes first is the landed seat's, checked by
@@ -2280,6 +2401,7 @@ fn converge(
         landed::remove(&intent_path)?;
         fault_point!(EstateConvergeAfterLanded);
         custody.merge(engine.custody);
+        custody.add("handoff-lifted", lifted);
         Ok(custody)
     };
     after().map_err(after_intent)
@@ -2323,7 +2445,10 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
     let mut intent: WorkspaceIntent = landed::read(&intent_path)?.ok_or_else(interrupted)?;
     let meta0 = Meta::read(worktree, place.source, &ledger.instance)?;
     let meta1 = Meta::read(worktree, place.source, &intent.to_instance)?;
-    let (old, new) = (sides(worktree, &meta0)?, sides(worktree, &meta1)?);
+    let (old, new) = (
+        handoff::landed_sides(worktree, &place.git_dir, place.source, &meta0)?,
+        sides(worktree, &meta1)?,
+    );
     let mut custody = Custody::default();
     custody.add(
         "git-lock-removed",
@@ -2527,7 +2652,7 @@ pub fn apply_refs(
     let repo = target.repository;
     // A11c (#226 item 4): a bare capture into a path that does not exist
     // lands a bare repository bulkload makes itself, native refs and all.
-    if staged.is_bare() && lstat(repo)?.is_none() {
+    if staged.is_bare() && planned(repo)?.is_none() {
         return super::land_bare_staged(
             staged,
             repo,
@@ -2724,28 +2849,31 @@ pub(super) fn land_standalone_refs(
 /// report of it): the checks it makes before anything is read from the
 /// capture or written anywhere. A bare capture is
 /// `GIT_BARE_CAPTURE_WORKSPACE`, a path already there
-/// `GIT_DESTINATION_OCCUPIED`, a parent that does not exist
-/// `GIT_DESTINATION_PARENT_MISSING`. Returns the path with its parent
-/// canonical.
+/// `GIT_DESTINATION_OCCUPIED`, absent parents an estate apply may not make
+/// (a symlink or a non-directory where they would start, M2 finding 1)
+/// `GIT_DESTINATION_PARENT_MISSING`. Returns the path, with its parent
+/// canonical or the absent parents the landing makes before its first
+/// write ([`super::parents::FirstTarget::place`]).
 ///
 /// # Errors
 /// As above.
 pub(super) fn first_landing_target(
     staged: &super::StagedBundle,
     destination: &Path,
-) -> Result<PathBuf> {
+) -> Result<super::parents::FirstTarget> {
     super::refuse_bare_capture(staged)?;
     if destination.symlink_metadata().is_ok() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
-    super::linked_destination(destination)
+    super::parents::FirstTarget::of(destination)
 }
 
 /// What a first linked landing decided before its first write to the
 /// destination repository ([`check_linked`]).
 pub(super) struct LinkedChecked {
-    /// The new worktree's path, its parent canonical.
-    pub destination: PathBuf,
+    /// The new worktree's path: its parent canonical, or its absent
+    /// parents, made by the landing after these checks (M2 finding 1).
+    pub destination: super::parents::FirstTarget,
     /// The plan's repository, canonical.
     pub repository: PathBuf,
     /// The capture's ref lines (`shallow::headers`'s form).
@@ -2756,6 +2884,9 @@ pub(super) struct LinkedChecked {
     pub exclude_path: PathBuf,
     /// The capture's exclude bytes.
     pub captured_exclude: Vec<u8>,
+    /// The lines `--exclude-union` appends (empty when the exclude is kept
+    /// as it is).
+    pub exclude_union: Vec<Vec<u8>>,
     /// The worktree tree's `ls-tree -r -z` listing.
     pub entries: Vec<u8>,
 }
@@ -2770,7 +2901,9 @@ pub(super) struct LinkedChecked {
 /// `GIT_IGNORE_POLICY_CONFLICT`) and its intent-to-add custody. A refusal
 /// here leaves the destination repository's refs, objects and files as
 /// they were. `estate-diff` reports a first linked landing through this
-/// same function, so the report and the apply cannot disagree.
+/// same function, so the report and the apply cannot disagree. `union`
+/// (`--exclude-union`) decides the exclude by [`linked_exclude`]'s union
+/// rule; nothing is written here.
 ///
 /// # Errors
 /// As above; whatever reading the capture refuses.
@@ -2779,7 +2912,7 @@ pub(super) fn check_linked(
     (repository, base): (&Path, Option<&super::StagedBundle>),
     destination: &Path,
     source: &str,
-    observed_ns: i128,
+    (observed_ns, union): (i128, bool),
 ) -> Result<LinkedChecked> {
     const SITE: &str = "git_carry::converge::check_linked";
     let destination = first_landing_target(staged, destination)?;
@@ -2801,12 +2934,12 @@ pub(super) fn check_linked(
         "info/exclude",
     ]))?);
     let common = super::common_repository(&repository)?;
-    linked_exclude(
+    let (_, exclude_union) = linked_exclude(
         &common,
         &exclude_path,
         &captured_exclude,
         source,
-        observed_ns,
+        (observed_ns, union),
     )?;
     // #131: a capture whose intent-to-add custody cannot be restored
     // refuses with nothing laid down.
@@ -2827,13 +2960,19 @@ pub(super) fn check_linked(
         instance: scratch.instance,
         exclude_path,
         captured_exclude,
+        exclude_union,
         entries,
     })
 }
 
 /// The common `info/exclude` (at `path`) a first linked landing keeps: the
-/// capture's (`captured`), or a newer one the main item set (finding 12).
-/// Anything else is `GIT_IGNORE_POLICY_CONFLICT`: it is never overwritten.
+/// capture's (`captured`), or a newer one the main item set (finding 12),
+/// with no lines to append. Anything else is `GIT_IGNORE_POLICY_CONFLICT`:
+/// it is never overwritten. With `union` (`--exclude-union`, M2 round 2
+/// item 2) the existing bytes are kept with the captured lines they lack,
+/// to be appended, where [`super::exclude_union::plan`] allows it (no
+/// negation on either side, not a ledgered exclude, a regular file or
+/// absent); otherwise the refusal stands.
 ///
 /// # Errors
 /// As above; IO reading it.
@@ -2842,8 +2981,8 @@ pub(super) fn linked_exclude(
     path: &Path,
     captured: &[u8],
     source: &str,
-    t: i128,
-) -> Result<Vec<u8>> {
+    (t, union): (i128, bool),
+) -> Result<(Vec<u8>, Vec<Vec<u8>>)> {
     let existing = match fs::read(path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -2855,7 +2994,10 @@ pub(super) fn linked_exclude(
         }
     };
     if existing == captured || exclude_newer(common, source, &existing, t)? {
-        Ok(existing)
+        Ok((existing, Vec::new()))
+    } else if union {
+        let append = super::exclude_union::plan(common, path, &existing, captured)?;
+        Ok((existing, append))
     } else {
         Err(BulkloadRefusal::GitIgnorePolicyConflict)
     }
@@ -2888,6 +3030,7 @@ pub(super) struct LinkedPlan {
 /// compare-and-swap. A branch that cannot be attached is never a refusal:
 /// the worktree lands detached at the captured head (finding 11). A
 /// foreign repository keeps provenance only.
+#[allow(clippy::too_many_lines)]
 pub(super) fn plan_linked(
     checked: &LinkedChecked,
     (bundle, base): (&Path, Option<&super::StagedBundle>),
@@ -2900,13 +3043,20 @@ pub(super) fn plan_linked(
     let lock = landed::lock(&common, source)?;
     let directory = landed::ledger_dir(&common, source);
     let mut custody = settle_repository(repository, &common, source)?;
-    let exclude = linked_exclude(
+    // `--exclude-union`: under the repository-wide exclude lock, an append
+    // a crash cut short is settled first.
+    let exclude_path = checked.exclude_path.as_path();
+    let exclude_lock = union_settle(landing, &common, exclude_path)?;
+    let (exclude, append) = linked_exclude(
         &common,
         &checked.exclude_path,
         &checked.captured_exclude,
         source,
-        t,
+        (t, landing.exclude_union.is_some()),
     )?;
+    if landing.beside && !append.is_empty() {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
     if let Some(base) = base {
         super::import_verified(repository, base.path(), source)?;
     }
@@ -2916,8 +3066,10 @@ pub(super) fn plan_linked(
     }
     let instance = instance.as_str();
     let meta = Meta::read(repository, source, instance)?;
+    // A beside landing (M2 round 2 item c) never steps the repository's
+    // native refs: it is the operator's, whatever its marker says.
     let mut ledger = landed::read::<RefLedger>(&directory.join(landed::REFS_LANDED))?
-        .filter(|ledger| ledger.created);
+        .filter(|ledger| ledger.created && !landing.beside);
     let checked: BTreeSet<String> = checked_out_by(repository)?
         .into_iter()
         .map(|(_, branch)| branch)
@@ -2932,14 +3084,21 @@ pub(super) fn plan_linked(
         ledger = Some(next);
     }
     let (native, symrefs) = native_refs::native_refs(repository)?;
-    let head = head_plan(
-        meta.symbolic(repository)?.as_deref(),
+    let symbolic = meta.symbolic(repository)?;
+    let mut head = head_plan(
+        symbolic.as_deref().filter(|_| !landing.beside),
         meta.get("head")?,
         (&native, &symrefs),
         ledger.as_ref(),
         &checked,
         t,
     );
+    // A beside landing is detached at the captured head, its branch
+    // recorded: no branch of the operator's repository is created or moved.
+    if landing.beside {
+        head.intended = symbolic;
+        head.line = Some("head-detached-beside");
+    }
     let mut create = None;
     match (&head.branch, ledger) {
         (Some((name, before, after)), Some(mut next)) => {
@@ -2977,6 +3136,10 @@ pub(super) fn plan_linked(
     if let Some(line) = head.line {
         custody.count(line);
     }
+    // `--exclude-union`: the append is the plan's last write, after every
+    // refusal it can decide, under the lock.
+    let exclude = union_append(landing, exclude_path, exclude, &append, &mut custody)?;
+    drop(exclude_lock);
     Ok(LinkedPlan {
         head,
         meta,
@@ -2987,6 +3150,45 @@ pub(super) fn plan_linked(
         create,
         lock,
     })
+}
+
+/// `--exclude-union`: the repository-wide exclude lock, taken and held by
+/// the caller, and the item's intents settled under it; `None` without
+/// the flag.
+fn union_settle(landing: &Landing<'_>, common: &Path, path: &Path) -> Result<Option<fs::File>> {
+    let Some(record) = landing.exclude_union else {
+        return Ok(None);
+    };
+    let held = super::exclude_union::lock(common)?;
+    super::exclude_union::settle(record, path)?;
+    Ok(Some(held))
+}
+
+/// `--exclude-union`'s append of `append` to the exclude at `path` (which
+/// holds `exclude`), recorded; the exclude the landing keeps. Counts
+/// `exclude-appended=<lines>`: every appended line of the item's record no
+/// finished landing reported yet (this append's, and one a later refusal
+/// or a crash kept from its receipt).
+fn union_append(
+    landing: &Landing<'_>,
+    path: &Path,
+    exclude: Vec<u8>,
+    append: &[Vec<u8>],
+    custody: &mut Custody,
+) -> Result<Vec<u8>> {
+    let Some(record) = landing.exclude_union else {
+        return Ok(exclude);
+    };
+    let kept = if append.is_empty() {
+        exclude
+    } else {
+        super::exclude_union::apply((record, landing.item), path, &exclude, append)?
+    };
+    let lines = super::exclude_union::unreported(record, path)?;
+    if lines > 0 {
+        custody.add("exclude-appended", lines);
+    }
+    Ok(kept)
 }
 
 /// Whether a first linked landing may keep a common `info/exclude` that is
@@ -3040,6 +3242,7 @@ pub(super) fn finish_landing(
 
 mod adopt;
 pub mod diff;
+pub mod handoff;
 
 #[cfg(test)]
 mod tests;

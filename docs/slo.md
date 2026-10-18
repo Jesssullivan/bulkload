@@ -6,15 +6,39 @@ It also defines the SLOs every claim must be proven against. Where it conflicts
 with an older gate, the dated ruling here wins. Change it only by a new dated
 ruling, never by editing a number in place.
 
+**Scope (2026-10-16, editorial under R-N13; no new ruling).** This charter is
+the canonical source for the SLO definitions, their proof obligations and the
+rulings that amend them ([SOURCES.md](SOURCES.md)). What bulkload must achieve
+is [SPEC.md](SPEC.md) (bulkload#236); its conflict readings C1–C20 are
+standing rulings (OI-1003-Q194, Linear TIN-4543 comment `14484c4a`). SPEC
+does not supersede the Completion bar below: it keeps it as OI-1003-Q4's
+record (intent ledger SEAT-10; RUL-06 "Unchanged: SEAT-10") and adds when
+bulkload is done (C20). A superseded line below keeps its text and carries a
+bracketed `[2026-10-16: …]` pointer to what replaced it. The 2026-10-16
+amendment at the end indexes rulings not yet indexed here.
+
 ## Completion bar (OI-1003-Q4)
 
+[2026-10-16: SPEC.md keeps this bar as OI-1003-Q4's record (SEAT-10) and
+adds when bulkload is done: OI-1003-Q194 C20, the full run meets SPEC R0
+and R3 is proven. The intent ledger cites the second paragraph as the
+ruling record of OI-1003-Q13 (ONCE-08).]
+
 Bulkload is complete when its SLOs are **definable and provable**, not when a
-migration happens to succeed. Three bodies of work make up the bar:
+migration happens to succeed [2026-10-16: agent wording, not in OI-1003-Q4
+(SPEC.md, "Not superseded, and what is corrected"); it must not be read as
+"the migration does not count". The migration in full is part of the bar,
+below]. Three bodies of work make up the bar:
 
 - **Proofs**
-  - A whitepaper with a bibliography of prior art.
+  - A whitepaper with a bibliography of prior art. [2026-10-17: deleted under
+    R-C843 (TIN-4543 `ace8649c`), citing SPEC; R-C844: done is the R7 resume
+    test plus a hash manifest, and no paper is required.
+    `docs/whitepaper/bibliography.md` stays as prior-art salvage.]
   - Runtime proofs that can be demonstrated.
-  - A formal model of the protocol.
+  - A formal model of the protocol. [2026-10-17: deleted under R-C843; R-C844
+    requires no formal model. Only `docs/formal/EstateConverge.tla` stays,
+    until #237 is fixed.]
 - **Engineering**
   - Simplifications and refactors.
   - An adversarial architecture review.
@@ -29,20 +53,29 @@ full neo→sting migration is not a major scheduled event. It is one more run of
 a tool that is already trusted, no different from any other sync. Because S3
 and S5 hold, it can be started whenever convenient and repeated as neo's work
 lanes finish, and every rerun converges without re-reading anything. OI-1002-Q24
-(no full migration before bulkload is complete) still stands. What
+(no full migration before bulkload is complete) still stands [2026-10-16:
+relaxed for S1 by OI-1003-Q142, and superseded on order by OI-1003-Q194 C6
+(RUL-06): the full run does not wait for the proofs. SPEC also corrects the
+reading of Q24 as a *single* run. See the 2026-10-16 amendment]. What
 OI-1003-Q13 removes is the framing of that run as a one-off milestone.
 
 ## Core SLOs
 
 | SLO | Definition | Proof obligation |
 |---|---|---|
-| **S1 Faster than rclone** | Gate (a): local copy beats rclone, B/A/B/A/B order, B passes only if all 3 B reps pass (OI-1002-Q30). Gate (b): a neo→sting pull beats rclone over sftp. No hard wall-clock SLA for the migration run itself (OI-1003-Q3). | Gated samples under R-N81/R-N91 on the sealed corpus, then evidence in `docs/evidence/`. |
-| **S2 Never interrupt the source** (OI-1003-Q5, Q9) | **Proven properties:** bulkload never takes a git lock or any flock or lease on source repositories, never writes to the source, and never signals a process. It runs at background IO and CPU priority. **Measured budget:** with bulkload running, a reference agent workload on the source shows at most **+25 % p95 latency**, and bulkload adds at most **+2.0 to load1**. | The properties are covered by property tests plus the formal model. The budget is measured and recorded in every gated run. |
-| **S3 Idempotent incremental completion** (OI-1003-Q6, Q10) | A rerun reads **0 content bytes** for unchanged seats (R25 / R-N58), and its walk is metadata only. On an unchanged estate a rerun finishes in **≤ 10 % of the first pass's wall-clock**. After N changed files, a rerun reads only those files' changed chunks. As neo's work lanes complete, re-running sync brings them over with nothing re-walked for content and nothing re-read. | Counters `source_bytes_read` and `transferred_content_bytes`, plus the rerun/first-pass ratio, recorded per run. R25 is also covered by the formal model. |
-| **S4 Complete and accounted** (OI-1003-Q1) | The closure report shows **0 unaccounted**: every planned item is `applied`, `referenced-only`, or a typed refusal. Every typed refusal carries an operator-reviewed disposition (accept, re-carry, or abandon) before the run counts as complete. A bare `IO` or `FRAME_CODEC` never counts. A daily-work verdict on sting (#40) is required. | The native closure report plus a bound attestation ledger (#119, #133), and the disposition ledger. |
+| **S1 Faster than rclone** | Gate (a): local copy beats rclone, B/A/B/A/B order, B passes only if all 3 B reps pass (OI-1002-Q30). Gate (b): a neo→sting pull beats rclone over sftp. No hard wall-clock SLA for the migration run itself (OI-1003-Q3). [2026-10-16: both gates are decided on the hermetic rig and a neo→sting run is a field confirmation (OI-1003-Q97, amendment 2026-10-07). OI-1003-Q194 C2 makes cross-host gate (b) on an estate-shaped many-file corpus S1's headline and the rig's gate (a) a regression guard, and C3 reads the 1 % delta as a real in-place change to about 1 % of files; see the 2026-10-16 amendment.] | Gated samples under R-N81/R-N91 on the sealed corpus, then evidence in `docs/evidence/`. [2026-10-16: R-N91 is read as superseded by OI-1003-Q194 C18 together with SPEC R3 ("Samples run on live hosts"); RUL-18 itself names CONF-01/06/07/08, not R-N91. R-N81 stands; how its load gate fits SPEC R3 is open, see the 2026-10-16 amendment.] |
+| **S2 Never interrupt the source** (OI-1003-Q5, Q9) | **Proven properties:** bulkload never takes a git lock or any flock or lease on source repositories, never writes to the source, and never signals a process. [2026-10-16: with the counted exceptions OI-1003-Q16 (the SQLite backup's shared read lock), Q36 (`-shm`) and Q72 (empty `-wal`), below.] It runs at background IO and CPU priority. **Measured budget:** with bulkload running, a reference agent workload on the source shows at most **+25 % p95 latency**, and bulkload adds at most **+2.0 to load1**. | The properties are covered by property tests plus the formal model [2026-10-17: deleted under R-C843]. The budget is measured and recorded in every gated run. |
+| **S3 Idempotent incremental completion** (OI-1003-Q6, Q10) | A rerun reads **0 content bytes** for unchanged seats (R25 / R-N58), and its walk is metadata only. On an unchanged estate a rerun finishes in **≤ 10 % of the first pass's wall-clock**. After N changed files, a rerun reads only those files' changed chunks. As neo's work lanes complete, re-running sync brings them over with nothing re-walked for content and nothing re-read. | Counters `source_bytes_read` and `transferred_content_bytes`, plus the rerun/first-pass ratio, recorded per run. R25 is also covered by the formal model [2026-10-17: deleted under R-C843]. |
+| **S4 Complete and accounted** (OI-1003-Q1) | The closure report shows **0 unaccounted**: every planned item is `applied`, `referenced-only`, or a typed refusal. Every typed refusal carries an operator-reviewed disposition (accept, re-carry, or abandon) before the run counts as complete. A bare `IO` or `FRAME_CODEC` never counts. A daily-work verdict on sting (#40) is required. [2026-10-17: #40 was closed not_planned 2026-10-16 ~17:40Z; the S4 verdict carrier is Linear TIN-6592.] [2026-10-16: OI-1003-Q194 C14 adds a carried-as-files outcome, marked corrupt in closure, for trees and rescue copies bulkload cannot capture natively; no code records it yet. #40 tracks the handoff-verify probe verdict, not SPEC R0's resume check.] | The native closure report plus a bound attestation ledger (#119, #133), and the disposition ledger. |
 | **S5 Source stays live** (OI-1003-Q2) | Agents keep working on neo during the run. Bulkload tolerates movement as drift custody (R-N30, extended by OI-1003-Q11), and a final delta pass (#103) catches up. There is no freeze window. | Drift custody recorded per item; the delta pass is under S3. |
 
 ## Proof package (OI-1003-Q7)
+
+[2026-10-17: R-C844 (TIN-4543 `ace8649c`) supersedes OI-1003-Q4, Q7, Q32
+and Q155 here: done is the R7 resume test plus a hash manifest, and no paper
+or formal model is required. R-C843 deleted the whitepaper and the formal
+model (`docs/formal/EstateConverge.tla` stays until #237 is fixed). Runnable
+property tests stay as tests.]
 
 - **Whitepaper and bibliography.** Covers design, invariants, the SLO
   definitions above, and the proof method. Positions bulkload against prior art:
@@ -50,7 +83,7 @@ OI-1003-Q13 removes is the framing of that run as a one-off milestone.
   - casync/desync; restic/borg; bup; Unison; ZFS send/receive;
   - content-defined chunking (FastCDC); BLAKE3;
   - crash-consistency literature (ALICE, CrashMonkey).
-- **Formal model.** A TLA+ (or equivalent) specification of wire v5, `Held`,
+- **Formal model.** A TLA+ (or equivalent) specification of wire v5 [2026-10-16: the wire is v6 since #218; `docs/formal/README.md` lists the modules; 2026-10-17: deleted under R-C843/R-C844 except `EstateConverge.tla`], `Held`,
   ledger commit and resume. It is model-checked for R25 (no committed capture is
   re-read), durability ordering and S2's no-write/no-lock properties.
 - **Property tests, not fuzzing.** Decompose existing tests and checks into
@@ -82,7 +115,8 @@ OI-1003-Q13 removes is the framing of that run as a one-off milestone.
   - stage-parent ownership is verified.
 - **#124 (OI-1002-Q33).** Salvaged temporaries are kept only for refusals that
   touched bytes. Salvage is bounded, with a typed refusal when the bound is hit.
-  R25 stays strict for anything the destination held durably.
+  R25 stays strict for anything the destination held durably. [2026-10-16:
+  the bounds are OI-1003-Q24 below; R25's reading is OI-1003-Q40 below.]
 
 ## Amendments 2026-10-03: architecture rulings (WP0, OI-1003-Q15..Q20)
 
@@ -97,7 +131,8 @@ as properties.
   - Then measure S3 on the estate-shaped corpus (e).
   - Choose v1, hybrid (v1 estate layer with v2 negotiation) or v2 on the numbers.
   - Until then, carry_v2 stays frozen behind a feature. Its open PRs (#136) are
-    held, and new work avoids it.
+    held, and new work avoids it. [2026-10-16: carry_v2 is deleted; amendment
+    2026-10-05 below.]
 - **(b) S2 typed source access (OI-1003-Q16).**
   - Every source access is typed by kind: file read, an allowlisted git read
     command, or SQLite backup.
@@ -117,7 +152,9 @@ as properties.
   - New crash traces prove the replacement ordering.
 - **(e) Estate-shaped S1 corpus (OI-1003-Q19).** A deterministic, sealed
   generator of git-heavy, many-small-file trees. S1 is measured on it in
-  addition to R23's corpus v1.
+  addition to R23's corpus v1. [2026-10-16: no S1 sample on it exists yet
+  (the hermetic-rig amendment: "still owed"); OI-1003-Q194 C2 makes an
+  estate-shaped many-file corpus the corpus of S1's headline gate.]
 - **(f) Background priority by default (OI-1003-Q17).**
   - Source-side verbs (serve, estate-capture, snapshot, estimate) enter
     background CPU and IO priority at startup:
@@ -292,13 +329,19 @@ as properties.
 
 ## Amendment 2026-10-06: S1 gate (b) harness (OI-1003-Q66)
 
-- The gate (b) harness is built (`gate_b.py`, `just bench-gate-b`) and its
+- The gate (b) harness is built (`gate_b.py`, `just bench-gate-b`) [2026-10-17:
+  both retired under N03 (TIN-4543 `63feb3cf`); M3 uses `m3_link.py` (#246)]
+  and its
   protocol is [plans/2026-10-06-s1-gate-b-protocol.md](plans/2026-10-06-s1-gate-b-protocol.md).
   It changes no SLO and no number above. Its choices are drafts until the
   operator ratifies them: SQLite seats are left out of the comparable set, the
   delta is a 1 % XOR, the arms run N/R/N/R/N, and gate (a)'s 2 GiB RSS cap
-  applies. No neo run happens until gate (a) passes.
-- Gate (b)'s rep rule is gate (a)'s rule with two unratified deviations. It
+  applies. No neo run happens until gate (a) passes. [2026-10-16: gate (b)'s
+  protocol was ratified in OI-1003-Q82 and Q89 (see the hermetic-rig
+  amendment); a neo→sting run is a field confirmation (Q97); the full run's
+  order is OI-1003-Q142 and Q194 C6.]
+- Gate (b)'s rep rule is gate (a)'s rule with two unratified deviations
+  [2026-10-16: one since the 2026-10-07 (fourth) amendment]. It
   gates the warm resume (0 bytes received, 0 content bytes read), but:
   - it runs no interrupted-resume phase, so `r25_interrupted_zero` is not
     part of a gate (b) verdict (the harness never signals a process);
@@ -320,7 +363,8 @@ as properties.
   for. Property P72 (codec round trip and legacy mapping) and P73 (green iff
   every refusal is dispositioned and no untyped IO exists) carry the proof.
   Transfer and SQLite provider outcomes join this ledger in WP3 PR 4; until
-  then S4 is proven for estate items only.
+  then S4 is proven for estate items only. [2026-10-16: replaced by
+  "S4 covers a whole run", amendment 2026-10-15 (later).]
 - **What a disposition is bound to.** The ledger is bound to its plan (path
   and a digest of the plan's bytes) and SOURCE label. An item disposition is
   bound to the refusal instance it reviews (the item's current capture and
@@ -328,7 +372,7 @@ as properties.
   refusal; a later refusal of the same code against another capture or with
   another record is pending review again.
 - **Standing policies are open-ended (a design statement of WP3 PR 3, not
-  yet an operator ruling).** A standing-policy disposition covers every
+  yet an operator ruling [2026-10-16: ruled, OI-1003-Q74 below]).** A standing-policy disposition covers every
   refusal with its code under the bound plan and label, now or later. It is
   bounded only by the plan digest and the label. Whether that is the
   intended meaning of "operator-reviewed disposition" for S4 is an open
@@ -408,6 +452,10 @@ names the fact its site knows, so a disposition reviews the real cause.
   | yoga | Linux x86_64, 8 cores, 16 GB | Gate (b) source, Linux to Linux. |
   | PZM | macOS arm64 | Gate (b) source, macOS to Linux, mirroring neo to sting. |
 
+  [2026-10-16: the core counts in this table count logical CPUs; the
+  2026-10-07 corrections amendment below corrects them (mbp-13 is 2 cores
+  and 4 threads; yoga's cores were not probed).]
+
   Every rig file lives under one bounded directory, `~/git-bulkload/`, on
   each host: the clone, the builds, the sealed corpus and all run output.
 - **The sealed corpus.** Gate (a) runs on R23 corpus v1 (OI-1002-Q28):
@@ -427,7 +475,8 @@ names the fact its site knows, so a disposition reviews the real cause.
   and run with a translator named `pmset` first on PATH that reports the
   Linux power state in pmset's words. B never runs behind it. A stays
   informational and the verdict rule is unchanged.
-- **Open: the A control on the rig.** On mbp-13 the pinned A fails on its
+- **Open: the A control on the rig** [2026-10-16: ruled, OI-1003-Q103, the
+  third amendment below]. On mbp-13 the pinned A fails on its
   own, before any power check matters: its copy refuses with `IO (errno
   32)` every time on the dry-run corpus and in one of three native-only runs
   on corpus v1 (2026-10-07, see the lane's agent note). A gated sample
@@ -451,7 +500,11 @@ names the fact its site knows, so a disposition reviews the real cause.
   - macOS code paths on gate (a). Gate (a) on the rig is Linux only until
     PZM has room for the corpus and five destination copies (it has about
     13 GB free). Until then, macOS local-copy performance is covered only by
-    a field confirmation on neo.
+    a field confirmation on neo. [2026-10-16: SPEC R4 says builds, tests
+    and heavy work do not run on neo (FOOT-03, 2026-08-26; FOOT-10,
+    2026-09-01); the newer R-N69 (about 2026-09-23) allowed prefixed local
+    builds there. Which governs is open for the operator (`AGENTS.md`,
+    "Agent lanes"); SPEC R3 leaves gate (b)'s hosts to a new question.]
   - APFS and the TinylandState volume. The rig's work root is XFS on
     mbp-13's internal SSD.
   - Tailscale link variance. The rig's hosts are quiet and close; the
@@ -652,7 +705,7 @@ Q10, Q18). It changes no number and no ruling.
   - a file system without an atomic exchange cannot supersede: a changed
     seat there is refused `DESTINATION_EXCHANGE_UNSUPPORTED` before it is
     staged, and does not converge. Whether such destinations need a
-    fallback is unruled;
+    fallback is unruled [2026-10-16: ruled, OI-1003-Q100];
   - a seat past the source's retention budget (512 MiB) is streamed whole,
     as an added seat of that size is (#77);
   - an output this session supersedes stays readable for later seats of the
@@ -665,7 +718,14 @@ Q10, Q18). It changes no number and no ruling.
   (`tests/power_loss.rs`, `tests/fault_harness.rs`).
 - **Refusal code.** A transfer's occupied destination path is
   `DESTINATION_OCCUPIED`; `GIT_DESTINATION_OCCUPIED` is the Git carry's
-  alone.
+  alone. [2026-10-18, M2r2 A-103: an occupied path whose settled, writable,
+  append-only file (`.jsonl`, `.txt` by default) has no owning record and
+  holds a verified byte prefix of the seat (at least one whole chunk) is
+  extended in place by the tail instead (`docs/design.md`, "Grown
+  destination files"); the wire carries the tail and the chunk it starts
+  in, the destination reads the held prefix once, and a failed proof is
+  remembered (`NotPrefix`) under the file's settled identity, so an
+  unchanged rerun reads and sends nothing for it (R25, P21).]
 - **Gate (b)'s second deviation is gone.** The 2026-10-06 amendment lets
   gate (b)'s warm-resume reads be "net of the 16-byte SQLite magic probes".
   `source_bytes_read` no longer holds them, so the raw counter is 0 on a
@@ -674,7 +734,8 @@ Q10, Q18). It changes no number and no ruling.
   counter, and the deviation is out of `deviations_from_gate_a`); gate (b)
   now has one unratified deviation, the missing interrupted-resume phase.
 - **Review fixes (2026-10-07, same change).** What the review of #186 and
-  #187 found, and what the code does now. None of this is ruled; each is
+  #187 found, and what the code does now. None of this is ruled
+  [2026-10-16: ruled, OI-1003-Q100 to Q102 below]; each is
   listed for the operator in the lane's note.
   - *A seat standing refused is not read on every run.* A seat the
     destination refuses `DESTINATION_OCCUPIED` (or
@@ -693,7 +754,8 @@ Q10, Q18). It changes no number and no ruling.
     whose exchange took effect and whose row never committed leaves the new
     file with an ownership row, written by the next sweep from the
     publish's record, so a seat that changes once more still converges.
-  - *The model does not hold these records yet*
+  - *The model does not hold these records yet* [2026-10-16: it does,
+    OI-1003-Q102 below]
     (`docs/formal/README.md`, "What the #187 review added to the code and
     not to the model").
 
@@ -819,7 +881,8 @@ ruling, and it is not an S1 result.
   does not re-read the ledgers. Their model rows fail `ConvergesWhenQuiet` as
   stated limits.
 - **Existing landings** (before this change) carry no ledger and are not
-  converged; `--adopt` is not built (OI-1003-Q145).
+  converged; `--adopt` is not built (OI-1003-Q145). [2026-10-16: built
+  and merged (#233); amendment 2026-10-15 (#226) below.]
 
 ## Amendment 2026-10-15 (later): S4 transfers, S5 HEAD and index drift, the S2 harness alongside a run (OI-1003-Q152)
 
@@ -850,7 +913,10 @@ Q155). No SLO number changes.
   only". Still outside: the offline provider verbs (`snapshot`, `compose`,
   `compose-state`, `hydrate-state`, `apply-state-candidate`), which belong
   to no run. Proof: P86 (`closure/transfer_tests.rs`), the CLI row in
-  `tests/space_closure_cli.rs`, report schema `bulkload.closure.v3`.
+  `tests/space_closure_cli.rs`, report schema `bulkload.closure.v3`
+  [2026-10-16: `bulkload.closure.v4` since #233, below; 2026-10-17:
+  `bulkload.closure.v5` since M2r2 b and c, the `carried` and
+  `applied-beside` dispositions].
 - **S5: HEAD and index drift is custody (#38, OI-1003-Q11, under
   OI-1003-Q152).** An agent committing, switching or staging inside a
   captured checkout, or in a worktree nested in it, during a capture pass
@@ -863,7 +929,8 @@ Q155). No SLO number changes.
   only outside the export's window (key drift) is a coherent snapshot of
   the state the export read and applies, and the closure counts it
   applied, as it would a clean pass the source moved past a moment later.
-  So the run closes by converging deltas with no freeze. Still refusals: the exclude file, the stash reflog,
+  So the run closes by converging deltas with no freeze. Still refusals [2026-10-16: the
+  stash reflog is custody since OI-1003-Q161, next amendment]: the exclude file, the stash reflog,
   configuration, the shallow frontier, foreign nests and gitlinks, and the
   omitted roots moving under a pass. Proof: P87 (capture raced by a commit
   and a stage, then a switch; each recapture converges the landing to the
@@ -1184,7 +1251,14 @@ Operator rulings, Linear TIN-4543, 2026-10-15. No SLO number changes.
 
 The ruling is OI-1003-Q171/Q172 (Linear TIN-4543, quoted from the
 workflow's task text): bulkload is the interim flagship data mover, ahead
-of tcfs. #226 lists what the GFTB resume needed a hand script for. No SLO
+of tcfs. [2026-10-16: corrected attribution. "Interim flagship data mover"
+is the operator's own statement, intent ledger PUR-20 (operator,
+2026-10-15T17:04:18Z, about #226): "bulkloads bread and butter, interim
+flagfip data mover as a precursion to the solutions we want TCFS to
+provide". It is not OI-1003-Q171/Q172: per TIN-4543 comment `aff765a8`
+(2026-10-15), Q171 runs three sprints in parallel (sprint 1 is "bulkload as
+the everyday mover") and Q172 moves GloriousFlywheel neo→sting the way GFTB
+moved.] #226 lists what the GFTB resume needed a hand script for. No SLO
 number changes. These are proof-status lines and the contract's new
 surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`.
 
@@ -1213,8 +1287,9 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
 - **`--activate-origin PREFIX`** activates a named scp-style or `ssh://`
   origin at a first landing (#226 item 6). The #216 default is unchanged:
   only HTTPS origins are active, and a local path never.
-- **Rebuildable omissions are counted** (#226 item 5). Closure is
-  `bulkload.closure.v4`: an `omissions` block names every omitted root
+- **Rebuildable omissions are counted** (#226 item 5). Closure was
+  `bulkload.closure.v4` (v5 since M2r2 b and c add the `carried` and
+  `applied-beside` dispositions and their totals; see `docs/design.md`): an `omissions` block names every omitted root
   with its entries and bytes, and a capture from before the sidecar shows
   `unknown`, never zero. "Equals the source" is exact except for those
   counted roots.
@@ -1256,6 +1331,87 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
   model's adoption decisions are ghosts (`AdoptKept` excuses only what the
   ref step left), T0 is reached, and four mutation rows bite
   (`docs/formal/README.md`, "#226").
+
+## Amendment 2026-10-16: the hand-off block (OI-1003-Q183, TIN-6569)
+
+The ruling is OI-1003-Q183 (Linear TIN-6569, quoted from the workflow's
+task text; the relayed operator request was cut off and the quote was not
+checked against Linear in this lane): a beside-landing carries a builtin
+addendum at the top of `AGENTS.md` and `CLAUDE.md` with the landing's
+absolute paths, dated details and high-level differences, and tells agents
+to converge and consolidate completely before any other work with the
+user. No SLO number changes. The design note is
+`docs/agent-notes/2026-10-16-estate-handoff-design.md`; the contract is
+`docs/design.md`, "Hand-off block".
+
+- **S5:** a block that is intact and recorded is bulkload's bytes, never
+  a local change: converge proves the seat as the block followed by the
+  landed blob and keeps it. Any edit inside the block or below it is a
+  local change: `GIT_DESTINATION_MODIFIED`, as for any edit. An edit
+  inside the block also makes the hand-off refuse
+  `HANDOFF_BLOCK_MODIFIED` with nothing written; under an edit below it,
+  a rerun re-renders the block alone and keeps the user's bytes, and the
+  record's print never vouches for them (review of 2026-10-16).
+  `NoLocalWorkLost` is amended in one place: an operator value a render
+  left under an intact block is kept. A block carried from another
+  landing is content and is never dropped (OI-1003-Q185).
+- **S4:** the hand-off is an annotation outside closure's gate. Its four
+  refusals (five until OI-1003-Q188 removed `HANDOFF_NOT_PRIVATE`) are
+  typed per workspace and never change an item's outcome;
+  the H step's result is a line of its own after the apply's receipts.
+- **S3:** an unchanged `estate-handoff` rerun reads 0 destination bytes
+  and writes nothing once its record's prints are past the racy window
+  (one settling rerun re-dates them); a no-op `estate-apply` does no H
+  step. A converge reads a handed-off target once, as it reads any seat
+  whose print moved.
+- **S2:** the source is never read.
+- **Review of 2026-10-16** (two refuters against `9ec8d36`; the design
+  note's section 18 has the per-finding table): the record's print is
+  re-checked at every write; a crashed clear is finished; a carried block
+  is kept as content (OI-1003-Q185); the privacy guard counts a preserved
+  inert origin and URL rewrites (the guard is since removed,
+  OI-1003-Q188); commit detection reads branch and tag
+  history; `ready` is reachable by consolidating; options persist across
+  reruns; `AGENTS.override.md` is covered. No SLO number changes.
+- **Re-reviews of 2026-10-16** (design note section 19): a block of this
+  landing's identity whose whole file is the target's landed blob (a round
+  trip, with or without the record) is carried content, kept below the new
+  block and never dropped or refused (S5, OI-1003-Q185); a block removed by
+  hand and put back byte for byte is bulkload's again, never presented as
+  carried; a created file stays `created` across re-renders. No SLO number
+  changes.
+- **Operator rulings of 2026-10-16** (Linear TIN-6569; design note
+  section 19): OI-1003-Q188, the privacy guard is removed and the block is
+  always written; OI-1003-Q189, `ready` also needs a clean working tree in
+  the live sibling and in every destination-only worktree; OI-1003-Q190,
+  `--clear --clear-carried` removes carried blocks from landed content as a
+  recorded edit converge accepts (S5: never from bytes that are not the
+  landed blob; S3 unchanged, no read on an unchanged rerun beyond the
+  `git status` of the sibling and destination-only worktrees that Q189
+  rules); OI-1003-Q191, commit detection flags the token only in commits
+  the carried capture does not reach, and a token in the source's history
+  is information. No SLO number changes.
+- **Re-review 3 of 2026-10-16** (design note section 20): a block of this
+  landing's identity that the target's landed blob itself starts with is
+  carried content whatever the user wrote below it since (a round trip
+  the H step missed is never dropped by a render or `--clear`, S5 and
+  OI-1003-Q185); a crashed `--clear-carried` finished after a user's edit
+  still records its removal; commit detection flags only token lines the
+  source's history never added (a cherry-picked source block is
+  information) and reads remote-tracking refs and every stash entry; the
+  `git status` of the sibling and destination-only worktrees runs no
+  filter driver. No SLO number changes.
+- **Proof.** `tests/estate_handoff.rs` H0 to H19 (H0 is the control: a
+  naive prepend refuses MODIFIED), the hand-off unit rows and the
+  `render_then_clear_is_identity` property, the `estate.handoff.*`
+  fault-harness rows (render, clear, lift, converge and H step), and
+  EstateConverge's `Handoff` rows with the invariant
+  `HandoffOwnsOnlyItsBlock` and five mutation rows
+  (`docs/formal/README.md`, "TIN-6569").
+- **Open for the operator:** which copy carries the work forward for a
+  landing beside a live copy (agents never delete either). Answered: which
+  repositories count as private (none is asked: OI-1003-Q188) and what
+  `ready` reads (commits and clean trees: OI-1003-Q189).
 
 ## Amendment 2026-10-16: the delta lever, opt-in pending a reading of S3 inequality 2 (OI-1003-Q154)
 
@@ -1412,8 +1568,143 @@ proof obligation above stands.
   right before `gh pr merge --match-head-commit`.
 - **Retirement.** The local gate retires when GloriousFlywheel v4 fabric
   check runs land (TIN-5946). Sting RBE is later, not part of this ruling.
+- **Gate host (2026-10-18).** Since the operator's 2026-10-17 ruling that
+  heavy work moves off sting, the gate's build and test half runs on honey on
+  the exact head; merging main, signing, pushing, the receipt and the merge
+  stay on sting, and the receipt names the host.
+
+## Amendment 2026-10-16: R0, every agent lane continues on the destination (TIN-6587)
+
+The operator's core user expectation (2026-10-16, Linear TIN-6587; R0 of the
+draft `docs/SPEC.md`, PR #236): after a run, `claude --resume` and `codex
+resume` in each lane's destination working directory list and resume its
+sessions, transcripts byte-identical. Until now no SLO measured it, and the
+2026-10-16 investigation found it holds for no neo lane on sting
+(`docs/agent-notes/2026-10-16-reseat-investigation.md`). No SLO number
+changes. This adds a verb, its acceptance check and its proof rows; the
+contract is `docs/design.md`, "Agent session re-seat".
+
+- **R0 acceptance is `estate-reseat --check`**, read-only: per lane, the
+  transcripts and rollouts the two pickers read in the destination
+  directory hold the landed ones (exactly, or continued by a resume there;
+  never ending inside a line), the Git state is `estate-diff`
+  `identical`, and the hand-off note is present when TIN-6569's marker is
+  given. It replaces the undefined "daily-work verdict" (#40) as the
+  per-lane record. A lane without its Git input is `incomplete`, never a
+  pass. R0 also fails when nothing was checked, when retention is unsafe,
+  and for every session or thread with no lane (unmapped, unresolved) or
+  failed by ID, unless the operator names it (`--waive`, `--waive-from`).
+- **S3:** an unchanged `estate-reseat` reads 0 landed bytes
+  (`read_reseat_landing_bytes=0`), the landed Codex snapshot included, and
+  writes 0. A grown transcript is read once from the landing: every placed
+  byte proven by its BLAKE3, then the new tail (the source is never read,
+  R25).
+- **S4:** every session, thread or file that is not re-seated is a typed
+  row: `RESEAT_DEST_DIVERGED`, `RESEAT_DEST_CONTINUED`,
+  `RESEAT_EXTEND_RACED`, `RESEAT_SOURCE_REWRITTEN`,
+  `RESEAT_LANE_UNMAPPED`, `RESEAT_LANE_UNRESOLVED`,
+  `RESEAT_LANE_COLLISION`, `RESEAT_INDEX_CONFLICT`,
+  `RESEAT_INDEX_ROW_ABSENT`, `RESEAT_UNREADABLE_FORM`,
+  `DESTINATION_OCCUPIED`; a run refuses `RESEAT_LANDING_ABSENT`,
+  `RESEAT_RETENTION_UNSAFE` and `RESEAT_INDEX_ABSENT` before writing, and
+  `--check` `RESEAT_R0_FAILED`. They are report rows, not closure items:
+  the closure report does not join them yet.
+- **S5 and never overwrite:** a destination copy is adopted only when equal,
+  extended only when a verified byte prefix (whole lines, the destination's
+  size checked before every write), and otherwise kept beside the landed
+  one; a placed file changed at the destination is the destination's from
+  then on. Codex rows are inserted only, never updated; a row the
+  destination already holds gets no second rollout beside it.
+- **Proof:** `reseat::tests` and `reseat::tests::findings` (synthetic
+  transcripts and Codex stores in throwaway homes, one row per review
+  finding, each seen failing against the first build), `tests/estate_reseat.rs`
+  (the CLI, and canaries on the installed Claude Code picker and the
+  installed Codex resume in throwaway homes with no network), and eleven
+  fault-harness rows over the seven `reseat.*` points.
+- **Open, for the operator** (the investigation note's section 6, as
+  restated in `docs/agent-notes/2026-10-16-estate-reseat-review-fixes.md`):
+  which destination directory a lane keys to when the run lands Git beside
+  the live tree; the gftb and GloriousFlywheel sessions (D4b); neo's own
+  sessions (and sting's) blocked at their destination key by sting's
+  symlinked transcripts, and ~9,242 Codex rows spelled through the `~/git`
+  symlink (TIN-5268's hold); whether existing Codex rows may be updated;
+  and home and `/private/tmp` sessions (`--unmapped`, `--waive`). The verb
+  takes no decision on any of them: its defaults are the conservative ones.
+
+### Addendum 2026-10-16: the re-reviews of `8a89f9a` and OI-1003-Q198 (TIN-6587)
+
+No SLO number changes. The two re-reviews of `8a89f9a` (data safety:
+fix first, one MAJOR; user outcome: mergeable, four minors) and the
+operator's rulings OI-1003-Q198 (Linear TIN-6587, comment `fbccc49b`)
+amend the R0 amendment above; the contract is `docs/design.md`, "Agent
+session re-seat", and the receipt
+`docs/agent-notes/2026-10-16-estate-reseat-rereview-fixes.md`.
+
+- **S3** now holds on neo's real shape: a session refused (unmapped,
+  unresolved) or unreadable is ledgered by its landed identity and not
+  read again, so an unchanged rerun reads 0 landed bytes with them too.
+- **S4** gains `RESEAT_LOCKED` (another run holds a destination root or
+  STATE), `RESEAT_REGULARIZE_RACED` (both copies kept),
+  `RESEAT_UNDO_TARGET_CHANGED` (`--undo` over an archive target that is
+  gone or no longer the recorded bytes: nothing changed) and, before writing,
+  `DESTINATION_SPACE_INSUFFICIENT` (the engine's `--min-free-percent` rule,
+  a project quota judged too, over the bytes the pass's placements would
+  write). A symlinked transcript's regularization is judged per link as it
+  copies, with those bytes still reserved: a link that does not fit is its
+  own `space-refused` line (`DESTINATION_SPACE_INSUFFICIENT`) mid-pass, kept
+  a link, retried by a later pass (M2 round 2, item 1). Everything under a project key that
+  is no session's is carried with its key or named by a `key` line
+  (Q185). A rollout recorded outside every `--codex-source-root` is
+  `RESEAT_LANE_UNMAPPED:rollout-root` in `--check` too.
+- **S5, as ruled:** the destination's own Codex row or rollout form for a
+  thread is never replaced and nothing is placed beside it, for rollouts
+  with no snapshot row too (the MAJOR); since the operator's M2 round 2
+  (2026-10-17) such a thread is `destination-adopted` (the row's file holds
+  the landed lines), `destination-holds` or `destination-row-only`
+  (unproved), not a refusal, and every destination row spelled through the
+  home's `git` or a `--map` symlink is re-spelled, lane or not; a destination file with more than
+  one link is never written. Three destination changes are ruled: an
+  existing row whose `cwd` only spells the lane through a symlink gets
+  that column re-spelled (OI-1003-Q198); a symlinked transcript is
+  replaced by a regular copy of its target (the archive kept,
+  OI-1003-Q198); and, with `--replace-archived-dest ROOT` (A-106,
+  2026-10-18, "neo's version wins; fork stays in archive"), a transcript,
+  sidecar or rollout that is a symlink into ROOT whose landed file is a
+  fork of the target (not equal, not a prefix of it) is replaced by the
+  landed file, the archive target never written. All three are ledgered
+  with their old values and reversed by `--undo` wherever the destination
+  still holds exactly what re-seat wrote. `--check` reports
+  `replaced_archived`, `replace_pending`, `replace_equal_size` and
+  `replace_proved`. A second landing of the same home under a new root re-binds this
+  STATE's rows to it with `--rebind-landing OLD=NEW` (A-106 follow-up)
+  only where the placed bytes are proved the new landed file's (BLAKE3);
+  nothing at the destination changes, `--undo` puts the binding back, and
+  `--check` reports `rebound` and `rebind_pending`.
+- **R0 acceptance** also fails a longer landed form of a rollout that was
+  never placed (`extra-form-unplaced`), and names a row carrying the
+  source's `cwd` (`row-cwd-is-source`). Rollouts with no snapshot row get a
+  row from their header (Q198 D), so their lane's picker lists them; home
+  and `/private/tmp` sessions are placed by ID and are in no lane (Q198 C).
+- **Proof:** `reseat::tests::findings::rereview` (nine rows, each failing
+  against `8a89f9a` first) and `reseat::tests::findings::q198` (seven
+  rows), the CLI space row and two more real-binary canaries in
+  `tests/estate_reseat.rs`, `reseat::tests::findings::a106` (eight rows:
+  replacement and undo, another landing's `occupied` row, regularization,
+  a Codex rollout, overlapping roots refused, a target held open, an
+  archive ahead and a changed target, a target written under the swap),
+  and twenty-two fault-harness rows over fifteen `reseat.*` points.
+- **Resolved by OI-1003-Q198** (the open items above): where lanes key
+  (A), gftb and GloriousFlywheel (B), home and `/private/tmp` sessions (C),
+  rowless rollouts (D), `.zst` rollouts (E), sting's symlinked transcripts
+  and the ~9,242 `~/git`-spelled Codex rows.
 
 ## Priority (OI-1003-Q4)
+
+[2026-10-16: what bulkload must achieve, and the order that rules now, is
+SPEC.md (OI-1003-Q194). Item 4's order is superseded by C6 (RUL-06): the
+full run does not wait for the proofs, and R-N56's lift is no longer a
+precondition. "A routine, repeatable sync run" stands (SPEC corrects the
+*single*-run reading of OI-1002-Q24).]
 
 1. Make S1–S5 provable: proof package, property-test decomposition, and
    SLO-recording runs.
@@ -1424,3 +1715,112 @@ proof obligation above stands.
    on, migrating neo to sting is a routine, repeatable sync run (OI-1003-Q13):
    rerun as neo's work lanes complete, each run reaching closure with 0
    unaccounted.
+
+## Amendment 2026-10-16: rulings not yet indexed here, and status lines (editorial, R-N13)
+
+No new ruling and no SLO number changes. This indexes operator rulings that
+bear on this charter and had no index entry here, each with its record,
+and states what they leave standing. The operative text is the record cited.
+
+- **OI-1003-Q142** (2026-10-08; TIN-4543 comment `7734678e`; intent ledger
+  SEAT-31): the full neo→sting run happens once estate reruns converge and
+  refusals are fully typed, even with S1 still failing, as an S3/S4/S5 proof
+  run. It relaxes OI-1002-Q24 for S1.
+- **OI-1003-Q150** (2026-10-15; TIN-4543 `b6c52dd2`): S1 stays gated
+  against plain rclone. (Q152, no freeze window, and Q154, three S1 levers,
+  from the same record, already have their amendments above.)
+- **OI-1003-Q170** (2026-10-15; TIN-4543 `8062b656`): the full-run landing
+  gets its own XFS project on sting's fast-local.
+- **OI-1003-Q185, Q192** (2026-10-16; TIN-4543 `a92634c1`, `68248cf1`):
+  nothing is ever excluded; only truly recreatable content (build outputs,
+  dependency directories, caches) may be dropped.
+- **OI-1003-Q194** (2026-10-16; TIN-4543 `14484c4a`): the operator accepted
+  every recommended reading of SPEC's conflicts C1–C20 as standing rulings,
+  recorded in SPEC.md (#236). Those that bear on this charter:
+  - C2: S1's headline is cross-host gate (b) on an estate-shaped many-file
+    corpus; the rig's gate (a) is a regression guard (this reopens Q97).
+  - C3: the 1 % delta is a real in-place change to about 1 % of files. The
+    bench does not measure that today: it XORs the head of the first file
+    in row order and removes that file from each destination
+    (`docs/agent-notes/2026-10-16-delta-regression.md`).
+  - C5: the 2026-10-03 S3 reading stands (0 content bytes re-read, a
+    metadata-only re-walk, a rerun within 10 %).
+  - C6: the full run does not wait for the proofs.
+  - C14: a carried-as-files outcome for what cannot be captured natively
+    (S4 row above); not built.
+  - C18: the old quiet-window selections are superseded by never-halt.
+  - C20: bulkload is done when the full run meets SPEC R0 and R3 is proven.
+- **Status of OI-1002-Q24 and R-N56.** Q142 relaxed Q24 for S1, and Q194 C6
+  rules that the full run does not wait for the proofs. R-N56's freeze of
+  estate operations until the M2 gates pass (2026-09-23) is therefore
+  superseded on order (C6, RUL-06; SPEC.md, "Not superseded, and what is
+  corrected"); estate carries have run since (the GFTB carry, OI-1003-Q163,
+  `docs/evidence/field-2026-10-15-gftb-carry.md`).
+- **R-N91.** Holding other lanes quiet while a gated sample runs is read
+  as superseded by C18 together with SPEC R3 ("Samples run on live hosts";
+  intent ledger LIVE-40 to LIVE-42, L2). RUL-18 itself names CONF-01, 06,
+  07 and 08, not R-N91, so this is a reading, not the ruling's text. R-N81
+  (AC power, load1 below 2.5 before every rep and every arm) stands for
+  gated samples on the rig. Open for the operator: how R-N81's load gate
+  fits SPEC R3's samples on live hosts ("a sample taken under load is
+  recorded as such").
+- **Still open here.** S1's core-table text is not rewritten for C2 and C3:
+  that waits for the gate (b) protocol on the estate-shaped corpus and a
+  bench delta that matches C3.
+- **What this pass labelled.** The "Completion bar" section and the
+  "Priority (OI-1003-Q4)" section keep their text, with dated pointers to
+  SPEC.md: the Completion bar stays OI-1003-Q4's record (SEAT-10; ONCE-08
+  cites it for Q13), and Priority item 4's order is superseded by C6.
+
+## Amendment 2026-10-16 (M2 item 3): estate-capture priority and bounded starvation
+
+Source: the operator's M2 lane instruction of 2026-10-16 ("bulkload is one
+command", item 3: on macOS background priority starved `estate-capture`, a
+Git child in uninterruptible IO for 25 minutes behind a normal-priority
+`serve`; "propose and implement a bounded-starvation rule: escalate to
+normal after N seconds without progress, recorded in counters. At minimum,
+document it and default `estate-capture` to normal when no interactive
+load is detected"), the plan of record's M2 fix 5 ("adaptive priority").
+To be entered in the ruling ledger (TIN-4543); until it is, this amendment
+records the instruction, not a ruling.
+
+- **(f) for `estate-capture`.** Its default class is `auto`: background
+  when a terminal was read or written within 300 s, normal otherwise,
+  recorded `priority_from=auto priority_auto=...`. The other source-side
+  verbs of (f) and OI-1003-Q25 are unchanged; gate (a)'s rule (opt out only
+  with an explicit, recorded flag) is unchanged for `copy`.
+- **Bounded starvation.** A background `estate-capture`, or any background
+  verb given `--escalate-after`, escalates its IO class once after the
+  threshold (default 300 s) with no counter or descendant-IO movement,
+  recorded on its counters line. An S2 sample's process (`serve`, `copy`)
+  runs no watcher unless asked, so its class is what (f) says.
+
+## Amendment 2026-10-17 (M2r2 item 6): stale and moved nested pointers
+
+A proof-status line, not a new ruling (OI-1003-Q1). The in-place run's
+telefreeze capture refused a bare `GIT_INVENTORY_MALFORMED`. Its ignored
+evidence archive held copies of two pruned linked worktrees whose `.git`
+pointers named administrations that no longer exist. The census now names
+the cause.
+
+- **New codes.** Each is raised by product code and pinned by a test that
+  fails without it:
+
+  | Code | Raised when | Was |
+  |---|---|---|
+  | `GIT_NEST_POINTER_STALE path=` | a `.git` pointer below the checkout names an administration absent on this host (a copy of a pruned or other-host worktree, a submodule whose `.git/modules` entry is gone, a dangling symlink or absent mount), or a worktree administration of this repository whose registered checkout exists and points back to it (a copy of a live worktree) | `GIT_INVENTORY_MALFORMED` |
+  | `GIT_NEST_WORKTREE_MOVED path=` | a `.git` pointer below the checkout names a worktree administration of this repository whose registered checkout is absent (moved without `git worktree repair`) | `GIT_INVENTORY_MALFORMED` |
+
+- **Existing codes at fewer sites.** A live nested worktree registered by a
+  relative path (`--relative-paths`, Git 2.48) is custody. It no longer
+  refuses: the registered path is read against the administration
+  directory. A pointer is read as raw bytes, so a non-UTF-8 pointer naming
+  an absent administration is `GIT_NEST_POINTER_STALE` with its path.
+- **Old records.** No code left the taxonomy. A record written before this
+  change keeps `GIT_INVENTORY_MALFORMED`; a rerun records the new code, and
+  only that record can be dispositioned under it.
+- **Still open.** The census reports the first such directory per item, not
+  all of them. Other malformed pointers (a symlinked, empty, oversized or
+  prefix-less `.git`) still refuse `GIT_INVENTORY_MALFORMED` without a
+  path, and so does a non-UTF-8 path to a readable foreign repository (the
+  nest's own Git reads are text).

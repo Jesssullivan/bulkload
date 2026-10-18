@@ -752,7 +752,7 @@ fn a_chunk_of_a_superseded_output_is_still_filled_locally() {
                 session: &session,
                 salvage: &salvage,
             },
-            &row,
+            (&row, false),
             &manifest,
             &mut Vec::new(),
         );
@@ -1483,9 +1483,11 @@ fn round_trip_resumes_without_source_reads_and_preserves_divergence() {
     assert_eq!(second.reused, 2);
     assert_eq!(second.source_bytes_read, 0);
     assert_eq!(second.bytes_received, 0);
+    // A mode wider than the source's is a metadata conflict, refused and
+    // kept (M2 item 2: a narrower one is entered with its mode kept).
     std::fs::set_permissions(
         destination.join("nested"),
-        std::fs::Permissions::from_mode(0o700),
+        std::fs::Permissions::from_mode(0o777),
     )
     .unwrap();
     let metadata_conflict = corpus.run().unwrap();
@@ -1495,7 +1497,27 @@ fn round_trip_resumes_without_source_reads_and_preserves_divergence() {
             .unwrap()
             .mode()
             & 0o777,
-        0o700
+        0o777
+    );
+    std::fs::set_permissions(
+        destination.join("nested"),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let narrower = corpus.run().unwrap();
+    assert!(narrower.refusals.is_empty(), "{:?}", narrower.refusals);
+    let source_mode = std::fs::metadata(source.join("nested")).unwrap().mode() & 0o7777;
+    assert_eq!(
+        narrower.directories_mode_kept,
+        vec![(b"nested".to_vec(), 0o700, source_mode)]
+    );
+    assert_eq!(
+        std::fs::metadata(destination.join("nested"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o700,
+        "a narrower mode is kept, never reverted"
     );
     std::fs::set_permissions(
         destination.join("nested"),
@@ -2922,7 +2944,8 @@ fn a_stale_capture_record_is_refreshed_by_a_manifest_adoption() {
     );
 }
 
-/// #169 review (`AdoptOnlyUnrowed` in docs/formal): the record's adoption is
+/// #169 review (`AdoptOnlyUnrowed` in docs/formal, deleted 2026-10-17 under
+/// R-C843): the record's adoption is
 /// for outputs with no row. A clean rerun answers every rowed output `Reuse`
 /// from its row: it adopts nothing, proves nothing, and so hashes no
 /// destination byte, whatever the source-read counter says. A regression of
@@ -3035,3 +3058,6 @@ mod levers;
 
 // ---- S1 lever 3 (OI-1003-Q154): the directory finish in the last group ------
 mod fold;
+
+// ---- M2r2 A-103: a grown byte-prefix destination file is extended ----------
+mod prefix;

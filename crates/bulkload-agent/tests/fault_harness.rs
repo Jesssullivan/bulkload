@@ -1327,6 +1327,30 @@ use estate_converge::EstateConverge;
 mod estate_adopt;
 use estate_adopt::EstateAdopt;
 
+// The `reseat.*` points (R0, TIN-6587): a re-seat of landed agent sessions
+// crashed, and the rerun settling it forward.
+#[path = "fault_harness/reseat.rs"]
+mod reseat;
+use reseat::Reseat;
+
+// The `estate.handoff.*` points (TIN-6569, OI-1003-Q183): a hand-off
+// render, clear or converge lift crashed, and the rerun finishing it.
+#[path = "fault_harness/estate_handoff.rs"]
+mod estate_handoff;
+use estate_handoff::EstateHandoff;
+
+// M2r2 A-103: a grown byte-prefix file's extension crashed, and the rerun
+// finishing it.
+#[path = "fault_harness/prefix_extend.rs"]
+mod prefix_extend;
+use prefix_extend::PrefixExtend;
+
+// The `estate.carry.*` point (M2r2 b): `estate-carry-files` crashed after
+// its carry record, and the rerun finishing it.
+#[path = "fault_harness/estate_carried.rs"]
+mod estate_carried;
+use estate_carried::EstateCarried;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
@@ -1399,6 +1423,18 @@ scenarios! {
     receive_after_decide_mid => ReceiveAfterDecide: 30, WITH_REFUSAL;
     receive_after_chunks_mid => ReceiveAfterChunks: 25, WITH_REFUSAL;
     receive_after_end_mid => ReceiveAfterEnd: 25, WITH_REFUSAL;
+    // M2r2 A-103: the rerun that extends grown byte-prefix files, crashed
+    // at each step of an extension and at its adoption's group commit
+    // (module fault_harness/prefix_extend.rs).
+    prefix_before_append_first => ReceivePrefixBeforeAppend: 1, PrefixExtend;
+    prefix_before_append_last => ReceivePrefixBeforeAppend: 3, PrefixExtend;
+    prefix_after_append_first => ReceivePrefixAfterAppend: 1, PrefixExtend;
+    prefix_after_append_last => ReceivePrefixAfterAppend: 3, PrefixExtend;
+    prefix_after_flush_first => ReceivePrefixAfterFlush: 1, PrefixExtend;
+    prefix_after_flush_last => ReceivePrefixAfterFlush: 3, PrefixExtend;
+    prefix_receive_after_chunks => ReceiveAfterChunks: 2, PrefixExtend;
+    prefix_publish_before_commit => PublishDestinationBeforeCommit: 1, PrefixExtend;
+    prefix_publish_after_commit => PublishDestinationAfterCommit: 1, PrefixExtend;
     // WP0(d), #187: the fault is armed in a rerun that supersedes this
     // store's own outputs of changed seats (module docs).
     supersede_after_intent_first => SupersedeAfterIntent: 1, SUPERSEDING;
@@ -1462,6 +1498,78 @@ scenarios! {
     estate_adopt_after_refs => EstateAdoptAfterRefs: 1, EstateAdopt::Workspace;
     estate_adopt_after_ledger => EstateAdoptAfterLedger: 1, EstateAdopt::Workspace;
     estate_adopt_bare_staged => EstateAdoptBareStaged: 1, EstateAdopt::Bare;
+    // M2 finding 1: a first landing's absent parents made, not recorded.
+    estate_apply_parents_made => EstateApplyParentsMade: 1, EstateAdopt::Parents;
+    // M2 round 2, item 2: an --exclude-union append, recorded as an intent
+    // before the exclude is written, and the exclude written before the
+    // record is settled.
+    estate_apply_exclude_intent => EstateApplyExcludeIntent: 1, EstateAdopt::ExcludeUnion;
+    estate_apply_exclude_appended => EstateApplyExcludeAppended: 1, EstateAdopt::ExcludeUnion;
+    // M2 round 2, item c: a beside landing crashed after its worktree is
+    // added (finished forward from its landing intent) and after its refs.
+    estate_apply_beside_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::Beside;
+    estate_apply_beside_refs => EstateApplyBesideRefs: 1, EstateAdopt::Beside;
+    estate_apply_beside_stale_capture => EstateConvergeLinkedAdded: 1, EstateAdopt::BesideStale;
+    // M2r2 b: a capture-refused item carried as files, crashed after its
+    // carry record and before its outcome.
+    estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;
+    // Re-seat (R0, TIN-6587): a first pass crashed at its first and its last
+    // placement (the transcript, then the Codex rollout) and at its row
+    // commit; a pass extending a grown transcript; a pass superseding a
+    // changed plan. Each settled forward by the rerun, then read-free.
+    reseat_after_temp_seal_first => ReseatAfterTempSeal: 1, Reseat::Fresh;
+    reseat_after_temp_seal_rollout => ReseatAfterTempSeal: 4, Reseat::Fresh;
+    reseat_after_publish_first => ReseatAfterPublish: 1, Reseat::Fresh;
+    reseat_after_publish_plan => ReseatAfterPublish: 3, Reseat::Fresh;
+    reseat_after_row_insert => ReseatAfterRowInsert: 1, Reseat::Fresh;
+    reseat_after_extend_intent => ReseatAfterExtendIntent: 1, Reseat::Grow;
+    reseat_mid_extend => ReseatMidExtend: 1, Reseat::Grow;
+    reseat_after_extend => ReseatAfterExtend: 1, Reseat::Grow;
+    reseat_after_supersede_exchange => ReseatAfterSupersedeExchange: 1, Reseat::Plan;
+    // A rollout landed as `.jsonl.zst`, decompressed into its temporary and
+    // published as plain `.jsonl` (review 0, finding 1).
+    reseat_zst_after_temp_seal_rollout => ReseatAfterTempSeal: 4, Reseat::Zst;
+    reseat_zst_after_publish_rollout => ReseatAfterPublish: 4, Reseat::Zst;
+    // The operator's 2026-10-16 rulings (OI-1003-Q198): a symlinked
+    // destination transcript regularized, an existing Codex row's `cwd`
+    // re-spelled, a row built from a rowless rollout's header; and the
+    // `--undo` that reverses the first two. Each settled forward by the
+    // rerun.
+    reseat_q198_after_regularize_exchange => ReseatAfterRegularizeExchange: 1, Reseat::Q198;
+    reseat_q198_after_cwd_update => ReseatAfterCwdUpdate: 1, Reseat::Q198;
+    reseat_q198_after_synth_row_insert => ReseatAfterSynthRowInsert: 1, Reseat::Q198;
+    reseat_q198_undo_after_exchange => ReseatAfterUndoExchange: 1, Reseat::Undo;
+    reseat_q198_undo_after_cwd => ReseatAfterUndoCwd: 1, Reseat::Undo;
+    reseat_archived_after_intent => ReseatAfterReplaceIntent: 1, Reseat::Archived;
+    reseat_archived_after_exchange => ReseatAfterReplaceExchange: 1, Reseat::Archived;
+    reseat_archived_before_done => ReseatBeforeReplaceDone: 1, Reseat::Archived;
+    reseat_archived_undo_after_exchange => ReseatAfterUndoExchange: 1, Reseat::ArchivedUndo;
+    reseat_archived_moved_after_exchange => ReseatAfterReplaceExchange: 1, Reseat::ArchivedMoved;
+    reseat_archived_moved_before_done => ReseatBeforeReplaceDone: 1, Reseat::ArchivedMoved;
+    // The hand-off block (TIN-6569): every point of a render, a clear and
+    // converge's lift, each finished by the rerun.
+    estate_handoff_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::Render;
+    estate_handoff_after_temp => EstateHandoffAfterTemp: 1, EstateHandoff::Render;
+    estate_handoff_after_exchange => EstateHandoffAfterExchange: 1, EstateHandoff::Render;
+    estate_handoff_after_exchange_second => EstateHandoffAfterExchange: 2, EstateHandoff::Render;
+    estate_handoff_after_record => EstateHandoffAfterRecord: 1, EstateHandoff::Render;
+    estate_handoff_clear_after_exchange => EstateHandoffClearAfterExchange: 1, EstateHandoff::Clear;
+    estate_handoff_lift_after_unlink => EstateHandoffLiftAfterUnlink: 1, EstateHandoff::Lift;
+    estate_handoff_converge_after_intent => EstateConvergeAfterIntent: 1, EstateHandoff::Converge;
+    estate_handoff_converge_seat_after_exchange => EstateConvergeSeatAfterExchange: 1, EstateHandoff::Converge;
+    estate_handoff_h_step_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_temp => EstateHandoffAfterTemp: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_exchange => EstateHandoffAfterExchange: 1, EstateHandoff::HStep;
+    estate_handoff_h_step_after_record => EstateHandoffAfterRecord: 1, EstateHandoff::HStep;
+    // Review of 2026-10-16: a crashed re-render over a user's edit, settled
+    // by a run that refuses; a crashed clear finished by a no-op apply.
+    estate_handoff_rerender_over_edit => EstateHandoffAfterIntent: 1, EstateHandoff::RerenderOverEdit;
+    estate_handoff_clear_noop_apply => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearNoOpApply;
+    estate_handoff_clear_carried_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::ClearCarried;
+    estate_handoff_clear_carried_after_exchange => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearCarried;
+    // Re-review 3 of 2026-10-16, finding 3: a crashed clear-carried
+    // finished after a user's edit still records its removal.
+    estate_handoff_clear_carried_edit_revert => EstateHandoffClearAfterExchange: 1, EstateHandoff::ClearCarriedEditRevert;
 }
 
 /// Set to `1` by `just crash-sweep`: run the whole (point, nth) sweep.

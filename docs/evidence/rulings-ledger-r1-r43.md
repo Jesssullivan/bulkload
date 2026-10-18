@@ -1,4 +1,6 @@
 # Consolidated Rulings Ledger R1–R43
+
+> **Label (2026-10-16, R-N13; body unchanged).** Historical. The Status column is as of 2026-09-02. Current rulings: `docs/slo.md` (SLOs), Linear TIN-4543 and TIN-3692 (records), lab `AGENTS.md` (process); see `docs/SOURCES.md`. Superseded since: R34 by PUR-19 / R-N53 (bulkload is its own repo, 2026-09-23); R35's A/B/A/B/A bench order by OI-1002-Q30 (B/A/B/A/B); R38's WAYFINDING lane finished (#35) and its output was deleted from `main` in `46fb68f2`; the rsync `--update` live-lane protocol below went with the Python engine (#36). R33 here is the SQLite allowlist ruling; code that cites "R33" for the deny-panics lint wall means a different rule. R25's quote here is normalized; the operator's verbatim text is intent ledger ONCE-01 (#236). R33's sensitive-path clause is superseded by OI-1003-Q185 (nothing is excluded by content).
 ## Bulkload→Sting Migration, 2026-08-28 to 2026-09-02
 
 **Sources:** `/Volumes/TinylandState/tinyland-state/bulkload-boundary-20260824/STATUS` (append-only ledger); `/Users/jess/.claude/plans/please-examine-the-craziness-inherited-sky.md` (plan document, sections "Rulings (interview N)" and context sections); `/Users/jess/.bulkload-ceremony-rescue-20260829/WEEK-REVIEW-20260829.md`.

@@ -351,6 +351,72 @@ counters! {
     // their last look because a `-wal`, `-journal` or `-shm` had appeared
     // beside the path since the entry was decided (OI-1003-Q146).
     DestSqliteSidecarRefused => "dest_sqlite_sidecar_refused",
+    // Existing directories this destination store does not own, entered
+    // with their mode kept although it differs from the source's (M2 item
+    // 2): this user's, owner read, write and search, and nothing wider than
+    // the source's mode. Each is also reported `directory-mode-kept`.
+    DestDirectoryModeKept => "dest_directory_mode_kept",
+    // Existing regular files with no owning record that held a verified
+    // byte prefix of their source and were extended in place by its tail
+    // (M2r2 A-103) and whose records committed, and the tail bytes
+    // appended (a subset of `write_dest_materialize_bytes`, counted as
+    // written, whether or not the entry then committed). The prefix proof's
+    // reads are `read_dest_verify_existing_bytes`.
+    DestPrefixExtended => "dest_prefix_extended",
+    DestPrefixAppendWrite => "write_dest_prefix_append_bytes",
+    // `estate-reseat` (R0, TIN-6587). Bytes read from the landed agent
+    // state (the run's copy of the source's `~/.claude` and `~/.codex`):
+    // 0 on a pass whose landed files and Codex snapshot are unchanged (S3);
+    // a grown transcript once (its placed bytes proven, its tail appended);
+    // a `.zst` counts its compressed bytes; a re-read snapshot its size.
+    ReseatLandingRead => "read_reseat_landing_bytes",
+    // Bytes read from the destination's live agent state to prove a copy
+    // already there identical to, or a prefix of, the landed one.
+    ReseatDestRead => "read_reseat_dest_bytes",
+    // Bytes written into the destination's live agent state.
+    ReseatDestWrite => "write_reseat_dest_bytes",
+    // Placements re-bound from a landed file under an old landing root to
+    // the same bytes under a new one (`--rebind-landing`, A-106 follow-up).
+    ReseatRebound => "reseat_rebound",
+    // Destination transcripts and rollouts that were symlinks into a
+    // `--replace-archived-dest` root, replaced by the differing landed
+    // file (A-106; the archive target kept, the link ledgered).
+    ReseatArchivedReplaced => "reseat_archived_replaced",
+    // Bounded starvation (M2 item 3): a process at background priority
+    // whose counters did not move for `--escalate-after` seconds moved its
+    // IO back to the normal class once (`priority::escalate`): how many
+    // times it was tried (0 or 1), when (nanoseconds from start), and how
+    // many threads moved (its own and its descendants' on Linux; 1, the
+    // process, on Darwin).
+    PriorityEscalations => "priority_escalations",
+    PriorityEscalatedNs => "priority_escalated_ns",
+    PriorityEscalatedThreads => "priority_escalated_threads",
+    // Threads (Linux) an escalation could not move, or 1 when it failed
+    // for the process itself.
+    PriorityEscalationFailures => "priority_escalation_failures",
+    // Estate adopt and `estate-diff` scratch repositories (#226; M2r2 item
+    // 3). Plan bases imported into a scratch repository (one whole-base
+    // `index-pack`, or a connectivity walk where the borrowed destination
+    // store already holds the base): in `estate-diff`, one per base and
+    // destination object store, however many items borrow it; and scratch
+    // repositories that borrowed such an import instead of indexing the
+    // base again.
+    GitScratchBaseImports => "git_scratch_base_imports",
+    GitScratchBaseBorrowed => "git_scratch_base_borrowed",
+    // Chained (re-captured) captures flattened into one self-contained
+    // bundle (`chain::flatten`): each fetches its bases and links into a
+    // private repository and writes the whole history as one bundle, a
+    // whole-repository cost per chained item in `estate-diff`, the apply and
+    // the restore verbs alike, never shared (M2r2 item 3 review).
+    GitChainFlattens => "git_chain_flattens",
+    // Free-space checks (OI-1001-Q2) this process ran, and those refused,
+    // by the limit that bound (M2 round 2, item 1): the filesystem's, or a
+    // project quota's (`statvfs` inside a project-quota tree reports the
+    // quota). A refusal both limits bind counts in both. The last refusal's
+    // numbers are the `space_refusal` line.
+    SpaceChecks => "space_checks",
+    SpaceRefusedFilesystem => "space_refused_filesystem",
+    SpaceRefusedQuota => "space_refused_quota",
 }
 
 const COUNT: usize = Counter::ALL.len();

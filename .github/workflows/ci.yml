@@ -16,7 +16,7 @@ jobs:
   test:
     name: ${{ matrix.gate }} terminal gate
     runs-on: tinyland-nix
-    timeout-minutes: 25
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
