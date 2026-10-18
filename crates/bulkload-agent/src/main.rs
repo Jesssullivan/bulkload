@@ -238,11 +238,15 @@ SUBCOMMANDS:
                 with no snapshot row is placed with a row built from its
                 header (OI-1003-Q198 D; RESEAT_INDEX_ROW_ABSENT when it cannot
                 fill one); a destination row or rollout form for a thread is
-                the destination's (RESEAT_INDEX_CONFLICT, nothing placed),
-                except that an existing row whose cwd only spells the lane
-                differently (through the ~/git symlink) gets its cwd column
-                re-spelled to the canonical path, ledgered (OI-1003-Q198 (1);
-                --no-respell). Symlinked destination transcripts
+                the destination's, nothing placed: destination-adopted when
+                the file its row names holds the landed lines, else
+                destination-holds (a file there, unproved) or
+                destination-row-only (a row only), proof named, and
+                RESEAT_INDEX_CONFLICT for a row naming another file. Every
+                existing row whose cwd is spelled through the home's git or a
+                --map symlink gets its cwd column re-spelled to the canonical
+                path, lane or not, ledgered (OI-1003-Q198 (1); --no-respell;
+                --check counts them). Symlinked destination transcripts
                 (projects/*/*.jsonl) are first regularized into regular-file
                 copies of their targets with the targets' mtime, the targets
                 kept, ledgered (OI-1003-Q198 (2); --no-regularize); a target
