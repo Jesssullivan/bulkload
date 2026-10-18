@@ -394,6 +394,21 @@ counters! {
     // Threads (Linux) an escalation could not move, or 1 when it failed
     // for the process itself.
     PriorityEscalationFailures => "priority_escalation_failures",
+    // Estate adopt and `estate-diff` scratch repositories (#226; M2r2 item
+    // 3). Plan bases imported into a scratch repository (one whole-base
+    // `index-pack`, or a connectivity walk where the borrowed destination
+    // store already holds the base): in `estate-diff`, one per base and
+    // destination object store, however many items borrow it; and scratch
+    // repositories that borrowed such an import instead of indexing the
+    // base again.
+    GitScratchBaseImports => "git_scratch_base_imports",
+    GitScratchBaseBorrowed => "git_scratch_base_borrowed",
+    // Chained (re-captured) captures flattened into one self-contained
+    // bundle (`chain::flatten`): each fetches its bases and links into a
+    // private repository and writes the whole history as one bundle, a
+    // whole-repository cost per chained item in `estate-diff`, the apply and
+    // the restore verbs alike, never shared (M2r2 item 3 review).
+    GitChainFlattens => "git_chain_flattens",
     // Free-space checks (OI-1001-Q2) this process ran, and those refused,
     // by the limit that bound (M2 round 2, item 1): the filesystem's, or a
     // project quota's (`statvfs` inside a project-quota tree reports the
