@@ -1339,6 +1339,12 @@ use reseat::Reseat;
 mod estate_handoff;
 use estate_handoff::EstateHandoff;
 
+// The `estate.carry.*` point (M2r2 b): `estate-carry-files` crashed after
+// its carry record, and the rerun finishing it.
+#[path = "fault_harness/estate_carried.rs"]
+mod estate_carried;
+use estate_carried::EstateCarried;
+
 macro_rules! scenarios {
     ($($name:ident => $point:ident : $nth:expr, $fixture:expr;)*) => {
         $(
@@ -1486,6 +1492,9 @@ scenarios! {
     estate_apply_beside_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::Beside;
     estate_apply_beside_refs => EstateApplyBesideRefs: 1, EstateAdopt::Beside;
     estate_apply_beside_stale_capture => EstateConvergeLinkedAdded: 1, EstateAdopt::BesideStale;
+    // M2r2 b: a capture-refused item carried as files, crashed after its
+    // carry record and before its outcome.
+    estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;
     // Re-seat (R0, TIN-6587): a first pass crashed at its first and its last
     // placement (the transcript, then the Codex rollout) and at its row
     // commit; a pass extending a grown transcript; a pass superseding a

@@ -82,6 +82,10 @@ pub enum Outcome {
     IndexRepaired,
     /// The verb refused the item.
     Refused(Refusal),
+    /// `estate-carry-files` carried an item whose capture refused as files,
+    /// byte-exact, through a recorded transfer session (M2r2 b). Appended
+    /// after `Refused`: the variant order is the on-disk format.
+    CarriedAsFiles,
     /// The adopt proof refused the existing planned workspace
     /// (`GIT_DESTINATION_DIVERGED`) and, under `--adopt --beside SUFFIX`,
     /// apply landed the captured checkout beside it with every captured ref
@@ -91,8 +95,11 @@ pub enum Outcome {
     PreviousWorkspaceBesideNotRevalidated,
 }
 
-/// Every non-refusal outcome and its legacy string, in variant order.
-pub const NAMED: [(Outcome, &str); 10] = [
+/// Every non-refusal outcome and its legacy string, in variant order
+/// (`Refused`, variant 10, sits between `IndexRepaired` and
+/// `CarriedAsFiles`; `WorkspaceBeside` and
+/// `PreviousWorkspaceBesideNotRevalidated` follow, M2r2 c).
+pub const NAMED: [(Outcome, &str); 13] = [
     (Outcome::Captured, "captured"),
     (Outcome::CapturedWithDrift, "captured-with-drift"),
     (
@@ -115,11 +122,7 @@ pub const NAMED: [(Outcome, &str); 10] = [
         "previous-ref-custody-not-workspace-parity",
     ),
     (Outcome::IndexRepaired, "index-repaired"),
-];
-
-/// Outcomes only a typed record holds (no legacy writer produced them),
-/// with their names, in variant order after [`Outcome::Refused`].
-pub const NAMED_TYPED: [(Outcome, &str); 2] = [
+    (Outcome::CarriedAsFiles, "carried-as-files"),
     (Outcome::WorkspaceBeside, "workspace-beside"),
     (
         Outcome::PreviousWorkspaceBesideNotRevalidated,
@@ -138,25 +141,12 @@ impl Outcome {
             Self::Refused(_) => REFUSED,
             named => NAMED
                 .iter()
-                .chain(&NAMED_TYPED)
                 .find(|(outcome, _)| outcome == named)
                 .map_or(REFUSED, |(_, name)| name),
         }
     }
 
-    /// The non-refusal outcome named `name`, including the typed-only ones
-    /// ([`NAMED_TYPED`]): what a receipt may name.
-    #[must_use]
-    pub fn named_typed(name: &str) -> Option<Self> {
-        Self::named(name).or_else(|| {
-            NAMED_TYPED
-                .iter()
-                .find(|(_, known)| *known == name)
-                .map(|(outcome, _)| outcome.clone())
-        })
-    }
-
-    /// The non-refusal outcome a legacy record named `name`.
+    /// The non-refusal outcome named `name`.
     #[must_use]
     pub fn named(name: &str) -> Option<Self> {
         NAMED
@@ -382,7 +372,7 @@ impl OutcomeRecord {
         let outcome = match (outcome, refusal) {
             (REFUSED, Some(refusal)) => Outcome::Refused(Refusal::of(refusal, site)),
             (name, None) => {
-                Outcome::named_typed(name).ok_or(BulkloadRefusal::ContractSelfInconsistent)?
+                Outcome::named(name).ok_or(BulkloadRefusal::ContractSelfInconsistent)?
             }
             (_, Some(_)) => return Err(BulkloadRefusal::ContractSelfInconsistent),
         };
@@ -507,6 +497,8 @@ mod tests {
                 .prop_map(BulkloadRefusal::GitNestPopulatedSubmodule),
             path.clone()
                 .prop_map(BulkloadRefusal::GitNestCarrierRefused),
+            path.clone()
+                .prop_map(BulkloadRefusal::GitCarryPointerAttached),
             path.clone().prop_map(BulkloadRefusal::GitSourceAlternates),
             proptest::option::of(path).prop_map(BulkloadRefusal::SpaceExhausted),
             prop_oneof![
@@ -778,21 +770,20 @@ mod tests {
     #[test]
     fn golden_encodings_are_stable() {
         for (index, (outcome, _)) in NAMED.iter().enumerate() {
+            // `Refused` is variant 10; the outcomes appended after it
+            // (`CarriedAsFiles`, M2r2 b) sit one index further on.
+            let variant = if index >= 10 { index + 1 } else { index };
             assert_eq!(
                 postcard::to_allocvec(outcome).unwrap(),
-                vec![u8::try_from(index).unwrap()]
+                vec![u8::try_from(variant).unwrap()]
             );
         }
-        // The typed-only outcomes follow `Refused` (index 10).
-        for (index, (outcome, name)) in NAMED_TYPED.iter().enumerate() {
-            assert_eq!(
-                postcard::to_allocvec(outcome).unwrap(),
-                vec![u8::try_from(NAMED.len() + 1 + index).unwrap()]
-            );
-            assert_eq!(outcome.name(), *name);
-            assert_eq!(Outcome::named_typed(name).as_ref(), Some(outcome));
-            // No legacy writer produced them: a legacy record never maps.
-            assert_eq!(Outcome::named(name), None);
+        for (outcome, variant) in [
+            (Outcome::CarriedAsFiles, 11),
+            (Outcome::WorkspaceBeside, 12),
+            (Outcome::PreviousWorkspaceBesideNotRevalidated, 13),
+        ] {
+            assert_eq!(postcard::to_allocvec(&outcome).unwrap(), vec![variant]);
         }
         let record = OutcomeRecord {
             source: PathBuf::from("/s"),

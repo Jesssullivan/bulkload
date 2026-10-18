@@ -907,7 +907,9 @@ Q155). No SLO number changes.
   `compose-state`, `hydrate-state`, `apply-state-candidate`), which belong
   to no run. Proof: P86 (`closure/transfer_tests.rs`), the CLI row in
   `tests/space_closure_cli.rs`, report schema `bulkload.closure.v3`
-  [2026-10-16: `bulkload.closure.v4` since #233, below].
+  [2026-10-16: `bulkload.closure.v4` since #233, below; 2026-10-17:
+  `bulkload.closure.v5` since M2r2 b and c, the `carried` and
+  `applied-beside` dispositions].
 - **S5: HEAD and index drift is custody (#38, OI-1003-Q11, under
   OI-1003-Q152).** An agent committing, switching or staging inside a
   captured checkout, or in a worktree nested in it, during a capture pass
@@ -1278,8 +1280,9 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
 - **`--activate-origin PREFIX`** activates a named scp-style or `ssh://`
   origin at a first landing (#226 item 6). The #216 default is unchanged:
   only HTTPS origins are active, and a local path never.
-- **Rebuildable omissions are counted** (#226 item 5). Closure is
-  `bulkload.closure.v4`: an `omissions` block names every omitted root
+- **Rebuildable omissions are counted** (#226 item 5). Closure was
+  `bulkload.closure.v4` (v5 since M2r2 b and c add the `carried` and
+  `applied-beside` dispositions and their totals; see `docs/design.md`): an `omissions` block names every omitted root
   with its entries and bytes, and a capture from before the sidecar shows
   `unknown`, never zero. "Equals the source" is exact except for those
   counted roots.
@@ -1596,7 +1599,11 @@ session re-seat", and the receipt
   `RESEAT_LANE_UNMAPPED:rollout-root` in `--check` too.
 - **S5, as ruled:** the destination's own Codex row or rollout form for a
   thread is never replaced and nothing is placed beside it, for rollouts
-  with no snapshot row too (the MAJOR); a destination file with more than
+  with no snapshot row too (the MAJOR); since the operator's M2 round 2
+  (2026-10-17) such a thread is `destination-adopted` (the row's file holds
+  the landed lines), `destination-holds` or `destination-row-only`
+  (unproved), not a refusal, and every destination row spelled through the
+  home's `git` or a `--map` symlink is re-spelled, lane or not; a destination file with more than
   one link is never written. Two destination changes are ruled
   (OI-1003-Q198): an existing row whose `cwd` only spells the lane through
   a symlink gets that column re-spelled, and a symlinked transcript is

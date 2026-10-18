@@ -350,9 +350,13 @@ pub enum Point {
     /// union (synced); the record still says intent.
     EstateApplyExcludeAppended,
     /// `estate.apply.beside_refs`: a beside landing (M2 round 2 item c)
-    /// landed and its refs created under `refs/<suffix>/`; its STATE record
-    /// and the item's journal not yet written.
+    /// landed and its refs created under `refs/<ns>/`; its STATE record
+    /// still names them pending and the item's journal is not written.
     EstateApplyBesideRefs,
+    /// `estate.carry.recorded`: `estate-carry-files` landed an item's
+    /// bytes and wrote its carry record; the outcome record still says
+    /// `CAPTURE_ABSENT` (M2r2 b).
+    EstateCarryRecorded,
     /// `reseat.after_temp_seal`
     ReseatAfterTempSeal,
     /// `reseat.after_publish`
@@ -399,7 +403,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 66] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -447,6 +451,7 @@ impl Point {
         Self::EstateApplyExcludeIntent,
         Self::EstateApplyExcludeAppended,
         Self::EstateApplyBesideRefs,
+        Self::EstateCarryRecorded,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
         Self::ReseatAfterExtendIntent,
@@ -518,6 +523,7 @@ impl Point {
             Self::EstateApplyExcludeIntent => "estate.apply.exclude_intent",
             Self::EstateApplyExcludeAppended => "estate.apply.exclude_appended",
             Self::EstateApplyBesideRefs => "estate.apply.beside_refs",
+            Self::EstateCarryRecorded => "estate.carry.recorded",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",
             Self::ReseatAfterExtendIntent => "reseat.after_extend_intent",

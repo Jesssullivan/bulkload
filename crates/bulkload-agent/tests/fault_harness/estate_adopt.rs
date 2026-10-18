@@ -305,6 +305,7 @@ impl World {
                 activate_origin: Vec::new(),
                 exclude_union: self.union,
                 beside: self.beside.then(|| SUFFIX.to_owned()),
+                side_roots: Vec::new(),
             },
             &|row| {
                 rows.lock().unwrap().push((row.outcome, row.reason.clone()));
@@ -450,6 +451,7 @@ fn adopt_child_entry() {
             beside: std::env::var_os(CHILD_BESIDE_ENV)
                 .is_some_and(|value| value == "1")
                 .then(|| SUFFIX.to_owned()),
+            side_roots: Vec::new(),
         },
         &|_| Ok(()),
     );

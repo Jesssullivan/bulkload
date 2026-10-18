@@ -78,16 +78,32 @@
 //! the report covers the transfers the operator named (`--transfer`) and
 //! says so (no `transfer_manifest` block).
 //!
-//! The report is `bulkload.closure.v5` (M2 round 2 item c: the
-//! disposition `applied-beside` and its total `applied_beside`, after
-//! `applied`; nothing else changes from v4). v4 was #226 item 5 (v3 from WP3 PR 4,
+//! - `carried` (M2r2 b, v5): the item plans a workspace, its capture
+//!   refused, and `estate-carry-files` carried it as files: its outcome is
+//!   `CarriedAsFiles`, and its `{item}-{blake3(SOURCE)}.carried` record
+//!   names a transfer record that still has the bytes the carry recorded,
+//!   is a completed session into the recorded destination, and holds no
+//!   refused path ([`crate::estate::carried::prove`]). Accounted, like
+//!   `applied`. A carried outcome without that proof is unaccounted
+//!   (`carried-record-missing`, `carried-transfer-changed`, ...).
+//!
+//! The report is `bulkload.closure.v5` (M2r2 b and c). v5 adds the
+//! dispositions `applied-beside` and `carried`, their totals
+//! `applied_beside` (after `applied`) and `carried` (after `covered`), and
+//! on a carried row the `carried` block (via, destination, beside, transfer
+//! state, gits). Nothing else changes from v4.
+//!
+//! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
 //! `unmatched_journals`, `omissions`: the rebuildable roots the planned
 //! items' current captures omitted, from each capture's `.omissions`
 //! sidecar (`items_known`, `items_unknown`, `roots`, `entries`, `bytes`,
 //! one row per root with `item`, `path`, `entries` and `bytes`, and the
-//! `unknown` items whose capture predates the sidecar, never counted as
-//! zero). Nothing else changes from v3: rows, totals, dispositions and the
+//! `unknown` items, never counted as zero). A capture from before the
+//! sidecar is read in band from its bundle's header; only with
+//! `closure-report --omissions-from-destination` is a list the header names
+//! read from the destination repository's objects (`git_carry::in_band`,
+//! M2 round 2, d). Nothing else changes from v3: rows, totals, dispositions and the
 //! gate are as before, and omissions are outside every one of them. In v3
 //! (unchanged): a transfer row names its `kind` (an estate row prints as in
 //! v2), and adds `transfer`, `path`, `transfer_outcome` and `sqlite_code`, `disposition` can be `covered`, and the
@@ -128,6 +144,10 @@ pub enum Disposition {
     Covered,
     /// Not provably closed, for this reason.
     Unaccounted(&'static str),
+    /// A capture-refused item carried as files by `estate-carry-files`
+    /// (M2r2 b): its outcome, its carry record and the completed transfer
+    /// session that record names agree, with no refused path.
+    Carried,
 }
 
 impl Disposition {
@@ -142,6 +162,7 @@ impl Disposition {
             Self::ReferencedOnly => "referenced-only",
             Self::Covered => "covered",
             Self::Unaccounted(_) => "unaccounted",
+            Self::Carried => "carried",
         }
     }
 
@@ -220,10 +241,13 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
     match &record.outcome {
         Outcome::Refused(refusal) => refusal_disposition(refusal),
         Outcome::WorkspaceBeside | Outcome::PreviousWorkspaceBesideNotRevalidated => {
-            if entry.has_workspace {
-                journal("workspace-beside", Disposition::AppliedBeside)
-            } else {
-                Disposition::Unaccounted("outcome-workspace-mismatch")
+            // Review of #266, B4: the beside landing's STATE record must name
+            // the item and its current capture, with no ref pending or kept.
+            match (&entry.beside, entry.has_workspace) {
+                (_, false) => Disposition::Unaccounted("outcome-workspace-mismatch"),
+                (None, true) => Disposition::Unaccounted("beside-record-missing"),
+                (Some(Err(why)), true) => Disposition::Unaccounted(why),
+                (Some(Ok(())), true) => journal("workspace-beside", Disposition::AppliedBeside),
             }
         }
         Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
@@ -255,6 +279,21 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
         | Outcome::CaptureExtendedFromDrift
         | Outcome::CaptureReusedAfterCensus
         | Outcome::DeferredWithDrift => Disposition::Unaccounted("not-an-apply-outcome"),
+        // M2r2 b: carried as files; the carry record and its transfer
+        // session must prove it.
+        // A refs-only item rides on a carried workspace item of the same
+        // source (`via`); a workspace item carries its own.
+        Outcome::CarriedAsFiles => match &entry.carried {
+            None => Disposition::Unaccounted("carried-record-missing"),
+            Some(Err(why)) => Disposition::Unaccounted(why),
+            Some(Ok(proof)) if proof.source != entry.source => {
+                Disposition::Unaccounted("carried-source-mismatch")
+            }
+            Some(Ok(proof)) if proof.via.is_some() == entry.has_workspace => {
+                Disposition::Unaccounted("carried-shape-mismatch")
+            }
+            Some(Ok(_)) => Disposition::Carried,
+        },
     }
 }
 
@@ -371,6 +410,8 @@ pub struct Row {
     pub ruled_default: Option<crate::disposition::Decision>,
     /// Whether [`Self::ruled_default`] is what disposes it now.
     pub by_default: bool,
+    /// The proved carry of a `carried` row (M2r2 b).
+    pub carried: Option<crate::estate::carried::CarriedProof>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -387,6 +428,8 @@ pub struct Report {
     pub referenced_only: u64,
     /// Transfer sidecars covered by a snapshot (WP3 PR 4).
     pub covered: u64,
+    /// Capture-refused items carried as files (M2r2 b, v5).
+    pub carried: u64,
     pub unaccounted: u64,
     /// Typed refusals disposed by their ruled default, not a review.
     pub ruled_default: u64,
@@ -421,6 +464,10 @@ pub struct Omissions {
     pub known: u64,
     /// Items whose omissions are unknown.
     pub unknown: Vec<String>,
+    /// How many unknown items each reason accounts for (M2 round 2, d):
+    /// printed by the binary as an `omissions-unknown` line, outside the
+    /// v4 JSON.
+    pub unknown_because: std::collections::BTreeMap<String, u64>,
     /// One row per omitted root: item, path, entries, bytes.
     pub rows: Vec<(String, Vec<u8>, u64, u64)>,
 }
@@ -463,19 +510,23 @@ impl Report {
             ..Self::default()
         };
         for entry in &ledger.entries {
-            match &entry.omitted {
-                Some(omitted) => {
-                    report.omissions.known += 1;
-                    report.omissions.rows.extend(omitted.iter().map(|root| {
-                        (
-                            entry.item.clone(),
-                            root.rel_path.clone(),
-                            root.entries,
-                            root.bytes,
-                        )
-                    }));
-                }
-                None => report.omissions.unknown.push(entry.item.clone()),
+            if let Some(omitted) = &entry.omitted {
+                report.omissions.known += 1;
+                report.omissions.rows.extend(omitted.iter().map(|root| {
+                    (
+                        entry.item.clone(),
+                        root.rel_path.clone(),
+                        root.entries,
+                        root.bytes,
+                    )
+                }));
+            } else {
+                report.omissions.unknown.push(entry.item.clone());
+                *report
+                    .omissions
+                    .unknown_because
+                    .entry(entry.unknown_because.unwrap_or("unknown").to_owned())
+                    .or_default() += 1;
             }
             report.rows.push(Row {
                 item: entry.item.clone(),
@@ -497,6 +548,20 @@ impl Report {
                 transfer: None,
                 ruled_default: None,
                 by_default: false,
+                carried: entry
+                    .carried
+                    .as_ref()
+                    .and_then(|proof| proof.as_ref().ok())
+                    .filter(|_| {
+                        matches!(
+                            entry.record,
+                            Some(Ok(crate::outcome::OutcomeRecord {
+                                outcome: Outcome::CarriedAsFiles,
+                                ..
+                            }))
+                        )
+                    })
+                    .cloned(),
             });
         }
         report.recount();
@@ -521,9 +586,10 @@ impl Report {
             self.refused_pending_review,
             self.referenced_only,
             self.covered,
+            self.carried,
             self.unaccounted,
             self.ruled_default,
-        ) = (0, 0, 0, 0, 0, 0, 0, 0);
+        ) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
         self.refusals.clear();
         for row in &mut self.rows {
             if let Some(code) = row.disposition.refusal().map(str::to_owned) {
@@ -552,6 +618,7 @@ impl Report {
                 Disposition::RefusedPendingReview(_) => self.refused_pending_review += 1,
                 Disposition::ReferencedOnly => self.referenced_only += 1,
                 Disposition::Covered => self.covered += 1,
+                Disposition::Carried => self.carried += 1,
                 Disposition::Unaccounted(_) => self.unaccounted += 1,
             }
         }
@@ -849,7 +916,7 @@ impl Report {
         let mut out = String::new();
         let _ = write!(
             out,
-            "{{\"schema\":\"{SCHEMA}\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"transfer_rows\":{},\"applied\":{},\"applied_beside\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"covered\":{},\"unaccounted\":{},\"pending_review\":{},\"ruled_default\":{}}},\"refusals\":{{",
+            "{{\"schema\":\"{SCHEMA}\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"transfer_rows\":{},\"applied\":{},\"applied_beside\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"covered\":{},\"carried\":{},\"unaccounted\":{},\"pending_review\":{},\"ruled_default\":{}}},\"refusals\":{{",
             if self.native_passes() { "pass" } else { "fail" },
             if self.passes() { "pass" } else { "fail" },
             self.planned(),
@@ -860,6 +927,7 @@ impl Report {
             self.refused_pending_review,
             self.referenced_only,
             self.covered,
+            self.carried,
             self.unaccounted,
             self.pending_review(),
             self.ruled_default,
@@ -923,6 +991,17 @@ impl Report {
             }
             if let Disposition::Unaccounted(why) = &row.disposition {
                 let _ = write!(out, ",\"unaccounted_reason\":{}", json_string(why));
+            }
+            if let Some(proof) = &row.carried {
+                let _ = write!(
+                    out,
+                    ",\"carried\":{{\"via\":{},\"destination\":{},\"beside\":{},\"transfer_state\":{},\"gits\":{}}}",
+                    proof.via.as_deref().map_or_else(|| "null".to_owned(), json_string),
+                    json_string(&proof.destination.to_string_lossy()),
+                    proof.beside,
+                    json_string(&proof.transfer_state.to_string_lossy()),
+                    proof.gits,
+                );
             }
             if let Some(review) = &row.review {
                 out.push_str(",\"review\":");
@@ -1126,6 +1205,7 @@ fn transfer_row(
         transfer: Some(detail),
         ruled_default: None,
         by_default: false,
+        carried: None,
     }
 }
 
@@ -2026,6 +2106,49 @@ mod tests {
         JournalState::Present(body.to_owned())
     }
 
+    /// M2r2 c (review of #266, B4): a beside outcome closes
+    /// `applied-beside` only with its exact journal and a `.beside` record
+    /// that proves the landing; otherwise it is unaccounted, by reason.
+    #[test]
+    fn a_beside_outcome_needs_its_journal_and_record() {
+        let with = |beside: Option<std::result::Result<(), &'static str>>, journal| LedgerEntry {
+            beside,
+            ..entry('b', true, Some(("workspace-beside", None)), journal)
+        };
+        assert_eq!(
+            classify(&with(Some(Ok(())), present("workspace-beside"))),
+            Disposition::AppliedBeside
+        );
+        assert_eq!(
+            classify(&with(None, present("workspace-beside"))),
+            Disposition::Unaccounted("beside-record-missing")
+        );
+        assert_eq!(
+            classify(&with(
+                Some(Err("beside-record-mismatch")),
+                present("workspace-beside")
+            )),
+            Disposition::Unaccounted("beside-record-mismatch")
+        );
+        assert_eq!(
+            classify(&with(Some(Ok(())), present("workspace-restored"))),
+            Disposition::Unaccounted("journal-outcome-mismatch")
+        );
+        let refs_only = LedgerEntry {
+            beside: Some(Ok(())),
+            ..entry(
+                'r',
+                false,
+                Some(("workspace-beside", None)),
+                present("workspace-beside"),
+            )
+        };
+        assert_eq!(
+            classify(&refs_only),
+            Disposition::Unaccounted("outcome-workspace-mismatch")
+        );
+    }
+
     fn entry(
         item: char,
         has_workspace: bool,
@@ -2048,7 +2171,10 @@ mod tests {
             }),
             journal,
             capture,
+            unknown_because: None,
             omitted: None,
+            carried: None,
+            beside: None,
         }
     }
 
@@ -2341,7 +2467,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
+            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
         ), "{json}");
         // A typed refusal row names its code, recording site and errno.
         assert!(json.contains(
@@ -2528,7 +2654,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
+            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
         ), "{json}");
         // The attested refusal of c is a typed refusal: it needs a review.
         assert!(json.contains(
@@ -2593,7 +2719,7 @@ mod tests {
         assert_eq!(report.gate(), Ok(()));
         let json = report.to_json();
         assert!(
-            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"unaccounted\":4,\"pending_review\":0,\"ruled_default\":0}"),
+            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":4,\"pending_review\":0,\"ruled_default\":0}"),
             "{json}"
         );
         assert!(json.contains(
@@ -2944,6 +3070,7 @@ mod tests {
     #[test]
     fn omitted_rebuildable_roots_are_counted_and_unknown_is_not_zero() {
         let known = LedgerEntry {
+            unknown_because: None,
             omitted: Some(vec![
                 crate::git_carry::RebuildableOmission {
                     rel_path: b"node_modules".to_vec(),
@@ -2964,6 +3091,7 @@ mod tests {
             )
         };
         let none = LedgerEntry {
+            unknown_because: None,
             omitted: Some(Vec::new()),
             ..entry(
                 'b',
@@ -3715,7 +3843,10 @@ mod tests {
                     record: outcome,
                     journal,
                     capture: Some(item(index)),
+                    unknown_because: None,
                     omitted: None,
+                    carried: None,
+                    beside: None,
                 });
                 let Kind::Typed(code, how) = kind else {
                     continue;
