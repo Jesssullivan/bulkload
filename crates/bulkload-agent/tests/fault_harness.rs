@@ -1505,6 +1505,11 @@ scenarios! {
     // record is settled.
     estate_apply_exclude_intent => EstateApplyExcludeIntent: 1, EstateAdopt::ExcludeUnion;
     estate_apply_exclude_appended => EstateApplyExcludeAppended: 1, EstateAdopt::ExcludeUnion;
+    // M2 round 2, item c: a beside landing crashed after its worktree is
+    // added (finished forward from its landing intent) and after its refs.
+    estate_apply_beside_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::Beside;
+    estate_apply_beside_refs => EstateApplyBesideRefs: 1, EstateAdopt::Beside;
+    estate_apply_beside_stale_capture => EstateConvergeLinkedAdded: 1, EstateAdopt::BesideStale;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

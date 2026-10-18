@@ -914,7 +914,9 @@ Q155). No SLO number changes.
   `compose-state`, `hydrate-state`, `apply-state-candidate`), which belong
   to no run. Proof: P86 (`closure/transfer_tests.rs`), the CLI row in
   `tests/space_closure_cli.rs`, report schema `bulkload.closure.v3`
-  [2026-10-16: `bulkload.closure.v4` since #233, below].
+  [2026-10-16: `bulkload.closure.v4` since #233, below; 2026-10-17:
+  `bulkload.closure.v5` since M2r2 b and c, the `carried` and
+  `applied-beside` dispositions].
 - **S5: HEAD and index drift is custody (#38, OI-1003-Q11, under
   OI-1003-Q152).** An agent committing, switching or staging inside a
   captured checkout, or in a worktree nested in it, during a capture pass
@@ -1286,8 +1288,8 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
   origin at a first landing (#226 item 6). The #216 default is unchanged:
   only HTTPS origins are active, and a local path never.
 - **Rebuildable omissions are counted** (#226 item 5). Closure was
-  `bulkload.closure.v4` (v5 since M2r2 b adds the `carried` disposition;
-  see `docs/design.md`): an `omissions` block names every omitted root
+  `bulkload.closure.v4` (v5 since M2r2 b and c add the `carried` and
+  `applied-beside` dispositions and their totals; see `docs/design.md`): an `omissions` block names every omitted root
   with its entries and bytes, and a capture from before the sidecar shows
   `unknown`, never zero. "Equals the source" is exact except for those
   counted roots.
