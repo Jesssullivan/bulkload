@@ -1525,6 +1525,54 @@ default**. Diagnosis: `docs/agent-notes/2026-10-16-delta-regression.md`
   on the bench comes before any gated sample (Q143); the diagnosis expects
   about 0.89x rclone on the bench delta, at Q143's 0.90x margin.
 
+## Amendment 2026-10-16: the merge gate is a local receipt on sting (OI-1003-Q199)
+
+Operator ruling OI-1003-Q199 (Linear TIN-4543 comment `b208cbae`). It
+changes where the existing gates run, not what they prove; every SLO and
+proof obligation above stands.
+
+- **Gate location.** A PR merges on `just local-gate` run on sting inside
+  `nix develop`, on the exact PR head brought up to date with main. The gate
+  is `check-fast` plus the history secret scan of HEAD's ancestry
+  (`secrets-scan-head`; a shared checkout's other refs are not the PR's)
+  plus a Bazel graph load
+  (`bazel-graph`, a query that closes the OI-1003-Q65 gap, not a build); the
+  CI contract test holds it to CI's gate set. GitHub CI runs only on `v*`
+  tags and `workflow_dispatch`, as the backstop, and the "Protect main"
+  ruleset no longer requires status checks. Darwin code runs
+  `just darwin-check` on pzm only when `just darwin-touched` flags the PR,
+  never on neo (OI-1003-Q196); while pzm is on hold that check is deferred
+  and the deferral recorded.
+- **Attestation.** `scripts/local-gate-receipt.sh` runs CI's gate exactly
+  (`nix flake check --no-build --no-write-lock-file`, then
+  `nix develop --ignore-environment` with CI's `--keep` list only, running
+  `just local-gate`), so neither the caller's shell nor ambient
+  `BULKLOAD_*`/`RUSTFLAGS` settings reach it, and refuses a dirty tree or an
+  overlay (ignored or excluded files other than build output, skip-worktree
+  or assume-unchanged files, outside cargo configs) unless
+  `--allow-overlay` is given and recorded. It writes one receipt line per
+  run, led by PASS or FAIL: host, PR, head sha, tree, main, the flake.lock
+  and log sha256, exit code, times, kind and overlay, citing OI-1003-Q199
+  and R-N13. A FAIL is posted only as "Local gate FAILED", never as a
+  receipt. The kind is derived from the diff (docs only when every changed
+  path is Markdown) and may be raised, never lowered. Every PR carries the
+  receipt; code PRs also need the lanes' adversarial review (OI-1003-Q173);
+  docs PRs need the receipt only. The receipt is self-attested: the exact
+  sha, the clean-tree, overlay and up-to-date checks, the log digest and
+  tag-time CI are its mitigations.
+- **Staleness.** A receipt is valid only while receipt.head equals the PR
+  head and receipt.main equals main's current tip; a push to the PR or a
+  merge to main voids it, so two PRs gated on the same main cannot both
+  merge on those receipts. `just local-gate-verify --pr N` checks both
+  against GitHub (and the receipt's tree against the head's) and is run
+  right before `gh pr merge --match-head-commit`.
+- **Retirement.** The local gate retires when GloriousFlywheel v4 fabric
+  check runs land (TIN-5946). Sting RBE is later, not part of this ruling.
+- **Gate host (2026-10-18).** Since the operator's 2026-10-17 ruling that
+  heavy work moves off sting, the gate's build and test half runs on honey on
+  the exact head; merging main, signing, pushing, the receipt and the merge
+  stay on sting, and the receipt names the host.
+
 ## Amendment 2026-10-16: R0, every agent lane continues on the destination (TIN-6587)
 
 The operator's core user expectation (2026-10-16, Linear TIN-6587; R0 of the

@@ -9,7 +9,7 @@ inputs:
     description: Exact triggering event name
     required: true
   expected-sha:
-    description: Exact checked-out PR head or push commit
+    description: Exact checked-out tag or dispatched commit
     required: true
   ref:
     description: Exact triggering Git ref
@@ -18,7 +18,7 @@ inputs:
     description: Exact repository identity
     required: true
   head-repository:
-    description: PR head repository, or repository identity for a push
+    description: Repository identity of the tested commit
     required: true
   upload-bazel-results:
     description: True only for a trusted push to refs/heads/main
@@ -125,7 +125,7 @@ runs:
         USE_BAZEL_VERSION: ""
       run: |
         set -euo pipefail
-        expected=825d154fb96d8795185420e3b5049f1504bb5aaf29cd521a64f8fb5d500b8e6f
+        expected=752df5abcd7c07d9ffbe18bac6f5ddad7309f52266b4349e5a38306f4b408bc4
         source_guard="$GITHUB_WORKSPACE/scripts/ci-public-read-guard.sh"
         [[ "$(/usr/bin/sha256sum "$source_guard" | /usr/bin/awk '{print $1}')" == "$expected" ]]
         guard_dir=$(/usr/bin/mktemp -d "$RUNNER_TEMP/bulkload-public-read-guard.XXXXXXXX")
@@ -236,7 +236,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 825d154fb96d8795185420e3b5049f1504bb5aaf29cd521a64f8fb5d500b8e6f ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 752df5abcd7c07d9ffbe18bac6f5ddad7309f52266b4349e5a38306f4b408bc4 ]]
         /bin/bash --noprofile --norc -p -c "$guard_source" bulkload-public-read-guard preflight
 
     - name: Discover sanctioned runner endpoint authority
@@ -424,7 +424,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 825d154fb96d8795185420e3b5049f1504bb5aaf29cd521a64f8fb5d500b8e6f ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 752df5abcd7c07d9ffbe18bac6f5ddad7309f52266b4349e5a38306f4b408bc4 ]]
         /bin/bash --noprofile --norc -p -c "$guard_source" bulkload-public-read-guard enforce
 
     - name: Verify effective Nix client authority
@@ -615,7 +615,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 825d154fb96d8795185420e3b5049f1504bb5aaf29cd521a64f8fb5d500b8e6f ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 752df5abcd7c07d9ffbe18bac6f5ddad7309f52266b4349e5a38306f4b408bc4 ]]
         /bin/bash --noprofile --norc -p -c "$guard_source" bulkload-public-read-guard bazel
 
     - name: Build the Bulkload documentation through the public Flywheel action
@@ -789,7 +789,7 @@ runs:
         set -euo pipefail
         guard_source=$(/bin/cat -- "$BULKLOAD_GUARD_PATH"; printf x)
         guard_source=${guard_source%x}
-        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 825d154fb96d8795185420e3b5049f1504bb5aaf29cd521a64f8fb5d500b8e6f ]]
+        [[ "$(printf '%s' "$guard_source" | /usr/bin/sha256sum | /usr/bin/awk '{print $1}')" == 752df5abcd7c07d9ffbe18bac6f5ddad7309f52266b4349e5a38306f4b408bc4 ]]
         /bin/bash --noprofile --norc -p -c "$guard_source" bulkload-public-read-guard bazel
 
     - name: Test the complete Bulkload Bazel graph through the public Flywheel action
