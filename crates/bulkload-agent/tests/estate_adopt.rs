@@ -1887,12 +1887,12 @@ fn p113_a_beside_landing_never_appends_to_the_live_exclude() {
         fs::create_dir_all(source.join(".git/info")).unwrap();
         fs::write(source.join(".git/info/exclude"), b"a.log\nb.log\n").unwrap();
         fs::create_dir_all(dest.join(".git/info")).unwrap();
-        let live: &[u8] = if held {
+        let live_exclude: &[u8] = if held {
             b"b.log\na.log\nc.log\n"
         } else {
             b"a.log\n"
         };
-        fs::write(dest.join(".git/info/exclude"), live).unwrap();
+        fs::write(dest.join(".git/info/exclude"), live_exclude).unwrap();
         fs::write(dest.join("operator.log"), b"untracked at the destination\n").unwrap();
         let run = diverged(&world, &source, &dest, false);
         let status = git(&dest, &["status", "--porcelain", "--untracked-files=all"]);
@@ -1901,7 +1901,10 @@ fn p113_a_beside_landing_never_appends_to_the_live_exclude() {
         let line = diff_line(&diff.stdout, &source).to_owned();
         let ran = run.apply(&["--adopt", "--exclude-union", "--beside", SUFFIX]);
         let row = receipt(&receipts(&ran.stdout), &source).clone();
-        assert_eq!(fs::read(dest.join(".git/info/exclude")).unwrap(), live);
+        assert_eq!(
+            fs::read(dest.join(".git/info/exclude")).unwrap(),
+            live_exclude
+        );
         if !held {
             // Before `git status`, which refreshes the index itself.
             assert_eq!((freeze_all(&dest), all_refs(&dest)), frozen);

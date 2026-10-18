@@ -1389,7 +1389,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                         adopt: options.adopt,
                         activate_origin: options.activate_origin,
                         exclude_union: options.exclude_union,
-                        beside: options.beside.clone(),
+                        beside: options.beside,
                     },
                 ),
                 &receipt,
