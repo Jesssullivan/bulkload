@@ -280,6 +280,11 @@ pub struct TransferStats {
     /// carries one (`SQLITE_BACKUP_FAILED`), by relative path: what
     /// [`Self::default_disposition`] reads (OI-1003-Q148).
     pub refusal_sqlite_codes: BTreeMap<Vec<u8>, i32>,
+    /// The OS errno of an `IO` refusal in [`Self::refusals`] that this
+    /// side raised, by relative path (S4, TIN-6592): its transfer record
+    /// keeps it. A refusal the peer sent carries its code alone (wire v6
+    /// has no errno), so none is recorded for it.
+    pub refusal_errnos: BTreeMap<Vec<u8>, i32>,
     /// Orphaned temporaries of this destination store removed by name.
     pub temporaries_removed: u64,
     /// Temporary-grammar names left in place because the sweep could not
@@ -340,6 +345,22 @@ impl TransferStats {
                 .insert(rel_path.clone(), sqlite_code);
         }
         self.refusals.push((rel_path, code));
+    }
+
+    /// Record a refusal of `rel_path` that this side raised, with the
+    /// `SQLite` code it carries, keeping a bare `IO`'s errno (S4,
+    /// TIN-6592).
+    fn refuse_here(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
+        self.keep_errno(&rel_path, refusal);
+        self.refuse(rel_path, refusal.code().to_owned(), refusal.sqlite_code());
+    }
+
+    /// Keep the errno of a bare `IO` this side raised for `rel_path` (S4,
+    /// TIN-6592).
+    fn keep_errno(&mut self, rel_path: &[u8], refusal: &BulkloadRefusal) {
+        if let BulkloadRefusal::Io(Some(errno)) = refusal {
+            self.refusal_errnos.insert(rel_path.to_vec(), *errno);
+        }
     }
 
     /// The default S4 disposition of the refusal of `rel_path` with `code`
@@ -734,8 +755,19 @@ pub fn copy_with(
         match (result, served) {
             // The destination refused for a reason of its own (its setup,
             // which now runs while the source opens its store, item 1b): the
-            // source's broken stream is only the echo of it.
-            (Err(refusal), Err(_)) if !matches!(refusal, BulkloadRefusal::Io(_)) => Err(refusal),
+            // source's broken stream is only the echo of it, whatever the
+            // destination's code (an IO with its errno included). A
+            // destination that lost its stream is the echo of the source's
+            // refusal.
+            (Err(refusal), Err(BulkloadRefusal::TransportLost)) => Err(refusal),
+            (Err(refusal), Err(_))
+                if !matches!(
+                    refusal,
+                    BulkloadRefusal::Io(_) | BulkloadRefusal::TransportLost
+                ) =>
+            {
+                Err(refusal)
+            }
             (result, served) => {
                 served?;
                 result
@@ -1420,6 +1452,40 @@ fn after_sniff(root: &Path) {
     }
 }
 
+/// A test-only hook run with a seat's relative path before its capture
+/// opens it.
+#[cfg(test)]
+type OpenHook = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Test-only hooks by canonical source root, run before a capture opens a
+/// walked seat (S4, TIN-6592): where a writer can still remove it.
+#[cfg(test)]
+static BEFORE_OPEN: Mutex<Vec<(PathBuf, OpenHook)>> = Mutex::new(Vec::new());
+
+/// Set (or, with `None`, clear) the before-open hook of a canonical source
+/// root.
+#[cfg(test)]
+fn set_before_open(root: &Path, hook: Option<OpenHook>) {
+    let mut hooks = BEFORE_OPEN.lock().unwrap_or_else(PoisonError::into_inner);
+    hooks.retain(|(hooked_root, _)| hooked_root != root);
+    if let Some(hook) = hook {
+        hooks.push((root.to_path_buf(), hook));
+    }
+}
+
+#[cfg(test)]
+fn before_open(root: &Path, rel_path: &[u8]) {
+    let hook = BEFORE_OPEN
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(hooked_root, _)| hooked_root == root)
+        .map(|(_, hook)| Arc::clone(hook));
+    if let Some(hook) = hook {
+        hook(rel_path);
+    }
+}
+
 /// Test-only: who a `snapshot`-mode session's source half takes itself to
 /// be, by canonical source root. Unit tests of what the source does once it
 /// may read run as root in CI, so they assume an ordinary user; tests of the
@@ -2055,7 +2121,9 @@ impl<W: Write> Write for Corked<'_, W> {
 
 impl<W: Write> Uncork for Corked<'_, W> {
     fn uncork(&mut self) -> Result<()> {
-        self.0.flush().refuse_at("transfer::uncork")
+        self.0
+            .flush()
+            .map_err(|error| crate::refuse::transport(&error, "transfer::uncork"))
     }
 }
 
@@ -3501,7 +3569,8 @@ fn seat_directory<'r>(
                     crate::walk::rel_path(row.rel_path.get(..at).unwrap_or_default()),
                     crate::io::OpenMode::Directory,
                 )
-                .refuse_at("transfer::seat_directory")?,
+                // S4 (TIN-6592): a directory removed since the walk.
+                .map_err(|error| crate::refuse::source_seat(&error, "transfer::seat_directory"))?,
             ),
             row.rel_path.get(at + 1..).unwrap_or_default(),
         ),
@@ -3677,13 +3746,18 @@ fn room_for_slot(work: &SourceWork<'_>, reserved: &mut SlotReservation, bound: u
 
 /// Open a source seat for reading, component by component beneath the
 /// source root descriptor (W4 PR 3): a symlink at any component is refused.
+// S4 (TIN-6592): a walked seat gone before its capture opens it is
+// `SOURCE_VANISHED`, never a bare IO: on the wire a refusal is its code
+// alone, so an errno never reaches the destination's record.
 fn open_source(work: &SourceWork<'_>, row: &RowSchema) -> Result<std::fs::File> {
+    #[cfg(test)]
+    before_open(work.root, &row.rel_path);
     let fd = crate::io::sys::openat_beneath(
         work.root_fd,
         crate::walk::rel_path(&row.rel_path),
         crate::io::OpenMode::Read,
     )
-    .refuse_at("transfer::open_source")?;
+    .map_err(|error| crate::refuse::source_seat(&error, "transfer::open_source"))?;
     Ok(std::fs::File::from(fd))
 }
 
@@ -3808,9 +3882,7 @@ fn finish_receive(
     for (rel_path, outcome) in committer.finish()? {
         match outcome {
             Ok(()) => stats.completed += 1,
-            Err(refusal) => {
-                stats.refuse(rel_path, refusal.code().to_owned(), refusal.sqlite_code());
-            }
+            Err(refusal) => stats.refuse_here(rel_path, &refusal),
         }
     }
     resolve_sidecars(stats, sidecars, snapshot_bases);
@@ -5276,7 +5348,9 @@ impl<W: Write> Inbound<'_, W> {
         Ok(())
     }
 
+    // The code alone, as before, and a bare `IO`'s errno (TIN-6592).
     fn refuse(&mut self, rel_path: Vec<u8>, refusal: &BulkloadRefusal) {
+        self.stats.keep_errno(&rel_path, refusal);
         self.stats
             .refusals
             .push((rel_path, refusal.code().to_owned()));
@@ -7441,7 +7515,7 @@ fn read_wire<R: Read>(input: &mut R, hand: Option<&HandIn>) -> Result<Wire> {
     let mut prefix = [0_u8; FRAME_HEADER_BYTES];
     input
         .read_exact(&mut prefix)
-        .refuse_at("transfer::read_frame")?;
+        .map_err(|error| crate::refuse::transport(&error, "transfer::read_frame"))?;
     let [a, b, c, d, tag] = prefix;
     let length = u32::from_be_bytes([a, b, c, d]) as usize;
     if length > MAX_FRAME_BYTES {
@@ -7455,7 +7529,7 @@ fn read_wire<R: Read>(input: &mut R, hand: Option<&HandIn>) -> Result<Wire> {
         let mut header = [0_u8; DATA_HEADER_BYTES];
         input
             .read_exact(&mut header)
-            .refuse_at("transfer::read_frame")?;
+            .map_err(|error| crate::refuse::transport(&error, "transfer::read_frame"))?;
         let header = DataHeader::from_bytes(&header)?;
         if header.size as usize > MAX_DATA_PAYLOAD {
             return Err(BulkloadRefusal::BudgetExceeded);
@@ -7477,7 +7551,7 @@ fn read_wire<R: Read>(input: &mut R, hand: Option<&HandIn>) -> Result<Wire> {
         let mut header = [0_u8; DATA_HEADER_BYTES];
         input
             .read_exact(&mut header)
-            .refuse_at("transfer::read_frame")?;
+            .map_err(|error| crate::refuse::transport(&error, "transfer::read_frame"))?;
         let header = DataHeader::from_bytes(&header)?;
         if header.size as usize != size {
             return Err(BulkloadRefusal::FrameCodec);
@@ -7485,13 +7559,13 @@ fn read_wire<R: Read>(input: &mut R, hand: Option<&HandIn>) -> Result<Wire> {
         let mut payload = vec![0_u8; size];
         input
             .read_exact(&mut payload)
-            .refuse_at("transfer::read_frame")?;
+            .map_err(|error| crate::refuse::transport(&error, "transfer::read_frame"))?;
         Frame::Data { header, payload }
     } else {
         let mut bytes = vec![0_u8; body];
         input
             .read_exact(&mut bytes)
-            .refuse_at("transfer::read_frame")?;
+            .map_err(|error| crate::refuse::transport(&error, "transfer::read_frame"))?;
         Frame::decode_body(tag, &bytes)?
     };
     counters::bump(Counter::WireFramesReceived);
@@ -7537,10 +7611,12 @@ fn write_data<W: Write>(output: &mut W, header: &DataHeader, payload: &[u8]) -> 
             }
             Ok(written) => IoSlice::advance_slices(&mut remaining, written),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => (),
-            Err(error) => return Err(crate::refuse::io(&error, "transfer::write_data")),
+            Err(error) => return Err(crate::refuse::transport(&error, "transfer::write_data")),
         }
     }
-    output.flush().refuse_at("transfer::write_data")?;
+    output
+        .flush()
+        .map_err(|error| crate::refuse::transport(&error, "transfer::write_data"))?;
     counters::bump(Counter::WireFramesSent);
     counters::add_len(Counter::WireBytesSent, prefix.len() + payload.len());
     Ok(())
@@ -7573,8 +7649,10 @@ pub fn write_control<W: Write>(output: &mut W, control: &Control) -> Result<()> 
     let encoded = control.encode()?;
     output
         .write_all(&encoded)
-        .refuse_at("transfer::write_control")?;
-    output.flush().refuse_at("transfer::write_control")?;
+        .map_err(|error| crate::refuse::transport(&error, "transfer::write_control"))?;
+    output
+        .flush()
+        .map_err(|error| crate::refuse::transport(&error, "transfer::write_control"))?;
     counters::bump(Counter::WireFramesSent);
     counters::add_len(Counter::WireBytesSent, encoded.len());
     Ok(())

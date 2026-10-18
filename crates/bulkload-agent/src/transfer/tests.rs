@@ -1606,6 +1606,152 @@ fn a_short_data_frame_is_refused_without_reading_on() {
     assert_eq!(input.len(), 10 + next.len());
 }
 
+/// S4 (TIN-6592): a stream that ends at or inside a frame is the
+/// transport's loss (`TRANSPORT_LOST`), never a bare IO no review can
+/// close: the empty stream, and every cut of a whole frame.
+#[test]
+fn a_stream_that_ends_is_transport_lost() {
+    assert_eq!(
+        read_frame(&mut [].as_slice()).unwrap_err(),
+        BulkloadRefusal::TransportLost
+    );
+    for whole in [Control::WalkDone { entries: 7 }.encode().unwrap(), {
+        let mut frame = Vec::new();
+        let payload = [7_u8; 64];
+        write_data(
+            &mut frame,
+            &DataHeader {
+                entry: 0,
+                index: 0,
+                offset: 0,
+                size: 64,
+                digest: *blake3::hash(&payload).as_bytes(),
+            },
+            &payload,
+        )
+        .unwrap();
+        frame
+    }] {
+        assert!(read_frame(&mut whole.as_slice()).is_ok());
+        for cut in 1..whole.len() {
+            assert_eq!(
+                read_frame(&mut &whole[..cut]).unwrap_err(),
+                BulkloadRefusal::TransportLost,
+                "cut {cut} of {}",
+                whole.len()
+            );
+        }
+    }
+}
+
+/// S4 (TIN-6592): a frame written to a peer that is gone (`EPIPE`) is
+/// `TRANSPORT_LOST`.
+#[test]
+fn a_write_to_a_gone_peer_is_transport_lost() {
+    let (mut ours, theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    drop(theirs);
+    assert_eq!(
+        write_control(&mut ours, &Control::WalkDone { entries: 0 }).unwrap_err(),
+        BulkloadRefusal::TransportLost
+    );
+}
+
+/// S4 (TIN-6592): a `pull` whose transport dies after the open (an ssh
+/// that times out, a source that exits) ends `TRANSPORT_LOST`, which its
+/// transfer record keeps as a typed session refusal; it was a bare `IO`
+/// with no errno.
+#[test]
+fn a_receive_whose_peer_is_gone_is_transport_lost() {
+    let corpus = Corpus::new();
+    let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+    let peer = std::thread::spawn(move || {
+        // The source reads the open and goes away without a word.
+        let _ = read_frame(&mut theirs);
+    });
+    let mut input = ours.try_clone().unwrap();
+    let mut output = ours;
+    let received = receive(
+        &mut input,
+        &mut output,
+        Path::new("/peer/source"),
+        Path::new("/peer/state"),
+        &corpus.base.join("destination"),
+        &corpus.base.join("destination-state"),
+    );
+    // Closed before the join: a regression that refuses before the open
+    // fails here instead of leaving the peer waiting.
+    drop((input, output));
+    peer.join().unwrap();
+    assert_eq!(received.unwrap_err(), BulkloadRefusal::TransportLost);
+}
+
+/// S4 (TIN-6592): a refusal this side raises keeps a bare `IO`'s errno for
+/// the transfer record, and nothing else gains one.
+#[test]
+fn a_refusal_raised_here_keeps_a_bare_ios_errno() {
+    let mut stats = TransferStats::default();
+    stats.refuse_here(b"a".to_vec(), &BulkloadRefusal::Io(Some(libc::EACCES)));
+    stats.refuse_here(b"b".to_vec(), &BulkloadRefusal::Io(None));
+    stats.refuse_here(b"c".to_vec(), &BulkloadRefusal::DestinationOccupied);
+    stats.keep_errno(b"d", &BulkloadRefusal::Io(Some(libc::EIO)));
+    assert_eq!(
+        stats.refusals,
+        [
+            (b"a".to_vec(), "IO".to_owned()),
+            (b"b".to_vec(), "IO".to_owned()),
+            (b"c".to_vec(), "DESTINATION_OCCUPIED".to_owned()),
+        ]
+    );
+    assert_eq!(
+        stats.refusal_errnos,
+        BTreeMap::from([(b"a".to_vec(), libc::EACCES), (b"d".to_vec(), libc::EIO)])
+    );
+}
+
+/// S4 (TIN-6592): a walked seat removed before its capture opens it is
+/// `SOURCE_VANISHED` (it was a bare `IO`, errno 2, which the wire carries
+/// as `IO` alone). The rest of the session carries, nothing is remembered
+/// for the seat, and the next pass, which no longer walks it, refuses
+/// nothing.
+#[test]
+fn a_seat_removed_before_its_capture_opens_it_is_source_vanished() {
+    struct Unhook(PathBuf);
+    impl Drop for Unhook {
+        fn drop(&mut self) {
+            set_before_open(&self.0, None);
+        }
+    }
+    let corpus = Corpus::new();
+    let source = corpus.base.join("source");
+    std::fs::write(source.join("kept"), b"the kept bytes").unwrap();
+    std::fs::write(source.join("gone"), b"the gone bytes").unwrap();
+    let root = std::fs::canonicalize(&source).unwrap();
+    let hook: OpenHook = {
+        let root = root.clone();
+        Arc::new(move |rel_path: &[u8]| {
+            if rel_path == b"gone" {
+                let _ = std::fs::remove_file(root.join("gone"));
+            }
+        })
+    };
+    set_before_open(&root, Some(hook));
+    let _unhook = Unhook(root);
+
+    let first = corpus.run().unwrap();
+    assert_eq!(
+        first.refusals,
+        [(b"gone".to_vec(), "SOURCE_VANISHED".to_owned())]
+    );
+    assert!(first.refusal_errnos.is_empty());
+    assert_eq!(
+        std::fs::read(corpus.base.join("destination/kept")).unwrap(),
+        b"the kept bytes"
+    );
+    assert!(!corpus.base.join("destination/gone").exists());
+    let second = corpus.run().unwrap();
+    assert!(second.refusals.is_empty(), "{:?}", second.refusals);
+}
+
 #[test]
 fn credit_waiters_wake_on_grant_and_on_close() {
     let credit = Credit::new();

@@ -27,6 +27,12 @@ pub enum BulkloadRefusal {
     SnapshotRootsOverlap,
     /// The source tree changed after the immutable snapshot was taken.
     SourceChangedAfterSnapshot,
+    /// A seat the source walk listed was gone when it was statted, entered
+    /// or opened for its bytes (`ENOENT`): it, or a directory above it, was
+    /// removed after the listing (S4, TIN-6592). Nothing of it is carried,
+    /// and nothing is remembered for it; the next pass walks the source as
+    /// it is then. Was a bare `IO` (errno 2), which no review can close.
+    SourceVanished,
     /// A capture recorded drift under its pass, so it does not hold every
     /// seat's bytes; apply refuses it until a later pass extends it clean.
     CaptureDrifted,
@@ -58,6 +64,13 @@ pub enum BulkloadRefusal {
     /// A closure report found planned items whose durable ledger does not end
     /// as applied, a typed refusal or referenced-only (OI-1001-Q2).
     ClosureUnaccounted,
+    /// A verb ran every item or path it was asked for, and at least one of
+    /// them refused (S4, #231). The run-level exit only: each refusal is
+    /// typed in its own outcome record, transfer record or receipt line,
+    /// and this code is never recorded as an item's or a path's outcome (a
+    /// closure row naming it is unaccounted). Was
+    /// `CONTRACT_SELF_INCONSISTENT`, which names a contract fault.
+    ItemsRefused,
 
     // ---- path handling ----------------------------------------------------
     /// A path that must be absolute is not.
@@ -349,6 +362,15 @@ pub enum BulkloadRefusal {
     /// A worker thread, or the peer of one of its channels, ended before the
     /// work it owned was done (WP3).
     WorkerLost,
+    /// The session's transport did not end clean (S4, TIN-6592): the frame
+    /// stream ended at or inside a frame, a write to it found the peer gone
+    /// (`EPIPE`, `ECONNRESET`), or a `pull`'s transport process exited
+    /// unsuccessfully, even after the session. The peer's own refusal, when
+    /// it had one, is on its stderr and never crossed the wire. Outputs
+    /// already committed stay durable, so a rerun resumes without reading
+    /// them again (R25). A closure row holding it is unaccounted until a
+    /// rerun replaces it; no review closes it. Was a bare `IO`.
+    TransportLost,
 
     // ---- agent session re-seat (R0, TIN-6587) -------------------------------
     /// `estate-reseat`: the destination already holds a file at a session's
@@ -470,6 +492,7 @@ impl BulkloadRefusal {
         match *self {
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
             Self::SourceChangedAfterSnapshot => "SOURCE_CHANGED_AFTER_SNAPSHOT",
+            Self::SourceVanished => "SOURCE_VANISHED",
             Self::CaptureDrifted => "CAPTURE_DRIFTED",
             Self::CaptureAbsent => "CAPTURE_ABSENT",
             Self::DigestMismatch => "DIGEST_MISMATCH",
@@ -480,6 +503,7 @@ impl BulkloadRefusal {
             Self::FieldDomainViolation => "FIELD_DOMAIN_VIOLATION",
             Self::ContractSelfInconsistent => "CONTRACT_SELF_INCONSISTENT",
             Self::ClosureUnaccounted => "CLOSURE_UNACCOUNTED",
+            Self::ItemsRefused => "ITEMS_REFUSED",
             Self::PathNotAbsolute => "PATH_NOT_ABSOLUTE",
             Self::PathNotPortable => "PATH_NOT_PORTABLE",
             Self::PathEscapesRoot => "PATH_ESCAPES_ROOT",
@@ -535,6 +559,7 @@ impl BulkloadRefusal {
             Self::FrameCodec => "FRAME_CODEC",
             Self::ProtocolStateViolation => "PROTOCOL_STATE_VIOLATION",
             Self::WorkerLost => "WORKER_LOST",
+            Self::TransportLost => "TRANSPORT_LOST",
             Self::ReseatDestDiverged => "RESEAT_DEST_DIVERGED",
             Self::ReseatDestContinued => "RESEAT_DEST_CONTINUED",
             Self::ReseatSourceRewritten => "RESEAT_SOURCE_REWRITTEN",
@@ -565,6 +590,7 @@ impl BulkloadRefusal {
     pub const CODES: &'static [&'static str] = &[
         "SNAPSHOT_ROOTS_OVERLAP",
         "SOURCE_CHANGED_AFTER_SNAPSHOT",
+        "SOURCE_VANISHED",
         "CAPTURE_DRIFTED",
         "CAPTURE_ABSENT",
         "DIGEST_MISMATCH",
@@ -575,6 +601,7 @@ impl BulkloadRefusal {
         "FIELD_DOMAIN_VIOLATION",
         "CONTRACT_SELF_INCONSISTENT",
         "CLOSURE_UNACCOUNTED",
+        "ITEMS_REFUSED",
         "PATH_NOT_ABSOLUTE",
         "PATH_NOT_PORTABLE",
         "PATH_ESCAPES_ROOT",
@@ -630,6 +657,7 @@ impl BulkloadRefusal {
         "FRAME_CODEC",
         "PROTOCOL_STATE_VIOLATION",
         "WORKER_LOST",
+        "TRANSPORT_LOST",
         "RESEAT_DEST_DIVERGED",
         "RESEAT_DEST_CONTINUED",
         "RESEAT_SOURCE_REWRITTEN",
@@ -824,6 +852,7 @@ mod tests {
         let all = [
             BulkloadRefusal::SnapshotRootsOverlap,
             BulkloadRefusal::SourceChangedAfterSnapshot,
+            BulkloadRefusal::SourceVanished,
             BulkloadRefusal::CaptureDrifted,
             BulkloadRefusal::CaptureAbsent,
             BulkloadRefusal::DigestMismatch,
@@ -834,6 +863,7 @@ mod tests {
             BulkloadRefusal::FieldDomainViolation,
             BulkloadRefusal::ContractSelfInconsistent,
             BulkloadRefusal::ClosureUnaccounted,
+            BulkloadRefusal::ItemsRefused,
             BulkloadRefusal::PathNotAbsolute,
             BulkloadRefusal::PathNotPortable,
             BulkloadRefusal::PathEscapesRoot,
@@ -889,6 +919,7 @@ mod tests {
             BulkloadRefusal::FrameCodec,
             BulkloadRefusal::ProtocolStateViolation,
             BulkloadRefusal::WorkerLost,
+            BulkloadRefusal::TransportLost,
             BulkloadRefusal::ReseatDestDiverged,
             BulkloadRefusal::ReseatDestContinued,
             BulkloadRefusal::ReseatSourceRewritten,

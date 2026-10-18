@@ -2405,8 +2405,9 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer:
     };
     let exit_status = child.wait().refuse_at("main::pull_command")?;
     let stats = result?;
+    // S4 (TIN-6592): the session ended but its transport did not end clean.
     if !exit_status.success() {
-        return Err(BulkloadRefusal::Io(None));
+        return Err(BulkloadRefusal::TransportLost);
     }
     Ok(stats)
 }
@@ -2491,7 +2492,12 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         stats.sqlite_sidecars_covered.len()
     );
     for (path, code) in &stats.refusals {
-        eprintln!("refused {}: {code}", path.escape_ascii());
+        // S4 (TIN-6592): an IO raised here prints its errno, as its record
+        // keeps it.
+        match stats.refusal_errnos.get(path) {
+            Some(errno) => eprintln!("refused {}: {code} (errno {errno})", path.escape_ascii()),
+            None => eprintln!("refused {}: {code}", path.escape_ascii()),
+        }
         if let Some(disposition) = stats.default_disposition(path, code) {
             eprintln!(
                 "default-disposition {}: {disposition} ({code}, OI-1003-Q148)",
@@ -2533,10 +2539,11 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
             path.escape_ascii()
         );
     }
+    // S4 (#231): every path ran; the refused ones are in the record.
     if stats.refusals.is_empty() {
         Ok(())
     } else {
-        Err(BulkloadRefusal::ContractSelfInconsistent)
+        Err(BulkloadRefusal::ItemsRefused)
     }
 }
 

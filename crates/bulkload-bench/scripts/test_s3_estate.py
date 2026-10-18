@@ -40,7 +40,7 @@ COPY_OUT = (
 COPY_ERR = (
     "refused state.sqlite: SQLITE_STATE_CHANGED\n"
     "refused sessions/a b\\xc3\\xa9.jsonl: GIT_DESTINATION_OCCUPIED\n"
-    "bulkload-agent: refused: CONTRACT_SELF_INCONSISTENT\n"
+    "bulkload-agent: refused: ITEMS_REFUSED\n"
 )
 CAPTURE_OUT = (
     'item=0 source="/w/git/r00 x" outcome=captured reason=None source_bytes_read=10\n'
@@ -73,7 +73,7 @@ class ParseTests(unittest.TestCase):
                 ("sessions/a bé.jsonl", "GIT_DESTINATION_OCCUPIED"),
             ],
         )
-        self.assertEqual(s3.final_refusal(COPY_ERR), "CONTRACT_SELF_INCONSISTENT")
+        self.assertEqual(s3.final_refusal(COPY_ERR), "ITEMS_REFUSED")
 
     def test_unescape_ascii_invalid_utf8(self) -> None:
         self.assertEqual(s3.unescape_ascii("a\\xff\\t\\\\"), b"a\xff\t\\")
