@@ -301,7 +301,7 @@ SUBCOMMANDS:
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
-                  [--no-respell] [--no-regularize] [--undo]
+                  [--no-respell] [--no-regularize] [--rebind-landing OLD=NEW]... [--undo]
                   [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
                 R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
                 .claude and .codex, the run's copy of SOURCE_HOME's) into
@@ -335,7 +335,18 @@ SUBCOMMANDS:
                 copies of their targets with the targets' mtime, the targets
                 kept, ledgered (OI-1003-Q198 (2); --no-regularize); a target
                 written during it is RESEAT_REGULARIZE_RACED with both copies
-                kept (the line's kept field names a copy kept aside). --undo
+                kept (the line's kept field names a copy kept aside).
+                --rebind-landing OLD=NEW (repeatable; A-106 follow-up): a
+                placement row naming a landed file under OLD (as the rows
+                spell it; OLD may be gone) is re-bound to the same file under
+                NEW (must exist) instead of a collision, only when the row is
+                this STATE's own (placed, adopted or continued), the
+                destination is the single-link regular file it last wrote,
+                and the bytes it placed are proved NEW's file's first bytes
+                (BLAKE3 against the row's digest, or the destination's own
+                read by descriptor): exactly them, rebound (nothing written);
+                longer, re-bound then extended as usual; never inferred from
+                size. --undo puts each rebind back (ledger only). --undo
                 puts back every symlink and old cwd this STATE changed, where
                 the destination still holds exactly what re-seat wrote and
                 the archive target holds the recorded bytes (else
@@ -1633,6 +1644,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let (mut claude, mut codex) = (true, true);
     let (mut undo, mut respell, mut regularize, mut default_by_id) = (false, true, true, true);
     let mut by_id = Vec::new();
+    let mut rebind = Vec::new();
     let mut at = 0;
     let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
     while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
@@ -1649,6 +1661,23 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             "--no-default-by-id" => default_by_id = false,
             "--unmapped=report" => unmapped = Unmapped::Report,
             "--unmapped=by-id" => unmapped = Unmapped::ById,
+            "--rebind-landing" => {
+                let (from, to) = value(at + 1)?
+                    .to_str()
+                    .ok_or(BulkloadRefusal::PathNotPortable)?
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                let (from, to) = (Path::new(from), Path::new(to));
+                if !from.is_absolute() || !to.is_absolute() {
+                    return Err(BulkloadRefusal::PathNotAbsolute);
+                }
+                // The new root must exist (judged by its real path); the
+                // old one may be gone and is taken as the rows recorded it.
+                let to =
+                    std::fs::canonicalize(to).refuse_at("main::reseat_command::rebind_landing")?;
+                rebind.push((from.to_path_buf(), to));
+                step = 2;
+            }
             "--map" => {
                 let (from, to) = value(at + 1)?
                     .to_str()
@@ -1773,6 +1802,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
         }
     }
     options.maps = maps;
+    options.rebind = rebind;
     options.unmapped = unmapped;
     options.claude = claude;
     options.codex = codex;

@@ -105,6 +105,11 @@ CREATE TABLE IF NOT EXISTS regularized(
     state TEXT NOT NULL, pass INTEGER NOT NULL,
     digest BLOB
 );
+CREATE TABLE IF NOT EXISTS rebind(
+    dest BLOB PRIMARY KEY, old_landing BLOB NOT NULL, new_landing BLOB NOT NULL,
+    o_dev INTEGER NOT NULL, o_ino INTEGER NOT NULL, o_size INTEGER NOT NULL, o_mtime INTEGER NOT NULL,
+    state TEXT NOT NULL, pass INTEGER NOT NULL
+);
 ";
 /// A file's identity: what a pass compares instead of reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -235,6 +240,21 @@ pub struct Session {
     /// when its landed file changed.
     pub landed_size: Option<u64>,
     pub landed_mtime: Option<i64>,
+}
+
+/// One placement re-bound from a landed file under an old landing root
+/// to the same file under a new one (`--rebind-landing`, A-106
+/// follow-up): the bytes it placed proved the new landing's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebind {
+    pub dest: PathBuf,
+    pub old_landing: PathBuf,
+    pub new_landing: PathBuf,
+    /// The placement row's landed identity before the rebind (for an
+    /// `unproved` row, the new landed file's identity when it was refused).
+    pub old_landed: Identity,
+    /// `done`, `undone`, `undo-kept` or `unproved`.
+    pub state: String,
 }
 
 /// One re-spelled destination Codex row (OI-1003-Q198 (1)).
@@ -553,6 +573,203 @@ impl Ledger {
             digest: digest(stored_digest),
             intent,
         }))
+    }
+
+    /// Every destination path with a placement row.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn placement_dests(&self) -> Result<Vec<PathBuf>> {
+        let mut statement = sql(self
+            .conn
+            .prepare("SELECT dest FROM placement ORDER BY dest"))?;
+        let rows = sql(statement.query_map([], |row| row.get::<_, Vec<u8>>(0)))?;
+        Ok(sql(rows.collect::<rusqlite::Result<Vec<_>>>())?
+            .into_iter()
+            .map(path_of)
+            .collect())
+    }
+
+    fn has_rebind_table(&self) -> Result<bool> {
+        sql(self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'rebind'",
+            [],
+            |row| row.get::<_, i64>(0),
+        ))
+        .map(|count| count > 0)
+    }
+
+    /// The rebind row of `dest`.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn rebind(&self, dest: &Path) -> Result<Option<Rebind>> {
+        Ok(self.rebinds()?.into_iter().find(|row| row.dest == dest))
+    }
+
+    /// Every rebind row.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn rebinds(&self) -> Result<Vec<Rebind>> {
+        if !self.has_rebind_table()? {
+            return Ok(Vec::new());
+        }
+        let mut statement = sql(self.conn.prepare(
+            "SELECT dest, old_landing, new_landing, o_dev, o_ino, o_size, o_mtime, state
+             FROM rebind ORDER BY dest",
+        ))?;
+        let rows = sql(statement.query_map([], |row| {
+            Ok(Rebind {
+                dest: path_of(row.get(0)?),
+                old_landing: path_of(row.get(1)?),
+                new_landing: path_of(row.get(2)?),
+                old_landed: Identity {
+                    dev: uint(row.get(3)?),
+                    ino: uint(row.get(4)?),
+                    size: uint(row.get(5)?),
+                    mtime: row.get(6)?,
+                },
+                state: row.get(7)?,
+            })
+        }))?;
+        sql(rows.collect::<rusqlite::Result<Vec<_>>>())
+    }
+
+    /// Re-bind the placement row of `rebind.dest` from its old landed file
+    /// to `rebind.new_landing` (its landed identity set to `landed`), with
+    /// the rebind row, in one commit; only while the row still names the
+    /// old landed file. Returns whether it did.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit; the refusal of a
+    /// read-only ledger.
+    pub fn put_rebind(&self, rebind: &Rebind, landed: Identity) -> Result<bool> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = (|| -> rusqlite::Result<bool> {
+            let changed = self.conn.execute(
+                "UPDATE placement SET landing = ?2, l_dev = ?3, l_ino = ?4, l_size = ?5,
+                    l_mtime = ?6, pass = ?7
+                 WHERE dest = ?1 AND landing = ?8",
+                params![
+                    blob(&rebind.dest),
+                    blob(&rebind.new_landing),
+                    int(landed.dev),
+                    int(landed.ino),
+                    int(landed.size),
+                    landed.mtime,
+                    self.pass,
+                    blob(&rebind.old_landing),
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
+            self.conn.execute(
+                "INSERT OR REPLACE INTO rebind(dest, old_landing, new_landing,
+                    o_dev, o_ino, o_size, o_mtime, state, pass)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    blob(&rebind.dest),
+                    blob(&rebind.old_landing),
+                    blob(&rebind.new_landing),
+                    int(rebind.old_landed.dev),
+                    int(rebind.old_landed.ino),
+                    int(rebind.old_landed.size),
+                    rebind.old_landed.mtime,
+                    rebind.state,
+                    self.pass,
+                ],
+            )?;
+            Ok(true)
+        })();
+        if let Ok(done) = outcome {
+            sql(self
+                .conn
+                .execute_batch(if done { "COMMIT" } else { "ROLLBACK" }))?;
+            Ok(done)
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            Err(BulkloadRefusal::SqliteStateChanged)
+        }
+    }
+
+    /// Remember a rebind the byte proof refused (`unproved`): the new
+    /// landed file's identity in place of the old landed one, so a pass
+    /// does not read it again while it is unchanged (S3).
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn put_rebind_unproved(&self, rebind: &Rebind) -> Result<()> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute(
+            "INSERT OR REPLACE INTO rebind(dest, old_landing, new_landing,
+                o_dev, o_ino, o_size, o_mtime, state, pass)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unproved', ?8)",
+            params![
+                blob(&rebind.dest),
+                blob(&rebind.old_landing),
+                blob(&rebind.new_landing),
+                int(rebind.old_landed.dev),
+                int(rebind.old_landed.ino),
+                int(rebind.old_landed.size),
+                rebind.old_landed.mtime,
+                self.pass,
+            ],
+        ))
+        .map(drop)
+    }
+
+    /// Put a rebind back (`--undo`, ledger only): the placement row names
+    /// the old landed file again, with its old landed identity, while it
+    /// still names the new one; the rebind row `undone` either way
+    /// (`kept` when the row moved on). Returns whether the row was put
+    /// back.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn undo_rebind(&self, rebind: &Rebind) -> Result<bool> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = (|| -> rusqlite::Result<bool> {
+            let changed = self.conn.execute(
+                "UPDATE placement SET landing = ?2, l_dev = ?3, l_ino = ?4, l_size = ?5,
+                    l_mtime = ?6
+                 WHERE dest = ?1 AND landing = ?7",
+                params![
+                    blob(&rebind.dest),
+                    blob(&rebind.old_landing),
+                    int(rebind.old_landed.dev),
+                    int(rebind.old_landed.ino),
+                    int(rebind.old_landed.size),
+                    rebind.old_landed.mtime,
+                    blob(&rebind.new_landing),
+                ],
+            )?;
+            self.conn.execute(
+                "UPDATE rebind SET state = ?2, pass = ?3 WHERE dest = ?1",
+                params![
+                    blob(&rebind.dest),
+                    if changed == 1 { "undone" } else { "undo-kept" },
+                    self.pass
+                ],
+            )?;
+            Ok(changed == 1)
+        })();
+        if let Ok(done) = outcome {
+            sql(self.conn.execute_batch("COMMIT"))?;
+            Ok(done)
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            Err(BulkloadRefusal::SqliteStateChanged)
+        }
     }
 
     /// Write `row` (insert or replace), committed before this returns.

@@ -1609,7 +1609,11 @@ session re-seat", and the receipt
   a symlink gets that column re-spelled, and a symlinked transcript is
   replaced by a regular copy of its target (the archive kept); both are
   ledgered with their old values and reversed by `--undo` wherever the
-  destination still holds exactly what re-seat wrote.
+  destination still holds exactly what re-seat wrote. A second landing of
+  the same home under a new root re-binds this STATE's rows to it with
+  `--rebind-landing OLD=NEW` (A-106 follow-up) only where the placed bytes
+  are proved the new landed file's (BLAKE3); nothing at the destination
+  changes, and `--undo` puts the binding back.
 - **R0 acceptance** also fails a longer landed form of a rollout that was
   never placed (`extra-form-unplaced`), and names a row carrying the
   source's `cwd` (`row-cwd-is-source`). Rollouts with no snapshot row get a

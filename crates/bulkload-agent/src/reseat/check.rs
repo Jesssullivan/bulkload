@@ -119,6 +119,13 @@ pub struct CheckSummary {
     /// through the home's `git` or a `--map` symlink): reported, never
     /// judged (operator M2 round 2, 2026-10-17).
     pub respell_pending: u64,
+    /// `--rebind-landing` (A-106 follow-up): placement rows re-bound
+    /// (`done`), and rows a pass would try to re-bind: this STATE's own,
+    /// naming a landed file under an old root whose new-root file exists,
+    /// their destination still the single-link file they last wrote (the
+    /// byte proof is the pass's).
+    pub rebound: u64,
+    pub rebind_pending: u64,
 }
 
 impl CheckSummary {
@@ -348,6 +355,9 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         // Whenever the destination index exists, landed threads or not.
         summary.respell_pending = codex::respell_pending(options, ledger.as_ref())?;
     }
+    if let Some(ledger) = ledger.as_ref() {
+        (summary.rebound, summary.rebind_pending) = rebind_counts(options, ledger)?;
+    }
     for (tool, state) in [
         (
             claude::TOOL,
@@ -388,7 +398,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     summary.lanes = table;
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"r0\":\"{}\"}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"rebound\":{},\"rebind_pending\":{},\"r0\":\"{}\"}}",
         summary.checked,
         summary.lanes.len(),
         summary.count("pass"),
@@ -401,9 +411,56 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         summary.unlaned.iter().filter(|item| item.waived).count(),
         if summary.retention_ok { "ok" } else { "unsafe" },
         summary.respell_pending,
+        summary.rebound,
+        summary.rebind_pending,
         if summary.verdict().is_ok() { "pass" } else { "fail" },
     ))?;
     Ok(summary)
+}
+
+/// `(rebound, rebind_pending)`: see [`CheckSummary::rebound`].
+fn rebind_counts(options: &Options, ledger: &Ledger) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let rebinds = ledger.rebinds()?;
+    let rebound = rebinds.iter().filter(|row| row.state == "done").count() as u64;
+    if options.rebind.is_empty() {
+        return Ok((rebound, 0));
+    }
+    let mut pending = 0;
+    for dest in ledger.placement_dests()? {
+        let Some(row) = ledger.placement(&dest)? else {
+            continue;
+        };
+        if row.intent.is_some()
+            || !matches!(
+                row.state,
+                super::ledger::State::Ours
+                    | super::ledger::State::Adopted
+                    | super::ledger::State::Continued
+            )
+            || rebinds.iter().any(|done| done.dest == dest)
+        {
+            continue;
+        }
+        let mapped = options.rebind.iter().find_map(|(old, new)| {
+            row.landing
+                .strip_prefix(old)
+                .ok()
+                .map(|rest| new.join(rest))
+        });
+        let Some(mapped) = mapped else {
+            continue;
+        };
+        let held = std::fs::symlink_metadata(&dest).is_ok_and(|meta| {
+            meta.is_file()
+                && meta.nlink() == 1
+                && super::ledger::Identity::of(&meta) == row.placed_identity
+        });
+        if held && std::fs::symlink_metadata(&mapped).is_ok() {
+            pending += 1;
+        }
+    }
+    Ok((rebound, pending))
 }
 
 /// A session or thread with no lane.

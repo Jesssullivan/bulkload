@@ -367,6 +367,9 @@ counters! {
     ReseatDestRead => "read_reseat_dest_bytes",
     // Bytes written into the destination's live agent state.
     ReseatDestWrite => "write_reseat_dest_bytes",
+    // Placements re-bound from a landed file under an old landing root to
+    // the same bytes under a new one (`--rebind-landing`, A-106 follow-up).
+    ReseatRebound => "reseat_rebound",
     // Bounded starvation (M2 item 3): a process at background priority
     // whose counters did not move for `--escalate-after` seconds moved its
     // IO back to the normal class once (`priority::escalate`): how many

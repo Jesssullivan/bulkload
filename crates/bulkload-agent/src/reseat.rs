@@ -218,6 +218,10 @@ pub struct Options {
     /// The free-space floor, percent of each destination file system
     /// (`--min-free-percent`; the engine's rule).
     pub min_free_percent: u8,
+    /// `--rebind-landing OLD=NEW` (A-106 follow-up): placement rows naming
+    /// a landed file under OLD are re-bound to the same file under NEW
+    /// when the placed bytes are proved NEW's (never inferred from size).
+    pub rebind: Vec<(PathBuf, PathBuf)>,
 }
 
 /// The default `--retention-margin-days`.
@@ -265,6 +269,7 @@ impl Options {
             respell_cwd: true,
             regularize: true,
             min_free_percent: crate::space::min_free_percent(),
+            rebind: Vec::new(),
         }
     }
 
@@ -667,6 +672,9 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
 /// Reverse what this STATE's ledger changed in the destination's own
 /// state under the 2026-10-16 rulings (OI-1003-Q198).
 ///
+/// Its `--rebind-landing` rebinds are put back too (ledger only: each
+/// placement row names its old landed file again).
+///
 /// It puts each regularized
 /// transcript's symlink back and each re-spelled Codex row's old `cwd`,
 /// only where the destination still holds exactly what re-seat wrote; one
@@ -683,8 +691,23 @@ pub fn undo(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Resu
     let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "undo")?;
     let links = regularize::undo(&ledger, emit)?;
     let rows = codex::undo(&mut ledger, emit)?;
+    let mut rebinds = 0_u64;
+    for rebind in ledger.rebinds()? {
+        if rebind.state != "done" {
+            continue;
+        }
+        // Ledger only: the placement row names the old landed file again.
+        let back = ledger.undo_rebind(&rebind)?;
+        rebinds += u64::from(back);
+        emit(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo\",\"tool\":\"rebind\",\"dest\":{},\"restored\":{},\"outcome\":\"{}\"}}",
+            shown(&rebind.dest),
+            shown(&rebind.old_landing),
+            if back { "undone" } else { "undo-kept" },
+        ))?;
+    }
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows}}}"
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows},\"rebinds\":{rebinds}}}"
     ))?;
     drop(held);
     Ok((links, rows))

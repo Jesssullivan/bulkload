@@ -2669,7 +2669,7 @@ bulkload-agent estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
     [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
     [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
     [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
-    [--no-respell] [--no-regularize] [--undo]
+    [--no-respell] [--no-regularize] [--rebind-landing OLD=NEW]... [--undo]
     [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
 ```
 
@@ -2950,6 +2950,43 @@ landing, its placed bytes proven and its tail appended (the landing is the
 destination's own copy; the source is never read, R25). A live lane is
 caught up by repeated passes; the pass after its session stops on the
 source leaves it equal to the landing.
+
+**A new landing root** (`--rebind-landing OLD=NEW`, repeatable; A-106
+follow-up, 2026-10-18). A second landing of the same home under a new
+root (home2, then home3) collides with every placement the first one made
+(`RESEAT_LANE_COLLISION`: the row names another landed file), even where
+the bytes are the same. With the flag, a placement row naming a landed
+file under OLD (as the rows spell it; OLD may be gone) whose path under
+NEW (canonicalized; it must exist) is the file this pass places, the same
+stream or the same real path, is re-bound instead of a collision when all
+of these hold:
+
+- the row is this STATE's own (`ours`, `adopted` or `continued`, no
+  intent) and no `--undo` put a rebind of it back;
+- the destination is a regular file with one link whose identity is the
+  one the row last wrote;
+- the bytes it placed are proved the new landed file's: its first
+  `placed` content bytes (decompressed for a `.zst`) hash (BLAKE3) to the
+  row's digest, or, with none recorded, to the destination's own first
+  bytes read by descriptor with its identity checked before and after.
+
+The new landed file exactly those bytes: `rebound` (a file and session
+word; nothing written; the row's landed identity set to the new file's).
+Longer: re-bound with the old landed identity kept, so the same pass
+proves the placed bytes and appends the rest as for any grown landing
+(`extended`). Anything else stays a collision, and a refused proof is
+remembered (`unproved`, with the new file's identity) so it is not read
+again while that file is unchanged. Never inferred from names or sizes.
+The placement row and a `rebind` row are written in one commit, and only
+while the row still names the old landed file; nothing at the
+destination changes, so no fault point is needed. Counter
+`reseat_rebound`. `--undo` puts each rebind back (ledger only: the row
+names the old landed file and identity again; `undo-kept` when the row
+moved on since), and a pass does not re-bind it again by itself.
+`--check` reports `rebound` (rebinds done) and `rebind_pending` (this
+STATE's rows under an old root whose new-root file exists and whose
+destination is still the file they last wrote; the byte proof is the
+pass's).
 
 **Undo** (`--undo`, OI-1003-Q198). It reverses what this STATE's ledger
 changed in the destination's own state under the rulings: each regularized
