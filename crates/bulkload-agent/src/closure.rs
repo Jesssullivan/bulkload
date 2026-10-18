@@ -17,6 +17,16 @@
 //!   ([`crate::disposition`]): accept, re-carry or abandon. An item row
 //!   disposes only the refusal instance it was made against ([`instance`]);
 //!   a standing policy disposes every refusal with its code.
+//! - `applied-beside` (closure v5, M2 round 2 item c): the item plans a
+//!   workspace, its outcome is `WorkspaceBeside` (or a re-apply's
+//!   `PreviousWorkspaceBesideNotRevalidated`), and the exact journal for its
+//!   current capture says `workspace-beside`: the existing planned checkout
+//!   differed (its adopt proof refused `GIT_DESTINATION_DIVERGED`) and was
+//!   left as it was, and `estate-apply --adopt --beside SUFFIX` landed the
+//!   captured checkout beside it (`<workspace>SUFFIX`) with every captured
+//!   ref created under `refs/<ns>/` (a ref kept at another value refuses
+//!   the item instead). Closed: every captured byte and ref is at the
+//!   destination, beside the live tree.
 //! - `referenced-only`: the item plans no workspace, its outcome is
 //!   `RefsImported` (or `PreviousRefCustodyNotWorkspaceParity`, or
 //!   `IndexRepaired` from `git-repair-missing-index` with a state directory,
@@ -77,10 +87,11 @@
 //!   `applied`. A carried outcome without that proof is unaccounted
 //!   (`carried-record-missing`, `carried-transfer-changed`, ...).
 //!
-//! The report is `bulkload.closure.v5` (M2r2 b). v5 adds the disposition
-//! `carried`, its total `carried` after `covered`, and on a carried row the
-//! `carried` block (via, destination, beside, transfer state, gits). Nothing
-//! else changes from v4.
+//! The report is `bulkload.closure.v5` (M2r2 b and c). v5 adds the
+//! dispositions `applied-beside` and `carried`, their totals
+//! `applied_beside` (after `applied`) and `carried` (after `covered`), and
+//! on a carried row the `carried` block (via, destination, beside, transfer
+//! state, gits). Nothing else changes from v4.
 //!
 //! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
@@ -119,6 +130,9 @@ use crate::{BulkloadRefusal, Result};
 pub enum Disposition {
     /// Workspace restored, journal present.
     Applied,
+    /// The captured checkout landed beside a differing planned one, journal
+    /// present (closure v5).
+    AppliedBeside,
     /// A typed refusal with this code that an operator review disposes (S4).
     Refused(String),
     /// A typed refusal with this code that no review disposes yet (S4).
@@ -142,6 +156,7 @@ impl Disposition {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::Applied => "applied",
+            Self::AppliedBeside => "applied-beside",
             Self::Refused(_) => "refused",
             Self::RefusedPendingReview(_) => "refused-pending-review",
             Self::ReferencedOnly => "referenced-only",
@@ -225,6 +240,16 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
     };
     match &record.outcome {
         Outcome::Refused(refusal) => refusal_disposition(refusal),
+        Outcome::WorkspaceBeside | Outcome::PreviousWorkspaceBesideNotRevalidated => {
+            // Review of #266, B4: the beside landing's STATE record must name
+            // the item and its current capture, with no ref pending or kept.
+            match (&entry.beside, entry.has_workspace) {
+                (_, false) => Disposition::Unaccounted("outcome-workspace-mismatch"),
+                (None, true) => Disposition::Unaccounted("beside-record-missing"),
+                (Some(Err(why)), true) => Disposition::Unaccounted(why),
+                (Some(Ok(())), true) => journal("workspace-beside", Disposition::AppliedBeside),
+            }
+        }
         Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
             if entry.has_workspace {
                 journal("workspace-restored", Disposition::Applied)
@@ -394,6 +419,8 @@ pub struct Row {
 pub struct Report {
     pub rows: Vec<Row>,
     pub applied: u64,
+    /// Landed beside a differing planned checkout (closure v5).
+    pub applied_beside: u64,
     /// Typed refusals a review disposes.
     pub refused: u64,
     /// Typed refusals no review disposes yet.
@@ -554,6 +581,7 @@ impl Report {
         let mut decisions = std::collections::BTreeMap::<&'static str, u64>::new();
         (
             self.applied,
+            self.applied_beside,
             self.refused,
             self.refused_pending_review,
             self.referenced_only,
@@ -561,7 +589,7 @@ impl Report {
             self.carried,
             self.unaccounted,
             self.ruled_default,
-        ) = (0, 0, 0, 0, 0, 0, 0, 0);
+        ) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
         self.refusals.clear();
         for row in &mut self.rows {
             if let Some(code) = row.disposition.refusal().map(str::to_owned) {
@@ -585,6 +613,7 @@ impl Report {
             }
             match &row.disposition {
                 Disposition::Applied => self.applied += 1,
+                Disposition::AppliedBeside => self.applied_beside += 1,
                 Disposition::Refused(_) => self.refused += 1,
                 Disposition::RefusedPendingReview(_) => self.refused_pending_review += 1,
                 Disposition::ReferencedOnly => self.referenced_only += 1,
@@ -887,12 +916,13 @@ impl Report {
         let mut out = String::new();
         let _ = write!(
             out,
-            "{{\"schema\":\"{SCHEMA}\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"transfer_rows\":{},\"applied\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"covered\":{},\"carried\":{},\"unaccounted\":{},\"pending_review\":{},\"ruled_default\":{}}},\"refusals\":{{",
+            "{{\"schema\":\"{SCHEMA}\",\"verdict\":\"{}\",\"gate\":\"{}\",\"totals\":{{\"planned\":{},\"transfer_rows\":{},\"applied\":{},\"applied_beside\":{},\"refused\":{},\"refused_pending_review\":{},\"referenced_only\":{},\"covered\":{},\"carried\":{},\"unaccounted\":{},\"pending_review\":{},\"ruled_default\":{}}},\"refusals\":{{",
             if self.native_passes() { "pass" } else { "fail" },
             if self.passes() { "pass" } else { "fail" },
             self.planned(),
             self.transfer_rows(),
             self.applied,
+            self.applied_beside,
             self.refused,
             self.refused_pending_review,
             self.referenced_only,
@@ -2076,6 +2106,49 @@ mod tests {
         JournalState::Present(body.to_owned())
     }
 
+    /// M2r2 c (review of #266, B4): a beside outcome closes
+    /// `applied-beside` only with its exact journal and a `.beside` record
+    /// that proves the landing; otherwise it is unaccounted, by reason.
+    #[test]
+    fn a_beside_outcome_needs_its_journal_and_record() {
+        let with = |beside: Option<std::result::Result<(), &'static str>>, journal| LedgerEntry {
+            beside,
+            ..entry('b', true, Some(("workspace-beside", None)), journal)
+        };
+        assert_eq!(
+            classify(&with(Some(Ok(())), present("workspace-beside"))),
+            Disposition::AppliedBeside
+        );
+        assert_eq!(
+            classify(&with(None, present("workspace-beside"))),
+            Disposition::Unaccounted("beside-record-missing")
+        );
+        assert_eq!(
+            classify(&with(
+                Some(Err("beside-record-mismatch")),
+                present("workspace-beside")
+            )),
+            Disposition::Unaccounted("beside-record-mismatch")
+        );
+        assert_eq!(
+            classify(&with(Some(Ok(())), present("workspace-restored"))),
+            Disposition::Unaccounted("journal-outcome-mismatch")
+        );
+        let refs_only = LedgerEntry {
+            beside: Some(Ok(())),
+            ..entry(
+                'r',
+                false,
+                Some(("workspace-beside", None)),
+                present("workspace-beside"),
+            )
+        };
+        assert_eq!(
+            classify(&refs_only),
+            Disposition::Unaccounted("outcome-workspace-mismatch")
+        );
+    }
+
     fn entry(
         item: char,
         has_workspace: bool,
@@ -2101,6 +2174,7 @@ mod tests {
             unknown_because: None,
             omitted: None,
             carried: None,
+            beside: None,
         }
     }
 
@@ -2393,7 +2467,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
+            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":4,\"transfer_rows\":0,\"applied\":1,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":1,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":1,\"pending_review\":1,\"ruled_default\":0},\"refusals\":{\"CAPTURE_DRIFTED\":1}"
         ), "{json}");
         // A typed refusal row names its code, recording site and errno.
         assert!(json.contains(
@@ -2580,7 +2654,7 @@ mod tests {
         assert_eq!(report.gate(), Err(BulkloadRefusal::ClosureUnaccounted));
         let json = report.to_json();
         assert!(json.starts_with(
-            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
+            "{\"schema\":\"bulkload.closure.v5\",\"verdict\":\"fail\",\"gate\":\"fail\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":4,\"pending_review\":1,\"ruled_default\":0}"
         ), "{json}");
         // The attested refusal of c is a typed refusal: it needs a review.
         assert!(json.contains(
@@ -2645,7 +2719,7 @@ mod tests {
         assert_eq!(report.gate(), Ok(()));
         let json = report.to_json();
         assert!(
-            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":4,\"pending_review\":0,\"ruled_default\":0}"),
+            json.contains("\"verdict\":\"fail\",\"gate\":\"pass\",\"totals\":{\"planned\":5,\"transfer_rows\":0,\"applied\":0,\"applied_beside\":0,\"refused\":0,\"refused_pending_review\":0,\"referenced_only\":1,\"covered\":0,\"carried\":0,\"unaccounted\":4,\"pending_review\":0,\"ruled_default\":0}"),
             "{json}"
         );
         assert!(json.contains(
@@ -3772,6 +3846,7 @@ mod tests {
                     unknown_because: None,
                     omitted: None,
                     carried: None,
+                    beside: None,
                 });
                 let Kind::Typed(code, how) = kind else {
                     continue;

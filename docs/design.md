@@ -248,13 +248,29 @@ own transfer and records the result in the estate ledger.
   - Carrying a workspace item again also re-records the refs-only items
     riding on it.
 - **Binaries.** Only binaries with this change know `carried-as-files`
-  (outcome variant 11). An older binary reads such a record as unreadable,
+  (outcome variant 11; M2r2 c's `workspace-beside` and
+  `previous-workspace-beside-not-revalidated` are 12 and 13). An older binary reads such a record as unreadable,
   and an older `estate-apply` records `CAPTURE_ABSENT` over it. Run the
   carry and every later apply with the merged binary.
-- **What changed for a v4 reader.** `bulkload.closure.v5`:
+- **What changed for a v4 reader.** `bulkload.closure.v5` (M2r2 b and c,
+  one schema):
   - the disposition `carried`, counted in the new `totals.carried` after
     `covered` (accounted; it is in neither `applied` nor
     `pending_review`);
+  - the disposition `applied-beside` (M2r2 c: an existing planned checkout
+    the adopt proof refused `GIT_DESTINATION_DIVERGED`, landed beside by
+    `estate-apply --adopt --beside SUFFIX` with every captured ref in; see
+    the `--beside` paragraph), counted in the new `totals.applied_beside`
+    right after `applied` (accounted; in neither `applied` nor
+    `pending_review`); its outcome is `workspace-beside` (or a rerun's
+    `previous-workspace-beside-not-revalidated`), and it is unaccounted
+    `beside-record-missing` or `beside-record-mismatch` unless its
+    `{item}-{blake3(SOURCE)}.beside` record names the item, the current
+    capture and no pending or kept ref;
+  - the totals, in order: `planned`, `transfer_rows`, `applied`,
+    `applied_beside`, `refused`, `refused_pending_review`,
+    `referenced_only`, `covered`, `carried`, `unaccounted`,
+    `pending_review`, `ruled_default`;
   - a `carried` block on such a row: `via`, `destination`, `beside`,
     `transfer_state` and `gits`;
   - the new unaccounted reasons above.
@@ -339,9 +355,10 @@ Not joined: `snapshot` and the offline compose verbs, which belong to no
 run; a source's tagged engine temporaries a walk skipped are listed by the
 transfer, not rows.
 
-The report schema is `bulkload.closure.v5` from M2r2 b (2026-10-17; what
-changed for a v4 reader is in the carried-as-files paragraph above). v4 came
-from #226 (OI-1003-Q171/Q172, 2026-10-15). What changed for a v3 reader: one top-level block after
+The report schema is `bulkload.closure.v5` from M2r2 b and c (2026-10-17;
+what changed for a v4 reader, both dispositions, is in the carried-as-files
+section above). v4 came from #226 (OI-1003-Q171/Q172, 2026-10-15). What
+changed for a v3 reader: one top-level block after
 `unmatched_journals`, `omissions`: the rebuildable roots the planned items'
 current captures omitted (`node_modules`, `.direnv`, `__pycache__`,
 `.terraform` and the rest of `REBUILDABLE_DIRECTORIES`), from each
@@ -1122,6 +1139,70 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   would land the item, the component `exclude-union=<n>` (items of one
   repository each count the lines; the apply appends them once), or
   `exclude-union-refused=<CODE>` where it would not.
+- **`--beside` lands a diverged checkout beside it (M2 round 2 item c,
+  2026-10-17).** The in-place i02 batch ended 10 workspace items
+  `GIT_DESTINATION_DIVERGED`: the live checkout exists and differs from the
+  capture, so `--adopt` cannot prove it. Each was carried by hand as a
+  refs-only item plus a standalone `<path>.neo-20261016`. With
+  `estate-apply --adopt --beside SUFFIX` (the flag requires `--adopt`), a
+  workspace item whose existing checkout the adopt proof refuses
+  `GIT_DESTINATION_DIVERGED` (nothing written) leaves that checkout's
+  working tree, index, HEAD and native refs exactly as they are and lands
+  the capture at the workspace path with `SUFFIX` appended, the meaning
+  `estate-carry-files --beside SUFFIX` gives it. No other refusal leads
+  there: a first landing that refused after writing (an authority change)
+  leaves its partial checkout for review, never a second copy. The ref
+  namespace `ns` is `SUFFIX` without its leading `.`, one plain ref
+  component (letters, digits, `.`, `_`, `-`; no leading `.` or `-`, no
+  `..`, no trailing `.` or `.lock`); labels using the same suffix share it.
+  A ref named `refs/<ns>` or `refs/<ns>-stash` refuses
+  `GIT_DESTINATION_OCCUPIED` before anything lands. An absent beside path
+  gets a first linked landing into the planned repository (its objects and
+  provenance refs imported, its `worktrees/` administration and ledgers
+  written, as any linked landing writes them), detached at the captured
+  head with the branch recorded (`head-detached-beside`): no branch of the
+  live repository is created or moved, and its native refs are never
+  stepped. A beside landing never appends to the shared `info/exclude`
+  (that would change what the live checkout ignores): under
+  `--exclude-union` it lands only when the live exclude already holds
+  every captured line, and otherwise refuses `GIT_IGNORE_POLICY_CONFLICT`.
+  A landing a crash cut short is finished forward, never converged; one
+  that held an older capture is then refused `GIT_DESTINATION_OCCUPIED`.
+  An existing beside path is accepted only as this item's own landing of
+  this capture, or as a standalone checkout no ledger names (the lane's
+  hand-made `<path>.neo-20261016`) that the A11a proof finds equal to the
+  capture: it is adopted in place in its own repository, and the capture
+  is imported into the planned repository for the refs. That proof
+  compares HEAD, the index entries, the exclude and every carried seat's
+  kind, mode and bytes; untracked files the capture does not carry, the
+  checkout's own stash and extra branches and remotes are not compared, and
+  the adoption steps the carried refs in that checkout's repository. Any
+  other beside path refuses `GIT_DESTINATION_OCCUPIED` (never the planned
+  checkout's `GIT_DESTINATION_DIVERGED`). Then every captured ref
+  `refs/<name>` is wanted as `refs/<ns>/<name>` and stash entry `n`
+  (newest first) as `refs/<ns>-stash/<n>`: a name already at the same value
+  is present; one at another value is kept, never moved or deleted; one
+  that would collide with an existing ref as a directory or a file refuses
+  `GIT_DESTINATION_OCCUPIED` before any ref is written. The rest are
+  recorded write-ahead as pending in STATE
+  (`{item}-{blake3(SOURCE)}.beside`: path, suffix, the capture from the
+  beside checkout's own ledger, instance, refs pending, created and kept),
+  created in one compare-and-swap transaction through the converge's ref
+  writer (synced), then recorded as created; a rerun after a crash moves
+  each pending ref it finds at its value to created. The receipt counts
+  `beside-landed` (or `beside-present`), `beside-linked` or
+  `beside-standalone`, `beside-ref-created`, `beside-ref-present` and
+  `beside-ref-kept`. With every wanted ref in, the outcome and journal are
+  `workspace-beside` (a rerun `previous-workspace-beside-not-revalidated`)
+  and closure v5 classifies the item `applied-beside`; a kept ref refuses
+  the item `GIT_DESTINATION_OCCUPIED` after the record, so it stays pending
+  review. A crash after the worktree is added (`estate.converge.linked_added`)
+  or after the refs (`estate.apply.beside_refs`) leaves the live checkout
+  untouched and the item `journal-missing`; the rerun finishes it.
+  `estate-diff --beside SUFFIX` adds `beside=<landing|ignore-policy-conflict|
+  landed|existing|occupied>:<path>` to a `diverged` row. The beside
+  checkout is a worktree of the live repository: `git worktree list` there
+  shows it.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads
@@ -2332,6 +2413,111 @@ was settled: the same before and after it was read, and not stamped within
 the racy window of the read. A changed seat, a changed file, or a file
 system that has gained the exchange makes the record a miss. The record
 is a memo about no durable bytes; losing it costs one more source read.
+
+Grown destination files (M2r2 A-103, 2026-10-18; review round the same
+day). A landing moved by hand orphans its destination store: every file
+there is then one the store does not own. An append-only transcript that
+grew on the source since is a byte prefix of its seat, and was refused
+`DESTINATION_OCCUPIED` (310 of them on 2026-10-17, with
+`files_materialized=0`). Such a file is now extended in place by its tail:
+
+- **Scope.** `BULKLOAD_PREFIX_EXTEND` unset (the default): append-only
+  files only, a path ending `.jsonl` or `.txt`, as `estate-reseat` extends;
+  `all`: any regular file; `0`: none.
+- **Which files.** In scope, an existing regular file at the path with no
+  owning record (no reuse or ownership row), one link (a second name would
+  change with it), this user's, the source's mode, `0 < length < size`,
+  that this user can open for appending (a read-only or immutable file is
+  refused as before, nothing fetched), and settled: its mtime and ctime
+  older than the racy window by the destination's clock, so no live writer
+  is at it (a file written just now is refused as before, not remembered,
+  and tried again once it is quiet). It must hold at least one whole chunk
+  of the manifest: a file whose held bytes all lie in the first chunk is
+  refused too, since judging it would take that chunk over the wire for a
+  seat that may be refused (P21, #187). Any other file is adopted when it
+  is the seat's bytes and refused `DESTINATION_OCCUPIED` otherwise, as
+  before. A `SQLite` snapshot's output is never extended.
+- **The proof.** Every manifest chunk that ends within the file's length is
+  read back from the file and must hash to its digest; the bytes are read
+  once (`read_dest_verify_existing_bytes`), and a failed proof refuses at
+  the plan with no chunk asked of the source and no byte written. The
+  rest, from the first chunk that does not end within the file, is staged
+  in a temporary of its own and filled as any staged file is (chunks held
+  here, then the wire), so only the tail and the chunk it starts in cross.
+  Before anything is appended, the part of that chunk the file already
+  holds is compared with the staged bytes; a difference refuses with
+  nothing written, after that chunk and the tail crossed. A seat streamed
+  whole in place of a manifest (a source that could not keep its chunks)
+  is extended the same way from its staged copy, its whole prefix
+  compared: on that path a prefix inside the first chunk is extended too,
+  the wire having been spent already.
+- **The append.** The file must be the one the plan proved, untouched
+  since: the same `(dev, ino, size, mtime, ctime)` by the descriptor the
+  plan read and by the append descriptor the plan opened (no link
+  followed). An intent row (path, prior length, BLAKE3 of the prior bytes,
+  prior identity) is committed, then the tail is appended through an
+  `O_APPEND` descriptor in 1 MiB pieces, the file's size checked before
+  and after every piece, as `estate-reseat` extends: a byte a live writer
+  appended first is never written over (an `O_APPEND` write lands after
+  it), and the entry is refused `DESTINATION_OCCUPIED` with every writer's
+  bytes kept. The window left is a writer that appends between a size
+  check and the write of one piece: both writers' bytes are kept, the size
+  after the piece is not ours, and the entry is refused. The file is then
+  flushed (`F_FULLFSYNC` on Darwin), its size must be the seat's, and the
+  straddling chunk is re-hashed against its digest as the file now holds
+  it, a second check of the head comparison.
+- **The record.** The extended file is adopted: its capture record (#169)
+  and its row are written as an adoption's, and the group commit seals it
+  (its own sync, or the device seal) and its directory before the commit;
+  that seal is what makes the row safe, and the extension's flush is
+  defence in depth (`tests/power_loss.rs`). The row's chunk hints are the
+  whole file's. In the same transaction a `prefix_extensions` row records
+  the path, the prior length, the BLAKE3 of the prior bytes and the
+  identity after, and the intent is settled. A file is counted
+  (`dest_prefix_extended`) and reported (`prefix-extended PATH from=PRIOR
+  to=SIZE prefix_blake3=HEX`) only once its record committed;
+  `write_dest_prefix_append_bytes` counts the bytes appended, a subset of
+  `write_dest_materialize_bytes`. From then on the file is this store's:
+  an unchanged rerun reuses it, and a later growth supersedes it as any own
+  output.
+- **Remembered refusals.** A failed proof, at the plan or in the head
+  comparison, is remembered `NotPrefix` under the identity the plan found
+  settled, which is honoured: an unchanged rerun reads and sends nothing
+  for it (R25, P21). A refusal remembered `Occupied` before the extension
+  existed is not honoured for a file the extension may try: it is proved
+  once more. A refusal for another reason (the file moved, a writer
+  appended, an I/O error) is not remembered.
+- **Crashes.** `receive.prefix_before_append`, `receive.prefix_after_append`
+  and `receive.prefix_after_flush` (and the group commit's points after
+  them) leave every file a byte prefix of its seat (the old one, a longer
+  one, or all of it) and the staged tail aside for the sweep; the rerun
+  extends or adopts what it finds. A rerun that adopts the whole file with
+  an intent recorded for its path (a crash after the flush) records its
+  `prefix_extensions` row from the intent, once the intent's prior bytes
+  are proven to be the file's first ones. Power loss: the checker holds
+  every committed record to its bytes and the file to a prefix keeping
+  every old byte in every state of the traced run. Not covered by it: a
+  file system that persists a size before the data it covers can leave
+  zeros past the old length; that file is no longer a prefix and is
+  refused `DESTINATION_OCCUPIED`, its old bytes intact, and the refusal is
+  reported `prefix-extension-interrupted PATH prior=N` from the unsettled
+  intent, so the operator knows the length the file was proven to hold
+  (what follows was appended since, by the crashed run or a writer).
+
+Re-keying a moved landing is not built. A destination store keys its rows
+by path relative to the destination root and records each output's
+`(dev, ino, size, mtime, ctime)`; it does not record the root's own path.
+After a true rename within one file system (`mv` on one mount), the files
+keep their inodes and stamps, so the operator passes the old DEST_STATE
+with the new destination, with the same SOURCE_STATE and the same
+destination-relative layout, and every unchanged file is reused as before
+(the moved root directory is decided again). Two live landings must never
+share one store. A copy (`cp`, or `mv` across mounts) makes new inodes: no
+record could prove those files are the ones it describes without reading
+them, so they fall back to adoption by content, which is safe; that is
+what this extension does with a fresh store. The 2026-10-16 move used a
+copy, so reusing the old store would not have helped it: the extension is
+the tool for that case.
 
 The formal model held all of this from 2026-10-07 until R-C843 deleted it on 2026-10-17 (OI-1003-Q102: model
 first, then merge): the intent and its sweep, the ownership row, the

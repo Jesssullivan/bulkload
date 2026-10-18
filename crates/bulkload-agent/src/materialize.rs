@@ -1482,6 +1482,30 @@ impl Destination {
         open_regular(&parent, &leaf)
     }
 
+    /// Open an existing output for appending by relative path, component by
+    /// component, following no link (M2r2 A-103: a verified byte prefix of
+    /// its source is extended in place). The caller proves it is the file
+    /// it read, by identity.
+    ///
+    /// # Errors
+    /// Refuses a missing output, a non-regular node, a file this user may
+    /// not write, or an unsafe ancestor.
+    pub(crate) fn open_output_append(&self, rel_path: &[u8]) -> Result<File> {
+        let (parent, leaf) = self.parent(rel_path)?;
+        let file = File::from(
+            crate::io::sys::open_append_at(&parent, &leaf)
+                .refuse_at("materialize::open_output_append")?,
+        );
+        if !file
+            .metadata()
+            .refuse_at("materialize::open_output_append")?
+            .is_file()
+        {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        Ok(file)
+    }
+
     fn shared_parent(&self, path: &[u8]) -> Result<(Arc<File>, CString)> {
         let directory = path
             .iter()
@@ -2350,6 +2374,7 @@ impl PublishSink {
                         rel_path: record.rel_path,
                         identity,
                         racy: record.racy,
+                        extended: None,
                         hints: record.hints,
                     });
                     settled.push((intent, false));
@@ -2596,6 +2621,7 @@ impl PublishSink {
                             rel_path: record.rel_path,
                             identity,
                             racy: record.racy,
+                            extended: None,
                             hints: record.hints,
                         });
                     }
@@ -3643,6 +3669,7 @@ mod tests {
                     rel_path: name.as_bytes().to_vec(),
                     identity: crate::freshness::StatIdentity::from_metadata(&metadata),
                     racy: false,
+                    extended: None,
                     hints: Vec::new(),
                 },
                 file,

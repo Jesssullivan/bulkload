@@ -69,6 +69,11 @@ pub struct Landing<'a> {
     /// `GIT_IGNORE_POLICY_CONFLICT` for any exclude that is not the
     /// capture's.
     pub exclude_union: Option<&'a Path>,
+    /// A beside landing (`estate-apply --beside`, M2 round 2 item c): a
+    /// first linked landing into the planned repository at the beside path,
+    /// detached at the captured head, that never steps the repository's
+    /// native refs.
+    pub beside: bool,
 }
 
 impl<'a> Landing<'a> {
@@ -2092,6 +2097,7 @@ impl Place<'_> {
 /// item was removed), `GIT_DESTINATION_OCCUPIED` (not bulkload's, or
 /// another item's), `GIT_CONVERGE_STALE_CAPTURE`, `GIT_CONVERGE_SHAPE_CHANGED`,
 /// `GIT_CONVERGE_INTERRUPTED`, or whatever the restore or import refuses.
+#[allow(clippy::too_many_lines)]
 pub fn apply_workspace(
     staged: &super::StagedBundle,
     target: &Target<'_>,
@@ -2170,6 +2176,12 @@ pub fn apply_workspace(
         super::recover_linked_landing(&destination, &place.common, target.source, &intent)?;
         landed::remove(&landing_intent)?;
         custody.count("landing-recovered");
+        // A beside landing (M2 round 2 item c) is finished forward and
+        // never converged: a converge could attach a branch of the
+        // operator's repository.
+        if landing.beside {
+            return Ok(Applied::of(false, &custody));
+        }
     }
     let mut ledger: LandedWorkspace =
         landed::read(&ledger_path)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
@@ -3018,6 +3030,7 @@ pub(super) struct LinkedPlan {
 /// compare-and-swap. A branch that cannot be attached is never a refusal:
 /// the worktree lands detached at the captured head (finding 11). A
 /// foreign repository keeps provenance only.
+#[allow(clippy::too_many_lines)]
 pub(super) fn plan_linked(
     checked: &LinkedChecked,
     (bundle, base): (&Path, Option<&super::StagedBundle>),
@@ -3041,6 +3054,9 @@ pub(super) fn plan_linked(
         source,
         (t, landing.exclude_union.is_some()),
     )?;
+    if landing.beside && !append.is_empty() {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
     if let Some(base) = base {
         super::import_verified(repository, base.path(), source)?;
     }
@@ -3050,8 +3066,10 @@ pub(super) fn plan_linked(
     }
     let instance = instance.as_str();
     let meta = Meta::read(repository, source, instance)?;
+    // A beside landing (M2 round 2 item c) never steps the repository's
+    // native refs: it is the operator's, whatever its marker says.
     let mut ledger = landed::read::<RefLedger>(&directory.join(landed::REFS_LANDED))?
-        .filter(|ledger| ledger.created);
+        .filter(|ledger| ledger.created && !landing.beside);
     let checked: BTreeSet<String> = checked_out_by(repository)?
         .into_iter()
         .map(|(_, branch)| branch)
@@ -3066,14 +3084,21 @@ pub(super) fn plan_linked(
         ledger = Some(next);
     }
     let (native, symrefs) = native_refs::native_refs(repository)?;
-    let head = head_plan(
-        meta.symbolic(repository)?.as_deref(),
+    let symbolic = meta.symbolic(repository)?;
+    let mut head = head_plan(
+        symbolic.as_deref().filter(|_| !landing.beside),
         meta.get("head")?,
         (&native, &symrefs),
         ledger.as_ref(),
         &checked,
         t,
     );
+    // A beside landing is detached at the captured head, its branch
+    // recorded: no branch of the operator's repository is created or moved.
+    if landing.beside {
+        head.intended = symbolic;
+        head.line = Some("head-detached-beside");
+    }
     let mut create = None;
     match (&head.branch, ledger) {
         (Some((name, before, after)), Some(mut next)) => {

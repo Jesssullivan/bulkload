@@ -45,6 +45,9 @@ pub struct DiffOptions {
     /// `--activate-origin PREFIX`: what a first landing would activate
     /// under the same prefixes `estate-apply` is given.
     pub activate_origin: Vec<String>,
+    /// `--beside SUFFIX`: what `estate-apply --adopt --beside SUFFIX` does
+    /// with a diverged item (M2 round 2 item c).
+    pub beside: Option<String>,
     /// `--side-root ROOT` (M2r2 item e): what `estate-apply --side-root`
     /// would seat is reported (`kind:"seat"` rows), and each item spelled
     /// through such a link is answered at the directory it names, which is
@@ -308,6 +311,7 @@ fn item_row(
         capture: captured.digest,
         parents: None,
         exclude_union: None,
+        beside: false,
     };
     let target = converge::Target {
         repository: &item.repository,
@@ -321,7 +325,7 @@ fn item_row(
             &target,
             &landing,
             options.since,
-            (&options.activate_origin, items),
+            (&options.activate_origin, items, options.beside.as_deref()),
         )?
     } else {
         converge::diff::refs_only(

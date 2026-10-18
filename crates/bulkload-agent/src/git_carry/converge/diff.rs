@@ -73,6 +73,9 @@ pub struct ItemRow {
     /// The components that differ: `head`, `index`, `exclude`,
     /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
     /// landing that makes `n` absent parents (M2 finding 1);
+    /// with `--beside SUFFIX`, `beside=<landing|ignore-policy-conflict|
+    /// landed|existing|occupied>:<path>` for a `diverged` item (what
+    /// `estate-apply --adopt --beside SUFFIX` does; M2 round 2 item c);
     /// `exclude-union=<n>` for an `ignore-policy-conflict` that
     /// `estate-apply --exclude-union` lands by appending `n` lines (items
     /// of one repository each count them; the apply appends them once), or
@@ -168,6 +171,70 @@ fn first_landing(
     }
 }
 
+// What `estate-apply --adopt --beside SUFFIX` does with a diverged item
+// (M2 round 2 item c): `beside=<verdict>:<path>`, the verdict `landing`
+// (absent: a linked landing; the shared exclude must already hold every
+// captured line), `ignore-policy-conflict` (absent, but the linked landing
+// would refuse `GIT_IGNORE_POLICY_CONFLICT`: a beside landing never appends
+// to the live repository's exclude), `landed` (this item's own landing of
+// this capture: nothing to land), `existing` (a standalone checkout no
+// ledger names: adopted if it proves equal, else refused occupied) or
+// `occupied` (`GIT_DESTINATION_OCCUPIED`, the ref namespace included); or
+// `beside-refused=<CODE>` for a suffix that names no namespace.
+fn beside_component(
+    workspace: &Path,
+    (common, captured_exclude): (&Path, &[u8]),
+    landing: &Landing<'_>,
+    (source, suffix): (&str, &str),
+    repository: &Path,
+) -> Result<String> {
+    let ns = match super::super::beside::namespace(suffix) {
+        Ok(ns) => ns,
+        Err(refusal) => return Ok(format!("beside-refused={}", refusal.code())),
+    };
+    let beside = super::super::beside::path(workspace, suffix);
+    let verdict = if super::super::beside::namespace_taken(repository, &ns)? {
+        "occupied"
+    } else if planned(&beside)?.is_none() {
+        let existing = match fs::read(common.join("info/exclude")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::converge::diff::beside",
+                ))
+            }
+        };
+        let fits = existing == captured_exclude
+            || super::super::exclude_union::missing(&existing, captured_exclude)
+                .is_ok_and(|missing| missing.is_empty());
+        if fits {
+            "landing"
+        } else {
+            "ignore-policy-conflict"
+        }
+    } else {
+        let ledger = match landed::worktree_git_dir(&beside)? {
+            Some(git_dir) => landed::read::<LandedWorkspace>(
+                &landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_LANDED),
+            )?,
+            None => None,
+        };
+        if ledger
+            .as_ref()
+            .is_some_and(|ledger| ledger.item == landing.item && ledger.capture == landing.capture)
+        {
+            "landed"
+        } else if ledger.is_none() && beside.join(".git").is_dir() {
+            "existing"
+        } else {
+            "occupied"
+        }
+    };
+    Ok(format!("beside={verdict}:{}", beside.display()))
+}
+
 // The component a first landing that makes `absent` parents carries.
 fn parents_component(row: &mut ItemRow, absent: usize) {
     if absent > 0 {
@@ -180,12 +247,13 @@ fn parents_component(row: &mut ItemRow, absent: usize) {
 ///
 /// # Errors
 /// Whatever reading the destination or the capture refuses.
+#[allow(clippy::too_many_lines)]
 pub fn workspace(
     staged: &super::super::StagedBundle,
     target: &Target<'_>,
     landing: &Landing<'_>,
     since: Option<i128>,
-    (origins, items): (&[String], &[String]),
+    (origins, items, beside): (&[String], &[String], Option<&str>),
 ) -> Result<ItemRow> {
     let workspace = target
         .workspace
@@ -276,6 +344,15 @@ pub fn workspace(
             row.class = "differs";
             row.adopt = "diverged";
             row.components = components;
+            if let Some(suffix) = beside {
+                row.components.push(beside_component(
+                    workspace,
+                    (&common, &meta.exclude(&scratch.repo)?),
+                    landing,
+                    (target.source, suffix),
+                    target.repository,
+                )?);
+            }
             row.hint = Some(hint(
                 &scratch.repo,
                 &head_of(workspace)?.oid,

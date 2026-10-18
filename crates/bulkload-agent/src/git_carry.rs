@@ -19,6 +19,7 @@ use std::process::Command;
 use crate::{BulkloadRefusal, Result};
 
 mod batch_objects;
+pub mod beside;
 pub mod chain;
 pub mod converge;
 pub mod decide;
@@ -6830,6 +6831,7 @@ pub fn restore_staged(
             capture: staged.digest(),
             parents: None,
             exclude_union: None,
+            beside: false,
         },
         &[],
     )
@@ -7313,6 +7315,7 @@ pub fn restore_linked_staged(
             capture: staged.digest(),
             parents: None,
             exclude_union: None,
+            beside: false,
         },
     )
     .map(drop)
@@ -7349,6 +7352,11 @@ pub(crate) fn restore_linked_staged_landed(
         source,
         (landing.observed_ns, landing.exclude_union.is_some()),
     )?;
+    // A beside landing (M2 round 2 item c, review A1) never appends to the
+    // shared exclude: that would change what the live checkout ignores.
+    if landing.beside && !checked.exclude_union.is_empty() {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
     // M2 finding 1: after every write-free refusal, the absent parents
     // are the landing's first write.
     let (destination, parents_made) = checked.destination.place(landing.parents_record())?;
@@ -7623,6 +7631,7 @@ pub(crate) fn recover_linked_landing(
             capture: intent.capture,
             parents: None,
             exclude_union: None,
+            beside: false,
         },
         &meta,
         (&intent.head, intent.intended_branch.as_ref()),
