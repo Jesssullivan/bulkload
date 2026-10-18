@@ -55,6 +55,15 @@ pub struct DiffOptions {
     /// `--activate-origin PREFIX`: what a first landing would activate
     /// under the same prefixes `estate-apply` is given.
     pub activate_origin: Vec<String>,
+    /// `--beside SUFFIX`: what `estate-apply --adopt --beside SUFFIX` does
+    /// with a diverged item (M2 round 2 item c).
+    pub beside: Option<String>,
+    /// `--side-root ROOT` (M2r2 item e): what `estate-apply --side-root`
+    /// would seat is reported (`kind:"seat"` rows), and each item spelled
+    /// through such a link is answered at the directory it names, which is
+    /// the tree the live path holds once seated (component
+    /// `side-root-seat`).
+    pub side_roots: Vec<PathBuf>,
 }
 
 /// The counts of one run, by class and by adopt answer.
@@ -111,6 +120,23 @@ pub fn diff(
         .map(id)
         .collect::<Result<Vec<String>>>()?;
     let mut bases = Bases::new(&contents.items, corpus)?;
+    let roots = super::seat::roots(&options.side_roots)?;
+    let mut seats: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for candidate in super::seat::candidates(&contents.items, &roots) {
+        let (seat, target, refused) = match &candidate.found {
+            super::seat::Found::Seatable { target, .. } => {
+                seats.push((candidate.live.clone(), target.clone()));
+                ("seatable", Some(target), None)
+            }
+            super::seat::Found::Refused(refusal) => ("refused", None, Some(refusal.code())),
+        };
+        line(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"seat\",\"path\":{},\"target\":{},\"seat\":\"{seat}\",\"refused\":{}}}",
+            json_string(&converge::diff::shown(&candidate.live)),
+            target.map_or_else(|| "null".to_owned(), |target| json_string(&converge::diff::shown(target))),
+            refused.map_or_else(|| "null".to_owned(), json_string),
+        ))?;
+    }
     let mut seen = BTreeSet::new();
     for (index, item) in contents.items.iter().enumerate() {
         let identity = id(item)?;
@@ -126,8 +152,9 @@ pub fn diff(
                 .as_ref()
                 .map_or_else(|| "null".to_owned(), |path| json_string(&converge::diff::shown(path))),
         );
+        let (seated, answered_item) = seated_item(item, &seats);
         let answered = item_row(
-            item,
+            &answered_item,
             (&identity, &items),
             (corpus, &mut bases),
             source,
@@ -136,7 +163,10 @@ pub fn diff(
         );
         bases.done(index);
         match answered {
-            Ok((row, journaled, omitted)) => {
+            Ok((mut row, journaled, omitted)) => {
+                if seated {
+                    row.components.push("side-root-seat".to_owned());
+                }
                 if let Some(workspace) = &item.workspace {
                     summary
                         .workspaces
@@ -304,6 +334,31 @@ impl Staged<'_> {
     }
 }
 
+// `item` with each path spelled through a seatable link (`seats`: live,
+// target) spelled at the target instead, and whether any was.
+fn seated_item(item: &super::Item, seats: &[(PathBuf, PathBuf)]) -> (bool, super::Item) {
+    let mut seated = false;
+    let mut moved = |path: &Path| {
+        for (live, target) in seats {
+            if let Ok(rest) = path.strip_prefix(live) {
+                seated = true;
+                return if rest.as_os_str().is_empty() {
+                    target.clone()
+                } else {
+                    target.join(rest)
+                };
+            }
+        }
+        path.to_path_buf()
+    };
+    let answered = super::Item {
+        source: item.source.clone(),
+        repository: moved(&item.repository),
+        workspace: item.workspace.as_deref().map(&mut moved),
+    };
+    (seated, answered)
+}
+
 // One item: its capture staged (a chain flattened, a plan base staged),
 // then the converge's report function. Nothing is imported at the
 // destination: a base goes into the scratch repository only.
@@ -351,6 +406,8 @@ fn item_row(
         observed_ns: retained_parts(corpus, &captured.bundle)?.map_or(0, |parts| parts.started_ns),
         capture: captured.digest,
         parents: None,
+        exclude_union: None,
+        beside: false,
     };
     let target = converge::Target {
         repository: &item.repository,
@@ -364,7 +421,7 @@ fn item_row(
             &target,
             &landing,
             options.since,
-            (&options.activate_origin, items),
+            (&options.activate_origin, items, options.beside.as_deref()),
         )?
     } else {
         converge::diff::refs_only(

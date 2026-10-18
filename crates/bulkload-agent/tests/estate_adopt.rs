@@ -24,9 +24,13 @@
 //! - P95: without `--adopt` an identical copy stays occupied, untouched.
 //! - P96 ADOPT-BARE (F7, A11d): a pre-made empty bare takes the marker,
 //!   the native refs and the captured symbolic HEAD under `--adopt`.
-//! - P108/P109 DIFF-ONE-IMPORT (M2r2 item 3): `estate-diff` imports a
+//! - P130/P131 DIFF-ONE-IMPORT (M2r2 item 3): `estate-diff` imports a
 //!   repository's plan base once, however many of its worktree items it
 //!   answers, and its rows are byte-identical to an import per item.
+//! - P120/P121 SIDE-ROOT-SEAT (M2r2 item e): live paths that are symlinks
+//!   into a side root (the GFTB shape the 10-16 lane converted by hand
+//!   with `cp -a`) are seated by `estate-apply --side-root` and re-keyed
+//!   there; `estate-unseat` undoes it exactly.
 //!
 //! Fixture repositories are created and destroyed here; their Git runs with
 //! no global configuration and no hooks (R-N98).
@@ -1400,14 +1404,14 @@ fn counter(ran: &Ran, name: &str) -> u64 {
         .unwrap_or_else(|| panic!("no {name} in {}", ran.stderr))
 }
 
-/// P108 DIFF-ONE-IMPORT-EQUAL (M2r2 item 3): over the GFTB shapes plus
+/// P130 DIFF-ONE-IMPORT-EQUAL (M2r2 item 3): over the GFTB shapes plus
 /// four more source-only worktrees of `infra` (every row class the
 /// fixture has: landed, diverged, first linked landings, dest-only),
 /// `estate-diff` with the shared import prints exactly the bytes the
 /// import-per-item arm prints, imports each plan base once, and lends it
 /// to every scratch the other arm built its own import in.
 #[test]
-fn p108_estate_diff_shares_one_base_import_and_answers_the_same_bytes() {
+fn p130_estate_diff_shares_one_base_import_and_answers_the_same_bytes() {
     let world = Gftb::new();
     let infra = world.neo("infra");
     let mut rows = world.plan_rows();
@@ -1580,7 +1584,7 @@ fn worktree_world(
     (world, rows)
 }
 
-/// P109 DIFF-ONE-INDEX-PACK (M2r2 item 3, the 10-16 in-place finding:
+/// P131 DIFF-ONE-INDEX-PACK (M2r2 item 3, the 10-16 in-place finding:
 /// estate-diff indexed a repository's whole bundle once per worktree
 /// item): two repositories of a main and four linked worktrees each,
 /// against destination repositories that hold none of their objects, so
@@ -1591,7 +1595,7 @@ fn worktree_world(
 /// one that `index-pack` would skip as connected, walks the whole base);
 /// the import-per-item arm indexes a base in every one of them.
 #[test]
-fn p109_estate_diff_runs_one_index_pack_per_repository() {
+fn p131_estate_diff_runs_one_index_pack_per_repository() {
     let (world, rows) = worktree_world(&["one", "two"], 4, &|world, name| world.sting(name));
     let run = Run::new(&world, &rows);
     settle();
@@ -1684,7 +1688,7 @@ fn p109_estate_diff_runs_one_index_pack_per_repository() {
     );
 }
 
-/// P110 DIFF-ONE-IMPORT-PER-STORE (M2r2 item 3 review): one base read
+/// P132 DIFF-ONE-IMPORT-PER-STORE (M2r2 item 3 review): one base read
 /// against two destination object stores. The main checkout is a first
 /// landing at an absent path (its origin is read in a scratch that
 /// borrows no store) and its worktrees land into an existing, unrelated
@@ -1692,7 +1696,7 @@ fn p109_estate_diff_runs_one_index_pack_per_repository() {
 /// never one store's import lent to the other's scratches, and rows
 /// byte-identical to the import-per-item arm.
 #[test]
-fn p110_estate_diff_imports_a_base_once_per_destination_store() {
+fn p132_estate_diff_imports_a_base_once_per_destination_store() {
     let (world, rows) = worktree_world(&["one"], 3, &|world, _| world.sting("fresh"));
     let run = Run::new(&world, &rows);
     settle();
@@ -1723,13 +1727,13 @@ fn p110_estate_diff_imports_a_base_once_per_destination_store() {
     );
 }
 
-/// P111 DIFF-SHARED-CORPUS-PATH (M2r2 item 3 review, finding 1): a corpus
+/// P133 DIFF-SHARED-CORPUS-PATH (M2r2 item 3 review, finding 1): a corpus
 /// whose path is not UTF-8 lends its shared import (the alternates line is
 /// written as bytes), and one whose path holds a newline, which no
 /// alternates line can name, imports the base per scratch as before; in
 /// both, the rows are the import-per-item arm's.
 #[test]
-fn p111_estate_diff_shares_under_any_corpus_path_it_can_name() {
+fn p133_estate_diff_shares_under_any_corpus_path_it_can_name() {
     use std::os::unix::ffi::OsStrExt as _;
     for (name, imports, borrowed) in [(&b"corpus-\xff"[..], 1, 4), (&b"corpus-\nline"[..], 4, 0)] {
         let (world, rows) = worktree_world(&["one"], 3, &|world, name| world.sting(name));
@@ -1758,4 +1762,806 @@ fn p111_estate_diff_shares_under_any_corpus_path_it_can_name() {
         );
         assert_eq!(counter(&off, "git_scratch_base_imports"), 4, "{name:?}");
     }
+}
+
+fn seat_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|line| line.starts_with("seat "))
+        .collect()
+}
+
+fn inode(path: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::symlink_metadata(path).unwrap().ino()
+}
+
+fn unseat(state: &Path, lives: &[&Path]) -> Ran {
+    let mut list: Vec<OsString> = vec!["estate-unseat".into(), state.as_os_str().to_owned()];
+    list.extend(lives.iter().map(|live| live.as_os_str().to_owned()));
+    agent(&list)
+}
+
+/// P120 SIDE-ROOT-SEAT (M2r2 item e; the GFTB shape of 10-16): a family
+/// (a main and a linked worktree) landed into a side root by an earlier
+/// plan, the live main a symlink into it and the live worktrees directory
+/// another. Under a live-path plan `estate-apply --adopt` refuses the
+/// symlinked spelling; `estate-diff --side-root` says what a seat does and
+/// answers each item at the tree it would seat, writing nothing;
+/// `estate-apply --adopt --side-root` seats both links (the same inodes at
+/// the live paths, a link back at each side-root path, no worktree byte
+/// touched) and re-keys both ledgers; closure passes; a rerun seats and
+/// writes nothing; `estate-unseat` puts both links and both trees back.
+#[test]
+fn p120_a_symlinked_live_path_into_a_side_root_is_seated_and_rekeyed() {
+    let world = Gftb::new();
+    let side = world.sting("estate");
+    fs::create_dir(&side).unwrap();
+    let (main_src, feat_src) = (world.neo("infra"), world.neo("infra.worktrees/feat"));
+    let (main_side, feat_side) = (side.join("infra"), side.join("infra.worktrees/feat"));
+    let first = named_run(
+        &world,
+        "side",
+        &[
+            (&main_src, &main_side, Some(&main_side)),
+            (&feat_src, &main_side, Some(&feat_side)),
+        ],
+    );
+    first.capture();
+    private_dir(&first.applied);
+    let landed = first.apply(&[]);
+    assert!(landed.ok, "{}\n{}", landed.stdout, landed.stderr);
+    // The live tree: links into the side root, as the GFTB carry left it.
+    let live_root = world.sting("live");
+    fs::create_dir(&live_root).unwrap();
+    let (main_live, worktrees_live) = (live_root.join("infra"), live_root.join("infra.worktrees"));
+    std::os::unix::fs::symlink(&main_side, &main_live).unwrap();
+    std::os::unix::fs::symlink(side.join("infra.worktrees"), &worktrees_live).unwrap();
+    let feat_live = worktrees_live.join("feat");
+    let second = named_run(
+        &world,
+        "live",
+        &[
+            (&main_src, &main_live, Some(&main_live)),
+            (&feat_src, &main_live, Some(&feat_live)),
+        ],
+    );
+    settle();
+    second.capture();
+    private_dir(&second.applied);
+    let (main_ino, worktrees_ino) = (inode(&main_side), inode(&side.join("infra.worktrees")));
+    let trees = (freeze(&main_side), freeze(&side.join("infra.worktrees")));
+    // Without --side-root: the symlinked spelling is refused, as before.
+    let refused = second.apply(&["--adopt"]);
+    assert!(!refused.ok);
+    assert!(seat_lines(&refused.stdout).is_empty(), "{}", refused.stdout);
+    for source in [&main_src, &feat_src] {
+        let row = receipt(&receipts(&refused.stdout), source).clone();
+        assert!(row.2.contains("GIT_DESTINATION_OCCUPIED"), "{row:?}");
+    }
+    // The dry run: both links seatable, each item answered at its tree.
+    let before = freeze_all(&world.sting(""));
+    let diff = second.diff(&["--side-root", side.to_str().unwrap()]);
+    assert_eq!(freeze_all(&world.sting("")), before, "estate-diff wrote");
+    let seats: Vec<&str> = diff
+        .stdout
+        .lines()
+        .filter(|line| line.contains("\"kind\":\"seat\""))
+        .collect();
+    assert_eq!(seats.len(), 2, "{}", diff.stdout);
+    assert!(
+        seats
+            .iter()
+            .all(|line| line.contains("\"seat\":\"seatable\"")),
+        "{seats:?}"
+    );
+    for source in [&main_src, &feat_src] {
+        let line = diff_line(&diff.stdout, source);
+        assert!(line.contains("\"side-root-seat\""), "{line}");
+        assert!(line.contains("\"adopt\":\"ledgered-other-item\""), "{line}");
+    }
+    // The apply: seated, then re-keyed at the live paths.
+    let ran = second.apply(&["--adopt", "--side-root", side.to_str().unwrap()]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let lines = seat_lines(&ran.stdout);
+    assert_eq!(lines.len(), 2, "{}", ran.stdout);
+    assert!(
+        lines
+            .iter()
+            .all(|line| line.contains("outcome=seated reason=none")),
+        "{lines:?}"
+    );
+    for source in [&main_src, &feat_src] {
+        let row = receipt(&receipts(&ran.stdout), source).clone();
+        assert!(row.2.contains("rekeyed=1"), "{row:?}");
+    }
+    assert!(fs::symlink_metadata(&main_live).unwrap().is_dir());
+    assert_eq!(inode(&main_live), main_ino);
+    assert_eq!(inode(&worktrees_live), worktrees_ino);
+    assert_eq!(fs::read_link(&main_side).unwrap(), main_live);
+    assert_eq!(
+        fs::read_link(side.join("infra.worktrees")).unwrap(),
+        worktrees_live
+    );
+    assert_eq!(
+        (freeze(&main_live), freeze(&worktrees_live)),
+        trees,
+        "a seat or the re-key touched a checkout byte or lstat field"
+    );
+    let closure = second.closure();
+    assert!(
+        closure
+            .stdout
+            .contains("\"verdict\":\"pass\",\"gate\":\"pass\""),
+        "{}",
+        closure.stdout
+    );
+    // A rerun: nothing to seat, the journal no-op.
+    let rerun = second.apply(&["--adopt", "--side-root", side.to_str().unwrap()]);
+    assert!(rerun.ok, "{}\n{}", rerun.stdout, rerun.stderr);
+    assert!(seat_lines(&rerun.stdout).is_empty(), "{}", rerun.stdout);
+    assert!(receipts(&rerun.stdout)
+        .iter()
+        .all(|row| row.1.starts_with("previous-")));
+    // The undo: both trees back at their side-root paths, both links back.
+    let undone = unseat(&second.applied, &[]);
+    assert!(undone.ok, "{}\n{}", undone.stdout, undone.stderr);
+    assert_eq!(undone.stdout.matches("outcome=unseated").count(), 2);
+    assert_eq!(fs::read_link(&main_live).unwrap(), main_side);
+    assert_eq!(
+        fs::read_link(&worktrees_live).unwrap(),
+        side.join("infra.worktrees")
+    );
+    assert_eq!(inode(&main_side), main_ino);
+    assert_eq!(inode(&side.join("infra.worktrees")), worktrees_ino);
+    assert!(
+        !unseat(&second.applied, &[&main_live]).ok,
+        "no record is left"
+    );
+}
+
+/// P121 SIDE-ROOT-SEAT-REFUSED (M2r2 item e): only a single hop into a side
+/// root is seated. A link that reaches the side root through another link
+/// is refused `PATH_ESCAPES_ROOT` and left as it is (its item still refused
+/// as a symlinked spelling); a link outside every side root is not the
+/// verb's (no seat row).
+#[test]
+fn p121_only_a_single_hop_into_a_side_root_is_seated() {
+    let world = Gftb::new();
+    let side = world.sting("estate");
+    fs::create_dir(&side).unwrap();
+    let source = world.neo("lamesh");
+    let tree = side.join("lamesh");
+    fs::rename(world.sting("lamesh"), &tree).unwrap();
+    let alias = world.sting("alias");
+    std::os::unix::fs::symlink(&side, &alias).unwrap();
+    let live = world.sting("live-lamesh");
+    std::os::unix::fs::symlink(alias.join("lamesh"), &live).unwrap();
+    let elsewhere = world.sting("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    fs::rename(world.sting("sshrepo"), elsewhere.join("sshrepo")).ok();
+    let outside = world.sting("live-ssh");
+    std::os::unix::fs::symlink(elsewhere.join("sshrepo"), &outside).unwrap();
+    let run = named_run(
+        &world,
+        "hops",
+        &[
+            (&source, &live, Some(&live)),
+            (&world.neo("sshrepo"), &outside, Some(&outside)),
+        ],
+    );
+    run.capture();
+    private_dir(&run.applied);
+    let before = freeze_all(&world.sting(""));
+    // Without --adopt a seated tree could only refuse: refused up front.
+    let unadopted = run.apply(&["--side-root", side.to_str().unwrap()]);
+    assert!(!unadopted.ok);
+    assert!(
+        unadopted.stderr.contains("FIELD_DOMAIN_VIOLATION"),
+        "{}",
+        unadopted.stderr
+    );
+    assert!(seat_lines(&unadopted.stdout).is_empty());
+    let ran = run.apply(&["--adopt", "--side-root", side.to_str().unwrap()]);
+    let lines = seat_lines(&ran.stdout);
+    assert_eq!(lines.len(), 1, "{}", ran.stdout);
+    assert!(
+        lines[0].contains("outcome=refused reason=PATH_ESCAPES_ROOT"),
+        "{lines:?}"
+    );
+    let row = receipt(&receipts(&ran.stdout), &source).clone();
+    assert!(row.2.contains("GIT_DESTINATION_OCCUPIED"), "{row:?}");
+    assert_eq!(fs::read_link(&live).unwrap(), alias.join("lamesh"));
+    assert!(fs::symlink_metadata(&tree).unwrap().is_dir());
+    assert_eq!(freeze_all(&world.sting("")), before, "a refused seat wrote");
+}
+
+/// The `--exclude-union` shape of the 2026-10-16 in-place run (M2 round 2,
+/// item 2: 250 new linked worktrees refused `GIT_IGNORE_POLICY_CONFLICT`
+/// where the source's exclude was a superset of the destination's): the
+/// source's common exclude is `captured`, the destination's `existing`,
+/// and two source-only linked worktrees are planned into the destination
+/// repository (no main item, which `--adopt` would refuse diverged).
+fn exclude_union_world<'a>(
+    world: &'a Gftb,
+    captured: &[u8],
+    existing: &[u8],
+) -> (Run<'a>, [PathBuf; 2]) {
+    let neo = world.neo("infra");
+    let second = world.neo("infra.worktrees/only-src2");
+    git(
+        &neo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "src-only-2",
+            second.to_str().unwrap(),
+        ],
+    );
+    fs::write(second.join("second.txt"), b"second work\n").unwrap();
+    fs::create_dir_all(neo.join(".git/info")).unwrap();
+    fs::write(neo.join(".git/info/exclude"), captured).unwrap();
+    let infra = world.sting("infra");
+    fs::create_dir_all(infra.join(".git/info")).unwrap();
+    fs::write(infra.join(".git/info/exclude"), existing).unwrap();
+    let sources = [world.neo("infra.worktrees/only-src"), second];
+    let run = named_run(
+        world,
+        "union",
+        &[
+            (
+                &sources[0],
+                &infra,
+                Some(&world.sting("infra.worktrees/only-src")),
+            ),
+            (
+                &sources[1],
+                &infra,
+                Some(&world.sting("infra.worktrees/only-src2")),
+            ),
+        ],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    (run, sources)
+}
+
+/// Every `*.exclude-union` record in `state`, decoded.
+fn union_records(state: &Path) -> Vec<bulkload_agent::git_carry::exclude_union::ExcludeUnion> {
+    fs::read_dir(state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "exclude-union"))
+        .map(|path| {
+            bulkload_agent::git_carry::exclude_union::read_record(&path)
+                .unwrap()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// P108 EXCLUDE-UNION (M2 round 2, item 2): a destination exclude the
+/// capture's is a superset of (plus one line of its own) refuses every new
+/// linked worktree `GIT_IGNORE_POLICY_CONFLICT` without the flag, with
+/// nothing written; `estate-diff` says so and names what the flag would
+/// append (`exclude-union=3`), read-only. With `--exclude-union` both land:
+/// the first appends the three missing captured lines after the
+/// destination's own bytes (a byte prefix, kept exactly), counted
+/// `exclude-appended=3` and recorded in STATE as appended; the second finds
+/// nothing missing and writes nothing. A rerun is a journal no-op.
+#[test]
+fn p108_exclude_union_appends_the_missing_captured_lines_and_lands() {
+    let world = Gftb::new();
+    let captured = b"*.log\n# neo additions\nscratch/\n\n.envrc\n";
+    let existing = b"*.log\nsting-local/\n";
+    let (run, sources) = exclude_union_world(&world, captured, existing);
+    let exclude = world.sting("infra/.git/info/exclude");
+
+    let diff = run.diff(&[]);
+    for source in &sources {
+        let line = diff_line(&diff.stdout, source);
+        assert!(
+            line.contains("\"adopt\":\"ignore-policy-conflict\"")
+                && line.contains("\"exclude-union=3\""),
+            "{line}"
+        );
+    }
+    assert_eq!(fs::read(&exclude).unwrap(), existing);
+
+    let ran = run.apply(&[]);
+    assert!(!ran.ok, "{}", ran.stdout);
+    let rows = receipts(&ran.stdout);
+    for source in &sources {
+        let row = receipt(&rows, source);
+        assert_eq!(row.1, "refused", "{row:?}");
+        assert!(row.2.contains("GIT_IGNORE_POLICY_CONFLICT"), "{row:?}");
+    }
+    assert_eq!(fs::read(&exclude).unwrap(), existing);
+    assert!(union_records(&run.applied).is_empty());
+
+    let ran = run.apply(&["--exclude-union"]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let rows = receipts(&ran.stdout);
+    let mut appended = 0;
+    for source in &sources {
+        let row = receipt(&rows, source);
+        assert_eq!(row.1, "workspace-restored", "{row:?}");
+        if row.2.contains("exclude-appended=3") {
+            appended += 1;
+        }
+        assert!(!row.2.contains("GIT_"), "{row:?}");
+    }
+    assert_eq!(appended, 1, "one append, then nothing missing: {rows:?}");
+    let now = fs::read(&exclude).unwrap();
+    assert!(now.starts_with(existing), "the destination's bytes moved");
+    assert_eq!(
+        now,
+        b"*.log\nsting-local/\n# neo additions\nscratch/\n.envrc\n"
+    );
+    let records = union_records(&run.applied);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].appends.len(), 1);
+    let append = &records[0].appends[0];
+    assert_eq!(
+        append.state,
+        bulkload_agent::git_carry::exclude_union::AppendState::Appended
+    );
+    assert_eq!(
+        append.lines,
+        [&b"# neo additions"[..], b"scratch/", b".envrc"]
+            .map(<[u8]>::to_vec)
+            .to_vec()
+    );
+    assert_eq!(
+        fs::read(world.sting("infra.worktrees/only-src2/second.txt")).unwrap(),
+        b"second work\n"
+    );
+    assert_eq!(
+        fs::read(world.sting("infra.worktrees/only-src/only-src.txt")).unwrap(),
+        b"only-src work\n"
+    );
+
+    let ran = run.apply(&["--exclude-union"]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    for source in &sources {
+        let row = receipt(&receipts(&ran.stdout), source).clone();
+        assert_eq!(
+            row.1, "previous-workspace-restoration-not-revalidated",
+            "{row:?}"
+        );
+    }
+    assert_eq!(fs::read(&exclude).unwrap(), now);
+    assert_eq!(union_records(&run.applied), records);
+}
+
+/// P109 EXCLUDE-UNION-NEGATION (M2 round 2, item 2): a negation makes a
+/// union order-sensitive (the last matching pattern decides), so a
+/// captured exclude holding `!pattern` keeps `GIT_IGNORE_POLICY_CONFLICT`
+/// under `--exclude-union` too, with nothing written or recorded, and
+/// `estate-diff` says the flag refuses too
+/// (`exclude-union-refused=GIT_IGNORE_POLICY_CONFLICT`).
+#[test]
+fn p109_exclude_union_refuses_a_negation() {
+    let world = Gftb::new();
+    let captured = b"*.log\n!keep.log\nscratch/\n";
+    let existing = b"*.log\n";
+    let (run, sources) = exclude_union_world(&world, captured, existing);
+    let exclude = world.sting("infra/.git/info/exclude");
+    let infra = world.sting("infra");
+    let refs_before = all_refs(&infra);
+    let diff = run.diff(&[]);
+    for source in &sources {
+        let line = diff_line(&diff.stdout, source);
+        assert!(
+            line.contains("\"adopt\":\"ignore-policy-conflict\"")
+                && line.contains("\"exclude-union-refused=GIT_IGNORE_POLICY_CONFLICT\""),
+            "{line}"
+        );
+    }
+    let ran = run.apply(&["--exclude-union"]);
+    assert!(!ran.ok, "{}", ran.stdout);
+    let rows = receipts(&ran.stdout);
+    for source in &sources {
+        let row = receipt(&rows, source);
+        assert_eq!(row.1, "refused", "{row:?}");
+        assert!(row.2.contains("GIT_IGNORE_POLICY_CONFLICT"), "{row:?}");
+    }
+    assert_eq!(fs::read(&exclude).unwrap(), existing);
+    assert_eq!(all_refs(&infra), refs_before);
+    assert!(union_records(&run.applied).is_empty());
+    assert!(!world.sting("infra.worktrees/only-src").exists());
+}
+
+/// The suffix the beside tests land under.
+const SUFFIX: &str = ".neo-20261016";
+
+/// The beside checkout of `dest` under [`SUFFIX`].
+fn beside_of(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_owned();
+    name.push(SUFFIX);
+    PathBuf::from(name)
+}
+
+/// Every ref of `repo` by name, provenance (`refs/carry`) left out.
+fn named_refs(repo: &Path) -> BTreeMap<String, String> {
+    all_refs(repo)
+        .lines()
+        .filter(|line| !line.starts_with("refs/carry"))
+        .map(|line| {
+            let (name, value) = line.split_once(' ').unwrap();
+            (name.to_owned(), value.to_owned())
+        })
+        .collect()
+}
+
+/// A diverged `lamesh` (a seat edited at the destination) whose source is
+/// on a branch the destination lacks, captured; its run.
+fn diverged<'a>(world: &'a Gftb, source: &Path, dest: &Path, commit: bool) -> Run<'a> {
+    fs::write(dest.join("README"), b"edited on sting\n").unwrap();
+    if commit {
+        git(dest, &["commit", "--quiet", "-am", "sting's own"]);
+    }
+    git(source, &["switch", "--quiet", "-c", "neo-feature"]);
+    let run = Run::new(
+        world,
+        &[(
+            source.to_path_buf(),
+            dest.to_path_buf(),
+            Some(dest.to_path_buf()),
+        )],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    run
+}
+
+/// P110 BESIDE (M2 round 2 item c: 10 i02 items refused
+/// `GIT_DESTINATION_DIVERGED`): a destination checkout that differs from
+/// the capture refuses diverged under `--adopt` with nothing written; with
+/// `--beside` alone (no `--adopt`) the verb refuses; `estate-diff --beside`
+/// names the beside landing. With `--adopt --beside SUFFIX` the destination
+/// checkout keeps every seat, HEAD, index and native ref (no branch is
+/// created for the source's `neo-feature`, which it lacks); the capture
+/// lands at `<dest>SUFFIX`, a linked worktree of the destination
+/// repository detached at the captured head; every captured ref is
+/// created as `refs/neo-20261016/<name>`; STATE records them as created;
+/// the receipt counts them; `closure-report` says `applied-beside`; a
+/// rerun is a journal no-op and the diff then says `beside=landed`.
+#[test]
+fn p110_a_diverged_checkout_lands_beside_and_the_live_one_stays() {
+    let (world, source, dest) = small();
+    let run = diverged(&world, &source, &dest, true);
+    let frozen = freeze_all(&dest);
+    let native = named_refs(&dest);
+    let ran = run.apply(&["--adopt"]);
+    assert!(
+        receipt(&receipts(&ran.stdout), &source)
+            .2
+            .contains("GIT_DESTINATION_DIVERGED"),
+        "{}",
+        ran.stdout
+    );
+    let ran = run.apply(&["--beside", SUFFIX]);
+    assert!(
+        !ran.ok && ran.stderr.contains("REQUIRED_FIELD_MISSING"),
+        "{}",
+        ran.stderr
+    );
+    assert!(!beside_of(&dest).exists());
+    let diff = run.diff(&["--beside", SUFFIX]);
+    let line = diff_line(&diff.stdout, &source).to_owned();
+    assert!(
+        line.contains("\"adopt\":\"diverged\"")
+            && line.contains(&format!(
+                "\"beside=landing:{}\"",
+                beside_of(&dest).display()
+            )),
+        "{line}"
+    );
+    assert!(!run.diff(&[]).stdout.contains("beside="));
+
+    let ran = run.apply(&["--adopt", "--beside", SUFFIX]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let row = receipt(&receipts(&ran.stdout), &source).clone();
+    assert_eq!(row.1, "workspace-beside", "{row:?}");
+    assert!(
+        row.2.contains("beside-landed=1")
+            && row.2.contains("beside-linked=1")
+            && row.2.contains("beside-ref-created=5")
+            && row.2.contains("beside-ref-kept=0"),
+        "{row:?}"
+    );
+    // The destination checkout: every seat and its whole .git but the new
+    // worktree administration, provenance and refs are as they were.
+    let moved: Vec<_> = freeze_all(&dest)
+        .into_iter()
+        .filter(|row| !frozen.contains(row))
+        .map(|row| row.0)
+        .filter(|path| {
+            let path = path.strip_prefix(&dest).unwrap();
+            !(path.starts_with(".git/worktrees")
+                || path.starts_with(".git/refs")
+                || path.starts_with(".git/objects")
+                || path.starts_with(".git/bulkload")
+                || path.starts_with(".git/logs/refs")
+                || path == Path::new(".git/packed-refs")
+                || path == Path::new(".git")
+                || path == Path::new(".git/logs")
+                || path == Path::new(".git/worktrees"))
+        })
+        .collect();
+    assert!(moved.is_empty(), "the beside landing moved {moved:?}");
+    let now = named_refs(&dest);
+    for (name, value) in &native {
+        assert_eq!(now.get(name), Some(value), "{name} moved");
+    }
+    assert!(!now.contains_key("refs/heads/neo-feature"), "{now:?}");
+    let carried = named_refs(&source);
+    let mut wanted = BTreeMap::new();
+    for (name, value) in &carried {
+        let rest = name.strip_prefix("refs/").unwrap();
+        wanted.insert(format!("refs/neo-20261016/{rest}"), value.clone());
+    }
+    for (name, value) in &wanted {
+        assert_eq!(now.get(name), Some(value), "{name}");
+    }
+    assert_eq!(now.len(), native.len() + carried.len(), "{now:?}");
+    let beside = beside_of(&dest);
+    assert_eq!(fs::read(beside.join("README")).unwrap(), b"LA-Mesh\n");
+    assert_eq!(fs::read(dest.join("README")).unwrap(), b"edited on sting\n");
+    assert_eq!(
+        git(&beside, &["rev-parse", "HEAD"]),
+        git(&source, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "HEAD"
+    );
+    assert_eq!(
+        fs::canonicalize(git(&beside, &["rev-parse", "--git-common-dir"]).trim()).unwrap(),
+        fs::canonicalize(dest.join(".git")).unwrap()
+    );
+    let record = beside_record(&run.applied);
+    assert!(record.pending.is_empty() && record.kept.is_empty());
+    let created: BTreeMap<String, String> = record.created.into_iter().collect();
+    assert_eq!(created, wanted);
+    let closure = run.closure();
+    assert!(
+        closure.stdout.contains("\"applied_beside\":1")
+            && closure
+                .stdout
+                .contains("\"disposition\":\"applied-beside\""),
+        "{}",
+        closure.stdout
+    );
+    let ran = run.apply(&["--adopt", "--beside", SUFFIX]);
+    assert_eq!(
+        receipt(&receipts(&ran.stdout), &source).1,
+        "previous-workspace-beside-not-revalidated"
+    );
+    assert_eq!(named_refs(&dest), now);
+    let diff = run.diff(&["--beside", SUFFIX]);
+    assert!(
+        diff_line(&diff.stdout, &source).contains("\"beside=landed:"),
+        "{}",
+        diff.stdout
+    );
+}
+
+/// The `.beside` record in `state`.
+fn beside_record(state: &Path) -> bulkload_agent::git_carry::beside::BesideRecord {
+    let found: Vec<PathBuf> = fs::read_dir(state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "beside"))
+        .collect();
+    assert_eq!(found.len(), 1, "{found:?}");
+    bulkload_agent::git_carry::beside::read_record(&found[0])
+        .unwrap()
+        .unwrap()
+}
+
+/// P111 BESIDE-OCCUPIED (M2 round 2 item c): a beside path that exists and
+/// is not this item's landing of this capture, or a ref named
+/// `refs/<ns>`, refuses `GIT_DESTINATION_OCCUPIED` with nothing written to
+/// the destination repository or the beside path; `estate-diff` says
+/// `beside=occupied`.
+#[test]
+fn p111_an_occupied_beside_path_refuses_and_nothing_is_written() {
+    for occupy in ["path", "namespace"] {
+        let (world, source, dest) = small();
+        let run = diverged(&world, &source, &dest, false);
+        let beside = beside_of(&dest);
+        if occupy == "path" {
+            fs::create_dir(&beside).unwrap();
+            fs::write(beside.join("operator.txt"), b"mine\n").unwrap();
+        } else {
+            git(&dest, &["update-ref", "refs/neo-20261016", "HEAD"]);
+        }
+        let frozen = (
+            freeze_all(&dest),
+            beside.exists().then(|| freeze_all(&beside)),
+            all_refs(&dest),
+        );
+        let diff = run.diff(&["--beside", SUFFIX]);
+        assert!(
+            diff_line(&diff.stdout, &source).contains("\"beside=occupied:"),
+            "{occupy}: {}",
+            diff.stdout
+        );
+        let ran = run.apply(&["--adopt", "--beside", SUFFIX]);
+        let row = receipt(&receipts(&ran.stdout), &source).clone();
+        assert_eq!(row.1, "refused", "{occupy}: {row:?}");
+        assert!(
+            row.2.contains("GIT_DESTINATION_OCCUPIED"),
+            "{occupy}: {row:?}"
+        );
+        assert_eq!(
+            (
+                freeze_all(&dest),
+                beside.exists().then(|| freeze_all(&beside)),
+                all_refs(&dest)
+            ),
+            frozen,
+            "{occupy}"
+        );
+    }
+}
+
+/// P112 BESIDE-EXISTING (M2 round 2 item c: the in-place lane made
+/// `<path>.neo-20261016` by hand for 9 of the 10 diverged i02 items): a
+/// standalone checkout already at the beside path, equal to the capture,
+/// is adopted in place under `--adopt --beside` (`estate-diff` says
+/// `beside=existing`); the capture's refs go in under `refs/neo-*/` of the
+/// destination repository; the rerun is a journal no-op. One that differs
+/// refuses `GIT_DESTINATION_OCCUPIED` (the beside path holds something
+/// else) with nothing written to either.
+#[test]
+fn p112_an_existing_standalone_beside_is_adopted_when_equal() {
+    for equal in [true, false] {
+        let (world, source, dest) = small();
+        let run = diverged(&world, &source, &dest, false);
+        let beside = beside_of(&dest);
+        copy_tree(&source, &beside);
+        if !equal {
+            fs::write(beside.join("README"), b"not the capture\n").unwrap();
+        }
+        let diff = run.diff(&["--beside", SUFFIX]);
+        assert!(
+            diff_line(&diff.stdout, &source).contains("\"beside=existing:"),
+            "{}",
+            diff.stdout
+        );
+        let frozen = (freeze_all(&dest), all_refs(&dest));
+        let ran = run.apply(&["--adopt", "--beside", SUFFIX]);
+        let row = receipt(&receipts(&ran.stdout), &source).clone();
+        if !equal {
+            assert_eq!(row.1, "refused", "{row:?}");
+            assert!(row.2.contains("GIT_DESTINATION_OCCUPIED"), "{row:?}");
+            assert_eq!((freeze_all(&dest), all_refs(&dest)), frozen);
+            continue;
+        }
+        assert_eq!(row.1, "workspace-beside", "{row:?}");
+        assert!(
+            row.2.contains("beside-standalone=1") && row.2.contains("beside-ref-created=5"),
+            "{row:?}"
+        );
+        assert!(beside
+            .join(".git/bulkload/v1/neo/workspace.landed")
+            .is_file());
+        let now = named_refs(&dest);
+        let created = now
+            .keys()
+            .filter(|name| name.starts_with("refs/neo-"))
+            .count();
+        assert_eq!(created, 5, "{now:?}");
+        assert_eq!(fs::read(dest.join("README")).unwrap(), b"edited on sting\n");
+        let ran = run.apply(&["--adopt", "--beside", SUFFIX]);
+        assert_eq!(
+            receipt(&receipts(&ran.stdout), &source).1,
+            "previous-workspace-beside-not-revalidated"
+        );
+    }
+}
+
+/// P113 BESIDE-EXCLUDE (review of #266, A1): a beside landing never
+/// appends to the live repository's shared `info/exclude` (it would change
+/// what the live checkout ignores): with the captured exclude holding a
+/// line the live one lacks, `--adopt --beside --exclude-union` refuses
+/// `GIT_IGNORE_POLICY_CONFLICT` and the live exclude, checkout and refs
+/// are unchanged; `estate-diff --beside` says `beside=ignore-policy-conflict`.
+/// When the live exclude already holds every captured line (in another
+/// order), the beside lands with nothing appended.
+#[test]
+fn p113_a_beside_landing_never_appends_to_the_live_exclude() {
+    for held in [false, true] {
+        let (world, source, dest) = small();
+        fs::create_dir_all(source.join(".git/info")).unwrap();
+        fs::write(source.join(".git/info/exclude"), b"a.log\nb.log\n").unwrap();
+        fs::create_dir_all(dest.join(".git/info")).unwrap();
+        let live_exclude: &[u8] = if held {
+            b"b.log\na.log\nc.log\n"
+        } else {
+            b"a.log\n"
+        };
+        fs::write(dest.join(".git/info/exclude"), live_exclude).unwrap();
+        fs::write(dest.join("operator.log"), b"untracked at the destination\n").unwrap();
+        let run = diverged(&world, &source, &dest, false);
+        let status = git(&dest, &["status", "--porcelain", "--untracked-files=all"]);
+        let frozen = (freeze_all(&dest), all_refs(&dest));
+        let diff = run.diff(&["--beside", SUFFIX]);
+        let line = diff_line(&diff.stdout, &source).to_owned();
+        let ran = run.apply(&["--adopt", "--exclude-union", "--beside", SUFFIX]);
+        let row = receipt(&receipts(&ran.stdout), &source).clone();
+        assert_eq!(
+            fs::read(dest.join(".git/info/exclude")).unwrap(),
+            live_exclude
+        );
+        if !held {
+            // Before `git status`, which refreshes the index itself.
+            assert_eq!((freeze_all(&dest), all_refs(&dest)), frozen);
+        }
+        assert_eq!(
+            git(&dest, &["status", "--porcelain", "--untracked-files=all"]),
+            status
+        );
+        if held {
+            assert!(line.contains("\"beside=landing:"), "{line}");
+            assert_eq!(row.1, "workspace-beside", "{row:?}");
+            assert!(!row.2.contains("exclude-appended"), "{row:?}");
+            continue;
+        }
+        assert!(line.contains("\"beside=ignore-policy-conflict:"), "{line}");
+        assert_eq!(row.1, "refused", "{row:?}");
+        assert!(row.2.contains("GIT_IGNORE_POLICY_CONFLICT"), "{row:?}");
+        assert!(!beside_of(&dest).exists());
+    }
+}
+
+/// P114 BESIDE-KEPT (review of #266, B4): a ref already at
+/// `refs/neo-20261016/<name>` with another value is kept, never moved;
+/// the beside checkout lands and the other refs go in, but the item is
+/// refused `GIT_DESTINATION_OCCUPIED` (STATE records the kept ref) and
+/// `closure-report` counts it pending review, never `applied-beside`.
+#[test]
+fn p114_a_kept_namespace_ref_keeps_the_item_refused() {
+    let (world, source, dest) = small();
+    let run = diverged(&world, &source, &dest, false);
+    git(
+        &dest,
+        &[
+            "update-ref",
+            "refs/neo-20261016/heads/neo-feature",
+            "HEAD~0",
+        ],
+    );
+    let other = git(&dest, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(
+        &source,
+        &["commit", "--quiet", "--allow-empty", "-m", "neo moved"],
+    );
+    settle();
+    run.capture();
+    let ran = run.apply(&["--adopt", "--beside", SUFFIX]);
+    let row = receipt(&receipts(&ran.stdout), &source).clone();
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(row.2.contains("GIT_DESTINATION_OCCUPIED"), "{row:?}");
+    assert_eq!(
+        git(&dest, &["rev-parse", "refs/neo-20261016/heads/neo-feature"]).trim(),
+        other
+    );
+    let record = beside_record(&run.applied);
+    assert_eq!(record.kept.len(), 1, "{record:?}");
+    assert_eq!(record.created.len(), 4, "{record:?}");
+    let closure = run.closure();
+    assert!(
+        closure.stdout.contains("\"applied_beside\":0")
+            && closure.stdout.contains("\"refused_pending_review\":1"),
+        "{}",
+        closure.stdout
+    );
 }

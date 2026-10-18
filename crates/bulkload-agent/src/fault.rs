@@ -98,6 +98,9 @@
 //! | `receive.after_decide` | one entry decided, no content received for it |
 //! | `receive.after_chunks` | one file's chunks verified, covering it, and written to its temporary |
 //! | `receive.after_end` | an entry's `End` handled; its output may still be waiting on its group |
+//! | `receive.prefix_before_append` | a grown destination file's prefix proven and its tail received into a temporary; the file untouched (M2r2 A-103) |
+//! | `receive.prefix_after_append` | the tail written into the destination file, not yet flushed; no record |
+//! | `receive.prefix_after_flush` | the extended file flushed; its record not yet queued |
 //!
 //! Git estate capture publication, in `estate::capture_item` (Q42 lane L7,
 //! P70). The `{bundle}.reuse` manifest is published after the bundle and its
@@ -287,6 +290,12 @@ pub enum Point {
     ReceiveAfterChunks,
     /// `receive.after_end`
     ReceiveAfterEnd,
+    /// `receive.prefix_before_append`
+    ReceivePrefixBeforeAppend,
+    /// `receive.prefix_after_append`
+    ReceivePrefixAfterAppend,
+    /// `receive.prefix_after_flush`
+    ReceivePrefixAfterFlush,
     /// `estate.after_bundle_publish`
     EstateAfterBundlePublish,
     /// `estate.before_reuse_sidecar`
@@ -342,6 +351,21 @@ pub enum Point {
     /// (0755, synced), not yet recorded in STATE; nothing landed (M2
     /// finding 1).
     EstateApplyParentsMade,
+    /// `estate.apply.exclude_intent`: an `--exclude-union` append recorded
+    /// in STATE as an intent; the common exclude not yet written (M2
+    /// round 2, item 2).
+    EstateApplyExcludeIntent,
+    /// `estate.apply.exclude_appended`: the common exclude replaced by its
+    /// union (synced); the record still says intent.
+    EstateApplyExcludeAppended,
+    /// `estate.apply.beside_refs`: a beside landing (M2 round 2 item c)
+    /// landed and its refs created under `refs/<ns>/`; its STATE record
+    /// still names them pending and the item's journal is not written.
+    EstateApplyBesideRefs,
+    /// `estate.carry.recorded`: `estate-carry-files` landed an item's
+    /// bytes and wrote its carry record; the outcome record still says
+    /// `CAPTURE_ABSENT` (M2r2 b).
+    EstateCarryRecorded,
     /// `reseat.after_temp_seal`
     ReseatAfterTempSeal,
     /// `reseat.after_publish`
@@ -366,6 +390,16 @@ pub enum Point {
     ReseatAfterUndoCwd,
     /// `reseat.after_undo_exchange`
     ReseatAfterUndoExchange,
+    /// `reseat.after_replace_intent`: a `--replace-archived-dest`
+    /// replacement's intent row durable (no placement row yet), the landed
+    /// copy staged and sealed, nothing exchanged (A-106).
+    ReseatAfterReplaceIntent,
+    /// `reseat.after_replace_exchange`: the landed copy at the path, the
+    /// destination's link under the temporary name.
+    ReseatAfterReplaceExchange,
+    /// `reseat.before_replace_done`: the link removed and the directory
+    /// sealed; the row not yet `done`, no placement row written.
+    ReseatBeforeReplaceDone,
     /// `estate.handoff.after_intent`: the hand-off intent durable; no
     /// target written (TIN-6569, OI-1003-Q183).
     EstateHandoffAfterIntent,
@@ -388,7 +422,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 72] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -410,6 +444,9 @@ impl Point {
         Self::ReceiveAfterDecide,
         Self::ReceiveAfterChunks,
         Self::ReceiveAfterEnd,
+        Self::ReceivePrefixBeforeAppend,
+        Self::ReceivePrefixAfterAppend,
+        Self::ReceivePrefixAfterFlush,
         Self::EstateAfterBundlePublish,
         Self::EstateBeforeReuseSidecar,
         Self::EstateAfterReuseSidecar,
@@ -433,6 +470,10 @@ impl Point {
         Self::EstateAdoptAfterLedger,
         Self::EstateAdoptBareStaged,
         Self::EstateApplyParentsMade,
+        Self::EstateApplyExcludeIntent,
+        Self::EstateApplyExcludeAppended,
+        Self::EstateApplyBesideRefs,
+        Self::EstateCarryRecorded,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
         Self::ReseatAfterExtendIntent,
@@ -445,6 +486,9 @@ impl Point {
         Self::ReseatAfterRegularizeExchange,
         Self::ReseatAfterUndoCwd,
         Self::ReseatAfterUndoExchange,
+        Self::ReseatAfterReplaceIntent,
+        Self::ReseatAfterReplaceExchange,
+        Self::ReseatBeforeReplaceDone,
         Self::EstateHandoffAfterIntent,
         Self::EstateHandoffAfterTemp,
         Self::EstateHandoffAfterExchange,
@@ -478,6 +522,9 @@ impl Point {
             Self::ReceiveAfterDecide => "receive.after_decide",
             Self::ReceiveAfterChunks => "receive.after_chunks",
             Self::ReceiveAfterEnd => "receive.after_end",
+            Self::ReceivePrefixBeforeAppend => "receive.prefix_before_append",
+            Self::ReceivePrefixAfterAppend => "receive.prefix_after_append",
+            Self::ReceivePrefixAfterFlush => "receive.prefix_after_flush",
             Self::EstateAfterBundlePublish => "estate.after_bundle_publish",
             Self::EstateBeforeReuseSidecar => "estate.before_reuse_sidecar",
             Self::EstateAfterReuseSidecar => "estate.after_reuse_sidecar",
@@ -501,6 +548,10 @@ impl Point {
             Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
             Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
             Self::EstateApplyParentsMade => "estate.apply.parents_made",
+            Self::EstateApplyExcludeIntent => "estate.apply.exclude_intent",
+            Self::EstateApplyExcludeAppended => "estate.apply.exclude_appended",
+            Self::EstateApplyBesideRefs => "estate.apply.beside_refs",
+            Self::EstateCarryRecorded => "estate.carry.recorded",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",
             Self::ReseatAfterExtendIntent => "reseat.after_extend_intent",
@@ -513,6 +564,9 @@ impl Point {
             Self::ReseatAfterRegularizeExchange => "reseat.after_regularize_exchange",
             Self::ReseatAfterUndoCwd => "reseat.after_undo_cwd",
             Self::ReseatAfterUndoExchange => "reseat.after_undo_exchange",
+            Self::ReseatAfterReplaceIntent => "reseat.after_replace_intent",
+            Self::ReseatAfterReplaceExchange => "reseat.after_replace_exchange",
+            Self::ReseatBeforeReplaceDone => "reseat.before_replace_done",
             Self::EstateHandoffAfterIntent => "estate.handoff.after_intent",
             Self::EstateHandoffAfterTemp => "estate.handoff.after_temp",
             Self::EstateHandoffAfterExchange => "estate.handoff.after_exchange",

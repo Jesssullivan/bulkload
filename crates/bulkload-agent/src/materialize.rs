@@ -46,9 +46,10 @@
 //! ([`owned_output`]). Anything else stays no-clobber and refuses
 //! `DESTINATION_OCCUPIED`.
 //!
-//! The replacement is the exchange design the formal model checks
-//! (`docs/formal`, `MC_wp0d_exchange`), not check-then-rename, which leaves
-//! a window a third party's write falls into (`MC_wp0d_check_rename`). In
+//! The replacement is the exchange design the formal model checked
+//! (`docs/formal`, `MC_wp0d_exchange`; deleted 2026-10-17, R-C843), not
+//! check-then-rename, which leaves a window a third party's write falls
+//! into (`MC_wp0d_check_rename`). In
 //! the group's commit ([`PublishSink`]):
 //!
 //! 1. the staged file is sealed (in a [`crate::io::durable::batched`]
@@ -1481,6 +1482,30 @@ impl Destination {
         open_regular(&parent, &leaf)
     }
 
+    /// Open an existing output for appending by relative path, component by
+    /// component, following no link (M2r2 A-103: a verified byte prefix of
+    /// its source is extended in place). The caller proves it is the file
+    /// it read, by identity.
+    ///
+    /// # Errors
+    /// Refuses a missing output, a non-regular node, a file this user may
+    /// not write, or an unsafe ancestor.
+    pub(crate) fn open_output_append(&self, rel_path: &[u8]) -> Result<File> {
+        let (parent, leaf) = self.parent(rel_path)?;
+        let file = File::from(
+            crate::io::sys::open_append_at(&parent, &leaf)
+                .refuse_at("materialize::open_output_append")?,
+        );
+        if !file
+            .metadata()
+            .refuse_at("materialize::open_output_append")?
+            .is_file()
+        {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        Ok(file)
+    }
+
     fn shared_parent(&self, path: &[u8]) -> Result<(Arc<File>, CString)> {
         let directory = path
             .iter()
@@ -2349,6 +2374,7 @@ impl PublishSink {
                         rel_path: record.rel_path,
                         identity,
                         racy: record.racy,
+                        extended: None,
                         hints: record.hints,
                     });
                     settled.push((intent, false));
@@ -2595,6 +2621,7 @@ impl PublishSink {
                             rel_path: record.rel_path,
                             identity,
                             racy: record.racy,
+                            extended: None,
                             hints: record.hints,
                         });
                     }
@@ -3640,6 +3667,7 @@ mod tests {
                     rel_path: name.as_bytes().to_vec(),
                     identity: crate::freshness::StatIdentity::from_metadata(&metadata),
                     racy: false,
+                    extended: None,
                     hints: Vec::new(),
                 },
                 file,
