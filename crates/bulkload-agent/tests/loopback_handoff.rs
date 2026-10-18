@@ -736,7 +736,13 @@ fn a_cross_process_session_extends_a_grown_prefix() {
     );
     assert_eq!(counted.get(Counter::DestPrefixExtended), 1);
     assert_eq!(counted.get(Counter::DestPrefixAppendWrite), tail);
-    assert_eq!(counted.get(Counter::DestVerifyRead), prior as u64);
+    // The held prefix read once, and the straddling chunk re-read after the
+    // append (at most 256 KiB).
+    let verified = counted.get(Counter::DestVerifyRead);
+    assert!(
+        verified > prior as u64 && verified <= prior as u64 + (256 << 10),
+        "{verified}"
+    );
     assert_eq!(
         counted.get(Counter::HashWireVerify),
         stats.bytes_received,
