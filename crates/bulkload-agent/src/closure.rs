@@ -74,8 +74,11 @@
 //! items' current captures omitted, from each capture's `.omissions`
 //! sidecar (`items_known`, `items_unknown`, `roots`, `entries`, `bytes`,
 //! one row per root with `item`, `path`, `entries` and `bytes`, and the
-//! `unknown` items whose capture predates the sidecar, never counted as
-//! zero). Nothing else changes from v3: rows, totals, dispositions and the
+//! `unknown` items, never counted as zero). A capture from before the
+//! sidecar is read in band from its bundle's header; only with
+//! `closure-report --omissions-from-destination` is a list the header names
+//! read from the destination repository's objects (`git_carry::in_band`,
+//! M2 round 2, d). Nothing else changes from v3: rows, totals, dispositions and the
 //! gate are as before, and omissions are outside every one of them. In v3
 //! (unchanged): a transfer row names its `kind` (an estate row prints as in
 //! v2), and adds `transfer`, `path`, `transfer_outcome` and `sqlite_code`, `disposition` can be `covered`, and the
@@ -396,6 +399,10 @@ pub struct Omissions {
     pub known: u64,
     /// Items whose omissions are unknown.
     pub unknown: Vec<String>,
+    /// How many unknown items each reason accounts for (M2 round 2, d):
+    /// printed by the binary as an `omissions-unknown` line, outside the
+    /// v4 JSON.
+    pub unknown_because: std::collections::BTreeMap<String, u64>,
     /// One row per omitted root: item, path, entries, bytes.
     pub rows: Vec<(String, Vec<u8>, u64, u64)>,
 }
@@ -438,19 +445,23 @@ impl Report {
             ..Self::default()
         };
         for entry in &ledger.entries {
-            match &entry.omitted {
-                Some(omitted) => {
-                    report.omissions.known += 1;
-                    report.omissions.rows.extend(omitted.iter().map(|root| {
-                        (
-                            entry.item.clone(),
-                            root.rel_path.clone(),
-                            root.entries,
-                            root.bytes,
-                        )
-                    }));
-                }
-                None => report.omissions.unknown.push(entry.item.clone()),
+            if let Some(omitted) = &entry.omitted {
+                report.omissions.known += 1;
+                report.omissions.rows.extend(omitted.iter().map(|root| {
+                    (
+                        entry.item.clone(),
+                        root.rel_path.clone(),
+                        root.entries,
+                        root.bytes,
+                    )
+                }));
+            } else {
+                report.omissions.unknown.push(entry.item.clone());
+                *report
+                    .omissions
+                    .unknown_because
+                    .entry(entry.unknown_because.unwrap_or("unknown").to_owned())
+                    .or_default() += 1;
             }
             report.rows.push(Row {
                 item: entry.item.clone(),
@@ -2020,6 +2031,7 @@ mod tests {
             }),
             journal,
             capture,
+            unknown_because: None,
             omitted: None,
         }
     }
@@ -2916,6 +2928,7 @@ mod tests {
     #[test]
     fn omitted_rebuildable_roots_are_counted_and_unknown_is_not_zero() {
         let known = LedgerEntry {
+            unknown_because: None,
             omitted: Some(vec![
                 crate::git_carry::RebuildableOmission {
                     rel_path: b"node_modules".to_vec(),
@@ -2936,6 +2949,7 @@ mod tests {
             )
         };
         let none = LedgerEntry {
+            unknown_because: None,
             omitted: Some(Vec::new()),
             ..entry(
                 'b',
@@ -3687,6 +3701,7 @@ mod tests {
                     record: outcome,
                     journal,
                     capture: Some(item(index)),
+                    unknown_because: None,
                     omitted: None,
                 });
                 let Kind::Typed(code, how) = kind else {
