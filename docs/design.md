@@ -1336,6 +1336,39 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   `git-export` and the other strict exports still refuse any drift.
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
+- A `.git` gitdir-pointer file below the checkout that does not name its
+  own administration refuses before any byte is read, by that directory's
+  path (M2r2 item 6; each was a bare `GIT_INVENTORY_MALFORMED`).
+  The pointer is read as Git reads it: raw bytes after `gitdir: `, with
+  trailing CR and LF stripped. A registered path is read against the
+  administration directory.
+  - `GIT_NEST_POINTER_STALE` covers two cases:
+    - It names an administration absent on this host (missing, not a
+      directory, or reached through a regular file). This happens with a
+      copy of a pruned linked worktree, one carried from another host, a
+      submodule whose `.git/modules` entry was removed, or a pointer through
+      a dangling symlink or an absent mount. Git does not read such a
+      directory as a repository.
+    - It names a worktree administration of this repository whose
+      registered checkout exists and points back to it. The directory is a
+      copy of that live worktree, and Git would act on the live worktree's
+      HEAD and index through it.
+  - `GIT_NEST_WORKTREE_MOVED` covers the registered checkout being absent:
+    a worktree moved without `git worktree repair`. Git still works there,
+    and `git worktree repair` run in it re-registers it.
+
+  The census stops at the first such directory, so a run names one; a
+  rerun names the next. The remedy is the operator's, in the source, and
+  depends on the case:
+  - for a leftover copy, remove or rename its pointer;
+  - for a submodule, restore its administration;
+  - for a mount, bring it back;
+  - for a moved worktree, repair it.
+
+  Whether to carry an absent-administration directory as plain files
+  instead is an open question. The pointer would have to be omitted or
+  neutralised and recorded, because restoring it could reattach to a real
+  administration on the destination.
 - An object-store rewrite is drift too (WP1, S5). The export reads the
   source's pack listing with its authority; when a Git child of the pass
   fails and that listing has changed (a `gc`, `repack` or `prune` racing
