@@ -1763,7 +1763,24 @@ miss (#87).
     `SqliteSidecar`, and its outcome is its base's, resolved when the session
     ends: covered when the base was published from a snapshot or reused as
     one, refused by name (`SQLITE_STATE_CHANGED`) otherwise. A sidecar with
-    no base is offered and refused by name, as in v5. A sidecar listed and
+    no base is offered and refused by name, as in v5. *A Git ref or reflog
+    named like a sidecar is exempt* (M2r2, 2026-10-17). A branch named
+    `fix-journal`, `fix-wal` or `fix-shm` has a loose ref and a reflog of
+    that name beside the ref of its base name; the in-place run's cmux pull
+    refused three such reflogs `SQLITE_STATE_CHANGED`. The exemption is
+    decided by content, for a path with a directory named `refs` or `logs`
+    above it (any administration: `.git`, a bare repository whatever its
+    name, a submodule's `modules/<name>`, a linked worktree's). The file
+    must read as a ref or reflog: `ref: `, or a 40- or 64-digit lowercase
+    hex id followed by a newline or a space. Its base-named neighbour, when
+    present, must not carry the `SQLite` magic. Such a file is offered and
+    carried as an ordinary file, and its base is never offered as a
+    database beside a `-wal`. Anything else under `refs/` or `logs/` keeps
+    the sidecar rules: an empty file, a `SQLite` journal, WAL or
+    shared-memory file, text that is not a ref, or anything unreadable.
+    The prefilter is by path, so no other sidecar is read for this; a
+    candidate's check reads at most 80 bytes of it and 16 of its base
+    (`source_sniff_bytes`). A sidecar listed and
     gone before its stat (a live rollback-mode store's `-journal`) is still
     its base's sidecar, not an `IO` refusal. A base without the
     database magic (an encrypted store) offered beside a `-wal` that holds
