@@ -48,9 +48,13 @@ pub const FILE: &str = "reseat.sqlite";
 /// first build, `550396c`: window digests, inode-only supersede intents)
 /// is refused, never read as this one; version 2 (`8a89f9a`) is migrated
 /// in place (new tables and session columns only).
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 /// Version 2's tables are a subset of version 3's.
 const MIGRATE_FROM: i64 = 2;
+/// Version 3 lacks only `regularized.kind` (A-106): migrated in place. A
+/// build of version 3 refuses a version 4 ledger, so it never reads a
+/// replacement as a regularization (review B11).
+const MIGRATE_FROM_V3: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS placement(
@@ -378,7 +382,7 @@ impl Ledger {
             |row| row.get(0),
         ))?;
         let fresh = version == 0 && tables == 0;
-        if !fresh && version != VERSION && version != MIGRATE_FROM {
+        if !fresh && version != VERSION && version != MIGRATE_FROM && version != MIGRATE_FROM_V3 {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         sql(conn.execute_batch(SCHEMA))?;
@@ -453,14 +457,14 @@ impl Ledger {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ))?;
         let version: i64 = sql(conn.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
-        if version != VERSION && version != MIGRATE_FROM {
+        if version != VERSION && version != MIGRATE_FROM && version != MIGRATE_FROM_V3 {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         Ok(Some(Self {
             conn,
             pass: 0,
             read_only: true,
-            v3: version == VERSION,
+            v3: version >= MIGRATE_FROM_V3,
             token: String::new(),
         }))
     }
@@ -953,6 +957,57 @@ impl Ledger {
             ],
         ))
         .map(drop)
+    }
+
+    /// Mark a replacement `done` and write the placement row that names
+    /// the landed file at its path, in one commit (review B1): the row of
+    /// another landing that kept the link (`occupied`) is replaced by it.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit; the refusal of a
+    /// read-only or version 2 ledger.
+    pub fn put_replace_done(&self, regular: &Regular, placement: &Placement) -> Result<()> {
+        if !self.v3 || self.read_only || !regular.replace {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = self.put_regular(regular).and_then(|()| self.put(placement));
+        match outcome {
+            Ok(()) => sql(self.conn.execute_batch("COMMIT")),
+            Err(refusal) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Mark a replacement `done` that a crash left in flight, dropping in
+    /// the same commit any placement row of its path that is not this
+    /// ledger's own (`ours`, `adopted`, `continued`): the path now holds
+    /// the landed file, decided afresh by the pass (review B1).
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn settle_replace_done(&self, regular: &Regular) -> Result<()> {
+        if !self.v3 || self.read_only || !regular.replace {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = self.put_regular(regular).and_then(|()| {
+            sql(self.conn.execute(
+                "DELETE FROM placement WHERE dest = ?1
+                 AND state NOT IN ('ours', 'adopted', 'continued')",
+                params![blob(&regular.link)],
+            ))
+            .map(drop)
+        });
+        match outcome {
+            Ok(()) => sql(self.conn.execute_batch("COMMIT")),
+            Err(refusal) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(refusal)
+            }
+        }
     }
 
     /// Delete the placement row of `dest` (a replacement that never took

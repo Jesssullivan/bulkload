@@ -563,6 +563,34 @@ fn space(options: &Options, wants: &[(&Path, u64)]) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a `--replace-archived-dest` root that overlaps the live state.
+///
+/// `FIELD_DOMAIN_VIOLATION` before anything is read or written when a root
+/// equals, contains or is under the real destination `.claude` or
+/// `.codex`, or contains the destination home: a swap there would happen
+/// inside the archive, or the root would take the live state itself for
+/// an archive (review A1).
+///
+/// # Errors
+/// `FIELD_DOMAIN_VIOLATION`.
+pub fn archive_roots_disjoint(options: &Options) -> Result<()> {
+    let live: Vec<PathBuf> = [&options.dest_claude, &options.dest_codex]
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect();
+    let home = std::fs::canonicalize(&options.dest_home).ok();
+    for root in &options.replace_archived {
+        if live
+            .iter()
+            .any(|dest| root.starts_with(dest) || dest.starts_with(root))
+            || home.as_ref().is_some_and(|home| home.starts_with(root))
+        {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+    }
+    Ok(())
+}
+
 /// Settle the regularizations and archive replacements a crash left in
 /// flight, before any placement, whether or not this pass regularizes.
 fn settle_intents(
@@ -571,12 +599,12 @@ fn settle_intents(
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    for (on, dest) in [
-        (options.claude, &options.dest_claude),
-        (options.codex, &options.dest_codex),
+    for (on, dest, tool) in [
+        (options.claude, &options.dest_claude, claude::TOOL),
+        (options.codex, &options.dest_codex, codex::TOOL),
     ] {
         if let (true, Ok(real)) = (on, std::fs::canonicalize(dest)) {
-            regularize::settle_intents(&real, ledger, summary, emit)?;
+            regularize::settle_intents(&real, tool, ledger, summary, emit)?;
         }
     }
     Ok(())
@@ -587,7 +615,9 @@ fn settle_intents(
 /// then the summary line.
 ///
 /// # Errors
-/// Before anything is written: `RESEAT_LOCKED` when another run holds a
+/// Before anything is written: `FIELD_DOMAIN_VIOLATION` for a
+/// `--replace-archived-dest` root that overlaps the live destination
+/// ([`archive_roots_disjoint`]), `RESEAT_LOCKED` when another run holds a
 /// destination root or STATE, `RESEAT_LANDING_ABSENT` when a landed tree
 /// the run covers is absent, `RESEAT_RETENTION_UNSAFE` when the
 /// destination's Claude Code would delete a re-seated file within the
@@ -596,6 +626,7 @@ fn settle_intents(
 /// free-space floor. Then ledger, I/O and schema refusals. A session's own
 /// refusal is its line's `refused` code, never the run's.
 pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<Summary> {
+    archive_roots_disjoint(options)?;
     let lanes = Lanes::new(options);
     let mut summary = Summary::default();
     let mut held = Held(Vec::new());
@@ -713,7 +744,8 @@ pub fn undo(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Resu
     lock_root(&mut held, &options.dest_codex)?;
     lock_state(&mut held, &options.state)?;
     let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "undo")?;
-    let links = regularize::undo(&ledger, emit)?;
+    let codex_root = std::fs::canonicalize(&options.dest_codex).ok();
+    let links = regularize::undo(&ledger, codex_root.as_deref(), emit)?;
     let rows = codex::undo(&mut ledger, emit)?;
     emit(&format!(
         "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows}}}"

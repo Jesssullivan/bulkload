@@ -378,14 +378,14 @@ pub enum Point {
     /// `reseat.after_undo_exchange`
     ReseatAfterUndoExchange,
     /// `reseat.after_replace_intent`: a `--replace-archived-dest`
-    /// replacement's intent and placement rows durable, the landed copy
-    /// staged, nothing exchanged (A-106).
+    /// replacement's intent row durable (no placement row yet), the landed
+    /// copy staged and sealed, nothing exchanged (A-106).
     ReseatAfterReplaceIntent,
     /// `reseat.after_replace_exchange`: the landed copy at the path, the
     /// destination's link under the temporary name.
     ReseatAfterReplaceExchange,
     /// `reseat.before_replace_done`: the link removed and the directory
-    /// sealed; the row not yet `done`.
+    /// sealed; the row not yet `done`, no placement row written.
     ReseatBeforeReplaceDone,
     /// `estate.handoff.after_intent`: the hand-off intent durable; no
     /// target written (TIN-6569, OI-1003-Q183).

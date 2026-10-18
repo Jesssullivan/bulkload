@@ -1521,6 +1521,8 @@ scenarios! {
     reseat_archived_after_exchange => ReseatAfterReplaceExchange: 1, Reseat::Archived;
     reseat_archived_before_done => ReseatBeforeReplaceDone: 1, Reseat::Archived;
     reseat_archived_undo_after_exchange => ReseatAfterUndoExchange: 1, Reseat::ArchivedUndo;
+    reseat_archived_moved_after_exchange => ReseatAfterReplaceExchange: 1, Reseat::ArchivedMoved;
+    reseat_archived_moved_before_done => ReseatBeforeReplaceDone: 1, Reseat::ArchivedMoved;
     // The hand-off block (TIN-6569): every point of a render, a clear and
     // converge's lift, each finished by the rerun.
     estate_handoff_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::Render;

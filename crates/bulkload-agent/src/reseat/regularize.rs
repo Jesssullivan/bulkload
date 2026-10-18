@@ -197,8 +197,14 @@ impl Outcome {
 }
 
 fn line(link: &Path, outcome: &Outcome) -> String {
+    line_of("regularize", TOOL, link, outcome)
+}
+
+/// A report line of `kind` (`regularize`, or `replace` for an archive
+/// replacement, A-106) for `tool`.
+fn line_of(kind: &str, tool: &str, link: &Path, outcome: &Outcome) -> String {
     format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"regularize\",\"tool\":\"{TOOL}\",\"link\":{},\"outcome\":\"{}\",\"refused\":{},\"kept\":{}}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"{kind}\",\"tool\":\"{tool}\",\"link\":{},\"outcome\":\"{}\",\"refused\":{},\"kept\":{}}}",
         json_string(&link.to_string_lossy()),
         outcome.word,
         outcome
@@ -452,6 +458,13 @@ impl<'a> Site<'a> {
             }
             self.seal()?;
             row.state = RegularState::Done;
+            if row.replace {
+                // A replacement: done, and any row of the path that is not
+                // this ledger's dropped in the same commit (review B1).
+                self.ledger.settle_replace_done(&row)?;
+                counters::bump(Counter::ReseatArchivedReplaced);
+                return Ok(Outcome::new("replaced-archived", None));
+            }
             self.ledger.put_regular(&row)?;
             return Ok(Outcome::new("regularized", None));
         }
@@ -463,7 +476,14 @@ impl<'a> Site<'a> {
             self.seal()?;
             let kept = self.keep()?;
             self.forget(&row)?;
-            return Ok(Outcome::raced("raced-restored", kept));
+            return Ok(Outcome::raced(
+                if row.replace {
+                    "replace-raced-restored"
+                } else {
+                    "raced-restored"
+                },
+                kept,
+            ));
         }
         // Both written (or the link gone): the copy stays at the path, the
         // archive is untouched. The row keeps the staged identity: `--undo`
@@ -475,7 +495,14 @@ impl<'a> Site<'a> {
         self.seal()?;
         row.state = RegularState::Raced;
         self.ledger.put_regular(&row)?;
-        Ok(Outcome::raced("raced-kept", None))
+        Ok(Outcome::raced(
+            if row.replace {
+                "replace-raced-kept"
+            } else {
+                "raced-kept"
+            },
+            None,
+        ))
     }
 
     /// Finish what a crash left under an `intent` row; `None` when the
@@ -685,7 +712,7 @@ pub fn regularize(
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    settle_intents(root, ledger, summary, emit)?;
+    settle_intents(root, TOOL, ledger, summary, emit)?;
     for link in links(root)? {
         if ledger.regular(&link)?.is_some() {
             // Regularized, raced or undone: never again by itself.
@@ -721,6 +748,7 @@ pub fn regularize(
 /// Ledger and I/O refusals.
 pub fn settle_intents(
     root: &Path,
+    tool: &str,
     ledger: &Ledger,
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
@@ -729,11 +757,22 @@ pub fn settle_intents(
         if row.state == RegularState::Intent && row.link.starts_with(root) {
             if let Some(site) = Site::new(ledger, &row.link)? {
                 if let Some(outcome) = site.settle_intent(row.clone())? {
-                    *summary
-                        .rows
-                        .entry(format!("link-{}", outcome.word))
-                        .or_default() += 1;
-                    emit(&line(&row.link, &outcome))?;
+                    if row.replace {
+                        // A replacement a crash interrupted, finished (or
+                        // put back): reported as one (review B2).
+                        if outcome.word == "replaced-archived" {
+                            summary.file(tool, super::place::Outcome::ReplacedArchived);
+                        } else {
+                            *summary.rows.entry(outcome.word.to_owned()).or_default() += 1;
+                        }
+                        emit(&line_of("replace", tool, &row.link, &outcome))?;
+                    } else {
+                        *summary
+                            .rows
+                            .entry(format!("link-{}", outcome.word))
+                            .or_default() += 1;
+                        emit(&line(&row.link, &outcome))?;
+                    }
                 }
             }
         }
@@ -745,7 +784,11 @@ pub fn settle_intents(
 ///
 /// # Errors
 /// Ledger and I/O refusals; a link's own outcome is its line.
-pub fn undo(ledger: &Ledger, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<u64> {
+pub fn undo(
+    ledger: &Ledger,
+    codex_root: Option<&Path>,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<u64> {
     let mut undone = 0;
     for row in ledger.regulars()? {
         let Some(site) = Site::new(ledger, &row.link)? else {
@@ -772,8 +815,14 @@ pub fn undo(ledger: &Ledger, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result
             // there any more.
             ledger.delete_placement(&row.link)?;
         }
+        // A Codex rollout's replacement is the codex tool's (review A5a).
+        let tool = if codex_root.is_some_and(|root| row.link.starts_with(root)) {
+            "codex"
+        } else {
+            TOOL
+        };
         emit(&format!(
-            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo\",\"tool\":\"{TOOL}\",\"link\":{},\"target\":{},\"outcome\":\"{}\",\"refused\":{}}}",
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo\",\"tool\":\"{tool}\",\"link\":{},\"target\":{},\"outcome\":\"{}\",\"refused\":{}}}",
             json_string(&row.link.to_string_lossy()),
             json_string(&row.target.to_string_lossy()),
             outcome.word,

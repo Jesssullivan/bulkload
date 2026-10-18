@@ -324,15 +324,21 @@ SUBCOMMANDS:
                 version wins, the fork stays in the archive): a destination
                 transcript, subagent sidecar or rollout that is a symlink
                 whose fully resolved target is a regular file under ROOT's
-                real path, and whose landed file differs from that target,
+                real path, and whose landed file is a fork of that target,
                 is replaced by the landed file (staged beside it with its
                 mtime, sealed, exchanged atomically, directory sealed),
                 outcome replaced-archived; the link text, the target's real
                 path, identity and BLAKE3 are ledgered first, the target is
                 verified unchanged before and after the exchange and never
                 written or removed; an equal landing leaves the link
-                (occupied); links into ROOT are not regularized; --check
-                counts replaced_archived and replace_pending. --undo
+                (occupied), a landing that is a prefix of the target too
+                (dest-ahead), and a target a process holds open stays
+                (occupied); a ROOT overlapping the live .claude or .codex
+                (or containing DEST_HOME) is refused FIELD_DOMAIN_VIOLATION;
+                links into ROOT are not regularized; --check counts
+                replaced_archived, replace_pending, replace_equal_size and
+                replace_proved. Run it, and its --undo, with no live session
+                on the destination. --undo
                 puts back every symlink and old cwd this STATE changed, where
                 the destination still holds exactly what re-seat wrote and
                 the archive target holds the recorded bytes (else
