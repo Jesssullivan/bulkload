@@ -9,11 +9,13 @@
 //! source; the source holding a tip of the prior, [`super::chain`]). The
 //! decision is a reuse hit, a typed refusal (R33: refusals are values), or
 //! an export with a basis, a chain depth, a rebase and a reuse offer. The
-//! variant names are the labels of the closed unions in
+//! variant names are the labels of the closed unions of the deleted
 //! `docs/formal/catalogue/Types.dhall`.
 //!
-//! The reference copy is `decide` in `docs/formal/hs/GitCarryCore.hs`, and
-//! its pinned rows (`tests/data/decide_rows.tsv`) pin this function: P67
+//! The reference copy was `decide` in `docs/formal/hs/GitCarryCore.hs`,
+//! deleted with the catalogue under R-C843 (2026-10-17); its pinned rows
+//! (`tests/data/decide_rows.tsv`) are now a frozen fixture and pin this
+//! function: P67
 //! checks every row of every lane (`v1`, `L6b`, `L8`), drawing each "-"
 //! input at random. The policy is a column of each row, so every policy the
 //! reference has is checked here (L6b's chain under a plan base, Q46's root

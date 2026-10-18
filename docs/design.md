@@ -1295,7 +1295,7 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   the flattened restore advertises exactly the head's refs: none of the
   link's drift markers. The drifted bundle itself still never applies.
   Since Q42 L6a (OI-1003-Q43) these choices are one pure, total function,
-  `git_carry::decide::decide`, which P67 pins to the Haskell reference's rows.
+  `git_carry::decide::decide`, which P67 pins to frozen rows (`tests/data/decide_rows.tsv`, rendered by the Haskell reference until R-C843 deleted it on 2026-10-17).
 - A whole capture is reused (`capture-reused-after-census`) only when its key
   is unchanged and no seat is racy against its recorded pass start. A capture with a racy seat, or with no recorded pass start
   (records from before the start was recorded), takes the per-seat path
@@ -1325,6 +1325,15 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   checks the bundle digest, but corpus integrity rests on its 0700 custody.
 
 ## Performance
+
+[Label 2026-10-17 (R-N13), Bulkload Reset Review row E05: the two-gate
+corpus race below is retired as the performance bar. Since R-C842 (Linear
+TIN-4543 `ace8649c`) the gate of record is end-to-end wall-clock time to a
+verified working seat, compared against an rclone sync of the same home
+([SPEC](SPEC.md) R3); gate (a) stays only as a regression guard, and the
+gate (b) harness `gate_b.py` is retired (N03; `m3_link.py` carries the
+rclone arm). The gate text is kept as a dated record. The resume and
+adoption rules after it describe the running engine and stand.]
 
 Performance is the product bar (R23, R25). Two gates (R-N57); their order,
 verdict rule, hosts and corpus are S1 in [slo.md](slo.md) (OI-1002-Q30's
@@ -1380,6 +1389,11 @@ source bytes read.
   (the seat moved since that capture) is read again and not counted.
 
 ## M2 gates (historical)
+
+[Label 2026-10-17 (R-N13), Bulkload Reset Review row E05: the W4 and W5
+corpus-race gates in this table are retired by R-C842 (Linear TIN-4543
+`ace8649c`); they are not gates of record. The S2 budget rules after the
+table stand (`s2_budget.py` is kept).]
 
 [Historical, labelled 2026-10-16 (R-N13).] The M2 workstream acceptance
 table as of 2026-10-05. S1–S5 in [slo.md](slo.md) replaced this framing;
@@ -1556,7 +1570,7 @@ miss (#87).
   fallback) fail on that bound alone. Whether handed bytes are wire bytes
   for that inequality is unruled. `just fault-harness` runs the crash,
   power-loss and resume suites with the lever on too (`delta-lever`).
-  `BulkloadTransfer.tla` already lets `RecvEntry` choose `Send` for any
+  `BulkloadTransfer.tla` (deleted 2026-10-17, R-C843) already lets `RecvEntry` choose `Send` for any
   absent output, so the lever is inside the model (docs/slo.md, the
   2026-10-16 amendment). The source sends `Manifest`, from
   its ledger without reading when the stat identity is recorded; the
@@ -1855,7 +1869,7 @@ copy of corpus v1 committed 10 to 18 destination groups on the rig; with
 informational census (1 destination group commit against 3 to 5,
 2026-10-15, not of record), until the rig series measures it. Each group still
 seals before its one FULL commit and every `Held` still follows that commit
-(R25: `BulkloadTransfer.tla`'s `Commit` takes any nonempty set of ready
+(R25: `BulkloadTransfer.tla`'s (deleted 2026-10-17, R-C843) `Commit` takes any nonempty set of ready
 seats, so a larger group is a behaviour the model already checks), and the
 most a crash leaves unrecorded is still one group within the same bounds;
 #169's adoption recovers it without a source read. No commit is relaxed:
@@ -2019,9 +2033,10 @@ as without batching. A discarded creation clears its record before its
 temporary goes (#74 N3), a level whose shared seal or commit failed
 included (its commit may have reached the log although it reported a
 failure), and every clear is traced apart from a completion
-(`DirectoryCleared`). `docs/formal/DirectoryRecords.tla` checks
-the records under per-name power loss, journal seals and reused inode
-numbers (README, "Directory records").
+(`DirectoryCleared`). Until R-C843 deleted it on 2026-10-17,
+`docs/formal/DirectoryRecords.tla` checked the records under per-name
+power loss, journal seals and reused inode numbers (`git show e3522007:docs/formal/README.md`,
+"Directory records").
 
 The finish rides the session's last output group (OI-1003-Q154 lever 3;
 the SOTA study's lever 2, R-N102's finish commit unit; built 2026-10-16).
@@ -2056,7 +2071,7 @@ already empty (the last output closed it at a file or byte bound, or an
 idle or age bound closed it first) drops the finish, which then runs as
 before over the modes already set. `BULKLOAD_DIRECTORY_FOLD=0`
 restores the separate finish for A/B; `directories_folded` counts the
-directories finished in a group. The model is `DirectoryRecords.tla`'s
+directories finished in a group. The model is `DirectoryRecords.tla`'s (deleted 2026-10-17, R-C843)
 `Place` and `GroupFinish` with `CompletionAfterChildren` (a completed
 directory owes no output of its run); the power-loss proof is
 `every_power_loss_state_of_a_folded_finish_is_explored`, in group and
@@ -2090,8 +2105,9 @@ state-root seals (#161) are fully synced on both sides, every destination
 commit is `synchronous=FULL`, `fullfsync=ON`, and a checkpoint on the
 relaxed connection is still a full flush. `--source-ledger-sync=full` syncs
 every row commit and fails the session on the first failed one, for
-comparison. `docs/formal` checks the relaxed ledger (`MC_wp0g`,
-`MC_wp0g_deep`, `MC_wp0g_strict`) and shows a relaxed authority breaking R25
+comparison. Until R-C843 deleted them on 2026-10-17, the `BulkloadTransfer.tla`
+configs checked the relaxed ledger (`MC_wp0g`, `MC_wp0g_deep`,
+`MC_wp0g_strict`) and showed a relaxed authority breaking R25
 (`MC_wp0g_authority`); P79 and `tests/power_loss.rs` take the real store
 through every loss.
 
@@ -2100,7 +2116,7 @@ replace the output at its path only when that output is this store's own,
 untouched: its `(dev, ino, size, mtime, ctime)` equals a row this store
 committed for the path. Any other file there is refused
 `DESTINATION_OCCUPIED` and left as it is. The replacement is the exchange
-design the formal model checks (`MC_wp0d_exchange`): the group's commit seals
+design the formal model checked until R-C843 deleted it (`MC_wp0d_exchange`): the group's commit seals
 the staged file, records an intent that takes the output's rows out of the
 store, trades the staged name and the leaf in one `RENAME_EXCHANGE`
 (`RENAME_SWAP` on Darwin), checks the displaced file, removes it when it is
@@ -2117,7 +2133,7 @@ the old output's own chunks, so only absent chunks cross the wire (WP0(c),
 inequality 2). A `SQLite` snapshot output (#218) is superseded the same
 way (OI-1003-Q146), with one more look: no `-wal`, `-journal` or `-shm`
 beside it at Decide and immediately before the exchange ("SQLite
-snapshot seats", Wire v6); `docs/formal/SqliteCarry.tla` checks it
+snapshot seats", Wire v6); `docs/formal/SqliteCarry.tla` (deleted 2026-10-17, R-C843) checks it
 (`SqliteNoClobber`, `SqliteOldOrNewWhole`, `SqliteNoForeignSidecar`).
 
 What "this store's own" covers (#187 review, 2026-10-07). An output has a
@@ -2146,7 +2162,7 @@ holds other bytes: nothing is staged, no chunk is asked of the source, and
 the old output keeps its row. Such a seat does not converge there. That is
 the ruled behaviour (OI-1003-Q100): the refusal stands, and there is no
 fallback to a rename over the output, which is the check-then-rename shape
-the formal model refutes.
+the formal model refuted (deleted 2026-10-17, R-C843).
 
 Refusals the destination remembers (#187 review, R25). A seat refused
 `DESTINATION_OCCUPIED` or `DESTINATION_EXCHANGE_UNSUPPORTED` after its
@@ -2161,12 +2177,12 @@ the racy window of the read. A changed seat, a changed file, or a file
 system that has gained the exchange makes the record a miss. The record
 is a memo about no durable bytes; losing it costs one more source read.
 
-The formal model holds all of this since 2026-10-07 (OI-1003-Q102: model
+The formal model held all of this from 2026-10-07 until R-C843 deleted it on 2026-10-17 (OI-1003-Q102: model
 first, then merge): the intent and its sweep, the ownership row, the
 remembered refusal and the refusal without an exchange, with the
 invariants `NoClobber`, `SupersedeAtomic`, `OwnershipNeverReuse`,
 `RememberedRefusalSound` and `ExchangeRefusedUpFront`
-(`docs/formal/README.md`, "#187's records in the model").
+(`docs/formal/README.md`, "#187's records in the model" (deleted 2026-10-17, R-C843)).
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a
