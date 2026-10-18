@@ -121,6 +121,81 @@ pub fn write_record(path: &Path, record: &BesideRecord) -> Result<()> {
     landed::write(path, record)
 }
 
+/// What STATE records of one item's refs-in (M2 item 7).
+///
+/// `estate-apply --refs-in` (and `estate-move`): the captured branches and
+/// tags the live repository holds at another value, or lacks, created under
+/// `refs/<ns>/`. Recorded write-ahead like a [`BesideRecord`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefsInRecord {
+    /// `estate::id` of the item.
+    pub item: String,
+    /// The ref namespace (the `--beside` suffix without its leading `.`).
+    pub ns: String,
+    /// The capture whose refs went in.
+    pub capture: [u8; 32],
+    /// The capture's provenance instance in the repository.
+    pub instance: String,
+    /// `(name, oid)` each ref about to be created (write-ahead).
+    pub pending: Vec<(String, String)>,
+    /// `(name, oid)` each ref this item's refs-in created.
+    pub created: Vec<(String, String)>,
+    /// `(name, existing, carried)` each ref kept with another value.
+    pub kept: Vec<(String, String, String)>,
+}
+
+impl landed::Record for RefsInRecord {
+    const MAGIC: &'static [u8; 16] = b"bulkload-refsin1";
+}
+
+/// The refs-in record at `path`, if any.
+///
+/// # Errors
+/// IO; a record that does not decode.
+pub fn read_refs_in(path: &Path) -> Result<Option<RefsInRecord>> {
+    landed::read::<RefsInRecord>(path)
+}
+
+/// Write the refs-in `record` at `path` (atomically, durably).
+///
+/// # Errors
+/// IO.
+pub fn write_refs_in(path: &Path, record: &RefsInRecord) -> Result<()> {
+    landed::write(path, record)
+}
+
+/// The refs a refs-in wants in `repo` (M2 item 7).
+///
+/// The in-place lane's `refs-in.py` made native: each captured branch `refs/heads/<name>` or
+/// tag `refs/tags/<name>` of `instance` that `repo` lacks or holds at
+/// another value, as `refs/<ns>/heads/<name>` (`refs/<ns>/tags/<name>`).
+/// A captured ref `repo` holds at its value wants nothing. Read-only.
+///
+/// # Errors
+/// Whatever reading the provenance or the refs refuses.
+pub fn refs_in_wanted(
+    repo: &Path,
+    source: &str,
+    instance: &str,
+    ns: &str,
+) -> Result<BTreeMap<String, String>> {
+    let held = names(repo)?;
+    let mut wanted = BTreeMap::new();
+    for (name, value) in native_refs::carried(repo, source, instance)? {
+        if !(name.starts_with("refs/heads/") || name.starts_with("refs/tags/")) {
+            continue;
+        }
+        if held.get(&name) == Some(&value) {
+            continue;
+        }
+        let rest = name
+            .strip_prefix("refs/")
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        wanted.insert(format!("refs/{ns}/{rest}"), value);
+    }
+    Ok(wanted)
+}
+
 /// The ref namespace of `suffix`: the suffix without its leading `.`, one
 /// plain ref component (see the module docs).
 ///
@@ -290,15 +365,31 @@ pub fn create(repo: &Path, refs: &[(String, String)]) -> Result<()> {
 /// # Errors
 /// Whatever listing the refs refuses.
 pub fn settle(repo: &Path, record: &mut BesideRecord) -> Result<()> {
-    if record.pending.is_empty() {
+    settle_lists(repo, &mut record.pending, &mut record.created)
+}
+
+/// [`settle`] for a refs-in record.
+///
+/// # Errors
+/// Whatever listing the refs refuses.
+pub fn settle_refs_in(repo: &Path, record: &mut RefsInRecord) -> Result<()> {
+    settle_lists(repo, &mut record.pending, &mut record.created)
+}
+
+// Each pending ref `repo` holds at its value moves to `created`; the rest of
+// `pending` is dropped.
+fn settle_lists(
+    repo: &Path,
+    pending: &mut Vec<(String, String)>,
+    created: &mut Vec<(String, String)>,
+) -> Result<()> {
+    if pending.is_empty() {
         return Ok(());
     }
     let existing = names(repo)?;
-    for (name, value) in std::mem::take(&mut record.pending) {
-        if existing.get(&name) == Some(&value)
-            && !record.created.iter().any(|(held, _)| *held == name)
-        {
-            record.created.push((name, value));
+    for (name, value) in std::mem::take(pending) {
+        if existing.get(&name) == Some(&value) && !created.iter().any(|(held, _)| *held == name) {
+            created.push((name, value));
         }
     }
     Ok(())

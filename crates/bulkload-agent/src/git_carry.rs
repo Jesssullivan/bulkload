@@ -815,6 +815,14 @@ fn exported_refs(
     Ok(pending)
 }
 
+/// Whether `source` is a label `estate-apply` and the provenance
+/// namespaces accept (`refs/carry/v1/<SOURCE>/`): 1 to 64 ASCII letters,
+/// digits, `-` or `_`.
+#[must_use]
+pub fn source_label_allowed(source: &str) -> bool {
+    source_slug(source)
+}
+
 fn source_slug(source: &str) -> bool {
     !source.is_empty()
         && source.len() <= 64

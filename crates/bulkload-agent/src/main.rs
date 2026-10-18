@@ -15,6 +15,10 @@ use bulkload_agent::hash;
 use bulkload_agent::walk::{self, HashPolicy, WalkOptions};
 use bulkload_proto::{BulkloadRefusal, Control, FileKind, Frame, Result, RowSchema};
 
+// `estate-move-source` and `estate-move` (M2 item 7): the verbs above,
+// composed.
+mod estate_move;
+
 const USAGE: &str = "\
 bulkload-agent -- ordinary-file transport and offline SQLite composition
 
@@ -66,7 +70,7 @@ SUBCOMMANDS:
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply [--adopt] [--exclude-union] [--beside SUFFIX] [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+    estate-apply [--adopt] [--exclude-union] [--beside SUFFIX] [--refs-in] [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces.
                 A landed checkout bulkload proves unchanged converges to the
                 current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
@@ -112,6 +116,15 @@ SUBCOMMANDS:
                 applied-beside. A beside path or ref namespace holding anything
                 else, or a captured ref kept at another value, refuses
                 GIT_DESTINATION_OCCUPIED.
+                --refs-in (M2 item 7; needs --adopt and --beside): after an
+                item adopts, lands or converges its repository (not a beside
+                landing), each captured branch and tag the repository lacks
+                or holds at another value goes in create-only as
+                refs/NS/heads/NAME (refs/NS/tags/NAME), recorded write-ahead
+                in STATE ITEM-SOURCE.refs-in; receipt refs-in-created=N
+                refs-in-present=N. No native ref moves. A ref of that name
+                held at another value is kept and the item refuses
+                GIT_DESTINATION_OCCUPIED (pending review), as --beside does.
                 --side-root ROOT (repeatable; M2r2 item e; needs --adopt):
                 after the preflights and before any item, each planned path
                 spelled through a symlink whose one hop names a directory
@@ -123,6 +136,63 @@ SUBCOMMANDS:
                 reason=`; an interrupted seat or undo is finished first); the
                 items then adopt or re-key at the live path, and a seat stays
                 if they refuse
+    estate-move-source [--map SRC=LIVE]... [--jobs N] [--include-rebuildable] MOVE_STATE SOURCE_ROOT...
+                M2 item 7, the source half of estate-move (run on the
+                source; auto priority, as estate-capture): every Git
+                repository under each SOURCE_ROOT (the walk stops at a
+                repository and does not follow symlinks), grouped as Git
+                groups it: the main and every worktree it registers, wherever
+                they are (a linked worktree under a root brings its main), a
+                bare repository refs-only. Each path's live path is the
+                longest --map prefix's, else the same path. One line per item
+                (estate-move-source item=ID kind=main|linked|bare) and per
+                note (symlink, not-git files, prunable worktree, unreadable
+                repository: printed and counted, never planned silently).
+                New items are appended to MOVE_STATE/carry/plan.postcard
+                (estate-add-batch; existing ones never change), then the plan
+                is captured (estate-capture, jobs N, default 2) into
+                MOVE_STATE/carry/corpus with private state in
+                MOVE_STATE/private. An item's capture refusal is its line's
+                (the destination carries it as files); only a refusal of the
+                whole capture fails the verb. MOVE_STATE is 0700 and flocked
+    estate-move --label LABEL --source SOURCE [--plan-only] [--exclude-union] [--no-handoff]
+                [--activate-origin PREFIX]... [--side-root ROOT]... [--jobs N]
+                [--sessions SOURCE_HOME [--codex-source-root DIR] [--dest-home DIR] [--map SRC=DST]...]
+                [--remote-executable PATH [--ssh-config FILE]]
+                HOST|- SOURCE_MOVE_STATE MOVE_STATE
+                M2 item 7 (design 2026-10-16-estate-move-design.md), the
+                destination half: one pass of the move, composed of the verbs
+                above, each phase's end recorded in MOVE_STATE/move.ledger
+                (LABEL, SOURCE, HOST and SOURCE_MOVE_STATE are bound at the
+                first run; a rerun naming others refuses
+                RECEIPT_BINDING_INVALID). HOST - is this host (copy), else
+                pull over SSH; serve's state is SOURCE_MOVE_STATE/serve/NAME.
+                1 pull: SOURCE_MOVE_STATE/carry into MOVE_STATE/carry. 2 plan:
+                per item the live path's presence (absent, empty, git,
+                not-git, symlinked, unreadable) and whether the corpus holds
+                its capture give one action: land, adopt (apply proves it or
+                lands it beside), refs-only, carry-live, carry-beside, or
+                refuse (left to the apply's typed refusal, pending review); one
+                estate-move item= line each and a histogram line. A carry
+                decision is kept while the item stays uncaptured. --plan-only
+                stops here after an estate-diff preview (MOVE_STATE/diff.jsonl).
+                3 apply: estate-apply --adopt --beside .LABEL --refs-in
+                (and --exclude-union, --activate-origin, --side-root as given)
+                into MOVE_STATE/private; item refusals are recorded and the
+                pass goes on, any other refusal stops it. 4 carry:
+                estate-carry-files for the carry items, at the live path or
+                with --beside .LABEL. 5 handoff: estate-handoff (unless
+                --no-handoff). 6 with --sessions: SOURCE_HOME/.claude and the
+                Codex root (--codex-source-root, default SOURCE_HOME/.codex)
+                into MOVE_STATE/landing, then estate-reseat --lanes-from-plan
+                (--map passed on) into DEST_HOME (--dest-home, default $HOME),
+                state MOVE_STATE/reseat. 7 closure: closure-report over the
+                plan, written to MOVE_STATE/closure.json and summarised on an
+                estate-move closure line; the verb exits with its gate
+                (CLOSURE_UNACCOUNTED while anything is unaccounted or pending
+                review). Files and agent state carry SQLite as snapshots. A
+                rerun is the next converge pass. Nothing is deleted, no live
+                ref moves, no live checkout is switched
     estate-unseat PRIVATE_STATE [LIVE ...]
                 M2r2 item e: undo each seat estate-apply --side-root recorded in
                 PRIVATE_STATE (or only those of the LIVE paths given): the
@@ -587,6 +657,7 @@ COUNTERS:
 const SOURCE_SIDE_VERBS: &[&str] = &[
     "serve",
     "estate-capture",
+    "estate-move-source",
     "snapshot",
     "git-carry-estimate",
     "git-export",
@@ -595,7 +666,7 @@ const SOURCE_SIDE_VERBS: &[&str] = &[
 
 /// Verbs whose default class is `auto` (M2 item 3): background when a
 /// person is at the host, normal otherwise (`priority::presence`).
-const AUTO_VERBS: &[&str] = &["estate-capture"];
+const AUTO_VERBS: &[&str] = &["estate-capture", "estate-move-source"];
 
 /// A `--priority=` value: a class, or `auto`.
 #[derive(Clone, Copy)]
@@ -714,6 +785,9 @@ fn main() -> ExitCode {
             | "estate-unseat"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
+        Some(name @ ("estate-move-source" | "estate-move")) => {
+            estate_move::command(name, &args.collect::<Vec<_>>())
+        }
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
@@ -1441,31 +1515,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             .parse::<usize>()
             .map_err(|_| BulkloadRefusal::FieldDomainViolation)
     };
-    let receipt = |row: &estate::Receipt| {
-        let mut output = std::io::stdout().lock();
-        write!(
-            output,
-            "item={} source={:?} outcome={} reason={:?} source_bytes_read={}",
-            row.item, row.source, row.outcome, row.reason, row.bytes_read
-        )
-        .refuse_at("main::estate_command")?;
-        if let Some(why) = row.reuse_unavailable {
-            write!(output, " reuse_unavailable={why}").refuse_at("main::estate_command")?;
-        }
-        writeln!(output).refuse_at("main::estate_command")?;
-        // One line per drifted ref or seat, after the item line, so a clean
-        // item stays one line.
-        for line in &row.drift {
-            writeln!(output, "item={} drift={line}", row.item).refuse_at("main::estate_command")?;
-        }
-        // One line per nest after the item line, so a nest-free item stays
-        // one line (R-N73). Paths inside are byte-escaped.
-        for line in &row.nested {
-            writeln!(output, "item={} {line}", row.item).refuse_at("main::estate_command")?;
-        }
-        output.flush().refuse_at("main::estate_command")?;
-        Ok(())
-    };
+    let receipt = print_receipt;
     match command {
         "estate-retarget" => {
             let mut positional = Vec::new();
@@ -1557,6 +1607,10 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             if rest.len() != 5 || options.since.is_some() || !options.scan.is_empty() {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
+            // `--refs-in` names its refs under the `--beside` namespace.
+            if options.refs_in && (options.beside.is_none() || !options.adopt) {
+                return Err(BulkloadRefusal::RequiredFieldMissing);
+            }
             let path = |i: usize| -> Result<&Path> {
                 rest.get(i)
                     .map(Path::new)
@@ -1579,6 +1633,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                         side_roots: options.side_roots,
                         exclude_union: options.exclude_union,
                         beside: options.beside,
+                        refs_in: options.refs_in,
                     },
                 ),
                 &receipt,
@@ -1592,7 +1647,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         "estate-diff" => {
             let (options, rest) = estate_options(args)?;
-            if rest.len() < 4 || options.adopt || options.exclude_union {
+            if rest.len() < 4 || options.adopt || options.exclude_union || options.refs_in {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let source = rest
@@ -1654,6 +1709,35 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         _ => Err(BulkloadRefusal::RequiredFieldMissing),
     }
+}
+
+// One estate receipt line (`estate-capture`, `estate-apply`, and the phases
+// of `estate-move-source` and `estate-move` that run them).
+#[allow(clippy::unnecessary_debug_formatting)] // Paths print escaped and quoted.
+fn print_receipt(row: &bulkload_agent::estate::Receipt) -> Result<()> {
+    let mut output = std::io::stdout().lock();
+    write!(
+        output,
+        "item={} source={:?} outcome={} reason={:?} source_bytes_read={}",
+        row.item, row.source, row.outcome, row.reason, row.bytes_read
+    )
+    .refuse_at("main::estate_command")?;
+    if let Some(why) = row.reuse_unavailable {
+        write!(output, " reuse_unavailable={why}").refuse_at("main::estate_command")?;
+    }
+    writeln!(output).refuse_at("main::estate_command")?;
+    // One line per drifted ref or seat, after the item line, so a clean
+    // item stays one line.
+    for line in &row.drift {
+        writeln!(output, "item={} drift={line}", row.item).refuse_at("main::estate_command")?;
+    }
+    // One line per nest after the item line, so a nest-free item stays
+    // one line (R-N73). Paths inside are byte-escaped.
+    for line in &row.nested {
+        writeln!(output, "item={} {line}", row.item).refuse_at("main::estate_command")?;
+    }
+    output.flush().refuse_at("main::estate_command")?;
+    Ok(())
 }
 
 // R0 (TIN-6587): re-seat landed agent sessions, or check that they hold.
@@ -1986,6 +2070,7 @@ struct EstateOptions {
     adopt: bool,
     exclude_union: bool,
     beside: Option<String>,
+    refs_in: bool,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
@@ -2004,6 +2089,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             }
             "--exclude-union" if !options.exclude_union => {
                 options.exclude_union = true;
+                at += 1;
+            }
+            "--refs-in" if !options.refs_in => {
+                options.refs_in = true;
                 at += 1;
             }
             "--beside" if options.beside.is_none() => {
