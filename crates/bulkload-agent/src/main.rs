@@ -301,7 +301,8 @@ SUBCOMMANDS:
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
-                  [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]... [--undo]
+                  [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
+                  [--rebind-landing OLD=NEW]... [--undo]
                   [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
                 R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
                 .claude and .codex, the run's copy of SOURCE_HOME's) into
@@ -336,6 +337,17 @@ SUBCOMMANDS:
                 kept, ledgered (OI-1003-Q198 (2); --no-regularize); a target
                 written during it is RESEAT_REGULARIZE_RACED with both copies
                 kept (the line's kept field names a copy kept aside).
+                --rebind-landing OLD=NEW (repeatable; A-106 follow-up): a
+                placement row naming a landed file under OLD (as the rows
+                spell it; OLD may be gone) is re-bound to the same file under
+                NEW (must exist) instead of a collision, only when the row is
+                this STATE's own (placed, adopted or continued), the
+                destination is the single-link regular file it last wrote,
+                and the bytes it placed are proved NEW's file's first bytes
+                (BLAKE3 against the row's digest, or the destination's own
+                read by descriptor): exactly them, rebound (nothing written);
+                longer, re-bound then extended as usual; never inferred from
+                size. --undo puts each rebind back (ledger only).
                 --replace-archived-dest ROOT (repeatable; A-106: the landed
                 version wins, the fork stays in the archive): a destination
                 transcript, subagent sidecar or rollout that is a symlink
@@ -438,11 +450,16 @@ BOUNDARIES:
     pull passes full to serve.
     --min-free-percent=N (0-100, default 25): DESTINATION_SPACE_INSUFFICIENT
     when planned bytes would leave the destination filesystem (statvfs) with
-    less than N% free. copy/pull refuse each entry that does not fit, as a
+    less than N% free, or, inside a project-quota tree (where statvfs
+    reports the quota; Linux), the quota with less than N% of its limit
+    free. The refusal says which limit bound and both numbers (a
+    space_refusal line; counters space_refused_filesystem and
+    space_refused_quota). copy/pull refuse each entry that does not fit, as a
     value, before requesting its content: the bytes of every entry decided
     and not yet Held count against a probe refreshed on each group commit,
     so the session continues and stays resumable. estate-apply refuses before
-    any item, planning bundle sizes (a lower bound).
+    any item, planning the bundle bytes each destination repository does not
+    already hold (a lower bound).
     --priority=background|normal|auto (WP0(f)): serve, snapshot,
     git-carry-estimate, git-export and copy read a live source, so they enter
     background CPU and IO priority before anything else (Linux nice 19 and the
@@ -729,6 +746,13 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(refusal) => {
             eprintln!("bulkload-agent: refused: {refusal}");
+            // M2 round 2, item 1: which limit refused, and both numbers;
+            // only for this verb's own space refusal, and once (review A3).
+            if refusal == BulkloadRefusal::DestinationSpaceInsufficient {
+                if let Some(space) = bulkload_agent::space::take_refusal() {
+                    eprintln!("bulkload-agent: space: {}", space.fields());
+                }
+            }
             ExitCode::FAILURE
         }
     }
@@ -1652,6 +1676,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let (mut claude, mut codex) = (true, true);
     let (mut undo, mut respell, mut regularize, mut default_by_id) = (false, true, true, true);
     let mut by_id = Vec::new();
+    let mut rebind = Vec::new();
     let mut archived = Vec::new();
     let mut at = 0;
     let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
@@ -1669,6 +1694,23 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             "--no-default-by-id" => default_by_id = false,
             "--unmapped=report" => unmapped = Unmapped::Report,
             "--unmapped=by-id" => unmapped = Unmapped::ById,
+            "--rebind-landing" => {
+                let (from, to) = value(at + 1)?
+                    .to_str()
+                    .ok_or(BulkloadRefusal::PathNotPortable)?
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                let (from, to) = (Path::new(from), Path::new(to));
+                if !from.is_absolute() || !to.is_absolute() {
+                    return Err(BulkloadRefusal::PathNotAbsolute);
+                }
+                // The new root must exist (judged by its real path); the
+                // old one may be gone and is taken as the rows recorded it.
+                let to =
+                    std::fs::canonicalize(to).refuse_at("main::reseat_command::rebind_landing")?;
+                rebind.push((from.to_path_buf(), to));
+                step = 2;
+            }
             "--map" => {
                 let (from, to) = value(at + 1)?
                     .to_str()
@@ -1806,6 +1848,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
         }
     }
     options.maps = maps;
+    options.rebind = rebind;
     options.unmapped = unmapped;
     options.claude = claude;
     options.codex = codex;
@@ -2412,6 +2455,11 @@ fn report_counters(verb: &str, started: std::time::Instant, priority: Priority) 
         elapsed_ns(started),
         Counters::snapshot().render()
     ));
+    // The last refused free-space check: which limit bound (the filesystem
+    // or a project quota) and both limits' numbers (M2 round 2, item 1).
+    if let Some(space) = bulkload_agent::space::last_refusal() {
+        lines.push(format!("space_refusal {prefix} {}", space.fields()));
+    }
     if matches!(verb, "copy" | "pull") {
         let mut output = std::io::stdout().lock();
         for line in &lines {

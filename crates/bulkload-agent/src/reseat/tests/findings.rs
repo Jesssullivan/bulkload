@@ -18,7 +18,9 @@ use crate::reseat::{check, reseat, Options, Unmapped};
 mod a106;
 mod m2r2;
 mod q198;
+mod rebind;
 mod rereview;
+mod space;
 
 const T1: &str = "019a0000-0000-7000-8000-0000000000f1";
 const T9: &str = "019a0000-0000-7000-8000-0000000000f9";

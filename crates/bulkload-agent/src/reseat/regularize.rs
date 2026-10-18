@@ -110,28 +110,6 @@ pub fn links(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Bytes a pass would write regularizing the links under `root` (each
-/// target's size, for the free-space check).
-///
-/// # Errors
-/// The I/O refusal of a listing; ledger refusals.
-pub fn planned(root: &Path, ledger: Option<&Ledger>) -> Result<u64> {
-    let mut total = 0_u64;
-    for link in links(root)? {
-        if let Some(ledger) = ledger {
-            if ledger.regular(&link)?.is_some() {
-                continue;
-            }
-        }
-        if let Ok(meta) = std::fs::metadata(&link) {
-            if meta.is_file() {
-                total = total.saturating_add(meta.len());
-            }
-        }
-    }
-    Ok(total)
-}
-
 /// Where a test acts as a live session between two steps of a
 /// regularization (the hook runs only in unit tests).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,7 +509,7 @@ impl<'a> Site<'a> {
         self.ledger.delete_regular(self.link)
     }
 
-    fn regularize(&self) -> Result<Outcome> {
+    fn regularize(&self, space: Space<'_>) -> Result<Outcome> {
         let Some(link_meta) = lstat(self.link)? else {
             return Ok(Outcome::new("absent", None));
         };
@@ -545,11 +523,33 @@ impl<'a> Site<'a> {
                 Some(BulkloadRefusal::DestinationOccupied),
             ));
         };
-        if !lstat(&resolved)?.is_some_and(|meta| meta.is_file()) {
+        let Some(target) = lstat(&resolved)?.filter(std::fs::Metadata::is_file) else {
             return Ok(Outcome::new(
                 "target-not-regular",
                 Some(BulkloadRefusal::DestinationOccupied),
             ));
+        };
+        // The free-space rule per link, as it is copied (M2 round 2, item
+        // 1): a pass's other work is never held back by every link's bytes
+        // at once, and a link that does not fit now is this line's refusal.
+        // The bytes the pass's placements were admitted for stay reserved
+        // beside it (review B1), so a regularization never takes what the
+        // placements after it will write.
+        let parent = self.link.parent().ok_or(BulkloadRefusal::PathEscapesRoot)?;
+        let size = target.len();
+        if size > 0 {
+            let mut wants = space.reserved.to_vec();
+            wants.push((parent, size));
+            match crate::space::preflight_many(&wants, space.min_free_percent) {
+                Ok(()) => {}
+                Err(BulkloadRefusal::DestinationSpaceInsufficient) => {
+                    return Ok(Outcome::new(
+                        "space-refused",
+                        Some(BulkloadRefusal::DestinationSpaceInsufficient),
+                    ));
+                }
+                Err(refusal) => return Err(refusal),
+            }
         }
         let staged = self.stage(&resolved)?;
         hook(Step::Staged, self.link);
@@ -700,8 +700,24 @@ impl<'a> Site<'a> {
     }
 }
 
+/// The free-space rule a regularization pass is held to: the floor, and
+/// the bytes already admitted for the pass's placements, `(destination,
+/// bytes)`, which stay reserved beside each link's copy.
+#[derive(Clone, Copy)]
+pub struct Space<'a> {
+    pub min_free_percent: u8,
+    pub reserved: &'a [(&'a Path, u64)],
+}
+
 /// Regularize every symlinked transcript under the destination `.claude`
 /// root `root`, one `regularize` line each.
+///
+/// Each link's copy is checked
+/// against the free-space rule ([`Space`]: the floor, with the placements'
+/// admitted bytes still reserved) when it is made, never all of them before
+/// the pass: a link that does not fit is its own
+/// `space-refused` line (`DESTINATION_SPACE_INSUFFICIENT`) and the next
+/// pass retries it.
 ///
 /// # Errors
 /// Ledger and I/O refusals; a link's own outcome is its line.
@@ -709,6 +725,7 @@ pub fn regularize(
     root: &Path,
     archived: &[PathBuf],
     ledger: &Ledger,
+    space: Space<'_>,
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
@@ -730,7 +747,7 @@ pub fn regularize(
         let Some(site) = Site::new(ledger, &link)? else {
             continue;
         };
-        let outcome = site.regularize()?;
+        let outcome = site.regularize(space)?;
         *summary
             .rows
             .entry(format!("link-{}", outcome.word))

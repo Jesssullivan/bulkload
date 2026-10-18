@@ -5933,6 +5933,21 @@ pub(crate) fn carried_heads(bundle: &Path, objects: Option<&Path>) -> Result<Str
 // `repo`'s refs and at the bundle's prerequisites, which `bundle verify` has
 // already found complete, so it reads only what the bundle brings.
 fn unbundle_objects(repo: &Path, bundle: &Path, advertised: &str) -> Result<()> {
+    let Some(walk) = closure_walk(bundle, advertised)? else {
+        return Ok(());
+    };
+    if holds_closure(repo, &walk).is_ok() {
+        return Ok(());
+    }
+    output(git(repo).args(["bundle", "unbundle"]).arg(bundle))?;
+    holds_closure(repo, &walk)?;
+    Ok(())
+}
+
+// The `rev-list --stdin` walk proving `repo` holds every object `bundle`
+// advertises: each advertised value once, then `^` each prerequisite.
+// `None` when it advertises nothing.
+fn closure_walk(bundle: &Path, advertised: &str) -> Result<Option<String>> {
     let mut walk = String::new();
     let mut objects = std::collections::BTreeSet::new();
     for line in advertised.lines() {
@@ -5948,32 +5963,45 @@ fn unbundle_objects(repo: &Path, bundle: &Path, advertised: &str) -> Result<()> 
         }
     }
     if walk.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     for prerequisite in shared::prerequisites(bundle)? {
         walk.push('^');
         walk.push_str(&prerequisite);
         walk.push('\n');
     }
-    let connected = || {
-        input(
-            git(repo).args([
-                "rev-list",
-                "--objects",
-                "--quiet",
-                "--stdin",
-                "--not",
-                "--all",
-            ]),
-            walk.as_bytes(),
-        )
+    Ok(Some(walk))
+}
+
+// Whether `repo` holds the closure `walk` names (see `closure_walk`).
+fn holds_closure(repo: &Path, walk: &str) -> Result<Vec<u8>> {
+    input(
+        git(repo).args([
+            "rev-list",
+            "--objects",
+            "--quiet",
+            "--stdin",
+            "--not",
+            "--all",
+        ]),
+        walk.as_bytes(),
+    )
+}
+
+/// Whether the destination repository `repo` already holds every object
+/// `bundle` brings: the test an import makes before it takes anything, so
+/// an import of it writes no object (M2 round 2, item 1: the apply's space
+/// plan charges nothing for it). Reads only.
+///
+/// # Errors
+/// Whatever `bundle list-heads` or the header refuses; a walk that finds an
+/// object missing is `Ok(false)`.
+pub(crate) fn bundle_held(repo: &Path, bundle: &Path) -> Result<bool> {
+    let advertised = text(git(repo).args(["bundle", "list-heads"]).arg(bundle))?;
+    let Some(walk) = closure_walk(bundle, &advertised)? else {
+        return Ok(true);
     };
-    if connected().is_ok() {
-        return Ok(());
-    }
-    output(git(repo).args(["bundle", "unbundle"]).arg(bundle))?;
-    connected()?;
-    Ok(())
+    Ok(holds_closure(repo, &walk).is_ok())
 }
 
 fn capture_revision(heads: &str, suffix: &str) -> Result<String> {

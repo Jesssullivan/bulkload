@@ -375,6 +375,9 @@ counters! {
     ReseatDestRead => "read_reseat_dest_bytes",
     // Bytes written into the destination's live agent state.
     ReseatDestWrite => "write_reseat_dest_bytes",
+    // Placements re-bound from a landed file under an old landing root to
+    // the same bytes under a new one (`--rebind-landing`, A-106 follow-up).
+    ReseatRebound => "reseat_rebound",
     // Destination transcripts and rollouts that were symlinks into a
     // `--replace-archived-dest` root, replaced by the differing landed
     // file (A-106; the archive target kept, the link ledgered).
@@ -406,6 +409,14 @@ counters! {
     // whole-repository cost per chained item in `estate-diff`, the apply and
     // the restore verbs alike, never shared (M2r2 item 3 review).
     GitChainFlattens => "git_chain_flattens",
+    // Free-space checks (OI-1001-Q2) this process ran, and those refused,
+    // by the limit that bound (M2 round 2, item 1): the filesystem's, or a
+    // project quota's (`statvfs` inside a project-quota tree reports the
+    // quota). A refusal both limits bind counts in both. The last refusal's
+    // numbers are the `space_refusal` line.
+    SpaceChecks => "space_checks",
+    SpaceRefusedFilesystem => "space_refused_filesystem",
+    SpaceRefusedQuota => "space_refused_quota",
 }
 
 const COUNT: usize = Counter::ALL.len();

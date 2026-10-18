@@ -280,7 +280,10 @@ pub enum BulkloadRefusal {
     BudgetExceeded,
     /// Writing the planned bytes would leave the destination filesystem with
     /// less free space than the configured floor (`--min-free-percent`,
-    /// default 25%), or with no room at all (OI-1001-Q2).
+    /// default 25%), or with no room at all (OI-1001-Q2). Inside a
+    /// project-quota tree the quota is a second limit, its floor that
+    /// percent of the quota's own limit; the binary names the limit that
+    /// bound and both limits' numbers (`space_refusal`).
     DestinationSpaceInsufficient,
     /// A write met `ENOSPC` or `EDQUOT` (S4, #220, #126), named by the site
     /// that knows where it wrote: one of bulkload's own temporaries (under

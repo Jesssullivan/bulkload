@@ -1599,8 +1599,12 @@ session re-seat", and the receipt
   STATE), `RESEAT_REGULARIZE_RACED` (both copies kept),
   `RESEAT_UNDO_TARGET_CHANGED` (`--undo` over an archive target that is
   gone or no longer the recorded bytes: nothing changed) and, before writing,
-  `DESTINATION_SPACE_INSUFFICIENT` (the engine's `--min-free-percent` rule
-  over the bytes a pass would write). Everything under a project key that
+  `DESTINATION_SPACE_INSUFFICIENT` (the engine's `--min-free-percent` rule,
+  a project quota judged too, over the bytes the pass's placements would
+  write). A symlinked transcript's regularization is judged per link as it
+  copies, with those bytes still reserved: a link that does not fit is its
+  own `space-refused` line (`DESTINATION_SPACE_INSUFFICIENT`) mid-pass, kept
+  a link, retried by a later pass (M2 round 2, item 1). Everything under a project key that
   is no session's is carried with its key or named by a `key` line
   (Q185). A rollout recorded outside every `--codex-source-root` is
   `RESEAT_LANE_UNMAPPED:rollout-root` in `--check` too.
@@ -1623,7 +1627,11 @@ session re-seat", and the receipt
   with their old values and reversed by `--undo` wherever the destination
   still holds exactly what re-seat wrote. `--check` reports
   `replaced_archived`, `replace_pending`, `replace_equal_size` and
-  `replace_proved`.
+  `replace_proved`. A second landing of the same home under a new root re-binds this
+  STATE's rows to it with `--rebind-landing OLD=NEW` (A-106 follow-up)
+  only where the placed bytes are proved the new landed file's (BLAKE3);
+  nothing at the destination changes, `--undo` puts the binding back, and
+  `--check` reports `rebound` and `rebind_pending`.
 - **R0 acceptance** also fails a longer landed form of a rollout that was
   never placed (`extra-form-unplaced`), and names a row carrying the
   source's `cwd` (`row-cwd-is-source`). Rollouts with no snapshot row get a
