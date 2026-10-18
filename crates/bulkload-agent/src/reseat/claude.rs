@@ -316,6 +316,7 @@ pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Resul
                     ledger.as_ref(),
                     &root.join(rel),
                     &landed,
+                    &options.replace_archived,
                 )?);
             }
         }

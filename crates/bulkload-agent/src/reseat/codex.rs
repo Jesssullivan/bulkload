@@ -384,6 +384,7 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
             ledger,
             &root.join(dest_form(&rel)),
             &options.landing_codex.join(&rel),
+            &options.replace_archived,
         )?);
     }
     for file in unindexed(options, &named)? {
@@ -402,6 +403,7 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
             ledger,
             &root.join(dest_form(&file.rel)),
             &options.landing_codex.join(&file.rel),
+            &options.replace_archived,
         )?);
     }
     Ok(total)
