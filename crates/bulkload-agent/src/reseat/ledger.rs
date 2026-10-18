@@ -30,7 +30,15 @@
 //! - `regularized`: one row per symlinked destination transcript this
 //!   ledger replaced with a regular-file copy of its target
 //!   (OI-1003-Q198 (2)), with the link text and both identities, so
-//!   `--undo` puts the symlink back.
+//!   `--undo` puts the symlink back; with kind `replace`, a
+//!   `--replace-archived-dest` replacement by the landed file (A-106).
+//! - `rebind_history`: one row per `--rebind-landing` rebind (append-only;
+//!   a chained one adds a row): the old and new landed file and identity,
+//!   and the placement row's bytes, destination identity and digest at the
+//!   rebind, so `--undo` puts it back only over an unchanged row.
+//! - `rebind_unproved`: per destination, the new landed file a rebind's
+//!   byte proof refused and its identity then, so a pass does not read it
+//!   again while it is unchanged (S3).
 //!
 //! A row is committed only after the bytes it describes are durable at the
 //! destination (the engine rule).
@@ -48,13 +56,17 @@ pub const FILE: &str = "reseat.sqlite";
 /// first build, `550396c`: window digests, inode-only supersede intents)
 /// is refused, never read as this one; version 2 (`8a89f9a`) is migrated
 /// in place (new tables and session columns only).
-const VERSION: i64 = 4;
+const VERSION: i64 = 5;
 /// Version 2's tables are a subset of version 3's.
 const MIGRATE_FROM: i64 = 2;
 /// Version 3 lacks only `regularized.kind` (A-106): migrated in place. A
 /// build of version 3 refuses a version 4 ledger, so it never reads a
 /// replacement as a regularization (review B11).
 const MIGRATE_FROM_V3: i64 = 3;
+/// Version 4 lacks only the rebind tables (A-106 follow-up): migrated in
+/// place. A build of version 4 refuses a version 5 ledger, so it never
+/// ignores a rebind, on a pass or on `--undo` (review 8).
+const MIGRATE_FROM_V4: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS placement(
@@ -108,6 +120,21 @@ CREATE TABLE IF NOT EXISTS regularized(
     r_dev INTEGER NOT NULL, r_ino INTEGER NOT NULL, r_size INTEGER NOT NULL, r_mtime INTEGER NOT NULL,
     state TEXT NOT NULL, pass INTEGER NOT NULL,
     digest BLOB
+);
+CREATE TABLE IF NOT EXISTS rebind_history(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, dest BLOB NOT NULL,
+    old_landing BLOB NOT NULL, new_landing BLOB NOT NULL,
+    o_dev INTEGER NOT NULL, o_ino INTEGER NOT NULL, o_size INTEGER NOT NULL, o_mtime INTEGER NOT NULL,
+    n_dev INTEGER NOT NULL, n_ino INTEGER NOT NULL, n_size INTEGER NOT NULL, n_mtime INTEGER NOT NULL,
+    placed INTEGER NOT NULL,
+    d_dev INTEGER NOT NULL, d_ino INTEGER NOT NULL, d_size INTEGER NOT NULL, d_mtime INTEGER NOT NULL,
+    digest BLOB,
+    state TEXT NOT NULL, pass INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rebind_unproved(
+    dest BLOB PRIMARY KEY, new_landing BLOB NOT NULL,
+    n_dev INTEGER NOT NULL, n_ino INTEGER NOT NULL, n_size INTEGER NOT NULL, n_mtime INTEGER NOT NULL,
+    pass INTEGER NOT NULL
 );
 ";
 /// A file's identity: what a pass compares instead of reading it.
@@ -239,6 +266,31 @@ pub struct Session {
     /// when its landed file changed.
     pub landed_size: Option<u64>,
     pub landed_mtime: Option<i64>,
+}
+
+/// One rebind of a placement to the same landed file under a new root.
+///
+/// `--rebind-landing` (A-106 follow-up): the bytes it placed proved the
+/// new landing's. Rows are history, one per rebind (a chained one adds a
+/// row), never overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rebind {
+    /// Its order in the history (0 before it is written).
+    pub seq: i64,
+    pub dest: PathBuf,
+    pub old_landing: PathBuf,
+    pub new_landing: PathBuf,
+    /// The placement row's landed identity before and after the rebind.
+    pub old_landed: Identity,
+    pub new_landed: Identity,
+    /// The placement row's bytes, destination identity and digest at the
+    /// rebind: `--undo` puts the old binding back only while the row still
+    /// holds exactly these (else `undo-kept`).
+    pub placed: u64,
+    pub placed_identity: Identity,
+    pub digest: Option<[u8; 32]>,
+    /// `done`, `undone` or `undo-kept`.
+    pub state: String,
 }
 
 /// One re-spelled destination Codex row (OI-1003-Q198 (1)).
@@ -382,7 +434,12 @@ impl Ledger {
             |row| row.get(0),
         ))?;
         let fresh = version == 0 && tables == 0;
-        if !fresh && version != VERSION && version != MIGRATE_FROM && version != MIGRATE_FROM_V3 {
+        if !fresh
+            && version != VERSION
+            && version != MIGRATE_FROM
+            && version != MIGRATE_FROM_V3
+            && version != MIGRATE_FROM_V4
+        {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         sql(conn.execute_batch(SCHEMA))?;
@@ -457,7 +514,11 @@ impl Ledger {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ))?;
         let version: i64 = sql(conn.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
-        if version != VERSION && version != MIGRATE_FROM && version != MIGRATE_FROM_V3 {
+        if version != VERSION
+            && version != MIGRATE_FROM
+            && version != MIGRATE_FROM_V3
+            && version != MIGRATE_FROM_V4
+        {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         Ok(Some(Self {
@@ -567,6 +628,281 @@ impl Ledger {
             digest: digest(stored_digest),
             intent,
         }))
+    }
+
+    /// Every destination path with a placement row.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn placement_dests(&self) -> Result<Vec<PathBuf>> {
+        let mut statement = sql(self
+            .conn
+            .prepare("SELECT dest FROM placement ORDER BY dest"))?;
+        let rows = sql(statement.query_map([], |row| row.get::<_, Vec<u8>>(0)))?;
+        Ok(sql(rows.collect::<rusqlite::Result<Vec<_>>>())?
+            .into_iter()
+            .map(path_of)
+            .collect())
+    }
+
+    fn has_table(&self, name: &str) -> Result<bool> {
+        sql(self.conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
+            |row| row.get::<_, i64>(0),
+        ))
+        .map(|count| count > 0)
+    }
+
+    /// The rebind history of `dest`, oldest first.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn rebinds_of(&self, dest: &Path) -> Result<Vec<Rebind>> {
+        Ok(self
+            .rebinds()?
+            .into_iter()
+            .filter(|row| row.dest == dest)
+            .collect())
+    }
+
+    /// Every rebind, oldest first.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn rebinds(&self) -> Result<Vec<Rebind>> {
+        if !self.has_table("rebind_history")? {
+            return Ok(Vec::new());
+        }
+        let mut statement = sql(self.conn.prepare(
+            "SELECT seq, dest, old_landing, new_landing, o_dev, o_ino, o_size, o_mtime,
+                    n_dev, n_ino, n_size, n_mtime, placed, d_dev, d_ino, d_size, d_mtime,
+                    digest, state
+             FROM rebind_history ORDER BY seq",
+        ))?;
+        let identity = |row: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Identity> {
+            Ok(Identity {
+                dev: uint(row.get(at)?),
+                ino: uint(row.get(at + 1)?),
+                size: uint(row.get(at + 2)?),
+                mtime: row.get(at + 3)?,
+            })
+        };
+        let rows = sql(statement.query_map([], |row| {
+            Ok(Rebind {
+                seq: row.get(0)?,
+                dest: path_of(row.get(1)?),
+                old_landing: path_of(row.get(2)?),
+                new_landing: path_of(row.get(3)?),
+                old_landed: identity(row, 4)?,
+                new_landed: identity(row, 8)?,
+                placed: uint(row.get(12)?),
+                placed_identity: identity(row, 13)?,
+                digest: digest(row.get(17)?),
+                state: row.get(18)?,
+            })
+        }))?;
+        sql(rows.collect::<rusqlite::Result<Vec<_>>>())
+    }
+
+    /// The refused rebind of `dest` remembered: the new landed file and its
+    /// identity when the proof refused it.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn rebind_unproved(&self, dest: &Path) -> Result<Option<(PathBuf, Identity)>> {
+        if !self.has_table("rebind_unproved")? {
+            return Ok(None);
+        }
+        sql(self
+            .conn
+            .query_row(
+                "SELECT new_landing, n_dev, n_ino, n_size, n_mtime FROM rebind_unproved
+                 WHERE dest = ?1",
+                params![blob(dest)],
+                |row| {
+                    Ok((
+                        path_of(row.get(0)?),
+                        Identity {
+                            dev: uint(row.get(1)?),
+                            ino: uint(row.get(2)?),
+                            size: uint(row.get(3)?),
+                            mtime: row.get(4)?,
+                        },
+                    ))
+                },
+            )
+            .optional())
+    }
+
+    /// Re-bind the placement row of `rebind.dest` from `old_landing` to
+    /// `new_landing` (its landed identity set to `new_landed`) and append
+    /// the rebind to the history, in one commit; only while the row still
+    /// names the old landed file. A refused-proof memo of the path is
+    /// cleared. Returns whether it did.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit; the refusal of a
+    /// read-only ledger.
+    pub fn put_rebind(&self, rebind: &Rebind) -> Result<bool> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = (|| -> rusqlite::Result<bool> {
+            let changed = self.conn.execute(
+                "UPDATE placement SET landing = ?2, l_dev = ?3, l_ino = ?4, l_size = ?5,
+                    l_mtime = ?6, pass = ?7
+                 WHERE dest = ?1 AND landing = ?8",
+                params![
+                    blob(&rebind.dest),
+                    blob(&rebind.new_landing),
+                    int(rebind.new_landed.dev),
+                    int(rebind.new_landed.ino),
+                    int(rebind.new_landed.size),
+                    rebind.new_landed.mtime,
+                    self.pass,
+                    blob(&rebind.old_landing),
+                ],
+            )?;
+            if changed != 1 {
+                return Ok(false);
+            }
+            self.conn.execute(
+                "INSERT INTO rebind_history(dest, old_landing, new_landing,
+                    o_dev, o_ino, o_size, o_mtime, n_dev, n_ino, n_size, n_mtime,
+                    placed, d_dev, d_ino, d_size, d_mtime, digest, state, pass)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, 'done', ?18)",
+                params![
+                    blob(&rebind.dest),
+                    blob(&rebind.old_landing),
+                    blob(&rebind.new_landing),
+                    int(rebind.old_landed.dev),
+                    int(rebind.old_landed.ino),
+                    int(rebind.old_landed.size),
+                    rebind.old_landed.mtime,
+                    int(rebind.new_landed.dev),
+                    int(rebind.new_landed.ino),
+                    int(rebind.new_landed.size),
+                    rebind.new_landed.mtime,
+                    int(rebind.placed),
+                    int(rebind.placed_identity.dev),
+                    int(rebind.placed_identity.ino),
+                    int(rebind.placed_identity.size),
+                    rebind.placed_identity.mtime,
+                    rebind.digest.as_ref().map(<[u8; 32]>::as_slice),
+                    self.pass,
+                ],
+            )?;
+            self.conn.execute(
+                "DELETE FROM rebind_unproved WHERE dest = ?1",
+                params![blob(&rebind.dest)],
+            )?;
+            Ok(true)
+        })();
+        if let Ok(done) = outcome {
+            sql(self
+                .conn
+                .execute_batch(if done { "COMMIT" } else { "ROLLBACK" }))?;
+            Ok(done)
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            Err(BulkloadRefusal::SqliteStateChanged)
+        }
+    }
+
+    /// Remember a rebind the byte proof refused, by the new landed file's
+    /// identity, so a pass does not read it again while it is unchanged
+    /// (S3). Never touches the history.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn put_rebind_unproved(
+        &self,
+        dest: &Path,
+        landing: &Path,
+        identity: Identity,
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute(
+            "INSERT OR REPLACE INTO rebind_unproved(dest, new_landing,
+                n_dev, n_ino, n_size, n_mtime, pass)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                blob(dest),
+                blob(landing),
+                int(identity.dev),
+                int(identity.ino),
+                int(identity.size),
+                identity.mtime,
+                self.pass,
+            ],
+        ))
+        .map(drop)
+    }
+
+    /// Put one rebind back (`--undo`, ledger only, newest first): the
+    /// placement row names the old landed file and identity again, only
+    /// while it still holds exactly what the rebind left (the new landed
+    /// file and identity, the bytes, destination identity and digest);
+    /// the history row `undone`, else `undo-kept`. Returns whether the row
+    /// was put back.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn undo_rebind(&self, rebind: &Rebind) -> Result<bool> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = (|| -> rusqlite::Result<bool> {
+            let changed = self.conn.execute(
+                "UPDATE placement SET landing = ?2, l_dev = ?3, l_ino = ?4, l_size = ?5,
+                    l_mtime = ?6
+                 WHERE dest = ?1 AND landing = ?7
+                   AND l_dev = ?8 AND l_ino = ?9 AND l_size = ?10 AND l_mtime = ?11
+                   AND placed = ?12 AND d_dev = ?13 AND d_ino = ?14 AND d_size = ?15
+                   AND d_mtime = ?16 AND digest IS ?17",
+                params![
+                    blob(&rebind.dest),
+                    blob(&rebind.old_landing),
+                    int(rebind.old_landed.dev),
+                    int(rebind.old_landed.ino),
+                    int(rebind.old_landed.size),
+                    rebind.old_landed.mtime,
+                    blob(&rebind.new_landing),
+                    int(rebind.new_landed.dev),
+                    int(rebind.new_landed.ino),
+                    int(rebind.new_landed.size),
+                    rebind.new_landed.mtime,
+                    int(rebind.placed),
+                    int(rebind.placed_identity.dev),
+                    int(rebind.placed_identity.ino),
+                    int(rebind.placed_identity.size),
+                    rebind.placed_identity.mtime,
+                    rebind.digest.as_ref().map(<[u8; 32]>::as_slice),
+                ],
+            )?;
+            self.conn.execute(
+                "UPDATE rebind_history SET state = ?2, pass = ?3 WHERE seq = ?1",
+                params![
+                    rebind.seq,
+                    if changed == 1 { "undone" } else { "undo-kept" },
+                    self.pass
+                ],
+            )?;
+            Ok(changed == 1)
+        })();
+        if let Ok(done) = outcome {
+            sql(self.conn.execute_batch("COMMIT"))?;
+            Ok(done)
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            Err(BulkloadRefusal::SqliteStateChanged)
+        }
     }
 
     /// Write `row` (insert or replace), committed before this returns.

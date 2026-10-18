@@ -2349,6 +2349,45 @@ pub struct StagedBundle {
     digest: [u8; 32],
     // Whether its headers mark a capture of a bare repository (S4, #162).
     bare: bool,
+    // `estate-diff` (M2r2 item 3): set on a plan base the run shares
+    // between its items. Every scratch repository built over this base
+    // borrows one import of it per destination object store, made in this
+    // stage's private directory, instead of indexing the whole base again.
+    // `None` (every other verb): each scratch imports the base itself.
+    shared: Option<std::sync::Mutex<Vec<SharedBase>>>,
+}
+
+/// One import of a shared plan base into a scratch repository of its own
+/// (`estate-diff`, M2r2 item 3), keyed by what the import depends on: the
+/// destination object store the scratch borrows, the object format and the
+/// source name its provenance refs carry.
+#[derive(Debug)]
+struct SharedBase {
+    objects: Option<PathBuf>,
+    format: &'static str,
+    source: String,
+    // What a scratch borrows; `None` when a borrower cannot take the base
+    // by alternates and refs alone (a custody envelope, whose import
+    // writes a shallow frontier, or a stage path an alternates line cannot
+    // name): such a scratch imports the base itself, as before. Only a
+    // made import is kept: a refusal is never replayed to a later item,
+    // which tries again as it did before the share.
+    seed: Option<BaseSeed>,
+}
+
+/// What a scratch repository takes from a shared base import: its object
+/// store, as one more alternate (whose refs Git also reads as negative
+/// tips, `--alternate-refs`, so a borrower's connectivity checks stop at
+/// the base), and, created through the private-repository ref writer
+/// (`native_refs::transact_private`),
+/// the refs the import made outside its own provenance instance (the
+/// `union/v1` carry refs, which a borrower's import compares its own
+/// against). The instance's refs are not copied: every scratch read is
+/// scoped to the item's own instance.
+#[derive(Debug, Clone)]
+struct BaseSeed {
+    objects: PathBuf,
+    refs: Vec<(String, String)>,
 }
 
 impl StagedBundle {
@@ -2375,6 +2414,12 @@ impl StagedBundle {
     /// `estate-diff`, #226), never at the destination.
     pub(crate) fn private_dir(&self) -> &Path {
         self.directory.path()
+    }
+
+    /// Share this plan base's scratch import between every scratch
+    /// repository built over it (`estate-diff`, M2r2 item 3).
+    pub(crate) fn share_imports(&mut self) {
+        self.shared = Some(std::sync::Mutex::new(Vec::new()));
     }
 }
 
@@ -2461,6 +2506,7 @@ pub fn stage_bundle(bundle: &Path) -> Result<StagedBundle> {
         bundle: path,
         digest,
         bare: bare_marked(&heads),
+        shared: None,
     })
 }
 
@@ -4775,17 +4821,26 @@ fn repository_census(root: &Path, common: &Path) -> Result<Census> {
 // file resolving to a worktree administration directory of `common`,
 // registered back to this checkout, is a nested worktree of the same
 // repository; a pointer resolving to administration of a different repository
-// is a foreign nested repository. A symlink, an unreadable `.git`, an
-// unresolvable pointer, or a pointer into `common` that is not a registered
-// worktree keeps the refusal: that is malformed inventory, not custody.
+// is a foreign nested repository. A symlink or an unreadable `.git` keeps
+// the refusal: that is malformed inventory, not custody. M2r2 item 6 types
+// three pointer states by the directory's path:
+// - a pointer naming an administration absent on this host (a copy of a
+//   pruned worktree, one carried from another host, a submodule whose
+//   `.git/modules` entry is gone, a dangling symlink or an absent mount):
+//   `GIT_NEST_POINTER_STALE`; Git does not read the directory as a
+//   repository;
+// - a pointer into a worktree administration of `common` whose registered
+//   checkout exists and points back to it: a copy of that live worktree,
+//   `GIT_NEST_POINTER_STALE` too; Git would act on the live worktree's HEAD
+//   and index through it;
+// - a pointer into one whose registered checkout is absent: a worktree
+//   moved without `git worktree repair`, `GIT_NEST_WORKTREE_MOVED`.
 fn nested_administration(
     root: &Path,
     directory: &Path,
     scope: NestScope<'_>,
 ) -> Result<Option<NestedCustody>> {
-    use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
     let common = scope.common;
     let pointer = directory.join(".git");
     let meta = match fs::symlink_metadata(&pointer) {
@@ -4814,28 +4869,16 @@ fn nested_administration(
     if !meta.is_file() || meta.len() > GITDIR_POINTER_LIMIT {
         return Err(BulkloadRefusal::GitInventoryMalformed);
     }
-    let mut contents = String::new();
-    fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(&pointer)
-        .refuse_at("git_carry::nested_administration")?
-        .take(GITDIR_POINTER_LIMIT)
-        .read_to_string(&mut contents)
-        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    let target = contents
-        .lines()
-        .next()
-        .and_then(|line| line.strip_prefix("gitdir: "))
-        .map(str::trim_end)
-        .filter(|value| !value.is_empty())
-        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-    // Any unresolvable pointer is malformed inventory, never a transient IO fault.
-    let admin = fs::canonicalize(directory.join(target))
-        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    if !admin.is_dir() {
-        return Err(BulkloadRefusal::GitInventoryMalformed);
-    }
+    let contents = read_pointer_file(&pointer)?;
+    let target = pointer_target(&contents).ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let stale =
+        || -> Result<BulkloadRefusal> { Ok(BulkloadRefusal::GitNestPointerStale(rel_path()?)) };
+    // An administration absent on this host is stale, named by its
+    // directory. Any other unresolvable pointer is malformed inventory,
+    // never a transient IO fault.
+    let Some(admin) = resolve_admin(&directory.join(target))? else {
+        return Err(stale()?);
+    };
     let worktrees = common.join("worktrees");
     if admin.parent() != Some(worktrees.as_path()) {
         // Not our administration at all: a worktree of another repository, or
@@ -4851,12 +4894,43 @@ fn nested_administration(
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?
         .to_owned();
     // Registration is the administration's back-pointer to this very checkout.
-    let registered = fs::read_to_string(admin.join("gitdir"))
-        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
-    if fs::canonicalize(registered.trim_end()).ok()
-        != Some(fs::canonicalize(&pointer).refuse_at("git_carry::nested_administration")?)
-    {
+    // Git reads it right-trimmed of whitespace and, when relative (`worktree
+    // add --relative-paths`, `worktree.useRelativePaths`), against the
+    // administration directory itself; `join` keeps an absolute one.
+    let registered =
+        fs::read(admin.join("gitdir")).map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    let registered = registered.trim_ascii_end();
+    if registered.is_empty() || registered.contains(&0) {
         return Err(BulkloadRefusal::GitInventoryMalformed);
+    }
+    let ours = fs::canonicalize(&pointer).refuse_at("git_carry::nested_administration")?;
+    match fs::canonicalize(admin.join(std::ffi::OsStr::from_bytes(registered))) {
+        Ok(theirs) if theirs == ours => {}
+        Ok(theirs) => {
+            // Registered to another checkout. A copy of a live worktree only
+            // when that checkout's own pointer leads back to this
+            // administration; anything else is malformed inventory.
+            let back = read_pointer_file(&theirs)
+                .ok()
+                .and_then(|bytes| {
+                    pointer_target(&bytes)
+                        .map(|target| theirs.parent().map(|parent| parent.join(target)))
+                })
+                .flatten()
+                .map(|target| resolve_admin(&target))
+                .transpose()?
+                .flatten();
+            if back.as_deref() == Some(admin.as_path()) {
+                return Err(stale()?);
+            }
+            return Err(BulkloadRefusal::GitInventoryMalformed);
+        }
+        Err(error) if absent(&error) => {
+            // The registered checkout is gone: this worktree moved (or was
+            // copied) without `git worktree repair`.
+            return Err(BulkloadRefusal::GitNestWorktreeMoved(rel_path()?));
+        }
+        Err(_) => return Err(BulkloadRefusal::GitInventoryMalformed),
     }
     // Git itself must agree that this is a linked worktree of the same repository.
     let seen =
@@ -4873,6 +4947,56 @@ fn nested_administration(
         worktree_name,
         head_oid,
     })))
+}
+
+// Whether a path lookup failed because something along it is absent on this
+// host (a missing entry, a regular file where a directory was expected).
+fn absent(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
+}
+
+// The bytes of a gitdir-pointer file, read without following a symlink and
+// bounded by GITDIR_POINTER_LIMIT.
+fn read_pointer_file(pointer: &Path) -> Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut contents = Vec::new();
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(pointer)
+        .refuse_at("git_carry::nested_administration")?
+        .take(GITDIR_POINTER_LIMIT)
+        .read_to_end(&mut contents)
+        .map_err(|_| BulkloadRefusal::GitInventoryMalformed)?;
+    Ok(contents)
+}
+
+// The path a gitdir-pointer file names, as Git reads it
+// (`read_gitfile_gently`): the bytes after a leading `gitdir: `, with
+// trailing CR and LF stripped, as raw OS bytes (a non-UTF-8 path is a path).
+// None for an empty value, a missing prefix, or an interior NUL or newline.
+fn pointer_target(contents: &[u8]) -> Option<&Path> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut value = contents.strip_prefix(b"gitdir: ")?;
+    while let [rest @ .., b'\n' | b'\r'] = value {
+        value = rest;
+    }
+    if value.is_empty() || value.contains(&0) || value.contains(&b'\n') {
+        return None;
+    }
+    Some(Path::new(std::ffi::OsStr::from_bytes(value)))
+}
+
+// The canonical administration directory `target` names: None when it is
+// absent on this host (missing, through a regular file, or not a directory).
+fn resolve_admin(target: &Path) -> Result<Option<PathBuf>> {
+    match fs::canonicalize(target) {
+        Ok(admin) if admin.is_dir() => Ok(Some(admin)),
+        Ok(_) => Ok(None),
+        Err(error) if absent(&error) => Ok(None),
+        Err(_) => Err(BulkloadRefusal::GitInventoryMalformed),
+    }
 }
 
 // One typed filesystem seat from its lstat metadata. Sockets, FIFOs and
@@ -5888,6 +6012,21 @@ pub(crate) fn carried_heads(bundle: &Path, objects: Option<&Path>) -> Result<Str
 // `repo`'s refs and at the bundle's prerequisites, which `bundle verify` has
 // already found complete, so it reads only what the bundle brings.
 fn unbundle_objects(repo: &Path, bundle: &Path, advertised: &str) -> Result<()> {
+    let Some(walk) = closure_walk(bundle, advertised)? else {
+        return Ok(());
+    };
+    if holds_closure(repo, &walk).is_ok() {
+        return Ok(());
+    }
+    output(git(repo).args(["bundle", "unbundle"]).arg(bundle))?;
+    holds_closure(repo, &walk)?;
+    Ok(())
+}
+
+// The `rev-list --stdin` walk proving `repo` holds every object `bundle`
+// advertises: each advertised value once, then `^` each prerequisite.
+// `None` when it advertises nothing.
+fn closure_walk(bundle: &Path, advertised: &str) -> Result<Option<String>> {
     let mut walk = String::new();
     let mut objects = std::collections::BTreeSet::new();
     for line in advertised.lines() {
@@ -5903,32 +6042,45 @@ fn unbundle_objects(repo: &Path, bundle: &Path, advertised: &str) -> Result<()> 
         }
     }
     if walk.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     for prerequisite in shared::prerequisites(bundle)? {
         walk.push('^');
         walk.push_str(&prerequisite);
         walk.push('\n');
     }
-    let connected = || {
-        input(
-            git(repo).args([
-                "rev-list",
-                "--objects",
-                "--quiet",
-                "--stdin",
-                "--not",
-                "--all",
-            ]),
-            walk.as_bytes(),
-        )
+    Ok(Some(walk))
+}
+
+// Whether `repo` holds the closure `walk` names (see `closure_walk`).
+fn holds_closure(repo: &Path, walk: &str) -> Result<Vec<u8>> {
+    input(
+        git(repo).args([
+            "rev-list",
+            "--objects",
+            "--quiet",
+            "--stdin",
+            "--not",
+            "--all",
+        ]),
+        walk.as_bytes(),
+    )
+}
+
+/// Whether the destination repository `repo` already holds every object
+/// `bundle` brings: the test an import makes before it takes anything, so
+/// an import of it writes no object (M2 round 2, item 1: the apply's space
+/// plan charges nothing for it). Reads only.
+///
+/// # Errors
+/// Whatever `bundle list-heads` or the header refuses; a walk that finds an
+/// object missing is `Ok(false)`.
+pub(crate) fn bundle_held(repo: &Path, bundle: &Path) -> Result<bool> {
+    let advertised = text(git(repo).args(["bundle", "list-heads"]).arg(bundle))?;
+    let Some(walk) = closure_walk(bundle, &advertised)? else {
+        return Ok(true);
     };
-    if connected().is_ok() {
-        return Ok(());
-    }
-    output(git(repo).args(["bundle", "unbundle"]).arg(bundle))?;
-    connected()?;
-    Ok(())
+    Ok(holds_closure(repo, &walk).is_ok())
 }
 
 fn capture_revision(heads: &str, suffix: &str) -> Result<String> {
@@ -9828,9 +9980,10 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-    // Custody is for repositories Git can read. A symlink named .git, an
-    // unresolvable pointer, and a directory named .git that is not a
-    // repository are malformed inventory, exactly as before R-N32.
+    // Custody is for repositories Git can read. A symlink named .git and a
+    // directory named .git that is not a repository are malformed inventory,
+    // exactly as before R-N32; a pointer that resolves to nothing is a stale
+    // worktree copy, named by its directory (M2r2 item 6).
     #[test]
     fn a_symlinked_dot_git_still_refuses() {
         let root =
@@ -9867,7 +10020,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             reusable_capture_key(&source),
-            Err(BulkloadRefusal::GitInventoryMalformed)
+            Err(BulkloadRefusal::GitNestPointerStale(b"stray".to_vec()))
         );
         fs::remove_dir_all(&stray).unwrap();
         // A directory named .git that Git cannot read as a repository: the
@@ -9883,6 +10036,255 @@ mod tests {
         fs::remove_dir_all(&hollow).unwrap();
         assert!(nested_repositories(&source).unwrap().is_empty());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    // M2r2 item 6 (the telefreeze GIT_INVENTORY_MALFORMED): an ignored
+    // archive in the checkout holds copies of linked worktrees whose `.git`
+    // pointer files name administrations that were pruned, or that exist
+    // only on the host the repository was carried from. Git reads none of
+    // them as a repository. The capture refuses with a typed code naming
+    // the first such directory instead of a bare GIT_INVENTORY_MALFORMED,
+    // before any byte is read and without writing to the source. A copy of
+    // a live linked worktree (its pointer names an administration
+    // registered to another checkout) is stale the same way.
+    #[test]
+    fn a_stale_worktree_pointer_copy_refuses_typed_with_its_path() {
+        let root = fresh("bulkload-stale-pointer");
+        let source = root.join("main");
+        committed_repository(&source, b"main");
+        fs::create_dir_all(source.join(".git/info")).unwrap();
+        fs::write(source.join(".git/info/exclude"), b"archive/\n").unwrap();
+        // A pruned worktree's administration, spelled as another host would.
+        let pruned = source.join("archive/pruned-20261006/tree");
+        fs::create_dir_all(&pruned).unwrap();
+        fs::write(pruned.join("kept.txt"), b"evidence").unwrap();
+        fs::write(
+            pruned.join(".git"),
+            b"gitdir: /Users/nobody/git/main/.git/worktrees/pruned-20261006\n",
+        )
+        .unwrap();
+        let ignored =
+            output(git(&source).args(["status", "--porcelain", "--ignored", "-uall"])).unwrap();
+        // Git itself descends into the copy: it is no repository to Git.
+        assert!(!git(&pruned)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+        assert!(
+            String::from_utf8_lossy(&ignored).contains("!! archive/pruned-20261006/tree/kept.txt"),
+            "{}",
+            String::from_utf8_lossy(&ignored)
+        );
+        let stamps = walk_stamps(&source.join(".git"));
+        let expected =
+            BulkloadRefusal::GitNestPointerStale(b"archive/pruned-20261006/tree".to_vec());
+        assert_eq!(reusable_capture_key(&source), Err(expected.clone()));
+        assert_eq!(
+            export_repository(&source, &root.join("capture-pruned")),
+            Err(expected.clone())
+        );
+        assert_eq!(
+            expected.to_string(),
+            "GIT_NEST_POINTER_STALE path=\"archive/pruned-20261006/tree\""
+        );
+        // A pointer through a regular file (ENOTDIR) is stale too.
+        fs::write(
+            pruned.join(".git"),
+            format!("gitdir: {}\n", source.join("tracked/worktrees/x").display()),
+        )
+        .unwrap();
+        assert_eq!(reusable_capture_key(&source), Err(expected.clone()));
+        // A pointer to a regular file names no administration either.
+        fs::write(
+            pruned.join(".git"),
+            format!("gitdir: {}\n", source.join("tracked").display()),
+        )
+        .unwrap();
+        assert_eq!(reusable_capture_key(&source), Err(expected));
+        // The refused passes wrote nothing under the source's administration.
+        assert_eq!(walk_stamps(&source.join(".git")), stamps);
+        fs::remove_dir_all(source.join("archive")).unwrap();
+        // A copy of a live linked worktree: its pointer resolves to an
+        // administration registered back to the real worktree, not to it.
+        let live = root.join("live");
+        output(
+            git(&source)
+                .args(["worktree", "add", "-q", "-b", "live"])
+                .arg(&live),
+        )
+        .unwrap();
+        let copy = source.join("archive/live-copy");
+        fs::create_dir_all(&copy).unwrap();
+        fs::copy(live.join(".git"), copy.join(".git")).unwrap();
+        fs::copy(live.join("tracked"), copy.join("tracked")).unwrap();
+        // Git reads the copy through the live worktree's administration: its
+        // HEAD and index are the live worktree's, not a repository of its own.
+        let seen = text(git(&copy).args(["rev-parse", "--absolute-git-dir"])).unwrap();
+        assert_eq!(
+            fs::canonicalize(seen).unwrap(),
+            fs::canonicalize(source.join(".git/worktrees/live")).unwrap()
+        );
+        let stamps = walk_stamps(&source.join(".git"));
+        assert_eq!(
+            reusable_capture_key(&source),
+            Err(BulkloadRefusal::GitNestPointerStale(
+                b"archive/live-copy".to_vec()
+            ))
+        );
+        assert_eq!(walk_stamps(&source.join(".git")), stamps);
+        // Removing the copy restores the capture: nothing else was refused.
+        fs::remove_dir_all(source.join("archive")).unwrap();
+        let captured = reusable_capture_key(&source);
+        fs::remove_dir_all(root).unwrap();
+        assert!(captured.is_ok(), "{captured:?}");
+    }
+
+    // M2r2 item 6 review: a live nested worktree whose administration
+    // registers it by a relative path (`git worktree add --relative-paths`,
+    // `worktree.useRelativePaths`, Git 2.48) is custody, not stale. Git reads
+    // the registered path against the administration directory, never the
+    // process's working directory. Written by hand here so the test does not
+    // depend on the Git version; a CRLF-terminated pointer reads as Git
+    // reads it.
+    #[test]
+    fn a_relative_registered_nested_worktree_is_custody() {
+        let root = fresh("bulkload-relative-worktree");
+        let source = root.join("main");
+        committed_repository(&source, b"main");
+        let nested = source.join("wt/rel");
+        fs::create_dir_all(source.join("wt")).unwrap();
+        output(
+            git(&source)
+                .args(["worktree", "add", "-q", "-b", "rel"])
+                .arg(&nested),
+        )
+        .unwrap();
+        fs::write(
+            source.join(".git/worktrees/rel/gitdir"),
+            b"../../../wt/rel/.git\n",
+        )
+        .unwrap();
+        fs::write(nested.join(".git"), b"gitdir: ../../.git/worktrees/rel\r\n").unwrap();
+        let head = text(git(&nested).args(["rev-parse", "--verify", "HEAD"])).unwrap();
+        let custody = nested_worktrees(&source);
+        let key = reusable_capture_key(&source);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            custody.unwrap(),
+            vec![NestedWorktree {
+                rel_path: b"wt/rel".to_vec(),
+                worktree_name: "rel".to_owned(),
+                head_oid: head,
+            }]
+        );
+        assert!(key.is_ok(), "{key:?}");
+    }
+
+    // M2r2 item 6 review: a nested worktree moved without `git worktree
+    // repair` still works for Git, and repair fixes it; it is not a copy and
+    // its pointer is not stale. It refuses GIT_NEST_WORKTREE_MOVED by its
+    // path, and captures as custody once repaired.
+    #[test]
+    fn a_moved_nested_worktree_refuses_moved_until_repaired() {
+        let root = fresh("bulkload-moved-worktree");
+        let source = root.join("main");
+        committed_repository(&source, b"main");
+        fs::create_dir_all(source.join("wt")).unwrap();
+        let before = source.join("wt/before");
+        let after = source.join("wt/after");
+        output(
+            git(&source)
+                .args(["worktree", "add", "-q", "-b", "moved"])
+                .arg(&before),
+        )
+        .unwrap();
+        fs::rename(&before, &after).unwrap();
+        // Git still works there.
+        let head = text(git(&after).args(["rev-parse", "--verify", "HEAD"])).unwrap();
+        let stamps = walk_stamps(&source.join(".git"));
+        let refused = reusable_capture_key(&source);
+        let unchanged = walk_stamps(&source.join(".git")) == stamps;
+        output(git(&after).args(["worktree", "repair"])).unwrap();
+        let custody = nested_worktrees(&source);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            refused,
+            Err(BulkloadRefusal::GitNestWorktreeMoved(b"wt/after".to_vec()))
+        );
+        assert!(unchanged, "the refused pass wrote under the source's .git");
+        assert_eq!(
+            custody.unwrap(),
+            vec![NestedWorktree {
+                rel_path: b"wt/after".to_vec(),
+                worktree_name: "before".to_owned(),
+                head_oid: head,
+            }]
+        );
+    }
+
+    // M2r2 item 6 review: a pointer is raw bytes, as Git reads it. A
+    // non-UTF-8 gitdir naming an administration absent on this host is
+    // stale and named, no longer an unreadable bare GIT_INVENTORY_MALFORMED;
+    // a pointer without the `gitdir: ` prefix still is malformed. (A
+    // non-UTF-8 path to a readable foreign repository still refuses
+    // malformed in the nest's own Git reads, whose output is text.)
+    #[test]
+    fn a_non_utf8_stale_pointer_is_named() {
+        let root = fresh("bulkload-non-utf8-pointer");
+        let source = root.join("main");
+        committed_repository(&source, b"main");
+        fs::write(source.join(".gitignore"), b"archive/\n").unwrap();
+        let copy = source.join("archive/copy");
+        fs::create_dir_all(&copy).unwrap();
+        fs::write(
+            copy.join(".git"),
+            b"gitdir: /nowhere/\xff/.git/worktrees/x\n",
+        )
+        .unwrap();
+        let stale = reusable_capture_key(&source);
+        fs::write(copy.join(".git"), b"gitdir:no-space\n").unwrap();
+        let malformed = reusable_capture_key(&source);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            stale,
+            Err(BulkloadRefusal::GitNestPointerStale(
+                b"archive/copy".to_vec()
+            ))
+        );
+        assert_eq!(malformed, Err(BulkloadRefusal::GitInventoryMalformed));
+    }
+
+    // The pointer reader follows Git's `read_gitfile_gently`: trailing CR and
+    // LF only are stripped; spaces are part of the path.
+    #[test]
+    fn pointer_target_reads_as_git_reads() {
+        assert_eq!(pointer_target(b"gitdir: a/b\r\n"), Some(Path::new("a/b")));
+        assert_eq!(pointer_target(b"gitdir: a/b \n"), Some(Path::new("a/b ")));
+        assert_eq!(pointer_target(b"gitdir: a\nb\n"), None);
+        assert_eq!(pointer_target(b"gitdir: \n"), None);
+        assert_eq!(pointer_target(b"gitdir:a\n"), None);
+        assert_eq!(pointer_target(b"\xef\xbb\xbfgitdir: a\n"), None);
+        assert_eq!(pointer_target(b"gitdir: a\0b\n"), None);
+    }
+
+    // Path, size and modification time of every entry under `dir`, sorted.
+    fn walk_stamps(dir: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
+        let mut out = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in fs::read_dir(&next).unwrap() {
+                let entry = entry.unwrap();
+                let meta = fs::symlink_metadata(entry.path()).unwrap();
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                }
+                out.push((entry.path(), meta.len(), meta.modified().unwrap()));
+            }
+        }
+        out.sort();
+        out
     }
 
     // A repository with no foreign nest and no gitlink hashes and encodes

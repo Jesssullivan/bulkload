@@ -1599,8 +1599,12 @@ session re-seat", and the receipt
   STATE), `RESEAT_REGULARIZE_RACED` (both copies kept),
   `RESEAT_UNDO_TARGET_CHANGED` (`--undo` over an archive target that is
   gone or no longer the recorded bytes: nothing changed) and, before writing,
-  `DESTINATION_SPACE_INSUFFICIENT` (the engine's `--min-free-percent` rule
-  over the bytes a pass would write). Everything under a project key that
+  `DESTINATION_SPACE_INSUFFICIENT` (the engine's `--min-free-percent` rule,
+  a project quota judged too, over the bytes the pass's placements would
+  write). A symlinked transcript's regularization is judged per link as it
+  copies, with those bytes still reserved: a link that does not fit is its
+  own `space-refused` line (`DESTINATION_SPACE_INSUFFICIENT`) mid-pass, kept
+  a link, retried by a later pass (M2 round 2, item 1). Everything under a project key that
   is no session's is carried with its key or named by a `key` line
   (Q185). A rollout recorded outside every `--codex-source-root` is
   `RESEAT_LANE_UNMAPPED:rollout-root` in `--check` too.
@@ -1623,7 +1627,11 @@ session re-seat", and the receipt
   with their old values and reversed by `--undo` wherever the destination
   still holds exactly what re-seat wrote. `--check` reports
   `replaced_archived`, `replace_pending`, `replace_equal_size` and
-  `replace_proved`.
+  `replace_proved`. A second landing of the same home under a new root re-binds this
+  STATE's rows to it with `--rebind-landing OLD=NEW` (A-106 follow-up)
+  only where the placed bytes are proved the new landed file's (BLAKE3);
+  nothing at the destination changes, `--undo` puts the binding back, and
+  `--check` reports `rebound` and `rebind_pending`.
 - **R0 acceptance** also fails a longer landed form of a rollout that was
   never placed (`extra-form-unplaced`), and names a row carrying the
   source's `cwd` (`row-cwd-is-source`). Rollouts with no snapshot row get a
@@ -1738,3 +1746,33 @@ records the instruction, not a ruling.
   threshold (default 300 s) with no counter or descendant-IO movement,
   recorded on its counters line. An S2 sample's process (`serve`, `copy`)
   runs no watcher unless asked, so its class is what (f) says.
+
+## Amendment 2026-10-17 (M2r2 item 6): stale and moved nested pointers
+
+A proof-status line, not a new ruling (OI-1003-Q1). The in-place run's
+telefreeze capture refused a bare `GIT_INVENTORY_MALFORMED`. Its ignored
+evidence archive held copies of two pruned linked worktrees whose `.git`
+pointers named administrations that no longer exist. The census now names
+the cause.
+
+- **New codes.** Each is raised by product code and pinned by a test that
+  fails without it:
+
+  | Code | Raised when | Was |
+  |---|---|---|
+  | `GIT_NEST_POINTER_STALE path=` | a `.git` pointer below the checkout names an administration absent on this host (a copy of a pruned or other-host worktree, a submodule whose `.git/modules` entry is gone, a dangling symlink or absent mount), or a worktree administration of this repository whose registered checkout exists and points back to it (a copy of a live worktree) | `GIT_INVENTORY_MALFORMED` |
+  | `GIT_NEST_WORKTREE_MOVED path=` | a `.git` pointer below the checkout names a worktree administration of this repository whose registered checkout is absent (moved without `git worktree repair`) | `GIT_INVENTORY_MALFORMED` |
+
+- **Existing codes at fewer sites.** A live nested worktree registered by a
+  relative path (`--relative-paths`, Git 2.48) is custody. It no longer
+  refuses: the registered path is read against the administration
+  directory. A pointer is read as raw bytes, so a non-UTF-8 pointer naming
+  an absent administration is `GIT_NEST_POINTER_STALE` with its path.
+- **Old records.** No code left the taxonomy. A record written before this
+  change keeps `GIT_INVENTORY_MALFORMED`; a rerun records the new code, and
+  only that record can be dispositioned under it.
+- **Still open.** The census reports the first such directory per item, not
+  all of them. Other malformed pointers (a symlinked, empty, oversized or
+  prefix-less `.git`) still refuse `GIT_INVENTORY_MALFORMED` without a
+  path, and so does a non-UTF-8 path to a readable foreign repository (the
+  nest's own Git reads are text).

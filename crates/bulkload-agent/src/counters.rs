@@ -375,6 +375,9 @@ counters! {
     ReseatDestRead => "read_reseat_dest_bytes",
     // Bytes written into the destination's live agent state.
     ReseatDestWrite => "write_reseat_dest_bytes",
+    // Placements re-bound from a landed file under an old landing root to
+    // the same bytes under a new one (`--rebind-landing`, A-106 follow-up).
+    ReseatRebound => "reseat_rebound",
     // Destination transcripts and rollouts that were symlinks into a
     // `--replace-archived-dest` root, replaced by the differing landed
     // file (A-106; the archive target kept, the link ledgered).
@@ -391,6 +394,29 @@ counters! {
     // Threads (Linux) an escalation could not move, or 1 when it failed
     // for the process itself.
     PriorityEscalationFailures => "priority_escalation_failures",
+    // Estate adopt and `estate-diff` scratch repositories (#226; M2r2 item
+    // 3). Plan bases imported into a scratch repository (one whole-base
+    // `index-pack`, or a connectivity walk where the borrowed destination
+    // store already holds the base): in `estate-diff`, one per base and
+    // destination object store, however many items borrow it; and scratch
+    // repositories that borrowed such an import instead of indexing the
+    // base again.
+    GitScratchBaseImports => "git_scratch_base_imports",
+    GitScratchBaseBorrowed => "git_scratch_base_borrowed",
+    // Chained (re-captured) captures flattened into one self-contained
+    // bundle (`chain::flatten`): each fetches its bases and links into a
+    // private repository and writes the whole history as one bundle, a
+    // whole-repository cost per chained item in `estate-diff`, the apply and
+    // the restore verbs alike, never shared (M2r2 item 3 review).
+    GitChainFlattens => "git_chain_flattens",
+    // Free-space checks (OI-1001-Q2) this process ran, and those refused,
+    // by the limit that bound (M2 round 2, item 1): the filesystem's, or a
+    // project quota's (`statvfs` inside a project-quota tree reports the
+    // quota). A refusal both limits bind counts in both. The last refusal's
+    // numbers are the `space_refusal` line.
+    SpaceChecks => "space_checks",
+    SpaceRefusedFilesystem => "space_refused_filesystem",
+    SpaceRefusedQuota => "space_refused_quota",
 }
 
 const COUNT: usize = Counter::ALL.len();

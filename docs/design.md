@@ -907,6 +907,42 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
     An unrelated one keeps the provenance import and refuses
     `GIT_DESTINATION_OCCUPIED` (pending review, never counted applied).
   - `estate-diff` reports all of this beforehand, read-only.
+  - `estate-diff` imports a repository's plan base once (M2r2 item 3,
+    the 10-16 in-place finding: it indexed the whole base again for every
+    worktree item, O(items x repository), 11 rows an hour on a large
+    repository under load). A base is staged once per run and imported
+    once per destination object store into a scratch repository in its
+    stage; every item's scratch borrows that import and imports only its
+    own capture. A borrower takes the import's objects as one more
+    alternate after the destination's (Git reads that repository's refs
+    as negative tips, `--alternate-refs`, so a borrower's connectivity
+    checks stop at the base) and the refs the import made outside its own
+    provenance instance (the `union/v1` carry refs, which the borrower's
+    import compares its own against; usually none). The instance's own
+    refs are not copied: every scratch read is scoped to the item's
+    instance. A custody envelope (whose import writes a shallow frontier;
+    `estate-capture` does not make one as a plan base) and a stage whose
+    path no alternates line can name (a newline or a leading quote) are
+    imported per scratch, as before; a path that is not UTF-8 is lent, its
+    line written as bytes. A refusal while staging or importing a base is
+    not kept: the next item naming it tries again, so a transient failure
+    refuses one row, as before. The stage, with every import in it, is
+    removed after the last item naming its base, so its disk is one copy
+    of the base plus one import per destination store from the first such
+    item to the last. `estate-reseat --check` reads Git state through
+    `estate-diff` and shares the same way. Counted on the counters line:
+    `git_scratch_base_imports` (whole-base imports into a scratch
+    repository, by `estate-diff` and by the apply's adopt and
+    first-landing scratches) and `git_scratch_base_borrowed` (scratches
+    that borrowed a shared import). `BULKLOAD_DIFF_SHARED_IMPORT=0`
+    (exactly `0`; unset or any other value shares) is the A/B arm, an
+    import per scratch as before; its rows are byte-identical (P130-P133).
+    `estate-apply` is unchanged: each item still stages and imports its
+    own base. Not built: a chained (re-captured) item is still flattened
+    per item (`chain::flatten` fetches its bases and links into a private
+    repository and writes the whole history as one bundle, which the
+    scratch then indexes), a whole-repository cost per chained item in
+    every verb, counted `git_chain_flattens`.
   - Not built: `--protect` (land the source's state beside a destination
     adopt refuses).
 - **Hand-off block (TIN-6569, OI-1003-Q183, 2026-10-16;
@@ -1300,6 +1336,39 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   `git-export` and the other strict exports still refuse any drift.
   Directory-shape drift (a directory removed, a directory replaced by a file, a
   file replaced by a symlink) refuses fail-closed.
+- A `.git` gitdir-pointer file below the checkout that does not name its
+  own administration refuses before any byte is read, by that directory's
+  path (M2r2 item 6; each was a bare `GIT_INVENTORY_MALFORMED`).
+  The pointer is read as Git reads it: raw bytes after `gitdir: `, with
+  trailing CR and LF stripped. A registered path is read against the
+  administration directory.
+  - `GIT_NEST_POINTER_STALE` covers two cases:
+    - It names an administration absent on this host (missing, not a
+      directory, or reached through a regular file). This happens with a
+      copy of a pruned linked worktree, one carried from another host, a
+      submodule whose `.git/modules` entry was removed, or a pointer through
+      a dangling symlink or an absent mount. Git does not read such a
+      directory as a repository.
+    - It names a worktree administration of this repository whose
+      registered checkout exists and points back to it. The directory is a
+      copy of that live worktree, and Git would act on the live worktree's
+      HEAD and index through it.
+  - `GIT_NEST_WORKTREE_MOVED` covers the registered checkout being absent:
+    a worktree moved without `git worktree repair`. Git still works there,
+    and `git worktree repair` run in it re-registers it.
+
+  The census stops at the first such directory, so a run names one; a
+  rerun names the next. The remedy is the operator's, in the source, and
+  depends on the case:
+  - for a leftover copy, remove or rename its pointer;
+  - for a submodule, restore its administration;
+  - for a mount, bring it back;
+  - for a moved worktree, repair it.
+
+  Whether to carry an absent-administration directory as plain files
+  instead is an open question. The pointer would have to be omitted or
+  neutralised and recorded, because restoring it could reattach to a real
+  administration on the destination.
 - An object-store rewrite is drift too (WP1, S5). The export reads the
   source's pack listing with its authority; when a Git child of the pass
   fails and that listing has changed (a `gc`, `repack` or `prune` racing
@@ -2545,6 +2614,41 @@ filesystem (`statvfs`; `statfs` on Darwin) with less than
 the space available) refuses `DESTINATION_SPACE_INSUFFICIENT` before it
 starts.
 
+Two limits (M2 round 2, item 1, 2026-10-17). On XFS (and ext4) with project
+quotas, `statvfs` of a directory inside a project-quota tree reports the
+project's limit and use, not the filesystem's: on sting, `/srv/fast-local/jess`
+read 74 GB free under its quota against 174 GB on the filesystem, and every
+check refused with no hint why. The probe now reads the path's view and, on
+Linux, the view at the root of the same filesystem (the mount of the path's
+device whose root is `/`, from `/proc/self/mountinfo`). When the two report
+different sizes, the path's view is a project quota and the root's is the
+filesystem. **The floor is a percent of each limit's own size, applied to
+each:** the write must leave `--min-free-percent` of the quota's limit free
+under the quota, and the same percent of the filesystem's size free on the
+filesystem. Where several destinations share a filesystem, the filesystem
+is judged on all their bytes and each quota on its own tree's. A refusal
+names the limit that bound (`bound=filesystem`, `project-quota` or `both`)
+and both limits' numbers: the verb's `space_refusal` line beside its
+counters (`planned_bytes`, `filesystem_planned_bytes`, `min_free_percent`,
+`filesystem_total_bytes`, `filesystem_available_bytes`, `quota=none` or
+`quota=project` with `quota_total_bytes` and `quota_available_bytes`, then
+`path`; the process's last refused check), repeated once after a verb that
+ends `DESTINATION_SPACE_INSUFFICIENT` as `bulkload-agent: space: ...`; the
+counters `space_checks`, `space_refused_filesystem` and
+`space_refused_quota` count every check and every refusal by limit. A
+`DESTINATION_SPACE_INSUFFICIENT` converted from a write's `ENOSPC` or
+`EDQUOT` (a Git child, a store's `SQLITE_FULL`) was judged by no limit and
+prints no `space:` line. Only a smaller size at the path is a quota, and
+the root must still resolve to the path's device when it is read (a mount
+stacked on it hides it). Where the root cannot be found or read (no
+mountinfo, a device mounted only below its root or hidden, Darwin), the
+path's view is the filesystem's, as before. Quotas of one size on one
+device are summed together and judged by the least room any of them
+reported. Known limits of the labels: XFS reports a quota's free space as
+the lesser of the quota's and the filesystem's, so a full filesystem can
+also read as its quota binding (`both`); a quota with only a soft limit,
+or a realtime-inherit directory, reads as XFS reports it.
+
 - `copy` and `pull` decide it per entry on wire v6. An entry decided
   `Send` or `WantManifest` reserves its size until its `Held`. Each
   admission checks every reserved byte against a probe that is refreshed on
@@ -2552,12 +2656,25 @@ starts.
   is answered `Decision::Refuse` with that code: no new frame, the session
   continues, and a later run resumes it without re-reading durable bytes
   (R25).
-- `estate-apply` checks before any item runs. Each pending item's bundle
-  size is charged to its repository's filesystem and, for a linked worktree,
-  to its workspace's. The corpus's filesystem is charged twice the `jobs`
-  largest bundles, for bundle and base staging. Bundle size is a lower
-  bound on a checkout. An item the plan cannot read is skipped and refuses
-  on its own.
+- `estate-apply` checks before any item runs. Each pending item charges
+  its repository the bundles (the capture, its chain links and plan bases)
+  the destination repository does not already hold whole, by the same test
+  the import makes before it takes anything, and each bundle once per
+  repository across the plan (M2 round 2, item 1: a re-captured item over
+  a landed one, an adopted repository and a repository's other worktrees
+  charged their whole chains again). The checkout is charged apart from
+  the objects, to the workspace (a standalone's is its repository):
+  nothing when the workspace ledger records this capture landed; the
+  capture's own bundle when it records an earlier capture (a converge
+  moves the checkout forward); the whole chain when no checkout is
+  recorded (a first landing, or one a crash cut after its import or its
+  `worktree add`). The corpus is charged twice the `jobs` largest pending
+  bundles, for bundle and base staging. Bundle bytes are compressed, so
+  the charge is a lower bound, with stated margins it does not cover: a
+  checkout's expansion past its bundle, a pack's index files and a thin
+  pack's completion, a linked worktree's index, and a chain's links staged
+  beside its head. An item the plan cannot read, or whose destination
+  cannot be stat'ed or probed, is skipped and refuses on its own.
 - `estate-capture` checks per item (#101, OI-1002-Q11). Before an item's
   export writes, its estimated bundle (the larger of its census's
   regular-file bytes and the retained bundle it extends) plus every byte
@@ -2817,7 +2934,8 @@ bulkload-agent estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
     [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
     [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
     [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
-    [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]... [--undo]
+    [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
+    [--rebind-landing OLD=NEW]... [--undo]
     [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
 ```
 
@@ -2837,11 +2955,26 @@ temporary even outside the lock (re-review of `8a89f9a`: two unlocked runs
 published each other's half-written file).
 
 **Refused before anything is written.** `DESTINATION_SPACE_INSUFFICIENT`:
-the engine's free-space rule (`--min-free-percent`, default 25) for the
-bytes a pass would write on each destination file system (an upper bound:
-every landed file the ledger does not hold unchanged, a `.zst` at its
-frame's declared size, an owned placement's new tail only, every symlinked
-transcript's target). Sting's live state is on a file system under the 25%
+the engine's free-space rule (`--min-free-percent`, default 25; a project
+quota judged as well, see the space preflight) for the bytes the pass's
+placements would write on each destination file system. It is meant as an
+upper bound and is decided as the placement decides (M2 round 2, item 1):
+nothing for a collision, a `Continued` row, or a kept row (`Diverged`,
+`Occupied`, `Rewritten`, `Unreadable`) whose landed file and destination
+are both as recorded; for an owned placement, nothing when its file is gone
+or changed since (the destination's) or the landed file is unchanged, else
+the new tail of an append-only file or the whole of any other; otherwise
+the whole content where nothing is, the bytes past an append-only regular
+copy or a symlinked transcript's target, and nothing over any other file
+or node; a `.zst` at its frame's declared size.
+
+**Refused mid-pass, per link.** A symlinked transcript's regularization is
+not in that check (every link's target at once held whole passes back):
+each link is judged as it is copied, with the bytes the placements were
+admitted for still reserved beside it, so a regularization never takes
+what the placements after it write. One that does not fit is its own
+`space-refused` line (`DESTINATION_SPACE_INSUFFICIENT`), kept a link, and
+retried by a later pass; the links before it stay regularized. Sting's live state is on a file system under the 25%
 floor, so the live run names its floor explicitly. `RESEAT_LANDING_ABSENT`: a landed
 `.claude` or `.codex` the run covers is not a directory (absent, or a
 symlink to a source-only volume such as neo's `/Volumes/...` codex link);
@@ -3087,11 +3220,13 @@ earlier placement stays and the line names `previous_key`.
 naming its landed file: the landed file's identity at the last pass, the
 destination file's identity after bulkload's last write, the bytes placed
 and their BLAKE3, and an intent while an extension or supersede is in
-flight. The ledger carries its schema version (`user_version` 4: a
-version 2 or 3 ledger is migrated in place, a version 2 one keeping the
-shared temporary name for what it left in flight; version 4 adds the
+flight. The ledger carries its schema version (`user_version` 5: a
+version 2, 3 or 4 ledger is migrated in place, a version 2 one keeping
+the shared temporary name for what it left in flight; version 4 adds the
 replacement kind, so a build of version 3 refuses it rather than read a
-replacement as a regularization); the first build's ledger is refused
+replacement as a regularization; version 5 adds the rebind history and
+memo, so a build of version 4 refuses it rather than ignore a rebind on a
+pass or on `--undo`); the first build's ledger is refused
 `SCHEMA_MISMATCH`. An unchanged rerun reads 0
 landed bytes, the Codex snapshot and every refused, unreadable or
 unmapped session included (`read_reseat_landing_bytes`, also
@@ -3100,6 +3235,52 @@ landing, its placed bytes proven and its tail appended (the landing is the
 destination's own copy; the source is never read, R25). A live lane is
 caught up by repeated passes; the pass after its session stops on the
 source leaves it equal to the landing.
+
+**A new landing root** (`--rebind-landing OLD=NEW`, repeatable; A-106
+follow-up, 2026-10-18). A second landing of the same home under a new
+root (home2, then home3) collides with every placement the first one made
+(`RESEAT_LANE_COLLISION`: the row names another landed file), even where
+the bytes are the same. With the flag, a placement row naming a landed
+file under OLD (as the rows spell it; OLD may be gone) whose path under
+NEW (canonicalized; it must exist) is the file this pass places (the
+same stream, another form of it such as `.jsonl.zst`, or the same real
+path; every pair is tried) is re-bound instead of a collision when all of
+these hold:
+
+- the row is this STATE's own placement (`ours` or `adopted`, no intent;
+  a `continued` row is the destination's and stays as it is) and no
+  rebind of it was undone;
+- the destination is a regular file with one link whose identity is the
+  one the row last wrote;
+- the bytes it placed are proved the new landed file's: its first
+  `placed` content bytes (decompressed for a `.zst`) hash (BLAKE3) to the
+  row's digest, or, with none recorded, to the destination's own first
+  bytes read by descriptor with its identity checked before and after.
+
+The new landed file exactly those bytes, and its identity the same before
+the proof, at it and after it: `rebound` (a file and session word;
+nothing written; the row's landed identity set to that identity). Longer,
+or changed around the proof: re-bound with the old landed identity kept,
+so the same pass proves the placed bytes and appends the rest as for any
+grown landing (the session's word is then that placement's, `extended`;
+`reseat_rebound` counts both kinds). Anything else stays a collision; a
+refused proof is remembered by the new landed file's identity
+(`rebind_unproved`, apart from the history) so it is not read again while
+that file is unchanged. Never inferred from names or sizes. Each rebind
+appends a row to an append-only history (`rebind_history`: old and new
+landed file and identity, and the row's bytes, destination identity and
+digest at the rebind) in the same commit as the placement row's update,
+and only while that row still names the old landed file; a chained
+rebind (home2 → home3 → home4) adds a row per hop. Nothing at the
+destination changes, so no fault point is needed. `--undo` puts the
+rebinds back newest first (ledger only), each only while the row still
+holds exactly what that rebind left; one that moved on since (extended,
+superseded, continued) is `undo-kept` and keeps its binding. A pass does
+not re-bind a path whose rebind was undone. `--check` reports `rebound`
+(rebinds done) and `rebind_pending` (this STATE's own rows under an old
+root whose new-root file exists in either form, whose destination is
+still the file they last wrote, and that were not refused unchanged; the
+byte proof is the pass's); without `--rebind-landing` nothing is pending.
 
 **Undo** (`--undo`, OI-1003-Q198). It reverses what this STATE's ledger
 changed in the destination's own state under the rulings: each regularized
