@@ -2381,6 +2381,94 @@ starts.
   reported as the destination's. Any other I/O error a store meets is `IO`
   with its errno (`EIO` where the errno cannot be read).
 
+## A symlinked live path into a side root: `--side-root` (M2r2 item e, 2026-10-17)
+
+The 10-16 in-place move met live checkout paths that were symlinks into a
+side root: `~/git/<name> -> estate/gftb-20261015/git/<name>`, the trees an
+earlier estate landing made. `estate-apply --adopt` refuses a checkout
+spelled through a symlink (`GIT_DESTINATION_OCCUPIED`, `estate-diff`
+`symlinked-path`; P97, P98), so the lane replaced each link with a `cp -a`
+of its target and ran `git worktree repair` by hand
+(`gftb-unlink-run.sh`, 29 links). `--side-root ROOT` (repeatable) on
+`estate-apply --adopt` and `estate-diff` does it natively:
+
+- **Which links.** For each planned repository and workspace path, the
+  first symlink at or above it (from the root down). It is this verb's only
+  when it names a path inside a side root; a link elsewhere is left alone
+  (its items refuse as before). It is seated only when its single hop names
+  a real directory strictly inside the root: the link's text, joined to the
+  link's directory, is already in lexical form (no `.` or `..`) and is
+  exactly the path the system resolves (no other link on the way); the
+  link's own parent is a real path; the target is neither at, inside nor
+  above another such link's target or the real path of any planned path
+  not spelled through this link (two links into nested trees, a
+  `.worktrees/` directory inside a main checkout reached by its own link,
+  an item planned at the side root: all refused); and both are on one file
+  system. Otherwise the link is refused (`PATH_ESCAPES_ROOT`,
+  `GIT_DESTINATION_OCCUPIED`, or `IO` with `EXDEV`) and no path is changed.
+  Each link is checked again right before its seat.
+- **When.** After the apply's preflights (the space floor) and before any
+  item, under the STATE lock and an `flock` on both parent directories (two
+  applies or undos on different STATEs never move one live path at once;
+  the second refuses `IO` `EWOULDBLOCK`). `--side-root` needs `--adopt`
+  (`FIELD_DOMAIN_VIOLATION` otherwise): a seated tree is an existing
+  checkout. A seat stays when its items then refuse; `estate-unseat` undoes
+  it.
+- **The seat.** A record `seat-<blake3(LIVE)>.seat` in STATE (live path,
+  target, link text, the directory's device and inode, the plan, phase
+  `seating`), durable first; one `renameat2(RENAME_EXCHANGE)`
+  (`renameatx_np(RENAME_SWAP)` on Darwin) of the two names, so the live
+  path holds the directory itself (the same inode: no byte copied, read or
+  written, every `lstat` field below it kept; only the moved directory's
+  own ctime changes) and the target the old link. A swap that fails with
+  both names unchanged (no `RENAME_EXCHANGE` on NFS or FUSE, `ENOTDIR`)
+  removes its record again. Then at once, before either parent is synced,
+  the target's link is replaced by one naming the live path (made under a
+  fixed temporary name, swapped in by a second exchange, the old link
+  unlinked), so every path that still names the side root (a linked
+  worktree's `gitdir` file, its admin directory's backlink, another tool's
+  configuration) resolves to the same tree; then both parents are synced.
+  The swap is atomic for the live spelling; between the two exchanges the
+  side-root spelling names the old link. The apply prints `seat live=
+  target= outcome=seated|seat-resumed|unseated|refused reason=`.
+- **Then the items.** They adopt (A11a) or re-key (A11b) at the live path,
+  as at any real directory: the adopt proofs compare canonical paths, so
+  worktree links that name the side root still prove.
+- **Crash.** The record's phase and what the two paths hold name every
+  intermediate state of a seat (recorded, swapped, relinked) and of an
+  undo (marked, swapped back, relinked, record not yet removed). Every
+  `estate-apply` on the STATE, with or without `--side-root`, first
+  finishes each record by its phase; a record whose paths hold none of its
+  states is a `refused` line (`RECEIPT_BINDING_INVALID`) and the apply goes
+  on, its paths left as they are.
+- **Undo.** `estate-unseat PRIVATE_STATE [LIVE ...]` marks the record
+  `unseating` (durable), swaps back, restores the live link with its own
+  text and removes the record (`outcome=unseated plan=`); a tree replaced
+  or a link rewritten since refuses `RECEIPT_BINDING_INVALID` before the
+  mark, changing no path. An undo after the items re-keyed leaves their
+  ledgers keyed to the live plan.
+- **Dry run.** `estate-diff --side-root ROOT` prints one `kind:"seat"` row
+  per link (`seatable` or `refused` with its code) and answers each item
+  spelled through a seatable link at the directory it names (the tree the
+  live path holds once seated), with the component `side-root-seat`.
+  Read-only.
+- **Against the copy `cp -a` made (operator decision).** No second tree,
+  no disk, no byte to re-prove, and the live spelling changes atomically.
+  The side root does change: each seated target becomes a link back to the
+  live path, where `cp -a` left the side root untouched and duplicated it.
+  No `git worktree repair` runs: the admin files keep the side-root
+  spelling, which the link back resolves, so `git worktree list` shows the
+  side-root paths and removing the side root (its links back) would break
+  those worktrees. Repairing them (a recorded write of `.git` and `gitdir`
+  files) is not built.
+- Tests: `estate::seat` unit tests (exact undo; every crash step of a seat
+  and of an undo, never re-seated; a failed swap leaves no record; a record
+  resume cannot finish is a line; a held parent refuses; hop rules; nested
+  targets and planned paths inside a target; a target the plan names);
+  P120 (a main and a linked worktrees directory landed into a side root,
+  seated and re-keyed, closure passing, unseated); P121 (single hop only,
+  `--side-root` without `--adopt` refused).
+
 ## Installing the agent (M2 item 4, 2026-10-16)
 
 A `bulkload-agent` built inside `nix develop` is dynamically linked

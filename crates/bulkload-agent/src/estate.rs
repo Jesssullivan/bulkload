@@ -2974,6 +2974,13 @@ pub struct ApplyOptions {
     /// an scp-style or `ssh://` origin starting with one of these; a local
     /// path never ([`git_carry::origin_prefix_allowed`]).
     pub activate_origin: Vec<String>,
+    /// `--side-root ROOT` (repeatable; M2r2 item e; needs `adopt`): after
+    /// the preflights and before any item lands, each planned path spelled
+    /// through a symlink whose single hop names a directory inside ROOT is
+    /// seated there ([`seat`]): the directory takes the live path by one
+    /// exchange (same inode, no byte copied) and the side-root path becomes
+    /// a link back, recorded in STATE for `estate-unseat`.
+    pub side_roots: Vec<PathBuf>,
     /// `--exclude-union` (M2 round 2, item 2): a first linked landing whose
     /// repository's common `info/exclude` is not the capture's appends the
     /// captured lines it lacks, recorded in STATE, instead of refusing
@@ -3032,6 +3039,55 @@ pub fn apply_with(
     )
 }
 
+/// `estate-unseat STATE [LIVE ...]` (M2r2 item e): undo every seat
+/// recorded in `state`, or those of `lives`, under the apply's STATE lock;
+/// one line per seat undone, handed to `line`.
+///
+/// # Errors
+/// `REQUIRED_FIELD_MISSING` for a LIVE path with no seat record (nothing is
+/// undone); [`seat::unseat`]'s refusal, at the first seat refused.
+pub fn unseat(
+    state: &Path,
+    lives: &[PathBuf],
+    line: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let _lock = exclusive(&state.join("estate.lock"))?;
+    let records = seat::records(state)?;
+    if lives
+        .iter()
+        .any(|live| !records.iter().any(|(_, record)| &record.live == live))
+    {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    for (path, record) in records {
+        if !lives.is_empty() && !lives.contains(&record.live) {
+            continue;
+        }
+        seat::unseat(&path, &record)?;
+        line(&format!(
+            "{} plan=\"{}\"",
+            seat_line(&record.live, &record.target, "unseated", None),
+            record.plan.display().to_string().escape_debug()
+        ))?;
+    }
+    Ok(())
+}
+
+// One seat's line on the apply's output (M2r2 item e).
+fn seat_line(
+    live: &Path,
+    target: &Path,
+    outcome: &str,
+    refusal: Option<&BulkloadRefusal>,
+) -> String {
+    format!(
+        "seat live=\"{}\" target=\"{}\" outcome={outcome} reason={}",
+        live.display().to_string().escape_debug(),
+        target.display().to_string().escape_debug(),
+        refusal.map_or("none", BulkloadRefusal::code),
+    )
+}
+
 /// [`apply_with`], with each hand-off H step's line (TIN-6569,
 /// OI-1003-Q183: `item=<id> handoff=<written|unchanged|CODE>`) handed to
 /// `handoff_line` after the last level.
@@ -3055,6 +3111,10 @@ pub fn apply_reporting(
     {
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
+    // A seated tree is an existing checkout: only `--adopt` lands into it.
+    if !options.side_roots.is_empty() && !options.adopt {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
     private_directory(state)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let contents: Plan = read(plan)?;
@@ -3062,6 +3122,39 @@ pub fn apply_reporting(
     // take a destination filesystem under its free-space floor.
     for (probe, planned) in space_plan(&contents, corpus, state, source, jobs) {
         crate::space::preflight(&probe, planned)?;
+    }
+    // M2r2 item e, after the preflights and before any item: finish every
+    // seat or undo a crash interrupted (a record that cannot be finished is
+    // a refused line, never the apply's refusal), then seat the plan's
+    // symlinked live paths into the side roots. A seat stays when its items
+    // then refuse (`estate-unseat` undoes it).
+    let roots = seat::roots(&options.side_roots)?;
+    for (record, done) in seat::resume(state)? {
+        match done {
+            Ok(seat::Seated::Present) => {}
+            Ok(done) => handoff_line(&seat_line(&record.live, &record.target, done.word(), None))?,
+            Err(refusal) => handoff_line(&seat_line(
+                &record.live,
+                &record.target,
+                "refused",
+                Some(&refusal),
+            ))?,
+        }
+    }
+    let owner = std::path::absolute(plan).refuse_at("estate::apply")?;
+    for candidate in seat::candidates(&contents.items, &roots) {
+        let line = match &candidate.found {
+            seat::Found::Seatable { target, .. } => {
+                match seat::seat(state, &owner, &contents.items, &roots, &candidate.live) {
+                    Ok(done) => seat_line(&candidate.live, target, done.word(), None),
+                    Err(refusal) => seat_line(&candidate.live, target, "refused", Some(&refusal)),
+                }
+            }
+            seat::Found::Refused(refusal) => {
+                seat_line(&candidate.live, Path::new(""), "refused", Some(refusal))
+            }
+        };
+        handoff_line(&line)?;
     }
     let mut locks = std::collections::BTreeMap::new();
     let mut groups = std::collections::BTreeMap::new();
@@ -3284,6 +3377,9 @@ pub mod custody_probe {
         ))
     }
 }
+
+// `estate-apply --side-root` and `estate-unseat` (M2r2 item e).
+pub mod seat;
 
 // `estate-diff` (#226 item 1).
 pub mod carried;

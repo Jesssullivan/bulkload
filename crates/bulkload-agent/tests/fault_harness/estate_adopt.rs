@@ -273,6 +273,7 @@ impl World {
                 adopt,
                 activate_origin: Vec::new(),
                 exclude_union: self.union,
+                side_roots: Vec::new(),
             },
             &|row| {
                 rows.lock().unwrap().push((row.outcome, row.reason.clone()));
@@ -414,6 +415,7 @@ fn adopt_child_entry() {
             adopt: true,
             activate_origin: Vec::new(),
             exclude_union: std::env::var_os(CHILD_UNION_ENV).is_some_and(|value| value == "1"),
+            side_roots: Vec::new(),
         },
         &|_| Ok(()),
     );
