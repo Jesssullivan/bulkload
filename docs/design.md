@@ -120,6 +120,161 @@ recorded under another source (`record-source-mismatch`) is still refused
   does. A review row naming such a code disposes nothing and is listed under
   `reviewed.unmatched`; the rest of the ledger keeps working.
 
+**Capture-refused items carried as files (M2r2 b, 2026-10-17).** An item
+whose capture refused has no capture record; `estate-apply` records it
+`CAPTURE_ABSENT`, and closure holds it `refused-pending-review`. The cases
+are a partial clone, a malformed inventory, a missing index, a nest
+conversion attribute and a failed Git child. The in-place run carried 14
+such items with hand-run `pull` sessions, which closure could not bind to
+the plan.
+
+`estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--host
+HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
+PLAN CORPUS PRIVATE_STATE SOURCE CARRY_STATE` carries them with bulkload's
+own transfer and records the result in the estate ledger.
+
+- **Eligible.** An item is eligible when the corpus holds no capture
+  record for it, and its outcome record is
+  `CAPTURE_ABSENT`, or an earlier `carried-as-files`, which is re-proved.
+  Every other item is printed `skipped=<why>` and left alone.
+- **Destination.** The destination is the planned workspace, or with
+  `--beside` the workspace path with SUFFIX appended (a suffix holding `/`
+  or NUL refuses `FIELD_DOMAIN_VIOLATION`). An absent destination is made
+  one level deep, 0755, under an existing parent; otherwise the item
+  refuses `GIT_DESTINATION_PARENT_MISSING`.
+- **One transfer session.** Each item gets one `copy` or `pull` (from
+  HOST, with the remote source state under DIR) recorded in
+  `CARRY_STATE/<item>/dest`, like any session. The transfer's rules hold:
+  - bytes are carried exactly, `.git` included;
+  - an equal destination file is adopted with nothing written;
+  - a differing one is refused and never overwritten;
+  - the transfer's own durability order applies.
+
+  A session that ends refused, or completes with a refused path, does not
+  carry the item. It prints `carried=incomplete` with the first refused
+  path, keeps its outcome, and the verb exits nonzero. The transfer's own
+  rows, joined with `--transfer`, name every refused path.
+- **Binding an earlier session (`--bind ITEM=DEST_STATE`).** The item is
+  bound to a session the same transport already recorded in that state:
+  same source key, same destination, completed, with no refused path. No
+  session runs and nothing is written under the destination; the `.git`
+  resolution and the records below are the same. This is how bulkload proves a
+  carry made earlier by its own `pull` (the in-place run's hand-run
+  sessions). Without such a record the item refuses
+  `CLOSURE_UNACCOUNTED` and keeps its outcome. A later session rewriting
+  that record unproves the carry (`carried-transfer-changed`) until it is
+  bound again.
+- **`.git` resolution (#261).** Whenever anything landed (a completed,
+  incomplete or refused session, or a bind), every directory below the
+  destination that holds a `.git` entry (a directory, a pointer file, a
+  symlink, or a symlink to a pointer file) is resolved as Git resolves it.
+  Git's `rev-parse` gives its git dir, common dir and top level; it runs
+  with no optional locks, no hooks, no fsmonitor and no discovery above
+  the directory. Its object alternates and every symlink inside its
+  administration are resolved too. Each result must be inside the carried
+  tree, or Git must be unable to use the directory at all (an
+  administration absent on this host). Anything outside refuses
+  `GIT_CARRY_POINTER_ATTACHED path=<the .git entry>`, recorded as the
+  item's outcome, because Git would act on another repository through the
+  carried copy. That covers:
+  - a pointer naming an outside repository;
+  - a `.git` symlink to a pointer file;
+  - an internal worktree administration whose `commondir` is outside;
+  - a nested `.git` directory with an outside `core.worktree`;
+  - outside alternates.
+
+  An incomplete session reports an attachment too. The landed bytes are
+  left for review; nothing is rewritten. Nothing is withheld before
+  landing, because the source walk (local, or the remote `serve`) has no
+  per-path exclusion. Admin-internal gitfiles that Git reads only for
+  pruning (`worktrees/*/gitdir`) are not resolved.
+- **Records, in order.** The carry record
+  `{item}-{blake3(SOURCE)}.carried` is written first, durably (temporary,
+  fsync, rename, directory fsync). It holds the item, source, destination,
+  `beside`, whether the carry made the destination, the transfer state, the
+  session's row identity and the blake3 of its record bytes, and the
+  pointers. Then the outcome becomes `carried-as-files` (a new `Outcome`
+  variant, appended after `Refused`).
+  - A crash between the two leaves `CAPTURE_ABSENT`, and closure never
+    reads such an item `carried`; the rerun's transfer adopts what landed
+    and finishes it (fault point `estate.carry.recorded`, harness row
+    `estate_carry_recorded`).
+  - `estate-apply` keeps a carried item's outcome while its carry still
+    proves, so a re-apply never returns it to `CAPTURE_ABSENT`.
+- **Closure (v5).** Closure counts the item `carried` (accounted, like
+  `applied`) only when all of these hold:
+  - the outcome is `carried-as-files`;
+  - the carry record decodes and names the item and its source;
+  - its destination is the planned workspace with the recorded suffix, or,
+    for a refs-only item, none of its own;
+  - the transfer record it names still has the recorded bytes, and is a
+    completed session from this item's source into that destination with
+    no refused path;
+  - every recorded `.git` directory still resolves inside the destination
+    or not at all;
+  - for a refs-only item, its `via` names a planned workspace item of the
+    same source whose own outcome is `carried-as-files` and whose own carry
+    proves.
+
+  Otherwise it is unaccounted, with a reason such as
+  `carried-record-missing`, `carried-destination-mismatch`,
+  `carried-transfer-changed`, `carried-transfer-mismatch`,
+  `carried-transfer-refused-paths`, `carried-pointer-attached`,
+  `carried-shape-mismatch` or `carried-via-unproved`.
+- **What `carried` means.** `carried` means the item was carried at the
+  session's time.
+  - Checked again on every proof (closure, and `estate-apply` keeping the
+    outcome): the transfer record's bytes, and each recorded `.git`
+    directory's resolution, so a target that appeared since (a sibling
+    applied later beside it, say) makes the item unaccounted.
+  - Not checked again: the destination's bytes, and `.git` entries made
+    under it after the carry.
+- **Byte-exact, with the transfer's two exceptions.** A live SQLite
+  database is carried as a snapshot (`--sqlite=snapshot`), its live
+  sidecars covered, not copied. The source's tagged engine temporaries are
+  listed by the transfer, not carried.
+- **Selections are checked before any write.** Every `--item` and
+  `--bind` must name a planned, eligible item, and a bind must name a
+  workspace item; otherwise the run refuses `FIELD_DOMAIN_VIOLATION`, one
+  line per bad selection, before any lock or write. `--bind-only` also
+  refuses a selected workspace item that has no bind, so no session can
+  run by accident.
+- **Reruns.** An item already carried whose carry still proves is kept
+  (`kept=proved`) with no session, unless `--recarry` or a bind for it asks
+  again. One whose carry no longer proves needs either.
+  - A rerun that ends refused or incomplete for an item that was carried
+    writes `CAPTURE_ABSENT` back, for it and for every refs-only item
+    riding on it.
+  - Carrying a workspace item again also re-records the refs-only items
+    riding on it.
+- **Binaries.** Only binaries with this change know `carried-as-files`
+  (outcome variant 11). An older binary reads such a record as unreadable,
+  and an older `estate-apply` records `CAPTURE_ABSENT` over it. Run the
+  carry and every later apply with the merged binary.
+- **What changed for a v4 reader.** `bulkload.closure.v5`:
+  - the disposition `carried`, counted in the new `totals.carried` after
+    `covered` (accounted; it is in neither `applied` nor
+    `pending_review`);
+  - a `carried` block on such a row: `via`, `destination`, `beside`,
+    `transfer_state` and `gits`;
+  - the new unaccounted reasons above.
+
+  Nothing else changed.
+- **No-op applies.** A re-apply keeps a carried item's outcome as a no-op,
+  like a previous journal: its repository is not marked touched.
+- **Refs-only items.** A refs-only item whose capture refused (the plan's
+  `repository` only) has its custody, the source's `.git`, inside a carried
+  workspace item of the same source. After the workspace items, it gets a
+  carry record naming that item (`via`) and binding the same transfer
+  record, and the outcome `carried-as-files`. Nothing is written at its
+  repository. Without a carried sibling it keeps `CAPTURE_ABSENT`. Closure
+  requires `via` exactly for a refs-only item
+  (`carried-shape-mismatch` otherwise).
+- **`--dry-run`.** It reads only and prints, per item, the destination,
+  what is there now (`absent`, `empty`, `nonempty`), whether its parent
+  exists, the prior transfer records in its state, and the session it would
+  run.
+
 **Transfers in the same report (WP3 PR 4, 2026-10-15, S4).** Every `copy`
 and `pull` session leaves a durable record in its DEST_STATE, one per
 transfer under `transfer.closure.d/<item>.closure` (`<item>` is the
@@ -184,8 +339,9 @@ Not joined: `snapshot` and the offline compose verbs, which belong to no
 run; a source's tagged engine temporaries a walk skipped are listed by the
 transfer, not rows.
 
-The report schema is `bulkload.closure.v4` from #226 (OI-1003-Q171/Q172,
-2026-10-15). What changed for a v3 reader: one top-level block after
+The report schema is `bulkload.closure.v5` from M2r2 b (2026-10-17; what
+changed for a v4 reader is in the carried-as-files paragraph above). v4 came
+from #226 (OI-1003-Q171/Q172, 2026-10-15). What changed for a v3 reader: one top-level block after
 `unmatched_journals`, `omissions`: the rebuildable roots the planned items'
 current captures omitted (`node_modules`, `.direnv`, `__pycache__`,
 `.terraform` and the rest of `REBUILDABLE_DIRECTORIES`), from each

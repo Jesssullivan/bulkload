@@ -2264,6 +2264,24 @@ fn apply_item(
     // typed refusal, never a bare IO errno; and it names the absent capture
     // (S4, #219), never a sealed object a capture recorded and lost.
     if !record.try_exists().refuse_at("estate::apply_item")? {
+        // M2r2 b: an item `estate-carry-files` carried as files, with its
+        // carry still proved, keeps that outcome; a re-apply never turns it
+        // back into CAPTURE_ABSENT.
+        let carried_now = matches!(
+            crate::outcome::read_record(&state.join(format!("{identity}.outcome"))),
+            Ok(crate::outcome::OutcomeRecord {
+                outcome: crate::outcome::Outcome::CarriedAsFiles,
+                ..
+            })
+        );
+        if carried_now
+            && matches!(
+                carried::prove(&[state.to_path_buf()], &identity, source, item),
+                Some(Ok(_))
+            )
+        {
+            return Ok(Completion::clean(carried::CARRIED_OUTCOME));
+        }
         return Err(BulkloadRefusal::CaptureAbsent);
     }
     let captured: Capture = read(&record)?;
@@ -2608,6 +2626,12 @@ pub struct LedgerEntry {
     /// sidecar, from what its bundle carries in band
     /// ([`git_carry::in_band`], M2 round 2, d); `None` when that is unknown.
     pub omitted: Option<Vec<git_carry::RebuildableOmission>>,
+    /// The item's proved carry as files (M2r2 b): its
+    /// `{item}-{blake3(SOURCE)}.carried` record from the last state
+    /// directory holding one, with the transfer record it names checked
+    /// ([`carried::prove`]), or why it proves nothing. `None` when no state
+    /// directory holds one.
+    pub carried: Option<std::result::Result<carried::CarriedProof, &'static str>>,
     /// Why `omitted` is unknown: `no-capture`, `capture-unreadable`,
     /// `sidecar-unreadable`, or the in-band reader's reason
     /// (`header-unreadable`, `value-not-read`, `value-not-held`,
@@ -2736,6 +2760,7 @@ pub fn ledger_with(
             JournalState::CaptureUnreadable
         };
         let record = records.get(&identity);
+        let carried = carried::prove(states, &identity, source, item);
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
@@ -2743,10 +2768,12 @@ pub fn ledger_with(
             journal,
             capture,
             omitted,
+            carried,
             unknown_because,
             item: identity,
         });
     }
+    check_riders(&mut ledger);
     ledger.foreign_records = records
         .into_keys()
         .filter(|item| !planned.contains(item))
@@ -2756,6 +2783,44 @@ pub fn ledger_with(
         .filter(|name| !matched.contains(name))
         .collect();
     Ok(ledger)
+}
+
+// M2r2 b: a refs-only item's carry rides on a planned workspace item of the
+// same source whose own outcome is carried-as-files and proves.
+fn check_riders(ledger: &mut Ledger) {
+    let riding: Vec<(usize, String)> = ledger
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match &entry.carried {
+            Some(Ok(carried::CarriedProof { via: Some(via), .. })) => Some((index, via.clone())),
+            _ => None,
+        })
+        .collect();
+    for (index, via) in riding {
+        let Some(source) = ledger.entries.get(index).map(|entry| entry.source.clone()) else {
+            continue;
+        };
+        let proved = ledger.entries.iter().any(|sibling| {
+            sibling.item == via
+                && sibling.has_workspace
+                && sibling.source == source
+                && matches!(
+                    sibling.record,
+                    Some(Ok(crate::outcome::OutcomeRecord {
+                        outcome: crate::outcome::Outcome::CarriedAsFiles,
+                        ..
+                    }))
+                )
+                && matches!(
+                    sibling.carried,
+                    Some(Ok(carried::CarriedProof { via: None, .. }))
+                )
+        });
+        if let (false, Some(entry)) = (proved, ledger.entries.get_mut(index)) {
+            entry.carried = Some(Err("carried-via-unproved"));
+        }
+    }
 }
 
 /// Where an item's first landing records the parents it made (M2 finding 1).
@@ -3145,10 +3210,10 @@ pub fn apply_reporting(
         // TIN-6569: a repository whose item did more than a journal no-op
         // gets the H step after the last level; a refused item's own
         // workspace never does (design 6.4: the converge left it as it was).
-        if done
-            .as_ref()
-            .map_or(true, |done| !done.outcome.starts_with("previous-"))
-        {
+        if done.as_ref().map_or(true, |done| {
+            // A kept carry (M2r2 b) is a no-op, like a previous journal.
+            !done.outcome.starts_with("previous-") && done.outcome != carried::CARRIED_OUTCOME
+        }) {
             let mut touched = touched
                 .lock()
                 .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
@@ -3317,6 +3382,7 @@ pub mod custody_probe {
 pub mod seat;
 
 // `estate-diff` (#226 item 1).
+pub mod carried;
 mod diff;
 pub use diff::{diff, DiffOptions, Summary as DiffSummary, SCHEMA as DIFF_SCHEMA};
 
