@@ -163,14 +163,53 @@ intent ledger and ruling records are never deleted.
 
 ## Validation
 
+Merge gate (OI-1003-Q199, 2026-10-16, Linear TIN-4543 comment `b208cbae`):
+a PR merges on a local receipt from sting, not on runner CI (since the
+operator's 2026-10-17 ruling the gate's build and test half runs on honey on
+the exact head; the receipt names the host).
+`just local-gate-receipt --pr N --post` (`scripts/local-gate-receipt.sh`)
+runs, from the repository root, exactly what the CI action runs:
+`nix flake check --no-build --no-write-lock-file`, then
+`nix develop --no-write-lock-file --ignore-environment` keeping only CI's
+`HOME`, `NIX_*_HOME` and `XDG_*_HOME`, running `just local-gate`
+(`check-fast`, the history secret scan limited to HEAD's ancestry
+`secrets-scan-head`, and the Bazel graph load `bazel-graph`; the contract
+test holds it to CI's gate set and derives the `nix develop` line from the
+action). Ambient `BULKLOAD_*`, `RUSTFLAGS`, `CARGO_*` and `PATH` never reach
+the gate. It refuses a dirty tree and an overlay (an ignored or excluded
+file other than build output, such as `.envrc.local` or `.env.local`; a
+skip-worktree or assume-unchanged file; a cargo config above the checkout
+or in `~/.cargo`) unless `--allow-overlay` is given, which the receipt
+records. The receipt line leads with PASS or FAIL and records head, tree,
+main, the flake.lock and log digests, the exit code, the kind and the
+overlay; `--post` comments a PASS as "Local gate receipt" and a FAIL only
+as "Local gate FAILED", never as a receipt. The kind comes from the diff:
+docs when every changed path is Markdown, else code; `--kind` may raise
+docs to code, never lower it. Docs PRs need the receipt only; code PRs also
+need the lanes' adversarial review (OI-1003-Q173).
+A receipt is valid only while receipt.head is the PR head and receipt.main
+is main's current tip: a push to the PR or any merge to main voids it.
+Right before `gh pr merge --match-head-commit`, the merge runs
+`just local-gate-verify --pr N`, which checks both against GitHub, the
+receipt's tree against the head's, and that the newest gate comment from a
+writer for that head and main is a PASS. A PR that `just darwin-touched`
+flags (a Darwin path, the io layer, a Rust file with any `target_os`,
+`target_vendor`, `target_family`, `cfg!(` or unix/windows cfg, `build.rs`,
+`.cargo/`, `Cargo.*`, the toolchain or `flake.*`) also needs
+`just darwin-check` on pzm, never neo (OI-1003-Q196); while pzm is on hold
+that check is deferred and recorded with the receipt. CI runs only on `v*`
+tags and `workflow_dispatch`, as the backstop. The local gate retires when
+GloriousFlywheel v4 fabric check runs land (TIN-5946).
+
 Local first (OI-1001-Q2, 2026-10-01): run `just check-fast` inside
 `nix develop` before pushing; GloriousFlywheel CI is a contended backstop,
 not the first signal. The `justfile`'s recipe comments are the reference for
 every tier (`just --list`): `check-fast` (mandatory), `check-optional`,
 `check-full`, and the deep tier (`props-deep`, `crash-sweep`; OI-1003-Q78,
-Q81), which is never a PR gate. PR CI runs two gates, `ci-source` and
-`ci-fault-harness` (R-N122, OI-1003-Q65); `ci-source` also runs the history
-secret scan, which locally is in the optional tier.
+Q81), which is never a PR gate. CI (`v*` tags and `workflow_dispatch`) runs
+two gates, `ci-source` and `ci-fault-harness` (R-N122, OI-1003-Q65);
+`ci-source` also runs the history secret scan, which locally is in the
+optional tier and, scoped to HEAD's ancestry, in `local-gate`.
 
 Rules the recipes do not enforce on their own:
 
@@ -184,7 +223,8 @@ Rules the recipes do not enforce on their own:
   `scripts/ci-public-read-guard.sh`, the action and
   `tests/test_ci_contract.py`. Changing the workflow updates
   `WORKFLOW_SHA256` in `tests/test_ci_contract.py`.
-- No PR loads the Bazel graph. `just test` and `just test-local` run
+- `local-gate` loads the Bazel graph (`bazel-graph`, a query, OI-1003-Q199);
+  nothing in a PR gate builds it. `just test` and `just test-local` run
   `//:tests`; `just build` and `just ci` build `//:bulkload`.
 
 Stage explicit paths.
