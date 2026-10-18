@@ -349,7 +349,7 @@ fn closure_dispose_records_a_review_that_closes_a_typed_refusal() {
     let out = String::from_utf8_lossy(&closed.stdout);
     assert!(closed.status.success(), "{out}");
     assert!(
-        out.contains("\"schema\":\"bulkload.closure.v4\",\"verdict\":\"pass\",\"gate\":\"pass\"")
+        out.contains("\"schema\":\"bulkload.closure.v5\",\"verdict\":\"pass\",\"gate\":\"pass\"")
             && out.contains("\"review\":{\"decision\":\"accept\",\"reviewer\":\"jess\",\"date\":\"2026-10-06\",\"basis\":\"item\"}"),
         "{out}"
     );
@@ -571,7 +571,7 @@ fn a_copy_session_is_rows_of_the_closure_report_and_its_gate() {
     let out = String::from_utf8_lossy(&joined.stdout).into_owned();
     assert!(!joined.status.success());
     assert!(
-        out.contains("\"schema\":\"bulkload.closure.v4\",\"verdict\":\"pass\",\"gate\":\"fail\"")
+        out.contains("\"schema\":\"bulkload.closure.v5\",\"verdict\":\"pass\",\"gate\":\"fail\"")
             && out.contains("\"planned\":1,\"transfer_rows\":2,\"applied\":1")
             && out.contains("\"refused_pending_review\":2")
             && out.contains("\"disposition\":\"applied\",\"kind\":\"transfer-session\"")

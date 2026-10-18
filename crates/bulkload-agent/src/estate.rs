@@ -2264,6 +2264,24 @@ fn apply_item(
     // typed refusal, never a bare IO errno; and it names the absent capture
     // (S4, #219), never a sealed object a capture recorded and lost.
     if !record.try_exists().refuse_at("estate::apply_item")? {
+        // M2r2 b: an item `estate-carry-files` carried as files, with its
+        // carry still proved, keeps that outcome; a re-apply never turns it
+        // back into CAPTURE_ABSENT.
+        let carried_now = matches!(
+            crate::outcome::read_record(&state.join(format!("{identity}.outcome"))),
+            Ok(crate::outcome::OutcomeRecord {
+                outcome: crate::outcome::Outcome::CarriedAsFiles,
+                ..
+            })
+        );
+        if carried_now
+            && matches!(
+                carried::prove(&[state.to_path_buf()], &identity, source, item),
+                Some(Ok(_))
+            )
+        {
+            return Ok(Completion::clean(carried::CARRIED_OUTCOME));
+        }
         return Err(BulkloadRefusal::CaptureAbsent);
     }
     let captured: Capture = read(&record)?;
@@ -2608,6 +2626,12 @@ pub struct LedgerEntry {
     /// sidecar, from what its bundle carries in band
     /// ([`git_carry::in_band`], M2 round 2, d); `None` when that is unknown.
     pub omitted: Option<Vec<git_carry::RebuildableOmission>>,
+    /// The item's proved carry as files (M2r2 b): its
+    /// `{item}-{blake3(SOURCE)}.carried` record from the last state
+    /// directory holding one, with the transfer record it names checked
+    /// ([`carried::prove`]), or why it proves nothing. `None` when no state
+    /// directory holds one.
+    pub carried: Option<std::result::Result<carried::CarriedProof, &'static str>>,
     /// Why `omitted` is unknown: `no-capture`, `capture-unreadable`,
     /// `sidecar-unreadable`, or the in-band reader's reason
     /// (`header-unreadable`, `value-not-read`, `value-not-held`,
@@ -2736,6 +2760,7 @@ pub fn ledger_with(
             JournalState::CaptureUnreadable
         };
         let record = records.get(&identity);
+        let carried = carried::prove(states, &identity, source, item);
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
@@ -2743,10 +2768,12 @@ pub fn ledger_with(
             journal,
             capture,
             omitted,
+            carried,
             unknown_because,
             item: identity,
         });
     }
+    check_riders(&mut ledger);
     ledger.foreign_records = records
         .into_keys()
         .filter(|item| !planned.contains(item))
@@ -2756,6 +2783,44 @@ pub fn ledger_with(
         .filter(|name| !matched.contains(name))
         .collect();
     Ok(ledger)
+}
+
+// M2r2 b: a refs-only item's carry rides on a planned workspace item of the
+// same source whose own outcome is carried-as-files and proves.
+fn check_riders(ledger: &mut Ledger) {
+    let riding: Vec<(usize, String)> = ledger
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match &entry.carried {
+            Some(Ok(carried::CarriedProof { via: Some(via), .. })) => Some((index, via.clone())),
+            _ => None,
+        })
+        .collect();
+    for (index, via) in riding {
+        let Some(source) = ledger.entries.get(index).map(|entry| entry.source.clone()) else {
+            continue;
+        };
+        let proved = ledger.entries.iter().any(|sibling| {
+            sibling.item == via
+                && sibling.has_workspace
+                && sibling.source == source
+                && matches!(
+                    sibling.record,
+                    Some(Ok(crate::outcome::OutcomeRecord {
+                        outcome: crate::outcome::Outcome::CarriedAsFiles,
+                        ..
+                    }))
+                )
+                && matches!(
+                    sibling.carried,
+                    Some(Ok(carried::CarriedProof { via: None, .. }))
+                )
+        });
+        if let (false, Some(entry)) = (proved, ledger.entries.get_mut(index)) {
+            entry.carried = Some(Err("carried-via-unproved"));
+        }
+    }
 }
 
 /// Where an item's first landing records the parents it made (M2 finding 1).
@@ -2909,6 +2974,13 @@ pub struct ApplyOptions {
     /// an scp-style or `ssh://` origin starting with one of these; a local
     /// path never ([`git_carry::origin_prefix_allowed`]).
     pub activate_origin: Vec<String>,
+    /// `--side-root ROOT` (repeatable; M2r2 item e; needs `adopt`): after
+    /// the preflights and before any item lands, each planned path spelled
+    /// through a symlink whose single hop names a directory inside ROOT is
+    /// seated there ([`seat`]): the directory takes the live path by one
+    /// exchange (same inode, no byte copied) and the side-root path becomes
+    /// a link back, recorded in STATE for `estate-unseat`.
+    pub side_roots: Vec<PathBuf>,
     /// `--exclude-union` (M2 round 2, item 2): a first linked landing whose
     /// repository's common `info/exclude` is not the capture's appends the
     /// captured lines it lacks, recorded in STATE, instead of refusing
@@ -2967,6 +3039,55 @@ pub fn apply_with(
     )
 }
 
+/// `estate-unseat STATE [LIVE ...]` (M2r2 item e): undo every seat
+/// recorded in `state`, or those of `lives`, under the apply's STATE lock;
+/// one line per seat undone, handed to `line`.
+///
+/// # Errors
+/// `REQUIRED_FIELD_MISSING` for a LIVE path with no seat record (nothing is
+/// undone); [`seat::unseat`]'s refusal, at the first seat refused.
+pub fn unseat(
+    state: &Path,
+    lives: &[PathBuf],
+    line: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let _lock = exclusive(&state.join("estate.lock"))?;
+    let records = seat::records(state)?;
+    if lives
+        .iter()
+        .any(|live| !records.iter().any(|(_, record)| &record.live == live))
+    {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    for (path, record) in records {
+        if !lives.is_empty() && !lives.contains(&record.live) {
+            continue;
+        }
+        seat::unseat(&path, &record)?;
+        line(&format!(
+            "{} plan=\"{}\"",
+            seat_line(&record.live, &record.target, "unseated", None),
+            record.plan.display().to_string().escape_debug()
+        ))?;
+    }
+    Ok(())
+}
+
+// One seat's line on the apply's output (M2r2 item e).
+fn seat_line(
+    live: &Path,
+    target: &Path,
+    outcome: &str,
+    refusal: Option<&BulkloadRefusal>,
+) -> String {
+    format!(
+        "seat live=\"{}\" target=\"{}\" outcome={outcome} reason={}",
+        live.display().to_string().escape_debug(),
+        target.display().to_string().escape_debug(),
+        refusal.map_or("none", BulkloadRefusal::code),
+    )
+}
+
 /// [`apply_with`], with each hand-off H step's line (TIN-6569,
 /// OI-1003-Q183: `item=<id> handoff=<written|unchanged|CODE>`) handed to
 /// `handoff_line` after the last level.
@@ -2990,6 +3111,10 @@ pub fn apply_reporting(
     {
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
+    // A seated tree is an existing checkout: only `--adopt` lands into it.
+    if !options.side_roots.is_empty() && !options.adopt {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
     private_directory(state)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let contents: Plan = read(plan)?;
@@ -2997,6 +3122,39 @@ pub fn apply_reporting(
     // take a destination filesystem under its free-space floor.
     for (probe, planned) in space_plan(&contents, corpus, state, source, jobs) {
         crate::space::preflight(&probe, planned)?;
+    }
+    // M2r2 item e, after the preflights and before any item: finish every
+    // seat or undo a crash interrupted (a record that cannot be finished is
+    // a refused line, never the apply's refusal), then seat the plan's
+    // symlinked live paths into the side roots. A seat stays when its items
+    // then refuse (`estate-unseat` undoes it).
+    let roots = seat::roots(&options.side_roots)?;
+    for (record, done) in seat::resume(state)? {
+        match done {
+            Ok(seat::Seated::Present) => {}
+            Ok(done) => handoff_line(&seat_line(&record.live, &record.target, done.word(), None))?,
+            Err(refusal) => handoff_line(&seat_line(
+                &record.live,
+                &record.target,
+                "refused",
+                Some(&refusal),
+            ))?,
+        }
+    }
+    let owner = std::path::absolute(plan).refuse_at("estate::apply")?;
+    for candidate in seat::candidates(&contents.items, &roots) {
+        let line = match &candidate.found {
+            seat::Found::Seatable { target, .. } => {
+                match seat::seat(state, &owner, &contents.items, &roots, &candidate.live) {
+                    Ok(done) => seat_line(&candidate.live, target, done.word(), None),
+                    Err(refusal) => seat_line(&candidate.live, target, "refused", Some(&refusal)),
+                }
+            }
+            seat::Found::Refused(refusal) => {
+                seat_line(&candidate.live, Path::new(""), "refused", Some(refusal))
+            }
+        };
+        handoff_line(&line)?;
     }
     let mut locks = std::collections::BTreeMap::new();
     let mut groups = std::collections::BTreeMap::new();
@@ -3052,10 +3210,10 @@ pub fn apply_reporting(
         // TIN-6569: a repository whose item did more than a journal no-op
         // gets the H step after the last level; a refused item's own
         // workspace never does (design 6.4: the converge left it as it was).
-        if done
-            .as_ref()
-            .map_or(true, |done| !done.outcome.starts_with("previous-"))
-        {
+        if done.as_ref().map_or(true, |done| {
+            // A kept carry (M2r2 b) is a no-op, like a previous journal.
+            !done.outcome.starts_with("previous-") && done.outcome != carried::CARRIED_OUTCOME
+        }) {
             let mut touched = touched
                 .lock()
                 .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
@@ -3220,7 +3378,11 @@ pub mod custody_probe {
     }
 }
 
+// `estate-apply --side-root` and `estate-unseat` (M2r2 item e).
+pub mod seat;
+
 // `estate-diff` (#226 item 1).
+pub mod carried;
 mod diff;
 pub use diff::{diff, DiffOptions, Summary as DiffSummary, SCHEMA as DIFF_SCHEMA};
 
