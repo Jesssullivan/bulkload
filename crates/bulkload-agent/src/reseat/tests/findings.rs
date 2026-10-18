@@ -18,6 +18,7 @@ use crate::reseat::{check, reseat, Options, Unmapped};
 mod a106;
 mod m2r2;
 mod q198;
+mod rebind;
 mod rereview;
 mod space;
 

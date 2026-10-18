@@ -576,7 +576,9 @@ pub fn reseat(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let root = super::root(&options.dest_claude)?;
-    let placer = Placer::new(ledger, &root).with_archived(&options.replace_archived);
+    let placer = Placer::new(ledger, &root)
+        .with_archived(&options.replace_archived)
+        .with_rebind(&options.rebind);
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
     let mut refused_keys: BTreeMap<String, BulkloadRefusal> = BTreeMap::new();
     for candidate in &sessions.list {

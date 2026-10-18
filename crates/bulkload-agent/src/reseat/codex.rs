@@ -633,7 +633,9 @@ pub fn reseat(
             }
         }
         let landed = options.landing_codex.join(&rel);
-        let placer = Placer::new(ledger, &dest.root).with_archived(&options.replace_archived);
+        let placer = Placer::new(ledger, &dest.root)
+            .with_archived(&options.replace_archived)
+            .with_rebind(&options.rebind);
         let outcome = placer
             .place(&landed, &dest_rel, Kind::Rollout, &thread.id, None)?
             .outcome;
@@ -1614,7 +1616,9 @@ fn reseat_unindexed(
                 continue;
             }
         }
-        let placer = Placer::new(ledger, &dest.root).with_archived(&options.replace_archived);
+        let placer = Placer::new(ledger, &dest.root)
+            .with_archived(&options.replace_archived)
+            .with_rebind(&options.rebind);
         let outcome = placer
             .place(&landed, &dest_rel, Kind::Rollout, &id, None)?
             .outcome;

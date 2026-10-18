@@ -375,6 +375,9 @@ counters! {
     ReseatDestRead => "read_reseat_dest_bytes",
     // Bytes written into the destination's live agent state.
     ReseatDestWrite => "write_reseat_dest_bytes",
+    // Placements re-bound from a landed file under an old landing root to
+    // the same bytes under a new one (`--rebind-landing`, A-106 follow-up).
+    ReseatRebound => "reseat_rebound",
     // Destination transcripts and rollouts that were symlinks into a
     // `--replace-archived-dest` root, replaced by the differing landed
     // file (A-106; the archive target kept, the link ledgered).
