@@ -1482,22 +1482,23 @@ impl Destination {
         open_regular(&parent, &leaf)
     }
 
-    /// Open an existing output write-only by relative path, component by
+    /// Open an existing output for appending by relative path, component by
     /// component, following no link (M2r2 A-103: a verified byte prefix of
     /// its source is extended in place). The caller proves it is the file
     /// it read, by identity.
     ///
     /// # Errors
-    /// Refuses a missing output, a non-regular node or an unsafe ancestor.
-    pub(crate) fn open_output_write(&self, rel_path: &[u8]) -> Result<File> {
+    /// Refuses a missing output, a non-regular node, a file this user may
+    /// not write, or an unsafe ancestor.
+    pub(crate) fn open_output_append(&self, rel_path: &[u8]) -> Result<File> {
         let (parent, leaf) = self.parent(rel_path)?;
         let file = File::from(
-            crate::io::sys::open_write_at(&parent, &leaf)
-                .refuse_at("materialize::open_output_write")?,
+            crate::io::sys::open_append_at(&parent, &leaf)
+                .refuse_at("materialize::open_output_append")?,
         );
         if !file
             .metadata()
-            .refuse_at("materialize::open_output_write")?
+            .refuse_at("materialize::open_output_append")?
             .is_file()
         {
             return Err(BulkloadRefusal::DestinationOccupied);

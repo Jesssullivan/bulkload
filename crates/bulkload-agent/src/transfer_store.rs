@@ -834,7 +834,8 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS supersedes (dir BLOB NOT NULL, temp BLOB NOT NULL, intent BLOB NOT NULL, PRIMARY KEY (dir, temp));
                 CREATE TABLE IF NOT EXISTS refused_outputs (key BLOB PRIMARY KEY, kind INTEGER NOT NULL, identity BLOB NOT NULL);
                 CREATE TABLE IF NOT EXISTS owned_outputs (key BLOB PRIMARY KEY, identity BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS prefix_extensions (path BLOB NOT NULL, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, identity BLOB NOT NULL, PRIMARY KEY (path, prior_size));",
+                CREATE TABLE IF NOT EXISTS prefix_extensions (path BLOB NOT NULL, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, identity BLOB NOT NULL, PRIMARY KEY (path, prior_size));
+                CREATE TABLE IF NOT EXISTS prefix_intents (path BLOB PRIMARY KEY, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, prior_identity BLOB NOT NULL);",
             )
             .and_then(|()| {
                 conn.execute(
@@ -1065,6 +1066,62 @@ impl Store {
         counters::sqlite_commit(Counter::SqliteRefusedOutput, started, &recorded);
         recorded?;
         Ok(())
+    }
+
+    /// Record, durably, that a prefix extension of the file at `rel_path`
+    /// is about to append to it (M2r2 A-103): its proven length, the BLAKE3
+    /// of those bytes and its identity then. Committed before the first
+    /// byte is written and settled by the adoption's commit, so a crash in
+    /// between leaves the length the file held (a rerun that adopts the
+    /// whole file records its `prefix_extensions` row from it; one that
+    /// finds other bytes past it names that length for the operator).
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub(crate) fn begin_prefix_extension(
+        &self,
+        rel_path: &[u8],
+        proof: PrefixProof,
+        identity: &StatIdentity,
+    ) -> Result<()> {
+        let identity = identity_bytes(identity)?;
+        #[cfg(feature = "io-trace")]
+        let _serial = crate::io::trace::serialize();
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO prefix_intents VALUES (?1, ?2, ?3, ?4)",
+                (
+                    rel_path,
+                    i64::try_from(proof.prior_size).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+                    proof.prior_blake3.as_slice(),
+                    identity,
+                ),
+            )
+            .map_err(sqlite_error)?;
+        Ok(())
+    }
+
+    /// The unsettled prefix extension of `rel_path`, if a crash left one
+    /// ([`Self::begin_prefix_extension`]).
+    ///
+    /// # Errors
+    /// Refuses database failures.
+    pub(crate) fn prefix_intent(&self, rel_path: &[u8]) -> Result<Option<PrefixProof>> {
+        let found: Option<(i64, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT prior_size, prior_blake3 FROM prefix_intents WHERE path = ?1",
+                [rel_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        Ok(found.and_then(|(size, digest)| {
+            Some(PrefixProof {
+                prior_size: u64::try_from(size).ok()?,
+                prior_blake3: digest.try_into().ok()?,
+            })
+        }))
     }
 
     /// Record one `Event::Commit` for this store (R-N88): a commit returned
@@ -2161,7 +2218,9 @@ pub(crate) fn owner_key(row_key: &[u8]) -> Option<&[u8]> {
 /// alone.
 fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
     if let Some(proof) = &output.extended {
-        // M2r2 A-103: the prefix the extension proved, and what it made.
+        // M2r2 A-103: the prefix the extension proved, and what it made;
+        // its intent, recorded before the first byte was appended, is
+        // settled in the same transaction.
         conn.execute(
             "INSERT OR REPLACE INTO prefix_extensions VALUES (?1, ?2, ?3, ?4)",
             (
@@ -2170,6 +2229,11 @@ fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
                 proof.prior_blake3.as_slice(),
                 identity_bytes(&output.identity)?,
             ),
+        )
+        .map_err(sqlite_error)?;
+        conn.execute(
+            "DELETE FROM prefix_intents WHERE path = ?1",
+            [&output.rel_path],
         )
         .map_err(sqlite_error)?;
     }
@@ -2695,6 +2759,7 @@ mod tests {
                 "outputs",
                 "owned_outputs",
                 "prefix_extensions",
+                "prefix_intents",
                 "refused_outputs",
                 "refused_seats",
                 "settings",

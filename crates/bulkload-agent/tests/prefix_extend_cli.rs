@@ -91,6 +91,7 @@ fn copy_extends_a_grown_prefix_and_says_so() {
     let scratch = Scratch::new("on");
     let (full, prior) = grown(&scratch);
     settle(&scratch.path("source"));
+    settle(&scratch.path("destination"));
     let (ok, stdout, stderr) = scratch.copy(None);
     assert!(ok, "{stdout}{stderr}");
     assert_eq!(
@@ -115,6 +116,7 @@ fn copy_with_the_extension_off_refuses_as_before() {
     let scratch = Scratch::new("off");
     let (full, prior) = grown(&scratch);
     settle(&scratch.path("source"));
+    settle(&scratch.path("destination"));
     let (ok, stdout, stderr) = scratch.copy(Some("0"));
     assert!(!ok, "{stdout}{stderr}");
     assert!(

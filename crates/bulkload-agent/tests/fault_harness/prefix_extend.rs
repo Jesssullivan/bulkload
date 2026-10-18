@@ -88,6 +88,8 @@ fn scenario(point: Point, nth: u64) {
         fs::write(scratch.source().join(name), bytes).unwrap();
     }
     settle(&scratch.source());
+    // The extension requires the destination's files settled.
+    settle(&scratch.destination());
 
     let spec = format!("{}:{nth}", point.name());
     let group = crash_child(&scratch, point, &spec, nth > 1, &[]);

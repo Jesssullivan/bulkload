@@ -715,6 +715,7 @@ fn a_cross_process_session_extends_a_grown_prefix() {
     std::fs::remove_dir_all(scratch.path("destination-state")).unwrap();
     std::fs::write(scratch.path("source/t.jsonl"), &full).unwrap();
     settle_racy_window(&scratch.path("source")).unwrap();
+    settle_racy_window(&scratch.path("destination")).unwrap();
     let (stats, counted, _) = cross_process(&scratch, None);
     assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
     assert_eq!(
