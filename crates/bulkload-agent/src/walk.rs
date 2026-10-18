@@ -512,11 +512,15 @@ impl<'root> Walker<'root> {
                 return self
                     .sidecar_of(parent, name.to_bytes(), &rel_path)
                     .map_or_else(
-                        || refuse(rel_path, crate::refuse::io(&error, "walk::visit")),
+                        || refuse(rel_path, crate::refuse::source_seat(&error, "walk::visit")),
                         |item| Visit::Items(vec![item]),
                     );
             }
-            Err(error) => return refuse(rel_path, crate::refuse::io(&error, "walk::visit")),
+            // S4 (TIN-6592): listed and gone before its stat is
+            // `SOURCE_VANISHED`, never a bare IO no review can close.
+            Err(error) => {
+                return refuse(rel_path, crate::refuse::source_seat(&error, "walk::visit"))
+            }
         };
         if !self.cross_device && stat.node.dev != self.root_dev {
             return Visit::Skip;
@@ -658,6 +662,13 @@ impl<'root> Walker<'root> {
             // and not a directory row any more.
             Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
                 return refuse(rel_path, BulkloadRefusal::SourceChangedAfterSnapshot);
+            }
+            // Removed since its stat (S4, TIN-6592): no row, as for a swap.
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                return refuse(
+                    rel_path,
+                    crate::refuse::source_seat(&error, "walk::visit_directory"),
+                );
             }
             // Unreadable: the directory is a seat, its contents are refused.
             Err(error) => {
@@ -1069,7 +1080,7 @@ mod tests {
 
     use std::path::PathBuf;
 
-    use bulkload_proto::FileKind;
+    use bulkload_proto::{BulkloadRefusal, FileKind};
 
     use super::{walk, HashPolicy, WalkItem, WalkOptions, Walker};
     use crate::freshness::MemoryCache;
@@ -1735,6 +1746,49 @@ mod tests {
         assert!(!rows_of(&outcome)
             .iter()
             .any(|row| row.starts_with(b"long-enough/")));
+    }
+
+    /// S4 (TIN-6592): a seat listed with its directory and removed before
+    /// the walk stats it is `SOURCE_VANISHED`, not a bare IO: a file, and a
+    /// directory with its whole subtree, in a plain walk and in a
+    /// `snapshot` one. Nothing of either is a row.
+    #[test]
+    fn a_seat_gone_before_its_stat_is_source_vanished() {
+        use std::os::fd::AsFd as _;
+        for sqlite in [false, true] {
+            let corpus = Corpus::new("vanished-seat");
+            std::fs::write(corpus.root.join("kept"), b"k").unwrap();
+            std::fs::write(corpus.root.join("gone"), b"g").unwrap();
+            std::fs::create_dir_all(corpus.root.join("gone-dir/inner")).unwrap();
+            std::fs::write(corpus.root.join("gone-dir/inner/f"), b"f").unwrap();
+            let root = crate::io::sys::open_root(&corpus.root).unwrap();
+            let walker = Walker::new(root.as_fd(), false)
+                .unwrap()
+                .with_sqlite(sqlite);
+            // Listed with the root: both are gone before the walk stats them.
+            std::fs::remove_file(corpus.root.join("gone")).unwrap();
+            std::fs::remove_dir_all(corpus.root.join("gone-dir")).unwrap();
+            let mut refused = Vec::new();
+            let mut rows = Vec::new();
+            for item in walker {
+                match item {
+                    WalkItem::Refused(seat) => refused.push((seat.rel_path, seat.refusal)),
+                    WalkItem::Row(row) | WalkItem::RowWithWal(row, _) => rows.push(row.rel_path),
+                    other => panic!("{other:?}"),
+                }
+            }
+            refused.sort_by(|a, b| a.0.cmp(&b.0));
+            assert_eq!(
+                refused,
+                vec![
+                    (b"gone".to_vec(), BulkloadRefusal::SourceVanished),
+                    (b"gone-dir".to_vec(), BulkloadRefusal::SourceVanished),
+                ],
+                "sqlite={sqlite}"
+            );
+            assert!(rows.contains(&b"kept".to_vec()), "{rows:?}");
+            assert!(!rows.iter().any(|row| row.starts_with(b"gone")), "{rows:?}");
+        }
     }
 
     /// #218 review round 2 (found by P80 under load): a live rollback-mode

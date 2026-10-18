@@ -69,6 +69,46 @@ pub fn io_in(
     }
 }
 
+/// The refusal for an I/O error statting, entering or opening a seat the
+/// source walk listed, at `site` (S4, TIN-6592).
+///
+/// `ENOENT` is `SOURCE_VANISHED`: the seat, or a directory above it, was
+/// removed after the listing. `ELOOP` and `ENOTDIR` are
+/// `SOURCE_CHANGED_AFTER_SNAPSHOT`: a component was swapped for a symlink
+/// or a non-directory, which a no-follow open beneath the root refuses.
+/// Anything else is [`io`], with its errno.
+#[must_use]
+pub fn source_seat(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
+    match error.raw_os_error() {
+        Some(libc::ENOENT) => {
+            debug_assert!(is_site(site), "refusal site {site:?} is not a path");
+            BulkloadRefusal::SourceVanished
+        }
+        Some(libc::ELOOP | libc::ENOTDIR) => {
+            debug_assert!(is_site(site), "refusal site {site:?} is not a path");
+            BulkloadRefusal::SourceChangedAfterSnapshot
+        }
+        _ => io(error, site),
+    }
+}
+
+/// The refusal for an I/O error reading or writing a session's frame
+/// stream at `site` (S4, TIN-6592).
+///
+/// The stream ending at or inside a frame (`UnexpectedEof`), or a peer
+/// that is gone (`EPIPE`, `ECONNRESET`), is `TRANSPORT_LOST`: the transport
+/// ended before the session did. Anything else is [`io`], with its errno.
+#[must_use]
+pub fn transport(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
+    if error.kind() == std::io::ErrorKind::UnexpectedEof
+        || matches!(error.raw_os_error(), Some(libc::EPIPE | libc::ECONNRESET))
+    {
+        debug_assert!(is_site(site), "refusal site {site:?} is not a path");
+        return BulkloadRefusal::TransportLost;
+    }
+    io(error, site)
+}
+
 /// The refusal for a postcard error at `site`.
 #[must_use]
 pub fn codec(site: &'static str) -> BulkloadRefusal {
@@ -125,6 +165,47 @@ mod tests {
                 Ok(value)
             );
         }
+    }
+
+    // S4 (TIN-6592): a listed seat that is gone is typed, a swapped
+    // component is a change, and any other errno stays IO with its errno.
+    #[test]
+    fn a_vanished_seat_is_typed_and_other_errnos_keep_theirs() {
+        let at = |errno| super::source_seat(&std::io::Error::from_raw_os_error(errno), "t::s");
+        assert_eq!(at(libc::ENOENT), BulkloadRefusal::SourceVanished);
+        assert_eq!(at(libc::ELOOP), BulkloadRefusal::SourceChangedAfterSnapshot);
+        assert_eq!(
+            at(libc::ENOTDIR),
+            BulkloadRefusal::SourceChangedAfterSnapshot
+        );
+        for errno in [libc::EACCES, libc::EIO, libc::EPERM] {
+            assert_eq!(at(errno), BulkloadRefusal::Io(Some(errno)));
+        }
+    }
+
+    // S4 (TIN-6592): a stream that ends, or a peer that is gone, is the
+    // transport's loss; any other error stays IO.
+    #[test]
+    fn a_lost_transport_is_typed_and_other_errors_keep_their_errno() {
+        let eof = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(
+            super::transport(&eof, "t::s"),
+            BulkloadRefusal::TransportLost
+        );
+        for errno in [libc::EPIPE, libc::ECONNRESET] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert_eq!(
+                super::transport(&error, "t::s"),
+                BulkloadRefusal::TransportLost
+            );
+        }
+        let error = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(
+            super::transport(&error, "t::s"),
+            BulkloadRefusal::Io(Some(libc::EIO))
+        );
+        let other = std::io::Error::other("no errno");
+        assert_eq!(super::transport(&other, "t::s"), BulkloadRefusal::Io(None));
     }
 
     // S4 (#220): a full or over-quota filesystem names the directory; any

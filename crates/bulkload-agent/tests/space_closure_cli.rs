@@ -556,6 +556,14 @@ fn a_copy_session_is_rows_of_the_closure_report_and_its_gate() {
     ]);
     assert!(!copied.status.success());
     assert!(String::from_utf8_lossy(&copied.stderr).contains("refused kept: DESTINATION_OCCUPIED"));
+    // #231 (S4): the run-level exit names the refused paths, never a
+    // contract fault.
+    assert_eq!(
+        String::from_utf8_lossy(&copied.stderr).lines().last(),
+        Some("bulkload-agent: refused: ITEMS_REFUSED"),
+        "{}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
     // One record per transfer, under transfer.closure.d (review finding 2).
     let records = || -> Vec<std::path::PathBuf> {
         std::fs::read_dir(dest_state.join("transfer.closure.d"))

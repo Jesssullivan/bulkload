@@ -1922,8 +1922,9 @@ fn execute(
             })
         })
     })?;
+    // S4 (#231): every item ran; each refusal is in its own record.
     if refused.load(std::sync::atomic::Ordering::Relaxed) {
-        Err(BulkloadRefusal::ContractSelfInconsistent)
+        Err(BulkloadRefusal::ItemsRefused)
     } else {
         Ok(())
     }
@@ -6733,8 +6734,9 @@ mod closure_lane_20261002 {
                 Ok(())
             },
         );
-        // Any refused item makes the pass refuse, after every item ran.
-        assert_eq!(outcome, Err(BulkloadRefusal::ContractSelfInconsistent));
+        // Any refused item makes the pass refuse, after every item ran,
+        // with the run-level code, never a contract fault (#231).
+        assert_eq!(outcome, Err(BulkloadRefusal::ItemsRefused));
         let mut rows = rows.into_inner().unwrap();
         rows.sort();
         assert_eq!(

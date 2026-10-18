@@ -1776,3 +1776,49 @@ the cause.
   prefix-less `.git`) still refuse `GIT_INVENTORY_MALFORMED` without a
   path, and so does a non-UTF-8 path to a readable foreign repository (the
   nest's own Git reads are text).
+
+## Amendment 2026-10-18 (M3, TIN-6592): run-level refusal, vanished seats, a lost transport
+
+A proof-status line, not a new ruling (OI-1003-Q1; M3 code lane under
+operator ruling A-20261018-110, R-N13). The in-place run's logs of
+2026-10-16 to 2026-10-18 showed three S4 residuals: every verb that
+recorded any item or path refusal ended `CONTRACT_SELF_INCONSISTENT`
+(#231, F3); a `pull` of `~/.claude` recorded 11,842 bare `IO` path
+refusals, all inside four job scratch checkouts and five rotated backups
+removed while the pass ran; and a `pull` whose ssh transport timed out
+ended its session with a bare `IO` and no errno. A bare `IO` is never
+accounted, and no review can close it.
+
+- **New codes.** Each is raised by product code and pinned by a test that
+  fails without it:
+
+  | Code | Raised when | Was |
+  |---|---|---|
+  | `ITEMS_REFUSED` | a verb ran every item or path it was asked for and at least one refused (`estate-capture`, `estate-apply`, `estate-carry-files`, `copy`, `pull`). The run-level exit only: each refusal is typed in its own record, and this code is never an item's or a path's outcome (#231) | `CONTRACT_SELF_INCONSISTENT` |
+  | `SOURCE_VANISHED` | a seat the source walk listed is gone (`ENOENT`) when the walk stats or enters it, or when a transfer's capture opens it: it, or a directory above it, was removed after the listing. Nothing of it is carried or remembered; the next pass walks the source as it is then | bare `IO` (errno 2; on the wire, `IO` alone) |
+  | `TRANSPORT_LOST` | a transfer session's frame stream ends at or inside a frame, a write finds the peer gone (`EPIPE`, `ECONNRESET`), or a `pull`'s ssh exits unsuccessfully after the session. The peer's own refusal, when it had one, is on its stderr; a local `copy` still reports the source's refusal when the destination only lost its stream | bare `IO` with no errno |
+
+- **Existing codes at more sites.** A component of a walked seat swapped
+  for a symlink or a non-directory before the transfer's capture opens it
+  (`ELOOP`, `ENOTDIR`) is `SOURCE_CHANGED_AFTER_SNAPSHOT`, as the walk
+  already refused such a directory.
+- **A transfer row keeps a local errno.** An `IO` that the destination side
+  of a transfer raised for a path keeps its errno in the transfer record
+  (`refused PATH: IO (errno N)` on stderr). It is still untyped and still
+  unaccounted; the errno says which typed code it needs.
+- **Disposition.** A `SOURCE_VANISHED` path and a `TRANSPORT_LOST` session
+  are typed refusals, pending review like any other. A rerun replaces the
+  transfer's record (the latest session is the transfer's state), so
+  re-carry is the natural disposition of a lost transport.
+- **Old records.** No code left the taxonomy. A record written before this
+  change keeps its bare `IO`, and stays unaccounted; re-running the verb
+  records the new code. An older agent reads a record naming a new code as
+  `refusal-code-retired` (unaccounted), so both hosts of a `pull` run the
+  same build.
+- **Still open.** A refusal the source sends crosses the wire as its code
+  alone (wire v6), so a source-side `IO` other than `ENOENT` still reaches
+  the destination's record without its errno. Carrying it needs a wire
+  version (an operator decision). A seat whose stat or open fails with
+  another errno (such as `EACCES`) stays a bare `IO`. A directory removed
+  between its stat and its open is `SOURCE_VANISHED` too; no test
+  reproduces that window.
