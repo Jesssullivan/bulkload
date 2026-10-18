@@ -119,6 +119,13 @@ pub struct CheckSummary {
     /// through the home's `git` or a `--map` symlink): reported, never
     /// judged (operator M2 round 2, 2026-10-17).
     pub respell_pending: u64,
+    /// `--rebind-landing` (A-106 follow-up): placement rows re-bound
+    /// (`done`), and rows a pass would try to re-bind: this STATE's own,
+    /// naming a landed file under an old root whose new-root file exists,
+    /// their destination still the single-link file they last wrote (the
+    /// byte proof is the pass's).
+    pub rebound: u64,
+    pub rebind_pending: u64,
     /// `--replace-archived-dest` (A-106): destination links this ledger
     /// replaced with the landed file (`done`); and, at placement paths
     /// now, links to a regular file under a root that a pass would
@@ -441,6 +448,9 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         summary.respell_pending = codex::respell_pending(options, ledger.as_ref())?;
     }
     if let Some(ledger) = ledger.as_ref() {
+        (summary.rebound, summary.rebind_pending) = rebind_counts(options, ledger)?;
+    }
+    if let Some(ledger) = ledger.as_ref() {
         summary.replaced_archived = ledger
             .regulars()?
             .iter()
@@ -487,7 +497,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     summary.lanes = table;
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"replaced_archived\":{},\"replace_pending\":{},\"replace_equal_size\":{},\"replace_proved\":{},\"r0\":\"{}\"}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"replaced_archived\":{},\"replace_pending\":{},\"replace_equal_size\":{},\"replace_proved\":{},\"rebound\":{},\"rebind_pending\":{},\"r0\":\"{}\"}}",
         summary.checked,
         summary.lanes.len(),
         summary.count("pass"),
@@ -504,9 +514,66 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         summary.replace_pending,
         summary.replace_equal_size,
         summary.replace_proved,
+        summary.rebound,
+        summary.rebind_pending,
         if summary.verdict().is_ok() { "pass" } else { "fail" },
     ))?;
     Ok(summary)
+}
+
+/// `(rebound, rebind_pending)`: see [`CheckSummary::rebound`]. Without
+/// `--rebind-landing` nothing is pending.
+fn rebind_counts(options: &Options, ledger: &Ledger) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let rebinds = ledger.rebinds()?;
+    let rebound = rebinds.iter().filter(|row| row.state == "done").count() as u64;
+    if options.rebind.is_empty() {
+        return Ok((rebound, 0));
+    }
+    let mut pending = 0;
+    for dest in ledger.placement_dests()? {
+        let Some(row) = ledger.placement(&dest)? else {
+            continue;
+        };
+        if row.intent.is_some()
+            || !matches!(
+                row.state,
+                super::ledger::State::Ours | super::ledger::State::Adopted
+            )
+            || rebinds.iter().any(|done| {
+                done.dest == dest && (done.state == "undone" || done.state == "undo-kept")
+            })
+        {
+            continue;
+        }
+        // Every pair, every form the new landed file may have now.
+        let Some(found) = options
+            .rebind
+            .iter()
+            .flat_map(|pair| place::mapped_forms(&row.landing, pair))
+            .find(|form| std::fs::symlink_metadata(form).is_ok())
+        else {
+            continue;
+        };
+        if let Some((refused, identity)) = ledger.rebind_unproved(&dest)? {
+            // Refused and unchanged since: not pending.
+            let now = std::fs::symlink_metadata(&refused)
+                .ok()
+                .map(|meta| super::ledger::Identity::of(&meta));
+            if place::same_stream(&refused, &found) && now == Some(identity) {
+                continue;
+            }
+        }
+        let held = std::fs::symlink_metadata(&dest).is_ok_and(|meta| {
+            meta.is_file()
+                && meta.nlink() == 1
+                && super::ledger::Identity::of(&meta) == row.placed_identity
+        });
+        if held {
+            pending += 1;
+        }
+    }
+    Ok((rebound, pending))
 }
 
 /// A session or thread with no lane.

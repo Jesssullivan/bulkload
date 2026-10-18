@@ -2779,7 +2779,8 @@ bulkload-agent estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
     [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
     [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
     [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
-    [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]... [--undo]
+    [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
+    [--rebind-landing OLD=NEW]... [--undo]
     [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
 ```
 
@@ -3049,11 +3050,13 @@ earlier placement stays and the line names `previous_key`.
 naming its landed file: the landed file's identity at the last pass, the
 destination file's identity after bulkload's last write, the bytes placed
 and their BLAKE3, and an intent while an extension or supersede is in
-flight. The ledger carries its schema version (`user_version` 4: a
-version 2 or 3 ledger is migrated in place, a version 2 one keeping the
-shared temporary name for what it left in flight; version 4 adds the
+flight. The ledger carries its schema version (`user_version` 5: a
+version 2, 3 or 4 ledger is migrated in place, a version 2 one keeping
+the shared temporary name for what it left in flight; version 4 adds the
 replacement kind, so a build of version 3 refuses it rather than read a
-replacement as a regularization); the first build's ledger is refused
+replacement as a regularization; version 5 adds the rebind history and
+memo, so a build of version 4 refuses it rather than ignore a rebind on a
+pass or on `--undo`); the first build's ledger is refused
 `SCHEMA_MISMATCH`. An unchanged rerun reads 0
 landed bytes, the Codex snapshot and every refused, unreadable or
 unmapped session included (`read_reseat_landing_bytes`, also
@@ -3062,6 +3065,52 @@ landing, its placed bytes proven and its tail appended (the landing is the
 destination's own copy; the source is never read, R25). A live lane is
 caught up by repeated passes; the pass after its session stops on the
 source leaves it equal to the landing.
+
+**A new landing root** (`--rebind-landing OLD=NEW`, repeatable; A-106
+follow-up, 2026-10-18). A second landing of the same home under a new
+root (home2, then home3) collides with every placement the first one made
+(`RESEAT_LANE_COLLISION`: the row names another landed file), even where
+the bytes are the same. With the flag, a placement row naming a landed
+file under OLD (as the rows spell it; OLD may be gone) whose path under
+NEW (canonicalized; it must exist) is the file this pass places (the
+same stream, another form of it such as `.jsonl.zst`, or the same real
+path; every pair is tried) is re-bound instead of a collision when all of
+these hold:
+
+- the row is this STATE's own placement (`ours` or `adopted`, no intent;
+  a `continued` row is the destination's and stays as it is) and no
+  rebind of it was undone;
+- the destination is a regular file with one link whose identity is the
+  one the row last wrote;
+- the bytes it placed are proved the new landed file's: its first
+  `placed` content bytes (decompressed for a `.zst`) hash (BLAKE3) to the
+  row's digest, or, with none recorded, to the destination's own first
+  bytes read by descriptor with its identity checked before and after.
+
+The new landed file exactly those bytes, and its identity the same before
+the proof, at it and after it: `rebound` (a file and session word;
+nothing written; the row's landed identity set to that identity). Longer,
+or changed around the proof: re-bound with the old landed identity kept,
+so the same pass proves the placed bytes and appends the rest as for any
+grown landing (the session's word is then that placement's, `extended`;
+`reseat_rebound` counts both kinds). Anything else stays a collision; a
+refused proof is remembered by the new landed file's identity
+(`rebind_unproved`, apart from the history) so it is not read again while
+that file is unchanged. Never inferred from names or sizes. Each rebind
+appends a row to an append-only history (`rebind_history`: old and new
+landed file and identity, and the row's bytes, destination identity and
+digest at the rebind) in the same commit as the placement row's update,
+and only while that row still names the old landed file; a chained
+rebind (home2 → home3 → home4) adds a row per hop. Nothing at the
+destination changes, so no fault point is needed. `--undo` puts the
+rebinds back newest first (ledger only), each only while the row still
+holds exactly what that rebind left; one that moved on since (extended,
+superseded, continued) is `undo-kept` and keeps its binding. A pass does
+not re-bind a path whose rebind was undone. `--check` reports `rebound`
+(rebinds done) and `rebind_pending` (this STATE's own rows under an old
+root whose new-root file exists in either form, whose destination is
+still the file they last wrote, and that were not refused unchanged; the
+byte proof is the pass's); without `--rebind-landing` nothing is pending.
 
 **Undo** (`--undo`, OI-1003-Q198). It reverses what this STATE's ledger
 changed in the destination's own state under the rulings: each regularized

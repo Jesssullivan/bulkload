@@ -67,7 +67,7 @@ use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, Per
 use std::path::{Component, Path, PathBuf};
 
 use super::json::FieldScanner;
-use super::ledger::{Identity, Intent, Ledger, Placement, Regular, RegularState, State};
+use super::ledger::{Identity, Intent, Ledger, Placement, Rebind, Regular, RegularState, State};
 use super::Kind;
 use crate::counters::{self, Counter};
 use crate::refuse::RefuseAt as _;
@@ -121,6 +121,10 @@ pub enum Outcome {
     Raced,
     /// A `.jsonl` with no complete line yet: nothing placed.
     Held,
+    /// This ledger's placement of the same bytes from the landed file
+    /// under an old landing root, re-bound to the new one
+    /// (`--rebind-landing`): nothing written.
+    Rebound,
     /// The destination's symlink into a `--replace-archived-dest` root,
     /// replaced by the differing landed file (A-106).
     ReplacedArchived,
@@ -149,6 +153,7 @@ impl Outcome {
             Self::Collision => "collision",
             Self::Raced => "extend-raced",
             Self::Held => "held",
+            Self::Rebound => "rebound",
             Self::ReplacedArchived => "replaced-archived",
         }
     }
@@ -163,6 +168,7 @@ impl Outcome {
                 | Self::Extended
                 | Self::Superseded
                 | Self::Unchanged
+                | Self::Rebound
                 | Self::ReplacedArchived
         )
     }
@@ -177,6 +183,7 @@ impl Outcome {
             | Self::Superseded
             | Self::Unchanged
             | Self::Held
+            | Self::Rebound
             | Self::ReplacedArchived => None,
             Self::Diverged => Some(BulkloadRefusal::ReseatDestDiverged),
             Self::DestAhead | Self::Continued { .. } | Self::Removed => {
@@ -235,7 +242,8 @@ pub fn plain(path: &Path) -> PathBuf {
 
 /// Whether two landed paths name one stream (equal, or one form of the
 /// other).
-fn same_stream(a: &Path, b: &Path) -> bool {
+#[must_use]
+pub fn same_stream(a: &Path, b: &Path) -> bool {
     a == b || plain(a) == plain(b)
 }
 
@@ -312,6 +320,10 @@ fn content_size(landed: &Path, meta: &std::fs::Metadata) -> Result<u64> {
 pub struct Placer<'a> {
     pub ledger: &'a Ledger,
     pub root: &'a Path,
+    /// `--rebind-landing OLD=NEW` pairs (A-106 follow-up): a placement
+    /// row naming a landed file under OLD is re-bound to the same file
+    /// under NEW when the bytes it placed are proved NEW's.
+    pub rebind: &'a [(PathBuf, PathBuf)],
     /// `--replace-archived-dest` roots (canonical): a transcript, sidecar
     /// or rollout at the destination that is a symlink resolving to a
     /// regular file under one is replaced by a differing landed file
@@ -326,6 +338,7 @@ impl<'a> Placer<'a> {
         Self {
             ledger,
             root,
+            rebind: &[],
             archived: &[],
         }
     }
@@ -358,6 +371,210 @@ impl<'a> Placer<'a> {
         }
         archive_link(dest, self.archived)
     }
+
+    /// The same placer, re-binding rows under the `rebind` pairs.
+    #[must_use]
+    pub const fn with_rebind(self, rebind: &'a [(PathBuf, PathBuf)]) -> Self {
+        Self { rebind, ..self }
+    }
+
+    /// Re-bind `row` (naming another landed file) to `landing` when a
+    /// `--rebind-landing` pair maps its landed path to `landing`'s (the
+    /// same stream, or the same real path; every pair is tried), the row
+    /// is this ledger's own placement (`ours` or `adopted`, no intent; a
+    /// `continued` row is the destination's and is never re-bound) and no
+    /// rebind of it was undone, the destination is the regular
+    /// single-link file the row last wrote (its identity), and the placed
+    /// bytes are proved the new landed file's: its first `placed` bytes
+    /// (decompressed) hash to the row's digest (or, with none recorded, to
+    /// the destination's own first bytes, read by descriptor with its
+    /// identity checked before and after).
+    ///
+    /// `Some(true)` when the new landed content is exactly them and its
+    /// identity held from before the proof to after it (re-bound with
+    /// that identity, nothing to write); `Some(false)` when it is longer,
+    /// or changed around the proof (re-bound with the old landed identity
+    /// kept, so the pass proves and extends as usual); `None` otherwise (a
+    /// collision as before; a refused proof is remembered by the new
+    /// landed file's identity, not read again while it holds).
+    fn rebind_row(&self, row: &Placement, landing: &Path, dest: &Path) -> Result<Option<bool>> {
+        if self.rebind.is_empty()
+            || row.intent.is_some()
+            || !matches!(row.state, State::Ours | State::Adopted)
+        {
+            return Ok(None);
+        }
+        if !self
+            .rebind
+            .iter()
+            .any(|pair| maps_to(&row.landing, pair, landing))
+        {
+            return Ok(None);
+        }
+        let landing_now = lstat(landing)?.map(|meta| Identity::of(&meta));
+        let history = self.ledger.rebinds_of(dest)?;
+        if history
+            .iter()
+            .any(|earlier| earlier.state == "undone" || earlier.state == "undo-kept")
+        {
+            // `--undo` put it back: not re-bound again by itself.
+            return Ok(None);
+        }
+        if let Some((refused, identity)) = self.ledger.rebind_unproved(dest)? {
+            if refused == landing && Some(identity) == landing_now {
+                // Its bytes were not the placed ones, and the new landed
+                // file has not changed since: not read again (S3).
+                return Ok(None);
+            }
+        }
+        let Some(meta) = lstat(dest)? else {
+            return Ok(None);
+        };
+        if !meta.is_file() || meta.nlink() != 1 || Identity::of(&meta) != row.placed_identity {
+            return Ok(None);
+        }
+        let unproved = || -> Result<Option<bool>> {
+            if let Some(identity) = landing_now {
+                self.ledger.put_rebind_unproved(dest, landing, identity)?;
+            }
+            Ok(None)
+        };
+        let Some((prefix, longer, read_identity)) = landed_prefix(landing, row.placed) else {
+            return unproved();
+        };
+        let expected = match row.digest {
+            Some(digest) => Some(digest),
+            None => dest_prefix(dest, row.placed, row.placed_identity)?,
+        };
+        if expected != Some(prefix) {
+            return unproved();
+        }
+        // Exactly the placed bytes, and the landed file held still from
+        // before the proof to after it: its identity is recorded. Else the
+        // old landed identity is kept and the pass proves and extends.
+        let held = landing_now == Some(read_identity)
+            && lstat(landing)?.map(|meta| Identity::of(&meta)) == Some(read_identity);
+        let equal = !longer && held;
+        let landed = if equal { read_identity } else { row.landed };
+        let done = self.ledger.put_rebind(&Rebind {
+            seq: 0,
+            dest: dest.to_path_buf(),
+            old_landing: row.landing.clone(),
+            new_landing: landing.to_path_buf(),
+            old_landed: row.landed,
+            new_landed: landed,
+            placed: row.placed,
+            placed_identity: row.placed_identity,
+            digest: row.digest,
+            state: "done".to_owned(),
+        })?;
+        if !done {
+            return Ok(None);
+        }
+        counters::bump(Counter::ReseatRebound);
+        Ok(Some(equal))
+    }
+}
+
+/// Whether `pair` (`OLD`, `NEW`) maps the landed path `recorded` to the
+/// file `landing`: the same spelling (or another form of it, `.zst`), or
+/// the same real path (NEW is canonical, the landing as given).
+#[must_use]
+pub fn maps_to(recorded: &Path, (old, new): &(PathBuf, PathBuf), landing: &Path) -> bool {
+    let Ok(rest) = recorded.strip_prefix(old) else {
+        return false;
+    };
+    let mapped = new.join(rest);
+    same_stream(&mapped, landing)
+        || matches!(
+            (std::fs::canonicalize(&mapped), std::fs::canonicalize(landing)),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+/// The landed forms `recorded` may have under the new root of `pair`: as
+/// mapped, and its other form (`.zst` added or removed), for `--check`.
+#[must_use]
+pub fn mapped_forms(recorded: &Path, (old, new): &(PathBuf, PathBuf)) -> Vec<PathBuf> {
+    let Ok(rest) = recorded.strip_prefix(old) else {
+        return Vec::new();
+    };
+    let mapped = new.join(rest);
+    let other = if compressed(&mapped) {
+        plain(&mapped)
+    } else {
+        let mut name = mapped.clone().into_os_string();
+        name.push(".zst");
+        PathBuf::from(name)
+    };
+    vec![mapped, other]
+}
+
+/// The BLAKE3 of the first `length` content bytes of the landed file at
+/// `path` (decompressed for a `.zst`), whether it holds more, and the
+/// identity it was read at; `None` when it holds fewer, or cannot be read
+/// as its form.
+fn landed_prefix(path: &Path, length: u64) -> Option<([u8; 32], bool, Identity)> {
+    let Ok(landing) = Landing::open(path) else {
+        return None;
+    };
+    let Ok(mut reader) = landing.reader() else {
+        return None;
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut at = 0_u64;
+    while at < length {
+        let want = usize::try_from((length - at).min(CHUNK as u64)).unwrap_or(CHUNK);
+        let chunk = buffer.get_mut(..want).unwrap_or_default();
+        let read = match reader.read(chunk) {
+            Ok(0) => return None,
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+        counters::update(
+            &mut hasher,
+            Counter::HashOther,
+            chunk.get(..read).unwrap_or_default(),
+        );
+        at += read as u64;
+    }
+    let mut one = [0_u8; 1];
+    let longer = loop {
+        match reader.read(&mut one) {
+            Ok(read) => break read > 0,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    };
+    Some((*hasher.finalize().as_bytes(), longer, landing.identity()))
+}
+
+/// The BLAKE3 of the destination file's first `length` bytes, read by
+/// descriptor; `None` unless its identity is `identity` before and after.
+fn dest_prefix(path: &Path, length: u64, identity: Identity) -> Result<Option<[u8; 32]>> {
+    let Ok(file) = crate::hash::open_nofollow(path) else {
+        return Ok(None);
+    };
+    let before = Identity::of(&file.metadata().refuse_at("reseat::place::dest_prefix")?);
+    if before != identity || before.size < length {
+        return Ok(None);
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut at = 0_u64;
+    while at < length {
+        let want = usize::try_from((length - at).min(CHUNK as u64)).unwrap_or(CHUNK);
+        let chunk = buffer.get_mut(..want).unwrap_or_default();
+        file.read_exact_at(chunk, at)
+            .refuse_at("reseat::place::dest_prefix")?;
+        counters::add_len(Counter::ReseatDestRead, want);
+        counters::update(&mut hasher, Counter::HashOther, chunk);
+        at += want as u64;
+    }
+    let after = Identity::of(&file.metadata().refuse_at("reseat::place::dest_prefix")?);
+    Ok((after == identity).then(|| *hasher.finalize().as_bytes()))
 }
 
 /// The symlink at `dest` when its fully resolved target is a regular file
@@ -983,12 +1200,17 @@ impl Placer<'_> {
             // target (its digest set) stands while both are unchanged.
             row = None;
         }
-        if row
-            .as_ref()
-            .is_some_and(|row| !same_stream(&row.landing, landing))
+        if let Some(other) = row
+            .clone()
+            .filter(|row| !same_stream(&row.landing, landing))
         {
-            // Another landed file owns this destination path.
-            return done(Outcome::Collision);
+            // Another landed file owns this destination path, unless it is
+            // the same file under a re-bound landing root.
+            match self.rebind_row(&other, landing, &dest)? {
+                None => return done(Outcome::Collision),
+                Some(true) => return done(Outcome::Rebound),
+                Some(false) => row = self.ledger.placement(&dest)?,
+            }
         }
         let Some(directory) = self.parent(rel)? else {
             return done(Outcome::Occupied);

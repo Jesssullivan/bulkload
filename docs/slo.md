@@ -1623,7 +1623,11 @@ session re-seat", and the receipt
   with their old values and reversed by `--undo` wherever the destination
   still holds exactly what re-seat wrote. `--check` reports
   `replaced_archived`, `replace_pending`, `replace_equal_size` and
-  `replace_proved`.
+  `replace_proved`. A second landing of the same home under a new root re-binds this
+  STATE's rows to it with `--rebind-landing OLD=NEW` (A-106 follow-up)
+  only where the placed bytes are proved the new landed file's (BLAKE3);
+  nothing at the destination changes, `--undo` puts the binding back, and
+  `--check` reports `rebound` and `rebind_pending`.
 - **R0 acceptance** also fails a longer landed form of a rollout that was
   never placed (`extra-form-unplaced`), and names a row carrying the
   source's `cwd` (`row-cwd-is-source`). Rollouts with no snapshot row get a
