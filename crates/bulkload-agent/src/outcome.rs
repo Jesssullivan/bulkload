@@ -95,10 +95,11 @@ pub enum Outcome {
     PreviousWorkspaceBesideNotRevalidated,
 }
 
-/// Every non-refusal outcome and its legacy string, in variant order
-/// (`Refused`, variant 10, sits between `IndexRepaired` and
-/// `CarriedAsFiles`; `WorkspaceBeside` and
-/// `PreviousWorkspaceBesideNotRevalidated` follow, M2r2 c).
+/// Every non-refusal outcome and its legacy string, in variant order.
+///
+/// `Refused`, variant 10, sits between `IndexRepaired` and
+/// `CarriedAsFiles` (11); `WorkspaceBeside` (12) and
+/// `PreviousWorkspaceBesideNotRevalidated` (13) follow (M2r2 c).
 pub const NAMED: [(Outcome, &str); 13] = [
     (Outcome::Captured, "captured"),
     (Outcome::CapturedWithDrift, "captured-with-drift"),
