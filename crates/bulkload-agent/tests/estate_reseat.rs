@@ -215,6 +215,14 @@ fn cli_space_floor_refuses_before_writing() {
         stderr.contains("DESTINATION_SPACE_INSUFFICIENT"),
         "{stderr}"
     );
+    // M2 round 2, item 1: which limit bound, with both numbers.
+    assert!(
+        stderr.contains("bulkload-agent: space: bound=")
+            && stderr.contains(" min_free_percent=100 ")
+            && stderr.contains(" filesystem_total_bytes=")
+            && stderr.contains("space_refusal verb=estate-reseat "),
+        "{stderr}"
+    );
     assert!(!world.placed().exists(), "nothing written");
     assert!(
         !world.base.join("state").exists(),
@@ -227,6 +235,12 @@ fn cli_space_floor_refuses_before_writing() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(world.placed().is_file());
+    // A pass over what is already placed writes nothing, so even a floor no
+    // write could meet passes (M2 round 2, item 1).
+    let out = run("100");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{stderr}");
+    assert!(!stderr.contains("space_refusal"), "{stderr}");
 }
 
 fn on_path(name: &str) -> Option<PathBuf> {

@@ -384,6 +384,7 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
             ledger,
             &root.join(dest_form(&rel)),
             &options.landing_codex.join(&rel),
+            &options.replace_archived,
         )?);
     }
     for file in unindexed(options, &named)? {
@@ -402,6 +403,7 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
             ledger,
             &root.join(dest_form(&file.rel)),
             &options.landing_codex.join(&file.rel),
+            &options.replace_archived,
         )?);
     }
     Ok(total)
@@ -631,7 +633,9 @@ pub fn reseat(
             }
         }
         let landed = options.landing_codex.join(&rel);
-        let placer = Placer::new(ledger, &dest.root).with_archived(&options.replace_archived);
+        let placer = Placer::new(ledger, &dest.root)
+            .with_archived(&options.replace_archived)
+            .with_rebind(&options.rebind);
         let outcome = placer
             .place(&landed, &dest_rel, Kind::Rollout, &thread.id, None)?
             .outcome;
@@ -1612,7 +1616,9 @@ fn reseat_unindexed(
                 continue;
             }
         }
-        let placer = Placer::new(ledger, &dest.root).with_archived(&options.replace_archived);
+        let placer = Placer::new(ledger, &dest.root)
+            .with_archived(&options.replace_archived)
+            .with_rebind(&options.rebind);
         let outcome = placer
             .place(&landed, &dest_rel, Kind::Rollout, &id, None)?
             .outcome;

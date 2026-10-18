@@ -218,6 +218,10 @@ pub struct Options {
     /// The free-space floor, percent of each destination file system
     /// (`--min-free-percent`; the engine's rule).
     pub min_free_percent: u8,
+    /// `--rebind-landing OLD=NEW` (A-106 follow-up): placement rows naming
+    /// a landed file under OLD are re-bound to the same file under NEW
+    /// when the placed bytes are proved NEW's (never inferred from size).
+    pub rebind: Vec<(PathBuf, PathBuf)>,
     /// `--replace-archived-dest ROOT`, canonical (A-106): a destination
     /// transcript, sidecar or rollout that is a symlink to a regular file
     /// under one of these is replaced by the differing landed file, the
@@ -270,6 +274,7 @@ impl Options {
             respell_cwd: true,
             regularize: true,
             min_free_percent: crate::space::min_free_percent(),
+            rebind: Vec::new(),
             replace_archived: Vec::new(),
         }
     }
@@ -541,26 +546,11 @@ fn lock_state(held: &mut Held, state: &Path) -> Result<()> {
 pub const LOCK: &str = "reseat.lock";
 
 /// Refuse `DESTINATION_SPACE_INSUFFICIENT` unless each destination file
-/// system keeps the floor after the bytes planned for it (the engine's
-/// rule, `--min-free-percent`).
+/// system, and each project quota a destination is under, keeps the floor
+/// after the bytes planned for it (the engine's rule, `--min-free-percent`;
+/// [`crate::space::preflight_many`]).
 fn space(options: &Options, wants: &[(&Path, u64)]) -> Result<()> {
-    use std::os::unix::fs::MetadataExt as _;
-    let mut by_device: BTreeMap<u64, (PathBuf, u64)> = BTreeMap::new();
-    for (path, bytes) in wants {
-        if *bytes == 0 {
-            continue;
-        }
-        let existing = crate::space::existing_ancestor(path)?;
-        let device = std::fs::metadata(&existing)
-            .map_err(|error| crate::refuse::io(&error, "reseat::space"))?
-            .dev();
-        let entry = by_device.entry(device).or_insert((existing, 0));
-        entry.1 = entry.1.saturating_add(*bytes);
-    }
-    for (path, bytes) in by_device.values() {
-        crate::space::check(*bytes, crate::space::probe(path)?, options.min_free_percent)?;
-    }
-    Ok(())
+    crate::space::preflight_many(wants, options.min_free_percent)
 }
 
 /// Refuse a `--replace-archived-dest` root that overlaps the live state.
@@ -646,13 +636,14 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     } else {
         None
     };
-    let mut planned_claude = match &claude {
+    let planned_claude = match &claude {
         Some(sessions) => claude::retention(options, &lanes, sessions)?,
         None => 0,
     };
     if codex == Some(true) {
         codex::preflight(options)?;
     }
+    let admitted;
     {
         let ledger = ledger::Ledger::open_read_only(&options.state)?;
         let planned_codex = if codex == Some(true) {
@@ -660,12 +651,10 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
         } else {
             0
         };
-        if options.claude && options.regularize {
-            if let Ok(real) = std::fs::canonicalize(&options.dest_claude) {
-                planned_claude =
-                    planned_claude.saturating_add(regularize::planned(&real, ledger.as_ref())?);
-            }
-        }
+        // Regularization is checked per link as it copies
+        // (`regularize::regularize`), never here: every symlinked
+        // transcript's bytes at once held whole passes back (M2 round 2,
+        // item 1).
         space(
             options,
             &[
@@ -673,6 +662,7 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
                 (&options.dest_codex, planned_codex),
             ],
         )?;
+        admitted = (planned_claude, planned_codex);
     }
     lock_state(&mut held, &options.state)?;
     let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "reseat")?;
@@ -704,10 +694,18 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     if options.claude && options.regularize {
         // Before placement: a regularized copy that is a prefix of a landed
         // transcript is then extended like any other.
+        let reserved = [
+            (options.dest_claude.as_path(), admitted.0),
+            (options.dest_codex.as_path(), admitted.1),
+        ];
         regularize::regularize(
             &root(&options.dest_claude)?,
             &options.replace_archived,
             &ledger,
+            regularize::Space {
+                min_free_percent: options.min_free_percent,
+                reserved: &reserved,
+            },
             &mut summary,
             emit,
         )?;
@@ -730,6 +728,9 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
 /// Reverse what this STATE's ledger changed in the destination's own
 /// state under the 2026-10-16 rulings (OI-1003-Q198).
 ///
+/// Its `--rebind-landing` rebinds are put back too (ledger only: each
+/// placement row names its old landed file again).
+///
 /// It puts each regularized
 /// transcript's symlink back and each re-spelled Codex row's old `cwd`,
 /// only where the destination still holds exactly what re-seat wrote; one
@@ -747,8 +748,24 @@ pub fn undo(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Resu
     let codex_root = std::fs::canonicalize(&options.dest_codex).ok();
     let links = regularize::undo(&ledger, codex_root.as_deref(), emit)?;
     let rows = codex::undo(&mut ledger, emit)?;
+    let mut rebinds = 0_u64;
+    // Newest first: a chained rebind is put back hop by hop.
+    for rebind in ledger.rebinds()?.into_iter().rev() {
+        if rebind.state != "done" {
+            continue;
+        }
+        // Ledger only: the placement row names the old landed file again.
+        let back = ledger.undo_rebind(&rebind)?;
+        rebinds += u64::from(back);
+        emit(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo\",\"tool\":\"rebind\",\"dest\":{},\"restored\":{},\"outcome\":\"{}\"}}",
+            shown(&rebind.dest),
+            shown(&rebind.old_landing),
+            if back { "undone" } else { "undo-kept" },
+        ))?;
+    }
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows}}}"
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows},\"rebinds\":{rebinds}}}"
     ))?;
     drop(held);
     Ok((links, rows))
