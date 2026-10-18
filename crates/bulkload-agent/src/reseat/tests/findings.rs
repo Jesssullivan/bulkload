@@ -16,6 +16,7 @@ use super::{append, r0, run, set_mtime, transcript, World, SERIAL, SID, SID2, SO
 use crate::reseat::{check, reseat, Options, Unmapped};
 
 mod a106;
+mod a111;
 mod m2r2;
 mod q198;
 mod rebind;

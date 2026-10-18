@@ -53,6 +53,12 @@
 //! only their `cwd` re-spelled ([`codex`]), and sting's symlinked
 //! transcripts are regularized into regular files ([`regularize`]); both
 //! are ledgered and reversed by `--undo` ([`undo`]).
+//!
+//! The operator's A-20261018-111 (Linear asks ledger, 2026-10-18): "Extend
+//! regularize to companions" (every symlinked companion is regularized the
+//! same way, and a path re-linked after its regularization is decided
+//! again, [`regularize`]) and "Keep sting's, waive it" (a kept companion is
+//! waived per path, ledgered and reported, [`waiver`]).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -78,6 +84,7 @@ pub mod regularize;
     clippy::cast_possible_truncation
 )]
 mod tests;
+pub mod waiver;
 
 pub use check::{check, CheckSummary};
 
@@ -85,7 +92,7 @@ pub use check::{check, CheckSummary};
 pub const SCHEMA: &str = "bulkload.estate-reseat.v1";
 
 /// What kind of file a placement row is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Kind {
     /// A Claude session transcript, `projects/<key>/<sid>.jsonl`.
     Transcript,
@@ -227,6 +234,15 @@ pub struct Options {
     /// under one of these is replaced by the differing landed file, the
     /// archive target kept and the link ledgered for `--undo`.
     pub replace_archived: Vec<PathBuf>,
+    /// `--waive-companion DEST` (A-20261018-111, "Keep sting's, waive
+    /// it"): kept companions waived per path on a pass ([`waiver`]).
+    pub waive_companions: Vec<PathBuf>,
+    /// `--waive-lane DEST_CWD` (A-20261018-112): lanes whose working
+    /// directory is absent on the destination and the source, waived on a
+    /// pass for `lane_waiver_reason` ([`waiver`]).
+    pub waive_lanes: Vec<PathBuf>,
+    /// `--reason`, required with `--waive-lane`: `source-absent`.
+    pub lane_waiver_reason: Option<String>,
 }
 
 /// The default `--retention-margin-days`.
@@ -276,6 +292,9 @@ impl Options {
             min_free_percent: crate::space::min_free_percent(),
             rebind: Vec::new(),
             replace_archived: Vec::new(),
+            waive_companions: Vec::new(),
+            waive_lanes: Vec::new(),
+            lane_waiver_reason: None,
         }
     }
 
@@ -615,8 +634,32 @@ fn settle_intents(
 /// and no destination index, `DESTINATION_SPACE_INSUFFICIENT` below the
 /// free-space floor. Then ledger, I/O and schema refusals. A session's own
 /// refusal is its line's `refused` code, never the run's.
+#[allow(clippy::too_many_lines)]
 pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<Summary> {
     archive_roots_disjoint(options)?;
+    if !options.waive_companions.is_empty() && !options.claude {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    // A lane waiver names its reason, one the ruling gives
+    // (A-20261018-112), before anything is written.
+    let lane_reason = match (&options.lane_waiver_reason, options.waive_lanes.is_empty()) {
+        (None, true) => None,
+        (Some(reason), false) if waiver::LANE_REASONS.contains(&reason.as_str()) => {
+            Some(reason.clone())
+        }
+        _ => return Err(BulkloadRefusal::FieldDomainViolation),
+    };
+    for path in &options.waive_lanes {
+        key::resolve_dest(path)?;
+    }
+    let waivers = if options.waive_companions.is_empty() {
+        Vec::new()
+    } else {
+        waiver::normalize(
+            &options.waive_companions,
+            &waiver::claude_root(&options.dest_claude)?,
+        )?
+    };
     let lanes = Lanes::new(options);
     let mut summary = Summary::default();
     let mut held = Held(Vec::new());
@@ -638,7 +681,7 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     };
     let planned_claude = match &claude {
         Some(sessions) => claude::retention(options, &lanes, sessions)?,
-        None => 0,
+        None => claude::Planned::default(),
     };
     if codex == Some(true) {
         codex::preflight(options)?;
@@ -658,11 +701,11 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
         space(
             options,
             &[
-                (&options.dest_claude, planned_claude),
+                (&options.dest_claude, planned_claude.bytes),
                 (&options.dest_codex, planned_codex),
             ],
         )?;
-        admitted = (planned_claude, planned_codex);
+        admitted = (planned_claude.bytes, planned_codex);
     }
     lock_state(&mut held, &options.state)?;
     let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "reseat")?;
@@ -691,25 +734,46 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
         ))?;
     }
     settle_intents(options, &ledger, &mut summary, emit)?;
-    if options.claude && options.regularize {
+    // The real roots the regularization writes under (`(root, tool)`).
+    let mut roots = Vec::new();
+    if options.regularize {
+        for (on, dest, tool) in [
+            (options.claude, &options.dest_claude, claude::TOOL),
+            (options.codex, &options.dest_codex, codex::TOOL),
+        ] {
+            if let (true, Ok(real)) = (on, std::fs::canonicalize(dest)) {
+                // A path re-linked since this ledger left a regular file
+                // there is decided again (A-20261018-111).
+                regularize::relinks(&real, tool, &ledger, &mut summary, emit)?;
+                roots.push((real, tool));
+            }
+        }
+    }
+    let deferred = if options.claude && options.regularize {
         // Before placement: a regularized copy that is a prefix of a landed
-        // transcript is then extended like any other.
+        // transcript or companion is then extended like any other.
         let reserved = [
             (options.dest_claude.as_path(), admitted.0),
             (options.dest_codex.as_path(), admitted.1),
         ];
         regularize::regularize(
             &root(&options.dest_claude)?,
-            &options.replace_archived,
-            &ledger,
-            regularize::Space {
-                min_free_percent: options.min_free_percent,
-                reserved: &reserved,
+            regularize::Pass {
+                archived: &options.replace_archived,
+                placed: &planned_claude.sessions,
+                landing: &options.landing_claude,
+                space: regularize::Space {
+                    min_free_percent: options.min_free_percent,
+                    reserved: &reserved,
+                },
             },
+            &ledger,
             &mut summary,
             emit,
-        )?;
-    }
+        )?
+    } else {
+        Vec::new()
+    };
     if let Some(sessions) = &claude {
         claude::reseat(options, &lanes, &ledger, sessions, &mut summary, emit)?;
     }
@@ -720,13 +784,40 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
         Some(false) => codex::sweep_alone(options, &mut ledger, &mut summary, emit)?,
         None => {}
     }
+    if options.regularize {
+        // The archive links the placement kept (equal or ahead), and the
+        // sidecar links it left untouched, regularized (A-20261018-111).
+        regularize::after_placement(
+            &roots,
+            &deferred,
+            &options.replace_archived,
+            &ledger,
+            options.min_free_percent,
+            &mut summary,
+            emit,
+        )?;
+    }
+    if !waivers.is_empty() {
+        waiver::apply(&waivers, &ledger, options.now_ns, &mut summary, emit)?;
+    }
+    if let Some(reason) = &lane_reason {
+        waiver::apply_lanes(
+            &options.waive_lanes,
+            reason,
+            &ledger,
+            options.now_ns,
+            &mut summary,
+            emit,
+        )?;
+    }
     emit(&summary.line())?;
     drop(held);
     Ok(summary)
 }
 
 /// Reverse what this STATE's ledger changed in the destination's own
-/// state under the 2026-10-16 rulings (OI-1003-Q198).
+/// state under the 2026-10-16 rulings (OI-1003-Q198), and revoke its
+/// companion waivers (A-20261018-111).
 ///
 /// Its `--rebind-landing` rebinds are put back too (ledger only: each
 /// placement row names its old landed file again).
@@ -748,6 +839,7 @@ pub fn undo(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Resu
     let codex_root = std::fs::canonicalize(&options.dest_codex).ok();
     let links = regularize::undo(&ledger, codex_root.as_deref(), emit)?;
     let rows = codex::undo(&mut ledger, emit)?;
+    let waivers = waiver::undo(&ledger, emit)? + waiver::undo_lanes(&ledger, emit)?;
     let mut rebinds = 0_u64;
     // Newest first: a chained rebind is put back hop by hop.
     for rebind in ledger.rebinds()?.into_iter().rev() {
@@ -765,7 +857,7 @@ pub fn undo(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Resu
         ))?;
     }
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows},\"rebinds\":{rebinds}}}"
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows},\"rebinds\":{rebinds},\"waivers\":{waivers}}}"
     ))?;
     drop(held);
     Ok((links, rows))

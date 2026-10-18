@@ -1550,6 +1550,14 @@ scenarios! {
     reseat_archived_undo_after_exchange => ReseatAfterUndoExchange: 1, Reseat::ArchivedUndo;
     reseat_archived_moved_after_exchange => ReseatAfterReplaceExchange: 1, Reseat::ArchivedMoved;
     reseat_archived_moved_before_done => ReseatBeforeReplaceDone: 1, Reseat::ArchivedMoved;
+    // A-20261018-111: symlinked companions regularized (sting's own
+    // file-history snapshot, then a landed session's subagent transcript)
+    // and their undo; a transcript link the placement proved equal to the
+    // landed one, regularized after it.
+    reseat_companions_first_exchange => ReseatAfterRegularizeExchange: 1, Reseat::Companions;
+    reseat_companions_second_exchange => ReseatAfterRegularizeExchange: 2, Reseat::Companions;
+    reseat_companions_undo_after_exchange => ReseatAfterUndoExchange: 1, Reseat::CompanionsUndo;
+    reseat_archived_equal_after_regularize => ReseatAfterRegularizeExchange: 1, Reseat::ArchivedEqual;
     // The hand-off block (TIN-6569): every point of a render, a clear and
     // converge's lift, each finished by the rerun.
     estate_handoff_after_intent => EstateHandoffAfterIntent: 1, EstateHandoff::Render;

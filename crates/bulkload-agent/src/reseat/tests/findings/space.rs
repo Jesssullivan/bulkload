@@ -289,12 +289,16 @@ fn a_regularization_keeps_the_placements_bytes_reserved_then_retries() {
         let mut lines = Vec::new();
         regularize::regularize(
             &root,
-            &[],
-            &ledger,
-            regularize::Space {
-                min_free_percent: 0,
-                reserved: &reserved,
+            regularize::Pass {
+                archived: &[],
+                placed: &std::collections::BTreeMap::new(),
+                landing: &options.landing_claude,
+                space: regularize::Space {
+                    min_free_percent: 0,
+                    reserved: &reserved,
+                },
             },
+            &ledger,
             &mut summary,
             &mut |line| {
                 lines.push(line.to_owned());

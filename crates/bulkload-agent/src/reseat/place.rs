@@ -297,6 +297,9 @@ pub fn planned(
     }
     let landed_now = Identity::of(&meta);
     let row = match ledger {
+        // A path re-linked since this ledger left a regular file there is
+        // decided again, as with no row (A-20261018-111).
+        Some(ledger) if relinked(ledger, dest)? => None,
         Some(ledger) => ledger.placement(dest)?,
         None => None,
     };
@@ -351,6 +354,15 @@ pub fn planned(
             Some(_) => Ok(0),
         },
     }
+}
+
+/// Whether this ledger's regularization or replacement of `dest` no
+/// longer stands: marked `relinked`, or `done`/`raced` with a symlink at
+/// the path now (a re-link a pass has not marked yet).
+fn relinked(ledger: &Ledger, dest: &Path) -> Result<bool> {
+    Ok(ledger
+        .regular(dest)?
+        .is_some_and(|row| !row.stands() || row.relinked_now()))
 }
 
 /// The content size of a landed file: its size, or a `.zst`'s
@@ -438,7 +450,7 @@ impl<'a> Placer<'a> {
         {
             return Ok(None);
         }
-        if self.ledger.regular(dest)?.is_some() {
+        if self.ledger.regular(dest)?.is_some() && !relinked(self.ledger, dest)? {
             return Ok(None);
         }
         archive_link(dest, self.archived)
@@ -724,6 +736,34 @@ pub fn open_by_a_process(path: &Path) -> bool {
     false
 }
 
+/// Every path a process this user can see holds open now.
+///
+/// Read once (a sweep over many links reads `/proc` once, not once per
+/// link; observation only, no process is signalled, R-N11). Empty where
+/// `/proc` is absent.
+#[must_use]
+pub fn open_files() -> std::collections::HashSet<PathBuf> {
+    let mut open = std::collections::HashSet::new();
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return open;
+    };
+    for process in processes.flatten() {
+        let name = process.file_name();
+        if !name.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(path) = std::fs::read_link(fd.path()) {
+                open.insert(path);
+            }
+        }
+    }
+    open
+}
+
 /// `(identity, BLAKE3, BLAKE3 of the first bytes when longer)`.
 type TargetDigests = (Identity, [u8; 32], Option<[u8; 32]>);
 
@@ -777,6 +817,27 @@ fn target_digests(path: &Path, prefix: u64) -> Result<Option<TargetDigests>> {
 /// the target (equal), or a strict prefix of it (the archive ahead).
 const LINK_EQUAL: u64 = 0;
 const LINK_AHEAD: u64 = 1;
+
+/// Whether the placement row of `dest` proved the landed file equal to its
+/// archive link's target (`occupied` with a digest, [`LINK_EQUAL`]) and
+/// the path is still that link.
+///
+/// # Errors
+/// Ledger and `lstat` refusals.
+pub fn proved_equal(ledger: &Ledger, dest: &Path) -> Result<bool> {
+    let Some(row) = ledger.placement(dest)? else {
+        return Ok(false);
+    };
+    let target = std::fs::canonicalize(dest)
+        .ok()
+        .and_then(|real| lstat(&real).ok().flatten())
+        .map(|meta| Identity::of(&meta));
+    Ok(row.state == State::Occupied
+        && row.digest.is_some()
+        && row.placed == LINK_EQUAL
+        && lstat(dest)?.is_some_and(|meta| meta.is_symlink())
+        && target == Some(row.placed_identity))
+}
 
 /// Run `hook` after a replacement's exchange (unit tests only: a live
 /// writer between the swap and its checks).
@@ -1248,7 +1309,13 @@ impl Placer<'_> {
             Some(meta) if meta.is_file() => Identity::of(&meta),
             _ => return done(Outcome::LandingNotRegular),
         };
-        let mut row = self.ledger.placement(&dest)?;
+        // A path re-linked since this ledger left a regular file there is
+        // decided again from what it is now (A-20261018-111).
+        let mut row = if relinked(self.ledger, &dest)? {
+            None
+        } else {
+            self.ledger.placement(&dest)?
+        };
         if row
             .as_ref()
             .is_some_and(|row| row.state == State::Unreadable && row.landed == landed_now)

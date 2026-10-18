@@ -403,7 +403,8 @@ SUBCOMMANDS:
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
                   [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
-                  [--rebind-landing OLD=NEW]... [--undo]
+                  [--rebind-landing OLD=NEW]... [--waive-companion DEST]...
+                  [--waive-lane DEST_CWD... --reason source-absent] [--undo]
                   [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
                 R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
                 .claude and .codex, the run's copy of SOURCE_HOME's) into
@@ -433,11 +434,39 @@ SUBCOMMANDS:
                 --map symlink gets its cwd column re-spelled to the canonical
                 path, lane or not, ledgered (OI-1003-Q198 (1); --no-respell;
                 --check counts them). Symlinked destination transcripts
-                (projects/*/*.jsonl) are first regularized into regular-file
-                copies of their targets with the targets' mtime, the targets
-                kept, ledgered (OI-1003-Q198 (2); --no-regularize); a target
-                written during it is RESEAT_REGULARIZE_RACED with both copies
-                kept (the line's kept field names a copy kept aside).
+                (projects/*/*.jsonl) and companions (A-20261018-111: under a
+                real projects/<key>/, file-history/, tasks/, session-env/,
+                debug/*.txt, todos/, plans/*.md; a target outside the live
+                .claude) are first regularized into regular-file copies of
+                their targets with the targets' mtime, the targets kept,
+                ledgered (OI-1003-Q198 (2); --no-regularize turns both off);
+                a target written during it is RESEAT_REGULARIZE_RACED with
+                both copies kept (the line's kept field names a copy kept
+                aside), one a process holds open is held-open, and a
+                directory link there is reported dir-link, never written
+                through. A path re-linked after its regularization is
+                decided again (a relinked line; its regularize line is
+                marked relinked), never skipped as handled.
+                --waive-companion DEST (repeatable; A-20261018-111, keep
+                sting's and waive it): after the placement, a companion this
+                STATE kept (diverged or continued; never a transcript or
+                rollout) is waived by its destination path, its
+                destination and landed files' identities and the
+                destination's BLAKE3 ledgered; --check then passes that
+                session while both files are unchanged, naming each on a
+                waived-companion line (a changed one fails it,
+                companion-waiver-stale); a path that is not a kept
+                companion is waive-refused, nothing recorded; --undo
+                revokes every waiver. --waive-lane DEST_CWD (repeatable)
+                with --reason source-absent (A-20261018-112: the lane's
+                directory is absent on the destination and on the source,
+                a worktree removed after its work): a pass records a lane
+                waiver while the directory is absent on the destination
+                (else waive-refused); --check then waives that lane's
+                directory, Git and hand-off rules while it stays absent,
+                names it on the lane line (lane_waiver) and the summary
+                (lanes_waived), and still checks its sessions and threads;
+                --undo revokes it.
                 --rebind-landing OLD=NEW (repeatable; A-106 follow-up): a
                 placement row naming a landed file under OLD (as the rows
                 spell it; OLD may be gone) is re-bound to the same file under
@@ -464,7 +493,10 @@ SUBCOMMANDS:
                 (dest-ahead), and a target a process holds open stays
                 (occupied); a ROOT overlapping the live .claude or .codex
                 (or containing DEST_HOME) is refused FIELD_DOMAIN_VIOLATION;
-                links into ROOT are not regularized; --check counts
+                links into ROOT are left to the placement, and after it
+                each link it proved equal or ahead (and each sidecar link of
+                a placed session it never placed) is regularized; --check
+                counts
                 replaced_archived, replace_pending, replace_equal_size and
                 replace_proved. Run it, and its --undo, with no live session
                 on the destination. --undo
@@ -1791,6 +1823,9 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut by_id = Vec::new();
     let mut rebind = Vec::new();
     let mut archived = Vec::new();
+    let mut waive_companions = Vec::new();
+    let mut waive_lanes = Vec::new();
+    let mut lane_reason = None;
     let mut at = 0;
     let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
     while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
@@ -1845,6 +1880,8 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             | "--managed-settings"
             | "--by-id"
             | "--replace-archived-dest"
+            | "--waive-companion"
+            | "--waive-lane"
             | "--waive-from" => {
                 let path = PathBuf::from(value(at + 1)?);
                 match arg {
@@ -1870,6 +1907,18 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
                             std::fs::canonicalize(&path)
                                 .refuse_at("main::reseat_command::replace_archived_dest")?,
                         );
+                    }
+                    "--waive-companion" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        waive_companions.push(path);
+                    }
+                    "--waive-lane" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        waive_lanes.push(path);
                     }
                     "--waive-from" => {
                         let text = std::fs::read_to_string(&path)
@@ -1902,6 +1951,16 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
                         .and_then(|days| days.parse::<i64>().ok())
                         .filter(|days| *days >= 0)
                         .ok_or(BulkloadRefusal::FieldDomainViolation)?,
+                );
+                step = 2;
+            }
+            "--reason" => {
+                lane_reason = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .filter(|reason| !reason.is_empty())
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
                 );
                 step = 2;
             }
@@ -1952,6 +2011,9 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
         options.codex_source_roots = roots;
     }
     options.replace_archived = archived;
+    options.waive_companions = waive_companions;
+    options.waive_lanes = waive_lanes;
+    options.lane_waiver_reason = lane_reason;
     if from_plan {
         let plan = plan.as_ref().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
         for item in bulkload_agent::estate::inspect(plan)? {
@@ -1994,6 +2056,15 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut output = std::io::stdout().lock();
     let mut emit = |line: &str| writeln!(output, "{line}").refuse_at("main::reseat_command");
     if check && undo {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    if (check || undo)
+        && (!options.waive_companions.is_empty()
+            || !options.waive_lanes.is_empty()
+            || options.lane_waiver_reason.is_some())
+    {
+        // A waiver is recorded by a pass; the check reads it, the undo
+        // revokes it.
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
     if undo {

@@ -2940,7 +2940,8 @@ bulkload-agent estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
     [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
     [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
     [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
-    [--rebind-landing OLD=NEW]... [--undo]
+    [--rebind-landing OLD=NEW]... [--waive-companion DEST]...
+    [--waive-lane DEST_CWD... --reason source-absent] [--undo]
     [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
 ```
 
@@ -3076,6 +3077,45 @@ appends to the archive. A dangling link or one to a non-file is kept
 (`DESTINATION_OCCUPIED`). A regularized copy that is a byte prefix of a
 landed neo session is then extended like any other. `--no-regularize`
 skips it.
+
+**Symlinked companions** (A-20261018-111, 2026-10-18, "Extend regularize
+to companions"). On sting about 37,900 companion files (about 30 GiB:
+subagent transcripts and their `.meta.json`, tool results, workflows,
+`file-history` snapshots) are symlinks into the archive whose targets are
+the landed bytes, and `--check` failed their sessions
+(`companion-missing`: a companion must be a regular file). Every symlink
+at a companion's place is regularized the same way, in the same pass
+before the placement: under a real `projects/<key>/` (anything but a
+top-level transcript: sidecars, `memory/`, and other key files), under
+`file-history/`, `tasks/` and `session-env/`, and `debug/<name>.txt`,
+`todos/*` and `plans/*.md`, found through real directories only (a
+symlinked directory is never descended; a symlinked key directory is
+skipped as for transcripts; a temporary is never listed). Only a link
+whose target resolves to a regular file outside the live `.claude` is
+copied: one within it is the agent's own structure (`inside-root`,
+`DESTINATION_OCCUPIED`), a dangling one is kept and named, and a
+directory symlink at a companion's place (the 2026-10-01 repair's
+`file-history/<sid>` → a fork directory, about 1,000 on sting) is named
+`dir-link` and never written through. Each line names the companion's
+kind (`"companion":"sidecar"`, `global`, `plan`, `memory`, `extra`), its
+summary rows are `companion-<outcome>`, and `--undo` puts each link back
+under the transcript's rule. A target that some process holds open (every
+`/proc/<pid>/fd` read once per sweep, observation only) is not copied,
+transcripts included: `held-open` (`DESTINATION_OCCUPIED`), decided again
+next pass; it narrows the window the identity checks leave.
+
+**Re-linked paths** (A-20261018-111). A row marks a path handled only
+while the path is what the row left. A `done` or `raced` regularization
+or replacement whose path is a symlink again was re-linked by someone else
+(384 regularized transcripts were, at 2026-10-18T04:58Z): the pass marks
+the row `relinked` and drops the path's placement row in one commit (a
+`relinked` line naming the old state and the new link text), then decides
+the path again as if neither existed: it is regularized again (its line
+carries `"relinked":true`), and the placement adopts, extends or replaces
+what is there. A placement and its space check treat such a path the same
+way even with `--no-regularize`. An `undone` row's link is the one
+`--undo` put back and is never judged again; `--undo` skips a `relinked`
+row (the link there is not this ledger's to restore).
 
 **Codex.** Each thread of the landed snapshot, oldest first (so a fork's or
 spawned thread's parent is registered before it). A row the destination's
@@ -3225,13 +3265,15 @@ earlier placement stays and the line names `previous_key`.
 naming its landed file: the landed file's identity at the last pass, the
 destination file's identity after bulkload's last write, the bytes placed
 and their BLAKE3, and an intent while an extension or supersede is in
-flight. The ledger carries its schema version (`user_version` 5: a
-version 2, 3 or 4 ledger is migrated in place, a version 2 one keeping
+flight. The ledger carries its schema version (`user_version` 6: a
+version 2, 3, 4 or 5 ledger is migrated in place, a version 2 one keeping
 the shared temporary name for what it left in flight; version 4 adds the
 replacement kind, so a build of version 3 refuses it rather than read a
 replacement as a regularization; version 5 adds the rebind history and
 memo, so a build of version 4 refuses it rather than ignore a rebind on a
-pass or on `--undo`); the first build's ledger is refused
+pass or on `--undo`; version 6 adds the companion and lane waivers and
+the `relinked` state, so a build of version 5 refuses it rather than
+ignore a waiver or skip a re-linked path); the first build's ledger is refused
 `SCHEMA_MISMATCH`. An unchanged rerun reads 0
 landed bytes, the Codex snapshot and every refused, unreadable or
 unmapped session included (`read_reseat_landing_bytes`, also
@@ -3391,8 +3433,22 @@ process crash only (`_exit`), and `estate-reseat` is not wired to the
 `io::crash_check` power-loss model, so dropping one of these `fsync`
 calls is not caught by any test.
 
-Regularization leaves links into a ROOT to the placement (a link no
-landed file names stays a link). `--check` reports `replaced_archived`
+Regularization leaves transcript links into a ROOT, and companion links
+into a ROOT at the sidecar of a session the pass places, to the
+placement. After it (A-20261018-111, the #270 gap), with regularization
+on, each link the placement proved equal to or a prefix of its target and
+so kept (`occupied` or `dest-ahead` with a digest, this pass or an earlier
+one; transcripts, sidecars and Codex rollouts alike) is regularized under
+the same rule, and so is each such sidecar link the placement never
+placed and no landed file names (sting's own file in a placed session's
+directory); one a landed file names but the pass did not place (its
+transcript kept out) is `left-to-placement`. A link it replaced, refused
+or did not prove (held open, moved) is not touched, and a transcript link
+no landed file names stays a link. A transcript proved equal takes its
+companions with it, so a fork among them is replaced in the same pass
+rather than regularized as sting's. The next pass adopts the regularized
+file (its `occupied` row is decided again, the destination having
+changed). `--check` reports `replaced_archived`
 (`done` rows) and, at placement paths now, `replace_pending` (archive
 links whose landed whole lines differ in size from the target, a
 compressed landing included), `replace_equal_size` (equal sizes: a pass
@@ -3400,12 +3456,57 @@ compares them) and `replace_proved` (proved equal or ahead, nothing
 changed since); a replaced file is checked as the landed file like any
 other.
 
+**Kept companions waived by path** (A-20261018-111, "Keep sting's, waive
+it"). A companion the destination already held with other bytes is kept
+by never-overwrite (`diverged`, or `dest-continued`/`dest-ahead`), and the
+check fails its session. `--waive-companion DEST` (repeatable) on a pass
+waives one such file after the placement decided it: DEST is judged by
+its real parent (so `~/.claude/...` spelled through sting's `.claude`
+link names the row) and must be under the live `.claude`, else the run
+refuses `FIELD_DOMAIN_VIOLATION` before anything is written. Only a path
+whose placement row is this STATE's, of a companion kind (never a
+transcript or rollout: `--waive` names a session), kept (`diverged` or
+`continued`), with the destination and landed files both as the row
+recorded them, is waived: a `waiver` row (ledger version 6) records the
+destination file's identity and BLAKE3 and the landed file's identity
+(`waived`; `already-waived` for the same pair again; `rewaived` when
+either changed and the operator waives the new pair). Anything else is
+`waive-refused` with its reason (`no-placement-row`, `not-a-companion`,
+`not-kept`, `dest-changed`, `landing-changed`) and nothing is recorded.
+`--check` accepts a waived companion only while both files are the
+waived ones, naming each on a `waived-companion` line, on the lane line
+(`waived`) and the summary (`companions_waived`); a waived file that
+changed fails its session `companion-waiver-stale`
+(`companion_waivers_stale`), never silently. `--undo` revokes every
+waiver (a `waiver` undo line; `waivers` on the undo summary).
+
+**Lanes absent on both hosts** (A-20261018-112). A lane whose working
+directory is absent on the destination fails `dest-cwd-absent`, though
+its transcripts are carried and listed under the lane's key. When the
+directory is absent on the source too (a worktree removed after its
+work), `--waive-lane DEST_CWD` (repeatable) with `--reason source-absent`
+(the one reason ruled; any other, or a lane waiver without one, refuses
+the run before anything is written) on a pass records a `lane_waiver` row
+for the directory, resolved as the lane is (through the destination's
+`git` link to its real path), only while it is absent on the destination
+(`waived`, `already-waived`; an existing directory is `waive-refused`).
+The source is never read (R25): its absence is the operator's finding,
+named by the reason. `--check` then judges that lane's sessions and
+threads as any lane's and waives its directory-bound rules (the
+directory, Git and the hand-off note) while the directory stays absent:
+the lane passes when its sessions and threads hold, its line names the
+waiver (`lane_waiver`), and the summary counts it (`lanes_waived`). A
+directory that appears later is judged as usual. `--undo` revokes every
+lane waiver.
+
 **Crash safety.** Fifteen fault points (`reseat.*`, `src/fault.rs`) with
-twenty-two fault-harness rows (two of them a `.jsonl.zst` rollout
+twenty-six fault-harness rows (two of them a `.jsonl.zst` rollout
 decompressed into its temporary; five the rulings' mutations and their
 undo; six an archive replacement at its intent, after its exchange and
 before `done`, two of them over an `occupied` row from another landing
-with regularization off, and its undo): a rerun
+with regularization off, and its undo; four A-20261018-111's companion
+regularizations at each exchange and their undo, and an equal archive
+link regularized after the placement): a rerun
 settles every crash forward from the ledger and the destination's own
 bytes. A temporary with no intent is a staged
 copy and is removed; an extend intent is resumed after proving the placed
@@ -3439,7 +3540,9 @@ either the lane is `incomplete`, never a pass); with `--note-marker`
 or thread without a lane (unmapped, unresolved, unreadable) or kept by ID
 and not holding is an `unlaned` line. It exits `RESEAT_R0_FAILED` unless
 something was checked, every lane passes, retention holds, and every
-`unlaned` one is named by `--waive` / `--waive-from`. It never opens a
+`unlaned` one is named by `--waive` / `--waive-from`. A kept companion
+holds only by a `--waive-companion` waiver, and an absent lane only by a
+`--waive-lane` waiver (both above), each named on its own line. It never opens a
 session in the live destination state, because opening appends; two
 real-binary canaries (`tests/estate_reseat.rs`) run in throwaway homes
 under `bwrap --unshare-net`: the installed Claude Code picker lists the

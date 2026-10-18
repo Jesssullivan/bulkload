@@ -47,7 +47,38 @@
 //! only while the regular file is exactly the copy this ledger made; one
 //! changed since (a resume appended, or a re-seat pass extended it) is
 //! kept, `RESEAT_DEST_CONTINUED`.
+//!
+//! **Companions** (A-20261018-111, "Extend regularize to companions"). On
+//! sting about 37,900 companion files (subagent transcripts and their
+//! `.meta.json`, tool results, workflows, `file-history`, and the rest a
+//! re-seat places beside a session) are symlinks into the archive, so a
+//! lane whose companions are links fails `--check` (`companion-missing`).
+//! Every symlink at a companion's place ([`companion_links`]: under a real
+//! `projects/<key>/` other than a top-level transcript, `file-history/`,
+//! `tasks/`, `session-env/`, `debug/<name>.txt`, `todos/`, `plans/*.md`,
+//! through real directories only) whose target is a regular file outside
+//! the live root is regularized with the same discipline, row and undo as
+//! a transcript. A directory symlink there (the 2026-10-01 repair's
+//! `file-history/<sid>` and the like) is reported `dir-link`, never written
+//! through. With `--replace-archived-dest`, a link into a root at the
+//! sidecar of a session the pass places is left to the placement (A-106:
+//! a fork is replaced by the landed file); after the placement, each link
+//! it proved equal to or a prefix of its target (kept a link, `occupied`
+//! or `dest-ahead`), transcripts and rollouts included, and each such
+//! sidecar link it never placed, is regularized ([`after_placement`]).
+//!
+//! **Re-linked paths** (A-20261018-111). A `done` or `raced` row whose path
+//! is a symlink again was re-linked by someone else since (384 transcripts
+//! were, at 2026-10-18T04:58Z). It is never skipped as handled: the pass
+//! marks it `relinked` and drops its placement row in one commit (a
+//! `relinked` line), then decides the path again as if it had no row; its
+//! regularization line carries `"relinked":true`.
+//!
+//! A target some process holds open (`/proc`, read once per sweep,
+//! observation only) is not regularized: `held-open`
+//! (`DESTINATION_OCCUPIED`), decided again next pass.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
@@ -56,7 +87,7 @@ use std::path::{Path, PathBuf};
 
 use super::ledger::{Identity, Ledger, Regular, RegularState};
 use super::place::{c_name, identity_at, lstat, open_dir, temp_name};
-use super::{Summary, SCHEMA};
+use super::{Kind, Summary, SCHEMA};
 use crate::closure::json_string;
 use crate::counters::{self, Counter};
 use crate::refuse::RefuseAt as _;
@@ -108,6 +139,157 @@ pub fn links(root: &Path) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+/// Whether `name` is a top-level transcript's: `<name>.jsonl`, not hidden.
+fn transcript_name(name: &std::ffi::OsStr) -> bool {
+    Path::new(name)
+        .extension()
+        .is_some_and(|extension| extension == "jsonl")
+        && !name.as_bytes().starts_with(b".")
+}
+
+/// Whether `name` is a session ID (a UUID: 36 characters, dashes at 8,
+/// 13, 18 and 23, hex digits elsewhere).
+fn session_id(name: &str) -> bool {
+    name.len() == 36
+        && name.bytes().enumerate().all(|(at, byte)| {
+            if matches!(at, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// What a companion at `rel` (relative to the live `.claude`) is, by its
+/// place; `None` for a top-level transcript or a place re-seat does not
+/// place anything.
+#[must_use]
+pub fn companion_kind(rel: &Path) -> Option<Kind> {
+    let parts: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map(std::path::Component::as_os_str)
+        .collect();
+    let first = parts.first()?.to_str()?;
+    match first {
+        "projects" => match parts.len() {
+            0..=2 => None,
+            3 => (!transcript_name(parts.get(2)?)).then_some(Kind::Extra),
+            _ => Some(match parts.get(2)?.to_str() {
+                Some("memory") => Kind::Memory,
+                Some(dir) if session_id(dir) => Kind::Sidecar,
+                _ => Kind::Extra,
+            }),
+        },
+        "file-history" | "tasks" | "session-env" if parts.len() >= 3 => Some(Kind::Global),
+        "debug" if parts.len() == 2 => Path::new(parts.get(1)?)
+            .extension()
+            .is_some_and(|extension| extension == "txt")
+            .then_some(Kind::Global),
+        "todos" if parts.len() == 2 => Some(Kind::Global),
+        "plans" if parts.len() == 2 => Path::new(parts.get(1)?)
+            .extension()
+            .is_some_and(|extension| extension == "md")
+            .then_some(Kind::Plan),
+        _ => None,
+    }
+}
+
+/// The symlinks at companions' places under the live `.claude` root.
+#[derive(Debug, Default)]
+pub struct CompanionLinks {
+    /// `(link, kind)`, sorted.
+    pub files: Vec<(PathBuf, Kind)>,
+    /// Directory symlinks at a companion's place (never written through).
+    pub dir_links: Vec<PathBuf>,
+}
+
+/// Every symlink at a companion's place under the destination `.claude`
+/// root `root` ([`companion_kind`]).
+///
+/// Found through real directories only: a symlinked directory is never descended (a link to a directory is a
+/// `dir_links` entry, a symlinked key directory is skipped as for
+/// transcripts). This ledger's own temporaries and kept copies are regular
+/// files and never listed.
+///
+/// # Errors
+/// The I/O refusal of a listing; `PATH_DEPTH_EXCEEDED`.
+pub fn companion_links(root: &Path) -> Result<CompanionLinks> {
+    let mut out = CompanionLinks::default();
+    let mut pending: Vec<(PathBuf, usize)> = Vec::new();
+    for top in [
+        "projects",
+        "file-history",
+        "tasks",
+        "session-env",
+        "debug",
+        "todos",
+        "plans",
+    ] {
+        if lstat(&root.join(top))?.is_some_and(|meta| meta.is_dir()) {
+            pending.push((PathBuf::from(top), 0));
+        }
+    }
+    while let Some((rel, depth)) = pending.pop() {
+        let entries = match std::fs::read_dir(root.join(&rel)) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).refuse_at("reseat::regularize::companion_links"),
+        };
+        for entry in entries {
+            let entry = entry.refuse_at("reseat::regularize::companion_links")?;
+            let child = rel.join(entry.file_name());
+            let kind = entry
+                .file_type()
+                .refuse_at("reseat::regularize::companion_links")?;
+            if kind.is_dir() {
+                // `projects/` itself holds key directories, every other top
+                // its entries.
+                if depth >= super::claude::DEPTH_LIMIT {
+                    return Err(BulkloadRefusal::PathDepthExceeded);
+                }
+                pending.push((child, depth + 1));
+                continue;
+            }
+            if !kind.is_symlink() || entry.file_name().as_bytes().ends_with(b".bulkload-reseat") {
+                // A regular file, or one of this or another ledger's
+                // temporaries (an interrupted undo's link): never listed.
+                continue;
+            }
+            let in_projects_root = rel == Path::new("projects");
+            if in_projects_root {
+                // A symlinked key directory: never written through.
+                continue;
+            }
+            if std::fs::metadata(root.join(&child)).is_ok_and(|meta| meta.is_dir()) {
+                if companion_place(&child) {
+                    out.dir_links.push(root.join(&child));
+                }
+                continue;
+            }
+            if let Some(of) = companion_kind(&child) {
+                out.files.push((root.join(&child), of));
+            }
+        }
+    }
+    out.files.sort();
+    out.dir_links.sort();
+    Ok(out)
+}
+
+/// Whether a directory at `rel` is a place companions live under (a
+/// session's sidecar or per-session state directory, a key's `memory/`).
+fn companion_place(rel: &Path) -> bool {
+    let parts: Vec<&std::ffi::OsStr> = rel
+        .components()
+        .map(std::path::Component::as_os_str)
+        .collect();
+    match parts.first().and_then(|first| first.to_str()) {
+        Some("projects") => parts.len() >= 3,
+        Some("file-history" | "tasks" | "session-env") => parts.len() >= 2,
+        _ => false,
+    }
 }
 
 /// Where a test acts as a live session between two steps of a
@@ -181,8 +363,22 @@ fn line(link: &Path, outcome: &Outcome) -> String {
 /// A report line of `kind` (`regularize`, or `replace` for an archive
 /// replacement, A-106) for `tool`.
 fn line_of(kind: &str, tool: &str, link: &Path, outcome: &Outcome) -> String {
+    report(kind, tool, link, outcome, None, false)
+}
+
+/// [`line_of`], naming the companion's kind (`"companion"`) and a path
+/// decided again after a re-link (`"relinked":true`) when they apply; a
+/// transcript's line is unchanged.
+fn report(
+    kind: &str,
+    tool: &str,
+    link: &Path,
+    outcome: &Outcome,
+    of: Option<Kind>,
+    relinked: bool,
+) -> String {
     format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"{kind}\",\"tool\":\"{tool}\",\"link\":{},\"outcome\":\"{}\",\"refused\":{},\"kept\":{}}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"{kind}\",\"tool\":\"{tool}\",\"link\":{},\"outcome\":\"{}\",\"refused\":{},\"kept\":{}{}{}}}",
         json_string(&link.to_string_lossy()),
         outcome.word,
         outcome
@@ -193,6 +389,8 @@ fn line_of(kind: &str, tool: &str, link: &Path, outcome: &Outcome) -> String {
             || "null".to_owned(),
             |kept| json_string(&kept.to_string_lossy())
         ),
+        of.map_or_else(String::new, |of| format!(",\"companion\":\"{}\"", of.word())),
+        if relinked { ",\"relinked\":true" } else { "" },
     )
 }
 
@@ -509,7 +707,7 @@ impl<'a> Site<'a> {
         self.ledger.delete_regular(self.link)
     }
 
-    fn regularize(&self, space: Space<'_>) -> Result<Outcome> {
+    fn regularize(&self, space: Space<'_>, open: &HashSet<PathBuf>) -> Result<Outcome> {
         let Some(link_meta) = lstat(self.link)? else {
             return Ok(Outcome::new("absent", None));
         };
@@ -529,6 +727,14 @@ impl<'a> Site<'a> {
                 Some(BulkloadRefusal::DestinationOccupied),
             ));
         };
+        if open.contains(&resolved) {
+            // A live writer holds the target open: its writes would go on
+            // into the archive after the swap. Decided again next pass.
+            return Ok(Outcome::new(
+                "held-open",
+                Some(BulkloadRefusal::DestinationOccupied),
+            ));
+        }
         // The free-space rule per link, as it is copied (M2 round 2, item
         // 1): a pass's other work is never held back by every link's bytes
         // at once, and a link that does not fit now is this line's refusal.
@@ -709,8 +915,120 @@ pub struct Space<'a> {
     pub reserved: &'a [(&'a Path, u64)],
 }
 
-/// Regularize every symlinked transcript under the destination `.claude`
-/// root `root`, one `regularize` line each.
+/// What a regularization pass needs besides the ledger.
+#[derive(Clone, Copy)]
+pub struct Pass<'a> {
+    /// `--replace-archived-dest` roots (canonical).
+    pub archived: &'a [PathBuf],
+    /// `(destination key, session id)` of each landed session this pass
+    /// places, to its landed key ([`super::claude::Planned`]): its
+    /// sidecars' archive links are left to the placement.
+    pub placed: &'a BTreeMap<(String, String), String>,
+    /// The landed `.claude`: whether a deferred sidecar has a landed file.
+    pub landing: &'a Path,
+    pub space: Space<'a>,
+}
+
+/// A sidecar link left to the placement, and its landed counterpart (the
+/// file the placement would place there).
+#[derive(Debug, Clone)]
+pub struct Deferred {
+    pub link: PathBuf,
+    pub landed: PathBuf,
+}
+
+/// Mark every re-linked row under `root` `relinked`.
+///
+/// A `done` or `raced` row whose path is a symlink again has its placement
+/// row dropped in the same commit, one `relinked` line each: the path is
+/// decided again (A-20261018-111).
+///
+/// # Errors
+/// Ledger refusals.
+pub fn relinks(
+    root: &Path,
+    tool: &str,
+    ledger: &Ledger,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for row in ledger.regulars()? {
+        if !row.link.starts_with(root) || !row.relinked_now() {
+            continue;
+        }
+        let previous = match row.state {
+            RegularState::Raced => "raced",
+            _ => "done",
+        };
+        if ledger.relink(&row.link)? {
+            *summary.rows.entry("relinked".to_owned()).or_default() += 1;
+            emit(&format!(
+                "{{\"schema\":\"{SCHEMA}\",\"kind\":\"relinked\",\"tool\":\"{tool}\",\"link\":{},\"was\":\"{previous}\",\"replace\":{},\"link_text\":{}}}",
+                json_string(&row.link.to_string_lossy()),
+                row.replace,
+                std::fs::read_link(&row.link).map_or_else(
+                    |_| "null".to_owned(),
+                    |text| json_string(&text.to_string_lossy())
+                ),
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// The summary-row prefix of a link's outcome: `link-` for a transcript
+/// (and a Codex rollout), `companion-` for a companion.
+const fn prefix(of: Option<Kind>) -> &'static str {
+    if of.is_some() {
+        "companion-"
+    } else {
+        "link-"
+    }
+}
+
+/// Regularize the symlink at `link` (of kind `of`, `None` for a transcript
+/// or rollout) unless a row of this ledger stands for it; one line.
+#[allow(clippy::too_many_arguments)]
+fn one(
+    root: &Path,
+    tool: &str,
+    link: &Path,
+    of: Option<Kind>,
+    ledger: &Ledger,
+    (space, open): (Space<'_>, &HashSet<PathBuf>),
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let relinked = match ledger.regular(link)? {
+        // Regularized, raced or undone: never again by itself.
+        Some(row) if row.stands() => return Ok(()),
+        Some(_) => true,
+        None => false,
+    };
+    let Some(site) = Site::new(ledger, link)? else {
+        return Ok(());
+    };
+    let outcome =
+        if of.is_some() && std::fs::canonicalize(link).is_ok_and(|real| real.starts_with(root)) {
+            // A link within the live state (the agent's own structure) is not
+            // an archive copy: left as it is.
+            Outcome::new("inside-root", Some(BulkloadRefusal::DestinationOccupied))
+        } else {
+            site.regularize(space, open)?
+        };
+    *summary
+        .rows
+        .entry(format!("{}{}", prefix(of), outcome.word))
+        .or_default() += 1;
+    emit(&report("regularize", tool, link, &outcome, of, relinked))
+}
+
+/// Regularize every symlinked transcript and companion under the
+/// destination `.claude` root `root` before placement.
+///
+/// One `regularize` line each; returns the companion links left to the placement (a landed
+/// session's sidecar linked into a `--replace-archived-dest` root), for
+/// [`after_placement`].
 ///
 /// Each link's copy is checked
 /// against the free-space rule ([`Space`]: the floor, with the placements'
@@ -723,36 +1041,191 @@ pub struct Space<'a> {
 /// Ledger and I/O refusals; a link's own outcome is its line.
 pub fn regularize(
     root: &Path,
+    pass: Pass<'_>,
+    ledger: &Ledger,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<Vec<Deferred>> {
+    settle_intents(root, TOOL, ledger, summary, emit)?;
+    let open = super::place::open_files();
+    let into_archive = |link: &Path| {
+        !pass.archived.is_empty()
+            && std::fs::canonicalize(link)
+                .is_ok_and(|real| pass.archived.iter().any(|root| real.starts_with(root)))
+    };
+    for link in links(root)? {
+        if into_archive(&link) {
+            // A link into a `--replace-archived-dest` root is left for the
+            // placement to replace with the landed file (A-106); one it
+            // proves equal or ahead is regularized after it.
+            continue;
+        }
+        one(
+            root,
+            TOOL,
+            &link,
+            None,
+            ledger,
+            (pass.space, &open),
+            summary,
+            emit,
+        )?;
+    }
+    let found = companion_links(root)?;
+    for dir in &found.dir_links {
+        *summary
+            .rows
+            .entry("companion-dir-link".to_owned())
+            .or_default() += 1;
+        emit(&report(
+            "regularize",
+            TOOL,
+            dir,
+            &Outcome::new("dir-link", Some(BulkloadRefusal::DestinationOccupied)),
+            None,
+            false,
+        ))?;
+    }
+    let mut deferred = Vec::new();
+    for (link, of) in found.files {
+        if of == Kind::Sidecar && into_archive(&link) {
+            if let Some(landed) = placed_sidecar(root, &link, &pass) {
+                deferred.push(Deferred { link, landed });
+                continue;
+            }
+        }
+        one(
+            root,
+            TOOL,
+            &link,
+            Some(of),
+            ledger,
+            (pass.space, &open),
+            summary,
+            emit,
+        )?;
+    }
+    Ok(deferred)
+}
+
+/// The landed counterpart of `link` when it is under `projects/<key>/<sid>/`
+/// of a session the pass places.
+fn placed_sidecar(root: &Path, link: &Path, pass: &Pass<'_>) -> Option<PathBuf> {
+    let rel = link.strip_prefix(root).ok()?;
+    let mut parts = rel.components();
+    let (Some(projects), Some(key), Some(sid)) = (parts.next(), parts.next(), parts.next()) else {
+        return None;
+    };
+    if projects.as_os_str() != "projects" {
+        return None;
+    }
+    let source_key = pass.placed.get(&(
+        key.as_os_str().to_str()?.to_owned(),
+        sid.as_os_str().to_str()?.to_owned(),
+    ))?;
+    Some(
+        pass.landing
+            .join("projects")
+            .join(source_key)
+            .join(sid)
+            .join(parts.as_path()),
+    )
+}
+
+/// After the placement, regularize the archive links it kept.
+///
+/// With `--replace-archived-dest` only: every link it left into a root
+/// under the destination roots `roots` (`(root,
+/// tool)`, canonical): each path whose placement row proved the landed
+/// file equal to, or a prefix of, the link's target (`occupied` or
+/// `dest-ahead` with a digest: transcripts, sidecars and rollouts), and
+/// each `deferred` sidecar link it never placed (no row) that no landed
+/// file names (sting's own file in a placed session's directory; one a
+/// landed file names is left to a later placement, `left-to-placement`).
+/// Nothing the placement replaced, refused or has not proved is touched.
+/// One line each, its `kind` `regularize`.
+///
+/// # Errors
+/// Ledger and I/O refusals; a link's own outcome is its line.
+pub fn after_placement(
+    roots: &[(PathBuf, &'static str)],
+    deferred: &[Deferred],
     archived: &[PathBuf],
     ledger: &Ledger,
-    space: Space<'_>,
+    min_free_percent: u8,
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    settle_intents(root, TOOL, ledger, summary, emit)?;
-    for link in links(root)? {
-        if ledger.regular(&link)?.is_some() {
-            // Regularized, raced or undone: never again by itself.
+    if archived.is_empty() {
+        return Ok(());
+    }
+    let mut todo: BTreeSet<PathBuf> = ledger.proved_links()?.into_iter().collect();
+    for item in deferred {
+        if todo.contains(&item.link) || ledger.placement(&item.link)?.is_some() {
             continue;
         }
-        if !archived.is_empty()
-            && std::fs::canonicalize(&link)
-                .is_ok_and(|real| archived.iter().any(|root| real.starts_with(root)))
-        {
-            // A link into a `--replace-archived-dest` root is left for the
-            // placement to replace with the landed file (A-106); one no
-            // landed file names stays a link.
+        if lstat(&item.landed)?.is_some() {
+            // A landed file names it, and this pass did not place it (its
+            // transcript kept out): a later placement decides it (A-106: a
+            // fork is replaced, never regularized as sting's).
+            *summary
+                .rows
+                .entry("companion-left-to-placement".to_owned())
+                .or_default() += 1;
+            emit(&report(
+                "regularize",
+                TOOL,
+                &item.link,
+                &Outcome::new("left-to-placement", None),
+                Some(Kind::Sidecar),
+                false,
+            ))?;
             continue;
         }
-        let Some(site) = Site::new(ledger, &link)? else {
+        todo.insert(item.link.clone());
+    }
+    let open = super::place::open_files();
+    let space = Space {
+        min_free_percent,
+        reserved: &[],
+    };
+    for link in todo {
+        let Some((root, tool)) = roots.iter().find(|(root, _)| link.starts_with(root)) else {
             continue;
         };
-        let outcome = site.regularize(space)?;
-        *summary
-            .rows
-            .entry(format!("link-{}", outcome.word))
-            .or_default() += 1;
-        emit(&line(&link, &outcome))?;
+        if super::place::archive_link(&link, archived)?.is_none() {
+            // Replaced, regularized, or no longer a link into a root.
+            continue;
+        }
+        // Through real directories only: the placement made them so; one
+        // replaced by a link since is not written through.
+        let real_parent = link
+            .parent()
+            .is_some_and(|parent| std::fs::canonicalize(parent).ok().as_deref() == Some(parent));
+        let of = if *tool == TOOL {
+            link.strip_prefix(root).ok().and_then(companion_kind)
+        } else {
+            None
+        };
+        if !real_parent {
+            *summary
+                .rows
+                .entry(format!("{}parent-not-real", prefix(of)))
+                .or_default() += 1;
+            emit(&report(
+                "regularize",
+                tool,
+                &link,
+                &Outcome::new(
+                    "parent-not-real",
+                    Some(BulkloadRefusal::DestinationOccupied),
+                ),
+                of,
+                false,
+            ))?;
+            continue;
+        }
+        one(root, tool, &link, of, ledger, (space, &open), summary, emit)?;
     }
     Ok(())
 }
@@ -784,11 +1257,16 @@ pub fn settle_intents(
                         }
                         emit(&line_of("replace", tool, &row.link, &outcome))?;
                     } else {
+                        let of = if tool == TOOL {
+                            row.link.strip_prefix(root).ok().and_then(companion_kind)
+                        } else {
+                            None
+                        };
                         *summary
                             .rows
-                            .entry(format!("link-{}", outcome.word))
+                            .entry(format!("{}{}", prefix(of), outcome.word))
                             .or_default() += 1;
-                        emit(&line(&row.link, &outcome))?;
+                        emit(&report("regularize", tool, &row.link, &outcome, of, false))?;
                     }
                 }
             }
@@ -816,7 +1294,9 @@ pub fn undo(
             continue;
         };
         let outcome = match row.state {
-            RegularState::Undone => continue,
+            // Undone, or re-linked by someone else since (the link is
+            // there already, not this ledger's to put back).
+            RegularState::Undone | RegularState::Relinked => continue,
             RegularState::Intent => match site.settle_intent(row.clone())? {
                 None => continue,
                 Some(_) => match ledger.regular(&row.link)? {

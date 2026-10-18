@@ -1877,3 +1877,56 @@ paths, and the new test reproduces exactly that output.
   removed or renamed during a pass would show as many `SOURCE_VANISHED`
   rows that one standing policy could accept; no check yet tells that
   from churn. A path refused by both sides as `IO` takes the local errno.
+
+## Amendment 2026-10-18: companions regularized, re-links, and per-path waivers (A-20261018-111, A-20261018-112)
+
+No SLO number changes. The operator's A-20261018-111 (Linear asks ledger
+doc `2d0eee49`, 2026-10-18: "Extend regularize to companions"; "Keep
+sting's, waive it") and A-20261018-112 (lanes whose working directory is
+absent on both hosts are waivable in `--check`) amend the R0 amendment
+above; the contract is `docs/design.md`, "Agent session re-seat", and the
+receipt `docs/agent-notes/2026-10-18-regularize-companions.md`.
+
+- **R0 (SPEC C8/C9):** a lane whose companions are symlinks into the
+  archive no longer fails `--check` on that alone: every symlinked
+  companion (subagent transcripts and their `.meta.json`, tool results,
+  workflows, `file-history`, `tasks`, `session-env`, debug logs, todos,
+  plans, memory notes and other key files) is regularized before the
+  placement with the transcript's discipline (byte copy, no reflink, P84;
+  read-back BLAKE3 and identity checks; atomic exchange; a `regularized`
+  row; `--undo`; the archive target never written), so the session's
+  companions are regular files holding the landed bytes. With
+  `--replace-archived-dest`, a link the placement proves equal to (or a
+  prefix of) its target, which it keeps a link, is regularized after it
+  (the #270 gap: an identical link stayed `occupied`), and an equal
+  transcript link now takes its companions with it (a fork among them is
+  replaced in the same pass).
+- **S5, as ruled:** a path this ledger regularized that is a symlink again
+  (re-linked by someone else; 384 transcripts were at 2026-10-18T04:58Z) is
+  never skipped as handled: it is named (`relinked`), its placement row
+  dropped, and it is decided again. A target some process holds open is
+  not regularized (`held-open`, `DESTINATION_OCCUPIED`, retried); a
+  directory symlink at a companion's place is named (`dir-link`) and
+  never written through.
+- **R0 acceptance waivers, ledgered:** a companion kept by never-overwrite
+  (`diverged`, `continued`) is accepted per path only by a
+  `--waive-companion` waiver binding the destination file's identity and
+  BLAKE3 and the landed file's identity; `--check` names each
+  (`waived-companion`, `companions_waived`) and fails a session whose
+  waived file changed (`companion-waiver-stale`). A lane whose directory is
+  absent on the destination and the source is accepted only by a
+  `--waive-lane ... --reason source-absent` waiver while it stays absent;
+  its sessions are still checked, the lane line names the waiver
+  (`lane_waiver`) and the summary counts it (`lanes_waived`). Both are
+  revoked by `--undo`.
+- **S3** still holds: an unchanged rerun reads 0 landed bytes; the
+  companion sweep lists the destination only.
+- **Proof:** `reseat::tests::findings::a111` (eight rows: companions
+  regularized, checked and undone, with directory, dangling, in-root and
+  temporary links; `--no-regularize`; a write before the swap; a target
+  held open; re-linked paths judged again; the archive links the
+  placement keeps regularized after it; a kept companion waived by path;
+  the version 5 ledger migrated) and `a112_an_absent_lane_is_waived_with_its_reason`,
+  and four more fault-harness rows (companions at each exchange, their
+  undo, and an equal archive link regularized after the placement):
+  twenty-six rows over fifteen `reseat.*` points.

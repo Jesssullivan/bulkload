@@ -39,6 +39,16 @@
 //! - `rebind_unproved`: per destination, the new landed file a rebind's
 //!   byte proof refused and its identity then, so a pass does not read it
 //!   again while it is unchanged (S3).
+//! - `waiver`: one row per kept companion the operator waived by path
+//!   (`--waive-companion`, A-20261018-111 "Keep sting's, waive it"): the
+//!   destination file's identity and BLAKE3 and the landed file's identity
+//!   it was waived against, so `--check` accepts exactly that pair and
+//!   names it; `--undo` marks it `undone`.
+//! - `lane_waiver`: one row per lane whose working directory the operator
+//!   waived as absent on the destination and the source (`--waive-lane
+//!   --reason source-absent`, A-20261018-112), so `--check` passes that
+//!   lane's directory-bound rules while it is absent and names it; its
+//!   sessions are still checked. `--undo` marks it `undone`.
 //!
 //! A row is committed only after the bytes it describes are durable at the
 //! destination (the engine rule).
@@ -56,7 +66,7 @@ pub const FILE: &str = "reseat.sqlite";
 /// first build, `550396c`: window digests, inode-only supersede intents)
 /// is refused, never read as this one; version 2 (`8a89f9a`) is migrated
 /// in place (new tables and session columns only).
-const VERSION: i64 = 5;
+const VERSION: i64 = 6;
 /// Version 2's tables are a subset of version 3's.
 const MIGRATE_FROM: i64 = 2;
 /// Version 3 lacks only `regularized.kind` (A-106): migrated in place. A
@@ -67,6 +77,11 @@ const MIGRATE_FROM_V3: i64 = 3;
 /// place. A build of version 4 refuses a version 5 ledger, so it never
 /// ignores a rebind, on a pass or on `--undo` (review 8).
 const MIGRATE_FROM_V4: i64 = 4;
+/// Version 5 lacks only the `waiver` table and the `relinked`
+/// regularization state (A-20261018-111): migrated in place. A build of
+/// version 5 refuses a version 6 ledger, so it never ignores a waiver or
+/// reads a re-linked row as one it may skip.
+const MIGRATE_FROM_V5: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS placement(
@@ -135,6 +150,19 @@ CREATE TABLE IF NOT EXISTS rebind_unproved(
     dest BLOB PRIMARY KEY, new_landing BLOB NOT NULL,
     n_dev INTEGER NOT NULL, n_ino INTEGER NOT NULL, n_size INTEGER NOT NULL, n_mtime INTEGER NOT NULL,
     pass INTEGER NOT NULL
+);
+";
+/// Version 6's addition (A-20261018-111): companion waivers.
+const SCHEMA_V6: &str = "
+CREATE TABLE IF NOT EXISTS waiver(
+    dest BLOB PRIMARY KEY, landing BLOB NOT NULL, kind TEXT NOT NULL, session TEXT NOT NULL,
+    l_dev INTEGER NOT NULL, l_ino INTEGER NOT NULL, l_size INTEGER NOT NULL, l_mtime INTEGER NOT NULL,
+    d_dev INTEGER NOT NULL, d_ino INTEGER NOT NULL, d_size INTEGER NOT NULL, d_mtime INTEGER NOT NULL,
+    digest BLOB NOT NULL, state TEXT NOT NULL, pass INTEGER NOT NULL, at_ns INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS lane_waiver(
+    dest_cwd BLOB PRIMARY KEY, given BLOB NOT NULL, reason TEXT NOT NULL,
+    state TEXT NOT NULL, pass INTEGER NOT NULL, at_ns INTEGER NOT NULL
 );
 ";
 /// A file's identity: what a pass compares instead of reading it.
@@ -318,6 +346,11 @@ pub enum RegularState {
     Raced,
     /// `--undo` put the symlink back.
     Undone,
+    /// The regular file this ledger left at the path was replaced by a
+    /// symlink since (by someone else): the path is decided again, as if
+    /// it had no row (A-20261018-111; 384 transcripts were re-linked at
+    /// 2026-10-18T04:58Z). Its placement row was dropped with it.
+    Relinked,
 }
 
 impl RegularState {
@@ -327,6 +360,7 @@ impl RegularState {
             Self::Done => "done",
             Self::Raced => "raced",
             Self::Undone => "undone",
+            Self::Relinked => "relinked",
         }
     }
 
@@ -336,6 +370,7 @@ impl RegularState {
             "done" => Self::Done,
             "raced" => Self::Raced,
             "undone" => Self::Undone,
+            "relinked" => Self::Relinked,
             _ => return Err(BulkloadRefusal::SchemaMismatch),
         })
     }
@@ -366,6 +401,59 @@ pub struct Regular {
     /// placement row is written once the row is `done` (a crash before
     /// that leaves none, and the next pass adopts the file at the path).
     pub replace: bool,
+}
+
+impl Regular {
+    /// Whether the row still stands for its path: a pass leaves the path
+    /// alone (`done`, `raced`, `undone`, `intent`). A `relinked` row does
+    /// not: the path is decided again as if it had none.
+    #[must_use]
+    pub fn stands(&self) -> bool {
+        self.state != RegularState::Relinked
+    }
+
+    /// Whether the regular file this row left at its path (`done` or
+    /// `raced`) has been replaced by a symlink since: a re-link by someone
+    /// else, judged again (A-20261018-111). An `undone` row's link is the
+    /// one `--undo` put back.
+    #[must_use]
+    pub fn relinked_now(&self) -> bool {
+        matches!(self.state, RegularState::Done | RegularState::Raced)
+            && std::fs::symlink_metadata(&self.link).is_ok_and(|meta| meta.is_symlink())
+    }
+}
+
+/// One waived companion (`--waive-companion`, A-20261018-111): a kept
+/// destination file the operator accepted in place of its landed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Waiver {
+    pub dest: PathBuf,
+    pub landing: PathBuf,
+    /// The placement row's kind word.
+    pub kind: String,
+    pub session: String,
+    /// The landed file's identity it was waived against.
+    pub landed: Identity,
+    /// The destination file's identity and BLAKE3 when waived.
+    pub dest_identity: Identity,
+    pub digest: [u8; 32],
+    /// `active` or `undone`.
+    pub state: String,
+    pub at_ns: i64,
+}
+
+/// One waived lane (`--waive-lane`, A-20261018-112).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaneWaiver {
+    /// The lane's destination working directory, resolved as a lane is.
+    pub dest_cwd: PathBuf,
+    /// The path as the operator gave it.
+    pub given: PathBuf,
+    /// `source-absent`.
+    pub reason: String,
+    /// `active` or `undone`.
+    pub state: String,
+    pub at_ns: i64,
 }
 
 /// The `regularized.kind` of a `--replace-archived-dest` row (NULL for a
@@ -439,11 +527,13 @@ impl Ledger {
             && version != MIGRATE_FROM
             && version != MIGRATE_FROM_V3
             && version != MIGRATE_FROM_V4
+            && version != MIGRATE_FROM_V5
         {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         sql(conn.execute_batch(SCHEMA))?;
         sql(conn.execute_batch(SCHEMA_V3))?;
+        sql(conn.execute_batch(SCHEMA_V6))?;
         for (table, column, kind) in [
             ("session", "l_size", "INTEGER"),
             ("session", "l_mtime", "INTEGER"),
@@ -518,6 +608,7 @@ impl Ledger {
             && version != MIGRATE_FROM
             && version != MIGRATE_FROM_V3
             && version != MIGRATE_FROM_V4
+            && version != MIGRATE_FROM_V5
         {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
@@ -1464,6 +1555,204 @@ impl Ledger {
     /// this build cannot read.
     pub fn regulars(&self) -> Result<Vec<Regular>> {
         self.regular_rows(None)
+    }
+
+    /// Mark the `done` or `raced` row of `link` `relinked` and drop the
+    /// placement row of the path, in one commit: the regular file this
+    /// ledger left there was replaced by a symlink since, so the path is
+    /// decided again from what it is now (A-20261018-111). Returns whether
+    /// a row was marked.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit; the refusal of a
+    /// read-only or version 2 ledger.
+    pub fn relink(&self, link: &Path) -> Result<bool> {
+        if !self.v3 || self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = (|| -> rusqlite::Result<bool> {
+            let marked = self.conn.execute(
+                "UPDATE regularized SET state = 'relinked', pass = ?2
+                 WHERE link = ?1 AND state IN ('done', 'raced')",
+                params![blob(link), self.pass],
+            )?;
+            if marked > 0 {
+                self.conn
+                    .execute("DELETE FROM placement WHERE dest = ?1", params![blob(link)])?;
+            }
+            Ok(marked > 0)
+        })();
+        if let Ok(marked) = outcome {
+            sql(self.conn.execute_batch("COMMIT"))?;
+            Ok(marked)
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK");
+            Err(BulkloadRefusal::SqliteStateChanged)
+        }
+    }
+
+    /// Every destination path whose placement row proved the landed file
+    /// equal to, or a prefix of, its archive link's target and so kept the
+    /// link (`occupied` with a digest, A-106).
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn proved_links(&self) -> Result<Vec<PathBuf>> {
+        let mut statement = sql(self.conn.prepare(
+            "SELECT dest FROM placement WHERE state = 'occupied' AND digest IS NOT NULL
+             ORDER BY dest",
+        ))?;
+        let rows = sql(statement.query_map([], |row| row.get::<_, Vec<u8>>(0)))?;
+        Ok(sql(rows.collect::<rusqlite::Result<Vec<_>>>())?
+            .into_iter()
+            .map(path_of)
+            .collect())
+    }
+
+    fn waiver_rows(&self, filter: Option<&Path>) -> Result<Vec<Waiver>> {
+        if !self.has_table("waiver")? {
+            return Ok(Vec::new());
+        }
+        let mut statement = sql(self.conn.prepare(
+            "SELECT dest, landing, kind, session, l_dev, l_ino, l_size, l_mtime,
+                    d_dev, d_ino, d_size, d_mtime, digest, state, at_ns
+             FROM waiver WHERE ?1 IS NULL OR dest = ?1 ORDER BY dest",
+        ))?;
+        let identity = |row: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Identity> {
+            Ok(Identity {
+                dev: uint(row.get(at)?),
+                ino: uint(row.get(at + 1)?),
+                size: uint(row.get(at + 2)?),
+                mtime: row.get(at + 3)?,
+            })
+        };
+        let rows = sql(statement.query_map(params![filter.map(blob)], |row| {
+            Ok((
+                Waiver {
+                    dest: path_of(row.get(0)?),
+                    landing: path_of(row.get(1)?),
+                    kind: row.get(2)?,
+                    session: row.get(3)?,
+                    landed: identity(row, 4)?,
+                    dest_identity: identity(row, 8)?,
+                    digest: [0; 32],
+                    state: row.get(13)?,
+                    at_ns: row.get(14)?,
+                },
+                row.get::<_, Vec<u8>>(12)?,
+            ))
+        }))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (mut waiver, hash) = sql(row)?;
+            waiver.digest = digest(Some(hash)).ok_or(BulkloadRefusal::SchemaMismatch)?;
+            out.push(waiver);
+        }
+        Ok(out)
+    }
+
+    /// The waiver row of `dest`, active or undone.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read; `SCHEMA_MISMATCH` on a row
+    /// this build cannot read.
+    pub fn waiver(&self, dest: &Path) -> Result<Option<Waiver>> {
+        Ok(self.waiver_rows(Some(dest))?.into_iter().next())
+    }
+
+    /// Every waiver row.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read; `SCHEMA_MISMATCH` on a row
+    /// this build cannot read.
+    pub fn waivers(&self) -> Result<Vec<Waiver>> {
+        self.waiver_rows(None)
+    }
+
+    /// Every lane waiver row.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn lane_waivers(&self) -> Result<Vec<LaneWaiver>> {
+        if !self.has_table("lane_waiver")? {
+            return Ok(Vec::new());
+        }
+        let mut statement = sql(self.conn.prepare(
+            "SELECT dest_cwd, given, reason, state, at_ns FROM lane_waiver ORDER BY dest_cwd",
+        ))?;
+        let rows = sql(statement.query_map([], |row| {
+            Ok(LaneWaiver {
+                dest_cwd: path_of(row.get(0)?),
+                given: path_of(row.get(1)?),
+                reason: row.get(2)?,
+                state: row.get(3)?,
+                at_ns: row.get(4)?,
+            })
+        }))?;
+        sql(rows.collect::<rusqlite::Result<Vec<_>>>())
+    }
+
+    /// Write a lane waiver row (insert or replace), committed before this
+    /// returns.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit; the refusal of a
+    /// read-only ledger.
+    pub fn put_lane_waiver(&self, waiver: &LaneWaiver) -> Result<()> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute(
+            "INSERT OR REPLACE INTO lane_waiver(dest_cwd, given, reason, state, pass, at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                blob(&waiver.dest_cwd),
+                blob(&waiver.given),
+                waiver.reason,
+                waiver.state,
+                self.pass,
+                waiver.at_ns,
+            ],
+        ))
+        .map(drop)
+    }
+
+    /// Write a waiver row (insert or replace), committed before this
+    /// returns.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit; the refusal of a
+    /// read-only ledger.
+    pub fn put_waiver(&self, waiver: &Waiver) -> Result<()> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute(
+            "INSERT OR REPLACE INTO waiver(dest, landing, kind, session,
+                l_dev, l_ino, l_size, l_mtime, d_dev, d_ino, d_size, d_mtime,
+                digest, state, pass, at_ns)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                blob(&waiver.dest),
+                blob(&waiver.landing),
+                waiver.kind,
+                waiver.session,
+                int(waiver.landed.dev),
+                int(waiver.landed.ino),
+                int(waiver.landed.size),
+                waiver.landed.mtime,
+                int(waiver.dest_identity.dev),
+                int(waiver.dest_identity.ino),
+                int(waiver.dest_identity.size),
+                waiver.dest_identity.mtime,
+                waiver.digest.as_slice(),
+                waiver.state,
+                self.pass,
+                waiver.at_ns,
+            ],
+        ))
+        .map(drop)
     }
 }
 

@@ -45,7 +45,7 @@ pub const TOOL: &str = "claude";
 const CWD: &[&str] = &["cwd"];
 const SLUG: &[&str] = &["slug"];
 /// The deepest sidecar tree walked.
-const DEPTH_LIMIT: usize = 64;
+pub(super) const DEPTH_LIMIT: usize = 64;
 /// Claude Code's default `cleanupPeriodDays`.
 const DEFAULT_RETENTION_DAYS: i64 = 30;
 /// How far into a transcript the retention check looks for its `slug`.
@@ -243,23 +243,37 @@ fn session_mtimes(
     Ok(out)
 }
 
+/// What a pass would place, as the retention check found it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Planned {
+    /// The bytes it would write at most (the free-space check).
+    pub bytes: u64,
+    /// `(destination key, session id)` of every landed session it would
+    /// place, to its landed (source) key: their sidecars are the
+    /// companions a `--replace-archived-dest` placement may replace, so
+    /// regularization leaves their archive links to it (A-20261018-111).
+    pub sessions: BTreeMap<(String, String), String>,
+}
+
 /// Refuse before anything is written when the destination's Claude Code
 /// would delete a re-seated file within the margin
 /// (`--retention-margin-days`, default 365): they keep their source
 /// modification times. The retention is the smallest any settings source
 /// sets (managed, user, each lane's project and local), and every file of
 /// a session counts, not only its transcript. Returns the bytes the pass
-/// would write (an upper bound, for the free-space check).
+/// would write (an upper bound, for the free-space check) and the sessions
+/// it would place ([`Planned`]).
 ///
 /// # Errors
 /// `RESEAT_RETENTION_UNSAFE`; the I/O refusal of reading the settings or
 /// a transcript's head (its lane and slug, once, then from the ledger).
-pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Result<u64> {
+pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Result<Planned> {
     let ledger = Ledger::open_read_only(&options.state)?;
     let root = std::fs::canonicalize(&options.dest_claude).ok();
     let mut lane_dirs = Vec::new();
     let mut mtimes = Vec::new();
     let mut planned = 0_u64;
+    let mut placed = BTreeMap::new();
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
     for candidate in &sessions.list {
         let cached = match &ledger {
@@ -294,6 +308,12 @@ pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Resul
                 slug.as_deref(),
             )?);
         }
+        if let Some(dest_key) = &dest_key {
+            placed.insert(
+                (dest_key.clone(), candidate.sid.clone()),
+                candidate.key.clone(),
+            );
+        }
         if let (Some(dest_key), Some(root)) = (dest_key, root.as_ref()) {
             let rel = Path::new("projects")
                 .join(&dest_key)
@@ -326,7 +346,10 @@ pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Resul
         .iter()
         .all(|mtime| retained(days, options.retention_margin_days, *mtime, options.now_ns))
     {
-        Ok(planned)
+        Ok(Planned {
+            bytes: planned,
+            sessions: placed,
+        })
     } else {
         Err(BulkloadRefusal::ReseatRetentionUnsafe)
     }
@@ -644,8 +667,13 @@ pub fn reseat(
         summary.file(TOOL, transcript.outcome);
         let mut files: BTreeMap<&'static str, u64> = BTreeMap::new();
         // A transcript kept out (occupied, diverged, handed over) takes
-        // none of its companions: they stay in the landing with it.
-        let companions_too = transcript.outcome.landed();
+        // none of its companions: they stay in the landing with it. An
+        // archive link the placement proved equal to the landed transcript
+        // holds it (A-106), so its companions go (A-20261018-111: a fork
+        // among them is replaced in this pass, not regularized as sting's).
+        let companions_too = transcript.outcome.landed()
+            || (transcript.outcome == place::Outcome::Occupied
+                && place::proved_equal(ledger, &root.join(&rel))?);
         let mut place = |landed: &Path, dest: &Path, kind: Kind, session: &str| -> Result<()> {
             let outcome = placer.place(landed, dest, kind, session, None)?.outcome;
             summary.file(TOOL, outcome);

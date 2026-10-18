@@ -26,8 +26,14 @@
 //! `--replace-archived-dest` over a destination transcript that is a
 //! symlink into the replace root holding a shorter fork (A-106), at its
 //! intent, after its exchange and before it is `done`; `ArchivedUndo` the
-//! `--undo` that puts that link back. `_exit` models a process crash only
-//! (see the harness header).
+//! `--undo` that puts that link back. `Companions` crashes a first pass
+//! that regularizes symlinked companions (A-20261018-111: sting's own
+//! `file-history` snapshot, then a landed session's subagent transcript)
+//! at each exchange, and `CompanionsUndo` the `--undo` that puts them back;
+//! `ArchivedEqual` crashes the regularization after the placement of a
+//! transcript linked into the replace root whose target is the landed
+//! transcript (kept a link by the placement). `_exit` models a process
+//! crash only (see the harness header).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,6 +90,14 @@ pub enum Reseat {
     /// landing without the flag, then a first pass from the new landing
     /// with it, regularization off (review B1, M1).
     ArchivedMoved,
+    /// The first pass over symlinked companions (A-20261018-111).
+    Companions,
+    /// The `--undo` after a full pass over the `Companions` world.
+    CompanionsUndo,
+    /// The first pass with the destination transcript a link into the
+    /// replace root holding exactly the landed transcript: regularized
+    /// after the placement (A-20261018-111).
+    ArchivedEqual,
 }
 
 impl Scenario for Reseat {
@@ -367,6 +381,56 @@ impl World {
         fs::write(self.base.join("replace-on"), b"").unwrap();
     }
 
+    /// A-20261018-111: the landed session's subagent transcript and
+    /// sting's own `file-history` snapshot, both symlinks into the archive
+    /// (the sidecar's target the landed bytes).
+    fn companions(&self) {
+        let sidecar = self.pairs()[1].clone();
+        let target = self.base.join("archive/claude/agent-a.jsonl");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(&sidecar.0, &target).unwrap();
+        fs::create_dir_all(sidecar.1.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, &sidecar.1).unwrap();
+        let own = self.own_history();
+        fs::write(self.own_history_target(), b"own history\n").unwrap();
+        fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(self.own_history_target(), own).unwrap();
+    }
+
+    fn own_history(&self) -> PathBuf {
+        self.base
+            .join("dest/.claude/file-history")
+            .join(OWN)
+            .join("own@v1")
+    }
+
+    fn own_history_target(&self) -> PathBuf {
+        self.base.join("archive/claude/own@v1")
+    }
+
+    /// The companion links of [`Self::companions`]: `(link, target)`.
+    fn companion_links(&self) -> Vec<(PathBuf, PathBuf)> {
+        vec![
+            (self.own_history(), self.own_history_target()),
+            (
+                self.pairs()[1].1.clone(),
+                self.base.join("archive/claude/agent-a.jsonl"),
+            ),
+        ]
+    }
+
+    /// The destination transcript a link into the replace root whose
+    /// target is the landed transcript's bytes.
+    fn archived_equal(&self) {
+        let target = self.base.join("replace-archive/equal.jsonl");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::copy(self.landed_transcript(), &target).unwrap();
+        let link = &self.pairs()[0].1;
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, link).unwrap();
+        fs::write(self.base.join("replace-on"), b"").unwrap();
+    }
+
     fn fork_target(&self) -> PathBuf {
         self.base.join("replace-archive/fork.jsonl")
     }
@@ -534,19 +598,35 @@ fn scenario(point: Point, nth: u64, kind: Reseat) {
             world.archived();
             world.reseat();
         }
+        Reseat::Companions => world.companions(),
+        Reseat::CompanionsUndo => {
+            world.companions();
+            world.reseat();
+        }
+        Reseat::ArchivedEqual => world.archived_equal(),
     }
     let landed = fs::read(world.landed_transcript()).unwrap();
 
     crash_mode(
         &world,
         &format!("{}:{nth}", point.name()),
-        matches!(kind, Reseat::Undo | Reseat::ArchivedUndo),
+        matches!(
+            kind,
+            Reseat::Undo | Reseat::ArchivedUndo | Reseat::CompanionsUndo
+        ),
     );
     match kind {
         Reseat::Q198 => return settled_q198(&world, &pairs, &label),
         Reseat::Undo => return settled_undo(&world, &label),
         Reseat::ArchivedUndo => return settled_archived_undo(&world, &label),
         Reseat::ArchivedMoved => return settled_archived_moved(&world, &pairs, &label),
+        Reseat::Companions => return settled_companions(&world, &pairs, &label),
+        Reseat::CompanionsUndo => return settled_companions_undo(&world, &label),
+        Reseat::ArchivedEqual => assert_eq!(
+            fs::read(world.base.join("replace-archive/equal.jsonl")).unwrap(),
+            landed,
+            "{label}: the archive target is never written"
+        ),
         Reseat::Archived => assert_eq!(
             fs::read(world.fork_target()).unwrap(),
             World::fork_bytes(),
@@ -783,6 +863,87 @@ fn settled_q198(world: &World, pairs: &[(PathBuf, PathBuf)], label: &str) {
         Some(&2),
         "{label}: {summary:?}"
     );
+}
+
+/// The rerun after a crash in a first pass over symlinked companions
+/// (A-20261018-111): each companion a regular copy of its target (the
+/// archive kept), every landed file placed, no temporary, each row
+/// `done`, the R0 check passing; then a rerun reads no landed byte.
+fn settled_companions(world: &World, pairs: &[(PathBuf, PathBuf)], label: &str) {
+    settled(world, pairs, label);
+    for (link, target) in world.companion_links() {
+        assert!(
+            fs::symlink_metadata(&link).unwrap().is_file(),
+            "{label}: {link:?}"
+        );
+        assert_eq!(
+            fs::read(&link).unwrap(),
+            fs::read(&target).unwrap(),
+            "{label}"
+        );
+    }
+    assert_eq!(
+        fs::read(world.own_history_target()).unwrap(),
+        b"own history\n",
+        "{label}: the archive kept"
+    );
+    {
+        let ledger = reseat::ledger::Ledger::open_read_only(&world.base.join("state"))
+            .unwrap()
+            .unwrap();
+        let rows = ledger.regulars().unwrap();
+        assert_eq!(rows.len(), 2, "{label}: {rows:?}");
+        assert!(
+            rows.iter()
+                .all(|row| row.state == reseat::ledger::RegularState::Done),
+            "{label}: {rows:?}"
+        );
+    }
+    let before = Counters::snapshot();
+    let summary = world.reseat();
+    assert_eq!(
+        Counters::snapshot()
+            .since(before)
+            .get(Counter::ReseatLandingRead),
+        0,
+        "{label}: {summary:?}"
+    );
+}
+
+/// The rerun of an `--undo` crashed after a full pass over the
+/// `Companions` world: each link back with its text over its unchanged
+/// copy, the archive kept, no temporary, each row `undone`; a second undo
+/// has nothing left to do.
+fn settled_companions_undo(world: &World, label: &str) {
+    let (links, _) = world.undo();
+    assert!(links <= 2, "{label}");
+    for (link, target) in world.companion_links() {
+        assert_eq!(fs::read_link(&link).ok(), Some(target), "{label}");
+    }
+    assert_eq!(
+        fs::read(world.own_history_target()).unwrap(),
+        b"own history\n",
+        "{label}"
+    );
+    assert_eq!(
+        world.temporaries(),
+        Vec::<PathBuf>::new(),
+        "{label}: a temporary left"
+    );
+    {
+        let ledger = reseat::ledger::Ledger::open_read_only(&world.base.join("state"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            ledger
+                .regulars()
+                .unwrap()
+                .iter()
+                .all(|row| row.state == reseat::ledger::RegularState::Undone),
+            "{label}"
+        );
+    }
+    assert_eq!(world.undo(), (0, 0), "{label}");
 }
 
 /// `src` copied to `dst`, files and directories.

@@ -13,7 +13,11 @@
 //!   ends inside a line fails (`ends-mid-line`: a resume would append into
 //!   that record). Every landed sidecar, per-session global and plan file
 //!   is a regular file at its place (of the same size unless the session
-//!   continued).
+//!   continued), or a kept companion the operator waived by path
+//!   (`--waive-companion` on a pass, A-20261018-111) whose destination and
+//!   landed files are still the waived ones: named on a
+//!   `waived-companion` line, never silently (one changed since fails the
+//!   session, `companion-waiver-stale`).
 //! - **Codex, as the picker reads it** (fact 2.2): the destination's
 //!   `threads` row has `cwd == realpath(dest_cwd)` and a `rollout_path`
 //!   (the plain `.jsonl` re-seat placed, or the `.jsonl.zst` Codex
@@ -86,6 +90,12 @@ pub struct LaneCheck {
     pub handoff: String,
     /// `<tool>:<id>:<reason>`, the first [`NAMED_FAILURES`].
     pub failures: Vec<String>,
+    /// Companions that hold only by a waiver (A-20261018-111).
+    pub waived: u64,
+    /// The reason of the lane waiver that holds for this absent lane
+    /// (A-20261018-112): its directory, Git and hand-off rules are waived;
+    /// its sessions and threads are checked as for any lane.
+    pub lane_waiver: Option<String>,
     /// `pass`, `fail` or `incomplete`.
     pub verdict: &'static str,
 }
@@ -138,6 +148,12 @@ pub struct CheckSummary {
     pub replace_pending: u64,
     pub replace_equal_size: u64,
     pub replace_proved: u64,
+    /// Kept companions accepted by a waiver (A-20261018-111): `(session,
+    /// destination path)`, each named on a `waived-companion` line.
+    pub companions_waived: Vec<(String, PathBuf)>,
+    /// Waivers whose destination or landed file changed since: their
+    /// sessions fail (`companion-waiver-stale`).
+    pub companion_waivers_stale: u64,
 }
 
 impl CheckSummary {
@@ -156,7 +172,12 @@ impl CheckSummary {
         let target_meta = std::fs::symlink_metadata(&resolved).ok();
         let landed_meta = std::fs::symlink_metadata(landed).ok();
         if let Some(ledger) = ledger {
-            if ledger.regular(dest)?.is_some() {
+            // A row that stands (not re-linked since) is this ledger's
+            // regularization or replacement: not a candidate.
+            if ledger
+                .regular(dest)?
+                .is_some_and(|row| row.stands() && !row.relinked_now())
+            {
                 return Ok(());
             }
             // Proved equal or ahead by a pass, nothing changed since.
@@ -483,8 +504,19 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     let workspaces = git_classes(options)?;
     for (dest_cwd, lane) in &mut table {
+        if !lane.exists {
+            lane.lane_waiver = super::waiver::lane_standing(ledger.as_ref(), dest_cwd)?;
+        }
         judge(options, workspaces.as_ref(), dest_cwd, lane)?;
         emit(&lane_line(dest_cwd, lane))?;
+    }
+    for (session, dest) in &summary.companions_waived {
+        emit(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"waived-companion\",\"tool\":\"{}\",\"session\":{},\"dest\":{}}}",
+            claude::TOOL,
+            json_string(session),
+            shown(dest),
+        ))?;
     }
     for item in &summary.unlaned {
         emit(&format!(
@@ -497,7 +529,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     summary.lanes = table;
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"replaced_archived\":{},\"replace_pending\":{},\"replace_equal_size\":{},\"replace_proved\":{},\"rebound\":{},\"rebind_pending\":{},\"r0\":\"{}\"}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"replaced_archived\":{},\"replace_pending\":{},\"replace_equal_size\":{},\"replace_proved\":{},\"rebound\":{},\"rebind_pending\":{},\"companions_waived\":{},\"companion_waivers_stale\":{},\"lanes_waived\":{},\"r0\":\"{}\"}}",
         summary.checked,
         summary.lanes.len(),
         summary.count("pass"),
@@ -516,6 +548,9 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         summary.replace_proved,
         summary.rebound,
         summary.rebind_pending,
+        summary.companions_waived.len(),
+        summary.companion_waivers_stale,
+        summary.lanes.values().filter(|lane| lane.lane_waiver.is_some()).count(),
         if summary.verdict().is_ok() { "pass" } else { "fail" },
     ))?;
     Ok(summary)
@@ -639,6 +674,7 @@ fn tally(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_claude(
     options: &Options,
     lanes: &Lanes,
@@ -697,6 +733,7 @@ fn check_claude(
                 Some(slug) => Some(slug),
                 None => slug_of(&candidate.path)?,
             };
+            let mut waived = Vec::new();
             for (landed, rel, _) in
                 claude::companions(options, sessions, candidate, &key, slug.as_deref())?
             {
@@ -715,9 +752,29 @@ fn check_claude(
                     }
                 };
                 if !present {
-                    held = Holds::Not("companion-missing");
+                    // A kept companion the operator waived holds while both
+                    // files are the waived ones (A-20261018-111).
+                    match super::waiver::standing(ledger, &root.join(&rel), &landed)? {
+                        super::waiver::Standing::Waived => {
+                            waived.push(root.join(&rel));
+                            continue;
+                        }
+                        super::waiver::Standing::Stale => {
+                            summary.companion_waivers_stale += 1;
+                            held = Holds::Not("companion-waiver-stale");
+                        }
+                        super::waiver::Standing::No => held = Holds::Not("companion-missing"),
+                    }
                     break;
                 }
+            }
+            if !matches!(held, Holds::Not(_)) && !waived.is_empty() {
+                if let Some(lane) = lane.as_ref() {
+                    table.entry(lane.dest_cwd.clone()).or_default().waived += waived.len() as u64;
+                }
+                summary
+                    .companions_waived
+                    .extend(waived.into_iter().map(|dest| (candidate.sid.clone(), dest)));
             }
         }
         tally(
@@ -993,6 +1050,18 @@ pub(crate) fn judge(
     dest_cwd: &Path,
     lane: &mut LaneCheck,
 ) -> Result<()> {
+    if lane.lane_waiver.is_some() && !lane.exists {
+        // A-20261018-112: the directory is gone on both hosts; only its
+        // sessions and threads are judged.
+        "waived".clone_into(&mut lane.git);
+        "not-required".clone_into(&mut lane.handoff);
+        lane.verdict = if lane.sessions_ok == lane.sessions && lane.threads_ok == lane.threads {
+            "pass"
+        } else {
+            "fail"
+        };
+        return Ok(());
+    }
     lane.git = if options.sessions_only {
         "waived".to_owned()
     } else {
@@ -1136,7 +1205,7 @@ fn handoff_present(dest_cwd: &Path, marker: &str) -> Result<bool> {
 
 fn lane_line(dest_cwd: &Path, lane: &LaneCheck) -> String {
     format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"lane\",\"dest_cwd\":{},\"dest_cwd_exists\":{},\"sessions\":{},\"sessions_ok\":{},\"threads\":{},\"threads_ok\":{},\"continued\":{},\"git\":{},\"handoff\":{},\"verdict\":\"{}\",\"failures\":[{}]}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"lane\",\"dest_cwd\":{},\"dest_cwd_exists\":{},\"sessions\":{},\"sessions_ok\":{},\"threads\":{},\"threads_ok\":{},\"continued\":{},\"git\":{},\"handoff\":{},\"verdict\":\"{}\",\"waived\":{},\"lane_waiver\":{},\"failures\":[{}]}}",
         shown(dest_cwd),
         lane.exists,
         lane.sessions,
@@ -1147,6 +1216,10 @@ fn lane_line(dest_cwd: &Path, lane: &LaneCheck) -> String {
         json_string(&lane.git),
         json_string(&lane.handoff),
         lane.verdict,
+        lane.waived,
+        lane.lane_waiver
+            .as_deref()
+            .map_or_else(|| "null".to_owned(), json_string),
         lane.failures
             .iter()
             .map(|failure| json_string(failure))
