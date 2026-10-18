@@ -68,9 +68,13 @@
 //! the list with the tests this binary reports under `--list --ignored`, and
 //! checks each listed test's ignore reason.
 //!
-//! The list is empty. The four R-N86 tests it held (a refused capture left
-//! the victim's bytes in the source pack) pass since W4 PR 2 removed the
-//! pack (R-N58), as `live_writer_*_leaves_no_source_ledger_row`.
+//! The four R-N86 tests the list held (a refused capture left the victim's
+//! bytes in the source pack) pass since W4 PR 2 removed the pack (R-N58),
+//! as `live_writer_*_leaves_no_source_ledger_row`. It holds two tests now,
+//! `converge_settle_keeps_an_added_seat_the_operator_deleted_*`: #237
+//! reproduced on the real code (a converge's settle re-creates an added
+//! seat the operator deleted after the crash), mid-seat and after the
+//! index step.
 //!
 //! # Hung scenarios
 //!
@@ -1805,8 +1809,41 @@ const KNOWN_VIOLATION_REASON: &str = "#[ignore = \"known violation";
 /// Known violations: `#[ignore]`d tests asserting invariants the engine breaks
 /// today, with the fault point each one is the only scenario for, if any.
 /// Listed, never counted as coverage.
-/// Empty since W4 PR 2: the four R-N86 source-pack tests pass (R-N58).
-const KNOWN_VIOLATIONS: [(&str, Option<Point>); 0] = [];
+/// Empty from W4 PR 2 (the four R-N86 source-pack tests pass, R-N58) until
+/// #237 was reproduced on the real code (2026-10-18). Its points,
+/// `estate.converge.after_seat` and `estate.converge.after_index`, keep
+/// their passing `Delta` rows. A fix for #237 removes both `#[ignore]`s and
+/// both entries here.
+const KNOWN_VIOLATIONS: [(&str, Option<Point>); 2] = [
+    (
+        "converge_settle_keeps_an_added_seat_the_operator_deleted_mid_seat",
+        None,
+    ),
+    (
+        "converge_settle_keeps_an_added_seat_the_operator_deleted_after_index",
+        None,
+    ),
+];
+
+/// #237 (`EstateConverge` `NoLocalWorkLost` at `MaxSrc` 2), on the real code:
+/// a converge crashed right after its `Add` of an untracked seat, the
+/// operator deletes that seat, and the rerun's settle
+/// writes it again. See `estate_converge::deleted_add`. Run it with
+/// `--ignored`; it fails with "the rerun re-created the seat the operator
+/// deleted".
+#[test]
+#[ignore = "known violation #237: a converge settle re-creates an added seat the operator deleted after the crash"]
+fn converge_settle_keeps_an_added_seat_the_operator_deleted_mid_seat() {
+    estate_converge::deleted_add(true);
+}
+
+/// #237, the same deletion after every seat step and the index: the settle
+/// still redoes its seats first.
+#[test]
+#[ignore = "known violation #237: a converge settle re-creates an added seat the operator deleted, after the index step"]
+fn converge_settle_keeps_an_added_seat_the_operator_deleted_after_index() {
+    estate_converge::deleted_add(false);
+}
 
 /// The attributes directly above `fn <name>(` (or `pub fn <name>(`): the
 /// text between the preceding item's end and the function.

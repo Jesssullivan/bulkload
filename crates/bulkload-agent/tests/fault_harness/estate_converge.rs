@@ -792,3 +792,68 @@ fn fresh_index_lock(world: &World, label: &str) {
         .unwrap_or_else(|| panic!("{label}: no scratch index at the crash"));
     fs::write(git_dir.join(format!("{fresh}.lock")), b"DIRC").unwrap();
 }
+
+/// #237 on the real code (TIN-4546, M3 code lane, A-20261018-110):
+/// `EstateConverge`'s `NoLocalWorkLost` counterexample at `MaxSrc` 2. A
+/// converge adds `added.txt` and crashes with its workspace intent
+/// pending; the operator then deletes the seat the converge added; the
+/// rerun's settle replays the intent's `Add`, finds the path free and
+/// writes the seat again. The operator's deletion is lost.
+///
+/// The settle decides each seat from its content alone (the design's rule:
+/// a seat that still holds its old print is redone; an `Add`'s old print
+/// is "absent"), and the intent records no step's progress. `added.txt` is
+/// untracked at the source, so no index records it either. Two rows:
+///
+/// - `mid_seat` (`estate.converge.after_seat:6`, right after the `Add` of
+///   `added.txt`, the sixth seat step): #237's window, mid-apply.
+/// - `after_index` (`estate.converge.after_index:1`): every seat step and
+///   the index are done, and the rerun still redoes the seats first. A fix
+///   that tracks progress only up to some later step must keep it red.
+///
+/// Deleting after the crash stands in for a deletion during the apply:
+/// the settle reads only the state it finds. Each row asserts its setup
+/// (the seat added, the intent pending) and then that the deletion
+/// survives the rerun, whatever the rerun records. Both fail today; the
+/// fault harness lists them as known violations.
+pub fn deleted_add(mid_seat: bool) {
+    let fault = if mid_seat {
+        "estate.converge.after_seat:6"
+    } else {
+        "estate.converge.after_index:1"
+    };
+    let label = format!("{fault}/DeletedAdd");
+    let world = World::new("deleted-add");
+    world.capture("plan", "corpus");
+    let landed = world.apply("plan", "corpus", "applied");
+    assert_eq!(landed, vec![("workspace-restored", None)], "{label}");
+    settle();
+    world.work();
+    settle();
+    world.capture("plan", "corpus");
+
+    crash(&world, fault);
+
+    let added = world.dst().join("added.txt");
+    assert_eq!(
+        fs::read(&added).unwrap(),
+        b"new at c1\n",
+        "{label}: the converge added the seat before the crash"
+    );
+    assert!(
+        world
+            .dst()
+            .join(".git/bulkload/v1/neo/workspace.intent")
+            .exists(),
+        "{label}: the intent is pending"
+    );
+    // The operator's work: the seat the converge added is deleted.
+    fs::remove_file(&added).unwrap();
+
+    let rows = world.apply("plan", "corpus", "applied");
+    assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+    assert!(
+        fs::symlink_metadata(&added).is_err(),
+        "{label}: the rerun re-created the seat the operator deleted ({rows:?})"
+    );
+}
