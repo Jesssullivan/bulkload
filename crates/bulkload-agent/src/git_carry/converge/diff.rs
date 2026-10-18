@@ -247,6 +247,7 @@ fn parents_component(row: &mut ItemRow, absent: usize) {
 ///
 /// # Errors
 /// Whatever reading the destination or the capture refuses.
+#[allow(clippy::too_many_lines)]
 pub fn workspace(
     staged: &super::super::StagedBundle,
     target: &Target<'_>,

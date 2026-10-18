@@ -134,7 +134,7 @@ pub fn namespace(suffix: &str) -> Result<String> {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         && !name.starts_with(['.', '-'])
         && !name.ends_with('.')
-        && !name.ends_with(".lock")
+        && !name.as_bytes().ends_with(b".lock")
         && !name.contains("..");
     if plain {
         Ok(name.to_owned())
@@ -256,10 +256,12 @@ pub fn plan(repo: &Path, wanted: &BTreeMap<String, String>) -> Result<RefsPlan> 
     Ok(planned)
 }
 
-/// Create `refs` in `repo`: one transaction of compare-and-swap `create`
-/// lines through the converge's ref writer, which syncs the refs and their
-/// directories before returning. A ref another writer created meanwhile
-/// refuses the whole transaction, with nothing moved.
+/// Create `refs` in `repo`, create-only.
+///
+/// One transaction of compare-and-swap `create` lines through the
+/// converge's ref writer, which syncs the refs and their directories before
+/// returning. A ref another writer created meanwhile refuses the whole
+/// transaction, with nothing moved.
 ///
 /// # Errors
 /// Whatever the transaction refuses.
@@ -279,9 +281,11 @@ pub fn create(repo: &Path, refs: &[(String, String)]) -> Result<()> {
     native_refs::update_refs(repo, None, &transaction, &names)
 }
 
-/// Move each pending ref of `record` that `repo` holds at its value to
-/// created (a crash cut the record off after the refs), and drop the rest
-/// of the pending list (never written, or since changed: decided again).
+/// Settle `record`'s pending refs against `repo`.
+///
+/// Each pending ref `repo` holds at its value moves to created (a crash cut
+/// the record off after the refs); the rest of the pending list is dropped
+/// (never written, or since changed: decided again).
 ///
 /// # Errors
 /// Whatever listing the refs refuses.

@@ -2531,7 +2531,7 @@ fn beside_item(
     }
     suffix.clone_into(&mut record.suffix);
     record.capture = ledger.capture;
-    record.instance = instance.clone();
+    record.instance.clone_from(&instance);
     let wanted = git_carry::beside::wanted(target.repository, target.source, &instance, &ns)?;
     let planned = git_carry::beside::plan(target.repository, &wanted)?;
     record.kept.clone_from(&planned.kept);
