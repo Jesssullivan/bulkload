@@ -718,7 +718,12 @@ Q10, Q18). It changes no number and no ruling.
   (`tests/power_loss.rs`, `tests/fault_harness.rs`).
 - **Refusal code.** A transfer's occupied destination path is
   `DESTINATION_OCCUPIED`; `GIT_DESTINATION_OCCUPIED` is the Git carry's
-  alone.
+  alone. [2026-10-18, M2r2 A-103: an occupied path whose file has no owning
+  record and holds a verified byte prefix of the seat (at least one whole
+  chunk) is extended in place by the tail instead (`docs/design.md`,
+  "Grown destination files"); the wire carries the tail and the chunk it
+  starts in, the destination reads the held prefix once, and a failed
+  proof is remembered (`NotPrefix`) so R25 holds for it too.]
 - **Gate (b)'s second deviation is gone.** The 2026-10-06 amendment lets
   gate (b)'s warm-resume reads be "net of the 16-byte SQLite magic probes".
   `source_bytes_read` no longer holds them, so the raw counter is 0 on a

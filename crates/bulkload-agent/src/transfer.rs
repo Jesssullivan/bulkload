@@ -99,7 +99,7 @@ use crate::materialize::{
 };
 use crate::transfer_store::{
     row_key, sqlite_key, ChunkHint, LedgerItem, LedgerRecord, LedgerSink, Manifest, OutputRecord,
-    PublisherSide, RefusedOutput, RefusedSeat, Store,
+    PrefixProof, PublisherSide, RefusedOutput, RefusedSeat, Store,
 };
 use crate::walk::{WalkItem, Walker};
 use crate::{BulkloadRefusal, Result, RowSchema};
@@ -297,6 +297,12 @@ pub struct TransferStats {
     /// mode kept although it differs from the source's (M2 item 2): by
     /// relative path, with the mode found and the source's.
     pub directories_mode_kept: Vec<(Vec<u8>, u32, u32)>,
+    /// Existing regular files with no owning record that held a verified
+    /// byte prefix of their source and were extended in place by its tail
+    /// (M2r2 A-103): by relative path, with the prefix's length and BLAKE3
+    /// and the size the file was extended to. Each is also reported
+    /// `prefix-extended` and ledgered in the store's `prefix_extensions`.
+    pub prefix_extended: Vec<(Vec<u8>, u64, [u8; 32], u64)>,
     /// Directories this session finished in its last output group's commit
     /// rather than in a completion commit of their own (OI-1003-Q154 lever
     /// 3; `directories_folded`). 0 when the fold is off
@@ -792,6 +798,42 @@ pub fn set_loopback_handoff(root: &Path, on: Option<bool>) {
 /// way the source reads each seat at most once and every byte placed is
 /// verified (handed chunks by the source's own digest).
 pub const LOCAL_NEW_PATH_STREAM_ENV: &str = "BULKLOAD_LOCAL_NEW_PATH_STREAM";
+
+/// `0` turns the prefix extension off (M2r2 A-103; on by default): an
+/// existing regular file with no owning record that holds a byte prefix of
+/// its source is then refused `DESTINATION_OCCUPIED`, as before.
+pub const PREFIX_EXTEND_ENV: &str = "BULKLOAD_PREFIX_EXTEND";
+
+/// The prefix extension by canonical destination root, for tests that
+/// compare both arms in one process.
+static PREFIX_EXTEND_OVERRIDE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
+
+/// Run sessions into the canonical destination `root` with the prefix
+/// extension on or off (`None`: the default again). Test hook.
+#[doc(hidden)]
+pub fn set_prefix_extend(root: &Path, on: Option<bool>) {
+    let mut overrides = PREFIX_EXTEND_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(on) = on {
+        overrides.push((root.to_path_buf(), on));
+    }
+}
+
+/// Whether a grown destination file under the canonical destination `root`
+/// is extended (M2r2 A-103): on, unless [`PREFIX_EXTEND_ENV`] is `0`.
+fn prefix_extend_enabled(root: &Path) -> bool {
+    PREFIX_EXTEND_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map_or_else(
+            || std::env::var(PREFIX_EXTEND_ENV).map_or(true, |value| value != "0"),
+            |(_, on)| *on,
+        )
+}
 
 /// The delta lever by canonical destination root, for tests that compare
 /// both arms in one process.
@@ -5470,6 +5512,7 @@ impl<W: Write> Inbound<'_, W> {
                                 rel_path: row.rel_path.clone(),
                                 identity,
                                 racy: false,
+                                extended: None,
                                 hints,
                             },
                             file,
@@ -5511,6 +5554,12 @@ impl<W: Write> Inbound<'_, W> {
         if refused == RefusedOutput::ExchangeUnsupported && self.target.exchange_supported(row)? {
             return Ok(None);
         }
+        // M2r2 A-103: refused before the prefix extension existed, and a
+        // file it may extend: proved once more (a failed proof is
+        // remembered `NotPrefix`, which is honoured).
+        if refused == RefusedOutput::Occupied && self.may_extend(row)? {
+            return Ok(None);
+        }
         counters::bump(Counter::TransferRefusedOutputsRemembered);
         Ok(Some(refused))
     }
@@ -5520,6 +5569,28 @@ impl<W: Write> Inbound<'_, W> {
     /// Only for a capture that was not racy and a file that was `settled`
     /// when it was read ([`verify_settled`]). Best effort: a record that
     /// cannot be written costs one more source read, never the session.
+    /// Whether the file at `row`'s path is one the prefix extension would
+    /// try (M2r2 A-103): the extension on and [`extend_candidate`].
+    fn may_extend(&self, row: &RowSchema) -> Result<bool> {
+        if !prefix_extend_enabled(self.target.path()) {
+            return Ok(false);
+        }
+        Ok(self
+            .target
+            .existing(row)?
+            .is_some_and(|(file, _)| extend_candidate(&file, row).is_some()))
+    }
+
+    /// The record of an occupied refusal: `NotPrefix` when the file was one
+    /// the prefix extension tried (M2r2 A-103), else `Occupied`.
+    fn occupied(&self, row: &RowSchema) -> RefusedOutput {
+        if self.may_extend(row).unwrap_or(false) {
+            RefusedOutput::NotPrefix
+        } else {
+            RefusedOutput::Occupied
+        }
+    }
+
     fn remember_refusal(
         &self,
         key: &[u8],
@@ -5646,7 +5717,8 @@ impl<W: Write> Inbound<'_, W> {
                     session: &self.session,
                     salvage: &self.salvage,
                 },
-                &row,
+                // A snapshot's output is never extended (#218).
+                (&row, !snapshot && prefix_extend_enabled(self.target.path())),
                 &manifest,
                 &mut salvaged_from,
             )
@@ -5993,6 +6065,7 @@ impl<W: Write> Inbound<'_, W> {
         self.target.fold_finish()
     }
 
+    #[allow(clippy::too_many_lines)] // Verify, adopt, extend or supersede, stage, publish.
     fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32], racy: bool) -> Result<()> {
         let Streaming {
             row,
@@ -6020,6 +6093,9 @@ impl<W: Write> Inbound<'_, W> {
                 }
             });
         let mut supersede = None;
+        // M2r2 A-103: a grown file with no owning record, extended from the
+        // streamed copy (its whole prefix compared, `base` 0).
+        let mut grown = None;
         if checked.is_ok() && adopt {
             // Streamed in place of a manifest: an existing output at the
             // path is adopted against the streamed chunks, as a manifest
@@ -6042,8 +6118,17 @@ impl<W: Write> Inbound<'_, W> {
                     Ok(identity) => Ok(Some((file, parent, identity))),
                     Err(BulkloadRefusal::DestinationOccupied) => {
                         supersede = owned_output(self.store, &self.authority, &row, &file)?;
+                        if supersede.is_none()
+                            && !snapshot
+                            && prefix_extend_enabled(self.target.path())
+                        {
+                            if let Some((identity, prior)) = extend_candidate(&file, &row) {
+                                grown = Some((file, parent, identity, prior));
+                                return Ok(None);
+                            }
+                        }
                         if supersede.is_none() {
-                            self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
+                            self.remember_refusal(&key, settled, racy, self.occupied(&row));
                             Err(BulkloadRefusal::DestinationOccupied)
                         } else if self.target.exchange_supported(&row)? {
                             Ok(None)
@@ -6075,6 +6160,24 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(refusal);
                 }
             }
+        }
+        if let Some((file, parent, identity, prior)) = grown {
+            // A non-empty source streamed whole: its staged copy is here.
+            let staged = staged.ok_or(BulkloadRefusal::DestinationOccupied)?;
+            return self.finish_extend(
+                staged,
+                Extend {
+                    file,
+                    parent,
+                    identity,
+                    prior,
+                    base: 0,
+                    hasher: blake3::Hasher::new(),
+                    hints,
+                },
+                &row,
+                (key, record, racy, root),
+            );
         }
         let mut staged = match (checked, staged) {
             (Ok(()), Some(staged)) => staged,
@@ -6142,7 +6245,7 @@ impl<W: Write> Inbound<'_, W> {
                     let (verified, settled) =
                         verify_settled(self.target.path(), &file, &row, &manifest);
                     if matches!(verified, Err(BulkloadRefusal::DestinationOccupied)) {
-                        self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
+                        self.remember_refusal(&key, settled, racy, self.occupied(&row));
                     }
                     verified?
                 };
@@ -6159,6 +6262,14 @@ impl<W: Write> Inbound<'_, W> {
                     return Err(failure.refusal);
                 }
                 fault_point!(ReceiveAfterChunks);
+                if let Some(extend) = staging.extend.take() {
+                    return self.finish_extend(
+                        staging.staged,
+                        *extend,
+                        &row,
+                        (key, record, racy, root),
+                    );
+                }
                 if snapshot {
                     if let Err(refusal) = self.verify_snapshot(&staging.staged, &row) {
                         let _ = staging.staged.discard();
@@ -6196,6 +6307,20 @@ impl<W: Write> Inbound<'_, W> {
         (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
         identity: StatIdentity,
     ) -> Result<()> {
+        self.adopt_as(file, parent, row, (key, record, racy, root), identity, None)
+    }
+
+    /// [`Self::adopt`], with the record of a prefix extension (M2r2 A-103):
+    /// its chunk hints and its `prefix_extensions` row.
+    fn adopt_as(
+        &self,
+        file: std::fs::File,
+        parent: Arc<std::fs::File>,
+        row: &RowSchema,
+        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
+        identity: StatIdentity,
+        extended: Option<(PrefixProof, Vec<ChunkHint>)>,
+    ) -> Result<()> {
         let identity = if racy {
             identity
         } else {
@@ -6215,11 +6340,145 @@ impl<W: Write> Inbound<'_, W> {
                 rel_path: row.rel_path.clone(),
                 identity,
                 racy,
-                hints: Vec::new(),
+                extended: extended.as_ref().map(|(proof, _)| *proof),
+                hints: extended.map(|(_, hints)| hints).unwrap_or_default(),
             },
             file,
             parent,
         })
+    }
+
+    /// Append a grown file's tail (M2r2 A-103, [`plan_extend`]): the file
+    /// must be the one the plan proved, untouched since (its identity, by the
+    /// descriptor the plan read and by a fresh write-only open of its path:
+    /// a live writer, a replacement or a rename refuses
+    /// `DESTINATION_OCCUPIED` with nothing written); the head of the
+    /// straddling chunk it already holds must equal the staged tail's; then
+    /// the tail is written at its own offsets and the file flushed, before
+    /// its record is queued. Its row is an adoption's, with the prefix's
+    /// length and BLAKE3 in `prefix_extensions`. The staged tail is removed
+    /// either way.
+    ///
+    /// One window stays, as in `estate-reseat`'s extension: a writer that
+    /// appends between the last identity check and the append. It is seen
+    /// after (the size is not the source's) and refuses the entry, the
+    /// bytes both wrote kept.
+    fn finish_extend(
+        &mut self,
+        staged: StagedFile,
+        extend: Extend,
+        row: &RowSchema,
+        record: (Vec<u8>, [u8; 32], bool, [u8; 32]),
+    ) -> Result<()> {
+        let Extend {
+            file,
+            parent,
+            identity,
+            prior,
+            base,
+            mut hasher,
+            hints,
+        } = extend;
+        let appended = self.append_tail(&staged, &file, (identity, prior, base), &mut hasher, row);
+        let _ = staged.discard();
+        let after = appended?;
+        let proof = PrefixProof {
+            prior_size: prior,
+            prior_blake3: *hasher.finalize().as_bytes(),
+        };
+        counters::bump(Counter::DestPrefixExtended);
+        self.stats.prefix_extended.push((
+            row.rel_path.clone(),
+            prior,
+            proof.prior_blake3,
+            row.size,
+        ));
+        self.adopt_as(file, parent, row, record, after, Some((proof, hints)))
+    }
+
+    /// The checks and writes of [`Self::finish_extend`]; the file's identity
+    /// after the flush.
+    fn append_tail(
+        &self,
+        staged: &StagedFile,
+        file: &std::fs::File,
+        (identity, prior, base): (StatIdentity, u64, u64),
+        hasher: &mut blake3::Hasher,
+        row: &RowSchema,
+    ) -> Result<StatIdentity> {
+        const PIECE: u64 = 1 << 20;
+        let current = |handle: &std::fs::File| {
+            handle
+                .metadata()
+                .map(|found| StatIdentity::from_metadata(&found))
+                .refuse_at("transfer::append_tail")
+        };
+        let writer = self.target.open_output_write(&row.rel_path)?;
+        if current(file)? != identity || current(&writer)? != identity {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        let mut held = vec![0_u8; usize::try_from(PIECE).unwrap_or(usize::MAX)];
+        let mut tail = vec![0_u8; held.len()];
+        // The straddling chunk's head: what the file holds of it must be
+        // the staged tail's first bytes.
+        let mut at = base;
+        while at < prior {
+            let length = usize::try_from((prior - at).min(PIECE)).unwrap_or(usize::MAX);
+            let (Some(mine), Some(theirs)) = (held.get_mut(..length), tail.get_mut(..length))
+            else {
+                return Err(BulkloadRefusal::BudgetExceeded);
+            };
+            if crate::io::sys::pread_full(file, mine, at).refuse_at("transfer::append_tail")?
+                != length
+                || crate::io::sys::pread_full(&**staged.file(), theirs, at - base)
+                    .refuse_at("transfer::append_tail")?
+                    != length
+            {
+                return Err(BulkloadRefusal::DestinationOccupied);
+            }
+            counters::add_len(Counter::DestVerifyRead, length);
+            if mine != theirs {
+                return Err(BulkloadRefusal::DestinationOccupied);
+            }
+            hasher.update(mine);
+            at += length as u64;
+        }
+        fault_point!(ReceivePrefixBeforeAppend);
+        if current(&writer)? != identity {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        let mut at = prior;
+        while at < row.size {
+            let length = usize::try_from((row.size - at).min(PIECE)).unwrap_or(usize::MAX);
+            let piece = tail
+                .get_mut(..length)
+                .ok_or(BulkloadRefusal::BudgetExceeded)?;
+            if crate::io::sys::pread_full(&**staged.file(), piece, at - base)
+                .refuse_at("transfer::append_tail")?
+                != length
+            {
+                return Err(BulkloadRefusal::DigestMismatch);
+            }
+            crate::io::sys::pwrite_all(&writer, piece, at).map_err(|error| {
+                crate::materialize::space_refusal(crate::refuse::io(
+                    &error,
+                    "transfer::append_tail",
+                ))
+            })?;
+            counters::add_len(Counter::DestMaterializeWrite, length);
+            counters::add_len(Counter::DestPrefixAppendWrite, length);
+            at += length as u64;
+        }
+        fault_point!(ReceivePrefixAfterAppend);
+        counters::sync_full(&writer).map_err(|error| {
+            crate::materialize::space_refusal(crate::refuse::io(&error, "transfer::append_tail"))
+        })?;
+        fault_point!(ReceivePrefixAfterFlush);
+        let after = current(&writer)?;
+        if after.size != row.size || current(file)? != after {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        Ok(after)
     }
 
     /// Write the capture record of a non-racy capture (#169), apply the
@@ -6394,6 +6653,31 @@ struct Staging {
     hints: Vec<ChunkHint>,
     /// Bytes filled locally, every offset counted (item 1a).
     placed: u64,
+    /// Set when the staged file is the tail of an existing destination file
+    /// that holds a verified byte prefix of the source (M2r2 A-103): the
+    /// staged file holds bytes `[base, size)` and is appended from, never
+    /// published.
+    extend: Option<Box<Extend>>,
+}
+
+/// An existing destination file with no owning record whose first
+/// `prior` bytes are proven, through `[0, base)`, to be the source's (M2r2
+/// A-103). `base` is the offset of the first chunk that does not end within
+/// `[0, prior)`: the staged tail starts there, and its head `[base, prior)`
+/// is compared with the file's before anything is appended.
+struct Extend {
+    /// The file, read through this descriptor.
+    file: std::fs::File,
+    parent: Arc<std::fs::File>,
+    /// Its identity when the plan read it: what the append requires.
+    identity: StatIdentity,
+    /// Its length then.
+    prior: u64,
+    base: u64,
+    /// BLAKE3 over `[0, base)` so far.
+    hasher: blake3::Hasher,
+    /// Every distinct chunk's first occurrence, at its offset in the file.
+    hints: Vec<ChunkHint>,
 }
 
 /// Validate a manifest against its row, adopt an existing output, or stage a
@@ -6414,7 +6698,7 @@ struct Staging {
 #[allow(clippy::too_many_lines)] // Validate, adopt or supersede, stage, fill, kick.
 fn plan_file(
     context: &ReceiveContext<'_>,
-    row: &RowSchema,
+    (row, extend): (&RowSchema, bool),
     manifest: &Manifest,
     salvaged_from: &mut Vec<usize>,
 ) -> Plan {
@@ -6475,6 +6759,11 @@ fn plan_file(
                         Err(refusal) => return Plan::Refuse(refusal),
                     }
                 }
+                // M2r2 A-103: a grown file is extended, any other is
+                // adopted or refused as before.
+                Ok(None) if extend => {
+                    return plan_extend(context, row, manifest, (file, parent), salvaged_from)
+                }
                 Ok(None) => return Plan::Adopt(file, parent, None),
                 Err(refusal) => return Plan::Refuse(refusal),
             }
@@ -6531,7 +6820,167 @@ fn plan_file(
         placements,
         hints,
         placed,
+        extend: None,
     })
+}
+
+/// M2r2 A-103: an existing regular file with no owning record whose bytes
+/// are a strict byte prefix of the manifest's (an append-only transcript
+/// that grew on the source) is extended in place by the tail instead of
+/// refused `DESTINATION_OCCUPIED`, unless [`PREFIX_EXTEND_ENV`] is `0`.
+///
+/// Planned only for a regular file with one link, a mode equal to the
+/// source's, and `0 < len < size`, which holds at least one whole chunk of
+/// the manifest (a shorter file is refused as before: judging it would take
+/// a chunk over the wire for a seat that may be refused). The proof reads
+/// the file once: every
+/// manifest chunk that ends within its length is read back from it and must
+/// hash to the chunk's digest (`read_dest_verify_existing_bytes`). The tail
+/// from the first chunk that does not is staged in a temporary of its own
+/// and filled as any staged file is (locally held chunks, then the wire);
+/// its head, the part of that chunk the file already holds, is compared at
+/// the end, before a byte is appended (`Inbound::finish_extend`). Any
+/// other file keeps today's answer: `Plan::Adopt`, which refuses it
+/// `DESTINATION_OCCUPIED` when its bytes are not the manifest's.
+fn plan_extend(
+    context: &ReceiveContext<'_>,
+    row: &RowSchema,
+    manifest: &Manifest,
+    (file, parent): (std::fs::File, Arc<std::fs::File>),
+    salvaged_from: &mut Vec<usize>,
+) -> Plan {
+    let Some((base, hasher, identity, prior)) = prove_prefix(&file, row, manifest) else {
+        return Plan::Adopt(file, parent, None);
+    };
+    let staged = match context.target.stage(row) {
+        Ok(staged) => staged,
+        Err(refusal) => return Plan::Refuse(refusal),
+    };
+    let mut placements: HashMap<[u8; 32], (u64, Vec<u64>)> = HashMap::new();
+    let mut order = Vec::new();
+    let mut hints = Vec::new();
+    let mut seen = HashSet::new();
+    let mut offset = 0_u64;
+    for (index, chunk) in manifest.chunks.iter().enumerate() {
+        if seen.insert(chunk.digest) {
+            hints.push(ChunkHint {
+                digest: chunk.digest,
+                offset,
+                size: chunk.size,
+            });
+        }
+        if offset >= base {
+            let Ok(index) = u32::try_from(index) else {
+                let _ = staged.discard();
+                return Plan::Refuse(BulkloadRefusal::BudgetExceeded);
+            };
+            let entry = placements.entry(chunk.digest).or_insert_with(|| {
+                order.push((chunk.digest, index));
+                (chunk.size, Vec::new())
+            });
+            entry.1.push(offset - base);
+        }
+        offset = offset.saturating_add(chunk.size);
+    }
+    let mut missing = Vec::new();
+    let mut outputs = HashMap::new();
+    let mut placed = 0_u64;
+    for (digest, index) in order {
+        let Some((size, offsets)) = placements.get(&digest) else {
+            continue;
+        };
+        let filled =
+            local_chunk(context, &mut outputs, &digest, *size, salvaged_from).and_then(|data| {
+                data.map(|data| place(staged.file(), &data, offsets))
+                    .transpose()
+            });
+        match filled {
+            Ok(Some(())) => {
+                placed = placed.saturating_add(size.saturating_mul(offsets.len() as u64));
+            }
+            Ok(None) => missing.push(index),
+            Err(refusal) => {
+                let _ = staged.discard();
+                return Plan::Refuse(refusal);
+            }
+        }
+    }
+    if let Err(refusal) = kick_after(staged.file(), 0, placed) {
+        let _ = staged.discard();
+        return Plan::Refuse(refusal);
+    }
+    Plan::Write(Staging {
+        staged,
+        supersede: None,
+        missing,
+        placements,
+        hints: Vec::new(),
+        placed,
+        extend: Some(Box::new(Extend {
+            file,
+            parent,
+            identity,
+            prior,
+            base,
+            hasher,
+            hints,
+        })),
+    })
+}
+
+/// Whether `file` may be extended to `row` (M2r2 A-103): a regular file
+/// with one link (a hard link's other name would change with it), the
+/// source's mode, and `0 < len < size`. Its identity and length.
+fn extend_candidate(file: &std::fs::File, row: &RowSchema) -> Option<(StatIdentity, u64)> {
+    let found = file.metadata().ok()?;
+    let prior = found.len();
+    (found.is_file()
+        && found.nlink() == 1
+        && prior > 0
+        && prior < row.size
+        && found.mode() & 0o7777 == row.mode & 0o7777)
+        .then(|| (StatIdentity::from_metadata(&found), prior))
+}
+
+/// The proof half of [`plan_extend`]: `(base, BLAKE3 over [0, base), the
+/// file's identity, its length)` when `file` is a candidate and every
+/// manifest chunk ending within its length is its bytes; `None` otherwise.
+fn prove_prefix(
+    file: &std::fs::File,
+    row: &RowSchema,
+    manifest: &Manifest,
+) -> Option<(u64, blake3::Hasher, StatIdentity, u64)> {
+    if manifest.size() != Some(row.size) {
+        return None;
+    }
+    let (identity, prior) = extend_candidate(file, row)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0_u8; crate::hash::CDC_MAX_BYTES as usize];
+    let mut offset = 0_u64;
+    let mut base = None;
+    for chunk in &manifest.chunks {
+        let end = offset.checked_add(chunk.size)?;
+        if end > prior {
+            base = Some(offset);
+            break;
+        }
+        let slot = buffer.get_mut(..usize::try_from(chunk.size).ok()?)?;
+        if crate::io::sys::pread_full(file, slot, offset).ok()? != slot.len() {
+            return None;
+        }
+        counters::add_len(Counter::DestVerifyRead, slot.len());
+        if counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
+            return None;
+        }
+        hasher.update(slot);
+        offset = end;
+    }
+    let after = StatIdentity::from_metadata(&file.metadata().ok()?);
+    // At least one whole chunk proven: a file whose held bytes all lie in
+    // the first chunk could only be judged with that chunk's bytes from the
+    // source, and a refused seat costs no wire byte (P21, #187).
+    let base = base.filter(|base| *base > 0)?;
+    (after == identity).then_some((base, hasher, identity, prior))
 }
 
 /// A chunk this destination already holds, re-read and re-verified: from a

@@ -98,6 +98,9 @@
 //! | `receive.after_decide` | one entry decided, no content received for it |
 //! | `receive.after_chunks` | one file's chunks verified, covering it, and written to its temporary |
 //! | `receive.after_end` | an entry's `End` handled; its output may still be waiting on its group |
+//! | `receive.prefix_before_append` | a grown destination file's prefix proven and its tail received into a temporary; the file untouched (M2r2 A-103) |
+//! | `receive.prefix_after_append` | the tail written into the destination file, not yet flushed; no record |
+//! | `receive.prefix_after_flush` | the extended file flushed; its record not yet queued |
 //!
 //! Git estate capture publication, in `estate::capture_item` (Q42 lane L7,
 //! P70). The `{bundle}.reuse` manifest is published after the bundle and its
@@ -287,6 +290,12 @@ pub enum Point {
     ReceiveAfterChunks,
     /// `receive.after_end`
     ReceiveAfterEnd,
+    /// `receive.prefix_before_append`
+    ReceivePrefixBeforeAppend,
+    /// `receive.prefix_after_append`
+    ReceivePrefixAfterAppend,
+    /// `receive.prefix_after_flush`
+    ReceivePrefixAfterFlush,
     /// `estate.after_bundle_publish`
     EstateAfterBundlePublish,
     /// `estate.before_reuse_sidecar`
@@ -395,7 +404,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 64] = [
+    pub const ALL: [Self; 67] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -417,6 +426,9 @@ impl Point {
         Self::ReceiveAfterDecide,
         Self::ReceiveAfterChunks,
         Self::ReceiveAfterEnd,
+        Self::ReceivePrefixBeforeAppend,
+        Self::ReceivePrefixAfterAppend,
+        Self::ReceivePrefixAfterFlush,
         Self::EstateAfterBundlePublish,
         Self::EstateBeforeReuseSidecar,
         Self::EstateAfterReuseSidecar,
@@ -487,6 +499,9 @@ impl Point {
             Self::ReceiveAfterDecide => "receive.after_decide",
             Self::ReceiveAfterChunks => "receive.after_chunks",
             Self::ReceiveAfterEnd => "receive.after_end",
+            Self::ReceivePrefixBeforeAppend => "receive.prefix_before_append",
+            Self::ReceivePrefixAfterAppend => "receive.prefix_after_append",
+            Self::ReceivePrefixAfterFlush => "receive.prefix_after_flush",
             Self::EstateAfterBundlePublish => "estate.after_bundle_publish",
             Self::EstateBeforeReuseSidecar => "estate.before_reuse_sidecar",
             Self::EstateAfterReuseSidecar => "estate.after_reuse_sidecar",

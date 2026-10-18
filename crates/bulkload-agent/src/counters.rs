@@ -356,6 +356,12 @@ counters! {
     // 2): this user's, owner read, write and search, and nothing wider than
     // the source's mode. Each is also reported `directory-mode-kept`.
     DestDirectoryModeKept => "dest_directory_mode_kept",
+    // Existing regular files with no owning record that held a verified
+    // byte prefix of their source and were extended in place by its tail
+    // (M2r2 A-103), and the tail bytes appended. The prefix proof's reads
+    // are `read_dest_verify_existing_bytes`.
+    DestPrefixExtended => "dest_prefix_extended",
+    DestPrefixAppendWrite => "write_dest_prefix_append_bytes",
     // `estate-reseat` (R0, TIN-6587). Bytes read from the landed agent
     // state (the run's copy of the source's `~/.claude` and `~/.codex`):
     // 0 on a pass whose landed files and Codex snapshot are unchanged (S3);

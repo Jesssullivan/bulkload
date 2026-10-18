@@ -491,6 +491,24 @@ pub fn open_read_at(dir: impl AsFd, name: &CStr) -> io::Result<OwnedFd> {
     )
 }
 
+/// Open the existing `name` inside `dir` write-only without following a
+/// link, creating nothing or blocking on a FIFO (`O_WRONLY | O_NOFOLLOW |
+/// O_NONBLOCK | O_CLOEXEC`; no `O_APPEND`, no `O_TRUNC`): a grown
+/// destination file's tail is written at its own offsets (M2r2 A-103). The
+/// caller checks the kind and the identity. The writes themselves go
+/// through [`pwrite_all`], which the R-N88 trace sees.
+///
+/// # Errors
+/// Returns the `openat` failure.
+pub fn open_write_at(dir: impl AsFd, name: &CStr) -> io::Result<OwnedFd> {
+    openat_raw(
+        dir.as_fd(),
+        name,
+        libc::O_WRONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+}
+
 /// `symlinkat(target, dir, name)`: a new symbolic link holding `target`
 /// literally. An existing `name` is `EEXIST`.
 ///

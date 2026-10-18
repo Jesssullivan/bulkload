@@ -2124,6 +2124,81 @@ the racy window of the read. A changed seat, a changed file, or a file
 system that has gained the exchange makes the record a miss. The record
 is a memo about no durable bytes; losing it costs one more source read.
 
+Grown destination files (M2r2 A-103, 2026-10-18). A landing moved by hand
+orphans its destination store: every file there is then one the store does
+not own. An append-only transcript that grew on the source since is a byte
+prefix of its seat, and was refused `DESTINATION_OCCUPIED` (310 of them on
+2026-10-17, with `files_materialized=0`). Such a file is now extended in
+place by its tail, on by default (`BULKLOAD_PREFIX_EXTEND=0` turns it off):
+
+- **Which files.** An existing regular file at the path with no owning
+  record (no reuse or ownership row), one link (a second name would change
+  with it), the source's mode, and `0 < length < size`, that holds at least
+  one whole chunk of the manifest. Any other file is adopted when it is
+  the seat's bytes and refused `DESTINATION_OCCUPIED` otherwise, as before.
+  A file whose held bytes all lie in the manifest's first chunk is refused
+  too: judging it would take that chunk over the wire for a seat that may
+  be refused (P21, #187). A `SQLite` snapshot's output is never extended.
+- **The proof.** Every manifest chunk that ends within the file's length is
+  read back from the file and must hash to its digest; the bytes are read
+  once (`read_dest_verify_existing_bytes`), and a failed proof refuses at
+  the plan, with no chunk asked of the source and no byte written. The
+  rest, from the first chunk that does not end within the file, is staged
+  in a temporary of its own and filled as any staged file is (chunks held
+  here, then the wire), so only the tail and the chunk it starts in cross.
+  Before anything is appended, the part of that chunk the file already
+  holds is compared with the staged bytes. A seat streamed whole in place
+  of a manifest is extended the same way from its staged copy, its whole
+  prefix compared.
+- **The append.** The file must be the one the plan proved, untouched
+  since: the same `(dev, ino, size, mtime, ctime)` by the descriptor the
+  plan read and by a fresh write-only open of its path (no link followed);
+  a live writer, a replacement or a rename refuses `DESTINATION_OCCUPIED`
+  with nothing written. The tail is written at its own offsets (never
+  `O_APPEND`, never a truncation) and the file is flushed
+  (`F_FULLFSYNC` on Darwin) before its record is queued; its size after the
+  flush must be the seat's. One window stays, as in `estate-reseat`'s
+  extension: a writer that appends between the last identity check and the
+  write is seen after it (the size is not the seat's) and refuses the
+  entry, both writers' bytes kept.
+- **The record.** The extended file is adopted: its capture record (#169)
+  and its row are written as an adoption's, the group commit seals it and
+  its directory first, and the row's chunk hints are the whole file's. In
+  the same transaction a `prefix_extensions` row records the path, the
+  prior length, the BLAKE3 of the prior bytes and the identity after. The
+  binary prints `prefix-extended PATH from=PRIOR to=SIZE
+  prefix_blake3=HEX`; the counters are `dest_prefix_extended` and
+  `write_dest_prefix_append_bytes`. From then on the file is this store's:
+  an unchanged rerun reuses it, and a later growth supersedes it as any own
+  output.
+- **Remembered refusals.** A refusal remembered `Occupied` before the
+  extension existed is not honoured for a file the extension may try: it
+  is proved once more. A failed proof is remembered `NotPrefix`, which is
+  honoured, so a file that is not a prefix is read once and then refused
+  from its record (R25).
+- **Crashes.** `receive.prefix_before_append`, `receive.prefix_after_append`
+  and `receive.prefix_after_flush` (and the group commit's points after
+  them) leave every file a byte prefix of its seat (the old one, a longer
+  one, or all of it) and the staged tail aside for the sweep; the rerun
+  extends or adopts what it finds. A crash between the flush and the commit
+  adopts the whole file by content and loses its `prefix_extensions` row.
+  Not covered: a power loss during the append on a file system that
+  persists a size before the data it covers can leave zeros past the old
+  length; that file is no longer a prefix and is refused
+  `DESTINATION_OCCUPIED`, its old bytes intact (no power-loss row for this
+  path yet).
+
+Re-keying a moved landing is not built. A destination store keys its rows
+by path relative to the destination root and records each output's
+`(dev, ino, size, mtime, ctime)`; it does not record the root's own path.
+A landing moved within one file system keeps its files' inodes and stamps,
+so the operator passes the old DEST_STATE with the new destination, and
+every unchanged file is reused as before (the moved root directory is
+decided again). A landing copied to another file system has new inodes:
+no record could prove those files are the ones it describes without reading
+them, which is what adoption by content and this extension already do with
+a fresh store.
+
 The formal model held all of this from 2026-10-07 until R-C843 deleted it on 2026-10-17 (OI-1003-Q102: model
 first, then merge): the intent and its sweep, the ownership row, the
 remembered refusal and the refusal without an exchange, with the

@@ -2116,6 +2116,13 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
             path.escape_ascii()
         );
     }
+    for (path, prior, prefix, size) in &stats.prefix_extended {
+        eprintln!(
+            "prefix-extended {} from={prior} to={size} prefix_blake3={}",
+            path.escape_ascii(),
+            blake3::Hash::from_bytes(*prefix).to_hex()
+        );
+    }
     for (path, found, source) in &stats.directories_mode_kept {
         eprintln!(
             "directory-mode-kept {} found={found:04o} source={source:04o}",

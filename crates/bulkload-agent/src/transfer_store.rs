@@ -425,6 +425,12 @@ pub enum RefusedOutput {
     /// The path holds this store's own output with other bytes than the
     /// seat's, on a file system with no atomic exchange.
     ExchangeUnsupported,
+    /// The path holds a file this store does not own that could have been
+    /// a byte prefix of the seat's (M2r2 A-103) and is not: its prefix
+    /// proof failed. An [`Self::Occupied`] record written before the prefix
+    /// extension is not honoured for such a file while the extension is on
+    /// (it is planned once more); this one is.
+    NotPrefix,
 }
 
 impl RefusedOutput {
@@ -433,6 +439,7 @@ impl RefusedOutput {
         match self {
             Self::Occupied => 1,
             Self::ExchangeUnsupported => 2,
+            Self::NotPrefix => 3,
         }
     }
 
@@ -440,6 +447,7 @@ impl RefusedOutput {
         match tag {
             1 => Some(Self::Occupied),
             2 => Some(Self::ExchangeUnsupported),
+            3 => Some(Self::NotPrefix),
             _ => None,
         }
     }
@@ -448,7 +456,7 @@ impl RefusedOutput {
     #[must_use]
     pub const fn refusal(self) -> BulkloadRefusal {
         match self {
-            Self::Occupied => BulkloadRefusal::DestinationOccupied,
+            Self::Occupied | Self::NotPrefix => BulkloadRefusal::DestinationOccupied,
             Self::ExchangeUnsupported => BulkloadRefusal::DestinationExchangeUnsupported,
         }
     }
@@ -468,6 +476,19 @@ pub(crate) struct OutputRecord {
     pub racy: bool,
     /// First occurrence of each distinct chunk in this output.
     pub hints: Vec<ChunkHint>,
+    /// Set when the output is an existing file this store did not own,
+    /// extended in place from a verified byte prefix of its source (M2r2
+    /// A-103): its `prefix_extensions` row, committed with this one.
+    pub extended: Option<PrefixProof>,
+}
+
+/// What a prefix extension proved about the file before it wrote (M2r2
+/// A-103): its length then, and the BLAKE3 of those bytes. Its row also
+/// names the path and the identity after the extension.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefixProof {
+    pub prior_size: u64,
+    pub prior_blake3: [u8; 32],
 }
 
 /// Where a chunk lies in an output named by the enclosing record.
@@ -812,7 +833,8 @@ impl Store {
                 CREATE TABLE IF NOT EXISTS refused_seats (key BLOB PRIMARY KEY, kind INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS supersedes (dir BLOB NOT NULL, temp BLOB NOT NULL, intent BLOB NOT NULL, PRIMARY KEY (dir, temp));
                 CREATE TABLE IF NOT EXISTS refused_outputs (key BLOB PRIMARY KEY, kind INTEGER NOT NULL, identity BLOB NOT NULL);
-                CREATE TABLE IF NOT EXISTS owned_outputs (key BLOB PRIMARY KEY, identity BLOB NOT NULL);",
+                CREATE TABLE IF NOT EXISTS owned_outputs (key BLOB PRIMARY KEY, identity BLOB NOT NULL);
+                CREATE TABLE IF NOT EXISTS prefix_extensions (path BLOB NOT NULL, prior_size INTEGER NOT NULL, prior_blake3 BLOB NOT NULL, identity BLOB NOT NULL, PRIMARY KEY (path, prior_size));",
             )
             .and_then(|()| {
                 conn.execute(
@@ -2138,6 +2160,19 @@ pub(crate) fn owner_key(row_key: &[u8]) -> Option<&[u8]> {
 /// under its key, or, for a racy capture's output, its path's ownership row
 /// alone.
 fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
+    if let Some(proof) = &output.extended {
+        // M2r2 A-103: the prefix the extension proved, and what it made.
+        conn.execute(
+            "INSERT OR REPLACE INTO prefix_extensions VALUES (?1, ?2, ?3, ?4)",
+            (
+                &output.rel_path,
+                i64::try_from(proof.prior_size).map_err(|_| BulkloadRefusal::BudgetExceeded)?,
+                proof.prior_blake3.as_slice(),
+                identity_bytes(&output.identity)?,
+            ),
+        )
+        .map_err(sqlite_error)?;
+    }
     if output.racy {
         // Never a reuse key (#86): drop any row an earlier capture left
         // under it, too.
@@ -2659,6 +2694,7 @@ mod tests {
                 "output_hints",
                 "outputs",
                 "owned_outputs",
+                "prefix_extensions",
                 "refused_outputs",
                 "refused_seats",
                 "settings",
@@ -2890,6 +2926,7 @@ mod tests {
                 rel_path: rel_path.to_vec(),
                 identity: identity(ino),
                 racy: false,
+                extended: None,
                 hints: Vec::new(),
             })
         };
@@ -2995,6 +3032,7 @@ mod tests {
                 rel_path: rel_path.to_vec(),
                 identity: identity(ino),
                 racy: false,
+                extended: None,
                 hints: Vec::new(),
             })
         };
@@ -3676,6 +3714,7 @@ mod tests {
                 rel_path: b"nested/output".to_vec(),
                 identity,
                 racy: false,
+                extended: None,
                 hints: vec![hint],
             }],
             &[],
@@ -3715,6 +3754,7 @@ mod tests {
             rel_path: b"output".to_vec(),
             identity,
             racy,
+            extended: None,
             hints: vec![ChunkHint {
                 digest: [5; 32],
                 offset: 0,
@@ -3751,6 +3791,7 @@ mod tests {
             rel_path: b"dir/seat".to_vec(),
             identity,
             racy,
+            extended: None,
             hints: Vec::new(),
         };
         publisher.commit_outputs(&[record(true)], &[])?;
@@ -3878,6 +3919,7 @@ mod tests {
             rel_path: b"output".to_vec(),
             identity,
             racy: false,
+            extended: None,
             hints: vec![ChunkHint {
                 digest: [7; 32],
                 offset: 0,
@@ -3941,6 +3983,7 @@ mod tests {
             rel_path: path.to_vec(),
             identity,
             racy: false,
+            extended: None,
             hints: vec![ChunkHint {
                 digest: [9; 32],
                 offset,
