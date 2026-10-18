@@ -1902,6 +1902,10 @@ fn p113_a_beside_landing_never_appends_to_the_live_exclude() {
         let ran = run.apply(&["--adopt", "--exclude-union", "--beside", SUFFIX]);
         let row = receipt(&receipts(&ran.stdout), &source).clone();
         assert_eq!(fs::read(dest.join(".git/info/exclude")).unwrap(), live);
+        if !held {
+            // Before `git status`, which refreshes the index itself.
+            assert_eq!((freeze_all(&dest), all_refs(&dest)), frozen);
+        }
         assert_eq!(
             git(&dest, &["status", "--porcelain", "--untracked-files=all"]),
             status
@@ -1915,7 +1919,6 @@ fn p113_a_beside_landing_never_appends_to_the_live_exclude() {
         assert!(line.contains("\"beside=ignore-policy-conflict:"), "{line}");
         assert_eq!(row.1, "refused", "{row:?}");
         assert!(row.2.contains("GIT_IGNORE_POLICY_CONFLICT"), "{row:?}");
-        assert_eq!((freeze_all(&dest), all_refs(&dest)), frozen);
         assert!(!beside_of(&dest).exists());
     }
 }
