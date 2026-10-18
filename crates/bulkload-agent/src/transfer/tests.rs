@@ -752,7 +752,7 @@ fn a_chunk_of_a_superseded_output_is_still_filled_locally() {
                 session: &session,
                 salvage: &salvage,
             },
-            &row,
+            (&row, false),
             &manifest,
             &mut Vec::new(),
         );
@@ -2944,7 +2944,8 @@ fn a_stale_capture_record_is_refreshed_by_a_manifest_adoption() {
     );
 }
 
-/// #169 review (`AdoptOnlyUnrowed` in docs/formal): the record's adoption is
+/// #169 review (`AdoptOnlyUnrowed` in docs/formal, deleted 2026-10-17 under
+/// R-C843): the record's adoption is
 /// for outputs with no row. A clean rerun answers every rowed output `Reuse`
 /// from its row: it adopts nothing, proves nothing, and so hashes no
 /// destination byte, whatever the source-read counter says. A regression of
@@ -3057,3 +3058,6 @@ mod levers;
 
 // ---- S1 lever 3 (OI-1003-Q154): the directory finish in the last group ------
 mod fold;
+
+// ---- M2r2 A-103: a grown byte-prefix destination file is extended ----------
+mod prefix;
