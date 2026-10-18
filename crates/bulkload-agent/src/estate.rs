@@ -2608,7 +2608,9 @@ pub struct LedgerEntry {
     /// Why `omitted` is unknown: `no-capture`, `capture-unreadable`,
     /// `sidecar-unreadable`, or the in-band reader's reason
     /// (`header-unreadable`, `value-not-read`, `value-not-held`,
-    /// `envelope-not-read`, `envelope-not-held`).
+    /// `value-unreadable`, `envelope-not-read`, `envelope-not-held`,
+    /// `envelope-unreadable`, `holder-partial-clone`,
+    /// `holder-git-too-old`).
     pub unknown_because: Option<&'static str>,
 }
 

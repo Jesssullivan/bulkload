@@ -75,8 +75,10 @@
 //! sidecar (`items_known`, `items_unknown`, `roots`, `entries`, `bytes`,
 //! one row per root with `item`, `path`, `entries` and `bytes`, and the
 //! `unknown` items, never counted as zero). A capture from before the
-//! sidecar is read in band from its bundle's header and the destination
-//! repository's objects (`git_carry::in_band`, M2 round 2, d). Nothing else changes from v3: rows, totals, dispositions and the
+//! sidecar is read in band from its bundle's header; only with
+//! `closure-report --omissions-from-destination` is a list the header names
+//! read from the destination repository's objects (`git_carry::in_band`,
+//! M2 round 2, d). Nothing else changes from v3: rows, totals, dispositions and the
 //! gate are as before, and omissions are outside every one of them. In v3
 //! (unchanged): a transfer row names its `kind` (an estate row prints as in
 //! v2), and adds `transfer`, `path`, `transfer_outcome` and `sqlite_code`, `disposition` can be `covered`, and the

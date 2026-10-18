@@ -762,6 +762,9 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
         // destination repository's objects; only before PLAN.
         if let [flag, rest @ ..] = positional {
             if flag == "--omissions-from-destination" {
+                if read_destinations {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
                 read_destinations = true;
                 positional = rest;
                 continue;

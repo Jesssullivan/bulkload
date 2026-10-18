@@ -181,10 +181,7 @@ pub(super) fn headers(repository: &Path, bundle: &Path) -> Result<String> {
     Ok(inventory)
 }
 
-pub(super) fn custody_manifest(
-    repository: &Path,
-    value: &str,
-) -> Result<(Vec<u8>, String, String)> {
+fn custody_manifest(repository: &Path, value: &str) -> Result<(Vec<u8>, String, String)> {
     let object = text(git(repository).args(["rev-parse", &format!("{value}:value")]))?;
     let mut reader = super::batch_objects::BatchObjects::new(repository)?;
     let mut bytes = Vec::new();
