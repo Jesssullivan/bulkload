@@ -2779,7 +2779,7 @@ bulkload-agent estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
     [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
     [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
     [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
-    [--no-respell] [--no-regularize] [--undo]
+    [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]... [--undo]
     [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
 ```
 
@@ -3049,9 +3049,11 @@ earlier placement stays and the line names `previous_key`.
 naming its landed file: the landed file's identity at the last pass, the
 destination file's identity after bulkload's last write, the bytes placed
 and their BLAKE3, and an intent while an extension or supersede is in
-flight. The ledger carries its schema version (`user_version` 3: a
-version 2 ledger is migrated in place, keeping the shared temporary name
-for what it left in flight); the first build's ledger is refused
+flight. The ledger carries its schema version (`user_version` 4: a
+version 2 or 3 ledger is migrated in place, a version 2 one keeping the
+shared temporary name for what it left in flight; version 4 adds the
+replacement kind, so a build of version 3 refuses it rather than read a
+replacement as a regularization); the first build's ledger is refused
 `SCHEMA_MISMATCH`. An unchanged rerun reads 0
 landed bytes, the Codex snapshot and every refused, unreadable or
 unmapped session included (`read_reseat_landing_bytes`, also
@@ -3078,9 +3080,108 @@ nothing changes for it (a row written before the digest was recorded is
 refused the same way). An undone row or link is not changed again by a
 later pass. Placed sessions are not removed.
 
-**Crash safety.** Twelve fault points (`reseat.*`, `src/fault.rs`) with
-sixteen fault-harness rows (two of them a `.jsonl.zst` rollout decompressed
-into its temporary; five the rulings' mutations and their undo): a rerun
+**Archive links: the landed version wins** (`--replace-archived-dest
+ROOT`, repeatable; operator ruling A-106, 2026-10-18: "neo's version
+wins; fork stays in archive"). Without it a destination file that is a
+symlink is never written through (`occupied`). With it, a destination
+transcript, subagent sidecar (`projects/<key>/<sid>/…`) or Codex rollout
+that is a symlink is replaced by its landed file when all of these hold:
+
+- the link's fully resolved target (every hop followed by the kernel) is
+  a regular file under the real path of a ROOT; only the final target is
+  judged, so `..` or an intermediate link cannot bring a target under a
+  root it is not under;
+- the link's own directory does not resolve under a ROOT, and no ROOT
+  equals, contains or is under the real destination `.claude` or
+  `.codex` or contains the destination home: such a ROOT is refused
+  `FIELD_DOMAIN_VIOLATION` before anything is read or written (the swap
+  would otherwise happen inside the archive, or take the live state for
+  one). A ROOT is canonicalized when the flag is parsed; one that does
+  not exist is refused;
+- this STATE has no regularization or replacement row for the path (a
+  replaced or undone one is never replaced again by itself);
+- no process this user can see holds the target open (every
+  `/proc/<pid>/fd/*` link is read, observation only; a live session would
+  go on writing into the archive after the swap): such a link stays
+  `occupied` and is decided again next pass;
+- the landed content (whole lines, as placed) is neither the target's
+  bytes (BLAKE3: the link stays, `occupied`) nor a strict prefix of them
+  (the archive ahead of the landing, not a fork: the link stays,
+  `dest-ahead`, `RESEAT_DEST_CONTINUED`, as for a regular file that
+  continued). The ruling replaces forks, not archives ahead; replacing
+  those too is an operator call.
+
+An equal or ahead link is recorded with the target's identity (in place
+of the link's) and its relation, and is not read again while the
+landing and the target are unchanged; a target that changes is decided
+again.
+
+The landed content is staged beside the link (`.<name>.<token>.bulkload-reseat`)
+with the landed file's mode and mtime and sealed (`fsync`). The link text,
+the target's real path, identity and BLAKE3, and the link's and the
+copy's identities are ledgered (`regularized`, kind `replace`, `intent`)
+before anything at the path changes. The target and the link are
+verified unchanged and the target not held open, the copy and the link
+are exchanged atomically (`RENAME_EXCHANGE`), the link under the
+temporary name and the target's identity are verified again, the link is
+removed and the directory sealed (`fsync`); then, in one commit, the row
+is `done` and the placement row names the landed file (`ours`), replacing
+any row another landing left for the path. Later passes extend it like
+any placement. Outcome `replaced-archived` (a file word;
+`reseat_archived_replaced` on the counters line). The archive target is
+never opened for writing, renamed or removed. A link or target that
+changed before the swap, a path that held something else, or a target
+written under the swap puts everything back as it was (the staged copy
+removed: the landing holds its bytes) and the file stays `occupied`. An
+earlier pass's `occupied` row for the path, from another landing or
+without the flag, is decided again instead of being a `collision` (it
+placed nothing).
+
+Crashes settle forward at the start of the next pass, whether or not it
+regularizes: before the exchange the staged copy is removed (or, if it
+changed, kept aside as `.<name>.<token>.kept-<inode>.bulkload-reseat`,
+never removed by a pass) and the row dropped, and the next pass decides
+again; after it the row is `done`, any row of the path that is not this
+ledger's own is dropped in the same commit, the line is a `replace` line
+`replaced-archived` (counted), and the pass adopts the file at the path
+(the landed bytes). A target written under a crashed swap leaves either
+the link back with the copy kept aside (`replace-raced-restored`) or both
+kept (`replace-raced-kept`), as for a regularization.
+
+`--undo` puts the exact link text back (not the link's own timestamps)
+over an unchanged copy and a verified target (the regularization's rule;
+a file a later pass extended is `undo-kept`, `RESEAT_DEST_CONTINUED`) and
+drops the placement row, so no later pass replaces it again. `--undo`
+reverses everything this STATE changed in the destination's own state:
+its replacements, its regularizations and its re-spelled Codex rows
+alike; undoing only some of them is an operator call (a separate STATE
+per kind of change). Run a replacement, and its undo, with no live
+session on the destination: the open-file check narrows, but cannot
+close, the window between it and the swap.
+
+Power loss: the copy is durable before the intent, the intent before
+the exchange, and the directory before `done`; whichever name the
+directory holds after a power loss is settled by its identity like a
+crash. This ordering is argued, not tested: the fault harness models a
+process crash only (`_exit`), and `estate-reseat` is not wired to the
+`io::crash_check` power-loss model, so dropping one of these `fsync`
+calls is not caught by any test.
+
+Regularization leaves links into a ROOT to the placement (a link no
+landed file names stays a link). `--check` reports `replaced_archived`
+(`done` rows) and, at placement paths now, `replace_pending` (archive
+links whose landed whole lines differ in size from the target, a
+compressed landing included), `replace_equal_size` (equal sizes: a pass
+compares them) and `replace_proved` (proved equal or ahead, nothing
+changed since); a replaced file is checked as the landed file like any
+other.
+
+**Crash safety.** Fifteen fault points (`reseat.*`, `src/fault.rs`) with
+twenty-two fault-harness rows (two of them a `.jsonl.zst` rollout
+decompressed into its temporary; five the rulings' mutations and their
+undo; six an archive replacement at its intent, after its exchange and
+before `done`, two of them over an `occupied` row from another landing
+with regularization off, and its undo): a rerun
 settles every crash forward from the ledger and the destination's own
 bytes. A temporary with no intent is a staged
 copy and is removed; an extend intent is resumed after proving the placed

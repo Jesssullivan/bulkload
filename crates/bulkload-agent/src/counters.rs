@@ -375,6 +375,10 @@ counters! {
     ReseatDestRead => "read_reseat_dest_bytes",
     // Bytes written into the destination's live agent state.
     ReseatDestWrite => "write_reseat_dest_bytes",
+    // Destination transcripts and rollouts that were symlinks into a
+    // `--replace-archived-dest` root, replaced by the differing landed
+    // file (A-106; the archive target kept, the link ledgered).
+    ReseatArchivedReplaced => "reseat_archived_replaced",
     // Bounded starvation (M2 item 3): a process at background priority
     // whose counters did not move for `--escalate-after` seconds moved its
     // IO back to the normal class once (`priority::escalate`): how many
