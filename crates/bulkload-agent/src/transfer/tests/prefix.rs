@@ -5,9 +5,8 @@
 //! `DESTINATION_OCCUPIED` exactly as before.
 
 use super::*;
-use crate::counters::Counters;
 
-/// The process-wide counters these rows measure: one row at a time.
+/// The live-writer hook is process-wide: these rows run one at a time.
 static SERIAL: Mutex<()> = Mutex::new(());
 
 fn serial() -> std::sync::MutexGuard<'static, ()> {
@@ -105,9 +104,7 @@ fn a_grown_prefix_is_extended_in_place_ledgered_and_counted() {
     let inode = std::fs::metadata(destination.join("t.jsonl"))
         .unwrap()
         .ino();
-    let before = Counters::snapshot();
     let rerun = corpus.run().unwrap();
-    let since = Counters::snapshot().since(before);
     assert!(rerun.refusals.is_empty(), "{:?}", rerun.refusals);
     assert_eq!(std::fs::read(destination.join("t.jsonl")).unwrap(), full);
     assert_eq!(
@@ -140,19 +137,12 @@ fn a_grown_prefix_is_extended_in_place_ledgered_and_counted() {
             ),
         ]
     );
-    assert_eq!(since.get(Counter::DestPrefixExtended), 2);
-    assert_eq!(
-        since.get(Counter::DestPrefixAppendWrite),
-        (full.len() - prior + 10) as u64
-    );
-    // The prefix proof reads each held byte once; the second check re-reads
-    // each file's straddling chunk after the append.
-    let verified = since.get(Counter::DestVerifyRead);
-    assert!(
-        verified > (prior + 599_990) as u64
-            && verified <= (prior + 599_990) as u64 + 2 * u64::from(crate::hash::CDC_MAX_BYTES),
-        "{verified}"
-    );
+    // The process-wide counters (`dest_prefix_extended`,
+    // `write_dest_prefix_append_bytes`, `read_dest_verify_existing_bytes`)
+    // are proven where nothing else runs beside the session: the
+    // cross-process row of `tests/loopback_handoff.rs` (serialized) and
+    // `tests/prefix_extend_cli.rs` (the binary's own counters line). Lib
+    // tests run in parallel, so a delta here would count other rows' reads.
     // Only the tail and the chunk it starts in cross: never the whole file.
     assert!(
         rerun.bytes_received
