@@ -68,9 +68,12 @@
 //! the list with the tests this binary reports under `--list --ignored`, and
 //! checks each listed test's ignore reason.
 //!
-//! The list is empty. The four R-N86 tests it held (a refused capture left
-//! the victim's bytes in the source pack) pass since W4 PR 2 removed the
-//! pack (R-N58), as `live_writer_*_leaves_no_source_ledger_row`.
+//! The four R-N86 tests the list held (a refused capture left the victim's
+//! bytes in the source pack) pass since W4 PR 2 removed the pack (R-N58),
+//! as `live_writer_*_leaves_no_source_ledger_row`. It holds one test now:
+//! `converge_settle_keeps_an_added_seat_the_operator_deleted`, #237
+//! reproduced on the real code (a converge's settle re-creates an added
+//! seat the operator deleted after the crash).
 //!
 //! # Hung scenarios
 //!
@@ -1805,8 +1808,23 @@ const KNOWN_VIOLATION_REASON: &str = "#[ignore = \"known violation";
 /// Known violations: `#[ignore]`d tests asserting invariants the engine breaks
 /// today, with the fault point each one is the only scenario for, if any.
 /// Listed, never counted as coverage.
-/// Empty since W4 PR 2: the four R-N86 source-pack tests pass (R-N58).
-const KNOWN_VIOLATIONS: [(&str, Option<Point>); 0] = [];
+/// Empty from W4 PR 2 (the four R-N86 source-pack tests pass, R-N58) until
+/// #237 was reproduced on the real code (2026-10-18). Its point,
+/// `estate.converge.after_index`, keeps its passing `Delta` row.
+const KNOWN_VIOLATIONS: [(&str, Option<Point>); 1] = [(
+    "converge_settle_keeps_an_added_seat_the_operator_deleted",
+    None,
+)];
+
+/// #237 (EstateConverge `NoLocalWorkLost` at `MaxSrc` 2), on the real code:
+/// a converge crashed after its `Add` of a seat, the operator deletes that
+/// seat, and the rerun's settle writes it again. See
+/// `estate_converge::deleted_add`. Run it with `--ignored` to see it fail.
+#[test]
+#[ignore = "known violation #237: a converge settle re-creates an added seat the operator deleted after the crash"]
+fn converge_settle_keeps_an_added_seat_the_operator_deleted() {
+    estate_converge::deleted_add();
+}
 
 /// The attributes directly above `fn <name>(` (or `pub fn <name>(`): the
 /// text between the preceding item's end and the function.

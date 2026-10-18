@@ -792,3 +792,53 @@ fn fresh_index_lock(world: &World, label: &str) {
         .unwrap_or_else(|| panic!("{label}: no scratch index at the crash"));
     fs::write(git_dir.join(format!("{fresh}.lock")), b"DIRC").unwrap();
 }
+
+/// #237 on the real code (TIN-4546, M3 code lane, A-20261018-110):
+/// EstateConverge's `NoLocalWorkLost` counterexample at `MaxSrc` 2. A
+/// converge adds `added.txt` and crashes after its index step
+/// (`estate.converge.after_index`), with the workspace intent pending. The
+/// operator then deletes the seat the converge added. The rerun's settle
+/// replays the intent's `Add`, finds the path free and writes the seat
+/// again: the operator's deletion is lost. An absent `Add` target reads the
+/// same as an `Add` the crash cut short, and the intent records no step's
+/// progress, so the settle cannot tell the two apart.
+///
+/// The invariant asserted is only that the deletion survives the rerun
+/// (whatever the rerun records). It fails today; the fault harness lists
+/// it as a known violation until the settle can tell them apart.
+pub fn deleted_add() {
+    let label = "estate.converge.after_index:1/DeletedAdd";
+    let world = World::new("deleted-add");
+    world.capture("plan", "corpus");
+    let landed = world.apply("plan", "corpus", "applied");
+    assert_eq!(landed, vec![("workspace-restored", None)], "{label}");
+    settle();
+    world.work();
+    settle();
+    world.capture("plan", "corpus");
+
+    crash(&world, "estate.converge.after_index:1");
+
+    let added = world.dst().join("added.txt");
+    assert_eq!(
+        fs::read(&added).unwrap(),
+        b"new at c1\n",
+        "{label}: the converge added the seat before the crash"
+    );
+    assert!(
+        world
+            .dst()
+            .join(".git/bulkload/v1/neo/workspace.intent")
+            .exists(),
+        "{label}: the intent is pending"
+    );
+    // The operator's work: the seat the converge added is deleted.
+    fs::remove_file(&added).unwrap();
+
+    let rows = world.apply("plan", "corpus", "applied");
+    assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+    assert!(
+        fs::symlink_metadata(&added).is_err(),
+        "{label}: the rerun re-created the seat the operator deleted ({rows:?})"
+    );
+}
