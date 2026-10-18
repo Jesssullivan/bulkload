@@ -66,7 +66,7 @@ SUBCOMMANDS:
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply [--adopt] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+    estate-apply [--adopt] [--exclude-union] [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces.
                 A landed checkout bulkload proves unchanged converges to the
                 current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
@@ -87,8 +87,38 @@ SUBCOMMANDS:
                 lands a bare repository bulkload makes (with or without
                 --adopt). --activate-origin PREFIX (repeatable): a first landing
                 activates an scp-style or ssh:// origin starting with PREFIX
-                (never a local path); otherwise only HTTPS origins are active
-    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+                (never a local path); otherwise only HTTPS origins are active.
+                --exclude-union (M2 round 2): a first linked landing whose
+                repository's common info/exclude is not the capture's appends
+                the captured lines it lacks instead of refusing
+                GIT_IGNORE_POLICY_CONFLICT: a recorded write (STATE
+                ITEM-SOURCE.exclude-union; receipt exclude-appended=N) that never
+                removes or reorders a line and changes what EVERY worktree of the
+                repository ignores. Where a line would be appended it still
+                refuses for a negation (!pattern) on either side, an exclude a
+                bulkload ledger owns, a symlinked info or an exclude that is not
+                a regular file with one link this user owns.
+                --side-root ROOT (repeatable; M2r2 item e; needs --adopt):
+                after the preflights and before any item, each planned path
+                spelled through a symlink whose one hop names a directory
+                inside ROOT (not nested with another seat's target or a
+                planned path) is seated: one exchange gives the live path the
+                directory (same inode, no byte copied) and a link back
+                replaces the side-root path, recorded in PRIVATE_STATE
+                (`seat live= target= outcome=seated|seat-resumed|unseated|refused
+                reason=`; an interrupted seat or undo is finished first); the
+                items then adopt or re-key at the live path, and a seat stays
+                if they refuse
+    estate-unseat PRIVATE_STATE [LIVE ...]
+                M2r2 item e: undo each seat estate-apply --side-root recorded in
+                PRIVATE_STATE (or only those of the LIVE paths given): the
+                directory back at its side-root path (the same inode), the
+                link back at the live path with its own text, the record
+                removed (the record is marked unseating first, so an
+                interrupted undo is finished, never re-seated). Refuses
+                RECEIPT_BINDING_INVALID, changing no path, when either path no
+                longer holds what the seat left.
+    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
                 ledger; differs with a hint without one), with what estate-apply
@@ -136,12 +166,47 @@ SUBCOMMANDS:
                 given again; an unchanged rerun reads and writes nothing. One
                 JSON line per workspace (schema bulkload.estate-handoff.v1, the
                 verb's own name)
-    closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+    estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--bind ID=DEST_STATE]...
+                [--bind-only] [--recarry]
+                [--host HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
+                PLAN CORPUS PRIVATE_STATE SOURCE CARRY_STATE
+                M2r2 b: carry each planned item whose capture refused (no
+                capture record; its outcome CAPTURE_ABSENT) as files,
+                byte-exact, by one recorded transfer session (`copy`, or
+                `pull` from HOST with the remote source state under DIR) into
+                its workspace, or beside it (the workspace path with SUFFIX
+                appended), the session recorded in CARRY_STATE/<item>/dest.
+                An equal destination file is adopted; a differing one is
+                refused and never overwritten, and the item is then not
+                carried. --bind ID=DEST_STATE binds an item to a session
+                this transport already recorded in DEST_STATE (same source,
+                same destination, completed, no refused path) instead of
+                running one: nothing is transferred or written under the
+                destination. Whatever landed, each directory below the
+                destination holding a `.git` entry is resolved as Git
+                resolves it (rev-parse, object alternates, symlinks in its
+                administration); anything outside the carried tree refuses
+                GIT_CARRY_POINTER_ATTACHED (the bytes stay for review). A
+                carried item gets a `{item}-{blake3(SOURCE)}.carried` record
+                and the outcome carried-as-files, which closure-report counts
+                `carried` while the transfer record and the `.git`
+                resolutions prove it. A refs-only item rides on a carried
+                workspace item of the same source (via=). Every --item and
+                --bind must name a planned eligible item (a bind, a workspace
+                item), or the run refuses FIELD_DOMAIN_VIOLATION before any
+                write; --bind-only refuses a selected workspace item with no
+                bind. An item already carried whose carry still proves is
+                kept with no session unless --recarry or a bind for it asks;
+                a rerun that does not carry an item that was carried writes
+                CAPTURE_ABSENT back (and for refs-only items riding on it).
+                --dry-run reads only and prints what each item would do.
+                One line per item
+    closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] [--omissions-from-destination] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
                 are mapped) and journals (later directories override earlier
                 outcome records), with SOURCE the label estate-apply was
-                given. Prints a bulkload.closure.v4 JSON ledger: every planned
+                given. Prints a bulkload.closure.v5 JSON ledger: every planned
                 item is applied (workspace, exact current-capture journal),
                 refused-pending-review (typed code; a bare IO or FRAME_CODEC
                 is not typed, nor is a code retired from the taxonomy),
@@ -151,8 +216,15 @@ SUBCOMMANDS:
                 the native one. `gate` is S4: every item accounted and every
                 typed refusal reviewed, so it can fail while `verdict`
                 passes and `unaccounted` is 0; it exits nonzero with
-                CLOSURE_UNACCOUNTED when it fails.
+                CLOSURE_UNACCOUNTED when it fails. The omissions block
+                reads each capture's .omissions sidecar; a capture from
+                before it is read from its bundle's header (no omission ref:
+                zero roots), and why an item stays unknown is printed on
+                stderr (omissions-unknown REASON=N ...).
                 Options, only before PLAN, each at most once:
+                --omissions-from-destination: for a capture from before the
+                sidecar whose bundle names an omission list, read that list
+                by oid from the item's destination repository (reads only).
                 --attest LEDGER.json: join a bulkload.closure-ledger.v1
                 attestation ledger for items closed by audit, not by a verb.
                 The ledger must name this PLAN and SOURCE (plan,
@@ -234,11 +306,15 @@ SUBCOMMANDS:
                 with no snapshot row is placed with a row built from its
                 header (OI-1003-Q198 D; RESEAT_INDEX_ROW_ABSENT when it cannot
                 fill one); a destination row or rollout form for a thread is
-                the destination's (RESEAT_INDEX_CONFLICT, nothing placed),
-                except that an existing row whose cwd only spells the lane
-                differently (through the ~/git symlink) gets its cwd column
-                re-spelled to the canonical path, ledgered (OI-1003-Q198 (1);
-                --no-respell). Symlinked destination transcripts
+                the destination's, nothing placed: destination-adopted when
+                the file its row names holds the landed lines, else
+                destination-holds (a file there, unproved) or
+                destination-row-only (a row only), proof named, and
+                RESEAT_INDEX_CONFLICT for a row naming another file. Every
+                existing row whose cwd is spelled through the home's git or a
+                --map symlink gets its cwd column re-spelled to the canonical
+                path, lane or not, ledgered (OI-1003-Q198 (1); --no-respell;
+                --check counts them). Symlinked destination transcripts
                 (projects/*/*.jsonl) are first regularized into regular-file
                 copies of their targets with the targets' mtime, the targets
                 kept, ledgered (OI-1003-Q198 (2); --no-regularize); a target
@@ -359,7 +435,9 @@ BOUNDARIES:
     DESTINATION_EXCHANGE_UNSUPPORTED before it is staged. With
     --sqlite=refuse (the default) they refuse live SQLite files, sniffing
     each once (source_sniff_bytes on the counters line) and remembering the
-    refusal, and every -wal, -shm and -journal by name.
+    refusal, and every -wal, -shm and -journal by name, except a Git ref or
+    reflog so named: below a directory named refs or logs, reading as a ref
+    or a reflog line, beside no SQLite database (M2r2).
     --sqlite=snapshot (#218; copy and pull, carried to serve in its Open):
     a database is carried as a backup-API snapshot the source takes into its
     private state (SOURCE_STATE/sqlite-snapshots, at most 4 GiB of slots
@@ -370,7 +448,7 @@ BOUNDARIES:
     magic beside a -wal that holds frames (an encrypted store) is refused
     SQLITE_STATE_CHANGED, never carried raw. An unchanged store is reused with nothing opened: its key is its
     row and its -wal's identity. A -wal, -shm or -journal beside a database
-    is never carried: it is covered when its database was carried as a
+    (a Git ref or reflog so named aside) is never carried: it is covered when its database was carried as a
     snapshot, and refused SQLITE_STATE_CHANGED otherwise. A changed store
     supersedes its own older snapshot output through the same exchange
     (OI-1003-Q146) only when no -wal, -journal or -shm sits beside the
@@ -580,8 +658,9 @@ fn main() -> ExitCode {
         }
         Some(
             name @ ("estate-add" | "estate-add-batch" | "estate-show" | "estate-capture"
-            | "estate-apply" | "estate-diff" | "estate-handoff" | "estate-retarget"),
+            | "estate-apply" | "estate-diff" | "estate-handoff" | "estate-retarget" | "estate-unseat"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
+        Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
@@ -754,8 +833,21 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut dispositions = None;
     let mut manifest = None;
     let mut transfers = Vec::new();
+    let mut read_destinations = false;
     let mut positional = args;
     loop {
+        // M2 round 2, d: read a pre-sidecar capture's omission list from its
+        // destination repository's objects; only before PLAN.
+        if let [flag, rest @ ..] = positional {
+            if flag == "--omissions-from-destination" {
+                if read_destinations {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
+                read_destinations = true;
+                positional = rest;
+                continue;
+            }
+        }
         // WP3 PR 4: `--transfer DEST_STATE`, repeatable, also only before PLAN.
         if let [flag, state, rest @ ..] = positional {
             if flag == "--transfer" {
@@ -794,8 +886,13 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     }
     let source = source.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
     let states: Vec<PathBuf> = states.iter().map(PathBuf::from).collect();
-    let ledger =
-        bulkload_agent::estate::ledger(Path::new(plan), Path::new(corpus), source, &states)?;
+    let ledger = bulkload_agent::estate::ledger_with(
+        Path::new(plan),
+        Path::new(corpus),
+        source,
+        &states,
+        read_destinations,
+    )?;
     let mut report = bulkload_agent::closure::Report::from_ledger(&ledger);
     join_transfer_inputs(
         &mut report,
@@ -820,6 +917,17 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{}", report.to_json()).refuse_at("main::closure_command")?;
     stdout.flush().refuse_at("main::closure_command")?;
+    // M2 round 2, d: why each unknown item's omissions are unknown.
+    if !report.omissions.unknown_because.is_empty() {
+        let reasons = report
+            .omissions
+            .unknown_because
+            .iter()
+            .map(|(reason, items)| format!("{reason}={items}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("omissions-unknown {reasons}");
+    }
     report.gate()
 }
 
@@ -1408,6 +1516,8 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     &estate::ApplyOptions {
                         adopt: options.adopt,
                         activate_origin: options.activate_origin,
+                        side_roots: options.side_roots,
+                        exclude_union: options.exclude_union,
                     },
                 ),
                 &receipt,
@@ -1421,7 +1531,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         "estate-diff" => {
             let (options, rest) = estate_options(args)?;
-            if rest.len() < 4 || options.adopt {
+            if rest.len() < 4 || options.adopt || options.exclude_union {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let source = rest
@@ -1439,10 +1549,19 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     since: options.since,
                     scan: options.scan,
                     activate_origin: options.activate_origin,
+                    side_roots: options.side_roots,
                 },
                 &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
             )
             .map(drop)?;
+            output.flush().refuse_at("main::estate_command")
+        }
+        "estate-unseat" if !args.is_empty() => {
+            let lives: Vec<PathBuf> = args.iter().skip(1).map(PathBuf::from).collect();
+            let mut output = std::io::stdout().lock();
+            estate::unseat(path(0)?, &lives, &mut |line| {
+                writeln!(output, "{line}").refuse_at("main::estate_command")
+            })?;
             output.flush().refuse_at("main::estate_command")
         }
         "estate-handoff" => {
@@ -1770,9 +1889,11 @@ fn handoff_options(
 #[derive(Default)]
 struct EstateOptions {
     adopt: bool,
+    exclude_union: bool,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
+    side_roots: Vec<PathBuf>,
 }
 
 fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::ffi::OsString])> {
@@ -1783,6 +1904,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
         match arg {
             "--adopt" if !options.adopt => {
                 options.adopt = true;
+                at += 1;
+            }
+            "--exclude-union" if !options.exclude_union => {
+                options.exclude_union = true;
                 at += 1;
             }
             "--activate-origin" => {
@@ -1807,6 +1932,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             }
             "--scan" => {
                 options.scan.push(PathBuf::from(value(at + 1)?));
+                at += 2;
+            }
+            "--side-root" => {
+                options.side_roots.push(PathBuf::from(value(at + 1)?));
                 at += 2;
             }
             other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
@@ -1943,6 +2072,139 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
         || pull_command(args),
     )
     .and_then(|stats| report_transfer(&stats))
+}
+
+// M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,
+// the remote source state per item under --source-state-root.
+#[allow(clippy::too_many_lines)] // Argument parsing, then one call.
+fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use bulkload_agent::estate::carried::{self, CarryJob, CarryOptions, Transport};
+    struct Pull {
+        host: std::ffi::OsString,
+        source_state_root: PathBuf,
+        remote: Option<std::ffi::OsString>,
+        config: Option<std::ffi::OsString>,
+    }
+    impl Transport for Pull {
+        fn verb(&self) -> &'static str {
+            "pull"
+        }
+        fn source_key(&self, source: &Path) -> String {
+            bulkload_agent::transfer_outcome::pull_source(&self.host, source)
+        }
+        fn roots_apart(&self, job: &CarryJob) -> Result<()> {
+            bulkload_agent::transfer::receive_roots_apart(&job.destination, &job.destination_state)
+        }
+        fn run(&self, job: &CarryJob) -> Result<bulkload_agent::transfer::TransferStats> {
+            let mut args: Vec<std::ffi::OsString> = vec![
+                self.host.clone(),
+                job.source.clone().into_os_string(),
+                job.destination.clone().into_os_string(),
+                self.source_state_root.join(&job.item).into_os_string(),
+                job.destination_state.clone().into_os_string(),
+            ];
+            // `pull` takes SSH_CONFIG only after REMOTE_EXECUTABLE; the
+            // parser requires the one with the other.
+            args.extend(self.remote.iter().cloned());
+            args.extend(self.config.iter().cloned());
+            pull_command(&args)
+        }
+    }
+    let mut options = CarryOptions::default();
+    let (mut host, mut root, mut remote, mut config) = (None, None, None, None);
+    let mut at = 0;
+    let value = |at: usize| {
+        args.get(at)
+            .cloned()
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)
+    };
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        match arg {
+            "--dry-run" if !options.dry_run => {
+                options.dry_run = true;
+                at += 1;
+                continue;
+            }
+            "--bind-only" if !options.bind_only => {
+                options.bind_only = true;
+                at += 1;
+                continue;
+            }
+            "--recarry" if !options.recarry => {
+                options.recarry = true;
+                at += 1;
+                continue;
+            }
+            "--beside" if options.beside.is_none() => options.beside = Some(value(at + 1)?),
+            "--item" => options.items.push(
+                value(at + 1)?
+                    .into_string()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?,
+            ),
+            "--bind" => {
+                let pair = value(at + 1)?
+                    .into_string()
+                    .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
+                let (item, state) = pair
+                    .split_once('=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                if !Path::new(state).is_absolute()
+                    || options
+                        .bind
+                        .insert(item.to_owned(), PathBuf::from(state))
+                        .is_some()
+                {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
+            }
+            "--host" if host.is_none() => host = Some(value(at + 1)?),
+            "--source-state-root" if root.is_none() => root = Some(PathBuf::from(value(at + 1)?)),
+            "--remote-executable" if remote.is_none() => remote = Some(value(at + 1)?),
+            "--ssh-config" if config.is_none() => config = Some(value(at + 1)?),
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+        at += 2;
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let [plan, corpus, state, source, carry_state] = rest else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    let source = source
+        .to_str()
+        .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+    if config.is_some() && remote.is_none() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    let local = carried::LocalCopy;
+    let pull;
+    let transport: &dyn Transport = match (host, root) {
+        (Some(host), Some(source_state_root)) => {
+            pull = Pull {
+                host,
+                source_state_root,
+                remote,
+                config,
+            };
+            &pull
+        }
+        (None, None) if remote.is_none() && config.is_none() => &local,
+        _ => return Err(BulkloadRefusal::RequiredFieldMissing),
+    };
+    let mut output = std::io::stdout().lock();
+    carried::carry_files(
+        Path::new(plan),
+        Path::new(corpus),
+        Path::new(state),
+        source,
+        Path::new(carry_state),
+        &options,
+        transport,
+        &mut |line| {
+            writeln!(output, "{line}").refuse_at("main::carry_files_command")?;
+            output.flush().refuse_at("main::carry_files_command")
+        },
+    )
 }
 
 // Review finding 3 (S4): list one transfer a run expects in its manifest,

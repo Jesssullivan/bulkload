@@ -128,6 +128,8 @@ only under "Where intent was lost", labelled as agent text.
 | RUL: Rulings on the round-2 conflicts (OI-1003-Q194) | 0 | 20 | 20 |
 | **Total** | **126** | **167** | **293** |
 
+*Annotation (2026-10-17): FAST-25 and PROC-28 were appended after round 2 (review row K06); the counts above are as of round 2.*
+
 ## PUR: Purpose, and how bulkload relates to tcfs
 
 - **PUR-01** · operator · 2026-07-17T20:26:52Z · neo · Codex session `019f71bd` (`history.jsonl`); re-pasted in Claude session `79b8ac1b` 2026-07-18T13:54:45Z; D:23
@@ -1359,6 +1361,12 @@ only under "Where intent was lost", labelled as agent text.
 
   Not bulkload (Google Drive mount research). The operator's view that rclone's weak points are walking, listing and syncing.
 
+- **FAST-25** · operator · 2026-10-16T21:07:03Z (Linear post time; typed ~21:05Z) · — · Linear TIN-4543 comment 9539098b (lab-seat relay, "the operator's text verbatim")
+
+  > the hard part in my mind is beatin rclone, where agents have fabricated a false paper, proofs, archietcures that completly miss the point of bulkoad in termns on ntework, idempotancy, streaming, copyonce, NOT interupt work on neo / source machine; these are nuances of the ask, migrate from one machine to another fast. that is a difficult problem in practice, and I think all we've done is dress up a adhoc clone operation instead of actaully thinking about what is being asked and what it MEANS. migirating bit for bit accorss huge nubmers of devlopment files, dots, ingnores, scaches, blobs, engs, dots, exports, handling divergencwe, git, ssh, home exports, local exports, agent temps, agent dialogs, angent transciprts, agent plans, symlinks etc is a (very difficult* task in practice, but CAN be clearly described. beating rclone shoudl be done in the itended architecure, which has nothign to do with cloning.
+
+  Appended 2026-10-17 (Bulkload Reset Review row K06). Governs R-C842 (end-to-end seat time is R3's gate of record) and R-C843 (the paper, formal model and clone-race lever notes are deleted), both TIN-4543 ace8649c.
+
 ## FOOT: Footprint and host hygiene
 
 - **FOOT-01** · operator · 2026-08-29T03:18:36Z · neo · Claude session `79b8ac1b`; D:7767
@@ -1650,6 +1658,16 @@ only under "Where intent was lost", labelled as agent text.
   > we are working on bulkload  codebase this plan, right?
 
   The morning after the 09-30 and 10-01 family moves, which a Codex agent ran with bespoke Python scripts, not bulkload (compare PROC-17).
+
+- **PROC-28** · operator · 2026-10-16T21:07:15Z (Linear post time; typed ~21:10Z) · — · Linear TIN-4543 comment d5f4d170 (lab-seat relay, "Operator addendum ... verbatim")
+
+  > a clean slate architecure should have addresed this from base principles, not dressed up cloning.
+
+  > (which we've done now more than once over months)
+
+  > I think we are getting there now
+
+  Appended 2026-10-17 (Bulkload Reset Review row K06). The addendum to FAST-25.
 
 ## CONF: Statements that pull against each other
 

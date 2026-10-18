@@ -31,6 +31,8 @@ pub mod decide;
 )]
 mod decide_tests;
 pub mod estimate;
+pub mod exclude_union;
+pub mod in_band;
 #[cfg(test)]
 #[allow(
     clippy::expect_used,
@@ -540,6 +542,35 @@ fn verify_bundle(repo: &Path, bundle: &Path) -> Result<()> {
         }
     }
     Err(BulkloadRefusal::GitInventoryMalformed)
+}
+
+/// What Git resolves for `dir`, a directory holding a `.git` entry (M2r2 b,
+/// `estate-carry-files`' check of a carried tree): with `top_level` false,
+/// its absolute git dir and common dir; with it true, its top level (none
+/// for a bare administration). `None` when Git refuses the directory, as it
+/// does for an administration absent on this host. A read through the
+/// hardened builder: no optional locks, no hooks, no fsmonitor, no
+/// discovery above `dir`'s parent.
+pub(crate) fn resolved_paths(dir: &Path, top_level: bool) -> Option<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let answer = if top_level {
+        output(git(dir).args(["rev-parse", "--show-toplevel"]))
+    } else {
+        output(git(dir).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ]))
+    }
+    .ok()?;
+    Some(
+        answer
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| PathBuf::from(std::ffi::OsStr::from_bytes(line)))
+            .collect(),
+    )
 }
 
 fn text(command: &mut Command) -> Result<String> {
@@ -6770,6 +6801,7 @@ pub fn restore_staged(
             observed_ns: 0,
             capture: staged.digest(),
             parents: None,
+            exclude_union: None,
         },
         &[],
     )
@@ -7252,6 +7284,7 @@ pub fn restore_linked_staged(
             observed_ns: 0,
             capture: staged.digest(),
             parents: None,
+            exclude_union: None,
         },
     )
     .map(drop)
@@ -7286,7 +7319,7 @@ pub(crate) fn restore_linked_staged_landed(
         (repository, base),
         destination,
         source,
-        landing.observed_ns,
+        (landing.observed_ns, landing.exclude_union.is_some()),
     )?;
     // M2 finding 1: after every write-free refusal, the absent parents
     // are the landing's first write.
@@ -7408,6 +7441,11 @@ pub(crate) fn restore_linked_staged_landed(
         Some(index),
         custody,
     )?;
+    // `--exclude-union`: the receipt of this finished landing counted the
+    // item's appends.
+    if let Some(record) = landing.exclude_union {
+        exclude_union::reported(record, &exclude_path)?;
+    }
     landed::remove(&landing_intent)?;
     drop(lock);
     Ok(applied)
@@ -7556,6 +7594,7 @@ pub(crate) fn recover_linked_landing(
             observed_ns: intent.observed_ns,
             capture: intent.capture,
             parents: None,
+            exclude_union: None,
         },
         &meta,
         (&intent.head, intent.intended_branch.as_ref()),
