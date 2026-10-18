@@ -1485,6 +1485,7 @@ scenarios! {
     // added (finished forward from its landing intent) and after its refs.
     estate_apply_beside_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::Beside;
     estate_apply_beside_refs => EstateApplyBesideRefs: 1, EstateAdopt::Beside;
+    estate_apply_beside_stale_capture => EstateConvergeLinkedAdded: 1, EstateAdopt::BesideStale;
     // Re-seat (R0, TIN-6587): a first pass crashed at its first and its last
     // placement (the transcript, then the Codex rollout) and at its row
     // commit; a pass extending a grown transcript; a pass superseding a

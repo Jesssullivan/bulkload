@@ -3054,6 +3054,9 @@ pub(super) fn plan_linked(
         source,
         (t, landing.exclude_union.is_some()),
     )?;
+    if landing.beside && !append.is_empty() {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
     if let Some(base) = base {
         super::import_verified(repository, base.path(), source)?;
     }

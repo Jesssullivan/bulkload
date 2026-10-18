@@ -1,55 +1,76 @@
-//! `estate-apply --beside` (M2 round 2, item c, 2026-10-17).
+//! `estate-apply --adopt --beside SUFFIX` (M2 round 2, item c, 2026-10-17).
 //!
-//! The in-place run's i02 batch ended 12 workspace items refused: 10
-//! `GIT_DESTINATION_DIVERGED` (the live checkout differs from the capture,
-//! so `--adopt` cannot prove it) and 2 `GIT_AUTHORITY_CHANGED`. Each was
-//! carried by hand as a refs-only item into the live repository and a
-//! second, standalone item at `<path>.neo-20261016`. `--beside` does it
-//! natively, and leaves the live checkout exactly as it was:
+//! The in-place run's i02 batch ended 10 workspace items refused
+//! `GIT_DESTINATION_DIVERGED`: the live checkout exists and differs from the
+//! capture, so `--adopt` cannot prove it. Each was carried by hand as a
+//! refs-only item into the live repository and a second, standalone item at
+//! `<path>.neo-20261016`. `--beside` does it natively, and leaves the live
+//! checkout's working tree, index, HEAD and native refs as they were:
 //!
-//! - **Where.** The beside path is the planned workspace's path with
-//!   `.<suffix>` appended, `suffix` being `<prefix>-<YYYYMMDD>`: `prefix`
-//!   the SOURCE label up to its first `-` (`neo-inplace-20261016` gives
-//!   `neo`), and the date the label's first dash-separated component that is
-//!   a calendar date (`20261016`), else the capture's own instant (its
-//!   `started_ns`, UTC). A label with neither, against a legacy capture with
-//!   no instant, refuses `REQUIRED_FIELD_MISSING`.
+//! - **When.** Only under `--adopt`, and only for a workspace item whose
+//!   planned checkout existed and whose adopt proof refused
+//!   `GIT_DESTINATION_DIVERGED` (nothing written). No other refusal leads
+//!   here: a first landing that refused after its writes leaves its partial
+//!   checkout for review, never a second copy beside it.
+//! - **Where.** The workspace path with `SUFFIX` appended verbatim (the
+//!   same meaning as `estate-carry-files --beside SUFFIX`): `.neo-20261016`
+//!   gives `<path>.neo-20261016`. Its ref namespace is `SUFFIX` without
+//!   its leading `.`, which must be one plain ref component (letters,
+//!   digits, `.`, `_`, `-`; not starting with `.` or `-`, no `..`, not
+//!   ending in `.` or `.lock`), else `FIELD_DOMAIN_VIOLATION`. Labels that
+//!   use the same SUFFIX share the namespace: their refs are kept, never
+//!   moved, and a differing one keeps the item refused (below).
 //! - **What lands there.** A first linked landing of the capture into the
 //!   planned (live) repository, detached at the captured head with its
 //!   branch recorded (`head-detached-beside`): no branch of the live
 //!   repository is created or moved, and its native refs are never
-//!   stepped, whatever its marker says. The capture's objects are imported
-//!   (its provenance instance, as any landing imports it). The exclude
-//!   policy is a linked landing's (`--exclude-union` applies). A beside path
-//!   that exists refuses `GIT_DESTINATION_OCCUPIED` unless it is this
-//!   item's own landing of this capture (its workspace ledger says so), a
-//!   landing of it a crash cut short (its landing intent), which is
-//!   finished forward, or, under `--adopt`, a standalone checkout (its own
-//!   `.git` directory, no ledger; the in-place lane made
-//!   `<path>.neo-20261016` by hand) that proves equal to the capture: it is
-//!   adopted in place in its own repository (A11a), and the capture is
-//!   imported into the planned repository for the refs below. One that
-//!   differs refuses `GIT_DESTINATION_DIVERGED`.
-//! - **Refs in.** Every captured ref `refs/<name>` is created as
-//!   `refs/<suffix>/<name>`, and stash entry `n` (newest first) as
-//!   `refs/<suffix>/stashes/<n>`, in one `update-ref` transaction of
-//!   `create` lines: create-only. A name that holds the same value already
-//!   is counted present; one that holds another value is kept as it is
-//!   (never moved or deleted) and counted. Nothing outside
-//!   `refs/<suffix>/` is written.
-//! - **Recorded, counted.** After the refs (and the landing's own
-//!   ledgers), STATE records `{item}-{blake3(SOURCE)}.beside`
-//!   ([`BesideRecord`]): the beside path, the suffix, the capture, the
-//!   instance, the refs created and the refs kept. The receipt counts
-//!   `beside-landed`, `beside-ref-created=<n>`, `beside-ref-present=<n>`
-//!   and `beside-ref-kept=<n>`; the journal and outcome are
-//!   `workspace-beside`, which `closure-report` (v5) classifies
-//!   `applied-beside`.
-//!
-//! Only the item's own refusals `GIT_DESTINATION_DIVERGED` and
-//! `GIT_AUTHORITY_CHANGED`, returned by the planned workspace's apply, lead
-//! to a beside landing; nothing else does, and without the flag nothing
-//! changes.
+//!   stepped, whatever its marker says. The capture's objects and
+//!   provenance refs are imported, the worktree's administration is added
+//!   under `worktrees/`, and the landing's own ledgers are written, as any
+//!   linked landing writes them. The exclude policy is a linked landing's,
+//!   except that a beside landing never appends to the shared
+//!   `info/exclude` (that would change what the live checkout ignores):
+//!   under `--exclude-union` it lands only when nothing is missing, and
+//!   otherwise refuses `GIT_IGNORE_POLICY_CONFLICT`. A landing a crash cut
+//!   short is finished forward, never converged, and refused
+//!   `GIT_DESTINATION_OCCUPIED` when it held an older capture.
+//! - **An existing beside path** refuses `GIT_DESTINATION_OCCUPIED` unless
+//!   it is this item's own landing of this capture (its workspace ledger
+//!   names both), or a standalone checkout (its own `.git` directory) no
+//!   ledger names that proves equal to the capture: it is adopted in place
+//!   in its own repository (A11a), and the capture is imported into the
+//!   planned repository for the refs. That proof compares HEAD, the index
+//!   entries, the exclude and every carried seat's kind, mode and bytes;
+//!   untracked files the capture does not carry, the checkout's own stash
+//!   and its extra branches and remotes are not compared, and the
+//!   adoption steps the carried refs in that checkout's repository (absent
+//!   ones created, equal ones adopted, differing ones kept). One that
+//!   differs refuses `GIT_DESTINATION_OCCUPIED`: the beside path holds
+//!   something else.
+//! - **Refs in.** Before anything is landed, a ref named `refs/<ns>` or
+//!   `refs/<ns>-stash` refuses `GIT_DESTINATION_OCCUPIED`. After the
+//!   landing, every captured ref `refs/<name>` is wanted as
+//!   `refs/<ns>/<name>`, and stash entry `n` (newest first) as
+//!   `refs/<ns>-stash/<n>`, a namespace of its own. A wanted name that a
+//!   ref of the repository holds the same value at is present; one held at
+//!   another value is kept, never moved or deleted; one a ref of the
+//!   repository would collide with as a directory or a file refuses
+//!   `GIT_DESTINATION_OCCUPIED` before any ref is written. The rest are
+//!   recorded in STATE as pending, then created in one compare-and-swap
+//!   transaction through the converge's ref writer (synced), then recorded
+//!   as created.
+//! - **Recorded, counted.** STATE holds `{item}-{blake3(SOURCE)}.beside`
+//!   ([`BesideRecord`]): the beside path, the suffix, the capture (from the
+//!   beside checkout's own ledger), the instance, the refs pending,
+//!   created and kept. A rerun after a crash moves each pending ref it
+//!   finds at its value to created. The receipt counts `beside-landed` (or
+//!   `beside-present` when the beside checkout was there already),
+//!   `beside-linked` or `beside-standalone`, `beside-ref-created`,
+//!   `beside-ref-present` and `beside-ref-kept`. With every wanted ref in,
+//!   the journal and outcome are `workspace-beside`, which `closure-report`
+//!   (v5) classifies `applied-beside`; a kept ref refuses the item
+//!   `GIT_DESTINATION_OCCUPIED` instead, after the record, so it stays
+//!   pending review until the namespace is resolved.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -66,19 +87,22 @@ pub struct BesideRecord {
     pub item: String,
     /// The beside checkout's absolute path.
     pub path: Vec<u8>,
+    /// `--beside`'s suffix, as given.
     pub suffix: String,
-    /// The capture's bundle digest.
+    /// The capture the beside checkout holds (its own ledger's).
     pub capture: [u8; 32],
-    /// The capture's provenance instance in the repository.
+    /// The capture's provenance instance in the planned repository.
     pub instance: String,
-    /// `(name, oid)` each ref this landing created.
+    /// `(name, oid)` each ref about to be created (write-ahead).
+    pub pending: Vec<(String, String)>,
+    /// `(name, oid)` each ref this item's beside landing created.
     pub created: Vec<(String, String)>,
     /// `(name, existing, carried)` each ref kept with another value.
     pub kept: Vec<(String, String, String)>,
 }
 
 impl landed::Record for BesideRecord {
-    const MAGIC: &'static [u8; 16] = b"bulkload-beside1";
+    const MAGIC: &'static [u8; 16] = b"bulkload-beside2";
 }
 
 /// The record at `path`, if any.
@@ -97,83 +121,68 @@ pub fn write_record(path: &Path, record: &BesideRecord) -> Result<()> {
     landed::write(path, record)
 }
 
-/// Days since 1970-01-01 to a civil (year, month, day), proleptic
-/// Gregorian (Hinnant's `civil_from_days`).
-const fn civil(days: i64) -> (i64, i64, i64) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
-    (year, month, day)
-}
-
-/// Whether `text` is a `YYYYMMDD` calendar date.
-fn date_like(text: &str) -> bool {
-    if text.len() != 8 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
-        return false;
-    }
-    let field = |range: std::ops::Range<usize>| {
-        text.get(range)
-            .and_then(|digits| digits.parse::<u32>().ok())
-            .unwrap_or(0)
-    };
-    let (year, month, day) = (field(0..4), field(4..6), field(6..8));
-    (1970..=9999).contains(&year) && (1..=12).contains(&month) && (1..=31).contains(&day)
-}
-
-/// The beside suffix for SOURCE label `source` and a capture taken at
-/// `observed_ns` (see the module docs).
+/// The ref namespace of `suffix`: the suffix without its leading `.`, one
+/// plain ref component (see the module docs).
 ///
 /// # Errors
-/// `REQUIRED_FIELD_MISSING` when neither the label nor the capture names a
-/// date; `PATH_NOT_PORTABLE` when the label's prefix is not a plain name.
-pub fn suffix(source: &str, observed_ns: i128) -> Result<String> {
-    let prefix = source.split('-').next().unwrap_or_default();
-    if prefix.is_empty()
-        || prefix.starts_with('.')
-        || !prefix
+/// `FIELD_DOMAIN_VIOLATION` for any other suffix.
+pub fn namespace(suffix: &str) -> Result<String> {
+    let name = suffix.strip_prefix('.').unwrap_or(suffix);
+    let plain = !name.is_empty()
+        && name
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'.')
-    {
-        return Err(BulkloadRefusal::PathNotPortable);
-    }
-    let date = if let Some(date) = source.split('-').skip(1).find(|part| date_like(part)) {
-        date.to_owned()
-    } else if observed_ns > 0 {
-        let days = i64::try_from(observed_ns.div_euclid(86_400 * 1_000_000_000))
-            .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
-        let (year, month, day) = civil(days);
-        format!("{year:04}{month:02}{day:02}")
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        && !name.starts_with(['.', '-'])
+        && !name.ends_with('.')
+        && !name.ends_with(".lock")
+        && !name.contains("..");
+    if plain {
+        Ok(name.to_owned())
     } else {
-        return Err(BulkloadRefusal::RequiredFieldMissing);
-    };
-    Ok(format!("{prefix}-{date}"))
+        Err(BulkloadRefusal::FieldDomainViolation)
+    }
 }
 
-/// The beside path of `workspace` under `suffix`: `<workspace>.<suffix>`.
+/// The beside path of `workspace` under `suffix`: the path with `suffix`
+/// appended verbatim.
+#[must_use]
+pub fn path(workspace: &Path, suffix: &str) -> PathBuf {
+    let mut name = workspace.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Every ref name of `repo`.
+fn names(repo: &Path) -> Result<BTreeMap<String, String>> {
+    let listed = text(git(repo).args(["for-each-ref", "--format=%(objectname) %(refname)"]))?;
+    let mut names = BTreeMap::new();
+    for line in listed.lines() {
+        let (value, name) = line
+            .split_once(' ')
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        names.insert(name.to_owned(), value.to_owned());
+    }
+    Ok(names)
+}
+
+/// Whether `repo` holds a ref named `refs/<ns>` or `refs/<ns>-stash`: the
+/// namespace a beside landing writes under would collide with it.
 ///
 /// # Errors
-/// `PATH_NOT_ABSOLUTE` for a workspace with no final name.
-pub fn path(workspace: &Path, suffix: &str) -> Result<PathBuf> {
-    let name = workspace
-        .file_name()
-        .ok_or(BulkloadRefusal::PathNotAbsolute)?;
-    let mut beside = name.to_owned();
-    beside.push(".");
-    beside.push(suffix);
-    Ok(workspace.with_file_name(beside))
+/// Whatever listing the refs refuses.
+pub fn namespace_taken(repo: &Path, ns: &str) -> Result<bool> {
+    let names = names(repo)?;
+    Ok(
+        names.contains_key(&format!("refs/{ns}"))
+            || names.contains_key(&format!("refs/{ns}-stash")),
+    )
 }
 
 /// Import `staged` into `repo` and name the instance it wrote.
 ///
 /// Provenance only, as a refs-only item imports: for a beside checkout
-/// adopted in its own repository, whose refs go in under `refs/<suffix>/`
-/// of the planned one.
+/// adopted in its own repository, whose refs go in under `refs/<ns>/` of
+/// the planned one.
 ///
 /// # Errors
 /// Whatever the import refuses.
@@ -181,17 +190,8 @@ pub fn import_instance(repo: &Path, staged: &super::StagedBundle, source: &str) 
     super::import_verified_instance(repo, staged.path(), source).map(|(_, instance)| instance)
 }
 
-/// What [`refs_in`] did.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RefsIn {
-    pub created: Vec<(String, String)>,
-    pub present: u64,
-    pub kept: Vec<(String, String, String)>,
-}
-
 /// The refs a beside landing wants in `repo`: each captured ref of
-/// `instance` under `refs/<suffix>/`, each stash entry as
-/// `refs/<suffix>/stashes/<n>`.
+/// `instance` under `refs/<ns>/`, each stash entry as `refs/<ns>-stash/<n>`.
 ///
 /// # Errors
 /// Whatever reading the provenance refuses.
@@ -199,72 +199,105 @@ pub fn wanted(
     repo: &Path,
     source: &str,
     instance: &str,
-    suffix: &str,
+    ns: &str,
 ) -> Result<BTreeMap<String, String>> {
     let mut wanted = BTreeMap::new();
     for (name, value) in native_refs::carried(repo, source, instance)? {
         let rest = name
             .strip_prefix("refs/")
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        wanted.insert(format!("refs/{suffix}/{rest}"), value);
+        wanted.insert(format!("refs/{ns}/{rest}"), value);
     }
     let (stash, _) = native_refs::carried_stash(repo, source, instance)?;
     for (index, entry) in stash.iter().enumerate() {
-        wanted.insert(format!("refs/{suffix}/stashes/{index}"), entry.oid.clone());
+        wanted.insert(format!("refs/{ns}-stash/{index}"), entry.oid.clone());
     }
     Ok(wanted)
 }
 
-/// Create the refs [`wanted`] names in `repo`, create-only (see the module
-/// docs).
+/// What [`plan`] decided for the wanted refs.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RefsPlan {
+    /// `(name, oid)` to create.
+    pub create: Vec<(String, String)>,
+    /// `(name, oid)` already held at their value.
+    pub present: Vec<(String, String)>,
+    /// `(name, existing, carried)` held at another value: kept.
+    pub kept: Vec<(String, String, String)>,
+}
+
+/// Decide each wanted ref against `repo`'s refs now (see the module docs).
+/// Read-only.
 ///
 /// # Errors
-/// `GIT_INVENTORY_MALFORMED` for a malformed listing; whatever the
-/// transaction refuses (a ref created by another writer meanwhile refuses
-/// the whole transaction, with nothing moved).
-pub fn refs_in(repo: &Path, wanted: &BTreeMap<String, String>, suffix: &str) -> Result<RefsIn> {
-    let listed = text(git(repo).args([
-        "for-each-ref",
-        "--format=%(objectname) %(refname)",
-        &format!("refs/{suffix}/"),
-    ]))?;
-    let mut existing = BTreeMap::new();
-    for line in listed.lines() {
-        let (value, name) = line
-            .split_once(' ')
-            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        if !oid(value) {
-            return Err(BulkloadRefusal::GitInventoryMalformed);
-        }
-        existing.insert(name.to_owned(), value.to_owned());
-    }
-    let mut done = RefsIn::default();
-    let mut transaction = Vec::new();
+/// `GIT_DESTINATION_OCCUPIED` when a ref to create collides with one of the
+/// repository's as a directory or a file; `GIT_INVENTORY_MALFORMED` for a
+/// malformed listing.
+pub fn plan(repo: &Path, wanted: &BTreeMap<String, String>) -> Result<RefsPlan> {
+    let existing = names(repo)?;
+    let mut planned = RefsPlan::default();
     for (name, value) in wanted {
         if !oid(value) {
             return Err(BulkloadRefusal::GitInventoryMalformed);
         }
         match existing.get(name) {
-            Some(held) if held == value => done.present += 1,
-            Some(held) => done.kept.push((name.clone(), held.clone(), value.clone())),
+            Some(held) if held == value => planned.present.push((name.clone(), value.clone())),
+            Some(held) => planned
+                .kept
+                .push((name.clone(), held.clone(), value.clone())),
             None => {
-                transaction.extend_from_slice(b"create ");
-                transaction.extend_from_slice(name.as_bytes());
-                transaction.push(0);
-                transaction.extend_from_slice(value.as_bytes());
-                transaction.push(0);
-                done.created.push((name.clone(), value.clone()));
+                if native_refs::name_conflict(name, existing.keys().map(String::as_str)) {
+                    return Err(BulkloadRefusal::GitDestinationOccupied);
+                }
+                planned.create.push((name.clone(), value.clone()));
             }
         }
     }
-    if !transaction.is_empty() {
-        // The converge's one destination ref writer: the lines are
-        // compare-and-swap creates, and the refs and their directories are
-        // synced before any record names them.
-        let names: Vec<&str> = done.created.iter().map(|(name, _)| name.as_str()).collect();
-        native_refs::update_refs(repo, None, &transaction, &names)?;
+    Ok(planned)
+}
+
+/// Create `refs` in `repo`: one transaction of compare-and-swap `create`
+/// lines through the converge's ref writer, which syncs the refs and their
+/// directories before returning. A ref another writer created meanwhile
+/// refuses the whole transaction, with nothing moved.
+///
+/// # Errors
+/// Whatever the transaction refuses.
+pub fn create(repo: &Path, refs: &[(String, String)]) -> Result<()> {
+    if refs.is_empty() {
+        return Ok(());
     }
-    Ok(done)
+    let mut transaction = Vec::new();
+    for (name, value) in refs {
+        transaction.extend_from_slice(b"create ");
+        transaction.extend_from_slice(name.as_bytes());
+        transaction.push(0);
+        transaction.extend_from_slice(value.as_bytes());
+        transaction.push(0);
+    }
+    let names: Vec<&str> = refs.iter().map(|(name, _)| name.as_str()).collect();
+    native_refs::update_refs(repo, None, &transaction, &names)
+}
+
+/// Move each pending ref of `record` that `repo` holds at its value to
+/// created (a crash cut the record off after the refs), and drop the rest
+/// of the pending list (never written, or since changed: decided again).
+///
+/// # Errors
+/// Whatever listing the refs refuses.
+pub fn settle(repo: &Path, record: &mut BesideRecord) -> Result<()> {
+    if record.pending.is_empty() {
+        return Ok(());
+    }
+    let existing = names(repo)?;
+    for (name, value) in std::mem::take(&mut record.pending) {
+        if existing.get(&name) == Some(&value)
+            && !record.created.iter().any(|(held, _)| *held == name)
+        {
+            record.created.push((name, value));
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -273,37 +306,96 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_suffix_takes_the_label_prefix_and_its_date() {
-        assert_eq!(suffix("neo-inplace-20261016", 0).unwrap(), "neo-20261016");
-        assert_eq!(suffix("neo", 0), Err(BulkloadRefusal::RequiredFieldMissing));
-        // 2026-10-17T00:51:00Z from the capture when the label has no date.
-        let ns = 1_792_198_260_i128 * 1_000_000_000;
-        assert_eq!(suffix("neo", ns).unwrap(), "neo-20261017");
-        assert_eq!(suffix("neo-inplace", ns).unwrap(), "neo-20261017");
-        // Not a date: 13th month, wrong width.
-        assert_eq!(suffix("neo-20261316", ns).unwrap(), "neo-20261017");
-        assert_eq!(suffix("neo-2026101", ns).unwrap(), "neo-20261017");
-        assert_eq!(
-            suffix("../x-20261016", 0),
-            Err(BulkloadRefusal::PathNotPortable)
-        );
-        assert_eq!(
-            suffix("-20261016", 0),
-            Err(BulkloadRefusal::PathNotPortable)
-        );
-        assert_eq!(civil(0), (1970, 1, 1));
-        assert_eq!(civil(20_743), (2026, 10, 17));
+    fn the_namespace_is_one_plain_ref_component() {
+        assert_eq!(namespace(".neo-20261016").unwrap(), "neo-20261016");
+        assert_eq!(namespace("neo-20261016").unwrap(), "neo-20261016");
+        assert_eq!(namespace("neo_1.x").unwrap(), "neo_1.x");
+        for bad in [
+            "", ".", "..neo", ".-neo", "neo/x", "neo..x", "neo.", "neo.lock", "neo x", "neo@{1}",
+            "neo:x", "neo~1", "neo^", "neo*", "neo\\x",
+        ] {
+            assert_eq!(
+                namespace(bad),
+                Err(BulkloadRefusal::FieldDomainViolation),
+                "{bad:?}"
+            );
+        }
     }
 
     #[test]
-    fn the_path_appends_the_suffix_to_the_final_name() {
+    fn the_path_appends_the_suffix_verbatim() {
         assert_eq!(
-            path(Path::new("/srv/git/xoxd.ai"), "neo-20261016").unwrap(),
+            path(Path::new("/srv/git/xoxd.ai"), ".neo-20261016"),
             PathBuf::from("/srv/git/xoxd.ai.neo-20261016")
         );
         assert_eq!(
-            path(Path::new("/"), "neo-20261016"),
-            Err(BulkloadRefusal::PathNotAbsolute)
+            path(Path::new("/srv/git/xoxd.ai"), "-beside"),
+            PathBuf::from("/srv/git/xoxd.ai-beside")
         );
+    }
+
+    #[test]
+    fn a_pending_ref_found_at_its_value_settles_created() {
+        let base = std::env::temp_dir().join(format!("bulkload-beside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "user.name=T", "-c", "user.email=t@localhost", "-C"])
+                .arg(&base)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        run(&["init", "--quiet", "--template=", "-b", "main"]);
+        run(&["commit", "--quiet", "--allow-empty", "-m", "c0"]);
+        let head = run(&["rev-parse", "HEAD"]).trim().to_owned();
+        let wanted: BTreeMap<String, String> = [
+            ("refs/ns/heads/main".to_owned(), head.clone()),
+            ("refs/ns/heads/other".to_owned(), head.clone()),
+            ("refs/ns-stash/0".to_owned(), head.clone()),
+        ]
+        .into();
+        // A crash after the refs: the record still says pending.
+        let first = plan(&base, &wanted).unwrap();
+        assert_eq!(first.create.len(), 3);
+        create(&base, &first.create).unwrap();
+        let mut record = BesideRecord {
+            pending: first.create.clone(),
+            ..BesideRecord::default()
+        };
+        // One pending ref was never written (a different value).
+        record
+            .pending
+            .push(("refs/ns/heads/never".to_owned(), head.clone()));
+        settle(&base, &mut record).unwrap();
+        assert!(record.pending.is_empty());
+        assert_eq!(record.created, first.create);
+        let again = plan(&base, &wanted).unwrap();
+        assert!(again.create.is_empty());
+        assert_eq!(again.present.len(), 3);
+        // A ref at another value is kept; a directory/file collision refuses.
+        run(&["update-ref", "refs/ns/heads/main", "HEAD"]);
+        run(&["commit", "--quiet", "--allow-empty", "-m", "c1"]);
+        let moved: BTreeMap<String, String> = [(
+            "refs/ns/heads/main".to_owned(),
+            run(&["rev-parse", "HEAD"]).trim().to_owned(),
+        )]
+        .into();
+        assert_eq!(plan(&base, &moved).unwrap().kept.len(), 1);
+        let collides: BTreeMap<String, String> =
+            [("refs/ns/heads/main/deeper".to_owned(), head.clone())].into();
+        assert_eq!(
+            plan(&base, &collides),
+            Err(BulkloadRefusal::GitDestinationOccupied)
+        );
+        assert!(!namespace_taken(&base, "ns").unwrap());
+        run(&["update-ref", "refs/taken", &head]);
+        assert!(namespace_taken(&base, "taken").unwrap());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 }

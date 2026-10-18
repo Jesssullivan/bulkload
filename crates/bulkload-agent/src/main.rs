@@ -60,7 +60,7 @@ SUBCOMMANDS:
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply [--adopt] [--exclude-union] [--beside] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+    estate-apply [--adopt] [--exclude-union] [--beside SUFFIX] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces.
                 A landed checkout bulkload proves unchanged converges to the
                 current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
@@ -92,19 +92,21 @@ SUBCOMMANDS:
                 refuses for a negation (!pattern) on either side, an exclude a
                 bulkload ledger owns, a symlinked info or an exclude that is not
                 a regular file with one link this user owns.
-                --beside (M2 round 2): a workspace item whose planned checkout
-                refuses GIT_DESTINATION_DIVERGED or GIT_AUTHORITY_CHANGED leaves
-                it as it is and lands the capture at WORKSPACE.SUFFIX (SUFFIX
-                PREFIX-YYYYMMDD: the SOURCE label up to its first '-', and the
-                label's date, else the capture's UTC date) as a detached linked
-                worktree of the planned repository, then creates every captured
-                ref as refs/SUFFIX/NAME and each stash entry as
-                refs/SUFFIX/stashes/N, create-only (an existing one is kept and
-                counted); recorded in STATE ITEM-SOURCE.beside; outcome and
-                journal workspace-beside, closure applied-beside. An existing
-                beside path that is not this item's landing of this capture
-                refuses GIT_DESTINATION_OCCUPIED
-    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+                --beside SUFFIX (M2 round 2; requires --adopt): a workspace
+                item whose existing checkout the adopt proof refuses
+                GIT_DESTINATION_DIVERGED is left as it is and the capture lands
+                at the workspace path with SUFFIX appended (as estate-carry-files
+                --beside SUFFIX), a detached linked worktree of the planned
+                repository (never appending to its shared info/exclude), or an
+                equal standalone checkout already there is adopted in place.
+                Every captured ref goes in as refs/NS/NAME and each stash entry
+                as refs/NS-stash/N (NS: SUFFIX without its leading '.', one
+                plain ref component), create-only, recorded write-ahead in STATE
+                ITEM-SOURCE.beside; outcome and journal workspace-beside, closure
+                applied-beside. A beside path or ref namespace holding anything
+                else, or a captured ref kept at another value, refuses
+                GIT_DESTINATION_OCCUPIED
+    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--beside SUFFIX] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
                 ledger; differs with a hint without one), with what estate-apply
@@ -1387,7 +1389,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                         adopt: options.adopt,
                         activate_origin: options.activate_origin,
                         exclude_union: options.exclude_union,
-                        beside: options.beside,
+                        beside: options.beside.clone(),
                     },
                 ),
                 &receipt,
@@ -1401,7 +1403,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         "estate-diff" => {
             let (options, rest) = estate_options(args)?;
-            if rest.len() < 4 || options.adopt || options.exclude_union || options.beside {
+            if rest.len() < 4 || options.adopt || options.exclude_union {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let source = rest
@@ -1419,6 +1421,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     since: options.since,
                     scan: options.scan,
                     activate_origin: options.activate_origin,
+                    beside: options.beside,
                 },
                 &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
             )
@@ -1751,7 +1754,7 @@ fn handoff_options(
 struct EstateOptions {
     adopt: bool,
     exclude_union: bool,
-    beside: bool,
+    beside: Option<String>,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
@@ -1771,9 +1774,14 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
                 options.exclude_union = true;
                 at += 1;
             }
-            "--beside" if !options.beside => {
-                options.beside = true;
-                at += 1;
+            "--beside" if options.beside.is_none() => {
+                options.beside = Some(
+                    value(at + 1)?
+                        .to_str()
+                        .ok_or(BulkloadRefusal::FieldDomainViolation)?
+                        .to_owned(),
+                );
+                at += 2;
             }
             "--activate-origin" => {
                 let prefix = value(at + 1)?

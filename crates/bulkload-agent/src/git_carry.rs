@@ -7294,6 +7294,11 @@ pub(crate) fn restore_linked_staged_landed(
         source,
         (landing.observed_ns, landing.exclude_union.is_some()),
     )?;
+    // A beside landing (M2 round 2 item c, review A1) never appends to the
+    // shared exclude: that would change what the live checkout ignores.
+    if landing.beside && !checked.exclude_union.is_empty() {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
     // M2 finding 1: after every write-free refusal, the absent parents
     // are the landing's first write.
     let (destination, parents_made) = checked.destination.place(landing.parents_record())?;

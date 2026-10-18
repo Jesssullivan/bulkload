@@ -73,8 +73,9 @@ pub struct ItemRow {
     /// The components that differ: `head`, `index`, `exclude`,
     /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
     /// landing that makes `n` absent parents (M2 finding 1);
-    /// `beside=<landing|landed|existing|occupied>:<path>` for a `diverged` item
-    /// (what `estate-apply --beside` does; M2 round 2 item c);
+    /// with `--beside SUFFIX`, `beside=<landing|ignore-policy-conflict|
+    /// landed|existing|occupied>:<path>` for a `diverged` item (what
+    /// `estate-apply --adopt --beside SUFFIX` does; M2 round 2 item c);
     /// `exclude-union=<n>` for an `ignore-policy-conflict` that
     /// `estate-apply --exclude-union` lands by appending `n` lines (items
     /// of one repository each count them; the apply appends them once), or
@@ -170,21 +171,49 @@ fn first_landing(
     }
 }
 
-// What `estate-apply --beside` does with a diverged item (M2 round 2 item
-// c): `beside=<verdict>:<path>`, the verdict `landing` (absent: the capture
-// lands there), `landed` (this item's own landing of this capture: nothing
-// to land), `existing` (a standalone checkout no ledger names: `--adopt
-// --beside` adopts it if it proves equal, else refuses diverged) or
-// `occupied` (`GIT_DESTINATION_OCCUPIED`); or
-// `beside-refused=<CODE>` when no beside path can be named.
-fn beside_component(workspace: &Path, landing: &Landing<'_>, source: &str) -> Result<String> {
-    let suffix = match super::super::beside::suffix(source, landing.observed_ns) {
-        Ok(suffix) => suffix,
+// What `estate-apply --adopt --beside SUFFIX` does with a diverged item
+// (M2 round 2 item c): `beside=<verdict>:<path>`, the verdict `landing`
+// (absent: a linked landing; the shared exclude must already hold every
+// captured line), `ignore-policy-conflict` (absent, but the linked landing
+// would refuse `GIT_IGNORE_POLICY_CONFLICT`: a beside landing never appends
+// to the live repository's exclude), `landed` (this item's own landing of
+// this capture: nothing to land), `existing` (a standalone checkout no
+// ledger names: adopted if it proves equal, else refused occupied) or
+// `occupied` (`GIT_DESTINATION_OCCUPIED`, the ref namespace included); or
+// `beside-refused=<CODE>` for a suffix that names no namespace.
+fn beside_component(
+    workspace: &Path,
+    (common, captured_exclude): (&Path, &[u8]),
+    landing: &Landing<'_>,
+    (source, suffix): (&str, &str),
+    repository: &Path,
+) -> Result<String> {
+    let ns = match super::super::beside::namespace(suffix) {
+        Ok(ns) => ns,
         Err(refusal) => return Ok(format!("beside-refused={}", refusal.code())),
     };
-    let beside = super::super::beside::path(workspace, &suffix)?;
-    let verdict = if planned(&beside)?.is_none() {
-        "landing"
+    let beside = super::super::beside::path(workspace, suffix);
+    let verdict = if super::super::beside::namespace_taken(repository, &ns)? {
+        "occupied"
+    } else if planned(&beside)?.is_none() {
+        let existing = match fs::read(common.join("info/exclude")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => {
+                return Err(crate::refuse::io(
+                    &error,
+                    "git_carry::converge::diff::beside",
+                ))
+            }
+        };
+        let fits = existing == captured_exclude
+            || super::super::exclude_union::missing(&existing, captured_exclude)
+                .is_ok_and(|missing| missing.is_empty());
+        if fits {
+            "landing"
+        } else {
+            "ignore-policy-conflict"
+        }
     } else {
         let ledger = match landed::worktree_git_dir(&beside)? {
             Some(git_dir) => landed::read::<LandedWorkspace>(
@@ -198,8 +227,6 @@ fn beside_component(workspace: &Path, landing: &Landing<'_>, source: &str) -> Re
         {
             "landed"
         } else if ledger.is_none() && beside.join(".git").is_dir() {
-            // A standalone checkout without a ledger: `--adopt --beside`
-            // adopts it when it proves equal to the capture.
             "existing"
         } else {
             "occupied"
@@ -225,7 +252,7 @@ pub fn workspace(
     target: &Target<'_>,
     landing: &Landing<'_>,
     since: Option<i128>,
-    (origins, items): (&[String], &[String]),
+    (origins, items, beside): (&[String], &[String], Option<&str>),
 ) -> Result<ItemRow> {
     let workspace = target
         .workspace
@@ -316,8 +343,15 @@ pub fn workspace(
             row.class = "differs";
             row.adopt = "diverged";
             row.components = components;
-            row.components
-                .push(beside_component(workspace, landing, target.source)?);
+            if let Some(suffix) = beside {
+                row.components.push(beside_component(
+                    workspace,
+                    (&common, &meta.exclude(&scratch.repo)?),
+                    landing,
+                    (target.source, suffix),
+                    target.repository,
+                )?);
+            }
             row.hint = Some(hint(
                 &scratch.repo,
                 &head_of(workspace)?.oid,

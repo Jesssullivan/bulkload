@@ -45,6 +45,9 @@ pub struct DiffOptions {
     /// `--activate-origin PREFIX`: what a first landing would activate
     /// under the same prefixes `estate-apply` is given.
     pub activate_origin: Vec<String>,
+    /// `--beside SUFFIX`: what `estate-apply --adopt --beside SUFFIX` does
+    /// with a diverged item (M2 round 2 item c).
+    pub beside: Option<String>,
 }
 
 /// The counts of one run, by class and by adopt answer.
@@ -263,7 +266,7 @@ fn item_row(
             &target,
             &landing,
             options.since,
-            (&options.activate_origin, items),
+            (&options.activate_origin, items, options.beside.as_deref()),
         )?
     } else {
         converge::diff::refs_only(

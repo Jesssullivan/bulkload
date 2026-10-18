@@ -82,9 +82,10 @@ pub enum Outcome {
     IndexRepaired,
     /// The verb refused the item.
     Refused(Refusal),
-    /// Apply refused the planned workspace (`GIT_DESTINATION_DIVERGED` or
-    /// `GIT_AUTHORITY_CHANGED`) and, under `--beside`, landed the captured
-    /// checkout beside it with create-only refs in (M2 round 2, item c).
+    /// The adopt proof refused the existing planned workspace
+    /// (`GIT_DESTINATION_DIVERGED`) and, under `--adopt --beside SUFFIX`,
+    /// apply landed the captured checkout beside it with every captured ref
+    /// created in (M2 round 2, item c).
     WorkspaceBeside,
     /// A re-apply found the beside journal and did not revalidate it.
     PreviousWorkspaceBesideNotRevalidated,

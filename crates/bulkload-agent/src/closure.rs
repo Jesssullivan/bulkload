@@ -20,11 +20,13 @@
 //! - `applied-beside` (closure v5, M2 round 2 item c): the item plans a
 //!   workspace, its outcome is `WorkspaceBeside` (or a re-apply's
 //!   `PreviousWorkspaceBesideNotRevalidated`), and the exact journal for its
-//!   current capture says `workspace-beside`: the planned checkout differed
-//!   (`GIT_DESTINATION_DIVERGED`, `GIT_AUTHORITY_CHANGED`) and was left as
-//!   it was, and `estate-apply --beside` landed the captured checkout beside
-//!   it (`<workspace>.<suffix>`) with create-only refs in. Closed: every
-//!   captured byte and ref is at the destination, beside the live tree.
+//!   current capture says `workspace-beside`: the existing planned checkout
+//!   differed (its adopt proof refused `GIT_DESTINATION_DIVERGED`) and was
+//!   left as it was, and `estate-apply --adopt --beside SUFFIX` landed the
+//!   captured checkout beside it (`<workspace>SUFFIX`) with every captured
+//!   ref created under `refs/<ns>/` (a ref kept at another value refuses
+//!   the item instead). Closed: every captured byte and ref is at the
+//!   destination, beside the live tree.
 //! - `referenced-only`: the item plans no workspace, its outcome is
 //!   `RefsImported` (or `PreviousRefCustodyNotWorkspaceParity`, or
 //!   `IndexRepaired` from `git-repair-missing-index` with a state directory,

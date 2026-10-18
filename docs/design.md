@@ -186,9 +186,10 @@ transfer, not rows.
 
 The report schema is `bulkload.closure.v5` from M2 round 2 item c
 (2026-10-17). What changed for a v4 reader: the disposition
-`applied-beside` (a workspace item whose planned checkout differed,
-`GIT_DESTINATION_DIVERGED` or `GIT_AUTHORITY_CHANGED`, landed beside it by
-`estate-apply --beside`, with the exact current-capture journal
+`applied-beside` (a workspace item whose existing planned checkout the
+adopt proof refused `GIT_DESTINATION_DIVERGED`, landed beside it by
+`estate-apply --adopt --beside SUFFIX` with every captured ref in, with
+the exact current-capture journal
 `workspace-beside`; accounted and closed) and its total `applied_beside`,
 right after `applied`. Nothing else changes.
 
@@ -940,49 +941,68 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   `exclude-union-refused=<CODE>` where it would not.
 - **`--beside` lands a diverged checkout beside it (M2 round 2 item c,
   2026-10-17).** The in-place i02 batch ended 10 workspace items
-  `GIT_DESTINATION_DIVERGED` (a live checkout that differs from the capture,
-  which `--adopt` cannot prove) and 2 `GIT_AUTHORITY_CHANGED`; each was
-  carried by hand as a refs-only item plus a standalone item at
-  `<path>.neo-20261016`. With `estate-apply --beside`, a workspace item whose
-  planned checkout's apply refuses either code leaves that checkout exactly
-  as it is and lands the capture beside it, at `<workspace>.<suffix>`:
-  `suffix` is `<prefix>-<YYYYMMDD>`, `prefix` the SOURCE label up to its
-  first `-`, the date the label's first dash-separated calendar date, else
-  the capture's own instant (UTC); neither refuses
-  `REQUIRED_FIELD_MISSING`. The landing is a first linked landing into the
-  planned repository (its objects imported as any landing imports them),
-  detached at the captured head with the branch recorded
-  (`head-detached-beside`): no branch of the live repository is created or
-  moved, its native refs are never stepped, and a landing a crash cut short
-  is finished forward, never converged. The exclude policy is a linked
-  landing's (`--exclude-union` applies). A beside path that exists refuses
-  `GIT_DESTINATION_OCCUPIED` unless it is this item's own landing of this
-  capture (then nothing is landed again) or, under `--adopt`, a standalone
-  checkout no ledger names (the lane's hand-made `<path>.neo-20261016`)
-  that proves equal to the capture: it is adopted in place in its own
-  repository (A11a), and the capture is imported into the planned
-  repository for the refs (one that differs refuses
-  `GIT_DESTINATION_DIVERGED`). Then every captured ref
-  `refs/<name>` is created as `refs/<suffix>/<name>`, and stash entry `n`
-  (newest first) as `refs/<suffix>/stashes/<n>`, in one `update-ref`
-  transaction of `create` lines: create-only. A name already holding the
-  same value is counted present; one holding another value is kept, never
-  moved or deleted, and counted. Nothing outside `refs/<suffix>/` is written.
-  This is a recorded write: STATE records `{item}-{blake3(SOURCE)}.beside`
-  (path, suffix, capture, instance, refs created and kept) after the refs
-  and the landing's own ledgers; the receipt counts `beside-landed`,
-  `beside-after=<CODE>`, `beside-linked` or `beside-standalone`,
-  `beside-ref-created`, `beside-ref-present` and
-  `beside-ref-kept`; the outcome and journal are `workspace-beside` (a rerun
-  `previous-workspace-beside-not-revalidated`), and closure v5 classifies
-  the item `applied-beside`. A crash after the worktree is added
-  (`estate.converge.linked_added`) or after the refs
-  (`estate.apply.beside_refs`) leaves the live checkout untouched and the
-  item `journal-missing`; the rerun finishes it. `estate-diff` adds the
-  component `beside=<landing|landed|existing|occupied>:<path>` to a
-  `diverged` row
-  (an authority change is decided only by the apply). The beside checkout
-  is a worktree of the live repository: `git worktree list` there shows it.
+  `GIT_DESTINATION_DIVERGED`: the live checkout exists and differs from the
+  capture, so `--adopt` cannot prove it. Each was carried by hand as a
+  refs-only item plus a standalone `<path>.neo-20261016`. With
+  `estate-apply --adopt --beside SUFFIX` (the flag requires `--adopt`), a
+  workspace item whose existing checkout the adopt proof refuses
+  `GIT_DESTINATION_DIVERGED` (nothing written) leaves that checkout's
+  working tree, index, HEAD and native refs exactly as they are and lands
+  the capture at the workspace path with `SUFFIX` appended, the meaning
+  `estate-carry-files --beside SUFFIX` gives it. No other refusal leads
+  there: a first landing that refused after writing (an authority change)
+  leaves its partial checkout for review, never a second copy. The ref
+  namespace `ns` is `SUFFIX` without its leading `.`, one plain ref
+  component (letters, digits, `.`, `_`, `-`; no leading `.` or `-`, no
+  `..`, no trailing `.` or `.lock`); labels using the same suffix share it.
+  A ref named `refs/<ns>` or `refs/<ns>-stash` refuses
+  `GIT_DESTINATION_OCCUPIED` before anything lands. An absent beside path
+  gets a first linked landing into the planned repository (its objects and
+  provenance refs imported, its `worktrees/` administration and ledgers
+  written, as any linked landing writes them), detached at the captured
+  head with the branch recorded (`head-detached-beside`): no branch of the
+  live repository is created or moved, and its native refs are never
+  stepped. A beside landing never appends to the shared `info/exclude`
+  (that would change what the live checkout ignores): under
+  `--exclude-union` it lands only when the live exclude already holds
+  every captured line, and otherwise refuses `GIT_IGNORE_POLICY_CONFLICT`.
+  A landing a crash cut short is finished forward, never converged; one
+  that held an older capture is then refused `GIT_DESTINATION_OCCUPIED`.
+  An existing beside path is accepted only as this item's own landing of
+  this capture, or as a standalone checkout no ledger names (the lane's
+  hand-made `<path>.neo-20261016`) that the A11a proof finds equal to the
+  capture: it is adopted in place in its own repository, and the capture
+  is imported into the planned repository for the refs. That proof
+  compares HEAD, the index entries, the exclude and every carried seat's
+  kind, mode and bytes; untracked files the capture does not carry, the
+  checkout's own stash and extra branches and remotes are not compared, and
+  the adoption steps the carried refs in that checkout's repository. Any
+  other beside path refuses `GIT_DESTINATION_OCCUPIED` (never the planned
+  checkout's `GIT_DESTINATION_DIVERGED`). Then every captured ref
+  `refs/<name>` is wanted as `refs/<ns>/<name>` and stash entry `n`
+  (newest first) as `refs/<ns>-stash/<n>`: a name already at the same value
+  is present; one at another value is kept, never moved or deleted; one
+  that would collide with an existing ref as a directory or a file refuses
+  `GIT_DESTINATION_OCCUPIED` before any ref is written. The rest are
+  recorded write-ahead as pending in STATE
+  (`{item}-{blake3(SOURCE)}.beside`: path, suffix, the capture from the
+  beside checkout's own ledger, instance, refs pending, created and kept),
+  created in one compare-and-swap transaction through the converge's ref
+  writer (synced), then recorded as created; a rerun after a crash moves
+  each pending ref it finds at its value to created. The receipt counts
+  `beside-landed` (or `beside-present`), `beside-linked` or
+  `beside-standalone`, `beside-ref-created`, `beside-ref-present` and
+  `beside-ref-kept`. With every wanted ref in, the outcome and journal are
+  `workspace-beside` (a rerun `previous-workspace-beside-not-revalidated`)
+  and closure v5 classifies the item `applied-beside`; a kept ref refuses
+  the item `GIT_DESTINATION_OCCUPIED` after the record, so it stays pending
+  review. A crash after the worktree is added (`estate.converge.linked_added`)
+  or after the refs (`estate.apply.beside_refs`) leaves the live checkout
+  untouched and the item `journal-missing`; the rerun finishes it.
+  `estate-diff --beside SUFFIX` adds `beside=<landing|ignore-policy-conflict|
+  landed|existing|occupied>:<path>` to a `diverged` row. The beside
+  checkout is a worktree of the live repository: `git worktree list` there
+  shows it.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads

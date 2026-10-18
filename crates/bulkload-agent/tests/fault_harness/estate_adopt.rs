@@ -73,8 +73,10 @@ use super::{Scenario, CHILD_DEADLINE, CHILD_WATCHDOG, CHILD_WATCHDOG_EXIT_CODE, 
 const CHILD_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_BASE";
 /// Set only in an `ExcludeUnion` child: it applies with `--exclude-union`.
 const CHILD_UNION_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_UNION";
-/// Set only in a `Beside` child: it applies with `--beside`.
+/// Set only in a `Beside` child: it applies with `--beside SUFFIX`.
 const CHILD_BESIDE_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_BESIDE";
+/// The `Beside` rows' suffix.
+const SUFFIX: &str = ".neo-20261016";
 
 /// What is crashed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,6 +92,9 @@ pub enum EstateAdopt {
     /// A diverged checkout landed beside under `--beside` (M2 round 2,
     /// item c).
     Beside,
+    /// `Beside` crashed at `linked_added`, then the source moved and was
+    /// captured again (review of #266, B1).
+    BesideStale,
 }
 
 impl Scenario for EstateAdopt {
@@ -154,7 +159,7 @@ impl World {
         let world = Self {
             base: fs::canonicalize(&base).unwrap(),
             union: kind == EstateAdopt::ExcludeUnion,
-            beside: kind == EstateAdopt::Beside,
+            beside: matches!(kind, EstateAdopt::Beside | EstateAdopt::BesideStale),
         };
         let src = world.base.join("src");
         fs::create_dir(&src).unwrap();
@@ -222,8 +227,11 @@ impl World {
             assert!(out.status.success());
             git(&dest, &["branch", "-D", "neo-only"]);
             git(&dest, &["branch", "sting-only", "v0"]);
-            if kind == EstateAdopt::Beside {
+            if matches!(kind, EstateAdopt::Beside | EstateAdopt::BesideStale) {
                 fs::write(dest.join("d/b.txt"), b"beta, edited at the destination\n").unwrap();
+                // Review B6: the source's HEAD is a branch the destination
+                // lacks, so an attach would create it there.
+                git(&src, &["switch", "--quiet", "-c", "beside-only"]);
             }
         }
         estate::add_batch(&world.base.join("plan"), &[item]).unwrap();
@@ -296,7 +304,7 @@ impl World {
                 adopt,
                 activate_origin: Vec::new(),
                 exclude_union: self.union,
-                beside: self.beside,
+                beside: self.beside.then(|| SUFFIX.to_owned()),
             },
             &|row| {
                 rows.lock().unwrap().push((row.outcome, row.reason.clone()));
@@ -439,7 +447,9 @@ fn adopt_child_entry() {
             adopt: true,
             activate_origin: Vec::new(),
             exclude_union: std::env::var_os(CHILD_UNION_ENV).is_some_and(|value| value == "1"),
-            beside: std::env::var_os(CHILD_BESIDE_ENV).is_some_and(|value| value == "1"),
+            beside: std::env::var_os(CHILD_BESIDE_ENV)
+                .is_some_and(|value| value == "1")
+                .then(|| SUFFIX.to_owned()),
         },
         &|_| Ok(()),
     );
@@ -461,6 +471,10 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
     }
     if kind == EstateAdopt::Beside {
         beside(&world, &label, point, nth);
+        return;
+    }
+    if kind == EstateAdopt::BesideStale {
+        beside_stale(&world, &label, point, nth);
         return;
     }
     if kind == EstateAdopt::Bare {
@@ -676,24 +690,61 @@ fn exclude_union(world: &World, label: &str, point: Point, nth: u64) {
     );
 }
 
-/// The beside checkout of the `Beside` row (`dst.neo-YYYYMMDD`), if any.
-fn beside_path(world: &World) -> Option<PathBuf> {
-    fs::read_dir(&world.base)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("dst.neo-"))
-        })
+/// The beside checkout of the `Beside` rows.
+fn beside_path(world: &World) -> PathBuf {
+    world.base.join(format!("dst{SUFFIX}"))
 }
 
-/// Every ref under `refs/<suffix>/` of `repo`.
+/// Every ref under `refs/neo-20261016/` and `refs/neo-20261016-stash/`.
 fn beside_refs(repo: &Path) -> std::collections::BTreeMap<String, String> {
     refs(repo)
         .into_iter()
         .filter(|(name, _)| name.starts_with("refs/neo-"))
         .collect()
+}
+
+/// The refs the `Beside` rows' capture wants under the namespace.
+fn wanted_refs(world: &World) -> std::collections::BTreeMap<String, String> {
+    let src = world.base.join("src");
+    let mut wanted: std::collections::BTreeMap<String, String> = refs(&src)
+        .into_iter()
+        .filter(|(name, _)| name != "refs/stash")
+        .map(|(name, value)| {
+            (
+                format!("refs/neo-20261016/{}", name.strip_prefix("refs/").unwrap()),
+                value,
+            )
+        })
+        .collect();
+    if let Ok(tip) = git_command(&src)
+        .args(["rev-parse", "--verify", "-q", "refs/stash"])
+        .output()
+    {
+        let tip = String::from_utf8(tip.stdout).unwrap().trim().to_owned();
+        if !tip.is_empty() {
+            wanted.insert("refs/neo-20261016/stash".to_owned(), tip);
+            let list = git(&src, &["stash", "list", "--format=%H"]);
+            for (index, oid) in list.lines().enumerate() {
+                wanted.insert(format!("refs/neo-20261016-stash/{index}"), oid.to_owned());
+            }
+        }
+    }
+    wanted
+}
+
+/// The `Beside` rows' STATE record, if written.
+fn beside_record(world: &World) -> Option<bulkload_agent::git_carry::beside::BesideRecord> {
+    let found: Vec<PathBuf> = fs::read_dir(world.base.join("applied"))
+        .ok()?
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "beside"))
+        .collect();
+    assert!(found.len() <= 1, "{found:?}");
+    found.first().map(|path| {
+        bulkload_agent::git_carry::beside::read_record(path)
+            .unwrap()
+            .unwrap()
+    })
 }
 
 /// The `Beside` row: see the module docs.
@@ -704,33 +755,40 @@ fn beside(world: &World, label: &str, point: Point, nth: u64) {
         .into_iter()
         .filter(|(name, _)| !name.starts_with("refs/neo-"))
         .collect();
+    let wanted = wanted_refs(world);
     crash(world, &format!("{}:{nth}", point.name()));
     assert_eq!(checkout(&dst), before, "{label}: the destination moved");
-    let crashed_refs = beside_refs(&dst);
-    let records = |world: &World| {
-        fs::read_dir(world.base.join("applied")).map_or(0, |dir| {
-            dir.filter(|entry| {
-                entry
-                    .as_ref()
-                    .unwrap()
-                    .path()
-                    .extension()
-                    .is_some_and(|ext| ext == "beside")
-            })
-            .count()
-        })
-    };
-    assert_eq!(records(world), 0, "{label}: no record before the refs");
+    let after_refs = point == Point::EstateApplyBesideRefs;
+    // Review B5/B6: at `beside_refs` every wanted ref is in and the record
+    // names them all pending; at `linked_added` neither.
+    if after_refs {
+        assert_eq!(beside_refs(&dst), wanted, "{label}: the refs at the crash");
+        let record = beside_record(world).unwrap();
+        let pending: std::collections::BTreeMap<String, String> =
+            record.pending.into_iter().collect();
+        assert_eq!(pending, wanted, "{label}: the write-ahead record");
+        assert!(record.created.is_empty(), "{label}");
+    } else {
+        assert!(beside_refs(&dst).is_empty(), "{label}");
+        assert!(
+            beside_record(world).is_none(),
+            "{label}: no record before the refs"
+        );
+    }
     assert_eq!(world.unaccounted(), 1, "{label}: journal-missing");
     let rows = world.apply(true);
     assert_eq!(rows.len(), 1, "{label}");
     assert_eq!(rows[0].0, "workspace-beside", "{label}: {rows:?}");
     let reason = rows[0].1.clone().unwrap_or_default();
-    assert!(
-        reason.contains("beside-landed=1")
-            && reason.contains("beside-after=GIT_DESTINATION_DIVERGED"),
-        "{label}: {reason}"
-    );
+    if after_refs {
+        assert!(reason.contains("beside-present=1"), "{label}: {reason}");
+    } else {
+        // Finished forward from the landing intent, never converged.
+        assert!(
+            reason.contains("landing-recovered") && !reason.contains("converged"),
+            "{label}: {reason}"
+        );
+    }
     assert_eq!(
         checkout(&dst),
         before,
@@ -740,31 +798,16 @@ fn beside(world: &World, label: &str, point: Point, nth: u64) {
         .into_iter()
         .filter(|(name, _)| !name.starts_with("refs/neo-"))
         .collect();
-    assert_eq!(now, native, "{label}: a native ref moved");
-    let landed = beside_refs(&dst);
-    for (name, value) in &crashed_refs {
-        assert_eq!(landed.get(name), Some(value), "{label}: {name} moved");
-    }
-    let source = refs(&world.base.join("src"));
-    let suffix = landed
-        .keys()
-        .next()
-        .and_then(|name| name.split('/').nth(1))
-        .unwrap()
-        .to_owned();
-    for (name, value) in &source {
-        let rest = name.strip_prefix("refs/").unwrap();
-        assert_eq!(
-            landed.get(&format!("refs/{suffix}/{rest}")),
-            Some(value),
-            "{label}: {name} not in"
-        );
-    }
-    let beside = beside_path(world).unwrap();
-    assert_eq!(
-        beside.file_name().unwrap().to_str().unwrap(),
-        format!("dst.{suffix}")
+    assert_eq!(now, native, "{label}: a native ref moved or was created");
+    assert_eq!(beside_refs(&dst), wanted, "{label}");
+    let record = beside_record(world).unwrap();
+    assert!(
+        record.pending.is_empty() && record.kept.is_empty(),
+        "{label}"
     );
+    let created: std::collections::BTreeMap<String, String> = record.created.into_iter().collect();
+    assert_eq!(created, wanted, "{label}: every ref recorded as created");
+    let beside = beside_path(world);
     assert_eq!(
         fs::read(beside.join("d/b.txt")).unwrap(),
         b"beta\n",
@@ -775,11 +818,56 @@ fn beside(world: &World, label: &str, point: Point, nth: u64) {
         git(&world.base.join("src"), &["rev-parse", "HEAD"]),
         "{label}"
     );
-    assert_eq!(records(world), 1, "{label}");
+    assert_eq!(
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "HEAD",
+        "{label}: detached"
+    );
     assert_eq!(world.unaccounted(), 0, "{label}");
     let rows = world.apply(true);
     assert_eq!(
         rows[0].0, "previous-workspace-beside-not-revalidated",
         "{label}"
+    );
+}
+
+/// The `BesideStale` row (review B1): a beside landing crashed after its
+/// worktree was added, then the source moved and was captured again. The
+/// rerun finishes the crashed landing forward (the older capture) and then
+/// refuses `GIT_DESTINATION_OCCUPIED`: the beside path holds another
+/// capture. No ref goes in, no record is written, the destination checkout
+/// is untouched, and the item is a typed refusal, never `applied-beside`.
+fn beside_stale(world: &World, label: &str, point: Point, nth: u64) {
+    let dst = world.dst();
+    let before = checkout(&dst);
+    let src = world.base.join("src");
+    let old = git(&src, &["rev-parse", "HEAD"]);
+    crash(world, &format!("{}:{nth}", point.name()));
+    fs::write(src.join("a.txt"), b"alpha, moved after the crash\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "moved"]);
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    world.capture();
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "refused", "{label}: {rows:?}");
+    assert!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("GIT_DESTINATION_OCCUPIED")),
+        "{label}: {rows:?}"
+    );
+    assert_eq!(checkout(&dst), before, "{label}");
+    assert!(beside_refs(&dst).is_empty(), "{label}");
+    assert!(beside_record(world).is_none(), "{label}");
+    assert_eq!(
+        git(&beside_path(world), &["rev-parse", "HEAD"]),
+        old,
+        "{label}"
+    );
+    assert_eq!(
+        world.unaccounted(),
+        0,
+        "{label}: a typed refusal is accounted"
     );
 }
