@@ -86,12 +86,21 @@ pub enum Outcome {
     /// byte-exact, through a recorded transfer session (M2r2 b). Appended
     /// after `Refused`: the variant order is the on-disk format.
     CarriedAsFiles,
+    /// The adopt proof refused the existing planned workspace
+    /// (`GIT_DESTINATION_DIVERGED`) and, under `--adopt --beside SUFFIX`,
+    /// apply landed the captured checkout beside it with every captured ref
+    /// created in (M2 round 2, item c).
+    WorkspaceBeside,
+    /// A re-apply found the beside journal and did not revalidate it.
+    PreviousWorkspaceBesideNotRevalidated,
 }
 
-/// Every non-refusal outcome and its legacy string, in variant order
-/// (`Refused`, variant 10, sits between `IndexRepaired` and
-/// `CarriedAsFiles`).
-pub const NAMED: [(Outcome, &str); 11] = [
+/// Every non-refusal outcome and its legacy string, in variant order.
+///
+/// `Refused`, variant 10, sits between `IndexRepaired` and
+/// `CarriedAsFiles` (11); `WorkspaceBeside` (12) and
+/// `PreviousWorkspaceBesideNotRevalidated` (13) follow (M2r2 c).
+pub const NAMED: [(Outcome, &str); 13] = [
     (Outcome::Captured, "captured"),
     (Outcome::CapturedWithDrift, "captured-with-drift"),
     (
@@ -115,6 +124,11 @@ pub const NAMED: [(Outcome, &str); 11] = [
     ),
     (Outcome::IndexRepaired, "index-repaired"),
     (Outcome::CarriedAsFiles, "carried-as-files"),
+    (Outcome::WorkspaceBeside, "workspace-beside"),
+    (
+        Outcome::PreviousWorkspaceBesideNotRevalidated,
+        "previous-workspace-beside-not-revalidated",
+    ),
 ];
 
 /// The legacy string of a refusal outcome.
@@ -765,10 +779,13 @@ mod tests {
                 vec![u8::try_from(variant).unwrap()]
             );
         }
-        assert_eq!(
-            postcard::to_allocvec(&Outcome::CarriedAsFiles).unwrap(),
-            vec![11]
-        );
+        for (outcome, variant) in [
+            (Outcome::CarriedAsFiles, 11),
+            (Outcome::WorkspaceBeside, 12),
+            (Outcome::PreviousWorkspaceBesideNotRevalidated, 13),
+        ] {
+            assert_eq!(postcard::to_allocvec(&outcome).unwrap(), vec![variant]);
+        }
         let record = OutcomeRecord {
             source: PathBuf::from("/s"),
             outcome: Outcome::Refused(Refusal::new("IO", "estate::apply", Some(2)).unwrap()),

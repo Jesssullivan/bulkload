@@ -1339,6 +1339,12 @@ use reseat::Reseat;
 mod estate_handoff;
 use estate_handoff::EstateHandoff;
 
+// M2r2 A-103: a grown byte-prefix file's extension crashed, and the rerun
+// finishing it.
+#[path = "fault_harness/prefix_extend.rs"]
+mod prefix_extend;
+use prefix_extend::PrefixExtend;
+
 // The `estate.carry.*` point (M2r2 b): `estate-carry-files` crashed after
 // its carry record, and the rerun finishing it.
 #[path = "fault_harness/estate_carried.rs"]
@@ -1417,6 +1423,18 @@ scenarios! {
     receive_after_decide_mid => ReceiveAfterDecide: 30, WITH_REFUSAL;
     receive_after_chunks_mid => ReceiveAfterChunks: 25, WITH_REFUSAL;
     receive_after_end_mid => ReceiveAfterEnd: 25, WITH_REFUSAL;
+    // M2r2 A-103: the rerun that extends grown byte-prefix files, crashed
+    // at each step of an extension and at its adoption's group commit
+    // (module fault_harness/prefix_extend.rs).
+    prefix_before_append_first => ReceivePrefixBeforeAppend: 1, PrefixExtend;
+    prefix_before_append_last => ReceivePrefixBeforeAppend: 3, PrefixExtend;
+    prefix_after_append_first => ReceivePrefixAfterAppend: 1, PrefixExtend;
+    prefix_after_append_last => ReceivePrefixAfterAppend: 3, PrefixExtend;
+    prefix_after_flush_first => ReceivePrefixAfterFlush: 1, PrefixExtend;
+    prefix_after_flush_last => ReceivePrefixAfterFlush: 3, PrefixExtend;
+    prefix_receive_after_chunks => ReceiveAfterChunks: 2, PrefixExtend;
+    prefix_publish_before_commit => PublishDestinationBeforeCommit: 1, PrefixExtend;
+    prefix_publish_after_commit => PublishDestinationAfterCommit: 1, PrefixExtend;
     // WP0(d), #187: the fault is armed in a rerun that supersedes this
     // store's own outputs of changed seats (module docs).
     supersede_after_intent_first => SupersedeAfterIntent: 1, SUPERSEDING;
@@ -1487,6 +1505,11 @@ scenarios! {
     // record is settled.
     estate_apply_exclude_intent => EstateApplyExcludeIntent: 1, EstateAdopt::ExcludeUnion;
     estate_apply_exclude_appended => EstateApplyExcludeAppended: 1, EstateAdopt::ExcludeUnion;
+    // M2 round 2, item c: a beside landing crashed after its worktree is
+    // added (finished forward from its landing intent) and after its refs.
+    estate_apply_beside_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::Beside;
+    estate_apply_beside_refs => EstateApplyBesideRefs: 1, EstateAdopt::Beside;
+    estate_apply_beside_stale_capture => EstateConvergeLinkedAdded: 1, EstateAdopt::BesideStale;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;
