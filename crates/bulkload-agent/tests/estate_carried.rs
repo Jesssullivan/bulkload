@@ -597,46 +597,66 @@ fn every_way_git_would_reach_outside_refuses_attached() {
     type Shape = fn(&Path, &Path, &Path);
     let shapes: [(&str, Shape, &str); 4] = [
         // A `.git` symlink to a gitfile that names an outside repository.
-        ("symlink-gitfile", |_, source, other| {
-            fs::create_dir_all(source.join("nested")).unwrap();
-            fs::write(
-                source.join("nested/gitlink"),
-                format!("gitdir: {}\n", other.display()),
-            )
-            .unwrap();
-            std::os::unix::fs::symlink("gitlink", source.join("nested/.git")).unwrap();
-        }, "nested/.git"),
+        (
+            "symlink-gitfile",
+            |_, source, other| {
+                fs::create_dir_all(source.join("nested")).unwrap();
+                fs::write(
+                    source.join("nested/gitlink"),
+                    format!("gitdir: {}\n", other.display()),
+                )
+                .unwrap();
+                std::os::unix::fs::symlink("gitlink", source.join("nested/.git")).unwrap();
+            },
+            "nested/.git",
+        ),
         // A nested real `.git` directory whose work tree is outside.
-        ("core-worktree", |base, source, _| {
-            let nested = source.join("vendor/lib");
-            fs::create_dir_all(&nested).unwrap();
-            git(&nested, &["init", "--quiet", "--template="]);
-            let elsewhere = base.join("elsewhere");
-            fs::create_dir_all(&elsewhere).unwrap();
-            git(
-                &nested,
-                &["config", "core.worktree", elsewhere.to_str().unwrap()],
-            );
-        }, "vendor/lib/.git"),
+        (
+            "core-worktree",
+            |base, source, _| {
+                let nested = source.join("vendor/lib");
+                fs::create_dir_all(&nested).unwrap();
+                git(&nested, &["init", "--quiet", "--template="]);
+                let elsewhere = base.join("elsewhere");
+                fs::create_dir_all(&elsewhere).unwrap();
+                git(
+                    &nested,
+                    &["config", "core.worktree", elsewhere.to_str().unwrap()],
+                );
+            },
+            "vendor/lib/.git",
+        ),
         // An internal worktree administration whose common dir is outside.
-        ("commondir", |_, source, other| {
-            let admin = source.join(".git/worktrees/wt");
-            fs::create_dir_all(&admin).unwrap();
-            fs::write(admin.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
-            fs::write(admin.join("commondir"), format!("{}\n", other.display())).unwrap();
-            fs::create_dir_all(source.join("wt")).unwrap();
-            fs::write(admin.join("gitdir"), format!("{}\n", source.join("wt/.git").display())).unwrap();
-            fs::write(source.join("wt/.git"), b"gitdir: ../.git/worktrees/wt\n").unwrap();
-        }, "wt/.git"),
+        (
+            "commondir",
+            |_, source, other| {
+                let admin = source.join(".git/worktrees/wt");
+                fs::create_dir_all(&admin).unwrap();
+                fs::write(admin.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+                fs::write(admin.join("commondir"), format!("{}\n", other.display())).unwrap();
+                fs::create_dir_all(source.join("wt")).unwrap();
+                fs::write(
+                    admin.join("gitdir"),
+                    format!("{}\n", source.join("wt/.git").display()),
+                )
+                .unwrap();
+                fs::write(source.join("wt/.git"), b"gitdir: ../.git/worktrees/wt\n").unwrap();
+            },
+            "wt/.git",
+        ),
         // The carried repository borrows objects from outside.
-        ("alternates", |_, source, other| {
-            fs::create_dir_all(source.join(".git/objects/info")).unwrap();
-            fs::write(
-                source.join(".git/objects/info/alternates"),
-                format!("{}\n", other.join("objects").display()),
-            )
-            .unwrap();
-        }, ".git"),
+        (
+            "alternates",
+            |_, source, other| {
+                fs::create_dir_all(source.join(".git/objects/info")).unwrap();
+                fs::write(
+                    source.join(".git/objects/info/alternates"),
+                    format!("{}\n", other.join("objects").display()),
+                )
+                .unwrap();
+            },
+            ".git",
+        ),
     ];
     for (tag, shape, entry) in shapes {
         let world = World::new(tag, |base, source| {
@@ -714,14 +734,30 @@ fn selections_are_validated_before_any_write_and_carries_are_kept() {
     // A typo'd --bind or --item refuses, with nothing written anywhere.
     let bad_bind = world.carry(&["--bind", &format!("{typo}={}", world.path("x").display())]);
     assert!(!bad_bind.ok);
-    assert!(bad_bind.stdout.contains("refused=bind reason=unplanned"), "{}", bad_bind.stdout);
+    assert!(
+        bad_bind.stdout.contains("refused=bind reason=unplanned"),
+        "{}",
+        bad_bind.stdout
+    );
     let bad_item = world.carry(&["--item", &typo]);
     assert!(!bad_item.ok);
-    assert!(bad_item.stdout.contains("refused=not-eligible reason=unplanned"), "{}", bad_item.stdout);
+    assert!(
+        bad_item
+            .stdout
+            .contains("refused=not-eligible reason=unplanned"),
+        "{}",
+        bad_item.stdout
+    );
     // --bind-only with no bind for the eligible item refuses too.
     let bind_only = world.carry(&["--bind-only"]);
     assert!(!bind_only.ok);
-    assert!(bind_only.stdout.contains("refused=bind-only reason=bind-missing"), "{}", bind_only.stdout);
+    assert!(
+        bind_only
+            .stdout
+            .contains("refused=bind-only reason=bind-missing"),
+        "{}",
+        bind_only.stdout
+    );
     assert!(!world.workspace.exists());
     assert!(!world.path("carry").exists());
     // A carry, then a rerun without --recarry: kept, no session run.
@@ -731,7 +767,11 @@ fn selections_are_validated_before_any_write_and_carries_are_kept() {
     let kept = world.carry(&[]);
     assert!(kept.ok, "{}", kept.stdout);
     assert!(kept.stdout.contains(" kept=proved"), "{}", kept.stdout);
-    assert_eq!(stamps(&world.path("carry")), state, "a kept carry ran a session");
+    assert_eq!(
+        stamps(&world.path("carry")),
+        state,
+        "a kept carry ran a session"
+    );
     assert_eq!(stamps(&world.workspace), landed);
 }
 
@@ -739,7 +779,15 @@ fn selections_are_validated_before_any_write_and_carries_are_kept() {
 fn a_failed_recarry_writes_capture_absent_back_for_it_and_its_riders() {
     let world = World::new("revert", |_, _| {});
     let live = world.path("dst/live");
-    assert!(agent(&os(&[&"estate-add", &world.path("plan"), &world.source, &live])).ok);
+    assert!(
+        agent(&os(&[
+            &"estate-add",
+            &world.path("plan"),
+            &world.source,
+            &live
+        ]))
+        .ok
+    );
     let _ = agent(&os(&[
         &"estate-capture",
         &world.path("plan"),
@@ -751,11 +799,23 @@ fn a_failed_recarry_writes_capture_absent_back_for_it_and_its_riders() {
     assert!(world.carry(&[]).ok);
     assert!(world.closure().contains("\"carried\":2,"));
     // The destination now differs; a re-carry cannot carry it.
-    fs::write(world.workspace.join("a.txt"), b"edited at the destination\n").unwrap();
+    fs::write(
+        world.workspace.join("a.txt"),
+        b"edited at the destination\n",
+    )
+    .unwrap();
     let ran = world.carry(&["--recarry"]);
     assert!(!ran.ok, "{}", ran.stdout);
-    assert!(ran.stdout.contains(" carried=incomplete "), "{}", ran.stdout);
+    assert!(
+        ran.stdout.contains(" carried=incomplete "),
+        "{}",
+        ran.stdout
+    );
     let report = world.closure();
     assert!(report.contains("\"carried\":0,"), "{report}");
-    assert_eq!(report.matches("\"refusal\":\"CAPTURE_ABSENT\"").count(), 2, "{report}");
+    assert_eq!(
+        report.matches("\"refusal\":\"CAPTURE_ABSENT\"").count(),
+        2,
+        "{report}"
+    );
 }

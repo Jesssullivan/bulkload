@@ -82,8 +82,8 @@ use super::{exclusive, id, private_directory, read, write, Item, Plan};
 use crate::outcome::{Outcome, OutcomeRecord};
 use crate::refuse::RefuseAt as _;
 use crate::transfer_outcome::{self, Session, TransferRecord};
-use std::collections::{BTreeMap, BTreeSet};
 use crate::{BulkloadRefusal, Result};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The outcome name a carried item's record holds.
 pub const CARRIED_OUTCOME: &str = "carried-as-files";
@@ -360,7 +360,10 @@ fn prove_record(
             .destination
             .join(std::ffi::OsStr::from_bytes(&git.rel_dir));
         // A destination gone since resolves to nothing: nothing attaches.
-        if matches!(resolve_git(&record.destination, &dir), Ok(Resolved::Outside)) {
+        if matches!(
+            resolve_git(&record.destination, &dir),
+            Ok(Resolved::Outside)
+        ) {
             return Err("carried-pointer-attached");
         }
     }
@@ -387,9 +390,8 @@ fn selection_errors(
     let mut errors = Vec::new();
     let why = |identity: &String| -> Option<&'static str> {
         match (planned.get(identity), eligible.get(identity)) {
-            (None, _) => Some("unplanned"),
+            (None, _) | (_, None) => Some("unplanned"),
             (_, Some(Eligibility::Skip(why))) => Some(why),
-            (_, None) => Some("unplanned"),
             _ => None,
         }
     };
@@ -422,7 +424,9 @@ fn selection_errors(
                 && !matches!(eligible.get(identity), Some(Eligibility::Skip(_)) | None)
                 && !options.bind.contains_key(identity)
             {
-                errors.push(format!("item={identity} refused=bind-only reason=bind-missing"));
+                errors.push(format!(
+                    "item={identity} refused=bind-only reason=bind-missing"
+                ));
             }
         }
     }
@@ -464,7 +468,10 @@ pub fn carry_files(
         if eligible.contains_key(&identity) {
             continue;
         }
-        eligible.insert(identity.clone(), eligibility(item, &identity, corpus, state)?);
+        eligible.insert(
+            identity.clone(),
+            eligibility(item, &identity, corpus, state)?,
+        );
         items.push((item, identity));
     }
     let errors = selection_errors(&contents, &eligible, options)?;
@@ -492,7 +499,11 @@ pub fn carry_files(
             continue;
         }
         let prefix = format!("item={identity} source={:?}", item.source);
-        let carried_now = match eligible.get(identity).copied().unwrap_or(Eligibility::Skip("unplanned")) {
+        let carried_now = match eligible
+            .get(identity)
+            .copied()
+            .unwrap_or(Eligibility::Skip("unplanned"))
+        {
             Eligibility::Skip(why) => {
                 line(&format!("{prefix} skipped={why}"))?;
                 continue;
@@ -523,7 +534,10 @@ pub fn carry_files(
             }
             continue;
         }
-        let suffix = options.beside.as_ref().map(|suffix| suffix.as_bytes().to_vec());
+        let suffix = options
+            .beside
+            .as_ref()
+            .map(|suffix| suffix.as_bytes().to_vec());
         let mut name = workspace.as_os_str().to_owned();
         if let Some(suffix) = &options.beside {
             name.push(suffix);
@@ -605,7 +619,9 @@ pub fn carry_files(
         if matches!(state_now, Eligibility::Carried) && !riding && !options.recarry {
             match prove(&[state.to_path_buf()], identity, source_label, item) {
                 Some(Ok(_)) if via_proves(&contents, identity, state, source_label) => {
-                    line(&format!("{prefix} refs-only outcome={CARRIED_OUTCOME} kept=proved"))?;
+                    line(&format!(
+                        "{prefix} refs-only outcome={CARRIED_OUTCOME} kept=proved"
+                    ))?;
                     continue;
                 }
                 _ => {}

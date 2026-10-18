@@ -2709,8 +2709,21 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             item: identity,
         });
     }
-    // M2r2 b: a refs-only item's carry rides on a planned workspace item of
-    // the same source whose own outcome is carried-as-files and proves.
+    check_riders(&mut ledger);
+    ledger.foreign_records = records
+        .into_keys()
+        .filter(|item| !planned.contains(item))
+        .collect();
+    ledger.unmatched_journals = journals
+        .into_iter()
+        .filter(|name| !matched.contains(name))
+        .collect();
+    Ok(ledger)
+}
+
+// M2r2 b: a refs-only item's carry rides on a planned workspace item of the
+// same source whose own outcome is carried-as-files and proves.
+fn check_riders(ledger: &mut Ledger) {
     let riding: Vec<(usize, String)> = ledger
         .entries
         .iter()
@@ -2744,15 +2757,6 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             entry.carried = Some(Err("carried-via-unproved"));
         }
     }
-    ledger.foreign_records = records
-        .into_keys()
-        .filter(|item| !planned.contains(item))
-        .collect();
-    ledger.unmatched_journals = journals
-        .into_iter()
-        .filter(|name| !matched.contains(name))
-        .collect();
-    Ok(ledger)
 }
 
 /// Where an item's first landing records the parents it made (M2 finding 1).
@@ -3049,13 +3053,10 @@ pub fn apply_reporting(
         // TIN-6569: a repository whose item did more than a journal no-op
         // gets the H step after the last level; a refused item's own
         // workspace never does (design 6.4: the converge left it as it was).
-        if done
-            .as_ref()
-            .map_or(true, |done| {
-                // A kept carry (M2r2 b) is a no-op, like a previous journal.
-                !done.outcome.starts_with("previous-") && done.outcome != carried::CARRIED_OUTCOME
-            })
-        {
+        if done.as_ref().map_or(true, |done| {
+            // A kept carry (M2r2 b) is a no-op, like a previous journal.
+            !done.outcome.starts_with("previous-") && done.outcome != carried::CARRIED_OUTCOME
+        }) {
             let mut touched = touched
                 .lock()
                 .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
