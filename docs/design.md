@@ -2503,6 +2503,52 @@ starts.
   reported as the destination's. Any other I/O error a store meets is `IO`
   with its errno (`EIO` where the errno cannot be read).
 
+## Re-pointable captures: `estate-retarget` (M2 item 5, 2026-10-16)
+
+An item's identity is the blake3 of `(source, repository, workspace)`, so
+a changed destination made a new item whose capture record
+(`{item}.capture`) did not exist, and the next capture exported the whole
+repository again. Nothing in a capture depends on the destination: its key
+is the source's (`capture_key_parts`), its bundle is named in the record as
+an opaque file name, and every sidecar (`.base`, `.prior`, `.drift`,
+`.nested`, `.parts`, `.reuse`) hangs off that bundle name; plan-base groups
+are keyed by the source's common directory. `estate-retarget PLAN CORPUS
+--map OLD=NEW [--map ...]` therefore re-points without a source read:
+
+1. under the plan lock, each item's repository and workspace take the
+   longest `OLD` that is a component-wise prefix (`NEW` replaces it); the
+   source never changes;
+2. the new plan is checked as `estate-add-batch` checks one (no two
+   workspace targets overlap, R-N114; two items that become one refuse
+   `GIT_DESTINATION_OCCUPIED`), before anything is written;
+3. each moved item's record is written under its new identity with the
+   old record's bytes (temporary, fsync, rename, directory fsync); one
+   already there with the same bytes is kept, one with other bytes (that
+   identity's own capture, e.g. a plan re-pointed back after a re-capture)
+   refuses the whole retarget `RECEIPT_BINDING_INVALID`: capture again
+   first, or set that record aside by hand;
+4. the plan as it was is kept as `PLAN.before-retarget-<digest>`, then the
+   new plan replaces it.
+
+It prints one line per moved item (`item= was= ... capture=rekeyed|present|
+absent`). Refused before anything is read: a CORPUS that is not a
+directory, two maps with the same `OLD`, and any `NEW` at or under any
+`OLD` (a rerun would move the items again). A crash before step 4 leaves
+new records nothing reads; the rerun finishes, and a rerun after it
+changes nothing. The plan lock serialises plan writers only: not to be run
+beside a capture or apply of the plan. On a plan already applied, the
+moved items are new: closure counts them unaccounted until applied at the
+new paths (a new landing, or an `--adopt` re-key of a tree moved there by
+hand), and the old landing stays; like any plan edit, it changes the
+plan's digest, so a dispositions ledger or transfer manifest bound to it
+refuses `RECEIPT_BINDING_INVALID`. Nothing is deleted.
+The next `estate-capture` of the new plan is a reuse hit
+(`capture-reused-after-census`, 0 source bytes) and the apply lands at the
+new paths. Not re-keyed: apply STATE (journals and outcome records belong
+to the old destination; a tree moved there by hand is re-keyed by
+`estate-apply --adopt`, A11b) and the capture's private STATE (per-export
+attempt directories; the next capture writes the new outcome records).
+
 ## A symlinked live path into a side root: `--side-root` (M2r2 item e, 2026-10-17)
 
 The 10-16 in-place move met live checkout paths that were symlinks into a
