@@ -1,5 +1,7 @@
 # 2026-10-06 s2-proof-closure (completion-bar audit lane 7)
 
+> **Label (2026-10-17, R-N13; body unchanged).** Context (R-C843/R-C844, Linear TIN-4543 `ace8649c`): the whitepaper and formal model this lane served were deleted 2026-10-17; the completion bar is now SPEC R7 resume plus a hash manifest. The property tests this note describes stay as runnable tests.
+
 Rulings: OI-1003-Q5, OI-1003-Q9, OI-1003-Q16, OI-1003-Q36, OI-1003-Q60,
 R-N13. Branch `feat/s2-proof-closure-20261006`, worktree
 `bulkload.worktrees/s2-proof-closure-20261006`. Main `600c765` is merged in. PR #197 is open. Its CI failed as root on `b385f08`; the
