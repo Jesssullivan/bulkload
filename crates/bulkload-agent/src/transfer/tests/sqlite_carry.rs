@@ -2615,3 +2615,49 @@ fn the_delta_lever_finds_a_snapshot_seats_row_under_its_snapshot_key() {
     assert_eq!(published(&sqlite.destination().join("kept.db")).len(), 5);
     assert_eq!(published(&sqlite.destination().join("fresh.db")).len(), 7);
 }
+
+/// M2r2 (the in-place run's cmux refusal): a branch named `*-journal`,
+/// `*-wal` or `*-shm` has a loose ref and a reflog of that name beside the
+/// ref of its base name. Inside Git's ref storage those are carried as the
+/// files they are, in both modes; a sidecar-named file anywhere else is
+/// still refused by name (`--sqlite=refuse`) or as a sidecar
+/// (`--sqlite=snapshot`), and a real store's sidecars are untouched by the
+/// rule.
+#[test]
+fn refs_named_like_sidecars_are_carried_in_git_ref_storage() {
+    let _serial = serial();
+    for mode in [SqliteMode::Refuse, SqliteMode::Snapshot] {
+        let sqlite = Sqlite::new();
+        let source = sqlite.source();
+        let files: [(&str, &[u8]); 9] = [
+            (".git/logs/refs/remotes/upstream/audit", b"0 1 a\n"),
+            (".git/logs/refs/remotes/upstream/audit-journal", b"0 1 b\n"),
+            (".git/refs/heads/topic", b"1111\n"),
+            (".git/refs/heads/topic-wal", b"2222\n"),
+            (".git/refs/heads/topic-shm", b"3333\n"),
+            ("mirror.git/refs/heads/x", b"4444\n"),
+            ("mirror.git/refs/heads/x-journal", b"5555\n"),
+            ("notes", b"plain\n"),
+            ("notes-journal", b"not in ref storage\n"),
+        ];
+        for (path, bytes) in files {
+            let path = source.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let stats = sqlite.run(mode).unwrap();
+        assert_eq!(
+            stats.refusals,
+            [(b"notes-journal".to_vec(), "SQLITE_STATE_CHANGED".to_owned())],
+            "{mode:?}"
+        );
+        for (path, bytes) in files.iter().filter(|(path, _)| *path != "notes-journal") {
+            assert_eq!(
+                std::fs::read(sqlite.destination().join(path)).unwrap(),
+                *bytes,
+                "{mode:?} {path}"
+            );
+        }
+        assert!(!sqlite.destination().join("notes-journal").exists());
+    }
+}

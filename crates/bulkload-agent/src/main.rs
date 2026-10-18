@@ -367,7 +367,9 @@ BOUNDARIES:
     DESTINATION_EXCHANGE_UNSUPPORTED before it is staged. With
     --sqlite=refuse (the default) they refuse live SQLite files, sniffing
     each once (source_sniff_bytes on the counters line) and remembering the
-    refusal, and every -wal, -shm and -journal by name.
+    refusal, and every -wal, -shm and -journal by name (outside Git's ref
+    storage, where such a name is a ref or a reflog: below a `.git` or
+    `*.git` directory's refs/ or logs/, or a linked worktree's, M2r2).
     --sqlite=snapshot (#218; copy and pull, carried to serve in its Open):
     a database is carried as a backup-API snapshot the source takes into its
     private state (SOURCE_STATE/sqlite-snapshots, at most 4 GiB of slots
@@ -378,7 +380,7 @@ BOUNDARIES:
     magic beside a -wal that holds frames (an encrypted store) is refused
     SQLITE_STATE_CHANGED, never carried raw. An unchanged store is reused with nothing opened: its key is its
     row and its -wal's identity. A -wal, -shm or -journal beside a database
-    is never carried: it is covered when its database was carried as a
+    (outside Git's ref storage) is never carried: it is covered when its database was carried as a
     snapshot, and refused SQLITE_STATE_CHANGED otherwise. A changed store
     supersedes its own older snapshot output through the same exchange
     (OI-1003-Q146) only when no -wal, -journal or -shm sits beside the

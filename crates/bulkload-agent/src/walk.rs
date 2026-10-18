@@ -288,6 +288,35 @@ pub enum WalkItem {
 /// The names `SQLite` gives a database's sidecars (#218).
 pub const SQLITE_SIDECAR_SUFFIXES: [&[u8]; 3] = [b"-wal", b"-shm", b"-journal"];
 
+/// Whether `rel_path` lies in a Git administration's ref storage.
+///
+/// There a name ending in `-wal`, `-shm` or `-journal` is a ref, never a
+/// `SQLite` sidecar (M2r2: a reflog of a branch named `fix-journal` was
+/// refused `SQLITE_STATE_CHANGED`).
+///
+/// That is below `<admin>/refs/` or `<admin>/logs/`, or a linked worktree's
+/// `<admin>/worktrees/<name>/refs/` or `logs/`, where `<admin>` is a
+/// component named `.git` or ending in `.git` (a bare repository). Such a
+/// path is never reported as a sidecar, never refused by name, and its file
+/// is never a database row with a `-wal` beside it. `SQLite` keeps no files
+/// there; elsewhere the sidecar rules are unchanged.
+#[must_use]
+pub fn in_git_ref_storage(rel_path: &[u8]) -> bool {
+    let parts: Vec<&[u8]> = rel_path.split(|byte| *byte == b'/').collect();
+    let storage =
+        |part: Option<&&[u8]>| matches!(part, Some(&name) if name == b"refs" || name == b"logs");
+    parts.iter().enumerate().any(|(index, part)| {
+        let admin = *part == b".git" || (part.len() > b".git".len() && part.ends_with(b".git"));
+        let rest = parts.get(index + 1..).unwrap_or_default();
+        // At least one component below the storage directory: the file.
+        admin
+            && ((storage(rest.first()) && rest.len() >= 2)
+                || (matches!(rest.first(), Some(&name) if name == b"worktrees")
+                    && storage(rest.get(2))
+                    && rest.len() >= 4))
+    })
+}
+
 /// One directory being listed: its descriptor, the length of its relative
 /// path in the walker's shared path buffer, and the names in it still to
 /// visit.
@@ -474,8 +503,9 @@ impl<'root> Walker<'root> {
         };
         let mut wal = leaf.to_vec();
         wal.extend_from_slice(b"-wal");
+        let in_refs = in_git_ref_storage(&rel_path);
         let row = row_from_stat(rel_path, stat);
-        if level.holds(&wal) {
+        if !in_refs && level.holds(&wal) {
             if let Some(found) = regular(&wal) {
                 return WalkItem::RowWithWal(row, sidecar_id(&found));
             }
@@ -486,6 +516,9 @@ impl<'root> Walker<'root> {
     /// `leaf` as a `-wal`, `-shm` or `-journal` of a regular base listed
     /// beside it (#218), or `None`.
     fn sidecar_of(&self, parent: BorrowedFd<'_>, leaf: &[u8], rel_path: &[u8]) -> Option<WalkItem> {
+        if in_git_ref_storage(rel_path) {
+            return None;
+        }
         let level = self.stack.last()?;
         SQLITE_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
             let base = leaf.strip_suffix(*suffix)?;
@@ -958,6 +991,43 @@ mod tests {
 
     use super::{walk, HashPolicy, WalkItem, WalkOptions, Walker};
     use crate::freshness::MemoryCache;
+
+    // M2r2: names ending in a sidecar suffix inside Git's ref storage are
+    // refs and reflogs; everywhere else the sidecar rules are unchanged.
+    #[test]
+    fn git_ref_storage_is_told_apart() {
+        for inside in [
+            &b".git/logs/refs/remotes/upstream/fix-journal"[..],
+            b".git/refs/heads/topic-wal",
+            b".git/logs/HEAD",
+            b"repo/.git/refs/tags/v1-shm",
+            b"mirror.git/refs/heads/a-journal",
+            b".git/worktrees/wt/logs/HEAD-journal",
+            b".git/worktrees/wt/refs/bisect/x-wal",
+        ] {
+            assert!(
+                super::in_git_ref_storage(inside),
+                "{}",
+                inside.escape_ascii()
+            );
+        }
+        for outside in [
+            &b"store.db-journal"[..],
+            b".git/refs",
+            b".git/annex/keysdb/db-wal",
+            b".git/worktrees/wt",
+            b".git/worktrees/wt/refs",
+            b"refs/heads/a-journal",
+            b"data/.gitx/refs/a-journal",
+            b".git",
+        ] {
+            assert!(
+                !super::in_git_ref_storage(outside),
+                "{}",
+                outside.escape_ascii()
+            );
+        }
+    }
 
     struct Corpus {
         root: PathBuf,

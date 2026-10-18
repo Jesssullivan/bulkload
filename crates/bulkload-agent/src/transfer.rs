@@ -2992,9 +2992,12 @@ fn capture_file<'w>(
     if row.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
+    // Every -wal, -shm and -journal is refused by name, except a ref or
+    // reflog in Git's ref storage (M2r2).
     if crate::walk::SQLITE_SIDECAR_SUFFIXES
         .iter()
         .any(|suffix| row.rel_path.ends_with(suffix))
+        && !crate::walk::in_git_ref_storage(&row.rel_path)
     {
         return Err(BulkloadRefusal::SqliteStateChanged);
     }

@@ -1571,7 +1571,16 @@ miss (#87).
     `SqliteSidecar`, and its outcome is its base's, resolved when the session
     ends: covered when the base was published from a snapshot or reused as
     one, refused by name (`SQLITE_STATE_CHANGED`) otherwise. A sidecar with
-    no base is offered and refused by name, as in v5. A sidecar listed and
+    no base is offered and refused by name, as in v5. *Git's ref storage is
+    exempt* (M2r2, 2026-10-17): below a `.git` or `*.git` directory's
+    `refs/` or `logs/`, or a linked worktree's `worktrees/<name>/refs/` or
+    `logs/`, a name ending in `-wal`, `-shm` or `-journal` is a loose ref or
+    a reflog of a branch so named, never a sidecar. It is offered and
+    carried as the file it is in both modes, and its base-named neighbour
+    is never offered as a database beside a `-wal`. Before this, the
+    in-place run's cmux pull refused three such reflogs
+    `SQLITE_STATE_CHANGED`. SQLite keeps no files there; outside that
+    namespace the rules are unchanged. A sidecar listed and
     gone before its stat (a live rollback-mode store's `-journal`) is still
     its base's sidecar, not an `IO` refusal. A base without the
     database magic (an encrypted store) offered beside a `-wal` that holds
