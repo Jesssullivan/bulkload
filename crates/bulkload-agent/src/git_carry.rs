@@ -2378,7 +2378,8 @@ struct SharedBase {
 /// What a scratch repository takes from a shared base import: its object
 /// store, as one more alternate (whose refs Git also reads as negative
 /// tips, `--alternate-refs`, so a borrower's connectivity checks stop at
-/// the base), and, as one create transaction (`update-ref --stdin -z`),
+/// the base), and, created through the private-repository ref writer
+/// (`native_refs::transact_private`),
 /// the refs the import made outside its own provenance instance (the
 /// `union/v1` carry refs, which a borrower's import compares its own
 /// against). The instance's refs are not copied: every scratch read is
@@ -2386,7 +2387,7 @@ struct SharedBase {
 #[derive(Debug, Clone)]
 struct BaseSeed {
     objects: PathBuf,
-    refs: Vec<u8>,
+    refs: Vec<(String, String)>,
 }
 
 impl StagedBundle {

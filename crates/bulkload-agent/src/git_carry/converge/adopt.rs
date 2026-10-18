@@ -113,12 +113,20 @@ impl Scratch {
         )?;
         match (base, &seed) {
             (Some(_), Some(seed)) => {
-                if !seed.refs.is_empty() {
-                    super::super::input(
-                        git(&repo).args(["update-ref", "--no-deref", "--stdin", "-z"]),
-                        &seed.refs,
-                    )?;
-                }
+                // The registered private-repository writer (the scratch is
+                // this process's own); usually nothing to create.
+                let ops: Vec<super::super::landed::RefOp> = seed
+                    .refs
+                    .iter()
+                    .map(|(name, value)| super::super::landed::RefOp {
+                        name: name.clone(),
+                        old: None,
+                        new: Some(value.clone()),
+                        before: None,
+                        after: None,
+                    })
+                    .collect();
+                native_refs::transact_private(&repo, &ops)?;
                 crate::counters::bump(crate::counters::Counter::GitScratchBaseBorrowed);
             }
             (Some(base), None) => {
@@ -293,7 +301,7 @@ fn borrowed_base(
     let lendable = super::super::shallow::custody_oid(&listed).is_none()
         && alternates_line(base.private_dir().as_os_str().as_bytes());
     let seed = if lendable {
-        Some(import_shared(base, objects, format, source)?)
+        import_shared(base, objects, format, source)?
     } else {
         None
     };
@@ -310,13 +318,15 @@ fn borrowed_base(
 // The shared import itself: a scratch repository in the base's private
 // directory, built as an unshared scratch builds its own (same format,
 // same lender, the same `import_verified`), whose objects and non-instance
-// refs a borrower then takes. A refusal removes it.
+// refs a borrower then takes. A refusal removes it. `None` (the import
+// kept, unlent) for a ref name that is not UTF-8, which the borrower's
+// ref writer cannot name: each scratch then imports the base itself.
 fn import_shared(
     base: &super::super::StagedBundle,
     objects: Option<&Path>,
     format: &'static str,
     source: &str,
-) -> Result<super::super::BaseSeed> {
+) -> Result<Option<super::super::BaseSeed>> {
     const SITE: &str = "git_carry::converge::adopt::import_shared";
     let dir = fresh_dir(base.private_dir(), "shared-base")?;
     let made = (|| {
@@ -351,16 +361,16 @@ fn import_shared(
             if name.contains(&0) {
                 return Err(BulkloadRefusal::GitInventoryMalformed);
             }
-            refs.extend_from_slice(b"create ");
-            refs.extend_from_slice(name);
-            refs.push(0);
-            refs.extend_from_slice(value);
-            refs.push(0);
+            let (Ok(name), Ok(value)) = (std::str::from_utf8(name), std::str::from_utf8(value))
+            else {
+                return Ok(None);
+            };
+            refs.push((name.to_owned(), value.to_owned()));
         }
-        Ok(super::super::BaseSeed {
+        Ok(Some(super::super::BaseSeed {
             objects: fs::canonicalize(repo.join(".git/objects")).refuse_at(SITE)?,
             refs,
-        })
+        }))
     })();
     if made.is_err() {
         let _ = fs::remove_dir_all(&dir);
