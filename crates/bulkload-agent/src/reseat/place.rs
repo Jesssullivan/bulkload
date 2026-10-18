@@ -67,7 +67,7 @@ use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _, Per
 use std::path::{Component, Path, PathBuf};
 
 use super::json::FieldScanner;
-use super::ledger::{Identity, Intent, Ledger, Placement, Rebind, State};
+use super::ledger::{Identity, Intent, Ledger, Placement, Rebind, Regular, RegularState, State};
 use super::Kind;
 use crate::counters::{self, Counter};
 use crate::refuse::RefuseAt as _;
@@ -125,6 +125,9 @@ pub enum Outcome {
     /// under an old landing root, re-bound to the new one
     /// (`--rebind-landing`): nothing written.
     Rebound,
+    /// The destination's symlink into a `--replace-archived-dest` root,
+    /// replaced by the differing landed file (A-106).
+    ReplacedArchived,
 }
 
 impl Outcome {
@@ -151,6 +154,7 @@ impl Outcome {
             Self::Raced => "extend-raced",
             Self::Held => "held",
             Self::Rebound => "rebound",
+            Self::ReplacedArchived => "replaced-archived",
         }
     }
 
@@ -165,6 +169,7 @@ impl Outcome {
                 | Self::Superseded
                 | Self::Unchanged
                 | Self::Rebound
+                | Self::ReplacedArchived
         )
     }
 
@@ -178,7 +183,8 @@ impl Outcome {
             | Self::Superseded
             | Self::Unchanged
             | Self::Held
-            | Self::Rebound => None,
+            | Self::Rebound
+            | Self::ReplacedArchived => None,
             Self::Diverged => Some(BulkloadRefusal::ReseatDestDiverged),
             Self::DestAhead | Self::Continued { .. } | Self::Removed => {
                 Some(BulkloadRefusal::ReseatDestContinued)
@@ -318,6 +324,11 @@ pub struct Placer<'a> {
     /// row naming a landed file under OLD is re-bound to the same file
     /// under NEW when the bytes it placed are proved NEW's.
     pub rebind: &'a [(PathBuf, PathBuf)],
+    /// `--replace-archived-dest` roots (canonical): a transcript, sidecar
+    /// or rollout at the destination that is a symlink resolving to a
+    /// regular file under one is replaced by a differing landed file
+    /// (A-106).
+    pub archived: &'a [PathBuf],
 }
 
 impl<'a> Placer<'a> {
@@ -328,7 +339,37 @@ impl<'a> Placer<'a> {
             ledger,
             root,
             rebind: &[],
+            archived: &[],
         }
+    }
+
+    /// The same placer, replacing archive links under `archived`.
+    #[must_use]
+    pub const fn with_archived(self, archived: &'a [PathBuf]) -> Self {
+        Self { archived, ..self }
+    }
+
+    /// The destination's link at `dest` that a differing landed file of
+    /// `kind` replaces: a symlink (never regularized, replaced or undone
+    /// by this ledger) whose fully resolved target is a regular file under
+    /// an archive root. Every hop is followed by the kernel; only the
+    /// final target's real path is judged, against canonical roots, so no
+    /// `..` or intermediate link can place it under a root it is not
+    /// under. `(link text, resolved target, link metadata)`.
+    fn archived_link(
+        &self,
+        dest: &Path,
+        kind: Kind,
+    ) -> Result<Option<(PathBuf, PathBuf, std::fs::Metadata)>> {
+        if self.archived.is_empty()
+            || !matches!(kind, Kind::Transcript | Kind::Sidecar | Kind::Rollout)
+        {
+            return Ok(None);
+        }
+        if self.ledger.regular(dest)?.is_some() {
+            return Ok(None);
+        }
+        archive_link(dest, self.archived)
     }
 
     /// The same placer, re-binding rows under the `rebind` pairs.
@@ -535,6 +576,164 @@ fn dest_prefix(path: &Path, length: u64, identity: Identity) -> Result<Option<[u
     let after = Identity::of(&file.metadata().refuse_at("reseat::place::dest_prefix")?);
     Ok((after == identity).then(|| *hasher.finalize().as_bytes()))
 }
+
+/// The symlink at `dest` when its fully resolved target is a regular file
+/// under one of the canonical `roots`.
+///
+/// Returns `(link text, resolved target, link metadata)`. Every hop is
+/// followed by the kernel; only the final target's real path is judged,
+/// so no `..` or intermediate link can place it under a root it is not
+/// under. A link whose own directory resolves under a root is never one:
+/// the exchange would happen inside the archive (review A1).
+///
+/// # Errors
+/// `lstat` refusals other than absence.
+pub fn archive_link(
+    dest: &Path,
+    roots: &[PathBuf],
+) -> Result<Option<(PathBuf, PathBuf, std::fs::Metadata)>> {
+    if roots.is_empty() {
+        return Ok(None);
+    }
+    let Some(meta) = lstat(dest)? else {
+        return Ok(None);
+    };
+    if !meta.is_symlink() {
+        return Ok(None);
+    }
+    let Ok(text) = std::fs::read_link(dest) else {
+        return Ok(None);
+    };
+    let Ok(resolved) = std::fs::canonicalize(dest) else {
+        return Ok(None);
+    };
+    if !lstat(&resolved)?.is_some_and(|target| target.is_file())
+        || !roots.iter().any(|root| resolved.starts_with(root))
+    {
+        return Ok(None);
+    }
+    let Some(parent) = dest
+        .parent()
+        .and_then(|parent| std::fs::canonicalize(parent).ok())
+    else {
+        return Ok(None);
+    };
+    if roots.iter().any(|root| parent.starts_with(root)) {
+        return Ok(None);
+    }
+    Ok(Some((text, resolved, meta)))
+}
+
+/// Whether a process this user can see holds `path` open.
+///
+/// Every `/proc/<pid>/fd/*` link is read (observation only, no process is
+/// signalled, R-N11); a live writer would keep appending to the archive
+/// target after the swap (review A2). `false` where `/proc` is absent.
+#[must_use]
+pub fn open_by_a_process(path: &Path) -> bool {
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    for process in processes.flatten() {
+        let name = process.file_name();
+        if !name.as_bytes().iter().all(u8::is_ascii_digit) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(process.path().join("fd")) else {
+            continue;
+        };
+        if fds
+            .flatten()
+            .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|open| open == path))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// `(identity, BLAKE3, BLAKE3 of the first bytes when longer)`.
+type TargetDigests = (Identity, [u8; 32], Option<[u8; 32]>);
+
+/// The archive target's identity and BLAKE3, and the BLAKE3 of its first
+/// `prefix` bytes when it is longer (whether the landing is a prefix of
+/// it); `None` when it is not a regular file or changed while read.
+fn target_digests(path: &Path, prefix: u64) -> Result<Option<TargetDigests>> {
+    let Ok(mut file) = crate::hash::open_nofollow(path) else {
+        return Ok(None);
+    };
+    let meta = file.metadata().refuse_at("reseat::place::target")?;
+    if !meta.is_file() {
+        return Ok(None);
+    }
+    let identity = Identity::of(&meta);
+    let mut hasher = blake3::Hasher::new();
+    let mut at_prefix = None;
+    let mut buffer = vec![0_u8; CHUNK];
+    let mut total = 0_u64;
+    loop {
+        if total == prefix && at_prefix.is_none() && identity.size > prefix {
+            at_prefix = Some(*hasher.finalize().as_bytes());
+        }
+        let want = if total < prefix && identity.size > prefix {
+            usize::try_from((prefix - total).min(CHUNK as u64)).unwrap_or(CHUNK)
+        } else {
+            CHUNK
+        };
+        let read = file
+            .read(buffer.get_mut(..want).unwrap_or_default())
+            .refuse_at("reseat::place::target_read")?;
+        if read == 0 {
+            break;
+        }
+        counters::add_len(Counter::ReseatDestRead, read);
+        counters::update(
+            &mut hasher,
+            Counter::HashOther,
+            buffer.get(..read).unwrap_or_default(),
+        );
+        total = total.saturating_add(read as u64);
+    }
+    let after = Identity::of(&file.metadata().refuse_at("reseat::place::target")?);
+    if after != identity || total != identity.size {
+        return Ok(None);
+    }
+    Ok(Some((identity, *hasher.finalize().as_bytes(), at_prefix)))
+}
+
+/// The `placed` value of an `occupied` archive-link row: the landing is
+/// the target (equal), or a strict prefix of it (the archive ahead).
+const LINK_EQUAL: u64 = 0;
+const LINK_AHEAD: u64 = 1;
+
+/// Run `hook` after a replacement's exchange (unit tests only: a live
+/// writer between the swap and its checks).
+#[cfg(test)]
+type ReplaceHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+std::thread_local! {
+    static REPLACE_HOOK: std::cell::RefCell<Option<ReplaceHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Set (or clear) the after-exchange hook on this thread.
+#[cfg(test)]
+pub fn set_replace_hook(hook: Option<ReplaceHook>) {
+    REPLACE_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(test)]
+fn replace_hook(dest: &Path) {
+    REPLACE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().as_mut() {
+            hook(dest);
+        }
+    });
+}
+
+#[cfg(not(test))]
+const fn replace_hook(_dest: &Path) {}
 
 /// The landed file's bytes, from offset 0 to its identity's size, through
 /// `pread` (so the landing is never read past what it was when opened).
@@ -985,6 +1184,22 @@ impl Placer<'_> {
             // Unreadable as it was last pass: not read again.
             return done(Outcome::Unreadable);
         }
+        let archived = self.archived_link(&dest, kind)?;
+        if archived.is_some()
+            && row.as_ref().is_some_and(|row| {
+                row.state == State::Occupied
+                    && !(same_stream(&row.landing, landing)
+                        && row.landed == landed_now
+                        && row.digest.is_some())
+            })
+        {
+            // The destination's archive link, kept (`occupied`) by a pass
+            // that did not replace (another landing, or without the
+            // flag): nothing is placed there, so it is decided again
+            // (A-106). A row that proved the landing equal to the archive
+            // target (its digest set) stands while both are unchanged.
+            row = None;
+        }
         if let Some(other) = row
             .clone()
             .filter(|row| !same_stream(&row.landing, landing))
@@ -1237,6 +1452,11 @@ impl Site<'_> {
                 .put(&self.row(state, landing.identity, observed, 0))?;
             Ok(Placed { outcome, scanner })
         };
+        if meta.is_symlink() {
+            if let Some((text, resolved, link)) = self.placer.archived_link(self.dest, self.kind)? {
+                return self.replace_archived(landing, (&text, &resolved, &link));
+            }
+        }
         if !meta.is_file() || meta.nlink() > 1 {
             // Another name for these bytes (an archive copy, the landing
             // itself) would change with them.
@@ -1285,6 +1505,201 @@ impl Site<'_> {
                 scanner: placed.scanner,
             },
             _ => placed,
+        })
+    }
+
+    /// `D` is the destination's symlink into a `--replace-archived-dest`
+    /// root (A-106: the operator's ruling that the landed version wins and
+    /// the fork stays in the archive).
+    ///
+    /// The landed content is staged beside it (whole lines, its mode and
+    /// mtime, sealed) and compared with the target by BLAKE3: equal, the
+    /// link stays (`occupied`); the landing a strict prefix of the target
+    /// (the archive ahead, not a fork), the link stays (`dest-ahead`).
+    /// Both are recorded with the target's identity and not read again
+    /// while it, the link and the landing are unchanged. A target some
+    /// process holds open stays (`occupied`). Otherwise the link text, the
+    /// target's real path, identity and digest are ledgered (`intent`);
+    /// the target and link are verified unchanged; the copy and the link
+    /// are exchanged atomically; the link and the target are verified
+    /// again (else everything is put back); the link (now under the
+    /// temporary name) is removed and the directory sealed; then the row
+    /// is `done` and the placement row names the landed file, in one
+    /// commit. The archive target is never written or removed; `--undo`
+    /// puts the exact link text back over an unchanged copy and a verified
+    /// target.
+    #[allow(clippy::too_many_lines)]
+    fn replace_archived(
+        &self,
+        landing: &Landing,
+        (text, resolved, link): (&Path, &Path, &std::fs::Metadata),
+    ) -> Result<Placed> {
+        let ledger = self.placer.ledger;
+        let link_identity = Identity::of(link);
+        let kept = |outcome: Outcome, proof: Option<([u8; 32], Identity, u64)>| -> Result<Placed> {
+            // A proved row records the target's identity (in place of the
+            // link's) and whether the landing equals it or is a prefix of
+            // it; an unproved one the link's, decided again next pass.
+            let row = match proof {
+                Some((digest, target, relation)) => {
+                    let mut row = self.row(State::Occupied, landing.identity, target, relation);
+                    row.digest = Some(digest);
+                    row
+                }
+                None => self.row(State::Occupied, landing.identity, link_identity, 0),
+            };
+            ledger.put(&row)?;
+            Ok(Placed {
+                outcome,
+                scanner: None,
+            })
+        };
+        let occupied = || kept(Outcome::Occupied, None);
+        let now_target = lstat(resolved)?.map(|meta| Identity::of(&meta));
+        if let Some(row) = ledger.placement(self.dest)? {
+            if row.state == State::Occupied
+                && same_stream(&row.landing, self.landing_path)
+                && row.landed == landing.identity
+                && row.digest.is_some()
+                && now_target == Some(row.placed_identity)
+            {
+                // Proved before; the landing and the target unchanged.
+                return Ok(Placed {
+                    outcome: if row.placed == LINK_AHEAD {
+                        Outcome::DestAhead
+                    } else {
+                        Outcome::Occupied
+                    },
+                    scanner: None,
+                });
+            }
+        }
+        if open_by_a_process(resolved) {
+            // A live session holds the archive target open: its writes
+            // would go on into the archive after the swap.
+            return occupied();
+        }
+        let Some(staged) = self.stage_or_clear(landing)? else {
+            return Ok(Placed {
+                outcome: Outcome::Unreadable,
+                scanner: None,
+            });
+        };
+        let Some(target) = target_digests(resolved, staged.written)? else {
+            // Not a regular file, or written while it was read.
+            self.clear_temp()?;
+            return occupied();
+        };
+        if staged.written == target.0.size && staged.digest == target.1 {
+            // The landed file is the archive's: nothing to replace.
+            self.clear_temp()?;
+            return kept(Outcome::Occupied, Some((target.1, target.0, LINK_EQUAL)));
+        }
+        if self.lines && staged.written == 0 && staged.held > 0 {
+            self.clear_temp()?;
+            return Ok(Placed {
+                outcome: Outcome::Held,
+                scanner: None,
+            });
+        }
+        if target.2 == Some(staged.digest) {
+            // The archive holds the landed lines and more: ahead, not a
+            // fork; kept like a destination that continued (review A3).
+            self.clear_temp()?;
+            return kept(Outcome::DestAhead, Some((target.1, target.0, LINK_AHEAD)));
+        }
+        let copy = Identity::of(
+            &staged
+                .file
+                .metadata()
+                .refuse_at("reseat::place::replace_staged")?,
+        );
+        let regular = Regular {
+            link: self.dest.to_path_buf(),
+            target: text.to_path_buf(),
+            resolved: resolved.to_path_buf(),
+            link_identity,
+            target_identity: target.0,
+            regular: copy,
+            digest: Some(target.1),
+            state: RegularState::Intent,
+            replace: true,
+        };
+        let mut placement = self.row(State::Ours, landing.identity, copy, staged.written);
+        placement.digest = Some(staged.digest);
+        let unchanged = || {
+            lstat(resolved)
+                .ok()
+                .flatten()
+                .map(|meta| Identity::of(&meta))
+                == Some(target.0)
+                && lstat(self.dest)
+                    .ok()
+                    .flatten()
+                    .map(|meta| Identity::of(&meta))
+                    == Some(link_identity)
+                && std::fs::read_link(self.dest).is_ok_and(|now| now == text)
+        };
+        if !unchanged() {
+            // The link or the archive moved since they were read: kept, the
+            // staged copy removed (the landing holds its bytes).
+            self.clear_temp()?;
+            return occupied();
+        }
+        ledger.put_regular(&regular)?;
+        fault_point!(ReseatAfterReplaceIntent);
+        let name = c_name(self.name)?;
+        let temp = self.temp_c()?;
+        let undo_intent = || ledger.delete_regular(self.dest);
+        if !unchanged() || open_by_a_process(resolved) {
+            self.clear_temp()?;
+            undo_intent()?;
+            return occupied();
+        }
+        if let Err(error) = crate::io::exchange(self.directory, &temp, &name) {
+            self.clear_temp()?;
+            undo_intent()?;
+            if crate::io::rename_unsupported(&error) {
+                return Ok(Placed {
+                    outcome: Outcome::ExchangeUnsupported,
+                    scanner: None,
+                });
+            }
+            return Err(error).refuse_at("reseat::place::replace_exchange");
+        }
+        fault_point!(ReseatAfterReplaceExchange);
+        replace_hook(self.dest);
+        let link_at_temp = lstat(&self.temp())?
+            .is_some_and(|meta| meta.is_symlink() && Identity::of(&meta) == link_identity)
+            && std::fs::read_link(self.temp()).is_ok_and(|now| now == text);
+        let target_held = lstat(resolved)?.map(|meta| Identity::of(&meta)) == Some(target.0);
+        if !link_at_temp || !target_held {
+            // Something other than the link was displaced, or the archive
+            // was written under the swap: put it back as it was; the
+            // staged copy (the landing holds its bytes) removed.
+            crate::io::exchange(self.directory, &temp, &name)
+                .refuse_at("reseat::place::replace_exchange_back")?;
+            self.clear_temp()?;
+            crate::io::durable::seal_dir(self.directory)
+                .refuse_at("reseat::place::replace_seal")?;
+            undo_intent()?;
+            return occupied();
+        }
+        crate::io::sys::unlinkat(self.directory, &temp, false)
+            .refuse_at("reseat::place::replace_unlink_link")?;
+        crate::io::durable::seal_dir(self.directory).refuse_at("reseat::place::replace_seal")?;
+        fault_point!(ReseatBeforeReplaceDone);
+        ledger.put_replace_done(
+            &Regular {
+                state: RegularState::Done,
+                ..regular
+            },
+            &placement,
+        )?;
+        counters::bump(Counter::ReseatArchivedReplaced);
+        Ok(Placed {
+            outcome: Outcome::ReplacedArchived,
+            scanner: staged.scanner,
         })
     }
 

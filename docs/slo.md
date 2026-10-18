@@ -718,7 +718,14 @@ Q10, Q18). It changes no number and no ruling.
   (`tests/power_loss.rs`, `tests/fault_harness.rs`).
 - **Refusal code.** A transfer's occupied destination path is
   `DESTINATION_OCCUPIED`; `GIT_DESTINATION_OCCUPIED` is the Git carry's
-  alone.
+  alone. [2026-10-18, M2r2 A-103: an occupied path whose settled, writable,
+  append-only file (`.jsonl`, `.txt` by default) has no owning record and
+  holds a verified byte prefix of the seat (at least one whole chunk) is
+  extended in place by the tail instead (`docs/design.md`, "Grown
+  destination files"); the wire carries the tail and the chunk it starts
+  in, the destination reads the held prefix once, and a failed proof is
+  remembered (`NotPrefix`) under the file's settled identity, so an
+  unchanged rerun reads and sends nothing for it (R25, P21).]
 - **Gate (b)'s second deviation is gone.** The 2026-10-06 amendment lets
   gate (b)'s warm-resume reads be "net of the 16-byte SQLite magic probes".
   `source_bytes_read` no longer holds them, so the raw counter is 0 on a
@@ -1604,16 +1611,23 @@ session re-seat", and the receipt
   the landed lines), `destination-holds` or `destination-row-only`
   (unproved), not a refusal, and every destination row spelled through the
   home's `git` or a `--map` symlink is re-spelled, lane or not; a destination file with more than
-  one link is never written. Two destination changes are ruled
-  (OI-1003-Q198): an existing row whose `cwd` only spells the lane through
-  a symlink gets that column re-spelled, and a symlinked transcript is
-  replaced by a regular copy of its target (the archive kept); both are
-  ledgered with their old values and reversed by `--undo` wherever the
-  destination still holds exactly what re-seat wrote. A second landing of
-  the same home under a new root re-binds this STATE's rows to it with
-  `--rebind-landing OLD=NEW` (A-106 follow-up) only where the placed bytes
-  are proved the new landed file's (BLAKE3); nothing at the destination
-  changes, and `--undo` puts the binding back.
+  one link is never written. Three destination changes are ruled: an
+  existing row whose `cwd` only spells the lane through a symlink gets
+  that column re-spelled (OI-1003-Q198); a symlinked transcript is
+  replaced by a regular copy of its target (the archive kept,
+  OI-1003-Q198); and, with `--replace-archived-dest ROOT` (A-106,
+  2026-10-18, "neo's version wins; fork stays in archive"), a transcript,
+  sidecar or rollout that is a symlink into ROOT whose landed file is a
+  fork of the target (not equal, not a prefix of it) is replaced by the
+  landed file, the archive target never written. All three are ledgered
+  with their old values and reversed by `--undo` wherever the destination
+  still holds exactly what re-seat wrote. `--check` reports
+  `replaced_archived`, `replace_pending`, `replace_equal_size` and
+  `replace_proved`. A second landing of the same home under a new root re-binds this
+  STATE's rows to it with `--rebind-landing OLD=NEW` (A-106 follow-up)
+  only where the placed bytes are proved the new landed file's (BLAKE3);
+  nothing at the destination changes, `--undo` puts the binding back, and
+  `--check` reports `rebound` and `rebind_pending`.
 - **R0 acceptance** also fails a longer landed form of a rollout that was
   never placed (`extra-form-unplaced`), and names a row carrying the
   source's `cwd` (`row-cwd-is-source`). Rollouts with no snapshot row get a
@@ -1622,8 +1636,11 @@ session re-seat", and the receipt
 - **Proof:** `reseat::tests::findings::rereview` (nine rows, each failing
   against `8a89f9a` first) and `reseat::tests::findings::q198` (seven
   rows), the CLI space row and two more real-binary canaries in
-  `tests/estate_reseat.rs`, and sixteen fault-harness rows over twelve
-  `reseat.*` points.
+  `tests/estate_reseat.rs`, `reseat::tests::findings::a106` (eight rows:
+  replacement and undo, another landing's `occupied` row, regularization,
+  a Codex rollout, overlapping roots refused, a target held open, an
+  archive ahead and a changed target, a target written under the swap),
+  and twenty-two fault-harness rows over fifteen `reseat.*` points.
 - **Resolved by OI-1003-Q198** (the open items above): where lanes key
   (A), gftb and GloriousFlywheel (B), home and `/private/tmp` sessions (C),
   rowless rollouts (D), `.zst` rollouts (E), sting's symlinked transcripts

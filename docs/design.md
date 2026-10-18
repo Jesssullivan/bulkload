@@ -452,6 +452,11 @@ Source safety (S2, WP1):
   11 cleared keys) and its remote probe over ssh.
 - A partial-clone source refuses `GIT_SOURCE_PARTIAL_CLONE` before any other
   read, in `git-export` and `estate-capture`.
+  A native carry ("promisor mode": the present objects only, packed with
+  `--missing=allow-promisor`, the promisor configuration carried as-is,
+  the landed repository a partial clone) is designed, with experiments,
+  in `docs/agent-notes/2026-10-16-partial-clone-carry-design.md` (M2 item
+  6); not built. Until it is, such a repository is carried as files.
 - The source's object store is read-only to a capture (#162).
   - Git freshens (re-stamps the mtime of) any existing copy of an object it
     writes, alternates included.
@@ -2414,6 +2419,111 @@ the racy window of the read. A changed seat, a changed file, or a file
 system that has gained the exchange makes the record a miss. The record
 is a memo about no durable bytes; losing it costs one more source read.
 
+Grown destination files (M2r2 A-103, 2026-10-18; review round the same
+day). A landing moved by hand orphans its destination store: every file
+there is then one the store does not own. An append-only transcript that
+grew on the source since is a byte prefix of its seat, and was refused
+`DESTINATION_OCCUPIED` (310 of them on 2026-10-17, with
+`files_materialized=0`). Such a file is now extended in place by its tail:
+
+- **Scope.** `BULKLOAD_PREFIX_EXTEND` unset (the default): append-only
+  files only, a path ending `.jsonl` or `.txt`, as `estate-reseat` extends;
+  `all`: any regular file; `0`: none.
+- **Which files.** In scope, an existing regular file at the path with no
+  owning record (no reuse or ownership row), one link (a second name would
+  change with it), this user's, the source's mode, `0 < length < size`,
+  that this user can open for appending (a read-only or immutable file is
+  refused as before, nothing fetched), and settled: its mtime and ctime
+  older than the racy window by the destination's clock, so no live writer
+  is at it (a file written just now is refused as before, not remembered,
+  and tried again once it is quiet). It must hold at least one whole chunk
+  of the manifest: a file whose held bytes all lie in the first chunk is
+  refused too, since judging it would take that chunk over the wire for a
+  seat that may be refused (P21, #187). Any other file is adopted when it
+  is the seat's bytes and refused `DESTINATION_OCCUPIED` otherwise, as
+  before. A `SQLite` snapshot's output is never extended.
+- **The proof.** Every manifest chunk that ends within the file's length is
+  read back from the file and must hash to its digest; the bytes are read
+  once (`read_dest_verify_existing_bytes`), and a failed proof refuses at
+  the plan with no chunk asked of the source and no byte written. The
+  rest, from the first chunk that does not end within the file, is staged
+  in a temporary of its own and filled as any staged file is (chunks held
+  here, then the wire), so only the tail and the chunk it starts in cross.
+  Before anything is appended, the part of that chunk the file already
+  holds is compared with the staged bytes; a difference refuses with
+  nothing written, after that chunk and the tail crossed. A seat streamed
+  whole in place of a manifest (a source that could not keep its chunks)
+  is extended the same way from its staged copy, its whole prefix
+  compared: on that path a prefix inside the first chunk is extended too,
+  the wire having been spent already.
+- **The append.** The file must be the one the plan proved, untouched
+  since: the same `(dev, ino, size, mtime, ctime)` by the descriptor the
+  plan read and by the append descriptor the plan opened (no link
+  followed). An intent row (path, prior length, BLAKE3 of the prior bytes,
+  prior identity) is committed, then the tail is appended through an
+  `O_APPEND` descriptor in 1 MiB pieces, the file's size checked before
+  and after every piece, as `estate-reseat` extends: a byte a live writer
+  appended first is never written over (an `O_APPEND` write lands after
+  it), and the entry is refused `DESTINATION_OCCUPIED` with every writer's
+  bytes kept. The window left is a writer that appends between a size
+  check and the write of one piece: both writers' bytes are kept, the size
+  after the piece is not ours, and the entry is refused. The file is then
+  flushed (`F_FULLFSYNC` on Darwin), its size must be the seat's, and the
+  straddling chunk is re-hashed against its digest as the file now holds
+  it, a second check of the head comparison.
+- **The record.** The extended file is adopted: its capture record (#169)
+  and its row are written as an adoption's, and the group commit seals it
+  (its own sync, or the device seal) and its directory before the commit;
+  that seal is what makes the row safe, and the extension's flush is
+  defence in depth (`tests/power_loss.rs`). The row's chunk hints are the
+  whole file's. In the same transaction a `prefix_extensions` row records
+  the path, the prior length, the BLAKE3 of the prior bytes and the
+  identity after, and the intent is settled. A file is counted
+  (`dest_prefix_extended`) and reported (`prefix-extended PATH from=PRIOR
+  to=SIZE prefix_blake3=HEX`) only once its record committed;
+  `write_dest_prefix_append_bytes` counts the bytes appended, a subset of
+  `write_dest_materialize_bytes`. From then on the file is this store's:
+  an unchanged rerun reuses it, and a later growth supersedes it as any own
+  output.
+- **Remembered refusals.** A failed proof, at the plan or in the head
+  comparison, is remembered `NotPrefix` under the identity the plan found
+  settled, which is honoured: an unchanged rerun reads and sends nothing
+  for it (R25, P21). A refusal remembered `Occupied` before the extension
+  existed is not honoured for a file the extension may try: it is proved
+  once more. A refusal for another reason (the file moved, a writer
+  appended, an I/O error) is not remembered.
+- **Crashes.** `receive.prefix_before_append`, `receive.prefix_after_append`
+  and `receive.prefix_after_flush` (and the group commit's points after
+  them) leave every file a byte prefix of its seat (the old one, a longer
+  one, or all of it) and the staged tail aside for the sweep; the rerun
+  extends or adopts what it finds. A rerun that adopts the whole file with
+  an intent recorded for its path (a crash after the flush) records its
+  `prefix_extensions` row from the intent, once the intent's prior bytes
+  are proven to be the file's first ones. Power loss: the checker holds
+  every committed record to its bytes and the file to a prefix keeping
+  every old byte in every state of the traced run. Not covered by it: a
+  file system that persists a size before the data it covers can leave
+  zeros past the old length; that file is no longer a prefix and is
+  refused `DESTINATION_OCCUPIED`, its old bytes intact, and the refusal is
+  reported `prefix-extension-interrupted PATH prior=N` from the unsettled
+  intent, so the operator knows the length the file was proven to hold
+  (what follows was appended since, by the crashed run or a writer).
+
+Re-keying a moved landing is not built. A destination store keys its rows
+by path relative to the destination root and records each output's
+`(dev, ino, size, mtime, ctime)`; it does not record the root's own path.
+After a true rename within one file system (`mv` on one mount), the files
+keep their inodes and stamps, so the operator passes the old DEST_STATE
+with the new destination, with the same SOURCE_STATE and the same
+destination-relative layout, and every unchanged file is reused as before
+(the moved root directory is decided again). Two live landings must never
+share one store. A copy (`cp`, or `mv` across mounts) makes new inodes: no
+record could prove those files are the ones it describes without reading
+them, so they fall back to adoption by content, which is safe; that is
+what this extension does with a fresh store. The 2026-10-16 move used a
+copy, so reusing the old store would not have helped it: the extension is
+the tool for that case.
+
 The formal model held all of this from 2026-10-07 until R-C843 deleted it on 2026-10-17 (OI-1003-Q102: model
 first, then merge): the intent and its sweep, the ownership row, the
 remembered refusal and the refusal without an exchange, with the
@@ -2669,7 +2779,8 @@ bulkload-agent estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
     [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
     [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
     [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
-    [--no-respell] [--no-regularize] [--rebind-landing OLD=NEW]... [--undo]
+    [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
+    [--rebind-landing OLD=NEW]... [--undo]
     [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
 ```
 
@@ -2939,9 +3050,13 @@ earlier placement stays and the line names `previous_key`.
 naming its landed file: the landed file's identity at the last pass, the
 destination file's identity after bulkload's last write, the bytes placed
 and their BLAKE3, and an intent while an extension or supersede is in
-flight. The ledger carries its schema version (`user_version` 3: a
-version 2 ledger is migrated in place, keeping the shared temporary name
-for what it left in flight); the first build's ledger is refused
+flight. The ledger carries its schema version (`user_version` 5: a
+version 2, 3 or 4 ledger is migrated in place, a version 2 one keeping
+the shared temporary name for what it left in flight; version 4 adds the
+replacement kind, so a build of version 3 refuses it rather than read a
+replacement as a regularization; version 5 adds the rebind history and
+memo, so a build of version 4 refuses it rather than ignore a rebind on a
+pass or on `--undo`); the first build's ledger is refused
 `SCHEMA_MISMATCH`. An unchanged rerun reads 0
 landed bytes, the Codex snapshot and every refused, unreadable or
 unmapped session included (`read_reseat_landing_bytes`, also
@@ -3014,9 +3129,108 @@ nothing changes for it (a row written before the digest was recorded is
 refused the same way). An undone row or link is not changed again by a
 later pass. Placed sessions are not removed.
 
-**Crash safety.** Twelve fault points (`reseat.*`, `src/fault.rs`) with
-sixteen fault-harness rows (two of them a `.jsonl.zst` rollout decompressed
-into its temporary; five the rulings' mutations and their undo): a rerun
+**Archive links: the landed version wins** (`--replace-archived-dest
+ROOT`, repeatable; operator ruling A-106, 2026-10-18: "neo's version
+wins; fork stays in archive"). Without it a destination file that is a
+symlink is never written through (`occupied`). With it, a destination
+transcript, subagent sidecar (`projects/<key>/<sid>/…`) or Codex rollout
+that is a symlink is replaced by its landed file when all of these hold:
+
+- the link's fully resolved target (every hop followed by the kernel) is
+  a regular file under the real path of a ROOT; only the final target is
+  judged, so `..` or an intermediate link cannot bring a target under a
+  root it is not under;
+- the link's own directory does not resolve under a ROOT, and no ROOT
+  equals, contains or is under the real destination `.claude` or
+  `.codex` or contains the destination home: such a ROOT is refused
+  `FIELD_DOMAIN_VIOLATION` before anything is read or written (the swap
+  would otherwise happen inside the archive, or take the live state for
+  one). A ROOT is canonicalized when the flag is parsed; one that does
+  not exist is refused;
+- this STATE has no regularization or replacement row for the path (a
+  replaced or undone one is never replaced again by itself);
+- no process this user can see holds the target open (every
+  `/proc/<pid>/fd/*` link is read, observation only; a live session would
+  go on writing into the archive after the swap): such a link stays
+  `occupied` and is decided again next pass;
+- the landed content (whole lines, as placed) is neither the target's
+  bytes (BLAKE3: the link stays, `occupied`) nor a strict prefix of them
+  (the archive ahead of the landing, not a fork: the link stays,
+  `dest-ahead`, `RESEAT_DEST_CONTINUED`, as for a regular file that
+  continued). The ruling replaces forks, not archives ahead; replacing
+  those too is an operator call.
+
+An equal or ahead link is recorded with the target's identity (in place
+of the link's) and its relation, and is not read again while the
+landing and the target are unchanged; a target that changes is decided
+again.
+
+The landed content is staged beside the link (`.<name>.<token>.bulkload-reseat`)
+with the landed file's mode and mtime and sealed (`fsync`). The link text,
+the target's real path, identity and BLAKE3, and the link's and the
+copy's identities are ledgered (`regularized`, kind `replace`, `intent`)
+before anything at the path changes. The target and the link are
+verified unchanged and the target not held open, the copy and the link
+are exchanged atomically (`RENAME_EXCHANGE`), the link under the
+temporary name and the target's identity are verified again, the link is
+removed and the directory sealed (`fsync`); then, in one commit, the row
+is `done` and the placement row names the landed file (`ours`), replacing
+any row another landing left for the path. Later passes extend it like
+any placement. Outcome `replaced-archived` (a file word;
+`reseat_archived_replaced` on the counters line). The archive target is
+never opened for writing, renamed or removed. A link or target that
+changed before the swap, a path that held something else, or a target
+written under the swap puts everything back as it was (the staged copy
+removed: the landing holds its bytes) and the file stays `occupied`. An
+earlier pass's `occupied` row for the path, from another landing or
+without the flag, is decided again instead of being a `collision` (it
+placed nothing).
+
+Crashes settle forward at the start of the next pass, whether or not it
+regularizes: before the exchange the staged copy is removed (or, if it
+changed, kept aside as `.<name>.<token>.kept-<inode>.bulkload-reseat`,
+never removed by a pass) and the row dropped, and the next pass decides
+again; after it the row is `done`, any row of the path that is not this
+ledger's own is dropped in the same commit, the line is a `replace` line
+`replaced-archived` (counted), and the pass adopts the file at the path
+(the landed bytes). A target written under a crashed swap leaves either
+the link back with the copy kept aside (`replace-raced-restored`) or both
+kept (`replace-raced-kept`), as for a regularization.
+
+`--undo` puts the exact link text back (not the link's own timestamps)
+over an unchanged copy and a verified target (the regularization's rule;
+a file a later pass extended is `undo-kept`, `RESEAT_DEST_CONTINUED`) and
+drops the placement row, so no later pass replaces it again. `--undo`
+reverses everything this STATE changed in the destination's own state:
+its replacements, its regularizations and its re-spelled Codex rows
+alike; undoing only some of them is an operator call (a separate STATE
+per kind of change). Run a replacement, and its undo, with no live
+session on the destination: the open-file check narrows, but cannot
+close, the window between it and the swap.
+
+Power loss: the copy is durable before the intent, the intent before
+the exchange, and the directory before `done`; whichever name the
+directory holds after a power loss is settled by its identity like a
+crash. This ordering is argued, not tested: the fault harness models a
+process crash only (`_exit`), and `estate-reseat` is not wired to the
+`io::crash_check` power-loss model, so dropping one of these `fsync`
+calls is not caught by any test.
+
+Regularization leaves links into a ROOT to the placement (a link no
+landed file names stays a link). `--check` reports `replaced_archived`
+(`done` rows) and, at placement paths now, `replace_pending` (archive
+links whose landed whole lines differ in size from the target, a
+compressed landing included), `replace_equal_size` (equal sizes: a pass
+compares them) and `replace_proved` (proved equal or ahead, nothing
+changed since); a replaced file is checked as the landed file like any
+other.
+
+**Crash safety.** Fifteen fault points (`reseat.*`, `src/fault.rs`) with
+twenty-two fault-harness rows (two of them a `.jsonl.zst` rollout
+decompressed into its temporary; five the rulings' mutations and their
+undo; six an archive replacement at its intent, after its exchange and
+before `done`, two of them over an `occupied` row from another landing
+with regularization off, and its undo): a rerun
 settles every crash forward from the ledger and the destination's own
 bytes. A temporary with no intent is a staged
 copy and is removed; an extend intent is resumed after proving the placed

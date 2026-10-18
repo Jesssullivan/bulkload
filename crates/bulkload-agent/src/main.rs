@@ -301,7 +301,8 @@ SUBCOMMANDS:
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
-                  [--no-respell] [--no-regularize] [--rebind-landing OLD=NEW]... [--undo]
+                  [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
+                  [--rebind-landing OLD=NEW]... [--undo]
                   [--no-claude] [--no-codex] SOURCE_HOME LANDING_HOME DEST_HOME STATE
                 R0 (TIN-6587): re-seat the landed agent sessions (LANDING_HOME's
                 .claude and .codex, the run's copy of SOURCE_HOME's) into
@@ -346,7 +347,26 @@ SUBCOMMANDS:
                 (BLAKE3 against the row's digest, or the destination's own
                 read by descriptor): exactly them, rebound (nothing written);
                 longer, re-bound then extended as usual; never inferred from
-                size. --undo puts each rebind back (ledger only). --undo
+                size. --undo puts each rebind back (ledger only).
+                --replace-archived-dest ROOT (repeatable; A-106: the landed
+                version wins, the fork stays in the archive): a destination
+                transcript, subagent sidecar or rollout that is a symlink
+                whose fully resolved target is a regular file under ROOT's
+                real path, and whose landed file is a fork of that target,
+                is replaced by the landed file (staged beside it with its
+                mtime, sealed, exchanged atomically, directory sealed),
+                outcome replaced-archived; the link text, the target's real
+                path, identity and BLAKE3 are ledgered first, the target is
+                verified unchanged before and after the exchange and never
+                written or removed; an equal landing leaves the link
+                (occupied), a landing that is a prefix of the target too
+                (dest-ahead), and a target a process holds open stays
+                (occupied); a ROOT overlapping the live .claude or .codex
+                (or containing DEST_HOME) is refused FIELD_DOMAIN_VIOLATION;
+                links into ROOT are not regularized; --check counts
+                replaced_archived, replace_pending, replace_equal_size and
+                replace_proved. Run it, and its --undo, with no live session
+                on the destination. --undo
                 puts back every symlink and old cwd this STATE changed, where
                 the destination still holds exactly what re-seat wrote and
                 the archive target holds the recorded bytes (else
@@ -1645,6 +1665,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let (mut undo, mut respell, mut regularize, mut default_by_id) = (false, true, true, true);
     let mut by_id = Vec::new();
     let mut rebind = Vec::new();
+    let mut archived = Vec::new();
     let mut at = 0;
     let value = |at: usize| args.get(at).ok_or(BulkloadRefusal::RequiredFieldMissing);
     while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
@@ -1698,6 +1719,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             | "--landing-codex"
             | "--managed-settings"
             | "--by-id"
+            | "--replace-archived-dest"
             | "--waive-from" => {
                 let path = PathBuf::from(value(at + 1)?);
                 match arg {
@@ -1712,6 +1734,17 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
                             return Err(BulkloadRefusal::PathNotAbsolute);
                         }
                         by_id.push(path);
+                    }
+                    "--replace-archived-dest" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        // Judged by its real path: a root that does not
+                        // exist names nothing to replace and is refused.
+                        archived.push(
+                            std::fs::canonicalize(&path)
+                                .refuse_at("main::reseat_command::replace_archived_dest")?,
+                        );
                     }
                     "--waive-from" => {
                         let text = std::fs::read_to_string(&path)
@@ -1793,6 +1826,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     if !roots.is_empty() {
         options.codex_source_roots = roots;
     }
+    options.replace_archived = archived;
     if from_plan {
         let plan = plan.as_ref().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
         for item in bulkload_agent::estate::inspect(plan)? {
@@ -2460,6 +2494,19 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     for path in &stats.directories_fallback {
         eprintln!(
             "directory-created-by-mkdir-fallback {}",
+            path.escape_ascii()
+        );
+    }
+    for (path, prior, prefix, size) in &stats.prefix_extended {
+        eprintln!(
+            "prefix-extended {} from={prior} to={size} prefix_blake3={}",
+            path.escape_ascii(),
+            blake3::Hash::from_bytes(*prefix).to_hex()
+        );
+    }
+    for (path, prior) in &stats.prefix_interrupted {
+        eprintln!(
+            "prefix-extension-interrupted {} prior={prior} (a crashed extension proved the first {prior} bytes; what follows was appended since)",
             path.escape_ascii()
         );
     }

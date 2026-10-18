@@ -752,7 +752,7 @@ fn a_chunk_of_a_superseded_output_is_still_filled_locally() {
                 session: &session,
                 salvage: &salvage,
             },
-            &row,
+            (&row, false),
             &manifest,
             &mut Vec::new(),
         );
@@ -3058,3 +3058,6 @@ mod levers;
 
 // ---- S1 lever 3 (OI-1003-Q154): the directory finish in the last group ------
 mod fold;
+
+// ---- M2r2 A-103: a grown byte-prefix destination file is extended ----------
+mod prefix;

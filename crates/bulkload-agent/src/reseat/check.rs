@@ -126,6 +126,67 @@ pub struct CheckSummary {
     /// byte proof is the pass's).
     pub rebound: u64,
     pub rebind_pending: u64,
+    /// `--replace-archived-dest` (A-106): destination links this ledger
+    /// replaced with the landed file (`done`); and, at placement paths
+    /// now, links to a regular file under a root that a pass would
+    /// replace (the landed whole lines' size differs from the target's),
+    /// would compare (equal sizes: an equal landing leaves the link), or
+    /// already proved equal or ahead with nothing changed since
+    /// (`replace_proved`). A replaced file is checked as the landed file
+    /// like any other.
+    pub replaced_archived: u64,
+    pub replace_pending: u64,
+    pub replace_equal_size: u64,
+    pub replace_proved: u64,
+}
+
+impl CheckSummary {
+    /// Count the placement path `dest` of the landed file `landed` when it
+    /// is an archive link a pass would replace or compare.
+    fn archive_candidate(
+        &mut self,
+        options: &Options,
+        ledger: Option<&Ledger>,
+        dest: &Path,
+        landed: &Path,
+    ) -> Result<()> {
+        let Some((_, resolved, _)) = place::archive_link(dest, &options.replace_archived)? else {
+            return Ok(());
+        };
+        let target_meta = std::fs::symlink_metadata(&resolved).ok();
+        let landed_meta = std::fs::symlink_metadata(landed).ok();
+        if let Some(ledger) = ledger {
+            if ledger.regular(dest)?.is_some() {
+                return Ok(());
+            }
+            // Proved equal or ahead by a pass, nothing changed since.
+            if let (Some(row), Some(target), Some(landed_now)) =
+                (ledger.placement(dest)?, &target_meta, &landed_meta)
+            {
+                if row.state == super::ledger::State::Occupied
+                    && row.digest.is_some()
+                    && row.landing == landed
+                    && row.landed == super::ledger::Identity::of(landed_now)
+                    && row.placed_identity == super::ledger::Identity::of(target)
+                {
+                    self.replace_proved += 1;
+                    return Ok(());
+                }
+            }
+        }
+        let target = target_meta.map_or(0, |meta| meta.len());
+        let size = if place::line_ruled(landed) {
+            whole_lines_len(landed)?
+        } else {
+            landed_meta.map_or(0, |meta| meta.len())
+        };
+        if place::compressed(landed) || size != target {
+            self.replace_pending += 1;
+        } else {
+            self.replace_equal_size += 1;
+        }
+        Ok(())
+    }
 }
 
 impl CheckSummary {
@@ -205,6 +266,35 @@ fn holds(landed: &Path, dest: &Path, lines: bool) -> Result<Holds> {
         Err(BulkloadRefusal::ReseatUnreadableForm) => Ok(Holds::Not("unreadable-form")),
         other => other,
     }
+}
+
+/// The length of a JSON Lines file's whole lines (up to its last newline),
+/// found by reading back from its end; what a pass would place.
+fn whole_lines_len(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::FileExt as _;
+    let Ok(file) = crate::hash::open_nofollow(path) else {
+        return Ok(0);
+    };
+    let size = file
+        .metadata()
+        .refuse_at("reseat::check::whole_lines")?
+        .len();
+    let mut end = size;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while end > 0 {
+        let start = end.saturating_sub(buffer.len() as u64);
+        let chunk = buffer
+            .get_mut(..usize::try_from(end - start).unwrap_or(0))
+            .unwrap_or_default();
+        file.read_exact_at(chunk, start)
+            .refuse_at("reseat::check::whole_lines")?;
+        counters::add_len(Counter::HashFileRead, chunk.len());
+        if let Some(at) = chunk.iter().rposition(|byte| *byte == b'\n') {
+            return Ok(start + at as u64 + 1);
+        }
+        end = start;
+    }
+    Ok(0)
 }
 
 /// Whether the destination file `dest` holds the landed rollout's whole
@@ -320,7 +410,9 @@ fn stream_holds(landed: &Landing, dest: &Landing, lines: bool) -> Result<Holds> 
 /// I/O, ledger and snapshot refusals. A lane's failure is its line's
 /// `verdict`; [`CheckSummary::verdict`] turns any into
 /// `RESEAT_R0_FAILED`.
+#[allow(clippy::too_many_lines)]
 pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<CheckSummary> {
+    super::archive_roots_disjoint(options)?;
     let lanes = Lanes::new(options);
     let mut summary = CheckSummary {
         retention_ok: true,
@@ -357,6 +449,13 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     if let Some(ledger) = ledger.as_ref() {
         (summary.rebound, summary.rebind_pending) = rebind_counts(options, ledger)?;
+    }
+    if let Some(ledger) = ledger.as_ref() {
+        summary.replaced_archived = ledger
+            .regulars()?
+            .iter()
+            .filter(|row| row.replace && row.state == super::ledger::RegularState::Done)
+            .count() as u64;
     }
     for (tool, state) in [
         (
@@ -398,7 +497,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     summary.lanes = table;
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"rebound\":{},\"rebind_pending\":{},\"r0\":\"{}\"}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"replaced_archived\":{},\"replace_pending\":{},\"replace_equal_size\":{},\"replace_proved\":{},\"rebound\":{},\"rebind_pending\":{},\"r0\":\"{}\"}}",
         summary.checked,
         summary.lanes.len(),
         summary.count("pass"),
@@ -411,6 +510,10 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         summary.unlaned.iter().filter(|item| item.waived).count(),
         if summary.retention_ok { "ok" } else { "unsafe" },
         summary.respell_pending,
+        summary.replaced_archived,
+        summary.replace_pending,
+        summary.replace_equal_size,
+        summary.replace_proved,
         summary.rebound,
         summary.rebind_pending,
         if summary.verdict().is_ok() { "pass" } else { "fail" },
@@ -574,6 +677,20 @@ fn check_claude(
             .join("projects")
             .join(&key)
             .join(format!("{}.jsonl", candidate.sid));
+        if !options.replace_archived.is_empty() {
+            summary.archive_candidate(options, ledger, &dest, &candidate.path)?;
+            let slug = match cached.as_ref().and_then(|row| row.slug.clone()) {
+                Some(slug) => Some(slug),
+                None => slug_of(&candidate.path)?,
+            };
+            for (landed, rel, kind) in
+                claude::companions(options, sessions, candidate, &key, slug.as_deref())?
+            {
+                if kind == super::Kind::Sidecar {
+                    summary.archive_candidate(options, ledger, &root.join(&rel), &landed)?;
+                }
+            }
+        }
         let mut held = holds(&candidate.path, &dest, true)?;
         if !matches!(held, Holds::Not(_)) {
             let slug = match cached.as_ref().and_then(|row| row.slug.clone()) {
@@ -694,6 +811,14 @@ fn check_codex(
                 continue;
             }
         };
+        if let Some(rel) = &rel {
+            summary.archive_candidate(
+                options,
+                ledger,
+                &root.join(codex::dest_form(rel)),
+                &options.landing_codex.join(rel),
+            )?;
+        }
         let held = match rel {
             None => Holds::Not("landing-absent"),
             Some(rel) => thread_holds(
@@ -808,6 +933,12 @@ fn check_codex(
                 continue;
             }
         };
+        summary.archive_candidate(
+            options,
+            ledger,
+            &root.join(codex::dest_form(&file.rel)),
+            &landed,
+        )?;
         let held = thread_holds(
             options,
             (&root, dest.as_ref()),
