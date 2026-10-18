@@ -146,7 +146,7 @@ pub(crate) mod git_env {
 /// `--no-optional-locks`, every `-c` override, every cleared and set
 /// variable, and `GIT_CEILING_DIRECTORIES` at `repo`'s parent, so discovery
 /// never climbs above the path it was given.
-fn git(repo: &Path) -> Command {
+pub(crate) fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
     for key in git_env::CLEARED {
         command.env_remove(key);

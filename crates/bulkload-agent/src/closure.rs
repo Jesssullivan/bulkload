@@ -79,7 +79,7 @@
 //!
 //! The report is `bulkload.closure.v5` (M2r2 b). v5 adds the disposition
 //! `carried`, its total `carried` after `covered`, and on a carried row the
-//! `carried` block (destination, beside, transfer state, pointers). Nothing
+//! `carried` block (via, destination, beside, transfer state, gits). Nothing
 //! else changes from v4.
 //!
 //! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
@@ -954,12 +954,12 @@ impl Report {
             if let Some(proof) = &row.carried {
                 let _ = write!(
                     out,
-                    ",\"carried\":{{\"via\":{},\"destination\":{},\"beside\":{},\"transfer_state\":{},\"pointers\":{}}}",
+                    ",\"carried\":{{\"via\":{},\"destination\":{},\"beside\":{},\"transfer_state\":{},\"gits\":{}}}",
                     proof.via.as_deref().map_or_else(|| "null".to_owned(), json_string),
                     json_string(&proof.destination.to_string_lossy()),
                     proof.beside,
                     json_string(&proof.transfer_state.to_string_lossy()),
-                    proof.pointers,
+                    proof.gits,
                 );
             }
             if let Some(review) = &row.review {

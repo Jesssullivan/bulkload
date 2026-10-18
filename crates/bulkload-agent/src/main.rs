@@ -131,31 +131,40 @@ SUBCOMMANDS:
                 JSON line per workspace (schema bulkload.estate-handoff.v1, the
                 verb's own name)
     estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--bind ID=DEST_STATE]...
+                [--bind-only] [--recarry]
                 [--host HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
                 PLAN CORPUS PRIVATE_STATE SOURCE CARRY_STATE
-                M2r2 b: carry each planned workspace item whose capture
-                refused (no capture record; its outcome CAPTURE_ABSENT) as
-                files, byte-exact, by one recorded transfer session (`copy`,
-                or `pull` from HOST with the remote source state under DIR)
-                into its workspace, or beside it (the workspace path with
-                SUFFIX appended), the session recorded in
-                CARRY_STATE/<item>/dest. An equal destination file is
-                adopted; a differing one is refused and never overwritten,
-                and the item is then not carried. Each landed `.git` pointer
-                file or symlink is resolved where it landed: one naming
-                nothing on this host or the carried tree itself is recorded;
-                one naming an existing directory outside the tree refuses
+                M2r2 b: carry each planned item whose capture refused (no
+                capture record; its outcome CAPTURE_ABSENT) as files,
+                byte-exact, by one recorded transfer session (`copy`, or
+                `pull` from HOST with the remote source state under DIR) into
+                its workspace, or beside it (the workspace path with SUFFIX
+                appended), the session recorded in CARRY_STATE/<item>/dest.
+                An equal destination file is adopted; a differing one is
+                refused and never overwritten, and the item is then not
+                carried. --bind ID=DEST_STATE binds an item to a session
+                this transport already recorded in DEST_STATE (same source,
+                same destination, completed, no refused path) instead of
+                running one: nothing is transferred or written under the
+                destination. Whatever landed, each directory below the
+                destination holding a `.git` entry is resolved as Git
+                resolves it (rev-parse, object alternates, symlinks in its
+                administration); anything outside the carried tree refuses
                 GIT_CARRY_POINTER_ATTACHED (the bytes stay for review). A
                 carried item gets a `{item}-{blake3(SOURCE)}.carried` record
                 and the outcome carried-as-files, which closure-report counts
-                `carried` once the transfer record proves it. --bind
-                ID=DEST_STATE binds an item to a session this transport
-                already recorded in DEST_STATE (same source, same
-                destination, completed, no refused path) instead of running
-                one: nothing is transferred or written under the
-                destination. A refs-only item rides on a carried workspace
-                item of the same source (via=). --dry-run reads only and
-                prints what each item would do. One line per item
+                `carried` while the transfer record and the `.git`
+                resolutions prove it. A refs-only item rides on a carried
+                workspace item of the same source (via=). Every --item and
+                --bind must name a planned eligible item (a bind, a workspace
+                item), or the run refuses FIELD_DOMAIN_VIOLATION before any
+                write; --bind-only refuses a selected workspace item with no
+                bind. An item already carried whose carry still proves is
+                kept with no session unless --recarry or a bind for it asks;
+                a rerun that does not carry an item that was carried writes
+                CAPTURE_ABSENT back (and for refs-only items riding on it).
+                --dry-run reads only and prints what each item would do.
+                One line per item
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
@@ -1974,6 +1983,16 @@ fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
         match arg {
             "--dry-run" if !options.dry_run => {
                 options.dry_run = true;
+                at += 1;
+                continue;
+            }
+            "--bind-only" if !options.bind_only => {
+                options.bind_only = true;
+                at += 1;
+                continue;
+            }
+            "--recarry" if !options.recarry => {
+                options.recarry = true;
                 at += 1;
                 continue;
             }

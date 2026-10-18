@@ -2249,7 +2249,7 @@ fn apply_item(
         );
         if carried_now
             && matches!(
-                carried::prove(&[state.to_path_buf()], &identity, source),
+                carried::prove(&[state.to_path_buf()], &identity, source, item),
                 Some(Ok(_))
             )
         {
@@ -2694,7 +2694,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             JournalState::CaptureUnreadable
         };
         let record = records.get(&identity);
-        let carried = carried::prove(states, &identity, source);
+        let carried = carried::prove(states, &identity, source, item);
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
@@ -2705,6 +2705,41 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             carried,
             item: identity,
         });
+    }
+    // M2r2 b: a refs-only item's carry rides on a planned workspace item of
+    // the same source whose own outcome is carried-as-files and proves.
+    let riding: Vec<(usize, String)> = ledger
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match &entry.carried {
+            Some(Ok(carried::CarriedProof { via: Some(via), .. })) => Some((index, via.clone())),
+            _ => None,
+        })
+        .collect();
+    for (index, via) in riding {
+        let Some(source) = ledger.entries.get(index).map(|entry| entry.source.clone()) else {
+            continue;
+        };
+        let proved = ledger.entries.iter().any(|sibling| {
+            sibling.item == via
+                && sibling.has_workspace
+                && sibling.source == source
+                && matches!(
+                    sibling.record,
+                    Some(Ok(crate::outcome::OutcomeRecord {
+                        outcome: crate::outcome::Outcome::CarriedAsFiles,
+                        ..
+                    }))
+                )
+                && matches!(
+                    sibling.carried,
+                    Some(Ok(carried::CarriedProof { via: None, .. }))
+                )
+        });
+        if let (false, Some(entry)) = (proved, ledger.entries.get_mut(index)) {
+            entry.carried = Some(Err("carried-via-unproved"));
+        }
     }
     ledger.foreign_records = records
         .into_keys()
@@ -2995,7 +3030,10 @@ pub fn apply_reporting(
         // workspace never does (design 6.4: the converge left it as it was).
         if done
             .as_ref()
-            .map_or(true, |done| !done.outcome.starts_with("previous-"))
+            .map_or(true, |done| {
+                // A kept carry (M2r2 b) is a no-op, like a previous journal.
+                !done.outcome.starts_with("previous-") && done.outcome != carried::CARRIED_OUTCOME
+            })
         {
             let mut touched = touched
                 .lock()
