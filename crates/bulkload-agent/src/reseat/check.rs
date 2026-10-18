@@ -418,7 +418,8 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     Ok(summary)
 }
 
-/// `(rebound, rebind_pending)`: see [`CheckSummary::rebound`].
+/// `(rebound, rebind_pending)`: see [`CheckSummary::rebound`]. Without
+/// `--rebind-landing` nothing is pending.
 fn rebind_counts(options: &Options, ledger: &Ledger) -> Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     let rebinds = ledger.rebinds()?;
@@ -434,29 +435,38 @@ fn rebind_counts(options: &Options, ledger: &Ledger) -> Result<(u64, u64)> {
         if row.intent.is_some()
             || !matches!(
                 row.state,
-                super::ledger::State::Ours
-                    | super::ledger::State::Adopted
-                    | super::ledger::State::Continued
+                super::ledger::State::Ours | super::ledger::State::Adopted
             )
-            || rebinds.iter().any(|done| done.dest == dest)
+            || rebinds.iter().any(|done| {
+                done.dest == dest && (done.state == "undone" || done.state == "undo-kept")
+            })
         {
             continue;
         }
-        let mapped = options.rebind.iter().find_map(|(old, new)| {
-            row.landing
-                .strip_prefix(old)
-                .ok()
-                .map(|rest| new.join(rest))
-        });
-        let Some(mapped) = mapped else {
+        // Every pair, every form the new landed file may have now.
+        let Some(found) = options
+            .rebind
+            .iter()
+            .flat_map(|pair| place::mapped_forms(&row.landing, pair))
+            .find(|form| std::fs::symlink_metadata(form).is_ok())
+        else {
             continue;
         };
+        if let Some((refused, identity)) = ledger.rebind_unproved(&dest)? {
+            // Refused and unchanged since: not pending.
+            let now = std::fs::symlink_metadata(&refused)
+                .ok()
+                .map(|meta| super::ledger::Identity::of(&meta));
+            if place::same_stream(&refused, &found) && now == Some(identity) {
+                continue;
+            }
+        }
         let held = std::fs::symlink_metadata(&dest).is_ok_and(|meta| {
             meta.is_file()
                 && meta.nlink() == 1
                 && super::ledger::Identity::of(&meta) == row.placed_identity
         });
-        if held && std::fs::symlink_metadata(&mapped).is_ok() {
+        if held {
             pending += 1;
         }
     }

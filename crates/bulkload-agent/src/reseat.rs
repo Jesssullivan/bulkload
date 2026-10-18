@@ -692,7 +692,8 @@ pub fn undo(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Resu
     let links = regularize::undo(&ledger, emit)?;
     let rows = codex::undo(&mut ledger, emit)?;
     let mut rebinds = 0_u64;
-    for rebind in ledger.rebinds()? {
+    // Newest first: a chained rebind is put back hop by hop.
+    for rebind in ledger.rebinds()?.into_iter().rev() {
         if rebind.state != "done" {
             continue;
         }

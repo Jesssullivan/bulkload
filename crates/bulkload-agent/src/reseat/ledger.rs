@@ -105,10 +105,20 @@ CREATE TABLE IF NOT EXISTS regularized(
     state TEXT NOT NULL, pass INTEGER NOT NULL,
     digest BLOB
 );
-CREATE TABLE IF NOT EXISTS rebind(
-    dest BLOB PRIMARY KEY, old_landing BLOB NOT NULL, new_landing BLOB NOT NULL,
+CREATE TABLE IF NOT EXISTS rebind_history(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT, dest BLOB NOT NULL,
+    old_landing BLOB NOT NULL, new_landing BLOB NOT NULL,
     o_dev INTEGER NOT NULL, o_ino INTEGER NOT NULL, o_size INTEGER NOT NULL, o_mtime INTEGER NOT NULL,
+    n_dev INTEGER NOT NULL, n_ino INTEGER NOT NULL, n_size INTEGER NOT NULL, n_mtime INTEGER NOT NULL,
+    placed INTEGER NOT NULL,
+    d_dev INTEGER NOT NULL, d_ino INTEGER NOT NULL, d_size INTEGER NOT NULL, d_mtime INTEGER NOT NULL,
+    digest BLOB,
     state TEXT NOT NULL, pass INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rebind_unproved(
+    dest BLOB PRIMARY KEY, new_landing BLOB NOT NULL,
+    n_dev INTEGER NOT NULL, n_ino INTEGER NOT NULL, n_size INTEGER NOT NULL, n_mtime INTEGER NOT NULL,
+    pass INTEGER NOT NULL
 );
 ";
 /// A file's identity: what a pass compares instead of reading it.
@@ -242,18 +252,28 @@ pub struct Session {
     pub landed_mtime: Option<i64>,
 }
 
-/// One placement re-bound from a landed file under an old landing root
-/// to the same file under a new one (`--rebind-landing`, A-106
-/// follow-up): the bytes it placed proved the new landing's.
+/// One rebind of a placement to the same landed file under a new root.
+///
+/// `--rebind-landing` (A-106 follow-up): the bytes it placed proved the
+/// new landing's. Rows are history, one per rebind (a chained one adds a
+/// row), never overwritten.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rebind {
+    /// Its order in the history (0 before it is written).
+    pub seq: i64,
     pub dest: PathBuf,
     pub old_landing: PathBuf,
     pub new_landing: PathBuf,
-    /// The placement row's landed identity before the rebind (for an
-    /// `unproved` row, the new landed file's identity when it was refused).
+    /// The placement row's landed identity before and after the rebind.
     pub old_landed: Identity,
-    /// `done`, `undone`, `undo-kept` or `unproved`.
+    pub new_landed: Identity,
+    /// The placement row's bytes, destination identity and digest at the
+    /// rebind: `--undo` puts the old binding back only while the row still
+    /// holds exactly these (else `undo-kept`).
+    pub placed: u64,
+    pub placed_identity: Identity,
+    pub digest: Option<[u8; 32]>,
+    /// `done`, `undone` or `undo-kept`.
     pub state: String,
 }
 
@@ -590,61 +610,106 @@ impl Ledger {
             .collect())
     }
 
-    fn has_rebind_table(&self) -> Result<bool> {
+    fn has_table(&self, name: &str) -> Result<bool> {
         sql(self.conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'rebind'",
-            [],
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![name],
             |row| row.get::<_, i64>(0),
         ))
         .map(|count| count > 0)
     }
 
-    /// The rebind row of `dest`.
+    /// The rebind history of `dest`, oldest first.
     ///
     /// # Errors
     /// `SQLITE_STATE_CHANGED` on a failed read.
-    pub fn rebind(&self, dest: &Path) -> Result<Option<Rebind>> {
-        Ok(self.rebinds()?.into_iter().find(|row| row.dest == dest))
+    pub fn rebinds_of(&self, dest: &Path) -> Result<Vec<Rebind>> {
+        Ok(self
+            .rebinds()?
+            .into_iter()
+            .filter(|row| row.dest == dest)
+            .collect())
     }
 
-    /// Every rebind row.
+    /// Every rebind, oldest first.
     ///
     /// # Errors
     /// `SQLITE_STATE_CHANGED` on a failed read.
     pub fn rebinds(&self) -> Result<Vec<Rebind>> {
-        if !self.has_rebind_table()? {
+        if !self.has_table("rebind_history")? {
             return Ok(Vec::new());
         }
         let mut statement = sql(self.conn.prepare(
-            "SELECT dest, old_landing, new_landing, o_dev, o_ino, o_size, o_mtime, state
-             FROM rebind ORDER BY dest",
+            "SELECT seq, dest, old_landing, new_landing, o_dev, o_ino, o_size, o_mtime,
+                    n_dev, n_ino, n_size, n_mtime, placed, d_dev, d_ino, d_size, d_mtime,
+                    digest, state
+             FROM rebind_history ORDER BY seq",
         ))?;
+        let identity = |row: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Identity> {
+            Ok(Identity {
+                dev: uint(row.get(at)?),
+                ino: uint(row.get(at + 1)?),
+                size: uint(row.get(at + 2)?),
+                mtime: row.get(at + 3)?,
+            })
+        };
         let rows = sql(statement.query_map([], |row| {
             Ok(Rebind {
-                dest: path_of(row.get(0)?),
-                old_landing: path_of(row.get(1)?),
-                new_landing: path_of(row.get(2)?),
-                old_landed: Identity {
-                    dev: uint(row.get(3)?),
-                    ino: uint(row.get(4)?),
-                    size: uint(row.get(5)?),
-                    mtime: row.get(6)?,
-                },
-                state: row.get(7)?,
+                seq: row.get(0)?,
+                dest: path_of(row.get(1)?),
+                old_landing: path_of(row.get(2)?),
+                new_landing: path_of(row.get(3)?),
+                old_landed: identity(row, 4)?,
+                new_landed: identity(row, 8)?,
+                placed: uint(row.get(12)?),
+                placed_identity: identity(row, 13)?,
+                digest: digest(row.get(17)?),
+                state: row.get(18)?,
             })
         }))?;
         sql(rows.collect::<rusqlite::Result<Vec<_>>>())
     }
 
-    /// Re-bind the placement row of `rebind.dest` from its old landed file
-    /// to `rebind.new_landing` (its landed identity set to `landed`), with
-    /// the rebind row, in one commit; only while the row still names the
-    /// old landed file. Returns whether it did.
+    /// The refused rebind of `dest` remembered: the new landed file and its
+    /// identity when the proof refused it.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed read.
+    pub fn rebind_unproved(&self, dest: &Path) -> Result<Option<(PathBuf, Identity)>> {
+        if !self.has_table("rebind_unproved")? {
+            return Ok(None);
+        }
+        sql(self
+            .conn
+            .query_row(
+                "SELECT new_landing, n_dev, n_ino, n_size, n_mtime FROM rebind_unproved
+                 WHERE dest = ?1",
+                params![blob(dest)],
+                |row| {
+                    Ok((
+                        path_of(row.get(0)?),
+                        Identity {
+                            dev: uint(row.get(1)?),
+                            ino: uint(row.get(2)?),
+                            size: uint(row.get(3)?),
+                            mtime: row.get(4)?,
+                        },
+                    ))
+                },
+            )
+            .optional())
+    }
+
+    /// Re-bind the placement row of `rebind.dest` from `old_landing` to
+    /// `new_landing` (its landed identity set to `new_landed`) and append
+    /// the rebind to the history, in one commit; only while the row still
+    /// names the old landed file. A refused-proof memo of the path is
+    /// cleared. Returns whether it did.
     ///
     /// # Errors
     /// `SQLITE_STATE_CHANGED` on a failed commit; the refusal of a
     /// read-only ledger.
-    pub fn put_rebind(&self, rebind: &Rebind, landed: Identity) -> Result<bool> {
+    pub fn put_rebind(&self, rebind: &Rebind) -> Result<bool> {
         if self.read_only {
             return Err(BulkloadRefusal::ContractSelfInconsistent);
         }
@@ -657,10 +722,10 @@ impl Ledger {
                 params![
                     blob(&rebind.dest),
                     blob(&rebind.new_landing),
-                    int(landed.dev),
-                    int(landed.ino),
-                    int(landed.size),
-                    landed.mtime,
+                    int(rebind.new_landed.dev),
+                    int(rebind.new_landed.ino),
+                    int(rebind.new_landed.size),
+                    rebind.new_landed.mtime,
                     self.pass,
                     blob(&rebind.old_landing),
                 ],
@@ -669,9 +734,11 @@ impl Ledger {
                 return Ok(false);
             }
             self.conn.execute(
-                "INSERT OR REPLACE INTO rebind(dest, old_landing, new_landing,
-                    o_dev, o_ino, o_size, o_mtime, state, pass)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT INTO rebind_history(dest, old_landing, new_landing,
+                    o_dev, o_ino, o_size, o_mtime, n_dev, n_ino, n_size, n_mtime,
+                    placed, d_dev, d_ino, d_size, d_mtime, digest, state, pass)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, 'done', ?18)",
                 params![
                     blob(&rebind.dest),
                     blob(&rebind.old_landing),
@@ -680,9 +747,22 @@ impl Ledger {
                     int(rebind.old_landed.ino),
                     int(rebind.old_landed.size),
                     rebind.old_landed.mtime,
-                    rebind.state,
+                    int(rebind.new_landed.dev),
+                    int(rebind.new_landed.ino),
+                    int(rebind.new_landed.size),
+                    rebind.new_landed.mtime,
+                    int(rebind.placed),
+                    int(rebind.placed_identity.dev),
+                    int(rebind.placed_identity.ino),
+                    int(rebind.placed_identity.size),
+                    rebind.placed_identity.mtime,
+                    rebind.digest.as_ref().map(<[u8; 32]>::as_slice),
                     self.pass,
                 ],
+            )?;
+            self.conn.execute(
+                "DELETE FROM rebind_unproved WHERE dest = ?1",
+                params![blob(&rebind.dest)],
             )?;
             Ok(true)
         })();
@@ -697,39 +777,44 @@ impl Ledger {
         }
     }
 
-    /// Remember a rebind the byte proof refused (`unproved`): the new
-    /// landed file's identity in place of the old landed one, so a pass
-    /// does not read it again while it is unchanged (S3).
+    /// Remember a rebind the byte proof refused, by the new landed file's
+    /// identity, so a pass does not read it again while it is unchanged
+    /// (S3). Never touches the history.
     ///
     /// # Errors
     /// `SQLITE_STATE_CHANGED` on a failed commit.
-    pub fn put_rebind_unproved(&self, rebind: &Rebind) -> Result<()> {
+    pub fn put_rebind_unproved(
+        &self,
+        dest: &Path,
+        landing: &Path,
+        identity: Identity,
+    ) -> Result<()> {
         if self.read_only {
             return Err(BulkloadRefusal::ContractSelfInconsistent);
         }
         sql(self.conn.execute(
-            "INSERT OR REPLACE INTO rebind(dest, old_landing, new_landing,
-                o_dev, o_ino, o_size, o_mtime, state, pass)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unproved', ?8)",
+            "INSERT OR REPLACE INTO rebind_unproved(dest, new_landing,
+                n_dev, n_ino, n_size, n_mtime, pass)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
-                blob(&rebind.dest),
-                blob(&rebind.old_landing),
-                blob(&rebind.new_landing),
-                int(rebind.old_landed.dev),
-                int(rebind.old_landed.ino),
-                int(rebind.old_landed.size),
-                rebind.old_landed.mtime,
+                blob(dest),
+                blob(landing),
+                int(identity.dev),
+                int(identity.ino),
+                int(identity.size),
+                identity.mtime,
                 self.pass,
             ],
         ))
         .map(drop)
     }
 
-    /// Put a rebind back (`--undo`, ledger only): the placement row names
-    /// the old landed file again, with its old landed identity, while it
-    /// still names the new one; the rebind row `undone` either way
-    /// (`kept` when the row moved on). Returns whether the row was put
-    /// back.
+    /// Put one rebind back (`--undo`, ledger only, newest first): the
+    /// placement row names the old landed file and identity again, only
+    /// while it still holds exactly what the rebind left (the new landed
+    /// file and identity, the bytes, destination identity and digest);
+    /// the history row `undone`, else `undo-kept`. Returns whether the row
+    /// was put back.
     ///
     /// # Errors
     /// `SQLITE_STATE_CHANGED` on a failed commit.
@@ -742,7 +827,10 @@ impl Ledger {
             let changed = self.conn.execute(
                 "UPDATE placement SET landing = ?2, l_dev = ?3, l_ino = ?4, l_size = ?5,
                     l_mtime = ?6
-                 WHERE dest = ?1 AND landing = ?7",
+                 WHERE dest = ?1 AND landing = ?7
+                   AND l_dev = ?8 AND l_ino = ?9 AND l_size = ?10 AND l_mtime = ?11
+                   AND placed = ?12 AND d_dev = ?13 AND d_ino = ?14 AND d_size = ?15
+                   AND d_mtime = ?16 AND digest IS ?17",
                 params![
                     blob(&rebind.dest),
                     blob(&rebind.old_landing),
@@ -751,12 +839,22 @@ impl Ledger {
                     int(rebind.old_landed.size),
                     rebind.old_landed.mtime,
                     blob(&rebind.new_landing),
+                    int(rebind.new_landed.dev),
+                    int(rebind.new_landed.ino),
+                    int(rebind.new_landed.size),
+                    rebind.new_landed.mtime,
+                    int(rebind.placed),
+                    int(rebind.placed_identity.dev),
+                    int(rebind.placed_identity.ino),
+                    int(rebind.placed_identity.size),
+                    rebind.placed_identity.mtime,
+                    rebind.digest.as_ref().map(<[u8; 32]>::as_slice),
                 ],
             )?;
             self.conn.execute(
-                "UPDATE rebind SET state = ?2, pass = ?3 WHERE dest = ?1",
+                "UPDATE rebind_history SET state = ?2, pass = ?3 WHERE seq = ?1",
                 params![
-                    blob(&rebind.dest),
+                    rebind.seq,
                     if changed == 1 { "undone" } else { "undo-kept" },
                     self.pass
                 ],
