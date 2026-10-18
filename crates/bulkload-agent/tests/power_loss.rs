@@ -2315,3 +2315,108 @@ fn every_power_loss_state_of_a_folded_finish_is_explored() {
         );
     }
 }
+
+/// M2r2 A-103: a rerun into a landing whose store was lost extends a grown
+/// byte-prefix file in place. In every power-loss state every committed
+/// record names the bytes it describes (the extended file's adoption row
+/// included), and the file at its final name is a byte prefix of the grown
+/// source that keeps every old byte. What makes the record safe is the
+/// adoption's group seal before its commit (the file's own sync, or the
+/// device seal); the extension's explicit flush is defence in depth. The
+/// same trace with every sync of the file and every device seal dropped
+/// must fail.
+#[test]
+fn every_power_loss_state_of_a_prefix_extension_keeps_the_old_bytes() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    set_durability(Durability::Group);
+    let scratch = Scratch::new("prefix");
+    let full = noise(0xA103, 900_000);
+    let prior = 600_001;
+    fs::write(scratch.source().join("t.jsonl"), &full[..prior]).unwrap();
+    bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    let first = run_copy(&scratch);
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    // The landing is moved by hand: its store is lost.
+    fs::remove_dir_all(scratch.base.join("destination-state")).unwrap();
+    fs::write(scratch.source().join("t.jsonl"), &full).unwrap();
+    bulkload_agent::transfer::settle_racy_window(&scratch.source()).unwrap();
+    bulkload_agent::transfer::settle_racy_window(&scratch.destination()).unwrap();
+    let after = expected(&scratch.source());
+    let file = node(&scratch.destination().join("t.jsonl"));
+    let (image, events, stats) = traced_rerun(&scratch);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(
+        stats.prefix_extended.len(),
+        1,
+        "{:?}",
+        stats.prefix_extended
+    );
+    assert_eq!(
+        fs::read(scratch.destination().join("t.jsonl")).unwrap(),
+        full
+    );
+    let report = |events: &[Event]| {
+        check_view(&image, events, &options(), |view, info| {
+            for commit in &info.commits {
+                let Event::Commit { records, .. } = &events[*commit] else {
+                    return Err(format!("event {commit} is not a commit"));
+                };
+                for record in records {
+                    committed_record(&after, view, record)?;
+                }
+            }
+            for (rel, entry) in view.walk() {
+                let Entry::File { data, .. } = entry else {
+                    continue;
+                };
+                if is_temporary(&rel) {
+                    continue;
+                }
+                if rel != b"t.jsonl" {
+                    return Err(format!("unexpected {}", String::from_utf8_lossy(&rel)));
+                }
+                if data.len() < prior || data.len() > full.len() || data != &full[..data.len()] {
+                    return Err(format!(
+                        "t.jsonl holds {} bytes that are not a prefix keeping the old ones",
+                        data.len()
+                    ));
+                }
+            }
+            if info.complete
+                && !matches!(view.get(b"t.jsonl"), Some(Entry::File { data, .. }) if data == full.as_slice())
+            {
+                return Err("copy returned but t.jsonl is not the grown source".to_owned());
+            }
+            Ok(())
+        })
+        .unwrap()
+    };
+    let checked = report(&events);
+    eprintln!("{}", checked.summary(&events));
+    assert!(checked.states > checked.crash_points);
+    assert!(checked.passed(), "{}", checked.summary(&events));
+
+    // Teeth: without the file's syncs and the device seals, the adoption's
+    // record can outlive the appended bytes it vouches for.
+    let unsealed: Vec<Event> = events
+        .iter()
+        .filter(|event| {
+            !syncs(event, &[file])
+                && !matches!(
+                    event,
+                    Event::Sync {
+                        kind: SyncKind::FsSync,
+                        ..
+                    }
+                )
+        })
+        .cloned()
+        .collect();
+    assert!(unsealed.len() < events.len(), "the trace seals the file");
+    let broken = report(&unsealed);
+    assert!(
+        !broken.violations.is_empty(),
+        "a record ahead of its file's seal must fail: {}",
+        broken.summary(&unsealed)
+    );
+}

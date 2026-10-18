@@ -15,6 +15,7 @@ use rusqlite::{params, Connection};
 use super::{append, r0, run, set_mtime, transcript, World, SERIAL, SID, SID2, SOURCE_HOME};
 use crate::reseat::{check, reseat, Options, Unmapped};
 
+mod m2r2;
 mod q198;
 mod rereview;
 

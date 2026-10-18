@@ -1,9 +1,10 @@
 //! P67 DECISION-CORE (Q42 lane L6a, OI-1003-Q43): git carry's decision core,
-//! [`decide`], against its Haskell reference and its own laws.
+//! [`decide`], against its Haskell reference's frozen rows and its own laws.
 //!
 //! - **Pinned rows.** Every row of `tests/data/decide_rows.tsv`, which
-//!   `docs/formal/hs/GitCarryCore.hs rows` renders from the reference
-//!   `decide`, decides exactly the row's output under the row's policy, with
+//!   `docs/formal/hs/GitCarryCore.hs rows` rendered from the reference
+//!   `decide` (deleted under R-C843, 2026-10-17; the TSV is now a frozen
+//!   fixture), decides exactly the row's output under the row's policy, with
 //!   each "-" input drawn at random (the fixed seed everywhere;
 //!   `BULKLOAD_PROPTEST_DEEP=1` draws more from it, OI-1003-Q78). That is all
 //!   three lanes: `v1`, whose policy is [`Policy::V1`] (the code before
@@ -12,9 +13,10 @@
 //!   whose policy `decide` implements before its lane lands the custody the
 //!   callers need to act on it.
 //! - **Labels.** The rows' output columns, over every lane, use exactly the
-//!   labels of the Rust unions. The reference refuses to render rows that
-//!   leave a label unreached, and `just formal-nv` requires its labels to be
-//!   `catalogue/Types.dhall`'s, so the Rust variant names are the Dhall labels.
+//!   labels of the Rust unions. The reference refused to render rows that
+//!   left a label unreached, and the deleted `just formal-nv` required its
+//!   labels to be `catalogue/Types.dhall`'s, so the Rust variant names are
+//!   the Dhall labels.
 //! - **Totality.** For every input and policy, [`decide`] returns, and its
 //!   decision is well-formed: a refusal only for a lost base, a hit never on
 //!   a broken chain, a chained basis exactly when the depth is at least one

@@ -697,3 +697,55 @@ fn a_new_path_the_source_ledger_holds_keeps_its_ledger_manifest() {
         assert!(counted.get(Counter::DestLocalReuseRead) >= twin.len() as u64);
     }
 }
+
+/// M2r2 A-103 over the wire (`pull` without `ssh`): a landing whose store
+/// was lost holds a byte prefix of a transcript that grew on the source.
+/// The cross-process session extends it in place: only the tail and the
+/// chunk it starts in cross, the prefix proof reads the held bytes once,
+/// and every received byte is verified.
+#[test]
+fn a_cross_process_session_extends_a_grown_prefix() {
+    let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+    let scratch = Scratch::new("prefix");
+    let full = noise(0x00A1_0300, 4 << 20);
+    let prior = (3 << 20) + 777;
+    std::fs::write(scratch.path("source/t.jsonl"), &full[..prior]).unwrap();
+    let (first, _, _) = cross_process(&scratch, None);
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    std::fs::remove_dir_all(scratch.path("destination-state")).unwrap();
+    std::fs::write(scratch.path("source/t.jsonl"), &full).unwrap();
+    settle_racy_window(&scratch.path("source")).unwrap();
+    settle_racy_window(&scratch.path("destination")).unwrap();
+    let (stats, counted, _) = cross_process(&scratch, None);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(
+        std::fs::read(scratch.path("destination/t.jsonl")).unwrap(),
+        full
+    );
+    assert_eq!(
+        stats.prefix_extended.len(),
+        1,
+        "{:?}",
+        stats.prefix_extended
+    );
+    let tail = (full.len() - prior) as u64;
+    assert!(
+        stats.bytes_received >= tail && stats.bytes_received < tail + (2 << 20),
+        "{} received for a {tail}-byte tail",
+        stats.bytes_received
+    );
+    assert_eq!(counted.get(Counter::DestPrefixExtended), 1);
+    assert_eq!(counted.get(Counter::DestPrefixAppendWrite), tail);
+    // The held prefix read once, and the straddling chunk re-read after the
+    // append (at most 256 KiB).
+    let verified = counted.get(Counter::DestVerifyRead);
+    assert!(
+        verified > prior as u64 && verified <= prior as u64 + (256 << 10),
+        "{verified}"
+    );
+    assert_eq!(
+        counted.get(Counter::HashWireVerify),
+        stats.bytes_received,
+        "every received byte verified"
+    );
+}

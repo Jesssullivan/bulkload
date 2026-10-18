@@ -18,10 +18,16 @@ it needs its own PR.
 | **Design**: how bulkload works, its contracts and refusal codes | [`docs/design.md`](design.md). | Crate docs and `USAGE` describe their own surface; the whitepaper explains and cites. |
 | **Enforced engineering rules** | The guard that enforces each: the dependency wall in `crates/bulkload-agent/tests/dep_graph.rs`; the deny-panics wall in each crate's `[lints.clippy]` (`Cargo.toml`); the source command registry in `crates/bulkload-agent/tests/source_command_registry.rs`. | Name the guard; do not copy its list. |
 | **Validation tiers and CI** | `justfile` recipe comments (`just --list`) and `.github/workflows/ci.yml`. | `AGENTS.md` states the rule ("run `just check-fast` before pushing") and points there. |
-| **Formal model**: modules, run order, results of record | [`docs/formal/README.md`](formal/README.md); the row lists are `docs/formal/configs*.tsv`; the rendered file count is what `just tla-render --check` prints. | Link the module's results paragraph; do not restate row or file counts. |
+| **Formal model** [2026-10-17: deleted under R-C843 (TIN-4543 `ace8649c`), citing SPEC; R-C844: done is the R7 resume test plus a hash manifest, and no paper or formal model is required] | [`docs/SPEC.md`](SPEC.md) for what done requires. Only `docs/formal/EstateConverge.tla` and its configs remain, until bulkload#237 is fixed ([`docs/formal/README.md`](formal/README.md)). | Do not cite a model-checking result as a receipt of done. |
 | **Measured results** | [`docs/evidence/`](evidence/): one dated file per sample or run, never edited after the fact except for a dated label under its title. | slo.md records proof status and cites the file; the whitepaper and README link, not restate. |
 | **Live workstreams and status** | The Linear document [Bulkload — product shape, SLOs, proofs and live workstreams (SSOT)](https://linear.app/tinyland/document/bulkload-product-shape-slos-proofs-and-live-workstreams-ssot-5e4bab288565) (P-TIN-177). Work items: GitHub issues (`gate-a`, `pre-migration`, `later`). | The document holds pointers, the priority order and the live board; it was rewritten 2026-10-16T17:34Z by the OI-1003-Q194 reconcile. Status, evidence and next for each stream live on its P-TIN-177 milestone and that milestone's live issue. Per the document: when a stream changes state, update its milestone and live issue; edit the document's table only when a live issue is added or retired. Agent notes and chat are not status. |
 | **History**: what was done, when, and why | `docs/agent-notes/` (one dated record per session); `docs/plans/` (dated plans); `docs/evidence/rulings-ledger-r1-r43.md`; TIN-4543 and TIN-3692 comments; tag `carry-v2-final`. | Records are never rewritten. A record that is no longer true gets a dated label at its top naming what superseded it. |
+
+[2026-10-17: the whitepaper (`docs/whitepaper/bulkload.md`) and the formal
+model were deleted under R-C843 (TIN-4543 `ace8649c`), citing
+[`docs/SPEC.md`](SPEC.md). The mentions of "the whitepaper" in the table
+above are historical; `docs/whitepaper/bibliography.md` stays as prior-art
+salvage.]
 
 ## Precedence
 
@@ -35,18 +41,20 @@ it needs its own PR.
   no document decides it: both are stated with their dates and the conflict
   is listed below for the operator.
 
-## Open for the operator
+## Settled 2026-10-16 (formerly open for the operator)
 
-- **Builds and tests on neo.** FOOT-03 (2026-08-26): "we CANNOT EVER build
-  on neo, EVER"; FOOT-10 (2026-09-01) restates it for tests, checks and
-  lints; SPEC R4 cites both. R-N69 (about 2026-09-23, newer) allowed local
-  cargo builds on neo behind an inline `TINYLAND_ALLOW_LOCAL_BUILD="<lane>
-  (R-N69)"` prefix. Neither is recorded as superseding the other, and
-  OI-1003-Q194 (C1–C20) does not address it. `AGENTS.md`, "Agent lanes",
-  carries the same entry.
-- **R-N81 and SPEC R3.** R-N81's load gate (load1 below 2.5 for a gated
-  sample) against SPEC R3's "Samples run on live hosts" (`docs/slo.md`,
-  amendment 2026-10-16, R-N91).
+Both items were ruled at 17:45:55Z (Linear TIN-4543 `34c2a101`); this
+section was corrected 2026-10-17 (Bulkload Reset Review row C11).
+
+- **Builds and tests on neo: never (OI-1003-Q196).** FOOT-03 and FOOT-10
+  are upheld and R-N69 is retired. Darwin checks run on PZM or a CI macOS
+  runner, never on neo. `AGENTS.md`, "Agent lanes", carries the same entry.
+- **R-N81 and SPEC R3: rig controls, no quiet windows (OI-1003-Q197).** A
+  rep of record passes R-N81 (load1 < 2.5, AC power) plus the rig's thermal
+  and slot controls; other work is never quiesced for a sample, and
+  under-load reps stay informational (Q39). Since R-C842 (`ace8649c`) the
+  gate of record is end-to-end seat time; the corpus race is a regression
+  guard only.
 
 ## Labels
 
