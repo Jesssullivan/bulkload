@@ -13,7 +13,7 @@ What remains here, and why:
 
 | File | Why it stays |
 |---|---|
-| [`EstateConverge.tla`](EstateConverge.tla) | The estate convergence model (OI-1003-Q144). It is the reproducer for bulkload#237 (a `NoLocalWorkLost` counterexample at `MaxSrc=2`: a deletion made during an apply is undone by the post-crash settle). It stays until #237 is fixed. |
+| [`EstateConverge.tla`](EstateConverge.tla) | The estate convergence model (OI-1003-Q144). It is the reproducer for bulkload#237 (a `NoLocalWorkLost` counterexample at `MaxSrc=2`: a deletion made during an apply is undone by the post-crash settle). It stays until #237 is fixed. [2026-10-18: reproduced on the real code by the fault harness's two known violations `converge_settle_keeps_an_added_seat_the_operator_deleted_*` (TIN-4546).] |
 | [`configs_ec.tsv`](configs_ec.tsv) | The module's run order and expected outcome per config. `just tla-check` reads it. |
 | `MC_ec_*.cfg` | The module's TLC configurations. |
 
