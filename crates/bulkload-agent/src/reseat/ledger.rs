@@ -801,17 +801,18 @@ impl Ledger {
         let outcome = (|| {
             let transaction = self.conn.transaction()?;
             for (id, old, new) in rows {
-                // A row this ledger already re-spelled keeps its first old
-                // value (the destination's own spelling); any other takes
-                // the value it holds now. Either way it is in flight again
+                // The old value is the one the row holds now: a row this
+                // ledger re-spelled before and the destination spelled
+                // again since is put back to the destination's latest
+                // spelling, never to an older one that may name another
+                // directory (M2 round 2 review). It is in flight again
                 // (`intent`), so a crash before it is marked stays
                 // undoable.
                 transaction.execute(
                     "INSERT INTO cwd_update(id, db, old_cwd, new_cwd, state, pass)
                      VALUES (?1, ?2, ?3, ?4, 'intent', ?5)
                      ON CONFLICT(id) DO UPDATE SET
-                        old_cwd = CASE WHEN cwd_update.state = 'applied'
-                            THEN cwd_update.old_cwd ELSE excluded.old_cwd END,
+                        old_cwd = excluded.old_cwd,
                         db = excluded.db, new_cwd = excluded.new_cwd,
                         state = 'intent', pass = excluded.pass",
                     params![id, blob(db), old, new, pass],

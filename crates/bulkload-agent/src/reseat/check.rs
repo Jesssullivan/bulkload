@@ -115,6 +115,10 @@ pub struct CheckSummary {
     pub checked: u64,
     /// Whether the destination's retention keeps every landed file.
     pub retention_ok: bool,
+    /// Destination Codex rows a pass would re-spell (their `cwd` spelled
+    /// through the home's `git` or a `--map` symlink): reported, never
+    /// judged (operator M2 round 2, 2026-10-17).
+    pub respell_pending: u64,
 }
 
 impl CheckSummary {
@@ -194,6 +198,24 @@ fn holds(landed: &Path, dest: &Path, lines: bool) -> Result<Holds> {
         Err(BulkloadRefusal::ReseatUnreadableForm) => Ok(Holds::Not("unreadable-form")),
         other => other,
     }
+}
+
+/// Whether the destination file `dest` holds the landed rollout's whole
+/// lines (the rule of [`holds`] for JSON Lines): `Ok("exactly")` or
+/// `Ok("continued")`, else `Err(reason)`. Used by a pass to prove a
+/// thread the destination already holds in another form.
+///
+/// # Errors
+/// I/O refusals.
+pub(super) fn holds_lines(
+    landed: &Path,
+    dest: &Path,
+) -> Result<std::result::Result<&'static str, &'static str>> {
+    Ok(match holds(landed, dest, true)? {
+        Holds::Exactly => Ok("exactly"),
+        Holds::Continued => Ok("continued"),
+        Holds::Not(reason) => Err(reason),
+    })
 }
 
 /// Read up to `buffer.len()` bytes: fewer only at the end.
@@ -322,6 +344,10 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     if codex_landed == Some(true) {
         check_codex(options, &lanes, ledger.as_ref(), &mut summary, &mut table)?;
     }
+    if options.codex {
+        // Whenever the destination index exists, landed threads or not.
+        summary.respell_pending = codex::respell_pending(options, ledger.as_ref())?;
+    }
     for (tool, state) in [
         (
             claude::TOOL,
@@ -362,7 +388,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     summary.lanes = table;
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"r0\":\"{}\"}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"r0\":\"{}\"}}",
         summary.checked,
         summary.lanes.len(),
         summary.count("pass"),
@@ -374,6 +400,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         summary.unlaned.len(),
         summary.unlaned.iter().filter(|item| item.waived).count(),
         if summary.retention_ok { "ok" } else { "unsafe" },
+        summary.respell_pending,
         if summary.verdict().is_ok() { "pass" } else { "fail" },
     ))?;
     Ok(summary)
@@ -847,18 +874,32 @@ fn thread_holds(
         }));
     }
     let placed = root.join(codex::dest_form(rel));
-    let rollout = PathBuf::from(rollout);
     // The plain file re-seat placed, or the `.zst` Codex compressed it
-    // into at the destination.
-    let compressed_there = {
-        let mut name = placed.clone().into_os_string();
-        name.push(".zst");
-        PathBuf::from(name)
+    // into at the destination, its directory spelled any way that
+    // resolves to the same one.
+    let named = codex::names(&rollout, &placed);
+    let rollout = PathBuf::from(rollout);
+    let zst = rollout
+        .extension()
+        .is_some_and(|extension| extension == "zst");
+    let gz = rollout
+        .extension()
+        .is_some_and(|extension| extension == "gz");
+    // The plain file or Codex's `.zst` at this place, or the same rollout
+    // file in another directory (a pass adopts one that holds the landed
+    // lines: `destination-adopted`); never a `.gz`.
+    let accepted = match named {
+        codex::Names::Plain => true,
+        codex::Names::Form => zst,
+        codex::Names::Elsewhere => !gz,
+        codex::Names::Other => false,
     };
-    if rollout != placed && rollout != compressed_there {
+    if !accepted {
         return Ok(Holds::Not("row-rollout-differs"));
     }
-    holds(&options.landing_codex.join(rel), &rollout, true)
+    // A destination file that cannot be read fails this thread, not the
+    // check.
+    Ok(holds(&options.landing_codex.join(rel), &rollout, true).unwrap_or(Holds::Not("unreadable")))
 }
 
 /// Each planned workspace's `estate-diff` class, when `--plan` was given.

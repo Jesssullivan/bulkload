@@ -399,8 +399,14 @@ pub struct Summary {
     /// `(tool, word)` → sessions or threads, by their transcript's or
     /// rollout's outcome, or a lane refusal.
     pub sessions: BTreeMap<(String, String), u64>,
-    /// Codex thread rows: `registered`, `adopted`, `unchanged`,
-    /// `conflict`, `index-absent`.
+    /// Codex thread rows: `registered`, `adopted` (a row naming this
+    /// placement), `unchanged`, `conflict`, `synthesized`, `absent`,
+    /// `respelled`, `changed-since` (a re-spelling whose row changed
+    /// first), `respell-not-text` (rows skipped: `id` or `cwd` not UTF-8),
+    /// `respell-link-moved` (rows not re-spelled: a link moved during the
+    /// sweep), and the holding words `destination-adopted`,
+    /// `destination-holds`, `destination-row-only` (also session words;
+    /// distinct from the placement word `adopted`).
     pub rows: BTreeMap<String, u64>,
 }
 
@@ -644,8 +650,12 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
     if let Some(sessions) = &claude {
         claude::reseat(options, &lanes, &ledger, sessions, &mut summary, emit)?;
     }
-    if codex == Some(true) {
-        codex::reseat(options, &lanes, &mut ledger, &mut summary, emit)?;
+    match codex {
+        Some(true) => codex::reseat(options, &lanes, &mut ledger, &mut summary, emit)?,
+        // Nothing landed: the destination's symlink-spelled rows are still
+        // re-spelled (operator M2 round 2 review).
+        Some(false) => codex::sweep_alone(options, &mut ledger, &mut summary, emit)?,
+        None => {}
     }
     emit(&summary.line())?;
     drop(held);

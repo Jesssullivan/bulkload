@@ -31,9 +31,14 @@ migration happens to succeed [2026-10-16: agent wording, not in OI-1003-Q4
 below]. Three bodies of work make up the bar:
 
 - **Proofs**
-  - A whitepaper with a bibliography of prior art.
+  - A whitepaper with a bibliography of prior art. [2026-10-17: deleted under
+    R-C843 (TIN-4543 `ace8649c`), citing SPEC; R-C844: done is the R7 resume
+    test plus a hash manifest, and no paper is required.
+    `docs/whitepaper/bibliography.md` stays as prior-art salvage.]
   - Runtime proofs that can be demonstrated.
-  - A formal model of the protocol.
+  - A formal model of the protocol. [2026-10-17: deleted under R-C843; R-C844
+    requires no formal model. Only `docs/formal/EstateConverge.tla` stays,
+    until #237 is fixed.]
 - **Engineering**
   - Simplifications and refactors.
   - An adversarial architecture review.
@@ -59,12 +64,18 @@ OI-1003-Q13 removes is the framing of that run as a one-off milestone.
 | SLO | Definition | Proof obligation |
 |---|---|---|
 | **S1 Faster than rclone** | Gate (a): local copy beats rclone, B/A/B/A/B order, B passes only if all 3 B reps pass (OI-1002-Q30). Gate (b): a neo→sting pull beats rclone over sftp. No hard wall-clock SLA for the migration run itself (OI-1003-Q3). [2026-10-16: both gates are decided on the hermetic rig and a neo→sting run is a field confirmation (OI-1003-Q97, amendment 2026-10-07). OI-1003-Q194 C2 makes cross-host gate (b) on an estate-shaped many-file corpus S1's headline and the rig's gate (a) a regression guard, and C3 reads the 1 % delta as a real in-place change to about 1 % of files; see the 2026-10-16 amendment.] | Gated samples under R-N81/R-N91 on the sealed corpus, then evidence in `docs/evidence/`. [2026-10-16: R-N91 is read as superseded by OI-1003-Q194 C18 together with SPEC R3 ("Samples run on live hosts"); RUL-18 itself names CONF-01/06/07/08, not R-N91. R-N81 stands; how its load gate fits SPEC R3 is open, see the 2026-10-16 amendment.] |
-| **S2 Never interrupt the source** (OI-1003-Q5, Q9) | **Proven properties:** bulkload never takes a git lock or any flock or lease on source repositories, never writes to the source, and never signals a process. [2026-10-16: with the counted exceptions OI-1003-Q16 (the SQLite backup's shared read lock), Q36 (`-shm`) and Q72 (empty `-wal`), below.] It runs at background IO and CPU priority. **Measured budget:** with bulkload running, a reference agent workload on the source shows at most **+25 % p95 latency**, and bulkload adds at most **+2.0 to load1**. | The properties are covered by property tests plus the formal model. The budget is measured and recorded in every gated run. |
-| **S3 Idempotent incremental completion** (OI-1003-Q6, Q10) | A rerun reads **0 content bytes** for unchanged seats (R25 / R-N58), and its walk is metadata only. On an unchanged estate a rerun finishes in **≤ 10 % of the first pass's wall-clock**. After N changed files, a rerun reads only those files' changed chunks. As neo's work lanes complete, re-running sync brings them over with nothing re-walked for content and nothing re-read. | Counters `source_bytes_read` and `transferred_content_bytes`, plus the rerun/first-pass ratio, recorded per run. R25 is also covered by the formal model. |
-| **S4 Complete and accounted** (OI-1003-Q1) | The closure report shows **0 unaccounted**: every planned item is `applied`, `referenced-only`, or a typed refusal. Every typed refusal carries an operator-reviewed disposition (accept, re-carry, or abandon) before the run counts as complete. A bare `IO` or `FRAME_CODEC` never counts. A daily-work verdict on sting (#40) is required. [2026-10-16: OI-1003-Q194 C14 adds a carried-as-files outcome, marked corrupt in closure, for trees and rescue copies bulkload cannot capture natively; no code records it yet. #40 tracks the handoff-verify probe verdict, not SPEC R0's resume check.] | The native closure report plus a bound attestation ledger (#119, #133), and the disposition ledger. |
+| **S2 Never interrupt the source** (OI-1003-Q5, Q9) | **Proven properties:** bulkload never takes a git lock or any flock or lease on source repositories, never writes to the source, and never signals a process. [2026-10-16: with the counted exceptions OI-1003-Q16 (the SQLite backup's shared read lock), Q36 (`-shm`) and Q72 (empty `-wal`), below.] It runs at background IO and CPU priority. **Measured budget:** with bulkload running, a reference agent workload on the source shows at most **+25 % p95 latency**, and bulkload adds at most **+2.0 to load1**. | The properties are covered by property tests plus the formal model [2026-10-17: deleted under R-C843]. The budget is measured and recorded in every gated run. |
+| **S3 Idempotent incremental completion** (OI-1003-Q6, Q10) | A rerun reads **0 content bytes** for unchanged seats (R25 / R-N58), and its walk is metadata only. On an unchanged estate a rerun finishes in **≤ 10 % of the first pass's wall-clock**. After N changed files, a rerun reads only those files' changed chunks. As neo's work lanes complete, re-running sync brings them over with nothing re-walked for content and nothing re-read. | Counters `source_bytes_read` and `transferred_content_bytes`, plus the rerun/first-pass ratio, recorded per run. R25 is also covered by the formal model [2026-10-17: deleted under R-C843]. |
+| **S4 Complete and accounted** (OI-1003-Q1) | The closure report shows **0 unaccounted**: every planned item is `applied`, `referenced-only`, or a typed refusal. Every typed refusal carries an operator-reviewed disposition (accept, re-carry, or abandon) before the run counts as complete. A bare `IO` or `FRAME_CODEC` never counts. A daily-work verdict on sting (#40) is required. [2026-10-17: #40 was closed not_planned 2026-10-16 ~17:40Z; the S4 verdict carrier is Linear TIN-6592.] [2026-10-16: OI-1003-Q194 C14 adds a carried-as-files outcome, marked corrupt in closure, for trees and rescue copies bulkload cannot capture natively; no code records it yet. #40 tracks the handoff-verify probe verdict, not SPEC R0's resume check.] | The native closure report plus a bound attestation ledger (#119, #133), and the disposition ledger. |
 | **S5 Source stays live** (OI-1003-Q2) | Agents keep working on neo during the run. Bulkload tolerates movement as drift custody (R-N30, extended by OI-1003-Q11), and a final delta pass (#103) catches up. There is no freeze window. | Drift custody recorded per item; the delta pass is under S3. |
 
 ## Proof package (OI-1003-Q7)
+
+[2026-10-17: R-C844 (TIN-4543 `ace8649c`) supersedes OI-1003-Q4, Q7, Q32
+and Q155 here: done is the R7 resume test plus a hash manifest, and no paper
+or formal model is required. R-C843 deleted the whitepaper and the formal
+model (`docs/formal/EstateConverge.tla` stays until #237 is fixed). Runnable
+property tests stay as tests.]
 
 - **Whitepaper and bibliography.** Covers design, invariants, the SLO
   definitions above, and the proof method. Positions bulkload against prior art:
@@ -72,7 +83,7 @@ OI-1003-Q13 removes is the framing of that run as a one-off milestone.
   - casync/desync; restic/borg; bup; Unison; ZFS send/receive;
   - content-defined chunking (FastCDC); BLAKE3;
   - crash-consistency literature (ALICE, CrashMonkey).
-- **Formal model.** A TLA+ (or equivalent) specification of wire v5 [2026-10-16: the wire is v6 since #218; `docs/formal/README.md` lists the modules], `Held`,
+- **Formal model.** A TLA+ (or equivalent) specification of wire v5 [2026-10-16: the wire is v6 since #218; `docs/formal/README.md` lists the modules; 2026-10-17: deleted under R-C843/R-C844 except `EstateConverge.tla`], `Held`,
   ledger commit and resume. It is model-checked for R25 (no committed capture is
   re-read), durability ordering and S2's no-write/no-lock properties.
 - **Property tests, not fuzzing.** Decompose existing tests and checks into
@@ -318,7 +329,9 @@ as properties.
 
 ## Amendment 2026-10-06: S1 gate (b) harness (OI-1003-Q66)
 
-- The gate (b) harness is built (`gate_b.py`, `just bench-gate-b`) and its
+- The gate (b) harness is built (`gate_b.py`, `just bench-gate-b`) [2026-10-17:
+  both retired under N03 (TIN-4543 `63feb3cf`); M3 uses `m3_link.py` (#246)]
+  and its
   protocol is [plans/2026-10-06-s1-gate-b-protocol.md](plans/2026-10-06-s1-gate-b-protocol.md).
   It changes no SLO and no number above. Its choices are drafts until the
   operator ratifies them: SQLite seats are left out of the comparable set, the
@@ -1265,8 +1278,9 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
 - **`--activate-origin PREFIX`** activates a named scp-style or `ssh://`
   origin at a first landing (#226 item 6). The #216 default is unchanged:
   only HTTPS origins are active, and a local path never.
-- **Rebuildable omissions are counted** (#226 item 5). Closure is
-  `bulkload.closure.v4`: an `omissions` block names every omitted root
+- **Rebuildable omissions are counted** (#226 item 5). Closure was
+  `bulkload.closure.v4` (v5 since M2r2 b adds the `carried` disposition;
+  see `docs/design.md`): an `omissions` block names every omitted root
   with its entries and bytes, and a capture from before the sidecar shows
   `unknown`, never zero. "Equals the source" is exact except for those
   counted roots.
@@ -1587,7 +1601,11 @@ session re-seat", and the receipt
   `RESEAT_LANE_UNMAPPED:rollout-root` in `--check` too.
 - **S5, as ruled:** the destination's own Codex row or rollout form for a
   thread is never replaced and nothing is placed beside it, for rollouts
-  with no snapshot row too (the MAJOR); a destination file with more than
+  with no snapshot row too (the MAJOR); since the operator's M2 round 2
+  (2026-10-17) such a thread is `destination-adopted` (the row's file holds
+  the landed lines), `destination-holds` or `destination-row-only`
+  (unproved), not a refusal, and every destination row spelled through the
+  home's `git` or a `--map` symlink is re-spelled, lane or not; a destination file with more than
   one link is never written. Two destination changes are ruled
   (OI-1003-Q198): an existing row whose `cwd` only spells the lane through
   a symlink gets that column re-spelled, and a symlinked transcript is
