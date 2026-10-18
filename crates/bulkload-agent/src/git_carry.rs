@@ -147,7 +147,7 @@ pub(crate) mod git_env {
 /// `--no-optional-locks`, every `-c` override, every cleared and set
 /// variable, and `GIT_CEILING_DIRECTORIES` at `repo`'s parent, so discovery
 /// never climbs above the path it was given.
-pub(crate) fn git(repo: &Path) -> Command {
+fn git(repo: &Path) -> Command {
     let mut command = Command::new("git");
     for key in git_env::CLEARED {
         command.env_remove(key);
@@ -541,6 +541,35 @@ fn verify_bundle(repo: &Path, bundle: &Path) -> Result<()> {
         }
     }
     Err(BulkloadRefusal::GitInventoryMalformed)
+}
+
+/// What Git resolves for `dir`, a directory holding a `.git` entry (M2r2 b,
+/// `estate-carry-files`' check of a carried tree): with `top_level` false,
+/// its absolute git dir and common dir; with it true, its top level (none
+/// for a bare administration). `None` when Git refuses the directory, as it
+/// does for an administration absent on this host. A read through the
+/// hardened builder: no optional locks, no hooks, no fsmonitor, no
+/// discovery above `dir`'s parent.
+pub(crate) fn resolved_paths(dir: &Path, top_level: bool) -> Option<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let answer = if top_level {
+        output(git(dir).args(["rev-parse", "--show-toplevel"]))
+    } else {
+        output(git(dir).args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--absolute-git-dir",
+            "--git-common-dir",
+        ]))
+    }
+    .ok()?;
+    Some(
+        answer
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| PathBuf::from(std::ffi::OsStr::from_bytes(line)))
+            .collect(),
+    )
 }
 
 fn text(command: &mut Command) -> Result<String> {

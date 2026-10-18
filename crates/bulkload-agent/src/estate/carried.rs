@@ -1016,26 +1016,6 @@ enum Resolved {
     Outside,
 }
 
-// `git rev-parse ARGS` in `dir`, hardened (no optional locks, no hooks, no
-// fsmonitor, no discovery above `dir`'s parent): its lines, or None when
-// Git refuses the directory.
-fn rev_parse(dir: &Path, args: &[&str]) -> Option<Vec<PathBuf>> {
-    let out = crate::git_carry::git(dir)
-        .arg("rev-parse")
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    out.status.success().then(|| {
-        out.stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(|line| PathBuf::from(std::ffi::OsStr::from_bytes(line)))
-            .collect()
-    })
-}
-
 fn inside(root: &Path, path: &Path) -> bool {
     fs::canonicalize(path).map_or(true, |path| path.starts_with(root))
 }
@@ -1084,14 +1064,7 @@ fn alternates_inside(root: &Path, common: &Path) -> bool {
 /// object alternates and every symlink in its administration.
 fn resolve_git(root: &Path, dir: &Path) -> Result<Resolved> {
     let root = fs::canonicalize(root).refuse_at(SITE)?;
-    let Some(dirs) = rev_parse(
-        dir,
-        &[
-            "--path-format=absolute",
-            "--absolute-git-dir",
-            "--git-common-dir",
-        ],
-    ) else {
+    let Some(dirs) = crate::git_carry::resolved_paths(dir, false) else {
         return Ok(Resolved::Absent);
     };
     let [git_dir, common] = dirs.as_slice() else {
@@ -1101,7 +1074,7 @@ fn resolve_git(root: &Path, dir: &Path) -> Result<Resolved> {
         return Ok(Resolved::Outside);
     }
     // A bare administration has no top level; a work tree must be ours.
-    if let Some(top) = rev_parse(dir, &["--show-toplevel"]) {
+    if let Some(top) = crate::git_carry::resolved_paths(dir, true) {
         if top.iter().any(|top| !inside(&root, top)) {
             return Ok(Resolved::Outside);
         }
