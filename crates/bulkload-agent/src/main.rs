@@ -658,7 +658,8 @@ fn main() -> ExitCode {
         }
         Some(
             name @ ("estate-add" | "estate-add-batch" | "estate-show" | "estate-capture"
-            | "estate-apply" | "estate-diff" | "estate-handoff" | "estate-retarget" | "estate-unseat"),
+            | "estate-apply" | "estate-diff" | "estate-handoff" | "estate-retarget"
+            | "estate-unseat"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
