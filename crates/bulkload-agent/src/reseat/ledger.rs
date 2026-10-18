@@ -305,7 +305,16 @@ pub struct Regular {
     /// `None` on a row written before it was recorded: never undone.
     pub digest: Option<[u8; 32]>,
     pub state: RegularState,
+    /// A `--replace-archived-dest` replacement (A-106): the regular file
+    /// at the path is the landed file, not a copy of the target; its
+    /// placement row is written once the row is `done` (a crash before
+    /// that leaves none, and the next pass adopts the file at the path).
+    pub replace: bool,
 }
+
+/// The `regularized.kind` of a `--replace-archived-dest` row (NULL for a
+/// regularization).
+const REPLACE_KIND: &str = "replace";
 
 /// The open ledger.
 pub struct Ledger {
@@ -378,6 +387,7 @@ impl Ledger {
             ("session", "l_size", "INTEGER"),
             ("session", "l_mtime", "INTEGER"),
             ("regularized", "digest", "BLOB"),
+            ("regularized", "kind", "TEXT"),
         ] {
             let present: i64 = sql(conn.query_row(
                 "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -917,9 +927,9 @@ impl Ledger {
         sql(self.conn.execute(
             "INSERT OR REPLACE INTO regularized(link, target, resolved,
                 k_dev, k_ino, k_size, k_mtime, t_dev, t_ino, t_size, t_mtime,
-                r_dev, r_ino, r_size, r_mtime, state, pass, digest)
+                r_dev, r_ino, r_size, r_mtime, state, pass, digest, kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18)",
+                     ?18, ?19)",
             params![
                 blob(&row.link),
                 blob(&row.target),
@@ -939,8 +949,24 @@ impl Ledger {
                 row.state.word(),
                 self.pass,
                 row.digest.as_ref().map(<[u8; 32]>::as_slice),
+                row.replace.then_some(REPLACE_KIND),
             ],
         ))
+        .map(drop)
+    }
+
+    /// Delete the placement row of `dest` (a replacement that never took
+    /// place, or one `--undo` reversed).
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn delete_placement(&self, dest: &Path) -> Result<()> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self
+            .conn
+            .execute("DELETE FROM placement WHERE dest = ?1", params![blob(dest)]))
         .map(drop)
     }
 
@@ -948,11 +974,20 @@ impl Ledger {
         if !self.v3 {
             return Ok(Vec::new());
         }
-        let mut statement = sql(self.conn.prepare(
-            "SELECT link, target, resolved, k_dev, k_ino, k_size, k_mtime,
-                    t_dev, t_ino, t_size, t_mtime, r_dev, r_ino, r_size, r_mtime, state, digest
-             FROM regularized WHERE ?1 IS NULL OR link = ?1 ORDER BY link",
+        // A ledger this build has not opened for writing yet has no `kind`
+        // column: every row of it is a regularization.
+        let kind: i64 = sql(self.conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('regularized') WHERE name = 'kind'",
+            [],
+            |row| row.get(0),
         ))?;
+        let mut statement = sql(self.conn.prepare(&format!(
+            "SELECT link, target, resolved, k_dev, k_ino, k_size, k_mtime,
+                    t_dev, t_ino, t_size, t_mtime, r_dev, r_ino, r_size, r_mtime, state, digest,
+                    {}
+             FROM regularized WHERE ?1 IS NULL OR link = ?1 ORDER BY link",
+            if kind > 0 { "kind" } else { "NULL" }
+        )))?;
         let identity = |row: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Identity> {
             Ok(Identity {
                 dev: uint(row.get(at)?),
@@ -971,12 +1006,22 @@ impl Ledger {
                 identity(row, 11)?,
                 row.get::<_, String>(15)?,
                 row.get::<_, Option<Vec<u8>>>(16)?,
+                row.get::<_, Option<String>>(17)?,
             ))
         }))?;
         let mut out = Vec::new();
         for row in rows {
-            let (link, target, resolved, link_identity, target_identity, regular, state, hash) =
-                sql(row)?;
+            let (
+                link,
+                target,
+                resolved,
+                link_identity,
+                target_identity,
+                regular,
+                state,
+                hash,
+                kind,
+            ) = sql(row)?;
             out.push(Regular {
                 link,
                 target,
@@ -986,6 +1031,11 @@ impl Ledger {
                 regular,
                 digest: digest(hash),
                 state: RegularState::parse(&state)?,
+                replace: match kind.as_deref() {
+                    None => false,
+                    Some(REPLACE_KIND) => true,
+                    Some(_) => return Err(BulkloadRefusal::SchemaMismatch),
+                },
             });
         }
         Ok(out)

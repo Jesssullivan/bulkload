@@ -377,6 +377,16 @@ pub enum Point {
     ReseatAfterUndoCwd,
     /// `reseat.after_undo_exchange`
     ReseatAfterUndoExchange,
+    /// `reseat.after_replace_intent`: a `--replace-archived-dest`
+    /// replacement's intent and placement rows durable, the landed copy
+    /// staged, nothing exchanged (A-106).
+    ReseatAfterReplaceIntent,
+    /// `reseat.after_replace_exchange`: the landed copy at the path, the
+    /// destination's link under the temporary name.
+    ReseatAfterReplaceExchange,
+    /// `reseat.before_replace_done`: the link removed and the directory
+    /// sealed; the row not yet `done`.
+    ReseatBeforeReplaceDone,
     /// `estate.handoff.after_intent`: the hand-off intent durable; no
     /// target written (TIN-6569, OI-1003-Q183).
     EstateHandoffAfterIntent,
@@ -399,7 +409,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 65] = [
+    pub const ALL: [Self; 68] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -459,6 +469,9 @@ impl Point {
         Self::ReseatAfterRegularizeExchange,
         Self::ReseatAfterUndoCwd,
         Self::ReseatAfterUndoExchange,
+        Self::ReseatAfterReplaceIntent,
+        Self::ReseatAfterReplaceExchange,
+        Self::ReseatBeforeReplaceDone,
         Self::EstateHandoffAfterIntent,
         Self::EstateHandoffAfterTemp,
         Self::EstateHandoffAfterExchange,
@@ -530,6 +543,9 @@ impl Point {
             Self::ReseatAfterRegularizeExchange => "reseat.after_regularize_exchange",
             Self::ReseatAfterUndoCwd => "reseat.after_undo_cwd",
             Self::ReseatAfterUndoExchange => "reseat.after_undo_exchange",
+            Self::ReseatAfterReplaceIntent => "reseat.after_replace_intent",
+            Self::ReseatAfterReplaceExchange => "reseat.after_replace_exchange",
+            Self::ReseatBeforeReplaceDone => "reseat.before_replace_done",
             Self::EstateHandoffAfterIntent => "estate.handoff.after_intent",
             Self::EstateHandoffAfterTemp => "estate.handoff.after_temp",
             Self::EstateHandoffAfterExchange => "estate.handoff.after_exchange",

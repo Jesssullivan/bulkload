@@ -218,6 +218,11 @@ pub struct Options {
     /// The free-space floor, percent of each destination file system
     /// (`--min-free-percent`; the engine's rule).
     pub min_free_percent: u8,
+    /// `--replace-archived-dest ROOT`, canonical (A-106): a destination
+    /// transcript, sidecar or rollout that is a symlink to a regular file
+    /// under one of these is replaced by the differing landed file, the
+    /// archive target kept and the link ledgered for `--undo`.
+    pub replace_archived: Vec<PathBuf>,
 }
 
 /// The default `--retention-margin-days`.
@@ -265,6 +270,7 @@ impl Options {
             respell_cwd: true,
             regularize: true,
             min_free_percent: crate::space::min_free_percent(),
+            replace_archived: Vec::new(),
         }
     }
 
@@ -557,6 +563,25 @@ fn space(options: &Options, wants: &[(&Path, u64)]) -> Result<()> {
     Ok(())
 }
 
+/// Settle the regularizations and archive replacements a crash left in
+/// flight, before any placement, whether or not this pass regularizes.
+fn settle_intents(
+    options: &Options,
+    ledger: &ledger::Ledger,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for (on, dest) in [
+        (options.claude, &options.dest_claude),
+        (options.codex, &options.dest_codex),
+    ] {
+        if let (true, Ok(real)) = (on, std::fs::canonicalize(dest)) {
+            regularize::settle_intents(&real, ledger, summary, emit)?;
+        }
+    }
+    Ok(())
+}
+
 /// Re-seat the landed sessions into the destination's live agent state:
 /// one JSON line per tool, per session and per thread, handed to `line`,
 /// then the summary line.
@@ -644,10 +669,17 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
             "{{\"schema\":\"{SCHEMA}\",\"kind\":\"tool\",\"tool\":\"{tool}\",\"state\":\"{state}\"}}"
         ))?;
     }
+    settle_intents(options, &ledger, &mut summary, emit)?;
     if options.claude && options.regularize {
         // Before placement: a regularized copy that is a prefix of a landed
         // transcript is then extended like any other.
-        regularize::regularize(&root(&options.dest_claude)?, &ledger, &mut summary, emit)?;
+        regularize::regularize(
+            &root(&options.dest_claude)?,
+            &options.replace_archived,
+            &ledger,
+            &mut summary,
+            emit,
+        )?;
     }
     if let Some(sessions) = &claude {
         claude::reseat(options, &lanes, &ledger, sessions, &mut summary, emit)?;

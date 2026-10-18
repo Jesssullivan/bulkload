@@ -119,6 +119,44 @@ pub struct CheckSummary {
     /// through the home's `git` or a `--map` symlink): reported, never
     /// judged (operator M2 round 2, 2026-10-17).
     pub respell_pending: u64,
+    /// `--replace-archived-dest` (A-106): destination links this ledger
+    /// replaced with the landed file (`done`); and, at placement paths
+    /// now, links to a regular file under a root that a pass would
+    /// replace (their sizes differ) or would compare (equal sizes: an equal
+    /// landing leaves the link). A replaced file is checked as the landed
+    /// file like any other.
+    pub replaced_archived: u64,
+    pub replace_pending: u64,
+    pub replace_equal_size: u64,
+}
+
+impl CheckSummary {
+    /// Count the placement path `dest` of the landed file `landed` when it
+    /// is an archive link a pass would replace or compare.
+    fn archive_candidate(
+        &mut self,
+        options: &Options,
+        ledger: Option<&Ledger>,
+        dest: &Path,
+        landed: &Path,
+    ) -> Result<()> {
+        let Some((_, resolved, _)) = place::archive_link(dest, &options.replace_archived)? else {
+            return Ok(());
+        };
+        if let Some(ledger) = ledger {
+            if ledger.regular(dest)?.is_some() {
+                return Ok(());
+            }
+        }
+        let target = std::fs::metadata(&resolved).map_or(0, |meta| meta.len());
+        let size = std::fs::symlink_metadata(landed).map_or(0, |meta| meta.len());
+        if place::compressed(landed) || size != target {
+            self.replace_pending += 1;
+        } else {
+            self.replace_equal_size += 1;
+        }
+        Ok(())
+    }
 }
 
 impl CheckSummary {
@@ -348,6 +386,13 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         // Whenever the destination index exists, landed threads or not.
         summary.respell_pending = codex::respell_pending(options, ledger.as_ref())?;
     }
+    if let Some(ledger) = ledger.as_ref() {
+        summary.replaced_archived = ledger
+            .regulars()?
+            .iter()
+            .filter(|row| row.replace && row.state == super::ledger::RegularState::Done)
+            .count() as u64;
+    }
     for (tool, state) in [
         (
             claude::TOOL,
@@ -388,7 +433,7 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
     }
     summary.lanes = table;
     emit(&format!(
-        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"r0\":\"{}\"}}",
+        "{{\"schema\":\"{SCHEMA}\",\"kind\":\"check-summary\",\"checked\":{},\"lanes\":{},\"pass\":{},\"fail\":{},\"incomplete\":{},\"unmapped\":{},\"by_id\":{},\"by_id_ok\":{},\"unlaned\":{},\"waived\":{},\"retention\":\"{}\",\"respell_pending\":{},\"replaced_archived\":{},\"replace_pending\":{},\"replace_equal_size\":{},\"r0\":\"{}\"}}",
         summary.checked,
         summary.lanes.len(),
         summary.count("pass"),
@@ -401,6 +446,9 @@ pub fn check(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Res
         summary.unlaned.iter().filter(|item| item.waived).count(),
         if summary.retention_ok { "ok" } else { "unsafe" },
         summary.respell_pending,
+        summary.replaced_archived,
+        summary.replace_pending,
+        summary.replace_equal_size,
         if summary.verdict().is_ok() { "pass" } else { "fail" },
     ))?;
     Ok(summary)
@@ -507,6 +555,20 @@ fn check_claude(
             .join("projects")
             .join(&key)
             .join(format!("{}.jsonl", candidate.sid));
+        if !options.replace_archived.is_empty() {
+            summary.archive_candidate(options, ledger, &dest, &candidate.path)?;
+            let slug = match cached.as_ref().and_then(|row| row.slug.clone()) {
+                Some(slug) => Some(slug),
+                None => slug_of(&candidate.path)?,
+            };
+            for (landed, rel, kind) in
+                claude::companions(options, sessions, candidate, &key, slug.as_deref())?
+            {
+                if kind == super::Kind::Sidecar {
+                    summary.archive_candidate(options, ledger, &root.join(&rel), &landed)?;
+                }
+            }
+        }
         let mut held = holds(&candidate.path, &dest, true)?;
         if !matches!(held, Holds::Not(_)) {
             let slug = match cached.as_ref().and_then(|row| row.slug.clone()) {
@@ -627,6 +689,14 @@ fn check_codex(
                 continue;
             }
         };
+        if let Some(rel) = &rel {
+            summary.archive_candidate(
+                options,
+                ledger,
+                &root.join(codex::dest_form(rel)),
+                &options.landing_codex.join(rel),
+            )?;
+        }
         let held = match rel {
             None => Holds::Not("landing-absent"),
             Some(rel) => thread_holds(
@@ -741,6 +811,12 @@ fn check_codex(
                 continue;
             }
         };
+        summary.archive_candidate(
+            options,
+            ledger,
+            &root.join(codex::dest_form(&file.rel)),
+            &landed,
+        )?;
         let held = thread_holds(
             options,
             (&root, dest.as_ref()),

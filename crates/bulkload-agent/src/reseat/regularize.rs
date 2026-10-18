@@ -222,7 +222,7 @@ fn lstat_identity(path: &Path) -> Option<Identity> {
 /// The identity and BLAKE3 of the regular file at `path` (not following a
 /// terminal symlink), read whole; `None` when it is absent, not a regular
 /// file, cannot be opened, or changed while it was read.
-fn read_digest(path: &Path) -> Result<Option<(Identity, [u8; 32])>> {
+pub(super) fn read_digest(path: &Path) -> Result<Option<(Identity, [u8; 32])>> {
     let Ok(mut file) = crate::hash::open_nofollow(path) else {
         return Ok(None);
     };
@@ -462,7 +462,7 @@ impl<'a> Site<'a> {
                 .refuse_at("reseat::regularize::exchange_back")?;
             self.seal()?;
             let kept = self.keep()?;
-            self.ledger.delete_regular(self.link)?;
+            self.forget(&row)?;
             return Ok(Outcome::raced("raced-restored", kept));
         }
         // Both written (or the link gone): the copy stays at the path, the
@@ -490,8 +490,18 @@ impl<'a> Site<'a> {
         // Not exchanged (or exchanged back): the temporary, if any, is the
         // staged copy.
         self.retire_staged(&row)?;
-        self.ledger.delete_regular(self.link)?;
+        self.forget(&row)?;
         Ok(None)
+    }
+
+    /// Drop the row of a regularization or replacement that did not take
+    /// place; for a replacement, any placement row of the path too (the
+    /// destination's link is there again: decided afresh).
+    fn forget(&self, row: &Regular) -> Result<()> {
+        if row.replace {
+            self.ledger.delete_placement(self.link)?;
+        }
+        self.ledger.delete_regular(self.link)
     }
 
     fn regularize(&self) -> Result<Outcome> {
@@ -525,6 +535,7 @@ impl<'a> Site<'a> {
             regular: staged.copy,
             digest: Some(staged.digest),
             state: RegularState::Intent,
+            replace: false,
         };
         if !staged.verified || !self.unchanged(&row) {
             // Written while it was copied or before the swap: the archive
@@ -669,11 +680,51 @@ impl<'a> Site<'a> {
 /// Ledger and I/O refusals; a link's own outcome is its line.
 pub fn regularize(
     root: &Path,
+    archived: &[PathBuf],
     ledger: &Ledger,
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
-    // Rows a crash left in flight, whatever the link is now.
+    settle_intents(root, ledger, summary, emit)?;
+    for link in links(root)? {
+        if ledger.regular(&link)?.is_some() {
+            // Regularized, raced or undone: never again by itself.
+            continue;
+        }
+        if !archived.is_empty()
+            && std::fs::canonicalize(&link)
+                .is_ok_and(|real| archived.iter().any(|root| real.starts_with(root)))
+        {
+            // A link into a `--replace-archived-dest` root is left for the
+            // placement to replace with the landed file (A-106); one no
+            // landed file names stays a link.
+            continue;
+        }
+        let Some(site) = Site::new(ledger, &link)? else {
+            continue;
+        };
+        let outcome = site.regularize()?;
+        *summary
+            .rows
+            .entry(format!("link-{}", outcome.word))
+            .or_default() += 1;
+        emit(&line(&link, &outcome))?;
+    }
+    Ok(())
+}
+
+/// Settle every regularization or replacement row a crash left `intent`
+/// under the destination root `root`, whatever the path is now (run
+/// before any placement, regularizing or not).
+///
+/// # Errors
+/// Ledger and I/O refusals.
+pub fn settle_intents(
+    root: &Path,
+    ledger: &Ledger,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
     for row in ledger.regulars()? {
         if row.state == RegularState::Intent && row.link.starts_with(root) {
             if let Some(site) = Site::new(ledger, &row.link)? {
@@ -686,21 +737,6 @@ pub fn regularize(
                 }
             }
         }
-    }
-    for link in links(root)? {
-        if ledger.regular(&link)?.is_some() {
-            // Regularized, raced or undone: never again by itself.
-            continue;
-        }
-        let Some(site) = Site::new(ledger, &link)? else {
-            continue;
-        };
-        let outcome = site.regularize()?;
-        *summary
-            .rows
-            .entry(format!("link-{}", outcome.word))
-            .or_default() += 1;
-        emit(&line(&link, &outcome))?;
     }
     Ok(())
 }
@@ -731,6 +767,11 @@ pub fn undo(ledger: &Ledger, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result
             RegularState::Done | RegularState::Raced => site.undo(row.clone())?,
         };
         undone += u64::from(outcome.word == "undone");
+        if row.replace && outcome.word == "undone" {
+            // The destination's link is back: no landed file is placed
+            // there any more.
+            ledger.delete_placement(&row.link)?;
+        }
         emit(&format!(
             "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo\",\"tool\":\"{TOOL}\",\"link\":{},\"target\":{},\"outcome\":\"{}\",\"refused\":{}}}",
             json_string(&row.link.to_string_lossy()),
