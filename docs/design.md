@@ -120,6 +120,161 @@ recorded under another source (`record-source-mismatch`) is still refused
   does. A review row naming such a code disposes nothing and is listed under
   `reviewed.unmatched`; the rest of the ledger keeps working.
 
+**Capture-refused items carried as files (M2r2 b, 2026-10-17).** An item
+whose capture refused has no capture record; `estate-apply` records it
+`CAPTURE_ABSENT`, and closure holds it `refused-pending-review`. The cases
+are a partial clone, a malformed inventory, a missing index, a nest
+conversion attribute and a failed Git child. The in-place run carried 14
+such items with hand-run `pull` sessions, which closure could not bind to
+the plan.
+
+`estate-carry-files [--dry-run] [--beside SUFFIX] [--item ID]... [--host
+HOST --source-state-root DIR [--remote-executable PATH] [--ssh-config FILE]]
+PLAN CORPUS PRIVATE_STATE SOURCE CARRY_STATE` carries them with bulkload's
+own transfer and records the result in the estate ledger.
+
+- **Eligible.** An item is eligible when the corpus holds no capture
+  record for it, and its outcome record is
+  `CAPTURE_ABSENT`, or an earlier `carried-as-files`, which is re-proved.
+  Every other item is printed `skipped=<why>` and left alone.
+- **Destination.** The destination is the planned workspace, or with
+  `--beside` the workspace path with SUFFIX appended (a suffix holding `/`
+  or NUL refuses `FIELD_DOMAIN_VIOLATION`). An absent destination is made
+  one level deep, 0755, under an existing parent; otherwise the item
+  refuses `GIT_DESTINATION_PARENT_MISSING`.
+- **One transfer session.** Each item gets one `copy` or `pull` (from
+  HOST, with the remote source state under DIR) recorded in
+  `CARRY_STATE/<item>/dest`, like any session. The transfer's rules hold:
+  - bytes are carried exactly, `.git` included;
+  - an equal destination file is adopted with nothing written;
+  - a differing one is refused and never overwritten;
+  - the transfer's own durability order applies.
+
+  A session that ends refused, or completes with a refused path, does not
+  carry the item. It prints `carried=incomplete` with the first refused
+  path, keeps its outcome, and the verb exits nonzero. The transfer's own
+  rows, joined with `--transfer`, name every refused path.
+- **Binding an earlier session (`--bind ITEM=DEST_STATE`).** The item is
+  bound to a session the same transport already recorded in that state:
+  same source key, same destination, completed, with no refused path. No
+  session runs and nothing is written under the destination; the `.git`
+  resolution and the records below are the same. This is how bulkload proves a
+  carry made earlier by its own `pull` (the in-place run's hand-run
+  sessions). Without such a record the item refuses
+  `CLOSURE_UNACCOUNTED` and keeps its outcome. A later session rewriting
+  that record unproves the carry (`carried-transfer-changed`) until it is
+  bound again.
+- **`.git` resolution (#261).** Whenever anything landed (a completed,
+  incomplete or refused session, or a bind), every directory below the
+  destination that holds a `.git` entry (a directory, a pointer file, a
+  symlink, or a symlink to a pointer file) is resolved as Git resolves it.
+  Git's `rev-parse` gives its git dir, common dir and top level; it runs
+  with no optional locks, no hooks, no fsmonitor and no discovery above
+  the directory. Its object alternates and every symlink inside its
+  administration are resolved too. Each result must be inside the carried
+  tree, or Git must be unable to use the directory at all (an
+  administration absent on this host). Anything outside refuses
+  `GIT_CARRY_POINTER_ATTACHED path=<the .git entry>`, recorded as the
+  item's outcome, because Git would act on another repository through the
+  carried copy. That covers:
+  - a pointer naming an outside repository;
+  - a `.git` symlink to a pointer file;
+  - an internal worktree administration whose `commondir` is outside;
+  - a nested `.git` directory with an outside `core.worktree`;
+  - outside alternates.
+
+  An incomplete session reports an attachment too. The landed bytes are
+  left for review; nothing is rewritten. Nothing is withheld before
+  landing, because the source walk (local, or the remote `serve`) has no
+  per-path exclusion. Admin-internal gitfiles that Git reads only for
+  pruning (`worktrees/*/gitdir`) are not resolved.
+- **Records, in order.** The carry record
+  `{item}-{blake3(SOURCE)}.carried` is written first, durably (temporary,
+  fsync, rename, directory fsync). It holds the item, source, destination,
+  `beside`, whether the carry made the destination, the transfer state, the
+  session's row identity and the blake3 of its record bytes, and the
+  pointers. Then the outcome becomes `carried-as-files` (a new `Outcome`
+  variant, appended after `Refused`).
+  - A crash between the two leaves `CAPTURE_ABSENT`, and closure never
+    reads such an item `carried`; the rerun's transfer adopts what landed
+    and finishes it (fault point `estate.carry.recorded`, harness row
+    `estate_carry_recorded`).
+  - `estate-apply` keeps a carried item's outcome while its carry still
+    proves, so a re-apply never returns it to `CAPTURE_ABSENT`.
+- **Closure (v5).** Closure counts the item `carried` (accounted, like
+  `applied`) only when all of these hold:
+  - the outcome is `carried-as-files`;
+  - the carry record decodes and names the item and its source;
+  - its destination is the planned workspace with the recorded suffix, or,
+    for a refs-only item, none of its own;
+  - the transfer record it names still has the recorded bytes, and is a
+    completed session from this item's source into that destination with
+    no refused path;
+  - every recorded `.git` directory still resolves inside the destination
+    or not at all;
+  - for a refs-only item, its `via` names a planned workspace item of the
+    same source whose own outcome is `carried-as-files` and whose own carry
+    proves.
+
+  Otherwise it is unaccounted, with a reason such as
+  `carried-record-missing`, `carried-destination-mismatch`,
+  `carried-transfer-changed`, `carried-transfer-mismatch`,
+  `carried-transfer-refused-paths`, `carried-pointer-attached`,
+  `carried-shape-mismatch` or `carried-via-unproved`.
+- **What `carried` means.** `carried` means the item was carried at the
+  session's time.
+  - Checked again on every proof (closure, and `estate-apply` keeping the
+    outcome): the transfer record's bytes, and each recorded `.git`
+    directory's resolution, so a target that appeared since (a sibling
+    applied later beside it, say) makes the item unaccounted.
+  - Not checked again: the destination's bytes, and `.git` entries made
+    under it after the carry.
+- **Byte-exact, with the transfer's two exceptions.** A live SQLite
+  database is carried as a snapshot (`--sqlite=snapshot`), its live
+  sidecars covered, not copied. The source's tagged engine temporaries are
+  listed by the transfer, not carried.
+- **Selections are checked before any write.** Every `--item` and
+  `--bind` must name a planned, eligible item, and a bind must name a
+  workspace item; otherwise the run refuses `FIELD_DOMAIN_VIOLATION`, one
+  line per bad selection, before any lock or write. `--bind-only` also
+  refuses a selected workspace item that has no bind, so no session can
+  run by accident.
+- **Reruns.** An item already carried whose carry still proves is kept
+  (`kept=proved`) with no session, unless `--recarry` or a bind for it asks
+  again. One whose carry no longer proves needs either.
+  - A rerun that ends refused or incomplete for an item that was carried
+    writes `CAPTURE_ABSENT` back, for it and for every refs-only item
+    riding on it.
+  - Carrying a workspace item again also re-records the refs-only items
+    riding on it.
+- **Binaries.** Only binaries with this change know `carried-as-files`
+  (outcome variant 11). An older binary reads such a record as unreadable,
+  and an older `estate-apply` records `CAPTURE_ABSENT` over it. Run the
+  carry and every later apply with the merged binary.
+- **What changed for a v4 reader.** `bulkload.closure.v5`:
+  - the disposition `carried`, counted in the new `totals.carried` after
+    `covered` (accounted; it is in neither `applied` nor
+    `pending_review`);
+  - a `carried` block on such a row: `via`, `destination`, `beside`,
+    `transfer_state` and `gits`;
+  - the new unaccounted reasons above.
+
+  Nothing else changed.
+- **No-op applies.** A re-apply keeps a carried item's outcome as a no-op,
+  like a previous journal: its repository is not marked touched.
+- **Refs-only items.** A refs-only item whose capture refused (the plan's
+  `repository` only) has its custody, the source's `.git`, inside a carried
+  workspace item of the same source. After the workspace items, it gets a
+  carry record naming that item (`via`) and binding the same transfer
+  record, and the outcome `carried-as-files`. Nothing is written at its
+  repository. Without a carried sibling it keeps `CAPTURE_ABSENT`. Closure
+  requires `via` exactly for a refs-only item
+  (`carried-shape-mismatch` otherwise).
+- **`--dry-run`.** It reads only and prints, per item, the destination,
+  what is there now (`absent`, `empty`, `nonempty`), whether its parent
+  exists, the prior transfer records in its state, and the session it would
+  run.
+
 **Transfers in the same report (WP3 PR 4, 2026-10-15, S4).** Every `copy`
 and `pull` session leaves a durable record in its DEST_STATE, one per
 transfer under `transfer.closure.d/<item>.closure` (`<item>` is the
@@ -184,18 +339,55 @@ Not joined: `snapshot` and the offline compose verbs, which belong to no
 run; a source's tagged engine temporaries a walk skipped are listed by the
 transfer, not rows.
 
-The report schema is `bulkload.closure.v4` from #226 (OI-1003-Q171/Q172,
-2026-10-15). What changed for a v3 reader: one top-level block after
+The report schema is `bulkload.closure.v5` from M2r2 b (2026-10-17; what
+changed for a v4 reader is in the carried-as-files paragraph above). v4 came
+from #226 (OI-1003-Q171/Q172, 2026-10-15). What changed for a v3 reader: one top-level block after
 `unmatched_journals`, `omissions`: the rebuildable roots the planned items'
 current captures omitted (`node_modules`, `.direnv`, `__pycache__`,
 `.terraform` and the rest of `REBUILDABLE_DIRECTORIES`), from each
 capture's `{bundle}.omissions` sidecar: `items_known`, `items_unknown`,
 `roots`, `entries`, `bytes`, one row per root (`item`, `path`, `entries`,
-`bytes`) and the `unknown` items, whose capture predates the sidecar and
-is never counted as zero. Rows, totals, dispositions and the gate are
-v3's: an omitted root is accounted custody outside `planned` and every
-disposition. "Equals the source" reads exactly: equal except these
-counted roots.
+`bytes`) and the `unknown` items, never counted as zero. Rows, totals,
+dispositions and the gate are v3's: an omitted root is accounted custody
+outside `planned` and every disposition. "Equals the source" reads
+exactly: equal except these counted roots.
+
+A capture without the sidecar (M2 round 2, d, 2026-10-17). Every capture
+since `bf10700c` (authored 2026-09-22) names what it omitted in its own bundle, as
+the metadata ref `refs/carry-export/rebuildable-omissions-v1`, present only
+when it omitted something; the sidecar arrived with `3fe1f075`
+(2026-10-16). The 2026-10-16 in-place batches were captured on neo by
+`5beb0314`, between the two, so `closure-report` on i02 listed all 900
+items `unknown`. Without a sidecar the report now reads the bundle's
+header (never its pack): no omission ref means the capture omitted
+nothing (known, zero roots); the header is read strictly, and a line, a
+capability or an oid a capture header does not have is
+`header-unreadable`, never zero. With `--omissions-from-destination`
+(opt-in: it reads the live destination repositories), the ref's list is
+read by the oid the header names from the item's destination repository,
+which holds it once the item's import ran, and a shallow custody
+envelope's inventory is read from the same repository first. Reads only
+(`cat-file`, `rev-parse`, `ls-tree`, `--no-optional-locks`); nothing is
+unbundled or written. A destination is read only with a `git` at or over
+2.46 (so `GIT_NO_LAZY_FETCH` keeps a missing object from being fetched)
+and never when it is a partial clone, and only the shape a capture writes
+is taken: a commit whose tree is one `100644 blob` entry named `value`.
+Objects are not hashed again: that needs a SHA implementation the agent
+does not carry or a writer subcommand the S2 contract's pinned writer
+table does not admit (bulkload#188), so an object planted in the
+destination under the metadata oid reads as what it says. Like the
+sidecar, nothing checks the bundle's own digest here: a pack corrupted
+after its header still reads as its header says.
+What stays unknown says why on stderr, outside the v4 JSON:
+`omissions-unknown <reason>=<items> ...`, the reasons `no-capture`,
+`capture-unreadable`, `sidecar-unreadable`, `header-unreadable`,
+`value-not-read` and `envelope-not-read` (named in the bundle, destination
+not read), `value-not-held` and `envelope-not-held` (read, but the
+destination does not hold it, for example before the apply),
+`value-unreadable` and `envelope-unreadable` (held, but not the shape a
+capture writes, over the cap or not decodable),
+`holder-partial-clone` and `holder-git-too-old`. `estate-diff` and `estate-handoff` still read the
+sidecar only.
 
 The report schema was `bulkload.closure.v3` from WP3 PR 4. What changed for
 a v2 reader: a transfer row names its `kind` and adds `transfer` (the
@@ -1571,7 +1763,24 @@ miss (#87).
     `SqliteSidecar`, and its outcome is its base's, resolved when the session
     ends: covered when the base was published from a snapshot or reused as
     one, refused by name (`SQLITE_STATE_CHANGED`) otherwise. A sidecar with
-    no base is offered and refused by name, as in v5. A sidecar listed and
+    no base is offered and refused by name, as in v5. *A Git ref or reflog
+    named like a sidecar is exempt* (M2r2, 2026-10-17). A branch named
+    `fix-journal`, `fix-wal` or `fix-shm` has a loose ref and a reflog of
+    that name beside the ref of its base name; the in-place run's cmux pull
+    refused three such reflogs `SQLITE_STATE_CHANGED`. The exemption is
+    decided by content, for a path with a directory named `refs` or `logs`
+    above it (any administration: `.git`, a bare repository whatever its
+    name, a submodule's `modules/<name>`, a linked worktree's). The file
+    must read as a ref or reflog: `ref: `, or a 40- or 64-digit lowercase
+    hex id followed by a newline or a space. Its base-named neighbour, when
+    present, must not carry the `SQLite` magic. Such a file is offered and
+    carried as an ordinary file, and its base is never offered as a
+    database beside a `-wal`. Anything else under `refs/` or `logs/` keeps
+    the sidecar rules: an empty file, a `SQLite` journal, WAL or
+    shared-memory file, text that is not a ref, or anything unreadable.
+    The prefilter is by path, so no other sidecar is read for this; a
+    candidate's check reads at most 80 bytes of it and 16 of its base
+    (`source_sniff_bytes`). A sidecar listed and
     gone before its stat (a live rollback-mode store's `-journal`) is still
     its base's sidecar, not an `IO` refusal. A base without the
     database magic (an encrypted store) offered beside a `-wal` that holds
@@ -2293,6 +2502,94 @@ starts.
   directory: no preflight charges it, and a source-side full disk is never
   reported as the destination's. Any other I/O error a store meets is `IO`
   with its errno (`EIO` where the errno cannot be read).
+
+## A symlinked live path into a side root: `--side-root` (M2r2 item e, 2026-10-17)
+
+The 10-16 in-place move met live checkout paths that were symlinks into a
+side root: `~/git/<name> -> estate/gftb-20261015/git/<name>`, the trees an
+earlier estate landing made. `estate-apply --adopt` refuses a checkout
+spelled through a symlink (`GIT_DESTINATION_OCCUPIED`, `estate-diff`
+`symlinked-path`; P97, P98), so the lane replaced each link with a `cp -a`
+of its target and ran `git worktree repair` by hand
+(`gftb-unlink-run.sh`, 29 links). `--side-root ROOT` (repeatable) on
+`estate-apply --adopt` and `estate-diff` does it natively:
+
+- **Which links.** For each planned repository and workspace path, the
+  first symlink at or above it (from the root down). It is this verb's only
+  when it names a path inside a side root; a link elsewhere is left alone
+  (its items refuse as before). It is seated only when its single hop names
+  a real directory strictly inside the root: the link's text, joined to the
+  link's directory, is already in lexical form (no `.` or `..`) and is
+  exactly the path the system resolves (no other link on the way); the
+  link's own parent is a real path; the target is neither at, inside nor
+  above another such link's target or the real path of any planned path
+  not spelled through this link (two links into nested trees, a
+  `.worktrees/` directory inside a main checkout reached by its own link,
+  an item planned at the side root: all refused); and both are on one file
+  system. Otherwise the link is refused (`PATH_ESCAPES_ROOT`,
+  `GIT_DESTINATION_OCCUPIED`, or `IO` with `EXDEV`) and no path is changed.
+  Each link is checked again right before its seat.
+- **When.** After the apply's preflights (the space floor) and before any
+  item, under the STATE lock and an `flock` on both parent directories (two
+  applies or undos on different STATEs never move one live path at once;
+  the second refuses `IO` `EWOULDBLOCK`). `--side-root` needs `--adopt`
+  (`FIELD_DOMAIN_VIOLATION` otherwise): a seated tree is an existing
+  checkout. A seat stays when its items then refuse; `estate-unseat` undoes
+  it.
+- **The seat.** A record `seat-<blake3(LIVE)>.seat` in STATE (live path,
+  target, link text, the directory's device and inode, the plan, phase
+  `seating`), durable first; one `renameat2(RENAME_EXCHANGE)`
+  (`renameatx_np(RENAME_SWAP)` on Darwin) of the two names, so the live
+  path holds the directory itself (the same inode: no byte copied, read or
+  written, every `lstat` field below it kept; only the moved directory's
+  own ctime changes) and the target the old link. A swap that fails with
+  both names unchanged (no `RENAME_EXCHANGE` on NFS or FUSE, `ENOTDIR`)
+  removes its record again. Then at once, before either parent is synced,
+  the target's link is replaced by one naming the live path (made under a
+  fixed temporary name, swapped in by a second exchange, the old link
+  unlinked), so every path that still names the side root (a linked
+  worktree's `gitdir` file, its admin directory's backlink, another tool's
+  configuration) resolves to the same tree; then both parents are synced.
+  The swap is atomic for the live spelling; between the two exchanges the
+  side-root spelling names the old link. The apply prints `seat live=
+  target= outcome=seated|seat-resumed|unseated|refused reason=`.
+- **Then the items.** They adopt (A11a) or re-key (A11b) at the live path,
+  as at any real directory: the adopt proofs compare canonical paths, so
+  worktree links that name the side root still prove.
+- **Crash.** The record's phase and what the two paths hold name every
+  intermediate state of a seat (recorded, swapped, relinked) and of an
+  undo (marked, swapped back, relinked, record not yet removed). Every
+  `estate-apply` on the STATE, with or without `--side-root`, first
+  finishes each record by its phase; a record whose paths hold none of its
+  states is a `refused` line (`RECEIPT_BINDING_INVALID`) and the apply goes
+  on, its paths left as they are.
+- **Undo.** `estate-unseat PRIVATE_STATE [LIVE ...]` marks the record
+  `unseating` (durable), swaps back, restores the live link with its own
+  text and removes the record (`outcome=unseated plan=`); a tree replaced
+  or a link rewritten since refuses `RECEIPT_BINDING_INVALID` before the
+  mark, changing no path. An undo after the items re-keyed leaves their
+  ledgers keyed to the live plan.
+- **Dry run.** `estate-diff --side-root ROOT` prints one `kind:"seat"` row
+  per link (`seatable` or `refused` with its code) and answers each item
+  spelled through a seatable link at the directory it names (the tree the
+  live path holds once seated), with the component `side-root-seat`.
+  Read-only.
+- **Against the copy `cp -a` made (operator decision).** No second tree,
+  no disk, no byte to re-prove, and the live spelling changes atomically.
+  The side root does change: each seated target becomes a link back to the
+  live path, where `cp -a` left the side root untouched and duplicated it.
+  No `git worktree repair` runs: the admin files keep the side-root
+  spelling, which the link back resolves, so `git worktree list` shows the
+  side-root paths and removing the side root (its links back) would break
+  those worktrees. Repairing them (a recorded write of `.git` and `gitdir`
+  files) is not built.
+- Tests: `estate::seat` unit tests (exact undo; every crash step of a seat
+  and of an undo, never re-seated; a failed swap leaves no record; a record
+  resume cannot finish is a line; a held parent refuses; hop rules; nested
+  targets and planned paths inside a target; a target the plan names);
+  P120 (a main and a linked worktrees directory landed into a side root,
+  seated and re-keyed, closure passing, unseated); P121 (single hop only,
+  `--side-root` without `--adopt` refused).
 
 ## Installing the agent (M2 item 4, 2026-10-16)
 

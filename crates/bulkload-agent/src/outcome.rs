@@ -82,10 +82,16 @@ pub enum Outcome {
     IndexRepaired,
     /// The verb refused the item.
     Refused(Refusal),
+    /// `estate-carry-files` carried an item whose capture refused as files,
+    /// byte-exact, through a recorded transfer session (M2r2 b). Appended
+    /// after `Refused`: the variant order is the on-disk format.
+    CarriedAsFiles,
 }
 
-/// Every non-refusal outcome and its legacy string, in variant order.
-pub const NAMED: [(Outcome, &str); 10] = [
+/// Every non-refusal outcome and its legacy string, in variant order
+/// (`Refused`, variant 10, sits between `IndexRepaired` and
+/// `CarriedAsFiles`).
+pub const NAMED: [(Outcome, &str); 11] = [
     (Outcome::Captured, "captured"),
     (Outcome::CapturedWithDrift, "captured-with-drift"),
     (
@@ -108,6 +114,7 @@ pub const NAMED: [(Outcome, &str); 10] = [
         "previous-ref-custody-not-workspace-parity",
     ),
     (Outcome::IndexRepaired, "index-repaired"),
+    (Outcome::CarriedAsFiles, "carried-as-files"),
 ];
 
 /// The legacy string of a refusal outcome.
@@ -477,6 +484,8 @@ mod tests {
                 .prop_map(BulkloadRefusal::GitNestPopulatedSubmodule),
             path.clone()
                 .prop_map(BulkloadRefusal::GitNestCarrierRefused),
+            path.clone()
+                .prop_map(BulkloadRefusal::GitCarryPointerAttached),
             path.clone().prop_map(BulkloadRefusal::GitSourceAlternates),
             proptest::option::of(path).prop_map(BulkloadRefusal::SpaceExhausted),
             prop_oneof![
@@ -748,11 +757,18 @@ mod tests {
     #[test]
     fn golden_encodings_are_stable() {
         for (index, (outcome, _)) in NAMED.iter().enumerate() {
+            // `Refused` is variant 10; the outcomes appended after it
+            // (`CarriedAsFiles`, M2r2 b) sit one index further on.
+            let variant = if index >= 10 { index + 1 } else { index };
             assert_eq!(
                 postcard::to_allocvec(outcome).unwrap(),
-                vec![u8::try_from(index).unwrap()]
+                vec![u8::try_from(variant).unwrap()]
             );
         }
+        assert_eq!(
+            postcard::to_allocvec(&Outcome::CarriedAsFiles).unwrap(),
+            vec![11]
+        );
         let record = OutcomeRecord {
             source: PathBuf::from("/s"),
             outcome: Outcome::Refused(Refusal::new("IO", "estate::apply", Some(2)).unwrap()),

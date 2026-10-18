@@ -3070,11 +3070,25 @@ fn capture_file<'w>(
     if row.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES) {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
-    if crate::walk::SQLITE_SIDECAR_SUFFIXES
+    // Every -wal, -shm and -journal is refused by name, except a Git ref or
+    // reflog so named, decided by content (M2r2).
+    if let Some(suffix) = crate::walk::SQLITE_SIDECAR_SUFFIXES
         .iter()
-        .any(|suffix| row.rel_path.ends_with(suffix))
+        .find(|suffix| row.rel_path.ends_with(suffix))
     {
-        return Err(BulkloadRefusal::SqliteStateChanged);
+        let base = row
+            .rel_path
+            .get(..row.rel_path.len() - suffix.len())
+            .unwrap_or_default();
+        let is_ref = crate::walk::ref_storage_candidate(&row.rel_path)
+            && crate::walk::ref_named_like_sidecar(
+                work.root_fd,
+                crate::walk::rel_path(&row.rel_path),
+                crate::walk::rel_path(base),
+            );
+        if !is_ref {
+            return Err(BulkloadRefusal::SqliteStateChanged);
+        }
     }
     #[cfg(feature = "fault-injection")]
     let file_path = work.root.join(crate::walk::rel_path(&row.rel_path));

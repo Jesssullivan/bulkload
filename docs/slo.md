@@ -1285,8 +1285,9 @@ surface; the design note is `docs/agent-notes/2026-10-15-estate-adopt-design.md`
 - **`--activate-origin PREFIX`** activates a named scp-style or `ssh://`
   origin at a first landing (#226 item 6). The #216 default is unchanged:
   only HTTPS origins are active, and a local path never.
-- **Rebuildable omissions are counted** (#226 item 5). Closure is
-  `bulkload.closure.v4`: an `omissions` block names every omitted root
+- **Rebuildable omissions are counted** (#226 item 5). Closure was
+  `bulkload.closure.v4` (v5 since M2r2 b adds the `carried` disposition;
+  see `docs/design.md`): an `omissions` block names every omitted root
   with its entries and bytes, and a capture from before the sidecar shows
   `unknown`, never zero. "Equals the source" is exact except for those
   counted roots.
