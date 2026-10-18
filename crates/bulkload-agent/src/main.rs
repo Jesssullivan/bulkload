@@ -60,7 +60,7 @@ SUBCOMMANDS:
                 Append selected items in one linear plan update
     estate-capture PLAN PRIVATE_STATE CORPUS JOBS [--include-rebuildable]
                 Capture reviewed Git items with successful capture reuse (jobs 1 or 2)
-    estate-apply [--adopt] [--exclude-union] [--activate-origin PREFIX]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
+    estate-apply [--adopt] [--exclude-union] [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS PRIVATE_STATE SOURCE JOBS
                 Import refs and restore only explicitly selected absent workspaces.
                 A landed checkout bulkload proves unchanged converges to the
                 current capture. --adopt (#226, OI-1003-Q171/Q172): an existing
@@ -91,8 +91,28 @@ SUBCOMMANDS:
                 repository ignores. Where a line would be appended it still
                 refuses for a negation (!pattern) on either side, an exclude a
                 bulkload ledger owns, a symlinked info or an exclude that is not
-                a regular file with one link this user owns
-    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+                a regular file with one link this user owns.
+                --side-root ROOT (repeatable; M2r2 item e; needs --adopt):
+                after the preflights and before any item, each planned path
+                spelled through a symlink whose one hop names a directory
+                inside ROOT (not nested with another seat's target or a
+                planned path) is seated: one exchange gives the live path the
+                directory (same inode, no byte copied) and a link back
+                replaces the side-root path, recorded in PRIVATE_STATE
+                (`seat live= target= outcome=seated|seat-resumed|unseated|refused
+                reason=`; an interrupted seat or undo is finished first); the
+                items then adopt or re-key at the live path, and a seat stays
+                if they refuse
+    estate-unseat PRIVATE_STATE [LIVE ...]
+                M2r2 item e: undo each seat estate-apply --side-root recorded in
+                PRIVATE_STATE (or only those of the LIVE paths given): the
+                directory back at its side-root path (the same inode), the
+                link back at the live path with its own text, the record
+                removed (the record is marked unseating first, so an
+                interrupted undo is finished, never re-seated). Refuses
+                RECEIPT_BINDING_INVALID, changing no path, when either path no
+                longer holds what the seat left.
+    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
                 ledger; differs with a hint without one), with what estate-apply
@@ -595,7 +615,7 @@ fn main() -> ExitCode {
         }
         Some(
             name @ ("estate-add" | "estate-add-batch" | "estate-show" | "estate-capture"
-            | "estate-apply" | "estate-diff" | "estate-handoff"),
+            | "estate-apply" | "estate-diff" | "estate-handoff" | "estate-unseat"),
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
@@ -1412,6 +1432,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     &estate::ApplyOptions {
                         adopt: options.adopt,
                         activate_origin: options.activate_origin,
+                        side_roots: options.side_roots,
                         exclude_union: options.exclude_union,
                     },
                 ),
@@ -1444,10 +1465,19 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     since: options.since,
                     scan: options.scan,
                     activate_origin: options.activate_origin,
+                    side_roots: options.side_roots,
                 },
                 &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),
             )
             .map(drop)?;
+            output.flush().refuse_at("main::estate_command")
+        }
+        "estate-unseat" if !args.is_empty() => {
+            let lives: Vec<PathBuf> = args.iter().skip(1).map(PathBuf::from).collect();
+            let mut output = std::io::stdout().lock();
+            estate::unseat(path(0)?, &lives, &mut |line| {
+                writeln!(output, "{line}").refuse_at("main::estate_command")
+            })?;
             output.flush().refuse_at("main::estate_command")
         }
         "estate-handoff" => {
@@ -1779,6 +1809,7 @@ struct EstateOptions {
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
+    side_roots: Vec<PathBuf>,
 }
 
 fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::ffi::OsString])> {
@@ -1817,6 +1848,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             }
             "--scan" => {
                 options.scan.push(PathBuf::from(value(at + 1)?));
+                at += 2;
+            }
+            "--side-root" => {
+                options.side_roots.push(PathBuf::from(value(at + 1)?));
                 at += 2;
             }
             other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
