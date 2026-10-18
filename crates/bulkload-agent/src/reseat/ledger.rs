@@ -48,9 +48,13 @@ pub const FILE: &str = "reseat.sqlite";
 /// first build, `550396c`: window digests, inode-only supersede intents)
 /// is refused, never read as this one; version 2 (`8a89f9a`) is migrated
 /// in place (new tables and session columns only).
-const VERSION: i64 = 3;
+const VERSION: i64 = 4;
 /// Version 2's tables are a subset of version 3's.
 const MIGRATE_FROM: i64 = 2;
+/// Version 3 lacks only `regularized.kind` (A-106): migrated in place. A
+/// build of version 3 refuses a version 4 ledger, so it never reads a
+/// replacement as a regularization (review B11).
+const MIGRATE_FROM_V3: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS placement(
@@ -305,7 +309,16 @@ pub struct Regular {
     /// `None` on a row written before it was recorded: never undone.
     pub digest: Option<[u8; 32]>,
     pub state: RegularState,
+    /// A `--replace-archived-dest` replacement (A-106): the regular file
+    /// at the path is the landed file, not a copy of the target; its
+    /// placement row is written once the row is `done` (a crash before
+    /// that leaves none, and the next pass adopts the file at the path).
+    pub replace: bool,
 }
+
+/// The `regularized.kind` of a `--replace-archived-dest` row (NULL for a
+/// regularization).
+const REPLACE_KIND: &str = "replace";
 
 /// The open ledger.
 pub struct Ledger {
@@ -369,7 +382,7 @@ impl Ledger {
             |row| row.get(0),
         ))?;
         let fresh = version == 0 && tables == 0;
-        if !fresh && version != VERSION && version != MIGRATE_FROM {
+        if !fresh && version != VERSION && version != MIGRATE_FROM && version != MIGRATE_FROM_V3 {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         sql(conn.execute_batch(SCHEMA))?;
@@ -378,6 +391,7 @@ impl Ledger {
             ("session", "l_size", "INTEGER"),
             ("session", "l_mtime", "INTEGER"),
             ("regularized", "digest", "BLOB"),
+            ("regularized", "kind", "TEXT"),
         ] {
             let present: i64 = sql(conn.query_row(
                 "SELECT count(*) FROM pragma_table_info(?1) WHERE name = ?2",
@@ -443,14 +457,14 @@ impl Ledger {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         ))?;
         let version: i64 = sql(conn.query_row("PRAGMA user_version", [], |row| row.get(0)))?;
-        if version != VERSION && version != MIGRATE_FROM {
+        if version != VERSION && version != MIGRATE_FROM && version != MIGRATE_FROM_V3 {
             return Err(BulkloadRefusal::SchemaMismatch);
         }
         Ok(Some(Self {
             conn,
             pass: 0,
             read_only: true,
-            v3: version == VERSION,
+            v3: version >= MIGRATE_FROM_V3,
             token: String::new(),
         }))
     }
@@ -917,9 +931,9 @@ impl Ledger {
         sql(self.conn.execute(
             "INSERT OR REPLACE INTO regularized(link, target, resolved,
                 k_dev, k_ino, k_size, k_mtime, t_dev, t_ino, t_size, t_mtime,
-                r_dev, r_ino, r_size, r_mtime, state, pass, digest)
+                r_dev, r_ino, r_size, r_mtime, state, pass, digest, kind)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18)",
+                     ?18, ?19)",
             params![
                 blob(&row.link),
                 blob(&row.target),
@@ -939,8 +953,75 @@ impl Ledger {
                 row.state.word(),
                 self.pass,
                 row.digest.as_ref().map(<[u8; 32]>::as_slice),
+                row.replace.then_some(REPLACE_KIND),
             ],
         ))
+        .map(drop)
+    }
+
+    /// Mark a replacement `done` and write the placement row that names
+    /// the landed file at its path, in one commit (review B1): the row of
+    /// another landing that kept the link (`occupied`) is replaced by it.
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit; the refusal of a
+    /// read-only or version 2 ledger.
+    pub fn put_replace_done(&self, regular: &Regular, placement: &Placement) -> Result<()> {
+        if !self.v3 || self.read_only || !regular.replace {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = self.put_regular(regular).and_then(|()| self.put(placement));
+        match outcome {
+            Ok(()) => sql(self.conn.execute_batch("COMMIT")),
+            Err(refusal) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Mark a replacement `done` that a crash left in flight, dropping in
+    /// the same commit any placement row of its path that is not this
+    /// ledger's own (`ours`, `adopted`, `continued`): the path now holds
+    /// the landed file, decided afresh by the pass (review B1).
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn settle_replace_done(&self, regular: &Regular) -> Result<()> {
+        if !self.v3 || self.read_only || !regular.replace {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self.conn.execute_batch("BEGIN IMMEDIATE"))?;
+        let outcome = self.put_regular(regular).and_then(|()| {
+            sql(self.conn.execute(
+                "DELETE FROM placement WHERE dest = ?1
+                 AND state NOT IN ('ours', 'adopted', 'continued')",
+                params![blob(&regular.link)],
+            ))
+            .map(drop)
+        });
+        match outcome {
+            Ok(()) => sql(self.conn.execute_batch("COMMIT")),
+            Err(refusal) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(refusal)
+            }
+        }
+    }
+
+    /// Delete the placement row of `dest` (a replacement that never took
+    /// place, or one `--undo` reversed).
+    ///
+    /// # Errors
+    /// `SQLITE_STATE_CHANGED` on a failed commit.
+    pub fn delete_placement(&self, dest: &Path) -> Result<()> {
+        if self.read_only {
+            return Err(BulkloadRefusal::ContractSelfInconsistent);
+        }
+        sql(self
+            .conn
+            .execute("DELETE FROM placement WHERE dest = ?1", params![blob(dest)]))
         .map(drop)
     }
 
@@ -948,11 +1029,20 @@ impl Ledger {
         if !self.v3 {
             return Ok(Vec::new());
         }
-        let mut statement = sql(self.conn.prepare(
-            "SELECT link, target, resolved, k_dev, k_ino, k_size, k_mtime,
-                    t_dev, t_ino, t_size, t_mtime, r_dev, r_ino, r_size, r_mtime, state, digest
-             FROM regularized WHERE ?1 IS NULL OR link = ?1 ORDER BY link",
+        // A ledger this build has not opened for writing yet has no `kind`
+        // column: every row of it is a regularization.
+        let kind: i64 = sql(self.conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('regularized') WHERE name = 'kind'",
+            [],
+            |row| row.get(0),
         ))?;
+        let mut statement = sql(self.conn.prepare(&format!(
+            "SELECT link, target, resolved, k_dev, k_ino, k_size, k_mtime,
+                    t_dev, t_ino, t_size, t_mtime, r_dev, r_ino, r_size, r_mtime, state, digest,
+                    {}
+             FROM regularized WHERE ?1 IS NULL OR link = ?1 ORDER BY link",
+            if kind > 0 { "kind" } else { "NULL" }
+        )))?;
         let identity = |row: &rusqlite::Row<'_>, at: usize| -> rusqlite::Result<Identity> {
             Ok(Identity {
                 dev: uint(row.get(at)?),
@@ -971,12 +1061,22 @@ impl Ledger {
                 identity(row, 11)?,
                 row.get::<_, String>(15)?,
                 row.get::<_, Option<Vec<u8>>>(16)?,
+                row.get::<_, Option<String>>(17)?,
             ))
         }))?;
         let mut out = Vec::new();
         for row in rows {
-            let (link, target, resolved, link_identity, target_identity, regular, state, hash) =
-                sql(row)?;
+            let (
+                link,
+                target,
+                resolved,
+                link_identity,
+                target_identity,
+                regular,
+                state,
+                hash,
+                kind,
+            ) = sql(row)?;
             out.push(Regular {
                 link,
                 target,
@@ -986,6 +1086,11 @@ impl Ledger {
                 regular,
                 digest: digest(hash),
                 state: RegularState::parse(&state)?,
+                replace: match kind.as_deref() {
+                    None => false,
+                    Some(REPLACE_KIND) => true,
+                    Some(_) => return Err(BulkloadRefusal::SchemaMismatch),
+                },
             });
         }
         Ok(out)

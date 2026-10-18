@@ -26,7 +26,7 @@ fn a_placement_without_a_row_charges_only_what_it_writes() {
     fs::write(&landed, &bytes).unwrap();
     let size = bytes.len() as u64;
     let planned = |dest: &std::path::Path, landed: &std::path::Path| {
-        place::planned(None, dest, landed).unwrap()
+        place::planned(None, dest, landed, &[]).unwrap()
     };
     // Absent, under an absent parent too.
     assert_eq!(planned(&base.join("absent.jsonl"), &landed), size);
@@ -45,6 +45,19 @@ fn a_placement_without_a_row_charges_only_what_it_writes() {
     let link = base.join("link.jsonl");
     std::os::unix::fs::symlink(&target, &link).unwrap();
     assert_eq!(planned(&link, &landed), size - 30);
+    // A symlink into a `--replace-archived-dest` root is replaced by the
+    // whole landed file (A-106), never regularized: the whole content.
+    let archive = base.join("archive");
+    std::fs::create_dir(&archive).unwrap();
+    std::fs::write(archive.join("t.jsonl"), &bytes[..30]).unwrap();
+    let archived_link = base.join("archived.jsonl");
+    std::os::unix::fs::symlink(archive.join("t.jsonl"), &archived_link).unwrap();
+    let roots = [std::fs::canonicalize(&archive).unwrap()];
+    assert_eq!(
+        place::planned(None, &archived_link, &landed, &roots).unwrap(),
+        size
+    );
+    assert_eq!(planned(&archived_link, &landed), size - 30);
     let dangling = base.join("dangling.jsonl");
     std::os::unix::fs::symlink(base.join("gone"), &dangling).unwrap();
     assert_eq!(planned(&dangling, &landed), 0);
@@ -173,10 +186,13 @@ fn a_kept_row_whose_destination_is_gone_charges_the_whole_file() {
         "{lines:?}"
     );
     let open = || ledger::Ledger::open_read_only(&options.state).unwrap();
-    assert_eq!(place::planned(open().as_ref(), &dest, &landed).unwrap(), 0);
+    assert_eq!(
+        place::planned(open().as_ref(), &dest, &landed, &[]).unwrap(),
+        0
+    );
     fs::remove_file(&dest).unwrap();
     assert_eq!(
-        place::planned(open().as_ref(), &dest, &landed).unwrap(),
+        place::planned(open().as_ref(), &dest, &landed, &[]).unwrap(),
         bytes.len() as u64
     );
     // And the pass that writes it is held to the floor.
@@ -218,13 +234,13 @@ fn an_occupied_link_that_became_a_regular_prefix_charges_its_tail() {
     let tail = (bytes.len() - cut) as u64;
     // Still the link: a regularization earlier in a pass would copy it.
     assert_eq!(
-        place::planned(open().as_ref(), &dest, &landed).unwrap(),
+        place::planned(open().as_ref(), &dest, &landed, &[]).unwrap(),
         tail
     );
     fs::remove_file(&dest).unwrap();
     fs::write(&dest, &bytes[..cut]).unwrap();
     assert_eq!(
-        place::planned(open().as_ref(), &dest, &landed).unwrap(),
+        place::planned(open().as_ref(), &dest, &landed, &[]).unwrap(),
         tail
     );
     let (_, lines, _) = run(&options);
@@ -273,6 +289,7 @@ fn a_regularization_keeps_the_placements_bytes_reserved_then_retries() {
         let mut lines = Vec::new();
         regularize::regularize(
             &root,
+            &[],
             &ledger,
             regularize::Space {
                 min_free_percent: 0,
