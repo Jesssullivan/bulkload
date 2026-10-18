@@ -24,7 +24,7 @@
 //! - P95: without `--adopt` an identical copy stays occupied, untouched.
 //! - P96 ADOPT-BARE (F7, A11d): a pre-made empty bare takes the marker,
 //!   the native refs and the captured symbolic HEAD under `--adopt`.
-//! - P108/P109 SIDE-ROOT-SEAT (M2r2 item e): live paths that are symlinks
+//! - P120/P121 SIDE-ROOT-SEAT (M2r2 item e): live paths that are symlinks
 //!   into a side root (the GFTB shape the 10-16 lane converted by hand
 //!   with `cp -a`) are seated by `estate-apply --side-root` and re-keyed
 //!   there; `estate-unseat` undoes it exactly.
@@ -1402,7 +1402,7 @@ fn unseat(state: &Path, lives: &[&Path]) -> Ran {
     agent(&list)
 }
 
-/// P108 SIDE-ROOT-SEAT (M2r2 item e; the GFTB shape of 10-16): a family
+/// P120 SIDE-ROOT-SEAT (M2r2 item e; the GFTB shape of 10-16): a family
 /// (a main and a linked worktree) landed into a side root by an earlier
 /// plan, the live main a symlink into it and the live worktrees directory
 /// another. Under a live-path plan `estate-apply --adopt` refuses the
@@ -1413,7 +1413,7 @@ fn unseat(state: &Path, lives: &[&Path]) -> Ran {
 /// touched) and re-keys both ledgers; closure passes; a rerun seats and
 /// writes nothing; `estate-unseat` puts both links and both trees back.
 #[test]
-fn p108_a_symlinked_live_path_into_a_side_root_is_seated_and_rekeyed() {
+fn p120_a_symlinked_live_path_into_a_side_root_is_seated_and_rekeyed() {
     let world = Gftb::new();
     let side = world.sting("estate");
     fs::create_dir(&side).unwrap();
@@ -1540,13 +1540,13 @@ fn p108_a_symlinked_live_path_into_a_side_root_is_seated_and_rekeyed() {
     );
 }
 
-/// P109 SIDE-ROOT-SEAT-REFUSED (M2r2 item e): only a single hop into a side
+/// P121 SIDE-ROOT-SEAT-REFUSED (M2r2 item e): only a single hop into a side
 /// root is seated. A link that reaches the side root through another link
 /// is refused `PATH_ESCAPES_ROOT` and left as it is (its item still refused
 /// as a symlinked spelling); a link outside every side root is not the
 /// verb's (no seat row).
 #[test]
-fn p109_only_a_single_hop_into_a_side_root_is_seated() {
+fn p121_only_a_single_hop_into_a_side_root_is_seated() {
     let world = Gftb::new();
     let side = world.sting("estate");
     fs::create_dir(&side).unwrap();
@@ -1585,4 +1585,203 @@ fn p109_only_a_single_hop_into_a_side_root_is_seated() {
     assert_eq!(fs::read_link(&live).unwrap(), alias.join("lamesh"));
     assert!(fs::symlink_metadata(&tree).unwrap().is_dir());
     assert_eq!(freeze_all(&world.sting("")), before, "a refused seat wrote");
+}
+
+/// The `--exclude-union` shape of the 2026-10-16 in-place run (M2 round 2,
+/// item 2: 250 new linked worktrees refused `GIT_IGNORE_POLICY_CONFLICT`
+/// where the source's exclude was a superset of the destination's): the
+/// source's common exclude is `captured`, the destination's `existing`,
+/// and two source-only linked worktrees are planned into the destination
+/// repository (no main item, which `--adopt` would refuse diverged).
+fn exclude_union_world<'a>(
+    world: &'a Gftb,
+    captured: &[u8],
+    existing: &[u8],
+) -> (Run<'a>, [PathBuf; 2]) {
+    let neo = world.neo("infra");
+    let second = world.neo("infra.worktrees/only-src2");
+    git(
+        &neo,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "src-only-2",
+            second.to_str().unwrap(),
+        ],
+    );
+    fs::write(second.join("second.txt"), b"second work\n").unwrap();
+    fs::create_dir_all(neo.join(".git/info")).unwrap();
+    fs::write(neo.join(".git/info/exclude"), captured).unwrap();
+    let infra = world.sting("infra");
+    fs::create_dir_all(infra.join(".git/info")).unwrap();
+    fs::write(infra.join(".git/info/exclude"), existing).unwrap();
+    let sources = [world.neo("infra.worktrees/only-src"), second];
+    let run = named_run(
+        world,
+        "union",
+        &[
+            (
+                &sources[0],
+                &infra,
+                Some(&world.sting("infra.worktrees/only-src")),
+            ),
+            (
+                &sources[1],
+                &infra,
+                Some(&world.sting("infra.worktrees/only-src2")),
+            ),
+        ],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    (run, sources)
+}
+
+/// Every `*.exclude-union` record in `state`, decoded.
+fn union_records(state: &Path) -> Vec<bulkload_agent::git_carry::exclude_union::ExcludeUnion> {
+    fs::read_dir(state)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "exclude-union"))
+        .map(|path| {
+            bulkload_agent::git_carry::exclude_union::read_record(&path)
+                .unwrap()
+                .unwrap()
+        })
+        .collect()
+}
+
+/// P108 EXCLUDE-UNION (M2 round 2, item 2): a destination exclude the
+/// capture's is a superset of (plus one line of its own) refuses every new
+/// linked worktree `GIT_IGNORE_POLICY_CONFLICT` without the flag, with
+/// nothing written; `estate-diff` says so and names what the flag would
+/// append (`exclude-union=3`), read-only. With `--exclude-union` both land:
+/// the first appends the three missing captured lines after the
+/// destination's own bytes (a byte prefix, kept exactly), counted
+/// `exclude-appended=3` and recorded in STATE as appended; the second finds
+/// nothing missing and writes nothing. A rerun is a journal no-op.
+#[test]
+fn p108_exclude_union_appends_the_missing_captured_lines_and_lands() {
+    let world = Gftb::new();
+    let captured = b"*.log\n# neo additions\nscratch/\n\n.envrc\n";
+    let existing = b"*.log\nsting-local/\n";
+    let (run, sources) = exclude_union_world(&world, captured, existing);
+    let exclude = world.sting("infra/.git/info/exclude");
+
+    let diff = run.diff(&[]);
+    for source in &sources {
+        let line = diff_line(&diff.stdout, source);
+        assert!(
+            line.contains("\"adopt\":\"ignore-policy-conflict\"")
+                && line.contains("\"exclude-union=3\""),
+            "{line}"
+        );
+    }
+    assert_eq!(fs::read(&exclude).unwrap(), existing);
+
+    let ran = run.apply(&[]);
+    assert!(!ran.ok, "{}", ran.stdout);
+    let rows = receipts(&ran.stdout);
+    for source in &sources {
+        let row = receipt(&rows, source);
+        assert_eq!(row.1, "refused", "{row:?}");
+        assert!(row.2.contains("GIT_IGNORE_POLICY_CONFLICT"), "{row:?}");
+    }
+    assert_eq!(fs::read(&exclude).unwrap(), existing);
+    assert!(union_records(&run.applied).is_empty());
+
+    let ran = run.apply(&["--exclude-union"]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let rows = receipts(&ran.stdout);
+    let mut appended = 0;
+    for source in &sources {
+        let row = receipt(&rows, source);
+        assert_eq!(row.1, "workspace-restored", "{row:?}");
+        if row.2.contains("exclude-appended=3") {
+            appended += 1;
+        }
+        assert!(!row.2.contains("GIT_"), "{row:?}");
+    }
+    assert_eq!(appended, 1, "one append, then nothing missing: {rows:?}");
+    let now = fs::read(&exclude).unwrap();
+    assert!(now.starts_with(existing), "the destination's bytes moved");
+    assert_eq!(
+        now,
+        b"*.log\nsting-local/\n# neo additions\nscratch/\n.envrc\n"
+    );
+    let records = union_records(&run.applied);
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0].appends.len(), 1);
+    let append = &records[0].appends[0];
+    assert_eq!(
+        append.state,
+        bulkload_agent::git_carry::exclude_union::AppendState::Appended
+    );
+    assert_eq!(
+        append.lines,
+        [&b"# neo additions"[..], b"scratch/", b".envrc"]
+            .map(<[u8]>::to_vec)
+            .to_vec()
+    );
+    assert_eq!(
+        fs::read(world.sting("infra.worktrees/only-src2/second.txt")).unwrap(),
+        b"second work\n"
+    );
+    assert_eq!(
+        fs::read(world.sting("infra.worktrees/only-src/only-src.txt")).unwrap(),
+        b"only-src work\n"
+    );
+
+    let ran = run.apply(&["--exclude-union"]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    for source in &sources {
+        let row = receipt(&receipts(&ran.stdout), source).clone();
+        assert_eq!(
+            row.1, "previous-workspace-restoration-not-revalidated",
+            "{row:?}"
+        );
+    }
+    assert_eq!(fs::read(&exclude).unwrap(), now);
+    assert_eq!(union_records(&run.applied), records);
+}
+
+/// P109 EXCLUDE-UNION-NEGATION (M2 round 2, item 2): a negation makes a
+/// union order-sensitive (the last matching pattern decides), so a
+/// captured exclude holding `!pattern` keeps `GIT_IGNORE_POLICY_CONFLICT`
+/// under `--exclude-union` too, with nothing written or recorded, and
+/// `estate-diff` says the flag refuses too
+/// (`exclude-union-refused=GIT_IGNORE_POLICY_CONFLICT`).
+#[test]
+fn p109_exclude_union_refuses_a_negation() {
+    let world = Gftb::new();
+    let captured = b"*.log\n!keep.log\nscratch/\n";
+    let existing = b"*.log\n";
+    let (run, sources) = exclude_union_world(&world, captured, existing);
+    let exclude = world.sting("infra/.git/info/exclude");
+    let infra = world.sting("infra");
+    let refs_before = all_refs(&infra);
+    let diff = run.diff(&[]);
+    for source in &sources {
+        let line = diff_line(&diff.stdout, source);
+        assert!(
+            line.contains("\"adopt\":\"ignore-policy-conflict\"")
+                && line.contains("\"exclude-union-refused=GIT_IGNORE_POLICY_CONFLICT\""),
+            "{line}"
+        );
+    }
+    let ran = run.apply(&["--exclude-union"]);
+    assert!(!ran.ok, "{}", ran.stdout);
+    let rows = receipts(&ran.stdout);
+    for source in &sources {
+        let row = receipt(&rows, source);
+        assert_eq!(row.1, "refused", "{row:?}");
+        assert!(row.2.contains("GIT_IGNORE_POLICY_CONFLICT"), "{row:?}");
+    }
+    assert_eq!(fs::read(&exclude).unwrap(), existing);
+    assert_eq!(all_refs(&infra), refs_before);
+    assert!(union_records(&run.applied).is_empty());
+    assert!(!world.sting("infra.worktrees/only-src").exists());
 }

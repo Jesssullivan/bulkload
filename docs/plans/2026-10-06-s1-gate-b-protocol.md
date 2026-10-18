@@ -1,5 +1,7 @@
 # S1 gate (b) protocol: neo→sting pull, native vs rclone over sftp
 
+> **[2026-10-17: `gate_b.py`, `test_gate_b.py` and `just bench-gate-b` were retired under N03 (TIN-4543 `63feb3cf`); M3 uses `m3_link.py` (#246), and end-to-end seat time is the gate of record (R-C842, `ace8649c`).]**
+
 > **Historical record (labelled 2026-10-16, R-N13; body unchanged).** Superseded for hosts by OI-1003-Q97 (2026-10-07): S1 gate (b) is decided on the hermetic rig (yoga→mbp-13, PZM→mbp-13), and a neo→sting run is a field confirmation only (`docs/slo.md`, amendment 2026-10-07; runbook `2026-10-07-s1-hermetic-rig.md`). OI-1003-Q194 C2 then makes cross-host gate (b) on an estate-shaped corpus S1's headline. The protocol rules ratified in OI-1003-Q82 and Q89 still apply; "no neo run happens until gate (a) passes" is superseded by Q97 and OI-1003-Q142.
 
 Status: harness built, never run against neo. Operator ruling OI-1003-Q66 lifts

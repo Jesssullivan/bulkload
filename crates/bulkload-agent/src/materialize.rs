@@ -46,9 +46,10 @@
 //! ([`owned_output`]). Anything else stays no-clobber and refuses
 //! `DESTINATION_OCCUPIED`.
 //!
-//! The replacement is the exchange design the formal model checks
-//! (`docs/formal`, `MC_wp0d_exchange`), not check-then-rename, which leaves
-//! a window a third party's write falls into (`MC_wp0d_check_rename`). In
+//! The replacement is the exchange design the formal model checked
+//! (`docs/formal`, `MC_wp0d_exchange`; deleted 2026-10-17, R-C843), not
+//! check-then-rename, which leaves a window a third party's write falls
+//! into (`MC_wp0d_check_rename`). In
 //! the group's commit ([`PublishSink`]):
 //!
 //! 1. the staged file is sealed (in a [`crate::io::durable::batched`]

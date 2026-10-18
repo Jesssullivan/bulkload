@@ -1,6 +1,7 @@
 # decide_rows.tsv: pinned rows of git carry's decision core, decide(Inputs) -> Decision (P67).
-# Rendered by docs/formal/hs/GitCarryCore.hs (`rows`); do not edit. `just formal-nv` checks it
-# byte for byte (`rows --check`). Reference: GitCarryCore.hs's decide, derived from v1 at main
+# Rendered by docs/formal/hs/GitCarryCore.hs (`rows`), which was deleted 2026-10-17 under R-C843
+# with `just formal-nv`; this file is now a frozen fixture, edited only by hand and reviewed
+# against decide.rs. Reference (historical): GitCarryCore.hs's decide, derived from v1 at main
 # (estate.rs prepare_base, retained_capture, chainable, chain_offer; git_carry.rs ExportOptions,
 # export_pass; chain.rs CHAIN_DEPTH_LIMIT) and OI-1003-Q46's re-root policy (OI-1003-Q43).
 # lane: v1 = main's behaviour (root_window 0, chain_under_base false); L6b = fix 2, a chain kept
