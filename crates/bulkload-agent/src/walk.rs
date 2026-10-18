@@ -288,33 +288,99 @@ pub enum WalkItem {
 /// The names `SQLite` gives a database's sidecars (#218).
 pub const SQLITE_SIDECAR_SUFFIXES: [&[u8]; 3] = [b"-wal", b"-shm", b"-journal"];
 
-/// Whether `rel_path` lies in a Git administration's ref storage.
+/// Whether `rel_path` could be a Git loose ref or reflog: some directory
+/// above the file is named `refs` or `logs`.
 ///
-/// There a name ending in `-wal`, `-shm` or `-journal` is a ref, never a
-/// `SQLite` sidecar (M2r2: a reflog of a branch named `fix-journal` was
-/// refused `SQLITE_STATE_CHANGED`).
-///
-/// That is below `<admin>/refs/` or `<admin>/logs/`, or a linked worktree's
-/// `<admin>/worktrees/<name>/refs/` or `logs/`, where `<admin>` is a
-/// component named `.git` or ending in `.git` (a bare repository). Such a
-/// path is never reported as a sidecar, never refused by name, and its file
-/// is never a database row with a `-wal` beside it. `SQLite` keeps no files
-/// there; elsewhere the sidecar rules are unchanged.
+/// A path-only prefilter that keeps the content check below off every
+/// other sidecar-named file, so a real store's sidecars are never read for
+/// it. It covers any administration: `.git`, a bare repository whatever its
+/// name, `modules/<name>` of a submodule, a linked worktree's.
 #[must_use]
-pub fn in_git_ref_storage(rel_path: &[u8]) -> bool {
-    let parts: Vec<&[u8]> = rel_path.split(|byte| *byte == b'/').collect();
-    let storage =
-        |part: Option<&&[u8]>| matches!(part, Some(&name) if name == b"refs" || name == b"logs");
-    parts.iter().enumerate().any(|(index, part)| {
-        let admin = *part == b".git" || (part.len() > b".git".len() && part.ends_with(b".git"));
-        let rest = parts.get(index + 1..).unwrap_or_default();
-        // At least one component below the storage directory: the file.
-        admin
-            && ((storage(rest.first()) && rest.len() >= 2)
-                || (matches!(rest.first(), Some(&name) if name == b"worktrees")
-                    && storage(rest.get(2))
-                    && rest.len() >= 4))
+pub fn ref_storage_candidate(rel_path: &[u8]) -> bool {
+    let Some(end) = rel_path.iter().rposition(|byte| *byte == b'/') else {
+        return false;
+    };
+    rel_path
+        .get(..end)
+        .unwrap_or_default()
+        .split(|byte| *byte == b'/')
+        .any(|part| part == b"refs" || part == b"logs")
+}
+
+/// Whether `head`, a file's first bytes, reads as a Git loose ref or reflog.
+///
+/// That is `ref: ` (a symbolic ref), or a 40- or 64-digit lowercase hex
+/// object id followed by a newline (a loose ref) or a space (a reflog
+/// line). A `SQLite` journal (`d9 d5 05 f9 ..`), WAL (`37 7f 06 82/83`) or
+/// shared-memory file never does, nor does an empty file.
+#[must_use]
+pub fn looks_like_git_ref(head: &[u8]) -> bool {
+    if head.starts_with(b"ref: ") {
+        return true;
+    }
+    let hex = head
+        .iter()
+        .take_while(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+        .count();
+    (hex == 40 || hex == 64) && matches!(head.get(hex), Some(b'\n' | b' '))
+}
+
+/// What a sidecar decision found at a path.
+enum Head {
+    Absent,
+    Unreadable,
+    Bytes(Vec<u8>),
+}
+
+/// The first `limit` bytes of the regular file `rel` beneath `dir`, opened
+/// without following a symlink. Counted as `source_sniff_bytes`.
+fn head(dir: BorrowedFd<'_>, rel: &Path, limit: usize) -> Head {
+    let file = match sys::openat_beneath(dir, rel, crate::io::OpenMode::Read) {
+        Ok(fd) => std::fs::File::from(fd),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) =>
+        {
+            return Head::Absent;
+        }
+        Err(_) => return Head::Unreadable,
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Head::Absent;
+    }
+    let mut bytes = vec![0; limit];
+    sys::pread_full(&file, &mut bytes, 0).map_or(Head::Unreadable, |read| {
+        bytes.truncate(read);
+        crate::counters::add_len(crate::counters::Counter::SourceSniff, read);
+        Head::Bytes(bytes)
     })
+}
+
+/// The first 16 bytes of every `SQLite` database file.
+const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+
+/// Whether the sidecar-named file `own` beneath `dir` is a Git ref or
+/// reflog, not a `SQLite` sidecar (M2r2: the reflog of a branch named
+/// `fix-journal` was refused `SQLITE_STATE_CHANGED`).
+///
+/// Decided by content, only for a [`ref_storage_candidate`] path: `own`
+/// reads as a ref or reflog ([`looks_like_git_ref`]), and its base-named
+/// neighbour `base`, when there, is not a `SQLite` database. Anything
+/// unreadable, empty or `SQLite`-shaped keeps the sidecar rules. Reads at
+/// most 80 bytes of `own` and 16 of `base`.
+#[must_use]
+pub fn ref_named_like_sidecar(dir: BorrowedFd<'_>, own: &Path, base: &Path) -> bool {
+    let Head::Bytes(own) = head(dir, own, 80) else {
+        return false;
+    };
+    if !looks_like_git_ref(&own) {
+        return false;
+    }
+    match head(dir, base, SQLITE_MAGIC.len()) {
+        Head::Absent => true,
+        Head::Bytes(base) => !base.starts_with(SQLITE_MAGIC),
+        Head::Unreadable => false,
+    }
 }
 
 /// One directory being listed: its descriptor, the length of its relative
@@ -503,25 +569,41 @@ impl<'root> Walker<'root> {
         };
         let mut wal = leaf.to_vec();
         wal.extend_from_slice(b"-wal");
-        let in_refs = in_git_ref_storage(&rel_path);
-        let row = row_from_stat(rel_path, stat);
-        if !in_refs && level.holds(&wal) {
+        // M2r2: a `-wal` that is a Git ref or reflog is no store's WAL.
+        let wal_is_ref = |wal: &[u8]| {
+            ref_storage_candidate(&rel_path)
+                && ref_named_like_sidecar(
+                    parent,
+                    Path::new(OsStr::from_bytes(wal)),
+                    Path::new(OsStr::from_bytes(leaf)),
+                )
+        };
+        if level.holds(&wal) {
             if let Some(found) = regular(&wal) {
-                return WalkItem::RowWithWal(row, sidecar_id(&found));
+                if !wal_is_ref(&wal) {
+                    return WalkItem::RowWithWal(row_from_stat(rel_path, stat), sidecar_id(&found));
+                }
             }
         }
-        WalkItem::Row(row)
+        WalkItem::Row(row_from_stat(rel_path, stat))
     }
 
     /// `leaf` as a `-wal`, `-shm` or `-journal` of a regular base listed
     /// beside it (#218), or `None`.
     fn sidecar_of(&self, parent: BorrowedFd<'_>, leaf: &[u8], rel_path: &[u8]) -> Option<WalkItem> {
-        if in_git_ref_storage(rel_path) {
-            return None;
-        }
         let level = self.stack.last()?;
         SQLITE_SIDECAR_SUFFIXES.iter().find_map(|suffix| {
             let base = leaf.strip_suffix(*suffix)?;
+            // M2r2: a Git ref or reflog so named is an ordinary file.
+            if ref_storage_candidate(rel_path)
+                && ref_named_like_sidecar(
+                    parent,
+                    Path::new(OsStr::from_bytes(leaf)),
+                    Path::new(OsStr::from_bytes(base)),
+                )
+            {
+                return None;
+            }
             // `<base>` sorts before its sidecars: it was listed, and is
             // stat'ed again for its kind.
             let regular = !base.is_empty()
@@ -992,39 +1074,58 @@ mod tests {
     use super::{walk, HashPolicy, WalkItem, WalkOptions, Walker};
     use crate::freshness::MemoryCache;
 
-    // M2r2: names ending in a sidecar suffix inside Git's ref storage are
-    // refs and reflogs; everywhere else the sidecar rules are unchanged.
+    // M2r2: the path prefilter and the content test that decide whether a
+    // sidecar-named file is a Git ref or reflog.
     #[test]
-    fn git_ref_storage_is_told_apart() {
-        for inside in [
+    fn refs_named_like_sidecars_are_told_apart() {
+        for candidate in [
             &b".git/logs/refs/remotes/upstream/fix-journal"[..],
             b".git/refs/heads/topic-wal",
-            b".git/logs/HEAD",
-            b"repo/.git/refs/tags/v1-shm",
-            b"mirror.git/refs/heads/a-journal",
-            b".git/worktrees/wt/logs/HEAD-journal",
-            b".git/worktrees/wt/refs/bisect/x-wal",
+            b"mirror/refs/heads/a-journal",
+            b".git/modules/sub/refs/heads/b-shm",
+            b"db/abc-123/logs/HEAD-journal",
         ] {
             assert!(
-                super::in_git_ref_storage(inside),
+                super::ref_storage_candidate(candidate),
                 "{}",
-                inside.escape_ascii()
+                candidate.escape_ascii()
             );
         }
-        for outside in [
+        for other in [
             &b"store.db-journal"[..],
-            b".git/refs",
-            b".git/annex/keysdb/db-wal",
-            b".git/worktrees/wt",
-            b".git/worktrees/wt/refs",
-            b"refs/heads/a-journal",
-            b"data/.gitx/refs/a-journal",
-            b".git",
+            b"refs",
+            b"data/x-wal",
+            b"refsx/a-wal",
         ] {
             assert!(
-                !super::in_git_ref_storage(outside),
+                !super::ref_storage_candidate(other),
                 "{}",
-                outside.escape_ascii()
+                other.escape_ascii()
+            );
+        }
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        for git in [
+            format!("{oid}\n"),
+            format!("{oid} {oid} A <a@b> 1 +0000\tcommit: x\n"),
+            "ref: refs/heads/main\n".to_owned(),
+            format!("{oid}{}\n", &oid[..24]),
+        ] {
+            assert!(super::looks_like_git_ref(git.as_bytes()), "{git}");
+        }
+        for not_git in [
+            &b""[..],
+            b"\xd9\xd5\x05\xf9\x20\xa1\x63\xd7",
+            b"\x37\x7f\x06\x82\x00\x2d\xe2\x18",
+            b"\x18\xe2\x2d\x00",
+            b"SQLite format 3\0",
+            b"0123456789ABCDEF0123456789ABCDEF01234567\n",
+            b"0123456789abcdef\n",
+            b"plain text\n",
+        ] {
+            assert!(
+                !super::looks_like_git_ref(not_git),
+                "{}",
+                not_git.escape_ascii()
             );
         }
     }

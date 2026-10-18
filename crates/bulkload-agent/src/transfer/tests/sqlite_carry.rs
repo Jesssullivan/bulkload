@@ -2618,46 +2618,100 @@ fn the_delta_lever_finds_a_snapshot_seats_row_under_its_snapshot_key() {
 
 /// M2r2 (the in-place run's cmux refusal): a branch named `*-journal`,
 /// `*-wal` or `*-shm` has a loose ref and a reflog of that name beside the
-/// ref of its base name. Inside Git's ref storage those are carried as the
-/// files they are, in both modes; a sidecar-named file anywhere else is
-/// still refused by name (`--sqlite=refuse`) or as a sidecar
-/// (`--sqlite=snapshot`), and a real store's sidecars are untouched by the
-/// rule.
+/// ref of its base name. Those are carried as the files they are, in both
+/// modes, in any administration (`.git`, a bare repository whatever its
+/// name, a submodule's `modules/<name>`), because their content reads as a
+/// ref or reflog. A sidecar-named file that does not (plain text in a
+/// `foo.git/logs` folder, a live WAL store's `-wal` and `-shm`, a hot
+/// journal, all inside a `logs/` directory) keeps the sidecar rules: never
+/// carried raw.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn refs_named_like_sidecars_are_carried_in_git_ref_storage() {
     let _serial = serial();
+    let oid = "0123456789abcdef0123456789abcdef01234567";
+    let reflog = format!("{oid} {oid} A U Thor <a@example.com> 1 +0000\tfetch: fast-forward\n");
+    let reference = format!("{oid}\n");
     for mode in [SqliteMode::Refuse, SqliteMode::Snapshot] {
         let sqlite = Sqlite::new();
         let source = sqlite.source();
-        let files: [(&str, &[u8]); 9] = [
-            (".git/logs/refs/remotes/upstream/audit", b"0 1 a\n"),
-            (".git/logs/refs/remotes/upstream/audit-journal", b"0 1 b\n"),
-            (".git/refs/heads/topic", b"1111\n"),
-            (".git/refs/heads/topic-wal", b"2222\n"),
-            (".git/refs/heads/topic-shm", b"3333\n"),
-            ("mirror.git/refs/heads/x", b"4444\n"),
-            ("mirror.git/refs/heads/x-journal", b"5555\n"),
+        let refs: Vec<(&str, &[u8])> = vec![
+            (".git/logs/refs/remotes/upstream/audit", reflog.as_bytes()),
+            (
+                ".git/logs/refs/remotes/upstream/audit-journal",
+                reflog.as_bytes(),
+            ),
+            (".git/refs/heads/topic", reference.as_bytes()),
+            (".git/refs/heads/topic-wal", reference.as_bytes()),
+            (".git/refs/heads/topic-shm", reference.as_bytes()),
+            (
+                ".git/modules/sub/refs/heads/y-journal",
+                reference.as_bytes(),
+            ),
+            (".git/modules/sub/logs/HEAD-journal", reflog.as_bytes()),
+            ("mirror/refs/heads/x", reference.as_bytes()),
+            ("mirror/refs/heads/x-journal", b"ref: refs/heads/x\n"),
+        ];
+        let others: Vec<(&str, &[u8])> = vec![
             ("notes", b"plain\n"),
             ("notes-journal", b"not in ref storage\n"),
+            ("foo.git/logs/app", b"an app log\n"),
+            ("foo.git/logs/app-journal", b"an app journal, not a ref\n"),
         ];
-        for (path, bytes) in files {
+        for (path, bytes) in refs.iter().chain(&others) {
             let path = source.join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, bytes).unwrap();
         }
+        // A live WAL store and a store with a hot journal, inside `logs/`.
+        let logs = source.join("app.git/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        build(&logs.join("live.db"), Journal::Wal, 1024, 3);
+        let live = Connection::open(logs.join("live.db")).unwrap();
+        live.execute_batch("PRAGMA wal_autocheckpoint=0; INSERT INTO accounts VALUES (3, 7);")
+            .unwrap();
+        assert!(logs.join("live.db-wal").exists() && logs.join("live.db-shm").exists());
+        build(&logs.join("hot.db"), Journal::Delete, 1024, 3);
+        let mut journal = vec![0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];
+        journal.resize(512, 0);
+        std::fs::write(logs.join("hot.db-journal"), &journal).unwrap();
         let stats = sqlite.run(mode).unwrap();
-        assert_eq!(
-            stats.refusals,
-            [(b"notes-journal".to_vec(), "SQLITE_STATE_CHANGED".to_owned())],
-            "{mode:?}"
-        );
-        for (path, bytes) in files.iter().filter(|(path, _)| *path != "notes-journal") {
+        drop(live);
+        let refused: Vec<&[u8]> = stats
+            .refusals
+            .iter()
+            .map(|(path, _)| path.as_slice())
+            .collect();
+        for (path, bytes) in &refs {
+            assert!(
+                !refused.contains(&path.as_bytes()),
+                "{mode:?} {path}: {:?}",
+                stats.refusals
+            );
             assert_eq!(
                 std::fs::read(sqlite.destination().join(path)).unwrap(),
                 *bytes,
                 "{mode:?} {path}"
             );
         }
-        assert!(!sqlite.destination().join("notes-journal").exists());
+        for path in [
+            "notes-journal",
+            "foo.git/logs/app-journal",
+            "app.git/logs/live.db-wal",
+            "app.git/logs/live.db-shm",
+            "app.git/logs/hot.db-journal",
+        ] {
+            assert!(
+                !sqlite.destination().join(path).exists(),
+                "{mode:?} {path} carried raw"
+            );
+        }
+        for path in ["notes-journal", "foo.git/logs/app-journal"] {
+            assert!(
+                refused.contains(&path.as_bytes()),
+                "{mode:?} {path}: {:?}",
+                stats.refusals
+            );
+        }
     }
 }
