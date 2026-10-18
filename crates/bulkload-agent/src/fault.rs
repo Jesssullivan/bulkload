@@ -342,6 +342,13 @@ pub enum Point {
     /// (0755, synced), not yet recorded in STATE; nothing landed (M2
     /// finding 1).
     EstateApplyParentsMade,
+    /// `estate.apply.exclude_intent`: an `--exclude-union` append recorded
+    /// in STATE as an intent; the common exclude not yet written (M2
+    /// round 2, item 2).
+    EstateApplyExcludeIntent,
+    /// `estate.apply.exclude_appended`: the common exclude replaced by its
+    /// union (synced); the record still says intent.
+    EstateApplyExcludeAppended,
     /// `estate.carry.recorded`: `estate-carry-files` landed an item's
     /// bytes and wrote its carry record; the outcome record still says
     /// `CAPTURE_ABSENT` (M2r2 b).
@@ -392,7 +399,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 63] = [
+    pub const ALL: [Self; 65] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -437,6 +444,8 @@ impl Point {
         Self::EstateAdoptAfterLedger,
         Self::EstateAdoptBareStaged,
         Self::EstateApplyParentsMade,
+        Self::EstateApplyExcludeIntent,
+        Self::EstateApplyExcludeAppended,
         Self::EstateCarryRecorded,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
@@ -506,6 +515,8 @@ impl Point {
             Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
             Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
             Self::EstateApplyParentsMade => "estate.apply.parents_made",
+            Self::EstateApplyExcludeIntent => "estate.apply.exclude_intent",
+            Self::EstateApplyExcludeAppended => "estate.apply.exclude_appended",
             Self::EstateCarryRecorded => "estate.carry.recorded",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",

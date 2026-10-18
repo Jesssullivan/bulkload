@@ -2352,11 +2352,14 @@ fn apply_item(
     // M2 finding 1: a first landing makes its absent parents (0755) and
     // records them here.
     let parents = parents_path(state, &identity, source);
+    // M2 round 2, item 2: `--exclude-union` records its appends here.
+    let union = exclude_union_path(state, &identity, source);
     let landing = git_carry::converge::Landing {
         item: &identity,
         observed_ns: retained_parts(corpus, &captured.bundle)?.map_or(0, |parts| parts.started_ns),
         capture: captured.digest,
         parents: Some(&parents),
+        exclude_union: options.exclude_union.then_some(union.as_path()),
     };
     let target = git_carry::converge::Target {
         repository: &item.repository,
@@ -2765,6 +2768,17 @@ pub fn parents_path(state: &Path, identity: &str, source: &str) -> PathBuf {
     ))
 }
 
+/// Where an item's `--exclude-union` appends are recorded (M2 round 2,
+/// item 2): `{item}-{blake3(source)}.exclude-union` in STATE, a
+/// [`git_carry::exclude_union::ExcludeUnion`]. Per item and source.
+#[must_use]
+pub fn exclude_union_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.exclude-union",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
 // The apply journal for one item, source and capture digest. Its presence
 // means the item's restore or import completed; its body is that outcome.
 fn journal_path(state: &Path, identity: &str, source: &str, digest: &[u8; 32]) -> PathBuf {
@@ -2892,6 +2906,13 @@ pub struct ApplyOptions {
     /// an scp-style or `ssh://` origin starting with one of these; a local
     /// path never ([`git_carry::origin_prefix_allowed`]).
     pub activate_origin: Vec<String>,
+    /// `--exclude-union` (M2 round 2, item 2): a first linked landing whose
+    /// repository's common `info/exclude` is not the capture's appends the
+    /// captured lines it lacks, recorded in STATE, instead of refusing
+    /// `GIT_IGNORE_POLICY_CONFLICT`; only where the union cannot change
+    /// what either policy means (no negation on either side) and no
+    /// bulkload ledger owns the exclude ([`git_carry::exclude_union`]).
+    pub exclude_union: bool,
 }
 
 /// Apply explicit restores only; common Git administration is serialized.

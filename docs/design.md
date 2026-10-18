@@ -1031,6 +1031,61 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   `bare-landing`) with the component `parents=<n>` (the levels absent
   now; items sharing them each count them), and `parent-missing` only
   where the policy refuses.
+- **`--exclude-union` is a recorded write (M2 round 2, item 2,
+  2026-10-17).** The in-place run refused 250 new linked worktrees
+  `GIT_IGNORE_POLICY_CONFLICT` in repositories whose captured common
+  exclude was a pure superset of the destination's. Without the flag
+  nothing changes. With `estate-apply --exclude-union`, a first linked
+  landing whose common `info/exclude` is neither the capture's nor a newer
+  one the main item set appends the captured lines it lacks after its last
+  line, each once, in captured order, and lands. Lines compare as Git
+  reads them (a leading UTF-8 byte order mark skipped, one trailing CR
+  dropped, unescaped trailing spaces trimmed, a line empty after that
+  skipped); an appended line is the captured line's bytes. No existing
+  byte is removed, changed or reordered (the old file is a byte prefix of
+  the new one); when nothing is missing nothing is written, so a rerun,
+  and every later linked item of the same repository, writes nothing.
+  Where a line would be appended, the refusal is kept for: a negation
+  (`!pattern`; `\!` is a literal) on either side, since Git decides by
+  the last matching pattern and an append would then not be a union; an
+  exclude a bulkload ledger at the repository records (any label's main
+  workspace ledger, or a ref ledger's exclude row: that main item's
+  converge owns it, and an append would fail its proof); an `info` that is
+  not a real directory, or an exclude that is not a regular file, has more
+  than one link or another owner (nothing is written through a link); and
+  an exclude that changed between the decision and the write. **The write
+  is repository-wide:** every worktree of the repository reads
+  `info/exclude`, so the append changes what the main checkout and every
+  other linked worktree ignore (an untracked file a new pattern matches
+  leaves `git status`, `git add -A` and `git stash -u` skip it, and a
+  `core.excludesFile` negation no longer re-includes it). The decision is
+  made by the write-free checks, then again under a repository-wide lock
+  (`$GIT_COMMON_DIR/bulkload/exclude.lock`, shared by every SOURCE label;
+  Git itself takes none) that also covers settling and the append. The
+  append is the plan's last write before `git worktree add`; that and the
+  materialization after it can still refuse. The new bytes go to a
+  temporary in `info` (given the old file's mode with `fchmod`, 0644 for a
+  new file, synced); the append is recorded write-ahead in STATE
+  (`{item}-{blake3(SOURCE)}.exclude-union`: the path, the digests before
+  and after, the lines, the temporary's name and inode) as an intent, the
+  temporary is renamed over the exclude, `info` is synced, and the entry is
+  marked `appended`. A crash between (`estate.apply.exclude_intent`,
+  `estate.apply.exclude_appended`) leaves an intent the next run under the
+  flag settles by identity, never by content: `appended` when the exclude
+  is the recorded inode, `not-written` when the temporary is still there
+  (it is removed), otherwise left an intent (the file was replaced since).
+  A crash before the intent can leave a `.bulkload-exclude-*` temporary no
+  record names; Git never reads it. The receipt of the landing that
+  finishes counts `exclude-appended=<n>`: every appended line of the
+  item's record no finished landing has reported, so an append a later
+  refusal or a crash kept from its receipt is counted by the rerun that
+  lands. Where the destination holds lines the capture lacks, the landed
+  worktree's ignore set is the union of both: a captured untracked file
+  can be ignored there (its bytes are carried all the same).
+  `estate-diff` still says `ignore-policy-conflict` and, where the flag
+  would land the item, the component `exclude-union=<n>` (items of one
+  repository each count the lines; the apply appends them once), or
+  `exclude-union-refused=<CODE>` where it would not.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads
@@ -1343,7 +1398,7 @@ writers never pause for a capture. What moved is recorded, never absorbed:
   the flattened restore advertises exactly the head's refs: none of the
   link's drift markers. The drifted bundle itself still never applies.
   Since Q42 L6a (OI-1003-Q43) these choices are one pure, total function,
-  `git_carry::decide::decide`, which P67 pins to the Haskell reference's rows.
+  `git_carry::decide::decide`, which P67 pins to frozen rows (`tests/data/decide_rows.tsv`, rendered by the Haskell reference until R-C843 deleted it on 2026-10-17).
 - A whole capture is reused (`capture-reused-after-census`) only when its key
   is unchanged and no seat is racy against its recorded pass start. A capture with a racy seat, or with no recorded pass start
   (records from before the start was recorded), takes the per-seat path
@@ -1618,7 +1673,7 @@ miss (#87).
   fallback) fail on that bound alone. Whether handed bytes are wire bytes
   for that inequality is unruled. `just fault-harness` runs the crash,
   power-loss and resume suites with the lever on too (`delta-lever`).
-  `BulkloadTransfer.tla` already lets `RecvEntry` choose `Send` for any
+  `BulkloadTransfer.tla` (deleted 2026-10-17, R-C843) already lets `RecvEntry` choose `Send` for any
   absent output, so the lever is inside the model (docs/slo.md, the
   2026-10-16 amendment). The source sends `Manifest`, from
   its ledger without reading when the stat identity is recorded; the
@@ -1917,7 +1972,7 @@ copy of corpus v1 committed 10 to 18 destination groups on the rig; with
 informational census (1 destination group commit against 3 to 5,
 2026-10-15, not of record), until the rig series measures it. Each group still
 seals before its one FULL commit and every `Held` still follows that commit
-(R25: `BulkloadTransfer.tla`'s `Commit` takes any nonempty set of ready
+(R25: `BulkloadTransfer.tla`'s (deleted 2026-10-17, R-C843) `Commit` takes any nonempty set of ready
 seats, so a larger group is a behaviour the model already checks), and the
 most a crash leaves unrecorded is still one group within the same bounds;
 #169's adoption recovers it without a source read. No commit is relaxed:
@@ -2081,9 +2136,10 @@ as without batching. A discarded creation clears its record before its
 temporary goes (#74 N3), a level whose shared seal or commit failed
 included (its commit may have reached the log although it reported a
 failure), and every clear is traced apart from a completion
-(`DirectoryCleared`). `docs/formal/DirectoryRecords.tla` checks
-the records under per-name power loss, journal seals and reused inode
-numbers (README, "Directory records").
+(`DirectoryCleared`). Until R-C843 deleted it on 2026-10-17,
+`docs/formal/DirectoryRecords.tla` checked the records under per-name
+power loss, journal seals and reused inode numbers (`git show e3522007:docs/formal/README.md`,
+"Directory records").
 
 The finish rides the session's last output group (OI-1003-Q154 lever 3;
 the SOTA study's lever 2, R-N102's finish commit unit; built 2026-10-16).
@@ -2118,7 +2174,7 @@ already empty (the last output closed it at a file or byte bound, or an
 idle or age bound closed it first) drops the finish, which then runs as
 before over the modes already set. `BULKLOAD_DIRECTORY_FOLD=0`
 restores the separate finish for A/B; `directories_folded` counts the
-directories finished in a group. The model is `DirectoryRecords.tla`'s
+directories finished in a group. The model is `DirectoryRecords.tla`'s (deleted 2026-10-17, R-C843)
 `Place` and `GroupFinish` with `CompletionAfterChildren` (a completed
 directory owes no output of its run); the power-loss proof is
 `every_power_loss_state_of_a_folded_finish_is_explored`, in group and
@@ -2152,8 +2208,9 @@ state-root seals (#161) are fully synced on both sides, every destination
 commit is `synchronous=FULL`, `fullfsync=ON`, and a checkpoint on the
 relaxed connection is still a full flush. `--source-ledger-sync=full` syncs
 every row commit and fails the session on the first failed one, for
-comparison. `docs/formal` checks the relaxed ledger (`MC_wp0g`,
-`MC_wp0g_deep`, `MC_wp0g_strict`) and shows a relaxed authority breaking R25
+comparison. Until R-C843 deleted them on 2026-10-17, the `BulkloadTransfer.tla`
+configs checked the relaxed ledger (`MC_wp0g`, `MC_wp0g_deep`,
+`MC_wp0g_strict`) and showed a relaxed authority breaking R25
 (`MC_wp0g_authority`); P79 and `tests/power_loss.rs` take the real store
 through every loss.
 
@@ -2162,7 +2219,7 @@ replace the output at its path only when that output is this store's own,
 untouched: its `(dev, ino, size, mtime, ctime)` equals a row this store
 committed for the path. Any other file there is refused
 `DESTINATION_OCCUPIED` and left as it is. The replacement is the exchange
-design the formal model checks (`MC_wp0d_exchange`): the group's commit seals
+design the formal model checked until R-C843 deleted it (`MC_wp0d_exchange`): the group's commit seals
 the staged file, records an intent that takes the output's rows out of the
 store, trades the staged name and the leaf in one `RENAME_EXCHANGE`
 (`RENAME_SWAP` on Darwin), checks the displaced file, removes it when it is
@@ -2179,7 +2236,7 @@ the old output's own chunks, so only absent chunks cross the wire (WP0(c),
 inequality 2). A `SQLite` snapshot output (#218) is superseded the same
 way (OI-1003-Q146), with one more look: no `-wal`, `-journal` or `-shm`
 beside it at Decide and immediately before the exchange ("SQLite
-snapshot seats", Wire v6); `docs/formal/SqliteCarry.tla` checks it
+snapshot seats", Wire v6); `docs/formal/SqliteCarry.tla` (deleted 2026-10-17, R-C843) checks it
 (`SqliteNoClobber`, `SqliteOldOrNewWhole`, `SqliteNoForeignSidecar`).
 
 What "this store's own" covers (#187 review, 2026-10-07). An output has a
@@ -2208,7 +2265,7 @@ holds other bytes: nothing is staged, no chunk is asked of the source, and
 the old output keeps its row. Such a seat does not converge there. That is
 the ruled behaviour (OI-1003-Q100): the refusal stands, and there is no
 fallback to a rename over the output, which is the check-then-rename shape
-the formal model refutes.
+the formal model refuted (deleted 2026-10-17, R-C843).
 
 Refusals the destination remembers (#187 review, R25). A seat refused
 `DESTINATION_OCCUPIED` or `DESTINATION_EXCHANGE_UNSUPPORTED` after its
@@ -2223,12 +2280,12 @@ the racy window of the read. A changed seat, a changed file, or a file
 system that has gained the exchange makes the record a miss. The record
 is a memo about no durable bytes; losing it costs one more source read.
 
-The formal model holds all of this since 2026-10-07 (OI-1003-Q102: model
+The formal model held all of this from 2026-10-07 until R-C843 deleted it on 2026-10-17 (OI-1003-Q102: model
 first, then merge): the intent and its sweep, the ownership row, the
 remembered refusal and the refusal without an exchange, with the
 invariants `NoClobber`, `SupersedeAtomic`, `OwnershipNeverReuse`,
 `RememberedRefusalSound` and `ExchangeRefusedUpFront`
-(`docs/formal/README.md`, "#187's records in the model").
+(`docs/formal/README.md`, "#187's records in the model" (deleted 2026-10-17, R-C843)).
 
 A store's state root and its database entry are sealed (the root fully
 flushed) before `Store::open` returns, so before Start and any commit, and a
