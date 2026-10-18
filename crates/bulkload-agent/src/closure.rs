@@ -297,22 +297,41 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
     }
 }
 
+/// The typed codes no review closes, with the reason a row holding one is
+/// unaccounted: only a rerun that records another outcome closes it.
+///
+/// - `GIT_CONVERGE_INTERRUPTED` (estate converge, finding 6): a converge
+///   cut short left the checkout part old, part new under a pending intent.
+/// - `TRANSPORT_LOST` (S4, TIN-6592): a transfer session whose transport
+///   ended before it did. Its record holds no row for the paths it never
+///   reached, so a review would close an incomplete transfer; and the
+///   peer's own refusal, when it had one, never crossed the wire.
+/// - `ITEMS_REFUSED` (S4, #231): the run-level exit, never an item's or a
+///   path's outcome; a record naming it proves nothing about the item.
+#[must_use]
+pub fn rerun_only(code: &str) -> Option<&'static str> {
+    match code {
+        "GIT_CONVERGE_INTERRUPTED" => Some("converge-interrupted"),
+        "TRANSPORT_LOST" => Some("transport-lost"),
+        "ITEMS_REFUSED" => Some("run-level-refusal"),
+        _ => None,
+    }
+}
+
 /// A recorded refusal, natively: pending review when typed, else
 /// unaccounted. The one rule estate items and transfer rows share (S4).
 #[must_use]
 pub fn refusal_disposition(refusal: &crate::outcome::Refusal) -> Disposition {
-    match refusal.code() {
+    match (refusal.code(), rerun_only(refusal.code())) {
         // A bare IO or FRAME_CODEC names no cause (S4).
-        "IO" => Disposition::Unaccounted("refusal-untyped-io"),
-        "FRAME_CODEC" => Disposition::Unaccounted("refusal-untyped-frame-codec"),
-        // Estate converge (finding 6): a converge cut short left the
-        // checkout part old, part new under a pending intent. No review
-        // closes it; only a rerun that settles the intent does.
-        "GIT_CONVERGE_INTERRUPTED" => Disposition::Unaccounted("converge-interrupted"),
+        ("IO", _) => Disposition::Unaccounted("refusal-untyped-io"),
+        ("FRAME_CODEC", _) => Disposition::Unaccounted("refusal-untyped-frame-codec"),
+        // Typed, but no review closes it ([`rerun_only`]).
+        (_, Some(why)) => Disposition::Unaccounted(why),
         // The code left the taxonomy after the record was written: it
         // names no cause the taxonomy holds, and no review can name it.
         _ if refusal.is_retired() => Disposition::Unaccounted("refusal-code-retired"),
-        code => Disposition::RefusedPendingReview(code.to_owned()),
+        (code, None) => Disposition::RefusedPendingReview(code.to_owned()),
     }
 }
 
@@ -1470,9 +1489,14 @@ impl AttestationRow {
         match native.outcome.as_ref().and_then(Outcome::refusal) {
             Some(refusal) if refusal.is_retired() => return Err("native-refusal-code-retired"),
             Some(refusal) if !refusal.is_typed() => return Err("native-refusal-untyped"),
-            // Finding 6: only a rerun that settles the intent closes it.
-            Some(refusal) if refusal.code() == "GIT_CONVERGE_INTERRUPTED" => {
-                return Err("native-converge-interrupted")
+            // Finding 6, TIN-6592, #231: only a rerun closes it
+            // ([`rerun_only`]).
+            Some(refusal) if rerun_only(refusal.code()).is_some() => {
+                return Err(match refusal.code() {
+                    "GIT_CONVERGE_INTERRUPTED" => "native-converge-interrupted",
+                    "TRANSPORT_LOST" => "native-transport-lost",
+                    _ => "native-run-level-refusal",
+                });
             }
             _ => {}
         }
@@ -2309,6 +2333,70 @@ mod tests {
         let report = Report::from_ledger(&ledger);
         assert_eq!(report.unaccounted, 1);
         assert_eq!(report.refused_pending_review, 0);
+    }
+
+    // S4 (TIN-6592, #231): a lost transport, and a record naming the
+    // run-level code, are typed but never accounted: not natively, not by an
+    // item review, not by a standing policy. Only a rerun closes them.
+    #[test]
+    fn a_lost_transport_and_a_run_level_code_are_unaccounted_whatever_their_review() {
+        let ledger = Ledger {
+            entries: vec![
+                entry(
+                    'a',
+                    true,
+                    Some(("refused", Some("TRANSPORT_LOST"))),
+                    JournalState::Absent,
+                ),
+                entry(
+                    'b',
+                    true,
+                    Some(("refused", Some("ITEMS_REFUSED"))),
+                    JournalState::Absent,
+                ),
+            ],
+            ..Ledger::default()
+        };
+        assert_eq!(
+            classify(&ledger.entries[0]),
+            Disposition::Unaccounted("transport-lost")
+        );
+        assert_eq!(
+            classify(&ledger.entries[1]),
+            Disposition::Unaccounted("run-level-refusal")
+        );
+        let mut report = Report::from_ledger(&ledger);
+        let mut reviews = reviews();
+        reviews.rows = vec![
+            Review::new(
+                scope(&report, 'a'),
+                "TRANSPORT_LOST",
+                Decision::ReCarry,
+                "jess",
+                "2026-10-18",
+            )
+            .unwrap(),
+            Review::new(
+                Scope::Policy,
+                "TRANSPORT_LOST",
+                Decision::Accept,
+                "jess",
+                "2026-10-18",
+            )
+            .unwrap(),
+            Review::new(
+                Scope::Policy,
+                "ITEMS_REFUSED",
+                Decision::Accept,
+                "jess",
+                "2026-10-18",
+            )
+            .unwrap(),
+        ];
+        report.dispose(&reviews);
+        assert_eq!(report.unaccounted, 2);
+        assert_eq!(report.refused + report.refused_pending_review, 0);
+        assert!(report.gate().is_err());
     }
 
     #[test]
@@ -3706,16 +3794,16 @@ mod tests {
 
         const RETIRED: &str = "RETIRED_FOR_P73";
 
-        // The codes a review can close. `GIT_CONVERGE_INTERRUPTED` is typed
-        // but never closed by a review (estate converge, finding 6); its
-        // own row is `an_interrupted_converge_is_unaccounted_whatever_its_review`.
+        // The codes a review can close. The `rerun_only` codes are typed
+        // but never closed by a review (estate converge, finding 6; S4,
+        // TIN-6592 and #231); their own rows are
+        // `an_interrupted_converge_is_unaccounted_whatever_its_review` and
+        // `a_lost_transport_and_a_run_level_code_are_unaccounted_whatever_their_review`.
         fn typed_codes() -> Vec<&'static str> {
             BulkloadRefusal::CODES
                 .iter()
                 .copied()
-                .filter(|code| {
-                    crate::outcome::is_typed_code(code) && *code != "GIT_CONVERGE_INTERRUPTED"
-                })
+                .filter(|code| crate::outcome::is_typed_code(code) && rerun_only(code).is_none())
                 .collect()
         }
 

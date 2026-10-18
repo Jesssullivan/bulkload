@@ -107,8 +107,9 @@ pub(crate) fn hash_beneath_observed(
 ) -> HashRead {
     let mut bytes_read = 0;
     let mut metadata_checks = 0;
+    // S4 (TIN-6592): a walked seat removed before it is hashed.
     let digest = crate::io::sys::openat_beneath(root, rel, crate::io::OpenMode::Read)
-        .refuse_at("hash::hash_beneath_observed")
+        .map_err(|error| crate::refuse::source_seat(&error, "hash::hash_beneath_observed"))
         .and_then(|fd| {
             hash_open_file(
                 File::from(fd),

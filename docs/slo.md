@@ -1824,3 +1824,56 @@ the cause.
   prefix-less `.git`) still refuse `GIT_INVENTORY_MALFORMED` without a
   path, and so does a non-UTF-8 path to a readable foreign repository (the
   nest's own Git reads are text).
+
+## Amendment 2026-10-18 (M3, TIN-6592): run-level refusal, vanished seats, a lost transport
+
+A proof-status line, not a new ruling (OI-1003-Q1; M3 code lane under
+operator ruling A-20261018-110, R-N13). The in-place run's logs of
+2026-10-16 to 2026-10-18 (summarised on Linear TIN-6592, 2026-10-18)
+showed three S4 residuals: every verb that recorded any item or path
+refusal ended `CONTRACT_SELF_INCONSISTENT` (#231, F3); one `pull` of
+`~/.claude` printed 11,842 path refusals as a bare `IO`, all inside four
+job scratch checkouts and five rotated backups that the agents remove on
+their own; and `pull`s whose ssh timed out ended their sessions with a
+bare `IO` and no errno. A bare `IO` is never accounted, and no review can
+close it. The destination never saw those errnos (wire v6 carries a code
+alone); that the scratch paths were removed (`ENOENT`) is read from the
+paths, and the new test reproduces exactly that output.
+
+- **New codes.** Each is raised by product code and pinned by a test that
+  fails without it:
+
+  | Code | Raised when | Was |
+  |---|---|---|
+  | `ITEMS_REFUSED` | a verb ran every item or path it was asked for and at least one refused (`estate-capture`, `estate-apply`, `estate-carry-files`, `copy`, `pull`). The run-level exit only: each refusal is typed in its own record. Across `estate-*` levels a level that aborted keeps its own refusal (#231) | `CONTRACT_SELF_INCONSISTENT` |
+  | `SOURCE_VANISHED` | a seat the source walk listed is gone (`ENOENT`) when the walk stats or enters it, when it is hashed, or when a transfer's capture opens it or its directory: it, or a directory above it, was removed after the listing. Nothing of it is carried or remembered; the next pass walks the source as it is then | bare `IO` (errno 2; on the wire, `IO` alone) |
+  | `TRANSPORT_LOST` | a transfer session's frame stream ends at or inside a frame, a write finds the peer gone (`EPIPE`, `ECONNRESET`), or a `pull`'s ssh exits unsuccessfully, even after the session. The peer's own refusal, when it had one, is on its stderr; a local `copy` reports the destination's refusal when the source only lost its stream, and the source's when the destination only lost its | bare `IO` with no errno |
+
+- **A lost transport is unaccounted until a rerun.** `TRANSPORT_LOST` is
+  typed but, like `GIT_CONVERGE_INTERRUPTED`, no review or attestation
+  closes it (`transport-lost`): the session's record holds no row for the
+  paths it never reached, and the peer's own refusal never crossed the
+  wire. A rerun replaces the transfer's record. A closure row naming
+  `ITEMS_REFUSED` is unaccounted too (`run-level-refusal`); no product
+  site records one.
+- **A transfer row keeps a local errno.** An `IO` that the destination side
+  of a transfer raised for a path keeps its errno in the transfer record
+  (`refused PATH: IO (errno N)` on stderr). It is still untyped and still
+  unaccounted; the errno says which typed code it needs.
+- **Disposition.** A `SOURCE_VANISHED` path is a typed refusal, pending
+  review like any other.
+- **Old records.** No code left the taxonomy. A record written before this
+  change keeps its bare `IO`, and stays unaccounted; re-running the verb
+  records the new code. An older agent reads a record naming a new code as
+  `refusal-code-retired` (unaccounted), so both hosts of a `pull` run the
+  same build.
+- **Still open.** A refusal the source sends crosses the wire as its code
+  alone (wire v6), so a source-side `IO` other than `ENOENT` still reaches
+  the destination's record without its errno; carrying it needs a wire
+  version (an operator decision). A seat whose stat or open fails with
+  another errno (`EACCES`, or `ELOOP`/`ENOTDIR` for a swapped component)
+  stays a bare `IO`. A directory removed between its stat and its open is
+  `SOURCE_VANISHED` too; no test reproduces that window. A source root
+  removed or renamed during a pass would show as many `SOURCE_VANISHED`
+  rows that one standing policy could accept; no check yet tells that
+  from churn. A path refused by both sides as `IO` takes the local errno.
