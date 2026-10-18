@@ -33,6 +33,29 @@
 //! (nothing left to make, so nothing recorded), and a second rerun is a
 //! journal no-op.
 //!
+//! `ExcludeUnion` (M2 round 2, item 2): a source linked worktree whose
+//! common exclude is a superset of the destination repository's, applied
+//! with `--exclude-union` (this row only: the others run without it),
+//! crashed after the append's intent is recorded (the exclude untouched,
+//! its temporary written) or after the rename (the record still an
+//! intent): the worktree is absent and the item `journal-missing`; the
+//! rerun settles the intent by identity (`not-written`, its temporary
+//! removed, then a fresh append; or `appended`, with nothing left to
+//! append), counts the unreported append `exclude-appended=1` either way,
+//! lands the worktree, and a second rerun is a journal no-op.
+//!
+//! `Beside` (M2 round 2 item c): the `Workspace` shape with one seat the
+//! destination changed, so `--adopt` refuses `GIT_DESTINATION_DIVERGED`,
+//! applied with `--adopt --beside` (this row only), crashed after the
+//! beside worktree is added and before its ledger (`linked_added`: the
+//! rerun finishes it forward from its landing intent), or after the refs
+//! are created and before the STATE record and the journal (`beside_refs`):
+//! the destination checkout is untouched either way, the item
+//! `journal-missing`; the rerun lands (or finds landed) the beside checkout,
+//! every `refs/<suffix>/` ref holds the capture's value and none moved,
+//! the record is written and the journal says `workspace-beside`; a second
+//! rerun is a journal no-op.
+//!
 //! `_exit` models a process crash only (see the harness header).
 
 use std::fs;
@@ -48,6 +71,12 @@ use super::{Scenario, CHILD_DEADLINE, CHILD_WATCHDOG, CHILD_WATCHDOG_EXIT_CODE, 
 
 /// Set only in a child: the scratch base it applies in.
 const CHILD_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_BASE";
+/// Set only in an `ExcludeUnion` child: it applies with `--exclude-union`.
+const CHILD_UNION_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_UNION";
+/// Set only in a `Beside` child: it applies with `--beside SUFFIX`.
+const CHILD_BESIDE_ENV: &str = "BULKLOAD_W7_ADOPT_CHILD_BESIDE";
+/// The `Beside` rows' suffix.
+const SUFFIX: &str = ".neo-20261016";
 
 /// What is crashed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +87,14 @@ pub enum EstateAdopt {
     Bare,
     /// A first landing under absent parents (M2 finding 1).
     Parents,
+    /// A first linked landing under `--exclude-union` (M2 round 2, item 2).
+    ExcludeUnion,
+    /// A diverged checkout landed beside under `--beside` (M2 round 2,
+    /// item c).
+    Beside,
+    /// `Beside` crashed at `linked_added`, then the source moved and was
+    /// captured again (review of #266, B1).
+    BesideStale,
 }
 
 impl Scenario for EstateAdopt {
@@ -98,6 +135,11 @@ fn git(repo: &Path, args: &[&str]) -> String {
 
 struct World {
     base: PathBuf,
+    /// `--exclude-union` on every apply: the `ExcludeUnion` row only, so the
+    /// other rows keep their crash coverage without the flag.
+    union: bool,
+    /// `--beside` on every apply: the `Beside` row only.
+    beside: bool,
 }
 
 impl Drop for World {
@@ -116,6 +158,8 @@ impl World {
         fs::create_dir(&base).unwrap();
         let world = Self {
             base: fs::canonicalize(&base).unwrap(),
+            union: kind == EstateAdopt::ExcludeUnion,
+            beside: matches!(kind, EstateAdopt::Beside | EstateAdopt::BesideStale),
         };
         let src = world.base.join("src");
         fs::create_dir(&src).unwrap();
@@ -129,7 +173,9 @@ impl World {
         git(&src, &["branch", "side"]);
         git(&src, &["branch", "neo-only"]);
         git(&src, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
-        let (item, dest) = if kind == EstateAdopt::Parents {
+        let (item, dest) = if kind == EstateAdopt::ExcludeUnion {
+            (world.exclude_union_item(&src), None)
+        } else if kind == EstateAdopt::Parents {
             (
                 Item {
                     source: src.clone(),
@@ -181,9 +227,50 @@ impl World {
             assert!(out.status.success());
             git(&dest, &["branch", "-D", "neo-only"]);
             git(&dest, &["branch", "sting-only", "v0"]);
+            if matches!(kind, EstateAdopt::Beside | EstateAdopt::BesideStale) {
+                fs::write(dest.join("d/b.txt"), b"beta, edited at the destination\n").unwrap();
+                // Review B6: the source's HEAD is a branch the destination
+                // lacks, so an attach would create it there.
+                git(&src, &["switch", "--quiet", "-c", "beside-only"]);
+            }
         }
         estate::add_batch(&world.base.join("plan"), &[item]).unwrap();
         world
+    }
+
+    /// The `ExcludeUnion` item: a linked worktree of `src` whose common
+    /// exclude is a superset of the destination's, a `cp -a` of `src`
+    /// without its worktree administration.
+    fn exclude_union_item(&self, src: &Path) -> Item {
+        let tree = self.base.join("src-wt");
+        git(
+            src,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "feature",
+                tree.to_str().unwrap(),
+            ],
+        );
+        fs::write(tree.join("wt.txt"), b"wt\n").unwrap();
+        fs::create_dir_all(src.join(".git/info")).unwrap();
+        fs::write(src.join(".git/info/exclude"), b"*.log\nbuild/\n").unwrap();
+        let out = Command::new("cp")
+            .arg("-a")
+            .arg(src)
+            .arg(self.dst())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        fs::remove_dir_all(self.dst().join(".git/worktrees")).unwrap();
+        fs::write(self.dst().join(".git/info/exclude"), b"*.log\n").unwrap();
+        Item {
+            source: tree,
+            repository: self.dst(),
+            workspace: Some(self.base.join("dst-wt")),
+        }
     }
 
     fn dst(&self) -> PathBuf {
@@ -216,6 +303,9 @@ impl World {
             &ApplyOptions {
                 adopt,
                 activate_origin: Vec::new(),
+                exclude_union: self.union,
+                beside: self.beside.then(|| SUFFIX.to_owned()),
+                side_roots: Vec::new(),
             },
             &|row| {
                 rows.lock().unwrap().push((row.outcome, row.reason.clone()));
@@ -301,6 +391,8 @@ fn crash(world: &World, fault: &str) {
         ])
         .env(CHILD_ENV, &world.base)
         .env(FAULT_ENV, fault)
+        .env(CHILD_UNION_ENV, if world.union { "1" } else { "" })
+        .env(CHILD_BESIDE_ENV, if world.beside { "1" } else { "" })
         .env_remove(super::CHILD_ENV)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -355,6 +447,11 @@ fn adopt_child_entry() {
         &ApplyOptions {
             adopt: true,
             activate_origin: Vec::new(),
+            exclude_union: std::env::var_os(CHILD_UNION_ENV).is_some_and(|value| value == "1"),
+            beside: std::env::var_os(CHILD_BESIDE_ENV)
+                .is_some_and(|value| value == "1")
+                .then(|| SUFFIX.to_owned()),
+            side_roots: Vec::new(),
         },
         &|_| Ok(()),
     );
@@ -368,6 +465,18 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
     world.capture();
     if kind == EstateAdopt::Parents {
         parents(&world, &label, point, nth);
+        return;
+    }
+    if kind == EstateAdopt::ExcludeUnion {
+        exclude_union(&world, &label, point, nth);
+        return;
+    }
+    if kind == EstateAdopt::Beside {
+        beside(&world, &label, point, nth);
+        return;
+    }
+    if kind == EstateAdopt::BesideStale {
+        beside_stale(&world, &label, point, nth);
         return;
     }
     if kind == EstateAdopt::Bare {
@@ -503,5 +612,264 @@ fn parents(world: &World, label: &str, point: Point, nth: u64) {
     assert_eq!(
         rows[0].0, "previous-workspace-restoration-not-revalidated",
         "{label}"
+    );
+}
+
+/// The `ExcludeUnion` row: see the module docs.
+fn exclude_union(world: &World, label: &str, point: Point, nth: u64) {
+    use bulkload_agent::git_carry::exclude_union::{read_record, AppendState};
+    let exclude = world.dst().join(".git/info/exclude");
+    let record = || {
+        let found: Vec<PathBuf> = fs::read_dir(world.base.join("applied"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "exclude-union"))
+            .collect();
+        assert_eq!(found.len(), 1, "{label}: one record");
+        read_record(&found[0]).unwrap().unwrap()
+    };
+    let written = point == Point::EstateApplyExcludeAppended;
+    crash(world, &format!("{}:{nth}", point.name()));
+    assert_eq!(
+        fs::read(&exclude).unwrap(),
+        if written {
+            b"*.log\nbuild/\n".as_slice()
+        } else {
+            b"*.log\n"
+        },
+        "{label}"
+    );
+    assert_eq!(
+        record()
+            .appends
+            .iter()
+            .map(|append| append.state)
+            .collect::<Vec<_>>(),
+        [AppendState::Intent],
+        "{label}: recorded ahead of the write, settled after it"
+    );
+    assert!(
+        fs::symlink_metadata(world.base.join("dst-wt")).is_err(),
+        "{label}: nothing landed"
+    );
+    assert_eq!(world.unaccounted(), 1, "{label}: journal-missing");
+    let rows = world.apply(false);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
+    assert!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("exclude-appended=1")),
+        "{label}: the append reaches a receipt either way: {rows:?}"
+    );
+    let leftovers: Vec<_> = fs::read_dir(world.dst().join(".git/info"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(leftovers, ["exclude"], "{label}: a temporary was left");
+    assert_eq!(fs::read(&exclude).unwrap(), b"*.log\nbuild/\n", "{label}");
+    let states: Vec<AppendState> = record().appends.iter().map(|append| append.state).collect();
+    if written {
+        assert_eq!(states, [AppendState::Appended], "{label}");
+    } else {
+        assert_eq!(
+            states,
+            [AppendState::NotWritten, AppendState::Appended],
+            "{label}"
+        );
+    }
+    assert_eq!(
+        fs::read(world.base.join("dst-wt/wt.txt")).unwrap(),
+        b"wt\n",
+        "{label}"
+    );
+    assert_eq!(world.unaccounted(), 0, "{label}");
+    let rows = world.apply(false);
+    assert_eq!(
+        rows[0].0, "previous-workspace-restoration-not-revalidated",
+        "{label}"
+    );
+}
+
+/// The beside checkout of the `Beside` rows.
+fn beside_path(world: &World) -> PathBuf {
+    world.base.join(format!("dst{SUFFIX}"))
+}
+
+/// Every ref under `refs/neo-20261016/` and `refs/neo-20261016-stash/`.
+fn beside_refs(repo: &Path) -> std::collections::BTreeMap<String, String> {
+    refs(repo)
+        .into_iter()
+        .filter(|(name, _)| name.starts_with("refs/neo-"))
+        .collect()
+}
+
+/// The refs the `Beside` rows' capture wants under the namespace.
+fn wanted_refs(world: &World) -> std::collections::BTreeMap<String, String> {
+    let src = world.base.join("src");
+    let mut wanted: std::collections::BTreeMap<String, String> = refs(&src)
+        .into_iter()
+        .filter(|(name, _)| name != "refs/stash")
+        .map(|(name, value)| {
+            (
+                format!("refs/neo-20261016/{}", name.strip_prefix("refs/").unwrap()),
+                value,
+            )
+        })
+        .collect();
+    if let Ok(tip) = git_command(&src)
+        .args(["rev-parse", "--verify", "-q", "refs/stash"])
+        .output()
+    {
+        let tip = String::from_utf8(tip.stdout).unwrap().trim().to_owned();
+        if !tip.is_empty() {
+            wanted.insert("refs/neo-20261016/stash".to_owned(), tip);
+            let list = git(&src, &["stash", "list", "--format=%H"]);
+            for (index, oid) in list.lines().enumerate() {
+                wanted.insert(format!("refs/neo-20261016-stash/{index}"), oid.to_owned());
+            }
+        }
+    }
+    wanted
+}
+
+/// The `Beside` rows' STATE record, if written.
+fn beside_record(world: &World) -> Option<bulkload_agent::git_carry::beside::BesideRecord> {
+    let found: Vec<PathBuf> = fs::read_dir(world.base.join("applied"))
+        .ok()?
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "beside"))
+        .collect();
+    assert!(found.len() <= 1, "{found:?}");
+    found.first().map(|path| {
+        bulkload_agent::git_carry::beside::read_record(path)
+            .unwrap()
+            .unwrap()
+    })
+}
+
+/// The `Beside` row: see the module docs.
+fn beside(world: &World, label: &str, point: Point, nth: u64) {
+    let dst = world.dst();
+    let before = checkout(&dst);
+    let native: std::collections::BTreeMap<String, String> = refs(&dst)
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("refs/neo-"))
+        .collect();
+    let wanted = wanted_refs(world);
+    crash(world, &format!("{}:{nth}", point.name()));
+    assert_eq!(checkout(&dst), before, "{label}: the destination moved");
+    let after_refs = point == Point::EstateApplyBesideRefs;
+    // Review B5/B6: at `beside_refs` every wanted ref is in and the record
+    // names them all pending; at `linked_added` neither.
+    if after_refs {
+        assert_eq!(beside_refs(&dst), wanted, "{label}: the refs at the crash");
+        let record = beside_record(world).unwrap();
+        let pending: std::collections::BTreeMap<String, String> =
+            record.pending.into_iter().collect();
+        assert_eq!(pending, wanted, "{label}: the write-ahead record");
+        assert!(record.created.is_empty(), "{label}");
+    } else {
+        assert!(beside_refs(&dst).is_empty(), "{label}");
+        assert!(
+            beside_record(world).is_none(),
+            "{label}: no record before the refs"
+        );
+    }
+    assert_eq!(world.unaccounted(), 1, "{label}: journal-missing");
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-beside", "{label}: {rows:?}");
+    let reason = rows[0].1.clone().unwrap_or_default();
+    if after_refs {
+        assert!(reason.contains("beside-present=1"), "{label}: {reason}");
+    } else {
+        // Finished forward from the landing intent, never converged.
+        assert!(
+            reason.contains("landing-recovered") && !reason.contains("converged"),
+            "{label}: {reason}"
+        );
+    }
+    assert_eq!(
+        checkout(&dst),
+        before,
+        "{label}: the rerun moved the destination"
+    );
+    let now: std::collections::BTreeMap<String, String> = refs(&dst)
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("refs/neo-"))
+        .collect();
+    assert_eq!(now, native, "{label}: a native ref moved or was created");
+    assert_eq!(beside_refs(&dst), wanted, "{label}");
+    let record = beside_record(world).unwrap();
+    assert!(
+        record.pending.is_empty() && record.kept.is_empty(),
+        "{label}"
+    );
+    let created: std::collections::BTreeMap<String, String> = record.created.into_iter().collect();
+    assert_eq!(created, wanted, "{label}: every ref recorded as created");
+    let beside = beside_path(world);
+    assert_eq!(
+        fs::read(beside.join("d/b.txt")).unwrap(),
+        b"beta\n",
+        "{label}: the beside holds the capture"
+    );
+    assert_eq!(
+        git(&beside, &["rev-parse", "HEAD"]),
+        git(&world.base.join("src"), &["rev-parse", "HEAD"]),
+        "{label}"
+    );
+    assert_eq!(
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "HEAD",
+        "{label}: detached"
+    );
+    assert_eq!(world.unaccounted(), 0, "{label}");
+    let rows = world.apply(true);
+    assert_eq!(
+        rows[0].0, "previous-workspace-beside-not-revalidated",
+        "{label}"
+    );
+}
+
+/// The `BesideStale` row (review B1): a beside landing crashed after its
+/// worktree was added, then the source moved and was captured again. The
+/// rerun finishes the crashed landing forward (the older capture) and then
+/// refuses `GIT_DESTINATION_OCCUPIED`: the beside path holds another
+/// capture. No ref goes in, no record is written, the destination checkout
+/// is untouched, and the item is a typed refusal, never `applied-beside`.
+fn beside_stale(world: &World, label: &str, point: Point, nth: u64) {
+    let dst = world.dst();
+    let before = checkout(&dst);
+    let src = world.base.join("src");
+    let old = git(&src, &["rev-parse", "HEAD"]);
+    crash(world, &format!("{}:{nth}", point.name()));
+    fs::write(src.join("a.txt"), b"alpha, moved after the crash\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "moved"]);
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    world.capture();
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "refused", "{label}: {rows:?}");
+    assert!(
+        rows[0]
+            .1
+            .as_deref()
+            .is_some_and(|reason| reason.contains("GIT_DESTINATION_OCCUPIED")),
+        "{label}: {rows:?}"
+    );
+    assert_eq!(checkout(&dst), before, "{label}");
+    assert!(beside_refs(&dst).is_empty(), "{label}");
+    assert!(beside_record(world).is_none(), "{label}");
+    assert_eq!(
+        git(&beside_path(world), &["rev-parse", "HEAD"]),
+        old,
+        "{label}"
+    );
+    assert_eq!(
+        world.unaccounted(),
+        0,
+        "{label}: a typed refusal is accounted"
     );
 }

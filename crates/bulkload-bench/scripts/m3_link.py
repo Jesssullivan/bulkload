@@ -40,9 +40,9 @@ Subcommands:
       source, `pull` of the capture, `estate-apply` here, against rclone of
       the same checkouts (order G/R/G), initial and unchanged rerun. Every
       rep records an iperf3 baseline (when both hosts have iperf3), the ssh
-      ceiling (gate_b's dd calibration) and both hosts' load before and
+      ceiling (link_common's dd calibration) and both hosts' load before and
       after every arm.
-      --dry-run: one-host loopback (gate_b's ssh shim; the sftp subsystem is
+      --dry-run: one-host loopback (link_common's ssh shim; the sftp subsystem is
       the local sftp-server) on a generated corpus. NOT A SAMPLE.
 
 Nothing here signals a process, writes a source tree other than the
@@ -71,7 +71,7 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import gate_b as gb  # noqa: E402
+import link_common as gb  # noqa: E402
 import r23_ab as ab  # noqa: E402
 
 FORMAT = "bulkload-m3-link-v1"
@@ -108,7 +108,7 @@ MTIME = 1_790_899_200  # 2026-10-02T00:00:00Z, as r23_corpus.py
 # --------------------------------------------------------------- helper code
 
 # Runs on either host (python 3.8+, standard library only), appended to
-# gate_b's REMOTE_HELPER so its conditions/manifest/xor ops are shared.
+# link_common's REMOTE_HELPER so its conditions/manifest/xor ops are shared.
 M3_HELPER = r'''
 SIZE_EDGES = (0, 512, 4096, 16384, 65536, 262144, 1 << 20, 4 << 20, 16 << 20,
               64 << 20, 256 << 20, 1 << 30)
@@ -352,7 +352,7 @@ def op_census(args):
     return out
 
 
-# The serve wrapper: gate_b's, with an exit status any Python 3.8 decodes.
+# The serve wrapper: link_common's, with an exit status any Python 3.8 decodes.
 M3_WRAPPER = """#!{python} -I
 import os, subprocess, sys
 child = subprocess.Popen([{agent!r}] + {flags!r} + sys.argv[1:])
@@ -669,7 +669,7 @@ def local(op: str, args: dict[str, object]) -> dict[str, object]:
 
 @dataclasses.dataclass
 class Transport(gb.Transport):
-    """gate_b's one ssh transport, with the M3 ops in its helper program."""
+    """link_common's one ssh transport, with the M3 ops in its helper program."""
 
     def helper(self, op: str, args: dict[str, object]) -> dict[str, object]:
         program = (
@@ -1126,7 +1126,7 @@ def rclone_tuned_argv(
     ]
 
 
-# rclone as gate (a) and gate_b run it: --transfers 4 --checkers 4.
+# rclone as gate (a) and the retired gate_b.py ran it: --transfers 4 --checkers 4.
 PLAIN_TUNING = ("--transfers", "4", "--checkers", "4")
 
 
@@ -1141,7 +1141,7 @@ def delta_plan_files(
 
     ceil(percent of the comparable non-empty regular files), chosen in a
     seeded path-hash order; each is changed in place by XOR over its first
-    min(size, cap) bytes (gate_b's `xor` op), so its size is kept, its bytes
+    min(size, cap) bytes (link_common's `xor` op), so its size is kept, its bytes
     and mtime change, and nothing is removed at any destination.
     """
     files = [r for r in rows if r[1] == "f" and r[0] not in exclusions and r[3] > 0]
@@ -2012,7 +2012,7 @@ def dest_budget(
 
 
 def rows_identity(rows: list[list[object]]) -> str:
-    """corpus_identity's digest, from gate_b manifest rows of a working copy."""
+    """corpus_identity's digest, from link_common manifest rows of a working copy."""
     digest = hashlib.sha256()
     for rel, kind, _mode, size, value in rows:
         if kind == "f":

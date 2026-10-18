@@ -82,10 +82,25 @@ pub enum Outcome {
     IndexRepaired,
     /// The verb refused the item.
     Refused(Refusal),
+    /// `estate-carry-files` carried an item whose capture refused as files,
+    /// byte-exact, through a recorded transfer session (M2r2 b). Appended
+    /// after `Refused`: the variant order is the on-disk format.
+    CarriedAsFiles,
+    /// The adopt proof refused the existing planned workspace
+    /// (`GIT_DESTINATION_DIVERGED`) and, under `--adopt --beside SUFFIX`,
+    /// apply landed the captured checkout beside it with every captured ref
+    /// created in (M2 round 2, item c).
+    WorkspaceBeside,
+    /// A re-apply found the beside journal and did not revalidate it.
+    PreviousWorkspaceBesideNotRevalidated,
 }
 
 /// Every non-refusal outcome and its legacy string, in variant order.
-pub const NAMED: [(Outcome, &str); 10] = [
+///
+/// `Refused`, variant 10, sits between `IndexRepaired` and
+/// `CarriedAsFiles` (11); `WorkspaceBeside` (12) and
+/// `PreviousWorkspaceBesideNotRevalidated` (13) follow (M2r2 c).
+pub const NAMED: [(Outcome, &str); 13] = [
     (Outcome::Captured, "captured"),
     (Outcome::CapturedWithDrift, "captured-with-drift"),
     (
@@ -108,6 +123,12 @@ pub const NAMED: [(Outcome, &str); 10] = [
         "previous-ref-custody-not-workspace-parity",
     ),
     (Outcome::IndexRepaired, "index-repaired"),
+    (Outcome::CarriedAsFiles, "carried-as-files"),
+    (Outcome::WorkspaceBeside, "workspace-beside"),
+    (
+        Outcome::PreviousWorkspaceBesideNotRevalidated,
+        "previous-workspace-beside-not-revalidated",
+    ),
 ];
 
 /// The legacy string of a refusal outcome.
@@ -477,6 +498,8 @@ mod tests {
                 .prop_map(BulkloadRefusal::GitNestPopulatedSubmodule),
             path.clone()
                 .prop_map(BulkloadRefusal::GitNestCarrierRefused),
+            path.clone()
+                .prop_map(BulkloadRefusal::GitCarryPointerAttached),
             path.clone().prop_map(BulkloadRefusal::GitNestPointerStale),
             path.clone().prop_map(BulkloadRefusal::GitNestWorktreeMoved),
             path.clone().prop_map(BulkloadRefusal::GitSourceAlternates),
@@ -750,10 +773,20 @@ mod tests {
     #[test]
     fn golden_encodings_are_stable() {
         for (index, (outcome, _)) in NAMED.iter().enumerate() {
+            // `Refused` is variant 10; the outcomes appended after it
+            // (`CarriedAsFiles`, M2r2 b) sit one index further on.
+            let variant = if index >= 10 { index + 1 } else { index };
             assert_eq!(
                 postcard::to_allocvec(outcome).unwrap(),
-                vec![u8::try_from(index).unwrap()]
+                vec![u8::try_from(variant).unwrap()]
             );
+        }
+        for (outcome, variant) in [
+            (Outcome::CarriedAsFiles, 11),
+            (Outcome::WorkspaceBeside, 12),
+            (Outcome::PreviousWorkspaceBesideNotRevalidated, 13),
+        ] {
+            assert_eq!(postcard::to_allocvec(&outcome).unwrap(), vec![variant]);
         }
         let record = OutcomeRecord {
             source: PathBuf::from("/s"),

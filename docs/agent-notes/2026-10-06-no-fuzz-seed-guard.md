@@ -1,5 +1,7 @@
 # 2026-10-06: no-fuzz seed guard
 
+> **Label (2026-10-17, R-N13; body unchanged).** Context (R-C843/R-C844, Linear TIN-4543 `ace8649c`): the whitepaper and formal model this lane served were deleted 2026-10-17; the completion bar is now SPEC R7 resume plus a hash manifest. The seed guard (`tests/prop_seed_guard.rs`) stays.
+
 **Lane:** no-fuzz-seed-guard (workflow subagent, sting).
 **Branch:** `feat/seeded-proptests-20261006`, worktree
 `bulkload.worktrees/seed-guard-20261006`, based on `origin/main` `b6ecd50`.

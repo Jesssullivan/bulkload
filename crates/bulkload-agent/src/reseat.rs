@@ -218,6 +218,11 @@ pub struct Options {
     /// The free-space floor, percent of each destination file system
     /// (`--min-free-percent`; the engine's rule).
     pub min_free_percent: u8,
+    /// `--replace-archived-dest ROOT`, canonical (A-106): a destination
+    /// transcript, sidecar or rollout that is a symlink to a regular file
+    /// under one of these is replaced by the differing landed file, the
+    /// archive target kept and the link ledgered for `--undo`.
+    pub replace_archived: Vec<PathBuf>,
 }
 
 /// The default `--retention-margin-days`.
@@ -265,6 +270,7 @@ impl Options {
             respell_cwd: true,
             regularize: true,
             min_free_percent: crate::space::min_free_percent(),
+            replace_archived: Vec::new(),
         }
     }
 
@@ -399,8 +405,14 @@ pub struct Summary {
     /// `(tool, word)` → sessions or threads, by their transcript's or
     /// rollout's outcome, or a lane refusal.
     pub sessions: BTreeMap<(String, String), u64>,
-    /// Codex thread rows: `registered`, `adopted`, `unchanged`,
-    /// `conflict`, `index-absent`.
+    /// Codex thread rows: `registered`, `adopted` (a row naming this
+    /// placement), `unchanged`, `conflict`, `synthesized`, `absent`,
+    /// `respelled`, `changed-since` (a re-spelling whose row changed
+    /// first), `respell-not-text` (rows skipped: `id` or `cwd` not UTF-8),
+    /// `respell-link-moved` (rows not re-spelled: a link moved during the
+    /// sweep), and the holding words `destination-adopted`,
+    /// `destination-holds`, `destination-row-only` (also session words;
+    /// distinct from the placement word `adopted`).
     pub rows: BTreeMap<String, u64>,
 }
 
@@ -551,12 +563,61 @@ fn space(options: &Options, wants: &[(&Path, u64)]) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a `--replace-archived-dest` root that overlaps the live state.
+///
+/// `FIELD_DOMAIN_VIOLATION` before anything is read or written when a root
+/// equals, contains or is under the real destination `.claude` or
+/// `.codex`, or contains the destination home: a swap there would happen
+/// inside the archive, or the root would take the live state itself for
+/// an archive (review A1).
+///
+/// # Errors
+/// `FIELD_DOMAIN_VIOLATION`.
+pub fn archive_roots_disjoint(options: &Options) -> Result<()> {
+    let live: Vec<PathBuf> = [&options.dest_claude, &options.dest_codex]
+        .into_iter()
+        .filter_map(|path| std::fs::canonicalize(path).ok())
+        .collect();
+    let home = std::fs::canonicalize(&options.dest_home).ok();
+    for root in &options.replace_archived {
+        if live
+            .iter()
+            .any(|dest| root.starts_with(dest) || dest.starts_with(root))
+            || home.as_ref().is_some_and(|home| home.starts_with(root))
+        {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+    }
+    Ok(())
+}
+
+/// Settle the regularizations and archive replacements a crash left in
+/// flight, before any placement, whether or not this pass regularizes.
+fn settle_intents(
+    options: &Options,
+    ledger: &ledger::Ledger,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    for (on, dest, tool) in [
+        (options.claude, &options.dest_claude, claude::TOOL),
+        (options.codex, &options.dest_codex, codex::TOOL),
+    ] {
+        if let (true, Ok(real)) = (on, std::fs::canonicalize(dest)) {
+            regularize::settle_intents(&real, tool, ledger, summary, emit)?;
+        }
+    }
+    Ok(())
+}
+
 /// Re-seat the landed sessions into the destination's live agent state:
 /// one JSON line per tool, per session and per thread, handed to `line`,
 /// then the summary line.
 ///
 /// # Errors
-/// Before anything is written: `RESEAT_LOCKED` when another run holds a
+/// Before anything is written: `FIELD_DOMAIN_VIOLATION` for a
+/// `--replace-archived-dest` root that overlaps the live destination
+/// ([`archive_roots_disjoint`]), `RESEAT_LOCKED` when another run holds a
 /// destination root or STATE, `RESEAT_LANDING_ABSENT` when a landed tree
 /// the run covers is absent, `RESEAT_RETENTION_UNSAFE` when the
 /// destination's Claude Code would delete a re-seated file within the
@@ -565,6 +626,7 @@ fn space(options: &Options, wants: &[(&Path, u64)]) -> Result<()> {
 /// free-space floor. Then ledger, I/O and schema refusals. A session's own
 /// refusal is its line's `refused` code, never the run's.
 pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Result<Summary> {
+    archive_roots_disjoint(options)?;
     let lanes = Lanes::new(options);
     let mut summary = Summary::default();
     let mut held = Held(Vec::new());
@@ -638,16 +700,27 @@ pub fn reseat(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Re
             "{{\"schema\":\"{SCHEMA}\",\"kind\":\"tool\",\"tool\":\"{tool}\",\"state\":\"{state}\"}}"
         ))?;
     }
+    settle_intents(options, &ledger, &mut summary, emit)?;
     if options.claude && options.regularize {
         // Before placement: a regularized copy that is a prefix of a landed
         // transcript is then extended like any other.
-        regularize::regularize(&root(&options.dest_claude)?, &ledger, &mut summary, emit)?;
+        regularize::regularize(
+            &root(&options.dest_claude)?,
+            &options.replace_archived,
+            &ledger,
+            &mut summary,
+            emit,
+        )?;
     }
     if let Some(sessions) = &claude {
         claude::reseat(options, &lanes, &ledger, sessions, &mut summary, emit)?;
     }
-    if codex == Some(true) {
-        codex::reseat(options, &lanes, &mut ledger, &mut summary, emit)?;
+    match codex {
+        Some(true) => codex::reseat(options, &lanes, &mut ledger, &mut summary, emit)?,
+        // Nothing landed: the destination's symlink-spelled rows are still
+        // re-spelled (operator M2 round 2 review).
+        Some(false) => codex::sweep_alone(options, &mut ledger, &mut summary, emit)?,
+        None => {}
     }
     emit(&summary.line())?;
     drop(held);
@@ -671,7 +744,8 @@ pub fn undo(options: &Options, emit: &mut dyn FnMut(&str) -> Result<()>) -> Resu
     lock_root(&mut held, &options.dest_codex)?;
     lock_state(&mut held, &options.state)?;
     let mut ledger = ledger::Ledger::open(&options.state, options.now_ns, "undo")?;
-    let links = regularize::undo(&ledger, emit)?;
+    let codex_root = std::fs::canonicalize(&options.dest_codex).ok();
+    let links = regularize::undo(&ledger, codex_root.as_deref(), emit)?;
     let rows = codex::undo(&mut ledger, emit)?;
     emit(&format!(
         "{{\"schema\":\"{SCHEMA}\",\"kind\":\"undo-summary\",\"links\":{links},\"rows\":{rows}}}"

@@ -202,6 +202,13 @@ pub enum BulkloadRefusal {
     /// Carries the nest's path relative to the enclosing checkout;
     /// [`fmt::Display`] prints it escaped.
     GitNestCarrierRefused(Vec<u8>),
+    /// `estate-carry-files` (M2r2 b) landed a `.git` pointer file or symlink
+    /// that resolves, where it landed, to an existing directory outside the
+    /// carried tree: Git would act on that repository through the carried
+    /// copy. The item is not recorded as carried; the landed bytes are left
+    /// for the operator. Carries the entry's path relative to the
+    /// destination; [`fmt::Display`] prints it escaped.
+    GitCarryPointerAttached(Vec<u8>),
     /// A `.git` gitdir-pointer file below the captured checkout names an
     /// administration that is not its own (M2r2 item 6), either:
     /// - one absent on this host: the directory it names does not exist or
@@ -502,6 +509,7 @@ impl BulkloadRefusal {
             Self::GitNestConversionAttribute(_) => "GIT_NEST_CONVERSION_ATTRIBUTE",
             Self::GitNestPopulatedSubmodule(_) => "GIT_NEST_POPULATED_SUBMODULE",
             Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
+            Self::GitCarryPointerAttached(_) => "GIT_CARRY_POINTER_ATTACHED",
             Self::GitNestPointerStale(_) => "GIT_NEST_POINTER_STALE",
             Self::GitNestWorktreeMoved(_) => "GIT_NEST_WORKTREE_MOVED",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
@@ -596,6 +604,7 @@ impl BulkloadRefusal {
         "GIT_NEST_CONVERSION_ATTRIBUTE",
         "GIT_NEST_POPULATED_SUBMODULE",
         "GIT_NEST_CARRIER_REFUSED",
+        "GIT_CARRY_POINTER_ATTACHED",
         "GIT_NEST_POINTER_STALE",
         "GIT_NEST_WORKTREE_MOVED",
         "GIT_REPOSITORY_NOT_AT_PATH",
@@ -661,6 +670,7 @@ impl fmt::Display for BulkloadRefusal {
             | Self::GitNestConversionAttribute(ref path)
             | Self::GitNestPopulatedSubmodule(ref path)
             | Self::GitNestCarrierRefused(ref path)
+            | Self::GitCarryPointerAttached(ref path)
             | Self::GitNestPointerStale(ref path)
             | Self::GitNestWorktreeMoved(ref path)
             | Self::GitSourceAlternates(ref path)
@@ -853,6 +863,7 @@ mod tests {
             BulkloadRefusal::GitNestConversionAttribute(Vec::new()),
             BulkloadRefusal::GitNestPopulatedSubmodule(Vec::new()),
             BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
+            BulkloadRefusal::GitCarryPointerAttached(Vec::new()),
             BulkloadRefusal::GitNestPointerStale(Vec::new()),
             BulkloadRefusal::GitNestWorktreeMoved(Vec::new()),
             BulkloadRefusal::GitRepositoryNotAtPath,
