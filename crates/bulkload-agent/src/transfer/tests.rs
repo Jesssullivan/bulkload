@@ -2944,7 +2944,8 @@ fn a_stale_capture_record_is_refreshed_by_a_manifest_adoption() {
     );
 }
 
-/// #169 review (`AdoptOnlyUnrowed` in docs/formal): the record's adoption is
+/// #169 review (`AdoptOnlyUnrowed` in docs/formal, deleted 2026-10-17 under
+/// R-C843): the record's adoption is
 /// for outputs with no row. A clean rerun answers every rowed output `Reuse`
 /// from its row: it adopts nothing, proves nothing, and so hashes no
 /// destination byte, whatever the source-read counter says. A regression of
