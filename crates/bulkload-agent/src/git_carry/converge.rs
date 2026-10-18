@@ -387,6 +387,45 @@ fn worktrees(repo: &Path) -> Result<Vec<(PathBuf, Option<String>)>> {
     Ok(found)
 }
 
+/// One worktree `git worktree list` names (`estate-move-source`'s
+/// inventory, M2 item 7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    /// The worktree's path as Git records it (its real path).
+    pub path: PathBuf,
+    /// The repository itself is bare (only ever the first entry).
+    pub bare: bool,
+    /// Git calls the worktree prunable: its directory is gone.
+    pub prunable: bool,
+}
+
+/// Every worktree `repo` registers, its main first, with whether the
+/// repository is bare and whether Git calls a worktree prunable. Read-only
+/// (the same `worktree list` [`worktrees`] reads).
+///
+/// # Errors
+/// Whatever `git worktree list` refuses.
+pub fn worktree_census(repo: &Path) -> Result<Vec<Listed>> {
+    let listed = output(git(repo).args(["worktree", "list", "--porcelain", "-z"]))?;
+    let mut found: Vec<Listed> = Vec::new();
+    for field in listed.split(|byte| *byte == 0) {
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            found.push(Listed {
+                path: PathBuf::from(OsStr::from_bytes(path)),
+                bare: false,
+                prunable: false,
+            });
+        } else if let Some(last) = found.last_mut() {
+            if field == b"bare" {
+                last.bare = true;
+            } else if field == b"prunable" || field.starts_with(b"prunable ") {
+                last.prunable = true;
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// The git directory of every worktree of `repo` that has one (the main
 /// worktree's `.git`, each linked worktree's `worktrees/<id>`).
 pub(super) fn worktree_git_dirs(repo: &Path) -> Result<Vec<PathBuf>> {

@@ -734,6 +734,15 @@ pub(crate) fn id(item: &Item) -> Result<String> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// An item's identity (`estate::id`): the name its capture record, outcome
+/// record and journal carry, and what `estate-carry-files --item` takes.
+///
+/// # Errors
+/// `FRAME_CODEC` when the item does not encode.
+pub fn item_id(item: &Item) -> Result<String> {
+    id(item)
+}
+
 /// Append one operator-selected source and destination. No inventory guesses.
 ///
 /// # Errors
@@ -2411,12 +2420,28 @@ fn apply_item(
         source,
         base: base.as_ref(),
     };
+    // M2 item 7: a ref named `refs/<ns>` itself would take the refs-in
+    // namespace; refused before the item writes anything. A path Git cannot
+    // read as a repository is left to the landing's own refusal.
+    if options.refs_in && item.repository.exists() {
+        let suffix = options
+            .beside
+            .as_deref()
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let ns = git_carry::beside::namespace(suffix)?;
+        if matches!(
+            git_carry::beside::namespace_taken(&item.repository, &ns),
+            Ok(true)
+        ) {
+            return Err(BulkloadRefusal::GitDestinationOccupied);
+        }
+    }
     let policy = git_carry::converge::Policy {
         adopt: options.adopt,
         origins: &options.activate_origin,
         items,
     };
-    let (outcome, applied) = if item.workspace.is_some() {
+    let (outcome, mut applied) = if item.workspace.is_some() {
         let landed_before = landed_before(state, &identity, source, &journal)?;
         let (outcome, applied) = match git_carry::converge::apply_workspace(
             &staged,
@@ -2453,6 +2478,26 @@ fn apply_item(
             git_carry::converge::apply_refs(&staged, &target, &landing, &policy)?,
         )
     };
+    // M2 item 7 (`estate-move`): refs-in after an adopt, a landing or a
+    // converge, before the journal, so a crash is finished by the rerun. A
+    // beside landing took every captured ref under the namespace already.
+    if options.refs_in && outcome != "workspace-beside" {
+        let suffix = options
+            .beside
+            .as_deref()
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        let words = refs_in(
+            item,
+            &staged,
+            &target,
+            (state, &identity, suffix),
+            captured.digest,
+        )?;
+        applied.custody = Some(match applied.custody.take() {
+            Some(more) => format!("{more} {words}"),
+            None => words,
+        });
+    }
     write(&journal, &outcome.to_owned())?;
     let mut done = Completion::clean(outcome).naming(nested);
     done.custody = applied
@@ -2653,6 +2698,83 @@ fn beside_item(
         None => words,
     });
     Ok(applied)
+}
+
+/// Where an item's refs-in is recorded (M2 item 7, `estate-move`):
+/// `{item}-{blake3(source)}.refs-in` in STATE, a
+/// [`git_carry::beside::RefsInRecord`].
+#[must_use]
+pub fn refs_in_record_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.refs-in",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
+/// `estate-apply --refs-in` (M2 item 7).
+///
+/// The in-place lane's `refs-in.py` made native (operator ruling "refs in,
+/// tree beside", A-20261016-072): after this item adopted, landed or converged its repository, each
+/// captured branch and tag the repository lacks or holds at another value
+/// goes in create-only as `refs/<ns>/heads/<name>` (`refs/<ns>/tags/<name>`),
+/// `ns` the `--beside` suffix's namespace. Recorded write-ahead in STATE
+/// like a beside landing's refs; no ref is moved or deleted. A ref of that
+/// name already held at another value (an earlier pass's, the source has
+/// moved since) is kept, never moved, recorded and counted
+/// (`refs-in-kept=N`), as the design's step 7 reports `exists`: the
+/// source's value stays in the capture's provenance refs. A ref named
+/// `refs/<ns>` itself refuses the item before it writes anything
+/// (`apply_item`). Returns the receipt's custody words.
+fn refs_in(
+    item: &Item,
+    staged: &git_carry::StagedBundle,
+    target: &git_carry::converge::Target<'_>,
+    (state, identity, suffix): (&Path, &str, &str),
+    capture: [u8; 32],
+) -> Result<String> {
+    let ns = git_carry::beside::namespace(suffix)?;
+    let repository = target.repository;
+    if git_carry::beside::namespace_taken(repository, &ns)? {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    // The capture's provenance instance: the workspace ledger this apply
+    // just proved or wrote names it; a refs-only item (or a ledger that
+    // does not name this item's capture) imports it again, as a beside
+    // landing's adopted standalone checkout does.
+    let ledger = match item.workspace.as_deref() {
+        Some(workspace) => beside_ledger(workspace, target.source)?
+            .filter(|ledger| ledger.item == identity && ledger.capture == capture),
+        None => None,
+    };
+    let instance = if let Some(ledger) = ledger {
+        ledger.instance
+    } else {
+        if let Some(base) = target.base {
+            git_carry::import_staged(repository, base, target.source)?;
+        }
+        git_carry::beside::import_instance(repository, staged, target.source)?
+    };
+    let record_path = refs_in_record_path(state, identity, target.source);
+    let mut record = git_carry::beside::read_refs_in(&record_path)?.unwrap_or_default();
+    git_carry::beside::settle_refs_in(repository, &mut record)?;
+    identity.clone_into(&mut record.item);
+    ns.clone_into(&mut record.ns);
+    record.capture = capture;
+    record.instance.clone_from(&instance);
+    let wanted = git_carry::beside::refs_in_wanted(repository, target.source, &instance, &ns)?;
+    let planned = git_carry::beside::plan(repository, &wanted)?;
+    record.kept.clone_from(&planned.kept);
+    record.pending.clone_from(&planned.create);
+    git_carry::beside::write_refs_in(&record_path, &record)?;
+    git_carry::beside::create(repository, &planned.create)?;
+    record.created.extend(std::mem::take(&mut record.pending));
+    git_carry::beside::write_refs_in(&record_path, &record)?;
+    Ok(format!(
+        "refs-in-created={} refs-in-present={} refs-in-kept={}",
+        planned.create.len(),
+        planned.present.len(),
+        planned.kept.len()
+    ))
 }
 
 // Finding 13: whether STATE holds a journal of this item for a capture
@@ -3290,6 +3412,12 @@ pub struct ApplyOptions {
     /// under `refs/<ns>/`; the planned checkout is left as it was
     /// ([`git_carry::beside`]).
     pub beside: Option<String>,
+    /// `--refs-in` (M2 item 7, `estate-move`; needs `adopt` and `beside`):
+    /// after an item adopts, lands or converges, each captured branch and
+    /// tag its repository lacks or holds at another value is created under
+    /// `refs/<ns>/` (the `--beside` namespace), create-only, recorded in
+    /// STATE ([`git_carry::beside::RefsInRecord`]).
+    pub refs_in: bool,
 }
 
 /// Apply explicit restores only; common Git administration is serialized.
@@ -3419,6 +3547,9 @@ pub fn apply_reporting(
             return Err(BulkloadRefusal::RequiredFieldMissing);
         }
         git_carry::beside::namespace(suffix)?;
+    }
+    if options.refs_in && options.beside.is_none() {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
     }
     // A seated tree is an existing checkout: only `--adopt` lands into it.
     if !options.side_roots.is_empty() && !options.adopt {
@@ -3701,6 +3832,9 @@ mod handoff;
 pub use handoff::{handoff, HandoffMode, HandoffOptions, HandoffSummary, SCHEMA as HANDOFF_SCHEMA};
 mod retarget;
 pub use retarget::{mapped as retarget_mapped, retarget, Moved as Retargeted};
+
+// `estate-move` and `estate-move-source` (M2 item 7).
+pub mod moving;
 
 // S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
 #[cfg(test)]
