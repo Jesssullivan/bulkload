@@ -342,6 +342,13 @@ pub enum Point {
     /// (0755, synced), not yet recorded in STATE; nothing landed (M2
     /// finding 1).
     EstateApplyParentsMade,
+    /// `estate.apply.exclude_intent`: an `--exclude-union` append recorded
+    /// in STATE as an intent; the common exclude not yet written (M2
+    /// round 2, item 2).
+    EstateApplyExcludeIntent,
+    /// `estate.apply.exclude_appended`: the common exclude replaced by its
+    /// union (synced); the record still says intent.
+    EstateApplyExcludeAppended,
     /// `reseat.after_temp_seal`
     ReseatAfterTempSeal,
     /// `reseat.after_publish`
@@ -388,7 +395,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 62] = [
+    pub const ALL: [Self; 64] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -433,6 +440,8 @@ impl Point {
         Self::EstateAdoptAfterLedger,
         Self::EstateAdoptBareStaged,
         Self::EstateApplyParentsMade,
+        Self::EstateApplyExcludeIntent,
+        Self::EstateApplyExcludeAppended,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
         Self::ReseatAfterExtendIntent,
@@ -501,6 +510,8 @@ impl Point {
             Self::EstateAdoptAfterLedger => "estate.adopt.after_ledger",
             Self::EstateAdoptBareStaged => "estate.adopt.bare_staged",
             Self::EstateApplyParentsMade => "estate.apply.parents_made",
+            Self::EstateApplyExcludeIntent => "estate.apply.exclude_intent",
+            Self::EstateApplyExcludeAppended => "estate.apply.exclude_appended",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",
             Self::ReseatAfterExtendIntent => "reseat.after_extend_intent",
