@@ -140,7 +140,7 @@ SUBCOMMANDS:
                 given again; an unchanged rerun reads and writes nothing. One
                 JSON line per workspace (schema bulkload.estate-handoff.v1, the
                 verb's own name)
-    closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+    closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] [--omissions-from-destination] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
                 are mapped) and journals (later directories override earlier
@@ -155,8 +155,15 @@ SUBCOMMANDS:
                 the native one. `gate` is S4: every item accounted and every
                 typed refusal reviewed, so it can fail while `verdict`
                 passes and `unaccounted` is 0; it exits nonzero with
-                CLOSURE_UNACCOUNTED when it fails.
+                CLOSURE_UNACCOUNTED when it fails. The omissions block
+                reads each capture's .omissions sidecar; a capture from
+                before it is read from its bundle's header (no omission ref:
+                zero roots), and why an item stays unknown is printed on
+                stderr (omissions-unknown REASON=N ...).
                 Options, only before PLAN, each at most once:
+                --omissions-from-destination: for a capture from before the
+                sidecar whose bundle names an omission list, read that list
+                by oid from the item's destination repository (reads only).
                 --attest LEDGER.json: join a bulkload.closure-ledger.v1
                 attestation ledger for items closed by audit, not by a verb.
                 The ledger must name this PLAN and SOURCE (plan,
@@ -764,8 +771,21 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut dispositions = None;
     let mut manifest = None;
     let mut transfers = Vec::new();
+    let mut read_destinations = false;
     let mut positional = args;
     loop {
+        // M2 round 2, d: read a pre-sidecar capture's omission list from its
+        // destination repository's objects; only before PLAN.
+        if let [flag, rest @ ..] = positional {
+            if flag == "--omissions-from-destination" {
+                if read_destinations {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                }
+                read_destinations = true;
+                positional = rest;
+                continue;
+            }
+        }
         // WP3 PR 4: `--transfer DEST_STATE`, repeatable, also only before PLAN.
         if let [flag, state, rest @ ..] = positional {
             if flag == "--transfer" {
@@ -804,8 +824,13 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     }
     let source = source.to_str().ok_or(BulkloadRefusal::PathNotPortable)?;
     let states: Vec<PathBuf> = states.iter().map(PathBuf::from).collect();
-    let ledger =
-        bulkload_agent::estate::ledger(Path::new(plan), Path::new(corpus), source, &states)?;
+    let ledger = bulkload_agent::estate::ledger_with(
+        Path::new(plan),
+        Path::new(corpus),
+        source,
+        &states,
+        read_destinations,
+    )?;
     let mut report = bulkload_agent::closure::Report::from_ledger(&ledger);
     join_transfer_inputs(
         &mut report,
@@ -830,6 +855,17 @@ fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{}", report.to_json()).refuse_at("main::closure_command")?;
     stdout.flush().refuse_at("main::closure_command")?;
+    // M2 round 2, d: why each unknown item's omissions are unknown.
+    if !report.omissions.unknown_because.is_empty() {
+        let reasons = report
+            .omissions
+            .unknown_because
+            .iter()
+            .map(|(reason, items)| format!("{reason}={items}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("omissions-unknown {reasons}");
+    }
     report.gate()
 }
 

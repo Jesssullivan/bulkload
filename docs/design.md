@@ -191,11 +191,47 @@ current captures omitted (`node_modules`, `.direnv`, `__pycache__`,
 `.terraform` and the rest of `REBUILDABLE_DIRECTORIES`), from each
 capture's `{bundle}.omissions` sidecar: `items_known`, `items_unknown`,
 `roots`, `entries`, `bytes`, one row per root (`item`, `path`, `entries`,
-`bytes`) and the `unknown` items, whose capture predates the sidecar and
-is never counted as zero. Rows, totals, dispositions and the gate are
-v3's: an omitted root is accounted custody outside `planned` and every
-disposition. "Equals the source" reads exactly: equal except these
-counted roots.
+`bytes`) and the `unknown` items, never counted as zero. Rows, totals,
+dispositions and the gate are v3's: an omitted root is accounted custody
+outside `planned` and every disposition. "Equals the source" reads
+exactly: equal except these counted roots.
+
+A capture without the sidecar (M2 round 2, d, 2026-10-17). Every capture
+since `bf10700c` (authored 2026-09-22) names what it omitted in its own bundle, as
+the metadata ref `refs/carry-export/rebuildable-omissions-v1`, present only
+when it omitted something; the sidecar arrived with `3fe1f075`
+(2026-10-16). The 2026-10-16 in-place batches were captured on neo by
+`5beb0314`, between the two, so `closure-report` on i02 listed all 900
+items `unknown`. Without a sidecar the report now reads the bundle's
+header (never its pack): no omission ref means the capture omitted
+nothing (known, zero roots); the header is read strictly, and a line, a
+capability or an oid a capture header does not have is
+`header-unreadable`, never zero. With `--omissions-from-destination`
+(opt-in: it reads the live destination repositories), the ref's list is
+read by the oid the header names from the item's destination repository,
+which holds it once the item's import ran, and a shallow custody
+envelope's inventory is read from the same repository first. Reads only
+(`cat-file`, `rev-parse`, `ls-tree`, `--no-optional-locks`); nothing is
+unbundled or written. A destination is read only with a `git` at or over
+2.46 (so `GIT_NO_LAZY_FETCH` keeps a missing object from being fetched)
+and never when it is a partial clone, and only the shape a capture writes
+is taken: a commit whose tree is one `100644 blob` entry named `value`.
+Objects are not hashed again: that needs a SHA implementation the agent
+does not carry or a writer subcommand the S2 contract's pinned writer
+table does not admit (bulkload#188), so an object planted in the
+destination under the metadata oid reads as what it says. Like the
+sidecar, nothing checks the bundle's own digest here: a pack corrupted
+after its header still reads as its header says.
+What stays unknown says why on stderr, outside the v4 JSON:
+`omissions-unknown <reason>=<items> ...`, the reasons `no-capture`,
+`capture-unreadable`, `sidecar-unreadable`, `header-unreadable`,
+`value-not-read` and `envelope-not-read` (named in the bundle, destination
+not read), `value-not-held` and `envelope-not-held` (read, but the
+destination does not hold it, for example before the apply),
+`value-unreadable` and `envelope-unreadable` (held, but not the shape a
+capture writes, over the cap or not decodable),
+`holder-partial-clone` and `holder-git-too-old`. `estate-diff` and `estate-handoff` still read the
+sidecar only.
 
 The report schema was `bulkload.closure.v3` from WP3 PR 4. What changed for
 a v2 reader: a transfer row names its `kind` and adds `transfer` (the

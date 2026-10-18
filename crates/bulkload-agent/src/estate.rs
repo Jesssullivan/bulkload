@@ -352,6 +352,33 @@ fn retained_omissions(corpus: &Path, bundle: &str) -> Option<Vec<git_carry::Rebu
     read(&path).ok()
 }
 
+/// An item's omissions for the closure report, and why they are unknown when
+/// they are: the capture's `.omissions` sidecar; without one (a capture from
+/// before it, `3fe1f075`), what the bundle carries in band, its omission
+/// list read by oid from the item's destination repository once its import
+/// ran, when `read_destinations` (M2 round 2, d). Reads only.
+fn item_omissions(
+    item: &Item,
+    corpus: &Path,
+    bundle: &str,
+    read_destinations: bool,
+) -> (
+    Option<Vec<git_carry::RebuildableOmission>>,
+    Option<&'static str>,
+) {
+    let sidecar = omissions_sidecar(corpus, bundle);
+    if sidecar.is_file() {
+        return read(&sidecar).map_or((None, Some("sidecar-unreadable")), |omitted| {
+            (Some(omitted), None)
+        });
+    }
+    let holder = read_destinations.then_some(item.repository.as_path());
+    match git_carry::in_band::omissions(&corpus.join(bundle), holder) {
+        git_carry::in_band::InBand::Known(omitted) => (Some(omitted), None),
+        git_carry::in_band::InBand::Unknown(reason) => (None, Some(reason)),
+    }
+}
+
 // A drifted capture deliberately omits the drifted seats' bytes, so its sidecar
 // is the record of what it does not hold. Absent means the pass raced nothing.
 fn retained_drift(corpus: &Path, bundle: &str) -> Result<git_carry::CaptureDrift> {
@@ -2577,9 +2604,17 @@ pub struct LedgerEntry {
     /// it (#133).
     pub capture: Option<String>,
     /// The rebuildable roots the current capture omitted (#226 item 5),
-    /// from its `.omissions` sidecar; `None` when that is unknown (a
-    /// capture from before the sidecar, or no readable capture).
+    /// from its `.omissions` sidecar or, for a capture from before the
+    /// sidecar, from what its bundle carries in band
+    /// ([`git_carry::in_band`], M2 round 2, d); `None` when that is unknown.
     pub omitted: Option<Vec<git_carry::RebuildableOmission>>,
+    /// Why `omitted` is unknown: `no-capture`, `capture-unreadable`,
+    /// `sidecar-unreadable`, or the in-band reader's reason
+    /// (`header-unreadable`, `value-not-read`, `value-not-held`,
+    /// `value-unreadable`, `envelope-not-read`, `envelope-not-held`,
+    /// `envelope-unreadable`, `holder-partial-clone`,
+    /// `holder-git-too-old`).
+    pub unknown_because: Option<&'static str>,
 }
 
 /// A plan's items joined with their outcome records and apply journals.
@@ -2611,6 +2646,28 @@ fn is_identity(value: &str) -> bool {
 /// # Errors
 /// Refuses a malformed plan or an unreadable state directory.
 pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> Result<Ledger> {
+    ledger_with(plan, corpus, source, states, false)
+}
+
+/// [`ledger`], optionally reading omission lists from destinations.
+///
+/// With `read_destinations` (`closure-report
+/// --omissions-from-destination`, M2 round 2, d) a capture from before the
+/// `.omissions` sidecar whose bundle names an omission list has that list
+/// read by oid from the item's destination repository's objects (reads
+/// only, `--no-optional-locks`). Without it the bundle header alone
+/// decides: no omission ref is known zero, a named list stays unknown
+/// (`value-not-read`).
+///
+/// # Errors
+/// As [`ledger`].
+pub fn ledger_with(
+    plan: &Path,
+    corpus: &Path,
+    source: &str,
+    states: &[PathBuf],
+    read_destinations: bool,
+) -> Result<Ledger> {
     type Record = std::result::Result<crate::outcome::OutcomeRecord, crate::outcome::Unreadable>;
     let contents: Plan = read(plan)?;
     let mut records = std::collections::BTreeMap::<String, Record>::new();
@@ -2646,11 +2703,16 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
         let record_path = corpus.join(format!("{identity}.capture"));
         let mut capture = None;
         let mut omitted = None;
+        let unknown_because;
         let journal = if !record_path.try_exists().refuse_at("estate::ledger")? {
+            unknown_because = Some("no-capture");
             JournalState::NoCapture
         } else if let Ok(captured) = read::<Capture>(&record_path) {
             if filename(&captured.bundle) {
-                omitted = retained_omissions(corpus, &captured.bundle);
+                (omitted, unknown_because) =
+                    item_omissions(item, corpus, &captured.bundle, read_destinations);
+            } else {
+                unknown_because = Some("capture-unreadable");
             }
             capture = Some(
                 blake3::Hash::from_bytes(captured.digest)
@@ -2670,6 +2732,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
                 JournalState::Present(read::<String>(&path).unwrap_or_default())
             })
         } else {
+            unknown_because = Some("capture-unreadable");
             JournalState::CaptureUnreadable
         };
         let record = records.get(&identity);
@@ -2680,6 +2743,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             journal,
             capture,
             omitted,
+            unknown_because,
             item: identity,
         });
     }
@@ -6016,6 +6080,97 @@ mod closure_lane_20261002 {
         git(&source, &["add", "file"]);
         git(&source, &["commit", "-q", "-m", "base"]);
         source
+    }
+
+    /// M2 round 2, d: the in-place batch i02 (900 items) was captured on
+    /// neo by an engine (`5beb0314`) older than the `.omissions` sidecar
+    /// (`3fe1f075`), so `closure-report` listed every item's omissions
+    /// `unknown`. Each bundle still names what it omitted in band. This
+    /// fixture is that corpus: two captures whose sidecars are gone, one
+    /// that omitted `node_modules` and one that omitted nothing. Before
+    /// apply the omitting one is unknown (`value-not-held`: its list is in
+    /// a pack nothing has indexed) and the other is known empty from its
+    /// header; after apply both are known, the list read by oid from the
+    /// destination repository, equal to what the sidecar said.
+    #[test]
+    fn a_corpus_from_before_the_omissions_sidecar_is_classified_in_band() {
+        use crate::closure::Report;
+        let root = fresh("omissions-in-band");
+        let omitting = repository(&root, "omitting", b"tracked");
+        fs::create_dir_all(omitting.join("node_modules/pkg")).unwrap();
+        fs::write(omitting.join("node_modules/pkg/index.js"), b"rebuildable").unwrap();
+        let quiet = repository(&root, "quiet", b"quiet");
+        let plan = root.join("plan");
+        add(
+            &plan,
+            &omitting,
+            &root.join("omitting-dest"),
+            Some(&root.join("omitting-dest")),
+        )
+        .unwrap();
+        add(
+            &plan,
+            &quiet,
+            &root.join("quiet-dest"),
+            Some(&root.join("quiet-dest")),
+        )
+        .unwrap();
+        let (state, corpus, applied) = (
+            root.join("state"),
+            root.join("corpus"),
+            root.join("applied"),
+        );
+        private_directory(&state).unwrap();
+        private_directory(&corpus).unwrap();
+        private_directory(&applied).unwrap();
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let report_with = |read: bool| {
+            Report::from_ledger(
+                &ledger_with(&plan, &corpus, "neo", std::slice::from_ref(&applied), read).unwrap(),
+            )
+            .omissions
+        };
+        let report = || report_with(true);
+        // With the sidecars, as the engine writes them today.
+        let with_sidecars = report();
+        assert_eq!((with_sidecars.known, with_sidecars.unknown.len()), (2, 0));
+        assert_eq!(
+            with_sidecars
+                .rows
+                .iter()
+                .map(|row| row.1.clone())
+                .collect::<Vec<_>>(),
+            vec![b"node_modules".to_vec()]
+        );
+        // The pre-sidecar corpus: every `.omissions` sidecar gone.
+        for entry in fs::read_dir(&corpus).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "omissions")
+            {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let before = report();
+        assert_eq!((before.known, before.unknown.len()), (1, 1), "{before:?}");
+        assert_eq!(
+            before.unknown_because.get("value-not-held"),
+            Some(&1),
+            "{before:?}"
+        );
+        assert!(before.rows.is_empty());
+        apply(&plan, &corpus, &applied, "neo", 1, &|_| Ok(())).unwrap();
+        let after = report();
+        assert_eq!((after.known, after.unknown.len()), (2, 0), "{after:?}");
+        assert_eq!(after.rows, with_sidecars.rows);
+        assert!(after.unknown_because.is_empty());
+        // Without destination reads (the default) the header decides alone:
+        // the named list stays unknown and says it was not read.
+        let header_only = report_with(false);
+        assert_eq!((header_only.known, header_only.unknown.len()), (1, 1));
+        assert_eq!(header_only.unknown_because.get("value-not-read"), Some(&1));
+        fs::remove_dir_all(root).unwrap();
     }
 
     // 1 TiB filesystem with 32 KiB available: a small checkout fits, a
