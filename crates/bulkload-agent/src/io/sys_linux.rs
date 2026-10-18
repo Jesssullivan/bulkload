@@ -495,6 +495,40 @@ pub fn rename_exclusive_at(
     Ok(())
 }
 
+/// `renameat2(RENAME_EXCHANGE)` between two directories: `a` in `a_dir` and `b` in
+/// `b_dir`, both of which must exist, atomically trade the files they name
+/// (`estate-apply --side-root`, M2r2 item e: a live symlink and the
+/// side-root directory it names). Nothing is replaced or removed. Not
+/// traced: no transfer publish uses it. A file system without it reports
+/// `EINVAL`, `ENOTSUP` or `ENOSYS` ([`super::rename_unsupported`]); two
+/// file systems, `EXDEV`.
+///
+/// # Errors
+/// Returns the rename failure; a missing name is `ENOENT`.
+pub fn exchange_at(a_dir: impl AsFd, a: &CStr, b_dir: impl AsFd, b: &CStr) -> io::Result<()> {
+    trace_serial!();
+    let (a_dir, b_dir) = (a_dir.as_fd(), b_dir.as_fd());
+    #[cfg(any(test, feature = "fault-injection"))]
+    if super::sys_posix::rename_forced_unsupported() {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    // SAFETY: both descriptors are live for the call and both names are
+    // NUL-terminated and outlive it.
+    let exchanged = unsafe {
+        libc::renameat2(
+            a_dir.as_raw_fd(),
+            a.as_ptr(),
+            b_dir.as_raw_fd(),
+            b.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if exchanged != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// `renameat2(RENAME_EXCHANGE)` within one directory: `a` and `b`, both of
 /// which must exist, atomically trade the files they name (WP0(d), #187).
 /// Nothing is replaced or removed. A kernel or file system without it

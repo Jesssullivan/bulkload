@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::git_carry::decide;
 use crate::{git_carry, BulkloadRefusal, Result};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub source: PathBuf,
     pub repository: PathBuf,
@@ -350,6 +350,33 @@ fn retained_omissions(corpus: &Path, bundle: &str) -> Option<Vec<git_carry::Rebu
         return None;
     }
     read(&path).ok()
+}
+
+/// An item's omissions for the closure report, and why they are unknown when
+/// they are: the capture's `.omissions` sidecar; without one (a capture from
+/// before it, `3fe1f075`), what the bundle carries in band, its omission
+/// list read by oid from the item's destination repository once its import
+/// ran, when `read_destinations` (M2 round 2, d). Reads only.
+fn item_omissions(
+    item: &Item,
+    corpus: &Path,
+    bundle: &str,
+    read_destinations: bool,
+) -> (
+    Option<Vec<git_carry::RebuildableOmission>>,
+    Option<&'static str>,
+) {
+    let sidecar = omissions_sidecar(corpus, bundle);
+    if sidecar.is_file() {
+        return read(&sidecar).map_or((None, Some("sidecar-unreadable")), |omitted| {
+            (Some(omitted), None)
+        });
+    }
+    let holder = read_destinations.then_some(item.repository.as_path());
+    match git_carry::in_band::omissions(&corpus.join(bundle), holder) {
+        git_carry::in_band::InBand::Known(omitted) => (Some(omitted), None),
+        git_carry::in_band::InBand::Unknown(reason) => (None, Some(reason)),
+    }
 }
 
 // A drifted capture deliberately omits the drifted seats' bytes, so its sidecar
@@ -2237,6 +2264,24 @@ fn apply_item(
     // typed refusal, never a bare IO errno; and it names the absent capture
     // (S4, #219), never a sealed object a capture recorded and lost.
     if !record.try_exists().refuse_at("estate::apply_item")? {
+        // M2r2 b: an item `estate-carry-files` carried as files, with its
+        // carry still proved, keeps that outcome; a re-apply never turns it
+        // back into CAPTURE_ABSENT.
+        let carried_now = matches!(
+            crate::outcome::read_record(&state.join(format!("{identity}.outcome"))),
+            Ok(crate::outcome::OutcomeRecord {
+                outcome: crate::outcome::Outcome::CarriedAsFiles,
+                ..
+            })
+        );
+        if carried_now
+            && matches!(
+                carried::prove(&[state.to_path_buf()], &identity, source, item),
+                Some(Ok(_))
+            )
+        {
+            return Ok(Completion::clean(carried::CARRIED_OUTCOME));
+        }
         return Err(BulkloadRefusal::CaptureAbsent);
     }
     let captured: Capture = read(&record)?;
@@ -2267,6 +2312,7 @@ fn apply_item(
             let done: String = read(&journal)?;
             let outcome = match done.as_str() {
                 "workspace-restored" => "previous-workspace-restoration-not-revalidated",
+                "workspace-beside" => "previous-workspace-beside-not-revalidated",
                 "refs-imported" => "previous-ref-custody-not-workspace-parity",
                 _ => return Err(BulkloadRefusal::ReceiptBindingInvalid),
             };
@@ -2334,11 +2380,15 @@ fn apply_item(
     // M2 finding 1: a first landing makes its absent parents (0755) and
     // records them here.
     let parents = parents_path(state, &identity, source);
+    // M2 round 2, item 2: `--exclude-union` records its appends here.
+    let union = exclude_union_path(state, &identity, source);
     let landing = git_carry::converge::Landing {
         item: &identity,
         observed_ns: retained_parts(corpus, &captured.bundle)?.map_or(0, |parts| parts.started_ns),
         capture: captured.digest,
         parents: Some(&parents),
+        exclude_union: options.exclude_union.then_some(union.as_path()),
+        beside: false,
     };
     let target = git_carry::converge::Target {
         repository: &item.repository,
@@ -2353,20 +2403,35 @@ fn apply_item(
     };
     let (outcome, applied) = if item.workspace.is_some() {
         let landed_before = landed_before(state, &identity, source, &journal)?;
-        let applied = git_carry::converge::apply_workspace(
+        let (outcome, applied) = match git_carry::converge::apply_workspace(
             &staged,
             &target,
             &landing,
             landed_before,
             &policy,
-        )?;
+        ) {
+            Ok(applied) => ("workspace-restored", applied),
+            // M2 round 2 item c: the planned checkout exists, its adopt
+            // proof refused (nothing written), and it stays as it is; the
+            // capture lands beside it. Review B2: no other refusal does.
+            Err(BulkloadRefusal::GitDestinationDiverged) if options.adopt => {
+                match options.beside.as_deref() {
+                    Some(suffix) => (
+                        "workspace-beside",
+                        beside_item(&staged, &target, &landing, (state, &policy, suffix))?,
+                    ),
+                    None => return Err(BulkloadRefusal::GitDestinationDiverged),
+                }
+            }
+            Err(refusal) => return Err(refusal),
+        };
         if let Some(key) = deferred {
             imported
                 .lock()
                 .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?
                 .insert(key);
         }
-        ("workspace-restored", applied)
+        (outcome, applied)
     } else {
         (
             "refs-imported",
@@ -2386,6 +2451,193 @@ fn apply_item(
         })
         .or_else(|| applied.converged.then(|| "converged".to_owned()));
     Ok(done)
+}
+
+/// Whether the last `.beside` record of `identity` in `states` proves its
+/// beside landing of the current capture (`capture`, lowercase hex):
+/// `None` with no record (review of #266, B4).
+fn beside_proof(
+    states: &[PathBuf],
+    identity: &str,
+    source: &str,
+    capture: Option<&str>,
+) -> Option<std::result::Result<(), &'static str>> {
+    let path = states
+        .iter()
+        .rev()
+        .map(|state| beside_record_path(state, identity, source))
+        .find(|path| path.is_file())?;
+    let Ok(Some(record)) = git_carry::beside::read_record(&path) else {
+        return Some(Err("beside-record-unreadable"));
+    };
+    let current = capture.is_some_and(|capture| {
+        blake3::Hash::from_bytes(record.capture).to_hex().as_str() == capture
+    });
+    Some(
+        if record.item == identity && current && record.pending.is_empty() && record.kept.is_empty()
+        {
+            Ok(())
+        } else {
+            Err("beside-record-mismatch")
+        },
+    )
+}
+
+/// Where an item's beside landing is recorded (M2 round 2 item c):
+/// `{item}-{blake3(source)}.beside` in STATE, a
+/// [`git_carry::beside::BesideRecord`].
+#[must_use]
+pub fn beside_record_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.beside",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
+/// The workspace ledger of the checkout at `beside` for `source`, if any.
+fn beside_ledger(
+    beside: &Path,
+    source: &str,
+) -> Result<Option<git_carry::landed::LandedWorkspace>> {
+    let Some(git_dir) = git_carry::landed::worktree_git_dir(beside)? else {
+        return Ok(None);
+    };
+    git_carry::landed::read(
+        &git_carry::landed::ledger_dir(&git_dir, source).join(git_carry::landed::WORKSPACE_LANDED),
+    )
+}
+
+/// `estate-apply --adopt --beside SUFFIX` (M2 round 2 item c,
+/// [`git_carry::beside`]): the planned checkout's adopt proof refused
+/// `GIT_DESTINATION_DIVERGED`, so the capture lands at `<workspace>SUFFIX`
+/// as a first linked landing into the planned repository, detached, its
+/// native refs never stepped (or an equal standalone checkout already
+/// there is adopted in place); then the captured refs go in create-only
+/// under `refs/<ns>/`, recorded write-ahead in STATE.
+fn beside_item(
+    staged: &git_carry::StagedBundle,
+    target: &git_carry::converge::Target<'_>,
+    landing: &git_carry::converge::Landing<'_>,
+    (state, policy, suffix): (&Path, &git_carry::converge::Policy<'_>, &str),
+) -> Result<git_carry::converge::Applied> {
+    let workspace = target
+        .workspace
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let ns = git_carry::beside::namespace(suffix)?;
+    let beside = git_carry::beside::path(workspace, suffix);
+    // Review of #266, A3: the namespace is checked before anything lands.
+    if git_carry::beside::namespace_taken(target.repository, &ns)? {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    let beside_target = git_carry::converge::Target {
+        workspace: Some(&beside),
+        ..*target
+    };
+    let beside_landing = git_carry::converge::Landing {
+        beside: true,
+        ..*landing
+    };
+    // A standalone checkout someone already put at the beside path (the
+    // in-place lane made `<path>.neo-20261016` by hand) is adopted when it
+    // proves equal to the capture (A11a, its own repository); otherwise the
+    // beside path is never adopted, re-keyed or converged: it is this
+    // item's own landing of this capture, finished forward, or new.
+    let standalone = beside.join(".git").is_dir();
+    let beside_policy = git_carry::converge::Policy {
+        adopt: standalone,
+        ..*policy
+    };
+    let standalone_target = git_carry::converge::Target {
+        repository: &beside,
+        workspace: Some(&beside),
+        ..*target
+    };
+    let existing = beside_ledger(&beside, target.source)?;
+    let landed = match &existing {
+        Some(ledger) if ledger.item == landing.item && ledger.capture == landing.capture => {
+            git_carry::converge::Applied::default()
+        }
+        Some(_) => return Err(BulkloadRefusal::GitDestinationOccupied),
+        None => git_carry::converge::apply_workspace(
+            staged,
+            if standalone {
+                &standalone_target
+            } else {
+                &beside_target
+            },
+            &beside_landing,
+            false,
+            &beside_policy,
+        )
+        // The beside checkout differs from the capture: the beside path
+        // holds something else (review A6: never the planned checkout's
+        // code).
+        .map_err(|refusal| match refusal {
+            BulkloadRefusal::GitDestinationDiverged => BulkloadRefusal::GitDestinationOccupied,
+            other => other,
+        })?,
+    };
+    // Review B1: what the beside checkout holds is read from its own
+    // ledger, and must be this item's landing of this capture (a crashed
+    // landing of an older capture is finished forward, then refused here).
+    let ledger = beside_ledger(&beside, target.source)?
+        .filter(|ledger| ledger.item == landing.item && ledger.capture == landing.capture)
+        .ok_or(BulkloadRefusal::GitDestinationOccupied)?;
+    // The capture's provenance instance in the planned repository: a
+    // linked beside landing imported it there; an adopted standalone one
+    // holds it in its own repository, so it is imported here (with its plan
+    // base), as a refs-only item would.
+    let instance = if standalone {
+        if let Some(base) = target.base {
+            git_carry::import_staged(target.repository, base, target.source)?;
+        }
+        git_carry::beside::import_instance(target.repository, staged, target.source)?
+    } else {
+        ledger.instance.clone()
+    };
+    let record_path = beside_record_path(state, landing.item, target.source);
+    let mut record = git_carry::beside::read_record(&record_path)?.unwrap_or_default();
+    // Review B5: refs a crashed run created are named by its pending list.
+    git_carry::beside::settle(target.repository, &mut record)?;
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        landing.item.clone_into(&mut record.item);
+        record.path = beside.as_os_str().as_bytes().to_vec();
+    }
+    suffix.clone_into(&mut record.suffix);
+    record.capture = ledger.capture;
+    record.instance.clone_from(&instance);
+    let wanted = git_carry::beside::wanted(target.repository, target.source, &instance, &ns)?;
+    let planned = git_carry::beside::plan(target.repository, &wanted)?;
+    record.kept.clone_from(&planned.kept);
+    record.pending.clone_from(&planned.create);
+    git_carry::beside::write_record(&record_path, &record)?;
+    git_carry::beside::create(target.repository, &planned.create)?;
+    fault_point!(EstateApplyBesideRefs);
+    record.created.extend(std::mem::take(&mut record.pending));
+    git_carry::beside::write_record(&record_path, &record)?;
+    // Review B4: a captured ref kept at another value is not landed; the
+    // item stays refused (pending review) until the namespace is resolved.
+    if !planned.kept.is_empty() {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    let words = format!(
+        "beside-{}=1 beside-{}=1 beside-ref-created={} beside-ref-present={} beside-ref-kept=0",
+        if existing.is_some() {
+            "present"
+        } else {
+            "landed"
+        },
+        if standalone { "standalone" } else { "linked" },
+        planned.create.len(),
+        planned.present.len(),
+    );
+    let mut applied = landed;
+    applied.custody = Some(match applied.custody.take() {
+        Some(more) => format!("{words} {more}"),
+        None => words,
+    });
+    Ok(applied)
 }
 
 // Finding 13: whether STATE holds a journal of this item for a capture
@@ -2574,9 +2826,28 @@ pub struct LedgerEntry {
     /// it (#133).
     pub capture: Option<String>,
     /// The rebuildable roots the current capture omitted (#226 item 5),
-    /// from its `.omissions` sidecar; `None` when that is unknown (a
-    /// capture from before the sidecar, or no readable capture).
+    /// from its `.omissions` sidecar or, for a capture from before the
+    /// sidecar, from what its bundle carries in band
+    /// ([`git_carry::in_band`], M2 round 2, d); `None` when that is unknown.
     pub omitted: Option<Vec<git_carry::RebuildableOmission>>,
+    /// The item's proved carry as files (M2r2 b): its
+    /// `{item}-{blake3(SOURCE)}.carried` record from the last state
+    /// directory holding one, with the transfer record it names checked
+    /// ([`carried::prove`]), or why it proves nothing. `None` when no state
+    /// directory holds one.
+    pub carried: Option<std::result::Result<carried::CarriedProof, &'static str>>,
+    /// M2r2 c: whether the item's `{item}-{blake3(SOURCE)}.beside` record
+    /// (the last state directory holding one) proves its beside landing:
+    /// it names the item and its current capture, with no ref pending or
+    /// kept. `None` when no state directory holds one.
+    pub beside: Option<std::result::Result<(), &'static str>>,
+    /// Why `omitted` is unknown: `no-capture`, `capture-unreadable`,
+    /// `sidecar-unreadable`, or the in-band reader's reason
+    /// (`header-unreadable`, `value-not-read`, `value-not-held`,
+    /// `value-unreadable`, `envelope-not-read`, `envelope-not-held`,
+    /// `envelope-unreadable`, `holder-partial-clone`,
+    /// `holder-git-too-old`).
+    pub unknown_because: Option<&'static str>,
 }
 
 /// A plan's items joined with their outcome records and apply journals.
@@ -2608,6 +2879,28 @@ fn is_identity(value: &str) -> bool {
 /// # Errors
 /// Refuses a malformed plan or an unreadable state directory.
 pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> Result<Ledger> {
+    ledger_with(plan, corpus, source, states, false)
+}
+
+/// [`ledger`], optionally reading omission lists from destinations.
+///
+/// With `read_destinations` (`closure-report
+/// --omissions-from-destination`, M2 round 2, d) a capture from before the
+/// `.omissions` sidecar whose bundle names an omission list has that list
+/// read by oid from the item's destination repository's objects (reads
+/// only, `--no-optional-locks`). Without it the bundle header alone
+/// decides: no omission ref is known zero, a named list stays unknown
+/// (`value-not-read`).
+///
+/// # Errors
+/// As [`ledger`].
+pub fn ledger_with(
+    plan: &Path,
+    corpus: &Path,
+    source: &str,
+    states: &[PathBuf],
+    read_destinations: bool,
+) -> Result<Ledger> {
     type Record = std::result::Result<crate::outcome::OutcomeRecord, crate::outcome::Unreadable>;
     let contents: Plan = read(plan)?;
     let mut records = std::collections::BTreeMap::<String, Record>::new();
@@ -2643,11 +2936,16 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
         let record_path = corpus.join(format!("{identity}.capture"));
         let mut capture = None;
         let mut omitted = None;
+        let unknown_because;
         let journal = if !record_path.try_exists().refuse_at("estate::ledger")? {
+            unknown_because = Some("no-capture");
             JournalState::NoCapture
         } else if let Ok(captured) = read::<Capture>(&record_path) {
             if filename(&captured.bundle) {
-                omitted = retained_omissions(corpus, &captured.bundle);
+                (omitted, unknown_because) =
+                    item_omissions(item, corpus, &captured.bundle, read_destinations);
+            } else {
+                unknown_because = Some("capture-unreadable");
             }
             capture = Some(
                 blake3::Hash::from_bytes(captured.digest)
@@ -2667,9 +2965,12 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
                 JournalState::Present(read::<String>(&path).unwrap_or_default())
             })
         } else {
+            unknown_because = Some("capture-unreadable");
             JournalState::CaptureUnreadable
         };
         let record = records.get(&identity);
+        let carried = carried::prove(states, &identity, source, item);
+        let beside = beside_proof(states, &identity, source, capture.as_deref());
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
@@ -2677,9 +2978,13 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
             journal,
             capture,
             omitted,
+            carried,
+            beside,
+            unknown_because,
             item: identity,
         });
     }
+    check_riders(&mut ledger);
     ledger.foreign_records = records
         .into_keys()
         .filter(|item| !planned.contains(item))
@@ -2691,6 +2996,44 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
     Ok(ledger)
 }
 
+// M2r2 b: a refs-only item's carry rides on a planned workspace item of the
+// same source whose own outcome is carried-as-files and proves.
+fn check_riders(ledger: &mut Ledger) {
+    let riding: Vec<(usize, String)> = ledger
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| match &entry.carried {
+            Some(Ok(carried::CarriedProof { via: Some(via), .. })) => Some((index, via.clone())),
+            _ => None,
+        })
+        .collect();
+    for (index, via) in riding {
+        let Some(source) = ledger.entries.get(index).map(|entry| entry.source.clone()) else {
+            continue;
+        };
+        let proved = ledger.entries.iter().any(|sibling| {
+            sibling.item == via
+                && sibling.has_workspace
+                && sibling.source == source
+                && matches!(
+                    sibling.record,
+                    Some(Ok(crate::outcome::OutcomeRecord {
+                        outcome: crate::outcome::Outcome::CarriedAsFiles,
+                        ..
+                    }))
+                )
+                && matches!(
+                    sibling.carried,
+                    Some(Ok(carried::CarriedProof { via: None, .. }))
+                )
+        });
+        if let (false, Some(entry)) = (proved, ledger.entries.get_mut(index)) {
+            entry.carried = Some(Err("carried-via-unproved"));
+        }
+    }
+}
+
 /// Where an item's first landing records the parents it made (M2 finding 1).
 ///
 /// `{item}-{blake3(source)}.parents` in STATE, a
@@ -2700,6 +3043,17 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
 pub fn parents_path(state: &Path, identity: &str, source: &str) -> PathBuf {
     state.join(format!(
         "{identity}-{}.parents",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
+}
+
+/// Where an item's `--exclude-union` appends are recorded (M2 round 2,
+/// item 2): `{item}-{blake3(source)}.exclude-union` in STATE, a
+/// [`git_carry::exclude_union::ExcludeUnion`]. Per item and source.
+#[must_use]
+pub fn exclude_union_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.exclude-union",
         blake3::hash(source.as_bytes()).to_hex()
     ))
 }
@@ -2831,6 +3185,27 @@ pub struct ApplyOptions {
     /// an scp-style or `ssh://` origin starting with one of these; a local
     /// path never ([`git_carry::origin_prefix_allowed`]).
     pub activate_origin: Vec<String>,
+    /// `--side-root ROOT` (repeatable; M2r2 item e; needs `adopt`): after
+    /// the preflights and before any item lands, each planned path spelled
+    /// through a symlink whose single hop names a directory inside ROOT is
+    /// seated there ([`seat`]): the directory takes the live path by one
+    /// exchange (same inode, no byte copied) and the side-root path becomes
+    /// a link back, recorded in STATE for `estate-unseat`.
+    pub side_roots: Vec<PathBuf>,
+    /// `--exclude-union` (M2 round 2, item 2): a first linked landing whose
+    /// repository's common `info/exclude` is not the capture's appends the
+    /// captured lines it lacks, recorded in STATE, instead of refusing
+    /// `GIT_IGNORE_POLICY_CONFLICT`; only where the union cannot change
+    /// what either policy means (no negation on either side) and no
+    /// bulkload ledger owns the exclude ([`git_carry::exclude_union`]).
+    pub exclude_union: bool,
+    /// `--beside SUFFIX` (M2 round 2 item c; only with `--adopt`): a
+    /// workspace item whose existing planned checkout the adopt proof
+    /// refuses `GIT_DESTINATION_DIVERGED` lands beside it instead, at the
+    /// workspace path with SUFFIX appended, with the captured refs created
+    /// under `refs/<ns>/`; the planned checkout is left as it was
+    /// ([`git_carry::beside`]).
+    pub beside: Option<String>,
 }
 
 /// Apply explicit restores only; common Git administration is serialized.
@@ -2882,6 +3257,55 @@ pub fn apply_with(
     )
 }
 
+/// `estate-unseat STATE [LIVE ...]` (M2r2 item e): undo every seat
+/// recorded in `state`, or those of `lives`, under the apply's STATE lock;
+/// one line per seat undone, handed to `line`.
+///
+/// # Errors
+/// `REQUIRED_FIELD_MISSING` for a LIVE path with no seat record (nothing is
+/// undone); [`seat::unseat`]'s refusal, at the first seat refused.
+pub fn unseat(
+    state: &Path,
+    lives: &[PathBuf],
+    line: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let _lock = exclusive(&state.join("estate.lock"))?;
+    let records = seat::records(state)?;
+    if lives
+        .iter()
+        .any(|live| !records.iter().any(|(_, record)| &record.live == live))
+    {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    }
+    for (path, record) in records {
+        if !lives.is_empty() && !lives.contains(&record.live) {
+            continue;
+        }
+        seat::unseat(&path, &record)?;
+        line(&format!(
+            "{} plan=\"{}\"",
+            seat_line(&record.live, &record.target, "unseated", None),
+            record.plan.display().to_string().escape_debug()
+        ))?;
+    }
+    Ok(())
+}
+
+// One seat's line on the apply's output (M2r2 item e).
+fn seat_line(
+    live: &Path,
+    target: &Path,
+    outcome: &str,
+    refusal: Option<&BulkloadRefusal>,
+) -> String {
+    format!(
+        "seat live=\"{}\" target=\"{}\" outcome={outcome} reason={}",
+        live.display().to_string().escape_debug(),
+        target.display().to_string().escape_debug(),
+        refusal.map_or("none", BulkloadRefusal::code),
+    )
+}
+
 /// [`apply_with`], with each hand-off H step's line (TIN-6569,
 /// OI-1003-Q183: `item=<id> handoff=<written|unchanged|CODE>`) handed to
 /// `handoff_line` after the last level.
@@ -2905,6 +3329,17 @@ pub fn apply_reporting(
     {
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
+    // Review B2: `--beside` acts only on an adopt proof's refusal.
+    if let Some(suffix) = &options.beside {
+        if !options.adopt {
+            return Err(BulkloadRefusal::RequiredFieldMissing);
+        }
+        git_carry::beside::namespace(suffix)?;
+    }
+    // A seated tree is an existing checkout: only `--adopt` lands into it.
+    if !options.side_roots.is_empty() && !options.adopt {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
     private_directory(state)?;
     let _lock = exclusive(&state.join("estate.lock"))?;
     let contents: Plan = read(plan)?;
@@ -2912,6 +3347,39 @@ pub fn apply_reporting(
     // take a destination filesystem under its free-space floor.
     for (probe, planned) in space_plan(&contents, corpus, state, source, jobs) {
         crate::space::preflight(&probe, planned)?;
+    }
+    // M2r2 item e, after the preflights and before any item: finish every
+    // seat or undo a crash interrupted (a record that cannot be finished is
+    // a refused line, never the apply's refusal), then seat the plan's
+    // symlinked live paths into the side roots. A seat stays when its items
+    // then refuse (`estate-unseat` undoes it).
+    let roots = seat::roots(&options.side_roots)?;
+    for (record, done) in seat::resume(state)? {
+        match done {
+            Ok(seat::Seated::Present) => {}
+            Ok(done) => handoff_line(&seat_line(&record.live, &record.target, done.word(), None))?,
+            Err(refusal) => handoff_line(&seat_line(
+                &record.live,
+                &record.target,
+                "refused",
+                Some(&refusal),
+            ))?,
+        }
+    }
+    let owner = std::path::absolute(plan).refuse_at("estate::apply")?;
+    for candidate in seat::candidates(&contents.items, &roots) {
+        let line = match &candidate.found {
+            seat::Found::Seatable { target, .. } => {
+                match seat::seat(state, &owner, &contents.items, &roots, &candidate.live) {
+                    Ok(done) => seat_line(&candidate.live, target, done.word(), None),
+                    Err(refusal) => seat_line(&candidate.live, target, "refused", Some(&refusal)),
+                }
+            }
+            seat::Found::Refused(refusal) => {
+                seat_line(&candidate.live, Path::new(""), "refused", Some(refusal))
+            }
+        };
+        handoff_line(&line)?;
     }
     let mut locks = std::collections::BTreeMap::new();
     let mut groups = std::collections::BTreeMap::new();
@@ -2967,10 +3435,10 @@ pub fn apply_reporting(
         // TIN-6569: a repository whose item did more than a journal no-op
         // gets the H step after the last level; a refused item's own
         // workspace never does (design 6.4: the converge left it as it was).
-        if done
-            .as_ref()
-            .map_or(true, |done| !done.outcome.starts_with("previous-"))
-        {
+        if done.as_ref().map_or(true, |done| {
+            // A kept carry (M2r2 b) is a no-op, like a previous journal.
+            !done.outcome.starts_with("previous-") && done.outcome != carried::CARRIED_OUTCOME
+        }) {
             let mut touched = touched
                 .lock()
                 .map_err(|_| BulkloadRefusal::GitAuthorityChanged)?;
@@ -3135,13 +3603,19 @@ pub mod custody_probe {
     }
 }
 
+// `estate-apply --side-root` and `estate-unseat` (M2r2 item e).
+pub mod seat;
+
 // `estate-diff` (#226 item 1).
+pub mod carried;
 mod diff;
 pub use diff::{diff, DiffOptions, Summary as DiffSummary, SCHEMA as DIFF_SCHEMA};
 
 // `estate-handoff` (TIN-6569, OI-1003-Q183).
 mod handoff;
 pub use handoff::{handoff, HandoffMode, HandoffOptions, HandoffSummary, SCHEMA as HANDOFF_SCHEMA};
+mod retarget;
+pub use retarget::{mapped as retarget_mapped, retarget, Moved as Retargeted};
 
 // S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
 #[cfg(test)]
@@ -5995,6 +6469,97 @@ mod closure_lane_20261002 {
         git(&source, &["add", "file"]);
         git(&source, &["commit", "-q", "-m", "base"]);
         source
+    }
+
+    /// M2 round 2, d: the in-place batch i02 (900 items) was captured on
+    /// neo by an engine (`5beb0314`) older than the `.omissions` sidecar
+    /// (`3fe1f075`), so `closure-report` listed every item's omissions
+    /// `unknown`. Each bundle still names what it omitted in band. This
+    /// fixture is that corpus: two captures whose sidecars are gone, one
+    /// that omitted `node_modules` and one that omitted nothing. Before
+    /// apply the omitting one is unknown (`value-not-held`: its list is in
+    /// a pack nothing has indexed) and the other is known empty from its
+    /// header; after apply both are known, the list read by oid from the
+    /// destination repository, equal to what the sidecar said.
+    #[test]
+    fn a_corpus_from_before_the_omissions_sidecar_is_classified_in_band() {
+        use crate::closure::Report;
+        let root = fresh("omissions-in-band");
+        let omitting = repository(&root, "omitting", b"tracked");
+        fs::create_dir_all(omitting.join("node_modules/pkg")).unwrap();
+        fs::write(omitting.join("node_modules/pkg/index.js"), b"rebuildable").unwrap();
+        let quiet = repository(&root, "quiet", b"quiet");
+        let plan = root.join("plan");
+        add(
+            &plan,
+            &omitting,
+            &root.join("omitting-dest"),
+            Some(&root.join("omitting-dest")),
+        )
+        .unwrap();
+        add(
+            &plan,
+            &quiet,
+            &root.join("quiet-dest"),
+            Some(&root.join("quiet-dest")),
+        )
+        .unwrap();
+        let (state, corpus, applied) = (
+            root.join("state"),
+            root.join("corpus"),
+            root.join("applied"),
+        );
+        private_directory(&state).unwrap();
+        private_directory(&corpus).unwrap();
+        private_directory(&applied).unwrap();
+        capture(&plan, &state, &corpus, 1, &|_| Ok(())).unwrap();
+        let report_with = |read: bool| {
+            Report::from_ledger(
+                &ledger_with(&plan, &corpus, "neo", std::slice::from_ref(&applied), read).unwrap(),
+            )
+            .omissions
+        };
+        let report = || report_with(true);
+        // With the sidecars, as the engine writes them today.
+        let with_sidecars = report();
+        assert_eq!((with_sidecars.known, with_sidecars.unknown.len()), (2, 0));
+        assert_eq!(
+            with_sidecars
+                .rows
+                .iter()
+                .map(|row| row.1.clone())
+                .collect::<Vec<_>>(),
+            vec![b"node_modules".to_vec()]
+        );
+        // The pre-sidecar corpus: every `.omissions` sidecar gone.
+        for entry in fs::read_dir(&corpus).unwrap() {
+            let path = entry.unwrap().path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "omissions")
+            {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let before = report();
+        assert_eq!((before.known, before.unknown.len()), (1, 1), "{before:?}");
+        assert_eq!(
+            before.unknown_because.get("value-not-held"),
+            Some(&1),
+            "{before:?}"
+        );
+        assert!(before.rows.is_empty());
+        apply(&plan, &corpus, &applied, "neo", 1, &|_| Ok(())).unwrap();
+        let after = report();
+        assert_eq!((after.known, after.unknown.len()), (2, 0), "{after:?}");
+        assert_eq!(after.rows, with_sidecars.rows);
+        assert!(after.unknown_because.is_empty());
+        // Without destination reads (the default) the header decides alone:
+        // the named list stays unknown and says it was not read.
+        let header_only = report_with(false);
+        assert_eq!((header_only.known, header_only.unknown.len()), (1, 1));
+        assert_eq!(header_only.unknown_because.get("value-not-read"), Some(&1));
+        fs::remove_dir_all(root).unwrap();
     }
 
     // 1 TiB filesystem with 32 KiB available: a small checkout fits, a

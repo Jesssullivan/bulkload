@@ -83,6 +83,13 @@ struct Crash<'a> {
 /// state of the resume: a committed output names a file holding its bytes,
 /// and a bound directory record names a directory.
 fn resume_after(tag: &str, crash: impl FnOnce(&Crash<'_>)) {
+    // A process-wide recorder also records every other test thread with no
+    // recorder of its own, so these proofs run one at a time, and each holds
+    // the lock from before its first traced call: `Store::open` seals the
+    // store it creates, and another proof's recorder must never see that.
+    let _alone = ALONE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let base = scratch(tag);
     let (source, destination, state) = (
         base.join("source"),
@@ -109,11 +116,6 @@ fn resume_after(tag: &str, crash: impl FnOnce(&Crash<'_>)) {
 
     let image = Image::scan(&destination).unwrap();
     let recorder = Recorder::new();
-    // A process-wide recorder also records every other test thread with no
-    // recorder of its own, so these proofs run one at a time.
-    let _alone = ALONE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     {
         let _attached = recorder.attach_process();
         crash(&Crash {
@@ -1006,6 +1008,11 @@ fn a_finish_crashed_after_some_seals_completes_every_directory_in_one_commit() {
 #[test]
 fn a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it() {
     let run = |tag: &str, admit_under_held: bool| {
+        // Held from before the source store's open, whose seal another
+        // proof's process-wide recorder would otherwise trace.
+        let _alone = ALONE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let base = scratch(tag);
         let (source, destination) = (base.join("source"), base.join("destination"));
         let (source_state, destination_state) =
@@ -1060,9 +1067,6 @@ fn a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it() {
         .unwrap();
         let image = Image::scan(&destination).unwrap();
         let recorder = Recorder::new();
-        let _alone = ALONE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let stats = {
             let _attached = recorder.attach_process();
             // The crashed run: `y` made, sealed, bound and renamed into

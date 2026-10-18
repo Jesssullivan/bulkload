@@ -112,6 +112,24 @@ symlink is `unregistered`). Verified on sting (4 store paths rooted,
 `rooted=4`). Static musl: not built (flake change moves the guard's pinned
 digests).
 
+## Item 5: `estate-retarget`, re-pointable captures
+
+Design: `docs/design.md`, "Re-pointable captures". Finding: item IDs hash
+the destination, so re-pointing a plan forced a full re-capture. The
+capture does not depend on the destination (source key, opaque bundle
+name, sidecars keyed by the bundle name, base groups by the source's
+common directory), so the verb rewrites the plan under its lock and writes
+one new `{item}.capture` per moved item with the old record's bytes, after
+checking the new plan as `estate-add-batch` would; the old plan is kept as
+`PLAN.before-retarget-<digest>`. Built because it was clean (PR on
+`feat/estate-retarget-20261016`). Tests: `retarget::tests` (component
+prefix), `estate_retarget` P108 (re-point, then the capture is a reuse hit
+with `read_source_file_bytes=0`, the apply lands at the new paths and none
+at the old, the rerun is a no-op, re-pointing back finds the records
+`present`) and P109 (an overlapping target refuses with plan and corpus
+unchanged). Not re-keyed by design: apply STATE and the capture's private
+STATE.
+
 ## Item 6: malformed inventory and partial clones
 
 PR #253. Telefreeze's `GIT_INVENTORY_MALFORMED` not reproduced from sting;

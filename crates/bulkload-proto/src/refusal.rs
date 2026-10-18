@@ -202,6 +202,13 @@ pub enum BulkloadRefusal {
     /// Carries the nest's path relative to the enclosing checkout;
     /// [`fmt::Display`] prints it escaped.
     GitNestCarrierRefused(Vec<u8>),
+    /// `estate-carry-files` (M2r2 b) landed a `.git` pointer file or symlink
+    /// that resolves, where it landed, to an existing directory outside the
+    /// carried tree: Git would act on that repository through the carried
+    /// copy. The item is not recorded as carried; the landed bytes are left
+    /// for the operator. Carries the entry's path relative to the
+    /// destination; [`fmt::Display`] prints it escaped.
+    GitCarryPointerAttached(Vec<u8>),
     /// A path given as a repository is not that repository's root: Git would
     /// resolve it to an enclosing repository, or to none at all.
     GitRepositoryNotAtPath,
@@ -478,6 +485,7 @@ impl BulkloadRefusal {
             Self::GitNestConversionAttribute(_) => "GIT_NEST_CONVERSION_ATTRIBUTE",
             Self::GitNestPopulatedSubmodule(_) => "GIT_NEST_POPULATED_SUBMODULE",
             Self::GitNestCarrierRefused(_) => "GIT_NEST_CARRIER_REFUSED",
+            Self::GitCarryPointerAttached(_) => "GIT_CARRY_POINTER_ATTACHED",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
@@ -570,6 +578,7 @@ impl BulkloadRefusal {
         "GIT_NEST_CONVERSION_ATTRIBUTE",
         "GIT_NEST_POPULATED_SUBMODULE",
         "GIT_NEST_CARRIER_REFUSED",
+        "GIT_CARRY_POINTER_ATTACHED",
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_SOURCE_PARTIAL_CLONE",
@@ -633,6 +642,7 @@ impl fmt::Display for BulkloadRefusal {
             | Self::GitNestConversionAttribute(ref path)
             | Self::GitNestPopulatedSubmodule(ref path)
             | Self::GitNestCarrierRefused(ref path)
+            | Self::GitCarryPointerAttached(ref path)
             | Self::GitSourceAlternates(ref path)
             | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
@@ -823,6 +833,7 @@ mod tests {
             BulkloadRefusal::GitNestConversionAttribute(Vec::new()),
             BulkloadRefusal::GitNestPopulatedSubmodule(Vec::new()),
             BulkloadRefusal::GitNestCarrierRefused(Vec::new()),
+            BulkloadRefusal::GitCarryPointerAttached(Vec::new()),
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitSourcePartialClone,

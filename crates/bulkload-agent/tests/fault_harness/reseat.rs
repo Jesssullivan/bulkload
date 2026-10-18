@@ -22,8 +22,12 @@
 //! destination transcript regularized, an existing Codex row spelled
 //! through the `git` symlink re-spelled, a row built from a rowless
 //! rollout's header; `Undo` crashes the `--undo` that reverses the first
-//! two after a full pass. `_exit` models a process crash only (see the
-//! harness header).
+//! two after a full pass. `Archived` crashes a first pass with
+//! `--replace-archived-dest` over a destination transcript that is a
+//! symlink into the replace root holding a shorter fork (A-106), at its
+//! intent, after its exchange and before it is `done`; `ArchivedUndo` the
+//! `--undo` that puts that link back. `_exit` models a process crash only
+//! (see the harness header).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -71,6 +75,15 @@ pub enum Reseat {
     Q198,
     /// The `--undo` after a full pass over the OI-1003-Q198 world.
     Undo,
+    /// The first pass with the destination transcript a link into the
+    /// `--replace-archived-dest` root (A-106).
+    Archived,
+    /// The `--undo` after a full pass over the `Archived` world.
+    ArchivedUndo,
+    /// The `Archived` link kept `occupied` by an earlier pass from another
+    /// landing without the flag, then a first pass from the new landing
+    /// with it, regularization off (review B1, M1).
+    ArchivedMoved,
 }
 
 impl Scenario for Reseat {
@@ -160,14 +173,27 @@ impl World {
     }
 
     fn options(base: &Path) -> Options {
+        // A second landing of the same home, when one was made.
+        let landing = if base.join("landing2").is_dir() {
+            base.join("landing2")
+        } else {
+            base.join("landing")
+        };
         let mut options = Options::new(
             Path::new("/Users/jess"),
-            &base.join("landing"),
+            &landing,
             &base.join("dest"),
             &base.join("state"),
         );
         options.sessions_only = true;
         options.managed_settings = vec![base.join("managed-settings.json")];
+        if base.join("replace-on").exists() {
+            options.replace_archived =
+                vec![fs::canonicalize(base.join("replace-archive")).unwrap()];
+        }
+        if base.join("no-regularize").exists() {
+            options.regularize = false;
+        }
         options
     }
 
@@ -312,6 +338,43 @@ impl World {
             .unwrap();
     }
 
+    /// A-106: the destination transcript a symlink into the replace root,
+    /// its target a fork holding the landed transcript's first lines.
+    fn archived(&self) {
+        self.archive_link_only();
+        fs::write(self.base.join("replace-on"), b"").unwrap();
+    }
+
+    /// The link and its fork target, with the flag still off.
+    fn archive_link_only(&self) {
+        let target = self.fork_target();
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, Self::fork_bytes()).unwrap();
+        let link = &self.pairs()[0].1;
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&target, link).unwrap();
+    }
+
+    /// Review B1: a pass from the first landing without the flag keeps the
+    /// link (`occupied`, its row naming that landing); then a second
+    /// landing of the same home, the flag on, regularization off.
+    fn archived_moved(&self) {
+        self.archive_link_only();
+        fs::write(self.base.join("no-regularize"), b"").unwrap();
+        let summary = self.reseat();
+        assert_eq!(summary.files_of("claude", "occupied"), 1, "{summary:?}");
+        copy_tree(&self.base.join("landing"), &self.base.join("landing2"));
+        fs::write(self.base.join("replace-on"), b"").unwrap();
+    }
+
+    fn fork_target(&self) -> PathBuf {
+        self.base.join("replace-archive/fork.jsonl")
+    }
+
+    fn fork_bytes() -> Vec<u8> {
+        (0..3).map(line).collect::<String>().into_bytes()
+    }
+
     fn row(&self, id: &str) -> Option<(String, String, String)> {
         rusqlite::Connection::open(self.base.join("dest/.codex/state_5.sqlite"))
             .unwrap()
@@ -415,6 +478,7 @@ fn reseat_child_entry() {
     panic!("the armed point was not reached: reseat returned {outcome:?}");
 }
 
+#[allow(clippy::too_many_lines)]
 fn scenario(point: Point, nth: u64, kind: Reseat) {
     let _serial = SERIAL
         .lock()
@@ -464,17 +528,30 @@ fn scenario(point: Point, nth: u64, kind: Reseat) {
             world.q198();
             world.reseat();
         }
+        Reseat::Archived => world.archived(),
+        Reseat::ArchivedMoved => world.archived_moved(),
+        Reseat::ArchivedUndo => {
+            world.archived();
+            world.reseat();
+        }
     }
     let landed = fs::read(world.landed_transcript()).unwrap();
 
     crash_mode(
         &world,
         &format!("{}:{nth}", point.name()),
-        kind == Reseat::Undo,
+        matches!(kind, Reseat::Undo | Reseat::ArchivedUndo),
     );
     match kind {
         Reseat::Q198 => return settled_q198(&world, &pairs, &label),
         Reseat::Undo => return settled_undo(&world, &label),
+        Reseat::ArchivedUndo => return settled_archived_undo(&world, &label),
+        Reseat::ArchivedMoved => return settled_archived_moved(&world, &pairs, &label),
+        Reseat::Archived => assert_eq!(
+            fs::read(world.fork_target()).unwrap(),
+            World::fork_bytes(),
+            "{label}: the archive target is never written"
+        ),
         Reseat::Fresh | Reseat::Grow | Reseat::Plan | Reseat::Zst => {}
     }
 
@@ -500,7 +577,28 @@ fn scenario(point: Point, nth: u64, kind: Reseat) {
         );
     }
 
+    if kind == Reseat::Archived {
+        // The settling pass reports the replacement as one (review B2).
+        let summary = world.reseat();
+        assert_eq!(
+            summary.files_of("claude", "replaced-archived"),
+            1,
+            "{label}: {summary:?}"
+        );
+    }
     settled(&world, &pairs, &label);
+    if kind == Reseat::Archived {
+        assert_eq!(fs::read(world.fork_target()).unwrap(), World::fork_bytes());
+        let ledger = reseat::ledger::Ledger::open_read_only(&world.base.join("state"))
+            .unwrap()
+            .unwrap();
+        let rows = ledger.regulars().unwrap();
+        assert_eq!(rows.len(), 1, "{label}: {rows:?}");
+        assert!(
+            rows[0].replace && rows[0].state == reseat::ledger::RegularState::Done,
+            "{label}: {rows:?}"
+        );
+    }
 
     // S3 after the crash is settled.
     let before = Counters::snapshot();
@@ -685,6 +783,116 @@ fn settled_q198(world: &World, pairs: &[(PathBuf, PathBuf)], label: &str) {
         Some(&2),
         "{label}: {summary:?}"
     );
+}
+
+/// `src` copied to `dst`, files and directories.
+fn copy_tree(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst).unwrap();
+    for entry in fs::read_dir(src).unwrap() {
+        let entry = entry.unwrap();
+        let to = dst.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &to);
+        } else {
+            fs::copy(entry.path(), &to).unwrap();
+        }
+    }
+}
+
+/// The rerun after a crash in a replacement over an `occupied` row from
+/// another landing, regularization off (review B1, M1): the settling pass
+/// reports the replacement, the path holds the new landing's transcript
+/// (regular), the old landing's row is gone (no `collision`), the archive
+/// target untouched, no temporary; the next pass reads nothing.
+fn settled_archived_moved(world: &World, pairs: &[(PathBuf, PathBuf)], label: &str) {
+    let summary = world.reseat();
+    assert_eq!(
+        summary.files_of("claude", "replaced-archived"),
+        1,
+        "{label}: {summary:?}"
+    );
+    assert_eq!(
+        summary.sessions_of("claude", "collision"),
+        0,
+        "{label}: {summary:?}"
+    );
+    let dest = &pairs[0].1;
+    assert!(fs::symlink_metadata(dest).unwrap().is_file(), "{label}");
+    assert_eq!(fs::read(dest).ok(), landed_bytes(&pairs[0].0), "{label}");
+    assert_eq!(fs::read(world.fork_target()).unwrap(), World::fork_bytes());
+    assert_eq!(
+        world.temporaries(),
+        Vec::<PathBuf>::new(),
+        "{label}: a temporary left"
+    );
+    {
+        let ledger = reseat::ledger::Ledger::open_read_only(&world.base.join("state"))
+            .unwrap()
+            .unwrap();
+        let row = ledger.placement(dest).unwrap().unwrap();
+        assert!(
+            row.landing.starts_with(world.base.join("landing2")),
+            "{label}: {row:?}"
+        );
+        assert!(
+            matches!(
+                row.state,
+                reseat::ledger::State::Ours | reseat::ledger::State::Adopted
+            ),
+            "{label}: {row:?}"
+        );
+        assert!(ledger
+            .regulars()
+            .unwrap()
+            .iter()
+            .all(|row| row.replace && row.state == reseat::ledger::RegularState::Done));
+    }
+    let before = Counters::snapshot();
+    let summary = world.reseat();
+    assert_eq!(
+        Counters::snapshot()
+            .since(before)
+            .get(Counter::ReseatLandingRead),
+        0,
+        "{label}: {summary:?}"
+    );
+    assert_eq!(summary.sessions_of("claude", "collision"), 0, "{label}");
+}
+
+/// The rerun of an `--undo` crashed after a full pass over the `Archived`
+/// world (A-106): the exact link back over the replaced file, the archive
+/// target untouched, no temporary, the row `undone` and the placement
+/// row gone; a second undo has nothing left to do.
+fn settled_archived_undo(world: &World, label: &str) {
+    let (links, _) = world.undo();
+    assert!(links <= 1, "{label}");
+    let link = &world.pairs()[0].1;
+    assert_eq!(
+        fs::read_link(link).ok(),
+        Some(world.fork_target()),
+        "{label}"
+    );
+    assert_eq!(fs::read(world.fork_target()).unwrap(), World::fork_bytes());
+    assert_eq!(
+        world.temporaries(),
+        Vec::<PathBuf>::new(),
+        "{label}: a temporary left"
+    );
+    {
+        let ledger = reseat::ledger::Ledger::open_read_only(&world.base.join("state"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            ledger
+                .regulars()
+                .unwrap()
+                .iter()
+                .all(|row| row.state == reseat::ledger::RegularState::Undone),
+            "{label}"
+        );
+        assert_eq!(ledger.placement(link).unwrap(), None, "{label}");
+    }
+    assert_eq!(world.undo(), (0, 0), "{label}");
 }
 
 /// The rerun of an `--undo` crashed after a full pass over the

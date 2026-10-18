@@ -569,6 +569,8 @@ fn adopt_landing(staged: &super::super::StagedBundle) -> Landing<'static> {
         observed_ns: 1,
         capture: staged.digest(),
         parents: None,
+        exclude_union: None,
+        beside: false,
     }
 }
 
@@ -1030,6 +1032,8 @@ fn a_rekey_never_takes_a_tree_from_an_item_of_the_same_plan() {
         observed_ns: 2,
         capture: ledger.capture,
         parents: None,
+        exclude_union: None,
+        beside: false,
     };
     let refusal = |items: &[String]| {
         adopt::rekey_refusal(
