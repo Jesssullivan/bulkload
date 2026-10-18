@@ -491,6 +491,27 @@ pub fn open_read_at(dir: impl AsFd, name: &CStr) -> io::Result<OwnedFd> {
     )
 }
 
+/// Open the existing `name` inside `dir` for appending, without following
+/// a link, creating nothing or blocking on a FIFO (`O_WRONLY | O_APPEND |
+/// O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC`; never `O_TRUNC`): a grown
+/// destination file's tail is appended, so a byte a live writer appended
+/// first is never written over (M2r2 A-103). The caller checks the kind,
+/// the identity and the size before and after each write. The writes go
+/// through [`pwrite_all`] (on Linux `pwrite` on an `O_APPEND` descriptor
+/// appends whatever the offset), which the R-N88 trace sees.
+///
+/// # Errors
+/// Returns the `openat` failure (`EACCES` for a file this user cannot
+/// write, `EPERM` for an immutable one).
+pub fn open_append_at(dir: impl AsFd, name: &CStr) -> io::Result<OwnedFd> {
+    openat_raw(
+        dir.as_fd(),
+        name,
+        libc::O_WRONLY | libc::O_APPEND | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+}
+
 /// `symlinkat(target, dir, name)`: a new symbolic link holding `target`
 /// literally. An existing `name` is `EEXIST`.
 ///

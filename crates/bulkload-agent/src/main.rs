@@ -2433,6 +2433,19 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
             path.escape_ascii()
         );
     }
+    for (path, prior, prefix, size) in &stats.prefix_extended {
+        eprintln!(
+            "prefix-extended {} from={prior} to={size} prefix_blake3={}",
+            path.escape_ascii(),
+            blake3::Hash::from_bytes(*prefix).to_hex()
+        );
+    }
+    for (path, prior) in &stats.prefix_interrupted {
+        eprintln!(
+            "prefix-extension-interrupted {} prior={prior} (a crashed extension proved the first {prior} bytes; what follows was appended since)",
+            path.escape_ascii()
+        );
+    }
     for (path, found, source) in &stats.directories_mode_kept {
         eprintln!(
             "directory-mode-kept {} found={found:04o} source={source:04o}",
