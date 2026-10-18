@@ -500,6 +500,8 @@ mod tests {
                 .prop_map(BulkloadRefusal::GitNestCarrierRefused),
             path.clone()
                 .prop_map(BulkloadRefusal::GitCarryPointerAttached),
+            path.clone().prop_map(BulkloadRefusal::GitNestPointerStale),
+            path.clone().prop_map(BulkloadRefusal::GitNestWorktreeMoved),
             path.clone().prop_map(BulkloadRefusal::GitSourceAlternates),
             proptest::option::of(path).prop_map(BulkloadRefusal::SpaceExhausted),
             prop_oneof![
