@@ -447,8 +447,9 @@ pub fn advanced_at(workspace: &Path, source: &str) -> Result<Option<Advanced>> {
 // changes), or a status that lists a staged or unstaged change. Each entry
 // is as Git lists it by default: an untracked file, or a directory that
 // holds nothing tracked (`.serena`, not each file under it), a nested
-// repository included. Git runs with no fsmonitor and no untracked cache,
-// so it walks the worktree itself.
+// repository included. Git runs with no fsmonitor (`git_env`), so it walks
+// the worktree itself (an untracked cache it keeps is checked against the
+// directories' times).
 fn status(worktree: &Path, git_dir: &Path) -> Result<Option<Vec<Vec<u8>>>> {
     for name in IN_PROGRESS {
         if lstat(&git_dir.join(name))?.is_some() {
@@ -464,8 +465,6 @@ fn status(worktree: &Path, git_dir: &Path) -> Result<Option<Vec<Vec<u8>>>> {
         return Ok(None);
     }
     let listed = output(git(worktree).args([
-        "-c",
-        "core.untrackedCache=false",
         "status",
         "--porcelain=v1",
         "-z",

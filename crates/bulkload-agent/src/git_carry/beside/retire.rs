@@ -432,9 +432,8 @@ fn git_differs(
         if lstat(&admin.join("locked"))?.is_some() {
             return Ok(Some("locked".to_owned()));
         }
-        if lstat(&admin.join("refs"))?.is_some_and(|meta| meta.is_dir())
-            && !walk(&admin.join("refs"), true)?.is_empty()
-        {
+        let own = admin.join("refs");
+        if lstat(&own)?.is_some_and(|meta| meta.is_dir()) && !walk(&own, true)?.is_empty() {
             return Ok(Some("worktree-refs".to_owned()));
         }
         commits.extend(reflogs(&admin.join("logs"))?);
@@ -455,26 +454,16 @@ fn git_differs(
             return Ok(Some("remotes".to_owned()));
         }
         let names = live_names(live, source)?;
-        let listed = output(git(beside).args([
-            "for-each-ref",
-            "--format=%(objectname) %(objecttype) %(*objectname) %(*objecttype) %(refname)",
-        ]))?;
+        let listed = output(git(beside).args(["for-each-ref", "--format=%(objectname) %(refname)"]))?;
         for line in String::from_utf8_lossy(&listed).lines() {
-            let fields: Vec<&str> = line.split(' ').collect();
-            let (Some(value), Some(kind), Some(peeled), Some(peeled_kind), Some(name)) = (
-                fields.first(),
-                fields.get(1),
-                fields.get(2),
-                fields.get(3),
-                fields.get(4),
-            ) else {
+            let Some((value, name)) = line.split_once(' ') else {
                 return Ok(Some("unreachable".to_owned()));
             };
             if name.starts_with("refs/carry") {
                 continue;
             }
             // The stash's entries are decided by commit below.
-            if *name != "refs/stash" {
+            if name != "refs/stash" {
                 let spaced = name
                     .strip_prefix("refs/")
                     .map(|rest| format!("refs/{ns}/{rest}"));
@@ -487,21 +476,9 @@ fn git_differs(
                     return Ok(Some(format!("refs:{name}")));
                 }
             }
-            match (*kind, *peeled_kind) {
-                ("commit", _) => commits.push((*value).to_owned()),
-                ("tag", "commit") => commits.push((*peeled).to_owned()),
-                _ => {
-                    // A ref to a tree or a blob: present in the live
-                    // object store, or lost with the checkout.
-                    let present = git(live)
-                        .args(["cat-file", "-e", value])
-                        .output()
-                        .refuse_at(SITE)?;
-                    if !present.status.success() {
-                        return Ok(Some("unreachable".to_owned()));
-                    }
-                }
-            }
+            // A tag is peeled by the reachability walk; a ref to a tree or
+            // a blob fails it, and the checkout is kept.
+            commits.push(value.to_owned());
         }
         for entry in super::super::native_refs::stash_reflog(beside)? {
             commits.push(entry.oid);

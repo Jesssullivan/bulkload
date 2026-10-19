@@ -542,6 +542,12 @@ const NOT_COMMANDS: &[(&str, usize, &str)] = &[
     ("fetch", 1, "The remote.origin.fetch configuration field."),
     ("merge", 1, "The branch.NAME.merge configuration field."),
     ("rebase", 1, "The branch.NAME.rebase configuration field."),
+    (
+        "refs",
+        1,
+        "A linked worktree administration directory's own `refs` directory \
+         (a beside retirement keeps a checkout that has per-worktree refs).",
+    ),
     ("remote", 1, "The branch.NAME.remote configuration field."),
     (
         "tag",
