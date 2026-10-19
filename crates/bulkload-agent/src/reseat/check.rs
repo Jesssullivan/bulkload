@@ -649,19 +649,26 @@ fn check_claude(
 ) -> Result<()> {
     summary.retention_ok = claude::retention(options, lanes, sessions).is_ok();
     let root = super::root(&options.dest_claude)?;
+    let live = options.live_claude_landing();
     for candidate in &sessions.list {
+        // A live-home landing (C9): a re-seat's own placement is checked as
+        // its landed session's destination, not as a session of its own.
+        if live && claude::own_placement(options, ledger, &root, candidate)? {
+            continue;
+        }
         let cached = match ledger {
             Some(ledger) => ledger
                 .session(claude::TOOL, &candidate.sid)?
                 .filter(|row| row.landing == candidate.path),
             None => None,
         };
-        let (lane, key) = match claude::resolve(candidate, cached.as_ref(), lanes, options)? {
-            Resolved::Lane(_, lane) => {
+        let (lane, key) = match claude::resolve(candidate, cached.as_ref(), lanes, (options, live))?
+        {
+            Resolved::Lane(_, lane) | Resolved::InPlace(_, Some(lane)) => {
                 let key = lane.key.clone();
                 (Some(lane), key)
             }
-            Resolved::ById(_) => (None, candidate.key.clone()),
+            Resolved::ById(_) | Resolved::InPlace(_, None) => (None, candidate.key.clone()),
             Resolved::Refused(_, refusal) => {
                 unlaned(
                     summary,
@@ -771,7 +778,7 @@ fn check_codex(
     } else {
         None
     };
-    let threads = codex::landed_threads(&options.landing_codex.join(codex::STATE_DB))?;
+    let threads = codex::landed_threads(&options.landing_index().unwrap_or_default())?;
     let ids: BTreeSet<String> = threads.iter().map(|thread| thread.id.clone()).collect();
     let mut named = BTreeSet::new();
     // Each tallied thread: its lane (or none, by ID), expected cwd, source

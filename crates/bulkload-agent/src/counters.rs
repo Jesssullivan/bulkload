@@ -364,6 +364,11 @@ counters! {
     // reads are `read_dest_verify_existing_bytes`.
     DestPrefixExtended => "dest_prefix_extended",
     DestPrefixAppendWrite => "write_dest_prefix_append_bytes",
+    // Seats published, reused or adopted beside a differing live
+    // destination file under `--beside SUFFIX` (plan of record
+    // 2026-10-19, C1/C2), whose records committed. Each is also reported
+    // `applied-beside` and is an `applied-beside` transfer closure row.
+    DestAppliedBeside => "dest_applied_beside",
     // `estate-reseat` (R0, TIN-6587). Bytes read from the landed agent
     // state (the run's copy of the source's `~/.claude` and `~/.codex`):
     // 0 on a pass whose landed files and Codex snapshot are unchanged (S3);
