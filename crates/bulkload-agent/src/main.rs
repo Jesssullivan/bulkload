@@ -842,22 +842,7 @@ fn main() -> ExitCode {
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
         Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
-        Some("serve") => {
-            let args = args.collect::<Vec<_>>();
-            let (kind, rest) = root_kind(&args);
-            if rest.is_empty() {
-                let (input, output) = (std::io::stdin(), std::io::stdout());
-                bulkload_agent::transfer::tune_stream(&input);
-                bulkload_agent::transfer::tune_stream(&output);
-                // The reader thread owns stdin for the session; the process
-                // exit closes the transport.
-                bulkload_agent::transfer::serve_kind(input, &mut output.lock(), kind)
-            } else {
-                // #232: `--file` is serve's one option; another word is
-                // refused, where before it was ignored.
-                Err(BulkloadRefusal::FieldDomainViolation)
-            }
-        }
+        Some("serve") => serve_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1011,6 +996,40 @@ fn global_flags(
         }
     }
     Ok(rest)
+}
+
+/// `copy [--file] ...` and `pull [--file] ...`: a leading `--file` (#232)
+/// names a single-file root.
+fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
+    let (kind, args) = root_kind(args);
+    let path = |index: usize| {
+        args.get(index)
+            .map(Path::new)
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)
+    };
+    match command {
+        "copy" if args.len() == 4 => {
+            // WP3 PR 4: the session's outcomes are closure rows.
+            copy_recorded_kind(kind, path(0)?, path(1)?, path(2)?, path(3)?)
+        }
+        "pull" if (5..=7).contains(&args.len()) => pull_recorded_kind(kind, args),
+        _ => Err(BulkloadRefusal::RequiredFieldMissing),
+    }
+}
+
+/// `serve [--file]`: one framed session on stdin/stdout. `--file` (#232) is
+/// its one option; another word is refused, where before it was ignored.
+fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
+    let (kind, rest) = root_kind(args);
+    if !rest.is_empty() {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    let (input, output) = (std::io::stdin(), std::io::stdout());
+    bulkload_agent::transfer::tune_stream(&input);
+    bulkload_agent::transfer::tune_stream(&output);
+    // The reader thread owns stdin for the session; the process exit closes
+    // the transport.
+    bulkload_agent::transfer::serve_kind(input, &mut output.lock(), kind)
 }
 
 /// Split a leading `--file` (#232) from a transfer verb's arguments: the
@@ -1339,23 +1358,7 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             println!("{count}");
             Ok(())
         }
-        "copy" | "pull" => {
-            // #232: a leading `--file` names a single-file root.
-            let (kind, args) = root_kind(args);
-            let path = |index: usize| {
-                args.get(index)
-                    .map(Path::new)
-                    .ok_or(BulkloadRefusal::RequiredFieldMissing)
-            };
-            match command {
-                "copy" if args.len() == 4 => {
-                    // WP3 PR 4: the session's outcomes are closure rows.
-                    copy_recorded_kind(kind, path(0)?, path(1)?, path(2)?, path(3)?)
-                }
-                "pull" if (5..=7).contains(&args.len()) => pull_recorded_kind(kind, args),
-                _ => Err(BulkloadRefusal::RequiredFieldMissing),
-            }
-        }
+        "copy" | "pull" => transfer_command(command, args),
         "snapshot" if (2..=3).contains(&args.len()) => {
             bulkload_agent::provider_sqlite::snapshot(path(0)?, path(1)?, steps(args.get(2))?)?;
             println!("snapshot complete");
