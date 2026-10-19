@@ -96,11 +96,15 @@
 //! dispositions `applied-beside` and `carried`, their totals
 //! `applied_beside` (after `applied`) and `carried` (after `covered`), and
 //! on a carried row the `carried` block (via, destination, beside, transfer
-//! state, gits). Nothing else changes from v4. Within v5 (plan of record
-//! 2026-10-19, C3 and C4) a transfer entry row may carry
-//! `transfer_outcome` `carried-corrupt` (disposition `carried`) or
-//! `sidecar-follows-refused-base` (disposition `covered`), and then a
-//! `related` path; no existing field changes.
+//! state, gits). Nothing else changes from v4. Gap C12 (2026-10-19) adds
+//! two keys to a row with a typed refusal, nothing else: `refs_in` (`ns`,
+//! `created`, `kept`) when the item's `.refs-in` record names its current
+//! capture, so a refused beside landing whose refs went in says so, and,
+//! for `GIT_BESIDE_FOREIGN`, `refusal_detail`, the recorded refusal that
+//! names the beside path. Within v5 (plan of record 2026-10-19, C3 and C4)
+//! a transfer entry row may carry `transfer_outcome` `carried-corrupt`
+//! (disposition `carried`) or `sidecar-follows-refused-base` (disposition
+//! `covered`), and then a `related` path; no existing field changes.
 //!
 //! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
@@ -445,6 +449,14 @@ pub struct Row {
     pub by_default: bool,
     /// The proved carry of a `carried` row (M2r2 b).
     pub carried: Option<crate::estate::carried::CarriedProof>,
+    /// Gap C12: the refs `--refs-in` imported for the item's current
+    /// capture, printed on a refused row (`refs_in`): a beside landing
+    /// refused, the refs went in all the same.
+    pub refs_in: Option<crate::estate::RefsInSummary>,
+    /// Gap C12: a `GIT_BESIDE_FOREIGN` refusal's recorded detail (its
+    /// `Display`, which names the beside path), printed as
+    /// `refusal_detail`.
+    pub detail: Option<String>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -595,6 +607,8 @@ impl Report {
                         )
                     })
                     .cloned(),
+                refs_in: entry.refs_in.clone(),
+                detail: beside_foreign_detail(entry),
             });
         }
         report.recount();
@@ -1025,6 +1039,23 @@ impl Report {
             if let Disposition::Unaccounted(why) = &row.disposition {
                 let _ = write!(out, ",\"unaccounted_reason\":{}", json_string(why));
             }
+            // Gap C12: a refused row names the refs its item's refs-in
+            // imported for this capture, and a `GIT_BESIDE_FOREIGN` the
+            // beside path.
+            if row.outcome.as_ref().and_then(Outcome::refusal).is_some() {
+                if let Some(detail) = &row.detail {
+                    let _ = write!(out, ",\"refusal_detail\":{}", json_string(detail));
+                }
+                if let Some(refs) = &row.refs_in {
+                    let _ = write!(
+                        out,
+                        ",\"refs_in\":{{\"ns\":{},\"created\":{},\"kept\":{}}}",
+                        json_string(&refs.ns),
+                        refs.created,
+                        refs.kept,
+                    );
+                }
+            }
             if let Some(proof) = &row.carried {
                 let _ = write!(
                     out,
@@ -1207,6 +1238,16 @@ fn expected_rows(expected: &crate::transfer_outcome::Expected, since: u64) -> Ve
     )
 }
 
+// Gap C12: a `GIT_BESIDE_FOREIGN` refusal's recorded detail, which names
+// the beside path; `None` for every other outcome.
+fn beside_foreign_detail(entry: &LedgerEntry) -> Option<String> {
+    let record = entry.record.as_ref()?.as_ref().ok()?;
+    let refusal = record.outcome.refusal()?;
+    (refusal.code() == "GIT_BESIDE_FOREIGN")
+        .then(|| record.reason.clone())
+        .flatten()
+}
+
 // One unaccounted session row with no readable record, named `item`.
 fn unrecorded(state: &std::path::Path, item: String, source: &str, why: &'static str) -> Row {
     transfer_row(
@@ -1247,6 +1288,8 @@ fn transfer_row(
         ruled_default: None,
         by_default: false,
         carried: None,
+        refs_in: None,
+        detail: None,
     }
 }
 
@@ -2249,6 +2292,7 @@ mod tests {
             omitted: None,
             carried: None,
             beside: None,
+            refs_in: None,
         }
     }
 
@@ -3985,6 +4029,7 @@ mod tests {
                     omitted: None,
                     carried: None,
                     beside: None,
+                    refs_in: None,
                 });
                 let Kind::Typed(code, how) = kind else {
                     continue;
