@@ -273,7 +273,13 @@ own transfer and records the result in the estate ledger.
     `pending_review`, `ruled_default`;
   - a `carried` block on such a row: `via`, `destination`, `beside`,
     `transfer_state` and `gits`;
-  - the new unaccounted reasons above.
+  - the new unaccounted reasons above;
+  - (gap C12, 2026-10-19) on a row with a typed refusal, a `refs_in` block
+    (`ns`, `created`, `kept`) when the item's `.refs-in` record names its
+    current capture (a refused beside's refs went in all the same), and,
+    for `GIT_BESIDE_FOREIGN`, `refusal_detail`, the refusal as recorded
+    (it names the beside path). Both are added keys; no total, disposition
+    or gate changes.
 
   Nothing else changed.
 - **No-op applies.** A re-apply keeps a carried item's outcome as a no-op,
@@ -1221,22 +1227,15 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   (that would change what the live checkout ignores): under
   `--exclude-union` it lands only when the live exclude already holds
   every captured line, and otherwise refuses `GIT_IGNORE_POLICY_CONFLICT`.
-  A landing a crash cut short is finished forward, never converged; one
-  that held an older capture is then refused `GIT_DESTINATION_OCCUPIED`.
-  An existing beside path is accepted only as this item's own landing of
-  this capture, or as a standalone checkout no ledger names (the lane's
-  hand-made `<path>.neo-20261016`) that the A11a proof finds equal to the
-  capture: it is adopted in place in its own repository, and the capture
-  is imported into the planned repository for the refs. That proof
-  compares HEAD, the index entries, the exclude and every carried seat's
-  kind, mode and bytes; untracked files the capture does not carry, the
-  checkout's own stash and extra branches and remotes are not compared, and
-  the adoption steps the carried refs in that checkout's repository. Any
-  other beside path refuses `GIT_DESTINATION_OCCUPIED` (never the planned
-  checkout's `GIT_DESTINATION_DIVERGED`). Then every captured ref
+  A landing a crash cut short is finished forward, then converged when it
+  held an older capture. An existing beside path is taken as the next
+  bullet says (gap C12). Then every captured ref
   `refs/<name>` is wanted as `refs/<ns>/<name>` and stash entry `n`
   (newest first) as `refs/<ns>-stash/<n>`: a name already at the same value
-  is present; one at another value is kept, never moved or deleted; one
+  is present; one this item created and that still holds the value it
+  created is moved to the new value; one this item created that is gone is
+  never created again; one at any other value is kept, never moved or
+  deleted; one
   that would collide with an existing ref as a directory or a file refuses
   `GIT_DESTINATION_OCCUPIED` before any ref is written. The rest are
   recorded write-ahead as pending in STATE
@@ -1245,8 +1244,10 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   created in one compare-and-swap transaction through the converge's ref
   writer (synced), then recorded as created; a rerun after a crash moves
   each pending ref it finds at its value to created. The receipt counts
-  `beside-landed` (or `beside-present`), `beside-linked` or
-  `beside-standalone`, `beside-ref-created`, `beside-ref-present` and
+  how the beside path was taken (`beside-landed`, `beside-present`,
+  `beside-converged`, `beside-rekeyed` or `beside-adopted`),
+  `beside-linked` or `beside-standalone`, `beside-ref-created`,
+  `beside-ref-present`, `beside-ref-moved`, `beside-ref-retired` and
   `beside-ref-kept`. With every wanted ref in, the outcome and journal are
   `workspace-beside` (a rerun `previous-workspace-beside-not-revalidated`)
   and closure v5 classifies the item `applied-beside`; a kept ref refuses
@@ -1255,9 +1256,58 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   or after the refs (`estate.apply.beside_refs`) leaves the live checkout
   untouched and the item `journal-missing`; the rerun finishes it.
   `estate-diff --beside SUFFIX` adds `beside=<landing|ignore-policy-conflict|
-  landed|existing|occupied>:<path>` to a `diverged` row. The beside
-  checkout is a worktree of the live repository: `git worktree list` there
-  shows it.
+  landed|converge|rekey|existing|foreign|occupied>:<path>` to a `diverged`
+  row (what the apply tries; no proof is run for it). A beside checkout
+  bulkload landed first is a worktree of the live repository: `git
+  worktree list` there shows it.
+- **Beside landings converge, and a beside path is adopted by proof (gap
+  C12, plan of record rev 2; operator ruling A-115, 2026-10-18,
+  "Landings placed beside refuse every later pass once neo changes" →
+  "Yes, converge them").** A diverged item lands beside on every pass,
+  including when the beside directory exists. `git_carry::beside::land`
+  reads the beside path before anything is written and takes it one way:
+  absent, the first linked landing (one this item's STATE record says it
+  landed there and that is gone was retired by the operator's agent: never
+  laid down again, `GIT_DESTINATION_MODIFIED`, as a removed live checkout
+  is); this item's own landing, present for this capture and converged for
+  an older one by the converge that converges a live landing (proved
+  against its ledger first, read-only, its recorded hand-off blocks its
+  own: an edit, a commit or a switch there since refuses
+  `GIT_DESTINATION_MODIFIED` with nothing written); a landing of another
+  item (the in-place lane's hand plans landed `<path>.neo-20261016` as
+  standalone items of their own, which is what refused the five
+  GloriousFlywheel beside items on 2026-10-18) re-keyed by A11b after its
+  proof and converged; a standalone checkout no ledger names adopted by
+  the A11a proof in its own repository; anything else
+  `GIT_BESIDE_FOREIGN`, which names the beside path, with nothing there
+  written (a `.git` gitfile naming a gitdir that is gone, or another
+  repository's, included: it is resolved read-only first, never a bare
+  `IO`). Namespace stash entries are decided by commit, never by index: a
+  stash commit this item put under `refs/<ns>-stash/` and the operator
+  removed is left out of later passes, and the rest renumbered (a beside
+  landing) or new ones put at a free index (refs-in), so a removed commit
+  never comes back under another index. A linked beside checkout converges detached at the captured
+  head (`head-detached-beside`) and never steps the live repository's
+  native refs (`Place::beside`); a standalone one is its own repository
+  and converges as any standalone landing does. The adoption proof of a
+  beside checkout compares HEAD, the index entries, its `info/exclude`,
+  its stash (each entry's commit, newest first) and every carried seat's
+  kind, mode and bytes; the one difference it declares is a bulkload
+  hand-off block at byte 0 of `AGENTS.md` or `CLAUDE.md` above the captured
+  bytes, sealed as estate-handoff renders it (its `id=` is the blake3 of the
+  block with the id blanked, so an edit inside the block or a block a
+  person wrote is a difference), counted `beside-handoff-block`. Such a
+  block is bulkload's own output: a later converge that replaces the seat
+  drops it, as it drops a recorded block, and estate-handoff renders it
+  again. A standalone checkout is adopted as it stands,
+  never converted to a linked worktree: converting would rewrite its
+  `.git` and move its objects, branches and stash into the live
+  repository, and the proof needs neither, since the live repository gets
+  the capture's provenance and the namespace refs either way. When the
+  beside landing refuses, `--refs-in` still imports the item's branches,
+  tags and stash entries (`refs/<ns>-stash/<n>`) create-only, and closure
+  prints them on the refused row (`refs_in`: namespace, created, kept),
+  with a `GIT_BESIDE_FOREIGN` row's `refusal_detail` naming the path.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked
   out elsewhere re-attaches, and a ref the operator put back to its landed
   value converges, only on the next capture: the journal no-op (A4) reads

@@ -123,14 +123,27 @@ SUBCOMMANDS:
                 GIT_DESTINATION_DIVERGED is left as it is and the capture lands
                 at the workspace path with SUFFIX appended (as estate-carry-files
                 --beside SUFFIX), a detached linked worktree of the planned
-                repository (never appending to its shared info/exclude), or an
-                equal standalone checkout already there is adopted in place.
-                Every captured ref goes in as refs/NS/NAME and each stash entry
-                as refs/NS-stash/N (NS: SUFFIX without its leading '.', one
-                plain ref component), create-only, recorded write-ahead in STATE
-                ITEM-SOURCE.beside; outcome and journal workspace-beside, closure
-                applied-beside. A beside path or ref namespace holding anything
-                else, or a captured ref kept at another value, refuses
+                repository (never appending to its shared info/exclude). Every
+                pass lands it (gap C12, A-115): this item's own beside landing
+                of an older capture converges (proved unchanged first, else
+                GIT_DESTINATION_MODIFIED; a linked one stays detached, no live
+                ref stepped), another item's landing is re-keyed (A11b) and
+                converged, and a standalone checkout no ledger names is adopted
+                in place when it proves equal (HEAD, index, exclude, stash and
+                every carried seat; a sealed bulkload hand-off block at byte
+                0 of AGENTS.md/CLAUDE.md the one difference allowed). Anything
+                else at the beside path refuses GIT_BESIDE_FOREIGN path=...
+                with nothing there written, and the item's branches, tags and
+                stash entries still go in under --refs-in. A beside landing this item
+                made and the operator removed is not laid down again
+                (GIT_DESTINATION_MODIFIED). Every captured ref goes in as
+                refs/NS/NAME and each stash entry as refs/NS-stash/N (NS:
+                SUFFIX without its leading '.', one plain ref component),
+                recorded write-ahead in STATE ITEM-SOURCE.beside: created, or
+                moved where this item's own earlier ref still holds the value it
+                created; outcome and journal workspace-beside, closure
+                applied-beside. A ref namespace holding anything else, or a
+                captured ref kept at another value, refuses
                 GIT_DESTINATION_OCCUPIED.
                 --refs-in (M2 item 7; needs --adopt and --beside): after an
                 item adopts, lands or converges its repository (not a beside
@@ -138,10 +151,14 @@ SUBCOMMANDS:
                 or holds at another value goes in create-only as
                 refs/NS/heads/NAME (refs/NS/tags/NAME), recorded write-ahead
                 in STATE ITEM-SOURCE.refs-in; receipt refs-in-created=N
-                refs-in-present=N refs-in-kept=N. No ref moves: a ref of that
-                name held at another value (an earlier pass's) is kept and
-                counted, the source's value staying in its provenance refs. A
-                ref named refs/NS itself refuses the item
+                refs-in-present=N refs-in-kept=N refs-in-retired=N. No ref
+                moves: a ref of that name held at another value (an earlier
+                pass's) is kept and counted, the source's value staying in its
+                provenance refs; one this item created and the operator
+                removed is not created again (retired). When a beside landing
+                refuses (gap C12), its refs-in still runs, stash entries
+                included as refs/NS-stash/N, and closure prints refs_in on the
+                refused row. A ref named refs/NS itself refuses the item
                 GIT_DESTINATION_OCCUPIED before it writes anything.
                 --side-root ROOT (repeatable; M2r2 item e; needs --adopt):
                 after the preflights and before any item, each planned path
@@ -217,8 +234,8 @@ SUBCOMMANDS:
                 into MOVE_STATE/private, --jobs N (default 2); when every
                 item answered, item
                 refusals are each item's and the pass goes on, else it stops.
-                A beside landing does not converge to a newer capture: it is
-                then refused pending review. 4 carry: estate-carry-files for
+                A beside landing converges to a newer capture when its proof
+                holds (gap C12). 4 carry: estate-carry-files for
                 the carry items, at the live path while it is still absent or
                 empty, else with --beside .LABEL. 5 hand-off: estate-handoff
                 for the items whose workspace this pass landed or adopted

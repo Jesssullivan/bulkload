@@ -405,6 +405,78 @@ pub(super) fn landed_sides(
     Ok(sides)
 }
 
+/// The hand-off block at byte 0 of target `name` in `worktree`, if it is
+/// a regular file whose head is a well-formed block ([`render::marker`])
+/// sealed as estate-handoff rendered it ([`render::sealed`]: an edit inside
+/// it, or a block a person wrote, is not one).
+fn marked(worktree: &Path, name: &str) -> Result<Option<Vec<u8>>> {
+    let path = worktree.join(name);
+    if !lstat(&path)?.is_some_and(|meta| meta.is_file()) {
+        return Ok(None);
+    }
+    let head = head_of_file(&path)?;
+    Ok(match render::marker(&head) {
+        render::Marker::Block(len) => head
+            .get(..len)
+            .filter(|block| render::sealed(block))
+            .map(<[u8]>::to_vec),
+        render::Marker::None | render::Marker::Malformed => None,
+    })
+}
+
+/// The adopt proof's one declared difference for a beside checkout
+/// bulkload did not land (gap C12, A-115).
+///
+/// `estate-apply --adopt --beside` allows a bulkload hand-off block at byte
+/// 0 of a target (`AGENTS.md`, `CLAUDE.md`), well formed and sealed as
+/// estate-handoff rendered it, so its own write never blocks the adoption
+/// while an edit inside the block still does. Each regular target seat of
+/// `sides` whose file starts with such a block accepts it as a prefix above
+/// the captured bytes (never trusted by print: the bytes under it are
+/// read). A block that is not sealed, or bytes below it that are not the
+/// captured blob, still differ. Read-only.
+///
+/// # Errors
+/// Whatever reading a target refuses.
+pub(super) fn declared_blocks(worktree: &Path, sides: &mut BTreeMap<Vec<u8>, Side>) -> Result<()> {
+    for name in TARGETS {
+        let Some(side) = sides
+            .get_mut(name.as_bytes())
+            .filter(|side| side.kind == Kind::Regular)
+        else {
+            continue;
+        };
+        if let Some(block) = marked(worktree, name)? {
+            let prefix = Prefix {
+                len: len64(&block),
+                digest: digest(&block),
+                trusted: None,
+                strip: 0,
+            };
+            if !side.prefix.contains(&prefix) {
+                side.prefix.push(prefix);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// How many targets (`AGENTS.md`, `CLAUDE.md`) of `worktree` start with a
+/// sealed hand-off block: the receipt's `beside-handoff-block` after
+/// a beside adoption [`declared_blocks`] proved. Read-only.
+///
+/// # Errors
+/// Whatever reading a target refuses.
+pub(super) fn marked_targets(worktree: &Path) -> Result<u64> {
+    let mut found = 0;
+    for name in TARGETS {
+        if marked(worktree, name)?.is_some() {
+            found += 1;
+        }
+    }
+    Ok(found)
+}
+
 /// The prefixes of `prefixes` that `file` starts with (by length and
 /// digest), longest first: a prefix of length 0 always matches. Reads at
 /// most the longest prefix.

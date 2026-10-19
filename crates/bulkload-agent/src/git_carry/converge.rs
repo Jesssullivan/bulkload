@@ -2004,6 +2004,12 @@ struct Place<'a> {
     common: PathBuf,
     source: &'a str,
     standalone: bool,
+    /// A linked beside checkout (M2 round 2 item c; its converge, gap C12,
+    /// A-115): a worktree of the planned (live) repository, so the native
+    /// ref step never runs and HEAD stays detached at the captured head. A
+    /// standalone beside checkout is its own repository and converges as
+    /// any standalone landing does.
+    beside: bool,
 }
 
 impl Place<'_> {
@@ -2040,6 +2046,11 @@ impl Place<'_> {
         only: Option<&str>,
         custody: &mut Custody,
     ) -> Result<()> {
+        // A linked beside checkout's repository is the operator's live one:
+        // its native refs are never stepped, whatever its marker says.
+        if self.beside {
+            return Ok(());
+        }
         let Some(ledger) = self.ref_ledger()? else {
             return Ok(());
         };
@@ -2186,6 +2197,7 @@ pub fn apply_workspace(
         git_dir,
         source: target.source,
         standalone,
+        beside: landing.beside && !standalone,
     };
     let ledger_path = place.workspace_dir().join(landed::WORKSPACE_LANDED);
     // A12: no ledger, not bulkload's (checked before any write), unless a
@@ -2215,10 +2227,14 @@ pub fn apply_workspace(
         super::recover_linked_landing(&destination, &place.common, target.source, &intent)?;
         landed::remove(&landing_intent)?;
         custody.count("landing-recovered");
-        // A beside landing (M2 round 2 item c) is finished forward and
-        // never converged: a converge could attach a branch of the
-        // operator's repository.
-        if landing.beside {
+        // A beside landing (M2 round 2 item c) is finished forward; one of
+        // this capture is done. One of an older capture converges below
+        // (gap C12, A-115), detached, no native ref of the operator's
+        // repository stepped (`Place::beside`).
+        if landing.beside
+            && landed::read::<LandedWorkspace>(&ledger_path)?
+                .is_some_and(|ledger| ledger.capture == landing.capture)
+        {
             return Ok(Applied::of(false, &custody));
         }
     }
@@ -2265,6 +2281,54 @@ pub fn apply_workspace(
         &proof,
     )?);
     Ok(Applied::of(true, &custody))
+}
+
+/// Gap C12: why the checkout at `target`'s workspace, whose workspace
+/// ledger `ledger` names another item, may not be taken by `landing`'s
+/// item; `None` when it may.
+///
+/// Read-only, before any lock or write: the A11b re-key's own refusal
+/// ([`adopt::rekey_refusal`]: its shape, an item of this plan, another
+/// tree), and, for a linked checkout, a workspace intent pending there,
+/// which that other item's converge planned and whose settle could attach
+/// a branch of the live repository.
+///
+/// # Errors
+/// Whatever reading the checkout or the capture refuses.
+pub(super) fn rekey_check(
+    staged: &super::StagedBundle,
+    target: &Target<'_>,
+    landing: &Landing<'_>,
+    policy: &Policy<'_>,
+    ledger: &LandedWorkspace,
+) -> Result<Option<&'static str>> {
+    let workspace = target
+        .workspace
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let Some(git_dir) = landed::worktree_git_dir(workspace)? else {
+        return Ok(Some("not-a-checkout"));
+    };
+    let standalone = workspace == target.repository;
+    if !standalone
+        && landed::exists(
+            &landed::ledger_dir(&git_dir, target.source).join(landed::WORKSPACE_INTENT),
+        )?
+    {
+        return Ok(Some("intent-pending"));
+    }
+    let common = landed::common_dir(&git_dir)?;
+    adopt::rekey_refusal(
+        staged,
+        workspace,
+        target.repository,
+        (&git_dir, &common),
+        standalone,
+        target.base,
+        target.source,
+        ledger,
+        landing,
+        policy.items,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2344,14 +2408,21 @@ fn converge(
         .collect();
     let (native, symrefs) = native_refs::native_refs(worktree)?;
     let symbolic = meta1.symbolic(worktree)?;
-    let plan = head_plan(
-        symbolic.as_deref(),
+    let mut plan = head_plan(
+        symbolic.as_deref().filter(|_| !place.beside),
         meta1.get("head")?,
         (&native, &symrefs),
         place.ref_ledger()?.as_ref(),
         &others,
         landing.observed_ns,
     );
+    // A linked beside checkout converges as it landed: detached at the
+    // captured head, its branch recorded, no branch of the operator's
+    // repository created or moved (gap C12, A-115).
+    if place.beside {
+        plan.intended.clone_from(&symbolic);
+        plan.line = Some("head-detached-beside");
+    }
     let exclude_bytes = meta1.exclude(worktree)?;
     let exclude = (place.standalone && exclude_digest(&exclude_bytes) != ledger.exclude)
         .then(|| (ledger.exclude, exclude_digest(&exclude_bytes)));
@@ -2557,14 +2628,19 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
             .is_some_and(|b| others.contains(b) && current.symbolic.as_ref() != Some(b));
         if taken || branch_line_fails(worktree, intent.branch.as_ref(), &others)? {
             let (native, symrefs) = native_refs::native_refs(worktree)?;
-            let plan = head_plan(
-                meta1.symbolic(worktree)?.as_deref(),
+            let symbolic = meta1.symbolic(worktree)?;
+            let mut plan = head_plan(
+                symbolic.as_deref().filter(|_| !place.beside),
                 meta1.get("head")?,
                 (&native, &symrefs),
                 place.ref_ledger()?.as_ref(),
                 &others,
                 intent.to_observed_ns,
             );
+            if place.beside {
+                plan.intended = symbolic;
+                plan.line = Some("head-detached-beside");
+            }
             if plan.head != intent.head.1 || plan.branch != intent.branch {
                 // A branch line the crash left done (its own transaction
                 // committed) is bulkload's write: its row stays recorded.

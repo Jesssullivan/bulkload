@@ -74,8 +74,10 @@ pub struct ItemRow {
     /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
     /// landing that makes `n` absent parents (M2 finding 1);
     /// with `--beside SUFFIX`, `beside=<landing|ignore-policy-conflict|
-    /// landed|existing|occupied>:<path>` for a `diverged` item (what
-    /// `estate-apply --adopt --beside SUFFIX` does; M2 round 2 item c);
+    /// landed|converge|rekey|existing|foreign|occupied>:<path>` for a
+    /// `diverged` item (what `estate-apply --adopt --beside SUFFIX` does;
+    /// M2 round 2 item c, gap C12), and `retired` for an absent one this
+    /// item's STATE record says it landed (`estate::diff`);
     /// `exclude-union=<n>` for an `ignore-policy-conflict` that
     /// `estate-apply --exclude-union` lands by appending `n` lines (items
     /// of one repository each count them; the apply appends them once), or
@@ -172,22 +174,31 @@ fn first_landing(
 }
 
 // What `estate-apply --adopt --beside SUFFIX` does with a diverged item
-// (M2 round 2 item c): `beside=<verdict>:<path>`, the verdict `landing`
-// (absent: a linked landing; the shared exclude must already hold every
-// captured line), `ignore-policy-conflict` (absent, but the linked landing
-// would refuse `GIT_IGNORE_POLICY_CONFLICT`: a beside landing never appends
-// to the live repository's exclude), `landed` (this item's own landing of
-// this capture: nothing to land), `existing` (a standalone checkout no
-// ledger names: adopted if it proves equal, else refused occupied) or
-// `occupied` (`GIT_DESTINATION_OCCUPIED`, the ref namespace included); or
-// `beside-refused=<CODE>` for a suffix that names no namespace.
+// (M2 round 2 item c; gap C12, A-115): `beside=<verdict>:<path>`, the
+// verdict `landing` (absent: a linked landing; the shared exclude must
+// already hold every captured line), `ignore-policy-conflict` (absent, but
+// the linked landing would refuse `GIT_IGNORE_POLICY_CONFLICT`: a beside
+// landing never appends to the live repository's exclude), `landed` (this
+// item's own landing of this capture: nothing to land), `converge` (this
+// item's own landing of an older capture: converged when its proof holds,
+// else `GIT_DESTINATION_MODIFIED`), `rekey` (another item's landing that
+// the read-only A11b check lets this item take: re-keyed and converged
+// when its proof holds; one it refuses is `foreign`), `existing` (a
+// standalone checkout no ledger names: adopted if it proves equal, else
+// `GIT_BESIDE_FOREIGN`), `foreign` (anything else at the path:
+// `GIT_BESIDE_FOREIGN`) or `occupied` (the ref namespace taken,
+// `GIT_DESTINATION_OCCUPIED`); or `beside-refused=<CODE>` for a suffix that
+// names no namespace. Read-only: no proof is run for the verdict.
 fn beside_component(
-    workspace: &Path,
+    (staged, target, items): (&super::super::StagedBundle, &Target<'_>, &[String]),
     (common, captured_exclude): (&Path, &[u8]),
     landing: &Landing<'_>,
-    (source, suffix): (&str, &str),
-    repository: &Path,
+    suffix: &str,
 ) -> Result<String> {
+    let (repository, source) = (target.repository, target.source);
+    let workspace = target
+        .workspace
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
     let ns = match super::super::beside::namespace(suffix) {
         Ok(ns) => ns,
         Err(refusal) => return Ok(format!("beside-refused={}", refusal.code())),
@@ -215,21 +226,45 @@ fn beside_component(
             "ignore-policy-conflict"
         }
     } else {
-        let ledger = match landed::worktree_git_dir(&beside)? {
-            Some(git_dir) => landed::read::<LandedWorkspace>(
-                &landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_LANDED),
-            )?,
-            None => None,
-        };
-        if ledger
-            .as_ref()
-            .is_some_and(|ledger| ledger.item == landing.item && ledger.capture == landing.capture)
-        {
-            "landed"
-        } else if ledger.is_none() && beside.join(".git").is_dir() {
-            "existing"
+        let directory = fs::symlink_metadata(&beside).is_ok_and(|meta| meta.is_dir());
+        let ledger = if directory {
+            super::super::beside::ledger_of(&beside, source)?
         } else {
-            "occupied"
+            None
+        };
+        match &ledger {
+            Some(ledger) if ledger.item == landing.item && ledger.capture == landing.capture => {
+                "landed"
+            }
+            Some(ledger) if ledger.item == landing.item => "converge",
+            // Another item's landing: what the apply's read-only re-key
+            // check answers (its shape, an item of this plan, another tree,
+            // a linked checkout's pending intent).
+            Some(ledger) => {
+                let standalone =
+                    fs::symlink_metadata(beside.join(".git")).is_ok_and(|meta| meta.is_dir());
+                let at = Target {
+                    repository: if standalone { &beside } else { repository },
+                    workspace: Some(&beside),
+                    ..*target
+                };
+                let policy = super::Policy {
+                    adopt: true,
+                    origins: &[],
+                    items,
+                };
+                if super::rekey_check(staged, &at, landing, &policy, ledger)?.is_some() {
+                    "foreign"
+                } else {
+                    "rekey"
+                }
+            }
+            None if directory
+                && fs::symlink_metadata(beside.join(".git")).is_ok_and(|meta| meta.is_dir()) =>
+            {
+                "existing"
+            }
+            None => "foreign",
         }
     };
     Ok(format!("beside={verdict}:{}", beside.display()))
@@ -346,11 +381,10 @@ pub fn workspace(
             row.components = components;
             if let Some(suffix) = beside {
                 row.components.push(beside_component(
-                    workspace,
+                    (staged, target, items),
                     (&common, &meta.exclude(&scratch.repo)?),
                     landing,
-                    (target.source, suffix),
-                    target.repository,
+                    suffix,
                 )?);
             }
             row.hint = Some(hint(

@@ -703,6 +703,31 @@ pub fn marker(bytes: &[u8]) -> Marker {
     Marker::Malformed
 }
 
+/// Whether a well-formed `block` ([`marker`]) is exactly as estate-handoff
+/// rendered it.
+///
+/// Its `id=` is the first 16 hex digits of the blake3 of the block with
+/// every `id=<id>` blanked (as [`render`] seals it), so an edit inside the
+/// block, or a block a person wrote, does not hold. Gap C12: the one
+/// difference a beside adoption allows.
+#[must_use]
+pub fn sealed(block: &[u8]) -> bool {
+    let Some(id) = block
+        .get(BEGIN.len()..BEGIN.len() + 16)
+        .and_then(|id| std::str::from_utf8(id).ok())
+    else {
+        return false;
+    };
+    let Ok(text) = std::str::from_utf8(block) else {
+        return false;
+    };
+    if id == BLANK_ID || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    let blanked = text.replace(&format!("id={id}"), &format!("id={BLANK_ID}"));
+    blake3::hash(blanked.as_bytes()).to_hex().get(..16) == Some(id)
+}
+
 /// A fixed block's inputs, for the unit rows here and in `handoff::tests`.
 #[cfg(test)]
 pub(super) fn sample() -> Inputs {
@@ -770,6 +795,26 @@ pub(super) fn sample() -> Inputs {
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    // Gap C12: a rendered block is sealed by its id; an edit inside it, a
+    // blank id or a hand-written block is not.
+    #[test]
+    fn a_rendered_block_is_sealed_and_an_edit_inside_is_not() {
+        let block = render(&sample(), false);
+        assert_eq!(marker(&block), Marker::Block(block.len()));
+        assert!(sealed(&block));
+        let text = String::from_utf8(block).unwrap();
+        let edited = text.replacen("converge", "converg3", 1);
+        assert_ne!(edited, text);
+        assert!(matches!(marker(edited.as_bytes()), Marker::Block(_)));
+        assert!(!sealed(edited.as_bytes()));
+        let id = &text[BEGIN.len()..BEGIN.len() + 16];
+        let blank = text.replace(&format!("id={id}"), &format!("id={BLANK_ID}"));
+        assert!(!sealed(blank.as_bytes()));
+        let written = b"<!-- bulkload-handoff:v1 BEGIN id=0123456789abcdef -->\nhi\n<!-- bulkload-handoff:v1 END id=0123456789abcdef -->\n\n";
+        assert!(matches!(marker(written), Marker::Block(_)));
+        assert!(!sealed(written));
+    }
 
     #[test]
     fn render_is_pure_and_order_free() {
