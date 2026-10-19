@@ -97,21 +97,62 @@ Merge resolutions (stacking #283 and #280): `copy`/`pull` take
 
 Merge follow-up: #280's `a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed`
 now expects #283's `DESTINATION_KIND_MISMATCH` for the regular seat without
-`--beside`; with it, the seat still lands beside.
+`--beside`. With `--beside`, `plan_file`, the streamed `other_kind` check
+and the two beside identity lookups take either code, so the seat still
+lands beside.
 
 ## Commits and receipts
 
-Lane commits on the branch (after the two merges): `feat(estate-move): carry
-the source notes; hold the rest typed`, `test(beside): a regular seat over a
-destination symlink is KIND_MISMATCH without --beside`, `style(notes):
-rustfmt; usage names source-vanished seats`, and this note. The honey
-receipts for the pushed head (host, head, `TMPDIR`, each step's result) are
-in the PR body: a note cannot name the commit that holds it.
+Lane commits on the branch, after the two merges:
+- `19a2ec3` feat(estate-move): carry the source notes; hold the rest typed;
+- `3e51b7c` and `e08fea9`, the #283 × #280 reconciliation: a regular seat
+  over a destination symlink is `DESTINATION_KIND_MISMATCH` without
+  `--beside` (#283), and every `--beside` site lands it beside (#280);
+- `f6b4120` test: settle the fixture's racy window (#86) before the first
+  pass, so the rerun's 0 source bytes is R25's under any load;
+- `e6deb1f` and `53cb674`, rustfmt and usage text; `0ff064b`, this note.
+
+Receipts, honey, head `f6b4120aa3b9`, tree `d01f1946`, `nice -n 19 nix
+develop .#default`, `CARGO_TARGET_DIR` and `CARGO_HOME` under
+`~/git-build/estate-move-carry-notes-20261019-cargo` (debuginfo off),
+`TMPDIR=/var/tmp/jess-bulkload-tests/estate-move-carry-notes-20261019`.
+honey's load was 74 to 119 throughout.
+- `cargo fmt --all -- --check`: ok.
+- `cargo clippy -p bulkload-agent -p bulkload-proto --all-targets --locked
+  -D warnings`: ok.
+- `cargo clippy --workspace --all-targets --locked -D warnings`: ok.
+- `cargo test -p bulkload-proto`: 18 passed.
+- `cargo test -p bulkload-agent --locked --no-fail-fast`: 42 targets, 1279
+  passed, 1 failed, 8 ignored. The failure was `estate_move.rs`
+  `one_pass_lands_adopts_besides_carries_and_accounts_for_every_item` at
+  `:399`: the converge pass did not recapture `diverged`
+  (`previous-workspace-beside-not-revalidated`). It is the brief's listed
+  load-flake. Rerun alone (throttled, 4 jobs, 4 test threads, load 119) it
+  failed once, then passed.
+- `just rust-check`: fmt, both clippy passes and the `io-trace` clippy pass
+  were ok. In `rust-test`, groups 1, 3, 4 and 5 were ok. Group 2 stopped at
+  the same `estate_move` flake: it has no `--no-fail-fast`, so the targets
+  after it did not run. Those targets were then run alone:
+  `estate_move_notes` 2, `estate_move_source_roots` 6, `estate_reseat` 6,
+  `estate_retarget` 3 and `estimate_cli` 4, all passed.
+- `estate_move_notes` was also run alone twice on the head: 2 passed both
+  times.
+
+The flake comes from `estate_move.rs`'s own design: its converge pass relies
+on `diverged`'s first capture still being racy at the second source pass.
+The notes phase adds one more session to each pass, which widens that
+window a little. The test is #282's (gap C12); settling it would change
+what it proves, and that is that lane's call.
+
+Not run in this lane: `just fault-harness` and the R-N88/R-N119 power-loss
+proofs (mandatory in `check-fast` and the merge gate). They were held back
+because honey was needed for a production image build (coordinator,
+2026-10-19).
 
 `just darwin-touched` against `origin/main`: yes, from #280's and #283's
-files and the `open_regular` merge resolution (the lane's own commits alone:
-no). The stacked diff needs `just darwin-check` on pzm before merge, or its
-recorded deferral while pzm is on hold.
+files and the `open_regular` merge resolution (the lane's own commits
+alone: no). The stacked diff needs `just darwin-check` on pzm before merge,
+or its recorded deferral while pzm is on hold.
 
 ## Still open
 
