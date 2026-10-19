@@ -97,6 +97,15 @@ with no `.git` entry:
   `estate_apply_nonrepo_linked_added` (crash, rerun finishes; no file
   written; one registration; branch and status right; second rerun a
   journal no-op).
+- `tests/estate_move.rs`: the standalone `occupied` item now refuses
+  `GIT_DESTINATION_NONREPO_DIFFERS` (was `GIT_DESTINATION_OCCUPIED`); and
+  the converge-pass check #282 added (`beside-converged=1`) only holds
+  when the pass recaptured `diverged`, which depends on the source
+  census's timing (it did not under honey's load on 10-19), so it now
+  accepts either that converge or the journal no-op.
+- The S2 source-command registry caps `read-tree` call sites
+  (`source_command_registry.rs`, "a ceiling only shrinks"): the adoption
+  uses the existing `read_tree` helper, adding no site.
 - Results: in the PR body with host, head and TMPDIR.
 
 ## Open

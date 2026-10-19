@@ -7745,12 +7745,10 @@ pub(crate) fn adopt_nonrepo_linked(
     if text(git(destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
         return Err(BulkloadRefusal::GitAuthorityChanged);
     }
-    let mut command = git(destination);
-    durable(&mut command);
-    output(command.args([
-        "read-tree",
-        &format!("{}^{{tree}}", capture_revision(&heads, "staged")?),
-    ]))?;
+    read_tree(
+        &mut git(destination),
+        &[&format!("{}^{{tree}}", capture_revision(&heads, "staged")?)],
+    )?;
     restore_intent_to_add(destination, None, &heads)?;
     let exclude = match fs::read(&checked.exclude_path) {
         Ok(value) => value,

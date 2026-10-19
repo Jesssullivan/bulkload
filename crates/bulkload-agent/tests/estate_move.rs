@@ -13,7 +13,8 @@
 //!   lands beside it at `<path>.<label>`, the live checkout untouched;
 //! - `broken` and `broken2`: captures refused (no index): carried as files,
 //!   at the live path (absent) and beside it (occupied);
-//! - `occupied`: a non-Git tree at the live path: refused typed, untouched;
+//! - `occupied`: a non-Git tree at the live path (a standalone item's):
+//!   refused typed (`GIT_DESTINATION_NONREPO_DIFFERS`), untouched;
 //! - `bare.git`: a bare repository landed refs-only.
 //!
 //! Then: closure accounts for every item; a rerun changes no ref and keeps
@@ -383,13 +384,26 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
         "{}",
         converged.stdout
     );
-    // The new pass recaptured `diverged` too, and its beside landing
-    // converges to the new capture (gap C12, A-115: a beside landing used
-    // to refuse every later pass `GIT_DESTINATION_OCCUPIED`): the live
-    // checkout and its refs as they were, the beside checkout still
-    // detached at the captured head. Everything accounts as before.
+    // When the new pass recaptured `diverged` too (whether it does depends
+    // on the source census's timing), its beside landing converges to the
+    // new capture (gap C12, A-115: a beside landing used to refuse every
+    // later pass `GIT_DESTINATION_OCCUPIED`); otherwise its journal is a
+    // no-op. Either way the live checkout and its refs are as they were,
+    // the beside checkout still detached at the captured head, and
+    // everything accounts as before.
+    let diverged_row = converged
+        .stdout
+        .lines()
+        .find(|line| {
+            line.starts_with("item=")
+                && line.contains(" outcome=")
+                && line.contains("/src/git/diverged\"")
+        })
+        .unwrap_or_default();
     assert!(
-        converged.stdout.contains("beside-converged=1"),
+        (diverged_row.contains(" outcome=workspace-beside ")
+            && diverged_row.contains("beside-converged=1"))
+            || diverged_row.contains(" outcome=previous-workspace-beside-not-revalidated "),
         "{}",
         converged.stdout
     );
@@ -397,7 +411,7 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
     let mut got = closure(&converged.stdout);
     assert!(
         got.remove("refusals")
-            .is_some_and(|codes| codes.contains("GIT_DESTINATION_OCCUPIED:1")),
+            .is_some_and(|codes| codes.contains("GIT_DESTINATION_NONREPO_DIFFERS:1")),
         "{}",
         converged.stdout
     );
