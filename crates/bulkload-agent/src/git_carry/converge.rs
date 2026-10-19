@@ -2973,11 +2973,13 @@ pub fn pending(workspace: Option<&Path>, repository: &Path, source: &str) -> Res
     let Some((git_dir, common)) = locate(workspace, repository)? else {
         return Ok(Pending::default());
     };
+    let workspace_dir = landed::ledger_dir(&git_dir, source);
     Ok(Pending {
         refs: landed::exists(&landed::ledger_dir(&common, source).join(landed::REFS_INTENT))?,
-        workspace: landed::exists(
-            &landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_INTENT),
-        )?,
+        // An advance a crash cut short (`--advance-ancestor`) is pending
+        // too: a rerun with or without the flag settles it.
+        workspace: landed::exists(&workspace_dir.join(landed::WORKSPACE_INTENT))?
+            || landed::exists(&workspace_dir.join(advance::INTENT))?,
     })
 }
 

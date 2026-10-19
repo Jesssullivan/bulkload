@@ -21,6 +21,14 @@
 //!   administration removed and the renamed tree not yet deleted.
 //! - `RetireStandalone`: the same with a standalone beside checkout a pass
 //!   adopted by proof (#282).
+//! - `RetireNoFlag`: `Retire`'s shape crashed mid-advance or after the
+//!   rename, its rerun without the flag: the advance and the retirement a
+//!   flagged pass began are finished all the same.
+//! - `AdvanceEdited`: crashed after the branch's compare-and-swap, then a
+//!   seat no operation touches (`.gitignore`) edited at the live checkout:
+//!   the rerun finishes the advance from the proof's prints, then proves
+//!   the ledger it wrote and refuses `GIT_DESTINATION_MODIFIED`, the edit
+//!   kept (never recorded as bulkload's output).
 //!
 //! The parent asserts after the crash that neither tree is lost: every
 //! live seat holds the live HEAD's bytes or the capture's, the live
@@ -60,6 +68,15 @@ pub enum EstateAdvance {
     Retire,
     /// The retirement of a standalone beside checkout adopted by proof.
     RetireStandalone,
+    /// `Retire`'s shape, its rerun without `--advance-ancestor` (review
+    /// of this lane, finding 1): the rerun still finishes the advance and
+    /// the retirement a flagged pass began.
+    RetireNoFlag,
+    /// `Advance`, a seat no operation touches edited at the live checkout
+    /// after the crash (review finding 2): the settle records the proof's
+    /// print, so its proof refuses `GIT_DESTINATION_MODIFIED` and keeps the
+    /// edit, never taking it for bulkload's output.
+    AdvanceEdited,
 }
 
 impl Scenario for EstateAdvance {
@@ -394,7 +411,8 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
     if kind == EstateAdvance::RetireStandalone {
         cp_a(&world.src(), &world.beside());
     }
-    if kind != EstateAdvance::Advance {
+    let besides = !matches!(kind, EstateAdvance::Advance | EstateAdvance::AdvanceEdited);
+    if besides {
         let rows = world.apply(false);
         assert_eq!(rows.len(), 1, "{label}");
         assert_eq!(rows[0].0, "workspace-beside", "{label}: {rows:?}");
@@ -405,7 +423,7 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
     let sting_log = PathBuf::from("sting.log");
     captured.insert(sting_log.clone(), live[&sting_log].clone());
     let mine = own(&world);
-    let beside = (kind != EstateAdvance::Advance).then(|| files(&world.beside()));
+    let beside = besides.then(|| files(&world.beside()));
 
     crash(&world, &format!("{}:{nth}", point.name()));
 
@@ -432,7 +450,11 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
         assert_eq!(&files(&at), beside, "{label}: the beside landing's bytes");
     }
 
-    let rows = world.apply(true);
+    if kind == EstateAdvance::AdvanceEdited {
+        edited(&world, &label);
+        return;
+    }
+    let rows = world.apply(kind != EstateAdvance::RetireNoFlag);
     assert_eq!(rows.len(), 1, "{label}");
     assert_eq!(rows[0].0, "workspace-restored", "{label}: {rows:?}");
     assert_eq!(files(&dst), captured, "{label}: the live checkout");
@@ -456,7 +478,7 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
         !dst.join(".git/bulkload/v1/neo/advance.intent").exists(),
         "{label}"
     );
-    if kind != EstateAdvance::Advance {
+    if besides {
         let reason = rows[0].1.clone().unwrap_or_default();
         assert!(
             reason
@@ -480,5 +502,45 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
     assert_eq!(
         rows[0].0, "previous-workspace-restoration-not-revalidated",
         "{label}: a second rerun is a no-op"
+    );
+}
+
+/// The `AdvanceEdited` row after its crash (module docs).
+fn edited(world: &World, label: &str) {
+    let dst = world.dst();
+    let edit = b"*.log\nedited at the destination\n";
+    fs::write(dst.join(".gitignore"), edit).unwrap();
+    // The rerun settles the advance forward (the branch, the seats, the
+    // index, the ledger from the proof's prints), then proves the ledger
+    // it wrote: the edit is a difference, refused and kept.
+    for pass in ["settle", "again"] {
+        let rows = world.apply(true);
+        assert_eq!(rows.len(), 1, "{label} {pass}");
+        assert!(
+            rows[0]
+                .1
+                .as_deref()
+                .is_some_and(|reason| reason.contains("GIT_DESTINATION_MODIFIED")),
+            "{label} {pass}: {rows:?}"
+        );
+        assert_eq!(
+            fs::read(dst.join(".gitignore")).unwrap(),
+            edit,
+            "{label} {pass}: the edit is never taken for bulkload's output"
+        );
+        assert_eq!(
+            git(&dst, &["rev-parse", "HEAD"]),
+            git(&world.src(), &["rev-parse", "HEAD"]),
+            "{label} {pass}"
+        );
+        assert!(
+            !dst.join(".git/bulkload/v1/neo/advance.intent").exists(),
+            "{label} {pass}"
+        );
+    }
+    assert_eq!(
+        fs::read(dst.join("a.txt")).unwrap(),
+        fs::read(world.src().join("a.txt")).unwrap(),
+        "{label}: the advance is finished"
     );
 }

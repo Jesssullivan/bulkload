@@ -1325,8 +1325,11 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   entry), and no ignored entry stands where the capture tracks a path
   (`GIT_ADVANCE_UNTRACKED_COLLIDES`, naming the paths; the coordinator's
   2026-10-19 refinement); and nothing of that moved between the proof and
-  the compare-and-swap (`GIT_ADVANCE_RACED`). Each refusal writes nothing
-  at the live checkout, lands the capture beside it in the same pass, and
+  the compare-and-swap, nor did HEAD leave the branch in the instant after
+  it (the branch is put back; `GIT_ADVANCE_RACED`). Each refusal writes
+  nothing to the live checkout's worktree, index or refs (one under the
+  lock may follow an additive import of the capture's objects and
+  provenance), lands the capture beside it in the same pass, and
   is recorded in STATE (`{item}-{blake3(SOURCE)}.advance`: the code, its
   detail, the live HEAD and a digest of its untracked files), so closure
   holds the beside row `refused-pending-review` with that code until
@@ -1351,8 +1354,10 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   is never touched: where the capture holds a seat it does not track, the
   live entry and its subtree are left (`advance-kept=N`, recorded) and the
   capture's bytes stay in its provenance; a captured directory the live
-  checkout holds as an untracked directory keeps its own mode. The live
-  checkout's own untracked files stay byte for byte. The item's outcome
+  checkout holds as an untracked (ignored) directory keeps its own mode,
+  and only what the capture tracks under it lands (the rest is left, never
+  mixed into the live checkout's ignored tree). The live checkout's own
+  untracked files stay byte for byte. A gitlink is never a collision. The item's outcome
   and journal are `workspace-restored` (closure `applied`); its receipt
   counts `advanced`, `advance-branch-moved`, `advance-kept`,
   `advance-kept-dirs` and the seat words. Later passes converge the
@@ -1362,8 +1367,14 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   value bulkload left it at (never detached for being a foreign
   repository's). A crash after the intent settles forward on the rerun
   (each seat by its content: the live HEAD's, the capture's, or a third
-  party's, which refuses `GIT_CONVERGE_INTERRUPTED` with the intent kept);
-  one whose branch never moved drops the intent and proves afresh.
+  party's, which refuses `GIT_CONVERGE_INTERRUPTED` with the intent kept),
+  recording the proof's prints for seats no operation touches (an edit
+  since the crash is then a difference the ledger's proof refuses
+  `GIT_DESTINATION_MODIFIED`, never bulkload's output); one whose branch
+  never moved drops the intent and proves afresh. A rerun with or without
+  the flag finishes it (a pending advance intent or STATE retirement
+  record ends no journal), and the beside landing of an advance a flagged
+  pass began is retired by the rerun that finishes it.
 - **The beside landing an advance made redundant is retired only once
   proved equal (same ruling: "the beside copy is retired only after
   bulkload proves the live tree equals it").** After an advance, the
@@ -1380,17 +1391,24 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   tracked or untracked file of the live tree that is not ignored held by
   it, but the live checkout's own untracked files the advance left; no
   nested repository, own worktree or lock; every commit its Git names
-  (its refs but provenance, its stash, its HEAD reflog; a linked
-  landing's per-worktree refs and HEAD reflog) reachable from the live
-  repository's refs. Any difference keeps it with the reason
+  (its refs but provenance, its stash, every reflog; a linked landing's
+  per-worktree reflogs, and no per-worktree ref) reachable from the live
+  repository's refs; for a standalone one, every ref held by the live
+  repository by name and value (its own, under the beside namespace, or
+  in the capture's provenance), no hook of its own and no remote URL the
+  live repository lacks. Its prints are taken before the proof and again
+  after it (a write while the proof read it keeps it, `raced`). Any
+  difference keeps it with the reason
   (`differs:head`, `differs:index`, `differs:seat=<path>`,
   `missing:<path>`, `extra:<path>`, `unreachable`, ...). The removal is
   recorded in STATE first (`{item}-{blake3(SOURCE)}.retire`), renames the
   checkout to a private `.bulkload-retire-<tag>` beside it, re-proves it
   by the digest of every entry's print (a write since puts it back,
   `raced`), marks the record deleting, removes a linked landing's
-  administration directory (its `gitdir` must name the checkout), deletes
-  the renamed tree (its identity checked) and removes the record; a rerun
+  administration directory (its `gitdir` must hold what it held when
+  proved, or be gone after a crash), deletes the renamed tree (its
+  identity checked; its directories made writable first, a failure kept
+  `delete-failed` for the next pass) and removes the record; a rerun
   finishes from the record. The `.advance` record and the receipt say
   `advance-beside=retired|kept|absent` (with `advance-beside-reason=`),
   and closure prints them in the row's `advance` block.

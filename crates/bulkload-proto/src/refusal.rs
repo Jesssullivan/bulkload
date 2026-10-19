@@ -211,14 +211,17 @@ pub enum BulkloadRefusal {
     /// or its working-tree changes): the same path, or one a directory of
     /// the other. Or an ignored entry stands where the capture tracks a
     /// path. The live checkout's untracked and ignored files are never
-    /// touched, so nothing is written; the capture lands beside it.
-    /// Carries the colliding paths (newline-separated, at most 16, then a
+    /// touched, so nothing is written to its worktree, index or refs (an
+    /// additive import of the capture's objects and provenance aside); the
+    /// capture lands beside it. Carries the colliding paths (newline-separated, at most 16, then a
     /// `+N` line), raw bytes; [`fmt::Display`] prints them escaped.
     GitAdvanceUntrackedCollides(Vec<u8>),
     /// `--advance-ancestor`: the live checkout changed between the advance
     /// proof and its compare-and-swap (HEAD, the branch, the index or a
-    /// proved seat). Nothing is written to the live checkout or its refs;
-    /// the capture lands beside it.
+    /// proved seat), or HEAD left the branch in the instant after it (the
+    /// branch is put back). Nothing is written to the live checkout's
+    /// worktree, index or refs (an additive import of the capture's objects
+    /// and provenance aside); the capture lands beside it.
     GitAdvanceRaced,
     /// Between the capture a checkout holds and the current one, the source
     /// changed what converge does not carry: the shallow frontier, nested

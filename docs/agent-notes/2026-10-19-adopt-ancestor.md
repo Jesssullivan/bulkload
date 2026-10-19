@@ -157,6 +157,35 @@ the advanced checkout's filters), `converge/adopt.rs`, `beside.rs`,
    it (`refused:GIT_DESTINATION_MODIFIED`).
 5. **The `.beside` STATE record is kept after a retirement**, so a later
    beside pass treats the path as retired (#282: never laid down again).
+6. **The collision rule, read for the coordinator's own examples.** An
+   untracked entry is taken as Git lists it (`?? .serena/`, one entry for a
+   directory that holds nothing tracked). It collides with a captured path
+   that is the same, with any captured path under it, and with a captured
+   *file* above it; a captured *directory* above it is no collision. The
+   literal "one is a parent directory of the other" would refuse the
+   MassageIthaca shape (`docs/agent-notes/2026-08-28-convergence-review/`
+   sits under the tracked `docs/agent-notes/`), which the coordinator wants
+   advanced; this reading needs the coordinator's sign-off. Gitlinks are
+   never a collision (a submodule's directory is the live checkout's).
+7. **A live ignored directory takes only the capture's tracked files.**
+   Where the capture holds a directory the live checkout holds as an
+   ignored one, the capture's tracked files under it land (the checkout is
+   wrong without them) and what the capture does not track there is left,
+   never mixed into the live checkout's ignored tree.
+8. **Ownership by proof.** After the #282 beside pass, a beside landing of
+   another item (re-keyed by A11b) or a standalone checkout no ledger named
+   (adopted by A11a) is this item's by proof, as #282 defines it, and so
+   retirable once proved equal; a foreign one (`GIT_BESIDE_FOREIGN`) is
+   kept (`refused:GIT_BESIDE_FOREIGN`).
+9. **A beside kept after an advance does not hold the closure gate.** It is
+   closure-visible (`advance.beside=kept`, `reason`) but the row stays
+   `applied`: the ruling says to keep it until proved equal, which this
+   does; whether a kept beside should be pending review (R4, duplicates)
+   is the operator's call.
+10. **The finish of an advance a flagged pass began needs no flag.** A
+   rerun without `--advance-ancestor` settles a pending advance (as any
+   pending converge) and retires its beside landing; a STATE retirement
+   record or an advance intent ends no journal.
 
 ## Tests
 
@@ -182,14 +211,47 @@ Run on honey (rows created and destroyed by the tests, R-N98):
   compare-and-swap: `GIT_ADVANCE_RACED`, nothing written),
   `an_advance_lands_the_capture_on_the_live_branch`, `advance::tests`
   (kept/left rules, the collision rule), `beside::retire::tests`.
-- Fault harness, 11 rows: `estate_advance_after_{intent,branch,seat_first,seat_mid,index,ledger}`
+- Fault harness, 14 rows: `estate_advance_after_{intent,branch,seat_first,seat_mid,index,ledger}`
   and `estate_advance_retire_{after_intent,after_rename,mid}`,
   `estate_advance_retire_standalone_{after_rename,mid}`: after each crash
   every live seat is the live HEAD's or the capture's, sting's own state is
   as it was and the beside bytes are whole at their path or private name;
-  the rerun finishes, closure 0 unaccounted, a second rerun a no-op.
+  the rerun finishes, closure 0 unaccounted, a second rerun a no-op. Then
+  `estate_advance_after_seat_rerun_without_flag` and
+  `estate_advance_retire_after_rename_rerun_without_flag` (the rerun has no
+  flag and still finishes), and `estate_advance_after_branch_then_edited`
+  (an edit after the crash is refused and kept, never ledgered as
+  bulkload's).
+- Library rows added after the review:
+  `converge::tests::an_advance_whose_head_switched_puts_the_branch_back`.
+- `estate_adopt` P131's "read by an item's scratch" filter matched any
+  `/adopt-` in the path, so it failed under this lane's TMPDIR
+  (`.../adopt-ancestor-20261019/...`); it now reads the scratch's own
+  directory name (`<stage>/adopt-<n>/repo`). Test-only.
 - The full `cargo test -p bulkload-agent --locked` and `just rust-check` on
   the pushed head are in the PR body with host, head and TMPDIR.
+
+## Review
+
+One adversarial read-only review (a refuter subagent, nothing run) at
+`eef6599`; its findings and what was done (fixes in the second commit):
+
+| # | Finding | Disposition |
+| --- | --- | --- |
+| 1 | a rerun without the flag ended on the beside journal, leaving a half-advanced checkout (or a renamed beside) as `applied-beside` | fixed: an advance intent counts as a pending workspace intent and a `.retire` record ends no journal; the advance and its retirement are finished without the flag (rows `..._rerun_without_flag`) |
+| 2 | a settle recorded current prints for seats no operation touched, so an edit made after a crash became "bulkload's output" a later converge would replace | fixed: the intent carries the proof's prints and the settle records those; the edit is refused `GIT_DESTINATION_MODIFIED` and kept (row `estate_advance_after_branch_then_edited`) |
+| 3 | the retirement took its prints after the (long) proof, so a write during the proof could be deleted | fixed: prints before and after the proof, kept `raced` on any change; the intent stores the earlier digest. Residual: a write into the renamed tree during its deletion is lost (narrow; documented) |
+| 4 | a crash inside the admin removal (gitdir gone) or a read-only captured directory wedged the retirement on a bare `IO` | fixed: a gone `gitdir` is the record's own once deleting; directories are made writable before deletion; a failed deletion is kept `delete-failed`, the record left for the next pass |
+| 5 | gitlinks in the tracked set made every repository with a submodule collide | fixed: gitlinks are never a collision |
+| 6 | HEAD switched between the proof and the branch's compare-and-swap let the advance move a branch no longer checked out | fixed: the import now precedes the under-lock proof (the window is the intent write), and HEAD is checked after the compare-and-swap; a switch puts the branch back and refuses `GIT_ADVANCE_RACED` (unit row). Git cannot verify HEAD's target in the transaction that moves its branch |
+| 7 | a collision fixed by removing an ignored entry was never retried for the same capture | fixed: the record lists the colliding paths; the item is proved again once one is gone |
+| 8 | later converges of an advanced checkout did not import new stash entries | fixed: refs-in carries the stash for any advanced checkout |
+| 9 | the collision rule differs from the coordinator's text | decision 6 above, for sign-off |
+| 10 | files added into a live ignored directory | fixed: only the capture's tracked files land there (decision 7) |
+| 11 | "each refusal writes nothing" was inaccurate after the import | wording fixed (worktree, index and refs untouched; the additive import aside) |
+| 12 | a standalone beside's refs by name, hooks, remotes, other reflogs and annotated tags were not checked | fixed: every ref by name and value (own, namespace or provenance), every reflog, no own hooks, no remote URL the live repository lacks; `info/exclude` and other configuration are left to the capture's provenance (open) |
+| 13 | a kept beside counts `applied` | decision 9 above (operator's call) |
+| 14 | the admin removal compared a spelling of the path | fixed: bound to the `gitdir` bytes recorded at the proof |
 
 ## Open
 
@@ -202,6 +264,10 @@ Run on honey (rows created and destroyed by the tests, R-N98):
   and deletes the directory once it is proved equal (no write there since
   the proof, checked by prints after the rename); a shell sitting there is
   left in a deleted directory. Not detected (no process inspection).
+- A standalone beside checkout's `info/exclude` and configuration other
+  than its remote URLs are not compared before it is retired: their
+  captured form is in the capture's provenance, but an edit made there by
+  hand since its landing would go with it.
 - **Global excludes**: bulkload's Git runs with no global configuration, so
   a file ignored only through a custom `core.excludesFile` reads as
   untracked; it collides (refusal, beside) only where the capture holds

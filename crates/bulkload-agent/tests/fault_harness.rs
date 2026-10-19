@@ -1552,6 +1552,12 @@ scenarios! {
     estate_advance_retire_mid => EstateAdvanceRetireMid: 1, EstateAdvance::Retire;
     estate_advance_retire_standalone_after_rename => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireStandalone;
     estate_advance_retire_standalone_mid => EstateAdvanceRetireMid: 1, EstateAdvance::RetireStandalone;
+    // Review of this lane: a rerun without the flag finishes what a
+    // flagged pass began; an edit made after the crash is never taken for
+    // bulkload's output.
+    estate_advance_after_seat_rerun_without_flag => EstateAdvanceAfterSeat: 1, EstateAdvance::RetireNoFlag;
+    estate_advance_retire_after_rename_rerun_without_flag => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireNoFlag;
+    estate_advance_after_branch_then_edited => EstateAdvanceAfterBranch: 1, EstateAdvance::AdvanceEdited;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

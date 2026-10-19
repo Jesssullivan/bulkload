@@ -139,8 +139,10 @@ pub struct Left {
     /// it): left as they were, with everything under them. Sorted.
     pub kept: Vec<Vec<u8>>,
     /// Captured directories the live checkout held as untracked
-    /// directories: the directory itself keeps its mode; what the capture
-    /// holds under it is landed or kept entry by entry. Sorted.
+    /// directories (ignored ones: its untracked files collide with no
+    /// captured path): the directory itself keeps its mode, what the
+    /// capture tracks under it lands, and what it does not track is left
+    /// (in `kept`). Sorted.
     pub kept_dirs: Vec<Vec<u8>>,
     /// The live checkout's own untracked files (not ignored) when it was
     /// advanced, apart from every captured path: never touched, and never
@@ -222,6 +224,11 @@ pub struct AdvanceIntent {
     pub index_old: [u8; 32],
     /// The live HEAD tree's seats, as proved.
     pub old: Vec<OldSeat>,
+    /// Their prints, as proved: a settle records these for a seat no
+    /// operation touches, never one it reads afterwards (so an edit made
+    /// since a crash is a difference the next converge proves, never
+    /// bulkload's output).
+    pub prints: Vec<SeatPrint>,
     /// What the advance leaves to the live checkout.
     pub left: Left,
     /// The branch (or the detached HEAD) is at `to`: written right after
@@ -303,6 +310,8 @@ pub struct AdvanceRecord {
     /// The digest of the live checkout's untracked file list when it was
     /// decided ([`untracked_digest`]).
     pub untracked: [u8; 32],
+    /// The paths a `GIT_ADVANCE_UNTRACKED_COLLIDES` named.
+    pub paths: Vec<Vec<u8>>,
 }
 
 impl landed::Record for AdvanceRecord {
@@ -497,14 +506,23 @@ impl Captured {
     fn read(scratch: &Scratch, meta: &Meta) -> Result<Self> {
         let mut tracked = BTreeSet::new();
         for tree in [meta.get("head")?, meta.get("staged")?] {
-            let listed =
-                output(git(&scratch.repo).args(["ls-tree", "-r", "-z", "--name-only", tree]))?;
-            tracked.extend(
-                listed
-                    .split(|byte| *byte == 0)
-                    .filter(|path| !path.is_empty())
-                    .map(<[u8]>::to_vec),
-            );
+            let listed = output(git(&scratch.repo).args(["ls-tree", "-r", "-z", tree]))?;
+            for entry in listed
+                .split(|byte| *byte == 0)
+                .filter(|entry| !entry.is_empty())
+            {
+                let tab = entry
+                    .iter()
+                    .position(|byte| *byte == b'\t')
+                    .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+                // A gitlink is a nested repository's place, its directory
+                // the live checkout's (as its HEAD's tree leaves it to the
+                // seats), never a seat that collides.
+                if entry.starts_with(b"160000 ") {
+                    continue;
+                }
+                tracked.insert(entry.get(tab + 1..).unwrap_or_default().to_vec());
+            }
         }
         for entry in super::super::carried_intent_to_add(&scratch.repo, &meta.heads())? {
             tracked.insert(entry.rel_path);
@@ -791,6 +809,13 @@ fn plan(
         if old.contains_key(path) || ancestors(path).any(|at| kept.contains(at)) {
             continue;
         }
+        // Under a directory the live checkout holds untracked (an ignored
+        // one), only what the capture tracks lands: the rest is left, never
+        // mixed into the live checkout's ignored tree.
+        if ancestors(path).any(|at| kept_dirs.contains(at)) && !captured.tracks(path) {
+            kept.insert(path.clone());
+            continue;
+        }
         let at = match safe_destination(worktree, Path::new(OsStr::from_bytes(path))) {
             Ok(at) => at,
             // A parent the advance creates first.
@@ -977,20 +1002,9 @@ pub(super) fn workspace(
     }
     let mut custody = super::settle_repository(worktree, &place.common, source)?;
     custody.add("probe-removed", super::sweep_probes(worktree)?);
-    if !still(place, &proven)? {
-        return Err(BulkloadRefusal::GitAdvanceRaced);
-    }
-    // The untracked files under the lock: one added since the proof must
-    // collide with no captured path either.
-    let untracked = status(worktree, &place.git_dir)?.ok_or(BulkloadRefusal::GitAdvanceRaced)?;
-    let colliding: Vec<Vec<u8>> = untracked
-        .iter()
-        .filter(|path| proven.captured.collides(path))
-        .cloned()
-        .collect();
-    if !colliding.is_empty() {
-        return Err(collides(&colliding));
-    }
+    // The capture's objects and provenance first (additive; the live
+    // checkout's worktree, index and refs untouched), so the proof below
+    // is the last read before the intent and the branch's compare-and-swap.
     if let Some(base) = place.base {
         super::super::import_verified(worktree, base.path(), source)?;
     }
@@ -1000,6 +1014,21 @@ pub(super) fn workspace(
     }
     let meta1 = Meta::read(worktree, source, &instance)?;
     let new = sides(worktree, &meta1)?;
+    // The proof again, under the lock: HEAD, its branch, the index and
+    // every proved seat as they were, and the untracked files (one added
+    // since must collide with no captured path either).
+    if !still(place, &proven)? {
+        return Err(BulkloadRefusal::GitAdvanceRaced);
+    }
+    let untracked = status(worktree, &place.git_dir)?.ok_or(BulkloadRefusal::GitAdvanceRaced)?;
+    let colliding: Vec<Vec<u8>> = untracked
+        .iter()
+        .filter(|path| proven.captured.collides(path))
+        .cloned()
+        .collect();
+    if !colliding.is_empty() {
+        return Err(collides(&colliding));
+    }
     // Planned again under the lock, from the import: an entry the live
     // checkout gained since the proof where the capture lands one is left
     // to it (or collides), never written over.
@@ -1019,6 +1048,7 @@ pub(super) fn workspace(
         to: proven.to.clone(),
         index_old: proven.index,
         old: old_seats(&proven.old),
+        prints: proven.prints.values().cloned().collect(),
         left: planned.left.clone(),
         branch_done: false,
     };
@@ -1042,6 +1072,20 @@ pub(super) fn workspace(
         && !moved(worktree, &intent)?
     {
         landed::remove(&intent_path)?;
+        return Err(BulkloadRefusal::GitAdvanceRaced);
+    }
+    // HEAD must still be on the branch the compare-and-swap moved (Git
+    // cannot verify HEAD's target in the transaction that moves it, as
+    // moving it logs HEAD too): a switch in the instant since puts the
+    // branch back by compare-and-swap and refuses, nothing else written.
+    if head_of(worktree)? != proven.to {
+        if let (Some((name, _, _)), true) = (&branch, proven.from.oid != proven.to.oid) {
+            let back = format!("update {name}\0{}\0{}\0", proven.from.oid, proven.to.oid);
+            let _ = native_refs::update_refs(worktree, None, back.as_bytes(), &[name.as_str()]);
+        }
+        if !moved(worktree, &intent)? {
+            landed::remove(&intent_path)?;
+        }
         return Err(BulkloadRefusal::GitAdvanceRaced);
     }
     intent.branch_done = true;
@@ -1228,13 +1272,12 @@ pub(super) fn settle(place: &Place<'_>, landing: &Landing<'_>) -> Result<Option<
             intent.index_old,
             &intent.tag,
         )?;
-        let mut custody = finish(
-            place,
-            &intent,
-            index,
-            &new,
-            (&engine.written, &BTreeMap::new()),
-        )?;
+        let proved: Prints = intent
+            .prints
+            .iter()
+            .map(|print| (print.path.clone(), print.clone()))
+            .collect();
+        let mut custody = finish(place, &intent, index, &new, (&engine.written, &proved))?;
         custody.merge(engine.custody);
         custody.count("advance-settled");
         Ok(custody)

@@ -1201,3 +1201,36 @@ fn an_advance_lands_the_capture_on_the_live_branch() {
     assert_eq!(record.to, ledger.head);
     assert_eq!(record.from.symbolic.as_deref(), Some("refs/heads/main"));
 }
+
+/// Review of this lane, finding 6: HEAD switched to another branch in the
+/// instant before the branch's compare-and-swap. Git cannot verify HEAD's
+/// target in the transaction that moves the branch, so the advance checks
+/// HEAD after it: the branch is put back by compare-and-swap, and the
+/// advance refuses `GIT_ADVANCE_RACED` with nothing else written.
+#[test]
+fn an_advance_whose_head_switched_puts_the_branch_back() {
+    let (_dir, _source, dest, staged) = advance_world();
+    let main = git_run(&dest, &["rev-parse", "main"]);
+    let at = dest.clone();
+    super::super::mid_pass::arm_at(
+        &dest,
+        super::super::mid_pass::Stage::AdvanceBeforeBranch,
+        move || {
+            git_run(&at, &["switch", "--quiet", "-c", "other"]);
+        },
+    );
+    assert_eq!(
+        advance_at(&staged, &dest),
+        Err(BulkloadRefusal::GitAdvanceRaced)
+    );
+    assert_eq!(git_run(&dest, &["rev-parse", "main"]), main);
+    assert_eq!(
+        git_run(&dest, &["symbolic-ref", "HEAD"]),
+        "refs/heads/other"
+    );
+    assert_eq!(fs::read(dest.join("f")).unwrap(), b"one\n");
+    assert!(!dest.join("g").exists());
+    let records = landed::ledger_dir(&dest.join(".git"), "neo");
+    assert!(!records.join(advance::INTENT).exists());
+    assert!(!records.join(landed::WORKSPACE_LANDED).exists());
+}

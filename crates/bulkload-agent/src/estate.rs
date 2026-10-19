@@ -2340,7 +2340,12 @@ fn apply_item(
         let retry = done == "workspace-beside"
             && options.advance_ancestor
             && advance_retry(item, state, (&identity, source), &captured.digest)?;
-        if !pending.workspace && !retry {
+        // A beside retirement a crash cut short is finished by a rerun,
+        // with or without the flag.
+        let retiring = retire_record_path(state, &identity, source)
+            .try_exists()
+            .refuse_at("estate::apply_item")?;
+        if !pending.workspace && !retry && !retiring {
             let outcome = match done.as_str() {
                 "workspace-restored" => "previous-workspace-restoration-not-revalidated",
                 "workspace-beside" => "previous-workspace-beside-not-revalidated",
@@ -2540,12 +2545,21 @@ fn apply_item(
             .beside
             .as_deref()
             .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+        // An advanced checkout (now or by an earlier pass) keeps its own
+        // stash: the capture's entries go in under the namespace.
+        let stash = applied.advanced
+            || match item.workspace.as_deref() {
+                Some(workspace) => {
+                    git_carry::converge::advance::advanced_at(workspace, source)?.is_some()
+                }
+                None => false,
+            };
         let words = refs_in(
             item,
             &staged,
             &target,
             (state, &identity, suffix),
-            (captured.digest, applied.advanced),
+            (captured.digest, stash),
         )?;
         applied.custody = Some(match applied.custody.take() {
             Some(more) => format!("{more} {words}"),
@@ -2788,6 +2802,16 @@ fn record_advance(
     use git_carry::converge::advance;
     let path = advance_record_path(state, identity, source);
     let (live, branch) = advance::live_head(workspace).unwrap_or_default();
+    // The colliding paths, so a rerun proves the item again once one is
+    // gone (an ignored one is in no untracked digest).
+    let paths = match refusal {
+        BulkloadRefusal::GitAdvanceUntrackedCollides(listed) => listed
+            .split(|byte| *byte == b'\n')
+            .filter(|path| !path.is_empty() && !path.starts_with(b"+"))
+            .map(<[u8]>::to_vec)
+            .collect(),
+        _ => Vec::new(),
+    };
     let record = advance::AdvanceRecord {
         item: identity.to_owned(),
         capture,
@@ -2795,6 +2819,7 @@ fn record_advance(
         branch,
         outcome: refusal.code().to_owned(),
         detail: refusal.to_string(),
+        paths,
         untracked: advance::untracked_digest(workspace)
             .ok()
             .flatten()
@@ -2820,6 +2845,7 @@ fn advance_retry(
     capture: &[u8; 32],
 ) -> Result<bool> {
     use git_carry::converge::advance;
+    use std::os::unix::ffi::OsStrExt as _;
     let Some(workspace) = item.workspace.as_deref() else {
         return Ok(false);
     };
@@ -2845,6 +2871,12 @@ fn advance_retry(
             Ok(match decided {
                 Some(record) => {
                     advance::live_head(workspace).ok() != Some((record.live, record.branch))
+                        || !record.paths.iter().all(|path| {
+                            workspace
+                                .join(std::ffi::OsStr::from_bytes(path))
+                                .symlink_metadata()
+                                .is_ok()
+                        })
                 }
                 None => true,
             })
@@ -2854,9 +2886,10 @@ fn advance_retry(
 
 // `--advance-ancestor`, after an item's workspace outcome: the advance
 // record in STATE (`advanced`, with the live HEAD it moved from), a
-// retirement a crash cut short finished, then (when this pass advanced,
-// with the flag) the item's beside landing retired once proved equal to
-// the live tree. Its receipt words, `None` when the item was not advanced.
+// retirement a crash cut short finished, then (when this pass advanced or
+// finished an advance a flagged pass began) the item's beside landing
+// retired once proved equal to the live tree. Its receipt words, `None`
+// when the item was not advanced.
 #[allow(clippy::too_many_lines)]
 fn advanced_item(
     item: &Item,
@@ -2910,14 +2943,14 @@ fn advanced_item(
     advance::write_record(&record_path, &record)?;
     let decided = match (pending, options.beside.as_deref()) {
         (Some(done), _) => Some(Some(done)),
-        (None, Some(suffix)) if record.beside == "pending" && options.advance_ancestor => {
-            Some(retire_beside(
-                workspace,
-                (staged, target, landing, policy),
-                (&retire_path, identity, capture),
-                suffix,
-            )?)
-        }
+        // The advance was begun under `--advance-ancestor`: its beside
+        // landing is retired even by a rerun that finishes it without.
+        (None, Some(suffix)) if record.beside == "pending" => Some(retire_beside(
+            workspace,
+            (staged, target, landing, policy),
+            (&retire_path, identity, capture),
+            suffix,
+        )?),
         (None, _) => None,
     };
     if let Some(done) = decided {
@@ -2984,7 +3017,15 @@ fn retire_beside(
     let left = git_carry::converge::advance::advanced_at(workspace, target.source)?
         .map(|done| done.left)
         .unwrap_or_default();
-    retire::retire(retire_path, &beside, workspace, (identity, capture), &left).map(Some)
+    let ns = git_carry::beside::namespace(suffix)?;
+    retire::retire(
+        retire_path,
+        &beside,
+        workspace,
+        (identity, capture),
+        (&left, &ns, target.source),
+    )
+    .map(Some)
 }
 
 /// `estate-apply --refs-in` (M2 item 7).

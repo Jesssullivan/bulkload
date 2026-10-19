@@ -1078,7 +1078,13 @@ impl Report {
             }
             // `--advance-ancestor`: a beside row whose advance refused holds
             // that typed refusal (the outcome is the beside landing's).
-            if row.outcome.as_ref().and_then(Outcome::refusal).is_none() {
+            if row.outcome.as_ref().and_then(Outcome::refusal).is_none()
+                && row
+                    .advance
+                    .as_ref()
+                    .and_then(crate::estate::AdvanceSummary::refusal)
+                    .is_some()
+            {
                 if let Some(code) = row.disposition.refusal() {
                     let _ = write!(out, ",\"refusal\":{}", json_string(code));
                 }
