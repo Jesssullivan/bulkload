@@ -6586,7 +6586,10 @@ impl<W: Write> Inbound<'_, W> {
         let beside = beside_row(row, suffix);
         let identity = match self.target.identity(&beside) {
             Ok(Some(identity)) => identity,
-            Ok(None) | Err(BulkloadRefusal::DestinationOccupied) => return Ok(false),
+            Ok(None)
+            | Err(
+                BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch,
+            ) => return Ok(false),
             Err(refusal) => return Err(refusal),
         };
         for candidate in std::iter::once(key).chain(snapshot.map(|(k, _)| k.as_slice())) {
@@ -6641,7 +6644,10 @@ impl<W: Write> Inbound<'_, W> {
         let beside = beside_row(row, &suffix);
         let identity = match self.target.identity(&beside) {
             Ok(Some(identity)) => identity,
-            Ok(None) | Err(BulkloadRefusal::DestinationOccupied) => return Ok(None),
+            Ok(None)
+            | Err(
+                BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch,
+            ) => return Ok(None),
             Err(refusal) => return Err(refusal),
         };
         for (candidate, is_snapshot) in snapshot
@@ -7242,7 +7248,7 @@ impl<W: Write> Inbound<'_, W> {
             && self.beside.is_some()
             && matches!(
                 self.target.existing(&row),
-                Err(BulkloadRefusal::DestinationOccupied)
+                Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch)
             );
         if live_sidecar || other_kind {
             land_beside = self
@@ -8630,8 +8636,11 @@ fn plan_file(
         }
         Ok(None) => None,
         // `--beside`: a node of another kind at the live path (a symlink:
-        // review of #280, finding 5) lands beside.
-        Err(BulkloadRefusal::DestinationOccupied) if beside.is_some() => {
+        // review of #280, finding 5; `DESTINATION_KIND_MISMATCH` since #283
+        // review 3) lands beside.
+        Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch)
+            if beside.is_some() =>
+        {
             land_beside = beside_at();
             None
         }
