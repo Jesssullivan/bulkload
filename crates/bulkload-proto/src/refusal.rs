@@ -45,9 +45,11 @@ pub enum BulkloadRefusal {
     SourceRootUnreadable(Option<i32>),
     /// The source root is not the kind the verb was given (#232): a regular
     /// file where a tree was named (`copy`/`pull` without `--file`), or a
-    /// directory, symlink or special file where `--file` named one regular
-    /// file. The destination raises it too when its `--file` session is
-    /// offered anything but one regular row.
+    /// directory or special file where `--file` named one file (a symlink
+    /// there is carried as a link). Under `--file` it is the walk's row for
+    /// that name, carried typed over the wire; the destination raises it too
+    /// when its `--file` session is offered anything but one regular or
+    /// symlink row.
     SourceRootKindMismatch,
     /// A capture recorded drift under its pass, so it does not hold every
     /// seat's bytes; apply refuses it until a later pass extends it clean.
@@ -375,10 +377,14 @@ pub enum BulkloadRefusal {
     /// above it. Nothing is written.
     DestinationParentMissing,
     /// The destination path holds the wrong kind of node for the verb
-    /// (#232): a directory where `--file` would land one regular file, or a
-    /// regular or special file where a tree would land. Nothing is written
-    /// and nothing is replaced; a file at DEST that differs from a `--file`
-    /// source is `DESTINATION_OCCUPIED`, as in a tree.
+    /// (#232): a directory where `--file` would land one regular file, a
+    /// regular or special file or a symlink where a tree would land, or a
+    /// symlink (to a file, a directory or nothing) where a regular output
+    /// lands, in a tree or under `--file`. No link is followed, nothing is
+    /// written and nothing is replaced; a file at DEST that differs from
+    /// the source is `DESTINATION_OCCUPIED`, as before. Under `copy --file`
+    /// and `pull --file` it is also the root's own refusal when the source
+    /// offers anything but one regular file or one symlink.
     DestinationKindMismatch,
     /// A changed seat's output is this store's own, but its file system has
     /// no atomic exchange of two names (`renameat2(RENAME_EXCHANGE)`,

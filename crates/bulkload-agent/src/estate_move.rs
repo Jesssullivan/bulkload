@@ -201,7 +201,8 @@ fn source_command(args: &[OsString]) -> Result<()> {
             note.code.unwrap_or("none"),
         ))?;
     }
-    let existing = if plan.try_exists().refuse_at("estate_move::source")? {
+    let plan_existed = plan.try_exists().refuse_at("estate_move::source")?;
+    let existing = if plan_existed {
         estate::inspect(&plan)?
     } else {
         Vec::new()
@@ -221,7 +222,10 @@ fn source_command(args: &[OsString]) -> Result<()> {
         .map(|planned| planned.item.clone())
         .filter(|item| !existing.contains(item))
         .collect();
-    if !new.is_empty() {
+    // A first pass whose roots hold no repository still writes its (empty)
+    // plan, so the pass completes and the destination half reads a plan,
+    // never `IO (errno 2)` (#283 review 5).
+    if !new.is_empty() || !plan_existed {
         estate::add_batch(&plan, &new)?;
     }
     let planned = estate::inspect(&plan)?.len();
