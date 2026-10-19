@@ -27,8 +27,10 @@ struct Ran {
 
 impl Scratch {
     fn new(name: &str) -> Self {
-        let base =
-            std::env::temp_dir().join(format!("bulkload-single-file-{name}-{}", std::process::id()));
+        let base = std::env::temp_dir().join(format!(
+            "bulkload-single-file-{name}-{}",
+            std::process::id()
+        ));
         let _ = std::fs::remove_dir_all(&base);
         std::fs::create_dir_all(base.join("source")).unwrap();
         std::fs::create_dir(base.join("destination")).unwrap();
@@ -118,7 +120,11 @@ fn names(dir: &Path) -> Vec<String> {
 }
 
 fn mode(path: &Path) -> u32 {
-    std::fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 fn settle(path: &Path) {
@@ -133,7 +139,10 @@ fn copy_file_lands_the_file_byte_exact_and_an_unchanged_rerun_reads_nothing() {
     settle(&scratch.path("source"));
     let ran = scratch.copy(true, "source/a.txt", "destination/a.txt", ("ss", "ds"));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert_eq!(std::fs::read(scratch.path("destination/a.txt")).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(scratch.path("destination/a.txt")).unwrap(),
+        bytes
+    );
     // One file landed, nothing else in its directory.
     assert_eq!(names(&scratch.path("destination")), ["a.txt"]);
     assert_eq!(counter(&ran.stdout, "completed"), 1, "{}", ran.stdout);
@@ -148,9 +157,17 @@ fn copy_file_lands_the_file_byte_exact_and_an_unchanged_rerun_reads_nothing() {
     settle(&scratch.path("destination"));
     let again = scratch.copy(true, "source/a.txt", "destination/a.txt", ("ss", "ds"));
     assert!(again.ok, "{}{}", again.stdout, again.stderr);
-    assert_eq!(counter(&again.stdout, "source_bytes_read"), 0, "{}", again.stdout);
+    assert_eq!(
+        counter(&again.stdout, "source_bytes_read"),
+        0,
+        "{}",
+        again.stdout
+    );
     assert_eq!(counter(&again.stdout, "refusals"), 0, "{}", again.stdout);
-    assert_eq!(std::fs::read(scratch.path("destination/a.txt")).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(scratch.path("destination/a.txt")).unwrap(),
+        bytes
+    );
     // The session is recorded in DEST_STATE like a tree's (WP3 PR 4).
     assert!(scratch.path("ds/transfer.closure.d").is_dir());
 }
@@ -163,7 +180,10 @@ fn copy_file_lands_under_the_destination_name() {
     settle(&scratch.path("source"));
     let ran = scratch.copy(true, "source/a.txt", "destination/b.txt", ("ss", "ds"));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert_eq!(std::fs::read(scratch.path("destination/b.txt")).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(scratch.path("destination/b.txt")).unwrap(),
+        bytes
+    );
     assert_eq!(names(&scratch.path("destination")), ["b.txt"]);
 }
 
@@ -179,7 +199,10 @@ fn copy_file_adopts_an_identical_file_and_refuses_a_differing_one() {
     let ran = scratch.copy(true, "source/a.txt", "destination/a.txt", ("ss", "ds"));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     assert_eq!(counter(&ran.stdout, "refusals"), 0, "{}", ran.stdout);
-    assert_eq!(std::fs::read(scratch.path("destination/a.txt")).unwrap(), bytes);
+    assert_eq!(
+        std::fs::read(scratch.path("destination/a.txt")).unwrap(),
+        bytes
+    );
     // Differing, and not bulkload's: preserved and refused, typed.
     let other = noise(5, 64 * 1024);
     std::fs::write(scratch.path("destination/c.txt"), &other).unwrap();
@@ -191,7 +214,10 @@ fn copy_file_adopts_an_identical_file_and_refuses_a_differing_one() {
         "{}",
         ran.stderr
     );
-    assert_eq!(std::fs::read(scratch.path("destination/c.txt")).unwrap(), other);
+    assert_eq!(
+        std::fs::read(scratch.path("destination/c.txt")).unwrap(),
+        other
+    );
 }
 
 #[test]
@@ -284,7 +310,12 @@ fn copy_makes_an_absent_destination_root_and_never_its_parent() {
     );
     assert!(!scratch.path("destination/missing").exists());
     // The same for a file's parent.
-    let ran = scratch.copy(true, "source/a.txt", "destination/missing/a.txt", ("ss3", "ds3"));
+    let ran = scratch.copy(
+        true,
+        "source/a.txt",
+        "destination/missing/a.txt",
+        ("ss3", "ds3"),
+    );
     assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
     assert!(
         ran.stderr.contains("refused: DESTINATION_PARENT_MISSING"),
@@ -298,7 +329,11 @@ fn copy_makes_an_absent_destination_root_and_never_its_parent() {
 fn the_wrong_kind_of_node_at_the_destination_is_typed() {
     let scratch = Scratch::new("destkind");
     std::fs::write(scratch.path("source/a.txt"), b"a\n").unwrap();
-    std::fs::write(scratch.path("destination/taken"), b"a file where a tree lands\n").unwrap();
+    std::fs::write(
+        scratch.path("destination/taken"),
+        b"a file where a tree lands\n",
+    )
+    .unwrap();
     // `--file` would land on a directory.
     let ran = scratch.copy(true, "source/a.txt", "destination", ("ss", "ds"));
     assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
@@ -331,14 +366,28 @@ fn serve_makes_the_one_missing_level_of_its_state_parent() {
     std::fs::write(scratch.path("source/a.txt"), b"a\n").unwrap();
     std::fs::create_dir(scratch.path("states")).unwrap();
     settle(&scratch.path("source"));
-    let ran = scratch.copy(false, "source", "destination", ("states/serve/corpus", "ds"));
+    let ran = scratch.copy(
+        false,
+        "source",
+        "destination",
+        ("states/serve/corpus", "ds"),
+    );
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     assert!(scratch.path("states/serve").is_dir());
     assert_eq!(mode(&scratch.path("states/serve")), 0o700);
     assert!(scratch.path("states/serve/corpus").is_dir());
-    let ran = scratch.copy(false, "source", "destination2", ("states/a/b/corpus", "ds2"));
+    let ran = scratch.copy(
+        false,
+        "source",
+        "destination2",
+        ("states/a/b/corpus", "ds2"),
+    );
     assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert!(ran.stderr.contains("refused: IO (errno 2)"), "{}", ran.stderr);
+    assert!(
+        ran.stderr.contains("refused: IO (errno 2)"),
+        "{}",
+        ran.stderr
+    );
     assert!(!scratch.path("states/a").exists());
     assert!(!scratch.path("destination2").exists());
 }
@@ -355,7 +404,10 @@ fn a_symlinked_destination_root_is_still_refused() {
     settle(&scratch.path("source"));
     let ran = scratch.copy(false, "source", "destination/link", ("ss", "ds"));
     assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert_eq!(names(&scratch.path("destination/real")), Vec::<String>::new());
+    assert_eq!(
+        names(&scratch.path("destination/real")),
+        Vec::<String>::new()
+    );
 }
 
 // #218 under `--file` (#232): a live WAL store is keyed by its `-wal` too,
@@ -394,9 +446,20 @@ fn copy_file_keys_a_live_wal_store_by_its_wal() {
     let main_before = std::fs::symlink_metadata(&db).unwrap();
     settle(&scratch.path("source"));
     let snapshot = ["--sqlite=snapshot"];
-    let ran = scratch.copy_with(&snapshot, true, "source/app.db", "destination/app.db", ("ss", "ds"));
+    let ran = scratch.copy_with(
+        &snapshot,
+        true,
+        "source/app.db",
+        "destination/app.db",
+        ("ss", "ds"),
+    );
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert_eq!(counter(&ran.stdout, "sqlite_snapshots"), 1, "{}", ran.stdout);
+    assert_eq!(
+        counter(&ran.stdout, "sqlite_snapshots"),
+        1,
+        "{}",
+        ran.stdout
+    );
     assert_eq!(count(&scratch.path("destination/app.db")), 2);
     // Nothing but the database lands: its sidecars are never offered.
     assert_eq!(names(&scratch.path("destination")), ["app.db"]);
@@ -406,14 +469,35 @@ fn copy_file_keys_a_live_wal_store_by_its_wal() {
     // The commit went to the `-wal` only.
     let main_after = std::fs::symlink_metadata(&db).unwrap();
     assert_eq!(
-        (main_before.ino(), main_before.size(), main_before.mtime_nsec(), main_before.mtime()),
-        (main_after.ino(), main_after.size(), main_after.mtime_nsec(), main_after.mtime())
+        (
+            main_before.ino(),
+            main_before.size(),
+            main_before.mtime_nsec(),
+            main_before.mtime()
+        ),
+        (
+            main_after.ino(),
+            main_after.size(),
+            main_after.mtime_nsec(),
+            main_after.mtime()
+        )
     );
     settle(&scratch.path("source"));
     settle(&scratch.path("destination"));
-    let ran = scratch.copy_with(&snapshot, true, "source/app.db", "destination/app.db", ("ss", "ds"));
+    let ran = scratch.copy_with(
+        &snapshot,
+        true,
+        "source/app.db",
+        "destination/app.db",
+        ("ss", "ds"),
+    );
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert_eq!(counter(&ran.stdout, "sqlite_snapshots"), 1, "{}", ran.stdout);
+    assert_eq!(
+        counter(&ran.stdout, "sqlite_snapshots"),
+        1,
+        "{}",
+        ran.stdout
+    );
     assert_eq!(count(&scratch.path("destination/app.db")), 3);
     drop(writer);
 }

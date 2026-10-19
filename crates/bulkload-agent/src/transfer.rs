@@ -637,7 +637,13 @@ fn ensure_state_parent(state: &Path) -> Result<()> {
     match crate::io::sys::mkdirat(&grandparent, &name, 0o700) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(crate::refuse::io_in(&error, parent, "transfer::ensure_state_parent")),
+        Err(error) => {
+            return Err(crate::refuse::io_in(
+                &error,
+                parent,
+                "transfer::ensure_state_parent",
+            ))
+        }
     }
     grandparent
         .sync_dir_counted()
@@ -683,12 +689,14 @@ fn open_source_root(root: &Path, kind: RootKind) -> Result<SourceRoot> {
                 .file_name()
                 .ok_or(BulkloadRefusal::SourceRootKindMismatch)?;
             let dir = parent_or_dot(root);
-            let fd = crate::io::sys::open_root(dir)
-                .map_err(|error| crate::refuse::source_root(&error, "transfer::open_source_root"))?;
+            let fd = crate::io::sys::open_root(dir).map_err(|error| {
+                crate::refuse::source_root(&error, "transfer::open_source_root")
+            })?;
             let seat =
                 crate::io::c_name(name.as_bytes()).refuse_at("transfer::open_source_root")?;
-            let stat = crate::io::sys::fstatat_nofollow(&fd, &seat)
-                .map_err(|error| crate::refuse::source_root(&error, "transfer::open_source_root"))?;
+            let stat = crate::io::sys::fstatat_nofollow(&fd, &seat).map_err(|error| {
+                crate::refuse::source_root(&error, "transfer::open_source_root")
+            })?;
             if !stat.is_file() {
                 return Err(BulkloadRefusal::SourceRootKindMismatch);
             }
@@ -761,7 +769,8 @@ fn resolve_destination(destination: &Path, kind: RootKind) -> Result<Landing> {
                 Err(BulkloadRefusal::DestinationKindMismatch)
             }
             Some(_) => Ok(Landing {
-                dir: std::fs::canonicalize(destination).refuse_at("transfer::resolve_destination")?,
+                dir: std::fs::canonicalize(destination)
+                    .refuse_at("transfer::resolve_destination")?,
                 open: destination.to_path_buf(),
                 leaf: None,
                 create: false,
@@ -814,7 +823,13 @@ fn make_destination_root(dir: &Path) -> Result<()> {
     match crate::io::sys::mkdirat(&parent, &name, 0o700) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(crate::refuse::io_in(&error, dir, "transfer::make_destination_root")),
+        Err(error) => {
+            return Err(crate::refuse::io_in(
+                &error,
+                dir,
+                "transfer::make_destination_root",
+            ))
+        }
     }
     parent
         .sync_dir_counted()
@@ -5533,7 +5548,11 @@ impl<W: Write> Inbound<'_, W> {
                 }
             };
             match frame {
-                Frame::Control(Control::Entry { entry, mut row, wal }) => {
+                Frame::Control(Control::Entry {
+                    entry,
+                    mut row,
+                    wal,
+                }) => {
                     if entry != offered || walk_done.is_some() {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
                     }

@@ -202,7 +202,10 @@ mod tests {
         let at = |errno| super::source_root(&std::io::Error::from_raw_os_error(errno), "t::s");
         assert_eq!(at(libc::ENOENT), BulkloadRefusal::SourceRootMissing);
         for errno in [libc::EACCES, libc::ELOOP, libc::ENOTDIR, libc::EIO] {
-            assert_eq!(at(errno), BulkloadRefusal::SourceRootUnreadable(Some(errno)));
+            assert_eq!(
+                at(errno),
+                BulkloadRefusal::SourceRootUnreadable(Some(errno))
+            );
         }
         assert_eq!(
             super::source_root(&std::io::Error::other("no errno"), "t::s"),

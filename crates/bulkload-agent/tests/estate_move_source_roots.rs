@@ -127,12 +127,21 @@ fn a_vanished_root_is_a_note_and_the_pass_continues() {
     let world = World::new("vanished");
     let state = world.path("state");
     let gone = world.path("gone");
-    let ran = agent(&os(&[&"estate-move-source", &state, &gone, &world.path("live")]));
+    let ran = agent(&os(&[
+        &"estate-move-source",
+        &state,
+        &gone,
+        &world.path("live"),
+    ]));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     let note = format!(
         "estate-move-source note=source-vanished path={gone:?} count=1 code=SOURCE_ROOT_MISSING"
     );
-    assert!(ran.stdout.contains(&note), "want {note:?} in\n{}", ran.stdout);
+    assert!(
+        ran.stdout.contains(&note),
+        "want {note:?} in\n{}",
+        ran.stdout
+    );
     let inventory = ran
         .stdout
         .lines()
@@ -165,5 +174,9 @@ fn a_pass_with_no_usable_root_refuses_typed() {
         "{}",
         ran.stderr
     );
-    assert!(!ran.stdout.contains("phase=inventory outcome=ok"), "{}", ran.stdout);
+    assert!(
+        !ran.stdout.contains("phase=inventory outcome=ok"),
+        "{}",
+        ran.stdout
+    );
 }

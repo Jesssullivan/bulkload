@@ -461,11 +461,7 @@ impl<'root> Walker<'root> {
     ///
     /// # Errors
     /// Refuses with the `fstat` or reopen failure of the root.
-    pub fn single_seat(
-        root: BorrowedFd<'root>,
-        name: &CStr,
-        cross_device: bool,
-    ) -> Result<Self> {
+    pub fn single_seat(root: BorrowedFd<'root>, name: &CStr, cross_device: bool) -> Result<Self> {
         let root_dev = sys::fstat(root).refuse_at("walk::single_seat")?.node.dev;
         let dir = sys::open_dir_at(root, c".").refuse_at("walk::single_seat")?;
         let mut names = vec![name.to_owned()];
