@@ -742,7 +742,8 @@ struct Landing {
     open: PathBuf,
     /// The one name the session lands, for a `--file` root.
     leaf: Option<Vec<u8>>,
-    /// A tree root that is absent: made (0755) once the S2 checks pass.
+    /// A tree root that is absent: made (the source root's mode, else
+    /// 0700) once the source's `Start` arrives.
     create: bool,
 }
 
@@ -771,6 +772,12 @@ impl Landing {
 /// `DESTINATION_KIND_MISMATCH` for a non-directory where a tree lands or a
 /// directory where a file does.
 fn resolve_destination(destination: &Path, kind: RootKind) -> Result<Landing> {
+    // A trailing `/` (or `/.`) makes the kernel follow a symlink at the
+    // last component, in the lstat below and in the no-follow open after
+    // it: DEST is rebuilt from its components, so it is judged, and later
+    // opened, as the name it is (#283 verification A).
+    let destination: PathBuf = destination.components().collect();
+    let destination = destination.as_path();
     let found = match std::fs::symlink_metadata(destination) {
         Ok(meta) => Some(meta),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -839,19 +846,22 @@ fn read_start<R: Read>(input: &mut R, hand: Option<&HandIn>) -> Result<Vec<u8>> 
     Ok(authority)
 }
 
-/// Make an absent destination tree root (#232), mode 0755 under the
-/// process umask as `estate-carry-files` makes its destinations (#283
-/// review 6), in its existing parent. Only the root the operator named, never a parent (R2.2: the run
-/// writes where it was asked and nowhere else), and only once the S2 checks
-/// passed, so a refused session makes nothing. Its entry is made durable
-/// before the store that names it opens.
-fn make_destination_root(dir: &Path) -> Result<()> {
+/// Make an absent destination tree root (#232) in its existing parent, with
+/// `mode`: the source root's permission bits when this side knows them
+/// (`copy`), else 0700 (`pull`: wire v6 carries no root row), never wider,
+/// and narrowed further by the process umask (#283 verification B: a
+/// `copy ~/.ssh /new/.ssh` must not land world-listable). Only the root the
+/// operator named, never a parent (R2.2: the run writes where it was asked
+/// and nowhere else), and only once the S2 checks passed, so a refused
+/// session makes nothing. Its entry is made durable before the store that
+/// names it opens.
+fn make_destination_root(dir: &Path, mode: u32) -> Result<()> {
     use crate::counters::CountedSync as _;
     let name = dir.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?;
     let name = crate::io::c_name(name.as_bytes()).refuse_at("transfer::make_destination_root")?;
     let parent =
         std::fs::File::open(parent_or_dot(dir)).refuse_at("transfer::make_destination_root")?;
-    match crate::io::sys::mkdirat(&parent, &name, 0o755) {
+    match crate::io::sys::mkdirat(&parent, &name, mode & 0o777) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
@@ -1075,6 +1085,12 @@ fn copy_session(
     kind: RootKind,
 ) -> Result<TransferStats> {
     let destination_root = copy_roots(source, destination, source_state, destination_state, kind)?;
+    // The source root is on this host: an absent DEST root takes its mode
+    // (#283 verification B). A `--file` session never makes a root.
+    let source_mode = match kind {
+        RootKind::Tree => std::fs::metadata(source).ok().map(|meta| meta.mode()),
+        RootKind::File => None,
+    };
     let (hand_out, hand_in) = if loopback_handoff(&destination_root) {
         let (out, into) = handoff::pair();
         (Some(out), Some(into))
@@ -1134,6 +1150,7 @@ fn copy_session(
                     sqlite,
                     Some(hand),
                     kind,
+                    source_mode,
                 ),
                 None => receive_session(
                     &mut receiver,
@@ -1143,6 +1160,7 @@ fn copy_session(
                     sqlite,
                     None,
                     kind,
+                    source_mode,
                 ),
             }
         };
@@ -5344,6 +5362,7 @@ pub fn receive_with<R: Read, W: Write>(
         sqlite,
         None,
         RootKind::Tree,
+        None,
     )
 }
 
@@ -5373,6 +5392,7 @@ pub fn receive_kind<R: Read, W: Write>(
         sqlite_mode(),
         None,
         kind,
+        None,
     )
 }
 
@@ -5388,6 +5408,7 @@ fn receive_session<R: Read, W: Write>(
     sqlite: SqliteMode,
     hand: Option<HandIn>,
     kind: RootKind,
+    source_mode: Option<u32>,
 ) -> Result<TransferStats> {
     let setup_timer = PhaseTimer(&RECV_SETUP_NS, Instant::now());
     // S2: the overlap of the destination's state and root is refused before
@@ -5430,7 +5451,7 @@ fn receive_session<R: Read, W: Write>(
     let store = Store::open(destination_state)?;
     let early_start = if landing.create {
         let authority = read_start(input, hand.as_ref())?;
-        make_destination_root(&landing.dir)?;
+        make_destination_root(&landing.dir, source_mode.map_or(0o700, |mode| mode & 0o777))?;
         Some(authority)
     } else {
         None

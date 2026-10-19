@@ -4,10 +4,11 @@
 //! identical, `DESTINATION_OCCUPIED` when it differs, 0 source bytes on an
 //! unchanged rerun, and a later tree pass of the parent reuses the rows);
 //! a leaf that is missing or of another kind is a typed row that crosses
-//! the wire; `copy` makes an absent DEST root (0755 under the umask, as
-//! carry does) and never its parent, and removes it again when its own
-//! setup refuses; a symlinked DEST is typed and never followed. And #276's
-//! source half: `serve` makes every missing parent of its state root.
+//! the wire; an absent DEST root is made with the source root's mode (0700
+//! over `pull`), never wider, never its parent, and removed again when this
+//! side's setup refuses; a symlinked DEST is typed and never followed, a
+//! trailing `/` included. And #276's source half: `serve` makes every
+//! missing parent of its state root.
 
 #![allow(
     clippy::unwrap_used,
@@ -347,17 +348,10 @@ fn copy_makes_an_absent_destination_root_and_never_its_parent() {
     let ran = scratch.copy(false, "source", "destination/new", ("ss", "ds"));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     assert!(scratch.path("destination/new").is_dir());
-    // 0755 under the umask, as estate-carry-files makes its destinations.
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        std::fs::DirBuilder::new()
-            .mode(0o755)
-            .create(scratch.path("as-carry"))
-            .unwrap();
-    }
+    // The source root's mode, under the umask (verification B).
     assert_eq!(
         mode(&scratch.path("destination/new")),
-        mode(&scratch.path("as-carry"))
+        mode(&scratch.path("source"))
     );
     assert_eq!(
         std::fs::read(scratch.path("destination/new/d/b.txt")).unwrap(),
@@ -748,4 +742,92 @@ fn a_destination_setup_refusal_leaves_no_empty_root() {
         ran.stderr
     );
     assert!(!scratch.path("destination/new").exists(), "{}", ran.stderr);
+}
+
+/// A directory this process makes with `bits`: the mode bulkload's own
+/// `mkdirat` gets for the same bits under the same umask.
+fn made_with(scratch: &Scratch, name: &str, bits: u32) -> u32 {
+    use std::os::unix::fs::DirBuilderExt as _;
+    std::fs::DirBuilder::new()
+        .mode(bits)
+        .create(scratch.path(name))
+        .unwrap();
+    mode(&scratch.path(name))
+}
+
+// #283 verification A: a trailing `/` (or `/.`) on DEST would make the
+// kernel follow a symlink at its last component; DEST is judged as the
+// name it is, so a link there is `DESTINATION_KIND_MISMATCH` and nothing is
+// written through it. A plain absent DEST with a trailing slash still works.
+#[test]
+fn a_trailing_slash_never_follows_a_link_at_dest() {
+    let scratch = Scratch::new("trailingslash");
+    std::fs::write(scratch.path("source/a.txt"), b"a\n").unwrap();
+    std::fs::create_dir(scratch.path("destination/real")).unwrap();
+    std::fs::write(scratch.path("destination/real.txt"), b"theirs\n").unwrap();
+    std::os::unix::fs::symlink("real", scratch.path("destination/link")).unwrap();
+    std::os::unix::fs::symlink("real.txt", scratch.path("destination/lf")).unwrap();
+    settle(&scratch.path("source"));
+    for (index, dest) in ["destination/link/", "destination/link/."].iter().enumerate() {
+        let states = (format!("ss{index}"), format!("ds{index}"));
+        let ran = scratch.copy(false, "source", dest, (&states.0, &states.1));
+        assert!(!ran.ok, "{dest}: {}{}", ran.stdout, ran.stderr);
+        assert!(
+            ran.stderr.contains("refused: DESTINATION_KIND_MISMATCH"),
+            "{dest}: {}",
+            ran.stderr
+        );
+    }
+    let ran = scratch.copy(true, "source/a.txt", "destination/lf/", ("ssf", "dsf"));
+    assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert!(
+        ran.stderr.contains("refused lf: DESTINATION_KIND_MISMATCH"),
+        "{}",
+        ran.stderr
+    );
+    assert_eq!(names(&scratch.path("destination/real")), Vec::<String>::new());
+    assert_eq!(
+        std::fs::read(scratch.path("destination/real.txt")).unwrap(),
+        b"theirs\n"
+    );
+    let ran = scratch.copy(false, "source", "destination/new/", ("ssn", "dsn"));
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert_eq!(
+        std::fs::read(scratch.path("destination/new/a.txt")).unwrap(),
+        b"a\n"
+    );
+}
+
+// #283 verification B: an absent DEST root takes the source root's
+// permission bits under `copy` (a private source lands private), never
+// wider; over `pull`, whose wire carries no root row, it is 0700.
+#[test]
+fn an_absent_root_takes_the_source_mode_never_wider() {
+    let scratch = Scratch::new("rootmode");
+    for (name, bits) in [("private", 0o700), ("group", 0o750)] {
+        let source = format!("src-{name}");
+        std::fs::create_dir(scratch.path(&source)).unwrap();
+        std::fs::write(scratch.path(&format!("{source}/f")), b"f\n").unwrap();
+        std::fs::set_permissions(scratch.path(&source), std::fs::Permissions::from_mode(bits))
+            .unwrap();
+        settle(&scratch.path(&source));
+        let dest = format!("destination/{name}");
+        let ran = scratch.copy(false, &source, &dest, (&format!("ss-{name}"), &format!("ds-{name}")));
+        assert!(ran.ok, "{name}: {}{}", ran.stdout, ran.stderr);
+        assert_eq!(
+            mode(&scratch.path(&dest)),
+            made_with(&scratch, &format!("expect-{name}"), bits),
+            "{name}"
+        );
+    }
+    std::fs::write(scratch.path("source/a.txt"), b"a\n").unwrap();
+    std::fs::set_permissions(scratch.path("source"), std::fs::Permissions::from_mode(0o755))
+        .unwrap();
+    settle(&scratch.path("source"));
+    let ran = scratch.pull(false, "source", "destination/pulled", ("ss-p", "ds-p"));
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert_eq!(
+        mode(&scratch.path("destination/pulled")),
+        made_with(&scratch, "expect-pulled", 0o700)
+    );
 }

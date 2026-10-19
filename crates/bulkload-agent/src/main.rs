@@ -603,15 +603,16 @@ BOUNDARIES:
     priority_escalate_after=SECONDS, and priority_escalations,
     priority_escalated_ns, priority_escalated_threads and
     priority_escalation_failures record it.
-    copy/pull make an absent DEST themselves (mode 0755 under the umask, as
-    estate-carry-files makes its destinations) when its parent exists, once
-    the source's root opened, and never a parent:
-    DESTINATION_PARENT_MISSING (#232; R2.2, the run writes where it was
-    asked and nowhere else); a root made for a session whose own setup then
-    refuses is removed while still empty. A symlink at DEST, or a regular or
+    copy/pull make an absent DEST themselves when its parent exists, once
+    the source's root opened, and never a parent (DESTINATION_PARENT_MISSING;
+    #232; R2.2, the run writes where it was asked and nowhere else). copy
+    gives the new root the source root's permission bits, pull (whose wire
+    carries no root row) 0700, never wider, and the umask narrows either; a
+    root made for a session whose own setup then refuses is removed while
+    still empty. A symlink at DEST, or a regular or
     special file where a tree would land, is DESTINATION_KIND_MISMATCH, as
     is a directory at DEST under --file and a symlink where a regular file
-    lands; no link at DEST is followed.
+    lands; no link at DEST is followed, a trailing / on DEST included.
     --file (#232): SOURCE is one file and DEST the file it lands as, in
     DEST's existing parent, under DEST's own name. Only SOURCE's parent is
     resolved: a regular file is carried byte for byte, a symlink as a
