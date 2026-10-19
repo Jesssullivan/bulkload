@@ -694,10 +694,10 @@ fn open_source_root(root: &Path, kind: RootKind) -> Result<SourceRoot> {
             })?;
             let seat =
                 crate::io::c_name(name.as_bytes()).refuse_at("transfer::open_source_root")?;
-            let stat = crate::io::sys::fstatat_nofollow(&fd, &seat).map_err(|error| {
+            let found = crate::io::sys::fstatat_nofollow(&fd, &seat).map_err(|error| {
                 crate::refuse::source_root(&error, "transfer::open_source_root")
             })?;
-            if !stat.is_file() {
+            if !found.is_file() {
                 return Err(BulkloadRefusal::SourceRootKindMismatch);
             }
             Ok(SourceRoot {
@@ -730,10 +730,10 @@ impl Landing {
     /// in its parent and sweeps only its own tagged temporaries there, so a
     /// state beside the file (`~/.zshrc` beside a state under `~`) is apart.
     fn root(&self) -> PathBuf {
-        match &self.leaf {
-            None => self.dir.clone(),
-            Some(leaf) => self.dir.join(crate::walk::rel_path(leaf)),
-        }
+        self.leaf.as_ref().map_or_else(
+            || self.dir.clone(),
+            |leaf| self.dir.join(crate::walk::rel_path(leaf)),
+        )
     }
 }
 
@@ -809,6 +809,15 @@ fn resolve_destination(destination: &Path, kind: RootKind) -> Result<Landing> {
     }
 }
 
+/// The source's `Start`: its authority. Anything else first is a protocol
+/// violation.
+fn read_start<R: Read>(input: &mut R, hand: Option<&HandIn>) -> Result<Vec<u8>> {
+    let Wire::Frame(Frame::Control(Control::Start { authority })) = read_wire(input, hand)? else {
+        return Err(BulkloadRefusal::ProtocolStateViolation);
+    };
+    Ok(authority)
+}
+
 /// Make an absent destination tree root (#232), mode 0700, in its existing
 /// parent. Only the root the operator named, never a parent (R2.2: the run
 /// writes where it was asked and nowhere else), and only once the S2 checks
@@ -862,10 +871,11 @@ pub fn copy_roots_apart(
     )
 }
 
-/// [`copy_roots_apart`] for a root of `kind` (#232): with
-/// [`RootKind::File`] the source is one regular file and DEST the file it
-/// lands as, so the check holds the two files apart (a `copy` of a file
-/// onto itself is an overlap) and each state apart from each file.
+/// [`copy_roots_apart`] for a root of `kind` (#232).
+///
+/// With [`RootKind::File`] the source is one regular file and DEST the
+/// file it lands as, so the check holds the two files apart (a `copy` of a
+/// file onto itself is an overlap) and each state apart from each file.
 ///
 /// # Errors
 /// As [`copy_roots_apart`], plus the root refusals of
@@ -998,8 +1008,9 @@ pub fn copy_with(
     )
 }
 
-/// [`copy`] of a root of `kind` (#232), in the process's [`sqlite_mode`]:
-/// with [`RootKind::File`], `source` is one regular file and `destination`
+/// [`copy`] of a root of `kind` (#232), in the process's [`sqlite_mode`].
+///
+/// With [`RootKind::File`], `source` is one regular file and `destination`
 /// the file it lands as, byte for byte, in an existing parent.
 ///
 /// # Errors
@@ -2171,9 +2182,11 @@ pub fn serve<R: Read + Send + 'static, W: Write>(input: R, output: &mut W) -> Re
     serve_session(input, output, None, RootKind::Tree)
 }
 
-/// [`serve`] of a root of `kind` (#232): `serve --file` serves the one
-/// regular file the session's `Open` names, beneath its parent directory,
-/// and refuses any other kind of root `SOURCE_ROOT_KIND_MISMATCH`.
+/// [`serve`] of a root of `kind` (#232).
+///
+/// `serve --file` serves the one regular file the session's `Open` names,
+/// beneath its parent directory, and refuses any other kind of root
+/// `SOURCE_ROOT_KIND_MISMATCH`.
 ///
 /// # Errors
 /// As [`serve`], plus the root refusals (`SOURCE_ROOT_*`).
@@ -5280,10 +5293,11 @@ pub fn receive_with<R: Read, W: Write>(
     )
 }
 
-/// [`receive`] of a root of `kind` (#232), in the process's
-/// [`sqlite_mode`]: with [`RootKind::File`] the remote `serve --file`
-/// offers one regular file, landed as `destination` (a file path) in its
-/// existing parent, under `destination`'s own name.
+/// [`receive`] of a root of `kind` (#232), in the process's [`sqlite_mode`].
+///
+/// With [`RootKind::File`] the remote `serve --file` offers one regular
+/// file, landed as `destination` (a file path) in its existing parent,
+/// under `destination`'s own name.
 ///
 /// # Errors
 /// As [`receive`], plus the root refusals (`DESTINATION_*`,
@@ -5332,11 +5346,6 @@ fn receive_session<R: Read, W: Write>(
     if overlaps(&canonical_state(destination_state)?, &destination_root) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
-    // #232: an absent tree root is made now, the checks passed and nothing
-    // else written yet.
-    if landing.create {
-        make_destination_root(&landing.dir)?;
-    }
     write_control(
         output,
         &Control::Open {
@@ -5358,6 +5367,17 @@ fn receive_session<R: Read, W: Write>(
             bytes: CREDIT_WINDOW,
         },
     )?;
+    // #232: an absent tree root is made only once the source's `Start`
+    // says its root opened as the kind asked for, so a session the source
+    // refuses (a missing root, the wrong kind) leaves no empty DEST behind
+    // (R4). It costs the first run into an absent root one round trip.
+    let early_start = if landing.create {
+        let authority = read_start(input, hand.as_ref())?;
+        make_destination_root(&landing.dir)?;
+        Some(authority)
+    } else {
+        None
+    };
     let store = Store::open(destination_state)?;
     let mut target = Destination::open(&landing.open, &store)?;
     if overlaps(store.root(), &destination_root) {
@@ -5379,10 +5399,9 @@ fn receive_session<R: Read, W: Write>(
         (true, false) => NewPath::Manifest,
         (true, true) => NewPath::StreamLocal,
     };
-    let Wire::Frame(Frame::Control(Control::Start { authority })) =
-        read_wire(input, hand.as_ref())?
-    else {
-        return Err(BulkloadRefusal::ProtocolStateViolation);
+    let authority = match early_start {
+        Some(authority) => authority,
+        None => read_start(input, hand.as_ref())?,
     };
     // The delta lever reads the source's ledger, which the source half
     // opened before `Start`. A ledger this side cannot open leaves the
@@ -5468,7 +5487,7 @@ fn receive_session<R: Read, W: Write>(
             batch: DirectoryBatch::default(),
             batched: HashMap::new(),
             sqlite,
-            leaf: landing.leaf.clone(),
+            leaf: landing.leaf,
             sidecars: Vec::new(),
             snapshot_bases: HashSet::new(),
         };
