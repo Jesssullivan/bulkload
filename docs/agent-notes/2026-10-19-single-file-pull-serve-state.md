@@ -185,6 +185,16 @@ fixed and the branch data-safe, with two small defects, fixed in
   source root's permission bits (`& 0o777`), never wider, narrowed by the
   umask; `pull` makes it 0700, since wire v6 carries no root row.
 
+Commits: `8d9ac60` (A, B), `1ed52f6` (clippy `too_many_arguments`: the
+root's kind and source mode as one pair; rustfmt). Receipt on `1ed52f6`,
+honey, targeted only as the coordinator asked (a production build was
+waiting; `nice -n 19`, 4 build jobs, 4 test threads, one test run): fmt
+ok; `cargo clippy -p bulkload-agent -p bulkload-proto --all-targets
+--locked -D warnings` ok; `tests/single_file_copy.rs` 17 passed (A:
+`a_trailing_slash_never_follows_a_link_at_dest`; B:
+`an_absent_root_takes_the_source_mode_never_wider`). The full merge gate is
+the coordinator's.
+
 Filed, not fixed (coordinator): #287 (C: a `copy --file` closure record is
 keyed by a symlink leaf's target) and #288 (D: cross-verb ownership
 flip-flop; the review's repro was not in this lane's hands, so the issue
