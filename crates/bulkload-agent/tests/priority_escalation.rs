@@ -23,7 +23,9 @@
 use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 fn counters(stderr: &str) -> (String, BTreeMap<String, String>) {
     let line = stderr
