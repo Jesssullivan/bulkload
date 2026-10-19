@@ -703,9 +703,13 @@ fn open_source_root(root: &Path, kind: RootKind) -> Result<SourceRoot> {
 
 /// Where a session lands, as the operator named it (#232).
 struct Landing {
-    /// The canonical directory the destination opens: DEST for a tree,
+    /// The canonical directory the session lands in: DEST for a tree,
     /// DEST's parent for a `--file` root.
     dir: PathBuf,
+    /// The path the destination opens, without following its last
+    /// component: DEST as the operator gave it for an existing tree (a
+    /// symlink there is refused, as before #232), else [`Landing::dir`].
+    open: PathBuf,
     /// The one name the session lands, for a `--file` root.
     leaf: Option<Vec<u8>>,
     /// A tree root that is absent: made (0700) once the S2 checks pass.
@@ -758,6 +762,7 @@ fn resolve_destination(destination: &Path, kind: RootKind) -> Result<Landing> {
             }
             Some(_) => Ok(Landing {
                 dir: std::fs::canonicalize(destination).refuse_at("transfer::resolve_destination")?,
+                open: destination.to_path_buf(),
                 leaf: None,
                 create: false,
             }),
@@ -765,8 +770,10 @@ fn resolve_destination(destination: &Path, kind: RootKind) -> Result<Landing> {
                 let name = destination
                     .file_name()
                     .ok_or(BulkloadRefusal::PathNotAbsolute)?;
+                let dir = canonical_parent()?.join(name);
                 Ok(Landing {
-                    dir: canonical_parent()?.join(name),
+                    open: dir.clone(),
+                    dir,
                     leaf: None,
                     create: true,
                 })
@@ -779,8 +786,13 @@ fn resolve_destination(destination: &Path, kind: RootKind) -> Result<Landing> {
             if found.is_some_and(|meta| meta.is_dir()) {
                 return Err(BulkloadRefusal::DestinationKindMismatch);
             }
+            // DEST's parent is an earlier component of the path the
+            // operator named, followed like any other; DEST itself is
+            // opened beneath it without following, as a seat in a tree.
+            let dir = canonical_parent()?;
             Ok(Landing {
-                dir: canonical_parent()?,
+                open: dir.clone(),
+                dir,
                 leaf: Some(name.as_bytes().to_vec()),
                 create: false,
             })
@@ -5332,7 +5344,7 @@ fn receive_session<R: Read, W: Write>(
         },
     )?;
     let store = Store::open(destination_state)?;
-    let mut target = Destination::open(&landing.dir, &store)?;
+    let mut target = Destination::open(&landing.open, &store)?;
     if overlaps(store.root(), &destination_root) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }

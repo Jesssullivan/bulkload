@@ -1350,9 +1350,9 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             match command {
                 "copy" if args.len() == 4 => {
                     // WP3 PR 4: the session's outcomes are closure rows.
-                    copy_recorded(kind, path(0)?, path(1)?, path(2)?, path(3)?)
+                    copy_recorded_kind(kind, path(0)?, path(1)?, path(2)?, path(3)?)
                 }
-                "pull" if (5..=7).contains(&args.len()) => pull_recorded(kind, args),
+                "pull" if (5..=7).contains(&args.len()) => pull_recorded_kind(kind, args),
                 _ => Err(BulkloadRefusal::RequiredFieldMissing),
             }
         }
@@ -2313,7 +2313,18 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
 // canonical SOURCE and DEST so a rerun spelled another way names the same
 // rows. S2 (review finding 1): the overlap decision is made before the
 // record's first write, so a refused overlap writes nothing anywhere.
-fn copy_recorded(
+fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &Path) -> Result<()> {
+    copy_recorded_kind(
+        bulkload_agent::transfer::RootKind::Tree,
+        source,
+        dest,
+        source_state,
+        dest_state,
+    )
+}
+
+// #232: `copy_recorded` of a root of `kind` (`copy --file`).
+fn copy_recorded_kind(
     kind: bulkload_agent::transfer::RootKind,
     source: &Path,
     dest: &Path,
@@ -2343,7 +2354,15 @@ fn copy_recorded(
 // WP3 PR 4: a pull session's outcomes are closure rows, keyed on
 // HOST:SOURCE and the canonical DEST, recorded in DEST_STATE around the
 // session (`pull_command`, whose ssh child the S2 registry pins).
-fn pull_recorded(kind: bulkload_agent::transfer::RootKind, args: &[std::ffi::OsString]) -> Result<()> {
+fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
+    pull_recorded_kind(bulkload_agent::transfer::RootKind::Tree, args)
+}
+
+// #232: `pull_recorded` of a root of `kind` (`pull --file`).
+fn pull_recorded_kind(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<()> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2395,7 +2414,7 @@ fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
             // parser requires the one with the other.
             args.extend(self.remote.iter().cloned());
             args.extend(self.config.iter().cloned());
-            pull_command(&args)
+            pull_command(bulkload_agent::transfer::RootKind::Tree, &args)
         }
     }
     let mut options = CarryOptions::default();

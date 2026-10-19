@@ -42,8 +42,23 @@ impl Scratch {
     /// `copy [--file] SOURCE DEST SOURCE_STATE DEST_STATE`, every path
     /// relative to the scratch.
     fn copy(&self, file: bool, source: &str, dest: &str, states: (&str, &str)) -> Ran {
+        self.copy_with(&[], file, source, dest, states)
+    }
+
+    /// [`Scratch::copy`] with global flags before the verb.
+    fn copy_with(
+        &self,
+        globals: &[&str],
+        file: bool,
+        source: &str,
+        dest: &str,
+        states: (&str, &str),
+    ) -> Ran {
         let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
-        command.arg("--min-free-percent=0").arg("copy");
+        command
+            .arg("--min-free-percent=0")
+            .args(globals)
+            .arg("copy");
         if file {
             command.arg("--file");
         }
@@ -326,4 +341,79 @@ fn serve_makes_the_one_missing_level_of_its_state_parent() {
     assert!(ran.stderr.contains("refused: IO (errno 2)"), "{}", ran.stderr);
     assert!(!scratch.path("states/a").exists());
     assert!(!scratch.path("destination2").exists());
+}
+
+// A symlink at DEST is refused, as before #232: the destination root is
+// opened by the path given, without following it, and nothing lands at
+// the symlink's target.
+#[test]
+fn a_symlinked_destination_root_is_still_refused() {
+    let scratch = Scratch::new("symlinkdest");
+    std::fs::write(scratch.path("source/a.txt"), b"a\n").unwrap();
+    std::fs::create_dir(scratch.path("destination/real")).unwrap();
+    std::os::unix::fs::symlink("real", scratch.path("destination/link")).unwrap();
+    settle(&scratch.path("source"));
+    let ran = scratch.copy(false, "source", "destination/link", ("ss", "ds"));
+    assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert_eq!(names(&scratch.path("destination/real")), Vec::<String>::new());
+}
+
+// #218 under `--file` (#232): a live WAL store is keyed by its `-wal` too,
+// though the single-seat walk lists nothing else. A commit that writes
+// only the `-wal` (no checkpoint) changes the key, so the rerun takes a
+// new snapshot and lands the new row; keyed by the main file alone, it
+// would reuse the stale one.
+#[test]
+fn copy_file_keys_a_live_wal_store_by_its_wal() {
+    use std::os::unix::fs::MetadataExt as _;
+    let scratch = Scratch::new("walkey");
+    // As root the snapshot mode refuses SQLITE_SOURCE_AS_ROOT (OI-1003-Q76).
+    if std::fs::metadata(scratch.path("source")).unwrap().uid() == 0 {
+        return;
+    }
+    let db = scratch.path("source/app.db");
+    let writer = rusqlite::Connection::open(&db).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(k INTEGER PRIMARY KEY, v BLOB NOT NULL);
+             INSERT INTO t(v) VALUES (randomblob(64)), (randomblob(64));",
+        )
+        .unwrap();
+    assert!(scratch.path("source/app.db-wal").is_file());
+    let count = |path: &Path| -> i64 {
+        let reader = rusqlite::Connection::open_with_flags(
+            format!("file:{}?immutable=1", path.display()),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .unwrap();
+        reader
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap()
+    };
+    let main_before = std::fs::symlink_metadata(&db).unwrap();
+    settle(&scratch.path("source"));
+    let snapshot = ["--sqlite=snapshot"];
+    let ran = scratch.copy_with(&snapshot, true, "source/app.db", "destination/app.db", ("ss", "ds"));
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert_eq!(counter(&ran.stdout, "sqlite_snapshots"), 1, "{}", ran.stdout);
+    assert_eq!(count(&scratch.path("destination/app.db")), 2);
+    // Nothing but the database lands: its sidecars are never offered.
+    assert_eq!(names(&scratch.path("destination")), ["app.db"]);
+    writer
+        .execute_batch("INSERT INTO t(v) VALUES (randomblob(64));")
+        .unwrap();
+    // The commit went to the `-wal` only.
+    let main_after = std::fs::symlink_metadata(&db).unwrap();
+    assert_eq!(
+        (main_before.ino(), main_before.size(), main_before.mtime_nsec(), main_before.mtime()),
+        (main_after.ino(), main_after.size(), main_after.mtime_nsec(), main_after.mtime())
+    );
+    settle(&scratch.path("source"));
+    settle(&scratch.path("destination"));
+    let ran = scratch.copy_with(&snapshot, true, "source/app.db", "destination/app.db", ("ss", "ds"));
+    assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
+    assert_eq!(counter(&ran.stdout, "sqlite_snapshots"), 1, "{}", ran.stdout);
+    assert_eq!(count(&scratch.path("destination/app.db")), 3);
+    drop(writer);
 }
