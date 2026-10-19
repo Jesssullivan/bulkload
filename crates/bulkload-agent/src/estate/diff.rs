@@ -415,7 +415,7 @@ fn item_row(
         source,
         base: base.as_ref().map(Staged::get),
     };
-    let row = if item.workspace.is_some() {
+    let mut row = if item.workspace.is_some() {
         converge::diff::workspace(
             &staged,
             &target,
@@ -432,9 +432,53 @@ fn item_row(
             &options.activate_origin,
         )?
     };
+    if let (Some(suffix), Some(workspace)) = (options.beside.as_deref(), item.workspace.as_deref())
+    {
+        retired_beside(&mut row, states, (identity, source), workspace, suffix)?;
+    }
     let journal = journal_path(Path::new(""), identity, source, &captured.digest);
     let journaled = states.iter().any(|state| state.join(&journal).is_file());
     Ok((row, journaled, retained_omissions(corpus, &captured.bundle)))
+}
+
+// Gap C12: an absent beside path this item's last `.beside` record says it
+// landed was folded or retired by the operator's agent, and `estate-apply`
+// never lays it down again (`GIT_DESTINATION_MODIFIED`): the row says
+// `beside=retired:<path>`, never `landing`.
+fn retired_beside(
+    row: &mut converge::diff::ItemRow,
+    states: &[PathBuf],
+    (identity, source): (&str, &str),
+    workspace: &Path,
+    suffix: &str,
+) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let beside = git_carry::beside::path(workspace, suffix);
+    let Some(path) = states
+        .iter()
+        .rev()
+        .map(|state| super::beside_record_path(state, identity, source))
+        .find(|path| path.is_file())
+    else {
+        return Ok(());
+    };
+    let landed = git_carry::beside::read_record(&path)?.is_some_and(|record| {
+        record.item == identity
+            && record.path == beside.as_os_str().as_bytes()
+            && record.capture != [0; 32]
+    });
+    if !landed {
+        return Ok(());
+    }
+    for component in &mut row.components {
+        for verdict in ["landing", "ignore-policy-conflict"] {
+            if let Some(rest) = component.strip_prefix(&format!("beside={verdict}:")) {
+                *component = format!("beside=retired:{rest}");
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn write_row(

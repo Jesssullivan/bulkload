@@ -19,8 +19,12 @@
 //!    index entries, a standalone item's `info/exclude`, and every carried
 //!    seat's kind, mode and content (each print taken before and after its
 //!    read must agree; the ledger's racy instant is taken before the first
-//!    read). Any difference is `GIT_DESTINATION_DIVERGED`, and nothing is
-//!    written;
+//!    read). For a beside checkout (`--beside`, gap C12) the stash too
+//!    (each entry's commit, newest first), and a bulkload hand-off block
+//!    at byte 0 of `AGENTS.md` or `CLAUDE.md` above the captured bytes,
+//!    sealed as estate-handoff renders it, is the one difference allowed
+//!    ([`super::handoff::declared_blocks`]). Any difference is
+//!    `GIT_DESTINATION_DIVERGED`, and nothing is written;
 //! 5. under the destination lock: still no workspace ledger (another apply
 //!    may have landed or adopted it since; `GIT_DESTINATION_OCCUPIED`), any
 //!    pending ref intent settled, the proved prints checked again
@@ -442,7 +446,13 @@ pub(in crate::git_carry) fn prove_adoptable(
     if standalone && exclude != exclude_digest(&meta.exclude(&scratch.repo)?) {
         differs.push("exclude".to_owned());
     }
-    let sides = sides(&scratch.repo, meta)?;
+    let mut sides = sides(&scratch.repo, meta)?;
+    // Gap C12 (A-115): a beside checkout bulkload did not land may differ
+    // from the capture by a bulkload hand-off block at byte 0 of a target,
+    // and by nothing else.
+    if landing.beside {
+        super::handoff::declared_blocks(worktree, &mut sides)?;
+    }
     let mut objects = BatchObjects::new(&scratch.repo)?;
     let mut prints = Vec::with_capacity(sides.len());
     let mut seats = Vec::new();
@@ -717,6 +727,7 @@ pub(super) fn workspace(
         Found::Equal(ledger) => *ledger,
         Found::Differs(_) => return Err(BulkloadRefusal::GitDestinationDiverged),
     };
+    let declared = beside_stash_and_blocks(worktree, &scratch, (source, landing.beside))?;
     #[cfg(test)]
     super::super::mid_pass::fire(worktree, super::super::mid_pass::Stage::AdoptBeforeLock);
     let _lock = landed::lock(&place.common, source)?;
@@ -787,7 +798,32 @@ pub(super) fn workspace(
     fault_point!(EstateAdoptAfterLedger);
     custody.count("adopted");
     custody.add("adopted-seats", seats);
+    custody.add("beside-handoff-block", declared);
     Ok(Applied::adopted(&custody))
+}
+
+// Gap C12 (A-115): a beside checkout bulkload did not land is adopted only
+// when its stash is the capture's too (each entry's commit, newest first),
+// else `GIT_DESTINATION_DIVERGED`; its proof allowed a hand-off block at
+// byte 0 of a target, counted here (`beside-handoff-block`). Read-only.
+fn beside_stash_and_blocks(
+    worktree: &Path,
+    scratch: &Scratch,
+    (source, beside): (&str, bool),
+) -> Result<u64> {
+    if !beside {
+        return Ok(0);
+    }
+    let (carried, _) = native_refs::carried_stash(&scratch.repo, source, &scratch.instance)?;
+    let held = native_refs::stash_reflog(worktree)?;
+    if !carried
+        .iter()
+        .map(|entry| &entry.oid)
+        .eq(held.iter().map(|entry| &entry.oid))
+    {
+        return Err(BulkloadRefusal::GitDestinationDiverged);
+    }
+    super::handoff::marked_targets(worktree)
 }
 
 // The adoption record, then (by the caller) the marker: written in the

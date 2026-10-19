@@ -847,6 +847,7 @@ fn adopt_at(staged: &super::super::StagedBundle, dest: &Path) -> Result<Applied>
         common: dest.join(".git"),
         source: "neo",
         standalone: true,
+        beside: false,
     };
     adopt::workspace(staged, &target, &adopt_landing(staged), &place)
 }

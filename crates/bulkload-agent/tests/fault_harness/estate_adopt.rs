@@ -56,6 +56,15 @@
 //! the record is written and the journal says `workspace-beside`; a second
 //! rerun is a journal no-op.
 //!
+//! `BesideConverge` (gap C12, operator ruling A-115): the `Beside` shape
+//! landed beside by a first pass, then the source moved and was captured
+//! again, and the second pass's converge of the beside checkout crashed
+//! after its intent, a seat, the index or HEAD. The destination checkout is
+//! untouched; the rerun settles the converge forward with no native ref of
+//! the destination repository stepped: the beside checkout holds the new
+//! capture, still detached, every namespace ref is at the new capture's
+//! value, and a second rerun is a journal no-op.
+//!
 //! `_exit` models a process crash only (see the harness header).
 
 use std::fs;
@@ -95,6 +104,9 @@ pub enum EstateAdopt {
     /// `Beside` crashed at `linked_added`, then the source moved and was
     /// captured again (review of #266, B1).
     BesideStale,
+    /// `Beside` landed, the source moved, and the beside converge crashed
+    /// (gap C12, A-115).
+    BesideConverge,
 }
 
 impl Scenario for EstateAdopt {
@@ -159,7 +171,10 @@ impl World {
         let world = Self {
             base: fs::canonicalize(&base).unwrap(),
             union: kind == EstateAdopt::ExcludeUnion,
-            beside: matches!(kind, EstateAdopt::Beside | EstateAdopt::BesideStale),
+            beside: matches!(
+                kind,
+                EstateAdopt::Beside | EstateAdopt::BesideStale | EstateAdopt::BesideConverge
+            ),
         };
         let src = world.base.join("src");
         fs::create_dir(&src).unwrap();
@@ -227,7 +242,10 @@ impl World {
             assert!(out.status.success());
             git(&dest, &["branch", "-D", "neo-only"]);
             git(&dest, &["branch", "sting-only", "v0"]);
-            if matches!(kind, EstateAdopt::Beside | EstateAdopt::BesideStale) {
+            if matches!(
+                kind,
+                EstateAdopt::Beside | EstateAdopt::BesideStale | EstateAdopt::BesideConverge
+            ) {
                 fs::write(dest.join("d/b.txt"), b"beta, edited at the destination\n").unwrap();
                 // Review B6: the source's HEAD is a branch the destination
                 // lacks, so an attach would create it there.
@@ -479,6 +497,10 @@ fn scenario(point: Point, nth: u64, kind: EstateAdopt) {
     }
     if kind == EstateAdopt::BesideStale {
         beside_stale(&world, &label, point, nth);
+        return;
+    }
+    if kind == EstateAdopt::BesideConverge {
+        beside_converge(&world, &label, point, nth);
         return;
     }
     if kind == EstateAdopt::Bare {
@@ -835,43 +857,138 @@ fn beside(world: &World, label: &str, point: Point, nth: u64) {
     );
 }
 
-/// The `BesideStale` row (review B1): a beside landing crashed after its
-/// worktree was added, then the source moved and was captured again. The
-/// rerun finishes the crashed landing forward (the older capture) and then
-/// refuses `GIT_DESTINATION_OCCUPIED`: the beside path holds another
-/// capture. No ref goes in, no record is written, the destination checkout
-/// is untouched, and the item is a typed refusal, never `applied-beside`.
+/// The `BesideStale` row (review B1; gap C12, A-115): a beside landing
+/// crashed after its worktree was added, then the source moved and was
+/// captured again. The rerun finishes the crashed landing forward (the
+/// older capture) and converges it to the new capture in the same pass:
+/// still detached at the (new) captured head, the destination checkout and
+/// its native refs untouched, every namespace ref at the new capture's
+/// value and recorded created, the item `applied-beside`; a second rerun
+/// is a journal no-op.
 fn beside_stale(world: &World, label: &str, point: Point, nth: u64) {
     let dst = world.dst();
     let before = checkout(&dst);
+    let native: std::collections::BTreeMap<String, String> = refs(&dst)
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("refs/neo-"))
+        .collect();
     let src = world.base.join("src");
-    let old = git(&src, &["rev-parse", "HEAD"]);
     crash(world, &format!("{}:{nth}", point.name()));
     fs::write(src.join("a.txt"), b"alpha, moved after the crash\n").unwrap();
     git(&src, &["commit", "--quiet", "-am", "moved"]);
     std::thread::sleep(std::time::Duration::from_millis(2_100));
     world.capture();
+    let wanted = wanted_refs(world);
     let rows = world.apply(true);
     assert_eq!(rows.len(), 1, "{label}");
-    assert_eq!(rows[0].0, "refused", "{label}: {rows:?}");
+    assert_eq!(rows[0].0, "workspace-beside", "{label}: {rows:?}");
+    let reason = rows[0].1.clone().unwrap_or_default();
     assert!(
-        rows[0]
-            .1
-            .as_deref()
-            .is_some_and(|reason| reason.contains("GIT_DESTINATION_OCCUPIED")),
-        "{label}: {rows:?}"
+        reason.contains("landing-recovered")
+            && reason.contains("converged")
+            && reason.contains("beside-converged=1"),
+        "{label}: {reason}"
     );
     assert_eq!(checkout(&dst), before, "{label}");
-    assert!(beside_refs(&dst).is_empty(), "{label}");
-    assert!(beside_record(world).is_none(), "{label}");
+    let now: std::collections::BTreeMap<String, String> = refs(&dst)
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("refs/neo-"))
+        .collect();
+    assert_eq!(now, native, "{label}: a native ref moved or was created");
+    assert_eq!(beside_refs(&dst), wanted, "{label}");
+    let record = beside_record(world).unwrap();
+    assert!(
+        record.pending.is_empty() && record.kept.is_empty(),
+        "{label}"
+    );
+    let created: std::collections::BTreeMap<String, String> = record.created.into_iter().collect();
+    assert_eq!(created, wanted, "{label}");
+    let beside = beside_path(world);
     assert_eq!(
-        git(&beside_path(world), &["rev-parse", "HEAD"]),
-        old,
+        fs::read(beside.join("a.txt")).unwrap(),
+        b"alpha, moved after the crash\n",
+        "{label}: the beside holds the new capture"
+    );
+    assert_eq!(
+        git(&beside, &["rev-parse", "HEAD"]),
+        git(&src, &["rev-parse", "HEAD"]),
         "{label}"
     );
     assert_eq!(
-        world.unaccounted(),
-        0,
-        "{label}: a typed refusal is accounted"
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "HEAD",
+        "{label}: detached"
+    );
+    assert_eq!(world.unaccounted(), 0, "{label}");
+    let rows = world.apply(true);
+    assert_eq!(
+        rows[0].0, "previous-workspace-beside-not-revalidated",
+        "{label}"
+    );
+}
+
+/// The `BesideConverge` rows: see the module docs.
+fn beside_converge(world: &World, label: &str, point: Point, nth: u64) {
+    let dst = world.dst();
+    let rows = world.apply(true);
+    assert_eq!(
+        rows[0].0, "workspace-beside",
+        "{label}: first pass {rows:?}"
+    );
+    let before = checkout(&dst);
+    let native: std::collections::BTreeMap<String, String> = refs(&dst)
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("refs/neo-"))
+        .collect();
+    let src = world.base.join("src");
+    fs::write(src.join("a.txt"), b"alpha, moved\n").unwrap();
+    git(&src, &["commit", "--quiet", "-am", "moved"]);
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    world.capture();
+    let wanted = wanted_refs(world);
+    crash(world, &format!("{}:{nth}", point.name()));
+    assert_eq!(checkout(&dst), before, "{label}: the destination moved");
+    let rows = world.apply(true);
+    assert_eq!(rows.len(), 1, "{label}");
+    assert_eq!(rows[0].0, "workspace-beside", "{label}: {rows:?}");
+    let reason = rows[0].1.clone().unwrap_or_default();
+    assert!(reason.contains("converged"), "{label}: {reason}");
+    assert_eq!(
+        checkout(&dst),
+        before,
+        "{label}: the rerun moved the destination"
+    );
+    let now: std::collections::BTreeMap<String, String> = refs(&dst)
+        .into_iter()
+        .filter(|(name, _)| !name.starts_with("refs/neo-"))
+        .collect();
+    assert_eq!(now, native, "{label}: a native ref moved or was created");
+    assert_eq!(beside_refs(&dst), wanted, "{label}");
+    let record = beside_record(world).unwrap();
+    assert!(
+        record.pending.is_empty() && record.kept.is_empty(),
+        "{label}"
+    );
+    let beside = beside_path(world);
+    assert_eq!(
+        fs::read(beside.join("a.txt")).unwrap(),
+        b"alpha, moved\n",
+        "{label}: the beside holds the new capture"
+    );
+    assert_eq!(
+        git(&beside, &["rev-parse", "HEAD"]),
+        git(&src, &["rev-parse", "HEAD"]),
+        "{label}"
+    );
+    assert_eq!(
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "HEAD",
+        "{label}: detached"
+    );
+    assert_eq!(world.unaccounted(), 0, "{label}");
+    let rows = world.apply(true);
+    assert_eq!(
+        rows[0].0, "previous-workspace-beside-not-revalidated",
+        "{label}"
     );
 }
