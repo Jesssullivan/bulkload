@@ -714,7 +714,10 @@ fn a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed() {
     assert_eq!(
         codes,
         [
-            ("AGENTS.md".to_owned(), "DESTINATION_KIND_MISMATCH".to_owned()),
+            (
+                "AGENTS.md".to_owned(),
+                "DESTINATION_KIND_MISMATCH".to_owned()
+            ),
             ("d".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
             ("d/inner.txt".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
         ]
