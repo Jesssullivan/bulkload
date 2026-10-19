@@ -384,12 +384,7 @@ fn serve_makes_every_missing_parent_of_its_state_root() {
         b"a\n"
     );
     // Inside the source: S2 refuses before any level is made.
-    let ran = scratch.copy(
-        false,
-        "source",
-        "destination2",
-        ("source/x/y/state", "ds2"),
-    );
+    let ran = scratch.copy(false, "source", "destination2", ("source/x/y/state", "ds2"));
     assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
     assert!(
         ran.stderr.contains("refused: SNAPSHOT_ROOTS_OVERLAP"),

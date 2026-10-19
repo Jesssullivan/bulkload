@@ -261,10 +261,20 @@ fn carry_over_ssh(name: &str, before_move: impl FnOnce(&Path)) {
         Some(&bin),
     );
     let both = format!("{}\n{}", moved.stdout, moved.stderr);
-    assert!(moved.stdout.contains("estate-move phase=pull outcome=ok"), "{both}");
-    assert!(moved.stdout.contains("estate-move phase=carry outcome=ok"), "{both}");
+    assert!(
+        moved.stdout.contains("estate-move phase=pull outcome=ok"),
+        "{both}"
+    );
+    assert!(
+        moved.stdout.contains("estate-move phase=carry outcome=ok"),
+        "{both}"
+    );
     assert!(!both.contains("TRANSPORT_LOST"), "{both}");
-    assert_eq!(fs::read(dst.join("broken/b.txt")).unwrap(), b"b\n", "{both}");
+    assert_eq!(
+        fs::read(dst.join("broken/b.txt")).unwrap(),
+        b"b\n",
+        "{both}"
+    );
     // Each `serve` state is where the destination half named it, private.
     for level in ["serve", "serve/carry", "serve/corpus"] {
         assert_eq!(mode(&source_state.join(level)), 0o700, "{level}\n{both}");
