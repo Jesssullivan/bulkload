@@ -3559,11 +3559,19 @@ mod tests {
         let handle = File::open(std::env::temp_dir()).refuse_at(at)?;
         let device = handle.metadata().refuse_at(at)?.dev();
         let (major, minor) = (libc::major(device), libc::minor(device));
+        // The fixture's root mount is another device than the temporary
+        // directory's: a host whose temporary directory is itself 253:0
+        // (honey's `/var/tmp`, 2026-10-19) would otherwise match it first.
+        let root = if (major, minor) == (253, 0) {
+            (253, 1)
+        } else {
+            (253, 0)
+        };
         let line = |numbers: (u32, u32), fstype: &str| {
             format!(
-                "22 1 253:0 / / rw shared:1 - xfs /dev/mapper/root rw\n\
+                "22 1 {}:{} / / rw shared:1 - xfs /dev/mapper/root rw\n\
                  41 22 {}:{} / /mnt rw shared:9 - {fstype} /dev/sdz1 rw\n",
-                numbers.0, numbers.1
+                root.0, root.1, numbers.0, numbers.1
             )
         };
         let answer = |mountinfo: String| {
