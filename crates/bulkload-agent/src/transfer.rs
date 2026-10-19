@@ -6576,8 +6576,7 @@ impl<W: Write> Inbound<'_, W> {
         // capture, which therefore never costs a source read again.
         match outcome {
             Ok(()) => {
-                self.pending_held
-                    .insert(corrupt.unwrap_or(rel_path), entry);
+                self.pending_held.insert(corrupt.unwrap_or(rel_path), entry);
             }
             Err(refusal) => {
                 if corrupt.is_some() {

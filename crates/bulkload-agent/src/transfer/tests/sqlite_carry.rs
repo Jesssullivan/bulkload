@@ -1196,9 +1196,7 @@ fn p82_a_corrupt_store_is_carried_beside_its_path_and_marked_corrupt() {
                     OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
                 )
                 .unwrap()
-                .query_row("PRAGMA integrity_check", [], |row| {
-                    row.get::<_, String>(0)
-                });
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0));
                 assert!(
                     !matches!(check.as_deref(), Ok("ok")),
                     "{damage:?}: marked corrupt for a reason: {check:?}"
