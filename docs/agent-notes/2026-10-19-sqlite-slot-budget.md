@@ -118,3 +118,40 @@ alive") rules out; every later wait was on files.
   both ends, is still open).
 - The fault harness has no row for the oversize or chunked paths (unit and
   integration tests only).
+
+## 2026-10-19: merge of main and the adversarial review of #278
+
+Merge: signed merge commit `68546a61` of origin/main `9854236` (#281, #282);
+one doc-only conflict in `closure.rs`, both sentences kept. #281's
+`638ef089` fixed the ext-magic fixture this note's host section names.
+
+Review (PR comment, coordinator seat, at `42c9d99a`): source side safe;
+destination and closure not yet. Fixed on this branch, each with a
+regression test, in the commit after the merge:
+
+| Item | Fix | Test |
+|---|---|---|
+| 1 (high) could not check recorded as corrupt | `verify_received` lets `SQLite` judge first: `Corrupt` only for `SQLITE_CORRUPT`/`SQLITE_NOTADB` or rows not `ok`; any other open, prepare or step failure is `SQLITE_INTEGRITY_CHECK_FAILED`; a sound file whose header is not a snapshot's is refused | `a_check_that_could_not_run_is_refused_not_corrupt`, `a_sound_store_whose_check_cannot_run_is_refused_not_carried_corrupt` (545-byte root) |
+| 2 (med-high) sidecar follows a plain file's refusal | follows only a base proven a SQLite seat: announced by `SqliteSnapshot`, or refused with `SQLITE_BACKUP_FAILED`, `SQLITE_INTEGRITY_CHECK_FAILED`, `SQLITE_SOURCE_NOT_OWNER`, `SQLITE_SOURCE_AS_ROOT` or `SQLITE_STATE_CHANGED` | `a_file_named_like_a_sidecar_beside_a_refused_plain_file_keeps_its_own_refusal`; P83 split |
+| 3 (med) changed corrupt store | outcomes of the beside file are the database's (`SqliteOutcomes::besides`); second name `<db>.corrupt-<YYYYMMDD>-<HHMMSS>.<ns>`; same bytes adopted by content; held check looks at both names | `a_corrupt_store_changed_on_the_same_day_lands_beside_its_first_carry`, `a_failed_corrupt_carry_is_one_refusal_under_its_database` |
+| 4 (med) oversize queueing, restarts | oversize slots taken at once, several at a time, each bounded by the floor; slot wait its own; carry budget is the wall plus at most 4 restarts before half a pass; oversize wall base + 3 passes at 32 MiB/s; `sqlite-backup-restarts` on stderr | `oversize_slots_never_queue_behind_one_another` (review probe), `a_store_restarted_late_in_each_pass_is_given_more_passes` |
+| 5 (low-med) wall unbounded | parse 1..=1800; cap applied after `.max(base)`; `checked_add` deadline | flags test, `a_slot_wait_never_overflows_the_clock` |
+| 6 (low) | sidecar check after the sound/corrupt decision; raw path only when settled, identity checked after every read (and the reader bounded to the announced size); explicit defaults not forwarded; extended busy codes retried | `a_corrupt_snapshot_lands_beside_whatever_appeared_at_its_path`, `a_raw_corrupt_read_rewritten_under_it_is_refused`, flags test, `extended_busy_codes_are_waited_out` |
+
+Gaps left by the review:
+
+- Item 4, not fixable in code under OI-1003-Q16: a store committed to more
+  often than one backup pass takes can never finish, since each commit
+  restarts the backup from page 1 and Q16 releases the read lock between
+  steps. It now stops after four early restarts with `BUDGET_EXCEEDED`
+  and prints its restart count. Holding one read transaction across the
+  steps (in WAL mode it does not block writers, only checkpoints past it)
+  would finish it; that changes Q16's reading and is the operator's call.
+- Item 2: a database refused before it was announced with a code any file
+  may get (`BUDGET_EXCEEDED` at the source, `DESTINATION_OCCUPIED` at its
+  decision) is not proven a database, so its sidecars stay refused by
+  name (one row each, as before this lane). Closing that needs a typed
+  code for a database's budget refusal.
+- Item 3: a store that is changed, then only touched, lands its touched
+  copy under a new timed name (reuse by content looks at the dated name
+  and the row's own timed name only).

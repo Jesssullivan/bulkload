@@ -620,35 +620,50 @@ BOUNDARIES:
     4G; a whole number with an optional K, M, G or T) and never past the
     --min-free-percent floor of that filesystem (BUDGET_EXCEEDED). A store
     whose main file and -wal exceed that budget is not refused for it
-    (A-115, chunked snapshot): it takes the one oversize slot, bounded by
-    the floor alone, and its snapshot is cut into fixed chunks of whole
-    pages; the slot file is the whole snapshot, since the backup API
-    writes a database no byte of which is final before its last step. One
-    backup takes at most --sqlite-carry-wall=SECONDS on the clock (default
-    30), more for a store over the budget in proportion to its size, at
-    most 30 minutes; a step that meets another connection's lock is tried
-    again with a bounded backoff inside that wall, holding no lock of its
-    own, and is refused SQLITE_STATE_CHANGED only when the wall is spent.
-    pull forwards both flags to the remote serve. A file without the SQLite
+    (A-115, chunked snapshot): it takes an oversize slot at once, several
+    at a time, each bounded by the floor alone, and a snapshot over 4 GiB
+    is cut into fixed chunks of whole pages; the slot file is the whole
+    snapshot, since the backup API writes a database no byte of which is
+    final before its last step. The wait for budget room is its own (as
+    long as the base wall) and never counts against the backup's wall. One
+    backup takes at most --sqlite-carry-wall=SECONDS on the clock (1 to
+    1800, default 30), a store over the budget three more passes at
+    32 MiB/s, never past 30 minutes; a step that meets another
+    connection's lock (SQLITE_BUSY_RECOVERY among them) is tried again
+    with a bounded backoff inside that wall, holding no lock of its own,
+    and is refused SQLITE_STATE_CHANGED only when the wall is spent. A
+    commit restarts a backup from page 1: restarts late in a pass are
+    allowed until the wall, but more than four before half a pass refuse
+    BUDGET_EXCEEDED, and a backup that restarted prints
+    sqlite-backup-restarts PATH restarts=N wall_s=N outcome=... on stderr.
+    pull forwards both flags to the remote serve when they are not at
+    their defaults. A file without the SQLite
     magic beside a -wal that holds frames (an encrypted store) is refused
     SQLITE_STATE_CHANGED, never carried raw. An unchanged store is reused with nothing opened: its key is its
     row and its -wal's identity. A -wal, -shm or -journal beside a database
     (a Git ref or reflog so named aside) is never carried: it is covered when its database was carried as a
-    snapshot, follows its database's one refusal when that was refused
-    (one refusal in closure, not one per file), and is refused
-    SQLITE_STATE_CHANGED otherwise. A changed store
+    snapshot, follows its database's one refusal when that database was
+    refused and is proven a SQLite seat (announced as a snapshot, or
+    refused with a code only a database gets; one refusal in closure, not
+    one per file), and is refused SQLITE_STATE_CHANGED otherwise. A changed store
     supersedes its own older snapshot output through the same exchange
     (OI-1003-Q146) only when no -wal, -journal or -shm sits beside the
     path here, checked at the decision and again just before the exchange;
     a path with one beside it, or holding a file this store did not land
     or that was touched since, is refused DESTINATION_OCCUPIED and left as
     it is. A store whose snapshot fails integrity_check, or whose backup
-    met corruption beside no -wal with frames (its main file read raw), is
-    carried as a plain file beside its path, <db>.corrupt-<YYYYMMDD> (the
-    date the source file was last modified, UTC), never installed as a
-    database, and recorded carried-corrupt (C14, RUL-14; the former
-    abandon default of OI-1003-Q148 is withdrawn); an unchanged rerun finds
-    it held and reads nothing. Such a backup beside a -wal with frames
+    met corruption beside no -wal with frames (its settled main file read
+    raw, refused SOURCE_CHANGED_AFTER_SNAPSHOT if it moves under the
+    read), is carried as a plain file beside its path,
+    <db>.corrupt-<YYYYMMDD> (the date the source file was last modified,
+    UTC), or <db>.corrupt-<YYYYMMDD>-<HHMMSS>.<ns> when the first holds
+    other bytes, a file holding the same bytes being adopted instead; never
+    installed as a database, and recorded carried-corrupt (C14, RUL-14; the
+    former abandon default of OI-1003-Q148 is withdrawn); an unchanged
+    rerun finds it held and reads nothing. Only SQLite's own verdict
+    (SQLITE_CORRUPT, SQLITE_NOTADB, integrity_check not ok) marks a store
+    corrupt; a check that could not run is refused
+    SQLITE_INTEGRITY_CHECK_FAILED. Such a backup beside a -wal with frames
     stays refused SQLITE_BACKUP_FAILED, pending review.
     The default stays --sqlite=refuse (OI-1003-Q147): a pull that must
     carry databases passes --sqlite=snapshot.

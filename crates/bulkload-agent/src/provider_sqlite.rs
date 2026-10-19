@@ -231,9 +231,13 @@ fn carry_steps(source: &Path) -> (i32, Option<StepHook>) {
 enum StepBudget {
     /// At most this many steps, restarts included (the provider verbs).
     Fixed(u32),
-    /// A carry snapshot (#218): `max(4, ceil(pages / 128) x 4)` steps,
-    /// restarts included, and at most `wall` on the clock (engineering
-    /// defaults, design D9; unruled).
+    /// A carry snapshot (#218): at most `wall` on the clock, and at most
+    /// [`MAX_EARLY_RESTARTS`] restarts that came before half a pass was
+    /// copied; restarts later in a pass are not counted (review of #278,
+    /// item 4: a live store that commits late in each long pass is given
+    /// more passes, one that commits faster than half a pass is refused
+    /// early). Engineering defaults, unruled; before the review it was
+    /// `max(4, ceil(pages / 128) x 4)` steps, restarts included.
     Carry { wall: Duration },
 }
 
@@ -348,17 +352,36 @@ const BUSY_BACKOFF: Duration = Duration::from_millis(1);
 /// The longest wait after a busy step of a carry backup.
 const BUSY_BACKOFF_MAX: Duration = Duration::from_millis(256);
 
+/// Restarts a carry backup may take before half a pass was copied, before
+/// it is refused `BUDGET_EXCEEDED` (review of #278, item 4): a store that
+/// commits faster than half a pass can never be read under OI-1003-Q16's
+/// bounded steps, so it stops early instead of reading for its whole wall.
+/// Engineering default, unruled.
+const MAX_EARLY_RESTARTS: u64 = 4;
+
+/// Whether a step's failure is another connection's lock, which a carry
+/// backup waits out (`SQLITE_BUSY`, `SQLITE_LOCKED` and their extended
+/// codes, `SQLITE_BUSY_RECOVERY` among them; review of #278, item 6). The
+/// backup step reports the primary codes as [`StepResult::Busy`] and
+/// [`StepResult::Locked`]; an extended code arrives as an error.
+const fn busy_failure(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _)
+            if matches!(failure.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+    )
+}
+
 /// Step one backup to its end within `budget`, `pages` pages a step
 /// ([`STEP_PAGES`] outside unit tests), counting what it copies.
 ///
-/// A step that meets another connection's lock (`SQLITE_BUSY`,
-/// `SQLITE_LOCKED`) copies nothing. Under a fixed budget it refuses
-/// `SQLITE_STATE_CHANGED` at once, as the `snapshot` verb documents. Under
-/// a carry budget it is tried again after [`BUSY_BACKOFF`], doubling to
-/// [`BUSY_BACKOFF_MAX`], as long as the wall has room for the wait
-/// (`source_sqlite_busy_retries`); the wall exhausted, it refuses
-/// `SQLITE_STATE_CHANGED`. A busy step counts against the wall, never
-/// against the step budget, and runs no step hook.
+/// A step that meets another connection's lock ([`busy_failure`]) copies
+/// nothing. Under a fixed budget it refuses `SQLITE_STATE_CHANGED` at
+/// once, as the `snapshot` verb documents. Under a carry budget it is tried
+/// again after [`BUSY_BACKOFF`], doubling to [`BUSY_BACKOFF_MAX`], as long
+/// as the wall has room for the wait (`source_sqlite_busy_retries`); the
+/// wall exhausted, it refuses `SQLITE_STATE_CHANGED`. A busy step counts
+/// against the wall, never against the step budget, and runs no step hook.
 fn step_all(
     source: &Connection,
     destination: &mut Connection,
@@ -372,8 +395,13 @@ fn step_all(
     let mut steps = 0_u64;
     let mut before: Option<u64> = None;
     let mut backoff = BUSY_BACKOFF;
+    let mut early_restarts = 0_u64;
     loop {
-        let step = backup.step(pages).map_err(backup_refusal)?;
+        let step = match backup.step(pages) {
+            Ok(step) => step,
+            Err(error) if busy_failure(&error) => StepResult::Busy,
+            Err(error) => return Err(backup_refusal(error)),
+        };
         if matches!(step, StepResult::Busy | StepResult::Locked) {
             // Do not spin while another process holds a lock: wait with a
             // bounded backoff, holding no lock of this backup's own, while
@@ -401,9 +429,13 @@ fn step_all(
             // A step that copied pages and left as many to go, or more,
             // began from page 1 again: another connection committed since
             // the last one.
-            Some(_) if remaining > 0 => {
+            Some(before) if remaining > 0 => {
                 stats.restarts += 1;
                 counters::bump(Counter::SourceSqliteBackupRestarts);
+                // The pass it ended had copied `total - before` pages.
+                if total.saturating_sub(before).saturating_mul(2) < total {
+                    early_restarts += 1;
+                }
                 total.saturating_sub(remaining)
             }
             Some(_) => 0,
@@ -424,12 +456,7 @@ fn step_all(
         let over = match budget {
             StepBudget::Fixed(max) => steps >= u64::from(max),
             StepBudget::Carry { wall } => {
-                steps
-                    >= total
-                        .div_ceil(pages.unsigned_abs().into())
-                        .saturating_mul(4)
-                        .max(4)
-                    || started.elapsed() > wall
+                early_restarts > MAX_EARLY_RESTARTS || started.elapsed() > wall
             }
         };
         if over {
@@ -467,25 +494,32 @@ pub fn carry_wall_base() -> Duration {
     }
 }
 
-/// Parse `--sqlite-carry-wall=SECONDS`: a whole number of seconds, at
-/// least 1.
+/// Parse `--sqlite-carry-wall=SECONDS`: a whole number of seconds, from 1
+/// to [`CARRY_WALL_MAX`]'s 1800 (review of #278, item 5: the cap holds for
+/// every wall, the flag's included).
 ///
 /// # Errors
-/// Refuses anything else `FIELD_DOMAIN_VIOLATION`.
+/// Refuses anything else `FIELD_DOMAIN_VIOLATION`, the binary's usage
+/// refusal.
 pub fn parse_carry_wall(value: &str) -> Result<Duration> {
     value
         .parse::<u64>()
         .ok()
-        .filter(|secs| *secs > 0)
+        .filter(|secs| (1..=CARRY_WALL_MAX.as_secs()).contains(secs))
         .map(Duration::from_secs)
         .ok_or(BulkloadRefusal::FieldDomainViolation)
 }
 
 /// The least source rate a store larger than the slot budget is allowed,
 /// in bytes per second (operator 2026-10-18, "Chunked snapshot", A-115;
-/// plan of record 2026-10-19, C3): its wall grows by one second per this
-/// many bytes of its main file and `-wal`. Engineering default, unruled.
+/// plan of record 2026-10-19, C3). Engineering default, unruled.
 const CARRY_FLOOR_RATE: u64 = 32 * 1024 * 1024;
+
+/// Whole passes at [`CARRY_FLOOR_RATE`] a store larger than the slot
+/// budget is given on top of the base wall (review of #278, item 4: a live
+/// store restarts its backup on a commit, so one pass is not enough).
+/// Engineering default, unruled.
+const OVERSIZE_PASSES: u64 = 3;
 
 /// The most any one carry backup may take on the clock, however large its
 /// store. OI-1003-Q16's lock stays bounded in duration: a WAL-mode source
@@ -496,19 +530,22 @@ pub(crate) const CARRY_WALL_MAX: Duration = Duration::from_mins(30);
 /// The wall clock of one carry backup of a store whose main file and
 /// `-wal` hold `bytes`, under a slot budget of `slot_budget` bytes: the
 /// process's base wall ([`carry_wall_base`]) for a store within the budget,
-/// and for a larger one (an oversize slot, A-115) the base plus one second
-/// per [`CARRY_FLOOR_RATE`] bytes, at most [`CARRY_WALL_MAX`] and never
-/// less than the base. A function of the sizes alone, so the same store
-/// gets the same wall on every run.
+/// and for a larger one (an oversize slot, A-115) the base plus
+/// [`OVERSIZE_PASSES`] passes at [`CARRY_FLOOR_RATE`]. Never less than the
+/// base, and never more than [`CARRY_WALL_MAX`], applied last (review of
+/// #278, item 5). A function of the sizes alone, so the same store gets the
+/// same wall on every run.
 #[must_use]
 pub(crate) fn carry_wall(bytes: u64, slot_budget: u64) -> Duration {
     let base = carry_wall_base();
-    if bytes <= slot_budget {
-        return base;
-    }
-    base.saturating_add(Duration::from_secs(bytes / CARRY_FLOOR_RATE))
-        .min(CARRY_WALL_MAX)
-        .max(base)
+    let wall = if bytes <= slot_budget {
+        base
+    } else {
+        base.saturating_add(Duration::from_secs(
+            (bytes / CARRY_FLOOR_RATE).saturating_mul(OVERSIZE_PASSES),
+        ))
+    };
+    wall.max(base).min(CARRY_WALL_MAX)
 }
 
 /// What one carry snapshot read, wrote and found (#218).
@@ -554,6 +591,10 @@ pub(crate) struct CarryReport {
 /// not refused. The output is not synced: it is a private, transient file
 /// the transfer reads once more and removes.
 ///
+/// Beside the outcome it returns what the read cost, refused or not
+/// ([`CarryRead`]): its source bytes, and its restarts from page 1, which
+/// the transfer reports (review of #278, item 4).
+///
 /// # Errors
 /// Refuses root, an existing output, the budget (`BUDGET_EXCEEDED`), a
 /// step still busy when the wall is exhausted (`SQLITE_STATE_CHANGED`) and
@@ -564,9 +605,12 @@ pub(crate) fn snapshot_for_carry(
     as_root: bool,
     wal_bound: u64,
     wall: Duration,
-) -> (Result<CarryReport>, u64) {
+) -> (Result<CarryReport>, CarryRead) {
     if as_root {
-        return (Err(BulkloadRefusal::SqliteSourceAsRoot), 0);
+        return (
+            Err(BulkloadRefusal::SqliteSourceAsRoot),
+            CarryRead::default(),
+        );
     }
     let footprint = Footprint::observe(source);
     let mut stats = BackupStats::default();
@@ -600,7 +644,22 @@ pub(crate) fn snapshot_for_carry(
         counters::bump(Counter::SourceSqliteSnapshots);
         counters::add(Counter::SourceSqliteFkViolations, report.fk_violations);
     }
-    (report, source_bytes)
+    (
+        report,
+        CarryRead {
+            source_bytes,
+            restarts: stats.restarts,
+        },
+    )
+}
+
+/// What one carry backup read, whether or not it finished.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CarryRead {
+    /// Source bytes read, as [`CarryReport::source_bytes`] bounds them.
+    pub source_bytes: u64,
+    /// Restarts from page 1 (`source_sqlite_backup_restarts`).
+    pub restarts: u64,
 }
 
 /// A carry snapshot's own checks, on the private copy only: journal mode
@@ -644,33 +703,47 @@ fn finish_carry(destination: Connection) -> Result<(u64, bool)> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Verified {
     /// A database in journal mode DELETE whose `integrity_check` is exactly
-    /// `ok`: published at its path.
+    /// `ok`, its page count times its page size its length: published at
+    /// its path.
     Sound,
-    /// A `SQLite` database file (its magic is there) that is not sound: a
-    /// header `SQLite` cannot read, a page count that does not match its
-    /// size, a journal mode other than DELETE, or an `integrity_check` that
-    /// is not `ok`. Carried beside its path, marked corrupt, never
-    /// installed as a database (C14, RUL-14; plan of record 2026-10-19,
-    /// C4).
+    /// A `SQLite` file whose bytes `SQLite` itself judged unsound: opening or
+    /// checking it failed `SQLITE_CORRUPT` or `SQLITE_NOTADB`, or
+    /// `integrity_check` returned anything but `ok`. Carried beside its
+    /// path, marked corrupt, never installed as a database (C14, RUL-14;
+    /// plan of record 2026-10-19, C4). Never a check that could not run
+    /// (review of #278, item 1).
     Corrupt,
 }
 
+/// The primary code of a `SQLite` failure that is the bytes' own verdict:
+/// `SQLITE_CORRUPT` (11) or `SQLITE_NOTADB` (26).
+const fn corrupt_failure(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(failure, _) if matches!(failure.extended_code & 0xff, 11 | 26)
+    )
+}
+
 /// Verify a received snapshot before it is published (#218, design section
-/// 9): the header's magic, its page size times its page count equals
-/// `size`, its journal mode is not WAL, and `PRAGMA integrity_check`
-/// returns exactly `ok`. The file is the destination's own staged
-/// temporary, opened read-only with `immutable=1` and
-/// `SQLITE_OPEN_NOFOLLOW`, so `SQLite` creates no `-shm`, `-wal` or
-/// `-journal` beside it and takes no lock.
+/// 9). The file is the destination's own staged temporary, opened
+/// read-only with `immutable=1` and `SQLITE_OPEN_NOFOLLOW`, so `SQLite`
+/// creates no `-shm`, `-wal` or `-journal` beside it and takes no lock.
 ///
-/// A file that carries the `SQLite` magic but fails any later check is
-/// [`Verified::Corrupt`]: the source's backup of a corrupt store, carried
-/// to be landed beside its path (C14). Only a file that is not a `SQLite`
-/// database at all, or whose staged length is not `size`, is refused: a
-/// peer that sends a non-database as a snapshot (P82), or a staging fault.
+/// `SQLite` judges the bytes first: an open, prepare or step that fails
+/// `SQLITE_CORRUPT` or `SQLITE_NOTADB`, or an `integrity_check` that is not
+/// exactly `ok`, is [`Verified::Corrupt`] (the source's backup of a corrupt
+/// store, or its raw bytes, carried to be landed beside its path, C14). A
+/// file `SQLite` judged sound is [`Verified::Sound`] only if its header is
+/// a snapshot's: journal mode DELETE (bytes 18 and 19 both 1, design D4)
+/// and its page count times its page size its length.
 ///
 /// # Errors
-/// Refuses those `SQLITE_INTEGRITY_CHECK_FAILED`.
+/// Refuses `SQLITE_INTEGRITY_CHECK_FAILED`, never `Corrupt` (review of
+/// #278, item 1: "could not check" is not "corrupt"): a staged length
+/// other than `size`, no `SQLite` magic (a peer that sends a non-database
+/// as a snapshot, P82), any other open, prepare or step failure (a path
+/// too long for `SQLite`, descriptor or memory exhaustion, a read error),
+/// and a file `SQLite` judged sound whose header is not a snapshot's.
 pub(crate) fn verify_received(file: &fs::File, path: &Path, size: u64) -> Result<Verified> {
     use std::os::unix::fs::FileExt as _;
     let failed = BulkloadRefusal::SqliteIntegrityCheckFailed;
@@ -683,18 +756,6 @@ pub(crate) fn verify_received(file: &fs::File, path: &Path, size: u64) -> Result
     if !header.starts_with(b"SQLite format 3\0") {
         return Err(failed);
     }
-    let byte = |at: usize| header.get(at).copied().unwrap_or(0);
-    let page_size = match u16::from_be_bytes([byte(16), byte(17)]) {
-        1 => 65_536_u64,
-        size if size >= 512 && size.is_power_of_two() => u64::from(size),
-        _ => return Ok(Verified::Corrupt),
-    };
-    let pages = u64::from(u32::from_be_bytes([byte(28), byte(29), byte(30), byte(31)]));
-    // Bytes 18 and 19 are the write and read versions: 1 is the rollback
-    // journal, 2 is WAL (design D4: a snapshot is published in DELETE mode).
-    if byte(18) != 1 || byte(19) != 1 || pages.checked_mul(page_size) != Some(size) {
-        return Ok(Verified::Corrupt);
-    }
     let mut uri = b"file:".to_vec();
     for byte in path.as_os_str().as_encoded_bytes() {
         if byte.is_ascii_alphanumeric() || b"/-_.~".contains(byte) {
@@ -705,28 +766,41 @@ pub(crate) fn verify_received(file: &fs::File, path: &Path, size: u64) -> Result
     }
     uri.extend_from_slice(b"?immutable=1");
     let uri = String::from_utf8(uri).map_err(|_| failed.clone())?;
-    let Ok(connection) = Connection::open_with_flags(
+    let rows = Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
             | OpenFlags::SQLITE_OPEN_URI
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
-    ) else {
-        return Ok(Verified::Corrupt);
-    };
-    let rows = connection
-        .prepare("PRAGMA integrity_check")
-        .and_then(|mut statement| {
-            statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()
-        });
+    )
+    .and_then(|connection| {
+        connection
+            .prepare("PRAGMA integrity_check")
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            })
+    });
     counters::add(Counter::DestSqliteVerifyBytes, size);
-    if matches!(rows.as_deref(), Ok([ok]) if ok == "ok") {
-        counters::bump(Counter::DestSqliteVerified);
-        Ok(Verified::Sound)
-    } else {
-        Ok(Verified::Corrupt)
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(error) if corrupt_failure(&error) => return Ok(Verified::Corrupt),
+        Err(_) => return Err(failed),
+    };
+    if rows != ["ok"] {
+        return Ok(Verified::Corrupt);
     }
+    let byte = |at: usize| header.get(at).copied().unwrap_or(0);
+    let page_size = match u16::from_be_bytes([byte(16), byte(17)]) {
+        1 => 65_536_u64,
+        size => u64::from(size),
+    };
+    let pages = u64::from(u32::from_be_bytes([byte(28), byte(29), byte(30), byte(31)]));
+    if byte(18) != 1 || byte(19) != 1 || pages.checked_mul(page_size) != Some(size) {
+        return Err(failed);
+    }
+    counters::bump(Counter::DestSqliteVerified);
+    Ok(Verified::Sound)
 }
 
 /// What a snapshot's read leaves beside its source database (S2; OI-1003-Q16,
@@ -1885,20 +1959,25 @@ mod tests {
             verify_received(&fs::File::open(&corrupt).unwrap(), &corrupt, report.size),
             Ok(Verified::Corrupt)
         );
-        // Header forms the destination tells apart without opening: a page
-        // size SQLite cannot read, a WAL-mode main file, a page count that
-        // does not match the size: all corrupt carries, never sound.
-        for (at, value) in [(16_usize, [0x5A_u8, 0x5A]), (18, [2, 2])] {
-            let mut header = fs::read(&sound).unwrap();
-            header[at..at + 2].copy_from_slice(&value);
-            let path = dir.join(format!("header-{at}.sqlite"));
-            fs::write(&path, &header).unwrap();
-            assert_eq!(
-                verify_received(&fs::File::open(&path).unwrap(), &path, header.len() as u64),
-                Ok(Verified::Corrupt),
-                "header byte {at}"
-            );
-        }
+        // A page size SQLite cannot read is its SQLITE_NOTADB: corrupt. A
+        // WAL-mode header on pages SQLite reads as sound is no snapshot
+        // (design D4): refused, never sound and never corrupt.
+        let mut header = fs::read(&sound).unwrap();
+        header[16..18].copy_from_slice(&[0x5A, 0x5A]);
+        let path = dir.join("header-16.sqlite");
+        fs::write(&path, &header).unwrap();
+        assert_eq!(
+            verify_received(&fs::File::open(&path).unwrap(), &path, header.len() as u64),
+            Ok(Verified::Corrupt)
+        );
+        let mut header = fs::read(&sound).unwrap();
+        header[18..20].copy_from_slice(&[2, 2]);
+        let path = dir.join("header-18.sqlite");
+        fs::write(&path, &header).unwrap();
+        assert_eq!(
+            verify_received(&fs::File::open(&path).unwrap(), &path, header.len() as u64),
+            Err(BulkloadRefusal::SqliteIntegrityCheckFailed)
+        );
         let mut short = fs::read(&sound).unwrap();
         short.truncate(3 * 1024);
         let path = dir.join("short.sqlite");
@@ -1919,6 +1998,65 @@ mod tests {
             Err(BulkloadRefusal::SqliteIntegrityCheckFailed)
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Review of #278, item 1: a check that could not run is refused
+    /// `SQLITE_INTEGRITY_CHECK_FAILED`, never reported corrupt. A sound
+    /// snapshot whose path `SQLite` cannot open (here: gone from under its
+    /// descriptor; in the review, a destination root longer than `SQLite`'s
+    /// 512-byte path limit) is refused, and so is a corrupt one: what could
+    /// not be read was not judged.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn a_check_that_could_not_run_is_refused_not_corrupt() {
+        assume_unprivileged();
+        let dir = carry_fixture("unchecked");
+        let database = dir.join("store.sqlite");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE; CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+                 INSERT INTO t VALUES (1, 'one'), (2, 'two');",
+            )
+            .unwrap();
+        connection.close().map_err(|(_, error)| error).unwrap();
+        let sound = dir.join("sound.sqlite");
+        let (report, _) = snapshot_for_carry(&database, &sound, false, 0, CARRY_WALL);
+        let size = report.unwrap().size;
+        let held = fs::File::open(&sound).unwrap();
+        assert_eq!(verify_received(&held, &sound, size), Ok(Verified::Sound));
+        fs::remove_file(&sound).unwrap();
+        assert_eq!(
+            verify_received(&held, &sound, size),
+            Err(BulkloadRefusal::SqliteIntegrityCheckFailed),
+            "an open that fails is no verdict on the bytes"
+        );
+        let long = dir
+            .join("x".repeat(255))
+            .join("y".repeat(255))
+            .join("store.sqlite");
+        assert_eq!(
+            verify_received(&held, &long, size),
+            Err(BulkloadRefusal::SqliteIntegrityCheckFailed),
+            "a path SQLite cannot open is no verdict on the bytes"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Review of #278, item 6: `SQLITE_BUSY_RECOVERY` and every other
+    /// extended busy or locked code is waited out like `SQLITE_BUSY`;
+    /// corruption, I/O and the rest are not.
+    #[test]
+    fn extended_busy_codes_are_waited_out() {
+        let failure =
+            |code: i32| rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+        for code in [5, 6, 261, 517, 262, 773] {
+            assert!(busy_failure(&failure(code)), "{code}");
+        }
+        for code in [1, 10, 11, 26, 267, 779, 1034] {
+            assert!(!busy_failure(&failure(code)), "{code}");
+        }
+        assert!(!busy_failure(&rusqlite::Error::InvalidQuery));
     }
 
     #[test]

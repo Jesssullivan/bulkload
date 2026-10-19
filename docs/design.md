@@ -2004,11 +2004,16 @@ miss (#87).
     owned by another user than the reader is refused
     `SQLITE_SOURCE_NOT_OWNER` before `SQLite` opens it. Otherwise the source
     takes the `snapshot` verb's stepped backup (OI-1003-Q16; one at a time,
-    a step budget and a wall clock, `--sqlite-carry-wall=SECONDS`, 30 by
-    default: `BUDGET_EXCEEDED`, not remembered; a step that meets another
-    connection's lock is tried again with a bounded backoff inside that
-    wall, holding no lock of its own, and refuses `SQLITE_STATE_CHANGED`
-    only when the wall is spent; plan of record 2026-10-19, C3) from
+    within a wall clock, `--sqlite-carry-wall=SECONDS`, 1 to 1800, 30 by
+    default, and at most four restarts that came before half a pass was
+    copied: `BUDGET_EXCEEDED`, not remembered; restarts later in a pass are
+    allowed until the wall, and a backup that restarted prints
+    `sqlite-backup-restarts` with its count; a step that meets another
+    connection's lock, extended busy codes such as `SQLITE_BUSY_RECOVERY`
+    included, is tried again with a bounded backoff inside that wall,
+    holding no lock of its own, and refuses `SQLITE_STATE_CHANGED` only
+    when the wall is spent; plan of record 2026-10-19, C3, and review of
+    #278, items 4 and 6) from
     `canonical_root/rel_path`, opened read-only, WAL-aware and
     `SQLITE_OPEN_NOFOLLOW` (which refuses a symlink at any component of the
     path, `SQLITE_CANTOPEN_SYMLINK`, refused as `PATH_ESCAPES_ROOT`), into a
@@ -2018,21 +2023,25 @@ miss (#87).
     does not compare index content with table content). Every slot,
     streamed or kept for a manifest, is reserved against the slot budget
     (`--sqlite-slot-bytes=BYTES`, 4 GiB by default) of slots alive at once
-    before its backup, waiting up to the carry wall for room, and the slot
+    before its backup, waiting for room as long as the base wall (its own
+    wait, never counted against the backup's wall), and the slot
     directory's filesystem must keep the `--min-free-percent` floor with
     it written: `BUDGET_EXCEEDED` otherwise, not remembered. A store whose
     main file and `-wal` exceed the whole budget is not refused for it
-    (operator 2026-10-18, "Chunked snapshot", A-115): it takes the one
-    oversize slot, outside the budget and one at a time, bounded by the
-    floor and the manifest bound alone, with a wall that grows one second
-    per 32 MiB of its size (at most 30 min); the slot file is the whole
+    (operator 2026-10-18, "Chunked snapshot", A-115): it takes an oversize
+    slot at once, outside the budget and several at a time (review of
+    #278, item 4), each bounded by the floor, checked under the backup
+    lock after every earlier slot is written, and the manifest bound, with
+    a wall of the base plus three passes at 32 MiB/s, never past 30 min,
+    the cap applied last (item 5); the slot file is the whole
     snapshot, since the backup API writes a database no page of which is
     final before its last step (a restart rewrites them, the header is
     finished last), so what the budget bounds is the slots beside it and
     the memory a chunk takes. A snapshot over 4 GiB is cut into fixed
     chunks of whole pages (the least power of two from 64 KiB that fits
     one manifest; `source_sqlite_chunked_snapshots`), a function of its
-    size alone (S3). `pull` forwards both flags to the remote `serve`. A
+    size alone (S3). `pull` forwards both flags to the remote `serve` when
+    they are not at their defaults. A
     sniffed database's descriptor is closed only under the backup lock, so
     it never drops the POSIX locks of a backup of a hard link of the same
     store. A residual stands: a directory swapped between `SQLite`'s own
@@ -2051,33 +2060,58 @@ miss (#87).
     record 2026-10-19, C4): the page copy is carried all the same, and the
     destination lands it beside the path. A backup that itself met
     corruption (`SQLITE_BACKUP_FAILED` with primary code 11 or 26) beside
-    no `-wal` with frames reads the main file raw and carries it the same
-    way (`source_sqlite_corrupt_carried`); beside a `-wal` with frames the
+    no `-wal` with frames reads the main file raw, only when the capture
+    settled, and carries it the same way (`source_sqlite_corrupt_carried`);
+    the file must keep the walked row's identity across every read of it,
+    or the entry is refused `SOURCE_CHANGED_AFTER_SNAPSHOT` (review of
+    #278, item 6); beside a `-wal` with frames the
     raw file could miss the `-wal`'s transactions, so that store stays a
     typed refusal, remembered under the snapshot key when the capture
     settled, pending the operator's review. A legacy integrity record is
     ignored. A sidecar of a refused database follows that one refusal
-    (`sqlite_sidecars_follow_refused`), never a second one by name.
+    (`sqlite_sidecars_follow_refused`), never a second one by name, when the
+    database is proven a `SQLite` seat: the source announced it as a
+    snapshot, or refused it with a code only a database gets
+    (`SQLITE_BACKUP_FAILED`, `SQLITE_INTEGRITY_CHECK_FAILED`,
+    `SQLITE_SOURCE_NOT_OWNER`, `SQLITE_SOURCE_AS_ROOT`,
+    `SQLITE_STATE_CHANGED`). A base refused before it was announced with a
+    code any file may get (`BUDGET_EXCEEDED`, `DESTINATION_OCCUPIED` at
+    its decision) is not proven one: its sidecars stay refused by name, so
+    a user's `notes-journal` beside a refused plain `notes` keeps its own
+    refusal (review of #278, item 2).
   - *Destination.* Admission reserves the main file's and the `-wal`'s
     sizes at Decide and the snapshot's exact size when it is announced. A
     path with a `-wal`, `-journal` or `-shm` beside it is refused
     `DESTINATION_OCCUPIED` at Decide (nothing is read on the source; not
     remembered; removing the sidecar converges) and again just before
-    publish. The staged file is verified (header, size, not WAL,
-    `integrity_check` exactly `ok`, opened `immutable=1`) before it is
-    published. A `SQLite` file that is not sound (a header `SQLite` cannot
-    read, a page count that does not match, a journal mode other than
-    DELETE, an `integrity_check` not `ok`) is landed beside its path as
-    `<db>.corrupt-<YYYYMMDD>` (the UTC date the source file was last
-    modified, so the same store lands at one name on every run), a plain
-    file, never installed as a database, with no superseding exchange
-    (whatever is at the database's path stays), recorded `carried-corrupt`
-    (C14, RUL-14; closure disposition `carried`, outcome `carried-corrupt`,
-    `related` the beside path). Its output row is keyed on the snapshot
-    key, so an unchanged rerun finds the carry held and skips the store
-    with nothing read on the source. Only a file with no `SQLite` magic at
-    all, or whose staged length is not the announced size, is refused
-    `SQLITE_INTEGRITY_CHECK_FAILED` (P82: a peer that sends a non-database
+    publish of a sound snapshot. The staged file is verified (opened
+    `immutable=1`) before it is published: `SQLite` judges the bytes first,
+    and only its own verdict (`SQLITE_CORRUPT` or `SQLITE_NOTADB` from the
+    open or the check, or an `integrity_check` not `ok`) marks the file
+    corrupt; a sound file must also carry a snapshot's header (journal
+    mode DELETE, page count times page size its length). A corrupt one is
+    landed beside its path, whatever sits beside the path (review of #278,
+    item 6), as `<db>.corrupt-<YYYYMMDD>` (the UTC date the source file was
+    last modified), or, when that name holds other bytes (the store changed
+    on the same day), `<db>.corrupt-<YYYYMMDD>-<HHMMSS>.<ns>`, its full
+    modification time; a name that holds the same bytes is adopted instead
+    (the store was touched, not changed), and when both hold other bytes
+    the database is refused `DESTINATION_OCCUPIED` under its own path
+    (item 3). Both names are functions of the row, so a store lands at one
+    name on every run. It is a plain file, never installed as a database,
+    with no superseding exchange (whatever is at the database's path
+    stays), recorded `carried-corrupt` (C14, RUL-14; closure disposition
+    `carried`, outcome `carried-corrupt`, `related` the beside path). Its
+    output row is keyed on the snapshot key, so an unchanged rerun finds
+    the carry held at either name and skips the store with nothing read on
+    the source; a group commit of the beside file that fails is the
+    database's refusal, so its sidecars follow that one refusal. A check
+    that could not run (the open, prepare or step failing otherwise: a path
+    too long for `SQLite`, descriptor or memory exhaustion, a read error)
+    is refused `SQLITE_INTEGRITY_CHECK_FAILED`, never marked corrupt
+    (review of #278, item 1), as is a file with no `SQLite` magic at all,
+    a staged length other than the announced size, or a file `SQLite`
+    judged sound whose header is not a snapshot's (P82: a peer that sends a non-database
     as a snapshot). The former `abandon` default (OI-1003-Q148) is
     withdrawn: no refusal has a default disposition
     (`transfer::default_disposition` answers `None`); corruption the backup

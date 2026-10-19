@@ -1334,7 +1334,7 @@ fn p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination() {
             b"not a database!!".to_vec()
         };
         payload.extend(noise(9, 4096 - 16));
-        let source = std::thread::spawn(move || peer_sends_snapshot(peer, &payload));
+        let source = std::thread::spawn(move || peer_sends_snapshot(peer, &payload, None));
         let mut input = ours.try_clone().unwrap();
         let mut output = ours;
         let stats = receive_with(
@@ -1375,9 +1375,12 @@ fn p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination() {
 /// The source half of [`p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination`]:
 /// a peer that offers `fake.db` and sends `payload` as its snapshot. The
 /// destination's `Held` is read, true or false, and the stream is ended.
+/// With `after_decide`, that file is written once the entry is decided and
+/// before its content is sent (a `-wal` appearing at the destination).
 fn peer_sends_snapshot(
     mut peer: std::os::unix::net::UnixStream,
     payload: &[u8],
+    after_decide: Option<&Path>,
 ) -> std::os::unix::net::UnixStream {
     {
         let Frame::Control(Control::Open { sqlite, .. }) = read_frame(&mut peer).unwrap() else {
@@ -1418,6 +1421,9 @@ fn peer_sends_snapshot(
             match read_frame(&mut peer).unwrap() {
                 Frame::Control(Control::Decide { decision, .. }) => {
                     assert_eq!(decision, Decision::Send);
+                    if let Some(path) = after_decide {
+                        std::fs::write(path, b"a live -wal").unwrap();
+                    }
                     break;
                 }
                 Frame::Control(Control::Credit { .. }) => {}
@@ -1635,18 +1641,27 @@ fn p83_sidecars_follow_their_base_and_are_never_carried() {
                 );
                 let mut expected = Vec::new();
                 if blocked || destined == Destined::Foreign {
-                    // One refusal, the base's; its sidecar follows it (plan
-                    // of record 2026-10-19, C3), never a second refusal.
                     expected.push((b"store.db".to_vec(), "DESTINATION_OCCUPIED".to_owned()));
-                    assert_eq!(refusals, expected, "{case}");
-                    assert_eq!(
-                        stats.sqlite_sidecars_follow_refused,
+                    let follows: Vec<_> = if blocked {
+                        // Refused at its decision, before the source read
+                        // it: not proven a database, so its sidecar keeps
+                        // its own refusal by name (review of #278, item 2).
+                        if let Some(path) = &sidecar_path {
+                            expected.push((path.clone(), "SQLITE_STATE_CHANGED".to_owned()));
+                        }
+                        Vec::new()
+                    } else {
+                        // Read and announced as a snapshot, then refused
+                        // for the foreign file at its path: a database, so
+                        // its sidecar follows that one refusal.
                         sidecar_path
                             .iter()
                             .map(|path| (path.clone(), b"store.db".to_vec()))
-                            .collect::<Vec<_>>(),
-                        "{case}"
-                    );
+                            .collect()
+                    };
+                    expected.sort();
+                    assert_eq!(refusals, expected, "{case}");
+                    assert_eq!(stats.sqlite_sidecars_follow_refused, follows, "{case}");
                     assert!(stats.sqlite_sidecars_covered.is_empty(), "{case}");
                     assert_eq!(
                         scan(&sqlite.destination()),
@@ -2905,14 +2920,16 @@ fn the_slot_budget_and_carry_wall_flags_parse_and_forward() {
             "{value}"
         );
     }
-    for (value, secs) in [("1", 1), ("30", 30), ("900", 900)] {
+    for (value, secs) in [("1", 1), ("30", 30), ("900", 900), ("1800", 1800)] {
         assert_eq!(
             crate::provider_sqlite::parse_carry_wall(value),
             Ok(Duration::from_secs(secs)),
             "{value}"
         );
     }
-    for value in ["", "0", "-5", "30s", "1.5"] {
+    // Review of #278, item 5: past the 30-minute cap is a usage refusal,
+    // never a wall that overflows the clock.
+    for value in ["", "0", "-5", "30s", "1.5", "1801", "18446744073709551615"] {
         assert_eq!(
             crate::provider_sqlite::parse_carry_wall(value),
             Err(BulkloadRefusal::FieldDomainViolation),
@@ -2927,6 +2944,10 @@ fn the_slot_budget_and_carry_wall_flags_parse_and_forward() {
         crate::provider_sqlite::CARRY_WALL
     );
     assert!(serve_flags().is_empty());
+    // Review of #278, item 6: an explicit default is not forwarded.
+    set_sqlite_slot_bytes(SLOT_BYTES);
+    crate::provider_sqlite::set_carry_wall(crate::provider_sqlite::CARRY_WALL);
+    assert!(serve_flags().is_empty());
     set_sqlite_slot_bytes(8 << 30);
     crate::provider_sqlite::set_carry_wall(Duration::from_secs(45));
     assert_eq!(sqlite_slot_bytes(), 8 << 30);
@@ -2934,30 +2955,51 @@ fn the_slot_budget_and_carry_wall_flags_parse_and_forward() {
         serve_flags(),
         ["--sqlite-slot-bytes=8589934592", "--sqlite-carry-wall=45"]
     );
-    // A store within the budget keeps the base wall; one over it gets a
-    // second per 32 MiB more, never less than the base, at most 30 min.
+    // A store within the budget keeps the base wall; one over it gets
+    // three passes at 32 MiB/s more, never less than the base, and the
+    // 30-minute cap holds last.
     assert_eq!(
         crate::provider_sqlite::carry_wall(8 << 30, 8 << 30),
         Duration::from_secs(45)
     );
     assert_eq!(
         crate::provider_sqlite::carry_wall((8 << 30) + 1, 8 << 30),
-        Duration::from_secs(45 + 256)
+        Duration::from_secs(45 + 3 * 256)
     );
     assert_eq!(
         crate::provider_sqlite::carry_wall(1 << 50, 8 << 30),
         crate::provider_sqlite::CARRY_WALL_MAX
+    );
+    crate::provider_sqlite::set_carry_wall(Duration::from_mins(30));
+    assert_eq!(
+        crate::provider_sqlite::carry_wall(1 << 40, 8 << 30),
+        crate::provider_sqlite::CARRY_WALL_MAX,
+        "the cap after the base"
     );
     set_sqlite_slot_bytes(0);
     crate::provider_sqlite::set_carry_wall(Duration::ZERO);
     assert!(serve_flags().is_empty());
     assert_eq!(sqlite_slot_bytes(), SLOT_BYTES);
     // The real store that could not be carried: 8.8 GB under the default
-    // 4 GiB budget takes 30 s + 262 s.
+    // 4 GiB budget takes 30 s + 3 x 262 s.
     assert_eq!(
         crate::provider_sqlite::carry_wall(8_800_000_000, SLOT_BYTES),
-        Duration::from_secs(30 + 262)
+        Duration::from_secs(30 + 3 * 262)
     );
+}
+
+/// Review of #278, item 5: a slot wait never overflows the clock, however
+/// long it is asked to be.
+#[test]
+fn a_slot_wait_never_overflows_the_clock() {
+    let budget = Arc::new(SlotBudget::new(1024));
+    let held = budget.reserve(512, Duration::MAX).unwrap();
+    let more = budget.reserve(512, Duration::MAX).unwrap();
+    assert!(budget.reserve(1, Duration::from_millis(10)).is_none());
+    drop((held, more));
+    assert!(budget.reserve(1024, Duration::MAX).is_some());
+    // Over the whole budget: an oversize slot, at once, outside it.
+    assert!(budget.reserve(1 << 40, Duration::ZERO).is_some());
 }
 
 /// A snapshot is cut into fixed chunks only above the chunk threshold, into
@@ -3026,6 +3068,18 @@ fn a_corrupt_carry_is_named_by_its_path_and_mtime_date() {
         b"codex/state_5.sqlite.corrupt-20261019",
         "the row's other fields do not name it"
     );
+    // The second name, for a store changed on the same day: its full
+    // modification time (review of #278, item 3).
+    row.mtime_ns = 1_792_368_000 * 1_000_000_000 + 3_723_000_000_123;
+    assert_eq!(hhmmss_ns(row.mtime_ns), "010203.000000123");
+    assert_eq!(
+        corrupt_beside_paths(&row),
+        [
+            b"codex/state_5.sqlite.corrupt-20261019".to_vec(),
+            b"codex/state_5.sqlite.corrupt-20261019-010203.000000123".to_vec(),
+        ]
+    );
+    assert_eq!(hhmmss_ns(-1), "235959.999999999");
 }
 
 /// A store whose main file is larger than the whole slot budget is carried
@@ -3066,10 +3120,13 @@ fn a_store_larger_than_the_slot_budget_is_carried_from_an_oversize_slot() {
     assert_eq!(warm.source_bytes_read, 0);
 }
 
-/// Two stores over the budget take the oversize slot one after the other,
-/// never together: the slot bytes alive at once never pass one of them.
+/// Review of #278, item 4: stores over the budget take their oversize
+/// slots at once, several at a time, bounded by the free-space floor, so
+/// none times out queueing behind another. The review's probe: three
+/// oversize stores, a 1 s carry wall, each slot held 3 s after its
+/// snapshot (before, two were refused `BUDGET_EXCEEDED`).
 #[test]
-fn oversize_slots_are_taken_one_at_a_time() {
+fn oversize_slots_never_queue_behind_one_another() {
     let _serial = serial();
     let sqlite = Sqlite::new();
     for name in ["a.db", "b.db", "c.db"] {
@@ -3082,41 +3139,17 @@ fn oversize_slots_are_taken_one_at_a_time() {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push((sqlite.root.clone(), size / 2));
-    let slots = sqlite.corpus.base.join("source-state").join(SLOT_DIR);
-    let peak = Arc::new(AtomicU64::new(0));
-    let hook: CaptureHook = {
-        let peak = Arc::clone(&peak);
-        Arc::new(move || {
-            let started = Instant::now();
-            loop {
-                let alive: u64 = std::fs::read_dir(&slots).map_or(0, |entries| {
-                    entries
-                        .filter_map(|entry| entry.ok()?.metadata().ok())
-                        .map(|meta| meta.len())
-                        .sum()
-                });
-                peak.fetch_max(alive, Ordering::Relaxed);
-                if started.elapsed() > Duration::from_millis(1200) {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        })
-    };
+    crate::provider_sqlite::set_carry_wall(Duration::from_secs(1));
+    let hook: CaptureHook = Arc::new(|| std::thread::sleep(Duration::from_secs(3)));
     set_after_snapshot(&sqlite.root, Some(hook));
     let before = Counters::snapshot();
     let stats = sqlite.snapshot();
     let delta = Counters::snapshot().since(before);
     set_after_snapshot(&sqlite.root, None);
+    crate::provider_sqlite::set_carry_wall(Duration::ZERO);
     assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
     assert_eq!(stats.sqlite_snapshots.len(), 3);
     assert_eq!(delta.get(Counter::SourceSqliteOversizeSlots), 3);
-    let peak = peak.load(Ordering::Relaxed);
-    assert!(peak > 0, "the hook saw a slot");
-    assert!(
-        peak <= size + 4096,
-        "oversize slots alive at once: {peak} bytes, one store is {size}"
-    );
     assert_eq!(sqlite.slots(), 0);
 }
 
@@ -3172,4 +3205,334 @@ fn a_snapshot_over_the_chunk_threshold_is_carried_in_fixed_chunks_and_verifies()
         assert_eq!(warm.reused, 1, "{journal:?}");
         assert_eq!(warm.source_bytes_read, 0, "{journal:?}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Review of #278 (items 1 to 6): regression tests
+// ---------------------------------------------------------------------------
+
+/// Item 1: a sound store whose destination check cannot run is refused
+/// `SQLITE_INTEGRITY_CHECK_FAILED`, never carried as corrupt. The review's
+/// probe: a destination root longer than `SQLite`'s 512-byte path limit.
+#[test]
+fn a_sound_store_whose_check_cannot_run_is_refused_not_carried_corrupt() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    build(&sqlite.source().join("sound.db"), Journal::Delete, 1024, 3);
+    let mut long = sqlite.destination();
+    while long.as_os_str().len() < 545 {
+        long.push("d".repeat(60));
+    }
+    std::fs::create_dir_all(&long).unwrap();
+    let stats = copy_with(
+        &sqlite.source(),
+        &long,
+        &sqlite.corpus.base.join("source-state"),
+        &sqlite.corpus.base.join("long-state"),
+        SqliteMode::Snapshot,
+    )
+    .unwrap();
+    assert_eq!(
+        stats.refusals,
+        [(
+            b"sound.db".to_vec(),
+            "SQLITE_INTEGRITY_CHECK_FAILED".to_owned()
+        )]
+    );
+    assert!(stats.sqlite_carried_corrupt.is_empty());
+    assert_eq!(
+        std::fs::read_dir(&long).unwrap().count(),
+        0,
+        "nothing landed, at the path or beside it"
+    );
+}
+
+/// Item 2: a user's file named like a sidecar beside a plain file that was
+/// refused is its own path with its own refusal, never covered by it.
+#[test]
+fn a_file_named_like_a_sidecar_beside_a_refused_plain_file_keeps_its_own_refusal() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    std::fs::write(sqlite.source().join("notes"), b"my notes").unwrap();
+    std::fs::write(sqlite.source().join("notes-journal"), b"my journal").unwrap();
+    std::fs::write(sqlite.destination().join("notes"), b"other notes").unwrap();
+    let stats = sqlite.snapshot();
+    let mut refusals = stats.refusals.clone();
+    refusals.sort();
+    assert_eq!(
+        refusals,
+        [
+            (b"notes".to_vec(), "DESTINATION_OCCUPIED".to_owned()),
+            (b"notes-journal".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
+        ]
+    );
+    assert!(stats.sqlite_sidecars_follow_refused.is_empty());
+    assert!(stats.sqlite_sidecars_covered.is_empty());
+    assert_eq!(
+        std::fs::read(sqlite.destination().join("notes")).unwrap(),
+        b"other notes"
+    );
+}
+
+/// Damage one page of a 1 KiB-page store, so its snapshot fails
+/// `integrity_check` while the backup reads it.
+fn damage_page(path: &Path, page: usize, fill: u8) {
+    let mut bytes = std::fs::read(path).unwrap();
+    for byte in &mut bytes[(page - 1) * 1024 + 8..page * 1024] {
+        *byte = fill;
+    }
+    std::fs::write(path, &bytes).unwrap();
+}
+
+/// Set a file's modification time to `at` seconds past the Unix epoch.
+fn set_mtime(path: &Path, at: u64) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(at))
+        .unwrap();
+}
+
+/// Item 3: a corrupt store touched on the same day is reused by content (no
+/// second copy); one changed on the same day lands under its full
+/// modification time beside the first; each round has no refusal, its
+/// empty `-journal` is covered (one row), and the unchanged rerun reads
+/// nothing. Before, the change was refused `DESTINATION_OCCUPIED` with its
+/// sidecar refused apart, and re-read in full on every run.
+#[test]
+#[allow(clippy::too_many_lines)] // Four rounds, read top to bottom.
+fn a_corrupt_store_changed_on_the_same_day_lands_beside_its_first_carry() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let database = sqlite.source().join("rescue.db");
+    build_large(&database, Journal::Delete, 4, 60);
+    damage_page(&database, 5, 0xA5);
+    std::fs::write(sqlite.source().join("rescue.db-journal"), b"").unwrap();
+    // 2026-10-19 10:00:00 UTC, then an hour later, then two.
+    let t0 = 1_792_404_000;
+    set_mtime(&database, t0);
+    let dated = sqlite.destination().join("rescue.db.corrupt-20261019");
+    let round = |label: &str| {
+        let stats = sqlite.snapshot();
+        assert!(stats.refusals.is_empty(), "{label}: {:?}", stats.refusals);
+        assert_eq!(
+            stats.sqlite_sidecars_covered,
+            [b"rescue.db-journal".to_vec()],
+            "{label}: one row for the sidecar"
+        );
+        assert!(stats.sqlite_sidecars_follow_refused.is_empty(), "{label}");
+        assert!(!sqlite.destination().join("rescue.db").exists(), "{label}");
+        stats
+    };
+    let first = round("first");
+    assert_eq!(
+        first.sqlite_carried_corrupt,
+        [(
+            b"rescue.db".to_vec(),
+            b"rescue.db.corrupt-20261019".to_vec()
+        )]
+    );
+    let landed = std::fs::read(&dated).unwrap();
+    // Touched, not changed: the same bytes, adopted where they are.
+    set_mtime(&database, t0 + 3600);
+    let touched = round("touched");
+    assert_eq!(
+        touched.sqlite_carried_corrupt,
+        [(
+            b"rescue.db".to_vec(),
+            b"rescue.db.corrupt-20261019".to_vec()
+        )]
+    );
+    let corrupt_files = || {
+        let mut names: Vec<_> = std::fs::read_dir(sqlite.destination())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().contains(".corrupt-"))
+            .collect();
+        names.sort();
+        names
+    };
+    assert_eq!(corrupt_files().len(), 1, "no second copy of the same bytes");
+    // Changed on the same day: beside the first, under its full time.
+    damage_page(&database, 6, 0x5A);
+    set_mtime(&database, t0 + 7200);
+    let changed = round("changed");
+    assert_eq!(
+        changed.sqlite_carried_corrupt,
+        [(
+            b"rescue.db".to_vec(),
+            b"rescue.db.corrupt-20261019-120000.000000000".to_vec()
+        )]
+    );
+    assert_eq!(std::fs::read(&dated).unwrap(), landed, "the first stays");
+    assert_eq!(corrupt_files().len(), 2);
+    // Unchanged: held under its second name, nothing read.
+    let again = round("again");
+    assert_eq!(again.source_bytes_read, 0);
+    assert_eq!(again.bytes_received, 0);
+    assert_eq!(again.reused, 1);
+    assert_eq!(
+        again.sqlite_carried_corrupt,
+        [(
+            b"rescue.db".to_vec(),
+            b"rescue.db.corrupt-20261019-120000.000000000".to_vec()
+        )]
+    );
+}
+
+/// Item 3: a corrupt carry whose beside file's group commit fails is the
+/// database's refusal, under the database's path, and its sidecar follows
+/// that one refusal (before, the refusal was filed under the beside name
+/// and the sidecar refused apart).
+#[test]
+fn a_failed_corrupt_carry_is_one_refusal_under_its_database() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let database = sqlite.source().join("rescue.db");
+    build_large(&database, Journal::Delete, 4, 60);
+    damage_page(&database, 5, 0xA5);
+    std::fs::write(sqlite.source().join("rescue.db-journal"), b"").unwrap();
+    let store_root = destination_store_root(&sqlite.corpus);
+    crate::transfer_store::fail_group_commits(&store_root, true);
+    let stats = sqlite.snapshot();
+    crate::transfer_store::fail_group_commits(&store_root, false);
+    assert_eq!(stats.refusals.len(), 1, "{:?}", stats.refusals);
+    assert_eq!(stats.refusals[0].0, b"rescue.db");
+    assert!(stats.sqlite_carried_corrupt.is_empty());
+    assert_eq!(
+        stats.sqlite_sidecars_follow_refused,
+        [(b"rescue.db-journal".to_vec(), b"rescue.db".to_vec())]
+    );
+    // Commits work again: carried beside its path.
+    let carried = sqlite.snapshot();
+    assert!(carried.refusals.is_empty(), "{:?}", carried.refusals);
+    assert_eq!(carried.sqlite_carried_corrupt.len(), 1);
+}
+
+/// Item 4: a live store whose backup restarts late in each pass (more than
+/// half copied) is given more passes than the four the step budget used to
+/// allow, and arrives whole with every commit; its restarts are counted.
+#[test]
+fn a_store_restarted_late_in_each_pass_is_given_more_passes() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let database = sqlite.source().join("store.db");
+    build_large(&database, Journal::Delete, 10, 120);
+    let pages = std::fs::metadata(&database).unwrap().len() / 1024;
+    let per_pass = pages.div_ceil(4);
+    assert!(per_pass >= 8, "{pages} pages");
+    let writer = Arc::new(Mutex::new(Writer::start(&database)));
+    let acked_before = writer.lock().unwrap().commit();
+    let (since, commits) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+    let hook: crate::provider_sqlite::StepHook = {
+        let (writer, since, commits) = (
+            Arc::clone(&writer),
+            Arc::clone(&since),
+            Arc::clone(&commits),
+        );
+        Arc::new(move |_, done| {
+            let at = since.fetch_add(1, Ordering::Relaxed) + 1;
+            if !done && at + 1 == per_pass && commits.load(Ordering::Relaxed) < 6 {
+                writer.lock().unwrap().commit();
+                commits.fetch_add(1, Ordering::Relaxed);
+                since.store(0, Ordering::Relaxed);
+            }
+        })
+    };
+    crate::provider_sqlite::set_carry_steps(&sqlite.root, Some((4, Some(hook))));
+    let before = Counters::snapshot();
+    let stats = sqlite.snapshot();
+    let delta = Counters::snapshot().since(before);
+    crate::provider_sqlite::set_carry_steps(&sqlite.root, None);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(commits.load(Ordering::Relaxed), 6);
+    assert_eq!(delta.get(Counter::SourceSqliteBackupRestarts), 6);
+    let acked_after = writer.lock().unwrap().acked();
+    assert_eq!(acked_after, acked_before + 6);
+    assert_eq!(
+        published(&sqlite.destination().join("store.db")).len() as u64,
+        acked_after,
+        "the last pass carries every commit"
+    );
+    let writer = Arc::into_inner(writer).unwrap().into_inner().unwrap();
+    writer.finish();
+}
+
+/// Item 6: a corrupt snapshot is landed beside its path even when a `-wal`
+/// appeared at the database's path after the entry was decided: the
+/// sidecar check guards only a sound snapshot's install at the path.
+#[test]
+fn a_corrupt_snapshot_lands_beside_whatever_appeared_at_its_path() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let (peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+    let mut payload = b"SQLite format 3\0".to_vec();
+    payload.extend(noise(9, 4096 - 16));
+    let wal = sqlite.destination().join("fake.db-wal");
+    let source = std::thread::spawn(move || peer_sends_snapshot(peer, &payload, Some(&wal)));
+    let mut input = ours.try_clone().unwrap();
+    let mut output = ours;
+    let stats = receive_with(
+        &mut input,
+        &mut output,
+        Path::new("/peer/source"),
+        Path::new("/peer/state"),
+        &sqlite.destination(),
+        &sqlite.corpus.base.join("destination-state"),
+        SqliteMode::Snapshot,
+    )
+    .unwrap();
+    drop(source.join().unwrap());
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(
+        stats.sqlite_carried_corrupt,
+        [(b"fake.db".to_vec(), b"fake.db.corrupt-19700101".to_vec())]
+    );
+    assert!(!sqlite.destination().join("fake.db").exists());
+    assert_eq!(
+        std::fs::read(sqlite.destination().join("fake.db-wal")).unwrap(),
+        b"a live -wal",
+        "what appeared stays as it is"
+    );
+}
+
+/// Item 6: a store read raw (its backup met `SQLITE_NOTADB`) that is
+/// rewritten under the read is refused `SOURCE_CHANGED_AFTER_SNAPSHOT`:
+/// nothing lands, at the path or beside it, and the next run carries it.
+#[test]
+fn a_raw_corrupt_read_rewritten_under_it_is_refused() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let database = sqlite.source().join("rescue.db");
+    build_large(&database, Journal::Delete, 4, 60);
+    let mut bytes = std::fs::read(&database).unwrap();
+    for byte in &mut bytes[16..100] {
+        *byte = 0x5A;
+    }
+    std::fs::write(&database, &bytes).unwrap();
+    let rewritten = database;
+    let hook: CaptureHook = Arc::new(move || {
+        use std::io::Write as _;
+        let mut file = std::fs::File::options()
+            .append(true)
+            .open(&rewritten)
+            .unwrap();
+        file.write_all(&[0_u8; 1024]).unwrap();
+    });
+    set_after_snapshot(&sqlite.root, Some(hook));
+    let stats = sqlite.snapshot();
+    set_after_snapshot(&sqlite.root, None);
+    assert_eq!(
+        stats.refusals,
+        [(
+            b"rescue.db".to_vec(),
+            "SOURCE_CHANGED_AFTER_SNAPSHOT".to_owned()
+        )]
+    );
+    assert!(stats.sqlite_carried_corrupt.is_empty());
+    assert_eq!(std::fs::read_dir(sqlite.destination()).unwrap().count(), 0);
+    let quiet = sqlite.snapshot();
+    assert!(quiet.refusals.is_empty(), "{:?}", quiet.refusals);
+    assert_eq!(quiet.sqlite_carried_corrupt.len(), 1);
 }
