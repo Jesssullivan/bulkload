@@ -1149,8 +1149,7 @@ fn copy_session(
                     sides.1,
                     sqlite,
                     Some(hand),
-                    kind,
-                    source_mode,
+                    (kind, source_mode),
                 ),
                 None => receive_session(
                     &mut receiver,
@@ -1159,8 +1158,7 @@ fn copy_session(
                     sides.1,
                     sqlite,
                     None,
-                    kind,
-                    source_mode,
+                    (kind, source_mode),
                 ),
             }
         };
@@ -5361,8 +5359,7 @@ pub fn receive_with<R: Read, W: Write>(
         (destination, destination_state),
         sqlite,
         None,
-        RootKind::Tree,
-        None,
+        (RootKind::Tree, None),
     )
 }
 
@@ -5391,8 +5388,7 @@ pub fn receive_kind<R: Read, W: Write>(
         (destination, destination_state),
         sqlite_mode(),
         None,
-        kind,
-        None,
+        (kind, None),
     )
 }
 
@@ -5407,8 +5403,9 @@ fn receive_session<R: Read, W: Write>(
     (destination, destination_state): (&Path, &Path),
     sqlite: SqliteMode,
     hand: Option<HandIn>,
-    kind: RootKind,
-    source_mode: Option<u32>,
+    // The root's kind, and the source root's mode when this side knows it
+    // (a local `copy`), which an absent DEST root takes.
+    (kind, source_mode): (RootKind, Option<u32>),
 ) -> Result<TransferStats> {
     let setup_timer = PhaseTimer(&RECV_SETUP_NS, Instant::now());
     // S2: the overlap of the destination's state and root is refused before

@@ -768,7 +768,10 @@ fn a_trailing_slash_never_follows_a_link_at_dest() {
     std::os::unix::fs::symlink("real", scratch.path("destination/link")).unwrap();
     std::os::unix::fs::symlink("real.txt", scratch.path("destination/lf")).unwrap();
     settle(&scratch.path("source"));
-    for (index, dest) in ["destination/link/", "destination/link/."].iter().enumerate() {
+    for (index, dest) in ["destination/link/", "destination/link/."]
+        .iter()
+        .enumerate()
+    {
         let states = (format!("ss{index}"), format!("ds{index}"));
         let ran = scratch.copy(false, "source", dest, (&states.0, &states.1));
         assert!(!ran.ok, "{dest}: {}{}", ran.stdout, ran.stderr);
@@ -785,7 +788,10 @@ fn a_trailing_slash_never_follows_a_link_at_dest() {
         "{}",
         ran.stderr
     );
-    assert_eq!(names(&scratch.path("destination/real")), Vec::<String>::new());
+    assert_eq!(
+        names(&scratch.path("destination/real")),
+        Vec::<String>::new()
+    );
     assert_eq!(
         std::fs::read(scratch.path("destination/real.txt")).unwrap(),
         b"theirs\n"
@@ -812,7 +818,12 @@ fn an_absent_root_takes_the_source_mode_never_wider() {
             .unwrap();
         settle(&scratch.path(&source));
         let dest = format!("destination/{name}");
-        let ran = scratch.copy(false, &source, &dest, (&format!("ss-{name}"), &format!("ds-{name}")));
+        let ran = scratch.copy(
+            false,
+            &source,
+            &dest,
+            (&format!("ss-{name}"), &format!("ds-{name}")),
+        );
         assert!(ran.ok, "{name}: {}{}", ran.stdout, ran.stderr);
         assert_eq!(
             mode(&scratch.path(&dest)),
@@ -821,8 +832,11 @@ fn an_absent_root_takes_the_source_mode_never_wider() {
         );
     }
     std::fs::write(scratch.path("source/a.txt"), b"a\n").unwrap();
-    std::fs::set_permissions(scratch.path("source"), std::fs::Permissions::from_mode(0o755))
-        .unwrap();
+    std::fs::set_permissions(
+        scratch.path("source"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
     settle(&scratch.path("source"));
     let ran = scratch.pull(false, "source", "destination/pulled", ("ss-p", "ds-p"));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);

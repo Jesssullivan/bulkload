@@ -154,7 +154,8 @@ variants kept). Then, in the coordinator's order:
    a made root still empty is removed (`remove_dir`) when this side's setup
    then refuses, and the made root is 0755 under the umask, as
    `estate-carry-files` makes its destinations (this replaces the 0700 the
-   brief named; the coordinator asked to align with carry).
+   brief named; the coordinator asked to align with carry). Superseded by
+   verification B below: the source root's mode, else 0700.
 7. LOW, no change: a hand-made group- or other-readable `MOVE_STATE/serve`
    refuses `PATH_ESCAPES_ROOT`; the live neo `MOVE_STATE`s are 0700
    (reviewer checked).
@@ -167,6 +168,27 @@ waited on files, so I wrote its exit marker myself to release them
 no-ops by atomic rename. The A/B script now bounds its fetch
 (`timeout 300`). The lean target dir (`target-sf-v3`, debuginfo off)
 replaced a 12 GB one after the coordinator reported `/home` at 100 %.
+
+## Verification round (#283 at `633ff463`)
+
+The coordinator's verification review found all six first-review items
+fixed and the branch data-safe, with two small defects, fixed in
+`8d9ac60`:
+
+- A: a DEST written with a trailing `/` (or `/.`) followed a symlink at its
+  last component (`lstat("dst/")` reports the target; the no-follow open
+  follows a path ending in `/`). `resolve_destination` rebuilds DEST from
+  its components before the lstat and the open, so a link there is
+  `DESTINATION_KIND_MISMATCH`.
+- B: a newly made DEST root was 0755 whatever the source, so
+  `copy ~/.ssh /new/.ssh` landed world-listable. `copy` makes it with the
+  source root's permission bits (`& 0o777`), never wider, narrowed by the
+  umask; `pull` makes it 0700, since wire v6 carries no root row.
+
+Filed, not fixed (coordinator): #287 (C: a `copy --file` closure record is
+keyed by a symlink leaf's target) and #288 (D: cross-verb ownership
+flip-flop; the review's repro was not in this lane's hands, so the issue
+gives this lane's reading of the mechanism to be checked against it).
 
 ## Tests
 
