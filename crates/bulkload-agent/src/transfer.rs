@@ -584,70 +584,94 @@ fn parent_or_dot(path: &Path) -> &Path {
 }
 
 /// The canonical path a private state root has, or will have once a store
-/// creates it: the root itself when it exists, else its canonical parent
-/// joined with its name; and when the parent is absent too, the canonical
-/// grandparent joined with both names, since `serve` makes one missing
-/// level ([`ensure_state_parent`], #276). Read-only, so an overlap with a
-/// root it must not touch is refused before anything is created (WP1 PR 3,
-/// S2).
+/// creates it: the root itself when it exists, else its nearest existing
+/// ancestor, canonical, joined with every missing name below it, since
+/// `serve` makes each missing parent ([`ensure_state_parents`], #276).
+/// Read-only, so an overlap with a root it must not touch is refused before
+/// anything is created (WP1 PR 3, S2).
 fn canonical_state(state: &Path) -> Result<PathBuf> {
     match std::fs::symlink_metadata(state) {
         Ok(_) => std::fs::canonicalize(state).refuse_at("transfer::canonical_state"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let name = state.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?;
-            let parent = parent_or_dot(state);
-            match std::fs::canonicalize(parent) {
-                Ok(parent) => Ok(parent.join(name)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let level = parent.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?;
-                    Ok(std::fs::canonicalize(parent_or_dot(parent))
-                        .refuse_at("transfer::canonical_state")?
-                        .join(level)
-                        .join(name))
+            let mut missing = vec![state.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?];
+            let mut at = parent_or_dot(state);
+            loop {
+                match std::fs::canonicalize(at) {
+                    Ok(mut found) => {
+                        found.extend(missing.iter().rev());
+                        return Ok(found);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        missing.push(at.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?);
+                        at = parent_or_dot(at);
+                    }
+                    Err(error) => {
+                        return Err(crate::refuse::io(&error, "transfer::canonical_state"))
+                    }
                 }
-                Err(error) => Err(crate::refuse::io(&error, "transfer::canonical_state")),
             }
         }
         Err(error) => Err(crate::refuse::io(&error, "transfer::canonical_state")),
     }
 }
 
-/// `serve`'s own precondition (#276): the directory its state root sits in
-/// exists. An absent one is made here, mode 0700, when its own parent
-/// exists; one level, so a deeper missing chain stays the operator's and
-/// refuses as before. An existing directory is left as it is, whatever its
-/// mode: the store judges its own root, not the path above it. The new
-/// entry is made durable before the store's entry beneath it is (R-N102).
+/// `serve`'s own precondition (#276): every directory above its state root
+/// exists. Each absent one is made here, mode 0700, from the nearest
+/// existing ancestor down (`create_dir_all` semantics). The ancestor is the
+/// operator's path, symlinks and all, as the store's own earlier components
+/// are; every directory made here is made with `mkdirat` beneath the
+/// descriptor of the one above it and entered with `O_NOFOLLOW`, so a name
+/// swapped for a symlink in between refuses `PATH_ESCAPES_ROOT` and nothing
+/// is made through it. An existing directory is left as it is, whatever its
+/// mode: the store judges its own root, not the path above it. Each new
+/// entry is made durable before the next one beneath it (R-N102).
 ///
-/// `estate-move-source` makes `MOVE_STATE/serve` too; this covers a state
-/// handed to `serve` by anything else (`pull` by hand, a newer destination
-/// half, `estate-carry-files --source-state-root`), whoever drives it.
-fn ensure_state_parent(state: &Path) -> Result<()> {
+/// `estate-move-source` makes `MOVE_STATE/serve` and `MOVE_STATE/serve/carry`
+/// too; this covers a state handed to `serve` by anything else (`pull` by
+/// hand, `estate-carry-files --source-state-root`, a newer destination half
+/// against an older source tree), whoever drives it.
+fn ensure_state_parents(state: &Path) -> Result<()> {
     use crate::counters::CountedSync as _;
-    let parent = parent_or_dot(state);
-    match std::fs::symlink_metadata(parent) {
-        Ok(_) => return Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(crate::refuse::io(&error, "transfer::ensure_state_parent")),
-    }
-    let name = parent.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?;
-    let name = crate::io::c_name(name.as_bytes()).refuse_at("transfer::ensure_state_parent")?;
-    let grandparent =
-        std::fs::File::open(parent_or_dot(parent)).refuse_at("transfer::ensure_state_parent")?;
-    match crate::io::sys::mkdirat(&grandparent, &name, 0o700) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => {
-            return Err(crate::refuse::io_in(
-                &error,
-                parent,
-                "transfer::ensure_state_parent",
-            ))
+    const SITE: &str = "transfer::ensure_state_parents";
+    let mut missing = Vec::new();
+    let mut at = parent_or_dot(state);
+    loop {
+        match std::fs::symlink_metadata(at) {
+            Ok(_) => break,
+            // A missing `.` or `/` has no name to make: the walk ends.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if at.file_name().is_none() {
+                    return Err(crate::refuse::io(&error, SITE));
+                }
+                missing.push(at);
+                at = parent_or_dot(at);
+            }
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
         }
     }
-    grandparent
-        .sync_dir_counted()
-        .refuse_at("transfer::ensure_state_parent")
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut directory = std::fs::File::open(at).refuse_at(SITE)?;
+    for path in missing.iter().rev() {
+        let name = path.file_name().ok_or(BulkloadRefusal::PathNotAbsolute)?;
+        let name = crate::io::c_name(name.as_bytes()).refuse_at(SITE)?;
+        match crate::io::sys::mkdirat(&directory, &name, 0o700) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(crate::refuse::io_in(&error, path, SITE)),
+        }
+        directory.sync_dir_counted().refuse_at(SITE)?;
+        let next = crate::io::sys::open_dir_at(&directory, &name).map_err(|error| {
+            if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+                BulkloadRefusal::PathEscapesRoot
+            } else {
+                crate::refuse::io(&error, SITE)
+            }
+        })?;
+        directory = std::fs::File::from(next);
+    }
+    Ok(())
 }
 
 /// The source root of a session, open (#232).
@@ -2213,9 +2237,9 @@ fn serve_session<R: Read + Send + 'static, W: Write>(
     if overlaps(&canonical_state(&state)?, &root) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
-    // #276: the one directory the state root sits in, when absent; after
-    // the check above, so it is never made inside the source.
-    ensure_state_parent(&state)?;
+    // #276: every directory above the state root, when absent; after the
+    // check above, so none is ever made inside the source.
+    ensure_state_parents(&state)?;
     let store = Store::open(&state)?;
     // Again on the store's own canonical root: a state swapped for a symlink
     // after the check above still refuses before any source read.

@@ -121,8 +121,9 @@ fn jobs(value: Option<&OsString>) -> Result<usize> {
 /// under the roots ([`moving::inventory`]), append the new items to
 /// `MOVE_STATE/carry/plan.postcard` (`estate-add-batch`), and capture the
 /// plan into `MOVE_STATE/carry/corpus` (`estate-capture`, private state in
-/// `MOVE_STATE/private`), and make `MOVE_STATE/serve`, where the
-/// destination half's `pull`s keep their `serve` states (#276). A capture
+/// `MOVE_STATE/private`), and make `MOVE_STATE/serve` and
+/// `MOVE_STATE/serve/carry`, where the destination half's `pull`s and its
+/// carry phase keep their `serve` states (#276). A capture
 /// refusal is an item's (its line says
 /// why; the destination carries it as files); only a refusal of the whole
 /// capture fails the verb.
@@ -165,12 +166,16 @@ fn source_command(args: &[OsString]) -> Result<()> {
     let _lock = moving::lock(&state)?;
     let carry = state.join("carry");
     moving::private_dir(&carry)?;
-    // #276: the destination half's `pull`s name their source state under
-    // `MOVE_STATE/serve/NAME`, on this host, over the transport it chose.
-    // The directory is this verb's, like `carry/` and `private/`, so it is
-    // here before the first `serve` is ever asked to open a state in it
-    // (`serve` makes it too, for a state handed to it by anything else).
+    // #276: the destination half's `pull`s name their source states under
+    // `MOVE_STATE/serve/NAME` (the corpus, the sessions) and its carry
+    // phase under `MOVE_STATE/serve/carry/ITEM` (`estate-carry-files
+    // --source-state-root`), on this host, over the transport it chose. The
+    // directories are this verb's, like `carry/` and `private/`, so they are
+    // here before the first `serve` is asked to open a state in them
+    // (`serve` makes every missing parent too, for a state handed to it by
+    // anything else).
     moving::private_dir(&state.join("serve"))?;
+    moving::private_dir(&state.join("serve/carry"))?;
     // The pass's mark: `estate-move` refuses a corpus pulled while a pass
     // was still writing it (its `done` mark is another pass's, or none).
     let pass = now_ns().to_string();

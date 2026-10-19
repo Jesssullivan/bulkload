@@ -357,11 +357,12 @@ fn the_wrong_kind_of_node_at_the_destination_is_typed() {
     assert_eq!(names(&scratch.path("destination")), ["taken"]);
 }
 
-// #276 (b): `serve`, here `copy`'s in-process source half, makes the one
-// directory its state root sits in; a deeper missing chain still refuses,
-// with nothing made.
+// #276 (b): `serve`, here `copy`'s in-process source half, makes every
+// missing directory above its state root, 0700 each (the carry phase's
+// `serve/carry/ITEM` is two levels below `serve/`); a missing chain that
+// would lie inside the source refuses the overlap with nothing made.
 #[test]
-fn serve_makes_the_one_missing_level_of_its_state_parent() {
+fn serve_makes_every_missing_parent_of_its_state_root() {
     let scratch = Scratch::new("stateparent");
     std::fs::write(scratch.path("source/a.txt"), b"a\n").unwrap();
     std::fs::create_dir(scratch.path("states")).unwrap();
@@ -370,25 +371,32 @@ fn serve_makes_the_one_missing_level_of_its_state_parent() {
         false,
         "source",
         "destination",
-        ("states/serve/corpus", "ds"),
+        ("states/serve/carry/item", "ds"),
     );
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert!(scratch.path("states/serve").is_dir());
-    assert_eq!(mode(&scratch.path("states/serve")), 0o700);
-    assert!(scratch.path("states/serve/corpus").is_dir());
+    for level in ["states/serve", "states/serve/carry"] {
+        assert!(scratch.path(level).is_dir(), "{level}");
+        assert_eq!(mode(&scratch.path(level)), 0o700, "{level}");
+    }
+    assert!(scratch.path("states/serve/carry/item").is_dir());
+    assert_eq!(
+        std::fs::read(scratch.path("destination/a.txt")).unwrap(),
+        b"a\n"
+    );
+    // Inside the source: S2 refuses before any level is made.
     let ran = scratch.copy(
         false,
         "source",
         "destination2",
-        ("states/a/b/corpus", "ds2"),
+        ("source/x/y/state", "ds2"),
     );
     assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
     assert!(
-        ran.stderr.contains("refused: IO (errno 2)"),
+        ran.stderr.contains("refused: SNAPSHOT_ROOTS_OVERLAP"),
         "{}",
         ran.stderr
     );
-    assert!(!scratch.path("states/a").exists());
+    assert!(!scratch.path("source/x").exists());
     assert!(!scratch.path("destination2").exists());
 }
 

@@ -1,9 +1,16 @@
 //! `estate-move-source` through the binary, on its state tree and its
 //! roots:
 //!
-//! - #276 (a): the pass makes `MOVE_STATE/serve` (0700) beside `carry/` and
-//!   `private/`, so the destination half's first cross-host `pull` finds the
-//!   directory its `serve` state is named in;
+//! - #276 (a): the pass makes `MOVE_STATE/serve` and `MOVE_STATE/serve/carry`
+//!   (0700) beside `carry/` and `private/`, so the destination half's first
+//!   cross-host `pull` and its carry phase find the directories their
+//!   `serve` states are named in;
+//! - #276, both sites, over a transport: `estate-move` to a host that is not
+//!   `-` runs every `pull` through `ssh`, here a stand-in first on `PATH`
+//!   that runs the remote command on this host. Over a fresh
+//!   `SOURCE_MOVE_STATE` the corpus pull (`serve/corpus`) and the carry phase
+//!   (`serve/carry/ITEM`) both end `ok`; with `serve/` removed (a source half
+//!   from before the fix) `serve` makes every missing parent itself (#276 b);
 //! - #277: a `SOURCE_ROOT` gone by the time the pass reaches it is a typed
 //!   `source-vanished` note (`SOURCE_ROOT_MISSING`) and the pass continues
 //!   with the rest; a pass with no usable root at all refuses, typed.
@@ -28,12 +35,24 @@ struct Ran {
 }
 
 fn agent(args: &[OsString]) -> Ran {
-    let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
+    agent_with_path(args, None)
+}
+
+/// [`agent`], with `first` ahead of the inherited `PATH`.
+fn agent_with_path(args: &[OsString], first: Option<&Path>) -> Ran {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+    command
         .arg("--min-free-percent=0")
         .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .unwrap();
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    if let Some(first) = first {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let mut path = OsString::from(first);
+        path.push(":");
+        path.push(inherited);
+        command.env("PATH", path);
+    }
+    let out = command.output().unwrap();
     Ran {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -112,14 +131,15 @@ fn the_pass_makes_the_serve_directory_beside_carry_and_private() {
     let state = world.path("state");
     let ran = agent(&os(&[&"estate-move-source", &state, &world.path("live")]));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    for name in ["carry", "private", "serve"] {
+    for name in ["carry", "private", "serve", "serve/carry"] {
         let dir = state.join(name);
         assert!(dir.is_dir(), "{name} missing:\n{}", ran.stdout);
         assert_eq!(mode(&dir), 0o700, "{name}");
     }
     // Nothing of the pass's own lands in `serve/`: it is the destination
-    // half's to fill, one `pull` state per name.
-    assert_eq!(fs::read_dir(state.join("serve")).unwrap().count(), 0);
+    // half's to fill, one `pull` state per name (and `carry/` per item).
+    assert_eq!(fs::read_dir(state.join("serve")).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(state.join("serve/carry")).unwrap().count(), 0);
 }
 
 #[test]
@@ -179,4 +199,95 @@ fn a_pass_with_no_usable_root_refuses_typed() {
         "{}",
         ran.stdout
     );
+}
+
+/// An `ssh` stand-in: drops ssh's own options and the host, then runs the
+/// remote command here, its stdin and stdout the session's.
+fn fake_ssh(dir: &Path) {
+    fs::create_dir_all(dir).unwrap();
+    let ssh = dir.join("ssh");
+    fs::write(
+        &ssh,
+        "#!/bin/sh\nwhile [ $# -gt 0 ] && [ \"$1\" != -- ]; do shift; done\nshift 2\nexec \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&ssh, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// `live` (lands) and `broken` (no index: its capture is refused, so the
+/// carry phase carries it as files), sourced, then moved to `fakehost`
+/// over the `ssh` stand-in. `before_move` runs on the source state between
+/// the two halves.
+fn carry_over_ssh(name: &str, before_move: impl FnOnce(&Path)) {
+    let world = World::new(name);
+    let src = world.path("src");
+    let dst = world.path("dst");
+    fs::create_dir_all(src.join("broken")).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    fs::rename(world.path("live/repo"), src.join("land")).unwrap();
+    let broken = src.join("broken");
+    git(&broken, &["init", "--quiet", "--template=", "-b", "main"]);
+    fs::write(broken.join("b.txt"), "b\n").unwrap();
+    git(&broken, &["add", "."]);
+    git(&broken, &["commit", "--quiet", "-m", "c0"]);
+    fs::remove_file(broken.join(".git/index")).unwrap();
+    let source_state = world.path("move-src");
+    let state = world.path("move-dst");
+    let map = format!("{}={}", src.display(), dst.display());
+    let sourced = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src,
+    ]));
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    before_move(&source_state);
+    let bin = world.path("fake-bin");
+    fake_ssh(&bin);
+    let moved = agent_with_path(
+        &os(&[
+            &"estate-move",
+            &"--label",
+            &"neo-20261019",
+            &"--source",
+            &"neo",
+            &"--remote-executable",
+            &env!("CARGO_BIN_EXE_bulkload-agent"),
+            &"fakehost",
+            &source_state,
+            &state,
+        ]),
+        Some(&bin),
+    );
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(moved.stdout.contains("estate-move phase=pull outcome=ok"), "{both}");
+    assert!(moved.stdout.contains("estate-move phase=carry outcome=ok"), "{both}");
+    assert!(!both.contains("TRANSPORT_LOST"), "{both}");
+    assert_eq!(fs::read(dst.join("broken/b.txt")).unwrap(), b"b\n", "{both}");
+    // Each `serve` state is where the destination half named it, private.
+    for level in ["serve", "serve/carry", "serve/corpus"] {
+        assert_eq!(mode(&source_state.join(level)), 0o700, "{level}\n{both}");
+    }
+    let items: Vec<_> = fs::read_dir(source_state.join("serve/carry"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(items.len(), 1, "{items:?}\n{both}");
+    assert_eq!(mode(&items[0]), 0o700);
+}
+
+// #276, both sites, over a fresh SOURCE_MOVE_STATE.
+#[test]
+fn the_carry_phase_over_ssh_finds_its_serve_states() {
+    carry_over_ssh("carry-fresh", |_| {});
+}
+
+// #276 (b): a source half from before the fix made no `serve/`: `serve`
+// makes `serve/` and `serve/carry/` itself, 0700, for both sites.
+#[test]
+fn the_carry_phase_over_ssh_without_a_serve_directory() {
+    carry_over_ssh("carry-no-serve", |source_state| {
+        fs::remove_dir_all(source_state.join("serve")).unwrap();
+    });
 }
