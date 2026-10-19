@@ -394,7 +394,7 @@ fn root_view(path: &Path) -> Option<Space> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn root_view(_path: &Path) -> Option<Space> {
+const fn root_view(_path: &Path) -> Option<Space> {
     None
 }
 
