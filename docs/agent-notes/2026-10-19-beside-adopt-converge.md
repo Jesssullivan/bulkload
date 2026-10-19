@@ -113,10 +113,14 @@ New rows (fixtures created and destroyed by the tests, R-N98):
   entry included, imported despite a refused beside; closure `refs_in`),
   P122 (the GloriousFlywheel shape: a hand-plan standalone landing with
   estate-handoff blocks, re-keyed and converged), P123 (a retired beside
-  landing is not laid down again; diff `beside=retired`).
+  landing is not laid down again; diff `beside=retired`), P124 (a gitfile
+  naming a gone or another repository's gitdir is `GIT_BESIDE_FOREIGN`),
+  P125 (stash entries decided by commit).
 - Fault harness: `estate_apply_beside_converge_after_{intent,seat,index,head}`
   (a crashed beside converge settles forward, no native ref of the live
-  repository moved); `estate_apply_beside_stale_capture` now converges.
+  repository moved); `estate_apply_beside_rekey_after_{intent,seat,head}`
+  (the same for a re-keyed standalone hand-plan landing);
+  `estate_apply_beside_stale_capture` now converges.
 - Changed rows: P111 and P112 expect `GIT_BESIDE_FOREIGN` (diff
   `beside=foreign`) where they expected `GIT_DESTINATION_OCCUPIED`;
   `tests/estate_move.rs`'s converge pass expects the beside item
@@ -157,6 +161,19 @@ findings and what was done:
 | 8 | the refused beside's refs-in is not in the receipt | open: closure's `refs_in` names it; the refusal's receipt is the refusal |
 | 9 | tests: `contains` matched `=10`; no edit-inside or retired-refs rows | fixed: exact word matching, P117 and P123 rows; a CAS conflict on a move and a third party moving a namespace ref between passes are not tested (open) |
 
+## Second review (coordinator, PR #282 comment, 2026-10-19T06:07Z, at `20c8981`)
+
+Verdict there: no data-loss findings; F1 must be fixed before the live run.
+
+| # | Finding | Disposition |
+| --- | --- | --- |
+| F1 | a beside directory whose `.git` gitfile names a gitdir that is gone (the two `/Users/jess/...` dirs, any copy of a pruned worktree) ended as a bare `IO (errno 2)`: unaccounted, not dispositionable | fixed: `beside::linked_into` resolves the gitfile, the gitdir and its common directory read-only before anything else; a gone gitdir or another repository's common directory is `GIT_BESIDE_FOREIGN`; P124 (`gone`, `other`) checks nothing is written and closure has 0 unaccounted |
+| F2 | stash refs are named by index but retired and moved by name, so a stash commit the operator deleted came back under another index | fixed: `beside::stash_wanted` decides stash entries by commit: a commit this item put under `refs/<ns>-stash/` that no ref there holds now is left out, the rest renumbered (beside landing) or new ones put at a free index (refs-in); `plan_own` never retires a stash entry by name; P125 (beside converge and refused-beside refs-in) |
+| F3 | `plan_own` recreates an absent namespace ref this item never created (another item's, or the 10-17 hand refs-in's), even one the operator deleted | gap: needs every item's records for the repository (items of one repository share its refs); additive only, no ref moved or lost |
+| F4 | `rekey_refusal` checks only the current plan, so two live plans naming the same `<X>.LABEL` could re-key it back and forth | gap: each re-key still needs its full ledger proof first, so no edit is lost; one plan per MOVE_STATE is the run discipline tonight |
+| F5 | an `OCCUPIED`/`DIVERGED` raised inside `apply_workspace` after `landed::lock`, `settle_repository` and `sweep_probes` is mapped to foreign, so under a race a lock file and ledger directory get created inside a foreign `.git` | gap: only the post-lock race re-checks (another apply adopting the same checkout at that moment, or a change between the proof and the lock) reach it; every decision `land` can make read-only now runs before the lock (`linked_into`, `rekey_check`, the adoption proof); what the race leaves is bulkload's empty lock file and ledger directory, no user byte; removing them is unsafe while the other apply holds that lock |
+| F6 | the new fault rows covered only the linked beside converge; tonight's shapes are standalone | fixed: `estate_apply_beside_rekey_after_{intent,seat,head}` (a hand plan's standalone landing at the beside path, re-keyed, its converge crashed; settled forward, still standalone, no live ref moved) |
+
 ## Open
 
 - `GloriousFlywheel-mms-dind-pin-20260831` (and every symlinked live
@@ -172,8 +189,12 @@ findings and what was done:
   the two linked ones whose `.git` names a `/Users/jess/...` path: they
   hold older neo state than the current capture, so they will refuse
   `GIT_BESIDE_FOREIGN` (named) and wait for closure-dispose; their refs go
-  in. The 56 hand-plan landings with hand-off records (the GloriousFlywheel
-  shape) re-key and converge when their proof holds.
+  in (before F1's fix the two linked ones ended as a bare `IO`). Those
+  refused items get only their refs on this pass, not the source's newest
+  tree bytes: the tree waits for the operator's review (a requirement gap
+  the second review named, not a defect). The 56 hand-plan landings with
+  hand-off records (the GloriousFlywheel shape) re-key and converge when
+  their proof holds.
 - An adopted beside checkout whose hand-off block bulkload did not record
   (the foreign-adoption allowance) is proved by its print on later passes;
   a later content check (racy print, another file system) reads the block

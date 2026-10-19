@@ -75,7 +75,11 @@
 //!     and the checkout's extra branches and remotes, are not compared;
 //!   - anything else, or one of the above whose shape or proof finds it
 //!     another's (`GIT_DESTINATION_OCCUPIED` or `GIT_DESTINATION_DIVERGED`
-//!     inside): `GIT_BESIDE_FOREIGN`, naming the beside path. Nothing there
+//!     inside): `GIT_BESIDE_FOREIGN`, naming the beside path. A `.git`
+//!     gitfile is resolved read-only first (review of #282, F1): one naming
+//!     an administration directory that is gone (a copy of a pruned or
+//!     moved worktree) or whose common directory is not the planned
+//!     repository's is foreign too, never a bare `IO`. Nothing there
 //!     is written, moved or deleted, and closure holds the item pending
 //!     review; the item's refs still go in (`--refs-in`).
 //! - **Refs in.** Before anything is landed, a ref named `refs/<ns>` or
@@ -90,7 +94,11 @@
 //!   `beside-ref-moved`; the old value stays in the earlier capture's
 //!   provenance refs). One this item created that is absent now was
 //!   removed by the operator and is never created again
-//!   (`beside-ref-retired`). One held at any other value is kept, never
+//!   (`beside-ref-retired`). Stash entries are decided by commit, never by
+//!   index (review of #282, F2, [`stash_wanted`]): a stash commit this
+//!   item put there that no `refs/<ns>-stash/` ref holds now is left out
+//!   and the rest renumbered, so a removed commit never comes back under
+//!   another index. One held at any other value is kept, never
 //!   moved or deleted; one a ref of the repository would collide with as a
 //!   directory or a file refuses `GIT_DESTINATION_OCCUPIED` before any ref
 //!   is written. The creates and moves are recorded in STATE as pending,
@@ -111,7 +119,7 @@
 //!   `GIT_DESTINATION_OCCUPIED` instead, after the record, so it stays
 //!   pending review until the namespace is resolved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
@@ -237,27 +245,73 @@ pub fn refs_in_wanted(
     Ok(wanted)
 }
 
-/// The carried stash entries of `instance` in `repo` as a beside landing
-/// wants them.
+/// Whether `name` is a stash entry ref, `refs/<ns>-stash/<n>`: named by
+/// its position in the source's stash, so it is decided by its commit
+/// ([`stash_wanted`]), never retired by its name ([`plan_own`]).
+fn stash_entry(name: &str) -> bool {
+    name.strip_prefix("refs/")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(ns, index)| {
+            ns.ends_with("-stash") && !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit())
+        })
+}
+
+/// The carried stash entries of `instance` in `repo` as this item wants
+/// them under `refs/<ns>-stash/`, decided by commit (gap C12; review of
+/// #282, F2).
 ///
-/// Entry `n` (newest first) is `refs/<ns>-stash/<n>`. Gap C12: a refused
-/// beside's refs-in carries the stash too, so the source's stashes reach
-/// the live repository while the tree waits for review. Read-only.
+/// A stash commit this item put there before (`own`: its `.beside` and
+/// `.refs-in` records' `created`) that no ref there holds now was removed
+/// by the operator: it is left out, so a removed commit never comes back
+/// under another index. With `positional` (a beside landing, which mirrors
+/// the source's stash) the rest are numbered newest first, entry `n` as
+/// `refs/<ns>-stash/<n>`, and [`plan_own`] moves this item's own entries
+/// to them. Without it (create-only refs-in) a commit a ref there already
+/// holds is not wanted again, and each new one takes the lowest free
+/// index. Read-only.
 ///
 /// # Errors
-/// Whatever reading the provenance refuses.
+/// Whatever reading the provenance or the refs refuses.
 pub fn stash_wanted(
     repo: &Path,
-    source: &str,
-    instance: &str,
-    ns: &str,
+    (source, instance, ns): (&str, &str, &str),
+    own: &[(String, String)],
+    positional: bool,
 ) -> Result<BTreeMap<String, String>> {
+    let prefix = format!("refs/{ns}-stash/");
+    let existing = names(repo)?;
+    let held: BTreeSet<&str> = existing
+        .iter()
+        .filter(|(name, _)| name.starts_with(&prefix))
+        .map(|(_, value)| value.as_str())
+        .collect();
+    let removed: BTreeSet<&str> = own
+        .iter()
+        .filter(|(name, _)| name.starts_with(&prefix))
+        .map(|(_, value)| value.as_str())
+        .filter(|value| !held.contains(value))
+        .collect();
     let (stash, _) = native_refs::carried_stash(repo, source, instance)?;
-    Ok(stash
+    let mut wanted = BTreeMap::new();
+    let mut free = 0_usize;
+    for entry in stash
         .into_iter()
-        .enumerate()
-        .map(|(index, entry)| (format!("refs/{ns}-stash/{index}"), entry.oid))
-        .collect())
+        .filter(|entry| !removed.contains(entry.oid.as_str()))
+    {
+        if positional {
+            wanted.insert(format!("{prefix}{}", wanted.len()), entry.oid);
+            continue;
+        }
+        if held.contains(entry.oid.as_str()) || wanted.values().any(|value| *value == entry.oid) {
+            continue;
+        }
+        while existing.contains_key(&format!("{prefix}{free}")) {
+            free += 1;
+        }
+        wanted.insert(format!("{prefix}{free}"), entry.oid);
+        free += 1;
+    }
+    Ok(wanted)
 }
 
 /// The ref namespace of `suffix`: the suffix without its leading `.`, one
@@ -329,16 +383,18 @@ pub fn import_instance(repo: &Path, staged: &super::StagedBundle, source: &str) 
     super::import_verified_instance(repo, staged.path(), source).map(|(_, instance)| instance)
 }
 
-/// The refs a beside landing wants in `repo`: each captured ref of
-/// `instance` under `refs/<ns>/`, each stash entry as `refs/<ns>-stash/<n>`.
+/// The refs a beside landing wants in `repo`.
+///
+/// Each captured ref of `instance` under `refs/<ns>/`, each stash entry as
+/// `refs/<ns>-stash/<n>` ([`stash_wanted`], positional, less the commits
+/// this item put there and the operator removed since: `own`).
 ///
 /// # Errors
 /// Whatever reading the provenance refuses.
 pub fn wanted(
     repo: &Path,
-    source: &str,
-    instance: &str,
-    ns: &str,
+    (source, instance, ns): (&str, &str, &str),
+    own: &[(String, String)],
 ) -> Result<BTreeMap<String, String>> {
     let mut wanted = BTreeMap::new();
     for (name, value) in native_refs::carried(repo, source, instance)? {
@@ -347,7 +403,7 @@ pub fn wanted(
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
         wanted.insert(format!("refs/{ns}/{rest}"), value);
     }
-    wanted.extend(stash_wanted(repo, source, instance, ns)?);
+    wanted.extend(stash_wanted(repo, (source, instance, ns), own, true)?);
     Ok(wanted)
 }
 
@@ -403,8 +459,10 @@ pub fn plan(repo: &Path, wanted: &BTreeMap<String, String>) -> Result<RefsPlan> 
 /// own value is bulkload's own output, unchanged since it wrote it, and
 /// moves to the carried value (`moved`); a name this item created that is
 /// absent now was removed by the operator and is never created again
-/// (`retired`). Every other name is decided as [`plan`] decides it: a ref
-/// held at another value is kept, never moved. Read-only.
+/// (`retired`), except a stash entry, whose removed commit
+/// [`stash_wanted`] already left out (its index may hold another commit
+/// now). Every other name is decided as [`plan`] decides it: a ref held at
+/// another value is kept, never moved. Read-only.
 ///
 /// # Errors
 /// As [`plan`].
@@ -430,7 +488,7 @@ pub fn plan_own(
             Some(held) => planned
                 .kept
                 .push((name.clone(), held.clone(), value.clone())),
-            None if own.iter().any(|(mine, _)| mine == name) => {
+            None if !stash_entry(name) && own.iter().any(|(mine, _)| mine == name) => {
                 planned.retired.push((name.clone(), value.clone()));
             }
             None => {
@@ -623,6 +681,28 @@ pub fn ledger_of(beside: &Path, source: &str) -> Result<Option<landed::LandedWor
     landed::read(&landed::ledger_dir(&git_dir, source).join(landed::WORKSPACE_LANDED))
 }
 
+// Review of #282, F1: whether `beside`, which holds no `.git` directory, is
+// a linked worktree of `repository`: a `.git` gitfile naming an
+// administration directory that exists, whose common directory is the
+// repository's. Read-only; anything else (no `.git`, a gitfile naming a
+// gitdir that is gone, another repository's worktree, an unreadable one)
+// is foreign.
+fn linked_into(beside: &Path, repository: &Path) -> bool {
+    let Ok(Some(git_dir)) = landed::worktree_git_dir(beside) else {
+        return false;
+    };
+    if !std::fs::symlink_metadata(&git_dir).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
+    match (
+        landed::common_dir(&git_dir),
+        super::common_repository(repository),
+    ) {
+        (Ok(common), Ok(planned)) => converge::same_dir(&common, &planned),
+        _ => false,
+    }
+}
+
 /// Land the capture at `beside` for the planned item `target` (gap C12).
 ///
 /// See the module docs (A-115): a first linked landing when the path is
@@ -682,6 +762,12 @@ pub fn land(
         return Err(foreign());
     }
     let standalone = std::fs::symlink_metadata(beside.join(".git")).is_ok_and(|meta| meta.is_dir());
+    // Review of #282, F1: a `.git` gitfile is read before anything else: one
+    // naming an administration directory that is gone (a copy of a pruned
+    // or moved worktree) or another repository's is foreign, never a bare IO.
+    if !standalone && !linked_into(beside, target.repository) {
+        return Err(foreign());
+    }
     let at = if standalone { &own_repository } else { &linked };
     let ledger = ledger_of(beside, target.source)?;
     let (how, policy) = match &ledger {

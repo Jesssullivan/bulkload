@@ -3103,3 +3103,120 @@ fn p123_a_retired_beside_landing_is_not_laid_down_again() {
         }
     }
 }
+
+/// P124 BESIDE-GITFILE (review of #282, F1): a beside directory whose
+/// `.git` gitfile names an administration directory that is gone (a copy
+/// of a pruned or moved linked worktree, as the two sting `*.neo-20261016`
+/// directories naming `/Users/jess/...` are) or another repository's
+/// refuses `GIT_BESIDE_FOREIGN`, typed and pending review, never a bare
+/// `IO`; nothing at the beside path is written; `estate-diff` says
+/// `beside=foreign`; closure has nothing unaccounted.
+#[test]
+fn p124_a_beside_gitfile_naming_a_gone_or_foreign_gitdir_is_foreign() {
+    for case in ["gone", "other"] {
+        let (world, source, dest) = small();
+        let run = diverged(&world, &source, &dest, false);
+        let beside = beside_of(&dest);
+        copy_tree(&source, &beside);
+        fs::remove_dir_all(beside.join(".git")).unwrap();
+        let gitdir = if case == "gone" {
+            world.path("gone/.git/worktrees/lamesh")
+        } else {
+            let other = unrelated_source(&world, "other");
+            let tree = world.path("other-wt");
+            git(
+                &other,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    "w",
+                    tree.to_str().unwrap(),
+                ],
+            );
+            other.join(".git/worktrees/other-wt")
+        };
+        fs::write(
+            beside.join(".git"),
+            format!("gitdir: {}\n", gitdir.display()),
+        )
+        .unwrap();
+        let frozen = freeze_all(&beside);
+        let diff = run.diff(&["--beside", SUFFIX]);
+        assert!(
+            diff_line(&diff.stdout, &source).contains("\"beside=foreign:"),
+            "{case}: {}",
+            diff.stdout
+        );
+        let ran = run.apply(&["--adopt", "--beside", SUFFIX, "--refs-in"]);
+        let row = receipt(&receipts(&ran.stdout), &source).clone();
+        assert_eq!(row.1, "refused", "{case}: {row:?}");
+        assert!(row.2.contains("GIT_BESIDE_FOREIGN"), "{case}: {row:?}");
+        assert_eq!(freeze_all(&beside), frozen, "{case}: the beside path moved");
+        let closure = run.closure();
+        assert!(
+            closure.stdout.contains("\"unaccounted\":0")
+                && closure.stdout.contains("\"refused_pending_review\":1")
+                && closure.stdout.contains("\"GIT_BESIDE_FOREIGN\":1"),
+            "{case}: {}",
+            closure.stdout
+        );
+    }
+}
+
+/// P125 BESIDE-STASH-BY-COMMIT (review of #282, F2): stash entries are
+/// decided by commit, never by index. After a pass put the source's stash
+/// `A` at `refs/neo-20261016-stash/0` and the operator deleted it, the
+/// source stashing `B` (its stash now `B`, `A`) makes the next pass put
+/// `B` at index 0, and no ref holds `A` again under another index: through
+/// a beside converge (a mirror, its own entries moved), and through the
+/// create-only refs-in of a refused beside (a new commit at a free index).
+#[test]
+fn p125_stash_refs_are_decided_by_commit() {
+    for refused in [false, true] {
+        let (world, source, dest) = small();
+        fs::write(source.join("README"), b"LA-Mesh, stash A\n").unwrap();
+        git(&source, &["stash", "push", "--quiet", "-m", "A"]);
+        let a = git(&source, &["rev-parse", "refs/stash"]).trim().to_owned();
+        let run = diverged(&world, &source, &dest, true);
+        let beside = beside_of(&dest);
+        let mut flags = vec!["--adopt", "--beside", SUFFIX];
+        if refused {
+            fs::create_dir(&beside).unwrap();
+            fs::write(beside.join("operator.txt"), b"mine\n").unwrap();
+            flags.push("--refs-in");
+        }
+        let stash = |repo: &Path| -> BTreeMap<String, String> {
+            named_refs(repo)
+                .into_iter()
+                .filter(|(name, _)| name.starts_with("refs/neo-20261016-stash/"))
+                .collect()
+        };
+        run.apply(&flags);
+        assert_eq!(
+            stash(&dest),
+            BTreeMap::from([("refs/neo-20261016-stash/0".to_owned(), a.clone())]),
+            "{refused}"
+        );
+        git(&dest, &["update-ref", "-d", "refs/neo-20261016-stash/0"]);
+        fs::write(source.join("README"), b"LA-Mesh, stash B\n").unwrap();
+        git(&source, &["stash", "push", "--quiet", "-m", "B"]);
+        let b = git(&source, &["rev-parse", "refs/stash"]).trim().to_owned();
+        settle();
+        run.capture();
+        let ran = run.apply(&flags);
+        let row = receipt(&receipts(&ran.stdout), &source).clone();
+        let expected = if refused {
+            "refused"
+        } else {
+            "workspace-beside"
+        };
+        assert_eq!(row.1, expected, "{refused}: {row:?}");
+        assert_eq!(
+            stash(&dest),
+            BTreeMap::from([("refs/neo-20261016-stash/0".to_owned(), b)]),
+            "{refused}: a removed stash commit came back"
+        );
+    }
+}

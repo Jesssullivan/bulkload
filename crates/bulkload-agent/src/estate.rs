@@ -2650,7 +2650,8 @@ fn beside_item(
             .unwrap_or_default();
     git_carry::beside::settle_refs_in(target.repository, &mut refs_in)?;
     let own = git_carry::beside::own_refs(&record.created, &refs_in.created);
-    let wanted = git_carry::beside::wanted(target.repository, target.source, &instance, &ns)?;
+    let wanted =
+        git_carry::beside::wanted(target.repository, (target.source, &instance, &ns), &own)?;
     let planned = git_carry::beside::plan_own(target.repository, &wanted, &own)?;
     record.kept.clone_from(&planned.kept);
     record.pending = planned.writes();
@@ -2753,24 +2754,26 @@ fn refs_in(
     ns.clone_into(&mut record.ns);
     record.capture = capture;
     record.instance.clone_from(&instance);
-    let mut wanted = git_carry::beside::refs_in_wanted(repository, target.source, &instance, &ns)?;
-    if stash {
-        wanted.extend(git_carry::beside::stash_wanted(
-            repository,
-            target.source,
-            &instance,
-            &ns,
-        )?);
-    }
     // Gap C12: a name this item created before (here or in its beside
     // landing) and the operator removed since is never created again
     // (`refs-in-retired`); create-only, so one of its own the source moved
-    // since is kept, as any other differing name is.
+    // since is kept, as any other differing name is. Stash entries are
+    // decided by commit (review of #282, F2): a removed one is never
+    // created again under another index, and a new one takes a free index.
     let beside_created =
         git_carry::beside::read_record(&beside_record_path(state, identity, target.source))?
             .map(|record| record.created)
             .unwrap_or_default();
     let own = git_carry::beside::own_refs(&beside_created, &record.created);
+    let mut wanted = git_carry::beside::refs_in_wanted(repository, target.source, &instance, &ns)?;
+    if stash {
+        wanted.extend(git_carry::beside::stash_wanted(
+            repository,
+            (target.source, &instance, &ns),
+            &own,
+            false,
+        )?);
+    }
     let mut planned = git_carry::beside::plan_own(repository, &wanted, &own)?;
     planned.kept.append(&mut planned.moved);
     record.kept.clone_from(&planned.kept);

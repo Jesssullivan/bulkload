@@ -1266,7 +1266,13 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   proof and converged; a standalone checkout no ledger names adopted by
   the A11a proof in its own repository; anything else
   `GIT_BESIDE_FOREIGN`, which names the beside path, with nothing there
-  written. A linked beside checkout converges detached at the captured
+  written (a `.git` gitfile naming a gitdir that is gone, or another
+  repository's, included: it is resolved read-only first, never a bare
+  `IO`). Namespace stash entries are decided by commit, never by index: a
+  stash commit this item put under `refs/<ns>-stash/` and the operator
+  removed is left out of later passes, and the rest renumbered (a beside
+  landing) or new ones put at a free index (refs-in), so a removed commit
+  never comes back under another index. A linked beside checkout converges detached at the captured
   head (`head-detached-beside`) and never steps the live repository's
   native refs (`Place::beside`); a standalone one is its own repository
   and converges as any standalone landing does. The adoption proof of a
