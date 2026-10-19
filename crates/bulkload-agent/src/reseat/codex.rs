@@ -325,7 +325,7 @@ pub fn landed_anything(options: &Options) -> Result<bool> {
     if !std::fs::metadata(&options.landing_codex).is_ok_and(|meta| meta.is_dir()) {
         return Err(BulkloadRefusal::ReseatLandingAbsent);
     }
-    Ok(options.landing_codex.join(STATE_DB).is_file()
+    Ok(options.landing_index().is_file()
         || TREES.iter().any(|tree| {
             std::fs::read_dir(options.landing_codex.join(tree))
                 .is_ok_and(|mut entries| entries.next().is_some())
@@ -354,7 +354,7 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
     let Ok(root) = std::fs::canonicalize(&options.dest_codex) else {
         return Ok(0);
     };
-    let path = options.landing_codex.join(STATE_DB);
+    let path = options.landing_index();
     let cached = match (ledger, std::fs::symlink_metadata(&path)) {
         (Some(ledger), Ok(meta)) => ledger.snapshot_threads(&path, Identity::of(&meta))?,
         _ => None,
@@ -513,7 +513,7 @@ pub fn reseat(
 ) -> Result<()> {
     let root = super::root(&options.dest_codex)?;
     let mut snapshot = Snapshot {
-        path: options.landing_codex.join(STATE_DB),
+        path: options.landing_index(),
         conn: None,
     };
     let db = root.join(STATE_DB);
@@ -1502,6 +1502,13 @@ fn reseat_unindexed(
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
+    // A live-home landing (plan of record 2026-10-19, C9): the landed
+    // `.codex` is the live one, so the destination's own rollouts are listed
+    // here too. One the destination already indexes, or one whose recorded
+    // working directory is no source path and has no lane, is the
+    // destination's own: `in-place`, nothing read past its name, nothing
+    // written.
+    let live = options.live_codex_landing();
     for file in unindexed(options, named)? {
         let landed = options.landing_codex.join(&file.rel);
         let shown_id = file
@@ -1541,6 +1548,11 @@ fn reseat_unindexed(
             ))?;
             continue;
         }
+        if live && row_of(&dest.conn, &id)?.is_some() {
+            summary.session(TOOL, "in-place");
+            emit(&thread_line((&id, ""), None, "in-place", None, None))?;
+            continue;
+        }
         let Some(cwd) = unindexed_cwd(ledger, &id, &landed)? else {
             remember_refused(
                 ledger,
@@ -1561,6 +1573,11 @@ fn reseat_unindexed(
         let (dest_cwd, in_lane) = match lanes.lane(Path::new(&cwd))? {
             Some(lane) => (super::key::utf8(&lane.dest_cwd)?.to_owned(), true),
             None if options.by_id(&cwd) => (cwd.clone(), false),
+            None if live && !Path::new(&cwd).starts_with(&options.source_home) => {
+                summary.session(TOOL, "in-place");
+                emit(&thread_line((&id, &cwd), None, "in-place", None, None))?;
+                continue;
+            }
             None => {
                 remember_refused(
                     ledger,

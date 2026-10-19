@@ -31,16 +31,32 @@ USAGE:
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
     walk PATH   Stat-walk PATH and print the row and refusal counts
-    copy SOURCE DEST SOURCE_STATE DEST_STATE
+    copy [--beside SUFFIX] SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores; the
                 session's outcomes are recorded in
                 DEST_STATE/transfer.closure.d, one record per transfer, for
                 closure-report --transfer (WP3 PR 4). The S2 overlap checks
                 run before anything is written; a session that ends refused
-                keeps the earlier session's refused rows
-    pull HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
+                keeps the earlier session's refused rows.
+                --beside SUFFIX (plan of record 2026-10-19, C1/C2): land
+                into a live destination. An existing file bulkload did not
+                write is adopted when its bytes are the source's and
+                extended when it is a verified byte prefix of an
+                append-only source (as without the flag); one that differs
+                (and a symlink that differs) is left as it is and the
+                source's bytes are published at <path>SUFFIX, recorded
+                applied-beside in the transfer record (closure counts it
+                carried, never pending review). A database with a live
+                -wal/-shm/-journal beside it lands its snapshot at
+                <db>SUFFIX. A beside path holding something of its own is
+                refused DESTINATION_OCCUPIED; only this store's own earlier
+                beside output is superseded. SUFFIX is one name component
+                (e.g. .neo-20261019). Without the flag a differing file is
+                refused DESTINATION_OCCUPIED and nothing is placed
+    pull [--beside SUFFIX] HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
                 Native SSH pull; remote bulkload-agent must be installed; the
-                session is recorded in DEST_STATE as copy's is
+                session is recorded in DEST_STATE as copy's is; --beside as
+                copy's
     serve       Serve one framed request on stdin/stdout (for SSH)
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
@@ -206,19 +222,34 @@ SUBCOMMANDS:
                 the carry items, at the live path while it is still absent or
                 empty, else with --beside .LABEL. 5 hand-off: estate-handoff
                 for the items whose workspace this pass landed or adopted
-                (unless --no-hand-off). 6 with --sessions: SOURCE_HOME/.claude
-                and the Codex root (--codex-source-root, default
-                SOURCE_HOME/.codex) into MOVE_STATE/landing, then, when both
-                pulls completed, estate-reseat --lanes-from-plan with each
-                --map and --reseat-arg (one estate-reseat option per flag,
-                e.g. --no-regularize, --unmapped=by-id) into DEST_HOME
-                (--dest-home, default $HOME), state MOVE_STATE/reseat. 7
+                (unless --no-hand-off). 6 with --sessions (plan of record
+                2026-10-19, C9/C10/C11; no intermediary stage):
+                SOURCE_HOME/.claude and the Codex root (--codex-source-root,
+                default SOURCE_HOME/.codex) are pulled with --beside .LABEL
+                into the LIVE DEST_HOME/.claude and DEST_HOME/.codex
+                (--dest-home, default $HOME), transfer records in
+                MOVE_STATE/pull/{claude,codex}: equal files adopted, grown
+                append-only files extended, differing files and the live
+                Codex index's snapshot landed beside as <path>.LABEL. Then,
+                when both sessions completed (paths refused in them stay
+                typed refusals in closure), estate-reseat --lanes-from-plan
+                with each --map and --reseat-arg (one estate-reseat option
+                per flag, e.g. --no-regularize, --unmapped=by-id) re-keys
+                the landed sessions from the live home into DEST_HOME
+                (landing = DEST_HOME; the landed Codex index is
+                state_5.sqlite.LABEL when the live index was kept), state
+                MOVE_STATE/reseat. 7
                 closure: closure-report over the plan (with --dispositions, the
-                closure-dispose ledger joined), written to
+                closure-dispose ledger joined) and, with --sessions, over the
+                two session transfer records (applied-beside accounted,
+                refused paths pending review), written to
                 MOVE_STATE/closure.json, summarised on an estate-move closure
-                line with not_moved= (the source notes). The gate passes only
-                when every item is accounted and reviewed and nothing is noted
-                not moved; an estate-move gate= line names the next step. The
+                line with not_moved= (the source notes) and, with --sessions,
+                sessions= and reseat_unaccounted= (re-seat outcomes that
+                leave a session not resumable). The gate passes only when
+                every item and every session row is accounted and reviewed,
+                nothing is noted not moved and no re-seat outcome is
+                unaccounted; an estate-move gate= line names the next step. The
                 verb exits with the first phase's refusal, else
                 CLOSURE_UNACCOUNTED while the gate fails. The next converge
                 pass is estate-move-source again on the source, then
@@ -399,7 +430,8 @@ SUBCOMMANDS:
     estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
                   [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
                   [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
-                  [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
+                  [--landing-codex-index FILE] [--unmapped=report|by-id] [--note-marker TEXT]
+                  [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
                   [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
@@ -1263,6 +1295,31 @@ fn export_command(
     Ok(())
 }
 
+/// Take a leading `--beside SUFFIX` (or `--beside=SUFFIX`) off `args`,
+/// setting the process's beside suffix, and return the rest.
+fn beside_option(args: &[std::ffi::OsString]) -> Result<&[std::ffi::OsString]> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Some(first) = args.first() else {
+        return Ok(args);
+    };
+    let (suffix, taken) = if first.as_os_str() == "--beside" {
+        (
+            args.get(1)
+                .ok_or(BulkloadRefusal::RequiredFieldMissing)?
+                .as_bytes()
+                .to_vec(),
+            2,
+        )
+    } else if let Some(value) = first.as_bytes().strip_prefix(b"--beside=") {
+        (value.to_vec(), 1)
+    } else {
+        return Ok(args);
+    };
+    bulkload_agent::transfer::set_beside_suffix(Some(suffix))?;
+    Ok(args.get(taken..).unwrap_or_default())
+}
+
+#[allow(clippy::too_many_lines)] // One arm per verb; `--beside` for copy and pull.
 fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
     let path = |index: usize| {
         args.get(index)
@@ -1300,11 +1357,24 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             println!("{count}");
             Ok(())
         }
-        "copy" if args.len() == 4 => {
-            // WP3 PR 4: the session's outcomes are closure rows.
-            copy_recorded(path(0)?, path(1)?, path(2)?, path(3)?)
+        // `--beside SUFFIX` leads the positional arguments of copy and
+        // pull (plan of record 2026-10-19, C1/C2).
+        "copy" | "pull" => {
+            let rest = beside_option(args)?;
+            let path = |index: usize| {
+                rest.get(index)
+                    .map(Path::new)
+                    .ok_or(BulkloadRefusal::RequiredFieldMissing)
+            };
+            match command {
+                "copy" if rest.len() == 4 => {
+                    // WP3 PR 4: the session's outcomes are closure rows.
+                    copy_recorded(path(0)?, path(1)?, path(2)?, path(3)?)
+                }
+                "pull" if (5..=7).contains(&rest.len()) => pull_recorded(rest),
+                _ => Err(BulkloadRefusal::RequiredFieldMissing),
+            }
         }
-        "pull" if (5..=7).contains(&args.len()) => pull_recorded(args),
         "snapshot" if (2..=3).contains(&args.len()) => {
             bulkload_agent::provider_sqlite::snapshot(path(0)?, path(1)?, steps(args.get(2))?)?;
             println!("snapshot complete");
@@ -1772,6 +1842,13 @@ fn print_receipt(row: &bulkload_agent::estate::Receipt) -> Result<()> {
 // R0 (TIN-6587): re-seat landed agent sessions, or check that they hold.
 #[allow(clippy::too_many_lines)]
 fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
+    reseat_run(args).map(drop)
+}
+
+/// `estate-reseat`, returning a pass's summary (`None` for `--check` and
+/// `--undo`), which `estate-move` folds into its gate (C11).
+#[allow(clippy::too_many_lines)]
+fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::reseat::Summary>> {
     use bulkload_agent::reseat::{self, GitCheck, Unmapped};
     let mut check = false;
     let mut maps = Vec::new();
@@ -1779,7 +1856,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let (mut plan, mut corpus, mut source) = (None, None, None);
     let mut states = Vec::new();
     let mut roots = Vec::new();
-    let (mut landing_claude, mut landing_codex) = (None, None);
+    let (mut landing_claude, mut landing_codex, mut landing_index) = (None, None, None);
     let mut unmapped = Unmapped::Report;
     let mut marker = None;
     let mut sessions_only = false;
@@ -1842,6 +1919,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             | "--codex-source-root"
             | "--landing-claude"
             | "--landing-codex"
+            | "--landing-codex-index"
             | "--managed-settings"
             | "--by-id"
             | "--replace-archived-dest"
@@ -1853,6 +1931,12 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
                     "--private-state" => states.push(path),
                     "--codex-source-root" => roots.push(path),
                     "--landing-claude" => landing_claude = Some(path),
+                    "--landing-codex-index" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        landing_index = Some(path);
+                    }
                     "--managed-settings" => managed.push(path),
                     "--by-id" => {
                         if !path.is_absolute() {
@@ -1948,6 +2032,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     if let Some(path) = landing_codex {
         options.landing_codex = path;
     }
+    options.landing_index = landing_index;
     if !roots.is_empty() {
         options.codex_source_roots = roots;
     }
@@ -1996,14 +2081,17 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     if check && undo {
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
-    if undo {
+    let summary = if undo {
         reseat::undo(&options, &mut emit).map(drop)?;
+        None
     } else if check {
         reseat::check(&options, &mut emit)?.verdict()?;
+        None
     } else {
-        reseat::reseat(&options, &mut emit).map(drop)?;
-    }
-    output.flush().refuse_at("main::reseat_command")
+        Some(reseat::reseat(&options, &mut emit)?)
+    };
+    output.flush().refuse_at("main::reseat_command")?;
+    Ok(summary)
 }
 
 /// `estate-handoff`'s options, before its positional arguments
@@ -2597,7 +2685,7 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
          source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
-         sqlite_sidecars_covered={}",
+         sqlite_sidecars_covered={} applied_beside={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
@@ -2607,8 +2695,16 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         stats.capped_subtrees(),
         bulkload_agent::transfer::sqlite_mode_label(stats.sqlite_mode),
         stats.sqlite_snapshots.len(),
-        stats.sqlite_sidecars_covered.len()
+        stats.sqlite_sidecars_covered.len(),
+        stats.applied_beside.len()
     );
+    for (path, beside) in &stats.applied_beside {
+        eprintln!(
+            "applied-beside {} at={}",
+            path.escape_ascii(),
+            beside.escape_ascii()
+        );
+    }
     for (path, code) in &stats.refusals {
         // S4 (TIN-6592): an IO raised here prints its errno, as its record
         // keeps it.

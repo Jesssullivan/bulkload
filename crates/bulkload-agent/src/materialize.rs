@@ -1584,6 +1584,27 @@ impl StagedFile {
         &self.file
     }
 
+    /// The same staged file, to be published at `<leaf><suffix>` beside the
+    /// leaf it was staged for (`--beside`; the plan of record 2026-10-19,
+    /// C1/C2). The temporary itself is unchanged.
+    ///
+    /// # Errors
+    /// `PATH_NOT_PORTABLE` for a name that cannot be a C string.
+    pub(crate) fn with_suffix(mut self, suffix: &[u8]) -> Result<Self> {
+        let mut leaf = self.leaf.as_bytes().to_vec();
+        leaf.extend_from_slice(suffix);
+        match cstring(&leaf) {
+            Ok(leaf) => {
+                self.leaf = leaf;
+                Ok(self)
+            }
+            Err(refusal) => {
+                let _ = self.discard();
+                Err(refusal)
+            }
+        }
+    }
+
     /// Mark the staged file as a verified `SQLite` snapshot (#218): its
     /// rename into a free leaf, or its exchange with this store's own
     /// output (OI-1003-Q146), is refused `DESTINATION_OCCUPIED` when a

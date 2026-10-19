@@ -169,6 +169,11 @@ pub struct Options {
     pub landing_claude: PathBuf,
     /// The landed `.codex`, holding the landed `state_5.sqlite` snapshot.
     pub landing_codex: PathBuf,
+    /// The landed Codex index when it is not `landing_codex/state_5.sqlite`
+    /// (`--landing-codex-index`): with a live-home landing (plan of record
+    /// 2026-10-19, C9) the source's snapshot sits beside the live index as
+    /// `state_5.sqlite<suffix>`.
+    pub landing_index: Option<PathBuf>,
     /// The destination home: its `git` directory is the default lane root.
     pub dest_home: PathBuf,
     /// The destination's live `.claude`.
@@ -253,6 +258,7 @@ impl Options {
             source_home: source_home.to_path_buf(),
             landing_claude: landing_home.join(".claude"),
             landing_codex: landing_home.join(".codex"),
+            landing_index: None,
             dest_home: dest_home.to_path_buf(),
             dest_claude: dest_home.join(".claude"),
             dest_codex: dest_home.join(".codex"),
@@ -276,6 +282,43 @@ impl Options {
             min_free_percent: crate::space::min_free_percent(),
             rebind: Vec::new(),
             replace_archived: Vec::new(),
+        }
+    }
+
+    /// The landed Codex index: `landing_codex/state_5.sqlite`, or the
+    /// `--landing-codex-index` given.
+    #[must_use]
+    pub fn landing_index(&self) -> PathBuf {
+        self.landing_index
+            .clone()
+            .unwrap_or_else(|| self.landing_codex.join(codex::STATE_DB))
+    }
+
+    /// Whether the landed `.claude` is the destination's own live `.claude`
+    /// (a live-home landing, plan of record 2026-10-19, C9): the two resolve
+    /// to one directory. A landed session already under the key of its own
+    /// working directory is then in place, with nothing to re-seat.
+    #[must_use]
+    pub fn live_claude_landing(&self) -> bool {
+        match (
+            std::fs::canonicalize(&self.landing_claude),
+            std::fs::canonicalize(&self.dest_claude),
+        ) {
+            (Ok(landing), Ok(dest)) => landing == dest,
+            _ => false,
+        }
+    }
+
+    /// [`Self::live_claude_landing`] for `.codex`: the landed `.codex` is the
+    /// destination's live one (C9).
+    #[must_use]
+    pub fn live_codex_landing(&self) -> bool {
+        match (
+            std::fs::canonicalize(&self.landing_codex),
+            std::fs::canonicalize(&self.dest_codex),
+        ) {
+            (Ok(landing), Ok(dest)) => landing == dest,
+            _ => false,
         }
     }
 
@@ -308,6 +351,44 @@ impl Options {
 
 /// The default by-ID prefixes (OI-1003-Q198 C): neo's scratch directories.
 pub const BY_ID_PREFIXES: [&str; 2] = ["/private/tmp", "/tmp"];
+
+/// Whether a session or thread outcome word leaves the session accounted
+/// for in an `estate-move` closure (C11).
+///
+/// Accounted: resumable at its lane (`placed`,
+/// `adopted`, `extended`, `superseded`, `unchanged`, `rebound`,
+/// `replaced-archived`, `in-place`, and the Codex row words `registered`,
+/// `destination-adopted`, `destination-holds`, `destination-row-only`), or
+/// kept with the destination's own copy beside it, as SPEC R2.2 rules
+/// (`diverged`, `dest-ahead`, `dest-continued`, `both-continued`,
+/// `dest-removed`, `extend-raced`). Every other word (a lane refusal code,
+/// `occupied`, `collision`, `held`, `unreadable-form`, `exchange-unsupported`,
+/// `index-conflict`, ...) leaves the landed bytes somewhere no resume finds
+/// them, and holds the gate.
+#[must_use]
+pub fn word_accounted(word: &str) -> bool {
+    matches!(
+        word,
+        "placed"
+            | "adopted"
+            | "extended"
+            | "superseded"
+            | "unchanged"
+            | "rebound"
+            | "replaced-archived"
+            | "in-place"
+            | "registered"
+            | "destination-adopted"
+            | "destination-holds"
+            | "destination-row-only"
+            | "diverged"
+            | "dest-ahead"
+            | "dest-continued"
+            | "both-continued"
+            | "dest-removed"
+            | "extend-raced"
+    )
+}
 
 /// Now, nanoseconds since the epoch.
 #[must_use]
@@ -452,6 +533,19 @@ impl Summary {
             .get(&(tool.to_owned(), word.to_owned()))
             .copied()
             .unwrap_or(0)
+    }
+
+    /// The session and thread outcomes of this pass that leave a landed
+    /// session not resumable at its lane and not kept beside
+    /// ([`word_accounted`]), as `tool/word` → count. `estate-move` holds its
+    /// gate while any remain (plan of record 2026-10-19, C11).
+    #[must_use]
+    pub fn unaccounted(&self) -> BTreeMap<String, u64> {
+        self.sessions
+            .iter()
+            .filter(|((_, word), count)| **count > 0 && !word_accounted(word))
+            .map(|((tool, word), count)| (format!("{tool}/{word}"), *count))
+            .collect()
     }
 
     fn line(&self) -> String {

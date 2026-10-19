@@ -681,3 +681,66 @@ proptest! {
         prop_assert_eq!(report.ruled_default, defaulted);
     }
 }
+
+/// Plan of record 2026-10-19, C1/C2: a seat `--beside SUFFIX` landed beside
+/// a differing live file is an `applied-beside` transfer row, accounted and
+/// counted in `applied_beside`, never pending review, and the row names the
+/// beside path; a refused path in the same session still holds the gate,
+/// so the gate reads the agent state exactly as it is on the destination.
+#[test]
+fn an_applied_beside_entry_is_accounted_and_gate_relevant() {
+    let stats_of = || {
+        let mut stats = TransferStats::default();
+        stats.applied_beside.push((
+            b"settings.json".to_vec(),
+            b"settings.json.neo-20261019".to_vec(),
+        ));
+        stats.applied_beside.push((
+            b"state_5.sqlite".to_vec(),
+            b"state_5.sqlite.neo-20261019".to_vec(),
+        ));
+        stats.sqlite_snapshots.push(b"state_5.sqlite".to_vec());
+        stats.completed = 2;
+        stats
+    };
+    let dest = state_with(&ended(stats_of()));
+    let report = report_of(&[dest.path()]);
+    assert_eq!(report.transfer_rows(), 3, "the session and two entries");
+    assert_eq!(report.applied, 1, "the session ran to its end");
+    assert_eq!(report.applied_beside, 2);
+    assert_eq!((report.unaccounted, report.refused_pending_review), (0, 0));
+    assert!(report.passes(), "nothing pending: the gate passes");
+    let placed = row(&report, "settings.json");
+    assert_eq!(placed.disposition, Disposition::AppliedBeside);
+    assert_eq!(placed.kind, RowKind::TransferEntry);
+    assert_eq!(
+        placed
+            .transfer
+            .as_ref()
+            .and_then(|detail| detail.beside.as_deref()),
+        Some(&b"settings.json.neo-20261019"[..])
+    );
+    let json = report.to_json();
+    assert!(
+        json.contains(
+            "\"transfer_outcome\":\"applied-beside\",\"beside\":\"settings.json.neo-20261019\""
+        ),
+        "{json}"
+    );
+    assert!(json.contains("\"applied_beside\":2"), "{json}");
+
+    // The same session with one path refused beside the two landed: the
+    // beside rows stay accounted, the refusal holds the gate.
+    let mut stats = stats_of();
+    refused(&mut stats, "kept", "DESTINATION_OCCUPIED", None);
+    let dest = state_with(&ended(stats));
+    let report = report_of(&[dest.path()]);
+    assert_eq!(report.applied_beside, 2);
+    assert_eq!(report.refused_pending_review, 1);
+    assert_eq!(report.unaccounted, 0);
+    assert!(!report.passes());
+    assert_eq!(
+        row(&report, "kept").disposition,
+        Disposition::RefusedPendingReview("DESTINATION_OCCUPIED".into())
+    );
+}

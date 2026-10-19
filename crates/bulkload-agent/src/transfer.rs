@@ -334,6 +334,12 @@ pub struct TransferStats {
     /// base that was carried as a snapshot: covered by it, never carried
     /// (#218), by relative path. A sidecar whose base was not is a refusal.
     pub sqlite_sidecars_covered: Vec<Vec<u8>>,
+    /// Seats whose bytes were published, reused or adopted beside a
+    /// differing live destination file under `--beside SUFFIX`
+    /// ([`set_beside_suffix`]): `(source path, beside path)`. Each is
+    /// reported `applied-beside` and is an `applied-beside` row of the
+    /// session's transfer record, accounted in closure.
+    pub applied_beside: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl TransferStats {
@@ -901,6 +907,122 @@ fn prefix_extend_scope(root: &Path) -> PrefixExtend {
             },
             |(_, scope)| *scope,
         )
+}
+
+/// `--beside SUFFIX` on `pull` and `copy` (plan of record 2026-10-19, Step
+/// C gaps C1 and C2; SPEC R2.2, C10: a lossless union that never clobbers
+/// DEST). Without it an existing destination file bulkload did not write
+/// and whose bytes are not the seat's is refused `DESTINATION_OCCUPIED` and
+/// nothing is placed. With it the staged bytes are published at
+/// `<path><SUFFIX>` instead, the live file untouched, and the entry is
+/// accounted `applied-beside` in the session's transfer record, so
+/// `closure-report --transfer` counts it as carried, not pending review.
+/// A byte-identical file is still adopted, a verified byte prefix is still
+/// extended ([`PREFIX_EXTEND_ENV`]), and a symlink that differs is created
+/// beside too. A database with a live `-wal`, `-journal` or `-shm` beside
+/// it (which no snapshot may land on, OI-1003-Q146) lands its snapshot at
+/// `<db><SUFFIX>` under the same flag. A beside path that holds something
+/// of its own is refused `DESTINATION_OCCUPIED` as before: nothing is ever
+/// replaced but this store's own earlier beside output, by the exchange
+/// that supersedes any output of this store (WP0(d)). A later pass reuses
+/// or adopts the beside output under its own row, so an unchanged seat
+/// reads nothing (S3).
+///
+/// The suffix is appended verbatim: `.neo-20261019` gives
+/// `settings.json.neo-20261019`. It is one name component (not empty, no
+/// `/`, no NUL, not `.` or `..`).
+static BESIDE_SUFFIX: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+
+/// The beside suffix by canonical destination root, for tests that run
+/// sessions with and without it in one process.
+static BESIDE_OVERRIDE: Mutex<Vec<(PathBuf, Option<Vec<u8>>)>> = Mutex::new(Vec::new());
+
+/// Whether `suffix` may be a `--beside` suffix: one name component.
+#[must_use]
+pub fn beside_suffix_allowed(suffix: &[u8]) -> bool {
+    !suffix.is_empty()
+        && !suffix.contains(&b'/')
+        && !suffix.contains(&0)
+        && suffix != b"."
+        && suffix != b".."
+}
+
+/// Run every session of this process with `--beside SUFFIX` (`None`: off).
+///
+/// # Errors
+/// `FIELD_DOMAIN_VIOLATION` for a suffix [`beside_suffix_allowed`] refuses.
+pub fn set_beside_suffix(suffix: Option<Vec<u8>>) -> Result<()> {
+    if let Some(suffix) = &suffix {
+        if !beside_suffix_allowed(suffix) {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+    }
+    *BESIDE_SUFFIX.lock().unwrap_or_else(PoisonError::into_inner) = suffix;
+    Ok(())
+}
+
+/// Run sessions into the canonical destination `root` with `--beside` at
+/// `suffix` (`Some(None)`: off for this root; `None`: the process setting
+/// again). Test hook.
+#[doc(hidden)]
+pub fn set_beside(root: &Path, suffix: Option<Option<Vec<u8>>>) {
+    let mut overrides = BESIDE_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    overrides.retain(|(at, _)| at != root);
+    if let Some(suffix) = suffix {
+        overrides.push((root.to_path_buf(), suffix));
+    }
+}
+
+/// The `--beside` suffix sessions into the canonical destination `root`
+/// run with.
+fn beside_suffix(root: &Path) -> Option<Vec<u8>> {
+    BESIDE_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map_or_else(
+            || {
+                BESIDE_SUFFIX
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .clone()
+            },
+            |(_, suffix)| suffix.clone(),
+        )
+}
+
+/// `rel_path` with the beside `suffix` appended.
+#[must_use]
+pub fn beside_path(rel_path: &[u8], suffix: &[u8]) -> Vec<u8> {
+    let mut beside = Vec::with_capacity(rel_path.len() + suffix.len());
+    beside.extend_from_slice(rel_path);
+    beside.extend_from_slice(suffix);
+    beside
+}
+
+/// `row` at its beside path: the same seat, named `<path><suffix>`.
+fn beside_row(row: &RowSchema, suffix: &[u8]) -> RowSchema {
+    RowSchema {
+        rel_path: beside_path(&row.rel_path, suffix),
+        ..row.clone()
+    }
+}
+
+/// The row key of a seat's beside output from its live row key: the keys
+/// of one path share the path's prefix ([`transfer_store::path_prefix`]),
+/// so the beside key is the same key under the beside path. Holds for the
+/// row key and the snapshot key alike.
+fn beside_key(authority: &[u8], key: &[u8], rel_path: &[u8], beside: &[u8]) -> Result<Vec<u8>> {
+    let live = crate::transfer_store::path_prefix(authority, rel_path)?;
+    let rest = key
+        .strip_prefix(live.as_slice())
+        .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+    let mut out = crate::transfer_store::path_prefix(authority, beside)?;
+    out.extend_from_slice(rest);
+    Ok(out)
 }
 
 /// The delta lever by canonical destination root, for tests that compare
@@ -3876,15 +3998,29 @@ fn finish_receive(
     committer: Committer<PublishSink>,
     stats: &mut TransferStats,
     salvage_staged: &HashMap<Vec<u8>, Vec<usize>>,
-    sidecars: &[SidecarReport],
-    snapshot_bases: &HashSet<Vec<u8>>,
+    (sidecars, snapshot_bases): (&[SidecarReport], &HashSet<Vec<u8>>),
+    beside_of: &HashMap<Vec<u8>, Vec<u8>>,
 ) -> Result<()> {
     for (rel_path, outcome) in committer.finish()? {
-        match outcome {
-            Ok(()) => stats.completed += 1,
-            Err(refusal) => stats.refuse_here(rel_path, &refusal),
+        // A publication under a beside path (`--beside`) is the source
+        // path's outcome: accounted `applied-beside` once committed, and
+        // refused under the source's name otherwise.
+        match (beside_of.get(&rel_path), outcome) {
+            (Some(source), Ok(())) => {
+                stats.completed += 1;
+                stats.applied_beside.push((source.clone(), rel_path));
+            }
+            (Some(source), Err(refusal)) => stats.refuse_here(source.clone(), &refusal),
+            (None, Ok(())) => stats.completed += 1,
+            (None, Err(refusal)) => stats.refuse_here(rel_path, &refusal),
         }
     }
+    stats.applied_beside.sort();
+    stats.applied_beside.dedup();
+    counters::add(
+        Counter::DestAppliedBeside,
+        stats.applied_beside.len() as u64,
+    );
     resolve_sidecars(stats, sidecars, snapshot_bases);
     let keep = salvage_to_keep(target, stats, salvage_staged);
     target.retire_salvaged(&keep)?;
@@ -4774,6 +4910,12 @@ struct Inbound<'a, W> {
     sidecars: Vec<SidecarReport>,
     /// Bases published from a snapshot, or reused or adopted as one.
     snapshot_bases: HashSet<Vec<u8>>,
+    /// `--beside SUFFIX` for this session's root ([`beside_suffix`]).
+    beside: Option<Vec<u8>>,
+    /// Publications queued under a beside path, by that path, with the
+    /// source path each stands for: the committer's outcomes name the
+    /// beside path, the session's report names the source's.
+    beside_of: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5009,6 +5151,7 @@ fn receive_session<R: Read, W: Write>(
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .any(|root| root == target.path());
+        let beside = beside_suffix(target.path());
         let mut receiver = Inbound {
             output,
             hand,
@@ -5050,6 +5193,8 @@ fn receive_session<R: Read, W: Write>(
             sqlite,
             sidecars: Vec::new(),
             snapshot_bases: HashSet::new(),
+            beside,
+            beside_of: HashMap::new(),
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -5063,6 +5208,7 @@ fn receive_session<R: Read, W: Write>(
             pool,
             sidecars,
             snapshot_bases,
+            beside_of,
             ..
         } = receiver;
         drop(pool);
@@ -5073,10 +5219,18 @@ fn receive_session<R: Read, W: Write>(
             salvage_staged,
             sidecars,
             snapshot_bases,
+            beside_of,
         ))
     });
-    let (source_bytes_read, mut stats, session, salvage_staged, sidecars, snapshot_bases) =
-        streamed?;
+    let (
+        source_bytes_read,
+        mut stats,
+        session,
+        salvage_staged,
+        sidecars,
+        snapshot_bases,
+        beside_of,
+    ) = streamed?;
     let _tail_timer = PhaseTimer(&RECV_TAIL_NS, Instant::now());
     stats.source_bytes_read = source_bytes_read;
     drop(session);
@@ -5086,8 +5240,8 @@ fn receive_session<R: Read, W: Write>(
         committer,
         &mut stats,
         &salvage_staged,
-        &sidecars,
-        &snapshot_bases,
+        (&sidecars, &snapshot_bases),
+        &beside_of,
     )?;
     Ok(stats)
 }
@@ -5367,6 +5521,7 @@ impl<W: Write> Inbound<'_, W> {
     /// is refused `DESTINATION_OCCUPIED` (R5): a snapshot published there
     /// could be rolled back or overlaid by it. The check reads only this
     /// side, so it is not remembered; removing the sidecar converges.
+    #[allow(clippy::too_many_lines)] // One arm per kind; `--beside` for symlinks and reuse.
     fn entry(&mut self, entry: u64, row: RowSchema, wal: Option<SidecarId>) -> Result<()> {
         let census_started = Instant::now();
         let snapshot_mode = self.sqlite == SqliteMode::Snapshot;
@@ -5390,7 +5545,22 @@ impl<W: Write> Inbound<'_, W> {
                     .directory(&row, self.store, &self.authority)
                     .map(|()| Decision::Skip),
             },
-            FileKind::Symlink => self.target.symlink(&row).map(|()| Decision::Skip),
+            FileKind::Symlink => match self.target.symlink(&row) {
+                // `--beside`: a differing symlink is created beside the
+                // live one, or adopted there when it is already this
+                // link; the live link is never replaced.
+                Err(BulkloadRefusal::DestinationOccupied) if self.beside.is_some() => {
+                    let suffix = self.beside.clone().unwrap_or_default();
+                    let beside = beside_row(&row, &suffix);
+                    self.target.symlink(&beside).map(|()| {
+                        self.stats
+                            .applied_beside
+                            .push((row.rel_path.clone(), beside.rel_path));
+                        Decision::Skip
+                    })
+                }
+                other => other.map(|()| Decision::Skip),
+            },
             FileKind::Regular => self.target.identity(&row).and_then(|identity| {
                 if let Some(identity) = &identity {
                     if let Some((snapshot_key, _)) = &snapshot {
@@ -5403,6 +5573,12 @@ impl<W: Write> Inbound<'_, W> {
                     if self.store.output_matches(&key, identity)? {
                         self.stats.reused += 1;
                         return Ok(Decision::Reuse);
+                    }
+                    // `--beside`: this seat's output already beside the
+                    // live file, from an earlier pass, is reused like any
+                    // output of this store (S3), and stays accounted.
+                    if let Some(reused) = self.reuse_beside(&row, &key, snapshot.as_ref())? {
+                        return Ok(reused);
                     }
                     // Refused before for what the path holds, and neither
                     // the seat nor that file has moved since: the same
@@ -5422,7 +5598,14 @@ impl<W: Write> Inbound<'_, W> {
                         return Ok(Decision::Reuse);
                     }
                 }
-                if snapshot_mode && self.target.sqlite_sidecars_present(&row.rel_path)? {
+                // Under `--beside` a snapshot whose path has a sidecar
+                // beside it is asked for and lands beside (decided when
+                // its content is planned, where the beside path is checked
+                // the same way).
+                if snapshot_mode
+                    && self.beside.is_none()
+                    && self.target.sqlite_sidecars_present(&row.rel_path)?
+                {
                     return Err(BulkloadRefusal::DestinationOccupied);
                 }
                 let keys = std::iter::once(key.as_slice()).chain(
@@ -5702,6 +5885,13 @@ impl<W: Write> Inbound<'_, W> {
         if refused == RefusedOutput::Occupied && self.may_extend(row)? {
             return Ok(None);
         }
+        // `--beside`: an occupied path is no longer the end of the entry;
+        // it is planned once more and lands beside.
+        if self.beside.is_some()
+            && matches!(refused, RefusedOutput::Occupied | RefusedOutput::NotPrefix)
+        {
+            return Ok(None);
+        }
         counters::bump(Counter::TransferRefusedOutputsRemembered);
         Ok(Some(refused))
     }
@@ -5717,6 +5907,45 @@ impl<W: Write> Inbound<'_, W> {
             .target
             .existing(row)?
             .is_some_and(|(file, _)| extend_candidate(&file, row, root).is_some()))
+    }
+
+    /// `--beside`: `Reuse` when this seat's output already sits beside the
+    /// live file under its beside row (an earlier pass placed it there),
+    /// by the row key or, in `snapshot` mode, the snapshot key. The seat is
+    /// accounted `applied-beside` again, so the record of this session
+    /// keeps naming it.
+    fn reuse_beside(
+        &mut self,
+        row: &RowSchema,
+        key: &[u8],
+        snapshot: Option<&(Vec<u8>, [u8; 32])>,
+    ) -> Result<Option<Decision>> {
+        let Some(suffix) = self.beside.clone() else {
+            return Ok(None);
+        };
+        let beside = beside_row(row, &suffix);
+        let Some(identity) = self.target.identity(&beside)? else {
+            return Ok(None);
+        };
+        for (candidate, is_snapshot) in snapshot
+            .map(|(snapshot_key, _)| (snapshot_key.as_slice(), true))
+            .into_iter()
+            .chain(std::iter::once((key, false)))
+        {
+            let key_beside =
+                beside_key(&self.authority, candidate, &row.rel_path, &beside.rel_path)?;
+            if self.store.output_matches(&key_beside, &identity)? {
+                self.stats.reused += 1;
+                if is_snapshot {
+                    self.snapshot_applied(&row.rel_path);
+                }
+                self.stats
+                    .applied_beside
+                    .push((row.rel_path.clone(), beside.rel_path));
+                return Ok(Some(Decision::Reuse));
+            }
+        }
+        Ok(None)
     }
 
     /// A refusal of an entry whose path a crashed prefix extension left
@@ -5864,10 +6093,13 @@ impl<W: Write> Inbound<'_, W> {
                     salvage: &self.salvage,
                 },
                 // A snapshot's output is never extended (#218).
-                (
-                    &row,
-                    !snapshot && prefix_extend_scope(self.target.path()).covers(&row.rel_path),
-                ),
+                Planned {
+                    row: &row,
+                    extend: !snapshot
+                        && prefix_extend_scope(self.target.path()).covers(&row.rel_path),
+                    snapshot,
+                    beside: self.beside.as_deref(),
+                },
                 &manifest,
                 &mut salvaged_from,
             )
@@ -6139,10 +6371,19 @@ impl<W: Write> Inbound<'_, W> {
         // has committed: its file and directory are sealed and the store
         // commit has drained them, so the bytes are durable here under the
         // final name (#77 round 2, N1). Only then may the source record the
-        // capture, which therefore never costs a source read again.
+        // capture, which therefore never costs a source read again. An
+        // output queued under its beside path (`--beside`) is awaited
+        // under that path, which the committer's outcome names.
         match outcome {
-            Ok(()) => {
-                self.pending_held.insert(rel_path, entry);
+            Ok(beside) => {
+                let held_as = match beside {
+                    Some(beside) => {
+                        self.beside_of.insert(beside.clone(), rel_path);
+                        beside
+                    }
+                    None => rel_path,
+                };
+                self.pending_held.insert(held_as, entry);
             }
             Err(refusal) => {
                 self.refuse(rel_path, &refusal);
@@ -6216,8 +6457,15 @@ impl<W: Write> Inbound<'_, W> {
         self.target.fold_finish()
     }
 
+    /// Returns the beside path when the output was queued under it
+    /// (`--beside`), else `None`.
     #[allow(clippy::too_many_lines)] // Verify, adopt, extend or supersede, stage, publish.
-    fn end_streaming(&mut self, streaming: Streaming, root: [u8; 32], racy: bool) -> Result<()> {
+    fn end_streaming(
+        &mut self,
+        streaming: Streaming,
+        root: [u8; 32],
+        racy: bool,
+    ) -> Result<Option<Vec<u8>>> {
         let Streaming {
             row,
             key,
@@ -6244,10 +6492,27 @@ impl<W: Write> Inbound<'_, W> {
                 }
             });
         let mut supersede = None;
+        let manifest = Manifest {
+            root,
+            chunks: specs,
+        };
         // M2r2 A-103: a grown file with no owning record, extended from the
         // streamed copy (its whole prefix compared, `base` 0).
         let mut grown = None;
-        if checked.is_ok() && adopt {
+        // `--beside`: the beside path this entry lands at, when the live
+        // path holds other bytes bulkload did not write, or a snapshot's
+        // live path has a sidecar beside it.
+        let mut land_beside: Option<Vec<u8>> = None;
+        let live_sidecar = checked.is_ok()
+            && snapshot
+            && self.beside.is_some()
+            && self.target.sqlite_sidecars_present(&row.rel_path)?;
+        if live_sidecar {
+            land_beside = self
+                .beside
+                .as_deref()
+                .map(|suffix| beside_path(&row.rel_path, suffix));
+        } else if checked.is_ok() && adopt {
             // Streamed in place of a manifest: an existing output at the
             // path is adopted against the streamed chunks, as a manifest
             // would have been checked, and the staged copy is dropped. One
@@ -6258,10 +6523,6 @@ impl<W: Write> Inbound<'_, W> {
             let existing = self.target.existing(&row).and_then(|existing| {
                 let Some((file, parent)) = existing else {
                     return Ok(None);
-                };
-                let manifest = Manifest {
-                    root,
-                    chunks: specs,
                 };
                 let (verified, settled) =
                     verify_settled(self.target.path(), &file, &row, &manifest);
@@ -6291,7 +6552,14 @@ impl<W: Write> Inbound<'_, W> {
                                 }
                             }
                         }
-                        if supersede.is_none() {
+                        if supersede.is_none() && self.beside.is_some() {
+                            // `--beside`: the streamed copy lands beside.
+                            land_beside = self
+                                .beside
+                                .as_deref()
+                                .map(|suffix| beside_path(&row.rel_path, suffix));
+                            Ok(None)
+                        } else if supersede.is_none() {
                             self.note_interrupted(&row.rel_path);
                             self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
                             Err(BulkloadRefusal::DestinationOccupied)
@@ -6315,13 +6583,9 @@ impl<W: Write> Inbound<'_, W> {
                     if let Some(staged) = staged {
                         let _ = staged.discard();
                     }
-                    return self.adopt_settling(
-                        file,
-                        parent,
-                        &row,
-                        (key, record, racy, root),
-                        identity,
-                    );
+                    return self
+                        .adopt_settling(file, parent, &row, (key, record, racy, root), identity)
+                        .map(|()| None);
                 }
                 Ok(None) => (),
                 Err(refusal) => {
@@ -6353,7 +6617,7 @@ impl<W: Write> Inbound<'_, W> {
                 (key, record, racy, root),
             );
         }
-        let mut staged = match (checked, staged) {
+        let staged = match (checked, staged) {
             (Ok(()), Some(staged)) => staged,
             // An empty file has no data frame; it is staged here.
             (Ok(()), None) => self.target.stage(&row)?,
@@ -6365,6 +6629,60 @@ impl<W: Write> Inbound<'_, W> {
             }
         };
         fault_point!(ReceiveAfterChunks);
+        // `--beside`: the beside path is decided as a planned entry's is;
+        // the staged copy takes the beside name.
+        let (row, key) = match &land_beside {
+            Some(beside_rel) => {
+                let beside = RowSchema {
+                    rel_path: beside_rel.clone(),
+                    ..row.clone()
+                };
+                let target = beside_target(
+                    &ReceiveContext {
+                        target: self.target,
+                        store: self.store,
+                        authority: &self.authority,
+                        displaced: &self.displaced,
+                        session: &self.session,
+                        salvage: &self.salvage,
+                    },
+                    &beside,
+                    &manifest,
+                    snapshot,
+                );
+                let key_beside = beside_key(&self.authority, &key, &row.rel_path, beside_rel);
+                match (target, key_beside) {
+                    (Ok(BesideTarget::Fresh), Ok(key_beside)) => (beside, key_beside),
+                    (Ok(BesideTarget::Supersede(owned)), Ok(key_beside)) => {
+                        supersede = Some(*owned);
+                        (beside, key_beside)
+                    }
+                    (Ok(BesideTarget::Adopt(file, parent, identity)), Ok(key_beside)) => {
+                        let _ = staged.discard();
+                        let placed = beside.rel_path.clone();
+                        return self
+                            .adopt(
+                                file,
+                                parent,
+                                &beside,
+                                (key_beside, record, racy, root),
+                                identity,
+                            )
+                            .map(|()| Some(placed));
+                    }
+                    (Err(refusal), _) | (_, Err(refusal)) => {
+                        let _ = staged.discard();
+                        return Err(refusal);
+                    }
+                }
+            }
+            None => (row, key),
+        };
+        let mut staged = if land_beside.is_some() {
+            staged.with_suffix(self.beside.as_deref().unwrap_or_default())?
+        } else {
+            staged
+        };
         if snapshot {
             if let Err(refusal) = self.verify_snapshot(&staged, &row) {
                 let _ = staged.discard();
@@ -6373,6 +6691,7 @@ impl<W: Write> Inbound<'_, W> {
             staged.mark_sqlite();
         }
         self.publish(staged, &row, (key, record, racy, root), hints, supersede)
+            .map(|()| land_beside)
     }
 
     /// A received snapshot's last checks before it is published (#218):
@@ -6393,7 +6712,10 @@ impl<W: Write> Inbound<'_, W> {
         )
     }
 
-    fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<()> {
+    /// Returns the beside path when the output was queued under it
+    /// (`--beside`), else `None`.
+    #[allow(clippy::too_many_lines)] // One arm per plan; `--beside` for adopt and write.
+    fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<Option<Vec<u8>>> {
         let Filling {
             row,
             key,
@@ -6407,7 +6729,7 @@ impl<W: Write> Inbound<'_, W> {
         let root = manifest.root;
         match plan {
             Plan::Refuse(refusal) => Err(refusal),
-            Plan::Adopt(file, parent, verified) => {
+            Plan::Adopt(file, parent, verified, beside) => {
                 // Verified at the plan: read again only if it moved since.
                 let unmoved = verified.filter(|identity| {
                     file.metadata()
@@ -6418,13 +6740,33 @@ impl<W: Write> Inbound<'_, W> {
                 } else {
                     let (verified, settled) =
                         verify_settled(self.target.path(), &file, &row, &manifest);
-                    if matches!(verified, Err(BulkloadRefusal::DestinationOccupied)) {
+                    if matches!(verified, Err(BulkloadRefusal::DestinationOccupied))
+                        && beside.is_none()
+                    {
                         self.note_interrupted(&row.rel_path);
                         self.remember_refusal(&key, settled, racy, RefusedOutput::Occupied);
                     }
                     verified?
                 };
-                self.adopt_settling(file, parent, &row, (key, record, racy, root), identity)
+                // An adopted beside output is recorded under its own row.
+                let Some(beside_rel) = beside else {
+                    return self
+                        .adopt_settling(file, parent, &row, (key, record, racy, root), identity)
+                        .map(|()| None);
+                };
+                let key_beside = beside_key(&self.authority, &key, &row.rel_path, &beside_rel)?;
+                let beside_row = RowSchema {
+                    rel_path: beside_rel.clone(),
+                    ..row
+                };
+                self.adopt(
+                    file,
+                    parent,
+                    &beside_row,
+                    (key_beside, record, racy, root),
+                    identity,
+                )
+                .map(|()| Some(beside_rel))
             }
             Plan::NotPrefix(identity) => {
                 self.note_interrupted(&row.rel_path);
@@ -6450,6 +6792,17 @@ impl<W: Write> Inbound<'_, W> {
                         (key, record, racy, root),
                     );
                 }
+                // `--beside`: published under the seat's beside row.
+                let (row, key) = match &staging.beside {
+                    Some(beside_rel) => (
+                        RowSchema {
+                            rel_path: beside_rel.clone(),
+                            ..row.clone()
+                        },
+                        beside_key(&self.authority, &key, &row.rel_path, beside_rel)?,
+                    ),
+                    None => (row, key),
+                };
                 if snapshot {
                     if let Err(refusal) = self.verify_snapshot(&staging.staged, &row) {
                         let _ = staging.staged.discard();
@@ -6464,6 +6817,7 @@ impl<W: Write> Inbound<'_, W> {
                     staging.hints,
                     staging.supersede.map(|owned| *owned),
                 )
+                .map(|()| staging.beside)
             }
         }
     }
@@ -6599,13 +6953,15 @@ impl<W: Write> Inbound<'_, W> {
     /// settled, so an unchanged rerun reads and sends nothing for it. The
     /// staged tail is removed either way. The file is counted and reported
     /// extended once its record commits (`finish_receive`).
+    /// Returns the beside path when the file was not a prefix after all and
+    /// `--beside` landed the whole seat beside it ([`Self::beside_from_extend`]).
     fn finish_extend(
         &mut self,
         staged: StagedFile,
         extend: Extend,
         row: &RowSchema,
         record: (Vec<u8>, [u8; 32], bool, [u8; 32]),
-    ) -> Result<()> {
+    ) -> Result<Option<Vec<u8>>> {
         let Extend {
             file,
             parent,
@@ -6617,6 +6973,9 @@ impl<W: Write> Inbound<'_, W> {
             hints,
             straddle,
         } = extend;
+        // BLAKE3 over the proven `[0, base)`, before the head compare adds
+        // to it: what a beside landing re-checks the prefix against.
+        let proven = *hasher.clone().finalize().as_bytes();
         let appended = self.append_tail(
             &staged,
             (&file, &writer),
@@ -6624,16 +6983,35 @@ impl<W: Write> Inbound<'_, W> {
             &mut hasher,
             row,
         );
-        let _ = staged.discard();
         let (after, proof) = match appended {
-            Ok(done) => done,
+            Ok(done) => {
+                let _ = staged.discard();
+                done
+            }
+            // `--beside`: the straddling chunk's head differs, so the file
+            // is not the seat's prefix; the seat lands whole beside it,
+            // from the file's proven prefix and the staged tail.
+            Err(Unextended::NotPrefix) if self.beside.is_some() => {
+                let suffix = self.beside.clone().unwrap_or_default();
+                return self
+                    .beside_from_extend(
+                        staged,
+                        (&file, identity, base, proven),
+                        (row, hints),
+                        record,
+                        &suffix,
+                    )
+                    .map(Some);
+            }
             Err(Unextended::NotPrefix) => {
+                let _ = staged.discard();
                 let (key, _, racy, _) = &record;
                 self.remember_refusal(key, Some(identity), *racy, RefusedOutput::NotPrefix);
                 self.note_interrupted(&row.rel_path);
                 return Err(BulkloadRefusal::DestinationOccupied);
             }
             Err(Unextended::Refused(refusal)) => {
+                let _ = staged.discard();
                 self.note_interrupted(&row.rel_path);
                 return Err(refusal);
             }
@@ -6645,7 +7023,136 @@ impl<W: Write> Inbound<'_, W> {
             proof.prior_blake3,
             row.size,
         ));
-        Ok(())
+        Ok(None)
+    }
+
+    /// `--beside` after a failed prefix extension: the seat's bytes are the
+    /// live file's `[0, base)` (proven the manifest's by chunk, and
+    /// re-hashed here against `proven` as they are copied: a file changed
+    /// since is refused `DESTINATION_OCCUPIED`, nothing placed) followed by
+    /// the staged tail `[base, size)`, every byte of which was verified as it
+    /// arrived. They are written to a new staged file, which is published
+    /// at the beside path as any beside output is ([`beside_target`]); the
+    /// staged tail is removed either way. The live file is read, never
+    /// written. Returns the beside path.
+    #[allow(clippy::too_many_lines)] // Copy the proven prefix, then the tail; judge, publish.
+    fn beside_from_extend(
+        &mut self,
+        tail: StagedFile,
+        (file, identity, base, proven): (&std::fs::File, StatIdentity, u64, [u8; 32]),
+        (row, hints): (&RowSchema, Vec<ChunkHint>),
+        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
+        suffix: &[u8],
+    ) -> Result<Vec<u8>> {
+        const PIECE: u64 = 1 << 20;
+        let beside = beside_row(row, suffix);
+        let key_beside = beside_key(&self.authority, &key, &row.rel_path, &beside.rel_path)?;
+        let whole = (|| -> Result<StagedFile> {
+            let out = self.target.stage(row)?.with_suffix(suffix)?;
+            let copied = (|| -> Result<()> {
+                let mut buffer = vec![0_u8; usize::try_from(PIECE).unwrap_or(usize::MAX)];
+                let mut hasher = blake3::Hasher::new();
+                let mut at = 0_u64;
+                while at < base {
+                    let length = usize::try_from((base - at).min(PIECE)).unwrap_or(usize::MAX);
+                    let piece = buffer
+                        .get_mut(..length)
+                        .ok_or(BulkloadRefusal::BudgetExceeded)?;
+                    if crate::io::sys::pread_full(file, piece, at)
+                        .refuse_at("transfer::beside_from_extend")?
+                        != length
+                    {
+                        return Err(BulkloadRefusal::DestinationOccupied);
+                    }
+                    counters::add_len(Counter::DestVerifyRead, length);
+                    hasher.update(piece);
+                    crate::io::sys::pwrite_all(&**out.file(), piece, at).map_err(|error| {
+                        crate::materialize::space_refusal(crate::refuse::io(
+                            &error,
+                            "transfer::beside_from_extend",
+                        ))
+                    })?;
+                    counters::add_len(Counter::DestMaterializeWrite, length);
+                    at += length as u64;
+                }
+                let moved = file.metadata().map_or(true, |found| {
+                    StatIdentity::from_metadata(&found) != identity
+                });
+                if moved || *hasher.finalize().as_bytes() != proven {
+                    return Err(BulkloadRefusal::DestinationOccupied);
+                }
+                while at < row.size {
+                    let length = usize::try_from((row.size - at).min(PIECE)).unwrap_or(usize::MAX);
+                    let piece = buffer
+                        .get_mut(..length)
+                        .ok_or(BulkloadRefusal::BudgetExceeded)?;
+                    if crate::io::sys::pread_full(&**tail.file(), piece, at - base)
+                        .refuse_at("transfer::beside_from_extend")?
+                        != length
+                    {
+                        return Err(BulkloadRefusal::DigestMismatch);
+                    }
+                    crate::io::sys::pwrite_all(&**out.file(), piece, at).map_err(|error| {
+                        crate::materialize::space_refusal(crate::refuse::io(
+                            &error,
+                            "transfer::beside_from_extend",
+                        ))
+                    })?;
+                    counters::add_len(Counter::DestMaterializeWrite, length);
+                    at += length as u64;
+                }
+                Ok(())
+            })();
+            match copied {
+                Ok(()) => Ok(out),
+                Err(refusal) => {
+                    let _ = out.discard();
+                    Err(refusal)
+                }
+            }
+        })();
+        let _ = tail.discard();
+        let out = whole?;
+        // The whole file is staged: the beside path is judged against its
+        // bytes as a planned entry's is.
+        let target = {
+            let context = ReceiveContext {
+                target: self.target,
+                store: self.store,
+                authority: &self.authority,
+                displaced: &self.displaced,
+                session: &self.session,
+                salvage: &self.salvage,
+            };
+            beside_existing(&context, &beside, out.file())
+        };
+        let supersede = match target {
+            Ok(BesideTarget::Fresh) => None,
+            Ok(BesideTarget::Supersede(owned)) => Some(*owned),
+            Ok(BesideTarget::Adopt(file, parent, identity)) => {
+                let _ = out.discard();
+                self.adopt(
+                    file,
+                    parent,
+                    &beside,
+                    (key_beside, record, racy, root),
+                    identity,
+                )?;
+                return Ok(beside.rel_path);
+            }
+            Err(refusal) => {
+                let _ = out.discard();
+                return Err(refusal);
+            }
+        };
+        self.publish(
+            out,
+            &beside,
+            (key_beside, record, racy, root),
+            hints,
+            supersede,
+        )?;
+        Ok(beside.rel_path)
     }
 
     /// The checks and writes of [`Self::finish_extend`]: the file's
@@ -6892,8 +7399,15 @@ enum Plan {
     /// An existing output to adopt once the entry ends. The identity is the
     /// one its bytes were already verified under, when the plan checked
     /// them (an output of this store, WP0(d)); otherwise they are verified
-    /// then.
-    Adopt(std::fs::File, Arc<std::fs::File>, Option<StatIdentity>),
+    /// then. The last field names the beside path when the output adopted
+    /// is the seat's beside output (`--beside`), under whose row it is
+    /// recorded.
+    Adopt(
+        std::fs::File,
+        Arc<std::fs::File>,
+        Option<StatIdentity>,
+        Option<Vec<u8>>,
+    ),
     /// This store's own output holds other bytes than the manifest's, on a
     /// file system with no atomic exchange to supersede it with: refused
     /// `DESTINATION_EXCHANGE_UNSUPPORTED` once the entry ends, with nothing
@@ -6962,6 +7476,9 @@ struct Staging {
     /// staged file holds bytes `[base, size)` and is appended from, never
     /// published.
     extend: Option<Box<Extend>>,
+    /// `--beside`: the staged file is published at this path, beside the
+    /// live file the plan found differing, under the seat's beside row.
+    beside: Option<Vec<u8>>,
 }
 
 /// An existing destination file with no owning record whose first
@@ -7041,13 +7558,132 @@ fn append_hook(rel_path: &[u8]) {
 /// ends, and refused `DESTINATION_OCCUPIED` if they do not: it is never
 /// replaced. A `SQLite` snapshot's output follows the same rule (#218,
 /// OI-1003-Q146).
+/// What [`plan_file`] plans: the row, whether the prefix extension may try
+/// its path, whether its content is a `SQLite` snapshot, and the `--beside`
+/// suffix of the session.
+#[derive(Clone, Copy)]
+struct Planned<'p> {
+    row: &'p RowSchema,
+    extend: bool,
+    snapshot: bool,
+    beside: Option<&'p [u8]>,
+}
+
+/// Where a seat lands beside its live path (`--beside`), decided by what
+/// the beside path holds ([`beside_target`]).
+enum BesideTarget {
+    /// Nothing there: a fresh publish.
+    Fresh,
+    /// This seat's bytes are there already (this store's own earlier beside
+    /// output, or a file that verifies): adopted under the beside row.
+    Adopt(std::fs::File, Arc<std::fs::File>, StatIdentity),
+    /// This store's own beside output holds other bytes: superseded by the
+    /// exchange (WP0(d)).
+    Supersede(Box<OwnedOutput>),
+}
+
+/// Decide the beside path of `row` (`--beside`): free, this store's own
+/// output (adopted when it verifies, superseded when it does not, refused
+/// `DESTINATION_EXCHANGE_UNSUPPORTED` with no exchange), a foreign file
+/// that verifies (adopted), or a foreign file with other bytes, refused
+/// `DESTINATION_OCCUPIED`: nothing is ever replaced beside either. A
+/// snapshot's beside path with a sidecar beside it is refused the same way
+/// (OI-1003-Q146).
+fn beside_target(
+    context: &ReceiveContext<'_>,
+    beside: &RowSchema,
+    manifest: &Manifest,
+    snapshot: bool,
+) -> Result<BesideTarget> {
+    if snapshot && context.target.sqlite_sidecars_present(&beside.rel_path)? {
+        return Err(BulkloadRefusal::DestinationOccupied);
+    }
+    let Some((file, parent)) = context.target.existing(beside)? else {
+        return Ok(BesideTarget::Fresh);
+    };
+    let owned = owned_output(context.store, context.authority, beside, &file)?;
+    let (verified, _) = verify_settled(context.target.path(), &file, beside, manifest);
+    match (verified, owned) {
+        (Ok(identity), _) => Ok(BesideTarget::Adopt(file, parent, identity)),
+        (Err(BulkloadRefusal::DestinationOccupied), Some(owned)) => {
+            if context.target.exchange_supported(beside)? {
+                Ok(BesideTarget::Supersede(Box::new(owned)))
+            } else {
+                Err(BulkloadRefusal::DestinationExchangeUnsupported)
+            }
+        }
+        (Err(refusal), _) => Err(refusal),
+    }
+}
+
+/// [`beside_target`] judged against a staged copy of the seat instead of a
+/// manifest (a failed prefix extension has the whole seat staged and no
+/// manifest at hand): an existing beside file equal to `staged` byte for
+/// byte is adopted; one with other bytes is superseded when it is this
+/// store's own and refused `DESTINATION_OCCUPIED` otherwise.
+fn beside_existing(
+    context: &ReceiveContext<'_>,
+    beside: &RowSchema,
+    staged: &std::fs::File,
+) -> Result<BesideTarget> {
+    let Some((file, parent)) = context.target.existing(beside)? else {
+        return Ok(BesideTarget::Fresh);
+    };
+    let found = file.metadata().refuse_at("transfer::beside_existing")?;
+    if found.len() == beside.size && same_bytes(&file, staged, beside.size)? {
+        return Ok(BesideTarget::Adopt(
+            file,
+            parent,
+            StatIdentity::from_metadata(&found),
+        ));
+    }
+    match owned_output(context.store, context.authority, beside, &file)? {
+        Some(owned) if context.target.exchange_supported(beside)? => {
+            Ok(BesideTarget::Supersede(Box::new(owned)))
+        }
+        Some(_) => Err(BulkloadRefusal::DestinationExchangeUnsupported),
+        None => Err(BulkloadRefusal::DestinationOccupied),
+    }
+}
+
+/// Whether the first `size` bytes of `a` and `b` are the same, read in 1
+/// MiB pieces (`read_dest_verify_existing_bytes`).
+fn same_bytes(a: &std::fs::File, b: &std::fs::File, size: u64) -> Result<bool> {
+    const PIECE: u64 = 1 << 20;
+    let mut mine = vec![0_u8; usize::try_from(PIECE).unwrap_or(usize::MAX)];
+    let mut theirs = vec![0_u8; mine.len()];
+    let mut at = 0_u64;
+    while at < size {
+        let length = usize::try_from((size - at).min(PIECE)).unwrap_or(usize::MAX);
+        let (Some(left), Some(right)) = (mine.get_mut(..length), theirs.get_mut(..length)) else {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        };
+        let read_left =
+            crate::io::sys::pread_full(a, left, at).refuse_at("transfer::same_bytes")?;
+        let read_right =
+            crate::io::sys::pread_full(b, right, at).refuse_at("transfer::same_bytes")?;
+        counters::add_len(Counter::DestVerifyRead, length);
+        if read_left != length || read_right != length || left != right {
+            return Ok(false);
+        }
+        at += length as u64;
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_lines)] // Validate, adopt or supersede, stage, fill, kick.
 fn plan_file(
     context: &ReceiveContext<'_>,
-    (row, extend): (&RowSchema, bool),
+    planned: Planned<'_>,
     manifest: &Manifest,
     salvaged_from: &mut Vec<usize>,
 ) -> Plan {
+    let Planned {
+        row,
+        extend,
+        snapshot,
+        beside,
+    } = planned;
     let mut placements: HashMap<[u8; 32], (u64, Vec<u64>)> = HashMap::new();
     let mut order = Vec::new();
     let mut offset = 0_u64;
@@ -7078,16 +7714,31 @@ fn plan_file(
     if offset != row.size {
         return Plan::Refuse(BulkloadRefusal::DigestMismatch);
     }
-    let supersede = match context.target.existing(row) {
+    // `--beside` (plan of record 2026-10-19, C1/C2): a snapshot whose live
+    // path has a sidecar beside it never lands there, whatever the path
+    // holds; it lands beside.
+    let live_sidecar = snapshot
+        && beside.is_some()
+        && match context.target.sqlite_sidecars_present(&row.rel_path) {
+            Ok(present) => present,
+            Err(refusal) => return Plan::Refuse(refusal),
+        };
+    // Set when this entry lands beside its live path: the beside path.
+    let mut land_beside: Option<Vec<u8>> = None;
+    let mut supersede = match context.target.existing(row) {
         Ok(Some((file, parent))) => {
             match owned_output(context.store, context.authority, row, &file) {
+                Ok(Some(_)) if live_sidecar => {
+                    land_beside = beside.map(|suffix| beside_path(&row.rel_path, suffix));
+                    None
+                }
                 Ok(Some(owned)) => {
                     let (verified, settled) =
                         verify_settled(context.target.path(), &file, row, manifest);
                     match verified {
                         // The seat was touched, not changed: nothing to
                         // replace.
-                        Ok(identity) => return Plan::Adopt(file, parent, Some(identity)),
+                        Ok(identity) => return Plan::Adopt(file, parent, Some(identity), None),
                         // Changed. Without an atomic exchange the output
                         // cannot be superseded: say so now, before a byte
                         // is staged or asked of the source. A snapshot
@@ -7105,21 +7756,78 @@ fn plan_file(
                         Err(refusal) => return Plan::Refuse(refusal),
                     }
                 }
-                // M2r2 A-103: a grown file is extended, any other is
-                // adopted or refused as before.
-                Ok(None) if extend => {
-                    return plan_extend(context, row, manifest, (file, parent), salvaged_from)
+                Ok(None) if live_sidecar => {
+                    land_beside = beside.map(|suffix| beside_path(&row.rel_path, suffix));
+                    None
                 }
-                Ok(None) => return Plan::Adopt(file, parent, None),
+                // M2r2 A-103: a grown file is extended, any other is
+                // adopted or refused as before. Under `--beside` a file
+                // that is not the seat's (a failed prefix proof, or other
+                // bytes, judged now) lands beside instead.
+                Ok(None) => {
+                    let plan = if extend {
+                        plan_extend(context, row, manifest, (file, parent), salvaged_from)
+                    } else {
+                        Plan::Adopt(file, parent, None, None)
+                    };
+                    let Some(suffix) = beside else {
+                        return plan;
+                    };
+                    match plan {
+                        Plan::Adopt(file, parent, None, None) => {
+                            let (verified, _) =
+                                verify_settled(context.target.path(), &file, row, manifest);
+                            match verified {
+                                Ok(identity) => {
+                                    return Plan::Adopt(file, parent, Some(identity), None)
+                                }
+                                Err(BulkloadRefusal::DestinationOccupied) => {
+                                    land_beside = Some(beside_path(&row.rel_path, suffix));
+                                }
+                                Err(refusal) => return Plan::Refuse(refusal),
+                            }
+                        }
+                        Plan::NotPrefix(_) => {
+                            land_beside = Some(beside_path(&row.rel_path, suffix));
+                        }
+                        other => return other,
+                    }
+                    None
+                }
                 Err(refusal) => return Plan::Refuse(refusal),
             }
+        }
+        Ok(None) if live_sidecar => {
+            land_beside = beside.map(|suffix| beside_path(&row.rel_path, suffix));
+            None
         }
         Ok(None) => None,
         Err(refusal) => return Plan::Refuse(refusal),
     };
+    if let Some(beside_rel) = &land_beside {
+        let beside = RowSchema {
+            rel_path: beside_rel.clone(),
+            ..row.clone()
+        };
+        match beside_target(context, &beside, manifest, snapshot) {
+            Ok(BesideTarget::Fresh) => {}
+            Ok(BesideTarget::Adopt(file, parent, identity)) => {
+                return Plan::Adopt(file, parent, Some(identity), Some(beside_rel.clone()))
+            }
+            Ok(BesideTarget::Supersede(owned)) => supersede = Some(owned),
+            Err(refusal) => return Plan::Refuse(refusal),
+        }
+    }
     let staged = match context.target.stage(row) {
         Ok(staged) => staged,
         Err(refusal) => return Plan::Refuse(refusal),
+    };
+    let staged = match &land_beside {
+        Some(_) => match staged.with_suffix(beside.unwrap_or_default()) {
+            Ok(staged) => staged,
+            Err(refusal) => return Plan::Refuse(refusal),
+        },
+        None => staged,
     };
     let mut missing = Vec::new();
     let mut hints = Vec::with_capacity(order.len());
@@ -7167,6 +7875,7 @@ fn plan_file(
         hints,
         placed,
         extend: None,
+        beside: land_beside,
     })
 }
 
@@ -7200,7 +7909,7 @@ fn plan_extend(
 ) -> Plan {
     let root = context.target.path();
     let Some((identity, prior)) = extend_candidate(&file, row, root) else {
-        return Plan::Adopt(file, parent, None);
+        return Plan::Adopt(file, parent, None, None);
     };
     // Writable, and the very file read: else not a candidate.
     let writer = match context.target.open_output_append(&row.rel_path) {
@@ -7211,12 +7920,12 @@ fn plan_extend(
         {
             writer
         }
-        _ => return Plan::Adopt(file, parent, None),
+        _ => return Plan::Adopt(file, parent, None, None),
     };
     let (base, hasher) = match prove_prefix(&file, row, manifest, (identity, prior)) {
         Proof::Proven(base, hasher) => (base, *hasher),
         Proof::NotPrefix => return Plan::NotPrefix(identity),
-        Proof::Untried => return Plan::Adopt(file, parent, None),
+        Proof::Untried => return Plan::Adopt(file, parent, None, None),
     };
     let staged = match context.target.stage(row) {
         Ok(staged) => staged,
@@ -7297,6 +8006,7 @@ fn plan_extend(
             hints,
             straddle,
         })),
+        beside: None,
     })
 }
 
