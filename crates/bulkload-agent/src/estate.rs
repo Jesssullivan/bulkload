@@ -2454,11 +2454,31 @@ fn apply_item(
             // M2 round 2 item c: the planned checkout exists, its adopt
             // proof refused (nothing written), and it stays as it is; the
             // capture lands beside it. Review B2: no other refusal does.
-            Err(BulkloadRefusal::GitDestinationDiverged) if options.adopt => {
+            // 2026-10-19 (the td01 batch): a non-repo directory at a linked
+            // item's planned path that does not prove equal, or a standalone
+            // item's, is left as it is and the capture lands beside it too;
+            // the code is the beside landing's recorded reason.
+            Err(
+                reason @ (BulkloadRefusal::GitDestinationDiverged
+                | BulkloadRefusal::GitDestinationNonrepoDiffers),
+            ) if options.adopt => {
                 let Some(suffix) = options.beside.as_deref() else {
-                    return Err(BulkloadRefusal::GitDestinationDiverged);
+                    return Err(reason);
                 };
-                match beside_item(&staged, &target, &landing, (state, &policy, suffix)) {
+                // A standalone item's non-repo directory holds no repository
+                // to land beside into or import refs into: refused typed,
+                // pending review, nothing written.
+                if reason == BulkloadRefusal::GitDestinationNonrepoDiffers
+                    && item.workspace.as_deref() == Some(item.repository.as_path())
+                {
+                    return Err(reason);
+                }
+                match beside_item(
+                    &staged,
+                    &target,
+                    &landing,
+                    (state, &policy, suffix, &reason),
+                ) {
                     Ok(applied) => ("workspace-beside", applied),
                     // Gap C12 (A-115): the tree waits for review beside the
                     // live checkout, but the item's refs go in now, branches,
@@ -2587,7 +2607,12 @@ fn beside_item(
     staged: &git_carry::StagedBundle,
     target: &git_carry::converge::Target<'_>,
     landing: &git_carry::converge::Landing<'_>,
-    (state, policy, suffix): (&Path, &git_carry::converge::Policy<'_>, &str),
+    (state, policy, suffix, reason): (
+        &Path,
+        &git_carry::converge::Policy<'_>,
+        &str,
+        &BulkloadRefusal,
+    ),
 ) -> Result<git_carry::converge::Applied> {
     use std::os::unix::ffi::OsStrExt as _;
     let workspace = target
@@ -2667,8 +2692,16 @@ fn beside_item(
     if !planned.kept.is_empty() {
         return Err(BulkloadRefusal::GitDestinationOccupied);
     }
+    // 2026-10-19: why the capture went beside (the planned checkout's
+    // `GIT_DESTINATION_DIVERGED`, or a non-repo directory's
+    // `GIT_DESTINATION_NONREPO_DIFFERS`), for closure's `beside_reason`.
+    write(
+        &beside_reason_path(state, landing.item, target.source),
+        &reason.code().to_owned(),
+    )?;
     let words = format!(
-        "beside-{}=1 beside-{}=1 beside-ref-created={} beside-ref-present={} beside-ref-moved={} beside-ref-retired={} beside-ref-kept=0",
+        "beside-reason={} beside-{}=1 beside-{}=1 beside-ref-created={} beside-ref-present={} beside-ref-moved={} beside-ref-retired={} beside-ref-kept=0",
+        reason.code(),
         landed.how.word(),
         if landed.standalone {
             "standalone"
@@ -2686,6 +2719,19 @@ fn beside_item(
         None => words,
     });
     Ok(applied)
+}
+
+/// Where the reason an item's capture landed beside is recorded.
+///
+/// 2026-10-19: `{item}-{blake3(source)}.beside-reason` in STATE, the
+/// refusal code that sent it there (`GIT_DESTINATION_DIVERGED`,
+/// `GIT_DESTINATION_NONREPO_DIFFERS`).
+#[must_use]
+pub fn beside_reason_path(state: &Path, identity: &str, source: &str) -> PathBuf {
+    state.join(format!(
+        "{identity}-{}.beside-reason",
+        blake3::hash(source.as_bytes()).to_hex()
+    ))
 }
 
 /// Where an item's refs-in is recorded (M2 item 7, `estate-move`):
@@ -3000,6 +3046,10 @@ pub struct LedgerEntry {
     /// refs `--refs-in` imported, which closure prints on a refused row (a
     /// beside landing refused, its refs in all the same). `None` otherwise.
     pub refs_in: Option<RefsInSummary>,
+    /// 2026-10-19: the reason the item's capture landed beside (its
+    /// `.beside-reason` record in the last state directory holding one),
+    /// which closure prints on an `applied-beside` row.
+    pub beside_reason: Option<String>,
     /// Why `omitted` is unknown: `no-capture`, `capture-unreadable`,
     /// `sidecar-unreadable`, or the in-band reader's reason
     /// (`header-unreadable`, `value-not-read`, `value-not-held`,
@@ -3089,6 +3139,7 @@ pub fn ledger(plan: &Path, corpus: &Path, source: &str, states: &[PathBuf]) -> R
 ///
 /// # Errors
 /// As [`ledger`].
+#[allow(clippy::too_many_lines)]
 pub fn ledger_with(
     plan: &Path,
     corpus: &Path,
@@ -3167,6 +3218,12 @@ pub fn ledger_with(
         let carried = carried::prove(states, &identity, source, item);
         let beside = beside_proof(states, &identity, source, capture.as_deref());
         let refs_in = refs_in_summary(states, &identity, source, capture.as_deref());
+        let beside_reason = states
+            .iter()
+            .rev()
+            .map(|state| beside_reason_path(state, &identity, source))
+            .find(|path| path.is_file())
+            .and_then(|path| read::<String>(&path).ok());
         ledger.entries.push(LedgerEntry {
             source: item.source.clone(),
             has_workspace: item.workspace.is_some(),
@@ -3177,6 +3234,7 @@ pub fn ledger_with(
             carried,
             beside,
             refs_in,
+            beside_reason,
             unknown_because,
             item: identity,
         });

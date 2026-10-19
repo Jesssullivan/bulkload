@@ -1526,6 +1526,11 @@ scenarios! {
     estate_apply_beside_rekey_after_intent => EstateConvergeAfterIntent: 1, EstateAdopt::BesideRekey;
     estate_apply_beside_rekey_after_seat => EstateConvergeAfterSeat: 1, EstateAdopt::BesideRekey;
     estate_apply_beside_rekey_after_head => EstateConvergeAfterHead: 1, EstateAdopt::BesideRekey;
+    // 2026-10-19 (the td01 batch): a stripped linked worktree adopted by
+    // registering it again, crashed after its administration directory
+    // and after its gitfile; finished by the rerun, no file written.
+    estate_apply_nonrepo_registered => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoAdopt;
+    estate_apply_nonrepo_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::NonrepoAdopt;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

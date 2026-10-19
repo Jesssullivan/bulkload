@@ -5191,8 +5191,20 @@ fn restore_filesystem_rows(destination: &Path, revision: &str) -> Result<()> {
                 {
                     return Err(BulkloadRefusal::GitInventoryMalformed);
                 }
-                file.set_permissions(fs::Permissions::from_mode(row.mode & 0o777))
-                    .refuse_at("git_carry::restore_filesystem_rows")?;
+                // A mode already held is not set again (2026-10-19: a
+                // recovered adoption of a non-repo directory changes no
+                // file's metadata, its ctime included).
+                if file
+                    .metadata()
+                    .refuse_at("git_carry::restore_filesystem_rows")?
+                    .permissions()
+                    .mode()
+                    & 0o777
+                    != row.mode & 0o777
+                {
+                    file.set_permissions(fs::Permissions::from_mode(row.mode & 0o777))
+                        .refuse_at("git_carry::restore_filesystem_rows")?;
+                }
                 file.sync_file_counted()
                     .refuse_at("git_carry::restore_filesystem_rows")?;
             }
@@ -5232,9 +5244,18 @@ fn restore_filesystem_rows(destination: &Path, revision: &str) -> Result<()> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
             .open(path)
             .refuse_at("git_carry::restore_filesystem_rows")?;
-        directory
-            .set_permissions(fs::Permissions::from_mode(row.mode & 0o777))
-            .refuse_at("git_carry::restore_filesystem_rows")?;
+        if directory
+            .metadata()
+            .refuse_at("git_carry::restore_filesystem_rows")?
+            .permissions()
+            .mode()
+            & 0o777
+            != row.mode & 0o777
+        {
+            directory
+                .set_permissions(fs::Permissions::from_mode(row.mode & 0o777))
+                .refuse_at("git_carry::restore_filesystem_rows")?;
+        }
         directory
             .sync_dir_counted()
             .refuse_at("git_carry::restore_filesystem_rows")?;
@@ -7617,6 +7638,159 @@ pub(crate) fn restore_linked_staged_landed(
     landed::remove(&landing_intent)?;
     drop(lock);
     Ok(applied)
+}
+
+/// Adopt the non-repo directory at `destination` as a linked worktree of
+/// `repository` for an estate item, under `--adopt`, never rewriting a
+/// file in it (2026-10-19, the td01 batch: linked worktrees whose `.git`
+/// the 2026-08-29 ceremony stripped, their files left in place).
+///
+/// [`converge::check_nonrepo`] proves every carried seat there first,
+/// read-only (`GIT_DESTINATION_NONREPO_DIFFERS` otherwise, and the caller
+/// lands the capture beside it). Then, as a first linked landing does
+/// ([`restore_linked_staged_landed`]): under the destination lock the
+/// capture is imported, the native ref step runs and HEAD is planned
+/// ([`converge::plan_linked`]); the directory is checked again (still no
+/// `.git`, every seat still at its proved print); the landing intent is
+/// written. Then the registration `git worktree add` would make, for the
+/// existing directory: the HEAD branch `worktree add -b` would create in a
+/// foreign repository, by compare-and-swap; the administration directory
+/// ([`converge::register`]); and last the `.git` gitfile, created new, the
+/// one entry the adoption adds to the directory. A crash after it
+/// (`estate.converge.linked_added`) is finished forward by
+/// [`recover_linked_landing`], which writes no seat that holds the
+/// capture's content. Then the index from the capture and, once every
+/// seat still holds its proved print, the workspace ledger from the
+/// proof's prints. Files the capture does not carry stay as they are.
+///
+/// # Errors
+/// `GIT_DESTINATION_NONREPO_DIFFERS` (a seat differs, or a stale
+/// registration names the path), `GIT_DESTINATION_OCCUPIED` (a `.git`
+/// appeared, or the path is not spelled canonically),
+/// `GIT_DESTINATION_MODIFIED` (a seat moved after the registration: the
+/// intent stays, so the rerun finishes it or refuses typed), and whatever
+/// a first linked landing refuses.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn adopt_nonrepo_linked(
+    staged: &StagedBundle,
+    (repository, base): (&Path, Option<&StagedBundle>),
+    destination: &Path,
+    source: &str,
+    landing: &converge::Landing<'_>,
+) -> Result<converge::Applied> {
+    const SITE: &str = "git_carry::adopt_nonrepo_linked";
+    use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    destination_git_ready()?;
+    let proof = converge::check_nonrepo(
+        staged,
+        (repository, base),
+        destination,
+        (source, landing.item),
+        (landing.observed_ns, landing.exclude_union.is_some()),
+    )?;
+    let checked = proof.checked;
+    let heads = checked.heads.clone();
+    let head = capture_revision(&heads, "head")?;
+    let plan = converge::plan_linked(&checked, (staged.path(), base), source, landing)?;
+    // Under the lock: still no `.git`, every seat still as proved.
+    if !converge::nonrepo(destination) {
+        return Err(BulkloadRefusal::GitDestinationOccupied);
+    }
+    if !converge::seats_still(destination, &proof.prints)? {
+        return Err(BulkloadRefusal::GitDestinationNonrepoDiffers);
+    }
+    let landing_intent =
+        landed::landing_intent_path(&landed::ledger_dir(&plan.common, source), destination);
+    landed::write(
+        &landing_intent,
+        &landed::LandingIntent {
+            item: landing.item.to_owned(),
+            destination: destination.as_os_str().as_bytes().to_vec(),
+            capture: landing.capture,
+            observed_ns: landing.observed_ns,
+            instance: plan.instance.clone(),
+            head: plan.head.head.clone(),
+            intended_branch: plan.head.intended.clone(),
+        },
+    )?;
+    // A foreign repository: the branch `worktree add -b` would create,
+    // created only where it is still absent.
+    if let (Some(_), Some(branch)) = (&plan.create, &plan.head.head.symbolic) {
+        let mut line = b"create ".to_vec();
+        line.extend_from_slice(branch.as_bytes());
+        line.push(0);
+        line.extend_from_slice(plan.head.head.oid.as_bytes());
+        line.push(0);
+        native_refs::update_refs(&checked.repository, None, &line, &[branch.as_str()])?;
+    }
+    let admin = converge::register(&plan.common, destination, &plan.head.head)?;
+    fault_point!(EstateApplyNonrepoRegistered);
+    {
+        let mut gitfile = b"gitdir: ".to_vec();
+        gitfile.extend_from_slice(admin.as_os_str().as_bytes());
+        gitfile.push(b'\n');
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(destination.join(".git"))
+            .refuse_at(SITE)?;
+        file.write_all(&gitfile).refuse_at(SITE)?;
+        file.sync_all().refuse_at(SITE)?;
+        landed::sync_dir(destination)?;
+    }
+    fault_point!(EstateConvergeLinkedAdded);
+    if text(git(destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
+        return Err(BulkloadRefusal::GitAuthorityChanged);
+    }
+    let mut command = git(destination);
+    durable(&mut command);
+    output(command.args([
+        "read-tree",
+        &format!("{}^{{tree}}", capture_revision(&heads, "staged")?),
+    ]))?;
+    restore_intent_to_add(destination, None, &heads)?;
+    let exclude = match fs::read(&checked.exclude_path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    if exclude != plan.exclude {
+        return Err(BulkloadRefusal::GitIgnorePolicyConflict);
+    }
+    if text(git(destination).args(["rev-parse", "--verify", "HEAD"]))? != head {
+        return Err(BulkloadRefusal::GitAuthorityChanged);
+    }
+    let git_dir =
+        landed::worktree_git_dir(destination)?.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    let index = converge::installed_index(destination, &git_dir, &plan.meta)?;
+    // The ledger names the proof's prints as landed: only while they hold.
+    if !converge::seats_still(destination, &proof.prints)? {
+        return Err(BulkloadRefusal::GitDestinationModified);
+    }
+    let seats = u64::try_from(proof.prints.len()).unwrap_or(u64::MAX);
+    let mut custody = plan.custody;
+    if !converge::record_adopted(
+        destination,
+        (&git_dir, &plan.common),
+        source,
+        landing,
+        (&plan.instance, &plan.head.head, plan.head.intended.as_ref()),
+        index,
+        (proof.recorded_ns, proof.prints),
+    )? {
+        custody.count("not-convergeable");
+    }
+    if let Some(record) = landing.exclude_union {
+        exclude_union::reported(record, &checked.exclude_path)?;
+    }
+    landed::remove(&landing_intent)?;
+    drop(plan.lock);
+    custody.count("adopted-nonrepo");
+    custody.add("adopted-seats", seats);
+    Ok(converge::Applied::adopted(&custody))
 }
 
 /// Finish a first linked landing a crash cut short between `worktree add`

@@ -96,7 +96,9 @@
 //! `created`, `kept`) when the item's `.refs-in` record names its current
 //! capture, so a refused beside landing whose refs went in says so, and,
 //! for `GIT_BESIDE_FOREIGN`, `refusal_detail`, the recorded refusal that
-//! names the beside path.
+//! names the beside path. 2026-10-19 adds `beside_reason` to an
+//! `applied-beside` row: the refusal code that sent the capture beside
+//! (`GIT_DESTINATION_DIVERGED`, `GIT_DESTINATION_NONREPO_DIFFERS`).
 //!
 //! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
@@ -444,6 +446,10 @@ pub struct Row {
     /// `Display`, which names the beside path), printed as
     /// `refusal_detail`.
     pub detail: Option<String>,
+    /// 2026-10-19: on an `applied-beside` row, the refusal code that sent
+    /// the capture beside (`GIT_DESTINATION_DIVERGED`,
+    /// `GIT_DESTINATION_NONREPO_DIFFERS`), printed as `beside_reason`.
+    pub beside_reason: Option<String>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -596,6 +602,7 @@ impl Report {
                     .cloned(),
                 refs_in: entry.refs_in.clone(),
                 detail: beside_foreign_detail(entry),
+                beside_reason: entry.beside_reason.clone(),
             });
         }
         report.recount();
@@ -1043,6 +1050,11 @@ impl Report {
                     );
                 }
             }
+            if let (Disposition::AppliedBeside, Some(reason)) =
+                (&row.disposition, &row.beside_reason)
+            {
+                let _ = write!(out, ",\"beside_reason\":{}", json_string(reason));
+            }
             if let Some(proof) = &row.carried {
                 let _ = write!(
                     out,
@@ -1269,6 +1281,7 @@ fn transfer_row(
         carried: None,
         refs_in: None,
         detail: None,
+        beside_reason: None,
     }
 }
 
@@ -2244,6 +2257,7 @@ mod tests {
             carried: None,
             beside: None,
             refs_in: None,
+            beside_reason: None,
         }
     }
 
@@ -3981,6 +3995,7 @@ mod tests {
                     carried: None,
                     beside: None,
                     refs_in: None,
+                    beside_reason: None,
                 });
                 let Kind::Typed(code, how) = kind else {
                     continue;

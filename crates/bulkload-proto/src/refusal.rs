@@ -180,6 +180,18 @@ pub enum BulkloadRefusal {
     /// `refs/<ns>/` (`--refs-in`). Carries the beside path, raw bytes;
     /// [`fmt::Display`] prints it escaped.
     GitBesideForeign(Vec<u8>),
+    /// `estate-apply --adopt` (2026-10-19, the td01 batch): a linked
+    /// worktree item's planned path holds a directory with no `.git` at all
+    /// (a worktree whose registration was stripped) that the apply cannot
+    /// adopt by registering it again: it differs from the capture in a
+    /// captured path's kind, mode or bytes, a stale registration of the
+    /// repository already names the path, or the item is not a linked
+    /// worktree (a standalone item has no registration to re-create). The
+    /// directory is never written, moved or deleted. Under `--beside` the
+    /// capture lands beside it and this code is the beside landing's
+    /// recorded reason (`beside-reason`); without it the item is refused
+    /// with it, pending review.
+    GitDestinationNonrepoDiffers,
     /// Between the capture a checkout holds and the current one, the source
     /// changed what converge does not carry: the shallow frontier, nested
     /// repository custody, the omitted rebuildable roots or bareness.
@@ -534,6 +546,7 @@ impl BulkloadRefusal {
             Self::GitDestinationModified => "GIT_DESTINATION_MODIFIED",
             Self::GitDestinationDiverged => "GIT_DESTINATION_DIVERGED",
             Self::GitBesideForeign(_) => "GIT_BESIDE_FOREIGN",
+            Self::GitDestinationNonrepoDiffers => "GIT_DESTINATION_NONREPO_DIFFERS",
             Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
             Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
             Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
@@ -633,6 +646,7 @@ impl BulkloadRefusal {
         "GIT_DESTINATION_MODIFIED",
         "GIT_DESTINATION_DIVERGED",
         "GIT_BESIDE_FOREIGN",
+        "GIT_DESTINATION_NONREPO_DIFFERS",
         "HANDOFF_NOT_LANDED",
         "HANDOFF_TARGET_UNSUPPORTED",
         "HANDOFF_BLOCK_MODIFIED",
@@ -897,6 +911,7 @@ mod tests {
             BulkloadRefusal::GitDestinationModified,
             BulkloadRefusal::GitDestinationDiverged,
             BulkloadRefusal::GitBesideForeign(Vec::new()),
+            BulkloadRefusal::GitDestinationNonrepoDiffers,
             BulkloadRefusal::HandoffNotLanded,
             BulkloadRefusal::HandoffTargetUnsupported,
             BulkloadRefusal::HandoffBlockModified,

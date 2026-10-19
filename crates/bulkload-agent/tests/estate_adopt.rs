@@ -3220,3 +3220,282 @@ fn p125_stash_refs_are_decided_by_commit() {
         );
     }
 }
+
+// ---- an occupied non-repo directory (2026-10-19, the td01 batch: linked
+// worktrees of tinyland.dev whose `.git` the 2026-08-29 ceremony stripped,
+// their files left in place) ----------------------------------------------
+
+/// The td01 shape: a source `app` with a linked worktree `app.worktrees/wt`
+/// (a commit of its own, a tracked file edited, an untracked file); at the
+/// destination `app` (a copy without its worktree administration) and the
+/// worktree's files with no `.git` at all, plus `build.log`, a file only
+/// the destination has. The run plans both and is captured.
+fn nonrepo_world(world: &Gftb) -> (Run<'_>, PathBuf, PathBuf, PathBuf) {
+    let main = world.neo("app");
+    fs::create_dir(&main).unwrap();
+    git(&main, &["init", "--quiet", "--template=", "-b", "main"]);
+    fs::write(main.join("a.txt"), b"alpha\n").unwrap();
+    git(&main, &["add", "."]);
+    git(&main, &["commit", "--quiet", "-m", "c1"]);
+    fs::create_dir(world.neo("app.worktrees")).unwrap();
+    let wt = world.neo("app.worktrees/wt");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "-b",
+            "wt",
+            wt.to_str().unwrap(),
+        ],
+    );
+    fs::create_dir(wt.join("d")).unwrap();
+    fs::write(wt.join("d/b.txt"), b"beta\n").unwrap();
+    git(&wt, &["add", "d/b.txt"]);
+    git(&wt, &["commit", "--quiet", "-m", "wt c2"]);
+    fs::write(wt.join("a.txt"), b"alpha, edited on neo\n").unwrap();
+    fs::write(wt.join("notes.txt"), b"untracked on neo\n").unwrap();
+    let dmain = world.sting("app");
+    copy_tree(&main, &dmain);
+    fs::remove_dir_all(dmain.join(".git/worktrees")).unwrap();
+    fs::create_dir(world.sting("app.worktrees")).unwrap();
+    let dwt = world.sting("app.worktrees/wt");
+    copy_tree(&wt, &dwt);
+    fs::remove_file(dwt.join(".git")).unwrap();
+    fs::write(dwt.join("build.log"), b"only at the destination\n").unwrap();
+    let run = Run::new(
+        world,
+        &[
+            (main, dmain.clone(), Some(dmain.clone())),
+            (wt.clone(), dmain.clone(), Some(dwt.clone())),
+        ],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    (run, wt, dmain, dwt)
+}
+
+/// Every entry under `dir` but its top-level `.git`, with its `lstat`
+/// identity: what an adoption of a non-repo directory must not change.
+fn entries_of(dir: &Path) -> Vec<(PathBuf, u64, i64, i64, i64, u64, u32)> {
+    freeze_all(dir)
+        .into_iter()
+        .filter(|row| row.0 != dir.join(".git"))
+        .collect()
+}
+
+/// P126 NONREPO-ADOPT: a linked worktree's directory with no `.git` that
+/// holds every captured path with its kind, mode and bytes (tracked and
+/// untracked, the edit included) is adopted under `--adopt` by registering
+/// it again: a `.git` gitfile and an administration directory of the
+/// destination repository, the index from the capture. No file in it is
+/// written (every entry keeps its inode, times, size and mode), the file
+/// only the destination has stays, the worktree is on its branch with the
+/// capture's status, `git worktree list` names it, `estate-diff` said
+/// `nonrepo-adoptable` before, closure says `applied`, and the source's
+/// next commit converges into it like any landing.
+#[test]
+fn p126_an_equal_nonrepo_worktree_is_adopted_by_registering_it() {
+    let world = Gftb::new();
+    let (run, wt, dmain, dwt) = nonrepo_world(&world);
+    let before = entries_of(&dwt);
+    let diff = run.diff(&[]);
+    assert!(
+        diff_line(&diff.stdout, &wt).contains("\"adopt\":\"nonrepo-adoptable\""),
+        "{}",
+        diff.stdout
+    );
+    let ran = run.apply(&["--adopt"]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let row = receipt(&receipts(&ran.stdout), &wt).clone();
+    assert_eq!(row.1, "workspace-restored", "{row:?}");
+    assert!(row.2.contains("adopted-nonrepo=1"), "{row:?}");
+    assert_eq!(
+        entries_of(&dwt),
+        before,
+        "a file in the directory was written"
+    );
+    assert_eq!(
+        fs::read(dwt.join("build.log")).unwrap(),
+        b"only at the destination\n"
+    );
+    let gitfile = fs::read_to_string(dwt.join(".git")).unwrap();
+    assert!(
+        gitfile.starts_with(&format!(
+            "gitdir: {}",
+            dmain.join(".git/worktrees/").display()
+        )),
+        "{gitfile}"
+    );
+    assert_eq!(
+        git(&dwt, &["rev-parse", "HEAD"]),
+        git(&wt, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&dwt, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "wt"
+    );
+    let status = git(&dwt, &["status", "--porcelain", "--untracked-files=all"]);
+    let mut want: Vec<String> = git(&wt, &["status", "--porcelain", "--untracked-files=all"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    want.push("?? build.log".to_owned());
+    want.sort();
+    let mut got: Vec<String> = status.lines().map(str::to_owned).collect();
+    got.sort();
+    assert_eq!(got, want);
+    assert!(
+        git(&dmain, &["worktree", "list", "--porcelain"])
+            .contains(&format!("worktree {}", dwt.display())),
+        "{}",
+        git(&dmain, &["worktree", "list", "--porcelain"])
+    );
+    let closure = run.closure();
+    assert!(
+        closure.stdout.contains("\"unaccounted\":0") && closure.stdout.contains("\"applied\":2"),
+        "{}",
+        closure.stdout
+    );
+    let ran = run.apply(&["--adopt"]);
+    assert_eq!(
+        receipt(&receipts(&ran.stdout), &wt).1,
+        "previous-workspace-restoration-not-revalidated"
+    );
+    // The adopted worktree converges like any landing.
+    fs::write(wt.join("later.txt"), b"later, from neo\n").unwrap();
+    git(&wt, &["add", "later.txt"]);
+    git(&wt, &["commit", "--quiet", "-m", "later"]);
+    settle();
+    run.capture();
+    let ran = run.apply(&["--adopt"]);
+    let row = receipt(&receipts(&ran.stdout), &wt).clone();
+    assert_eq!(row.1, "workspace-restored", "{row:?}");
+    assert!(row.2.contains("converged"), "{row:?}");
+    assert_eq!(
+        fs::read(dwt.join("later.txt")).unwrap(),
+        b"later, from neo\n"
+    );
+    assert_eq!(
+        fs::read(dwt.join("build.log")).unwrap(),
+        b"only at the destination\n"
+    );
+}
+
+/// P127 NONREPO-BESIDE: a linked worktree's directory with no `.git` that
+/// differs from the capture (a captured file edited at the destination)
+/// is never written: under `--adopt` alone it refuses
+/// `GIT_DESTINATION_NONREPO_DIFFERS`, typed and pending review; under
+/// `--adopt --beside --refs-in` the capture lands beside it at
+/// `<path>.neo-20261016` as a linked worktree of the repository (detached,
+/// its refs in under `refs/neo-20261016/`), the receipt and closure name
+/// the reason (`beside-reason`, `beside_reason`), and the directory keeps
+/// every entry as it was. `estate-diff` says `nonrepo-differs` with the
+/// differing seat and `beside=landing`.
+#[test]
+fn p127_a_differing_nonrepo_worktree_stays_and_the_capture_lands_beside() {
+    let world = Gftb::new();
+    let (run, wt, dmain, dwt) = nonrepo_world(&world);
+    fs::write(dwt.join("d/b.txt"), b"beta, edited on sting\n").unwrap();
+    let before = entries_of(&dwt);
+    let diff = run.diff(&["--beside", SUFFIX]);
+    let line = diff_line(&diff.stdout, &wt).to_owned();
+    assert!(
+        line.contains("\"adopt\":\"nonrepo-differs\"")
+            && line.contains("\"seat=d/b.txt\"")
+            && line.contains("\"beside=landing:"),
+        "{line}"
+    );
+    let ran = run.apply(&["--adopt"]);
+    let row = receipt(&receipts(&ran.stdout), &wt).clone();
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(row.2.contains("GIT_DESTINATION_NONREPO_DIFFERS"), "{row:?}");
+    assert_eq!(entries_of(&dwt), before);
+    assert!(!dwt.join(".git").exists());
+    let closure = run.closure();
+    assert!(
+        closure.stdout.contains("\"unaccounted\":0")
+            && closure
+                .stdout
+                .contains("\"GIT_DESTINATION_NONREPO_DIFFERS\":1"),
+        "{}",
+        closure.stdout
+    );
+    let ran = run.apply(&["--adopt", "--beside", SUFFIX, "--refs-in"]);
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let row = receipt(&receipts(&ran.stdout), &wt).clone();
+    assert_eq!(row.1, "workspace-beside", "{row:?}");
+    assert!(
+        row.2
+            .contains("beside-reason=GIT_DESTINATION_NONREPO_DIFFERS")
+            && row.2.contains("beside-landed=1")
+            && row.2.contains("beside-linked=1"),
+        "{row:?}"
+    );
+    assert_eq!(
+        entries_of(&dwt),
+        before,
+        "the non-repo directory was written"
+    );
+    assert!(!dwt.join(".git").exists());
+    let beside = beside_of(&dwt);
+    assert_eq!(
+        git(&beside, &["rev-parse", "HEAD"]),
+        git(&wt, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]).trim(),
+        "HEAD"
+    );
+    assert_eq!(fs::read(beside.join("d/b.txt")).unwrap(), b"beta\n");
+    assert_eq!(
+        named_refs(&dmain).get("refs/neo-20261016/heads/wt"),
+        Some(&git(&wt, &["rev-parse", "HEAD"]).trim().to_owned())
+    );
+    let closure = run.closure();
+    assert!(
+        closure.stdout.contains("\"applied_beside\":1")
+            && closure
+                .stdout
+                .contains("\"beside_reason\":\"GIT_DESTINATION_NONREPO_DIFFERS\"")
+            && closure.stdout.contains("\"unaccounted\":0"),
+        "{}",
+        closure.stdout
+    );
+}
+
+/// P128 NONREPO-STANDALONE: a standalone item's planned path holding a
+/// directory with no `.git` has no registration to re-create and no
+/// repository to land beside into: under `--adopt --beside --refs-in` it
+/// refuses `GIT_DESTINATION_NONREPO_DIFFERS`, typed and pending review,
+/// and nothing there or beside it is written, even when its files are the
+/// capture's.
+#[test]
+fn p128_a_standalone_nonrepo_directory_refuses_typed_and_stays() {
+    let (world, source, dest) = small();
+    fs::remove_dir_all(dest.join(".git")).unwrap();
+    let run = Run::new(
+        &world,
+        &[(source.clone(), dest.clone(), Some(dest.clone()))],
+    );
+    settle();
+    run.capture();
+    private_dir(&run.applied);
+    let before = entries_of(&dest);
+    let ran = run.apply(&["--adopt", "--beside", SUFFIX, "--refs-in"]);
+    let row = receipt(&receipts(&ran.stdout), &source).clone();
+    assert_eq!(row.1, "refused", "{row:?}");
+    assert!(row.2.contains("GIT_DESTINATION_NONREPO_DIFFERS"), "{row:?}");
+    assert_eq!(entries_of(&dest), before);
+    assert!(!dest.join(".git").exists());
+    assert!(!beside_of(&dest).exists());
+    let closure = run.closure();
+    assert!(
+        closure.stdout.contains("\"unaccounted\":0")
+            && closure.stdout.contains("\"refused_pending_review\":1"),
+        "{}",
+        closure.stdout
+    );
+}
