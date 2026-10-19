@@ -31,17 +31,22 @@ USAGE:
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
     walk PATH   Stat-walk PATH and print the row and refusal counts
-    copy SOURCE DEST SOURCE_STATE DEST_STATE
+    copy [--file] SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores; the
                 session's outcomes are recorded in
                 DEST_STATE/transfer.closure.d, one record per transfer, for
                 closure-report --transfer (WP3 PR 4). The S2 overlap checks
                 run before anything is written; a session that ends refused
-                keeps the earlier session's refused rows
-    pull HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
+                keeps the earlier session's refused rows. --file: SOURCE is
+                one regular file, landed as the file DEST (#232; BOUNDARIES)
+    pull [--file] HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
                 Native SSH pull; remote bulkload-agent must be installed; the
-                session is recorded in DEST_STATE as copy's is
-    serve       Serve one framed request on stdin/stdout (for SSH)
+                session is recorded in DEST_STATE as copy's is. --file as
+                copy's, run on the source as serve --file
+    serve [--file]
+                Serve one framed request on stdin/stdout (for SSH). With
+                --file the root the request names is one regular file
+                (pull --file passes it); any other word is refused
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
@@ -596,7 +601,22 @@ BOUNDARIES:
     priority_escalate_after=SECONDS, and priority_escalations,
     priority_escalated_ns, priority_escalated_threads and
     priority_escalation_failures record it.
-    copy/pull require an existing destination directory.
+    copy/pull make an absent DEST themselves (mode 0700) when its parent
+    exists, and never a parent: DESTINATION_PARENT_MISSING (#232; R2.2, the
+    run writes where it was asked and nowhere else). A regular or special
+    file at DEST where a tree would land is DESTINATION_KIND_MISMATCH, as is
+    a directory at DEST under --file.
+    --file (#232): SOURCE is one regular file and DEST the file it lands as,
+    byte for byte, in DEST's existing parent, under DEST's own name; an
+    identical file at DEST is adopted, a differing one is refused
+    DESTINATION_OCCUPIED, and an unchanged rerun reads 0 bytes for it, as
+    for a seat in a tree. pull --file runs the source half as serve --file.
+    A source root that is not the kind the verb was given (a file without
+    --file, anything but a regular file with it) is
+    SOURCE_ROOT_KIND_MISMATCH; an absent source root SOURCE_ROOT_MISSING;
+    one that cannot be resolved or opened SOURCE_ROOT_UNREADABLE with its
+    errno. Over ssh those three are the source's whole-session refusal and
+    reach the operator through its stderr; the wire is unchanged (v6).
     copy/pull replace only their own untouched outputs, when the source seat
     changed (superseding publish, WP0(d)); any other divergent destination
     file is preserved and refused DESTINATION_OCCUPIED, and remembered: an
@@ -839,14 +859,7 @@ fn main() -> ExitCode {
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
         Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
-        Some("serve") => {
-            let (input, output) = (std::io::stdin(), std::io::stdout());
-            bulkload_agent::transfer::tune_stream(&input);
-            bulkload_agent::transfer::tune_stream(&output);
-            // The reader thread owns stdin for the session; the process
-            // exit closes the transport.
-            bulkload_agent::transfer::serve(input, &mut output.lock())
-        }
+        Some("serve") => serve_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1000,6 +1013,51 @@ fn global_flags(
         }
     }
     Ok(rest)
+}
+
+/// `copy [--file] ...` and `pull [--file] ...`: a leading `--file` (#232)
+/// names a single-file root.
+fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
+    let (kind, args) = root_kind(args);
+    let path = |index: usize| {
+        args.get(index)
+            .map(Path::new)
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)
+    };
+    match command {
+        "copy" if args.len() == 4 => {
+            // WP3 PR 4: the session's outcomes are closure rows.
+            copy_recorded_kind(kind, path(0)?, path(1)?, path(2)?, path(3)?)
+        }
+        "pull" if (5..=7).contains(&args.len()) => pull_recorded_kind(kind, args),
+        _ => Err(BulkloadRefusal::RequiredFieldMissing),
+    }
+}
+
+/// `serve [--file]`: one framed session on stdin/stdout. `--file` (#232) is
+/// its one option; another word is refused, where before it was ignored.
+fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
+    let (kind, rest) = root_kind(args);
+    if !rest.is_empty() {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    let (input, output) = (std::io::stdin(), std::io::stdout());
+    bulkload_agent::transfer::tune_stream(&input);
+    bulkload_agent::transfer::tune_stream(&output);
+    // The reader thread owns stdin for the session; the process exit closes
+    // the transport.
+    bulkload_agent::transfer::serve_kind(input, &mut output.lock(), kind)
+}
+
+/// Split a leading `--file` (#232) from a transfer verb's arguments: the
+/// root is one regular file, else a tree.
+fn root_kind(
+    args: &[std::ffi::OsString],
+) -> (bulkload_agent::transfer::RootKind, &[std::ffi::OsString]) {
+    match args.split_first() {
+        Some((flag, rest)) if flag == "--file" => (bulkload_agent::transfer::RootKind::File, rest),
+        _ => (bulkload_agent::transfer::RootKind::Tree, args),
+    }
 }
 
 // OI-1001-Q2: bulkload's own closure gate. The JSON ledger goes to stdout
@@ -1317,11 +1375,7 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             println!("{count}");
             Ok(())
         }
-        "copy" if args.len() == 4 => {
-            // WP3 PR 4: the session's outcomes are closure rows.
-            copy_recorded(path(0)?, path(1)?, path(2)?, path(3)?)
-        }
-        "pull" if (5..=7).contains(&args.len()) => pull_recorded(args),
+        "copy" | "pull" => transfer_command(command, args),
         "snapshot" if (2..=3).contains(&args.len()) => {
             bulkload_agent::provider_sqlite::snapshot(path(0)?, path(1)?, steps(args.get(2))?)?;
             println!("snapshot complete");
@@ -2280,14 +2334,39 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
 // rows. S2 (review finding 1): the overlap decision is made before the
 // record's first write, so a refused overlap writes nothing anywhere.
 fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &Path) -> Result<()> {
+    copy_recorded_kind(
+        bulkload_agent::transfer::RootKind::Tree,
+        source,
+        dest,
+        source_state,
+        dest_state,
+    )
+}
+
+// #232: `copy_recorded` of a root of `kind` (`copy --file`).
+fn copy_recorded_kind(
+    kind: bulkload_agent::transfer::RootKind,
+    source: &Path,
+    dest: &Path,
+    source_state: &Path,
+    dest_state: &Path,
+) -> Result<()> {
     let stats = bulkload_agent::transfer_outcome::record_session(
         dest_state,
         "copy",
         &bulkload_agent::transfer_outcome::copy_source(source),
         &bulkload_agent::transfer_outcome::stable(dest),
         "transfer::copy",
-        || bulkload_agent::transfer::copy_roots_apart(source, dest, source_state, dest_state),
-        || bulkload_agent::transfer::copy(source, dest, source_state, dest_state),
+        || {
+            bulkload_agent::transfer::copy_roots_apart_kind(
+                source,
+                dest,
+                source_state,
+                dest_state,
+                kind,
+            )
+        },
+        || bulkload_agent::transfer::copy_kind(source, dest, source_state, dest_state, kind),
     )?;
     report_transfer(&stats)
 }
@@ -2296,6 +2375,14 @@ fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &P
 // HOST:SOURCE and the canonical DEST, recorded in DEST_STATE around the
 // session (`pull_command`, whose ssh child the S2 registry pins).
 fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
+    pull_recorded_kind(bulkload_agent::transfer::RootKind::Tree, args)
+}
+
+// #232: `pull_recorded` of a root of `kind` (`pull --file`).
+fn pull_recorded_kind(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<()> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2308,8 +2395,8 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
         &bulkload_agent::transfer_outcome::pull_source(host, path(1)?),
         &bulkload_agent::transfer_outcome::stable(path(2)?),
         "transfer::pull",
-        || bulkload_agent::transfer::receive_roots_apart(path(2)?, path(4)?),
-        || pull_command(args),
+        || bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind),
+        || pull_command(kind, args),
     )
     .and_then(|stats| report_transfer(&stats))
 }
@@ -2347,7 +2434,7 @@ fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
             // parser requires the one with the other.
             args.extend(self.remote.iter().cloned());
             args.extend(self.config.iter().cloned());
-            pull_command(&args)
+            pull_command(bulkload_agent::transfer::RootKind::Tree, &args)
         }
     }
     let mut options = CarryOptions::default();
@@ -2480,7 +2567,10 @@ fn expect_command(args: &[std::ffi::OsString]) -> Result<()> {
     Ok(())
 }
 
-fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer::TransferStats> {
+fn pull_command(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<bulkload_agent::transfer::TransferStats> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2517,8 +2607,12 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer:
     if bulkload_agent::durable::ledger_sync() == bulkload_agent::durable::LedgerSync::Full {
         ssh.arg("--source-ledger-sync=full");
     }
+    ssh.arg("serve");
+    // #232: the source half serves one regular file, as this side lands it.
+    if kind == bulkload_agent::transfer::RootKind::File {
+        ssh.arg("--file");
+    }
     let mut child = ssh
-        .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -2529,13 +2623,14 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer:
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
         bulkload_agent::transfer::tune_stream(&output);
         bulkload_agent::transfer::tune_stream(&input);
-        bulkload_agent::transfer::receive(
+        bulkload_agent::transfer::receive_kind(
             &mut input,
             &mut output,
             path(1)?,
             path(3)?,
             path(2)?,
             path(4)?,
+            kind,
         )
     };
     let exit_status = child.wait().refuse_at("main::pull_command")?;

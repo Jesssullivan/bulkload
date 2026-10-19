@@ -421,6 +421,9 @@ pub struct Walker<'root> {
     directories_listed: u64,
     /// Classify `SQLite` sidecars and attach `-wal` identities (#218).
     sqlite: bool,
+    /// [`Walker::single_seat`]: the one name visited; the root level lists
+    /// that name's sidecars too, but only for [`Level::holds`].
+    only: Option<CString>,
     _root: BorrowedFd<'root>,
 }
 
@@ -444,6 +447,53 @@ impl<'root> Walker<'root> {
         Self::with_limits(root, cross_device, WalkLimits::DEFAULT)
     }
 
+    /// A walk beneath `root`, a directory descriptor, that visits only the
+    /// one entry `name` (#232): the single-file source of `copy --file` and
+    /// `pull --file`. The directory is not listed. Its level holds `name`
+    /// and whichever of `name-wal`, `name-shm` and `name-journal` exist
+    /// beside it (one `fstatat` each), so a [`Walker::with_sqlite`] walk
+    /// still keys a database by its `-wal`'s identity (#218: a WAL commit
+    /// leaves the main file untouched); only `name` is visited, so no
+    /// sidecar is ever offered. `name` is stat'ed and yielded as in any
+    /// walk (gone since the caller's stat: `SOURCE_VANISHED`). The caller
+    /// has checked the kind it wants; a directory here would be descended
+    /// into like any other.
+    ///
+    /// # Errors
+    /// Refuses with the `fstat` or reopen failure of the root.
+    pub fn single_seat(root: BorrowedFd<'root>, name: &CStr, cross_device: bool) -> Result<Self> {
+        let root_dev = sys::fstat(root).refuse_at("walk::single_seat")?.node.dev;
+        let dir = sys::open_dir_at(root, c".").refuse_at("walk::single_seat")?;
+        let mut names = vec![name.to_owned()];
+        for suffix in SQLITE_SIDECAR_SUFFIXES {
+            let mut sidecar = name.to_bytes().to_vec();
+            sidecar.extend_from_slice(suffix);
+            if let Ok(sidecar) = CString::new(sidecar) {
+                if sys::fstatat_nofollow(&dir, &sidecar).is_ok() {
+                    names.push(sidecar);
+                }
+            }
+        }
+        names.sort_unstable();
+        Ok(Self {
+            root_dev,
+            cross_device,
+            limits: WalkLimits::DEFAULT,
+            stack: vec![Level {
+                dir,
+                prefix_len: 0,
+                names,
+                next: 0,
+            }],
+            path: Vec::new(),
+            ready: VecDeque::new(),
+            directories_listed: 1,
+            sqlite: false,
+            only: Some(name.to_owned()),
+            _root: root,
+        })
+    }
+
     /// [`Walker::new`] within `limits`.
     ///
     /// # Errors
@@ -463,6 +513,7 @@ impl<'root> Walker<'root> {
             ready: VecDeque::new(),
             directories_listed: 0,
             sqlite: false,
+            only: None,
             _root: root,
         };
         match sys::open_dir_at(root, c".")
@@ -781,6 +832,10 @@ impl Iterator for Walker<'_> {
             let prefix_len = level.prefix_len;
             let level = self.stack.last()?;
             let name = level.names.get(at)?;
+            // A single-seat walk lists a name's sidecars for `holds` only.
+            if self.only.as_ref().is_some_and(|only| only != name) {
+                continue;
+            }
             self.path.truncate(prefix_len);
             if prefix_len != 0 {
                 self.path.push(b'/');
