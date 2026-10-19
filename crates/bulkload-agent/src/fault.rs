@@ -131,6 +131,24 @@
 //! | `estate.converge.after_head` | HEAD and its branch new; the workspace ledger old, its intent pending |
 //! | `estate.converge.after_landed` | the new workspace ledger, no intent; no journal or outcome record |
 //!
+//! Estate advance (`estate-apply --advance-ancestor`, operator ruling
+//! 2026-10-19), in `git_carry::converge::advance` and `estate`: a clean
+//! live checkout whose HEAD is an ancestor of the captured one, advanced
+//! in place, then the beside landing it made redundant retired. The rerun
+//! finishes either, or refuses typed, and never loses the live tree or the
+//! beside one:
+//!
+//! | Name | Crash leaves (in the destination) |
+//! |------|-----------------------------------|
+//! | `estate.advance.after_intent` | the advance intent durable; the live branch, seats and index untouched |
+//! | `estate.advance.after_branch` | the live branch (or detached HEAD) at the captured HEAD by compare-and-swap; seats and index still the live HEAD's |
+//! | `estate.advance.after_seat` | one more seat written and sealed (mid-materialize) |
+//! | `estate.advance.after_index` | every seat and the captured index in place; no advance record or ledger |
+//! | `estate.advance.after_ledger` | the advance record and the workspace ledger; the intent pending, no journal |
+//! | `estate.advance.retire_after_intent` | a beside landing proved equal to the live tree and its retirement recorded in STATE; nothing moved |
+//! | `estate.advance.retire_after_rename` | the beside landing under its private retirement name, whole |
+//! | `estate.advance.retire_mid` | the retirement re-proved and marked deleting, a linked landing's administration removed; the renamed tree not yet deleted |
+//!
 //! Agent session re-seat, in `reseat` (R0, TIN-6587). Each rerun settles
 //! what a crash left forward from the ledger and the destination's own
 //! bytes, never by re-reading what it already placed:
@@ -362,6 +380,34 @@ pub enum Point {
     /// landed and its refs created under `refs/<ns>/`; its STATE record
     /// still names them pending and the item's journal is not written.
     EstateApplyBesideRefs,
+    /// `estate.advance.after_intent`: an `--advance-ancestor` advance's
+    /// intent durable (operator ruling 2026-10-19); the live checkout, its
+    /// branch and its index untouched.
+    EstateAdvanceAfterIntent,
+    /// `estate.advance.after_branch`: the live branch (or detached HEAD)
+    /// moved by compare-and-swap to the captured HEAD; every seat and the
+    /// index still the live HEAD's.
+    EstateAdvanceAfterBranch,
+    /// `estate.advance.after_seat`: one more seat of the advance written
+    /// and sealed (mid-materialize).
+    EstateAdvanceAfterSeat,
+    /// `estate.advance.after_index`: every seat and the captured index in
+    /// place (the checkout done); no advance record or ledger.
+    EstateAdvanceAfterIndex,
+    /// `estate.advance.after_ledger`: the advance record and the workspace
+    /// ledger written; the intent still pending, no journal.
+    EstateAdvanceAfterLedger,
+    /// `estate.advance.retire_after_intent`: a beside landing proved equal
+    /// to the advanced live tree, its retirement recorded in STATE; nothing
+    /// moved.
+    EstateAdvanceRetireAfterIntent,
+    /// `estate.advance.retire_after_rename`: the beside landing renamed to
+    /// its private retirement name; its administration and bytes all there.
+    EstateAdvanceRetireAfterRename,
+    /// `estate.advance.retire_mid`: the retirement re-proved and marked
+    /// deleting, a linked landing's administration removed; its renamed
+    /// tree not yet deleted.
+    EstateAdvanceRetireMid,
     /// `estate.carry.recorded`: `estate-carry-files` landed an item's
     /// bytes and wrote its carry record; the outcome record still says
     /// `CAPTURE_ABSENT` (M2r2 b).
@@ -422,7 +468,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 72] = [
+    pub const ALL: [Self; 80] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -473,6 +519,14 @@ impl Point {
         Self::EstateApplyExcludeIntent,
         Self::EstateApplyExcludeAppended,
         Self::EstateApplyBesideRefs,
+        Self::EstateAdvanceAfterIntent,
+        Self::EstateAdvanceAfterBranch,
+        Self::EstateAdvanceAfterSeat,
+        Self::EstateAdvanceAfterIndex,
+        Self::EstateAdvanceAfterLedger,
+        Self::EstateAdvanceRetireAfterIntent,
+        Self::EstateAdvanceRetireAfterRename,
+        Self::EstateAdvanceRetireMid,
         Self::EstateCarryRecorded,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
@@ -551,6 +605,14 @@ impl Point {
             Self::EstateApplyExcludeIntent => "estate.apply.exclude_intent",
             Self::EstateApplyExcludeAppended => "estate.apply.exclude_appended",
             Self::EstateApplyBesideRefs => "estate.apply.beside_refs",
+            Self::EstateAdvanceAfterIntent => "estate.advance.after_intent",
+            Self::EstateAdvanceAfterBranch => "estate.advance.after_branch",
+            Self::EstateAdvanceAfterSeat => "estate.advance.after_seat",
+            Self::EstateAdvanceAfterIndex => "estate.advance.after_index",
+            Self::EstateAdvanceAfterLedger => "estate.advance.after_ledger",
+            Self::EstateAdvanceRetireAfterIntent => "estate.advance.retire_after_intent",
+            Self::EstateAdvanceRetireAfterRename => "estate.advance.retire_after_rename",
+            Self::EstateAdvanceRetireMid => "estate.advance.retire_mid",
             Self::EstateCarryRecorded => "estate.carry.recorded",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",

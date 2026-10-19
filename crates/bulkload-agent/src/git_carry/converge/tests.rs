@@ -848,8 +848,9 @@ fn adopt_at(staged: &super::super::StagedBundle, dest: &Path) -> Result<Applied>
         source: "neo",
         standalone: true,
         beside: false,
+        advanced: None,
     };
-    adopt::workspace(staged, &target, &adopt_landing(staged), &place)
+    adopt::workspace(staged, &target, &adopt_landing(staged), &place, false)
 }
 
 fn all_refs(repo: &Path) -> String {
@@ -1056,4 +1057,147 @@ fn a_rekey_never_takes_a_tree_from_an_item_of_the_same_plan() {
         refusal(&["this-item".to_owned(), ledger.item.clone()]),
         Some("item-in-plan")
     );
+}
+
+// ---- `--advance-ancestor` (operator ruling 2026-10-19) ---------------------
+
+// A source on `main` two commits ahead of a `cp -a` copy of itself at the
+// first (the live checkout, clean, an ancestor), with a dirty edit; its
+// capture, staged.
+fn advance_world() -> (
+    tempfile::TempDir,
+    PathBuf,
+    PathBuf,
+    super::super::StagedBundle,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("source");
+    fs::create_dir(&source).unwrap();
+    git_run(&source, &["init", "--quiet", "--template=", "-b", "main"]);
+    fs::write(source.join("f"), b"one\n").unwrap();
+    git_run(&source, &["add", "f"]);
+    git_run(&source, &["commit", "--quiet", "-m", "one"]);
+    let dest = root.join("dest");
+    let copied = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(&source)
+        .arg(&dest)
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    fs::write(source.join("f"), b"two\n").unwrap();
+    git_run(&source, &["commit", "--quiet", "-am", "two"]);
+    fs::write(source.join("g"), b"new\n").unwrap();
+    git_run(&source, &["add", "g"]);
+    git_run(&source, &["commit", "--quiet", "-m", "three"]);
+    fs::write(source.join("f"), b"dirty\n").unwrap();
+    let bundle = super::super::export_repository(&source, &root.join("capture")).unwrap();
+    let staged = super::super::stage_bundle(&bundle).unwrap();
+    (dir, source, dest, staged)
+}
+
+// `--advance-ancestor` at the standalone live checkout `dest`, as
+// apply_workspace calls it.
+fn advance_at(staged: &super::super::StagedBundle, dest: &Path) -> Result<Applied> {
+    let target = Target {
+        repository: dest,
+        workspace: Some(dest),
+        source: "neo",
+        base: None,
+    };
+    let place = Place {
+        worktree: dest,
+        base: None,
+        git_dir: dest.join(".git"),
+        common: dest.join(".git"),
+        source: "neo",
+        standalone: true,
+        beside: false,
+        advanced: None,
+    };
+    adopt::workspace(staged, &target, &adopt_landing(staged), &place, true)
+}
+
+/// The live branch moved between the advance proof and its
+/// compare-and-swap: before the lock (the proof re-checked under it), or
+/// after the intent (the compare-and-swap itself loses). Either refuses
+/// `GIT_ADVANCE_RACED` with nothing written: the branch holds the commit
+/// the operator made, the worktree and the index are as they were, no
+/// intent, record or ledger is left.
+#[test]
+fn an_advance_whose_branch_moved_refuses_raced_with_nothing_written() {
+    for stage in [
+        super::super::mid_pass::Stage::AdvanceBeforeLock,
+        super::super::mid_pass::Stage::AdvanceBeforeBranch,
+    ] {
+        let (_dir, _source, dest, staged) = advance_world();
+        let at = dest.clone();
+        super::super::mid_pass::arm_at(&dest, stage, move || {
+            git_run(
+                &at,
+                &["commit", "--quiet", "--allow-empty", "-m", "sting's own"],
+            );
+        });
+        assert_eq!(
+            advance_at(&staged, &dest),
+            Err(BulkloadRefusal::GitAdvanceRaced),
+            "{stage:?}"
+        );
+        assert_eq!(
+            git_run(&dest, &["log", "-1", "--format=%s", "main"]),
+            "sting's own",
+            "{stage:?}"
+        );
+        assert_eq!(git_run(&dest, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+        assert_eq!(fs::read(dest.join("f")).unwrap(), b"one\n", "{stage:?}");
+        assert!(!dest.join("g").exists(), "{stage:?}");
+        assert_eq!(git_run(&dest, &["status", "--porcelain"]), "", "{stage:?}");
+        let records = landed::ledger_dir(&dest.join(".git"), "neo");
+        for record in [
+            advance::INTENT,
+            advance::ADVANCED,
+            landed::WORKSPACE_LANDED,
+            landed::REFS_LANDED,
+        ] {
+            assert!(
+                !records.join(record).exists(),
+                "{stage:?}: {record} written"
+            );
+        }
+    }
+}
+
+/// The advance itself, at the library seam: the branch moved by
+/// compare-and-swap to the captured HEAD, the captured tree, its dirty edit
+/// and index laid down, the advance record and the workspace ledger
+/// written, no repository marker set (no native ref step), no intent left.
+#[test]
+fn an_advance_lands_the_capture_on_the_live_branch() {
+    let (_dir, source, dest, staged) = advance_world();
+    let applied = advance_at(&staged, &dest).unwrap();
+    assert!(applied.advanced);
+    let words = applied.custody.unwrap_or_default();
+    assert!(words.split(' ').any(|word| word == "advanced=1"), "{words}");
+    assert_eq!(
+        git_run(&dest, &["rev-parse", "HEAD"]),
+        git_run(&source, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(git_run(&dest, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(fs::read(dest.join("f")).unwrap(), b"dirty\n");
+    assert_eq!(fs::read(dest.join("g")).unwrap(), b"new\n");
+    assert_eq!(
+        git_run(&dest, &["status", "--porcelain"]),
+        git_run(&source, &["status", "--porcelain"])
+    );
+    let records = landed::ledger_dir(&dest.join(".git"), "neo");
+    assert!(!records.join(advance::INTENT).exists());
+    assert!(!records.join(landed::REFS_LANDED).exists());
+    let ledger: LandedWorkspace = landed::read(&records.join(landed::WORKSPACE_LANDED))
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.item, "item");
+    let record = advance::read_advanced(&records).unwrap().unwrap();
+    assert_eq!(record.to, ledger.head);
+    assert_eq!(record.from.symbolic.as_deref(), Some("refs/heads/main"));
 }

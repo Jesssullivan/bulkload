@@ -180,6 +180,46 @@ pub enum BulkloadRefusal {
     /// `refs/<ns>/` (`--refs-in`). Carries the beside path, raw bytes;
     /// [`fmt::Display`] prints it escaped.
     GitBesideForeign(Vec<u8>),
+    /// `estate-apply --advance-ancestor` (operator ruling 2026-10-19, "Yes,
+    /// advance those"): the live checkout bulkload did not land is not
+    /// clean. Its index or a tracked file differs from its HEAD (a staged
+    /// or unstaged change), an operation is in progress (merge, rebase,
+    /// cherry-pick, revert, bisect), an index entry is marked
+    /// assume-unchanged or skip-worktree, or a seat the advance would
+    /// replace does not hold its HEAD's bytes. Untracked files are judged
+    /// by `GIT_ADVANCE_UNTRACKED_COLLIDES`. Nothing is written; the capture
+    /// lands beside it instead, as without the flag.
+    GitAdvanceNotClean,
+    /// `--advance-ancestor`: the live checkout's HEAD is not an ancestor of
+    /// (or equal to) the captured HEAD, or it is unborn. Nothing is
+    /// written; the capture lands beside it.
+    GitAdvanceNotAncestor,
+    /// `--advance-ancestor`: the live checkout's branch is not the captured
+    /// one (one detached and the other on a branch, or two branch names).
+    /// Detaching or switching the live checkout is never the answer: nothing
+    /// is written; the capture lands beside it.
+    GitAdvanceBranchMismatch,
+    /// `--advance-ancestor`: the live branch cannot be moved by
+    /// compare-and-swap alone: another worktree has it checked out (or a
+    /// rebase or bisect there holds it), a pending bulkload intent names
+    /// it, it is a symbolic ref, or its tip is not the live HEAD. Nothing
+    /// is written; the capture lands beside it.
+    GitAdvanceBranchBusy,
+    /// `--advance-ancestor` (coordinator refinement of the 2026-10-19
+    /// ruling): an untracked file of the live checkout that is not ignored
+    /// collides with a path the capture holds (its HEAD's tree, its index
+    /// or its working-tree changes): the same path, or one a directory of
+    /// the other. Or an ignored entry stands where the capture tracks a
+    /// path. The live checkout's untracked and ignored files are never
+    /// touched, so nothing is written; the capture lands beside it.
+    /// Carries the colliding paths (newline-separated, at most 16, then a
+    /// `+N` line), raw bytes; [`fmt::Display`] prints them escaped.
+    GitAdvanceUntrackedCollides(Vec<u8>),
+    /// `--advance-ancestor`: the live checkout changed between the advance
+    /// proof and its compare-and-swap (HEAD, the branch, the index or a
+    /// proved seat). Nothing is written to the live checkout or its refs;
+    /// the capture lands beside it.
+    GitAdvanceRaced,
     /// Between the capture a checkout holds and the current one, the source
     /// changed what converge does not carry: the shallow frontier, nested
     /// repository custody, the omitted rebuildable roots or bareness.
@@ -534,6 +574,12 @@ impl BulkloadRefusal {
             Self::GitDestinationModified => "GIT_DESTINATION_MODIFIED",
             Self::GitDestinationDiverged => "GIT_DESTINATION_DIVERGED",
             Self::GitBesideForeign(_) => "GIT_BESIDE_FOREIGN",
+            Self::GitAdvanceNotClean => "GIT_ADVANCE_NOT_CLEAN",
+            Self::GitAdvanceNotAncestor => "GIT_ADVANCE_NOT_ANCESTOR",
+            Self::GitAdvanceBranchMismatch => "GIT_ADVANCE_BRANCH_MISMATCH",
+            Self::GitAdvanceBranchBusy => "GIT_ADVANCE_BRANCH_BUSY",
+            Self::GitAdvanceUntrackedCollides(_) => "GIT_ADVANCE_UNTRACKED_COLLIDES",
+            Self::GitAdvanceRaced => "GIT_ADVANCE_RACED",
             Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
             Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
             Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
@@ -633,6 +679,12 @@ impl BulkloadRefusal {
         "GIT_DESTINATION_MODIFIED",
         "GIT_DESTINATION_DIVERGED",
         "GIT_BESIDE_FOREIGN",
+        "GIT_ADVANCE_NOT_CLEAN",
+        "GIT_ADVANCE_NOT_ANCESTOR",
+        "GIT_ADVANCE_BRANCH_MISMATCH",
+        "GIT_ADVANCE_BRANCH_BUSY",
+        "GIT_ADVANCE_UNTRACKED_COLLIDES",
+        "GIT_ADVANCE_RACED",
         "HANDOFF_NOT_LANDED",
         "HANDOFF_TARGET_UNSUPPORTED",
         "HANDOFF_BLOCK_MODIFIED",
@@ -698,6 +750,23 @@ impl BulkloadRefusal {
     pub fn is_code(code: &str) -> bool {
         Self::CODES.contains(&code)
     }
+
+    /// Whether this is one of `estate-apply --advance-ancestor`'s
+    /// precondition refusals (operator ruling 2026-10-19): the live
+    /// checkout stays as it is and the capture lands beside it in the same
+    /// pass.
+    #[must_use]
+    pub const fn is_advance_precondition(&self) -> bool {
+        matches!(
+            self,
+            Self::GitAdvanceNotClean
+                | Self::GitAdvanceNotAncestor
+                | Self::GitAdvanceBranchMismatch
+                | Self::GitAdvanceBranchBusy
+                | Self::GitAdvanceUntrackedCollides(_)
+                | Self::GitAdvanceRaced
+        )
+    }
 }
 
 impl fmt::Display for BulkloadRefusal {
@@ -722,6 +791,9 @@ impl fmt::Display for BulkloadRefusal {
             | Self::GitBesideForeign(ref path)
             | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
+            }
+            Self::GitAdvanceUntrackedCollides(ref paths) => {
+                write!(f, "{} paths=\"{}\"", self.code(), paths.escape_ascii())
             }
             _ => f.write_str(self.code()),
         }
@@ -897,6 +969,12 @@ mod tests {
             BulkloadRefusal::GitDestinationModified,
             BulkloadRefusal::GitDestinationDiverged,
             BulkloadRefusal::GitBesideForeign(Vec::new()),
+            BulkloadRefusal::GitAdvanceNotClean,
+            BulkloadRefusal::GitAdvanceNotAncestor,
+            BulkloadRefusal::GitAdvanceBranchMismatch,
+            BulkloadRefusal::GitAdvanceBranchBusy,
+            BulkloadRefusal::GitAdvanceUntrackedCollides(Vec::new()),
+            BulkloadRefusal::GitAdvanceRaced,
             BulkloadRefusal::HandoffNotLanded,
             BulkloadRefusal::HandoffTargetUnsupported,
             BulkloadRefusal::HandoffBlockModified,
@@ -1005,6 +1083,11 @@ mod tests {
         assert_eq!(
             BulkloadRefusal::GitBesideForeign(b"/git/GF.neo-20261016".to_vec()).to_string(),
             "GIT_BESIDE_FOREIGN path=\"/git/GF.neo-20261016\""
+        );
+        assert_eq!(
+            BulkloadRefusal::GitAdvanceUntrackedCollides(b".serena\ntofu/modules".to_vec())
+                .to_string(),
+            "GIT_ADVANCE_UNTRACKED_COLLIDES paths=\".serena\\ntofu/modules\""
         );
     }
 

@@ -252,6 +252,7 @@ fn beside_component(
                     adopt: true,
                     origins: &[],
                     items,
+                    advance: false,
                 };
                 if super::rekey_check(staged, &at, landing, &policy, ledger)?.is_some() {
                     "foreign"

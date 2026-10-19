@@ -1331,6 +1331,14 @@ use estate_converge::EstateConverge;
 mod estate_adopt;
 use estate_adopt::EstateAdopt;
 
+// The `estate.advance.*` points (operator ruling 2026-10-19,
+// `--advance-ancestor`): an advance of a live checkout, or the retirement
+// of the beside landing it made redundant, crashed; the rerun finishing it
+// with neither tree lost.
+#[path = "fault_harness/estate_advance.rs"]
+mod estate_advance;
+use estate_advance::EstateAdvance;
+
 // The `reseat.*` points (R0, TIN-6587): a re-seat of landed agent sessions
 // crashed, and the rerun settling it forward.
 #[path = "fault_harness/reseat.rs"]
@@ -1526,6 +1534,24 @@ scenarios! {
     estate_apply_beside_rekey_after_intent => EstateConvergeAfterIntent: 1, EstateAdopt::BesideRekey;
     estate_apply_beside_rekey_after_seat => EstateConvergeAfterSeat: 1, EstateAdopt::BesideRekey;
     estate_apply_beside_rekey_after_head => EstateConvergeAfterHead: 1, EstateAdopt::BesideRekey;
+    // Operator ruling 2026-10-19 (`--advance-ancestor`): a clean live
+    // ancestor advanced in place, crashed after its intent, after the
+    // branch's compare-and-swap, after a seat (first, and mid-materialize),
+    // after the index (the checkout done) and after its ledger; then the
+    // beside landing's retirement crashed after its record, after the
+    // rename and mid-retirement, linked and standalone. Each finished by
+    // the rerun, neither tree lost.
+    estate_advance_after_intent => EstateAdvanceAfterIntent: 1, EstateAdvance::Advance;
+    estate_advance_after_branch => EstateAdvanceAfterBranch: 1, EstateAdvance::Advance;
+    estate_advance_after_seat_first => EstateAdvanceAfterSeat: 1, EstateAdvance::Advance;
+    estate_advance_after_seat_mid => EstateAdvanceAfterSeat: 3, EstateAdvance::Advance;
+    estate_advance_after_index => EstateAdvanceAfterIndex: 1, EstateAdvance::Advance;
+    estate_advance_after_ledger => EstateAdvanceAfterLedger: 1, EstateAdvance::Advance;
+    estate_advance_retire_after_intent => EstateAdvanceRetireAfterIntent: 1, EstateAdvance::Retire;
+    estate_advance_retire_after_rename => EstateAdvanceRetireAfterRename: 1, EstateAdvance::Retire;
+    estate_advance_retire_mid => EstateAdvanceRetireMid: 1, EstateAdvance::Retire;
+    estate_advance_retire_standalone_after_rename => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireStandalone;
+    estate_advance_retire_standalone_mid => EstateAdvanceRetireMid: 1, EstateAdvance::RetireStandalone;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

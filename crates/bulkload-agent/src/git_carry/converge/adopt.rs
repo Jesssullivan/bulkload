@@ -691,12 +691,16 @@ fn still(
 /// workspace ledger by the time the lock is held;
 /// `GIT_DESTINATION_DIVERGED` when it differs from the capture (all with
 /// nothing written); whatever the import, the ref step or a record write
-/// refuses.
+/// refuses. With `advance` (`--advance-ancestor`, operator ruling
+/// 2026-10-19), a checkout that differs is advanced to the capture instead
+/// when it may be ([`super::advance::workspace`]), or refused with a typed
+/// `GIT_ADVANCE_*` code and nothing written.
 pub(super) fn workspace(
     staged: &super::super::StagedBundle,
     target: &Target<'_>,
     landing: &Landing<'_>,
     place: &Place<'_>,
+    advance: bool,
 ) -> Result<Applied> {
     let worktree = place.worktree;
     let source = place.source;
@@ -725,6 +729,9 @@ pub(super) fn workspace(
         landing,
     )? {
         Found::Equal(ledger) => *ledger,
+        Found::Differs(_) if advance && !landing.beside => {
+            return super::advance::workspace(staged, landing, place, &scratch, &meta);
+        }
         Found::Differs(_) => return Err(BulkloadRefusal::GitDestinationDiverged),
     };
     let declared = beside_stash_and_blocks(worktree, &scratch, (source, landing.beside))?;

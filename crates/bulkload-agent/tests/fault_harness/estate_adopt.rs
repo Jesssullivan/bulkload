@@ -345,6 +345,7 @@ impl World {
                 beside: self.beside.then(|| SUFFIX.to_owned()),
                 side_roots: Vec::new(),
                 refs_in: false,
+                advance_ancestor: false,
             },
             &|row| {
                 rows.lock().unwrap().push((row.outcome, row.reason.clone()));
@@ -492,6 +493,7 @@ fn adopt_child_entry() {
                 .then(|| SUFFIX.to_owned()),
             side_roots: Vec::new(),
             refs_in: false,
+            advance_ancestor: false,
         },
         &|_| Ok(()),
     );
@@ -1049,6 +1051,7 @@ fn beside_rekey(world: &World, label: &str, point: Point, nth: u64) {
             beside: None,
             side_roots: Vec::new(),
             refs_in: false,
+            advance_ancestor: false,
         },
         &|row| {
             landed.lock().unwrap().push(row.outcome);
