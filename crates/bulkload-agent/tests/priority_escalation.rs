@@ -50,6 +50,7 @@ fn io_class(pid: u32) -> i64 {
 }
 
 /// Poll `check` every 50 ms until it holds or `deadline` passes.
+#[cfg(target_os = "linux")]
 fn eventually(deadline: Duration, check: &dyn Fn() -> bool) -> bool {
     let until = Instant::now() + deadline;
     loop {
