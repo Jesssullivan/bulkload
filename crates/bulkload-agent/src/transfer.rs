@@ -5582,10 +5582,10 @@ impl<W: Write> Inbound<'_, W> {
             None
         };
         let decided = match row.kind {
-            FileKind::Directory => match self.batched.remove(&row.rel_path) {
-                Some(created) => created.map(|()| Decision::Skip),
-                None => self.decide_directory(&row),
-            },
+            FileKind::Directory => self.batched.remove(&row.rel_path).map_or_else(
+                || self.decide_directory(&row),
+                |created| created.map(|()| Decision::Skip),
+            ),
             FileKind::Symlink => self.decide_symlink(&row),
             FileKind::Regular => self.decide_regular(&row, &key, snapshot.as_ref(), snapshot_mode),
             _ => Err(BulkloadRefusal::FieldDomainViolation),
