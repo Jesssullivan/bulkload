@@ -623,10 +623,7 @@ fn copy_file_carries_a_symlink_as_a_link() {
     std::os::unix::fs::symlink(&absolute, scratch.path("source/abs")).unwrap();
     std::os::unix::fs::symlink("elsewhere", scratch.path("destination/other")).unwrap();
     settle(&scratch.path("source"));
-    for (leaf, target) in [
-        ("rel", PathBuf::from("real.txt")),
-        ("abs", absolute),
-    ] {
+    for (leaf, target) in [("rel", PathBuf::from("real.txt")), ("abs", absolute)] {
         let source = format!("source/{leaf}");
         let dest = format!("destination/{leaf}");
         for pass in 0..2 {
