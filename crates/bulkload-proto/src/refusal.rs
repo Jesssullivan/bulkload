@@ -398,6 +398,13 @@ pub enum BulkloadRefusal {
     /// them again (R25). A closure row holding it is unaccounted until a
     /// rerun replaces it; no review closes it. Was a bare `IO`.
     TransportLost,
+    /// `estate-move-source` or `estate-move`: another run holds this
+    /// `MOVE_STATE`'s lock (`move.lock`, an exclusive non-blocking `flock`),
+    /// named by path (#279). One move per state directory at a time;
+    /// nothing was read or written, and nothing waits: the run that holds
+    /// it finishes, then this one is rerun. No review closes it. Was a bare
+    /// `IO` (errno 11).
+    MoveStateBusy(Vec<u8>),
 
     // ---- agent session re-seat (R0, TIN-6587) -------------------------------
     /// `estate-reseat`: the destination already holds a file at a session's
@@ -592,6 +599,7 @@ impl BulkloadRefusal {
             Self::ProtocolStateViolation => "PROTOCOL_STATE_VIOLATION",
             Self::WorkerLost => "WORKER_LOST",
             Self::TransportLost => "TRANSPORT_LOST",
+            Self::MoveStateBusy(_) => "MOVE_STATE_BUSY",
             Self::ReseatDestDiverged => "RESEAT_DEST_DIVERGED",
             Self::ReseatDestContinued => "RESEAT_DEST_CONTINUED",
             Self::ReseatSourceRewritten => "RESEAT_SOURCE_REWRITTEN",
@@ -695,6 +703,7 @@ impl BulkloadRefusal {
         "PROTOCOL_STATE_VIOLATION",
         "WORKER_LOST",
         "TRANSPORT_LOST",
+        "MOVE_STATE_BUSY",
         "RESEAT_DEST_DIVERGED",
         "RESEAT_DEST_CONTINUED",
         "RESEAT_SOURCE_REWRITTEN",
@@ -745,6 +754,7 @@ impl fmt::Display for BulkloadRefusal {
             | Self::GitNestPointerStale(ref path)
             | Self::GitNestWorktreeMoved(ref path)
             | Self::GitSourceAlternates(ref path)
+            | Self::MoveStateBusy(ref path)
             | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
             }
@@ -965,6 +975,7 @@ mod tests {
             BulkloadRefusal::ProtocolStateViolation,
             BulkloadRefusal::WorkerLost,
             BulkloadRefusal::TransportLost,
+            BulkloadRefusal::MoveStateBusy(Vec::new()),
             BulkloadRefusal::ReseatDestDiverged,
             BulkloadRefusal::ReseatDestContinued,
             BulkloadRefusal::ReseatSourceRewritten,

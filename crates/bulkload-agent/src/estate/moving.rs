@@ -742,9 +742,17 @@ pub fn write_report(path: &Path, bytes: &[u8]) -> Result<()> {
 /// per state directory at a time.
 ///
 /// # Errors
-/// IO, including a lock another process holds (refused, never waited on).
+/// `MOVE_STATE_BUSY` naming the lock for a lock another process holds
+/// (refused, never waited on, #279); IO otherwise.
 pub fn lock(state: &Path) -> Result<impl Drop> {
-    super::exclusive(&state.join("move.lock"))
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = state.join("move.lock");
+    super::exclusive(&path).map_err(|refusal| match refusal {
+        BulkloadRefusal::Io(Some(libc::EWOULDBLOCK)) => {
+            BulkloadRefusal::MoveStateBusy(path.as_os_str().as_bytes().to_vec())
+        }
+        other => other,
+    })
 }
 
 #[cfg(test)]
@@ -1033,6 +1041,27 @@ mod tests {
             inventory(&[gone, base.join("also-gone")], &[]),
             Err(BulkloadRefusal::SourceRootMissing)
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // #279: a held move state is typed and names its lock; once the holder
+    // lets go, the next run takes it.
+    #[test]
+    fn a_held_move_state_is_busy_and_named() {
+        let base = base("busy");
+        let held = lock(&base).unwrap();
+        let lock_path = base.join("move.lock");
+        let refused = lock(&base).err().expect("a second lock on a held state");
+        assert_eq!(
+            refused,
+            BulkloadRefusal::MoveStateBusy(lock_path.as_os_str().as_encoded_bytes().to_vec())
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!("MOVE_STATE_BUSY path=\"{}\"", lock_path.display())
+        );
+        drop(held);
+        assert!(lock(&base).is_ok());
         fs::remove_dir_all(&base).unwrap();
     }
 
