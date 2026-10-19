@@ -466,7 +466,10 @@ enum Rerun {
 /// racy window (`rerun`), it checks the bytes under the block before the
 /// print is re-dated, so the print never vouches for the edit, and a
 /// converge that replaces the target refuses MODIFIED with the edit kept.
-fn an_edit_after_the_exchange_survives(rerun: Rerun) {
+/// `slow`: the edit is stamped explicitly and the render then takes longer
+/// than the racy allowance (C03): the print stays racy because the record
+/// is dated at the render's start, before its write, not after its prints.
+fn an_edit_after_the_exchange_survives(rerun: Rerun, slow: bool) {
     use crate::estate::{self, HandoffMode, HandoffOptions};
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
@@ -521,6 +524,16 @@ fn an_edit_after_the_exchange_survives(rerun: Rerun) {
             let mut bytes = fs::read(&edited).unwrap();
             bytes.extend_from_slice(b"A local note.\n");
             fs::write(&edited, bytes).unwrap();
+            if slow {
+                fs::File::open(&edited)
+                    .unwrap()
+                    .set_modified(std::time::SystemTime::now())
+                    .unwrap();
+                std::thread::sleep(std::time::Duration::from_nanos(
+                    u64::try_from(super::super::super::RACY_GRANULARITY_NS).unwrap()
+                        + 100_000_000,
+                ));
+            }
         },
     );
     handoff(false);
@@ -553,7 +566,15 @@ fn an_edit_after_the_exchange_survives(rerun: Rerun) {
 /// Review of 2026-10-16 (mutation row for the re-dating path).
 #[test]
 fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
-    an_edit_after_the_exchange_survives(Rerun::Unchanged);
+    an_edit_after_the_exchange_survives(Rerun::Unchanged, false);
+}
+
+/// C03: the same edit inside a render slower than the racy allowance. The
+/// record was dated after the render's prints, so the edit's print was
+/// trusted at once and the converge landed over it.
+#[test]
+fn an_edit_inside_a_slow_render_is_never_vouched_for() {
+    an_edit_after_the_exchange_survives(Rerun::Unchanged, true);
 }
 
 /// Re-review of 2026-10-16, finding 1: the keep path re-dated a racy
@@ -561,13 +582,13 @@ fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
 /// the block (a rerun that retires another target).
 #[test]
 fn a_kept_block_never_redates_a_racy_print_unchecked_on_a_retire() {
-    an_edit_after_the_exchange_survives(Rerun::Retire);
+    an_edit_after_the_exchange_survives(Rerun::Retire, false);
 }
 
 /// Re-review of 2026-10-16, finding 1: the same through `--renew`.
 #[test]
 fn a_kept_block_never_redates_a_racy_print_unchecked_on_a_renew() {
-    an_edit_after_the_exchange_survives(Rerun::Renew);
+    an_edit_after_the_exchange_survives(Rerun::Renew, false);
 }
 
 /// Mutation row (review of 2026-10-16): `--clear` of a created file that a

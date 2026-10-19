@@ -2497,6 +2497,8 @@ fn converge(
         if let Some(line) = plan.line {
             custody.count(line);
         }
+        #[cfg(test)]
+        super::mid_pass::fire(worktree, super::mid_pass::Stage::ConvergeWritten);
         let next = next_ledger(
             worktree,
             ledger,

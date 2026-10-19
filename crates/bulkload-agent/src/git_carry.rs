@@ -2955,6 +2955,14 @@ pub(crate) mod mid_pass {
         /// targets were written and before their prints are taken (TIN-6569,
         /// review of 2026-10-16).
         HandoffWritten,
+        /// Keyed by the parent of a first landing's destination (the
+        /// destination itself does not exist when the test arms it): after
+        /// the landing wrote its seats and index, before its workspace
+        /// ledger takes their prints.
+        LandingWritten,
+        /// Keyed by a destination checkout: a converge after its seat, index
+        /// and HEAD writes, before its next workspace ledger is built.
+        ConvergeWritten,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -7074,6 +7082,10 @@ pub(crate) fn restore_staged_landed(
     restore_intent_to_add(&work, None, &heads)?;
     restore_filesystem_rows(&work, &find("filesystem-v1")?)?;
     apply_standalone_configuration(&work, &work.join(".git/carry-config"), &configuration)?;
+    #[cfg(test)]
+    if let Some(parent) = target.parent() {
+        mid_pass::fire(parent, mid_pass::Stage::LandingWritten);
+    }
     let applied = converge::finish_landing(
         &work,
         &work.join(".git"),
@@ -7599,6 +7611,10 @@ pub(crate) fn restore_linked_staged_landed(
     let git_dir =
         landed::worktree_git_dir(&destination)?.ok_or(BulkloadRefusal::GitInventoryMalformed)?;
     let index = converge::installed_index(&destination, &git_dir, &meta)?;
+    #[cfg(test)]
+    if let Some(parent) = destination.parent() {
+        mid_pass::fire(parent, mid_pass::Stage::LandingWritten);
+    }
     let applied = converge::finish_landing(
         &destination,
         &common,
