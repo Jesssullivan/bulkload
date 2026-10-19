@@ -818,3 +818,203 @@ fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
     );
     assert_eq!(thread_cwds(&dst_codex.join("state_5.sqlite")), cwds);
 }
+
+/// Review of #280, findings 6 and 7: a destination with no Codex index.
+/// The pull never writes the live index: the source's snapshot lands
+/// beside it as `state_5.sqlite.LABEL`, and the re-seat seeds the live
+/// index from that snapshot (its thread rows left out) and registers the
+/// lane's thread under the destination's `cwd` and rollout path, never
+/// reading a live index as the snapshot. A destination session with no
+/// `cwd` under a destination key is in place and holds nothing.
+#[test]
+fn sessions_into_a_destination_with_no_codex_index_seed_it() {
+    let base = std::env::temp_dir().join(format!("bulkload-move-fresh-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let world = World {
+        base: fs::canonicalize(&base).unwrap(),
+    };
+    let base = &world.base;
+    let src_home = base.join("src/home");
+    let dst_home = base.join("dst/home");
+    let (src_git, dst_git) = (src_home.join("git"), dst_home.join("git"));
+    fs::create_dir_all(&src_git).unwrap();
+    fs::create_dir_all(&dst_git).unwrap();
+    repo(&src_git.join("lab"), "l.txt");
+    let (src_lane, dst_lane) = (src_git.join("lab"), dst_git.join("lab"));
+
+    // The source: one Claude session, one Codex thread of the lane.
+    let src_projects = src_home.join(".claude/projects").join(key(&src_lane));
+    fs::create_dir_all(&src_projects).unwrap();
+    fs::write(
+        src_projects.join(format!("{SID}.jsonl")),
+        transcript(SID, &src_lane, "NEO"),
+    )
+    .unwrap();
+    fs::write(
+        src_home.join(".claude/settings.json"),
+        b"{\"cleanupPeriodDays\": 3650}\n",
+    )
+    .unwrap();
+    let src_codex = src_home.join(".codex");
+    let rollout_rel = format!("sessions/2026/10/19/rollout-2026-10-19T10-00-00-{THREAD}.jsonl");
+    let rollout = src_codex.join(&rollout_rel);
+    fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    fs::write(
+        &rollout,
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{THREAD}\",\"cwd\":\"{}\"}}}}\n",
+            src_lane.display()
+        ),
+    )
+    .unwrap();
+    codex_index(
+        &src_codex.join("state_5.sqlite"),
+        THREAD,
+        rollout.to_str().unwrap(),
+        &src_lane,
+    );
+    {
+        let conn = rusqlite::Connection::open(src_codex.join("state_5.sqlite")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE backfill_state (id INTEGER PRIMARY KEY, status TEXT NOT NULL);
+             INSERT INTO backfill_state VALUES (1, 'complete');",
+        )
+        .unwrap();
+    }
+
+    // The destination: a live .claude with its own session that records no
+    // cwd, and no .codex at all.
+    let dst_claude = dst_home.join(".claude");
+    let own_projects = dst_claude.join("projects").join(key(&dst_lane));
+    fs::create_dir_all(&own_projects).unwrap();
+    fs::write(
+        dst_claude.join("settings.json"),
+        b"{\"cleanupPeriodDays\": 3650}\n",
+    )
+    .unwrap();
+    let no_cwd = format!(
+        "{{\"type\":\"summary\",\"summary\":\"no cwd here\",\"sessionId\":\"{DEST_SID}\"}}\n"
+    );
+    fs::write(own_projects.join(format!("{DEST_SID}.jsonl")), &no_cwd).unwrap();
+    let dst_codex = dst_home.join(".codex");
+
+    let source_state = base.join("move-src");
+    let state = base.join("move-dst");
+    let map = format!("{}={}", src_git.display(), dst_git.display());
+    let sourced = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src_git,
+    ]));
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let moved = agent(&os(&[
+        &"estate-move",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    assert!(moved.ok, "{}\n{}", moved.stdout, moved.stderr);
+    assert!(
+        moved.stdout.contains("estate-move gate=pass"),
+        "{}",
+        moved.stdout
+    );
+    let snapshot = dst_codex.join(format!("state_5.sqlite.{LABEL}"));
+    assert!(
+        snapshot.is_file(),
+        "the snapshot lands beside, live path absent"
+    );
+    assert!(
+        moved.stdout.contains("\"kind\":\"index\"")
+            && moved.stdout.contains("\"outcome\":\"seeded\""),
+        "{}",
+        moved.stdout
+    );
+    let live = dst_codex.join("state_5.sqlite");
+    assert_eq!(
+        thread_cwds(&live),
+        [(THREAD.to_owned(), dst_lane.to_str().unwrap().to_owned())],
+        "registered for the lane, not copied with the source's cwd:\n{}",
+        moved.stdout
+    );
+    let rollout_path: String = rusqlite::Connection::open_with_flags(
+        format!("file:{}?immutable=1", live.display()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap()
+    .query_row("SELECT rollout_path FROM threads", [], |row| row.get(0))
+    .unwrap();
+    assert_eq!(
+        rollout_path,
+        fs::canonicalize(&dst_codex)
+            .unwrap()
+            .join(&rollout_rel)
+            .to_str()
+            .unwrap()
+    );
+    let backfill: String = rusqlite::Connection::open_with_flags(
+        format!("file:{}?immutable=1", live.display()),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap()
+    .query_row("SELECT status FROM backfill_state", [], |row| row.get(0))
+    .unwrap();
+    assert_eq!(
+        backfill, "complete",
+        "the destination Codex never backfills"
+    );
+    assert_eq!(
+        thread_cwds(&snapshot),
+        [(THREAD.to_owned(), src_lane.to_str().unwrap().to_owned())],
+        "the snapshot itself is the source's, untouched"
+    );
+    // The destination's own cwd-less session: in place, nothing held.
+    assert_eq!(
+        fs::read_to_string(own_projects.join(format!("{DEST_SID}.jsonl"))).unwrap(),
+        no_cwd
+    );
+    let totals = closure(&moved.stdout);
+    assert_eq!(totals["reseat_unaccounted"], "0", "{}", moved.stdout);
+    assert_eq!(totals["unaccounted"], "0", "{}", moved.stdout);
+
+    // The rerun reads the snapshot this pass reused, and changes nothing.
+    let again = agent(&os(&[
+        &"estate-move",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    assert!(again.ok, "{}\n{}", again.stdout, again.stderr);
+    assert!(
+        !again.stdout.contains("\"outcome\":\"seeded\""),
+        "{}",
+        again.stdout
+    );
+    assert_eq!(
+        thread_cwds(&live),
+        [(THREAD.to_owned(), dst_lane.to_str().unwrap().to_owned())]
+    );
+}

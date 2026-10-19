@@ -94,8 +94,8 @@ use crate::counters::{self, Counter};
 use crate::freshness::StatIdentity;
 use crate::io::durable::{Committer, LedgerSync};
 use crate::materialize::{
-    owned_output, verify_existing, Destination, Displaced, OwnedOutput, PendingOutput, Publication,
-    PublishSink, SharedDisplaced, StagedFile,
+    owned_beside, owned_output, verify_existing, Destination, Displaced, OwnedOutput,
+    PendingOutput, Publication, PublishSink, SharedDisplaced, StagedFile,
 };
 use crate::transfer_store::{
     row_key, sqlite_key, ChunkHint, LedgerItem, LedgerRecord, LedgerSink, Manifest, OutputRecord,
@@ -994,6 +994,27 @@ fn beside_suffix(root: &Path) -> Option<Vec<u8>> {
         )
 }
 
+/// Seats that land beside under `--beside` whatever their live path holds,
+/// absent included (`estate-move`'s Codex index, review of #280 finding 6:
+/// the live index is never written by a pull, and the snapshot a pass
+/// takes is always at `state_5.sqlite<suffix>`). Relative paths.
+static BESIDE_ALWAYS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// Land the seats at `paths` beside under `--beside` whatever their live
+/// path holds (an empty list: none).
+pub fn set_beside_always(paths: Vec<Vec<u8>>) {
+    *BESIDE_ALWAYS.lock().unwrap_or_else(PoisonError::into_inner) = paths;
+}
+
+fn beside_always() -> HashSet<Vec<u8>> {
+    BESIDE_ALWAYS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .cloned()
+        .collect()
+}
+
 /// `rel_path` with the beside `suffix` appended.
 #[must_use]
 pub fn beside_path(rel_path: &[u8], suffix: &[u8]) -> Vec<u8> {
@@ -1011,10 +1032,17 @@ fn beside_row(row: &RowSchema, suffix: &[u8]) -> RowSchema {
     }
 }
 
+/// The mark every beside row's key ends with (review of #280, finding 4):
+/// a seat's beside path may be the live path of another source seat (the
+/// source holds `x` and `x<suffix>`), whose rows share the path's prefix.
+/// Only a marked row makes a file at the beside path this seat's own.
+const BESIDE_KEY_MARK: &[u8] = b"\0bulkload.beside.v1";
+
 /// The row key of a seat's beside output from its live row key: the keys
 /// of one path share the path's prefix ([`transfer_store::path_prefix`]),
-/// so the beside key is the same key under the beside path. Holds for the
-/// row key and the snapshot key alike.
+/// so the beside key is the same key under the beside path, then
+/// [`BESIDE_KEY_MARK`]. Holds for the row key and the snapshot key alike;
+/// the row still decodes from the front.
 fn beside_key(authority: &[u8], key: &[u8], rel_path: &[u8], beside: &[u8]) -> Result<Vec<u8>> {
     let live = crate::transfer_store::path_prefix(authority, rel_path)?;
     let rest = key
@@ -1022,6 +1050,7 @@ fn beside_key(authority: &[u8], key: &[u8], rel_path: &[u8], beside: &[u8]) -> R
         .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
     let mut out = crate::transfer_store::path_prefix(authority, beside)?;
     out.extend_from_slice(rest);
+    out.extend_from_slice(BESIDE_KEY_MARK);
     Ok(out)
 }
 
@@ -4916,6 +4945,15 @@ struct Inbound<'a, W> {
     /// source path each stands for: the committer's outcomes name the
     /// beside path, the session's report names the source's.
     beside_of: HashMap<Vec<u8>, Vec<u8>>,
+    /// `--beside` (review of #280, finding 4): the destination paths ending
+    /// with the suffix that this session already decided to write, a seat's
+    /// own live path or another seat's beside path. A second claim of one is
+    /// that seat's `DESTINATION_OCCUPIED`, never two publications of one
+    /// name. Only suffixed names are kept, so it stays small.
+    claimed: HashSet<Vec<u8>>,
+    /// `--beside`: seats landed beside whatever their live path holds
+    /// ([`set_beside_always`]).
+    always: HashSet<Vec<u8>>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5195,6 +5233,8 @@ fn receive_session<R: Read, W: Write>(
             snapshot_bases: HashSet::new(),
             beside,
             beside_of: HashMap::new(),
+            claimed: HashSet::new(),
+            always: beside_always(),
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -5545,80 +5585,8 @@ impl<W: Write> Inbound<'_, W> {
                     .directory(&row, self.store, &self.authority)
                     .map(|()| Decision::Skip),
             },
-            FileKind::Symlink => match self.target.symlink(&row) {
-                // `--beside`: a differing symlink is created beside the
-                // live one, or adopted there when it is already this
-                // link; the live link is never replaced.
-                Err(BulkloadRefusal::DestinationOccupied) if self.beside.is_some() => {
-                    let suffix = self.beside.clone().unwrap_or_default();
-                    let beside = beside_row(&row, &suffix);
-                    self.target.symlink(&beside).map(|()| {
-                        self.stats
-                            .applied_beside
-                            .push((row.rel_path.clone(), beside.rel_path));
-                        Decision::Skip
-                    })
-                }
-                other => other.map(|()| Decision::Skip),
-            },
-            FileKind::Regular => self.target.identity(&row).and_then(|identity| {
-                if let Some(identity) = &identity {
-                    if let Some((snapshot_key, _)) = &snapshot {
-                        if self.store.output_matches(snapshot_key, identity)? {
-                            self.stats.reused += 1;
-                            self.snapshot_applied(&row.rel_path);
-                            return Ok(Decision::Reuse);
-                        }
-                    }
-                    if self.store.output_matches(&key, identity)? {
-                        self.stats.reused += 1;
-                        return Ok(Decision::Reuse);
-                    }
-                    // `--beside`: this seat's output already beside the
-                    // live file, from an earlier pass, is reused like any
-                    // output of this store (S3), and stays accounted.
-                    if let Some(reused) = self.reuse_beside(&row, &key, snapshot.as_ref())? {
-                        return Ok(reused);
-                    }
-                    // Refused before for what the path holds, and neither
-                    // the seat nor that file has moved since: the same
-                    // answer, and the source reads nothing for it (R25).
-                    // Asked ahead of the capture record: a file that did
-                    // not verify against this seat cannot prove it either,
-                    // and proving hashes the whole output.
-                    for remembered in std::iter::once(&key).chain(snapshot.as_ref().map(|(k, _)| k))
-                    {
-                        if let Some(refused) =
-                            self.remembered_refusal(&row, remembered, identity)?
-                        {
-                            return Err(refused.refusal());
-                        }
-                    }
-                    if self.adopt_unrowed(&row, &key, snapshot.as_ref())? {
-                        return Ok(Decision::Reuse);
-                    }
-                }
-                // Under `--beside` a snapshot whose path has a sidecar
-                // beside it is asked for and lands beside (decided when
-                // its content is planned, where the beside path is checked
-                // the same way).
-                if snapshot_mode
-                    && self.beside.is_none()
-                    && self.target.sqlite_sidecars_present(&row.rel_path)?
-                {
-                    return Err(BulkloadRefusal::DestinationOccupied);
-                }
-                let keys = std::iter::once(key.as_slice()).chain(
-                    snapshot
-                        .as_ref()
-                        .map(|(snapshot_key, _)| snapshot_key.as_slice()),
-                );
-                Ok(if self.wants_manifest(&row, identity.is_some(), keys)? {
-                    Decision::WantManifest
-                } else {
-                    Decision::Send
-                })
-            }),
+            FileKind::Symlink => self.decide_symlink(&row),
+            FileKind::Regular => self.decide_regular(&row, &key, snapshot.as_ref(), snapshot_mode),
             _ => Err(BulkloadRefusal::FieldDomainViolation),
         };
         REUSE_CENSUS_NS.fetch_add(elapsed_ns(census_started), Ordering::Relaxed);
@@ -5885,10 +5853,12 @@ impl<W: Write> Inbound<'_, W> {
         if refused == RefusedOutput::Occupied && self.may_extend(row)? {
             return Ok(None);
         }
-        // `--beside`: an occupied path is no longer the end of the entry;
-        // it is planned once more and lands beside.
+        // `--beside`: an occupied path is no longer the end of the entry; it
+        // lands beside, unless its beside path was refused too and is
+        // unchanged since (review of #280, finding 3).
         if self.beside.is_some()
             && matches!(refused, RefusedOutput::Occupied | RefusedOutput::NotPrefix)
+            && !self.beside_refusal_stands(row, key, None)?
         {
             return Ok(None);
         }
@@ -5909,6 +5879,198 @@ impl<W: Write> Inbound<'_, W> {
             .is_some_and(|(file, _)| extend_candidate(&file, row, root).is_some()))
     }
 
+    /// `--beside` (review of #280, finding 4): claim `path` for this
+    /// session when it ends with the suffix. `false` when it is claimed
+    /// already: a second seat would write the same name.
+    fn claim(&mut self, path: &[u8]) -> bool {
+        match &self.beside {
+            Some(suffix) if path.ends_with(suffix) => self.claimed.insert(path.to_vec()),
+            _ => true,
+        }
+    }
+
+    /// `--beside` (finding 4): the beside name a planned entry writes is
+    /// claimed for the rest of the session.
+    fn claim_planned(&mut self, plan: &Plan) {
+        match plan {
+            Plan::Write(Staging {
+                beside: Some(beside),
+                ..
+            })
+            | Plan::Adopt(_, _, _, Some(beside)) => {
+                self.claimed.insert(beside.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// A symlink seat: created, or adopted when it is the same link. Under
+    /// `--beside` a live path holding something else gets the link beside
+    /// it (or adopts it there); the live path is never replaced.
+    fn decide_symlink(&mut self, row: &RowSchema) -> Result<Decision> {
+        if !self.claim(&row.rel_path) {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        match self.target.symlink(row) {
+            Err(BulkloadRefusal::DestinationOccupied) if self.beside.is_some() => {
+                let suffix = self.beside.clone().unwrap_or_default();
+                let beside = beside_row(row, &suffix);
+                if !self.claim(&beside.rel_path) {
+                    return Err(BulkloadRefusal::DestinationOccupied);
+                }
+                self.target.symlink(&beside)?;
+                self.stats
+                    .applied_beside
+                    .push((row.rel_path.clone(), beside.rel_path));
+                Ok(Decision::Skip)
+            }
+            other => other.map(|()| Decision::Skip),
+        }
+    }
+
+    /// Decide a regular seat (see [`Self::entry`]). Under `--beside` a live
+    /// path holding a node of another kind (a symlink, review of #280
+    /// finding 5) is no refusal: its content is asked for and lands beside.
+    fn decide_regular(
+        &mut self,
+        row: &RowSchema,
+        key: &[u8],
+        snapshot: Option<&(Vec<u8>, [u8; 32])>,
+        snapshot_mode: bool,
+    ) -> Result<Decision> {
+        if !self.claim(&row.rel_path) {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        // A seat landed beside whatever its live path holds is decided as
+        // one whose live path holds another kind: its beside path alone.
+        let (identity, other_kind) = if self.lands_beside_always(row) {
+            (None, true)
+        } else {
+            match self.target.identity(row) {
+                Err(BulkloadRefusal::DestinationOccupied) if self.beside.is_some() => (None, true),
+                found => (found?, false),
+            }
+        };
+        if let Some(identity) = &identity {
+            if let Some((snapshot_key, _)) = snapshot {
+                if self.store.output_matches(snapshot_key, identity)? {
+                    self.stats.reused += 1;
+                    self.snapshot_applied(&row.rel_path);
+                    return Ok(Decision::Reuse);
+                }
+            }
+            if self.store.output_matches(key, identity)? {
+                self.stats.reused += 1;
+                return Ok(Decision::Reuse);
+            }
+        }
+        // `--beside`: this seat's output already beside the live path, from
+        // an earlier pass, is reused like any output of this store (S3), and
+        // stays accounted.
+        if identity.is_some() || other_kind {
+            if let Some(reused) = self.reuse_beside(row, key, snapshot)? {
+                return Ok(reused);
+            }
+        }
+        if let Some(identity) = &identity {
+            // Refused before for what the path holds, and neither the seat
+            // nor that file has moved since: the same answer, and the
+            // source reads nothing for it (R25). Asked ahead of the capture
+            // record: a file that did not verify against this seat cannot
+            // prove it either, and proving hashes the whole output.
+            for remembered in std::iter::once(key).chain(snapshot.map(|(k, _)| k.as_slice())) {
+                if let Some(refused) = self.remembered_refusal(row, remembered, identity)? {
+                    return Err(refused.refusal());
+                }
+            }
+            if self.adopt_unrowed(row, key, snapshot)? {
+                return Ok(Decision::Reuse);
+            }
+        }
+        let live_sidecar = snapshot_mode && self.target.sqlite_sidecars_present(&row.rel_path)?;
+        // Under `--beside` a snapshot whose path has a sidecar beside it is
+        // asked for and lands beside (decided when its content is planned,
+        // where the beside path is checked the same way).
+        if live_sidecar && self.beside.is_none() {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        // `--beside`, a live path of another kind or with a live sidecar: a
+        // beside path refused before for what it holds, unchanged since, is
+        // refused again with nothing read (review of #280, finding 3).
+        if (other_kind || live_sidecar) && self.beside_refusal_stands(row, key, snapshot)? {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        let keys =
+            std::iter::once(key).chain(snapshot.map(|(snapshot_key, _)| snapshot_key.as_slice()));
+        Ok(
+            if self.wants_manifest(row, identity.is_some() || other_kind, keys)? {
+                Decision::WantManifest
+            } else {
+                Decision::Send
+            },
+        )
+    }
+
+    /// Whether `row` lands beside under `--beside` whatever its live path
+    /// holds ([`set_beside_always`]).
+    fn lands_beside_always(&self, row: &RowSchema) -> bool {
+        self.beside.is_some() && self.always.contains(&row.rel_path)
+    }
+
+    /// `--beside` (review of #280, finding 3): whether the seat's beside path
+    /// still holds the file a beside landing was refused for
+    /// ([`RefusedOutput::BesideOccupied`], under its beside key and that
+    /// file's identity), by the row key or the snapshot key.
+    fn beside_refusal_stands(
+        &self,
+        row: &RowSchema,
+        key: &[u8],
+        snapshot: Option<&(Vec<u8>, [u8; 32])>,
+    ) -> Result<bool> {
+        let Some(suffix) = &self.beside else {
+            return Ok(false);
+        };
+        let beside = beside_row(row, suffix);
+        let identity = match self.target.identity(&beside) {
+            Ok(Some(identity)) => identity,
+            Ok(None) | Err(BulkloadRefusal::DestinationOccupied) => return Ok(false),
+            Err(refusal) => return Err(refusal),
+        };
+        for candidate in std::iter::once(key).chain(snapshot.map(|(k, _)| k.as_slice())) {
+            let key_beside =
+                beside_key(&self.authority, candidate, &row.rel_path, &beside.rel_path)?;
+            if self.store.refused_output(&key_beside, &identity)?
+                == Some(RefusedOutput::BesideOccupied)
+            {
+                counters::bump(Counter::TransferRefusedOutputsRemembered);
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// `--beside` (review of #280, finding 3): remember that this seat's
+    /// beside landing was refused, under its live key for what the live
+    /// path holds (`live`, when it is a file) and under its beside key for
+    /// what the beside path holds, so an unchanged rerun reads nothing.
+    fn remember_beside_refusal(
+        &self,
+        (row, key, racy): (&RowSchema, &[u8], bool),
+        live: Option<(StatIdentity, RefusedOutput)>,
+        beside: Option<StatIdentity>,
+    ) {
+        if let Some((identity, refused)) = live {
+            self.remember_refusal(key, Some(identity), racy, refused);
+        }
+        let Some(suffix) = &self.beside else {
+            return;
+        };
+        let beside_rel = beside_path(&row.rel_path, suffix);
+        if let Ok(key_beside) = beside_key(&self.authority, key, &row.rel_path, &beside_rel) {
+            self.remember_refusal(&key_beside, beside, racy, RefusedOutput::BesideOccupied);
+        }
+    }
+
     /// `--beside`: `Reuse` when this seat's output already sits beside the
     /// live file under its beside row (an earlier pass placed it there),
     /// by the row key or, in `snapshot` mode, the snapshot key. The seat is
@@ -5924,8 +6086,10 @@ impl<W: Write> Inbound<'_, W> {
             return Ok(None);
         };
         let beside = beside_row(row, &suffix);
-        let Some(identity) = self.target.identity(&beside)? else {
-            return Ok(None);
+        let identity = match self.target.identity(&beside) {
+            Ok(Some(identity)) => identity,
+            Ok(None) | Err(BulkloadRefusal::DestinationOccupied) => return Ok(None),
+            Err(refusal) => return Err(refusal),
         };
         for (candidate, is_snapshot) in snapshot
             .map(|(snapshot_key, _)| (snapshot_key.as_slice(), true))
@@ -5935,6 +6099,9 @@ impl<W: Write> Inbound<'_, W> {
             let key_beside =
                 beside_key(&self.authority, candidate, &row.rel_path, &beside.rel_path)?;
             if self.store.output_matches(&key_beside, &identity)? {
+                if !self.claim(&beside.rel_path) {
+                    return Err(BulkloadRefusal::DestinationOccupied);
+                }
                 self.stats.reused += 1;
                 if is_snapshot {
                     self.snapshot_applied(&row.rel_path);
@@ -6099,6 +6266,8 @@ impl<W: Write> Inbound<'_, W> {
                         && prefix_extend_scope(self.target.path()).covers(&row.rel_path),
                     snapshot,
                     beside: self.beside.as_deref(),
+                    claimed: &self.claimed,
+                    always: self.lands_beside_always(&row),
                 },
                 &manifest,
                 &mut salvaged_from,
@@ -6121,10 +6290,13 @@ impl<W: Write> Inbound<'_, W> {
                     Some(WriteTarget::new(staging.staged.file(), staging.placed)),
                 )
             }
-            Plan::Refuse(_) | Plan::Adopt(..) | Plan::NoExchange(_) | Plan::NotPrefix(_) => {
-                (Vec::new(), None)
-            }
+            Plan::Refuse(_)
+            | Plan::Adopt(..)
+            | Plan::NoExchange(_)
+            | Plan::NotPrefix(_)
+            | Plan::BesideRefused { .. } => (Vec::new(), None),
         };
+        self.claim_planned(&plan);
         write_control(
             self.output,
             &Control::NeedChunks {
@@ -6504,10 +6676,22 @@ impl<W: Write> Inbound<'_, W> {
         // live path has a sidecar beside it.
         let mut land_beside: Option<Vec<u8>> = None;
         let live_sidecar = checked.is_ok()
-            && snapshot
+            && (self.lands_beside_always(&row)
+                || (snapshot
+                    && self.beside.is_some()
+                    && self.target.sqlite_sidecars_present(&row.rel_path)?));
+        // What the live path's refusal may be remembered as (finding 3).
+        let mut live_refused: Option<(StatIdentity, RefusedOutput)> = None;
+        // `--beside`: a node of another kind at the live path lands beside
+        // (review of #280, finding 5).
+        let other_kind = checked.is_ok()
+            && adopt
             && self.beside.is_some()
-            && self.target.sqlite_sidecars_present(&row.rel_path)?;
-        if live_sidecar {
+            && matches!(
+                self.target.existing(&row),
+                Err(BulkloadRefusal::DestinationOccupied)
+            );
+        if live_sidecar || other_kind {
             land_beside = self
                 .beside
                 .as_deref()
@@ -6529,7 +6713,13 @@ impl<W: Write> Inbound<'_, W> {
                 match verified {
                     Ok(identity) => Ok(Some((file, parent, identity))),
                     Err(BulkloadRefusal::DestinationOccupied) => {
-                        supersede = owned_output(self.store, &self.authority, &row, &file)?;
+                        // Under `--beside` a live path is never replaced
+                        // (review of #280, finding 1).
+                        supersede = if self.beside.is_some() {
+                            None
+                        } else {
+                            owned_output(self.store, &self.authority, &row, &file)?
+                        };
                         let root_path = self.target.path();
                         if supersede.is_none()
                             && !snapshot
@@ -6558,6 +6748,8 @@ impl<W: Write> Inbound<'_, W> {
                                 .beside
                                 .as_deref()
                                 .map(|suffix| beside_path(&row.rel_path, suffix));
+                            live_refused =
+                                settled.map(|identity| (identity, RefusedOutput::Occupied));
                             Ok(None)
                         } else if supersede.is_none() {
                             self.note_interrupted(&row.rel_path);
@@ -6633,6 +6825,11 @@ impl<W: Write> Inbound<'_, W> {
         // the staged copy takes the beside name.
         let (row, key) = match &land_beside {
             Some(beside_rel) => {
+                // Another seat of this session writes this name (finding 4).
+                if !self.claim(beside_rel) {
+                    let _ = staged.discard();
+                    return Err(BulkloadRefusal::DestinationOccupied);
+                }
                 let beside = RowSchema {
                     rel_path: beside_rel.clone(),
                     ..row.clone()
@@ -6670,7 +6867,14 @@ impl<W: Write> Inbound<'_, W> {
                             )
                             .map(|()| Some(placed));
                     }
-                    (Err(refusal), _) | (_, Err(refusal)) => {
+                    (Err((refusal, settled)), _) => {
+                        let _ = staged.discard();
+                        if refusal == BulkloadRefusal::DestinationOccupied {
+                            self.remember_beside_refusal((&row, &key, racy), live_refused, settled);
+                        }
+                        return Err(refusal);
+                    }
+                    (_, Err(refusal)) => {
                         let _ = staged.discard();
                         return Err(refusal);
                     }
@@ -6776,6 +6980,16 @@ impl<W: Write> Inbound<'_, W> {
             Plan::NoExchange(settled) => {
                 self.remember_refusal(&key, settled, racy, RefusedOutput::ExchangeUnsupported);
                 Err(BulkloadRefusal::DestinationExchangeUnsupported)
+            }
+            Plan::BesideRefused {
+                refusal,
+                live,
+                beside,
+            } => {
+                if refusal == BulkloadRefusal::DestinationOccupied {
+                    self.remember_beside_refusal((&row, &key, racy), live, beside);
+                }
+                Err(refusal)
             }
             Plan::Write(mut staging) => {
                 self.open -= 1;
@@ -7047,6 +7261,11 @@ impl<W: Write> Inbound<'_, W> {
         const PIECE: u64 = 1 << 20;
         let beside = beside_row(row, suffix);
         let key_beside = beside_key(&self.authority, &key, &row.rel_path, &beside.rel_path)?;
+        // Another seat of this session writes this name (finding 4).
+        if !self.claim(&beside.rel_path) {
+            let _ = tail.discard();
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
         let whole = (|| -> Result<StagedFile> {
             let out = self.target.stage(row)?.with_suffix(suffix)?;
             let copied = (|| -> Result<()> {
@@ -7228,17 +7447,15 @@ impl<W: Write> Inbound<'_, W> {
         };
         let mut at = prior;
         while at < row.size {
-            let length = usize::try_from((row.size - at).min(PIECE)).unwrap_or(usize::MAX);
-            let piece = tail
-                .get_mut(..length)
-                .ok_or_else(|| refused(BulkloadRefusal::BudgetExceeded))?;
-            if crate::io::sys::pread_full(&**staged.file(), piece, at - base)
-                .refuse_at("transfer::append_tail")
-                .map_err(refused)?
-                != length
-            {
-                return Err(refused(BulkloadRefusal::DigestMismatch));
-            }
+            // Review of #280, finding 8: every piece ends at a record
+            // boundary (its last newline; a record longer than a piece is
+            // read whole), and is written by one `O_APPEND` write, so a
+            // destination appender that slips in between two pieces never
+            // lands inside a record of ours. Only the seat's own last
+            // bytes, past its last newline, may end without one.
+            let piece = record_piece(staged.file(), (at - base, row.size - at), &mut tail)
+                .map_err(refused)?;
+            let length = piece.len();
             // Ours to append only while the file ends where our last byte
             // does: a live writer's bytes are never written over.
             if size_of(writer)? != at {
@@ -7420,6 +7637,17 @@ enum Plan {
     /// `DESTINATION_OCCUPIED` once the entry ends, remembered `NotPrefix`
     /// under its settled identity, with no chunk asked for.
     NotPrefix(StatIdentity),
+    /// `--beside`: the seat lands beside its live path, and the beside path
+    /// cannot take it (a foreign file with other bytes, a name another seat
+    /// of this session writes, a sidecar): refused once the entry ends, with
+    /// nothing staged or asked for. `live` and `beside` are the settled
+    /// identities it is remembered under, when known (review of #280,
+    /// finding 3).
+    BesideRefused {
+        refusal: BulkloadRefusal,
+        live: Option<(StatIdentity, RefusedOutput)>,
+        beside: Option<StatIdentity>,
+    },
 }
 
 /// [`verify_existing`], and, when the output holds other bytes than the
@@ -7567,6 +7795,10 @@ struct Planned<'p> {
     extend: bool,
     snapshot: bool,
     beside: Option<&'p [u8]>,
+    /// Suffixed names this session already writes (`Inbound::claimed`).
+    claimed: &'p HashSet<Vec<u8>>,
+    /// Lands beside whatever its live path holds ([`set_beside_always`]).
+    always: bool,
 }
 
 /// Where a seat lands beside its live path (`--beside`), decided by what
@@ -7589,30 +7821,50 @@ enum BesideTarget {
 /// `DESTINATION_OCCUPIED`: nothing is ever replaced beside either. A
 /// snapshot's beside path with a sidecar beside it is refused the same way
 /// (OI-1003-Q146).
+///
+/// Ownership is this seat's beside output's only ([`owned_beside`], review of
+/// #280, finding 4). A refusal for a foreign file carries that file's
+/// settled identity, which it may be remembered under (finding 3).
 fn beside_target(
     context: &ReceiveContext<'_>,
     beside: &RowSchema,
     manifest: &Manifest,
     snapshot: bool,
-) -> Result<BesideTarget> {
-    if snapshot && context.target.sqlite_sidecars_present(&beside.rel_path)? {
-        return Err(BulkloadRefusal::DestinationOccupied);
+) -> std::result::Result<BesideTarget, (BulkloadRefusal, Option<StatIdentity>)> {
+    let plain = |refusal| (refusal, None);
+    if snapshot
+        && context
+            .target
+            .sqlite_sidecars_present(&beside.rel_path)
+            .map_err(plain)?
+    {
+        return Err(plain(BulkloadRefusal::DestinationOccupied));
     }
-    let Some((file, parent)) = context.target.existing(beside)? else {
+    let Some((file, parent)) = context.target.existing(beside).map_err(plain)? else {
         return Ok(BesideTarget::Fresh);
     };
-    let owned = owned_output(context.store, context.authority, beside, &file)?;
-    let (verified, _) = verify_settled(context.target.path(), &file, beside, manifest);
+    let owned = owned_beside(
+        context.store,
+        context.authority,
+        beside,
+        &file,
+        BESIDE_KEY_MARK,
+    )
+    .map_err(plain)?;
+    let (verified, settled) = verify_settled(context.target.path(), &file, beside, manifest);
     match (verified, owned) {
         (Ok(identity), _) => Ok(BesideTarget::Adopt(file, parent, identity)),
         (Err(BulkloadRefusal::DestinationOccupied), Some(owned)) => {
-            if context.target.exchange_supported(beside)? {
+            if context.target.exchange_supported(beside).map_err(plain)? {
                 Ok(BesideTarget::Supersede(Box::new(owned)))
             } else {
-                Err(BulkloadRefusal::DestinationExchangeUnsupported)
+                Err(plain(BulkloadRefusal::DestinationExchangeUnsupported))
             }
         }
-        (Err(refusal), _) => Err(refusal),
+        (Err(BulkloadRefusal::DestinationOccupied), None) => {
+            Err((BulkloadRefusal::DestinationOccupied, settled))
+        }
+        (Err(refusal), _) => Err(plain(refusal)),
     }
 }
 
@@ -7637,7 +7889,13 @@ fn beside_existing(
             StatIdentity::from_metadata(&found),
         ));
     }
-    match owned_output(context.store, context.authority, beside, &file)? {
+    match owned_beside(
+        context.store,
+        context.authority,
+        beside,
+        &file,
+        BESIDE_KEY_MARK,
+    )? {
         Some(owned) if context.target.exchange_supported(beside)? => {
             Ok(BesideTarget::Supersede(Box::new(owned)))
         }
@@ -7683,6 +7941,8 @@ fn plan_file(
         extend,
         snapshot,
         beside,
+        claimed,
+        always,
     } = planned;
     let mut placements: HashMap<[u8; 32], (u64, Vec<u64>)> = HashMap::new();
     let mut order = Vec::new();
@@ -7717,19 +7977,34 @@ fn plan_file(
     // `--beside` (plan of record 2026-10-19, C1/C2): a snapshot whose live
     // path has a sidecar beside it never lands there, whatever the path
     // holds; it lands beside.
-    let live_sidecar = snapshot
-        && beside.is_some()
-        && match context.target.sqlite_sidecars_present(&row.rel_path) {
-            Ok(present) => present,
-            Err(refusal) => return Plan::Refuse(refusal),
-        };
-    // Set when this entry lands beside its live path: the beside path.
+    // So does a seat that lands beside whatever its live path holds.
+    let live_sidecar = (always && beside.is_some())
+        || (snapshot
+            && beside.is_some()
+            && match context.target.sqlite_sidecars_present(&row.rel_path) {
+                Ok(present) => present,
+                Err(refusal) => return Plan::Refuse(refusal),
+            });
+    let beside_at = || beside.map(|suffix| beside_path(&row.rel_path, suffix));
+    // Set when this entry lands beside its live path: the beside path, and
+    // what the live path's refusal may be remembered as (finding 3).
     let mut land_beside: Option<Vec<u8>> = None;
+    let mut live_refused: Option<(StatIdentity, RefusedOutput)> = None;
     let mut supersede = match context.target.existing(row) {
         Ok(Some((file, parent))) => {
-            match owned_output(context.store, context.authority, row, &file) {
-                Ok(Some(_)) if live_sidecar => {
-                    land_beside = beside.map(|suffix| beside_path(&row.rel_path, suffix));
+            // Under `--beside` a live path is never replaced, whoever wrote
+            // it (review of #280, finding 1): this store's own output there,
+            // adopted or published on an earlier pass, is judged as any
+            // other file is. A grown append-only file is extended through
+            // `O_APPEND`; any other difference lands beside.
+            let owned = if beside.is_some() {
+                Ok(None)
+            } else {
+                owned_output(context.store, context.authority, row, &file)
+            };
+            match owned {
+                Ok(_) if live_sidecar => {
+                    land_beside = beside_at();
                     None
                 }
                 Ok(Some(owned)) => {
@@ -7756,10 +8031,6 @@ fn plan_file(
                         Err(refusal) => return Plan::Refuse(refusal),
                     }
                 }
-                Ok(None) if live_sidecar => {
-                    land_beside = beside.map(|suffix| beside_path(&row.rel_path, suffix));
-                    None
-                }
                 // M2r2 A-103: a grown file is extended, any other is
                 // adopted or refused as before. Under `--beside` a file
                 // that is not the seat's (a failed prefix proof, or other
@@ -7775,7 +8046,7 @@ fn plan_file(
                     };
                     match plan {
                         Plan::Adopt(file, parent, None, None) => {
-                            let (verified, _) =
+                            let (verified, settled) =
                                 verify_settled(context.target.path(), &file, row, manifest);
                             match verified {
                                 Ok(identity) => {
@@ -7783,12 +8054,15 @@ fn plan_file(
                                 }
                                 Err(BulkloadRefusal::DestinationOccupied) => {
                                     land_beside = Some(beside_path(&row.rel_path, suffix));
+                                    live_refused =
+                                        settled.map(|identity| (identity, RefusedOutput::Occupied));
                                 }
                                 Err(refusal) => return Plan::Refuse(refusal),
                             }
                         }
-                        Plan::NotPrefix(_) => {
+                        Plan::NotPrefix(identity) => {
                             land_beside = Some(beside_path(&row.rel_path, suffix));
+                            live_refused = Some((identity, RefusedOutput::NotPrefix));
                         }
                         other => return other,
                     }
@@ -7798,13 +8072,27 @@ fn plan_file(
             }
         }
         Ok(None) if live_sidecar => {
-            land_beside = beside.map(|suffix| beside_path(&row.rel_path, suffix));
+            land_beside = beside_at();
             None
         }
         Ok(None) => None,
+        // `--beside`: a node of another kind at the live path (a symlink:
+        // review of #280, finding 5) lands beside.
+        Err(BulkloadRefusal::DestinationOccupied) if beside.is_some() => {
+            land_beside = beside_at();
+            None
+        }
         Err(refusal) => return Plan::Refuse(refusal),
     };
     if let Some(beside_rel) = &land_beside {
+        // Another seat of this session writes this name (finding 4).
+        if claimed.contains(beside_rel) {
+            return Plan::BesideRefused {
+                refusal: BulkloadRefusal::DestinationOccupied,
+                live: None,
+                beside: None,
+            };
+        }
         let beside = RowSchema {
             rel_path: beside_rel.clone(),
             ..row.clone()
@@ -7815,7 +8103,13 @@ fn plan_file(
                 return Plan::Adopt(file, parent, Some(identity), Some(beside_rel.clone()))
             }
             Ok(BesideTarget::Supersede(owned)) => supersede = Some(owned),
-            Err(refusal) => return Plan::Refuse(refusal),
+            Err((refusal, settled)) => {
+                return Plan::BesideRefused {
+                    refusal,
+                    live: live_refused,
+                    beside: settled,
+                }
+            }
         }
     }
     let staged = match context.target.stage(row) {
@@ -8035,6 +8329,47 @@ fn extend_candidate(
         && identity.mtime_ns < quiet_since
         && identity.ctime_ns < quiet_since)
         .then_some((identity, prior))
+}
+
+/// The next piece of a prefix extension's tail (review of #280, finding 8):
+/// read from `staged` at `offset`, at most `remaining` bytes, ending at its
+/// last newline. A piece with no newline in its first megabyte is read on
+/// until one (or the tail's end), so it is one whole record. `buffer` is
+/// grown as needed; the piece is its front.
+fn record_piece<'b>(
+    staged: &std::fs::File,
+    (offset, remaining): (u64, u64),
+    buffer: &'b mut Vec<u8>,
+) -> Result<&'b [u8]> {
+    const PIECE: u64 = 1 << 20;
+    let mut read = 0_u64;
+    loop {
+        let want = (remaining - read).min(PIECE);
+        let start = usize::try_from(read).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        let end = usize::try_from(read + want).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+        if buffer.len() < end {
+            buffer.resize(end, 0);
+        }
+        let slot = buffer
+            .get_mut(start..end)
+            .ok_or(BulkloadRefusal::BudgetExceeded)?;
+        if crate::io::sys::pread_full(staged, slot, offset + read)
+            .refuse_at("transfer::record_piece")?
+            != slot.len()
+        {
+            return Err(BulkloadRefusal::DigestMismatch);
+        }
+        let newline = slot.iter().rposition(|byte| *byte == b'\n');
+        read += want;
+        if read == remaining {
+            return buffer.get(..end).ok_or(BulkloadRefusal::BudgetExceeded);
+        }
+        if let Some(at) = newline {
+            return buffer
+                .get(..start + at + 1)
+                .ok_or(BulkloadRefusal::BudgetExceeded);
+        }
+    }
 }
 
 /// What [`prove_prefix`] found.

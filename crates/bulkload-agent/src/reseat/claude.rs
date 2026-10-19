@@ -433,7 +433,15 @@ pub fn resolve(
         }
         _ => first_cwd(&candidate.path)?,
     };
+    // A live-home landing (review of #280, finding 7): a transcript under a
+    // key that is not under the source home's key is the destination's own
+    // (the source's land under keys of source paths), already where Claude
+    // Code lists it, with or without a `cwd` its key agrees with.
+    let destination_own = live && !source_keyed(options, &candidate.key);
     let Some(cwd) = cwd else {
+        if destination_own {
+            return Ok(Resolved::InPlace(String::new(), None));
+        }
         return Ok(Resolved::Refused(
             String::new(),
             BulkloadRefusal::ReseatLaneUnresolved,
@@ -456,6 +464,9 @@ pub fn resolve(
         }
     }
     if !own_key {
+        if destination_own {
+            return Ok(Resolved::InPlace(cwd, None));
+        }
         return Ok(Resolved::Refused(
             cwd,
             BulkloadRefusal::ReseatLaneUnresolved,
@@ -466,6 +477,27 @@ pub fn resolve(
         None if options.by_id(&cwd) => Ok(Resolved::ById(cwd)),
         None => Ok(Resolved::Refused(cwd, BulkloadRefusal::ReseatLaneUnmapped)),
     }
+}
+
+/// Whether the project key `key` is one of a path under the source home
+/// (its key, or that key and a `-`), when the source home and the
+/// destination home key differently. When they key alike (one home path
+/// on both hosts), every key counts as the source's: nothing is taken for
+/// the destination's own by its key alone.
+fn source_keyed(options: &Options, key: &str) -> bool {
+    let (Some(source), Some(destination)) = (
+        options.source_home.to_str().map(key::project_key),
+        options.dest_home.to_str().map(key::project_key),
+    ) else {
+        return true;
+    };
+    if source == destination {
+        return true;
+    }
+    key == source
+        || key
+            .strip_prefix(source.as_str())
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 /// Every regular file (and every other node, to report) under `root`, as

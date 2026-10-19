@@ -757,6 +757,8 @@ fn a_chunk_of_a_superseded_output_is_still_filled_locally() {
                 extend: false,
                 snapshot: false,
                 beside: None,
+                claimed: &HashSet::new(),
+                always: false,
             },
             &manifest,
             &mut Vec::new(),

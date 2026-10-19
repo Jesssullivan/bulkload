@@ -430,8 +430,8 @@ SUBCOMMANDS:
     estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
                   [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
                   [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
-                  [--landing-codex-index FILE] [--unmapped=report|by-id] [--note-marker TEXT]
-                  [--sessions-only]
+                  [--landing-codex-index FILE | --no-landing-codex-index]
+                  [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
                   [--no-respell] [--no-regularize] [--replace-archived-dest ROOT]...
@@ -1856,7 +1856,8 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
     let (mut plan, mut corpus, mut source) = (None, None, None);
     let mut states = Vec::new();
     let mut roots = Vec::new();
-    let (mut landing_claude, mut landing_codex, mut landing_index) = (None, None, None);
+    let (mut landing_claude, mut landing_codex) = (None, None);
+    let mut landing_index = bulkload_agent::reseat::LandingIndex::InLanding;
     let mut unmapped = Unmapped::Report;
     let mut marker = None;
     let mut sessions_only = false;
@@ -1882,6 +1883,9 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
             "--no-respell" => respell = false,
             "--no-regularize" => regularize = false,
             "--no-default-by-id" => default_by_id = false,
+            "--no-landing-codex-index" => {
+                landing_index = bulkload_agent::reseat::LandingIndex::Absent;
+            }
             "--unmapped=report" => unmapped = Unmapped::Report,
             "--unmapped=by-id" => unmapped = Unmapped::ById,
             "--rebind-landing" => {
@@ -1935,7 +1939,7 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
                         if !path.is_absolute() {
                             return Err(BulkloadRefusal::PathNotAbsolute);
                         }
-                        landing_index = Some(path);
+                        landing_index = bulkload_agent::reseat::LandingIndex::At(path);
                     }
                     "--managed-settings" => managed.push(path),
                     "--by-id" => {

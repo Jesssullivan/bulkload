@@ -488,3 +488,255 @@ fn a_suffix_is_one_name_component() {
     }
     set_beside_suffix(None).unwrap();
 }
+
+// ---- review of #280 (2026-10-19), findings 1, 3, 4, 5 ----------------------
+
+/// JSONL lines of about 100 bytes each, `count` of them, numbered from
+/// `from`.
+fn jsonl(from: usize, count: usize) -> Vec<u8> {
+    (from..from + count)
+        .flat_map(|index| {
+            format!("{{\"n\":{index},\"text\":\"line {index} of a live rollout, padded to about a hundred bytes\"}}\n")
+                .into_bytes()
+        })
+        .collect()
+}
+
+/// Finding 1, first reproduction: a live file adopted on pass 1 (identical)
+/// is the destination's still; the seat changes on the source, and pass 2
+/// lands the new bytes beside it, the live file untouched (same inode, same
+/// bytes), never exchanged.
+#[test]
+fn an_adopted_live_file_is_never_replaced_when_its_seat_changes() {
+    let beside = Beside::new();
+    let source = beside.source();
+    let destination = beside.destination();
+    let original = noise(341, 4096);
+    std::fs::write(source.join("config.toml"), &original).unwrap();
+    std::fs::write(destination.join("config.toml"), &original).unwrap();
+    settle(&beside.corpus);
+    let first = beside.run();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    assert!(first.applied_beside.is_empty(), "adopted, not beside");
+    let inode = std::fs::metadata(destination.join("config.toml"))
+        .unwrap()
+        .ino();
+
+    let edited = noise(342, 5000);
+    std::fs::write(source.join("config.toml"), &edited).unwrap();
+    settle(&beside.corpus);
+    let second = beside.run();
+    assert!(second.refusals.is_empty(), "{:?}", second.refusals);
+    assert_eq!(
+        std::fs::read(destination.join("config.toml")).unwrap(),
+        original,
+        "the live file keeps the destination's bytes"
+    );
+    assert_eq!(
+        std::fs::metadata(destination.join("config.toml"))
+            .unwrap()
+            .ino(),
+        inode,
+        "never exchanged"
+    );
+    assert_eq!(
+        std::fs::read(destination.join(beside_name("config.toml"))).unwrap(),
+        edited
+    );
+    assert_eq!(
+        applied(&second),
+        [("config.toml".to_owned(), beside_name("config.toml"))]
+    );
+}
+
+/// Finding 1, second reproduction: an append-only file bulkload published
+/// on pass 1, held open for appending by a destination writer, grows on the
+/// source; pass 2 extends it in place through `O_APPEND` (same inode, never
+/// replaced), so the writer's next line lands in the live file after it.
+#[test]
+fn a_published_append_only_file_held_open_by_a_writer_is_extended_in_place() {
+    use std::io::Write as _;
+    let beside = Beside::new();
+    let source = beside.source();
+    let destination = beside.destination();
+    let head = jsonl(0, 6000);
+    std::fs::write(source.join("rollout.jsonl"), &head).unwrap();
+    settle(&beside.corpus);
+    let first = beside.run();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    let live = destination.join("rollout.jsonl");
+    assert_eq!(std::fs::read(&live).unwrap(), head);
+    let inode = std::fs::metadata(&live).unwrap().ino();
+    let mut writer = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&live)
+        .unwrap();
+
+    let mut grown = head;
+    grown.extend_from_slice(&jsonl(6000, 2000));
+    std::fs::write(source.join("rollout.jsonl"), &grown).unwrap();
+    settle(&beside.corpus);
+    let second = beside.run();
+    assert!(second.refusals.is_empty(), "{:?}", second.refusals);
+    assert_eq!(
+        second.prefix_extended.len(),
+        1,
+        "{:?}",
+        second.prefix_extended
+    );
+    assert!(
+        second.applied_beside.is_empty(),
+        "{:?}",
+        second.applied_beside
+    );
+    assert_eq!(
+        std::fs::metadata(&live).unwrap().ino(),
+        inode,
+        "extended in place, never replaced"
+    );
+    writer.write_all(b"{\"dest\":\"next turn\"}\n").unwrap();
+    writer.flush().unwrap();
+    drop(writer);
+    let mut want = grown;
+    want.extend_from_slice(b"{\"dest\":\"next turn\"}\n");
+    assert_eq!(
+        std::fs::read(&live).unwrap(),
+        want,
+        "the writer's line follows the extension, in the live file"
+    );
+}
+
+/// Finding 3: a seat whose live file differs and whose beside path holds a
+/// foreign file is refused, and the unchanged rerun refuses it again with 0
+/// source bytes read and nothing received (S3, R25).
+#[test]
+fn a_refused_beside_landing_is_remembered_and_reads_nothing_again() {
+    let beside = Beside::new();
+    let source = beside.source();
+    let destination = beside.destination();
+    std::fs::write(source.join("a.json"), noise(351, 120_000)).unwrap();
+    std::fs::write(destination.join("a.json"), noise(352, 100_000)).unwrap();
+    std::fs::write(destination.join(beside_name("a.json")), noise(353, 50_000)).unwrap();
+    settle(&beside.corpus);
+    let first = beside.run();
+    assert_eq!(
+        first.refusals,
+        [(b"a.json".to_vec(), "DESTINATION_OCCUPIED".to_owned())]
+    );
+    assert!(first.source_bytes_read > 0);
+    let again = beside.run();
+    assert_eq!(again.refusals, first.refusals);
+    assert_eq!(
+        (again.source_bytes_read, again.bytes_received),
+        (0, 0),
+        "remembered under both keys"
+    );
+    // The beside path freed: the next pass lands it.
+    std::fs::remove_file(destination.join(beside_name("a.json"))).unwrap();
+    let landed = beside.run();
+    assert!(landed.refusals.is_empty(), "{:?}", landed.refusals);
+    assert_eq!(
+        applied(&landed),
+        [("a.json".to_owned(), beside_name("a.json"))]
+    );
+}
+
+/// Finding 4: the source holds `x` and `x<SUFFIX>`, and the destination's
+/// `x` differs: one seat is refused `DESTINATION_OCCUPIED`, typed, the
+/// session completes, and nothing is written twice under one name; a rerun
+/// never replaces the source's own `x<SUFFIX>` with `x`'s bytes.
+#[test]
+fn a_beside_name_the_source_also_holds_is_a_typed_refusal_of_one_seat() {
+    let beside = Beside::new();
+    let source = beside.source();
+    let destination = beside.destination();
+    let ours = noise(361, 90_000);
+    let suffixed = noise(362, 80_000);
+    let theirs = noise(363, 70_000);
+    std::fs::write(source.join("x"), &ours).unwrap();
+    std::fs::write(source.join(beside_name("x")), &suffixed).unwrap();
+    std::fs::write(destination.join("x"), &theirs).unwrap();
+    settle(&beside.corpus);
+    for pass in 0..2 {
+        let stats = beside.run();
+        assert_eq!(stats.refusals.len(), 1, "pass {pass}: {:?}", stats.refusals);
+        assert_eq!(stats.refusals[0].1, "DESTINATION_OCCUPIED", "pass {pass}");
+        assert_eq!(
+            std::fs::read(destination.join("x")).unwrap(),
+            theirs,
+            "pass {pass}"
+        );
+        let held = std::fs::read(destination.join(beside_name("x"))).unwrap();
+        assert!(held == suffixed || held == ours, "pass {pass}");
+        if pass == 1 {
+            assert_eq!(
+                std::fs::read(destination.join(beside_name("x"))).unwrap(),
+                held,
+                "never replaced across passes"
+            );
+        }
+        settle(&beside.corpus);
+    }
+}
+
+/// Finding 5: a regular seat over a destination symlink (a Home Manager
+/// `/nix/store` link, as sting's `~/.codex/AGENTS.md`) lands beside under
+/// `--beside`, the link untouched; without the flag it is refused
+/// `DESTINATION_OCCUPIED`, typed, never a bare `IO`. A directory over a
+/// destination symlink is refused typed, with every child, and nothing is
+/// written through the link.
+#[test]
+fn a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed() {
+    let beside = Beside::new();
+    let source = beside.source();
+    let destination = beside.destination();
+    let store = beside.corpus.base.join("nix-store");
+    std::fs::create_dir(&store).unwrap();
+    std::fs::write(store.join("agents.md"), b"home manager's\n").unwrap();
+    std::fs::create_dir(store.join("dir")).unwrap();
+    std::os::unix::fs::symlink(store.join("agents.md"), destination.join("AGENTS.md")).unwrap();
+    std::os::unix::fs::symlink(store.join("dir"), destination.join("d")).unwrap();
+    std::fs::write(source.join("AGENTS.md"), b"neo's agents\n").unwrap();
+    std::fs::create_dir(source.join("d")).unwrap();
+    std::fs::write(source.join("d/inner.txt"), b"inner\n").unwrap();
+    settle(&beside.corpus);
+
+    let without = beside.run_without();
+    let mut codes: Vec<(String, String)> = without
+        .refusals
+        .iter()
+        .map(|(path, code)| (String::from_utf8_lossy(path).into_owned(), code.clone()))
+        .collect();
+    codes.sort();
+    assert_eq!(
+        codes,
+        [
+            ("AGENTS.md".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
+            ("d".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
+            ("d/inner.txt".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
+        ]
+    );
+
+    let with = beside.run();
+    assert_eq!(
+        applied(&with),
+        [("AGENTS.md".to_owned(), beside_name("AGENTS.md"))]
+    );
+    assert_eq!(
+        std::fs::read(destination.join(beside_name("AGENTS.md"))).unwrap(),
+        b"neo's agents\n"
+    );
+    assert!(std::fs::symlink_metadata(destination.join("AGENTS.md"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        std::fs::read(store.join("agents.md")).unwrap(),
+        b"home manager's\n"
+    );
+    assert!(with
+        .refusals
+        .iter()
+        .all(|(_, code)| code == "DESTINATION_OCCUPIED"));
+    assert_eq!(std::fs::read_dir(store.join("dir")).unwrap().count(), 0);
+}

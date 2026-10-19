@@ -150,16 +150,103 @@ and check under load. It passed in the targeted run before and in the
 `cf1166b` run, and the code it drives (`regularize`) is untouched here: a
 host-load flake, recorded, not fixed in this lane.
 
+## Review of #280 (2026-10-19) and the fixes
+
+The coordinator's adversarial review of `0e08334` (comment on #280, probes
+on honey) found the defects below. They are fixed on this branch in new
+commits (no force-push); the receipt above is for `cf1166b` and is
+superseded by the one added with the fixes.
+
+1. **Blocking: a live path was replaced under `--beside`.** An "owned" live
+   file (adopted identical, or published, on an earlier pass) whose seat
+   changed was exchanged into place: the destination's bytes were lost, and
+   a published rollout held open by a destination writer was replaced, so
+   the writer's next line went to the unlinked inode. Fixed: under
+   `--beside` ownership of a live path licenses nothing. The file is judged
+   as any other: equal is adopted, a grown append-only file is extended
+   through the `O_APPEND` prefix path, anything else lands beside. Both
+   reproductions are tests
+   (`an_adopted_live_file_is_never_replaced_when_its_seat_changes`,
+   `a_published_append_only_file_held_open_by_a_writer_is_extended_in_place`).
+   Without the flag, WP0(d)'s supersede of the store's own unchanged output
+   is as before.
+2. **Blocking: the PR body was another lane's** (it would have closed
+   #232, #276, #277, #279). The shared scratchpad body file had been
+   overwritten by another lane before `gh pr create`. Rewritten from this
+   note and the commits, from a lane-unique file; it closes no issue.
+3. **Unchanged reruns re-read the source.** A beside landing refused for
+   a foreign file at the beside path is now remembered under the seat's
+   beside key (`RefusedOutput::BesideOccupied`, new tag 4) with that file's
+   settled identity, beside the live path's own record; an unchanged rerun
+   refuses it with 0 source bytes (test
+   `a_refused_beside_landing_is_remembered_and_reads_nothing_again`).
+4. **Beside-name collision aborted the session.** Each suffixed name a
+   session writes is claimed once (a seat's own live path or another seat's
+   beside path); a second claim is that seat's `DESTINATION_OCCUPIED`,
+   typed, and the session completes. Beside rows carry a key mark, so only
+   this seat's own earlier beside output is ever superseded at a beside
+   path; the source's own `x<suffix>` output is never replaced with `x`'s
+   bytes (test `a_beside_name_the_source_also_holds_is_a_typed_refusal_of_one_seat`).
+5. **Kind mismatch was bare `IO`.** A destination open that meets a symlink
+   or a non-directory (`ELOOP`, `ENOTDIR`) is `DESTINATION_OCCUPIED`,
+   typed. Under `--beside` a regular seat over a symlink (sting's Home
+   Manager `~/.codex/AGENTS.md`) lands beside, the link untouched; a
+   directory over a symlink is refused typed with its children (landing a
+   whole subtree beside is a gap, below). Test
+   `a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed`.
+6. **The Codex re-seat could read the live index as the snapshot.** Now:
+   `estate-move` makes the Codex index seat always land beside
+   (`state_5.sqlite.LABEL`, live path absent included), so a pull never
+   writes the live index; the re-seat gets `--landing-codex-index` only for
+   the snapshot this pass's completed Codex transfer record names
+   (`applied-beside`, started this pass), else `--no-landing-codex-index`
+   (new): a stale snapshot is never reused. `estate-reseat` refuses
+   `FIELD_DOMAIN_VIOLATION` before writing when the landed index resolves
+   to the live one. A destination with no index gets one seeded from this
+   pass's snapshot (`VACUUM INTO` a temporary, its thread rows removed,
+   published without replacing anything), then each lane's thread is
+   registered under the destination `cwd` and rollout path; every other
+   table, `backfill_state` included, is kept, so Codex never backfills the
+   landed rollouts under their source `cwd`. Seeding needs a snapshot whose
+   `backfill_state` holds a row (its Codex completed the backfill it runs
+   once); without one the run still refuses `RESEAT_INDEX_ABSENT` before
+   writing, as review 0 finding 4 ruled (`r0_4_...` unchanged). Test
+   `sessions_into_a_destination_with_no_codex_index_seed_it`.
+7. **Destination-own sessions held the gate.** On a live-home landing, a
+   transcript under a key that is not under the source home's key is the
+   destination's own and `in-place`, with or without a `cwd` its key
+   agrees with (same test as 6). When both homes key alike (one home path
+   on both hosts) nothing is taken for the destination's by its key alone.
+8. **`append_tail` could split a record under a racing appender.** Every
+   piece of a prefix extension now ends at its last newline (a record
+   longer than a piece is written whole), one `O_APPEND` write each, so a
+   destination append between two pieces never lands inside a record of
+   ours; the size checks before and after each piece are unchanged.
+9. **Neo-key project directories stay inside the live `~/.claude`.** Not
+   fixed in this PR (gap below).
+
 ## Open
 
-- The Codex re-seat on a destination with no live `state_5.sqlite` (nothing
-  to land beside, so the pull lands the source's snapshot at the live name)
-  then reads that same file as the landed index. Reseat refused that
-  destination before too (`RESEAT_INDEX_ABSENT`); the real estate's Codex
-  index is live with sidecars, which is the case built and tested here.
+- **Finding 9 (no duplicate bits, R4):** the source's transcripts land in
+  the live `~/.claude/projects/<neo key>/` and the re-seat copies each
+  re-keyed one to `<destination key>/`, so the neo-key copy stays as a
+  second copy. The right shape is a pull that re-keys at the destination:
+  a receive-side prefix map (`projects/<neo key>/` →
+  `projects/<destination key>/`) that `estate-move` builds from the plan's
+  lanes for keys only one source `cwd` maps to (the key is lossy; reseat
+  keeps resolving the rest by each transcript's `cwd`). It touches row
+  keys, ownership, beside paths, parent creation and the reseat's ledger,
+  so it is its own PR; not done here. Removing or linking the neo-key copy
+  instead is ruled out (C8/C9: no transcript removed, none symlinked; the
+  placer refuses hardlinks).
+- A directory seat over a destination symlink is refused, typed, with
+  every child, instead of landing the subtree beside.
+- A racy beside output records only its path's ownership row, which the
+  per-seat beside ownership does not count: a later pass refuses that
+  beside path `DESTINATION_OCCUPIED` instead of superseding it.
 - Re-seat outcomes that hold the gate (`reseat_held=`) are not yet
   dispositionable by `closure-dispose`; whether an operator review may close
-  one (for example an unmapped neo scratch cwd) is a dated question for the
-  operator, not decided here.
+  one is a dated question for the operator, not decided here.
 - Beside outputs never converge back into the live path (C12 for files,
   as for checkouts): a later pass keeps them beside, current.
+- `just darwin-check` on pzm is owed before merge.

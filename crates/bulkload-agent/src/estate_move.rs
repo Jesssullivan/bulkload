@@ -17,6 +17,7 @@
 
 use std::ffi::OsString;
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -734,6 +735,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
     // typed closure rows, and a refused settings file never holds the
     // transcripts' re-seat.
     let sessions: Option<Sessions> = if let Some(home) = &run.sessions {
+        let pass_started = now_secs();
         let pulled = sessions_pull(&run, home);
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
@@ -745,7 +747,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
             reseat: None,
         };
         if session_completed(&pulled) {
-            let reseated = reseat(&run, home, (&plan, &corpus, &private));
+            let reseated = reseat(&run, home, (&plan, &corpus, &private), pass_started);
             let ended: Result<()> = reseated.as_ref().map(drop).map_err(Clone::clone);
             note(&ended);
             reached(&mut ledger, &ledger_path, "reseat", word(&ended))?;
@@ -1039,7 +1041,11 @@ fn sessions_pull(run: &Move, home: &Path) -> Result<()> {
         .unwrap_or_else(|| home.join(".codex"));
     bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()))?;
     let claude = run.transfer_live(&home.join(".claude"), &dest.join(".claude"), "claude");
+    // The Codex index always lands beside, as this pass's snapshot: the
+    // pull never writes the live index (review of #280, finding 6).
+    bulkload_agent::transfer::set_beside_always(vec![STATE_DB.as_bytes().to_vec()]);
     let codex = run.transfer_live(&codex_root, &dest.join(".codex"), "codex");
+    bulkload_agent::transfer::set_beside_always(Vec::new());
     let cleared = bulkload_agent::transfer::set_beside_suffix(None);
     // A session that did not complete outranks one that completed with
     // refused paths: the phase's word says whether the re-seat may run.
@@ -1052,6 +1058,42 @@ fn sessions_pull(run: &Move, home: &Path) -> Result<()> {
         }
     }
     outcome
+}
+
+// The Codex index snapshot this pass landed beside the live index: the
+// `applied-beside` row of `state_5.sqlite` in a completed Codex transfer
+// record of this pass (started at or after `pass_started`, Unix seconds).
+fn landed_index(run: &Move, dest_codex: &Path, pass_started: u64) -> Option<PathBuf> {
+    use bulkload_agent::transfer_outcome::{self, EntryOutcome, Session};
+    let state = run.state.join("pull").join("codex");
+    let destination = transfer_outcome::stable(dest_codex);
+    transfer_outcome::records(&state)
+        .iter()
+        .filter_map(|(_, path)| transfer_outcome::read_file(path)?.ok())
+        .filter(|record| {
+            record.session == Session::Completed
+                && record.started >= pass_started
+                && record.destination == destination
+        })
+        .find_map(|record| {
+            record
+                .entries
+                .iter()
+                .find_map(|entry| match &entry.outcome {
+                    EntryOutcome::AppliedBeside { beside }
+                        if entry.rel_path == STATE_DB.as_bytes() =>
+                    {
+                        Some(dest_codex.join(std::ffi::OsStr::from_bytes(beside)))
+                    }
+                    _ => None,
+                })
+        })
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
 }
 
 // Whether every session transfer completed: every path answered, refused
@@ -1068,6 +1110,7 @@ fn reseat(
     run: &Move,
     home: &Path,
     (plan, corpus, private): (&Path, &Path, &Path),
+    pass_started: u64,
 ) -> Result<Option<bulkload_agent::reseat::Summary>> {
     let dest_home = dest_home(run)?;
     let codex_root = run
@@ -1092,14 +1135,12 @@ fn reseat(
         args.extend(["--map".into(), pair]);
     }
     args.extend(run.reseat_args.iter().cloned());
-    let beside_index = dest_home
-        .join(".codex")
-        .join(format!("{STATE_DB}{}", run.suffix()));
-    if beside_index.is_file() {
-        args.extend([
-            "--landing-codex-index".into(),
-            beside_index.into_os_string(),
-        ]);
+    // Review of #280, finding 6: the landed index is the snapshot this
+    // pass took, named by this pass's Codex transfer record, or none: never
+    // the live index, never an earlier pass's snapshot.
+    match landed_index(run, &dest_home.join(".codex"), pass_started) {
+        Some(index) => args.extend(["--landing-codex-index".into(), index.into_os_string()]),
+        None => args.push("--no-landing-codex-index".into()),
     }
     args.extend([
         "--codex-source-root".into(),

@@ -778,7 +778,7 @@ fn check_codex(
     } else {
         None
     };
-    let threads = codex::landed_threads(&options.landing_codex.join(codex::STATE_DB))?;
+    let threads = codex::landed_threads(&options.landing_index().unwrap_or_default())?;
     let ids: BTreeSet<String> = threads.iter().map(|thread| thread.id.clone()).collect();
     let mut named = BTreeSet::new();
     // Each tallied thread: its lane (or none, by ID), expected cwd, source
