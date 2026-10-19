@@ -161,6 +161,7 @@ const BYPASSES: &[Bypass] = &[
              ifbulkload_agent::durable::ledger_sync()==\
              bulkload_agent::durable::LedgerSync::Full{\
              ssh.arg(\"--source-ledger-sync=full\");}\
+             forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);}\
              letmutchild=ssh.arg(\"serve\")\
              .stdin(Stdio::piped()).stdout(Stdio::piped())\
              .stderr(Stdio::inherit()).spawn()",
@@ -171,7 +172,12 @@ const BYPASSES: &[Bypass] = &[
               remote word is `bulkload-agent` or a validated absolute path, \
               and the ssh child touches no local source. The two mode flags it \
               may pass (`--durability=strict`, and WP0(g)'s \
-              `--source-ledger-sync=full`, OI-1003-Q109) are fixed literals.",
+              `--source-ledger-sync=full`, OI-1003-Q109) are fixed literals. \
+              The `SQLite` flags it may pass (`--sqlite-slot-bytes=N`, \
+              `--sqlite-carry-wall=N`, plan of record 2026-10-19, C3) are the \
+              verb's own, rendered by `transfer::serve_flags` from the parsed \
+              integers (digits only, never caller text), and only when set \
+              away from their defaults.",
     },
     Bypass {
         id: "agent::provider_sqlite::hydrate::hydrate_one(program)",

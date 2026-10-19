@@ -22,10 +22,13 @@ the corrupt copies, which closure also marks corrupt)".
 
 Produced: PR https://github.com/Jesssullivan/bulkload/pull/278, signed
 commits `77fa2ce8` (the change), `4b1fe938` (this note), `a8421bc5`
-(rustfmt), and the clippy-fix commit that also carries this paragraph. The
-receipts (`cargo test -p bulkload-agent --locked`, `just rust-check`, host
-honey) are in the PR body, at the PR's final head, with the `TMPDIR` they
-ran under. A parallel, uncommitted draft of chunked snapshots sits in the
+(rustfmt), `5189c99d` (clippy), and the P76 registration commit that also
+carries this paragraph: forwarding the two flags changed `pull_command`'s
+registered `ssh` child, so its shape and argument in
+`tests/source_command_registry.rs` are updated as `b7f46e46` did for
+`--source-ledger-sync=full`. The receipts (`cargo test -p bulkload-agent
+--locked`, `just rust-check`, host honey) are in the PR body, at the PR's
+final head, with the `TMPDIR` they ran under. A parallel, uncommitted draft of chunked snapshots sits in the
 local worktree `bulkload.worktrees/sqlite-chunked-20261018` (branch
 `feat/sqlite-chunked-snapshot-20261018`, never pushed, last touched
 2026-10-18 22:42Z); this lane does not build on it and left it as it was.
