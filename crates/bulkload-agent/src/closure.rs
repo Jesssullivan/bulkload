@@ -101,12 +101,15 @@
 //! its current capture, `advance` (`outcome`: `advanced` or the
 //! `GIT_ADVANCE_*` code; `detail`, the refusal's, such as the colliding
 //! paths; `beside`: `pending`, `absent`, `retired` or `kept`; `reason`;
-//! `kept`, the entries the advance left to the live checkout), and
+//! `kept`, the entries the advance left to the live checkout;
+//! `file_besides`, the captured files it landed as `<path>SUFFIX`). It
 //! classifies an `applied-beside` row whose advance refused
-//! `refused-pending-review` with that code (printed as `refusal`, its
-//! detail as `refusal_detail`), bound to
-//! the code and the live HEAD it was decided against: the capture landed
-//! beside, and the operator disposes whether it stays there.
+//! `refused-pending-review` with that code, and an `applied` row whose
+//! advance kept its beside landing `refused-pending-review` with
+//! `GIT_ADVANCE_BESIDE_KEPT` (a duplicate on the destination; the
+//! coordinator's decision on #289). Either is printed as `refusal`, its
+//! detail as `refusal_detail`, and bound to the code, the live HEAD it was
+//! decided against and the detail: the operator disposes what stays.
 //!
 //! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
@@ -221,7 +224,11 @@ pub fn instance(entry: &LedgerEntry) -> String {
         Some(Ok(_)) if advance.is_some() => advance.map_or((4, Vec::new()), |(code, summary)| {
             (
                 4,
-                format!("{code}\0{}\0{}", summary.live, summary.branch).into_bytes(),
+                format!(
+                    "{code}\0{}\0{}\0{}",
+                    summary.live, summary.branch, summary.detail
+                )
+                .into_bytes(),
             )
         }),
         None => (0_u8, Vec::new()),
@@ -289,7 +296,17 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
         }
         Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
             if entry.has_workspace {
-                journal("workspace-restored", Disposition::Applied)
+                // `--advance-ancestor`: an advanced checkout whose beside
+                // landing was kept holds that duplicate pending review.
+                advance_refusal(entry).map_or_else(
+                    || journal("workspace-restored", Disposition::Applied),
+                    |code| {
+                        journal(
+                            "workspace-restored",
+                            Disposition::RefusedPendingReview(code.to_owned()),
+                        )
+                    },
+                )
             } else {
                 Disposition::Unaccounted("outcome-workspace-mismatch")
             }
@@ -334,21 +351,31 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
     }
 }
 
-// `--advance-ancestor`: the `GIT_ADVANCE_*` code that refused the advance
-// of a beside row's live checkout for its current capture, when one did.
+// `--advance-ancestor`: the typed refusal an item's advance record holds
+// for its current capture: on a beside row, the `GIT_ADVANCE_*` code that
+// refused the advance; on a restored row (the live checkout advanced),
+// `GIT_ADVANCE_BESIDE_KEPT` when its beside landing was kept, a duplicate.
 fn advance_refusal(entry: &LedgerEntry) -> Option<&str> {
-    let beside = matches!(
-        entry.record,
-        Some(Ok(crate::outcome::OutcomeRecord {
-            outcome: Outcome::WorkspaceBeside | Outcome::PreviousWorkspaceBesideNotRevalidated,
-            ..
-        }))
-    );
-    entry
+    let outcome = match &entry.record {
+        Some(Ok(record)) => &record.outcome,
+        _ => return None,
+    };
+    let code = entry
         .advance
         .as_ref()
-        .filter(|_| beside)
-        .and_then(crate::estate::AdvanceSummary::refusal)
+        .and_then(crate::estate::AdvanceSummary::refusal)?;
+    let kept = code == "GIT_ADVANCE_BESIDE_KEPT";
+    match outcome {
+        Outcome::WorkspaceBeside | Outcome::PreviousWorkspaceBesideNotRevalidated if !kept => {
+            Some(code)
+        }
+        Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated
+            if kept =>
+        {
+            Some(code)
+        }
+        _ => None,
+    }
 }
 
 /// The typed codes no review closes, with the reason a row holding one is
@@ -1103,12 +1130,13 @@ impl Report {
                 }
                 let _ = write!(
                     out,
-                    ",\"advance\":{{\"outcome\":{},\"detail\":{},\"beside\":{},\"reason\":{},\"kept\":{}}}",
+                    ",\"advance\":{{\"outcome\":{},\"detail\":{},\"beside\":{},\"reason\":{},\"kept\":{},\"file_besides\":{}}}",
                     json_string(&advance.outcome),
                     json_string(&advance.detail),
                     json_string(&advance.beside),
                     json_string(&advance.reason),
                     advance.kept,
+                    advance.besides,
                 );
             }
             // Gap C12: a refused row names the refs its item's refs-in

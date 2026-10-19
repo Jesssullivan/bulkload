@@ -163,9 +163,10 @@ SUBCOMMANDS:
                 lays down the captured tree, dirty and untracked files and
                 index as a landing does; an ignored entry of the live
                 checkout where the capture lands one is never touched (left,
-                counted advance-kept=N; the capture's bytes stay in its
-                provenance), nor are other branches, the stash, other
-                worktrees, configuration or info/exclude. The checkout is
+                counted advance-kept=N), and the captured file there lands
+                beside it as PATHSUFFIX, create-only
+                (advance-file-besides=N); nor are other branches, the stash,
+                other worktrees, configuration or info/exclude. The checkout is
                 then landed (workspace-restored, ledgered; recorded in its
                 .git as advanced), the captured refs and stash entries go in
                 under --refs-in, and the item's beside landing, brought to
@@ -175,7 +176,9 @@ SUBCOMMANDS:
                 a sealed hand-off block the one difference allowed; nothing
                 its Git holds unreachable from the live repository), else
                 kept with a reason (receipt advance-beside=retired|kept|
-                absent advance-beside-reason=...). A refused advance writes
+                absent advance-beside-reason=...); a kept beside is a
+                duplicate: closure holds the item refused-pending-review
+                GIT_ADVANCE_BESIDE_KEPT until closure-dispose. A refused advance writes
                 nothing at the live checkout, lands beside in the same pass,
                 and is recorded in PRIVATE_STATE ITEM-SOURCE.advance: closure
                 holds the item refused-pending-review with that code until
@@ -287,7 +290,7 @@ SUBCOMMANDS:
                 interrupted undo is finished, never re-seated). Refuses
                 RECEIPT_BINDING_INVALID, changing no path, when either path no
                 longer holds what the seat left.
-    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... [--beside SUFFIX] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
+    estate-diff [--since NS] [--scan DIR]... [--activate-origin PREFIX]... [--side-root ROOT]... [--beside SUFFIX] [--advance-ancestor] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: classify each plan item against the destination now
                 (identical, source-only, source-ahead, dest-ahead, diverged with a
                 ledger; differs with a hint without one), with what estate-apply
@@ -296,7 +299,11 @@ SUBCOMMANDS:
                 rebuildable omissions and the origin a first landing activates;
                 plus worktrees of planned repositories no item plans and, with
                 --scan, Git directories under DIR in no planned family
-                (dest-only). One bulkload.estate-diff.v1 JSON line per row
+                (dest-only). With --advance-ancestor, a diverged live checkout
+                estate-apply --advance-ancestor would advance reads
+                adopt:advance, one it would refuse keeps diverged with the
+                component advance-refused=CODE (estate-move --plan-only with
+                the flag passes it). One bulkload.estate-diff.v1 JSON line per row
     estate-handoff [--check | --clear [--clear-carried] | --dry-run] [--item ID]...
                 [--workspace PATH]... [--sibling LANDED_PREFIX=LIVE_PREFIX]...
                 [--readme] [--renew] [--as-of NS] PLAN CORPUS PRIVATE_STATE SOURCE
@@ -1734,12 +1741,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
         }
         "estate-diff" => {
             let (options, rest) = estate_options(args)?;
-            if rest.len() < 4
-                || options.adopt
-                || options.exclude_union
-                || options.refs_in
-                || options.advance_ancestor
-            {
+            if rest.len() < 4 || options.adopt || options.exclude_union || options.refs_in {
                 return Err(BulkloadRefusal::RequiredFieldMissing);
             }
             let source = rest
@@ -1758,6 +1760,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                     scan: options.scan,
                     activate_origin: options.activate_origin,
                     beside: options.beside,
+                    advance_ancestor: options.advance_ancestor,
                     side_roots: options.side_roots,
                 },
                 &mut |line| writeln!(output, "{line}").refuse_at("main::estate_command"),

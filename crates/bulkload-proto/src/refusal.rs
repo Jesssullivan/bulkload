@@ -223,6 +223,14 @@ pub enum BulkloadRefusal {
     /// worktree, index or refs (an additive import of the capture's objects
     /// and provenance aside); the capture lands beside it.
     GitAdvanceRaced,
+    /// `--advance-ancestor` (the coordinator's decision on #289): the live
+    /// checkout was advanced, and the item's beside landing it made
+    /// redundant is kept: not proved equal to the live tree, not this
+    /// item's, or its retirement refused. A duplicate on the destination,
+    /// so closure holds the item pending review until it is disposed.
+    /// Carries the reason (`differs:seat=<path>`, `not-owned`, ...), raw
+    /// bytes; [`fmt::Display`] prints it escaped.
+    GitAdvanceBesideKept(Vec<u8>),
     /// Between the capture a checkout holds and the current one, the source
     /// changed what converge does not carry: the shallow frontier, nested
     /// repository custody, the omitted rebuildable roots or bareness.
@@ -583,6 +591,7 @@ impl BulkloadRefusal {
             Self::GitAdvanceBranchBusy => "GIT_ADVANCE_BRANCH_BUSY",
             Self::GitAdvanceUntrackedCollides(_) => "GIT_ADVANCE_UNTRACKED_COLLIDES",
             Self::GitAdvanceRaced => "GIT_ADVANCE_RACED",
+            Self::GitAdvanceBesideKept(_) => "GIT_ADVANCE_BESIDE_KEPT",
             Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
             Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
             Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
@@ -688,6 +697,7 @@ impl BulkloadRefusal {
         "GIT_ADVANCE_BRANCH_BUSY",
         "GIT_ADVANCE_UNTRACKED_COLLIDES",
         "GIT_ADVANCE_RACED",
+        "GIT_ADVANCE_BESIDE_KEPT",
         "HANDOFF_NOT_LANDED",
         "HANDOFF_TARGET_UNSUPPORTED",
         "HANDOFF_BLOCK_MODIFIED",
@@ -797,6 +807,9 @@ impl fmt::Display for BulkloadRefusal {
             }
             Self::GitAdvanceUntrackedCollides(ref paths) => {
                 write!(f, "{} paths=\"{}\"", self.code(), paths.escape_ascii())
+            }
+            Self::GitAdvanceBesideKept(ref reason) => {
+                write!(f, "{} reason=\"{}\"", self.code(), reason.escape_ascii())
             }
             _ => f.write_str(self.code()),
         }
@@ -978,6 +991,7 @@ mod tests {
             BulkloadRefusal::GitAdvanceBranchBusy,
             BulkloadRefusal::GitAdvanceUntrackedCollides(Vec::new()),
             BulkloadRefusal::GitAdvanceRaced,
+            BulkloadRefusal::GitAdvanceBesideKept(Vec::new()),
             BulkloadRefusal::HandoffNotLanded,
             BulkloadRefusal::HandoffTargetUnsupported,
             BulkloadRefusal::HandoffBlockModified,

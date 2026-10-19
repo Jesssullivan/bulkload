@@ -857,6 +857,7 @@ fn preview(run: &Move, (plan, corpus, private): (&Path, &Path, &Path)) -> Result
             scan: Vec::new(),
             activate_origin: run.origins.clone(),
             beside: Some(run.suffix()),
+            advance_ancestor: run.advance_ancestor,
             side_roots: run.side_roots.clone(),
         },
         &mut |line| writeln!(file, "{line}").refuse_at("estate_move::diff"),

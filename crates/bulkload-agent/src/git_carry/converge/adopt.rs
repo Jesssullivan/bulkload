@@ -695,12 +695,13 @@ fn still(
 /// 2026-10-19), a checkout that differs is advanced to the capture instead
 /// when it may be ([`super::advance::workspace`]), or refused with a typed
 /// `GIT_ADVANCE_*` code and nothing written.
+#[allow(clippy::too_many_lines)]
 pub(super) fn workspace(
     staged: &super::super::StagedBundle,
     target: &Target<'_>,
     landing: &Landing<'_>,
     place: &Place<'_>,
-    advance: bool,
+    advance: Option<&str>,
 ) -> Result<Applied> {
     let worktree = place.worktree;
     let source = place.source;
@@ -729,8 +730,9 @@ pub(super) fn workspace(
         landing,
     )? {
         Found::Equal(ledger) => *ledger,
-        Found::Differs(_) if advance && !landing.beside => {
-            return super::advance::workspace(staged, landing, place, &scratch, &meta);
+        Found::Differs(_) if advance.is_some() && !landing.beside => {
+            let suffix = advance.unwrap_or_default();
+            return super::advance::workspace(staged, landing, place, (&scratch, &meta), suffix);
         }
         Found::Differs(_) => return Err(BulkloadRefusal::GitDestinationDiverged),
     };

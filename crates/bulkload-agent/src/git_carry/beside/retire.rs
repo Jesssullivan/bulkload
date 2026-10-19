@@ -14,7 +14,9 @@
 //! - every entry under the beside checkout (its `.git` aside), tracked,
 //!   untracked or ignored, held by the live tree at the same path with the
 //!   same kind, the same bytes (or link target) and the same executable
-//!   bit; a bulkload hand-off block at byte 0 of `AGENTS.md` or
+//!   bit, or, for a captured file the live checkout keeps as its own
+//!   ignored file, at the file-level beside `<path>SUFFIX` the advance
+//!   landed; a bulkload hand-off block at byte 0 of `AGENTS.md` or
 //!   `CLAUDE.md`, sealed as estate-handoff renders it, is the one
 //!   difference allowed (either side);
 //! - every tracked or untracked file of the live tree that is not ignored
@@ -265,7 +267,9 @@ fn same_bytes(a: &Path, b: &Path, targets: bool) -> Result<bool> {
 
 // Why the entry `entry` of the beside checkout is not held by the live
 // tree at `live`; `None` when it is.
-fn entry_differs(beside: &Path, live: &Path, entry: &Entry) -> Result<Option<String>> {
+// A kept captured file the advance landed as a file-level beside
+// (`<path>SUFFIX`, `left`) is held there.
+fn entry_differs(beside: &Path, live: &Path, entry: &Entry, left: &Left) -> Result<Option<String>> {
     const SITE: &str = "git_carry::beside::retire::entry";
     let shown = || entry.relative.escape_ascii().to_string();
     let name = entry
@@ -296,21 +300,34 @@ fn entry_differs(beside: &Path, live: &Path, entry: &Entry) -> Result<Option<Str
             };
         return Ok((!created).then(|| format!("missing:{}", shown())));
     };
-    let meta = &entry.meta;
-    let same = if meta.is_dir() {
-        there.is_dir()
-    } else if meta.file_type().is_symlink() {
-        there.file_type().is_symlink()
-            && fs::read_link(beside.join(relative)).refuse_at(SITE)?
-                == fs::read_link(live.join(relative)).refuse_at(SITE)?
-    } else if meta.is_file() {
-        there.is_file()
-            && (meta.mode() & 0o111 == 0) == (there.mode() & 0o111 == 0)
-            && same_bytes(&beside.join(relative), &live.join(relative), target)?
-    } else {
-        false
+    let held = |at: &Path, there: &fs::Metadata| -> Result<bool> {
+        let meta = &entry.meta;
+        Ok(if meta.is_dir() {
+            there.is_dir()
+        } else if meta.file_type().is_symlink() {
+            there.file_type().is_symlink()
+                && fs::read_link(beside.join(relative)).refuse_at(SITE)?
+                    == fs::read_link(at).refuse_at(SITE)?
+        } else if meta.is_file() {
+            there.is_file()
+                && (meta.mode() & 0o111 == 0) == (there.mode() & 0o111 == 0)
+                && same_bytes(&beside.join(relative), at, target)?
+        } else {
+            false
+        })
     };
-    Ok((!same).then(|| format!("differs:seat={}", shown())))
+    if held(&live.join(relative), &there)? {
+        return Ok(None);
+    }
+    if let Some(file_beside) = left.beside_of(&entry.relative) {
+        let at = live.join(OsStr::from_bytes(&file_beside));
+        if let Some(there) = lstat(&at)? {
+            if held(&at, &there)? {
+                return Ok(None);
+            }
+        }
+    }
+    Ok(Some(format!("differs:seat={}", shown())))
 }
 
 // The commits a reflog file names (each line's new value), when it exists.
@@ -517,7 +534,7 @@ pub fn differs(
     }
     let entries = walk(beside, false)?;
     for entry in &entries {
-        if let Some(why) = entry_differs(beside, live, entry)? {
+        if let Some(why) = entry_differs(beside, live, entry, left)? {
             return Ok(Some(why));
         }
     }
@@ -540,6 +557,7 @@ pub fn differs(
         // staged) is the index's, compared above.
         if !held.contains(path)
             && !left.own_untracked(path)
+            && !left.is_file_beside(path)
             && lstat(&live.join(OsStr::from_bytes(path)))?.is_some()
         {
             return Ok(Some(format!("extra:{}", path.escape_ascii())));

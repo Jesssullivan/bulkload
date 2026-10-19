@@ -136,7 +136,8 @@ the advanced checkout's filters), `converge/adopt.rs`, `beside.rs`,
    brief's points: after the branch CAS (`after_branch`), mid-materialize
    (`after_seat:3`), after checkout (`after_index`: tree, working changes
    and index all in place, no ledger).
-2. **Ignored entries where the capture lands a seat it does not track** are
+2. *(Changed by the coordinator, see "Coordinator decisions" below.)*
+   **Ignored entries where the capture lands a seat it does not track** are
    left to the live checkout (counted, recorded, never in the ledger),
    rather than refusing the advance. Host-specific ignored entries
    (`bazel-*` and `result` links, `.claude/settings.local.json`, `.env`)
@@ -167,7 +168,8 @@ the advanced checkout's filters), `converge/adopt.rs`, `beside.rs`,
    sits under the tracked `docs/agent-notes/`), which the coordinator wants
    advanced; this reading needs the coordinator's sign-off. Gitlinks are
    never a collision (a submodule's directory is the live checkout's).
-7. **A live ignored directory takes only the capture's tracked files.**
+7. *(Withdrawn, see "Coordinator decisions" below.)*
+   **A live ignored directory takes only the capture's tracked files.**
    Where the capture holds a directory the live checkout holds as an
    ignored one, the capture's tracked files under it land (the checkout is
    wrong without them) and what the capture does not track there is left,
@@ -177,7 +179,8 @@ the advanced checkout's filters), `converge/adopt.rs`, `beside.rs`,
    (adopted by A11a) is this item's by proof, as #282 defines it, and so
    retirable once proved equal; a foreign one (`GIT_BESIDE_FOREIGN`) is
    kept (`refused:GIT_BESIDE_FOREIGN`).
-9. **A beside kept after an advance does not hold the closure gate.** It is
+9. *(Changed by the coordinator, see "Coordinator decisions" below.)*
+   **A beside kept after an advance does not hold the closure gate.** It is
    closure-visible (`advance.beside=kept`, `reason`) but the row stays
    `applied`: the ruling says to keep it until proved equal, which this
    does; whether a kept beside should be pending review (R4, duplicates)
@@ -253,13 +256,46 @@ One adversarial read-only review (a refuter subagent, nothing run) at
 | 13 | a kept beside counts `applied` | decision 9 above (operator's call) |
 | 14 | the admin removal compared a spelling of the path | fixed: bound to the `gitdir` bytes recorded at the proof |
 
+## Coordinator decisions on the sign-offs (2026-10-19, on #289)
+
+From the standing rulings (no duplicate bytes on sting; nothing excluded;
+every outcome visible):
+
+1. **Accepted**: an untracked directory under a directory the capture
+   tracks does not collide (decision 6).
+2. **Changed** (decision 2 above): an ignored-vs-untracked *file* conflict
+   no longer keeps the whole beside tree. The capture's file (or link) at
+   that path lands as a file-level beside `<path>SUFFIX`, create-only
+   (through the seat engine, numbered after the delta so a settle names it
+   the same; present when it already holds the captured version; left
+   kept when something else holds it), counted (`advance-file-besides`,
+   closure `file_besides`), and the retirement proof accepts it in place
+   of the path. A kept *directory* (a live ignored file where the capture
+   holds a directory) still keeps the beside tree: that subtree reconcile
+   is the hook for the beside-only-unique lane (`Left.kept` minus
+   `Left.besides` is exactly what is left for it).
+3. **Accepted**: live-only untracked files the advance left alone are not a
+   difference (decision 3).
+4. **Changed** (decision 9 above): a beside kept after an advance is a
+   duplicate: closure holds the item `refused-pending-review` with the new
+   code `GIT_ADVANCE_BESIDE_KEPT` (carrying the reason), dispositionable.
+
+Also done: `estate-diff --advance-ancestor` (and `estate-move --plan-only`
+with the flag) previews the advance read-only (`adopt:"advance"`, or
+`diverged` with `advance-refused=<CODE>`), so a plan never reports an
+advance as a beside landing. And decision 7 above is withdrawn under
+"nothing excluded": what the capture holds under a live ignored directory
+lands entry by entry where the path is free (never over a live file; an
+occupied one is a kept file, landing as a file-level beside).
+
 ## Open
 
-- **`estate-diff` does not preview the advance**: a live ancestor still
-  reads `adopt=diverged` (and `beside=...`) in `estate-move --plan-only`.
-  The proof is read-only and could be run there; not built.
-- **A beside kept after an advance stays** until the operator removes it:
-  later passes converge the live checkout and never revisit the beside.
+- **A beside kept after an advance stays** until the operator disposes it
+  (`GIT_ADVANCE_BESIDE_KEPT`, pending review): later passes converge the
+  live checkout and never revisit the beside.
+- **Kept directories** (a live ignored file or link where the capture holds
+  a directory) still keep the beside tree: the file-level reconcile of such
+  subtrees is the beside-only-unique lane's.
 - **Sessions with their cwd in a retired beside**: the retirement renames
   and deletes the directory once it is proved equal (no write there since
   the proof, checked by prints after the rename); a shell sitting there is
