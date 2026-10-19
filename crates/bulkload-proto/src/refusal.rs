@@ -33,6 +33,22 @@ pub enum BulkloadRefusal {
     /// and nothing is remembered for it; the next pass walks the source as
     /// it is then. Was a bare `IO` (errno 2), which no review can close.
     SourceVanished,
+    /// The source root the verb was given does not exist (`ENOENT` at the
+    /// root itself, #232). Nothing is served or recorded. It is the whole
+    /// session's refusal, so over a wire it reaches the destination only
+    /// through the source's stderr. Was a bare `IO` (errno 2).
+    SourceRootMissing,
+    /// The source root exists but could not be resolved or opened as a
+    /// root (#232): an unsearchable parent (`EACCES`), a symlink loop
+    /// (`ELOOP`), or any other failure of the root open. Carries the OS
+    /// errno when known. A seat *beneath* a root keeps its own refusal.
+    SourceRootUnreadable(Option<i32>),
+    /// The source root is not the kind the verb was given (#232): a regular
+    /// file where a tree was named (`copy`/`pull` without `--file`), or a
+    /// directory, symlink or special file where `--file` named one regular
+    /// file. The destination raises it too when its `--file` session is
+    /// offered anything but one regular row.
+    SourceRootKindMismatch,
     /// A capture recorded drift under its pass, so it does not hold every
     /// seat's bytes; apply refuses it until a later pass extends it clean.
     CaptureDrifted,
@@ -341,6 +357,17 @@ pub enum BulkloadRefusal {
     /// WP0(d), OI-1003-Q18, #187). The Git carry's occupied destinations
     /// keep `GIT_DESTINATION_OCCUPIED`.
     DestinationOccupied,
+    /// The destination's parent directory is absent (#232). `copy` and
+    /// `pull` create an absent DEST itself (mode 0700) when its parent
+    /// exists, and never a parent: the operator named DEST, not the path
+    /// above it. Nothing is written.
+    DestinationParentMissing,
+    /// The destination path holds the wrong kind of node for the verb
+    /// (#232): a directory where `--file` would land one regular file, or a
+    /// regular or special file where a tree would land. Nothing is written
+    /// and nothing is replaced; a file at DEST that differs from a `--file`
+    /// source is `DESTINATION_OCCUPIED`, as in a tree.
+    DestinationKindMismatch,
     /// A changed seat's output is this store's own, but its file system has
     /// no atomic exchange of two names (`renameat2(RENAME_EXCHANGE)`,
     /// `renameatx_np(RENAME_SWAP)`), the one call a superseding publish
@@ -493,6 +520,9 @@ impl BulkloadRefusal {
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
             Self::SourceChangedAfterSnapshot => "SOURCE_CHANGED_AFTER_SNAPSHOT",
             Self::SourceVanished => "SOURCE_VANISHED",
+            Self::SourceRootMissing => "SOURCE_ROOT_MISSING",
+            Self::SourceRootUnreadable(_) => "SOURCE_ROOT_UNREADABLE",
+            Self::SourceRootKindMismatch => "SOURCE_ROOT_KIND_MISMATCH",
             Self::CaptureDrifted => "CAPTURE_DRIFTED",
             Self::CaptureAbsent => "CAPTURE_ABSENT",
             Self::DigestMismatch => "DIGEST_MISMATCH",
@@ -554,6 +584,8 @@ impl BulkloadRefusal {
             Self::DestinationSpaceInsufficient => "DESTINATION_SPACE_INSUFFICIENT",
             Self::SpaceExhausted(_) => "SPACE_EXHAUSTED",
             Self::DestinationOccupied => "DESTINATION_OCCUPIED",
+            Self::DestinationParentMissing => "DESTINATION_PARENT_MISSING",
+            Self::DestinationKindMismatch => "DESTINATION_KIND_MISMATCH",
             Self::DestinationExchangeUnsupported => "DESTINATION_EXCHANGE_UNSUPPORTED",
             Self::SalvageBoundExceeded => "SALVAGE_BOUND_EXCEEDED",
             Self::FrameCodec => "FRAME_CODEC",
@@ -591,6 +623,9 @@ impl BulkloadRefusal {
         "SNAPSHOT_ROOTS_OVERLAP",
         "SOURCE_CHANGED_AFTER_SNAPSHOT",
         "SOURCE_VANISHED",
+        "SOURCE_ROOT_MISSING",
+        "SOURCE_ROOT_UNREADABLE",
+        "SOURCE_ROOT_KIND_MISMATCH",
         "CAPTURE_DRIFTED",
         "CAPTURE_ABSENT",
         "DIGEST_MISMATCH",
@@ -652,6 +687,8 @@ impl BulkloadRefusal {
         "DESTINATION_SPACE_INSUFFICIENT",
         "SPACE_EXHAUSTED",
         "DESTINATION_OCCUPIED",
+        "DESTINATION_PARENT_MISSING",
+        "DESTINATION_KIND_MISMATCH",
         "DESTINATION_EXCHANGE_UNSUPPORTED",
         "SALVAGE_BOUND_EXCEEDED",
         "FRAME_CODEC",
@@ -690,6 +727,9 @@ impl fmt::Display for BulkloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Io(Some(errno)) => write!(f, "IO (errno {errno})"),
+            Self::SourceRootUnreadable(Some(errno)) => {
+                write!(f, "{} (errno {errno})", self.code())
+            }
             Self::SqliteBackupFailed(Some(code)) => {
                 write!(f, "{} (sqlite code {code})", self.code())
             }
@@ -853,6 +893,9 @@ mod tests {
             BulkloadRefusal::SnapshotRootsOverlap,
             BulkloadRefusal::SourceChangedAfterSnapshot,
             BulkloadRefusal::SourceVanished,
+            BulkloadRefusal::SourceRootMissing,
+            BulkloadRefusal::SourceRootUnreadable(None),
+            BulkloadRefusal::SourceRootKindMismatch,
             BulkloadRefusal::CaptureDrifted,
             BulkloadRefusal::CaptureAbsent,
             BulkloadRefusal::DigestMismatch,
@@ -914,6 +957,8 @@ mod tests {
             BulkloadRefusal::DestinationSpaceInsufficient,
             BulkloadRefusal::SpaceExhausted(None),
             BulkloadRefusal::DestinationOccupied,
+            BulkloadRefusal::DestinationParentMissing,
+            BulkloadRefusal::DestinationKindMismatch,
             BulkloadRefusal::DestinationExchangeUnsupported,
             BulkloadRefusal::SalvageBoundExceeded,
             BulkloadRefusal::FrameCodec,

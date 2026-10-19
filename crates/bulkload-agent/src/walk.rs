@@ -444,6 +444,41 @@ impl<'root> Walker<'root> {
         Self::with_limits(root, cross_device, WalkLimits::DEFAULT)
     }
 
+    /// A walk beneath `root`, a directory descriptor, that visits only the
+    /// one entry `name` (#232): the single-file source of `copy --file` and
+    /// `pull --file`. The directory is not listed, so nothing beside `name`
+    /// is seen, a `-wal` of a database so named included; `name` is stat'ed
+    /// and yielded as in any walk (a seat gone between the caller's stat and
+    /// this one is `SOURCE_VANISHED`). The caller has checked the kind it
+    /// wants; a directory here would be descended into like any other.
+    ///
+    /// # Errors
+    /// Refuses with the `fstat` or reopen failure of the root.
+    pub fn single_seat(
+        root: BorrowedFd<'root>,
+        name: &CStr,
+        cross_device: bool,
+    ) -> Result<Self> {
+        let root_dev = sys::fstat(root).refuse_at("walk::single_seat")?.node.dev;
+        let dir = sys::open_dir_at(root, c".").refuse_at("walk::single_seat")?;
+        Ok(Self {
+            root_dev,
+            cross_device,
+            limits: WalkLimits::DEFAULT,
+            stack: vec![Level {
+                dir,
+                prefix_len: 0,
+                names: vec![name.to_owned()],
+                next: 0,
+            }],
+            path: Vec::new(),
+            ready: VecDeque::new(),
+            directories_listed: 1,
+            sqlite: false,
+            _root: root,
+        })
+    }
+
     /// [`Walker::new`] within `limits`.
     ///
     /// # Errors

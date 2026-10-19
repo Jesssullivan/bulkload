@@ -192,7 +192,7 @@ fn a_receiver_without_the_hand_off_refuses_a_handed_frame() {
             let input = sender.try_clone().unwrap();
             let closer = sender.try_clone().unwrap();
             let mut sender = sender;
-            let served = serve_session(input, &mut sender, Some(hand));
+            let served = serve_session(input, &mut sender, Some(hand), RootKind::Tree);
             let _ = closer.shutdown(std::net::Shutdown::Both);
             served
         });

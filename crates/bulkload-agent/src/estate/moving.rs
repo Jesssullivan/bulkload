@@ -55,7 +55,10 @@ pub struct Note {
     /// `symlink` (not followed), `not-git` (plain files directly in a
     /// directory the walk descended; `count` of them), `prunable` (a
     /// registered worktree whose directory is gone), `unreadable` (Git
-    /// refused to list the repository's worktrees; `code`).
+    /// refused to list the repository's worktrees, or a root or entry
+    /// could not be read; `code`), `source-vanished` (a `SOURCE_ROOT` that
+    /// was gone when the pass reached it, #277; `code`
+    /// `SOURCE_ROOT_MISSING`).
     pub what: &'static str,
     pub count: u64,
     pub code: Option<&'static str>,
@@ -110,8 +113,33 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
     const SITE: &str = "estate::moving::walk";
     let mut found = Vec::new();
     let mut notes = Vec::new();
+    let mut usable = 0_usize;
+    let mut first_refusal = None;
     for root in roots {
-        let root = fs::canonicalize(root).refuse_at(SITE)?;
+        // #277: the source is live (S5, Q152), so a root listed moments ago
+        // may be gone or unreadable by the time the pass reaches it. That is
+        // a typed note the pass continues past, never the whole pass's
+        // refusal; only a pass with no usable root at all refuses, with
+        // the first root's refusal.
+        let root = match fs::canonicalize(root) {
+            Ok(root) => root,
+            Err(error) => {
+                let refusal = crate::refuse::source_root(&error, SITE);
+                notes.push(if refusal == BulkloadRefusal::SourceRootMissing {
+                    Note {
+                        path: root.clone(),
+                        what: "source-vanished",
+                        count: 1,
+                        code: Some(refusal.code()),
+                    }
+                } else {
+                    unreadable(root.clone(), &refusal)
+                });
+                first_refusal.get_or_insert(refusal);
+                continue;
+            }
+        };
+        usable += 1;
         let mut stack = vec![root];
         while let Some(directory) = stack.pop() {
             if git_directory(&directory) {
@@ -166,6 +194,11 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
                     code: None,
                 });
             }
+        }
+    }
+    if usable == 0 {
+        if let Some(refusal) = first_refusal {
+            return Err(refusal);
         }
     }
     Ok((found, notes))
@@ -963,6 +996,42 @@ mod tests {
         assert_eq!(
             inventory(&[PathBuf::from("git")], &[]),
             Err(BulkloadRefusal::PathNotAbsolute)
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // #277: a root gone by the time the pass reaches it is a typed note and
+    // the pass continues with the rest; only no usable root at all refuses.
+    #[test]
+    fn a_vanished_root_is_a_note_and_the_pass_continues() {
+        let base = base("vanished");
+        let live = base.join("live");
+        fs::create_dir_all(live.join("repo")).unwrap();
+        git(&live.join("repo"), &["init", "--quiet", "--template="]);
+        let gone = base.join("gone");
+        let found = inventory(&[gone.clone(), live.clone()], &[]).unwrap();
+        assert_eq!(
+            found
+                .items
+                .iter()
+                .map(|planned| planned.item.source.clone())
+                .collect::<Vec<_>>(),
+            vec![live.join("repo")],
+            "{found:?}"
+        );
+        assert!(
+            found.notes.contains(&Note {
+                path: gone.clone(),
+                what: "source-vanished",
+                count: 1,
+                code: Some("SOURCE_ROOT_MISSING"),
+            }),
+            "{:?}",
+            found.notes
+        );
+        assert_eq!(
+            inventory(&[gone, base.join("also-gone")], &[]),
+            Err(BulkloadRefusal::SourceRootMissing)
         );
         fs::remove_dir_all(&base).unwrap();
     }
