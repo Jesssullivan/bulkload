@@ -184,6 +184,18 @@ pub enum BulkloadRefusal {
     /// content. Nothing is imported or written; the destination's work is
     /// never claimed (accept keeps it, re-carry lands it elsewhere).
     GitDestinationDiverged,
+    /// `estate-apply --adopt --beside SUFFIX` (gap C12, operator ruling
+    /// A-115): the beside path `<workspace>SUFFIX` holds something this
+    /// item can neither converge nor adopt: not this item's own beside
+    /// landing, not a landing of another item that re-keys to it (A11b),
+    /// and not a standalone checkout that proves equal to the capture
+    /// (A11a: HEAD, the index, the exclude, the stash and every carried
+    /// seat, with a bulkload hand-off block at byte 0 of `AGENTS.md` or
+    /// `CLAUDE.md` the one difference allowed). Nothing at the beside path
+    /// is written, moved or deleted, and the item's refs still go in under
+    /// `refs/<ns>/` (`--refs-in`). Carries the beside path, raw bytes;
+    /// [`fmt::Display`] prints it escaped.
+    GitBesideForeign(Vec<u8>),
     /// Between the capture a checkout holds and the current one, the source
     /// changed what converge does not carry: the shallow frontier, nested
     /// repository custody, the omitted rebuildable roots or bareness.
@@ -558,6 +570,7 @@ impl BulkloadRefusal {
             Self::GitDestinationOccupied => "GIT_DESTINATION_OCCUPIED",
             Self::GitDestinationModified => "GIT_DESTINATION_MODIFIED",
             Self::GitDestinationDiverged => "GIT_DESTINATION_DIVERGED",
+            Self::GitBesideForeign(_) => "GIT_BESIDE_FOREIGN",
             Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
             Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
             Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
@@ -662,6 +675,7 @@ impl BulkloadRefusal {
         "GIT_DESTINATION_OCCUPIED",
         "GIT_DESTINATION_MODIFIED",
         "GIT_DESTINATION_DIVERGED",
+        "GIT_BESIDE_FOREIGN",
         "HANDOFF_NOT_LANDED",
         "HANDOFF_TARGET_UNSUPPORTED",
         "HANDOFF_BLOCK_MODIFIED",
@@ -755,6 +769,7 @@ impl fmt::Display for BulkloadRefusal {
             | Self::GitNestWorktreeMoved(ref path)
             | Self::GitSourceAlternates(ref path)
             | Self::MoveStateBusy(ref path)
+            | Self::GitBesideForeign(ref path)
             | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
             }
@@ -934,6 +949,7 @@ mod tests {
             BulkloadRefusal::GitDestinationOccupied,
             BulkloadRefusal::GitDestinationModified,
             BulkloadRefusal::GitDestinationDiverged,
+            BulkloadRefusal::GitBesideForeign(Vec::new()),
             BulkloadRefusal::HandoffNotLanded,
             BulkloadRefusal::HandoffTargetUnsupported,
             BulkloadRefusal::HandoffBlockModified,
@@ -1041,6 +1057,10 @@ mod tests {
         assert_eq!(
             BulkloadRefusal::GitNestWorktreeMoved(b"wt/after".to_vec()).to_string(),
             "GIT_NEST_WORKTREE_MOVED path=\"wt/after\""
+        );
+        assert_eq!(
+            BulkloadRefusal::GitBesideForeign(b"/git/GF.neo-20261016".to_vec()).to_string(),
+            "GIT_BESIDE_FOREIGN path=\"/git/GF.neo-20261016\""
         );
     }
 

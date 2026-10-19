@@ -1514,6 +1514,18 @@ scenarios! {
     estate_apply_beside_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::Beside;
     estate_apply_beside_refs => EstateApplyBesideRefs: 1, EstateAdopt::Beside;
     estate_apply_beside_stale_capture => EstateConvergeLinkedAdded: 1, EstateAdopt::BesideStale;
+    // Gap C12 (A-115): a beside landing's converge to a newer capture,
+    // crashed after its intent, a seat, the index and HEAD, each settled
+    // forward by the rerun with no native ref of the live repository moved.
+    estate_apply_beside_converge_after_intent => EstateConvergeAfterIntent: 1, EstateAdopt::BesideConverge;
+    estate_apply_beside_converge_after_seat => EstateConvergeAfterSeat: 1, EstateAdopt::BesideConverge;
+    estate_apply_beside_converge_after_index => EstateConvergeAfterIndex: 1, EstateAdopt::BesideConverge;
+    estate_apply_beside_converge_after_head => EstateConvergeAfterHead: 1, EstateAdopt::BesideConverge;
+    // Review of #282, F6: a hand plan's standalone landing at the beside
+    // path, re-keyed by this item, its converge crashed.
+    estate_apply_beside_rekey_after_intent => EstateConvergeAfterIntent: 1, EstateAdopt::BesideRekey;
+    estate_apply_beside_rekey_after_seat => EstateConvergeAfterSeat: 1, EstateAdopt::BesideRekey;
+    estate_apply_beside_rekey_after_head => EstateConvergeAfterHead: 1, EstateAdopt::BesideRekey;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;
