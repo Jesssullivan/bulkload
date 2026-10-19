@@ -383,17 +383,21 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
         "{}",
         converged.stdout
     );
-    // The new pass recaptured `diverged` too, and a beside landing never
-    // converges to a newer capture (#266): it is refused pending review,
-    // its beside checkout and the live one left as they were. Everything
-    // else accounts as before.
+    // The new pass recaptured `diverged` too, and its beside landing
+    // converges to the new capture (gap C12, A-115: a beside landing used
+    // to refuse every later pass `GIT_DESTINATION_OCCUPIED`): the live
+    // checkout and its refs as they were, the beside checkout still
+    // detached at the captured head. Everything accounts as before.
+    assert!(
+        converged.stdout.contains("beside-converged=1"),
+        "{}",
+        converged.stdout
+    );
     let mut want = first;
-    want.insert("applied_beside".to_owned(), "0".to_owned());
-    want.insert("refused_pending_review".to_owned(), "2".to_owned());
     let mut got = closure(&converged.stdout);
     assert!(
         got.remove("refusals")
-            .is_some_and(|codes| codes.contains("GIT_DESTINATION_OCCUPIED:2")),
+            .is_some_and(|codes| codes.contains("GIT_DESTINATION_OCCUPIED:1")),
         "{}",
         converged.stdout
     );
@@ -403,7 +407,19 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
         git(&dst.join("diverged"), &["rev-parse", "HEAD"]),
         diverged_head
     );
-    assert!(dst.join(format!("diverged.{LABEL}/d.txt")).is_file());
+    for line in diverged_refs.lines() {
+        assert!(
+            refs(&dst.join("diverged")).contains(line),
+            "native ref moved: {line}"
+        );
+    }
+    let beside = dst.join(format!("diverged.{LABEL}"));
+    assert!(beside.join("d.txt").is_file());
+    assert_eq!(
+        git(&beside, &["rev-parse", "HEAD"]),
+        git(&src.join("diverged"), &["rev-parse", "HEAD"])
+    );
+    assert_eq!(git(&beside, &["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD");
     assert_eq!(
         git(&same, &["rev-parse", &format!("refs/{LABEL}/heads/topic")]),
         src_topic
