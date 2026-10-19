@@ -207,6 +207,10 @@ fn estate(world: &World, unreadable: bool) -> (PathBuf, PathBuf) {
     std::os::unix::fs::symlink("../a.txt", src.join("archive/sub/link-in")).unwrap();
     // A symlink beside the repositories.
     std::os::unix::fs::symlink("lab", src.join("lab-link")).unwrap();
+    // Past the racy window (#86), so the first pass records every capture
+    // and an unchanged rerun can show 0 source reads, however loaded the
+    // host is.
+    bulkload_agent::transfer::settle_racy_window(&src).unwrap();
     if unreadable {
         fs::create_dir(src.join("locked")).unwrap();
         fs::write(src.join("locked/secret.txt"), b"x\n").unwrap();
