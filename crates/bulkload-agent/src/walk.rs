@@ -454,10 +454,11 @@ impl<'root> Walker<'root> {
     /// beside it (one `fstatat` each), so a [`Walker::with_sqlite`] walk
     /// still keys a database by its `-wal`'s identity (#218: a WAL commit
     /// leaves the main file untouched); only `name` is visited, so no
-    /// sidecar is ever offered. `name` is stat'ed and yielded as in any
-    /// walk (gone since the caller's stat: `SOURCE_VANISHED`). The caller
-    /// has checked the kind it wants; a directory here would be descended
-    /// into like any other.
+    /// sidecar is ever offered. `name` is stat'ed without following it and
+    /// yielded as in any walk: a regular file as a row, a symlink as a row
+    /// with its literal target, an absent name as `SOURCE_VANISHED`, and a
+    /// directory or special file as `SOURCE_ROOT_KIND_MISMATCH`, never
+    /// entered.
     ///
     /// # Errors
     /// Refuses with the `fstat` or reopen failure of the root.
@@ -577,6 +578,12 @@ impl<'root> Walker<'root> {
             return Visit::Skip;
         }
         let kind = kind_of(&stat);
+        // A single-seat walk (#232) carries one regular file or one symlink
+        // (as a link, R1); anything else at the name is not the kind the
+        // verb was given, refused typed and never entered (#283 review 1).
+        if self.only.is_some() && !matches!(kind, FileKind::Regular | FileKind::Symlink) {
+            return refuse(rel_path, BulkloadRefusal::SourceRootKindMismatch);
+        }
         // Engine temporaries are matched before either cap (#129): one is
         // recorded, never carried, so its depth or length refuses nothing.
         if kind == FileKind::Regular && temporary_kind(name.to_bytes()) == Some(FileKind::Regular) {

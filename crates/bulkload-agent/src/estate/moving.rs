@@ -56,9 +56,10 @@ pub struct Note {
     /// directory the walk descended; `count` of them), `prunable` (a
     /// registered worktree whose directory is gone), `unreadable` (Git
     /// refused to list the repository's worktrees, or a root or entry
-    /// could not be read; `code`), `source-vanished` (a `SOURCE_ROOT` that
-    /// was gone when the pass reached it, #277; `code`
-    /// `SOURCE_ROOT_MISSING`).
+    /// could not be read; `code`, typed for a root:
+    /// `SOURCE_ROOT_UNREADABLE`), `source-vanished` (a `SOURCE_ROOT` gone
+    /// when the pass reached it, `SOURCE_ROOT_MISSING`, #277; or a name
+    /// beneath one gone mid-walk, `SOURCE_VANISHED`).
     pub what: &'static str,
     pub count: u64,
     pub code: Option<&'static str>,
@@ -125,24 +126,16 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
             Ok(root) => root,
             Err(error) => {
                 let refusal = crate::refuse::source_root(&error, SITE);
-                notes.push(if refusal == BulkloadRefusal::SourceRootMissing {
-                    Note {
-                        path: root.clone(),
-                        what: "source-vanished",
-                        count: 1,
-                        code: Some(refusal.code()),
-                    }
-                } else {
-                    unreadable(root.clone(), &refusal)
-                });
+                notes.push(typed_note(root.clone(), &refusal));
                 first_refusal.get_or_insert(refusal);
                 continue;
             }
         };
-        usable += 1;
-        let mut stack = vec![root];
+        let mut stack = vec![root.clone()];
         while let Some(directory) = stack.pop() {
+            let is_root = directory == root;
             if git_directory(&directory) {
+                usable += usize::from(is_root);
                 found.push(directory);
                 continue;
             }
@@ -155,10 +148,27 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
                         .map(|entry| entry.map(|entry| entry.path()))
                         .collect()
                 });
+            // The root itself (mode 000, or gone since it was resolved) is
+            // the root's typed refusal and leaves the root unusable; a
+            // directory beneath it gone since its listing is
+            // `SOURCE_VANISHED` (#283 review 5). Any other failure beneath
+            // the root keeps its errno (per-seat typing is gap C5's).
             let mut entries = match listed {
-                Ok(entries) => entries,
+                Ok(entries) => {
+                    usable += usize::from(is_root);
+                    entries
+                }
+                Err(error) if is_root => {
+                    let refusal = crate::refuse::source_root(&error, SITE);
+                    notes.push(typed_note(directory, &refusal));
+                    first_refusal.get_or_insert(refusal);
+                    continue;
+                }
                 Err(error) => {
-                    notes.push(unreadable(directory, &crate::refuse::io(&error, SITE)));
+                    notes.push(typed_note(
+                        directory,
+                        &crate::refuse::source_seat(&error, SITE),
+                    ));
                     continue;
                 }
             };
@@ -166,10 +176,11 @@ fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
             let mut plain = 0u64;
             // Pushed in reverse so the walk visits names in order.
             for path in entries.into_iter().rev() {
+                // Listed and gone before its stat: `SOURCE_VANISHED`.
                 let meta = match fs::symlink_metadata(&path) {
                     Ok(meta) => meta,
                     Err(error) => {
-                        notes.push(unreadable(path, &crate::refuse::io(&error, SITE)));
+                        notes.push(typed_note(path, &crate::refuse::source_seat(&error, SITE)));
                         continue;
                     }
                 };
@@ -210,6 +221,24 @@ const fn unreadable(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
         what: "unreadable",
         count: 1,
         code: Some(refusal.code()),
+    }
+}
+
+/// A walk refusal as a note: a root or entry that is gone (`ENOENT`) is
+/// `source-vanished`, anything else `unreadable`; each keeps its typed code.
+const fn typed_note(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
+    if matches!(
+        refusal,
+        BulkloadRefusal::SourceRootMissing | BulkloadRefusal::SourceVanished
+    ) {
+        Note {
+            path,
+            what: "source-vanished",
+            count: 1,
+            code: Some(refusal.code()),
+        }
+    } else {
+        unreadable(path, refusal)
     }
 }
 
@@ -1041,6 +1070,59 @@ mod tests {
             inventory(&[gone, base.join("also-gone")], &[]),
             Err(BulkloadRefusal::SourceRootMissing)
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // #283 review 5: a root that cannot be listed (mode 000) is typed and
+    // unusable, the pass continues with the rest; a root that holds no
+    // repository is usable and yields nothing; every walk refusal keeps its
+    // typed code in its note.
+    #[test]
+    fn unreadable_and_empty_roots_are_typed_notes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = base("rootkinds");
+        let live = base.join("live");
+        fs::create_dir_all(live.join("repo")).unwrap();
+        git(&live.join("repo"), &["init", "--quiet", "--template="]);
+        let empty = base.join("empty");
+        fs::create_dir_all(empty.join("plain")).unwrap();
+        fs::write(empty.join("plain/f.txt"), b"f\n").unwrap();
+        let locked = base.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&locked).is_ok();
+        let found = inventory(&[locked.clone(), empty.clone(), live], &[]);
+        let found_empty = inventory(std::slice::from_ref(&empty), &[]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.items.len(), 1, "{found:?}");
+        if !readable {
+            assert!(
+                found.notes.contains(&Note {
+                    path: locked,
+                    what: "unreadable",
+                    count: 1,
+                    code: Some("SOURCE_ROOT_UNREADABLE"),
+                }),
+                "{:?}",
+                found.notes
+            );
+        }
+        let found_empty = found_empty.unwrap();
+        assert!(found_empty.items.is_empty());
+        assert!(found_empty.notes.iter().any(|note| note.what == "not-git"));
+        for (refusal, what) in [
+            (BulkloadRefusal::SourceRootMissing, "source-vanished"),
+            (BulkloadRefusal::SourceVanished, "source-vanished"),
+            (
+                BulkloadRefusal::SourceRootUnreadable(Some(13)),
+                "unreadable",
+            ),
+            (BulkloadRefusal::Io(Some(13)), "unreadable"),
+        ] {
+            let note = typed_note(PathBuf::from("/x"), &refusal);
+            assert_eq!((note.what, note.code), (what, Some(refusal.code())));
+        }
         fs::remove_dir_all(&base).unwrap();
     }
 

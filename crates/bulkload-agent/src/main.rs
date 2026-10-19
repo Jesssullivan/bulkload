@@ -38,7 +38,8 @@ SUBCOMMANDS:
                 closure-report --transfer (WP3 PR 4). The S2 overlap checks
                 run before anything is written; a session that ends refused
                 keeps the earlier session's refused rows. --file: SOURCE is
-                one regular file, landed as the file DEST (#232; BOUNDARIES).
+                one file (or symlink, carried as a link), landed as DEST
+                (#232; BOUNDARIES).
                 --beside SUFFIX (plan of record 2026-10-19, C1/C2): land
                 into a live destination. An existing file bulkload did not
                 write is adopted when its bytes are the source's and
@@ -61,8 +62,9 @@ SUBCOMMANDS:
                 copy's; --file as copy's, run on the source as serve --file
     serve [--file]
                 Serve one framed request on stdin/stdout (for SSH). With
-                --file the root the request names is one regular file
-                (pull --file passes it); any other word is refused
+                --file the root the request names is one file or symlink,
+                never followed (pull --file passes it); any other word is
+                refused
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
@@ -633,22 +635,32 @@ BOUNDARIES:
     priority_escalate_after=SECONDS, and priority_escalations,
     priority_escalated_ns, priority_escalated_threads and
     priority_escalation_failures record it.
-    copy/pull make an absent DEST themselves (mode 0700) when its parent
-    exists, and never a parent: DESTINATION_PARENT_MISSING (#232; R2.2, the
-    run writes where it was asked and nowhere else). A regular or special
-    file at DEST where a tree would land is DESTINATION_KIND_MISMATCH, as is
-    a directory at DEST under --file.
-    --file (#232): SOURCE is one regular file and DEST the file it lands as,
-    byte for byte, in DEST's existing parent, under DEST's own name; an
-    identical file at DEST is adopted, a differing one is refused
+    copy/pull make an absent DEST themselves (mode 0755 under the umask, as
+    estate-carry-files makes its destinations) when its parent exists, once
+    the source's root opened, and never a parent:
+    DESTINATION_PARENT_MISSING (#232; R2.2, the run writes where it was
+    asked and nowhere else); a root made for a session whose own setup then
+    refuses is removed while still empty. A symlink at DEST, or a regular or
+    special file where a tree would land, is DESTINATION_KIND_MISMATCH, as
+    is a directory at DEST under --file and a symlink where a regular file
+    lands; no link at DEST is followed.
+    --file (#232): SOURCE is one file and DEST the file it lands as, in
+    DEST's existing parent, under DEST's own name. Only SOURCE's parent is
+    resolved: a regular file is carried byte for byte, a symlink as a
+    symlink with its literal target (never its target's bytes). An
+    identical file or link at DEST is adopted, a differing one is refused
     DESTINATION_OCCUPIED, and an unchanged rerun reads 0 bytes for it, as
-    for a seat in a tree. pull --file runs the source half as serve --file.
-    A source root that is not the kind the verb was given (a file without
-    --file, anything but a regular file with it) is
-    SOURCE_ROOT_KIND_MISMATCH; an absent source root SOURCE_ROOT_MISSING;
-    one that cannot be resolved or opened SOURCE_ROOT_UNREADABLE with its
-    errno. Over ssh those three are the source's whole-session refusal and
-    reach the operator through its stderr; the wire is unchanged (v6).
+    for a seat in a tree; its rows are keyed as a tree session of SOURCE's
+    parent keys them, so a later tree pass of that parent with the same
+    states reuses them. pull --file runs the source half as serve --file.
+    Under --file the leaf is judged by the walk, after the session opened:
+    an absent one is a SOURCE_VANISHED row and a directory or special file
+    a SOURCE_ROOT_KIND_MISMATCH row, each typed in the destination's record.
+    A regular file named without --file is SOURCE_ROOT_KIND_MISMATCH; an
+    absent tree root or --file parent SOURCE_ROOT_MISSING; one that cannot
+    be resolved or opened SOURCE_ROOT_UNREADABLE with its errno. Over ssh
+    those are the source's whole-session refusal and reach the operator
+    through its stderr; the wire is unchanged (v6).
     copy/pull replace only their own untouched outputs, when the source seat
     changed (superseding publish, WP0(d)); any other divergent destination
     file is preserved and refused DESTINATION_OCCUPIED, and remembered: an

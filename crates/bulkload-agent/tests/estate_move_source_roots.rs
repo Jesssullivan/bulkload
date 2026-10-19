@@ -301,3 +301,32 @@ fn the_carry_phase_over_ssh_without_a_serve_directory() {
         fs::remove_dir_all(source_state.join("serve")).unwrap();
     });
 }
+
+// #283 review 5: a first pass whose usable roots hold no repository
+// completes with an empty plan (never `IO (errno 2)` reading a plan that
+// was never written), and its files are counted as not-git.
+#[test]
+fn a_first_pass_with_no_repository_completes_empty() {
+    let world = World::new("norepo");
+    let plain = world.path("plain");
+    fs::create_dir_all(plain.join("d")).unwrap();
+    fs::write(plain.join("d/f.txt"), "f\n").unwrap();
+    let state = world.path("state");
+    let ran = agent(&os(&[&"estate-move-source", &state, &plain]));
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    assert!(
+        ran.stdout
+            .contains("estate-move-source phase=inventory outcome=ok items=0 new=0 planned=0"),
+        "{}",
+        ran.stdout
+    );
+    assert!(ran.stdout.contains(" not_git_files=1 "), "{}", ran.stdout);
+    assert!(
+        ran.stdout
+            .contains("estate-move-source phase=capture outcome=ok captured=0 refused=0"),
+        "{}",
+        ran.stdout
+    );
+    assert!(state.join("carry/plan.postcard").is_file());
+    assert!(state.join("carry/move-source.done").is_file());
+}

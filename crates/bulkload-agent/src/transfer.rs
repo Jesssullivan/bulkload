@@ -691,12 +691,16 @@ struct SourceRoot {
     seat: Option<std::ffi::CString>,
 }
 
-/// Open the canonical source `root` as the `kind` the verb was given.
+/// Open the source `root` as the `kind` the verb was given: a tree's
+/// canonical directory, or a `--file` root's canonical parent with its leaf
+/// as given. A `--file` leaf is not looked at here: the single-seat walk
+/// judges it after `Start`, so a missing leaf is a `SOURCE_VANISHED` row and
+/// a directory or special file a `SOURCE_ROOT_KIND_MISMATCH` row, each
+/// carried typed over the wire to the destination's closure (#283 review 2).
 ///
 /// # Errors
 /// `SOURCE_ROOT_MISSING`, `SOURCE_ROOT_UNREADABLE` (with the errno), or
-/// `SOURCE_ROOT_KIND_MISMATCH` for a regular file named as a tree or a
-/// non-regular node named with `--file`.
+/// `SOURCE_ROOT_KIND_MISMATCH` for a regular file named as a tree.
 fn open_source_root(root: &Path, kind: RootKind) -> Result<SourceRoot> {
     match kind {
         RootKind::Tree => {
@@ -724,12 +728,6 @@ fn open_source_root(root: &Path, kind: RootKind) -> Result<SourceRoot> {
             })?;
             let seat =
                 crate::io::c_name(name.as_bytes()).refuse_at("transfer::open_source_root")?;
-            let found = crate::io::sys::fstatat_nofollow(&fd, &seat).map_err(|error| {
-                crate::refuse::source_root(&error, "transfer::open_source_root")
-            })?;
-            if !found.is_file() {
-                return Err(BulkloadRefusal::SourceRootKindMismatch);
-            }
             Ok(SourceRoot {
                 dir: dir.to_path_buf(),
                 fd,
@@ -750,7 +748,7 @@ struct Landing {
     open: PathBuf,
     /// The one name the session lands, for a `--file` root.
     leaf: Option<Vec<u8>>,
-    /// A tree root that is absent: made (0700) once the S2 checks pass.
+    /// A tree root that is absent: made (0755) once the S2 checks pass.
     create: bool,
 }
 
@@ -793,11 +791,10 @@ fn resolve_destination(destination: &Path, kind: RootKind) -> Result<Landing> {
     };
     match kind {
         RootKind::Tree => match found {
-            // A symlink at DEST resolves here and is refused by the
-            // destination's no-follow open, as before.
-            Some(meta) if !meta.is_dir() && !meta.file_type().is_symlink() => {
-                Err(BulkloadRefusal::DestinationKindMismatch)
-            }
+            // A symlink at DEST (to a directory, a file or nothing) is never
+            // followed: refused typed, before anything is opened or written
+            // (#283 review 3; it was IO errno 20 or 40).
+            Some(meta) if !meta.is_dir() => Err(BulkloadRefusal::DestinationKindMismatch),
             Some(_) => Ok(Landing {
                 dir: std::fs::canonicalize(destination)
                     .refuse_at("transfer::resolve_destination")?,
@@ -848,8 +845,9 @@ fn read_start<R: Read>(input: &mut R, hand: Option<&HandIn>) -> Result<Vec<u8>> 
     Ok(authority)
 }
 
-/// Make an absent destination tree root (#232), mode 0700, in its existing
-/// parent. Only the root the operator named, never a parent (R2.2: the run
+/// Make an absent destination tree root (#232), mode 0755 under the
+/// process umask as `estate-carry-files` makes its destinations (#283
+/// review 6), in its existing parent. Only the root the operator named, never a parent (R2.2: the run
 /// writes where it was asked and nowhere else), and only once the S2 checks
 /// passed, so a refused session makes nothing. Its entry is made durable
 /// before the store that names it opens.
@@ -859,7 +857,7 @@ fn make_destination_root(dir: &Path) -> Result<()> {
     let name = crate::io::c_name(name.as_bytes()).refuse_at("transfer::make_destination_root")?;
     let parent =
         std::fs::File::open(parent_or_dot(dir)).refuse_at("transfer::make_destination_root")?;
-    match crate::io::sys::mkdirat(&parent, &name, 0o700) {
+    match crate::io::sys::mkdirat(&parent, &name, 0o755) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
@@ -931,8 +929,18 @@ fn copy_roots(
     destination_state: &Path,
     kind: RootKind,
 ) -> Result<PathBuf> {
-    let source_root = std::fs::canonicalize(source)
-        .map_err(|error| crate::refuse::source_root(&error, "transfer::copy_roots"))?;
+    // A `--file` root resolves only its parent, as `serve` does: the leaf
+    // is never followed, and a missing one is the walk's typed row.
+    let source_root = match kind {
+        RootKind::Tree => std::fs::canonicalize(source),
+        RootKind::File => {
+            let leaf = source
+                .file_name()
+                .ok_or(BulkloadRefusal::SourceRootKindMismatch)?;
+            std::fs::canonicalize(parent_or_dot(source)).map(|parent| parent.join(leaf))
+        }
+    }
+    .map_err(|error| crate::refuse::source_root(&error, "transfer::copy_roots"))?;
     let landing = resolve_destination(destination, kind)?;
     let destination_root = landing.root();
     if overlaps(&source_root, &destination_root) {
@@ -2382,7 +2390,7 @@ fn serve_session<R: Read + Send + 'static, W: Write>(
     hand: Option<HandOut>,
     kind: RootKind,
 ) -> Result<()> {
-    let (root, state, sqlite, as_root) = read_open(&mut input)?;
+    let (root, state, sqlite, as_root) = read_open(&mut input, kind)?;
     // S2 (WP1 PR 3): refuse before `Store::open` creates the state root, so
     // an overlapping state never writes a byte inside the source.
     if overlaps(&canonical_state(&state)?, &root) {
@@ -2403,9 +2411,13 @@ fn serve_session<R: Read + Send + 'static, W: Write>(
     let opened = open_source_root(&root, kind)?;
     let root_fd = opened.fd;
     let meta = crate::io::sys::fstat(&root_fd).refuse_at("transfer::serve")?;
+    // The authority names the directory walked, with its identity: for a
+    // `--file` root its parent, so a later tree session of that parent with
+    // the same states keys the file's rows alike and reuses them (#283
+    // review 4).
     let authority = postcard::to_stdvec(&(
         store.authority()?,
-        root.as_os_str().as_bytes(),
+        opened.dir.as_os_str().as_bytes(),
         meta.node.dev,
         meta.node.ino,
     ))
@@ -2522,7 +2534,10 @@ fn serve_session<R: Read + Send + 'static, W: Write>(
 /// is before any store is created or anything beneath the root is opened,
 /// and `copy` runs [`serve`] as its source half, so the one check covers
 /// both verbs (R14).
-fn read_open<R: Read>(input: &mut R) -> Result<(PathBuf, PathBuf, SqliteMode, bool)> {
+fn read_open<R: Read>(
+    input: &mut R,
+    kind: RootKind,
+) -> Result<(PathBuf, PathBuf, SqliteMode, bool)> {
     let Frame::Control(Control::Open {
         proto,
         wire_id: id,
@@ -2536,9 +2551,24 @@ fn read_open<R: Read>(input: &mut R) -> Result<(PathBuf, PathBuf, SqliteMode, bo
     if proto != PROTO_VERSION || id != wire_id() {
         return Err(BulkloadRefusal::FrameCodec);
     }
-    // #232: a root that is not there, or cannot be resolved, is typed.
-    let root = std::fs::canonicalize(path(root))
-        .map_err(|error| crate::refuse::source_root(&error, "transfer::read_open"))?;
+    // #232: a root that is not there, or cannot be resolved, is typed. A
+    // `--file` root resolves only its parent: the leaf is the name as
+    // given, never followed (a symlink there is carried as a symlink row,
+    // never as its target's bytes, R1), and never stat'ed before `Start`,
+    // so its own refusal crosses the wire typed (#283 review 1 and 2).
+    let given = path(root);
+    let root = match kind {
+        RootKind::Tree => std::fs::canonicalize(&given)
+            .map_err(|error| crate::refuse::source_root(&error, "transfer::read_open"))?,
+        RootKind::File => {
+            let leaf = given
+                .file_name()
+                .ok_or(BulkloadRefusal::SourceRootKindMismatch)?;
+            std::fs::canonicalize(parent_or_dot(&given))
+                .map_err(|error| crate::refuse::source_root(&error, "transfer::read_open"))?
+                .join(leaf)
+        }
+    };
     let as_root = reads_as_root(&root);
     if sqlite == SqliteMode::Snapshot && as_root {
         return Err(BulkloadRefusal::SqliteSourceAsRoot);
@@ -5575,6 +5605,9 @@ fn receive_session<R: Read, W: Write>(
     // says its root opened as the kind asked for, so a session the source
     // refuses (a missing root, the wrong kind) leaves no empty DEST behind
     // (R4). It costs the first run into an absent root one round trip.
+    // This side's store opens first, so its own failure makes nothing at
+    // DEST (#283 review 6).
+    let store = Store::open(destination_state)?;
     let early_start = if landing.create {
         let authority = read_start(input, hand.as_ref())?;
         make_destination_root(&landing.dir)?;
@@ -5582,19 +5615,29 @@ fn receive_session<R: Read, W: Write>(
     } else {
         None
     };
-    let store = Store::open(destination_state)?;
-    let mut target = Destination::open(&landing.open, &store)?;
+    // A root made here and still empty is removed again when the rest of
+    // this side's setup refuses (`remove_dir` takes only an empty
+    // directory, so nothing anyone wrote into it is touched).
+    let made = landing.create.then_some(landing.dir.as_path());
+    let unmade = |refusal: BulkloadRefusal| {
+        if let Some(dir) = made {
+            let _ = std::fs::remove_dir(dir);
+        }
+        refusal
+    };
+    let mut target = Destination::open(&landing.open, &store).map_err(unmade)?;
     if overlaps(store.root(), &destination_root) {
-        return Err(BulkloadRefusal::SnapshotRootsOverlap);
+        return Err(unmade(BulkloadRefusal::SnapshotRootsOverlap));
     }
     let budget = crate::io::limits::descriptor_budget();
     let (notify, group_outcomes) = std::sync::mpsc::channel();
     let displaced = Displaced::shared(usize::try_from((budget / 8).clamp(1, 64)).unwrap_or(1));
     let committer =
-        publication_committer(destination_state, budget, notify, Arc::clone(&displaced))?;
+        publication_committer(destination_state, budget, notify, Arc::clone(&displaced))
+            .map_err(unmade)?;
     // The committer holds the exclusive publisher, so no temporary of this
     // store is in flight while the root is swept.
-    target.sweep_root(&store)?;
+    target.sweep_root(&store).map_err(unmade)?;
     let mut new_path = match (
         store.has_output_hints()?,
         hand.is_some() && local_new_path_stream(target.path()),
@@ -5885,18 +5928,22 @@ impl<W: Write> Inbound<'_, W> {
 }
 
 impl<W: Write> Inbound<'_, W> {
-    /// A `--file` session (#232): the source offers one regular file by its
-    /// own leaf, and it lands under the destination's leaf, so every record
-    /// this side keeps (its row, its reuse key, a refusal) is keyed by the
-    /// path it lives at here, and a rerun finds it. Anything else offered
-    /// (a second entry, a directory, a symlink, a path beneath a directory)
-    /// is not the file the verb was given. A tree session is untouched.
+    /// A `--file` session (#232): the source offers one regular file or one
+    /// symlink by its own leaf (or that leaf's typed refusal), and it lands
+    /// under the destination's leaf, so every record this side keeps (its
+    /// row, its reuse key, a refusal) is keyed by the path it lives at
+    /// here, and a rerun finds it. Anything else offered (a second entry, a
+    /// directory, a path beneath a directory) is not the file the verb was
+    /// given. A tree session is untouched.
     fn land(&self, rel_path: &mut Vec<u8>, entry: Option<(u64, FileKind)>) -> Result<()> {
         let Some(leaf) = &self.leaf else {
             return Ok(());
         };
         let beneath = rel_path.contains(&b'/');
-        let other = entry.is_some_and(|(entry, kind)| entry != 0 || kind != FileKind::Regular);
+        // One regular file, or one symlink carried as a link (R1).
+        let other = entry.is_some_and(|(entry, kind)| {
+            entry != 0 || !matches!(kind, FileKind::Regular | FileKind::Symlink)
+        });
         if beneath || other {
             return Err(BulkloadRefusal::SourceRootKindMismatch);
         }
@@ -6448,7 +6495,13 @@ impl<W: Write> Inbound<'_, W> {
             (None, true)
         } else {
             match self.target.identity(row) {
-                Err(BulkloadRefusal::DestinationOccupied) if self.beside.is_some() => (None, true),
+                // A node of another kind at the live path: a symlink
+                // (`DESTINATION_KIND_MISMATCH`, #283 review 3) or a
+                // non-directory on the way (`DESTINATION_OCCUPIED`).
+                Err(
+                    BulkloadRefusal::DestinationOccupied
+                    | BulkloadRefusal::DestinationKindMismatch,
+                ) if self.beside.is_some() => (None, true),
                 found => (found?, false),
             }
         };

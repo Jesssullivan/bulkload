@@ -2988,10 +2988,19 @@ fn other_kind(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
 }
 
 fn open_regular(parent: &File, name: &CStr) -> Result<File> {
-    let file = File::from(
-        crate::io::sys::open_read_at(parent, name)
-            .map_err(|error| other_kind(&error, "materialize::open_regular"))?,
-    );
+    // The open follows no link, so `ELOOP` is this name being a symlink (to
+    // a file, a directory or nothing): the wrong kind of node where a
+    // regular output lands, typed (#283 review 3; it was IO errno 40). A
+    // non-directory on the way is another kind too, `DESTINATION_OCCUPIED`
+    // (review of #280, finding 5). Under `--beside` both land beside
+    // (`decide_regular`).
+    let file = File::from(crate::io::sys::open_read_at(parent, name).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            BulkloadRefusal::DestinationKindMismatch
+        } else {
+            other_kind(&error, "materialize::open_regular")
+        }
+    })?);
     if !file
         .metadata()
         .refuse_at("materialize::open_regular")?
