@@ -188,12 +188,24 @@ SUBCOMMANDS:
                 bare repository refs-only. Each path's live path is the
                 longest --map prefix's, else the same path. One line per item
                 (estate-move-source item=ID kind=main|linked|bare) and per
-                note: what is not planned (a symlink, plain files, a prunable
-                worktree, an unreadable repository or entry, a directory its
-                repository does not list, and each nested repository a
-                capture holds as custody only) is printed, counted and
-                written to MOVE_STATE/carry/move-source.notes; estate-move
-                reports it not moved. New items are appended to
+                note: what is not planned is printed, counted and written to
+                MOVE_STATE/carry/move-source.notes (WHAT COUNT CODE PATH, a
+                tab, LIVE: each path's bytes escaped, LIVE by the same --map
+                rules as items), for estate-move's notes phase to carry
+                (2026-10-19): not-git-file (a plain file in a directory that
+                holds a repository, e.g. ~/git/receipt.txt or a
+                *.worktrees directory's log), not-git-tree (the outermost
+                directory holding no repository, its entries counted, e.g.
+                an archive, .idea, .direnv), symlink (in a directory that
+                holds a repository), prunable (a worktree Git lists
+                prunable; its tree when the directory is still there),
+                not-in-census (a directory its repository does not list),
+                unreadable (typed, SOURCE_ROOT_UNREADABLE for a read),
+                source-vanished, and nested (each nested repository a
+                capture holds as custody only, by its own path). A seat
+                removed between its listing and its stat is gone, not
+                noted. MOVE_STATE/serve/notes is made beside serve/carry.
+                New items are appended to
                 MOVE_STATE/carry/plan.postcard (estate-add-batch; existing
                 ones never change, and a source planned at another live path
                 refuses RECEIPT_BINDING_INVALID), then the plan is captured
@@ -244,7 +256,35 @@ SUBCOMMANDS:
                 A beside landing converges to a newer capture when its proof
                 holds (gap C12). 4 carry: estate-carry-files for
                 the carry items, at the live path while it is still absent or
-                empty, else with --beside .LABEL. 5 hand-off: estate-handoff
+                empty, else with --beside .LABEL. 4b notes (2026-10-19,
+                nothing is ever excluded): every source note through the
+                same transport (copy, or pull from HOST), each one recorded
+                transfer (MOVE_STATE/pull/notes/ID; the source's serve
+                state SOURCE_MOVE_STATE/serve/notes/ID) with --beside .LABEL
+                to the live path the source half mapped it to: a
+                not-git-file as a --file session, a symlink as a --file
+                session of the link itself (never followed), a
+                not-git-tree, prunable or not-in-census directory as one
+                tree session (custody as files; a worktree is never
+                registered again). A tree lands into a live directory
+                holding no repository (equal files adopted, differing ones
+                beside, nothing removed) and at <live>.LABEL beside
+                anything else there; a file or link at <live>.LABEL beside a
+                directory. Absent parents are made 0755 and recorded in
+                MOVE_STATE/notes/ID.parents. A note under a planned item's
+                checkout or under a carried tree is covered, never carried
+                twice; nested (GIT_NEST_CUSTODY_ONLY), unreadable and
+                source-vanished notes, and a prunable worktree whose
+                directory is gone (SOURCE_ROOT_MISSING), are held typed,
+                pending review; a
+                note from an older source half (not-git), a tree holding a
+                planned item or a path that does not decode is unaccounted.
+                One estate-move note= line each (outcome, counters, at=,
+                beside_root=), an estate-move notes summary
+                (source_bytes_read=: 0 on an unchanged rerun) and the rows
+                of the notes no transfer accounts for in
+                MOVE_STATE/notes.rows (closure-dispose --source-notes).
+                5 hand-off: estate-handoff
                 for the items whose workspace this pass landed or adopted
                 (unless --no-hand-off). 6 with --sessions (plan of record
                 2026-10-19, C9/C10/C11; no intermediary stage):
@@ -264,15 +304,21 @@ SUBCOMMANDS:
                 state_5.sqlite.LABEL when the live index was kept), state
                 MOVE_STATE/reseat. 7
                 closure: closure-report over the plan (with --dispositions, the
-                closure-dispose ledger joined) and, with --sessions, over the
+                closure-dispose ledger joined), over every carried note's
+                transfer record and one source-note row per other note and,
+                with --sessions, over the
                 two session transfer records (applied-beside accounted,
                 refused paths pending review), written to
                 MOVE_STATE/closure.json, summarised on an estate-move closure
-                line with not_moved= (the source notes) and, with --sessions,
+                line with notes=, notes_carried=, not_moved= (the entries of
+                the notes neither carried nor covered) and
+                not_moved_dispositioned= (those a review or policy disposes)
+                and, with --sessions,
                 sessions= and reseat_unaccounted= (re-seat outcomes that
                 leave a session not resumable). The gate passes only when
-                every item and every session row is accounted and reviewed,
-                nothing is noted not moved and no re-seat outcome is
+                every item, session, note transfer and note row is accounted
+                and reviewed, every note still not moved is dispositioned
+                and no re-seat outcome is
                 unaccounted; an estate-move gate= line names the next step. The
                 verb exits with the first phase's refusal, else
                 CLOSURE_UNACCOUNTED while the gate fails. The next converge
@@ -424,7 +470,7 @@ SUBCOMMANDS:
                 transfer-expect listed, bound to PLAN: a listed transfer with
                 no record, or whose session started before the manifest's
                 since, is unaccounted
-    closure-dispose [--attest LEDGER.json] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] LEDGER PLAN CORPUS SOURCE ITEM|--policy CODE accept|re-carry|abandon REVIEWER YYYY-MM-DD [PRIVATE_STATE ...]
+    closure-dispose [--attest LEDGER.json] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] [--source-notes ROWS ...] LEDGER PLAN CORPUS SOURCE ITEM|--policy CODE accept|re-carry|abandon REVIEWER YYYY-MM-DD [PRIVATE_STATE ...]
                 Record an operator review of a typed refusal (S4) in LEDGER,
                 created when absent and bound to PLAN (its path and a digest
                 of its bytes; PLAN must be a plan) and SOURCE. With ITEM: the
@@ -443,7 +489,11 @@ SUBCOMMANDS:
                 name no cause and refuse (FIELD_DOMAIN_VIOLATION), as does a
                 CODE the taxonomy does not hold. --transfer and
                 --transfer-manifest join transfer rows as closure-report
-                does, so ITEM may name one
+                does, so ITEM may name one. --source-notes ROWS
+                (estate-move's MOVE_STATE/notes.rows, 2026-10-19) joins the
+                source notes that pass held, so ITEM may name one by its
+                note= identity (e.g. GIT_NEST_CUSTODY_ONLY,
+                SOURCE_ROOT_UNREADABLE)
     transfer-expect MANIFEST PLAN copy SOURCE DEST DEST_STATE
     transfer-expect MANIFEST PLAN pull HOST SOURCE DEST DEST_STATE
                 List one transfer a run expects in MANIFEST
@@ -1234,6 +1284,24 @@ fn join_transfer_inputs(
 // like estate-add; `--policy` stands in for ITEM. An item review is bound to
 // the refusal instance the report holds now, so the verb reads the same
 // inputs as closure-report. Prints the recorded row.
+// 2026-10-19: estate-move's source-note rows (each MOVE_STATE/notes.rows
+// given), joined so `closure-dispose` can review one.
+fn join_source_notes(
+    report: &mut bulkload_agent::closure::Report,
+    files: &[PathBuf],
+) -> Result<()> {
+    for rows in files {
+        report.join_notes(
+            &bulkload_agent::estate::moving::notes::read_rows(rows)?
+                .iter()
+                .map(bulkload_agent::estate::moving::notes::RowRecord::row)
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Options, then one review row.
 fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
     use bulkload_agent::disposition::{self, Decision, Row, Scope};
     fn text(value: &std::ffi::OsString) -> Result<&str> {
@@ -1242,6 +1310,7 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut attest = None;
     let mut manifest = None;
     let mut transfers = Vec::new();
+    let mut source_notes = Vec::new();
     let mut positional = args;
     loop {
         match positional {
@@ -1262,8 +1331,17 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
                 transfers.push(PathBuf::from(state));
                 positional = rest;
             }
+            // 2026-10-19: estate-move's source-note rows
+            // (MOVE_STATE/notes.rows) can be reviewed too.
+            [flag, rows, rest @ ..] if flag == "--source-notes" => {
+                source_notes.push(PathBuf::from(rows));
+                positional = rest;
+            }
             [flag]
-                if flag == "--attest" || flag == "--transfer" || flag == "--transfer-manifest" =>
+                if flag == "--attest"
+                    || flag == "--transfer"
+                    || flag == "--transfer-manifest"
+                    || flag == "--source-notes" =>
             {
                 return Err(BulkloadRefusal::RequiredFieldMissing)
             }
@@ -1293,6 +1371,7 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
             let estate = bulkload_agent::estate::ledger(plan, Path::new(corpus), source, &states)?;
             let mut report = bulkload_agent::closure::Report::from_ledger(&estate);
             join_transfer_inputs(&mut report, &transfers, manifest.as_deref(), plan)?;
+            join_source_notes(&mut report, &source_notes)?;
             if let Some(attest) = &attest {
                 report.attest(&bulkload_agent::closure::AttestationLedger::read(
                     attest, plan, source,
@@ -2444,11 +2523,40 @@ fn copy_recorded_kind(
     source_state: &Path,
     dest_state: &Path,
 ) -> Result<()> {
-    let stats = bulkload_agent::transfer_outcome::record_session(
+    report_transfer(&copy_session_recorded(
+        kind,
+        source,
+        dest,
+        source_state,
+        dest_state,
+    )?)
+}
+
+// The record keys of a root of `kind`: a `--file` root names its own leaf,
+// never what a symlink there points at (estate-move notes, 2026-10-19).
+fn record_key(kind: bulkload_agent::transfer::RootKind, path: &Path) -> PathBuf {
+    match kind {
+        bulkload_agent::transfer::RootKind::File => {
+            bulkload_agent::transfer_outcome::stable_leaf(path)
+        }
+        bulkload_agent::transfer::RootKind::Tree => bulkload_agent::transfer_outcome::stable(path),
+    }
+}
+
+// [`copy_recorded_kind`]'s session under its record, its stats returned
+// unprinted (estate-move's notes phase prints its own line per note).
+fn copy_session_recorded(
+    kind: bulkload_agent::transfer::RootKind,
+    source: &Path,
+    dest: &Path,
+    source_state: &Path,
+    dest_state: &Path,
+) -> Result<bulkload_agent::transfer::TransferStats> {
+    bulkload_agent::transfer_outcome::record_session(
         dest_state,
         "copy",
-        &bulkload_agent::transfer_outcome::copy_source(source),
-        &bulkload_agent::transfer_outcome::stable(dest),
+        &record_key(kind, source).to_string_lossy(),
+        &record_key(kind, dest),
         "transfer::copy",
         || {
             bulkload_agent::transfer::copy_roots_apart_kind(
@@ -2460,8 +2568,7 @@ fn copy_recorded_kind(
             )
         },
         || bulkload_agent::transfer::copy_kind(source, dest, source_state, dest_state, kind),
-    )?;
-    report_transfer(&stats)
+    )
 }
 
 // WP3 PR 4: a pull session's outcomes are closure rows, keyed on
@@ -2476,6 +2583,15 @@ fn pull_recorded_kind(
     kind: bulkload_agent::transfer::RootKind,
     args: &[std::ffi::OsString],
 ) -> Result<()> {
+    pull_session_recorded(kind, args).and_then(|stats| report_transfer(&stats))
+}
+
+// [`pull_recorded_kind`]'s session under its record, its stats returned
+// unprinted (estate-move's notes phase prints its own line per note).
+fn pull_session_recorded(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<bulkload_agent::transfer::TransferStats> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2486,12 +2602,11 @@ fn pull_recorded_kind(
         path(4)?,
         "pull",
         &bulkload_agent::transfer_outcome::pull_source(host, path(1)?),
-        &bulkload_agent::transfer_outcome::stable(path(2)?),
+        &record_key(kind, path(2)?),
         "transfer::pull",
         || bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind),
         || pull_command(kind, args),
     )
-    .and_then(|stats| report_transfer(&stats))
 }
 
 // M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,

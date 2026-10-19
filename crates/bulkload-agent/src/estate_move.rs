@@ -177,6 +177,8 @@ fn source_command(args: &[OsString]) -> Result<()> {
     // anything else).
     moving::private_dir(&state.join("serve"))?;
     moving::private_dir(&state.join("serve/carry"))?;
+    // The notes phase's `serve` states (2026-10-19), one per note.
+    moving::private_dir(&state.join("serve/notes"))?;
     // The pass's mark: `estate-move` refuses a corpus pulled while a pass
     // was still writing it (its `done` mark is another pass's, or none).
     let pass = now_ns().to_string();
@@ -239,11 +241,16 @@ fn source_command(args: &[OsString]) -> Result<()> {
             .sum()
     };
     out(&format!(
-        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} prunable={} unreadable={} source_vanished={} not_in_census={}",
+        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} not_git_trees={} prunable={} unreadable={} source_vanished={} not_in_census={}",
         found.items.len(),
         new.len(),
-        noted("symlink"),
-        noted("not-git"),
+        noted(moving::notes::LINK),
+        noted(moving::notes::FILE) + noted(moving::notes::TREE),
+        found
+            .notes
+            .iter()
+            .filter(|note| note.what == moving::notes::TREE)
+            .count(),
         noted("prunable"),
         noted("unreadable"),
         noted("source-vanished"),
@@ -281,7 +288,7 @@ fn source_command(args: &[OsString]) -> Result<()> {
                         .lock()
                         .map_err(|_| BulkloadRefusal::WorkerLost)?
                         .push(moving::Note {
-                            path: row.source.clone(),
+                            path: nested_path(&row.source, line),
                             what: "nested",
                             count: 1,
                             code: None,
@@ -311,7 +318,7 @@ fn source_command(args: &[OsString]) -> Result<()> {
         )?;
         moving::write_report(
             &carry.join(NOTES),
-            moving::render_notes(&all_notes).as_bytes(),
+            moving::render_notes(&all_notes, &maps).as_bytes(),
         )?;
         moving::write_report(&carry.join(DONE), pass.as_bytes())?;
     }
@@ -333,6 +340,32 @@ fn source_command(args: &[OsString]) -> Result<()> {
         Err(refusal) if !finished => Err(refusal),
         _ => Ok(()),
     }
+}
+
+// A nested repository's own path: the item's source joined with the nest's
+// (its receipt line's escaped `path="..."`), so each nest is its own note;
+// the item's source when the line names none it can read.
+fn nested_path(source: &Path, line: &str) -> PathBuf {
+    // The closing quote is the first one no backslash escapes.
+    let quoted = |rest: &str| {
+        let mut escaped = false;
+        rest.char_indices()
+            .find(|&(_, c)| {
+                let end = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                end
+            })
+            .and_then(|(at, _)| rest.get(..at))
+            .map(str::to_owned)
+    };
+    line.split_once("path=\"")
+        .and_then(|(_, rest)| quoted(rest))
+        .and_then(|escaped| moving::notes::unescape(&escaped))
+        .filter(|rel| !rel.is_empty())
+        .map_or_else(
+            || source.to_path_buf(),
+            |rel| source.join(std::ffi::OsStr::from_bytes(&rel)),
+        )
 }
 
 /// What phase 6 leaves for the closure (C11): the two session transfer
@@ -632,6 +665,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
     let text = |name: &str| std::fs::read_to_string(carry.join(name)).unwrap_or_default();
     let refusals = moving::parse_refusals(&text(REFUSALS));
     let notes = moving::note_counts(&text(NOTES));
+    let note_lines = moving::notes::parse(&text(NOTES));
 
     // 2. Decide every item against the destination now. Under --plan-only
     // the decisions are shown, never recorded.
@@ -647,6 +681,9 @@ fn move_command(args: &[OsString]) -> Result<()> {
     let mut rows = moving::decide(&items, &inputs, &mut decided, now_ns())?;
     let suffix = run.suffix();
     print_plan(&rows, &suffix, &notes)?;
+    // The source notes, decided against the plan's items (2026-10-19).
+    let decided_notes = moving::notes::decide(&note_lines, &items);
+    print_notes_plan(&decided_notes)?;
     if run.plan_only {
         return preview(&run, (&plan, &corpus, &private));
     }
@@ -730,6 +767,22 @@ fn move_command(args: &[OsString]) -> Result<()> {
     note(&carried);
     reached(&mut ledger, &ledger_path, "carry", word(&carried))?;
 
+    // 4b. The source notes (2026-10-19; "NOTHING is EVER excluded"): every
+    // note the source half could not plan as an item, carried through the
+    // same transport to its live path, else covered or held typed. Each
+    // note's refusal is that note's (a closure row); only a refusal of the
+    // phase itself stops it.
+    let note_pass = carry_notes(&run, &decided_notes);
+    let note_word = match &note_pass {
+        Ok(pass) => pass.word(),
+        Err(refusal) => format!("refused:{}", refusal.code()),
+    };
+    note(&note_pass.as_ref().map(drop).map_err(Clone::clone));
+    reached(&mut ledger, &ledger_path, "notes", note_word)?;
+    // A phase that stopped leaves every note not moved (its first refusal
+    // is the verb's).
+    let note_pass = note_pass.unwrap_or_else(|_| NotesPass::not_run(&decided_notes));
+
     // 5. The hand-off block in each landed workspace (OI-1003-Q183).
     if run.handoff && !landed.is_empty() {
         let mut args: Vec<OsString> = Vec::new();
@@ -800,6 +853,16 @@ fn move_command(args: &[OsString]) -> Result<()> {
     if let Some(sessions) = &sessions {
         report.join_transfers(&sessions.pulls)?;
     }
+    // 2026-10-19: each carried note's transfer rows, and one row for each
+    // note no transfer of this pass accounts for.
+    report.join_transfers(&note_pass.states)?;
+    report.join_notes(
+        &note_pass
+            .rows
+            .iter()
+            .map(moving::notes::RowRecord::row)
+            .collect::<Vec<_>>(),
+    )?;
     if let Some(dispositions) = &run.dispositions {
         report.dispose(&bulkload_agent::disposition::Ledger::read(
             dispositions,
@@ -828,14 +891,17 @@ fn move_command(args: &[OsString]) -> Result<()> {
         .map(|(code, count)| format!("{code}:{count}"))
         .collect::<Vec<_>>()
         .join(",");
-    let not_moved: u64 = notes.values().sum();
+    // What is still not moved: each note neither carried nor covered,
+    // weighted by the entries it stands for, and how much of it a review
+    // or a standing policy disposes.
+    let (not_moved, not_moved_dispositioned) = note_pass.not_moved(&report);
     let held = reseat_held
         .iter()
         .map(|(word, count)| format!("{word}:{count}"))
         .collect::<Vec<_>>()
         .join(",");
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} notes={} notes_carried={} not_moved={not_moved} not_moved_dispositioned={not_moved_dispositioned} refusals={} sessions={} transfer_rows={} note_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,
@@ -844,18 +910,21 @@ fn move_command(args: &[OsString]) -> Result<()> {
         report.refused,
         report.refused_pending_review,
         report.unaccounted,
+        note_pass.settled.len(),
+        note_pass.carried,
         if refusals.is_empty() { "none" } else { &refusals },
         if sessions.is_some() { "claude,codex" } else { "none" },
         report.transfer_rows(),
+        report.note_rows(),
         if held.is_empty() { "none" } else { &held },
     ))?;
-    let gate = report
-        .gate()
-        .and(if not_moved == 0 && reseat_unaccounted == 0 {
+    let gate = report.gate().and(
+        if not_moved == not_moved_dispositioned && reseat_unaccounted == 0 {
             Ok(())
         } else {
             Err(BulkloadRefusal::ClosureUnaccounted)
-        });
+        },
+    );
     reached(&mut ledger, &ledger_path, "closure", word(&gate))?;
     out(&format!(
         "estate-move gate={} next={}",
@@ -1023,6 +1092,305 @@ fn carry_files(
         }
     }
     carried
+}
+
+// The notes' plan: one count per plan word (`estate-move notes-plan`).
+fn print_notes_plan(decided: &[moving::notes::Decided]) -> Result<()> {
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for note in decided {
+        *counts.entry(note.plan.word().to_owned()).or_default() += 1;
+    }
+    out(&format!(
+        "estate-move notes-plan notes={} {}",
+        decided.len(),
+        if counts.is_empty() {
+            "none".to_owned()
+        } else {
+            counts
+                .iter()
+                .map(|(word, count)| format!("{word}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    ))
+}
+
+/// How one note of the pass was settled.
+#[derive(Debug, Clone)]
+enum Settled {
+    /// Its transfer ran: the record in this `DEST_STATE` says how it ended.
+    Transfer(PathBuf),
+    /// No transfer of the pass accounts for it: its row, by identity.
+    Row(String),
+}
+
+/// What phase 4b leaves for the closure (2026-10-19).
+#[derive(Debug, Default)]
+struct NotesPass {
+    /// Each note, the entries it stands for and how it was settled.
+    settled: Vec<(u64, Settled)>,
+    /// The transfer states of the notes whose transfer ran.
+    states: Vec<PathBuf>,
+    /// The notes no transfer of the pass accounts for.
+    rows: Vec<moving::notes::RowRecord>,
+    /// Notes whose transfer completed.
+    carried: u64,
+    /// Source bytes the notes' sessions read (0 on an unchanged rerun, R25).
+    source_bytes_read: u64,
+    /// Notes whose transfer ran and refused.
+    refused: u64,
+}
+
+impl NotesPass {
+    // Every note as a row, for a phase that stopped: a planned carry is
+    // unaccounted (`note-not-carried`), the rest as planned.
+    fn not_run(decided: &[moving::notes::Decided]) -> Self {
+        let mut pass = Self::default();
+        for note in decided {
+            let record = moving::notes::RowRecord::of(note, None);
+            pass.settled
+                .push((note.line.count, Settled::Row(record.item.clone())));
+            pass.rows.push(record);
+        }
+        pass
+    }
+
+    fn word(&self) -> String {
+        if self.refused == 0 {
+            "ok".to_owned()
+        } else {
+            format!("notes-refused count={}", self.refused)
+        }
+    }
+
+    // The entries still not moved, and how many of them a review or a
+    // standing policy disposes, read from the closure report the notes'
+    // rows joined (after its reviews).
+    fn not_moved(&self, report: &bulkload_agent::closure::Report) -> (u64, u64) {
+        use bulkload_agent::closure::{Disposition, RowKind};
+        let (mut not_moved, mut disposed) = (0_u64, 0_u64);
+        for (count, settled) in &self.settled {
+            let dispositions: Vec<&Disposition> = match settled {
+                Settled::Transfer(state) => {
+                    let state = bulkload_agent::transfer_outcome::stable(state);
+                    report
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            row.kind == RowKind::TransferSession
+                                && row
+                                    .transfer
+                                    .as_ref()
+                                    .is_some_and(|detail| detail.state == state)
+                        })
+                        .map(|row| &row.disposition)
+                        .collect()
+                }
+                Settled::Row(item) => report
+                    .rows
+                    .iter()
+                    .filter(|row| row.kind == RowKind::SourceNote && row.item == *item)
+                    .map(|row| &row.disposition)
+                    .collect(),
+            };
+            if dispositions
+                .iter()
+                .any(|found| matches!(found, Disposition::Applied | Disposition::Covered))
+            {
+                continue;
+            }
+            not_moved = not_moved.saturating_add(*count);
+            if dispositions
+                .iter()
+                .any(|found| matches!(found, Disposition::Refused(_)))
+            {
+                disposed = disposed.saturating_add(*count);
+            }
+        }
+        (not_moved, disposed)
+    }
+}
+
+// Phase 4b (2026-10-19): every carriable note through the transport with
+// `--beside .LABEL`, each a recorded transfer of its own
+// (`MOVE_STATE/pull/notes/ID`, the source's `serve` state
+// `SOURCE_MOVE_STATE/serve/notes/ID`), and a row for every other note
+// (`MOVE_STATE/notes.rows`, which `closure-dispose --source-notes` reads).
+fn carry_notes(run: &Move, decided: &[moving::notes::Decided]) -> Result<NotesPass> {
+    let pulled = run.state.join("pull/notes");
+    moving::private_dir(&run.state.join("pull"))?;
+    moving::private_dir(&pulled)?;
+    let parents = run.state.join("notes");
+    moving::private_dir(&parents)?;
+    if run.local() {
+        moving::private_dir(&run.source_state.join("serve"))?;
+        moving::private_dir(&run.source_state.join("serve/notes"))?;
+    }
+    let mut pass = NotesPass::default();
+    bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()))?;
+    let carried = (|| -> Result<()> {
+        for note in decided {
+            let moving::notes::Plan::Carry { shape, live } = &note.plan else {
+                let record = moving::notes::RowRecord::of(note, None);
+                out(&format!(
+                    "estate-move note={} what={} plan={} count={} path={:?}",
+                    note.id,
+                    note.line.what,
+                    note.plan.word(),
+                    note.line.count,
+                    note.line
+                        .path
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new(&note.line.text)),
+                ))?;
+                pass.settled
+                    .push((note.line.count, Settled::Row(record.item.clone())));
+                pass.rows.push(record);
+                continue;
+            };
+            // On this host with no --map for it, the note is at its live
+            // path already: nothing to move.
+            if run.local() && note.line.path.as_deref() == Some(live.as_path()) {
+                let record =
+                    moving::notes::RowRecord::settled(note, "covered-in-place".to_owned(), None);
+                pass.settled
+                    .push((note.line.count, Settled::Row(record.item.clone())));
+                pass.rows.push(record);
+                continue;
+            }
+            let transfer_state = pulled.join(&note.id);
+            match carry_note(run, note, (*shape, live), &transfer_state, &parents) {
+                Ok(ended) => {
+                    pass.states.push(transfer_state.clone());
+                    pass.settled
+                        .push((note.line.count, Settled::Transfer(transfer_state)));
+                    match &ended.result {
+                        Ok(stats) => {
+                            pass.carried += 1;
+                            pass.source_bytes_read = pass
+                                .source_bytes_read
+                                .saturating_add(stats.source_bytes_read);
+                        }
+                        Err(_) => pass.refused += 1,
+                    }
+                    out(&ended.line(note))?;
+                }
+                Err(refusal) => {
+                    // Refused before its transfer ran: no record, so the
+                    // note's own row holds the refusal.
+                    let record = moving::notes::RowRecord::of(note, Some(&refusal));
+                    out(&format!(
+                        "estate-move note={} what={} plan={} outcome=refused:{} path={:?} live={live:?}",
+                        note.id,
+                        note.line.what,
+                        note.plan.word(),
+                        refusal.code(),
+                        note.line.path.as_deref().unwrap_or_else(|| Path::new("")),
+                    ))?;
+                    pass.settled
+                        .push((note.line.count, Settled::Row(record.item.clone())));
+                    pass.rows.push(record);
+                }
+            }
+        }
+        Ok(())
+    })();
+    let cleared = bulkload_agent::transfer::set_beside_suffix(None);
+    carried?;
+    cleared?;
+    moving::notes::write_rows(&run.state.join("notes.rows"), &pass.rows)?;
+    out(&format!(
+        "estate-move notes notes={} carried={} refused={} rows={} source_bytes_read={}",
+        pass.settled.len(),
+        pass.carried,
+        pass.refused,
+        pass.rows.len(),
+        pass.source_bytes_read,
+    ))?;
+    Ok(pass)
+}
+
+/// One carried note's ended transfer.
+struct Ended {
+    at: PathBuf,
+    beside: bool,
+    result: Result<bulkload_agent::transfer::TransferStats>,
+}
+
+impl Ended {
+    fn line(&self, note: &moving::notes::Decided) -> String {
+        let counters = match &self.result {
+            Ok(stats) => format!(
+                "outcome=carried completed={} reused={} source_bytes_read={} refusals={} applied_beside={}",
+                stats.completed,
+                stats.reused,
+                stats.source_bytes_read,
+                stats.refusals.len(),
+                stats.applied_beside.len(),
+            ),
+            Err(refusal) => format!("outcome=refused:{}", refusal.code()),
+        };
+        format!(
+            "estate-move note={} what={} plan={} {counters} path={:?} at={:?} beside_root={}",
+            note.id,
+            note.line.what,
+            note.plan.word(),
+            note.line.path.as_deref().unwrap_or_else(|| Path::new("")),
+            self.at,
+            self.beside,
+        )
+    }
+}
+
+// One note's transfer: where it lands (live, or beside what the live path
+// holds that cannot take it), the absent parents made (0755, recorded in
+// `MOVE_STATE/notes/ID.parents`, as `estate-apply` makes an item's), the
+// S2 checks, then the recorded session. `Err` is a refusal before the
+// session (no record); a session that ran and refused is `Ok` with its
+// refusal, its record in `state`.
+fn carry_note(
+    run: &Move,
+    note: &moving::notes::Decided,
+    (shape, live): (moving::notes::Shape, &Path),
+    state: &Path,
+    parents: &Path,
+) -> Result<Ended> {
+    use bulkload_agent::git_carry::parents::{absent_parents, FirstTarget};
+    use bulkload_agent::transfer::RootKind;
+    let from = note
+        .line
+        .path
+        .as_deref()
+        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    let suffix = run.suffix();
+    let (at, beside) = moving::notes::landing(shape, live, &suffix);
+    if !absent_parents(&at)?.is_empty() {
+        let record = parents.join(format!("{}.parents", note.id));
+        FirstTarget::of(&at)?.place(Some((record.as_path(), note.id.as_str())))?;
+    }
+    let kind = match shape {
+        moving::notes::Shape::File | moving::notes::Shape::Link => RootKind::File,
+        moving::notes::Shape::Tree => RootKind::Tree,
+    };
+    moving::private_dir(state)?;
+    let serve = run.source_state.join("serve/notes").join(&note.id);
+    let result = if run.local() {
+        bulkload_agent::transfer::copy_roots_apart_kind(from, &at, &serve, state, kind)?;
+        super::copy_session_recorded(kind, from, &at, &serve, state)
+    } else {
+        bulkload_agent::transfer::receive_roots_apart_kind(&at, state, kind)?;
+        let mut args: Vec<OsString> = vec![
+            run.host.clone(),
+            from.as_os_str().to_owned(),
+            at.as_os_str().to_owned(),
+            serve.into_os_string(),
+            state.as_os_str().to_owned(),
+        ];
+        args.extend(run.remote.iter().cloned());
+        args.extend(run.config.iter().cloned());
+        super::pull_session_recorded(kind, &args)
+    };
+    Ok(Ended { at, beside, result })
 }
 
 // The destination home the sessions land in (`--dest-home`, default

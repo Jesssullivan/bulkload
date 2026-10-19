@@ -276,6 +276,13 @@ pub enum BulkloadRefusal {
     /// path relative to the captured checkout; [`fmt::Display`] prints it
     /// escaped.
     GitNestWorktreeMoved(Vec<u8>),
+    /// A nested repository the enclosing capture holds as custody only (its
+    /// content is not carried, M2r2 item 5), noted by `estate-move-source`
+    /// and held by `estate-move`'s notes phase as a typed note pending
+    /// review (2026-10-19, "nothing is ever excluded"): an operator decides
+    /// whether custody is enough (accept), the nest is carried once its
+    /// cause is fixed (re-carry), or it is deliberately left (abandon).
+    GitNestCustodyOnly,
     /// A path given as a repository is not that repository's root: Git would
     /// resolve it to an enclosing repository, or to none at all.
     GitRepositoryNotAtPath,
@@ -595,6 +602,7 @@ impl BulkloadRefusal {
             Self::GitCarryPointerAttached(_) => "GIT_CARRY_POINTER_ATTACHED",
             Self::GitNestPointerStale(_) => "GIT_NEST_POINTER_STALE",
             Self::GitNestWorktreeMoved(_) => "GIT_NEST_WORKTREE_MOVED",
+            Self::GitNestCustodyOnly => "GIT_NEST_CUSTODY_ONLY",
             Self::GitRepositoryNotAtPath => "GIT_REPOSITORY_NOT_AT_PATH",
             Self::GitHavesUnprovable => "GIT_HAVES_UNPROVABLE",
             Self::GitSourcePartialClone => "GIT_SOURCE_PARTIAL_CLONE",
@@ -700,6 +708,7 @@ impl BulkloadRefusal {
         "GIT_CARRY_POINTER_ATTACHED",
         "GIT_NEST_POINTER_STALE",
         "GIT_NEST_WORKTREE_MOVED",
+        "GIT_NEST_CUSTODY_ONLY",
         "GIT_REPOSITORY_NOT_AT_PATH",
         "GIT_HAVES_UNPROVABLE",
         "GIT_SOURCE_PARTIAL_CLONE",
@@ -974,6 +983,7 @@ mod tests {
             BulkloadRefusal::GitCarryPointerAttached(Vec::new()),
             BulkloadRefusal::GitNestPointerStale(Vec::new()),
             BulkloadRefusal::GitNestWorktreeMoved(Vec::new()),
+            BulkloadRefusal::GitNestCustodyOnly,
             BulkloadRefusal::GitRepositoryNotAtPath,
             BulkloadRefusal::GitHavesUnprovable,
             BulkloadRefusal::GitSourcePartialClone,

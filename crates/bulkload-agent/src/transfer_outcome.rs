@@ -347,6 +347,27 @@ pub fn stable(path: &Path) -> PathBuf {
     }
 }
 
+/// [`stable`] of a `--file` root (#232; estate-move notes, 2026-10-19).
+///
+/// Its parent resolved and its own leaf kept, never followed, so a symlink
+/// seat (and a symlink a pass landed at DEST) names itself, and a rerun keys
+/// the same record. For a regular file it agrees with [`stable`].
+#[must_use]
+pub fn stable_leaf(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            std::fs::canonicalize(parent)
+                .map_or_else(|_| path.to_path_buf(), |parent| parent.join(name))
+        }
+        _ => stable(path),
+    }
+}
+
 /// The lock one transfer's record is written under, held for its session.
 /// Dropping it releases the lock.
 #[derive(Debug)]

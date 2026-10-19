@@ -81,6 +81,22 @@
 //! the report covers the transfers the operator named (`--transfer`) and
 //! says so (no `transfer_manifest` block).
 //!
+//! Source notes join it too (`estate-move`'s notes phase, 2026-10-19,
+//! [`Report::join_notes`]). A note the pass carried is the transfer rows of
+//! its own `DEST_STATE`, joined as above. A note no transfer accounts for is
+//! one `source-note` row: `covered` when a planned item's checkout or a
+//! carried tree holds it, `refused-pending-review` when it is held typed (a
+//! nested repository held as custody only, `GIT_NEST_CUSTODY_ONLY`; an
+//! unreadable entry, `SOURCE_ROOT_UNREADABLE`; a vanished root; a carry
+//! refused before its transfer ran), disposed like any typed refusal by an
+//! item row naming the note and its instance or by a standing policy, and
+//! `unaccounted` otherwise (an untyped hold, a note from an older source
+//! half, a tree that holds a planned item). A note row prints `kind`
+//! `source-note`, `note`, `path` (escaped), `count`, `note_outcome` and, when
+//! typed, `refusal`; `totals.transfer_rows` counts transfer rows only. The
+//! schema stays v5: these are added keys on an added row kind, as gap C12's
+//! were.
+//!
 //! - `carried` (M2r2 b, v5): the item plans a workspace, its capture
 //!   refused, and `estate-carry-files` carried it as files: its outcome is
 //!   `CarriedAsFiles`, and its `{item}-{blake3(SOURCE)}.carried` record
@@ -354,6 +370,10 @@ pub enum RowKind {
     TransferSession,
     /// One refused or covered path of a transfer session.
     TransferEntry,
+    /// One `estate-move-source` note that no transfer of the pass accounts
+    /// for (`estate-move`'s notes phase, 2026-10-19): covered by an item or
+    /// a carried tree, or held typed (pending review) or unaccounted.
+    SourceNote,
 }
 
 impl RowKind {
@@ -364,6 +384,7 @@ impl RowKind {
             Self::Estate => "estate",
             Self::TransferSession => "transfer-session",
             Self::TransferEntry => "transfer-entry",
+            Self::SourceNote => "source-note",
         }
     }
 }
@@ -388,6 +409,35 @@ pub struct TransferDetail {
     pub sqlite_code: Option<i32>,
     /// The beside path an `applied-beside` entry landed at (`--beside`).
     pub beside: Option<Vec<u8>>,
+}
+
+/// What a [`RowKind::SourceNote`] row reports (2026-10-19).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteDetail {
+    /// The note's kind as the source half wrote it (`nested`, `unreadable`,
+    /// `not-git-file`, ...).
+    pub what: String,
+    /// The note's source path, raw bytes.
+    pub path: Vec<u8>,
+    /// The entries it stands for.
+    pub count: u64,
+    /// Why no transfer of the pass accounts for it: `covered-by-item`,
+    /// `covered-by-tree`, `held`, `refused` (before its transfer ran), or
+    /// the reason it is unaccounted.
+    pub outcome: String,
+}
+
+/// One source note's row, as [`Report::join_notes`] joins it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoteRow {
+    /// The note's identity (64 lowercase hex), what a review names.
+    pub item: String,
+    /// The note's current refusal instance (64 lowercase hex).
+    pub instance: String,
+    /// `covered`, `refused-pending-review` (a typed code: a review or a
+    /// standing policy disposes it, S4) or `unaccounted`.
+    pub disposition: Disposition,
+    pub detail: NoteDetail,
 }
 
 /// The ruling that gives a transfer refusal its default disposition.
@@ -451,6 +501,8 @@ pub struct Row {
     /// `Display`, which names the beside path), printed as
     /// `refusal_detail`.
     pub detail: Option<String>,
+    /// A source note's own fields ([`RowKind::SourceNote`], 2026-10-19).
+    pub note: Option<NoteDetail>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -603,6 +655,7 @@ impl Report {
                     .cloned(),
                 refs_in: entry.refs_in.clone(),
                 detail: beside_foreign_detail(entry),
+                note: None,
             });
         }
         report.recount();
@@ -760,8 +813,52 @@ impl Report {
     pub fn transfer_rows(&self) -> u64 {
         self.rows
             .iter()
-            .filter(|row| row.kind != RowKind::Estate)
+            .filter(|row| matches!(row.kind, RowKind::TransferSession | RowKind::TransferEntry))
             .count() as u64
+    }
+
+    /// Source-note rows in the report (2026-10-19).
+    #[must_use]
+    pub fn note_rows(&self) -> u64 {
+        self.rows
+            .iter()
+            .filter(|row| row.kind == RowKind::SourceNote)
+            .count() as u64
+    }
+
+    /// Join `estate-move`'s source notes that no transfer of the pass
+    /// accounts for (2026-10-19): each one a [`RowKind::SourceNote`] row
+    /// under the same classification, reviews and gate as every other row.
+    /// A typed hold (`GIT_NEST_CUSTODY_ONLY`, `SOURCE_ROOT_UNREADABLE`, ...)
+    /// is pending review until an item row naming the note and its instance,
+    /// or a standing policy for its code, disposes it; a covered note is
+    /// accounted; anything else is unaccounted, which no review closes.
+    ///
+    /// # Errors
+    /// `FIELD_DOMAIN_VIOLATION` for a note joined twice.
+    pub fn join_notes(&mut self, rows: &[NoteRow]) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        self.rows.extend(rows.iter().map(|row| Row {
+            item: row.item.clone(),
+            source: PathBuf::from(std::ffi::OsStr::from_bytes(&row.detail.path)),
+            outcome: None,
+            unreadable: None,
+            disposition: row.disposition.clone(),
+            capture: CaptureId::None,
+            instance: row.instance.clone(),
+            review: None,
+            kind: RowKind::SourceNote,
+            transfer: None,
+            ruled_default: None,
+            by_default: false,
+            carried: None,
+            refs_in: None,
+            detail: None,
+            note: Some(row.detail.clone()),
+        }));
+        self.joined_once()?;
+        self.recount();
+        Ok(())
     }
 
     /// Join every transfer session recorded in each `DEST_STATE` (WP3 PR
@@ -1010,6 +1107,22 @@ impl Report {
             if let Some(detail) = &row.transfer {
                 let _ = write!(out, ",\"kind\":\"{}\"", row.kind.name());
                 write_transfer(&mut out, row, detail);
+            }
+            // A source note names its kind, its note and why no transfer
+            // accounts for it (2026-10-19).
+            if let Some(note) = &row.note {
+                let _ = write!(
+                    out,
+                    ",\"kind\":\"{}\",\"note\":{},\"path\":{},\"count\":{},\"note_outcome\":{}",
+                    row.kind.name(),
+                    json_string(&note.what),
+                    json_string(&note.path.escape_ascii().to_string()),
+                    note.count,
+                    json_string(&note.outcome),
+                );
+                if let Some(code) = row.disposition.refusal() {
+                    let _ = write!(out, ",\"refusal\":{}", json_string(code));
+                }
             }
             if let Some(refusal) = row.outcome.as_ref().and_then(Outcome::refusal) {
                 // `refusal` names a typed refusal only, as it always did. A
@@ -1284,6 +1397,7 @@ fn transfer_row(
         carried: None,
         refs_in: None,
         detail: None,
+        note: None,
     }
 }
 

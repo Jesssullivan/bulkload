@@ -16,6 +16,8 @@
 //! - `occupied`: a non-Git tree at the live path: refused typed, untouched;
 //! - `bare.git`: a bare repository landed refs-only.
 //!
+//! - `README.txt`: a plain file in the root, carried by the notes phase.
+//!
 //! Then: closure accounts for every item; a rerun changes no ref and keeps
 //! every carry where it went (P-MOVE-2); another label refuses
 //! `RECEIPT_BINDING_INVALID`; `--plan-only` writes nothing at a live path.
@@ -220,7 +222,8 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
             "main",
         ],
     );
-    // A plain file in a root is no repository: noted, not moved.
+    // A plain file in a root is no repository: noted, and carried by the
+    // notes phase to its live path (2026-10-19), so nothing is not moved.
     fs::write(src.join("README.txt"), b"not in any repository\n").unwrap();
     let same_refs = refs(&same);
     let diverged_refs = refs(&dst.join("diverged"));
@@ -288,7 +291,12 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
     assert_eq!(first["applied_beside"], "1", "{}", moved.stdout);
     assert_eq!(first["carried"], "2", "{}", moved.stdout);
     assert_eq!(first["refused_pending_review"], "1", "{}", moved.stdout);
-    assert_eq!(first["not_moved"], "1", "{}", moved.stdout);
+    assert_eq!(first["not_moved"], "0", "{}", moved.stdout);
+    assert_eq!(first["notes_carried"], "1", "{}", moved.stdout);
+    assert_eq!(
+        fs::read(dst.join("README.txt")).unwrap(),
+        b"not in any repository\n"
+    );
     assert!(
         moved.stdout.contains("estate-move gate=fail"),
         "{}",
