@@ -20,6 +20,15 @@ writers keep writing (LIVE-08 ...)". Acceptance 1: "every refusal is typed
 and dispositioned ... `carried-as-files` counts as carried (... RUL-14 for
 the corrupt copies, which closure also marks corrupt)".
 
+Produced: PR https://github.com/Jesssullivan/bulkload/pull/278, code
+commit `77fa2ce8` (signed), this note's follow-up commit on top. Receipts
+(`cargo test -p bulkload-agent --locked`, `just rust-check`, host honey,
+head `77fa2ce8`) are in the PR body; the two heads differ only in this
+file. A parallel, uncommitted draft of chunked snapshots sits in the
+local worktree `bulkload.worktrees/sqlite-chunked-20261018` (branch
+`feat/sqlite-chunked-snapshot-20261018`, never pushed, last touched
+2026-10-18 22:42Z); this lane does not build on it and left it as it was.
+
 ## What the 2026-10-18 pull refused, and what this lane changes
 
 `pull --sqlite=snapshot` of neo's Codex home (sting, 21:54Z): 12
