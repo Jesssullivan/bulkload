@@ -454,7 +454,8 @@ fn git_differs(
             return Ok(Some("remotes".to_owned()));
         }
         let names = live_names(live, source)?;
-        let listed = output(git(beside).args(["for-each-ref", "--format=%(objectname) %(refname)"]))?;
+        let listed =
+            output(git(beside).args(["for-each-ref", "--format=%(objectname) %(refname)"]))?;
         for line in String::from_utf8_lossy(&listed).lines() {
             let Some((value, name)) = line.split_once(' ') else {
                 return Ok(Some("unreachable".to_owned()));
