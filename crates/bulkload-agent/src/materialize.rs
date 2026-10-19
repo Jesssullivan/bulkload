@@ -1944,15 +1944,19 @@ pub(crate) fn owned_beside(
     authority: &[u8],
     row: &RowSchema,
     file: &File,
-    mark: &[u8],
 ) -> Result<Option<OwnedOutput>> {
+    use crate::transfer_store::{BESIDE_KEY_MARK, BESIDE_RACY_MARK};
     let identity =
         StatIdentity::from_metadata(&file.metadata().refuse_at("materialize::owned_beside")?);
     let rows = store.output_rows(authority, &row.rel_path)?;
     let recorded = identity_bytes(&identity)?;
+    // A racy capture's beside output is owned through its marked ownership
+    // row (second review of #280, N3).
     Ok(rows
         .iter()
-        .any(|(key, held)| key.ends_with(mark) && *held == recorded)
+        .any(|(key, held)| {
+            (key.ends_with(BESIDE_KEY_MARK) || key.ends_with(BESIDE_RACY_MARK)) && *held == recorded
+        })
         .then_some(OwnedOutput { identity, rows }))
 }
 

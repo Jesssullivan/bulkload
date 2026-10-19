@@ -171,6 +171,12 @@ pub struct Options {
     pub landing_codex: PathBuf,
     /// Where the landed Codex index is ([`LandingIndex`]).
     pub landing_index: LandingIndex,
+    /// `--beside-suffix SUFFIX` (second review of #280, N2): the suffix the
+    /// run's pull landed differing seats beside their live paths with. On a
+    /// live-home landing, `<path>SUFFIX` beside a destination symlink (an
+    /// archive link) is the source's copy of that session or rollout, and is
+    /// re-seated as the landed one; the link is never read.
+    pub beside_suffix: Option<String>,
     /// The destination home: its `git` directory is the default lane root.
     pub dest_home: PathBuf,
     /// The destination's live `.claude`.
@@ -256,6 +262,7 @@ impl Options {
             landing_claude: landing_home.join(".claude"),
             landing_codex: landing_home.join(".codex"),
             landing_index: LandingIndex::InLanding,
+            beside_suffix: None,
             dest_home: dest_home.to_path_buf(),
             dest_claude: dest_home.join(".claude"),
             dest_codex: dest_home.join(".codex"),
@@ -323,6 +330,34 @@ impl Options {
             (Ok(landing), Ok(dest)) => landing == dest,
             _ => false,
         }
+    }
+
+    /// `path` with the beside suffix appended, when the run has one.
+    #[must_use]
+    pub fn beside_of(&self, path: &Path) -> Option<PathBuf> {
+        let suffix = self.beside_suffix.as_ref()?;
+        let mut beside = path.as_os_str().to_owned();
+        beside.push(suffix);
+        Some(PathBuf::from(beside))
+    }
+
+    /// The landed rollout at `rel` (relative to the landed `.codex`) as the
+    /// re-seat reads it (second review of #280, N2): the file there, or, on
+    /// a live-home landing where that is a symlink (the destination's own
+    /// archive link, never read), the source's copy the pull landed beside
+    /// it when there is one.
+    #[must_use]
+    pub fn landed_codex(&self, rel: &Path) -> PathBuf {
+        let path = self.landing_codex.join(rel);
+        if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            if let Some(beside) = self
+                .beside_of(&path)
+                .filter(|beside| std::fs::symlink_metadata(beside).is_ok_and(|meta| meta.is_file()))
+            {
+                return beside;
+            }
+        }
+        path
     }
 
     /// [`Self::live_claude_landing`] for `.codex`: the landed `.codex` is the

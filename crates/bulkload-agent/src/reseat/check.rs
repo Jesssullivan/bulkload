@@ -652,8 +652,9 @@ fn check_claude(
     let live = options.live_claude_landing();
     for candidate in &sessions.list {
         // A live-home landing (C9): a re-seat's own placement is checked as
-        // its landed session's destination, not as a session of its own.
-        if live && claude::own_placement(options, ledger, &root, candidate)? {
+        // its landed session's destination, not as a session of its own; a
+        // destination archive link is never read (N2).
+        if live && (candidate.link || claude::own_placement(options, ledger, &root, candidate)?) {
             continue;
         }
         let cached = match ledger {
@@ -662,8 +663,12 @@ fn check_claude(
                 .filter(|row| row.landing == candidate.path),
             None => None,
         };
-        let (lane, key) = match claude::resolve(candidate, cached.as_ref(), lanes, (options, live))?
-        {
+        let (lane, key) = match claude::resolve(
+            candidate,
+            cached.as_ref(),
+            lanes,
+            (options, live && !candidate.beside),
+        )? {
             Resolved::Lane(_, lane) | Resolved::InPlace(_, Some(lane)) => {
                 let key = lane.key.clone();
                 (Some(lane), key)
@@ -823,7 +828,7 @@ fn check_codex(
                 options,
                 ledger,
                 &root.join(codex::dest_form(rel)),
-                &options.landing_codex.join(rel),
+                &options.landed_codex(rel),
             )?;
         }
         let held = match rel {
@@ -891,7 +896,7 @@ fn check_codex(
             }
             continue;
         }
-        let landed = options.landing_codex.join(&file.rel);
+        let landed = file.landed.clone();
         if file
             .rel
             .extension()
@@ -1104,7 +1109,7 @@ fn thread_holds(
     }
     // A destination file that cannot be read fails this thread, not the
     // check.
-    Ok(holds(&options.landing_codex.join(rel), &rollout, true).unwrap_or(Holds::Not("unreadable")))
+    Ok(holds(&options.landed_codex(rel), &rollout, true).unwrap_or(Holds::Not("unreadable")))
 }
 
 /// Each planned workspace's `estate-diff` class, when `--plan` was given.

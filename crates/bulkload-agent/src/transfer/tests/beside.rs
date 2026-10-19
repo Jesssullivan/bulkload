@@ -683,8 +683,10 @@ fn a_beside_name_the_source_also_holds_is_a_typed_refusal_of_one_seat() {
 /// `/nix/store` link, as sting's `~/.codex/AGENTS.md`) lands beside under
 /// `--beside`, the link untouched; without the flag it is refused
 /// `DESTINATION_OCCUPIED`, typed, never a bare `IO`. A directory over a
-/// destination symlink is refused typed, with every child, and nothing is
-/// written through the link.
+/// destination symlink (sting's `~/.claude/file-history/<uuid>` links into a
+/// repair tree; second review, finding 5) lands beside too, at
+/// `<dir><SUFFIX>/` with every entry under it, accounted `applied-beside`;
+/// nothing is written through the link, and a rerun reads nothing.
 #[test]
 fn a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed() {
     let beside = Beside::new();
@@ -694,11 +696,13 @@ fn a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed() {
     std::fs::create_dir(&store).unwrap();
     std::fs::write(store.join("agents.md"), b"home manager's\n").unwrap();
     std::fs::create_dir(store.join("dir")).unwrap();
+    std::fs::write(store.join("dir/theirs.txt"), b"the repair tree's\n").unwrap();
     std::os::unix::fs::symlink(store.join("agents.md"), destination.join("AGENTS.md")).unwrap();
     std::os::unix::fs::symlink(store.join("dir"), destination.join("d")).unwrap();
     std::fs::write(source.join("AGENTS.md"), b"neo's agents\n").unwrap();
-    std::fs::create_dir(source.join("d")).unwrap();
+    std::fs::create_dir_all(source.join("d/deeper")).unwrap();
     std::fs::write(source.join("d/inner.txt"), b"inner\n").unwrap();
+    std::fs::write(source.join("d/deeper/leaf.txt"), b"leaf\n").unwrap();
     settle(&beside.corpus);
 
     let without = beside.run_without();
@@ -708,35 +712,101 @@ fn a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed() {
         .map(|(path, code)| (String::from_utf8_lossy(path).into_owned(), code.clone()))
         .collect();
     codes.sort();
-    assert_eq!(
-        codes,
-        [
-            ("AGENTS.md".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
-            ("d".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
-            ("d/inner.txt".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
-        ]
+    assert!(
+        codes.iter().all(|(_, code)| code == "DESTINATION_OCCUPIED"),
+        "typed, never IO: {codes:?}"
     );
+    assert!(codes.contains(&("AGENTS.md".to_owned(), "DESTINATION_OCCUPIED".to_owned())));
+    assert!(codes.contains(&("d".to_owned(), "DESTINATION_OCCUPIED".to_owned())));
 
+    settle(&beside.corpus);
     let with = beside.run();
+    assert!(with.refusals.is_empty(), "{:?}", with.refusals);
+    let mut placed = applied(&with);
+    placed.sort();
     assert_eq!(
-        applied(&with),
-        [("AGENTS.md".to_owned(), beside_name("AGENTS.md"))]
+        placed,
+        [
+            ("AGENTS.md".to_owned(), beside_name("AGENTS.md")),
+            ("d".to_owned(), beside_name("d")),
+        ]
     );
     assert_eq!(
         std::fs::read(destination.join(beside_name("AGENTS.md"))).unwrap(),
         b"neo's agents\n"
     );
-    assert!(std::fs::symlink_metadata(destination.join("AGENTS.md"))
-        .unwrap()
-        .file_type()
-        .is_symlink());
+    let dir = destination.join(beside_name("d"));
+    assert_eq!(std::fs::read(dir.join("inner.txt")).unwrap(), b"inner\n");
+    assert_eq!(
+        std::fs::read(dir.join("deeper/leaf.txt")).unwrap(),
+        b"leaf\n"
+    );
+    for link in ["AGENTS.md", "d"] {
+        assert!(std::fs::symlink_metadata(destination.join(link))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
     assert_eq!(
         std::fs::read(store.join("agents.md")).unwrap(),
         b"home manager's\n"
     );
-    assert!(with
-        .refusals
-        .iter()
-        .all(|(_, code)| code == "DESTINATION_OCCUPIED"));
-    assert_eq!(std::fs::read_dir(store.join("dir")).unwrap().count(), 0);
+    let mut theirs: Vec<String> = std::fs::read_dir(store.join("dir"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    theirs.sort();
+    assert_eq!(theirs, ["theirs.txt"], "nothing written through the link");
+
+    settle(&beside.corpus);
+    let again = beside.run();
+    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
+    assert_eq!((again.source_bytes_read, again.bytes_received), (0, 0));
+    let mut placed_again = applied(&again);
+    placed_again.sort();
+    assert_eq!(placed_again, placed);
+}
+
+/// Second review of #280, N3: a beside output published from a racy
+/// capture (a source written within the racy window, as a live
+/// `history.jsonl` is) is still this seat's own: once the source changes,
+/// the next pass supersedes it at the beside path, never refusing it as a
+/// stranger's, and the live file stays untouched.
+#[test]
+fn a_racy_beside_output_is_still_this_seats_own() {
+    let beside = Beside::new();
+    let source = beside.source();
+    let destination = beside.destination();
+    let theirs = noise(371, 30_000);
+    std::fs::write(destination.join("config.json"), &theirs).unwrap();
+    let first_bytes = noise(372, 40_000);
+    let seat = source.join("config.json");
+    std::fs::write(&seat, &first_bytes).unwrap();
+    settle_racy_window(&destination).unwrap();
+    let racy = {
+        let clock = PinnedClock::at(&beside.corpus, stamp_ns(&seat) + 1);
+        let stats = beside.run();
+        drop(clock);
+        stats
+    };
+    assert!(racy.refusals.is_empty(), "{:?}", racy.refusals);
+    assert_eq!(
+        std::fs::read(destination.join(beside_name("config.json"))).unwrap(),
+        first_bytes
+    );
+
+    let second_bytes = noise(373, 45_000);
+    std::fs::write(&seat, &second_bytes).unwrap();
+    settle(&beside.corpus);
+    let next = beside.run();
+    assert!(next.refusals.is_empty(), "{:?}", next.refusals);
+    assert_eq!(
+        std::fs::read(destination.join(beside_name("config.json"))).unwrap(),
+        second_bytes,
+        "the racy beside output was this seat's own, so it was updated"
+    );
+    assert_eq!(
+        std::fs::read(destination.join("config.json")).unwrap(),
+        theirs
+    );
 }

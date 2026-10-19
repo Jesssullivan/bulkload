@@ -2222,9 +2222,23 @@ pub(crate) fn owner_key(row_key: &[u8]) -> Option<&[u8]> {
     row_key.get(..row_key.len().checked_sub(rest.len())?)
 }
 
+/// The mark every beside row's key ends with (review of #280, finding 4):
+/// a seat's beside path may be the live path of another source seat (the
+/// source holds `x` and `x<suffix>`), whose rows share the path's prefix.
+/// Only a marked row makes a file at a beside path that seat's own.
+pub(crate) const BESIDE_KEY_MARK: &[u8] = b"\0bulkload.beside.v1";
+
+/// The mark of the ownership row a racy capture's beside output gets
+/// (second review of #280, N3): the beside key with this mark in place of
+/// [`BESIDE_KEY_MARK`], in `outputs`. No reuse lookup ever asks for that
+/// key, so it is never a reuse key (#86), but it makes the output that
+/// seat's own, so a later pass supersedes it instead of refusing it as a
+/// stranger's.
+pub(crate) const BESIDE_RACY_MARK: &[u8] = b"\0bulkload.beside-racy.v1";
+
 /// Write an output's row inside the caller's transaction: its reuse row
 /// under its key, or, for a racy capture's output, its path's ownership row
-/// alone.
+/// alone (and, for a beside output, its marked ownership row, N3).
 fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
     if let Some(proof) = &output.extended {
         // M2r2 A-103: the prefix the extension proved, and what it made;
@@ -2255,6 +2269,16 @@ fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
         // seat, so it is never a reuse key.
         if let Some(owner) = owner_key(&output.key) {
             own_in(conn, owner, &output.identity)?;
+        }
+        if let Some(seat) = output.key.strip_suffix(BESIDE_KEY_MARK) {
+            let mut owner = seat.to_vec();
+            owner.extend_from_slice(BESIDE_RACY_MARK);
+            conn.execute(
+                "INSERT INTO outputs VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
+                (&owner, identity_bytes(&output.identity)?),
+            )
+            .map_err(sqlite_error)?;
         }
         return Ok(());
     }

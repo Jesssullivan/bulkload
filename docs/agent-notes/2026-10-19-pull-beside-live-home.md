@@ -225,6 +225,95 @@ superseded by the one added with the fixes.
 9. **Neo-key project directories stay inside the live `~/.claude`.** Not
    fixed in this PR (gap below).
 
+## Second review of #280 (2026-10-19, at `2290e26`) and the fixes
+
+Verdict of the second review: no path overwrites or loses live bytes, but
+it could not run on sting's real homes. `origin/main` (`9854236`, #281 and
+#282) is merged with a merge commit first. Each item below has a
+regression test built on sting's shape.
+
+- **N1: sting's `~/.claude` and `~/.codex` are symlinks** to
+  `/srv/fast-local/jess/state/{claude,codex}`. `estate-move` resolves a
+  symlinked live home once (`canonicalize`), requires a real directory this
+  user owns, and runs the transfer under the real path, following no further
+  link. An `estate-move sessions-home name=… live=… real=…` line names it,
+  and the transfer record's destination is the real path. Test:
+  `sessions_into_a_destination_with_no_codex_index_seed_it`, now with both
+  homes symlinked.
+- **N2: the destination's own archive links** (366 transcripts and 14,992
+  rollouts on sting link into `/srv/data/jess/archive`). On a live-home
+  landing they are never read or written through.
+  - `estate-reseat --beside-suffix SUFFIX` (new; estate-move passes
+    `.LABEL`) tells the re-seat how the pull named the source's copy landed
+    beside a link.
+  - Claude: a symlinked transcript with the source's copy beside it
+    (`<id>.jsonl.LABEL`, or under `<key>.LABEL/`) leaves that copy as the
+    landed session. The copy is placed at the lane's live name, and when
+    that name is a link into a `--replace-archived-dest` root it replaces
+    the link (A-106, existing placer rule; the archived fork stays).
+    Without the root it is `occupied` and holds the gate. A link with no
+    copy beside it is the destination's own and is `in-place`.
+  - Codex: the same rule through `Options::landed_codex`. A link with no
+    copy beside it is `landing-absent` for the snapshot's thread, and
+    `in-place` when unindexed.
+  - `estate-move --replace-archived-dest ROOT` (new) forwards the root.
+    Symlinked key directories on a live landing are the destination's own
+    and are not entered.
+  - Test: `archive_links_follow_a106_and_destination_links_stay`.
+- **N3: a racy capture's beside output** recorded only the shared
+  ownership row, so after the source changed it was refused as a stranger's.
+  Its row now also carries a beside mark (`BESIDE_RACY_MARK`, in `outputs`,
+  under a key no reuse lookup asks for). It is never reused, and a later
+  pass supersedes it. Test: `a_racy_beside_output_is_still_this_seats_own`.
+- **N4: an unmapped source session passed as in place.** Restored
+  `RESEAT_LANE_UNMAPPED` (typed, reviewable) for a source-keyed session
+  with no lane; only the destination's own sessions are in place. Test:
+  the archive test asserts `reseat_held=claude/RESEAT_LANE_UNMAPPED:1`.
+- **N5 (the Codex half of finding 7):** on a live landing, the
+  destination's own `.jsonl.gz`, its oddly named files and other forms are
+  `in-place`. So is a snapshot thread whose landed form is `.gz`: the bytes
+  are carried at the live name, and Codex reads no `.gz` on either host
+  (TIN-5268). Test: the archive test.
+- **Finding 5, directories:** under `--beside`, a directory whose live path
+  holds a symlink or another kind (sting's 275
+  `~/.claude/file-history/<uuid>` links into a repair tree) lands beside as
+  `<dir><SUFFIX>/`, accounted `applied-beside`. Every entry under it is
+  decided there, and the link is never followed. Live-mode re-seat skips
+  companions already at their own name (the per-ID trees), so it never
+  walks a linked `file-history/<id>` for a write. Test:
+  `a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed`.
+- **Finding 9, no duplicate bits: not in this PR; the next lane's spec.**
+  The pull *can* map neo project keys to destination keys at pull time, so
+  that nothing lands under a neo key. It is a receive-side change to how
+  each entry's destination path is keyed and recorded, so it gets its own
+  PR and review:
+  1. `pull`/`copy --map-prefix SRC_REL=DST_REL` (repeatable; receive side,
+     wire unchanged). An entry at `SRC_REL` or under `SRC_REL/` is decided,
+     keyed (`row_key` over the mapped row), recorded and published at
+     `DST_REL` plus the rest. Matching is by whole path components, and the
+     longest prefix wins. Two maps whose destinations nest or coincide
+     refuse `FIELD_DOMAIN_VIOLATION` before the session.
+  2. The transfer record names the source path and the mapped path (a
+     `mapped` entry outcome, accounted like `applied`). A mapped seat whose
+     destination holds something else follows `--beside` as any seat does;
+     two seats mapped onto one name in a session follow the finding-4 claim
+     rule (the second is typed `DESTINATION_OCCUPIED`).
+  3. `estate-move --sessions` builds the maps from the plan's lanes:
+     `projects/<key(S)>` becomes `projects/<key(D)>` for each lane `S → D`,
+     only when no other source working directory under SOURCE_HOME shares
+     `key(S)`. Keys are lossy, so the source's `projects/` names are
+     checked against the lanes, and an ambiguous key stays unmapped and is
+     re-keyed by the re-seat as today. The per-ID global trees need no map.
+  4. The re-seat then finds each mapped session `in-place` (lane key =
+     directory key) and copies nothing. Transcript bytes and `cwd` are
+     unchanged (C8).
+  5. Tests: a neo key mapped to the lane's destination key with no
+     `-Users-jess-*` directory created on the destination; byte-identical
+     transcripts; a rerun that reads 0; an ambiguous key that stays and is
+     re-seated.
+  6. The 80 neo-key directories already on sting are outside it: removing
+     a transcript is forbidden (C8, C9). They stay, reported as residue.
+
 ## Open
 
 - **Finding 9 (no duplicate bits, R4):** the source's transcripts land in
@@ -239,11 +328,13 @@ superseded by the one added with the fixes.
   so it is its own PR; not done here. Removing or linking the neo-key copy
   instead is ruled out (C8/C9: no transcript removed, none symlinked; the
   placer refuses hardlinks).
-- A directory seat over a destination symlink is refused, typed, with
-  every child, instead of landing the subtree beside.
-- A racy beside output records only its path's ownership row, which the
-  per-seat beside ownership does not count: a later pass refuses that
-  beside path `DESTINATION_OCCUPIED` instead of superseding it.
+- Re-keyed transcripts leave the neo-key copy in the live `~/.claude`
+  (finding 9, spec above), and an A-106 replacement keeps the source's
+  `<id>.jsonl.LABEL` copy beside the placed one: both are duplicate bytes
+  until the `--map-prefix` lane lands.
+- The second review notes that A-106's open-descriptor guard may not see
+  an open-append-close writer: a running destination session's next lines
+  can land in the placed copy (not lost, but no longer byte-identical).
 - Re-seat outcomes that hold the gate (`reseat_held=`) are not yet
   dispositionable by `closure-dispose`; whether an operator review may close
   one is a dated question for the operator, not decided here.

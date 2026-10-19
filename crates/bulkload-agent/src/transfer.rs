@@ -1032,11 +1032,7 @@ fn beside_row(row: &RowSchema, suffix: &[u8]) -> RowSchema {
     }
 }
 
-/// The mark every beside row's key ends with (review of #280, finding 4):
-/// a seat's beside path may be the live path of another source seat (the
-/// source holds `x` and `x<suffix>`), whose rows share the path's prefix.
-/// Only a marked row makes a file at the beside path this seat's own.
-const BESIDE_KEY_MARK: &[u8] = b"\0bulkload.beside.v1";
+use crate::transfer_store::BESIDE_KEY_MARK;
 
 /// The row key of a seat's beside output from its live row key: the keys
 /// of one path share the path's prefix ([`transfer_store::path_prefix`]),
@@ -4954,6 +4950,10 @@ struct Inbound<'a, W> {
     /// `--beside`: seats landed beside whatever their live path holds
     /// ([`set_beside_always`]).
     always: HashSet<Vec<u8>>,
+    /// `--beside` (second review of #280, finding 5): directories whose live
+    /// path holds a symlink or another kind, landed beside, by live path:
+    /// every entry under one is decided under its beside directory.
+    redirects: HashMap<Vec<u8>, Vec<u8>>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5235,6 +5235,7 @@ fn receive_session<R: Read, W: Write>(
             beside_of: HashMap::new(),
             claimed: HashSet::new(),
             always: beside_always(),
+            redirects: HashMap::new(),
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -5468,7 +5469,10 @@ impl<W: Write> Inbound<'_, W> {
     /// A walk frame's own handling.
     fn handle_walked(&mut self, frame: Walked) -> Result<()> {
         match frame {
-            Walked::Entry { entry, row, wal } => self.entry(entry, row, wal),
+            Walked::Entry { entry, row, wal } => {
+                let row = self.redirected(row);
+                self.entry(entry, row, wal)
+            }
             Walked::Refused {
                 rel_path,
                 code,
@@ -5580,10 +5584,7 @@ impl<W: Write> Inbound<'_, W> {
         let decided = match row.kind {
             FileKind::Directory => match self.batched.remove(&row.rel_path) {
                 Some(created) => created.map(|()| Decision::Skip),
-                None => self
-                    .target
-                    .directory(&row, self.store, &self.authority)
-                    .map(|()| Decision::Skip),
+                None => self.decide_directory(&row),
             },
             FileKind::Symlink => self.decide_symlink(&row),
             FileKind::Regular => self.decide_regular(&row, &key, snapshot.as_ref(), snapshot_mode),
@@ -5877,6 +5878,62 @@ impl<W: Write> Inbound<'_, W> {
             .target
             .existing(row)?
             .is_some_and(|(file, _)| extend_candidate(&file, row, root).is_some()))
+    }
+
+    /// `row` under the beside directory of its nearest redirected ancestor
+    /// (second review of #280, finding 5), or as it is.
+    fn redirected(&self, mut row: RowSchema) -> RowSchema {
+        if self.redirects.is_empty() {
+            return row;
+        }
+        let mut cut = None;
+        for (at, byte) in row.rel_path.iter().enumerate() {
+            if *byte == b'/' {
+                if let Some(beside) = row
+                    .rel_path
+                    .get(..at)
+                    .and_then(|dir| self.redirects.get(dir))
+                {
+                    cut = Some((at, beside.clone()));
+                }
+            }
+        }
+        if let Some((at, beside)) = cut {
+            let mut path = beside;
+            path.extend_from_slice(row.rel_path.get(at..).unwrap_or_default());
+            row.rel_path = path;
+        }
+        row
+    }
+
+    /// A directory seat: made, or entered when it is there. Under
+    /// `--beside` a live path holding a symlink or another kind (sting's
+    /// `~/.claude/file-history/<uuid>` links into a repair tree; second
+    /// review of #280, finding 5) gets the directory beside it, at
+    /// `<path><SUFFIX>`, accounted `applied-beside`, and every entry under
+    /// it is decided there; the link is never followed or replaced.
+    fn decide_directory(&mut self, row: &RowSchema) -> Result<Decision> {
+        if !self.claim(&row.rel_path) {
+            return Err(BulkloadRefusal::DestinationOccupied);
+        }
+        match self.target.directory(row, self.store, &self.authority) {
+            Err(BulkloadRefusal::DestinationOccupied) if self.beside.is_some() => {
+                let suffix = self.beside.clone().unwrap_or_default();
+                let beside = beside_row(row, &suffix);
+                if !self.claim(&beside.rel_path) {
+                    return Err(BulkloadRefusal::DestinationOccupied);
+                }
+                self.target
+                    .directory(&beside, self.store, &self.authority)?;
+                self.redirects
+                    .insert(row.rel_path.clone(), beside.rel_path.clone());
+                self.stats
+                    .applied_beside
+                    .push((row.rel_path.clone(), beside.rel_path));
+                Ok(Decision::Skip)
+            }
+            other => other.map(|()| Decision::Skip),
+        }
     }
 
     /// `--beside` (review of #280, finding 4): claim `path` for this
@@ -7843,14 +7900,7 @@ fn beside_target(
     let Some((file, parent)) = context.target.existing(beside).map_err(plain)? else {
         return Ok(BesideTarget::Fresh);
     };
-    let owned = owned_beside(
-        context.store,
-        context.authority,
-        beside,
-        &file,
-        BESIDE_KEY_MARK,
-    )
-    .map_err(plain)?;
+    let owned = owned_beside(context.store, context.authority, beside, &file).map_err(plain)?;
     let (verified, settled) = verify_settled(context.target.path(), &file, beside, manifest);
     match (verified, owned) {
         (Ok(identity), _) => Ok(BesideTarget::Adopt(file, parent, identity)),
@@ -7889,13 +7939,7 @@ fn beside_existing(
             StatIdentity::from_metadata(&found),
         ));
     }
-    match owned_beside(
-        context.store,
-        context.authority,
-        beside,
-        &file,
-        BESIDE_KEY_MARK,
-    )? {
+    match owned_beside(context.store, context.authority, beside, &file)? {
         Some(owned) if context.target.exchange_supported(beside)? => {
             Ok(BesideTarget::Supersede(Box::new(owned)))
         }

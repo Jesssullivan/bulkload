@@ -900,7 +900,13 @@ fn sessions_into_a_destination_with_no_codex_index_seed_it() {
     }
 
     // The destination: a live .claude with its own session that records no
-    // cwd, and no .codex at all.
+    // cwd, and an empty .codex with no index. Both are symlinks to real
+    // state directories, as sting's are (second review of #280, N1).
+    let state_dir = base.join("dst/state");
+    fs::create_dir_all(state_dir.join("claude")).unwrap();
+    fs::create_dir_all(state_dir.join("codex")).unwrap();
+    std::os::unix::fs::symlink(state_dir.join("claude"), dst_home.join(".claude")).unwrap();
+    std::os::unix::fs::symlink(state_dir.join("codex"), dst_home.join(".codex")).unwrap();
     let dst_claude = dst_home.join(".claude");
     let own_projects = dst_claude.join("projects").join(key(&dst_lane));
     fs::create_dir_all(&own_projects).unwrap();
@@ -948,6 +954,22 @@ fn sessions_into_a_destination_with_no_codex_index_seed_it() {
         "{}",
         moved.stdout
     );
+    // N1: each symlinked home was resolved once and named; the links stay.
+    for name in ["claude", "codex"] {
+        assert!(
+            moved
+                .stdout
+                .contains(&format!("estate-move sessions-home name={name} ")),
+            "{}",
+            moved.stdout
+        );
+    }
+    for link in [".claude", ".codex"] {
+        assert!(fs::symlink_metadata(dst_home.join(link))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
     let snapshot = dst_codex.join(format!("state_5.sqlite.{LABEL}"));
     assert!(
         snapshot.is_file(),
@@ -980,6 +1002,10 @@ fn sessions_into_a_destination_with_no_codex_index_seed_it() {
             .join(&rollout_rel)
             .to_str()
             .unwrap()
+    );
+    assert!(
+        state_dir.join("codex").join(&rollout_rel).is_file(),
+        "landed under the real path the link names"
     );
     let backfill: String = rusqlite::Connection::open_with_flags(
         format!("file:{}?immutable=1", live.display()),
@@ -1032,5 +1058,251 @@ fn sessions_into_a_destination_with_no_codex_index_seed_it() {
     assert_eq!(
         thread_cwds(&live),
         [(THREAD.to_owned(), dst_lane.to_str().unwrap().to_owned())]
+    );
+}
+
+/// Second review of #280, N2, N4 and N5, on sting's shapes. The
+/// destination's own transcripts and rollouts that are symlinks into an
+/// archive are never read.
+/// - When neo has the same session (A-106: "neo's version wins; fork stays
+///   in archive"), neo's copy becomes the file the picker reads at the live
+///   key, the link replaced, the archived fork left in the archive.
+/// - A link under a neo key with neo's copy landed beside it: the copy is
+///   re-keyed to the lane, the link stays.
+/// - A link neo has no copy of is the destination's own and stays,
+///   `in-place`.
+/// - The destination's own `.jsonl.gz` and oddly named rollouts are
+///   `in-place`.
+/// - A source session with no lane is `RESEAT_LANE_UNMAPPED`, typed, and
+///   holds the gate.
+#[test]
+fn archive_links_follow_a106_and_destination_links_stay() {
+    const SID_FORK: &str = "5e5e5e5e-3333-4222-8333-444444444444";
+    const SID_NEO_KEY: &str = "5e5e5e5e-4444-4222-8333-444444444444";
+    const SID_DEST: &str = "5e5e5e5e-5555-4222-8333-444444444444";
+    const SID_NO_LANE: &str = "5e5e5e5e-6666-4222-8333-444444444444";
+    const T_FORK: &str = "019a0000-0000-7000-8000-000000000009";
+    let base = std::env::temp_dir().join(format!("bulkload-move-archive-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let world = World {
+        base: fs::canonicalize(&base).unwrap(),
+    };
+    let base = &world.base;
+    let src_home = base.join("src/home");
+    let dst_home = base.join("dst/home");
+    let (src_git, dst_git) = (src_home.join("git"), dst_home.join("git"));
+    fs::create_dir_all(&src_git).unwrap();
+    fs::create_dir_all(&dst_git).unwrap();
+    repo(&src_git.join("lab"), "l.txt");
+    let (src_lane, dst_lane) = (src_git.join("lab"), dst_git.join("lab"));
+    let archive = base.join("archive");
+    fs::create_dir_all(&archive).unwrap();
+
+    // neo: two sessions of the lane and one whose cwd has no lane.
+    let src_projects = src_home.join(".claude/projects").join(key(&src_lane));
+    fs::create_dir_all(&src_projects).unwrap();
+    let neo = |sid: &str| transcript(sid, &src_lane, &format!("NEO-{sid}"));
+    for sid in [SID_FORK, SID_NEO_KEY] {
+        fs::write(src_projects.join(format!("{sid}.jsonl")), neo(sid)).unwrap();
+    }
+    let elsewhere = src_home.join("elsewhere");
+    let no_lane_projects = src_home.join(".claude/projects").join(key(&elsewhere));
+    fs::create_dir_all(&no_lane_projects).unwrap();
+    fs::write(
+        no_lane_projects.join(format!("{SID_NO_LANE}.jsonl")),
+        transcript(SID_NO_LANE, &elsewhere, "NOLANE"),
+    )
+    .unwrap();
+    fs::write(
+        src_home.join(".claude/settings.json"),
+        b"{\"cleanupPeriodDays\": 3650}\n",
+    )
+    .unwrap();
+    // neo's Codex: one thread of the lane.
+    let src_codex = src_home.join(".codex");
+    let fork_rel = format!("sessions/2026/10/19/rollout-2026-10-19T10-00-00-{T_FORK}.jsonl");
+    let neo_rollout = format!(
+        "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{T_FORK}\",\"cwd\":\"{}\"}}}}\n{{\"neo\":true}}\n",
+        src_lane.display()
+    );
+    fs::create_dir_all(src_codex.join(&fork_rel).parent().unwrap()).unwrap();
+    fs::write(src_codex.join(&fork_rel), &neo_rollout).unwrap();
+    codex_index(
+        &src_codex.join("state_5.sqlite"),
+        T_FORK,
+        src_codex.join(&fork_rel).to_str().unwrap(),
+        &src_lane,
+    );
+
+    // sting: archive links at the lane's key (a fork of a neo session, and
+    // one of its own) and under the neo key; a live index; its own .gz and
+    // an oddly named file among the rollouts; a rollout link into the
+    // archive for neo's thread.
+    let dst_claude = dst_home.join(".claude");
+    let dst_projects = dst_claude.join("projects").join(key(&dst_lane));
+    let neo_key_dir = dst_claude.join("projects").join(key(&src_lane));
+    fs::create_dir_all(&dst_projects).unwrap();
+    fs::create_dir_all(&neo_key_dir).unwrap();
+    fs::write(
+        dst_claude.join("settings.json"),
+        b"{\"cleanupPeriodDays\": 3650}\n",
+    )
+    .unwrap();
+    let fork_bytes = transcript(SID_FORK, &dst_lane, "FORK");
+    fs::write(archive.join("fork.jsonl"), &fork_bytes).unwrap();
+    std::os::unix::fs::symlink(
+        archive.join("fork.jsonl"),
+        dst_projects.join(format!("{SID_FORK}.jsonl")),
+    )
+    .unwrap();
+    fs::write(
+        archive.join("old-neo-key.jsonl"),
+        transcript(SID_NEO_KEY, &src_lane, "OLD"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        archive.join("old-neo-key.jsonl"),
+        neo_key_dir.join(format!("{SID_NEO_KEY}.jsonl")),
+    )
+    .unwrap();
+    fs::write(
+        archive.join("own.jsonl"),
+        transcript(SID_DEST, &dst_lane, "OWN"),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        archive.join("own.jsonl"),
+        dst_projects.join(format!("{SID_DEST}.jsonl")),
+    )
+    .unwrap();
+    let dst_codex = dst_home.join(".codex");
+    fs::create_dir_all(dst_codex.join("sessions/2026/10/19")).unwrap();
+    let archived_rollout: &[u8] =
+        b"{\"type\":\"session_meta\",\"payload\":{\"id\":\"fork\"}}\n{\"sting\":true}\n";
+    fs::write(archive.join("rollout-fork.jsonl"), archived_rollout).unwrap();
+    std::os::unix::fs::symlink(
+        archive.join("rollout-fork.jsonl"),
+        dst_codex.join(&fork_rel),
+    )
+    .unwrap();
+    codex_index(
+        &dst_codex.join("state_5.sqlite"),
+        T_FORK,
+        dst_codex.join(&fork_rel).to_str().unwrap(),
+        &dst_lane,
+    );
+    fs::write(dst_codex.join("state_5.sqlite-wal"), b"").unwrap();
+    let gz = dst_codex.join(
+        "sessions/2026/10/19/rollout-2026-10-18T09-00-00-019a0000-0000-7000-8000-00000000000a.jsonl.gz",
+    );
+    fs::write(&gz, b"\x1f\x8b old").unwrap();
+    let odd = dst_codex.join("sessions/2026/10/19/notes.txt");
+    fs::write(&odd, b"an odd name\n").unwrap();
+
+    let source_state = base.join("move-src");
+    let state = base.join("move-dst");
+    let map = format!("{}={}", src_git.display(), dst_git.display());
+    let sourced = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src_git,
+    ]));
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let moved = agent(&os(&[
+        &"estate-move",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"--replace-archived-dest",
+        &archive,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    assert!(
+        !moved.stdout.contains("refused:IO"),
+        "{}\n{}",
+        moved.stdout,
+        moved.stderr
+    );
+    assert!(
+        moved.stdout.contains("estate-move phase=reseat outcome=ok"),
+        "{}\n{}",
+        moved.stdout,
+        moved.stderr
+    );
+    // A-106: neo's copy is what the picker reads at the lane's key; the
+    // archived fork stays in the archive.
+    let at_live = dst_projects.join(format!("{SID_FORK}.jsonl"));
+    assert!(
+        fs::symlink_metadata(&at_live).unwrap().is_file(),
+        "{}",
+        moved.stdout
+    );
+    assert_eq!(fs::read_to_string(&at_live).unwrap(), neo(SID_FORK));
+    assert_eq!(
+        fs::read_to_string(archive.join("fork.jsonl")).unwrap(),
+        fork_bytes
+    );
+    assert!(
+        moved.stdout.contains("replaced-archived"),
+        "{}",
+        moved.stdout
+    );
+    // Under the neo key: the link stays, neo's copy (landed beside it) is
+    // re-keyed to the lane.
+    assert!(
+        fs::symlink_metadata(neo_key_dir.join(format!("{SID_NEO_KEY}.jsonl")))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_to_string(dst_projects.join(format!("{SID_NEO_KEY}.jsonl"))).unwrap(),
+        neo(SID_NEO_KEY)
+    );
+    // The destination's own link stays a link.
+    assert!(
+        fs::symlink_metadata(dst_projects.join(format!("{SID_DEST}.jsonl")))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    // Codex: neo's rollout replaces the archive link; the archived one stays.
+    let live_rollout = dst_codex.join(&fork_rel);
+    assert!(
+        fs::symlink_metadata(&live_rollout).unwrap().is_file(),
+        "{}",
+        moved.stdout
+    );
+    assert_eq!(fs::read_to_string(&live_rollout).unwrap(), neo_rollout);
+    assert_eq!(
+        fs::read(archive.join("rollout-fork.jsonl")).unwrap(),
+        archived_rollout
+    );
+    assert_eq!(fs::read(&gz).unwrap(), b"\x1f\x8b old");
+    assert_eq!(fs::read(&odd).unwrap(), b"an odd name\n");
+    // N4: the session with no lane holds the gate, typed and reviewable;
+    // nothing else does.
+    let totals = closure(&moved.stdout);
+    assert_eq!(
+        totals["reseat_held"], "claude/RESEAT_LANE_UNMAPPED:1",
+        "{}",
+        moved.stdout
+    );
+    assert!(
+        moved.stdout.contains("estate-move gate=fail"),
+        "{}",
+        moved.stdout
     );
 }

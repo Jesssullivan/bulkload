@@ -200,7 +200,7 @@ SUBCOMMANDS:
     estate-move --label LABEL --source SOURCE [--plan-only] [--exclude-union] [--no-hand-off]
                 [--activate-origin PREFIX]... [--side-root ROOT]... [--jobs N] [--dispositions LEDGER]
                 [--sessions SOURCE_HOME [--codex-source-root DIR] [--dest-home DIR]
-                 [--map SRC=DST]... [--reseat-arg ARG]...]
+                 [--map SRC=DST]... [--reseat-arg ARG]... [--replace-archived-dest ROOT]...]
                 [--remote-executable PATH [--ssh-config FILE]]
                 HOST|- SOURCE_MOVE_STATE MOVE_STATE
                 M2 item 7 (design 2026-10-16-estate-move-design.md), the
@@ -244,18 +244,26 @@ SUBCOMMANDS:
                 SOURCE_HOME/.claude and the Codex root (--codex-source-root,
                 default SOURCE_HOME/.codex) are pulled with --beside .LABEL
                 into the LIVE DEST_HOME/.claude and DEST_HOME/.codex
-                (--dest-home, default $HOME), transfer records in
+                (--dest-home, default $HOME; a home that is a symlink, as
+                sting's are, is resolved once to its real directory, which
+                this user must own, and named on an estate-move
+                sessions-home line), transfer records in
                 MOVE_STATE/pull/{claude,codex}: equal files adopted, grown
-                append-only files extended, differing files and the live
-                Codex index's snapshot landed beside as <path>.LABEL. Then,
+                append-only files extended, differing files, nodes of
+                another kind (directories included) and the Codex index's
+                snapshot landed beside as <path>.LABEL. Then,
                 when both sessions completed (paths refused in them stay
                 typed refusals in closure), estate-reseat --lanes-from-plan
                 with each --map and --reseat-arg (one estate-reseat option
                 per flag, e.g. --no-regularize, --unmapped=by-id) re-keys
                 the landed sessions from the live home into DEST_HOME
-                (landing = DEST_HOME; the landed Codex index is
-                state_5.sqlite.LABEL when the live index was kept), state
-                MOVE_STATE/reseat. 7
+                (landing = DEST_HOME, --beside-suffix .LABEL; the landed
+                Codex index is the state_5.sqlite.LABEL this pass's record
+                names, else none; a destination with no index is seeded
+                from it). A destination transcript or rollout that links
+                into a --replace-archived-dest ROOT is replaced by the
+                source's copy of that session (A-106); one with no source
+                copy stays, in place. State MOVE_STATE/reseat. 7
                 closure: closure-report over the plan (with --dispositions, the
                 closure-dispose ledger joined) and, with --sessions, over the
                 two session transfer records (applied-beside accounted,
@@ -447,7 +455,7 @@ SUBCOMMANDS:
     estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
                   [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
                   [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
-                  [--landing-codex-index FILE | --no-landing-codex-index]
+                  [--landing-codex-index FILE | --no-landing-codex-index] [--beside-suffix SUFFIX]
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
@@ -1875,6 +1883,7 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
     let mut roots = Vec::new();
     let (mut landing_claude, mut landing_codex) = (None, None);
     let mut landing_index = bulkload_agent::reseat::LandingIndex::InLanding;
+    let mut beside_suffix = None;
     let mut unmapped = Unmapped::Report;
     let mut marker = None;
     let mut sessions_only = false;
@@ -1902,6 +1911,16 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
             "--no-default-by-id" => default_by_id = false,
             "--no-landing-codex-index" => {
                 landing_index = bulkload_agent::reseat::LandingIndex::Absent;
+            }
+            "--beside-suffix" => {
+                let suffix = value(at + 1)?
+                    .to_str()
+                    .filter(|suffix| {
+                        bulkload_agent::transfer::beside_suffix_allowed(suffix.as_bytes())
+                    })
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                beside_suffix = Some(suffix.to_owned());
+                step = 2;
             }
             "--unmapped=report" => unmapped = Unmapped::Report,
             "--unmapped=by-id" => unmapped = Unmapped::ById,
@@ -2054,6 +2073,7 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
         options.landing_codex = path;
     }
     options.landing_index = landing_index;
+    options.beside_suffix = beside_suffix;
     if !roots.is_empty() {
         options.codex_source_roots = roots;
     }

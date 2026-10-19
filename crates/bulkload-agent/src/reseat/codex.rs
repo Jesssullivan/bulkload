@@ -483,7 +483,7 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
         total = total.saturating_add(place::planned(
             ledger,
             &root.join(dest_form(&rel)),
-            &options.landing_codex.join(&rel),
+            &options.landed_codex(&rel),
             &options.replace_archived,
         )?);
     }
@@ -499,10 +499,13 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
         {
             continue;
         }
+        if file.link {
+            continue;
+        }
         total = total.saturating_add(place::planned(
             ledger,
             &root.join(dest_form(&file.rel)),
-            &options.landing_codex.join(&file.rel),
+            &file.landed,
             &options.replace_archived,
         )?);
     }
@@ -520,8 +523,16 @@ struct Pending {
 /// One landed rollout file under a rollout tree, relative to `.codex`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Unindexed {
+    /// Its name relative to the landed `.codex`, as the destination names
+    /// it (a beside landing without its suffix).
     pub rel: PathBuf,
     pub id: Option<String>,
+    /// The file read for it: `landing_codex/rel`, or the source's copy
+    /// landed beside it ([`Options::landed_codex`], N2).
+    pub landed: PathBuf,
+    /// A symlink with no copy of the source's beside it: on a live-home
+    /// landing, the destination's own archive link, never read (N2).
+    pub link: bool,
 }
 
 /// The thread ID in a rollout file name (`rollout-<ts>-<uuid>.jsonl…`).
@@ -547,11 +558,32 @@ pub fn rollout_id(name: &str) -> Option<String> {
 /// # Errors
 /// The I/O refusal of a listing.
 pub fn unindexed(options: &Options, named: &BTreeSet<PathBuf>) -> Result<Vec<Unindexed>> {
+    let live = options.live_codex_landing();
+    let suffix = options.beside_suffix.as_deref().filter(|_| live);
     let mut out = Vec::new();
     for tree in TREES {
         let base = options.landing_codex.join(tree);
-        for rel in super::claude::walk(&base)? {
-            let rel = Path::new(tree).join(rel);
+        for found in super::claude::walk(&base)? {
+            let found = Path::new(tree).join(found);
+            let landed = options.landing_codex.join(&found);
+            // On a live-home landing (second review of #280, N2): the
+            // source's copy landed beside a live path of another kind is
+            // listed under that live name; a symlink with that copy beside
+            // it is left to the copy, one without is the destination's own.
+            let mapped = suffix.and_then(|suffix| {
+                found
+                    .to_str()
+                    .and_then(|text| text.strip_suffix(suffix))
+                    .map(PathBuf::from)
+            });
+            let link = mapped.is_none()
+                && std::fs::symlink_metadata(&landed)
+                    .is_ok_and(|meta| meta.file_type().is_symlink());
+            if link && options.landed_codex(&found) != landed {
+                continue;
+            }
+            let link = link && suffix.is_some();
+            let rel = mapped.unwrap_or(found);
             if named.contains(&rel) {
                 continue;
             }
@@ -559,7 +591,12 @@ pub fn unindexed(options: &Options, named: &BTreeSet<PathBuf>) -> Result<Vec<Uni
                 .file_name()
                 .and_then(|name| name.to_str())
                 .and_then(rollout_id);
-            out.push(Unindexed { rel, id });
+            out.push(Unindexed {
+                rel,
+                id,
+                landed,
+                link,
+            });
         }
     }
     Ok(out)
@@ -672,6 +709,17 @@ pub fn reseat(
                     )?;
                     continue;
                 }
+                if word == "in-place" {
+                    summary.session(TOOL, "in-place");
+                    emit(&thread_line(
+                        (&thread.id, &thread.cwd),
+                        None,
+                        "in-place",
+                        None,
+                        None,
+                    ))?;
+                    continue;
+                }
                 let counted = if unrooted {
                     format!("{}:rollout-root", refusal.code())
                 } else if word == "refused" {
@@ -711,7 +759,7 @@ pub fn reseat(
                 respells.push((thread.id.clone(), old, dest_cwd.clone()));
             }
             if let Some(holding) = &claim.holds {
-                let landed = options.landing_codex.join(&rel);
+                let landed = options.landed_codex(&rel);
                 let proved = prove(
                     ledger,
                     holding,
@@ -742,7 +790,7 @@ pub fn reseat(
                 continue;
             }
         }
-        let landed = options.landing_codex.join(&rel);
+        let landed = options.landed_codex(&rel);
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
             .with_rebind(&options.rebind);
@@ -1620,7 +1668,28 @@ fn reseat_unindexed(
     // written.
     let live = options.live_codex_landing();
     for file in unindexed(options, named)? {
-        let landed = options.landing_codex.join(&file.rel);
+        let landed = file.landed.clone();
+        // A live-home landing (second review of #280, N2 and N5): the
+        // destination's own archive link, its own `.jsonl.gz` and its
+        // oddly named files are in place, never read; so is another form of
+        // a thread the snapshot names (the bytes of both are carried).
+        if live
+            && (file.link
+                || file.id.is_none()
+                || file
+                    .rel
+                    .extension()
+                    .is_some_and(|extension| extension == "gz")
+                || file.id.as_deref().is_some_and(|id| ids.contains(id)))
+        {
+            let shown = file
+                .id
+                .clone()
+                .unwrap_or_else(|| file.rel.to_string_lossy().into_owned());
+            summary.session(TOOL, "in-place");
+            emit(&thread_line((&shown, ""), None, "in-place", None, None))?;
+            continue;
+        }
         let shown_id = file
             .id
             .clone()
@@ -2212,6 +2281,32 @@ fn locate(options: &Options, lanes: &Lanes, thread: &Thread) -> Result<Located> 
             None,
         )));
     };
+    // A live-home landing (second review of #280, N2): the destination's
+    // own archive link there, with no copy of the source's beside it, is
+    // never read; the thread is as if its landed rollout were absent.
+    let live = options.live_codex_landing();
+    if live
+        && options.beside_suffix.is_some()
+        && std::fs::symlink_metadata(options.landing_codex.join(&rel))
+            .is_ok_and(|meta| meta.file_type().is_symlink())
+        && options.landed_codex(&rel) == options.landing_codex.join(&rel)
+    {
+        return Ok(Err((
+            "landing-absent",
+            BulkloadRefusal::CaptureAbsent,
+            None,
+        )));
+    }
+    // A `.jsonl.gz` on a live-home landing is carried at its live name
+    // byte for byte; Codex reads no `.gz` on either host (TIN-5268), so
+    // there is nothing to re-seat: in place (second review of #280, N5).
+    if live && rel.extension().is_some_and(|extension| extension == "gz") {
+        return Ok(Err((
+            "in-place",
+            BulkloadRefusal::ReseatUnreadableForm,
+            Some(rel),
+        )));
+    }
     if rel.extension().is_some_and(|extension| extension == "gz") {
         return Ok(Err((
             "unreadable-form",

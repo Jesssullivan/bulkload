@@ -339,6 +339,11 @@ struct Move {
     maps: Vec<(PathBuf, PathBuf)>,
     reseat_args: Vec<OsString>,
     dispositions: Option<PathBuf>,
+    /// `--replace-archived-dest ROOT` (A-106, second review of #280 N2):
+    /// passed to `estate-reseat`, so a destination transcript or rollout
+    /// that links into ROOT is replaced by the source's copy of that session
+    /// (the archived fork stays in ROOT).
+    archived: Vec<PathBuf>,
     remote: Option<OsString>,
     config: Option<OsString>,
     jobs: usize,
@@ -364,6 +369,7 @@ impl Move {
             maps: Vec::new(),
             reseat_args: Vec::new(),
             dispositions: None,
+            archived: Vec::new(),
             remote: None,
             config: None,
             jobs: 2,
@@ -423,6 +429,7 @@ impl Move {
                         .cloned()
                         .ok_or(BulkloadRefusal::RequiredFieldMissing)?,
                 ),
+                "--replace-archived-dest" => parsed.archived.push(absolute(args.get(at + 1))?),
                 "--dispositions" if parsed.dispositions.is_none() => {
                     parsed.dispositions = Some(absolute(args.get(at + 1))?);
                 }
@@ -472,7 +479,8 @@ impl Move {
             && (parsed.codex_root.is_some()
                 || parsed.dest_home.is_some()
                 || !parsed.maps.is_empty()
-                || !parsed.reseat_args.is_empty())
+                || !parsed.reseat_args.is_empty()
+                || !parsed.archived.is_empty())
         {
             return Err(BulkloadRefusal::RequiredFieldMissing);
         }
@@ -509,17 +517,36 @@ impl Move {
     // [`Self::transfer`] into a live destination tree (the agent's own home
     // directory, plan of record 2026-10-19 C9): created 0700 when absent,
     // else taken as it is, whatever its mode (its mode is the agent's, not
-    // bulkload's to tighten); a non-directory there refuses
-    // PATH_ESCAPES_ROOT.
+    // bulkload's to tighten). A symlink there (sting's `~/.claude` and
+    // `~/.codex` link to `/srv/fast-local/jess/state/{claude,codex}`; second
+    // review of #280, N1) is resolved once: its real path must be a
+    // directory this user owns, and the transfer then runs under that real
+    // path, following no further link; the line below and the transfer's
+    // record (its destination is the real path) name it. Anything else
+    // refuses PATH_ESCAPES_ROOT.
     fn transfer_live(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
-        use std::os::unix::fs::DirBuilderExt as _;
-        match std::fs::DirBuilder::new().mode(0o700).create(to) {
-            Ok(()) => {}
+        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+        let real = match std::fs::DirBuilder::new().mode(0o700).create(to) {
+            Ok(()) => to.to_path_buf(),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if !std::fs::symlink_metadata(to)
-                    .refuse_at("estate_move::transfer_live")?
-                    .is_dir()
-                {
+                let found =
+                    std::fs::symlink_metadata(to).refuse_at("estate_move::transfer_live")?;
+                if found.is_dir() {
+                    to.to_path_buf()
+                } else if found.file_type().is_symlink() {
+                    let real = std::fs::canonicalize(to).refuse_at("estate_move::transfer_live")?;
+                    let resolved =
+                        std::fs::symlink_metadata(&real).refuse_at("estate_move::transfer_live")?;
+                    // SAFETY: geteuid has no preconditions or side effects.
+                    let me = unsafe { libc::geteuid() };
+                    if !resolved.is_dir() || resolved.uid() != me {
+                        return Err(BulkloadRefusal::PathEscapesRoot);
+                    }
+                    out(&format!(
+                        "estate-move sessions-home name={name} live={to:?} real={real:?}"
+                    ))?;
+                    real
+                } else {
                     return Err(BulkloadRefusal::PathEscapesRoot);
                 }
             }
@@ -529,8 +556,8 @@ impl Move {
                     "estate_move::transfer_live",
                 ))
             }
-        }
-        self.transfer_into(from, to, name)
+        };
+        self.transfer_into(from, &real, name)
     }
 
     fn transfer_into(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
@@ -1135,6 +1162,16 @@ fn reseat(
         args.extend(["--map".into(), pair]);
     }
     args.extend(run.reseat_args.iter().cloned());
+    // The pull's beside suffix, so the re-seat reads the source's copy
+    // beside a destination archive link (second review of #280, N2), and
+    // the archive roots A-106 replaces links into.
+    args.extend(["--beside-suffix".into(), run.suffix().into()]);
+    for root in &run.archived {
+        args.extend([
+            "--replace-archived-dest".into(),
+            root.clone().into_os_string(),
+        ]);
+    }
     // Review of #280, finding 6: the landed index is the snapshot this
     // pass took, named by this pass's Codex transfer record, or none: never
     // the live index, never an earlier pass's snapshot.
