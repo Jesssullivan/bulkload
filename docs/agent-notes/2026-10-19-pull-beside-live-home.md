@@ -114,7 +114,41 @@ and every refusal is typed and dispositioned (SEAT-12, `slo.md` S4)."
 
 ## Receipt
 
-Filled in below once the honey run is complete (host, head, summary lines).
+Host `honey`, head `cf1166bde850cbad676449048ebec400b3db4e76` (the pushed
+branch, checked out detached in `~/git-build/beside-live-home-20261019`),
+`CARGO_TARGET_DIR=~/git-build/target-beside-live-home`,
+`TMPDIR=/var/tmp/jess-bulkload-tests/pull-beside-live-home-20261019`, every
+command under `nice -n 19 nix develop --no-write-lock-file
+--ignore-environment .#default`. Logs on honey:
+`~/git-build/logs/beside-live-home-testall-cf1166b.log`,
+`~/git-build/logs/beside-live-home-rustcheck-cf1166b.log`.
+
+- `cargo test -p bulkload-agent --locked`: exit 0; 39 test binaries,
+  1233 passed, 0 failed, 8 ignored (lib: `test result: ok. 924 passed; 0
+  failed; 6 ignored`).
+- `just rust-check`: `cargo fmt --all -- --check` ok; `cargo clippy
+  --workspace --all-targets --locked -- -D warnings` ok; `cargo clippy -p
+  bulkload-agent --all-targets --locked --features io-trace -- -D warnings`
+  ok; `rust-test`: every group (1-unit, 2-integration-a-e,
+  3-integration-f-g, 4-integration-rest, 5-doc) ended with status 0, "all
+  42 test executables ran, in 5 groups", 1277 passed, 0 failed, 9 ignored;
+  `just rust-check` exit 0.
+- `just darwin-touched`: yes (counters.rs, materialize.rs, reseat.rs carry
+  platform cfgs already; this diff adds none). `just darwin-check` on pzm is
+  owed before merge (OI-1003-Q199), not run in this lane.
+- The commit that adds this receipt changes only this Markdown file over
+  `cf1166b`.
+
+Earlier run at `faddd661` (the first commit) on the same host: 922 passed,
+2 failed in the lib. `materialize::tests::the_ext_magic_reads_its_mount_type_by_major_and_minor`
+collided with the TMPDIR device (honey `/var/tmp` is 253:0, the fixture's
+hardcoded root), fixed by `cf1166b` (test only).
+`reseat::tests::findings::space::a_regularization_keeps_the_placements_bytes_reserved_then_retries`
+failed once: it reserves all but half a 64 MiB link against a live probe of
+free space, and honey's root filesystem moved more than that between probe
+and check under load. It passed in the targeted run before and in the
+`cf1166b` run, and the code it drives (`regularize`) is untouched here: a
+host-load flake, recorded, not fixed in this lane.
 
 ## Open
 
