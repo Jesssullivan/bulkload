@@ -708,10 +708,13 @@ fn a_seat_over_a_destination_symlink_lands_beside_or_refuses_typed() {
         .map(|(path, code)| (String::from_utf8_lossy(path).into_owned(), code.clone()))
         .collect();
     codes.sort();
+    // Without the flag a regular seat over a symlink is the wrong kind of
+    // node (#283 review 3: DESTINATION_KIND_MISMATCH, never followed); the
+    // directory seat and the seat beneath it are occupied.
     assert_eq!(
         codes,
         [
-            ("AGENTS.md".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
+            ("AGENTS.md".to_owned(), "DESTINATION_KIND_MISMATCH".to_owned()),
             ("d".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
             ("d/inner.txt".to_owned(), "DESTINATION_OCCUPIED".to_owned()),
         ]

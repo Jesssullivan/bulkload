@@ -6499,8 +6499,7 @@ impl<W: Write> Inbound<'_, W> {
                 // (`DESTINATION_KIND_MISMATCH`, #283 review 3) or a
                 // non-directory on the way (`DESTINATION_OCCUPIED`).
                 Err(
-                    BulkloadRefusal::DestinationOccupied
-                    | BulkloadRefusal::DestinationKindMismatch,
+                    BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch,
                 ) if self.beside.is_some() => (None, true),
                 found => (found?, false),
             }
