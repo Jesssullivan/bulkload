@@ -15,8 +15,10 @@
 //!   prefix (else kept: same paths, axiom 1). A linked worktree found under
 //!   a root brings its whole group, main included, even when the main is
 //!   outside every root (nothing excluded, axiom 2). What is not a Git
-//!   checkout (a symlink, a plain file, a prunable worktree, an unreadable
-//!   repository) is a [`Note`], printed and counted, never silently dropped.
+//!   checkout (a symlink, a plain file, a tree holding no repository, a
+//!   prunable worktree, an unreadable repository) is a [`Note`], printed and
+//!   counted, never silently dropped; `estate-move`'s notes phase carries
+//!   every one it can ([`notes`], 2026-10-19).
 //! - [`presence`] (destination, read-only): what the live path holds now.
 //! - [`action`] (pure): one action per item from its capture and presence,
 //!   the design's table (section 2.1 step 5). Apply decides adopt-or-beside
@@ -39,6 +41,8 @@ use super::{id, read, write, Item};
 use crate::git_carry::converge;
 use crate::{BulkloadRefusal, Result};
 
+pub mod notes;
+
 /// One item [`inventory`] plans, with its shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Planned {
@@ -47,15 +51,40 @@ pub struct Planned {
     pub kind: &'static str,
 }
 
-/// Something under a source root that is not planned, and why: printed and
-/// counted by `estate-move-source` (nothing is dropped silently).
+/// Something under a source root that is not planned, and why.
+///
+/// Printed and counted by `estate-move-source` (nothing is dropped
+/// silently), and carried by `estate-move`'s notes phase where it can be
+/// ([`notes`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Note {
     pub path: PathBuf,
-    /// `symlink` (not followed), `not-git` (plain files directly in a
-    /// directory the walk descended; `count` of them), `prunable` (a
-    /// registered worktree whose directory is gone), `unreadable` (Git
-    /// refused to list the repository's worktrees; `code`).
+    /// What it is (2026-10-19; the words before it are in [`notes::LEGACY`]):
+    ///
+    /// - `not-git-file`: one plain file (or other non-directory node)
+    ///   directly in a directory that holds a repository somewhere beneath
+    ///   it (`~/git/clockdiag-receipt.txt`, a `*.worktrees` directory's
+    ///   logs); `count` 1;
+    /// - `not-git-tree`: a directory that holds no repository at all, the
+    ///   outermost such one (an archive, `.idea`, `.direnv`, a scaffold);
+    ///   `count` the non-directory entries beneath it, at least 1;
+    /// - `symlink`: a symlink directly in a directory that holds a
+    ///   repository (one inside a `not-git-tree` is that tree's); never
+    ///   followed;
+    /// - `prunable`: a registered worktree Git lists prunable (its directory
+    ///   is gone, `code` `SOURCE_ROOT_MISSING`, or no longer names its
+    ///   administration);
+    /// - `not-in-census`: a Git directory its repository does not list (a
+    ///   copied or moved worktree);
+    /// - `unreadable`: Git refused to list the repository's worktrees, or a
+    ///   root, directory or entry could not be read; `code`
+    ///   (`SOURCE_ROOT_UNREADABLE` for a read, #283 review 5 for a root,
+    ///   2026-10-19 beneath one);
+    /// - `source-vanished`: a `SOURCE_ROOT` gone when the pass reached it
+    ///   (`SOURCE_ROOT_MISSING`, #277), or a name beneath one gone mid-walk
+    ///   (`SOURCE_VANISHED`);
+    /// - `nested`: a nested repository a capture holds as custody only (its
+    ///   path: the item's source joined with the nest's).
     pub what: &'static str,
     pub count: u64,
     pub code: Option<&'static str>,
@@ -101,71 +130,195 @@ pub fn inventory(roots: &[PathBuf], maps: &[(PathBuf, PathBuf)]) -> Result<Inven
         group(directory, maps, (&mut seen, &mut items, &mut notes));
     }
     items.sort_by(|a, b| a.item.source.cmp(&b.item.source));
+    // A prunable worktree whose directory is still there (it lost its
+    // `.git`) is one note, not two: its tree is the prunable note's, which
+    // counts the tree's entries.
+    let prunable: BTreeMap<PathBuf, u64> = notes
+        .iter()
+        .filter(|note| note.what == notes::TREE)
+        .map(|note| (note.path.clone(), note.count))
+        .filter(|(path, _)| {
+            notes
+                .iter()
+                .any(|note| note.what == "prunable" && note.path == *path)
+        })
+        .collect();
+    notes.retain(|note| !(note.what == notes::TREE && prunable.contains_key(&note.path)));
+    for note in &mut notes {
+        if let Some(count) = prunable.get(&note.path).filter(|_| note.what == "prunable") {
+            note.count = *count;
+        }
+    }
+    notes.sort_by(|a, b| (&a.path, a.what).cmp(&(&b.path, b.what)));
     Ok(Inventory { items, notes })
 }
 
+// What the walk saw of one directory that is not a Git directory: its
+// parent's index in the walk's list (none for a root), and the plain files
+// and symlinks directly in it.
+struct Seen {
+    path: PathBuf,
+    parent: Option<usize>,
+    files: Vec<PathBuf>,
+    links: Vec<PathBuf>,
+}
+
 // Every Git directory under `roots` (the walk stops at one and follows no
-// symlink), and the notes for what is not one.
+// symlink), and the notes for what is not one (2026-10-19): a directory
+// that holds no repository anywhere beneath it is one `not-git-tree` note
+// (the outermost one only: its own trees, files and links are its); in a
+// directory that does hold one, each plain file is a `not-git-file` note
+// and each symlink a `symlink` note. A seat the walk cannot read is a typed
+// note ([`typed_note`], [`seat_refusal`]).
+#[allow(clippy::too_many_lines)] // The walk, then its notes.
 fn walk(roots: &[PathBuf]) -> Result<(Vec<PathBuf>, Vec<Note>)> {
     const SITE: &str = "estate::moving::walk";
     let mut found = Vec::new();
     let mut notes = Vec::new();
+    let mut seen: Vec<Seen> = Vec::new();
+    // Whether each seen directory holds a Git directory beneath it.
+    let mut holds: Vec<bool> = Vec::new();
+    let mut usable = 0_usize;
+    let mut first_refusal = None;
     for root in roots {
-        let root = fs::canonicalize(root).refuse_at(SITE)?;
-        let mut stack = vec![root];
-        while let Some(directory) = stack.pop() {
-            if git_directory(&directory) {
-                found.push(directory);
+        // #277: the source is live (S5, Q152), so a root listed moments ago
+        // may be gone or unreadable by the time the pass reaches it. That is
+        // a typed note the pass continues past, never the whole pass's
+        // refusal; only a pass with no usable root at all refuses, with
+        // the first root's refusal.
+        let root = match fs::canonicalize(root) {
+            Ok(root) => root,
+            Err(error) => {
+                let refusal = crate::refuse::source_root(&error, SITE);
+                notes.push(typed_note(root.clone(), &refusal));
+                first_refusal.get_or_insert(refusal);
                 continue;
             }
-            // A directory or entry the walk cannot read (a protected folder,
-            // a name removed under the live source) is a note, never the
-            // whole inventory's refusal.
+        };
+        let mut stack: Vec<(PathBuf, Option<usize>)> = vec![(root.clone(), None)];
+        while let Some((directory, parent)) = stack.pop() {
+            let is_root = directory == root;
+            if git_directory(&directory) {
+                usable += usize::from(is_root);
+                found.push(directory);
+                // Every directory above it, up to its root, holds one.
+                let mut at = parent;
+                while let Some(index) = at {
+                    match holds.get_mut(index) {
+                        Some(held) if !*held => *held = true,
+                        _ => break,
+                    }
+                    at = seen.get(index).and_then(|above| above.parent);
+                }
+                continue;
+            }
+            // A directory or entry the walk cannot read (a protected folder)
+            // is a note, never the whole inventory's refusal; one removed
+            // since its parent listed it is gone.
             let listed: std::io::Result<Vec<PathBuf>> =
                 fs::read_dir(&directory).and_then(|entries| {
                     entries
                         .map(|entry| entry.map(|entry| entry.path()))
                         .collect()
                 });
+            // The root itself (mode 000, or gone since it was resolved) is
+            // the root's typed refusal and leaves the root unusable; a
+            // directory beneath it gone since its listing is
+            // `SOURCE_VANISHED` (#283 review 5), and any other failure
+            // beneath the root is typed too ([`seat_refusal`]).
             let mut entries = match listed {
-                Ok(entries) => entries,
+                Ok(entries) => {
+                    usable += usize::from(is_root);
+                    entries
+                }
+                Err(error) if is_root => {
+                    let refusal = crate::refuse::source_root(&error, SITE);
+                    notes.push(typed_note(directory, &refusal));
+                    first_refusal.get_or_insert(refusal);
+                    continue;
+                }
                 Err(error) => {
-                    notes.push(unreadable(directory, &crate::refuse::io(&error, SITE)));
+                    notes.push(typed_note(directory, &seat_refusal(&error, SITE)));
                     continue;
                 }
             };
             entries.sort();
-            let mut plain = 0u64;
+            let index = seen.len();
+            let mut here = Seen {
+                path: directory,
+                parent,
+                files: Vec::new(),
+                links: Vec::new(),
+            };
             // Pushed in reverse so the walk visits names in order.
             for path in entries.into_iter().rev() {
+                // Listed and gone before its stat: `SOURCE_VANISHED`.
                 let meta = match fs::symlink_metadata(&path) {
                     Ok(meta) => meta,
                     Err(error) => {
-                        notes.push(unreadable(path, &crate::refuse::io(&error, SITE)));
+                        notes.push(typed_note(path, &seat_refusal(&error, SITE)));
                         continue;
                     }
                 };
                 if meta.is_symlink() {
-                    notes.push(Note {
-                        path,
-                        what: "symlink",
-                        count: 1,
-                        code: None,
-                    });
+                    here.links.push(path);
                 } else if meta.is_dir() {
-                    stack.push(path);
+                    stack.push((path, Some(index)));
                 } else {
-                    plain += 1;
+                    here.files.push(path);
                 }
             }
-            if plain > 0 {
-                notes.push(Note {
-                    path: directory,
-                    what: "not-git",
-                    count: plain,
-                    code: None,
-                });
-            }
+            here.files.reverse();
+            here.links.reverse();
+            seen.push(here);
+            holds.push(false);
+        }
+    }
+    if usable == 0 {
+        if let Some(refusal) = first_refusal {
+            return Err(refusal);
+        }
+    }
+    // Each directory's entries beneath it: a directory is listed after its
+    // parent, so the list read backwards sums every subtree before its
+    // parent.
+    let mut beneath = vec![0_u64; seen.len()];
+    for index in (0..seen.len()).rev() {
+        let Some(dir) = seen.get(index) else {
+            continue;
+        };
+        let own = u64::try_from(dir.files.len() + dir.links.len()).unwrap_or(u64::MAX);
+        let total = beneath.get(index).copied().unwrap_or(0).saturating_add(own);
+        if let Some(slot) = beneath.get_mut(index) {
+            *slot = total;
+        }
+        if let Some(slot) = dir.parent.and_then(|parent| beneath.get_mut(parent)) {
+            *slot = slot.saturating_add(total);
+        }
+    }
+    let held = |index: usize| holds.get(index).copied().unwrap_or(false);
+    for (index, dir) in seen.into_iter().enumerate() {
+        if held(index) {
+            notes.extend(dir.files.into_iter().map(|path| Note {
+                path,
+                what: notes::FILE,
+                count: 1,
+                code: None,
+            }));
+            notes.extend(dir.links.into_iter().map(|path| Note {
+                path,
+                what: notes::LINK,
+                count: 1,
+                code: None,
+            }));
+        } else if dir.parent.is_none_or(held) {
+            // The outermost directory of a tree that holds no repository.
+            notes.push(Note {
+                path: dir.path,
+                what: notes::TREE,
+                count: beneath.get(index).copied().unwrap_or(0).max(1),
+                code: None,
+            });
         }
     }
     Ok((found, notes))
@@ -177,6 +330,36 @@ const fn unreadable(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
         what: "unreadable",
         count: 1,
         code: Some(refusal.code()),
+    }
+}
+
+/// A seat beneath a root the walk cannot list or stat, typed: gone since its
+/// listing is `SOURCE_VANISHED` (#283 review 5); anything else
+/// `SOURCE_ROOT_UNREADABLE` with its errno, the refusal a transfer rooted at
+/// that seat meets, so the note the notes phase holds is reviewable
+/// (2026-10-19; a bare `IO` is not).
+fn seat_refusal(error: &std::io::Error, site: &'static str) -> BulkloadRefusal {
+    match crate::refuse::source_seat(error, site) {
+        BulkloadRefusal::Io(errno) => BulkloadRefusal::SourceRootUnreadable(errno),
+        other => other,
+    }
+}
+
+/// A walk refusal as a note: a root or entry that is gone (`ENOENT`) is
+/// `source-vanished`, anything else `unreadable`; each keeps its typed code.
+const fn typed_note(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
+    if matches!(
+        refusal,
+        BulkloadRefusal::SourceRootMissing | BulkloadRefusal::SourceVanished
+    ) {
+        Note {
+            path,
+            what: "source-vanished",
+            count: 1,
+            code: Some(refusal.code()),
+        }
+    } else {
+        unreadable(path, refusal)
     }
 }
 
@@ -229,11 +412,17 @@ fn group(
     });
     for linked in listed.iter().skip(1) {
         if linked.prunable || !linked.path.is_dir() {
+            // Its directory gone: nothing to carry, and the note says so
+            // (typed, for review); still there: its tree is carried.
+            let gone = matches!(
+                fs::symlink_metadata(&linked.path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            );
             notes.push(Note {
                 path: linked.path.clone(),
                 what: "prunable",
                 count: 1,
-                code: None,
+                code: gone.then(|| BulkloadRefusal::SourceRootMissing.code()),
             });
             continue;
         }
@@ -665,19 +854,24 @@ pub fn parse_refusals(text: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The source half's notes file: one `WHAT COUNT CODE PATH` line per note
-/// (the path escaped, last).
+/// The source half's notes file: one `WHAT COUNT CODE PATH\tLIVE` per note.
+///
+/// Each path is its raw bytes escaped ([`notes::escape`], lossless, never a
+/// tab), LIVE the path's live path by the longest `--map` prefix (else the
+/// same path), as an item's is (2026-10-19; [`notes::parse`] reads it back).
 #[must_use]
-pub fn render_notes(notes: &[Note]) -> String {
+pub fn render_notes(notes: &[Note], maps: &[(PathBuf, PathBuf)]) -> String {
     use std::fmt::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
     notes.iter().fold(String::new(), |mut text, note| {
         let _ = writeln!(
             text,
-            "{} {} {} {}",
+            "{} {} {} {}\t{}",
             note.what,
             note.count,
             note.code.unwrap_or("none"),
-            note.path.display().to_string().escape_debug()
+            notes::escape(note.path.as_os_str().as_bytes()),
+            notes::escape(live_path(&note.path, maps).as_os_str().as_bytes()),
         );
         text
     })
@@ -709,9 +903,17 @@ pub fn write_report(path: &Path, bytes: &[u8]) -> Result<()> {
 /// per state directory at a time.
 ///
 /// # Errors
-/// IO, including a lock another process holds (refused, never waited on).
+/// `MOVE_STATE_BUSY` naming the lock for a lock another process holds
+/// (refused, never waited on, #279); IO otherwise.
 pub fn lock(state: &Path) -> Result<impl Drop> {
-    super::exclusive(&state.join("move.lock"))
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = state.join("move.lock");
+    super::exclusive(&path).map_err(|refusal| match refusal {
+        BulkloadRefusal::Io(Some(libc::EWOULDBLOCK)) => {
+            BulkloadRefusal::MoveStateBusy(path.as_os_str().as_bytes().to_vec())
+        }
+        other => other,
+    })
 }
 
 #[cfg(test)]
@@ -873,6 +1075,12 @@ mod tests {
         );
         git(&main, &["worktree", "add", "--quiet", "-b", "c", "../gone"]);
         fs::remove_dir_all(root.join("group/gone")).unwrap();
+        // A worktree whose directory is there but lost its `.git`: Git lists
+        // it prunable, and its tree is that one note's, never a second.
+        git(&main, &["worktree", "add", "--quiet", "-b", "k", "../kept"]);
+        fs::remove_file(root.join("group/kept/.git")).unwrap();
+        fs::write(root.join("group/kept/x.txt"), b"x").unwrap();
+        fs::write(root.join("group/kept/y.txt"), b"y").unwrap();
         // A main outside the root whose linked worktree is under it.
         let far = elsewhere.join("far");
         fs::create_dir(&far).unwrap();
@@ -902,6 +1110,18 @@ mod tests {
         );
         fs::write(root.join("notes.txt"), b"x").unwrap();
         std::os::unix::fs::symlink(&elsewhere, root.join("link")).unwrap();
+        // A tree holding no repository: one note for the whole tree, its
+        // files, links and directories counted in it, none noted alone.
+        fs::create_dir_all(root.join("archive/sub/deeper")).unwrap();
+        fs::create_dir_all(root.join("archive/empty")).unwrap();
+        fs::write(root.join("archive/a.txt"), b"a").unwrap();
+        fs::write(root.join("archive/sub/b.txt"), b"b").unwrap();
+        fs::write(root.join("archive/sub/deeper/c.txt"), b"c").unwrap();
+        std::os::unix::fs::symlink("a.txt", root.join("archive/sub/link")).unwrap();
+        // An empty tree is a note too (count 1: the directory itself).
+        fs::create_dir(root.join("hollow")).unwrap();
+        // A plain file beside the repositories of a group directory.
+        fs::write(root.join("group/run.log"), b"log").unwrap();
         let live = base.join("live");
         let maps = vec![(root.clone(), live.clone())];
         let found = inventory(std::slice::from_ref(&root), &maps).unwrap();
@@ -948,22 +1168,142 @@ mod tests {
         ];
         want.sort();
         assert_eq!(got, want);
-        let notes: BTreeSet<(&str, PathBuf)> = found
+        let notes: BTreeSet<(&str, PathBuf, u64)> = found
             .notes
             .iter()
-            .map(|note| (note.what, note.path.clone()))
+            .map(|note| (note.what, note.path.clone(), note.count))
             .collect();
-        assert!(
-            notes.contains(&("prunable", root.join("group/gone"))),
-            "{notes:?}"
-        );
-        assert!(notes.contains(&("symlink", root.join("link"))), "{notes:?}");
-        assert!(notes.contains(&("not-git", root)), "{notes:?}");
+        let want: BTreeSet<(&str, PathBuf, u64)> = [
+            ("prunable", root.join("group/gone"), 1),
+            ("prunable", root.join("group/kept"), 2),
+            ("symlink", root.join("link"), 1),
+            ("not-git-file", root.join("notes.txt"), 1),
+            ("not-git-file", root.join("group/run.log"), 1),
+            ("not-git-tree", root.join("archive"), 4),
+            ("not-git-tree", root.join("hollow"), 1),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(notes, want);
         // Relative roots or maps are refused.
         assert_eq!(
             inventory(&[PathBuf::from("git")], &[]),
             Err(BulkloadRefusal::PathNotAbsolute)
         );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // #277: a root gone by the time the pass reaches it is a typed note and
+    // the pass continues with the rest; only no usable root at all refuses.
+    #[test]
+    fn a_vanished_root_is_a_note_and_the_pass_continues() {
+        let base = base("vanished");
+        let live = base.join("live");
+        fs::create_dir_all(live.join("repo")).unwrap();
+        git(&live.join("repo"), &["init", "--quiet", "--template="]);
+        let gone = base.join("gone");
+        let found = inventory(&[gone.clone(), live.clone()], &[]).unwrap();
+        assert_eq!(
+            found
+                .items
+                .iter()
+                .map(|planned| planned.item.source.clone())
+                .collect::<Vec<_>>(),
+            vec![live.join("repo")],
+            "{found:?}"
+        );
+        assert!(
+            found.notes.contains(&Note {
+                path: gone.clone(),
+                what: "source-vanished",
+                count: 1,
+                code: Some("SOURCE_ROOT_MISSING"),
+            }),
+            "{:?}",
+            found.notes
+        );
+        assert_eq!(
+            inventory(&[gone, base.join("also-gone")], &[]),
+            Err(BulkloadRefusal::SourceRootMissing)
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // #283 review 5: a root that cannot be listed (mode 000) is typed and
+    // unusable, the pass continues with the rest; a root that holds no
+    // repository is usable and yields nothing; every walk refusal keeps its
+    // typed code in its note.
+    #[test]
+    fn unreadable_and_empty_roots_are_typed_notes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = base("rootkinds");
+        let live = base.join("live");
+        fs::create_dir_all(live.join("repo")).unwrap();
+        git(&live.join("repo"), &["init", "--quiet", "--template="]);
+        let empty = base.join("empty");
+        fs::create_dir_all(empty.join("plain")).unwrap();
+        fs::write(empty.join("plain/f.txt"), b"f\n").unwrap();
+        let locked = base.join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = fs::read_dir(&locked).is_ok();
+        let found = inventory(&[locked.clone(), empty.clone(), live], &[]);
+        let found_empty = inventory(std::slice::from_ref(&empty), &[]);
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
+        let found = found.unwrap();
+        assert_eq!(found.items.len(), 1, "{found:?}");
+        if !readable {
+            assert!(
+                found.notes.contains(&Note {
+                    path: locked,
+                    what: "unreadable",
+                    count: 1,
+                    code: Some("SOURCE_ROOT_UNREADABLE"),
+                }),
+                "{:?}",
+                found.notes
+            );
+        }
+        let found_empty = found_empty.unwrap();
+        assert!(found_empty.items.is_empty());
+        // 2026-10-19: a root holding no repository is one tree note.
+        assert!(found_empty
+            .notes
+            .iter()
+            .any(|note| note.what == notes::TREE));
+        for (refusal, what) in [
+            (BulkloadRefusal::SourceRootMissing, "source-vanished"),
+            (BulkloadRefusal::SourceVanished, "source-vanished"),
+            (
+                BulkloadRefusal::SourceRootUnreadable(Some(13)),
+                "unreadable",
+            ),
+            (BulkloadRefusal::Io(Some(13)), "unreadable"),
+        ] {
+            let note = typed_note(PathBuf::from("/x"), &refusal);
+            assert_eq!((note.what, note.code), (what, Some(refusal.code())));
+        }
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    // #279: a held move state is typed and names its lock; once the holder
+    // lets go, the next run takes it.
+    #[test]
+    fn a_held_move_state_is_busy_and_named() {
+        let base = base("busy");
+        let held = lock(&base).unwrap();
+        let lock_path = base.join("move.lock");
+        let refused = lock(&base).err().expect("a second lock on a held state");
+        assert_eq!(
+            refused,
+            BulkloadRefusal::MoveStateBusy(lock_path.as_os_str().as_encoded_bytes().to_vec())
+        );
+        assert_eq!(
+            refused.to_string(),
+            format!("MOVE_STATE_BUSY path=\"{}\"", lock_path.display())
+        );
+        drop(held);
+        assert!(lock(&base).is_ok());
         fs::remove_dir_all(&base).unwrap();
     }
 

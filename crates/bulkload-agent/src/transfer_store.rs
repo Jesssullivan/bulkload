@@ -431,6 +431,11 @@ pub enum RefusedOutput {
     /// extension is not honoured for such a file while the extension is on
     /// (it is planned once more); this one is.
     NotPrefix,
+    /// `--beside` (review of #280, finding 3): the beside path of a seat
+    /// holds a file this store does not own with other bytes than the
+    /// seat's. Recorded under the seat's beside key with that file's
+    /// identity, beside the live path's own record.
+    BesideOccupied,
 }
 
 impl RefusedOutput {
@@ -440,6 +445,7 @@ impl RefusedOutput {
             Self::Occupied => 1,
             Self::ExchangeUnsupported => 2,
             Self::NotPrefix => 3,
+            Self::BesideOccupied => 4,
         }
     }
 
@@ -448,6 +454,7 @@ impl RefusedOutput {
             1 => Some(Self::Occupied),
             2 => Some(Self::ExchangeUnsupported),
             3 => Some(Self::NotPrefix),
+            4 => Some(Self::BesideOccupied),
             _ => None,
         }
     }
@@ -456,7 +463,9 @@ impl RefusedOutput {
     #[must_use]
     pub const fn refusal(self) -> BulkloadRefusal {
         match self {
-            Self::Occupied | Self::NotPrefix => BulkloadRefusal::DestinationOccupied,
+            Self::Occupied | Self::NotPrefix | Self::BesideOccupied => {
+                BulkloadRefusal::DestinationOccupied
+            }
             Self::ExchangeUnsupported => BulkloadRefusal::DestinationExchangeUnsupported,
         }
     }

@@ -334,11 +334,41 @@ same report, totals and gate:
   standing policy says otherwise (the review wins), and the row's `review`
   prints `basis: ruled-default` with the ruling;
 - one **covered** row per live `-wal`, `-shm` or `-journal` the source
-  reported beside a database carried as a snapshot (`covered`, accounted).
+  reported beside a database carried as a snapshot (`covered`, accounted);
+- one **applied-beside** row per seat a `copy` or `pull` with `--beside
+  SUFFIX` landed beside a differing live destination file (plan of record
+  2026-10-19, C1/C2; `applied-beside`, accounted and counted in
+  `applied_beside`, the row printing `beside`, the path it landed at).
+  Under the flag a file bulkload did not write is still adopted when its
+  bytes are the seat's and extended when it is a verified byte prefix
+  (M2r2 A-103); one with other bytes, a differing symlink and a database
+  with a live sidecar beside it land at `<path>SUFFIX` under the beside
+  path's own row, so a rerun reuses them reading nothing. A beside path
+  holding a foreign file with other bytes refuses `DESTINATION_OCCUPIED`;
+  only the store's own beside output is superseded (WP0(d)).
+  `estate-move --sessions` pulls both agent homes this way into the live
+  home, joins both records into its closure, and holds its gate on any
+  re-seat outcome that leaves a session not resumable (C9 to C11).
+
+**Source notes in the same report (2026-10-19).** `estate-move`'s notes
+phase carries what `estate-move-source` noted and did not plan (below,
+"estate-move"); each carried note is one transfer with its own DEST_STATE
+(`MOVE_STATE/pull/notes/ID`), joined as above. Every other note is one
+**source-note** row (`kind: source-note`, printing `note`, `path`,
+`count`, `note_outcome` and, when typed, `refusal`): `covered` when a
+planned item's checkout or a carried tree holds it; pending review when it
+is held typed (a nested repository held as custody only,
+`GIT_NEST_CUSTODY_ONLY`; an unreadable entry, `SOURCE_ROOT_UNREADABLE`; a
+vanished root, `SOURCE_ROOT_MISSING`; a carry refused before its transfer
+ran, with its code); `unaccounted` otherwise (an untyped hold, a note from
+a source half before this change, a tree holding a planned item). A row's
+identity digests the note's kind and source path; its instance, how it was
+settled, its code and its count. `closure-dispose --source-notes
+MOVE_STATE/notes.rows` reviews one as it reviews a planned item.
 
 A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
 source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
-and the code (or `covered`); its refusal `instance` digests the row's
+and the code (or `covered`, `applied-beside`); its refusal `instance` digests the row's
 record, so a rerun that refuses identically keeps its review and any other
 record is a new instance. `closure-dispose --transfer DEST_STATE` reviews a
 transfer row as it reviews a planned item, in the same plan-bound ledger.
@@ -2932,6 +2962,46 @@ deleted, no live checkout is switched, and nothing is deleted. Open
 questions for the operator are in the design note (suffix naming for a
 second source, beside worktrees linked or standalone, tags in refs-in, one
 command over SSH or two halves).
+
+### The notes phase (2026-10-19)
+
+Operator, 2026-10-19: "NOTHING is EVER excluded" and "no intermidiary stage
+patterns". Tonight's passes noted about 9,600 entries (gf01 18, r01 1160,
+r02 553, r03 3805, r04 4112) that no phase moved: `estate-move` counted them
+`not_moved=` and failed its gate. Notes are now carried.
+
+- **What the source half notes.** The walk still stops at a repository and
+  follows no symlink. A directory that holds no repository anywhere beneath
+  it is one `not-git-tree` note (the outermost one; its entries counted). In
+  a directory that does hold one, each plain file is a `not-git-file` note
+  and each symlink a `symlink` note. A prunable worktree whose directory is
+  still there is one `prunable` note, not two. A nested repository held as
+  custody only is noted by its own path. Each line carries its path and its
+  live path (the same `--map` rules as items), both escaped losslessly.
+- **Phase 4b, after carry, before hand-off.** Each carriable note is one
+  recorded transfer through the existing transport (`pull --beside .LABEL`
+  from HOST, `copy` on this host): a file or a symlink as a `--file`
+  session (a symlink as the link itself, never followed), a tree, a
+  prunable worktree or a directory its repository does not list as one tree
+  session (custody as files; nothing is registered with Git). A tree lands
+  into a live directory holding no repository, as a lossless union, and at
+  `<live>.LABEL` beside anything else there; a file or a link lands at a
+  live path that is not a directory (an equal one adopted by its content
+  proof, a differing one beside), else beside it. Absent parents are made
+  as `estate-apply` makes an item's. A note under a planned item's checkout
+  or under a carried tree is not carried twice.
+- **Held, typed.** Nested custody-only (`GIT_NEST_CUSTODY_ONLY`),
+  unreadable and vanished notes, and a prunable worktree whose directory is
+  gone (`SOURCE_ROOT_MISSING`, nothing to carry), are rows pending review,
+  not silently passed: the operator accepts custody, re-carries once the
+  cause is fixed, or abandons.
+- **Closure.** `not_moved=` counts the entries of notes neither carried nor
+  covered, `not_moved_dispositioned=` those a review disposes; the gate
+  passes only when they are equal (and every row is accounted). An
+  unchanged rerun reads 0 source bytes for the carried notes (R25): each
+  note's own transfer state reuses its outputs.
+- **Not built.** One session per loose file: a directory of many loose
+  files beside repositories costs one transport session each.
 
 ## Installing the agent (M2 item 4, 2026-10-16)
 

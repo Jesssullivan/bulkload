@@ -17,6 +17,7 @@
 
 use std::ffi::OsString;
 use std::io::Write as _;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -121,7 +122,10 @@ fn jobs(value: Option<&OsString>) -> Result<usize> {
 /// under the roots ([`moving::inventory`]), append the new items to
 /// `MOVE_STATE/carry/plan.postcard` (`estate-add-batch`), and capture the
 /// plan into `MOVE_STATE/carry/corpus` (`estate-capture`, private state in
-/// `MOVE_STATE/private`). A capture refusal is an item's (its line says
+/// `MOVE_STATE/private`), and make `MOVE_STATE/serve` and
+/// `MOVE_STATE/serve/carry`, where the destination half's `pull`s and its
+/// carry phase keep their `serve` states (#276). A capture
+/// refusal is an item's (its line says
 /// why; the destination carries it as files); only a refusal of the whole
 /// capture fails the verb.
 #[allow(clippy::too_many_lines)] // Arguments, then the inventory and capture.
@@ -163,6 +167,18 @@ fn source_command(args: &[OsString]) -> Result<()> {
     let _lock = moving::lock(&state)?;
     let carry = state.join("carry");
     moving::private_dir(&carry)?;
+    // #276: the destination half's `pull`s name their source states under
+    // `MOVE_STATE/serve/NAME` (the corpus, the sessions) and its carry
+    // phase under `MOVE_STATE/serve/carry/ITEM` (`estate-carry-files
+    // --source-state-root`), on this host, over the transport it chose. The
+    // directories are this verb's, like `carry/` and `private/`, so they are
+    // here before the first `serve` is asked to open a state in them
+    // (`serve` makes every missing parent too, for a state handed to it by
+    // anything else).
+    moving::private_dir(&state.join("serve"))?;
+    moving::private_dir(&state.join("serve/carry"))?;
+    // The notes phase's `serve` states (2026-10-19), one per note.
+    moving::private_dir(&state.join("serve/notes"))?;
     // The pass's mark: `estate-move` refuses a corpus pulled while a pass
     // was still writing it (its `done` mark is another pass's, or none).
     let pass = now_ns().to_string();
@@ -188,7 +204,8 @@ fn source_command(args: &[OsString]) -> Result<()> {
             note.code.unwrap_or("none"),
         ))?;
     }
-    let existing = if plan.try_exists().refuse_at("estate_move::source")? {
+    let plan_existed = plan.try_exists().refuse_at("estate_move::source")?;
+    let existing = if plan_existed {
         estate::inspect(&plan)?
     } else {
         Vec::new()
@@ -208,7 +225,10 @@ fn source_command(args: &[OsString]) -> Result<()> {
         .map(|planned| planned.item.clone())
         .filter(|item| !existing.contains(item))
         .collect();
-    if !new.is_empty() {
+    // A first pass whose roots hold no repository still writes its (empty)
+    // plan, so the pass completes and the destination half reads a plan,
+    // never `IO (errno 2)` (#283 review 5).
+    if !new.is_empty() || !plan_existed {
         estate::add_batch(&plan, &new)?;
     }
     let planned = estate::inspect(&plan)?.len();
@@ -221,13 +241,19 @@ fn source_command(args: &[OsString]) -> Result<()> {
             .sum()
     };
     out(&format!(
-        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} prunable={} unreadable={} not_in_census={}",
+        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} not_git_trees={} prunable={} unreadable={} source_vanished={} not_in_census={}",
         found.items.len(),
         new.len(),
-        noted("symlink"),
-        noted("not-git"),
+        noted(moving::notes::LINK),
+        noted(moving::notes::FILE) + noted(moving::notes::TREE),
+        found
+            .notes
+            .iter()
+            .filter(|note| note.what == moving::notes::TREE)
+            .count(),
         noted("prunable"),
         noted("unreadable"),
+        noted("source-vanished"),
         noted("not-in-census"),
     ))?;
     let policy = if rebuildable {
@@ -262,7 +288,7 @@ fn source_command(args: &[OsString]) -> Result<()> {
                         .lock()
                         .map_err(|_| BulkloadRefusal::WorkerLost)?
                         .push(moving::Note {
-                            path: row.source.clone(),
+                            path: nested_path(&row.source, line),
                             what: "nested",
                             count: 1,
                             code: None,
@@ -292,7 +318,7 @@ fn source_command(args: &[OsString]) -> Result<()> {
         )?;
         moving::write_report(
             &carry.join(NOTES),
-            moving::render_notes(&all_notes).as_bytes(),
+            moving::render_notes(&all_notes, &maps).as_bytes(),
         )?;
         moving::write_report(&carry.join(DONE), pass.as_bytes())?;
     }
@@ -314,6 +340,39 @@ fn source_command(args: &[OsString]) -> Result<()> {
         Err(refusal) if !finished => Err(refusal),
         _ => Ok(()),
     }
+}
+
+// A nested repository's own path: the item's source joined with the nest's
+// (its receipt line's escaped `path="..."`), so each nest is its own note;
+// the item's source when the line names none it can read.
+fn nested_path(source: &Path, line: &str) -> PathBuf {
+    // The closing quote is the first one no backslash escapes.
+    let quoted = |rest: &str| {
+        let mut escaped = false;
+        rest.char_indices()
+            .find(|&(_, c)| {
+                let end = c == '"' && !escaped;
+                escaped = c == '\\' && !escaped;
+                end
+            })
+            .and_then(|(at, _)| rest.get(..at))
+            .map(str::to_owned)
+    };
+    line.split_once("path=\"")
+        .and_then(|(_, rest)| quoted(rest))
+        .and_then(|escaped| moving::notes::unescape(&escaped))
+        .filter(|rel| !rel.is_empty())
+        .map_or_else(
+            || source.to_path_buf(),
+            |rel| source.join(std::ffi::OsStr::from_bytes(&rel)),
+        )
+}
+
+/// What phase 6 leaves for the closure (C11): the two session transfer
+/// states, and the re-seat's summary when it ran.
+struct Sessions {
+    pulls: Vec<PathBuf>,
+    reseat: Option<bulkload_agent::reseat::Summary>,
 }
 
 /// The destination half's arguments.
@@ -492,9 +551,40 @@ impl Move {
     // One recorded transfer of the source's `from` into `to`: `copy` on
     // this host, else `pull` from HOST; `serve` keeps its source state in
     // the source half's `MOVE_STATE/serve/NAME`, this side in
-    // `MOVE_STATE/pull/NAME`.
+    // `MOVE_STATE/pull/NAME`. `to` is made private (0700) first.
     fn transfer(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
         moving::private_dir(to)?;
+        self.transfer_into(from, to, name)
+    }
+
+    // [`Self::transfer`] into a live destination tree (the agent's own home
+    // directory, plan of record 2026-10-19 C9): created 0700 when absent,
+    // else taken as it is, whatever its mode (its mode is the agent's, not
+    // bulkload's to tighten); a non-directory there refuses
+    // PATH_ESCAPES_ROOT.
+    fn transfer_live(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        match std::fs::DirBuilder::new().mode(0o700).create(to) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !std::fs::symlink_metadata(to)
+                    .refuse_at("estate_move::transfer_live")?
+                    .is_dir()
+                {
+                    return Err(BulkloadRefusal::PathEscapesRoot);
+                }
+            }
+            Err(error) => {
+                return Err(bulkload_agent::refuse::io(
+                    &error,
+                    "estate_move::transfer_live",
+                ))
+            }
+        }
+        self.transfer_into(from, to, name)
+    }
+
+    fn transfer_into(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
         let pulls = self.state.join("pull");
         moving::private_dir(&pulls)?;
         let serve = self.source_state.join("serve").join(name);
@@ -575,6 +665,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
     let text = |name: &str| std::fs::read_to_string(carry.join(name)).unwrap_or_default();
     let refusals = moving::parse_refusals(&text(REFUSALS));
     let notes = moving::note_counts(&text(NOTES));
+    let note_lines = moving::notes::parse(&text(NOTES));
 
     // 2. Decide every item against the destination now. Under --plan-only
     // the decisions are shown, never recorded.
@@ -590,6 +681,9 @@ fn move_command(args: &[OsString]) -> Result<()> {
     let mut rows = moving::decide(&items, &inputs, &mut decided, now_ns())?;
     let suffix = run.suffix();
     print_plan(&rows, &suffix, &notes)?;
+    // The source notes, decided against the plan's items (2026-10-19).
+    let decided_notes = moving::notes::decide(&note_lines, &items);
+    print_notes_plan(&decided_notes)?;
     if run.plan_only {
         return preview(&run, (&plan, &corpus, &private));
     }
@@ -673,6 +767,22 @@ fn move_command(args: &[OsString]) -> Result<()> {
     note(&carried);
     reached(&mut ledger, &ledger_path, "carry", word(&carried))?;
 
+    // 4b. The source notes (2026-10-19; "NOTHING is EVER excluded"): every
+    // note the source half could not plan as an item, carried through the
+    // same transport to its live path, else covered or held typed. Each
+    // note's refusal is that note's (a closure row); only a refusal of the
+    // phase itself stops it.
+    let note_pass = carry_notes(&run, &decided_notes);
+    let note_word = match &note_pass {
+        Ok(pass) => pass.word(),
+        Err(refusal) => format!("refused:{}", refusal.code()),
+    };
+    note(&note_pass.as_ref().map(drop).map_err(Clone::clone));
+    reached(&mut ledger, &ledger_path, "notes", note_word)?;
+    // A phase that stopped leaves every note not moved (its first refusal
+    // is the verb's).
+    let note_pass = note_pass.unwrap_or_else(|_| NotesPass::not_run(&decided_notes));
+
     // 5. The hand-off block in each landed workspace (OI-1003-Q183).
     if run.handoff && !landed.is_empty() {
         let mut args: Vec<OsString> = Vec::new();
@@ -690,16 +800,29 @@ fn move_command(args: &[OsString]) -> Result<()> {
         reached(&mut ledger, &ledger_path, "hand-off", word(&handed))?;
     }
 
-    // 6. Sessions: the agent state trees, then the re-seat (TIN-6587),
-    // only over a complete landing.
-    if let Some(home) = &run.sessions {
+    // 6. Sessions (plan of record 2026-10-19, C9/C10): the agent state
+    // trees into the live home, then the re-seat (TIN-6587), whenever both
+    // session transfers completed, path refusals included: those stay
+    // typed closure rows, and a refused settings file never holds the
+    // transcripts' re-seat.
+    let sessions: Option<Sessions> = if let Some(home) = &run.sessions {
+        let pass_started = now_secs();
         let pulled = sessions_pull(&run, home);
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
-        if pulled.is_ok() {
-            let reseated = reseat(&run, home, (&plan, &corpus, &private));
-            note(&reseated);
-            reached(&mut ledger, &ledger_path, "reseat", word(&reseated))?;
+        let mut outcome = Sessions {
+            pulls: ["claude", "codex"]
+                .iter()
+                .map(|name| run.state.join("pull").join(name))
+                .collect(),
+            reseat: None,
+        };
+        if session_completed(&pulled) {
+            let reseated = reseat(&run, home, (&plan, &corpus, &private), pass_started);
+            let ended: Result<()> = reseated.as_ref().map(drop).map_err(Clone::clone);
+            note(&ended);
+            reached(&mut ledger, &ledger_path, "reseat", word(&ended))?;
+            outcome.reseat = reseated.ok().flatten();
         } else {
             reached(
                 &mut ledger,
@@ -708,7 +831,10 @@ fn move_command(args: &[OsString]) -> Result<()> {
                 "skipped:sessions-pull-refused".to_owned(),
             )?;
         }
-    }
+        Some(outcome)
+    } else {
+        None
+    };
 
     // 7. Closure over the move: every planned item accounted, with the
     // operator's reviews joined; anything the source half could not plan
@@ -720,6 +846,23 @@ fn move_command(args: &[OsString]) -> Result<()> {
         std::slice::from_ref(&private),
         false,
     )?);
+    // C11: the session transfers are rows of the same report (their
+    // `applied-beside` entries accounted, their refused paths pending
+    // review, a transfer that never ran unaccounted), so the gate cannot
+    // pass with agent state unaccounted.
+    if let Some(sessions) = &sessions {
+        report.join_transfers(&sessions.pulls)?;
+    }
+    // 2026-10-19: each carried note's transfer rows, and one row for each
+    // note no transfer of this pass accounts for.
+    report.join_transfers(&note_pass.states)?;
+    report.join_notes(
+        &note_pass
+            .rows
+            .iter()
+            .map(moving::notes::RowRecord::row)
+            .collect::<Vec<_>>(),
+    )?;
     if let Some(dispositions) = &run.dispositions {
         report.dispose(&bulkload_agent::disposition::Ledger::read(
             dispositions,
@@ -727,6 +870,19 @@ fn move_command(args: &[OsString]) -> Result<()> {
             &run.source,
         )?);
     }
+    // The re-seat's outcomes that leave a session not resumable (or a
+    // re-seat that did not run) hold the gate too.
+    let reseat_held: std::collections::BTreeMap<String, u64> = match &sessions {
+        None => std::collections::BTreeMap::new(),
+        Some(Sessions {
+            reseat: Some(summary),
+            ..
+        }) => summary.unaccounted(),
+        Some(Sessions { reseat: None, .. }) => {
+            std::iter::once(("reseat/not-run".to_owned(), 1)).collect()
+        }
+    };
+    let reseat_unaccounted: u64 = reseat_held.values().sum();
     let report_path = run.state.join("closure.json");
     moving::write_report(&report_path, report.to_json().as_bytes())?;
     let refusals = report
@@ -735,9 +891,17 @@ fn move_command(args: &[OsString]) -> Result<()> {
         .map(|(code, count)| format!("{code}:{count}"))
         .collect::<Vec<_>>()
         .join(",");
-    let not_moved: u64 = notes.values().sum();
+    // What is still not moved: each note neither carried nor covered,
+    // weighted by the entries it stands for, and how much of it a review
+    // or a standing policy disposes.
+    let (not_moved, not_moved_dispositioned) = note_pass.not_moved(&report);
+    let held = reseat_held
+        .iter()
+        .map(|(word, count)| format!("{word}:{count}"))
+        .collect::<Vec<_>>()
+        .join(",");
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} notes={} notes_carried={} not_moved={not_moved} not_moved_dispositioned={not_moved_dispositioned} refusals={} sessions={} transfer_rows={} note_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,
@@ -746,13 +910,21 @@ fn move_command(args: &[OsString]) -> Result<()> {
         report.refused,
         report.refused_pending_review,
         report.unaccounted,
+        note_pass.settled.len(),
+        note_pass.carried,
         if refusals.is_empty() { "none" } else { &refusals },
+        if sessions.is_some() { "claude,codex" } else { "none" },
+        report.transfer_rows(),
+        report.note_rows(),
+        if held.is_empty() { "none" } else { &held },
     ))?;
-    let gate = report.gate().and(if not_moved == 0 {
-        Ok(())
-    } else {
-        Err(BulkloadRefusal::ClosureUnaccounted)
-    });
+    let gate = report.gate().and(
+        if not_moved == not_moved_dispositioned && reseat_unaccounted == 0 {
+            Ok(())
+        } else {
+            Err(BulkloadRefusal::ClosureUnaccounted)
+        },
+    );
     reached(&mut ledger, &ledger_path, "closure", word(&gate))?;
     out(&format!(
         "estate-move gate={} next={}",
@@ -922,28 +1094,411 @@ fn carry_files(
     carried
 }
 
-// Phase 6a: SOURCE_HOME/.claude and the Codex root into MOVE_STATE/landing.
+// The notes' plan: one count per plan word (`estate-move notes-plan`).
+fn print_notes_plan(decided: &[moving::notes::Decided]) -> Result<()> {
+    let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    for note in decided {
+        *counts.entry(note.plan.word().to_owned()).or_default() += 1;
+    }
+    out(&format!(
+        "estate-move notes-plan notes={} {}",
+        decided.len(),
+        if counts.is_empty() {
+            "none".to_owned()
+        } else {
+            counts
+                .iter()
+                .map(|(word, count)| format!("{word}={count}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+    ))
+}
+
+/// How one note of the pass was settled.
+#[derive(Debug, Clone)]
+enum Settled {
+    /// Its transfer ran: the record in this `DEST_STATE` says how it ended.
+    Transfer(PathBuf),
+    /// No transfer of the pass accounts for it: its row, by identity.
+    Row(String),
+}
+
+/// What phase 4b leaves for the closure (2026-10-19).
+#[derive(Debug, Default)]
+struct NotesPass {
+    /// Each note, the entries it stands for and how it was settled.
+    settled: Vec<(u64, Settled)>,
+    /// The transfer states of the notes whose transfer ran.
+    states: Vec<PathBuf>,
+    /// The notes no transfer of the pass accounts for.
+    rows: Vec<moving::notes::RowRecord>,
+    /// Notes whose transfer completed.
+    carried: u64,
+    /// Source bytes the notes' sessions read (0 on an unchanged rerun, R25).
+    source_bytes_read: u64,
+    /// Notes whose transfer ran and refused.
+    refused: u64,
+}
+
+impl NotesPass {
+    // Every note as a row, for a phase that stopped: a planned carry is
+    // unaccounted (`note-not-carried`), the rest as planned.
+    fn not_run(decided: &[moving::notes::Decided]) -> Self {
+        let mut pass = Self::default();
+        for note in decided {
+            let record = moving::notes::RowRecord::of(note, None);
+            pass.settled
+                .push((note.line.count, Settled::Row(record.item.clone())));
+            pass.rows.push(record);
+        }
+        pass
+    }
+
+    fn word(&self) -> String {
+        if self.refused == 0 {
+            "ok".to_owned()
+        } else {
+            format!("notes-refused count={}", self.refused)
+        }
+    }
+
+    // The entries still not moved, and how many of them a review or a
+    // standing policy disposes, read from the closure report the notes'
+    // rows joined (after its reviews).
+    fn not_moved(&self, report: &bulkload_agent::closure::Report) -> (u64, u64) {
+        use bulkload_agent::closure::{Disposition, RowKind};
+        let (mut not_moved, mut disposed) = (0_u64, 0_u64);
+        for (count, settled) in &self.settled {
+            let dispositions: Vec<&Disposition> = match settled {
+                Settled::Transfer(state) => {
+                    let state = bulkload_agent::transfer_outcome::stable(state);
+                    report
+                        .rows
+                        .iter()
+                        .filter(|row| {
+                            row.kind == RowKind::TransferSession
+                                && row
+                                    .transfer
+                                    .as_ref()
+                                    .is_some_and(|detail| detail.state == state)
+                        })
+                        .map(|row| &row.disposition)
+                        .collect()
+                }
+                Settled::Row(item) => report
+                    .rows
+                    .iter()
+                    .filter(|row| row.kind == RowKind::SourceNote && row.item == *item)
+                    .map(|row| &row.disposition)
+                    .collect(),
+            };
+            if dispositions
+                .iter()
+                .any(|found| matches!(found, Disposition::Applied | Disposition::Covered))
+            {
+                continue;
+            }
+            not_moved = not_moved.saturating_add(*count);
+            if dispositions
+                .iter()
+                .any(|found| matches!(found, Disposition::Refused(_)))
+            {
+                disposed = disposed.saturating_add(*count);
+            }
+        }
+        (not_moved, disposed)
+    }
+}
+
+// Phase 4b (2026-10-19): every carriable note through the transport with
+// `--beside .LABEL`, each a recorded transfer of its own
+// (`MOVE_STATE/pull/notes/ID`, the source's `serve` state
+// `SOURCE_MOVE_STATE/serve/notes/ID`), and a row for every other note
+// (`MOVE_STATE/notes.rows`, which `closure-dispose --source-notes` reads).
+fn carry_notes(run: &Move, decided: &[moving::notes::Decided]) -> Result<NotesPass> {
+    let pulled = run.state.join("pull/notes");
+    moving::private_dir(&run.state.join("pull"))?;
+    moving::private_dir(&pulled)?;
+    let parents = run.state.join("notes");
+    moving::private_dir(&parents)?;
+    if run.local() {
+        moving::private_dir(&run.source_state.join("serve"))?;
+        moving::private_dir(&run.source_state.join("serve/notes"))?;
+    }
+    let mut pass = NotesPass::default();
+    bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()))?;
+    let carried = (|| -> Result<()> {
+        for note in decided {
+            let moving::notes::Plan::Carry { shape, live } = &note.plan else {
+                let record = moving::notes::RowRecord::of(note, None);
+                out(&format!(
+                    "estate-move note={} what={} plan={} count={} path={:?}",
+                    note.id,
+                    note.line.what,
+                    note.plan.word(),
+                    note.line.count,
+                    note.line
+                        .path
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new(&note.line.text)),
+                ))?;
+                pass.settled
+                    .push((note.line.count, Settled::Row(record.item.clone())));
+                pass.rows.push(record);
+                continue;
+            };
+            // On this host with no --map for it, the note is at its live
+            // path already: nothing to move.
+            if run.local() && note.line.path.as_deref() == Some(live.as_path()) {
+                let record =
+                    moving::notes::RowRecord::settled(note, "covered-in-place".to_owned(), None);
+                pass.settled
+                    .push((note.line.count, Settled::Row(record.item.clone())));
+                pass.rows.push(record);
+                continue;
+            }
+            let transfer_state = pulled.join(&note.id);
+            match carry_note(run, note, (*shape, live), &transfer_state, &parents) {
+                Ok(ended) => {
+                    pass.states.push(transfer_state.clone());
+                    pass.settled
+                        .push((note.line.count, Settled::Transfer(transfer_state)));
+                    match &ended.result {
+                        Ok(stats) => {
+                            pass.carried += 1;
+                            pass.source_bytes_read = pass
+                                .source_bytes_read
+                                .saturating_add(stats.source_bytes_read);
+                        }
+                        Err(_) => pass.refused += 1,
+                    }
+                    out(&ended.line(note))?;
+                }
+                Err(refusal) => {
+                    // Refused before its transfer ran: no record, so the
+                    // note's own row holds the refusal.
+                    let record = moving::notes::RowRecord::of(note, Some(&refusal));
+                    out(&format!(
+                        "estate-move note={} what={} plan={} outcome=refused:{} path={:?} live={live:?}",
+                        note.id,
+                        note.line.what,
+                        note.plan.word(),
+                        refusal.code(),
+                        note.line.path.as_deref().unwrap_or_else(|| Path::new("")),
+                    ))?;
+                    pass.settled
+                        .push((note.line.count, Settled::Row(record.item.clone())));
+                    pass.rows.push(record);
+                }
+            }
+        }
+        Ok(())
+    })();
+    let cleared = bulkload_agent::transfer::set_beside_suffix(None);
+    carried?;
+    cleared?;
+    moving::notes::write_rows(&run.state.join("notes.rows"), &pass.rows)?;
+    out(&format!(
+        "estate-move notes notes={} carried={} refused={} rows={} source_bytes_read={}",
+        pass.settled.len(),
+        pass.carried,
+        pass.refused,
+        pass.rows.len(),
+        pass.source_bytes_read,
+    ))?;
+    Ok(pass)
+}
+
+/// One carried note's ended transfer.
+struct Ended {
+    at: PathBuf,
+    beside: bool,
+    result: Result<bulkload_agent::transfer::TransferStats>,
+}
+
+impl Ended {
+    fn line(&self, note: &moving::notes::Decided) -> String {
+        let counters = match &self.result {
+            Ok(stats) => format!(
+                "outcome=carried completed={} reused={} source_bytes_read={} refusals={} applied_beside={}",
+                stats.completed,
+                stats.reused,
+                stats.source_bytes_read,
+                stats.refusals.len(),
+                stats.applied_beside.len(),
+            ),
+            Err(refusal) => format!("outcome=refused:{}", refusal.code()),
+        };
+        format!(
+            "estate-move note={} what={} plan={} {counters} path={:?} at={:?} beside_root={}",
+            note.id,
+            note.line.what,
+            note.plan.word(),
+            note.line.path.as_deref().unwrap_or_else(|| Path::new("")),
+            self.at,
+            self.beside,
+        )
+    }
+}
+
+// One note's transfer: where it lands (live, or beside what the live path
+// holds that cannot take it), the absent parents made (0755, recorded in
+// `MOVE_STATE/notes/ID.parents`, as `estate-apply` makes an item's), the
+// S2 checks, then the recorded session. `Err` is a refusal before the
+// session (no record); a session that ran and refused is `Ok` with its
+// refusal, its record in `state`.
+fn carry_note(
+    run: &Move,
+    note: &moving::notes::Decided,
+    (shape, live): (moving::notes::Shape, &Path),
+    state: &Path,
+    parents: &Path,
+) -> Result<Ended> {
+    use bulkload_agent::git_carry::parents::{absent_parents, FirstTarget};
+    use bulkload_agent::transfer::RootKind;
+    let from = note
+        .line
+        .path
+        .as_deref()
+        .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
+    let suffix = run.suffix();
+    let (at, beside) = moving::notes::landing(shape, live, &suffix);
+    if !absent_parents(&at)?.is_empty() {
+        let record = parents.join(format!("{}.parents", note.id));
+        FirstTarget::of(&at)?.place(Some((record.as_path(), note.id.as_str())))?;
+    }
+    let kind = match shape {
+        moving::notes::Shape::File | moving::notes::Shape::Link => RootKind::File,
+        moving::notes::Shape::Tree => RootKind::Tree,
+    };
+    moving::private_dir(state)?;
+    let serve = run.source_state.join("serve/notes").join(&note.id);
+    let result = if run.local() {
+        bulkload_agent::transfer::copy_roots_apart_kind(from, &at, &serve, state, kind)?;
+        super::copy_session_recorded(kind, from, &at, &serve, state)
+    } else {
+        bulkload_agent::transfer::receive_roots_apart_kind(&at, state, kind)?;
+        let mut args: Vec<OsString> = vec![
+            run.host.clone(),
+            from.as_os_str().to_owned(),
+            at.as_os_str().to_owned(),
+            serve.into_os_string(),
+            state.as_os_str().to_owned(),
+        ];
+        args.extend(run.remote.iter().cloned());
+        args.extend(run.config.iter().cloned());
+        super::pull_session_recorded(kind, &args)
+    };
+    Ok(Ended { at, beside, result })
+}
+
+// The destination home the sessions land in (`--dest-home`, default
+// `$HOME`).
+fn dest_home(run: &Move) -> Result<PathBuf> {
+    run.dest_home.as_ref().map_or_else(
+        || {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .ok_or(BulkloadRefusal::RequiredFieldMissing)
+        },
+        |home| Ok(home.clone()),
+    )
+}
+
+/// The Codex index name.
+const STATE_DB: &str = "state_5.sqlite";
+
+// Phase 6a (plan of record 2026-10-19, C9; SPEC R4 "each tree lands once,
+// at its live path"): SOURCE_HOME/.claude and the Codex root into the LIVE
+// DEST_HOME/.claude and DEST_HOME/.codex, with `--beside .LABEL`: equal
+// files adopted, grown append-only files extended, differing files (and the
+// live Codex index's snapshot) landed beside as `<path>.LABEL`, nothing
+// overwritten and nothing staged. Both trees are pulled whatever the first
+// returned; the first refusal is the phase's. `ITEMS_REFUSED` means the
+// session completed with typed path refusals (closure rows), which does
+// not stop the re-seat (C10).
 fn sessions_pull(run: &Move, home: &Path) -> Result<()> {
-    let landing = run.state.join("landing");
-    moving::private_dir(&landing)?;
+    let dest = dest_home(run)?;
     let codex_root = run
         .codex_root
         .clone()
         .unwrap_or_else(|| home.join(".codex"));
-    let claude = run.transfer(&home.join(".claude"), &landing.join(".claude"), "claude");
-    let codex = run.transfer(&codex_root, &landing.join(".codex"), "codex");
-    claude.and(codex)
+    bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()))?;
+    let claude = run.transfer_live(&home.join(".claude"), &dest.join(".claude"), "claude");
+    // The Codex index always lands beside, as this pass's snapshot: the
+    // pull never writes the live index (review of #280, finding 6).
+    bulkload_agent::transfer::set_beside_always(vec![STATE_DB.as_bytes().to_vec()]);
+    let codex = run.transfer_live(&codex_root, &dest.join(".codex"), "codex");
+    bulkload_agent::transfer::set_beside_always(Vec::new());
+    let cleared = bulkload_agent::transfer::set_beside_suffix(None);
+    // A session that did not complete outranks one that completed with
+    // refused paths: the phase's word says whether the re-seat may run.
+    let mut outcome = Ok(());
+    for result in [claude, codex, cleared] {
+        if let Err(refusal) = result {
+            if session_completed(&outcome) {
+                outcome = Err(refusal);
+            }
+        }
+    }
+    outcome
 }
 
-// Phase 6b: `estate-reseat --lanes-from-plan` of the landing into DEST_HOME.
-fn reseat(run: &Move, home: &Path, (plan, corpus, private): (&Path, &Path, &Path)) -> Result<()> {
-    let dest_home = match &run.dest_home {
-        Some(home) => home.clone(),
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|home| home.is_absolute())
-            .ok_or(BulkloadRefusal::RequiredFieldMissing)?,
-    };
+// The Codex index snapshot this pass landed beside the live index: the
+// `applied-beside` row of `state_5.sqlite` in a completed Codex transfer
+// record of this pass (started at or after `pass_started`, Unix seconds).
+fn landed_index(run: &Move, dest_codex: &Path, pass_started: u64) -> Option<PathBuf> {
+    use bulkload_agent::transfer_outcome::{self, EntryOutcome, Session};
+    let state = run.state.join("pull").join("codex");
+    let destination = transfer_outcome::stable(dest_codex);
+    transfer_outcome::records(&state)
+        .iter()
+        .filter_map(|(_, path)| transfer_outcome::read_file(path)?.ok())
+        .filter(|record| {
+            record.session == Session::Completed
+                && record.started >= pass_started
+                && record.destination == destination
+        })
+        .find_map(|record| {
+            record
+                .entries
+                .iter()
+                .find_map(|entry| match &entry.outcome {
+                    EntryOutcome::AppliedBeside { beside }
+                        if entry.rel_path == STATE_DB.as_bytes() =>
+                    {
+                        Some(dest_codex.join(std::ffi::OsStr::from_bytes(beside)))
+                    }
+                    _ => None,
+                })
+        })
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs())
+}
+
+// Whether every session transfer completed: every path answered, refused
+// ones as typed closure rows (`ITEMS_REFUSED`), or none.
+const fn session_completed(pulled: &Result<()>) -> bool {
+    matches!(pulled, Ok(()) | Err(BulkloadRefusal::ItemsRefused))
+}
+
+// Phase 6b: `estate-reseat --lanes-from-plan` from the live home (the
+// landing) into DEST_HOME. The landed Codex index is the beside snapshot
+// `state_5.sqlite.LABEL` when the live index was kept (it had live
+// sidecars, or differed), else the index the pull landed.
+fn reseat(
+    run: &Move,
+    home: &Path,
+    (plan, corpus, private): (&Path, &Path, &Path),
+    pass_started: u64,
+) -> Result<Option<bulkload_agent::reseat::Summary>> {
+    let dest_home = dest_home(run)?;
     let codex_root = run
         .codex_root
         .clone()
@@ -966,13 +1521,20 @@ fn reseat(run: &Move, home: &Path, (plan, corpus, private): (&Path, &Path, &Path
         args.extend(["--map".into(), pair]);
     }
     args.extend(run.reseat_args.iter().cloned());
+    // Review of #280, finding 6: the landed index is the snapshot this
+    // pass took, named by this pass's Codex transfer record, or none: never
+    // the live index, never an earlier pass's snapshot.
+    match landed_index(run, &dest_home.join(".codex"), pass_started) {
+        Some(index) => args.extend(["--landing-codex-index".into(), index.into_os_string()]),
+        None => args.push("--no-landing-codex-index".into()),
+    }
     args.extend([
         "--codex-source-root".into(),
         codex_root.into_os_string(),
         home.as_os_str().to_owned(),
-        run.state.join("landing").into_os_string(),
+        dest_home.clone().into_os_string(),
         dest_home.into_os_string(),
         run.state.join("reseat").into_os_string(),
     ]);
-    super::reseat_command(&args)
+    super::reseat_run(&args)
 }

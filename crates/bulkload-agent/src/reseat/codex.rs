@@ -325,7 +325,7 @@ pub fn landed_anything(options: &Options) -> Result<bool> {
     if !std::fs::metadata(&options.landing_codex).is_ok_and(|meta| meta.is_dir()) {
         return Err(BulkloadRefusal::ReseatLandingAbsent);
     }
-    Ok(options.landing_codex.join(STATE_DB).is_file()
+    Ok(options.landing_index().is_some_and(|index| index.is_file())
         || TREES.iter().any(|tree| {
             std::fs::read_dir(options.landing_codex.join(tree))
                 .is_ok_and(|mut entries| entries.next().is_some())
@@ -338,11 +338,110 @@ pub fn landed_anything(options: &Options) -> Result<bool> {
 /// # Errors
 /// `RESEAT_INDEX_ABSENT`.
 pub fn preflight(options: &Options) -> Result<()> {
-    if options.dest_codex.join(STATE_DB).is_file() {
+    // A destination with no index gets one seeded from the snapshot this
+    // pass landed, when that snapshot's Codex completed its backfill
+    // ([`seed_index`]); else the first real `codex` start would backfill
+    // the placed rollouts under their source `cwd` (review 0, finding 4),
+    // and nothing is written.
+    if options.dest_codex.join(STATE_DB).is_file() || seedable(options)?.is_some() {
         Ok(())
     } else {
         Err(BulkloadRefusal::ReseatIndexAbsent)
     }
+}
+
+/// The landed snapshot a destination with no index may be seeded from: one
+/// whose `backfill_state` holds a row (its Codex completed the backfill it
+/// runs once), so the seeded index never backfills again.
+fn seedable(options: &Options) -> Result<Option<PathBuf>> {
+    let Some(landed) = options.landing_index().filter(|index| index.is_file()) else {
+        return Ok(None);
+    };
+    let source = open_snapshot(&landed)?;
+    let present: bool = sql(source.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'backfill_state'",
+        [],
+        |row| row.get(0),
+    ))?;
+    if !present {
+        return Ok(None);
+    }
+    let complete: bool = sql(source.query_row(
+        "SELECT count(*) > 0 FROM backfill_state",
+        [],
+        |row| row.get(0),
+    ))?;
+    Ok(complete.then_some(landed))
+}
+
+/// Review of #280, finding 6: a destination with no Codex index gets one
+/// before any row is registered, seeded from the snapshot this pass landed:
+/// `VACUUM INTO` a temporary beside the live name, every row of `threads`,
+/// `thread_spawn_edges` and `thread_dynamic_tools` removed from that copy
+/// (the threads are registered next, each under its lane's destination
+/// `cwd` and rollout path), the copy sealed, then published under the live
+/// name without replacing anything. Every other table is kept, so the
+/// destination Codex finds its schema, migrations and `backfill_state`
+/// complete and never backfills the landed rollouts under their source
+/// `cwd` (reseat investigation, 2026-10-16, section 2.2). Returns whether it
+/// seeded one. Nothing is written when the live index exists.
+///
+/// # Errors
+/// `SQLite` and I/O refusals; `DESTINATION_OCCUPIED` when a live index
+/// appeared in between (it is never replaced).
+pub fn seed_index(options: &Options) -> Result<bool> {
+    let live = options.dest_codex.join(STATE_DB);
+    if std::fs::symlink_metadata(&live).is_ok() {
+        return Ok(false);
+    }
+    let Some(landed) = seedable(options)? else {
+        return Ok(false);
+    };
+    let root = super::root(&options.dest_codex)?;
+    let temp_name = format!(".{STATE_DB}.{}.bulkload-seed", std::process::id());
+    let temp = root.join(&temp_name);
+    // A temporary of this name is this process's own, left by nothing else.
+    let _ = std::fs::remove_file(&temp);
+    let seeded = (|| -> Result<()> {
+        let source = open_snapshot(&landed)?;
+        let target = super::key::utf8(&temp)?;
+        sql(source.execute("VACUUM INTO ?1", [target]))?;
+        drop(source);
+        let copy = sql(Connection::open(&temp))?;
+        for table in ["thread_dynamic_tools", "thread_spawn_edges", "threads"] {
+            let present: bool = sql(copy.query_row(
+                "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |row| row.get(0),
+            ))?;
+            if present {
+                sql(copy.execute(&format!("DELETE FROM \"{table}\""), []))?;
+            }
+        }
+        sql(copy.close().map_err(|(_, error)| error))?;
+        let file = std::fs::File::open(&temp).refuse_at("reseat::codex::seed_index")?;
+        file.sync_all().refuse_at("reseat::codex::seed_index")?;
+        let directory = std::fs::File::open(&root).refuse_at("reseat::codex::seed_index")?;
+        let from = std::ffi::CString::new(temp_name.as_bytes())
+            .map_err(|_| BulkloadRefusal::PathNotPortable)?;
+        let to = std::ffi::CString::new(STATE_DB.as_bytes())
+            .map_err(|_| BulkloadRefusal::PathNotPortable)?;
+        match crate::io::publish_noreplace(&directory, &from, &to) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(BulkloadRefusal::DestinationOccupied)
+            }
+            Err(error) => return Err(crate::refuse::io(&error, "reseat::codex::seed_index")),
+        }
+        directory
+            .sync_all()
+            .refuse_at("reseat::codex::seed_index")?;
+        Ok(())
+    })();
+    if seeded.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    seeded.map(|()| true)
 }
 
 /// The bytes a pass would write placing the landed rollouts (the
@@ -354,7 +453,8 @@ pub fn planned(options: &Options, lanes: &Lanes, ledger: Option<&Ledger>) -> Res
     let Ok(root) = std::fs::canonicalize(&options.dest_codex) else {
         return Ok(0);
     };
-    let path = options.landing_codex.join(STATE_DB);
+    // No landed index: an absent path, so no thread is read from one.
+    let path = options.landing_index().unwrap_or_default();
     let cached = match (ledger, std::fs::symlink_metadata(&path)) {
         (Some(ledger), Ok(meta)) => ledger.snapshot_threads(&path, Identity::of(&meta))?,
         _ => None,
@@ -512,8 +612,18 @@ pub fn reseat(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     let root = super::root(&options.dest_codex)?;
+    // Review of #280, finding 6: a destination with no index gets one seeded
+    // from this pass's snapshot first.
+    if seed_index(options)? {
+        *summary.rows.entry("index-seeded".to_owned()).or_default() += 1;
+        emit(&format!(
+            "{{\"schema\":\"{SCHEMA}\",\"kind\":\"index\",\"tool\":\"{TOOL}\",\"outcome\":\"seeded\",\"index\":{}}}",
+            super::shown(&root.join(STATE_DB)),
+        ))?;
+    }
+    // No landed index: an absent path, so no thread is read from one.
     let mut snapshot = Snapshot {
-        path: options.landing_codex.join(STATE_DB),
+        path: options.landing_index().unwrap_or_default(),
         conn: None,
     };
     let db = root.join(STATE_DB);
@@ -1502,6 +1612,13 @@ fn reseat_unindexed(
     summary: &mut Summary,
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
+    // A live-home landing (plan of record 2026-10-19, C9): the landed
+    // `.codex` is the live one, so the destination's own rollouts are listed
+    // here too. One the destination already indexes, or one whose recorded
+    // working directory is no source path and has no lane, is the
+    // destination's own: `in-place`, nothing read past its name, nothing
+    // written.
+    let live = options.live_codex_landing();
     for file in unindexed(options, named)? {
         let landed = options.landing_codex.join(&file.rel);
         let shown_id = file
@@ -1541,6 +1658,11 @@ fn reseat_unindexed(
             ))?;
             continue;
         }
+        if live && row_of(&dest.conn, &id)?.is_some() {
+            summary.session(TOOL, "in-place");
+            emit(&thread_line((&id, ""), None, "in-place", None, None))?;
+            continue;
+        }
         let Some(cwd) = unindexed_cwd(ledger, &id, &landed)? else {
             remember_refused(
                 ledger,
@@ -1561,6 +1683,11 @@ fn reseat_unindexed(
         let (dest_cwd, in_lane) = match lanes.lane(Path::new(&cwd))? {
             Some(lane) => (super::key::utf8(&lane.dest_cwd)?.to_owned(), true),
             None if options.by_id(&cwd) => (cwd.clone(), false),
+            None if live && !Path::new(&cwd).starts_with(&options.source_home) => {
+                summary.session(TOOL, "in-place");
+                emit(&thread_line((&id, &cwd), None, "in-place", None, None))?;
+                continue;
+            }
             None => {
                 remember_refused(
                     ledger,

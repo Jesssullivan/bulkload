@@ -25,7 +25,11 @@
 //!   closes the row unless an operator review says otherwise;
 //! - one **covered** row per live `-wal`, `-shm` or `-journal` the source
 //!   reported beside a database carried as a snapshot: never carried, and
-//!   accounted for by its database's snapshot (#218).
+//!   accounted for by its database's snapshot (#218);
+//! - one **applied-beside** row per seat `--beside SUFFIX` published,
+//!   reused or adopted beside a differing live destination file (plan of
+//!   record 2026-10-19, C1/C2): the beside path is named, and the row is
+//!   accounted (`applied-beside`, closure v5), never pending review.
 //!
 //! [`record_session`] makes the verb's S2 overlap decision before its first
 //! write (review finding 1: a refused overlap writes nothing, not even a
@@ -109,6 +113,13 @@ pub enum EntryOutcome {
     /// A live `-wal`, `-shm` or `-journal` beside a database carried as a
     /// snapshot: covered by it, never carried (#218).
     SidecarCovered,
+    /// The seat's bytes were published, reused or adopted at `beside`, the
+    /// path with the session's `--beside` suffix appended, because the live
+    /// path held other bytes bulkload did not write (or a live sidecar).
+    /// Accounted: every captured byte is at the destination, beside the live
+    /// file. Appended after the earlier variants: a record from before it
+    /// still decodes.
+    AppliedBeside { beside: Vec<u8> },
 }
 
 /// One path row of a session.
@@ -195,6 +206,14 @@ impl TransferRecord {
                         outcome: EntryOutcome::SidecarCovered,
                     });
                 }
+                for (path, beside) in &stats.applied_beside {
+                    record.entries.push(Entry {
+                        rel_path: path.clone(),
+                        outcome: EntryOutcome::AppliedBeside {
+                            beside: beside.clone(),
+                        },
+                    });
+                }
                 record.entries.sort_by(|a, b| {
                     (&a.rel_path, entry_key(&a.outcome)).cmp(&(&b.rel_path, entry_key(&b.outcome)))
                 });
@@ -242,11 +261,13 @@ impl TransferRecord {
     }
 }
 
-// The code (or `covered`) a row's identity and order are keyed on.
+// The code (or `covered`, `applied-beside`) a row's identity and order are
+// keyed on.
 fn entry_key(outcome: &EntryOutcome) -> String {
     match outcome {
         EntryOutcome::Refused { refusal, .. } => refusal.code().to_owned(),
         EntryOutcome::SidecarCovered => "covered".to_owned(),
+        EntryOutcome::AppliedBeside { .. } => "applied-beside".to_owned(),
     }
 }
 
@@ -323,6 +344,27 @@ pub fn stable(path: &Path) -> PathBuf {
                 .map_or_else(|_| path.to_path_buf(), |parent| parent.join(name))
         }
         _ => path.to_path_buf(),
+    }
+}
+
+/// [`stable`] of a `--file` root (#232; estate-move notes, 2026-10-19).
+///
+/// Its parent resolved and its own leaf kept, never followed, so a symlink
+/// seat (and a symlink a pass landed at DEST) names itself, and a rerun keys
+/// the same record. For a regular file it agrees with [`stable`].
+#[must_use]
+pub fn stable_leaf(path: &Path) -> PathBuf {
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => {
+            let parent = if parent.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                parent
+            };
+            std::fs::canonicalize(parent)
+                .map_or_else(|_| path.to_path_buf(), |parent| parent.join(name))
+        }
+        _ => stable(path),
     }
 }
 

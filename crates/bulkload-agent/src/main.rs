@@ -31,17 +31,40 @@ USAGE:
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
     walk PATH   Stat-walk PATH and print the row and refusal counts
-    copy SOURCE DEST SOURCE_STATE DEST_STATE
+    copy [--beside SUFFIX] [--file] SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores; the
                 session's outcomes are recorded in
                 DEST_STATE/transfer.closure.d, one record per transfer, for
                 closure-report --transfer (WP3 PR 4). The S2 overlap checks
                 run before anything is written; a session that ends refused
-                keeps the earlier session's refused rows
-    pull HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
+                keeps the earlier session's refused rows. --file: SOURCE is
+                one file (or symlink, carried as a link), landed as DEST
+                (#232; BOUNDARIES).
+                --beside SUFFIX (plan of record 2026-10-19, C1/C2): land
+                into a live destination. An existing file bulkload did not
+                write is adopted when its bytes are the source's and
+                extended when it is a verified byte prefix of an
+                append-only source (as without the flag); one that differs
+                (and a symlink that differs) is left as it is and the
+                source's bytes are published at <path>SUFFIX, recorded
+                applied-beside in the transfer record (closure counts it
+                carried, never pending review). A database with a live
+                -wal/-shm/-journal beside it lands its snapshot at
+                <db>SUFFIX. A beside path holding something of its own is
+                refused DESTINATION_OCCUPIED; only this store's own earlier
+                beside output is superseded. SUFFIX is one name component
+                (e.g. .neo-20261019). Without the flag a differing file is
+                refused DESTINATION_OCCUPIED and nothing is placed.
+                --beside, when given, comes before --file
+    pull [--beside SUFFIX] [--file] HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
                 Native SSH pull; remote bulkload-agent must be installed; the
-                session is recorded in DEST_STATE as copy's is
-    serve       Serve one framed request on stdin/stdout (for SSH)
+                session is recorded in DEST_STATE as copy's is; --beside as
+                copy's; --file as copy's, run on the source as serve --file
+    serve [--file]
+                Serve one framed request on stdin/stdout (for SSH). With
+                --file the root the request names is one file or symlink,
+                never followed (pull --file passes it); any other word is
+                refused
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
@@ -165,12 +188,25 @@ SUBCOMMANDS:
                 bare repository refs-only. Each path's live path is the
                 longest --map prefix's, else the same path. One line per item
                 (estate-move-source item=ID kind=main|linked|bare) and per
-                note: what is not planned (a symlink, plain files, a prunable
-                worktree, an unreadable repository or entry, a directory its
-                repository does not list, and each nested repository a
-                capture holds as custody only) is printed, counted and
-                written to MOVE_STATE/carry/move-source.notes; estate-move
-                reports it not moved. New items are appended to
+                note: what is not planned is printed, counted and written to
+                MOVE_STATE/carry/move-source.notes (WHAT COUNT CODE PATH, a
+                tab, LIVE: each path's bytes escaped, LIVE by the same --map
+                rules as items), for estate-move's notes phase to carry
+                (2026-10-19): not-git-file (a plain file in a directory that
+                holds a repository, e.g. ~/git/receipt.txt or a
+                *.worktrees directory's log), not-git-tree (the outermost
+                directory holding no repository, its entries counted, e.g.
+                an archive, .idea, .direnv), symlink (in a directory that
+                holds a repository), prunable (a worktree Git lists
+                prunable; its tree when the directory is still there),
+                not-in-census (a directory its repository does not list),
+                unreadable (typed, SOURCE_ROOT_UNREADABLE for a read),
+                source-vanished (a root gone, SOURCE_ROOT_MISSING, or a
+                seat removed between its listing and its stat,
+                SOURCE_VANISHED), and nested (each nested repository a
+                capture holds as custody only, by its own path).
+                MOVE_STATE/serve/notes is made beside serve/carry.
+                New items are appended to
                 MOVE_STATE/carry/plan.postcard (estate-add-batch; existing
                 ones never change, and a source planned at another live path
                 refuses RECEIPT_BINDING_INVALID), then the plan is captured
@@ -221,21 +257,70 @@ SUBCOMMANDS:
                 A beside landing converges to a newer capture when its proof
                 holds (gap C12). 4 carry: estate-carry-files for
                 the carry items, at the live path while it is still absent or
-                empty, else with --beside .LABEL. 5 hand-off: estate-handoff
+                empty, else with --beside .LABEL. 4b notes (2026-10-19,
+                nothing is ever excluded): every source note through the
+                same transport (copy, or pull from HOST), each one recorded
+                transfer (MOVE_STATE/pull/notes/ID; the source's serve
+                state SOURCE_MOVE_STATE/serve/notes/ID) with --beside .LABEL
+                to the live path the source half mapped it to: a
+                not-git-file as a --file session, a symlink as a --file
+                session of the link itself (never followed), a
+                not-git-tree, prunable or not-in-census directory as one
+                tree session (custody as files; a worktree is never
+                registered again). A tree lands into a live directory
+                holding no repository (equal files adopted, differing ones
+                beside, nothing removed) and at <live>.LABEL beside
+                anything else there; a file or link at <live>.LABEL beside a
+                directory. Absent parents are made 0755 and recorded in
+                MOVE_STATE/notes/ID.parents. A note under a planned item's
+                checkout or under a carried tree is covered, never carried
+                twice; nested (GIT_NEST_CUSTODY_ONLY), unreadable and
+                source-vanished notes, and a prunable worktree whose
+                directory is gone (SOURCE_ROOT_MISSING), are held typed,
+                pending review; a
+                note from an older source half (not-git), a tree holding a
+                planned item or a path that does not decode is unaccounted.
+                One estate-move note= line each (outcome, counters, at=,
+                beside_root=), an estate-move notes summary
+                (source_bytes_read=: 0 on an unchanged rerun) and the rows
+                of the notes no transfer accounts for in
+                MOVE_STATE/notes.rows (closure-dispose --source-notes).
+                5 hand-off: estate-handoff
                 for the items whose workspace this pass landed or adopted
-                (unless --no-hand-off). 6 with --sessions: SOURCE_HOME/.claude
-                and the Codex root (--codex-source-root, default
-                SOURCE_HOME/.codex) into MOVE_STATE/landing, then, when both
-                pulls completed, estate-reseat --lanes-from-plan with each
-                --map and --reseat-arg (one estate-reseat option per flag,
-                e.g. --no-regularize, --unmapped=by-id) into DEST_HOME
-                (--dest-home, default $HOME), state MOVE_STATE/reseat. 7
+                (unless --no-hand-off). 6 with --sessions (plan of record
+                2026-10-19, C9/C10/C11; no intermediary stage):
+                SOURCE_HOME/.claude and the Codex root (--codex-source-root,
+                default SOURCE_HOME/.codex) are pulled with --beside .LABEL
+                into the LIVE DEST_HOME/.claude and DEST_HOME/.codex
+                (--dest-home, default $HOME), transfer records in
+                MOVE_STATE/pull/{claude,codex}: equal files adopted, grown
+                append-only files extended, differing files and the live
+                Codex index's snapshot landed beside as <path>.LABEL. Then,
+                when both sessions completed (paths refused in them stay
+                typed refusals in closure), estate-reseat --lanes-from-plan
+                with each --map and --reseat-arg (one estate-reseat option
+                per flag, e.g. --no-regularize, --unmapped=by-id) re-keys
+                the landed sessions from the live home into DEST_HOME
+                (landing = DEST_HOME; the landed Codex index is
+                state_5.sqlite.LABEL when the live index was kept), state
+                MOVE_STATE/reseat. 7
                 closure: closure-report over the plan (with --dispositions, the
-                closure-dispose ledger joined), written to
+                closure-dispose ledger joined), over every carried note's
+                transfer record and one source-note row per other note and,
+                with --sessions, over the
+                two session transfer records (applied-beside accounted,
+                refused paths pending review), written to
                 MOVE_STATE/closure.json, summarised on an estate-move closure
-                line with not_moved= (the source notes). The gate passes only
-                when every item is accounted and reviewed and nothing is noted
-                not moved; an estate-move gate= line names the next step. The
+                line with notes=, notes_carried=, not_moved= (the entries of
+                the notes neither carried nor covered) and
+                not_moved_dispositioned= (those a review or policy disposes)
+                and, with --sessions,
+                sessions= and reseat_unaccounted= (re-seat outcomes that
+                leave a session not resumable). The gate passes only when
+                every item, session, note transfer and note row is accounted
+                and reviewed, every note still not moved is dispositioned
+                and no re-seat outcome is
+                unaccounted; an estate-move gate= line names the next step. The
                 verb exits with the first phase's refusal, else
                 CLOSURE_UNACCOUNTED while the gate fails. The next converge
                 pass is estate-move-source again on the source, then
@@ -386,7 +471,7 @@ SUBCOMMANDS:
                 transfer-expect listed, bound to PLAN: a listed transfer with
                 no record, or whose session started before the manifest's
                 since, is unaccounted
-    closure-dispose [--attest LEDGER.json] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] LEDGER PLAN CORPUS SOURCE ITEM|--policy CODE accept|re-carry|abandon REVIEWER YYYY-MM-DD [PRIVATE_STATE ...]
+    closure-dispose [--attest LEDGER.json] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] [--source-notes ROWS ...] LEDGER PLAN CORPUS SOURCE ITEM|--policy CODE accept|re-carry|abandon REVIEWER YYYY-MM-DD [PRIVATE_STATE ...]
                 Record an operator review of a typed refusal (S4) in LEDGER,
                 created when absent and bound to PLAN (its path and a digest
                 of its bytes; PLAN must be a plan) and SOURCE. With ITEM: the
@@ -405,7 +490,11 @@ SUBCOMMANDS:
                 name no cause and refuse (FIELD_DOMAIN_VIOLATION), as does a
                 CODE the taxonomy does not hold. --transfer and
                 --transfer-manifest join transfer rows as closure-report
-                does, so ITEM may name one
+                does, so ITEM may name one. --source-notes ROWS
+                (estate-move's MOVE_STATE/notes.rows, 2026-10-19) joins the
+                source notes that pass held, so ITEM may name one by its
+                note= identity (e.g. GIT_NEST_CUSTODY_ONLY,
+                SOURCE_ROOT_UNREADABLE)
     transfer-expect MANIFEST PLAN copy SOURCE DEST DEST_STATE
     transfer-expect MANIFEST PLAN pull HOST SOURCE DEST DEST_STATE
                 List one transfer a run expects in MANIFEST
@@ -416,6 +505,7 @@ SUBCOMMANDS:
     estate-reseat [--check] [--map SRC=DST]... [--lanes-from-plan]
                   [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
                   [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
+                  [--landing-codex-index FILE | --no-landing-codex-index]
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
@@ -596,7 +686,32 @@ BOUNDARIES:
     priority_escalate_after=SECONDS, and priority_escalations,
     priority_escalated_ns, priority_escalated_threads and
     priority_escalation_failures record it.
-    copy/pull require an existing destination directory.
+    copy/pull make an absent DEST themselves (mode 0755 under the umask, as
+    estate-carry-files makes its destinations) when its parent exists, once
+    the source's root opened, and never a parent:
+    DESTINATION_PARENT_MISSING (#232; R2.2, the run writes where it was
+    asked and nowhere else); a root made for a session whose own setup then
+    refuses is removed while still empty. A symlink at DEST, or a regular or
+    special file where a tree would land, is DESTINATION_KIND_MISMATCH, as
+    is a directory at DEST under --file and a symlink where a regular file
+    lands; no link at DEST is followed.
+    --file (#232): SOURCE is one file and DEST the file it lands as, in
+    DEST's existing parent, under DEST's own name. Only SOURCE's parent is
+    resolved: a regular file is carried byte for byte, a symlink as a
+    symlink with its literal target (never its target's bytes). An
+    identical file or link at DEST is adopted, a differing one is refused
+    DESTINATION_OCCUPIED, and an unchanged rerun reads 0 bytes for it, as
+    for a seat in a tree; its rows are keyed as a tree session of SOURCE's
+    parent keys them, so a later tree pass of that parent with the same
+    states reuses them. pull --file runs the source half as serve --file.
+    Under --file the leaf is judged by the walk, after the session opened:
+    an absent one is a SOURCE_VANISHED row and a directory or special file
+    a SOURCE_ROOT_KIND_MISMATCH row, each typed in the destination's record.
+    A regular file named without --file is SOURCE_ROOT_KIND_MISMATCH; an
+    absent tree root or --file parent SOURCE_ROOT_MISSING; one that cannot
+    be resolved or opened SOURCE_ROOT_UNREADABLE with its errno. Over ssh
+    those are the source's whole-session refusal and reach the operator
+    through its stderr; the wire is unchanged (v6).
     copy/pull replace only their own untouched outputs, when the source seat
     changed (superseding publish, WP0(d)); any other divergent destination
     file is preserved and refused DESTINATION_OCCUPIED, and remembered: an
@@ -839,14 +954,7 @@ fn main() -> ExitCode {
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
         Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
-        Some("serve") => {
-            let (input, output) = (std::io::stdin(), std::io::stdout());
-            bulkload_agent::transfer::tune_stream(&input);
-            bulkload_agent::transfer::tune_stream(&output);
-            // The reader thread owns stdin for the session; the process
-            // exit closes the transport.
-            bulkload_agent::transfer::serve(input, &mut output.lock())
-        }
+        Some("serve") => serve_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1002,6 +1110,51 @@ fn global_flags(
     Ok(rest)
 }
 
+/// `copy [--file] ...` and `pull [--file] ...`: a leading `--file` (#232)
+/// names a single-file root.
+fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
+    let (kind, args) = root_kind(args);
+    let path = |index: usize| {
+        args.get(index)
+            .map(Path::new)
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)
+    };
+    match command {
+        "copy" if args.len() == 4 => {
+            // WP3 PR 4: the session's outcomes are closure rows.
+            copy_recorded_kind(kind, path(0)?, path(1)?, path(2)?, path(3)?)
+        }
+        "pull" if (5..=7).contains(&args.len()) => pull_recorded_kind(kind, args),
+        _ => Err(BulkloadRefusal::RequiredFieldMissing),
+    }
+}
+
+/// `serve [--file]`: one framed session on stdin/stdout. `--file` (#232) is
+/// its one option; another word is refused, where before it was ignored.
+fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
+    let (kind, rest) = root_kind(args);
+    if !rest.is_empty() {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    let (input, output) = (std::io::stdin(), std::io::stdout());
+    bulkload_agent::transfer::tune_stream(&input);
+    bulkload_agent::transfer::tune_stream(&output);
+    // The reader thread owns stdin for the session; the process exit closes
+    // the transport.
+    bulkload_agent::transfer::serve_kind(input, &mut output.lock(), kind)
+}
+
+/// Split a leading `--file` (#232) from a transfer verb's arguments: the
+/// root is one regular file, else a tree.
+fn root_kind(
+    args: &[std::ffi::OsString],
+) -> (bulkload_agent::transfer::RootKind, &[std::ffi::OsString]) {
+    match args.split_first() {
+        Some((flag, rest)) if flag == "--file" => (bulkload_agent::transfer::RootKind::File, rest),
+        _ => (bulkload_agent::transfer::RootKind::Tree, args),
+    }
+}
+
 // OI-1001-Q2: bulkload's own closure gate. The JSON ledger goes to stdout
 // whether or not it passes; the verdict is the exit status.
 fn closure_command(args: &[std::ffi::OsString]) -> Result<()> {
@@ -1132,6 +1285,24 @@ fn join_transfer_inputs(
 // like estate-add; `--policy` stands in for ITEM. An item review is bound to
 // the refusal instance the report holds now, so the verb reads the same
 // inputs as closure-report. Prints the recorded row.
+// 2026-10-19: estate-move's source-note rows (each MOVE_STATE/notes.rows
+// given), joined so `closure-dispose` can review one.
+fn join_source_notes(
+    report: &mut bulkload_agent::closure::Report,
+    files: &[PathBuf],
+) -> Result<()> {
+    for rows in files {
+        report.join_notes(
+            &bulkload_agent::estate::moving::notes::read_rows(rows)?
+                .iter()
+                .map(bulkload_agent::estate::moving::notes::RowRecord::row)
+                .collect::<Vec<_>>(),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Options, then one review row.
 fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
     use bulkload_agent::disposition::{self, Decision, Row, Scope};
     fn text(value: &std::ffi::OsString) -> Result<&str> {
@@ -1140,6 +1311,7 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut attest = None;
     let mut manifest = None;
     let mut transfers = Vec::new();
+    let mut source_notes = Vec::new();
     let mut positional = args;
     loop {
         match positional {
@@ -1160,8 +1332,17 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
                 transfers.push(PathBuf::from(state));
                 positional = rest;
             }
+            // 2026-10-19: estate-move's source-note rows
+            // (MOVE_STATE/notes.rows) can be reviewed too.
+            [flag, rows, rest @ ..] if flag == "--source-notes" => {
+                source_notes.push(PathBuf::from(rows));
+                positional = rest;
+            }
             [flag]
-                if flag == "--attest" || flag == "--transfer" || flag == "--transfer-manifest" =>
+                if flag == "--attest"
+                    || flag == "--transfer"
+                    || flag == "--transfer-manifest"
+                    || flag == "--source-notes" =>
             {
                 return Err(BulkloadRefusal::RequiredFieldMissing)
             }
@@ -1191,6 +1372,7 @@ fn dispose_command(args: &[std::ffi::OsString]) -> Result<()> {
             let estate = bulkload_agent::estate::ledger(plan, Path::new(corpus), source, &states)?;
             let mut report = bulkload_agent::closure::Report::from_ledger(&estate);
             join_transfer_inputs(&mut report, &transfers, manifest.as_deref(), plan)?;
+            join_source_notes(&mut report, &source_notes)?;
             if let Some(attest) = &attest {
                 report.attest(&bulkload_agent::closure::AttestationLedger::read(
                     attest, plan, source,
@@ -1280,6 +1462,31 @@ fn export_command(
     Ok(())
 }
 
+/// Take a leading `--beside SUFFIX` (or `--beside=SUFFIX`) off `args`,
+/// setting the process's beside suffix, and return the rest.
+fn beside_option(args: &[std::ffi::OsString]) -> Result<&[std::ffi::OsString]> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Some(first) = args.first() else {
+        return Ok(args);
+    };
+    let (suffix, taken) = if first.as_os_str() == "--beside" {
+        (
+            args.get(1)
+                .ok_or(BulkloadRefusal::RequiredFieldMissing)?
+                .as_bytes()
+                .to_vec(),
+            2,
+        )
+    } else if let Some(value) = first.as_bytes().strip_prefix(b"--beside=") {
+        (value.to_vec(), 1)
+    } else {
+        return Ok(args);
+    };
+    bulkload_agent::transfer::set_beside_suffix(Some(suffix))?;
+    Ok(args.get(taken..).unwrap_or_default())
+}
+
+#[allow(clippy::too_many_lines)] // One arm per verb; `--beside` for copy and pull.
 fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
     let path = |index: usize| {
         args.get(index)
@@ -1317,11 +1524,9 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             println!("{count}");
             Ok(())
         }
-        "copy" if args.len() == 4 => {
-            // WP3 PR 4: the session's outcomes are closure rows.
-            copy_recorded(path(0)?, path(1)?, path(2)?, path(3)?)
-        }
-        "pull" if (5..=7).contains(&args.len()) => pull_recorded(args),
+        // `--beside SUFFIX` leads the positional arguments of copy and
+        // pull (plan of record 2026-10-19, C1/C2), then `--file` (#232).
+        "copy" | "pull" => transfer_command(command, beside_option(args)?),
         "snapshot" if (2..=3).contains(&args.len()) => {
             bulkload_agent::provider_sqlite::snapshot(path(0)?, path(1)?, steps(args.get(2))?)?;
             println!("snapshot complete");
@@ -1789,6 +1994,13 @@ fn print_receipt(row: &bulkload_agent::estate::Receipt) -> Result<()> {
 // R0 (TIN-6587): re-seat landed agent sessions, or check that they hold.
 #[allow(clippy::too_many_lines)]
 fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
+    reseat_run(args).map(drop)
+}
+
+/// `estate-reseat`, returning a pass's summary (`None` for `--check` and
+/// `--undo`), which `estate-move` folds into its gate (C11).
+#[allow(clippy::too_many_lines)]
+fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::reseat::Summary>> {
     use bulkload_agent::reseat::{self, GitCheck, Unmapped};
     let mut check = false;
     let mut maps = Vec::new();
@@ -1797,6 +2009,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     let mut states = Vec::new();
     let mut roots = Vec::new();
     let (mut landing_claude, mut landing_codex) = (None, None);
+    let mut landing_index = bulkload_agent::reseat::LandingIndex::InLanding;
     let mut unmapped = Unmapped::Report;
     let mut marker = None;
     let mut sessions_only = false;
@@ -1822,6 +2035,9 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             "--no-respell" => respell = false,
             "--no-regularize" => regularize = false,
             "--no-default-by-id" => default_by_id = false,
+            "--no-landing-codex-index" => {
+                landing_index = bulkload_agent::reseat::LandingIndex::Absent;
+            }
             "--unmapped=report" => unmapped = Unmapped::Report,
             "--unmapped=by-id" => unmapped = Unmapped::ById,
             "--rebind-landing" => {
@@ -1859,6 +2075,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
             | "--codex-source-root"
             | "--landing-claude"
             | "--landing-codex"
+            | "--landing-codex-index"
             | "--managed-settings"
             | "--by-id"
             | "--replace-archived-dest"
@@ -1870,6 +2087,12 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
                     "--private-state" => states.push(path),
                     "--codex-source-root" => roots.push(path),
                     "--landing-claude" => landing_claude = Some(path),
+                    "--landing-codex-index" => {
+                        if !path.is_absolute() {
+                            return Err(BulkloadRefusal::PathNotAbsolute);
+                        }
+                        landing_index = bulkload_agent::reseat::LandingIndex::At(path);
+                    }
                     "--managed-settings" => managed.push(path),
                     "--by-id" => {
                         if !path.is_absolute() {
@@ -1965,6 +2188,7 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     if let Some(path) = landing_codex {
         options.landing_codex = path;
     }
+    options.landing_index = landing_index;
     if !roots.is_empty() {
         options.codex_source_roots = roots;
     }
@@ -2013,14 +2237,17 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     if check && undo {
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
-    if undo {
+    let summary = if undo {
         reseat::undo(&options, &mut emit).map(drop)?;
+        None
     } else if check {
         reseat::check(&options, &mut emit)?.verdict()?;
+        None
     } else {
-        reseat::reseat(&options, &mut emit).map(drop)?;
-    }
-    output.flush().refuse_at("main::reseat_command")
+        Some(reseat::reseat(&options, &mut emit)?)
+    };
+    output.flush().refuse_at("main::reseat_command")?;
+    Ok(summary)
 }
 
 /// `estate-handoff`'s options, before its positional arguments
@@ -2280,22 +2507,92 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
 // rows. S2 (review finding 1): the overlap decision is made before the
 // record's first write, so a refused overlap writes nothing anywhere.
 fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &Path) -> Result<()> {
-    let stats = bulkload_agent::transfer_outcome::record_session(
+    copy_recorded_kind(
+        bulkload_agent::transfer::RootKind::Tree,
+        source,
+        dest,
+        source_state,
+        dest_state,
+    )
+}
+
+// #232: `copy_recorded` of a root of `kind` (`copy --file`).
+fn copy_recorded_kind(
+    kind: bulkload_agent::transfer::RootKind,
+    source: &Path,
+    dest: &Path,
+    source_state: &Path,
+    dest_state: &Path,
+) -> Result<()> {
+    report_transfer(&copy_session_recorded(
+        kind,
+        source,
+        dest,
+        source_state,
+        dest_state,
+    )?)
+}
+
+// The record keys of a root of `kind`: a `--file` root names its own leaf,
+// never what a symlink there points at (estate-move notes, 2026-10-19).
+fn record_key(kind: bulkload_agent::transfer::RootKind, path: &Path) -> PathBuf {
+    match kind {
+        bulkload_agent::transfer::RootKind::File => {
+            bulkload_agent::transfer_outcome::stable_leaf(path)
+        }
+        bulkload_agent::transfer::RootKind::Tree => bulkload_agent::transfer_outcome::stable(path),
+    }
+}
+
+// [`copy_recorded_kind`]'s session under its record, its stats returned
+// unprinted (estate-move's notes phase prints its own line per note).
+fn copy_session_recorded(
+    kind: bulkload_agent::transfer::RootKind,
+    source: &Path,
+    dest: &Path,
+    source_state: &Path,
+    dest_state: &Path,
+) -> Result<bulkload_agent::transfer::TransferStats> {
+    bulkload_agent::transfer_outcome::record_session(
         dest_state,
         "copy",
-        &bulkload_agent::transfer_outcome::copy_source(source),
-        &bulkload_agent::transfer_outcome::stable(dest),
+        &record_key(kind, source).to_string_lossy(),
+        &record_key(kind, dest),
         "transfer::copy",
-        || bulkload_agent::transfer::copy_roots_apart(source, dest, source_state, dest_state),
-        || bulkload_agent::transfer::copy(source, dest, source_state, dest_state),
-    )?;
-    report_transfer(&stats)
+        || {
+            bulkload_agent::transfer::copy_roots_apart_kind(
+                source,
+                dest,
+                source_state,
+                dest_state,
+                kind,
+            )
+        },
+        || bulkload_agent::transfer::copy_kind(source, dest, source_state, dest_state, kind),
+    )
 }
 
 // WP3 PR 4: a pull session's outcomes are closure rows, keyed on
 // HOST:SOURCE and the canonical DEST, recorded in DEST_STATE around the
 // session (`pull_command`, whose ssh child the S2 registry pins).
 fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
+    pull_recorded_kind(bulkload_agent::transfer::RootKind::Tree, args)
+}
+
+// #232: `pull_recorded` of a root of `kind` (`pull --file`).
+fn pull_recorded_kind(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<()> {
+    pull_session_recorded(kind, args).and_then(|stats| report_transfer(&stats))
+}
+
+// [`pull_recorded_kind`]'s session under its record, its stats returned
+// unprinted (estate-move's notes phase prints its own line per note).
+fn pull_session_recorded(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<bulkload_agent::transfer::TransferStats> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2306,12 +2603,11 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
         path(4)?,
         "pull",
         &bulkload_agent::transfer_outcome::pull_source(host, path(1)?),
-        &bulkload_agent::transfer_outcome::stable(path(2)?),
+        &record_key(kind, path(2)?),
         "transfer::pull",
-        || bulkload_agent::transfer::receive_roots_apart(path(2)?, path(4)?),
-        || pull_command(args),
+        || bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind),
+        || pull_command(kind, args),
     )
-    .and_then(|stats| report_transfer(&stats))
 }
 
 // M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,
@@ -2347,7 +2643,7 @@ fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
             // parser requires the one with the other.
             args.extend(self.remote.iter().cloned());
             args.extend(self.config.iter().cloned());
-            pull_command(&args)
+            pull_command(bulkload_agent::transfer::RootKind::Tree, &args)
         }
     }
     let mut options = CarryOptions::default();
@@ -2480,7 +2776,10 @@ fn expect_command(args: &[std::ffi::OsString]) -> Result<()> {
     Ok(())
 }
 
-fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer::TransferStats> {
+fn pull_command(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<bulkload_agent::transfer::TransferStats> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2517,8 +2816,12 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer:
     if bulkload_agent::durable::ledger_sync() == bulkload_agent::durable::LedgerSync::Full {
         ssh.arg("--source-ledger-sync=full");
     }
+    ssh.arg("serve");
+    // #232: the source half serves one regular file, as this side lands it.
+    if kind == bulkload_agent::transfer::RootKind::File {
+        ssh.arg("--file");
+    }
     let mut child = ssh
-        .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -2529,13 +2832,14 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer:
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
         bulkload_agent::transfer::tune_stream(&output);
         bulkload_agent::transfer::tune_stream(&input);
-        bulkload_agent::transfer::receive(
+        bulkload_agent::transfer::receive_kind(
             &mut input,
             &mut output,
             path(1)?,
             path(3)?,
             path(2)?,
             path(4)?,
+            kind,
         )
     };
     let exit_status = child.wait().refuse_at("main::pull_command")?;
@@ -2614,7 +2918,7 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
          source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
-         sqlite_sidecars_covered={}",
+         sqlite_sidecars_covered={} applied_beside={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
@@ -2624,8 +2928,16 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         stats.capped_subtrees(),
         bulkload_agent::transfer::sqlite_mode_label(stats.sqlite_mode),
         stats.sqlite_snapshots.len(),
-        stats.sqlite_sidecars_covered.len()
+        stats.sqlite_sidecars_covered.len(),
+        stats.applied_beside.len()
     );
+    for (path, beside) in &stats.applied_beside {
+        eprintln!(
+            "applied-beside {} at={}",
+            path.escape_ascii(),
+            beside.escape_ascii()
+        );
+    }
     for (path, code) in &stats.refusals {
         // S4 (TIN-6592): an IO raised here prints its errno, as its record
         // keeps it.

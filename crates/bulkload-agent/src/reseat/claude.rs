@@ -26,6 +26,17 @@
 //!    `shell-snapshots/`, which are host-local. `history.jsonl` (prompt
 //!    history) and `~/.claude.json` are not read by the picker and stay in
 //!    the landing.
+//! 6. A live-home landing (plan of record 2026-10-19, C9: `estate-move
+//!    --sessions` pulls the source's `.claude` into the destination's live
+//!    `.claude` with `--beside`): the landed `.claude` is the live one, so
+//!    every transcript there is listed. One this ledger placed (an earlier
+//!    pass's re-seat) is an output, not a landed session, and is skipped
+//!    unread. One already under the key Claude Code lists it by in its lane
+//!    (its own key, with or without a lane: the destination's own sessions;
+//!    or its lane's destination key: one placed there before, by hand or by
+//!    another ledger) is `in-place` ([`Resolved::InPlace`]): ledgered,
+//!    nothing written. Only sessions landed under a source key whose lane is
+//!    elsewhere are placed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -256,19 +267,27 @@ fn session_mtimes(
 /// a transcript's head (its lane and slug, once, then from the ledger).
 pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Result<u64> {
     let ledger = Ledger::open_read_only(&options.state)?;
+    let live = options.live_claude_landing();
     let root = std::fs::canonicalize(&options.dest_claude).ok();
     let mut lane_dirs = Vec::new();
     let mut mtimes = Vec::new();
     let mut planned = 0_u64;
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
     for candidate in &sessions.list {
+        // A live-home landing: an earlier pass's placement is no landed
+        // session, and a session in place is placed by nothing (C9).
+        if let (true, Some(root)) = (live, root.as_ref()) {
+            if own_placement(options, ledger.as_ref(), root, candidate)? {
+                continue;
+            }
+        }
         let cached = match &ledger {
             Some(ledger) => ledger
                 .session(TOOL, &candidate.sid)?
                 .filter(|row| row.landing == candidate.path),
             None => None,
         };
-        let dest_key = match resolve(candidate, cached.as_ref(), lanes, options)? {
+        let dest_key = match resolve(candidate, cached.as_ref(), lanes, (options, live))? {
             Resolved::Lane(_, lane) => {
                 if !lane_dirs.contains(&lane.dest_cwd) {
                     lane_dirs.push(lane.dest_cwd.clone());
@@ -276,7 +295,7 @@ pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Resul
                 Some(lane.key)
             }
             Resolved::ById(_) => Some(candidate.key.clone()),
-            Resolved::Refused(..) => None,
+            Resolved::InPlace(..) | Resolved::Refused(..) => None,
         };
         // A session a pass already decided is not read again (S3): its
         // slug is the one it found, or none.
@@ -338,8 +357,30 @@ pub enum Resolved {
     Lane(String, Lane),
     /// To no lane, kept under its source key (`--unmapped=by-id`).
     ById(String),
+    /// A live-home landing only (C9): already under the key Claude Code
+    /// lists it by, in its lane when it has one. Nothing to place.
+    InPlace(String, Option<Lane>),
     /// To a refusal.
     Refused(String, BulkloadRefusal),
+}
+
+/// A live-home landing (C9): whether `candidate` is a transcript this
+/// ledger placed, an output of an earlier pass rather than a landed
+/// session. `root` is the canonical destination `.claude`.
+///
+/// # Errors
+/// The ledger's read refusal.
+pub fn own_placement(
+    options: &Options,
+    ledger: Option<&Ledger>,
+    root: &Path,
+    candidate: &Candidate,
+) -> Result<bool> {
+    let (Some(ledger), Ok(rel)) = (ledger, candidate.path.strip_prefix(&options.landing_claude))
+    else {
+        return Ok(false);
+    };
+    Ok(ledger.placement(&root.join(rel))?.is_some())
 }
 
 /// The transcript's first top-level `cwd`, reading only until it is found.
@@ -380,7 +421,7 @@ pub fn resolve(
     candidate: &Candidate,
     cached: Option<&Session>,
     lanes: &Lanes,
-    options: &Options,
+    (options, live): (&Options, bool),
 ) -> Result<Resolved> {
     let cwd = match cached.map(|row| (row.source_cwd.clone(), row)) {
         Some((Some(cwd), _)) if !cwd.is_empty() => Some(cwd),
@@ -392,23 +433,71 @@ pub fn resolve(
         }
         _ => first_cwd(&candidate.path)?,
     };
+    // A live-home landing (review of #280, finding 7): a transcript under a
+    // key that is not under the source home's key is the destination's own
+    // (the source's land under keys of source paths), already where Claude
+    // Code lists it, with or without a `cwd` its key agrees with.
+    let destination_own = live && !source_keyed(options, &candidate.key);
     let Some(cwd) = cwd else {
+        if destination_own {
+            return Ok(Resolved::InPlace(String::new(), None));
+        }
         return Ok(Resolved::Refused(
             String::new(),
             BulkloadRefusal::ReseatLaneUnresolved,
         ));
     };
-    if key::project_key(&cwd) != candidate.key {
+    let own_key = key::project_key(&cwd) == candidate.key;
+    let lane = if own_key || live {
+        lanes.lane(Path::new(&cwd))?
+    } else {
+        None
+    };
+    if live {
+        // C9: listed by Claude Code where it already is.
+        match lane {
+            Some(lane) if lane.key == candidate.key => {
+                return Ok(Resolved::InPlace(cwd, Some(lane)))
+            }
+            None if own_key => return Ok(Resolved::InPlace(cwd, None)),
+            _ => {}
+        }
+    }
+    if !own_key {
+        if destination_own {
+            return Ok(Resolved::InPlace(cwd, None));
+        }
         return Ok(Resolved::Refused(
             cwd,
             BulkloadRefusal::ReseatLaneUnresolved,
         ));
     }
-    match lanes.lane(Path::new(&cwd))? {
+    match lane {
         Some(lane) => Ok(Resolved::Lane(cwd, lane)),
         None if options.by_id(&cwd) => Ok(Resolved::ById(cwd)),
         None => Ok(Resolved::Refused(cwd, BulkloadRefusal::ReseatLaneUnmapped)),
     }
+}
+
+/// Whether the project key `key` is one of a path under the source home
+/// (its key, or that key and a `-`), when the source home and the
+/// destination home key differently. When they key alike (one home path
+/// on both hosts), every key counts as the source's: nothing is taken for
+/// the destination's own by its key alone.
+fn source_keyed(options: &Options, key: &str) -> bool {
+    let (Some(source), Some(destination)) = (
+        options.source_home.to_str().map(key::project_key),
+        options.dest_home.to_str().map(key::project_key),
+    ) else {
+        return true;
+    };
+    if source == destination {
+        return true;
+    }
+    key == source
+        || key
+            .strip_prefix(source.as_str())
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 /// Every regular file (and every other node, to report) under `root`, as
@@ -581,43 +670,62 @@ pub fn reseat(
         .with_rebind(&options.rebind);
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
     let mut refused_keys: BTreeMap<String, BulkloadRefusal> = BTreeMap::new();
+    let live = options.live_claude_landing();
     for candidate in &sessions.list {
+        // A live-home landing (C9): an earlier pass's placement is this
+        // ledger's output, not a landed session; nothing is read for it.
+        if live && own_placement(options, Some(ledger), &root, candidate)? {
+            continue;
+        }
         let cached = ledger
             .session(TOOL, &candidate.sid)?
             .filter(|row| row.landing == candidate.path);
-        let (cwd, lane, dest_key) = match resolve(candidate, cached.as_ref(), lanes, options)? {
-            Resolved::Lane(cwd, lane) => {
-                let key = lane.key.clone();
-                (cwd, Some(lane), key)
-            }
-            Resolved::ById(cwd) => (cwd, None, candidate.key.clone()),
-            Resolved::Refused(cwd, refusal) => {
-                // Cached, so a rerun does not scan it again (S3).
-                ledger.put_session(&Session {
-                    tool: TOOL.to_owned(),
-                    id: candidate.sid.clone(),
-                    landing: candidate.path.clone(),
-                    source_cwd: Some(cwd.clone()),
-                    outcome: refusal.code().to_owned(),
-                    landed_size: Some(candidate.size),
-                    landed_mtime: Some(candidate.mtime),
-                    ..Session::default()
-                })?;
-                refused_keys
-                    .entry(candidate.key.clone())
-                    .or_insert_with(|| refusal.clone());
-                summary.session(TOOL, refusal.code());
-                emit(&session_line(
-                    candidate,
-                    &cwd,
-                    (None, None, None),
-                    "refused",
-                    Some(&refusal),
-                    &BTreeMap::new(),
-                ))?;
-                continue;
-            }
-        };
+        let (cwd, lane, dest_key) =
+            match resolve(candidate, cached.as_ref(), lanes, (options, live))? {
+                Resolved::Lane(cwd, lane) => {
+                    let key = lane.key.clone();
+                    (cwd, Some(lane), key)
+                }
+                Resolved::ById(cwd) => (cwd, None, candidate.key.clone()),
+                Resolved::InPlace(cwd, lane) => {
+                    in_place(
+                        ledger,
+                        candidate,
+                        (&cwd, lane.as_ref()),
+                        cached.as_ref(),
+                        summary,
+                        emit,
+                    )?;
+                    keys_done.insert((candidate.key.clone(), candidate.key.clone()));
+                    continue;
+                }
+                Resolved::Refused(cwd, refusal) => {
+                    // Cached, so a rerun does not scan it again (S3).
+                    ledger.put_session(&Session {
+                        tool: TOOL.to_owned(),
+                        id: candidate.sid.clone(),
+                        landing: candidate.path.clone(),
+                        source_cwd: Some(cwd.clone()),
+                        outcome: refusal.code().to_owned(),
+                        landed_size: Some(candidate.size),
+                        landed_mtime: Some(candidate.mtime),
+                        ..Session::default()
+                    })?;
+                    refused_keys
+                        .entry(candidate.key.clone())
+                        .or_insert_with(|| refusal.clone());
+                    summary.session(TOOL, refusal.code());
+                    emit(&session_line(
+                        candidate,
+                        &cwd,
+                        (None, None, None),
+                        "refused",
+                        Some(&refusal),
+                        &BTreeMap::new(),
+                    ))?;
+                    continue;
+                }
+            };
         let rel = Path::new("projects")
             .join(&dest_key)
             .join(format!("{}.jsonl", candidate.sid));
@@ -733,6 +841,45 @@ pub fn reseat(
         ))?;
     }
     Ok(())
+}
+
+/// A live-home landing's session already where Claude Code lists it (C9):
+/// counted and reported `in-place`, nothing written to the agent state. Its
+/// session row is written so a rerun reads nothing for it (S3), unless the
+/// row of that ID names another landed copy (the same session landed under
+/// its source key too), which keeps its row.
+fn in_place(
+    ledger: &Ledger,
+    candidate: &Candidate,
+    (cwd, lane): (&str, Option<&Lane>),
+    cached: Option<&Session>,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    summary.session(TOOL, "in-place");
+    let other = cached.is_none() && ledger.session(TOOL, &candidate.sid)?.is_some();
+    if !other {
+        ledger.put_session(&Session {
+            tool: TOOL.to_owned(),
+            id: candidate.sid.clone(),
+            landing: candidate.path.clone(),
+            source_cwd: Some(cwd.to_owned()),
+            dest_cwd: lane.map(|lane| lane.dest_cwd.clone()),
+            dest_key: Some(candidate.key.clone()),
+            slug: cached.and_then(|row| row.slug.clone()),
+            outcome: "in-place".to_owned(),
+            landed_size: Some(candidate.size),
+            landed_mtime: Some(candidate.mtime),
+        })?;
+    }
+    emit(&session_line(
+        candidate,
+        cwd,
+        (lane, Some(&candidate.key), None),
+        "in-place",
+        None,
+        &BTreeMap::new(),
+    ))
 }
 
 fn session_line(

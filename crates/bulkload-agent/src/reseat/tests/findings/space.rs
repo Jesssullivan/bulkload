@@ -275,13 +275,18 @@ fn a_regularization_keeps_the_placements_bytes_reserved_then_retries() {
     assert!(bytes.len() - head > 32 * 1024 * 1024);
     let options = world.options();
     let root = fs::canonicalize(&options.dest_claude).unwrap();
-    // Reserve all but half the link's size: the reservation alone fits, the
-    // link beside it does not.
+    // The link alone fits (floor 0); counted beside the placements'
+    // reservation it does not. The reservation is twice the free space
+    // probed, so the answer does not depend on what other writers free on a
+    // shared filesystem between this probe and the check (it reserved all
+    // but half the link's size before, and failed on honey's busy root
+    // filesystem, 2026-10-19).
     let limits = crate::space::probe_limits(&root).unwrap();
     let free = limits.quota.map_or(limits.filesystem.available, |quota| {
         quota.available.min(limits.filesystem.available)
     });
-    let reserved_bytes = free.saturating_sub((bytes.len() as u64) / 2);
+    assert!(free > bytes.len() as u64, "the link alone fits");
+    let reserved_bytes = free.saturating_mul(2);
     let reserved = [(root.as_path(), reserved_bytes)];
     {
         let ledger = ledger::Ledger::open(&options.state, options.now_ns, "test").unwrap();
