@@ -625,7 +625,7 @@ fn copy_file_carries_a_symlink_as_a_link() {
     settle(&scratch.path("source"));
     for (leaf, target) in [
         ("rel", PathBuf::from("real.txt")),
-        ("abs", absolute.clone()),
+        ("abs", absolute),
     ] {
         let source = format!("source/{leaf}");
         let dest = format!("destination/{leaf}");
