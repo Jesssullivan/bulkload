@@ -314,6 +314,40 @@ regression test built on sting's shape.
   6. The 80 neo-key directories already on sting are outside it: removing
      a transcript is forbidden (C8, C9). They stay, reported as residue.
 
+## Receipt after both reviews
+
+Host `honey`, head `7d986f59f5be28340d0c099140dfa56fc2a429c0` (the pushed
+branch: the review fixes on the merge of `origin/main` `9854236`),
+checked out detached in `~/git-build/beside-live-home-20261019`.
+- Environment: `nice -n 19 nix develop --no-write-lock-file
+  --ignore-environment .#default`, with `CARGO_BUILD_JOBS=4`,
+  `RUST_TEST_THREADS=4` and debuginfo off (honey load 70–110, another
+  session's production build sharing it).
+- `CARGO_TARGET_DIR=~/git-build/target-beside-live-home`.
+- `TMPDIR=/var/tmp/jess-bulkload-tests/pull-beside-live-home-20261019/tmp`,
+  removed after the run.
+
+- `cargo clippy -p bulkload-agent --all-targets --locked -- -D warnings`:
+  ok.
+- `cargo test -p bulkload-agent --locked`: exit 0. 39 test binaries, 1251
+  passed, 0 failed, 8 ignored (lib: 931 passed, 6 ignored). Log
+  `~/git-build/logs/beside-live-home-testall-7d986f5.log`.
+- `just rust-check`, second run: exit 0. fmt check ok; workspace clippy
+  `-D warnings` ok; `io-trace` clippy ok; rust-test groups 1 to 5 status
+  0, "all 42 test executables ran, in 5 groups", 1295 passed, 0 failed, 9
+  ignored. Log `~/git-build/logs/beside-live-home-rustcheck-7d986f5.log`.
+- The first `just rust-check` at the same head failed one test in group 2.
+  `estate_adopt::p90_the_gftb_shapes_adopt_and_converge_with_bulkload_verbs_only`
+  asserts the bytes re-verified for seats written in their ledger's mtime
+  tick, which moves with load (24 against 57). The same test passed in the
+  `cargo test` run above and in the second `rust-check`, and it exercises
+  git adopt, which this diff does not touch.
+- #282's estate-move converge test failed once, at `96cdde0`, the same
+  way (a first capture racy or not by timing), and passed at `7d986f5`.
+- `just darwin-touched`: yes (platform cfgs already in the files touched);
+  `just darwin-check` on pzm is owed before merge. The merge gate
+  (`just local-gate-receipt --pr 280 --post`) has not been run.
+
 ## Open
 
 - **Finding 9 (no duplicate bits, R4):** the source's transcripts land in
