@@ -546,6 +546,14 @@ fn census(worktree: &Path, rows: &[crate::RowSchema]) -> Result<Vec<SeatPrint>> 
 /// private stage nobody else sees. `false` over the ledger cap: the
 /// checkout is landed without one and reported `not-convergeable` (finding
 /// 20.6).
+///
+/// `started_ns` is the landing's racy instant, taken before its first
+/// write (C03): every seat the landing wrote is stamped at or after it, so
+/// none is trusted by its print until a later pass has read it by content
+/// and recorded it again. An instant taken after the writes would let a
+/// seat an operator rewrote between bulkload's write and this record's
+/// print pass as bulkload's own once the landing took longer than
+/// [`super::RACY_GRANULARITY_NS`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_landing(
     worktree: &Path,
@@ -555,7 +563,7 @@ pub(super) fn record_landing(
     landing: &Landing<'_>,
     meta: &Meta,
     head: (Head, Option<String>),
-    index: Option<[u8; 32]>,
+    (index, started_ns): (Option<[u8; 32]>, i128),
 ) -> Result<bool> {
     let index = match index {
         Some(index) => index,
@@ -570,7 +578,7 @@ pub(super) fn record_landing(
         intended_branch: head.1,
         index,
         exclude: exclude_digest(&read_exclude(common)?),
-        recorded_ns: super::pass_start_ns(),
+        recorded_ns: started_ns,
         fsid: landed::fsid(worktree)?,
         seats: census(worktree, &meta.rows(worktree)?)?,
     };
@@ -1260,6 +1268,11 @@ impl std::io::Write for Compare {
 /// print (adopted by content, design 4.2 and Q2).
 struct Proof {
     prints: BTreeMap<Vec<u8>, SeatPrint>,
+    /// The racy instant, taken before the proof's first read: the ledger a
+    /// converge records after this proof is dated by it, so a print the
+    /// proof took (or a seat the converge then wrote) inside the window
+    /// stays racy (C03; as adopt's, review of 2026-10-16 finding 4).
+    started_ns: i128,
 }
 
 /// Prove the landed checkout at `worktree` unchanged since `ledger` (design
@@ -1271,6 +1284,7 @@ fn prove(
     standalone: bool,
     old: &BTreeMap<Vec<u8>, Side>,
 ) -> Result<Proof> {
+    let started_ns = super::pass_start_ns();
     let modified = BulkloadRefusal::GitDestinationModified;
     if head_of(worktree)? != ledger.head || index_digest(worktree, None)? != ledger.index {
         return Err(modified);
@@ -1327,7 +1341,7 @@ fn prove(
         prints.insert(seat.path.clone(), now);
     }
     objects.finish()?;
-    Ok(Proof { prints })
+    Ok(Proof { prints, started_ns })
 }
 
 /// Refuse a capture whose shape converge does not carry (A8): the shallow
@@ -1957,11 +1971,14 @@ fn tag(landing: &Landing<'_>) -> String {
 /// The new workspace ledger after a converge or a settle. `installed` is
 /// the index digest `publish_index` installed and the exclude digest the
 /// converge wrote or proved (review 3 finding 3: neither is read back).
+/// `recorded_ns` dates it (C03): a converge's proof instant, taken before
+/// the proof's first read and so before every write; a settle's, the
+/// ledger it settles from, whose prints it carries unread.
 #[allow(clippy::too_many_arguments)]
 fn next_ledger(
     worktree: &Path,
     before: &LandedWorkspace,
-    to: ([u8; 32], i128, &str),
+    (to, recorded_ns): (([u8; 32], i128, &str), i128),
     head: (Head, Option<String>),
     installed: ([u8; 32], [u8; 32]),
     new: &BTreeMap<Vec<u8>, Side>,
@@ -1990,7 +2007,7 @@ fn next_ledger(
         intended_branch: head.1,
         index: installed.0,
         exclude: installed.1,
-        recorded_ns: super::pass_start_ns(),
+        recorded_ns,
         fsid: landed::fsid(worktree)?,
         seats,
     })
@@ -2502,7 +2519,10 @@ fn converge(
         let next = next_ledger(
             worktree,
             ledger,
-            (landing.capture, landing.observed_ns, &instance),
+            (
+                (landing.capture, landing.observed_ns, &instance),
+                proof.started_ns,
+            ),
             (plan.head, plan.intended),
             (index, intent.exclude.map_or(ledger.exclude, |(_, new)| new)),
             &new,
@@ -2687,10 +2707,16 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
         .iter()
         .map(|seat| (seat.path.clone(), seat.clone()))
         .collect();
+    // The settle writes after a crash and carries the old ledger's prints
+    // without reading them: dated as that ledger is, never later, so no
+    // print it vouched for only as racy becomes trusted here (C03).
     let next = next_ledger(
         worktree,
         ledger,
-        (intent.to, intent.to_observed_ns, &intent.to_instance),
+        (
+            (intent.to, intent.to_observed_ns, &intent.to_instance),
+            ledger.recorded_ns,
+        ),
         (intent.head.1.clone(), intent.intended_branch.clone()),
         (index, intent.exclude.map_or(ledger.exclude, |(_, new)| new)),
         &new,
@@ -3322,7 +3348,9 @@ pub(super) fn exclude_newer(common: &Path, source: &str, existing: &[u8], t: i12
 /// Record a first landing's workspace ledger at `worktree`; `custody`
 /// gains `not-convergeable` when the ledger is over its cap. `index` is
 /// the digest of the index the landing installed (a linked landing's,
-/// [`installed_index`]); `None` reads a private stage's.
+/// [`installed_index`]); `None` reads a private stage's. `started_ns` is
+/// the landing's racy instant, taken before its first write
+/// ([`record_landing`]).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finish_landing(
     worktree: &Path,
@@ -3331,7 +3359,7 @@ pub(super) fn finish_landing(
     landing: &Landing<'_>,
     meta: &Meta,
     head: (&Head, Option<&String>),
-    index: Option<[u8; 32]>,
+    (index, started_ns): (Option<[u8; 32]>, i128),
     mut custody: Custody,
 ) -> Result<Applied> {
     let git_dir =
@@ -3350,7 +3378,7 @@ pub(super) fn finish_landing(
         landing,
         meta,
         (head.0.clone(), head.1.cloned()),
-        index,
+        (index, started_ns),
     )? {
         custody.count("not-convergeable");
     }

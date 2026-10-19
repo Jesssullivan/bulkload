@@ -6995,6 +6995,9 @@ pub(crate) fn restore_staged_landed(
 ) -> Result<converge::Applied> {
     const SITE: &str = "git_carry::restore_staged";
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    // The workspace ledger's racy instant, before the landing's first write
+    // (C03, `converge::record_landing`).
+    let started_ns = pass_start_ns();
     destination_git_ready()?;
     let bundle = staged.path();
     // R-N114: a destination already there is a collision, refused by type,
@@ -7093,7 +7096,7 @@ pub(crate) fn restore_staged_landed(
         landing,
         &meta,
         (&head.head, head.intended.as_ref()),
-        None,
+        (None, started_ns),
         custody,
     )?;
     // Before the rename: moving a directory to another parent needs write
@@ -7482,6 +7485,9 @@ pub(crate) fn restore_linked_staged_landed(
     landing: &converge::Landing<'_>,
 ) -> Result<converge::Applied> {
     use std::os::unix::fs::PermissionsExt;
+    // The workspace ledger's racy instant, before the landing's first write
+    // (C03, `converge::record_landing`): this landing writes in place.
+    let started_ns = pass_start_ns();
     destination_git_ready()?;
     // Dogfood of 2026-10-16, F2 (OI-1003-Q171, Q172, Q173): every refusal
     // that needs no write (bare capture, occupied, parent missing, the
@@ -7622,7 +7628,7 @@ pub(crate) fn restore_linked_staged_landed(
         landing,
         &meta,
         (&head_plan.head, head_plan.intended.as_ref()),
-        Some(index),
+        (Some(index), started_ns),
         custody,
     )?;
     // `--exclude-union`: the receipt of this finished landing counted the
@@ -7663,6 +7669,10 @@ pub(crate) fn recover_linked_landing(
 ) -> Result<()> {
     const SITE: &str = "git_carry::recover_linked_landing";
     use std::os::unix::ffi::OsStrExt;
+    // The ledger's racy instant, before this pass's first read or write
+    // (C03): what the crashed landing wrote is read by content below, and
+    // what this pass writes is stamped after it.
+    let started_ns = pass_start_ns();
     let modified = BulkloadRefusal::GitDestinationModified;
     if converge::head_of(destination)? != intent.head {
         return Err(modified);
@@ -7783,7 +7793,7 @@ pub(crate) fn recover_linked_landing(
         },
         &meta,
         (&intent.head, intent.intended_branch.as_ref()),
-        Some(target),
+        (Some(target), started_ns),
         native_refs::Custody::default(),
     )
     .map(drop)

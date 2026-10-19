@@ -366,7 +366,7 @@ fn the_ledger_records_the_installed_index_not_a_re_read() {
     let next = next_ledger(
         &repo,
         &before,
-        ([3; 32], 2, "j"),
+        (([3; 32], 2, "j"), 5),
         (before.head.clone(), None),
         (installed, [4; 32]),
         &BTreeMap::new(),
@@ -376,6 +376,8 @@ fn the_ledger_records_the_installed_index_not_a_re_read() {
     .unwrap();
     assert_eq!(next.index, installed);
     assert_eq!(next.exclude, [4; 32]);
+    // Dated by the instant it was given (C03), never by the clock now.
+    assert_eq!(next.recorded_ns, 5);
 }
 
 /// The earlier report's finding 1 (mutation `settle_remove_dir`): the delta
