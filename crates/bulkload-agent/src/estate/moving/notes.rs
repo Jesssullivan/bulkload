@@ -229,9 +229,7 @@ fn first_plan(line: &Line) -> Plan {
         FILE => carried(Shape::File),
         LINK => carried(Shape::Link),
         // A prunable worktree whose directory is gone has nothing to carry.
-        "prunable" if line.code.is_some() => {
-            Plan::Held(line.code.clone().unwrap_or_default())
-        }
+        "prunable" if line.code.is_some() => Plan::Held(line.code.clone().unwrap_or_default()),
         TREE | "prunable" | "not-in-census" => carried(Shape::Tree),
         "nested" => Plan::Held(BulkloadRefusal::GitNestCustodyOnly.code().to_owned()),
         "unreadable" => Plan::Held(line.code.clone().unwrap_or_else(|| "IO".to_owned())),

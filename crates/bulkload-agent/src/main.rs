@@ -201,10 +201,11 @@ SUBCOMMANDS:
                 prunable; its tree when the directory is still there),
                 not-in-census (a directory its repository does not list),
                 unreadable (typed, SOURCE_ROOT_UNREADABLE for a read),
-                source-vanished, and nested (each nested repository a
-                capture holds as custody only, by its own path). A seat
-                removed between its listing and its stat is gone, not
-                noted. MOVE_STATE/serve/notes is made beside serve/carry.
+                source-vanished (a root gone, SOURCE_ROOT_MISSING, or a
+                seat removed between its listing and its stat,
+                SOURCE_VANISHED), and nested (each nested repository a
+                capture holds as custody only, by its own path).
+                MOVE_STATE/serve/notes is made beside serve/carry.
                 New items are appended to
                 MOVE_STATE/carry/plan.postcard (estate-add-batch; existing
                 ones never change, and a source planned at another live path

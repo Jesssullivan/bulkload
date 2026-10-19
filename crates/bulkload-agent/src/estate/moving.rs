@@ -1267,7 +1267,10 @@ mod tests {
         let found_empty = found_empty.unwrap();
         assert!(found_empty.items.is_empty());
         // 2026-10-19: a root holding no repository is one tree note.
-        assert!(found_empty.notes.iter().any(|note| note.what == notes::TREE));
+        assert!(found_empty
+            .notes
+            .iter()
+            .any(|note| note.what == notes::TREE));
         for (refusal, what) in [
             (BulkloadRefusal::SourceRootMissing, "source-vanished"),
             (BulkloadRefusal::SourceVanished, "source-vanished"),
