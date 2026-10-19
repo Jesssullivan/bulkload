@@ -5452,8 +5452,9 @@ fn receive_session<R: Read, W: Write>(
     let budget = crate::io::limits::descriptor_budget();
     let (notify, group_outcomes) = std::sync::mpsc::channel();
     let displaced = Displaced::shared(usize::try_from((budget / 8).clamp(1, 64)).unwrap_or(1));
-    let committer = publication_committer(destination_state, budget, notify, Arc::clone(&displaced))
-        .map_err(unmade)?;
+    let committer =
+        publication_committer(destination_state, budget, notify, Arc::clone(&displaced))
+            .map_err(unmade)?;
     // The committer holds the exclusive publisher, so no temporary of this
     // store is in flight while the root is swept.
     target.sweep_root(&store).map_err(unmade)?;

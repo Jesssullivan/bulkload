@@ -100,7 +100,10 @@ impl Scratch {
         path.push(":");
         path.push(std::env::var_os("PATH").unwrap_or_default());
         let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
-        command.arg("--min-free-percent=0").arg("pull").env("PATH", path);
+        command
+            .arg("--min-free-percent=0")
+            .arg("pull")
+            .env("PATH", path);
         if file {
             command.arg("--file");
         }
@@ -471,17 +474,28 @@ fn a_symlinked_destination_is_typed_and_never_followed() {
     settle(&scratch.path("source"));
     for link in ["ld", "lf", "dangling"] {
         let dest = format!("destination/{link}");
-        let ran = scratch.copy(false, "source", &dest, (&format!("ss-t{link}"), &format!("ds-t{link}")));
+        let ran = scratch.copy(
+            false,
+            "source",
+            &dest,
+            (&format!("ss-t{link}"), &format!("ds-t{link}")),
+        );
         assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
         assert!(
             ran.stderr.contains("refused: DESTINATION_KIND_MISMATCH"),
             "{link}: {}",
             ran.stderr
         );
-        let ran = scratch.copy(true, "source/a.txt", &dest, (&format!("ss-f{link}"), &format!("ds-f{link}")));
+        let ran = scratch.copy(
+            true,
+            "source/a.txt",
+            &dest,
+            (&format!("ss-f{link}"), &format!("ds-f{link}")),
+        );
         assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);
         assert!(
-            ran.stderr.contains(&format!("refused {link}: DESTINATION_KIND_MISMATCH")),
+            ran.stderr
+                .contains(&format!("refused {link}: DESTINATION_KIND_MISMATCH")),
             "{link}: {}",
             ran.stderr
         );
@@ -490,7 +504,10 @@ fn a_symlinked_destination_is_typed_and_never_followed() {
             .file_type()
             .is_symlink());
     }
-    assert_eq!(names(&scratch.path("destination/real")), Vec::<String>::new());
+    assert_eq!(
+        names(&scratch.path("destination/real")),
+        Vec::<String>::new()
+    );
     assert_eq!(
         std::fs::read(scratch.path("destination/real.txt")).unwrap(),
         b"theirs\n"
@@ -606,7 +623,10 @@ fn copy_file_carries_a_symlink_as_a_link() {
     std::os::unix::fs::symlink(&absolute, scratch.path("source/abs")).unwrap();
     std::os::unix::fs::symlink("elsewhere", scratch.path("destination/other")).unwrap();
     settle(&scratch.path("source"));
-    for (leaf, target) in [("rel", PathBuf::from("real.txt")), ("abs", absolute.clone())] {
+    for (leaf, target) in [
+        ("rel", PathBuf::from("real.txt")),
+        ("abs", absolute.clone()),
+    ] {
         let source = format!("source/{leaf}");
         let dest = format!("destination/{leaf}");
         for pass in 0..2 {
@@ -656,7 +676,10 @@ fn pull_file_types_its_leaf_over_the_wire() {
         std::fs::read_link(scratch.path("destination/link")).unwrap(),
         PathBuf::from("a.txt")
     );
-    for (leaf, code) in [("none", "SOURCE_VANISHED"), ("dir", "SOURCE_ROOT_KIND_MISMATCH")] {
+    for (leaf, code) in [
+        ("none", "SOURCE_VANISHED"),
+        ("dir", "SOURCE_ROOT_KIND_MISMATCH"),
+    ] {
         let ran = scratch.pull(
             true,
             &format!("source/{leaf}"),
@@ -685,7 +708,12 @@ fn a_file_landing_is_reused_by_a_later_tree_pass_of_its_parent() {
     settle(&scratch.path("destination"));
     let ran = scratch.copy(false, "source", "destination", ("ss", "ds"));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
-    assert_eq!(counter(&ran.stdout, "source_bytes_read"), 0, "{}", ran.stdout);
+    assert_eq!(
+        counter(&ran.stdout, "source_bytes_read"),
+        0,
+        "{}",
+        ran.stdout
+    );
     assert_eq!(counter(&ran.stdout, "refusals"), 0, "{}", ran.stdout);
     let changed = noise(22, 60_000);
     std::fs::write(scratch.path("source/a.txt"), &changed).unwrap();
@@ -694,7 +722,10 @@ fn a_file_landing_is_reused_by_a_later_tree_pass_of_its_parent() {
     let ran = scratch.copy(false, "source", "destination", ("ss", "ds"));
     assert!(ran.ok, "{}{}", ran.stdout, ran.stderr);
     assert_eq!(counter(&ran.stdout, "refusals"), 0, "{}", ran.stdout);
-    assert_eq!(std::fs::read(scratch.path("destination/a.txt")).unwrap(), changed);
+    assert_eq!(
+        std::fs::read(scratch.path("destination/a.txt")).unwrap(),
+        changed
+    );
 }
 
 // #283 review 6: a root this side made is removed again, still empty, when
@@ -706,8 +737,11 @@ fn a_destination_setup_refusal_leaves_no_empty_root() {
     let scratch = Scratch::new("setupfail");
     std::fs::write(scratch.path("source/a.txt"), b"a\n").unwrap();
     std::fs::create_dir(scratch.path("ds-wide")).unwrap();
-    std::fs::set_permissions(scratch.path("ds-wide"), std::fs::Permissions::from_mode(0o755))
-        .unwrap();
+    std::fs::set_permissions(
+        scratch.path("ds-wide"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
     settle(&scratch.path("source"));
     let ran = scratch.copy(false, "source", "destination/new", ("ss", "ds-wide"));
     assert!(!ran.ok, "{}{}", ran.stdout, ran.stderr);

@@ -226,7 +226,7 @@ const fn unreadable(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
 
 /// A walk refusal as a note: a root or entry that is gone (`ENOENT`) is
 /// `source-vanished`, anything else `unreadable`; each keeps its typed code.
-fn typed_note(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
+const fn typed_note(path: PathBuf, refusal: &BulkloadRefusal) -> Note {
     if matches!(
         refusal,
         BulkloadRefusal::SourceRootMissing | BulkloadRefusal::SourceVanished
@@ -1091,8 +1091,8 @@ mod tests {
         fs::create_dir(&locked).unwrap();
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
         let readable = fs::read_dir(&locked).is_ok();
-        let found = inventory(&[locked.clone(), empty.clone(), live.clone()], &[]);
-        let found_empty = inventory(&[empty.clone()], &[]);
+        let found = inventory(&[locked.clone(), empty.clone(), live], &[]);
+        let found_empty = inventory(std::slice::from_ref(&empty), &[]);
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o700)).unwrap();
         let found = found.unwrap();
         assert_eq!(found.items.len(), 1, "{found:?}");
@@ -1114,7 +1114,10 @@ mod tests {
         for (refusal, what) in [
             (BulkloadRefusal::SourceRootMissing, "source-vanished"),
             (BulkloadRefusal::SourceVanished, "source-vanished"),
-            (BulkloadRefusal::SourceRootUnreadable(Some(13)), "unreadable"),
+            (
+                BulkloadRefusal::SourceRootUnreadable(Some(13)),
+                "unreadable",
+            ),
             (BulkloadRefusal::Io(Some(13)), "unreadable"),
         ] {
             let note = typed_note(PathBuf::from("/x"), &refusal);
