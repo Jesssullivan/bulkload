@@ -1593,6 +1593,22 @@ impl StagedFile {
         self.sqlite = true;
     }
 
+    /// Publish this staged file under another leaf of the same directory
+    /// (C14, RUL-14: a corrupt snapshot lands beside its path as
+    /// `<db>.corrupt-<YYYYMMDD>`, never at it). The temporary stays where
+    /// it is; only the name the rename gives it changes.
+    ///
+    /// # Errors
+    /// Refuses a leaf with an interior NUL, or one that is not a single
+    /// path component, `PATH_NOT_PORTABLE`.
+    pub(crate) fn rename_leaf(&mut self, leaf: &[u8]) -> Result<()> {
+        if leaf.is_empty() || leaf.contains(&b'/') {
+            return Err(BulkloadRefusal::PathNotPortable);
+        }
+        self.leaf = CString::new(leaf).map_err(|_| BulkloadRefusal::PathNotPortable)?;
+        Ok(())
+    }
+
     /// Whether a sidecar now sits beside the leaf of a staged snapshot.
     /// Fails closed: an `lstat` that fails other than `ENOENT` counts.
     fn sqlite_sidecar_appeared(&self) -> bool {

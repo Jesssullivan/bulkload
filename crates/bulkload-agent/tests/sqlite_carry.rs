@@ -508,3 +508,59 @@ fn unprivileged_leg(test: &str) {
         "{test}: refusal proved as root; full test passed as uid {UNPRIVILEGED}"
     ));
 }
+
+/// Plan of record 2026-10-19, C3: `--sqlite-slot-bytes=BYTES` and
+/// `--sqlite-carry-wall=SECONDS` are global flags of the binary, parsed as
+/// documented (a whole number with an optional binary suffix; whole
+/// seconds, at least 1) and refused `FIELD_DOMAIN_VIOLATION` otherwise,
+/// before any verb runs; the transfer line reports the C14 fields.
+#[test]
+fn the_sqlite_slot_budget_and_carry_wall_flags_are_parsed_before_the_verb() {
+    let base = tempfile::Builder::new()
+        .prefix("bulkload-sqlite-flags-")
+        .tempdir()
+        .unwrap();
+    for dir in ["source", "destination"] {
+        fs::create_dir(base.path().join(dir)).unwrap();
+    }
+    fs::write(base.path().join("source").join("plain.txt"), b"plain\n").unwrap();
+    let run = |flags: &[&str]| {
+        let mut command = Command::new(agent());
+        command.arg("--sqlite=refuse");
+        for flag in flags {
+            command.arg(flag);
+        }
+        command
+            .arg("copy")
+            .arg(base.path().join("source"))
+            .arg(base.path().join("destination"))
+            .arg(base.path().join("source-state"))
+            .arg(base.path().join("destination-state"))
+            .output()
+            .unwrap()
+    };
+    let output = run(&["--sqlite-slot-bytes=64M", "--sqlite-carry-wall=20"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let transfer = fields(&stdout, "completed=");
+    assert_eq!(transfer["completed"], "1");
+    assert_eq!(transfer["refusals"], "0");
+    assert_eq!(transfer["sqlite_carried_corrupt"], "0");
+    assert_eq!(transfer["sqlite_sidecars_follow_refused"], "0");
+    for bad in [
+        "--sqlite-slot-bytes=abc",
+        "--sqlite-slot-bytes=0",
+        "--sqlite-slot-bytes=4GB",
+        "--sqlite-carry-wall=0",
+        "--sqlite-carry-wall=30s",
+    ] {
+        let refused = run(&[bad]);
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert_eq!(refused.status.code(), Some(2), "{bad}: {stderr}");
+        assert!(stderr.contains("FIELD_DOMAIN_VIOLATION"), "{bad}: {stderr}");
+    }
+}

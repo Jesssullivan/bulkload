@@ -18,14 +18,21 @@
 //!   or `FRAME_CODEC`;
 //! - one **entry** row per refused path, typed like an estate refusal
 //!   (pending review until a disposition disposes it; a bare `IO` or
-//!   `FRAME_CODEC` never counts). A `SQLite` integrity failure
-//!   (`SQLITE_INTEGRITY_CHECK_FAILED`, or `SQLITE_BACKUP_FAILED` whose
-//!   primary code is 11 or 26) carries its ruled default disposition,
-//!   `abandon` (OI-1003-Q148, [`crate::transfer::default_disposition`]): it
-//!   closes the row unless an operator review says otherwise;
+//!   `FRAME_CODEC` never counts). Until the 2026-10-19 plan of record (C4)
+//!   a `SQLite` integrity failure carried the ruled default `abandon`
+//!   (OI-1003-Q148); C14 (RUL-14, 2026-10-16) rules the corrupt copies
+//!   carried as files and marked corrupt instead, so no refusal has a
+//!   default disposition now ([`crate::transfer::default_disposition`]
+//!   answers `None`);
 //! - one **covered** row per live `-wal`, `-shm` or `-journal` the source
 //!   reported beside a database carried as a snapshot: never carried, and
-//!   accounted for by its database's snapshot (#218).
+//!   accounted for by its database's snapshot (#218);
+//! - one **carried-corrupt** row per database whose snapshot was corrupt,
+//!   naming the file it was carried beside its path as
+//!   (`<db>.corrupt-<YYYYMMDD>`): accounted as carried, marked corrupt
+//!   (C14, RUL-14);
+//! - one **follows-refused** row per sidecar of a refused database: its
+//!   outcome is its base's one refusal (plan of record 2026-10-19, C3).
 //!
 //! [`record_session`] makes the verb's S2 overlap decision before its first
 //! write (review finding 1: a refused overlap writes nothing, not even a
@@ -98,6 +105,9 @@ pub enum Session {
 }
 
 /// One path's outcome a session row does not cover.
+///
+/// New variants go last: a record is postcard, decoded strictly, and an
+/// older record's variant indexes must keep their meaning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryOutcome {
     /// The path was refused with this refusal and, for
@@ -109,6 +119,15 @@ pub enum EntryOutcome {
     /// A live `-wal`, `-shm` or `-journal` beside a database carried as a
     /// snapshot: covered by it, never carried (#218).
     SidecarCovered,
+    /// A database whose snapshot was corrupt (its `integrity_check` not
+    /// `ok`, or a header `SQLite` cannot read): carried as a file beside its
+    /// path, at `beside`, marked corrupt and never installed as a database
+    /// (C14, RUL-14; plan of record 2026-10-19, C4). Accounted as carried.
+    CarriedCorrupt { beside: Vec<u8> },
+    /// A live `-wal`, `-shm` or `-journal` beside a database that was
+    /// refused: its outcome is its base's one refusal (plan of record
+    /// 2026-10-19, C3), so closure counts that refusal once. Never carried.
+    SidecarFollowsRefusedBase { database: Vec<u8> },
 }
 
 /// One path row of a session.
@@ -195,6 +214,22 @@ impl TransferRecord {
                         outcome: EntryOutcome::SidecarCovered,
                     });
                 }
+                for (path, beside) in &stats.sqlite_carried_corrupt {
+                    record.entries.push(Entry {
+                        rel_path: path.clone(),
+                        outcome: EntryOutcome::CarriedCorrupt {
+                            beside: beside.clone(),
+                        },
+                    });
+                }
+                for (path, database) in &stats.sqlite_sidecars_follow_refused {
+                    record.entries.push(Entry {
+                        rel_path: path.clone(),
+                        outcome: EntryOutcome::SidecarFollowsRefusedBase {
+                            database: database.clone(),
+                        },
+                    });
+                }
                 record.entries.sort_by(|a, b| {
                     (&a.rel_path, entry_key(&a.outcome)).cmp(&(&b.rel_path, entry_key(&b.outcome)))
                 });
@@ -242,11 +277,14 @@ impl TransferRecord {
     }
 }
 
-// The code (or `covered`) a row's identity and order are keyed on.
+// The code (or `covered`, `carried-corrupt`, `follows-refused`) a row's
+// identity and order are keyed on.
 fn entry_key(outcome: &EntryOutcome) -> String {
     match outcome {
         EntryOutcome::Refused { refusal, .. } => refusal.code().to_owned(),
         EntryOutcome::SidecarCovered => "covered".to_owned(),
+        EntryOutcome::CarriedCorrupt { .. } => "carried-corrupt".to_owned(),
+        EntryOutcome::SidecarFollowsRefusedBase { .. } => "follows-refused".to_owned(),
     }
 }
 

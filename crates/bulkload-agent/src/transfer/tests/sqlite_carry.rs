@@ -110,6 +110,10 @@ impl Drop for Sqlite {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|(root, _)| *root != self.root);
+        CHUNKED_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(root, ..)| *root != self.root);
         RETAIN_OVERRIDE
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -717,8 +721,8 @@ fn p80_a_closed_wal_store_is_carried_and_reused_on_its_second_run() {
 /// P80 pinned: a rollback-mode store with a hot journal cannot be read by
 /// a read-only connection (it would have to roll the journal back). It is
 /// refused `SQLITE_BACKUP_FAILED`, not remembered, nothing is published, and
-/// its journal, a sidecar of a base that was not carried, is refused by
-/// name.
+/// its journal, a sidecar of a base that was refused, follows that one
+/// refusal (never a second one by name).
 #[test]
 fn p80_a_hot_journal_is_refused_and_not_remembered() {
     let _serial = serial();
@@ -751,19 +755,18 @@ fn p80_a_hot_journal_is_refused_and_not_remembered() {
     writer.finish();
     for _ in 0..2 {
         let stats = sqlite.snapshot();
-        let mut refusals = stats.refusals.clone();
-        refusals.sort();
         assert_eq!(
-            refusals,
-            [
-                (b"hot.db".to_vec(), "SQLITE_BACKUP_FAILED".to_owned()),
-                (
-                    b"hot.db-journal".to_vec(),
-                    "SQLITE_STATE_CHANGED".to_owned()
-                ),
-            ]
+            stats.refusals,
+            [(b"hot.db".to_vec(), "SQLITE_BACKUP_FAILED".to_owned())]
+        );
+        // Its journal follows that one refusal (plan of record 2026-10-19,
+        // C3): one refusal in closure, not two.
+        assert_eq!(
+            stats.sqlite_sidecars_follow_refused,
+            [(b"hot.db-journal".to_vec(), b"hot.db".to_vec())]
         );
         assert!(!sqlite.destination().join("hot.db").exists());
+        assert!(!sqlite.destination().join("hot.db-journal").exists());
         assert_eq!(
             stats.default_disposition(b"hot.db", "SQLITE_BACKUP_FAILED"),
             None,
@@ -1075,7 +1078,7 @@ fn p81_refuse_mode_is_v5() {
 // ---------------------------------------------------------------------------
 
 /// How P82 damages a store.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Damage {
     /// An interior table page overwritten with garbage.
     InteriorPage,
@@ -1087,13 +1090,19 @@ enum Damage {
     Truncated,
 }
 
-/// P82: every corruption kind ends in the closed set
-/// (`SQLITE_INTEGRITY_CHECK_FAILED`, `SQLITE_BACKUP_FAILED`), never `IO`
-/// or `FRAME_CODEC`; nothing is published and no slot is left; an
-/// unchanged rerun refuses from the record with 0 source bytes, and so does
-/// the run after.
+/// P82, as C14 (RUL-14) and the 2026-10-19 plan of record (C4) rule it:
+/// every corruption kind is carried as a file beside its path,
+/// `<db>.corrupt-<YYYYMMDD>`, marked corrupt (`sqlite_carried_corrupt`),
+/// never refused and never installed at the database's path; no slot is
+/// left. A store whose pages the backup could read (an interior page, an
+/// index page, a truncated file) lands as the backup's page copy, which
+/// fails `integrity_check` as the source does; one whose header the backup
+/// could not read (`SQLITE_NOTADB`) lands as its raw bytes, exactly as
+/// they are. An unchanged rerun finds the carry held and reads 0 source
+/// bytes, and so does the run after; nothing is remembered at the source.
 #[test]
-fn p82_a_corrupt_store_is_refused_in_the_closed_set_and_remembered() {
+#[allow(clippy::too_many_lines)] // Four kinds of damage, three rounds each.
+fn p82_a_corrupt_store_is_carried_beside_its_path_and_marked_corrupt() {
     let _serial = serial();
     for damage in [
         Damage::InteriorPage,
@@ -1142,36 +1151,82 @@ fn p82_a_corrupt_store_is_refused_in_the_closed_set_and_remembered() {
             Damage::Truncated => bytes.truncate(1024 * 6),
         }
         std::fs::write(&database, &bytes).unwrap();
-        let mut codes = Vec::new();
+        let row_mtime = std::fs::metadata(&database).unwrap();
+        let beside = format!(
+            "rescue.db.corrupt-{}",
+            yyyymmdd(
+                i128::from(row_mtime.mtime()) * 1_000_000_000 + i128::from(row_mtime.mtime_nsec())
+            )
+        );
         for round in 0..3 {
+            let before = Counters::snapshot();
             let stats = sqlite.snapshot();
-            assert_eq!(stats.refusals.len(), 1, "{damage:?}: {:?}", stats.refusals);
-            let (path, code) = &stats.refusals[0];
-            assert_eq!(path, b"rescue.db");
+            let delta = Counters::snapshot().since(before);
             assert!(
-                code == "SQLITE_INTEGRITY_CHECK_FAILED" || code == "SQLITE_BACKUP_FAILED",
-                "{damage:?}: {code}"
+                stats.refusals.is_empty(),
+                "{damage:?} round {round}: {:?}",
+                stats.refusals
             );
-            // OI-1003-Q148: corruption is abandoned by default, whichever
-            // step met it, from the record as well (round > 0).
             assert_eq!(
-                stats.default_disposition(path, code),
-                Some("abandon"),
-                "{damage:?} round {round}: {code} {:?}",
-                stats.refusal_sqlite_codes
+                stats.sqlite_carried_corrupt,
+                [(b"rescue.db".to_vec(), beside.clone().into_bytes())],
+                "{damage:?} round {round}"
+            );
+            assert!(
+                stats.sqlite_snapshots.is_empty(),
+                "{damage:?}: a corrupt carry is no snapshot"
             );
             assert!(
                 !sqlite.destination().join("rescue.db").exists(),
-                "{damage:?}"
+                "{damage:?}: never installed at the database's path"
             );
-            assert_eq!(sqlite.slots(), 0, "{damage:?}");
-            if round > 0 {
-                assert_eq!(stats.source_bytes_read, 0, "{damage:?}: from the record");
+            let carried = sqlite.destination().join(&beside);
+            let landed = std::fs::read(&carried).unwrap();
+            assert!(landed.starts_with(b"SQLite format 3\0"), "{damage:?}");
+            if damage == Damage::Header {
+                // The backup met SQLITE_NOTADB: the raw bytes, as they are.
+                assert_eq!(landed, bytes, "{damage:?}: carried raw, exactly");
+            } else {
+                // The backup's page copy, in journal mode DELETE, still
+                // failing the check the source failed (a truncated copy
+                // fails it with SQLITE_CORRUPT rather than a row).
+                let uri = format!("file:{}?immutable=1", carried.display());
+                let check = Connection::open_with_flags(
+                    uri,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+                )
+                .unwrap()
+                .query_row("PRAGMA integrity_check", [], |row| {
+                    row.get::<_, String>(0)
+                });
+                assert!(
+                    !matches!(check.as_deref(), Ok("ok")),
+                    "{damage:?}: marked corrupt for a reason: {check:?}"
+                );
             }
-            codes.push(code.clone());
+            no_sidecars(&carried);
+            assert_eq!(sqlite.slots(), 0, "{damage:?}");
+            if round == 0 {
+                assert_eq!(
+                    delta.get(Counter::SourceSqliteCorruptCarried),
+                    1,
+                    "{damage:?}"
+                );
+                assert_eq!(delta.get(Counter::DestSqliteCorruptBeside), 1, "{damage:?}");
+                assert!(stats.bytes_received > 0, "{damage:?}: carried on the wire");
+            } else {
+                // Held beside the path under the snapshot key: skipped,
+                // nothing read on the source, nothing on the wire.
+                assert_eq!(stats.source_bytes_read, 0, "{damage:?}: from the record");
+                assert_eq!(stats.bytes_received, 0, "{damage:?}");
+                assert_eq!(stats.reused, 1, "{damage:?}");
+            }
         }
-        assert!(codes.windows(2).all(|pair| pair[0] == pair[1]), "{codes:?}");
-        assert_eq!(sqlite.remembered(), 1, "{damage:?}: remembered");
+        assert_eq!(
+            sqlite.remembered(),
+            0,
+            "{damage:?}: not a refusal, not remembered"
+        );
     }
 }
 
@@ -1269,11 +1324,64 @@ fn p82_another_users_database_is_refused_before_sqlite_opens_it() {
 #[allow(clippy::too_many_lines)] // One scripted peer, read top to bottom.
 fn p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination() {
     let _serial = serial();
-    let sqlite = Sqlite::new();
-    let (mut peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
-    let mut payload = b"SQLite format 3\0".to_vec();
-    payload.extend(noise(9, 4096 - 16));
-    let source = std::thread::spawn(move || {
+    // Without the magic: not a database at all, refused as before. With
+    // it: a `SQLite` file that is not sound, carried beside its path and
+    // marked corrupt (C14), never installed at it.
+    for magic in [false, true] {
+        let sqlite = Sqlite::new();
+        let (peer, ours) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut payload = if magic {
+            b"SQLite format 3\0".to_vec()
+        } else {
+            b"not a database!!".to_vec()
+        };
+        payload.extend(noise(9, 4096 - 16));
+        let source = std::thread::spawn(move || peer_sends_snapshot(peer, payload));
+        let mut input = ours.try_clone().unwrap();
+        let mut output = ours;
+        let stats = receive_with(
+            &mut input,
+            &mut output,
+            Path::new("/peer/source"),
+            Path::new("/peer/state"),
+            &sqlite.destination(),
+            &sqlite.corpus.base.join("destination-state"),
+            SqliteMode::Snapshot,
+        )
+        .unwrap();
+        drop(source.join().unwrap());
+        if magic {
+            assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+            assert_eq!(
+                stats.sqlite_carried_corrupt,
+                [(b"fake.db".to_vec(), b"fake.db.corrupt-19700101".to_vec())]
+            );
+            assert!(!sqlite.destination().join("fake.db").exists());
+            assert!(sqlite
+                .destination()
+                .join("fake.db.corrupt-19700101")
+                .exists());
+        } else {
+            assert_eq!(
+                stats.refusals,
+                [(
+                    b"fake.db".to_vec(),
+                    "SQLITE_INTEGRITY_CHECK_FAILED".to_owned()
+                )]
+            );
+            assert_eq!(std::fs::read_dir(sqlite.destination()).unwrap().count(), 0);
+        }
+    }
+}
+
+/// The source half of [`p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination`]:
+/// a peer that offers `fake.db` and sends `payload` as its snapshot. The
+/// destination's `Held` is read, true or false, and the stream is ended.
+fn peer_sends_snapshot(
+    mut peer: std::os::unix::net::UnixStream,
+    payload: Vec<u8>,
+) -> std::os::unix::net::UnixStream {
+    {
         let Frame::Control(Control::Open { sqlite, .. }) = read_frame(&mut peer).unwrap() else {
             panic!("no Open");
         };
@@ -1353,10 +1461,7 @@ fn p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination() {
         .unwrap();
         loop {
             match read_frame(&mut peer).unwrap() {
-                Frame::Control(Control::Held { held, .. }) => {
-                    assert!(!held);
-                    break;
-                }
+                Frame::Control(Control::Held { .. }) => break,
                 Frame::Control(Control::Credit { .. }) => {}
                 other => panic!("{other:?}"),
             }
@@ -1369,29 +1474,8 @@ fn p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination() {
             },
         )
         .unwrap();
-        peer
-    });
-    let mut input = ours.try_clone().unwrap();
-    let mut output = ours;
-    let stats = receive_with(
-        &mut input,
-        &mut output,
-        Path::new("/peer/source"),
-        Path::new("/peer/state"),
-        &sqlite.destination(),
-        &sqlite.corpus.base.join("destination-state"),
-        SqliteMode::Snapshot,
-    )
-    .unwrap();
-    drop(source.join().unwrap());
-    assert_eq!(
-        stats.refusals,
-        [(
-            b"fake.db".to_vec(),
-            "SQLITE_INTEGRITY_CHECK_FAILED".to_owned()
-        )]
-    );
-    assert_eq!(std::fs::read_dir(sqlite.destination()).unwrap().count(), 0);
+    }
+    peer
 }
 
 /// P82: a snapshot frame in a `refuse`-mode session ends it: a peer that
@@ -1553,12 +1637,19 @@ fn p83_sidecars_follow_their_base_and_are_never_carried() {
                 );
                 let mut expected = Vec::new();
                 if blocked || destined == Destined::Foreign {
+                    // One refusal, the base's; its sidecar follows it (plan
+                    // of record 2026-10-19, C3), never a second refusal.
                     expected.push((b"store.db".to_vec(), "DESTINATION_OCCUPIED".to_owned()));
-                    if let Some(path) = &sidecar_path {
-                        expected.push((path.clone(), "SQLITE_STATE_CHANGED".to_owned()));
-                    }
-                    expected.sort();
                     assert_eq!(refusals, expected, "{case}");
+                    assert_eq!(
+                        stats.sqlite_sidecars_follow_refused,
+                        sidecar_path
+                            .iter()
+                            .map(|path| (path.clone(), b"store.db".to_vec()))
+                            .collect::<Vec<_>>(),
+                        "{case}"
+                    );
+                    assert!(stats.sqlite_sidecars_covered.is_empty(), "{case}");
                     assert_eq!(
                         scan(&sqlite.destination()),
                         destination_before,
@@ -1631,16 +1722,20 @@ fn p83_a_sidecar_of_a_base_that_is_not_a_database_is_refused() {
     std::fs::write(sqlite.source().join("quiet.db-wal"), b"").unwrap();
     std::fs::write(sqlite.source().join("notes"), b"my notes").unwrap();
     std::fs::write(sqlite.source().join("notes-journal"), b"my journal").unwrap();
+    // `signal.db-wal` follows its refused base's one refusal (plan of
+    // record 2026-10-19, C3); the sidecars of bases that were carried raw
+    // stay visible refusals by name.
     let expected = [
         (b"notes-journal".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
         (b"quiet.db-wal".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
         (b"signal.db".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
-        (b"signal.db-wal".to_vec(), "SQLITE_STATE_CHANGED".to_owned()),
     ];
+    let follows = [(b"signal.db-wal".to_vec(), b"signal.db".to_vec())];
     let stats = sqlite.snapshot();
     let mut refusals = stats.refusals.clone();
     refusals.sort();
     assert_eq!(refusals, expected);
+    assert_eq!(stats.sqlite_sidecars_follow_refused, follows);
     assert!(stats.sqlite_sidecars_covered.is_empty());
     assert!(
         !sqlite.destination().join("signal.db").exists(),
@@ -1663,6 +1758,7 @@ fn p83_a_sidecar_of_a_base_that_is_not_a_database_is_refused() {
     let mut refusals = again.refusals.clone();
     refusals.sort();
     assert_eq!(refusals, expected);
+    assert_eq!(again.sqlite_sidecars_follow_refused, follows);
     assert_eq!(again.reused, 2);
     assert_eq!(again.source_bytes_read, 0);
     assert_eq!(
@@ -1866,23 +1962,86 @@ fn p82_an_index_out_of_step_with_its_table_is_refused_at_the_source_and_remember
             .unwrap();
         assert_ne!(full, "ok", "and fails integrity_check");
     }
+    // C14: carried beside the path, marked corrupt; never at the path.
     for round in 0..3 {
         let stats = sqlite.snapshot();
-        assert_eq!(
-            stats.refusals,
-            [(
-                b"index.db".to_vec(),
-                "SQLITE_INTEGRITY_CHECK_FAILED".to_owned()
-            )],
-            "round {round}"
+        assert!(
+            stats.refusals.is_empty(),
+            "round {round}: {:?}",
+            stats.refusals
         );
+        assert_eq!(stats.sqlite_carried_corrupt.len(), 1, "round {round}");
+        let (database, beside) = &stats.sqlite_carried_corrupt[0];
+        assert_eq!(database, b"index.db");
+        assert!(beside.starts_with(b"index.db.corrupt-"), "{beside:?}");
         assert!(!sqlite.destination().join("index.db").exists());
-        assert_eq!(stats.bytes_received, 0, "round {round}: nothing sent");
+        assert!(sqlite
+            .destination()
+            .join(std::ffi::OsStr::from_bytes(beside))
+            .exists());
         if round > 0 {
             assert_eq!(stats.source_bytes_read, 0, "round {round}: from the record");
+            assert_eq!(stats.bytes_received, 0, "round {round}: nothing sent");
         }
     }
-    assert_eq!(sqlite.remembered(), 1);
+    assert_eq!(sqlite.remembered(), 0);
+}
+
+/// Since C14 a remembered integrity refusal (a record a run before this
+/// change left) no longer stops the carry: the seat is snapshotted and
+/// carried beside its path. The two backup-corruption records are honoured
+/// only beside a `-wal` with frames, where the store is still refused.
+#[test]
+fn a_legacy_integrity_record_does_not_stop_a_corrupt_carry() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let database = sqlite.source().join("legacy.db");
+    build(&database, Journal::Delete, 1024, 2);
+    {
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE fill(k INTEGER PRIMARY KEY, w TEXT);
+                 WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+                 INSERT INTO fill SELECT i, hex(randomblob(40)) FROM n;",
+            )
+            .unwrap();
+    }
+    let mut bytes = std::fs::read(&database).unwrap();
+    for byte in &mut bytes[4 * 1024 + 8..5 * 1024] {
+        *byte = 0xA5;
+    }
+    std::fs::write(&database, &bytes).unwrap();
+    // The record an older build would have left, under the snapshot key.
+    let root_fd = crate::io::sys::open_root(&sqlite.root).unwrap();
+    let meta = crate::io::sys::fstat(&root_fd).unwrap();
+    let store = Store::open(&sqlite.corpus.base.join("source-state")).unwrap();
+    let authority = postcard::to_stdvec(&(
+        store.authority().unwrap(),
+        sqlite.root.as_os_str().as_bytes(),
+        meta.node.dev,
+        meta.node.ino,
+    ))
+    .unwrap();
+    let stat = crate::io::sys::fstat(&std::fs::File::open(&database).unwrap()).unwrap();
+    let row = crate::walk::row_from_stat(b"legacy.db".to_vec(), &stat);
+    let key = sqlite_key(&authority, &row, None).unwrap();
+    LedgerSink::with_sync(
+        store.into_publisher(PublisherSide::Source).unwrap(),
+        LedgerSync::Full,
+    )
+    .unwrap()
+    .publish(&[LedgerItem {
+        entry: 0,
+        key,
+        record: LedgerRecord::Refused(RefusedSeat::SqliteSnapshotIntegrity),
+    }])
+    .unwrap();
+    assert_eq!(sqlite.remembered(), 1, "the legacy record is there");
+    let stats = sqlite.snapshot();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(stats.sqlite_carried_corrupt.len(), 1);
+    assert!(stats.source_bytes_read > 0, "the record was ignored: read");
 }
 
 /// #218 review: a store larger than what is left of the in-memory retention
@@ -2487,21 +2646,16 @@ fn a_sidecar_before_a_fresh_rename_refuses_and_publishes_nothing() {
 /// codes masked as R10 masks them). No other refusal has a default, a
 /// backup that failed for another reason (busy, I/O, no code) included.
 #[test]
-fn q148_an_integrity_failure_defaults_to_abandon() {
+fn c14_no_refusal_has_a_default_disposition() {
+    // Until the 2026-10-19 plan of record (C4) the first five defaulted to
+    // `abandon` (OI-1003-Q148); C14 (RUL-14) carries corrupt stores as
+    // files instead, so what is still refused waits for the operator.
     for refusal in [
         BulkloadRefusal::SqliteIntegrityCheckFailed,
         BulkloadRefusal::SqliteBackupFailed(Some(11)),
         BulkloadRefusal::SqliteBackupFailed(Some(26)),
         BulkloadRefusal::SqliteBackupFailed(Some(267)),
         BulkloadRefusal::SqliteBackupFailed(Some(779)),
-    ] {
-        assert_eq!(
-            default_disposition(refusal.code(), refusal.sqlite_code()),
-            Some("abandon"),
-            "{refusal}"
-        );
-    }
-    for refusal in [
         BulkloadRefusal::DestinationOccupied,
         BulkloadRefusal::SqliteStateChanged,
         BulkloadRefusal::BudgetExceeded,
@@ -2516,19 +2670,18 @@ fn q148_an_integrity_failure_defaults_to_abandon() {
             "{refusal}"
         );
     }
-    // A `SQLite` code is read only beside `SQLITE_BACKUP_FAILED`.
     assert_eq!(default_disposition("DESTINATION_OCCUPIED", Some(11)), None);
 }
 
 /// OI-1003-Q148 across the wire: the backup's `SQLite` code crosses in the
-/// refusal frame, so the receiver gives backup-detected corruption the
-/// `abandon` default; a peer that attaches a `SQLite` code to any other
-/// refusal violates the protocol.
+/// refusal frame and is kept with the refusal (its closure row prints it);
+/// a peer that attaches a `SQLite` code to any other refusal violates the
+/// protocol. No code carries a default disposition since C14.
 #[test]
 fn q148_the_backup_code_crosses_the_wire_and_only_with_its_refusal() {
     let _serial = serial();
     for (code, sqlite_code, accepted, disposition) in [
-        ("SQLITE_BACKUP_FAILED", Some(11), true, Some("abandon")),
+        ("SQLITE_BACKUP_FAILED", Some(11), true, None),
         ("SQLITE_BACKUP_FAILED", Some(5), true, None),
         ("SQLITE_INTEGRITY_CHECK_FAILED", Some(11), false, None),
     ] {
@@ -2713,5 +2866,312 @@ fn refs_named_like_sidecars_are_carried_in_git_ref_storage() {
                 stats.refusals
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Plan of record 2026-10-19, C3: the slot budget and carry wall as flags, an
+// oversize slot for a store over the budget, fixed chunks for a snapshot over
+// the chunk threshold (A-115, "Chunked snapshot").
+// ---------------------------------------------------------------------------
+
+/// `--sqlite-slot-bytes` and `--sqlite-carry-wall` parse as the binary takes
+/// them, and `pull` forwards exactly the ones set away from their defaults.
+#[test]
+fn the_slot_budget_and_carry_wall_flags_parse_and_forward() {
+    let _serial = serial();
+    for (value, bytes) in [
+        ("512", 512),
+        ("4096", 4096),
+        ("8K", 8 << 10),
+        ("3m", 3 << 20),
+        ("4G", 4 << 30),
+        ("1T", 1 << 40),
+    ] {
+        assert_eq!(parse_sqlite_slot_bytes(value), Ok(bytes), "{value}");
+    }
+    for value in [
+        "",
+        "0",
+        "511",
+        "-1",
+        "4GB",
+        "G",
+        "1.5G",
+        "abc",
+        "99999999999T",
+    ] {
+        assert_eq!(
+            parse_sqlite_slot_bytes(value),
+            Err(BulkloadRefusal::FieldDomainViolation),
+            "{value}"
+        );
+    }
+    for (value, secs) in [("1", 1), ("30", 30), ("900", 900)] {
+        assert_eq!(
+            crate::provider_sqlite::parse_carry_wall(value),
+            Ok(Duration::from_secs(secs)),
+            "{value}"
+        );
+    }
+    for value in ["", "0", "-5", "30s", "1.5"] {
+        assert_eq!(
+            crate::provider_sqlite::parse_carry_wall(value),
+            Err(BulkloadRefusal::FieldDomainViolation),
+            "{value}"
+        );
+    }
+    // Defaults: nothing to forward, and the budget and wall are the
+    // constants.
+    assert_eq!(sqlite_slot_bytes(), SLOT_BYTES);
+    assert_eq!(
+        crate::provider_sqlite::carry_wall_base(),
+        crate::provider_sqlite::CARRY_WALL
+    );
+    assert!(serve_flags().is_empty());
+    set_sqlite_slot_bytes(8 << 30);
+    crate::provider_sqlite::set_carry_wall(Duration::from_secs(45));
+    assert_eq!(sqlite_slot_bytes(), 8 << 30);
+    assert_eq!(
+        serve_flags(),
+        ["--sqlite-slot-bytes=8589934592", "--sqlite-carry-wall=45"]
+    );
+    // A store within the budget keeps the base wall; one over it gets a
+    // second per 32 MiB more, never less than the base, at most 30 min.
+    assert_eq!(
+        crate::provider_sqlite::carry_wall(8 << 30, 8 << 30),
+        Duration::from_secs(45)
+    );
+    assert_eq!(
+        crate::provider_sqlite::carry_wall((8 << 30) + 1, 8 << 30),
+        Duration::from_secs(45 + 256)
+    );
+    assert_eq!(
+        crate::provider_sqlite::carry_wall(1 << 50, 8 << 30),
+        crate::provider_sqlite::CARRY_WALL_MAX
+    );
+    set_sqlite_slot_bytes(0);
+    crate::provider_sqlite::set_carry_wall(Duration::ZERO);
+    assert!(serve_flags().is_empty());
+    assert_eq!(sqlite_slot_bytes(), SLOT_BYTES);
+    // The real store that could not be carried: 8.8 GB under the default
+    // 4 GiB budget takes 30 s + 262 s.
+    assert_eq!(
+        crate::provider_sqlite::carry_wall(8_800_000_000, SLOT_BYTES),
+        Duration::from_secs(30 + 262)
+    );
+}
+
+/// A snapshot is cut into fixed chunks only above the chunk threshold, into
+/// the least power of two from 64 KiB that fits one manifest, whole pages
+/// each; the 8.8 GB store cuts into 128 KiB chunks.
+#[test]
+fn chunked_size_fits_one_manifest_of_whole_pages() {
+    assert_eq!(CHUNKED_ABOVE, 4 << 30);
+    assert_eq!(chunked_size(0), None);
+    assert_eq!(chunked_size(CHUNKED_ABOVE), None);
+    assert_eq!(chunked_size(CHUNKED_ABOVE + 1), Some(CHUNKED_MIN_BYTES));
+    assert_eq!(chunked_size(8_800_000_000), Some(128 << 10));
+    assert_eq!(
+        chunked_size((MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES)),
+        Some(u64::from(crate::hash::CDC_MAX_BYTES))
+    );
+    for size in [
+        CHUNKED_ABOVE + 1,
+        8_800_000_000,
+        17 << 30,
+        (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES),
+    ] {
+        let chunk = chunked_size(size).unwrap();
+        assert!(
+            chunk.is_power_of_two() && chunk % 65_536 == 0,
+            "{size}: {chunk}"
+        );
+        assert!(size.div_ceil(chunk) <= MAX_MANIFEST_CHUNKS as u64, "{size}");
+        assert!(chunk <= u64::from(crate::hash::CDC_MAX_BYTES), "{size}");
+    }
+}
+
+/// The corrupt carry's name is the database's path plus the UTC date of its
+/// last modification, a function of the row alone.
+#[test]
+fn a_corrupt_carry_is_named_by_its_path_and_mtime_date() {
+    assert_eq!(yyyymmdd(0), "19700101");
+    assert_eq!(yyyymmdd(-1), "19691231");
+    assert_eq!(yyyymmdd(951_782_400 * 1_000_000_000), "20000229");
+    assert_eq!(yyyymmdd(1_792_368_000 * 1_000_000_000), "20261019");
+    assert_eq!(
+        yyyymmdd(1_792_368_000 * 1_000_000_000 + 86_399_999_999_999),
+        "20261019"
+    );
+    let mut row = RowSchema {
+        rel_path: b"codex/state_5.sqlite".to_vec(),
+        kind: FileKind::Regular,
+        dev: 1,
+        ino: 2,
+        size: 4096,
+        mtime_ns: 1_792_368_000 * 1_000_000_000,
+        ctime_ns: 0,
+        mode: 0o100_644,
+        nlink: 1,
+        link_target: None,
+        blake3: None,
+    };
+    assert_eq!(
+        corrupt_beside_path(&row),
+        b"codex/state_5.sqlite.corrupt-20261019"
+    );
+    row.ctime_ns = 7;
+    row.size = 1;
+    assert_eq!(
+        corrupt_beside_path(&row),
+        b"codex/state_5.sqlite.corrupt-20261019",
+        "the row's other fields do not name it"
+    );
+}
+
+/// A store whose main file is larger than the whole slot budget is carried
+/// all the same (A-115): from the one oversize slot, outside the budget,
+/// while a small store beside it is carried from the budget; both verify,
+/// no slot is left, and the unchanged rerun reads nothing.
+#[test]
+fn a_store_larger_than_the_slot_budget_is_carried_from_an_oversize_slot() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    let large = sqlite.source().join("large.db");
+    let small = sqlite.source().join("small.db");
+    build_large(&large, Journal::Delete, 7, 160);
+    build(&small, Journal::Wal, 1024, 3);
+    let size = std::fs::metadata(&large).unwrap().len();
+    // A budget the large store does not fit, which the small one does.
+    SLOT_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((sqlite.root.clone(), size / 2));
+    assert!(std::fs::metadata(&small).unwrap().len() < size / 2);
+    let before = Counters::snapshot();
+    let stats = sqlite.snapshot();
+    let delta = Counters::snapshot().since(before);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    let mut snapshots = stats.sqlite_snapshots.clone();
+    snapshots.sort();
+    assert_eq!(snapshots, [b"large.db".to_vec(), b"small.db".to_vec()]);
+    assert_eq!(delta.get(Counter::SourceSqliteOversizeSlots), 1);
+    assert_eq!(delta.get(Counter::SourceSqliteSnapshots), 2);
+    assert_eq!(published(&sqlite.destination().join("large.db")).len(), 7);
+    assert_eq!(published(&sqlite.destination().join("small.db")).len(), 3);
+    no_sidecars(&sqlite.destination().join("large.db"));
+    assert_eq!(sqlite.slots(), 0);
+    let warm = sqlite.snapshot();
+    assert!(warm.refusals.is_empty(), "{:?}", warm.refusals);
+    assert_eq!(warm.reused, 2);
+    assert_eq!(warm.source_bytes_read, 0);
+}
+
+/// Two stores over the budget take the oversize slot one after the other,
+/// never together: the slot bytes alive at once never pass one of them.
+#[test]
+fn oversize_slots_are_taken_one_at_a_time() {
+    let _serial = serial();
+    let sqlite = Sqlite::new();
+    for name in ["a.db", "b.db", "c.db"] {
+        build_large(&sqlite.source().join(name), Journal::Delete, 3, 90);
+    }
+    let size = std::fs::metadata(sqlite.source().join("a.db"))
+        .unwrap()
+        .len();
+    SLOT_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .push((sqlite.root.clone(), size / 2));
+    let slots = sqlite.corpus.base.join("source-state").join(SLOT_DIR);
+    let peak = Arc::new(AtomicU64::new(0));
+    let hook: CaptureHook = {
+        let peak = Arc::clone(&peak);
+        Arc::new(move || {
+            let started = Instant::now();
+            loop {
+                let alive: u64 = std::fs::read_dir(&slots).map_or(0, |entries| {
+                    entries
+                        .filter_map(|entry| entry.ok()?.metadata().ok())
+                        .map(|meta| meta.len())
+                        .sum()
+                });
+                peak.fetch_max(alive, Ordering::Relaxed);
+                if started.elapsed() > Duration::from_millis(1200) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+    };
+    set_after_snapshot(&sqlite.root, Some(hook));
+    let before = Counters::snapshot();
+    let stats = sqlite.snapshot();
+    let delta = Counters::snapshot().since(before);
+    set_after_snapshot(&sqlite.root, None);
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(stats.sqlite_snapshots.len(), 3);
+    assert_eq!(delta.get(Counter::SourceSqliteOversizeSlots), 3);
+    let peak = peak.load(Ordering::Relaxed);
+    assert!(peak > 0, "the hook saw a slot");
+    assert!(
+        peak <= size + 4096,
+        "oversize slots alive at once: {peak} bytes, one store is {size}"
+    );
+    assert_eq!(sqlite.slots(), 0);
+}
+
+/// A snapshot over the chunk threshold is cut into fixed chunks of whole
+/// pages (A-115): it streams one chunk at a time, verifies at the
+/// destination and is published whole; a manifest run (the delta lever,
+/// after a change) reassembles it from the same fixed chunks; an unchanged
+/// rerun reads nothing.
+#[test]
+fn a_snapshot_over_the_chunk_threshold_is_carried_in_fixed_chunks_and_verifies() {
+    let _serial = serial();
+    for journal in [Journal::Wal, Journal::Delete] {
+        let sqlite = Sqlite::new();
+        let database = sqlite.source().join("store.db");
+        build_large(&database, journal, 12, 160);
+        // Every snapshot of this root is chunked, into 4 KiB chunks.
+        CHUNKED_OVERRIDE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((sqlite.root.clone(), 0, 4096));
+        let before = Counters::snapshot();
+        let stats = sqlite.snapshot();
+        let delta = Counters::snapshot().since(before);
+        assert!(
+            stats.refusals.is_empty(),
+            "{journal:?}: {:?}",
+            stats.refusals
+        );
+        assert_eq!(
+            delta.get(Counter::SourceSqliteChunkedSnapshots),
+            1,
+            "{journal:?}"
+        );
+        assert_eq!(delta.get(Counter::DestSqliteVerified), 1, "{journal:?}");
+        let output = sqlite.destination().join("store.db");
+        assert_eq!(published(&output).len(), 12, "{journal:?}");
+        no_sidecars(&output);
+        let landed = std::fs::metadata(&output).unwrap().len();
+        assert!(landed > 4096 * 8, "{journal:?}: many chunks");
+        assert_eq!(sqlite.slots(), 0, "{journal:?}");
+        // Changed: the snapshot is asked for by manifest (an output to
+        // supersede is here) and arrives whole from its fixed chunks.
+        commit_one(&database);
+        let changed = sqlite.snapshot();
+        assert!(
+            changed.refusals.is_empty(),
+            "{journal:?}: {:?}",
+            changed.refusals
+        );
+        assert_eq!(published(&output).len(), 13, "{journal:?}");
+        let warm = sqlite.snapshot();
+        assert!(warm.refusals.is_empty(), "{journal:?}: {:?}", warm.refusals);
+        assert_eq!(warm.reused, 1, "{journal:?}");
+        assert_eq!(warm.source_bytes_read, 0, "{journal:?}");
     }
 }

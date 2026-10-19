@@ -325,6 +325,21 @@ counters! {
     SourceSqliteBackupBytes => "source_sqlite_backup_bytes",
     // Backups restarted because another connection committed between steps.
     SourceSqliteBackupRestarts => "source_sqlite_backup_restarts",
+    // Carry backup steps that met another connection's lock and were tried
+    // again after a bounded backoff inside the carry wall (plan of record
+    // 2026-10-19, C3), instead of refusing on the first lock.
+    SourceSqliteBusyRetries => "source_sqlite_busy_retries",
+    // Stores whose main file and `-wal` exceed the slot budget
+    // (`--sqlite-slot-bytes`), carried from an oversize slot of their own
+    // under the free-space floor (A-115, "Chunked snapshot").
+    SourceSqliteOversizeSlots => "source_sqlite_oversize_slots",
+    // Snapshots cut into fixed chunks of whole pages, so one manifest
+    // carries them (A-115). Each is also one of `source_sqlite_snapshots`.
+    SourceSqliteChunkedSnapshots => "source_sqlite_chunked_snapshots",
+    // Stores whose snapshot failed its `integrity_check`, or whose backup
+    // met corruption and which were read raw, carried to be landed beside
+    // their path and marked corrupt (C14, RUL-14), never refused.
+    SourceSqliteCorruptCarried => "source_sqlite_corrupt_carried",
     // Nanoseconds a source connection was open, from open to close: in WAL
     // mode it holds `SHARED` on the main file that long (OI-1003-Q16's lock,
     // for the transfer and the `snapshot` verb alike).
@@ -340,6 +355,15 @@ counters! {
     // Live `-wal`, `-shm` and `-journal` files covered by their database's
     // snapshot (never carried).
     SqliteSidecarsCovered => "sqlite_sidecars_covered",
+    // Sidecars whose database was refused: their outcome is that one
+    // refusal's, so closure counts one refusal, not one per file (plan of
+    // record 2026-10-19, C3). Never carried.
+    SqliteSidecarsFollowRefused => "sqlite_sidecars_follow_refused_base",
+    // Received snapshots that carried the `SQLite` magic and failed the
+    // destination's checks, published beside their path as
+    // `<db>.corrupt-<YYYYMMDD>` and recorded `carried-corrupt` (C14,
+    // RUL-14), and the rerun skips that found such a copy held.
+    DestSqliteCorruptBeside => "dest_sqlite_corrupt_beside",
     // Snapshots the destination verified (`integrity_check`) before publish,
     // and the bytes of those files.
     DestSqliteVerified => "dest_sqlite_verified",

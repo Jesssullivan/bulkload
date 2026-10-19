@@ -26,7 +26,8 @@ USAGE:
     bulkload-agent [--durability=group|strict] [--min-free-percent=N]
                    [--priority=background|normal|auto] [--escalate-after=SECONDS]
                    [--source-ledger-sync=relaxed|full]
-                   [--sqlite=refuse|snapshot] <SUBCOMMAND>
+                   [--sqlite=refuse|snapshot] [--sqlite-slot-bytes=BYTES]
+                   [--sqlite-carry-wall=SECONDS] <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
@@ -361,10 +362,12 @@ SUBCOMMANDS:
                 FIELD_DOMAIN_VIOLATION): the session (applied when
                 it ended; unaccounted when it never ended, left no record, or
                 refused with a bare IO), one row per refused path (typed:
-                pending review; SQLITE_INTEGRITY_CHECK_FAILED and a corrupt
-                SQLITE_BACKUP_FAILED carry the ruled default abandon,
-                OI-1003-Q148, unless a review says otherwise) and one covered
-                row per live SQLite sidecar a snapshot covers
+                pending review; no code carries a default since C14 withdrew
+                OI-1003-Q148's abandon), one covered row per live SQLite
+                sidecar a snapshot covers or that follows its database's one
+                refusal (sidecar-follows-refused-base), and one carried row
+                per corrupt store carried beside its path (carried-corrupt,
+                its related path the <db>.corrupt-<YYYYMMDD> file; C14)
                 --transfer-manifest MANIFEST: join exactly the transfers
                 transfer-expect listed, bound to PLAN: a listed transfer with
                 no record, or whose session started before the manifest's
@@ -593,30 +596,53 @@ BOUNDARIES:
     or a reflog line, beside no SQLite database (M2r2).
     --sqlite=snapshot (#218; copy and pull, carried to serve in its Open):
     a database is carried as a backup-API snapshot the source takes into its
-    private state (SOURCE_STATE/sqlite-snapshots, at most 4 GiB of slots
-    at once, and never past the --min-free-percent floor of that
-    filesystem: BUDGET_EXCEEDED), never its live bytes, and verified
-    (integrity_check, at the source and again at the destination) before
-    it is published, in journal mode DELETE. A file without the SQLite
+    private state (SOURCE_STATE/sqlite-snapshots), never its live bytes,
+    and verified (integrity_check, at the source and again at the
+    destination) before it is published, in journal mode DELETE. The
+    slots alive at once stay within --sqlite-slot-bytes=BYTES (default
+    4G; a whole number with an optional K, M, G or T) and never past the
+    --min-free-percent floor of that filesystem (BUDGET_EXCEEDED). A store
+    whose main file and -wal exceed that budget is not refused for it
+    (A-115, chunked snapshot): it takes the one oversize slot, bounded by
+    the floor alone, and its snapshot is cut into fixed chunks of whole
+    pages; the slot file is the whole snapshot, since the backup API
+    writes a database no byte of which is final before its last step. One
+    backup takes at most --sqlite-carry-wall=SECONDS on the clock (default
+    30), more for a store over the budget in proportion to its size, at
+    most 30 minutes; a step that meets another connection's lock is tried
+    again with a bounded backoff inside that wall, holding no lock of its
+    own, and is refused SQLITE_STATE_CHANGED only when the wall is spent.
+    pull forwards both flags to the remote serve. A file without the SQLite
     magic beside a -wal that holds frames (an encrypted store) is refused
     SQLITE_STATE_CHANGED, never carried raw. An unchanged store is reused with nothing opened: its key is its
     row and its -wal's identity. A -wal, -shm or -journal beside a database
     (a Git ref or reflog so named aside) is never carried: it is covered when its database was carried as a
-    snapshot, and refused SQLITE_STATE_CHANGED otherwise. A changed store
+    snapshot, follows its database's one refusal when that was refused
+    (one refusal in closure, not one per file), and is refused
+    SQLITE_STATE_CHANGED otherwise. A changed store
     supersedes its own older snapshot output through the same exchange
     (OI-1003-Q146) only when no -wal, -journal or -shm sits beside the
     path here, checked at the decision and again just before the exchange;
     a path with one beside it, or holding a file this store did not land
     or that was touched since, is refused DESTINATION_OCCUPIED and left as
-    it is. A store failing integrity_check is refused
-    SQLITE_INTEGRITY_CHECK_FAILED (disposition abandon, OI-1003-Q148).
+    it is. A store whose snapshot fails integrity_check, or whose backup
+    met corruption beside no -wal with frames (its main file read raw), is
+    carried as a plain file beside its path, <db>.corrupt-<YYYYMMDD> (the
+    date the source file was last modified, UTC), never installed as a
+    database, and recorded carried-corrupt (C14, RUL-14; the former
+    abandon default of OI-1003-Q148 is withdrawn); an unchanged rerun finds
+    it held and reads nothing. Such a backup beside a -wal with frames
+    stays refused SQLITE_BACKUP_FAILED, pending review.
     The default stays --sqlite=refuse (OI-1003-Q147): a pull that must
     carry databases passes --sqlite=snapshot.
     The source half refuses SQLITE_SOURCE_AS_ROOT as root
     (the whole session, before anything is opened) and
     SQLITE_SOURCE_NOT_OWNER for a database another user owns. The
-    transfer line reports sqlite_mode=, sqlite_snapshots= and
-    sqlite_sidecars_covered=.
+    transfer line reports sqlite_mode=, sqlite_snapshots=,
+    sqlite_sidecars_covered=, sqlite_carried_corrupt= and
+    sqlite_sidecars_follow_refused=; each corrupt carry prints
+    carried-corrupt PATH beside=BESIDE, each following sidecar
+    sidecar-follows-refused PATH base=DATABASE.
     They enumerate the source each run; completed content is resumable.
     File manifests allow 131072 chunks and frames at most 8 MiB; oversized files refuse.
     Git-native divergent union is not supplied by copy/pull.
@@ -957,6 +983,24 @@ fn global_flags(
             bulkload_agent::transfer::set_sqlite_mode(bulkload_agent::transfer::parse_sqlite_mode(
                 mode,
             )?);
+            continue;
+        }
+        if let Some(bytes) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--sqlite-slot-bytes="))
+        {
+            bulkload_agent::transfer::set_sqlite_slot_bytes(
+                bulkload_agent::transfer::parse_sqlite_slot_bytes(bytes)?,
+            );
+            continue;
+        }
+        if let Some(seconds) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--sqlite-carry-wall="))
+        {
+            bulkload_agent::provider_sqlite::set_carry_wall(
+                bulkload_agent::provider_sqlite::parse_carry_wall(seconds)?,
+            );
             continue;
         }
         if let Some(mode) = arg
@@ -2500,6 +2544,11 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer:
     if bulkload_agent::durable::ledger_sync() == bulkload_agent::durable::LedgerSync::Full {
         ssh.arg("--source-ledger-sync=full");
     }
+    // Its slot budget and carry wall are this verb's (plan of record
+    // 2026-10-19, C3): the flags cross as flags, not in the wire's Open.
+    for flag in bulkload_agent::transfer::serve_flags() {
+        ssh.arg(flag);
+    }
     let mut child = ssh
         .arg("serve")
         .stdin(Stdio::piped())
@@ -2597,7 +2646,7 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
          source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
-         sqlite_sidecars_covered={}",
+         sqlite_sidecars_covered={} sqlite_carried_corrupt={} sqlite_sidecars_follow_refused={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
@@ -2607,7 +2656,9 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         stats.capped_subtrees(),
         bulkload_agent::transfer::sqlite_mode_label(stats.sqlite_mode),
         stats.sqlite_snapshots.len(),
-        stats.sqlite_sidecars_covered.len()
+        stats.sqlite_sidecars_covered.len(),
+        stats.sqlite_carried_corrupt.len(),
+        stats.sqlite_sidecars_follow_refused.len()
     );
     for (path, code) in &stats.refusals {
         // S4 (TIN-6592): an IO raised here prints its errno, as its record
@@ -2618,10 +2669,26 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         }
         if let Some(disposition) = stats.default_disposition(path, code) {
             eprintln!(
-                "default-disposition {}: {disposition} ({code}, OI-1003-Q148)",
+                "default-disposition {}: {disposition} ({code})",
                 path.escape_ascii()
             );
         }
+    }
+    // C14, RUL-14: a corrupt store carried as a file beside its path, and
+    // the sidecars whose outcome is their database's one refusal.
+    for (path, beside) in &stats.sqlite_carried_corrupt {
+        eprintln!(
+            "carried-corrupt {} beside={}",
+            path.escape_ascii(),
+            beside.escape_ascii()
+        );
+    }
+    for (path, database) in &stats.sqlite_sidecars_follow_refused {
+        eprintln!(
+            "sidecar-follows-refused {} base={}",
+            path.escape_ascii(),
+            database.escape_ascii()
+        );
     }
     if stats.temporaries_removed > 0 {
         eprintln!("temporaries-removed {}", stats.temporaries_removed);

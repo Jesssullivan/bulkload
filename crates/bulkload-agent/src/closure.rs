@@ -66,10 +66,15 @@
 //! session ran to its end, and `unaccounted` when it never ended
 //! (`transfer-interrupted`), left no record (`no-transfer-record`), or
 //! refused with a bare `IO` or `FRAME_CODEC`. Each refused path is an entry
-//! row, a typed refusal pending review like any other; a `SQLite` integrity
-//! failure carries its ruled default disposition `abandon` (OI-1003-Q148),
-//! which disposes it unless a review row says otherwise. Each live sidecar
-//! covered by its database's snapshot is `covered` (accounted). A run's
+//! row, a typed refusal pending review like any other (until the
+//! 2026-10-19 plan of record, C4, a `SQLite` integrity failure carried the
+//! ruled default `abandon`, OI-1003-Q148; C14, RUL-14, carries the corrupt
+//! copies as files instead, so no default remains). Each live sidecar
+//! covered by its database's snapshot is `covered` (accounted); a sidecar
+//! of a refused database is `covered` too, by that one refusal
+//! (`sidecar-follows-refused-base`). A database whose snapshot was corrupt
+//! and was carried beside its path is `carried` (`carried-corrupt`, its
+//! `related` the file it was landed as; C14). A run's
 //! expected transfers are bound to its PLAN by a transfer manifest
 //! ([`Report::join_manifest`], `--transfer-manifest`): a listed transfer
 //! with no record, or one older than the manifest, is unaccounted. With it,
@@ -91,7 +96,11 @@
 //! dispositions `applied-beside` and `carried`, their totals
 //! `applied_beside` (after `applied`) and `carried` (after `covered`), and
 //! on a carried row the `carried` block (via, destination, beside, transfer
-//! state, gits). Nothing else changes from v4.
+//! state, gits). Nothing else changes from v4. Within v5 (plan of record
+//! 2026-10-19, C3 and C4) a transfer entry row may carry
+//! `transfer_outcome` `carried-corrupt` (disposition `carried`) or
+//! `sidecar-follows-refused-base` (disposition `covered`), and then a
+//! `related` path; no existing field changes.
 //!
 //! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
@@ -376,6 +385,11 @@ pub struct TransferDetail {
     pub refusal: Option<crate::outcome::Refusal>,
     /// `SQLite`'s result code a `SQLITE_BACKUP_FAILED` carries.
     pub sqlite_code: Option<i32>,
+    /// The path this row's content is held at, when it is not `path`: a
+    /// corrupt snapshot's `<db>.corrupt-<YYYYMMDD>` (`carried-corrupt`,
+    /// C14), or the database a sidecar's outcome follows
+    /// (`sidecar-follows-refused-base`).
+    pub related: Option<Vec<u8>>,
 }
 
 /// The ruling that gives a transfer refusal its default disposition.
@@ -1118,6 +1132,13 @@ fn write_transfer(out: &mut String, row: &Row, detail: &TransferDetail) {
     if let Some(started) = detail.started {
         let _ = write!(out, ",\"started\":{started}");
     }
+    if let Some(related) = &detail.related {
+        let _ = write!(
+            out,
+            ",\"related\":{}",
+            json_string(&related.escape_ascii().to_string())
+        );
+    }
     if let Some(refusal) = &detail.refusal {
         let _ = write!(
             out,
@@ -1200,6 +1221,7 @@ fn unrecorded(state: &std::path::Path, item: String, source: &str, why: &'static
             outcome: None,
             refusal: None,
             sqlite_code: None,
+            related: None,
         },
     )
 }
@@ -1249,6 +1271,7 @@ fn record_rows(
         outcome,
         refusal,
         sqlite_code,
+        related: None,
     };
     let record = match read {
         None => {
@@ -1310,7 +1333,7 @@ fn record_rows(
         detail(None, Some(outcome), refusal, None, Some(record.started)),
     )];
     for entry in &record.entries {
-        let (outcome, refusal, sqlite_code, disposition, default) = match &entry.outcome {
+        let (outcome, refusal, sqlite_code, disposition, default, related) = match &entry.outcome {
             EntryOutcome::Refused {
                 refusal,
                 sqlite_code,
@@ -1321,23 +1344,50 @@ fn record_rows(
                 refusal_disposition(refusal),
                 crate::transfer::default_disposition(refusal.code(), *sqlite_code)
                     .and_then(|name| crate::disposition::Decision::parse(name).ok()),
+                None,
             ),
-            EntryOutcome::SidecarCovered => {
-                ("sidecar-covered", None, None, Disposition::Covered, None)
-            }
+            EntryOutcome::SidecarCovered => (
+                "sidecar-covered",
+                None,
+                None,
+                Disposition::Covered,
+                None,
+                None,
+            ),
+            // C14, RUL-14: a corrupt store carried as a file beside its
+            // path is accounted as carried, and marked by its outcome.
+            EntryOutcome::CarriedCorrupt { beside } => (
+                "carried-corrupt",
+                None,
+                None,
+                Disposition::Carried,
+                None,
+                Some(beside.clone()),
+            ),
+            // Its base's one refusal is the row that is dispositioned.
+            EntryOutcome::SidecarFollowsRefusedBase { database } => (
+                "sidecar-follows-refused-base",
+                None,
+                None,
+                Disposition::Covered,
+                None,
+                Some(database.clone()),
+            ),
         };
+        let mut entry_detail = detail(
+            Some(entry.rel_path.clone()),
+            Some(outcome),
+            refusal,
+            sqlite_code,
+            None,
+        );
+        entry_detail.related = related;
         let mut entry_row = transfer_row(
             record.entry_item(entry),
             &record.source,
             &encoded(entry),
             disposition,
-            detail(
-                Some(entry.rel_path.clone()),
-                Some(outcome),
-                refusal,
-                sqlite_code,
-                None,
-            ),
+            entry_detail,
         );
         entry_row.kind = RowKind::TransferEntry;
         // Only a typed refusal can carry a default: a bare IO never counts.

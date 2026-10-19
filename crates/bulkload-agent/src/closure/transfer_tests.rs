@@ -3,8 +3,10 @@
 //! A `copy` or `pull` session's durable record joins the closure report as
 //! rows: the session, each refused path and each covered sidecar. The gate
 //! is green iff the session ended, every typed refusal (session or entry)
-//! carries a review of its current instance, a standing policy, or its
-//! ruled default (`abandon` for an integrity failure, OI-1003-Q148), and
+//! carries a review of its current instance or a standing policy (until
+//! the 2026-10-19 plan of record, C4, an integrity failure had the ruled
+//! default `abandon`, OI-1003-Q148; C14 carries corrupt stores as files
+//! instead, so no default remains), and
 //! nothing is a bare `IO`, a `FRAME_CODEC` or a retired code. Before WP3
 //! PR 4 none of these rows existed: a transfer's refusals never reached the
 //! gate, so a closure report could pass over a run whose transfers refused.
@@ -91,17 +93,34 @@ fn a_transfer_session_joins_the_gate_row_by_row() {
         }
         stats.sqlite_snapshots.push(b"state.db".to_vec());
         stats.sqlite_sidecars_covered.push(b"state.db-wal".to_vec());
+        // C14: a corrupt store carried beside its path, and a sidecar
+        // whose outcome is its database's one refusal.
+        stats.sqlite_carried_corrupt.push((
+            b"rescue.db".to_vec(),
+            b"rescue.db.corrupt-20261001".to_vec(),
+        ));
+        stats
+            .sqlite_sidecars_follow_refused
+            .push((b"busy.db-wal".to_vec(), b"busy.db".to_vec()));
         stats
     };
     let dest = state_with(&ended(stats_of(true)));
     let report = report_of(&[dest.path()]);
     assert_eq!(report.planned(), 0);
-    assert_eq!(report.transfer_rows(), 7);
+    assert_eq!(report.transfer_rows(), 9);
     assert_eq!(report.applied, 1, "the session ran to its end");
-    assert_eq!(report.covered, 1);
-    // The two integrity failures are disposed by their ruled default.
-    assert_eq!((report.refused, report.ruled_default), (2, 2));
-    assert_eq!(report.refused_pending_review, 2);
+    assert_eq!(
+        report.covered, 2,
+        "the covered sidecar and the following one"
+    );
+    assert_eq!(
+        report.carried, 1,
+        "the corrupt store, carried beside its path"
+    );
+    // No refusal has a ruled default since C14: every typed one waits for
+    // its review.
+    assert_eq!((report.refused, report.ruled_default), (0, 0));
+    assert_eq!(report.refused_pending_review, 4);
     // A bare IO names no cause: unaccounted, so the native verdict fails.
     assert_eq!(report.unaccounted, 1);
     assert!(!report.native_passes() && !report.passes());
@@ -111,7 +130,7 @@ fn a_transfer_session_joins_the_gate_row_by_row() {
     );
     assert_eq!(
         row(&report, "corrupt.db").disposition,
-        Disposition::Refused("SQLITE_INTEGRITY_CHECK_FAILED".into())
+        Disposition::RefusedPendingReview("SQLITE_INTEGRITY_CHECK_FAILED".into())
     );
     assert_eq!(
         row(&report, "busy.db").disposition,
@@ -121,19 +140,30 @@ fn a_transfer_session_joins_the_gate_row_by_row() {
         row(&report, "state.db-wal").disposition,
         Disposition::Covered
     );
+    assert_eq!(row(&report, "rescue.db").disposition, Disposition::Carried);
+    assert_eq!(
+        row(&report, "busy.db-wal").disposition,
+        Disposition::Covered
+    );
     let json = report.to_json();
     assert!(
         json.contains("\"schema\":\"bulkload.closure.v5\"")
-            && json.contains("\"transfer_rows\":7")
-            && json.contains("\"ruled_default\":2"),
+            && json.contains("\"transfer_rows\":9")
+            && json.contains("\"ruled_default\":0"),
         "{json}"
     );
     assert!(
-        json.contains("\"disposition\":\"refused\",\"kind\":\"transfer-entry\""),
+        json.contains("\"disposition\":\"refused-pending-review\",\"kind\":\"transfer-entry\""),
         "{json}"
     );
     assert!(json.contains(
-        "\"path\":\"notadb.db\",\"transfer_outcome\":\"refused\",\"refusal\":\"SQLITE_BACKUP_FAILED\",\"site\":\"transfer::pull\",\"errno\":null,\"sqlite_code\":282,\"review\":{\"decision\":\"abandon\",\"reviewer\":null,\"date\":null,\"basis\":\"ruled-default\",\"ruling\":\"OI-1003-Q148\"}"
+        "\"path\":\"notadb.db\",\"transfer_outcome\":\"refused\",\"refusal\":\"SQLITE_BACKUP_FAILED\",\"site\":\"transfer::pull\",\"errno\":null,\"sqlite_code\":282}"
+    ), "{json}");
+    assert!(json.contains(
+        "\"path\":\"rescue.db\",\"transfer_outcome\":\"carried-corrupt\",\"related\":\"rescue.db.corrupt-20261001\""
+    ), "{json}");
+    assert!(json.contains(
+        "\"path\":\"busy.db-wal\",\"transfer_outcome\":\"sidecar-follows-refused-base\",\"related\":\"busy.db\""
     ), "{json}");
     assert!(
         json.contains(
@@ -143,8 +173,8 @@ fn a_transfer_session_joins_the_gate_row_by_row() {
     );
 
     // The rerun has no bare IO; reviews close the rest: an item row for the
-    // occupied path, a standing policy for the busy backup. An operator's
-    // re-carry of one integrity failure overrides its default.
+    // occupied path, a standing policy for the busy backup, an operator's
+    // re-carry of the integrity failure.
     let dest = state_with(&ended(stats_of(false)));
     let mut report = report_of(&[dest.path()]);
     let mut ledger = reviews();
@@ -184,7 +214,7 @@ fn a_transfer_session_joins_the_gate_row_by_row() {
     report.dispose(&ledger);
     assert!(report.passes(), "{}", report.to_json());
     assert_eq!(report.unaccounted, 0);
-    // The policy covers both backup failures; only none is left to its default.
+    // The policy covers both backup failures; nothing has a default.
     assert_eq!(report.ruled_default, 0);
     let recarried = row(&report, "corrupt.db");
     assert_eq!(
@@ -540,11 +570,14 @@ const RETIRED: &str = "RETIRED_FOR_P86";
 
 /// A drawn entry: its code, its `SQLite` code and its review (0 none, 1 an
 /// item row for its instance, 2 a standing policy, 3 an item row for
-/// another instance); or a covered sidecar.
+/// another instance); a covered sidecar; a corrupt store carried beside
+/// its path (C14); or a sidecar following its base's refusal.
 #[derive(Debug, Clone)]
 enum Drawn {
     Refused(usize, Option<i32>, u8),
     Covered,
+    CarriedCorrupt,
+    Follows,
 }
 
 fn drawn() -> impl Strategy<Value = Drawn> {
@@ -563,6 +596,8 @@ fn drawn() -> impl Strategy<Value = Drawn> {
         )
             .prop_map(|(code, sqlite, how)| Drawn::Refused(code, sqlite, how)),
         1 => Just(Drawn::Covered),
+        1 => Just(Drawn::CarriedCorrupt),
+        1 => Just(Drawn::Follows),
     ]
 }
 
@@ -579,9 +614,11 @@ fn session(kind: u8) -> Session {
     }
 }
 
+/// No refusal has a ruled default since C14 (RUL-14; plan of record
+/// 2026-10-19, C4): the model's default clause is always false.
 fn ruled(code: &str, sqlite: Option<i32>) -> bool {
-    code == "SQLITE_INTEGRITY_CHECK_FAILED"
-        || (code == "SQLITE_BACKUP_FAILED" && sqlite.is_some_and(|c| matches!(c & 0xff, 11 | 26)))
+    let _ = (code, sqlite);
+    false
 }
 
 proptest! {
@@ -610,6 +647,12 @@ proptest! {
                         sqlite_code: *sqlite,
                     },
                     Drawn::Covered => EntryOutcome::SidecarCovered,
+                    Drawn::CarriedCorrupt => EntryOutcome::CarriedCorrupt {
+                        beside: format!("p{index}.corrupt-20261019").into_bytes(),
+                    },
+                    Drawn::Follows => EntryOutcome::SidecarFollowsRefusedBase {
+                        database: b"base.db".to_vec(),
+                    },
                 },
             });
         }
@@ -655,7 +698,7 @@ proptest! {
         };
         let green = session_ok
             && entries.iter().all(|drawn| match drawn {
-                Drawn::Covered => true,
+                Drawn::Covered | Drawn::CarriedCorrupt | Drawn::Follows => true,
                 Drawn::Refused(code, sqlite, how) => closes(codes[*code], *sqlite, *how),
             });
         prop_assert_eq!(report.passes(), green, "{:?} {:?}", kind, entries);
@@ -665,8 +708,12 @@ proptest! {
         prop_assert_eq!(report.transfer_rows(), 1 + entries.len() as u64);
         prop_assert_eq!(
             report.applied + report.refused + report.refused_pending_review
-                + report.covered + report.unaccounted,
+                + report.covered + report.carried + report.unaccounted,
             report.transfer_rows()
+        );
+        prop_assert_eq!(
+            report.carried,
+            entries.iter().filter(|drawn| matches!(drawn, Drawn::CarriedCorrupt)).count() as u64
         );
         let typed = entries.iter().filter(|drawn| matches!(drawn,
             Drawn::Refused(code, _, _) if crate::outcome::is_typed_code(codes[*code])

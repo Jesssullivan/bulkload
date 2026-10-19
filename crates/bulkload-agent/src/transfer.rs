@@ -160,16 +160,39 @@ const RECV_JOB_MIN_BYTES: u64 = 4096;
 /// has window to keep offering (OI-1003-Q143 item 2).
 const DIRECTORY_BATCH_FRAMES: usize = 256;
 /// Bytes of `SQLite` snapshot slots the source keeps at once, streamed or
-/// kept for chunk requests (#218, design D9: the salvage bound's figure;
-/// unruled). Every slot is reserved before its backup and holds its
-/// reservation until it is removed (#218 review); a capture thread waits
-/// up to [`crate::provider_sqlite::CARRY_WALL`] for room. A store whose
-/// main file and `-wal` together exceed it, or that finds no room in that
-/// time, is refused `BUDGET_EXCEEDED` (not remembered).
+/// kept for chunk requests, when `--sqlite-slot-bytes` names no other
+/// budget (#218, design D9: the salvage bound's figure; unruled). Every
+/// slot is reserved before its backup and holds its reservation until it
+/// is removed (#218 review); a capture thread waits up to the carry wall
+/// ([`crate::provider_sqlite::carry_wall_base`]) for room, and one that
+/// finds none in that time is refused `BUDGET_EXCEEDED` (not remembered).
+/// A store whose main file and `-wal` together exceed the budget is not
+/// refused for it (operator 2026-10-18, "Chunked snapshot", A-115; plan of
+/// record 2026-10-19, C3): it takes an oversize slot of its own, one at a
+/// time, bounded by the free-space floor (`--min-free-percent`) and the
+/// manifest bound ([`MAX_MANIFEST_CHUNKS`] chunks), not by the budget, and
+/// its snapshot is cut into fixed chunks ([`chunked_size`]). The slot file
+/// is the whole snapshot: the backup API writes a database, whose pages
+/// a later restart rewrites and whose header its last step finishes, so
+/// no byte of it can leave for the wire before it is complete; what the
+/// budget bounds is the slots beside it and the memory each chunk takes.
 const SLOT_BYTES: u64 = 4 << 30;
+/// The slot budget `--sqlite-slot-bytes=BYTES` set for the process; 0
+/// means [`SLOT_BYTES`].
+static SQLITE_SLOT_BYTES: AtomicU64 = AtomicU64::new(0);
 /// The private directory, inside the source state, that holds snapshot
 /// slots (#218). Emptied when `serve` starts: no record depends on a slot.
 const SLOT_DIR: &str = "sqlite-snapshots";
+/// A snapshot larger than this is cut into fixed chunks of whole pages
+/// ([`chunked_size`]; A-115): the size at which content-defined chunks at
+/// their average ([`crate::hash::CDC_AVG_BYTES`]) would fill half of one
+/// manifest ([`MAX_MANIFEST_CHUNKS`]). A function of the size alone, never
+/// of the budget, so a store is cut the same way on every run (S3).
+const CHUNKED_ABOVE: u64 = (MAX_MANIFEST_CHUNKS as u64) * (crate::hash::CDC_AVG_BYTES as u64) / 2;
+/// The least fixed chunk a chunked snapshot is cut into: a multiple of
+/// every `SQLite` page size (512 B to 64 KiB), so a chunk always holds
+/// whole pages and a changed page changes one chunk.
+const CHUNKED_MIN_BYTES: u64 = 64 * 1024;
 /// The session's `SQLite` mode when the caller names none: `refuse` (design
 /// D1), unless `--sqlite=` set it for the process.
 static SQLITE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -211,26 +234,141 @@ pub const fn sqlite_mode_label(mode: SqliteMode) -> &'static str {
     }
 }
 
+/// Set the process's `SQLite` slot budget (`--sqlite-slot-bytes=BYTES`,
+/// plan of record 2026-10-19, C3): the bytes of snapshot slots the source
+/// keeps at once. `copy` sets it for its in-process source half; `pull`
+/// forwards it to the remote `serve` ([`serve_flags`]).
+pub fn set_sqlite_slot_bytes(bytes: u64) {
+    SQLITE_SLOT_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+/// The process's slot budget: `--sqlite-slot-bytes`'s, or [`SLOT_BYTES`].
+#[must_use]
+pub fn sqlite_slot_bytes() -> u64 {
+    match SQLITE_SLOT_BYTES.load(Ordering::Relaxed) {
+        0 => SLOT_BYTES,
+        bytes => bytes,
+    }
+}
+
+/// Parse `--sqlite-slot-bytes=BYTES`: a whole number of bytes, at least
+/// one page (512), with an optional binary suffix `K`, `M`, `G` or `T`
+/// (`4G` is 4 GiB).
+///
+/// # Errors
+/// Refuses anything else `FIELD_DOMAIN_VIOLATION`.
+pub fn parse_sqlite_slot_bytes(value: &str) -> Result<u64> {
+    let suffixes: [(&str, u32); 8] = [
+        ("K", 10),
+        ("k", 10),
+        ("M", 20),
+        ("m", 20),
+        ("G", 30),
+        ("g", 30),
+        ("T", 40),
+        ("t", 40),
+    ];
+    let (digits, shift) = suffixes
+        .iter()
+        .find_map(|(suffix, shift)| value.strip_suffix(suffix).map(|digits| (digits, *shift)))
+        .unwrap_or((value, 0));
+    let count = digits
+        .parse::<u64>()
+        .map_err(|_| BulkloadRefusal::FieldDomainViolation)?;
+    count
+        .checked_mul(1_u64 << shift)
+        .filter(|bytes| *bytes >= 512)
+        .ok_or(BulkloadRefusal::FieldDomainViolation)
+}
+
+/// The `SQLite` flags `pull` forwards to its remote `serve` so the source
+/// half runs under the same budget and wall as the verb was given: each of
+/// `--sqlite-slot-bytes` and `--sqlite-carry-wall` that is not at its
+/// default, rendered as it is parsed. Empty when both are.
+#[must_use]
+pub fn serve_flags() -> Vec<String> {
+    let mut flags = Vec::new();
+    let slot = SQLITE_SLOT_BYTES.load(Ordering::Relaxed);
+    if slot != 0 {
+        flags.push(format!("--sqlite-slot-bytes={slot}"));
+    }
+    let wall = crate::provider_sqlite::carry_wall_base();
+    if wall != crate::provider_sqlite::CARRY_WALL {
+        flags.push(format!("--sqlite-carry-wall={}", wall.as_secs()));
+    }
+    flags
+}
+
 /// The default S4 disposition ruled for a transfer refusal, if any, from
 /// its code and the `SQLite` result code it carries
 /// ([`BulkloadRefusal::sqlite_code`]).
 ///
-/// It is printed beside the refusal: `abandon` for an integrity failure
-/// (OI-1003-Q148: a store that fails its integrity check is not carried,
-/// and is closed as abandoned unless the operator reviews it otherwise).
-/// That is `SQLITE_INTEGRITY_CHECK_FAILED`, and `SQLITE_BACKUP_FAILED` whose
-/// primary code is 11 (`SQLITE_CORRUPT`) or 26 (`SQLITE_NOTADB`): corruption
-/// the backup step itself met, which never reaches `integrity_check` (the
-/// same primary codes a snapshot refusal is remembered by, R10). Since WP3
-/// PR 4 it is also the default disposition of the refusal's closure row
-/// (`closure-report --transfer`, [`crate::transfer_outcome`]), which an
-/// operator review overrides; every other refusal has no default.
+/// None has one now. Until the 2026-10-19 plan of record (C4) an integrity
+/// failure (`SQLITE_INTEGRITY_CHECK_FAILED`, and `SQLITE_BACKUP_FAILED`
+/// whose primary code is 11 `SQLITE_CORRUPT` or 26 `SQLITE_NOTADB`) was
+/// printed beside its refusal with the default `abandon` (OI-1003-Q148),
+/// and since WP3 PR 4 its closure row carried it. C14 (RUL-14, 2026-10-16)
+/// rules the corrupt copies carried as files and marked corrupt, which the
+/// transfer now does ([`TransferStats::sqlite_carried_corrupt`]); what is
+/// still refused (a backup that met corruption beside a `-wal` with
+/// frames) is a typed refusal pending the operator's review, as every
+/// other refusal is. The function stays for its callers, and for the
+/// record of what it answered.
 #[must_use]
 pub fn default_disposition(code: &str, sqlite_code: Option<i32>) -> Option<&'static str> {
-    let integrity = code == BulkloadRefusal::SqliteIntegrityCheckFailed.code()
-        || (code == BulkloadRefusal::SqliteBackupFailed(None).code()
-            && sqlite_code.is_some_and(|sqlite| matches!(sqlite & 0xff, 11 | 26)));
-    integrity.then_some("abandon")
+    let _ = (code, sqlite_code);
+    None
+}
+
+/// The fixed chunk a snapshot of `size` bytes is cut into (A-115, "Chunked
+/// snapshot"), when it is larger than [`CHUNKED_ABOVE`]: the least power
+/// of two from [`CHUNKED_MIN_BYTES`] that keeps it within
+/// [`MAX_MANIFEST_CHUNKS`] chunks, at most [`crate::hash::CDC_MAX_BYTES`].
+/// Every `SQLite` page size divides it, so each chunk holds whole pages
+/// and a changed page changes one chunk; content-defined cuts would buy
+/// nothing in a file whose pages never shift, and at their average a store
+/// past 8 GiB would not fit one manifest. `None`: cut by content, as every
+/// other seat.
+fn chunked_size(size: u64) -> Option<u64> {
+    if size <= CHUNKED_ABOVE {
+        return None;
+    }
+    Some(
+        size.div_ceil(MAX_MANIFEST_CHUNKS as u64)
+            .max(CHUNKED_MIN_BYTES)
+            .checked_next_power_of_two()
+            .unwrap_or(u64::MAX)
+            .min(u64::from(crate::hash::CDC_MAX_BYTES)),
+    )
+}
+
+/// The name a corrupt snapshot of `row` is carried beside its path as
+/// (C14, RUL-14; plan of record 2026-10-19, C4): `<rel_path>.corrupt-<YYYYMMDD>`,
+/// the date (UTC) the source file was last modified. A function of the row
+/// alone, so the same corrupt store lands at one name on every run (never
+/// twice, R2.4) and a rerun finds it held; a store modified since lands
+/// beside it under its own date, and the earlier copy stays (R2.2).
+fn corrupt_beside_path(row: &RowSchema) -> Vec<u8> {
+    let mut beside = row.rel_path.clone();
+    beside.extend_from_slice(b".corrupt-");
+    beside.extend_from_slice(yyyymmdd(row.mtime_ns).as_bytes());
+    beside
+}
+
+/// `YYYYMMDD` (UTC) of a time in nanoseconds since the Unix epoch, by the
+/// proleptic Gregorian civil-from-days computation (no dependency).
+fn yyyymmdd(unix_ns: i128) -> String {
+    let days = unix_ns.div_euclid(86_400 * 1_000_000_000);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i128::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}")
 }
 
 static WALK_NS: AtomicU64 = AtomicU64::new(0);
@@ -334,6 +472,18 @@ pub struct TransferStats {
     /// base that was carried as a snapshot: covered by it, never carried
     /// (#218), by relative path. A sidecar whose base was not is a refusal.
     pub sqlite_sidecars_covered: Vec<Vec<u8>>,
+    /// Databases whose snapshot was corrupt, carried as a file beside their
+    /// path and marked corrupt, never installed as a database (C14, RUL-14;
+    /// plan of record 2026-10-19, C4): the database's relative path and the
+    /// file it was carried as (`<db>.corrupt-<YYYYMMDD>`). Published this
+    /// session, or found held by it from an earlier one. Accounted as
+    /// carried; its sidecars are covered by it.
+    pub sqlite_carried_corrupt: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Sidecars the source reported beside a database that was refused:
+    /// the sidecar's relative path and its database's. Their outcome is
+    /// that one refusal's (plan of record 2026-10-19, C3), so closure
+    /// counts one refusal, not one per file. Never carried.
+    pub sqlite_sidecars_follow_refused: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 impl TransferStats {
@@ -1055,22 +1205,47 @@ struct SlotFile {
     path: PathBuf,
     /// Its share of the slot budget, given back once the file is removed.
     reserved: SlotReservation,
+    /// A slot this process wrote (removed when dropped), as against the
+    /// source's own main file read raw for a corrupt carry (C14; left
+    /// exactly as it is, and its reads counted as source reads).
+    owned: bool,
+}
+
+impl SlotFile {
+    /// What a read of this slot counts as: a private re-read of a slot
+    /// this process wrote, or a source read of a raw main file (C14).
+    const fn read_counter(&self) -> Counter {
+        if self.owned {
+            Counter::SourceSnapshotRead
+        } else {
+            Counter::SourceFileRead
+        }
+    }
 }
 
 impl Drop for SlotFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.owned {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
 /// The source's budget of snapshot slot bytes alive at once (#218 review,
-/// [`SLOT_BYTES`]): every slot, streamed or kept for a manifest, is
-/// reserved before its backup writes it and given back once it is removed,
-/// so the slots of every capture thread together never pass it.
+/// [`SLOT_BYTES`], `--sqlite-slot-bytes`): every slot, streamed or kept for
+/// a manifest, is reserved before its backup writes it and given back once
+/// it is removed, so the slots of every capture thread together never pass
+/// it. A store larger than the whole budget takes an oversize reservation
+/// instead (A-115): one at a time, outside the budget, so the small slots
+/// keep flowing beside it; its size is bounded by the free-space floor.
 struct SlotBudget {
     total: u64,
     left: Mutex<u64>,
     freed: Condvar,
+    /// An oversize slot is alive; its own condition, since a `Condvar`
+    /// serves one mutex.
+    oversize: Mutex<bool>,
+    oversize_freed: Condvar,
 }
 
 impl SlotBudget {
@@ -1079,16 +1254,39 @@ impl SlotBudget {
             total,
             left: Mutex::new(total),
             freed: Condvar::new(),
+            oversize: Mutex::new(false),
+            oversize_freed: Condvar::new(),
         }
     }
 
     /// Reserve `bytes`, waiting at most `wait` for other slots to be
-    /// removed; `None` when they still do not fit, or never could.
+    /// removed; `None` when they still do not fit. More than the whole
+    /// budget is an oversize reservation: it waits for the one before it to
+    /// go, and takes nothing from the budget.
     fn reserve(self: &Arc<Self>, bytes: u64, wait: std::time::Duration) -> Option<SlotReservation> {
-        if bytes > self.total {
-            return None;
-        }
         let deadline = Instant::now() + wait;
+        if bytes > self.total {
+            let mut busy = self.oversize.lock().unwrap_or_else(PoisonError::into_inner);
+            loop {
+                if !*busy {
+                    *busy = true;
+                    return Some(SlotReservation {
+                        budget: Arc::clone(self),
+                        bytes: 0,
+                        oversize: true,
+                    });
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return None;
+                }
+                busy = self
+                    .oversize_freed
+                    .wait_timeout(busy, remaining)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+        }
         let mut left = self.left.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if *left >= bytes {
@@ -1096,6 +1294,7 @@ impl SlotBudget {
                 return Some(SlotReservation {
                     budget: Arc::clone(self),
                     bytes,
+                    oversize: false,
                 });
             }
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1115,12 +1314,18 @@ impl SlotBudget {
 struct SlotReservation {
     budget: Arc<SlotBudget>,
     bytes: u64,
+    /// The one oversize slot (A-115): outside the budget, `bytes` 0.
+    oversize: bool,
 }
 
 impl SlotReservation {
     /// Make this reservation exactly `bytes`: what is over is given back at
     /// once; more is taken only when it is free now. `false` when it is not.
+    /// An oversize reservation is already as large as it gets.
     fn true_up(&mut self, bytes: u64) -> bool {
+        if self.oversize {
+            return true;
+        }
         let mut left = self
             .budget
             .left
@@ -1147,12 +1352,21 @@ impl SlotReservation {
 
 impl Drop for SlotReservation {
     fn drop(&mut self) {
-        *self
-            .budget
-            .left
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += self.bytes;
-        self.budget.freed.notify_all();
+        if self.oversize {
+            *self
+                .budget
+                .oversize
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = false;
+            self.budget.oversize_freed.notify_all();
+        } else {
+            *self
+                .budget
+                .left
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) += self.bytes;
+            self.budget.freed.notify_all();
+        }
     }
 }
 
@@ -1655,13 +1869,13 @@ impl Drop for BackupHeld {
     }
 }
 
-/// The retained-slot budget; tests set a smaller one per source root.
+/// The slot budget: `--sqlite-slot-bytes`'s, or [`SLOT_BYTES`].
 #[cfg(not(test))]
-const fn slot_budget(_root: &Path) -> u64 {
-    SLOT_BYTES
+fn slot_budget(_root: &Path) -> u64 {
+    sqlite_slot_bytes()
 }
 
-/// The retained-slot budget; tests set a smaller one per source root.
+/// The slot budget; tests set a smaller one per source root.
 #[cfg(test)]
 fn slot_budget(root: &Path) -> u64 {
     SLOT_OVERRIDE
@@ -1669,12 +1883,40 @@ fn slot_budget(root: &Path) -> u64 {
         .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .find(|(override_root, _)| override_root == root)
-        .map_or(SLOT_BYTES, |(_, bytes)| *bytes)
+        .map_or_else(sqlite_slot_bytes, |(_, bytes)| *bytes)
 }
 
 /// Test-only slot budgets by canonical source root.
 #[cfg(test)]
 static SLOT_OVERRIDE: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
+/// The fixed chunk of a snapshot of `size` bytes ([`chunked_size`]).
+#[cfg(not(test))]
+fn snapshot_chunk(_root: &Path, size: u64) -> Option<u64> {
+    chunked_size(size)
+}
+
+/// The fixed chunk of a snapshot of `size` bytes taken beneath `root`;
+/// tests set the size above which a snapshot is chunked, and the chunk,
+/// per source root, so a small store shows many chunks.
+#[cfg(test)]
+fn snapshot_chunk(root: &Path, size: u64) -> Option<u64> {
+    CHUNKED_OVERRIDE
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(override_root, ..)| override_root == root)
+        .map(|(_, above, chunk)| (*above, *chunk))
+        .map_or_else(
+            || chunked_size(size),
+            |(above, chunk)| (size > above).then_some(chunk),
+        )
+}
+
+/// Test-only: per canonical source root, the size above which a snapshot
+/// is chunked and the fixed chunk it is cut into.
+#[cfg(test)]
+static CHUNKED_OVERRIDE: Mutex<Vec<(PathBuf, u64, u64)>> = Mutex::new(Vec::new());
 
 /// What every capture thread shares.
 struct SourceWork<'a> {
@@ -2717,6 +2959,15 @@ fn run_job(work: &SourceWork<'_>, store: &Store, job: Job, events: &Sender<Event
 /// magic was seen: the seat is sniffed once more), and honours a snapshot
 /// refusal under the seat's snapshot key, its row and the `-wal` identity
 /// the walk offered.
+///
+/// Since the 2026-10-19 plan of record (C4; C14, RUL-14) a corrupt store is
+/// carried beside its path, not refused, so a remembered integrity record
+/// (`SqliteSnapshotIntegrity`, written before that change) is ignored: the
+/// seat is snapshotted and carried. A remembered backup corruption
+/// (`SqliteSnapshotCorrupt`, `SqliteSnapshotNotADatabase`) is honoured only
+/// beside a `-wal` that holds frames, where the store is still refused;
+/// otherwise its main file is read raw and carried beside, so the record
+/// is ignored too.
 fn remembered_refusal(
     work: &SourceWork<'_>,
     store: &Store,
@@ -2735,6 +2986,13 @@ fn remembered_refusal(
                 work.ledger,
                 store.refused_seat(&sqlite_key(work.authority, row, wal)?),
             )?
+            .filter(|refused| match refused {
+                RefusedSeat::SqliteSnapshotIntegrity => false,
+                RefusedSeat::SqliteSnapshotCorrupt | RefusedSeat::SqliteSnapshotNotADatabase => {
+                    wal.is_some_and(|wal| wal.size > 0)
+                }
+                _ => true,
+            })
         }
         None => None,
     };
@@ -3014,13 +3272,14 @@ fn serve_chunks(
 
 /// One chunk of the snapshot a manifest was built from, read again from its
 /// slot and checked against its digest: private state, not a source read
-/// (#218).
+/// (#218); a corrupt carry's raw main file is the source itself, and its
+/// read is counted as one (C14).
 fn slot_chunk(slot: &SlotFile, spec: &ChunkSpec, offset: u64) -> Result<SourceChunk> {
     let mut data =
         vec![0_u8; usize::try_from(spec.size).map_err(|_| BulkloadRefusal::BudgetExceeded)?];
     let read = crate::io::sys::pread_full(&slot.file, &mut data, offset)
         .refuse_at("transfer::slot_chunk")?;
-    counters::add_len(Counter::SourceSnapshotRead, read);
+    counters::add_len(slot.read_counter(), read);
     if read != data.len() {
         return Err(BulkloadRefusal::DigestMismatch);
     }
@@ -3330,6 +3589,15 @@ struct Snapshotted {
     /// post-stat, and neither is stamped within the racy allowance, so the
     /// row and `wal` vouch for the snapshot's bytes.
     settled: bool,
+    /// A corrupt store (C14, RUL-14): the slot is the backup's page copy
+    /// that failed its `integrity_check`, or (`slot.owned` false) the
+    /// source's own main file, read raw, when the backup itself met
+    /// corruption. Announced as a snapshot all the same; the destination's
+    /// checks fail it and land it beside its path, marked corrupt.
+    corrupt: bool,
+    /// The fixed chunk the snapshot is cut into (A-115, [`chunked_size`]);
+    /// `None` cuts it by content, as every other seat.
+    chunk: Option<u64>,
 }
 
 /// Snapshot one database seat and answer its entry (#218): announce the
@@ -3369,6 +3637,16 @@ fn snapshot_seat(
     // `take_snapshot` once its backup is done, or by its drop (#218 review).
     let taken = take_snapshot(work, row, &mut opened, bytes_read, sniffed)?;
     drop(opened);
+    if taken.corrupt {
+        counters::bump(Counter::SourceSqliteCorruptCarried);
+    }
+    if taken.chunk.is_some() {
+        counters::bump(Counter::SourceSqliteChunkedSnapshots);
+    }
+    // A raw main file is the source: its whole read is a source read (R13).
+    if !taken.slot.owned {
+        *bytes_read = bytes_read.saturating_add(taken.size);
+    }
     events
         .send(Event::Snapshot {
             entry,
@@ -3381,10 +3659,12 @@ fn snapshot_seat(
     let racy = !taken.settled;
     if want_manifest {
         // The slot already holds its reservation (#218 review).
+        let chunk = taken.chunk;
         let retained = Retained::slot(&work.retain, taken.slot);
         let chunks = chunk_slot(
             retained.slot.as_ref().ok_or(BulkloadRefusal::WorkerLost)?,
             taken.size,
+            chunk,
             |_, _, _| Ok(()),
         )?;
         return Ok(Event::Manifest {
@@ -3397,7 +3677,7 @@ fn snapshot_seat(
         });
     }
     let slot = taken.slot;
-    let chunks = chunk_slot(&slot, taken.size, |index, offset, chunk| {
+    let chunks = chunk_slot(&slot, taken.size, taken.chunk, |index, offset, chunk| {
         send_chunk(work, events, entry, index, offset, chunk)
     })?;
     drop(slot);
@@ -3414,20 +3694,57 @@ fn snapshot_seat(
     })
 }
 
-/// Chunk a snapshot slot as a capture chunks a seat. A private read, counted
-/// as `read_source_snapshot_bytes`, never as a source read.
+/// Chunk a snapshot slot as a capture chunks a seat, or, for a chunked
+/// snapshot (`fixed`, A-115), into chunks of exactly `fixed` bytes, the
+/// last one shorter. A private read, counted as `read_source_snapshot_bytes`,
+/// never as a source read, except a corrupt carry's raw main file (C14),
+/// which is the source. Either way one chunk at a time is held: a large
+/// store is streamed, never read whole into memory.
 fn chunk_slot(
     slot: &SlotFile,
     size: u64,
+    fixed: Option<u64>,
     mut sink: impl FnMut(u32, u64, SourceChunk) -> Result<()>,
 ) -> Result<Vec<ChunkSpec>> {
     let mut chunks = Vec::new();
     let mut offset = 0_u64;
     let _cdc_timer = PhaseTimer(&CDC_HASH_NS, Instant::now());
+    if let Some(fixed) = fixed {
+        if fixed == 0 || fixed > u64::from(crate::hash::CDC_MAX_BYTES) {
+            return Err(BulkloadRefusal::BudgetExceeded);
+        }
+        while offset < size {
+            if chunks.len() >= MAX_MANIFEST_CHUNKS {
+                return Err(BulkloadRefusal::BudgetExceeded);
+            }
+            let length = fixed.min(size - offset);
+            let mut data =
+                vec![0_u8; usize::try_from(length).map_err(|_| BulkloadRefusal::BudgetExceeded)?];
+            let read = crate::io::sys::pread_full(&slot.file, &mut data, offset)
+                .refuse_at("transfer::chunk_slot")?;
+            counters::add_len(slot.read_counter(), read);
+            // The slot is this process's own file, or a raw main file whose
+            // size was announced: a short read means its bytes are not the
+            // snapshot's.
+            if read != data.len() {
+                return Err(BulkloadRefusal::DigestMismatch);
+            }
+            let chunk = SourceChunk::hashed(data);
+            let index = u32::try_from(chunks.len()).map_err(|_| BulkloadRefusal::BudgetExceeded)?;
+            chunks.push(ChunkSpec {
+                digest: *chunk.digest(),
+                size: length,
+            });
+            sink(index, offset, chunk)?;
+            offset += length;
+        }
+        return Ok(chunks);
+    }
     for chunk in fastcdc::v2020::StreamCDC::new(
         SlotReader {
             file: &slot.file,
             offset: 0,
+            counter: slot.read_counter(),
         },
         crate::hash::CDC_MIN_BYTES,
         crate::hash::CDC_AVG_BYTES,
@@ -3467,13 +3784,15 @@ fn chunk_slot(
 struct SlotReader<'a> {
     file: &'a std::fs::File,
     offset: u64,
+    /// What the reads count as ([`SlotFile::read_counter`]).
+    counter: Counter,
 }
 
 impl Read for SlotReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = crate::io::sys::pread_full(self.file, buffer, self.offset)?;
         self.offset = self.offset.saturating_add(read as u64);
-        counters::add_len(Counter::SourceSnapshotRead, read);
+        counters::add_len(self.counter, read);
         Ok(read)
     }
 }
@@ -3589,11 +3908,17 @@ fn seat_directory<'r>(
 /// is remembered under the snapshot key when the capture settled (R10).
 ///
 /// Before the backup (#218 review) the slot is reserved against the slot
-/// budget, waiting up to [`crate::provider_sqlite::CARRY_WALL`] for room,
+/// budget (`--sqlite-slot-bytes`), waiting up to the carry wall for room,
 /// and the slot directory's filesystem must keep the free-space floor
 /// (`--min-free-percent`) with the slot written: either refuses
-/// `BUDGET_EXCEEDED`, not remembered. The sniff's descriptor is closed
-/// under the backup lock once the backup is done.
+/// `BUDGET_EXCEEDED`, not remembered. A store larger than the whole budget
+/// takes the one oversize slot instead, waiting for the one before it, and
+/// its wait and backup wall are [`crate::provider_sqlite::carry_wall`] of
+/// its size (A-115; plan of record 2026-10-19, C3). A snapshot that fails
+/// its `integrity_check`, or a store whose backup met corruption beside no
+/// `-wal` with frames (read raw), is carried all the same, marked corrupt
+/// for the destination to land beside its path (C14, RUL-14). The sniff's
+/// descriptor is closed under the backup lock once the backup is done.
 #[allow(
     clippy::too_many_lines,
     reason = "one backup between its pre- and post-stats, read top to bottom"
@@ -3619,14 +3944,19 @@ fn take_snapshot(
         .refuse_at("transfer::take_snapshot")?
         .node;
     // The slot's room first, outside the backup lock: a thread waiting for
-    // another slot to go never holds up a backup that fits.
+    // another slot to go never holds up a backup that fits. A store larger
+    // than the whole budget takes the one oversize slot (A-115), and both
+    // its wait and its backup's wall grow with its size.
+    let estimate = row.size.saturating_add(WalStat::of(parent, leaf).size());
+    let oversize = estimate > work.slot_budget.total;
+    let wall = crate::provider_sqlite::carry_wall(estimate, work.slot_budget.total);
     let mut reserved = work
         .slot_budget
-        .reserve(
-            row.size.saturating_add(WalStat::of(parent, leaf).size()),
-            crate::provider_sqlite::CARRY_WALL,
-        )
+        .reserve(estimate, wall)
         .ok_or(BulkloadRefusal::BudgetExceeded)?;
+    if oversize {
+        counters::bump(Counter::SourceSqliteOversizeSlots);
+    }
     let _one = work.backup.lock().unwrap_or_else(PoisonError::into_inner);
     #[cfg(test)]
     let _held = BackupHeld::mark();
@@ -3647,18 +3977,14 @@ fn take_snapshot(
         &slot_path,
         work.as_root,
         wal_bound,
-        crate::provider_sqlite::CARRY_WALL,
+        wall,
     );
     // Source content read, refused or not (R13).
     *bytes_read = bytes_read.saturating_add(source_bytes);
-    // Whatever the backup did, the slot goes when this is dropped, and its
-    // reservation with it.
-    let slot = std::fs::File::open(&slot_path).map(|file| SlotFile {
-        file,
-        path: slot_path.clone(),
-        reserved,
-    });
-    if slot.is_err() {
+    // Whatever the backup did, the slot file goes unless a snapshot holds
+    // it below, and its reservation with the snapshot.
+    let slot_file = std::fs::File::open(&slot_path);
+    if slot_file.is_err() {
         let _ = std::fs::remove_file(&slot_path);
     }
     let post_main = stat_main();
@@ -3681,34 +4007,85 @@ fn take_snapshot(
         && post_main.as_ref().map(identity) == pre_main.as_ref().map(identity)
         && !crate::git_carry::racy(row, opened.started_ns, now_ns)
         && wal_settled(pre_wal, post_wal, opened.started_ns, now_ns);
-    let report = match report {
-        Ok(report) => report,
+    let (mut slot, size, corrupt) = match report {
+        Ok(report) => {
+            let file = match slot_file {
+                Ok(file) => file,
+                Err(error) => {
+                    let _ = std::fs::remove_file(&slot_path);
+                    return Err(crate::refuse::io(&error, "transfer::take_snapshot"));
+                }
+            };
+            (
+                SlotFile {
+                    file,
+                    path: slot_path.clone(),
+                    reserved,
+                    owned: true,
+                },
+                report.size,
+                report.corrupt,
+            )
+        }
         // A directory of the path swapped for a symlink since the walk:
         // `SQLITE_OPEN_NOFOLLOW` refuses a symlink at any component.
         Err(BulkloadRefusal::SqliteBackupFailed(Some(SQLITE_CANTOPEN_SYMLINK))) => {
+            drop(slot_file);
+            let _ = std::fs::remove_file(&slot_path);
             return Err(BulkloadRefusal::PathEscapesRoot);
         }
         Err(refusal) => {
-            if settled {
-                if let Some(kind) = RefusedSeat::of_snapshot_refusal(&refusal) {
-                    *sniffed = Some((
-                        sqlite_key(work.authority, row, post_wal.id().as_ref())?,
-                        kind,
-                    ));
+            drop(slot_file);
+            let _ = std::fs::remove_file(&slot_path);
+            // The backup itself met corruption (`SQLITE_CORRUPT`,
+            // `SQLITE_NOTADB`): no page copy exists. Beside no `-wal` with
+            // frames the main file alone is the whole store, read raw and
+            // carried beside its path, marked corrupt (C14, RUL-14); beside
+            // one, the raw file could miss the `-wal`'s transactions, so
+            // the store stays a typed refusal for the operator's review.
+            let backup_corrupt = matches!(
+                &refusal,
+                BulkloadRefusal::SqliteBackupFailed(Some(code)) if matches!(code & 0xff, 11 | 26)
+            );
+            let wal_frames = pre_wal.size() > 0 || post_wal.size() > 0;
+            if backup_corrupt && !wal_frames && same_inode {
+                let file = open_source(work, row)?;
+                let stat = crate::io::sys::fstat(&file).refuse_at("transfer::take_snapshot")?;
+                if stat.node != opened_node {
+                    return Err(BulkloadRefusal::PathEscapesRoot);
                 }
+                (
+                    SlotFile {
+                        file,
+                        path: source.clone(),
+                        reserved,
+                        owned: false,
+                    },
+                    stat.size,
+                    true,
+                )
+            } else {
+                if settled {
+                    if let Some(kind) = RefusedSeat::of_snapshot_refusal(&refusal) {
+                        *sniffed = Some((
+                            sqlite_key(work.authority, row, post_wal.id().as_ref())?,
+                            kind,
+                        ));
+                    }
+                }
+                return Err(refusal);
             }
-            return Err(refusal);
         }
     };
-    let mut slot = slot.refuse_at("transfer::take_snapshot")?;
     if !same_inode {
         // `SQLite` resolved the path to another file than the walked seat.
         return Err(BulkloadRefusal::PathEscapesRoot);
     }
     // A snapshot can outgrow its bound when a writer committed between
-    // steps: it keeps its slot only when the budget has that room now.
-    if report.size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES)
-        || !slot.reserved.true_up(report.size)
+    // steps: it keeps its slot only when the budget has that room now (an
+    // oversize slot has all the room it gets; the manifest bound stands).
+    if size > (MAX_MANIFEST_CHUNKS as u64) * u64::from(crate::hash::CDC_MAX_BYTES)
+        || !slot.reserved.true_up(size)
     {
         return Err(BulkloadRefusal::BudgetExceeded);
     }
@@ -3717,9 +4094,11 @@ fn take_snapshot(
     }
     Ok(Snapshotted {
         slot,
-        size: report.size,
+        size,
         wal: post_wal.id(),
         settled,
+        corrupt,
+        chunk: snapshot_chunk(work.root, size),
     })
 }
 
@@ -3877,7 +4256,7 @@ fn finish_receive(
     stats: &mut TransferStats,
     salvage_staged: &HashMap<Vec<u8>, Vec<usize>>,
     sidecars: &[SidecarReport],
-    snapshot_bases: &HashSet<Vec<u8>>,
+    snapshot_bases: &mut HashSet<Vec<u8>>,
 ) -> Result<()> {
     for (rel_path, outcome) in committer.finish()? {
         match outcome {
@@ -3885,6 +4264,21 @@ fn finish_receive(
             Err(refusal) => stats.refuse_here(rel_path, &refusal),
         }
     }
+    // A corrupt carry whose beside file's group commit failed is not held
+    // here: its database covers no sidecar, and it is not carried (C14).
+    let refused: HashSet<Vec<u8>> = stats
+        .refusals
+        .iter()
+        .map(|(rel_path, _)| rel_path.clone())
+        .collect();
+    stats.sqlite_carried_corrupt.retain(|(database, beside)| {
+        if refused.contains(beside) {
+            snapshot_bases.remove(database);
+            false
+        } else {
+            true
+        }
+    });
     resolve_sidecars(stats, sidecars, snapshot_bases);
     let keep = salvage_to_keep(target, stats, salvage_staged);
     target.retire_salvaged(&keep)?;
@@ -3925,9 +4319,12 @@ type SidecarReport = (Vec<u8>, Vec<u8>);
 /// Bind each `SQLite` sidecar the source reported to its base's outcome
 /// (#218, review R2), once every outcome of the session is known: covered
 /// when the base is held here as a snapshot (published from one in this
-/// session and not refused since, or reused or adopted as one); refused by
-/// name, `SQLITE_STATE_CHANGED` as v5 refuses every sidecar, otherwise. So
-/// a sidecar is never counted covered by its name alone: the `-wal` of a
+/// session and not refused since, or reused or adopted as one) or as a
+/// corrupt carry beside its path (C14); following its base's refusal when
+/// the base was refused (plan of record 2026-10-19, C3: one refusal, not
+/// one per file, `sqlite_sidecars_follow_refused`); refused by name,
+/// `SQLITE_STATE_CHANGED` as v5 refuses every sidecar, otherwise. So a
+/// sidecar is never counted covered by its name alone: the `-wal` of a
 /// database without the `SQLite` magic (an encrypted store) carried raw, or
 /// a user's `notes-journal` beside a plain `notes`, stays a visible refusal.
 fn resolve_sidecars(
@@ -3948,16 +4345,21 @@ fn resolve_sidecars(
         return;
     }
     let mut covered = Vec::new();
+    let mut following = Vec::new();
     let mut uncovered = Vec::new();
     for (rel_path, database) in sidecars {
-        if snapshot_bases.contains(database) && !refused.contains(database) {
+        if refused.contains(database) {
+            following.push((rel_path.clone(), database.clone()));
+        } else if snapshot_bases.contains(database) {
             covered.push(rel_path.clone());
         } else {
             uncovered.push(rel_path.clone());
         }
     }
     counters::add(Counter::SqliteSidecarsCovered, covered.len() as u64);
+    counters::add(Counter::SqliteSidecarsFollowRefused, following.len() as u64);
     stats.sqlite_sidecars_covered.extend(covered);
+    stats.sqlite_sidecars_follow_refused.extend(following);
     let code = BulkloadRefusal::SqliteStateChanged.code();
     stats.refusals.extend(
         uncovered
@@ -4744,6 +5146,11 @@ struct Inbound<'a, W> {
     /// `Held` (#77 round 2, N1), and the committer's per-group outcomes.
     pending_held: HashMap<Vec<u8>, u64>,
     committed: Receiver<crate::materialize::GroupOutcomes>,
+    /// Corrupt snapshots this session published beside their path (C14):
+    /// the database's relative path to the file's, so the entry's `Held`
+    /// is matched to the group outcome of the file that was published,
+    /// and the database is never counted a snapshot.
+    corrupt_published: HashMap<Vec<u8>, Vec<u8>>,
     /// The source has offered every entry.
     walk_done: bool,
     /// Granted payload bytes not yet received.
@@ -5032,6 +5439,7 @@ fn receive_session<R: Read, W: Write>(
             salvage_staged: HashMap::new(),
             pending_held: HashMap::new(),
             committed: group_outcomes,
+            corrupt_published: HashMap::new(),
             walk_done: false,
             granted: CREDIT_WINDOW,
             consumed: 0,
@@ -5075,7 +5483,7 @@ fn receive_session<R: Read, W: Write>(
             snapshot_bases,
         ))
     });
-    let (source_bytes_read, mut stats, session, salvage_staged, sidecars, snapshot_bases) =
+    let (source_bytes_read, mut stats, session, salvage_staged, sidecars, mut snapshot_bases) =
         streamed?;
     let _tail_timer = PhaseTimer(&RECV_TAIL_NS, Instant::now());
     stats.source_bytes_read = source_bytes_read;
@@ -5087,7 +5495,7 @@ fn receive_session<R: Read, W: Write>(
         &mut stats,
         &salvage_staged,
         &sidecars,
-        &snapshot_bases,
+        &mut snapshot_bases,
     )?;
     Ok(stats)
 }
@@ -5392,6 +5800,16 @@ impl<W: Write> Inbound<'_, W> {
             },
             FileKind::Symlink => self.target.symlink(&row).map(|()| Decision::Skip),
             FileKind::Regular => self.target.identity(&row).and_then(|identity| {
+                // A corrupt carry held beside the path under this snapshot
+                // key (C14): the store is skipped, nothing read (R25).
+                if let Some((snapshot_key, _)) = &snapshot {
+                    if let Some(beside) = self.corrupt_beside_held(&row, snapshot_key)? {
+                        self.stats.reused += 1;
+                        counters::bump(Counter::DestSqliteCorruptBeside);
+                        self.corrupt_applied(&row.rel_path, beside);
+                        return Ok(Decision::Skip);
+                    }
+                }
                 if let Some(identity) = &identity {
                     if let Some((snapshot_key, _)) = &snapshot {
                         if self.store.output_matches(snapshot_key, identity)? {
@@ -5572,6 +5990,18 @@ impl<W: Write> Inbound<'_, W> {
         if self.snapshot_bases.insert(rel_path.to_vec()) {
             self.stats.sqlite_snapshots.push(rel_path.to_vec());
         }
+    }
+
+    /// A corrupt database at `rel_path` is carried beside its path as
+    /// `beside` (C14, RUL-14): published this session, or found held from
+    /// an earlier one. Recorded `carried-corrupt`, never a snapshot; its
+    /// sidecars are covered by it, as a snapshot covers them (the backup
+    /// read every page the pager could, the `-wal`'s frames among them).
+    fn corrupt_applied(&mut self, rel_path: &[u8], beside: Vec<u8>) {
+        self.snapshot_bases.insert(rel_path.to_vec());
+        self.stats
+            .sqlite_carried_corrupt
+            .push((rel_path.to_vec(), beside));
     }
 
     /// The source announces an entry's content as a `SQLite` snapshot of
@@ -6132,7 +6562,11 @@ impl<W: Write> Inbound<'_, W> {
                 (rel_path, snapshot, self.end_filling(filling, racy))
             }
         };
-        if snapshot && outcome.is_ok() {
+        // A corrupt snapshot was published beside the path (C14): the
+        // output to wait for is that file's, and the database is no
+        // snapshot here.
+        let corrupt = self.corrupt_published.remove(&rel_path);
+        if snapshot && outcome.is_ok() && corrupt.is_none() {
             self.snapshot_applied(&rel_path);
         }
         // Every End is answered. `held` is sent once the output's group
@@ -6142,9 +6576,13 @@ impl<W: Write> Inbound<'_, W> {
         // capture, which therefore never costs a source read again.
         match outcome {
             Ok(()) => {
-                self.pending_held.insert(rel_path, entry);
+                self.pending_held
+                    .insert(corrupt.unwrap_or(rel_path), entry);
             }
             Err(refusal) => {
+                if corrupt.is_some() {
+                    self.corrupt_withdrawn(&rel_path);
+                }
                 self.refuse(rel_path, &refusal);
                 self.release(entry);
                 write_control(self.output, &Control::Held { entry, held: false })?;
@@ -6366,11 +6804,16 @@ impl<W: Write> Inbound<'_, W> {
         };
         fault_point!(ReceiveAfterChunks);
         if snapshot {
-            if let Err(refusal) = self.verify_snapshot(&staged, &row) {
-                let _ = staged.discard();
-                return Err(refusal);
+            match self.verify_snapshot(&staged, &row) {
+                Ok(crate::provider_sqlite::Verified::Sound) => staged.mark_sqlite(),
+                Ok(crate::provider_sqlite::Verified::Corrupt) => {
+                    return self.publish_corrupt(staged, &row, (key, record, racy, root), hints);
+                }
+                Err(refusal) => {
+                    let _ = staged.discard();
+                    return Err(refusal);
+                }
             }
-            staged.mark_sqlite();
         }
         self.publish(staged, &row, (key, record, racy, root), hints, supersede)
     }
@@ -6380,9 +6823,15 @@ impl<W: Write> Inbound<'_, W> {
     /// again, as late as it can be made: one appearing after it is a stated
     /// residual), and the staged file is a sound database in journal mode
     /// DELETE whose `integrity_check` says `ok` (design section 9,
-    /// `provider_sqlite::verify_received`). A failure refuses the entry; the
-    /// caller discards the staged file.
-    fn verify_snapshot(&self, staged: &StagedFile, row: &RowSchema) -> Result<()> {
+    /// `provider_sqlite::verify_received`). A `SQLite` file that is not
+    /// sound is [`crate::provider_sqlite::Verified::Corrupt`]: the caller
+    /// lands it beside the path ([`Self::publish_corrupt`]). A failure
+    /// refuses the entry; the caller discards the staged file.
+    fn verify_snapshot(
+        &self,
+        staged: &StagedFile,
+        row: &RowSchema,
+    ) -> Result<crate::provider_sqlite::Verified> {
         if self.target.sqlite_sidecars_present(&row.rel_path)? {
             return Err(BulkloadRefusal::DestinationOccupied);
         }
@@ -6391,6 +6840,70 @@ impl<W: Write> Inbound<'_, W> {
             &self.target.staged_path(&row.rel_path, staged),
             row.size,
         )
+    }
+
+    /// Land a corrupt snapshot beside its path (C14, RUL-14: the corrupt
+    /// copies are carried as files and marked corrupt; plan of record
+    /// 2026-10-19, C4): the staged file is published as
+    /// `<db>.corrupt-<YYYYMMDD>` ([`corrupt_beside_path`]), a plain file,
+    /// never a database at the live path (not marked `sqlite`, so no sidecar
+    /// check guards it, and no superseding exchange: whatever is at the
+    /// database's own path stays as it is). Its output row is keyed on the
+    /// entry's snapshot key, so a rerun that finds the file held under that
+    /// key skips the store with nothing read ([`Self::corrupt_beside_held`]).
+    /// Recorded `carried-corrupt`; the store's sidecars are covered by it.
+    fn publish_corrupt(
+        &mut self,
+        mut staged: StagedFile,
+        row: &RowSchema,
+        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
+        hints: Vec<ChunkHint>,
+    ) -> Result<()> {
+        let beside = corrupt_beside_path(row);
+        let leaf = beside
+            .rsplit(|byte| *byte == b'/')
+            .next()
+            .unwrap_or_default();
+        if let Err(refusal) = staged.rename_leaf(leaf) {
+            let _ = staged.discard();
+            return Err(refusal);
+        }
+        let mut beside_row = row.clone();
+        beside_row.rel_path.clone_from(&beside);
+        counters::bump(Counter::DestSqliteCorruptBeside);
+        self.corrupt_published
+            .insert(row.rel_path.clone(), beside.clone());
+        self.corrupt_applied(&row.rel_path, beside);
+        self.publish(staged, &beside_row, (key, record, racy, root), hints, None)
+    }
+
+    /// A corrupt carry of `rel_path` that was recorded and then refused
+    /// before its publication was queued: not carried, and covering no
+    /// sidecar.
+    fn corrupt_withdrawn(&mut self, rel_path: &[u8]) {
+        self.stats
+            .sqlite_carried_corrupt
+            .retain(|(database, _)| database != rel_path);
+        self.snapshot_bases.remove(rel_path);
+    }
+
+    /// The corrupt carry of `row` this store already holds beside its path
+    /// (C14), when the file at [`corrupt_beside_path`] has the identity the
+    /// store recorded under `snapshot_key` when it published it: the rerun
+    /// skips the store with nothing read on the source (R25). `None`
+    /// otherwise, and the store is read again (it changed, or its carry is
+    /// gone).
+    fn corrupt_beside_held(&self, row: &RowSchema, snapshot_key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let beside = corrupt_beside_path(row);
+        let mut beside_row = row.clone();
+        beside_row.rel_path.clone_from(&beside);
+        let Some(identity) = self.target.identity(&beside_row)? else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .output_matches(snapshot_key, &identity)?
+            .then_some(beside))
     }
 
     fn end_filling(&mut self, filling: Filling, racy: bool) -> Result<()> {
@@ -6451,11 +6964,23 @@ impl<W: Write> Inbound<'_, W> {
                     );
                 }
                 if snapshot {
-                    if let Err(refusal) = self.verify_snapshot(&staging.staged, &row) {
-                        let _ = staging.staged.discard();
-                        return Err(refusal);
+                    match self.verify_snapshot(&staging.staged, &row) {
+                        Ok(crate::provider_sqlite::Verified::Sound) => {
+                            staging.staged.mark_sqlite();
+                        }
+                        Ok(crate::provider_sqlite::Verified::Corrupt) => {
+                            return self.publish_corrupt(
+                                staging.staged,
+                                &row,
+                                (key, record, racy, root),
+                                staging.hints,
+                            );
+                        }
+                        Err(refusal) => {
+                            let _ = staging.staged.discard();
+                            return Err(refusal);
+                        }
                     }
-                    staging.staged.mark_sqlite();
                 }
                 self.publish(
                     staging.staged,
