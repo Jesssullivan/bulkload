@@ -234,8 +234,9 @@ pub const fn sqlite_mode_label(mode: SqliteMode) -> &'static str {
     }
 }
 
-/// Set the process's `SQLite` slot budget (`--sqlite-slot-bytes=BYTES`,
-/// plan of record 2026-10-19, C3): the bytes of snapshot slots the source
+/// Set the process's `SQLite` slot budget (`--sqlite-slot-bytes=BYTES`).
+///
+/// Plan of record 2026-10-19, C3: the bytes of snapshot slots the source
 /// keeps at once. `copy` sets it for its in-process source half; `pull`
 /// forwards it to the remote `serve` ([`serve_flags`]).
 pub fn set_sqlite_slot_bytes(bytes: u64) {
@@ -281,10 +282,11 @@ pub fn parse_sqlite_slot_bytes(value: &str) -> Result<u64> {
         .ok_or(BulkloadRefusal::FieldDomainViolation)
 }
 
-/// The `SQLite` flags `pull` forwards to its remote `serve` so the source
-/// half runs under the same budget and wall as the verb was given: each of
-/// `--sqlite-slot-bytes` and `--sqlite-carry-wall` that is not at its
-/// default, rendered as it is parsed. Empty when both are.
+/// The `SQLite` flags `pull` forwards to its remote `serve`.
+///
+/// The source half runs under the same budget and wall as the verb was
+/// given: each of `--sqlite-slot-bytes` and `--sqlite-carry-wall` that is
+/// not at its default, rendered as it is parsed. Empty when both are.
 #[must_use]
 pub fn serve_flags() -> Vec<String> {
     let mut flags = Vec::new();
@@ -315,8 +317,7 @@ pub fn serve_flags() -> Vec<String> {
 /// other refusal is. The function stays for its callers, and for the
 /// record of what it answered.
 #[must_use]
-pub fn default_disposition(code: &str, sqlite_code: Option<i32>) -> Option<&'static str> {
-    let _ = (code, sqlite_code);
+pub const fn default_disposition(_code: &str, _sqlite_code: Option<i32>) -> Option<&'static str> {
     None
 }
 
@@ -4019,7 +4020,7 @@ fn take_snapshot(
             (
                 SlotFile {
                     file,
-                    path: slot_path.clone(),
+                    path: slot_path,
                     reserved,
                     owned: true,
                 },
@@ -4057,7 +4058,7 @@ fn take_snapshot(
                 (
                     SlotFile {
                         file,
-                        path: source.clone(),
+                        path: source,
                         reserved,
                         owned: false,
                     },
@@ -5775,6 +5776,10 @@ impl<W: Write> Inbound<'_, W> {
     /// is refused `DESTINATION_OCCUPIED` (R5): a snapshot published there
     /// could be rolled back or overlaid by it. The check reads only this
     /// side, so it is not remembered; removing the sidecar converges.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one entry's decision, from its census to its Decide, read top to bottom"
+    )]
     fn entry(&mut self, entry: u64, row: RowSchema, wal: Option<SidecarId>) -> Result<()> {
         let census_started = Instant::now();
         let snapshot_mode = self.sqlite == SqliteMode::Snapshot;

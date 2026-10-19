@@ -448,9 +448,10 @@ pub(crate) const CARRY_WALL: Duration = Duration::from_secs(30);
 /// seconds; 0 means [`CARRY_WALL`].
 static CARRY_WALL_SECS: AtomicU64 = AtomicU64::new(0);
 
-/// Set the process's carry wall (`--sqlite-carry-wall=SECONDS`, plan of
-/// record 2026-10-19, C3): the wall clock one carry backup of a store
-/// within the slot budget may take, and the base of a larger store's
+/// Set the process's carry wall (`--sqlite-carry-wall=SECONDS`).
+///
+/// Plan of record 2026-10-19, C3: the wall clock one carry backup of a
+/// store within the slot budget may take, and the base of a larger store's
 /// ([`carry_wall`]). `copy` sets it for its in-process source half; `pull`
 /// forwards it to the remote `serve`.
 pub fn set_carry_wall(wall: Duration) {
@@ -490,7 +491,7 @@ const CARRY_FLOOR_RATE: u64 = 32 * 1024 * 1024;
 /// store. OI-1003-Q16's lock stays bounded in duration: a WAL-mode source
 /// connection holds `SHARED` on the main file at most this long.
 /// Engineering default, unruled.
-pub(crate) const CARRY_WALL_MAX: Duration = Duration::from_secs(30 * 60);
+pub(crate) const CARRY_WALL_MAX: Duration = Duration::from_mins(30);
 
 /// The wall clock of one carry backup of a store whose main file and
 /// `-wal` hold `bytes`, under a slot budget of `slot_budget` bytes: the

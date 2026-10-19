@@ -1334,7 +1334,7 @@ fn p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination() {
             b"not a database!!".to_vec()
         };
         payload.extend(noise(9, 4096 - 16));
-        let source = std::thread::spawn(move || peer_sends_snapshot(peer, payload));
+        let source = std::thread::spawn(move || peer_sends_snapshot(peer, &payload));
         let mut input = ours.try_clone().unwrap();
         let mut output = ours;
         let stats = receive_with(
@@ -1377,7 +1377,7 @@ fn p82_a_non_database_sent_as_a_snapshot_is_refused_at_the_destination() {
 /// destination's `Held` is read, true or false, and the stream is ended.
 fn peer_sends_snapshot(
     mut peer: std::os::unix::net::UnixStream,
-    payload: Vec<u8>,
+    payload: &[u8],
 ) -> std::os::unix::net::UnixStream {
     {
         let Frame::Control(Control::Open { sqlite, .. }) = read_frame(&mut peer).unwrap() else {
@@ -1433,7 +1433,7 @@ fn peer_sends_snapshot(
             },
         )
         .unwrap();
-        let digest = *blake3::hash(&payload).as_bytes();
+        let digest = *blake3::hash(payload).as_bytes();
         write_data(
             &mut peer,
             &DataHeader {
@@ -1443,7 +1443,7 @@ fn peer_sends_snapshot(
                 offset: 0,
                 digest,
             },
-            &payload,
+            payload,
         )
         .unwrap();
         write_control(
@@ -2021,7 +2021,7 @@ fn a_legacy_integrity_record_does_not_stop_a_corrupt_carry() {
         meta.node.ino,
     ))
     .unwrap();
-    let stat = crate::io::sys::fstat(&std::fs::File::open(&database).unwrap()).unwrap();
+    let stat = crate::io::sys::fstat(std::fs::File::open(&database).unwrap()).unwrap();
     let row = crate::walk::row_from_stat(b"legacy.db".to_vec(), &stat);
     let key = sqlite_key(&authority, &row, None).unwrap();
     LedgerSink::with_sync(
@@ -2982,7 +2982,7 @@ fn chunked_size_fits_one_manifest_of_whole_pages() {
     ] {
         let chunk = chunked_size(size).unwrap();
         assert!(
-            chunk.is_power_of_two() && chunk % 65_536 == 0,
+            chunk.is_power_of_two() && chunk.is_multiple_of(65_536),
             "{size}: {chunk}"
         );
         assert!(size.div_ceil(chunk) <= MAX_MANIFEST_CHUNKS as u64, "{size}");
@@ -3051,7 +3051,7 @@ fn a_store_larger_than_the_slot_budget_is_carried_from_an_oversize_slot() {
     let stats = sqlite.snapshot();
     let delta = Counters::snapshot().since(before);
     assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
-    let mut snapshots = stats.sqlite_snapshots.clone();
+    let mut snapshots = stats.sqlite_snapshots;
     snapshots.sort();
     assert_eq!(snapshots, [b"large.db".to_vec(), b"small.db".to_vec()]);
     assert_eq!(delta.get(Counter::SourceSqliteOversizeSlots), 1);

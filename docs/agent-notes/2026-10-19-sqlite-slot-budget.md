@@ -20,11 +20,12 @@ writers keep writing (LIVE-08 ...)". Acceptance 1: "every refusal is typed
 and dispositioned ... `carried-as-files` counts as carried (... RUL-14 for
 the corrupt copies, which closure also marks corrupt)".
 
-Produced: PR https://github.com/Jesssullivan/bulkload/pull/278, code
-commit `77fa2ce8` (signed), this note's follow-up commit on top. Receipts
-(`cargo test -p bulkload-agent --locked`, `just rust-check`, host honey,
-head `77fa2ce8`) are in the PR body; the two heads differ only in this
-file. A parallel, uncommitted draft of chunked snapshots sits in the
+Produced: PR https://github.com/Jesssullivan/bulkload/pull/278, signed
+commits `77fa2ce8` (the change), `4b1fe938` (this note), `a8421bc5`
+(rustfmt), and the clippy-fix commit that also carries this paragraph. The
+receipts (`cargo test -p bulkload-agent --locked`, `just rust-check`, host
+honey) are in the PR body, at the PR's final head, with the `TMPDIR` they
+ran under. A parallel, uncommitted draft of chunked snapshots sits in the
 local worktree `bulkload.worktrees/sqlite-chunked-20261018` (branch
 `feat/sqlite-chunked-snapshot-20261018`, never pushed, last touched
 2026-10-18 22:42Z); this lane does not build on it and left it as it was.
@@ -74,6 +75,32 @@ local worktree `bulkload.worktrees/sqlite-chunked-20261018` (branch
   destination would refuse it `SQLITE_INTEGRITY_CHECK_FAILED` as before,
   never install it. An older source's remembered integrity records are
   ignored in snapshot mode so the 24 stores are carried on the next run.
+
+## Host-dependent test results on honey (not this change)
+
+Two existing tests pass or fail by where `TMPDIR` lives, which this lane
+found while taking receipts; neither touches the SQLite code:
+
+- `tests/estate_adopt.rs` (31 tests) runs `estate-capture` with the default
+  `--min-free-percent=25`. With `TMPDIR` on honey's `/home` (88 % used)
+  every capture refuses `DESTINATION_SPACE_INSUFFICIENT`.
+- `materialize::tests::the_ext_magic_reads_its_mount_type_by_major_and_minor`
+  writes a synthetic mountinfo whose first line is the device `253:0` as
+  xfs, then looks up `temp_dir()`'s device. honey's root filesystem (and
+  `/tmp`, `/var/tmp`) is `253:0`, so the lookup hits the xfs line and the
+  test fails; on any other device it passes. The real gate drops `TMPDIR`
+  (`nix develop --ignore-environment`), so on honey it meets this too.
+- Earlier honey lanes passed both with `TMPDIR` under `/dev/shm`, which the
+  global rule R-C856 now forbids. Per the coordinator (2026-10-19), this
+  lane ran its receipts under `/var/tmp/jess-bulkload-tests/<lane>` (root
+  device, 49 % used), which clears the floor and meets the collision. A fix
+  belongs to the owners of those tests (pass `--min-free-percent=0` as
+  `estate_carried`/`estate_move` do; key the synthetic root line off a
+  device that is not the handle's), not to this lane.
+
+Process note: one honey probe in this session ran `pgrep -f` on the lane's
+own scripts, which the repo's R-N104 ("never check whether a PID is
+alive") rules out; every later wait was on files.
 
 ## Gaps left
 
