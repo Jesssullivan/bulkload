@@ -160,32 +160,32 @@ Independent review of #291 at `d310063` (relayed by the coordinator):
 
 ## Report-only run on sting (read-only)
 
-2026-10-20 ~06:20Z, `estate-beside-retire --scan /srv/fast-local/jess/git
-.neo-20261016 neo <absent STATE>` with the honey-built agent at `b6d12e3`
-(sha256 `5356ea9b...0a35`, copied to sting, run `nice -n 19 ionice -c3`;
-no STATE made, nothing written; the same counts as the `3e44c8b` run but
-the two `.worktrees` trees). Full report:
-`/srv/fast-local/jess/bulkload/receipts/beside-retire-report-sting-20261020-b6d12e3.txt`.
+2026-10-20 ~08:30Z, `estate-beside-retire --scan /srv/fast-local/jess/git
+.neo-20261016 neo-inplace-20261016 <absent STATE>` (the SOURCE label the
+beside landings' ledgers carry) with the honey-built agent at `2064bc7`
+(sha256 `ef718f31...e7d6`, copied to sting, `nice -n 19 ionice -c3`; no
+STATE made, nothing written). Report:
+`/srv/fast-local/jess/bulkload/receipts/beside-retire-report-sting-20261020-2064bc7.txt`
+(earlier runs at `3e44c8b` and `b6d12e3` beside it, superseded).
 
-- 139 candidates (a `*.neo-20261016` directory with a live path; 24 more
-  have no live path).
-- **62 retirable, 16.8 GB allocated**: 53 standalone (16.0 GB), 7 linked
-  (0.79 GB), 2 empty (the two `oauth-mux` leftovers). Retiring them would
-  place 29,243 untracked/ignored files into their live checkouts, land
-  3,043 as `<file>.neo-20261016`, and create 10 refs under the namespace.
-- 77 refused, typed: `tracked-changes` 25 (neo's uncommitted work: what a
-  beside tree is for), `live-not-a-checkout` 22, `unreachable:logged` 11
-  (a reflog names a commit the live repository lacks; telefreeze, A-nix-src,
-  B-nixos-nix among them), `unreachable:head` 3 (DarwinNicUtil and the two
-  `l54-pr*` worktrees: their HEADs are not in sting's refs yet; a clean
-  pass of this build brings them in), `unknown-git` 5 (`modules` 2,
-  `lost-found`, `COMMIT_MSG_A/B` in `upstream/nix{,-src}`), `live-absent` 4,
-  `refs` 2, `nested` 2, `unborn`, `other-repository`, `not-a-checkout` 1
-  each.
-- The first run (`46cdaa6`) refused 57 standalone bulkload landings
-  `unknown-git:carry-config` and 9 `worktrees` (prunable copies of neo's
-  worktree administration); `067c6b0` ledgers the receipts and proves a
-  gone worktree's HEAD and reflogs instead.
+- 139 candidates (24 more `*.neo-20261016` directories have no live path).
+- **45 retirable, 4.31 GB allocated**: 38 standalone (4.09 GB), 5 linked
+  (0.22 GB), 2 empty. Retiring them writes 24 entries, all source-like (10
+  placed, 11 landed as `<file>.neo-20261016`, the rest directories), adopts
+  1,108 derived entries already equal in the live checkouts, creates 132
+  refs under the namespace and 2,873 reflog refs (`refs/neo-20261016/reflog/`),
+  and carries the objects of 1 commit the live store lacks.
+- 94 refused, typed: `live-not-a-checkout` 22, `tracked-changes` 18 (neo's
+  uncommitted work), `not-bulkload-landed` 17 (no bulkload ledger: hand
+  copies), **`derived-held` 17** (34,685 derived entries, mostly
+  `bazel-bin`, `.svelte-kit`, `.serena`, `dist`, `build`, waiting for the
+  build-output ruling), `rebuildable` 4, `live-absent` 4,
+  `unreachable:head` 3 (DarwinNicUtil, both `l54-pr*`), `refs` 3,
+  `unknown-git` 2, `nested` 2, `other-repository` 1, `not-a-checkout` 1.
+- The narrower ref set (review item 4) first refused 28 trees
+  `unreachable-remote` (`63068ab`); `2064bc7` carries a tree's every ref the
+  live repository lacks (remote-tracking ones too) under the namespace, so
+  none is dropped.
 
 ## Open
 
