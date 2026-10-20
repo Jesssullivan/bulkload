@@ -473,25 +473,6 @@ fn p90_the_gftb_shapes_adopt_and_converge_with_bulkload_verbs_only() {
     git(&world.neo("infra"), &["commit", "--quiet", "-am", "c2"]);
     settle();
     run.capture();
-    // Every seat of the worktree the first apply landed is re-stamped, its
-    // bytes unchanged, so the converge below proves each by content. Its
-    // ledger trusts an unchanged print only for a seat stamped more than the
-    // 2 s racy allowance before the ledger was recorded, and the landing
-    // wrote these seats before recording it: whether each fell inside the
-    // window rested on how long the landing took (under load some were
-    // proved by print and fewer bytes read). The mtime is set explicitly,
-    // an hour before the old one; the ctime moves with it.
-    for row in freeze(&only)
-        .iter()
-        .filter(|row| row.7 & 0o170_000 == 0o100_000)
-    {
-        let seat = only.join(&row.0);
-        let stamp = fs::symlink_metadata(&seat).unwrap().modified().unwrap();
-        fs::File::open(&seat)
-            .unwrap()
-            .set_modified(stamp - std::time::Duration::from_hours(1))
-            .unwrap();
-    }
     let untouched = fs::symlink_metadata(infra.join("run.sh")).unwrap();
     let converged = run.apply(&[]);
     assert!(converged.ok, "{}\n{}", converged.stdout, converged.stderr);
@@ -515,16 +496,16 @@ fn p90_the_gftb_shapes_adopt_and_converge_with_bulkload_verbs_only() {
     }
     // The adopted prints held, so the adopted checkouts proved by print
     // alone: the only destination bytes read are the seats of the
-    // worktree the first apply landed, each re-stamped above and so read
-    // by content.
-    let landed_seats: u64 = freeze(&only)
+    // worktree this apply first landed, all racy against its own ledger
+    // (dated before the landing's first write, however long it took).
+    let landed_racy: u64 = freeze(&only)
         .iter()
         .filter(|row| row.7 & 0o170_000 == 0o100_000)
         .map(|row| row.6)
         .sum();
     assert_eq!(
         converged.counters.get("read_dest_verify_existing_bytes"),
-        Some(&landed_seats),
+        Some(&landed_racy),
         "{:?}",
         converged.counters
     );
