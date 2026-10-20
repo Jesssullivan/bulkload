@@ -1620,27 +1620,6 @@ impl StagedFile {
         &self.file
     }
 
-    /// The same staged file, to be published at `<leaf><suffix>` beside the
-    /// leaf it was staged for (`--beside`; the plan of record 2026-10-19,
-    /// C1/C2). The temporary itself is unchanged.
-    ///
-    /// # Errors
-    /// `PATH_NOT_PORTABLE` for a name that cannot be a C string.
-    pub(crate) fn with_suffix(mut self, suffix: &[u8]) -> Result<Self> {
-        let mut leaf = self.leaf.as_bytes().to_vec();
-        leaf.extend_from_slice(suffix);
-        match cstring(&leaf) {
-            Ok(leaf) => {
-                self.leaf = leaf;
-                Ok(self)
-            }
-            Err(refusal) => {
-                let _ = self.discard();
-                Err(refusal)
-            }
-        }
-    }
-
     /// Mark the staged file as a verified `SQLite` snapshot (#218): its
     /// rename into a free leaf, or its exchange with this store's own
     /// output (OI-1003-Q146), is refused `DESTINATION_OCCUPIED` when a
@@ -1983,32 +1962,6 @@ pub(crate) fn owned_output(
     Ok(rows
         .iter()
         .any(|(_, held)| *held == recorded)
-        .then_some(OwnedOutput { identity, rows }))
-}
-
-/// [`owned_output`] for a seat's beside path (`--beside`; review of #280,
-/// finding 4): owned only through a row this store recorded for a beside
-/// output, whose key ends with `mark`. A live seat's output at that name
-/// (the source's own `x<suffix>`) shares the path, but never makes the file
-/// this seat's to replace.
-pub(crate) fn owned_beside(
-    store: &Store,
-    authority: &[u8],
-    row: &RowSchema,
-    file: &File,
-) -> Result<Option<OwnedOutput>> {
-    use crate::transfer_store::{BESIDE_KEY_MARK, BESIDE_RACY_MARK};
-    let identity =
-        StatIdentity::from_metadata(&file.metadata().refuse_at("materialize::owned_beside")?);
-    let rows = store.output_rows(authority, &row.rel_path)?;
-    let recorded = identity_bytes(&identity)?;
-    // A racy capture's beside output is owned through its marked ownership
-    // row (second review of #280, N3).
-    Ok(rows
-        .iter()
-        .any(|(key, held)| {
-            (key.ends_with(BESIDE_KEY_MARK) || key.ends_with(BESIDE_RACY_MARK)) && *held == recorded
-        })
         .then_some(OwnedOutput { identity, rows }))
 }
 

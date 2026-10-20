@@ -17,7 +17,6 @@
 
 use std::ffi::OsString;
 use std::io::Write as _;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -864,7 +863,6 @@ fn move_command(args: &[OsString]) -> Result<()> {
     // typed closure rows, and a refused settings file never holds the
     // transcripts' re-seat.
     let sessions: Option<Sessions> = if let Some(home) = &run.sessions {
-        let pass_started = now_secs();
         let (pulled, homes) = sessions_pull(&run, home);
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
@@ -877,7 +875,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
             reseat: None,
         };
         if let (true, Some(homes)) = (session_completed(&pulled), &homes) {
-            let reseated = reseat(&run, home, homes, (&plan, &corpus, &private), pass_started);
+            let reseated = reseat(&run, home, homes, (&plan, &corpus, &private));
             let ended: Result<()> = reseated.as_ref().map(drop).map_err(Clone::clone);
             note(&ended);
             reached(&mut ledger, &ledger_path, "reseat", word(&ended))?;
@@ -906,7 +904,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
         false,
     )?);
     // C11: the session transfers are rows of the same report (their
-    // `applied-beside` entries accounted, their refused paths pending
+    // consolidated entries accounted, their held paths pending
     // review, a transfer that never ran unaccounted), so the gate cannot
     // pass with agent state unaccounted.
     if let Some(sessions) = &sessions {
@@ -1154,9 +1152,6 @@ fn dest_home(run: &Move) -> Result<PathBuf> {
     )
 }
 
-/// The Codex index name.
-const STATE_DB: &str = "state_5.sqlite";
-
 /// Claude Code's user config beside `~/.claude`, and its pull's name.
 const CLAUDE_JSON: &str = ".claude.json";
 const CLAUDE_JSON_PULL: &str = "claude-json";
@@ -1307,36 +1302,6 @@ fn sessions_pull(run: &Move, home: &Path) -> (Result<()>, Option<Homes>) {
     (outcome, homes)
 }
 
-// The Codex index snapshot this pass landed beside the live index: the
-// `applied-beside` row of `state_5.sqlite` in a completed Codex transfer
-// record of this pass (started at or after `pass_started`, Unix seconds).
-fn landed_index(run: &Move, dest_codex: &Path, pass_started: u64) -> Option<PathBuf> {
-    use bulkload_agent::transfer_outcome::{self, EntryOutcome, Session};
-    let state = run.state.join("pull").join("codex");
-    let destination = transfer_outcome::stable(dest_codex);
-    transfer_outcome::records(&state)
-        .iter()
-        .filter_map(|(_, path)| transfer_outcome::read_file(path)?.ok())
-        .filter(|record| {
-            record.session == Session::Completed
-                && record.started >= pass_started
-                && record.destination == destination
-        })
-        .find_map(|record| {
-            record
-                .entries
-                .iter()
-                .find_map(|entry| match &entry.outcome {
-                    EntryOutcome::AppliedBeside { beside }
-                        if entry.rel_path == STATE_DB.as_bytes() =>
-                    {
-                        Some(dest_codex.join(std::ffi::OsStr::from_bytes(beside)))
-                    }
-                    _ => None,
-                })
-        })
-}
-
 // Whether the one-file session recorded in `state` found no file at its
 // source: it completed nothing, and its only rows are the source's absence.
 fn source_had_none(state: &Path) -> bool {
@@ -1356,12 +1321,6 @@ fn source_had_none(state: &Path) -> bool {
         })
 }
 
-fn now_secs() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_secs())
-}
-
 // Whether every session transfer completed: every path answered, refused
 // ones as typed closure rows (`ITEMS_REFUSED`), or none.
 const fn session_completed(pulled: &Result<()>) -> bool {
@@ -1369,15 +1328,13 @@ const fn session_completed(pulled: &Result<()>) -> bool {
 }
 
 // Phase 6b: `estate-reseat --lanes-from-plan` from the live home (the
-// landing) into DEST_HOME. The landed Codex index is the beside snapshot
-// `state_5.sqlite.LABEL` when the live index was kept (it had live
-// sidecars, or differed), else the index the pull landed.
+// landing) into DEST_HOME. No Codex index lands as a file (the stores are
+// the row union's), so the re-seat reads none.
 fn reseat(
     run: &Move,
     home: &Path,
     homes: &Homes,
     (plan, corpus, private): (&Path, &Path, &Path),
-    pass_started: u64,
 ) -> Result<Option<bulkload_agent::reseat::Summary>> {
     let dest_home = dest_home(run)?;
     // The homes must still be the directories the pull ran under (N1).
@@ -1436,10 +1393,8 @@ fn reseat(
             args.extend([flag.into(), listing.into_os_string()]);
         }
     }
-    match landed_index(run, &homes.codex, pass_started) {
-        Some(index) => args.extend(["--landing-codex-index".into(), index.into_os_string()]),
-        None => args.push("--no-landing-codex-index".into()),
-    }
+    // No Codex index lands as a file: the stores are the row union's.
+    args.push("--no-landing-codex-index".into());
     args.extend([
         "--codex-source-root".into(),
         codex_root.into_os_string(),

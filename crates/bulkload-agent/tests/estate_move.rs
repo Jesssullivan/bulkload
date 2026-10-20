@@ -835,6 +835,12 @@ fn sessions_are_consolidated_into_the_live_home_and_the_gate_reads_them() {
     let second = closure(&again.stdout);
     assert_eq!(second["refused_pending_review"], "1", "{}", again.stdout);
     assert_eq!(second["unaccounted"], "0", "{}", again.stdout);
+    // SPEC rule 3: no `<path>.LABEL` copy anywhere in the homes; the one
+    // there is the destination's own, untouched.
+    assert_eq!(
+        label_copies(&dst_home),
+        [format!(".claude/plugins/config.json.{LABEL}")]
+    );
     assert_eq!(
         fs::read_to_string(dst_projects.join(format!("{DEST_SID}.jsonl"))).unwrap(),
         dest_transcript
@@ -1286,6 +1292,12 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     );
     assert_eq!(fs::read(&gz).unwrap(), b"\x1f\x8b old");
     assert_eq!(fs::read(&odd).unwrap(), b"an odd name\n");
+    // SPEC rule 3: nothing lands beside a link either.
+    assert!(
+        label_copies(&dst_home).is_empty(),
+        "{:?}",
+        label_copies(&dst_home)
+    );
     // N4: the two neo sessions with no lane are typed and reviewable, the
     // one outside neo's home included (by provenance), and hold the gate.
     let totals = closure(&moved.stdout);
@@ -1634,4 +1646,83 @@ fn the_homes_plan_lists_every_file_and_writes_nothing() {
     assert_eq!(tree_files(&dst_home), before);
     assert!(!dst_claude.join("projects").exists());
     assert!(!state.join("pull").join("claude").exists());
+}
+
+/// Every name under `root` ending in `.LABEL`, the beside form (SPEC rule 3
+/// forbids it in a home).
+fn label_copies(root: &Path) -> Vec<String> {
+    let suffix = format!(".{LABEL}");
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.unwrap().path();
+            let name = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            if name.ends_with(&suffix) {
+                found.push(name);
+            }
+            if fs::symlink_metadata(&path).unwrap().is_dir() {
+                pending.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// SPEC rule 3 ("no beside copies"): `--beside` is gone from `copy` and
+/// `pull`, refused before anything is written, in either spelling.
+#[test]
+fn no_option_writes_a_label_copy_in_a_home() {
+    let base = std::env::temp_dir().join(format!("bulkload-move-nolabel-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let world = World {
+        base: fs::canonicalize(&base).unwrap(),
+    };
+    let base = &world.base;
+    let (src, dst) = (base.join("src"), base.join("dst"));
+    fs::create_dir_all(&src).unwrap();
+    fs::create_dir_all(&dst).unwrap();
+    fs::write(src.join("settings.json"), b"{\"a\": 1}\n").unwrap();
+    fs::write(dst.join("settings.json"), b"{\"b\": 2}\n").unwrap();
+    let suffix = format!(".{LABEL}");
+    for flags in [
+        vec![OsString::from("--beside"), OsString::from(&suffix)],
+        vec![OsString::from(format!("--beside={suffix}"))],
+        vec![
+            OsString::from("--consolidate"),
+            OsString::from("--beside"),
+            OsString::from(&suffix),
+        ],
+    ] {
+        let mut args = vec![OsString::from("copy")];
+        args.extend(flags);
+        args.extend([
+            src.clone().into_os_string(),
+            dst.clone().into_os_string(),
+            base.join("src-state").into_os_string(),
+            base.join("dst-state").into_os_string(),
+        ]);
+        let ran = agent(&args);
+        assert!(!ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+        assert!(
+            ran.stderr.contains("FIELD_DOMAIN_VIOLATION"),
+            "{}",
+            ran.stderr
+        );
+    }
+    assert!(label_copies(&dst).is_empty());
+    assert_eq!(
+        fs::read(dst.join("settings.json")).unwrap(),
+        b"{\"b\": 2}\n"
+    );
+    assert!(!base.join("dst-state").exists());
 }

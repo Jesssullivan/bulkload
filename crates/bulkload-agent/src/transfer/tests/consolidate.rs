@@ -172,7 +172,6 @@ fn a_differing_config_is_merged_in_place_and_nothing_lands_beside() {
             ("settings.json".to_owned(), "consolidate".to_owned()),
         ]
     );
-    assert!(stats.applied_beside.is_empty());
     // The source modified last: its model is in the file, sting's recorded.
     assert_eq!(
         std::fs::read_to_string(destination.join("settings.json")).unwrap(),

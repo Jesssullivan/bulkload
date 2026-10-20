@@ -195,6 +195,45 @@ Directories are answered `Skip`, and a planned file `Held{held:false}`, so
 the source records nothing either. A live home that does not exist yet is
 named, not made.
 
+## SPEC rule 3: beside removed (after merging main `c2da575`)
+
+Main `c2da575` carries #280 (`79a55ec`) and the ratified SPEC (#298); it
+was merged in with a signed merge commit, not rebased. SPEC rule 3 ("no
+beside copies") is served by removing `--beside` from the transfer path
+entirely, not only from the homes' default:
+- `copy`/`pull --beside SUFFIX` is gone: either spelling is refused
+  `FIELD_DOMAIN_VIOLATION` before anything is written.
+- The receive's beside machinery (beside paths, keys and targets, claims,
+  redirects, the always-beside list, `applied_beside` stats, the
+  `dest_applied_beside` counter, the store's beside key marks,
+  `materialize::owned_beside`, `StagedFile::with_suffix`) is removed. The
+  receive is pre-#280's plus #280's kept parts (the source listing, the
+  record-aligned extension pieces, the root-swap and `ELOOP` typing) plus
+  the consolidation.
+- A differing live file goes through `--consolidate`, or is held
+  `HOMES_CONSOLIDATE_UNSUPPORTED` with nothing written; without
+  `--consolidate` it is refused `DESTINATION_OCCUPIED` as before #280.
+- Kept for old records only: `EntryOutcome::AppliedBeside` still decodes
+  and stays accounted. Tag 4 of `RefusedOutput` is retired, never reused,
+  and an old record of it is a miss. Reseat's `--beside-suffix` still
+  reads copies an earlier pass left; nothing writes them now.
+- The git-side `estate-apply --beside` is lane a27c7c65's (PR B2), not
+  this lane's.
+- Test: `no_option_writes_a_label_copy_in_a_home`, plus a scan of both
+  homes for any `*.LABEL` name after the consolidated-homes and archive
+  passes.
+
+## SQLite routing (the row-union lane's requirement)
+
+The row union is `sqlite_union::consolidate(input, output, &Options)`, on
+main through branch `feat/sqlite-row-union-main-20261020`, not yet in this
+branch. When it lands, the homes pass routes each Codex store to it with
+one `--sqlite-rows serve` session per store. `state_5.sqlite` goes first,
+because the thread winners recorded there drive the rest. Each store and
+its `-wal`, `-shm` and `-journal` stay off the file path, as they already
+are here: held at the decision, before any byte is read. Their conflicts
+go to this ledger (`Ledger::connection()`).
+
 ## Known limits
 
 - An entry the source streams in place of its manifest (#77 F1, a source
@@ -227,3 +266,13 @@ Item 2, at its commit:
 | `cargo test -p bulkload-agent --lib -- consolidate::` | 17 passed |
 | `cargo test -p bulkload-proto` | 18 passed |
 | `--test refusal_taxonomy` | 5 passed |
+
+Items 1 and 3 with `--beside` removed, after the merge of main `c2da575`
+(the tested tree equals the commit that carries this note):
+
+| Check | Result |
+|---|---|
+| `cargo fmt --all -- --check` | ok |
+| `cargo clippy -p bulkload-agent --all-targets --locked -- -D warnings` | ok |
+| `cargo test -p bulkload-agent --locked` (full suite) | 1306 passed, 0 failed |
+| `cargo test -p bulkload-proto --locked` | 18 passed |

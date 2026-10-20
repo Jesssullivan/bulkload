@@ -26,10 +26,11 @@
 //! - one **covered** row per live `-wal`, `-shm` or `-journal` the source
 //!   reported beside a database carried as a snapshot: never carried, and
 //!   accounted for by its database's snapshot (#218);
-//! - one **applied-beside** row per seat `--beside SUFFIX` published,
-//!   reused or adopted beside a differing live destination file (plan of
-//!   record 2026-10-19, C1/C2): the beside path is named, and the row is
-//!   accounted (`applied-beside`, closure v5), never pending review.
+//! - one **consolidated** row per seat `--consolidate` merged into, or
+//!   found covered by, a differing live file (operator ruling 2026-10-20),
+//!   accounted. An **applied-beside** row of a record written while
+//!   `--beside` existed (#280, retired by SPEC rule 3) still decodes and
+//!   stays accounted.
 //!
 //! [`record_session`] makes the verb's S2 overlap decision before its first
 //! write (review finding 1: a refused overlap writes nothing, not even a
@@ -217,14 +218,6 @@ impl TransferRecord {
                         rel_path: path.clone(),
                         outcome: EntryOutcome::Consolidated {
                             action: action.clone(),
-                        },
-                    });
-                }
-                for (path, beside) in &stats.applied_beside {
-                    record.entries.push(Entry {
-                        rel_path: path.clone(),
-                        outcome: EntryOutcome::AppliedBeside {
-                            beside: beside.clone(),
                         },
                     });
                 }

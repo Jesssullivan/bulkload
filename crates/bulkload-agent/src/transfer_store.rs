@@ -431,11 +431,6 @@ pub enum RefusedOutput {
     /// extension is not honoured for such a file while the extension is on
     /// (it is planned once more); this one is.
     NotPrefix,
-    /// `--beside` (review of #280, finding 3): the beside path of a seat
-    /// holds a file this store does not own with other bytes than the
-    /// seat's. Recorded under the seat's beside key with that file's
-    /// identity, beside the live path's own record.
-    BesideOccupied,
     /// `--consolidate` (operator ruling 2026-10-20): the live path holds a
     /// file this seat's class has no union for (or whose union held it),
     /// with other bytes than the seat's: held
@@ -452,7 +447,6 @@ impl RefusedOutput {
             Self::Occupied => 1,
             Self::ExchangeUnsupported => 2,
             Self::NotPrefix => 3,
-            Self::BesideOccupied => 4,
             Self::ConsolidateHeld => 5,
         }
     }
@@ -462,7 +456,8 @@ impl RefusedOutput {
             1 => Some(Self::Occupied),
             2 => Some(Self::ExchangeUnsupported),
             3 => Some(Self::NotPrefix),
-            4 => Some(Self::BesideOccupied),
+            // 4 was `--beside`'s, retired with it (SPEC rule 3): never
+            // reused, and an old record of it is a miss.
             5 => Some(Self::ConsolidateHeld),
             _ => None,
         }
@@ -472,9 +467,7 @@ impl RefusedOutput {
     #[must_use]
     pub const fn refusal(self) -> BulkloadRefusal {
         match self {
-            Self::Occupied | Self::NotPrefix | Self::BesideOccupied => {
-                BulkloadRefusal::DestinationOccupied
-            }
+            Self::Occupied | Self::NotPrefix => BulkloadRefusal::DestinationOccupied,
             Self::ExchangeUnsupported => BulkloadRefusal::DestinationExchangeUnsupported,
             Self::ConsolidateHeld => BulkloadRefusal::HomesConsolidateUnsupported,
         }
@@ -2266,23 +2259,9 @@ pub(crate) fn owner_key(row_key: &[u8]) -> Option<&[u8]> {
     row_key.get(..row_key.len().checked_sub(rest.len())?)
 }
 
-/// The mark every beside row's key ends with (review of #280, finding 4):
-/// a seat's beside path may be the live path of another source seat (the
-/// source holds `x` and `x<suffix>`), whose rows share the path's prefix.
-/// Only a marked row makes a file at a beside path that seat's own.
-pub(crate) const BESIDE_KEY_MARK: &[u8] = b"\0bulkload.beside.v1";
-
-/// The mark of the ownership row a racy capture's beside output gets
-/// (second review of #280, N3): the beside key with this mark in place of
-/// [`BESIDE_KEY_MARK`], in `outputs`. No reuse lookup ever asks for that
-/// key, so it is never a reuse key (#86), but it makes the output that
-/// seat's own, so a later pass supersedes it instead of refusing it as a
-/// stranger's.
-pub(crate) const BESIDE_RACY_MARK: &[u8] = b"\0bulkload.beside-racy.v1";
-
 /// Write an output's row inside the caller's transaction: its reuse row
 /// under its key, or, for a racy capture's output, its path's ownership row
-/// alone (and, for a beside output, its marked ownership row, N3).
+/// alone.
 fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
     if let Some(proof) = &output.extended {
         // M2r2 A-103: the prefix the extension proved, and what it made;
@@ -2313,16 +2292,6 @@ fn row_in(conn: &rusqlite::Connection, output: &OutputRecord) -> Result<()> {
         // seat, so it is never a reuse key.
         if let Some(owner) = owner_key(&output.key) {
             own_in(conn, owner, &output.identity)?;
-        }
-        if let Some(seat) = output.key.strip_suffix(BESIDE_KEY_MARK) {
-            let mut owner = seat.to_vec();
-            owner.extend_from_slice(BESIDE_RACY_MARK);
-            conn.execute(
-                "INSERT INTO outputs VALUES (?1, ?2)
-                 ON CONFLICT(key) DO UPDATE SET identity=excluded.identity",
-                (&owner, identity_bytes(&output.identity)?),
-            )
-            .map_err(sqlite_error)?;
         }
         return Ok(());
     }
