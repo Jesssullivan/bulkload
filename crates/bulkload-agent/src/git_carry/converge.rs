@@ -548,11 +548,12 @@ fn census(worktree: &Path, rows: &[crate::RowSchema]) -> Result<Vec<SeatPrint>> 
 /// 20.6).
 ///
 /// `started_ns` is the landing's racy instant, taken before its first
-/// write (C03): every seat the landing wrote is stamped at or after it, so
-/// none is trusted by its print until a later pass has read it by content
-/// and recorded it again. An instant taken after the writes would let a
-/// seat an operator rewrote between bulkload's write and this record's
-/// print pass as bulkload's own once the landing took longer than
+/// write (C03, the racy-capture row of the 2026-10-19 reset review's
+/// register; "C03" below): every seat the landing wrote is stamped at or
+/// after it, so none is trusted by its print until a later pass has read
+/// it by content and recorded it again. An instant taken after the writes
+/// would let a seat an operator rewrote between bulkload's write and this
+/// record's print pass as bulkload's own once the landing took longer than
 /// [`super::RACY_GRANULARITY_NS`].
 #[allow(clippy::too_many_arguments)]
 pub(super) fn record_landing(
