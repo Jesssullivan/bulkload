@@ -793,7 +793,6 @@ pub fn reseat(
         let landed = options.landed_codex(&rel);
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
-            .with_kept_suffix(options.beside_suffix.as_deref())
             .with_rebind(&options.rebind)
             .with_beside(
                 options
@@ -1853,7 +1852,6 @@ fn reseat_unindexed(
         }
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
-            .with_kept_suffix(options.beside_suffix.as_deref())
             .with_rebind(&options.rebind)
             .with_beside(
                 options

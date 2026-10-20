@@ -79,6 +79,8 @@ const CHUNK: usize = 1024 * 1024;
 const LINE_LIMIT: usize = 512 * 1024 * 1024;
 /// The temporary's suffix; nothing else names a file this way.
 const TEMP_SUFFIX: &str = ".bulkload-reseat";
+/// A written A-106 copy held for review ([`held_name`]).
+const HELD_SUFFIX: &str = ".bulkload-held";
 
 /// What one placement did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,9 +127,11 @@ pub enum Outcome {
     /// was written in the window), and the copy that stood at the live name
     /// had been written since it was staged (a destination writer appended
     /// through the live name): that copy may hold the writer's bytes, so it
-    /// is never removed. It is published create-only beside the live name
-    /// and held for review (merge-gate review of #280, 2026-10-19).
-    KeptAside,
+    /// is never removed, and nothing is set aside or written beside the live
+    /// name (SPEC #298, ratified 2026-10-20). It stays under its private
+    /// held name ([`held_name`]), typed and listed, and every later pass at
+    /// this destination is held the same way until it is resolved.
+    HeldWritten,
     /// This ledger's placement of the same bytes from the landed file
     /// under an old landing root, re-bound to the new one
     /// (`--rebind-landing`): nothing written.
@@ -162,7 +166,7 @@ impl Outcome {
             Self::Held => "held",
             Self::Rebound => "rebound",
             Self::ReplacedArchived => "replaced-archived",
-            Self::KeptAside => "kept-aside",
+            Self::HeldWritten => "held-written",
         }
     }
 
@@ -197,7 +201,7 @@ impl Outcome {
             Self::DestAhead | Self::Continued { .. } | Self::Removed => {
                 Some(BulkloadRefusal::ReseatDestContinued)
             }
-            Self::Occupied | Self::KeptAside => Some(BulkloadRefusal::DestinationOccupied),
+            Self::Occupied | Self::HeldWritten => Some(BulkloadRefusal::DestinationOccupied),
             Self::Rewritten => Some(BulkloadRefusal::ReseatSourceRewritten),
             Self::LandingNotRegular | Self::Unreadable => {
                 Some(BulkloadRefusal::ReseatUnreadableForm)
@@ -415,12 +419,6 @@ pub struct Placer<'a> {
     /// source, and once its whole bytes are at `<name>` it is removed, so
     /// one copy of them stays. `--undo` puts it back.
     pub beside: Option<&'a str>,
-    /// The suffix a copy kept aside is published under
-    /// ([`Outcome::KeptAside`]): the run's beside suffix, else
-    /// `.bulkload-kept`. Where that name is taken (the source's copy the
-    /// pull landed beside the same live name, not yet consumed) the copy
-    /// falls to `<name><suffix>.1`, `.2`, ...
-    pub kept_suffix: Option<&'a str>,
 }
 
 impl<'a> Placer<'a> {
@@ -433,16 +431,6 @@ impl<'a> Placer<'a> {
             rebind: &[],
             archived: &[],
             beside: None,
-            kept_suffix: None,
-        }
-    }
-
-    /// The same placer, keeping a written copy aside under `suffix`.
-    #[must_use]
-    pub const fn with_kept_suffix(self, kept_suffix: Option<&'a str>) -> Self {
-        Self {
-            kept_suffix,
-            ..self
         }
     }
 
@@ -1092,6 +1080,21 @@ pub(super) fn c_name(name: &std::ffi::OsStr) -> Result<CString> {
     crate::io::c_name(name.as_bytes()).map_err(|_| BulkloadRefusal::PathNotPortable)
 }
 
+/// The private name a written A-106 copy is held under
+/// ([`Outcome::HeldWritten`]): `.<name>.<token>.bulkload-held`, never a
+/// temporary (no pass clears it) and never a beside name.
+#[must_use]
+pub fn held_name(name: &std::ffi::OsStr, token: &str) -> std::ffi::OsString {
+    let mut held = std::ffi::OsString::from(".");
+    held.push(name);
+    if !token.is_empty() {
+        held.push(".");
+        held.push(token);
+    }
+    held.push(HELD_SUFFIX);
+    held
+}
+
 /// The temporary beside `name`: `.<name>.<token>.bulkload-reseat`, or the
 /// shared `.<name>.bulkload-reseat` of a version 2 ledger (empty token).
 #[must_use]
@@ -1286,6 +1289,11 @@ impl Placer<'_> {
             Some(meta) if meta.is_file() => Identity::of(&meta),
             _ => return done(Outcome::LandingNotRegular),
         };
+        // A written copy held here on an earlier pass: held again, nothing
+        // written, until it is resolved.
+        if lstat(&dest.with_file_name(held_name(name, self.ledger.temp_token())))?.is_some() {
+            return done(Outcome::HeldWritten);
+        }
         let mut row = self.ledger.placement(&dest)?;
         if row
             .as_ref()
@@ -1432,30 +1440,20 @@ impl Site<'_> {
         c_name(temp_name(self.name, self.placer.ledger.temp_token()).as_os_str())
     }
 
-    /// Publish the temporary `temp` create-only beside the destination, as
-    /// `<name><suffix>`, else `<name><suffix>.<n>` (n up to 64), never
-    /// replacing anything ([`Outcome::KeptAside`]). With every name taken
-    /// the temporary is left where it is, named on the error, never
-    /// removed.
-    fn keep_aside(&self, temp: &CString) -> Result<()> {
-        let suffix = self.placer.kept_suffix.unwrap_or(".bulkload-kept");
-        for n in 0..=64_u32 {
-            let mut name = self.name.to_os_string();
-            name.push(suffix);
-            if n > 0 {
-                name.push(format!(".{n}"));
+    /// Hold the written temporary `temp` ([`Outcome::HeldWritten`]): it
+    /// moves, create-only, to its private held name ([`held_name`]), which no
+    /// pass clears; nothing is published beside the live name. A held name
+    /// already there is kept and the temporary stays where it is, named on
+    /// the refusal, never removed.
+    fn hold_written(&self, temp: &CString) -> Result<()> {
+        let held = c_name(&held_name(self.name, self.placer.ledger.temp_token()))?;
+        match crate::io::publish_noreplace(self.directory, temp, &held) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(BulkloadRefusal::DestinationOccupied)
             }
-            let target = c_name(&name)?;
-            match crate::io::publish_noreplace(self.directory, temp, &target) {
-                Ok(_) => {
-                    counters::bump(Counter::ReseatKeptAside);
-                    return Ok(());
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error).refuse_at("reseat::place::keep_aside"),
-            }
+            Err(error) => Err(error).refuse_at("reseat::place::hold_written"),
         }
-        Err(BulkloadRefusal::DestinationOccupied)
     }
 
     /// Remove a temporary a crashed pass left before it published (no
@@ -1873,18 +1871,18 @@ impl Site<'_> {
             // Our copy stood at the live name between the two exchanges: a
             // writer that opened the live name then appended to it. A copy
             // written since it was staged may hold the only copy of those
-            // bytes, so it is never removed: kept aside, create-only
-            // (merge-gate review of #280). An unwritten copy is the
-            // landing's bytes and is removed.
+            // bytes, so it is never removed: held typed under its private
+            // held name, nothing beside the live name (SPEC #298). An
+            // unwritten copy is the landing's bytes and is removed.
             let written = lstat(&self.temp())?
                 .is_some_and(|meta| meta.is_file() && Identity::of(&meta) != copy);
             if written {
-                self.keep_aside(&temp)?;
+                self.hold_written(&temp)?;
                 crate::io::durable::seal_dir(self.directory)
                     .refuse_at("reseat::place::replace_seal")?;
                 undo_intent()?;
                 return Ok(Placed {
-                    outcome: Outcome::KeptAside,
+                    outcome: Outcome::HeldWritten,
                     scanner: None,
                 });
             }

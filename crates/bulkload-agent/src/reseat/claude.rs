@@ -798,7 +798,6 @@ pub fn reseat(
     // archive link is consumed by its A-106 replacement (#280 finding 9).
     let placer = Placer::new(ledger, &root)
         .with_archived(&options.replace_archived)
-        .with_kept_suffix(options.beside_suffix.as_deref())
         .with_rebind(&options.rebind)
         .with_beside(options.beside_suffix.as_deref().filter(|_| live));
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();

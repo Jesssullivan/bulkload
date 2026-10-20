@@ -513,13 +513,16 @@ fn a106_a_target_written_under_the_swap_is_put_back() {
 /// destination writer appends through the live name while the landed copy
 /// stands there, and the archive target is written in the same window, so
 /// the swap is put back. The copy then holds the writer's line, the only
-/// copy of it: it is never removed, but kept aside create-only beside the
-/// live name, `kept-aside`, held for review. The link is back as it was.
+/// copy of it: it is never removed, and under SPEC #298 (ratified
+/// 2026-10-20) nothing is set aside beside the live name either. It is held
+/// typed, `held-written`, under its private held name; the next pass is held
+/// the same way with nothing written; `reseat_kept_aside` stays 0.
 #[test]
-fn a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back() {
+fn a106_a_copy_written_through_the_live_name_is_held_typed_never_set_aside() {
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let before = crate::counters::Counters::snapshot();
     let world = World::new();
     let archive = world.archive();
     let cwd = "/Users/jess/git/lab";
@@ -543,7 +546,7 @@ fn a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back() {
     let options = world.replacing();
     let (summary, lines, _) = run(&options);
     set_replace_hook(None);
-    assert_eq!(summary.files_of("claude", "kept-aside"), 1, "{lines:?}");
+    assert_eq!(summary.files_of("claude", "held-written"), 1, "{lines:?}");
     assert_eq!(
         summary.files_of("claude", "replaced-archived"),
         0,
@@ -551,17 +554,49 @@ fn a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back() {
     );
     let dest = world.dest_transcript(SID);
     assert_eq!(fs::read_link(&dest).unwrap(), target, "the link is back");
-    let mut kept = dest.as_os_str().to_owned();
-    kept.push(".bulkload-kept");
-    let kept = PathBuf::from(kept);
+    let dir = dest.parent().unwrap();
+    let names = |dir: &Path| -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    };
+    let listed = names(dir);
+    let held: Vec<&String> = listed
+        .iter()
+        .filter(|name| name.ends_with(".bulkload-held"))
+        .collect();
+    assert_eq!(held.len(), 1, "{listed:?}");
+    assert!(
+        !listed
+            .iter()
+            .any(|name| name.ends_with(".bulkload-kept") || name.ends_with(".bulkload-reseat")),
+        "nothing set aside beside the live name: {listed:?}"
+    );
     let mut want = neo;
     want.extend_from_slice(b"{\"sting\":\"next turn\"}\n");
     assert_eq!(
-        fs::read(&kept).unwrap(),
+        fs::read(dir.join(held[0])).unwrap(),
         want,
-        "the writer's line survives in the copy kept aside"
+        "the writer's line survives in the held copy"
     );
     assert!(fs::read(&target).unwrap().ends_with(b"{\"live\":1}\n"));
     let ledger = Ledger::open_read_only(&options.state).unwrap().unwrap();
     assert!(ledger.regular(&dest).unwrap().is_none());
+    drop(ledger);
+    // The next pass: held again, nothing written.
+    let target_bytes = fs::read(&target).unwrap();
+    let (again, lines, _) = run(&options);
+    assert_eq!(again.files_of("claude", "held-written"), 1, "{lines:?}");
+    assert_eq!(names(dir), listed, "nothing new beside the live name");
+    assert_eq!(fs::read(&target).unwrap(), target_bytes);
+    assert_eq!(
+        crate::counters::Counters::snapshot()
+            .since(before)
+            .get(crate::counters::Counter::ReseatKeptAside),
+        0,
+        "nothing is ever kept aside"
+    );
 }

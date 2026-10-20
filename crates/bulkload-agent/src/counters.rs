@@ -391,10 +391,10 @@ counters! {
     // removed once an A-106 replacement placed their whole bytes at
     // `<name>`: one copy of the source's bytes (#280 finding 9).
     ReseatBesideConsumed => "reseat_beside_consumed",
-    // A-106 swap-backs whose copy a destination writer wrote into was kept
-    // aside under a beside name (unique bytes held nowhere else): the one
-    // beside a re-seat ever makes, typed `kept-aside` and held for review
-    // (operator ruling 2026-10-20, "no duplicated besides").
+    // Copies a re-seat set aside beside a live name. Always 0: under SPEC
+    // #298 (ratified 2026-10-20) nothing is kept aside; a written A-106
+    // copy is held typed (`held-written`) under its private held name.
+    // Kept only as that assertion.
     ReseatKeptAside => "reseat_kept_aside",
     // Bounded starvation (M2 item 3): a process at background priority
     // whose counters did not move for `--escalate-after` seconds moved its
