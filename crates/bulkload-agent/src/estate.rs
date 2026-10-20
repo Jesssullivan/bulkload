@@ -285,8 +285,9 @@ struct Completion {
     reuse_unavailable: Option<&'static str>,
     /// Receipt lines, one per nest, already naming any carrying item.
     nested: Vec<String>,
-    /// An apply's ref and seat custody counts (estate converge), as
-    /// `key=value` words carried in the receipt's reason.
+    /// An apply's ref and seat custody counts (estate converge), or a
+    /// deferred capture's rewrite words ([`git_carry::StoreRewrite::words`]),
+    /// as `key=value` words carried in the receipt's reason.
     custody: Option<String>,
 }
 
@@ -310,11 +311,18 @@ impl Completion {
     // and a Git child failed on it. Drift custody, never a refusal: no record
     // is written, so any retained capture stays exactly what it was, and the
     // next pass captures the rewritten store. The receipt names no bytes: the
-    // pass's reads are in the process counters, not in a capture.
-    fn deferred(drift: &git_carry::CaptureDrift, nested: Vec<String>) -> Self {
+    // pass's reads are in the process counters, not in a capture. Its reason
+    // names the child refusal the rewrite absorbed and how many pack entries
+    // moved (`rewrite_cause=`, `rewrite_changed=`; p34, 2026-10-19).
+    fn deferred(
+        drift: &git_carry::CaptureDrift,
+        rewrite: &git_carry::StoreRewrite,
+        nested: Vec<String>,
+    ) -> Self {
         Self {
             drift: drift.lines(),
             nested,
+            custody: Some(rewrite.words()),
             ..Self::clean("deferred-with-drift")
         }
     }
@@ -1584,8 +1592,8 @@ fn capture_item(
         },
     )? {
         git_carry::Exported::Captured(export) => *export,
-        git_carry::Exported::ObjectStoreRewritten(drift) => {
-            return Ok(Completion::deferred(&drift, nested))
+        git_carry::Exported::ObjectStoreRewritten { drift, rewrite } => {
+            return Ok(Completion::deferred(&drift, &rewrite, nested))
         }
     };
     // The export's own census must name the nests the key did: a nest that
@@ -4750,7 +4758,17 @@ mod tests {
         assert_eq!(rows.len(), 1);
         let (outcome, reason, drift, _) = rows.first().unwrap();
         assert_eq!(*outcome, "deferred-with-drift");
-        assert_eq!(reason.as_deref(), Some("drift=1"));
+        // The absorbed refusal and the pack entries that moved are named,
+        // never dropped: the bundle child's bad object, and the repack's
+        // pack written over the old one.
+        let reason = reason.as_deref().unwrap();
+        assert!(
+            reason.starts_with(
+                "drift=1 rewrite_cause=GIT_CHILD_FAILED stderr_class=bad_object rewrite_changed="
+            ),
+            "{reason}"
+        );
+        assert_ne!(reason.rsplit('=').next(), Some("0"), "{reason}");
         assert_eq!(
             *drift,
             vec!["ObjectStoreRewritten \"objects/pack\"".to_owned()]

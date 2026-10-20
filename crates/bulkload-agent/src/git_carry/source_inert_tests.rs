@@ -293,7 +293,9 @@ fn captured(source: &Path, capture: &Path, prior: Option<(&Export, bool)>) -> Ex
             assert!(export.drift.is_empty(), "{:?}", export.drift);
             *export
         }
-        Exported::ObjectStoreRewritten(drift) => panic!("{drift:?}"),
+        // p34 under load (2026-10-19): the failing child and the moved
+        // entries, so the panic says what rewrote the store.
+        Exported::ObjectStoreRewritten { drift, rewrite } => panic!("{drift:?} {rewrite:?}"),
     }
 }
 
@@ -864,5 +866,64 @@ fn s4_a_bare_capture_never_lays_down_a_workspace() {
             "{name}"
         );
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// p34 under load (2026-10-19): the rewrite branch compared two listings
+/// and kept nothing of either. It now names every entry that moved, with
+/// its inode and size before and after, store by store.
+#[test]
+fn the_rewrite_names_every_pack_entry_that_moved() {
+    use std::collections::BTreeMap;
+    let store = PathBuf::from("/s");
+    let entries = |rows: &[(&str, u64, u64)]| -> BTreeMap<Vec<u8>, (u64, u64)> {
+        rows.iter()
+            .map(|(name, ino, size)| (name.as_bytes().to_vec(), (*ino, *size)))
+            .collect()
+    };
+    let before = vec![(
+        store.clone(),
+        entries(&[("kept.pack", 1, 10), ("gone.pack", 2, 20), ("moved.pack", 3, 30)]),
+    )];
+    let after = vec![(
+        store.clone(),
+        entries(&[("kept.pack", 1, 10), ("moved.pack", 4, 30), ("new.pack", 5, 50)]),
+    )];
+    let changed = super::pack_changes(&before, &after);
+    let named: Vec<(&[u8], Option<(u64, u64)>, Option<(u64, u64)>)> = changed
+        .iter()
+        .map(|change| (change.name.as_slice(), change.before, change.after))
+        .collect();
+    assert_eq!(
+        named,
+        vec![
+            (b"gone.pack".as_slice(), Some((2, 20)), None),
+            (b"moved.pack".as_slice(), Some((3, 30)), Some((4, 30))),
+            (b"new.pack".as_slice(), None, Some((5, 50))),
+        ]
+    );
+    assert!(changed.iter().all(|change| change.store == store));
+    assert!(super::pack_changes(&before, &before).is_empty());
+}
+
+/// p34 under load (2026-10-19): an entry the listing cannot stat for any
+/// reason but its removal used to be recorded as absent, so a transient
+/// stat failure after a Git child's failure read as a rewrite and turned
+/// the failure into drift custody. It now refuses with its errno; only a
+/// removed entry is absent.
+#[test]
+fn a_pack_entry_that_cannot_be_stated_refuses_and_never_reads_as_a_rewrite() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = fresh("unstatable");
+    let pack = root.join("objects/pack");
+    fs::create_dir_all(&pack).unwrap();
+    fs::write(pack.join("pack-a.pack"), b"pack").unwrap();
+    let stores = vec![root.join("objects")];
+    assert_eq!(super::pack_listing(&stores).unwrap()[0].1.len(), 1);
+    // Readable, not searchable: the listing reads the name, the stat fails.
+    fs::set_permissions(&pack, fs::Permissions::from_mode(0o400)).unwrap();
+    let listed = super::pack_listing(&stores);
+    fs::set_permissions(&pack, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(listed, Err(BulkloadRefusal::Io(Some(libc::EACCES))));
     fs::remove_dir_all(root).unwrap();
 }

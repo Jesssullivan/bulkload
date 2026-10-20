@@ -673,7 +673,8 @@ BOUNDARIES:
     pass, so that a Git child reading through it fails, is drift custody too:
     outcome=deferred-with-drift with one ObjectStoreRewritten objects/pack
     row, no capture record, and the next estate-capture captures the
-    rewritten store.
+    rewritten store; its reason names the failing child's refusal and how
+    many pack entries moved (rewrite_cause=..., rewrite_changed=N).
     A bundle that drifted under its export carries an in-band marker, and
     estate-apply and every git-restore/import/attach/repair verb refuse it
     with CAPTURE_DRIFTED; run estate-capture again first. An agent
