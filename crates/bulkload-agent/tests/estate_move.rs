@@ -195,6 +195,18 @@ fn state_line(stdout: &str, verb: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+// The `estate-move closure` line's `key=value` words.
+fn closure(stdout: &str) -> BTreeMap<String, String> {
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("estate-move closure "))
+        .unwrap_or_else(|| panic!("no closure line:\n{stdout}"));
+    line.split(' ')
+        .filter_map(|word| word.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned()))
+        .collect()
+}
+
 // Every path under `root`, relative, sorted (directories too).
 fn tree(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();

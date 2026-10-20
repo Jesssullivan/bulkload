@@ -197,8 +197,11 @@ pub fn ledger(rel: &[&OsStr]) -> bool {
         }
         // The session pulls' provenance listings (`pull/claude.listing`,
         // `pull/codex.listing`): the paths each pull carried, by name.
-        ["pull"] if name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && ext == "listing") => true,
-        ["pull"] => pending(name),
+        ["pull"] => {
+            name.rsplit_once('.')
+                .is_some_and(|(stem, ext)| !stem.is_empty() && ext == "listing")
+                || pending(name)
+        }
         [home, ..] if STORE_HOMES.contains(home) => STORE_LEDGERS.contains(&name),
         _ => false,
     }
