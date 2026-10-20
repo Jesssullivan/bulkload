@@ -127,7 +127,42 @@ the first mapped pass on sting worse for sessions sting resumed:
 
 ## Receipt
 
-RECEIPT_PLACEHOLDER
+Host `honey`, the code of `8ce9d42` (the pushed feature commit; the worktree
+`~/git-build/pull-map-prefix-20261019` is `a1c1cc1` with the lane's files,
+byte-identical to `8ce9d42`'s tree). `CARGO_HOME` and `CARGO_TARGET_DIR`
+under `~/git-build/pull-map-prefix-20261019-cargo/`,
+`TMPDIR=/var/tmp/jess-bulkload-tests/pull-map-prefix-20261019`, every
+command `nice -n 19 nix develop --no-write-lock-file --ignore-environment
+.#default`, `CARGO_BUILD_JOBS=4`, `RUST_TEST_THREADS=4`, debuginfo off.
+Another session's merge gate held honey throughout, so this lane ran
+targeted filters only, one at a time.
+
+- `cargo fmt --all -- --check`: ok. `cargo clippy -p bulkload-agent -p
+  bulkload-proto --all-targets --locked -- -D warnings`: ok.
+- Lib (`--lib`): `transfer::tests::map_prefix` 6/6, `transfer::map` 2/2,
+  `reseat::keymap` 2/2, `closure` 38/38, `transfer_outcome` 8/8,
+  `reseat::` 77/77, `transfer::tests::beside` 14/14,
+  `transfer::tests::prefix` 6/6.
+- Integration: `estate_move` 5 tests, the new
+  `sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed`
+  and the two updated session tests pass;
+  `one_pass_lands_adopts_besides_carries_and_accounts_for_every_item`
+  failed 2 of 3 runs at its `beside-converged=1` assertion (line 391) and
+  passed once. That is the listed honey load flake: a git beside-converge
+  path this lane does not touch, failing at the same line in #280's own
+  gate log at `a1c1cc1`
+  (`~/.local/state/bulkload/local-gate/a1c1cc182a35-2026-10-19T200242Z.log`).
+  `estate_reseat` 6/6, `prefix_extend_cli` 2/2, `estate_carried` 12/12,
+  `space_closure_cli` 10/10, `sqlite_carry` 3/3, `source_command_registry`
+  22/22, `estate_adopt` 40/40.
+- Fault harness (`--features fault-injection,io-trace --test
+  fault_harness`): `reseat` 23/23, `estate_converge` 23/23, `beside`
+  10/10, `sqlite_supersede` 3/3, `prefix_` 9/9, `receive_after` 6/6.
+- Not run here: the whole `cargo test -p bulkload-agent`, `just
+  rust-check` and the merge gate (`just local-gate-receipt --pr N
+  --post`), owed once honey is free; `just darwin-check` on pzm, owed
+  before merge.
+- Test scratch under `TMPDIR` removed after the runs.
 
 ## Open
 
