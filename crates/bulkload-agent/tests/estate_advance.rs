@@ -35,8 +35,12 @@
 //!   a process inside it, refuses `GIT_SWITCH_*` and lands beside.
 //! - R1 and R2 (findings 2 and 5): a process inside the beside landing
 //!   keeps it (`in-use`, tried again once it is gone); a standalone beside
-//!   checkout with a configuration entry the live repository lacks is
-//!   kept (`configuration`), never carried into the live configuration.
+//!   checkout's configuration entries and exclude patterns the live
+//!   repository lacks go in create-only, then it is retired; one whose key
+//!   the live configuration holds with another value is kept
+//!   (`configuration:<key>`).
+//! - A13 (C19): a process inside the live checkout refuses the advance
+//!   `GIT_ADVANCE_IN_USE`, no beside written; the next pass advances.
 //! - A7: ignored files present: kept; a captured ignored file of another
 //!   content at the same path lands as a file-level beside `<path>SUFFIX`
 //!   and the beside tree is still retired (the coordinator's decision).
@@ -1128,43 +1132,133 @@ fn r1_a_beside_landing_in_use_is_kept_then_retired_once_free() {
     );
 }
 
-/// R2 (review of #289, finding 5): a standalone beside checkout whose
-/// configuration holds an entry the live repository lacks (a branch
-/// upstream, the softconnect shape) is kept (`configuration`), and the live
-/// configuration is never touched.
+/// R2 (review of #289, finding 5; the coordinator's decision of
+/// 2026-10-20): a standalone beside checkout whose configuration holds
+/// entries whose key the live repository lacks (branch upstreams, the
+/// softconnect shape) and an `info/exclude` pattern the live exclude lacks:
+/// the live repository takes them create-only (counted in the receipt),
+/// and the beside is then retired. One whose key the live configuration
+/// holds with another value keeps the beside (`configuration:<key>`), the
+/// live configuration untouched.
 #[test]
-fn r2_a_standalone_beside_with_its_own_configuration_is_kept() {
+fn r2_a_standalone_beside_carries_absent_configuration_or_is_kept() {
+    for differs in [false, true] {
+        let world = World::new();
+        // Neo's own exclude pattern, which sting's copy (made earlier) lacks;
+        // the beside, a copy of neo, holds it as the capture does.
+        fs::create_dir_all(world.neo().join(".git/info")).unwrap();
+        fs::write(world.neo().join(".git/info/exclude"), b"*.scratch\n").unwrap();
+        world.capture();
+        let copied = Command::new("cp")
+            .arg("-a")
+            .arg(world.neo())
+            .arg(world.beside())
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        let beside = world.beside();
+        git(&beside, &["config", "branch.main.remote", "origin"]);
+        git(&beside, &["config", "branch.main.merge", "refs/heads/main"]);
+        let sting = world.sting();
+        if differs {
+            git(&sting, &["config", "branch.main.remote", "."]);
+        }
+        let ran = world.apply(&FLAGS);
+        assert_eq!(
+            receipt(&ran.stdout).0,
+            "workspace-beside",
+            "{}\n{}",
+            ran.stdout,
+            ran.stderr
+        );
+        let config = fs::read(sting.join(".git/config")).unwrap();
+        let ran = world.advance();
+        assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+        let (outcome, reason) = receipt(&ran.stdout);
+        assert_eq!(outcome, "workspace-restored", "{reason}");
+        holds_neo(&world);
+        if differs {
+            assert!(word(&reason, "advance-beside=kept"), "{reason}");
+            assert!(
+                word(
+                    &reason,
+                    "advance-beside-reason=configuration:branch.main.remote"
+                ),
+                "{reason}"
+            );
+            assert!(world.beside().join(".git").is_dir());
+            assert_eq!(
+                fs::read(sting.join(".git/config")).unwrap(),
+                config,
+                "the live configuration"
+            );
+        } else {
+            for held in [
+                "advance-beside=retired",
+                "advance-config-added=2",
+                "advance-exclude-appended=1",
+            ] {
+                assert!(word(&reason, held), "{held}: {reason}");
+            }
+            assert!(!world.beside().exists());
+            assert_eq!(
+                git(&sting, &["config", "branch.main.remote"]).trim(),
+                "origin"
+            );
+            assert_eq!(
+                git(&sting, &["config", "branch.main.merge"]).trim(),
+                "refs/heads/main"
+            );
+            assert!(fs::read_to_string(sting.join(".git/info/exclude"))
+                .unwrap()
+                .lines()
+                .any(|line| line == "*.scratch"));
+            // Created only where absent: what the live configuration held is
+            // as it was, a byte prefix of the new file.
+            assert!(fs::read(sting.join(".git/config"))
+                .unwrap()
+                .starts_with(&config));
+        }
+    }
+}
+
+/// A13 (the coordinator's decision on #289, C19): a process whose working
+/// directory is inside the live checkout refuses the advance
+/// `GIT_ADVANCE_IN_USE`, with nothing written and no beside written for that
+/// pass (one exists already); never remembered as a decision, so the next
+/// pass, the process gone, advances.
+#[test]
+fn a13_a_live_checkout_in_use_is_refused_then_advanced_once_free() {
     let world = World::new();
     world.capture();
-    let copied = Command::new("cp")
-        .arg("-a")
-        .arg(world.neo())
-        .arg(world.beside())
-        .status()
-        .unwrap();
-    assert!(copied.success());
-    git(&world.beside(), &["config", "branch.main.remote", "origin"]);
-    git(
-        &world.beside(),
-        &["config", "branch.main.merge", "refs/heads/main"],
-    );
     let ran = world.apply(&FLAGS);
-    assert_eq!(receipt(&ran.stdout).0, "workspace-beside", "{}", ran.stderr);
-    let config = fs::read(world.sting().join(".git/config")).unwrap();
+    assert_eq!(receipt(&ran.stdout).0, "workspace-beside");
+    let sting = world.sting();
+    let head = git(&sting, &["rev-parse", "HEAD"]);
+    let beside_head = identity(&world.beside().join("README"));
+    let mut child = Command::new("sleep")
+        .arg("120")
+        .current_dir(sting.join("src"))
+        .spawn()
+        .unwrap();
+    let ran = world.advance();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert!(
+        outcome.contains("GIT_ADVANCE_IN_USE") || reason.contains("GIT_ADVANCE_IN_USE"),
+        "{outcome} {reason}"
+    );
+    assert_eq!(git(&sting, &["rev-parse", "HEAD"]), head);
+    assert_eq!(identity(&world.beside().join("README")), beside_head);
+    assert!(world
+        .closure(None)
+        .stdout
+        .contains("\"refusal\":\"GIT_ADVANCE_IN_USE\""));
     let ran = world.advance();
     assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
     let (outcome, reason) = receipt(&ran.stdout);
     assert_eq!(outcome, "workspace-restored", "{reason}");
-    assert!(word(&reason, "advance-beside=kept"), "{reason}");
-    assert!(
-        word(&reason, "advance-beside-reason=configuration"),
-        "{reason}"
-    );
+    assert!(word(&reason, "advanced=1"), "{reason}");
     holds_neo(&world);
-    assert!(world.beside().join(".git").is_dir());
-    assert_eq!(
-        fs::read(world.sting().join(".git/config")).unwrap(),
-        config,
-        "the live configuration"
-    );
 }

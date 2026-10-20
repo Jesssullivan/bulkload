@@ -493,21 +493,6 @@ fn config_entries(repo: &Path) -> Result<BTreeSet<Vec<u8>>> {
         .collect())
 }
 
-// The patterns of an `info/exclude` file (no comment, no blank line).
-fn exclude_patterns(path: &Path) -> Result<BTreeSet<Vec<u8>>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(error) => return Err(crate::refuse::io(&error, SITE)),
-    };
-    Ok(bytes
-        .split(|byte| *byte == b'\n')
-        .map(<[u8]>::trim_ascii_end)
-        .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
-        .map(<[u8]>::to_vec)
-        .collect())
-}
-
 // Whether a Git operation is in progress, or a Git lock held, in the git
 // directory `dir`.
 fn operation_in(dir: &Path) -> Result<bool> {
@@ -520,46 +505,195 @@ fn operation_in(dir: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// What the live repository takes from a standalone beside checkout
+/// before the beside is retirable (the coordinator's decision on #289):
+/// configuration entries whose key the live configuration lacks, added
+/// create-only, and the `info/exclude` patterns it lacks, appended
+/// create-only by the exclude union's rule.
+#[derive(Debug, Default)]
+struct Carry {
+    config: Vec<(String, String)>,
+    exclude: Vec<Vec<u8>>,
+}
+
+/// What a retirement carried into the live repository: configuration
+/// entries added and exclude lines appended, for the receipt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Carried {
+    pub config: u64,
+    pub exclude: u64,
+}
+
+// A configuration entry's key (`key\nvalue`, or `key` alone).
+fn key_of(entry: &[u8]) -> &[u8] {
+    entry
+        .split(|byte| *byte == b'\n')
+        .next()
+        .unwrap_or_default()
+}
+
+// Whether a bulkload ledger at `common` other than an advance's of
+// `source` records its exclude (another label's workspace ledger, a
+// landing's, or a ref ledger's exclude row): that converge owns it, and an
+// append would fail its proof. An advanced checkout's exclude is never
+// proved.
+fn exclude_proved(common: &Path, source: &str) -> Result<bool> {
+    let root = common.join(landed::LEDGER_ROOT);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    for entry in entries {
+        let entry = entry.refuse_at(SITE)?;
+        if !entry.file_type().refuse_at(SITE)?.is_dir() {
+            continue;
+        }
+        let label = entry.path();
+        let advanced = entry.file_name().as_bytes() == source.as_bytes()
+            && landed::exists(&label.join(super::super::converge::advance::ADVANCED))?;
+        if !advanced && landed::exists(&label.join(landed::WORKSPACE_LANDED))? {
+            return Ok(true);
+        }
+        if landed::read::<landed::RefLedger>(&label.join(landed::REFS_LANDED))?
+            .is_some_and(|ledger| ledger.exclude.is_some())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // Why a standalone beside checkout's own Git state would be lost with it
-// (review of #289, finding 5): an operation in progress, a `modules`
-// directory, a configuration entry or an `info/exclude` pattern the live
-// repository lacks. Kept, typed, never carried into the live checkout's
-// configuration.
-fn state_differs(beside: &Path, live: &Path) -> Result<Option<&'static str>> {
+// (review of #289, finding 5), or what the live repository must take from
+// it first (the coordinator's decision on #289). Kept, typed: an operation
+// in progress (`in-progress`), a `modules` directory (`modules`), a
+// configuration entry whose key the live configuration holds with
+// another value, or one not safe to carry (`configuration:<key>`, the
+// value never named), exclude patterns no pure union carries or that
+// another converge proves (`exclude`). Otherwise the entries whose key the
+// live configuration lacks, and the patterns its exclude lacks.
+fn state_differs(
+    beside: &Path,
+    live: &Path,
+    source: &str,
+) -> Result<std::result::Result<Carry, String>> {
     let dir = beside.join(".git");
     if operation_in(&dir)? {
-        return Ok(Some("in-progress"));
+        return Ok(Err("in-progress".to_owned()));
     }
     let modules = dir.join("modules");
     if let Some(meta) = lstat(&modules)? {
         if !meta.is_dir() || fs::read_dir(&modules).refuse_at(SITE)?.next().is_some() {
-            return Ok(Some("modules"));
+            return Ok(Err("modules".to_owned()));
         }
     }
     let theirs = config_entries(live)?;
-    let machine = |entry: &[u8]| {
-        let key = entry
-            .split(|byte| *byte == b'\n')
-            .next()
-            .unwrap_or_default();
-        MACHINE_KEYS.contains(&key)
-    };
-    if config_entries(beside)?
-        .iter()
-        .any(|entry| !machine(entry) && !theirs.contains(entry))
-    {
-        return Ok(Some("configuration"));
+    let keys: BTreeSet<&[u8]> = theirs.iter().map(|entry| key_of(entry)).collect();
+    let mut carry = Carry::default();
+    for entry in config_entries(beside)? {
+        let key = key_of(&entry);
+        if MACHINE_KEYS.contains(&key) || theirs.contains(&entry) {
+            continue;
+        }
+        let kept = || Ok(Err(format!("configuration:{}", key.escape_ascii())));
+        if keys.contains(key) {
+            return kept();
+        }
+        let value = entry.get(key.len() + 1..);
+        let (Ok(name), Some(Ok(value))) =
+            (std::str::from_utf8(key), value.map(std::str::from_utf8))
+        else {
+            return kept();
+        };
+        if !super::super::safe_configuration_value(live, name, value) {
+            return kept();
+        }
+        carry.config.push((name.to_owned(), value.to_owned()));
     }
     let common = landed::worktree_git_dir(live)?
         .map(|git_dir| landed::common_dir(&git_dir))
         .transpose()?
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-    if !exclude_patterns(&dir.join("info/exclude"))?
-        .is_subset(&exclude_patterns(&common.join("info/exclude"))?)
-    {
-        return Ok(Some("exclude"));
+    let read = |path: &Path| -> Result<Vec<u8>> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(crate::refuse::io(&error, SITE)),
+        }
+    };
+    let existing = read(&common.join("info/exclude"))?;
+    match super::super::exclude_union::missing(&existing, &read(&dir.join("info/exclude"))?) {
+        Err(_) => return Ok(Err("exclude".to_owned())),
+        Ok(lines) if lines.is_empty() => {}
+        Ok(_) if exclude_proved(&common, source)? => return Ok(Err("exclude".to_owned())),
+        Ok(lines) => carry.exclude = lines,
     }
-    Ok(None)
+    Ok(Ok(carry))
+}
+
+// Carry `carry` into the live repository at `live`, create-only: each
+// configuration entry added only while its key is still absent (one that
+// appeared since with this value is held; with another, the beside is
+// kept), then the exclude patterns appended through the exclude union
+// (its lock, its STATE record `exclude_record` for `item`, its crash
+// settle). `Err` keeps the beside, with why.
+fn carry_into(
+    live: &Path,
+    carry: &Carry,
+    (exclude_record, item, beside): (&Path, &str, &Path),
+) -> Result<std::result::Result<Carried, String>> {
+    let mut carried = Carried::default();
+    for (key, value) in &carry.config {
+        let theirs = config_entries(live)?;
+        let entry = format!("{key}\n{value}").into_bytes();
+        if theirs.contains(&entry) {
+            continue;
+        }
+        if theirs.iter().any(|held| key_of(held) == key.as_bytes()) {
+            return Ok(Err(format!("configuration:{}", key.escape_default())));
+        }
+        output(git(live).args(["config", "--local", "--add", key, value]))?;
+        carried.config += 1;
+    }
+    if !carry.exclude.is_empty() {
+        let common = landed::worktree_git_dir(live)?
+            .map(|git_dir| landed::common_dir(&git_dir))
+            .transpose()?
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        let path = common.join("info/exclude");
+        let _held = super::super::exclude_union::lock(&common)?;
+        super::super::exclude_union::settle(exclude_record, &path)?;
+        let existing = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        };
+        let captured = match fs::read(beside.join(".git/info/exclude")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+        };
+        let Ok(lines) = super::super::exclude_union::missing(&existing, &captured) else {
+            return Ok(Err("exclude".to_owned()));
+        };
+        if !lines.is_empty() {
+            match super::super::exclude_union::apply(
+                (exclude_record, item),
+                &path,
+                &existing,
+                &lines,
+            ) {
+                Ok(_) => {}
+                Err(BulkloadRefusal::GitIgnorePolicyConflict) => {
+                    return Ok(Err("exclude".to_owned()))
+                }
+                Err(other) => return Err(other),
+            }
+            carried.exclude = u64::try_from(lines.len()).unwrap_or(u64::MAX);
+        }
+    }
+    Ok(Ok(carried))
 }
 
 // The refs (name to value) the live repository holds that a standalone
@@ -601,23 +735,24 @@ fn git_differs(
     live: &Path,
     admin: Option<&Path>,
     (ns, source): (&str, &str),
-) -> Result<Option<String>> {
+) -> Result<std::result::Result<Carry, String>> {
     let mut commits = Vec::new();
+    let mut carry = Carry::default();
     if let Some(admin) = admin {
         if lstat(&admin.join("locked"))?.is_some() {
-            return Ok(Some("locked".to_owned()));
+            return Ok(Err("locked".to_owned()));
         }
         if operation_in(admin)? {
-            return Ok(Some("in-progress".to_owned()));
+            return Ok(Err("in-progress".to_owned()));
         }
         let own = admin.join("refs");
         if lstat(&own)?.is_some_and(|meta| meta.is_dir()) && !walk(&own, true)?.is_empty() {
-            return Ok(Some("worktree-refs".to_owned()));
+            return Ok(Err("worktree-refs".to_owned()));
         }
         commits.extend(reflogs(&admin.join("logs"))?);
     } else {
         if super::super::converge::worktree_census(beside)?.len() > 1 {
-            return Ok(Some("worktrees".to_owned()));
+            return Ok(Err("worktrees".to_owned()));
         }
         let hooks = beside.join(".git/hooks");
         if lstat(&hooks)?.is_some_and(|meta| meta.is_dir())
@@ -625,15 +760,16 @@ fn git_differs(
                 .iter()
                 .any(|entry| !entry.meta.is_dir() && !entry.relative.ends_with(b".sample"))
         {
-            return Ok(Some("hooks".to_owned()));
+            return Ok(Err("hooks".to_owned()));
         }
         let urls = remote_urls(live)?;
         if !remote_urls(beside)?.is_subset(&urls) {
-            return Ok(Some("remotes".to_owned()));
+            return Ok(Err("remotes".to_owned()));
         }
-        if let Some(why) = state_differs(beside, live)? {
-            return Ok(Some(why.to_owned()));
-        }
+        carry = match state_differs(beside, live, source)? {
+            Ok(carry) => carry,
+            Err(why) => return Ok(Err(why)),
+        };
         let names = live_names(live, source)?;
         let all = |repo: &Path| -> Result<BTreeMap<String, String>> {
             let listed =
@@ -649,7 +785,7 @@ fn git_differs(
             output(git(beside).args(["for-each-ref", "--format=%(objectname) %(refname)"]))?;
         for line in String::from_utf8_lossy(&listed).lines() {
             let Some((value, name)) = line.split_once(' ') else {
-                return Ok(Some("unreachable".to_owned()));
+                return Ok(Err("unreachable".to_owned()));
             };
             // Provenance: held by the live repository by name and value
             // (the same capture's), else its commit must be reachable
@@ -671,7 +807,7 @@ fn git_differs(
                         .is_some_and(|values| values.iter().any(|held| held == value))
                 };
                 if !held(name) && !spaced.as_deref().is_some_and(held) {
-                    return Ok(Some(format!("refs:{name}")));
+                    return Ok(Err(format!("refs:{name}")));
                 }
             }
             // A tag is peeled by the reachability walk; a ref to a tree or
@@ -685,42 +821,42 @@ fn git_differs(
     }
     commits.sort();
     commits.dedup();
-    Ok((!reachable(live, &commits)).then(|| "unreachable".to_owned()))
+    if !reachable(live, &commits) {
+        return Ok(Err("unreachable".to_owned()));
+    }
+    Ok(Ok(carry))
 }
 
-/// Why the live tree at `live` does not equal the beside checkout at
-/// `beside` (module docs); `None` when it does.
-///
-/// `left` is what the advance left to the live tree (its own untracked
-/// files), `ns` the beside namespace and `source` the SOURCE label.
-/// Read-only.
-///
-/// # Errors
-/// Whatever reading either tree refuses.
-pub fn differs(
+// Why the live tree at `live` does not equal the beside checkout at
+// `beside` (module docs), or, when it does, what the live repository must
+// take from a standalone one first ([`Carry`]). `left` is what the advance
+// left to the live tree (its own untracked files), `ns` the beside
+// namespace and `source` the SOURCE label. Read-only.
+fn differs(
     beside: &Path,
     live: &Path,
     (left, ns, source): (&Left, &str, &str),
-) -> Result<Option<String>> {
+) -> Result<std::result::Result<Carry, String>> {
     let admin = linked_admin(beside)?;
     if let Some(admin) = &admin {
         if !admin_owned(beside, live, admin)? {
-            return Ok(Some("admin-foreign".to_owned()));
+            return Ok(Err("admin-foreign".to_owned()));
         }
     }
     if head_of(beside)?.oid != head_of(live)?.oid {
-        return Ok(Some("differs:head".to_owned()));
+        return Ok(Err("differs:head".to_owned()));
     }
     if index_digest(beside, None)? != index_digest(live, None)? {
-        return Ok(Some("differs:index".to_owned()));
+        return Ok(Err("differs:index".to_owned()));
     }
-    if let Some(why) = git_differs(beside, live, admin.as_deref(), (ns, source))? {
-        return Ok(Some(why));
-    }
+    let carry = match git_differs(beside, live, admin.as_deref(), (ns, source))? {
+        Ok(carry) => carry,
+        Err(why) => return Ok(Err(why)),
+    };
     let entries = walk(beside, false)?;
     for entry in &entries {
         if let Some(why) = entry_differs(beside, live, entry, left)? {
-            return Ok(Some(why));
+            return Ok(Err(why));
         }
     }
     let held: std::collections::BTreeSet<&[u8]> = entries
@@ -745,10 +881,10 @@ pub fn differs(
             && !left.is_file_beside(path)
             && lstat(&live.join(OsStr::from_bytes(path)))?.is_some()
         {
-            return Ok(Some(format!("extra:{}", path.escape_ascii())));
+            return Ok(Err(format!("extra:{}", path.escape_ascii())));
         }
     }
-    Ok(None)
+    Ok(Ok(carry))
 }
 
 // Whether `admin`, the administration directory a linked beside
@@ -821,19 +957,40 @@ fn rename_exclusive(from: &Path, to: &Path) -> Result<()> {
 /// Prove the beside checkout at `beside` equal to the live tree at `live`
 /// and retire it (module docs).
 ///
-/// The retirement is recorded at `record` (STATE). The caller has
-/// established the checkout is this item's landing of `capture`; `left` is
-/// what the advance left to the live tree.
+/// The retirement is recorded at `record` (STATE); `exclude_record` is the
+/// item's exclude-union record (STATE), for patterns a standalone beside
+/// carries into the live exclude. The caller has established the checkout
+/// is this item's landing of `capture`; `left` is what the advance left to
+/// the live tree. Returns what became of it and what the live repository
+/// took from it first.
 ///
 /// # Errors
-/// Whatever reading either tree, the rename, the removal or a record
-/// write refuses.
+/// Whatever reading either tree, the carry, the rename, the removal or a
+/// record write refuses.
 pub fn retire(
-    record: &Path,
+    (record, exclude_record): (&Path, &Path),
     beside: &Path,
     live: &Path,
     (item, capture): (&str, [u8; 32]),
     (left, ns, source): (&Left, &str, &str),
+) -> Result<(Retired, Carried)> {
+    let mut carried = Carried::default();
+    let retired = retire_carrying(
+        (record, exclude_record),
+        (beside, live),
+        (item, capture),
+        (left, ns, source),
+        &mut carried,
+    )?;
+    Ok((retired, carried))
+}
+
+fn retire_carrying(
+    (record, exclude_record): (&Path, &Path),
+    (beside, live): (&Path, &Path),
+    (item, capture): (&str, [u8; 32]),
+    (left, ns, source): (&Left, &str, &str),
+    carried: &mut Carried,
 ) -> Result<Retired> {
     // When the proof began, with a margin for a filesystem's coarse
     // timestamps: a file written after it has a later ctime.
@@ -845,11 +1002,18 @@ pub fn retire(
     if in_use(beside)? {
         return Ok(Retired::Kept("in-use".to_owned()));
     }
-    if let Some(why) = differs(beside, live, (left, ns, source))? {
-        return Ok(Retired::Kept(why));
-    }
+    let carry = match differs(beside, live, (left, ns, source))? {
+        Ok(carry) => carry,
+        Err(why) => return Ok(Retired::Kept(why)),
+    };
     if prints(beside, admin.as_deref())? != before {
         return Ok(Retired::Kept("raced".to_owned()));
+    }
+    // What the live repository lacks of a standalone beside's state goes
+    // in first, create-only (the coordinator's decision on #289).
+    match carry_into(live, &carry, (exclude_record, item, beside))? {
+        Ok(done) => *carried = done,
+        Err(why) => return Ok(Retired::Kept(why)),
     }
     let meta = fs::symlink_metadata(beside).refuse_at("git_carry::beside::retire")?;
     let admin_gitdir = match &admin {

@@ -1444,6 +1444,26 @@ fn an_edit_met_after_the_branch_moved_rolls_the_advance_back() {
     }
 }
 
+/// The coordinator's decision on #289 (C19): a process whose working
+/// directory is inside the live checkout refuses the advance
+/// `GIT_ADVANCE_IN_USE`, nothing written.
+#[test]
+fn an_advance_refuses_while_a_process_is_inside() {
+    let (_dir, _source, dest, staged) = advance_world();
+    let head = git_run(&dest, &["rev-parse", "HEAD"]);
+    let mut child = std::process::Command::new("sleep")
+        .arg("60")
+        .current_dir(&dest)
+        .spawn()
+        .unwrap();
+    let refused = advance_at(&staged, &dest);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(refused, Err(BulkloadRefusal::GitAdvanceInUse));
+    untouched(&dest, ("refs/heads/main", &head), "in use");
+    assert_eq!(fs::read(dest.join("f")).unwrap(), b"one\n");
+}
+
 /// Operator ruling 2026-10-19, "Switch when clean": a clean live checkout
 /// on `main`, the capture on `feature` (absent there). HEAD goes to
 /// `feature`, created create-only at the captured HEAD, with the captured

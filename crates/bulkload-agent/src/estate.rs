@@ -2507,6 +2507,14 @@ fn apply_item(
                         workspace,
                         refused,
                     )?;
+                    // A process inside the live checkout (the coordinator's
+                    // decision on #289, C19): retried by the next pass, and
+                    // no beside written while one already exists.
+                    if refused.is_advance_in_use()
+                        && fs::symlink_metadata(git_carry::beside::path(workspace, suffix)).is_ok()
+                    {
+                        return Err(refused.clone());
+                    }
                 }
                 match beside_item(&staged, &target, &landing, (state, &policy, suffix)) {
                     Ok(mut applied) => {
@@ -2929,6 +2937,7 @@ fn advanced_item(
     ),
 ) -> Result<Option<String>> {
     use git_carry::converge::advance;
+    use std::fmt::Write as _;
     let Some(workspace) = item.workspace.as_deref() else {
         return Ok(None);
     };
@@ -2972,24 +2981,47 @@ fn advanced_item(
     // A retirement put back for a transient reason before the workspace
     // step is tried again now.
     let pending = pending.filter(|done| !transient(done));
+    let mut carried = git_carry::beside::retire::Carried::default();
     let decided = match (pending, options.beside.as_deref()) {
         (Some(done), _) => Some(Some(done)),
         // The advance was begun under `--advance-ancestor`: its beside
         // landing is retired even by a rerun that finishes it without.
-        (None, Some(suffix)) if record.beside == "pending" => Some(retire_beside(
-            workspace,
-            (staged, target, landing, policy),
-            (&retire_path, identity, capture),
-            suffix,
-        )?),
+        (None, Some(suffix)) if record.beside == "pending" => Some(
+            retire_beside(
+                workspace,
+                (staged, target, landing, policy),
+                (
+                    &retire_path,
+                    &exclude_union_path(state, identity, source),
+                    identity,
+                    capture,
+                ),
+                suffix,
+            )?
+            .map(|(done, carry)| {
+                carried = carry;
+                done
+            }),
+        ),
         (None, _) => None,
     };
     if let Some(done) = decided {
         note_retired(&mut record, done.as_ref());
         advance::write_record(&record_path, &record)?;
     }
+    // What a standalone beside carried into the live repository first, created
+    // only where absent (the coordinator's decision on #289).
+    let mut carried_words = String::new();
+    for (name, count) in [
+        ("advance-config-added", carried.config),
+        ("advance-exclude-appended", carried.exclude),
+    ] {
+        if count > 0 {
+            let _ = write!(carried_words, " {name}={count}");
+        }
+    }
     Ok(Some(format!(
-        "advance-file-besides={} advance-beside={}{}{}",
+        "advance-file-besides={} advance-beside={}{}{}{carried_words}",
         record.besides,
         record.beside,
         if record.reason.is_empty() {
@@ -3079,10 +3111,15 @@ fn retire_beside(
         &git_carry::converge::Landing<'_>,
         &git_carry::converge::Policy<'_>,
     ),
-    (retire_path, identity, capture): (&Path, &str, [u8; 32]),
+    (retire_path, exclude_path, identity, capture): (&Path, &Path, &str, [u8; 32]),
     suffix: &str,
-) -> Result<Option<git_carry::beside::retire::Retired>> {
-    use git_carry::beside::retire::{self, Retired};
+) -> Result<
+    Option<(
+        git_carry::beside::retire::Retired,
+        git_carry::beside::retire::Carried,
+    )>,
+> {
+    use git_carry::beside::retire::{self, Carried, Retired};
     let beside = git_carry::beside::path(workspace, suffix);
     if fs::symlink_metadata(&beside).is_err() {
         return Ok(None);
@@ -3094,12 +3131,18 @@ fn retire_beside(
     if let Err(refusal) =
         git_carry::beside::land(staged, target, &beside_landing, policy, (&beside, false))
     {
-        return Ok(Some(Retired::Kept(format!("refused:{}", refusal.code()))));
+        return Ok(Some((
+            Retired::Kept(format!("refused:{}", refusal.code())),
+            Carried::default(),
+        )));
     }
     let owned = git_carry::beside::ledger_of(&beside, target.source)?
         .is_some_and(|ledger| ledger.item == identity && ledger.capture == capture);
     if !owned {
-        return Ok(Some(Retired::Kept("not-owned".to_owned())));
+        return Ok(Some((
+            Retired::Kept("not-owned".to_owned()),
+            Carried::default(),
+        )));
     }
     // The live checkout's own untracked files the advance left as they
     // were are never the beside landing's.
@@ -3108,7 +3151,7 @@ fn retire_beside(
         .unwrap_or_default();
     let ns = git_carry::beside::namespace(suffix)?;
     retire::retire(
-        retire_path,
+        (retire_path, exclude_path),
         &beside,
         workspace,
         (identity, capture),

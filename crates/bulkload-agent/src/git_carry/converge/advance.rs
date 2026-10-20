@@ -35,7 +35,11 @@
 //!    of the other (`GIT_ADVANCE_UNTRACKED_COLLIDES`, naming them). An
 //!    ignored entry collides only where the capture tracks the path (or
 //!    one under it); elsewhere it is left as it is;
-//! 6. under the lock, HEAD, the branch, the index entries and every proved
+//! 6. no process has its working directory or an open file inside it
+//!    (`/proc` on Linux; elsewhere unprovable, so refused:
+//!    `GIT_ADVANCE_IN_USE`, retryable; the coordinator's decision on #289,
+//!    C19: a live agent must not have files change under it);
+//! 7. under the lock, HEAD, the branch, the index entries and every proved
 //!    seat's print are as the proof found them (`GIT_ADVANCE_RACED`).
 //!
 //! Each refusal writes nothing at the live checkout; the caller lands the
@@ -282,6 +286,7 @@ fn typed(switching: bool, refusal: BulkloadRefusal) -> BulkloadRefusal {
         }
         BulkloadRefusal::GitAdvanceRaced => BulkloadRefusal::GitSwitchRaced,
         BulkloadRefusal::GitAdvanceRolledBack(paths) => BulkloadRefusal::GitSwitchRolledBack(paths),
+        BulkloadRefusal::GitAdvanceInUse => BulkloadRefusal::GitSwitchInUse,
         other => other,
     }
 }
@@ -892,7 +897,7 @@ struct Proven {
     switch: Option<Switch>,
 }
 
-// The preconditions, read-only (module docs, 1 to 5; a switch's a to f).
+// The preconditions, read-only (module docs, 1 to 6; a switch's a to f).
 fn prove(place: &Place<'_>, scratch: &Scratch, meta: &Meta) -> Result<Proven> {
     let worktree = place.worktree;
     let from = head_of(worktree)?;
@@ -958,8 +963,10 @@ fn prove(place: &Place<'_>, scratch: &Scratch, meta: &Meta) -> Result<Proven> {
     if !colliding.is_empty() {
         return Err(t(collides(&colliding)));
     }
-    if switching && !unused(worktree)? {
-        return Err(BulkloadRefusal::GitSwitchInUse);
+    // No process inside it (the ruling's condition c for a switch; the
+    // coordinator's decision on #289, C19, for an advance too).
+    if !unused(worktree)? {
+        return Err(t(BulkloadRefusal::GitAdvanceInUse));
     }
     let index = index_digest(worktree, None)?;
     if head_of(worktree)? != from {
@@ -1693,15 +1700,13 @@ pub(super) fn workspace(
     if !colliding.is_empty() {
         return Err(t(collides(&colliding)));
     }
-    if switching {
-        // The ruling's conditions e and c, under the locks: the captured
-        // HEAD reachable once the capture is in, and no process inside.
-        if !reachable_live(worktree, &proven.to.oid) {
-            return Err(BulkloadRefusal::GitSwitchUnreachable);
-        }
-        if !unused(worktree)? {
-            return Err(BulkloadRefusal::GitSwitchInUse);
-        }
+    // A switch's condition e under the locks: the captured HEAD reachable
+    // once the capture is in. And no process inside, again.
+    if switching && !reachable_live(worktree, &proven.to.oid) {
+        return Err(BulkloadRefusal::GitSwitchUnreachable);
+    }
+    if !unused(worktree)? {
+        return Err(t(BulkloadRefusal::GitAdvanceInUse));
     }
     // Planned again under the lock, from the import: an entry the live
     // checkout gained since the proof where the capture lands one is left

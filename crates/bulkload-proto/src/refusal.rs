@@ -262,6 +262,14 @@ pub enum BulkloadRefusal {
     /// line; `branch-left` or `head-left` when one was not put back), raw
     /// bytes.
     GitAdvanceRolledBack(Vec<u8>),
+    /// `--advance-ancestor` (the coordinator's decision on #289, C19: a
+    /// live agent must not have files change under it; work is topped up
+    /// as agents exit): a process has its working directory or an open
+    /// file inside the live checkout (`/proc` on Linux; elsewhere it cannot
+    /// be proved, so it is refused). Nothing is written. Retryable: a
+    /// rerun proves the item again (never remembered as a decision). The
+    /// capture lands beside it only when no beside landing exists yet.
+    GitAdvanceInUse,
     /// `--advance-ancestor`, a live checkout on another branch than the
     /// capture's (operator ruling 2026-10-19, "Switch when clean"): its
     /// index or a tracked file differs from its HEAD (a staged or unstaged
@@ -278,7 +286,7 @@ pub enum BulkloadRefusal {
     /// `--advance-ancestor`, a live checkout on another branch (condition
     /// c): a process has its working directory or an open file inside the
     /// checkout (`/proc` on Linux; elsewhere it cannot be proved, so it is
-    /// refused). Nothing is written; the capture lands beside it.
+    /// refused). Nothing is written; retryable, as `GIT_ADVANCE_IN_USE`.
     GitSwitchInUse,
     /// `--advance-ancestor`, a live checkout on another branch (condition
     /// d): the capture's branch is checked out in another worktree (or held
@@ -701,6 +709,7 @@ impl BulkloadRefusal {
             Self::GitAdvanceRaced => "GIT_ADVANCE_RACED",
             Self::GitAdvanceBesideKept(_) => "GIT_ADVANCE_BESIDE_KEPT",
             Self::GitAdvanceRolledBack(_) => "GIT_ADVANCE_ROLLED_BACK",
+            Self::GitAdvanceInUse => "GIT_ADVANCE_IN_USE",
             Self::GitSwitchNotClean => "GIT_SWITCH_NOT_CLEAN",
             Self::GitSwitchInProgress => "GIT_SWITCH_IN_PROGRESS",
             Self::GitSwitchInUse => "GIT_SWITCH_IN_USE",
@@ -823,6 +832,7 @@ impl BulkloadRefusal {
         "GIT_ADVANCE_RACED",
         "GIT_ADVANCE_BESIDE_KEPT",
         "GIT_ADVANCE_ROLLED_BACK",
+        "GIT_ADVANCE_IN_USE",
         "GIT_SWITCH_NOT_CLEAN",
         "GIT_SWITCH_IN_PROGRESS",
         "GIT_SWITCH_IN_USE",
@@ -901,6 +911,13 @@ impl BulkloadRefusal {
         Self::CODES.contains(&code)
     }
 
+    /// Whether this is `GIT_ADVANCE_IN_USE` or `GIT_SWITCH_IN_USE`: a process
+    /// inside the live checkout, retried by every pass until it is gone.
+    #[must_use]
+    pub const fn is_advance_in_use(&self) -> bool {
+        matches!(self, Self::GitAdvanceInUse | Self::GitSwitchInUse)
+    }
+
     /// Whether this is one of `estate-apply --advance-ancestor`'s refusals
     /// (operator rulings 2026-10-19, "Yes, advance those" and "Switch when
     /// clean"): a precondition, a race, or an advance rolled back. The live
@@ -918,6 +935,7 @@ impl BulkloadRefusal {
                 | Self::GitAdvanceUntrackedCollides(_)
                 | Self::GitAdvanceRaced
                 | Self::GitAdvanceRolledBack(_)
+                | Self::GitAdvanceInUse
                 | Self::GitSwitchNotClean
                 | Self::GitSwitchInProgress
                 | Self::GitSwitchInUse
@@ -1152,6 +1170,7 @@ mod tests {
             BulkloadRefusal::GitAdvanceRaced,
             BulkloadRefusal::GitAdvanceBesideKept(Vec::new()),
             BulkloadRefusal::GitAdvanceRolledBack(Vec::new()),
+            BulkloadRefusal::GitAdvanceInUse,
             BulkloadRefusal::GitSwitchNotClean,
             BulkloadRefusal::GitSwitchInProgress,
             BulkloadRefusal::GitSwitchInUse,
