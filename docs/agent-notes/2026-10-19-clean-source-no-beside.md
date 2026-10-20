@@ -133,21 +133,21 @@ One adversarial read-only review (a refuter subagent, nothing run) at
 
 ## Report-only run on sting (read-only)
 
-2026-10-20 ~05:55Z, `estate-beside-retire --scan /srv/fast-local/jess/git
-.neo-20261016 neo <absent STATE>` with the honey-built agent at `3e44c8b`
-(sha256 `813f3c98...68b1`, copied to sting, run `nice -n 19 ionice -c3`;
-no STATE made, nothing written). Full report:
-`/srv/fast-local/jess/bulkload/receipts/beside-retire-report-sting-20261020-3e44c8b.txt`.
+2026-10-20 ~06:20Z, `estate-beside-retire --scan /srv/fast-local/jess/git
+.neo-20261016 neo <absent STATE>` with the honey-built agent at `b6d12e3`
+(sha256 `5356ea9b...0a35`, copied to sting, run `nice -n 19 ionice -c3`;
+no STATE made, nothing written; the same counts as the `3e44c8b` run but
+the two `.worktrees` trees). Full report:
+`/srv/fast-local/jess/bulkload/receipts/beside-retire-report-sting-20261020-b6d12e3.txt`.
 
-- 137 candidates (a `*.neo-20261016` directory with a live path; 24 more
-  have no live path, and the `.worktrees` directories inside checkouts were
-  not yet scanned by that binary).
+- 139 candidates (a `*.neo-20261016` directory with a live path; 24 more
+  have no live path).
 - **62 retirable, 16.8 GB allocated**: 53 standalone (16.0 GB), 7 linked
   (0.79 GB), 2 empty (the two `oauth-mux` leftovers). Retiring them would
   place 29,243 untracked/ignored files into their live checkouts, land
   3,043 as `<file>.neo-20261016`, and create 10 refs under the namespace.
-- 75 refused, typed: `tracked-changes` 25 (neo's uncommitted work: what a
-  beside tree is for), `live-not-a-checkout` 20, `unreachable:logged` 11
+- 77 refused, typed: `tracked-changes` 25 (neo's uncommitted work: what a
+  beside tree is for), `live-not-a-checkout` 22, `unreachable:logged` 11
   (a reflog names a commit the live repository lacks; telefreeze, A-nix-src,
   B-nixos-nix among them), `unreachable:head` 3 (DarwinNicUtil and the two
   `l54-pr*` worktrees: their HEADs are not in sting's refs yet; a clean
