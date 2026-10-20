@@ -1195,6 +1195,10 @@ fn advance_at(staged: &super::super::StagedBundle, dest: &Path) -> Result<Applie
 /// and the index are as they were, no intent, record, ledger or lock is
 /// left.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn an_advance_whose_branch_moved_refuses_raced_with_nothing_written() {
     for stage in [
         super::super::mid_pass::Stage::AdvanceBeforeLock,
@@ -1247,6 +1251,10 @@ fn an_advance_whose_branch_moved_refuses_raced_with_nothing_written() {
 /// and index laid down, the advance record and the workspace ledger
 /// written, no repository marker set (no native ref step), no intent left.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn an_advance_lands_the_capture_on_the_live_branch() {
     let (_dir, source, dest, staged) = advance_world();
     let applied = advance_at(&staged, &dest).unwrap();
@@ -1282,6 +1290,10 @@ fn an_advance_lands_the_capture_on_the_live_branch() {
 /// HEAD after it: the branch is put back by compare-and-swap, and the
 /// advance refuses `GIT_ADVANCE_RACED` with nothing else written.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn an_advance_whose_head_switched_puts_the_branch_back() {
     let (_dir, _source, dest, staged) = advance_world();
     let main = git_run(&dest, &["rev-parse", "main"]);
@@ -1339,6 +1351,10 @@ fn untouched(dest: &Path, (branch, head): (&str, &str), what: &str) {
 /// One taken between the proof and the destination lock refuses
 /// `GIT_ADVANCE_RACED`, nothing moved either.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a_held_git_lock_refuses_the_advance_with_nothing_moved() {
     for lock in ["index.lock", "HEAD.lock"] {
         let (_dir, _source, dest, staged) = advance_world();
@@ -1382,6 +1398,10 @@ fn a_held_git_lock_refuses_the_advance_with_nothing_moved() {
 /// publish, so a live `git commit -a` cannot interleave (it refuses), and
 /// the advance lands whole.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a_commit_cannot_interleave_with_an_advance() {
     let (_dir, source, dest, staged) = advance_world();
     let at = dest.clone();
@@ -1414,6 +1434,10 @@ fn a_commit_cannot_interleave_with_an_advance() {
 /// as it is, `GIT_ADVANCE_ROLLED_BACK` naming it. Never HEAD advanced over
 /// the old index.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn an_edit_met_after_the_branch_moved_rolls_the_advance_back() {
     let (_dir, _source, dest, staged) = advance_world();
     let head = git_run(&dest, &["rev-parse", "HEAD"]);
@@ -1444,6 +1468,27 @@ fn an_edit_met_after_the_branch_moved_rolls_the_advance_back() {
     }
 }
 
+/// Off Linux nothing proves that no process is inside the live checkout,
+/// so every advance (and switch) refuses `GIT_ADVANCE_IN_USE`
+/// (`GIT_SWITCH_IN_USE`), nothing written (operator ruling 2026-10-19:
+/// "on Darwin refuse unless proven").
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn an_advance_is_refused_in_use_where_nothing_proves_no_process() {
+    let (_dir, _source, dest, staged) = advance_world();
+    let head = git_run(&dest, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        advance_at(&staged, &dest),
+        Err(BulkloadRefusal::GitAdvanceInUse)
+    );
+    untouched(&dest, ("refs/heads/main", &head), "unproven");
+    let (_dir, _source, dest, staged) = world_of(true);
+    assert_eq!(
+        advance_at(&staged, &dest),
+        Err(BulkloadRefusal::GitSwitchInUse)
+    );
+}
+
 /// The coordinator's decision on #289 (C19): a process whose working
 /// directory is inside the live checkout refuses the advance
 /// `GIT_ADVANCE_IN_USE`, nothing written.
@@ -1469,6 +1514,10 @@ fn an_advance_refuses_while_a_process_is_inside() {
 /// `feature`, created create-only at the captured HEAD, with the captured
 /// seats and index; `main` stays exactly where it was.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a_switch_lands_the_capture_on_its_branch_and_leaves_the_live_one() {
     let (_dir, source, dest, staged) = world_of(true);
     let main = git_run(&dest, &["rev-parse", "main"]);
@@ -1506,6 +1555,10 @@ fn a_switch_lands_the_capture_on_its_branch_and_leaves_the_live_one() {
 /// the captured HEAD moves it by compare-and-swap; one at a commit of its
 /// own refuses `GIT_SWITCH_BRANCH_DIVERGED`, nothing written.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a_switch_advances_an_ancestor_branch_and_refuses_a_diverged_one() {
     let (_dir, source, dest, staged) = world_of(true);
     git_run(&dest, &["branch", "feature"]);
@@ -1615,6 +1668,10 @@ fn a_switch_refuses_each_condition_typed_with_nothing_written() {
 /// back on `main`, the `feature` it created deleted by compare-and-swap,
 /// `GIT_SWITCH_ROLLED_BACK`.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a_switch_met_by_an_edit_is_rolled_back() {
     let (_dir, _source, dest, staged) = world_of(true);
     let main = git_run(&dest, &["rev-parse", "main"]);
