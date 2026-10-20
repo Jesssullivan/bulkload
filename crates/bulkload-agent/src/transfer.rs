@@ -282,6 +282,22 @@ pub fn parse_sqlite_slot_bytes(value: &str) -> Result<u64> {
         .ok_or(BulkloadRefusal::FieldDomainViolation)
 }
 
+/// Whether `serve` streams one `SQLite` store's rows (`--sqlite-rows`,
+/// [`crate::sqlite_union::serve_rows`]) instead of serving a tree.
+static ROWS_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set `--sqlite-rows` for this process: `serve` serves rows, and a
+/// `sqlite-union` passes the flag to the remote `serve`.
+pub fn set_rows_mode(on: bool) {
+    ROWS_MODE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether `--sqlite-rows` is set ([`set_rows_mode`]).
+#[must_use]
+pub fn rows_mode() -> bool {
+    ROWS_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The `SQLite` flags `pull` forwards to its remote `serve`.
 ///
 /// The source half runs under the same budget and wall as the verb was
@@ -292,6 +308,11 @@ pub fn parse_sqlite_slot_bytes(value: &str) -> Result<u64> {
 #[must_use]
 pub fn serve_flags() -> Vec<String> {
     let mut flags = Vec::new();
+    // `sqlite-union`: the remote serve streams one store's rows
+    // (operator ruling 2026-10-20), a fixed literal.
+    if rows_mode() {
+        flags.push("--sqlite-rows".to_owned());
+    }
     let slot = sqlite_slot_bytes();
     if slot != SLOT_BYTES {
         flags.push(format!("--sqlite-slot-bytes={slot}"));

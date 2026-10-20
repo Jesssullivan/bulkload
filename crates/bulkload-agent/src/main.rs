@@ -27,7 +27,7 @@ USAGE:
                    [--priority=background|normal|auto] [--escalate-after=SECONDS]
                    [--source-ledger-sync=relaxed|full]
                    [--sqlite=refuse|snapshot] [--sqlite-slot-bytes=BYTES]
-                   [--sqlite-carry-wall=SECONDS] <SUBCOMMAND>
+                   [--sqlite-carry-wall=SECONDS] [--sqlite-rows] <SUBCOMMAND>
 
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
@@ -68,6 +68,26 @@ SUBCOMMANDS:
                 --file the root the request names is one file or symlink,
                 never followed (pull --file passes it); any other word is
                 refused
+                With the global --sqlite-rows it streams one SQLite store's
+                rows instead (sqlite-union passes it)
+    sqlite-union [--map SRC=DST]... [--full] HOST SOURCE_DB DEST_DB SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
+    sqlite-union --local [--map SRC=DST]... [--full] SOURCE_DB DEST_DB DEST_STATE
+                Merge one SQLite store row by row into the live DEST_DB of
+                the same schema (operator ruling 2026-10-20): never a file
+                copy, never beside, no staged copy. The source is read from
+                one held WAL read snapshot (pull's ssh child runs
+                --sqlite-rows serve; --local reads it here). DEST_DB must
+                exist with an equal schema, else SQLITE_UNION_TARGET_ABSENT
+                or SQLITE_SCHEMA_MISMATCH and nothing is written. Rows are
+                matched by primary key: absent ones inserted, equal ones
+                adopted, a differing one replaced only by a strictly later
+                updated_at_ms/updated_at/updated_at_ordinal; every row not
+                kept is in DEST_STATE/consolidate.sqlite (tables row_union_*) with its key,
+                BLAKE3 and JSON. AUTOINCREMENT rows get new keys, read once.
+                cwd, path and *_path values under a --map SRC take its DST.
+                A rerun of an unchanged store reads nothing, of a changed one
+                only rows past its marks; --full reads every row. DEST_DB's
+                integrity_check runs after
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
@@ -984,6 +1004,7 @@ fn main() -> ExitCode {
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
         Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
         Some("serve") => serve_command(&args.collect::<Vec<_>>()),
+        Some("sqlite-union") => sqlite_union_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1131,6 +1152,10 @@ fn global_flags(
             );
             continue;
         }
+        if arg == "--sqlite-rows" {
+            bulkload_agent::transfer::set_rows_mode(true);
+            continue;
+        }
         if let Some(mode) = arg
             .to_str()
             .and_then(|value| value.strip_prefix("--source-ledger-sync="))
@@ -1186,6 +1211,25 @@ fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
         return Err(BulkloadRefusal::FieldDomainViolation);
     }
     let (input, output) = (std::io::stdin(), std::io::stdout());
+    // `--sqlite-rows serve`: one store's rows for a `sqlite-union`
+    // (operator ruling 2026-10-20).
+    if bulkload_agent::transfer::rows_mode() {
+        if kind == bulkload_agent::transfer::RootKind::File {
+            return Err(BulkloadRefusal::FieldDomainViolation);
+        }
+        let stats = bulkload_agent::sqlite_union::serve_rows(
+            &mut std::io::BufReader::new(input.lock()),
+            &mut std::io::BufWriter::with_capacity(1 << 20, output.lock()),
+        )?;
+        eprintln!(
+            "sqlite-rows unchanged={} tables={} rows={} held_ms={}",
+            stats.unchanged,
+            stats.tables,
+            stats.rows,
+            stats.held.as_millis()
+        );
+        return Ok(());
+    }
     bulkload_agent::transfer::tune_stream(&input);
     bulkload_agent::transfer::tune_stream(&output);
     // The reader thread owns stdin for the session; the process exit closes
@@ -2665,7 +2709,7 @@ fn pull_recorded_kind(
         &bulkload_agent::transfer_outcome::stable(path(2)?),
         "transfer::pull",
         || bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind),
-        || pull_command(kind, args),
+        || pull_tree(kind, args),
     )
     .and_then(|stats| {
         keep_listed(&stats);
@@ -2706,7 +2750,7 @@ fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
             // parser requires the one with the other.
             args.extend(self.remote.iter().cloned());
             args.extend(self.config.iter().cloned());
-            pull_command(bulkload_agent::transfer::RootKind::Tree, &args)
+            pull_tree(bulkload_agent::transfer::RootKind::Tree, &args)
         }
     }
     let mut options = CarryOptions::default();
@@ -2839,7 +2883,152 @@ fn expect_command(args: &[std::ffi::OsString]) -> Result<()> {
     Ok(())
 }
 
-fn pull_command(
+// Operator ruling 2026-10-20 ("they must be consoldiated"; "no dupes, no
+// duplciated besides, no stage dupes"): one SQLite store merged row by row
+// into the live destination store of the same schema.
+#[allow(clippy::too_many_lines)] // Argument parsing, then one call and its report line.
+fn sqlite_union_command(args: &[std::ffi::OsString]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut maps = Vec::new();
+    let (mut full, mut local) = (false, false);
+    let mut rest = args;
+    loop {
+        match rest {
+            [flag, pair, tail @ ..] if flag == "--map" => {
+                let pair = pair.as_bytes();
+                let at = pair
+                    .iter()
+                    .position(|byte| *byte == b'=')
+                    .ok_or(BulkloadRefusal::FieldDomainViolation)?;
+                let (from, to) = (pair.get(..at), pair.get(at + 1..));
+                let (Some(from), Some(to)) = (from, to) else {
+                    return Err(BulkloadRefusal::FieldDomainViolation);
+                };
+                if !from.starts_with(b"/") || !to.starts_with(b"/") {
+                    return Err(BulkloadRefusal::PathNotAbsolute);
+                }
+                maps.push((from.to_vec(), to.to_vec()));
+                rest = tail;
+            }
+            [flag, tail @ ..] if flag == "--full" => {
+                full = true;
+                rest = tail;
+            }
+            [flag, tail @ ..] if flag == "--local" => {
+                local = true;
+                rest = tail;
+            }
+            _ => break,
+        }
+    }
+    let maps = bulkload_agent::sqlite_union::maps(&maps);
+    let absolute = |path: &std::ffi::OsString| {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            Ok(path)
+        } else {
+            Err(BulkloadRefusal::PathNotAbsolute)
+        }
+    };
+    let stats = if local {
+        // `--local SOURCE_DB DEST_DB DEST_STATE`: both halves here.
+        let [source, dest, state] = rest else {
+            return Err(BulkloadRefusal::RequiredFieldMissing);
+        };
+        let source = absolute(source)?;
+        let options = bulkload_agent::sqlite_union::Options {
+            source: format!("local:{}", source.display()),
+            source_db: source.as_os_str().as_bytes().to_vec(),
+            dest: absolute(dest)?,
+            state: absolute(state)?,
+            maps,
+            full,
+        };
+        union_local(&options)?
+    } else {
+        // HOST SOURCE_DB DEST_DB SOURCE_STATE DEST_STATE [REMOTE [CONFIG]],
+        // `pull`'s positions, through `pull`'s ssh child.
+        let (Some(host), Some(source), Some(dest), Some(_), Some(state)) = (
+            rest.first(),
+            rest.get(1),
+            rest.get(2),
+            rest.get(3),
+            rest.get(4),
+        ) else {
+            return Err(BulkloadRefusal::RequiredFieldMissing);
+        };
+        let source = absolute(source)?;
+        let options = bulkload_agent::sqlite_union::Options {
+            source: bulkload_agent::transfer_outcome::pull_source(host, &source),
+            source_db: source.as_os_str().as_bytes().to_vec(),
+            dest: absolute(dest)?,
+            state: absolute(state)?,
+            maps,
+            full,
+        };
+        bulkload_agent::transfer::set_rows_mode(true);
+        pull_command(
+            bulkload_agent::transfer::RootKind::Tree,
+            rest,
+            |input, output| {
+                bulkload_agent::sqlite_union::consolidate(
+                    &mut std::io::BufReader::with_capacity(1 << 20, input),
+                    output,
+                    &options,
+                )
+            },
+        )?
+    };
+    println!(
+        "sqlite-union unchanged={} tables={} received={} inserted={} adopted={} replaced={} \
+         kept={} refused={} respelled={} batches={} longest_batch_ms={} held_ms={} \
+         fk_violations={}",
+        stats.unchanged,
+        stats.tables,
+        stats.received,
+        stats.inserted,
+        stats.adopted,
+        stats.replaced,
+        stats.kept,
+        stats.refused,
+        stats.respelled,
+        stats.batches,
+        stats.longest_batch.as_millis(),
+        stats.held_ns / 1_000_000,
+        stats.fk_violations
+    );
+    Ok(())
+}
+
+// `sqlite-union --local`: the source half on a thread of this process,
+// over a socket pair.
+fn union_local(
+    options: &bulkload_agent::sqlite_union::Options,
+) -> Result<bulkload_agent::sqlite_union::UnionStats> {
+    let (source, mut dest) = std::os::unix::net::UnixStream::pair()
+        .map_err(|error| BulkloadRefusal::Io(error.raw_os_error()))?;
+    let mut source_in = source
+        .try_clone()
+        .map_err(|error| BulkloadRefusal::Io(error.raw_os_error()))?;
+    let mut source_out = source;
+    let served = std::thread::spawn(move || {
+        bulkload_agent::sqlite_union::serve_rows(&mut source_in, &mut source_out)
+    });
+    let mut dest_in = dest
+        .try_clone()
+        .map_err(|error| BulkloadRefusal::Io(error.raw_os_error()))?;
+    let merged = bulkload_agent::sqlite_union::consolidate(&mut dest_in, &mut dest, options);
+    let _ = dest.shutdown(std::net::Shutdown::Both);
+    let served = served.join().map_err(|_| BulkloadRefusal::TransportLost)?;
+    let stats = merged?;
+    // The source's own refusal reached the merge as `Refused`; a source
+    // that failed after the merge ended is still this run's failure.
+    served?;
+    Ok(stats)
+}
+
+/// A tree or file `pull` through [`pull_command`]'s ssh child.
+fn pull_tree(
     kind: bulkload_agent::transfer::RootKind,
     args: &[std::ffi::OsString],
 ) -> Result<bulkload_agent::transfer::TransferStats> {
@@ -2848,6 +3037,27 @@ fn pull_command(
             .map(Path::new)
             .ok_or(BulkloadRefusal::RequiredFieldMissing)
     };
+    pull_command(kind, args, |input, output| {
+        bulkload_agent::transfer::receive_kind(
+            input,
+            output,
+            path(1)?,
+            path(3)?,
+            path(2)?,
+            path(4)?,
+            kind,
+        )
+    })
+}
+
+/// The remote `serve` over ssh (the S2 registry pins this child), its
+/// stdout and stdin handed to `receive`: a transfer's receive, or (with
+/// `--sqlite-rows`) a row union's.
+fn pull_command<T>(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+    receive: impl FnOnce(&mut std::process::ChildStdout, &mut std::process::ChildStdin) -> Result<T>,
+) -> Result<T> {
     let host = args.first().ok_or(BulkloadRefusal::RequiredFieldMissing)?;
     let remote = match args.get(5) {
         None => "bulkload-agent",
@@ -2900,15 +3110,7 @@ fn pull_command(
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
         bulkload_agent::transfer::tune_stream(&output);
         bulkload_agent::transfer::tune_stream(&input);
-        bulkload_agent::transfer::receive_kind(
-            &mut input,
-            &mut output,
-            path(1)?,
-            path(3)?,
-            path(2)?,
-            path(4)?,
-            kind,
-        )
+        receive(&mut input, &mut output)
     };
     let exit_status = child.wait().refuse_at("main::pull_command")?;
     let stats = result?;

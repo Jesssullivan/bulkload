@@ -181,7 +181,11 @@ const BYPASSES: &[Bypass] = &[
               `--sqlite-carry-wall=N`, plan of record 2026-10-19, C3) are the \
               verb's own, rendered by `transfer::serve_flags` from the parsed \
               integers (digits only, never caller text), and only when set \
-              away from their defaults.",
+              away from their defaults. `--sqlite-rows` (operator ruling \
+              2026-10-20) is a fixed literal `serve_flags` renders for a \
+              `sqlite-union`: the remote serve then streams one store's rows \
+              from a held read snapshot, the database named in the request \
+              on stdin, never on the command line.",
     },
     Bypass {
         id: "agent::provider_sqlite::hydrate::hydrate_one(program)",

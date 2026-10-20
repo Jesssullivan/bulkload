@@ -381,6 +381,28 @@ counters! {
     // This store's own earlier timed copies of a corrupt store retired once
     // a newer copy of the same store committed (review of #278, finding C).
     DestSqliteCorruptRetired => "dest_sqlite_corrupt_retired",
+    // `sqlite-union` (operator ruling 2026-10-20): source rows streamed from
+    // the held snapshot, and passes that read nothing because the store's
+    // identity was the one the destination recorded.
+    SourceSqliteRowsRead => "source_sqlite_rows_read",
+    SourceSqliteRowsUnchanged => "source_sqlite_rows_unchanged",
+    // Destination rows of a union by outcome: inserted, adopted (equal,
+    // nothing written), replaced by a later version (the old row ledgered
+    // first), kept over the source's (the source's ledgered), refused by a
+    // constraint (ledgered), and path values re-spelled through --map.
+    DestSqliteRowsInserted => "dest_sqlite_rows_inserted",
+    DestSqliteRowsAdopted => "dest_sqlite_rows_adopted",
+    DestSqliteRowsReplaced => "dest_sqlite_rows_replaced",
+    DestSqliteRowsKept => "dest_sqlite_rows_kept",
+    DestSqliteRowsRefused => "dest_sqlite_rows_refused",
+    DestSqliteRowsRespelled => "dest_sqlite_rows_respelled",
+    // Union write transactions committed on the live store, the time they
+    // held its write lock, tries that met a live writer's lock, and the
+    // integrity checks run after a pass.
+    DestSqliteUnionBatches => "dest_sqlite_union_batches",
+    DestSqliteUnionWriteNs => "dest_sqlite_union_write_ns",
+    DestSqliteUnionBusy => "dest_sqlite_union_busy",
+    DestSqliteUnionChecked => "dest_sqlite_union_checked",
     // Snapshots the destination verified (`integrity_check`) before publish,
     // and the bytes of those files.
     DestSqliteVerified => "dest_sqlite_verified",

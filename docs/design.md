@@ -2372,6 +2372,116 @@ specified how a caller retries carry_v2's ingest locks
 `carry-v2-final` holds the code and the contract's text. A future receiver
 for these frames needs a contract of its own.
 
+## SQLite row union: `sqlite-union` (operator ruling 2026-10-20)
+
+Operator ruling 2026-10-20, verbatim: "neither "WIN". they must be
+consoldiated. this is a non trivial task. this is what builload should be
+doing." and "no dupes, no duplciated besides, no stage dupes". It serves
+SPEC R2.2: "Every run is a lossless union into DEST" (C10; LIVE-15,
+LIVE-18, CONF-05, KEEP-36). A Codex home's stores (`state_5.sqlite`,
+`thread_history_1.sqlite`, `logs_2.sqlite` and any other) are merged row by
+row into the destination's live stores of the same name. They are never
+landed as a file, never beside one (`<db>.LABEL`), and never staged.
+
+**Transport.** `sqlite-union` runs over `pull`'s ssh child (the P76
+registry's `pull_command`), with one more fixed literal from `serve_flags`:
+`--sqlite-rows`. The remote `serve` then speaks the row stream
+(`bulkload_proto::rows`, its own protocol and schema id, `ROWS_VERSION` 1),
+not the transfer wire, which stays v6. The database path crosses in the
+request on stdin, never on the command line. `--local` runs both halves in
+one process.
+
+**Read side.** The source is opened read-only with a zero busy timeout. If
+it is in WAL mode, one read snapshot is held for the whole pass (operator
+ruling 2026-10-19 "Hold one read snapshot"), within the carry wall for the
+store's size and the source's free-space floor. A rollback-journal source
+is refused `SQLITE_UNION_SOURCE_NOT_WAL`: a read transaction there would
+hold up its writers (R2.1). Rows go over the wire in frames of at most 1024
+rows or 1 MiB. No temporary database exists on either host: this is the
+answer to "no stage dupes". The store's identity is the `stat` of its
+database and of a non-empty `-wal`. If it equals the identity the
+destination recorded at its last completed pass, the source reads nothing.
+
+**Schema.** The destination store must exist (`SQLITE_UNION_TARGET_ABSENT`
+otherwise: bulkload never creates an application's store). Its schema must
+equal the source's: every table's `CREATE` statement, its columns,
+`user_version` and the applied `_sqlx_migrations` (version and checksum).
+Otherwise `SQLITE_SCHEMA_MISMATCH`, and nothing is written. A virtual
+table, or a generated or hidden column, is `SQLITE_UNION_SCHEMA_UNSUPPORTED`.
+The destination's `schema_version` is checked again in every write
+transaction.
+
+**Write side.** Tables are merged parents first, by foreign key. Each
+write transaction is a `BEGIN IMMEDIATE` of at most 256 rows or 20 ms,
+under a 5 s busy timeout with backoff up to 300 s. A live writer on the
+destination therefore waits at most about one short batch. The union's
+connection enforces foreign keys, commits `synchronous=FULL` and never
+checkpoints on close. Per row:
+
+- **Natural key** (the primary key):
+  - A row the destination does not hold is inserted.
+  - An equal row is adopted, with nothing written.
+  - A differing row goes in only when its version column (`updated_at_ms`,
+    then `updated_at`, then `updated_at_ordinal`) is strictly later. It goes
+    in as an `UPDATE`, so no `ON DELETE CASCADE` fires.
+  - Otherwise the destination's row stays: `older`, `same-version` or
+    `unversioned`.
+- **Surrogate key** (`INTEGER PRIMARY KEY AUTOINCREMENT`, such as
+  `logs.id`), or no declared key:
+  - The key means nothing on another host, so the row is inserted with a
+    new key.
+  - A `UNIQUE` constraint naming a destination row adopts equal content and
+    keeps the destination's otherwise.
+  - Such a table may not be a foreign-key parent.
+- **Constraints:** a row a constraint refuses, such as a secondary
+  `UNIQUE` or a missing parent, is not written.
+- **Paths:** `cwd`, `path` and `*_path` values equal to, or under, a
+  `--map SRC` (at a component boundary) take the longest map's `DST` before
+  matching (A-055).
+- **sqlx's table:** `_sqlx_migrations` is compared, never merged.
+
+**Ledger** (`DEST_STATE/consolidate.sqlite (tables row_union_*)`, a bulkload store). The
+`rows` table holds every row not in the destination's final state: the
+source's row a destination row outranked or a constraint refused
+(`kept=dest`), and the destination's row a later source row replaced
+(`kept=source`). Each entry holds the key as JSON, the reason, the
+row's BLAKE3 and its JSON (non-UTF-8 text and blobs as hex). A displaced
+row is ledgered durably before the commit that replaces it.
+
+**Rerun.** Per table, the ledger keeps a rowid mark and a time mark. The
+source then reads `rowid > r OR <time> >= t`, in rowid order, with time
+columns `updated_at_ms` or `updated_at`.
+
+- **Time mark.** `t` is the snapshot's `max(<time>)` at the start of the
+  last pass that read the table to its end. A row changed since then has a
+  later time, assuming the source's clock does not run ahead of the rows it
+  wrote. A table with a time column keeps its marks until its end. A pass
+  cut short therefore reads it again from the old marks.
+- **Rowid mark.** A table without a time column saves its rowid mark every
+  32 batches.
+- **Surrogate tables.** They have only a rowid mark, saved every batch,
+  even under `--full`. Each insert batch is ledgered as pending, with its
+  destination rowid range and the BLAKE3 of its rows, before its commit.
+  A pending batch left by an interrupted pass is confirmed when those rows
+  are in the destination, and dropped otherwise. A surrogate row is
+  therefore never inserted twice.
+- **`--full`** reads every natural-key row again.
+
+After a pass, the destination's `integrity_check` must say `ok`
+(`SQLITE_INTEGRITY_CHECK_FAILED` otherwise; the rows are already
+committed). Its `foreign_key_check` rows are counted.
+
+**Gaps.**
+
+- A natural-key table without a time column (`thread_items`, the 8.8 GB
+  store's) is read past its rowid mark only. An in-place update of an older
+  row reaches the destination only on a `--full` pass.
+- Per-table later-wins can mix versions across tables. For example, a
+  thread's projection state may come from one host and its items from the
+  other.
+- `pull --consolidate` (#297) does not yet route a home's stores here. Until
+  it does, `sqlite-union` runs per store.
+
 ## Durability
 
 A record is never committed before the bytes it describes are durable on the
