@@ -1,5 +1,7 @@
 # Bulkload SLO and policy charter
 
+> **Superseded 2026-10-20.** This charter is no longer the requirement. [SPEC.md](SPEC.md) states what bulkload must do and what done means, and it wins on any disagreement. This file is history only. Do not cite its SLOs or ruling IDs as instructions.
+
 Ratified by operator interview 2026-10-03 (OI-1003-Q1–Q13), recorded under R-N13
 and on Linear TIN-4543. This charter defines what "bulkload is complete" means.
 It also defines the SLOs every claim must be proven against. Where it conflicts
