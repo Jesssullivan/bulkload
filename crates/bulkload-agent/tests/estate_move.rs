@@ -1452,9 +1452,16 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     )
     .unwrap();
     fs::write(lab.join(format!("{SID_RESUMED}.jsonl")), old).unwrap();
+    // Extending a live file needs the proof that no process is at it, which
+    // only Linux gives (`procs::inside`): elsewhere this session is held
+    // `live-in-use-unknown`, so it is left out there (the re-seat's own
+    // tests hold it off Linux).
+    let linux = cfg!(target_os = "linux");
     let neo_empty = transcript(SID_EMPTY, &src_lane, "NEO-EMPTY");
-    fs::write(dst_lane_projects.join(format!("{SID_EMPTY}.jsonl")), b"").unwrap();
-    fs::write(lab.join(format!("{SID_EMPTY}.jsonl")), &neo_empty).unwrap();
+    if linux {
+        fs::write(dst_lane_projects.join(format!("{SID_EMPTY}.jsonl")), b"").unwrap();
+        fs::write(lab.join(format!("{SID_EMPTY}.jsonl")), &neo_empty).unwrap();
+    }
     let resumed = fs::read(dst_lane_projects.join(format!("{SID_RESUMED}.jsonl"))).unwrap();
     // Both sides quiet past the racy window, as between real passes.
     let settle = || {
@@ -1517,17 +1524,19 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     // The empty live file: neo's bytes landed beside it, then the re-seat
     // extended the live file and removed the copy (one copy).
     let empty_at = dst_lane_projects.join(format!("{SID_EMPTY}.jsonl"));
-    assert_eq!(fs::read_to_string(&empty_at).unwrap(), neo_empty);
-    assert!(!dst_lane_projects
-        .join(format!("{SID_EMPTY}.jsonl.{LABEL}"))
-        .exists());
-    assert!(
-        moved.stdout.lines().any(|line| line.contains(SID_EMPTY)
-            && line.contains("\"kind\":\"session\"")
-            && line.contains("\"outcome\":\"extended\"")),
-        "{}",
-        moved.stdout
-    );
+    if linux {
+        assert_eq!(fs::read_to_string(&empty_at).unwrap(), neo_empty);
+        assert!(!dst_lane_projects
+            .join(format!("{SID_EMPTY}.jsonl.{LABEL}"))
+            .exists());
+        assert!(
+            moved.stdout.lines().any(|line| line.contains(SID_EMPTY)
+                && line.contains("\"kind\":\"session\"")
+                && line.contains("\"outcome\":\"extended\"")),
+            "{}",
+            moved.stdout
+        );
+    }
     let at_lane = dst_claude
         .join("projects")
         .join(key(&dst_lane))
@@ -1588,7 +1597,9 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
         ab
     );
     let first = closure(&moved.stdout);
-    assert_eq!(first["applied_beside"], "1", "{}", moved.stdout);
+    // The empty transcript's copy, landed beside before the re-seat.
+    let besides = if linux { "1" } else { "0" };
+    assert_eq!(first["applied_beside"], besides, "{}", moved.stdout);
     assert_eq!(first["key_maps"], "2", "{}", moved.stdout);
     assert_eq!(first["key_maps_held"], "1", "{}", moved.stdout);
     assert_eq!(first["unaccounted"], "0", "{}", moved.stdout);
@@ -1641,10 +1652,12 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     assert!(!dst_claude.join("projects").join(key(&src_lane)).exists());
     // The extended empty file is the seat's now: adopted, never landed
     // beside again.
-    assert_eq!(fs::read_to_string(&empty_at).unwrap(), neo_empty);
-    assert!(!dst_lane_projects
-        .join(format!("{SID_EMPTY}.jsonl.{LABEL}"))
-        .exists());
+    if linux {
+        assert_eq!(fs::read_to_string(&empty_at).unwrap(), neo_empty);
+        assert!(!dst_lane_projects
+            .join(format!("{SID_EMPTY}.jsonl.{LABEL}"))
+            .exists());
+    }
 
     // Unchanged: the claude transfer reads nothing.
     settle();

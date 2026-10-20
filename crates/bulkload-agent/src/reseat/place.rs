@@ -2726,6 +2726,10 @@ mod judge_tests {
 
     /// #294 review 1: the copy is judged by bytes, never taken as diverged.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the process check proves nothing off Linux: every extension is held live-in-use-unknown"
+    )]
     fn a_beside_copy_is_judged_by_its_bytes() {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
@@ -2788,6 +2792,10 @@ mod judge_tests {
     /// never `extended` while the copy holds bytes the live file lacks),
     /// until the finished line arrives.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the process check proves nothing off Linux: every extension is held live-in-use-unknown"
+    )]
     fn whole_lines_are_appended_however_long_and_a_partial_one_is_held() {
         let _serial = serial();
         let dir = tempfile::tempdir().unwrap();
@@ -2841,6 +2849,38 @@ mod judge_tests {
         );
         assert_eq!(std::fs::read(&at).unwrap(), finished);
         assert!(!beside.exists());
+    }
+
+    /// Off Linux nothing proves that no process holds the transcript or
+    /// works in the lane (no `/proc`): every extension is held
+    /// `live-in-use-unknown`, nothing written, the copy kept. Covered and
+    /// diverged copies need no such proof and are judged as on Linux.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn an_extension_is_held_where_nothing_proves_no_process() {
+        let _serial = serial();
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let live: &[u8] = b"{\"a\":1}\n";
+        let grown: &[u8] = b"{\"a\":1}\n{\"b\":2}\n";
+        for copy in [grown, &b"{\"a\":1}\n{\"b\":2}\n{\"c\""[..]] {
+            let (at, beside) = pair(&dir, live, copy);
+            let judged = judge_beside(&at, &beside, later(), None).unwrap();
+            assert_eq!(judged, Judged::Held("live-in-use-unknown"));
+            assert!(!super::super::word_accounted(judged.word()));
+            assert_eq!(std::fs::read(&at).unwrap(), live, "nothing written");
+            assert_eq!(std::fs::read(&beside).unwrap(), copy, "the copy kept");
+        }
+        let (at, beside) = pair(&dir, grown, live);
+        assert_eq!(
+            judge_beside(&at, &beside, later(), None).unwrap(),
+            Judged::Covered { consumed: true }
+        );
+        let (at, beside) = pair(&dir, b"{\"a\":1}\n{\"x\":9}\n", grown);
+        assert_eq!(
+            judge_beside(&at, &beside, later(), None).unwrap(),
+            Judged::Diverged
+        );
     }
 
     /// #294 verification 3: a quiet but open session (a process working in
