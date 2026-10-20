@@ -1788,10 +1788,12 @@ pub enum Exported {
     },
 }
 
-/// What an [`Exported::ObjectStoreRewritten`] met: the refusal of the Git
-/// child that failed (`GIT_CHILD_FAILED` with its stderr class, or
-/// `GIT_INVENTORY_MALFORMED`), and every `pack` entry that moved between
-/// the listing read before the pass and the one read after the failure.
+/// The object-store rewrite an [`Exported::ObjectStoreRewritten`] met.
+///
+/// The refusal of the Git child that failed (`GIT_CHILD_FAILED` with its
+/// stderr class, or `GIT_INVENTORY_MALFORMED`), and every `pack` entry
+/// that moved between the listing read before the pass and the one read
+/// after the failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreRewrite {
     pub cause: BulkloadRefusal,

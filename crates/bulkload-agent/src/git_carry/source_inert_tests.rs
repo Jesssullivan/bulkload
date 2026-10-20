@@ -883,26 +883,34 @@ fn the_rewrite_names_every_pack_entry_that_moved() {
     };
     let before = vec![(
         store.clone(),
-        entries(&[("kept.pack", 1, 10), ("gone.pack", 2, 20), ("moved.pack", 3, 30)]),
+        entries(&[
+            ("kept.pack", 1, 10),
+            ("gone.pack", 2, 20),
+            ("moved.pack", 3, 30),
+        ]),
     )];
     let after = vec![(
         store.clone(),
-        entries(&[("kept.pack", 1, 10), ("moved.pack", 4, 30), ("new.pack", 5, 50)]),
+        entries(&[
+            ("kept.pack", 1, 10),
+            ("moved.pack", 4, 30),
+            ("new.pack", 5, 50),
+        ]),
     )];
-    let changed = super::pack_changes(&before, &after);
-    let named: Vec<(&[u8], Option<(u64, u64)>, Option<(u64, u64)>)> = changed
-        .iter()
-        .map(|change| (change.name.as_slice(), change.before, change.after))
-        .collect();
+    let change = |name: &str, before, after| super::PackChange {
+        store: store.clone(),
+        name: name.as_bytes().to_vec(),
+        before,
+        after,
+    };
     assert_eq!(
-        named,
+        super::pack_changes(&before, &after),
         vec![
-            (b"gone.pack".as_slice(), Some((2, 20)), None),
-            (b"moved.pack".as_slice(), Some((3, 30)), Some((4, 30))),
-            (b"new.pack".as_slice(), None, Some((5, 50))),
+            change("gone.pack", Some((2, 20)), None),
+            change("moved.pack", Some((3, 30)), Some((4, 30))),
+            change("new.pack", None, Some((5, 50))),
         ]
     );
-    assert!(changed.iter().all(|change| change.store == store));
     assert!(super::pack_changes(&before, &before).is_empty());
 }
 
