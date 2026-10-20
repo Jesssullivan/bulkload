@@ -2986,7 +2986,7 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
          source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
-         sqlite_sidecars_covered={} applied_beside={} dest_ahead={} mapped={}",
+         sqlite_sidecars_covered={} applied_beside={} dest_ahead={} consolidated={} mapped={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
@@ -2999,8 +2999,21 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         stats.sqlite_sidecars_covered.len(),
         stats.applied_beside.len(),
         stats.dest_ahead.len(),
+        stats.consolidated.len(),
         stats.mapped.len()
     );
+    for done in &stats.consolidated {
+        eprintln!(
+            "consolidated {} seat_records={} live_extra={} output_size={} seat_blake3={} live_blake3={} output_blake3={}",
+            done.path.escape_ascii(),
+            done.seat_records,
+            done.live_extra,
+            done.output_size,
+            blake3::Hash::from(done.seat_blake3).to_hex(),
+            blake3::Hash::from(done.live_blake3).to_hex(),
+            blake3::Hash::from(done.output_blake3).to_hex(),
+        );
+    }
     for path in &stats.dest_ahead {
         eprintln!("dest-ahead {}", path.escape_ascii());
     }

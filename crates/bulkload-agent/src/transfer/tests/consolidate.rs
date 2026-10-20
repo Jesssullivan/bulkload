@@ -1,0 +1,205 @@
+//! Consolidation of append logs in place (operator ruling 2026-10-20:
+//! "neither WIN. they must be consolidated"; "no dupes, no duplicated
+//! besides"): a session continued on both hosts lands as one file holding
+//! both branches, `history.jsonl` as the union of its lines, a destination
+//! writer appending during the consolidation is never lost, and an unchanged
+//! rerun reads nothing. Never a beside copy.
+
+use super::*;
+
+const SUFFIX: &[u8] = b".neo-20261020";
+
+struct Homes {
+    corpus: Corpus,
+    root: PathBuf,
+}
+
+impl Homes {
+    fn new() -> Self {
+        let corpus = Corpus::new();
+        let root = std::fs::canonicalize(corpus.base.join("destination")).unwrap();
+        set_beside(&root, Some(Some(SUFFIX.to_vec())));
+        set_consolidate_root(&root, Some(true));
+        Self { corpus, root }
+    }
+
+    fn write(&self, side: &str, rel: &str, bytes: &[u8]) -> PathBuf {
+        let path = self.corpus.base.join(side).join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn settle(&self) {
+        settle_racy_window(&self.corpus.base.join("source")).unwrap();
+        settle_racy_window(&self.corpus.base.join("destination")).unwrap();
+    }
+}
+
+impl Drop for Homes {
+    fn drop(&mut self) {
+        set_beside(&self.root, None);
+        set_consolidate_root(&self.root, None);
+        set_consolidate_hook(&self.root, None);
+    }
+}
+
+fn record(uuid: &str, parent: &str, text: &str) -> String {
+    format!(
+        "{{\"parentUuid\":\"{parent}\",\"uuid\":\"{uuid}\",\"timestamp\":\"2026-10-20T00:00:00Z\",\"message\":\"{text}\"}}\n"
+    )
+}
+
+fn beside_of(path: &Path) -> PathBuf {
+    let mut beside = path.as_os_str().to_owned();
+    beside.push(std::ffi::OsStr::from_bytes(SUFFIX));
+    PathBuf::from(beside)
+}
+
+/// One session id continued on both hosts: one file at the path, neo's
+/// bytes then sting's branch; never a beside copy; ledgered; and the rerun
+/// reads nothing.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
+)]
+fn a_session_continued_on_both_hosts_is_one_file_with_both_branches() {
+    let homes = Homes::new();
+    let shared = format!("{}{}", record("a", "", "hi"), record("b", "a", "hello"));
+    let neo = format!("{shared}{}", record("n1", "b", "on neo"));
+    let sting_branch = format!(
+        "{}{}",
+        record("s1", "b", "on sting"),
+        record("s2", "s1", "more")
+    );
+    let rel = "projects/-k/s.jsonl";
+    homes.write("source", rel, neo.as_bytes());
+    let live = homes.write(
+        "destination",
+        rel,
+        format!("{shared}{sting_branch}").as_bytes(),
+    );
+    homes.settle();
+
+    let first = homes.corpus.run().unwrap();
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    assert!(
+        first.applied_beside.is_empty(),
+        "{:?}",
+        first.applied_beside
+    );
+    assert_eq!(
+        std::fs::read_to_string(&live).unwrap(),
+        format!("{neo}{sting_branch}"),
+        "one file: neo's bytes, then sting's branch"
+    );
+    assert!(!beside_of(&live).exists(), "never a beside copy");
+    assert_eq!(first.consolidated.len(), 1, "{:?}", first.consolidated);
+    let done = &first.consolidated[0];
+    assert_eq!(done.path, rel.as_bytes());
+    assert_eq!((done.seat_records, done.live_extra), (3, 2));
+    assert_eq!(
+        done.output_blake3,
+        *blake3::hash(format!("{neo}{sting_branch}").as_bytes()).as_bytes()
+    );
+    let ledger = crate::transfer_outcome::TransferRecord::ended(
+        "copy",
+        "source",
+        &homes.root,
+        &Ok(first),
+        "transfer::copy",
+    );
+    assert!(ledger
+        .entries
+        .iter()
+        .any(|entry| entry.rel_path == rel.as_bytes()
+            && matches!(
+                entry.outcome,
+                crate::transfer_outcome::EntryOutcome::Consolidated { live_extra: 2, .. }
+            )));
+
+    homes.settle();
+    let again = homes.corpus.run().unwrap();
+    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
+    assert_eq!(
+        again.source_bytes_read, 0,
+        "an unchanged rerun reads nothing"
+    );
+    assert!(again.consolidated.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(&live).unwrap(),
+        format!("{neo}{sting_branch}")
+    );
+}
+
+/// `history.jsonl` (no `uuid`): the union of its lines, counted.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
+)]
+fn history_is_the_union_of_both_hosts_lines() {
+    let homes = Homes::new();
+    let neo = "{\"display\":\"a\"}\n{\"display\":\"neo\"}\n";
+    let sting = "{\"display\":\"a\"}\n{\"display\":\"sting\"}\n";
+    homes.write("source", "history.jsonl", neo.as_bytes());
+    let live = homes.write("destination", "history.jsonl", sting.as_bytes());
+    homes.settle();
+    let stats = homes.corpus.run().unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert_eq!(
+        std::fs::read_to_string(&live).unwrap(),
+        "{\"display\":\"a\"}\n{\"display\":\"neo\"}\n{\"display\":\"sting\"}\n"
+    );
+    assert!(!beside_of(&live).exists());
+    assert_eq!(stats.consolidated.len(), 1);
+}
+
+/// A destination writer appends between the read and the exchange: its
+/// line is never lost (nothing is replaced, the path is refused
+/// `DESTINATION_UNSETTLED`), and the next pass merges it in.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
+)]
+fn a_line_sting_appends_during_the_consolidation_is_never_lost() {
+    fn append(live: &Path) {
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new().append(true).open(live).unwrap();
+        file.write_all(b"{\"uuid\":\"late\",\"message\":\"while merging\"}\n")
+            .unwrap();
+    }
+    let homes = Homes::new();
+    let shared = record("a", "", "hi");
+    let neo = format!("{shared}{}", record("n1", "a", "on neo"));
+    let sting = format!("{shared}{}", record("s1", "a", "on sting"));
+    let rel = "projects/-k/t.jsonl";
+    homes.write("source", rel, neo.as_bytes());
+    let live = homes.write("destination", rel, sting.as_bytes());
+    homes.settle();
+    set_consolidate_hook(&homes.root, Some(append));
+    let first = homes.corpus.run().unwrap();
+    set_consolidate_hook(&homes.root, None);
+    assert_eq!(
+        first.refusals,
+        [(rel.as_bytes().to_vec(), "DESTINATION_UNSETTLED".to_owned())]
+    );
+    assert!(first.consolidated.is_empty());
+    let late = "{\"uuid\":\"late\",\"message\":\"while merging\"}\n";
+    assert_eq!(
+        std::fs::read_to_string(&live).unwrap(),
+        format!("{sting}{late}"),
+        "the live file as the writer left it"
+    );
+    assert!(!beside_of(&live).exists());
+
+    homes.settle();
+    let again = homes.corpus.run().unwrap();
+    assert!(again.refusals.is_empty(), "{:?}", again.refusals);
+    assert_eq!(
+        std::fs::read_to_string(&live).unwrap(),
+        format!("{neo}{}{late}", record("s1", "a", "on sting"))
+    );
+}

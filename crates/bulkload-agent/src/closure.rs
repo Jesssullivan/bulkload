@@ -1430,6 +1430,11 @@ fn record_rows(
             // `--beside`: the live file holds the seat's bytes and more;
             // covered by it, nothing written.
             EntryOutcome::DestAhead => ("dest-ahead", None, None, Disposition::Covered, None),
+            // Consolidated in place: the seat's bytes and the live file's
+            // records, one file (ruling 2026-10-20).
+            EntryOutcome::Consolidated { .. } => {
+                ("consolidated", None, None, Disposition::Applied, None)
+            }
         };
         let mut entry_row = transfer_row(
             record.entry_item(entry),

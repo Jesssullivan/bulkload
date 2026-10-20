@@ -1183,6 +1183,10 @@ fn sessions_pull(
         .unwrap_or_else(|| home.join(".codex"));
     let pulls = run.state.join("pull");
     let suffix = bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()));
+    // Operator ruling 2026-10-20 ("neither WIN. they must be consolidated";
+    // "no dupes, no duplicated besides"): an append log the two homes both
+    // hold is consolidated in place, one file, never landed beside.
+    bulkload_agent::transfer::set_consolidate(true);
     // The source's transcripts and rollouts, listed by each session: the
     // provenance the re-seat tells them from the destination's own by
     // (independent review of #280, N4). Listed as they land: under their
@@ -1249,6 +1253,7 @@ fn sessions_pull(
     let codex_listed = write_listing(&pulls.join("codex.listing"), super::take_listed());
     bulkload_agent::transfer::set_beside_always(Vec::new());
     bulkload_agent::transfer::set_listing(Vec::new());
+    bulkload_agent::transfer::set_consolidate(false);
     let cleared = bulkload_agent::transfer::set_beside_suffix(None);
     // A session that did not complete outranks one that completed with
     // refused paths: the phase's word says whether the re-seat may run.

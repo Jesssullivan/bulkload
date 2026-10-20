@@ -137,6 +137,20 @@ pub enum EntryOutcome {
     /// it); nothing was written. Accounted, covered by that file. Appended
     /// after the earlier variants: a record from before it still decodes.
     DestAhead,
+    /// Consolidation (operator ruling 2026-10-20): the append log at
+    /// `rel_path` was consolidated in place, the seat's bytes then the live
+    /// file's records the seat lacked. The ledger of it: both inputs' and the
+    /// output's BLAKE3, the record counts and the output's size. Accounted.
+    /// Appended after the earlier variants: a record from before it still
+    /// decodes.
+    Consolidated {
+        seat_blake3: [u8; 32],
+        live_blake3: [u8; 32],
+        output_blake3: [u8; 32],
+        seat_records: u64,
+        live_extra: u64,
+        output_size: u64,
+    },
 }
 
 /// One path row of a session.
@@ -231,6 +245,19 @@ impl TransferRecord {
                         },
                     });
                 }
+                for done in &stats.consolidated {
+                    record.entries.push(Entry {
+                        rel_path: done.path.clone(),
+                        outcome: EntryOutcome::Consolidated {
+                            seat_blake3: done.seat_blake3,
+                            live_blake3: done.live_blake3,
+                            output_blake3: done.output_blake3,
+                            seat_records: done.seat_records,
+                            live_extra: done.live_extra,
+                            output_size: done.output_size,
+                        },
+                    });
+                }
                 for path in &stats.dest_ahead {
                     record.entries.push(Entry {
                         rel_path: path.clone(),
@@ -301,6 +328,7 @@ fn entry_key(outcome: &EntryOutcome) -> String {
         EntryOutcome::AppliedBeside { .. } => "applied-beside".to_owned(),
         EntryOutcome::Mapped { .. } => "mapped".to_owned(),
         EntryOutcome::DestAhead => "dest-ahead".to_owned(),
+        EntryOutcome::Consolidated { .. } => "consolidated".to_owned(),
     }
 }
 

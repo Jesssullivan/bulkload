@@ -938,7 +938,8 @@ fn carry_one(
                     transfer_outcome::EntryOutcome::SidecarCovered
                     | transfer_outcome::EntryOutcome::AppliedBeside { .. }
                     | transfer_outcome::EntryOutcome::Mapped { .. }
-                    | transfer_outcome::EntryOutcome::DestAhead => "",
+                    | transfer_outcome::EntryOutcome::DestAhead
+                    | transfer_outcome::EntryOutcome::Consolidated { .. } => "",
                 },
                 gits.len(),
             ),

@@ -3222,3 +3222,7 @@ mod beside;
 // ---- #280 finding 9: `--map-prefix SRC_REL=DST_REL` lands a source path
 // ---- once, at its mapped destination path --------------------------------
 mod map_prefix;
+
+// ---- operator ruling 2026-10-20: append logs consolidated in place, never
+// ---- landed beside ----------------------------------------------------------
+mod consolidate;

@@ -1522,8 +1522,9 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     assert!(!dst_lane_projects
         .join(format!("{SID_RESUMED}.jsonl.{LABEL}"))
         .exists());
-    // The empty live file: neo's bytes landed beside it, then the re-seat
-    // extended the live file and removed the copy (one copy).
+    // The empty live file: consolidated in place with neo's bytes by the
+    // pull (ruling 2026-10-20), never landed beside; in place for the
+    // re-seat.
     let empty_at = dst_lane_projects.join(format!("{SID_EMPTY}.jsonl"));
     if linux {
         assert_eq!(fs::read_to_string(&empty_at).unwrap(), neo_empty);
@@ -1533,7 +1534,7 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
         assert!(
             moved.stdout.lines().any(|line| line.contains(SID_EMPTY)
                 && line.contains("\"kind\":\"session\"")
-                && line.contains("\"outcome\":\"extended\"")),
+                && line.contains("\"outcome\":\"in-place\"")),
             "{}",
             moved.stdout
         );
@@ -1598,9 +1599,8 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
         ab
     );
     let first = closure(&moved.stdout);
-    // The empty transcript's copy, landed beside before the re-seat.
-    let besides = if linux { "1" } else { "0" };
-    assert_eq!(first["applied_beside"], besides, "{}", moved.stdout);
+    // Nothing lands beside: the empty transcript is consolidated in place.
+    assert_eq!(first["applied_beside"], "0", "{}", moved.stdout);
     assert_eq!(first["key_maps"], "2", "{}", moved.stdout);
     assert_eq!(first["key_maps_held"], "1", "{}", moved.stdout);
     assert_eq!(first["unaccounted"], "0", "{}", moved.stdout);
@@ -1694,13 +1694,17 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     assert_eq!(fs::read_dir(&state).unwrap().count(), before);
 }
 
-/// #294 review 1: a session both sides continued, under the lane's key the
-/// pull maps to. The pull keeps sting's transcript and lands neo's beside
-/// it; the re-seat judges the two by their bytes, finds neither a prefix of
-/// the other and holds the session for the operator's review
-/// (`beside-diverged`): `diverged=1`, the gate fails, both copies kept.
+/// Operator ruling 2026-10-20 ("neither WIN. they must be consolidated"): a
+/// session both sides continued, under the lane's key the pull maps to,
+/// lands as one file holding both branches (neo's bytes, then sting's
+/// records neo lacks), never a beside copy; the re-seat finds it in place,
+/// the closure names the consolidation, and the gate passes.
 #[test]
-fn a_session_both_sides_continued_is_held_diverged_for_review() {
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every consolidation is unsettled"
+)]
+fn a_session_both_sides_continued_is_consolidated_into_one_file() {
     const SID_BOTH: &str = "5e5e5e5e-aaaa-4222-8333-444444444444";
     let base = std::env::temp_dir().join(format!("bulkload-move-both-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
@@ -1763,34 +1767,29 @@ fn a_session_both_sides_continued_is_held_diverged_for_review() {
         &source_state,
         &state,
     ]));
-    assert!(!moved.ok, "{}\n{}", moved.stdout, moved.stderr);
+    assert!(moved.ok, "{}\n{}", moved.stdout, moved.stderr);
+    let one = at_lane.join(format!("{SID_BOTH}.jsonl"));
+    let sting_branch = transcript(SID_BOTH, &dst_lane, "STING-MORE");
     assert_eq!(
-        fs::read_to_string(at_lane.join(format!("{SID_BOTH}.jsonl"))).unwrap(),
-        sting,
-        "the destination's transcript untouched"
-    );
-    assert_eq!(
-        fs::read_to_string(at_lane.join(format!("{SID_BOTH}.jsonl.{LABEL}"))).unwrap(),
-        neo,
-        "neo's beside it, kept"
+        fs::read_to_string(&one).unwrap(),
+        format!("{neo}{sting_branch}"),
+        "one file: neo's bytes, then sting's branch"
     );
     assert!(
-        moved.stdout.lines().any(|line| line.contains(SID_BOTH)
-            && line.contains("\"kind\":\"session\"")
-            && line.contains("\"outcome\":\"beside-diverged\"")
-            && line.contains("RESEAT_DEST_DIVERGED")),
-        "{}",
-        moved.stdout
+        !at_lane.join(format!("{SID_BOTH}.jsonl.{LABEL}")).exists(),
+        "never a beside copy"
     );
     let totals = closure(&moved.stdout);
-    assert_eq!(totals["diverged"], "1", "{}", moved.stdout);
-    assert_eq!(
-        totals["reseat_held"], "claude/beside-diverged:1",
-        "{}",
-        moved.stdout
+    assert_eq!(totals["diverged"], "0", "{}", moved.stdout);
+    assert_eq!(totals["applied_beside"], "0", "{}", moved.stdout);
+    assert_eq!(totals["reseat_held"], "none", "{}", moved.stdout);
+    let closure_json = fs::read_to_string(state.join("closure.json")).unwrap();
+    assert!(
+        closure_json.contains("\"transfer_outcome\":\"consolidated\""),
+        "{closure_json}"
     );
     assert!(
-        moved.stdout.contains("estate-move gate=fail"),
+        moved.stdout.contains("estate-move gate=pass"),
         "{}",
         moved.stdout
     );
