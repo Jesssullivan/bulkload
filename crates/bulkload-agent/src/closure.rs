@@ -320,6 +320,17 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
                 (Some(Ok(_)), true) if entry.refs_in.is_none() => {
                     Disposition::Unaccounted("refs-in-record-missing")
                 }
+                // A captured ref the namespace holds at another value was
+                // kept, so the source's value is in by no ref there: the
+                // item waits for review, typed (review of #291, K1).
+                (Some(Ok(_)), true) if entry.refs_in.as_ref().is_some_and(|refs| refs.kept > 0) => {
+                    journal(
+                        "workspace-refs-in",
+                        Disposition::RefusedPendingReview(
+                            BulkloadRefusal::GitDestinationOccupied.code().to_owned(),
+                        ),
+                    )
+                }
                 (Some(Ok(_)), true) => journal("workspace-refs-in", Disposition::Applied),
             }
         }
@@ -1196,7 +1207,17 @@ impl Report {
                 );
             }
             // Operator ruling 2026-10-16 21:24Z: a row landed with no tree
-            // beside counts every file and names the refs that went in.
+            // beside counts every file and names the refs that went in; one
+            // whose refs-in kept a ref is held, named by its refusal.
+            if let (Some(_), Some(code)) = (&row.files, row.disposition.refusal()) {
+                let kept = row.refs_in.as_ref().map_or(0, |refs| refs.kept);
+                let _ = write!(
+                    out,
+                    ",\"refusal\":{},\"refusal_detail\":{}",
+                    json_string(code),
+                    json_string(&format!("refs-in-kept={kept}")),
+                );
+            }
             if let Some(files) = &row.files {
                 let tally = &files.tally;
                 let _ = write!(
@@ -2475,6 +2496,18 @@ mod tests {
                 present("workspace-refs-in")
             )),
             Disposition::Unaccounted("refs-in-record-missing")
+        );
+        let kept = crate::estate::RefsInSummary {
+            kept: 1,
+            ..refs.clone()
+        };
+        assert_eq!(
+            classify(&with(
+                Some(Ok(summary.clone())),
+                Some(kept),
+                present("workspace-refs-in")
+            )),
+            Disposition::RefusedPendingReview("GIT_DESTINATION_OCCUPIED".to_owned())
         );
         assert_eq!(
             classify(&with(

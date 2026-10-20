@@ -269,7 +269,7 @@ fn written_since(root: &Path, since_ns: i128) -> Result<bool> {
 
 // Whether a process has its working directory or an open file under
 // `root` (review of #289, finding 2); `true` where it cannot be proved.
-fn in_use(root: &Path) -> Result<bool> {
+pub(super) fn in_use(root: &Path) -> Result<bool> {
     Ok(crate::procs::inside(&[root])?.is_none_or(|pids| !pids.is_empty()))
 }
 

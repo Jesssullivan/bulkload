@@ -184,7 +184,13 @@ SUBCOMMANDS:
                 files-adopted=N files-beside=N ...; outcome and journal
                 workspace-refs-in, closure applied (with files and refs_in).
                 The live checkout's HEAD, index, tracked files, branches and
-                info/exclude are never touched.
+                info/exclude are never touched. Derived output (build/,
+                dist/, .svelte-kit/, .artifacts/, bazel-*, mktemp-named
+                directories, .serena/, rebuildable roots) is held (counted,
+                listed, never written) unless --place-derived; a refs-in
+                that kept a namespace ref leaves the item pending review
+                (GIT_DESTINATION_OCCUPIED); estate-placements lists or undoes
+                every placement.
                 --advance-ancestor (operator ruling 2026-10-19, 'Yes, advance
                 those'; needs --adopt and --beside): a live checkout bulkload
                 did not land that differs from the capture is advanced in
@@ -422,7 +428,7 @@ SUBCOMMANDS:
                 CAPTURE_ABSENT back (and for refs-only items riding on it).
                 --dry-run reads only and prints what each item would do.
                 One line per item
-    estate-beside-retire [--delete] [--drop-rebuildable] [--scan ROOT]... [--depth N] SUFFIX SOURCE PRIVATE_STATE [BESIDE ...]
+    estate-beside-retire [--delete] [--drop-rebuildable] [--place-derived] [--scan ROOT]... [--depth N] SUFFIX SOURCE PRIVATE_STATE [BESIDE ...]
                 Operator ruling 2026-10-16 21:24Z: prove each beside tree
                 (each BESIDE, and every directory named *SUFFIX whose live
                 path exists under a --scan ROOT, to --depth levels, default
@@ -436,7 +442,11 @@ SUBCOMMANDS:
                 branches and tags held there by name, natively or under
                 refs/NS/, else created there create-only), and every
                 untracked or ignored entry present and equal in the live
-                checkout or landable there as a file-level beside
+                checkout or landable there as a file-level beside (derived
+                output only with --place-derived, else derived-held:PATH;
+                only a tree bulkload landed, else not-bulkload-landed; a
+                process inside it refuses in-use; reflog-only commits are
+                carried in under refs/NS/reflog/, never dropped)
                 (FILE+SUFFIX); a rebuildable root (target/, node_modules/,
                 ...) refuses rebuildable:PATH unless --drop-rebuildable
                 (counted, dropped with the tree, as a capture omits it).
@@ -451,6 +461,15 @@ SUBCOMMANDS:
                 aside, re-proved by prints, its administration and tree
                 deleted); outcome=retired, or outcome=kept reason=... A
                 rerun finishes a removal a crash cut short.
+    estate-placements [--undo] [--record FILE]... PRIVATE_STATE
+                Every file a clean-source apply (ITEM-SOURCE.files) or a
+                beside retirement (beside-retire-TAG.files) placed into a live
+                checkout or landed beside a live file, and every directory it
+                made, listed by path from the records in PRIVATE_STATE (or the
+                --record files named). With --undo, each one still as placed
+                (identity, size and time unchanged) is removed, then each
+                directory the pass made that is empty now; anything changed
+                since is kept and counted, and the record is marked undone.
     closure-report [--attest LEDGER.json] [--dispositions LEDGER] [--transfer DEST_STATE ...] [--transfer-manifest MANIFEST] [--omissions-from-destination] PLAN CORPUS SOURCE PRIVATE_STATE [PRIVATE_STATE ...]
                 Read-only: join PLAN with CORPUS's capture records and each
                 PRIVATE_STATE's typed outcome records (legacy string records
@@ -979,6 +998,7 @@ fn main() -> ExitCode {
         ) => estate_command(name, &args.collect::<Vec<_>>()),
         Some("estate-carry-files") => carry_files_command(&args.collect::<Vec<_>>()),
         Some("estate-beside-retire") => beside_retire_command(&args.collect::<Vec<_>>()),
+        Some("estate-placements") => placements_command(&args.collect::<Vec<_>>()),
         Some(name @ ("estate-move-source" | "estate-move")) => estate_move::command(name, args),
         Some("apply-state-candidate") => apply_state_command(&args.collect::<Vec<_>>()),
         Some("closure-report") => closure_command(&args.collect::<Vec<_>>()),
@@ -1864,6 +1884,7 @@ fn estate_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
                         beside: options.beside,
                         refs_in: options.refs_in,
                         advance_ancestor: options.advance_ancestor,
+                        place_derived: options.place_derived,
                     },
                 ),
                 &receipt,
@@ -2310,6 +2331,7 @@ struct EstateOptions {
     beside: Option<String>,
     refs_in: bool,
     advance_ancestor: bool,
+    place_derived: bool,
     activate_origin: Vec<String>,
     since: Option<i128>,
     scan: Vec<PathBuf>,
@@ -2336,6 +2358,10 @@ fn estate_options(args: &[std::ffi::OsString]) -> Result<(EstateOptions, &[std::
             }
             "--advance-ancestor" if !options.advance_ancestor => {
                 options.advance_ancestor = true;
+                at += 1;
+            }
+            "--place-derived" if !options.place_derived => {
+                options.place_derived = true;
                 at += 1;
             }
             "--beside" if options.beside.is_none() => {
@@ -2546,6 +2572,39 @@ fn pull_recorded_kind(
 
 // M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,
 // the remote source state per item under --source-state-root.
+// `estate-placements [--undo] [--record FILE]... PRIVATE_STATE` (review of
+// #291, item 2).
+fn placements_command(args: &[std::ffi::OsString]) -> Result<()> {
+    let (mut undo, mut records) = (false, Vec::new());
+    let mut at = 0;
+    while let Some(arg) = args.get(at).and_then(|arg| arg.to_str()) {
+        match arg {
+            "--undo" if !undo => {
+                undo = true;
+                at += 1;
+            }
+            "--record" => {
+                records.push(PathBuf::from(
+                    args.get(at + 1)
+                        .ok_or(BulkloadRefusal::RequiredFieldMissing)?,
+                ));
+                at += 2;
+            }
+            other if other.starts_with("--") => return Err(BulkloadRefusal::FieldDomainViolation),
+            _ => break,
+        }
+    }
+    let rest = args.get(at..).unwrap_or_default();
+    let [state] = rest else {
+        return Err(BulkloadRefusal::RequiredFieldMissing);
+    };
+    bulkload_agent::estate::placements::run(Path::new(state), (&records, undo), &mut |line| {
+        let mut output = std::io::stdout().lock();
+        writeln!(output, "{line}").refuse_at("main::placements")?;
+        output.flush().refuse_at("main::placements")
+    })
+}
+
 // `estate-beside-retire [--delete] [--scan ROOT]... [--depth N] SUFFIX
 // SOURCE PRIVATE_STATE [BESIDE ...]` (operator ruling 2026-10-16 21:24Z).
 fn beside_retire_command(args: &[std::ffi::OsString]) -> Result<()> {
@@ -2564,6 +2623,10 @@ fn beside_retire_command(args: &[std::ffi::OsString]) -> Result<()> {
             }
             "--drop-rebuildable" if !options.drop_rebuildable => {
                 options.drop_rebuildable = true;
+                at += 1;
+            }
+            "--place-derived" if !options.place_derived => {
+                options.place_derived = true;
                 at += 1;
             }
             "--scan" => {

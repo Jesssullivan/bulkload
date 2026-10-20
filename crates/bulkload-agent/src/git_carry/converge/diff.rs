@@ -435,10 +435,9 @@ pub fn workspace(
             // the refs-in it runs first leaves that HEAD unreached).
             let clean = !advances
                 && refs_in
-                && beside.is_some()
-                && super::clean::assess(staged, target)
-                    .ok()
-                    .flatten()
+                && beside
+                    .and_then(|suffix| super::super::beside::namespace(suffix).ok())
+                    .and_then(|ns| super::clean::assess(staged, target, &ns).ok().flatten())
                     .is_some();
             if clean {
                 row.adopt = "refs-in";

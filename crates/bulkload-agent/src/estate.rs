@@ -2546,9 +2546,13 @@ fn apply_item(
                 // into: it lands beside.
                 let clean =
                     if options.refs_in && reason != BulkloadRefusal::GitDestinationNonrepoDiffers {
-                        git_carry::converge::clean::assess(&staged, &target)
-                            .ok()
-                            .flatten()
+                        git_carry::converge::clean::assess(
+                            &staged,
+                            &target,
+                            &git_carry::beside::namespace(suffix)?,
+                        )
+                        .ok()
+                        .flatten()
                     } else {
                         None
                     };
@@ -2557,7 +2561,7 @@ fn apply_item(
                         clean,
                         (item, &staged),
                         (&target, &landing),
-                        (state, &identity, suffix),
+                        (state, &identity, suffix, options.place_derived),
                     )
                 });
                 let landed = cleaned.and_then(|cleaned| {
@@ -2709,7 +2713,7 @@ fn clean_item(
         &git_carry::converge::Target<'_>,
         &git_carry::converge::Landing<'_>,
     ),
-    (state, identity, suffix): (&Path, &str, &str),
+    (state, identity, suffix, place_derived): (&Path, &str, &str, bool),
 ) -> Result<Option<(&'static str, git_carry::converge::Applied)>> {
     let words = refs_in(
         item,
@@ -2718,11 +2722,13 @@ fn clean_item(
         (state, identity, suffix),
         (landing.capture, RefsIn::FOLLOW),
     )?;
-    if !git_carry::converge::clean::reachable_in(target.repository, clean.head())? {
+    let ns = git_carry::beside::namespace(suffix)?;
+    if !git_carry::converge::clean::reachable_in(target.repository, clean.head(), &ns)? {
         return Ok(None);
     }
     let record = files_record_path(state, landing.item, target.source);
-    let mut applied = git_carry::converge::clean::land(clean, target, landing, (&record, suffix))?;
+    let mut applied =
+        git_carry::converge::clean::land(clean, target, landing, (&record, suffix, place_derived))?;
     applied.custody = Some(match applied.custody.take() {
         Some(more) => format!("{more} {words}"),
         None => words,
@@ -2802,16 +2808,16 @@ fn files_summary(
     let current = capture.is_some_and(|capture| {
         blake3::Hash::from_bytes(record.capture).to_hex().as_str() == capture
     });
-    Some(
-        if record.item == identity && current && record.done && record.occupied.is_empty() {
-            Ok(FilesSummary {
-                tracked: record.tracked,
-                tally: record.tally,
-            })
-        } else {
-            Err("files-record-mismatch")
-        },
-    )
+    Some(if record.undone {
+        Err("files-undone")
+    } else if record.item == identity && current && record.done && record.occupied.is_empty() {
+        Ok(FilesSummary {
+            tracked: record.tracked,
+            tally: record.tally,
+        })
+    } else {
+        Err("files-record-mismatch")
+    })
 }
 
 /// Whether the last `.beside` record of `identity` in `states` proves its
@@ -4287,6 +4293,11 @@ pub struct ApplyOptions {
     /// After an advance, the item's beside landing is retired once proved
     /// equal to the live tree ([`git_carry::beside::retire`]).
     pub advance_ancestor: bool,
+    /// `--place-derived`: a clean source's derived untracked or ignored
+    /// entries (build output and the like, [`git_carry::converge::files::class_of`])
+    /// are written as any entry; without it they are held, counted and
+    /// listed, until the operator rules on build output.
+    pub place_derived: bool,
 }
 
 /// Apply explicit restores only; common Git administration is serialized.
@@ -4712,6 +4723,10 @@ pub mod moving;
 
 // `estate-beside-retire` (operator ruling 2026-10-16 21:24Z).
 pub mod beside_retire;
+
+// `estate-placements`: the placements a clean-source apply or a beside
+// retirement made, listed and taken back.
+pub mod placements;
 
 // S4 refusal sweep (2026-10-08): #219, #220, #162, #183.
 #[cfg(test)]

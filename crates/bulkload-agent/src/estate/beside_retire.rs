@@ -43,6 +43,9 @@ pub struct RetireOptions {
     /// `--drop-rebuildable`: entries under a rebuildable root go with the
     /// tree, counted, as a capture omits them.
     pub drop_rebuildable: bool,
+    /// `--place-derived`: derived output a retirement needs placed is
+    /// placed (held otherwise, and the tree kept).
+    pub place_derived: bool,
 }
 
 /// What one run found and did.
@@ -88,7 +91,7 @@ impl Summary {
 fn proof_words(proof: &subset::Proof) -> String {
     let tally = &proof.tally;
     format!(
-        "shape={} head={} tracked={} present={} to-place={} to-beside={} beside-present={} dirs-present={} dirs-to-place={} dirs-beside={} rebuildable-dropped={} handoff={} refs-to-import={} reflog-to-carry={} reflog-objects-to-carry={} prunable-worktrees={} bytes={}",
+        "shape={} head={} tracked={} present={} to-place={} to-beside={} beside-present={} dirs-present={} dirs-to-place={} dirs-beside={} to-write-source={} to-write-derived={} derived={} rebuildable-dropped={} rebuildable-dropped-live-equal={} handoff={} refs-to-import={} reflog-to-carry={} reflog-objects-to-carry={} prunable-worktrees={} bytes={}",
         proof.shape.word(),
         if proof.head.is_empty() { "-" } else { &proof.head },
         proof.tracked,
@@ -99,7 +102,15 @@ fn proof_words(proof: &subset::Proof) -> String {
         tally.dirs_adopted,
         tally.dirs_placed,
         tally.dirs_beside,
+        tally.written_source,
+        tally.written_derived,
+        tally.derived,
         proof.rebuildable,
+        proof
+            .dropped
+            .iter()
+            .filter(|(_, state)| state == "equal")
+            .count(),
         proof.handoff,
         proof.refs.len(),
         proof.reflogs.len(),
@@ -164,6 +175,7 @@ pub fn run(options: &RetireOptions, out: &mut dyn FnMut(&str) -> Result<()>) -> 
             ns: &ns,
             source: &options.source,
             drop_rebuildable: options.drop_rebuildable,
+            place_derived: options.place_derived,
         };
         // A refusal proving one tree is that tree's typed answer; the run
         // goes on to the next.

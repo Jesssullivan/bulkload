@@ -347,6 +347,9 @@ struct Move {
     /// `--advance-ancestor` (operator ruling 2026-10-19), passed to the
     /// apply.
     advance_ancestor: bool,
+    /// `--place-derived`, passed to the apply: a clean source's derived
+    /// entries are written too (held until the operator rules otherwise).
+    place_derived: bool,
     handoff: bool,
     sessions: Option<PathBuf>,
     codex_root: Option<PathBuf>,
@@ -373,6 +376,7 @@ impl Move {
             side_roots: Vec::new(),
             exclude_union: false,
             advance_ancestor: false,
+            place_derived: false,
             handoff: true,
             sessions: None,
             codex_root: None,
@@ -409,6 +413,10 @@ impl Move {
                 }
                 "--advance-ancestor" if !parsed.advance_ancestor => {
                     parsed.advance_ancestor = true;
+                    step = 1;
+                }
+                "--place-derived" if !parsed.place_derived => {
+                    parsed.place_derived = true;
                     step = 1;
                 }
                 "--no-hand-off" if parsed.handoff => {
@@ -645,6 +653,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
                 beside: Some(suffix),
                 refs_in: true,
                 advance_ancestor: run.advance_ancestor,
+                place_derived: run.place_derived,
             },
         ),
         &|row| {

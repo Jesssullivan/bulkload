@@ -7,21 +7,28 @@
 //! are retired here when their content is a subset of the live repository
 //! by that same rule. [`prove`] reads one, read-only:
 //!
+//! 0. no process with its working directory or an open file inside it
+//!    (`in-use`; again before the rename and in the removal);
 //! 1. its shape: an empty directory (a refused carry's leftover) is
-//!    retirable as it is; otherwise a checkout, whose live path holds a
+//!    retirable as it is; otherwise a checkout bulkload landed (its
+//!    workspace ledger for SOURCE in its git directory, else
+//!    `not-bulkload-landed`), whose live path holds a
 //!    checkout: a linked worktree of the live repository whose
 //!    administration directory names it back (a copy of another worktree,
 //!    its gitfile naming that one's, refuses `worktree-link`), or a
 //!    standalone repository whose `.git` is a directory in the tree;
 //! 2. **tracked-clean**: no staged or unstaged change, no operation in
 //!    progress, no hidden index flag, no index lock;
-//! 3. **its HEAD reachable in the live repository** from a ref (provenance
-//!    `refs/carry*` aside, and never through its own worktree HEAD);
+//! 3. **its HEAD reachable in the live repository** from its local
+//!    branches, its tags or this item's namespace (`refs/<ns>/`,
+//!    `refs/<ns>-stash/`; never provenance, a remote-tracking ref, the
+//!    stash or its own worktree HEAD);
 //! 4. **nothing its Git holds lost with it**: a linked tree has no lock and
-//!    no per-worktree ref, and every commit its reflogs name is reachable
-//!    in the live repository; a standalone one has no worktree and no hook
-//!    of its own, and every commit its refs, stash and reflogs name is in
-//!    the live repository and reachable there (`unreachable:<name>`; a
+//!    no per-worktree ref; a standalone one has no live worktree (a gone,
+//!    prunable one's HEAD and reflogs are proved as its own) and no hook of
+//!    its own, and every commit its refs and stash name is in the live
+//!    repository and reachable there from those same refs
+//!    (`unreachable:<name>`; a
 //!    remote-tracking ref's own word, `unreachable-remote:`). Its branches,
 //!    tags and other refs (remote-tracking ones aside, which a fetch
 //!    rebuilds) are held by the live repository by name and value,
@@ -33,7 +40,12 @@
 //!    `info/` files refuse `unknown-git:<name>`), the live repository does
 //!    not borrow its objects (`borrowed-by-live`), and its configuration
 //!    (without an include, `config-include`) and `info/exclude` bytes are
-//!    kept in the retirement's ledger record;
+//!    kept in the retirement's ledger record (and a bulkload landing's
+//!    `.git/carry-config` receipts). A commit only its reflogs name is
+//!    never dropped (operator ruling 2026-10-16, "full history. drop
+//!    nothing. ever."): it is counted, and the retirement carries it in
+//!    under `refs/<ns>/reflog/<tree>-<tag>/<oid>` (its objects too, packed
+//!    from the tree, when the live store lacks them);
 //! 5. **every untracked and ignored entry present and equal in the live
 //!    checkout, or landed there as a file-level beside**: the file-level
 //!    reconcile of [`super::super::converge::files`] plans each one (an
@@ -44,8 +56,12 @@
 //!    rebuildable root (the capture's own
 //!    [`super::super::REBUILDABLE_DIRECTORIES`], a real directory nothing
 //!    tracked is under) refuses `rebuildable:<path>`, unless the run drops
-//!    them as a capture omits them (`--drop-rebuildable`: counted, never
-//!    reconciled). A nested repository refuses `nested:<path>`.
+//!    them as a capture omits them (`--drop-rebuildable`: each ledgered,
+//!    with what the live checkout holds at its path). Derived output
+//!    ([`super::super::converge::files::class_of`]) the reconcile would
+//!    have to write refuses `derived-held:<path>` until the operator rules
+//!    on build output (`--place-derived` writes it). A nested repository
+//!    refuses `nested:<path>`.
 //!
 //! The tree's prints (and a linked tree's administration directory's) are
 //! taken before the proof and after it (a session writing there refuses
@@ -123,6 +139,9 @@ pub struct Proof {
     /// Entries under a rebuildable root (`--drop-rebuildable`), not
     /// reconciled.
     pub rebuildable: u64,
+    /// Each of them, with what the live checkout holds at its path
+    /// (`equal`, `differs`, `absent`), for the ledger.
+    pub dropped: Vec<(Vec<u8>, String)>,
     /// Hand-off targets bulkload wrote there (a sealed block above a
     /// tracked file's bytes, or a target it created): bulkload's own.
     pub handoff: u64,
@@ -171,6 +190,9 @@ pub struct Rules<'a> {
     /// and go with the tree, as a capture omits them; without it one
     /// refuses `rebuildable:<path>`.
     pub drop_rebuildable: bool,
+    /// `--place-derived`: derived output is placed as any entry; without
+    /// it a tree that would need one placed refuses `derived-held:<path>`.
+    pub place_derived: bool,
 }
 
 /// [`prove`]'s answer.
@@ -269,17 +291,23 @@ fn standalone_refs(
 // in the live repository at `live` or not reachable there, naming the
 // first such (a remote-tracking ref's apart: a fetch may bring it back);
 // `None` when every one is.
-fn unreachable(live: &Path, mut commits: Vec<(String, String)>) -> Option<String> {
+fn unreachable(
+    live: &Path,
+    tips: &BTreeSet<String>,
+    mut commits: Vec<(String, String)>,
+) -> Option<String> {
     commits.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     commits.dedup_by(|a, b| a.1 == b.1);
     let all: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
-    if retire::reachable(live, &all) {
+    let unreached: BTreeSet<String> = clean::unreached_from(live, &all, tips)
+        .into_iter()
+        .collect();
+    if unreached.is_empty() {
         return None;
     }
     commits.sort_by_key(|(name, _)| (name.starts_with("refs/remotes/"), name.clone()));
-    // At most 256 single reads to name it; past them, unnamed.
-    for (name, commit) in commits.iter().take(256) {
-        if !retire::reachable(live, std::slice::from_ref(commit)) {
+    for (name, commit) in &commits {
+        if unreached.contains(commit) {
             let kind = if name.starts_with("refs/remotes/") {
                 "unreachable-remote"
             } else {
@@ -560,7 +588,7 @@ fn receipts(git_dir: &Path) -> Result<Option<Receipts>> {
 #[allow(clippy::type_complexity)]
 fn unreached(
     beside: &Path,
-    live: &Path,
+    (live, tips): (&Path, &BTreeSet<String>),
     mut logged: Vec<String>,
 ) -> Result<std::result::Result<(Vec<String>, u64), String>> {
     logged.retain(|commit| oid(commit));
@@ -603,11 +631,12 @@ fn unreached(
         absent = u64::try_from(missing.len()).unwrap_or(u64::MAX);
         unreached.extend(missing);
     }
-    for commit in logged.iter().filter(|commit| in_live.contains(*commit)) {
-        if !retire::reachable(live, std::slice::from_ref(commit)) {
-            unreached.push(commit.clone());
-        }
-    }
+    let held: Vec<String> = logged
+        .iter()
+        .filter(|commit| in_live.contains(*commit))
+        .cloned()
+        .collect();
+    unreached.extend(clean::unreached_from(live, &held, tips));
     unreached.sort();
     Ok(Ok((unreached, absent)))
 }
@@ -686,6 +715,24 @@ fn carry_reflogs(
     Ok(Ok(wanted.into_iter().collect()))
 }
 
+// What the live checkout at `live` holds at `path` against the beside
+// tree's entry there: `equal`, `differs` or `absent`.
+fn compared(beside: &Path, live: &Path, path: &[u8]) -> Result<String> {
+    let at = live.join(OsStr::from_bytes(path));
+    if fs::symlink_metadata(&at).is_err() {
+        return Ok("absent".to_owned());
+    }
+    let Some(want) = Want::on_disk(beside, path.to_vec())? else {
+        return Ok("differs".to_owned());
+    };
+    Ok(if files::holds_want(None, &at, &want)? {
+        "equal"
+    } else {
+        "differs"
+    }
+    .to_owned())
+}
+
 /// Prove the beside tree at `beside` a subset of the live checkout at
 /// `live` (module docs), by `rules`. Read-only.
 ///
@@ -700,6 +747,12 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     if !meta.is_dir() {
         return Ok(refused("not-a-directory"));
     }
+    // No process has its working directory or an open file inside it (the
+    // advance retirement's check; again before the rename, and in the
+    // removal).
+    if retire::in_use(beside)? {
+        return Ok(refused("in-use"));
+    }
     let empty_prints = retire::prints(beside, None)?;
     if fs::read_dir(beside).refuse_at(SITE)?.next().is_none() {
         return Ok(Verdict::Retirable(Box::new(Proof {
@@ -708,6 +761,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             tracked: 0,
             tally: Tally::default(),
             rebuildable: 0,
+            dropped: Vec::new(),
             handoff: 0,
             refs: Vec::new(),
             bytes: meta.blocks() * 512,
@@ -758,6 +812,13 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     } else {
         return Ok(refused("other-repository"));
     };
+    // Only a tree bulkload landed (its workspace ledger for this SOURCE in
+    // its git directory) is one this proof may retire: a copy no ledger
+    // names is the operator's.
+    if !landed::exists(&landed::ledger_dir(&git_dir, rules.source).join(landed::WORKSPACE_LANDED))?
+    {
+        return Ok(refused("not-bulkload-landed"));
+    }
     let admin = (shape == Shape::Linked).then(|| git_dir.clone());
     // The prints before the proof (the tree's, and a linked tree's
     // administration's): a write while it reads them refuses `raced`.
@@ -776,7 +837,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     if head.is_empty() {
         return Ok(refused("unborn"));
     }
-    if !clean::reachable_in(live, &head)? {
+    if !clean::reachable_in(live, &head, rules.ns)? {
         return Ok(refused(format!("unreachable:head={head}")));
     }
     // 4. Its Git: every commit it names, with the name it is reported
@@ -853,11 +914,12 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         Shape::Empty => {}
     }
     let tips: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
-    if let Some(why) = unreachable(live, commits) {
+    let live_tips = clean::live_tips(live, rules.ns)?;
+    if let Some(why) = unreachable(live, &live_tips, commits) {
         return Ok(refused(why));
     }
     // The commits only its reflogs name: carried in, never dropped.
-    let (reflogs, reflogs_absent) = match unreached(beside, live, logged)? {
+    let (reflogs, reflogs_absent) = match unreached(beside, (live, &live_tips), logged)? {
         Ok(found) => found,
         Err(why) => return Ok(refused(why)),
     };
@@ -872,6 +934,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         }
     }
     let mut rebuildable = 0_u64;
+    let mut dropped: Vec<(Vec<u8>, String)> = Vec::new();
     let mut handoff = blocks;
     let mut roots: Vec<Vec<u8>> = Vec::new();
     let mut wants = Vec::new();
@@ -895,6 +958,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
                 .is_some_and(|rest| rest.first() == Some(&b'/'))
         }) {
             rebuildable += 1;
+            dropped.push((path.clone(), compared(beside, live, &path)?));
             continue;
         }
         if entry.meta.is_dir()
@@ -907,6 +971,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
                 return Ok(refused(format!("rebuildable:{}", shown(&path))));
             }
             rebuildable += 1;
+            dropped.push((path.clone(), compared(beside, live, &path)?));
             roots.push(path);
             continue;
         }
@@ -917,9 +982,24 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     }
     wants.sort_by(|a, b| a.path.cmp(&b.path));
     let live_tracked = files::index_paths(live)?;
-    let planned = files::plan(live, rules.suffix, (&wants, &live_tracked), None)?;
+    let planned = files::plan(
+        live,
+        rules.suffix,
+        (&wants, &live_tracked),
+        rules.place_derived,
+        None,
+    )?;
     if let Some(first) = planned.occupied().first() {
         return Ok(refused(format!("occupied:{}", shown(first))));
+    }
+    // Derived output it would have to place waits for the operator's
+    // ruling on build output: the tree keeps it meanwhile.
+    if let Some(first) = planned.held(&wants).first() {
+        return Ok(refused(format!(
+            "derived-held:{}(+{})",
+            shown(first),
+            planned.held(&wants).len()
+        )));
     }
     if retire::prints(beside, admin.as_deref())? != before {
         return Ok(refused("raced"));
@@ -930,8 +1010,9 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         shape,
         head,
         tracked: files,
-        tally: planned.tally(),
+        tally: planned.tally(&wants),
         rebuildable,
+        dropped,
         handoff,
         refs,
         bytes,
@@ -970,6 +1051,11 @@ pub struct RetiredRecord {
     pub prunable: u64,
     /// The refs its reflog commits went in under, `(name, commit)`.
     pub reflogs: Vec<(String, String)>,
+    /// Each rebuildable entry dropped with it, and what the live checkout
+    /// held at its path (`equal`, `differs`, `absent`).
+    pub dropped: Vec<(Vec<u8>, String)>,
+    /// Its reconcile's record (every placement, by identity).
+    pub files_record: Vec<u8>,
     /// Unix nanoseconds at the proof.
     pub at_ns: i128,
     /// The removal began (the tree is renamed aside or gone).
@@ -1140,6 +1226,8 @@ pub fn retire(
         exclude: proof.exclude.clone(),
         carried: proof.carried.clone(),
         prunable: proof.prunable,
+        dropped: proof.dropped.clone(),
+        files_record: files_record.as_os_str().as_bytes().to_vec(),
         at_ns,
         ..RetiredRecord::default()
     };
@@ -1165,25 +1253,31 @@ pub fn retire(
     files::settle(&files_record)?;
     let salt = files_record.as_os_str().as_bytes();
     let live_tracked = files::index_paths(live)?;
-    let planned = files::plan(live, rules.suffix, (&proof.wants, &live_tracked), None)?;
-    if !planned.occupied().is_empty() {
+    let planned = files::plan(
+        live,
+        rules.suffix,
+        (&proof.wants, &live_tracked),
+        rules.place_derived,
+        None,
+    )?;
+    if !planned.occupied().is_empty() || !planned.held(&proof.wants).is_empty() {
         return Ok(Retired::Kept("raced".to_owned()));
     }
-    let mut reconciled = files::FilesRecord {
-        item: item.clone(),
-        capture: *blake3::hash(proof.head.as_bytes()).as_bytes(),
-        live: record.live.clone(),
-        suffix: rules.suffix.to_owned(),
-        tracked: proof.tracked,
-        temps: files::temps(live, &planned, salt),
-        dirs: files::dirs(live, &planned, &proof.wants)?,
-        besides: planned.besides(&proof.wants),
-        ..files::FilesRecord::default()
-    };
-    landed::write(&files_record, &reconciled)?;
-    reconciled.tally = files::execute(live, &planned, &proof.wants, salt, None)?;
-    reconciled.done = true;
-    landed::write(&files_record, &reconciled)?;
+    let mut journal = files::Journal::begin(
+        &files_record,
+        files::FilesRecord {
+            item: item.clone(),
+            capture: *blake3::hash(proof.head.as_bytes()).as_bytes(),
+            live: record.live.clone(),
+            suffix: rules.suffix.to_owned(),
+            tracked: proof.tracked,
+            temps: files::temps(live, &planned, salt),
+            besides: planned.besides(&proof.wants),
+            ..files::FilesRecord::default()
+        },
+    )?;
+    let tally = files::execute(live, &planned, &proof.wants, (salt, &mut journal), None)?;
+    journal.finish(tally)?;
     // The refs, create-only: a name taken since keeps the tree.
     if !proof.refs.is_empty() {
         let wanted: BTreeMap<String, String> = proof.refs.iter().cloned().collect();

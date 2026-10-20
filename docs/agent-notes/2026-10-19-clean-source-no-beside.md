@@ -131,6 +131,33 @@ One adversarial read-only review (a refuter subagent, nothing run) at
 | m8 | live tips counted remote-tracking refs and the stash | fixed: excluded |
 | m9 | carry-files: a crash after the mkdir leaves an empty directory forever; a partial transfer leaves a non-empty beside | first fixed (an empty beside destination is removed on refusal); the second left: a partial transfer's bytes are its resume state, recorded in its transfer rows |
 
+## Coordinator decisions and the independent review (2026-10-20)
+
+- Reflog-only commits (operator ruling 2026-10-16, "full history. drop
+  nothign. ever."): carried into the namespace, `refs/<ns>/reflog/<tree>-<tag>/<oid>`,
+  create-only, ledgered and counted, objects packed from the beside tree
+  when the live store lacks them (`894c0e3`).
+- `estate-move --plan-only` previews `adopt:refs-in` with `beside=none`
+  (`estate-diff --refs-in`).
+- estate-handoff into a `workspace-refs-in` live checkout: **not done**.
+  Hand-off is bound to a workspace ledger (it proves a target's bytes as
+  the landed blob plus its block, and records `handoff.landed` beside
+  `workspace.landed`); a refs-in live checkout is sting's own, with no
+  ledger, and its `AGENTS.md`/`CLAUDE.md` are sting's tracked files. Writing
+  a block there needs a design decision, not a small fix.
+
+Independent review of #291 at `d310063` (relayed by the coordinator):
+
+| # | Finding | Disposition |
+| --- | --- | --- |
+| 1 | rebuild on #289's head; use its in-use checks and admin re-proof | merged `583c0b9` (`7c34e60`) and `ae09525` (`44ccc8c`); `remove_proved` is rebuilt on #289's retire (its `in_use` before the rename and in `finish`, its admin-inclusive prints); the proof also refuses `in-use` up front |
+| 2 | record every placement; undo or list; hold placements pending the build-output ruling; classify source-like vs derived | every directory made and every file placed or landed beside is recorded by identity as it goes; `estate-placements [--undo]`; `class_of` (`build/`, `dist/`, `.svelte-kit/`, `.artifacts/`, `bazel-*`, `mktemp`-named, `.serena/`, rebuildable roots); derived writes held by default (`--place-derived`), counted per class in receipts and the retire report |
+| 3 | refs-in `kept` ignored by closure | a `workspace-refs-in` row with `refs_in.kept > 0` is `refused-pending-review` `GIT_DESTINATION_OCCUPIED` (C11) |
+| 4 | reachability counted remotes, stash, provenance | one ref set for HEAD and every commit: local branches, tags and this item's namespace |
+| 5 | settle touched directories it never made; EEXIST counted placed; no total check | directories recorded by inode as made; settle and undo touch only those; EEXIST is adopted; the tally must equal the planned entries |
+| 6 | scan took any `*SUFFIX` directory | a tree must carry a bulkload workspace ledger for SOURCE (`not-bulkload-landed`), R6 |
+| 7 | path-based writes; gitlinks; dropped rebuildables only counted | writes through `openat` descriptors (`O_NOFOLLOW` per component, `mkdirat`, `create_excl_at`, `renameat2`); files under a gitlink whose checkout is missing refuse `GIT_DESTINATION_PARENT_MISSING`; each dropped rebuildable path ledgered with `equal`/`differs`/`absent` against the live checkout |
+
 ## Report-only run on sting (read-only)
 
 2026-10-20 ~06:20Z, `estate-beside-retire --scan /srv/fast-local/jess/git

@@ -26,31 +26,42 @@
 //! - `<path>SUFFIX` itself held by something else: **occupied**, nothing
 //!   written there; the caller refuses the item `GIT_BESIDE_FOREIGN`
 //!   naming that path, after every other entry is in.
+//! - **derived** output ([`class_of`]: `build/`, `dist/`, `.svelte-kit/`,
+//!   `.artifacts/`, a `bazel-*` link, a `mktemp`-named directory,
+//!   `.serena/`, the capture's rebuildable roots) that would be written is
+//!   **held**: counted and listed, never written, until the operator rules
+//!   on build output (the coordinator, 2026-10-20); it stays in the
+//!   capture's provenance (an apply) or keeps its beside tree (a
+//!   retirement). `place_derived` writes it as any entry.
 //!
 //! Nothing is excluded and nothing is dropped: every entry ends counted in
-//! exactly one of those classes. The temporaries a pass is about to make
-//! are recorded write-ahead ([`FilesRecord`]); a pass a crash cut short
-//! leaves only those, which the next pass removes ([`settle`]) before it
-//! plans again. A rerun finds what the last one placed equal, and adopts
-//! it.
+//! exactly one of those classes, and the count is checked. Every write is
+//! made through directory descriptors opened beneath the live checkout one
+//! component at a time, never following a link. The temporaries a pass is
+//! about to make are recorded write-ahead ([`FilesRecord`]), each directory
+//! it made (by its identity) as it makes it, and what it placed or landed
+//! beside (by identity) as it goes: [`settle`] finishes a pass a crash cut
+//! short (its temporaries removed, the directories it made sealed or, when
+//! empty, removed), and [`undo`] takes back every placement still as it was
+//! placed. A rerun finds what the last one placed equal, and adopts it.
 
 use crate::refuse::RefuseAt as _;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::{CString, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{
-    DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
-};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use super::super::batch_objects::BatchObjects;
 use super::super::landed::{self, Kind};
-use super::super::{git, output};
+use super::super::{git, output, REBUILDABLE_DIRECTORIES};
 use super::{holds, lstat, Side};
+use crate::io::sys;
 use crate::{BulkloadRefusal, Result};
 
 const SITE: &str = "git_carry::converge::files";
@@ -116,6 +127,56 @@ impl Want {
     }
 }
 
+/// What an entry is, for the build-output ruling the operator is asked for
+/// (the coordinator, 2026-10-20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Class {
+    /// Source-like: written by a person or an agent.
+    Source,
+    /// Derived: build or tool output a build or a tool makes again.
+    Derived,
+}
+
+// Whether a path component is a `mktemp`-style name: `<stem>.XXXXXX`, six
+// letters and digits with at least one upper-case letter or digit
+// (`.native-osstore-vendor.Ab3xZ9`).
+fn mktemp_named(name: &[u8]) -> bool {
+    let Some(dot) = name.iter().rposition(|byte| *byte == b'.') else {
+        return false;
+    };
+    let tail = name.get(dot + 1..).unwrap_or_default();
+    dot > 0
+        && tail.len() == 6
+        && tail.iter().all(u8::is_ascii_alphanumeric)
+        && tail
+            .iter()
+            .any(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+/// The class of the entry at `path` (relative).
+///
+/// Derived when a component is `build`, `dist`, `.svelte-kit`,
+/// `.artifacts`, `.serena`, one of the capture's rebuildable roots, a
+/// `bazel-*` name or a `mktemp`-style name; source-like otherwise.
+#[must_use]
+pub fn class_of(path: &[u8]) -> Class {
+    let derived = path.split(|byte| *byte == b'/').any(|part| {
+        matches!(
+            part,
+            b"build" | b"dist" | b".svelte-kit" | b".artifacts" | b".serena"
+        ) || part.starts_with(b"bazel-")
+            || REBUILDABLE_DIRECTORIES
+                .iter()
+                .any(|name| name.as_bytes() == part)
+            || mktemp_named(part)
+    });
+    if derived {
+        Class::Derived
+    } else {
+        Class::Source
+    }
+}
+
 /// How every entry of one reconcile ended.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tally {
@@ -136,8 +197,16 @@ pub struct Tally {
     pub dirs_beside: u64,
     /// Entries whose beside path holds something else: nothing written.
     pub occupied: u64,
+    /// Derived entries that would be written, held for the ruling.
+    pub held: u64,
     /// Bytes written by placements and beside landings.
     pub bytes: u64,
+    /// Of the entries, those [`class_of`] calls derived (any action).
+    pub derived: u64,
+    /// Of the entries written or to write (placed, beside, made), those
+    /// that are source-like and those that are derived.
+    pub written_source: u64,
+    pub written_derived: u64,
 }
 
 impl Tally {
@@ -152,13 +221,14 @@ impl Tally {
             + self.dirs_adopted
             + self.dirs_beside
             + self.occupied
+            + self.held
     }
 
     /// The receipt words.
     #[must_use]
     pub fn words(&self) -> String {
         format!(
-            "files-placed={} files-adopted={} files-beside={} files-beside-present={} dirs-placed={} dirs-adopted={} dirs-beside={} files-occupied={} files-bytes-placed={}",
+            "files-placed={} files-adopted={} files-beside={} files-beside-present={} dirs-placed={} dirs-adopted={} dirs-beside={} files-occupied={} files-held-derived={} files-derived={} files-written-source={} files-written-derived={} files-bytes-placed={}",
             self.placed,
             self.adopted,
             self.beside,
@@ -167,9 +237,34 @@ impl Tally {
             self.dirs_adopted,
             self.dirs_beside,
             self.occupied,
+            self.held,
+            self.derived,
+            self.written_source,
+            self.written_derived,
             self.bytes,
         )
     }
+}
+
+/// One directory a pass made, by identity, and the mode it ends at.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Made {
+    pub path: Vec<u8>,
+    pub dev: u64,
+    pub ino: u64,
+    pub mode: u32,
+}
+
+/// One file or link a pass placed (or landed beside), by identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Placed {
+    pub path: Vec<u8>,
+    pub dev: u64,
+    pub ino: u64,
+    pub size: u64,
+    pub mtime_ns: i128,
+    /// Landed beside (`<path>SUFFIX`), not at its own path.
+    pub beside: bool,
 }
 
 /// What STATE records of one reconcile (`{item}-{blake3(SOURCE)}.files`
@@ -190,9 +285,12 @@ pub struct FilesRecord {
     pub tracked: u64,
     /// The temporaries this pass may leave (write-ahead).
     pub temps: Vec<Vec<u8>>,
-    /// The directories this pass may make, shallowest first, with the mode
-    /// each ends at (write-ahead).
-    pub dirs: Vec<(Vec<u8>, u32)>,
+    /// The directories this pass made, as it made them.
+    pub made: Vec<Made>,
+    /// The files and links it placed or landed beside, as it went (in
+    /// batches: a crash may leave the last few unlisted, each the source's
+    /// bytes, which the next pass adopts).
+    pub placed: Vec<Placed>,
     /// The pass ended: `tally` is its count.
     pub done: bool,
     pub tally: Tally,
@@ -200,10 +298,14 @@ pub struct FilesRecord {
     pub besides: Vec<(Vec<u8>, Vec<u8>)>,
     /// The beside paths that hold something else.
     pub occupied: Vec<Vec<u8>>,
+    /// The derived entries held for the ruling (relative to the source).
+    pub held: Vec<Vec<u8>>,
+    /// [`undo`] took the placements back.
+    pub undone: bool,
 }
 
 impl landed::Record for FilesRecord {
-    const MAGIC: &'static [u8; 16] = b"bulkload-files01";
+    const MAGIC: &'static [u8; 16] = b"bulkload-files02";
 }
 
 /// The record at `path`, if any.
@@ -214,13 +316,69 @@ pub fn read_record(path: &Path) -> Result<Option<FilesRecord>> {
     landed::read::<FilesRecord>(path)
 }
 
+/// A pass's record, written as it goes.
+pub(in crate::git_carry) struct Journal<'a> {
+    path: &'a Path,
+    pub record: FilesRecord,
+    unsaved: usize,
+}
+
+impl<'a> Journal<'a> {
+    /// Write `record` at `path` (write-ahead) and keep it.
+    ///
+    /// # Errors
+    /// IO.
+    pub(in crate::git_carry) fn begin(path: &'a Path, record: FilesRecord) -> Result<Self> {
+        landed::write(path, &record)?;
+        Ok(Self {
+            path,
+            record,
+            unsaved: 0,
+        })
+    }
+
+    fn made(&mut self, made: Made) -> Result<()> {
+        self.record.made.push(made);
+        self.save()
+    }
+
+    fn placed(&mut self, placed: Placed) -> Result<()> {
+        self.record.placed.push(placed);
+        self.unsaved += 1;
+        if self.unsaved >= 128 {
+            self.save()?;
+        }
+        Ok(())
+    }
+
+    fn save(&mut self) -> Result<()> {
+        self.unsaved = 0;
+        landed::write(self.path, &self.record)
+    }
+
+    /// Record the pass finished with `tally`.
+    ///
+    /// # Errors
+    /// IO.
+    pub(in crate::git_carry) fn finish(mut self, tally: Tally) -> Result<FilesRecord> {
+        self.record.tally = tally;
+        self.record.done = true;
+        self.save()?;
+        Ok(self.record)
+    }
+}
+
+fn path_of(bytes: &[u8]) -> &Path {
+    Path::new(OsStr::from_bytes(bytes))
+}
+
 /// Settle what an unfinished pass recorded at `path` left.
 ///
 /// Its temporaries are removed (a regular file or a link at a recorded
-/// private name), and each directory it may have made, deepest first, is
-/// removed when empty or given its mode when still the `0700` it was made
-/// at (nothing else is touched). The next pass plans again. A finished
-/// record is left as it is.
+/// private name), and each directory it made (its identity unchanged),
+/// deepest first, is removed when empty or given its mode when still the
+/// `0700` it was made at; nothing else is touched. The next pass plans
+/// again. A finished record is left as it is.
 ///
 /// # Errors
 /// IO.
@@ -232,7 +390,7 @@ pub fn settle(path: &Path) -> Result<()> {
         return Ok(());
     }
     for temp in &record.temps {
-        let temp = Path::new(OsStr::from_bytes(temp));
+        let temp = path_of(temp);
         let private = temp
             .file_name()
             .is_some_and(|name| name.as_bytes().starts_with(TEMP_PREFIX.as_bytes()));
@@ -245,21 +403,92 @@ pub fn settle(path: &Path) -> Result<()> {
             }
         }
     }
-    for (dir, mode) in record.dirs.iter().rev() {
-        let dir = Path::new(OsStr::from_bytes(dir));
+    seal_made(&record.made, false)
+}
+
+// Each directory in `made` still the one made (identity), deepest first:
+// removed when empty; else, unless `only_empty`, given its mode when still
+// `0700`.
+fn seal_made(made: &[Made], only_empty: bool) -> Result<()> {
+    let mut made: Vec<&Made> = made.iter().collect();
+    made.sort_by_key(|made| std::cmp::Reverse(made.path.len()));
+    for made in made {
+        let dir = path_of(&made.path);
         let Some(meta) = lstat(dir)? else {
             continue;
         };
-        if !meta.is_dir() {
+        if !meta.is_dir() || meta.dev() != made.dev || meta.ino() != made.ino {
             continue;
         }
         if fs::read_dir(dir).refuse_at(SITE)?.next().is_none() {
             fs::remove_dir(dir).refuse_at(SITE)?;
-        } else if meta.mode() & 0o7777 == 0o700 && mode & 0o7777 != 0o700 {
-            fs::set_permissions(dir, fs::Permissions::from_mode(mode & 0o7777)).refuse_at(SITE)?;
+        } else if !only_empty && meta.mode() & 0o7777 == 0o700 && made.mode & 0o7777 != 0o700 {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(dir, fs::Permissions::from_mode(made.mode & 0o7777))
+                .refuse_at(SITE)?;
         }
     }
     Ok(())
+}
+
+/// What [`undo`] did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Undone {
+    /// Files and links removed (still as placed).
+    pub removed: u64,
+    /// Files and links kept: gone, or changed since (identity, size or
+    /// time).
+    pub kept: u64,
+    /// Directories removed (made by the pass, empty now).
+    pub dirs: u64,
+}
+
+/// Take back the placements the record at `path` lists.
+///
+/// Each file or link still the one placed (identity, size and time
+/// unchanged) is removed, then each directory the pass made that is empty
+/// now; anything changed since is kept and counted. The record is marked
+/// undone.
+///
+/// # Errors
+/// IO.
+pub fn undo(path: &Path) -> Result<Undone> {
+    let Some(mut record) = read_record(path)? else {
+        return Ok(Undone::default());
+    };
+    let mut undone = Undone::default();
+    for placed in record.placed.iter().rev() {
+        let at = path_of(&placed.path);
+        let same = lstat(at)?.is_some_and(|meta| {
+            let identity = crate::freshness::StatIdentity::from_metadata(&meta);
+            meta.dev() == placed.dev
+                && meta.ino() == placed.ino
+                && identity.size == placed.size
+                && identity.mtime_ns == placed.mtime_ns
+                && !meta.is_dir()
+        });
+        if same {
+            fs::remove_file(at).refuse_at(SITE)?;
+            undone.removed += 1;
+        } else {
+            undone.kept += 1;
+        }
+    }
+    let before = record
+        .made
+        .iter()
+        .filter(|made| lstat(path_of(&made.path)).ok().flatten().is_some())
+        .count();
+    seal_made(&record.made, true)?;
+    let after = record
+        .made
+        .iter()
+        .filter(|made| lstat(path_of(&made.path)).ok().flatten().is_some())
+        .count();
+    undone.dirs = u64::try_from(before.saturating_sub(after)).unwrap_or(u64::MAX);
+    record.undone = true;
+    landed::write(path, &record)?;
+    Ok(undone)
 }
 
 /// The private name prefix of a placement's temporary.
@@ -277,6 +506,18 @@ pub(in crate::git_carry) enum Act {
     DirBeside,
     DirBesideAdopt,
     Occupied,
+    /// A derived entry that would be written, held for the ruling.
+    Held,
+}
+
+impl Act {
+    /// Whether the entry is written (placed, landed beside or made).
+    const fn writes(self) -> bool {
+        matches!(
+            self,
+            Self::Place | Self::Beside | Self::DirPlace | Self::DirBeside
+        )
+    }
 }
 
 /// One entry's decision: what it does and where (relative to the live
@@ -296,9 +537,22 @@ pub(in crate::git_carry) struct Planned {
 
 impl Planned {
     /// What the plan would count, written or not.
-    pub(in crate::git_carry) fn tally(&self) -> Tally {
+    pub(in crate::git_carry) fn tally(&self, wants: &[Want]) -> Tally {
         let mut tally = Tally::default();
         for step in &self.steps {
+            let class = wants
+                .get(step.want)
+                .map_or(Class::Source, |want| class_of(&want.path));
+            if class == Class::Derived {
+                tally.derived += 1;
+            }
+            if step.act.writes() {
+                if class == Class::Derived {
+                    tally.written_derived += 1;
+                } else {
+                    tally.written_source += 1;
+                }
+            }
             match step.act {
                 Act::Place => tally.placed += 1,
                 Act::Adopt => tally.adopted += 1,
@@ -308,9 +562,19 @@ impl Planned {
                 Act::DirAdopt => tally.dirs_adopted += 1,
                 Act::DirBeside | Act::DirBesideAdopt => tally.dirs_beside += 1,
                 Act::Occupied => tally.occupied += 1,
+                Act::Held => tally.held += 1,
             }
         }
         tally
+    }
+
+    /// The source paths of the entries held for the ruling.
+    pub(in crate::git_carry) fn held(&self, wants: &[Want]) -> Vec<Vec<u8>> {
+        self.steps
+            .iter()
+            .filter(|step| step.act == Act::Held)
+            .filter_map(|step| wants.get(step.want).map(|want| want.path.clone()))
+            .collect()
     }
 
     /// The beside landings, as `(source path, landed path)`.
@@ -502,14 +766,17 @@ fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
 ///
 /// `tracked` holds the paths the live index tracks: one absent on disk is
 /// the live checkout's own deletion, never undone, so a source entry there
-/// lands beside it.
+/// lands beside it. A derived entry ([`class_of`]) that would be written
+/// is held ([`Act::Held`], its subtree with it) unless `place_derived`.
 ///
 /// # Errors
 /// Whatever reading the live tree or the source refuses.
+#[allow(clippy::too_many_lines)] // One decision per entry, in order.
 pub(in crate::git_carry) fn plan(
     live: &Path,
     suffix: &str,
     (wants, tracked): (&[Want], &BTreeSet<Vec<u8>>),
+    place_derived: bool,
     mut objects: Option<&mut BatchObjects>,
 ) -> Result<Planned> {
     let mut steps = Vec::with_capacity(wants.len());
@@ -517,6 +784,7 @@ pub(in crate::git_carry) fn plan(
     let mut dest: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
     let mut made: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut occupied: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut held: BTreeSet<Vec<u8>> = BTreeSet::new();
     for (n, want) in wants.iter().enumerate() {
         if !plain(&want.path) {
             return Err(BulkloadRefusal::PathEscapesRoot);
@@ -539,6 +807,18 @@ pub(in crate::git_carry) fn plan(
             steps.push(Step {
                 want: n,
                 act: Act::Occupied,
+                at: join(dest.get(parent).map_or(parent, Vec::as_slice), leaf),
+            });
+            continue;
+        }
+        // An entry under a held directory is held with it.
+        if held.contains(parent) || ancestors(parent).any(|above| held.contains(above)) {
+            if want.side.kind == Kind::Directory {
+                held.insert(want.path.clone());
+            }
+            steps.push(Step {
+                want: n,
+                act: Act::Held,
                 at: join(dest.get(parent).map_or(parent, Vec::as_slice), leaf),
             });
             continue;
@@ -593,7 +873,15 @@ pub(in crate::git_carry) fn plan(
                 (act, beside)
             }
         };
+        let act = if act.writes() && !place_derived && class_of(&want.path) == Class::Derived {
+            Act::Held
+        } else {
+            act
+        };
         match act {
+            Act::Held if directory => {
+                held.insert(want.path.clone());
+            }
             Act::DirPlace | Act::DirBeside => {
                 made.insert(there.clone());
                 dest.insert(want.path.clone(), there.clone());
@@ -618,63 +906,24 @@ pub(in crate::git_carry) fn plan(
 /// The private temporary of a placement at `at` (relative to `live`), in
 /// its directory; `salt` keeps two reconciles' names apart.
 pub(in crate::git_carry) fn temp_of(live: &Path, at: &[u8], salt: &[u8]) -> PathBuf {
+    let parent = at.iter().rposition(|byte| *byte == b'/').map_or_else(
+        || live.to_path_buf(),
+        |slash| live.join(OsStr::from_bytes(at.get(..slash).unwrap_or_default())),
+    );
+    parent.join(OsStr::from_bytes(&temp_name(at, salt)))
+}
+
+// The temporary's file name for a placement at `at`.
+fn temp_name(at: &[u8], salt: &[u8]) -> Vec<u8> {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"bulkload-place-v1\0");
     hasher.update(&(salt.len() as u64).to_le_bytes());
     hasher.update(salt);
     hasher.update(at);
     let tag = hasher.finalize().to_hex();
-    let parent = at.iter().rposition(|byte| *byte == b'/').map_or_else(
-        || live.to_path_buf(),
-        |slash| live.join(OsStr::from_bytes(at.get(..slash).unwrap_or_default())),
-    );
-    parent.join(format!(
-        "{TEMP_PREFIX}{}",
-        tag.get(..24).unwrap_or_default()
-    ))
-}
-
-/// Every directory `planned` may make (write-ahead), shallowest first,
-/// with the mode it ends at: its directory steps, and the absent parents
-/// of every step (made `0755`).
-///
-/// # Errors
-/// Whatever reading the live tree refuses.
-pub(in crate::git_carry) fn dirs(
-    live: &Path,
-    planned: &Planned,
-    wants: &[Want],
-) -> Result<Vec<(Vec<u8>, u32)>> {
-    let mut found: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
-    for step in &planned.steps {
-        if step.act == Act::Occupied || step.act == Act::Adopt || step.act == Act::BesidePresent {
-            continue;
-        }
-        for above in ancestors(&step.at) {
-            if !found.contains_key(above) && lstat(&live.join(OsStr::from_bytes(above)))?.is_none()
-            {
-                found.insert(above.to_vec(), 0o755);
-            }
-        }
-        if matches!(step.act, Act::DirPlace | Act::DirBeside) {
-            let mode = wants.get(step.want).map_or(0o755, |want| want.side.mode);
-            found.insert(step.at.clone(), mode);
-        }
-    }
-    let mut dirs: Vec<(Vec<u8>, u32)> = found
-        .into_iter()
-        .map(|(at, mode)| {
-            (
-                live.join(OsStr::from_bytes(&at))
-                    .as_os_str()
-                    .as_bytes()
-                    .to_vec(),
-                mode,
-            )
-        })
-        .collect();
-    dirs.sort_by_key(|(at, _)| at.split(|byte| *byte == b'/').count());
-    Ok(dirs)
+    let mut name = TEMP_PREFIX.as_bytes().to_vec();
+    name.extend_from_slice(tag.get(..24).unwrap_or_default().as_bytes());
+    name
 }
 
 /// Every temporary `planned` may make (write-ahead).
@@ -692,39 +941,115 @@ pub(in crate::git_carry) fn temps(live: &Path, planned: &Planned, salt: &[u8]) -
         .collect()
 }
 
-fn cname(name: &OsStr) -> Result<CString> {
-    CString::new(name.as_bytes()).map_err(|_| BulkloadRefusal::PathNotPortable)
+fn cname(name: &[u8]) -> Result<CString> {
+    CString::new(name).map_err(|_| BulkloadRefusal::PathNotPortable)
 }
 
-// Make every absent directory above `rel` (0755, never through a link); a
-// path above it that is no directory is a destination change since the
-// plan.
-fn parents(live: &Path, rel: &[u8], synced: &mut BTreeSet<PathBuf>) -> Result<()> {
-    for above in ancestors(rel) {
-        let path = live.join(OsStr::from_bytes(above));
-        match lstat(&path)? {
-            Some(meta) if meta.is_dir() => {}
-            Some(_) => return Err(BulkloadRefusal::GitDestinationModified),
-            None => {
-                fs::DirBuilder::new()
-                    .mode(0o755)
-                    .create(&path)
-                    .or_else(|error| match error.kind() {
-                        std::io::ErrorKind::AlreadyExists if path.is_dir() => Ok(()),
-                        _ => Err(crate::refuse::io(&error, SITE)),
-                    })?;
-                if let Some(parent) = path.parent() {
-                    synced.insert(parent.to_path_buf());
-                }
-            }
-        }
+// `(parent, leaf)` of a relative path.
+fn split(rel: &[u8]) -> (&[u8], &[u8]) {
+    rel.iter()
+        .rposition(|byte| *byte == b'/')
+        .map_or((&[][..], rel), |slash| {
+            (
+                rel.get(..slash).unwrap_or_default(),
+                rel.get(slash + 1..).unwrap_or_default(),
+            )
+        })
+}
+
+// An IO failure where the live tree moved under the pass (a link or a file
+// where a directory was): a destination change, typed.
+fn moved(error: &std::io::Error) -> BulkloadRefusal {
+    match error.raw_os_error() {
+        Some(libc::ELOOP | libc::ENOTDIR) => BulkloadRefusal::GitDestinationModified,
+        _ => crate::refuse::io(error, SITE),
     }
-    Ok(())
 }
 
-// Write `want`'s bytes (or link) at `temp`, fsynced at its mode; the
-// bytes written.
-fn write_temp(temp: &Path, want: &Want, objects: Option<&mut BatchObjects>) -> Result<u64> {
+/// The live tree, written through directory descriptors opened beneath its
+/// root one component at a time, never following a link.
+struct Tree<'a> {
+    live: &'a Path,
+    root: OwnedFd,
+}
+
+impl<'a> Tree<'a> {
+    fn open(live: &'a Path) -> Result<Self> {
+        Ok(Self {
+            live,
+            root: sys::open_root(live).refuse_at(SITE)?,
+        })
+    }
+
+    // The directory `rel` beneath the root (the root for an empty `rel`);
+    // with a journal, each absent component is made (`0755`) and recorded.
+    fn dir(&self, rel: &[u8], mut journal: Option<&mut Journal<'_>>) -> Result<OwnedFd> {
+        let mut held = self.root.try_clone().refuse_at(SITE)?;
+        if rel.is_empty() {
+            return Ok(held);
+        }
+        let mut walked: Vec<u8> = Vec::new();
+        for part in rel.split(|byte| *byte == b'/') {
+            if !walked.is_empty() {
+                walked.push(b'/');
+            }
+            walked.extend_from_slice(part);
+            let name = cname(part)?;
+            let next = match sys::open_dir_at(held.as_fd(), &name) {
+                Ok(next) => next,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let Some(journal) = journal.as_deref_mut() else {
+                        return Err(crate::refuse::io(&error, SITE));
+                    };
+                    self.make(held.as_fd(), (&name, &walked), 0o755, journal)?;
+                    sys::open_dir_at(held.as_fd(), &name).map_err(|error| moved(&error))?
+                }
+                Err(error) => return Err(moved(&error)),
+            };
+            held = next;
+        }
+        Ok(held)
+    }
+
+    // Make the directory `name` in `parent` (its path `rel`) at `mode`,
+    // recorded by identity; `false` when it is there already.
+    fn make(
+        &self,
+        parent: std::os::fd::BorrowedFd<'_>,
+        (name, rel): (&CStr, &[u8]),
+        mode: u32,
+        journal: &mut Journal<'_>,
+    ) -> Result<bool> {
+        match sys::mkdirat(parent, name, mode) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                let found = sys::fstatat_nofollow(parent, name).map_err(|error| moved(&error))?;
+                if !found.is_dir() {
+                    return Err(BulkloadRefusal::GitDestinationModified);
+                }
+                return Ok(false);
+            }
+            Err(error) => return Err(moved(&error)),
+        }
+        let identity = sys::fstatat_nofollow(parent, name).refuse_at(SITE)?;
+        journal.made(Made {
+            path: self.live.join(path_of(rel)).as_os_str().as_bytes().to_vec(),
+            dev: identity.node.dev,
+            ino: identity.node.ino,
+            mode,
+        })?;
+        Ok(true)
+    }
+}
+
+// Write `want`'s bytes (or link) at `temp` in `dir`, fsynced at its mode;
+// the bytes written.
+fn write_temp(
+    dir: &OwnedFd,
+    temp: &CStr,
+    want: &Want,
+    objects: Option<&mut BatchObjects>,
+) -> Result<u64> {
     match want.side.kind {
         Kind::Symlink => {
             let link = want
@@ -732,17 +1057,12 @@ fn write_temp(temp: &Path, want: &Want, objects: Option<&mut BatchObjects>) -> R
                 .link
                 .as_deref()
                 .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-            std::os::unix::fs::symlink(OsStr::from_bytes(link), temp).refuse_at(SITE)?;
+            sys::symlinkat(&cname(link)?, dir.as_fd(), temp).refuse_at(SITE)?;
             Ok(0)
         }
         Kind::Regular => {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(temp)
-                .refuse_at(SITE)?;
+            let mut file =
+                fs::File::from(sys::create_excl_at(dir.as_fd(), temp, 0o600).refuse_at(SITE)?);
             let written = match (&want.disk, objects) {
                 (Some(disk), _) => copy_bytes(disk, &mut file)?,
                 (None, Some(objects)) => objects.copy_into(
@@ -756,8 +1076,7 @@ fn write_temp(temp: &Path, want: &Want, objects: Option<&mut BatchObjects>) -> R
                 (None, None) => return Err(BulkloadRefusal::GitInventoryMalformed),
             };
             file.flush().refuse_at(SITE)?;
-            file.set_permissions(fs::Permissions::from_mode(want.side.mode & 0o7777))
-                .refuse_at(SITE)?;
+            sys::fchmod(&file, want.side.mode & 0o7777).refuse_at(SITE)?;
             crate::counters::CountedSync::sync_file_counted(&file).refuse_at(SITE)?;
             Ok(written)
         }
@@ -789,96 +1108,113 @@ fn copy_bytes(from: &Path, to: &mut fs::File) -> Result<u64> {
     }
 }
 
-// Rename `temp` to `to` in their one directory, never over anything:
-// `false` when `to` is taken.
-fn rename_in(temp: &Path, to: &Path) -> Result<bool> {
-    let parent = to.parent().ok_or(BulkloadRefusal::PathEscapesRoot)?;
-    let directory = fs::File::open(parent).refuse_at(SITE)?;
-    let from = cname(temp.file_name().ok_or(BulkloadRefusal::PathEscapesRoot)?)?;
-    let leaf = cname(to.file_name().ok_or(BulkloadRefusal::PathEscapesRoot)?)?;
-    match crate::io::sys::rename_exclusive_at(&directory, &from, &directory, &leaf) {
-        Ok(()) => Ok(true),
-        Err(error) if error.raw_os_error() == Some(libc::EEXIST) => Ok(false),
-        Err(error) => Err(crate::refuse::io(&error, SITE)),
-    }
-}
-
-/// Run `planned` (from [`plan`], under the caller's lock, its temporaries
-/// recorded write-ahead): directories made, files placed and landed
-/// beside, create-only. An entry that appeared since the plan is adopted
+/// Run `planned` (from [`plan`], under the caller's lock, recorded in
+/// `journal`): directories made, files placed and landed beside,
+/// create-only, through descriptors opened beneath the live root (never
+/// following a link). An entry that appeared since the plan is adopted
 /// when it is equal; anything else that moved since refuses
-/// `GIT_DESTINATION_MODIFIED`, the rest left for the next pass.
+/// `GIT_DESTINATION_MODIFIED`, the rest left for the next pass. Every
+/// entry is counted once; a count that does not add up refuses.
 ///
 /// # Errors
 /// `GIT_DESTINATION_MODIFIED`; whatever a write refuses.
+#[allow(clippy::too_many_lines)]
 pub(in crate::git_carry) fn execute(
     live: &Path,
     planned: &Planned,
     wants: &[Want],
-    salt: &[u8],
+    (salt, journal): (&[u8], &mut Journal<'_>),
     mut objects: Option<&mut BatchObjects>,
 ) -> Result<Tally> {
+    let tree = Tree::open(live)?;
     let mut tally = Tally::default();
-    let mut synced: BTreeSet<PathBuf> = BTreeSet::new();
-    let mut modes: Vec<(PathBuf, u32)> = Vec::new();
+    let mut synced: BTreeSet<Vec<u8>> = BTreeSet::new();
+    let mut modes: Vec<(Vec<u8>, u32)> = Vec::new();
     for step in &planned.steps {
         let want = wants
             .get(step.want)
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        let path = live.join(OsStr::from_bytes(&step.at));
+        let class = class_of(&want.path);
+        if class == Class::Derived {
+            tally.derived += 1;
+        }
+        if step.act.writes() {
+            if class == Class::Derived {
+                tally.written_derived += 1;
+            } else {
+                tally.written_source += 1;
+            }
+        }
+        let (parent, leaf) = split(&step.at);
+        let path = live.join(path_of(&step.at));
         match step.act {
             Act::Adopt => tally.adopted += 1,
             Act::BesidePresent => tally.beside_present += 1,
             Act::DirAdopt => tally.dirs_adopted += 1,
             Act::DirBesideAdopt => tally.dirs_beside += 1,
             Act::Occupied => tally.occupied += 1,
+            Act::Held => tally.held += 1,
             Act::DirPlace | Act::DirBeside => {
-                parents(live, &step.at, &mut synced)?;
-                match fs::DirBuilder::new().mode(0o700).create(&path) {
-                    Ok(()) => modes.push((path.clone(), want.side.mode)),
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if !lstat(&path)?.is_some_and(|meta| meta.is_dir()) {
-                            return Err(BulkloadRefusal::GitDestinationModified);
-                        }
+                let dir = tree.dir(parent, Some(journal))?;
+                let made = tree.make(dir.as_fd(), (&cname(leaf)?, &step.at), 0o700, journal)?;
+                synced.insert(parent.to_vec());
+                if made {
+                    modes.push((step.at.clone(), want.side.mode));
+                    // The record names the mode the directory ends at.
+                    if let Some(last) = journal.record.made.last_mut() {
+                        last.mode = want.side.mode;
                     }
-                    Err(error) => return Err(crate::refuse::io(&error, SITE)),
                 }
-                if let Some(parent) = path.parent() {
-                    synced.insert(parent.to_path_buf());
-                }
-                if step.act == Act::DirPlace {
-                    tally.dirs_placed += 1;
-                } else {
-                    tally.dirs_beside += 1;
+                match (step.act, made) {
+                    (Act::DirPlace, true) => tally.dirs_placed += 1,
+                    (Act::DirPlace, false) => tally.dirs_adopted += 1,
+                    _ => tally.dirs_beside += 1,
                 }
             }
             Act::Place | Act::Beside => {
-                parents(live, &step.at, &mut synced)?;
-                let temp = temp_of(live, &step.at, salt);
-                if let Some(meta) = lstat(&temp)? {
-                    if !(meta.is_file() || meta.file_type().is_symlink()) {
-                        return Err(BulkloadRefusal::GitDestinationModified);
+                let dir = tree.dir(parent, Some(journal))?;
+                let temp = cname(&temp_name(&step.at, salt))?;
+                match sys::fstatat_nofollow(dir.as_fd(), &temp) {
+                    Ok(found) => {
+                        // A directory there is no temporary of ours.
+                        if found.is_dir() {
+                            return Err(BulkloadRefusal::GitDestinationModified);
+                        }
+                        sys::unlinkat(dir.as_fd(), &temp, false).refuse_at(SITE)?;
                     }
-                    fs::remove_file(&temp).refuse_at(SITE)?;
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(moved(&error)),
                 }
-                let written = write_temp(&temp, want, objects.as_deref_mut())?;
-                if !rename_in(&temp, &path)? {
-                    fs::remove_file(&temp).refuse_at(SITE)?;
-                    // Taken since the plan: equal is adopted, else the next
-                    // pass decides it again.
-                    if !holds_want(objects.as_deref_mut(), &path, want)? {
-                        return Err(BulkloadRefusal::GitDestinationModified);
+                let written = write_temp(&dir, &temp, want, objects.as_deref_mut())?;
+                let leaf = cname(leaf)?;
+                match sys::rename_exclusive_at(dir.as_fd(), &temp, dir.as_fd(), &leaf) {
+                    Ok(()) => {}
+                    Err(error) if error.raw_os_error() == Some(libc::EEXIST) => {
+                        sys::unlinkat(dir.as_fd(), &temp, false).refuse_at(SITE)?;
+                        // Taken since the plan: equal is adopted, else the
+                        // next pass decides it again.
+                        if !holds_want(objects.as_deref_mut(), &path, want)? {
+                            return Err(BulkloadRefusal::GitDestinationModified);
+                        }
+                        if step.act == Act::Place {
+                            tally.adopted += 1;
+                        } else {
+                            tally.beside_present += 1;
+                        }
+                        continue;
                     }
-                    if step.act == Act::Place {
-                        tally.adopted += 1;
-                    } else {
-                        tally.beside_present += 1;
-                    }
-                    continue;
+                    Err(error) => return Err(moved(&error)),
                 }
-                if let Some(parent) = path.parent() {
-                    synced.insert(parent.to_path_buf());
-                }
+                let placed = sys::fstatat_nofollow(dir.as_fd(), &leaf).refuse_at(SITE)?;
+                journal.placed(Placed {
+                    path: path.as_os_str().as_bytes().to_vec(),
+                    dev: placed.node.dev,
+                    ino: placed.node.ino,
+                    size: placed.size,
+                    mtime_ns: placed.mtime_ns,
+                    beside: step.act == Act::Beside,
+                })?;
+                synced.insert(parent.to_vec());
                 tally.bytes += written;
                 if step.act == Act::Place {
                     tally.placed += 1;
@@ -890,14 +1226,17 @@ pub(in crate::git_carry) fn execute(
     }
     // The directories this pass made take their modes last, deepest first,
     // so a read-only one still received what it holds.
-    for (path, mode) in modes.iter().rev() {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777)).refuse_at(SITE)?;
-        if let Some(parent) = path.parent() {
-            synced.insert(parent.to_path_buf());
-        }
+    for (rel, mode) in modes.iter().rev() {
+        let dir = tree.dir(rel, None)?;
+        sys::fchmod(&dir, mode & 0o7777).refuse_at(SITE)?;
+        synced.insert(split(rel).0.to_vec());
     }
-    for directory in &synced {
-        landed::sync_dir(directory)?;
+    for rel in &synced {
+        let dir = fs::File::from(tree.dir(rel, None)?);
+        crate::counters::CountedSync::sync_dir_counted(&dir).refuse_at(SITE)?;
+    }
+    if tally.entries() != u64::try_from(planned.steps.len()).unwrap_or(u64::MAX) {
+        return Err(BulkloadRefusal::GitInventoryMalformed);
     }
     Ok(tally)
 }
@@ -906,6 +1245,7 @@ pub(in crate::git_carry) fn execute(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
+    use std::os::unix::fs::DirBuilderExt as _;
 
     fn tree() -> (tempfile::TempDir, PathBuf, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -923,6 +1263,15 @@ mod tests {
             .collect();
         wants.sort_by(|a, b| a.path.cmp(&b.path));
         wants
+    }
+
+    // Execute `planned` with a journal beside the live tree.
+    fn run(live: &Path, planned: &Planned, wants: &[Want]) -> Result<Tally> {
+        let record = live.parent().unwrap().join("run.files");
+        let mut journal = Journal::begin(&record, FilesRecord::default())?;
+        let tally = execute(live, planned, wants, (b"t", &mut journal), None)?;
+        journal.finish(tally)?;
+        Ok(tally)
     }
 
     fn acts(planned: &Planned, wants: &[Want]) -> Vec<(String, Act, String)> {
@@ -973,7 +1322,14 @@ mod tests {
                 "link",
             ],
         );
-        let planned = plan(&live, ".neo-20261016", (&wants, &BTreeSet::new()), None).unwrap();
+        let planned = plan(
+            &live,
+            ".neo-20261016",
+            (&wants, &BTreeSet::new()),
+            false,
+            None,
+        )
+        .unwrap();
         let got = acts(&planned, &wants);
         let find = |path: &str| got.iter().find(|row| row.0 == path).unwrap().clone();
         assert_eq!(find("notes").1, Act::DirPlace);
@@ -990,8 +1346,8 @@ mod tests {
         assert_eq!(find("again.log").1, Act::BesidePresent);
         assert_eq!(find("taken.log").1, Act::Occupied);
         assert_eq!(find("link").1, Act::Place);
-        let tally = execute(&live, &planned, &wants, b"t", None).unwrap();
-        assert_eq!(tally, planned.tally().with_bytes(tally.bytes));
+        let tally = run(&live, &planned, &wants).unwrap();
+        assert_eq!(tally, planned.tally(&wants).with_bytes(tally.bytes));
         assert_eq!(tally.entries(), 9);
         assert_eq!(fs::read(live.join("differs.log")).unwrap(), b"sting\n");
         assert_eq!(
@@ -1008,8 +1364,15 @@ mod tests {
             Path::new("same.log")
         );
         // The second pass: everything placed is adopted, nothing written.
-        let again = plan(&live, ".neo-20261016", (&wants, &BTreeSet::new()), None).unwrap();
-        let tally = execute(&live, &again, &wants, b"t", None).unwrap();
+        let again = plan(
+            &live,
+            ".neo-20261016",
+            (&wants, &BTreeSet::new()),
+            false,
+            None,
+        )
+        .unwrap();
+        let tally = run(&live, &again, &wants).unwrap();
         assert_eq!(
             (tally.placed, tally.beside, tally.dirs_placed, tally.bytes),
             (0, 0, 0, 0)
@@ -1040,8 +1403,15 @@ mod tests {
             &source,
             &["cache", "cache/sub", "cache/sub/a", "via", "via/b"],
         );
-        let planned = plan(&live, ".neo-20261016", (&wants, &BTreeSet::new()), None).unwrap();
-        execute(&live, &planned, &wants, b"t", None).unwrap();
+        let planned = plan(
+            &live,
+            ".neo-20261016",
+            (&wants, &BTreeSet::new()),
+            false,
+            None,
+        )
+        .unwrap();
+        run(&live, &planned, &wants).unwrap();
         assert_eq!(fs::read(live.join("cache")).unwrap(), b"a live file\n");
         assert_eq!(
             fs::read(live.join("cache.neo-20261016/sub/a")).unwrap(),
@@ -1058,7 +1428,14 @@ mod tests {
         let (_dir, source, live) = tree();
         fs::write(source.join("a"), b"a\n").unwrap();
         let wants = wants(&source, &["a"]);
-        let planned = plan(&live, ".neo-20261016", (&wants, &BTreeSet::new()), None).unwrap();
+        let planned = plan(
+            &live,
+            ".neo-20261016",
+            (&wants, &BTreeSet::new()),
+            false,
+            None,
+        )
+        .unwrap();
         let temp = temp_of(&live, b"a", b"t");
         fs::write(&temp, b"half").unwrap();
         fs::write(live.join("operator"), b"mine\n").unwrap();
@@ -1074,7 +1451,7 @@ mod tests {
         settle(&record).unwrap();
         assert!(!temp.exists());
         assert!(live.join("operator").exists());
-        let tally = execute(&live, &planned, &wants, b"t", None).unwrap();
+        let tally = run(&live, &planned, &wants).unwrap();
         assert_eq!(tally.placed, 1);
         assert_eq!(fs::read(live.join("a")).unwrap(), b"a\n");
     }
@@ -1088,8 +1465,8 @@ mod tests {
         fs::write(source.join("gone.txt"), b"neo\n").unwrap();
         let wants = wants(&source, &["gone.txt"]);
         let tracked = BTreeSet::from([b"gone.txt".to_vec()]);
-        let planned = plan(&live, ".neo-20261016", (&wants, &tracked), None).unwrap();
-        execute(&live, &planned, &wants, b"t", None).unwrap();
+        let planned = plan(&live, ".neo-20261016", (&wants, &tracked), false, None).unwrap();
+        run(&live, &planned, &wants).unwrap();
         assert!(!live.join("gone.txt").exists());
         assert_eq!(
             fs::read(live.join("gone.txt.neo-20261016")).unwrap(),
@@ -1097,21 +1474,34 @@ mod tests {
         );
     }
 
-    /// The directories an unfinished pass may have made are settled: an
-    /// empty one removed, one still at `0700` given its mode.
+    /// The directories an unfinished pass made are settled by identity: an
+    /// empty one removed, one still at `0700` given its mode; a directory
+    /// at a recorded path that is not the one made (another inode), or one
+    /// no pass made, is never touched (review U1).
     #[test]
-    fn settle_removes_empty_made_directories_and_seals_the_rest() {
+    fn settle_touches_only_the_directories_the_pass_made() {
         let (_dir, _source, live) = tree();
-        let (empty, full) = (live.join("empty"), live.join("full"));
-        fs::DirBuilder::new().mode(0o700).create(&empty).unwrap();
-        fs::DirBuilder::new().mode(0o700).create(&full).unwrap();
+        let (empty, full, other) = (live.join("empty"), live.join("full"), live.join("other"));
+        for dir in [&empty, &full, &other] {
+            fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
+        }
         fs::write(full.join("a"), b"a\n").unwrap();
+        let made = |path: &Path, mode: u32| {
+            let meta = fs::metadata(path).unwrap();
+            Made {
+                path: path.as_os_str().as_bytes().to_vec(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+                mode,
+            }
+        };
+        let mut other_made = made(&other, 0o755);
+        other_made.ino += 1;
         let record = live.parent().unwrap().join("dirs.files");
-        let named = |path: &Path| path.as_os_str().as_bytes().to_vec();
         landed::write(
             &record,
             &FilesRecord {
-                dirs: vec![(named(&empty), 0o755), (named(&full), 0o750)],
+                made: vec![made(&empty, 0o755), made(&full, 0o750), other_made],
                 ..FilesRecord::default()
             },
         )
@@ -1119,6 +1509,91 @@ mod tests {
         settle(&record).unwrap();
         assert!(!empty.exists());
         assert_eq!(fs::metadata(&full).unwrap().mode() & 0o7777, 0o750);
+        assert!(
+            other.exists(),
+            "a directory the pass did not make was removed"
+        );
+    }
+
+    /// A derived entry (build output, a `mktemp` directory, `.serena`) that
+    /// would be written is held for the ruling, its subtree with it, and
+    /// counted; a source-like one is placed; with `place_derived` both are.
+    #[test]
+    fn derived_output_is_held_until_ruled() {
+        let (_dir, source, live) = tree();
+        fs::create_dir_all(source.join("build/out")).unwrap();
+        fs::write(source.join("build/out/a.o"), b"o\n").unwrap();
+        fs::create_dir_all(source.join(".native-osstore-vendor.Ab3xZ9")).unwrap();
+        fs::write(source.join("notes.md"), b"n\n").unwrap();
+        let wants = wants(
+            &source,
+            &[
+                "build",
+                "build/out",
+                "build/out/a.o",
+                ".native-osstore-vendor.Ab3xZ9",
+                "notes.md",
+            ],
+        );
+        assert_eq!(class_of(b"build/out/a.o"), Class::Derived);
+        assert_eq!(class_of(b".native-osstore-vendor.Ab3xZ9"), Class::Derived);
+        assert_eq!(class_of(b"bazel-out"), Class::Derived);
+        assert_eq!(class_of(b"docs/notes.md"), Class::Source);
+        assert_eq!(class_of(b"docs.backup"), Class::Source);
+        let planned = plan(
+            &live,
+            ".neo-20261016",
+            (&wants, &BTreeSet::new()),
+            false,
+            None,
+        )
+        .unwrap();
+        let tally = run(&live, &planned, &wants).unwrap();
+        assert_eq!((tally.held, tally.placed, tally.derived), (4, 1, 4));
+        assert!(!live.join("build").exists());
+        assert!(live.join("notes.md").exists());
+        assert_eq!(planned.held(&wants).len(), 4);
+        let planned = plan(
+            &live,
+            ".neo-20261016",
+            (&wants, &BTreeSet::new()),
+            true,
+            None,
+        )
+        .unwrap();
+        let tally = run(&live, &planned, &wants).unwrap();
+        assert_eq!((tally.held, tally.placed, tally.dirs_placed), (0, 1, 3));
+        assert!(live.join("build/out/a.o").exists());
+    }
+
+    /// Every placement is recorded by identity and can be taken back: what
+    /// is still as placed is removed with the directories the pass made;
+    /// what changed since is kept.
+    #[test]
+    fn undo_takes_back_only_what_is_still_as_placed() {
+        let (_dir, source, live) = tree();
+        fs::create_dir_all(source.join("d")).unwrap();
+        fs::write(source.join("d/a"), b"a\n").unwrap();
+        fs::write(source.join("b"), b"b\n").unwrap();
+        let wants = wants(&source, &["b", "d", "d/a"]);
+        let planned = plan(
+            &live,
+            ".neo-20261016",
+            (&wants, &BTreeSet::new()),
+            false,
+            None,
+        )
+        .unwrap();
+        run(&live, &planned, &wants).unwrap();
+        let record = live.parent().unwrap().join("run.files");
+        assert_eq!(read_record(&record).unwrap().unwrap().placed.len(), 2);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(live.join("b"), b"edited since\n").unwrap();
+        let undone = undo(&record).unwrap();
+        assert_eq!((undone.removed, undone.kept, undone.dirs), (1, 1, 1));
+        assert!(!live.join("d").exists());
+        assert_eq!(fs::read(live.join("b")).unwrap(), b"edited since\n");
+        assert!(read_record(&record).unwrap().unwrap().undone);
     }
 
     impl Tally {

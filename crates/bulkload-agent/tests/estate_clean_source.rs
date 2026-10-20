@@ -189,14 +189,14 @@ impl World {
         fs::write(neo.join("README"), b"v0\n").unwrap();
         fs::create_dir_all(neo.join("src")).unwrap();
         fs::write(neo.join("src/a.txt"), b"a0\n").unwrap();
-        fs::write(neo.join(".gitignore"), b"*.log\nbuild/\n").unwrap();
+        fs::write(neo.join(".gitignore"), b"*.log\nscratch/\n").unwrap();
         git(&neo, &["add", "."]);
         git(&neo, &["commit", "--quiet", "-m", "c0"]);
         git(&neo, &["tag", "v0"]);
         fs::write(neo.join("src/a.txt"), b"a1\n").unwrap();
         git(&neo, &["commit", "--quiet", "-am", "c1"]);
         fs::write(neo.join("same.txt"), b"the same on both\n").unwrap();
-        fs::create_dir_all(neo.join("build")).unwrap();
+        fs::create_dir_all(neo.join("scratch")).unwrap();
         let sting = world.sting();
         let copied = Command::new("cp")
             .arg("-a")
@@ -210,7 +210,7 @@ impl World {
         fs::write(sting.join("src/a.txt"), b"sting's own edit\n").unwrap();
         fs::write(sting.join("sting-own.txt"), b"sting's untracked\n").unwrap();
         fs::write(sting.join("differs.txt"), b"sting's differs\n").unwrap();
-        fs::write(sting.join("build/out.bin"), b"sting build output\n").unwrap();
+        fs::write(sting.join("scratch/out.bin"), b"sting scratch output\n").unwrap();
         // Neo: a branch and a stash sting lacks, then untracked and ignored
         // files; no tracked change.
         git(&neo, &["branch", "neo-only"]);
@@ -220,7 +220,7 @@ impl World {
         fs::write(neo.join("notes/todo.md"), b"neo's untracked todo\n").unwrap();
         fs::write(neo.join("differs.txt"), b"neo's differs\n").unwrap();
         fs::write(neo.join("neo.log"), b"neo's ignored log\n").unwrap();
-        fs::write(neo.join("build/out.bin"), b"neo build output\n").unwrap();
+        fs::write(neo.join("scratch/out.bin"), b"neo scratch output\n").unwrap();
         world
     }
 
@@ -275,6 +275,45 @@ impl World {
             &"1",
         ]));
         agent(&list)
+    }
+
+    /// Land neo's checkout standalone at the beside path as an item of a
+    /// plan of its own (the in-place lane's hand plans did): a bulkload
+    /// landing, its workspace ledger naming SOURCE.
+    fn land_beside_standalone(&self) {
+        let plan = self.path("carry-hand/plan.postcard");
+        fs::create_dir_all(self.path("carry-hand")).unwrap();
+        let added = agent(&os(&[
+            &"estate-add-batch",
+            &plan,
+            &self.neo(),
+            &self.beside(),
+            &self.beside(),
+        ]));
+        assert!(added.ok, "{}", added.stderr);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(self.path("apply-hand"))
+            .unwrap();
+        settle();
+        let ran = agent(&os(&[
+            &"estate-capture",
+            &plan,
+            &self.path("carry-hand/private"),
+            &self.path("carry-hand/corpus"),
+            &"1",
+        ]));
+        assert!(ran.ok, "hand capture: {}\n{}", ran.stdout, ran.stderr);
+        let ran = agent(&os(&[
+            &"estate-apply",
+            &plan,
+            &self.path("carry-hand/corpus"),
+            &self.path("apply-hand"),
+            &SOURCE,
+            &"1",
+        ]));
+        assert!(ran.ok, "hand apply: {}\n{}", ran.stdout, ran.stderr);
+        assert!(self.beside().join(".git").is_dir(), "{}", ran.stdout);
     }
 
     fn closure(&self) -> Ran {
@@ -337,7 +376,7 @@ impl Own {
                 "src/a.txt",
                 "sting-own.txt",
                 "differs.txt",
-                "build/out.bin",
+                "scratch/out.bin",
                 "same.txt",
                 "README",
                 ".gitignore",
@@ -377,8 +416,8 @@ fn holds_neo_files(world: &World) {
         b"neo's differs\n"
     );
     assert_eq!(
-        fs::read(sting.join(format!("build/out.bin{SUFFIX}"))).unwrap(),
-        b"neo build output\n"
+        fs::read(sting.join(format!("scratch/out.bin{SUFFIX}"))).unwrap(),
+        b"neo scratch output\n"
     );
 }
 
@@ -933,13 +972,7 @@ fn r3_a_standalone_copy_is_retired_only_once_its_commits_are_in() {
     let world = World::new();
     fs::write(world.neo().join("README"), b"v2 on neo\n").unwrap();
     git(&world.neo(), &["commit", "--quiet", "-am", "c2"]);
-    let copied = Command::new("cp")
-        .arg("-a")
-        .arg(world.neo())
-        .arg(world.beside())
-        .status()
-        .unwrap();
-    assert!(copied.success());
+    world.land_beside_standalone();
     git(&world.beside(), &["branch", "copy-only"]);
     let state = world.path("retire-state");
     let report = retire(&[], &state, &[world.beside().as_path()]);
@@ -990,13 +1023,7 @@ fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
     world.capture();
     let ran = world.apply(&FLAGS);
     assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
-    let copied = Command::new("cp")
-        .arg("-a")
-        .arg(world.neo())
-        .arg(world.beside())
-        .status()
-        .unwrap();
-    assert!(copied.success());
+    world.land_beside_standalone();
     let state = world.path("retire-state");
     fs::create_dir_all(world.beside().join(".git/modules/sub")).unwrap();
     fs::write(world.beside().join(".git/modules/sub/HEAD"), b"ref: x\n").unwrap();
@@ -1068,13 +1095,7 @@ fn r5_reflog_only_commits_are_carried_never_dropped() {
         if shape == "standalone" {
             let ran = world.apply(&FLAGS);
             assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
-            let copied = Command::new("cp")
-                .arg("-a")
-                .arg(world.neo())
-                .arg(world.beside())
-                .status()
-                .unwrap();
-            assert!(copied.success());
+            world.land_beside_standalone();
             git(
                 &world.beside(),
                 &[
@@ -1188,4 +1209,138 @@ fn c10_the_plan_previews_no_tree_beside_for_a_clean_source() {
         }
         assert!(!world.beside().exists(), "{dirty}: the preview wrote");
     }
+}
+
+/// R6 (review of #291, item 6): only a tree bulkload landed is retired by
+/// proof; a copy no workspace ledger names refuses `not-bulkload-landed`,
+/// found by `--scan` or named, and nothing is written.
+#[test]
+fn r6_a_tree_bulkload_did_not_land_is_never_retired() {
+    let world = World::new();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
+    let copied = Command::new("cp")
+        .arg("-a")
+        .arg(world.neo())
+        .arg(world.beside())
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let state = world.path("retire-state");
+    let frozen = tree(&world.beside());
+    let done = retire(&["--delete"], &state, &[world.beside().as_path()]);
+    let line = line_of(&done.stdout, &world.beside()).to_owned();
+    assert!(line.contains("reason=not-bulkload-landed"), "{line}");
+    assert_eq!(tree(&world.beside()), frozen);
+}
+
+/// C11 (review of #291, K1): a captured ref the namespace holds at another
+/// value is kept, never moved, so the source's value is in by no ref
+/// there: closure holds the item `refused-pending-review`
+/// (`GIT_DESTINATION_OCCUPIED`, `refs-in-kept=1`), never `applied`.
+#[test]
+fn c11_a_kept_namespace_ref_holds_the_item_for_review() {
+    let world = World::new();
+    let c0 = git(&world.sting(), &["rev-parse", "v0"]).trim().to_owned();
+    git(
+        &world.sting(),
+        &["update-ref", "refs/neo-20261016/heads/neo-only", &c0],
+    );
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert_eq!(outcome, "workspace-refs-in", "{reason}");
+    assert!(word(&reason, "refs-in-kept=1"), "{reason}");
+    assert_eq!(
+        named_refs(&world.sting()).get("refs/neo-20261016/heads/neo-only"),
+        Some(&c0),
+        "a kept ref moved"
+    );
+    let closure = world.closure();
+    assert!(
+        closure.stdout.contains("\"applied\":0")
+            && closure.stdout.contains("\"refused_pending_review\":1")
+            && closure
+                .stdout
+                .contains("\"refusal\":\"GIT_DESTINATION_OCCUPIED\"")
+            && closure.stdout.contains("refs-in-kept=1"),
+        "{}",
+        closure.stdout
+    );
+}
+
+/// C12 (review of #291, item 2): derived output (here `build/`) is held,
+/// counted and listed, never written, until the operator rules on build
+/// output; `--place-derived` writes it as any entry.
+#[test]
+fn c12_derived_output_is_held_until_the_ruling() {
+    for place in [false, true] {
+        let world = World::new();
+        fs::create_dir_all(world.neo().join("build")).unwrap();
+        fs::write(world.neo().join("build/gen.txt"), b"generated\n").unwrap();
+        world.capture();
+        let mut flags = FLAGS.to_vec();
+        if place {
+            flags.push("--place-derived");
+        }
+        let ran = world.apply(&flags);
+        let (outcome, reason) = receipt(&ran.stdout);
+        assert_eq!(outcome, "workspace-refs-in", "{place}: {reason}");
+        let held = if place { "0" } else { "2" };
+        assert!(
+            word(&reason, &format!("files-held-derived={held}")),
+            "{place}: {reason}"
+        );
+        assert_eq!(
+            world.sting().join("build/gen.txt").exists(),
+            place,
+            "{place}"
+        );
+        // The source-like files land either way.
+        assert!(world.sting().join("notes/todo.md").exists(), "{place}");
+    }
+}
+
+/// C13 (review of #291, item 2): every placement is recorded and can be
+/// listed and taken back: `estate-placements` lists them, `--undo`
+/// removes what is still as placed (and the directories made), and the
+/// item no longer closes `applied`.
+#[test]
+fn c13_placements_are_listed_and_taken_back() {
+    let world = World::new();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
+    let listed = agent(&os(&[&"estate-placements", &world.state()]));
+    assert!(listed.ok, "{}\n{}", listed.stdout, listed.stderr);
+    assert!(
+        listed
+            .stdout
+            .contains("estate-placements summary records=1 placed=2 beside=2 mode=list"),
+        "{}",
+        listed.stdout
+    );
+    let own = Own::of(&world);
+    let undone = agent(&os(&[&"estate-placements", &"--undo", &world.state()]));
+    assert!(undone.ok, "{}\n{}", undone.stdout, undone.stderr);
+    assert!(
+        undone.stdout.contains("removed=4 kept=0 dirs-removed=1"),
+        "{}",
+        undone.stdout
+    );
+    for gone in [
+        "notes/todo.md".to_owned(),
+        "neo.log".to_owned(),
+        format!("differs.txt{SUFFIX}"),
+        format!("scratch/out.bin{SUFFIX}"),
+        "notes".to_owned(),
+    ] {
+        assert!(!world.sting().join(&gone).exists(), "{gone}");
+    }
+    own.stays(&world);
+    assert!(
+        world.closure().stdout.contains("files-undone"),
+        "the item still closes"
+    );
 }

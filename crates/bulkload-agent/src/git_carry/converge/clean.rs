@@ -56,6 +56,9 @@ use crate::{BulkloadRefusal, Result};
 pub struct Clean {
     scratch: Scratch,
     head: String,
+    /// The gitlinks the captured HEAD records (nested repositories'
+    /// places).
+    gitlinks: BTreeSet<Vec<u8>>,
     tracked: u64,
     wants: Vec<Want>,
 }
@@ -80,14 +83,21 @@ impl Clean {
     }
 }
 
-// The paths the captured HEAD tracks (its trees and gitlinks too) and how
-// many of them are files or links, when the captured index and every
-// tracked seat are the HEAD's (module docs, 1); `None` when they are not.
+/// What the captured HEAD tracks: every path (its trees and gitlinks too),
+/// how many are files or links, and the gitlinks.
+struct Tracked {
+    paths: BTreeSet<Vec<u8>>,
+    files: u64,
+    gitlinks: BTreeSet<Vec<u8>>,
+}
+
+// What the captured HEAD tracks, when the captured index and every tracked
+// seat are the HEAD's (module docs, 1); `None` when they are not.
 fn tracked(
     scratch: &Scratch,
     meta: &Meta,
     sides: &BTreeMap<Vec<u8>, Side>,
-) -> Result<Option<(BTreeSet<Vec<u8>>, u64)>> {
+) -> Result<Option<Tracked>> {
     let head = meta.get("head")?;
     let tree = |revision: &str| {
         text(git(&scratch.repo).args([
@@ -110,6 +120,7 @@ fn tracked(
     let listed =
         output(git(&scratch.repo).args(["ls-tree", "-r", "-t", "-z", "--full-tree", head]))?;
     let mut paths = BTreeSet::new();
+    let mut gitlinks = BTreeSet::new();
     let mut files = 0_u64;
     for entry in listed
         .split(|byte| *byte == 0)
@@ -140,6 +151,7 @@ fn tracked(
                 {
                     return Ok(None);
                 }
+                gitlinks.insert(path.clone());
             }
             "100644" | "100755" | "120000" => {
                 let Some(side) = sides.get(&path) else {
@@ -162,7 +174,11 @@ fn tracked(
         }
         paths.insert(path);
     }
-    Ok(Some((paths, files)))
+    Ok(Some(Tracked {
+        paths,
+        files,
+        gitlinks,
+    }))
 }
 
 /// Whether `commit` is reachable, in the repository at `scratch` (which
@@ -185,22 +201,27 @@ fn reachable_from(scratch: &Path, commit: &str, tips: &BTreeSet<String>) -> bool
     .is_ok_and(|listed| listed.iter().all(u8::is_ascii_whitespace))
 }
 
-/// The values of every ref of `repository` that holds a commit durably:
-/// all but bulkload's provenance (`refs/carry*`), the remote-tracking refs
-/// (a fetch moves them) and the stash (its reflog is its entries).
+/// The values of the refs of `repository` that hold a commit durably for
+/// this rule: its local branches and tags, and this item's namespace
+/// (`refs/<ns>/`, `refs/<ns>-stash/`); never bulkload's provenance, a
+/// remote-tracking ref (a fetch moves it), the stash or another
+/// namespace.
 ///
 /// # Errors
 /// Whatever listing the refs refuses.
-pub(in crate::git_carry) fn live_tips(repository: &Path) -> Result<BTreeSet<String>> {
+pub(in crate::git_carry) fn live_tips(repository: &Path, ns: &str) -> Result<BTreeSet<String>> {
+    let spaced = format!("refs/{ns}/");
+    let stashed = format!("refs/{ns}-stash/");
     let listed = text(git(repository).args(["for-each-ref", "--format=%(objectname) %(refname)"]))?;
     let mut tips = BTreeSet::new();
     for line in listed.lines() {
         let (value, name) = line
             .split_once(' ')
             .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
-        if !(name.starts_with("refs/carry")
-            || name.starts_with("refs/remotes/")
-            || name == "refs/stash")
+        if name.starts_with("refs/heads/")
+            || name.starts_with("refs/tags/")
+            || name.starts_with(&spaced)
+            || name.starts_with(&stashed)
         {
             tips.insert(value.to_owned());
         }
@@ -208,13 +229,34 @@ pub(in crate::git_carry) fn live_tips(repository: &Path) -> Result<BTreeSet<Stri
     Ok(tips)
 }
 
+/// Of `commits`, those no ref of `tips` reaches in the repository at
+/// `repo` (one it cannot read, too), sorted.
+pub(in crate::git_carry) fn unreached_from(
+    repo: &Path,
+    commits: &[String],
+    tips: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut unreached: Vec<String> = commits
+        .iter()
+        .filter(|commit| !reachable_from(repo, commit, tips))
+        .cloned()
+        .collect();
+    unreached.sort();
+    unreached.dedup();
+    unreached
+}
+
 /// Whether `commit` is reachable from a ref of the live repository at
-/// `repository` ([`live_tips`]), read in that repository.
+/// `repository` ([`live_tips`] for the namespace `ns`), read there.
 ///
 /// # Errors
 /// Whatever listing the refs refuses.
-pub fn reachable_in(repository: &Path, commit: &str) -> Result<bool> {
-    Ok(reachable_from(repository, commit, &live_tips(repository)?))
+pub fn reachable_in(repository: &Path, commit: &str, ns: &str) -> Result<bool> {
+    Ok(reachable_from(
+        repository,
+        commit,
+        &live_tips(repository, ns)?,
+    ))
 }
 
 /// Read the capture `staged` for `target`'s live checkout (module docs).
@@ -226,7 +268,11 @@ pub fn reachable_in(repository: &Path, commit: &str) -> Result<bool> {
 /// # Errors
 /// Whatever building the scratch repository or reading the capture or the
 /// live refs refuses.
-pub fn assess(staged: &super::super::StagedBundle, target: &Target<'_>) -> Result<Option<Clean>> {
+pub fn assess(
+    staged: &super::super::StagedBundle,
+    target: &Target<'_>,
+    ns: &str,
+) -> Result<Option<Clean>> {
     let workspace = target
         .workspace
         .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
@@ -238,12 +284,17 @@ pub fn assess(staged: &super::super::StagedBundle, target: &Target<'_>) -> Resul
     )?;
     let meta = scratch.meta(target.source)?;
     let sides = sides(&scratch.repo, &meta)?;
-    let Some((paths, tracked)) = tracked(&scratch, &meta, &sides)? else {
+    let Some(Tracked {
+        paths,
+        files: tracked,
+        gitlinks,
+    }) = tracked(&scratch, &meta, &sides)?
+    else {
         return Ok(None);
     };
     // Every captured ref but the stash goes in under the namespace
     // (`--refs-in` of a clean source); the caller checks again once it has.
-    let mut tips = live_tips(target.repository)?;
+    let mut tips = live_tips(target.repository, ns)?;
     for (name, value) in native_refs::carried(&scratch.repo, target.source, &scratch.instance)? {
         if name != "refs/stash" {
             tips.insert(value);
@@ -266,6 +317,7 @@ pub fn assess(staged: &super::super::StagedBundle, target: &Target<'_>) -> Resul
     Ok(Some(Clean {
         scratch,
         head,
+        gitlinks,
         tracked,
         wants,
     }))
@@ -284,7 +336,7 @@ pub fn land(
     clean: &Clean,
     target: &Target<'_>,
     landing: &Landing<'_>,
-    (record, suffix): (&Path, &str),
+    (record, suffix, place_derived): (&Path, &str, bool),
 ) -> Result<Applied> {
     let workspace = target
         .workspace
@@ -296,6 +348,23 @@ pub fn land(
     // imports the capture (and a deferred plan base) into the live one.
     let _lock = landed::lock(&common, target.source)?;
     files::settle(record)?;
+    // A nested repository's ignored files go into its checkout, never into
+    // a plain directory made where its gitlink belongs.
+    for want in &clean.wants {
+        let under = clean.gitlinks.iter().find(|link| {
+            want.path
+                .strip_prefix(link.as_slice())
+                .is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
+        });
+        if let Some(link) = under {
+            let there = landed::worktree_git_dir(&workspace.join(OsStr::from_bytes(link)))
+                .ok()
+                .flatten();
+            if there.is_none() {
+                return Err(BulkloadRefusal::GitDestinationParentMissing);
+            }
+        }
+    }
     let salt = record.as_os_str().as_bytes();
     let mut objects = BatchObjects::new(&clean.scratch.repo)?;
     let tracked = files::index_paths(workspace)?;
@@ -303,27 +372,33 @@ pub fn land(
         workspace,
         suffix,
         (&clean.wants, &tracked),
+        place_derived,
         Some(&mut objects),
     )?;
-    let mut written = FilesRecord {
-        item: landing.item.to_owned(),
-        capture: landing.capture,
-        live: workspace.as_os_str().as_bytes().to_vec(),
-        suffix: suffix.to_owned(),
-        tracked: clean.tracked,
-        temps: files::temps(workspace, &planned, salt),
-        dirs: files::dirs(workspace, &planned, &clean.wants)?,
-        done: false,
-        tally: files::Tally::default(),
-        besides: planned.besides(&clean.wants),
-        occupied: planned.occupied(),
-    };
-    landed::write(record, &written)?;
-    let tally = files::execute(workspace, &planned, &clean.wants, salt, Some(&mut objects))?;
+    let mut journal = files::Journal::begin(
+        record,
+        FilesRecord {
+            item: landing.item.to_owned(),
+            capture: landing.capture,
+            live: workspace.as_os_str().as_bytes().to_vec(),
+            suffix: suffix.to_owned(),
+            tracked: clean.tracked,
+            temps: files::temps(workspace, &planned, salt),
+            besides: planned.besides(&clean.wants),
+            occupied: planned.occupied(),
+            held: planned.held(&clean.wants),
+            ..FilesRecord::default()
+        },
+    )?;
+    let tally = files::execute(
+        workspace,
+        &planned,
+        &clean.wants,
+        (salt, &mut journal),
+        Some(&mut objects),
+    )?;
     objects.finish()?;
-    written.tally = tally;
-    written.done = true;
-    landed::write(record, &written)?;
+    let written = journal.finish(tally)?;
     if let Some(first) = written.occupied.first() {
         return Err(BulkloadRefusal::GitBesideForeign(
             workspace

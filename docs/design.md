@@ -1585,13 +1585,19 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   this item's own earlier namespace refs moved to the source's values by
   compare-and-swap, as a beside landing moves its own (`refs-in-moved`);
   a name held at another value is kept and one the operator removed is
-  never created again. Then the captured HEAD must be reachable from a
-  live ref (provenance, remote-tracking refs and `refs/stash` aside), or
-  the capture lands beside in the same pass (its HEAD came in by no ref).
+  never created again. Then the captured HEAD must be reachable from the
+  live repository's local branches, tags or this item's namespace
+  (`refs/NS/`, `refs/NS-stash/`; never provenance, a remote-tracking ref,
+  the stash or another namespace), or the capture lands beside in the same
+  pass (its HEAD came in by no ref). A refs-in that kept a namespace ref
+  held at another value leaves the item `refused-pending-review`
+  (`GIT_DESTINATION_OCCUPIED`, `refs-in-kept=N`), never `applied`.
   An assessment that cannot read the capture lands beside too, as before.
   Then the source's untracked and ignored entries are reconciled into the
   live checkout one by one
-  (`git_carry::converge::files`), never by overwriting: absent, placed
+  (`git_carry::converge::files`), every write through directory
+  descriptors opened beneath the live root one component at a time (never
+  following a link), never by overwriting: absent, placed
   (a private temporary fsynced at its mode, renamed in with
   `RENAME_NOREPLACE`; directories made `0700` and given their mode last);
   present and equal (kind, bytes or link target, executable bit), adopted;
@@ -1602,13 +1608,23 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   never undone: the source's entry there lands beside it. A `<path>SUFFIX`
   holding something else is occupied: nothing is written there and the
   item refuses `GIT_BESIDE_FOREIGN` naming it, after every other entry is
-  in and its refs went in. The temporaries and the directories a pass may
-  make are recorded write-ahead in `{item}-{blake3(SOURCE)}.files`, which
-  a rerun settles first (temporaries removed, made directories removed
-  when empty or given their mode); the record
+  in and its refs went in. Derived output (`build/`, `dist/`,
+  `.svelte-kit/`, `.artifacts/`, `bazel-*`, a `mktemp`-named directory,
+  `.serena/`, the rebuildable roots) that would be written is held, counted
+  and listed, until the operator rules on build output (`--place-derived`
+  writes it). A nested repository's files under a gitlink whose checkout
+  the live tree lacks refuse `GIT_DESTINATION_PARENT_MISSING`, never a
+  plain directory made there. The temporaries a pass may make are recorded
+  write-ahead in `{item}-{blake3(SOURCE)}.files`, each directory it makes
+  (by identity) as it makes it and each placement (by identity) as it goes;
+  a rerun settles first (temporaries removed; only the directories the
+  pass made removed when empty or given their mode), and
+  `estate-placements [--undo]` lists every placement or takes back what is
+  still as placed; the record
   ends with every entry counted (`placed`, `adopted`, `beside`,
   `beside_present`, `dirs_placed`, `dirs_adopted`, `dirs_beside`,
-  `occupied`). The live checkout's HEAD, index, tracked files, branches,
+  `occupied`, `held`, with source-like and derived counts), checked against
+  the entries planned. The live checkout's HEAD, index, tracked files, branches,
   stash, configuration and `info/exclude` are never touched; the source's
   `info/exclude` and every captured byte stay in its provenance there.
   Outcome and journal `workspace-refs-in` (outcome variants 14 and 15,
@@ -1626,15 +1642,19 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   SUFFIX SOURCE PRIVATE_STATE [BESIDE ...]` proves each beside tree (each
   BESIDE, and each `*SUFFIX` directory with a live path under a `--scan`
   ROOT, never inside a checkout) a subset of its live checkout by the same
-  rule (`git_carry::beside::subset`): an empty directory (a refused
-  carry's leftover) is retirable as it is; otherwise it is a linked
+  rule (`git_carry::beside::subset`): no process inside it (#289's
+  check, again before the rename and in the removal); an empty directory
+  (a refused carry's leftover) is retirable as it is; otherwise it is a
+  tree bulkload landed (its workspace ledger for SOURCE, else
+  `not-bulkload-landed`), a linked
   worktree of the live repository whose administration directory names it
   back (a copy of another worktree refuses `worktree-link`) or a
   standalone repository whose `.git` is a directory in it, with no index
   lock, tracked-clean (the advance's status reading: no staged or unstaged
   change, operation or hidden flag; a sealed hand-off block at byte 0 of
   `AGENTS.md`/`CLAUDE.md` the one difference allowed), its HEAD reachable
-  from a live ref (provenance aside; never through its own worktree HEAD), with
+  from the live repository's local branches, tags or this item's
+  namespace (never through its own worktree HEAD), with
   nothing its Git holds lost (a linked tree: no lock, no per-worktree ref,
   every reflog commit reachable in the live repository; a standalone one:
   no own worktree or hook, every commit its refs, stash and reflogs name in
@@ -1645,12 +1665,17 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   `refs/NS-stash/` or wanted at a free index; nothing in its `.git` but an
   allow-list of entries, `unknown-git:<name>` for a submodule's
   `modules/`, `lfs/` and the like; the live repository not borrowing its
-  objects; its configuration without an include), and every untracked or
+  objects; its configuration without an include; a commit only its
+  reflogs name carried in under `refs/NS/reflog/<tree>-<tag>/<oid>`, its
+  objects packed from the tree when the live store lacks them: full
+  history, nothing dropped), and every untracked or
   ignored entry present and equal in the live checkout or landable there
   as a file-level beside (the reconcile above, planned; one occupied
   refuses `occupied:<path>`; a rebuildable root refuses
   `rebuildable:<path>` unless `--drop-rebuildable` drops it as a capture
-  omits it, counted; a nested repository refuses `nested:<path>`). Its
+  omits it, each path ledgered with what the live checkout holds there;
+  derived output it would need written refuses `derived-held:<path>`
+  unless `--place-derived`; a nested repository refuses `nested:<path>`). Its
   prints (a linked tree's administration directory's too) are taken
   before and after the proof (`raced`). A proof or retirement that fails
   with a refusal is that tree's line (`reason=error:<CODE>`), and the run
