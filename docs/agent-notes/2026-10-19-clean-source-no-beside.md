@@ -1,8 +1,9 @@
 # 2026-10-19: a clean source lands no tree beside; redundant beside trees retire by proof
 
-Lane: code lane on `bulkload`, branch `feat/clean-source-no-beside-20261019`,
-stacked on #289 (`feat/adopt-ancestor-20261019` at `9990aeb`, the advance
-lane, in flight), which is stacked on `origin/main` `9854236` (#282 merged).
+Lane: code lane on `bulkload`, branch `feat/clean-source-no-beside-20261019`
+(PR #291), stacked on #289 (`feat/adopt-ancestor-20261019`, the advance
+lane, in flight: started at `9990aeb`, its `0b5fb1d` merged in), which is
+stacked on `origin/main` `9854236` (#282 merged).
 Edited on sting in
 `/srv/fast-local/jess/git/bulkload.worktrees/clean-source-no-beside-20261019`;
 every build and test ran on honey (Q196: never on sting or neo), in
@@ -77,9 +78,10 @@ file is counted, nothing excluded.
    `--refs-in` the source's refs would not go in, so a clean source still
    lands beside there.
 2. **"HEAD reachable" means from a ref of the live repository other than
-   bulkload's provenance (`refs/carry*`), or from a captured branch or tag**
-   (which refs-in brings in). A detached HEAD on a commit no branch or tag
-   holds lands beside.
+   bulkload's provenance (`refs/carry*`), remote-tracking refs and
+   `refs/stash`, checked after refs-in ran.** A detached HEAD on a commit
+   no captured ref holds, or one whose namespace ref is held at another
+   value or was removed by the operator, lands beside.
 3. **File-level beside suffix is the `--beside` suffix** (`.neo-20261016`),
    not today's date: reruns on later days find their own earlier landings
    (`beside-present`) instead of making new copies.
@@ -91,23 +93,53 @@ file is counted, nothing excluded.
    name must be in the live repository and reachable there (a
    remote-tracking ref's own word, `unreachable-remote:`, since a fetch may
    rebuild it). Branch, tag and other names the live repository lacks are
-   created under `refs/<ns>/` on `--delete`; remote-tracking names are not
-   (the refs-in rule carries branches and tags). Its `config` and
-   `info/exclude` bytes go into the ledger record instead of being required
-   equal (the advance retirement requires remote URLs ⊆ live; this one does
-   not, since configuration is not content and is ledgered).
-7. **Rebuildable roots in a beside tree are counted, not reconciled**, as a
-   capture omits them (the fixed `REBUILDABLE_DIRECTORIES`, nothing tracked
-   below).
-8. **An existing beside landing is left alone by apply**: the clean pass
+   created under `refs/<ns>/` on `--delete`; remote-tracking names are not.
+   Its raw `config` and `info/exclude` bytes go into the ledger record
+   instead of being required equal (the advance retirement requires remote
+   URLs ⊆ live; this one does not, since configuration is not content and
+   is ledgered).
+7. **Rebuildable roots in a beside tree refuse by default**
+   (`rebuildable:<path>`); `--drop-rebuildable` applies the capture's own
+   policy (the fixed `REBUILDABLE_DIRECTORIES`, nothing tracked below):
+   counted, dropped with the tree. That is the operator's call per run.
+8. **The clean path's refs follow the source.** Its namespace refs are the
+   only holder of neo's work (no tree beside), so this item's own earlier
+   refs move by compare-and-swap, as a beside landing's do; elsewhere
+   refs-in stays create-only.
+9. **An existing beside landing is left alone by apply**: the clean pass
    names it (`beside-existing=<path>`) for `estate-beside-retire`; it is
    never removed by apply.
+
+## Review
+
+One adversarial read-only review (a refuter subagent, nothing run) at
+`1230c44`; findings and what was done (`0802d25`):
+
+| # | Finding | Disposition |
+| --- | --- | --- |
+| M1 | "HEAD reachable after refs-in" assumed: create-only refs-in keeps this item's own namespace ref at an old value, so a source that moved on lands no tree and its HEAD is in by no ref | fixed: the clean path runs refs-in first in follow mode (this item's own namespace refs move by compare-and-swap, as a beside landing's do), then checks HEAD reachable from a live ref, else lands beside in the same pass (C7, both cases) |
+| M2 | a linked beside never checked to own its administration: a `cp -a` of a live linked worktree would be retired and the live worktree's admin deleted | fixed: the admin's `gitdir` must name the tree back (`worktree-link`), and the live checkout's own admin refuses `shared-admin` (R2 "copy") |
+| M3 | a standalone tree's `.git` deleted without proving `modules/`, `lfs/`, `git-crypt/`, `info/*`, includes; config ledgered lossily | fixed: an allow-list of `.git` entries (`unknown-git:<name>`), `info/` limited to exclude/refs/packs, `borrowed-by-live`, `config-include`, raw config bytes ledgered (refused when unreadable) (R4) |
+| M4 | rebuildable roots deleted unproved | fixed: refused `rebuildable:<path>` by default; `--drop-rebuildable` drops them as a capture omits them, counted (R4) |
+| m1 | a commit in a linked tree between proof and removal (admin not in the prints) | fixed: the admin's prints are in the proof's raced check, and HEAD and admin are looked at again just before the rename; the rename-to-delete window is the advance retirement's (documented there) |
+| m2 | ledger keyed by path; `retired` written after the intent's removal | fixed: one ledger per retirement (`beside-retire-<tag>-<ns>.retired`), marked `deleting` before the removal; `settle_all` marks it retired when tree and intent are gone |
+| m3 | a live tracked file deleted in the worktree would be re-placed | fixed: live index paths are passed to the plan; the source's entry lands beside (C9, unit row) |
+| m4 | a gitlink typechange judged clean | fixed: a file or link at a gitlink path is a tracked change |
+| m5 | a crash leaves made directories at `0700` or empty | fixed: made directories are recorded write-ahead; settle removes empty ones, gives the rest their mode (unit row) |
+| m6 | one tree's IO error aborts the run; an assess error became a refusal | fixed: per-tree `reason=error:<CODE>`, summary `errors=`; an assess error lands beside as before |
+| m7 | the clean path imported fewer refs than the beside landing it replaces | fixed: every captured ref but the stash under the namespace (C8) |
+| m8 | live tips counted remote-tracking refs and the stash | fixed: excluded |
+| m9 | carry-files: a crash after the mkdir leaves an empty directory forever; a partial transfer leaves a non-empty beside | first fixed (an empty beside destination is removed on refusal); the second left: a partial transfer's bytes are its resume state, recorded in its transfer rows |
 
 ## Open
 
 - `estate-diff` / `estate-move --plan-only` still preview `beside=landing`
   for a clean diverged item (estate-diff takes no `--refs-in`); the apply
   then lands no tree.
+- estate-handoff writes no block into a `workspace-refs-in` live checkout
+  (`HANDOFF_NOT_LANDED`, as for a beside item's live path).
+- A retired standalone tree whose objects another repository than the
+  live one borrows (alternates elsewhere) is not detected.
 - The clean assessment builds a second scratch repository (the adopt proof
   built one), one more index of the bundle for a diverged item.
 - No fault-harness rows for the reconcile (unit rows prove the write-ahead

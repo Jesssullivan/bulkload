@@ -133,6 +133,12 @@ pub struct Proof {
     /// ledger.
     pub config: Vec<u8>,
     pub exclude: Vec<u8>,
+    /// A standalone bulkload landing's `.git/carry-config` receipts
+    /// (relative name, bytes), for the ledger.
+    pub carried: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Worktrees a standalone tree's `.git` registers that are gone on
+    /// this host (prunable: a copy's, naming another host's paths).
+    pub prunable: u64,
     prints: [u8; 32],
     admin_prints: [u8; 32],
     wants: Vec<Want>,
@@ -380,6 +386,8 @@ const GIT_ENTRIES: &[&str] = &[
     "bulkload",
     "shallow",
     "gitk.cache",
+    "worktrees",
+    "carry-config",
 ];
 
 /// The `.git/info` entries a standalone tree may hold: its exclude
@@ -467,6 +475,68 @@ fn owns_admin(beside: &Path, admin: &Path) -> bool {
     }
 }
 
+// The worktrees a standalone tree's `.git` registers besides its own: `Ok`
+// with how many (each gone on this host, Git's `prunable`: a copy's
+// administration naming another host's paths) and every commit their
+// administration names (its HEAD, its reflogs), to be proved reachable;
+// `Err` with the refusal word for one that is here, or holds a
+// per-worktree ref of its own.
+fn registered(beside: &Path, git_dir: &Path) -> Result<std::result::Result<(u64, Named), String>> {
+    let census = super::super::converge::worktree_census(beside)?;
+    if census.iter().skip(1).any(|listed| !listed.prunable) {
+        return Ok(Err("worktrees".to_owned()));
+    }
+    let mut named = Vec::new();
+    let admins = git_dir.join("worktrees");
+    if retire::lstat(&admins)?.is_some_and(|meta| meta.is_dir()) {
+        for entry in fs::read_dir(&admins).refuse_at(SITE)? {
+            let admin = entry.refuse_at(SITE)?.path();
+            if !retire::lstat(&admin)?.is_some_and(|meta| meta.is_dir()) {
+                continue;
+            }
+            if retire::worktree_refs(&admin)? {
+                return Ok(Err("worktree-refs".to_owned()));
+            }
+            let head = fs::read(admin.join("HEAD")).unwrap_or_default();
+            let head = String::from_utf8_lossy(head.trim_ascii()).into_owned();
+            if super::super::oid(&head) {
+                named.push(("worktree-head".to_owned(), head));
+            }
+            named.extend(labelled("logged", retire::reflogs(&admin.join("logs"))?));
+        }
+    }
+    let gone = u64::try_from(census.len().saturating_sub(1)).unwrap_or(u64::MAX);
+    Ok(Ok((gone, named)))
+}
+
+// A standalone bulkload landing's `.git/carry-config` receipts (the
+// captured configuration and its activation), every file's relative name
+// and bytes, for the ledger; `None` when they are not plain files or past
+// 4 MiB together.
+fn receipts(git_dir: &Path) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+    let root = git_dir.join("carry-config");
+    if retire::lstat(&root)?.is_none() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut read = Vec::new();
+    let mut total = 0_usize;
+    for entry in retire::walk(&root, true)? {
+        if entry.meta.is_dir() {
+            continue;
+        }
+        if !entry.meta.is_file() {
+            return Ok(None);
+        }
+        let bytes = fs::read(root.join(OsStr::from_bytes(&entry.relative))).refuse_at(SITE)?;
+        total += bytes.len();
+        if total > 4 << 20 {
+            return Ok(None);
+        }
+        read.push((entry.relative, bytes));
+    }
+    Ok(Some(read))
+}
+
 // The prints of a linked tree's administration directory (its HEAD, index
 // and reflog live there): a commit made in the tree while it is proved
 // changes them.
@@ -501,6 +571,8 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             bytes: meta.blocks() * 512,
             config: Vec::new(),
             exclude: Vec::new(),
+            carried: Vec::new(),
+            prunable: 0,
             prints: before,
             admin_prints: [0; 32],
             wants: Vec::new(),
@@ -564,7 +636,8 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     // under.
     let mut commits: Vec<(String, String)> = Vec::new();
     let mut refs = Vec::new();
-    let (mut config, mut exclude) = (Vec::new(), Vec::new());
+    let (mut config, mut exclude, mut carried) = (Vec::new(), Vec::new(), Vec::new());
+    let mut prunable = 0;
     let mut bytes = allocated(beside)?;
     match shape {
         Shape::Linked => {
@@ -578,11 +651,19 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             bytes += allocated(&git_dir)?;
         }
         Shape::Standalone => {
-            if super::super::converge::worktree_census(beside)?.len() > 1 {
-                return Ok(refused("worktrees"));
+            match registered(beside, &git_dir)? {
+                Ok((gone, named)) => {
+                    prunable = gone;
+                    commits.extend(named);
+                }
+                Err(why) => return Ok(refused(why)),
             }
             if let Some(why) = unknown_git(&git_dir)? {
                 return Ok(refused(why));
+            }
+            match receipts(&git_dir)? {
+                Some(read) => carried = read,
+                None => return Ok(refused("carry-config")),
             }
             if borrowed_by(&live_common, &git_dir) {
                 return Ok(refused("borrowed-by-live"));
@@ -701,6 +782,8 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         bytes,
         config,
         exclude,
+        carried,
+        prunable,
         prints: before,
         admin_prints: admin_before,
         wants,
@@ -724,6 +807,10 @@ pub struct RetiredRecord {
     /// A standalone tree's configuration and `info/exclude` bytes.
     pub config: Vec<u8>,
     pub exclude: Vec<u8>,
+    /// A standalone bulkload landing's `.git/carry-config` receipts.
+    pub carried: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Prunable worktrees its `.git` registered.
+    pub prunable: u64,
     /// Unix nanoseconds at the proof.
     pub at_ns: i128,
     /// The removal began (the tree is renamed aside or gone).
@@ -892,6 +979,8 @@ pub fn retire(
         bytes: proof.bytes,
         config: proof.config.clone(),
         exclude: proof.exclude.clone(),
+        carried: proof.carried.clone(),
+        prunable: proof.prunable,
         at_ns,
         ..RetiredRecord::default()
     };

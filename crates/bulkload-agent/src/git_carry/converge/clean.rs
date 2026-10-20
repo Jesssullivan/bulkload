@@ -18,14 +18,15 @@
 //!    executable bit (no unstaged change; a missing tracked file is one).
 //! 2. **Its HEAD reachable in the destination after refs-in**: the
 //!    captured HEAD commit is reachable from a ref the live repository
-//!    holds (provenance `refs/carry*` aside) or from a captured branch or
-//!    tag, which `--refs-in` brings in under `refs/<ns>/` when the live
-//!    repository lacks it at that value.
+//!    holds or from a captured ref, which `--refs-in` brings in under
+//!    `refs/<ns>/` ([`live_tips`] says which count). The caller runs that
+//!    refs-in (every captured ref, this item's own namespace refs following
+//!    the source by compare-and-swap) and checks again
+//!    ([`reachable_in`]): a HEAD it did not bring in after all lands beside.
 //!
 //! When both hold, there is nothing of the source's a tree beside would
 //! hold that the live repository does not get by ref: [`land`] writes no
-//! tree beside. Its refs go in (`--refs-in`, the caller, stash entries
-//! included) and the source's untracked and ignored entries are reconciled
+//! tree beside, and the source's untracked and ignored entries are reconciled
 //! file by file into the live checkout ([`super::files`]: absent placed,
 //! equal adopted, different landed as `<file>SUFFIX`), recorded in STATE
 //! (`{item}-{blake3(SOURCE)}.files`). The live checkout's HEAD, index,

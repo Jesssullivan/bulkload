@@ -995,13 +995,40 @@ fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
     let report = retire(&[], &state, &[world.beside().as_path()]);
     let line = line_of(&report.stdout, &world.beside()).to_owned();
     assert!(line.contains("reason=rebuildable:target"), "{line}");
+    // A bulkload landing's own receipts, and a worktree its `.git`
+    // registers that is gone on this host (a copy's), are accounted for:
+    // the receipts ledgered, the gone worktree's HEAD proved reachable.
+    fs::create_dir_all(world.beside().join(".git/carry-config")).unwrap();
+    fs::write(
+        world.beside().join(".git/carry-config/source-config"),
+        b"[core]\n",
+    )
+    .unwrap();
+    let gone = world.path("gone-worktree");
+    git(
+        &world.beside(),
+        &["worktree", "add", "--quiet", "--detach", gone.to_str().unwrap()],
+    );
+    fs::remove_dir_all(&gone).unwrap();
     let report = retire(&["--drop-rebuildable"], &state, &[world.beside().as_path()]);
     let line = line_of(&report.stdout, &world.beside()).to_owned();
     for held in [
         "verdict=retirable",
         "shape=standalone",
         "rebuildable-dropped=3",
+        "prunable-worktrees=1",
     ] {
         assert!(line.split_whitespace().any(|w| w == held), "{held}: {line}");
     }
+    let done = retire(
+        &["--delete", "--drop-rebuildable"],
+        &state,
+        &[world.beside().as_path()],
+    );
+    assert!(
+        line_of(&done.stdout, &world.beside()).contains("outcome=retired"),
+        "{}",
+        done.stdout
+    );
+    assert!(!world.beside().exists());
 }

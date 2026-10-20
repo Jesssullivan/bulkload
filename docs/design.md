@@ -1440,20 +1440,33 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   HEAD tracks is a carried seat of the same kind, blob and executable bit
   (tracked-clean), and its HEAD is reachable from a live ref (provenance
   `refs/carry*` aside) or from a captured branch or tag (which refs-in
-  brings in), no tree lands beside. The refs go in as for any adopted item
-  (stash entries too, as `refs/NS-stash/N`), and the source's untracked and
-  ignored entries are reconciled into the live checkout one by one
+  brings in), no tree lands beside. The refs go in first: every captured
+  ref but the stash as `refs/NS/<rest>` (not only branches and tags: no
+  tree beside holds the rest), each stash entry as `refs/NS-stash/N`, and
+  this item's own earlier namespace refs moved to the source's values by
+  compare-and-swap, as a beside landing moves its own (`refs-in-moved`);
+  a name held at another value is kept and one the operator removed is
+  never created again. Then the captured HEAD must be reachable from a
+  live ref (provenance, remote-tracking refs and `refs/stash` aside), or
+  the capture lands beside in the same pass (its HEAD came in by no ref).
+  An assessment that cannot read the capture lands beside too, as before.
+  Then the source's untracked and ignored entries are reconciled into the
+  live checkout one by one
   (`git_carry::converge::files`), never by overwriting: absent, placed
   (a private temporary fsynced at its mode, renamed in with
   `RENAME_NOREPLACE`; directories made `0700` and given their mode last);
   present and equal (kind, bytes or link target, executable bit), adopted;
   present and different, landed as `<path>SUFFIX` (an entry under a live
   file or link, under `<that path>SUFFIX/`; never through a link), or
-  counted present when an earlier pass put it there. A `<path>SUFFIX`
+  counted present when an earlier pass put it there. A path the live
+  index tracks and its worktree deleted is the live checkout's own change,
+  never undone: the source's entry there lands beside it. A `<path>SUFFIX`
   holding something else is occupied: nothing is written there and the
   item refuses `GIT_BESIDE_FOREIGN` naming it, after every other entry is
-  in and its refs went in. The temporaries are recorded write-ahead in
-  `{item}-{blake3(SOURCE)}.files`, which a rerun settles first; the record
+  in and its refs went in. The temporaries and the directories a pass may
+  make are recorded write-ahead in `{item}-{blake3(SOURCE)}.files`, which
+  a rerun settles first (temporaries removed, made directories removed
+  when empty or given their mode); the record
   ends with every entry counted (`placed`, `adopted`, `beside`,
   `beside_present`, `dirs_placed`, `dirs_adopted`, `dirs_beside`,
   `occupied`). The live checkout's HEAD, index, tracked files, branches,
@@ -1476,10 +1489,13 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   ROOT, never inside a checkout) a subset of its live checkout by the same
   rule (`git_carry::beside::subset`): an empty directory (a refused
   carry's leftover) is retirable as it is; otherwise it is a linked
-  worktree of the live repository or a standalone repository, with no
-  index lock, tracked-clean (the advance's status reading: no staged or
-  unstaged change, operation or hidden flag), its HEAD reachable from a
-  live ref (provenance aside; never through its own worktree HEAD), with
+  worktree of the live repository whose administration directory names it
+  back (a copy of another worktree refuses `worktree-link`) or a
+  standalone repository whose `.git` is a directory in it, with no index
+  lock, tracked-clean (the advance's status reading: no staged or unstaged
+  change, operation or hidden flag; a sealed hand-off block at byte 0 of
+  `AGENTS.md`/`CLAUDE.md` the one difference allowed), its HEAD reachable
+  from a live ref (provenance aside; never through its own worktree HEAD), with
   nothing its Git holds lost (a linked tree: no lock, no per-worktree ref,
   every reflog commit reachable in the live repository; a standalone one:
   no own worktree or hook, every commit its refs, stash and reflogs name in
@@ -1487,28 +1503,38 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   refs but remote-tracking ones held there by name and value, natively or
   under `refs/NS/`, else wanted there create-only, a name held at another
   value refusing `refs:<name>`; its stash commits held under
-  `refs/NS-stash/` or wanted at a free index), and every untracked or
+  `refs/NS-stash/` or wanted at a free index; nothing in its `.git` but an
+  allow-list of entries, `unknown-git:<name>` for a submodule's
+  `modules/`, `lfs/` and the like; the live repository not borrowing its
+  objects; its configuration without an include), and every untracked or
   ignored entry present and equal in the live checkout or landable there
   as a file-level beside (the reconcile above, planned; one occupied
-  refuses `occupied:<path>`; entries under a rebuildable root are counted,
-  as a capture omits them; a nested repository refuses `nested:<path>`).
-  Its prints are taken before and after the proof (`raced`). Report only
+  refuses `occupied:<path>`; a rebuildable root refuses
+  `rebuildable:<path>` unless `--drop-rebuildable` drops it as a capture
+  omits it, counted; a nested repository refuses `nested:<path>`). Its
+  prints (a linked tree's administration directory's too) are taken
+  before and after the proof (`raced`). A proof or retirement that fails
+  with a refusal is that tree's line (`reason=error:<CODE>`), and the run
+  goes on. Report only
   by default, one line per tree (`verdict=retirable` with `shape`, `head`,
   `tracked`, `present`, `to-place`, `to-beside`, `beside-present`,
   `rebuildable`, `refs-to-import` and the allocated `bytes`, or
   `verdict=refused reason=...`) and a summary; nothing is written. With
   `--delete`, under the live repository's destination lock: the ledger
-  record (`beside-retire-<tag>.retired` in PRIVATE_STATE: path, live path,
+  record (`beside-retire-<tag>-<ns>.retired` in PRIVATE_STATE, one per
+  retirement: path, live path,
   shape, HEAD, counts, refs, bytes, a standalone tree's `config` and
   `info/exclude` bytes), the reconcile (recorded write-ahead), the refs
-  (create-only), a second proof (every entry now present), then the
+  (create-only), a second proof (every entry now present) and a last look
+  at its HEAD and administration, the ledger marked deleting, then the
   beside retirement's crash-safe removal (`beside-retire-<tag>.retire`,
   the rename aside, the re-proof by prints, the administration, the
   tree); `outcome=retired` or `outcome=kept reason=...`, and the ledger
   marked retired. A rerun finishes a removal a crash cut short.
 - **No empty beside directory.** `estate-carry-files` removes a
   destination directory it made when the item ends not carried and the
-  directory is still empty (`rmdir`), so a refused carry (the two empty
+  directory is still empty (`rmdir`), and an empty beside destination a
+  crashed earlier carry left, so a refused carry (the two empty
   `*.neo-20261016` directories on sting, 2026-10-19) leaves nothing on
   disk.
 - **Limits (2026-10-09).** A HEAD detached because its branch was checked

@@ -146,20 +146,24 @@ SUBCOMMANDS:
                 GIT_DESTINATION_OCCUPIED before it writes anything.
                 With --refs-in, a capture with no tracked change (index and
                 tracked files its HEAD's) whose HEAD a live ref or a captured
-                branch or tag brings in lands NO tree beside (operator ruling
-                2026-10-16 21:24Z, 'refs in always; a tree beside ONLY where
-                neo has uncommitted work'): its refs go in (stash entries as
-                refs/NS-stash/N) and its untracked and ignored files are
-                reconciled into the live checkout one by one, create-only:
-                absent placed, equal adopted, different landed as
-                FILE+SUFFIX (a directory under a live file, under
-                DIR+SUFFIX/); a FILE+SUFFIX holding something else refuses
-                GIT_BESIDE_FOREIGN path=... after the rest. Recorded in STATE
-                ITEM-SOURCE.files; receipt beside-tree=none files-tracked=N
-                files-placed=N files-adopted=N files-beside=N ...; outcome
-                and journal workspace-refs-in, closure applied (with files
-                and refs_in). The live checkout's HEAD, index, tracked files,
-                refs and info/exclude are never touched.
+                ref brings in lands NO tree beside (operator ruling 2026-10-16
+                21:24Z, 'refs in always; a tree beside ONLY where neo has
+                uncommitted work'): every captured ref goes in as refs/NS/...
+                (stash entries as refs/NS-stash/N), this item's own earlier
+                namespace refs moved to the source's values (refs-in-moved=N);
+                then, its HEAD reachable from a live ref (else it lands
+                beside), its untracked and ignored files are reconciled into
+                the live checkout one by one, create-only: absent placed,
+                equal adopted, different landed as FILE+SUFFIX (a directory
+                under a live file, under DIR+SUFFIX/; a path the live index
+                tracks and its worktree deleted, beside too); a FILE+SUFFIX
+                holding something else refuses GIT_BESIDE_FOREIGN path=...
+                after the rest. Recorded in STATE ITEM-SOURCE.files; receipt
+                beside-tree=none files-tracked=N files-placed=N
+                files-adopted=N files-beside=N ...; outcome and journal
+                workspace-refs-in, closure applied (with files and refs_in).
+                The live checkout's HEAD, index, tracked files, branches and
+                info/exclude are never touched.
                 --advance-ancestor (operator ruling 2026-10-19, 'Yes, advance
                 those'; needs --adopt and --beside): a live checkout bulkload
                 did not land that differs from the capture is advanced in
