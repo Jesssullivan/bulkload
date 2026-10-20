@@ -132,3 +132,19 @@ to. PR B replaces their payload path.
   - Q193 as narrowed by C4: drop a batch's payload after a verified
     apply.
 - R-N13: this note.
+
+## Amendment 2026-10-20 (coordinator: the homes pass must run)
+
+`estate-move --sessions` over a source half with no Git item is the homes
+pass, next on the critical path, and PR A must not refuse it. The pull now
+lands only the source half's `carry` ledgers (plan, marks): the corpus is
+excluded through the engine's new per-destination excluded-paths list
+(`transfer::set_excluded`, ported from B1), so a corpus an old source half
+left is never landed or read. A plan with Git items still refuses
+`STATE_PAYLOAD_LEFT` at the pull; a plan with none goes on to the live-home
+session pulls (#280) and closure, under the same state guards. Proofs:
+`a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state`
+(tests/estate_move.rs), `a_remote_pass_pulls_only_ledgers_and_refuses_a_git_plan`
+(tests/estate_move_source_roots.rs), and
+`an_excluded_subtree_is_never_landed_or_read` (transfer tests). The four
+#280 `--sessions` tests each drive a Git lane and stay ignored until PR B.

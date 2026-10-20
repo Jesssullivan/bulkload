@@ -268,6 +268,8 @@ static SEND_WRITE_NS: AtomicU64 = AtomicU64::new(0);
 pub struct TransferStats {
     /// Newly materialized or independently verified regular files.
     pub completed: u64,
+    /// Entries skipped as excluded ([`set_excluded`]), never landed.
+    pub excluded: u64,
     /// Outputs skipped using a previously persisted completion.
     pub reused: u64,
     /// Content bytes received across the transport.
@@ -1436,6 +1438,41 @@ fn beside_always() -> HashSet<Vec<u8>> {
 
 /// The prefixes of the seats a session lists ([`TransferStats::listed`]).
 static LISTING: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// The paths sessions into a destination root never land
+/// ([`set_excluded`]), by canonical destination root.
+static EXCLUDED: Mutex<Vec<(PathBuf, Vec<Vec<u8>>)>> = Mutex::new(Vec::new());
+
+/// Never land `paths` (relative to `root`, the destination root, each a
+/// seat or a whole subtree) in a session into `root`: the destination
+/// answers each such entry `Skip` before anything is made or asked for, so
+/// the source reads none of its bytes (the streamed capture: a repository's
+/// `objects`, its rebuildable directories and its nested repositories,
+/// which travel otherwise or not at all). `None` clears `root`'s list.
+pub fn set_excluded(root: &Path, paths: Option<Vec<Vec<u8>>>) {
+    let mut all = EXCLUDED.lock().unwrap_or_else(PoisonError::into_inner);
+    all.retain(|(at, _)| at != root);
+    if let Some(paths) = paths {
+        all.push((root.to_path_buf(), paths));
+    }
+}
+
+fn excluded(root: &Path) -> Vec<Vec<u8>> {
+    EXCLUDED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .find(|(at, _)| at == root)
+        .map(|(_, paths)| paths.clone())
+        .unwrap_or_default()
+}
+
+/// Whether `rel_path` is one of `excluded` or beneath one.
+fn is_excluded(excluded: &[Vec<u8>], rel_path: &[u8]) -> bool {
+    excluded.iter().any(|path| {
+        rel_path.strip_prefix(path.as_slice()).is_some_and(|rest| rest.is_empty() || rest.first() == Some(&b'/'))
+    })
+}
 
 /// List the source's regular and symlink seats under `prefixes` in every
 /// session of this process (an empty list: none).
@@ -5445,6 +5482,8 @@ struct Inbound<'a, W> {
     redirects: HashMap<Vec<u8>, Vec<u8>>,
     /// The listing prefixes ([`set_listing`]).
     listing: Vec<Vec<u8>>,
+    /// The paths never landed ([`set_excluded`]).
+    excluded: Vec<Vec<u8>>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5738,6 +5777,7 @@ fn receive_session<R: Read, W: Write>(
             .iter()
             .any(|root| root == target.path());
         let beside = beside_suffix(target.path());
+        let excluded_paths = excluded(target.path());
         let mut receiver = Inbound {
             output,
             hand,
@@ -5786,6 +5826,7 @@ fn receive_session<R: Read, W: Write>(
             always: beside_always(),
             redirects: HashMap::new(),
             listing: listing(),
+            excluded: excluded_paths,
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -6000,6 +6041,20 @@ impl<W: Write> Inbound<'_, W> {
     /// One walk frame: handled now, or held back by a batch of new
     /// directories (see [`DirectoryBatch`]).
     fn walked(&mut self, frame: Walked) -> Result<()> {
+        // An excluded path is skipped before any batch or decision: nothing
+        // is made for it and the source reads none of it.
+        if let Walked::Entry { entry, row, .. } = &frame {
+            if is_excluded(&self.excluded, &row.rel_path) {
+                self.stats.excluded += 1;
+                return write_control(
+                    self.output,
+                    &Control::Decide {
+                        entry: *entry,
+                        decision: Decision::Skip,
+                    },
+                );
+            }
+        }
         let cap = self.target.batch();
         if cap <= 1 {
             return self.handle_walked(frame);

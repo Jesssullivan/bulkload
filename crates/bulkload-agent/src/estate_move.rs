@@ -654,6 +654,17 @@ impl Move {
         }
     }
 
+    // [`Self::transfer`] of the source half's `carry`, its corpus excluded:
+    // only the plan and the pass marks land (SPEC rule 2).
+    fn transfer_ledgers(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
+        moving::private_dir(to)?;
+        let root = std::fs::canonicalize(to).refuse_at("estate_move::transfer_ledgers")?;
+        bulkload_agent::transfer::set_excluded(&root, Some(vec![b"corpus".to_vec()]));
+        let moved = self.transfer(from, to, name);
+        bulkload_agent::transfer::set_excluded(&root, None);
+        moved
+    }
+
     // One recorded transfer of the source's `from` into `to`: `copy` on
     // this host, else `pull` from HOST; `serve` keeps its source state in
     // the source half's `MOVE_STATE/serve/NAME`, this side in
@@ -741,10 +752,11 @@ fn word(result: &Result<()>) -> String {
 ///
 /// SPEC rule 2 (reset 2026-10-20): a state holding a retired staging
 /// format (this one, or the source half's on this host) is refused at
-/// startup, each one named (`STATE_FORMAT_RETIRED`); a pull of the corpus
-/// or of the session trees into the state is refused before it writes
-/// (`STATE_PAYLOAD_LEFT`), so a pass refuses at its pull until the streamed
-/// capture replaces it; every pass ends with its state line, and the
+/// startup, each one named (`STATE_FORMAT_RETIRED`); the pull lands only
+/// the source half's plan and marks (a corpus is excluded), a plan with Git
+/// items refuses `STATE_PAYLOAD_LEFT` at the pull until the streamed
+/// capture replaces the corpus apply, and a plan with none (the homes pass,
+/// `--sessions`) goes on; every pass ends with its state line, and the
 /// closure line carries `state_payload_bytes=`.
 fn move_command(args: &[OsString]) -> Result<()> {
     let run = Move::parse(args)?;
@@ -785,11 +797,21 @@ fn move_pass(run: &Move) -> Result<()> {
         }
     };
 
-    // 1. The source half's plan and corpus, from a finished pass only. A
-    // corpus pulled into the state is staging (SPEC rule 2): refused before
-    // the pull writes.
-    let pulled = bulkload_agent::state_payload::refuse_staging(&run.state, &carry.join("corpus"))
-        .and_then(|()| run.transfer(&run.source_state.join("carry"), &carry, "corpus"))
+    // 1. The source half's plan and pass marks, from a finished pass only.
+    // SPEC rule 2: only its ledgers are pulled; a corpus (a source half
+    // from before the reset) is excluded, never landed or read. A plan with
+    // Git items needs the corpus apply, refused until the streamed capture
+    // replaces it; a plan with none (the homes pass: `--sessions` only)
+    // goes on.
+    let pulled = run
+        .transfer_ledgers(&run.source_state.join("carry"), &carry, "corpus")
+        .and_then(|()| {
+            if estate::inspect(&plan)?.is_empty() {
+                Ok(())
+            } else {
+                bulkload_agent::state_payload::refuse_staging(&run.state, &carry.join("corpus"))
+            }
+        })
         .and_then(|()| finished_pass(&carry));
     reached(&mut ledger, &ledger_path, "pull", word(&pulled))?;
     pulled?;

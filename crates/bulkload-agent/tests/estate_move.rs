@@ -518,6 +518,94 @@ fn thread_cwds(path: &Path) -> Vec<(String, String)> {
     rows
 }
 
+/// The homes pass under SPEC rule 2: `estate-move --sessions` over a source
+/// half that planned no Git item runs, landing `.claude` and `.codex` at
+/// the LIVE destination home (no landing area), with only the plan and
+/// marks pulled into MOVE_STATE and no payload in either state.
+#[test]
+fn a_sessions_only_pass_lands_the_live_home_with_no_payload_in_state() {
+    let world = World::new("homes");
+    let base = world.base.clone();
+    let (src_home, dst_home) = (base.join("src/home"), base.join("dst/home"));
+    let (src_git, dst_git) = (src_home.join("git"), dst_home.join("git"));
+    fs::create_dir_all(src_git.join("notes")).unwrap();
+    fs::write(src_git.join("notes/todo.txt"), b"not a repository\n").unwrap();
+    fs::create_dir_all(&dst_git).unwrap();
+    let lane = src_git.join("lab");
+    let projects = src_home.join(".claude/projects").join(key(&lane));
+    fs::create_dir_all(&projects).unwrap();
+    let neo = transcript(SID, &lane, "NEO");
+    fs::write(projects.join(format!("{SID}.jsonl")), &neo).unwrap();
+    fs::write(src_home.join(".claude/history.jsonl"), b"{\"display\":\"p\"}\n").unwrap();
+    let rollout_rel = format!("sessions/2026/10/20/rollout-2026-10-20T10-00-00-{THREAD}.jsonl");
+    let rollout = src_home.join(".codex").join(&rollout_rel);
+    fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    fs::write(&rollout, b"{\"type\":\"session_meta\"}\n").unwrap();
+    codex_index(
+        &src_home.join(".codex/state_5.sqlite"),
+        THREAD,
+        rollout.to_str().unwrap(),
+        &lane,
+    );
+    fs::create_dir_all(dst_home.join(".claude")).unwrap();
+    fs::write(dst_home.join(".claude/settings.json"), b"{}\n").unwrap();
+    let source_state = base.join("move-src");
+    let state = base.join("move-dst");
+    let map = format!("{}={}", src_git.display(), dst_git.display());
+    let sourced = agent(&os(&[
+        &"estate-move-source",
+        &"--map",
+        &map,
+        &source_state,
+        &src_git,
+    ]));
+    assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    let moved = agent(&os(&[
+        &"estate-move",
+        &"--label",
+        &LABEL,
+        &"--source",
+        &"neo",
+        &"--sessions",
+        &src_home,
+        &"--dest-home",
+        &dst_home,
+        &"--map",
+        &map,
+        &"-",
+        &source_state,
+        &state,
+    ]));
+    let both = format!("{}\n{}", moved.stdout, moved.stderr);
+    assert!(moved.stdout.contains("estate-move phase=pull outcome=ok"), "{both}");
+    assert!(
+        moved.stdout.contains("estate-move phase=sessions-pull outcome=ok"),
+        "{both}"
+    );
+    assert_eq!(
+        fs::read_to_string(
+            dst_home
+                .join(".claude/projects")
+                .join(key(&lane))
+                .join(format!("{SID}.jsonl"))
+        )
+        .unwrap(),
+        neo,
+        "the transcript landed live, byte for byte"
+    );
+    assert_eq!(
+        fs::read(dst_home.join(".codex").join(&rollout_rel)).unwrap(),
+        b"{\"type\":\"session_meta\"}\n"
+    );
+    assert_eq!(fs::read(dst_home.join(".claude/settings.json")).unwrap(), b"{}\n");
+    assert!(!state.join("landing").exists(), "no landing area");
+    let words = state_line(&moved.stdout, "estate-move");
+    assert_eq!(words["state_payload_bytes"], "0", "{both}");
+    assert_eq!(closure(&moved.stdout)["state_payload_bytes"], "0", "{both}");
+    holds_no_payload(&state, 0);
+    holds_no_payload(&source_state, 0);
+}
+
 /// `estate-move --sessions` lands the source's `.claude` and `.codex` at the
 /// LIVE destination home with `--beside .LABEL` (C9: no landing stage):
 /// nothing there is overwritten, a differing settings file and the live
