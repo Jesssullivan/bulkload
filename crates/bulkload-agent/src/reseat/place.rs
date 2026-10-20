@@ -1447,7 +1447,10 @@ impl Site<'_> {
             }
             let target = c_name(&name)?;
             match crate::io::publish_noreplace(self.directory, temp, &target) {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    counters::bump(Counter::ReseatKeptAside);
+                    return Ok(());
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error).refuse_at("reseat::place::keep_aside"),
             }
