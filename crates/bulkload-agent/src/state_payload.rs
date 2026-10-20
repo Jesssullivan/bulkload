@@ -109,6 +109,10 @@ impl Measure {
 /// S2 registry scan reads a list led by a Git subcommand as Git arguments.)
 const STORE_HOMES: &[&str] = &["reseat", "carry-files", "pull", "serve"];
 
+/// The pulls' home, where the session pulls also keep their provenance
+/// listings.
+const PULLS: &str = "pull";
+
 /// The ledgers a transfer or re-seat store keeps (`SQLite`, its write-ahead
 /// log, shared memory and rollback journal; the writer and re-seat locks).
 const STORE_LEDGERS: &[&str] = &[
@@ -197,7 +201,7 @@ pub fn ledger(rel: &[&OsStr]) -> bool {
         }
         // The session pulls' provenance listings (`pull/claude.listing`,
         // `pull/codex.listing`): the paths each pull carried, by name.
-        ["pull"] => {
+        [home] if *home == PULLS => {
             name.rsplit_once('.')
                 .is_some_and(|(stem, ext)| !stem.is_empty() && ext == "listing")
                 || pending(name)
