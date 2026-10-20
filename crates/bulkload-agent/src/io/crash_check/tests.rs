@@ -905,7 +905,8 @@ fn a_number_reused_after_its_last_name_is_unlinked_names_a_new_inode() {
         }
         match made {
             None if !info.complete => {}
-            Some(Entry::File { data, .. }) if data == NEW || (data.is_empty() && !info.complete) => {}
+            Some(Entry::File { data, .. })
+                if data == NEW || (data.is_empty() && !info.complete) => {}
             other => return Err(format!("fresh is {other:?}")),
         }
         both |= keep.is_some() && made.is_some();
@@ -974,8 +975,10 @@ fn a_number_created_while_its_inode_still_has_a_name_is_refused() {
     ];
     assert!(incarnations(&initial(), &twice).is_err());
     // Unresolved, the reuse is refused by the checker itself.
-    let error = check_view(&initial(), &reused_keep(), &Options::default(), |_, _| Ok(()))
-        .unwrap_err();
+    let error = check_view(&initial(), &reused_keep(), &Options::default(), |_, _| {
+        Ok(())
+    })
+    .unwrap_err();
     assert!(error.to_string().contains("incarnations"), "{error}");
 }
 

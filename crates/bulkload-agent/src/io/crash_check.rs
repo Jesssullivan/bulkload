@@ -830,10 +830,8 @@ fn renamed(event: &Event, id: impl Fn(NodeId) -> NodeId) -> Event {
             dir: id(*dir),
             name: name.clone(),
         },
-        Event::Untraced { call, error } => Event::Untraced {
-            call: *call,
-            error: error.clone(),
-        },
+        // Names no node.
+        Event::Untraced { .. } => event.clone(),
     }
 }
 
@@ -859,7 +857,12 @@ impl Names {
     }
 
     fn set(&mut self, dir: NodeId, name: &[u8], node: NodeId) {
-        if let Some(old) = self.entries.entry(dir).or_default().insert(name.to_vec(), node) {
+        if let Some(old) = self
+            .entries
+            .entry(dir)
+            .or_default()
+            .insert(name.to_vec(), node)
+        {
             self.drop_one(old);
         }
         *self.count.entry(node).or_default() += 1;
