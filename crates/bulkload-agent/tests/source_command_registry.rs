@@ -462,9 +462,13 @@ const WRITERS: &[(&str, usize, &str)] = &[
     ),
     (
         "config (writing form)",
-        3,
+        4,
         "prepare_attachment and the configuration activation: the private \
-         attachment repository's own core.bare, core.worktree and reviewed keys.",
+         attachment repository's own core.bare, core.worktree and reviewed keys. \
+         Four since #289 (the coordinator's decision of 2026-10-20): a beside \
+         retirement adds, create-only, a standalone beside's entries whose key \
+         the advanced live repository lacks (`config --local --add`, only keys \
+         safe_configuration_value allows); never a source repository.",
     ),
     (
         "fast-import",
@@ -484,7 +488,13 @@ const WRITERS: &[(&str, usize, &str)] = &[
         4,
         "The capture's private write store and a bundle's envelope repository.",
     ),
-    ("index-pack", 1, "shallow::unpack: the destination's store."),
+    (
+        "index-pack",
+        2,
+        "shallow::unpack: the destination's store; and a beside retirement's \
+         reflog carry (operator ruling 2026-10-16, full history): the live \
+         repository's store, from a pack read from the beside tree.",
+    ),
     (
         "init",
         5,
@@ -542,10 +552,23 @@ const NOT_COMMANDS: &[(&str, usize, &str)] = &[
         4,
         "An object type, as cat-file and for-each-ref print it.",
     ),
-    ("config", 2, "The repository's `config` file name."),
+    (
+        "config",
+        3,
+        "The repository's `config` file name (a beside retirement ledgers a \
+         standalone tree's raw configuration).",
+    ),
     ("fetch", 1, "The remote.origin.fetch configuration field."),
     ("merge", 1, "The branch.NAME.merge configuration field."),
     ("rebase", 1, "The branch.NAME.rebase configuration field."),
+    (
+        "refs",
+        2,
+        "A linked worktree administration directory's own `refs` directory \
+         (a beside retirement keeps a checkout that has per-worktree refs), \
+         and a standalone tree's `.git/refs` (a known entry of the beside \
+         retirement's `.git` allow-list).",
+    ),
     ("remote", 1, "The branch.NAME.remote configuration field."),
     (
         "tag",
@@ -2930,7 +2953,7 @@ fn each_way_of_undoing_the_contract_is_refused() {
         ),
         (
             "fn f(r: &Path) { git(r).args([\"config\", \"core.worktree\"]).arg(r); }",
-            "\"config (writing form)\": 4 uses, ceiling 3",
+            "\"config (writing form)\": 5 uses, ceiling 4",
         ),
         (
             "fn f(r: &Path) { git(r).args([\"-C\", \"elsewhere\", \"checkout\", \".\"]); }",
@@ -3007,7 +3030,7 @@ fn an_entry_that_outlives_its_code_is_refused() {
     for (module, expected) in [
         (
             "agent::git_carry::shallow",
-            &["WRITERS \"index-pack\": registered as 1, the tree holds 0"][..],
+            &["WRITERS \"index-pack\": registered as 2, the tree holds 1"][..],
         ),
         (
             "agent::git_carry::estimate",

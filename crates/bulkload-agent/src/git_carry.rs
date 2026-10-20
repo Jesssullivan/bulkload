@@ -2955,6 +2955,15 @@ pub(crate) mod mid_pass {
         /// targets were written and before their prints are taken (TIN-6569,
         /// review of 2026-10-16).
         HandoffWritten,
+        /// Keyed by a live checkout: `--advance-ancestor` between its
+        /// read-only proof and the destination lock.
+        AdvanceBeforeLock,
+        /// Keyed by a live checkout: `--advance-ancestor` after its intent
+        /// and before the branch's compare-and-swap.
+        AdvanceBeforeBranch,
+        /// Keyed by a live checkout: `--advance-ancestor` after its branch
+        /// moved (recorded), before its first seat.
+        AdvanceAfterBranch,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;

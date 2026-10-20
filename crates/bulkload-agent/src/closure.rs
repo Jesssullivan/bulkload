@@ -27,6 +27,16 @@
 //!   ref created under `refs/<ns>/` (a ref kept at another value refuses
 //!   the item instead). Closed: every captured byte and ref is at the
 //!   destination, beside the live tree.
+//! - `applied` also (operator ruling 2026-10-16 21:24Z, "refs in always; a
+//!   tree beside ONLY where neo has uncommitted work"): the outcome is
+//!   `WorkspaceRefsIn` (or a re-apply's
+//!   `PreviousWorkspaceRefsInNotRevalidated`), the exact journal says
+//!   `workspace-refs-in`, the item's `.files` record names its current
+//!   capture, finished with no entry occupied, and its `.refs-in` record
+//!   names that capture with no ref pending: the capture held no tracked
+//!   change and its HEAD came in by ref, so no tree landed beside; its
+//!   untracked and ignored files were placed, adopted or landed beside one
+//!   by one, every one counted (the row's `files` block, with `refs_in`).
 //! - `referenced-only`: the item plans no workspace, its outcome is
 //!   `RefsImported` (or `PreviousRefCustodyNotWorkspaceParity`, or
 //!   `IndexRepaired` from `git-repair-missing-index` with a state directory,
@@ -99,6 +109,20 @@
 //! names the beside path. 2026-10-19 adds `beside_reason` to an
 //! `applied-beside` row: the refusal code that sent the capture beside
 //! (`GIT_DESTINATION_DIVERGED`, `GIT_DESTINATION_NONREPO_DIFFERS`).
+//! `--advance-ancestor` (operator ruling
+//! 2026-10-19) adds one key to a row whose item's `.advance` record names
+//! its current capture, `advance` (`outcome`: `advanced` or the
+//! `GIT_ADVANCE_*` code; `detail`, the refusal's, such as the colliding
+//! paths; `beside`: `pending`, `absent`, `retired` or `kept`; `reason`;
+//! `kept`, the entries the advance left to the live checkout;
+//! `file_besides`, the captured files it landed as `<path>SUFFIX`). It
+//! classifies an `applied-beside` row whose advance refused
+//! `refused-pending-review` with that code, and an `applied` row whose
+//! advance kept its beside landing `refused-pending-review` with
+//! `GIT_ADVANCE_BESIDE_KEPT` (a duplicate on the destination; the
+//! coordinator's decision on #289). Either is printed as `refusal`, its
+//! detail as `refusal_detail`, and bound to the code, the live HEAD it was
+//! decided against and the detail: the operator disposes what stays.
 //!
 //! v4 was `bulkload.closure.v4` (#226 item 5; v3 from WP3 PR 4,
 //! v2 from WP3 PR 3, v1 before). v4 adds one top-level block after
@@ -205,7 +229,21 @@ pub fn instance(entry: &LedgerEntry) -> String {
         CaptureId::Unreadable => (1, String::new()),
         CaptureId::Digest(digest) => (2, digest),
     };
+    let advance = advance_refusal(entry).zip(entry.advance.as_ref());
     let (record_tag, record) = match &entry.record {
+        // `--advance-ancestor`: a beside row's advance refusal is bound to
+        // the refusal and the live HEAD it was decided against, not to the
+        // beside outcome record, which a journal rerun rewrites.
+        Some(Ok(_)) if advance.is_some() => advance.map_or((4, Vec::new()), |(code, summary)| {
+            (
+                4,
+                format!(
+                    "{code}\0{}\0{}\0{}",
+                    summary.live, summary.branch, summary.detail
+                )
+                .into_bytes(),
+            )
+        }),
         None => (0_u8, Vec::new()),
         Some(Err(why)) => (1, why.reason().as_bytes().to_vec()),
         // A decoded record always re-encodes (its path came from postcard).
@@ -254,12 +292,61 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
                 (_, false) => Disposition::Unaccounted("outcome-workspace-mismatch"),
                 (None, true) => Disposition::Unaccounted("beside-record-missing"),
                 (Some(Err(why)), true) => Disposition::Unaccounted(why),
-                (Some(Ok(())), true) => journal("workspace-beside", Disposition::AppliedBeside),
+                // `--advance-ancestor` (operator ruling 2026-10-19): the
+                // capture landed beside because its advance of the live
+                // checkout refused; that typed refusal is the row's, pending
+                // review, so the operator decides what stays beside.
+                (Some(Ok(())), true) => advance_refusal(entry).map_or_else(
+                    || journal("workspace-beside", Disposition::AppliedBeside),
+                    |code| {
+                        journal(
+                            "workspace-beside",
+                            Disposition::RefusedPendingReview(code.to_owned()),
+                        )
+                    },
+                ),
+            }
+        }
+        // Operator ruling 2026-10-16 21:24Z: no tree beside, the refs in
+        // and every untracked and ignored entry counted. The `.files`
+        // record must name the item and its current capture, finished with
+        // nothing occupied, and the `.refs-in` record that capture with no
+        // ref pending.
+        Outcome::WorkspaceRefsIn | Outcome::PreviousWorkspaceRefsInNotRevalidated => {
+            match (&entry.files, entry.has_workspace) {
+                (_, false) => Disposition::Unaccounted("outcome-workspace-mismatch"),
+                (None, true) => Disposition::Unaccounted("files-record-missing"),
+                (Some(Err(why)), true) => Disposition::Unaccounted(why),
+                (Some(Ok(_)), true) if entry.refs_in.is_none() => {
+                    Disposition::Unaccounted("refs-in-record-missing")
+                }
+                // A captured ref the namespace holds at another value was
+                // kept, so the source's value is in by no ref there: the
+                // item waits for review, typed (review of #291, K1).
+                (Some(Ok(_)), true) if entry.refs_in.as_ref().is_some_and(|refs| refs.kept > 0) => {
+                    journal(
+                        "workspace-refs-in",
+                        Disposition::RefusedPendingReview(
+                            BulkloadRefusal::GitDestinationOccupied.code().to_owned(),
+                        ),
+                    )
+                }
+                (Some(Ok(_)), true) => journal("workspace-refs-in", Disposition::Applied),
             }
         }
         Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated => {
             if entry.has_workspace {
-                journal("workspace-restored", Disposition::Applied)
+                // `--advance-ancestor`: an advanced checkout whose beside
+                // landing was kept holds that duplicate pending review.
+                advance_refusal(entry).map_or_else(
+                    || journal("workspace-restored", Disposition::Applied),
+                    |code| {
+                        journal(
+                            "workspace-restored",
+                            Disposition::RefusedPendingReview(code.to_owned()),
+                        )
+                    },
+                )
             } else {
                 Disposition::Unaccounted("outcome-workspace-mismatch")
             }
@@ -301,6 +388,33 @@ pub fn classify(entry: &LedgerEntry) -> Disposition {
             }
             Some(Ok(_)) => Disposition::Carried,
         },
+    }
+}
+
+// `--advance-ancestor`: the typed refusal an item's advance record holds
+// for its current capture: on a beside row, the `GIT_ADVANCE_*` code that
+// refused the advance; on a restored row (the live checkout advanced),
+// `GIT_ADVANCE_BESIDE_KEPT` when its beside landing was kept, a duplicate.
+fn advance_refusal(entry: &LedgerEntry) -> Option<&str> {
+    let outcome = match &entry.record {
+        Some(Ok(record)) => &record.outcome,
+        _ => return None,
+    };
+    let code = entry
+        .advance
+        .as_ref()
+        .and_then(crate::estate::AdvanceSummary::refusal)?;
+    let kept = code == "GIT_ADVANCE_BESIDE_KEPT";
+    match outcome {
+        Outcome::WorkspaceBeside | Outcome::PreviousWorkspaceBesideNotRevalidated if !kept => {
+            Some(code)
+        }
+        Outcome::WorkspaceRestored | Outcome::PreviousWorkspaceRestorationNotRevalidated
+            if kept =>
+        {
+            Some(code)
+        }
+        _ => None,
     }
 }
 
@@ -448,6 +562,12 @@ pub struct Row {
     /// `Display`, which names the beside path), printed as
     /// `refusal_detail`.
     pub detail: Option<String>,
+    /// `--advance-ancestor` (operator ruling 2026-10-19): what the item's
+    /// advance record says of its current capture, printed as `advance`.
+    pub advance: Option<crate::estate::AdvanceSummary>,
+    /// Operator ruling 2026-10-16 21:24Z: a `workspace-refs-in` row's file
+    /// count (no tree beside), printed as `files`.
+    pub files: Option<crate::estate::FilesSummary>,
     /// 2026-10-19: on an `applied-beside` row, the refusal code that sent
     /// the capture beside (`GIT_DESTINATION_DIVERGED`,
     /// `GIT_DESTINATION_NONREPO_DIFFERS`), printed as `beside_reason`.
@@ -604,6 +724,22 @@ impl Report {
                     .cloned(),
                 refs_in: entry.refs_in.clone(),
                 detail: beside_foreign_detail(entry),
+                advance: entry.advance.clone(),
+                files: entry
+                    .files
+                    .as_ref()
+                    .and_then(|files| files.as_ref().ok())
+                    .filter(|_| {
+                        matches!(
+                            entry.record,
+                            Some(Ok(crate::outcome::OutcomeRecord {
+                                outcome: Outcome::WorkspaceRefsIn
+                                    | Outcome::PreviousWorkspaceRefsInNotRevalidated,
+                                ..
+                            }))
+                        )
+                    })
+                    .cloned(),
                 beside_reason: entry.beside_reason.clone(),
             });
         }
@@ -1032,8 +1168,80 @@ impl Report {
                         .map_or_else(|| "null".to_owned(), |errno| errno.to_string()),
                 );
             }
+            // `--advance-ancestor`: a beside row whose advance refused holds
+            // that typed refusal (the outcome is the beside landing's).
+            if row.outcome.as_ref().and_then(Outcome::refusal).is_none()
+                && row
+                    .advance
+                    .as_ref()
+                    .and_then(crate::estate::AdvanceSummary::refusal)
+                    .is_some()
+            {
+                if let Some(code) = row.disposition.refusal() {
+                    let _ = write!(out, ",\"refusal\":{}", json_string(code));
+                }
+            }
             if let Disposition::Unaccounted(why) = &row.disposition {
                 let _ = write!(out, ",\"unaccounted_reason\":{}", json_string(why));
+            }
+            if let Some(advance) = &row.advance {
+                // A beside row held by its advance's refusal names that
+                // refusal's detail (the colliding paths).
+                if row.outcome.as_ref().and_then(Outcome::refusal).is_none()
+                    && row.disposition.refusal().is_some()
+                    && !advance.detail.is_empty()
+                {
+                    let _ = write!(out, ",\"refusal_detail\":{}", json_string(&advance.detail));
+                }
+                let _ = write!(
+                    out,
+                    ",\"advance\":{{\"outcome\":{},\"detail\":{},\"beside\":{},\"reason\":{},\"kept\":{},\"file_besides\":{},\"switched\":{},\"retire_pending\":{}}}",
+                    json_string(&advance.outcome),
+                    json_string(&advance.detail),
+                    json_string(&advance.beside),
+                    json_string(&advance.reason),
+                    advance.kept,
+                    advance.besides,
+                    advance.switched,
+                    advance.retiring,
+                );
+            }
+            // Operator ruling 2026-10-16 21:24Z: a row landed with no tree
+            // beside counts every file and names the refs that went in; one
+            // whose refs-in kept a ref is held, named by its refusal.
+            if let (Some(_), Some(code)) = (&row.files, row.disposition.refusal()) {
+                let kept = row.refs_in.as_ref().map_or(0, |refs| refs.kept);
+                let _ = write!(
+                    out,
+                    ",\"refusal\":{},\"refusal_detail\":{}",
+                    json_string(code),
+                    json_string(&format!("refs-in-kept={kept}")),
+                );
+            }
+            if let Some(files) = &row.files {
+                let tally = &files.tally;
+                let _ = write!(
+                    out,
+                    ",\"files\":{{\"tracked\":{},\"placed\":{},\"adopted\":{},\"beside\":{},\"beside_present\":{},\"dirs_placed\":{},\"dirs_adopted\":{},\"dirs_beside\":{},\"bytes_placed\":{}}}",
+                    files.tracked,
+                    tally.placed,
+                    tally.adopted,
+                    tally.beside,
+                    tally.beside_present,
+                    tally.dirs_placed,
+                    tally.dirs_adopted,
+                    tally.dirs_beside,
+                    tally.bytes,
+                );
+                if let Some(refs) = &row.refs_in {
+                    let _ = write!(
+                        out,
+                        ",\"refs_in\":{{\"ns\":{},\"created\":{},\"kept\":{}}}",
+                        json_string(&refs.ns),
+                        refs.created,
+                        refs.kept,
+                    );
+                }
             }
             // Gap C12: a refused row names the refs its item's refs-in
             // imported for this capture, and a `GIT_BESIDE_FOREIGN` the
@@ -1283,6 +1491,8 @@ fn transfer_row(
         carried: None,
         refs_in: None,
         detail: None,
+        advance: None,
+        files: None,
         beside_reason: None,
     }
 }
@@ -2232,6 +2442,83 @@ mod tests {
         );
     }
 
+    /// Operator ruling 2026-10-16 21:24Z: a `workspace-refs-in` outcome
+    /// (no tree beside) closes `applied` only with its exact journal, a
+    /// finished `.files` record of the current capture and its refs-in
+    /// record; otherwise it is unaccounted, by reason.
+    #[test]
+    fn a_refs_in_outcome_needs_its_journal_its_files_and_its_refs() {
+        let summary = crate::estate::FilesSummary {
+            tracked: 3,
+            tally: crate::git_carry::converge::files::Tally::default(),
+        };
+        let refs = crate::estate::RefsInSummary {
+            ns: "neo-20261016".to_owned(),
+            created: 1,
+            kept: 0,
+        };
+        let with =
+            |files: Option<std::result::Result<crate::estate::FilesSummary, &'static str>>,
+             refs_in: Option<crate::estate::RefsInSummary>,
+             journal| LedgerEntry {
+                refs_in,
+                files,
+                ..entry('f', true, Some(("workspace-refs-in", None)), journal)
+            };
+        assert_eq!(
+            classify(&with(
+                Some(Ok(summary.clone())),
+                Some(refs.clone()),
+                present("workspace-refs-in")
+            )),
+            Disposition::Applied
+        );
+        assert_eq!(
+            classify(&with(
+                None,
+                Some(refs.clone()),
+                present("workspace-refs-in")
+            )),
+            Disposition::Unaccounted("files-record-missing")
+        );
+        assert_eq!(
+            classify(&with(
+                Some(Err("files-record-mismatch")),
+                Some(refs.clone()),
+                present("workspace-refs-in")
+            )),
+            Disposition::Unaccounted("files-record-mismatch")
+        );
+        assert_eq!(
+            classify(&with(
+                Some(Ok(summary.clone())),
+                None,
+                present("workspace-refs-in")
+            )),
+            Disposition::Unaccounted("refs-in-record-missing")
+        );
+        let kept = crate::estate::RefsInSummary {
+            kept: 1,
+            ..refs.clone()
+        };
+        assert_eq!(
+            classify(&with(
+                Some(Ok(summary.clone())),
+                Some(kept),
+                present("workspace-refs-in")
+            )),
+            Disposition::RefusedPendingReview("GIT_DESTINATION_OCCUPIED".to_owned())
+        );
+        assert_eq!(
+            classify(&with(
+                Some(Ok(summary)),
+                Some(refs),
+                present("workspace-beside")
+            )),
+            Disposition::Unaccounted("journal-outcome-mismatch")
+        );
+    }
+
     fn entry(
         item: char,
         has_workspace: bool,
@@ -2259,6 +2546,8 @@ mod tests {
             carried: None,
             beside: None,
             refs_in: None,
+            advance: None,
+            files: None,
             beside_reason: None,
         }
     }
@@ -3997,6 +4286,8 @@ mod tests {
                     carried: None,
                     beside: None,
                     refs_in: None,
+                    advance: None,
+                    files: None,
                     beside_reason: None,
                 });
                 let Kind::Typed(code, how) = kind else {

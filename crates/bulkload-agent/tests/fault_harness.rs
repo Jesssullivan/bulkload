@@ -1331,6 +1331,14 @@ use estate_converge::EstateConverge;
 mod estate_adopt;
 use estate_adopt::EstateAdopt;
 
+// The `estate.advance.*` points (operator ruling 2026-10-19,
+// `--advance-ancestor`): an advance of a live checkout, or the retirement
+// of the beside landing it made redundant, crashed; the rerun finishing it
+// with neither tree lost.
+#[path = "fault_harness/estate_advance.rs"]
+mod estate_advance;
+use estate_advance::EstateAdvance;
+
 // The `reseat.*` points (R0, TIN-6587): a re-seat of landed agent sessions
 // crashed, and the rerun settling it forward.
 #[path = "fault_harness/reseat.rs"]
@@ -1526,6 +1534,54 @@ scenarios! {
     estate_apply_beside_rekey_after_intent => EstateConvergeAfterIntent: 1, EstateAdopt::BesideRekey;
     estate_apply_beside_rekey_after_seat => EstateConvergeAfterSeat: 1, EstateAdopt::BesideRekey;
     estate_apply_beside_rekey_after_head => EstateConvergeAfterHead: 1, EstateAdopt::BesideRekey;
+    // Operator ruling 2026-10-19 (`--advance-ancestor`): a clean live
+    // ancestor advanced in place, crashed after its intent, after the
+    // branch's compare-and-swap, after a seat (first, and mid-materialize),
+    // after the index (the checkout done) and after its ledger; then the
+    // beside landing's retirement crashed after its record, after the
+    // rename and mid-retirement, linked and standalone. Each finished by
+    // the rerun, neither tree lost.
+    estate_advance_after_intent => EstateAdvanceAfterIntent: 1, EstateAdvance::Advance;
+    estate_advance_after_branch => EstateAdvanceAfterBranch: 1, EstateAdvance::Advance;
+    estate_advance_after_seat_first => EstateAdvanceAfterSeat: 1, EstateAdvance::Advance;
+    estate_advance_after_seat_mid => EstateAdvanceAfterSeat: 3, EstateAdvance::Advance;
+    estate_advance_after_index => EstateAdvanceAfterIndex: 1, EstateAdvance::Advance;
+    estate_advance_after_ledger => EstateAdvanceAfterLedger: 1, EstateAdvance::Advance;
+    estate_advance_retire_after_intent => EstateAdvanceRetireAfterIntent: 1, EstateAdvance::Retire;
+    estate_advance_retire_after_rename => EstateAdvanceRetireAfterRename: 1, EstateAdvance::Retire;
+    estate_advance_retire_mid => EstateAdvanceRetireMid: 1, EstateAdvance::Retire;
+    estate_advance_retire_standalone_after_rename => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireStandalone;
+    estate_advance_retire_standalone_mid => EstateAdvanceRetireMid: 1, EstateAdvance::RetireStandalone;
+    // Review of this lane: a rerun without the flag finishes what a
+    // flagged pass began; an edit made after the crash is never taken for
+    // bulkload's output.
+    estate_advance_after_seat_rerun_without_flag => EstateAdvanceAfterSeat: 1, EstateAdvance::RetireNoFlag;
+    estate_advance_retire_after_rename_rerun_without_flag => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireNoFlag;
+    estate_advance_after_branch_then_edited => EstateAdvanceAfterBranch: 1, EstateAdvance::AdvanceEdited;
+    // Review of #289, finding 1: a seat the advance replaces edited after
+    // its crash rolls it back, never HEAD advanced over the old index (the
+    // rollback itself crashed after its intent and mid-seat, then
+    // finished). Operator ruling 2026-10-19, "Switch when clean": a switch
+    // crashed at each step, between its branch's creation and HEAD's move
+    // too. Findings 2 and 3: a retirement finished before the workspace
+    // step, and never over a write made since its proof.
+    estate_advance_after_branch_rolled_back => EstateAdvanceAfterBranch: 1, EstateAdvance::AdvanceRolledBack;
+    estate_advance_after_seat_rolled_back => EstateAdvanceAfterSeat: 2, EstateAdvance::AdvanceRolledBack;
+    estate_advance_rollback_after_intent => EstateAdvanceRollbackAfterIntent: 1, EstateAdvance::RollbackCrash;
+    estate_advance_rollback_mid => EstateAdvanceRollbackMid: 2, EstateAdvance::RollbackCrash;
+    estate_advance_switch_after_intent => EstateAdvanceAfterIntent: 1, EstateAdvance::Switch;
+    estate_advance_switch_head_branch => EstateConvergeHeadBranch: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_branch => EstateAdvanceAfterBranch: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_seat => EstateAdvanceAfterSeat: 3, EstateAdvance::Switch;
+    estate_advance_switch_after_index => EstateAdvanceAfterIndex: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_ledger => EstateAdvanceAfterLedger: 1, EstateAdvance::Switch;
+    estate_advance_retire_after_rename_live_edited => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireLiveEdited;
+    estate_advance_retire_after_rename_written => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireWritten;
+    estate_advance_retire_mid_written => EstateAdvanceRetireMid: 1, EstateAdvance::RetireWritten;
+    // The verification of #289, r6: a standalone beside's two-valued key
+    // carried into the live configuration, crashed after the first value;
+    // the rerun adds the second and retires the beside.
+    estate_advance_retire_carried => EstateAdvanceRetireCarried: 1, EstateAdvance::RetireCarry;
     // 2026-10-19 (the td01 batch): a stripped linked worktree adopted by
     // registering it again, crashed after its administration directory
     // and after its gitfile; finished by the rerun, no file written.

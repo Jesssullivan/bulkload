@@ -259,6 +259,7 @@ fn beside_component(
                     adopt: true,
                     origins: &[],
                     items,
+                    advance: None,
                     beside: None,
                 };
                 if super::rekey_check(staged, &at, landing, &policy, ledger)?.is_some() {
@@ -296,7 +297,7 @@ pub fn workspace(
     target: &Target<'_>,
     landing: &Landing<'_>,
     since: Option<i128>,
-    (origins, items, beside): (&[String], &[String], Option<&str>),
+    (origins, items, beside, advance, refs_in): (&[String], &[String], Option<&str>, bool, bool),
 ) -> Result<ItemRow> {
     let workspace = target
         .workspace
@@ -390,7 +391,59 @@ pub fn workspace(
             row.class = "differs";
             row.adopt = "diverged";
             row.components = components;
-            if let Some(suffix) = beside {
+            // `--advance-ancestor`: what the apply would do with it, so a
+            // plan never reports an advance as a beside landing.
+            let mut switching = false;
+            let advances = advance
+                && match super::advance::preview(
+                    &super::Place {
+                        worktree: workspace,
+                        base: target.base,
+                        git_dir: git_dir.clone(),
+                        common: common.clone(),
+                        source: target.source,
+                        standalone,
+                        beside: false,
+                        advanced: None,
+                    },
+                    (&scratch, &meta),
+                    beside,
+                )? {
+                    Ok(switch) => {
+                        switching = switch;
+                        true
+                    }
+                    Err(refusal) => {
+                        row.components
+                            .push(format!("advance-refused={}", refusal.code()));
+                        false
+                    }
+                };
+            if advances {
+                // A switch (operator ruling 2026-10-19, "Switch when
+                // clean") is an advance onto the capture's branch.
+                row.adopt = if switching {
+                    "advance-switch"
+                } else {
+                    "advance"
+                };
+            }
+            // `--refs-in` (operator ruling 2026-10-16 21:24Z): a capture
+            // with no tracked change whose HEAD its refs bring in lands no
+            // tree beside, so the plan never reports one (the apply's own
+            // assessment, read-only; it lands beside after all only when
+            // the refs-in it runs first leaves that HEAD unreached).
+            let clean = !advances
+                && refs_in
+                && beside
+                    .and_then(|suffix| super::super::beside::namespace(suffix).ok())
+                    .and_then(|ns| super::clean::assess(staged, target, &ns).ok().flatten())
+                    .is_some();
+            if clean {
+                row.adopt = "refs-in";
+                row.components.push("beside=none".to_owned());
+            }
+            if let (false, false, Some(suffix)) = (advances, clean, beside) {
                 row.components.push(beside_component(
                     (staged, target, items),
                     (&common, &meta.exclude(&scratch.repo)?),

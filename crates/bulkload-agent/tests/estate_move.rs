@@ -9,8 +9,9 @@
 //!   `topic` branch the destination moved: refs-in creates
 //!   `refs/<label>/heads/topic` at the source's value, and the destination's
 //!   `topic` and checkout stay as they were;
-//! - `diverged`: a destination checkout with its own commit: the capture
-//!   lands beside it at `<path>.<label>`, the live checkout untouched;
+//! - `diverged`: a destination checkout with its own commit, the source
+//!   with an uncommitted tracked change: the capture lands beside it at
+//!   `<path>.<label>`, the live checkout untouched;
 //! - `broken` and `broken2`: captures refused (no index): carried as files,
 //!   at the live path (absent) and beside it (occupied);
 //! - `occupied`: a non-Git tree at the live path (a standalone item's):
@@ -189,6 +190,9 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
         &dst.join("diverged"),
         &["commit", "--quiet", "--allow-empty", "-m", "dest only"],
     );
+    // The source's uncommitted tracked work is what lands beside (operator
+    // ruling 2026-10-16 21:24Z: a source with none lands no tree beside).
+    fs::write(src.join("diverged/d.txt"), b"d, unstaged on the source\n").unwrap();
     let diverged_head = git(&dst.join("diverged"), &["rev-parse", "HEAD"]);
     // broken, broken2: no index, so the capture refuses them.
     for name in ["broken", "broken2"] {

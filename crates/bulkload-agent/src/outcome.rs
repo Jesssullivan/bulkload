@@ -93,14 +93,24 @@ pub enum Outcome {
     WorkspaceBeside,
     /// A re-apply found the beside journal and did not revalidate it.
     PreviousWorkspaceBesideNotRevalidated,
+    /// The adopt proof refused the existing planned workspace and the
+    /// capture held no tracked change, its HEAD reachable through the refs
+    /// `--refs-in` imported: no tree landed beside; the source's untracked
+    /// and ignored files were reconciled into the live checkout, file by
+    /// file (operator ruling 2026-10-16 21:24Z, "refs in always; a tree
+    /// beside ONLY where neo has uncommitted work").
+    WorkspaceRefsIn,
+    /// A re-apply found the refs-in journal and did not revalidate it.
+    PreviousWorkspaceRefsInNotRevalidated,
 }
 
 /// Every non-refusal outcome and its legacy string, in variant order.
 ///
 /// `Refused`, variant 10, sits between `IndexRepaired` and
 /// `CarriedAsFiles` (11); `WorkspaceBeside` (12) and
-/// `PreviousWorkspaceBesideNotRevalidated` (13) follow (M2r2 c).
-pub const NAMED: [(Outcome, &str); 13] = [
+/// `PreviousWorkspaceBesideNotRevalidated` (13) follow (M2r2 c), then
+/// `WorkspaceRefsIn` (14) and `PreviousWorkspaceRefsInNotRevalidated` (15).
+pub const NAMED: [(Outcome, &str); 15] = [
     (Outcome::Captured, "captured"),
     (Outcome::CapturedWithDrift, "captured-with-drift"),
     (
@@ -128,6 +138,11 @@ pub const NAMED: [(Outcome, &str); 13] = [
     (
         Outcome::PreviousWorkspaceBesideNotRevalidated,
         "previous-workspace-beside-not-revalidated",
+    ),
+    (Outcome::WorkspaceRefsIn, "workspace-refs-in"),
+    (
+        Outcome::PreviousWorkspaceRefsInNotRevalidated,
+        "previous-workspace-refs-in-not-revalidated",
     ),
 ];
 
@@ -785,6 +800,8 @@ mod tests {
             (Outcome::CarriedAsFiles, 11),
             (Outcome::WorkspaceBeside, 12),
             (Outcome::PreviousWorkspaceBesideNotRevalidated, 13),
+            (Outcome::WorkspaceRefsIn, 14),
+            (Outcome::PreviousWorkspaceRefsInNotRevalidated, 15),
         ] {
             assert_eq!(postcard::to_allocvec(&outcome).unwrap(), vec![variant]);
         }

@@ -15,7 +15,10 @@
 //! 1. The destination is the planned workspace, or with `--beside SUFFIX`
 //!    the workspace's path with SUFFIX appended. An absent destination is
 //!    made (one level, 0755; its parent must exist,
-//!    `GIT_DESTINATION_PARENT_MISSING`).
+//!    `GIT_DESTINATION_PARENT_MISSING`), and removed again when the item
+//!    ends not carried with nothing landed in it: a refused carry leaves
+//!    no empty directory (operator ruling 2026-10-16 21:24Z; the two empty
+//!    `*.neo-20261016` directories on sting, 2026-10-19).
 //! 2. One transfer session (`copy`, or `pull` over SSH) into it, recorded in
 //!    `CARRY_STATE/<item>/dest` like any `copy` or `pull`
 //!    ([`crate::transfer_outcome::record_session`]). The transfer's rules
@@ -877,6 +880,20 @@ fn carry_one(
         }
         Err(error) => return Err(crate::refuse::io(&error, SITE)),
     };
+    // Operator ruling 2026-10-16 21:24Z (no empty beside directory): a
+    // destination this carry made and nothing landed in is removed again
+    // when the item is not carried, so a refused carry leaves nothing on
+    // disk; so is an empty beside destination an earlier carry made and a
+    // crash left (a beside path is never the operator's). Only an empty
+    // directory is ever removed.
+    let empty_beside = !created
+        && !bound
+        && suffix.is_some()
+        && fs::read_dir(&job.destination).is_ok_and(|mut entries| entries.next().is_none());
+    let mut made = Unmade {
+        path: &job.destination,
+        armed: created || empty_beside,
+    };
     // 2. The transfer session, recorded in its destination state; or, for
     // a bind, the session already recorded there.
     let source_key = transport.source_key(&job.source);
@@ -956,6 +973,7 @@ fn carry_one(
         gits,
         via: None,
     };
+    made.armed = false;
     write(&carried_path(state, identity, source_label), &record)?;
     fault_point!(EstateCarryRecorded);
     record_outcome(state, identity, item, Ok(&record))?;
@@ -971,6 +989,23 @@ fn carry_one(
             record.gits.len(),
         ),
     ))
+}
+
+/// A destination directory a carry made: removed when dropped armed and
+/// still empty (`rmdir` removes nothing else), its parent synced.
+struct Unmade<'a> {
+    path: &'a Path,
+    armed: bool,
+}
+
+impl Drop for Unmade<'_> {
+    fn drop(&mut self) {
+        if self.armed && fs::remove_dir(self.path).is_ok() {
+            if let Some(parent) = self.path.parent() {
+                let _ = fs::File::open(parent).and_then(|dir| dir.sync_all());
+            }
+        }
+    }
 }
 
 fn record_outcome(

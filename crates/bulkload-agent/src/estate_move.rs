@@ -335,6 +335,8 @@ fn source_command(args: &[OsString]) -> Result<()> {
 }
 
 /// The destination half's arguments.
+// Each bool is one independent command-line flag.
+#[allow(clippy::struct_excessive_bools)]
 struct Move {
     plan_only: bool,
     label: String,
@@ -342,6 +344,12 @@ struct Move {
     origins: Vec<String>,
     side_roots: Vec<PathBuf>,
     exclude_union: bool,
+    /// `--advance-ancestor` (operator ruling 2026-10-19), passed to the
+    /// apply.
+    advance_ancestor: bool,
+    /// `--place-derived`, passed to the apply: a clean source's derived
+    /// entries are written too (held until the operator rules otherwise).
+    place_derived: bool,
     handoff: bool,
     sessions: Option<PathBuf>,
     codex_root: Option<PathBuf>,
@@ -367,6 +375,8 @@ impl Move {
             origins: Vec::new(),
             side_roots: Vec::new(),
             exclude_union: false,
+            advance_ancestor: false,
+            place_derived: false,
             handoff: true,
             sessions: None,
             codex_root: None,
@@ -399,6 +409,14 @@ impl Move {
                 }
                 "--exclude-union" if !parsed.exclude_union => {
                     parsed.exclude_union = true;
+                    step = 1;
+                }
+                "--advance-ancestor" if !parsed.advance_ancestor => {
+                    parsed.advance_ancestor = true;
+                    step = 1;
+                }
+                "--place-derived" if !parsed.place_derived => {
+                    parsed.place_derived = true;
                     step = 1;
                 }
                 "--no-hand-off" if parsed.handoff => {
@@ -634,6 +652,8 @@ fn move_command(args: &[OsString]) -> Result<()> {
                 exclude_union: run.exclude_union,
                 beside: Some(suffix),
                 refs_in: true,
+                advance_ancestor: run.advance_ancestor,
+                place_derived: run.place_derived,
             },
         ),
         &|row| {
@@ -864,6 +884,9 @@ fn preview(run: &Move, (plan, corpus, private): (&Path, &Path, &Path)) -> Result
             scan: Vec::new(),
             activate_origin: run.origins.clone(),
             beside: Some(run.suffix()),
+            advance_ancestor: run.advance_ancestor,
+            // The apply's `--refs-in` lands no tree beside a clean capture.
+            refs_in: true,
             side_roots: run.side_roots.clone(),
         },
         &mut |line| writeln!(file, "{line}").refuse_at("estate_move::diff"),

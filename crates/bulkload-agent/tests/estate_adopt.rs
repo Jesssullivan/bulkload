@@ -1679,7 +1679,15 @@ fn p131_estate_diff_runs_one_index_pack_per_repository() {
         let elsewhere: Vec<_> = processes
             .iter()
             .filter(|process| {
-                process.worktree.contains("/adopt-") && process.argv.contains(bundle.as_str())
+                // An item's scratch is `<stage>/adopt-<n>/repo`: its own
+                // directory's name, never a `/adopt-` higher up the path
+                // (a TMPDIR may hold one).
+                process
+                    .worktree
+                    .rsplit('/')
+                    .nth(1)
+                    .is_some_and(|dir| dir.starts_with("adopt-"))
+                    && process.argv.contains(bundle.as_str())
             })
             .map(|process| (&process.worktree, &process.argv))
             .collect();
@@ -2214,6 +2222,15 @@ fn named_refs(repo: &Path) -> BTreeMap<String, String> {
             (name.to_owned(), value.to_owned())
         })
         .collect()
+}
+
+/// Neo's uncommitted tracked work, which is what a tree beside is for
+/// (operator ruling 2026-10-16 21:24Z, "refs in always; a tree beside ONLY
+/// where neo has uncommitted work"): with `--refs-in`, a source with no
+/// tracked change lands no tree beside (`tests/estate_clean_source.rs`), so
+/// the beside rows that pass `--refs-in` give the source this edit.
+fn neo_tracked_work(source: &Path) {
+    fs::write(source.join("README"), b"LA-Mesh, unstaged on neo\n").unwrap();
 }
 
 /// A diverged `lamesh` (a seat edited at the destination) whose source is
@@ -2936,6 +2953,7 @@ fn p119_a_refused_beside_still_imports_its_refs() {
     fs::write(source.join("README"), b"LA-Mesh, a stashed edit\n").unwrap();
     git(&source, &["stash", "push", "--quiet", "-m", "neo wip"]);
     let stash = git(&source, &["rev-parse", "refs/stash"]).trim().to_owned();
+    neo_tracked_work(&source);
     let run = diverged(&world, &source, &dest, true);
     let beside = beside_of(&dest);
     fs::create_dir(&beside).unwrap();
@@ -3015,6 +3033,7 @@ fn p122_a_hand_planned_beside_landing_is_rekeyed_and_converged() {
     fs::write(source.join("LATER"), b"LATER, from neo later\n").unwrap();
     git(&source, &["add", "LATER"]);
     git(&source, &["commit", "--quiet", "-m", "later"]);
+    neo_tracked_work(&source);
     let run = Run::new(
         &world,
         &[(source.clone(), dest.clone(), Some(dest.clone()))],
@@ -3094,6 +3113,9 @@ fn p123_a_retired_beside_landing_is_not_laid_down_again() {
                 }
             }
         }
+        if refs_in {
+            neo_tracked_work(&source);
+        }
         source_moves(&run, &source, "LATER");
         let diff = run.diff(&["--beside", SUFFIX]);
         assert!(
@@ -3134,6 +3156,7 @@ fn p123_a_retired_beside_landing_is_not_laid_down_again() {
 fn p124_a_beside_gitfile_naming_a_gone_or_foreign_gitdir_is_foreign() {
     for case in ["gone", "other"] {
         let (world, source, dest) = small();
+        neo_tracked_work(&source);
         let run = diverged(&world, &source, &dest, false);
         let beside = beside_of(&dest);
         copy_tree(&source, &beside);
@@ -3198,6 +3221,9 @@ fn p125_stash_refs_are_decided_by_commit() {
         fs::write(source.join("README"), b"LA-Mesh, stash A\n").unwrap();
         git(&source, &["stash", "push", "--quiet", "-m", "A"]);
         let a = git(&source, &["rev-parse", "refs/stash"]).trim().to_owned();
+        if refused {
+            neo_tracked_work(&source);
+        }
         let run = diverged(&world, &source, &dest, true);
         let beside = beside_of(&dest);
         let mut flags = vec!["--adopt", "--beside", SUFFIX];
@@ -3222,6 +3248,9 @@ fn p125_stash_refs_are_decided_by_commit() {
         fs::write(source.join("README"), b"LA-Mesh, stash B\n").unwrap();
         git(&source, &["stash", "push", "--quiet", "-m", "B"]);
         let b = git(&source, &["rev-parse", "refs/stash"]).trim().to_owned();
+        if refused {
+            neo_tracked_work(&source);
+        }
         settle();
         run.capture();
         let ran = run.apply(&flags);
