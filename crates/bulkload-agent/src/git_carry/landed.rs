@@ -41,6 +41,9 @@ pub const REFS_INTENT: &str = "refs.intent";
 pub const WORKSPACE_LANDED: &str = "workspace.landed";
 /// The workspace intent's file name.
 pub const WORKSPACE_INTENT: &str = "workspace.intent";
+/// What a refused proof proved before it refused ([`WorkspaceProven`]),
+/// beside the workspace ledger it extends.
+pub const WORKSPACE_PROVEN: &str = "workspace.proven";
 /// A first linked landing's intent: `landing-<key>.intent` in the common
 /// ledger directory, `<key>` naming the destination (#216's residual).
 pub const LANDING_INTENT_PREFIX: &str = "landing-";
@@ -454,6 +457,38 @@ pub struct LandedWorkspace {
     pub seats: Vec<SeatPrint>,
 }
 
+/// What a converge's proof had proved when it refused
+/// `GIT_DESTINATION_MODIFIED` (#292 review F2), so the next pass does not
+/// read those seats again while the refusal stands.
+///
+/// The ledger is left as it is: its `recorded_ns` is also the hand-off's
+/// "landed" instant. This record is bound to it by the ledger's capture and
+/// `recorded_ns`, and is ignored once either moves. Each print is one the
+/// refused proof read by content under a print that held still, or one an
+/// earlier such record vouched for in that proof, and `recorded_ns` is that
+/// proof's racy instant, taken before its first read: a print stamped
+/// within the racy allowance of it stays racy, as a ledger's does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceProven {
+    /// The workspace ledger this extends: its capture and `recorded_ns`.
+    pub capture: [u8; 32],
+    pub ledger_ns: i128,
+    /// The refused proof's racy instant.
+    pub recorded_ns: i128,
+    /// The file system the prints were taken on.
+    pub fsid: u64,
+    /// The seats it vouches for, sorted by path.
+    pub seats: Vec<SeatPrint>,
+}
+
+impl WorkspaceProven {
+    /// Whether this extends `ledger` on the file system `fsid`.
+    #[must_use]
+    pub fn extends(&self, ledger: &LandedWorkspace, fsid: u64) -> bool {
+        (self.capture, self.ledger_ns, self.fsid) == (ledger.capture, ledger.recorded_ns, fsid)
+    }
+}
+
 /// A pending workspace converge: durable before the converge's first
 /// destination write, removed after the ledger it produces. It names both
 /// captures; the seat operations are recomputed from their provenance
@@ -518,6 +553,10 @@ impl Record for LandedWorkspace {
 
 impl Record for WorkspaceIntent {
     const MAGIC: &'static [u8; 16] = MAGIC;
+}
+
+impl Record for WorkspaceProven {
+    const MAGIC: &'static [u8; 16] = b"bulkload-proven1";
 }
 
 impl Record for LandingIntent {
