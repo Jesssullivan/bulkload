@@ -530,8 +530,7 @@ fn an_edit_after_the_exchange_survives(rerun: Rerun, slow: bool) {
                     .set_modified(std::time::SystemTime::now())
                     .unwrap();
                 std::thread::sleep(std::time::Duration::from_nanos(
-                    u64::try_from(super::super::super::RACY_GRANULARITY_NS).unwrap()
-                        + 100_000_000,
+                    u64::try_from(super::super::super::RACY_GRANULARITY_NS).unwrap() + 100_000_000,
                 ));
             }
         },
