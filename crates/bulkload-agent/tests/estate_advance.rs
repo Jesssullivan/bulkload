@@ -1156,7 +1156,10 @@ fn r2_a_standalone_beside_with_its_own_configuration_is_kept() {
     let (outcome, reason) = receipt(&ran.stdout);
     assert_eq!(outcome, "workspace-restored", "{reason}");
     assert!(word(&reason, "advance-beside=kept"), "{reason}");
-    assert!(word(&reason, "advance-beside-reason=configuration"), "{reason}");
+    assert!(
+        word(&reason, "advance-beside-reason=configuration"),
+        "{reason}"
+    );
     holds_neo(&world);
     assert!(world.beside().join(".git").is_dir());
     assert_eq!(

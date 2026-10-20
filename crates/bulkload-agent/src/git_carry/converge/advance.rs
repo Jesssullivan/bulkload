@@ -17,15 +17,17 @@
 //! 1. its HEAD is born and an ancestor of (or equal to) the captured HEAD
 //!    (`GIT_ADVANCE_NOT_ANCESTOR`);
 //! 2. its branch is the captured one: both on the same branch, or both
-//!    detached (`GIT_ADVANCE_BRANCH_MISMATCH`; detaching or switching the
-//!    live checkout is never the answer);
+//!    detached (`GIT_ADVANCE_BRANCH_MISMATCH` when one is detached;
+//!    detaching or attaching the live checkout is never the answer). Two
+//!    branch names switch when clean (below);
 //! 3. that branch is a plain ref whose tip is the live HEAD, no other
 //!    worktree has it checked out (or held by a rebase or bisect) and no
 //!    pending bulkload intent names it (`GIT_ADVANCE_BRANCH_BUSY`);
 //! 4. its index and tracked files are clean: no staged or unstaged change,
-//!    no merge, rebase, cherry-pick, revert or bisect in progress, no
-//!    assume-unchanged or skip-worktree entry, and every seat the advance
-//!    replaces or removes holds its HEAD's bytes (`GIT_ADVANCE_NOT_CLEAN`);
+//!    no merge, rebase, cherry-pick, revert or bisect in progress, no Git
+//!    lock held (`index.lock`, `HEAD.lock`), no assume-unchanged or
+//!    skip-worktree entry, and every seat the advance replaces or removes
+//!    holds its HEAD's bytes (`GIT_ADVANCE_NOT_CLEAN`);
 //! 5. its untracked files that are not ignored (the coordinator's
 //!    refinement of the ruling: sting's own untracked work stays, byte for
 //!    byte) collide with no path the capture holds, in its HEAD's tree, its
@@ -38,6 +40,25 @@
 //!
 //! Each refusal writes nothing at the live checkout; the caller lands the
 //! capture beside it in the same pass, as without the flag.
+//!
+//! The switch (operator ruling 2026-10-19, interview, "Switch when
+//! clean"): a live checkout on another branch than the capture's is
+//! switched to the capture's branch at the captured HEAD, through the same
+//! machinery, when (a) it is clean (4 above: `GIT_SWITCH_NOT_CLEAN`), (b)
+//! no Git operation is in progress and no Git lock held
+//! (`GIT_SWITCH_IN_PROGRESS`), (c) no process has its working directory or
+//! an open file inside it (`/proc`, Linux; elsewhere refused:
+//! `GIT_SWITCH_IN_USE`), (d) the capture's branch is checked out in no
+//! worktree and named by no pending intent (`GIT_SWITCH_BRANCH_BUSY`), (e)
+//! the captured HEAD is reachable from the live refs once the capture is
+//! in (`GIT_SWITCH_UNREACHABLE`), and (f) no untracked file collides
+//! (`GIT_SWITCH_UNTRACKED_COLLIDES`). The capture's branch is created
+//! create-only, or moved by compare-and-swap from an ancestor of the
+//! captured HEAD (one diverged: `GIT_SWITCH_BRANCH_DIVERGED`), HEAD put on
+//! it with its own compare-and-swap; the live branch stays exactly where
+//! it was, recorded (`from` in [`Advanced`]). The live HEAD need not be an
+//! ancestor. A race under the lock is `GIT_SWITCH_RACED`, a rollback
+//! `GIT_SWITCH_ROLLED_BACK`.
 //!
 //! The advance, under the lock, after an additive import of the capture's
 //! objects and provenance:
@@ -77,11 +98,20 @@
 //! captured branches, tags and stash entries go in under `refs/<ns>/`
 //! (`--refs-in`, the caller).
 //!
-//! Every refusal after the intent is `GIT_CONVERGE_INTERRUPTED` (the
-//! converge's rule): the rerun settles the intent forward ([`settle`]),
-//! each seat classified by its content (old, new or a third party's), the
-//! index by compare-and-swap on its entries; an intent whose branch never
-//! moved is dropped and the checkout proved afresh.
+//! Bulkload holds the live checkout's own `index.lock` (marked,
+//! [`index_marker`]) from the proof under the destination lock to the
+//! index publish (review of #289, finding 1): no `git commit -a` or other
+//! index writer of the operator's interleaves, and a crash leaves it held
+//! (their Git refuses typed) until the rerun settles. Never HEAD advanced
+//! over the old index: a third party's edit met after the branch moved
+//! (or an index changed under the lock) rolls the advance back
+//! ([`roll_back`]: every seat to the live HEAD's bytes, the refs by
+//! compare-and-swap, the lock released, the edit left as it is,
+//! `GIT_ADVANCE_ROLLED_BACK`), and the capture lands beside. Any other
+//! failure after the intent is `GIT_CONVERGE_INTERRUPTED`, the lock kept:
+//! the rerun settles the intent ([`settle`]) forward or back, each seat
+//! classified by its content; an intent whose ref step never happened is
+//! dropped and the checkout proved afresh.
 //!
 //! Later passes converge the advanced checkout as any landing, with three
 //! rules from its record ([`Advanced`]): the entries it left to the live
