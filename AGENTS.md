@@ -1,165 +1,68 @@
-# bulkload Development Context
+# bulkload
 
-> **Read [docs/SPEC.md](docs/SPEC.md) first.** It states what bulkload is for,
-> traced to the operator's own words in
-> [docs/intent-ledger.md](docs/intent-ledger.md). R0: every work lane carries
-> on at the destination (conversations resume and can be carried on,
-> transcripts intact, repos and worktrees intact, nothing dropped but truly
-> recreatable content; transcripts byte for byte under their original
-> session IDs, SPEC C8/C9). R3: proven faster than rclone on complex networks and many-file estates,
-> staging work data before tcfs launches. Where this file, `docs/slo.md` or a
-> Linear document disagrees with SPEC on what bulkload must achieve, SPEC
-> wins.
->
-> - **Quote the requirement you serve.** Every lane plan and every audit
->   quotes, verbatim, the SPEC requirement it serves (R0–R4), with the ledger
->   IDs SPEC cites for it. A plan or audit that cannot quote one is out of
->   scope. "Done", "ready" or "verified" is reported only with SPEC's
->   acceptance receipts.
-> - **Never re-ask a standing ruling.** The rulings in SPEC's "Standing
->   operator rulings" table are never re-asked, and no interview offers an
->   option that contradicts them. SPEC's 2026-10-16 rulings on C1–C20
->   (OI-1003-Q194) are standing too. A new conflict may be asked once, as a
->   dated question. When the operator restates a standing ruling, even
->   phrased as a question, that is confirmation, not an open question.
-> - **The ledger is append-only.** `docs/intent-ledger.md` is never trimmed or
->   paraphrased, R-N55 included. New operator statements are added as new
->   entries.
+Read [docs/SPEC.md](docs/SPEC.md) first. It is short and it is the whole
+requirement: what bulkload must do, what done means, the rules, and how each
+kind of data is consolidated. It was reset on 2026-10-20 at the operator's
+request. Older specs, SLO text, design notes and rulings are history, not
+instructions.
 
-## Ratified rulings (read first)
+What every lane must keep in mind:
 
-Process rulings are lab's, and lab's text is canonical: lab `AGENTS.md`
-"Ratified rulings", **R-HOOK-CONVERGENCE-20261004** (Linear TIN-3692 comment
-`98cf680c-7299-4949-bfb2-60079053ad43`). It supersedes the former R-N11
-blanket process ban and the R-N12 hook-stop mechanics that this file used to
-summarise (the 2026-09-20/24 text, last synced from lab#1913 by #78). Read
-R-N11, R-N12 and R-N13 there; they are not copied here
-([docs/SOURCES.md](docs/SOURCES.md), "Lab process rulings").
+- bulkload consolidates two live estates into one. Where both sides changed
+  something, the result contains both, merged at the one path. It never
+  writes a second copy beside the first, and it never stages.
+- Done is the operator's own `claude --resume` and `codex resume` on sting.
+  Nothing else is reported as done, ready or landed.
+- A lane plan quotes the SPEC rule it serves. Work that serves no rule there
+  is out of scope.
+- Do not mint ruling IDs, boards or checkpoint cadences. Ask the operator
+  once when a real decision is missing, and record the answer in SPEC only if
+  the operator says so.
 
-Repo-specific delta: this file's former R-N13 text (2026-09-20) also said
-"Ticket descriptions are never rewritten, only superseded by dated
-comments." Lab's current R-N13 does not restate that clause and no ruling
-has withdrawn it, so it still applies here.
+## Process rules
 
-Force push is allowed (OI-1003-Q195, operator 2026-10-16: "force push is
-totally allowe[d]"). `--force` and `--force-with-lease` need no extra
-confirmation; server-side branch protection is the only gate. Do not restate
-a ban the operator did not give, in this file, a lane brief or a receipt.
+Process rules are lab's: R-N11, R-N12 and R-N13 in lab `AGENTS.md`
+(R-HOOK-CONVERGENCE-20261004). In short:
+
+- Never signal another session's processes.
+- Hook output is advisory.
+- Cite the operator's words or the SPEC rule in every receipt.
+- Write a `docs/agent-notes/` entry per session.
 
 ## Repository
 
-This repository is bulkload: a live-host estate mover in Rust. It is its own
-project and shares no code with TCFS (tummycrypt); it may carry TCFS data
-(R-N53, 2026-09-23). The Python engine, the stillness ceremony and the
-installer are retired and are not recreated.
+bulkload is a live-host estate consolidator in Rust, separate from TCFS
+(tummycrypt).
 
 - `crates/bulkload-proto`: wire frames, row schema, refusal taxonomy.
-- `crates/bulkload-agent`: walk, chunk transport, Git estate carry, SQLite
-  provider-state composition.
-- `crates/bulkload-bench`: the R23 benchmark against rclone.
-- `crates/bulkload-handoff`: the credential-class handoff probes, kept out of
-  the agent binary (WP10).
-
-What bulkload must achieve: [docs/SPEC.md](docs/SPEC.md) (#236). How it
-works: [docs/design.md](docs/design.md). `docs/evidence/` holds measured
-results and the historical rulings ledger (evidence, not current
-instructions).
-
-## Sources of truth
-
-[docs/SOURCES.md](docs/SOURCES.md) names the one canonical place for each
-kind of fact. Point to it; do not copy its content into agent files or notes.
-
-## Live workstreams
-
-The entry point is the Linear document named in
-[docs/SOURCES.md](docs/SOURCES.md) (rewritten 2026-10-16T17:34Z): priority
-order, live board and pointers. When a stream changes state, update its
-P-TIN-177 milestone and live issue; edit the document's table only when a
-live issue is added or retired (the document's own rule). In chat, follow lab
-R-HOOK-CONVERGENCE-20261004 (brief, changes only, no whole-board recital).
+- `crates/bulkload-agent`: walk, transport, Git estate consolidation, agent
+  home and SQLite consolidation.
+- `crates/bulkload-bench`: the end-to-end race against rclone (SPEC goal 2).
+- `crates/bulkload-handoff`: credential handoff probes, kept out of the agent
+  binary.
 
 ## Engine rules
 
-- Performance: S1 in [docs/slo.md](docs/slo.md) defines the bar, the gates,
-  their order and verdict rule.
-- Unsafe-first (R-N54): raw syscalls, zero-copy and reused buffers are the
-  default design choice. Every `unsafe` block carries a `// SAFETY:` comment.
-- R25 (R-N58): no re-read of what the destination holds durably. The reading
-  that is the SLO's obligation, and the strict reading's status and limits,
-  are in docs/slo.md (OI-1003-Q40 and its 2026-10-06 amendment). Resume must
-  be measurable with `source_bytes_read` counters.
-- Durability: a record is never committed before the bytes it describes are
-  durable. Refusals are values, never panics: the deny-panics lints in each
-  crate's `[lints.clippy]`. Code calls that wall "R33"; the R1–R43 ledger's
-  R33 is a different ruling (see that file's header).
-- Dependency wall: the agent must not depend on anything in the `FORBIDDEN`
-  list of `crates/bulkload-agent/tests/dep_graph.rs`. Fix a violation by
-  removing the dependency, not by widening the list.
+- Never re-read what the destination already holds durably. Resume is
+  measured with `source_bytes_read` counters.
+- A record is never committed before the bytes it describes are durable.
+- Refusals are typed values, never panics (the deny-panics lints).
+- Every `unsafe` block carries a `// SAFETY:` comment.
+- The agent must not depend on anything in the `FORBIDDEN` list of
+  `crates/bulkload-agent/tests/dep_graph.rs`.
+- SQLite is read through its backup API or a held read snapshot. Never copy
+  live WAL/SHM bytes, and never replace a database. Rows are merged.
 
-## Estate rules
+## Lanes
 
-- Keep all operator and agent sessions running. Process control follows lab
-  R-N11 (above).
-- Include Git, agents, credentials, dots, SQLite and worktrees. Preserve both
-  hosts' unique state; an unresolved state class is not an implicit exclusion.
-  Only truly recreatable content may be dropped (OI-1003-Q185, Q192).
-- Git-aware union preserves refs, objects, real stashes, indexes, working bytes
-  and worktree administration without changing an active checkout.
-- Carry account credentials privately; preserve destination machine identity
-  and Home Manager authority. Never print credentials.
-- Capture SQLite through its backup API; never copy live WAL/SHM bytes or
-  replace a database with unique rows. Preserve conflicts for explicit
-  resolution.
-- Reclaim only proven redundant data after preserving unique content.
-- Estate operations are not frozen. R-N56's freeze is superseded on order
-  (OI-1003-Q194 C6, RUL-06), after OI-1003-Q142 relaxed OI-1002-Q24
-  (docs/slo.md, amendment 2026-10-16).
-
-## Agent lanes
-
-- Hook output is advisory (lab R-N12): record it in the receipt and continue
-  within authorization. A hook finding never stops a lane. R-N80, R-N92 and
-  R-N101 described the retired hook-stop regime and no longer apply. This
-  repository ships no pre-commit hook; a machine-level process-safety audit
-  is a Lab hook and advisory like the rest.
-- Never check whether a PID is alive. Wait only on your own background
-  tasks' notifications, or on files (R-N104).
-- The product's own cargo tests disable hooks only in fixture repos they
-  create and destroy (R-N98, test fixtures).
-- Each lane builds with its own `CARGO_TARGET_DIR`. A shared target
-  directory lets one lane test another lane's binaries.
-- Builds and tests on neo: **never** (OI-1003-Q196, operator 2026-10-16,
-  Linear TIN-4543 `34c2a101`). This upholds FOOT-03 (2026-08-26, "we CANNOT
-  EVER build on neo, EVER") and FOOT-10 (2026-09-01); R-N69 and its
-  `TINYLAND_ALLOW_LOCAL_BUILD` prefix are retired. Darwin checks run on PZM
-  or a CI macOS runner. A newer neo agent is built elsewhere and shipped to
-  neo with its sha256 checked.
-- Benchmark and S2 sampling conditions (R-N81, OI-1003-Q39, Q152, Q160,
-  Q168) are in docs/slo.md S1 and S2. Samples of record use rig controls,
-  never quiet windows (OI-1003-Q197, `34c2a101`): a rep of record passes
-  R-N81 (load1 < 2.5, AC power) and the rig's thermal and slot controls
-  (per-rep CPU package temperature and throttle count recorded, a refusal
-  threshold, balanced A/B slots, a cool-down between reps). Other work is
-  never quiesced for a sample, so R-N91 is superseded; under-load reps stay
-  informational (Q39). This settles "R-N81 vs SPEC R3". Since R-C842
-  (2026-10-16, TIN-4543 `ace8649c`) the gate of record is end-to-end time
-  to a verified working seat against an rclone sync of the same home; the
-  corpus race (gate a) stays only as a regression guard.
-
-## Durable notes
-
-Every session writes one entry in `docs/agent-notes/`, named
-`YYYY-MM-DD-<lane>.md` (R-N13, R-N84). An entry records what was done,
-the rulings it cites, the PRs and shas it produced, and what is still open.
-Distilled facts and rulings also go on the owning Linear issue. Nothing
-durable is left in `/tmp` or a harness scratchpad. Notes are dated records:
-one that is no longer true gets a dated label at its top naming what
-superseded it, and is not rewritten or deleted (lab R-N13; this replaces the
-earlier R-N55 deletion rule). One exception is ruled: R-C843
-(2026-10-16, TIN-4543 `ace8649c`) deletes the condemned whitepaper, formal
-model and clone-race lever notes in a signed commit citing docs/SPEC.md; the
-intent ledger and ruling records are never deleted.
+- Builds and tests never run on neo or sting. They run on honey (Linux) and
+  pzm (Darwin), at `nice -n 19`, each lane with its own `CARGO_TARGET_DIR`
+  and `TMPDIR`. Scratch is deleted after the run.
+- Never check whether a PID is alive. Wait on your own task notifications or
+  on files.
+- Fixture tests disable hooks only in the fixture repos they create.
+- Notes are dated records. A note that is no longer true gets a dated label
+  naming what superseded it.
 
 ## Validation
 

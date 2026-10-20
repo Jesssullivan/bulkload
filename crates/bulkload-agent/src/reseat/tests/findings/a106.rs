@@ -508,3 +508,60 @@ fn a106_a_target_written_under_the_swap_is_put_back() {
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
 }
+
+/// Merge-gate review of #280 (2026-10-19, a probe with this hook): a
+/// destination writer appends through the live name while the landed copy
+/// stands there, and the archive target is written in the same window, so
+/// the swap is put back. The copy then holds the writer's line, the only
+/// copy of it: it is never removed, but kept aside create-only beside the
+/// live name, `kept-aside`, held for review. The link is back as it was.
+#[test]
+fn a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let world = World::new();
+    let archive = world.archive();
+    let cwd = "/Users/jess/git/lab";
+    let neo = transcript(SID, cwd, "neo", 8);
+    world.land(SID, cwd, &neo);
+    let target = archive.join("live.jsonl");
+    World::archive_link(
+        &world.dest_transcript(SID),
+        &target,
+        &transcript(SID, cwd, "fork", 2),
+    );
+    let (written, archived) = (world.dest_transcript(SID), target.clone());
+    set_replace_hook(Some(Box::new(move |_dest: &Path| {
+        // The live name now holds the landed copy: the writer's line lands
+        // in it. Then the archive target is written too.
+        let mut live = fs::OpenOptions::new().append(true).open(&written).unwrap();
+        std::io::Write::write_all(&mut live, b"{\"sting\":\"next turn\"}\n").unwrap();
+        let mut file = fs::OpenOptions::new().append(true).open(&archived).unwrap();
+        std::io::Write::write_all(&mut file, b"{\"live\":1}\n").unwrap();
+    })));
+    let options = world.replacing();
+    let (summary, lines, _) = run(&options);
+    set_replace_hook(None);
+    assert_eq!(summary.files_of("claude", "kept-aside"), 1, "{lines:?}");
+    assert_eq!(
+        summary.files_of("claude", "replaced-archived"),
+        0,
+        "{lines:?}"
+    );
+    let dest = world.dest_transcript(SID);
+    assert_eq!(fs::read_link(&dest).unwrap(), target, "the link is back");
+    let mut kept = dest.as_os_str().to_owned();
+    kept.push(".bulkload-kept");
+    let kept = PathBuf::from(kept);
+    let mut want = neo;
+    want.extend_from_slice(b"{\"sting\":\"next turn\"}\n");
+    assert_eq!(
+        fs::read(&kept).unwrap(),
+        want,
+        "the writer's line survives in the copy kept aside"
+    );
+    assert!(fs::read(&target).unwrap().ends_with(b"{\"live\":1}\n"));
+    let ledger = Ledger::open_read_only(&options.state).unwrap().unwrap();
+    assert!(ledger.regular(&dest).unwrap().is_none());
+}

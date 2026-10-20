@@ -26,6 +26,17 @@
 //!    `shell-snapshots/`, which are host-local. `history.jsonl` (prompt
 //!    history) and `~/.claude.json` are not read by the picker and stay in
 //!    the landing.
+//! 6. A live-home landing (plan of record 2026-10-19, C9: `estate-move
+//!    --sessions` pulls the source's `.claude` into the destination's live
+//!    `.claude` with `--beside`): the landed `.claude` is the live one, so
+//!    every transcript there is listed. One this ledger placed (an earlier
+//!    pass's re-seat) is an output, not a landed session, and is skipped
+//!    unread. One already under the key Claude Code lists it by in its lane
+//!    (its own key, with or without a lane: the destination's own sessions;
+//!    or its lane's destination key: one placed there before, by hand or by
+//!    another ledger) is `in-place` ([`Resolved::InPlace`]): ledgered,
+//!    nothing written. Only sessions landed under a source key whose lane is
+//!    elsewhere are placed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read as _;
@@ -57,6 +68,17 @@ const DAY_NS: i64 = 86_400 * 1_000_000_000;
 pub struct Candidate {
     /// The key directory it was landed under (the source's key).
     pub key: String,
+    /// That directory's name: the key, or on a live-home landing the key
+    /// with the beside suffix when the pull landed the whole directory
+    /// beside a live path of another kind (second review of #280, finding 5).
+    pub dir: String,
+    /// A symlink (on a live-home landing, the destination's own archive
+    /// link): never read (second review of #280, N2).
+    pub link: bool,
+    /// The source's copy landed beside a live path that holds something
+    /// else (`<sid>.jsonl<suffix>`, or under `<key><suffix>/`): never in
+    /// place, always placed at its live name.
+    pub beside: bool,
     pub sid: String,
     pub path: PathBuf,
     pub mtime: i64,
@@ -101,19 +123,40 @@ impl Sessions {
             return Err(BulkloadRefusal::ReseatLandingAbsent);
         }
         let projects = options.landing_claude.join("projects");
+        let live = options.live_claude_landing();
+        let suffix = options.beside_suffix.as_deref().filter(|_| live);
         let mut list = Vec::new();
         let mut keys = Vec::new();
-        for key in names(&projects)? {
-            let directory = projects.join(&key);
+        for dir in names(&projects)? {
+            let directory = projects.join(&dir);
             // A key directory the landing holds as a symlink is listed
-            // through it; each transcript is still checked with `lstat`.
+            // through it; each transcript is still checked with `lstat`. On
+            // a live-home landing one is the destination's own, never
+            // entered (N2).
+            if live
+                && std::fs::symlink_metadata(&directory)
+                    .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                continue;
+            }
             if !std::fs::metadata(&directory).is_ok_and(|meta| meta.is_dir()) {
                 continue;
             }
-            keys.push(key.clone());
+            let key = suffix
+                .and_then(|suffix| dir.strip_suffix(suffix))
+                .unwrap_or(&dir)
+                .to_owned();
+            keys.push(dir.clone());
             for name in names(&directory)? {
-                let Some(sid) = name.strip_suffix(".jsonl") else {
-                    continue;
+                let (sid, suffixed) = match name.strip_suffix(".jsonl") {
+                    Some(sid) => (sid, false),
+                    None => match suffix
+                        .and_then(|suffix| name.strip_suffix(suffix))
+                        .and_then(|name| name.strip_suffix(".jsonl"))
+                    {
+                        Some(sid) => (sid, true),
+                        None => continue,
+                    },
                 };
                 if sid.is_empty() || sid.starts_with('.') {
                     continue;
@@ -122,8 +165,17 @@ impl Sessions {
                 let Ok(meta) = std::fs::symlink_metadata(&path) else {
                     continue;
                 };
+                let link = meta.file_type().is_symlink();
+                let beside = suffixed || key != dir;
+                // A beside landing is the source's file, never a link.
+                if beside && !meta.is_file() {
+                    continue;
+                }
                 list.push(Candidate {
                     key: key.clone(),
+                    dir: dir.clone(),
+                    link,
+                    beside,
                     sid: sid.to_owned(),
                     path,
                     mtime: Identity::of(&meta).mtime,
@@ -256,19 +308,33 @@ fn session_mtimes(
 /// a transcript's head (its lane and slug, once, then from the ledger).
 pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Result<u64> {
     let ledger = Ledger::open_read_only(&options.state)?;
+    let live = options.live_claude_landing();
     let root = std::fs::canonicalize(&options.dest_claude).ok();
     let mut lane_dirs = Vec::new();
     let mut mtimes = Vec::new();
     let mut planned = 0_u64;
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
     for candidate in &sessions.list {
+        // A live-home landing: an earlier pass's placement is no landed
+        // session, and a session in place is placed by nothing (C9).
+        if let (true, Some(root)) = (live, root.as_ref()) {
+            if candidate.link || own_placement(options, ledger.as_ref(), root, candidate)? {
+                continue;
+            }
+        }
         let cached = match &ledger {
             Some(ledger) => ledger
                 .session(TOOL, &candidate.sid)?
                 .filter(|row| row.landing == candidate.path),
             None => None,
         };
-        let dest_key = match resolve(candidate, cached.as_ref(), lanes, options)? {
+        let known = known_source(ledger.as_ref(), &candidate.sid)?;
+        let dest_key = match resolve(
+            candidate,
+            cached.as_ref(),
+            lanes,
+            (options, live && !candidate.beside, known),
+        )? {
             Resolved::Lane(_, lane) => {
                 if !lane_dirs.contains(&lane.dest_cwd) {
                     lane_dirs.push(lane.dest_cwd.clone());
@@ -276,7 +342,7 @@ pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Resul
                 Some(lane.key)
             }
             Resolved::ById(_) => Some(candidate.key.clone()),
-            Resolved::Refused(..) => None,
+            Resolved::InPlace(..) | Resolved::Refused(..) => None,
         };
         // A session a pass already decided is not read again (S3): its
         // slug is the one it found, or none.
@@ -304,9 +370,9 @@ pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Resul
                     .into_iter()
                     .map(|(landed, rel, _)| (landed, rel)),
             );
-            if keys_done.insert((candidate.key.clone(), dest_key.clone())) {
+            if keys_done.insert((candidate.dir.clone(), dest_key.clone())) {
                 files.extend(
-                    key_files(options, sessions, &candidate.key, &dest_key)?
+                    key_files(options, sessions, &candidate.dir, &dest_key)?
                         .into_iter()
                         .map(|(landed, rel, _)| (landed, rel)),
                 );
@@ -338,8 +404,30 @@ pub enum Resolved {
     Lane(String, Lane),
     /// To no lane, kept under its source key (`--unmapped=by-id`).
     ById(String),
+    /// A live-home landing only (C9): already under the key Claude Code
+    /// lists it by, in its lane when it has one. Nothing to place.
+    InPlace(String, Option<Lane>),
     /// To a refusal.
     Refused(String, BulkloadRefusal),
+}
+
+/// A live-home landing (C9): whether `candidate` is a transcript this
+/// ledger placed, an output of an earlier pass rather than a landed
+/// session. `root` is the canonical destination `.claude`.
+///
+/// # Errors
+/// The ledger's read refusal.
+pub fn own_placement(
+    options: &Options,
+    ledger: Option<&Ledger>,
+    root: &Path,
+    candidate: &Candidate,
+) -> Result<bool> {
+    let (Some(ledger), Ok(rel)) = (ledger, candidate.path.strip_prefix(&options.landing_claude))
+    else {
+        return Ok(false);
+    };
+    Ok(ledger.placement(&root.join(rel))?.is_some())
 }
 
 /// The transcript's first top-level `cwd`, reading only until it is found.
@@ -372,7 +460,7 @@ fn field(path: &Path, wanted: &'static [&'static str], limit: u64) -> Result<Opt
 
 /// Resolve `candidate`'s lane, from its session row when it has one (a
 /// found `cwd` always; "none recorded" while the landed transcript is
-/// unchanged).
+/// unchanged). `known`: [`known_source`].
 ///
 /// # Errors
 /// I/O refusals of the scan; a destination path that cannot resolve.
@@ -380,7 +468,7 @@ pub fn resolve(
     candidate: &Candidate,
     cached: Option<&Session>,
     lanes: &Lanes,
-    options: &Options,
+    (options, live, known): (&Options, bool, bool),
 ) -> Result<Resolved> {
     let cwd = match cached.map(|row| (row.source_cwd.clone(), row)) {
         Some((Some(cwd), _)) if !cwd.is_empty() => Some(cwd),
@@ -392,23 +480,108 @@ pub fn resolve(
         }
         _ => first_cwd(&candidate.path)?,
     };
+    // A live-home landing (review of #280, finding 7): a transcript under a
+    // key that is not under the source home's key is the destination's own
+    // (the source's land under keys of source paths), already where Claude
+    // Code lists it, with or without a `cwd` its key agrees with. Never one
+    // an earlier pass recorded as the source's: provenance is sticky, so a
+    // session the source pruned since keeps its typed outcome (verification
+    // of #280, N4 across passes).
+    let destination_own = live && !known && destination_own(options, candidate);
     let Some(cwd) = cwd else {
+        if destination_own {
+            return Ok(Resolved::InPlace(String::new(), None));
+        }
         return Ok(Resolved::Refused(
             String::new(),
             BulkloadRefusal::ReseatLaneUnresolved,
         ));
     };
-    if key::project_key(&cwd) != candidate.key {
+    let own_key = key::project_key(&cwd) == candidate.key;
+    let lane = if own_key || live {
+        lanes.lane(Path::new(&cwd))?
+    } else {
+        None
+    };
+    if live {
+        // C9: listed by Claude Code where it already is.
+        match lane {
+            Some(lane) if lane.key == candidate.key => {
+                return Ok(Resolved::InPlace(cwd, Some(lane)))
+            }
+            // Only the destination's own: a source-keyed session with no
+            // lane stays `RESEAT_LANE_UNMAPPED`, typed and reviewable
+            // (second review of #280, N4).
+            None if own_key && destination_own => return Ok(Resolved::InPlace(cwd, None)),
+            _ => {}
+        }
+    }
+    if !own_key {
+        if destination_own {
+            return Ok(Resolved::InPlace(cwd, None));
+        }
         return Ok(Resolved::Refused(
             cwd,
             BulkloadRefusal::ReseatLaneUnresolved,
         ));
     }
-    match lanes.lane(Path::new(&cwd))? {
+    match lane {
         Some(lane) => Ok(Resolved::Lane(cwd, lane)),
         None if options.by_id(&cwd) => Ok(Resolved::ById(cwd)),
         None => Ok(Resolved::Refused(cwd, BulkloadRefusal::ReseatLaneUnmapped)),
     }
+}
+
+/// Whether the re-seat ledger recorded session `sid` as the source's on an
+/// earlier pass: a row of any outcome but `in-place` (placed, adopted,
+/// refused, ...). Provenance is sticky (verification of #280, N4): such a
+/// session is never taken for the destination's own, and its typed outcome
+/// stands until dispositioned.
+///
+/// # Errors
+/// The ledger's read refusal.
+pub fn known_source(ledger: Option<&Ledger>, sid: &str) -> Result<bool> {
+    let Some(ledger) = ledger else {
+        return Ok(false);
+    };
+    Ok(ledger
+        .session(TOOL, sid)?
+        .is_some_and(|row| row.outcome != "in-place"))
+}
+
+/// Whether `candidate` is the destination's own session (a live-home
+/// landing): by provenance, not in this run's source listing
+/// (`--claude-listing`; independent review of #280, N4), else by its key's
+/// shape ([`source_keyed`]).
+fn destination_own(options: &Options, candidate: &Candidate) -> bool {
+    options.claude_listing.as_ref().map_or_else(
+        || !source_keyed(options, &candidate.key),
+        |listed| {
+            let rel = format!("projects/{}/{}.jsonl", candidate.key, candidate.sid);
+            !listed.contains(rel.as_bytes())
+        },
+    )
+}
+
+/// Whether the project key `key` is one of a path under the source home
+/// (its key, or that key and a `-`), when the source home and the
+/// destination home key differently. When they key alike (one home path
+/// on both hosts), every key counts as the source's: nothing is taken for
+/// the destination's own by its key alone.
+fn source_keyed(options: &Options, key: &str) -> bool {
+    let (Some(source), Some(destination)) = (
+        options.source_home.to_str().map(key::project_key),
+        options.dest_home.to_str().map(key::project_key),
+    ) else {
+        return true;
+    };
+    if source == destination {
+        return true;
+    }
+    key == source
+        || key
+            .strip_prefix(source.as_str())
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 /// Every regular file (and every other node, to report) under `root`, as
@@ -450,10 +623,29 @@ pub fn companions(
     dest_key: &str,
     slug: Option<&str>,
 ) -> Result<Vec<(PathBuf, PathBuf, Kind)>> {
+    let mut out = companions_landed(options, sessions, candidate, dest_key, slug)?;
+    // A live-home landing (second review of #280, finding 5): a companion
+    // already at its own destination name (the per-session trees, plans
+    // and todos, keyed by ID, not by project) is in place; nothing is read
+    // or written for it, so a linked `file-history/<id>` is never walked
+    // into for a write.
+    if options.live_claude_landing() {
+        out.retain(|(landed, rel, _)| *landed != options.landing_claude.join(rel));
+    }
+    Ok(out)
+}
+
+fn companions_landed(
+    options: &Options,
+    sessions: &Sessions,
+    candidate: &Candidate,
+    dest_key: &str,
+    slug: Option<&str>,
+) -> Result<Vec<(PathBuf, PathBuf, Kind)>> {
     let landing = &options.landing_claude;
     let sid = &candidate.sid;
     let mut out = Vec::new();
-    let sidecar = landing.join("projects").join(&candidate.key).join(sid);
+    let sidecar = landing.join("projects").join(&candidate.dir).join(sid);
     for rel in walk(&sidecar)? {
         out.push((
             sidecar.join(&rel),
@@ -524,11 +716,26 @@ pub fn key_files(
     key: &str,
     dest_key: &str,
 ) -> Result<Vec<(PathBuf, PathBuf, Kind)>> {
+    let mut out = key_files_landed(options, sessions, key, dest_key)?;
+    // A live-home landing: a key's file already at its own destination name
+    // is in place, never placed again or reported kept.
+    if options.live_claude_landing() {
+        out.retain(|(landed, rel, _)| *landed != options.landing_claude.join(rel));
+    }
+    Ok(out)
+}
+
+fn key_files_landed(
+    options: &Options,
+    sessions: &Sessions,
+    key: &str,
+    dest_key: &str,
+) -> Result<Vec<(PathBuf, PathBuf, Kind)>> {
     let base = options.landing_claude.join("projects").join(key);
     let sids: BTreeSet<&str> = sessions
         .list
         .iter()
-        .filter(|candidate| candidate.key == key)
+        .filter(|candidate| candidate.dir == key)
         .map(|candidate| candidate.sid.as_str())
         .collect();
     let mut out = Vec::new();
@@ -578,19 +785,65 @@ pub fn reseat(
     let root = super::root(&options.dest_claude)?;
     let placer = Placer::new(ledger, &root)
         .with_archived(&options.replace_archived)
+        .with_kept_suffix(options.beside_suffix.as_deref())
         .with_rebind(&options.rebind);
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
     let mut refused_keys: BTreeMap<String, BulkloadRefusal> = BTreeMap::new();
+    let live = options.live_claude_landing();
     for candidate in &sessions.list {
+        // A live-home landing (C9): an earlier pass's placement is this
+        // ledger's output, not a landed session; nothing is read for it.
+        if live && own_placement(options, Some(ledger), &root, candidate)? {
+            continue;
+        }
         let cached = ledger
             .session(TOOL, &candidate.sid)?
             .filter(|row| row.landing == candidate.path);
-        let (cwd, lane, dest_key) = match resolve(candidate, cached.as_ref(), lanes, options)? {
+        // A live-home landing (second review of #280, N2): a symlinked
+        // transcript (the destination's own archive link) is never read. The
+        // source's copy of that session, when the pull landed one beside it,
+        // is that ID's landed transcript and is placed at the live name
+        // (with `--replace-archived-dest` replacing the link, A-106); else
+        // the link is the destination's own and in place.
+        if live && candidate.link {
+            // Its key directory is accounted for: no "kept" report for it.
+            keys_done.insert((candidate.dir.clone(), candidate.key.clone()));
+            if !has_beside(sessions, candidate) {
+                in_place(
+                    ledger,
+                    candidate,
+                    ("", None),
+                    cached.as_ref(),
+                    summary,
+                    emit,
+                )?;
+            }
+            continue;
+        }
+        let known = known_source(Some(ledger), &candidate.sid)?;
+        let (cwd, lane, dest_key) = match resolve(
+            candidate,
+            cached.as_ref(),
+            lanes,
+            (options, live && !candidate.beside, known),
+        )? {
             Resolved::Lane(cwd, lane) => {
                 let key = lane.key.clone();
                 (cwd, Some(lane), key)
             }
             Resolved::ById(cwd) => (cwd, None, candidate.key.clone()),
+            Resolved::InPlace(cwd, lane) => {
+                in_place(
+                    ledger,
+                    candidate,
+                    (&cwd, lane.as_ref()),
+                    cached.as_ref(),
+                    summary,
+                    emit,
+                )?;
+                keys_done.insert((candidate.dir.clone(), candidate.key.clone()));
+                continue;
+            }
             Resolved::Refused(cwd, refusal) => {
                 // Cached, so a rerun does not scan it again (S3).
                 ledger.put_session(&Session {
@@ -671,10 +924,10 @@ pub fn reseat(
                 place(&landed, &dest, kind, &candidate.sid)?;
             }
         }
-        if keys_done.insert((candidate.key.clone(), dest_key.clone())) {
+        if keys_done.insert((candidate.dir.clone(), dest_key.clone())) {
             // The key's memory and everything else under it that is no
             // session's (S4, Q185).
-            for (landed, dest, kind) in key_files(options, sessions, &candidate.key, &dest_key)? {
+            for (landed, dest, kind) in key_files(options, sessions, &candidate.dir, &dest_key)? {
                 place(&landed, &dest, kind, "")?;
             }
         }
@@ -733,6 +986,61 @@ pub fn reseat(
         ))?;
     }
     Ok(())
+}
+
+/// Whether the pull landed the source's copy of `link`'s session beside it
+/// (second review of #280, N2): a beside candidate of the same key and ID.
+fn has_beside(sessions: &Sessions, link: &Candidate) -> bool {
+    sessions
+        .list
+        .iter()
+        .any(|other| other.beside && other.key == link.key && other.sid == link.sid)
+}
+
+/// A live-home landing's session already where Claude Code lists it (C9):
+/// counted and reported `in-place`, nothing written to the agent state. Its
+/// session row is written so a rerun reads nothing for it (S3), unless the
+/// row of that ID names another landed copy (the same session landed under
+/// its source key too), which keeps its row.
+fn in_place(
+    ledger: &Ledger,
+    candidate: &Candidate,
+    (cwd, lane): (&str, Option<&Lane>),
+    cached: Option<&Session>,
+    summary: &mut Summary,
+    emit: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    summary.session(TOOL, "in-place");
+    // Another landing's row is not this one's to replace; nor is a typed
+    // outcome (verification of #280, N4): only a mapped lane (the
+    // operator's disposition) turns an earlier refusal into `in-place`.
+    let other = match ledger.session(TOOL, &candidate.sid)? {
+        Some(row) if cached.is_none() => Some(row),
+        Some(row) if lane.is_none() && row.outcome != "in-place" => Some(row),
+        _ => None,
+    };
+    if other.is_none() {
+        ledger.put_session(&Session {
+            tool: TOOL.to_owned(),
+            id: candidate.sid.clone(),
+            landing: candidate.path.clone(),
+            source_cwd: Some(cwd.to_owned()),
+            dest_cwd: lane.map(|lane| lane.dest_cwd.clone()),
+            dest_key: Some(candidate.key.clone()),
+            slug: cached.and_then(|row| row.slug.clone()),
+            outcome: "in-place".to_owned(),
+            landed_size: Some(candidate.size),
+            landed_mtime: Some(candidate.mtime),
+        })?;
+    }
+    emit(&session_line(
+        candidate,
+        cwd,
+        (lane, Some(&candidate.key), None),
+        "in-place",
+        None,
+        &BTreeMap::new(),
+    ))
 }
 
 fn session_line(

@@ -36,6 +36,6 @@ target/release/bulkload-bench --help
 
 - [Where each fact lives](docs/SOURCES.md)
 - [What bulkload must achieve](docs/SPEC.md) (#236)
-- [SLOs and proofs](docs/slo.md)
+- [SLOs and proofs (superseded 2026-10-20 by SPEC.md)](docs/slo.md)
 - [Design](docs/design.md)
 - [Measured evidence](docs/evidence/)

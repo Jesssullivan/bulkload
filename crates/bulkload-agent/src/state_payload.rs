@@ -195,6 +195,10 @@ pub fn ledger(rel: &[&OsStr]) -> bool {
                     && (extension == "lock" || extension == crate::transfer_outcome::RECORD_EXT)
             }) || pending(name)
         }
+        // The session pulls' provenance listings (`pull/claude.listing`,
+        // `pull/codex.listing`): the paths each pull carried, by name.
+        ["pull"] if name.rsplit_once('.').is_some_and(|(stem, ext)| !stem.is_empty() && ext == "listing") => true,
+        ["pull"] => pending(name),
         [home, ..] if STORE_HOMES.contains(home) => STORE_LEDGERS.contains(&name),
         _ => false,
     }
@@ -419,6 +423,8 @@ mod tests {
             "private/abc-def.exclude-union",
             "private/abc-def-0123.done",
             "private/abc-def.carried",
+            "pull/claude.listing",
+            "pull/codex.listing",
             "pull/corpus/transfer.sqlite",
             "pull/corpus/transfer.sqlite-wal",
             "pull/corpus/writer.lock",
@@ -442,6 +448,8 @@ mod tests {
             "private/abc-0/index",
             "private/abc.pending-x",
             "pull/corpus/data.bin",
+            "pull/.listing",
+            "pull/claude.listing/x",
             "pull/corpus/transfer.closure.d/item.json",
             "landing/.claude/projects/p/s.jsonl",
             "other/transfer.sqlite",

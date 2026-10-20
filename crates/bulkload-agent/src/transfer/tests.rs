@@ -752,7 +752,14 @@ fn a_chunk_of_a_superseded_output_is_still_filled_locally() {
                 session: &session,
                 salvage: &salvage,
             },
-            (&row, false),
+            Planned {
+                row: &row,
+                extend: false,
+                snapshot: false,
+                beside: None,
+                claimed: &HashSet::new(),
+                always: false,
+            },
             &manifest,
             &mut Vec::new(),
         );
@@ -3207,3 +3214,7 @@ mod fold;
 
 // ---- M2r2 A-103: a grown byte-prefix destination file is extended ----------
 mod prefix;
+
+// ---- plan of record 2026-10-19 C1/C2: `--beside SUFFIX` lands a differing
+// ---- file beside the live one --------------------------------------------
+mod beside;
