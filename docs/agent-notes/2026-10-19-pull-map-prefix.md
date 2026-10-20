@@ -262,9 +262,61 @@ one defect and two hardenings in `place::judge_beside`:
   `TRANSPORT_LOST`): unaccounted, `destination-unsettled`, and neither a
   review row nor a standing policy closes it. Only a later pass that
   decides the path does.
+- #280's head `fc0cb4e` (N4 sticky provenance, cumulative listing) is
+  merged (`34c9038`; one conflict, both sides' appended tests kept). A
+  source path the owner rule refuses (`DESTINATION_MAP_CONFLICT`) is
+  listed at its own path, as #280 now lists every source path the walk
+  refused, so a destination file of that name is never taken for the
+  destination's own; a mapped one is listed where it lands. Test:
+  `map_prefix::a_refused_second_route_is_listed_as_the_sources`.
 - Tests: `judge_tests::whole_lines_are_appended_however_long_and_a_partial_one_is_held`,
   `judge_tests::a_session_working_in_the_lane_is_never_written_into`,
   `closure::transfer_tests::an_unsettled_destination_is_rerun_only`.
+
+## Receipt after the verification (2026-10-20)
+
+- Host `honey`. The worktree was overlaid with every file of the head that
+  differs from `6e3ae3a`. Environment and limits as before.
+- Targeted runs only, one at a time.
+- fmt: ok. clippy (`-D warnings`, `bulkload-agent` and `bulkload-proto`,
+  all targets): ok.
+- proto: 18/18.
+- Lib:
+
+  | Filter | Passed |
+  | --- | --- |
+  | `map_prefix` | 8/8 |
+  | `judge_tests` | 4/4 |
+  | `procs` | 1/1 |
+  | `keymap` | 4/4 |
+  | `closure` | 39/39 |
+  | `transfer_outcome` | 8/8 |
+  | `reseat::` | 84/84 |
+  | `transfer::tests::beside` | 15/15 |
+  | `transfer::tests::prefix` | 6/6 |
+
+- Integration, on the merged tree with #280's `fc0cb4e`:
+
+  | Suite | Passed |
+  | --- | --- |
+  | `estate_move` | 7/7 (#280's new provenance test included) |
+  | `estate_reseat` | 7/7 |
+  | `single_file_copy` | 17/17 |
+  | `estate_move_source_roots` | 6/6 |
+  | `estate_carried` | 12/12 |
+  | `source_command_registry` | 22/22 |
+  | `prefix_extend_cli` | 2/2 |
+  | `estate_adopt` | 40/40 |
+
+- Fault harness: `reseat` 23/23, `beside` 10/10, `prefix_` 9/9,
+  `receive_after` 6/6.
+- One run of `reseat::` failed first:
+  `existing_copies_are_adopted_extended_or_kept` measures the process-wide
+  landed-read counter, and the new judge tests read landed bytes beside it.
+  The judge tests now take that module's `SERIAL` lock, and the rerun
+  passed 84/84.
+- Still owed: the whole suite, `just rust-check`, the merge gate, and pzm
+  `darwin-check`.
 
 ## Receipt after the review (2026-10-20, at `60d769d`)
 

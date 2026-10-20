@@ -459,3 +459,38 @@ fn a_live_file_written_now_is_unsettled_and_the_next_pass_decides() {
         b"{\"a\":1}\n{\"neo\":3}\n"
     );
 }
+
+/// #280 N4 with the map: a source path the owner rule refuses is still the
+/// source's, listed at its own path; a mapped one is listed where it lands.
+#[test]
+fn a_refused_second_route_is_listed_as_the_sources() {
+    let run = Mapped::new(vec![pair(NEO, STING)], false);
+    Mapped::write(&run.source(&format!("{NEO}/x.jsonl")), b"mapped\n");
+    Mapped::write(&run.source(&format!("{STING}/y.jsonl")), b"native\n");
+    run.settle();
+    set_listing(vec![b"projects/".to_vec()]);
+    let stats = run.corpus.run();
+    set_listing(Vec::new());
+    let stats = stats.unwrap();
+    assert_eq!(
+        refused(&stats),
+        [
+            (STING.to_owned(), "DESTINATION_MAP_CONFLICT".to_owned()),
+            (
+                format!("{STING}/y.jsonl"),
+                "DESTINATION_MAP_CONFLICT".to_owned()
+            ),
+        ]
+    );
+    let mut listed = stats.listed;
+    listed.sort();
+    assert!(
+        listed.contains(&format!("{STING}/x.jsonl").into_bytes()),
+        "{listed:?}"
+    );
+    assert!(
+        listed.contains(&format!("{STING}/y.jsonl").into_bytes()),
+        "{listed:?}"
+    );
+    assert!(!listed.iter().any(|path| path.starts_with(NEO.as_bytes())));
+}

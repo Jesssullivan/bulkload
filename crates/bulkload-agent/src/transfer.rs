@@ -6129,6 +6129,13 @@ impl<W: Write> Inbound<'_, W> {
                 Ok(())
             }
             Walked::Unowned { entry, row } => {
+                // Refused, and still the source's: listed at its own path,
+                // as any source path the walk refused (verification of
+                // #280, N4), so a destination file of that name is never
+                // taken for the destination's own.
+                if matches!(row.kind, FileKind::Regular | FileKind::Symlink) {
+                    self.list(&row.rel_path);
+                }
                 let refusal = BulkloadRefusal::DestinationMapConflict;
                 self.refuse(row.rel_path, &refusal);
                 write_control(
