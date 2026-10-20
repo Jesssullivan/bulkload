@@ -224,3 +224,21 @@ contended and retries later) and blocks none of its writes. Caveats: this
 is Codex's main branch, not necessarily the build installed on neo; and
 a source that issues FULL, RESTART or TRUNCATE checkpoints is outside the
 ruling.
+
+## 2026-10-20: merge of #280 (b7b9d10)
+
+#280 (live-home `--beside`, listing, owner-checked roots, A-106) merges
+first; #278 merged its head with a signed merge (R-N13 receipt) and kept
+both sides:
+
+- `EntryOutcome`: `AppliedBeside` keeps #280's position, and this lane's
+  three variants follow it, so a record decodes in main's order.
+- A beside-path committer outcome is the source path's (#280). A corrupt
+  carry's outcome is its database's (item 3).
+- #280 split `entry` into `decide_*`. `decide_regular` still skips a
+  corrupt carry held beside the path, with nothing read.
+- A corrupt snapshot under `--beside` keeps the seat's own row and key. It
+  lands at `<db>.corrupt-<YYYYMMDD>`, a name of its own that never touches
+  the live file, and is awaited under that file. As auto-merged, it would
+  have been named after the beside path and awaited under the wrong name.
+- Not covered by a test: a corrupt snapshot pulled with `--beside`.

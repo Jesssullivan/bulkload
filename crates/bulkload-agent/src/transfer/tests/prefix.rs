@@ -393,8 +393,18 @@ fn a_live_writer_appending_mid_extension_is_never_overwritten() {
     assert!(rerun.prefix_extended.is_empty());
     let now = std::fs::read(&path).unwrap();
     // The old prefix and the first appended piece, then the writer's line,
-    // whole and in place.
-    let piece = prior + (1 << 20);
+    // whole and in place. A piece ends at its last newline, a record read
+    // whole when its first megabyte holds none (review of #280, finding 8).
+    let window = &full[prior..prior + (1 << 20)];
+    let piece = window.iter().rposition(|byte| *byte == b'\n').map_or_else(
+        || {
+            full[prior + (1 << 20)..]
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(full.len(), |at| prior + (1 << 20) + at + 1)
+        },
+        |at| prior + at + 1,
+    );
     assert_eq!(&now[..piece], &full[..piece]);
     assert_eq!(&now[piece..], foreign.as_slice());
 }

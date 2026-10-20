@@ -936,6 +936,7 @@ fn carry_one(
                 match &first.outcome {
                     transfer_outcome::EntryOutcome::Refused { refusal, .. } => refusal.code(),
                     transfer_outcome::EntryOutcome::SidecarCovered
+                    | transfer_outcome::EntryOutcome::AppliedBeside { .. }
                     | transfer_outcome::EntryOutcome::CarriedCorrupt { .. }
                     | transfer_outcome::EntryOutcome::SidecarFollowsRefusedBase { .. }
                     | transfer_outcome::EntryOutcome::CorruptCopyRetired { .. } => "",

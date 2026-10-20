@@ -74,7 +74,10 @@
 //! of a refused database is `covered` too, by that one refusal
 //! (`sidecar-follows-refused-base`). A database whose snapshot was corrupt
 //! and was carried beside its path is `carried` (`carried-corrupt`, its
-//! `related` the file it was landed as; C14). A run's
+//! `related` the file it was landed as; C14). Each seat `--beside SUFFIX`
+//! landed beside a differing live file is `applied-beside` (accounted,
+//! counted in `applied_beside`; the row names the beside path, plan of
+//! record 2026-10-19 C1/C2). A run's
 //! expected transfers are bound to its PLAN by a transfer manifest
 //! ([`Report::join_manifest`], `--transfer-manifest`): a listed transfer
 //! with no record, or one older than the manifest, is unaccounted. With it,
@@ -387,8 +390,8 @@ pub struct TransferDetail {
     /// The refused or covered path (entry rows).
     pub path: Option<Vec<u8>>,
     /// The row's outcome name: `completed`, `running` or `refused` for a
-    /// session, `refused` or `sidecar-covered` for an entry, `null` with no
-    /// readable record.
+    /// session, `refused`, `sidecar-covered` or `applied-beside` for an
+    /// entry, `null` with no readable record.
     pub outcome: Option<&'static str>,
     /// The recorded refusal, typed or not.
     pub refusal: Option<crate::outcome::Refusal>,
@@ -399,6 +402,8 @@ pub struct TransferDetail {
     /// C14), or the database a sidecar's outcome follows
     /// (`sidecar-follows-refused-base`).
     pub related: Option<Vec<u8>>,
+    /// The beside path an `applied-beside` entry landed at (`--beside`).
+    pub beside: Option<Vec<u8>>,
 }
 
 /// The ruling that gives a transfer refusal its default disposition.
@@ -1185,6 +1190,13 @@ fn write_transfer(out: &mut String, row: &Row, detail: &TransferDetail) {
             json_string(&related.escape_ascii().to_string())
         );
     }
+    if let Some(beside) = &detail.beside {
+        let _ = write!(
+            out,
+            ",\"beside\":{}",
+            json_string(&beside.escape_ascii().to_string())
+        );
+    }
     if let Some(refusal) = &detail.refusal {
         let _ = write!(
             out,
@@ -1278,6 +1290,7 @@ fn unrecorded(state: &std::path::Path, item: String, source: &str, why: &'static
             refusal: None,
             sqlite_code: None,
             related: None,
+            beside: None,
         },
     )
 }
@@ -1331,6 +1344,7 @@ fn record_rows(
         refusal,
         sqlite_code,
         related: None,
+        beside: None,
     };
     let record = match read {
         None => {
@@ -1441,6 +1455,16 @@ fn record_rows(
                 None,
                 Some(database.clone()),
             ),
+            // `--beside`: landed beside the differing live file, accounted
+            // as an estate item landed beside is (closure v5).
+            EntryOutcome::AppliedBeside { .. } => (
+                "applied-beside",
+                None,
+                None,
+                Disposition::AppliedBeside,
+                None,
+                None,
+            ),
         };
         let mut entry_detail = detail(
             Some(entry.rel_path.clone()),
@@ -1457,6 +1481,11 @@ fn record_rows(
             disposition,
             entry_detail,
         );
+        if let (EntryOutcome::AppliedBeside { beside }, Some(detail)) =
+            (&entry.outcome, entry_row.transfer.as_mut())
+        {
+            detail.beside = Some(beside.clone());
+        }
         entry_row.kind = RowKind::TransferEntry;
         // Only a typed refusal can carry a default: a bare IO never counts.
         entry_row.ruled_default = default.filter(|_| entry_row.disposition.refusal().is_some());
