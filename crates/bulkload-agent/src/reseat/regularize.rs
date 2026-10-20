@@ -629,7 +629,27 @@ impl<'a> Site<'a> {
 
     /// Put the link back over an unchanged copy (`--undo`), only over a
     /// verified target.
-    fn undo(&self, mut row: Regular) -> Result<Outcome> {
+    /// The copy under the temporary name after an undo put the link back:
+    /// removed (the landing holds its bytes), or, when its landing was a
+    /// beside copy an archive replacement consumed (`restore`, #280 finding
+    /// 9), put back at that name, never replacing anything (kept aside when
+    /// the name is taken).
+    fn retire_copy(&self, restore: Option<&Path>) -> Result<()> {
+        let Some(name) = restore.and_then(Path::file_name) else {
+            return self.unlink_temp();
+        };
+        match crate::io::publish_noreplace(&self.directory, &self.temp_c, &c_name(name)?) {
+            Ok(_) => Ok(()),
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => self.keep().map(drop),
+            Err(error) => Err(crate::refuse::io_in(
+                &error,
+                self.link,
+                "reseat::regularize::restore",
+            )),
+        }
+    }
+
+    fn undo(&self, mut row: Regular, restore: Option<&Path>) -> Result<Outcome> {
         let target_changed = || {
             Outcome::new(
                 "undo-refused",
@@ -642,7 +662,7 @@ impl<'a> Site<'a> {
         // A crash inside an earlier undo: the link already back.
         if Self::is_link_to(self.link, &row.target) {
             if identity_at(&self.temp)? == Some(row.regular) {
-                self.unlink_temp()?;
+                self.retire_copy(restore)?;
                 self.seal()?;
             }
             row.state = RegularState::Undone;
@@ -679,7 +699,7 @@ impl<'a> Site<'a> {
             .refuse_at("reseat::regularize::undo_exchange")?;
         fault_point!(ReseatAfterUndoExchange);
         if identity_at(&self.temp)? == Some(row.regular) {
-            self.unlink_temp()?;
+            self.retire_copy(restore)?;
             self.seal()?;
             row.state = RegularState::Undone;
             self.ledger.put_regular(&row)?;
@@ -808,6 +828,24 @@ pub fn undo(
 ) -> Result<u64> {
     let mut undone = 0;
     for row in ledger.regulars()? {
+        // A replacement whose landing was the pull's beside copy in the
+        // link's directory, consumed by it (#280 finding 9): the copy goes
+        // back there.
+        let restore = if row.replace {
+            ledger
+                .placement(&row.link)?
+                .map(|placement| placement.landing)
+                .filter(|landing| {
+                    // The link's own directory, by real path (a live home
+                    // may be reached through a symlink).
+                    let real = |path: &Path| path.parent().and_then(|dir| dir.canonicalize().ok());
+                    real(landing).is_some()
+                        && real(landing) == real(&row.link)
+                        && lstat(landing).ok().flatten().is_none()
+                })
+        } else {
+            None
+        };
         let Some(site) = Site::new(ledger, &row.link)? else {
             emit(&line(
                 &row.link,
@@ -820,11 +858,15 @@ pub fn undo(
             RegularState::Intent => match site.settle_intent(row.clone())? {
                 None => continue,
                 Some(_) => match ledger.regular(&row.link)? {
-                    Some(settled) if settled.state != RegularState::Undone => site.undo(settled)?,
+                    Some(settled) if settled.state != RegularState::Undone => {
+                        site.undo(settled, restore.as_deref())?
+                    }
                     _ => continue,
                 },
             },
-            RegularState::Done | RegularState::Raced => site.undo(row.clone())?,
+            RegularState::Done | RegularState::Raced => {
+                site.undo(row.clone(), restore.as_deref())?
+            }
         };
         undone += u64::from(outcome.word == "undone");
         if row.replace && outcome.word == "undone" {

@@ -436,6 +436,14 @@ pub enum RefusedOutput {
     /// seat's. Recorded under the seat's beside key with that file's
     /// identity, beside the live path's own record.
     BesideOccupied,
+    /// `--beside` (#280 finding 9): not a refusal. The live path holds a
+    /// file this store does not own whose first bytes are exactly the
+    /// seat's, and more (the destination continued an append-only file: a
+    /// session resumed there). The seat's bytes are at the destination, so
+    /// nothing is written, beside or in place, and the entry is accounted
+    /// `dest-ahead`; recorded so an unchanged rerun answers it with nothing
+    /// read.
+    DestAhead,
 }
 
 impl RefusedOutput {
@@ -446,6 +454,7 @@ impl RefusedOutput {
             Self::ExchangeUnsupported => 2,
             Self::NotPrefix => 3,
             Self::BesideOccupied => 4,
+            Self::DestAhead => 5,
         }
     }
 
@@ -455,6 +464,7 @@ impl RefusedOutput {
             2 => Some(Self::ExchangeUnsupported),
             3 => Some(Self::NotPrefix),
             4 => Some(Self::BesideOccupied),
+            5 => Some(Self::DestAhead),
             _ => None,
         }
     }
@@ -463,7 +473,8 @@ impl RefusedOutput {
     #[must_use]
     pub const fn refusal(self) -> BulkloadRefusal {
         match self {
-            Self::Occupied | Self::NotPrefix | Self::BesideOccupied => {
+            // `DestAhead` is answered before it is ever asked for as one.
+            Self::Occupied | Self::NotPrefix | Self::BesideOccupied | Self::DestAhead => {
                 BulkloadRefusal::DestinationOccupied
             }
             Self::ExchangeUnsupported => BulkloadRefusal::DestinationExchangeUnsupported,

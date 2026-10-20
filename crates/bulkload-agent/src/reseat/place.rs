@@ -401,6 +401,12 @@ pub struct Placer<'a> {
     /// regular file under one is replaced by a differing landed file
     /// (A-106).
     pub archived: &'a [PathBuf],
+    /// A live-home landing's beside suffix (#280 finding 9, the operator's
+    /// "no duplicates"): a landed file at `<name><suffix>` beside the
+    /// archive link it replaces at `<name>` (A-106) is this placement's
+    /// source, and once its whole bytes are at `<name>` it is removed, so
+    /// one copy of them stays. `--undo` puts it back.
+    pub beside: Option<&'a str>,
 }
 
 impl<'a> Placer<'a> {
@@ -412,7 +418,15 @@ impl<'a> Placer<'a> {
             root,
             rebind: &[],
             archived: &[],
+            beside: None,
         }
+    }
+
+    /// The same placer, taking a landed file beside the link it replaces
+    /// as consumed ([`Self::beside`]).
+    #[must_use]
+    pub const fn with_beside(self, beside: Option<&'a str>) -> Self {
+        Self { beside, ..self }
     }
 
     /// The same placer, replacing archive links under `archived`.
@@ -1769,10 +1783,57 @@ impl Site<'_> {
             &placement,
         )?;
         counters::bump(Counter::ReseatArchivedReplaced);
+        self.consume_beside(landing, staged.written)?;
         Ok(Placed {
             outcome: Outcome::ReplacedArchived,
             scanner: staged.scanner,
         })
+    }
+
+    /// After an archive link's replacement (A-106) by a landed file the
+    /// pull landed beside it, `<name><suffix>` in the same directory
+    /// ([`Placer::beside`]): that file is removed once its whole bytes are
+    /// the placed copy's (`written` is its size, it is unchanged since it
+    /// was read, and the replacement is recorded `done`), so neo's bytes
+    /// are on the destination once (#280 finding 9). The placement row
+    /// still names it as the landing; `--undo` puts the copy back at its
+    /// name. Anything else is left as it is.
+    fn consume_beside(&self, landing: &Landing, written: u64) -> Result<()> {
+        let Some(suffix) = self.placer.beside else {
+            return Ok(());
+        };
+        let mut expected = self.name.to_owned();
+        expected.push(suffix);
+        let Some(name) = self
+            .landing_path
+            .file_name()
+            .filter(|name| *name == expected.as_os_str())
+        else {
+            return Ok(());
+        };
+        if written != landing.identity.size || landing.compressed {
+            return Ok(());
+        }
+        // In the link's own directory (judged by the open directory, as a
+        // live home may be reached through a symlink), and still the very
+        // file whose bytes were placed.
+        let name = c_name(name)?;
+        let here = crate::io::sys::fstatat_nofollow(self.directory, &name).ok();
+        let same = here.is_some_and(|stat| {
+            stat.node.dev == landing.identity.dev
+                && stat.node.ino == landing.identity.ino
+                && stat.size == landing.identity.size
+                && i64::try_from(stat.mtime_ns).ok() == Some(landing.identity.mtime)
+                && stat.mode & 0o170_000 == 0o100_000
+        });
+        if !same {
+            return Ok(());
+        }
+        crate::io::sys::unlinkat(self.directory, &name, false)
+            .refuse_at("reseat::place::consume_beside")?;
+        crate::io::durable::seal_dir(self.directory).refuse_at("reseat::place::consume_seal")?;
+        counters::bump(Counter::ReseatBesideConsumed);
+        Ok(())
     }
 
     /// `D` is this ledger's: unchanged, extend, supersede, or hand over.

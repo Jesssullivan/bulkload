@@ -387,6 +387,10 @@ counters! {
     // `--replace-archived-dest` root, replaced by the differing landed
     // file (A-106; the archive target kept, the link ledgered).
     ReseatArchivedReplaced => "reseat_archived_replaced",
+    // Landed files the pull put beside an archive link (`<name><suffix>`),
+    // removed once an A-106 replacement placed their whole bytes at
+    // `<name>`: one copy of the source's bytes (#280 finding 9).
+    ReseatBesideConsumed => "reseat_beside_consumed",
     // Bounded starvation (M2 item 3): a process at background priority
     // whose counters did not move for `--escalate-after` seconds moved its
     // IO back to the normal class once (`priority::escalate`): how many

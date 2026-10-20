@@ -377,8 +377,8 @@ pub struct TransferDetail {
     /// The refused or covered path (entry rows).
     pub path: Option<Vec<u8>>,
     /// The row's outcome name: `completed`, `running` or `refused` for a
-    /// session, `refused`, `sidecar-covered` or `applied-beside` for an
-    /// entry, `null` with no readable record.
+    /// session, `refused`, `sidecar-covered`, `applied-beside`, `mapped` or
+    /// `dest-ahead` for an entry, `null` with no readable record.
     pub outcome: Option<&'static str>,
     /// The recorded refusal, typed or not.
     pub refusal: Option<crate::outcome::Refusal>,
@@ -386,6 +386,9 @@ pub struct TransferDetail {
     pub sqlite_code: Option<i32>,
     /// The beside path an `applied-beside` entry landed at (`--beside`).
     pub beside: Option<Vec<u8>>,
+    /// The destination path a `mapped` entry's source path landed at
+    /// (`--map-prefix`, #280 finding 9).
+    pub mapped: Option<Vec<u8>>,
 }
 
 /// The ruling that gives a transfer refusal its default disposition.
@@ -1162,6 +1165,13 @@ fn write_transfer(out: &mut String, row: &Row, detail: &TransferDetail) {
             json_string(&beside.escape_ascii().to_string())
         );
     }
+    if let Some(mapped) = &detail.mapped {
+        let _ = write!(
+            out,
+            ",\"mapped\":{}",
+            json_string(&mapped.escape_ascii().to_string())
+        );
+    }
     if let Some(refusal) = &detail.refusal {
         let _ = write!(
             out,
@@ -1255,6 +1265,7 @@ fn unrecorded(state: &std::path::Path, item: String, source: &str, why: &'static
             refusal: None,
             sqlite_code: None,
             beside: None,
+            mapped: None,
         },
     )
 }
@@ -1307,6 +1318,7 @@ fn record_rows(
         refusal,
         sqlite_code,
         beside: None,
+        mapped: None,
     };
     let record = match read {
         None => {
@@ -1392,6 +1404,12 @@ fn record_rows(
                 Disposition::AppliedBeside,
                 None,
             ),
+            // `--map-prefix`: the source path landed at its mapped path,
+            // accounted as the session's applied entries are.
+            EntryOutcome::Mapped { .. } => ("mapped", None, None, Disposition::Applied, None),
+            // `--beside`: the live file holds the seat's bytes and more;
+            // covered by it, nothing written.
+            EntryOutcome::DestAhead => ("dest-ahead", None, None, Disposition::Covered, None),
         };
         let mut entry_row = transfer_row(
             record.entry_item(entry),
@@ -1406,10 +1424,12 @@ fn record_rows(
                 None,
             ),
         );
-        if let (EntryOutcome::AppliedBeside { beside }, Some(detail)) =
-            (&entry.outcome, entry_row.transfer.as_mut())
-        {
-            detail.beside = Some(beside.clone());
+        if let Some(detail) = entry_row.transfer.as_mut() {
+            match &entry.outcome {
+                EntryOutcome::AppliedBeside { beside } => detail.beside = Some(beside.clone()),
+                EntryOutcome::Mapped { to } => detail.mapped = Some(to.clone()),
+                _ => {}
+            }
         }
         entry_row.kind = RowKind::TransferEntry;
         // Only a typed refusal can carry a default: a bare IO never counts.

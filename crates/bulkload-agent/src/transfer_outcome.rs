@@ -29,7 +29,14 @@
 //! - one **applied-beside** row per seat `--beside SUFFIX` published,
 //!   reused or adopted beside a differing live destination file (plan of
 //!   record 2026-10-19, C1/C2): the beside path is named, and the row is
-//!   accounted (`applied-beside`, closure v5), never pending review.
+//!   accounted (`applied-beside`, closure v5), never pending review;
+//! - one **mapped** row per `--map-prefix SRC_REL=DST_REL` the session
+//!   landed an entry through (#280 finding 9): the source path and the
+//!   destination path it landed at, accounted like `applied`. Every other
+//!   row of such a session names the destination's (mapped) path;
+//! - one **dest-ahead** row per seat `--beside` found already held by its
+//!   live destination file, and more (#280 finding 9: an append-only file
+//!   the destination continued): nothing written, accounted as covered.
 //!
 //! [`record_session`] makes the verb's S2 overlap decision before its first
 //! write (review finding 1: a refused overlap writes nothing, not even a
@@ -120,6 +127,16 @@ pub enum EntryOutcome {
     /// file. Appended after the earlier variants: a record from before it
     /// still decodes.
     AppliedBeside { beside: Vec<u8> },
+    /// `--map-prefix` (#280 finding 9): the entry's `rel_path` is a map's
+    /// source path, and every entry at or under it landed at `to` plus the
+    /// rest of its path, once. Accounted like `applied`. Appended after the
+    /// earlier variants: a record from before it still decodes.
+    Mapped { to: Vec<u8> },
+    /// `--beside` (#280 finding 9): the live destination file at
+    /// `rel_path` holds the seat's bytes and more (the destination continued
+    /// it); nothing was written. Accounted, covered by that file. Appended
+    /// after the earlier variants: a record from before it still decodes.
+    DestAhead,
 }
 
 /// One path row of a session.
@@ -214,6 +231,20 @@ impl TransferRecord {
                         },
                     });
                 }
+                for path in &stats.dest_ahead {
+                    record.entries.push(Entry {
+                        rel_path: path.clone(),
+                        outcome: EntryOutcome::DestAhead,
+                    });
+                }
+                for (source, destination) in &stats.mapped {
+                    record.entries.push(Entry {
+                        rel_path: source.clone(),
+                        outcome: EntryOutcome::Mapped {
+                            to: destination.clone(),
+                        },
+                    });
+                }
                 record.entries.sort_by(|a, b| {
                     (&a.rel_path, entry_key(&a.outcome)).cmp(&(&b.rel_path, entry_key(&b.outcome)))
                 });
@@ -268,6 +299,8 @@ fn entry_key(outcome: &EntryOutcome) -> String {
         EntryOutcome::Refused { refusal, .. } => refusal.code().to_owned(),
         EntryOutcome::SidecarCovered => "covered".to_owned(),
         EntryOutcome::AppliedBeside { .. } => "applied-beside".to_owned(),
+        EntryOutcome::Mapped { .. } => "mapped".to_owned(),
+        EntryOutcome::DestAhead => "dest-ahead".to_owned(),
     }
 }
 

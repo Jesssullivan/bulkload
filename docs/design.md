@@ -349,10 +349,46 @@ same report, totals and gate:
   `estate-move --sessions` pulls both agent homes this way into the live
   home, joins both records into its closure, and holds its gate on any
   re-seat outcome that leaves a session not resumable (C9 to C11).
+  Under the flag an append-only file (`.jsonl`, `.txt`) whose live copy
+  this store does not own, settled, already holds the seat's bytes and more
+  (the destination continued it: a session resumed there) is left as it is
+  and is one **dest-ahead** row (accounted as covered, the answer
+  remembered under that file's identity, so an unchanged rerun reads
+  nothing): landing it beside would only copy the same bytes again (#280
+  finding 9);
+- one **mapped** row per `--map-prefix SRC_REL=DST_REL` a `copy` or `pull`
+  landed entries through (#280 finding 9, "no duplicates"; accounted like
+  `applied`, the row printing `mapped`, the destination path). The map is a
+  receive-side rename, the wire unchanged: an entry at `SRC_REL` or under
+  `SRC_REL/` (whole components, the longest source wins) is decided, keyed
+  (`row_key` over the mapped row), recorded and published at `DST_REL` plus
+  the rest of its path, once. A path that would reach a map's destination
+  any other way is refused `DESTINATION_OCCUPIED` with everything under
+  it (the owner rule: a destination path lands only through the map whose
+  destination is the deepest holding it), so no two seats of a session
+  meet at one name and nothing merges. A set with an invalid side, one
+  source or destination twice, or a destination whose parent is not where
+  its source's parent lands, refuses `FIELD_DOMAIN_VIOLATION` before
+  either store exists. `estate-move --sessions` pulls the Claude tree with
+  the project-key map of the re-seat's own lanes:
+  `projects/<key(S)>=projects/<key(D)>` for each lane `S -> D`, `D` at its
+  real path on the destination and keyed exactly as Claude Code keys it
+  (`reseat::key`). A key two lane sources share (keys are lossy), two keys
+  whose destination key is one, and a lane that does not resolve stay
+  unmapped, named on typed `estate-move key-map-held` lines, and the
+  re-seat resolves their sessions by each transcript's `cwd` as before.
+  A mapped session lands where Claude Code lists it and the re-seat finds
+  it in place; the source-key directories earlier passes left are never
+  removed, and `estate-move --key-map-proof` lists, report only, how the
+  destination key holds each of their files. On a live-home landing a
+  source copy the pull put beside an archive link is consumed by its A-106
+  replacement (one copy of the source's bytes; `--undo` puts it back), and
+  one beside the destination's own regular transcript under the lane's key
+  is kept, `diverged`, nothing written.
 
 A transfer row's identity (`item`, 64 hex) is a digest of the transfer's
 source (`SOURCE`, or `HOST:SOURCE` for `pull`), its destination, the path
-and the code (or `covered`, `applied-beside`); its refusal `instance` digests the row's
+and the code (or `covered`, `applied-beside`, `mapped`, `dest-ahead`); its refusal `instance` digests the row's
 record, so a rerun that refuses identically keeps its review and any other
 record is a new instance. `closure-dispose --transfer DEST_STATE` reviews a
 transfer row as it reviews a planned item, in the same plan-bound ledger.

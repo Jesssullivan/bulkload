@@ -3218,3 +3218,7 @@ mod prefix;
 // ---- plan of record 2026-10-19 C1/C2: `--beside SUFFIX` lands a differing
 // ---- file beside the live one --------------------------------------------
 mod beside;
+
+// ---- #280 finding 9: `--map-prefix SRC_REL=DST_REL` lands a source path
+// ---- once, at its mapped destination path --------------------------------
+mod map_prefix;

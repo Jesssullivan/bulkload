@@ -65,6 +65,7 @@ mod claude;
 mod codex;
 pub mod json;
 pub mod key;
+pub mod keymap;
 pub mod ledger;
 pub mod place;
 pub mod regularize;

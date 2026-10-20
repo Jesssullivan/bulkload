@@ -31,7 +31,7 @@ USAGE:
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
     walk PATH   Stat-walk PATH and print the row and refusal counts
-    copy [--beside SUFFIX] SOURCE DEST SOURCE_STATE DEST_STATE
+    copy [--beside SUFFIX] [--map-prefix SRC_REL=DST_REL]... SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores; the
                 session's outcomes are recorded in
                 DEST_STATE/transfer.closure.d, one record per transfer, for
@@ -50,13 +50,30 @@ SUBCOMMANDS:
                 -wal/-shm/-journal beside it lands its snapshot at
                 <db>SUFFIX. A beside path holding something of its own is
                 refused DESTINATION_OCCUPIED; only this store's own earlier
-                beside output is superseded. SUFFIX is one name component
+                beside output is superseded. An append-only file (.jsonl,
+                .txt) whose live copy is settled and holds the source's
+                bytes and more (the destination continued it, #280 finding
+                9) is left as it is and recorded dest-ahead (covered),
+                nothing written. SUFFIX is one name component
                 (e.g. .neo-20261019). Without the flag a differing file is
-                refused DESTINATION_OCCUPIED and nothing is placed
-    pull [--beside SUFFIX] HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
+                refused DESTINATION_OCCUPIED and nothing is placed.
+                --map-prefix SRC_REL=DST_REL (repeatable; #280 finding 9):
+                a receive-side rename, the wire unchanged. An entry at
+                SRC_REL or under SRC_REL/ (whole path components, the
+                longest source wins) is decided, keyed, recorded and
+                published at DST_REL plus the rest of its path, once; the
+                transfer record names each map used (mapped, accounted like
+                applied). A path that would reach a map's destination any
+                other way (the source holds that name itself) is refused
+                DESTINATION_OCCUPIED with everything under it: nothing
+                merges. Refused FIELD_DOMAIN_VIOLATION before the session:
+                a side that is not a relative path of whole components, one
+                source or one destination twice, and a destination whose
+                parent is not where its source's parent lands
+    pull [--beside SUFFIX] [--map-prefix SRC_REL=DST_REL]... HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
                 Native SSH pull; remote bulkload-agent must be installed; the
-                session is recorded in DEST_STATE as copy's is; --beside as
-                copy's
+                session is recorded in DEST_STATE as copy's is; --beside and
+                --map-prefix as copy's
     serve       Serve one framed request on stdin/stdout (for SSH)
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
@@ -200,7 +217,8 @@ SUBCOMMANDS:
     estate-move --label LABEL --source SOURCE [--plan-only] [--exclude-union] [--no-hand-off]
                 [--activate-origin PREFIX]... [--side-root ROOT]... [--jobs N] [--dispositions LEDGER]
                 [--sessions SOURCE_HOME [--codex-source-root DIR] [--dest-home DIR]
-                 [--map SRC=DST]... [--reseat-arg ARG]... [--replace-archived-dest ROOT]...]
+                 [--map SRC=DST]... [--reseat-arg ARG]... [--replace-archived-dest ROOT]...
+                 [--key-map-proof]]
                 [--remote-executable PATH [--ssh-config FILE]]
                 HOST|- SOURCE_MOVE_STATE MOVE_STATE
                 M2 item 7 (design 2026-10-16-estate-move-design.md), the
@@ -251,7 +269,27 @@ SUBCOMMANDS:
                 MOVE_STATE/pull/{claude,codex}: equal files adopted, grown
                 append-only files extended, differing files, nodes of
                 another kind (directories included) and the Codex index's
-                snapshot landed beside as <path>.LABEL. Then,
+                snapshot landed beside as <path>.LABEL. The Claude tree is
+                pulled with the project-key map of the re-seat's lanes
+                (#280 finding 9; --map pairs, the plan's items,
+                SOURCE_HOME/git): --map-prefix projects/<key(S)>=projects/<key(D)>
+                for each lane S -> D, D at its real path here, so each
+                session lands once, under the key Claude Code lists it by
+                here, and the re-seat finds it in place. A key two lane
+                sources share, or two keys whose destination key is one, or
+                a lane that does not resolve, stays unmapped (re-keyed by
+                the re-seat as before) and is named on an estate-move
+                key-map-held line (reason= ambiguous-source-key,
+                dest-key-collision, lane-unresolved); estate-move key-map
+                lines name the rest. --key-map-proof: report only, after a
+                pass; from MOVE_STATE/carry's plan, the same key map, then
+                one JSON line per file under each source-keyed directory of
+                the live DEST_HOME/.claude/projects (left by passes before
+                the map: never removed) with its destination key and status
+                identical, prefix-extended, identical-beside,
+                prefix-extended-beside, differs, absent, dest-link,
+                dest-other, in-place or unresolved, and an estate-move
+                key-map-proof line; nothing is pulled, locked or written. Then,
                 when both sessions completed (paths refused in them stay
                 typed refusals in closure), estate-reseat --lanes-from-plan
                 with each --map and --reseat-arg (one estate-reseat option
@@ -1320,28 +1358,48 @@ fn export_command(
     Ok(())
 }
 
-/// Take a leading `--beside SUFFIX` (or `--beside=SUFFIX`) off `args`,
-/// setting the process's beside suffix, and return the rest.
-fn beside_option(args: &[std::ffi::OsString]) -> Result<&[std::ffi::OsString]> {
+/// Take the leading `--beside SUFFIX` (or `--beside=SUFFIX`, once) and
+/// `--map-prefix SRC_REL=DST_REL` (or `--map-prefix=...`, repeatable)
+/// options off `args`, setting the process's beside suffix and maps, and
+/// return the rest.
+fn transfer_options(args: &[std::ffi::OsString]) -> Result<&[std::ffi::OsString]> {
     use std::os::unix::ffi::OsStrExt as _;
-    let Some(first) = args.first() else {
-        return Ok(args);
-    };
-    let (suffix, taken) = if first.as_os_str() == "--beside" {
-        (
-            args.get(1)
-                .ok_or(BulkloadRefusal::RequiredFieldMissing)?
-                .as_bytes()
-                .to_vec(),
-            2,
-        )
-    } else if let Some(value) = first.as_bytes().strip_prefix(b"--beside=") {
-        (value.to_vec(), 1)
-    } else {
-        return Ok(args);
-    };
-    bulkload_agent::transfer::set_beside_suffix(Some(suffix))?;
-    Ok(args.get(taken..).unwrap_or_default())
+    let mut at = 0;
+    let mut suffix = None;
+    let mut maps = Vec::new();
+    while let Some(arg) = args.get(at).map(|arg| arg.as_bytes()) {
+        let (value, taken) = match arg {
+            b"--beside" | b"--map-prefix" => (
+                args.get(at + 1)
+                    .ok_or(BulkloadRefusal::RequiredFieldMissing)?
+                    .as_bytes(),
+                2,
+            ),
+            _ => match arg
+                .strip_prefix(b"--beside=")
+                .or_else(|| arg.strip_prefix(b"--map-prefix="))
+            {
+                Some(value) => (value, 1),
+                None => break,
+            },
+        };
+        if arg.starts_with(b"--beside") {
+            if suffix.is_some() {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            suffix = Some(value.to_vec());
+        } else {
+            maps.push(bulkload_agent::transfer::map::parse(value)?);
+        }
+        at += taken;
+    }
+    if !maps.is_empty() {
+        bulkload_agent::transfer::set_map_prefixes(maps)?;
+    }
+    if suffix.is_some() {
+        bulkload_agent::transfer::set_beside_suffix(suffix)?;
+    }
+    Ok(args.get(at..).unwrap_or_default())
 }
 
 #[allow(clippy::too_many_lines)] // One arm per verb; `--beside` for copy and pull.
@@ -1382,10 +1440,11 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             println!("{count}");
             Ok(())
         }
-        // `--beside SUFFIX` leads the positional arguments of copy and
-        // pull (plan of record 2026-10-19, C1/C2).
+        // `--beside SUFFIX` and `--map-prefix SRC_REL=DST_REL` lead the
+        // positional arguments of copy and pull (plan of record 2026-10-19,
+        // C1/C2; #280 finding 9).
         "copy" | "pull" => {
-            let rest = beside_option(args)?;
+            let rest = transfer_options(args)?;
             let path = |index: usize| {
                 rest.get(index)
                     .map(Path::new)
@@ -2726,7 +2785,7 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
     println!(
         "completed={} reused={} bytes_received={} source_bytes_read={} refusals={} \
          source_engine_temporaries={} capped_subtrees={} sqlite_mode={} sqlite_snapshots={} \
-         sqlite_sidecars_covered={} applied_beside={}",
+         sqlite_sidecars_covered={} applied_beside={} dest_ahead={} mapped={}",
         stats.completed,
         stats.reused,
         stats.bytes_received,
@@ -2737,13 +2796,25 @@ fn report_transfer(stats: &bulkload_agent::transfer::TransferStats) -> Result<()
         bulkload_agent::transfer::sqlite_mode_label(stats.sqlite_mode),
         stats.sqlite_snapshots.len(),
         stats.sqlite_sidecars_covered.len(),
-        stats.applied_beside.len()
+        stats.applied_beside.len(),
+        stats.dest_ahead.len(),
+        stats.mapped.len()
     );
+    for path in &stats.dest_ahead {
+        eprintln!("dest-ahead {}", path.escape_ascii());
+    }
     for (path, beside) in &stats.applied_beside {
         eprintln!(
             "applied-beside {} at={}",
             path.escape_ascii(),
             beside.escape_ascii()
+        );
+    }
+    for (source, destination) in &stats.mapped {
+        eprintln!(
+            "mapped {} at={}",
+            source.escape_ascii(),
+            destination.escape_ascii()
         );
     }
     for (path, code) in &stats.refusals {

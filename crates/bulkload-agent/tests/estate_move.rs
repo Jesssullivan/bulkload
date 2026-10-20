@@ -697,21 +697,26 @@ fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
         b"{\"display\":\"neo prompt\"}\n",
         "absent at the destination: landed in place"
     );
-    assert_eq!(
-        fs::read_to_string(
-            dst_claude
-                .join("projects")
-                .join(key(&src_lane))
-                .join(format!("{SID}.jsonl"))
-        )
-        .unwrap(),
-        neo_transcript,
-        "the source's session landed under its own key, byte for byte"
+    // #280 finding 9: the source's session landed once, under the lane's
+    // destination key, byte for byte; nothing under the source's key.
+    assert!(
+        !dst_claude.join("projects").join(key(&src_lane)).exists(),
+        "{}",
+        moved.stdout
     );
     assert_eq!(
         fs::read_to_string(dst_projects.join(format!("{SID}.jsonl"))).unwrap(),
         neo_transcript,
-        "and was re-seated under the lane's destination key"
+        "landed under the lane's destination key"
+    );
+    assert!(
+        moved.stdout.contains(&format!(
+            "estate-move key-map from={} to={}",
+            key(&src_lane),
+            key(&dst_lane)
+        )),
+        "{}",
+        moved.stdout
     );
     assert_eq!(
         fs::read_to_string(dst_projects.join(format!("{DEST_SID}.jsonl"))).unwrap(),
@@ -790,10 +795,18 @@ fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
         "{}",
         moved.stdout
     );
+    assert_eq!(first["key_maps_held"], "0", "{}", moved.stdout);
     let closure_json = fs::read_to_string(state.join("closure.json")).unwrap();
     assert!(
         closure_json.contains("\"transfer_outcome\":\"applied-beside\""),
         "{closure_json}"
+    );
+    assert!(
+        closure_json.contains(&format!(
+            "\"transfer_outcome\":\"mapped\",\"mapped\":\"projects/{}\"",
+            key(&dst_lane)
+        )),
+        "the closure names the source key's destination key: {closure_json}"
     );
     assert!(
         closure_json.contains(&format!("\"beside\":\"settings.json.{LABEL}\"")),
@@ -1259,8 +1272,17 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         "{}",
         moved.stdout
     );
-    // Under the neo key: the link stays, neo's copy (landed beside it) is
-    // re-keyed to the lane.
+    // #280 finding 9: neo's copy, landed beside the link, was consumed by
+    // the replacement: one copy of neo's bytes, at the live name.
+    assert!(
+        !dst_projects
+            .join(format!("{SID_FORK}.jsonl.{LABEL}"))
+            .exists(),
+        "{}",
+        moved.stdout
+    );
+    // Under the neo key: the link stays; neo's copy lands under the lane's
+    // key directly (the key map), never beside the neo-key link.
     assert!(
         fs::symlink_metadata(neo_key_dir.join(format!("{SID_NEO_KEY}.jsonl")))
             .unwrap()
@@ -1270,6 +1292,12 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     assert_eq!(
         fs::read_to_string(dst_projects.join(format!("{SID_NEO_KEY}.jsonl"))).unwrap(),
         neo(SID_NEO_KEY)
+    );
+    assert!(
+        !neo_key_dir
+            .join(format!("{SID_NEO_KEY}.jsonl.{LABEL}"))
+            .exists(),
+        "nothing lands under the neo key any more"
     );
     // The destination's own link stays a link.
     assert!(
@@ -1286,6 +1314,10 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         moved.stdout
     );
     assert_eq!(fs::read_to_string(&live_rollout).unwrap(), neo_rollout);
+    assert!(
+        !dst_codex.join(format!("{fork_rel}.{LABEL}")).exists(),
+        "neo's rollout beside the link was consumed by the replacement"
+    );
     assert_eq!(
         fs::read(archive.join("rollout-fork.jsonl")).unwrap(),
         archived_rollout
@@ -1305,4 +1337,302 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         "{}",
         moved.stdout
     );
+}
+
+/// #280 finding 9 ("no duplicates"): the source's project keys are mapped
+/// at the pull to their lanes' destination keys (the re-seat's lanes), so a
+/// session lands once, where Claude Code lists it here: no source-key
+/// directory, the re-seat finds it in place, and the closure names each
+/// source key with its destination key. A key two lane sources share
+/// (`a.b` and `a-b`) stays unmapped and typed, and its session is re-keyed
+/// by the re-seat as before. A transcript that grows on the source is
+/// extended in place under the mapped key; an unchanged pass reads nothing;
+/// the report-only proof lists the source-key directory left behind.
+#[test]
+fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
+    const SID_AB: &str = "5e5e5e5e-7777-4222-8333-444444444444";
+    const SID_RESUMED: &str = "5e5e5e5e-8888-4222-8333-444444444444";
+    const SID_BOTH: &str = "5e5e5e5e-9999-4222-8333-444444444444";
+    let base = std::env::temp_dir().join(format!("bulkload-move-keymap-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let world = World {
+        base: fs::canonicalize(&base).unwrap(),
+    };
+    let base = &world.base;
+    let src_home = base.join("src/home");
+    let dst_home = base.join("dst/home");
+    let (src_git, dst_git) = (src_home.join("git"), dst_home.join("git"));
+    fs::create_dir_all(&src_git).unwrap();
+    fs::create_dir_all(&dst_git).unwrap();
+    for name in ["lab", "a.b", "a-b"] {
+        repo(&src_git.join(name), "f.txt");
+    }
+    let (src_lane, dst_lane) = (src_git.join("lab"), dst_git.join("lab"));
+    let (src_ab, dst_ab) = (src_git.join("a.b"), dst_git.join("a.b"));
+    assert_eq!(key(&src_ab), key(&src_git.join("a-b")), "a lossy key");
+
+    let settings = b"{\"cleanupPeriodDays\": 3650}\n";
+    let src_claude = src_home.join(".claude");
+    let src_projects = src_claude.join("projects");
+    let neo = transcript(SID, &src_lane, "NEO");
+    let lab = src_projects.join(key(&src_lane));
+    fs::create_dir_all(lab.join(format!("{SID}/subagents"))).unwrap();
+    fs::write(lab.join(format!("{SID}.jsonl")), &neo).unwrap();
+    fs::write(
+        lab.join(format!("{SID}/subagents/agent-1.jsonl")),
+        b"{\"agent\":1}\n",
+    )
+    .unwrap();
+    let ab = transcript(SID_AB, &src_ab, "AB");
+    fs::create_dir_all(src_projects.join(key(&src_ab))).unwrap();
+    fs::write(
+        src_projects
+            .join(key(&src_ab))
+            .join(format!("{SID_AB}.jsonl")),
+        &ab,
+    )
+    .unwrap();
+    fs::write(src_claude.join("settings.json"), settings).unwrap();
+    fs::create_dir_all(src_home.join(".codex")).unwrap();
+    let dst_claude = dst_home.join(".claude");
+    fs::create_dir_all(dst_claude.join("projects")).unwrap();
+    fs::write(dst_claude.join("settings.json"), settings).unwrap();
+    fs::create_dir_all(dst_home.join(".codex")).unwrap();
+    // Two sessions an earlier pass re-seated here and the destination
+    // resumed: one neo left as it was (the destination holds its bytes and
+    // more: dest-ahead), one neo continued too (both kept).
+    let dst_lane_projects = dst_claude.join("projects").join(key(&dst_lane));
+    fs::create_dir_all(&dst_lane_projects).unwrap();
+    let sting_more = transcript(SID_RESUMED, &dst_lane, "STING-MORE");
+    for (sid, neo_more) in [(SID_RESUMED, None), (SID_BOTH, Some("NEO-MORE"))] {
+        let old = transcript(sid, &src_lane, "OLD");
+        let mut here = old.clone();
+        here.push_str(&sting_more);
+        fs::write(dst_lane_projects.join(format!("{sid}.jsonl")), &here).unwrap();
+        let mut there = old;
+        if let Some(label) = neo_more {
+            there.push_str(&transcript(sid, &src_lane, label));
+        }
+        fs::write(lab.join(format!("{sid}.jsonl")), there).unwrap();
+    }
+    let resumed = fs::read(dst_lane_projects.join(format!("{SID_RESUMED}.jsonl"))).unwrap();
+    let both = fs::read(dst_lane_projects.join(format!("{SID_BOTH}.jsonl"))).unwrap();
+    // Both sides quiet past the racy window, as between real passes.
+    let settle = || {
+        bulkload_agent::transfer::settle_racy_window(&src_claude).unwrap();
+        bulkload_agent::transfer::settle_racy_window(&dst_claude).unwrap();
+    };
+
+    let source_state = base.join("move-src");
+    let state = base.join("move-dst");
+    let map = format!("{}={}", src_git.display(), dst_git.display());
+    let source_pass = || {
+        let sourced = agent(&os(&[
+            &"estate-move-source",
+            &"--map",
+            &map,
+            &source_state,
+            &src_git,
+        ]));
+        assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+    };
+    let move_args = |extra: &[&dyn AsRef<std::ffi::OsStr>]| {
+        let mut args = os(&[
+            &"estate-move",
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"--sessions",
+            &src_home,
+            &"--dest-home",
+            &dst_home,
+            &"--map",
+            &map,
+        ]);
+        args.extend(os(extra));
+        args.extend(os(&[&"-", &source_state, &state]));
+        agent(&args)
+    };
+    // The claude transfer's stats line: the one session pulled with maps.
+    let claude_line = |stdout: &str| -> String {
+        stdout
+            .lines()
+            .find(|line| line.starts_with("completed=") && !line.ends_with(" mapped=0"))
+            .unwrap_or_else(|| panic!("no mapped transfer line:\n{stdout}"))
+            .to_owned()
+    };
+
+    settle();
+    source_pass();
+    let moved = move_args(&[]);
+    assert!(moved.ok, "{}\n{}", moved.stdout, moved.stderr);
+    // The resumed session: nothing landed, beside or in place.
+    assert_eq!(
+        fs::read(dst_lane_projects.join(format!("{SID_RESUMED}.jsonl"))).unwrap(),
+        resumed
+    );
+    assert!(!dst_lane_projects
+        .join(format!("{SID_RESUMED}.jsonl.{LABEL}"))
+        .exists());
+    // Both continued: the destination's untouched, neo's beside it, kept.
+    assert_eq!(
+        fs::read(dst_lane_projects.join(format!("{SID_BOTH}.jsonl"))).unwrap(),
+        both
+    );
+    assert!(dst_lane_projects
+        .join(format!("{SID_BOTH}.jsonl.{LABEL}"))
+        .is_file());
+    assert!(
+        moved.stdout.lines().any(|line| line.contains(SID_BOTH)
+            && line.contains("\"kind\":\"session\"")
+            && line.contains("\"outcome\":\"diverged\"")),
+        "{}",
+        moved.stdout
+    );
+    let at_lane = dst_claude
+        .join("projects")
+        .join(key(&dst_lane))
+        .join(format!("{SID}.jsonl"));
+    assert_eq!(fs::read_to_string(&at_lane).unwrap(), neo);
+    assert_eq!(
+        fs::read(
+            dst_claude
+                .join("projects")
+                .join(key(&dst_lane))
+                .join(format!("{SID}/subagents/agent-1.jsonl"))
+        )
+        .unwrap(),
+        b"{\"agent\":1}\n"
+    );
+    assert!(
+        !dst_claude.join("projects").join(key(&src_lane)).exists(),
+        "no source-key directory: {}",
+        moved.stdout
+    );
+    assert!(
+        moved
+            .stdout
+            .lines()
+            .any(|line| line.contains("\"kind\":\"session\"")
+                && line.contains(SID)
+                && line.contains("\"outcome\":\"in-place\"")),
+        "the re-seat finds it in place:\n{}",
+        moved.stdout
+    );
+    // The shared key: held, typed, and its session re-keyed as before.
+    assert!(
+        moved.stdout.contains(&format!(
+            "estate-move key-map-held key={} reason=ambiguous-source-key",
+            key(&src_ab)
+        )),
+        "{}",
+        moved.stdout
+    );
+    assert_eq!(
+        fs::read_to_string(
+            dst_claude
+                .join("projects")
+                .join(key(&src_ab))
+                .join(format!("{SID_AB}.jsonl"))
+        )
+        .unwrap(),
+        ab
+    );
+    assert_eq!(
+        fs::read_to_string(
+            dst_claude
+                .join("projects")
+                .join(key(&dst_ab))
+                .join(format!("{SID_AB}.jsonl"))
+        )
+        .unwrap(),
+        ab
+    );
+    let first = closure(&moved.stdout);
+    assert_eq!(first["applied_beside"], "1", "{}", moved.stdout);
+    assert_eq!(first["key_maps"], "2", "{}", moved.stdout);
+    assert_eq!(first["key_maps_held"], "1", "{}", moved.stdout);
+    assert_eq!(first["unaccounted"], "0", "{}", moved.stdout);
+    assert_eq!(first["reseat_unaccounted"], "0", "{}", moved.stdout);
+    assert!(
+        moved.stdout.contains("estate-move gate=pass"),
+        "{}",
+        moved.stdout
+    );
+    let closure_json = fs::read_to_string(state.join("closure.json")).unwrap();
+    assert!(
+        closure_json.contains(&format!(
+            "\"path\":\"projects/{}\",\"transfer_outcome\":\"mapped\",\"mapped\":\"projects/{}\"",
+            key(&src_lane),
+            key(&dst_lane)
+        )),
+        "{closure_json}"
+    );
+    assert!(
+        closure_json.contains(&format!(
+            "\"path\":\"projects/{}/{SID_RESUMED}.jsonl\",\"transfer_outcome\":\"dest-ahead\"",
+            key(&dst_lane)
+        )),
+        "{closure_json}"
+    );
+    let inode = std::os::unix::fs::MetadataExt::ino(&fs::metadata(&at_lane).unwrap());
+
+    // The session grows on the source: extended in place, under the key
+    // (both sides quiet past the racy window, as between real passes).
+    let mut grown = neo;
+    grown.push_str(&transcript(SID, &src_lane, "NEO2"));
+    fs::write(lab.join(format!("{SID}.jsonl")), &grown).unwrap();
+    settle();
+    source_pass();
+    let again = move_args(&[]);
+    assert!(again.ok, "{}\n{}", again.stdout, again.stderr);
+    assert_eq!(
+        fs::read_to_string(&at_lane).unwrap(),
+        grown,
+        "{}\n{}",
+        again.stdout,
+        again.stderr
+    );
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::ino(&fs::metadata(&at_lane).unwrap()),
+        inode,
+        "extended in place"
+    );
+    assert!(!at_lane.with_extension(format!("jsonl.{LABEL}")).exists());
+    assert!(!dst_claude.join("projects").join(key(&src_lane)).exists());
+
+    // Unchanged: the claude transfer reads nothing.
+    settle();
+    source_pass();
+    let third = move_args(&[]);
+    assert!(third.ok, "{}\n{}", third.stdout, third.stderr);
+    let line = claude_line(&third.stdout);
+    assert!(line.contains(" source_bytes_read=0 "), "{line}");
+    assert!(line.ends_with(" mapped=1"), "{line}");
+
+    // The report-only proof: the shared key's directory, its file already
+    // under the lane's key, byte for byte; nothing pulled or written.
+    let before = fs::read_dir(&state).unwrap().count();
+    let proof = move_args(&[&"--key-map-proof"]);
+    assert!(proof.ok, "{}\n{}", proof.stdout, proof.stderr);
+    assert!(
+        proof
+            .stdout
+            .contains("estate-move key-map-proof dirs=1 files=1 statuses=identical:1"),
+        "{}",
+        proof.stdout
+    );
+    assert!(
+        proof.stdout.contains("\"basis\":\"cwd\""),
+        "{}",
+        proof.stdout
+    );
+    assert!(
+        !proof.stdout.contains("estate-move phase="),
+        "{}",
+        proof.stdout
+    );
+    assert_eq!(fs::read_dir(&state).unwrap().count(), before);
 }

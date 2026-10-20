@@ -340,6 +340,19 @@ pub struct TransferStats {
     /// reported `applied-beside` and is an `applied-beside` row of the
     /// session's transfer record, accounted in closure.
     pub applied_beside: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `--map-prefix SRC_REL=DST_REL` ([`set_map_prefixes`]): each map an
+    /// entry of the session was landed through, `(source path, destination
+    /// path)`, as first used. Each is a `mapped` row of the session's
+    /// transfer record, accounted like `applied`; every other path this
+    /// report names is the destination's (the mapped path).
+    pub mapped: Vec<(Vec<u8>, Vec<u8>)>,
+    /// `--beside` (#280 finding 9): seats whose live destination file is
+    /// not this store's and holds the seat's bytes and more (an append-only
+    /// file the destination continued: a session resumed there), by path.
+    /// Nothing is written for one, beside or in place; each is a
+    /// `dest-ahead` row of the session's transfer record, accounted
+    /// (covered by the live file).
+    pub dest_ahead: Vec<Vec<u8>>,
 }
 
 impl TransferStats {
@@ -4954,6 +4967,10 @@ struct Inbound<'a, W> {
     /// path holds a symlink or another kind, landed beside, by live path:
     /// every entry under one is decided under its beside directory.
     redirects: HashMap<Vec<u8>, Vec<u8>>,
+    /// `--map-prefix` for this session's root ([`map::for_root`]): every
+    /// source path the walk offers is landed at its mapped path, or refused
+    /// by the owner rule ([`PrefixMap::land`]).
+    maps: PrefixMap,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -4970,6 +4987,13 @@ enum Walked {
     },
     EngineTemporary {
         rel_path: Vec<u8>,
+    },
+    /// `--map-prefix`: an entry the owner rule refuses (it would reach a
+    /// map's destination another way), at its source path: never a batch
+    /// member, answered `DESTINATION_OCCUPIED` in stream order.
+    Unowned {
+        entry: u64,
+        row: RowSchema,
     },
 }
 
@@ -5097,6 +5121,9 @@ fn receive_session<R: Read, W: Write>(
     if overlaps(&canonical_state(destination_state)?, &destination_root) {
         return Err(BulkloadRefusal::SnapshotRootsOverlap);
     }
+    // `--map-prefix`: a set the rules refuse refuses here, before either
+    // store exists.
+    let maps = map::for_root(&destination_root)?;
     write_control(
         output,
         &Control::Open {
@@ -5236,6 +5263,7 @@ fn receive_session<R: Read, W: Write>(
             claimed: HashSet::new(),
             always: beside_always(),
             redirects: HashMap::new(),
+            maps,
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -5327,11 +5355,13 @@ impl<W: Write> Inbound<'_, W> {
                         return Err(BulkloadRefusal::ProtocolStateViolation);
                     }
                     offered += 1;
-                    self.walked(Walked::Entry { entry, row, wal })?;
+                    let frame = self.landed(entry, row, wal);
+                    self.walked(frame)?;
                 }
                 Frame::Control(Control::SqliteSidecar { rel_path, database })
                     if self.sqlite == SqliteMode::Snapshot =>
                 {
+                    let (rel_path, database) = (self.maps.path(rel_path), self.maps.path(database));
                     self.sidecars.push((rel_path, database));
                 }
                 Frame::Control(Control::SqliteSnapshot { entry, size, wal })
@@ -5353,7 +5383,7 @@ impl<W: Write> Inbound<'_, W> {
                     code,
                     sqlite_code,
                 }) => self.walked(Walked::Refused {
-                    rel_path,
+                    rel_path: self.maps.path(rel_path),
                     code,
                     sqlite_code,
                 })?,
@@ -5364,6 +5394,7 @@ impl<W: Write> Inbound<'_, W> {
                     sqlite_code,
                 }) => self.refused(entry, &rel_path, code, sqlite_code)?,
                 Frame::Control(Control::EngineTemporary { rel_path }) => {
+                    let rel_path = self.maps.path(rel_path);
                     self.walked(Walked::EngineTemporary { rel_path })?;
                 }
                 Frame::Control(Control::WalkDone { entries }) => {
@@ -5484,6 +5515,46 @@ impl<W: Write> Inbound<'_, W> {
             Walked::EngineTemporary { rel_path } => {
                 self.stats.source_engine_temporaries.push(rel_path);
                 Ok(())
+            }
+            Walked::Unowned { entry, row } => {
+                let refusal = BulkloadRefusal::DestinationOccupied;
+                self.refuse(row.rel_path, &refusal);
+                write_control(
+                    self.output,
+                    &Control::Decide {
+                        entry,
+                        decision: Decision::Refuse {
+                            code: refusal.code().to_owned(),
+                        },
+                    },
+                )?;
+                fault_point!(ReceiveAfterDecide);
+                Ok(())
+            }
+        }
+    }
+
+    /// `--map-prefix`: the walk frame of an offered entry at its landed
+    /// path ([`PrefixMap::land`]), recording the map it was landed
+    /// through, or [`Walked::Unowned`] at its source path.
+    fn landed(&mut self, entry: u64, mut row: RowSchema, wal: Option<SidecarId>) -> Walked {
+        if self.maps.is_empty() {
+            return Walked::Entry { entry, row, wal };
+        }
+        match self.maps.land(std::mem::take(&mut row.rel_path)) {
+            Ok((by, landed)) => {
+                if let Some((source, destination)) = by.and_then(|at| self.maps.maps().get(at)) {
+                    let used = (source.clone(), destination.clone());
+                    if !self.stats.mapped.contains(&used) {
+                        self.stats.mapped.push(used);
+                    }
+                }
+                row.rel_path = landed;
+                Walked::Entry { entry, row, wal }
+            }
+            Err(source) => {
+                row.rel_path = source;
+                Walked::Unowned { entry, row }
             }
         }
     }
@@ -5883,27 +5954,31 @@ impl<W: Write> Inbound<'_, W> {
     /// `row` under the beside directory of its nearest redirected ancestor
     /// (second review of #280, finding 5), or as it is.
     fn redirected(&self, mut row: RowSchema) -> RowSchema {
+        row.rel_path = self.redirected_path(std::mem::take(&mut row.rel_path));
+        row
+    }
+
+    /// `path` under the beside directory of its nearest redirected
+    /// ancestor, or as it is.
+    fn redirected_path(&self, path: Vec<u8>) -> Vec<u8> {
         if self.redirects.is_empty() {
-            return row;
+            return path;
         }
         let mut cut = None;
-        for (at, byte) in row.rel_path.iter().enumerate() {
+        for (at, byte) in path.iter().enumerate() {
             if *byte == b'/' {
-                if let Some(beside) = row
-                    .rel_path
-                    .get(..at)
-                    .and_then(|dir| self.redirects.get(dir))
-                {
+                if let Some(beside) = path.get(..at).and_then(|dir| self.redirects.get(dir)) {
                     cut = Some((at, beside.clone()));
                 }
             }
         }
-        if let Some((at, beside)) = cut {
-            let mut path = beside;
-            path.extend_from_slice(row.rel_path.get(at..).unwrap_or_default());
-            row.rel_path = path;
+        match cut {
+            Some((at, mut beside)) => {
+                beside.extend_from_slice(path.get(at..).unwrap_or_default());
+                beside
+            }
+            None => path,
         }
-        row
     }
 
     /// A directory seat: made, or entered when it is there. Under
@@ -6037,6 +6112,12 @@ impl<W: Write> Inbound<'_, W> {
             // prove it either, and proving hashes the whole output.
             for remembered in std::iter::once(key).chain(snapshot.map(|(k, _)| k.as_slice())) {
                 if let Some(refused) = self.remembered_refusal(row, remembered, identity)? {
+                    // The live file held the seat's bytes and more, and
+                    // neither has moved (#280 finding 9): nothing to land.
+                    if refused == RefusedOutput::DestAhead {
+                        self.stats.dest_ahead.push(row.rel_path.clone());
+                        return Ok(Decision::Reuse);
+                    }
                     return Err(refused.refusal());
                 }
             }
@@ -6269,7 +6350,10 @@ impl<W: Write> Inbound<'_, W> {
                 row
             }
         };
-        if row.rel_path != rel_path {
+        // The wire names the source's path: the entry was decided at its
+        // mapped path (`--map-prefix`), under any beside directory of its
+        // ancestors (`--beside`), so the two are compared there.
+        if row.rel_path != self.redirected_path(self.maps.path(rel_path.to_vec())) {
             return Err(BulkloadRefusal::ProtocolStateViolation);
         }
         self.stats.refuse(row.rel_path, code, sqlite_code);
@@ -6351,7 +6435,8 @@ impl<W: Write> Inbound<'_, W> {
             | Plan::Adopt(..)
             | Plan::NoExchange(_)
             | Plan::NotPrefix(_)
-            | Plan::BesideRefused { .. } => (Vec::new(), None),
+            | Plan::BesideRefused { .. }
+            | Plan::DestAhead(_) => (Vec::new(), None),
         };
         self.claim_planned(&plan);
         write_control(
@@ -6588,6 +6673,9 @@ impl<W: Write> Inbound<'_, W> {
                 {
                     return Err(BulkloadRefusal::ProtocolStateViolation);
                 }
+                if let Plan::DestAhead(identity) = &filling.plan {
+                    return self.end_dest_ahead(entry, &filling.row, &filling.key, *identity, racy);
+                }
                 let rel_path = filling.row.rel_path.clone();
                 let snapshot = filling.snapshot;
                 (rel_path, snapshot, self.end_filling(filling, racy))
@@ -6620,6 +6708,29 @@ impl<W: Write> Inbound<'_, W> {
                 write_control(self.output, &Control::Held { entry, held: false })?;
             }
         }
+        self.settle_held()?;
+        fault_point!(ReceiveAfterEnd);
+        Ok(())
+    }
+
+    /// `--beside` (#280 finding 9): an entry the live file already holds,
+    /// and more ([`Plan::DestAhead`]): accounted `dest-ahead`, nothing
+    /// written, remembered under the file's identity (unless the capture was
+    /// racy), so an unchanged rerun answers it at `Decide` with nothing read.
+    /// Answered `held: false`: no output of this store holds it, so the
+    /// source records no capture for it.
+    fn end_dest_ahead(
+        &mut self,
+        entry: u64,
+        row: &RowSchema,
+        key: &[u8],
+        identity: StatIdentity,
+        racy: bool,
+    ) -> Result<()> {
+        self.remember_refusal(key, Some(identity), racy, RefusedOutput::DestAhead);
+        self.stats.dest_ahead.push(row.rel_path.clone());
+        self.release(entry);
+        write_control(self.output, &Control::Held { entry, held: false })?;
         self.settle_held()?;
         fault_point!(ReceiveAfterEnd);
         Ok(())
@@ -7048,6 +7159,8 @@ impl<W: Write> Inbound<'_, W> {
                 }
                 Err(refusal)
             }
+            // Answered by `end` before it gets here.
+            Plan::DestAhead(_) => Err(BulkloadRefusal::ContractSelfInconsistent),
             Plan::Write(mut staging) => {
                 self.open -= 1;
                 if let Some(failure) = failure {
@@ -7705,6 +7818,12 @@ enum Plan {
         live: Option<(StatIdentity, RefusedOutput)>,
         beside: Option<StatIdentity>,
     },
+    /// `--beside` (#280 finding 9): the live path holds a settled file this
+    /// store does not own whose first bytes are the manifest's, and more
+    /// ([`dest_ahead`]). Nothing is staged or asked for; the entry is
+    /// accounted `dest-ahead` once it ends, remembered under the file's
+    /// identity.
+    DestAhead(StatIdentity),
 }
 
 /// [`verify_existing`], and, when the output holds other bytes than the
@@ -8081,7 +8200,13 @@ fn plan_file(
                 // bytes, judged now) lands beside instead.
                 Ok(None) => {
                     let plan = if extend {
-                        plan_extend(context, row, manifest, (file, parent), salvaged_from)
+                        plan_extend(
+                            context,
+                            (row, beside.is_some()),
+                            manifest,
+                            (file, parent),
+                            salvaged_from,
+                        )
                     } else {
                         Plan::Adopt(file, parent, None, None)
                     };
@@ -8097,6 +8222,13 @@ fn plan_file(
                                     return Plan::Adopt(file, parent, Some(identity), None)
                                 }
                                 Err(BulkloadRefusal::DestinationOccupied) => {
+                                    // The live file holds these bytes and
+                                    // more: nothing to land (#280 finding 9).
+                                    if let Some(identity) =
+                                        dest_ahead(&file, row, manifest, context.target.path())
+                                    {
+                                        return Plan::DestAhead(identity);
+                                    }
                                     land_beside = Some(beside_path(&row.rel_path, suffix));
                                     live_refused =
                                         settled.map(|identity| (identity, RefusedOutput::Occupied));
@@ -8240,7 +8372,7 @@ fn plan_file(
 /// when its bytes are not the manifest's.
 fn plan_extend(
     context: &ReceiveContext<'_>,
-    row: &RowSchema,
+    (row, beside): (&RowSchema, bool),
     manifest: &Manifest,
     (file, parent): (std::fs::File, Arc<std::fs::File>),
     salvaged_from: &mut Vec<usize>,
@@ -8260,7 +8392,7 @@ fn plan_extend(
         }
         _ => return Plan::Adopt(file, parent, None, None),
     };
-    let (base, hasher) = match prove_prefix(&file, row, manifest, (identity, prior)) {
+    let (base, hasher) = match prove_prefix(&file, row, manifest, (identity, prior), beside) {
         Proof::Proven(base, hasher) => (base, *hasher),
         Proof::NotPrefix => return Plan::NotPrefix(identity),
         Proof::Untried => return Plan::Adopt(file, parent, None, None),
@@ -8348,6 +8480,55 @@ fn plan_extend(
     })
 }
 
+/// `--beside` (#280 finding 9): whether the existing `file` at `row`'s live
+/// path holds the seat's bytes and more: an append-only path in the prefix
+/// extension's scope ([`PREFIX_EXTEND_ENV`]), a regular file longer than
+/// the seat, settled (neither its content nor its inode changed within the
+/// racy window of now, by the destination's clock), whose first bytes are
+/// every manifest chunk's, read back and hashed, and unchanged while they
+/// were read. The destination continued it (a session resumed there): the
+/// seat's bytes are there, so landing them beside would only copy them a
+/// second time. Its identity, or `None`.
+fn dest_ahead(
+    file: &std::fs::File,
+    row: &RowSchema,
+    manifest: &Manifest,
+    root: &Path,
+) -> Option<StatIdentity> {
+    if !prefix_extend_scope(root).covers(&row.rel_path) || manifest.size() != Some(row.size) {
+        return None;
+    }
+    let found = file.metadata().ok()?;
+    let identity = StatIdentity::from_metadata(&found);
+    let quiet_since = capture_clock(root).saturating_sub(RACY_GRANULARITY_NS);
+    if !found.is_file()
+        || found.len() <= row.size
+        || identity.mtime_ns >= quiet_since
+        || identity.ctime_ns >= quiet_since
+    {
+        return None;
+    }
+    let mut buffer = vec![0_u8; crate::hash::CDC_MAX_BYTES as usize];
+    let mut offset = 0_u64;
+    for chunk in &manifest.chunks {
+        let slot = usize::try_from(chunk.size)
+            .ok()
+            .and_then(|size| buffer.get_mut(..size))?;
+        if crate::io::sys::pread_full(file, slot, offset).ok() != Some(slot.len()) {
+            return None;
+        }
+        counters::add_len(Counter::DestVerifyRead, slot.len());
+        if counters::hash(Counter::HashVerifyExisting, slot) != chunk.digest {
+            return None;
+        }
+        offset = offset.checked_add(chunk.size)?;
+    }
+    let unmoved = file
+        .metadata()
+        .is_ok_and(|after| StatIdentity::from_metadata(&after) == identity);
+    (offset == row.size && unmoved).then_some(identity)
+}
+
 /// Whether `file` may be extended to `row` (M2r2 A-103): a regular file
 /// with one link (a hard link's other name would change with it), this
 /// user's, the source's mode, `0 < len < size`, and settled: neither its
@@ -8429,12 +8610,18 @@ enum Proof {
 
 /// The proof half of [`plan_extend`] for the candidate `file` of `identity`
 /// and length `prior`: every manifest chunk ending within it must be its
-/// bytes, and at least one must.
+/// bytes, and at least one must. Under `--beside` (`beside`) none need:
+/// a file whose held bytes all lie in the first chunk is judged whole at
+/// the end (its head against the staged first chunk), since the seat's
+/// bytes cross either way, appended to it or landed beside it (#280
+/// finding 9: a small transcript that grew is extended, not copied
+/// beside).
 fn prove_prefix(
     file: &std::fs::File,
     row: &RowSchema,
     manifest: &Manifest,
     (identity, prior): (StatIdentity, u64),
+    beside: bool,
 ) -> Proof {
     if manifest.size() != Some(row.size) {
         return Proof::Untried;
@@ -8469,8 +8656,10 @@ fn prove_prefix(
     }
     // At least one whole chunk proven: a file whose held bytes all lie in
     // the first chunk could only be judged with that chunk's bytes from the
-    // source, and a refused seat costs no wire byte (P21, #187).
-    let Some(base) = base.filter(|base| *base > 0) else {
+    // source, and a refused seat costs no wire byte (P21, #187). Under
+    // `--beside` no seat is refused for what its live path holds: its bytes
+    // cross either way.
+    let Some(base) = base.filter(|base| *base > 0 || beside) else {
         return Proof::Untried;
     };
     let moved = file.metadata().map_or(true, |found| {
@@ -8752,6 +8941,9 @@ fn path(bytes: Vec<u8>) -> PathBuf {
 }
 
 mod handoff;
+pub mod map;
 #[cfg(test)]
 mod tests;
 pub(crate) mod unrowed;
+
+pub use map::{set_map_prefix, set_map_prefixes, PrefixMap};
