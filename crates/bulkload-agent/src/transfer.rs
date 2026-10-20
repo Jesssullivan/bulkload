@@ -1475,6 +1475,45 @@ fn beside_always() -> HashSet<Vec<u8>> {
 /// process (`estate-move --sessions`).
 static CONSOLIDATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The archive roots an append log's live link may point into
+/// ([`set_consolidate_archives`]).
+static CONSOLIDATE_ARCHIVES: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Set the archive roots (`--replace-archived-dest`) whose links the
+/// re-seat replaces by a union (A-106).
+///
+/// A consolidated append log whose live path is a link to a regular file
+/// under one of them is landed for that union; any other node of another
+/// kind is refused `DESTINATION_KIND_MISMATCH`.
+pub fn set_consolidate_archives(roots: &[PathBuf]) {
+    *CONSOLIDATE_ARCHIVES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner) = roots
+        .iter()
+        .map(|root| std::fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .collect();
+}
+
+/// Whether `live` is a link whose target is a regular file under an archive
+/// root ([`set_consolidate_archives`]).
+fn archive_link(live: &Path) -> bool {
+    let Ok(meta) = std::fs::symlink_metadata(live) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(target) = std::fs::canonicalize(live) else {
+        return false;
+    };
+    target.is_file()
+        && CONSOLIDATE_ARCHIVES
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|root| target.starts_with(root))
+}
+
 /// Consolidation by canonical destination root, for tests.
 static CONSOLIDATE_OVERRIDE: Mutex<Vec<(PathBuf, bool)>> = Mutex::new(Vec::new());
 
@@ -9185,6 +9224,18 @@ fn plan_file(
             None
         }
         Ok(None) => None,
+        // An append log under consolidation whose live path is another
+        // kind: never landed beside (SPEC #298), except a link into an
+        // archive root, whose target is the live file: its landing is the
+        // re-seat's A-106 union, consumed there (one file).
+        Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch)
+            if beside.is_some()
+                && !snapshot
+                && consolidates(context.target.path(), &row.rel_path)
+                && !archive_link(&context.target.path().join(path(row.rel_path.clone()))) =>
+        {
+            return Plan::Refuse(BulkloadRefusal::DestinationKindMismatch);
+        }
         // `--beside`: a node of another kind at the live path (a symlink:
         // review of #280, finding 5) lands beside.
         Err(BulkloadRefusal::DestinationOccupied | BulkloadRefusal::DestinationKindMismatch)

@@ -1206,6 +1206,9 @@ fn sessions_pull(
     // "no dupes, no duplicated besides"): an append log the two homes both
     // hold is consolidated in place, one file, never landed beside.
     bulkload_agent::transfer::set_consolidate(true);
+    // A live transcript link into an archive root is the A-106 union's;
+    // any other node of another kind at an append log's path is refused.
+    bulkload_agent::transfer::set_consolidate_archives(&run.archived);
     // The source's transcripts and rollouts, listed by each session: the
     // provenance the re-seat tells them from the destination's own by
     // (independent review of #280, N4). Listed as they land: under their
@@ -1273,6 +1276,7 @@ fn sessions_pull(
     bulkload_agent::transfer::set_beside_always(Vec::new());
     bulkload_agent::transfer::set_listing(Vec::new());
     bulkload_agent::transfer::set_consolidate(false);
+    bulkload_agent::transfer::set_consolidate_archives(&[]);
     let cleared = bulkload_agent::transfer::set_beside_suffix(None);
     // A session that did not complete outranks one that completed with
     // refused paths: the phase's word says whether the re-seat may run.

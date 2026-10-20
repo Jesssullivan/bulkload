@@ -249,3 +249,55 @@ fn a_beside_is_written_only_for_bytes_the_live_file_lacks() {
     }
     assert!(beside_of(&other).exists());
 }
+
+/// An append log whose live path is another kind (a directory, a link
+/// outside the archive roots) is refused typed, nothing landed beside it; a
+/// link into an archive root is the re-seat's A-106 union and is landed for
+/// it.
+#[test]
+fn a_log_whose_live_path_is_another_kind_is_refused_unless_an_archive_link() {
+    let homes = Homes::new();
+    let neo = record("a", "", "hi");
+    let (dir_rel, link_rel, archived_rel) = (
+        "projects/-k/dir.jsonl",
+        "projects/-k/link.jsonl",
+        "projects/-k/archived.jsonl",
+    );
+    for rel in [dir_rel, link_rel, archived_rel] {
+        homes.write("source", rel, neo.as_bytes());
+    }
+    let dir = homes.root.join(dir_rel);
+    std::fs::create_dir_all(&dir).unwrap();
+    let elsewhere = homes.write("elsewhere", "other.jsonl", b"{\"x\":1}\n");
+    std::os::unix::fs::symlink(&elsewhere, homes.root.join(link_rel)).unwrap();
+    let archive = homes.corpus.base.join("archive");
+    let target = homes.write("archive", "s.jsonl", b"{\"x\":2}\n");
+    std::os::unix::fs::symlink(&target, homes.root.join(archived_rel)).unwrap();
+    set_consolidate_archives(&[archive]);
+    homes.settle();
+    let stats = homes.corpus.run();
+    set_consolidate_archives(&[]);
+    let stats = stats.unwrap();
+    let mut refused: Vec<(String, String)> = stats
+        .refusals
+        .iter()
+        .map(|(path, code)| (String::from_utf8_lossy(path).into_owned(), code.clone()))
+        .collect();
+    refused.sort();
+    assert_eq!(
+        refused,
+        [
+            (dir_rel.to_owned(), "DESTINATION_KIND_MISMATCH".to_owned()),
+            (link_rel.to_owned(), "DESTINATION_KIND_MISMATCH".to_owned()),
+        ]
+    );
+    assert!(!beside_of(&dir).exists());
+    assert!(!beside_of(&homes.root.join(link_rel)).exists());
+    assert_eq!(std::fs::read(&elsewhere).unwrap(), b"{\"x\":1}\n");
+    assert_eq!(
+        std::fs::read(beside_of(&homes.root.join(archived_rel))).unwrap(),
+        neo.as_bytes(),
+        "landed for the re-seat's union"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"{\"x\":2}\n");
+}
