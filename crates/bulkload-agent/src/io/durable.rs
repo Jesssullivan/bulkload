@@ -1421,20 +1421,19 @@ mod tests {
     fn a_group_waits_out_its_idle_and_closes_at_its_age() -> Result<()> {
         // `closes`: before each next item, wait (bounded) until the committer
         // has closed every group so far by itself, on its idle.
-        let gapped = |idle: Duration,
-                      age: Option<Duration>,
-                      gaps: usize,
-                      (gap, closes): (Duration, bool)|
-         -> Result<Vec<usize>> {
-            let groups = Arc::new(Mutex::new(Vec::new()));
-            let committer = Committer::spawn_with(
-                Recorder(Arc::clone(&groups)),
+        let spawn = |groups: &Arc<Mutex<Vec<Vec<u64>>>>, idle, age| {
+            Committer::spawn_with(
+                Recorder(Arc::clone(groups)),
                 Limits {
                     group_idle: idle,
                     group_age: age,
                     ..Limits::default()
                 },
-            )?;
+            )
+        };
+        let gapped = |idle: Duration, gaps: usize, (gap, closes): (Duration, bool)| {
+            let groups = Arc::new(Mutex::new(Vec::new()));
+            let committer = spawn(&groups, idle, None)?;
             committer.submit(1)?;
             for submitted in 1..=gaps {
                 std::thread::sleep(gap);
@@ -1450,11 +1449,11 @@ mod tests {
             }
             committer.sync()?;
             drop(committer);
-            Ok(group_sizes(&groups))
+            Ok::<_, BulkloadRefusal>(group_sizes(&groups))
         };
         let gap = Duration::from_millis(60);
         // Five items 60 ms apart under a 2 s idle: one group, closed by sync.
-        assert_eq!(gapped(Duration::from_secs(2), None, 4, (gap, false))?, [5]);
+        assert_eq!(gapped(Duration::from_secs(2), 4, (gap, false))?, [5]);
         // The same five items under a 20 ms idle: each item alone, its group
         // closed on its idle with no sync. The committer judges idleness by
         // what it sees: a committer thread descheduled past the gap (a loaded
@@ -1464,20 +1463,36 @@ mod tests {
         // scheduling, not the idle rule, and a group closing late is only
         // later durability, never a record before its data. So each next
         // item waits until the committer has closed the group before it.
-        assert_eq!(
-            gapped(Duration::from_millis(20), None, 4, (gap, true))?,
-            [1; 5]
-        );
-        // Twenty items 60 ms apart (over 1.1 s) under a 2 s idle and a 300 ms
-        // age: closed by age, more than once, nothing lost.
-        let aged = gapped(
+        assert_eq!(gapped(Duration::from_millis(20), 4, (gap, true))?, [1; 5]);
+        // Items 60 ms apart under a 2 s idle and a 300 ms age, until the age
+        // has closed three groups (bounded): a group that never goes idle
+        // still closes, more than once, and nothing is lost. A fixed count
+        // of items raced the committer the same way: a starved committer
+        // takes several queued items at once, and a group's age runs from
+        // when the committer took its first.
+        let groups = Arc::new(Mutex::new(Vec::new()));
+        let committer = spawn(
+            &groups,
             Duration::from_secs(2),
             Some(Duration::from_millis(300)),
-            19,
-            (gap, false),
         )?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut submitted = 0_usize;
+        while group_sizes(&groups).len() < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the age never closed three groups: {:?}",
+                group_sizes(&groups)
+            );
+            committer.submit(1)?;
+            submitted += 1;
+            std::thread::sleep(gap);
+        }
+        committer.sync()?;
+        drop(committer);
+        let aged = group_sizes(&groups);
         assert!(aged.len() >= 3, "{aged:?}");
-        assert_eq!(aged.iter().sum::<usize>(), 20, "{aged:?}");
+        assert_eq!(aged.iter().sum::<usize>(), submitted, "{aged:?}");
         Ok(())
     }
 
