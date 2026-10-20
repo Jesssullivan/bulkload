@@ -162,7 +162,10 @@ const BYPASSES: &[Bypass] = &[
              bulkload_agent::durable::LedgerSync::Full{\
              ssh.arg(\"--source-ledger-sync=full\");}\
              forflaginbulkload_agent::transfer::serve_flags(){ssh.arg(flag);}\
-             letmutchild=ssh.arg(\"serve\")\
+             ssh.arg(\"serve\");\
+             ifkind==bulkload_agent::transfer::RootKind::File{\
+             ssh.arg(\"--file\");}\
+             letmutchild=ssh\
              .stdin(Stdio::piped()).stdout(Stdio::piped())\
              .stderr(Stdio::inherit()).spawn()",
         ),
@@ -170,10 +173,11 @@ const BYPASSES: &[Bypass] = &[
         why: "Starts the remote `bulkload-agent serve`, which is the source \
               reader and enters background priority itself (OI-1003-Q25). The \
               remote word is `bulkload-agent` or a validated absolute path, \
-              and the ssh child touches no local source. The two mode flags it \
-              may pass (`--durability=strict`, and WP0(g)'s \
-              `--source-ledger-sync=full`, OI-1003-Q109) are fixed literals. \
-              The `SQLite` flags it may pass (`--sqlite-slot-bytes=N`, \
+              and the ssh child touches no local source. The three mode flags \
+              it may pass (`--durability=strict`, WP0(g)'s \
+              `--source-ledger-sync=full`, OI-1003-Q109, and `serve --file` \
+              for a single-file root, #232) are fixed literals. The `SQLite` \
+              flags it may pass (`--sqlite-slot-bytes=N`, \
               `--sqlite-carry-wall=N`, plan of record 2026-10-19, C3) are the \
               verb's own, rendered by `transfer::serve_flags` from the parsed \
               integers (digits only, never caller text), and only when set \

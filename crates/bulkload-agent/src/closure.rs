@@ -326,6 +326,8 @@ pub fn rerun_only(code: &str) -> Option<&'static str> {
     match code {
         "GIT_CONVERGE_INTERRUPTED" => Some("converge-interrupted"),
         "TRANSPORT_LOST" => Some("transport-lost"),
+        // #279: another run held the move state; nothing ran.
+        "MOVE_STATE_BUSY" => Some("state-busy"),
         "ITEMS_REFUSED" => Some("run-level-refusal"),
         _ => None,
     }

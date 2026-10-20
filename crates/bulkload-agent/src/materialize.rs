@@ -2977,9 +2977,16 @@ fn open_dir(parent: &File, name: &CStr) -> Result<File> {
 }
 
 fn open_regular(parent: &File, name: &CStr) -> Result<File> {
-    let file = File::from(
-        crate::io::sys::open_read_at(parent, name).refuse_at("materialize::open_regular")?,
-    );
+    // The open follows no link, so `ELOOP` is this name being a symlink (to
+    // a file, a directory or nothing): the wrong kind of node where a
+    // regular output lands, typed (#283 review 3; it was IO errno 40).
+    let file = File::from(crate::io::sys::open_read_at(parent, name).map_err(|error| {
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            BulkloadRefusal::DestinationKindMismatch
+        } else {
+            crate::refuse::io(&error, "materialize::open_regular")
+        }
+    })?);
     if !file
         .metadata()
         .refuse_at("materialize::open_regular")?
