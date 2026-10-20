@@ -469,6 +469,10 @@ impl Own {
 /// A1, the `GloriousFlywheel` shape: beside first, then advanced in place,
 /// the beside landing retired; later passes converge in place.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a1_a_clean_ancestor_is_advanced_and_its_beside_landing_retired() {
     let world = World::new();
     world.capture();
@@ -574,6 +578,10 @@ fn a1_a_clean_ancestor_is_advanced_and_its_beside_landing_retired() {
 /// A2: a standalone beside checkout (a hand copy adopted by proof, #282)
 /// is retired the same way: a guarded removal of the directory.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a2_an_adopted_standalone_beside_is_retired_after_the_advance() {
     let world = World::new();
     world.capture();
@@ -755,6 +763,10 @@ fn a4_a6_each_precondition_refuses_typed_and_lands_beside() {
 /// own path, sting's files there untouched. The beside tree, everything
 /// else proved equal, is then retired.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a7_ignored_files_are_kept_and_a_conflict_lands_as_a_file_level_beside() {
     let world = World::new();
     fs::write(world.sting().join("neo.log"), b"sting's own log\n").unwrap();
@@ -806,6 +818,10 @@ fn a7_ignored_files_are_kept_and_a_conflict_lands_as_a_file_level_beside() {
 /// closure holds the item `refused-pending-review` with
 /// `GIT_ADVANCE_BESIDE_KEPT` and the reason, and the beside stays whole.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a11_a_beside_kept_after_the_advance_is_pending_review() {
     let world = World::new();
     world.capture();
@@ -854,6 +870,10 @@ fn a11_a_beside_kept_after_the_advance_is_pending_review() {
 /// own untracked directory, apart from every captured path, stays byte for
 /// byte; the checkout advances and the beside landing is still retired.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a8_untracked_files_apart_from_the_capture_stay_and_the_checkout_advances() {
     let world = World::new();
     let review = world
@@ -983,6 +1003,10 @@ fn a12_a_held_git_lock_refuses_the_advance_with_nothing_moved() {
 /// (named in the receipt), its stash, branches, worktrees and ignored
 /// files untouched, the beside landing retired.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn s1_a_clean_checkout_on_another_branch_is_switched() {
     let world = World::new();
     git(&world.neo(), &["switch", "--quiet", "-c", "feature"]);
@@ -1119,6 +1143,10 @@ fn s2_each_switch_condition_refuses_typed_and_lands_beside() {
 /// review), never removed under it; once the process is gone, a rerun
 /// tries again and retires it.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn r1_a_beside_landing_in_use_is_kept_then_retired_once_free() {
     let world = World::new();
     world.capture();
@@ -1169,6 +1197,10 @@ fn r1_a_beside_landing_in_use_is_kept_then_retired_once_free() {
 /// operator's Git reads), and a local identity (`user.email`, never
 /// carried) the live configuration does not hold.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn r2_a_standalone_beside_carries_absent_configuration_or_is_kept() {
     for shape in ["carried", "differs", "global", "identity"] {
         let world = World::new();
@@ -1281,6 +1313,10 @@ fn r2_a_standalone_beside_carries_absent_configuration_or_is_kept() {
 /// pass (one exists already); never remembered as a decision, so the next
 /// pass, the process gone, advances.
 #[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the process check proves nothing off Linux: every advance refuses _IN_USE"
+)]
 fn a13_a_live_checkout_in_use_is_refused_then_advanced_once_free() {
     let world = World::new();
     world.capture();

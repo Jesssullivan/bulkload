@@ -454,6 +454,22 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
     let world = World::new(&point.name().replace('.', "-"), kind == K::Switch);
     std::thread::sleep(std::time::Duration::from_millis(2_100));
     world.capture();
+    // Off Linux nothing proves no process is inside the live checkout
+    // (operator ruling 2026-10-19: "on Darwin refuse unless proven"): the
+    // flagged apply refuses `_IN_USE`, reaches no advance point, and lands
+    // the capture beside.
+    if cfg!(not(target_os = "linux")) {
+        let rows = world.apply(true);
+        assert_eq!(rows.len(), 1, "{label}");
+        assert!(
+            rows[0]
+                .1
+                .as_deref()
+                .is_some_and(|reason| reason.contains("_IN_USE")),
+            "{label}: {rows:?}"
+        );
+        return;
+    }
     if matches!(kind, K::RetireStandalone | K::RetireCarry) {
         cp_a(&world.src(), &world.beside());
     }

@@ -32,6 +32,7 @@ pub fn inside(roots: &[&Path]) -> Result<Option<Vec<u32>>> {
 
 // Whether `link` (a resolved `/proc` link) names a path under one of
 // `roots`; a deleted file's link (`... (deleted)`) names nothing there.
+#[cfg(target_os = "linux")]
 fn under(link: &Path, roots: &[PathBuf]) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     !link.as_os_str().as_bytes().ends_with(b" (deleted)")

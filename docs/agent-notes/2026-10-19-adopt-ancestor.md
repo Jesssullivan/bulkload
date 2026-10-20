@@ -431,7 +431,12 @@ with `HOME` pointed at a fixture.
   nothing, so seats the advance had written stay as they are.
 - **Darwin**: with the process check on every advance, nothing advances or
   switches on Darwin (unprovable, refused `GIT_ADVANCE_IN_USE` /
-  `GIT_SWITCH_IN_USE`); sting (Linux) is the target.
+  `GIT_SWITCH_IN_USE`); sting (Linux) is the target. The Darwin A/B at
+  `7057f05` failed to compile (`procs::under` unused off Linux); it is
+  `cfg`-gated in `eb94e18`. Off Linux the advance and switch success tests
+  are `ignore`d (still compiled), a Darwin-only lib test asserts the
+  refusal, and the advance fault rows assert the flagged apply refuses
+  `_IN_USE` and lands beside.
 - **A beside's configuration values are carried only for the keys
   `safe_configuration_value` allows** (user identity, push/pull modes,
   branch upstreams to `origin` or `.`, origin's default fetch refspec); any
