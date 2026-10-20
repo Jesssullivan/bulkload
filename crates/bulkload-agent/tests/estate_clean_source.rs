@@ -1007,7 +1007,13 @@ fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
     let gone = world.path("gone-worktree");
     git(
         &world.beside(),
-        &["worktree", "add", "--quiet", "--detach", gone.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            gone.to_str().unwrap(),
+        ],
     );
     fs::remove_dir_all(&gone).unwrap();
     let report = retire(&["--drop-rebuildable"], &state, &[world.beside().as_path()]);

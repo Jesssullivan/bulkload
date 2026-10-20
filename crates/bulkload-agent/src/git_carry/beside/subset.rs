@@ -135,7 +135,7 @@ pub struct Proof {
     pub exclude: Vec<u8>,
     /// A standalone bulkload landing's `.git/carry-config` receipts
     /// (relative name, bytes), for the ledger.
-    pub carried: Vec<(Vec<u8>, Vec<u8>)>,
+    pub carried: Receipts,
     /// Worktrees a standalone tree's `.git` registers that are gone on
     /// this host (prunable: a copy's, naming another host's paths).
     pub prunable: u64,
@@ -169,6 +169,9 @@ pub enum Verdict {
 /// `(name, value)` pairs: refs, or commits under the name they are
 /// reported by.
 type Named = Vec<(String, String)>;
+
+/// Files by relative name, with their bytes.
+type Receipts = Vec<(Vec<u8>, Vec<u8>)>;
 
 fn refused(why: impl Into<String>) -> Verdict {
     Verdict::Refused(why.into())
@@ -513,7 +516,7 @@ fn registered(beside: &Path, git_dir: &Path) -> Result<std::result::Result<(u64,
 // captured configuration and its activation), every file's relative name
 // and bytes, for the ledger; `None` when they are not plain files or past
 // 4 MiB together.
-fn receipts(git_dir: &Path) -> Result<Option<Vec<(Vec<u8>, Vec<u8>)>>> {
+fn receipts(git_dir: &Path) -> Result<Option<Receipts>> {
     let root = git_dir.join("carry-config");
     if retire::lstat(&root)?.is_none() {
         return Ok(Some(Vec::new()));
@@ -808,7 +811,7 @@ pub struct RetiredRecord {
     pub config: Vec<u8>,
     pub exclude: Vec<u8>,
     /// A standalone bulkload landing's `.git/carry-config` receipts.
-    pub carried: Vec<(Vec<u8>, Vec<u8>)>,
+    pub carried: Receipts,
     /// Prunable worktrees its `.git` registered.
     pub prunable: u64,
     /// Unix nanoseconds at the proof.
