@@ -460,16 +460,30 @@ enum Rerun {
     Renew,
 }
 
+/// How the user's edit inside the render is stamped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    /// As written: in the render's own timestamp window.
+    InWindow,
+    /// Stamped now explicitly, then the render takes longer than the racy
+    /// allowance (C03).
+    SlowRender,
+    /// Its mtime set an hour back (as `cp -p`, `rsync -t`, `tar x` or
+    /// `touch -d` leave it); only its ctime says when it was written (#292
+    /// review F1).
+    OldMtime,
+}
+
 /// A user edit made after the render's exchange and before its print is
 /// taken (the test hook) leaves a racy record print of the user's bytes
 /// over a `base` the render read. Whatever path the rerun takes past the
 /// racy window (`rerun`), it checks the bytes under the block before the
 /// print is re-dated, so the print never vouches for the edit, and a
 /// converge that replaces the target refuses MODIFIED with the edit kept.
-/// `slow`: the edit is stamped explicitly and the render then takes longer
-/// than the racy allowance (C03): the print stays racy because the record
-/// is dated at the render's start, before its write, not after its prints.
-fn an_edit_after_the_exchange_survives(rerun: Rerun, slow: bool) {
+/// `edit`: how the edit is stamped ([`Edit`]). The print stays racy because
+/// the record is dated at the render's start, before its write, not after
+/// its prints (C03), and is judged by its ctime as well as its mtime (F1).
+fn an_edit_after_the_exchange_survives(rerun: Rerun, edit: Edit) {
     use crate::estate::{self, HandoffMode, HandoffOptions};
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap();
@@ -524,14 +538,22 @@ fn an_edit_after_the_exchange_survives(rerun: Rerun, slow: bool) {
             let mut bytes = fs::read(&edited).unwrap();
             bytes.extend_from_slice(b"A local note.\n");
             fs::write(&edited, bytes).unwrap();
-            if slow {
-                fs::File::open(&edited)
-                    .unwrap()
-                    .set_modified(std::time::SystemTime::now())
-                    .unwrap();
-                std::thread::sleep(std::time::Duration::from_nanos(
-                    u64::try_from(super::super::super::RACY_GRANULARITY_NS).unwrap() + 100_000_000,
-                ));
+            let now = std::time::SystemTime::now();
+            match edit {
+                Edit::InWindow => {}
+                Edit::SlowRender => {
+                    fs::File::open(&edited).unwrap().set_modified(now).unwrap();
+                    std::thread::sleep(std::time::Duration::from_nanos(
+                        u64::try_from(super::super::super::RACY_GRANULARITY_NS).unwrap()
+                            + 100_000_000,
+                    ));
+                }
+                Edit::OldMtime => {
+                    fs::File::open(&edited)
+                        .unwrap()
+                        .set_modified(now - std::time::Duration::from_hours(1))
+                        .unwrap();
+                }
             }
         },
     );
@@ -565,7 +587,7 @@ fn an_edit_after_the_exchange_survives(rerun: Rerun, slow: bool) {
 /// Review of 2026-10-16 (mutation row for the re-dating path).
 #[test]
 fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
-    an_edit_after_the_exchange_survives(Rerun::Unchanged, false);
+    an_edit_after_the_exchange_survives(Rerun::Unchanged, Edit::InWindow);
 }
 
 /// C03: the same edit inside a render slower than the racy allowance. The
@@ -573,7 +595,15 @@ fn a_redated_print_never_vouches_for_an_edit_made_after_the_exchange() {
 /// trusted at once and the converge landed over it.
 #[test]
 fn an_edit_inside_a_slow_render_is_never_vouched_for() {
-    an_edit_after_the_exchange_survives(Rerun::Unchanged, true);
+    an_edit_after_the_exchange_survives(Rerun::Unchanged, Edit::SlowRender);
+}
+
+/// #292 review F1 (the reviewer's hand-off probe): the same edit with its
+/// mtime an hour back. Judged by mtime alone its print was trusted at once,
+/// and the converge landed over the edit (`seats-replaced=1`).
+#[test]
+fn an_edit_with_an_old_mtime_is_never_vouched_for() {
+    an_edit_after_the_exchange_survives(Rerun::Unchanged, Edit::OldMtime);
 }
 
 /// Re-review of 2026-10-16, finding 1: the keep path re-dated a racy
@@ -581,13 +611,13 @@ fn an_edit_inside_a_slow_render_is_never_vouched_for() {
 /// the block (a rerun that retires another target).
 #[test]
 fn a_kept_block_never_redates_a_racy_print_unchecked_on_a_retire() {
-    an_edit_after_the_exchange_survives(Rerun::Retire, false);
+    an_edit_after_the_exchange_survives(Rerun::Retire, Edit::InWindow);
 }
 
 /// Re-review of 2026-10-16, finding 1: the same through `--renew`.
 #[test]
 fn a_kept_block_never_redates_a_racy_print_unchecked_on_a_renew() {
-    an_edit_after_the_exchange_survives(Rerun::Renew, false);
+    an_edit_after_the_exchange_survives(Rerun::Renew, Edit::InWindow);
 }
 
 /// Mutation row (review of 2026-10-16): `--clear` of a created file that a

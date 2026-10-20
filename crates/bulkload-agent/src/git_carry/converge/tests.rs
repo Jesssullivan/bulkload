@@ -1248,3 +1248,142 @@ fn a_converge_dates_its_ledger_before_its_proof() {
         "the seat the converge wrote is trusted by its own ledger"
     );
 }
+
+/// #292 review F1 (the reviewer's linked-landing probe): a seat rewritten
+/// between the landing's write and its ledger with its mtime set an hour
+/// back (as `cp -p`, `rsync -t`, `tar x` or `touch -d` leave it) is never
+/// vouched for: its ctime says when it was written, and the trust check
+/// reads both stamps. Judged by mtime alone, the proof vouched for it.
+#[test]
+fn a_linked_landing_never_vouches_for_a_seat_rewritten_with_an_old_mtime() {
+    let (_dir, root, bundle) = one_file_capture();
+    let main = root.join("main");
+    super::super::restore_bundle(&bundle, &main, "neo").unwrap();
+    let linked = root.join("linked");
+    let seat = linked.join("f");
+    super::super::mid_pass::arm_at(
+        &root,
+        super::super::mid_pass::Stage::LandingWritten,
+        move || {
+            fs::write(&seat, b"two\n").unwrap();
+            let old = std::time::SystemTime::now() - std::time::Duration::from_hours(1);
+            fs::File::open(&seat).unwrap().set_modified(old).unwrap();
+        },
+    );
+    super::super::restore_linked(&bundle, &main, &linked, "neo").unwrap();
+    let ledger = ledger_at(&linked);
+    let git_dir = landed::worktree_git_dir(&linked).unwrap().unwrap();
+    let meta = Meta::read(&linked, "neo", &ledger.instance).unwrap();
+    let old = handoff::landed_sides(&linked, &git_dir, "neo", &meta).unwrap();
+    let common = landed::common_dir(&git_dir).unwrap();
+    assert_eq!(
+        prove(&linked, &common, &ledger, false, &old).err(),
+        Some(BulkloadRefusal::GitDestinationModified),
+        "the ledger vouched for a rewrite stamped an hour back"
+    );
+}
+
+/// #292 review F2: a converge whose proof refuses `GIT_DESTINATION_MODIFIED`
+/// records the seats it read equal (dated by its own instant, taken before
+/// its reads) beside the ledger, so while the refusal stands the next pass
+/// reads only the seat that differs, not every seat before it again. The
+/// ledger itself, whose instant the hand-off shows as "landed", is left as
+/// it is, and the edit is kept.
+#[test]
+fn a_refused_proof_records_what_it_proved_and_the_next_reads_only_the_rest() {
+    use crate::estate;
+    let dir = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(dir.path()).unwrap();
+    let source = root.join("src");
+    fs::create_dir(&source).unwrap();
+    git_run(&source, &["init", "--quiet", "--template=", "-b", "main"]);
+    for name in ["a.txt", "m.txt", "z.txt"] {
+        fs::write(source.join(name), format!("{name}\n")).unwrap();
+    }
+    git_run(&source, &["add", "-A"]);
+    git_run(&source, &["commit", "--quiet", "-m", "c0"]);
+    let target = root.join("dst");
+    let (plan, corpus, state) = (root.join("plan"), root.join("corpus"), root.join("state"));
+    estate::add(&plan, &source, &target, Some(&target)).unwrap();
+    let capture = || {
+        estate::capture(&plan, &root.join("private"), &corpus, 1, &|_| Ok(())).unwrap();
+    };
+    let apply = || {
+        let rows = std::sync::Mutex::new(Vec::new());
+        let _ = estate::apply(&plan, &corpus, &state, "neo", 1, &|row| {
+            rows.lock()
+                .unwrap()
+                .push(row.reason.clone().unwrap_or_default());
+            Ok(())
+        });
+        rows.into_inner().unwrap()
+    };
+    slow_pass();
+    capture();
+    apply();
+    let landed = ledger_at(&target);
+    // Past the landing's racy window; then an edit at the destination, and
+    // a source change for the converge to bring.
+    slow_pass();
+    fs::write(target.join("z.txt"), b"edited at the destination\n").unwrap();
+    fs::write(source.join("m.txt"), b"m.txt, second\n").unwrap();
+    git_run(&source, &["commit", "--quiet", "-am", "c1"]);
+    slow_pass();
+    capture();
+    let refused = |rows: &[String]| {
+        rows.iter()
+            .any(|reason| reason.contains("GIT_DESTINATION_MODIFIED"))
+    };
+    let rows = apply();
+    assert!(refused(&rows), "{rows:?}");
+    let git_dir = landed::worktree_git_dir(&target).unwrap().unwrap();
+    let directory = landed::ledger_dir(&git_dir, "neo");
+    assert_eq!(ledger_at(&target), landed, "the ledger moved");
+    let proven: WorkspaceProven = landed::read(&directory.join(landed::WORKSPACE_PROVEN))
+        .unwrap()
+        .expect("no record of what the refused proof proved");
+    assert_eq!(
+        proven
+            .seats
+            .iter()
+            .map(|seat| seat.path.as_slice())
+            .collect::<Vec<_>>(),
+        vec![b"a.txt".as_slice(), b"m.txt".as_slice()]
+    );
+    assert!(proven.recorded_ns > landed.recorded_ns);
+    assert!(proven.extends(&landed, landed::fsid(&target).unwrap()));
+    // The next proof reads only what it must: the two seats the record
+    // holds are vouched for by it, and it refuses on the edit again.
+    let meta = Meta::read(&target, "neo", &landed.instance).unwrap();
+    let old = handoff::landed_sides(&target, &git_dir, "neo", &meta).unwrap();
+    let mut vouched = BTreeMap::new();
+    assert_eq!(
+        prove_with(
+            &target,
+            &git_dir,
+            (&landed, Some(&proven)),
+            true,
+            &old,
+            (super::super::pass_start_ns(), &mut vouched),
+        )
+        .err(),
+        Some(BulkloadRefusal::GitDestinationModified)
+    );
+    let how: Vec<(&[u8], Vouched)> = vouched
+        .iter()
+        .map(|(path, (_, how))| (path.as_slice(), *how))
+        .collect();
+    assert_eq!(
+        how,
+        vec![
+            (b"a.txt".as_slice(), Vouched::Earlier),
+            (b"m.txt".as_slice(), Vouched::Earlier),
+        ]
+    );
+    // The refusal stands through the apply, and the edit is kept.
+    assert!(refused(&apply()));
+    assert_eq!(
+        fs::read(target.join("z.txt")).unwrap(),
+        b"edited at the destination\n"
+    );
+}

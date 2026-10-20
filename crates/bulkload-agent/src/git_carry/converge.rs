@@ -43,6 +43,7 @@ use bulkload_proto::FileKind;
 use super::batch_objects::BatchObjects;
 use super::landed::{
     self, Head, Kind, LandedRef, LandedWorkspace, RefLedger, SeatPrint, WorkspaceIntent,
+    WorkspaceProven,
 };
 use super::native_refs::{self, Custody};
 use super::{git, oid, output, safe_destination, text};
@@ -1276,6 +1277,19 @@ struct Proof {
     started_ns: i128,
 }
 
+/// How a proof vouched for one seat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Vouched {
+    /// By the ledger's own print.
+    Ledger,
+    /// By a hand-off record's print of the seat.
+    Handoff,
+    /// By a [`WorkspaceProven`] an earlier refused proof wrote.
+    Earlier,
+    /// By reading its bytes.
+    Content,
+}
+
 /// Prove the landed checkout at `worktree` unchanged since `ledger` (design
 /// 4.2, amended). Read-only; `GIT_DESTINATION_MODIFIED` on any failure.
 fn prove(
@@ -1285,7 +1299,30 @@ fn prove(
     standalone: bool,
     old: &BTreeMap<Vec<u8>, Side>,
 ) -> Result<Proof> {
-    let started_ns = super::pass_start_ns();
+    prove_with(
+        worktree,
+        common,
+        (ledger, None),
+        standalone,
+        old,
+        (super::pass_start_ns(), &mut BTreeMap::new()),
+    )
+}
+
+/// [`prove`], with `earlier` (a [`WorkspaceProven`] that extends `ledger`)
+/// vouching for the seats it holds as the ledger's prints do. `started_ns`
+/// is the proof's racy instant, taken by the caller before this first
+/// read; `vouched` gains how each regular or symlink seat was vouched for
+/// up to the refusal, if any, so a refused pass can record what it proved
+/// (#292 review F2).
+fn prove_with(
+    worktree: &Path,
+    common: &Path,
+    (ledger, earlier): (&LandedWorkspace, Option<&WorkspaceProven>),
+    standalone: bool,
+    old: &BTreeMap<Vec<u8>, Side>,
+    (started_ns, vouched): (i128, &mut BTreeMap<Vec<u8>, (SeatPrint, Vouched)>),
+) -> Result<Proof> {
     let modified = BulkloadRefusal::GitDestinationModified;
     if head_of(worktree)? != ledger.head || index_digest(worktree, None)? != ledger.index {
         return Err(modified);
@@ -1294,10 +1331,17 @@ fn prove(
     if standalone && exclude_digest(&read_exclude(common)?) != ledger.exclude {
         return Err(modified);
     }
-    let same_fs = landed::fsid(worktree)? == ledger.fsid;
+    let fsid = landed::fsid(worktree)?;
+    let same_fs = fsid == ledger.fsid;
     let racy_from = ledger
         .recorded_ns
         .saturating_sub(super::RACY_GRANULARITY_NS);
+    let earlier = earlier.filter(|earlier| earlier.extends(ledger, fsid));
+    let earlier_from = earlier.map_or(0, |earlier| {
+        earlier
+            .recorded_ns
+            .saturating_sub(super::RACY_GRANULARITY_NS)
+    });
     let mut prints = BTreeMap::new();
     let mut objects = BatchObjects::new(worktree)?;
     for seat in &ledger.seats {
@@ -1314,8 +1358,28 @@ fn prove(
             prints.insert(seat.path.clone(), now);
             continue;
         }
-        if same_fs && now.same(seat) && seat.mtime_ns < racy_from {
+        // Both stamps (#292 review F1): a rewrite that sets an old mtime
+        // (`cp -p`, `rsync -t`, `tar x`, `touch -d`) still moves the ctime.
+        if same_fs && now.same(seat) && seat.mtime_ns < racy_from && seat.ctime_ns < racy_from {
             prints.insert(seat.path.clone(), seat.clone());
+            vouched.insert(seat.path.clone(), (seat.clone(), Vouched::Ledger));
+            continue;
+        }
+        // What an earlier refused proof read equal, under its own instant.
+        if earlier
+            .and_then(|earlier| {
+                earlier
+                    .seats
+                    .binary_search_by(|print| print.path.cmp(&seat.path))
+                    .ok()
+                    .and_then(|index| earlier.seats.get(index))
+            })
+            .is_some_and(|print| {
+                now.same(print) && print.mtime_ns < earlier_from && print.ctime_ns < earlier_from
+            })
+        {
+            prints.insert(seat.path.clone(), now.clone());
+            vouched.insert(seat.path.clone(), (now, Vouched::Earlier));
             continue;
         }
         let side = old.get(&seat.path).ok_or_else(|| modified.clone())?;
@@ -1327,7 +1391,8 @@ fn prove(
             .iter()
             .any(|prefix| prefix.trusted.as_ref().is_some_and(|print| now.same(print)))
         {
-            prints.insert(seat.path.clone(), now);
+            prints.insert(seat.path.clone(), now.clone());
+            vouched.insert(seat.path.clone(), (now, Vouched::Handoff));
             continue;
         }
         // The content fallback: the landed bytes, under a print that held
@@ -1339,10 +1404,58 @@ fn prove(
         if settled.as_ref() != Some(&now) {
             return Err(modified);
         }
-        prints.insert(seat.path.clone(), now);
+        prints.insert(seat.path.clone(), now.clone());
+        vouched.insert(seat.path.clone(), (now, Vouched::Content));
     }
     objects.finish()?;
     Ok(Proof { prints, started_ns })
+}
+
+/// A converge's proof, recording what it proved when it refuses
+/// `GIT_DESTINATION_MODIFIED` (#292 review F2): the seats it read equal by
+/// content, or that an earlier such record vouched for, go into the
+/// [`WorkspaceProven`] beside the ledger, dated by this proof's instant, so
+/// the next pass reads only what it must while the refusal stands. The
+/// record is an optimisation: a failure to write it leaves the refusal as
+/// it is, and the next pass reads those seats again.
+fn prove_or_record(
+    place: &Place<'_>,
+    ledger: &LandedWorkspace,
+    old: &BTreeMap<Vec<u8>, Side>,
+) -> Result<Proof> {
+    let path = place.workspace_dir().join(landed::WORKSPACE_PROVEN);
+    // An unreadable record vouches for nothing.
+    let earlier = landed::read::<WorkspaceProven>(&path).ok().flatten();
+    let started_ns = super::pass_start_ns();
+    let mut vouched = BTreeMap::new();
+    let proved = prove_with(
+        place.worktree,
+        &place.common,
+        (ledger, earlier.as_ref()),
+        place.standalone,
+        old,
+        (started_ns, &mut vouched),
+    );
+    if matches!(proved, Err(BulkloadRefusal::GitDestinationModified)) {
+        let seats: Vec<SeatPrint> = vouched
+            .into_values()
+            .filter(|(_, how)| matches!(how, Vouched::Earlier | Vouched::Content))
+            .map(|(print, _)| print)
+            .collect();
+        if let (false, Ok(fsid)) = (seats.is_empty(), landed::fsid(place.worktree)) {
+            let _ = landed::write(
+                &path,
+                &WorkspaceProven {
+                    capture: ledger.capture,
+                    ledger_ns: ledger.recorded_ns,
+                    recorded_ns: started_ns,
+                    fsid,
+                    seats,
+                },
+            );
+        }
+    }
+    proved
 }
 
 /// Refuse a capture whose shape converge does not carry (A8): the shallow
@@ -2282,14 +2395,14 @@ pub fn apply_workspace(
     let old = handoff::landed_sides(workspace, &place.git_dir, place.source, &meta0)?;
     if ledger.capture == landing.capture {
         // A6 (finding 15a): the ledger is ahead of the journal; prove it.
-        prove(workspace, &place.common, &ledger, standalone, &old)?;
+        prove_or_record(&place, &ledger, &old)?;
         custody.count("journal-recovered");
         return Ok(Applied::of(converged, &custody));
     }
     if landing.observed_ns <= ledger.observed_ns {
         return Err(BulkloadRefusal::GitConvergeStaleCapture);
     }
-    let proof = prove(workspace, &place.common, &ledger, standalone, &old)?;
+    let proof = prove_or_record(&place, &ledger, &old)?;
     custody.merge(converge(
         &place,
         staged,
@@ -2531,6 +2644,8 @@ fn converge(
             &engine.written,
         )?;
         landed::write(&place.workspace_dir().join(landed::WORKSPACE_LANDED), &next)?;
+        // What a refused proof recorded is bound to the ledger just replaced.
+        landed::remove(&place.workspace_dir().join(landed::WORKSPACE_PROVEN))?;
         landed::remove(&intent_path)?;
         fault_point!(EstateConvergeAfterLanded);
         custody.merge(engine.custody);
@@ -2725,6 +2840,7 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
         &engine.written,
     )?;
     landed::write(&place.workspace_dir().join(landed::WORKSPACE_LANDED), &next)?;
+    landed::remove(&place.workspace_dir().join(landed::WORKSPACE_PROVEN))?;
     landed::remove(&intent_path)?;
     custody.merge(engine.custody);
     custody.count("workspace-intent-settled");

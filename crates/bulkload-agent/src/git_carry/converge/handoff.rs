@@ -335,7 +335,9 @@ pub(super) fn landed_sides(
                     trusted: file
                         .print
                         .clone()
-                        .filter(|print| same_fs && print.mtime_ns < racy_from),
+                        .filter(|print| {
+                            same_fs && print.mtime_ns < racy_from && print.ctime_ns < racy_from
+                        }),
                     strip: 0,
                 },
                 file.base.as_ref(),
@@ -713,8 +715,9 @@ fn unrecorded(head: &[u8], ours: &str, landed: &mut dyn FnMut() -> Result<bool>)
 }
 
 /// Whether `record`'s print of `file` vouches for its bytes now: the same
-/// file system, the same print, and stamped before the racy window of the
-/// record's `recorded_ns` (as `prove` trusts the workspace ledger's print).
+/// file system, the same print, and both its stamps (mtime and ctime; #292
+/// review F1) before the racy window of the record's `recorded_ns` (as
+/// `prove` trusts the workspace ledger's print).
 fn trusted(record: &HandoffLanded, file: &HandoffFile, now: Option<&SeatPrint>, fsid: u64) -> bool {
     let racy_from = record
         .recorded_ns
@@ -723,7 +726,9 @@ fn trusted(record: &HandoffLanded, file: &HandoffFile, now: Option<&SeatPrint>, 
         && file
             .print
             .as_ref()
-            .is_some_and(|print| now == Some(print) && print.mtime_ns < racy_from)
+            .is_some_and(|print| {
+                now == Some(print) && print.mtime_ns < racy_from && print.ctime_ns < racy_from
+            })
 }
 
 /// The bytes of the block at byte 0 of `bytes`: a well-formed block's, or,
@@ -2423,7 +2428,9 @@ fn render_workspace(
                     || file
                         .print
                         .as_ref()
-                        .is_none_or(|print| print.mtime_ns >= racy_from)
+                        .is_none_or(|print| {
+                            print.mtime_ns >= racy_from || print.ctime_ns >= racy_from
+                        })
                 {
                     continue;
                 }
