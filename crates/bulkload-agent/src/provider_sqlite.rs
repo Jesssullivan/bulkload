@@ -2334,37 +2334,111 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A one-byte OFD lock on `file` at `offset` (`kind` is `F_WRLCK` or
-    /// `F_RDLCK`), without blocking. OFD locks conflict with `SQLite`'s
-    /// POSIX locks even inside this process.
+    /// Names the `-shm` a [`wal_index_lock_holder_child`] locks; unset, the
+    /// child is a no-op.
     #[cfg(target_os = "linux")]
+    const WAL_INDEX_HOLDER: &str = "BULKLOAD_WAL_INDEX_HOLDER";
+
+    /// The lock holder of [`an_extended_busy_step_is_waited_out_on_a_new_backup_object`]:
+    /// this test binary re-run alone, taking POSIX locks on the `-shm`
+    /// [`WAL_INDEX_HOLDER`] names (a shared lock on the DMS byte, 128, and
+    /// exclusive ones on the WRITE and RECOVER bytes, 120 and 122), saying
+    /// `wal-index-locked`, and holding them until its stdin closes. A
+    /// process's POSIX locks are never copied into a child it forks, and
+    /// they are gone once it has exited.
+    #[cfg(target_os = "linux")]
+    #[test]
     #[allow(clippy::unwrap_used)]
-    fn ofd_lock_byte(file: &fs::File, offset: i64, kind: libc::c_int) {
+    fn wal_index_lock_holder_child() {
+        use std::io::{BufRead as _, Write as _};
         use std::os::fd::AsRawFd as _;
-        // SAFETY: an all-zero `flock` is a valid value of the plain C struct.
-        let mut lock: libc::flock = unsafe { std::mem::zeroed() };
-        lock.l_type = libc::c_short::try_from(kind).unwrap();
-        lock.l_whence = libc::c_short::try_from(libc::SEEK_SET).unwrap();
-        lock.l_start = offset;
-        lock.l_len = 1;
-        // SAFETY: the descriptor is live and `lock` outlives the call; OFD
-        // locks require `l_pid` 0, which `zeroed` set.
-        let held = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_OFD_SETLK, &raw mut lock) };
-        assert_eq!(held, 0, "F_OFD_SETLK: {}", std::io::Error::last_os_error());
+        let Some(path) = std::env::var_os(WAL_INDEX_HOLDER) else {
+            return;
+        };
+        let shm = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        for (offset, kind) in [
+            (128, libc::F_RDLCK),
+            (120, libc::F_WRLCK),
+            (122, libc::F_WRLCK),
+        ] {
+            // SAFETY: an all-zero `flock` is a valid value of the plain C
+            // struct.
+            let mut lock: libc::flock = unsafe { std::mem::zeroed() };
+            lock.l_type = libc::c_short::try_from(kind).unwrap();
+            lock.l_whence = libc::c_short::try_from(libc::SEEK_SET).unwrap();
+            lock.l_start = offset;
+            lock.l_len = 1;
+            // SAFETY: the descriptor is live and `lock` outlives the call.
+            let held = unsafe { libc::fcntl(shm.as_raw_fd(), libc::F_SETLK, &raw mut lock) };
+            assert_eq!(held, 0, "F_SETLK: {}", std::io::Error::last_os_error());
+        }
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "wal-index-locked").unwrap();
+        stdout.flush().unwrap();
+        let _ = std::io::stdin().lock().lines().count();
+    }
+
+    /// A [`wal_index_lock_holder_child`] holding the locks of `shm`'s
+    /// wal-index, which is first written as one zeroed 32 KiB page (mapped,
+    /// its header invalid). Released by [`WalIndexHolder::release`], which
+    /// waits for the child to exit, so the locks are gone when it returns.
+    ///
+    /// Not this process's own OFD locks, as before: a child that any test
+    /// forks meanwhile holds a copy of the locked descriptor until it execs,
+    /// and the locks with it, so closing ours did not release them under a
+    /// loaded run (the #278 gate on honey, 2026-10-20).
+    #[cfg(target_os = "linux")]
+    struct WalIndexHolder(std::process::Child);
+
+    #[cfg(target_os = "linux")]
+    impl WalIndexHolder {
+        #[allow(clippy::unwrap_used, clippy::panic)]
+        fn lock(shm: &Path) -> Self {
+            use std::io::BufRead as _;
+            fs::write(shm, vec![0_u8; 32 * 1024]).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "provider_sqlite::tests::wal_index_lock_holder_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(WAL_INDEX_HOLDER, shm)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdout = child.stdout.take().unwrap();
+            let locked = std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(std::result::Result::ok)
+                .any(|line| line.contains("wal-index-locked"));
+            assert!(locked, "the holder took its locks");
+            Self(child)
+        }
+
+        #[allow(clippy::unwrap_used)]
+        fn release(mut self) {
+            drop(self.0.stdin.take());
+            self.0.wait().unwrap();
+        }
     }
 
     /// The review's finding B, against the bundled `SQLite` itself. A reader
     /// that finds the wal-index mapped but its header invalid must recover
-    /// it; while another holder has the wal-index's WRITE (byte 120) and
-    /// RECOVER (byte 122) locks, its step fails `SQLITE_BUSY_RECOVERY`
-    /// (261). (The holder keeps a shared lock on the DMS byte, 128, so the
-    /// reader does not take the wal-index as stale and truncate it, and the
-    /// `-shm` is one zeroed 32 KiB page, so it maps.) `SQLite` keeps that
-    /// result on the backup object: the same object returns 261 again after
-    /// the locks are gone, and only a new one goes on. A carry backup (its
-    /// held snapshot set aside, so its steps take the locks) therefore waits
-    /// the busy out on new backup objects and finishes once the locks go,
-    /// long before its wall.
+    /// it; while another process holds the wal-index's WRITE and RECOVER
+    /// locks ([`WalIndexHolder`]), its step fails `SQLITE_BUSY_RECOVERY`
+    /// (261). `SQLite` keeps that result on the backup object: the same
+    /// object returns 261 again after the locks are gone, and only a new one
+    /// goes on, on the same connection (no new connection is needed). A
+    /// carry backup (its held snapshot set aside, so its steps take the
+    /// locks) therefore waits the busy out on new backup objects and
+    /// finishes once the locks go, long before its wall.
     #[cfg(target_os = "linux")]
     #[test]
     #[allow(clippy::unwrap_used, clippy::panic)]
@@ -2373,26 +2447,14 @@ mod tests {
         let dir = carry_fixture("busy-recovery");
         let (database, writer) = wal_store(&dir, 200);
         writer.close().map_err(|(_, error)| error).unwrap();
-        assert!(!sidecar(&database, "-shm").exists(), "closed clean");
-        let lock_wal_index = || {
-            let path = sidecar(&database, "-shm");
-            fs::write(&path, vec![0_u8; 32 * 1024]).unwrap();
-            let shm = OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap();
-            ofd_lock_byte(&shm, 128, libc::F_RDLCK);
-            ofd_lock_byte(&shm, 120, libc::F_WRLCK);
-            ofd_lock_byte(&shm, 122, libc::F_WRLCK);
-            shm
-        };
+        let shm = sidecar(&database, "-shm");
+        assert!(!shm.exists(), "closed clean");
         let extended = |result: rusqlite::Result<StepResult>| match result {
             Err(rusqlite::Error::SqliteFailure(failure, _)) => failure.extended_code,
             other => panic!("not an extended failure: {other:?}"),
         };
         // What SQLite does.
-        let held = lock_wal_index();
+        let held = WalIndexHolder::lock(&shm);
         let source =
             Connection::open_with_flags(&database, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         source.busy_timeout(Duration::ZERO).unwrap();
@@ -2400,7 +2462,7 @@ mod tests {
         {
             let backup = Backup::new(&source, &mut probe).unwrap();
             assert_eq!(extended(backup.step(5)), 261, "SQLITE_BUSY_RECOVERY");
-            drop(held);
+            held.release();
             assert_eq!(
                 extended(backup.step(5)),
                 261,
@@ -2408,17 +2470,18 @@ mod tests {
             );
         }
         let fresh = Backup::new(&source, &mut probe).unwrap();
+        let next = fresh.step(-1);
         assert!(
-            matches!(fresh.step(-1), Ok(StepResult::Done)),
-            "a new one goes on"
+            matches!(next, Ok(StepResult::Done)),
+            "a new one goes on, on the same connection: {next:?}"
         );
         drop(fresh);
         drop(source);
         // A carry backup waits it out on new objects, and finishes.
-        let held = lock_wal_index();
+        let held = WalIndexHolder::lock(&shm);
         let release = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
-            drop(held);
+            held.release();
         });
         set_carry_seams(true, None, None);
         let before = counters::Counters::snapshot();
