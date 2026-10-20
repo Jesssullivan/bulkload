@@ -892,6 +892,37 @@ fn a_missing_lender_refuses_naming_its_alternates_file() {
     );
 }
 
+/// A deferred capture's reason: its one drift row, then, as #293 names it,
+/// the refusal the rewrite absorbed and how many pack entries moved
+/// (`rewrite_cause=<code>`, `rewrite_stderr_class=<class>` for a failed
+/// child, `rewrite_changed=<n>`, n > 0). Which child a lender's prune breaks
+/// first depends on the platform's Git (Darwin's reads a bad object where
+/// Linux's may not), so the words are checked for their shape, not a cause.
+fn deferred_reason(reason: &str) -> bool {
+    let changed = |word: &str| {
+        word.strip_prefix("rewrite_changed=")
+            .and_then(|count| count.parse::<usize>().ok())
+            .is_some_and(|count| count > 0)
+    };
+    let class = |word: &str| {
+        word.strip_prefix("rewrite_stderr_class=")
+            .is_some_and(|class| {
+                !class.is_empty()
+                    && class
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+            })
+    };
+    match reason.split(' ').collect::<Vec<_>>().as_slice() {
+        ["drift=1"] => true,
+        ["drift=1", "rewrite_cause=GIT_INVENTORY_MALFORMED", count] => changed(count),
+        ["drift=1", "rewrite_cause=GIT_CHILD_FAILED", stderr, count] => {
+            class(stderr) && changed(count)
+        }
+        _ => false,
+    }
+}
+
 // #219 (S5): with alternates followed, a lender's `gc` under the pass is a
 // rewrite of what the capture reads. A `clone --shared` whose lender drops
 // and prunes an object the source still names makes the export's child fail
@@ -937,10 +968,11 @@ fn a_lender_rewrite_under_the_pass_is_drift_custody() {
     let state = root.join("state");
     let (ok, rows) = capture_rows(&plan, &state, &corpus);
     assert!(ok, "{rows:?}");
-    assert_eq!(
-        rows,
-        vec![("deferred-with-drift", Some("drift=1".to_owned()))]
-    );
+    let [(outcome, Some(reason))] = rows.as_slice() else {
+        panic!("{rows:?}");
+    };
+    assert_eq!(*outcome, "deferred-with-drift");
+    assert!(deferred_reason(reason), "{reason}");
     let item = id(inspect(&plan).unwrap().first().unwrap()).unwrap();
     assert!(!corpus.join(format!("{item}.capture")).exists());
     git_out(&source, &["update-ref", "-d", "refs/heads/doomed"]);

@@ -293,7 +293,9 @@ fn captured(source: &Path, capture: &Path, prior: Option<(&Export, bool)>) -> Ex
             assert!(export.drift.is_empty(), "{:?}", export.drift);
             *export
         }
-        Exported::ObjectStoreRewritten(drift) => panic!("{drift:?}"),
+        // p34 under load (2026-10-19): the failing child and the moved
+        // entries, so the panic says what rewrote the store.
+        Exported::ObjectStoreRewritten { drift, rewrite } => panic!("{drift:?} {rewrite:?}"),
     }
 }
 
@@ -864,5 +866,98 @@ fn s4_a_bare_capture_never_lays_down_a_workspace() {
             "{name}"
         );
     }
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// p34 under load (2026-10-19): the rewrite branch compared two listings
+/// and kept nothing of either. It now names every entry that moved, as each
+/// listing found it, store by store; an entry the first listing saw vanish
+/// between `readdir` and its stat is a change too (a `git gc` under way as
+/// the pass began), whatever the second listing says (review F4).
+#[test]
+fn the_rewrite_names_every_pack_entry_that_moved() {
+    use super::PackState::{Absent, Present, Vanished};
+    use std::collections::BTreeMap;
+    let store = PathBuf::from("/s");
+    let listing = |rows: &[(&str, super::PackState)]| {
+        vec![(
+            store.clone(),
+            rows.iter()
+                .map(|(name, state)| (name.as_bytes().to_vec(), *state))
+                .collect::<BTreeMap<_, _>>(),
+        )]
+    };
+    let at = |ino, size| Present { ino, size };
+    let before = listing(&[
+        ("kept.pack", at(1, 10)),
+        ("gone.pack", at(2, 20)),
+        ("moved.pack", at(3, 30)),
+        ("racing.pack", Vanished),
+    ]);
+    let after = listing(&[
+        ("kept.pack", at(1, 10)),
+        ("moved.pack", at(4, 30)),
+        ("new.pack", at(5, 50)),
+    ]);
+    let change = |name: &str, before, after| super::PackChange {
+        store: store.clone(),
+        name: name.as_bytes().to_vec(),
+        before,
+        after,
+    };
+    assert_eq!(
+        super::pack_changes(&before, &after),
+        vec![
+            change("gone.pack", at(2, 20), Absent),
+            change("moved.pack", at(3, 30), at(4, 30)),
+            change("new.pack", Absent, at(5, 50)),
+            change("racing.pack", Vanished, Absent),
+        ]
+    );
+    let settled = listing(&[("kept.pack", at(1, 10))]);
+    assert!(super::pack_changes(&settled, &settled).is_empty());
+    // Seen vanishing by the first listing: a change even when the second
+    // finds it vanishing too.
+    let racing = listing(&[("racing.pack", Vanished)]);
+    assert_eq!(
+        super::pack_changes(&racing, &racing),
+        vec![change("racing.pack", Vanished, Vanished)]
+    );
+}
+
+/// p34 under load (2026-10-19), review F3: an entry the listing cannot
+/// stat for any reason but its removal used to be recorded as absent, so a
+/// transient stat failure after a Git child's failure read as a rewrite and
+/// turned that failure into drift custody. It refuses
+/// `GIT_PACK_LISTING_UNREADABLE` with its errno, a typed code a review can
+/// close; only a removed entry is a change.
+#[test]
+fn a_pack_entry_that_cannot_be_stated_refuses_typed_and_never_reads_as_a_rewrite() {
+    use std::os::unix::fs::PermissionsExt as _;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        // Root stats through a directory it cannot search.
+        return;
+    }
+    let root = fresh("unstatable");
+    let pack = root.join("objects/pack");
+    fs::create_dir_all(&pack).unwrap();
+    fs::write(pack.join("pack-a.pack"), b"pack").unwrap();
+    let stores = vec![root.join("objects")];
+    assert_eq!(super::pack_listing(&stores).unwrap()[0].1.len(), 1);
+    // Readable, not searchable: the listing reads the name, the stat fails.
+    fs::set_permissions(&pack, fs::Permissions::from_mode(0o400)).unwrap();
+    let listed = super::pack_listing(&stores);
+    fs::set_permissions(&pack, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        listed,
+        Err(BulkloadRefusal::GitPackListingUnreadable(Some(
+            libc::EACCES
+        )))
+    );
+    assert_eq!(
+        listed.unwrap_err().to_string(),
+        format!("GIT_PACK_LISTING_UNREADABLE (errno {})", libc::EACCES)
+    );
     fs::remove_dir_all(root).unwrap();
 }

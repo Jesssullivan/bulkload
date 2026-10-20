@@ -1765,7 +1765,7 @@ pub fn export_repository_with_drift(
 ) -> Result<Export> {
     match export_repository_inner(repo, capture, options)? {
         Exported::Captured(export) => Ok(*export),
-        Exported::ObjectStoreRewritten(_) => Err(BulkloadRefusal::GitAuthorityChanged),
+        Exported::ObjectStoreRewritten { .. } => Err(BulkloadRefusal::GitAuthorityChanged),
     }
 }
 
@@ -1779,7 +1779,104 @@ pub enum Exported {
     /// failure is the rewrite, not the repository. Drift custody with one
     /// [`DriftKind::ObjectStoreRewritten`] row; the next pass captures the
     /// rewritten store. Never a refusal (S5, R-N30).
-    ObjectStoreRewritten(CaptureDrift),
+    ObjectStoreRewritten {
+        /// The one `ObjectStoreRewritten` row.
+        drift: CaptureDrift,
+        /// The child's refusal the rewrite absorbed, and what moved: kept,
+        /// so a receipt or a test names them (p34, 2026-10-19), never dropped.
+        rewrite: StoreRewrite,
+    },
+}
+
+/// The object-store rewrite an [`Exported::ObjectStoreRewritten`] met.
+///
+/// The refusal of the Git child that failed (`GIT_CHILD_FAILED` with its
+/// stderr class, or `GIT_INVENTORY_MALFORMED`), and every `pack` entry
+/// that moved between the listing read before the pass and the one read
+/// after the failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRewrite {
+    pub cause: BulkloadRefusal,
+    pub changed: Vec<PackChange>,
+}
+
+impl StoreRewrite {
+    /// The receipt's words: `rewrite_cause=<code>`, then
+    /// `rewrite_stderr_class=<class>` for a failed child, then
+    /// `rewrite_changed=<n>`.
+    #[must_use]
+    pub fn words(&self) -> String {
+        let class = match self.cause {
+            BulkloadRefusal::GitChildFailed(class) => {
+                format!(" rewrite_stderr_class={}", class.code())
+            }
+            _ => String::new(),
+        };
+        format!(
+            "rewrite_cause={}{class} rewrite_changed={}",
+            self.cause.code(),
+            self.changed.len()
+        )
+    }
+}
+
+/// One `pack` entry as a listing found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackState {
+    /// Not listed.
+    Absent,
+    /// Listed by `readdir` and gone before its stat: a rewrite under way.
+    Vanished,
+    /// Listed and stated.
+    Present {
+        /// Its inode.
+        ino: u64,
+        /// Its size.
+        size: u64,
+    },
+}
+
+/// One entry of a store's `pack` directory that appeared, vanished or was
+/// replaced (another inode or size) across a pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackChange {
+    /// The store, as [`alternates_walk`] names it.
+    pub store: PathBuf,
+    /// The entry's name in `pack`.
+    pub name: Vec<u8>,
+    /// As the listing before the pass found it.
+    pub before: PackState,
+    /// As the listing after the failure found it.
+    pub after: PackState,
+}
+
+/// Every store's `pack` entries by name, each [`PackState::Present`] or
+/// [`PackState::Vanished`], as [`pack_listing`] reads them.
+type PackListing = Vec<(PathBuf, std::collections::BTreeMap<Vec<u8>, PackState>)>;
+
+/// The entries that differ between two listings of the same stores. An
+/// entry the first listing saw vanish is a change whatever the second says:
+/// a rewrite was under way when the pass began (p34 review, F4).
+fn pack_changes(before: &PackListing, after: &PackListing) -> Vec<PackChange> {
+    let mut changed = Vec::new();
+    for ((store, old), (_, new)) in before.iter().zip(after) {
+        let names: std::collections::BTreeSet<&Vec<u8>> = old.keys().chain(new.keys()).collect();
+        for name in names {
+            let state = |listing: &std::collections::BTreeMap<Vec<u8>, PackState>| {
+                listing.get(name).copied().unwrap_or(PackState::Absent)
+            };
+            let (was, now) = (state(old), state(new));
+            if was != now || was == PackState::Vanished {
+                changed.push(PackChange {
+                    store: store.clone(),
+                    name: name.clone(),
+                    before: was,
+                    after: now,
+                });
+            }
+        }
+    }
+    changed
 }
 
 /// The estate capture's export: [`export_repository_with_drift`], plus
@@ -1807,48 +1904,48 @@ fn refusing_drift(export: Exported) -> Result<Export> {
     }
 }
 
-/// The identity of the source's pack listings: every entry of each store's
-/// `pack` directory by name, inode and size, hashed in name order, store by
-/// store. `stores` are the source's own and every store it borrows
-/// ([`alternates_walk`]; S4, #219): a `gc`, `repack` or `prune --expire` in
-/// a lender rewrites what the capture reads as surely as one in the source.
-/// A rewrite writes or removes packs, so it changes this; reading through a
-/// store never does. A missing pack directory is the empty listing.
-fn pack_listing(stores: &[PathBuf]) -> Result<[u8; 32]> {
+/// The source's pack listings: every entry of each store's `pack`
+/// directory by name, inode and size, store by store. `stores` are the
+/// source's own and every store it borrows ([`alternates_walk`]; S4, #219):
+/// a `gc`, `repack` or `prune --expire` in a lender rewrites what the
+/// capture reads as surely as one in the source. A rewrite writes or
+/// removes packs, so it changes this; reading through a store never does.
+/// A missing pack directory is the empty listing, and an entry removed
+/// between the listing and its stat is [`PackState::Vanished`]: the
+/// rewrite itself. Any other failure to read a listing refuses
+/// `GIT_PACK_LISTING_UNREADABLE` with its errno (p34 review, 2026-10-20):
+/// it is not a rewrite and must not pass for one, and a review can close it.
+fn pack_listing(stores: &[PathBuf]) -> Result<PackListing> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
-    let mut hash = blake3::Hasher::new();
+    let unreadable =
+        |error: &std::io::Error| BulkloadRefusal::GitPackListingUnreadable(error.raw_os_error());
+    let mut listing = Vec::with_capacity(stores.len());
     for store in stores {
-        let mut entries = Vec::new();
+        let mut entries = std::collections::BTreeMap::new();
         match fs::read_dir(store.join("pack")) {
-            Ok(listing) => {
-                for entry in listing {
-                    let entry = entry.refuse_at("git_carry::pack_listing")?;
-                    // A pack removed between the listing and its stat is the
-                    // rewrite itself; record it as absent.
-                    let (ino, size) = entry
-                        .metadata()
-                        .map_or((0, u64::MAX), |meta| (meta.ino(), meta.size()));
-                    entries.push((entry.file_name().as_bytes().to_vec(), ino, size));
+            Ok(read) => {
+                for entry in read {
+                    let entry = entry.map_err(|error| unreadable(&error))?;
+                    let state = match entry.metadata() {
+                        Ok(meta) => PackState::Present {
+                            ino: meta.ino(),
+                            size: meta.size(),
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            PackState::Vanished
+                        }
+                        Err(error) => return Err(unreadable(&error)),
+                    };
+                    entries.insert(entry.file_name().as_bytes().to_vec(), state);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(crate::refuse::io(&error, "git_carry::pack_listing")),
+            Err(error) => return Err(unreadable(&error)),
         }
-        entries.sort_unstable();
-        framed(&mut hash, store.as_os_str().as_bytes())?;
-        hash.update(
-            &u64::try_from(entries.len())
-                .unwrap_or(u64::MAX)
-                .to_le_bytes(),
-        );
-        for (name, ino, size) in &entries {
-            framed(&mut hash, name)?;
-            hash.update(&ino.to_le_bytes());
-            hash.update(&size.to_le_bytes());
-        }
+        listing.push((store.clone(), entries));
     }
-    Ok(*hash.finalize().as_bytes())
+    Ok(listing)
 }
 
 fn export_repository_inner(
@@ -1884,16 +1981,28 @@ fn export_repository_inner(
     let stores = alternates_walk(&repo)?.stores;
     let packs = pack_listing(&stores)?;
     match export_pass(&repo, &capture, &common, options) {
-        Err(BulkloadRefusal::GitInventoryMalformed | BulkloadRefusal::GitChildFailed(_))
-            if pack_listing(&stores)? != packs =>
-        {
+        Err(
+            cause @ (BulkloadRefusal::GitInventoryMalformed | BulkloadRefusal::GitChildFailed(_)),
+        ) => {
+            // The child's refusal stands when the second listing cannot be
+            // read: that failure is the listing's, never the child's.
+            let Ok(after) = pack_listing(&stores) else {
+                return Err(cause);
+            };
+            let changed = pack_changes(&packs, &after);
+            if changed.is_empty() {
+                return Err(cause);
+            }
             let mut drift = CaptureDrift::default();
             drift.extend([DriftRow::seat(
                 DriftKind::ObjectStoreRewritten,
                 b"objects/pack",
             )]);
             drift.seal()?;
-            Ok(Exported::ObjectStoreRewritten(drift))
+            Ok(Exported::ObjectStoreRewritten {
+                drift,
+                rewrite: StoreRewrite { cause, changed },
+            })
         }
         exported => exported.map(|export| Exported::Captured(Box::new(export))),
     }

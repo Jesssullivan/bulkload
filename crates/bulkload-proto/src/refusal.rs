@@ -51,6 +51,14 @@ pub enum BulkloadRefusal {
     /// when its `--file` session is offered anything but one regular or
     /// symlink row.
     SourceRootKindMismatch,
+    /// The source's pack listing could not be read (p34 review, 2026-10-20):
+    /// a `pack` directory of its object store, or of a store it borrows,
+    /// that could not be opened or read, or an entry in it that could not
+    /// be stated for any reason but its removal. The listing is how a
+    /// capture tells an object-store rewrite from a failed Git child, so
+    /// it is never guessed. Carries the OS errno when known. Was a bare
+    /// `IO`, which no review can close.
+    GitPackListingUnreadable(Option<i32>),
     /// A capture recorded drift under its pass, so it does not hold every
     /// seat's bytes; apply refuses it until a later pass extends it clean.
     CaptureDrifted,
@@ -568,6 +576,7 @@ impl BulkloadRefusal {
             Self::SourceRootMissing => "SOURCE_ROOT_MISSING",
             Self::SourceRootUnreadable(_) => "SOURCE_ROOT_UNREADABLE",
             Self::SourceRootKindMismatch => "SOURCE_ROOT_KIND_MISMATCH",
+            Self::GitPackListingUnreadable(_) => "GIT_PACK_LISTING_UNREADABLE",
             Self::CaptureDrifted => "CAPTURE_DRIFTED",
             Self::CaptureAbsent => "CAPTURE_ABSENT",
             Self::DigestMismatch => "DIGEST_MISMATCH",
@@ -641,6 +650,20 @@ impl BulkloadRefusal {
             Self::WorkerLost => "WORKER_LOST",
             Self::TransportLost => "TRANSPORT_LOST",
             Self::MoveStateBusy(_) => "MOVE_STATE_BUSY",
+            Self::ProbeFailed => "PROBE_FAILED",
+            Self::Io(_) => "IO",
+            // The reseat family has a table of its own.
+            _ => self.reseat_code(),
+        }
+    }
+
+    /// [`Self::code`] of a reseat refusal (`RESEAT_*`, the `reseat` verb's
+    /// family): the arms `code` leaves to this table. Any other refusal has
+    /// its arm in `code` and none here, so it reads as the empty string, a
+    /// code the code-table test (`codes_are_unique_and_well_formed`)
+    /// refuses for every refusal it lists.
+    const fn reseat_code(&self) -> &'static str {
+        match *self {
             Self::ReseatDestDiverged => "RESEAT_DEST_DIVERGED",
             Self::ReseatDestContinued => "RESEAT_DEST_CONTINUED",
             Self::ReseatSourceRewritten => "RESEAT_SOURCE_REWRITTEN",
@@ -658,8 +681,7 @@ impl BulkloadRefusal {
             Self::ReseatRegularizeRaced => "RESEAT_REGULARIZE_RACED",
             Self::ReseatUndoTargetChanged => "RESEAT_UNDO_TARGET_CHANGED",
             Self::ReseatR0Failed => "RESEAT_R0_FAILED",
-            Self::ProbeFailed => "PROBE_FAILED",
-            Self::Io(_) => "IO",
+            _ => "",
         }
     }
 }
@@ -675,6 +697,7 @@ impl BulkloadRefusal {
         "SOURCE_ROOT_MISSING",
         "SOURCE_ROOT_UNREADABLE",
         "SOURCE_ROOT_KIND_MISMATCH",
+        "GIT_PACK_LISTING_UNREADABLE",
         "CAPTURE_DRIFTED",
         "CAPTURE_ABSENT",
         "DIGEST_MISMATCH",
@@ -780,7 +803,8 @@ impl fmt::Display for BulkloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Io(Some(errno)) => write!(f, "IO (errno {errno})"),
-            Self::SourceRootUnreadable(Some(errno)) => {
+            Self::SourceRootUnreadable(Some(errno))
+            | Self::GitPackListingUnreadable(Some(errno)) => {
                 write!(f, "{} (errno {errno})", self.code())
             }
             Self::SqliteBackupFailed(Some(code)) => {
@@ -951,6 +975,7 @@ mod tests {
             BulkloadRefusal::SourceRootMissing,
             BulkloadRefusal::SourceRootUnreadable(None),
             BulkloadRefusal::SourceRootKindMismatch,
+            BulkloadRefusal::GitPackListingUnreadable(None),
             BulkloadRefusal::CaptureDrifted,
             BulkloadRefusal::CaptureAbsent,
             BulkloadRefusal::DigestMismatch,
@@ -1059,6 +1084,8 @@ mod tests {
         assert!(!BulkloadRefusal::is_code("IO (errno 2)"));
 
         for code in codes {
+            // A refusal whose arm is in neither table reads as "".
+            assert!(!code.is_empty(), "a listed refusal has no code");
             assert!(
                 code.chars()
                     .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'),

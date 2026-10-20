@@ -2185,6 +2185,24 @@ mod tests {
     use crate::disposition::{Decision, Row as Review, Scope};
     use crate::outcome::{OutcomeRecord, Unreadable};
 
+    /// p34 review F3 (#293): an unreadable pack listing is a typed refusal
+    /// that a review can close, never the bare `IO` counted unaccounted. Its
+    /// errno rides in the receipt (`GIT_PACK_LISTING_UNREADABLE (errno N)`),
+    /// as `SOURCE_ROOT_UNREADABLE`'s does; a record names an errno only for
+    /// `IO`.
+    #[test]
+    fn an_unreadable_pack_listing_is_pending_review() {
+        let refusal = crate::outcome::Refusal::of(
+            &BulkloadRefusal::GitPackListingUnreadable(Some(libc::EACCES)),
+            "git_carry::pack_listing",
+        );
+        assert_eq!(
+            refusal_disposition(&refusal),
+            Disposition::RefusedPendingReview("GIT_PACK_LISTING_UNREADABLE".into())
+        );
+        assert_eq!(refusal.errno(), None);
+    }
+
     fn present(body: &str) -> JournalState {
         JournalState::Present(body.to_owned())
     }
