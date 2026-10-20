@@ -951,7 +951,9 @@ fn a_pack_entry_that_cannot_be_stated_refuses_typed_and_never_reads_as_a_rewrite
     fs::set_permissions(&pack, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
         listed,
-        Err(BulkloadRefusal::GitPackListingUnreadable(Some(libc::EACCES)))
+        Err(BulkloadRefusal::GitPackListingUnreadable(Some(
+            libc::EACCES
+        )))
     );
     assert_eq!(
         listed.unwrap_err().to_string(),
