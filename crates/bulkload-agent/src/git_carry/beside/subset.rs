@@ -396,7 +396,10 @@ const REFS: &str = "refs";
 fn unknown_git(git_dir: &Path) -> Result<Option<String>> {
     for entry in fs::read_dir(git_dir).refuse_at(SITE)? {
         let name = entry.refuse_at(SITE)?.file_name();
-        if !GIT_ENTRIES.iter().any(|known| known.as_bytes() == name.as_bytes()) {
+        if !GIT_ENTRIES
+            .iter()
+            .any(|known| known.as_bytes() == name.as_bytes())
+        {
             return Ok(Some(format!("unknown-git:{}", shown(name.as_bytes()))));
         }
     }
@@ -416,13 +419,13 @@ fn unknown_git(git_dir: &Path) -> Result<Option<String>> {
 // Whether the live repository's object store (common directory
 // `live_common`) borrows from the standalone tree's (`git_dir`): removing
 // it would take objects the live repository reads.
-fn borrowed_by(live_common: &Path, git_dir: &Path) -> Result<bool> {
+fn borrowed_by(live_common: &Path, git_dir: &Path) -> bool {
     let objects = live_common.join("objects");
     let Ok(listed) = fs::read(objects.join("info/alternates")) else {
-        return Ok(false);
+        return false;
     };
     let Ok(own) = fs::canonicalize(git_dir.join("objects")) else {
-        return Ok(false);
+        return false;
     };
     for line in listed.split(|byte| *byte == b'\n') {
         let line = line.trim_ascii();
@@ -436,10 +439,10 @@ fn borrowed_by(live_common: &Path, git_dir: &Path) -> Result<bool> {
             objects.join(named)
         };
         if fs::canonicalize(&named).is_ok_and(|real| real.starts_with(&own)) {
-            return Ok(true);
+            return true;
         }
     }
-    Ok(false)
+    false
 }
 
 // Whether the linked tree at `beside` owns its administration directory
@@ -455,7 +458,10 @@ fn owns_admin(beside: &Path, admin: &Path) -> bool {
     } else {
         admin.join(named)
     };
-    match (fs::canonicalize(named), fs::canonicalize(beside.join(".git"))) {
+    match (
+        fs::canonicalize(named),
+        fs::canonicalize(beside.join(".git")),
+    ) {
         (Ok(named), Ok(own)) => named == own,
         _ => false,
     }
@@ -578,7 +584,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             if let Some(why) = unknown_git(&git_dir)? {
                 return Ok(refused(why));
             }
-            if borrowed_by(&live_common, &git_dir)? {
+            if borrowed_by(&live_common, &git_dir) {
                 return Ok(refused("borrowed-by-live"));
             }
             let hooks = git_dir.join("hooks");
@@ -592,7 +598,11 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             let Ok(raw) = fs::read(git_dir.join(CONFIG)) else {
                 return Ok(refused("config-unreadable"));
             };
-            if raw.to_ascii_lowercase().windows(8).any(|w| w == b"[include") {
+            if raw
+                .to_ascii_lowercase()
+                .windows(8)
+                .any(|w| w == b"[include")
+            {
                 return Ok(refused("config-include"));
             }
             config = raw;
@@ -764,10 +774,12 @@ fn mark_retired(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Finish every removal a crash cut short whose intent is in `state`,
-/// recording each finished one in its ledger record, and mark retired a
-/// ledger record whose removal had begun when its intent is gone and its
-/// tree too: the beside paths and what became of them.
+/// Finish every removal a crash cut short in `state`.
+///
+/// Each removal whose intent is there is finished and recorded in its
+/// ledger record, and a ledger record whose removal had begun is marked
+/// retired when its intent is gone and its tree too: the beside paths and
+/// what became of them.
 ///
 /// # Errors
 /// Whatever reading `state` or finishing a removal refuses.
@@ -945,9 +957,7 @@ pub fn retire(
     let admin = (again.shape == Shape::Linked)
         .then(|| landed::worktree_git_dir(beside).ok().flatten())
         .flatten();
-    if head_of(beside)?.oid != again.head
-        || admin_prints(admin.as_deref())? != again.admin_prints
-    {
+    if head_of(beside)?.oid != again.head || admin_prints(admin.as_deref())? != again.admin_prints {
         return Ok(Retired::Kept("raced".to_owned()));
     }
     record.deleting = true;

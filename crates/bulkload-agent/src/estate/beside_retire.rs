@@ -107,6 +107,7 @@ fn proof_words(proof: &subset::Proof) -> String {
 }
 
 /// Run `estate-beside-retire` (module docs); each line goes to `out`.
+#[allow(clippy::too_many_lines)] // The settle, then one loop over the trees.
 ///
 /// # Errors
 /// `FIELD_DOMAIN_VIOLATION` for a suffix that is no ref component or a

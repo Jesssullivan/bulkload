@@ -674,7 +674,11 @@ fn c8_every_captured_ref_goes_in_under_the_namespace() {
     assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
     assert_eq!(
         named_refs(&world.sting()).get("refs/neo-20261016/remotes/origin/feature"),
-        Some(&git(&world.neo(), &["rev-parse", "HEAD~1"]).trim().to_owned())
+        Some(
+            &git(&world.neo(), &["rev-parse", "HEAD~1"])
+                .trim()
+                .to_owned()
+        )
     );
 }
 
@@ -692,8 +696,16 @@ fn c9_a_live_deletion_is_never_undone() {
     fs::remove_file(sting.join("notes/todo.md")).unwrap();
     world.capture();
     let ran = world.apply(&FLAGS);
-    assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in", "{}", ran.stdout);
-    assert!(!sting.join("notes/todo.md").exists(), "the deletion was undone");
+    assert_eq!(
+        receipt(&ran.stdout).0,
+        "workspace-refs-in",
+        "{}",
+        ran.stdout
+    );
+    assert!(
+        !sting.join("notes/todo.md").exists(),
+        "the deletion was undone"
+    );
     assert_eq!(
         fs::read(sting.join(format!("notes/todo.md{SUFFIX}"))).unwrap(),
         b"neo's untracked todo\n"
@@ -853,7 +865,13 @@ fn r2_a_beside_tree_with_its_own_work_refuses_typed() {
             let feat = world.path("sting/feat");
             git(
                 &world.sting(),
-                &["worktree", "add", "--quiet", "--detach", feat.to_str().unwrap()],
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "--detach",
+                    feat.to_str().unwrap(),
+                ],
             );
             let copied = Command::new("cp")
                 .arg("-a")
@@ -979,7 +997,11 @@ fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
     assert!(line.contains("reason=rebuildable:target"), "{line}");
     let report = retire(&["--drop-rebuildable"], &state, &[world.beside().as_path()]);
     let line = line_of(&report.stdout, &world.beside()).to_owned();
-    for held in ["verdict=retirable", "shape=standalone", "rebuildable-dropped=3"] {
+    for held in [
+        "verdict=retirable",
+        "shape=standalone",
+        "rebuildable-dropped=3",
+    ] {
         assert!(line.split_whitespace().any(|w| w == held), "{held}: {line}");
     }
 }

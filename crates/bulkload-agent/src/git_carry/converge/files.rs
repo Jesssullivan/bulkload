@@ -214,12 +214,13 @@ pub fn read_record(path: &Path) -> Result<Option<FilesRecord>> {
     landed::read::<FilesRecord>(path)
 }
 
-/// Settle what an unfinished pass recorded at `path` left: its
-/// temporaries removed (a regular file or a link at a recorded private
-/// name), and each directory it may have made, deepest first, removed when
-/// empty or given its mode when still the `0700` it was made at (nothing
-/// else is touched). The next pass plans again. A finished record is left
-/// as it is.
+/// Settle what an unfinished pass recorded at `path` left.
+///
+/// Its temporaries are removed (a regular file or a link at a recorded
+/// private name), and each directory it may have made, deepest first, is
+/// removed when empty or given its mode when still the `0700` it was made
+/// at (nothing else is touched). The next pass plans again. A finished
+/// record is left as it is.
 ///
 /// # Errors
 /// IO.
@@ -646,8 +647,7 @@ pub(in crate::git_carry) fn dirs(
 ) -> Result<Vec<(Vec<u8>, u32)>> {
     let mut found: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
     for step in &planned.steps {
-        if step.act == Act::Occupied || step.act == Act::Adopt || step.act == Act::BesidePresent
-        {
+        if step.act == Act::Occupied || step.act == Act::Adopt || step.act == Act::BesidePresent {
             continue;
         }
         for above in ancestors(&step.at) {
@@ -665,12 +665,15 @@ pub(in crate::git_carry) fn dirs(
         .into_iter()
         .map(|(at, mode)| {
             (
-                live.join(OsStr::from_bytes(&at)).as_os_str().as_bytes().to_vec(),
+                live.join(OsStr::from_bytes(&at))
+                    .as_os_str()
+                    .as_bytes()
+                    .to_vec(),
                 mode,
             )
         })
         .collect();
-    dirs.sort_by_key(|(at, _)| at.iter().filter(|byte| **byte == b'/').count());
+    dirs.sort_by_key(|(at, _)| at.split(|byte| *byte == b'/').count());
     Ok(dirs)
 }
 

@@ -212,7 +212,7 @@ pub(in crate::git_carry) fn live_tips(repository: &Path) -> Result<BTreeSet<Stri
 ///
 /// # Errors
 /// Whatever listing the refs refuses.
-pub(in crate::git_carry) fn reachable_in(repository: &Path, commit: &str) -> Result<bool> {
+pub fn reachable_in(repository: &Path, commit: &str) -> Result<bool> {
     Ok(reachable_from(repository, commit, &live_tips(repository)?))
 }
 
