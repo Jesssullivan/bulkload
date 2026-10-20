@@ -1551,7 +1551,12 @@ fn pull_payload_bytes(state: &Path) -> u64 {
                 let lock = path
                     .extension()
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("lock"));
-                !(record || name.starts_with("transfer.sqlite") || lock)
+                // The store and the consolidation ledger are state, not
+                // payload.
+                !(record
+                    || name.starts_with("transfer.sqlite")
+                    || name.starts_with("consolidate.sqlite")
+                    || lock)
             })
         })
         .sum()

@@ -156,9 +156,10 @@ fn history_is_the_union_of_both_hosts_lines() {
     assert_eq!(stats.consolidated.len(), 1);
 }
 
-/// A destination writer appends between the read and the exchange: its
-/// line is never lost (nothing is replaced, the path is refused
-/// `DESTINATION_UNSETTLED`), and the next pass merges it in.
+/// A destination writer appends after the receive checked the live file and
+/// before the union reads it: its line is in the union, never lost. (A
+/// writer under the union's own swap is merged on the union's next read:
+/// `consolidate::append_log`'s tests.)
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -182,22 +183,22 @@ fn a_line_sting_appends_during_the_consolidation_is_never_lost() {
     set_consolidate_hook(&homes.root, Some(append));
     let first = homes.corpus.run().unwrap();
     set_consolidate_hook(&homes.root, None);
-    assert_eq!(
-        first.refusals,
-        [(rel.as_bytes().to_vec(), "DESTINATION_UNSETTLED".to_owned())]
-    );
-    assert!(first.consolidated.is_empty());
+    assert!(first.refusals.is_empty(), "{:?}", first.refusals);
+    assert_eq!(first.consolidated.len(), 1);
     let late = "{\"uuid\":\"late\",\"message\":\"while merging\"}\n";
     assert_eq!(
         std::fs::read_to_string(&live).unwrap(),
-        format!("{sting}{late}"),
-        "the live file as the writer left it"
+        format!("{neo}{}{late}", record("s1", "a", "on sting"))
     );
     assert!(!beside_of(&live).exists());
 
     homes.settle();
     let again = homes.corpus.run().unwrap();
     assert!(again.refusals.is_empty(), "{:?}", again.refusals);
+    assert_eq!(
+        again.source_bytes_read, 0,
+        "an unchanged rerun reads nothing"
+    );
     assert_eq!(
         std::fs::read_to_string(&live).unwrap(),
         format!("{neo}{}{late}", record("s1", "a", "on sting"))
@@ -300,4 +301,32 @@ fn a_log_whose_live_path_is_another_kind_is_refused_unless_an_archive_link() {
         "landed for the re-seat's union"
     );
     assert_eq!(std::fs::read(&target).unwrap(), b"{\"x\":2}\n");
+}
+
+/// SPEC #298 rule 7 through the one union: a live log holding every
+/// record of the source's, in another order, is covered. Nothing is
+/// rewritten (the same inode, the same bytes), and the entry is
+/// `dest-ahead`.
+#[test]
+fn a_live_log_holding_every_record_in_another_order_is_never_rewritten() {
+    use std::os::unix::fs::MetadataExt as _;
+    let homes = Homes::new();
+    let (a, b, s) = (
+        record("a", "", "hi"),
+        record("b", "a", "hello"),
+        record("s1", "a", "on sting"),
+    );
+    let rel = "projects/-k/order.jsonl";
+    homes.write("source", rel, format!("{a}{b}").as_bytes());
+    let held = format!("{a}{s}{b}");
+    let live = homes.write("destination", rel, held.as_bytes());
+    let inode = std::fs::metadata(&live).unwrap().ino();
+    homes.settle();
+    let stats = homes.corpus.run().unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    assert!(stats.consolidated.is_empty(), "{:?}", stats.consolidated);
+    assert_eq!(stats.dest_ahead, [rel.as_bytes().to_vec()]);
+    assert_eq!(std::fs::read_to_string(&live).unwrap(), held);
+    assert_eq!(std::fs::metadata(&live).unwrap().ino(), inode);
+    assert!(!beside_of(&live).exists());
 }

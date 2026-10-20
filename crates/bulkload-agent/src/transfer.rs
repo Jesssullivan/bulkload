@@ -5555,6 +5555,12 @@ struct Inbound<'a, W> {
     /// Entries queued for their group commit, by relative path, awaiting
     /// `Held` (#77 round 2, N1), and the committer's per-group outcomes.
     pending_held: HashMap<Vec<u8>, u64>,
+    /// Entries answered without a publication (an append log consolidated
+    /// by the union, or covered by it): `Held` is sent at their `End`.
+    answered: HashSet<Vec<u8>>,
+    /// The consolidation ledger (`consolidate.sqlite` in the state), opened
+    /// at the first union.
+    union_ledger: Option<crate::consolidate::Ledger>,
     committed: Receiver<crate::materialize::GroupOutcomes>,
     /// The source has offered every entry.
     walk_done: bool,
@@ -5940,6 +5946,8 @@ fn receive_session<R: Read, W: Write>(
             salvage: Salvage::default(),
             salvage_staged: HashMap::new(),
             pending_held: HashMap::new(),
+            answered: HashSet::new(),
+            union_ledger: None,
             committed: group_outcomes,
             walk_done: false,
             granted: CREDIT_WINDOW,
@@ -7472,6 +7480,10 @@ impl<W: Write> Inbound<'_, W> {
         // output queued under its beside path (`--beside`) is awaited
         // under that path, which the committer's outcome names.
         match outcome {
+            Ok(None) if self.answered.remove(&rel_path) => {
+                self.release(entry);
+                write_control(self.output, &Control::Held { entry, held: false })?;
+            }
             Ok(beside) => {
                 let held_as = match beside {
                     Some(beside) => {
@@ -8372,113 +8384,124 @@ impl<W: Write> Inbound<'_, W> {
     }
 
     /// Consolidate the append log at `row`'s live path with the seat's
-    /// bytes, staged whole at its live name in `staged` ([`consolidate`],
-    /// operator ruling 2026-10-20): one file at the path, the seat's bytes
-    /// and then the live file's records the seat lacks, never a beside copy.
+    /// bytes, staged whole in `staged` (operator ruling 2026-10-20; SPEC
+    /// #298 rules 3, 4 and 7). One code path with the homes dispatch: the
+    /// union is [`crate::consolidate::append_log::union`]'s, and this acts on
+    /// its outcome. Never a beside copy, never a stage copy published.
     ///
-    /// The live file must be a regular file, quiet past the racy window and
-    /// held open by no process ([`crate::procs::inside`]; where that cannot
-    /// be said, it is not touched); either side ending inside a line is not
-    /// merged. Any of these is `DESTINATION_UNSETTLED`, rerun-only: nothing
-    /// written, the next pass decides. The consolidated file then replaces
-    /// the live one by the superseding publish's exchange
-    /// ([`crate::materialize`], WP0(d)), checked against the live file's
-    /// identity as read here: a writer that appended since is never lost (the
-    /// exchange is not made, or made back), and the path is refused
-    /// `DESTINATION_UNSETTLED` for the next pass to merge again. Ledgered in
-    /// [`TransferStats::consolidated`] once its group commits.
+    /// - **Before.** The live file must be a regular file, quiet past the
+    ///   racy window; else `DESTINATION_UNSETTLED`, rerun-only.
+    /// - **Covered or adopted.** The live file already holds the seat's
+    ///   records: nothing is rewritten (rule 7), the entry is `dest-ahead`.
+    /// - **Extended or consolidated.** The union is traded in for the live
+    ///   file by the union's own crash-safe swap, checked against the live
+    ///   file as read; ledgered in [`TransferStats::consolidated`] and in
+    ///   the state's `consolidate.sqlite`.
+    /// - **Refused.** A file held open, ending inside a line, or changed on
+    ///   every read: `DESTINATION_UNSETTLED`, rerun-only, nothing written.
+    ///
+    /// Either way the answer is remembered under the live file's identity
+    /// then, so an unchanged rerun reads nothing. The staged seat is removed.
     fn consolidate(
         &mut self,
         staged: StagedFile,
         row: &RowSchema,
-        (key, record, racy, root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
-        hints: Vec<ChunkHint>,
+        (key, _record, racy, _root): (Vec<u8>, [u8; 32], bool, [u8; 32]),
+        _hints: Vec<ChunkHint>,
     ) -> Result<()> {
-        let unsettled = |staged: StagedFile| {
-            let _ = staged.discard();
-            Err(BulkloadRefusal::DestinationUnsettled)
-        };
-        let Ok(Some((file, _))) = self.target.existing(row) else {
-            return unsettled(staged);
-        };
-        let found = file.metadata().refuse_at("transfer::consolidate")?;
-        let identity = StatIdentity::from_metadata(&found);
-        let quiet = capture_clock(self.target.path()).saturating_sub(RACY_GRANULARITY_NS);
-        let live_path = self.target.path().join(path(row.rel_path.clone()));
-        let free = matches!(
-            crate::procs::inside(&[live_path.as_path()])?,
-            Some(pids) if pids.is_empty()
-        );
-        if !found.is_file() || identity.mtime_ns >= quiet || identity.ctime_ns >= quiet || !free {
-            return unsettled(staged);
-        }
-        let read_all = |handle: &std::fs::File, size: u64| -> Result<Vec<u8>> {
-            let mut bytes =
-                vec![0_u8; usize::try_from(size).map_err(|_| BulkloadRefusal::BudgetExceeded)?];
-            if crate::io::sys::pread_full(handle, &mut bytes, 0)
-                .refuse_at("transfer::consolidate")?
-                != bytes.len()
-            {
+        use crate::consolidate::{append_log, Action, Live, Maps, Source};
+        let result = (|| -> Result<Option<StatIdentity>> {
+            let Ok(Some((file, _))) = self.target.existing(row) else {
+                return Err(BulkloadRefusal::DestinationUnsettled);
+            };
+            let found = file.metadata().refuse_at("transfer::consolidate")?;
+            let quiet = capture_clock(self.target.path()).saturating_sub(RACY_GRANULARITY_NS);
+            let identity = StatIdentity::from_metadata(&found);
+            if !found.is_file() || identity.mtime_ns >= quiet || identity.ctime_ns >= quiet {
                 return Err(BulkloadRefusal::DestinationUnsettled);
             }
-            counters::add_len(Counter::DestVerifyRead, bytes.len());
-            Ok(bytes)
-        };
-        let (live, seat) = match (
-            read_all(&file, found.len()),
-            read_all(staged.file(), row.size),
-        ) {
-            (Ok(live), Ok(seat)) => (live, seat),
-            (Err(refusal), _) | (_, Err(refusal)) => {
-                let _ = staged.discard();
-                return Err(refusal);
+            let mut live_bytes = vec![
+                0_u8;
+                usize::try_from(found.len())
+                    .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+            ];
+            let read = crate::io::sys::pread_full(&file, &mut live_bytes, 0)
+                .refuse_at("transfer::consolidate")?;
+            counters::add_len(Counter::DestVerifyRead, read);
+            if self.union_ledger.is_none() {
+                self.union_ledger = Some(crate::consolidate::Ledger::open(self.store.root())?);
             }
-        };
-        let unmoved = file
-            .metadata()
-            .is_ok_and(|now| StatIdentity::from_metadata(&now) == identity);
-        let by_uuid = row.rel_path.starts_with(b"projects/");
-        let Some(merged) = consolidate::merge_jsonl(&seat, &live, by_uuid).filter(|_| unmoved)
-        else {
-            return unsettled(staged);
-        };
-        if let Err(error) = crate::io::sys::pwrite_all(&**staged.file(), &merged.extra, row.size) {
-            let _ = staged.discard();
-            return Err(crate::materialize::space_refusal(crate::refuse::io(
-                &error,
-                "transfer::consolidate",
-            )));
-        }
-        counters::add_len(Counter::DestMaterializeWrite, merged.extra.len());
-        let mut output = blake3::Hasher::new();
-        output.update(&seat);
-        output.update(&merged.extra);
-        let size = row.size + merged.extra.len() as u64;
-        self.stats.consolidated.push(Consolidated {
-            path: row.rel_path.clone(),
-            seat_blake3: *blake3::hash(&seat).as_bytes(),
-            live_blake3: *blake3::hash(&live).as_bytes(),
-            output_blake3: *output.finalize().as_bytes(),
-            seat_records: merged.seat_records,
-            live_extra: merged.live_extra,
-            output_size: size,
-        });
-        let out_row = RowSchema {
-            size,
-            ..row.clone()
-        };
-        #[cfg(test)]
-        consolidate_hook(self.target.path(), &live_path);
-        self.publish(
-            staged,
-            &out_row,
-            (key, record, racy, root),
-            hints,
-            Some(OwnedOutput {
-                identity,
-                rows: Vec::new(),
-            }),
-        )
+            let ledger = self
+                .union_ledger
+                .as_ref()
+                .ok_or(BulkloadRefusal::ContractSelfInconsistent)?;
+            let live_path = self.target.path().join(path(row.rel_path.clone()));
+            #[cfg(test)]
+            consolidate_hook(self.target.path(), &live_path);
+            let maps = Maps::new(Vec::new());
+            let outcome = append_log::union(
+                &Live {
+                    dir: staged.parent(),
+                    name: staged.leaf().to_bytes(),
+                    path: &live_path,
+                    rel: &row.rel_path,
+                },
+                &Source {
+                    file: staged.file(),
+                    path: &live_path,
+                    size: row.size,
+                    mtime_ns: row.mtime_ns,
+                    maps: &maps,
+                },
+                ledger,
+            )
+            .map_err(|refusal| match refusal {
+                BulkloadRefusal::HomesConsolidateRaced => BulkloadRefusal::DestinationUnsettled,
+                other => other,
+            })?;
+            let after = std::fs::symlink_metadata(&live_path)
+                .ok()
+                .filter(std::fs::Metadata::is_file)
+                .map(|meta| StatIdentity::from_metadata(&meta));
+            match outcome.action {
+                Action::Adopted | Action::Covered => {
+                    self.stats.dest_ahead.push(row.rel_path.clone());
+                    Ok(after)
+                }
+                Action::Extended | Action::Consolidated => {
+                    let mut seat = vec![
+                        0_u8;
+                        usize::try_from(row.size)
+                            .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+                    ];
+                    crate::io::sys::pread_full(&**staged.file(), &mut seat, 0)
+                        .refuse_at("transfer::consolidate")?;
+                    let output = std::fs::read(&live_path).refuse_at("transfer::consolidate")?;
+                    let plan = append_log::plan_at(&row.rel_path, &live_bytes, &seat);
+                    counters::add(Counter::DestMaterializeWrite, outcome.written);
+                    self.stats.completed += 1;
+                    self.stats.consolidated.push(Consolidated {
+                        path: row.rel_path.clone(),
+                        seat_blake3: *blake3::hash(&seat).as_bytes(),
+                        live_blake3: *blake3::hash(&live_bytes).as_bytes(),
+                        output_blake3: *blake3::hash(&output).as_bytes(),
+                        seat_records: plan.source_records,
+                        live_extra: plan.live_extra,
+                        output_size: output.len() as u64,
+                    });
+                    Ok(after)
+                }
+                Action::Created | Action::Held(_) => Err(BulkloadRefusal::DestinationUnsettled),
+            }
+        })();
+        let _ = staged.discard();
+        let settled = result?;
+        // Answered here, with no publication: remembered as `dest-ahead`
+        // under the live file's identity now (the next pass reads nothing
+        // while it is unchanged).
+        self.remember_refusal(&key, settled, racy, RefusedOutput::DestAhead);
+        self.answered.insert(row.rel_path.clone());
+        Ok(())
     }
 
     /// The checks and writes of [`Self::finish_extend`]: the file's
