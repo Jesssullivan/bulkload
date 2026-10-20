@@ -328,11 +328,12 @@ pub fn retention(options: &Options, lanes: &Lanes, sessions: &Sessions) -> Resul
                 .filter(|row| row.landing == candidate.path),
             None => None,
         };
+        let known = known_source(ledger.as_ref(), &candidate.sid)?;
         let dest_key = match resolve(
             candidate,
             cached.as_ref(),
             lanes,
-            (options, live && !candidate.beside),
+            (options, live && !candidate.beside, known),
         )? {
             Resolved::Lane(_, lane) => {
                 if !lane_dirs.contains(&lane.dest_cwd) {
@@ -462,7 +463,7 @@ fn field(path: &Path, wanted: &'static [&'static str], limit: u64) -> Result<Opt
 
 /// Resolve `candidate`'s lane, from its session row when it has one (a
 /// found `cwd` always; "none recorded" while the landed transcript is
-/// unchanged).
+/// unchanged). `known`: [`known_source`].
 ///
 /// # Errors
 /// I/O refusals of the scan; a destination path that cannot resolve.
@@ -470,7 +471,7 @@ pub fn resolve(
     candidate: &Candidate,
     cached: Option<&Session>,
     lanes: &Lanes,
-    (options, live): (&Options, bool),
+    (options, live, known): (&Options, bool, bool),
 ) -> Result<Resolved> {
     let cwd = match cached.map(|row| (row.source_cwd.clone(), row)) {
         Some((Some(cwd), _)) if !cwd.is_empty() => Some(cwd),
@@ -485,8 +486,11 @@ pub fn resolve(
     // A live-home landing (review of #280, finding 7): a transcript under a
     // key that is not under the source home's key is the destination's own
     // (the source's land under keys of source paths), already where Claude
-    // Code lists it, with or without a `cwd` its key agrees with.
-    let destination_own = live && destination_own(options, candidate);
+    // Code lists it, with or without a `cwd` its key agrees with. Never one
+    // an earlier pass recorded as the source's: provenance is sticky, so a
+    // session the source pruned since keeps its typed outcome (verification
+    // of #280, N4 across passes).
+    let destination_own = live && !known && destination_own(options, candidate);
     let Some(cwd) = cwd else {
         if destination_own {
             return Ok(Resolved::InPlace(String::new(), None));
@@ -536,6 +540,23 @@ pub fn resolve(
         None if options.by_id(&cwd) => Ok(Resolved::ById(cwd)),
         None => Ok(Resolved::Refused(cwd, BulkloadRefusal::ReseatLaneUnmapped)),
     }
+}
+
+/// Whether the re-seat ledger recorded session `sid` as the source's on an
+/// earlier pass: a row of any outcome but `in-place` (placed, adopted,
+/// refused, ...). Provenance is sticky (verification of #280, N4): such a
+/// session is never taken for the destination's own, and its typed outcome
+/// stands until dispositioned.
+///
+/// # Errors
+/// The ledger's read refusal.
+pub fn known_source(ledger: Option<&Ledger>, sid: &str) -> Result<bool> {
+    let Some(ledger) = ledger else {
+        return Ok(false);
+    };
+    Ok(ledger
+        .session(TOOL, sid)?
+        .is_some_and(|row| row.outcome != "in-place"))
 }
 
 /// Whether `candidate` is the destination's own session (a live-home
@@ -825,11 +846,12 @@ pub fn reseat(
             }
             continue;
         }
+        let known = known_source(Some(ledger), &candidate.sid)?;
         let (cwd, lane, dest_key) = match resolve(
             candidate,
             cached.as_ref(),
             lanes,
-            (options, live && !candidate.beside),
+            (options, live && !candidate.beside, known),
         )? {
             Resolved::Lane(cwd, lane) => {
                 let key = lane.key.clone();
@@ -1045,8 +1067,15 @@ fn in_place(
     emit: &mut dyn FnMut(&str) -> Result<()>,
 ) -> Result<()> {
     summary.session(TOOL, "in-place");
-    let other = cached.is_none() && ledger.session(TOOL, &candidate.sid)?.is_some();
-    if !other {
+    // Another landing's row is not this one's to replace; nor is a typed
+    // outcome (verification of #280, N4): only a mapped lane (the
+    // operator's disposition) turns an earlier refusal into `in-place`.
+    let other = match ledger.session(TOOL, &candidate.sid)? {
+        Some(row) if cached.is_none() => Some(row),
+        Some(row) if lane.is_none() && row.outcome != "in-place" => Some(row),
+        _ => None,
+    };
+    if other.is_none() {
         ledger.put_session(&Session {
             tool: TOOL.to_owned(),
             id: candidate.sid.clone(),

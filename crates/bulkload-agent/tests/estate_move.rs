@@ -1781,3 +1781,204 @@ fn a_session_both_sides_continued_is_held_diverged_for_review() {
         moved.stdout
     );
 }
+
+/// Verification of #280, N4 across passes: provenance is sticky. A neo
+/// session with no lane (a Claude transcript, and a Codex rollout neo's
+/// index has no row for) is `RESEAT_LANE_UNMAPPED` while neo lists it; once
+/// neo prunes it, the next pass still holds it typed (the pulls' listing is
+/// cumulative), and so does a pass whose listing no longer names it (the
+/// re-seat ledger recorded it as neo's): never `in-place`, the gate never
+/// passes on it, and its refused ledger row is never overwritten.
+#[test]
+fn listed_then_pruned_sessions_with_no_lane_stay_typed() {
+    const SID_PRUNED: &str = "5e5e5e5e-8888-4222-8333-444444444444";
+    const T_LANE: &str = "019a0000-0000-7000-8000-00000000000b";
+    const T_PRUNED: &str = "019a0000-0000-7000-8000-00000000000c";
+    const T_DEST: &str = "019a0000-0000-7000-8000-00000000000d";
+    let base = std::env::temp_dir().join(format!("bulkload-move-pruned-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&base);
+    fs::create_dir_all(&base).unwrap();
+    let world = World {
+        base: fs::canonicalize(&base).unwrap(),
+    };
+    let base = &world.base;
+    let src_home = base.join("src/home");
+    let dst_home = base.join("dst/home");
+    let (src_git, dst_git) = (src_home.join("git"), dst_home.join("git"));
+    fs::create_dir_all(&src_git).unwrap();
+    fs::create_dir_all(&dst_git).unwrap();
+    repo(&src_git.join("lab"), "l.txt");
+    let (src_lane, dst_lane) = (src_git.join("lab"), dst_git.join("lab"));
+
+    // neo: a session in a scratch directory of its home, which has no lane
+    // (neo's /Users/jess/scratch).
+    let scratch = src_home.join("scratch");
+    let scratch_projects = src_home.join(".claude/projects").join(key(&scratch));
+    fs::create_dir_all(&scratch_projects).unwrap();
+    let pruned_transcript = scratch_projects.join(format!("{SID_PRUNED}.jsonl"));
+    fs::write(
+        &pruned_transcript,
+        transcript(SID_PRUNED, &scratch, "PRUNED"),
+    )
+    .unwrap();
+    fs::write(
+        src_home.join(".claude/settings.json"),
+        b"{\"cleanupPeriodDays\": 3650}\n",
+    )
+    .unwrap();
+    // neo's Codex: a thread of the lane its index names, and a rollout of
+    // the scratch directory it has no row for.
+    let src_codex = src_home.join(".codex");
+    let meta = |id: &str, cwd: &Path| {
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"{}\"}}}}\n{{\"neo\":true}}\n",
+            cwd.display()
+        )
+    };
+    let lane_rel = format!("sessions/2026/10/19/rollout-2026-10-19T10-00-00-{T_LANE}.jsonl");
+    let pruned_rel = format!("sessions/2026/10/19/rollout-2026-10-19T11-00-00-{T_PRUNED}.jsonl");
+    fs::create_dir_all(src_codex.join(&lane_rel).parent().unwrap()).unwrap();
+    fs::write(src_codex.join(&lane_rel), meta(T_LANE, &src_lane)).unwrap();
+    fs::write(src_codex.join(&pruned_rel), meta(T_PRUNED, &scratch)).unwrap();
+    codex_index(
+        &src_codex.join("state_5.sqlite"),
+        T_LANE,
+        src_codex.join(&lane_rel).to_str().unwrap(),
+        &src_lane,
+    );
+
+    // sting: its live homes, with an index naming a thread of its own.
+    let dst_claude = dst_home.join(".claude");
+    fs::create_dir_all(&dst_claude).unwrap();
+    fs::write(
+        dst_claude.join("settings.json"),
+        b"{\"cleanupPeriodDays\": 3650}\n",
+    )
+    .unwrap();
+    let dst_codex = dst_home.join(".codex");
+    let dest_rollout = dst_codex.join(format!(
+        "sessions/2026/10/18/rollout-2026-10-18T10-00-00-{T_DEST}.jsonl"
+    ));
+    fs::create_dir_all(dest_rollout.parent().unwrap()).unwrap();
+    fs::write(&dest_rollout, meta(T_DEST, &dst_lane)).unwrap();
+    codex_index(
+        &dst_codex.join("state_5.sqlite"),
+        T_DEST,
+        dest_rollout.to_str().unwrap(),
+        &dst_lane,
+    );
+
+    let source_state = base.join("move-src");
+    let state = base.join("move-dst");
+    let map = format!("{}={}", src_git.display(), dst_git.display());
+    let pass = || {
+        let sourced = agent(&os(&[
+            &"estate-move-source",
+            &"--map",
+            &map,
+            &source_state,
+            &src_git,
+        ]));
+        assert!(sourced.ok, "{}\n{}", sourced.stdout, sourced.stderr);
+        agent(&os(&[
+            &"estate-move",
+            &"--label",
+            &LABEL,
+            &"--source",
+            &"neo",
+            &"--sessions",
+            &src_home,
+            &"--dest-home",
+            &dst_home,
+            &"--map",
+            &map,
+            // As in the archive test: the by-ID prefixes would take a `/tmp`
+            // test directory's session for a by-ID one.
+            &"--reseat-arg",
+            &"--no-default-by-id",
+            &"-",
+            &source_state,
+            &state,
+        ]))
+    };
+    let ledger = state.join("reseat").join("reseat.sqlite");
+    let outcome = |tool: &str, id: &str| -> String {
+        let conn = rusqlite::Connection::open_with_flags(
+            &ledger,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT outcome FROM session WHERE tool = ?1 AND id = ?2",
+            rusqlite::params![tool, id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    let held = |moved: &Ran, at: &str| {
+        assert!(
+            moved.stdout.contains("estate-move phase=reseat outcome=ok"),
+            "{at}\n{}\n{}",
+            moved.stdout,
+            moved.stderr
+        );
+        let totals = closure(&moved.stdout);
+        assert_eq!(
+            totals["reseat_held"], "claude/RESEAT_LANE_UNMAPPED:1,codex/RESEAT_LANE_UNMAPPED:1",
+            "{at}\n{}",
+            moved.stdout
+        );
+        assert!(
+            moved.stdout.contains("estate-move gate=fail"),
+            "{at}\n{}",
+            moved.stdout
+        );
+        assert_eq!(
+            outcome("claude", SID_PRUNED),
+            "RESEAT_LANE_UNMAPPED",
+            "{at}"
+        );
+        assert_eq!(outcome("codex", T_PRUNED), "RESEAT_LANE_UNMAPPED", "{at}");
+    };
+
+    // Pass 1: neo lists both; both are typed and hold the gate.
+    let first = pass();
+    held(&first, "pass 1");
+    let landed_transcript = dst_claude
+        .join("projects")
+        .join(key(&scratch))
+        .join(format!("{SID_PRUNED}.jsonl"));
+    assert!(landed_transcript.is_file(), "{}", first.stdout);
+    assert!(dst_codex.join(&pruned_rel).is_file(), "{}", first.stdout);
+
+    // neo prunes both. Pass 2: absent from this pass's walk, still neo's
+    // (the cumulative listing names them).
+    fs::remove_file(&pruned_transcript).unwrap();
+    fs::remove_file(src_codex.join(&pruned_rel)).unwrap();
+    let second = pass();
+    held(&second, "pass 2");
+    let listing = fs::read(state.join("pull/claude.listing")).unwrap();
+    let rel = format!("projects/{}/{SID_PRUNED}.jsonl", key(&scratch));
+    assert!(
+        listing
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == rel.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&listing)
+    );
+
+    // Pass 3: a listing that no longer names them (an earlier build's
+    // state): the re-seat ledger's rows keep them neo's.
+    fs::remove_file(state.join("pull/claude.listing")).unwrap();
+    fs::remove_file(state.join("pull/codex.listing")).unwrap();
+    let third = pass();
+    held(&third, "pass 3");
+    let listing = fs::read(state.join("pull/claude.listing")).unwrap();
+    assert!(
+        !listing
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == rel.as_bytes()),
+        "{}",
+        String::from_utf8_lossy(&listing)
+    );
+}

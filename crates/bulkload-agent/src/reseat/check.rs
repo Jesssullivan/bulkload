@@ -663,11 +663,12 @@ fn check_claude(
                 .filter(|row| row.landing == candidate.path),
             None => None,
         };
+        let known = claude::known_source(ledger, &candidate.sid)?;
         let (lane, key) = match claude::resolve(
             candidate,
             cached.as_ref(),
             lanes,
-            (options, live && !candidate.beside),
+            (options, live && !candidate.beside, known),
         )? {
             Resolved::Lane(_, lane) | Resolved::InPlace(_, Some(lane)) => {
                 let key = lane.key.clone();

@@ -179,10 +179,13 @@ pub struct Options {
     /// re-seated as the landed one; the link is never read.
     pub beside_suffix: Option<String>,
     /// `--claude-listing FILE` (independent review of #280, N4): the
-    /// transcripts this run's pull listed on the source, relative to its
-    /// `.claude`. On a live-home landing a session in it is the source's
-    /// (unmapped unless mapped or by ID); one not in it is the
-    /// destination's own, in place. Without it, the key's shape decides.
+    /// transcripts the pulls listed on the source, relative to its
+    /// `.claude` (`estate-move` keeps it cumulative over its passes, and
+    /// lists refused and skipped source paths too). On a live-home landing a
+    /// session in it is the source's (unmapped unless mapped or by ID); one
+    /// not in it is the destination's own, in place, unless the ledger
+    /// recorded it as the source's on an earlier pass (provenance is
+    /// sticky, verification of #280). Without it, the key's shape decides.
     pub claude_listing: Option<std::collections::HashSet<Vec<u8>>>,
     /// `--codex-listing FILE`: the same for the rollouts, relative to the
     /// source's `.codex`.

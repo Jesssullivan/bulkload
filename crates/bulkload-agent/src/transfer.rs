@@ -6089,29 +6089,42 @@ impl<W: Write> Inbound<'_, W> {
     }
 
     /// A walk frame's own handling.
+    /// List `rel_path` as the source's when it is under a listing prefix
+    /// ([`set_listing`]).
+    fn list(&mut self, rel_path: &[u8]) {
+        if self
+            .listing
+            .iter()
+            .any(|prefix| rel_path.starts_with(prefix))
+        {
+            self.stats.listed.push(rel_path.to_vec());
+        }
+    }
+
     fn handle_walked(&mut self, frame: Walked) -> Result<()> {
         match frame {
             Walked::Entry { entry, row, wal } => {
-                if matches!(row.kind, FileKind::Regular | FileKind::Symlink)
-                    && self
-                        .listing
-                        .iter()
-                        .any(|prefix| row.rel_path.starts_with(prefix))
-                {
-                    self.stats.listed.push(row.rel_path.clone());
+                if matches!(row.kind, FileKind::Regular | FileKind::Symlink) {
+                    self.list(&row.rel_path);
                 }
                 let row = self.redirected(row);
                 self.entry(entry, row, wal)
             }
+            // A source path the walk refused or skipped is still the
+            // source's: listed, so the re-seat never takes a destination
+            // file of that name for the destination's own (verification of
+            // #280, N4).
             Walked::Refused {
                 rel_path,
                 code,
                 sqlite_code,
             } => {
+                self.list(&rel_path);
                 self.stats.refuse(rel_path, code, sqlite_code);
                 Ok(())
             }
             Walked::EngineTemporary { rel_path } => {
+                self.list(&rel_path);
                 self.stats.source_engine_temporaries.push(rel_path);
                 Ok(())
             }

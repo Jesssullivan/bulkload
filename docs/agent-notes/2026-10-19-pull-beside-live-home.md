@@ -374,7 +374,8 @@ checked out detached in `~/git-build/beside-live-home-20261019`.
   - `estate-reseat --dest-*` refuses any path that is not its own
     canonical, owned directory.
   - A destination root swapped for a link before its open is
-    `PATH_ESCAPES_ROOT`, typed.
+    `DESTINATION_KIND_MISMATCH`, typed, as #283 types a link at DEST (it
+    was bare `IO`, `ELOOP`).
   - Tests: `a_destination_root_swapped_for_a_link_is_a_typed_refusal`,
     `cli_dest_homes_must_be_real_owned_directories`.
 - **N4 (partial before): the destination's own is decided by provenance.**
@@ -386,6 +387,12 @@ checked out detached in `~/git-build/beside-live-home-20261019`.
   own, in place. A neo session whose `cwd` is outside neo's home is no
   longer taken for sting's own. Test: the archive test, now with such a
   session (`reseat_held=claude/RESEAT_LANE_UNMAPPED:2`).
+- **Merges.** `origin/main` was merged at `86353ba` (#290 deflake; the
+  regularization space test's conflict resolved to #290's version, whose
+  lane owns it) and at `912907c` (#283). For a symlink where a regular
+  output lands, #283's `DESTINATION_KIND_MISMATCH` is kept; under
+  `--beside` that kind mismatch lands beside, as an occupied path does.
+  `copy`/`pull` take `--file` and `--beside` in either order.
 - **A-106 line loss.** After the exchange the landed copy stands at the
   live name, so a destination writer can append to it. If the archive
   target is also written in that window, the swap is put back, and the
@@ -394,6 +401,47 @@ checked out detached in `~/git-build/beside-live-home-20261019`.
   `<name><suffix>` (the run's beside suffix, else `.bulkload-kept`; `.1` …
   `.64` if taken), reported `kept-aside` and held for review. Test:
   `a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back`.
+
+## Verification at `182496f` (2026-10-20) and the fix
+
+The verification confirmed N1 (a relinked home probe is `PATH_ESCAPES_ROOT`,
+`reseat/not-run`) and A-106 (the written copy is kept as
+`<id>.jsonl.<LABEL>`, `kept-aside` holds the gate). It also confirmed that a
+sting session under a neo-shaped key is correctly `in-place`.
+
+- **N4 across passes (not fixed before).**
+  - Probe: a neo session with no lane (`/Users/jess/scratch`) was
+    `RESEAT_LANE_UNMAPPED` while neo listed it. On the next pass it was
+    absent from neo's listing (pruned on neo). It became `in-place`,
+    `unaccounted={}`, the gate passed, and its refused ledger row was
+    overwritten.
+  - Cause: both the Claude `destination_own` and the Codex unindexed rule
+    read "not in this pass's listing" as "the destination's own".
+- **Fix: provenance is sticky.** A session recorded as the source's on an
+  earlier pass stays the source's, and its typed outcome stands until it is
+  dispositioned. Three changes carry this:
+  - **Ledger.** A re-seat ledger session row of any outcome except
+    `in-place` (placed, adopted, refused, …) marks that ID as the source's
+    (`claude::known_source`; Codex alike). Such a session is never taken
+    for the destination's own. This holds for the listing rule, the
+    key-shape rule, the Codex "indexed by the destination" rule, and the
+    Codex "cwd outside the source home" rule.
+  - **No overwrite.** `in_place` never overwrites a typed row. Only a mapped
+    lane whose key is the session's own turns an earlier refusal into
+    `in-place`; mapping the lane is the operator's disposition.
+  - **Cumulative listing.** `pull/{claude,codex}.listing` is the union over
+    passes. The walk's refused and engine-temporary paths under the listing
+    prefixes are listed too, so a source transcript that the walk refused
+    or skipped this pass is still the source's. A pass that did not walk
+    keeps the earlier listing unchanged.
+  - Test: `listed_then_pruned_sessions_with_no_lane_stay_typed`, covering a
+    Claude transcript and a Codex rowless rollout over three passes:
+    - Pass 1: listed.
+    - Pass 2: pruned on the source; the cumulative listing still names them.
+    - Pass 3: the listing files removed, so only the ledger keeps them.
+    - Every pass expects
+      `reseat_held=claude/RESEAT_LANE_UNMAPPED:1,codex/RESEAT_LANE_UNMAPPED:1`,
+      `gate=fail`, and both ledger rows still `RESEAT_LANE_UNMAPPED`.
 
 ## Open
 
@@ -419,6 +467,18 @@ checked out detached in `~/git-build/beside-live-home-20261019`.
   (This note said "not lost" here before; that was wrong while the
   swap-back deleted the copy. See the review below: a written copy is now
   kept aside, never deleted.)
+- **Known gap, A-106 swap-back (reviewer's narrow residual, verification at
+  `182496f`).**
+  - The race: a destination writer opens the live name, which then holds
+    the copy, before the swap-back. It writes only after the swap-back's
+    "was the copy written?" identity check.
+  - Its descriptor still points at the copy's inode, which the swap-back
+    has judged unwritten. `clear_temp` removes that inode, so the late
+    lines go to an unlinked inode and are lost.
+  - Keeping the copy aside covers only a write that lands before the check.
+  - Closing the rest needs the writer kept out across the whole exchange.
+    One way: refuse the replacement while any process holds the live name
+    open, and check again after the swap-back. Not done here.
 - Re-seat outcomes that hold the gate (`reseat_held=`) are not yet
   dispositionable by `closure-dispose`; whether an operator review may close
   one is a dated question for the operator, not decided here.

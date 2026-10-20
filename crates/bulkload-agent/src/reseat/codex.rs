@@ -1734,10 +1734,18 @@ fn reseat_unindexed(
             ))?;
             continue;
         }
-        // By provenance (independent review of #280, N4): a rollout this
-        // run's pull did not list on the source is the destination's own,
-        // in place, whatever its `cwd`; nothing of it is read.
+        // Provenance is sticky (verification of #280, N4 across passes): a
+        // rollout an earlier pass recorded as the source's (a ledger row of
+        // any outcome but `in-place`) is never taken for the destination's
+        // own; its typed outcome stands until dispositioned.
+        let known = ledger
+            .session(TOOL, &id)?
+            .is_some_and(|row| row.outcome != "in-place");
+        // By provenance (independent review of #280, N4): a rollout the
+        // pulls did not list on the source is the destination's own, in
+        // place, whatever its `cwd`; nothing of it is read.
         if live
+            && !known
             && options
                 .codex_listing
                 .as_ref()
@@ -1747,7 +1755,7 @@ fn reseat_unindexed(
             emit(&thread_line((&id, ""), None, "in-place", None, None))?;
             continue;
         }
-        if live && row_of(&dest.conn, &id)?.is_some() {
+        if live && !known && row_of(&dest.conn, &id)?.is_some() {
             summary.session(TOOL, "in-place");
             emit(&thread_line((&id, ""), None, "in-place", None, None))?;
             continue;
@@ -1779,6 +1787,7 @@ fn reseat_unindexed(
             // A source rollout there stays resumable by ID: `codex resume
             // <id>` finds the file by its UUID.
             None if live
+                && !known
                 && options.codex_listing.is_none()
                 && !Path::new(&cwd).starts_with(&options.source_home) =>
             {
