@@ -924,15 +924,37 @@ fn h13_check_and_dry_run_write_nothing() {
 #[test]
 fn h14_estate_diff_reads_a_handed_off_item_as_identical() {
     let world = World::new();
-    let target_bytes = |world: &World| -> u64 {
+    let targets = |world: &World| -> Vec<PathBuf> {
         [world.dst(), world.dst_wt()]
             .iter()
             .flat_map(|w| [w.join("AGENTS.md"), w.join("CLAUDE.md")])
+            .collect()
+    };
+    let target_bytes = |world: &World| -> u64 {
+        targets(world)
+            .iter()
             .map(|path| fs::metadata(path).unwrap().len())
             .sum()
     };
-    // The landing's seats are racy against its ledger until a converge
-    // records them again: the diff reads them by content either way.
+    // Each diff reads every target by content: each is re-stamped first,
+    // its bytes unchanged (mtime set an hour back; the ctime moves with
+    // it), so no print of it is trusted. The landing's ledger and the
+    // hand-off's record trust an unchanged print stamped more than the 2 s
+    // racy allowance before they were recorded, and both write their files
+    // first, so whether a target was read rested on how long the landing or
+    // the hand-off took (under load one diff read a worktree's two targets,
+    // 43 bytes, that the other did not). The other seats are read alike by
+    // both diffs, against the one ledger, and cancel out.
+    let restamp = |world: &World| {
+        for path in targets(world) {
+            let stamp = fs::symlink_metadata(&path).unwrap().modified().unwrap();
+            fs::File::open(&path)
+                .unwrap()
+                .set_modified(stamp - std::time::Duration::from_hours(1))
+                .unwrap();
+        }
+    };
+    restamp(&world);
     let before = *world
         .diff()
         .counters
@@ -941,6 +963,7 @@ fn h14_estate_diff_reads_a_handed_off_item_as_identical() {
     let landed = target_bytes(&world);
     assert!(world.handoff(&[]).ok);
     settle();
+    restamp(&world);
     let diff = world.diff();
     let line = diff
         .stdout

@@ -31,32 +31,36 @@ USAGE:
 SUBCOMMANDS:
     selftest    Hash a temporary file and round-trip a postcard frame
     walk PATH   Stat-walk PATH and print the row and refusal counts
-    copy [--beside SUFFIX] [--map-prefix SRC_REL=DST_REL]... SOURCE DEST SOURCE_STATE DEST_STATE
+    copy [--file] [--beside SUFFIX] [--map-prefix SRC_REL=DST_REL]... SOURCE DEST SOURCE_STATE DEST_STATE
                 Native local copy with private resumable chunk stores; the
                 session's outcomes are recorded in
                 DEST_STATE/transfer.closure.d, one record per transfer, for
                 closure-report --transfer (WP3 PR 4). The S2 overlap checks
                 run before anything is written; a session that ends refused
-                keeps the earlier session's refused rows.
+                keeps the earlier session's refused rows. --file: SOURCE is
+                one file (or symlink, carried as a link), landed as DEST
+                (#232; BOUNDARIES).
                 --beside SUFFIX (plan of record 2026-10-19, C1/C2): land
                 into a live destination. An existing file bulkload did not
                 write is adopted when its bytes are the source's and
                 extended when it is a verified byte prefix of an
                 append-only source (as without the flag); one that differs
-                (and a symlink that differs) is left as it is and the
-                source's bytes are published at <path>SUFFIX, recorded
+                (and a symlink that differs, and a node of another kind,
+                directories included) is left as it is and the source's
+                bytes are published at <path>SUFFIX, recorded
                 applied-beside in the transfer record (closure counts it
                 carried, never pending review). A database with a live
                 -wal/-shm/-journal beside it lands its snapshot at
                 <db>SUFFIX. A beside path holding something of its own is
                 refused DESTINATION_OCCUPIED; only this store's own earlier
-                beside output is superseded. An append-only file (.jsonl,
-                .txt) whose live copy is settled and holds the source's
-                bytes and more (the destination continued it, #280 finding
-                9) is left as it is and recorded dest-ahead (covered),
-                nothing written. SUFFIX is one name component
-                (e.g. .neo-20261019). Without the flag a differing file is
-                refused DESTINATION_OCCUPIED and nothing is placed.
+                beside output is superseded. A live path is never replaced
+                under the flag. An append-only file (.jsonl, .txt) whose
+                live copy is settled and holds the source's bytes and more
+                (the destination continued it, #280 finding 9) is left as
+                it is and recorded dest-ahead (covered), nothing written.
+                SUFFIX is one name component (e.g. .neo-20261019). Without
+                the flag a differing file is refused DESTINATION_OCCUPIED
+                and nothing is placed.
                 --map-prefix SRC_REL=DST_REL (repeatable; #280 finding 9):
                 a receive-side rename, the wire unchanged. An entry at
                 SRC_REL or under SRC_REL/ (whole path components, the
@@ -70,11 +74,16 @@ SUBCOMMANDS:
                 a side that is not a relative path of whole components, one
                 source or one destination twice, and a destination whose
                 parent is not where its source's parent lands
-    pull [--beside SUFFIX] [--map-prefix SRC_REL=DST_REL]... HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
+    pull [--file] [--beside SUFFIX] [--map-prefix SRC_REL=DST_REL]... HOST SOURCE DEST SOURCE_STATE DEST_STATE [REMOTE_EXECUTABLE [SSH_CONFIG]]
                 Native SSH pull; remote bulkload-agent must be installed; the
-                session is recorded in DEST_STATE as copy's is; --beside and
+                session is recorded in DEST_STATE as copy's is. --file as
+                copy's, run on the source as serve --file; --beside and
                 --map-prefix as copy's
-    serve       Serve one framed request on stdin/stdout (for SSH)
+    serve [--file]
+                Serve one framed request on stdin/stdout (for SSH). With
+                --file the root the request names is one file or symlink,
+                never followed (pull --file passes it); any other word is
+                refused
     git-export REPO NEW_CAPTURE_DIR [--include-rebuildable]
                 Archive refs/stashes and staged/worktree trees in a bundle
     git-carry-estimate [--state-dir DIR] SOURCE_REPO DEST [SOURCE_REPO DEST ...]
@@ -494,6 +503,7 @@ SUBCOMMANDS:
                   [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
                   [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
                   [--landing-codex-index FILE | --no-landing-codex-index] [--beside-suffix SUFFIX]
+                  [--dest-claude DIR] [--dest-codex DIR] [--claude-listing FILE] [--codex-listing FILE]
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
@@ -674,7 +684,33 @@ BOUNDARIES:
     priority_escalate_after=SECONDS, and priority_escalations,
     priority_escalated_ns, priority_escalated_threads and
     priority_escalation_failures record it.
-    copy/pull require an existing destination directory.
+    copy/pull make an absent DEST themselves when its parent exists, once
+    the source's root opened, and never a parent (DESTINATION_PARENT_MISSING;
+    #232; R2.2, the run writes where it was asked and nowhere else). copy
+    gives the new root the source root's permission bits, pull (whose wire
+    carries no root row) 0700, never wider, and the umask narrows either; a
+    root made for a session whose own setup then refuses is removed while
+    still empty. A symlink at DEST, or a regular or
+    special file where a tree would land, is DESTINATION_KIND_MISMATCH, as
+    is a directory at DEST under --file and a symlink where a regular file
+    lands; no link at DEST is followed, a trailing / on DEST included.
+    --file (#232): SOURCE is one file and DEST the file it lands as, in
+    DEST's existing parent, under DEST's own name. Only SOURCE's parent is
+    resolved: a regular file is carried byte for byte, a symlink as a
+    symlink with its literal target (never its target's bytes). An
+    identical file or link at DEST is adopted, a differing one is refused
+    DESTINATION_OCCUPIED, and an unchanged rerun reads 0 bytes for it, as
+    for a seat in a tree; its rows are keyed as a tree session of SOURCE's
+    parent keys them, so a later tree pass of that parent with the same
+    states reuses them. pull --file runs the source half as serve --file.
+    Under --file the leaf is judged by the walk, after the session opened:
+    an absent one is a SOURCE_VANISHED row and a directory or special file
+    a SOURCE_ROOT_KIND_MISMATCH row, each typed in the destination's record.
+    A regular file named without --file is SOURCE_ROOT_KIND_MISMATCH; an
+    absent tree root or --file parent SOURCE_ROOT_MISSING; one that cannot
+    be resolved or opened SOURCE_ROOT_UNREADABLE with its errno. Over ssh
+    those are the source's whole-session refusal and reach the operator
+    through its stderr; the wire is unchanged (v6).
     copy/pull replace only their own untouched outputs, when the source seat
     changed (superseding publish, WP0(d)); any other divergent destination
     file is preserved and refused DESTINATION_OCCUPIED, and remembered: an
@@ -917,14 +953,7 @@ fn main() -> ExitCode {
         Some("closure-dispose") => dispose_command(&args.collect::<Vec<_>>()),
         Some("transfer-expect") => expect_command(&args.collect::<Vec<_>>()),
         Some("estate-reseat") => reseat_command(&args.collect::<Vec<_>>()),
-        Some("serve") => {
-            let (input, output) = (std::io::stdin(), std::io::stdout());
-            bulkload_agent::transfer::tune_stream(&input);
-            bulkload_agent::transfer::tune_stream(&output);
-            // The reader thread owns stdin for the session; the process
-            // exit closes the transport.
-            bulkload_agent::transfer::serve(input, &mut output.lock())
-        }
+        Some("serve") => serve_command(&args.collect::<Vec<_>>()),
         Some("help" | "--help" | "-h") => {
             println!("{USAGE}");
             return ExitCode::SUCCESS;
@@ -1078,6 +1107,51 @@ fn global_flags(
         }
     }
     Ok(rest)
+}
+
+/// `copy [--file] ...` and `pull [--file] ...`: a leading `--file` (#232)
+/// names a single-file root.
+fn transfer_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
+    let (kind, args) = transfer_options(args)?;
+    let path = |index: usize| {
+        args.get(index)
+            .map(Path::new)
+            .ok_or(BulkloadRefusal::RequiredFieldMissing)
+    };
+    match command {
+        "copy" if args.len() == 4 => {
+            // WP3 PR 4: the session's outcomes are closure rows.
+            copy_recorded_kind(kind, path(0)?, path(1)?, path(2)?, path(3)?)
+        }
+        "pull" if (5..=7).contains(&args.len()) => pull_recorded_kind(kind, args),
+        _ => Err(BulkloadRefusal::RequiredFieldMissing),
+    }
+}
+
+/// `serve [--file]`: one framed session on stdin/stdout. `--file` (#232) is
+/// its one option; another word is refused, where before it was ignored.
+fn serve_command(args: &[std::ffi::OsString]) -> Result<()> {
+    let (kind, rest) = root_kind(args);
+    if !rest.is_empty() {
+        return Err(BulkloadRefusal::FieldDomainViolation);
+    }
+    let (input, output) = (std::io::stdin(), std::io::stdout());
+    bulkload_agent::transfer::tune_stream(&input);
+    bulkload_agent::transfer::tune_stream(&output);
+    // The reader thread owns stdin for the session; the process exit closes
+    // the transport.
+    bulkload_agent::transfer::serve_kind(input, &mut output.lock(), kind)
+}
+
+/// Split a leading `--file` (#232) from a transfer verb's arguments: the
+/// root is one regular file, else a tree.
+fn root_kind(
+    args: &[std::ffi::OsString],
+) -> (bulkload_agent::transfer::RootKind, &[std::ffi::OsString]) {
+    match args.split_first() {
+        Some((flag, rest)) if flag == "--file" => (bulkload_agent::transfer::RootKind::File, rest),
+        _ => (bulkload_agent::transfer::RootKind::Tree, args),
+    }
 }
 
 // OI-1001-Q2: bulkload's own closure gate. The JSON ledger goes to stdout
@@ -1358,16 +1432,28 @@ fn export_command(
     Ok(())
 }
 
-/// Take the leading `--beside SUFFIX` (or `--beside=SUFFIX`, once) and
-/// `--map-prefix SRC_REL=DST_REL` (or `--map-prefix=...`, repeatable)
-/// options off `args`, setting the process's beside suffix and maps, and
-/// return the rest.
-fn transfer_options(args: &[std::ffi::OsString]) -> Result<&[std::ffi::OsString]> {
+/// Take the leading `--file` (#232, once), `--beside SUFFIX` (or
+/// `--beside=SUFFIX`, once) and `--map-prefix SRC_REL=DST_REL` (or
+/// `--map-prefix=...`, repeatable) options off `args`, in any order,
+/// setting the process's beside suffix and maps, and return the root kind
+/// and the rest.
+fn transfer_options(
+    args: &[std::ffi::OsString],
+) -> Result<(bulkload_agent::transfer::RootKind, &[std::ffi::OsString])> {
     use std::os::unix::ffi::OsStrExt as _;
     let mut at = 0;
+    let mut kind = bulkload_agent::transfer::RootKind::Tree;
     let mut suffix = None;
     let mut maps = Vec::new();
     while let Some(arg) = args.get(at).map(|arg| arg.as_bytes()) {
+        if arg == b"--file" {
+            if kind == bulkload_agent::transfer::RootKind::File {
+                return Err(BulkloadRefusal::FieldDomainViolation);
+            }
+            kind = bulkload_agent::transfer::RootKind::File;
+            at += 1;
+            continue;
+        }
         let (value, taken) = match arg {
             b"--beside" | b"--map-prefix" => (
                 args.get(at + 1)
@@ -1399,7 +1485,7 @@ fn transfer_options(args: &[std::ffi::OsString]) -> Result<&[std::ffi::OsString]
     if suffix.is_some() {
         bulkload_agent::transfer::set_beside_suffix(suffix)?;
     }
-    Ok(args.get(at..).unwrap_or_default())
+    Ok((kind, args.get(at..).unwrap_or_default()))
 }
 
 #[allow(clippy::too_many_lines)] // One arm per verb; `--beside` for copy and pull.
@@ -1440,25 +1526,10 @@ fn native_command(command: &str, args: &[std::ffi::OsString]) -> Result<()> {
             println!("{count}");
             Ok(())
         }
-        // `--beside SUFFIX` and `--map-prefix SRC_REL=DST_REL` lead the
-        // positional arguments of copy and pull (plan of record 2026-10-19,
-        // C1/C2; #280 finding 9).
-        "copy" | "pull" => {
-            let rest = transfer_options(args)?;
-            let path = |index: usize| {
-                rest.get(index)
-                    .map(Path::new)
-                    .ok_or(BulkloadRefusal::RequiredFieldMissing)
-            };
-            match command {
-                "copy" if rest.len() == 4 => {
-                    // WP3 PR 4: the session's outcomes are closure rows.
-                    copy_recorded(path(0)?, path(1)?, path(2)?, path(3)?)
-                }
-                "pull" if (5..=7).contains(&rest.len()) => pull_recorded(rest),
-                _ => Err(BulkloadRefusal::RequiredFieldMissing),
-            }
-        }
+        // `--beside SUFFIX` (plan of record 2026-10-19, C1/C2), `--file`
+        // (#232) and `--map-prefix SRC_REL=DST_REL` (#280 finding 9) lead
+        // the positional arguments of copy and pull, in any order.
+        "copy" | "pull" => transfer_command(command, args),
         "snapshot" if (2..=3).contains(&args.len()) => {
             bulkload_agent::provider_sqlite::snapshot(path(0)?, path(1)?, steps(args.get(2))?)?;
             println!("snapshot complete");
@@ -1929,6 +2000,31 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     reseat_run(args).map(drop)
 }
 
+/// `path`, when it is a real directory (no link on the way: it is its own
+/// canonical path) that this user owns; else `PATH_ESCAPES_ROOT`
+/// (independent review of #280, N1: the live homes the pull resolved).
+fn owned_real_dir(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let real = std::fs::canonicalize(path).refuse_at("main::owned_real_dir")?;
+    let found = std::fs::symlink_metadata(&real).refuse_at("main::owned_real_dir")?;
+    // SAFETY: geteuid has no preconditions or side effects.
+    let me = unsafe { libc::geteuid() };
+    if real != path || !found.is_dir() || found.uid() != me {
+        return Err(BulkloadRefusal::PathEscapesRoot);
+    }
+    Ok(real)
+}
+
+/// A source listing file: relative paths, each ended by a NUL.
+fn read_listing(path: &Path) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let bytes = std::fs::read(path).refuse_at("main::read_listing")?;
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
 /// `estate-reseat`, returning a pass's summary (`None` for `--check` and
 /// `--undo`), which `estate-move` folds into its gate (C11).
 #[allow(clippy::too_many_lines)]
@@ -1943,6 +2039,8 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
     let (mut landing_claude, mut landing_codex) = (None, None);
     let mut landing_index = bulkload_agent::reseat::LandingIndex::InLanding;
     let mut beside_suffix = None;
+    let (mut dest_claude, mut dest_codex) = (None, None);
+    let (mut claude_listing, mut codex_listing) = (None, None);
     let mut unmapped = Unmapped::Report;
     let mut marker = None;
     let mut sessions_only = false;
@@ -2019,6 +2117,10 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
             | "--landing-claude"
             | "--landing-codex"
             | "--landing-codex-index"
+            | "--dest-claude"
+            | "--dest-codex"
+            | "--claude-listing"
+            | "--codex-listing"
             | "--managed-settings"
             | "--by-id"
             | "--replace-archived-dest"
@@ -2030,6 +2132,10 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
                     "--private-state" => states.push(path),
                     "--codex-source-root" => roots.push(path),
                     "--landing-claude" => landing_claude = Some(path),
+                    "--dest-claude" => dest_claude = Some(owned_real_dir(&path)?),
+                    "--dest-codex" => dest_codex = Some(owned_real_dir(&path)?),
+                    "--claude-listing" => claude_listing = Some(read_listing(&path)?),
+                    "--codex-listing" => codex_listing = Some(read_listing(&path)?),
                     "--landing-codex-index" => {
                         if !path.is_absolute() {
                             return Err(BulkloadRefusal::PathNotAbsolute);
@@ -2133,6 +2239,14 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
     }
     options.landing_index = landing_index;
     options.beside_suffix = beside_suffix;
+    if let Some(path) = dest_claude {
+        options.dest_claude = path;
+    }
+    if let Some(path) = dest_codex {
+        options.dest_codex = path;
+    }
+    options.claude_listing = claude_listing;
+    options.codex_listing = codex_listing;
     if !roots.is_empty() {
         options.codex_source_roots = roots;
     }
@@ -2450,16 +2564,61 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
 // canonical SOURCE and DEST so a rerun spelled another way names the same
 // rows. S2 (review finding 1): the overlap decision is made before the
 // record's first write, so a refused overlap writes nothing anywhere.
+/// The source listing of the last recorded `copy` or `pull` of this
+/// process ([`bulkload_agent::transfer::set_listing`]): what `estate-move`
+/// hands `estate-reseat` as provenance (independent review of #280, N4).
+static LAST_LISTED: std::sync::Mutex<Option<Vec<Vec<u8>>>> = std::sync::Mutex::new(None);
+
+fn keep_listed(stats: &bulkload_agent::transfer::TransferStats) {
+    *LAST_LISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stats.listed.clone());
+}
+
+/// Take the last recorded session's listing (`None` when none ended).
+fn take_listed() -> Option<Vec<Vec<u8>>> {
+    LAST_LISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &Path) -> Result<()> {
+    copy_recorded_kind(
+        bulkload_agent::transfer::RootKind::Tree,
+        source,
+        dest,
+        source_state,
+        dest_state,
+    )
+}
+
+// #232: `copy_recorded` of a root of `kind` (`copy --file`).
+fn copy_recorded_kind(
+    kind: bulkload_agent::transfer::RootKind,
+    source: &Path,
+    dest: &Path,
+    source_state: &Path,
+    dest_state: &Path,
+) -> Result<()> {
     let stats = bulkload_agent::transfer_outcome::record_session(
         dest_state,
         "copy",
         &bulkload_agent::transfer_outcome::copy_source(source),
         &bulkload_agent::transfer_outcome::stable(dest),
         "transfer::copy",
-        || bulkload_agent::transfer::copy_roots_apart(source, dest, source_state, dest_state),
-        || bulkload_agent::transfer::copy(source, dest, source_state, dest_state),
+        || {
+            bulkload_agent::transfer::copy_roots_apart_kind(
+                source,
+                dest,
+                source_state,
+                dest_state,
+                kind,
+            )
+        },
+        || bulkload_agent::transfer::copy_kind(source, dest, source_state, dest_state, kind),
     )?;
+    keep_listed(&stats);
     report_transfer(&stats)
 }
 
@@ -2467,6 +2626,14 @@ fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &P
 // HOST:SOURCE and the canonical DEST, recorded in DEST_STATE around the
 // session (`pull_command`, whose ssh child the S2 registry pins).
 fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
+    pull_recorded_kind(bulkload_agent::transfer::RootKind::Tree, args)
+}
+
+// #232: `pull_recorded` of a root of `kind` (`pull --file`).
+fn pull_recorded_kind(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<()> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2479,10 +2646,13 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
         &bulkload_agent::transfer_outcome::pull_source(host, path(1)?),
         &bulkload_agent::transfer_outcome::stable(path(2)?),
         "transfer::pull",
-        || bulkload_agent::transfer::receive_roots_apart(path(2)?, path(4)?),
-        || pull_command(args),
+        || bulkload_agent::transfer::receive_roots_apart_kind(path(2)?, path(4)?, kind),
+        || pull_command(kind, args),
     )
-    .and_then(|stats| report_transfer(&stats))
+    .and_then(|stats| {
+        keep_listed(&stats);
+        report_transfer(&stats)
+    })
 }
 
 // M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,
@@ -2518,7 +2688,7 @@ fn carry_files_command(args: &[std::ffi::OsString]) -> Result<()> {
             // parser requires the one with the other.
             args.extend(self.remote.iter().cloned());
             args.extend(self.config.iter().cloned());
-            pull_command(&args)
+            pull_command(bulkload_agent::transfer::RootKind::Tree, &args)
         }
     }
     let mut options = CarryOptions::default();
@@ -2651,7 +2821,10 @@ fn expect_command(args: &[std::ffi::OsString]) -> Result<()> {
     Ok(())
 }
 
-fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer::TransferStats> {
+fn pull_command(
+    kind: bulkload_agent::transfer::RootKind,
+    args: &[std::ffi::OsString],
+) -> Result<bulkload_agent::transfer::TransferStats> {
     let path = |index: usize| {
         args.get(index)
             .map(Path::new)
@@ -2688,8 +2861,12 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer:
     if bulkload_agent::durable::ledger_sync() == bulkload_agent::durable::LedgerSync::Full {
         ssh.arg("--source-ledger-sync=full");
     }
+    ssh.arg("serve");
+    // #232: the source half serves one regular file, as this side lands it.
+    if kind == bulkload_agent::transfer::RootKind::File {
+        ssh.arg("--file");
+    }
     let mut child = ssh
-        .arg("serve")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -2700,13 +2877,14 @@ fn pull_command(args: &[std::ffi::OsString]) -> Result<bulkload_agent::transfer:
         let mut input = child.stdout.take().ok_or(BulkloadRefusal::Io(None))?;
         bulkload_agent::transfer::tune_stream(&output);
         bulkload_agent::transfer::tune_stream(&input);
-        bulkload_agent::transfer::receive(
+        bulkload_agent::transfer::receive_kind(
             &mut input,
             &mut output,
             path(1)?,
             path(3)?,
             path(2)?,
             path(4)?,
+            kind,
         )
     };
     let exit_status = child.wait().refuse_at("main::pull_command")?;

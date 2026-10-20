@@ -486,7 +486,7 @@ pub fn resolve(
     // key that is not under the source home's key is the destination's own
     // (the source's land under keys of source paths), already where Claude
     // Code lists it, with or without a `cwd` its key agrees with.
-    let destination_own = live && !source_keyed(options, &candidate.key);
+    let destination_own = live && destination_own(options, candidate);
     let Some(cwd) = cwd else {
         if destination_own {
             return Ok(Resolved::InPlace(String::new(), None));
@@ -536,6 +536,20 @@ pub fn resolve(
         None if options.by_id(&cwd) => Ok(Resolved::ById(cwd)),
         None => Ok(Resolved::Refused(cwd, BulkloadRefusal::ReseatLaneUnmapped)),
     }
+}
+
+/// Whether `candidate` is the destination's own session (a live-home
+/// landing): by provenance, not in this run's source listing
+/// (`--claude-listing`; independent review of #280, N4), else by its key's
+/// shape ([`source_keyed`]).
+fn destination_own(options: &Options, candidate: &Candidate) -> bool {
+    options.claude_listing.as_ref().map_or_else(
+        || !source_keyed(options, &candidate.key),
+        |listed| {
+            let rel = format!("projects/{}/{}.jsonl", candidate.key, candidate.sid);
+            !listed.contains(rel.as_bytes())
+        },
+    )
 }
 
 /// Whether the project key `key` is one of a path under the source home
@@ -691,6 +705,21 @@ pub fn key_files(
     key: &str,
     dest_key: &str,
 ) -> Result<Vec<(PathBuf, PathBuf, Kind)>> {
+    let mut out = key_files_landed(options, sessions, key, dest_key)?;
+    // A live-home landing: a key's file already at its own destination name
+    // is in place, never placed again or reported kept.
+    if options.live_claude_landing() {
+        out.retain(|(landed, rel, _)| *landed != options.landing_claude.join(rel));
+    }
+    Ok(out)
+}
+
+fn key_files_landed(
+    options: &Options,
+    sessions: &Sessions,
+    key: &str,
+    dest_key: &str,
+) -> Result<Vec<(PathBuf, PathBuf, Kind)>> {
     let base = options.landing_claude.join("projects").join(key);
     let sids: BTreeSet<&str> = sessions
         .list
@@ -748,6 +777,7 @@ pub fn reseat(
     // archive link is consumed by its A-106 replacement (#280 finding 9).
     let placer = Placer::new(ledger, &root)
         .with_archived(&options.replace_archived)
+        .with_kept_suffix(options.beside_suffix.as_deref())
         .with_rebind(&options.rebind)
         .with_beside(options.beside_suffix.as_deref().filter(|_| live));
     let mut keys_done: BTreeSet<(String, String)> = BTreeSet::new();
@@ -768,6 +798,8 @@ pub fn reseat(
         // (with `--replace-archived-dest` replacing the link, A-106); else
         // the link is the destination's own and in place.
         if live && candidate.link {
+            // Its key directory is accounted for: no "kept" report for it.
+            keys_done.insert((candidate.dir.clone(), candidate.key.clone()));
             if !has_beside(sessions, candidate) {
                 in_place(
                     ledger,

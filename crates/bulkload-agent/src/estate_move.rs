@@ -122,7 +122,10 @@ fn jobs(value: Option<&OsString>) -> Result<usize> {
 /// under the roots ([`moving::inventory`]), append the new items to
 /// `MOVE_STATE/carry/plan.postcard` (`estate-add-batch`), and capture the
 /// plan into `MOVE_STATE/carry/corpus` (`estate-capture`, private state in
-/// `MOVE_STATE/private`). A capture refusal is an item's (its line says
+/// `MOVE_STATE/private`), and make `MOVE_STATE/serve` and
+/// `MOVE_STATE/serve/carry`, where the destination half's `pull`s and its
+/// carry phase keep their `serve` states (#276). A capture
+/// refusal is an item's (its line says
 /// why; the destination carries it as files); only a refusal of the whole
 /// capture fails the verb.
 #[allow(clippy::too_many_lines)] // Arguments, then the inventory and capture.
@@ -164,6 +167,16 @@ fn source_command(args: &[OsString]) -> Result<()> {
     let _lock = moving::lock(&state)?;
     let carry = state.join("carry");
     moving::private_dir(&carry)?;
+    // #276: the destination half's `pull`s name their source states under
+    // `MOVE_STATE/serve/NAME` (the corpus, the sessions) and its carry
+    // phase under `MOVE_STATE/serve/carry/ITEM` (`estate-carry-files
+    // --source-state-root`), on this host, over the transport it chose. The
+    // directories are this verb's, like `carry/` and `private/`, so they are
+    // here before the first `serve` is asked to open a state in them
+    // (`serve` makes every missing parent too, for a state handed to it by
+    // anything else).
+    moving::private_dir(&state.join("serve"))?;
+    moving::private_dir(&state.join("serve/carry"))?;
     // The pass's mark: `estate-move` refuses a corpus pulled while a pass
     // was still writing it (its `done` mark is another pass's, or none).
     let pass = now_ns().to_string();
@@ -189,7 +202,8 @@ fn source_command(args: &[OsString]) -> Result<()> {
             note.code.unwrap_or("none"),
         ))?;
     }
-    let existing = if plan.try_exists().refuse_at("estate_move::source")? {
+    let plan_existed = plan.try_exists().refuse_at("estate_move::source")?;
+    let existing = if plan_existed {
         estate::inspect(&plan)?
     } else {
         Vec::new()
@@ -209,7 +223,10 @@ fn source_command(args: &[OsString]) -> Result<()> {
         .map(|planned| planned.item.clone())
         .filter(|item| !existing.contains(item))
         .collect();
-    if !new.is_empty() {
+    // A first pass whose roots hold no repository still writes its (empty)
+    // plan, so the pass completes and the destination half reads a plan,
+    // never `IO (errno 2)` (#283 review 5).
+    if !new.is_empty() || !plan_existed {
         estate::add_batch(&plan, &new)?;
     }
     let planned = estate::inspect(&plan)?.len();
@@ -222,13 +239,14 @@ fn source_command(args: &[OsString]) -> Result<()> {
             .sum()
     };
     out(&format!(
-        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} prunable={} unreadable={} not_in_census={}",
+        "estate-move-source phase=inventory outcome=ok items={} new={} planned={planned} symlinks={} not_git_files={} prunable={} unreadable={} source_vanished={} not_in_census={}",
         found.items.len(),
         new.len(),
         noted("symlink"),
         noted("not-git"),
         noted("prunable"),
         noted("unreadable"),
+        noted("source-vanished"),
         noted("not-in-census"),
     ))?;
     let policy = if rebuildable {
@@ -334,6 +352,53 @@ enum Mode {
     /// `--key-map-proof` (#280 finding 9): report only, from the plan an
     /// earlier pass pulled; nothing is pulled, locked or written.
     KeyMapProof,
+}
+
+/// The real `.claude` and `.codex` this pass's pull ran under, resolved
+/// once and owner-checked ([`Move::live_root`]): the re-seat runs under
+/// exactly these (independent review of #280, N1).
+struct Homes {
+    claude: PathBuf,
+    codex: PathBuf,
+}
+
+/// The real directory `path` resolves to, when this user owns it.
+fn owned_real(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let real = std::fs::canonicalize(path).refuse_at("estate_move::owned_real")?;
+    let resolved = std::fs::symlink_metadata(&real).refuse_at("estate_move::owned_real")?;
+    // SAFETY: geteuid has no preconditions or side effects.
+    let me = unsafe { libc::geteuid() };
+    if !resolved.is_dir() || resolved.uid() != me {
+        return Err(BulkloadRefusal::PathEscapesRoot);
+    }
+    Ok(real)
+}
+
+/// Whether the live home `live` still resolves to `real`, the directory
+/// this pass's pull ran under: a home relinked since is refused
+/// `PATH_ESCAPES_ROOT`, so no re-seat runs over a tree the pull never
+/// wrote (independent review of #280, N1).
+fn same_home(live: &Path, real: &Path) -> Result<()> {
+    if owned_real(live)? == real {
+        Ok(())
+    } else {
+        Err(BulkloadRefusal::PathEscapesRoot)
+    }
+}
+
+/// Write a session's source listing (NUL-ended relative paths).
+fn write_listing(path: &Path, listed: Option<Vec<Vec<u8>>>) -> Result<()> {
+    let _ = std::fs::remove_file(path);
+    if let Some(listed) = listed {
+        let mut bytes = Vec::new();
+        for entry in listed {
+            bytes.extend_from_slice(&entry);
+            bytes.push(0);
+        }
+        moving::write_report(path, &bytes)?;
+    }
+    Ok(())
 }
 
 /// The destination half's arguments.
@@ -534,7 +599,8 @@ impl Move {
         self.transfer_into(from, to, name)
     }
 
-    // [`Self::transfer`] into a live destination tree (the agent's own home
+    // The real root a transfer into a live destination tree runs under (the
+    // agent's own home
     // directory, plan of record 2026-10-19 C9): created 0700 when absent,
     // else taken as it is, whatever its mode (its mode is the agent's, not
     // bulkload's to tighten). A symlink there (sting's `~/.claude` and
@@ -544,40 +610,26 @@ impl Move {
     // path, following no further link; the line below and the transfer's
     // record (its destination is the real path) name it. Anything else
     // refuses PATH_ESCAPES_ROOT.
-    fn transfer_live(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
-        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
-        let real = match std::fs::DirBuilder::new().mode(0o700).create(to) {
-            Ok(()) => to.to_path_buf(),
+    fn live_root(to: &Path, name: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        match std::fs::DirBuilder::new().mode(0o700).create(to) {
+            Ok(()) => Ok(to.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let found =
-                    std::fs::symlink_metadata(to).refuse_at("estate_move::transfer_live")?;
+                let found = std::fs::symlink_metadata(to).refuse_at("estate_move::live_root")?;
                 if found.is_dir() {
-                    to.to_path_buf()
-                } else if found.file_type().is_symlink() {
-                    let real = std::fs::canonicalize(to).refuse_at("estate_move::transfer_live")?;
-                    let resolved =
-                        std::fs::symlink_metadata(&real).refuse_at("estate_move::transfer_live")?;
-                    // SAFETY: geteuid has no preconditions or side effects.
-                    let me = unsafe { libc::geteuid() };
-                    if !resolved.is_dir() || resolved.uid() != me {
-                        return Err(BulkloadRefusal::PathEscapesRoot);
-                    }
-                    out(&format!(
-                        "estate-move sessions-home name={name} live={to:?} real={real:?}"
-                    ))?;
-                    real
-                } else {
+                    return Ok(to.to_path_buf());
+                }
+                if !found.file_type().is_symlink() {
                     return Err(BulkloadRefusal::PathEscapesRoot);
                 }
+                let real = owned_real(to)?;
+                out(&format!(
+                    "estate-move sessions-home name={name} live={to:?} real={real:?}"
+                ))?;
+                Ok(real)
             }
-            Err(error) => {
-                return Err(bulkload_agent::refuse::io(
-                    &error,
-                    "estate_move::transfer_live",
-                ))
-            }
-        };
-        self.transfer_into(from, &real, name)
+            Err(error) => Err(bulkload_agent::refuse::io(&error, "estate_move::live_root")),
+        }
     }
 
     fn transfer_into(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
@@ -789,10 +841,8 @@ fn move_command(args: &[OsString]) -> Result<()> {
         let pass_started = now_secs();
         // #280 finding 9: the source's project keys land at their lanes'
         // destination keys, once; ambiguous keys stay, typed.
-        let derived = derive_key_maps(&run, home, &plan)?;
-        print_key_maps(&derived)?;
-        let pulled = sessions_pull(&run, home, &derived.prefixes());
-        key_maps = Some(derived);
+        let (pulled, homes, derived) = sessions_pull(&run, home, &plan);
+        key_maps = derived;
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
         let mut outcome = Sessions {
@@ -802,8 +852,8 @@ fn move_command(args: &[OsString]) -> Result<()> {
                 .collect(),
             reseat: None,
         };
-        if session_completed(&pulled) {
-            let reseated = reseat(&run, home, (&plan, &corpus, &private), pass_started);
+        if let (true, Some(homes)) = (session_completed(&pulled), &homes) {
+            let reseated = reseat(&run, home, homes, (&plan, &corpus, &private), pass_started);
             let ended: Result<()> = reseated.as_ref().map(drop).map_err(Clone::clone);
             note(&ended);
             reached(&mut ledger, &ledger_path, "reseat", word(&ended))?;
@@ -1091,35 +1141,95 @@ const STATE_DB: &str = "state_5.sqlite";
 // returned; the first refusal is the phase's. `ITEMS_REFUSED` means the
 // session completed with typed path refusals (closure rows), which does
 // not stop the re-seat (C10).
-fn sessions_pull(run: &Move, home: &Path, key_maps: &[(Vec<u8>, Vec<u8>)]) -> Result<()> {
-    let dest = dest_home(run)?;
-    let codex_root = run
+fn sessions_pull(
+    run: &Move,
+    home: &Path,
+    plan: &Path,
+) -> (
+    Result<()>,
+    Option<Homes>,
+    Option<bulkload_agent::reseat::keymap::KeyMaps>,
+) {
+    let dest = match dest_home(run) {
+        Ok(dest) => dest,
+        Err(refusal) => return (Err(refusal), None, None),
+    };
+    let codex_from = run
         .codex_root
         .clone()
         .unwrap_or_else(|| home.join(".codex"));
-    bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()))?;
-    // The Claude tree with the key maps (#280 finding 9), the Codex tree
-    // without: its rollouts are kept by date, not by working directory.
-    bulkload_agent::transfer::set_map_prefixes(key_maps.to_vec())?;
-    let claude = run.transfer_live(&home.join(".claude"), &dest.join(".claude"), "claude");
+    let pulls = run.state.join("pull");
+    let suffix = bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()));
+    // The source's transcripts and rollouts, listed by each session: the
+    // provenance the re-seat tells them from the destination's own by
+    // (independent review of #280, N4). Listed as they land: under their
+    // mapped keys.
+    bulkload_agent::transfer::set_listing(vec![b"projects/".to_vec()]);
+    let _ = super::take_listed();
+    let claude_root = Move::live_root(&dest.join(".claude"), "claude");
+    // #280 finding 9: the Claude tree with the key map of this pass's lanes,
+    // derived for the real, owner-checked home the pull runs under; the
+    // Codex tree without (its rollouts are kept by date, not by working
+    // directory). A map that cannot be derived or set holds the Claude pull:
+    // pulled unmapped, every re-keyed transcript would land twice.
+    let key_maps = claude_root
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|real| derive_key_maps(run, home, plan, real));
+    let claude = key_maps
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|maps| {
+            print_key_maps(maps)?;
+            bulkload_agent::transfer::set_map_prefixes(maps.prefixes())
+        })
+        .and_then(|()| {
+            claude_root
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(|real| run.transfer_into(&home.join(".claude"), real, "claude"))
+        });
     let unmapped = bulkload_agent::transfer::set_map_prefixes(Vec::new());
+    let claude_listed = write_listing(&pulls.join("claude.listing"), super::take_listed());
     // The Codex index always lands beside, as this pass's snapshot: the
     // pull never writes the live index (review of #280, finding 6).
+    bulkload_agent::transfer::set_listing(vec![
+        b"sessions/".to_vec(),
+        b"archived_sessions/".to_vec(),
+    ]);
     bulkload_agent::transfer::set_beside_always(vec![STATE_DB.as_bytes().to_vec()]);
-    let codex = run.transfer_live(&codex_root, &dest.join(".codex"), "codex");
+    let codex_root = Move::live_root(&dest.join(".codex"), "codex");
+    let codex = codex_root
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|real| run.transfer_into(&codex_from, real, "codex"));
+    let codex_listed = write_listing(&pulls.join("codex.listing"), super::take_listed());
     bulkload_agent::transfer::set_beside_always(Vec::new());
+    bulkload_agent::transfer::set_listing(Vec::new());
     let cleared = bulkload_agent::transfer::set_beside_suffix(None);
     // A session that did not complete outranks one that completed with
     // refused paths: the phase's word says whether the re-seat may run.
     let mut outcome = Ok(());
-    for result in [claude, unmapped, codex, cleared] {
+    for result in [
+        suffix,
+        claude,
+        unmapped,
+        claude_listed,
+        codex,
+        codex_listed,
+        cleared,
+    ] {
         if let Err(refusal) = result {
             if session_completed(&outcome) {
                 outcome = Err(refusal);
             }
         }
     }
-    outcome
+    let homes = match (claude_root, codex_root) {
+        (Ok(claude), Ok(codex)) => Some(Homes { claude, codex }),
+        _ => None,
+    };
+    (outcome, homes, key_maps.ok())
 }
 
 // The Codex index snapshot this pass landed beside the live index: the
@@ -1171,13 +1281,17 @@ fn lane_options(run: &Move, home: &Path, plan: &Path) -> Result<bulkload_agent::
 }
 
 // #280 finding 9: the Claude project-key map of this pass's lanes
-// (`reseat::keymap::derive`).
+// (`reseat::keymap::derive`), for the real, owner-checked `.claude` the
+// pull runs under (`claude`, independent review of #280, N1).
 fn derive_key_maps(
     run: &Move,
     home: &Path,
     plan: &Path,
+    claude: &Path,
 ) -> Result<bulkload_agent::reseat::keymap::KeyMaps> {
-    let options = lane_options(run, home, plan)?;
+    let mut options = lane_options(run, home, plan)?;
+    claude.clone_into(&mut options.dest_claude);
+    claude.clone_into(&mut options.landing_claude);
     bulkload_agent::reseat::keymap::derive(&options)
 }
 
@@ -1219,8 +1333,13 @@ fn key_map_proof(run: &Move) -> Result<()> {
         .as_ref()
         .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
     let plan = run.state.join("carry").join("plan.postcard");
-    let options = lane_options(run, home, &plan)?;
-    let maps = bulkload_agent::reseat::keymap::derive(&options)?;
+    // The live `.claude` resolved and owner-checked as the pull resolves
+    // it (N1), never created: report only.
+    let claude = owned_real(&dest_home(run)?.join(".claude"))?;
+    let maps = derive_key_maps(run, home, &plan, &claude)?;
+    let mut options = lane_options(run, home, &plan)?;
+    options.dest_claude.clone_from(&claude);
+    options.landing_claude = claude;
     print_key_maps(&maps)?;
     let summary = bulkload_agent::reseat::keymap::proof(&options, &maps, &mut |line| out(line))?;
     let counts = summary
@@ -1256,10 +1375,14 @@ const fn session_completed(pulled: &Result<()>) -> bool {
 fn reseat(
     run: &Move,
     home: &Path,
+    homes: &Homes,
     (plan, corpus, private): (&Path, &Path, &Path),
     pass_started: u64,
 ) -> Result<Option<bulkload_agent::reseat::Summary>> {
     let dest_home = dest_home(run)?;
+    // The homes must still be the directories the pull ran under (N1).
+    same_home(&dest_home.join(".claude"), &homes.claude)?;
+    same_home(&dest_home.join(".codex"), &homes.codex)?;
     let codex_root = run
         .codex_root
         .clone()
@@ -1295,7 +1418,27 @@ fn reseat(
     // Review of #280, finding 6: the landed index is the snapshot this
     // pass took, named by this pass's Codex transfer record, or none: never
     // the live index, never an earlier pass's snapshot.
-    match landed_index(run, &dest_home.join(".codex"), pass_started) {
+    let pulls = run.state.join("pull");
+    args.extend([
+        "--dest-claude".into(),
+        homes.claude.clone().into_os_string(),
+        "--landing-claude".into(),
+        homes.claude.clone().into_os_string(),
+        "--dest-codex".into(),
+        homes.codex.clone().into_os_string(),
+        "--landing-codex".into(),
+        homes.codex.clone().into_os_string(),
+    ]);
+    for (flag, name) in [
+        ("--claude-listing", "claude.listing"),
+        ("--codex-listing", "codex.listing"),
+    ] {
+        let listing = pulls.join(name);
+        if listing.is_file() {
+            args.extend([flag.into(), listing.into_os_string()]);
+        }
+    }
+    match landed_index(run, &homes.codex, pass_started) {
         Some(index) => args.extend(["--landing-codex-index".into(), index.into_os_string()]),
         None => args.push("--no-landing-codex-index".into()),
     }

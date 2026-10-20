@@ -348,6 +348,53 @@ checked out detached in `~/git-build/beside-live-home-20261019`.
   `just darwin-check` on pzm is owed before merge. The merge gate
   (`just local-gate-receipt --pr 280 --post`) has not been run.
 
+## Merge gate and independent verification (2026-10-19, at `a1c1cc1` and `7d986f5`)
+
+- **Merge-gate failure: test paths under `/tmp`, not timing.** The gate's
+  `nix develop` runs tests with `TMPDIR=/tmp/nix-shell.*`. The re-seat's
+  default by-ID prefixes are `/private/tmp` and `/tmp` (neo's scratch,
+  OI-1003-Q198 C), so every test path counted as a neo by-ID session.
+  Reproduced at `a1c1cc1` with TMPDIR under `/tmp` (both tests fail), and
+  passing under `/var/tmp`.
+  - `sessions_land_in_the_live_home_beside_and_the_gate_reads_them`: a real
+    defect. The destination's own rowless rollout took the by-ID rule and
+    got a synthesized row in the live index; on sting, its own `/tmp`
+    rollouts would be registered. Fixed by provenance (below): a rollout
+    this pull did not list on the source is in place, before any by-ID
+    rule. Without a listing, a rollout with no lane outside the source
+    home is in place, also before by-ID.
+  - `archive_links_follow_a106_and_destination_links_stay`: test-only. Its
+    "no lane" session sat under `/tmp` and was correctly by-ID; the test
+    passes `--no-default-by-id`.
+- **N1 (partial before): the homes the pull resolved are the homes the
+  re-seat uses.**
+  - `estate-move` passes the real, owner-checked paths to `estate-reseat`
+    (`--dest-claude`, `--dest-codex`, landing alike), and re-resolves both
+    homes first; one relinked since refuses `PATH_ESCAPES_ROOT`.
+  - `estate-reseat --dest-*` refuses any path that is not its own
+    canonical, owned directory.
+  - A destination root swapped for a link before its open is
+    `PATH_ESCAPES_ROOT`, typed.
+  - Tests: `a_destination_root_swapped_for_a_link_is_a_typed_refusal`,
+    `cli_dest_homes_must_be_real_owned_directories`.
+- **N4 (partial before): the destination's own is decided by provenance.**
+  The pull lists the source's transcripts (`projects/…`) and rollouts
+  (`sessions/…`, `archived_sessions/…`) as its walk offers them, and
+  `estate-move` hands that listing to the re-seat (`--claude-listing`,
+  `--codex-listing`). A session in it is the source's: re-seated,
+  by-ID, or `RESEAT_LANE_UNMAPPED`. One not in it is the destination's
+  own, in place. A neo session whose `cwd` is outside neo's home is no
+  longer taken for sting's own. Test: the archive test, now with such a
+  session (`reseat_held=claude/RESEAT_LANE_UNMAPPED:2`).
+- **A-106 line loss.** After the exchange the landed copy stands at the
+  live name, so a destination writer can append to it. If the archive
+  target is also written in that window, the swap is put back, and the
+  copy was deleted with the writer's line in it. Now a copy whose identity
+  changed since staging is never removed. It is published create-only as
+  `<name><suffix>` (the run's beside suffix, else `.bulkload-kept`; `.1` …
+  `.64` if taken), reported `kept-aside` and held for review. Test:
+  `a106_a_copy_written_through_the_live_name_is_kept_aside_on_swap_back`.
+
 ## Open
 
 - **Finding 9 (no duplicate bits, R4):** the source's transcripts land in
@@ -366,9 +413,12 @@ checked out detached in `~/git-build/beside-live-home-20261019`.
   (finding 9, spec above), and an A-106 replacement keeps the source's
   `<id>.jsonl.LABEL` copy beside the placed one: both are duplicate bytes
   until the `--map-prefix` lane lands.
-- The second review notes that A-106's open-descriptor guard may not see
-  an open-append-close writer: a running destination session's next lines
-  can land in the placed copy (not lost, but no longer byte-identical).
+- A-106's open-descriptor guard may not see an open-append-close writer:
+  after a replacement, a running destination session's next lines land in
+  the placed copy, which is then no longer byte-identical to the landing.
+  (This note said "not lost" here before; that was wrong while the
+  swap-back deleted the copy. See the review below: a written copy is now
+  kept aside, never deleted.)
 - Re-seat outcomes that hold the gate (`reseat_held=`) are not yet
   dispositionable by `closure-dispose`; whether an operator review may close
   one is a dated question for the operator, not decided here.

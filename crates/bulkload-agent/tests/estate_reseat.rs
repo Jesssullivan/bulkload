@@ -923,3 +923,25 @@ fn canary_real_claude_picker_lists_a_regularized_transcript() {
         "the picker did not leave; left running, not signalled"
     );
 }
+
+/// Independent review of #280, N1: `--dest-claude` and `--dest-codex` name
+/// the real homes the pull ran under; a path that is not its own canonical
+/// path (a link on the way, a home relinked since) is refused
+/// `PATH_ESCAPES_ROOT` before anything is read or written.
+#[test]
+fn cli_dest_homes_must_be_real_owned_directories() {
+    let world = World::new();
+    let real = world.base.join("state-claude");
+    fs::create_dir_all(&real).unwrap();
+    let link = world.base.join("linked-claude");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let (ok, stdout, stderr) = world.reseat(&["--dest-claude", link.to_str().unwrap()]);
+    assert!(!ok, "{stdout}");
+    assert!(stderr.contains("PATH_ESCAPES_ROOT"), "{stderr}");
+    assert!(!world.base.join("state").exists(), "nothing written");
+    let (ok, _, stderr) = world.reseat(&[
+        "--dest-claude",
+        world.base.join("dest/.claude").to_str().unwrap(),
+    ]);
+    assert!(ok, "{stderr}");
+}

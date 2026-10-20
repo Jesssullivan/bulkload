@@ -793,6 +793,7 @@ pub fn reseat(
         let landed = options.landed_codex(&rel);
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
+            .with_kept_suffix(options.beside_suffix.as_deref())
             .with_rebind(&options.rebind)
             .with_beside(
                 options
@@ -1733,6 +1734,19 @@ fn reseat_unindexed(
             ))?;
             continue;
         }
+        // By provenance (independent review of #280, N4): a rollout this
+        // run's pull did not list on the source is the destination's own,
+        // in place, whatever its `cwd`; nothing of it is read.
+        if live
+            && options
+                .codex_listing
+                .as_ref()
+                .is_some_and(|listed| !listed.contains(file.rel.as_os_str().as_encoded_bytes()))
+        {
+            summary.session(TOOL, "in-place");
+            emit(&thread_line((&id, ""), None, "in-place", None, None))?;
+            continue;
+        }
         if live && row_of(&dest.conn, &id)?.is_some() {
             summary.session(TOOL, "in-place");
             emit(&thread_line((&id, ""), None, "in-place", None, None))?;
@@ -1757,12 +1771,22 @@ fn reseat_unindexed(
         };
         let (dest_cwd, in_lane) = match lanes.lane(Path::new(&cwd))? {
             Some(lane) => (super::key::utf8(&lane.dest_cwd)?.to_owned(), true),
-            None if options.by_id(&cwd) => (cwd.clone(), false),
-            None if live && !Path::new(&cwd).starts_with(&options.source_home) => {
+            // On a live-home landing, a rollout with no lane outside the
+            // source home is the destination's own: in place, never given a
+            // row. Decided before the by-ID rule, whose `/tmp` prefixes would
+            // otherwise take the destination's own scratch sessions for neo's
+            // and write rows into its index (merge gate of #280, 2026-10-19).
+            // A source rollout there stays resumable by ID: `codex resume
+            // <id>` finds the file by its UUID.
+            None if live
+                && options.codex_listing.is_none()
+                && !Path::new(&cwd).starts_with(&options.source_home) =>
+            {
                 summary.session(TOOL, "in-place");
                 emit(&thread_line((&id, &cwd), None, "in-place", None, None))?;
                 continue;
             }
+            None if options.by_id(&cwd) => (cwd.clone(), false),
             None => {
                 remember_refused(
                     ledger,
@@ -1820,6 +1844,7 @@ fn reseat_unindexed(
         }
         let placer = Placer::new(ledger, &dest.root)
             .with_archived(&options.replace_archived)
+            .with_kept_suffix(options.beside_suffix.as_deref())
             .with_rebind(&options.rebind)
             .with_beside(
                 options

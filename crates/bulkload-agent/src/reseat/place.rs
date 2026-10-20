@@ -121,6 +121,13 @@ pub enum Outcome {
     Raced,
     /// A `.jsonl` with no complete line yet: nothing placed.
     Held,
+    /// A-106: the swap put the destination's link back (its archive target
+    /// was written in the window), and the copy that stood at the live name
+    /// had been written since it was staged (a destination writer appended
+    /// through the live name): that copy may hold the writer's bytes, so it
+    /// is never removed. It is published create-only beside the live name
+    /// and held for review (merge-gate review of #280, 2026-10-19).
+    KeptAside,
     /// This ledger's placement of the same bytes from the landed file
     /// under an old landing root, re-bound to the new one
     /// (`--rebind-landing`): nothing written.
@@ -155,6 +162,7 @@ impl Outcome {
             Self::Held => "held",
             Self::Rebound => "rebound",
             Self::ReplacedArchived => "replaced-archived",
+            Self::KeptAside => "kept-aside",
         }
     }
 
@@ -189,7 +197,7 @@ impl Outcome {
             Self::DestAhead | Self::Continued { .. } | Self::Removed => {
                 Some(BulkloadRefusal::ReseatDestContinued)
             }
-            Self::Occupied => Some(BulkloadRefusal::DestinationOccupied),
+            Self::Occupied | Self::KeptAside => Some(BulkloadRefusal::DestinationOccupied),
             Self::Rewritten => Some(BulkloadRefusal::ReseatSourceRewritten),
             Self::LandingNotRegular | Self::Unreadable => {
                 Some(BulkloadRefusal::ReseatUnreadableForm)
@@ -407,6 +415,12 @@ pub struct Placer<'a> {
     /// source, and once its whole bytes are at `<name>` it is removed, so
     /// one copy of them stays. `--undo` puts it back.
     pub beside: Option<&'a str>,
+    /// The suffix a copy kept aside is published under
+    /// ([`Outcome::KeptAside`]): the run's beside suffix, else
+    /// `.bulkload-kept`. Where that name is taken (the source's copy the
+    /// pull landed beside the same live name, not yet consumed) the copy
+    /// falls to `<name><suffix>.1`, `.2`, ...
+    pub kept_suffix: Option<&'a str>,
 }
 
 impl<'a> Placer<'a> {
@@ -419,6 +433,16 @@ impl<'a> Placer<'a> {
             rebind: &[],
             archived: &[],
             beside: None,
+            kept_suffix: None,
+        }
+    }
+
+    /// The same placer, keeping a written copy aside under `suffix`.
+    #[must_use]
+    pub const fn with_kept_suffix(self, kept_suffix: Option<&'a str>) -> Self {
+        Self {
+            kept_suffix,
+            ..self
         }
     }
 
@@ -1408,6 +1432,29 @@ impl Site<'_> {
         c_name(temp_name(self.name, self.placer.ledger.temp_token()).as_os_str())
     }
 
+    /// Publish the temporary `temp` create-only beside the destination, as
+    /// `<name><suffix>`, else `<name><suffix>.<n>` (n up to 64), never
+    /// replacing anything ([`Outcome::KeptAside`]). With every name taken
+    /// the temporary is left where it is, named on the error, never
+    /// removed.
+    fn keep_aside(&self, temp: &CString) -> Result<()> {
+        let suffix = self.placer.kept_suffix.unwrap_or(".bulkload-kept");
+        for n in 0..=64_u32 {
+            let mut name = self.name.to_os_string();
+            name.push(suffix);
+            if n > 0 {
+                name.push(format!(".{n}"));
+            }
+            let target = c_name(&name)?;
+            match crate::io::publish_noreplace(self.directory, temp, &target) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error).refuse_at("reseat::place::keep_aside"),
+            }
+        }
+        Err(BulkloadRefusal::DestinationOccupied)
+    }
+
     /// Remove a temporary a crashed pass left before it published (no
     /// intent names it, so it is a staged copy of a landed file).
     fn clear_temp(&self) -> Result<()> {
@@ -1761,10 +1808,27 @@ impl Site<'_> {
         let target_held = lstat(resolved)?.map(|meta| Identity::of(&meta)) == Some(target.0);
         if !link_at_temp || !target_held {
             // Something other than the link was displaced, or the archive
-            // was written under the swap: put it back as it was; the
-            // staged copy (the landing holds its bytes) removed.
+            // was written under the swap: put it back as it was.
             crate::io::exchange(self.directory, &temp, &name)
                 .refuse_at("reseat::place::replace_exchange_back")?;
+            // Our copy stood at the live name between the two exchanges: a
+            // writer that opened the live name then appended to it. A copy
+            // written since it was staged may hold the only copy of those
+            // bytes, so it is never removed: kept aside, create-only
+            // (merge-gate review of #280). An unwritten copy is the
+            // landing's bytes and is removed.
+            let written = lstat(&self.temp())?
+                .is_some_and(|meta| meta.is_file() && Identity::of(&meta) != copy);
+            if written {
+                self.keep_aside(&temp)?;
+                crate::io::durable::seal_dir(self.directory)
+                    .refuse_at("reseat::place::replace_seal")?;
+                undo_intent()?;
+                return Ok(Placed {
+                    outcome: Outcome::KeptAside,
+                    scanner: None,
+                });
+            }
             self.clear_temp()?;
             crate::io::durable::seal_dir(self.directory)
                 .refuse_at("reseat::place::replace_seal")?;
