@@ -166,8 +166,9 @@ pub struct Policy<'a> {
     /// adopt proof finds it differs is advanced to the capture when it is
     /// clean, its HEAD an ancestor of the captured HEAD and its branch the
     /// captured one, free to move ([`advance`]); otherwise a typed
-    /// `GIT_ADVANCE_*` refusal, with nothing written.
-    pub advance: bool,
+    /// `GIT_ADVANCE_*` refusal, with nothing written. It holds the beside
+    /// suffix (`--beside SUFFIX`) a file-level beside takes.
+    pub advance: Option<&'a str>,
 }
 
 /// Where an item lands.

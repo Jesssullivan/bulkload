@@ -252,7 +252,7 @@ fn beside_component(
                     adopt: true,
                     origins: &[],
                     items,
-                    advance: false,
+                    advance: None,
                 };
                 if super::rekey_check(staged, &at, landing, &policy, ledger)?.is_some() {
                     "foreign"
@@ -289,7 +289,7 @@ pub fn workspace(
     target: &Target<'_>,
     landing: &Landing<'_>,
     since: Option<i128>,
-    (origins, items, beside): (&[String], &[String], Option<&str>),
+    (origins, items, beside, advance): (&[String], &[String], Option<&str>, bool),
 ) -> Result<ItemRow> {
     let workspace = target
         .workspace
@@ -380,7 +380,34 @@ pub fn workspace(
             row.class = "differs";
             row.adopt = "diverged";
             row.components = components;
-            if let Some(suffix) = beside {
+            // `--advance-ancestor`: what the apply would do with it, so a
+            // plan never reports an advance as a beside landing.
+            let advances = advance
+                && match super::advance::preview(
+                    &super::Place {
+                        worktree: workspace,
+                        base: target.base,
+                        git_dir: git_dir.clone(),
+                        common: common.clone(),
+                        source: target.source,
+                        standalone,
+                        beside: false,
+                        advanced: None,
+                    },
+                    (&scratch, &meta),
+                    beside,
+                )? {
+                    None => true,
+                    Some(refusal) => {
+                        row.components
+                            .push(format!("advance-refused={}", refusal.code()));
+                        false
+                    }
+                };
+            if advances {
+                row.adopt = "advance";
+            }
+            if let (false, Some(suffix)) = (advances, beside) {
                 row.components.push(beside_component(
                     (staged, target, items),
                     (&common, &meta.exclude(&scratch.repo)?),

@@ -285,10 +285,12 @@ own transfer and records the result in the estate ledger.
   - (`--advance-ancestor`, 2026-10-19) an `advance` block on a row whose
     item's `.advance` record names its current capture (`outcome`:
     `advanced` or the `GIT_ADVANCE_*` code; `detail`; `beside`; `reason`;
-    `kept`), and an `applied-beside` row whose advance refused is
-    `refused-pending-review` with that code (printed as `refusal`, its
-    detail as `refusal_detail`), its instance bound to the code, the live
-    HEAD and its branch, so a journal rerun keeps a review valid.
+    `kept`, `file_besides`), an `applied-beside` row whose advance refused
+    is `refused-pending-review` with that code, and an `applied` row whose
+    advance kept its beside landing is `refused-pending-review` with
+    `GIT_ADVANCE_BESIDE_KEPT`; either printed as `refusal`, its detail as
+    `refusal_detail`, its instance bound to the code, the live HEAD, its
+    branch and the detail, so a journal rerun keeps a review valid.
 
   Nothing else changed.
 - **No-op applies.** A re-apply keeps a carried item's outcome as a no-op,
@@ -1354,12 +1356,19 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   branches, tags and stash entries go in under `refs/<ns>/` and
   `refs/<ns>-stash/` (`--refs-in`). An ignored entry of the live checkout
   is never touched: where the capture holds a seat it does not track, the
-  live entry and its subtree are left (`advance-kept=N`, recorded) and the
-  capture's bytes stay in its provenance; a captured directory the live
-  checkout holds as an untracked (ignored) directory keeps its own mode,
-  and only what the capture tracks under it lands (the rest is left, never
-  mixed into the live checkout's ignored tree). The live checkout's own
-  untracked files stay byte for byte. A gitlink is never a collision. The item's outcome
+  live entry and its subtree are left (`advance-kept=N`, recorded); a
+  captured file or link among them lands as a file-level beside,
+  `<path>SUFFIX`, create-only (`advance-file-besides=N`; the coordinator's
+  decision on #289: no beside tree kept for a file conflict), and a kept
+  directory's capture stays in the capture's provenance and keeps the
+  beside tree (the file-level reconcile of such subtrees is the next
+  lane's). A captured directory the live checkout holds as an untracked
+  (ignored) directory keeps its own mode, and what the capture holds
+  under it lands entry by entry. The live checkout's own untracked files
+  stay byte for byte. A gitlink is never a collision. `estate-diff
+  --advance-ancestor` (and `estate-move --plan-only --advance-ancestor`)
+  previews it read-only: `adopt:"advance"`, or `diverged` with the
+  component `advance-refused=<CODE>`. The item's outcome
   and journal are `workspace-restored` (closure `applied`); its receipt
   counts `advanced`, `advance-branch-moved`, `advance-kept`,
   `advance-kept-dirs` and the seat words. Later passes converge the
@@ -1387,7 +1396,9 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   beside the item does not own is never removed), and is proved equal to
   the live tree (`git_carry::beside::retire`): the same HEAD commit and
   index entries; every entry under it held by the live tree with the same
-  kind, bytes or link target and executable bit (a sealed bulkload
+  kind, bytes or link target and executable bit, or, for a captured file
+  the live checkout keeps as its own ignored file, at the file-level
+  beside the advance landed (a sealed bulkload
   hand-off block at byte 0 of `AGENTS.md` or `CLAUDE.md` the one
   difference allowed, a target the hand-off created included); every
   tracked or untracked file of the live tree that is not ignored held by
@@ -1413,7 +1424,10 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   `delete-failed` for the next pass) and removes the record; a rerun
   finishes from the record. The `.advance` record and the receipt say
   `advance-beside=retired|kept|absent` (with `advance-beside-reason=`),
-  and closure prints them in the row's `advance` block.
+  and closure prints them in the row's `advance` block. A kept beside is a
+  duplicate (the coordinator's decision on #289): closure holds the item
+  `refused-pending-review` with `GIT_ADVANCE_BESIDE_KEPT reason="..."`
+  until `closure-dispose`.
 - **A clean source lands no tree beside (operator ruling 2026-10-16
   21:24Z: "refs in always; a tree beside ONLY where neo has uncommitted
   work").** Under `estate-apply --adopt --beside SUFFIX --refs-in` (so

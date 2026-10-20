@@ -2453,7 +2453,10 @@ fn apply_item(
         adopt: options.adopt,
         origins: &options.activate_origin,
         items,
-        advance: options.advance_ancestor,
+        advance: options
+            .beside
+            .as_deref()
+            .filter(|_| options.advance_ancestor),
     };
     let (outcome, mut applied) = if item.workspace.is_some() {
         let landed_before = landed_before(state, &identity, source, &journal)?;
@@ -3101,6 +3104,9 @@ fn advanced_item(
                 kept: done.as_ref().map_or(0, |done| {
                     u64::try_from(done.left.kept.len()).unwrap_or(u64::MAX)
                 }),
+                besides: done.as_ref().map_or(0, |done| {
+                    u64::try_from(done.left.besides.len()).unwrap_or(u64::MAX)
+                }),
                 ..advance::AdvanceRecord::default()
             }
         }
@@ -3122,6 +3128,14 @@ fn advanced_item(
         if let Some(done) = done {
             done.word().clone_into(&mut record.beside);
             done.reason().clone_into(&mut record.reason);
+            // A kept beside is a duplicate: closure holds it pending review
+            // with this typed refusal and its reason.
+            record.detail = match done {
+                retire::Retired::Kept(reason) => {
+                    BulkloadRefusal::GitAdvanceBesideKept(reason.into_bytes()).to_string()
+                }
+                retire::Retired::Retired => String::new(),
+            };
         } else {
             // The beside path held nothing to retire.
             "absent".clone_into(&mut record.beside);
@@ -3130,7 +3144,8 @@ fn advanced_item(
         advance::write_record(&record_path, &record)?;
     }
     Ok(Some(format!(
-        "advance-beside={}{}",
+        "advance-file-besides={} advance-beside={}{}",
+        record.besides,
         record.beside,
         if record.reason.is_empty() {
             String::new()
@@ -3540,8 +3555,11 @@ pub struct AdvanceSummary {
     pub reason: String,
     /// How many captured entries the advance left to the live checkout.
     pub kept: u64,
-    /// A refusal's detail (the colliding paths, escaped).
+    /// A refusal's detail (the colliding paths, or a kept beside's
+    /// reason, escaped).
     pub detail: String,
+    /// How many captured files landed as file-level besides.
+    pub besides: u64,
     /// The live HEAD the advance was decided against: its commit and its
     /// branch (empty when detached).
     pub live: String,
@@ -3549,9 +3567,14 @@ pub struct AdvanceSummary {
 }
 
 impl AdvanceSummary {
-    /// The `GIT_ADVANCE_*` code that refused the advance, when one did.
+    /// The `GIT_ADVANCE_*` code that refused the advance, when one did;
+    /// or, after an advance, `GIT_ADVANCE_BESIDE_KEPT` when the beside
+    /// landing it made redundant was kept (a duplicate, pending review).
     #[must_use]
     pub fn refusal(&self) -> Option<&str> {
+        if self.outcome == "advanced" {
+            return (self.beside == "kept").then_some("GIT_ADVANCE_BESIDE_KEPT");
+        }
         (self.outcome.starts_with("GIT_ADVANCE_") && crate::outcome::is_typed_code(&self.outcome))
             .then_some(self.outcome.as_str())
     }
@@ -3617,6 +3640,7 @@ fn advance_summary(
         reason: record.reason,
         kept: record.kept,
         detail: record.detail,
+        besides: record.besides,
         live: record.live,
         branch: record.branch,
     })

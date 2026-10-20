@@ -25,8 +25,11 @@
 //!   checked out elsewhere (`GIT_ADVANCE_BRANCH_BUSY`), another branch
 //!   name (`GIT_ADVANCE_BRANCH_MISMATCH`): each lands beside, the live
 //!   checkout untouched.
-//! - A7: ignored files present: kept, and a beside landing whose ignored
-//!   file differs from the live one's is kept, with the reason.
+//! - A7: ignored files present: kept; a captured ignored file of another
+//!   content at the same path lands as a file-level beside `<path>SUFFIX`
+//!   and the beside tree is still retired (the coordinator's decision).
+//! - A11: a beside landing kept after the advance is a duplicate: closure
+//!   holds it `refused-pending-review` with `GIT_ADVANCE_BESIDE_KEPT`.
 //! - A8 to A10 (the coordinator's refinement): sting's own untracked files
 //!   apart from the capture stay and the checkout advances; an untracked
 //!   path the capture tracks, or an untracked directory the capture also
@@ -300,6 +303,15 @@ impl World {
         self.apply(&flags)
     }
 
+    fn diff(&self, extra: &[&str]) -> Ran {
+        let mut list: Vec<OsString> = vec!["estate-diff".into()];
+        list.extend(extra.iter().map(OsString::from));
+        list.extend(os(&[&self.plan(), &self.corpus(), &SOURCE, &self.state()]));
+        let ran = agent(&list);
+        assert!(ran.ok, "diff: {}\n{}", ran.stdout, ran.stderr);
+        ran
+    }
+
     fn closure(&self, dispositions: Option<&Path>) -> Ran {
         let mut list: Vec<OsString> = vec!["closure-report".into()];
         if let Some(ledger) = dispositions {
@@ -423,6 +435,20 @@ fn a1_a_clean_ancestor_is_advanced_and_its_beside_landing_retired() {
     assert!(world.beside().join(".git").is_file(), "a linked landing");
     let own = Own::of(&world);
     let before = git(&world.sting(), &["rev-parse", "HEAD"]);
+    // The plan's preview says what the apply will do.
+    let diff = world.diff(&["--beside", SUFFIX, "--advance-ancestor"]);
+    assert!(
+        diff.stdout.contains("\"adopt\":\"advance\""),
+        "{}",
+        diff.stdout
+    );
+    assert!(
+        world
+            .diff(&["--beside", SUFFIX])
+            .stdout
+            .contains("\"adopt\":\"diverged\""),
+        "without the flag"
+    );
 
     // The same capture, with the flag: the beside journal does not end it.
     let ran = world.advance();
@@ -542,6 +568,15 @@ fn a3_a_diverged_live_checkout_is_refused_typed_and_lands_beside() {
     world.capture();
     let head = git(&world.sting(), &["rev-parse", "HEAD"]);
     let a = identity(&world.sting().join("src/a.txt"));
+    let diff = world.diff(&["--beside", SUFFIX, "--advance-ancestor"]);
+    assert!(
+        diff.stdout.contains("\"adopt\":\"diverged\"")
+            && diff
+                .stdout
+                .contains("advance-refused=GIT_ADVANCE_NOT_ANCESTOR"),
+        "{}",
+        diff.stdout
+    );
     let ran = world.advance();
     assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
     let (outcome, reason) = receipt(&ran.stdout);
@@ -669,14 +704,19 @@ fn a4_a6_each_precondition_refuses_typed_and_lands_beside() {
     }
 }
 
-/// A7: ignored files present: sting's own are never touched, one where
-/// the capture holds its own ignored file of another content too (left,
-/// counted), and the beside landing that holds neo's is then kept, with
-/// the reason.
+/// A7 (the coordinator's decision on #289): ignored files present.
+/// Sting's own are never touched. Where the capture holds its own ignored
+/// file of another content at the path, sting's stays and the captured one
+/// lands as a file-level beside, `<path>SUFFIX`, create-only (counted).
+/// A captured ignored file under sting's ignored directory lands at its
+/// own path, sting's files there untouched. The beside tree, everything
+/// else proved equal, is then retired.
 #[test]
-fn a7_ignored_files_are_kept_and_keep_a_beside_that_differs() {
+fn a7_ignored_files_are_kept_and_a_conflict_lands_as_a_file_level_beside() {
     let world = World::new();
     fs::write(world.sting().join("neo.log"), b"sting's own log\n").unwrap();
+    fs::create_dir_all(world.neo().join("build")).unwrap();
+    fs::write(world.neo().join("build/neo.bin"), b"neo's build output\n").unwrap();
     world.capture();
     let ran = world.apply(&FLAGS);
     assert_eq!(receipt(&ran.stdout).0, "workspace-beside");
@@ -689,21 +729,82 @@ fn a7_ignored_files_are_kept_and_keep_a_beside_that_differs() {
     for held in [
         "advanced=1",
         "advance-kept=1",
-        "advance-beside=kept",
-        "advance-beside-reason=differs:seat=neo.log",
+        "advance-file-besides=1",
+        "advance-beside=retired",
     ] {
         assert!(word(&reason, held), "{held}: {reason}");
     }
     assert_eq!(identity(&world.sting().join("neo.log")), log);
-    own.stays(&world);
     assert_eq!(
-        fs::read(world.beside().join("neo.log")).unwrap(),
+        fs::read(world.sting().join(format!("neo.log{SUFFIX}"))).unwrap(),
         b"neo's ignored log\n"
     );
+    assert_eq!(
+        fs::read(world.sting().join("build/neo.bin")).unwrap(),
+        b"neo's build output\n"
+    );
+    own.stays(&world);
+    assert!(!world.beside().exists());
     assert_eq!(
         git(&world.sting(), &["rev-parse", "HEAD"]),
         git(&world.neo(), &["rev-parse", "HEAD"])
     );
+    let closure = world.closure(None);
+    assert!(
+        closure.stdout.contains("\"disposition\":\"applied\"")
+            && closure.stdout.contains("\"file_besides\":1"),
+        "{}",
+        closure.stdout
+    );
+}
+
+/// A11 (the coordinator's decision on #289): a beside landing kept after
+/// the advance (here an edit in it since its landing) is a duplicate:
+/// closure holds the item `refused-pending-review` with
+/// `GIT_ADVANCE_BESIDE_KEPT` and the reason, and the beside stays whole.
+#[test]
+fn a11_a_beside_kept_after_the_advance_is_pending_review() {
+    let world = World::new();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-beside");
+    fs::write(world.beside().join("README"), b"edited in the beside\n").unwrap();
+    let ran = world.advance();
+    assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+    let (outcome, reason) = receipt(&ran.stdout);
+    assert_eq!(outcome, "workspace-restored", "{reason}");
+    for held in [
+        "advanced=1",
+        "advance-beside=kept",
+        "advance-beside-reason=differs:seat=README",
+    ] {
+        assert!(word(&reason, held), "{held}: {reason}");
+    }
+    holds_neo(&world);
+    assert_eq!(
+        fs::read(world.beside().join("README")).unwrap(),
+        b"edited in the beside\n"
+    );
+    let closure = world.closure(None);
+    assert!(
+        closure.stdout.contains(
+            "\"disposition\":\"refused-pending-review\",\"refusal\":\"GIT_ADVANCE_BESIDE_KEPT\""
+        ) && closure.stdout.contains(
+            "\"refusal_detail\":\"GIT_ADVANCE_BESIDE_KEPT reason=\\\"differs:seat=README\\\"\""
+        ),
+        "{}",
+        closure.stdout
+    );
+    // A rerun is a journal no-op, and the row stays pending review.
+    let ran = world.advance();
+    assert_eq!(
+        receipt(&ran.stdout).0,
+        "previous-workspace-restoration-not-revalidated"
+    );
+    assert!(world
+        .closure(None)
+        .stdout
+        .contains("\"refusal\":\"GIT_ADVANCE_BESIDE_KEPT\""),);
 }
 
 /// A8 (the coordinator's refinement, the `MassageIthaca` shape): sting's

@@ -64,10 +64,14 @@
 //! live checkout. Its untracked files (proved apart from every captured
 //! path) are recorded as its own (`untracked`). A captured seat the
 //! capture does not track whose path the live checkout holds with an
-//! ignored entry is left to it, with its subtree (`kept`), and a captured
+//! ignored entry is left to it, with its subtree (`kept`); a captured file
+//! or link among those lands as a file-level beside, `<path>SUFFIX`,
+//! create-only (`besides`; the coordinator's decision on #289), and a kept
+//! directory's capture stays in the capture's provenance (and keeps the
+//! beside tree, for the file-level reconcile to come). A captured
 //! directory the live checkout holds as an untracked directory keeps its
-//! own mode (`kept_dirs`); the capture's bytes for them stay in its
-//! provenance in the live repository. Nor are other branches, the
+//! own mode (`kept_dirs`); what the capture holds under it lands entry by
+//! entry. Nor are other branches, the
 //! stash, other worktrees, configuration or `info/exclude` touched: no
 //! native ref step runs (the repository marker is never set), and the
 //! captured branches, tags and stash entries go in under `refs/<ns>/`
@@ -148,9 +152,56 @@ pub struct Left {
     /// advanced, apart from every captured path: never touched, and never
     /// a difference from its beside landing. Sorted.
     pub untracked: Vec<Vec<u8>>,
+    /// The beside suffix (`--beside SUFFIX`) the file-level besides take.
+    pub suffix: String,
+    /// Kept captured files (and links) whose captured version landed as a
+    /// file-level beside, `<path>SUFFIX`, create-only (the coordinator's
+    /// decision on #289: no beside tree kept for a file the live checkout
+    /// holds as its own ignored file). Sorted.
+    pub besides: Vec<Vec<u8>>,
 }
 
 impl Left {
+    /// The file-level beside path of the kept captured file `path`, when
+    /// its captured version landed as one.
+    #[must_use]
+    pub fn beside_of(&self, path: &[u8]) -> Option<Vec<u8>> {
+        self.besides
+            .binary_search_by(|kept| kept.as_slice().cmp(path))
+            .is_ok()
+            .then(|| [path, self.suffix.as_bytes()].concat())
+    }
+
+    /// Whether `path` is one of the file-level besides the advance landed.
+    #[must_use]
+    pub fn is_file_beside(&self, path: &[u8]) -> bool {
+        !self.suffix.is_empty()
+            && path
+                .strip_suffix(self.suffix.as_bytes())
+                .is_some_and(|kept| self.beside_of(kept).is_some())
+    }
+
+    // The seat operations that land the file-level besides: one create-only
+    // addition each, numbered after the delta's `first` operations, so a
+    // settle numbers (and names the temporaries of) each as the advance did.
+    fn beside_ops(&self, new: &Sides, first: usize) -> Vec<Op> {
+        self.besides
+            .iter()
+            .enumerate()
+            .filter_map(|(n, path)| {
+                let side = new.get(path)?;
+                Some(Op {
+                    n: first + n,
+                    path: [path.as_slice(), self.suffix.as_bytes()].concat(),
+                    action: Action::Add,
+                    old: None,
+                    new: Some(side.clone()),
+                    to_dir: false,
+                })
+            })
+            .collect()
+    }
+
     /// Whether `path` (or a directory above it) was left to the live
     /// checkout, with its subtree.
     #[must_use]
@@ -312,6 +363,8 @@ pub struct AdvanceRecord {
     pub untracked: [u8; 32],
     /// The paths a `GIT_ADVANCE_UNTRACKED_COLLIDES` named.
     pub paths: Vec<Vec<u8>>,
+    /// How many captured files the advance landed as file-level besides.
+    pub besides: u64,
 }
 
 impl landed::Record for AdvanceRecord {
@@ -796,12 +849,18 @@ struct Plan {
 // as one keeps its own mode. A tracked directory the capture turns into a
 // file while it holds such an entry cannot be freed without touching it.
 // Each of those two is `GIT_ADVANCE_UNTRACKED_COLLIDES`, naming the
-// paths. Read-only.
+// paths. A kept captured file (or link) whose path's directory is the live
+// checkout's lands as a file-level beside, `<path>SUFFIX` (`suffix`),
+// create-only: absent there, it is added; holding the captured version
+// already, it is present; holding anything else, the file stays kept and
+// the beside tree keeps it. `blobs` is the repository holding the
+// capture's objects. Read-only.
+#[allow(clippy::too_many_lines)]
 fn plan(
     worktree: &Path,
     (old, new): (&Sides, &Sides),
     captured: &Captured,
-    untracked: &[Vec<u8>],
+    (untracked, blobs, suffix): (&[Vec<u8>], &Path, Option<&str>),
 ) -> Result<Plan> {
     let mut kept = BTreeSet::<Vec<u8>>::new();
     let mut kept_dirs = BTreeSet::<Vec<u8>>::new();
@@ -809,13 +868,6 @@ fn plan(
     // Ascending: a directory is decided before what it holds.
     for (path, side) in new {
         if old.contains_key(path) || ancestors(path).any(|at| kept.contains(at)) {
-            continue;
-        }
-        // Under a directory the live checkout holds untracked (an ignored
-        // one), only what the capture tracks lands: the rest is left, never
-        // mixed into the live checkout's ignored tree.
-        if ancestors(path).any(|at| kept_dirs.contains(at)) && !captured.tracks(path) {
-            kept.insert(path.clone());
             continue;
         }
         let at = match safe_destination(worktree, Path::new(OsStr::from_bytes(path))) {
@@ -881,15 +933,50 @@ fn plan(
         colliding.dedup();
         return Err(collides(&colliding));
     }
+    let mut besides = Vec::new();
+    let mut present = BTreeSet::new();
+    if let Some(suffix) = suffix {
+        let mut objects = BatchObjects::new(blobs)?;
+        for path in &kept {
+            let Some(side) = new.get(path).filter(|side| side.kind != Kind::Directory) else {
+                continue;
+            };
+            let beside = [path.as_slice(), suffix.as_bytes()].concat();
+            if new.contains_key(&beside) || old.contains_key(&beside) {
+                continue;
+            }
+            let Ok(at) = safe_destination(worktree, Path::new(OsStr::from_bytes(&beside))) else {
+                continue;
+            };
+            if lstat(&at)?.is_some() {
+                if !holds(&mut objects, &at, side)? {
+                    continue;
+                }
+                present.insert(path.clone());
+            }
+            besides.push(path.clone());
+        }
+        objects.finish()?;
+    }
     let left = Left {
         kept: kept.into_iter().collect(),
         kept_dirs: kept_dirs.into_iter().collect(),
         untracked: untracked.to_vec(),
+        suffix: suffix.unwrap_or_default().to_owned(),
+        besides,
     };
-    let ops = delta(old, new)
+    // Numbered after every operation of the delta, as a settle numbers them.
+    let all = delta(old, new);
+    let first = all.iter().map(|op| op.n + 1).max().unwrap_or(0);
+    let mut ops: Vec<Op> = all
         .into_iter()
         .filter(|op| !left.leaves(&op.path))
         .collect();
+    ops.extend(left.beside_ops(new, first).into_iter().filter(|op| {
+        op.path
+            .strip_suffix(left.suffix.as_bytes())
+            .is_none_or(|kept| !present.contains(kept))
+    }));
     Ok(Plan { ops, left })
 }
 
@@ -917,6 +1004,46 @@ fn displaced_hold(worktree: &Path, ops: &[Op]) -> Result<bool> {
     }
     objects.finish()?;
     Ok(all)
+}
+
+/// What `estate-apply --advance-ancestor` would do with the live checkout
+/// at `place` whose adopt proof finds it differs from the capture in
+/// `scratch` (`meta`), read-only and without the lock (`estate-diff`, so
+/// `estate-move --plan-only` never reports an advance as a beside
+/// landing): `None` when it would advance, else the precondition refusal
+/// it would make. The apply proves everything again.
+///
+/// # Errors
+/// Whatever reading the checkout or the capture refuses.
+pub(super) fn preview(
+    place: &Place<'_>,
+    (scratch, meta): (&Scratch, &Meta),
+    suffix: Option<&str>,
+) -> Result<Option<BulkloadRefusal>> {
+    let typed = |refusal: BulkloadRefusal| -> Result<Option<BulkloadRefusal>> {
+        if refusal.is_advance_precondition() {
+            Ok(Some(refusal))
+        } else {
+            Err(refusal)
+        }
+    };
+    let proven = match prove(place, scratch, meta) {
+        Ok(proven) => proven,
+        Err(refusal) => return typed(refusal),
+    };
+    let planned = match plan(
+        place.worktree,
+        (&proven.old, &sides(&scratch.repo, meta)?),
+        &proven.captured,
+        (&proven.untracked, &scratch.repo, suffix),
+    ) {
+        Ok(planned) => planned,
+        Err(refusal) => return typed(refusal),
+    };
+    if !displaced_hold(place.worktree, &planned.ops)? {
+        return Ok(Some(BulkloadRefusal::GitAdvanceNotClean));
+    }
+    Ok(None)
 }
 
 // The proved seats as the intent records them.
@@ -978,8 +1105,8 @@ pub(super) fn workspace(
     staged: &super::super::StagedBundle,
     landing: &Landing<'_>,
     place: &Place<'_>,
-    scratch: &Scratch,
-    meta: &Meta,
+    (scratch, meta): (&Scratch, &Meta),
+    suffix: &str,
 ) -> Result<Applied> {
     let worktree = place.worktree;
     let source = place.source;
@@ -988,7 +1115,7 @@ pub(super) fn workspace(
         worktree,
         (&proven.old, &sides(&scratch.repo, meta)?),
         &proven.captured,
-        &proven.untracked,
+        (&proven.untracked, &scratch.repo, Some(suffix)),
     )?;
     if !displaced_hold(worktree, &planned.ops)? {
         return Err(BulkloadRefusal::GitAdvanceNotClean);
@@ -1034,7 +1161,12 @@ pub(super) fn workspace(
     // Planned again under the lock, from the import: an entry the live
     // checkout gained since the proof where the capture lands one is left
     // to it (or collides), never written over.
-    let planned = plan(worktree, (&proven.old, &new), &proven.captured, &untracked)?;
+    let planned = plan(
+        worktree,
+        (&proven.old, &new),
+        &proven.captured,
+        (&untracked, worktree, Some(suffix)),
+    )?;
     let tag = super::tag(landing);
     if planned.ops.iter().any(|op| op.action == Action::Replace) {
         probe_exchange(worktree, &tag)?;
@@ -1208,6 +1340,10 @@ fn finish(
         "advance-kept-dirs",
         u64::try_from(intent.left.kept_dirs.len()).unwrap_or(u64::MAX),
     );
+    custody.add(
+        "advance-file-besides",
+        u64::try_from(intent.left.besides.len()).unwrap_or(u64::MAX),
+    );
     Ok(custody)
 }
 
@@ -1258,10 +1394,13 @@ pub(super) fn settle(place: &Place<'_>, landing: &Landing<'_>) -> Result<Option<
             written: BTreeMap::new(),
             custody: Custody::default(),
         };
-        for op in delta(&old, &new)
+        let all = delta(&old, &new);
+        let first = all.iter().map(|op| op.n + 1).max().unwrap_or(0);
+        let ops: Vec<Op> = all
             .into_iter()
             .filter(|op| !intent.left.leaves(&op.path))
-        {
+            .collect();
+        for op in ops.into_iter().chain(intent.left.beside_ops(&new, first)) {
             engine.run(&op)?;
         }
         engine.modes(&intent.left.mode_sides(&new))?;
@@ -1337,7 +1476,14 @@ mod tests {
             kept: vec![b".env".to_vec(), b"build/out".to_vec()],
             kept_dirs: vec![b".claude".to_vec()],
             untracked: vec![b"docs/review".to_vec(), b"notes.md".to_vec()],
+            suffix: ".neo-20261016".to_owned(),
+            besides: vec![b".env".to_vec()],
         };
+        assert_eq!(left.beside_of(b".env"), Some(b".env.neo-20261016".to_vec()));
+        assert_eq!(left.beside_of(b"build/out"), None);
+        assert!(left.is_file_beside(b".env.neo-20261016"));
+        assert!(!left.is_file_beside(b".envrc.neo-20261016"));
+        assert!(!left.is_file_beside(b".env"));
         assert!(left.own_untracked(b"docs/review"));
         assert!(left.own_untracked(b"docs/review/a.md"));
         assert!(!left.own_untracked(b"docs"));

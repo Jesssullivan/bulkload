@@ -850,7 +850,7 @@ fn adopt_at(staged: &super::super::StagedBundle, dest: &Path) -> Result<Applied>
         beside: false,
         advanced: None,
     };
-    adopt::workspace(staged, &target, &adopt_landing(staged), &place, false)
+    adopt::workspace(staged, &target, &adopt_landing(staged), &place, None)
 }
 
 fn all_refs(repo: &Path) -> String {
@@ -1116,7 +1116,13 @@ fn advance_at(staged: &super::super::StagedBundle, dest: &Path) -> Result<Applie
         beside: false,
         advanced: None,
     };
-    adopt::workspace(staged, &target, &adopt_landing(staged), &place, true)
+    adopt::workspace(
+        staged,
+        &target,
+        &adopt_landing(staged),
+        &place,
+        Some(".neo-20261016"),
+    )
 }
 
 /// The live branch moved between the advance proof and its

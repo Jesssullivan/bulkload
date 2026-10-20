@@ -770,12 +770,12 @@ pub fn land(
     // live checkout only).
     let keep = Policy {
         adopt: false,
-        advance: false,
+        advance: None,
         ..*policy
     };
     let adopt = Policy {
         adopt: true,
-        advance: false,
+        advance: None,
         ..*policy
     };
     let meta = match std::fs::symlink_metadata(beside) {
