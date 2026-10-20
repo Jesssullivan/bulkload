@@ -51,6 +51,14 @@ pub enum BulkloadRefusal {
     /// when its `--file` session is offered anything but one regular or
     /// symlink row.
     SourceRootKindMismatch,
+    /// The source's pack listing could not be read (p34 review, 2026-10-20):
+    /// a `pack` directory of its object store, or of a store it borrows,
+    /// that could not be opened or read, or an entry in it that could not
+    /// be stated for any reason but its removal. The listing is how a
+    /// capture tells an object-store rewrite from a failed Git child, so
+    /// it is never guessed. Carries the OS errno when known. Was a bare
+    /// `IO`, which no review can close.
+    GitPackListingUnreadable(Option<i32>),
     /// A capture recorded drift under its pass, so it does not hold every
     /// seat's bytes; apply refuses it until a later pass extends it clean.
     CaptureDrifted,
@@ -548,6 +556,7 @@ impl BulkloadRefusal {
             Self::SourceRootMissing => "SOURCE_ROOT_MISSING",
             Self::SourceRootUnreadable(_) => "SOURCE_ROOT_UNREADABLE",
             Self::SourceRootKindMismatch => "SOURCE_ROOT_KIND_MISMATCH",
+            Self::GitPackListingUnreadable(_) => "GIT_PACK_LISTING_UNREADABLE",
             Self::CaptureDrifted => "CAPTURE_DRIFTED",
             Self::CaptureAbsent => "CAPTURE_ABSENT",
             Self::DigestMismatch => "DIGEST_MISMATCH",
@@ -653,6 +662,7 @@ impl BulkloadRefusal {
         "SOURCE_ROOT_MISSING",
         "SOURCE_ROOT_UNREADABLE",
         "SOURCE_ROOT_KIND_MISMATCH",
+        "GIT_PACK_LISTING_UNREADABLE",
         "CAPTURE_DRIFTED",
         "CAPTURE_ABSENT",
         "DIGEST_MISMATCH",
@@ -756,7 +766,8 @@ impl fmt::Display for BulkloadRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::Io(Some(errno)) => write!(f, "IO (errno {errno})"),
-            Self::SourceRootUnreadable(Some(errno)) => {
+            Self::SourceRootUnreadable(Some(errno))
+            | Self::GitPackListingUnreadable(Some(errno)) => {
                 write!(f, "{} (errno {errno})", self.code())
             }
             Self::SqliteBackupFailed(Some(code)) => {
@@ -927,6 +938,7 @@ mod tests {
             BulkloadRefusal::SourceRootMissing,
             BulkloadRefusal::SourceRootUnreadable(None),
             BulkloadRefusal::SourceRootKindMismatch,
+            BulkloadRefusal::GitPackListingUnreadable(None),
             BulkloadRefusal::CaptureDrifted,
             BulkloadRefusal::CaptureAbsent,
             BulkloadRefusal::DigestMismatch,

@@ -4764,7 +4764,8 @@ mod tests {
         let reason = reason.as_deref().unwrap();
         assert!(
             reason.starts_with(
-                "drift=1 rewrite_cause=GIT_CHILD_FAILED stderr_class=bad_object rewrite_changed="
+                "drift=1 rewrite_cause=GIT_CHILD_FAILED rewrite_stderr_class=bad_object \
+                 rewrite_changed="
             ),
             "{reason}"
         );

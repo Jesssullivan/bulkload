@@ -1801,15 +1801,39 @@ pub struct StoreRewrite {
 }
 
 impl StoreRewrite {
-    /// The receipt's words: `rewrite_cause=<refusal> rewrite_changed=<n>`.
+    /// The receipt's words: `rewrite_cause=<code>`, then
+    /// `rewrite_stderr_class=<class>` for a failed child, then
+    /// `rewrite_changed=<n>`.
     #[must_use]
     pub fn words(&self) -> String {
+        let class = match self.cause {
+            BulkloadRefusal::GitChildFailed(class) => {
+                format!(" rewrite_stderr_class={}", class.code())
+            }
+            _ => String::new(),
+        };
         format!(
-            "rewrite_cause={} rewrite_changed={}",
-            self.cause,
+            "rewrite_cause={}{class} rewrite_changed={}",
+            self.cause.code(),
             self.changed.len()
         )
     }
+}
+
+/// One `pack` entry as a listing found it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackState {
+    /// Not listed.
+    Absent,
+    /// Listed by `readdir` and gone before its stat: a rewrite under way.
+    Vanished,
+    /// Listed and stated.
+    Present {
+        /// Its inode.
+        ino: u64,
+        /// Its size.
+        size: u64,
+    },
 }
 
 /// One entry of a store's `pack` directory that appeared, vanished or was
@@ -1820,23 +1844,29 @@ pub struct PackChange {
     pub store: PathBuf,
     /// The entry's name in `pack`.
     pub name: Vec<u8>,
-    /// `(inode, size)` before and after; `None` where it was absent.
-    pub before: Option<(u64, u64)>,
-    pub after: Option<(u64, u64)>,
+    /// As the listing before the pass found it.
+    pub before: PackState,
+    /// As the listing after the failure found it.
+    pub after: PackState,
 }
 
-/// Every store's `pack` entries by name, with inode and size, as
-/// [`pack_listing`] reads them.
-type PackListing = Vec<(PathBuf, std::collections::BTreeMap<Vec<u8>, (u64, u64)>)>;
+/// Every store's `pack` entries by name, each [`PackState::Present`] or
+/// [`PackState::Vanished`], as [`pack_listing`] reads them.
+type PackListing = Vec<(PathBuf, std::collections::BTreeMap<Vec<u8>, PackState>)>;
 
-/// The entries that differ between two listings of the same stores.
+/// The entries that differ between two listings of the same stores. An
+/// entry the first listing saw vanish is a change whatever the second says:
+/// a rewrite was under way when the pass began (p34 review, F4).
 fn pack_changes(before: &PackListing, after: &PackListing) -> Vec<PackChange> {
     let mut changed = Vec::new();
     for ((store, old), (_, new)) in before.iter().zip(after) {
         let names: std::collections::BTreeSet<&Vec<u8>> = old.keys().chain(new.keys()).collect();
         for name in names {
-            let (was, now) = (old.get(name).copied(), new.get(name).copied());
-            if was != now {
+            let state = |listing: &std::collections::BTreeMap<Vec<u8>, PackState>| {
+                listing.get(name).copied().unwrap_or(PackState::Absent)
+            };
+            let (was, now) = (state(old), state(new));
+            if was != now || was == PackState::Vanished {
                 changed.push(PackChange {
                     store: store.clone(),
                     name: name.clone(),
@@ -1881,34 +1911,37 @@ fn refusing_drift(export: Exported) -> Result<Export> {
 /// capture reads as surely as one in the source. A rewrite writes or
 /// removes packs, so it changes this; reading through a store never does.
 /// A missing pack directory is the empty listing, and an entry removed
-/// between the listing and its stat is absent: the rewrite itself. Any
-/// other stat failure refuses with its errno (p34, 2026-10-19): it is not
-/// a rewrite, and must not pass for one.
+/// between the listing and its stat is [`PackState::Vanished`]: the
+/// rewrite itself. Any other failure to read a listing refuses
+/// `GIT_PACK_LISTING_UNREADABLE` with its errno (p34 review, 2026-10-20):
+/// it is not a rewrite and must not pass for one, and a review can close it.
 fn pack_listing(stores: &[PathBuf]) -> Result<PackListing> {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::MetadataExt as _;
-    const SITE: &str = "git_carry::pack_listing";
+    let unreadable =
+        |error: &std::io::Error| BulkloadRefusal::GitPackListingUnreadable(error.raw_os_error());
     let mut listing = Vec::with_capacity(stores.len());
     for store in stores {
         let mut entries = std::collections::BTreeMap::new();
         match fs::read_dir(store.join("pack")) {
             Ok(read) => {
                 for entry in read {
-                    let entry = entry.refuse_at(SITE)?;
-                    match entry.metadata() {
-                        Ok(meta) => {
-                            entries.insert(
-                                entry.file_name().as_bytes().to_vec(),
-                                (meta.ino(), meta.size()),
-                            );
+                    let entry = entry.map_err(|error| unreadable(&error))?;
+                    let state = match entry.metadata() {
+                        Ok(meta) => PackState::Present {
+                            ino: meta.ino(),
+                            size: meta.size(),
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            PackState::Vanished
                         }
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(error) => return Err(crate::refuse::io(&error, SITE)),
-                    }
+                        Err(error) => return Err(unreadable(&error)),
+                    };
+                    entries.insert(entry.file_name().as_bytes().to_vec(), state);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(crate::refuse::io(&error, SITE)),
+            Err(error) => return Err(unreadable(&error)),
         }
         listing.push((store.clone(), entries));
     }
@@ -1951,7 +1984,12 @@ fn export_repository_inner(
         Err(
             cause @ (BulkloadRefusal::GitInventoryMalformed | BulkloadRefusal::GitChildFailed(_)),
         ) => {
-            let changed = pack_changes(&packs, &pack_listing(&stores)?);
+            // The child's refusal stands when the second listing cannot be
+            // read: that failure is the listing's, never the child's.
+            let Ok(after) = pack_listing(&stores) else {
+                return Err(cause);
+            };
+            let changed = pack_changes(&packs, &after);
             if changed.is_empty() {
                 return Err(cause);
             }
