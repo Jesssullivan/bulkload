@@ -8,9 +8,9 @@ use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use super::config::{consolidate, merge, Action, Contents, Format, Ledger, Target};
+use super::config::{consolidate, merge, Contents, Format, Target};
 use super::value::{pointer, Maps, Side};
-use super::{json, toml};
+use super::{json, toml, Action, Ledger};
 use crate::BulkloadRefusal;
 
 fn maps() -> Maps {
@@ -678,4 +678,69 @@ fn a_path_prefix_is_translated_only_as_a_whole_path() {
         "node /home/jess/.claude/hooks/a.js"
     );
     assert_eq!(maps.string("x/Users/jess"), "x/Users/jess");
+}
+
+#[test]
+fn files_are_classed_by_the_union_they_take() {
+    use super::{union_of, Class};
+    assert_eq!(
+        Class::of(b".claude/projects/k/s.jsonl", false),
+        Class::AppendLog
+    );
+    assert_eq!(Class::of(b"history.jsonl", false), Class::AppendLog);
+    assert_eq!(
+        Class::of(b".claude/settings.json", false),
+        Class::Config(Format::Json)
+    );
+    assert_eq!(
+        Class::of(b"config.toml", false),
+        Class::Config(Format::Toml)
+    );
+    assert_eq!(Class::of(b"state_5.sqlite", false), Class::Sqlite);
+    assert_eq!(Class::of(b"anything", true), Class::Sqlite);
+    assert_eq!(Class::of(b"plugins/cache/x.bin", false), Class::Opaque);
+    // The append-log and SQLite unions are their lanes' (#294, #278):
+    // until they land those classes are held.
+    assert!(union_of(Class::AppendLog).is_none());
+    assert!(union_of(Class::Sqlite).is_none());
+    assert!(union_of(Class::Config(Format::Json)).is_some());
+    assert!(union_of(Class::Opaque).is_some());
+}
+
+#[test]
+fn an_opaque_file_is_adopted_when_equal_and_held_when_not() {
+    let home = Home::new("opaque");
+    let ledger = Ledger::open(&home.root.join("state")).unwrap();
+    home.live("blob.bin", "same", Duration::from_mins(1));
+    let dir = File::open(&home.root).unwrap();
+    let staged_path = home.root.join(".staged");
+    for (bytes, expected) in [
+        ("same", Action::Adopted),
+        ("other", Action::Held("opaque: the bytes differ")),
+    ] {
+        fs::write(&staged_path, bytes).unwrap();
+        let staged = File::open(&staged_path).unwrap();
+        let outcome = super::opaque(
+            &super::Live {
+                dir: &dir,
+                name: b"blob.bin",
+                path: &home.root.join("blob.bin"),
+                rel: b"blob.bin",
+            },
+            &super::Source {
+                file: &staged,
+                path: &staged_path,
+                size: bytes.len() as u64,
+                mtime_ns: 1,
+                maps: &maps(),
+            },
+            &ledger,
+        )
+        .unwrap();
+        assert_eq!(outcome.action, expected);
+        assert_eq!(
+            fs::read_to_string(home.root.join("blob.bin")).unwrap(),
+            "same"
+        );
+    }
 }

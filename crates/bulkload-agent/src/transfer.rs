@@ -8570,7 +8570,7 @@ fn beside_existing(
 
 /// Whether the first `size` bytes of `a` and `b` are the same, read in 1
 /// MiB pieces (`read_dest_verify_existing_bytes`).
-fn same_bytes(a: &std::fs::File, b: &std::fs::File, size: u64) -> Result<bool> {
+pub(crate) fn same_bytes(a: &std::fs::File, b: &std::fs::File, size: u64) -> Result<bool> {
     const PIECE: u64 = 1 << 20;
     let mut mine = vec![0_u8; usize::try_from(PIECE).unwrap_or(usize::MAX)];
     let mut theirs = vec![0_u8; mine.len()];
