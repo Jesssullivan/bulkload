@@ -810,3 +810,23 @@ fn a_racy_beside_output_is_still_this_seats_own() {
         theirs
     );
 }
+
+/// Independent review of #280, N1: a destination root swapped for a link
+/// after the caller resolved it (sting's `~/.claude` relinked between the
+/// pull's resolve and its open) is refused `PATH_ESCAPES_ROOT`, typed,
+/// never a bare `IO`; nothing is written through the link.
+#[test]
+fn a_destination_root_swapped_for_a_link_is_a_typed_refusal() {
+    let corpus = Corpus::new();
+    std::fs::write(corpus.base.join("source/a.txt"), b"a\n").unwrap();
+    let real = corpus.base.join("elsewhere");
+    std::fs::create_dir(&real).unwrap();
+    let store = Store::open(&corpus.base.join("destination-state")).unwrap();
+    std::fs::remove_dir(corpus.base.join("destination")).unwrap();
+    std::os::unix::fs::symlink(&real, corpus.base.join("destination")).unwrap();
+    let refused = Destination::open(&corpus.base.join("destination"), &store)
+        .map(|_| ())
+        .unwrap_err();
+    assert_eq!(refused, BulkloadRefusal::PathEscapesRoot);
+    assert_eq!(std::fs::read_dir(&real).unwrap().count(), 0);
+}

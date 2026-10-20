@@ -295,8 +295,17 @@ impl Destination {
     /// # Errors
     /// Refuses a missing root or symlink root, or a store without authority.
     pub fn open(path: &Path, store: &Store) -> Result<Self> {
+        // A root swapped for a link or a non-directory after the caller
+        // resolved it is `PATH_ESCAPES_ROOT`, typed, never a bare `IO`
+        // (independent review of #280, N1).
         let root = File::from(
-            crate::io::sys::open_dir_path_nofollow(path).refuse_at("materialize::open")?,
+            crate::io::sys::open_dir_path_nofollow(path).map_err(|error| {
+                if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+                    BulkloadRefusal::PathEscapesRoot
+                } else {
+                    crate::refuse::io(&error, "materialize::open")
+                }
+            })?,
         );
         let path = std::fs::canonicalize(path).refuse_at("materialize::open")?;
         Ok(Self {

@@ -1081,6 +1081,7 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     const SID_NEO_KEY: &str = "5e5e5e5e-4444-4222-8333-444444444444";
     const SID_DEST: &str = "5e5e5e5e-5555-4222-8333-444444444444";
     const SID_NO_LANE: &str = "5e5e5e5e-6666-4222-8333-444444444444";
+    const SID_OUTSIDE: &str = "5e5e5e5e-7777-4222-8333-444444444444";
     const T_FORK: &str = "019a0000-0000-7000-8000-000000000009";
     let base = std::env::temp_dir().join(format!("bulkload-move-archive-{}", std::process::id()));
     let _ = fs::remove_dir_all(&base);
@@ -1112,6 +1113,18 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     fs::write(
         no_lane_projects.join(format!("{SID_NO_LANE}.jsonl")),
         transcript(SID_NO_LANE, &elsewhere, "NOLANE"),
+    )
+    .unwrap();
+    // A neo session whose cwd is outside neo's home (neo's
+    // /private/var/folders or /Volumes): its key looks like no source
+    // key, but this pull listed it, so it is neo's, never taken for the
+    // destination's own (independent review of #280, N4).
+    let outside = base.join("outside");
+    let outside_projects = src_home.join(".claude/projects").join(key(&outside));
+    fs::create_dir_all(&outside_projects).unwrap();
+    fs::write(
+        outside_projects.join(format!("{SID_OUTSIDE}.jsonl")),
+        transcript(SID_OUTSIDE, &outside, "OUTSIDE"),
     )
     .unwrap();
     fs::write(
@@ -1225,6 +1238,12 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         &map,
         &"--replace-archived-dest",
         &archive,
+        // The by-ID prefixes (`/private/tmp`, `/tmp`) would take a session
+        // under a `/tmp` test directory for a by-ID one (the merge gate runs
+        // with nix's `TMPDIR=/tmp/nix-shell.*`): off, so the session with no
+        // lane is unmapped wherever the test runs.
+        &"--reseat-arg",
+        &"--no-default-by-id",
         &"-",
         &source_state,
         &state,
@@ -1292,11 +1311,12 @@ fn archive_links_follow_a106_and_destination_links_stay() {
     );
     assert_eq!(fs::read(&gz).unwrap(), b"\x1f\x8b old");
     assert_eq!(fs::read(&odd).unwrap(), b"an odd name\n");
-    // N4: the session with no lane holds the gate, typed and reviewable;
-    // nothing else does.
+    // N4: the two neo sessions with no lane hold the gate, typed and
+    // reviewable, the one outside neo's home included (by provenance, not
+    // by its key's shape); nothing else does.
     let totals = closure(&moved.stdout);
     assert_eq!(
-        totals["reseat_held"], "claude/RESEAT_LANE_UNMAPPED:1",
+        totals["reseat_held"], "claude/RESEAT_LANE_UNMAPPED:2",
         "{}",
         moved.stdout
     );

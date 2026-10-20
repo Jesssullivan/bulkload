@@ -324,6 +324,53 @@ struct Sessions {
     reseat: Option<bulkload_agent::reseat::Summary>,
 }
 
+/// The real `.claude` and `.codex` this pass's pull ran under, resolved
+/// once and owner-checked ([`Move::live_root`]): the re-seat runs under
+/// exactly these (independent review of #280, N1).
+struct Homes {
+    claude: PathBuf,
+    codex: PathBuf,
+}
+
+/// The real directory `path` resolves to, when this user owns it.
+fn owned_real(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let real = std::fs::canonicalize(path).refuse_at("estate_move::owned_real")?;
+    let resolved = std::fs::symlink_metadata(&real).refuse_at("estate_move::owned_real")?;
+    // SAFETY: geteuid has no preconditions or side effects.
+    let me = unsafe { libc::geteuid() };
+    if !resolved.is_dir() || resolved.uid() != me {
+        return Err(BulkloadRefusal::PathEscapesRoot);
+    }
+    Ok(real)
+}
+
+/// Whether the live home `live` still resolves to `real`, the directory
+/// this pass's pull ran under: a home relinked since is refused
+/// `PATH_ESCAPES_ROOT`, so no re-seat runs over a tree the pull never
+/// wrote (independent review of #280, N1).
+fn same_home(live: &Path, real: &Path) -> Result<()> {
+    if owned_real(live)? == real {
+        Ok(())
+    } else {
+        Err(BulkloadRefusal::PathEscapesRoot)
+    }
+}
+
+/// Write a session's source listing (NUL-ended relative paths).
+fn write_listing(path: &Path, listed: Option<Vec<Vec<u8>>>) -> Result<()> {
+    let _ = std::fs::remove_file(path);
+    if let Some(listed) = listed {
+        let mut bytes = Vec::new();
+        for entry in listed {
+            bytes.extend_from_slice(&entry);
+            bytes.push(0);
+        }
+        moving::write_report(path, &bytes)?;
+    }
+    Ok(())
+}
+
 /// The destination half's arguments.
 struct Move {
     plan_only: bool,
@@ -514,7 +561,8 @@ impl Move {
         self.transfer_into(from, to, name)
     }
 
-    // [`Self::transfer`] into a live destination tree (the agent's own home
+    // The real root a transfer into a live destination tree runs under (the
+    // agent's own home
     // directory, plan of record 2026-10-19 C9): created 0700 when absent,
     // else taken as it is, whatever its mode (its mode is the agent's, not
     // bulkload's to tighten). A symlink there (sting's `~/.claude` and
@@ -524,40 +572,26 @@ impl Move {
     // path, following no further link; the line below and the transfer's
     // record (its destination is the real path) name it. Anything else
     // refuses PATH_ESCAPES_ROOT.
-    fn transfer_live(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
-        use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
-        let real = match std::fs::DirBuilder::new().mode(0o700).create(to) {
-            Ok(()) => to.to_path_buf(),
+    fn live_root(to: &Path, name: &str) -> Result<PathBuf> {
+        use std::os::unix::fs::DirBuilderExt as _;
+        match std::fs::DirBuilder::new().mode(0o700).create(to) {
+            Ok(()) => Ok(to.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let found =
-                    std::fs::symlink_metadata(to).refuse_at("estate_move::transfer_live")?;
+                let found = std::fs::symlink_metadata(to).refuse_at("estate_move::live_root")?;
                 if found.is_dir() {
-                    to.to_path_buf()
-                } else if found.file_type().is_symlink() {
-                    let real = std::fs::canonicalize(to).refuse_at("estate_move::transfer_live")?;
-                    let resolved =
-                        std::fs::symlink_metadata(&real).refuse_at("estate_move::transfer_live")?;
-                    // SAFETY: geteuid has no preconditions or side effects.
-                    let me = unsafe { libc::geteuid() };
-                    if !resolved.is_dir() || resolved.uid() != me {
-                        return Err(BulkloadRefusal::PathEscapesRoot);
-                    }
-                    out(&format!(
-                        "estate-move sessions-home name={name} live={to:?} real={real:?}"
-                    ))?;
-                    real
-                } else {
+                    return Ok(to.to_path_buf());
+                }
+                if !found.file_type().is_symlink() {
                     return Err(BulkloadRefusal::PathEscapesRoot);
                 }
+                let real = owned_real(to)?;
+                out(&format!(
+                    "estate-move sessions-home name={name} live={to:?} real={real:?}"
+                ))?;
+                Ok(real)
             }
-            Err(error) => {
-                return Err(bulkload_agent::refuse::io(
-                    &error,
-                    "estate_move::transfer_live",
-                ))
-            }
-        };
-        self.transfer_into(from, &real, name)
+            Err(error) => Err(bulkload_agent::refuse::io(&error, "estate_move::live_root")),
+        }
     }
 
     fn transfer_into(&self, from: &Path, to: &Path, name: &str) -> Result<()> {
@@ -763,7 +797,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
     // transcripts' re-seat.
     let sessions: Option<Sessions> = if let Some(home) = &run.sessions {
         let pass_started = now_secs();
-        let pulled = sessions_pull(&run, home);
+        let (pulled, homes) = sessions_pull(&run, home);
         note(&pulled);
         reached(&mut ledger, &ledger_path, "sessions-pull", word(&pulled))?;
         let mut outcome = Sessions {
@@ -773,8 +807,8 @@ fn move_command(args: &[OsString]) -> Result<()> {
                 .collect(),
             reseat: None,
         };
-        if session_completed(&pulled) {
-            let reseated = reseat(&run, home, (&plan, &corpus, &private), pass_started);
+        if let (true, Some(homes)) = (session_completed(&pulled), &homes) {
+            let reseated = reseat(&run, home, homes, (&plan, &corpus, &private), pass_started);
             let ended: Result<()> = reseated.as_ref().map(drop).map_err(Clone::clone);
             note(&ended);
             reached(&mut ledger, &ledger_path, "reseat", word(&ended))?;
@@ -1060,31 +1094,59 @@ const STATE_DB: &str = "state_5.sqlite";
 // returned; the first refusal is the phase's. `ITEMS_REFUSED` means the
 // session completed with typed path refusals (closure rows), which does
 // not stop the re-seat (C10).
-fn sessions_pull(run: &Move, home: &Path) -> Result<()> {
-    let dest = dest_home(run)?;
-    let codex_root = run
+fn sessions_pull(run: &Move, home: &Path) -> (Result<()>, Option<Homes>) {
+    let dest = match dest_home(run) {
+        Ok(dest) => dest,
+        Err(refusal) => return (Err(refusal), None),
+    };
+    let codex_from = run
         .codex_root
         .clone()
         .unwrap_or_else(|| home.join(".codex"));
-    bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()))?;
-    let claude = run.transfer_live(&home.join(".claude"), &dest.join(".claude"), "claude");
+    let pulls = run.state.join("pull");
+    let suffix = bulkload_agent::transfer::set_beside_suffix(Some(run.suffix().into_bytes()));
+    // The source's transcripts and rollouts, listed by each session: the
+    // provenance the re-seat tells them from the destination's own by
+    // (independent review of #280, N4).
+    bulkload_agent::transfer::set_listing(vec![b"projects/".to_vec()]);
+    let _ = super::take_listed();
+    let claude_root = Move::live_root(&dest.join(".claude"), "claude");
+    let claude = claude_root
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|real| run.transfer_into(&home.join(".claude"), real, "claude"));
+    let claude_listed = write_listing(&pulls.join("claude.listing"), super::take_listed());
     // The Codex index always lands beside, as this pass's snapshot: the
     // pull never writes the live index (review of #280, finding 6).
+    bulkload_agent::transfer::set_listing(vec![
+        b"sessions/".to_vec(),
+        b"archived_sessions/".to_vec(),
+    ]);
     bulkload_agent::transfer::set_beside_always(vec![STATE_DB.as_bytes().to_vec()]);
-    let codex = run.transfer_live(&codex_root, &dest.join(".codex"), "codex");
+    let codex_root = Move::live_root(&dest.join(".codex"), "codex");
+    let codex = codex_root
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|real| run.transfer_into(&codex_from, real, "codex"));
+    let codex_listed = write_listing(&pulls.join("codex.listing"), super::take_listed());
     bulkload_agent::transfer::set_beside_always(Vec::new());
+    bulkload_agent::transfer::set_listing(Vec::new());
     let cleared = bulkload_agent::transfer::set_beside_suffix(None);
     // A session that did not complete outranks one that completed with
     // refused paths: the phase's word says whether the re-seat may run.
     let mut outcome = Ok(());
-    for result in [claude, codex, cleared] {
+    for result in [suffix, claude, claude_listed, codex, codex_listed, cleared] {
         if let Err(refusal) = result {
             if session_completed(&outcome) {
                 outcome = Err(refusal);
             }
         }
     }
-    outcome
+    let homes = match (claude_root, codex_root) {
+        (Ok(claude), Ok(codex)) => Some(Homes { claude, codex }),
+        _ => None,
+    };
+    (outcome, homes)
 }
 
 // The Codex index snapshot this pass landed beside the live index: the
@@ -1136,10 +1198,14 @@ const fn session_completed(pulled: &Result<()>) -> bool {
 fn reseat(
     run: &Move,
     home: &Path,
+    homes: &Homes,
     (plan, corpus, private): (&Path, &Path, &Path),
     pass_started: u64,
 ) -> Result<Option<bulkload_agent::reseat::Summary>> {
     let dest_home = dest_home(run)?;
+    // The homes must still be the directories the pull ran under (N1).
+    same_home(&dest_home.join(".claude"), &homes.claude)?;
+    same_home(&dest_home.join(".codex"), &homes.codex)?;
     let codex_root = run
         .codex_root
         .clone()
@@ -1175,7 +1241,27 @@ fn reseat(
     // Review of #280, finding 6: the landed index is the snapshot this
     // pass took, named by this pass's Codex transfer record, or none: never
     // the live index, never an earlier pass's snapshot.
-    match landed_index(run, &dest_home.join(".codex"), pass_started) {
+    let pulls = run.state.join("pull");
+    args.extend([
+        "--dest-claude".into(),
+        homes.claude.clone().into_os_string(),
+        "--landing-claude".into(),
+        homes.claude.clone().into_os_string(),
+        "--dest-codex".into(),
+        homes.codex.clone().into_os_string(),
+        "--landing-codex".into(),
+        homes.codex.clone().into_os_string(),
+    ]);
+    for (flag, name) in [
+        ("--claude-listing", "claude.listing"),
+        ("--codex-listing", "codex.listing"),
+    ] {
+        let listing = pulls.join(name);
+        if listing.is_file() {
+            args.extend([flag.into(), listing.into_os_string()]);
+        }
+    }
+    match landed_index(run, &homes.codex, pass_started) {
         Some(index) => args.extend(["--landing-codex-index".into(), index.into_os_string()]),
         None => args.push("--no-landing-codex-index".into()),
     }

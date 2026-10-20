@@ -334,6 +334,12 @@ pub struct TransferStats {
     /// base that was carried as a snapshot: covered by it, never carried
     /// (#218), by relative path. A sidecar whose base was not is a refusal.
     pub sqlite_sidecars_covered: Vec<Vec<u8>>,
+    /// The source's regular and symlink seats under the listing prefixes
+    /// ([`set_listing`]), every one the walk offered, as it named them:
+    /// this pull's source listing, the provenance `estate-reseat` tells the
+    /// source's sessions from the destination's own by (independent review
+    /// of #280, N4).
+    pub listed: Vec<Vec<u8>>,
     /// Seats whose bytes were published, reused or adopted beside a
     /// differing live destination file under `--beside SUFFIX`
     /// ([`set_beside_suffix`]): `(source path, beside path)`. Each is
@@ -1013,6 +1019,22 @@ fn beside_always() -> HashSet<Vec<u8>> {
         .iter()
         .cloned()
         .collect()
+}
+
+/// The prefixes of the seats a session lists ([`TransferStats::listed`]).
+static LISTING: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// List the source's regular and symlink seats under `prefixes` in every
+/// session of this process (an empty list: none).
+pub fn set_listing(prefixes: Vec<Vec<u8>>) {
+    *LISTING.lock().unwrap_or_else(PoisonError::into_inner) = prefixes;
+}
+
+fn listing() -> Vec<Vec<u8>> {
+    LISTING
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
 }
 
 /// `rel_path` with the beside `suffix` appended.
@@ -4954,6 +4976,8 @@ struct Inbound<'a, W> {
     /// path holds a symlink or another kind, landed beside, by live path:
     /// every entry under one is decided under its beside directory.
     redirects: HashMap<Vec<u8>, Vec<u8>>,
+    /// The listing prefixes ([`set_listing`]).
+    listing: Vec<Vec<u8>>,
 }
 
 /// A walk frame: what a batch of new directories holds back.
@@ -5236,6 +5260,7 @@ fn receive_session<R: Read, W: Write>(
             claimed: HashSet::new(),
             always: beside_always(),
             redirects: HashMap::new(),
+            listing: listing(),
         };
         drop(setup_timer);
         let source_bytes_read = {
@@ -5470,6 +5495,14 @@ impl<W: Write> Inbound<'_, W> {
     fn handle_walked(&mut self, frame: Walked) -> Result<()> {
         match frame {
             Walked::Entry { entry, row, wal } => {
+                if matches!(row.kind, FileKind::Regular | FileKind::Symlink)
+                    && self
+                        .listing
+                        .iter()
+                        .any(|prefix| row.rel_path.starts_with(prefix))
+                {
+                    self.stats.listed.push(row.rel_path.clone());
+                }
                 let row = self.redirected(row);
                 self.entry(entry, row, wal)
             }

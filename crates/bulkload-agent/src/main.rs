@@ -456,6 +456,7 @@ SUBCOMMANDS:
                   [--plan PLAN --corpus CORPUS --source LABEL [--private-state DIR]...]
                   [--codex-source-root DIR]... [--landing-claude DIR] [--landing-codex DIR]
                   [--landing-codex-index FILE | --no-landing-codex-index] [--beside-suffix SUFFIX]
+                  [--dest-claude DIR] [--dest-codex DIR] [--claude-listing FILE] [--codex-listing FILE]
                   [--unmapped=report|by-id] [--note-marker TEXT] [--sessions-only]
                   [--waive ID]... [--waive-from FILE] [--retention-margin-days N]
                   [--managed-settings FILE]... [--by-id DIR]... [--no-default-by-id]
@@ -1870,6 +1871,31 @@ fn reseat_command(args: &[std::ffi::OsString]) -> Result<()> {
     reseat_run(args).map(drop)
 }
 
+/// `path`, when it is a real directory (no link on the way: it is its own
+/// canonical path) that this user owns; else `PATH_ESCAPES_ROOT`
+/// (independent review of #280, N1: the live homes the pull resolved).
+fn owned_real_dir(path: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt as _;
+    let real = std::fs::canonicalize(path).refuse_at("main::owned_real_dir")?;
+    let found = std::fs::symlink_metadata(&real).refuse_at("main::owned_real_dir")?;
+    // SAFETY: geteuid has no preconditions or side effects.
+    let me = unsafe { libc::geteuid() };
+    if real != path || !found.is_dir() || found.uid() != me {
+        return Err(BulkloadRefusal::PathEscapesRoot);
+    }
+    Ok(real)
+}
+
+/// A source listing file: relative paths, each ended by a NUL.
+fn read_listing(path: &Path) -> Result<std::collections::HashSet<Vec<u8>>> {
+    let bytes = std::fs::read(path).refuse_at("main::read_listing")?;
+    Ok(bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
 /// `estate-reseat`, returning a pass's summary (`None` for `--check` and
 /// `--undo`), which `estate-move` folds into its gate (C11).
 #[allow(clippy::too_many_lines)]
@@ -1884,6 +1910,8 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
     let (mut landing_claude, mut landing_codex) = (None, None);
     let mut landing_index = bulkload_agent::reseat::LandingIndex::InLanding;
     let mut beside_suffix = None;
+    let (mut dest_claude, mut dest_codex) = (None, None);
+    let (mut claude_listing, mut codex_listing) = (None, None);
     let mut unmapped = Unmapped::Report;
     let mut marker = None;
     let mut sessions_only = false;
@@ -1960,6 +1988,10 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
             | "--landing-claude"
             | "--landing-codex"
             | "--landing-codex-index"
+            | "--dest-claude"
+            | "--dest-codex"
+            | "--claude-listing"
+            | "--codex-listing"
             | "--managed-settings"
             | "--by-id"
             | "--replace-archived-dest"
@@ -1971,6 +2003,10 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
                     "--private-state" => states.push(path),
                     "--codex-source-root" => roots.push(path),
                     "--landing-claude" => landing_claude = Some(path),
+                    "--dest-claude" => dest_claude = Some(owned_real_dir(&path)?),
+                    "--dest-codex" => dest_codex = Some(owned_real_dir(&path)?),
+                    "--claude-listing" => claude_listing = Some(read_listing(&path)?),
+                    "--codex-listing" => codex_listing = Some(read_listing(&path)?),
                     "--landing-codex-index" => {
                         if !path.is_absolute() {
                             return Err(BulkloadRefusal::PathNotAbsolute);
@@ -2074,6 +2110,14 @@ fn reseat_run(args: &[std::ffi::OsString]) -> Result<Option<bulkload_agent::rese
     }
     options.landing_index = landing_index;
     options.beside_suffix = beside_suffix;
+    if let Some(path) = dest_claude {
+        options.dest_claude = path;
+    }
+    if let Some(path) = dest_codex {
+        options.dest_codex = path;
+    }
+    options.claude_listing = claude_listing;
+    options.codex_listing = codex_listing;
     if !roots.is_empty() {
         options.codex_source_roots = roots;
     }
@@ -2391,6 +2435,25 @@ fn hydrate_command(args: &[std::ffi::OsString]) -> Result<()> {
 // canonical SOURCE and DEST so a rerun spelled another way names the same
 // rows. S2 (review finding 1): the overlap decision is made before the
 // record's first write, so a refused overlap writes nothing anywhere.
+/// The source listing of the last recorded `copy` or `pull` of this
+/// process ([`bulkload_agent::transfer::set_listing`]): what `estate-move`
+/// hands `estate-reseat` as provenance (independent review of #280, N4).
+static LAST_LISTED: std::sync::Mutex<Option<Vec<Vec<u8>>>> = std::sync::Mutex::new(None);
+
+fn keep_listed(stats: &bulkload_agent::transfer::TransferStats) {
+    *LAST_LISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stats.listed.clone());
+}
+
+/// Take the last recorded session's listing (`None` when none ended).
+fn take_listed() -> Option<Vec<Vec<u8>>> {
+    LAST_LISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &Path) -> Result<()> {
     let stats = bulkload_agent::transfer_outcome::record_session(
         dest_state,
@@ -2401,6 +2464,7 @@ fn copy_recorded(source: &Path, dest: &Path, source_state: &Path, dest_state: &P
         || bulkload_agent::transfer::copy_roots_apart(source, dest, source_state, dest_state),
         || bulkload_agent::transfer::copy(source, dest, source_state, dest_state),
     )?;
+    keep_listed(&stats);
     report_transfer(&stats)
 }
 
@@ -2423,7 +2487,10 @@ fn pull_recorded(args: &[std::ffi::OsString]) -> Result<()> {
         || bulkload_agent::transfer::receive_roots_apart(path(2)?, path(4)?),
         || pull_command(args),
     )
-    .and_then(|stats| report_transfer(&stats))
+    .and_then(|stats| {
+        keep_listed(&stats);
+        report_transfer(&stats)
+    })
 }
 
 // M2r2 b: `estate-carry-files`. A `pull` carries through `pull_command`,

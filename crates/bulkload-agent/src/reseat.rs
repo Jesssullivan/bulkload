@@ -177,6 +177,15 @@ pub struct Options {
     /// archive link) is the source's copy of that session or rollout, and is
     /// re-seated as the landed one; the link is never read.
     pub beside_suffix: Option<String>,
+    /// `--claude-listing FILE` (independent review of #280, N4): the
+    /// transcripts this run's pull listed on the source, relative to its
+    /// `.claude`. On a live-home landing a session in it is the source's
+    /// (unmapped unless mapped or by ID); one not in it is the
+    /// destination's own, in place. Without it, the key's shape decides.
+    pub claude_listing: Option<std::collections::HashSet<Vec<u8>>>,
+    /// `--codex-listing FILE`: the same for the rollouts, relative to the
+    /// source's `.codex`.
+    pub codex_listing: Option<std::collections::HashSet<Vec<u8>>>,
     /// The destination home: its `git` directory is the default lane root.
     pub dest_home: PathBuf,
     /// The destination's live `.claude`.
@@ -263,6 +272,8 @@ impl Options {
             landing_codex: landing_home.join(".codex"),
             landing_index: LandingIndex::InLanding,
             beside_suffix: None,
+            claude_listing: None,
+            codex_listing: None,
             dest_home: dest_home.to_path_buf(),
             dest_claude: dest_home.join(".claude"),
             dest_codex: dest_home.join(".codex"),
