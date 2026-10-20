@@ -112,7 +112,21 @@ SUBCOMMANDS:
                 way (an unrelated one refuses GIT_DESTINATION_OCCUPIED after the
                 provenance import), and a ledger naming another plan's item is
                 re-keyed after its proof when the capture is the landed tree's
-                (equal, or its HEAD descends from the ledger's). A bare capture into an absent path
+                (equal, or its HEAD descends from the ledger's). A linked
+                worktree item whose path holds a directory with no .git at all
+                (2026-10-19) is adopted when every captured path there holds
+                its kind, mode and bytes: registered again (a .git gitfile,
+                its worktrees/ administration, the index from the capture), no
+                file in it written, extra files kept (adopted-nonrepo=1),
+                unless another worktree holds the captured branch or another
+                registered worktree is bulkload's landing of the item or a
+                PATH.<suffix> copy it landed, detached or not, with or without
+                --beside (GIT_DESTINATION_NONREPO_DUPLICATE, nothing written,
+                pending review); one that differs, or a
+                standalone item's, refuses
+                GIT_DESTINATION_NONREPO_DIFFERS, nothing written, and under
+                --beside a linked item's capture lands beside it with its
+                refs (beside-reason=GIT_DESTINATION_NONREPO_DIFFERS). A bare capture into an absent path
                 lands a bare repository bulkload makes (with or without
                 --adopt). --activate-origin PREFIX (repeatable): a first landing
                 activates an scp-style or ssh:// origin starting with PREFIX

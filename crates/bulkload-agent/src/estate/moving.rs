@@ -497,6 +497,39 @@ pub const fn action(
     }
 }
 
+/// The plan's preview for a linked worktree item whose live path is a
+/// directory with no `.git` at all.
+///
+/// 2026-10-19, the td01 batch; review of #286: the apply adopts it by
+/// proof or lands the capture beside it
+/// (`git_carry::converge::check_nonrepo`), so the plan says `adopt`
+/// (`nonrepo-adopt-or-beside`), never `refuse` (`not-git`). Every other
+/// decision of [`action`] is kept, a standalone item's non-repo directory
+/// (refused typed by the apply) and a file included. Reads the path only.
+#[must_use]
+pub fn nonrepo_preview(
+    item: &Item,
+    capture: Capture,
+    (action, reason): (Action, &'static str),
+) -> (Action, &'static str) {
+    let linked = item
+        .workspace
+        .as_ref()
+        .filter(|workspace| **workspace != item.repository);
+    let nonrepo = linked.is_some_and(|path| {
+        fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
+            && matches!(
+                fs::symlink_metadata(path.join(".git")),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+            )
+    });
+    if action == Action::Refuse && reason == "not-git" && capture == Capture::Held && nonrepo {
+        (Action::Adopt, "nonrepo-adopt-or-beside")
+    } else {
+        (action, reason)
+    }
+}
+
 /// One item's recorded decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Decision {
@@ -649,7 +682,8 @@ pub fn decide(
         let capture = capture_of(held, inputs.refusals.get(&identity).map(String::as_str));
         let place = item.workspace.as_ref().unwrap_or(&item.repository);
         let now = presence(place);
-        let (action, reason) = action(item.workspace.is_some(), capture, now, inputs.seats);
+        let decided = action(item.workspace.is_some(), capture, now, inputs.seats);
+        let (action, reason) = nonrepo_preview(item, capture, decided);
         let previous = ledger.items.get(&identity);
         let carried = super::carried::carried_path(inputs.state, &identity, inputs.source)
             .try_exists()
@@ -791,6 +825,39 @@ mod tests {
     use crate::test_support::prop_config;
     use proptest::prelude::*;
     use std::process::Command;
+
+    // Review of #286: the plan previews a linked item's non-repo directory
+    // as the apply treats it (adopt or beside), and nothing else changes.
+    #[test]
+    fn a_linked_nonrepo_directory_previews_adopt() {
+        let base = std::env::temp_dir().join(format!("bulkload-preview-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let wt = base.join("repo.worktrees/wt");
+        fs::create_dir_all(&wt).unwrap();
+        fs::write(wt.join("a.txt"), b"a\n").unwrap();
+        let linked = Item {
+            source: PathBuf::from("/src/wt"),
+            repository: base.join("repo"),
+            workspace: Some(wt.clone()),
+        };
+        let refused = (Action::Refuse, "not-git");
+        assert_eq!(
+            nonrepo_preview(&linked, Capture::Held, refused),
+            (Action::Adopt, "nonrepo-adopt-or-beside")
+        );
+        assert_eq!(nonrepo_preview(&linked, Capture::Pending, refused), refused);
+        let standalone = Item {
+            repository: wt.clone(),
+            ..linked.clone()
+        };
+        assert_eq!(
+            nonrepo_preview(&standalone, Capture::Held, refused),
+            refused
+        );
+        fs::write(wt.join(".git"), b"gitdir: /nowhere\n").unwrap();
+        assert_eq!(nonrepo_preview(&linked, Capture::Held, refused), refused);
+        fs::remove_dir_all(&base).unwrap();
+    }
 
     const PRESENCES: [Presence; 6] = [
         Presence::Absent,

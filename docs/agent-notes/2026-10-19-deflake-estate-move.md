@@ -1,3 +1,9 @@
+> 2026-10-20: superseded in part by #292 (ledgers and hand-off records
+> dated before their writes). The p90 and h14 re-stamps described below
+> were removed there: with #292 every seat a landing or hand-off writes is
+> racy against its own record, which both tests assume. The estate_move
+> and reseat changes stand.
+
 # 2026-10-19: four bulkload-agent tests no longer rest on timing or free-space drift
 
 Lane: coordinator brief 2026-10-19 (deflake `estate_move`; later the same
