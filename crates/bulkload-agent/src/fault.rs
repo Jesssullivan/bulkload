@@ -424,6 +424,11 @@ pub enum Point {
     /// no process inside) and marked deleting; its renamed tree and a
     /// linked landing's administration not yet removed.
     EstateAdvanceRetireMid,
+    /// `estate.apply.nonrepo_registered`: a non-repo directory being
+    /// adopted as a linked worktree (2026-10-19): its landing intent and
+    /// its administration directory `worktrees/<id>` written, the `.git`
+    /// gitfile not yet; no file in the directory written.
+    EstateApplyNonrepoRegistered,
     /// `estate.carry.recorded`: `estate-carry-files` landed an item's
     /// bytes and wrote its carry record; the outcome record still says
     /// `CAPTURE_ABSENT` (M2r2 b).
@@ -484,7 +489,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 83] = [
+    pub const ALL: [Self; 84] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -546,6 +551,7 @@ impl Point {
         Self::EstateAdvanceRetireCarried,
         Self::EstateAdvanceRetireAfterRename,
         Self::EstateAdvanceRetireMid,
+        Self::EstateApplyNonrepoRegistered,
         Self::EstateCarryRecorded,
         Self::ReseatAfterTempSeal,
         Self::ReseatAfterPublish,
@@ -635,6 +641,7 @@ impl Point {
             Self::EstateAdvanceRetireCarried => "estate.advance.retire_carried",
             Self::EstateAdvanceRetireAfterRename => "estate.advance.retire_after_rename",
             Self::EstateAdvanceRetireMid => "estate.advance.retire_mid",
+            Self::EstateApplyNonrepoRegistered => "estate.apply.nonrepo_registered",
             Self::EstateCarryRecorded => "estate.carry.recorded",
             Self::ReseatAfterTempSeal => "reseat.after_temp_seal",
             Self::ReseatAfterPublish => "reseat.after_publish",

@@ -280,6 +280,10 @@ own transfer and records the result in the estate ledger.
     for `GIT_BESIDE_FOREIGN`, `refusal_detail`, the refusal as recorded
     (it names the beside path). Both are added keys; no total, disposition
     or gate changes;
+  - (2026-10-19) on an `applied-beside` row, `beside_reason`: the refusal
+    code that sent the capture beside (`GIT_DESTINATION_DIVERGED`,
+    `GIT_DESTINATION_NONREPO_DIFFERS`), from the item's `.beside-reason`
+    record. An added key only;
   - (`--advance-ancestor`, 2026-10-19) an `advance` block on a row whose
     item's `.advance` record names its current capture (`outcome`:
     `advanced` or the `GIT_ADVANCE_*` code; `detail`; `beside`; `reason`;
@@ -1255,6 +1259,71 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   row (what the apply tries; no proof is run for it). A beside checkout
   bulkload landed first is a worktree of the live repository: `git
   worktree list` there shows it.
+- **An occupied non-repo directory (2026-10-19, the td01 batch).** Six
+  linked worktrees of tinyland.dev exist on sting as directories with
+  their files and no `.git` at all (the 2026-08-29 ceremony stripped them);
+  `estate-apply` refused each `GIT_DESTINATION_OCCUPIED`. Under `--adopt`, a
+  linked worktree item whose planned path is such a directory is proved
+  read-only first (`converge::check_nonrepo`): spelled canonically, no
+  registration of the repository naming it (unless a landing intent of
+  this item does: its own registration a crash cut short), the first linked
+  landing's checks, and every seat the capture carries, tracked, untracked
+  and ignored, held there with its kind, mode and bytes (`adopt::prove_seats`);
+  files the capture does not carry are left alone. Equal, it is adopted by
+  registering it again, as `git worktree add` would and with nothing in it
+  written (`git_carry::adopt_nonrepo_linked`): under the destination lock
+  the capture is imported, the native ref step runs and HEAD is planned as
+  for a first linked landing; the directory is checked again; the landing
+  intent; a branch `worktree add -b` would create in a foreign repository;
+  the administration directory `worktrees/<id>` (`commondir`, `HEAD`, then
+  `gitdir`; `<id>` the directory's name, numbered when taken;
+  `estate.apply.nonrepo_registered`); the `.git` gitfile, created new
+  (`estate.converge.linked_added`); the index from the capture; and the
+  workspace ledger from the proof's prints once they still hold. A crash
+  is finished forward: before the gitfile by the same adoption reusing its
+  administration directory, after it by `recover_linked_landing`, which
+  sets no mode a seat already holds. The receipt counts `adopted-nonrepo`
+  and closure says `applied`; later passes converge it as any landing.
+  One that differs, or a standalone item's (no registration to re-create,
+  no repository to land beside into), refuses
+  `GIT_DESTINATION_NONREPO_DIFFERS` with nothing written; under `--beside`
+  a linked item's capture lands beside it exactly as a diverged checkout's
+  does (refs in, the directory untouched), and the beside landing records
+  the code that sent it there (`beside-reason=<CODE>` in the receipt,
+  `{item}-{blake3(SOURCE)}.beside-reason` in STATE, `beside_reason` on
+  closure's `applied-beside` row; `GIT_DESTINATION_DIVERGED` for a diverged
+  checkout). `estate-diff` reports `nonrepo-adoptable`, `nonrepo-duplicate`
+  or `nonrepo-differs` with the differing seats and the beside component,
+  and `estate-move`'s plan previews a linked item's non-repo directory as
+  `adopt` (`nonrepo-adopt-or-beside`).
+  Review of #286 (2026-10-19): an equal directory is never registered as a
+  second copy of the same worktree: when the captured branch is checked
+  out by another worktree of the repository (the td01 shape: the item's
+  beside landing from an earlier pass holds it) or the item's beside
+  landing exists at `<path>SUFFIX`, it refuses
+  `GIT_DESTINATION_NONREPO_DUPLICATE`, nothing written, pending review
+  (retiring a beside proven equal, as #289 retires one, is the follow-up).
+  Its verification (2026-10-19): the same refusal, with or without
+  `--beside` and whatever the copy's HEAD (the tin2835 shape is a detached
+  `<path>.neo-YYYYMMDD`), when any registered worktree of the repository is
+  bulkload's landing of this item (its workspace ledger names the item) or
+  a `<path>.<suffix>` sibling bulkload landed under any source.
+  The adoption's landing intent carries a marker: a crash past the gitfile
+  is finished by proving every seat again (content and mode, read from the
+  capture imported into the repository) and writing none, a missing or
+  changed seat refusing `GIT_DESTINATION_MODIFIED`, and the ledger is that
+  proof's. The administration directory is held `locked` "initializing"
+  until the gitfile is written, as `git worktree add` holds it; a relative
+  `gitdir` names the directory as an absolute one does; the re-check runs
+  under the lock before the import, the native ref step and any exclude
+  append; and a later pass that does not adopt it (a refusal, or a pass
+  without `--adopt`) removes the registration a crash left before the
+  gitfile, as does a failure of the adopting pass itself before its
+  gitfile names the registration (a partial gitfile it created is removed
+  first): nothing stays `locked` "initializing" for `git worktree prune`
+  or `git branch -f` to trip over. The removal is ownership-checked: only
+  an administration directory still locked "initializing", holding only
+  what the adoption writes, no `.git` naming it, and this item's intent.
 - **Beside landings converge, and a beside path is adopted by proof (gap
   C12, plan of record rev 2; operator ruling A-115, 2026-10-18,
   "Landings placed beside refuse every later pass once neo changes" →

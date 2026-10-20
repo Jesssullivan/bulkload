@@ -320,6 +320,26 @@ pub enum BulkloadRefusal {
     /// capture's branch (deleted when the switch created it, else put back)
     /// are restored by compare-and-swap. Carries the seats left to the edit.
     GitSwitchRolledBack(Vec<u8>),
+    /// `estate-apply --adopt` (2026-10-19, the td01 batch): a linked
+    /// worktree item's planned path holds a directory with no `.git` at all
+    /// (a worktree whose registration was stripped) that the apply cannot
+    /// adopt by registering it again: it differs from the capture in a
+    /// captured path's kind, mode or bytes, a stale registration of the
+    /// repository already names the path, or the item is not a linked
+    /// worktree (a standalone item has no registration to re-create). The
+    /// directory is never written, moved or deleted. Under `--beside` the
+    /// capture lands beside it and this code is the beside landing's
+    /// recorded reason (`beside-reason`); without it the item is refused
+    /// with it, pending review.
+    GitDestinationNonrepoDiffers,
+    /// `estate-apply --adopt` (review of #286, finding 1): a linked
+    /// worktree item's non-repo directory proves equal to the capture, but
+    /// registering it would make a second registered copy of the same
+    /// worktree: the captured branch is checked out by another worktree of
+    /// the repository, or the item's beside landing (`<path>SUFFIX`) exists.
+    /// Nothing is written to either; the item is pending review, so a
+    /// passing closure never stands on two copies.
+    GitDestinationNonrepoDuplicate,
     /// Between the capture a checkout holds and the current one, the source
     /// changed what converge does not carry: the shallow frontier, nested
     /// repository custody, the omitted rebuildable roots or bareness.
@@ -719,6 +739,8 @@ impl BulkloadRefusal {
             Self::GitSwitchUntrackedCollides(_) => "GIT_SWITCH_UNTRACKED_COLLIDES",
             Self::GitSwitchRaced => "GIT_SWITCH_RACED",
             Self::GitSwitchRolledBack(_) => "GIT_SWITCH_ROLLED_BACK",
+            Self::GitDestinationNonrepoDiffers => "GIT_DESTINATION_NONREPO_DIFFERS",
+            Self::GitDestinationNonrepoDuplicate => "GIT_DESTINATION_NONREPO_DUPLICATE",
             Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
             Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
             Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
@@ -842,6 +864,8 @@ impl BulkloadRefusal {
         "GIT_SWITCH_UNTRACKED_COLLIDES",
         "GIT_SWITCH_RACED",
         "GIT_SWITCH_ROLLED_BACK",
+        "GIT_DESTINATION_NONREPO_DIFFERS",
+        "GIT_DESTINATION_NONREPO_DUPLICATE",
         "HANDOFF_NOT_LANDED",
         "HANDOFF_TARGET_UNSUPPORTED",
         "HANDOFF_BLOCK_MODIFIED",
@@ -1180,6 +1204,8 @@ mod tests {
             BulkloadRefusal::GitSwitchUntrackedCollides(Vec::new()),
             BulkloadRefusal::GitSwitchRaced,
             BulkloadRefusal::GitSwitchRolledBack(Vec::new()),
+            BulkloadRefusal::GitDestinationNonrepoDiffers,
+            BulkloadRefusal::GitDestinationNonrepoDuplicate,
             BulkloadRefusal::HandoffNotLanded,
             BulkloadRefusal::HandoffTargetUnsupported,
             BulkloadRefusal::HandoffBlockModified,

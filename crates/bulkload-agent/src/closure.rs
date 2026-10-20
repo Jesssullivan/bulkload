@@ -96,7 +96,10 @@
 //! `created`, `kept`) when the item's `.refs-in` record names its current
 //! capture, so a refused beside landing whose refs went in says so, and,
 //! for `GIT_BESIDE_FOREIGN`, `refusal_detail`, the recorded refusal that
-//! names the beside path. `--advance-ancestor` (operator ruling
+//! names the beside path. 2026-10-19 adds `beside_reason` to an
+//! `applied-beside` row: the refusal code that sent the capture beside
+//! (`GIT_DESTINATION_DIVERGED`, `GIT_DESTINATION_NONREPO_DIFFERS`).
+//! `--advance-ancestor` (operator ruling
 //! 2026-10-19) adds one key to a row whose item's `.advance` record names
 //! its current capture, `advance` (`outcome`: `advanced` or the
 //! `GIT_ADVANCE_*` code; `detail`, the refusal's, such as the colliding
@@ -525,6 +528,10 @@ pub struct Row {
     /// `--advance-ancestor` (operator ruling 2026-10-19): what the item's
     /// advance record says of its current capture, printed as `advance`.
     pub advance: Option<crate::estate::AdvanceSummary>,
+    /// 2026-10-19: on an `applied-beside` row, the refusal code that sent
+    /// the capture beside (`GIT_DESTINATION_DIVERGED`,
+    /// `GIT_DESTINATION_NONREPO_DIFFERS`), printed as `beside_reason`.
+    pub beside_reason: Option<String>,
 }
 
 /// The per-item closure ledger and its totals.
@@ -678,6 +685,7 @@ impl Report {
                 refs_in: entry.refs_in.clone(),
                 detail: beside_foreign_detail(entry),
                 advance: entry.advance.clone(),
+                beside_reason: entry.beside_reason.clone(),
             });
         }
         report.recount();
@@ -1160,6 +1168,11 @@ impl Report {
                     );
                 }
             }
+            if let (Disposition::AppliedBeside, Some(reason)) =
+                (&row.disposition, &row.beside_reason)
+            {
+                let _ = write!(out, ",\"beside_reason\":{}", json_string(reason));
+            }
             if let Some(proof) = &row.carried {
                 let _ = write!(
                     out,
@@ -1387,6 +1400,7 @@ fn transfer_row(
         refs_in: None,
         detail: None,
         advance: None,
+        beside_reason: None,
     }
 }
 
@@ -2363,6 +2377,7 @@ mod tests {
             beside: None,
             refs_in: None,
             advance: None,
+            beside_reason: None,
         }
     }
 
@@ -4101,6 +4116,7 @@ mod tests {
                     beside: None,
                     refs_in: None,
                     advance: None,
+                    beside_reason: None,
                 });
                 let Kind::Typed(code, how) = kind else {
                     continue;

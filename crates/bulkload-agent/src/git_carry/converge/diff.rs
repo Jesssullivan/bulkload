@@ -68,7 +68,14 @@ pub struct ItemRow {
     /// `symlinked-path` and `occupied-shape` (`GIT_DESTINATION_OCCUPIED`
     /// before any proof, `adopt::foreign_shape`), `ledgered`,
     /// `ledgered-other-item` (re-keyed by A11b with `--adopt`),
-    /// `not-a-repository`, `not-at-path`.
+    /// `not-a-repository`, `not-at-path`; for a directory with no `.git` at
+    /// all (2026-10-19), `nonrepo-adoptable` (a linked item's that proves
+    /// equal: `--adopt` registers it, writing no file in it),
+    /// `nonrepo-duplicate` (equal, but another worktree holds the captured
+    /// branch or the item's beside landing exists:
+    /// `GIT_DESTINATION_NONREPO_DUPLICATE`, nothing written) or
+    /// `nonrepo-differs` (`GIT_DESTINATION_NONREPO_DIFFERS`: `--beside`
+    /// lands the capture beside it).
     pub adopt: &'static str,
     /// The components that differ: `head`, `index`, `exclude`,
     /// `seats=<n>`, `seat=<path>`, `unrelated`; `parents=<n>` for a first
@@ -253,6 +260,7 @@ fn beside_component(
                     origins: &[],
                     items,
                     advance: None,
+                    beside: None,
                 };
                 if super::rekey_check(staged, &at, landing, &policy, ledger)?.is_some() {
                     "foreign"
@@ -321,6 +329,9 @@ pub fn workspace(
         row.class = "differs";
         row.hint = Some("diverged");
         row.adopt = "not-a-repository";
+        if super::nonrepo(workspace) && planned(target.repository)?.is_some() {
+            nonrepo_row(&mut row, staged, target, landing, (items, beside))?;
+        }
         return Ok(row);
     };
     let common = landed::common_dir(&git_dir)?;
@@ -433,6 +444,88 @@ pub fn workspace(
         }
     }
     Ok(row)
+}
+
+// What `estate-apply --adopt` does with a directory with no `.git` at all at
+// the item's path (2026-10-19): the same read-only proof the apply runs
+// (`check_nonrepo`). A linked item's that proves equal is
+// `nonrepo-adoptable` (class `identical`); one that differs, or a
+// standalone item's (`nonrepo-standalone`), is `nonrepo-differs` with the
+// differing seats and, with `--beside`, the beside component; another
+// refusal of the proof's checks is a `nonrepo-refused=<CODE>` component.
+fn nonrepo_row(
+    row: &mut ItemRow,
+    staged: &super::super::StagedBundle,
+    target: &Target<'_>,
+    landing: &Landing<'_>,
+    (items, beside): (&[String], Option<&str>),
+) -> Result<()> {
+    let workspace = target
+        .workspace
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    if workspace == target.repository {
+        row.adopt = "nonrepo-differs";
+        row.components.push("nonrepo-standalone".to_owned());
+    } else {
+        let beside_path = beside.map(|suffix| super::super::beside::path(workspace, suffix));
+        match super::check_nonrepo(
+            staged,
+            (target.repository, target.base),
+            workspace,
+            (target.source, landing.item, beside_path.as_deref()),
+            (landing.observed_ns, false),
+        ) {
+            Ok(_) => {
+                row.class = "identical";
+                row.hint = None;
+                row.adopt = "nonrepo-adoptable";
+                return Ok(());
+            }
+            Err(BulkloadRefusal::GitDestinationNonrepoDuplicate) => {
+                row.class = "identical";
+                row.hint = None;
+                row.adopt = "nonrepo-duplicate";
+                return Ok(());
+            }
+            Err(BulkloadRefusal::GitDestinationNonrepoDiffers) => {
+                row.adopt = "nonrepo-differs";
+                let scratch = Scratch::new(
+                    staged,
+                    Some(&objects_of(target.repository)?),
+                    target.base,
+                    target.source,
+                )?;
+                let meta = scratch.meta(target.source)?;
+                if let Err(seats) =
+                    super::adopt::prove_seats(workspace, &scratch.repo, &meta, false)?
+                {
+                    row.components.extend(seats);
+                }
+            }
+            Err(refusal) => {
+                row.components
+                    .push(format!("nonrepo-refused={}", refusal.code()));
+                return Ok(());
+            }
+        }
+    }
+    if let Some(suffix) = beside {
+        let scratch = Scratch::new(
+            staged,
+            Some(&objects_of(target.repository)?),
+            target.base,
+            target.source,
+        )?;
+        let meta = scratch.meta(target.source)?;
+        let common = super::super::common_repository(target.repository)?;
+        row.components.push(beside_component(
+            (staged, target, items),
+            (&common, &meta.exclude(&scratch.repo)?),
+            landing,
+            suffix,
+        )?);
+    }
+    Ok(())
 }
 
 // The three-way row of a checkout with a workspace ledger: its class by

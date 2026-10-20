@@ -1582,6 +1582,18 @@ scenarios! {
     // carried into the live configuration, crashed after the first value;
     // the rerun adds the second and retires the beside.
     estate_advance_retire_carried => EstateAdvanceRetireCarried: 1, EstateAdvance::RetireCarry;
+    // 2026-10-19 (the td01 batch): a stripped linked worktree adopted by
+    // registering it again, crashed after its administration directory
+    // and after its gitfile; finished by the rerun, no file written.
+    estate_apply_nonrepo_registered => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoAdopt;
+    estate_apply_nonrepo_linked_added => EstateConvergeLinkedAdded: 1, EstateAdopt::NonrepoAdopt;
+    // Review of #286: a crash past the gitfile, then a seat removed and a
+    // mode changed (finding 2); a crash before it, then a seat edited
+    // (finding 6).
+    estate_apply_nonrepo_tampered => EstateConvergeLinkedAdded: 1, EstateAdopt::NonrepoTampered;
+    estate_apply_nonrepo_abandon => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoAbandon;
+    // Verification of #286: the same crash, then a pass without --adopt.
+    estate_apply_nonrepo_no_adopt => EstateApplyNonrepoRegistered: 1, EstateAdopt::NonrepoNoAdopt;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;
