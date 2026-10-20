@@ -110,8 +110,10 @@
 //!
 //! A trace holding an `Untraced` event (an event the recorder could not
 //! build) is refused, and so is a trace that creates a node identity the
-//! image or an earlier event already names. File systems reuse inode numbers
-//! after an unlink, and the model cannot tell the two inodes apart.
+//! image or an earlier event already names. File systems reuse an inode's
+//! number once its last name is gone (an unlink, or a rename over it); such
+//! a trace is checked after [`incarnations`] gives each inode an identity of
+//! its own, and refused where it cannot tell which inode a number means.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
@@ -695,8 +697,6 @@ struct Lowered {
     foreign: usize,
 }
 
-/// Whether every node an event mutates is known: in the image or created
-/// earlier in the trace. Syncs and commits touch nothing.
 /// The node a create-class event (`Create`, `Mkdir`, `Symlink`) brings
 /// into being.
 const fn created(event: &Event) -> Option<NodeId> {
@@ -706,6 +706,41 @@ const fn created(event: &Event) -> Option<NodeId> {
         }
         _ => None,
     }
+}
+
+/// Every node identity `event` names, its commit records' included.
+fn named_by(event: &Event) -> Vec<NodeId> {
+    let named = std::cell::RefCell::new(Vec::new());
+    let _ = renamed(event, |node| {
+        named.borrow_mut().push(node);
+        node
+    });
+    named.into_inner()
+}
+
+/// The node identities a commit's records name (not its store).
+fn recorded(records: &[CommitRecord]) -> Vec<NodeId> {
+    let mut nodes = Vec::new();
+    for record in records {
+        match record {
+            CommitRecord::DirectoryCreated {
+                node: Some(node), ..
+            } => nodes.push(*node),
+            CommitRecord::SupersedeBegun { staged, owned, .. } => {
+                nodes.push(*staged);
+                nodes.push(*owned);
+            }
+            CommitRecord::DirectoryCreated { node: None, .. }
+            | CommitRecord::Output { .. }
+            | CommitRecord::SupersedeSettled { .. }
+            | CommitRecord::Capture { .. }
+            | CommitRecord::RefusedSeat { .. }
+            | CommitRecord::DirectoryComplete { .. }
+            | CommitRecord::DirectoryCleared { .. }
+            | CommitRecord::RootSealed => {}
+        }
+    }
+    nodes
 }
 
 /// `event` with every node identity it names, its commit records' included,
@@ -732,7 +767,13 @@ fn renamed(event: &Event, id: impl Fn(NodeId) -> NodeId) -> Event {
             staged: id(*staged),
             owned: id(*owned),
         },
-        other => other.clone(),
+        CommitRecord::Output { .. }
+        | CommitRecord::SupersedeSettled { .. }
+        | CommitRecord::Capture { .. }
+        | CommitRecord::RefusedSeat { .. }
+        | CommitRecord::DirectoryComplete { .. }
+        | CommitRecord::DirectoryCleared { .. }
+        | CommitRecord::RootSealed => record.clone(),
     };
     match event {
         Event::Create {
@@ -835,12 +876,16 @@ fn renamed(event: &Event, id: impl Fn(NodeId) -> NodeId) -> Event {
     }
 }
 
-/// Every name each node holds, in the trace's own order (not a crash
+/// One inode: an inode number and which of the inodes the trace gave that
+/// number it is (0 for the first).
+type Incarnation = (NodeId, u32);
+
+/// Every name each inode holds, in the trace's own order (not a crash
 /// state's): which directory entries name it.
 #[derive(Default)]
 struct Names {
-    entries: HashMap<NodeId, BTreeMap<Vec<u8>, NodeId>>,
-    count: HashMap<NodeId, usize>,
+    entries: HashMap<Incarnation, BTreeMap<Vec<u8>, Incarnation>>,
+    count: HashMap<Incarnation, usize>,
 }
 
 impl Names {
@@ -849,14 +894,14 @@ impl Names {
         for (dir, node) in &initial.nodes {
             if let Node::Dir { entries, .. } = node {
                 for (name, child) in entries {
-                    names.set(*dir, name, *child);
+                    names.set((*dir, 0), name, (*child, 0));
                 }
             }
         }
         names
     }
 
-    fn set(&mut self, dir: NodeId, name: &[u8], node: NodeId) {
+    fn set(&mut self, dir: Incarnation, name: &[u8], node: Incarnation) {
         if let Some(old) = self
             .entries
             .entry(dir)
@@ -868,7 +913,7 @@ impl Names {
         *self.count.entry(node).or_default() += 1;
     }
 
-    fn remove(&mut self, dir: NodeId, name: &[u8]) {
+    fn remove(&mut self, dir: Incarnation, name: &[u8]) {
         if let Some(old) = self
             .entries
             .get_mut(&dir)
@@ -878,17 +923,18 @@ impl Names {
         }
     }
 
-    fn drop_one(&mut self, node: NodeId) {
+    fn drop_one(&mut self, node: Incarnation) {
         if let Some(count) = self.count.get_mut(&node) {
             *count = count.saturating_sub(1);
         }
     }
 
-    fn named(&self, node: NodeId) -> bool {
+    fn named(&self, node: Incarnation) -> bool {
         self.count.get(&node).is_some_and(|count| *count > 0)
     }
 
-    fn apply(&mut self, event: &Event) {
+    /// Apply `event`, its nodes already resolved by `at`.
+    fn apply(&mut self, event: &Event, at: impl Fn(NodeId) -> Incarnation) {
         match event {
             Event::Create {
                 dir: Some(dir),
@@ -902,7 +948,7 @@ impl Names {
             | Event::Symlink {
                 dir, name, node, ..
             }
-            | Event::Link { dir, name, node } => self.set(*dir, name, *node),
+            | Event::Link { dir, name, node } => self.set(at(*dir), name, at(*node)),
             Event::Rename {
                 node,
                 from_dir,
@@ -910,8 +956,8 @@ impl Names {
                 to_dir,
                 to,
             } => {
-                self.remove(*from_dir, from);
-                self.set(*to_dir, to, *node);
+                self.remove(at(*from_dir), from);
+                self.set(at(*to_dir), to, at(*node));
             }
             Event::Exchange {
                 dir,
@@ -920,14 +966,52 @@ impl Names {
                 b,
                 b_node,
             } => {
-                self.remove(*dir, a);
-                self.remove(*dir, b);
-                self.set(*dir, a, *a_node);
-                self.set(*dir, b, *b_node);
+                self.remove(at(*dir), a);
+                self.remove(at(*dir), b);
+                self.set(at(*dir), a, at(*a_node));
+                self.set(at(*dir), b, at(*b_node));
             }
-            Event::Unlink { dir, name } => self.remove(*dir, name),
+            Event::Unlink { dir, name } => self.remove(at(*dir), name),
             _ => {}
         }
+    }
+}
+
+/// Which inode each number names at each point of a trace: the one walk
+/// both passes of [`incarnations`] share, so they agree by construction.
+struct Walk {
+    /// Every identity the image or an event so far has named.
+    seen: HashSet<NodeId>,
+    /// The current inode of each number that has had more than one.
+    current: HashMap<NodeId, u32>,
+}
+
+impl Walk {
+    fn new(initial: &Image) -> Self {
+        Self {
+            seen: initial.nodes.keys().copied().collect(),
+            current: HashMap::new(),
+        }
+    }
+
+    fn at(&self, node: NodeId) -> Incarnation {
+        (node, self.current.get(&node).copied().unwrap_or(0))
+    }
+
+    /// Step over `event`: a create of a number already seen starts its
+    /// next inode, returned with the inode it ends. Every identity the
+    /// event names is seen from here on.
+    fn step(&mut self, event: &Event) -> Option<(Incarnation, Incarnation)> {
+        let reborn = created(event)
+            .filter(|node| self.seen.contains(node))
+            .map(|node| {
+                let old = self.at(node);
+                let next = (node, old.1 + 1);
+                self.current.insert(node, next.1);
+                (old, next)
+            });
+        self.seen.extend(named_by(event));
+        reborn
     }
 }
 
@@ -940,64 +1024,134 @@ impl Names {
 /// create (`Create`, `Mkdir`, `Symlink`) of a number the image or an
 /// earlier event already names is a new inode exactly when, by then, the
 /// trace's own namespace has dropped every name of the old one (an unlink,
-/// or a rename or exchange over it). From that create on, every event, and
-/// every commit record, naming that number names the new inode, which gets
-/// an identity no image node and no event uses: its `dev`, and an unused
-/// `ino` counted down from `u64::MAX`. Everything before the create keeps
-/// naming the old inode. An invariant that reads node identities from the
-/// trace's commit records must read them from this result, the one
-/// [`check_view`] and [`check`] are given.
+/// or a rename over it; an exchange only trades names). From that create
+/// on, every event, and
+/// every commit record, naming that number names the new inode; before it,
+/// the old one. The newest inode of each number keeps the number, so an
+/// identity read from the tree after the trace names the same inode here;
+/// each earlier one gets an identity no image node and no event uses (its
+/// `dev`, an unused `ino` counted down from `u64::MAX`), in the image too
+/// when the image held it. An invariant that reads node identities from the
+/// trace's commit records must read them from this result, the image and
+/// trace [`check_view`] and [`check`] are given.
 ///
-/// A create of a number whose inode still has a name is two inodes the
-/// trace cannot tell apart, and is refused; so is any reuse left in a trace
-/// handed to [`check_view`] or [`check`] unresolved.
+/// Refused, as two inodes the trace cannot tell apart:
+///
+/// - a create of a number whose inode still has a name, or of the image's
+///   root;
+/// - a commit record naming a number whose earlier inode an event also
+///   named since the store's previous commit (or the trace's start). The
+///   trace does not say when a record's identity was read; it is taken to
+///   be read in that window from an inode an event there names, as a
+///   directory's is from the inode its `Mkdir` just made. So a record could
+///   mean either inode, and a record whose earlier inode was last named
+///   before the window (the N3 order: a crashed run's temporary made, its
+///   record committed and cleared, the temporary unlinked and its number
+///   made anew) means the newer;
+///
+/// and any reuse left in a trace handed to [`check_view`] or [`check`]
+/// unresolved.
 ///
 /// # Errors
-/// A create of a node that still has a name in the trace.
-pub fn incarnations(initial: &Image, events: &[Event]) -> io::Result<Vec<Event>> {
-    let used = std::cell::RefCell::new(initial.nodes.keys().copied().collect::<HashSet<_>>());
-    for event in events {
-        let _ = renamed(event, |node| {
-            used.borrow_mut().insert(node);
-            node
-        });
-    }
-    let mut used = used.into_inner();
-    let mut seen: HashSet<NodeId> = initial.nodes.keys().copied().collect();
+/// As above.
+pub fn incarnations(initial: &Image, events: &[Event]) -> io::Result<(Image, Vec<Event>)> {
+    // Pass 1: how many inodes each number names, and every refusal.
+    let mut walk = Walk::new(initial);
     let mut names = Names::of(initial);
-    let mut current: HashMap<NodeId, NodeId> = HashMap::new();
-    let mut next = u64::MAX;
-    let mut out = Vec::with_capacity(events.len());
+    let mut newest: HashMap<NodeId, u32> = HashMap::new();
+    let mut last_named: HashMap<Incarnation, usize> = HashMap::new();
+    let mut window: HashMap<NodeId, usize> = HashMap::new();
     for (index, event) in events.iter().enumerate() {
-        if let Some(node) = created(event) {
-            if !seen.insert(node) {
-                let old = current.get(&node).copied().unwrap_or(node);
-                if names.named(old) {
+        if let Some((old, next)) = walk.step(event) {
+            if old.0 == initial.root || names.named(old) {
+                return Err(other(format!(
+                    "trace event {index} creates node {:?}, whose inode still has a name in \
+                     the trace (or is the image's root); refusing to conflate two inodes",
+                    old.0
+                )));
+            }
+            newest.insert(next.0, next.1);
+        }
+        if let Event::Commit { store, records } = event {
+            let since = window.get(store).copied().unwrap_or(0);
+            for node in recorded(records) {
+                let (_, now) = walk.at(node);
+                if let Some(named) = (0..now)
+                    .filter_map(|older| last_named.get(&(node, older)).copied())
+                    .find(|named| *named >= since)
+                {
                     return Err(other(format!(
-                        "trace event {index} creates node {node:?}, whose inode still has a \
-                         name in the trace; refusing to conflate two inodes"
+                        "trace event {index} commits a record naming node {node:?}, a number \
+                         event {named} named for another inode since the store's previous \
+                         commit; refusing to guess which inode the record means"
                     )));
                 }
-                let fresh = loop {
-                    let fresh = NodeId {
-                        dev: node.dev,
-                        ino: next,
-                    };
-                    next = next.saturating_sub(1);
-                    if used.insert(fresh) {
-                        break fresh;
-                    }
-                };
-                current.insert(node, fresh);
+            }
+            window.insert(*store, index + 1);
+        } else {
+            for node in named_by(event) {
+                last_named.insert(walk.at(node), index);
             }
         }
-        let event = renamed(event, |node| current.get(&node).copied().unwrap_or(node));
-        names.apply(&event);
-        out.push(event);
+        names.apply(event, |node| walk.at(node));
     }
-    Ok(out)
+    // Pass 2: every inode but the newest of its number gets a fresh identity.
+    let mut used: HashSet<NodeId> = walk.seen;
+    let mut fresh: HashMap<Incarnation, NodeId> = HashMap::new();
+    let mut next = u64::MAX;
+    let mut identity = |(node, number): Incarnation| -> NodeId {
+        if newest.get(&node).is_none_or(|last| *last == number) {
+            return node;
+        }
+        *fresh.entry((node, number)).or_insert_with(|| loop {
+            let candidate = NodeId {
+                dev: node.dev,
+                ino: next,
+            };
+            next = next.saturating_sub(1);
+            if used.insert(candidate) {
+                break candidate;
+            }
+        })
+    };
+    let mut walk = Walk::new(initial);
+    let mut out = Vec::with_capacity(events.len());
+    for event in events {
+        let _ = walk.step(event);
+        let resolved: HashMap<NodeId, NodeId> = named_by(event)
+            .into_iter()
+            .map(|node| (node, identity(walk.at(node))))
+            .collect();
+        out.push(renamed(event, |node| {
+            resolved.get(&node).copied().unwrap_or(node)
+        }));
+    }
+    // The image holds each of its nodes' first inode.
+    let image = Image {
+        root: initial.root,
+        nodes: initial
+            .nodes
+            .iter()
+            .map(|(node, entry)| {
+                let entry = match entry {
+                    Node::Dir { entries, mode } => Node::Dir {
+                        entries: entries
+                            .iter()
+                            .map(|(name, child)| (name.clone(), identity((*child, 0))))
+                            .collect(),
+                        mode: *mode,
+                    },
+                    other => other.clone(),
+                };
+                (identity((*node, 0)), entry)
+            })
+            .collect(),
+    };
+    Ok((image, out))
 }
 
+/// Whether every node an event mutates is known: in the image or created
+/// earlier in the trace. Syncs and commits touch nothing.
 fn touches_only(event: &Event, known: &HashSet<NodeId>) -> bool {
     let known = |node: &NodeId| known.contains(node);
     match event {

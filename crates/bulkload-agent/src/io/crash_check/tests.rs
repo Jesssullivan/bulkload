@@ -866,59 +866,78 @@ fn reused_keep() -> Vec<Event> {
     ]
 }
 
+/// `keep` holds its old bytes and is not `KEEP_NODE`; `fresh`, the newest
+/// inode of that number, is, and holds `NEW` once the protocol returned.
+/// Records whether some state held both files.
+fn both_inodes(view: View<'_>, info: &StateInfo, both: &mut bool) -> Result<(), String> {
+    let keep = view.get(b"keep");
+    let made = view.get(b"fresh");
+    match keep {
+        None => {}
+        Some(Entry::File { data, .. })
+            if data == KEEP && view.node_at(b"keep") != Some(KEEP_NODE) => {}
+        other => return Err(format!("keep is {other:?} at {:?}", view.node_at(b"keep"))),
+    }
+    match made {
+        None if !info.complete => {}
+        Some(Entry::File { data, .. })
+            if view.node_at(b"fresh") == Some(KEEP_NODE)
+                && (data == NEW || (data.is_empty() && !info.complete)) => {}
+        other => return Err(format!("fresh is {other:?}")),
+    }
+    *both |= keep.is_some() && made.is_some();
+    Ok(())
+}
+
 /// Inode reuse (the gate of #295, 2026-10-20: xfs gave a freed number to
 /// the next file). Once `keep`'s last name is unlinked its number names a
-/// new inode: `incarnations` gives `fresh` an identity of its own from its
-/// create on, the unlink keeps the old one, and every crash state holds
+/// new inode. `incarnations` gives the newest inode of the number the number
+/// itself (so an identity read from the tree afterwards still names it) and
+/// the image's old one an identity of its own, and every crash state holds
 /// each file's own bytes. A state that kept the create and lost the unlink
 /// holds both files, `keep` with its old bytes, which one inode under two
 /// names could not.
 #[test]
 fn a_number_reused_after_its_last_name_is_unlinked_names_a_new_inode() {
     let events = reused_keep();
-    let resolved = incarnations(&initial(), &events).unwrap();
-    assert_eq!(resolved[0], events[0]);
-    let Event::Create { node: fresh, .. } = resolved[1] else {
-        panic!("{:?}", resolved[1]);
-    };
-    assert_ne!(fresh, KEEP_NODE);
-    assert_eq!(fresh.dev, KEEP_NODE.dev);
-    assert_eq!(resolved[2], write(fresh, NEW));
-    assert_eq!(
-        resolved[3],
-        Event::Sync {
-            node: fresh,
-            kind: SyncKind::Fsync,
-        }
-    );
-    assert_eq!(resolved[4], events[4]);
+    let (image, resolved) = incarnations(&initial(), &events).unwrap();
+    // The trace names the newest inode by the number: nothing in it moves.
+    assert_eq!(resolved, events);
     // Resolved twice, nothing more moves.
-    assert_eq!(incarnations(&initial(), &resolved).unwrap(), resolved);
+    let (again, twice) = incarnations(&image, &resolved).unwrap();
+    assert_eq!(twice, resolved);
     let mut both = false;
-    let report = check_view(&initial(), &resolved, &Options::default(), |view, info| {
-        let keep = view.get(b"keep");
-        let made = view.get(b"fresh");
-        match keep {
-            None => {}
-            Some(Entry::File { data, .. }) if data == KEEP => {}
-            other => return Err(format!("keep is {other:?}")),
-        }
-        match made {
-            None if !info.complete => {}
-            Some(Entry::File { data, .. })
-                if data == NEW || (data.is_empty() && !info.complete) => {}
-            other => return Err(format!("fresh is {other:?}")),
-        }
-        both |= keep.is_some() && made.is_some();
-        Ok(())
+    let report = check_view(&again, &twice, &Options::default(), |view, info| {
+        both_inodes(view, info, &mut both)
     })
     .unwrap();
     assert!(report.passed(), "{}", report.summary(&resolved));
     assert!(both, "no state kept the create and lost the unlink");
 }
 
+/// A resolved reuse trace still has teeth (#296 review): without the new
+/// inode's fsync, a power loss after the protocol returned can leave
+/// `fresh` empty, and the checker says so.
+#[test]
+fn a_resolved_reuse_trace_still_catches_a_missing_fsync() {
+    let mut events = reused_keep();
+    events.remove(3);
+    let (image, resolved) = incarnations(&initial(), &events).unwrap();
+    let mut both = false;
+    let report = check_view(&image, &resolved, &Options::default(), |view, info| {
+        both_inodes(view, info, &mut both)
+    })
+    .unwrap();
+    assert!(
+        !report.violations.is_empty(),
+        "{}",
+        report.summary(&resolved)
+    );
+}
+
 /// The same when a rename over `keep` drops its last name: the number the
-/// next create reuses names a new inode.
+/// next create reuses names a new inode, and the image's old one is told
+/// apart.
 #[test]
 fn a_number_reused_after_a_rename_over_its_last_name_names_a_new_inode() {
     let events = vec![
@@ -936,29 +955,37 @@ fn a_number_reused_after_a_rename_over_its_last_name_names_a_new_inode() {
             mode: 0o644,
         },
     ];
-    let resolved = incarnations(&with_other(), &events).unwrap();
-    assert_eq!(resolved[0], events[0]);
-    assert!(
-        matches!(resolved[1], Event::Create { node, .. } if node != KEEP_NODE),
-        "{:?}",
-        resolved[1]
-    );
-    check_view(&with_other(), &resolved, &Options::default(), |_, _| Ok(())).unwrap();
+    let (image, resolved) = incarnations(&with_other(), &events).unwrap();
+    assert_eq!(resolved, events);
+    let report = check_view(&image, &resolved, &Options::default(), |view, info| {
+        if info.crash_point == 0 && view.node_at(b"keep") == Some(KEEP_NODE) {
+            return Err("the image's keep still has the reused number".to_owned());
+        }
+        if view.node_at(b"fresh").is_some_and(|node| node != KEEP_NODE) {
+            return Err("fresh lost its number".to_owned());
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(report.passed(), "{}", report.summary(&resolved));
 }
 
-/// A create of a number whose inode still has a name is two inodes the
-/// trace cannot tell apart: `incarnations` refuses it, as `check_view`
-/// refuses any reuse it is handed unresolved (review probe P1).
+/// Refused as two inodes the trace cannot tell apart: a create of a number
+/// whose inode still has a name, a create of the image's root, and any
+/// reuse handed to the checker unresolved (review probe P1).
 #[test]
 fn a_number_created_while_its_inode_still_has_a_name_is_refused() {
-    let still_named = vec![Event::Create {
-        dir: Some(ROOT),
-        name: Some(b"fresh".to_vec()),
-        node: KEEP_NODE,
-        mode: 0o644,
-    }];
-    let error = incarnations(&initial(), &still_named).unwrap_err();
+    let create = |node| {
+        vec![Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"fresh".to_vec()),
+            node,
+            mode: 0o644,
+        }]
+    };
+    let error = incarnations(&initial(), &create(KEEP_NODE)).unwrap_err();
     assert!(error.to_string().contains("still has a name"), "{error}");
+    assert!(incarnations(&initial(), &create(ROOT)).is_err());
     let twice = vec![
         Event::Mkdir {
             dir: ROOT,
@@ -974,7 +1001,6 @@ fn a_number_created_while_its_inode_still_has_a_name_is_refused() {
         },
     ];
     assert!(incarnations(&initial(), &twice).is_err());
-    // Unresolved, the reuse is refused by the checker itself.
     let error = check_view(&initial(), &reused_keep(), &Options::default(), |_, _| {
         Ok(())
     })
@@ -982,22 +1008,57 @@ fn a_number_created_while_its_inode_still_has_a_name_is_refused() {
     assert!(error.to_string().contains("incarnations"), "{error}");
 }
 
-/// A commit record names the inode its number named when the store
-/// committed: the swept temporary's record keeps the old identity, the
-/// record of the directory made again under the same number names the new
-/// one, so an invariant reading records from the resolved trace binds each
-/// to its own directory.
+/// A number another event named before any create of it is seen: a later
+/// create of it is a new inode, and the earlier event keeps naming the old
+/// one (#296 review, finding 3).
 #[test]
-fn a_commit_record_names_the_inode_of_its_own_time() {
+fn a_number_named_before_it_is_created_is_a_reuse() {
+    let events = vec![
+        write(n(30), b"elsewhere"),
+        Event::Create {
+            dir: Some(ROOT),
+            name: Some(b"fresh".to_vec()),
+            node: n(30),
+            mode: 0o644,
+        },
+    ];
+    let (_, resolved) = incarnations(&initial(), &events).unwrap();
+    assert!(
+        matches!(&resolved[0], Event::Write { node, .. } if *node != n(30)),
+        "{:?}",
+        resolved[0]
+    );
+    assert_eq!(resolved[1], events[1]);
+}
+
+fn directory_created(key: &[u8], node: NodeId) -> Event {
     use crate::io::trace::CommitRecord;
-    let created = |key: &[u8], node| Event::Commit {
+    Event::Commit {
         store: LEDGER,
         records: vec![CommitRecord::DirectoryCreated {
             key: key.to_vec(),
             node: Some(node),
             mode: 0o755,
         }],
-    };
+    }
+}
+
+fn directory_cleared(key: &[u8]) -> Event {
+    use crate::io::trace::CommitRecord;
+    Event::Commit {
+        store: LEDGER,
+        records: vec![CommitRecord::DirectoryCleared { key: key.to_vec() }],
+    }
+}
+
+/// The N3 order (#74): a crashed run's directory temporary is made and its
+/// record committed; the resume clears the record, unlinks the temporary
+/// and makes the level again, the file system giving the new directory the
+/// old number. The first record names the old inode (its own identity
+/// now), the second the new one, which keeps the number: no event named
+/// the old inode after the store's previous commit.
+#[test]
+fn a_commit_record_names_the_inode_of_its_window() {
     let events = vec![
         Event::Mkdir {
             dir: ROOT,
@@ -1005,26 +1066,72 @@ fn a_commit_record_names_the_inode_of_its_own_time() {
             node: n(20),
             mode: 0o700,
         },
-        created(b"a", n(20)),
+        directory_created(b"a", n(20)),
+        directory_cleared(b"a"),
         Event::Unlink {
             dir: ROOT,
             name: b".tmp-a".to_vec(),
         },
         Event::Mkdir {
             dir: ROOT,
-            name: b".tmp-b".to_vec(),
+            name: b".tmp-a2".to_vec(),
             node: n(20),
             mode: 0o700,
         },
-        created(b"b", n(20)),
+        directory_created(b"a", n(20)),
     ];
-    let resolved = incarnations(&initial(), &events).unwrap();
-    assert_eq!(resolved[..3], events[..3]);
-    let Event::Mkdir { node: again, .. } = resolved[3] else {
-        panic!("{:?}", resolved[3]);
+    let (_, resolved) = incarnations(&initial(), &events).unwrap();
+    let Event::Mkdir { node: old, .. } = resolved[0] else {
+        panic!("{:?}", resolved[0]);
     };
-    assert_ne!(again, n(20));
-    assert_eq!(resolved[4], created(b"b", again));
+    assert_ne!(old, n(20));
+    assert_eq!(resolved[1], directory_created(b"a", old));
+    assert_eq!(resolved[2..], events[2..]);
+}
+
+/// #296 review, finding 1: `d`'s directory is made and removed and `e`'s
+/// made under the same number before either record commits. Resolved by
+/// commit time both would bind `e`'s temporary, and a recovery would adopt
+/// it as `d`: the trace is refused, since an event named the earlier inode
+/// since the store's previous commit. So is a record after an event, other
+/// than the create, named the earlier inode in its window.
+#[test]
+fn a_record_naming_a_number_reused_within_its_window_is_refused() {
+    let mkdir = |name: &[u8]| Event::Mkdir {
+        dir: ROOT,
+        name: name.to_vec(),
+        node: n(20),
+        mode: 0o700,
+    };
+    let unlink = |name: &[u8]| Event::Unlink {
+        dir: ROOT,
+        name: name.to_vec(),
+    };
+    let refused = |events: &[Event]| {
+        let error = incarnations(&initial(), events).unwrap_err();
+        assert!(
+            error.to_string().contains("refusing to guess which inode"),
+            "{error}"
+        );
+    };
+    refused(&[
+        mkdir(b".tmp-d"),
+        unlink(b".tmp-d"),
+        mkdir(b".tmp-e"),
+        directory_created(b"d", n(20)),
+        directory_created(b"e", n(20)),
+    ]);
+    refused(&[
+        mkdir(b".tmp-d"),
+        directory_cleared(b"x"),
+        Event::SetMode {
+            node: n(20),
+            mode: 0o755,
+        },
+        unlink(b".tmp-d"),
+        mkdir(b".tmp-e"),
+        directory_created(b"d", n(20)),
+    ]);
 }
 
 const OTHER: NodeId = n(5);
@@ -1882,7 +1989,7 @@ mod reused {
         };
         let error = check_view(&image, &events, &Options::default(), |_, _| Ok(())).unwrap_err();
         assert!(error.to_string().contains("inode reuse"), "{error}");
-        let resolved = incarnations(&image, &events).unwrap();
+        let (image, resolved) = incarnations(&image, &events).unwrap();
         let report = check_view(&image, &resolved, &Options::default(), |view, info| {
             let mut names = Vec::new();
             for (rel, entry) in view.walk() {

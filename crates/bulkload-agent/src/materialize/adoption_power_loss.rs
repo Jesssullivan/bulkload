@@ -157,7 +157,7 @@ fn resume_after(tag: &str, crash: impl FnOnce(&Crash<'_>)) {
         target.flush_session().unwrap();
     }
     // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
-    let events = incarnations(&image, &recorder.take()).unwrap();
+    let (image, events) = incarnations(&image, &recorder.take()).unwrap();
     let options = Options {
         ignore_foreign: true,
         accept_bounded: true,
@@ -287,7 +287,7 @@ fn an_unrowed_output_is_adopted_without_source_reads() {
         // The crash: the group's row commit never runs.
     }
     // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
-    let events = incarnations(&image, &recorder.take()).unwrap();
+    let (image, events) = incarnations(&image, &recorder.take()).unwrap();
     assert!(
         events
             .iter()
@@ -521,7 +521,7 @@ fn a_batched_group_names_no_output_before_its_data_is_durable() {
         );
     }
     // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
-    let events = incarnations(&image, &recorder.take()).unwrap();
+    let (image, events) = incarnations(&image, &recorder.take()).unwrap();
     assert_eq!(
         events
             .iter()
@@ -695,6 +695,20 @@ fn directory_records_hold(
             }
         }
     }
+    // One inode is one directory: two live records bound to it would let a
+    // recovery adopt one key's directory as another's (#296 review).
+    let mut owners = std::collections::BTreeMap::new();
+    for (rel, node) in &bound {
+        if let Some(node) = node {
+            if let Some(other) = owners.insert(*node, rel) {
+                return Err(format!(
+                    "recorded directories {} and {} are bound to one inode",
+                    name(other),
+                    name(rel)
+                ));
+            }
+        }
+    }
     for (rel, node) in &bound {
         let Some(node) = node else {
             continue;
@@ -737,6 +751,44 @@ fn directory_records_hold(
         }
     }
     Ok(())
+}
+
+/// #296 review, finding 1: two live records bound to one inode are a
+/// violation, so a trace whose records both resolve to one directory (one
+/// key's temporary taken for another's) cannot pass.
+#[test]
+fn one_inode_bound_by_two_live_records_is_a_violation() {
+    let root = crate::io::NodeId { dev: 1, ino: 1 };
+    let made = crate::io::NodeId { dev: 1, ino: 2 };
+    let store = crate::io::NodeId { dev: 1, ino: 3 };
+    let created = |rel: &[u8]| CommitRecord::DirectoryCreated {
+        key: postcard::to_stdvec(&(Vec::<u8>::new(), rel.to_vec())).unwrap(),
+        node: Some(made),
+        mode: 0o755,
+    };
+    let events = vec![
+        Event::Mkdir {
+            dir: root,
+            name: [TEMPORARY_PREFIX, b"e"].concat(),
+            node: made,
+            mode: 0o700,
+        },
+        Event::Commit {
+            store,
+            records: vec![created(b"d"), created(b"e")],
+        },
+    ];
+    let before = std::collections::BTreeSet::new();
+    let modes = std::collections::BTreeMap::new();
+    let report = check_view(
+        &Image::empty(root),
+        &events,
+        &Options::default(),
+        |view, info| directory_records_hold(&events, view, info, &before, &modes, PAYLOAD),
+    )
+    .unwrap();
+    let summary = report.summary(&events);
+    assert!(summary.contains("bound to one inode"), "{summary}");
 }
 
 /// One batching proof's tree: [`SIBLINGS`], 0755, each with `f`.
@@ -892,7 +944,7 @@ fn check_siblings(
         resume_siblings(&tree, &store);
     }
     // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
-    let events = incarnations(&image, &recorder.take()).unwrap();
+    let (image, events) = incarnations(&image, &recorder.take()).unwrap();
     let modes = tree
         .directories
         .iter()
@@ -1096,7 +1148,7 @@ fn a_batch_waits_for_a_held_adoptable_directory_before_making_inside_it() {
             .retain(|root| *root != canonical_destination);
         assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
         // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
-        let events = incarnations(&image, &recorder.take()).unwrap();
+        let (image, events) = incarnations(&image, &recorder.take()).unwrap();
         let modes = [b"q/x".as_slice(), b"y", b"y/z"]
             .into_iter()
             .map(|rel| (rel.to_vec(), 0o755))

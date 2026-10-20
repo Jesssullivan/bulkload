@@ -86,3 +86,61 @@ All on honey, `TMPDIR` on xfs (`/var/tmp`, the root file system), load1
 The original failure (a reuse inside the resume proof) is environmental
 and was not seen again here; the forced test reproduces the same class
 (a freed number given to the next create within one trace) on every run.
+
+## Review round (#296 review at `800b7f3`), 2026-10-20
+
+Fixed on the same branch. The change is test-only: the trace model and the
+test invariants.
+
+- **Finding 1 (medium; new false accept).** Commit records were resolved by
+  commit time. The reviewer's trace was `Mkdir .tmp-d X`, `Unlink`,
+  `Mkdir .tmp-e X`, then commits of `DirectoryCreated(d, X)` and
+  `DirectoryCreated(e, X)`. Both records bound `e`'s temporary, and the
+  check accepted it.
+  - **What `incarnations` refuses now.** The trace does not say when a
+    record's identity was read. The model takes it to be read after the
+    store's previous commit, from an inode that some event in that window
+    names (a directory's identity comes from the inode its `Mkdir` just
+    made). `incarnations` refuses a record whose number had an earlier
+    inode that an event named after the store's previous commit.
+  - **The N3 order still resolves.** That order is: a crashed run's
+    temporary is made and its record committed, the record is cleared, the
+    temporary is unlinked, and a new directory gets the same number. The
+    earlier inode was last named before the window, so the record names
+    the newer inode.
+  - **Rule I did not use.** The stricter rule refuses whenever an earlier
+    inode was alive in the window. It would also refuse that real N3 trace
+    on xfs whenever no other commit of the store falls between the unlink
+    and the new record. That would bring the flake back as a refusal.
+  - **The invariants.** `directory_records_hold` (adoption_power_loss) and
+    `directory_ownership` (tests/power_loss) now also refuse one inode bound
+    by two live records.
+  - **Tests.** Added the reviewer's trace as a must-refuse test, together
+    with a variant where a `SetMode` names the earlier inode in the window.
+    Also added the N3-order acceptance test and a negative test: a resolved
+    reuse trace with the new inode's fsync dropped is a violation. A unit
+    test checks the two-keys-one-inode invariant.
+- **Finding 2.** The newest inode of each number keeps the real number.
+  Each earlier inode gets a fresh identity, counted down from `u64::MAX`.
+  `incarnations` returns `(Image, Vec<Event>)`, and the image is renamed
+  too, so identities read from the live tree after the trace still match.
+- **Finding 3.** `seen` is seeded from every identity an earlier event
+  names, commit records included. A create of a number that an earlier
+  Link, Rename or Write named is a new inode.
+- **Nits.**
+  - The `CommitRecord` match in `renamed` (and the new `recorded`) is
+    exhaustive.
+  - A create of the image's root is refused.
+  - The doc comment of `touches_only` is back above it.
+  - The module docs and the exchange wording are fixed: an exchange only
+    trades names.
+
+Validation of this round, on honey inside the gate's devShell (clippy
+0.1.96): all three clippy passes with -D warnings exited 0 (workspace;
+agent `io-trace`; workspace `fault-injection,io-trace`). `cargo fmt
+--check` failed on three spots. They were fixed with rustfmt alone on the
+changed files (it does not build). Tests were not yet run: the operator
+priority change held honey and pzm for the critical path. The tests still
+owed are `io::crash_check::` (with `fault-injection,io-trace` and without
+features), `materialize::adoption_power_loss::` and `--test power_loss`,
+plus a full `cargo fmt --all -- --check`. R-N13.

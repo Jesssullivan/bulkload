@@ -240,8 +240,7 @@ fn traced_copy(scratch: &Scratch) -> (Image, Vec<Event>) {
     };
     assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
     // Inode reuse told apart (xfs reuses freed inode numbers within a trace).
-    let events = incarnations(&image, &recorder.take()).unwrap();
-    (image, events)
+    incarnations(&image, &recorder.take()).unwrap()
 }
 
 fn options() -> Options {
@@ -376,6 +375,20 @@ fn directory_ownership(
                     bound.remove(&key_path(key));
                 }
                 _ => {}
+            }
+        }
+    }
+    // One inode is one directory: two live records bound to it would let a
+    // recovery adopt one key's directory as another's (#296 review).
+    let mut owners = BTreeMap::new();
+    for (rel, node) in &bound {
+        if let Some(node) = node {
+            if let Some(other) = owners.insert(*node, rel) {
+                return Err(format!(
+                    "recorded directories {} and {} are bound to one inode",
+                    name(other),
+                    name(rel)
+                ));
             }
         }
     }
@@ -809,7 +822,8 @@ fn store_kept(
 /// operation (none is a write), so `opened` is also an operation count.
 fn check_store(image: &Image, events: &[Event], opened: usize) -> Report {
     // Inode reuse told apart; indices are kept, so `opened` still counts.
-    let events = &incarnations(image, events).unwrap();
+    let (image, events) = incarnations(image, events).unwrap();
+    let (image, events) = (&image, events.as_slice());
     assert!(
         !events
             .iter()
@@ -1030,7 +1044,7 @@ fn traced_rerun(scratch: &Scratch) -> (Image, Vec<Event>, bulkload_agent::transf
         let _process = recorder.attach_process();
         run_copy(scratch)
     };
-    let events = incarnations(&image, &recorder.take()).unwrap();
+    let (image, events) = incarnations(&image, &recorder.take()).unwrap();
     (image, events, stats)
 }
 
@@ -1959,7 +1973,7 @@ fn every_power_loss_state_of_a_worker_written_copy_is_consistent() {
             &scratch.base.join("destination-state"),
         )
     };
-    let events = incarnations(&image, &recorder.take()).unwrap();
+    let (image, events) = incarnations(&image, &recorder.take()).unwrap();
     let timing = bulkload_agent::transfer::TransferTiming::snapshot().since(before);
     bulkload_agent::transfer::set_recv_worker_delay(0);
     bulkload_agent::transfer::set_writeback_kick_bytes(0);
