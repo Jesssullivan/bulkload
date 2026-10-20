@@ -2377,8 +2377,9 @@ fn last_byte(file: &File, size: u64) -> Result<Option<u8>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Judged {
     /// The live file was a strict byte prefix of the copy and was extended
-    /// in place by the copy's whole lines past it: `(prior, size)`. When it
-    /// is then the copy's bytes exactly, the copy was removed (one copy).
+    /// in place by every byte of the copy past it (the copy ends at a line
+    /// end): `(prior, size)`. The copy was then removed when it is still the
+    /// very file read (one copy).
     Extended {
         prior: u64,
         size: u64,
@@ -2535,8 +2536,11 @@ fn line_piece<'b>(
 ///   would fork inside one file), as [`crate::procs::inside`] sees on
 ///   Linux; where it cannot say, nothing is written.
 ///
-/// Anything else is [`Judged::Held`], typed with its reason, nothing written
-/// (a copy with no line end past the live file's bytes is `copy-mid-line`).
+/// Anything else is [`Judged::Held`], typed with its reason, nothing written.
+/// A copy with bytes past its last line end that the live file lacks is
+/// held `copy-mid-line` on every pass: its whole lines are appended (when
+/// safe) and the copy kept, so the gate never passes on a session whose
+/// last line only the copy holds.
 /// A copy whose bytes are the live file's first bytes is
 /// [`Judged::Covered`]; neither a prefix of the other is
 /// [`Judged::Diverged`]. A copy wholly in the live file afterwards, which a
@@ -2678,15 +2682,18 @@ pub fn judge_beside(
     {
         return Ok(Judged::Held("live-raced"));
     }
-    let consumed = if target == size {
-        remove_copy()?
-    } else {
-        false
-    };
+    // The copy holds bytes past its last line end (neo is still writing
+    // that line): the whole lines are appended and the copy kept, but the
+    // session is not complete here, so it is held, on this pass as on every
+    // later one, until the next pull carries the finished line (#294
+    // re-verification).
+    if target < size {
+        return Ok(Judged::Held("copy-mid-line"));
+    }
     Ok(Judged::Extended {
         prior: held,
         size: target,
-        consumed,
+        consumed: remove_copy()?,
     })
 }
 
@@ -2775,9 +2782,11 @@ mod judge_tests {
     }
 
     /// #294 verification 1 and 2: a line longer than a mebibyte is read on
-    /// and appended whole; a copy ending mid-line is extended by its whole
-    /// lines, the partial one left in the copy, and the next judgment of it
-    /// is held `copy-mid-line`, never a false `extended`.
+    /// and appended whole; a copy ending mid-line has its whole lines
+    /// appended, the partial one left in the copy, and is held
+    /// `copy-mid-line` on that pass and the next (#294 re-verification:
+    /// never `extended` while the copy holds bytes the live file lacks),
+    /// until the finished line arrives.
     #[test]
     fn whole_lines_are_appended_however_long_and_a_partial_one_is_held() {
         let _serial = serial();
@@ -2800,25 +2809,38 @@ mod judge_tests {
         assert_eq!(std::fs::read(&at).unwrap(), long);
         assert!(!beside.exists());
 
+        // A copy ending mid-line: the first pass appends its whole lines
+        // and holds; the second appends nothing and holds the same way.
         let partial: &[u8] = b"{\"a\":1}\n{\"b\":2}\n{\"c\"";
         let (at, beside) = pair(&dir, live, partial);
-        assert_eq!(
-            judge_beside(&at, &beside, later(), None).unwrap(),
-            Judged::Extended {
-                prior: live.len() as u64,
-                size: 16,
-                consumed: false
-            }
-        );
+        let first = judge_beside(&at, &beside, later(), None).unwrap();
+        assert_eq!(first, Judged::Held("copy-mid-line"));
         assert_eq!(std::fs::read(&at).unwrap(), b"{\"a\":1}\n{\"b\":2}\n");
         assert!(beside.exists(), "the partial line stays in the copy");
         let again = judge_beside(&at, &beside, later(), None).unwrap();
         assert_eq!(again, Judged::Held("copy-mid-line"));
-        assert!(!super::super::word_accounted(again.word()));
+        assert_eq!(std::fs::read(&at).unwrap(), b"{\"a\":1}\n{\"b\":2}\n");
+        for held in [first, again] {
+            assert!(!super::super::word_accounted(held.word()));
+            assert_eq!(
+                held.refusal(),
+                Some(crate::BulkloadRefusal::ReseatExtendRaced)
+            );
+        }
+        // Neo finishes the line and the next pull carries it: extended,
+        // the copy removed.
+        let finished: &[u8] = b"{\"a\":1}\n{\"b\":2}\n{\"c\":3}\n";
+        std::fs::write(&beside, finished).unwrap();
         assert_eq!(
-            again.refusal(),
-            Some(crate::BulkloadRefusal::ReseatExtendRaced)
+            judge_beside(&at, &beside, later(), None).unwrap(),
+            Judged::Extended {
+                prior: 16,
+                size: finished.len() as u64,
+                consumed: true
+            }
         );
+        assert_eq!(std::fs::read(&at).unwrap(), finished);
+        assert!(!beside.exists());
     }
 
     /// #294 verification 3: a quiet but open session (a process working in

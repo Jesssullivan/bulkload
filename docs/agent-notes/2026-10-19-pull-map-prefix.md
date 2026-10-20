@@ -245,10 +245,15 @@ one defect and two hardenings in `place::judge_beside`:
      (`last_line_end`). Each piece is a mebibyte ending at its last line
      end, or is read on to the next line end, one record however long
      (`line_piece`, as the pull's `record_piece` does).
-   - `extended` only when everything up to that line end was appended;
-     anything less is held `live-raced`.
-   - A copy with no line end past the live file's bytes is held
-     `copy-mid-line` (`RESEAT_EXTEND_RACED`, retryable).
+   - `extended` only when every byte of the copy was appended, the copy
+     ending at a line end; an append cut short is held `live-raced`.
+   - A copy with bytes past its last line end that the live file lacks
+     (neo still writing that line) is held `copy-mid-line`
+     (`RESEAT_EXTEND_RACED`, retryable) on every pass. The pass that
+     appends its whole lines holds too, and keeps the copy, so the gate
+     never passes once on incomplete content (re-verification at
+     `1d8cdb3`). It clears when neo finishes the line and the next pull
+     carries it.
 2. **(should) The appended range is read back and hashed** against the
    bytes written before the copy may be removed, not checked by size only.
 3. **(should) A quiet but open session is never written into.** Before
