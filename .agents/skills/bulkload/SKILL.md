@@ -1,23 +1,23 @@
 ---
 name: bulkload
-description: Move a live development estate (Git, worktrees, agent state, dots, SQLite) between hosts with the bulkload Rust engine while preserving both hosts' unique state.
+description: Consolidate a live development estate (Git, worktrees, Claude and Codex homes, dots, SQLite) from neo into sting in place, with bulkload's own verbs, never besides or staging.
 ---
 
 # Bulkload
 
-The engine is this repository's Rust workspace: `bulkload-agent` (verbs:
-run it with no arguments for the list) and `bulkload-bench`. Read
-`AGENTS.md` and `docs/SOURCES.md` (which file holds which fact) before
-acting.
+Read `docs/SPEC.md` first, then `AGENTS.md`. SPEC.md is the requirement and
+wins over every other file.
 
-Keep writers running. Include Git, agents, credentials, dots, worktrees and
-SQLite; preserve unique content on both hosts and destination machine
-identity. Git needs union of refs, objects, stashes, indexes, dirt and
-administration. SQLite needs backup-API capture and explicit composition,
-never a raw WAL/SHM copy or replacement of unique rows. Preserve Home Manager
-links and credential privacy.
-
-Estate operations are not frozen: R-N56's freeze is superseded on order
-(OI-1003-Q194 C6, RUL-06; `docs/slo.md`, amendment 2026-10-16).
-Engine work is tracked in Linear project "Bulkload M2: SLO engine". Every
-performance claim must come from `bulkload-bench` evidence.
+- Estate bytes move only through bulkload verbs (`bulkload-agent`; run it
+  with no arguments for the list). No rsync, rclone, cp, scp, tar or lane
+  scripts.
+- Land in place at the live path, copied once and streamed. No staging copy,
+  bundle, corpus, side root, landing area or beside copy on either machine.
+- Where both sides differ, consolidate them into the one live path (git refs
+  union and file-by-file merge, append-log union, structural config merge,
+  SQLite row union). Never pick a winner. A case bulkload cannot merge yet is
+  a typed hold that writes nothing.
+- Nothing is excluded. Never halt, signal or slow a live writer on either
+  machine.
+- Only the operator's own `claude --resume` and `codex resume` on sting says
+  a lane is done.

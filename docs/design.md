@@ -1,5 +1,7 @@
 # Bulkload design
 
+> **Reference only, 2026-10-20.** This describes how the code works today. It does not set requirements. [SPEC.md](SPEC.md) states what bulkload must do and wins on any disagreement. Any design here that writes a beside copy, a staging copy or a side root contradicts SPEC rules 2–4, and that design is a defect, not a feature.
+
 How bulkload works: its contracts, records and refusal codes. What it must
 achieve and when it is done is [SPEC.md](SPEC.md) (#236); the SLOs and their
 proofs are [slo.md](slo.md); [SOURCES.md](SOURCES.md) maps the rest.
