@@ -245,6 +245,35 @@ pub fn refs_in_wanted(
     Ok(wanted)
 }
 
+/// The refs a clean source's refs-in wants in `repo` (operator ruling
+/// 2026-10-16 21:24Z: no tree beside holds them, so the namespace does).
+///
+/// Every captured ref of `instance` but the stash (its entries go in by
+/// [`stash_wanted`]) that `repo` lacks or holds at another value, as
+/// `refs/<ns>/<rest>`, as a beside landing wants them. Read-only.
+///
+/// # Errors
+/// Whatever reading the provenance or the refs refuses.
+pub fn refs_in_wanted_every(
+    repo: &Path,
+    source: &str,
+    instance: &str,
+    ns: &str,
+) -> Result<BTreeMap<String, String>> {
+    let held = names(repo)?;
+    let mut wanted = BTreeMap::new();
+    for (name, value) in native_refs::carried(repo, source, instance)? {
+        if name == "refs/stash" || held.get(&name) == Some(&value) {
+            continue;
+        }
+        let rest = name
+            .strip_prefix("refs/")
+            .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+        wanted.insert(format!("refs/{ns}/{rest}"), value);
+    }
+    Ok(wanted)
+}
+
 /// Whether `name` is a stash entry ref, `refs/<ns>-stash/<n>`: named by
 /// its position in the source's stash, so it is decided by its commit
 /// ([`stash_wanted`]), never retired by its name ([`plan_own`]).

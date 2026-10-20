@@ -883,10 +883,16 @@ fn carry_one(
     // Operator ruling 2026-10-16 21:24Z (no empty beside directory): a
     // destination this carry made and nothing landed in is removed again
     // when the item is not carried, so a refused carry leaves nothing on
-    // disk. Only an empty directory is ever removed.
+    // disk; so is an empty beside destination an earlier carry made and a
+    // crash left (a beside path is never the operator's). Only an empty
+    // directory is ever removed.
+    let empty_beside = !created
+        && !bound
+        && suffix.is_some()
+        && fs::read_dir(&job.destination).is_ok_and(|mut entries| entries.next().is_none());
     let mut made = Unmade {
         path: &job.destination,
-        armed: created,
+        armed: created || empty_beside,
     };
     // 2. The transfer session, recorded in its destination state; or, for
     // a bind, the session already recorded there.

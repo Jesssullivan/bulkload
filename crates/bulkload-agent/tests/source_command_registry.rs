@@ -538,15 +538,22 @@ const NOT_COMMANDS: &[(&str, usize, &str)] = &[
         4,
         "An object type, as cat-file and for-each-ref print it.",
     ),
-    ("config", 2, "The repository's `config` file name."),
+    (
+        "config",
+        3,
+        "The repository's `config` file name (a beside retirement ledgers a \
+         standalone tree's raw configuration).",
+    ),
     ("fetch", 1, "The remote.origin.fetch configuration field."),
     ("merge", 1, "The branch.NAME.merge configuration field."),
     ("rebase", 1, "The branch.NAME.rebase configuration field."),
     (
         "refs",
-        1,
+        2,
         "A linked worktree administration directory's own `refs` directory \
-         (a beside retirement keeps a checkout that has per-worktree refs).",
+         (a beside retirement keeps a checkout that has per-worktree refs), \
+         and a standalone tree's `.git/refs` (a known entry of the beside \
+         retirement's `.git` allow-list).",
     ),
     ("remote", 1, "The branch.NAME.remote configuration field."),
     (

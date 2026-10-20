@@ -386,7 +386,7 @@ SUBCOMMANDS:
                 CAPTURE_ABSENT back (and for refs-only items riding on it).
                 --dry-run reads only and prints what each item would do.
                 One line per item
-    estate-beside-retire [--delete] [--scan ROOT]... [--depth N] SUFFIX SOURCE PRIVATE_STATE [BESIDE ...]
+    estate-beside-retire [--delete] [--drop-rebuildable] [--scan ROOT]... [--depth N] SUFFIX SOURCE PRIVATE_STATE [BESIDE ...]
                 Operator ruling 2026-10-16 21:24Z: prove each beside tree
                 (each BESIDE, and every directory named *SUFFIX whose live
                 path exists under a --scan ROOT, to --depth levels, default
@@ -401,13 +401,15 @@ SUBCOMMANDS:
                 refs/NS/, else created there create-only), and every
                 untracked or ignored entry present and equal in the live
                 checkout or landable there as a file-level beside
-                (FILE+SUFFIX; rebuildable roots counted, not reconciled).
+                (FILE+SUFFIX); a rebuildable root (target/, node_modules/,
+                ...) refuses rebuildable:PATH unless --drop-rebuildable
+                (counted, dropped with the tree, as a capture omits it).
                 One line per tree: verdict=retirable with the counts and
                 bytes, or verdict=refused reason=... (typed; nothing
                 written), then a summary. Report only: nothing is written.
                 --delete: each retirable tree's entries are reconciled into
                 the live checkout and its refs created, it is proved again,
-                ledgered in PRIVATE_STATE (beside-retire-TAG.retired: path,
+                ledgered in PRIVATE_STATE (beside-retire-TAG-NS.retired: path,
                 live path, HEAD, counts, refs, bytes, a standalone tree's
                 config and info/exclude) and removed crash-safely (renamed
                 aside, re-proved by prints, its administration and tree
@@ -2428,6 +2430,10 @@ fn beside_retire_command(args: &[std::ffi::OsString]) -> Result<()> {
         match arg {
             "--delete" if !options.delete => {
                 options.delete = true;
+                at += 1;
+            }
+            "--drop-rebuildable" if !options.drop_rebuildable => {
+                options.drop_rebuildable = true;
                 at += 1;
             }
             "--scan" => {

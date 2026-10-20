@@ -49,6 +49,7 @@ use serde::{Deserialize, Serialize};
 
 use super::super::batch_objects::BatchObjects;
 use super::super::landed::{self, Kind};
+use super::super::{git, output};
 use super::{holds, lstat, Side};
 use crate::{BulkloadRefusal, Result};
 
@@ -189,6 +190,9 @@ pub struct FilesRecord {
     pub tracked: u64,
     /// The temporaries this pass may leave (write-ahead).
     pub temps: Vec<Vec<u8>>,
+    /// The directories this pass may make, shallowest first, with the mode
+    /// each ends at (write-ahead).
+    pub dirs: Vec<(Vec<u8>, u32)>,
     /// The pass ended: `tally` is its count.
     pub done: bool,
     pub tally: Tally,
@@ -210,9 +214,12 @@ pub fn read_record(path: &Path) -> Result<Option<FilesRecord>> {
     landed::read::<FilesRecord>(path)
 }
 
-/// Remove the temporaries an unfinished pass recorded at `path` left (a
-/// regular file or a link at a recorded private name; nothing else is
-/// touched). A finished record is left as it is.
+/// Settle what an unfinished pass recorded at `path` left: its
+/// temporaries removed (a regular file or a link at a recorded private
+/// name), and each directory it may have made, deepest first, removed when
+/// empty or given its mode when still the `0700` it was made at (nothing
+/// else is touched). The next pass plans again. A finished record is left
+/// as it is.
 ///
 /// # Errors
 /// IO.
@@ -235,6 +242,20 @@ pub fn settle(path: &Path) -> Result<()> {
             if meta.is_file() || meta.file_type().is_symlink() {
                 fs::remove_file(temp).refuse_at(SITE)?;
             }
+        }
+    }
+    for (dir, mode) in record.dirs.iter().rev() {
+        let dir = Path::new(OsStr::from_bytes(dir));
+        let Some(meta) = lstat(dir)? else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        if fs::read_dir(dir).refuse_at(SITE)?.next().is_none() {
+            fs::remove_dir(dir).refuse_at(SITE)?;
+        } else if meta.mode() & 0o7777 == 0o700 && mode & 0o7777 != 0o700 {
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode & 0o7777)).refuse_at(SITE)?;
         }
     }
     Ok(())
@@ -362,6 +383,19 @@ fn plain(path: &[u8]) -> bool {
         })
 }
 
+/// The paths the index of the checkout at `worktree` holds.
+///
+/// # Errors
+/// Whatever listing the index refuses.
+pub(in crate::git_carry) fn index_paths(worktree: &Path) -> Result<BTreeSet<Vec<u8>>> {
+    let listed = output(git(worktree).args(["ls-files", "-z"]))?;
+    Ok(listed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
 /// Every want's path is plain (no `.git` component, no `..`): `false`
 /// when one is not, which no reconcile names.
 pub(in crate::git_carry) fn all_plain(wants: &[Want]) -> bool {
@@ -465,12 +499,16 @@ fn same_bytes(a: &Path, b: &Path) -> Result<bool> {
 /// Plan the reconcile of `wants` (sorted by path, so a directory comes
 /// before what it holds) into the live tree at `live`. Read-only.
 ///
+/// `tracked` holds the paths the live index tracks: one absent on disk is
+/// the live checkout's own deletion, never undone, so a source entry there
+/// lands beside it.
+///
 /// # Errors
 /// Whatever reading the live tree or the source refuses.
 pub(in crate::git_carry) fn plan(
     live: &Path,
     suffix: &str,
-    wants: &[Want],
+    (wants, tracked): (&[Want], &BTreeSet<Vec<u8>>),
     mut objects: Option<&mut BatchObjects>,
 ) -> Result<Planned> {
     let mut steps = Vec::with_capacity(wants.len());
@@ -507,7 +545,11 @@ pub(in crate::git_carry) fn plan(
         let base = dest.get(parent).cloned().unwrap_or_else(|| parent.to_vec());
         let here = join(&base, leaf);
         let directory = want.side.kind == Kind::Directory;
-        let found = at(live, &here, &made)?;
+        let found = match at(live, &here, &made)? {
+            // A path the live index tracks, deleted in its worktree.
+            At::Absent if tracked.contains(&here) => At::Other,
+            found => found,
+        };
         let equal = matches!(found, At::Other)
             && !directory
             && holds_want(
@@ -589,6 +631,47 @@ pub(in crate::git_carry) fn temp_of(live: &Path, at: &[u8], salt: &[u8]) -> Path
         "{TEMP_PREFIX}{}",
         tag.get(..24).unwrap_or_default()
     ))
+}
+
+/// Every directory `planned` may make (write-ahead), shallowest first,
+/// with the mode it ends at: its directory steps, and the absent parents
+/// of every step (made `0755`).
+///
+/// # Errors
+/// Whatever reading the live tree refuses.
+pub(in crate::git_carry) fn dirs(
+    live: &Path,
+    planned: &Planned,
+    wants: &[Want],
+) -> Result<Vec<(Vec<u8>, u32)>> {
+    let mut found: BTreeMap<Vec<u8>, u32> = BTreeMap::new();
+    for step in &planned.steps {
+        if step.act == Act::Occupied || step.act == Act::Adopt || step.act == Act::BesidePresent
+        {
+            continue;
+        }
+        for above in ancestors(&step.at) {
+            if !found.contains_key(above) && lstat(&live.join(OsStr::from_bytes(above)))?.is_none()
+            {
+                found.insert(above.to_vec(), 0o755);
+            }
+        }
+        if matches!(step.act, Act::DirPlace | Act::DirBeside) {
+            let mode = wants.get(step.want).map_or(0o755, |want| want.side.mode);
+            found.insert(step.at.clone(), mode);
+        }
+    }
+    let mut dirs: Vec<(Vec<u8>, u32)> = found
+        .into_iter()
+        .map(|(at, mode)| {
+            (
+                live.join(OsStr::from_bytes(&at)).as_os_str().as_bytes().to_vec(),
+                mode,
+            )
+        })
+        .collect();
+    dirs.sort_by_key(|(at, _)| at.iter().filter(|byte| **byte == b'/').count());
+    Ok(dirs)
 }
 
 /// Every temporary `planned` may make (write-ahead).
@@ -887,7 +970,7 @@ mod tests {
                 "link",
             ],
         );
-        let planned = plan(&live, ".neo-20261016", &wants, None).unwrap();
+        let planned = plan(&live, ".neo-20261016", (&wants, &BTreeSet::new()), None).unwrap();
         let got = acts(&planned, &wants);
         let find = |path: &str| got.iter().find(|row| row.0 == path).unwrap().clone();
         assert_eq!(find("notes").1, Act::DirPlace);
@@ -922,7 +1005,7 @@ mod tests {
             Path::new("same.log")
         );
         // The second pass: everything placed is adopted, nothing written.
-        let again = plan(&live, ".neo-20261016", &wants, None).unwrap();
+        let again = plan(&live, ".neo-20261016", (&wants, &BTreeSet::new()), None).unwrap();
         let tally = execute(&live, &again, &wants, b"t", None).unwrap();
         assert_eq!(
             (tally.placed, tally.beside, tally.dirs_placed, tally.bytes),
@@ -954,7 +1037,7 @@ mod tests {
             &source,
             &["cache", "cache/sub", "cache/sub/a", "via", "via/b"],
         );
-        let planned = plan(&live, ".neo-20261016", &wants, None).unwrap();
+        let planned = plan(&live, ".neo-20261016", (&wants, &BTreeSet::new()), None).unwrap();
         execute(&live, &planned, &wants, b"t", None).unwrap();
         assert_eq!(fs::read(live.join("cache")).unwrap(), b"a live file\n");
         assert_eq!(
@@ -972,7 +1055,7 @@ mod tests {
         let (_dir, source, live) = tree();
         fs::write(source.join("a"), b"a\n").unwrap();
         let wants = wants(&source, &["a"]);
-        let planned = plan(&live, ".neo-20261016", &wants, None).unwrap();
+        let planned = plan(&live, ".neo-20261016", (&wants, &BTreeSet::new()), None).unwrap();
         let temp = temp_of(&live, b"a", b"t");
         fs::write(&temp, b"half").unwrap();
         fs::write(live.join("operator"), b"mine\n").unwrap();
@@ -991,6 +1074,48 @@ mod tests {
         let tally = execute(&live, &planned, &wants, b"t", None).unwrap();
         assert_eq!(tally.placed, 1);
         assert_eq!(fs::read(live.join("a")).unwrap(), b"a\n");
+    }
+
+    /// A path the live index tracks and its worktree deleted is the live
+    /// checkout's own change: the source's entry there lands beside it,
+    /// never undoing the deletion.
+    #[test]
+    fn a_live_deletion_of_a_tracked_path_is_never_undone() {
+        let (_dir, source, live) = tree();
+        fs::write(source.join("gone.txt"), b"neo\n").unwrap();
+        let wants = wants(&source, &["gone.txt"]);
+        let tracked = BTreeSet::from([b"gone.txt".to_vec()]);
+        let planned = plan(&live, ".neo-20261016", (&wants, &tracked), None).unwrap();
+        execute(&live, &planned, &wants, b"t", None).unwrap();
+        assert!(!live.join("gone.txt").exists());
+        assert_eq!(
+            fs::read(live.join("gone.txt.neo-20261016")).unwrap(),
+            b"neo\n"
+        );
+    }
+
+    /// The directories an unfinished pass may have made are settled: an
+    /// empty one removed, one still at `0700` given its mode.
+    #[test]
+    fn settle_removes_empty_made_directories_and_seals_the_rest() {
+        let (_dir, _source, live) = tree();
+        let (empty, full) = (live.join("empty"), live.join("full"));
+        fs::DirBuilder::new().mode(0o700).create(&empty).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&full).unwrap();
+        fs::write(full.join("a"), b"a\n").unwrap();
+        let record = live.parent().unwrap().join("dirs.files");
+        let named = |path: &Path| path.as_os_str().as_bytes().to_vec();
+        landed::write(
+            &record,
+            &FilesRecord {
+                dirs: vec![(named(&empty), 0o755), (named(&full), 0o750)],
+                ..FilesRecord::default()
+            },
+        )
+        .unwrap();
+        settle(&record).unwrap();
+        assert!(!empty.exists());
+        assert_eq!(fs::metadata(&full).unwrap().mode() & 0o7777, 0o750);
     }
 
     impl Tally {

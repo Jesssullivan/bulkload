@@ -2496,18 +2496,34 @@ fn apply_item(
                 // reconciled into the live checkout, file by file
                 // (`git_carry::converge::clean`). Only under `--refs-in`:
                 // without it the refs would not go in.
+                // A capture the assessment cannot read lands beside, as it
+                // did before the rule; so does one whose HEAD the refs-in
+                // that follows did not bring in after all (a namespace ref
+                // held at another value, or one the operator removed).
                 let clean = if options.refs_in {
-                    git_carry::converge::clean::assess(&staged, &target)?
+                    git_carry::converge::clean::assess(&staged, &target)
+                        .ok()
+                        .flatten()
                 } else {
                     None
                 };
-                let landed = clean.as_ref().map_or_else(
-                    || {
-                        beside_item(&staged, &target, &landing, (state, &policy, suffix))
-                            .map(|applied| ("workspace-beside", applied))
-                    },
-                    |clean| clean_item(clean, item, &target, &landing, (state, suffix)),
-                );
+                let cleaned = clean.as_ref().map_or(Ok(None), |clean| {
+                    clean_item(
+                        clean,
+                        (item, &staged),
+                        (&target, &landing),
+                        (state, &identity, suffix),
+                    )
+                });
+                let landed = cleaned.and_then(|cleaned| {
+                    cleaned.map_or_else(
+                        || {
+                            beside_item(&staged, &target, &landing, (state, &policy, suffix))
+                                .map(|applied| ("workspace-beside", applied))
+                        },
+                        Ok,
+                    )
+                });
                 match landed {
                     Ok((outcome, mut applied)) => {
                         if let Some(refused) = &refused {
@@ -2533,7 +2549,7 @@ fn apply_item(
                                 &staged,
                                 &target,
                                 (state, &identity, suffix),
-                                (captured.digest, true),
+                                (captured.digest, RefsIn::STASH),
                             );
                         }
                         return Err(refusal);
@@ -2560,16 +2576,15 @@ fn apply_item(
     // beside landing took every captured ref under the namespace already.
     // An advanced live checkout's stash is the live one's, never touched,
     // so the captured stash entries go in as `refs/<ns>-stash/<n>` too.
-    if options.refs_in && outcome != "workspace-beside" {
+    // A clean source's refs went in before its files (`clean_item`).
+    if options.refs_in && outcome != "workspace-beside" && outcome != "workspace-refs-in" {
         let suffix = options
             .beside
             .as_deref()
             .ok_or(BulkloadRefusal::RequiredFieldMissing)?;
         // An advanced checkout (now or by an earlier pass) keeps its own
-        // stash: the capture's entries go in under the namespace, as a
-        // clean source's do (no tree beside holds them).
-        let stash = outcome == "workspace-refs-in"
-            || applied.advanced
+        // stash: the capture's entries go in under the namespace.
+        let stash = applied.advanced
             || match item.workspace.as_deref() {
                 Some(workspace) => {
                     git_carry::converge::advance::advanced_at(workspace, source)?.is_some()
@@ -2581,7 +2596,13 @@ fn apply_item(
             &staged,
             &target,
             (state, &identity, suffix),
-            (captured.digest, stash),
+            (
+                captured.digest,
+                RefsIn {
+                    stash,
+                    follow: false,
+                },
+            ),
         )?;
         applied.custody = Some(match applied.custody.take() {
             Some(more) => format!("{more} {words}"),
@@ -2622,21 +2643,40 @@ fn apply_item(
 }
 
 // Operator ruling 2026-10-16 21:24Z: the clean capture `clean` lands no
-// tree beside the live checkout; its untracked and ignored files are
-// reconciled into it ([`git_carry::converge::clean::land`]), recorded at
-// `{item}-{blake3(SOURCE)}.files` in STATE. The refs go in after, as for
-// any adopted or landed item (`--refs-in`, stash entries included). A
-// beside landing an earlier pass made is left as it was and named, for
-// `estate-beside-retire`.
+// tree beside the live checkout. Its refs go in first, every captured ref
+// and stash entry under the namespace, this item's own earlier refs moved
+// to the source's values by compare-and-swap (no tree beside holds them
+// now: the namespace does); then its HEAD must be reachable from a live
+// ref, or `None` (the caller lands beside). Then its untracked and ignored
+// files are reconciled into the live checkout
+// ([`git_carry::converge::clean::land`]), recorded at
+// `{item}-{blake3(SOURCE)}.files` in STATE. A beside landing an earlier
+// pass made is left as it was and named, for `estate-beside-retire`.
 fn clean_item(
     clean: &git_carry::converge::clean::Clean,
-    item: &Item,
-    target: &git_carry::converge::Target<'_>,
-    landing: &git_carry::converge::Landing<'_>,
-    (state, suffix): (&Path, &str),
-) -> Result<(&'static str, git_carry::converge::Applied)> {
+    (item, staged): (&Item, &git_carry::StagedBundle),
+    (target, landing): (
+        &git_carry::converge::Target<'_>,
+        &git_carry::converge::Landing<'_>,
+    ),
+    (state, identity, suffix): (&Path, &str, &str),
+) -> Result<Option<(&'static str, git_carry::converge::Applied)>> {
+    let words = refs_in(
+        item,
+        staged,
+        target,
+        (state, identity, suffix),
+        (landing.capture, RefsIn::FOLLOW),
+    )?;
+    if !git_carry::converge::clean::reachable_in(target.repository, clean.head())? {
+        return Ok(None);
+    }
     let record = files_record_path(state, landing.item, target.source);
     let mut applied = git_carry::converge::clean::land(clean, target, landing, (&record, suffix))?;
+    applied.custody = Some(match applied.custody.take() {
+        Some(more) => format!("{more} {words}"),
+        None => words,
+    });
     if let Some(workspace) = item.workspace.as_deref() {
         let beside = git_carry::beside::path(workspace, suffix);
         if fs::symlink_metadata(&beside).is_ok() {
@@ -2645,7 +2685,30 @@ fn clean_item(
                 .map(|words| format!("{words} beside-existing={}", beside.display()));
         }
     }
-    Ok(("workspace-refs-in", applied))
+    Ok(Some(("workspace-refs-in", applied)))
+}
+
+/// How [`refs_in`] takes the captured refs.
+#[derive(Debug, Clone, Copy)]
+struct RefsIn {
+    /// Each carried stash entry too, as `refs/<ns>-stash/<n>`.
+    stash: bool,
+    /// A clean source with no tree beside (operator ruling 2026-10-16
+    /// 21:24Z): every captured ref (not only branches and tags), and this
+    /// item's own earlier namespace refs moved to the source's values by
+    /// compare-and-swap, as a beside landing moves its own.
+    follow: bool,
+}
+
+impl RefsIn {
+    const STASH: Self = Self {
+        stash: true,
+        follow: false,
+    };
+    const FOLLOW: Self = Self {
+        stash: true,
+        follow: true,
+    };
 }
 
 /// Where an item's clean-source file reconcile is recorded (operator
@@ -3154,7 +3217,7 @@ fn refs_in(
     staged: &git_carry::StagedBundle,
     target: &git_carry::converge::Target<'_>,
     (state, identity, suffix): (&Path, &str, &str),
-    (capture, stash): ([u8; 32], bool),
+    (capture, how): ([u8; 32], RefsIn),
 ) -> Result<String> {
     let ns = git_carry::beside::namespace(suffix)?;
     let repository = target.repository;
@@ -3196,8 +3259,12 @@ fn refs_in(
             .map(|record| record.created)
             .unwrap_or_default();
     let own = git_carry::beside::own_refs(&beside_created, &record.created);
-    let mut wanted = git_carry::beside::refs_in_wanted(repository, target.source, &instance, &ns)?;
-    if stash {
+    let mut wanted = if how.follow {
+        git_carry::beside::refs_in_wanted_every(repository, target.source, &instance, &ns)?
+    } else {
+        git_carry::beside::refs_in_wanted(repository, target.source, &instance, &ns)?
+    };
+    if how.stash {
         wanted.extend(git_carry::beside::stash_wanted(
             repository,
             (target.source, &instance, &ns),
@@ -3206,17 +3273,24 @@ fn refs_in(
         )?);
     }
     let mut planned = git_carry::beside::plan_own(repository, &wanted, &own)?;
-    planned.kept.append(&mut planned.moved);
+    if !how.follow {
+        planned.kept.append(&mut planned.moved);
+    }
     record.kept.clone_from(&planned.kept);
-    record.pending.clone_from(&planned.create);
+    record.pending = planned.writes();
     git_carry::beside::write_refs_in(&record_path, &record)?;
-    git_carry::beside::create(repository, &planned.create)?;
-    for created in std::mem::take(&mut record.pending) {
-        git_carry::beside::upsert(&mut record.created, created);
+    git_carry::beside::write(repository, &planned)?;
+    for written in std::mem::take(&mut record.pending) {
+        git_carry::beside::upsert(&mut record.created, written);
     }
     git_carry::beside::write_refs_in(&record_path, &record)?;
+    let moved = if how.follow {
+        format!(" refs-in-moved={}", planned.moved.len())
+    } else {
+        String::new()
+    };
     Ok(format!(
-        "refs-in-created={} refs-in-present={} refs-in-kept={} refs-in-retired={}",
+        "refs-in-created={} refs-in-present={}{moved} refs-in-kept={} refs-in-retired={}",
         planned.create.len(),
         planned.present.len(),
         planned.kept.len(),

@@ -8,9 +8,11 @@
 //! by that same rule. [`prove`] reads one, read-only:
 //!
 //! 1. its shape: an empty directory (a refused carry's leftover) is
-//!    retirable as it is; otherwise a checkout, a linked worktree of the
-//!    live repository or a standalone repository, whose live path holds a
-//!    checkout;
+//!    retirable as it is; otherwise a checkout, whose live path holds a
+//!    checkout: a linked worktree of the live repository whose
+//!    administration directory names it back (a copy of another worktree,
+//!    its gitfile naming that one's, refuses `worktree-link`), or a
+//!    standalone repository whose `.git` is a directory in the tree;
 //! 2. **tracked-clean**: no staged or unstaged change, no operation in
 //!    progress, no hidden index flag, no index lock;
 //! 3. **its HEAD reachable in the live repository** from a ref (provenance
@@ -19,34 +21,45 @@
 //!    no per-worktree ref, and every commit its reflogs name is reachable
 //!    in the live repository; a standalone one has no worktree and no hook
 //!    of its own, and every commit its refs, stash and reflogs name is in
-//!    the live repository and reachable there. Its branches, tags and other
-//!    refs (remote-tracking ones aside, which a fetch rebuilds) are held
-//!    by the live repository by name and value, natively or under
-//!    `refs/<ns>/`, or are created there under `refs/<ns>/` (create-only;
-//!    one held there at another value refuses `refs:<name>`), and each
-//!    stash commit no `refs/<ns>-stash/` ref holds goes in at a free index.
-//!    Its configuration and `info/exclude` bytes are kept in the
-//!    retirement's ledger record;
+//!    the live repository and reachable there (`unreachable:<name>`; a
+//!    remote-tracking ref's own word, `unreachable-remote:`). Its branches,
+//!    tags and other refs (remote-tracking ones aside, which a fetch
+//!    rebuilds) are held by the live repository by name and value,
+//!    natively or under `refs/<ns>/`, or are created there under
+//!    `refs/<ns>/` (create-only; one held there at another value refuses
+//!    `refs:<name>`), and each stash commit no `refs/<ns>-stash/` ref
+//!    holds goes in at a free index. Its `.git` holds nothing else unproved
+//!    (an allow-list: a submodule's `modules/`, `lfs/`, `git-crypt/`, other
+//!    `info/` files refuse `unknown-git:<name>`), the live repository does
+//!    not borrow its objects (`borrowed-by-live`), and its configuration
+//!    (without an include, `config-include`) and `info/exclude` bytes are
+//!    kept in the retirement's ledger record;
 //! 5. **every untracked and ignored entry present and equal in the live
 //!    checkout, or landed there as a file-level beside**: the file-level
 //!    reconcile of [`super::super::converge::files`] plans each one (an
 //!    entry absent at the live checkout is placed, one that differs lands
 //!    at `<path>SUFFIX`); an entry whose beside path holds something else
-//!    refuses `occupied:<path>`. Entries under a rebuildable root (the
-//!    capture's own [`super::super::REBUILDABLE_DIRECTORIES`], a real
-//!    directory nothing tracked is under) are counted, as a capture omits
-//!    them, never reconciled. A nested repository refuses `nested:<path>`.
+//!    refuses `occupied:<path>`; a path the live index tracks and its
+//!    worktree deleted is never undone (the entry lands beside). A
+//!    rebuildable root (the capture's own
+//!    [`super::super::REBUILDABLE_DIRECTORIES`], a real directory nothing
+//!    tracked is under) refuses `rebuildable:<path>`, unless the run drops
+//!    them as a capture omits them (`--drop-rebuildable`: counted, never
+//!    reconciled). A nested repository refuses `nested:<path>`.
 //!
-//! The tree's prints are taken before the proof and after it (a session
-//! writing there refuses `raced`). Anything not provable is a typed
-//! refusal naming why, and nothing is written.
+//! The tree's prints (and a linked tree's administration directory's) are
+//! taken before the proof and after it (a session writing there refuses
+//! `raced`). Anything not provable is a typed refusal naming why, and
+//! nothing is written.
 //!
 //! Report only by default. With `--delete` ([`retire`]), under the live
 //! repository's destination lock: the file-level reconcile runs
 //! (recorded write-ahead), the refs go in, the tree is proved again (every
-//! entry now present: placed or beside), the ledger record is written
-//! (`beside-retire-<tag>.retired` in STATE: path, live path, shape, HEAD,
-//! counts, refs, bytes, configuration), and the tree is removed by the
+//! entry now present: placed or beside) and its HEAD and administration
+//! looked at once more, the ledger record is written
+//! (`beside-retire-<tag>-<ns>.retired` in STATE, one per retirement: path,
+//! live path, shape, HEAD, counts, refs, bytes, configuration), and the
+//! tree is removed by the
 //! beside retirement's crash-safe removal ([`super::retire`]: a STATE
 //! record, a rename to a private name, a re-proof by prints, a linked
 //! tree's administration, the tree). A rerun finishes a removal a crash cut
@@ -105,7 +118,8 @@ pub struct Proof {
     /// What the file-level reconcile of its untracked and ignored entries
     /// does (planned; `placed` and `beside` are still to write).
     pub tally: Tally,
-    /// Entries under a rebuildable root, not reconciled.
+    /// Entries under a rebuildable root (`--drop-rebuildable`), not
+    /// reconciled.
     pub rebuildable: u64,
     /// Hand-off targets bulkload wrote there (a sealed block above a
     /// tracked file's bytes, or a target it created): bulkload's own.
@@ -115,8 +129,26 @@ pub struct Proof {
     /// The bytes it holds on disk (allocated), its administration
     /// included.
     pub bytes: u64,
+    /// A standalone tree's configuration and `info/exclude` bytes, for the
+    /// ledger.
+    pub config: Vec<u8>,
+    pub exclude: Vec<u8>,
     prints: [u8; 32],
+    admin_prints: [u8; 32],
     wants: Vec<Want>,
+}
+
+/// What [`prove`] may take as given.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Rules<'a> {
+    /// The file-level beside suffix (`.neo-20261016`).
+    pub suffix: &'a str,
+    /// The ref namespace (the suffix without its leading `.`).
+    pub ns: &'a str,
+    /// `--drop-rebuildable`: entries under a rebuildable root are counted
+    /// and go with the tree, as a capture omits them; without it one
+    /// refuses `rebuildable:<path>`.
+    pub drop_rebuildable: bool,
 }
 
 /// [`prove`]'s answer.
@@ -147,16 +179,6 @@ fn allocated(root: &Path) -> Result<u64> {
         total += entry.meta.blocks() * 512;
     }
     Ok(total)
-}
-
-// The index entries' paths of the checkout at `worktree`.
-fn index_paths(worktree: &Path) -> Result<BTreeSet<Vec<u8>>> {
-    let listed = output(git(worktree).args(["ls-files", "-z"]))?;
-    Ok(listed
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(<[u8]>::to_vec)
-        .collect())
 }
 
 // Whether `path` or a path under it is in `tracked`.
@@ -335,15 +357,125 @@ fn handoff_created(beside: &Path, relative: &[u8]) -> Result<bool> {
     Ok(meta.is_file() && retire::unblocked(&fs::read(&at).refuse_at(SITE)?).is_empty())
 }
 
+/// The `.git` entries a standalone tree may hold, every one of which is
+/// proved (refs, objects, reflogs, hooks), ledgered (its configuration and
+/// `info/exclude`) or rebuilt by Git (the rest). Anything else (a
+/// submodule's `modules/`, `lfs/`, `git-crypt/`, `rr-cache/`, ...) refuses
+/// `unknown-git:<name>`.
+const GIT_ENTRIES: &[&str] = &[
+    "HEAD",
+    "ORIG_HEAD",
+    "FETCH_HEAD",
+    "COMMIT_EDITMSG",
+    CONFIG,
+    "description",
+    "index",
+    "packed-refs",
+    REFS,
+    "objects",
+    "logs",
+    "hooks",
+    "info",
+    "branches",
+    "bulkload",
+    "shallow",
+    "gitk.cache",
+];
+
+/// The `.git/info` entries a standalone tree may hold: its exclude
+/// (ledgered) and what `update-server-info` rebuilds.
+const INFO_ENTRIES: &[&str] = &["info/exclude", "info/refs", "info/packs"];
+
+/// A repository's configuration file name.
+const CONFIG: &str = "config";
+/// A repository's ref directory name.
+const REFS: &str = "refs";
+
+// Why a standalone tree's `.git` at `git_dir` holds something its removal
+// would lose unproved; `None` when it does not.
+fn unknown_git(git_dir: &Path) -> Result<Option<String>> {
+    for entry in fs::read_dir(git_dir).refuse_at(SITE)? {
+        let name = entry.refuse_at(SITE)?.file_name();
+        if !GIT_ENTRIES.iter().any(|known| known.as_bytes() == name.as_bytes()) {
+            return Ok(Some(format!("unknown-git:{}", shown(name.as_bytes()))));
+        }
+    }
+    let info = git_dir.join("info");
+    if retire::lstat(&info)?.is_some_and(|meta| meta.is_dir()) {
+        for entry in fs::read_dir(&info).refuse_at(SITE)? {
+            let mut name = b"info/".to_vec();
+            name.extend_from_slice(entry.refuse_at(SITE)?.file_name().as_bytes());
+            if !INFO_ENTRIES.iter().any(|known| known.as_bytes() == name) {
+                return Ok(Some(format!("unknown-git:{}", shown(&name))));
+            }
+        }
+    }
+    Ok(None)
+}
+
+// Whether the live repository's object store (common directory
+// `live_common`) borrows from the standalone tree's (`git_dir`): removing
+// it would take objects the live repository reads.
+fn borrowed_by(live_common: &Path, git_dir: &Path) -> Result<bool> {
+    let objects = live_common.join("objects");
+    let Ok(listed) = fs::read(objects.join("info/alternates")) else {
+        return Ok(false);
+    };
+    let Ok(own) = fs::canonicalize(git_dir.join("objects")) else {
+        return Ok(false);
+    };
+    for line in listed.split(|byte| *byte == b'\n') {
+        let line = line.trim_ascii();
+        if line.is_empty() || line.starts_with(b"#") {
+            continue;
+        }
+        let named = Path::new(OsStr::from_bytes(line));
+        let named = if named.is_absolute() {
+            named.to_path_buf()
+        } else {
+            objects.join(named)
+        };
+        if fs::canonicalize(&named).is_ok_and(|real| real.starts_with(&own)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// Whether the linked tree at `beside` owns its administration directory
+// `admin`: the directory's `gitdir` names `beside/.git` back (a copy of
+// another worktree, its gitfile naming that one's, does not).
+fn owns_admin(beside: &Path, admin: &Path) -> bool {
+    let Ok(text) = fs::read(admin.join("gitdir")) else {
+        return false;
+    };
+    let named = Path::new(OsStr::from_bytes(text.trim_ascii_end()));
+    let named = if named.is_absolute() {
+        named.to_path_buf()
+    } else {
+        admin.join(named)
+    };
+    match (fs::canonicalize(named), fs::canonicalize(beside.join(".git"))) {
+        (Ok(named), Ok(own)) => named == own,
+        _ => false,
+    }
+}
+
+// The prints of a linked tree's administration directory (its HEAD, index
+// and reflog live there): a commit made in the tree while it is proved
+// changes them.
+fn admin_prints(admin: Option<&Path>) -> Result<[u8; 32]> {
+    admin.map_or(Ok([0; 32]), retire::prints)
+}
+
 /// Prove the beside tree at `beside` a subset of the live checkout at
-/// `live` (module docs), with `suffix` the file-level beside suffix and
-/// `ns` the ref namespace. Read-only.
+/// `live` (module docs), by `rules`. Read-only.
 ///
 /// # Errors
 /// Whatever reading either tree refuses (a reason the tree is not provable
 /// is a [`Verdict::Refused`], never an error).
 #[allow(clippy::too_many_lines)]
-pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<Verdict> {
+pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
     let Some(meta) = retire::lstat(beside)? else {
         return Ok(refused("absent"));
     };
@@ -361,7 +493,10 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
             handoff: 0,
             refs: Vec::new(),
             bytes: meta.blocks() * 512,
+            config: Vec::new(),
+            exclude: Vec::new(),
             prints: before,
+            admin_prints: [0; 32],
             wants: Vec::new(),
         })));
     }
@@ -382,13 +517,27 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
     else {
         return Ok(refused("not-a-checkout"));
     };
+    let dotgit_dir = retire::lstat(&beside.join(".git"))?.is_some_and(|meta| meta.is_dir());
     let shape = if same_dir(&git_dir, &common) {
+        // A repository of its own, its `.git` a directory in the tree (a
+        // gitfile naming a git directory elsewhere is not one to remove).
+        if !dotgit_dir {
+            return Ok(refused("gitfile-standalone"));
+        }
         Shape::Standalone
     } else if same_dir(&common, &live_common) {
+        if same_dir(&git_dir, &live_git) {
+            return Ok(refused("shared-admin"));
+        }
+        if !owns_admin(beside, &git_dir) {
+            return Ok(refused("worktree-link"));
+        }
         Shape::Linked
     } else {
         return Ok(refused("other-repository"));
     };
+    let admin = (shape == Shape::Linked).then(|| git_dir.clone());
+    let admin_before = admin_prints(admin.as_deref())?;
     if retire::lstat(&git_dir.join("index.lock"))?.is_some() {
         return Ok(refused("index-locked"));
     }
@@ -409,6 +558,7 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
     // under.
     let mut commits: Vec<(String, String)> = Vec::new();
     let mut refs = Vec::new();
+    let (mut config, mut exclude) = (Vec::new(), Vec::new());
     let mut bytes = allocated(beside)?;
     match shape {
         Shape::Linked => {
@@ -425,6 +575,12 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
             if super::super::converge::worktree_census(beside)?.len() > 1 {
                 return Ok(refused("worktrees"));
             }
+            if let Some(why) = unknown_git(&git_dir)? {
+                return Ok(refused(why));
+            }
+            if borrowed_by(&live_common, &git_dir)? {
+                return Ok(refused("borrowed-by-live"));
+            }
             let hooks = git_dir.join("hooks");
             if retire::lstat(&hooks)?.is_some_and(|meta| meta.is_dir())
                 && retire::walk(&hooks, true)?
@@ -433,7 +589,19 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
             {
                 return Ok(refused("hooks"));
             }
-            match standalone_refs(beside, live, ns)? {
+            let Ok(raw) = fs::read(git_dir.join(CONFIG)) else {
+                return Ok(refused("config-unreadable"));
+            };
+            if raw.to_ascii_lowercase().windows(8).any(|w| w == b"[include") {
+                return Ok(refused("config-include"));
+            }
+            config = raw;
+            exclude = match fs::read(git_dir.join("info/exclude")) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                Err(_) => return Ok(refused("exclude-unreadable")),
+            };
+            match standalone_refs(beside, live, rules.ns)? {
                 Ok((named, wanted)) => {
                     commits.extend(named);
                     refs = wanted;
@@ -448,7 +616,7 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
         return Ok(refused(why));
     }
     // 5. Its untracked and ignored entries.
-    let tracked = index_paths(beside)?;
+    let tracked = files::index_paths(beside)?;
     let mut dirs = BTreeSet::new();
     for path in &tracked {
         for (at, byte) in path.iter().enumerate() {
@@ -489,6 +657,9 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
                 .any(|candidate| candidate.as_bytes() == name)
             && !tracks(&tracked, &path)
         {
+            if !rules.drop_rebuildable {
+                return Ok(refused(format!("rebuildable:{}", shown(&path))));
+            }
             rebuildable += 1;
             roots.push(path);
             continue;
@@ -499,11 +670,12 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
         }
     }
     wants.sort_by(|a, b| a.path.cmp(&b.path));
-    let planned = files::plan(live, suffix, &wants, None)?;
+    let live_tracked = files::index_paths(live)?;
+    let planned = files::plan(live, rules.suffix, (&wants, &live_tracked), None)?;
     if let Some(first) = planned.occupied().first() {
         return Ok(refused(format!("occupied:{}", shown(first))));
     }
-    if retire::prints(beside)? != before {
+    if retire::prints(beside)? != before || admin_prints(admin.as_deref())? != admin_before {
         return Ok(refused("raced"));
     }
     let files = u64::try_from(tracked.iter().filter(|path| !dirs.contains(*path)).count())
@@ -517,13 +689,16 @@ pub fn prove(beside: &Path, live: &Path, (suffix, ns): (&str, &str)) -> Result<V
         handoff,
         refs,
         bytes,
+        config,
+        exclude,
         prints: before,
+        admin_prints: admin_before,
         wants,
     })))
 }
 
 /// What the ledger keeps of one retired beside tree
-/// (`beside-retire-<tag>.retired` in STATE).
+/// (`beside-retire-<tag>-<ns>.retired` in STATE, one per retirement).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetiredRecord {
     pub path: Vec<u8>,
@@ -533,20 +708,22 @@ pub struct RetiredRecord {
     pub tracked: u64,
     pub tally: Tally,
     pub rebuildable: u64,
+    pub handoff: u64,
     pub refs: Vec<(String, String)>,
     pub bytes: u64,
-    /// A standalone tree's own configuration (`config --local --list -z`)
-    /// and its `info/exclude` bytes.
+    /// A standalone tree's configuration and `info/exclude` bytes.
     pub config: Vec<u8>,
     pub exclude: Vec<u8>,
     /// Unix nanoseconds at the proof.
     pub at_ns: i128,
+    /// The removal began (the tree is renamed aside or gone).
+    pub deleting: bool,
     /// The tree is gone.
     pub retired: bool,
 }
 
 impl landed::Record for RetiredRecord {
-    const MAGIC: &'static [u8; 16] = b"bulkload-subset1";
+    const MAGIC: &'static [u8; 16] = b"bulkload-subset2";
 }
 
 /// The tag a beside tree's records are named by in STATE.
@@ -557,38 +734,40 @@ pub fn tag(beside: &Path) -> String {
         .to_string()
 }
 
-/// Where a beside tree's retirement records are in `state`: the ledger
-/// record, the file reconcile and the removal intent.
+/// Where a beside tree's retirement records are in `state`: its file
+/// reconcile and its removal intent. The ledger record is one per
+/// retirement ([`ledger_path`]).
 #[must_use]
-pub fn records(state: &Path, beside: &Path) -> (PathBuf, PathBuf, PathBuf) {
+pub fn records(state: &Path, beside: &Path) -> (PathBuf, PathBuf) {
     let tag = tag(beside);
     (
-        state.join(format!("beside-retire-{tag}.retired")),
         state.join(format!("beside-retire-{tag}.files")),
         state.join(format!("beside-retire-{tag}.retire")),
     )
 }
 
-/// Finish a removal a crash cut short for the beside tree at `beside`
-/// (its intent in `state`): `None` when there was none.
-///
-/// # Errors
-/// Whatever finishing the removal refuses.
-pub fn settle(state: &Path, beside: &Path) -> Result<Option<Retired>> {
-    let (ledger, _, intent) = records(state, beside);
-    let done = retire::settle(&intent)?;
-    if matches!(done, Some(Retired::Retired)) {
-        if let Some(mut record) = landed::read::<RetiredRecord>(&ledger)? {
+/// The ledger record of the retirement named `item`
+/// (`beside-retire-<tag>-<ns>`) in `state`.
+#[must_use]
+pub fn ledger_path(state: &Path, item: &str) -> PathBuf {
+    state.join(format!("{item}.retired"))
+}
+
+// Mark the ledger record at `path` retired.
+fn mark_retired(path: &Path) -> Result<()> {
+    if let Some(mut record) = landed::read::<RetiredRecord>(path)? {
+        if !record.retired {
             record.retired = true;
-            landed::write(&ledger, &record)?;
+            landed::write(path, &record)?;
         }
     }
-    Ok(done)
+    Ok(())
 }
 
 /// Finish every removal a crash cut short whose intent is in `state`,
-/// recording each finished one in its ledger record: the beside paths and
-/// what became of them.
+/// recording each finished one in its ledger record, and mark retired a
+/// ledger record whose removal had begun when its intent is gone and its
+/// tree too: the beside paths and what became of them.
 ///
 /// # Errors
 /// Whatever reading `state` or finishing a removal refuses.
@@ -598,11 +777,18 @@ pub fn settle_all(state: &Path) -> Result<Vec<(PathBuf, Retired)>> {
         return Ok(settled);
     };
     let mut intents = Vec::new();
+    let mut ledgers = Vec::new();
     for entry in entries {
         let entry = entry.refuse_at(SITE)?;
         let name = entry.file_name();
-        if name.as_bytes().starts_with(b"beside-retire-") && name.as_bytes().ends_with(b".retire") {
+        let name = name.as_bytes();
+        if !name.starts_with(b"beside-retire-") {
+            continue;
+        }
+        if name.ends_with(b".retire") {
             intents.push(entry.path());
+        } else if name.ends_with(b".retired") {
+            ledgers.push(entry.path());
         }
     }
     intents.sort();
@@ -610,15 +796,33 @@ pub fn settle_all(state: &Path) -> Result<Vec<(PathBuf, Retired)>> {
         let Some(read) = landed::read::<retire::RetireIntent>(&intent)? else {
             continue;
         };
-        let beside = PathBuf::from(OsStr::from_bytes(&read.path));
-        if let Some(done) = settle(state, &beside)? {
-            settled.push((beside, done));
+        if let Some(done) = retire::settle(&intent)? {
+            if done == Retired::Retired {
+                mark_retired(&ledger_path(state, &read.item))?;
+            }
+            settled.push((PathBuf::from(OsStr::from_bytes(&read.path)), done));
+        }
+    }
+    ledgers.sort();
+    for ledger in ledgers {
+        let Some(record) = landed::read::<RetiredRecord>(&ledger)? else {
+            continue;
+        };
+        let path = PathBuf::from(OsStr::from_bytes(&record.path));
+        let (_, intent) = records(state, &path);
+        if record.deleting
+            && !record.retired
+            && retire::lstat(&path)?.is_none()
+            && retire::lstat(&intent)?.is_none()
+        {
+            mark_retired(&ledger)?;
+            settled.push((path, Retired::Retired));
         }
     }
     Ok(settled)
 }
 
-/// Whether `state` holds a removal a crash cut short (read-only).
+/// How many removals a crash cut short `state` holds (read-only).
 ///
 /// # Errors
 /// Whatever reading `state` refuses.
@@ -651,14 +855,18 @@ fn now_ns() -> i128 {
 /// # Errors
 /// `GIT_DESTINATION_MODIFIED` when the live tree moved under the
 /// reconcile; whatever a write, the ref creation or the removal refuses.
+#[allow(clippy::too_many_lines)]
 pub fn retire(
     state: &Path,
     source: &str,
     (beside, live): (&Path, &Path),
-    (suffix, ns): (&str, &str),
+    rules: Rules<'_>,
     proof: &Proof,
 ) -> Result<Retired> {
-    let (ledger, files_record, intent) = records(state, beside);
+    let (files_record, intent) = records(state, beside);
+    let at_ns = now_ns();
+    let item = format!("beside-retire-{}-{at_ns}", tag(beside));
+    let ledger = ledger_path(state, &item);
     let mut record = RetiredRecord {
         path: beside.as_os_str().as_bytes().to_vec(),
         live: live.as_os_str().as_bytes().to_vec(),
@@ -667,12 +875,16 @@ pub fn retire(
         tracked: proof.tracked,
         tally: proof.tally,
         rebuildable: proof.rebuildable,
+        handoff: proof.handoff,
         refs: proof.refs.clone(),
         bytes: proof.bytes,
-        at_ns: now_ns(),
+        config: proof.config.clone(),
+        exclude: proof.exclude.clone(),
+        at_ns,
         ..RetiredRecord::default()
     };
     if proof.shape == Shape::Empty {
+        record.deleting = true;
         landed::write(&ledger, &record)?;
         // `rmdir` removes an empty directory only: one written into since
         // the proof stays.
@@ -682,38 +894,29 @@ pub fn retire(
         if let Some(parent) = beside.parent() {
             landed::sync_dir(parent)?;
         }
-        record.retired = true;
-        landed::write(&ledger, &record)?;
+        mark_retired(&ledger)?;
         return Ok(Retired::Retired);
     }
     let git_dir = landed::worktree_git_dir(live)?.ok_or(BulkloadRefusal::GitDestinationOccupied)?;
     let common = landed::common_dir(&git_dir)?;
     let _lock = landed::lock(&common, source)?;
-    if proof.shape == Shape::Standalone {
-        // Its own configuration as Git lists it, and its exclude bytes.
-        record.config =
-            output(git(beside).args(["config", "--local", "--list", "-z"])).unwrap_or_default();
-        record.exclude = match fs::read(beside.join(".git/info/exclude")) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(crate::refuse::io(&error, SITE)),
-        };
-    }
     landed::write(&ledger, &record)?;
     // The file-level reconcile, recorded write-ahead.
     files::settle(&files_record)?;
     let salt = files_record.as_os_str().as_bytes();
-    let planned = files::plan(live, suffix, &proof.wants, None)?;
+    let live_tracked = files::index_paths(live)?;
+    let planned = files::plan(live, rules.suffix, (&proof.wants, &live_tracked), None)?;
     if !planned.occupied().is_empty() {
         return Ok(Retired::Kept("raced".to_owned()));
     }
     let mut reconciled = files::FilesRecord {
-        item: format!("beside-retire-{}", tag(beside)),
+        item: item.clone(),
         capture: *blake3::hash(proof.head.as_bytes()).as_bytes(),
         live: record.live.clone(),
-        suffix: suffix.to_owned(),
+        suffix: rules.suffix.to_owned(),
         tracked: proof.tracked,
         temps: files::temps(live, &planned, salt),
+        dirs: files::dirs(live, &planned, &proof.wants)?,
         besides: planned.besides(&proof.wants),
         ..files::FilesRecord::default()
     };
@@ -731,17 +934,28 @@ pub fn retire(
         super::create(live, &planned.create)?;
     }
     // Proved again: every entry is now in the live checkout.
-    let Verdict::Retirable(again) = prove(beside, live, (suffix, ns))? else {
+    let Verdict::Retirable(again) = prove(beside, live, rules)? else {
         return Ok(Retired::Kept("raced".to_owned()));
     };
     if again.tally.placed != 0 || again.tally.beside != 0 || again.tally.dirs_placed != 0 {
         return Ok(Retired::Kept("raced".to_owned()));
     }
-    let capture = *blake3::hash(format!("{}\0{}", tag(beside), proof.head).as_bytes()).as_bytes();
-    let done = retire::remove_proved(&intent, beside, (&reconciled.item, capture), again.prints)?;
+    // The last look before the rename: a commit made there since the
+    // proof (its HEAD, index or reflog) keeps the tree.
+    let admin = (again.shape == Shape::Linked)
+        .then(|| landed::worktree_git_dir(beside).ok().flatten())
+        .flatten();
+    if head_of(beside)?.oid != again.head
+        || admin_prints(admin.as_deref())? != again.admin_prints
+    {
+        return Ok(Retired::Kept("raced".to_owned()));
+    }
+    record.deleting = true;
+    landed::write(&ledger, &record)?;
+    let capture = *blake3::hash(format!("{item}\0{}", proof.head).as_bytes()).as_bytes();
+    let done = retire::remove_proved(&intent, beside, (&item, capture), again.prints)?;
     if done == Retired::Retired {
-        record.retired = true;
-        landed::write(&ledger, &record)?;
+        mark_retired(&ledger)?;
     }
     Ok(done)
 }

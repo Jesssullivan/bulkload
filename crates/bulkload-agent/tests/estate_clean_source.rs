@@ -612,6 +612,94 @@ fn c6_without_refs_in_a_clean_source_lands_beside() {
     assert!(world.beside().join(".git").is_file());
 }
 
+/// C7 (review M1): neo moves on after a clean pass. Its namespace ref is
+/// this item's own, so it follows the source by compare-and-swap (no tree
+/// beside holds the work: the namespace does) and the item stays clean.
+/// One the operator removed is never created again, so the moved HEAD
+/// comes in by no ref and the capture lands beside instead.
+#[test]
+fn c7_a_source_that_moved_on_follows_its_own_namespace_ref() {
+    for removed in [false, true] {
+        let world = World::new();
+        fs::write(world.neo().join("README"), b"v2 on neo\n").unwrap();
+        git(&world.neo(), &["commit", "--quiet", "-am", "c2"]);
+        world.capture();
+        let ran = world.apply(&FLAGS);
+        assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in", "{removed}");
+        if removed {
+            git(
+                &world.sting(),
+                &["update-ref", "-d", "refs/neo-20261016/heads/main"],
+            );
+        }
+        fs::write(world.neo().join("README"), b"v3 on neo\n").unwrap();
+        git(&world.neo(), &["commit", "--quiet", "-am", "c3"]);
+        world.capture();
+        let ran = world.apply(&FLAGS);
+        assert!(ran.ok, "{removed}: {}\n{}", ran.stdout, ran.stderr);
+        let (outcome, reason) = receipt(&ran.stdout);
+        let head = git(&world.neo(), &["rev-parse", "HEAD"]).trim().to_owned();
+        if removed {
+            assert_eq!(outcome, "workspace-beside", "{reason}");
+            assert_eq!(git(&world.beside(), &["rev-parse", "HEAD"]).trim(), head);
+            assert!(
+                !named_refs(&world.sting()).contains_key("refs/neo-20261016/heads/main"),
+                "a removed ref came back"
+            );
+        } else {
+            assert_eq!(outcome, "workspace-refs-in", "{reason}");
+            assert!(word(&reason, "refs-in-moved=1"), "{reason}");
+            assert_eq!(
+                named_refs(&world.sting()).get("refs/neo-20261016/heads/main"),
+                Some(&head)
+            );
+            assert!(!world.beside().exists());
+            assert!(world.closure().stdout.contains("\"applied\":1"));
+        }
+    }
+}
+
+/// C8 (review minor 7): no tree beside holds the source's other refs, so
+/// every captured ref goes in under the namespace (a remote-tracking one
+/// too), as a beside landing brought them.
+#[test]
+fn c8_every_captured_ref_goes_in_under_the_namespace() {
+    let world = World::new();
+    git(
+        &world.neo(),
+        &["update-ref", "refs/remotes/origin/feature", "HEAD~1"],
+    );
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
+    assert_eq!(
+        named_refs(&world.sting()).get("refs/neo-20261016/remotes/origin/feature"),
+        Some(&git(&world.neo(), &["rev-parse", "HEAD~1"]).trim().to_owned())
+    );
+}
+
+/// C9 (review minor 3): a path the live index tracks and its worktree
+/// deleted is sting's own change: neo's untracked file there lands beside
+/// it, never undoing the deletion.
+#[test]
+fn c9_a_live_deletion_is_never_undone() {
+    let world = World::new();
+    let sting = world.sting();
+    fs::create_dir_all(sting.join("notes")).unwrap();
+    fs::write(sting.join("notes/todo.md"), b"sting's tracked todo\n").unwrap();
+    git(&sting, &["add", "notes/todo.md"]);
+    git(&sting, &["commit", "--quiet", "-m", "sting's todo"]);
+    fs::remove_file(sting.join("notes/todo.md")).unwrap();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in", "{}", ran.stdout);
+    assert!(!sting.join("notes/todo.md").exists(), "the deletion was undone");
+    assert_eq!(
+        fs::read(sting.join(format!("notes/todo.md{SUFFIX}"))).unwrap(),
+        b"neo's untracked todo\n"
+    );
+}
+
 /// Every entry under `root` with its bytes or link target, `.git` included.
 fn tree(root: &Path) -> BTreeMap<PathBuf, (u32, Vec<u8>, i64)> {
     let mut out = BTreeMap::new();
@@ -748,16 +836,34 @@ fn r1_a_redundant_beside_tree_is_reported_then_retired() {
 }
 
 /// R2: a beside tree that is not a subset refuses typed, nothing written:
-/// a tracked change in it, or a commit made in it no live ref holds.
+/// a tracked change in it, a commit made in it no live ref holds, or a
+/// copy of another worktree whose gitfile names that one's administration
+/// (review M2: retiring it would delete the live worktree's).
 #[test]
 fn r2_a_beside_tree_with_its_own_work_refuses_typed() {
-    for case in ["tracked", "head"] {
+    for case in ["tracked", "head", "copy"] {
         let world = World::new();
         world.capture();
         let ran = world.apply(&["--adopt", "--beside", SUFFIX]);
         assert!(ran.ok, "{case}: {}\n{}", ran.stdout, ran.stderr);
         let beside = world.beside();
-        let reason = if case == "tracked" {
+        let reason = if case == "copy" {
+            fs::remove_dir_all(&beside).unwrap();
+            git(&world.sting(), &["worktree", "prune"]);
+            let feat = world.path("sting/feat");
+            git(
+                &world.sting(),
+                &["worktree", "add", "--quiet", "--detach", feat.to_str().unwrap()],
+            );
+            let copied = Command::new("cp")
+                .arg("-a")
+                .arg(&feat)
+                .arg(&beside)
+                .status()
+                .unwrap();
+            assert!(copied.success());
+            "reason=worktree-link"
+        } else if case == "tracked" {
             fs::write(beside.join("README"), b"edited in the beside tree\n").unwrap();
             "reason=tracked-changes"
         } else {
@@ -768,7 +874,7 @@ fn r2_a_beside_tree_with_its_own_work_refuses_typed() {
             "reason=unreachable:head="
         };
         let state = world.path("retire-state");
-        let frozen = tree(&beside);
+        let frozen = (tree(&beside), tree(&world.sting().join(".git/worktrees")));
         let done = retire(&["--delete"], &state, &[beside.as_path()]);
         assert!(done.ok, "{case}: {}\n{}", done.stdout, done.stderr);
         let line = line_of(&done.stdout, &beside);
@@ -776,7 +882,11 @@ fn r2_a_beside_tree_with_its_own_work_refuses_typed() {
             line.contains("verdict=refused") && line.contains(reason),
             "{case}: {line}"
         );
-        assert_eq!(tree(&beside), frozen, "{case}: the beside tree moved");
+        assert_eq!(
+            (tree(&beside), tree(&world.sting().join(".git/worktrees"))),
+            frozen,
+            "{case}: the beside tree or an administration moved"
+        );
         assert!(!world.sting().join("notes/todo.md").exists(), "{case}");
     }
 }
@@ -835,4 +945,41 @@ fn r3_a_standalone_copy_is_retired_only_once_its_commits_are_in() {
         "{refs:?}"
     );
     assert_eq!(refs.get("refs/neo-20261016/heads/main"), Some(&head));
+}
+
+/// R4 (review M3, M4): a standalone copy whose `.git` holds an entry the
+/// proof cannot account for (a submodule's `modules/`) refuses
+/// `unknown-git:modules`; a rebuildable root in a beside tree refuses
+/// `rebuildable:<path>` unless the run drops it as a capture omits it
+/// (`--drop-rebuildable`, counted).
+#[test]
+fn r4_unaccounted_git_entries_and_rebuildable_roots_refuse() {
+    let world = World::new();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
+    let copied = Command::new("cp")
+        .arg("-a")
+        .arg(world.neo())
+        .arg(world.beside())
+        .status()
+        .unwrap();
+    assert!(copied.success());
+    let state = world.path("retire-state");
+    fs::create_dir_all(world.beside().join(".git/modules/sub")).unwrap();
+    fs::write(world.beside().join(".git/modules/sub/HEAD"), b"ref: x\n").unwrap();
+    let report = retire(&[], &state, &[world.beside().as_path()]);
+    let line = line_of(&report.stdout, &world.beside()).to_owned();
+    assert!(line.contains("reason=unknown-git:modules"), "{line}");
+    fs::remove_dir_all(world.beside().join(".git/modules")).unwrap();
+    fs::create_dir_all(world.beside().join("target/debug")).unwrap();
+    fs::write(world.beside().join("target/debug/app"), b"built\n").unwrap();
+    let report = retire(&[], &state, &[world.beside().as_path()]);
+    let line = line_of(&report.stdout, &world.beside()).to_owned();
+    assert!(line.contains("reason=rebuildable:target"), "{line}");
+    let report = retire(&["--drop-rebuildable"], &state, &[world.beside().as_path()]);
+    let line = line_of(&report.stdout, &world.beside()).to_owned();
+    for held in ["verdict=retirable", "shape=standalone", "rebuildable-dropped=3"] {
+        assert!(line.split_whitespace().any(|w| w == held), "{held}: {line}");
+    }
 }

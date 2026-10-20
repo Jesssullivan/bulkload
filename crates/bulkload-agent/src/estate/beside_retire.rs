@@ -40,6 +40,9 @@ pub struct RetireOptions {
     pub scan: Vec<PathBuf>,
     /// How deep `--scan` looks.
     pub depth: usize,
+    /// `--drop-rebuildable`: entries under a rebuildable root go with the
+    /// tree, counted, as a capture omits them.
+    pub drop_rebuildable: bool,
 }
 
 /// What one run found and did.
@@ -55,6 +58,9 @@ pub struct Summary {
     pub kept: u64,
     pub settled: u64,
     pub pending: u64,
+    /// Trees whose proof or retirement failed with a refusal (named on
+    /// their line); the run goes on.
+    pub errors: u64,
 }
 
 impl Summary {
@@ -62,7 +68,7 @@ impl Summary {
     #[must_use]
     pub fn line(&self, delete: bool) -> String {
         format!(
-            "estate-beside-retire summary mode={} candidates={} retirable={} retirable_bytes={} empty={} refused={} retired={} retired_bytes={} kept={} settled={} pending_removals={}",
+            "estate-beside-retire summary mode={} candidates={} retirable={} retirable_bytes={} empty={} refused={} retired={} retired_bytes={} kept={} settled={} pending_removals={} errors={}",
             if delete { "delete" } else { "report" },
             self.candidates,
             self.retirable,
@@ -74,6 +80,7 @@ impl Summary {
             self.kept,
             self.settled,
             self.pending,
+            self.errors,
         )
     }
 }
@@ -81,7 +88,7 @@ impl Summary {
 fn proof_words(proof: &subset::Proof) -> String {
     let tally = &proof.tally;
     format!(
-        "shape={} head={} tracked={} present={} to-place={} to-beside={} beside-present={} dirs-present={} dirs-to-place={} dirs-beside={} rebuildable={} handoff={} refs-to-import={} bytes={}",
+        "shape={} head={} tracked={} present={} to-place={} to-beside={} beside-present={} dirs-present={} dirs-to-place={} dirs-beside={} rebuildable-dropped={} handoff={} refs-to-import={} bytes={}",
         proof.shape.word(),
         if proof.head.is_empty() { "-" } else { &proof.head },
         proof.tracked,
@@ -148,7 +155,24 @@ pub fn run(options: &RetireOptions, out: &mut dyn FnMut(&str) -> Result<()>) -> 
             ))?;
             continue;
         };
-        let verdict = subset::prove(&tree, &live, (&options.suffix, &ns))?;
+        let rules = subset::Rules {
+            suffix: &options.suffix,
+            ns: &ns,
+            drop_rebuildable: options.drop_rebuildable,
+        };
+        // A refusal proving one tree is that tree's typed answer; the run
+        // goes on to the next.
+        let verdict = match subset::prove(&tree, &live, rules) {
+            Ok(verdict) => verdict,
+            Err(refusal) => {
+                summary.errors += 1;
+                out(&format!(
+                    "estate-beside-retire beside={tree:?} live={live:?} verdict=refused reason=error:{}",
+                    refusal.code()
+                ))?;
+                continue;
+            }
+        };
         let proof = match verdict {
             subset::Verdict::Refused(why) => {
                 summary.refused += 1;
@@ -171,13 +195,19 @@ pub fn run(options: &RetireOptions, out: &mut dyn FnMut(&str) -> Result<()>) -> 
             ))?;
             continue;
         }
-        let done = subset::retire(
+        let done = match subset::retire(
             &options.state,
             &options.source,
             (&tree, &live),
-            (&options.suffix, &ns),
+            rules,
             &proof,
-        )?;
+        ) {
+            Ok(done) => done,
+            Err(refusal) => {
+                summary.errors += 1;
+                Retired::Kept(format!("error:{}", refusal.code()))
+            }
+        };
         match &done {
             Retired::Retired => {
                 summary.retired += 1;
@@ -185,16 +215,14 @@ pub fn run(options: &RetireOptions, out: &mut dyn FnMut(&str) -> Result<()>) -> 
             }
             Retired::Kept(_) => summary.kept += 1,
         }
-        let (ledger, _, _) = subset::records(&options.state, &tree);
         out(&format!(
-            "estate-beside-retire beside={tree:?} live={live:?} verdict=retirable {words} outcome={}{} ledger={:?}",
+            "estate-beside-retire beside={tree:?} live={live:?} verdict=retirable {words} outcome={}{}",
             done.word(),
             if done.reason().is_empty() {
                 String::new()
             } else {
                 format!(" reason={}", done.reason())
             },
-            ledger,
         ))?;
     }
     out(&summary.line(options.delete))?;

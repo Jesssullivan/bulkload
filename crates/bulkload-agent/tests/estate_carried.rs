@@ -365,8 +365,9 @@ fn beside_lands_next_to_an_occupied_workspace() {
 /// Operator ruling 2026-10-16 21:24Z (no empty beside directory; the two
 /// empty `*.neo-20261016` directories on sting, 2026-10-19): a carry whose
 /// session refuses before anything lands removes the destination it made,
-/// so nothing is left on disk, and the item stays `CAPTURE_ABSENT`. A
-/// destination that was there before is never removed.
+/// so nothing is left on disk, and the item stays `CAPTURE_ABSENT`; an
+/// empty beside destination an earlier carry left goes too. A beside
+/// destination that holds anything is never removed.
 #[test]
 fn a_refused_carry_leaves_no_empty_directory() {
     for existed in [false, true] {
@@ -374,6 +375,7 @@ fn a_refused_carry_leaves_no_empty_directory() {
         let beside = world.path("dst/repo.neo-20261016");
         if existed {
             fs::create_dir(&beside).unwrap();
+            fs::write(beside.join("operator.txt"), b"mine\n").unwrap();
         }
         fs::remove_dir_all(&world.source).unwrap();
         let ran = world.carry(&["--beside", ".neo-20261016"]);
@@ -387,6 +389,13 @@ fn a_refused_carry_leaves_no_empty_directory() {
         let report = world.closure();
         assert!(report.contains("CAPTURE_ABSENT"), "{existed}: {report}");
     }
+    // The empty leftover of an earlier refused carry.
+    let world = World::new("refused-leftover", |_, _| {});
+    let beside = world.path("dst/repo.neo-20261016");
+    fs::create_dir(&beside).unwrap();
+    fs::remove_dir_all(&world.source).unwrap();
+    world.carry(&["--beside", ".neo-20261016"]);
+    assert!(!beside.exists());
 }
 
 #[test]
