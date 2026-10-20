@@ -165,11 +165,12 @@ pub struct Proof {
     /// `refs/<ns>/reflog/<tree>/<oid>` before it goes (operator ruling
     /// 2026-10-16, "full history. drop nothing. ever.").
     pub reflogs: Vec<String>,
-    /// Those of them the live repository's object store lacks (their
-    /// objects are carried too).
-    pub reflogs_absent: u64,
-    /// Every commit its refs and stash name (all reachable in the live
-    /// repository): what a carry of its reflog commits leaves out.
+    /// The commits (its reflog commits, and the values of the refs to
+    /// create) the live repository's object store lacks: their objects are
+    /// packed from the tree and carried too.
+    pub objects_absent: u64,
+    /// Every commit its refs and stash name that the live store already
+    /// holds: what the pack leaves out.
     tips: Vec<String>,
     /// The prints of the tree and a linked tree's administration directory
     /// (its HEAD, index and reflogs live there), taken before the proof.
@@ -239,7 +240,10 @@ fn tracks(tracked: &BTreeSet<Vec<u8>>, path: &[u8]) -> bool {
 
 /// The commits a standalone tree's refs and stash name (each with the
 /// name it is reported under), and the refs to create in the live
-/// repository; `Err` with the refusal word.
+/// repository: every ref (a remote-tracking one too: full history) the
+/// live repository does not hold by name and value, natively or under the
+/// namespace, goes in under `refs/<ns>/`, each stash commit under
+/// `refs/<ns>-stash/`; `Err` with the refusal word.
 fn standalone_refs(
     beside: &Path,
     live: &Path,
@@ -251,7 +255,7 @@ fn standalone_refs(
     let mut wanted = Vec::new();
     for (name, value) in &own {
         commits.push((name.clone(), value.clone()));
-        if name == "refs/stash" || name.starts_with("refs/remotes/") {
+        if name == "refs/stash" {
             continue;
         }
         let Some(rest) = name.strip_prefix("refs/") else {
@@ -285,38 +289,6 @@ fn standalone_refs(
         free += 1;
     }
     Ok(Ok((commits, wanted)))
-}
-
-// Why some of `commits` (each with the name it is reported under) is not
-// in the live repository at `live` or not reachable there, naming the
-// first such (a remote-tracking ref's apart: a fetch may bring it back);
-// `None` when every one is.
-fn unreachable(
-    live: &Path,
-    tips: &BTreeSet<String>,
-    mut commits: Vec<(String, String)>,
-) -> Option<String> {
-    commits.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
-    commits.dedup_by(|a, b| a.1 == b.1);
-    let all: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
-    let unreached: BTreeSet<String> = clean::unreached_from(live, &all, tips)
-        .into_iter()
-        .collect();
-    if unreached.is_empty() {
-        return None;
-    }
-    commits.sort_by_key(|(name, _)| (name.starts_with("refs/remotes/"), name.clone()));
-    for (name, commit) in &commits {
-        if unreached.contains(commit) {
-            let kind = if name.starts_with("refs/remotes/") {
-                "unreachable-remote"
-            } else {
-                "unreachable"
-            };
-            return Some(format!("{kind}:{name}={commit}"));
-        }
-    }
-    Some("unreachable".to_owned())
 }
 
 // Whether the checkout at `beside` (git directory `git_dir`) is
@@ -581,6 +553,29 @@ fn receipts(git_dir: &Path) -> Result<Option<Receipts>> {
     Ok(Some(read))
 }
 
+// Of `commits`, those the object store of the repository at `repo` holds.
+fn present(repo: &Path, commits: &[String]) -> Result<BTreeSet<String>> {
+    if commits.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut request = String::new();
+    for commit in commits {
+        request.push_str(commit);
+        request.push('\n');
+    }
+    let listed = input(
+        git(repo).args(["cat-file", "--batch-check"]),
+        request.as_bytes(),
+    )?;
+    // `<oid> <type> <size>`, or `<oid> missing`.
+    Ok(String::from_utf8_lossy(&listed)
+        .lines()
+        .filter(|line| !line.ends_with(" missing"))
+        .filter_map(|line| line.split(' ').next())
+        .map(str::to_owned)
+        .collect())
+}
+
 // Of the commits `logged` (a beside tree's reflogs name them), those no
 // ref of the live repository at `live` reaches, sorted, and how many of
 // them its object store lacks; `Err` with the refusal word for one the
@@ -597,24 +592,6 @@ fn unreached(
     if logged.is_empty() {
         return Ok(Ok((Vec::new(), 0)));
     }
-    let present = |repo: &Path, commits: &[String]| -> Result<BTreeSet<String>> {
-        let mut request = String::new();
-        for commit in commits {
-            request.push_str(commit);
-            request.push('\n');
-        }
-        let listed = input(
-            git(repo).args(["cat-file", "--batch-check"]),
-            request.as_bytes(),
-        )?;
-        // `<oid> <type> <size>`, or `<oid> missing`.
-        Ok(String::from_utf8_lossy(&listed)
-            .lines()
-            .filter(|line| !line.ends_with(" missing"))
-            .filter_map(|line| line.split(' ').next())
-            .map(str::to_owned)
-            .collect())
-    };
     let in_live = present(live, &logged)?;
     let mut absent = 0;
     let mut unreached = Vec::new();
@@ -665,23 +642,25 @@ fn reflog_dir(beside: &Path, live: &Path, ns: &str) -> String {
     )
 }
 
-// Carry the commits `reflogs` (a beside tree's reflog commits no live ref
-// reaches) into the live repository at `live`: their objects first, when
-// its store lacks some (a pack of what they reach and none of `tips`
-// does, read from the beside tree and indexed into the live store), then
-// one ref each under [`reflog_dir`], create-only. The refs it wrote (or
+// Carry into the live repository at `live` what of the beside tree's Git
+// it lacks (full history: nothing dropped): the objects its store lacks
+// first (a pack of what the refs to create and the reflog commits reach,
+// and none of `tips` does, read from the beside tree and indexed into the
+// live store), then the refs, create-only, under the namespace, then one
+// ref per reflog commit under [`reflog_dir`]. The reflog refs it wrote (or
 // found at their value), or why it carried none.
-fn carry_reflogs(
+fn carry_history(
     (beside, live): (&Path, &Path),
     ns: &str,
     proof: &Proof,
 ) -> Result<std::result::Result<Vec<(String, String)>, String>> {
-    if proof.reflogs.is_empty() {
-        return Ok(Ok(Vec::new()));
-    }
-    if proof.reflogs_absent > 0 {
+    if proof.objects_absent > 0 {
         let mut request = String::new();
-        for commit in &proof.reflogs {
+        for commit in proof
+            .reflogs
+            .iter()
+            .chain(proof.refs.iter().map(|(_, commit)| commit))
+        {
             request.push_str(commit);
             request.push('\n');
         }
@@ -695,11 +674,22 @@ fn carry_reflogs(
             request.as_bytes(),
         )?;
         if pack.len() > 1 << 30 {
-            return Ok(Err("reflog-pack-large".to_owned()));
+            return Ok(Err("history-pack-large".to_owned()));
         }
         let mut command = git(live);
         durable(&mut command);
         input(command.args(["index-pack", "--stdin"]), &pack)?;
+    }
+    if !proof.refs.is_empty() {
+        let wanted: BTreeMap<String, String> = proof.refs.iter().cloned().collect();
+        let planned = super::plan(live, &wanted)?;
+        if let Some((name, _, _)) = planned.kept.first() {
+            return Ok(Err(format!("refs:{name}")));
+        }
+        super::create(live, &planned.create)?;
+    }
+    if proof.reflogs.is_empty() {
+        return Ok(Ok(Vec::new()));
     }
     let dir = reflog_dir(beside, live, ns);
     let wanted: BTreeMap<String, String> = proof
@@ -770,7 +760,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
             carried: Vec::new(),
             prunable: 0,
             reflogs: Vec::new(),
-            reflogs_absent: 0,
+            objects_absent: 0,
             tips: Vec::new(),
             prints: empty_prints,
             wants: Vec::new(),
@@ -913,16 +903,44 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         }
         Shape::Empty => {}
     }
-    let tips: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
-    let live_tips = clean::live_tips(live, rules.ns)?;
-    if let Some(why) = unreachable(live, &live_tips, commits) {
-        return Ok(refused(why));
+    // Every commit it names is kept: each ref the live repository does not
+    // hold by name and value goes in under the namespace (`refs`), and each
+    // commit only its reflogs (or a gone worktree's) name that no ref the
+    // live repository will hold reaches is carried in under
+    // `refs/<ns>/reflog/` (full history: nothing dropped). The objects the
+    // live store lacks are packed from the tree.
+    let all: Vec<String> = commits.iter().map(|(_, commit)| commit.clone()).collect();
+    let wanted: Vec<String> = refs.iter().map(|(_, commit)| commit.clone()).collect();
+    let in_live = present(live, &[all.as_slice(), wanted.as_slice()].concat())?;
+    if let Some(lost) = wanted.iter().find(|commit| !in_live.contains(*commit)) {
+        if !present(beside, std::slice::from_ref(lost))?.contains(lost) {
+            return Ok(refused(format!("missing:{lost}")));
+        }
     }
-    // The commits only its reflogs name: carried in, never dropped.
-    let (reflogs, reflogs_absent) = match unreached(beside, (live, &live_tips), logged)? {
+    let mut live_tips = clean::live_tips(live, rules.ns)?;
+    live_tips.extend(
+        wanted
+            .iter()
+            .filter(|commit| in_live.contains(*commit))
+            .cloned(),
+    );
+    let (mut reflogs, _) = match unreached(beside, (live, &live_tips), logged)? {
         Ok(found) => found,
         Err(why) => return Ok(refused(why)),
     };
+    // A reflog commit a ref to create holds is in by that ref.
+    reflogs.retain(|commit| !wanted.contains(commit));
+    let carried_commits: BTreeSet<&String> = reflogs.iter().chain(wanted.iter()).collect();
+    let carried_commits: Vec<String> = carried_commits.into_iter().cloned().collect();
+    let objects_absent =
+        u64::try_from(carried_commits.len() - present(live, &carried_commits)?.len())
+            .unwrap_or(u64::MAX);
+    // What the pack leaves out: every commit of its own the live store
+    // already holds.
+    let tips: Vec<String> = all
+        .into_iter()
+        .filter(|commit| in_live.contains(commit))
+        .collect();
     // 5. Its untracked and ignored entries.
     let tracked = files::index_paths(beside)?;
     let mut dirs = BTreeSet::new();
@@ -1021,7 +1039,7 @@ pub fn prove(beside: &Path, live: &Path, rules: Rules<'_>) -> Result<Verdict> {
         carried,
         prunable,
         reflogs,
-        reflogs_absent,
+        objects_absent,
         tips,
         prints: before,
         wants,
@@ -1278,17 +1296,10 @@ pub fn retire(
     )?;
     let tally = files::execute(live, &planned, &proof.wants, (salt, &mut journal), None)?;
     journal.finish(tally)?;
-    // The refs, create-only: a name taken since keeps the tree.
-    if !proof.refs.is_empty() {
-        let wanted: BTreeMap<String, String> = proof.refs.iter().cloned().collect();
-        let planned = super::plan(live, &wanted)?;
-        if let Some((name, _, _)) = planned.kept.first() {
-            return Ok(Retired::Kept(format!("refs:{name}")));
-        }
-        super::create(live, &planned.create)?;
-    }
-    // Its reflog commits, carried in (full history, nothing dropped).
-    match carry_reflogs((beside, live), rules.ns, proof)? {
+    // Its history, carried in (full history, nothing dropped): the
+    // objects the live store lacks, its refs, its reflog commits; a name
+    // taken since keeps the tree.
+    match carry_history((beside, live), rules.ns, proof)? {
         Ok(written) => record.reflogs = written,
         Err(why) => return Ok(Retired::Kept(why)),
     }

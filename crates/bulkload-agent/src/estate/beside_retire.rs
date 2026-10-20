@@ -91,7 +91,7 @@ impl Summary {
 fn proof_words(proof: &subset::Proof) -> String {
     let tally = &proof.tally;
     format!(
-        "shape={} head={} tracked={} present={} to-place={} to-beside={} beside-present={} dirs-present={} dirs-to-place={} dirs-beside={} to-write-source={} to-write-derived={} derived={} rebuildable-dropped={} rebuildable-dropped-live-equal={} handoff={} refs-to-import={} reflog-to-carry={} reflog-objects-to-carry={} prunable-worktrees={} bytes={}",
+        "shape={} head={} tracked={} present={} to-place={} to-beside={} beside-present={} dirs-present={} dirs-to-place={} dirs-beside={} to-write-source={} to-write-derived={} derived={} rebuildable-dropped={} rebuildable-dropped-live-equal={} handoff={} refs-to-import={} reflog-to-carry={} objects-to-carry={} prunable-worktrees={} bytes={}",
         proof.shape.word(),
         if proof.head.is_empty() { "-" } else { &proof.head },
         proof.tracked,
@@ -114,7 +114,7 @@ fn proof_words(proof: &subset::Proof) -> String {
         proof.handoff,
         proof.refs.len(),
         proof.reflogs.len(),
-        proof.reflogs_absent,
+        proof.objects_absent,
         proof.prunable,
         proof.bytes,
     )

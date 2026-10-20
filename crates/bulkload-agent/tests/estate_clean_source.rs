@@ -1142,7 +1142,7 @@ fn r5_reflog_only_commits_are_carried_never_dropped() {
         for held in [
             "verdict=retirable".to_owned(),
             "reflog-to-carry=1".to_owned(),
-            format!("reflog-objects-to-carry={objects}"),
+            format!("objects-to-carry={objects}"),
         ] {
             assert!(
                 line.split_whitespace().any(|w| w == held),
@@ -1342,5 +1342,50 @@ fn c13_placements_are_listed_and_taken_back() {
     assert!(
         world.closure().stdout.contains("files-undone"),
         "the item still closes"
+    );
+}
+
+/// R7 (full history): a standalone tree's remote-tracking ref whose commit
+/// only it holds is never dropped: it goes in under the namespace
+/// (`refs/<ns>/remotes/...`), its objects carried from the tree, and the
+/// tree is then retired.
+#[test]
+fn r7_a_remote_tracking_ref_only_the_tree_holds_is_carried() {
+    let world = World::new();
+    world.capture();
+    let ran = world.apply(&FLAGS);
+    assert_eq!(receipt(&ran.stdout).0, "workspace-refs-in");
+    world.land_beside_standalone();
+    let beside = world.beside();
+    git(
+        &beside,
+        &["commit", "--quiet", "--allow-empty", "-m", "upstream only"],
+    );
+    let only = git(&beside, &["rev-parse", "HEAD"]).trim().to_owned();
+    git(
+        &beside,
+        &["update-ref", "refs/remotes/upstream/topic", &only],
+    );
+    git(&beside, &["reset", "--quiet", "--hard", "HEAD~1"]);
+    let state = world.path("retire-state");
+    let report = retire(&[], &state, &[beside.as_path()]);
+    let line = line_of(&report.stdout, &beside).to_owned();
+    for held in [
+        "verdict=retirable",
+        "refs-to-import=1",
+        "reflog-to-carry=0",
+        "objects-to-carry=1",
+    ] {
+        assert!(line.split_whitespace().any(|w| w == held), "{held}: {line}");
+    }
+    let done = retire(&["--delete"], &state, &[beside.as_path()]);
+    assert!(
+        line_of(&done.stdout, &beside).contains("outcome=retired"),
+        "{}",
+        done.stdout
+    );
+    assert_eq!(
+        named_refs(&world.sting()).get("refs/neo-20261016/remotes/upstream/topic"),
+        Some(&only)
     );
 }
