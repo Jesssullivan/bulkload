@@ -303,29 +303,22 @@ impl<'a> Site<'a> {
             && std::fs::read_link(path).is_ok_and(|now| now == text)
     }
 
-    /// Move the regular file under the temporary name aside, never
-    /// replacing anything, as `.<name>.<token>.kept-<inode>.bulkload-reseat`
-    /// (an inode names one file while it exists, and a kept copy is never
-    /// removed by a pass). `None` when the temporary holds no regular file.
-    fn keep(&self) -> Result<Option<PathBuf>> {
-        let Some(meta) = lstat(&self.temp)? else {
-            return Ok(None);
-        };
-        if !meta.is_file() {
-            return Ok(None);
-        }
-        let ino = std::os::unix::fs::MetadataExt::ino(&meta);
-        let token = self.ledger.temp_token();
-        let tag = if token.is_empty() {
-            format!("kept-{ino}")
-        } else {
-            format!("{token}.kept-{ino}")
-        };
-        let kept_os = temp_name(&self.file_name, &tag);
-        crate::io::publish_noreplace(&self.directory, &self.temp_c, &c_name(&kept_os)?)
-            .map_err(|error| crate::refuse::io_in(&error, self.link, "reseat::regularize::keep"))?;
-        self.seal()?;
-        Ok(Some(self.link.with_file_name(kept_os)))
+    /// The regular file under the temporary name, a copy of the archive
+    /// target `live` (plus what a writer appended to it): unioned into
+    /// `live` and removed (SPEC #298 rules 3 and 4, [`super::fold`]); only
+    /// where the union refuses, moved to its kept name,
+    /// `.<name>.<token>.kept-<inode>.bulkload-reseat`, never replacing
+    /// anything, and every later pass unions it again. `None` when nothing
+    /// is kept.
+    fn keep(&self, live: &Path) -> Result<Option<PathBuf>> {
+        super::fold::fold_or_keep(
+            self.ledger,
+            &self.directory,
+            &self.temp,
+            &self.file_name,
+            super::fold::live_of(live).as_deref(),
+            &super::fold::rel_of(self.link),
+        )
     }
 
     /// The staged copy under the temporary name: removed when it is
@@ -339,7 +332,7 @@ impl<'a> Site<'a> {
             self.seal()?;
             return Ok(None);
         }
-        self.keep()
+        self.keep(&row.resolved)
     }
 
     /// Copy the target into the temporary: its bytes, mode and mtime,
@@ -350,8 +343,8 @@ impl<'a> Site<'a> {
         let meta = target.metadata().refuse_at("reseat::regularize::target")?;
         let source = Identity::of(&meta);
         if lstat(&self.temp)?.is_some_and(|meta| meta.is_file()) {
-            // Left by an interrupted pass: kept aside, never removed.
-            self.keep()?;
+            // Left by an interrupted pass: unioned into the target, or kept.
+            self.keep(resolved)?;
         }
         let mut copy = OpenOptions::new()
             .write(true)
@@ -452,7 +445,7 @@ impl<'a> Site<'a> {
             self.exchange()
                 .refuse_at("reseat::regularize::exchange_back")?;
             self.seal()?;
-            let kept = self.keep()?;
+            let kept = self.keep(&row.resolved)?;
             self.forget(&row)?;
             return Ok(Outcome::raced(
                 if row.replace {
@@ -516,6 +509,14 @@ impl<'a> Site<'a> {
         if !link_meta.is_symlink() {
             return Ok(Outcome::new("not-a-link", None));
         }
+        // A copy an earlier pass kept: unioned into the target first; one
+        // the union still refuses holds this link (nothing written).
+        if let Some(held) = super::fold::fold_kept(self.ledger, self.link)?
+            .into_iter()
+            .next()
+        {
+            return Ok(Outcome::raced("kept-held", Some(held)));
+        }
         let text = std::fs::read_link(self.link).refuse_at("reseat::regularize::readlink")?;
         let Ok(resolved) = std::fs::canonicalize(self.link) else {
             return Ok(Outcome::new(
@@ -567,7 +568,7 @@ impl<'a> Site<'a> {
         if !staged.verified || !self.unchanged(&row) {
             // Written while it was copied or before the swap: the archive
             // and the link untouched, the copy kept aside.
-            let kept = self.keep()?;
+            let kept = self.keep(&row.resolved)?;
             return Ok(Outcome::raced("raced-skipped", kept));
         }
         self.ledger.put_regular(&row)?;
@@ -593,7 +594,7 @@ impl<'a> Site<'a> {
             self.exchange()
                 .refuse_at("reseat::regularize::exchange_back")?;
             self.seal()?;
-            let kept = self.keep()?;
+            let kept = self.keep(&row.resolved)?;
             self.ledger.delete_regular(self.link)?;
             return Ok(Outcome::raced("raced-restored", kept));
         }
@@ -634,13 +635,13 @@ impl<'a> Site<'a> {
     /// beside copy an archive replacement consumed (`restore`, #280 finding
     /// 9), put back at that name, never replacing anything (kept aside when
     /// the name is taken).
-    fn retire_copy(&self, restore: Option<&Path>) -> Result<()> {
+    fn retire_copy(&self, restore: Option<&Path>, live: &Path) -> Result<()> {
         let Some(name) = restore.and_then(Path::file_name) else {
             return self.unlink_temp();
         };
         match crate::io::publish_noreplace(&self.directory, &self.temp_c, &c_name(name)?) {
             Ok(_) => Ok(()),
-            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => self.keep().map(drop),
+            Err(error) if error.raw_os_error() == Some(libc::EEXIST) => self.keep(live).map(drop),
             Err(error) => Err(crate::refuse::io_in(
                 &error,
                 self.link,
@@ -662,7 +663,7 @@ impl<'a> Site<'a> {
         // A crash inside an earlier undo: the link already back.
         if Self::is_link_to(self.link, &row.target) {
             if identity_at(&self.temp)? == Some(row.regular) {
-                self.retire_copy(restore)?;
+                self.retire_copy(restore, &row.resolved)?;
                 self.seal()?;
             }
             row.state = RegularState::Undone;
@@ -699,7 +700,7 @@ impl<'a> Site<'a> {
             .refuse_at("reseat::regularize::undo_exchange")?;
         fault_point!(ReseatAfterUndoExchange);
         if identity_at(&self.temp)? == Some(row.regular) {
-            self.retire_copy(restore)?;
+            self.retire_copy(restore, &row.resolved)?;
             self.seal()?;
             row.state = RegularState::Undone;
             self.ledger.put_regular(&row)?;

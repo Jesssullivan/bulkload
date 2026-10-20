@@ -512,13 +512,13 @@ fn a106_a_target_written_under_the_swap_is_put_back() {
 /// Merge-gate review of #280 (2026-10-19, a probe with this hook): a
 /// destination writer appends through the live name while the landed copy
 /// stands there, and the archive target is written in the same window, so
-/// the swap is put back. The copy then holds the writer's line, the only
-/// copy of it: it is never removed, and under SPEC #298 (ratified
-/// 2026-10-20) nothing is set aside beside the live name either. It is held
-/// typed, `held-written`, under its private held name; the next pass is held
-/// the same way with nothing written; `reseat_kept_aside` stays 0.
+/// the swap is put back. The copy then holds the writer's line. Under SPEC
+/// #298 (rules 3 and 4) it is no second copy: it is unioned into the live
+/// file (the archive target), ledgered, and removed once the merged bytes
+/// are durable. Nothing stays beside the live name, and
+/// `reseat_kept_aside` stays 0.
 #[test]
-fn a106_a_copy_written_through_the_live_name_is_held_typed_never_set_aside() {
+fn a106_a_copy_written_through_the_live_name_is_unioned_into_the_live_file() {
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -546,7 +546,7 @@ fn a106_a_copy_written_through_the_live_name_is_held_typed_never_set_aside() {
     let options = world.replacing();
     let (summary, lines, _) = run(&options);
     set_replace_hook(None);
-    assert_eq!(summary.files_of("claude", "held-written"), 1, "{lines:?}");
+    assert_eq!(summary.files_of("claude", "held-written"), 0, "{lines:?}");
     assert_eq!(
         summary.files_of("claude", "replaced-archived"),
         0,
@@ -555,47 +555,40 @@ fn a106_a_copy_written_through_the_live_name_is_held_typed_never_set_aside() {
     let dest = world.dest_transcript(SID);
     assert_eq!(fs::read_link(&dest).unwrap(), target, "the link is back");
     let dir = dest.parent().unwrap();
-    let names = |dir: &Path| -> Vec<String> {
-        let mut names: Vec<String> = fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
-    };
-    let listed = names(dir);
-    let held: Vec<&String> = listed
-        .iter()
-        .filter(|name| name.ends_with(".bulkload-held"))
+    let listed: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with('.'))
         .collect();
-    assert_eq!(held.len(), 1, "{listed:?}");
     assert!(
-        !listed
-            .iter()
-            .any(|name| name.ends_with(".bulkload-kept") || name.ends_with(".bulkload-reseat")),
-        "nothing set aside beside the live name: {listed:?}"
+        listed.is_empty(),
+        "no copy beside the live name: {listed:?}"
     );
     let mut want = neo;
     want.extend_from_slice(b"{\"sting\":\"next turn\"}\n");
-    assert_eq!(
-        fs::read(dir.join(held[0])).unwrap(),
-        want,
-        "the writer's line survives in the held copy"
+    let unioned = fs::read(&target).unwrap();
+    assert!(
+        unioned.starts_with(&want),
+        "the copy's bytes, the writer's line among them, first"
     );
-    assert!(fs::read(&target).unwrap().ends_with(b"{\"live\":1}\n"));
+    assert!(
+        unioned.ends_with(b"{\"live\":1}\n"),
+        "the archive's own line kept"
+    );
     let ledger = Ledger::open_read_only(&options.state).unwrap().unwrap();
     assert!(ledger.regular(&dest).unwrap().is_none());
     drop(ledger);
-    // The next pass: held again, nothing written.
-    let target_bytes = fs::read(&target).unwrap();
-    let (again, lines, _) = run(&options);
-    assert_eq!(again.files_of("claude", "held-written"), 1, "{lines:?}");
-    assert_eq!(names(dir), listed, "nothing new beside the live name");
-    assert_eq!(fs::read(&target).unwrap(), target_bytes);
+    let conn = rusqlite::Connection::open(options.state.join("consolidate.sqlite")).unwrap();
+    let unions: i64 = conn
+        .query_row("SELECT count(*) FROM append_log_union", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(unions, 1, "the union ledgered");
+    let counted = crate::counters::Counters::snapshot().since(before);
+    assert_eq!(counted.get(crate::counters::Counter::ReseatCopyFolded), 1);
     assert_eq!(
-        crate::counters::Counters::snapshot()
-            .since(before)
-            .get(crate::counters::Counter::ReseatKeptAside),
+        counted.get(crate::counters::Counter::ReseatKeptAside),
         0,
         "nothing is ever kept aside"
     );

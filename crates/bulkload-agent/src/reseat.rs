@@ -63,6 +63,7 @@ use crate::{BulkloadRefusal, Result};
 pub mod check;
 mod claude;
 mod codex;
+pub mod fold;
 pub mod json;
 pub mod key;
 pub mod keymap;

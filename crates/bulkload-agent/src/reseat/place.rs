@@ -79,8 +79,6 @@ const CHUNK: usize = 1024 * 1024;
 const LINE_LIMIT: usize = 512 * 1024 * 1024;
 /// The temporary's suffix; nothing else names a file this way.
 const TEMP_SUFFIX: &str = ".bulkload-reseat";
-/// A written A-106 copy held for review ([`held_name`]).
-const HELD_SUFFIX: &str = ".bulkload-held";
 
 /// What one placement did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,14 +121,12 @@ pub enum Outcome {
     Raced,
     /// A `.jsonl` with no complete line yet: nothing placed.
     Held,
-    /// A-106: the swap put the destination's link back (its archive target
-    /// was written in the window), and the copy that stood at the live name
-    /// had been written since it was staged (a destination writer appended
-    /// through the live name): that copy may hold the writer's bytes, so it
-    /// is never removed, and nothing is set aside or written beside the live
-    /// name (SPEC #298, ratified 2026-10-20). It stays under its private
-    /// held name ([`held_name`]), typed and listed, and every later pass at
-    /// this destination is held the same way until it is resolved.
+    /// A copy of this transcript a race left (an A-106 swap-back's copy a
+    /// destination writer appended to) that the union into the live file
+    /// refuses (a process holds one open, or it ends inside a line): kept
+    /// under its kept name, nothing written, and every later pass at this
+    /// destination unions it again before anything else ([`super::fold`];
+    /// SPEC #298 rules 3 and 4).
     HeldWritten,
     /// This ledger's placement of the same bytes from the landed file
     /// under an old landing root, re-bound to the new one
@@ -1080,21 +1076,6 @@ pub(super) fn c_name(name: &std::ffi::OsStr) -> Result<CString> {
     crate::io::c_name(name.as_bytes()).map_err(|_| BulkloadRefusal::PathNotPortable)
 }
 
-/// The private name a written A-106 copy is held under
-/// ([`Outcome::HeldWritten`]): `.<name>.<token>.bulkload-held`, never a
-/// temporary (no pass clears it) and never a beside name.
-#[must_use]
-pub fn held_name(name: &std::ffi::OsStr, token: &str) -> std::ffi::OsString {
-    let mut held = std::ffi::OsString::from(".");
-    held.push(name);
-    if !token.is_empty() {
-        held.push(".");
-        held.push(token);
-    }
-    held.push(HELD_SUFFIX);
-    held
-}
-
 /// The temporary beside `name`: `.<name>.<token>.bulkload-reseat`, or the
 /// shared `.<name>.bulkload-reseat` of a version 2 ledger (empty token).
 #[must_use]
@@ -1289,9 +1270,9 @@ impl Placer<'_> {
             Some(meta) if meta.is_file() => Identity::of(&meta),
             _ => return done(Outcome::LandingNotRegular),
         };
-        // A written copy held here on an earlier pass: held again, nothing
-        // written, until it is resolved.
-        if lstat(&dest.with_file_name(held_name(name, self.ledger.temp_token())))?.is_some() {
+        // A copy an earlier pass kept: unioned into the live file first;
+        // one the union still refuses holds this destination.
+        if !super::fold::fold_kept(self.ledger, &dest)?.is_empty() {
             return done(Outcome::HeldWritten);
         }
         let mut row = self.ledger.placement(&dest)?;
@@ -1438,22 +1419,6 @@ impl Site<'_> {
 
     fn temp_c(&self) -> Result<CString> {
         c_name(temp_name(self.name, self.placer.ledger.temp_token()).as_os_str())
-    }
-
-    /// Hold the written temporary `temp` ([`Outcome::HeldWritten`]): it
-    /// moves, create-only, to its private held name ([`held_name`]), which no
-    /// pass clears; nothing is published beside the live name. A held name
-    /// already there is kept and the temporary stays where it is, named on
-    /// the refusal, never removed.
-    fn hold_written(&self, temp: &CString) -> Result<()> {
-        let held = c_name(&held_name(self.name, self.placer.ledger.temp_token()))?;
-        match crate::io::publish_noreplace(self.directory, temp, &held) {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Err(BulkloadRefusal::DestinationOccupied)
-            }
-            Err(error) => Err(error).refuse_at("reseat::place::hold_written"),
-        }
     }
 
     /// Remove a temporary a crashed pass left before it published (no
@@ -1871,20 +1836,32 @@ impl Site<'_> {
             // Our copy stood at the live name between the two exchanges: a
             // writer that opened the live name then appended to it. A copy
             // written since it was staged may hold the only copy of those
-            // bytes, so it is never removed: held typed under its private
-            // held name, nothing beside the live name (SPEC #298). An
+            // bytes, so it is never removed before they are unioned into the
+            // live file, the archive target (SPEC #298 rules 3 and 4). An
             // unwritten copy is the landing's bytes and is removed.
             let written = lstat(&self.temp())?
                 .is_some_and(|meta| meta.is_file() && Identity::of(&meta) != copy);
             if written {
-                self.hold_written(&temp)?;
                 crate::io::durable::seal_dir(self.directory)
                     .refuse_at("reseat::place::replace_seal")?;
+                let kept = super::fold::fold_or_keep(
+                    self.placer.ledger,
+                    self.directory,
+                    &self.temp(),
+                    self.name,
+                    Some(resolved),
+                    &super::fold::rel_of(self.dest),
+                )?;
                 undo_intent()?;
-                return Ok(Placed {
-                    outcome: Outcome::HeldWritten,
-                    scanner: None,
-                });
+                if kept.is_some() {
+                    return Ok(Placed {
+                        outcome: Outcome::HeldWritten,
+                        scanner: None,
+                    });
+                }
+                // Unioned into the archive target: the link stands, and the
+                // next pass replaces it.
+                return occupied();
             }
             self.clear_temp()?;
             crate::io::durable::seal_dir(self.directory)

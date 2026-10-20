@@ -391,6 +391,10 @@ counters! {
     // removed once an A-106 replacement placed their whole bytes at
     // `<name>`: one copy of the source's bytes (#280 finding 9).
     ReseatBesideConsumed => "reseat_beside_consumed",
+    // Re-seat copies of an append log a race left (an A-106 swap-back's
+    // written copy, a Q198 regularization's copy) unioned into the live
+    // file and removed (SPEC #298 rules 3, 4; `reseat::fold`).
+    ReseatCopyFolded => "reseat_copy_folded",
     // Copies a re-seat set aside beside a live name. Always 0: under SPEC
     // #298 (ratified 2026-10-20) nothing is kept aside; a written A-106
     // copy is held typed (`held-written`) under its private held name.
