@@ -107,3 +107,33 @@ estate_handoff` 53 passed.
   transfer's settled checks take theirs before the read, and reseat does
   not trust prints by time. A reviewer may want the transfer's own output
   rows audited the same way.
+
+## 2026-10-20: the review of #292
+
+The independent review (PR comment, at `5714805`) found, and this lane
+fixed in `46e31c8` (clippy and rustfmt in `578a6b2`):
+
+- F1: the destination trust checks compared mtime only (`prove`, the
+  hand-off `landed_sides` and `trusted`, and the hand-off re-dating), so a
+  rewrite with an old mtime (`cp -p`, `rsync -t`, `tar x`, `touch -d`)
+  inside the window was trusted. Each now needs mtime and ctime both
+  outside the window. Regression tests, the reviewer's two probes:
+  `a_linked_landing_never_vouches_for_a_seat_rewritten_with_an_old_mtime`
+  and `an_edit_with_an_old_mtime_is_never_vouched_for`.
+- F2: after a proof refused `GIT_DESTINATION_MODIFIED`, nothing recorded
+  what it had read equal, so every pass re-read every seat up to the edit.
+  The converge's proof now writes a `WorkspaceProven`
+  (`workspace.proven`, beside the ledger, bound to it by capture and
+  `recorded_ns`) holding the seats it read equal by content, or that an
+  earlier such record vouched for, dated by the proof's own instant (taken
+  before its first read); the next proof trusts those prints as it trusts
+  the ledger's. The ledger itself is not re-dated: its `recorded_ns` is the
+  hand-off's "landed" instant. A converge that writes a new ledger removes
+  the record. Test:
+  `a_refused_proof_records_what_it_proved_and_the_next_reads_only_the_rest`.
+
+On honey at `578a6b2`: clippy `-D warnings` and fmt clean; the new and
+C03 tests 7 of 7 (at `46e31c8`); `--lib -- git_carry::converge:: estate::
+git_carry::beside` 164; `--test estate_adopt` 40, `--test estate_handoff`
+53, `--test estate_converge` 23, `--test estate_move` 1; `--features
+fault-injection --test fault_harness -- estate` 71, all passed.
