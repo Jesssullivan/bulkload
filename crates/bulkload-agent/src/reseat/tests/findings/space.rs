@@ -270,23 +270,34 @@ fn a_regularization_keeps_the_placements_bytes_reserved_then_retries() {
     let dest = world.dest_transcript(SID);
     fs::create_dir_all(dest.parent().unwrap()).unwrap();
     let target = world.base.join("archive.jsonl");
+    let archived = (bytes.len() - line.len()) as u64;
     fs::write(&target, &bytes[..bytes.len() - line.len()]).unwrap();
     std::os::unix::fs::symlink(&target, &dest).unwrap();
     assert!(bytes.len() - head > 32 * 1024 * 1024);
     let options = world.options();
     let root = fs::canonicalize(&options.dest_claude).unwrap();
-    // The link alone fits (floor 0); counted beside the placements'
-    // reservation it does not. The reservation is twice the free space
-    // probed, so the answer does not depend on what other writers free on a
-    // shared filesystem between this probe and the check (it reserved all
-    // but half the link's size before, and failed on honey's busy root
-    // filesystem, 2026-10-19).
+    // Reserve all but half the link's size: the reservation alone fits, the
+    // link beside it does not. The free space is probed here and again by
+    // the regularization, and on a shared file system it moves between the
+    // two: with the link at its real ~74 MB, a gain of half that (~37 MB)
+    // made it fit (a loaded build host's moved by 1.5 GB in 10 s). So for
+    // this pass the target is extended with a hole to an apparent 64 GiB
+    // (no blocks, and nothing reads it before the space check refuses),
+    // bounded by the free space so the reservation still decides on a small
+    // disk: the margin either way is half of that, not ~37 MB. It is cut
+    // back to its bytes before the pass with room.
     let limits = crate::space::probe_limits(&root).unwrap();
     let free = limits.quota.map_or(limits.filesystem.available, |quota| {
         quota.available.min(limits.filesystem.available)
     });
-    assert!(free > bytes.len() as u64, "the link alone fits");
-    let reserved_bytes = free.saturating_mul(2);
+    let apparent = (64_u64 << 30).min(free).max(archived);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_len(apparent)
+        .unwrap();
+    let reserved_bytes = free.saturating_sub(apparent / 2);
     let reserved = [(root.as_path(), reserved_bytes)];
     {
         let ledger = ledger::Ledger::open(&options.state, options.now_ns, "test").unwrap();
@@ -314,6 +325,12 @@ fn a_regularization_keeps_the_placements_bytes_reserved_then_retries() {
         );
     }
     assert!(fs::symlink_metadata(&dest).unwrap().is_symlink());
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .unwrap()
+        .set_len(archived)
+        .unwrap();
     // A pass with room: regularized, then extended by the last line.
     let (summary, lines, _) = run(&options);
     assert!(fs::symlink_metadata(&dest).unwrap().is_file(), "{lines:?}");
