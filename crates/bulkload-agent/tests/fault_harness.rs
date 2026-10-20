@@ -1558,6 +1558,26 @@ scenarios! {
     estate_advance_after_seat_rerun_without_flag => EstateAdvanceAfterSeat: 1, EstateAdvance::RetireNoFlag;
     estate_advance_retire_after_rename_rerun_without_flag => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireNoFlag;
     estate_advance_after_branch_then_edited => EstateAdvanceAfterBranch: 1, EstateAdvance::AdvanceEdited;
+    // Review of #289, finding 1: a seat the advance replaces edited after
+    // its crash rolls it back, never HEAD advanced over the old index (the
+    // rollback itself crashed after its intent and mid-seat, then
+    // finished). Operator ruling 2026-10-19, "Switch when clean": a switch
+    // crashed at each step, between its branch's creation and HEAD's move
+    // too. Findings 2 and 3: a retirement finished before the workspace
+    // step, and never over a write made since its proof.
+    estate_advance_after_branch_rolled_back => EstateAdvanceAfterBranch: 1, EstateAdvance::AdvanceRolledBack;
+    estate_advance_after_seat_rolled_back => EstateAdvanceAfterSeat: 2, EstateAdvance::AdvanceRolledBack;
+    estate_advance_rollback_after_intent => EstateAdvanceRollbackAfterIntent: 1, EstateAdvance::RollbackCrash;
+    estate_advance_rollback_mid => EstateAdvanceRollbackMid: 2, EstateAdvance::RollbackCrash;
+    estate_advance_switch_after_intent => EstateAdvanceAfterIntent: 1, EstateAdvance::Switch;
+    estate_advance_switch_head_branch => EstateConvergeHeadBranch: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_branch => EstateAdvanceAfterBranch: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_seat => EstateAdvanceAfterSeat: 3, EstateAdvance::Switch;
+    estate_advance_switch_after_index => EstateAdvanceAfterIndex: 1, EstateAdvance::Switch;
+    estate_advance_switch_after_ledger => EstateAdvanceAfterLedger: 1, EstateAdvance::Switch;
+    estate_advance_retire_after_rename_live_edited => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireLiveEdited;
+    estate_advance_retire_after_rename_written => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireWritten;
+    estate_advance_retire_mid_written => EstateAdvanceRetireMid: 1, EstateAdvance::RetireWritten;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

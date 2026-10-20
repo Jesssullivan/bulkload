@@ -185,8 +185,9 @@ pub enum BulkloadRefusal {
     /// clean. Its index or a tracked file differs from its HEAD (a staged
     /// or unstaged change), an operation is in progress (merge, rebase,
     /// cherry-pick, revert, bisect), an index entry is marked
-    /// assume-unchanged or skip-worktree, or a seat the advance would
-    /// replace does not hold its HEAD's bytes. Untracked files are judged
+    /// assume-unchanged or skip-worktree, a Git lock is held (`index.lock`,
+    /// `HEAD.lock`: a Git command writing the index or HEAD), or a seat the
+    /// advance would replace does not hold its HEAD's bytes. Untracked files are judged
     /// by `GIT_ADVANCE_UNTRACKED_COLLIDES`. Nothing is written; the capture
     /// lands beside it instead, as without the flag.
     GitAdvanceNotClean,
@@ -194,10 +195,11 @@ pub enum BulkloadRefusal {
     /// (or equal to) the captured HEAD, or it is unborn. Nothing is
     /// written; the capture lands beside it.
     GitAdvanceNotAncestor,
-    /// `--advance-ancestor`: the live checkout's branch is not the captured
-    /// one (one detached and the other on a branch, or two branch names).
-    /// Detaching or switching the live checkout is never the answer: nothing
-    /// is written; the capture lands beside it.
+    /// `--advance-ancestor`: one of the live checkout and the capture is on
+    /// a branch and the other detached. Detaching the live checkout is never
+    /// the answer, nor is attaching it to a branch: nothing is written; the
+    /// capture lands beside it. (Two different branch names switch when
+    /// clean, `GIT_SWITCH_*`: operator ruling 2026-10-19.)
     GitAdvanceBranchMismatch,
     /// `--advance-ancestor`: the live branch cannot be moved by
     /// compare-and-swap alone: another worktree has it checked out (or a
@@ -231,6 +233,67 @@ pub enum BulkloadRefusal {
     /// Carries the reason (`differs:seat=<path>`, `not-owned`, ...), raw
     /// bytes; [`fmt::Display`] prints it escaped.
     GitAdvanceBesideKept(Vec<u8>),
+    /// `--advance-ancestor` (review of #289, finding 1): after the advance
+    /// moved the live branch, a third party's edit met a seat it was
+    /// laying down (or the index changed under bulkload's own
+    /// `index.lock`): every seat it wrote is put back to the live HEAD's
+    /// bytes, the branch is put back by compare-and-swap, the lock is
+    /// released, and the edit is left as it is. Never HEAD advanced over the
+    /// old index. The capture lands beside it in the same pass. Carries the
+    /// seats left to the edit (newline-separated, at most 16, then a `+N`
+    /// line; `branch-left` or `head-left` when one was not put back), raw
+    /// bytes.
+    GitAdvanceRolledBack(Vec<u8>),
+    /// `--advance-ancestor`, a live checkout on another branch than the
+    /// capture's (operator ruling 2026-10-19, "Switch when clean"): its
+    /// index or a tracked file differs from its HEAD (a staged or unstaged
+    /// change, a dirty submodule, an assume-unchanged or skip-worktree
+    /// entry), or a seat the switch would replace does not hold its HEAD's
+    /// bytes. Nothing is written; the capture lands beside it.
+    GitSwitchNotClean,
+    /// `--advance-ancestor`, a live checkout on another branch (the
+    /// ruling's condition b): a Git operation is in progress (merge,
+    /// rebase, `am`, cherry-pick, revert, bisect) or a Git lock is held
+    /// (`index.lock`, `HEAD.lock`). Nothing is written; the capture lands
+    /// beside it.
+    GitSwitchInProgress,
+    /// `--advance-ancestor`, a live checkout on another branch (condition
+    /// c): a process has its working directory or an open file inside the
+    /// checkout (`/proc` on Linux; elsewhere it cannot be proved, so it is
+    /// refused). Nothing is written; the capture lands beside it.
+    GitSwitchInUse,
+    /// `--advance-ancestor`, a live checkout on another branch (condition
+    /// d): the capture's branch is checked out in another worktree (or held
+    /// there by a rebase or bisect), named by a pending bulkload intent, or
+    /// a symbolic ref. Nothing is written; the capture lands beside it.
+    GitSwitchBranchBusy,
+    /// `--advance-ancestor`, a live checkout on another branch: the live
+    /// repository holds the capture's branch at a commit that is not an
+    /// ancestor of (or equal to) the captured HEAD, so it cannot be
+    /// advanced by compare-and-swap. Nothing is written; the capture lands
+    /// beside it.
+    GitSwitchBranchDiverged,
+    /// `--advance-ancestor`, a live checkout on another branch (condition
+    /// e): the captured HEAD is not reachable from the live repository's
+    /// refs once the capture's objects and provenance are in. Nothing is
+    /// written to its worktree, index or refs (that additive import aside);
+    /// the capture lands beside it.
+    GitSwitchUnreachable,
+    /// `--advance-ancestor`, a live checkout on another branch (condition
+    /// f): as `GIT_ADVANCE_UNTRACKED_COLLIDES`, an untracked file collides
+    /// with a captured path. Carries the paths, raw bytes.
+    GitSwitchUntrackedCollides(Vec<u8>),
+    /// `--advance-ancestor`, a live checkout on another branch: the
+    /// checkout changed between the switch proof and its compare-and-swap.
+    /// Nothing is written to its worktree, index or refs (an additive import
+    /// aside); the capture lands beside it.
+    GitSwitchRaced,
+    /// `--advance-ancestor`, a live checkout on another branch: as
+    /// `GIT_ADVANCE_ROLLED_BACK`, a third party's edit met the switch after
+    /// HEAD moved: the seats, HEAD (back on the live branch) and the
+    /// capture's branch (deleted when the switch created it, else put back)
+    /// are restored by compare-and-swap. Carries the seats left to the edit.
+    GitSwitchRolledBack(Vec<u8>),
     /// Between the capture a checkout holds and the current one, the source
     /// changed what converge does not carry: the shallow frontier, nested
     /// repository custody, the omitted rebuildable roots or bareness.
@@ -550,6 +613,8 @@ impl BulkloadRefusal {
     ///
     /// These strings are the wire/log identity of a refusal and must not change
     /// once a milestone ships.
+    // One arm per refusal: the taxonomy is the length.
+    #[allow(clippy::too_many_lines)]
     #[must_use]
     pub const fn code(&self) -> &'static str {
         match *self {
@@ -592,6 +657,16 @@ impl BulkloadRefusal {
             Self::GitAdvanceUntrackedCollides(_) => "GIT_ADVANCE_UNTRACKED_COLLIDES",
             Self::GitAdvanceRaced => "GIT_ADVANCE_RACED",
             Self::GitAdvanceBesideKept(_) => "GIT_ADVANCE_BESIDE_KEPT",
+            Self::GitAdvanceRolledBack(_) => "GIT_ADVANCE_ROLLED_BACK",
+            Self::GitSwitchNotClean => "GIT_SWITCH_NOT_CLEAN",
+            Self::GitSwitchInProgress => "GIT_SWITCH_IN_PROGRESS",
+            Self::GitSwitchInUse => "GIT_SWITCH_IN_USE",
+            Self::GitSwitchBranchBusy => "GIT_SWITCH_BRANCH_BUSY",
+            Self::GitSwitchBranchDiverged => "GIT_SWITCH_BRANCH_DIVERGED",
+            Self::GitSwitchUnreachable => "GIT_SWITCH_UNREACHABLE",
+            Self::GitSwitchUntrackedCollides(_) => "GIT_SWITCH_UNTRACKED_COLLIDES",
+            Self::GitSwitchRaced => "GIT_SWITCH_RACED",
+            Self::GitSwitchRolledBack(_) => "GIT_SWITCH_ROLLED_BACK",
             Self::HandoffNotLanded => "HANDOFF_NOT_LANDED",
             Self::HandoffTargetUnsupported => "HANDOFF_TARGET_UNSUPPORTED",
             Self::HandoffBlockModified => "HANDOFF_BLOCK_MODIFIED",
@@ -698,6 +773,16 @@ impl BulkloadRefusal {
         "GIT_ADVANCE_UNTRACKED_COLLIDES",
         "GIT_ADVANCE_RACED",
         "GIT_ADVANCE_BESIDE_KEPT",
+        "GIT_ADVANCE_ROLLED_BACK",
+        "GIT_SWITCH_NOT_CLEAN",
+        "GIT_SWITCH_IN_PROGRESS",
+        "GIT_SWITCH_IN_USE",
+        "GIT_SWITCH_BRANCH_BUSY",
+        "GIT_SWITCH_BRANCH_DIVERGED",
+        "GIT_SWITCH_UNREACHABLE",
+        "GIT_SWITCH_UNTRACKED_COLLIDES",
+        "GIT_SWITCH_RACED",
+        "GIT_SWITCH_ROLLED_BACK",
         "HANDOFF_NOT_LANDED",
         "HANDOFF_TARGET_UNSUPPORTED",
         "HANDOFF_BLOCK_MODIFIED",
@@ -764,12 +849,14 @@ impl BulkloadRefusal {
         Self::CODES.contains(&code)
     }
 
-    /// Whether this is one of `estate-apply --advance-ancestor`'s
-    /// precondition refusals (operator ruling 2026-10-19): the live
-    /// checkout stays as it is and the capture lands beside it in the same
-    /// pass.
+    /// Whether this is one of `estate-apply --advance-ancestor`'s refusals
+    /// (operator rulings 2026-10-19, "Yes, advance those" and "Switch when
+    /// clean"): a precondition, a race, or an advance rolled back. The live
+    /// checkout is as it was (an edit that rolled it back aside) and the
+    /// capture lands beside it in the same pass; closure holds the item
+    /// pending review.
     #[must_use]
-    pub const fn is_advance_precondition(&self) -> bool {
+    pub const fn is_advance_refusal(&self) -> bool {
         matches!(
             self,
             Self::GitAdvanceNotClean
@@ -778,6 +865,16 @@ impl BulkloadRefusal {
                 | Self::GitAdvanceBranchBusy
                 | Self::GitAdvanceUntrackedCollides(_)
                 | Self::GitAdvanceRaced
+                | Self::GitAdvanceRolledBack(_)
+                | Self::GitSwitchNotClean
+                | Self::GitSwitchInProgress
+                | Self::GitSwitchInUse
+                | Self::GitSwitchBranchBusy
+                | Self::GitSwitchBranchDiverged
+                | Self::GitSwitchUnreachable
+                | Self::GitSwitchUntrackedCollides(_)
+                | Self::GitSwitchRaced
+                | Self::GitSwitchRolledBack(_)
         )
     }
 }
@@ -805,7 +902,10 @@ impl fmt::Display for BulkloadRefusal {
             | Self::SpaceExhausted(Some(ref path)) => {
                 write!(f, "{} path=\"{}\"", self.code(), path.escape_ascii())
             }
-            Self::GitAdvanceUntrackedCollides(ref paths) => {
+            Self::GitAdvanceUntrackedCollides(ref paths)
+            | Self::GitAdvanceRolledBack(ref paths)
+            | Self::GitSwitchUntrackedCollides(ref paths)
+            | Self::GitSwitchRolledBack(ref paths) => {
                 write!(f, "{} paths=\"{}\"", self.code(), paths.escape_ascii())
             }
             Self::GitAdvanceBesideKept(ref reason) => {
@@ -992,6 +1092,16 @@ mod tests {
             BulkloadRefusal::GitAdvanceUntrackedCollides(Vec::new()),
             BulkloadRefusal::GitAdvanceRaced,
             BulkloadRefusal::GitAdvanceBesideKept(Vec::new()),
+            BulkloadRefusal::GitAdvanceRolledBack(Vec::new()),
+            BulkloadRefusal::GitSwitchNotClean,
+            BulkloadRefusal::GitSwitchInProgress,
+            BulkloadRefusal::GitSwitchInUse,
+            BulkloadRefusal::GitSwitchBranchBusy,
+            BulkloadRefusal::GitSwitchBranchDiverged,
+            BulkloadRefusal::GitSwitchUnreachable,
+            BulkloadRefusal::GitSwitchUntrackedCollides(Vec::new()),
+            BulkloadRefusal::GitSwitchRaced,
+            BulkloadRefusal::GitSwitchRolledBack(Vec::new()),
             BulkloadRefusal::HandoffNotLanded,
             BulkloadRefusal::HandoffTargetUnsupported,
             BulkloadRefusal::HandoffBlockModified,

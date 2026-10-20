@@ -2961,6 +2961,9 @@ pub(crate) mod mid_pass {
         /// Keyed by a live checkout: `--advance-ancestor` after its intent
         /// and before the branch's compare-and-swap.
         AdvanceBeforeBranch,
+        /// Keyed by a live checkout: `--advance-ancestor` after its branch
+        /// moved (recorded), before its first seat.
+        AdvanceAfterBranch,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;

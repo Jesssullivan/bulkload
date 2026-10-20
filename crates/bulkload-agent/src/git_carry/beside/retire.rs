@@ -24,35 +24,51 @@
 //!   found there and left as they were, apart from every captured path
 //!   (the live tree's own, as its ignored files are);
 //! - nothing the beside checkout's Git holds lost with it: no nested
-//!   repository under it, no worktree of its own, no lock; every commit
-//!   its refs (provenance `refs/carry*` aside), its stash and its reflogs
-//!   name reachable from the live repository's refs (a linked landing's:
-//!   its per-worktree reflogs, and no per-worktree ref); a standalone
-//!   one's every ref held by the live repository by name and value (its
-//!   own, under the beside namespace, or in the capture's provenance), no
-//!   hook of its own and no remote URL the live repository lacks.
+//!   repository under it, no worktree of its own, no lock and no
+//!   operation in progress (merge, rebase, cherry-pick, revert, bisect);
+//!   every commit its refs, its stash and its reflogs name reachable from
+//!   the live repository's refs (a linked landing's: its per-worktree
+//!   reflogs, and no per-worktree ref; its administration directory under
+//!   the live repository's `worktrees/`, its `gitdir` naming the beside
+//!   checkout); a standalone one's every ref held by the live repository
+//!   by name and value (its own, under the beside namespace, or in the
+//!   capture's provenance; a provenance `refs/carry*` ref held by name and
+//!   value or a reachable commit), no hook of its own, no remote URL, no
+//!   configuration entry (the per-machine `core.*` keys `git init` writes
+//!   aside) and no `info/exclude` pattern the live repository lacks, and
+//!   no `modules` directory (review of #289, finding 5: kept, typed,
+//!   never carried into the live configuration, which an advance never
+//!   touches).
 //!
 //! Any difference keeps the beside checkout and returns why
 //! ([`Retired::Kept`]: `differs:head`, `differs:index`,
 //! `differs:seat=<path>`, `missing:<path>`, `extra:<path>`,
-//! `unreachable`, `refs:<name>`, `hooks`, `remotes`, `nested:<path>`,
-//! `locked`, `worktrees`, `worktree-refs`, `raced`). The tree's prints
-//! are taken before the proof and again after it: a write while the proof
-//! read it (a session working there) keeps it. Nothing is written before
-//! the proof.
+//! `unreachable`, `refs:<name>`, `hooks`, `remotes`, `configuration`,
+//! `exclude`, `modules`, `in-progress`, `nested:<path>`, `locked`,
+//! `worktrees`, `worktree-refs`, `admin-foreign`, `in-use`, `raced`).
+//! The prints of the tree and of a linked landing's administration
+//! directory (its HEAD, index, refs and reflogs) are taken before the
+//! proof and again after it: a write while the proof read it (a session
+//! working there) keeps it. A process whose working directory or an open
+//! file is inside it (`/proc`, Linux; elsewhere unprovable) keeps it
+//! (`in-use`). Nothing is written before the proof.
 //!
 //! The removal is crash-safe and never loses either tree: the retirement
 //! is recorded in STATE ([`RetireIntent`]: the path, a private name beside
-//! it, the directory's identity and a digest of every entry's print), the
-//! checkout is renamed to that private name (`estate.advance.
-//! retire_after_rename`), re-proved by its prints (a write since the proof
-//! puts it back: `raced`), marked deleting, a linked landing's
-//! administration directory removed (its `gitdir` must name the beside
-//! checkout; `estate.advance.retire_mid`), the renamed tree deleted (its
-//! identity checked first), and the record removed. A rerun finishes from
-//! the record ([`settle`]): nothing moved, the record goes and the caller
-//! proves again; renamed, re-proved and finished, or put back; deleting,
-//! finished.
+//! it, the directory's identity, a digest of every entry's print and when
+//! the proof began), the checkout is renamed to that private name
+//! (`estate.advance.retire_after_rename`; no process inside it first), and
+//! before its deletion re-proved (review of #289, finding 2): its prints
+//! unchanged and no process inside, else it goes back to its path
+//! (`raced`, `in-use`); a deletion a crash or a failure cut short
+//! resumes only while no file under it changed since the proof began
+//! (its ctime), else what is left goes back (`written-since`). Then it is
+//! marked deleting (`estate.advance.retire_mid`), the renamed tree deleted
+//! (its identity checked first), a linked landing's administration
+//! directory removed (under `worktrees/`, its `gitdir` as proved), and the
+//! record removed. A rerun finishes from the record ([`settle`], before
+//! the item's workspace step): nothing moved, the record goes and the
+//! caller proves again; renamed, re-proved and finished, or put back.
 
 use crate::refuse::RefuseAt as _;
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,6 +110,10 @@ pub struct RetireIntent {
     pub prints: [u8; 32],
     /// Renamed, re-proved and under deletion.
     pub deleting: bool,
+    /// When the proof began, with a margin: a file under the tree whose
+    /// ctime is later was written since, and a deletion cut short never
+    /// resumes over it.
+    pub recorded_ns: i128,
 }
 
 impl landed::Record for RetireIntent {
@@ -189,22 +209,60 @@ fn walk(root: &Path, with_git: bool) -> Result<Vec<Entry>> {
     Ok(found)
 }
 
-// The digest of every entry's print under `root`, its `.git` included: a
-// write anywhere under it since changes it.
-fn prints(root: &Path) -> Result<[u8; 32]> {
+// The digest of every entry's print under `root`, its `.git` included,
+// and under a linked landing's administration directory `admin` (its
+// HEAD, index, refs and reflogs; review of #289, finding 4): a write
+// anywhere under either since changes it.
+fn prints(root: &Path, admin: Option<&Path>) -> Result<[u8; 32]> {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"bulkload-retire-prints-v1\0");
-    for entry in walk(root, true)? {
-        let identity = crate::freshness::StatIdentity::from_metadata(&entry.meta);
-        hasher.update(&(entry.relative.len() as u64).to_le_bytes());
-        hasher.update(&entry.relative);
-        hasher.update(&entry.meta.mode().to_le_bytes());
-        hasher.update(&identity.ino.to_le_bytes());
-        hasher.update(&identity.size.to_le_bytes());
-        hasher.update(&identity.mtime_ns.to_le_bytes());
-        hasher.update(&identity.ctime_ns.to_le_bytes());
+    hasher.update(b"bulkload-retire-prints-v2\0");
+    let admin_entries = match admin {
+        Some(admin) if lstat(admin)?.is_some_and(|meta| meta.is_dir()) => walk(admin, true)?,
+        _ => Vec::new(),
+    };
+    for (part, entries) in [
+        (b"tree".as_slice(), walk(root, true)?),
+        (b"admin", admin_entries),
+    ] {
+        hasher.update(part);
+        for entry in entries {
+            let identity = crate::freshness::StatIdentity::from_metadata(&entry.meta);
+            hasher.update(&(entry.relative.len() as u64).to_le_bytes());
+            hasher.update(&entry.relative);
+            hasher.update(&entry.meta.mode().to_le_bytes());
+            hasher.update(&identity.ino.to_le_bytes());
+            hasher.update(&identity.size.to_le_bytes());
+            hasher.update(&identity.mtime_ns.to_le_bytes());
+            hasher.update(&identity.ctime_ns.to_le_bytes());
+        }
     }
     Ok(*hasher.finalize().as_bytes())
+}
+
+// Whether a file (or link) under `root` changed since `since_ns` (its
+// ctime is later): a deletion cut short never resumes over a write made
+// since its proof. Directories are not judged: the deletion itself moves
+// their times.
+fn written_since(root: &Path, since_ns: i128) -> Result<bool> {
+    Ok(walk(root, true)?.iter().any(|entry| {
+        !entry.meta.is_dir()
+            && crate::freshness::StatIdentity::from_metadata(&entry.meta).ctime_ns > since_ns
+    }))
+}
+
+// Whether a process has its working directory or an open file under
+// `root` (review of #289, finding 2); `true` where it cannot be proved.
+fn in_use(root: &Path) -> Result<bool> {
+    Ok(crate::procs::inside(&[root])?.is_none_or(|pids| !pids.is_empty()))
+}
+
+// Now, in nanoseconds since the epoch.
+fn now_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i128::try_from(since.as_nanos()).unwrap_or(i128::MAX)
+        })
 }
 
 // A file's bytes, counted as destination verification reads.
@@ -404,6 +462,106 @@ fn remote_urls(repo: &Path) -> Result<BTreeSet<Vec<u8>>> {
         .collect())
 }
 
+// The per-machine keys `git init` writes, never a difference between two
+// copies of one repository.
+const MACHINE_KEYS: &[&[u8]] = &[
+    b"core.repositoryformatversion",
+    b"core.filemode",
+    b"core.bare",
+    b"core.logallrefupdates",
+    b"core.ignorecase",
+    b"core.precomposeunicode",
+    b"core.symlinks",
+];
+
+// `repo`'s own configuration entries (`key\nvalue`, or `key` alone).
+fn config_entries(repo: &Path) -> Result<BTreeSet<Vec<u8>>> {
+    let out = git(repo)
+        .args(["config", "--local", "-z", "--list"])
+        .output()
+        .refuse_at(SITE)?;
+    match out.status.code() {
+        Some(0) => {}
+        Some(1) => return Ok(BTreeSet::new()),
+        _ => return Err(super::super::estimate::child_failed(&out.stderr)),
+    }
+    Ok(out
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+// The patterns of an `info/exclude` file (no comment, no blank line).
+fn exclude_patterns(path: &Path) -> Result<BTreeSet<Vec<u8>>> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    Ok(bytes
+        .split(|byte| *byte == b'\n')
+        .map(<[u8]>::trim_ascii_end)
+        .filter(|line| !line.is_empty() && !line.starts_with(b"#"))
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+// Whether a Git operation is in progress, or a Git lock held, in the git
+// directory `dir`.
+fn operation_in(dir: &Path) -> Result<bool> {
+    use super::super::converge::advance::{IN_PROGRESS, LOCKS};
+    for name in IN_PROGRESS.iter().chain(LOCKS) {
+        if lstat(&dir.join(name))?.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// Why a standalone beside checkout's own Git state would be lost with it
+// (review of #289, finding 5): an operation in progress, a `modules`
+// directory, a configuration entry or an `info/exclude` pattern the live
+// repository lacks. Kept, typed, never carried into the live checkout's
+// configuration.
+fn state_differs(beside: &Path, live: &Path) -> Result<Option<&'static str>> {
+    let dir = beside.join(".git");
+    if operation_in(&dir)? {
+        return Ok(Some("in-progress"));
+    }
+    let modules = dir.join("modules");
+    if let Some(meta) = lstat(&modules)? {
+        if !meta.is_dir() || fs::read_dir(&modules).refuse_at(SITE)?.next().is_some() {
+            return Ok(Some("modules"));
+        }
+    }
+    let theirs = config_entries(live)?;
+    let machine = |entry: &[u8]| {
+        let key = entry
+            .split(|byte| *byte == b'\n')
+            .next()
+            .unwrap_or_default();
+        MACHINE_KEYS.contains(&key)
+    };
+    if config_entries(beside)?
+        .iter()
+        .any(|entry| !machine(entry) && !theirs.contains(entry))
+    {
+        return Ok(Some("configuration"));
+    }
+    let common = landed::worktree_git_dir(live)?
+        .map(|git_dir| landed::common_dir(&git_dir))
+        .transpose()?
+        .ok_or(BulkloadRefusal::GitInventoryMalformed)?;
+    if !exclude_patterns(&dir.join("info/exclude"))?
+        .is_subset(&exclude_patterns(&common.join("info/exclude"))?)
+    {
+        return Ok(Some("exclude"));
+    }
+    Ok(None)
+}
+
 // The refs (name to value) the live repository holds that a standalone
 // beside checkout's refs may stand for: its own, those under the beside
 // namespace, and the current capture's carried refs (its provenance, named
@@ -449,6 +607,9 @@ fn git_differs(
         if lstat(&admin.join("locked"))?.is_some() {
             return Ok(Some("locked".to_owned()));
         }
+        if operation_in(admin)? {
+            return Ok(Some("in-progress".to_owned()));
+        }
         let own = admin.join("refs");
         if lstat(&own)?.is_some_and(|meta| meta.is_dir()) && !walk(&own, true)?.is_empty() {
             return Ok(Some("worktree-refs".to_owned()));
@@ -470,14 +631,33 @@ fn git_differs(
         if !remote_urls(beside)?.is_subset(&urls) {
             return Ok(Some("remotes".to_owned()));
         }
+        if let Some(why) = state_differs(beside, live)? {
+            return Ok(Some(why.to_owned()));
+        }
         let names = live_names(live, source)?;
+        let all = |repo: &Path| -> Result<BTreeMap<String, String>> {
+            let listed =
+                output(git(repo).args(["for-each-ref", "--format=%(objectname) %(refname)"]))?;
+            Ok(String::from_utf8_lossy(&listed)
+                .lines()
+                .filter_map(|line| line.split_once(' '))
+                .map(|(value, name)| (name.to_owned(), value.to_owned()))
+                .collect())
+        };
+        let live_refs = all(live)?;
         let listed =
             output(git(beside).args(["for-each-ref", "--format=%(objectname) %(refname)"]))?;
         for line in String::from_utf8_lossy(&listed).lines() {
             let Some((value, name)) = line.split_once(' ') else {
                 return Ok(Some("unreachable".to_owned()));
             };
+            // Provenance: held by the live repository by name and value
+            // (the same capture's), else its commit must be reachable
+            // there (review of #289, finding 5).
             if name.starts_with("refs/carry") {
+                if live_refs.get(name).map(String::as_str) != Some(value) {
+                    commits.push(value.to_owned());
+                }
                 continue;
             }
             // The stash's entries are decided by commit below.
@@ -523,6 +703,11 @@ pub fn differs(
     (left, ns, source): (&Left, &str, &str),
 ) -> Result<Option<String>> {
     let admin = linked_admin(beside)?;
+    if let Some(admin) = &admin {
+        if !admin_owned(beside, live, admin)? {
+            return Ok(Some("admin-foreign".to_owned()));
+        }
+    }
     if head_of(beside)?.oid != head_of(live)?.oid {
         return Ok(Some("differs:head".to_owned()));
     }
@@ -564,6 +749,30 @@ pub fn differs(
         }
     }
     Ok(None)
+}
+
+// Whether `admin`, the administration directory a linked beside
+// checkout's `.git` names, is the live repository's own registration of
+// that checkout (review of #289, finding 4): directly under its common
+// directory's `worktrees/`, its `gitdir` naming `<beside>/.git`.
+fn admin_owned(beside: &Path, live: &Path, admin: &Path) -> Result<bool> {
+    let Some(common) = landed::worktree_git_dir(live)?
+        .map(|git_dir| landed::common_dir(&git_dir))
+        .transpose()?
+    else {
+        return Ok(false);
+    };
+    let worktrees = fs::canonicalize(common.join("worktrees")).refuse_at(SITE)?;
+    if admin.parent() != Some(worktrees.as_path()) {
+        return Ok(false);
+    }
+    let named = match fs::read(admin.join("gitdir")) {
+        Ok(named) => named,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(crate::refuse::io(&error, SITE)),
+    };
+    let dotgit = fs::canonicalize(beside.join(".git")).refuse_at(SITE)?;
+    Ok(fs::canonicalize(path_of(named.trim_ascii_end())).is_ok_and(|named| named == dotgit))
 }
 
 // A linked checkout's administration directory (what its `.git` file
@@ -626,17 +835,23 @@ pub fn retire(
     (item, capture): (&str, [u8; 32]),
     (left, ns, source): (&Left, &str, &str),
 ) -> Result<Retired> {
+    // When the proof began, with a margin for a filesystem's coarse
+    // timestamps: a file written after it has a later ctime.
+    let started = now_ns() - 2_000_000_000;
+    let admin = linked_admin(beside)?;
     // The prints before the proof and after it: a write while the proof
     // read the tree (a session working there) keeps it.
-    let before = prints(beside)?;
+    let before = prints(beside, admin.as_deref())?;
+    if in_use(beside)? {
+        return Ok(Retired::Kept("in-use".to_owned()));
+    }
     if let Some(why) = differs(beside, live, (left, ns, source))? {
         return Ok(Retired::Kept(why));
     }
-    if prints(beside)? != before {
+    if prints(beside, admin.as_deref())? != before {
         return Ok(Retired::Kept("raced".to_owned()));
     }
     let meta = fs::symlink_metadata(beside).refuse_at("git_carry::beside::retire")?;
-    let admin = linked_admin(beside)?;
     let admin_gitdir = match &admin {
         Some(admin) => fs::read(admin.join("gitdir"))
             .refuse_at("git_carry::beside::retire")?
@@ -664,48 +879,76 @@ pub fn retire(
         ino: meta.ino(),
         prints: before,
         deleting: false,
+        recorded_ns: started,
     };
     landed::write(record, &intent)?;
     fault_point!(EstateAdvanceRetireAfterIntent);
+    // No process inside it, again, right before it is renamed.
+    if in_use(beside)? {
+        landed::remove(record)?;
+        return Ok(Retired::Kept("in-use".to_owned()));
+    }
     rename_exclusive(beside, &temp)?;
     fault_point!(EstateAdvanceRetireAfterRename);
     finish(record, intent)
 }
 
-// From the rename on: re-prove the renamed tree by its prints (put back
-// when a write since the proof changed it), mark it deleting, remove a
-// linked landing's administration, delete the tree, remove the record.
-fn finish(record: &Path, mut intent: RetireIntent) -> Result<Retired> {
+// The renamed tree goes back to the beside path (when nothing is there
+// since), the record with it; `why` says what kept it.
+fn put_back(record: &Path, intent: &RetireIntent, why: &str) -> Result<Retired> {
     let (path, temp) = (path_of(&intent.path), path_of(&intent.temp));
-    if !intent.deleting {
-        if prints(&temp)? != intent.prints {
-            if lstat(&path)?.is_some() {
-                // Something new at the beside path since: both kept, the
-                // record names the renamed tree.
-                return Ok(Retired::Kept(format!(
-                    "raced:{}",
-                    intent.temp.escape_ascii()
-                )));
-            }
-            rename_exclusive(&temp, &path)?;
-            landed::remove(record)?;
-            return Ok(Retired::Kept("raced".to_owned()));
-        }
-        intent.deleting = true;
-        landed::write(record, &intent)?;
+    if lstat(&path)?.is_some() {
+        // Something new at the beside path since: both kept, the record
+        // names the renamed tree.
+        return Ok(Retired::Kept(format!(
+            "raced:{}",
+            intent.temp.escape_ascii()
+        )));
     }
-    if let Some(admin) = intent.admin.as_deref().map(path_of) {
-        if !remove_admin(&admin, &intent.admin_gitdir)? {
+    rename_exclusive(&temp, &path)?;
+    landed::remove(record)?;
+    Ok(Retired::Kept(why.to_owned()))
+}
+
+// From the rename on: re-proved before its deletion (review of #289,
+// finding 2: its prints, or for a deletion cut short no file written since
+// the proof; no process inside), marked deleting, the tree deleted, a
+// linked landing's administration removed, the record removed.
+fn finish(record: &Path, mut intent: RetireIntent) -> Result<Retired> {
+    let temp = path_of(&intent.temp);
+    let admin = intent.admin.as_deref().map(path_of);
+    if lstat(&temp)?.is_some() {
+        let whole = prints(&temp, admin.as_deref())? == intent.prints;
+        if !whole && (!intent.deleting || written_since(&temp, intent.recorded_ns)?) {
+            return put_back(
+                record,
+                &intent,
+                if intent.deleting {
+                    "written-since"
+                } else {
+                    "raced"
+                },
+            );
+        }
+        if in_use(&temp)? {
+            // A tree a deletion cut short stays under its private name,
+            // the record pending (closure lists it); a whole one goes back.
+            if whole {
+                return put_back(record, &intent, "in-use");
+            }
             return Ok(Retired::Kept(format!(
-                "admin-unremoved:{}",
-                admin.as_os_str().as_bytes().escape_ascii()
+                "in-use:{}",
+                intent.temp.escape_ascii()
             )));
         }
-    }
-    fault_point!(EstateAdvanceRetireMid);
-    if let Some(meta) = lstat(&temp)? {
+        if !intent.deleting {
+            intent.deleting = true;
+            landed::write(record, &intent)?;
+        }
+        fault_point!(EstateAdvanceRetireMid);
         // The renamed tree is the one proved (its directory's identity), or
         // left as it is.
+        let meta = fs::symlink_metadata(&temp).refuse_at(SITE)?;
         if meta.dev() != intent.dev || meta.ino() != intent.ino || !meta.is_dir() {
             return Ok(Retired::Kept(format!(
                 "replaced:{}",
@@ -723,6 +966,14 @@ fn finish(record: &Path, mut intent: RetireIntent) -> Result<Retired> {
         }
         if let Some(parent) = temp.parent() {
             landed::sync_dir(parent)?;
+        }
+    }
+    if let Some(admin) = &admin {
+        if !remove_admin(admin, &intent.admin_gitdir)? {
+            return Ok(Retired::Kept(format!(
+                "admin-unremoved:{}",
+                admin.as_os_str().as_bytes().escape_ascii()
+            )));
         }
     }
     landed::remove(record)?;
@@ -756,15 +1007,21 @@ fn writable(root: &Path) -> Result<()> {
     Ok(())
 }
 
-// Remove a retired linked landing's administration directory when its
-// `gitdir` still holds what it held when proved (`proved`), or is gone (a
-// removal a crash cut short: the record names the directory); `false`
-// when it names something else now, left as it is.
+// Remove a retired linked landing's administration directory when it is
+// one under a `worktrees/` directory whose `gitdir` still holds what it
+// held when proved (`proved`: the proof checked it names the beside
+// checkout, [`admin_owned`]), or is gone (a removal a crash cut short: the
+// record names the directory); `false` when it is anything else now, left
+// as it is (review of #289, finding 4).
 fn remove_admin(admin: &Path, proved: &[u8]) -> Result<bool> {
     let Some(meta) = lstat(admin)? else {
         return Ok(true);
     };
-    if !meta.is_dir() {
+    let registered = admin
+        .parent()
+        .and_then(Path::file_name)
+        .is_some_and(|name| name.as_bytes() == b"worktrees");
+    if !meta.is_dir() || !registered {
         return Ok(false);
     }
     match fs::read(admin.join("gitdir")) {

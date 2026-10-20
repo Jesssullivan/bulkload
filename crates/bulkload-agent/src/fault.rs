@@ -145,9 +145,11 @@
 //! | `estate.advance.after_seat` | one more seat written and sealed (mid-materialize) |
 //! | `estate.advance.after_index` | every seat and the captured index in place; no advance record or ledger |
 //! | `estate.advance.after_ledger` | the advance record and the workspace ledger; the intent pending, no journal |
+//! | `estate.advance.rollback_after_intent` | a third party's edit met the advance after its branch moved: the intent marked rolling back; nothing put back yet |
+//! | `estate.advance.rollback_mid` | one more seat of a rollback put back (or left to the edit) |
 //! | `estate.advance.retire_after_intent` | a beside landing proved equal to the live tree and its retirement recorded in STATE; nothing moved |
 //! | `estate.advance.retire_after_rename` | the beside landing under its private retirement name, whole |
-//! | `estate.advance.retire_mid` | the retirement re-proved and marked deleting, a linked landing's administration removed; the renamed tree not yet deleted |
+//! | `estate.advance.retire_mid` | the retirement re-proved (prints, no process inside) and marked deleting; the renamed tree and a linked landing's administration not yet removed |
 //!
 //! Agent session re-seat, in `reseat` (R0, TIN-6587). Each rerun settles
 //! what a crash left forward from the ledger and the destination's own
@@ -397,6 +399,14 @@ pub enum Point {
     /// `estate.advance.after_ledger`: the advance record and the workspace
     /// ledger written; the intent still pending, no journal.
     EstateAdvanceAfterLedger,
+    /// `estate.advance.rollback_after_intent`: a third party's edit met an
+    /// advance after its branch moved (review of #289, finding 1); the
+    /// intent marked rolling back, nothing put back yet, bulkload's
+    /// `index.lock` held.
+    EstateAdvanceRollbackAfterIntent,
+    /// `estate.advance.rollback_mid`: one more seat of a rollback put back
+    /// to the live HEAD's bytes (or left to the edit).
+    EstateAdvanceRollbackMid,
     /// `estate.advance.retire_after_intent`: a beside landing proved equal
     /// to the advanced live tree, its retirement recorded in STATE; nothing
     /// moved.
@@ -404,9 +414,9 @@ pub enum Point {
     /// `estate.advance.retire_after_rename`: the beside landing renamed to
     /// its private retirement name; its administration and bytes all there.
     EstateAdvanceRetireAfterRename,
-    /// `estate.advance.retire_mid`: the retirement re-proved and marked
-    /// deleting, a linked landing's administration removed; its renamed
-    /// tree not yet deleted.
+    /// `estate.advance.retire_mid`: the retirement re-proved (its prints,
+    /// no process inside) and marked deleting; its renamed tree and a
+    /// linked landing's administration not yet removed.
     EstateAdvanceRetireMid,
     /// `estate.carry.recorded`: `estate-carry-files` landed an item's
     /// bytes and wrote its carry record; the outcome record still says
@@ -468,7 +478,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 80] = [
+    pub const ALL: [Self; 82] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -524,6 +534,8 @@ impl Point {
         Self::EstateAdvanceAfterSeat,
         Self::EstateAdvanceAfterIndex,
         Self::EstateAdvanceAfterLedger,
+        Self::EstateAdvanceRollbackAfterIntent,
+        Self::EstateAdvanceRollbackMid,
         Self::EstateAdvanceRetireAfterIntent,
         Self::EstateAdvanceRetireAfterRename,
         Self::EstateAdvanceRetireMid,
@@ -610,6 +622,8 @@ impl Point {
             Self::EstateAdvanceAfterSeat => "estate.advance.after_seat",
             Self::EstateAdvanceAfterIndex => "estate.advance.after_index",
             Self::EstateAdvanceAfterLedger => "estate.advance.after_ledger",
+            Self::EstateAdvanceRollbackAfterIntent => "estate.advance.rollback_after_intent",
+            Self::EstateAdvanceRollbackMid => "estate.advance.rollback_mid",
             Self::EstateAdvanceRetireAfterIntent => "estate.advance.retire_after_intent",
             Self::EstateAdvanceRetireAfterRename => "estate.advance.retire_after_rename",
             Self::EstateAdvanceRetireMid => "estate.advance.retire_mid",

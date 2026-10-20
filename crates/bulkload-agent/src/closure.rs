@@ -1130,13 +1130,15 @@ impl Report {
                 }
                 let _ = write!(
                     out,
-                    ",\"advance\":{{\"outcome\":{},\"detail\":{},\"beside\":{},\"reason\":{},\"kept\":{},\"file_besides\":{}}}",
+                    ",\"advance\":{{\"outcome\":{},\"detail\":{},\"beside\":{},\"reason\":{},\"kept\":{},\"file_besides\":{},\"switched\":{},\"retire_pending\":{}}}",
                     json_string(&advance.outcome),
                     json_string(&advance.detail),
                     json_string(&advance.beside),
                     json_string(&advance.reason),
                     advance.kept,
                     advance.besides,
+                    advance.switched,
+                    advance.retiring,
                 );
             }
             // Gap C12: a refused row names the refs its item's refs-in

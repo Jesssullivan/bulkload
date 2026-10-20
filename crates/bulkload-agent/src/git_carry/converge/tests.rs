@@ -1061,10 +1061,68 @@ fn a_rekey_never_takes_a_tree_from_an_item_of_the_same_plan() {
 
 // ---- `--advance-ancestor` (operator ruling 2026-10-19) ---------------------
 
+// Git in `repo`, its success and stderr (a command that may refuse).
+fn git_try(repo: &Path, args: &[&str]) -> (bool, String) {
+    let out = std::process::Command::new("git")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args([
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@localhost",
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-C",
+        ])
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+// Move `branch` of `repo` to a new empty commit on top of it without
+// touching the index (no lock an advance holds stops it).
+fn commit_beside_the_index(repo: &Path, branch: &str, message: &str) -> String {
+    let tree = git_run(repo, &["rev-parse", &format!("{branch}^{{tree}}")]);
+    let parent = git_run(repo, &["rev-parse", branch]);
+    let commit = git_run(repo, &["commit-tree", &tree, "-p", &parent, "-m", message]);
+    git_run(
+        repo,
+        &[
+            "update-ref",
+            &format!("refs/heads/{branch}"),
+            &commit,
+            &parent,
+        ],
+    );
+    commit
+}
+
 // A source on `main` two commits ahead of a `cp -a` copy of itself at the
 // first (the live checkout, clean, an ancestor), with a dirty edit; its
 // capture, staged.
 fn advance_world() -> (
+    tempfile::TempDir,
+    PathBuf,
+    PathBuf,
+    super::super::StagedBundle,
+) {
+    world_of(false)
+}
+
+// `advance_world`, the source's two commits on `feature` when `switch`
+// (operator ruling 2026-10-19, "Switch when clean"): the live checkout
+// stays on `main`.
+fn world_of(
+    switch: bool,
+) -> (
     tempfile::TempDir,
     PathBuf,
     PathBuf,
@@ -1086,6 +1144,9 @@ fn advance_world() -> (
         .status()
         .unwrap();
     assert!(copied.success());
+    if switch {
+        git_run(&source, &["switch", "--quiet", "-c", "feature"]);
+    }
     fs::write(source.join("f"), b"two\n").unwrap();
     git_run(&source, &["commit", "--quiet", "-am", "two"]);
     fs::write(source.join("g"), b"new\n").unwrap();
@@ -1127,10 +1188,12 @@ fn advance_at(staged: &super::super::StagedBundle, dest: &Path) -> Result<Applie
 
 /// The live branch moved between the advance proof and its
 /// compare-and-swap: before the lock (the proof re-checked under it), or
-/// after the intent (the compare-and-swap itself loses). Either refuses
-/// `GIT_ADVANCE_RACED` with nothing written: the branch holds the commit
-/// the operator made, the worktree and the index are as they were, no
-/// intent, record or ledger is left.
+/// after the intent (the compare-and-swap itself loses; a `git commit`
+/// there cannot run, bulkload holding the index lock, so the branch moves
+/// by `update-ref`). Either refuses `GIT_ADVANCE_RACED` with nothing
+/// written: the branch holds the commit the operator made, the worktree
+/// and the index are as they were, no intent, record, ledger or lock is
+/// left.
 #[test]
 fn an_advance_whose_branch_moved_refuses_raced_with_nothing_written() {
     for stage in [
@@ -1140,10 +1203,14 @@ fn an_advance_whose_branch_moved_refuses_raced_with_nothing_written() {
         let (_dir, _source, dest, staged) = advance_world();
         let at = dest.clone();
         super::super::mid_pass::arm_at(&dest, stage, move || {
-            git_run(
-                &at,
-                &["commit", "--quiet", "--allow-empty", "-m", "sting's own"],
-            );
+            if stage == super::super::mid_pass::Stage::AdvanceBeforeLock {
+                git_run(
+                    &at,
+                    &["commit", "--quiet", "--allow-empty", "-m", "sting's own"],
+                );
+            } else {
+                commit_beside_the_index(&at, "main", "sting's own");
+            }
         });
         assert_eq!(
             advance_at(&staged, &dest),
@@ -1159,6 +1226,7 @@ fn an_advance_whose_branch_moved_refuses_raced_with_nothing_written() {
         assert_eq!(fs::read(dest.join("f")).unwrap(), b"one\n", "{stage:?}");
         assert!(!dest.join("g").exists(), "{stage:?}");
         assert_eq!(git_run(&dest, &["status", "--porcelain"]), "", "{stage:?}");
+        assert!(!dest.join(".git/index.lock").exists(), "{stage:?}");
         let records = landed::ledger_dir(&dest.join(".git"), "neo");
         for record in [
             advance::INTENT,
@@ -1222,7 +1290,10 @@ fn an_advance_whose_head_switched_puts_the_branch_back() {
         &dest,
         super::super::mid_pass::Stage::AdvanceBeforeBranch,
         move || {
-            git_run(&at, &["switch", "--quiet", "-c", "other"]);
+            // `git switch` cannot run (bulkload holds the index lock);
+            // HEAD moves by `symbolic-ref`.
+            git_run(&at, &["branch", "other"]);
+            git_run(&at, &["symbolic-ref", "HEAD", "refs/heads/other"]);
         },
     );
     assert_eq!(
@@ -1239,4 +1310,313 @@ fn an_advance_whose_head_switched_puts_the_branch_back() {
     let records = landed::ledger_dir(&dest.join(".git"), "neo");
     assert!(!records.join(advance::INTENT).exists());
     assert!(!records.join(landed::WORKSPACE_LANDED).exists());
+}
+
+// Nothing of an advance or a switch at `dest`: HEAD on `branch` at `head`,
+// `f` and the index as they were, no `g`, no lock, intent or ledger.
+fn untouched(dest: &Path, (branch, head): (&str, &str), what: &str) {
+    assert_eq!(git_run(dest, &["rev-parse", "HEAD"]), head, "{what}");
+    assert_eq!(git_run(dest, &["symbolic-ref", "HEAD"]), branch, "{what}");
+    assert_eq!(
+        git_run(dest, &["diff", "--cached", "--name-only"]),
+        "",
+        "{what}"
+    );
+    assert!(!dest.join("g").exists(), "{what}");
+    assert!(
+        !dest.join(".git/index.lock").exists() || what.contains("lock"),
+        "{what}"
+    );
+    let records = landed::ledger_dir(&dest.join(".git"), "neo");
+    for record in [advance::INTENT, advance::ADVANCED, landed::WORKSPACE_LANDED] {
+        assert!(!records.join(record).exists(), "{what}: {record}");
+    }
+}
+
+/// Review of #289, finding 1: a Git lock held at the live checkout (an
+/// `index.lock` or `HEAD.lock` another command holds) is an operation in
+/// progress: `GIT_ADVANCE_NOT_CLEAN`, nothing moved, the lock as it was.
+/// One taken between the proof and the destination lock refuses
+/// `GIT_ADVANCE_RACED`, nothing moved either.
+#[test]
+fn a_held_git_lock_refuses_the_advance_with_nothing_moved() {
+    for lock in ["index.lock", "HEAD.lock"] {
+        let (_dir, _source, dest, staged) = advance_world();
+        let head = git_run(&dest, &["rev-parse", "HEAD"]);
+        fs::write(dest.join(".git").join(lock), b"another command's lock").unwrap();
+        assert_eq!(
+            advance_at(&staged, &dest),
+            Err(BulkloadRefusal::GitAdvanceNotClean),
+            "{lock}"
+        );
+        assert_eq!(
+            fs::read(dest.join(".git").join(lock)).unwrap(),
+            b"another command's lock"
+        );
+        fs::remove_file(dest.join(".git").join(lock)).unwrap();
+        untouched(&dest, ("refs/heads/main", &head), lock);
+        assert_eq!(fs::read(dest.join("f")).unwrap(), b"one\n");
+    }
+    let (_dir, _source, dest, staged) = advance_world();
+    let head = git_run(&dest, &["rev-parse", "HEAD"]);
+    let at = dest.clone();
+    super::super::mid_pass::arm_at(
+        &dest,
+        super::super::mid_pass::Stage::AdvanceBeforeLock,
+        move || fs::write(at.join(".git/index.lock"), b"taken since the proof").unwrap(),
+    );
+    assert_eq!(
+        advance_at(&staged, &dest),
+        Err(BulkloadRefusal::GitAdvanceRaced)
+    );
+    assert_eq!(
+        fs::read(dest.join(".git/index.lock")).unwrap(),
+        b"taken since the proof"
+    );
+    fs::remove_file(dest.join(".git/index.lock")).unwrap();
+    untouched(&dest, ("refs/heads/main", &head), "taken since the proof");
+}
+
+/// Review of #289, finding 1: bulkload holds the live checkout's own
+/// `index.lock` from its proof under the destination lock to the index
+/// publish, so a live `git commit -a` cannot interleave (it refuses), and
+/// the advance lands whole.
+#[test]
+fn a_commit_cannot_interleave_with_an_advance() {
+    let (_dir, source, dest, staged) = advance_world();
+    let at = dest.clone();
+    let refused = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let seen = std::sync::Arc::clone(&refused);
+    super::super::mid_pass::arm_at(
+        &dest,
+        super::super::mid_pass::Stage::AdvanceAfterBranch,
+        move || {
+            *seen.lock().unwrap() =
+                Some(git_try(&at, &["commit", "-a", "--allow-empty", "-m", "x"]));
+        },
+    );
+    let applied = advance_at(&staged, &dest).unwrap();
+    assert!(applied.advanced);
+    let (ran, stderr) = refused.lock().unwrap().take().unwrap();
+    assert!(!ran && stderr.contains("index.lock"), "{stderr}");
+    assert_eq!(
+        git_run(&dest, &["rev-parse", "HEAD"]),
+        git_run(&source, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(fs::read(dest.join("g")).unwrap(), b"new\n");
+    assert!(!dest.join(".git/index.lock").exists());
+}
+
+/// Review of #289, finding 1: a third party's edit met after the branch
+/// moved (here an untracked `g` where the advance adds one, after `f` was
+/// replaced) rolls the advance back: `f` back to the live HEAD's bytes,
+/// the branch back by compare-and-swap, the lock released, the edit left
+/// as it is, `GIT_ADVANCE_ROLLED_BACK` naming it. Never HEAD advanced over
+/// the old index.
+#[test]
+fn an_edit_met_after_the_branch_moved_rolls_the_advance_back() {
+    let (_dir, _source, dest, staged) = advance_world();
+    let head = git_run(&dest, &["rev-parse", "HEAD"]);
+    let at = dest.clone();
+    super::super::mid_pass::arm_at(
+        &dest,
+        super::super::mid_pass::Stage::AdvanceAfterBranch,
+        move || fs::write(at.join("g"), b"the operator's g\n").unwrap(),
+    );
+    assert_eq!(
+        advance_at(&staged, &dest),
+        Err(BulkloadRefusal::GitAdvanceRolledBack(b"g".to_vec()))
+    );
+    assert_eq!(git_run(&dest, &["rev-parse", "HEAD"]), head);
+    assert_eq!(git_run(&dest, &["rev-parse", "main"]), head);
+    assert_eq!(git_run(&dest, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(fs::read(dest.join("f")).unwrap(), b"one\n");
+    assert_eq!(fs::read(dest.join("g")).unwrap(), b"the operator's g\n");
+    assert_eq!(
+        git_run(&dest, &["status", "--porcelain"]),
+        "?? g",
+        "the index is the live HEAD's"
+    );
+    assert!(!dest.join(".git/index.lock").exists());
+    let records = landed::ledger_dir(&dest.join(".git"), "neo");
+    for record in [advance::INTENT, advance::ADVANCED, landed::WORKSPACE_LANDED] {
+        assert!(!records.join(record).exists(), "{record}");
+    }
+}
+
+/// Operator ruling 2026-10-19, "Switch when clean": a clean live checkout
+/// on `main`, the capture on `feature` (absent there). HEAD goes to
+/// `feature`, created create-only at the captured HEAD, with the captured
+/// seats and index; `main` stays exactly where it was.
+#[test]
+fn a_switch_lands_the_capture_on_its_branch_and_leaves_the_live_one() {
+    let (_dir, source, dest, staged) = world_of(true);
+    let main = git_run(&dest, &["rev-parse", "main"]);
+    let applied = advance_at(&staged, &dest).unwrap();
+    assert!(applied.advanced);
+    let words = applied.custody.unwrap_or_default();
+    assert!(
+        words.split(' ').any(|word| word == "advance-switched=1"),
+        "{words}"
+    );
+    assert_eq!(
+        git_run(&dest, &["symbolic-ref", "HEAD"]),
+        "refs/heads/feature"
+    );
+    assert_eq!(
+        git_run(&dest, &["rev-parse", "feature"]),
+        git_run(&source, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(git_run(&dest, &["rev-parse", "main"]), main);
+    assert_eq!(fs::read(dest.join("f")).unwrap(), b"dirty\n");
+    assert_eq!(fs::read(dest.join("g")).unwrap(), b"new\n");
+    assert_eq!(
+        git_run(&dest, &["status", "--porcelain"]),
+        git_run(&source, &["status", "--porcelain"])
+    );
+    let record = advance::read_advanced(&landed::ledger_dir(&dest.join(".git"), "neo"))
+        .unwrap()
+        .unwrap();
+    assert!(record.switched());
+    assert_eq!(record.from.symbolic.as_deref(), Some("refs/heads/main"));
+    assert!(!dest.join(".git/index.lock").exists());
+}
+
+/// A switch onto a `feature` the live repository holds at an ancestor of
+/// the captured HEAD moves it by compare-and-swap; one at a commit of its
+/// own refuses `GIT_SWITCH_BRANCH_DIVERGED`, nothing written.
+#[test]
+fn a_switch_advances_an_ancestor_branch_and_refuses_a_diverged_one() {
+    let (_dir, source, dest, staged) = world_of(true);
+    git_run(&dest, &["branch", "feature"]);
+    advance_at(&staged, &dest).unwrap();
+    assert_eq!(
+        git_run(&dest, &["rev-parse", "feature"]),
+        git_run(&source, &["rev-parse", "HEAD"])
+    );
+    let (_dir, _source, dest, staged) = world_of(true);
+    let main = git_run(&dest, &["rev-parse", "main"]);
+    git_run(&dest, &["branch", "feature"]);
+    let own = commit_beside_the_index(&dest, "feature", "sting's feature");
+    assert_eq!(
+        advance_at(&staged, &dest),
+        Err(BulkloadRefusal::GitSwitchBranchDiverged)
+    );
+    assert_eq!(git_run(&dest, &["rev-parse", "feature"]), own);
+    untouched(&dest, ("refs/heads/main", &main), "diverged");
+}
+
+/// Each condition of the ruling a switch needs, refused typed
+/// (`GIT_SWITCH_*`) with nothing written: a dirty checkout, an operation in
+/// progress or a lock, a process inside it, the capture's branch checked
+/// out elsewhere, an untracked file where the capture lands one.
+#[test]
+fn a_switch_refuses_each_condition_typed_with_nothing_written() {
+    for shape in ["dirty", "merge", "lock", "busy", "collides", "in-use"] {
+        let (dir, _source, dest, staged) = world_of(true);
+        let main = git_run(&dest, &["rev-parse", "main"]);
+        let mut child = None;
+        let expected = match shape {
+            "dirty" => {
+                fs::write(dest.join("f"), b"sting's edit\n").unwrap();
+                BulkloadRefusal::GitSwitchNotClean
+            }
+            "merge" => {
+                fs::write(dest.join(".git/MERGE_HEAD"), format!("{main}\n")).unwrap();
+                BulkloadRefusal::GitSwitchInProgress
+            }
+            "lock" => {
+                fs::write(dest.join(".git/index.lock"), b"another command's lock").unwrap();
+                BulkloadRefusal::GitSwitchInProgress
+            }
+            "busy" => {
+                git_run(&dest, &["branch", "feature"]);
+                let other = dir.path().join("other");
+                git_run(
+                    &dest,
+                    &[
+                        "worktree",
+                        "add",
+                        "--quiet",
+                        other.to_str().unwrap(),
+                        "feature",
+                    ],
+                );
+                BulkloadRefusal::GitSwitchBranchBusy
+            }
+            "collides" => {
+                fs::write(dest.join("g"), b"sting's untracked g\n").unwrap();
+                BulkloadRefusal::GitSwitchUntrackedCollides(b"g".to_vec())
+            }
+            _ => {
+                child = Some(
+                    std::process::Command::new("sleep")
+                        .arg("60")
+                        .current_dir(&dest)
+                        .spawn()
+                        .unwrap(),
+                );
+                BulkloadRefusal::GitSwitchInUse
+            }
+        };
+        let refused = advance_at(&staged, &dest);
+        if let Some(mut child) = child {
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+        assert_eq!(refused, Err(expected), "{shape}");
+        assert_eq!(git_run(&dest, &["rev-parse", "HEAD"]), main, "{shape}");
+        assert_eq!(
+            git_run(&dest, &["symbolic-ref", "HEAD"]),
+            "refs/heads/main",
+            "{shape}"
+        );
+        if shape != "busy" {
+            assert!(
+                git_try(
+                    &dest,
+                    &["rev-parse", "--verify", "--quiet", "refs/heads/feature"]
+                )
+                .0
+                .eq(&false),
+                "{shape}: no branch created"
+            );
+        }
+        if shape != "collides" {
+            assert!(!dest.join("g").exists(), "{shape}");
+        }
+        let records = landed::ledger_dir(&dest.join(".git"), "neo");
+        assert!(!records.join(advance::INTENT).exists(), "{shape}");
+        assert!(!records.join(landed::WORKSPACE_LANDED).exists(), "{shape}");
+    }
+}
+
+/// A switch whose seats meet an edit is rolled back as an advance is: HEAD
+/// back on `main`, the `feature` it created deleted by compare-and-swap,
+/// `GIT_SWITCH_ROLLED_BACK`.
+#[test]
+fn a_switch_met_by_an_edit_is_rolled_back() {
+    let (_dir, _source, dest, staged) = world_of(true);
+    let main = git_run(&dest, &["rev-parse", "main"]);
+    let at = dest.clone();
+    super::super::mid_pass::arm_at(
+        &dest,
+        super::super::mid_pass::Stage::AdvanceAfterBranch,
+        move || fs::write(at.join("g"), b"the operator's g\n").unwrap(),
+    );
+    assert_eq!(
+        advance_at(&staged, &dest),
+        Err(BulkloadRefusal::GitSwitchRolledBack(b"g".to_vec()))
+    );
+    assert_eq!(git_run(&dest, &["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(git_run(&dest, &["rev-parse", "HEAD"]), main);
+    assert!(
+        !git_try(
+            &dest,
+            &["rev-parse", "--verify", "--quiet", "refs/heads/feature"]
+        )
+        .0
+    );
+    assert_eq!(fs::read(dest.join("f")).unwrap(), b"one\n");
+    assert!(!dest.join(".git/index.lock").exists());
 }

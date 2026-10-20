@@ -382,6 +382,7 @@ pub fn workspace(
             row.components = components;
             // `--advance-ancestor`: what the apply would do with it, so a
             // plan never reports an advance as a beside landing.
+            let mut switching = false;
             let advances = advance
                 && match super::advance::preview(
                     &super::Place {
@@ -397,15 +398,24 @@ pub fn workspace(
                     (&scratch, &meta),
                     beside,
                 )? {
-                    None => true,
-                    Some(refusal) => {
+                    Ok(switch) => {
+                        switching = switch;
+                        true
+                    }
+                    Err(refusal) => {
                         row.components
                             .push(format!("advance-refused={}", refusal.code()));
                         false
                     }
                 };
             if advances {
-                row.adopt = "advance";
+                // A switch (operator ruling 2026-10-19, "Switch when
+                // clean") is an advance onto the capture's branch.
+                row.adopt = if switching {
+                    "advance-switch"
+                } else {
+                    "advance"
+                };
             }
             if let (false, Some(suffix)) = (advances, beside) {
                 row.components.push(beside_component(

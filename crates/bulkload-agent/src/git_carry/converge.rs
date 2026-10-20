@@ -1410,6 +1410,39 @@ impl Engine<'_> {
         Ok(())
     }
 
+    /// The print of a regular seat this converge just renamed into place,
+    /// from the descriptor it wrote (review of #289, finding 6: a later
+    /// `lstat` of the path took a write in between, or a file renamed over
+    /// it, as bulkload's own output). `before` is that descriptor's
+    /// metadata before the rename: the rename moves only its ctime, so a
+    /// size or mtime that moved since is a write into it, and the print
+    /// recorded is the one before (it matches nothing the seat holds now,
+    /// so the next converge proves the seat modified). The path holding
+    /// another inode is likewise never recorded as this converge's.
+    fn record_written(
+        &mut self,
+        relative: &[u8],
+        file: &fs::File,
+        before: &fs::Metadata,
+    ) -> Result<()> {
+        let now = file
+            .metadata()
+            .refuse_at("git_carry::converge::record_written")?;
+        let kept = |meta: &fs::Metadata| {
+            let (a, b) = (
+                crate::freshness::StatIdentity::from_metadata(meta),
+                crate::freshness::StatIdentity::from_metadata(before),
+            );
+            a.ino == b.ino && a.size == b.size && a.mtime_ns == b.mtime_ns
+        };
+        let chosen = if kept(&now) { &now } else { before };
+        self.written.insert(
+            relative.to_vec(),
+            SeatPrint::of(relative, chosen).ok_or_else(interrupted)?,
+        );
+        Ok(())
+    }
+
     /// The print the seat at `seat` must have before it is replaced or
     /// removed: the proof's (fresh), or its print now when its content is
     /// the old side's (settling). `Ok(None)`: not the landed seat.
@@ -1589,7 +1622,12 @@ impl Engine<'_> {
             return Err(interrupted());
         }
         self.writable(&seat.parent)?;
-        write_temp(seat, new, &mut self.objects)?;
+        let file = write_temp(seat, new, &mut self.objects)?;
+        let before = file
+            .as_ref()
+            .map(fs::File::metadata)
+            .transpose()
+            .refuse_at("git_carry::converge::add")?;
         let directory = seat.directory()?;
         if let Err(error) =
             crate::io::sys::rename_exclusive_at(&directory, &seat.temp, &directory, &seat.leaf)
@@ -1603,7 +1641,10 @@ impl Engine<'_> {
         }
         landed::sync_dir(&seat.parent)?;
         self.custody.count("seats-added");
-        self.record(seat, &op.path)
+        match (&file, &before) {
+            (Some(file), Some(before)) => self.record_written(&op.path, file, before),
+            _ => self.record(seat, &op.path),
+        }
     }
 
     fn replace(&mut self, seat: &Seat, op: &Op) -> Result<()> {
@@ -1632,7 +1673,12 @@ impl Engine<'_> {
             }
         }
         self.writable(&seat.parent)?;
-        write_temp(seat, new, &mut self.objects)?;
+        let file = write_temp(seat, new, &mut self.objects)?;
+        let before = file
+            .as_ref()
+            .map(fs::File::metadata)
+            .transpose()
+            .refuse_at("git_carry::converge::replace")?;
         fault_point!(EstateConvergeSeatBeforeExchange);
         let directory = seat.directory()?;
         if let Err(error) = crate::io::exchange(&directory, &seat.temp, &seat.leaf) {
@@ -1665,7 +1711,10 @@ impl Engine<'_> {
             fs::remove_file(&seat.temp_path).refuse_at("git_carry::converge::replace")?;
             landed::sync_dir(&seat.parent)?;
             self.custody.count("seats-replaced");
-            return self.record(seat, &op.path);
+            return match (&file, &before) {
+                (Some(file), Some(before)) => self.record_written(&op.path, file, before),
+                _ => self.record(seat, &op.path),
+            };
         }
         // Not the landed seat: it goes back, this converge's file is removed.
         crate::io::exchange(&directory, &seat.temp, &seat.leaf)
@@ -1822,13 +1871,16 @@ fn sweep_probes(worktree: &Path) -> Result<u64> {
 /// re-read, which would take an operator's `git add` since for landed).
 /// `before` names the tree the replaced index holds (a converge's old
 /// capture's staged tree; an advance's live HEAD tree), for the two-way
-/// `read-tree -m`.
+/// `read-tree -m`. `held` is the marker of an `index.lock` the caller
+/// already holds (an advance holds its own from the proof under the lock
+/// on, review of #289 finding 1): the index is published through it, and a
+/// refusal leaves it held for the caller to put back or keep.
 fn publish_index(
     worktree: &Path,
     git_dir: &Path,
     (before, after): (&str, &Meta),
     old: [u8; 32],
-    tag: &str,
+    (tag, held): (&str, Option<&[u8]>),
 ) -> Result<[u8; 32]> {
     const SITE: &str = "git_carry::converge::publish_index";
     let lock = git_dir.join("index.lock");
@@ -1856,18 +1908,28 @@ fn publish_index(
     )?;
     super::restore_intent_to_add(worktree, Some(&fresh), &after.heads())?;
     let target = index_digest(worktree, Some(&fresh))?;
-    // A lock this converge left (a crash while holding it, finding 5).
+    // The caller's own lock, or one this converge left (a crash while
+    // holding it, finding 5).
+    let mut holding = false;
     if lstat(&lock)?.is_some() {
-        let ours = fs::read(&lock).is_ok_and(|bytes| bytes == marker.as_bytes())
-            || index_digest(worktree, Some(&lock)).is_ok_and(|found| found == target);
-        if !ours {
-            cleanup();
-            return Err(interrupted());
+        let content = fs::read(&lock).ok();
+        if held.is_some_and(|held| content.as_deref() == Some(held)) {
+            holding = true;
+        } else {
+            let ours = content.is_some_and(|bytes| bytes == marker.as_bytes())
+                || index_digest(worktree, Some(&lock)).is_ok_and(|found| found == target);
+            if !ours {
+                cleanup();
+                return Err(interrupted());
+            }
+            fs::remove_file(&lock).refuse_at(SITE)?;
         }
-        fs::remove_file(&lock).refuse_at(SITE)?;
     }
     let current = index_digest(worktree, None)?;
     if current == target {
+        if let (true, Some(held)) = (holding, held) {
+            native_refs::remove_owned_lock(&lock, &[held.to_vec()])?;
+        }
         cleanup();
         return Ok(target);
     }
@@ -1875,18 +1937,20 @@ fn publish_index(
         cleanup();
         return Err(interrupted());
     }
-    // The marker exists before the lock's name (review 4: a lock created
-    // empty and left so by a power loss proved nothing, and wedged every
-    // rerun and the operator's Git).
-    if !native_refs::publish_lock(&lock, marker.as_bytes())? {
-        cleanup();
-        return Err(interrupted());
-    }
-    fault_point!(EstateConvergeIndexLocked);
-    if index_digest(worktree, None)? != old {
-        let _ = fs::remove_file(&lock);
-        cleanup();
-        return Err(interrupted());
+    if !holding {
+        // The marker exists before the lock's name (review 4: a lock
+        // created empty and left so by a power loss proved nothing, and
+        // wedged every rerun and the operator's Git).
+        if !native_refs::publish_lock(&lock, marker.as_bytes())? {
+            cleanup();
+            return Err(interrupted());
+        }
+        fault_point!(EstateConvergeIndexLocked);
+        if index_digest(worktree, None)? != old {
+            let _ = fs::remove_file(&lock);
+            cleanup();
+            return Err(interrupted());
+        }
     }
     fs::copy(&index, &merged).refuse_at(SITE)?;
     let two_way = super::read_tree(
@@ -2600,7 +2664,7 @@ fn converge(
             &place.git_dir,
             (&staged_tree(meta0)?, &meta1),
             ledger.index,
-            &tag,
+            (&tag, None),
         )?;
         fault_point!(EstateConvergeAfterIndex);
         set_head(worktree, &ledger.head, &plan.head, plan.branch.as_ref())
@@ -2714,7 +2778,7 @@ fn settle(place: &Place<'_>, ledger: &LandedWorkspace) -> Result<Custody> {
         &place.git_dir,
         (&staged_tree(&meta0)?, &meta1),
         intent.index_old,
-        &intent.tag,
+        (&intent.tag, None),
     )?;
     let head_old = intent.head.0.clone();
     let current = head_of(worktree)?;
