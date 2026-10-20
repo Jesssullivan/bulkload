@@ -1419,10 +1419,12 @@ mod tests {
     /// and a 20 ms idle (the bound before the lever) splits the same items.
     #[test]
     fn a_group_waits_out_its_idle_and_closes_at_its_age() -> Result<()> {
+        // `closes`: before each next item, wait (bounded) until the committer
+        // has closed every group so far by itself, on its idle.
         let gapped = |idle: Duration,
                       age: Option<Duration>,
                       gaps: usize,
-                      gap: Duration|
+                      (gap, closes): (Duration, bool)|
          -> Result<Vec<usize>> {
             let groups = Arc::new(Mutex::new(Vec::new()));
             let committer = Committer::spawn_with(
@@ -1434,8 +1436,16 @@ mod tests {
                 },
             )?;
             committer.submit(1)?;
-            for _ in 0..gaps {
+            for submitted in 1..=gaps {
                 std::thread::sleep(gap);
+                let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                while closes && group_sizes(&groups).len() < submitted {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "an idle group never closed by itself"
+                    );
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 committer.submit(1)?;
             }
             committer.sync()?;
@@ -1444,18 +1454,18 @@ mod tests {
         };
         let gap = Duration::from_millis(60);
         // Five items 60 ms apart under a 2 s idle: one group, closed by sync.
-        assert_eq!(gapped(Duration::from_secs(2), None, 4, gap)?, [5]);
-        // Five items under a 20 ms idle: each item alone. The gap is ten
-        // idles, not three, so a committer thread descheduled for a while
-        // on a loaded host still sees each idle out before the next item
-        // (a 60 ms gap grouped two items at load 45 to 60 on 32 CPUs).
+        assert_eq!(gapped(Duration::from_secs(2), None, 4, (gap, false))?, [5]);
+        // The same five items under a 20 ms idle: each item alone, its group
+        // closed on its idle with no sync. The committer judges idleness by
+        // what it sees: a committer thread descheduled past the gap (a loaded
+        // host, nice 19) finds the next item already queued and groups the
+        // two, whatever the gap (a 60 ms gap, and then a 200 ms one, grouped
+        // two items at load 45 to 60 on 32 CPUs: `[2, 1, 1, 1]`). That is
+        // scheduling, not the idle rule, and a group closing late is only
+        // later durability, never a record before its data. So each next
+        // item waits until the committer has closed the group before it.
         assert_eq!(
-            gapped(
-                Duration::from_millis(20),
-                None,
-                4,
-                Duration::from_millis(200)
-            )?,
+            gapped(Duration::from_millis(20), None, 4, (gap, true))?,
             [1; 5]
         );
         // Twenty items 60 ms apart (over 1.1 s) under a 2 s idle and a 300 ms
@@ -1464,7 +1474,7 @@ mod tests {
             Duration::from_secs(2),
             Some(Duration::from_millis(300)),
             19,
-            gap,
+            (gap, false),
         )?;
         assert!(aged.len() >= 3, "{aged:?}");
         assert_eq!(aged.iter().sum::<usize>(), 20, "{aged:?}");
