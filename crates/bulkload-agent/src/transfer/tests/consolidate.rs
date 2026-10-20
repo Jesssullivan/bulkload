@@ -203,3 +203,49 @@ fn a_line_sting_appends_during_the_consolidation_is_never_lost() {
         format!("{neo}{}{late}", record("s1", "a", "on sting"))
     );
 }
+
+/// Operator ruling 2026-10-20 ("no dupes, no duplicated besides"), every
+/// file class of the homes: a beside copy is written only for bytes the live
+/// file neither is, nor is a prefix of (extended in place), nor holds
+/// (covered, `dest-ahead`, the very bytes under another mode included).
+#[test]
+fn a_beside_is_written_only_for_bytes_the_live_file_lacks() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let homes = Homes::new();
+    // Settings the destination extended: covered.
+    homes.write("source", "settings.json", b"{\"a\":1}\n");
+    let covered = homes.write("destination", "settings.json", b"{\"a\":1}\n{\"b\":2}\n");
+    // The same bytes under another mode: covered.
+    let same = homes.write("source", "plugins/known.json", b"{\"p\":1}\n");
+    let moded = homes.write("destination", "plugins/known.json", b"{\"p\":1}\n");
+    std::fs::set_permissions(&same, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::set_permissions(&moded, std::fs::Permissions::from_mode(0o600)).unwrap();
+    // A live file that is a prefix of the source's: extended in place.
+    homes.write("source", "plugins/grown.json", b"{\"g\":1}\n{\"g\":2}\n");
+    let grown = homes.write("destination", "plugins/grown.json", b"{\"g\":1}\n");
+    // Other bytes: the one beside copy.
+    homes.write("source", "config.toml", b"model = \"neo\"\n");
+    let other = homes.write("destination", "config.toml", b"model = \"sting\"\n");
+    homes.settle();
+
+    let stats = homes.corpus.run().unwrap();
+    assert!(stats.refusals.is_empty(), "{:?}", stats.refusals);
+    let mut ahead = stats.dest_ahead.clone();
+    ahead.sort();
+    assert_eq!(
+        ahead,
+        [b"plugins/known.json".to_vec(), b"settings.json".to_vec()]
+    );
+    assert_eq!(
+        stats.applied_beside,
+        [(
+            b"config.toml".to_vec(),
+            [&b"config.toml"[..], SUFFIX].concat()
+        )]
+    );
+    assert_eq!(std::fs::read(&grown).unwrap(), b"{\"g\":1}\n{\"g\":2}\n");
+    for path in [&covered, &moded, &grown] {
+        assert!(!beside_of(path).exists(), "{path:?}");
+    }
+    assert!(beside_of(&other).exists());
+}

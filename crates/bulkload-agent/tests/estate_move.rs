@@ -343,7 +343,11 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
     );
     let again = agent(&move_args(&[], LABEL));
     assert!(!again.ok);
-    let second = closure(&again.stdout);
+    let mut second = closure(&again.stdout);
+    // The bytes the move state holds grow with each pass's records.
+    let mut first = first;
+    second.remove("move_state_bytes");
+    first.remove("move_state_bytes");
     assert_eq!(second, first, "{}", again.stdout);
     assert_eq!(
         (
@@ -421,6 +425,7 @@ fn one_pass_lands_adopts_besides_carries_and_accounts_for_every_item() {
         converged.stdout
     );
     want.remove("refusals");
+    got.remove("move_state_bytes");
     assert_eq!(got, want, "{}", converged.stdout);
     assert_eq!(
         git(&dst.join("diverged"), &["rev-parse", "HEAD"]),
@@ -761,7 +766,14 @@ fn sessions_land_in_the_live_home_beside_and_the_gate_reads_them() {
         "the live index gained the re-seated row"
     );
     assert!(dst_codex.join("state_5.sqlite-wal").exists());
-    assert!(dst_codex.join(format!("state_5.sqlite.{LABEL}")).is_file());
+    // Operator ruling 2026-10-20 ("no dupes"): the index snapshot landed
+    // beside is retired once its thread is registered in the live index.
+    assert!(!dst_codex.join(format!("state_5.sqlite.{LABEL}")).exists());
+    assert!(
+        moved.stdout.contains("estate-move codex-index-retired"),
+        "{}",
+        moved.stdout
+    );
     assert_eq!(
         fs::read_to_string(dst_codex.join(&rollout_rel)).unwrap(),
         rollout_bytes
@@ -1002,10 +1014,15 @@ fn sessions_into_a_destination_with_no_codex_index_seed_it() {
             .file_type()
             .is_symlink());
     }
+    // The snapshot landed beside (live path absent), seeded the index, and,
+    // its thread registered, was retired: no whole-DB copy stays (operator
+    // ruling 2026-10-20).
     let snapshot = dst_codex.join(format!("state_5.sqlite.{LABEL}"));
+    assert!(!snapshot.exists(), "{}", moved.stdout);
     assert!(
-        snapshot.is_file(),
-        "the snapshot lands beside, live path absent"
+        moved.stdout.contains("estate-move codex-index-retired"),
+        "{}",
+        moved.stdout
     );
     assert!(
         moved.stdout.contains("\"kind\":\"index\"")
@@ -1050,11 +1067,7 @@ fn sessions_into_a_destination_with_no_codex_index_seed_it() {
         backfill, "complete",
         "the destination Codex never backfills"
     );
-    assert_eq!(
-        thread_cwds(&snapshot),
-        [(THREAD.to_owned(), src_lane.to_str().unwrap().to_owned())],
-        "the snapshot itself is the source's, untouched"
-    );
+    // The snapshot was the source's, untouched, until retired (above).
     // The destination's own cwd-less session: in place, nothing held.
     assert_eq!(
         fs::read_to_string(own_projects.join(format!("{DEST_SID}.jsonl"))).unwrap(),
@@ -1300,7 +1313,12 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         "{}",
         moved.stdout
     );
-    assert_eq!(fs::read_to_string(&at_live).unwrap(), neo(SID_FORK));
+    // Operator ruling 2026-10-20 ("neither WIN"): the file at the live key
+    // is the union, neo's bytes then the archived fork's records.
+    assert_eq!(
+        fs::read_to_string(&at_live).unwrap(),
+        format!("{}{fork_bytes}", neo(SID_FORK))
+    );
     assert_eq!(
         fs::read_to_string(archive.join("fork.jsonl")).unwrap(),
         fork_bytes
@@ -1351,7 +1369,11 @@ fn archive_links_follow_a106_and_destination_links_stay() {
         "{}",
         moved.stdout
     );
-    assert_eq!(fs::read_to_string(&live_rollout).unwrap(), neo_rollout);
+    assert_eq!(
+        fs::read_to_string(&live_rollout).unwrap(),
+        format!("{neo_rollout}{}", String::from_utf8_lossy(archived_rollout)),
+        "the union: neo's rollout, then the archived fork's lines"
+    );
     assert!(
         !dst_codex.join(format!("{fork_rel}.{LABEL}")).exists(),
         "neo's rollout beside the link was consumed by the replacement"
@@ -1601,6 +1623,9 @@ fn sessions_land_once_under_the_mapped_key_and_a_shared_key_stays_typed() {
     let first = closure(&moved.stdout);
     // Nothing lands beside: the empty transcript is consolidated in place.
     assert_eq!(first["applied_beside"], "0", "{}", moved.stdout);
+    // No stage dupes (ruling 2026-10-20): the pulls' state holds no payload.
+    assert_eq!(first["pull_payload_bytes"], "0", "{}", moved.stdout);
+    assert!(first["move_state_bytes"].parse::<u64>().unwrap() > 0);
     assert_eq!(first["key_maps"], "2", "{}", moved.stdout);
     assert_eq!(first["key_maps_held"], "1", "{}", moved.stdout);
     assert_eq!(first["unaccounted"], "0", "{}", moved.stdout);

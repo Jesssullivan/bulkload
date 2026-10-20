@@ -1724,8 +1724,16 @@ impl Site<'_> {
             return occupied();
         };
         if staged.written == target.0.size && staged.digest == target.1 {
-            // The landed file is the archive's: nothing to replace.
+            // The landed file is the archive's: nothing to replace. Under
+            // consolidation (ruling 2026-10-20) the session is resumable
+            // through the link, and the source's copy beside it is that
+            // same bytes: removed, one copy.
             self.clear_temp()?;
+            if self.placer.beside.is_some() && self.lines {
+                let placed = kept(Outcome::Unchanged, Some((target.1, target.0, LINK_EQUAL)))?;
+                self.consume_beside(landing, staged.written)?;
+                return Ok(placed);
+            }
             return kept(Outcome::Occupied, Some((target.1, target.0, LINK_EQUAL)));
         }
         if self.lines && staged.written == 0 && staged.held > 0 {
@@ -1737,9 +1745,57 @@ impl Site<'_> {
         }
         if target.2 == Some(staged.digest) {
             // The archive holds the landed lines and more: ahead, not a
-            // fork; kept like a destination that continued (review A3).
+            // fork; kept like a destination that continued (review A3). The
+            // source's copy beside it holds nothing the archive lacks:
+            // removed under consolidation (ruling 2026-10-20).
             self.clear_temp()?;
-            return kept(Outcome::DestAhead, Some((target.1, target.0, LINK_AHEAD)));
+            let placed = kept(Outcome::DestAhead, Some((target.1, target.0, LINK_AHEAD)))?;
+            if self.placer.beside.is_some() && self.lines {
+                self.consume_beside(landing, staged.written)?;
+            }
+            return Ok(placed);
+        }
+        // Operator ruling 2026-10-20 ("neither WIN. they must be
+        // consolidated"): on a live-home landing, a JSON Lines replacement is
+        // the union, the landed bytes whole then the archive fork's records
+        // they lack (`transfer::consolidate`), never the landed bytes alone;
+        // the archive target itself stays as it is.
+        if self.placer.beside.is_some() && self.lines {
+            let landed = {
+                let mut bytes = vec![
+                    0_u8;
+                    usize::try_from(staged.written)
+                        .map_err(|_| BulkloadRefusal::BudgetExceeded)?
+                ];
+                if crate::io::sys::pread_full(&staged.file, &mut bytes, 0)
+                    .refuse_at("reseat::place::replace_union")?
+                    != bytes.len()
+                {
+                    self.clear_temp()?;
+                    return occupied();
+                }
+                bytes
+            };
+            let fork = std::fs::read(resolved).refuse_at("reseat::place::replace_union")?;
+            counters::add_len(Counter::ReseatDestRead, fork.len());
+            let by_uuid = matches!(self.kind, Kind::Transcript | Kind::Sidecar);
+            let unmoved = lstat(resolved)?.map(|meta| Identity::of(&meta)) == Some(target.0);
+            let Some(merged) = crate::transfer::consolidate::merge_jsonl(&landed, &fork, by_uuid)
+                .filter(|_| unmoved)
+            else {
+                self.clear_temp()?;
+                return Ok(Placed {
+                    outcome: Outcome::Held,
+                    scanner: None,
+                });
+            };
+            crate::io::sys::pwrite_all(&staged.file, &merged.extra, staged.written)
+                .refuse_at("reseat::place::replace_union")?;
+            counters::add_len(Counter::ReseatDestWrite, merged.extra.len());
+            staged
+                .file
+                .sync_all()
+                .refuse_at("reseat::place::replace_union")?;
         }
         let copy = Identity::of(
             &staged

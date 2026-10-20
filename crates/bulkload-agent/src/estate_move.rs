@@ -854,6 +854,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
     // typed closure rows, and a refused settings file never holds the
     // transcripts' re-seat.
     let mut key_maps = None;
+    let mut index_kept = false;
     let sessions: Option<Sessions> = if let Some(home) = &run.sessions {
         let pass_started = now_secs();
         // #280 finding 9: the source's project keys land at their lanes'
@@ -874,6 +875,21 @@ fn move_command(args: &[OsString]) -> Result<()> {
             let ended: Result<()> = reseated.as_ref().map(drop).map_err(Clone::clone);
             note(&ended);
             reached(&mut ledger, &ledger_path, "reseat", word(&ended))?;
+            // Operator ruling 2026-10-20 ("no dupes"): the Codex index
+            // snapshot this pass landed beside the live index is a whole-DB
+            // copy once its threads are registered in the live index.
+            if ended.is_ok() {
+                let index = retire_landed_index(&run, homes, pass_started);
+                note(&index.as_ref().map(drop).map_err(Clone::clone));
+                let index_word = match &index {
+                    Ok(None) => "none".to_owned(),
+                    Ok(Some(IndexCopy::Retired(threads))) => format!("retired:{threads}"),
+                    Ok(Some(IndexCopy::Kept(missing))) => format!("kept:missing={missing}"),
+                    Err(refusal) => format!("refused:{}", refusal.code()),
+                };
+                reached(&mut ledger, &ledger_path, "codex-index", index_word)?;
+                index_kept = matches!(index, Ok(Some(IndexCopy::Kept(_))) | Err(_));
+            }
             outcome.reseat = reseated.ok().flatten();
         } else {
             reached(
@@ -940,7 +956,7 @@ fn move_command(args: &[OsString]) -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     out(&format!(
-        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} key_maps_unused={} diverged={} report={report_path:?}",
+        "estate-move closure planned={} applied={} applied_beside={} carried={} referenced_only={} refused={} refused_pending_review={} unaccounted={} not_moved={not_moved} refusals={} sessions={} transfer_rows={} reseat_unaccounted={reseat_unaccounted} reseat_held={} key_maps={} key_maps_held={} key_maps_unused={} diverged={} codex_index_kept={} move_state_bytes={} pull_payload_bytes={} report={report_path:?}",
         rows.len(),
         report.applied,
         report.applied_beside,
@@ -961,14 +977,17 @@ fn move_command(args: &[OsString]) -> Result<()> {
             .filter(|(word, _)| word.ends_with("/beside-diverged"))
             .map(|(_, count)| count)
             .sum::<u64>(),
+        u8::from(index_kept),
+        tree_bytes(&run.state, &|_| true),
+        pull_payload_bytes(&run.state),
     ))?;
-    let gate = report
-        .gate()
-        .and(if not_moved == 0 && reseat_unaccounted == 0 {
+    let gate = report.gate().and(
+        if not_moved == 0 && reseat_unaccounted == 0 && !index_kept {
             Ok(())
         } else {
             Err(BulkloadRefusal::ClosureUnaccounted)
-        });
+        },
+    );
     reached(&mut ledger, &ledger_path, "closure", word(&gate))?;
     out(&format!(
         "estate-move gate={} next={}",
@@ -1411,6 +1430,127 @@ fn key_map_proof(run: &Move) -> Result<()> {
         summary.files.values().sum::<u64>(),
         if counts.is_empty() { "none" } else { &counts },
     ))
+}
+
+/// What became of the Codex index snapshot this pass landed beside the live
+/// index ([`retire_landed_index`]).
+enum IndexCopy {
+    /// Every thread it names is registered in the live index: removed, with
+    /// how many threads.
+    Retired(u64),
+    /// Threads it names the live index lacks: kept, pending review.
+    Kept(u64),
+}
+
+// Operator ruling 2026-10-20 ("no dupes"): the Codex index snapshot this
+// pass landed beside the live index (`state_5.sqlite.LABEL`, this pull's own
+// output, named by its transfer record) is a whole-DB copy once the re-seat
+// registered its threads in the live index. Every thread id it holds is
+// looked up in the live index (both opened read-only); all found, the
+// snapshot is removed and the removal is a ledger line; any missing, it is
+// kept and holds the gate, pending review. Never a permanent whole-DB copy.
+fn retire_landed_index(run: &Move, homes: &Homes, pass_started: u64) -> Result<Option<IndexCopy>> {
+    use rusqlite::{Connection, OpenFlags};
+    let Some(snapshot) = landed_index(run, &homes.codex, pass_started) else {
+        return Ok(None);
+    };
+    let live = homes.codex.join(STATE_DB);
+    if !snapshot.is_file() || !live.is_file() {
+        return Ok(None);
+    }
+    // An index that cannot be read as it was is one the pass cannot vouch
+    // for: typed, and the copy is kept.
+    let sql = |_: rusqlite::Error| BulkloadRefusal::SqliteStateChanged;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let ids: Vec<String> = {
+        let copy = Connection::open_with_flags(&snapshot, flags).map_err(sql)?;
+        let mut statement = copy.prepare("SELECT id FROM threads").map_err(sql)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(sql)?;
+        rows.collect::<std::result::Result<_, _>>().map_err(sql)?
+    };
+    let index = Connection::open_with_flags(&live, flags).map_err(sql)?;
+    let mut missing = 0_u64;
+    for id in &ids {
+        let found: Option<i64> = index
+            .query_row("SELECT 1 FROM threads WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(sql(other)),
+            })?;
+        missing += u64::from(found.is_none());
+    }
+    drop(index);
+    if missing > 0 {
+        out(&format!(
+            "estate-move codex-index-kept path={snapshot:?} threads={} missing={missing} reason=registration-incomplete"
+        , ids.len()))?;
+        return Ok(Some(IndexCopy::Kept(missing)));
+    }
+    std::fs::remove_file(&snapshot).refuse_at("estate_move::retire_landed_index")?;
+    if let Some(parent) = snapshot.parent() {
+        bulkload_agent::durable::seal_dir(
+            &std::fs::File::open(parent).refuse_at("estate_move::retire_landed_index")?,
+        )
+        .refuse_at("estate_move::retire_landed_index")?;
+    }
+    out(&format!(
+        "estate-move codex-index-retired path={snapshot:?} threads={}",
+        ids.len()
+    ))?;
+    Ok(Some(IndexCopy::Retired(ids.len() as u64)))
+}
+
+// Bytes of every regular file under `root` that `keep` takes (by path),
+// never following a link.
+fn tree_bytes(root: &Path, keep: &dyn Fn(&Path) -> bool) -> u64 {
+    let mut total = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                pending.push(entry.path());
+            } else if meta.is_file() && keep(&entry.path()) {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
+// Operator ruling 2026-10-20 ("no stage dupes"): bytes under
+// MOVE_STATE/pull/{claude,codex} that are not the pulls' resume state (the
+// transfer store, its lock and its closure records): a staged payload left
+// there. Reported on the closure line.
+fn pull_payload_bytes(state: &Path) -> u64 {
+    ["claude", "codex"]
+        .iter()
+        .map(|name| {
+            tree_bytes(&state.join("pull").join(name), &|path: &Path| {
+                let name = path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                let record = path
+                    .components()
+                    .any(|part| part.as_os_str() == bulkload_agent::transfer_outcome::RECORD_DIR);
+                let lock = path
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("lock"));
+                !(record || name.starts_with("transfer.sqlite") || lock)
+            })
+        })
+        .sum()
 }
 
 fn now_secs() -> u64 {

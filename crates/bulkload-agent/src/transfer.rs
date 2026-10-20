@@ -7145,7 +7145,7 @@ impl<W: Write> Inbound<'_, W> {
                 Planned {
                     row: &row,
                     extend: !snapshot
-                        && prefix_extend_scope(self.target.path()).covers(&row.rel_path),
+                        && extends(self.target.path(), &row.rel_path, self.beside.is_some()),
                     snapshot,
                     beside: self.beside.as_deref(),
                     claimed: &self.claimed,
@@ -7635,7 +7635,7 @@ impl<W: Write> Inbound<'_, W> {
                         let root_path = self.target.path();
                         if supersede.is_none()
                             && !snapshot
-                            && prefix_extend_scope(root_path).covers(&row.rel_path)
+                            && extends(root_path, &row.rel_path, self.beside.is_some())
                         {
                             if let Some((identity, prior)) =
                                 extend_candidate(&file, &row, root_path)
@@ -9146,6 +9146,7 @@ fn plan_file(
                                     // more: nothing to land (#280 finding 9).
                                     if let Some(identity) =
                                         dest_ahead(&file, row, manifest, context.target.path())
+                                            .filter(|_| !snapshot)
                                     {
                                         return Plan::DestAhead(identity);
                                     }
@@ -9418,28 +9419,29 @@ fn plan_extend(
 }
 
 /// `--beside` (#280 finding 9): whether the existing `file` at `row`'s live
-/// path holds the seat's bytes and more: an append-only path in the prefix
-/// extension's scope ([`PREFIX_EXTEND_ENV`]), a regular file longer than
-/// the seat, settled (neither its content nor its inode changed within the
-/// racy window of now, by the destination's clock), whose first bytes are
-/// every manifest chunk's, read back and hashed, and unchanged while they
-/// were read. The destination continued it (a session resumed there): the
-/// seat's bytes are there, so landing them beside would only copy them a
-/// second time. Its identity, or `None`.
+/// path holds the seat's bytes (and maybe more).
+///
+/// Any file class (operator ruling 2026-10-20, "no dupes"): a regular file
+/// no shorter than the seat, settled (neither its content nor its inode
+/// changed within the racy window of now, by the destination's clock),
+/// whose first bytes are every manifest chunk's, read back and hashed, and
+/// unchanged while they were read. The destination continued it (a session
+/// resumed there), or holds the very bytes under another mode: landing them
+/// beside would only copy them a second time. Its identity, or `None`.
 fn dest_ahead(
     file: &std::fs::File,
     row: &RowSchema,
     manifest: &Manifest,
     root: &Path,
 ) -> Option<StatIdentity> {
-    if !prefix_extend_scope(root).covers(&row.rel_path) || manifest.size() != Some(row.size) {
+    if manifest.size() != Some(row.size) {
         return None;
     }
     let found = file.metadata().ok()?;
     let identity = StatIdentity::from_metadata(&found);
     let quiet_since = capture_clock(root).saturating_sub(RACY_GRANULARITY_NS);
     if !found.is_file()
-        || found.len() <= row.size
+        || found.len() < row.size
         || identity.mtime_ns >= quiet_since
         || identity.ctime_ns >= quiet_since
     {
@@ -9464,6 +9466,18 @@ fn dest_ahead(
         .metadata()
         .is_ok_and(|after| StatIdentity::from_metadata(&after) == identity);
     (offset == row.size && unmoved).then_some(identity)
+}
+
+/// Whether the prefix extension may try a seat at `rel_path` in a session
+/// into `root`: its scope ([`PREFIX_EXTEND_ENV`]) covers the path, or, under
+/// `--beside`, any file class unless the extension is off (operator ruling
+/// 2026-10-20, "no dupes": a live file that is a byte prefix of the seat is
+/// extended, never copied beside, whatever its class).
+fn extends(root: &Path, rel_path: &[u8], beside: bool) -> bool {
+    match prefix_extend_scope(root) {
+        PrefixExtend::Off => false,
+        scope => beside || scope.covers(rel_path),
+    }
 }
 
 /// Whether `file` may be extended to `row` (M2r2 A-103): a regular file
