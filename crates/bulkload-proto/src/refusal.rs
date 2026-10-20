@@ -568,6 +568,10 @@ impl BulkloadRefusal {
     /// These strings are the wire/log identity of a refusal and must not change
     /// once a milestone ships.
     #[must_use]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one arm per refusal: the match is the code table"
+    )]
     pub const fn code(&self) -> &'static str {
         match *self {
             Self::SnapshotRootsOverlap => "SNAPSHOT_ROOTS_OVERLAP",
