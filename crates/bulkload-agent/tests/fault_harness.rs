@@ -1578,6 +1578,10 @@ scenarios! {
     estate_advance_retire_after_rename_live_edited => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireLiveEdited;
     estate_advance_retire_after_rename_written => EstateAdvanceRetireAfterRename: 1, EstateAdvance::RetireWritten;
     estate_advance_retire_mid_written => EstateAdvanceRetireMid: 1, EstateAdvance::RetireWritten;
+    // The verification of #289, r6: a standalone beside's two-valued key
+    // carried into the live configuration, crashed after the first value;
+    // the rerun adds the second and retires the beside.
+    estate_advance_retire_carried => EstateAdvanceRetireCarried: 1, EstateAdvance::RetireCarry;
     // M2r2 b: a capture-refused item carried as files, crashed after its
     // carry record and before its outcome.
     estate_carry_recorded => EstateCarryRecorded: 1, EstateCarried::Workspace;

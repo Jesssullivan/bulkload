@@ -148,6 +148,7 @@
 //! | `estate.advance.rollback_after_intent` | a third party's edit met the advance after its branch moved: the intent marked rolling back; nothing put back yet |
 //! | `estate.advance.rollback_mid` | one more seat of a rollback put back (or left to the edit) |
 //! | `estate.advance.retire_after_intent` | a beside landing proved equal to the live tree and its retirement recorded in STATE; nothing moved |
+//! | `estate.advance.retire_carried` | a standalone beside's configuration value added to the live repository (create-only), its retirement recorded; the next value of the key not yet |
 //! | `estate.advance.retire_after_rename` | the beside landing under its private retirement name, whole |
 //! | `estate.advance.retire_mid` | the retirement re-proved (prints, no process inside) and marked deleting; the renamed tree and a linked landing's administration not yet removed |
 //!
@@ -411,6 +412,11 @@ pub enum Point {
     /// to the advanced live tree, its retirement recorded in STATE; nothing
     /// moved.
     EstateAdvanceRetireAfterIntent,
+    /// `estate.advance.retire_carried`: one configuration value of a
+    /// standalone beside added to the live repository, create-only, after
+    /// the retirement's STATE record (the verification of #289, r6: a key's
+    /// values go in all or none, so the rerun finishes the key).
+    EstateAdvanceRetireCarried,
     /// `estate.advance.retire_after_rename`: the beside landing renamed to
     /// its private retirement name; its administration and bytes all there.
     EstateAdvanceRetireAfterRename,
@@ -478,7 +484,7 @@ pub enum Point {
 
 impl Point {
     /// Every fault point, in durability-path order.
-    pub const ALL: [Self; 82] = [
+    pub const ALL: [Self; 83] = [
         Self::PublishSourceAfterManifestInsert,
         Self::PublishSourceBeforeCommit,
         Self::PublishSourceAfterCommit,
@@ -537,6 +543,7 @@ impl Point {
         Self::EstateAdvanceRollbackAfterIntent,
         Self::EstateAdvanceRollbackMid,
         Self::EstateAdvanceRetireAfterIntent,
+        Self::EstateAdvanceRetireCarried,
         Self::EstateAdvanceRetireAfterRename,
         Self::EstateAdvanceRetireMid,
         Self::EstateCarryRecorded,
@@ -625,6 +632,7 @@ impl Point {
             Self::EstateAdvanceRollbackAfterIntent => "estate.advance.rollback_after_intent",
             Self::EstateAdvanceRollbackMid => "estate.advance.rollback_mid",
             Self::EstateAdvanceRetireAfterIntent => "estate.advance.retire_after_intent",
+            Self::EstateAdvanceRetireCarried => "estate.advance.retire_carried",
             Self::EstateAdvanceRetireAfterRename => "estate.advance.retire_after_rename",
             Self::EstateAdvanceRetireMid => "estate.advance.retire_mid",
             Self::EstateCarryRecorded => "estate.carry.recorded",

@@ -48,6 +48,10 @@
 //!   rename, then the live checkout edited: the rerun finishes the
 //!   retirement before the item's workspace step, which then refuses
 //!   `GIT_DESTINATION_MODIFIED`; nothing is left hidden.
+//! - `RetireCarry` (the verification of #289, r6): a standalone beside
+//!   whose configuration holds a key the live repository lacks with two
+//!   values, crashed after the first went in: the rerun adds the second
+//!   (all of a key's values or none), then retires the beside.
 //! - `RetireWritten` (finding 2): the retirement crashed after its rename
 //!   or marked deleting, then a file written into the renamed tree: the
 //!   rerun never deletes it; the tree goes back to its path, kept (a
@@ -110,6 +114,8 @@ pub enum EstateAdvance {
     RetireLiveEdited,
     /// `Retire` crashed, a file then written into the renamed tree.
     RetireWritten,
+    /// `RetireStandalone` with a two-valued key to carry, crashed mid-key.
+    RetireCarry,
 }
 
 impl Scenario for EstateAdvance {
@@ -448,8 +454,20 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
     let world = World::new(&point.name().replace('.', "-"), kind == K::Switch);
     std::thread::sleep(std::time::Duration::from_millis(2_100));
     world.capture();
-    if kind == K::RetireStandalone {
+    if matches!(kind, K::RetireStandalone | K::RetireCarry) {
         cp_a(&world.src(), &world.beside());
+    }
+    if kind == K::RetireCarry {
+        let beside = world.beside();
+        git(&beside, &["config", "branch.main.remote", "origin"]);
+        git(
+            &beside,
+            &["config", "--add", "branch.main.merge", "refs/heads/main"],
+        );
+        git(
+            &beside,
+            &["config", "--add", "branch.main.merge", "refs/heads/side"],
+        );
     }
     let besides = !matches!(
         kind,
@@ -570,6 +588,18 @@ fn scenario(point: Point, nth: u64, kind: EstateAdvance) {
         .collect();
     assert!(records.is_empty(), "{label}: {records:?}");
     assert_eq!(world.unaccounted(), 0, "{label}");
+    if kind == K::RetireCarry {
+        assert_eq!(
+            git(&dst, &["config", "--get-all", "branch.main.merge"]),
+            "refs/heads/main\nrefs/heads/side\n",
+            "{label}: both values, once each"
+        );
+        assert_eq!(
+            git(&dst, &["config", "branch.main.remote"]),
+            "origin\n",
+            "{label}"
+        );
+    }
     let rows = world.apply(true);
     assert_eq!(
         rows[0].0, "previous-workspace-restoration-not-revalidated",

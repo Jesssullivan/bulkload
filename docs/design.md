@@ -1453,15 +1453,19 @@ Merged in #224 (2026-10-15) and ruled with three stated limits
   progress (`modules`, `in-progress`; review of #289, finding 5), its
   `refs/carry*` held by name and value or reachable commits; its
   configuration entries (per-machine `core.*` keys aside) whose key the
-  live configuration lacks, and its `info/exclude` patterns the live
-  exclude lacks, are added to the live repository first, create-only (the
-  coordinator's decision of 2026-10-20: `git config --add` only for an
-  absent key with a value `safe_configuration_value` allows; patterns by
-  the exclude union's rule, recorded in STATE; receipt
-  `advance-config-added=N`, `advance-exclude-appended=N`), while a key the
-  live configuration holds with another value, or one not safe to carry,
-  keeps the beside (`configuration:<key>`), as does a pattern no pure
-  union carries (`exclude`); a linked one's administration directory under the
+  live repository's effective configuration lacks (its own with includes,
+  and the global and system files the operator's Git reads), and its
+  `info/exclude` patterns the live exclude lacks, are added to the live
+  repository first, create-only (the coordinator's decision of
+  2026-10-20: `git config --add` only for an absent key, every value of
+  it or none, planned in the retirement's STATE record so a crash mid-key
+  is finished by the rerun, with values `safe_configuration_value`
+  allows; patterns by the exclude union's rule; receipt
+  `advance-config-added=N` values, `advance-exclude-appended=N`), while a
+  key the live configuration holds with another value, one not safe to
+  carry, or an identity or signing key (`user.*`, `gpg.*`, `*.gpgsign`:
+  never carried) it does not hold keeps the beside (`configuration:<key>`),
+  as does a pattern no pure union carries (`exclude`); a linked one's administration directory under the
   live repository's `worktrees/`, its `gitdir` naming the beside
   (`admin-foreign`; finding 4). Its prints, a linked landing's
   administration directory included, are taken before the proof and

@@ -393,6 +393,20 @@ A13 (in use: refused, no beside written, advanced once free) and R2 (two
 absent upstreams and an exclude pattern carried, then retired; a key held
 with another value kept, live config untouched).
 
+## Verification of #289 at 1b2e1f5 (coordinator, 2026-10-20)
+
+All six earlier findings confirmed fixed by probe; the switch and the
+rollback hold. Two configuration-carry defects, fixed with tests:
+
+| # | Defect | Fix |
+| --- | --- | --- |
+| r6 | A key with two values (`branch.main.merge`) the live repository lacked: the first value went in, then the carry read its own write as a conflict; the beside was kept, the live configuration left with one of two values, uncounted. | Decided per key against the proof's snapshot: every value of an absent key goes in, or none. The plan is in the retirement's STATE record (`config`) before the first write, so a crash mid-key is finished by the rerun (`settle`; fault point `estate.advance.retire_carried`, row `estate_advance_retire_carried`); a key holding anything but planned values keeps the beside. Counted per value (`advance-config-added`). |
+| r7 | `user.email` was carried into live's local configuration: absence was read from `--local` only (no includes, no global), and `safe_configuration_value` allows any `user.name`/`user.email`. | Identity and signing keys (`user.*`, `gpg.*`, `commit.gpgsign`, `tag.gpgsign`, `push.gpgsign`, `tag.forceSignAnnotated`) are never carried; one the live configuration does not hold keeps the beside (`configuration:user.email`). Absence is tested against the effective configuration: local with includes, plus the global (`$XDG_CONFIG_HOME`/`~/.config` `git/config`, `~/.gitconfig`) and system (`/etc/gitconfig`) files, each with includes, read by name (bulkload's own Git children run without them). |
+
+R2 covers both (two merge values carried and counted; a key held differently
+in the live file or only in the global file; a differing local identity),
+with `HOME` pointed at a fixture.
+
 ## Open
 
 - **A beside kept after an advance stays** until the operator disposes it
@@ -401,11 +415,20 @@ with another value kept, live config untouched).
 - **Kept directories** (a live ignored file or link where the capture holds
   a directory) still keep the beside tree: the file-level reconcile of such
   subtrees is the beside-only-unique lane's.
-- **Process scan limits**: `/proc` shows this user's processes only (the
-  estate is this user's); a process that enters the tree between the last
-  scan and the rename or deletion is not seen. On Darwin nothing is
-  proved: a switch refuses `GIT_SWITCH_IN_USE` and a retirement keeps the
-  beside (`in-use`).
+- **The `/proc` check is best effort**: it sees only this user's
+  processes (other uids' links are unreadable) and only this mount
+  namespace's paths (a process in another mount namespace, a container,
+  resolves its cwd and fds to paths that do not compare); a process that
+  enters the tree between the last scan and the write is not seen; and a
+  link whose target name itself ends in ` (deleted)` is skipped as a
+  deleted file. On Darwin nothing is proved: an advance or switch refuses
+  `_IN_USE` and a retirement keeps the beside (`in-use`).
+- **A hand-deleted `index.lock`** (advance.rs, the settle's "someone's
+  HEAD since" branch): after a crash the advance's marked lock stays held
+  so the operator's Git refuses; an operator who deletes it by hand and
+  then moves HEAD (or commits over the half-advanced worktree) owns that
+  state: the settle drops the intent as `GIT_ADVANCE_RACED` and touches
+  nothing, so seats the advance had written stay as they are.
 - **Darwin**: with the process check on every advance, nothing advances or
   switches on Darwin (unprovable, refused `GIT_ADVANCE_IN_USE` /
   `GIT_SWITCH_IN_USE`); sting (Linux) is the target.

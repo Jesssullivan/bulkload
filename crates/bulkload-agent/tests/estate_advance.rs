@@ -118,11 +118,18 @@ struct Ran {
 }
 
 fn agent(args: &[OsString]) -> Ran {
-    let out = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"))
-        .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .output()
-        .unwrap();
+    agent_with(args, &[])
+}
+
+// `agent` with more environment (a HOME whose global Git configuration the
+// effective-configuration check reads, R2).
+fn agent_with(args: &[OsString], env: &[(&str, &Path)]) -> Ran {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_bulkload-agent"));
+    command.args(args).env("GIT_CONFIG_GLOBAL", "/dev/null");
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let out = command.output().unwrap();
     Ran {
         ok: out.status.success(),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -317,6 +324,24 @@ impl World {
         let mut flags = FLAGS.to_vec();
         flags.push("--advance-ancestor");
         self.apply(&flags)
+    }
+
+    /// `advance` with `HOME` (and `XDG_CONFIG_HOME` under it) at `home`.
+    fn advance_home(&self, home: &Path) -> Ran {
+        let mut list: Vec<OsString> = vec!["estate-apply".into()];
+        list.extend(FLAGS.iter().map(OsString::from));
+        list.push("--advance-ancestor".into());
+        list.extend(os(&[
+            &self.plan(),
+            &self.corpus(),
+            &self.state(),
+            &SOURCE,
+            &"1",
+        ]));
+        agent_with(
+            &list,
+            &[("HOME", home), ("XDG_CONFIG_HOME", &home.join(".config"))],
+        )
     }
 
     fn diff(&self, extra: &[&str]) -> Ran {
@@ -1133,16 +1158,19 @@ fn r1_a_beside_landing_in_use_is_kept_then_retired_once_free() {
 }
 
 /// R2 (review of #289, finding 5; the coordinator's decision of
-/// 2026-10-20): a standalone beside checkout whose configuration holds
-/// entries whose key the live repository lacks (branch upstreams, the
-/// softconnect shape) and an `info/exclude` pattern the live exclude lacks:
-/// the live repository takes them create-only (counted in the receipt),
-/// and the beside is then retired. One whose key the live configuration
-/// holds with another value keeps the beside (`configuration:<key>`), the
-/// live configuration untouched.
+/// 2026-10-20; its verification, r6 and r7): a standalone beside checkout
+/// whose configuration holds keys the live repository lacks (branch
+/// upstreams, the softconnect shape: `branch.main.merge` with two values)
+/// and an `info/exclude` pattern the live exclude lacks: the live
+/// repository takes them create-only, every value of each key (counted),
+/// and the beside is then retired. Kept (`configuration:<key>`), the live
+/// configuration untouched: a key the live configuration holds with
+/// another value (in its own file, or only in the global one the
+/// operator's Git reads), and a local identity (`user.email`, never
+/// carried) the live configuration does not hold.
 #[test]
 fn r2_a_standalone_beside_carries_absent_configuration_or_is_kept() {
-    for differs in [false, true] {
+    for shape in ["carried", "differs", "global", "identity"] {
         let world = World::new();
         // Neo's own exclude pattern, which sting's copy (made earlier) lacks;
         // the beside, a copy of neo, holds it as the capture does.
@@ -1158,67 +1186,92 @@ fn r2_a_standalone_beside_carries_absent_configuration_or_is_kept() {
         assert!(copied.success());
         let beside = world.beside();
         git(&beside, &["config", "branch.main.remote", "origin"]);
-        git(&beside, &["config", "branch.main.merge", "refs/heads/main"]);
+        git(
+            &beside,
+            &["config", "--add", "branch.main.merge", "refs/heads/main"],
+        );
+        git(
+            &beside,
+            &["config", "--add", "branch.main.merge", "refs/heads/topic"],
+        );
         let sting = world.sting();
-        if differs {
-            git(&sting, &["config", "branch.main.remote", "."]);
+        let home = world.path("home");
+        fs::create_dir_all(home.join(".config")).unwrap();
+        match shape {
+            "differs" => {
+                git(&sting, &["config", "branch.main.remote", "."]);
+            }
+            "global" => {
+                fs::write(
+                    home.join(".gitconfig"),
+                    b"[branch \"main\"]\n\tremote = upstream\n",
+                )
+                .unwrap();
+            }
+            "identity" => {
+                git(&beside, &["config", "user.email", "neo@example.invalid"]);
+            }
+            _ => {}
         }
         let ran = world.apply(&FLAGS);
         assert_eq!(
             receipt(&ran.stdout).0,
             "workspace-beside",
-            "{}\n{}",
+            "{shape}: {}\n{}",
             ran.stdout,
             ran.stderr
         );
         let config = fs::read(sting.join(".git/config")).unwrap();
-        let ran = world.advance();
-        assert!(ran.ok, "{}\n{}", ran.stdout, ran.stderr);
+        let ran = world.advance_home(&home);
+        assert!(ran.ok, "{shape}: {}\n{}", ran.stdout, ran.stderr);
         let (outcome, reason) = receipt(&ran.stdout);
-        assert_eq!(outcome, "workspace-restored", "{reason}");
+        assert_eq!(outcome, "workspace-restored", "{shape}: {reason}");
         holds_neo(&world);
-        if differs {
-            assert!(word(&reason, "advance-beside=kept"), "{reason}");
+        let kept = match shape {
+            "differs" | "global" => Some("configuration:branch.main.remote"),
+            "identity" => Some("configuration:user.email"),
+            _ => None,
+        };
+        if let Some(why) = kept {
+            assert!(word(&reason, "advance-beside=kept"), "{shape}: {reason}");
             assert!(
-                word(
-                    &reason,
-                    "advance-beside-reason=configuration:branch.main.remote"
-                ),
-                "{reason}"
+                word(&reason, &format!("advance-beside-reason={why}")),
+                "{shape}: {reason}"
             );
-            assert!(world.beside().join(".git").is_dir());
+            assert!(world.beside().join(".git").is_dir(), "{shape}");
             assert_eq!(
                 fs::read(sting.join(".git/config")).unwrap(),
                 config,
-                "the live configuration"
+                "{shape}: the live configuration"
             );
-        } else {
-            for held in [
-                "advance-beside=retired",
-                "advance-config-added=2",
-                "advance-exclude-appended=1",
-            ] {
-                assert!(word(&reason, held), "{held}: {reason}");
-            }
-            assert!(!world.beside().exists());
-            assert_eq!(
-                git(&sting, &["config", "branch.main.remote"]).trim(),
-                "origin"
-            );
-            assert_eq!(
-                git(&sting, &["config", "branch.main.merge"]).trim(),
-                "refs/heads/main"
-            );
-            assert!(fs::read_to_string(sting.join(".git/info/exclude"))
-                .unwrap()
-                .lines()
-                .any(|line| line == "*.scratch"));
-            // Created only where absent: what the live configuration held is
-            // as it was, a byte prefix of the new file.
-            assert!(fs::read(sting.join(".git/config"))
-                .unwrap()
-                .starts_with(&config));
+            continue;
         }
+        for held in [
+            "advance-beside=retired",
+            "advance-config-added=3",
+            "advance-exclude-appended=1",
+        ] {
+            assert!(word(&reason, held), "{held}: {reason}");
+        }
+        assert!(!world.beside().exists());
+        assert_eq!(
+            git(&sting, &["config", "branch.main.remote"]).trim(),
+            "origin"
+        );
+        assert_eq!(
+            git(&sting, &["config", "--get-all", "branch.main.merge"]),
+            "refs/heads/main\nrefs/heads/topic\n",
+            "every value of the key, once each"
+        );
+        assert!(fs::read_to_string(sting.join(".git/info/exclude"))
+            .unwrap()
+            .lines()
+            .any(|line| line == "*.scratch"));
+        // Created only where absent: what the live configuration held is
+        // as it was, a byte prefix of the new file.
+        assert!(fs::read(sting.join(".git/config"))
+            .unwrap()
+            .starts_with(&config));
     }
 }
 

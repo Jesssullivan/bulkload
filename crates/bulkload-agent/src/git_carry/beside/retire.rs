@@ -39,12 +39,15 @@
 //!   `git init` writes aside) whose key the live configuration lacks, and
 //!   its `info/exclude` patterns the live exclude lacks, go into the live
 //!   repository first, create-only (the coordinator's decision of
-//!   2026-10-20: `git config --add` only for an absent key and a value
-//!   `safe_configuration_value` allows; patterns by the exclude union's
-//!   rule, recorded in STATE), counted in the receipt; a key the live
-//!   configuration holds with another value, or one not safe to carry,
-//!   keeps the beside (`configuration:<key>`), as does a pattern no pure
-//!   union carries or another converge proves (`exclude`).
+//!   2026-10-20: `git config --add` only for a key the live repository's
+//!   effective configuration lacks, every value of it or none, planned in
+//!   the STATE record first; values `safe_configuration_value` allows;
+//!   patterns by the exclude union's rule, recorded in STATE), counted in
+//!   the receipt; a key the live configuration holds with another value,
+//!   one not safe to carry, or an identity or signing key it does not hold
+//!   (never carried; the verification of #289, r7) keeps the beside
+//!   (`configuration:<key>`), as does a pattern no pure union carries or
+//!   another converge proves (`exclude`).
 //!
 //! Any difference keeps the beside checkout and returns why
 //! ([`Retired::Kept`]: `differs:head`, `differs:index`,
@@ -121,6 +124,13 @@ pub struct RetireIntent {
     /// ctime is later was written since, and a deletion cut short never
     /// resumes over it.
     pub recorded_ns: i128,
+    /// The live checkout's path.
+    pub live: Vec<u8>,
+    /// The configuration a standalone beside carries into the live
+    /// repository before it goes (each key with all its values), added
+    /// after this record is written: a crash between two values is
+    /// finished from here ([`settle`]), never left with some of a key.
+    pub config: Vec<(String, Vec<String>)>,
 }
 
 impl landed::Record for RetireIntent {
@@ -481,15 +491,12 @@ const MACHINE_KEYS: &[&[u8]] = &[
     b"core.symlinks",
 ];
 
-// `repo`'s own configuration entries (`key\nvalue`, or `key` alone).
-fn config_entries(repo: &Path) -> Result<BTreeSet<Vec<u8>>> {
-    let out = git(repo)
-        .args(["config", "--local", "-z", "--list"])
-        .output()
-        .refuse_at(SITE)?;
+// The entries (`key\nvalue`, or `key` alone) a `git config ... --list`
+// child prints, in file order.
+fn listed_entries(out: &std::process::Output) -> Result<Vec<Vec<u8>>> {
     match out.status.code() {
         Some(0) => {}
-        Some(1) => return Ok(BTreeSet::new()),
+        Some(1) => return Ok(Vec::new()),
         _ => return Err(super::super::estimate::child_failed(&out.stderr)),
     }
     Ok(out
@@ -498,6 +505,61 @@ fn config_entries(repo: &Path) -> Result<BTreeSet<Vec<u8>>> {
         .filter(|entry| !entry.is_empty())
         .map(<[u8]>::to_vec)
         .collect())
+}
+
+// `repo`'s own configuration entries, in file order: what goes with it.
+fn config_entries(repo: &Path) -> Result<Vec<Vec<u8>>> {
+    let out = git(repo)
+        .args(["config", "--local", "-z", "--list"])
+        .output()
+        .refuse_at(SITE)?;
+    listed_entries(&out)
+}
+
+// The configuration the live repository at `live` is in effect run with
+// (the verification of #289, r7): its own with its includes, and the
+// global and system files the operator's Git reads (`$XDG_CONFIG_HOME` or
+// `~/.config` `git/config`, `~/.gitconfig`, `/etc/gitconfig`), each with
+// its includes. Bulkload's own Git children run without the global and
+// system files, so they are read by name here.
+fn effective_entries(live: &Path) -> Result<BTreeSet<Vec<u8>>> {
+    let out = git(live)
+        .args(["config", "--local", "--includes", "-z", "--list"])
+        .output()
+        .refuse_at(SITE)?;
+    let mut entries: BTreeSet<Vec<u8>> = listed_entries(&out)?.into_iter().collect();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|home| home.join(".config")));
+    let files = [
+        xdg.map(|xdg| xdg.join("git/config")),
+        home.map(|home| home.join(".gitconfig")),
+        Some(PathBuf::from("/etc/gitconfig")),
+    ];
+    for file in files.into_iter().flatten() {
+        if fs::metadata(&file).is_ok_and(|meta| meta.is_file()) {
+            let out = git(live)
+                .args(["config", "--includes", "-z", "--list", "--file"])
+                .arg(&file)
+                .output()
+                .refuse_at(SITE)?;
+            entries.extend(listed_entries(&out)?);
+        }
+    }
+    Ok(entries)
+}
+
+// Identity and signing keys (the verification of #289, r7) are never
+// carried: a local identity the live configuration does not hold (sting's
+// global one, with its signing key) keeps the beside.
+fn identity_key(key: &[u8]) -> bool {
+    key.starts_with(b"user.")
+        || key.starts_with(b"gpg.")
+        || matches!(
+            key,
+            b"commit.gpgsign" | b"tag.gpgsign" | b"push.gpgsign" | b"tag.forcesignannotated"
+        )
 }
 
 // Whether a Git operation is in progress, or a Git lock held, in the git
@@ -519,7 +581,9 @@ fn operation_in(dir: &Path) -> Result<bool> {
 /// create-only by the exclude union's rule.
 #[derive(Debug, Default)]
 struct Carry {
-    config: Vec<(String, String)>,
+    /// Each key the live configuration lacks, with every value the beside
+    /// holds for it, in order: all go in, or none.
+    config: Vec<(String, Vec<String>)>,
     exclude: Vec<Vec<u8>>,
 }
 
@@ -595,28 +659,40 @@ fn state_differs(
             return Ok(Err("modules".to_owned()));
         }
     }
-    let theirs = config_entries(live)?;
+    // Decided per key against the live repository's effective
+    // configuration (the verification of #289, r6 and r7).
+    let theirs = effective_entries(live)?;
     let keys: BTreeSet<&[u8]> = theirs.iter().map(|entry| key_of(entry)).collect();
-    let mut carry = Carry::default();
+    let mut by_key = BTreeMap::<Vec<u8>, Vec<Vec<u8>>>::new();
     for entry in config_entries(beside)? {
-        let key = key_of(&entry);
-        if MACHINE_KEYS.contains(&key) || theirs.contains(&entry) {
+        let key = key_of(&entry).to_vec();
+        if !MACHINE_KEYS.contains(&key.as_slice()) {
+            by_key.entry(key).or_default().push(entry);
+        }
+    }
+    let mut carry = Carry::default();
+    for (key, entries) in &by_key {
+        if entries.iter().all(|entry| theirs.contains(entry)) {
             continue;
         }
         let kept = || Ok(Err(format!("configuration:{}", key.escape_ascii())));
-        if keys.contains(key) {
+        if identity_key(key) || keys.contains(key.as_slice()) {
             return kept();
         }
-        let value = entry.get(key.len() + 1..);
-        let (Ok(name), Some(Ok(value))) =
-            (std::str::from_utf8(key), value.map(std::str::from_utf8))
-        else {
+        let Ok(name) = std::str::from_utf8(key) else {
             return kept();
         };
-        if !super::super::safe_configuration_value(live, name, value) {
-            return kept();
+        let mut values = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let Some(Ok(value)) = entry.get(key.len() + 1..).map(std::str::from_utf8) else {
+                return kept();
+            };
+            if !super::super::safe_configuration_value(live, name, value) {
+                return kept();
+            }
+            values.push(value.to_owned());
         }
-        carry.config.push((name.to_owned(), value.to_owned()));
+        carry.config.push((name.to_owned(), values));
     }
     let common = landed::worktree_git_dir(live)?
         .map(|git_dir| landed::common_dir(&git_dir))
@@ -639,30 +715,52 @@ fn state_differs(
     Ok(Ok(carry))
 }
 
-// Carry `carry` into the live repository at `live`, create-only: each
-// configuration entry added only while its key is still absent (one that
-// appeared since with this value is held; with another, the beside is
-// kept), then the exclude patterns appended through the exclude union
-// (its lock, its STATE record `exclude_record` for `item`, its crash
-// settle). `Err` keeps the beside, with why.
-fn carry_into(
+// Add the configuration a retirement planned (`config`, recorded in its
+// STATE record first) to the live repository at `live`, create-only and
+// all of a key's values or none (the verification of #289, r6): a key
+// whose effective values are some of the planned ones (this retirement's,
+// a crash cut short) gets the rest; one holding any other value keeps the
+// beside, nothing of that key written. Returns how many values went in.
+fn carry_config(
+    live: &Path,
+    config: &[(String, Vec<String>)],
+) -> Result<std::result::Result<u64, String>> {
+    let mut added = 0;
+    for (key, values) in config {
+        let theirs = effective_entries(live)?;
+        let held: Vec<&[u8]> = theirs
+            .iter()
+            .filter(|entry| key_of(entry) == key.as_bytes())
+            .map(|entry| entry.get(key.len() + 1..).unwrap_or_default())
+            .collect();
+        if held
+            .iter()
+            .any(|value| !values.iter().any(|planned| planned.as_bytes() == *value))
+        {
+            return Ok(Err(format!("configuration:{}", key.escape_default())));
+        }
+        for value in values {
+            if held.contains(&value.as_bytes()) {
+                continue;
+            }
+            output(git(live).args(["config", "--local", "--add", key, value]))?;
+            added += 1;
+            fault_point!(EstateAdvanceRetireCarried);
+        }
+    }
+    Ok(Ok(added))
+}
+
+// Carry the exclude patterns a standalone beside holds and the live
+// exclude lacks through the exclude union (its lock, its STATE record
+// `exclude_record` for `item`, its crash settle). `Err` keeps the beside,
+// with why. Returns how many lines went in.
+fn carry_exclude(
     live: &Path,
     carry: &Carry,
     (exclude_record, item, beside): (&Path, &str, &Path),
-) -> Result<std::result::Result<Carried, String>> {
-    let mut carried = Carried::default();
-    for (key, value) in &carry.config {
-        let theirs = config_entries(live)?;
-        let entry = format!("{key}\n{value}").into_bytes();
-        if theirs.contains(&entry) {
-            continue;
-        }
-        if theirs.iter().any(|held| key_of(held) == key.as_bytes()) {
-            return Ok(Err(format!("configuration:{}", key.escape_default())));
-        }
-        output(git(live).args(["config", "--local", "--add", key, value]))?;
-        carried.config += 1;
-    }
+) -> Result<std::result::Result<u64, String>> {
+    let mut appended = 0;
     if !carry.exclude.is_empty() {
         let common = landed::worktree_git_dir(live)?
             .map(|git_dir| landed::common_dir(&git_dir))
@@ -697,10 +795,10 @@ fn carry_into(
                 }
                 Err(other) => return Err(other),
             }
-            carried.exclude = u64::try_from(lines.len()).unwrap_or(u64::MAX);
+            appended = u64::try_from(lines.len()).unwrap_or(u64::MAX);
         }
     }
-    Ok(Ok(carried))
+    Ok(Ok(appended))
 }
 
 // The refs (name to value) the live repository holds that a standalone
@@ -1016,12 +1114,7 @@ fn retire_carrying(
     if prints(beside, admin.as_deref())? != before {
         return Ok(Retired::Kept("raced".to_owned()));
     }
-    // What the live repository lacks of a standalone beside's state goes
-    // in first, create-only (the coordinator's decision on #289).
-    match carry_into(live, &carry, (exclude_record, item, beside))? {
-        Ok(done) => *carried = done,
-        Err(why) => return Ok(Retired::Kept(why)),
-    }
+
     let meta = fs::symlink_metadata(beside).refuse_at("git_carry::beside::retire")?;
     let admin_gitdir = match &admin {
         Some(admin) => fs::read(admin.join("gitdir"))
@@ -1051,9 +1144,26 @@ fn retire_carrying(
         prints: before,
         deleting: false,
         recorded_ns: started,
+        live: live.as_os_str().as_bytes().to_vec(),
+        config: carry.config.clone(),
     };
     landed::write(record, &intent)?;
     fault_point!(EstateAdvanceRetireAfterIntent);
+    // What the live repository lacks of a standalone beside's state goes
+    // in first, create-only (the coordinator's decision on #289): the
+    // configuration as the record plans it, then the exclude patterns.
+    let done = match carry_config(live, &carry.config)? {
+        Ok(added) => carry_exclude(live, &carry, (exclude_record, item, beside))?
+            .map(|appended| (added, appended)),
+        Err(why) => Err(why),
+    };
+    match done {
+        Ok((config, exclude)) => *carried = Carried { config, exclude },
+        Err(why) => {
+            landed::remove(record)?;
+            return Ok(Retired::Kept(why));
+        }
+    }
     // No process inside it, again, right before it is renamed.
     if in_use(beside)? {
         landed::remove(record)?;
@@ -1226,6 +1336,13 @@ pub fn settle(record: &Path) -> Result<Option<Retired>> {
     if !intent.deleting {
         match (lstat(&path)?.is_some(), lstat(&temp)?.is_some()) {
             (true, false) => {
+                // Nothing moved; a configuration carry a crash cut short
+                // is finished (a key holding anything else since is left
+                // for the proof to keep the beside), then the caller
+                // proves again.
+                if !intent.config.is_empty() {
+                    let _ = carry_config(&path_of(&intent.live), &intent.config)?;
+                }
                 landed::remove(record)?;
                 return Ok(None);
             }
